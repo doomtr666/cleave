@@ -5,3 +5,5 @@ edition = "2024"
 
 [dependencies]
 egg = "0.11.0"
+pest = "2"
+pest_derive = "2"

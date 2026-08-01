@@ -1,0 +1,200 @@
+// cleave surface grammar — first pass, matches doc/grammar.md
+// Scope: matches Phase 1 (see doc/hld.md) for semantic processing (no closures yet).
+// while/for parse (the grammar is a funnel, wider than what the rest of the
+// pipeline processes yet) but aren't wired into CPS conversion/the e-graph.
+
+WHITESPACE = _{ " " | "\t" | NEWLINE }
+COMMENT = _{ "//" ~ (!NEWLINE ~ ANY)* }
+
+program = { SOI ~ item* ~ EOI }
+
+item = { use_decl | struct_decl | algebra_decl | impl_decl | fn_decl }
+
+// ---------------------------------------------------------------- crates
+// `use linalg;` (or `use linalg::Matrix;`) is the only mechanism — no separate
+// declaration to discover files. Resolution (compiler-driver concern, not Pest's):
+// search a path list (project source root, then the shipped standard library) for
+// a directory literally named `linalg`; every `.cleave` file in it is crate `linalg`
+// (a directory *is* a crate, strictly — no file elsewhere can claim to contribute to
+// it, no per-file redeclaration). Language-owned discovery (no external build tool
+// decides membership, the point that mattered from the Rust-vs-CMake comparison),
+// without Rust's separate mod-vs-crate distinction or its file=namespace 1:1 tax,
+// and without Go's domain-qualified naming + `replace`-escape-hatch friction (crate
+// names are short, local, human-chosen — not resolved yet: global uniqueness across
+// a public package ecosystem, deferred, not needed at this project's current scope).
+use_decl = { "use" ~ path ~ ";" }
+path     = { ident ~ ("::" ~ ident)* }
+
+// ---------------------------------------------------------------- fn
+fn_decl = { "fn" ~ ident ~ generic_params? ~ "(" ~ param_list? ~ ")" ~ ("->" ~ type_)? ~ block }
+
+generic_params = { "<" ~ generic_param ~ ("," ~ generic_param)* ~ ">" }
+generic_param  = { "const" ~ ident ~ ":" ~ type_ | ident ~ (":" ~ bound_list)? }
+bound_list     = { ident ~ ("+" ~ ident)* }
+
+param_list = { param ~ ("," ~ param)* }
+param      = { ident ~ (":" ~ type_)? }
+
+// ---------------------------------------------------------------- struct
+struct_decl = { "struct" ~ ident ~ generic_params? ~ "{" ~ field_list? ~ "}" }
+field_list  = { field ~ ("," ~ field)* ~ ","? }
+field       = { ident ~ ":" ~ type_ }
+
+// ---------------------------------------------------------------- algebra
+// "algebra" is the working keyword from hld.md's closing section; naming
+// (vs. a separate axiom-free "signature") is still open, see conversation notes.
+algebra_decl = { "algebra" ~ ident ~ generic_params? ~ (":" ~ bound_list)? ~ "{" ~ algebra_item* ~ "}" }
+algebra_item = { fn_sig | axiom_decl }
+fn_sig       = { "fn" ~ ident ~ "(" ~ param_list? ~ ")" ~ ("->" ~ type_)? ~ ";" }
+// the equality itself is just an ordinary `expr` (comparison already handles `==`);
+// no separate "==" token here, or it would conflict with comparison's own greedy parse.
+axiom_decl   = { "axiom" ~ ident ~ "(" ~ param_list? ~ ")" ~ ":" ~ expr ~ ";" }
+
+// ---------------------------------------------------------------- impl
+// `impl<T: Float> TestAlg<Complex<T>> { ... }` — an impl's own generic
+// parameters (distinct from the *algebra*'s own `<T>` in `algebra
+// TestAlg<T> { ... }`), needed once the target itself is generic
+// (`Complex<T>`, not a bare concrete type) — reuses `generic_params`, the
+// same shape `fn_decl`/`struct_decl`/`algebra_decl` already declare theirs
+// with.
+impl_decl = { "impl" ~ generic_params? ~ ident ~ "<" ~ type_ ~ ">" ~ "{" ~ fn_decl* ~ "}" }
+
+// ---------------------------------------------------------------- types
+// arrays are the 1D primitive (see grammar.md, "Primitives + arrays") — Matrix/Tensor
+// (multi-dim, strided) are algebras built on top, not a separate native array type.
+type_       = { array_type | path ~ ("<" ~ generic_arg ~ ("," ~ generic_arg)* ~ ">")? }
+// a generic argument is either a type or a const-generic value — numeric (`Matrix<f64, 3,
+// 3>`'s dimensions) or boolean (`Grid<true>`'s flag). `numeric_lit`/`bool_lit` are tried
+// *before* `type_`, not after: a bare number could never start a `path` (idents can't begin
+// with a digit) so that half is unambiguous either way, but `true`/`false` *would* otherwise
+// parse as an ordinary (bogus) `path` — `ident` has no keyword exclusion anywhere in this
+// grammar (see `primary`'s own `literal | path` ordering for the same reason) — so `type_`
+// must lose that race, not win it.
+generic_arg = { numeric_lit | bool_lit | type_ }
+// Fortran-style sugar: `[f64; 3, 4]` for a fixed-size 3x4 block, desugars (at AST-building
+// time, not here) to the nested form `[[f64; 4]; 3]` — same semantics/layout either way.
+array_type  = { "[" ~ type_ ~ ";" ~ expr ~ ("," ~ expr)* ~ "]" }
+
+// ---------------------------------------------------------------- statements / blocks
+block       = { "{" ~ stmt* ~ expr? ~ "}" }
+stmt        = { let_stmt | assign_stmt | expr_stmt }
+// `mut` wrapped in its own rule (rather than a bare literal) so its presence
+// is actually visible as a pair — a bare string literal leaves no trace at
+// all in pest's output, making "was `mut` there?" undetectable otherwise.
+let_stmt    = { "let" ~ mut_kw? ~ ident ~ (":" ~ type_)? ~ "=" ~ expr ~ ";" }
+mut_kw      = { "mut" }
+// reassignment of an existing `let mut` binding — bare `=`, no `let` (see grammar.md)
+assign_stmt = { ident ~ "=" ~ expr ~ ";" }
+expr_stmt   = { expr ~ ";" }
+
+// ---------------------------------------------------------------- expressions
+// precedence, low to high:
+// implication -> logical (and/or/xor) -> comparison -> additive -> multiplicative -> unary -> postfix -> primary
+expr = { implication }
+
+// standard propositional-logic precedence: implication binds looser than and/or/xor
+// (`a and b implies c or d` reads as `(a and b) implies (c or d)`).
+implication = { logical ~ (implies_op ~ logical)* }
+implies_op  = { "implies" }
+
+logical    = { comparison ~ (logical_op ~ comparison)* }
+logical_op = { "and" | "or" | "xor" }
+
+comparison = { additive ~ (comp_op ~ additive)* }
+comp_op    = { "<=" | ">=" | "==" | "!=" | "<" | ">" }
+
+additive = { multiplicative ~ (add_op ~ multiplicative)* }
+add_op   = { "+" | "-" }
+
+multiplicative = { unary ~ (mul_op ~ unary)* }
+mul_op         = { "*" | "/" }
+
+unary = { "-" ~ unary | postfix }
+
+postfix     = { primary ~ postfix_op* }
+// `a[i, j]` — Fortran-style sugar for nested indexing `a[i][j]`, same desugaring principle
+// as the multi-dim array_type above.
+// `call_args` wrapped in its own rule so its mere *presence* (even with zero
+// arguments, `.f()`) is visible — otherwise `.x` (field access) and `.f()`
+// (zero-arg method call) both produce identical pairs (just `ident`), since
+// an empty `arg_list?` and an absent one are indistinguishable on their own.
+postfix_op  = { "." ~ ident ~ call_args? | "[" ~ expr ~ ("," ~ expr)* ~ "]" }
+call_args   = { "(" ~ arg_list? ~ ")" }
+
+// `call_expr` before `struct_lit`, deliberately: `f()` (a zero-arg call) and
+// `Empty()` (a zero-*field* struct construction) are syntactically
+// identical, and PEG commits to the first alternative that fully matches —
+// `arg_list?`/`field_init_list?` are both optional, so an empty `()` always
+// matches `call_expr` first. This resolves correctly for the common case
+// (`make()`, an ordinary call, must never be mistaken for constructing a
+// struct named `make`) at the cost of a narrow remaining gap: a *genuinely*
+// zero-field struct's own construction syntax is indistinguishable from a
+// zero-arg call at parse time and falls through to `call_expr` too — see
+// `infer_call`'s own fallback, which special-cases exactly this one
+// remaining case (a zero-arg call naming a known, zero-field struct) rather
+// than leaving it as a silent "unresolved call".
+primary = { if_expr | while_expr | for_expr | array_lit | lambda_expr | call_expr | struct_lit | literal | path | "(" ~ expr ~ ")" | block }
+
+// `fn(a, b) { a + b }` — the same shape as `fn_decl`, minus the name: an
+// anonymous function value is "a `fn` without a name", not a separate
+// syntactic concept (deliberately not Rust's `|a, b| ...` — see conversation
+// notes: this project collapses near-duplicate constructs rather than
+// growing a second one, same reasoning that collapsed trait+signature into
+// `algebra` and mod+module into `use`). No generics here — a generic
+// anonymous value isn't a need this surfaces yet; can be added later without
+// disrupting this shape. Calling a lambda *literal* directly
+// (`(fn(a,b){a+b})(1,2)`) isn't supported yet — only calling a `let` binding
+// that holds one (`postfix`'s `call_expr` still requires a bare `path` as
+// callee) — deliberately deferred, see infer.rs's module docs.
+lambda_expr = { "fn" ~ "(" ~ param_list? ~ ")" ~ ("->" ~ type_)? ~ block }
+
+// qualified calls (`Ring::add(a, b)`) need the same path as plain references —
+// `path`'s single-segment case still covers a bare `add(a, b)`.
+call_expr = { path ~ "(" ~ arg_list? ~ ")" }
+arg_list  = { expr ~ ("," ~ expr)* }
+
+// Struct construction: `Vec2(x: 1.0, y: 2.0)` — named-argument call syntax,
+// deliberately *not* Rust's `Vec2 { x: 1.0, y: 2.0 }`. Braces-after-path
+// would collide with `if`/`while`/`for`'s own condition-then-block shape
+// (`if x { y }` — is `x { y }` a struct literal, or is `{ y }` the `if`'s
+// block?), which is exactly the ambiguity Rust itself has to special-case
+// away (disallowing a bare struct literal in condition position). Reusing
+// `(...)` sidesteps it entirely — this parses identically to an ordinary
+// call, distinguished only by its arguments being `ident ":" expr` pairs
+// instead of bare expressions; `call_expr` is still tried *before*
+// `struct_lit` in `primary` (see that rule's own comment — a *zero-arg* call
+// and a *zero-field* struct construction are otherwise indistinguishable),
+// so this only ever gets reached once `call_expr` has already failed to
+// consume a field's `:`. Every field must be named (no positional struct
+// construction) — matches the "closing the loop" instinct of writing the
+// field name at every
+// construction site, not just relying on argument order to line up with a
+// declaration that might be far away.
+struct_lit      = { path ~ "(" ~ field_init_list? ~ ")" }
+field_init_list = { field_init ~ ("," ~ field_init)* }
+field_init      = { ident ~ ":" ~ expr }
+
+if_expr = { "if" ~ expr ~ block ~ ("else" ~ (if_expr | block))? }
+
+// parses (funnel grammar), not yet wired into CPS conversion/the e-graph — see top-of-file note.
+while_expr = { "while" ~ expr ~ block }
+for_expr   = { "for" ~ ident ~ "in" ~ additive ~ ".." ~ additive ~ block }
+
+array_lit = { "[" ~ (expr ~ ("," ~ expr)*)? ~ "]" }
+
+// ---------------------------------------------------------------- literals
+literal = { imaginary_lit | numeric_lit | bool_lit }
+
+// digits, optional fraction, optional exponent — int vs. float is a semantic
+// distinction (presence of '.'/exponent), not a separate grammar production,
+// to avoid the ordered-choice partial-match pitfall (see conversation notes).
+number_body   = @{ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? ~ (^"e" ~ ("+" | "-")? ~ ASCII_DIGIT+)? }
+imaginary_lit = @{ number_body ~ "i" }
+numeric_lit   = @{ number_body ~ type_suffix? }
+type_suffix   = { ":" ~ ident }
+bool_lit      = { "true" | "false" }
+
+// Unicode identifier syntax (Unicode Standard Annex #31, XID_Start/XID_Continue) —
+// the same standard Rust itself uses, not a hand-picked "just Greek letters" range.
+// Superset of the plain-ASCII rule this replaces (XID_Start/Continue include ASCII).
+ident = @{ (XID_START | "_") ~ XID_CONTINUE* }

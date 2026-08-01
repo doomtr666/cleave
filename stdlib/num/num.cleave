@@ -1,0 +1,41 @@
+// Marks a type as "numeric" for defaulting/constraint purposes — see
+// cleave/src/infer.rs's module docs on the numeric-literal gap this exists
+// to eventually close (a literal's type variable should check membership
+// here instead of defaulting blindly, regardless of what it got unified
+// with along the way).
+//
+// No axioms/methods required — a pure existence-marker algebra. The
+// simplest possible real (not fabricated-for-a-test) stdlib content:
+// `Registry::has_impl("Num", ...)` is all that's needed for now.
+algebra Num<T> {}
+
+// `Int`/`Float` split `Num` along the one distinction a bare numeric
+// literal's own text already carries (`1` vs `1.0`) — the language has no
+// implicit conversions anywhere, integers and floats included, so a literal
+// written with a `.` genuinely cannot become an integer type and vice
+// versa; this is what makes that a real, checkable constraint rather than a
+// defaulting-only hint. Deliberately two *independent* marker algebras, not
+// `Int<T>: Num` / `Float<T>: Num` (algebra-bound inheritance isn't
+// implemented anywhere in the registry/inference yet — `bounds` is parsed
+// and merged across files, never consulted for `has_impl_named` — so a type
+// implementing `Int` isn't automatically treated as implementing `Num`
+// through this alone). A literal's own constraint set names all three
+// explicitly (`Num` *and* `Int`, or `Num` *and* `Float`) rather than relying
+// on inheritance to fill in `Num` — see `infer.rs`'s `NumberLit` handling.
+algebra Int<T> {}
+algebra Float<T> {}
+
+impl Num<i8> {}
+impl Num<i16> {}
+impl Num<i32> {}
+impl Num<i64> {}
+impl Num<f32> {}
+impl Num<f64> {}
+
+impl Int<i8> {}
+impl Int<i16> {}
+impl Int<i32> {}
+impl Int<i64> {}
+
+impl Float<f32> {}
+impl Float<f64> {}

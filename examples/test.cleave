@@ -1,0 +1,53 @@
+
+
+algebra TestAlg<T> {
+    fn add(x : T, y : T) -> T;
+    fn sub(x : T, y : T) -> T;
+    fn gt(x : T, y : T) -> bool;
+}
+
+impl TestAlg<i32> {
+    fn add(x , y) { 42 }
+    fn sub(x , y) { 42 }
+    fn gt(x , y) { true }
+}
+
+impl TestAlg<i64> {
+    fn add(x , y) { 42 }
+    fn sub(x , y) { 42 }
+    fn gt(x , y) { true }
+}
+
+struct Complex<T : Float> {
+    real : T,
+    imag : T,
+}
+
+impl<T : Float> TestAlg<Complex<T>> {
+    fn add(x , y) { Complex(real: x.real + y.real, imag: x.imag + y.imag) }
+    fn sub(x , y) { 42 }
+    fn gt(x , y) { true } 
+}
+
+
+fn fibonacci<T: Int>(x : T) -> T {
+    if x > 2 { fibonacci(x-1) + fibonacci(x-2) } else { x }
+}
+
+
+struct Matrix<T : Float, const R : Int, const C : Int> {
+    values : [T; R, C]
+} 
+
+fn main() {
+    let a = fibonacci(42:i32);
+    let b = fibonacci(42:i64);
+
+    let z1 = Complex(real: 1.0, imag: 0.0);
+    let z2 = Complex(real: 0.0, imag: 1.0);
+    let zr = z1 + z2;
+
+    let m = Matrix<f32,4,4>();
+
+    42
+}
