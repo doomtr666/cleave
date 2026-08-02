@@ -654,7 +654,33 @@ impl Lowerer {
 
     fn lower_array_lit(&mut self, pair: Pair<Rule>) -> Expr {
         let span = self.span_of(&pair);
-        let elems = pair.into_inner().map(|p| self.lower_expr(p)).collect();
+        let Some(body) = pair.into_inner().next() else {
+            return self.wrap(span, ExprKind::ArrayLit(Vec::new()));
+        };
+        let elems = match body.as_rule() {
+            // `[value; N]` -- re-lowers the *same* parsed `value` pair `N`
+            // times (cheap: `Pair` is a reference into the token stream, not
+            // an owned deep copy) rather than lowering once and cloning the
+            // resulting `Expr`, so each copy gets its own distinct `NodeId`
+            // — every other node in this AST is unique per occurrence (see
+            // `ast.rs`'s own doc comment on `NodeId`), and `node_types`
+            // (keyed by `NodeId`) would silently collapse all `N` copies
+            // into one entry otherwise.
+            Rule::array_repeat => {
+                let mut inner = body.into_inner();
+                let value = inner.next().unwrap();
+                let count_text = inner.next().unwrap().as_str();
+                // `numeric_lit`'s own text, possibly `:suffix`-terminated —
+                // a repeat count is never suffixed in practice, but strip it
+                // defensively rather than let `.parse` reject it outright.
+                let count: usize = count_text.split(':').next().unwrap().parse().unwrap_or_else(|e| {
+                    panic!("array-repeat count {count_text:?} is not a valid array size: {e}")
+                });
+                (0..count).map(|_| self.lower_expr(value.clone())).collect()
+            }
+            Rule::array_list => body.into_inner().map(|p| self.lower_expr(p)).collect(),
+            other => unreachable!("array_lit's own body must be array_repeat or array_list, got {other:?}"),
+        };
         self.wrap(span, ExprKind::ArrayLit(elems))
     }
 

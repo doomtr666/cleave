@@ -245,7 +245,19 @@ if_expr = { "if" ~ expr ~ block ~ ("else" ~ (if_expr | block))? }
 while_expr = { "while" ~ expr ~ block }
 for_expr   = { "for" ~ ident ~ "in" ~ additive ~ ".." ~ additive ~ block }
 
-array_lit = { "[" ~ (expr ~ ("," ~ expr)*)? ~ "]" }
+// `[value; N]` -- repeat sugar, desugared at *lowering* time (not inference
+// time, unlike `array_type`'s own `[T; N]` size slot) into N copies of
+// `value`, so `N` is restricted to a literal `numeric_lit` here specifically
+// -- lowering is a purely syntactic pass with no unification/const-generic
+// resolution machinery to fall back on, so it can only ever expand a count
+// it can already read off the token stream directly. `array_repeat`/
+// `array_list` are distinct named rules (not just two shapes folded into
+// one), so lowering can tell which one actually matched -- both produce a
+// flat sequence of `expr` children on their own, indistinguishable from each
+// other without this.
+array_lit    = { "[" ~ (array_repeat | array_list)? ~ "]" }
+array_repeat = { expr ~ ";" ~ numeric_lit }
+array_list   = { expr ~ ("," ~ expr)* }
 
 // ---------------------------------------------------------------- literals
 literal = { imaginary_lit | numeric_lit | bool_lit }

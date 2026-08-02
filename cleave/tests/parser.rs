@@ -180,6 +180,19 @@ fn array_literal() {
 }
 
 #[test]
+fn array_repeat_literal_parses() {
+    parses(Rule::expr, "[0.0; 4]");
+}
+
+#[test]
+fn array_repeat_literal_requires_a_literal_count() {
+    // The whole point of restricting this to `numeric_lit` in the grammar
+    // (see its own doc comment) -- a variable count has nothing for
+    // lowering-time desugaring to expand.
+    assert!(CleaveParser::parse(Rule::expr, "[0.0; n]").is_err());
+}
+
+#[test]
 fn array_indexing() {
     parses(Rule::expr, "a[0] + a[1]");
 }

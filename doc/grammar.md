@@ -46,7 +46,7 @@ No special syntax — `main` is an ordinary function, recognized by name convent
 
 ## The grammar is a funnel: parses more than the pipeline processes yet
 
-`cleave/src/grammar.pest` can be wider than what the rest of the compiler (AST lowering, CPS conversion, the e-graph) actually handles at any given point — a construct parsing successfully doesn't mean it's wired into semantic processing yet. Concretely right now: `while`/`for` parse (`while_expr`, `for_expr`) but are not yet connected to CPS conversion — they were deliberately scoped out of Phase 1's semantic processing (see `hld.md`), but there's no reason the grammar itself can't already accept them.
+`cleave/src/grammar.pest` can be wider than what the rest of the compiler (AST lowering, type inference, the e-graph) actually handles at any given point — a construct parsing successfully doesn't mean it's wired into semantic processing yet. `while`/`for` are a good example of how this actually plays out over time: they parsed (`while_expr`, `for_expr`) long before they had any real type inference behind them, and now they do (see `type_inference.md`, "Control flow gets real inference") — but they still aren't connected to CPS conversion/the e-graph, which is a separate, later stage (see `hld.md`). Parsing, type-checking, and lowering are three genuinely different milestones for any one construct, and this file tracks the first one; don't assume the other two follow automatically just because a construct is documented here.
 
 Also added to the actual grammar (previously only discussed, not yet reflected there):
 - **Arrays**: 1D fixed-size type `[T; N]`, literal `[1, 2, 3]`, indexing `a[i]` — matching "Primitives + arrays" below.
@@ -122,7 +122,83 @@ impl Ring<Vec2> {
 - **Construction is named-argument call syntax: `Vec2(x: 1.0, y: 2.0)`, not positional `Vec2(1.0, 2.0)`.** The original sketch didn't settle this; once it became a real question, `Vec2 { x: 1.0, y: 2.0 }` (Rust's own syntax) was considered and rejected — it collides with `if`/`while`/`for`'s own condition-then-block shape (`if x { y }` — is `x { y }` a struct literal, or is `{ y }` the `if`'s block?), the exact ambiguity Rust itself has to special-case away (disallowing a bare struct literal in condition position). Reusing `(...)` sidesteps it entirely, at the cost of a narrow, separate ambiguity between a zero-arg call and a zero-*field* struct construction (`Empty()`) — resolved by always preferring the call reading, with a single fallback case in `infer_call` recognizing a zero-arg call naming a known, zero-field struct (see `grammar.pest`'s `primary` comment, `cleave/src/infer.rs`). Every field must be named — no positional construction, deliberately, so a construction site names what it means rather than relying on argument order matching a declaration that might be far away.
 - **`v.x` is a direct field access (`ExprKind::FieldAccess`), not sugar for an auto-generated accessor function `x(v)`.** The original sketch's "auto-generated field-accessor functions, `v.x` desugars to `x(v)`" wasn't built — field access resolves directly against the struct's own declared fields during type inference (`Infer`'s `FieldAccess` handling), without going through the algebra-dispatch machinery operators use. Revisit if a real need for `x` as a free-standing, algebra-dispatchable function ever comes up (e.g. `map(x, vectors)`) — not needed for the base case.
 - **`struct` (data/layout) and `impl algebra for Struct` (behavior) stay separate**, mirroring Rust's own struct/trait-impl split — nothing new needed beyond the already-established algebra mechanism.
-- **Generic structs (`struct Pair<T> { a: T, b: T }`) parse (`struct_decl` already accepts `generic_params`) but construction is explicitly rejected, not silently wrong** — `Ty` has no representation yet for "a type applied to generic arguments" (the same gap array types and `Matrix<f64, 3, 3>`-style paths already have). A real, scoped-out gap, not an oversight.
+- **Generic structs (`struct Pair<T> { a: T, b: T }`) construct and infer correctly now** — `Ty::App(name, type_args)` (added specifically to close this gap) represents "a type applied to generic arguments", so `Pair(a: 1.0, b: 2.0)` infers `Pair<f64>` by unifying both fields' values against the struct's own shared `T`, with no annotation needed. See `type_inference.md`, "Generic structs: `Ty::App` and const-generics", for the mechanism and for the earlier state this note used to describe (a real, previously scoped-out gap, not always the case).
+
+## Generics: explicit `::<...>` (turbofish), never bare `<...>`
+
+**A real grammar ambiguity, not just a design preference.** The natural-looking `f<T>(x)` (bare angle brackets for an explicit type argument at a call site) is genuinely ambiguous in this grammar: `f < T > (x)` also parses as a chained comparison (`(f < T) > (x)`), and PEG's ordered-choice, no-backtracking-across-alternatives nature means there's no clean way to try both readings and prefer whichever "looks more like generics" — the grammar has to commit to one interpretation structurally, not heuristically. Rust hits the same ambiguity and resolves it with the "turbofish" (`f::<T>(x)`) for exactly this reason; cleave adopts the identical `::<...>` syntax, for the identical reason, rather than rediscovering a worse workaround.
+
+```
+fn id<T>(x: T) -> T { x }
+let a = id::<f64>(1.0);         // pins T explicitly, even though it's inferable here
+let v = Vec::<f64, 3>(data: [1.0, 2.0, 3.0]);  // struct construction, mixing a type and a const-generic argument
+```
+
+Turbofish is an **override**, not a requirement — omit it whenever inference already pins the generic down unambiguously (the overwhelming common case); reach for it when a literal's own shape would otherwise default somewhere unwanted (`id::<f64>(1)`, forcing the bare integer literal `1` to be treated as `f64` rather than defaulting to `i32`), or when constructing a generic struct with no field value that would otherwise pin every parameter (an empty array, a zero-field generic marker type).
+
+## Function types: `(T) -> U`, for higher-order parameters
+
+A parameter (or any other type-annotation position) can be typed as a function itself:
+
+```
+fn apply(f: (i32) -> i32, x: i32) -> i32 { f(x) }
+fn compose(f: (f64) -> f64, g: (f64) -> f64, x: f64) -> f64 { f(g(x)) }
+```
+
+`fn_type = "(" (type_ ("," type_)*)? ")" "->" type_` — added as `type_`'s first alternative, ahead of the ordinary `path`-based case, so `(` unambiguously starts a function type wherever a type is expected (nothing else in type position can start with `(`). Unlike an ordinary `fn_decl`'s own return type, the `->` here is **mandatory**, not optional: a ordinary function declaration can omit it and let the body's own inferred result fill it in, but a bare type annotation has no body anywhere nearby to infer a return type *from* — leaving it out would just be silently wrong (defaulting to `()`) rather than an honest gap. This is what actually makes a function a legitimate value to pass around — `apply`'s own `f` parameter can be handed any lambda or named function whose shape matches, checked structurally like any other type.
+
+## Inherent impls: methods without an algebra, `impl struct Vec2 { ... }`
+
+Not every method belongs to an algebra — sometimes a struct just needs an ordinary method, with no operator-dispatch/multi-implementation story attached (`v.len()`, not "some algebra `Norm` that any number of unrelated types could also implement"). An **inherent impl** covers exactly this:
+
+```
+struct Vec2 { x: f64, y: f64 }
+
+impl struct Vec2 {
+    fn len_sq(v) { v.x * v.x + v.y * v.y }
+}
+
+impl<T> struct Boxed<T> {
+    fn get(b) -> T { b.value }
+}
+```
+
+**The literal `struct` keyword right after `impl`/`impl<...>` is not decoration — it resolves a genuine grammar ambiguity, found by direct testing, not just an ordering concern.** `impl<T> Boxed<T> { ... }` (no `struct`) parses *identically* two different ways: as an algebra impl (`algebra` = `Boxed`, target = the bare type `T`) or as an inherent impl on the generic struct `Boxed<T>` — both fully match the same character sequence. Since `algebra_impl` is tried first in the grammar's ordered choice, it always wins, silently misreading "Boxed" as an algebra name (`` `get` is not declared by `algebra Boxed` `` — the actual error this produced before the fix). The mandatory `struct` keyword breaks the tie the same way Rust's own `impl Trait for Type` vs. `impl Type` split does (`for` as the disambiguator there, `struct` here) — reusing an existing keyword rather than inventing a new one, and deliberately scoped to the inherent-impl side only, so the pervasively-used ordinary algebra-impl syntax (`impl Ring<i32> { ... }`) needed no changes at all.
+
+**No implicit `self` — the receiver is an ordinary, explicit first parameter.** `v.len_sq()` calls `len_sq` with `v` filling its first positional parameter, exactly the same "no implicit anything" posture the rest of the language holds to. An unannotated first parameter defaults to the impl's own target type (`Vec2` for `len_sq`'s `v`, `Boxed<T>` for `get`'s `b`) — the same "fall back to what the enclosing context already establishes" treatment an algebra impl's own unannotated parameters already get from that algebra's declared signature; an inherent impl has no separate signature to fall back to, so the target itself is the closest equivalent. Any *other* parameter, and an explicitly-annotated first one, are checked/resolved normally.
+
+## Heterogeneous algebras: more than one type parameter
+
+An algebra isn't limited to a single generic type — `algebra MatMul<A, B, C>` genuinely relates three independent types, not one type used three times:
+
+```
+algebra MatMul<A, B, C> {
+    fn mul(a: A, b: B) -> C;
+}
+
+struct Matrix<T : Float, const R : i32, const C : i32> { values : [T; R, C] }
+
+impl<T: Float, const N: i32, const M: i32, const K: i32>
+    MatMul<Matrix<T,N,M>, Matrix<T,M,K>, Matrix<T,N,K>> {
+    fn mul(a, b) { /* ... */ }
+}
+```
+
+`algebra_impl = "impl" generic_params? ident "<" type_ ("," type_)* ">" "{" fn_decl* "}"` — the comma-separated repetition after the first target is what actually enables this; a single-target algebra impl (`impl Ring<i32>`, the overwhelming common case) is just this shape with zero repetitions, fully backward compatible. This is the syntax `a * b` for two differently-shaped matrices resolves through — see `type_inference.md`, "Heterogeneous algebra dispatch", for how the compiler resolves the shared/output-only type parameters (`M` shared between the two operands, `N`/`K` appearing only in the *result*) this genuinely needs.
+
+## Algebra bounds: `algebra Int<T> : Num { ... }`
+
+An algebra can declare that it requires another one, the same relationship Rust expresses with a supertrait (`trait Int: Num`):
+
+```
+algebra Num<T> {}
+algebra Int<T> : Num {}
+algebra Float<T> : Num {}
+
+impl Int<i32> {}   // no separate `impl Num<i32>` needed — `Int<i32>` counts as `Num<i32>` too
+```
+
+`algebra_decl = "algebra" ident generic_params? (":" bound_list)? "{" algebra_item* "}"` — this was already part of the grammar (`AlgebraDecl::bounds`) well before it meant anything; for a long stretch it parsed and was carried across file merges with nothing ever consulting it, which is why `stdlib/num/num.cleave` used to declare `Int`/`Float` as flat, independent markers duplicating `Num`'s own impls by hand. It's real now — see `type_inference.md`, "Algebra-bound inheritance", for the actual checking mechanism (and why it lives in `Infer`, not `Registry`).
 
 ## Primitives + arrays as the minimum type set; tensors/matrices are algebras, not arrays
 
@@ -132,9 +208,11 @@ impl Ring<Vec2> {
 
 **Multi-dimensional arrays: nested types already work, no grammar change needed for the semantics — but Fortran-style sugar is worth it for ergonomics.** `[[f64; 4]; 3]` (a fixed-size array of arrays) parses today with zero grammar changes (`array_type`'s element position is `type_`, itself recursively `array_type`-capable) and gives exactly the same contiguous, row-major memory layout a native 2D array would. But nested-bracket syntax and nested indexing (`a[i][j]`) are a real ergonomic step down from Fortran's `A(3,4)` / `A(i,j)` — and array ergonomics are arguably the one thing that keeps Fortran, otherwise a rough language by modern standards, genuinely loved by the scientific community. Worth the small grammar cost: `[f64; 3, 4]` (comma-separated dimensions) and `a[i, j]` (comma-separated indices) are added as pure sugar over the same nested form — no new semantics, no new memory layout, just surface convenience matching what scientists already expect.
 
+**Array repeat literal: `[value; N]`, sugar expanded at *lowering* time, not a runtime operation.** The natural-looking alternative — a stdlib function, `repeat(value, N)` — isn't actually buildable in cleave today: there's no way to construct or mutate an array element-by-element in a loop yet (no index-assignment, `assign_stmt` only reassigns a whole binding), so a real `repeat` would need much larger array-mutation primitives to exist first, unrelated to just wanting a repeated value. `[value; N]` sidesteps that entirely by desugaring, in `lower.rs`, directly into the ordinary `N`-element form (`[value, value, ..., value]`) — exactly the same "expand at lowering time, add zero inference-side machinery" move `[f64; 3, 4]` above already makes for multi-dimensional sugar. `N` is restricted to a literal integer specifically (`array_repeat = expr ~ ";" ~ numeric_lit`, a distinct grammar rule from the ordinary comma-separated `array_list`, so lowering can tell which one it's looking at) — lowering is a purely syntactic pass with no unification or const-generic resolution available to it, so it can only ever expand a count it can read directly off the token stream; a *variable* repeat count is a real, different, harder problem (needs the array-mutation primitives above) and isn't attempted here.
+
 **Tensor/Matrix/Vector must be their own structural algebras, not "arrays with a specific MLIR lowering."** This is a direct consequence of the founding "don't lower prematurely" thesis (see `hld.md`, "Core philosophy") — the whole motivating example for that thesis (`matmul(matmul(a,b),c)` vs. `matmul(a,matmul(b,c))` reassociation for FLOP savings) requires the e-graph to see `MatMul` as a named operation with real algebraic axioms (associativity, distributivity), not as ordinary array-indexing loops indistinguishable from any other loop. Same relationship as "primitive types are algebras too": Matrix's *eventual* MLIR lowering will of course use array-backed memory, but its language-level identity and the e-graph's reasoning about it stay at the structural/named-operation level — that's a lowering detail, not the type's identity.
 
-**Acceptance test for the struct+algebra mechanism:** it should be powerful enough to let `Matrix<T, Rows, Cols>` (real generics — element type *and* const-generic dimensions) be defined *entirely* via ordinary `struct`+`impl algebra`, no compiler-special-casing — validating "closing the loop" (see `hld.md`) for compound generic types, not just scalars.
+**Acceptance test for the struct+algebra mechanism, now met:** `Matrix<T, Rows, Cols>` (real generics — element type *and* const-generic dimensions) is defined *entirely* via ordinary `struct`+`impl algebra` today, no compiler-special-casing — `struct Matrix<T : Float, const R : i32, const C : i32> { values : [T; R, C] }` plus a heterogeneous `MatMul` impl (see "Heterogeneous algebras" above) validates "closing the loop" (see `hld.md`) for compound generic types, not just scalars. See `type_inference.md` for the const-generic (`Ty::Const`) and generic-struct (`Ty::App`) machinery this relies on.
 
 **Backing representation: a Fortran-style array descriptor, not a Rust-style contiguous slice.** `&[T]` (pointer + length) assumes stride-1 contiguous memory — too narrow for real HPC needs (sub-matrix views, transposed views, strided access for FFTs, halo regions). A descriptor generalizes this with an explicit stride and bound per dimension — `struct ArrayDescriptor<T, const RANK: usize> { ptr: *T, strides: [isize; RANK], shape: [usize; RANK] }` — the standard, well-precedented representation (Fortran's own array descriptors, and why numpy views work the way they do).
 

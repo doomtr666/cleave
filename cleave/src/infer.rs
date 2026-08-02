@@ -1194,21 +1194,6 @@ impl<'r> Infer<'r> {
         let impl_mapping = self.fresh_generics_mapping(impl_generics, fallback_span);
         let target_ty = self.ty_from_ast_mapped(target, &impl_mapping);
         let param_types = self.inherent_method_param_tys(&f.params, &impl_mapping, &target_ty);
-        // Only meaningful at *declaration* time: a call site has no
-        // "annotation" of its own to double-check, just a concrete
-        // `resolved_base` unified against `param_tys[0]` directly (see
-        // `ExprKind::MethodCall`'s own handling) — but a declaration whose
-        // first parameter is annotated (`fn len(v: Vec2) { ... }`) must
-        // still agree with the impl's own target, not silently accept a
-        // second, independent truth.
-        if let Some(t) = f.params.first().and_then(|p| p.ty.as_ref()) {
-            self.unify_at(t.span, &target_ty, &param_types[0])?;
-        }
-
-        let mut env = outer.clone();
-        for (p, ty) in f.params.iter().zip(&param_types) {
-            env.insert(p.name.clone(), Scheme::mono(ty.clone()));
-        }
 
         // Self-reference, the impl-method equivalent of `infer_fn`'s own
         // seeded placeholder — see `in_progress_methods`'s own doc comment
@@ -1222,19 +1207,185 @@ impl<'r> Infer<'r> {
             self.in_progress_methods.insert(key.clone(), (param_types.clone(), ret_var.clone()));
         }
 
-        let result = self.infer_block(&env, &f.body)?;
-        if let Some(ret) = &f.ret {
-            let declared = self.ty_from_ast_mapped(ret, &impl_mapping);
-            self.unify_at(ret.span, &declared, &result)?;
-        }
-        let result_span = f.body.tail.as_deref().map(|t| t.span).unwrap_or(fallback_span);
-        self.unify_at(result_span, &ret_var, &result)?;
+        let result =
+            self.infer_inherent_impl_fn_raw(outer, &impl_mapping, &target_ty, param_types.clone(), ret_var, f, fallback_span);
 
         if let Some(key) = &self_key {
             self.in_progress_methods.remove(key);
         }
 
-        self.finish_fn(f, param_types, result)
+        self.finish_fn(f, param_types, result?)
+    }
+
+    /// The body-inference core `infer_inherent_impl_fn_generic` (single
+    /// method, self-recursion only) and `infer_inherent_impl_block` (every
+    /// method of one impl block, real mutual recursion) both build on —
+    /// stops short of `finish_fn`'s defaulting/constraint-check/placeholder-
+    /// check, for the identical reason `infer_fn_raw` stops short of it for
+    /// a mutually-recursive *group* of top-level `fn`s (see `callgraph.rs`'s
+    /// own doc comment): that sequence must run once, after every method
+    /// sharing this `Infer` has had its body walked, not per-method.
+    fn infer_inherent_impl_fn_raw(
+        &mut self,
+        outer: &Env,
+        impl_mapping: &HashMap<String, Ty>,
+        target_ty: &Ty,
+        param_types: Vec<Ty>,
+        ret_var: Ty,
+        f: &FnDecl,
+        fallback_span: Span,
+    ) -> Result<Ty, TypeError> {
+        // Only meaningful when the first parameter is annotated: a call
+        // site has no "annotation" of its own to double-check, just a
+        // concrete `resolved_base` unified against `param_tys[0]` directly
+        // (see `ExprKind::MethodCall`'s own handling) — but a declaration
+        // whose first parameter is annotated (`fn len(v: Vec2) { ... }`)
+        // must still agree with the impl's own target, not silently accept
+        // a second, independent truth.
+        if let Some(t) = f.params.first().and_then(|p| p.ty.as_ref()) {
+            self.unify_at(t.span, target_ty, &param_types[0])?;
+        }
+
+        let mut env = outer.clone();
+        for (p, ty) in f.params.iter().zip(&param_types) {
+            env.insert(p.name.clone(), Scheme::mono(ty.clone()));
+        }
+
+        let result = self.infer_block(&env, &f.body)?;
+        if let Some(ret) = &f.ret {
+            let declared = self.ty_from_ast_mapped(ret, impl_mapping);
+            self.unify_at(ret.span, &declared, &result)?;
+        }
+        let result_span = f.body.tail.as_deref().map(|t| t.span).unwrap_or(fallback_span);
+        self.unify_at(result_span, &ret_var, &result)?;
+        Ok(result)
+    }
+
+    /// Like `infer_inherent_impl_fn_generic`, but for *every* method of one
+    /// inherent impl block together, sharing one `Infer`/`Subst` — real
+    /// mutual recursion between two separately-declared methods on the
+    /// *same* struct (`fn is_even(w) { ... w.dec().is_odd() ... } fn
+    /// is_odd(w) { ... w.dec().is_even() ... }`), which `in_progress_
+    /// methods`'s single self-only slot can't express (it only ever holds
+    /// an entry for whichever *one* method is currently being inferred).
+    /// The same reasoning `callgraph::infer_program` already applies to
+    /// top-level `fn`s, scoped down to one impl block instead of the whole
+    /// program.
+    ///
+    /// Doesn't build a real call graph or run Tarjan's algorithm the way
+    /// `infer_program` does — there's no *generalization* to order
+    /// correctly here: an inherent method's own generics are re-
+    /// instantiated fresh at every call site via `impl_mapping`, dispatch-
+    /// style, never through a reusable `Scheme` the way a top-level `fn`'s
+    /// own scheme is. Simply seeding every member's self/mutual-reference
+    /// placeholder before inferring *any* of their bodies, then inferring
+    /// all of them against one shared `Infer`, is already correct on its
+    /// own — there's no ordering to get right, only "everyone sees everyone
+    /// else" to arrange.
+    ///
+    /// Mirrors `callgraph.rs`'s own "defaulting/constraint-checking run once
+    /// per group, not once per member" rule, for the identical reason:
+    /// `finish_fn`'s sequence can't run per-method here, since `apply_
+    /// defaults`/`check_pending_constraints` would then drain state a
+    /// not-yet-inferred sibling still needed to contribute to.
+    ///
+    /// Returns one entry per `fns`, each either the method's own final
+    /// `(param_types, result)` or the `TypeError` that rejected it — the
+    /// caller (`dump.rs`) reads `self.node_types` afterward for rendering,
+    /// same as any other inference entry point; unlike `param_types` (a
+    /// single, last-write-wins field on `Infer`, unsuited to more than one
+    /// method sharing an instance), `node_types` is keyed by `NodeId` and
+    /// already accumulates correctly across however many bodies this one
+    /// `Infer` instance ends up walking.
+    pub fn infer_inherent_impl_block(
+        &mut self,
+        outer: &Env,
+        impl_generics: &[GenericParam],
+        target: &Type,
+        fns: &[FnDecl],
+        fallback_span: Span,
+    ) -> HashMap<String, Result<(Vec<Ty>, Ty), TypeError>> {
+        let impl_mapping = self.fresh_generics_mapping(impl_generics, fallback_span);
+        let target_ty = self.ty_from_ast_mapped(target, &impl_mapping);
+        let struct_name = match &target.kind {
+            TypeKind::Path(p, _) => Some(p.segments.join("::")),
+            _ => None,
+        };
+
+        // Seed every member's placeholder before inferring *any* of their
+        // bodies — visible to every other member (mutual recursion) and to
+        // itself (self-recursion).
+        let mut placeholders: HashMap<String, (Vec<Ty>, Ty)> = HashMap::new();
+        for f in fns {
+            let param_types = self.inherent_method_param_tys(&f.params, &impl_mapping, &target_ty);
+            let ret_var = self.vars.fresh();
+            if let Some(name) = &struct_name {
+                self.in_progress_methods.insert((name.clone(), f.name.clone()), (param_types.clone(), ret_var.clone()));
+            }
+            placeholders.insert(f.name.clone(), (param_types, ret_var));
+        }
+
+        let mut raw_results: HashMap<String, Result<Ty, TypeError>> = HashMap::new();
+        for f in fns {
+            let (param_types, ret_var) = placeholders[&f.name].clone();
+            // `check_pending_type_names` right here, per member, not folded
+            // into a group-wide sweep — see `Infer::check_pending_type_
+            // names`'s own doc comment for why: each entry belongs to
+            // whichever one member's body produced it.
+            let outcome = self
+                .infer_inherent_impl_fn_raw(outer, &impl_mapping, &target_ty, param_types, ret_var, f, fallback_span)
+                .and_then(|ty| self.check_pending_type_names().map(|()| ty));
+            raw_results.insert(f.name.clone(), outcome);
+        }
+
+        if let Some(name) = &struct_name {
+            for f in fns {
+                self.in_progress_methods.remove(&(name.clone(), f.name.clone()));
+            }
+        }
+
+        self.apply_defaults();
+        // A constraint failure here is a property of the block's mutual
+        // definition as a whole, not attributable to one specific member —
+        // reported against every member whose own raw inference otherwise
+        // succeeded (a raw-inference failure is already more specific and
+        // is left alone), mirroring `callgraph.rs`'s identical choice.
+        if let Err(e) = self.check_pending_constraints() {
+            for outcome in raw_results.values_mut() {
+                if outcome.is_ok() {
+                    *outcome = Err(e.clone());
+                }
+            }
+        }
+
+        // Re-resolve `node_types` through the final substitution before any
+        // caller (`dump.rs`) reads it — mirrors `finish_fn`'s identical
+        // step. Skipping this is a real bug, found by testing: a recursive
+        // call site's own node (`w.dec().is_odd()`, inside `is_even`'s own
+        // body) is recorded *while* `is_odd`'s own `ret_var` is still a bare
+        // variable — by the time this method returns, `check_pending_
+        // constraints`/unification elsewhere may have pinned it fully
+        // concrete, but nothing had gone back to update the already-recorded
+        // node entry to match.
+        let resolved_nodes: Vec<(NodeId, Ty)> = self.node_types.iter().map(|(id, t)| (*id, self.subst.apply(t))).collect();
+        self.node_types = resolved_nodes.into_iter().collect();
+
+        let mut results = HashMap::new();
+        for f in fns {
+            let (param_types, _) = &placeholders[&f.name];
+            let outcome = raw_results.remove(&f.name).unwrap();
+            let resolved = outcome.map(|result_ty| {
+                let final_params: Vec<Ty> = param_types.iter().map(|t| self.subst.apply(t)).collect();
+                let final_result = self.subst.apply(&result_ty);
+                (final_params, final_result)
+            });
+            let checked = resolved.and_then(|(final_params, final_result)| {
+                check_no_placeholder(f, &final_result, &final_params)?;
+                Ok((final_params, final_result))
+            });
+            results.insert(f.name.clone(), checked);
+        }
+        results
     }
 
     /// The "first parameter defaults to the impl's own target type when left
@@ -1639,19 +1790,40 @@ impl<'r> Infer<'r> {
 
     /// Non-committing existence probe: does *some* impl of `algebra` apply
     /// to the fully concrete `ty` — directly, or transitively through
-    /// algebra-bound inheritance (`algebra Int<T> : Num { }`: an `impl
-    /// Int<i32>`, with no separate `impl Num<i32>` anywhere, still satisfies
-    /// a `Num` bound, exactly the way stdlib's own `num.cleave` documents
-    /// wanting — see `Registry::algebra_bounds`'s own doc comment)? See
-    /// `match_impl`'s own doc comment for the shared engine underneath and
-    /// exactly what non-committing means here.
+    /// algebra-bound inheritance, checked in **both** directions along the
+    /// bound graph (`algebra X : Y` never says which side ends up with the
+    /// real `impl` — either can, and both are legitimate):
+    ///
+    /// - **Reverse witness**: some *more specific* algebra that itself
+    ///   bounds on `algebra` has a real impl. `algebra Int<T> : Num { }`: an
+    ///   `impl Int<i32>` alone, with no separate `impl Num<i32>` anywhere,
+    ///   still satisfies a `Num` bound — exactly what `stdlib/num/num.cleave`
+    ///   wants (see `Registry::algebra_bounds`'s own doc comment).
+    /// - **Forward aggregate**: `algebra` itself bounds on one or more other
+    ///   algebras, and *every one* of them is independently satisfied.
+    ///   `algebra Semiring<T> : AdditiveMonoid + MultiplicativeMonoid { }`:
+    ///   `impl AdditiveMonoid<i32>` and `impl MultiplicativeMonoid<i32>`
+    ///   together satisfy a `Semiring` bound, with no separate (even empty)
+    ///   `impl Semiring<i32>` needed. The mirror image of the reverse case —
+    ///   there, the concrete impl sits on the more-specific side; here, it
+    ///   sits on the more-general side(s) instead — found missing by direct
+    ///   testing: only the reverse direction was originally built, since
+    ///   `Int : Num` was the sole real motivating example at the time, and
+    ///   `Semiring : AdditiveMonoid + MultiplicativeMonoid` (structurally
+    ///   the *same* single-bound shape as `Int : Num`, once written with
+    ///   only one bound — this was never actually about "+" or multiple
+    ///   bounds at all) turned out to need the opposite walk.
+    ///
+    /// See `match_impl`'s own doc comment for the shared engine underneath
+    /// the direct-impl check and exactly what non-committing means here.
     ///
     /// Deliberately *not* threaded through `match_impl`/`dispatch_algebra_
     /// call` itself — inheritance only makes sense for a marker/existence
     /// check like this one. Dispatching an actual operator call needs a
     /// *real* impl with a real fn body to run; you can't "borrow" `Ring::
     /// mul`'s implementation from some other algebra `Ring` merely bounds
-    /// itself on, the way a bare existence check can borrow `Num`'s.
+    /// itself on (or aggregates from), the way a bare existence check can
+    /// borrow `Num`'s.
     fn has_matching_impl(&mut self, algebra: &str, ty: &Ty) -> bool {
         self.has_matching_impl_inherited(algebra, ty, &mut HashSet::new())
     }
@@ -1660,18 +1832,43 @@ impl<'r> Infer<'r> {
         // Guards against a cyclic bound declaration (`algebra A : B` and
         // `algebra B : A`) looping forever — a malformed program, but one
         // that must fail cleanly (no matching impl found) rather than
-        // overflow the stack.
+        // overflow the stack. Shared across *both* directions below, on
+        // purpose: a cycle mixing reverse and forward hops (`A : B`, `B`
+        // aggregating something that circles back to `A`) must terminate
+        // just as cleanly as a same-direction one.
         if !visited.insert(algebra.to_string()) {
             return false;
         }
         if self.match_impl(algebra, std::slice::from_ref(ty), false) {
             return true;
         }
-        self.registry
+        let reverse_witness = self
+            .registry
             .algebras_bounded_by(algebra)
             .collect::<Vec<_>>()
             .into_iter()
-            .any(|other| self.has_matching_impl_inherited(other, ty, visited))
+            .any(|other| self.has_matching_impl_inherited(other, ty, visited));
+        if reverse_witness {
+            return true;
+        }
+        // Forward aggregate — see this method's own doc comment. Gated on
+        // *at least two* own bounds, not just "non-empty" — a real
+        // regression, found by testing immediately after the naive
+        // non-empty-only version landed: `Int<T> : Num` and `Float<T> :
+        // Num` are *siblings* sharing one parent, each with a single bound.
+        // Aggregating through a lone bound is exactly equivalent to asking
+        // "is `Num` satisfied *by any means at all*" — which let `i8`
+        // (a real `Int`) satisfy a `Float` query too, since `Num<i8>` holds
+        // via `Int`, and a single-bound aggregate for `Float` couldn't tell
+        // that apart from `Num<i8>` holding via `Float` itself. A single
+        // bound is a rename/specialization relationship, already fully
+        // covered by the reverse-witness direction above when checking the
+        // *parent* — it never legitimately needs its own forward direction.
+        // Two or more bounds is different in kind, not just degree: no
+        // single sibling can satisfy a multi-ingredient conjunction by
+        // accident the way one sibling can satisfy a shared single parent.
+        let own_bounds = self.registry.algebra_bounds(algebra).to_vec();
+        own_bounds.len() >= 2 && own_bounds.iter().all(|b| self.has_matching_impl_inherited(b, ty, visited))
     }
 
     /// Real, committing dispatch for a (possibly heterogeneous,

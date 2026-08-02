@@ -2,10 +2,13 @@
 //! `fn`/`impl` method in a compiled `Program` and renders each statement/tail
 //! alongside its resolved type. Top-level `fn`s go through
 //! `callgraph::infer_program` (real self/mutual-recursion support, one pass
-//! over the whole program); `impl` methods are still each inferred with
-//! their own fresh `Infer`, in isolation from every other `impl` method or
-//! `fn` (see `infer.rs`'s module docs on why that's a separate, still-open
-//! gap, not an oversight here).
+//! over the whole program); an inherent impl's own methods go through
+//! `Infer::infer_inherent_impl_block` (real self/mutual-recursion support
+//! *within one impl block*, sharing one `Infer`); an algebra impl's own
+//! methods are still each inferred with their own fresh `Infer`, in
+//! isolation from every other algebra-impl method or `fn` (dispatch is
+//! signature-driven there, not body-driven, so this has never actually been
+//! a gap for that case — see `infer.rs`'s module docs).
 
 use crate::ast::*;
 use crate::callgraph::{self, ProgramInference};
@@ -72,18 +75,16 @@ pub fn dump_program(program: &Program, registry: &Registry) -> (String, Vec<Type
             }
             ItemKind::InherentImpl(d) => {
                 let _ = writeln!(out, "impl {} {{", fmt_type(&d.target));
-                for f in &d.fns {
-                    dump_inherent_impl_fn(
-                        &mut out,
-                        &mut errors,
-                        f,
-                        registry,
-                        &program_inference.global_env,
-                        &d.generics,
-                        &d.target,
-                        item.span,
-                    );
-                }
+                dump_inherent_impl_block(
+                    &mut out,
+                    &mut errors,
+                    &d.fns,
+                    registry,
+                    &program_inference.global_env,
+                    &d.generics,
+                    &d.target,
+                    item.span,
+                );
                 let _ = writeln!(out, "}}");
             }
         }
@@ -199,10 +200,18 @@ fn dump_impl_fn(
     }
 }
 
-fn dump_inherent_impl_fn(
+/// Renders every method of *one* inherent impl block, sharing a single
+/// `Infer::infer_inherent_impl_block` call — real mutual recursion between
+/// two methods of the same struct, not just self-recursion (see that
+/// method's own doc comment). Replaced the earlier one-`Infer`-per-method
+/// version of this function, which made genuine mutual recursion between
+/// two separately-declared methods on the same struct impossible in
+/// principle: each method's own body was inferred in total isolation, with
+/// no way for one to see the other's still-open placeholder.
+fn dump_inherent_impl_block(
     out: &mut String,
     errors: &mut Vec<TypeError>,
-    f: &FnDecl,
+    fns: &[FnDecl],
     registry: &Registry,
     global_env: &Env,
     impl_generics: &[GenericParam],
@@ -210,24 +219,30 @@ fn dump_inherent_impl_fn(
     fallback_span: Span,
 ) {
     let mut infer = Infer::new(registry);
-    match infer.infer_inherent_impl_fn_generic(global_env, impl_generics, target, f, fallback_span) {
-        Ok(ret) => {
-            let mut names = TyVarNames::default();
-            let params: Vec<String> = f
-                .params
-                .iter()
-                .zip(infer.param_types.iter())
-                .map(|(p, t)| format!("{}: {}", p.name, fmt_ty_named(t, &mut names)))
-                .collect();
-            let ret = fmt_ty_named(&ret, &mut names);
-            let _ = writeln!(out, "fn {}({}) -> {ret} {{", f.name, params.join(", "));
-            dump_block(out, &f.body, &infer.node_types, &mut names, 1);
-            let _ = writeln!(out, "}}");
-        }
-        Err(e) => {
-            let params: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
-            let _ = writeln!(out, "fn {}({}) {{ /* type error, see diagnostics */ }}", f.name, params.join(", "));
-            errors.push(e);
+    let mut results = infer.infer_inherent_impl_block(global_env, impl_generics, target, fns, fallback_span);
+    for f in fns {
+        match results.remove(&f.name) {
+            Some(Ok((param_types, ret))) => {
+                let mut names = TyVarNames::default();
+                let params: Vec<String> = f
+                    .params
+                    .iter()
+                    .zip(param_types.iter())
+                    .map(|(p, t)| format!("{}: {}", p.name, fmt_ty_named(t, &mut names)))
+                    .collect();
+                let ret = fmt_ty_named(&ret, &mut names);
+                let _ = writeln!(out, "fn {}({}) -> {ret} {{", f.name, params.join(", "));
+                dump_block(out, &f.body, &infer.node_types, &mut names, 1);
+                let _ = writeln!(out, "}}");
+            }
+            Some(Err(e)) => {
+                let params: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
+                let _ = writeln!(out, "fn {}({}) {{ /* type error, see diagnostics */ }}", f.name, params.join(", "));
+                errors.push(e);
+            }
+            // `infer_inherent_impl_block` always inserts exactly one entry
+            // per `fns` -- unreachable outside a bug in that invariant.
+            None => unreachable!("infer_inherent_impl_block did not report a result for `{}`", f.name),
         }
     }
 }

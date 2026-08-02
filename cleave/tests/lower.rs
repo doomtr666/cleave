@@ -26,6 +26,54 @@ fn only_stmt_expr(body: &Block) -> &Expr {
 }
 
 #[test]
+fn array_repeat_literal_desugars_to_n_copies() {
+    let f = lower_one_fn("fn f() { [0.0; 4] }");
+    match &only_stmt_expr(&f.body).kind {
+        ExprKind::ArrayLit(elems) => {
+            assert_eq!(elems.len(), 4);
+            for e in elems {
+                assert!(matches!(&e.kind, ExprKind::NumberLit { text, .. } if text == "0.0"));
+            }
+        }
+        other => panic!("expected ArrayLit, got {other:?}"),
+    }
+}
+
+#[test]
+fn array_repeat_literals_own_copies_each_get_a_distinct_node_id() {
+    // Every other node in the AST is unique per occurrence (see `ast.rs`'s
+    // own `NodeId` doc comment) -- a repeat literal's own desugared copies
+    // must be too, or `node_types` (keyed by `NodeId`) would silently
+    // collapse them into one entry.
+    let f = lower_one_fn("fn f() { [1; 3] }");
+    match &only_stmt_expr(&f.body).kind {
+        ExprKind::ArrayLit(elems) => {
+            let ids: std::collections::HashSet<NodeId> = elems.iter().map(|e| e.id).collect();
+            assert_eq!(ids.len(), 3, "expected 3 distinct NodeIds, got {ids:?}");
+        }
+        other => panic!("expected ArrayLit, got {other:?}"),
+    }
+}
+
+#[test]
+fn array_repeat_literal_with_zero_count_is_an_empty_array() {
+    let f = lower_one_fn("fn f() { [1; 0] }");
+    match &only_stmt_expr(&f.body).kind {
+        ExprKind::ArrayLit(elems) => assert!(elems.is_empty()),
+        other => panic!("expected ArrayLit, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_ordinary_comma_separated_array_literal_still_lowers_unaffected() {
+    let f = lower_one_fn("fn f() { [1, 2, 3] }");
+    match &only_stmt_expr(&f.body).kind {
+        ExprKind::ArrayLit(elems) => assert_eq!(elems.len(), 3),
+        other => panic!("expected ArrayLit, got {other:?}"),
+    }
+}
+
+#[test]
 fn lambda_lowers_with_params_and_body() {
     let f = lower_one_fn("fn f() { fn(a, b) { a + b } }");
     match &only_stmt_expr(&f.body).kind {

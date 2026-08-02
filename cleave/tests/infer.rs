@@ -49,6 +49,19 @@ fn lower_one_inherent_impl(src: &str) -> (Type, Vec<GenericParam>, FnDecl, Span)
     panic!("no inherent impl item found in {src:?}");
 }
 
+/// Like `lower_one_inherent_impl`, but returns *every* method of the impl
+/// block, for `Infer::infer_inherent_impl_block` — needed for mutual-
+/// recursion tests, which require at least two methods sharing one `Infer`.
+fn lower_inherent_impl(src: &str) -> (Type, Vec<GenericParam>, Vec<FnDecl>, Span) {
+    let program = lower_program(src);
+    for item in program.items {
+        if let ItemKind::InherentImpl(d) = item.kind {
+            return (d.target, d.generics, d.fns, item.span);
+        }
+    }
+    panic!("no inherent impl item found in {src:?}");
+}
+
 /// A **test-only** fixture standing in for a real stdlib â€” `infer_call` no
 /// longer special-cases operator names at all (see its own doc comment), so
 /// most of these tests need *some* declared algebra backing `add`/`lt`/`and`
@@ -342,6 +355,78 @@ fn cyclic_algebra_bounds_reject_cleanly_instead_of_looping_forever() {
     let mut infer = Infer::new(&registry);
     let err = infer.infer_fn(&f).unwrap_err();
     assert!(matches!(&err.kind, TypeErrorKind::MissingImpl { algebra, .. } if algebra == "A"), "got: {:?}", err.kind);
+}
+
+#[test]
+fn a_two_ingredient_algebra_is_satisfied_by_impls_of_both_ingredients_alone() {
+    // The mirror image of `algebra_bound_inheritance_lets_a_narrower_impl_
+    // satisfy_a_wider_bound` above: there, the concrete impl sits on the
+    // *more specific* side (`Int<i32>` witnessing `Num<i32>`). Here it sits
+    // on the *more general* side(s) instead -- `AdditiveMonoid<i32>` and
+    // `MultiplicativeMonoid<i32>` together witness `Semiring<i32>`, with no
+    // separate (even empty) `impl Semiring<i32>` anywhere.
+    let registry = registry_from(
+        "algebra AdditiveMonoid<T> { fn add(a: T, b: T) -> T; }
+         algebra MultiplicativeMonoid<T> { fn mul(a: T, b: T) -> T; }
+         algebra Semiring<T> : AdditiveMonoid + MultiplicativeMonoid {}
+         impl AdditiveMonoid<i32> { fn add(a, b) { a } }
+         impl MultiplicativeMonoid<i32> { fn mul(a, b) { a } }",
+    );
+    let f = lower_one_fn("fn f<T: Semiring>(x: T) -> i32 { x }");
+    let mut infer = Infer::new(&registry);
+    let ty = infer.infer_fn(&f).unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(ty, Ty::Con("i32".to_string()));
+}
+
+#[test]
+fn a_single_bound_algebra_does_not_aggregate_and_cannot_be_satisfied_by_its_own_parent() {
+    // Same shape as the two-ingredient case above, minus one ingredient --
+    // deliberately must *not* work the same way. A single bound is a
+    // rename/specialization relationship (already covered by the reverse-
+    // witness direction when checking the *parent*), not a composition; the
+    // forward-aggregate direction is gated on 2+ bounds specifically to
+    // avoid exactly this collapsing into "checking `Semiring<i32>` is the
+    // same as checking `AdditiveMonoid<i32>`" if it fired for one bound too.
+    let registry = registry_from(
+        "algebra AdditiveMonoid<T> { fn add(a: T, b: T) -> T; }
+         algebra Semiring<T> : AdditiveMonoid {}
+         impl AdditiveMonoid<i32> { fn add(a, b) { a } }",
+    );
+    let f = lower_one_fn("fn f<T: Semiring>(x: T) -> i32 { x }");
+    let mut infer = Infer::new(&registry);
+    let err = infer.infer_fn(&f).unwrap_err();
+    assert!(
+        matches!(&err.kind, TypeErrorKind::MissingImpl { algebra, .. } if algebra == "Semiring"),
+        "got: {:?}",
+        err.kind
+    );
+}
+
+#[test]
+fn sibling_algebras_sharing_one_parent_bound_do_not_leak_into_each_other() {
+    // The actual regression, found by testing right after the naive
+    // "non-empty bounds -> aggregate" version of this fix landed: `Int` and
+    // `Float` are siblings, each with a *single* bound on `Num`. A version
+    // that aggregated through any non-empty bound list let `i8` (a real
+    // `Int`) also satisfy a `Float` query, since `Num<i8>` holds (via
+    // `Int`) and a single-bound aggregate for `Float` couldn't distinguish
+    // that from `Num<i8>` holding via `Float` itself. Mirrors `stdlib/num/
+    // num.cleave`'s own real shape exactly (see `tests/stdlib.rs`'s own
+    // equivalent check against the real stdlib file).
+    let registry = registry_from(
+        "algebra Num<T> {}
+         algebra Int<T> : Num {}
+         algebra Float<T> : Num {}
+         impl Int<i8> {}",
+    );
+    let f = lower_one_fn("fn f<T: Float>(x: T) -> i8 { x }");
+    let mut infer = Infer::new(&registry);
+    let err = infer.infer_fn(&f).unwrap_err();
+    assert!(
+        matches!(&err.kind, TypeErrorKind::MissingImpl { algebra, .. } if algebra == "Float"),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -1789,6 +1874,71 @@ fn a_self_recursive_unannotated_inherent_method_infers_its_own_return_type() {
         .infer_inherent_impl_fn_generic(&cleave::infer::Env::new(), &generics, &target, &f, span)
         .unwrap_or_else(|e| panic!("{e:?}"));
     assert_eq!(ty, Ty::Con("i32".to_string()));
+}
+
+#[test]
+fn two_mutually_recursive_inherent_methods_infer_correctly() {
+    // The narrower gap `in_progress_methods` (single self-only slot)
+    // couldn't close: `is_even`/`is_odd`, as *separately declared* methods
+    // on the same struct, each calling the other -- neither self-recursive.
+    // Real bug this closes: each method used to be inferred with its own
+    // fresh `Infer`, in total isolation, so a recursive call to the *other*
+    // method (still mid-inference, in a completely different `Infer`
+    // instance) always deferred to `<not-yet-inferred>`, which then failed
+    // to unify with the `if`'s other branch. Fixed by `Infer::
+    // infer_inherent_impl_block`, which shares one `Infer` across every
+    // method of one impl block and seeds all their placeholders up front,
+    // mirroring `callgraph.rs`'s own group-based treatment of mutually
+    // recursive top-level `fn`s.
+    let registry = registry_from(
+        "algebra Ord<T> { fn eq(a: T, b: T) -> bool; }
+         impl Ord<i32> { fn eq(a, b) { true } }
+         algebra Ring<T> { fn sub(a: T, b: T) -> T; }
+         impl Ring<i32> { fn sub(a, b) { a } }
+         struct Wrap { n : i32 }",
+    );
+    let (target, generics, fns, span) = lower_inherent_impl(
+        "impl struct Wrap {
+            fn dec(w) -> Wrap { Wrap(n: w.n - 1) }
+            fn is_even(w) {
+                if eq(w.n, 0) { true } else { w.dec().is_odd() }
+            }
+            fn is_odd(w) {
+                if eq(w.n, 0) { false } else { w.dec().is_even() }
+            }
+        }",
+    );
+    let mut infer = Infer::new(&registry);
+    let results = infer.infer_inherent_impl_block(&cleave::infer::Env::new(), &generics, &target, &fns, span);
+    let is_even = results.get("is_even").unwrap().as_ref().unwrap_or_else(|e| panic!("{e:?}"));
+    let is_odd = results.get("is_odd").unwrap().as_ref().unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(is_even.1, Ty::Con("bool".to_string()));
+    assert_eq!(is_odd.1, Ty::Con("bool".to_string()));
+}
+
+#[test]
+fn a_single_self_recursive_method_still_works_through_infer_inherent_impl_block() {
+    // The block-level entry point, exercised with just one method -- a
+    // regression guard for the refactor `infer_inherent_impl_block` was
+    // built from (`infer_inherent_impl_fn_raw`, factored out of the
+    // existing single-method `infer_inherent_impl_fn_generic`), not a new
+    // capability on its own.
+    let registry = registry_from(
+        "algebra Ord<T> { fn eq(a: T, b: T) -> bool; }
+         impl Ord<i32> { fn eq(a, b) { true } }
+         struct Wrap { n : i32 }",
+    );
+    let (target, generics, fns, span) = lower_inherent_impl(
+        "impl struct Wrap {
+            fn countdown(w) {
+                if eq(w.n, 0) { 0 } else { w.countdown() }
+            }
+        }",
+    );
+    let mut infer = Infer::new(&registry);
+    let results = infer.infer_inherent_impl_block(&cleave::infer::Env::new(), &generics, &target, &fns, span);
+    let countdown = results.get("countdown").unwrap().as_ref().unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(countdown.1, Ty::Con("i32".to_string()));
 }
 
 // ---------------------------------------------------------------------
