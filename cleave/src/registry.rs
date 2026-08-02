@@ -21,6 +21,13 @@ use std::collections::HashMap;
 pub struct Registry {
     algebras: HashMap<String, AlgebraEntry>,
     structs: HashMap<String, StructEntry>,
+    /// Struct name -> method name -> entry. No candidate/ambiguity handling
+    /// needed the way algebra dispatch has (`algebras_with_fn`,
+    /// `AmbiguousOperator`): `driver::merge_programs`' own duplicate-method
+    /// detection already guarantees at most one method of a given name
+    /// exists per struct, so a lookup here is either "the" method or none —
+    /// see `Infer`'s own method-call handling.
+    inherent_methods: HashMap<String, HashMap<String, InherentMethodEntry>>,
 }
 
 struct StructEntry {
@@ -28,8 +35,25 @@ struct StructEntry {
     fields: Vec<Field>,
 }
 
+#[derive(Clone)]
+pub struct InherentMethodEntry {
+    /// The *impl block's* own generics (`impl<T> Vec2<T> { ... }`) — not
+    /// necessarily spelled the same as the struct's own declared generic
+    /// names; the impl's own `target` (below) is what actually establishes
+    /// the correspondence, positionally, the same way an algebra impl's
+    /// target already does for the algebra's own generics.
+    pub generics: Vec<GenericParam>,
+    pub target: Type,
+    pub method: FnDecl,
+}
+
 struct AlgebraEntry {
     generics: Vec<GenericParam>,
+    /// Other algebras this one requires (`algebra Int<T> : Num { ... }`) —
+    /// see `Registry::algebra_bounds`'s own doc comment for what this means
+    /// and where it's actually enforced (not here — `Registry` stays just
+    /// data, see the module doc).
+    bounds: Vec<String>,
     sigs: Vec<FnSig>,
     /// Keyed by the target type's canonical string (`fmt_type`) — same
     /// grouping key `driver.rs` uses to merge `impl` fragments.
@@ -46,6 +70,12 @@ struct ImplEntry {
     /// recognize an *exact* previously-declared spelling.
     generics: Vec<GenericParam>,
     target: Type,
+    /// Second and later targets, for a heterogeneous algebra
+    /// (`algebra MatMul<A, B, C>`) — empty for every single-generic algebra
+    /// (i.e. almost always). See `ImplDecl::extra_targets`'s own doc
+    /// comment for why this stays a separate field rather than folding
+    /// `target` into a single always-a-`Vec` shape.
+    extra_targets: Vec<Type>,
     #[allow(dead_code)]
     fns: Vec<FnDecl>,
 }
@@ -66,6 +96,7 @@ impl Registry {
                     .collect();
                 algebras.entry(d.name.clone()).or_insert_with(|| AlgebraEntry {
                     generics: d.generics.clone(),
+                    bounds: d.bounds.clone(),
                     sigs,
                     impls: HashMap::new(),
                 });
@@ -76,6 +107,7 @@ impl Registry {
             if let ItemKind::Impl(d) = &item.kind {
                 let entry = algebras.entry(d.algebra.clone()).or_insert_with(|| AlgebraEntry {
                     generics: Vec::new(),
+                    bounds: Vec::new(),
                     sigs: Vec::new(),
                     impls: HashMap::new(),
                 });
@@ -89,10 +121,19 @@ impl Registry {
                 // overwhelmingly common non-generic case, so this key is
                 // identical to the old plain `fmt_type` one wherever
                 // `has_impl_named`'s fast lookup actually depends on it.
-                let key = format!("{}{}", fmt_type(&d.target), fmt_generics(&d.generics));
+                // `extra_targets` folded in the same way, for the same
+                // reason — two heterogeneous impls sharing a first target
+                // but differing afterward must stay distinct too.
+                let extra_targets_key: String = d.extra_targets.iter().map(fmt_type).collect();
+                let key = format!("{}{}{}", fmt_type(&d.target), extra_targets_key, fmt_generics(&d.generics));
                 entry.impls.insert(
                     key,
-                    ImplEntry { generics: d.generics.clone(), target: d.target.clone(), fns: d.fns.clone() },
+                    ImplEntry {
+                        generics: d.generics.clone(),
+                        target: d.target.clone(),
+                        extra_targets: d.extra_targets.clone(),
+                        fns: d.fns.clone(),
+                    },
                 );
             }
         }
@@ -108,7 +149,30 @@ impl Registry {
             }
         }
 
-        Registry { algebras, structs }
+        let mut inherent_methods: HashMap<String, HashMap<String, InherentMethodEntry>> = HashMap::new();
+        for item in &program.items {
+            if let ItemKind::InherentImpl(d) = &item.kind {
+                // Only a bare/generic *path* target names a struct at all —
+                // an inherent impl on, say, an array type has nowhere to
+                // register itself usefully (nothing could ever dispatch a
+                // method call to it, since dispatch always starts from a
+                // resolved struct name); silently unindexed rather than a
+                // hard error, matching this file's "just data, no
+                // validation" stance (a real diagnostic for this, if
+                // wanted, belongs in `infer.rs` alongside its other
+                // `pending_type_name_checks`-style checks, not here).
+                let TypeKind::Path(p, _) = &d.target.kind else { continue };
+                let struct_name = p.segments.join("::");
+                for f in &d.fns {
+                    inherent_methods.entry(struct_name.clone()).or_default().insert(
+                        f.name.clone(),
+                        InherentMethodEntry { generics: d.generics.clone(), target: d.target.clone(), method: f.clone() },
+                    );
+                }
+            }
+        }
+
+        Registry { algebras, structs, inherent_methods }
     }
 
     /// Does `algebra` have an `impl` for this concrete target type? String
@@ -163,6 +227,27 @@ impl Registry {
         self.algebras.contains_key(algebra)
     }
 
+    /// Other algebras `algebra` itself requires (`algebra Int<T> : Num {
+    /// ... }` — `Registry::generics(Int)` returns `bounds: ["Num"]`). Mirrors
+    /// a `GenericParam::Type`'s own `bounds` field, one level up: instead of
+    /// constraining a caller's generic parameter, this constrains *every*
+    /// type any `impl` of `Int` is ever declared for — the actual check
+    /// (`Int<i32>` existing implies `Num<i32>` must too) lives in
+    /// `Infer::match_impl`, not here (`Registry` stays just data, see the
+    /// module doc).
+    pub fn algebra_bounds(&self, algebra: &str) -> &[String] {
+        self.algebras.get(algebra).map(|e| e.bounds.as_slice()).unwrap_or(&[])
+    }
+
+    /// The reverse of `algebra_bounds`: every algebra that names `algebra`
+    /// among its *own* bounds (`Int` and `Float` both, for `algebras_bounded_
+    /// by("Num")`, once `algebra Int<T> : Num` / `algebra Float<T> : Num`
+    /// exist) — what `Infer::has_matching_impl` walks to check "does some
+    /// *other*, more specific algebra's impl count as this one too".
+    pub fn algebras_bounded_by<'a>(&'a self, algebra: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.algebras.iter().filter(move |(_, e)| e.bounds.iter().any(|b| b == algebra)).map(|(name, _)| name.as_str())
+    }
+
     /// Every declared algebra's name — used by `Infer::check_no_overlapping_impls`
     /// to sweep the whole registry once, rather than being told which
     /// algebras exist by some other, already-scoped caller.
@@ -190,20 +275,63 @@ impl Registry {
         self.structs.get(name).map(|e| e.generics.as_slice()).unwrap_or(&[])
     }
 
-    /// Every impl of `algebra` whose *own* target is a pattern rather than a
-    /// concrete type (`impl<T: Float> Ring<Complex<T>>` — has generic
-    /// parameters of its own, distinct from the algebra's own `<T>`), each
-    /// as `(generics, target)` — for `Infer::has_matching_impl`'s real,
-    /// unification-based matching. Excludes the common non-generic case
-    /// entirely; those are still served by the plain, fast `has_impl_named`.
+    /// The struct's own inherent method named `method_name`, if any — see
+    /// `InherentMethodEntry`'s own doc comment for why this is a plain
+    /// lookup, no ambiguity/candidate handling.
+    pub fn inherent_method(&self, struct_name: &str, method_name: &str) -> Option<&InherentMethodEntry> {
+        self.inherent_methods.get(struct_name)?.get(method_name)
+    }
+
+    /// Every *single-target* impl of `algebra` whose own target is a
+    /// pattern rather than a concrete type (`impl<T: Float>
+    /// Ring<Complex<T>>` — has generic parameters of its own, distinct from
+    /// the algebra's own `<T>`), each as `(generics, target)` — for
+    /// `Infer::has_matching_impl`'s real, unification-based matching.
+    /// Excludes the common non-generic case entirely (still served by the
+    /// plain, fast `has_impl_named`) *and* excludes every multi-target,
+    /// heterogeneous impl (`extra_targets` non-empty) — `has_matching_impl`
+    /// only ever checks *one* type against *one* pattern, so matching just
+    /// a heterogeneous impl's own first target in isolation would be
+    /// structurally meaningless (it says nothing about whether the *other*
+    /// targets could also be satisfied); those go through
+    /// `multi_target_impls`/`Infer::has_matching_impl_multi` instead, which
+    /// checks every target together, coherently.
     pub fn generic_impls(&self, algebra: &str) -> Vec<(&[GenericParam], &Type)> {
         self.algebras
             .get(algebra)
             .map(|e| {
                 e.impls
                     .values()
-                    .filter(|i| !i.generics.is_empty())
+                    .filter(|i| !i.generics.is_empty() && i.extra_targets.is_empty())
                     .map(|i| (i.generics.as_slice(), &i.target))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// *Every* impl of `algebra`, uniformly, each as `(generics, all
+    /// targets in declaration order)` — single-target or heterogeneous,
+    /// generic or fully concrete alike, no filtering at all (unlike
+    /// `generic_impls`, which deliberately excludes the cases already
+    /// served by the fast string-keyed `has_impl_named`). For
+    /// `Infer::dispatch_algebra_call`'s own real, *committing* dispatch:
+    /// even a fully concrete, non-generic impl needs real unification
+    /// (not just a string-equality check) whenever the *query* side still
+    /// has an unresolved slot of its own — a generic appearing only in an
+    /// algebra fn's return type, never independently pinned by any
+    /// argument, is exactly that case; unifying a `Var` against a known
+    /// concrete target is what actually binds it.
+    pub fn all_impls(&self, algebra: &str) -> Vec<(&[GenericParam], Vec<&Type>)> {
+        self.algebras
+            .get(algebra)
+            .map(|e| {
+                e.impls
+                    .values()
+                    .map(|i| {
+                        let targets: Vec<&Type> =
+                            std::iter::once(&i.target).chain(i.extra_targets.iter()).collect();
+                        (i.generics.as_slice(), targets)
+                    })
                     .collect()
             })
             .unwrap_or_default()

@@ -9,8 +9,8 @@
 
 use crate::ast::*;
 use crate::callgraph::{self, ProgramInference};
-use crate::infer::{Infer, Ty, TyVar, TypeError};
-use crate::print::{fmt_params, fmt_type};
+use crate::infer::{Env, Infer, Ty, TyVar, TypeError};
+use crate::print::{fmt_params, fmt_turbofish, fmt_type};
 use crate::registry::Registry;
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -50,9 +50,39 @@ pub fn dump_program(program: &Program, registry: &Registry) -> (String, Vec<Type
             }
             ItemKind::Fn(f) => dump_program_fn(&mut out, &mut errors, f, &program_inference),
             ItemKind::Impl(d) => {
-                let _ = writeln!(out, "impl {}<{}> {{", d.algebra, fmt_type(&d.target));
+                let targets: Vec<String> =
+                    std::iter::once(&d.target).chain(d.extra_targets.iter()).map(fmt_type).collect();
+                let _ = writeln!(out, "impl {}<{}> {{", d.algebra, targets.join(", "));
+                let all_targets: Vec<Type> =
+                    std::iter::once(d.target.clone()).chain(d.extra_targets.iter().cloned()).collect();
                 for f in &d.fns {
-                    dump_impl_fn(&mut out, &mut errors, f, registry, &d.algebra, &d.generics, &d.target, item.span);
+                    dump_impl_fn(
+                        &mut out,
+                        &mut errors,
+                        f,
+                        registry,
+                        &program_inference.global_env,
+                        &d.algebra,
+                        &d.generics,
+                        &all_targets,
+                        item.span,
+                    );
+                }
+                let _ = writeln!(out, "}}");
+            }
+            ItemKind::InherentImpl(d) => {
+                let _ = writeln!(out, "impl {} {{", fmt_type(&d.target));
+                for f in &d.fns {
+                    dump_inherent_impl_fn(
+                        &mut out,
+                        &mut errors,
+                        f,
+                        registry,
+                        &program_inference.global_env,
+                        &d.generics,
+                        &d.target,
+                        item.span,
+                    );
                 }
                 let _ = writeln!(out, "}}");
             }
@@ -140,13 +170,47 @@ fn dump_impl_fn(
     errors: &mut Vec<TypeError>,
     f: &FnDecl,
     registry: &Registry,
+    global_env: &Env,
     algebra: &str,
+    impl_generics: &[GenericParam],
+    targets: &[Type],
+    fallback_span: Span,
+) {
+    let mut infer = Infer::new(registry);
+    match infer.infer_impl_fn_generic_with_env(global_env, algebra, impl_generics, targets, f, fallback_span) {
+        Ok(ret) => {
+            let mut names = TyVarNames::default();
+            let params: Vec<String> = f
+                .params
+                .iter()
+                .zip(infer.param_types.iter())
+                .map(|(p, t)| format!("{}: {}", p.name, fmt_ty_named(t, &mut names)))
+                .collect();
+            let ret = fmt_ty_named(&ret, &mut names);
+            let _ = writeln!(out, "fn {}({}) -> {ret} {{", f.name, params.join(", "));
+            dump_block(out, &f.body, &infer.node_types, &mut names, 1);
+            let _ = writeln!(out, "}}");
+        }
+        Err(e) => {
+            let params: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
+            let _ = writeln!(out, "fn {}({}) {{ /* type error, see diagnostics */ }}", f.name, params.join(", "));
+            errors.push(e);
+        }
+    }
+}
+
+fn dump_inherent_impl_fn(
+    out: &mut String,
+    errors: &mut Vec<TypeError>,
+    f: &FnDecl,
+    registry: &Registry,
+    global_env: &Env,
     impl_generics: &[GenericParam],
     target: &Type,
     fallback_span: Span,
 ) {
     let mut infer = Infer::new(registry);
-    match infer.infer_impl_fn_generic(algebra, impl_generics, target, f, fallback_span) {
+    match infer.infer_inherent_impl_fn_generic(global_env, impl_generics, target, f, fallback_span) {
         Ok(ret) => {
             let mut names = TyVarNames::default();
             let params: Vec<String> = f
@@ -212,8 +276,13 @@ fn fmt_expr_typed(e: &Expr, node_types: &NodeTypes, names: &mut TyVarNames) -> S
         ExprKind::ImaginaryLit { text, .. } => format!("{text}i"),
         ExprKind::BoolLit(b) => b.to_string(),
         ExprKind::Path(p) => p.segments.join("::"),
-        ExprKind::Call(path, args) => {
-            format!("{}({})", path.segments.join("::"), fmt_expr_list_typed(args, node_types, names))
+        ExprKind::Call(path, generics, args) => {
+            format!(
+                "{}{}({})",
+                path.segments.join("::"),
+                fmt_turbofish(generics),
+                fmt_expr_list_typed(args, node_types, names)
+            )
         }
         ExprKind::FieldAccess(base, name) => format!("{}.{name}", fmt_expr_typed(base, node_types, names)),
         ExprKind::MethodCall(base, name, args) => {
@@ -227,9 +296,10 @@ fn fmt_expr_typed(e: &Expr, node_types: &NodeTypes, names: &mut TyVarNames) -> S
             format!("{}[{}]", fmt_expr_typed(base, node_types, names), fmt_expr_typed(idx, node_types, names))
         }
         ExprKind::ArrayLit(elems) => format!("[{}]", fmt_expr_list_typed(elems, node_types, names)),
-        ExprKind::StructLit(path, fields) => format!(
-            "{}({})",
+        ExprKind::StructLit(path, generics, fields) => format!(
+            "{}{}({})",
             path.segments.join("::"),
+            fmt_turbofish(generics),
             fields
                 .iter()
                 .map(|(name, v)| format!("{name}: {}", fmt_expr_typed(v, node_types, names)))

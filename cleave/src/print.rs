@@ -54,6 +54,7 @@ impl Printer {
             ItemKind::Struct(d) => self.print_struct_decl(d),
             ItemKind::Algebra(d) => self.print_algebra_decl(d),
             ItemKind::Impl(d) => self.print_impl_decl(d),
+            ItemKind::InherentImpl(d) => self.print_inherent_impl_decl(d),
             ItemKind::Fn(d) => self.print_fn_decl(d),
         }
     }
@@ -88,7 +89,18 @@ impl Printer {
     }
 
     fn print_impl_decl(&mut self, d: &ImplDecl) {
-        self.line(format!("impl {}<{}> {{", d.algebra, fmt_type(&d.target)));
+        let targets: Vec<String> = std::iter::once(&d.target).chain(d.extra_targets.iter()).map(fmt_type).collect();
+        self.line(format!("impl{} {}<{}> {{", fmt_generics(&d.generics), d.algebra, targets.join(", ")));
+        self.indented(|p| {
+            for f in &d.fns {
+                p.print_fn_decl(f);
+            }
+        });
+        self.line("}");
+    }
+
+    fn print_inherent_impl_decl(&mut self, d: &InherentImplDecl) {
+        self.line(format!("impl{} {} {{", fmt_generics(&d.generics), fmt_type(&d.target)));
         self.indented(|p| {
             for f in &d.fns {
                 p.print_fn_decl(f);
@@ -186,7 +198,23 @@ pub(crate) fn fmt_type(ty: &Type) -> String {
             }
         }
         TypeKind::Array(elem, dim) => format!("[{}; {}]", fmt_type(elem), fmt_expr(dim)),
+        TypeKind::Fn(params, ret) => {
+            format!("({}) -> {}", params.iter().map(fmt_type).collect::<Vec<_>>().join(", "), fmt_type(ret))
+        }
     }
+}
+
+/// `pub(crate)`: reused by `dump.rs`. Renders an explicit turbofish
+/// (`::<f64, 4, 4>`), or `""` if `args` is empty — the overwhelmingly common
+/// case, since a struct/call's generics are normally inferred rather than
+/// spelled out. Shared by `Call`/`StructLit`'s own `fmt_expr` arms below.
+pub(crate) fn fmt_turbofish(args: &[GenericArg]) -> String {
+    if args.is_empty() {
+        return String::new();
+    }
+    let args: Vec<String> =
+        args.iter().map(|a| match a { GenericArg::Type(t) => fmt_type(t), GenericArg::Const(e) => fmt_expr(e) }).collect();
+    format!("::<{}>", args.join(", "))
 }
 
 /// `pub(crate)`: reused by `dump.rs` to render an expression's surface form
@@ -200,8 +228,13 @@ pub(crate) fn fmt_expr(e: &Expr) -> String {
         ExprKind::ImaginaryLit { text, .. } => format!("{text}i"),
         ExprKind::BoolLit(b) => b.to_string(),
         ExprKind::Path(p) => fmt_path(p),
-        ExprKind::Call(path, args) => {
-            format!("{}({})", fmt_path(path), args.iter().map(fmt_expr).collect::<Vec<_>>().join(", "))
+        ExprKind::Call(path, generics, args) => {
+            format!(
+                "{}{}({})",
+                fmt_path(path),
+                fmt_turbofish(generics),
+                args.iter().map(fmt_expr).collect::<Vec<_>>().join(", ")
+            )
         }
         ExprKind::FieldAccess(base, name) => format!("{}.{name}", fmt_expr(base)),
         ExprKind::MethodCall(base, name, args) => {
@@ -209,9 +242,10 @@ pub(crate) fn fmt_expr(e: &Expr) -> String {
         }
         ExprKind::Index(base, idx) => format!("{}[{}]", fmt_expr(base), fmt_expr(idx)),
         ExprKind::ArrayLit(elems) => format!("[{}]", elems.iter().map(fmt_expr).collect::<Vec<_>>().join(", ")),
-        ExprKind::StructLit(path, fields) => format!(
-            "{}({})",
+        ExprKind::StructLit(path, generics, fields) => format!(
+            "{}{}({})",
             fmt_path(path),
+            fmt_turbofish(generics),
             fields.iter().map(|(name, v)| format!("{name}: {}", fmt_expr(v))).collect::<Vec<_>>().join(", ")
         ),
         ExprKind::If { cond, then_branch, else_branch } => {

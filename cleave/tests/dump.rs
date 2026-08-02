@@ -116,6 +116,25 @@ fn a_generalized_self_recursive_function_does_not_show_a_contradictory_default_i
 }
 
 #[test]
+fn an_impl_method_can_call_an_ordinary_top_level_function() {
+    // A real bug, found by direct testing: an `impl` method's own `env` was
+    // always empty (`Env::new()`, never connected to `callgraph.rs`'s
+    // `global_env`) -- calling *any* top-level `fn`, even a wholly ordinary
+    // non-generic one, silently fell through to `infer_call`'s
+    // `<unresolved-call:...>` placeholder, with no error at all (the
+    // placeholder never happened to reach the impl method's own exposed
+    // signature). Fixed by seeding the method body's `env` with
+    // `ProgramInference::global_env` (`Infer::infer_impl_fn_generic_with_env`).
+    let src = "algebra TestAlg<T> { fn gt(x: T, y: T) -> bool; }
+        fn helper(x: i32) -> i32 { x }
+        impl TestAlg<i32> { fn gt(x, y) { helper(x); true } }
+        fn main() -> i32 { 0 }";
+    let (out, errs) = dump(src);
+    assert_eq!(errs, 0, "got:\n{out}");
+    assert!(out.contains("helper(x:i32):i32"), "got:\n{out}");
+}
+
+#[test]
 fn structs_and_algebras_are_shown_as_markers_not_omitted() {
     let (out, errs) = dump("struct Vec2 { x: f64, y: f64 }\nfn f() -> i32 { 0 }");
     assert_eq!(errs, 0, "got:\n{out}");

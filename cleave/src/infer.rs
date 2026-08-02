@@ -380,6 +380,11 @@ pub enum TypeErrorKind {
     MissingField { struct_name: String, field: String },
     /// A struct literal supplied the same field name more than once.
     DuplicateField { struct_name: String, field: String },
+    /// A method-call expression (`v.foo(...)`) whose base is a known,
+    /// concrete type with no inherent method by that name — either no
+    /// `impl` on that struct declares it, or the base isn't a struct at all
+    /// (a function value, array, or const — none of which have methods).
+    NoSuchMethod { struct_name: String, method: String },
     /// Two `impl`s of the same algebra declare their own generic target
     /// patterns in a way that could both match a common instantiation
     /// (`impl<T: Float> Ring<Complex<T>>` and `impl<T: Ord> Ring<Complex<T>>`
@@ -423,6 +428,9 @@ impl std::fmt::Display for TypeErrorKind {
             }
             TypeErrorKind::MissingField { struct_name, field } => {
                 write!(f, "`struct {struct_name}` construction is missing field `{field}`")
+            }
+            TypeErrorKind::NoSuchMethod { struct_name, method } => {
+                write!(f, "no method `{method}` on `{struct_name}`")
             }
             TypeErrorKind::DuplicateField { struct_name, field } => {
                 write!(f, "field `{field}` given more than once constructing `struct {struct_name}`")
@@ -680,6 +688,29 @@ pub struct Infer<'r> {
     /// `has_matching_impl`'s own doc comment already establishes for
     /// `self.subst`.
     pending_type_name_checks: Vec<(String, Span)>,
+    /// (struct, method) -> (param types, return-type placeholder) for
+    /// whichever *inherent* method is currently having its own body
+    /// inferred (`infer_inherent_impl_fn_generic`) — the impl-method
+    /// equivalent of a top-level `fn`'s own self-reference seeded into
+    /// `env` (see `infer_fn`). Consulted by `ExprKind::MethodCall`'s own
+    /// dispatch *before* falling back to the registry's static, declared
+    /// signature: an inherent method with no `->` annotation has nothing
+    /// else to offer a recursive call site (dispatch never re-runs a
+    /// callee's own body — see that arm's own doc comment on the narrower,
+    /// still-open gap this doesn't close: a call to a *different*,
+    /// similarly-unannotated method that hasn't started inferring yet still
+    /// falls through to the placeholder).
+    ///
+    /// Only ever holds at most one entry *per nesting level* in practice
+    /// (inherent methods are inferred one at a time, `dump.rs`'s own loop,
+    /// never concurrently) — a plain `HashMap` rather than a stack because
+    /// insert/remove already brackets each method's own body inference
+    /// correctly regardless of whether an outer entry happens to still be
+    /// present (a method calling a *different* struct's method while that
+    /// other struct's own method is *also* mid-inference — not reachable
+    /// today, since nothing infers two methods' bodies inside one another,
+    /// but harmless either way: each key is its own (struct, name) pair).
+    in_progress_methods: HashMap<(String, String), (Vec<Ty>, Ty)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -700,6 +731,7 @@ impl<'r> Infer<'r> {
             param_types: Vec::new(),
             quantified: HashSet::new(),
             pending_type_name_checks: Vec::new(),
+            in_progress_methods: HashMap::new(),
         }
     }
 
@@ -972,11 +1004,61 @@ impl<'r> Infer<'r> {
     /// mapping — the same bogus-literal-concrete-type-named-`"T"` bug
     /// `fn_generics_mapping` fixed for top-level `fn`s, here for `impl`
     /// targets instead.
+    ///
+    /// A thin wrapper over `infer_impl_fn_generic_with_env` with an empty
+    /// outer `env` — kept as a separate, stable entry point for the same
+    /// reason `infer_impl_fn` is: many existing direct callers (tests
+    /// especially) have no whole-program `global_env` to hand it and don't
+    /// need one.
     pub fn infer_impl_fn_generic(
         &mut self,
         algebra: &str,
         impl_generics: &[GenericParam],
         target: &Type,
+        f: &FnDecl,
+        fallback_span: Span,
+    ) -> Result<Ty, TypeError> {
+        self.infer_impl_fn_generic_with_env(
+            &Env::new(),
+            algebra,
+            impl_generics,
+            std::slice::from_ref(target),
+            f,
+            fallback_span,
+        )
+    }
+
+    /// Like `infer_impl_fn_generic`, but seeds the method body's own `env`
+    /// with `outer` first — every top-level `fn`'s finished, generalized
+    /// `Scheme` (`callgraph::infer_program`'s own `global_env`), so an impl
+    /// method's body can call an ordinary top-level function by name, not
+    /// just dispatch other algebra operators through the registry. Without
+    /// this, `env` was always empty (`Env::new()`), and *any* call to a
+    /// top-level `fn` from inside an impl method — even a wholly ordinary,
+    /// non-generic one — silently fell through to `infer_call`'s
+    /// `<unresolved-call:...>` placeholder, found by direct testing:
+    /// `impl TestAlg<i32> { fn gt(x, y) { helper(x); true } }` reported
+    /// `helper(x):<unresolved-call:helper>` with *no error at all*, since
+    /// the placeholder never happened to reach `gt`'s own exposed
+    /// signature. This closes that specific gap — not the harder, still-open
+    /// one: genuine mutual recursion *spanning* an impl method and a
+    /// top-level `fn` (`fn helper(x) { add(x, x) }` where `add` dispatches
+    /// into an impl method that itself calls `helper`) still isn't handled,
+    /// since the static call-graph scan `callgraph.rs` builds its SCC
+    /// grouping from has no way to know, without type information, *which*
+    /// impl an algebra-dispatched call like `add(x, y)` will actually target
+    /// — unlike an ordinary top-level call, resolved by name alone with no
+    /// ambiguity. `outer` here is always already a *finished* `global_env`
+    /// (built entirely before any impl method is ever inferred — see
+    /// `dump.rs`'s own ordering), so this doesn't need to solve that harder
+    /// problem to still be a real, sound improvement over an always-empty
+    /// `env`.
+    pub fn infer_impl_fn_generic_with_env(
+        &mut self,
+        outer: &Env,
+        algebra: &str,
+        impl_generics: &[GenericParam],
+        targets: &[Type],
         f: &FnDecl,
         fallback_span: Span,
     ) -> Result<Ty, TypeError> {
@@ -1000,26 +1082,34 @@ impl<'r> Infer<'r> {
         // The impl's *own* generics (`T` in `impl<T: Float> ...`) map to
         // fresh variables (with their own bounds pushed as real
         // `Constraint`s, exactly like a top-level `fn`'s own — see
-        // `fresh_generics_mapping`) *before* the target type itself is
+        // `fresh_generics_mapping`) *before* the target types themselves are
         // resolved, so `Complex<T>` becomes `App("Complex", [fresh])`, not a
         // bogus `App("Complex", [Con("T")])`.
         let impl_mapping = self.fresh_generics_mapping(impl_generics, fallback_span);
-        let target_ty = self.ty_from_ast_mapped(target, &impl_mapping);
+        let target_tys: Vec<Ty> = targets.iter().map(|t| self.ty_from_ast_mapped(t, &impl_mapping)).collect();
 
-        // The algebra's own generic parameter(s) bind directly to this
-        // impl's target type as a whole — `T` (the *algebra's* `T`) is
-        // literally `Complex<fresh>` throughout this whole method's
+        // The algebra's own generic parameters bind, *positionally*, to
+        // this impl's own targets — `T` (the algebra's own, first generic)
+        // is literally `Complex<fresh>` throughout this whole method's
         // inference, not a fresh variable disconnected from it.
         let generics = self.registry.generics(algebra).to_vec();
+        let mut target_ty_iter = target_tys.iter();
         let mapping: HashMap<String, Ty> = generics
             .iter()
             .filter_map(|g| match g {
-                GenericParam::Type { name, .. } => Some((name.clone(), target_ty.clone())),
+                // `.next()` per `Type` generic, in declaration order — the
+                // *positional* correspondence `targets` (and `target_tys`,
+                // built from it in the same order) already establishes; a
+                // `Const` generic on the algebra's own side consumes no
+                // target slot (const-generic algebra parameters aren't
+                // attempted — same scope this project's const-generics work
+                // has everywhere else it hasn't reached yet).
+                GenericParam::Type { name, .. } => target_ty_iter.next().map(|ty| (name.clone(), ty.clone())),
                 GenericParam::Const { .. } => None,
             })
             .collect();
 
-        let mut env = Env::new();
+        let mut env = outer.clone();
         let mut param_types = Vec::with_capacity(f.params.len());
         for (p, sig_p) in f.params.iter().zip(&sig.params) {
             let expected = match &sig_p.ty {
@@ -1056,6 +1146,120 @@ impl<'r> Infer<'r> {
         self.unify_at(result_span, &expected_ret, &result)?;
 
         self.finish_fn(f, param_types, result)
+    }
+
+    /// Infers one method of an *inherent* impl (`impl<T> Vec2<T> { fn
+    /// len(v) { ... } }`) — much simpler than `infer_impl_fn_generic_with_env`:
+    /// no algebra, so no declared `fn_sig` to conform to, no target-pattern
+    /// existence/coherence checking. Params are typed exactly like an
+    /// ordinary top-level `fn`'s own (annotated → resolved through
+    /// `impl_mapping`, so a `T`/`R`/`C` reference resolves to the impl's own
+    /// fresh generic instead of a bogus literal `Con("T")`; unannotated →
+    /// fresh var) — **except the first parameter**, which defaults to the
+    /// impl's own `target` type when left unannotated, exactly the same
+    /// "fall back to what the enclosing impl already declares" treatment an
+    /// *algebra* impl's own unannotated params already get from that
+    /// algebra's declared `fn_sig` (an inherent impl has no separate
+    /// signature to fall back to at all — the target itself is the closest
+    /// equivalent, and specifically *the first parameter's* role, "the
+    /// value this method belongs to", is already established by the impl
+    /// block itself: `impl Vec2 { fn len(v) { v.x } }` already says this
+    /// method is about `Vec2` values, so `v` defaulting to `Vec2` isn't new
+    /// magic, just the same "unannotated infers from context" this project
+    /// already does everywhere else). Found necessary by direct testing:
+    /// without this, `v.x` inside an unannotated `fn len(v) { v.x }` sees
+    /// `v` as a bare, totally unconstrained fresh var (nothing at
+    /// *declaration* time — as opposed to a *call site*, which does supply
+    /// a concrete `resolved_base` — ties it to `Vec2` at all), so
+    /// `FieldAccess` defers it as `<not-yet-inferred>`, which then survives
+    /// to the method's own exposed signature and fails
+    /// `check_no_placeholder` — a method that never mentions its own
+    /// receiver's type anywhere explicit could never type-check standalone
+    /// otherwise. If explicitly annotated anyway, checked against `target`
+    /// like anything else in this file that could carry two independent
+    /// truths, not trusted blindly. The body is inferred normally, the
+    /// declared return type (if any) checked against the body's own result
+    /// — then the same shared `finish_fn` tail every other inference entry
+    /// point uses. `outer` is `global_env`, same reasoning as
+    /// `infer_impl_fn_generic_with_env`'s own (an inherent method can call
+    /// an ordinary top-level `fn` too).
+    pub fn infer_inherent_impl_fn_generic(
+        &mut self,
+        outer: &Env,
+        impl_generics: &[GenericParam],
+        target: &Type,
+        f: &FnDecl,
+        fallback_span: Span,
+    ) -> Result<Ty, TypeError> {
+        let impl_mapping = self.fresh_generics_mapping(impl_generics, fallback_span);
+        let target_ty = self.ty_from_ast_mapped(target, &impl_mapping);
+        let param_types = self.inherent_method_param_tys(&f.params, &impl_mapping, &target_ty);
+        // Only meaningful at *declaration* time: a call site has no
+        // "annotation" of its own to double-check, just a concrete
+        // `resolved_base` unified against `param_tys[0]` directly (see
+        // `ExprKind::MethodCall`'s own handling) — but a declaration whose
+        // first parameter is annotated (`fn len(v: Vec2) { ... }`) must
+        // still agree with the impl's own target, not silently accept a
+        // second, independent truth.
+        if let Some(t) = f.params.first().and_then(|p| p.ty.as_ref()) {
+            self.unify_at(t.span, &target_ty, &param_types[0])?;
+        }
+
+        let mut env = outer.clone();
+        for (p, ty) in f.params.iter().zip(&param_types) {
+            env.insert(p.name.clone(), Scheme::mono(ty.clone()));
+        }
+
+        // Self-reference, the impl-method equivalent of `infer_fn`'s own
+        // seeded placeholder — see `in_progress_methods`'s own doc comment
+        // for why this lives there rather than in `env`: a recursive call
+        // goes through `ExprKind::MethodCall`'s own dispatch, which never
+        // consults `env` for its callee at all.
+        let self_key =
+            if let TypeKind::Path(p, _) = &target.kind { Some((p.segments.join("::"), f.name.clone())) } else { None };
+        let ret_var = self.vars.fresh();
+        if let Some(key) = &self_key {
+            self.in_progress_methods.insert(key.clone(), (param_types.clone(), ret_var.clone()));
+        }
+
+        let result = self.infer_block(&env, &f.body)?;
+        if let Some(ret) = &f.ret {
+            let declared = self.ty_from_ast_mapped(ret, &impl_mapping);
+            self.unify_at(ret.span, &declared, &result)?;
+        }
+        let result_span = f.body.tail.as_deref().map(|t| t.span).unwrap_or(fallback_span);
+        self.unify_at(result_span, &ret_var, &result)?;
+
+        if let Some(key) = &self_key {
+            self.in_progress_methods.remove(key);
+        }
+
+        self.finish_fn(f, param_types, result)
+    }
+
+    /// The "first parameter defaults to the impl's own target type when left
+    /// unannotated" convention shared by an inherent method's own
+    /// declaration (`infer_inherent_impl_fn_generic`) and a method call's
+    /// own dispatch (`ExprKind::MethodCall`) — see either call site's own
+    /// doc comment for why specifically the *first* parameter gets this
+    /// treatment (there's no magic `self`, just an ordinary positional
+    /// parameter whose role — "the value this method belongs to" — the
+    /// enclosing `impl` block already establishes). An explicitly annotated
+    /// parameter (any position) is resolved through `impl_mapping` like any
+    /// other type reference; deliberately doesn't unify or check anything
+    /// here — callers do that with whatever they specifically have on hand
+    /// (a concrete `resolved_base` at a call site, only `target_ty` itself
+    /// at declaration time).
+    fn inherent_method_param_tys(&mut self, params: &[Param], impl_mapping: &HashMap<String, Ty>, target_ty: &Ty) -> Vec<Ty> {
+        params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| match &p.ty {
+                Some(t) => self.ty_from_ast_mapped(t, impl_mapping),
+                None if i == 0 => target_ty.clone(),
+                None => self.vars.fresh(),
+            })
+            .collect()
     }
 
     /// Shared tail of `infer_fn`/`infer_impl_fn`: defaulting, the qualified-
@@ -1196,6 +1400,42 @@ impl<'r> Infer<'r> {
         Scheme { vars, constraints, ty }
     }
 
+    /// Every currently-pending constraint that shares at least one free
+    /// variable with `ty` (after `self.subst`) — copied, not removed, same
+    /// reasoning as `generalize`'s own sweep (a shared variable must stay
+    /// checkable from every type that exposes it, not just whichever call
+    /// claims it first). Unlike `generalize`'s own sweep, this doesn't
+    /// filter by "free in `ty` but not in some enclosing `env`" — there's no
+    /// quantification happening here, just forwarding whatever's still
+    /// unresolved so a *later* caller, once it pins the variable concrete,
+    /// can still check it.
+    ///
+    /// `callgraph.rs`'s own use: a *nullary* top-level `fn`'s returned type
+    /// can still carry a free variable with a real pending constraint on it
+    /// (`fn make_adder() { fn(x) { add(x, x) } }`'s returned closure's own
+    /// `T: Ring`) even though the Monomorphism Restriction means it's never
+    /// `generalize`d (see that module's own doc comment on why nullary
+    /// bindings skip generalization) — without this, found by direct
+    /// testing, the constraint silently vanished the moment that function's
+    /// own `Infer` instance (and its `self.constraints`) was discarded at
+    /// the end of its own group: `let f = make_adder(); f(true)` type-check
+    /// *succeeded*, with no `Ring<bool>` impl anywhere, because
+    /// `Scheme::mono` — the only thing crossing that group boundary for a
+    /// nullary binding — carries zero constraints by construction.
+    pub(crate) fn constraints_touching(&self, ty: &Ty) -> Vec<Constraint> {
+        let mut ty_fv = HashSet::new();
+        free_vars(&self.subst.apply(ty), &mut ty_fv);
+        self.constraints
+            .iter()
+            .filter(|c| {
+                let mut fv = HashSet::new();
+                free_vars(&self.subst.apply(&c.ty), &mut fv);
+                fv.iter().any(|v| ty_fv.contains(v))
+            })
+            .map(|c| Constraint { algebra: c.algebra.clone(), ty: self.subst.apply(&c.ty), span: c.span })
+            .collect()
+    }
+
     /// Instantiates a scheme with fresh type variables — every reference to
     /// a generalized binding gets its own independent copy, which is what
     /// lets e.g. `id(1)` and `id(true)` coexist against the same `∀a. a->a`.
@@ -1204,6 +1444,27 @@ impl<'r> Infer<'r> {
     /// this call site — each instantiation gets its own copy of "T: Ring",
     /// checked/propagated independently, same as the type variable itself.
     fn instantiate(&mut self, scheme: &Scheme) -> Ty {
+        self.instantiate_with_mapping(scheme).0
+    }
+
+    /// Like `instantiate`, but also hands back the fresh-variable mapping it
+    /// built — needed by `infer_call`'s explicit-turbofish handling, which
+    /// must unify each `f::<...>` argument against the *specific* fresh
+    /// variable standing in for one of `scheme.vars`, not just against
+    /// whatever position it happens to occupy in the substituted `Ty`
+    /// itself (a variable can appear in multiple places, or nowhere
+    /// syntactically obvious to zip against). `scheme.vars` is `generalize`'s
+    /// own numeric-sort of the quantified set — since a function's own
+    /// declared generics are minted as a single contiguous batch, in
+    /// declaration order, *before* anything else in its body (see
+    /// `fresh_fn_shape`), their `TyVar` ids stay lowest and in that same
+    /// order, so `scheme.vars`'s order reliably matches declaration order
+    /// for the common case. It does *not* if a declared generic never ends
+    /// up free in the function's own signature at all (an unused type
+    /// parameter) — a real, narrow edge case, not attempted here; a mismatch
+    /// there would show up as `generic_arg_to_ty`'s unification landing on
+    /// the wrong variable rather than a clean rejection.
+    fn instantiate_with_mapping(&mut self, scheme: &Scheme) -> (Ty, HashMap<TyVar, Ty>) {
         let mapping: HashMap<TyVar, Ty> = scheme.vars.iter().map(|v| (*v, self.vars.fresh())).collect();
         for c in &scheme.constraints {
             self.constraints.push(Constraint {
@@ -1212,7 +1473,7 @@ impl<'r> Infer<'r> {
                 span: c.span,
             });
         }
-        substitute(&scheme.ty, &mapping)
+        (substitute(&scheme.ty, &mapping), mapping)
     }
 
     /// Rejects two `impl`s of the same algebra whose own generic target
@@ -1244,23 +1505,39 @@ impl<'r> Infer<'r> {
     pub fn check_no_overlapping_impls(&mut self) -> Vec<TypeError> {
         let mut errors = Vec::new();
         for algebra in self.registry.algebra_names().map(str::to_string).collect::<Vec<_>>() {
-            let impls = self.registry.generic_impls(&algebra);
+            // `all_impls` (every target, single or multi, generic or fully
+            // concrete alike) rather than `generic_impls` (single-target
+            // generic only) — a heterogeneous algebra's own impls need the
+            // *whole* target tuple compared together: two impls overlap
+            // only if *every* position could coincide simultaneously, not
+            // just one. Concrete/non-generic impls ride along harmlessly
+            // (two differently-concrete targets simply never unify), no
+            // separate fast path needed for a check that only ever runs
+            // once, over the whole registry.
+            let impls = self.registry.all_impls(&algebra);
             for i in 0..impls.len() {
                 for j in (i + 1)..impls.len() {
-                    let (generics_a, target_a) = impls[i];
-                    let (generics_b, target_b) = impls[j];
+                    let (generics_a, targets_a) = &impls[i];
+                    let (generics_b, targets_b) = &impls[j];
+                    if targets_a.len() != targets_b.len() {
+                        continue;
+                    }
                     let mapping_a = self.fresh_vars_for_generics(generics_a);
                     let mapping_b = self.fresh_vars_for_generics(generics_b);
-                    let pattern_a = self.ty_from_ast_mapped(target_a, &mapping_a);
-                    let pattern_b = self.ty_from_ast_mapped(target_b, &mapping_b);
                     let mut trial = Subst::default();
-                    if unify(&mut trial, &pattern_a, &pattern_b).is_ok() {
+                    let all_overlap = targets_a.iter().zip(targets_b.iter()).all(|(ta, tb)| {
+                        let pattern_a = self.ty_from_ast_mapped(ta, &mapping_a);
+                        let pattern_b = self.ty_from_ast_mapped(tb, &mapping_b);
+                        unify(&mut trial, &pattern_a, &pattern_b).is_ok()
+                    });
+                    if all_overlap {
+                        let fmt_targets = |ts: &[&Type]| ts.iter().map(|t| fmt_type(t)).collect::<Vec<_>>().join(", ");
                         errors.push(TypeError {
-                            span: target_b.span,
+                            span: targets_b[0].span,
                             kind: TypeErrorKind::OverlappingImpls {
                                 algebra: algebra.clone(),
-                                a: fmt_type(target_a),
-                                b: fmt_type(target_b),
+                                a: fmt_targets(targets_a),
+                                b: fmt_targets(targets_b),
                             },
                         });
                     }
@@ -1270,39 +1547,76 @@ impl<'r> Infer<'r> {
         errors
     }
 
-    /// Checks whether `algebra` has an `impl` matching the *fully concrete*
-    /// `ty` — an exact canonical-string match for the overwhelmingly common
-    /// non-generic case (`Registry::has_impl_named`, a plain `HashMap`
-    /// lookup, tried first), or a real — but wholly speculative, see below —
-    /// unification against a generic impl's own target pattern otherwise
-    /// (`impl<T: Float> Ring<Complex<T>>`'s `Complex<T>`, treating the
-    /// impl's own `T` as a fresh variable), the piece `Registry` itself
-    /// can't do (it's deliberately just data, see its own module docs) since
-    /// only `Infer` has real unification machinery.
+    /// Checks whether `algebra` has an `impl` whose target pattern(s) unify,
+    /// positionally, against `query` — the shared engine behind
+    /// `has_matching_impl` (single-type existence probe, `commit = false`)
+    /// and `dispatch_algebra_call` (multi-type, `commit = true`); see each
+    /// wrapper's own doc comment for what distinguishes the two postures and
+    /// why both are needed. Candidates come from `Registry::all_impls`
+    /// (every impl of `algebra`, single- or multi-target, generic or fully
+    /// concrete alike — the piece `Registry` itself can't do this matching,
+    /// it's deliberately just data, see its own module docs); a mismatched
+    /// target-tuple length skips the candidate outright.
     ///
-    /// The unification against each candidate pattern runs against a
-    /// *cloned, throwaway* `Subst` (`trial`), never `self.subst` directly —
-    /// a match here is an existence probe ("does *some* impl apply"), not a
-    /// commitment to *which* one; permanently binding `self.subst` to
-    /// whichever candidate happened to be tried first would be arbitrary,
-    /// and a *failed* candidate must never leave partial bindings behind for
-    /// the next one to trip over. Fresh variables for the candidate's own
-    /// generics are minted via `fresh_vars_for_generics` specifically (not
-    /// `fresh_generics_mapping`) for the same reason: no bound should become
-    /// a *real*, persistent `Constraint` in `self.constraints` just because
-    /// one candidate was tried and rejected. Bounds are instead checked
-    /// directly, recursively (via this same method): a structural match
-    /// against `Complex<T>` alone isn't enough if `T`'s own resolved
-    /// argument doesn't actually satisfy `T: Float`.
-    fn has_matching_impl(&mut self, algebra: &str, ty: &Ty) -> bool {
-        if self.registry.has_impl_named(algebra, &ty.to_string()) {
-            return true;
+    /// For the overwhelmingly common single-target, fully-concrete case
+    /// (`add(1, 2)` against `impl Ring<i32>`), `Registry::has_impl_named`'s
+    /// plain `HashMap` lookup is tried first, before ever touching
+    /// unification.
+    ///
+    /// Each candidate's own unification runs against a *cloned* `Subst`
+    /// (`trial`), never `self.subst` directly — a rejected candidate must
+    /// never leave partial bindings behind for the next one to trip over.
+    /// Fresh variables for the candidate's own generics are minted via
+    /// `fresh_vars_for_generics` specifically (not `fresh_generics_mapping`)
+    /// for the same reason: no bound should become a *real*, persistent
+    /// `Constraint` in `self.constraints` just because one candidate was
+    /// tried and rejected — bounds are instead checked directly, recursively
+    /// (via `has_matching_impl`): a structural match against `Complex<T>`
+    /// alone isn't enough if `T`'s own resolved argument doesn't actually
+    /// satisfy `T: Float`.
+    ///
+    /// `commit`, once a candidate's target(s) unify *and* its bounds are
+    /// satisfied, decides whether that winning `trial` gets written back
+    /// into `self.subst` for real. `has_matching_impl` never commits — a
+    /// match there is only ever "does *some* impl apply", not a commitment
+    /// to *which* one, so permanently binding `self.subst` to whichever
+    /// candidate happened to be tried first would be arbitrary.
+    /// `dispatch_algebra_call` *must* commit: a generic appearing only in an
+    /// algebra fn's own *return* type (`C` in `fn mul(a: A, b: B) -> C;`) is
+    /// never independently constrained by a call's own arguments the way
+    /// `A`/`B` are — the only way to ever learn its concrete value is from a
+    /// successful match's own bindings. Safe specifically because
+    /// `check_no_overlapping_impls` already guarantees at most one impl's
+    /// target pattern can ever coherently match a given query tuple — no
+    /// "arbitrary pick among several" the way an uncommitted probe has to
+    /// stay neutral about. Checking the whole tuple together, positionally,
+    /// in one shared `trial`, also matters on its own (independent of
+    /// commit): a per-parameter loop calling `has_matching_impl`
+    /// independently, once per algebra generic, can't express "these two
+    /// parameters must resolve to types sharing one common impl
+    /// instantiation" — a shared impl-generic (`M` in `impl<T,N,M,K>
+    /// MatMul<Matrix<T,N,M>, Matrix<T,M,K>, Matrix<T,N,K>>`) could get bound
+    /// to two *different* concrete values across two independent checks and
+    /// neither call would ever notice — found by direct testing: `a * b` on
+    /// two mismatched-shape matrices type-checked with the call's own result
+    /// left as a bare, totally unconstrained variable.
+    fn match_impl(&mut self, algebra: &str, query: &[Ty], commit: bool) -> bool {
+        if let [ty] = query {
+            if self.registry.has_impl_named(algebra, &ty.to_string()) {
+                return true;
+            }
         }
-        for (generics, target) in self.registry.generic_impls(algebra) {
+        for (generics, targets) in self.registry.all_impls(algebra) {
+            if targets.len() != query.len() {
+                continue;
+            }
             let mapping = self.fresh_vars_for_generics(generics);
-            let pattern_ty = self.ty_from_ast_mapped(target, &mapping);
             let mut trial = self.subst.clone();
-            if unify(&mut trial, &pattern_ty, ty).is_err() {
+            let all_matched = targets.iter().zip(query).all(|(target, q)| {
+                let pattern_ty = self.ty_from_ast_mapped(target, &mapping);
+                unify(&mut trial, &pattern_ty, q).is_ok()
+            });
+            if !all_matched {
                 continue;
             }
             let bounds_satisfied = generics.iter().all(|g| match g {
@@ -1314,10 +1628,62 @@ impl<'r> Infer<'r> {
                 GenericParam::Const { .. } => true,
             });
             if bounds_satisfied {
+                if commit {
+                    self.subst = trial;
+                }
                 return true;
             }
         }
         false
+    }
+
+    /// Non-committing existence probe: does *some* impl of `algebra` apply
+    /// to the fully concrete `ty` — directly, or transitively through
+    /// algebra-bound inheritance (`algebra Int<T> : Num { }`: an `impl
+    /// Int<i32>`, with no separate `impl Num<i32>` anywhere, still satisfies
+    /// a `Num` bound, exactly the way stdlib's own `num.cleave` documents
+    /// wanting — see `Registry::algebra_bounds`'s own doc comment)? See
+    /// `match_impl`'s own doc comment for the shared engine underneath and
+    /// exactly what non-committing means here.
+    ///
+    /// Deliberately *not* threaded through `match_impl`/`dispatch_algebra_
+    /// call` itself — inheritance only makes sense for a marker/existence
+    /// check like this one. Dispatching an actual operator call needs a
+    /// *real* impl with a real fn body to run; you can't "borrow" `Ring::
+    /// mul`'s implementation from some other algebra `Ring` merely bounds
+    /// itself on, the way a bare existence check can borrow `Num`'s.
+    fn has_matching_impl(&mut self, algebra: &str, ty: &Ty) -> bool {
+        self.has_matching_impl_inherited(algebra, ty, &mut HashSet::new())
+    }
+
+    fn has_matching_impl_inherited(&mut self, algebra: &str, ty: &Ty, visited: &mut HashSet<String>) -> bool {
+        // Guards against a cyclic bound declaration (`algebra A : B` and
+        // `algebra B : A`) looping forever — a malformed program, but one
+        // that must fail cleanly (no matching impl found) rather than
+        // overflow the stack.
+        if !visited.insert(algebra.to_string()) {
+            return false;
+        }
+        if self.match_impl(algebra, std::slice::from_ref(ty), false) {
+            return true;
+        }
+        self.registry
+            .algebras_bounded_by(algebra)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .any(|other| self.has_matching_impl_inherited(other, ty, visited))
+    }
+
+    /// Real, committing dispatch for a (possibly heterogeneous,
+    /// possibly-multi-target) algebra call — checks `tys` together,
+    /// coherently, against `algebra`'s own impls, and on success writes the
+    /// winning match's bindings into `self.subst` for real. See
+    /// `match_impl`'s own doc comment for why commit is required here
+    /// specifically (an output-only generic can only ever be learned this
+    /// way) and why it's sound (`check_no_overlapping_impls` guarantees no
+    /// more than one impl could ever coherently match).
+    fn dispatch_algebra_call(&mut self, algebra: &str, tys: &[Ty]) -> bool {
+        self.match_impl(algebra, tys, true)
     }
 
     /// Checks every constraint still pending against the registry, once —
@@ -1484,6 +1850,10 @@ impl<'r> Infer<'r> {
                     _ => Ty::Con("<array-type-not-yet-inferred>".to_string()),
                 }
             }
+            TypeKind::Fn(params, ret) => Ty::Fn(
+                params.iter().map(|p| self.ty_from_ast_mapped(p, mapping)).collect(),
+                Box::new(self.ty_from_ast_mapped(ret, mapping)),
+            ),
         }
     }
 
@@ -1507,6 +1877,25 @@ impl<'r> Infer<'r> {
             ExprKind::BoolLit(b) => Some(Ty::Const(ConstValue::Bool(*b))),
             ExprKind::Path(p) if p.segments.len() == 1 => mapping.get(&p.segments[0]).cloned(),
             _ => None,
+        }
+    }
+
+    /// Resolves one explicit turbofish argument (`Matrix::<f64, 4, 4>`'s
+    /// `f64`/`4`, `fibonacci::<f64>`'s `f64`) to a `Ty` — always against an
+    /// *empty* generics mapping, unlike `ty_from_ast_mapped`'s other
+    /// callers: a turbofish argument naming one of the *enclosing*
+    /// function's own generic parameters by name (`fn g<U>() { f::<U>(x) }`)
+    /// isn't resolved correctly by this — it isn't threaded through
+    /// `infer_call`'s own signature — same "not attempted this increment,
+    /// flagged rather than silently wrong" posture as everywhere else a real
+    /// gap shows up in this file. The overwhelmingly common case (a concrete
+    /// type/const, `f64`/`4`/`true`) is unaffected by this limitation.
+    fn generic_arg_to_ty(&mut self, g: &GenericArg) -> Ty {
+        match g {
+            GenericArg::Type(t) => self.ty_from_ast(t),
+            GenericArg::Const(e) => {
+                self.const_value_from_expr(e, &HashMap::new()).unwrap_or_else(|| self.vars.fresh())
+            }
         }
     }
 
@@ -1577,11 +1966,14 @@ impl<'r> Infer<'r> {
                         let is_float = text.contains('.') || text.contains('e') || text.contains('E');
                         let default = if is_float { NumberDefault::Float } else { NumberDefault::Int };
                         self.pending_defaults.push((id, default));
-                        // "Num" *and* "Int"/"Float" — two independent
-                        // requirements, not one inheriting the other
-                        // (algebra-bound inheritance isn't implemented
-                        // anywhere in the registry yet — see
-                        // `stdlib/num/num.cleave`'s own doc comment). The
+                        // "Num" *and* "Int"/"Float", explicitly, even though
+                        // `algebra Int<T> : Num`/`Float<T> : Num` (see
+                        // `stdlib/num/num.cleave`) now makes the `Num` half
+                        // derivable from either one alone (`has_matching_
+                        // impl`'s own bound-inheritance walk) — kept explicit
+                        // anyway so this still works unchanged against *any*
+                        // stdlib a program might load, not just one that
+                        // happens to declare that particular bound. The
                         // shape-specific constraint is what makes a literal's
                         // `.` a real, checkable requirement rather than a
                         // defaulting-only hint that any later, unrelated
@@ -1621,7 +2013,7 @@ impl<'r> Infer<'r> {
                     .ok_or(TypeError { span: expr.span, kind: TypeErrorKind::UnknownName(name) })?;
                 Ok(self.instantiate(&scheme))
             }
-            ExprKind::Call(path, args) => self.infer_call(env, expr.span, path, args),
+            ExprKind::Call(path, generics, args) => self.infer_call(env, expr.span, path, generics, args),
             ExprKind::Block(b) => self.infer_block(env, b),
             ExprKind::If { cond, then_branch, else_branch } => {
                 let cond_ty = self.infer_expr(env, cond)?;
@@ -1644,12 +2036,154 @@ impl<'r> Infer<'r> {
                     }
                 }
             }
-            // Parses (funnel grammar) but not semantically wired yet — see
-            // `grammar.pest`'s top-of-file note; same posture here.
-            ExprKind::While { .. } | ExprKind::For { .. } => {
-                Ok(Ty::Con("<loop-not-yet-inferred>".to_string()))
+            // A `while`/`for` loop's own value is always `()`, unconditionally
+            // — same reasoning as an `if` with no `else` (see that arm's own
+            // comment just above): the body might run zero times (`while`)
+            // or its per-iteration result is discarded either way (there's
+            // no `break value` mechanism), so nothing meaningful could ever
+            // come out of evaluating one as an expression.
+            ExprKind::While { cond, body } => {
+                let cond_ty = self.infer_expr(env, cond)?;
+                self.unify_at(cond.span, &Ty::Con("bool".to_string()), &cond_ty)?;
+                self.infer_block(env, body)?;
+                Ok(Ty::Con("()".to_string()))
             }
-            ExprKind::MethodCall(..) => Ok(Ty::Con("<not-yet-inferred>".to_string())),
+            ExprKind::For { var, start, end, body } => {
+                let start_ty = self.infer_expr(env, start)?;
+                let end_ty = self.infer_expr(env, end)?;
+                self.unify_at(end.span, &start_ty, &end_ty)?;
+                // The loop variable's own type — not necessarily `i32`
+                // specifically (no hardcoded width, same "Int, unconstrained
+                // width" posture `ExprKind::Index`'s own bound already
+                // uses), just some real `Int`-impl'd type.
+                self.constraints.push(Constraint { algebra: "Int".to_string(), ty: start_ty.clone(), span: start.span });
+                let mut inner_env = env.clone();
+                inner_env.insert(var.clone(), Scheme::mono(start_ty));
+                // `infer_block` clones `inner_env` again internally — the
+                // same cheap-clone tradeoff `Lambda`'s own handling above
+                // already makes.
+                self.infer_block(&inner_env, body)?;
+                Ok(Ty::Con("()".to_string()))
+            }
+            ExprKind::MethodCall(base, name, args) => {
+                let base_ty = self.infer_expr(env, base)?;
+                let resolved_base = self.subst.apply(&base_ty);
+                // Still abstract, or an already-unresolved placeholder
+                // (chained off another not-yet-inferred expression) — same
+                // "we don't know yet" posture `FieldAccess` already uses.
+                if matches!(resolved_base, Ty::Var(_)) || is_placeholder(&resolved_base) {
+                    return Ok(Ty::Con("<not-yet-inferred>".to_string()));
+                }
+                let struct_name = match &resolved_base {
+                    Ty::Con(n) => n.clone(),
+                    Ty::App(n, _) => n.clone(),
+                    // A function value, array, or const-value — none of
+                    // these have methods, rejected the same way
+                    // `FieldAccess` rejects them for fields. `Ty::Var` is
+                    // included only for exhaustiveness — already returned
+                    // above, never actually reached here.
+                    Ty::Fn(..) | Ty::Array(..) | Ty::Const(_) | Ty::Var(_) => {
+                        return Err(TypeError {
+                            span: expr.span,
+                            kind: TypeErrorKind::NoSuchMethod {
+                                struct_name: resolved_base.to_string(),
+                                method: name.clone(),
+                            },
+                        });
+                    }
+                };
+                // A (self- or, less commonly, sibling-triggered) recursive
+                // call back into the method *currently* having its own body
+                // inferred — see `in_progress_methods`'s own doc comment.
+                // Reuses that enclosing invocation's own already-resolved
+                // param types and return-type placeholder directly, instead
+                // of re-deriving a fresh instantiation from the registry:
+                // there's exactly one in-flight instantiation to recurse
+                // into, the same one this call is already nested inside.
+                if let Some((param_tys, ret_ty)) = self.in_progress_methods.get(&(struct_name.clone(), name.clone())).cloned() {
+                    self.unify_at(base.span, &param_tys[0], &resolved_base)?;
+                    for (pt, a) in param_tys[1..].iter().zip(args) {
+                        let at = self.infer_expr(env, a)?;
+                        self.unify_at(a.span, pt, &at)?;
+                    }
+                    return Ok(self.subst.apply(&ret_ty));
+                }
+                let Some(entry) = self.registry.inherent_method(&struct_name, name).cloned() else {
+                    return Err(TypeError {
+                        span: expr.span,
+                        kind: TypeErrorKind::NoSuchMethod { struct_name, method: name.clone() },
+                    });
+                };
+                // `base` fills the method's own first parameter — an
+                // ordinary, explicit positional argument, not a magic
+                // `self` (see `grammar.pest`'s `inherent_impl` comment for
+                // why: this project doesn't have implicit-anything
+                // elsewhere, no reason to invent one here).
+                if entry.method.params.is_empty() || entry.method.params.len() != args.len() + 1 {
+                    return Err(TypeError {
+                        span: expr.span,
+                        kind: TypeErrorKind::ArityMismatch {
+                            name: name.clone(),
+                            expected: entry.method.params.len(),
+                            found: args.len() + 1,
+                        },
+                    });
+                }
+                // The impl block's own generics (`impl<T: Float> Vec2<T>`)
+                // — fresh per call, bounds pushed as real `Constraint`s
+                // exactly like an algebra impl's own (`fresh_generics_
+                // mapping`). `target_ty` — built *from* `impl_mapping`, so
+                // `Boxed<T>` becomes `App("Boxed", [impl_mapping["T"]])` —
+                // is what actually pins those generics down once unified
+                // against `resolved_base` below; a bare fresh var for
+                // `param_tys[0]` would *also* end up correctly unified with
+                // `resolved_base`, but as its own, disconnected variable,
+                // never actually feeding back into `impl_mapping` at all —
+                // a real bug, found by testing: a generic inherent method's
+                // own return type (`T`, resolved through this same
+                // `impl_mapping`) came back as a bare, still-unconstrained
+                // variable instead of the concrete type `base` actually
+                // has. Mirrors `infer_inherent_impl_fn_generic`'s own
+                // identical fix for the exact same reason, on the
+                // declaration side.
+                let impl_mapping = self.fresh_generics_mapping(&entry.generics, expr.span);
+                let target_ty = self.ty_from_ast_mapped(&entry.target, &impl_mapping);
+                let param_tys = self.inherent_method_param_tys(&entry.method.params, &impl_mapping, &target_ty);
+                self.unify_at(base.span, &param_tys[0], &resolved_base)?;
+                for (pt, a) in param_tys[1..].iter().zip(args) {
+                    let at = self.infer_expr(env, a)?;
+                    self.unify_at(a.span, pt, &at)?;
+                }
+                // Unlike an algebra call (which always has a real declared
+                // signature, return type included, to fall back on) or a
+                // top-level `fn` call (whose return type was already
+                // *inferred*, once, by the whole-program pass, then
+                // generalized into a reusable `Scheme` — see `callgraph.rs`)
+                // — dispatch here never re-runs the method's own body at the
+                // call site (except for the recursive, `in_progress_methods`
+                // case just above), so an inherent method with no explicit
+                // `->` annotation has no return type available *anywhere*
+                // else to report. Defaulting that to `()` would be silently
+                // *wrong*, not just imprecise (the method might return
+                // anything) — deferred as the usual "we don't know yet"
+                // placeholder instead, same posture as every other
+                // genuinely-unresolved case in this file. A method whose
+                // return type actually matters at a call site needs an
+                // explicit annotation; genuinely inferring it from the body
+                // the way a top-level `fn` does — for a call to some *other*
+                // unannotated method not already mid-inference (mutual
+                // recursion between two separately-declared inherent
+                // methods, neither self-recursive) — is a further increment
+                // (would need inherent methods to go through the same
+                // whole-program, generalize-once treatment `callgraph.rs`
+                // gives top-level `fn`s — not attempted here).
+                Ok(entry
+                    .method
+                    .ret
+                    .as_ref()
+                    .map(|t| self.ty_from_ast_mapped(t, &impl_mapping))
+                    .unwrap_or_else(|| Ty::Con("<not-yet-inferred>".to_string())))
+            }
             ExprKind::ArrayLit(elems) => {
                 // Every element must agree on one type — checked pairwise
                 // against a single shared fresh var, same "unify against a
@@ -1778,7 +2312,7 @@ impl<'r> Infer<'r> {
                     }),
                 }
             }
-            ExprKind::StructLit(path, fields) => {
+            ExprKind::StructLit(path, explicit_generics, fields) => {
                 let struct_name = path.segments.join("::");
                 let Some(declared_fields) = self.registry.struct_fields(&struct_name).map(<[Field]>::to_vec) else {
                     return Err(TypeError { span: expr.span, kind: TypeErrorKind::UnknownStruct(struct_name) });
@@ -1787,12 +2321,40 @@ impl<'r> Infer<'r> {
                 // (if any), one per construction site — exactly like an
                 // algebra call instantiating the algebra's own `T` fresh
                 // per call (`infer_algebra_call`). `T`'s eventual concrete
-                // type is *inferred* from the field values below, never
-                // written explicitly at the construction site — matches
-                // this project's "infer everything from usage" stance
-                // everywhere else.
+                // type is normally *inferred* from the field values below —
+                // matches this project's "infer everything from usage"
+                // stance everywhere else — but can also be pinned explicitly
+                // via a turbofish (`Matrix::<f64, 4, 4>(values: ...)`),
+                // needed whenever nothing about the field values themselves
+                // would otherwise determine it (a real, reported ergonomics
+                // gap: relying on an incidentally-suffixed literal to force
+                // the right type through unification). Positional against
+                // `struct_generics`' own declaration order — the same
+                // convention `Ty::App`'s argument list, and `zip_struct_
+                // generics`, already use.
                 let struct_generics = self.registry.struct_generics(&struct_name).to_vec();
                 let generics_mapping = self.fresh_generics_mapping(&struct_generics, expr.span);
+                if !explicit_generics.is_empty() {
+                    if explicit_generics.len() != struct_generics.len() {
+                        return Err(TypeError {
+                            span: expr.span,
+                            kind: TypeErrorKind::ArityMismatch {
+                                name: format!("{struct_name}::<...>"),
+                                expected: struct_generics.len(),
+                                found: explicit_generics.len(),
+                            },
+                        });
+                    }
+                    for (g, explicit) in struct_generics.iter().zip(explicit_generics) {
+                        let name = match g {
+                            GenericParam::Type { name, .. } => name,
+                            GenericParam::Const { name, .. } => name,
+                        };
+                        let fresh = generics_mapping[name].clone();
+                        let explicit_ty = self.generic_arg_to_ty(explicit);
+                        self.unify_at(expr.span, &fresh, &explicit_ty)?;
+                    }
+                }
 
                 let mut seen: HashSet<String> = HashSet::new();
                 for (name, value) in fields {
@@ -1897,7 +2459,14 @@ impl<'r> Infer<'r> {
     /// fn(a) { a + a }; x(true)` type-checked. Removed — `add` with zero
     /// registered candidates is now exactly as "unresolved" as calling an
     /// undeclared function, no quieter.
-    fn infer_call(&mut self, env: &Env, call_span: Span, path: &Path, args: &[Expr]) -> Result<Ty, TypeError> {
+    fn infer_call(
+        &mut self,
+        env: &Env,
+        call_span: Span,
+        path: &Path,
+        explicit_generics: &[GenericArg],
+        args: &[Expr],
+    ) -> Result<Ty, TypeError> {
         let name = path.segments.join("::");
         let arg_tys: Vec<Ty> = args
             .iter()
@@ -1915,6 +2484,14 @@ impl<'r> Infer<'r> {
             });
         }
         if let Some(&algebra) = candidates.first() {
+            // Explicit turbofish on an algebra-dispatched operator call
+            // (`add::<f64>(a, b)`) isn't wired up — algebra calls resolve
+            // their own generic entirely from the argument types
+            // (`infer_algebra_call`), with no `Scheme`/`instantiate` step
+            // for a turbofish to hook into the same way a `let`-bound/
+            // top-level fn call has below. Silently ignored rather than
+            // rejected, matching this file's permissive-by-omission posture
+            // for real gaps — not attempted this increment.
             return self.infer_algebra_call(call_span, algebra, &name, &arg_tys, args);
         }
 
@@ -1925,7 +2502,28 @@ impl<'r> Infer<'r> {
             // lambda *literal* directly isn't representable yet — `Call`'s
             // callee is a `Path`, not an arbitrary `Expr` (see
             // `grammar.pest`'s `lambda_expr` note) — deliberately deferred.
-            match self.instantiate(&scheme) {
+            let (instantiated, mapping) = self.instantiate_with_mapping(&scheme);
+            if !explicit_generics.is_empty() {
+                if explicit_generics.len() != scheme.vars.len() {
+                    return Err(TypeError {
+                        span: call_span,
+                        kind: TypeErrorKind::ArityMismatch {
+                            name: format!("{name}::<...>"),
+                            expected: scheme.vars.len(),
+                            found: explicit_generics.len(),
+                        },
+                    });
+                }
+                // `scheme.vars`' own order — see `instantiate_with_mapping`'s
+                // doc comment for why this reliably matches declaration
+                // order for the common case.
+                for (v, g) in scheme.vars.iter().zip(explicit_generics) {
+                    let fresh = mapping[v].clone();
+                    let explicit_ty = self.generic_arg_to_ty(g);
+                    self.unify_at(call_span, &fresh, &explicit_ty)?;
+                }
+            }
+            match instantiated {
                 Ty::Fn(param_tys, ret_ty) => {
                     if param_tys.len() != args.len() {
                         return Err(TypeError {
@@ -2014,40 +2612,89 @@ impl<'r> Infer<'r> {
             self.unify_at(a.span, pt, at)?;
         }
 
+        // Checked against the *algebra's own* generics (positionally
+        // resolved through `mapping`, e.g. `[A, B, C]` for a heterogeneous
+        // `algebra MatMul<A, B, C>`), together, in one coherent dispatch —
+        // not `param_tys` independently, one at a time. A per-parameter
+        // loop over `param_tys` (an earlier version of this method's own
+        // shape) can't express "these two parameters must resolve to types
+        // that share a common impl instantiation": nothing would connect
+        // the *trial* substitution used to check the first parameter to the
+        // one used for the second, so a shape-mismatched
+        // `Matrix<f32,2,3> * Matrix<f32,4,5>` could pass both checks
+        // independently while the call's own result type stayed a bare,
+        // totally unconstrained variable — found by direct testing. For a
+        // single-generic algebra (`Ring<T>`, the overwhelming common case),
+        // this resolves to exactly one type and behaves identically to the
+        // old per-parameter check.
+        //
+        // `C` (a generic appearing *only* in the return type, never in any
+        // parameter — `fn mul(a: A, b: B) -> C;`) is never independently
+        // constrained by the call's own arguments the way `A`/`B` are —
+        // the *only* way to ever learn its concrete value is from a
+        // successful dispatch match itself. Gating readiness on "every
+        // generic is concrete" (an earlier version of this method did
+        // exactly that) can never work for such a generic: `C` starts and
+        // stays an ordinary fresh, totally free `Ty::Var` right up until
+        // dispatch itself resolves it, so the gate would never open —
+        // found by direct testing (`no impl MatMul<Matrix<f32,2,3>>`, a
+        // single-type message, instead of ever attempting a real
+        // three-target match at all). Only the generics that actually
+        // appear in at least one *parameter* — found by checking whether
+        // each generic's own fresh var occurs free in `param_tys` — gate
+        // readiness; a return-type-only generic rides along into the match
+        // itself and gets bound *by* it.
+        let mut param_free_vars: HashSet<TyVar> = HashSet::new();
         for pt in &param_tys {
-            let resolved = self.subst.apply(pt);
-            match resolved {
-                _ if is_placeholder(&resolved) => {
-                    // An "unknown" — a placeholder for something not
-                    // type-inferred yet — deferred below like any other
-                    // still-open type, see the comment there.
-                    self.constraints.push(Constraint { algebra: algebra.to_string(), ty: resolved, span: call_span });
-                }
-                _ if is_fully_concrete(&resolved) => {
-                    if !self.has_matching_impl(algebra, &resolved) {
-                        return Err(TypeError {
-                            span: call_span,
-                            kind: TypeErrorKind::MissingImpl { algebra: algebra.to_string(), ty: resolved.to_string() },
-                        });
-                    }
-                }
-                // Still abstract somewhere (a generic caller, or a
-                // `Complex<'t9>` whose own argument isn't pinned down yet) —
-                // defer: either `generalize` migrates this into an
-                // enclosing `let`'s scheme, or `check_pending_constraints`
-                // catches it once `infer_fn` finishes, whichever comes
-                // first.
-                abstract_ty => {
-                    self.constraints.push(Constraint {
-                        algebra: algebra.to_string(),
-                        ty: abstract_ty,
-                        span: call_span,
-                    });
-                }
+            free_vars(pt, &mut param_free_vars);
+        }
+        let mut resolved_generics: Vec<Ty> = Vec::new();
+        let mut gating: Vec<Ty> = Vec::new();
+        for g in &generics {
+            let GenericParam::Type { name, .. } = g else { continue };
+            let fresh = &mapping[name];
+            let resolved = self.subst.apply(fresh);
+            if matches!(fresh, Ty::Var(v) if param_free_vars.contains(v)) {
+                gating.push(resolved.clone());
+            }
+            resolved_generics.push(resolved);
+        }
+
+        if gating.iter().any(is_placeholder) {
+            // At least one *input* generic is an "unknown" — a placeholder
+            // for something not type-inferred yet. Deferred per-generic
+            // below, same as the "still abstract" case — neither is
+            // precise enough to check *coherently* once deferred (that
+            // would need a multi-`Ty` `Constraint` variant this increment
+            // doesn't add), but permissive-by-omission here matches this
+            // file's existing posture everywhere else a constraint can't
+            // fully propagate yet, not a new gap.
+            for ty in resolved_generics {
+                self.constraints.push(Constraint { algebra: algebra.to_string(), ty, span: call_span });
+            }
+        } else if gating.iter().all(is_fully_concrete) {
+            // Ready: every *input* generic is known, so dispatch can
+            // actually run — commits the match's own bindings for real
+            // (see `dispatch_algebra_call`'s own doc comment for why that's
+            // sound here specifically), which is what lets an
+            // output-only generic like `C` end up resolved at all.
+            if !self.dispatch_algebra_call(algebra, &resolved_generics) {
+                let ty = resolved_generics.iter().map(Ty::to_string).collect::<Vec<_>>().join(", ");
+                return Err(TypeError { span: call_span, kind: TypeErrorKind::MissingImpl { algebra: algebra.to_string(), ty } });
+            }
+        } else {
+            // Still abstract somewhere among the *input* generics (a
+            // generic caller, or a `Complex<'t9>` whose own argument isn't
+            // pinned down yet) — defer, per-generic: either `generalize`
+            // migrates each into an enclosing `let`'s scheme, or
+            // `check_pending_constraints` catches it once `infer_fn`
+            // finishes, whichever comes first.
+            for ty in resolved_generics {
+                self.constraints.push(Constraint { algebra: algebra.to_string(), ty, span: call_span });
             }
         }
 
-        Ok(ret_ty)
+        Ok(self.subst.apply(&ret_ty))
     }
 
     /// Defaults any number-literal type variable never pinned to a concrete

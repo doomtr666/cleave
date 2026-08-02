@@ -104,6 +104,54 @@ fn generic_impls_with_the_same_bare_target_shape_but_different_bounds_both_survi
     assert_eq!(reg.generic_impls("Ring").len(), 2, "both impls should be indexed, not just one");
 }
 
+#[test]
+fn finds_an_inherent_method_by_struct_and_method_name() {
+    let p = program("struct Vec2 { x: f64, y: f64 }\nimpl struct Vec2 {\n    fn len(v) { v.x }\n}");
+    let reg = Registry::build(&p);
+    let entry = reg.inherent_method("Vec2", "len").expect("Vec2 declares an inherent `len`");
+    assert_eq!(entry.method.name, "len");
+    assert!(entry.generics.is_empty());
+}
+
+#[test]
+fn no_inherent_method_for_an_unknown_name_or_struct() {
+    let p = program("struct Vec2 { x: f64, y: f64 }\nimpl struct Vec2 {\n    fn len(v) { v.x }\n}");
+    let reg = Registry::build(&p);
+    assert!(reg.inherent_method("Vec2", "bogus").is_none());
+    assert!(reg.inherent_method("Bogus", "len").is_none());
+}
+
+#[test]
+fn generic_inherent_impls_own_generics_are_indexed() {
+    let p = program("struct Matrix<T> { data: T }\nimpl<T: Float> struct Matrix<T> {\n    fn get(m) { m }\n}");
+    let reg = Registry::build(&p);
+    let entry = reg.inherent_method("Matrix", "get").expect("Matrix declares an inherent `get`");
+    assert_eq!(entry.generics.len(), 1);
+}
+
+#[test]
+fn all_impls_returns_every_target_in_declaration_order() {
+    let p = program(
+        "algebra MatMul<A, B, C> { fn mul(a: A, b: B) -> C; }
+         impl<T> MatMul<T, T, T> { fn mul(a, b) { a } }",
+    );
+    let reg = Registry::build(&p);
+    let impls = reg.all_impls("MatMul");
+    assert_eq!(impls.len(), 1);
+    let (generics, targets) = &impls[0];
+    assert_eq!(generics.len(), 1);
+    assert_eq!(targets.len(), 3, "A, B, C -- three targets");
+}
+
+#[test]
+fn all_impls_includes_single_target_impls_too() {
+    let p = program("algebra Ring<T> { fn add(a: T, b: T) -> T; }\nimpl Ring<i32> { fn add(a, b) { a } }");
+    let reg = Registry::build(&p);
+    let impls = reg.all_impls("Ring");
+    assert_eq!(impls.len(), 1);
+    assert_eq!(impls[0].1.len(), 1);
+}
+
 fn vec2_type() -> cleave::ast::Type {
     type_from("Vec2")
 }

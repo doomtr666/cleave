@@ -35,9 +35,18 @@ fn fibonacci<T: Int>(x : T) -> T {
 }
 
 
-struct Matrix<T : Float, const R : Int, const C : Int> {
+struct Matrix<T : Float, const R : i32, const C : i32> {
     values : [T; R, C]
-} 
+}
+
+algebra MatMul<A, B, C> {
+    fn mul(a : A, b : B) -> C;
+}
+
+impl<T : Float, const N : i32, const M : i32, const K : i32>
+    MatMul<Matrix<T,N,M>, Matrix<T,M,K>, Matrix<T,N,K>> {
+    fn mul(a, b) { a }
+}
 
 fn main() {
     let a = fibonacci(42:i32);
@@ -47,7 +56,23 @@ fn main() {
     let z2 = Complex(real: 0.0, imag: 1.0);
     let zr = z1 + z2;
 
-    let m = Matrix<f32,4,4>();
+    let m = Matrix::<f32,4,4>(values: [
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0]
+    ]);
+
+    let ma = Matrix::<f32,2,3>(values: [
+        [1.0, 1.0, 1.0],
+        [1.0, 1.0, 1.0]
+    ]);
+    let mb = Matrix::<f32,3,5>(values: [
+        [1.0, 1.0, 1.0, 1.0, 1.0],
+        [1.0, 1.0, 1.0, 1.0, 1.0],
+        [1.0, 1.0, 1.0, 1.0, 1.0]
+    ]);
+    let mc = ma * mb;
 
     42
 }

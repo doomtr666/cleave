@@ -1,4 +1,4 @@
-﻿use cleave::ast::{FileId, FnDecl, ItemKind, Program, Span, StmtKind, Type};
+﻿use cleave::ast::{FileId, FnDecl, GenericParam, ItemKind, Program, Span, StmtKind, Type};
 use cleave::infer::{ConstValue, Infer, Ty, TypeErrorKind};
 use cleave::lower::Lowerer;
 use cleave::parser::{CleaveParser, Rule};
@@ -33,6 +33,20 @@ fn lower_one_impl(src: &str) -> (String, Type, FnDecl, Span) {
         }
     }
     panic!("no impl item found in {src:?}");
+}
+
+/// Finds the first *inherent* `impl` item in `src` and returns (target
+/// type, its impl-level generics, its first method, the enclosing `impl`
+/// item's own span).
+fn lower_one_inherent_impl(src: &str) -> (Type, Vec<GenericParam>, FnDecl, Span) {
+    let program = lower_program(src);
+    for item in program.items {
+        if let ItemKind::InherentImpl(d) = item.kind {
+            let f = d.fns.into_iter().next().expect("expected at least one fn in the impl");
+            return (d.target, d.generics, f, item.span);
+        }
+    }
+    panic!("no inherent impl item found in {src:?}");
 }
 
 /// A **test-only** fixture standing in for a real stdlib â€” `infer_call` no
@@ -281,6 +295,53 @@ fn a_declared_generic_type_parameter_without_a_bound_stays_unconstrained() {
     // `f32`, which does not implement `Int`, is accepted fine.
     let ty = infer_src("fn f<T>(x: T) -> f32 { x }");
     assert_eq!(ty, Ty::Con("f32".to_string()));
+}
+
+// ---------------------------------------------------------------------
+// algebra-bound inheritance (`algebra Int<T> : Num`): an impl of the
+// *narrower* algebra alone satisfies a bound on the *wider* one too, with
+// no separate impl needed -- mirrors `stdlib/num/num.cleave`'s own design.
+// ---------------------------------------------------------------------
+
+#[test]
+fn algebra_bound_inheritance_lets_a_narrower_impl_satisfy_a_wider_bound() {
+    let registry = registry_from(
+        "algebra Num<T> {}
+         algebra Int<T> : Num {}
+         impl Int<i32> {}",
+    );
+    let f = lower_one_fn("fn f<T: Num>(x: T) -> i32 { x }");
+    let mut infer = Infer::new(&registry);
+    let ty = infer.infer_fn(&f).unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(ty, Ty::Con("i32".to_string()));
+}
+
+#[test]
+fn algebra_bound_inheritance_does_not_apply_to_an_unrelated_type() {
+    // `f64` has no `impl Int<f64>` and no `impl Num<f64>` either -- the
+    // bound must not accept it just because *some* type satisfies `Num`
+    // through inheritance.
+    let registry = registry_from(
+        "algebra Num<T> {}
+         algebra Int<T> : Num {}
+         impl Int<i32> {}",
+    );
+    let f = lower_one_fn("fn f<T: Num>(x: T) -> f64 { x }");
+    let mut infer = Infer::new(&registry);
+    let err = infer.infer_fn(&f).unwrap_err();
+    assert!(matches!(&err.kind, TypeErrorKind::MissingImpl { algebra, .. } if algebra == "Num"), "got: {:?}", err.kind);
+}
+
+#[test]
+fn cyclic_algebra_bounds_reject_cleanly_instead_of_looping_forever() {
+    let registry = registry_from(
+        "algebra A<T> : B {}
+         algebra B<T> : A {}",
+    );
+    let f = lower_one_fn("fn f<T: A>(x: T) -> i32 { x }");
+    let mut infer = Infer::new(&registry);
+    let err = infer.infer_fn(&f).unwrap_err();
+    assert!(matches!(&err.kind, TypeErrorKind::MissingImpl { algebra, .. } if algebra == "A"), "got: {:?}", err.kind);
 }
 
 #[test]
@@ -1426,4 +1487,401 @@ fn a_const_generics_own_declared_type_naming_a_real_type_is_accepted() {
         struct Matrix<const R: i32> { x: i32 }
         fn f() -> Matrix<3> { Matrix(x: 1) }";
     infer_fn_named(src, "f").unwrap();
+}
+
+// ---------------------------------------------------------------------
+// turbofish: explicit `::<...>` generic arguments on a call or struct
+// construction, for when nothing about the arguments/field values
+// themselves would pin the instantiation down
+// ---------------------------------------------------------------------
+
+#[test]
+fn turbofish_on_a_let_bound_generic_lambda_pins_the_instantiation() {
+    let ty = infer_src("fn f() -> f64 { let id = fn(x) { x }; id::<f64>(1.0) }");
+    assert_eq!(ty, Ty::Con("f64".to_string()));
+}
+
+#[test]
+fn turbofish_conflicting_with_the_arguments_own_type_is_rejected() {
+    let f = lower_one_fn("fn f() { let id = fn(x) { x }; id::<f64>(1:i32) }");
+    let registry = builtin_registry();
+    let mut infer = Infer::new(&registry);
+    let err = infer.infer_fn(&f).unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::Unify(_)), "got: {:?}", err.kind);
+}
+
+#[test]
+fn turbofish_arity_mismatch_against_a_generic_lambda_is_rejected() {
+    let f = lower_one_fn("fn f() { let id = fn(x) { x }; id::<f64, i32>(1.0) }");
+    let registry = builtin_registry();
+    let mut infer = Infer::new(&registry);
+    let err = infer.infer_fn(&f).unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::ArityMismatch { .. }), "got: {:?}", err.kind);
+}
+
+#[test]
+fn turbofish_on_struct_construction_pins_type_and_const_generics() {
+    // The actual reported motivation: forcing `f64` (and the size) directly,
+    // rather than relying on an incidentally-suffixed literal to propagate
+    // the right type through unification.
+    let ty = infer_fn_named(
+        "struct Vec<T, const N: i32> { data: [T; N] }
+         fn f() -> Vec<f64, 3> { Vec::<f64, 3>(data: [1.0, 2.0, 3.0]) }",
+        "f",
+    )
+    .unwrap();
+    assert_eq!(ty, Ty::App("Vec".to_string(), vec![Ty::Con("f64".to_string()), Ty::Const(ConstValue::Int(3))]));
+}
+
+#[test]
+fn turbofish_on_struct_construction_forcing_a_bare_int_literal_into_float_is_still_rejected() {
+    // `[1, 2, 3]`'s bare literals are `Int`-shaped (no `.`) -- turbofish
+    // pinning `T` to `f64` conflicts with that real, checked constraint the
+    // exact same way any other int-literal-forced-into-a-float-context
+    // does (see `a_bare_int_shaped_literal_forced_into_a_float_context_is_
+    // now_rejected`); turbofish doesn't bypass the shape check.
+    let err = infer_fn_named(
+        "algebra Int<T> {}
+         impl Int<i32> {}
+         algebra Float<T> {}
+         impl Float<f64> {}
+         struct Vec<T, const N: i32> { data: [T; N] }
+         fn f() { Vec::<f64, 3>(data: [1, 2, 3]) }",
+        "f",
+    )
+    .unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::MissingImpl { .. }), "got: {:?}", err.kind);
+}
+
+#[test]
+fn turbofish_on_struct_construction_arity_mismatch_is_rejected() {
+    let err = infer_fn_named(
+        "struct Vec<T, const N: i32> { data: [T; N] }
+         fn f() -> Vec<f64, 3> { Vec::<f64>(data: [1.0, 2.0, 3.0]) }",
+        "f",
+    )
+    .unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::ArityMismatch { .. }), "got: {:?}", err.kind);
+}
+
+#[test]
+fn turbofish_on_struct_construction_conflicting_with_the_field_values_size_is_rejected() {
+    let err = infer_fn_named(
+        "struct Vec<T, const N: i32> { data: [T; N] }
+         fn f() { Vec::<f64, 4>(data: [1.0, 2.0, 3.0]) }",
+        "f",
+    )
+    .unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::Unify(_)), "got: {:?}", err.kind);
+}
+
+// ---------------------------------------------------------------------
+// control flow: while/for
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_while_loop_is_always_unit_typed() {
+    // Same reasoning as an `if` with no `else`: the body might run zero
+    // times, and there's no `break value` mechanism, so nothing meaningful
+    // could ever come out of evaluating one as an expression.
+    let ty = infer_src("fn f() -> bool { let mut i = 0; while i > 0 { i }; true }");
+    assert_eq!(ty, Ty::Con("bool".to_string()));
+}
+
+#[test]
+fn a_while_loops_condition_must_be_bool() {
+    let f = lower_one_fn("fn f() { while 1 { 2 } }");
+    let registry = builtin_registry();
+    let mut infer = Infer::new(&registry);
+    assert!(infer.infer_fn(&f).is_err(), "a non-bool condition must be rejected");
+}
+
+#[test]
+fn a_for_loops_body_and_variable_type_check_normally() {
+    let ty = infer_src("fn f() -> bool { for i in 0..10 { i > 0 }; true }");
+    assert_eq!(ty, Ty::Con("bool".to_string()));
+}
+
+#[test]
+fn a_for_loops_start_and_end_must_agree_in_type() {
+    // `0` (Int-shaped) vs `3.0` (Float-shaped) -- the exact same real,
+    // checked shape conflict a bare literal hits anywhere else in this
+    // file, not a for-loop-specific special case.
+    let f = lower_one_fn("fn f() { for i in 0..3.0 { i } }");
+    let registry = builtin_registry();
+    let mut infer = Infer::new(&registry);
+    let err = infer.infer_fn(&f).unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::MissingImpl { .. }), "got: {:?}", err.kind);
+}
+
+#[test]
+fn a_for_loops_variable_does_not_leak_into_the_enclosing_scope() {
+    let f = lower_one_fn("fn f() { for i in 0..10 { i }; i }");
+    let registry = builtin_registry();
+    let mut infer = Infer::new(&registry);
+    assert!(infer.infer_fn(&f).is_err(), "`i` must be unbound outside the loop");
+}
+
+#[test]
+fn a_for_loops_variable_is_int_constrained_not_forced_to_a_specific_width() {
+    // No hardcoded width -- the same "constrained, not blessed" posture
+    // `ExprKind::Index`'s own bound already uses. `i64` bounds must work
+    // exactly as well as the default `i32`.
+    let ty = infer_src("fn f() -> i64 { let mut acc = 0:i64; for i in 0:i64..10:i64 { acc = i; }; acc }");
+    assert_eq!(ty, Ty::Con("i64".to_string()));
+}
+
+// ---------------------------------------------------------------------
+// higher-order functions: an explicit function-type annotation
+// (`(i32) -> i32`) on a parameter
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_function_typed_parameter_is_itself_usable_inside_the_body() {
+    let ty = infer_src("fn apply(f: (i32) -> i32, x: i32) -> i32 { f(x) }");
+    assert_eq!(ty, Ty::Con("i32".to_string()));
+}
+
+#[test]
+fn a_function_typed_parameter_type_checks_in_isolation_even_with_no_caller() {
+    let f = lower_one_fn("fn apply(f: (i32) -> bool, x: i32) -> bool { f(x) }");
+    let registry = builtin_registry();
+    let mut infer = Infer::new(&registry);
+    assert!(infer.infer_fn(&f).is_ok());
+    // See `tests/callgraph.rs` for the call-site rejection (a lambda
+    // returning the wrong type passed to `apply`) -- that needs a real
+    // caller, which only the whole-program pass resolves; `infer_fn`/
+    // `infer_fn_named` only ever handle a function calling *itself*.
+}
+
+#[test]
+fn a_function_type_with_multiple_params_round_trips() {
+    let ty = infer_src("fn apply(f: (i32, f64) -> bool, x: i32, y: f64) -> bool { f(x, y) }");
+    assert_eq!(ty, Ty::Con("bool".to_string()));
+}
+
+// ---------------------------------------------------------------------
+// inherent impls (`impl struct Vec2 { ... }`, no algebra) and method-call
+// (`v.foo(...)`) dispatch
+// ---------------------------------------------------------------------
+
+#[test]
+fn an_inherent_methods_unannotated_first_parameter_defaults_to_the_impl_target() {
+    let ty = infer_fn_named(
+        "struct Vec2 { x: f64, y: f64 }
+         impl struct Vec2 { fn get_x(v) -> f64 { v.x } }
+         fn f() -> f64 { let p = Vec2(x: 1.0, y: 2.0); p.get_x() }",
+        "f",
+    )
+    .unwrap();
+    assert_eq!(ty, Ty::Con("f64".to_string()));
+}
+
+#[test]
+fn method_call_dispatches_the_declared_return_type() {
+    let ty = infer_fn_named(
+        "struct Vec2 { x: f64, y: f64 }
+         impl struct Vec2 { fn scale(v, s: f64) -> f64 { s } }
+         fn f() -> f64 { let p = Vec2(x: 1.0, y: 2.0); p.scale(2.0) }",
+        "f",
+    )
+    .unwrap();
+    assert_eq!(ty, Ty::Con("f64".to_string()));
+}
+
+#[test]
+fn method_call_with_a_wrong_argument_type_is_rejected() {
+    let err = infer_fn_named(
+        "struct Vec2 { x: f64, y: f64 }
+         impl struct Vec2 { fn scale(v, s: f64) -> f64 { s } }
+         fn f() { let p = Vec2(x: 1.0, y: 2.0); p.scale(true) }",
+        "f",
+    )
+    .unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::Unify(_)), "got: {:?}", err.kind);
+}
+
+#[test]
+fn method_call_with_wrong_arity_is_rejected() {
+    let err = infer_fn_named(
+        "struct Vec2 { x: f64, y: f64 }
+         impl struct Vec2 { fn scale(v, s: f64) -> f64 { s } }
+         fn f() { let p = Vec2(x: 1.0, y: 2.0); p.scale(1.0, 2.0) }",
+        "f",
+    )
+    .unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::ArityMismatch { .. }), "got: {:?}", err.kind);
+}
+
+#[test]
+fn method_call_on_an_unknown_method_is_rejected() {
+    let err = infer_fn_named(
+        "struct Vec2 { x: f64, y: f64 }
+         fn f() { let p = Vec2(x: 1.0, y: 2.0); p.bogus() }",
+        "f",
+    )
+    .unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::NoSuchMethod { .. }), "got: {:?}", err.kind);
+}
+
+#[test]
+fn method_call_on_a_non_struct_base_is_rejected() {
+    let f = lower_one_fn("fn f(x: i32) { x.foo() }");
+    let registry = builtin_registry();
+    let mut infer = Infer::new(&registry);
+    let err = infer.infer_fn(&f).unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::NoSuchMethod { .. }), "got: {:?}", err.kind);
+}
+
+#[test]
+fn a_method_call_with_no_declared_return_type_defers_permissively_when_unused() {
+    // No `->` on `len` -- the call's own result has nowhere to report a
+    // real type from (dispatch never re-runs the method's own body), so it
+    // defers as a placeholder. As long as that placeholder never has to
+    // reach the caller's *own* exposed signature (the call's result is
+    // simply discarded here), the whole program still succeeds.
+    let ty = infer_fn_named(
+        "struct Vec2 { x: f64, y: f64 }
+         impl struct Vec2 { fn len(v) { v.x } }
+         fn f() -> i32 { let p = Vec2(x: 1.0, y: 2.0); p.len(); 42 }",
+        "f",
+    )
+    .unwrap();
+    assert_eq!(ty, Ty::Con("i32".to_string()));
+}
+
+#[test]
+fn a_generic_structs_inherent_method_resolves_the_type_argument() {
+    let ty = infer_fn_named(
+        "struct Boxed<T> { value: T }
+         impl<T> struct Boxed<T> { fn get(b) -> T { b.value } }
+         fn f() -> f64 { let b = Boxed(value: 1.0); b.get() }",
+        "f",
+    )
+    .unwrap();
+    assert_eq!(ty, Ty::Con("f64".to_string()));
+}
+
+#[test]
+fn a_self_recursive_unannotated_inherent_method_infers_its_own_return_type() {
+    // Real bug, found by direct testing: `w.countdown()` (a recursive call
+    // to the *same* method, via the ordinary `v.method()` syntax, not by
+    // bare name) used to defer to `<not-yet-inferred>` even during the
+    // method's own declaration -- nothing tied a recursive `MethodCall` back
+    // to the enclosing invocation's own still-open return type the way a
+    // self-recursive top-level `fn` already gets via `env` (`infer_fn`'s own
+    // seeded placeholder never applies here: dispatch never consults `env`
+    // for its callee). Fixed via `Infer::in_progress_methods`.
+    let registry = registry_from(
+        "algebra Ord<T> { fn eq(a: T, b: T) -> bool; }
+         impl Ord<i32> { fn eq(a, b) { true } }
+         struct Wrap { n : i32 }",
+    );
+    let (target, generics, f, span) = lower_one_inherent_impl(
+        "impl struct Wrap {
+            fn countdown(w) {
+                if eq(w.n, 0) { 0 } else { w.countdown() }
+            }
+        }",
+    );
+    let mut infer = Infer::new(&registry);
+    let ty = infer
+        .infer_inherent_impl_fn_generic(&cleave::infer::Env::new(), &generics, &target, &f, span)
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(ty, Ty::Con("i32".to_string()));
+}
+
+// ---------------------------------------------------------------------
+// heterogeneous algebra dispatch: `algebra MatMul<A, B, C>`, a multi-target
+// impl, and `a * b` resolving a genuinely different result type
+// ---------------------------------------------------------------------
+
+const MATMUL_SRC: &str = "
+    algebra MatMul<A, B, C> { fn mul(a: A, b: B) -> C; }
+    algebra Float<T> {}
+    impl Float<f32> {}
+    impl Float<f64> {}
+    struct Matrix<T : Float, const R : i32, const C : i32> { values : [T; R, C] }
+    impl<T: Float, const N: i32, const M: i32, const K: i32>
+        MatMul<Matrix<T,N,M>, Matrix<T,M,K>, Matrix<T,N,K>> { fn mul(a, b) { a } }
+";
+
+#[test]
+fn matmul_resolves_the_output_shape_from_the_two_input_shapes() {
+    // The actual point: `C` (N,K) is neither `A`'s shape (N,M) nor `B`'s
+    // (M,K) -- it only exists once dispatch itself determines it.
+    let src = format!(
+        "{MATMUL_SRC}
+         fn f() -> Matrix<f32, 2, 5> {{
+             let a = Matrix::<f32, 2, 3>(values: [[1.0,1.0,1.0],[1.0,1.0,1.0]]);
+             let b = Matrix::<f32, 3, 5>(values: [[1.0,1.0,1.0,1.0,1.0],[1.0,1.0,1.0,1.0,1.0],[1.0,1.0,1.0,1.0,1.0]]);
+             a * b
+         }}"
+    );
+    let ty = infer_fn_named(&src, "f").unwrap();
+    assert_eq!(
+        ty,
+        Ty::App("Matrix".to_string(), vec![Ty::Con("f32".to_string()), Ty::Const(ConstValue::Int(2)), Ty::Const(ConstValue::Int(5))])
+    );
+}
+
+#[test]
+fn matmul_rejects_a_mismatched_middle_dimension() {
+    let src = format!(
+        "{MATMUL_SRC}
+         fn f() {{
+             let a = Matrix::<f32, 2, 3>(values: [[1.0,1.0,1.0],[1.0,1.0,1.0]]);
+             let b = Matrix::<f32, 4, 5>(values: [[1.0,1.0,1.0,1.0,1.0],[1.0,1.0,1.0,1.0,1.0],[1.0,1.0,1.0,1.0,1.0],[1.0,1.0,1.0,1.0,1.0]]);
+             let c = a * b;
+             42
+         }}"
+    );
+    let err = infer_fn_named(&src, "f").unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::MissingImpl { .. }), "got: {:?}", err.kind);
+}
+
+#[test]
+fn matmul_element_type_must_also_agree() {
+    // f32 vs f64 -- shapes line up (2x3 * 3x5), element type doesn't.
+    let src = format!(
+        "{MATMUL_SRC}
+         fn f() {{
+             let a = Matrix::<f32, 2, 3>(values: [[1.0,1.0,1.0],[1.0,1.0,1.0]]);
+             let b = Matrix::<f64, 3, 5>(values: [[1.0,1.0,1.0,1.0,1.0],[1.0,1.0,1.0,1.0,1.0],[1.0,1.0,1.0,1.0,1.0]]);
+             let c = a * b;
+             42
+         }}"
+    );
+    let err = infer_fn_named(&src, "f").unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::MissingImpl { .. }), "got: {:?}", err.kind);
+}
+
+#[test]
+fn overlapping_multi_target_impls_of_the_same_algebra_are_rejected() {
+    let src = "algebra MatMul<A, B, C> { fn mul(a: A, b: B) -> C; }
+        struct Matrix<T> { data: T }
+        algebra Float2<T> {}
+        impl Float2<f64> {}
+        algebra Ord2<T> {}
+        impl Ord2<f64> {}
+        impl<T: Float2> MatMul<Matrix<T>, Matrix<T>, Matrix<T>> { fn mul(a, b) { a } }
+        impl<T: Ord2> MatMul<Matrix<T>, Matrix<T>, Matrix<T>> { fn mul(a, b) { a } }";
+    let registry = registry_from(src);
+    let mut infer = Infer::new(&registry);
+    let errors = infer.check_no_overlapping_impls();
+    assert_eq!(errors.len(), 1, "got: {errors:?}");
+    assert!(matches!(errors[0].kind, TypeErrorKind::OverlappingImpls { .. }), "got: {:?}", errors[0].kind);
+}
+
+#[test]
+fn non_overlapping_multi_target_impls_differing_in_a_later_target_are_accepted() {
+    let src = "algebra MatMul<A, B, C> { fn mul(a: A, b: B) -> C; }
+        struct Matrix<T> { data: T }
+        struct Vector<T> { data: T }
+        impl<T> MatMul<Matrix<T>, Matrix<T>, Matrix<T>> { fn mul(a, b) { a } }
+        impl<T> MatMul<Matrix<T>, Vector<T>, Vector<T>> { fn mul(a, b) { b } }";
+    let registry = registry_from(src);
+    let mut infer = Infer::new(&registry);
+    let errors = infer.check_no_overlapping_impls();
+    assert!(errors.is_empty(), "got: {errors:?}");
 }

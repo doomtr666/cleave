@@ -9,7 +9,7 @@
 
 use crate::ast::*;
 use crate::parser::Rule;
-use pest::iterators::Pair;
+use pest::iterators::{Pair, Pairs};
 
 pub struct Lowerer {
     file: FileId,
@@ -69,7 +69,14 @@ impl Lowerer {
             Rule::use_decl => ItemKind::Use(self.lower_use_decl(inner)),
             Rule::struct_decl => ItemKind::Struct(self.lower_struct_decl(inner)),
             Rule::algebra_decl => ItemKind::Algebra(self.lower_algebra_decl(inner)),
-            Rule::impl_decl => ItemKind::Impl(self.lower_impl_decl(inner)),
+            Rule::impl_decl => {
+                let variant = inner.into_inner().next().unwrap();
+                match variant.as_rule() {
+                    Rule::algebra_impl => ItemKind::Impl(self.lower_algebra_impl(variant)),
+                    Rule::inherent_impl => ItemKind::InherentImpl(self.lower_inherent_impl(variant)),
+                    r => unreachable!("impl_decl: unexpected rule {r:?}"),
+                }
+            }
             Rule::fn_decl => ItemKind::Fn(self.lower_fn_decl(inner)),
             r => unreachable!("item: unexpected rule {r:?}"),
         };
@@ -239,7 +246,7 @@ impl Lowerer {
 
     // ---------------------------------------------------------------- impl
 
-    fn lower_impl_decl(&mut self, pair: Pair<Rule>) -> ImplDecl {
+    fn lower_algebra_impl(&mut self, pair: Pair<Rule>) -> ImplDecl {
         let mut inner = pair.into_inner().peekable();
 
         let generics = if matches!(inner.peek().map(|p| p.as_rule()), Some(Rule::generic_params)) {
@@ -250,8 +257,31 @@ impl Lowerer {
 
         let algebra = inner.next().unwrap().as_str().to_string();
         let target = self.lower_type(inner.next().unwrap());
+        // Zero or more additional `type_` pairs precede the `fn_decl*` tail
+        // — same "peel off while the rule keeps matching" pattern used
+        // everywhere else an optional repetition is flattened alongside
+        // fixed leading fields in this same pair (see `generic_params?`
+        // just above).
+        let mut extra_targets = Vec::new();
+        while matches!(inner.peek().map(|p| p.as_rule()), Some(Rule::type_)) {
+            extra_targets.push(self.lower_type(inner.next().unwrap()));
+        }
         let fns = inner.map(|p| self.lower_fn_decl(p)).collect();
-        ImplDecl { algebra, generics, target, fns }
+        ImplDecl { algebra, generics, target, extra_targets, fns }
+    }
+
+    fn lower_inherent_impl(&mut self, pair: Pair<Rule>) -> InherentImplDecl {
+        let mut inner = pair.into_inner().peekable();
+
+        let generics = if matches!(inner.peek().map(|p| p.as_rule()), Some(Rule::generic_params)) {
+            self.lower_generic_params(inner.next().unwrap())
+        } else {
+            Vec::new()
+        };
+
+        let target = self.lower_type(inner.next().unwrap());
+        let fns = inner.map(|p| self.lower_fn_decl(p)).collect();
+        InherentImplDecl { generics, target, fns }
     }
 
     // ---------------------------------------------------------------- types
@@ -262,6 +292,7 @@ impl Lowerer {
         let first = inner.next().unwrap();
         match first.as_rule() {
             Rule::array_type => self.lower_array_type(first),
+            Rule::fn_type => self.lower_fn_type(first),
             // `path`'s optional generic-arg list is flattened as trailing
             // siblings of `path` within this same `type_` pair, not nested
             // under a separate sub-rule — collect whatever remains.
@@ -272,6 +303,16 @@ impl Lowerer {
             }
             r => unreachable!("type_: unexpected rule {r:?}"),
         }
+    }
+
+    /// `(T1, T2) -> R` — every inner `type_` pair is a parameter *except*
+    /// the last, which is the (always-present, see `grammar.pest`'s own
+    /// comment) return type.
+    fn lower_fn_type(&mut self, pair: Pair<Rule>) -> Type {
+        let span = self.span_of(&pair);
+        let mut types: Vec<Type> = pair.into_inner().map(|p| self.lower_type(p)).collect();
+        let ret = Box::new(types.pop().expect("fn_type always has at least a return type"));
+        self.wrap(span, TypeKind::Fn(types, ret))
     }
 
     fn lower_generic_arg(&mut self, pair: Pair<Rule>) -> GenericArg {
@@ -422,7 +463,7 @@ impl Lowerer {
             let rhs = lower_operand(self, rhs_pair);
             let name = op_name(op_pair.as_str());
             let span = self.join(acc.span, rhs.span);
-            acc = self.wrap(span, ExprKind::Call(Path::single(name), vec![acc, rhs]));
+            acc = self.wrap(span, ExprKind::Call(Path::single(name), Vec::new(), vec![acc, rhs]));
         }
         acc
     }
@@ -435,7 +476,7 @@ impl Lowerer {
             Rule::unary => {
                 // "-" ~ unary — the "-" itself is a bare token, not a pair.
                 let operand = self.lower_unary(first);
-                self.wrap(span, ExprKind::Call(Path::single("neg"), vec![operand]))
+                self.wrap(span, ExprKind::Call(Path::single("neg"), Vec::new(), vec![operand]))
             }
             Rule::postfix => self.lower_postfix(first),
             r => unreachable!("unary: unexpected rule {r:?}"),
@@ -540,18 +581,31 @@ impl Lowerer {
 
     fn lower_call_expr(&mut self, pair: Pair<Rule>) -> Expr {
         let span = self.span_of(&pair);
-        let mut inner = pair.into_inner();
+        let mut inner = pair.into_inner().peekable();
         let path = self.lower_path(inner.next().unwrap());
+        let generics = self.lower_optional_turbofish(&mut inner);
         let args = inner.next().map(|p| self.lower_arg_list(p)).unwrap_or_default();
-        self.wrap(span, ExprKind::Call(path, args))
+        self.wrap(span, ExprKind::Call(path, generics, args))
     }
 
     fn lower_struct_lit(&mut self, pair: Pair<Rule>) -> Expr {
         let span = self.span_of(&pair);
-        let mut inner = pair.into_inner();
+        let mut inner = pair.into_inner().peekable();
         let path = self.lower_path(inner.next().unwrap());
+        let generics = self.lower_optional_turbofish(&mut inner);
         let fields = inner.next().map(|p| self.lower_field_init_list(p)).unwrap_or_default();
-        self.wrap(span, ExprKind::StructLit(path, fields))
+        self.wrap(span, ExprKind::StructLit(path, generics, fields))
+    }
+
+    /// Consumes a leading `Rule::turbofish` pair off `inner` if present,
+    /// returning its generic arguments — shared by `lower_call_expr`/
+    /// `lower_struct_lit`, the two constructs that can carry one.
+    fn lower_optional_turbofish(&mut self, inner: &mut std::iter::Peekable<Pairs<Rule>>) -> Vec<GenericArg> {
+        if matches!(inner.peek().map(|p| p.as_rule()), Some(Rule::turbofish)) {
+            inner.next().unwrap().into_inner().map(|p| self.lower_generic_arg(p)).collect()
+        } else {
+            Vec::new()
+        }
     }
 
     fn lower_field_init_list(&mut self, pair: Pair<Rule>) -> Vec<(String, Expr)> {

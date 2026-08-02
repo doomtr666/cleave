@@ -51,18 +51,70 @@ fn_sig       = { "fn" ~ ident ~ "(" ~ param_list? ~ ")" ~ ("->" ~ type_)? ~ ";" 
 axiom_decl   = { "axiom" ~ ident ~ "(" ~ param_list? ~ ")" ~ ":" ~ expr ~ ";" }
 
 // ---------------------------------------------------------------- impl
+// Two shapes: an *algebra* impl (dispatches `add`/`gt`/... through the
+// registry, see `infer.rs`) and an *inherent* impl (ordinary methods
+// belonging directly to one `struct`, no algebra involved — `v.len()`
+// dispatches by looking `len` up among `Vec2`'s own inherent methods, not
+// through any registry-mediated interface).
+//
+// A genuinely ambiguous case forced a real disambiguator here, not just
+// alternative ordering — found by testing: `impl<T> Boxed<T> { ... }`
+// parses *identically* either way (`algebra_impl`: algebra `Boxed`, target
+// the bare type `T`; `inherent_impl`: target the single type `Boxed<T>`),
+// since a struct with exactly *one* generic parameter produces the exact
+// same character sequence as an algebra name immediately followed by its
+// own single-type target. Trying `algebra_impl` first (as an earlier
+// version of this grammar did) doesn't fail cleanly on this input the way
+// it does for a genuinely non-algebra shape — it *fully matches*, wrongly,
+// silently treating `Boxed` as an algebra name. This is exactly the
+// problem Rust's own `impl Trait for Type` vs. `impl Type` solves with a
+// `for` keyword; the leading `struct` keyword plays the identical role
+// here (reusing an existing token rather than inventing a new one) —
+// required on *every* inherent impl, not just the ambiguous generic case,
+// for one uniform rule rather than two special-cased shapes.
+impl_decl = { algebra_impl | inherent_impl }
 // `impl<T: Float> TestAlg<Complex<T>> { ... }` — an impl's own generic
 // parameters (distinct from the *algebra*'s own `<T>` in `algebra
 // TestAlg<T> { ... }`), needed once the target itself is generic
 // (`Complex<T>`, not a bare concrete type) — reuses `generic_params`, the
 // same shape `fn_decl`/`struct_decl`/`algebra_decl` already declare theirs
-// with.
-impl_decl = { "impl" ~ generic_params? ~ ident ~ "<" ~ type_ ~ ">" ~ "{" ~ fn_decl* ~ "}" }
+// with. One or more targets, comma-separated, positionally matching the
+// algebra's own generic parameter list — `algebra Ring<T>` (one generic)
+// still only ever takes one (`impl Ring<Vec2>`, the overwhelmingly common
+// case, unchanged), but a genuinely heterogeneous algebra like
+// `algebra MatMul<A, B, C>` needs `impl<...> MatMul<Matrix<T,N,M>,
+// Matrix<T,M,K>, Matrix<T,N,K>>` — three independently-typed parameters, not
+// one type substituted for all three (see `infer.rs`'s own module docs on
+// why a single-target impl can't express that).
+algebra_impl  = { "impl" ~ generic_params? ~ ident ~ "<" ~ type_ ~ ("," ~ type_)* ~ ">" ~ "{" ~ fn_decl* ~ "}" }
+// `impl struct Vec2 { fn len(v) { ... } }` — no algebra name, no dispatch
+// through the registry; `target` is an ordinary `type_` (usually just a
+// bare struct name, `Vec2`, but can carry its own generic arguments the
+// same way a field/parameter type can, `impl<T> struct Matrix<T, R, C>`).
+// The first parameter of a method declared here plays the role a `self`
+// parameter would in a language with one — ordinary, explicit, no special
+// syntax, same "nothing magic, just the first positional argument" stance
+// this project already takes everywhere else (see `grammar.md`).
+inherent_impl = { "impl" ~ generic_params? ~ "struct" ~ type_ ~ "{" ~ fn_decl* ~ "}" }
 
 // ---------------------------------------------------------------- types
 // arrays are the 1D primitive (see grammar.md, "Primitives + arrays") — Matrix/Tensor
 // (multi-dim, strided) are algebras built on top, not a separate native array type.
-type_       = { array_type | path ~ ("<" ~ generic_arg ~ ("," ~ generic_arg)* ~ ">")? }
+type_       = { fn_type | array_type | path ~ ("<" ~ generic_arg ~ ("," ~ generic_arg)* ~ ">")? }
+// A function type, for annotating a higher-order-function parameter
+// (`fn apply(f: (i32) -> i32, x: i32) -> i32 { f(x) }`) — mirrors `Ty::Fn`
+// (already used internally for a lambda's own inferred type) with actual
+// surface syntax to *write* one, previously missing entirely. `(` can't
+// otherwise start a `type_` (no parenthesized-type grouping exists), so
+// there's no ambiguity to resolve by ordering here, unlike `expr`'s own
+// `(` overload (parenthesized expr vs. call arguments) — `type_` has no
+// such second meaning for a leading `(` to compete with. The return type is
+// mandatory, unlike `fn_decl`'s own optional `-> type_` (a function
+// *declaration* can leave its return type to be inferred from its body;
+// a type *annotation* has no body to infer anything from, so nothing to
+// default to `()` from — matches every other type-annotation position in
+// this grammar, all of which are fully explicit, never partially inferred).
+fn_type     = { "(" ~ (type_ ~ ("," ~ type_)*)? ~ ")" ~ "->" ~ type_ }
 // a generic argument is either a type or a const-generic value — numeric (`Matrix<f64, 3,
 // 3>`'s dimensions) or boolean (`Grid<true>`'s flag). `numeric_lit`/`bool_lit` are tried
 // *before* `type_`, not after: a bare number could never start a `path` (idents can't begin
@@ -150,8 +202,21 @@ lambda_expr = { "fn" ~ "(" ~ param_list? ~ ")" ~ ("->" ~ type_)? ~ block }
 
 // qualified calls (`Ring::add(a, b)`) need the same path as plain references —
 // `path`'s single-segment case still covers a bare `add(a, b)`.
-call_expr = { path ~ "(" ~ arg_list? ~ ")" }
+call_expr = { path ~ turbofish? ~ "(" ~ arg_list? ~ ")" }
 arg_list  = { expr ~ ("," ~ expr)* }
+
+// `fibonacci::<f64>(x)` / `Matrix::<f64, 4, 4>(values: ...)` — explicit type/const-generic
+// arguments at a call or struct-construction site, for when nothing about the arguments
+// themselves pins the instantiation down (see `infer.rs`'s own doc comment on
+// `ExprKind::Call`/`StructLit` for why relying on an incidentally-suffixed literal to
+// propagate the right type through unification was a real, reported ergonomics problem, not
+// just cosmetic). The double-colon isn't decorative: bare `f<T>(...)` in *expression*
+// position is genuinely ambiguous with `f < T > (...)` (three chained `<`/`>` comparisons) —
+// this grammar has no semantic lookahead to disambiguate the way a hand-written parser might,
+// so `::<` has to be its own unambiguous token sequence, exactly the reasoning Rust's own
+// turbofish exists for. `generic_arg` reused verbatim — same shape as a type's own `<...>`
+// argument list.
+turbofish = { "::" ~ "<" ~ generic_arg ~ ("," ~ generic_arg)* ~ ">" }
 
 // Struct construction: `Vec2(x: 1.0, y: 2.0)` — named-argument call syntax,
 // deliberately *not* Rust's `Vec2 { x: 1.0, y: 2.0 }`. Braces-after-path
@@ -170,7 +235,7 @@ arg_list  = { expr ~ ("," ~ expr)* }
 // field name at every
 // construction site, not just relying on argument order to line up with a
 // declaration that might be far away.
-struct_lit      = { path ~ "(" ~ field_init_list? ~ ")" }
+struct_lit      = { path ~ turbofish? ~ "(" ~ field_init_list? ~ ")" }
 field_init_list = { field_init ~ ("," ~ field_init)* }
 field_init      = { ident ~ ":" ~ expr }
 

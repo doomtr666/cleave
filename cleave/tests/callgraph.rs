@@ -466,3 +466,67 @@ fn a_bad_const_generic_type_name_is_caught_by_the_whole_program_pass_too() {
     );
     assert_eq!(ok_result(&result, "main"), Ty::Con("i32".to_string()));
 }
+
+#[test]
+fn a_higher_order_function_accepts_a_matching_lambda_from_a_caller() {
+    let src = "fn apply(f: (i32) -> i32, x: i32) -> i32 { f(x) }
+        fn g() -> i32 { let inc = fn(x) { x }; apply(inc, 5) }";
+    let program = lower_program(src);
+    let registry = registry_from(src);
+    let result = infer_program(&program, &registry);
+    assert_eq!(ok_result(&result, "g"), Ty::Con("i32".to_string()));
+}
+
+#[test]
+fn a_higher_order_function_rejects_a_lambda_with_the_wrong_return_type() {
+    let src = "fn apply(f: (i32) -> bool, x: i32) -> bool { f(x) }
+        fn g() -> bool { let bad = fn(x: i32) -> i32 { x }; apply(bad, 5) }";
+    let program = lower_program(src);
+    let registry = registry_from(src);
+    let result = infer_program(&program, &registry);
+    let err = err_result(&result, "g");
+    assert!(matches!(err.kind, cleave::infer::TypeErrorKind::Unify(_)), "got: {:?}", err.kind);
+}
+
+// ---------------------------------------------------------------------
+// a nullary top-level `fn`'s own returned type can still carry a free
+// variable with a real pending constraint on it -- the Monomorphism
+// Restriction means it's never `generalize`d, but the constraint must not
+// be lost just because of that (see `Infer::constraints_touching`'s own
+// doc comment for the bug this closes: a real, un-satisfiable program used
+// to silently type-check).
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_nullary_functions_returned_closure_still_enforces_its_own_constraint() {
+    let registry = builtin_registry();
+    let program = lower_program(
+        "fn make_adder() { fn(x) { add(x, x) } }
+        fn use_i32() -> i32 { let f = make_adder(); f(5) }",
+    );
+    let result = infer_program(&program, &registry);
+    assert!(result.results.get("make_adder").unwrap().is_ok(), "{:?}", result.results.get("make_adder"));
+    assert_eq!(ok_result(&result, "use_i32"), Ty::Con("i32".to_string()));
+}
+
+#[test]
+fn a_nullary_functions_returned_closure_rejects_a_type_with_no_matching_impl() {
+    // Same `make_adder` as above, but instantiated at `bool` -- `Ring` has
+    // no `impl Ring<bool>` anywhere in `builtin_registry`. Before this fix,
+    // `make_adder`'s own `Ring` constraint on its closure's parameter
+    // vanished the moment `make_adder`'s own group (and its `Infer`
+    // instance) finished, since `Scheme::mono` carried zero constraints —
+    // this type-checked successfully with no error at all.
+    let registry = builtin_registry();
+    let program = lower_program(
+        "fn make_adder() { fn(x) { add(x, x) } }
+        fn use_bool() -> bool { let f = make_adder(); f(true) }",
+    );
+    let result = infer_program(&program, &registry);
+    let err = err_result(&result, "use_bool");
+    assert!(
+        matches!(&err.kind, cleave::infer::TypeErrorKind::MissingImpl { algebra, .. } if algebra == "Ring"),
+        "got: {:?}",
+        err.kind
+    );
+}

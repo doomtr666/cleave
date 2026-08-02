@@ -80,7 +80,7 @@
 //! problem, not this one.
 
 use crate::ast::*;
-use crate::infer::{check_no_placeholder, Env, Infer, Scheme, Ty, TypeError};
+use crate::infer::{check_no_placeholder, Constraint, Env, Infer, Scheme, Ty, TypeError};
 use crate::registry::Registry;
 use std::collections::{HashMap, HashSet};
 
@@ -95,6 +95,14 @@ pub struct ProgramInference {
     /// One entry per top-level `fn` in the program, keyed by name.
     pub results: HashMap<String, Result<FnResult, TypeError>>,
     pub node_types: HashMap<NodeId, Ty>,
+    /// Every top-level `fn`'s finished, generalized `Scheme`, by name — the
+    /// same `Env` this pass builds up internally, exposed so `dump.rs` can
+    /// seed an `impl` method's own body with it
+    /// (`Infer::infer_impl_fn_generic_with_env`), letting it call an
+    /// ordinary top-level function by name instead of always hitting
+    /// `infer_call`'s unresolved-call placeholder (see that method's own
+    /// doc comment for the bug this closes).
+    pub global_env: Env,
 }
 
 /// Runs whole-program inference over every top-level `fn` in `program` (see
@@ -178,17 +186,27 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
         // takes no input to begin with. It also keeps `main` itself (always
         // nullary) reporting a concrete signature rather than a spuriously
         // "generic" one.
+        let mut nullary_constraints: HashMap<String, Vec<Constraint>> = HashMap::new();
         for name in group {
             let Ok(_) = &raw_results[name] else { continue };
             let f = functions[name.as_str()];
-            if f.params.is_empty() {
-                continue;
-            }
             let (param_types, ret_var, _) = &placeholders[name];
             let final_fn_ty = Ty::Fn(
                 param_types.iter().map(|t| infer.subst.apply(t)).collect(),
                 Box::new(infer.subst.apply(ret_var)),
             );
+            if f.params.is_empty() {
+                // Not generalized (Monomorphism Restriction — see below) —
+                // but a pending constraint on a variable this nullary
+                // member's own returned type still exposes must still
+                // survive into its `Scheme::mono`, captured here (this
+                // group's own `Infer`, and `self.constraints` along with
+                // it, is discarded once this group finishes) for the
+                // second loop below to attach. See `Infer::constraints_
+                // touching`'s own doc comment for the bug this closes.
+                nullary_constraints.insert(name.clone(), infer.constraints_touching(&final_fn_ty));
+                continue;
+            }
             // Generalized against `global_env` — the group's own siblings
             // (`group_env`) must not count as "free in the environment", see
             // module docs.
@@ -227,28 +245,36 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
 
                     match check_no_placeholder(f, &final_result, &final_params) {
                         Ok(()) => {
-                            // A nullary member never went through the
-                            // generalize loop above (Monomorphism
-                            // Restriction — see its own comment) and so was
-                            // never added to `global_env` at all — a real
-                            // bug, found by testing: any *other* function
-                            // calling a nullary helper (`fn make() -> Vec2 {
-                            // ... } fn main() { make() }`) silently fell
-                            // through to `infer_call`'s unresolved-call
+                            // A nullary member never gets *generalized*
+                            // above (Monomorphism Restriction — see the
+                            // first loop's own comment) and so was never
+                            // added to `global_env` at all until this point
+                            // — a real bug, found by testing: any *other*
+                            // function calling a nullary helper (`fn make()
+                            // -> Vec2 { ... } fn main() { make() }`) silently
+                            // fell through to `infer_call`'s unresolved-call
                             // placeholder, since `env.get("make")` never
                             // found anything. Not generalizing a nullary
                             // binding only ever meant "don't quantify its
                             // free variables" — it never meant "don't expose
-                            // it to callers at all". Inserted as a trivial
-                            // `Scheme::mono` (matching a parameterized
-                            // member's `Scheme`, minus any quantified vars)
-                            // using the exact same fully-resolved type
-                            // `FnResult` itself reports, so a later caller's
-                            // `instantiate` (a no-op on a mono scheme) sees
-                            // the real, concrete answer.
+                            // it to callers at all". Inserted with an empty
+                            // `vars` (matching a parameterized member's own
+                            // `Scheme`, minus any quantified vars) using the
+                            // exact same fully-resolved type `FnResult`
+                            // itself reports, so a later caller's
+                            // `instantiate` (a no-op on an unquantified
+                            // scheme) sees the real, concrete answer — but
+                            // *with* `nullary_constraints`' own entry
+                            // attached (not the true empty-`Scheme::mono` a
+                            // parameterless binding might suggest — see
+                            // `Infer::constraints_touching`'s own doc
+                            // comment for why an empty constraint list here
+                            // would silently lose a real, checkable
+                            // requirement).
                             if f.params.is_empty() {
                                 let ty = Ty::Fn(final_params.clone(), Box::new(final_result.clone()));
-                                global_env.insert(name.clone(), Scheme::mono(ty));
+                                let constraints = nullary_constraints.remove(name).unwrap_or_default();
+                                global_env.insert(name.clone(), Scheme { vars: Vec::new(), constraints, ty });
                             }
                             results
                                 .insert(name.clone(), Ok(FnResult { param_types: final_params, result: final_result }));
@@ -267,7 +293,7 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
         node_types.extend(infer.node_types.iter().map(|(id, t)| (*id, infer.subst.apply(t))));
     }
 
-    ProgramInference { results, node_types }
+    ProgramInference { results, node_types, global_env }
 }
 
 // ------------------------------------------------------------ static call-graph scan
@@ -303,7 +329,7 @@ fn collect_calls_expr(expr: &Expr, known: &HashSet<&str>, out: &mut Vec<String>)
                 out.push(name);
             }
         }
-        ExprKind::Call(path, args) => {
+        ExprKind::Call(path, _, args) => {
             let name = path.segments.join("::");
             if known.contains(name.as_str()) {
                 out.push(name);
@@ -328,7 +354,7 @@ fn collect_calls_expr(expr: &Expr, known: &HashSet<&str>, out: &mut Vec<String>)
                 collect_calls_expr(e, known, out);
             }
         }
-        ExprKind::StructLit(_, fields) => {
+        ExprKind::StructLit(_, _, fields) => {
             for (_, v) in fields {
                 collect_calls_expr(v, known, out);
             }

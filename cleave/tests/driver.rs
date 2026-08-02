@@ -168,3 +168,25 @@ fn generic_impls_sharing_a_bare_target_shape_but_different_bounds_stay_distinct(
         assert_eq!(d.fns.len(), 1, "each impl should keep only its own fn, got: {:?}", d.fns.iter().map(|f| &f.name).collect::<Vec<_>>());
     }
 }
+
+#[test]
+fn inherent_impl_fragments_across_files_are_merged_by_target() {
+    let f1 = file(0, "a.cleave", "struct Vec2 { x: f64, y: f64 }\nimpl struct Vec2 { fn len(v) { v.x } }");
+    let f2 = file(1, "b.cleave", "impl struct Vec2 { fn scale(v) { v.x } }");
+
+    let merged = merge_programs(vec![parse_file(&f1).unwrap(), parse_file(&f2).unwrap()]).unwrap();
+    let inherent: Vec<_> = merged.items.iter().filter(|i| matches!(i.kind, ItemKind::InherentImpl(_))).collect();
+    assert_eq!(inherent.len(), 1, "same target -- one merged fragment, got:\n{}", print_program(&merged));
+    let ItemKind::InherentImpl(d) = &inherent[0].kind else { unreachable!() };
+    assert_eq!(d.fns.len(), 2);
+}
+
+#[test]
+fn duplicate_inherent_method_across_files_is_a_conflict() {
+    let f1 = file(0, "a.cleave", "struct Vec2 { x: f64, y: f64 }\nimpl struct Vec2 { fn len(v) { v.x } }");
+    let f2 = file(1, "b.cleave", "impl struct Vec2 { fn len(v) { v.y } }");
+
+    let errs = merge_programs(vec![parse_file(&f1).unwrap(), parse_file(&f2).unwrap()]).unwrap_err();
+    assert_eq!(errs.len(), 1);
+    assert!(errs[0].message.contains("len"), "got: {}", errs[0].message);
+}

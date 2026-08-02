@@ -281,3 +281,95 @@ fn main() -> i32 {
 ";
     parses(Rule::program, src);
 }
+
+#[test]
+fn turbofish_on_a_call() {
+    parses(Rule::expr, "fibonacci::<f64>(x)");
+}
+
+#[test]
+fn turbofish_on_a_struct_construction() {
+    parses(Rule::expr, "Matrix::<f64, 4, 4>(values: v)");
+}
+
+#[test]
+fn turbofish_is_not_confused_with_comparison_chains() {
+    // The whole reason `::<` exists rather than bare `<...>` in expression
+    // position: `f < T > (a, b)` (three chained comparisons) is otherwise a
+    // perfectly valid parse of the exact same characters. Checked here by
+    // inspecting *which* alternative `primary` picked, not just that
+    // something parsed — same style as `zero_arg_call_is_not_parsed_as_a_
+    // struct_literal`.
+    let pair = CleaveParser::parse(Rule::primary, "f::<i32>(x)").unwrap().next().unwrap();
+    let inner = pair.into_inner().next().unwrap();
+    assert_eq!(inner.as_rule(), Rule::call_expr, "got: {:?}", inner.as_rule());
+}
+
+#[test]
+fn function_type_annotation_parses() {
+    parses(Rule::fn_decl, "fn apply(f: (i32) -> i32, x: i32) -> i32 { f(x) }");
+}
+
+#[test]
+fn function_type_with_no_params_parses() {
+    parses(Rule::type_, "() -> i32");
+}
+
+#[test]
+fn function_type_with_multiple_params_parses() {
+    parses(Rule::type_, "(i32, f64) -> bool");
+}
+
+#[test]
+fn inherent_impl_on_a_bare_struct_name_parses() {
+    parses(Rule::impl_decl, "impl struct Vec2 {\n    fn len(v) { v.x }\n}");
+}
+
+#[test]
+fn inherent_impl_on_a_generic_struct_parses() {
+    parses(Rule::impl_decl, "impl<T> struct Matrix<T> {\n    fn get(m) { m }\n}");
+}
+
+#[test]
+fn inherent_impl_is_distinguished_from_an_algebra_impl_by_the_struct_keyword() {
+    let pair =
+        CleaveParser::parse(Rule::impl_decl, "impl struct Vec2 { fn len(v) { v.x } }").unwrap().next().unwrap();
+    let inner = pair.into_inner().next().unwrap();
+    assert_eq!(inner.as_rule(), Rule::inherent_impl, "got: {:?}", inner.as_rule());
+}
+
+#[test]
+fn algebra_impl_is_still_recognized_as_such() {
+    let pair = CleaveParser::parse(Rule::impl_decl, "impl Ring<Vec2> { fn add(a, b) { a } }").unwrap().next().unwrap();
+    let inner = pair.into_inner().next().unwrap();
+    assert_eq!(inner.as_rule(), Rule::algebra_impl, "got: {:?}", inner.as_rule());
+}
+
+#[test]
+fn a_single_generic_struct_target_is_no_longer_ambiguous_with_an_algebra_impl() {
+    // The real bug the `struct` keyword fixes, found by testing:
+    // `impl<T> Boxed<T> { ... }` (no keyword) parses *identically* either
+    // way -- `algebra_impl` treats `Boxed` as an algebra name with `T` as
+    // its own single-type target, and fully matches, wrongly, since
+    // `algebra_impl` is tried first. The `struct` keyword makes the two
+    // shapes unambiguous at the very first token that differs.
+    let pair = CleaveParser::parse(Rule::impl_decl, "impl<T> struct Boxed<T> { fn get(b) { b } }")
+        .unwrap()
+        .next()
+        .unwrap();
+    let inner = pair.into_inner().next().unwrap();
+    assert_eq!(inner.as_rule(), Rule::inherent_impl, "got: {:?}", inner.as_rule());
+}
+
+#[test]
+fn multi_target_algebra_impl_parses() {
+    parses(
+        Rule::impl_decl,
+        "impl<T: Float, const N: i32, const M: i32, const K: i32> MatMul<Matrix<T,N,M>, Matrix<T,M,K>, Matrix<T,N,K>> {\n    fn mul(a, b) { a }\n}",
+    );
+}
+
+#[test]
+fn single_target_algebra_impl_still_parses_unchanged() {
+    parses(Rule::impl_decl, "impl Ring<Vec2> { fn add(a, b) { a } }");
+}
