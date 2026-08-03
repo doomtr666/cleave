@@ -1,23 +1,24 @@
-//! `cleave <file.cleave> [--dump-ast] [--dump-inference-pass]` — compiles one
-//! file (with real `use` resolution: the file's own directory as the
-//! project search path, the shipped stdlib always as a fallback — see
-//! `driver::compile`). This is the front-end so far: parse, lower, merge,
-//! resolve `use`, infer — nothing downstream of that exists yet (no
-//! monomorphization, no e-graph, no MLIR).
+//! `cleave <file.cleave> [--dump-ast] [--dump-inference-pass] [--dump-monomorphized]`
+//! — compiles one file (with real `use` resolution: the file's own directory
+//! as the project search path, the shipped stdlib always as a fallback —
+//! see `driver::compile`). This is the front-end so far: parse, lower,
+//! merge, resolve `use`, infer, monomorphize top-level `fn`s — nothing
+//! downstream of that exists yet (no e-graph, no MLIR).
 //!
 //! Each compiler pass gets its own `--dump-<pass>` flag, printing exactly
 //! that stage's output and nothing else — the same "see before and after,
 //! don't guess" discipline `print.rs` was built for early on, extended to a
 //! real multi-flag CLI instead of hand-editing this file per experiment.
-//! Passing none defaults to `--dump-inference-pass` alone (today's only
-//! real pass); passing more than one prints each requested stage under its
-//! own header, in pipeline order, so "before" and "after" a given pass sit
-//! next to each other. More `--dump-*` flags arrive as more passes do (CPS
-//! conversion, monomorphization, ...).
+//! Passing none defaults to `--dump-inference-pass` alone (today's most
+//! commonly wanted pass); passing more than one prints each requested stage
+//! under its own header, in pipeline order, so "before" and "after" a given
+//! pass sit next to each other. More `--dump-*` flags arrive as more passes
+//! do (CPS conversion, ...).
 
 use cleave::diag::SourceMap;
 use cleave::driver::compile;
 use cleave::dump::dump_program;
+use cleave::monomorphize::dump_monomorphized;
 use cleave::print::print_program;
 use cleave::registry::Registry;
 use std::path::PathBuf;
@@ -27,17 +28,20 @@ struct Args {
     path: PathBuf,
     dump_ast: bool,
     dump_inference_pass: bool,
+    dump_monomorphized: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut path = None;
     let mut dump_ast = false;
     let mut dump_inference_pass = false;
+    let mut dump_monomorphized = false;
 
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--dump-ast" => dump_ast = true,
             "--dump-inference-pass" => dump_inference_pass = true,
+            "--dump-monomorphized" => dump_monomorphized = true,
             other if other.starts_with("--") => return Err(format!("unknown flag {other:?}")),
             other if path.is_none() => path = Some(PathBuf::from(other)),
             other => return Err(format!("only one input file is supported, got a second argument {other:?}")),
@@ -47,13 +51,15 @@ fn parse_args() -> Result<Args, String> {
     // No `--dump-*` flag at all defaults to today's one real pass, so the
     // common case (`cleave file.cleave`) stays exactly as terse as before
     // these flags existed.
-    if !dump_ast && !dump_inference_pass {
+    if !dump_ast && !dump_inference_pass && !dump_monomorphized {
         dump_inference_pass = true;
     }
 
     match path {
-        Some(path) => Ok(Args { path, dump_ast, dump_inference_pass }),
-        None => Err("usage: cleave <file.cleave> [--dump-ast] [--dump-inference-pass]".to_string()),
+        Some(path) => Ok(Args { path, dump_ast, dump_inference_pass, dump_monomorphized }),
+        None => {
+            Err("usage: cleave <file.cleave> [--dump-ast] [--dump-inference-pass] [--dump-monomorphized]".to_string())
+        }
     }
 }
 
@@ -104,7 +110,8 @@ fn main() -> ExitCode {
     // Only header-separate stages when more than one is being dumped at
     // once — no point labeling the single thing being shown in the common,
     // single-flag (or no-flag) case.
-    let multiple = args.dump_ast && args.dump_inference_pass;
+    let flags_set = [args.dump_ast, args.dump_inference_pass, args.dump_monomorphized].iter().filter(|b| **b).count();
+    let multiple = flags_set > 1;
     let mut exit = ExitCode::SUCCESS;
 
     if args.dump_ast {
@@ -123,6 +130,23 @@ fn main() -> ExitCode {
         }
         let registry = Registry::build(&program);
         let (out, errs) = dump_program(&program, &registry);
+        print!("{out}");
+        if !errs.is_empty() {
+            let diags: Vec<_> = errs.iter().map(cleave::diag::Diagnostic::from).collect();
+            report(&diags, &sources);
+            exit = ExitCode::FAILURE;
+        }
+        if multiple {
+            println!();
+        }
+    }
+
+    if args.dump_monomorphized {
+        if multiple {
+            println!("--- monomorphized ---\n");
+        }
+        let registry = Registry::build(&program);
+        let (out, errs) = dump_monomorphized(&program, &registry);
         print!("{out}");
         if !errs.is_empty() {
             let diags: Vec<_> = errs.iter().map(cleave::diag::Diagnostic::from).collect();

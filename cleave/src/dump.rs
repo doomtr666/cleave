@@ -105,12 +105,12 @@ pub fn dump_program(program: &Program, registry: &Registry) -> (String, Vec<Type
 /// their own first free variable is correct, not a collision; they really
 /// are independent.
 #[derive(Default)]
-struct TyVarNames {
+pub(crate) struct TyVarNames {
     names: HashMap<TyVar, String>,
 }
 
 impl TyVarNames {
-    fn get(&mut self, v: TyVar) -> String {
+    pub(crate) fn get(&mut self, v: TyVar) -> String {
         let next = self.names.len();
         self.names
             .entry(v)
@@ -123,7 +123,7 @@ impl TyVarNames {
     }
 }
 
-fn fmt_ty_named(ty: &Ty, names: &mut TyVarNames) -> String {
+pub(crate) fn fmt_ty_named(ty: &Ty, names: &mut TyVarNames) -> String {
     match ty {
         Ty::Var(v) => format!("'{}", names.get(*v)),
         Ty::Con(name) => name.clone(),
@@ -247,24 +247,47 @@ fn dump_inherent_impl_block(
     }
 }
 
-fn dump_block(out: &mut String, block: &Block, node_types: &NodeTypes, names: &mut TyVarNames, indent: usize) {
+pub(crate) fn dump_block(out: &mut String, block: &Block, node_types: &NodeTypes, names: &mut TyVarNames, indent: usize) {
+    dump_block_with_call_names(out, block, node_types, names, indent, &HashMap::new());
+}
+
+/// Like `dump_block`, but a `Call` node present in `call_names` renders
+/// under that name instead of its own literal callee path — used by
+/// `monomorphize.rs` to show a specialization's own mangled callee names
+/// (`identity<i32>(x)`) rather than the ambiguous original (`identity(x)`,
+/// which specialization?). `dump_block` itself is a thin wrapper passing an
+/// empty map, kept as the stable, simpler entry point every pre-existing
+/// caller (none of which have any mangling concept) still uses unchanged.
+pub(crate) fn dump_block_with_call_names(
+    out: &mut String,
+    block: &Block,
+    node_types: &NodeTypes,
+    names: &mut TyVarNames,
+    indent: usize,
+    call_names: &HashMap<NodeId, String>,
+) {
     let pad = "    ".repeat(indent);
     for stmt in &block.stmts {
         match &stmt.kind {
             StmtKind::Let { mutable, name, value, .. } => {
                 let mut_kw = if *mutable { "mut " } else { "" };
-                let _ = writeln!(out, "{pad}let {mut_kw}{name} = {};", fmt_expr_typed(value, node_types, names));
+                let _ = writeln!(out, "{pad}let {mut_kw}{name} = {};", fmt_expr_typed(value, node_types, names, call_names));
             }
-            StmtKind::Assign { name, value } => {
-                let _ = writeln!(out, "{pad}{name} = {};", fmt_expr_typed(value, node_types, names));
+            StmtKind::Assign { target, value } => {
+                let _ = writeln!(
+                    out,
+                    "{pad}{} = {};",
+                    fmt_expr_typed(target, node_types, names, call_names),
+                    fmt_expr_typed(value, node_types, names, call_names)
+                );
             }
             StmtKind::Expr(e) => {
-                let _ = writeln!(out, "{pad}{};", fmt_expr_typed(e, node_types, names));
+                let _ = writeln!(out, "{pad}{};", fmt_expr_typed(e, node_types, names, call_names));
             }
         }
     }
     if let Some(tail) = &block.tail {
-        let _ = writeln!(out, "{pad}{}", fmt_expr_typed(tail, node_types, names));
+        let _ = writeln!(out, "{pad}{}", fmt_expr_typed(tail, node_types, names, call_names));
     }
 }
 
@@ -278,7 +301,7 @@ fn dump_block(out: &mut String, block: &Block, node_types: &NodeTypes, names: &m
 /// tests) — this is a separate renderer specifically for
 /// `--dump-inference-pass`, where seeing only the outermost type per line
 /// isn't enough to actually debug a deeply nested expression.
-fn fmt_expr_typed(e: &Expr, node_types: &NodeTypes, names: &mut TyVarNames) -> String {
+fn fmt_expr_typed(e: &Expr, node_types: &NodeTypes, names: &mut TyVarNames, call_names: &HashMap<NodeId, String>) -> String {
     // A suffixed literal is already fully annotated by its own suffix
     // (`1:i32`) — looking `node_types` up too would just repeat the same
     // information a second time.
@@ -292,45 +315,54 @@ fn fmt_expr_typed(e: &Expr, node_types: &NodeTypes, names: &mut TyVarNames) -> S
         ExprKind::BoolLit(b) => b.to_string(),
         ExprKind::Path(p) => p.segments.join("::"),
         ExprKind::Call(path, generics, args) => {
-            format!(
-                "{}{}({})",
-                path.segments.join("::"),
-                fmt_turbofish(generics),
-                fmt_expr_list_typed(args, node_types, names)
-            )
+            // A specialization's own mangled name (`identity<i32>`), when
+            // this specific call node has one (see `call_names`'s own doc
+            // comment) — the *original* callee path otherwise, exactly as
+            // before this parameter existed.
+            let name = call_names.get(&e.id).cloned().unwrap_or_else(|| path.segments.join("::"));
+            format!("{name}{}({})", fmt_turbofish(generics), fmt_expr_list_typed(args, node_types, names, call_names))
         }
-        ExprKind::FieldAccess(base, name) => format!("{}.{name}", fmt_expr_typed(base, node_types, names)),
+        ExprKind::FieldAccess(base, name) => format!("{}.{name}", fmt_expr_typed(base, node_types, names, call_names)),
         ExprKind::MethodCall(base, name, args) => {
             format!(
                 "{}.{name}({})",
-                fmt_expr_typed(base, node_types, names),
-                fmt_expr_list_typed(args, node_types, names)
+                fmt_expr_typed(base, node_types, names, call_names),
+                fmt_expr_list_typed(args, node_types, names, call_names)
             )
         }
         ExprKind::Index(base, idx) => {
-            format!("{}[{}]", fmt_expr_typed(base, node_types, names), fmt_expr_typed(idx, node_types, names))
+            format!(
+                "{}[{}]",
+                fmt_expr_typed(base, node_types, names, call_names),
+                fmt_expr_typed(idx, node_types, names, call_names)
+            )
         }
-        ExprKind::ArrayLit(elems) => format!("[{}]", fmt_expr_list_typed(elems, node_types, names)),
+        ExprKind::ArrayLit(elems) => format!("[{}]", fmt_expr_list_typed(elems, node_types, names, call_names)),
+        ExprKind::ArrayRepeat { value, count } => format!(
+            "[{}; {}]",
+            fmt_expr_typed(value, node_types, names, call_names),
+            fmt_expr_typed(count, node_types, names, call_names)
+        ),
         ExprKind::StructLit(path, generics, fields) => format!(
             "{}{}({})",
             path.segments.join("::"),
             fmt_turbofish(generics),
             fields
                 .iter()
-                .map(|(name, v)| format!("{name}: {}", fmt_expr_typed(v, node_types, names)))
+                .map(|(name, v)| format!("{name}: {}", fmt_expr_typed(v, node_types, names, call_names)))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
         ExprKind::If { cond, then_branch, else_branch } => {
             let mut s = format!(
                 "if {} {}",
-                fmt_expr_typed(cond, node_types, names),
-                fmt_block_inline_typed(then_branch, node_types, names)
+                fmt_expr_typed(cond, node_types, names, call_names),
+                fmt_block_inline_typed(then_branch, node_types, names, call_names)
             );
             if let Some(eb) = else_branch {
                 let _ = write!(s, " else {}", match &**eb {
-                    ElseBranch::If(i) => fmt_expr_typed(i, node_types, names),
-                    ElseBranch::Block(b) => fmt_block_inline_typed(b, node_types, names),
+                    ElseBranch::If(i) => fmt_expr_typed(i, node_types, names, call_names),
+                    ElseBranch::Block(b) => fmt_block_inline_typed(b, node_types, names, call_names),
                 });
             }
             s
@@ -338,47 +370,51 @@ fn fmt_expr_typed(e: &Expr, node_types: &NodeTypes, names: &mut TyVarNames) -> S
         ExprKind::While { cond, body } => {
             format!(
                 "while {} {}",
-                fmt_expr_typed(cond, node_types, names),
-                fmt_block_inline_typed(body, node_types, names)
+                fmt_expr_typed(cond, node_types, names, call_names),
+                fmt_block_inline_typed(body, node_types, names, call_names)
             )
         }
         ExprKind::For { var, start, end, body } => format!(
             "for {var} in {}..{} {}",
-            fmt_expr_typed(start, node_types, names),
-            fmt_expr_typed(end, node_types, names),
-            fmt_block_inline_typed(body, node_types, names)
+            fmt_expr_typed(start, node_types, names, call_names),
+            fmt_expr_typed(end, node_types, names, call_names),
+            fmt_block_inline_typed(body, node_types, names, call_names)
         ),
-        ExprKind::Block(b) => fmt_block_inline_typed(b, node_types, names),
+        ExprKind::Block(b) => fmt_block_inline_typed(b, node_types, names, call_names),
         ExprKind::Lambda { params, ret, body } => {
             let ret_ann = ret.as_ref().map(|t| format!(" -> {}", fmt_type(t))).unwrap_or_default();
-            format!("fn({}){ret_ann} {}", fmt_params(params), fmt_block_inline_typed(body, node_types, names))
+            format!("fn({}){ret_ann} {}", fmt_params(params), fmt_block_inline_typed(body, node_types, names, call_names))
         }
     };
     let ty = node_types.get(&e.id).map(|t| fmt_ty_named(t, names)).unwrap_or_else(|| "?".to_string());
     format!("{base}:{ty}")
 }
 
-fn fmt_expr_list_typed(exprs: &[Expr], node_types: &NodeTypes, names: &mut TyVarNames) -> String {
-    exprs.iter().map(|e| fmt_expr_typed(e, node_types, names)).collect::<Vec<_>>().join(", ")
+fn fmt_expr_list_typed(exprs: &[Expr], node_types: &NodeTypes, names: &mut TyVarNames, call_names: &HashMap<NodeId, String>) -> String {
+    exprs.iter().map(|e| fmt_expr_typed(e, node_types, names, call_names)).collect::<Vec<_>>().join(", ")
 }
 
 /// Like `print.rs`'s own `fmt_block_inline`, but every statement/tail inside
 /// is rendered via `fmt_expr_typed`.
-fn fmt_block_inline_typed(b: &Block, node_types: &NodeTypes, names: &mut TyVarNames) -> String {
+fn fmt_block_inline_typed(b: &Block, node_types: &NodeTypes, names: &mut TyVarNames, call_names: &HashMap<NodeId, String>) -> String {
     let mut parts: Vec<String> = b
         .stmts
         .iter()
         .map(|s| match &s.kind {
             StmtKind::Let { mutable, name, value, .. } => {
                 let mut_kw = if *mutable { "mut " } else { "" };
-                format!("let {mut_kw}{name} = {};", fmt_expr_typed(value, node_types, names))
+                format!("let {mut_kw}{name} = {};", fmt_expr_typed(value, node_types, names, call_names))
             }
-            StmtKind::Assign { name, value } => format!("{name} = {};", fmt_expr_typed(value, node_types, names)),
-            StmtKind::Expr(e) => format!("{};", fmt_expr_typed(e, node_types, names)),
+            StmtKind::Assign { target, value } => format!(
+                "{} = {};",
+                fmt_expr_typed(target, node_types, names, call_names),
+                fmt_expr_typed(value, node_types, names, call_names)
+            ),
+            StmtKind::Expr(e) => format!("{};", fmt_expr_typed(e, node_types, names, call_names)),
         })
         .collect();
     if let Some(tail) = &b.tail {
-        parts.push(fmt_expr_typed(tail, node_types, names));
+        parts.push(fmt_expr_typed(tail, node_types, names, call_names));
     }
     if parts.is_empty() {
         "{}".to_string()

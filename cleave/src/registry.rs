@@ -76,7 +76,6 @@ struct ImplEntry {
     /// comment for why this stays a separate field rather than folding
     /// `target` into a single always-a-`Vec` shape.
     extra_targets: Vec<Type>,
-    #[allow(dead_code)]
     fns: Vec<FnDecl>,
 }
 
@@ -331,6 +330,30 @@ impl Registry {
                         let targets: Vec<&Type> =
                             std::iter::once(&i.target).chain(i.extra_targets.iter()).collect();
                         (i.generics.as_slice(), targets)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Like `all_impls`, but also hands back each impl's own declared `fn`s
+    /// — needed by `monomorphize.rs`, the one consumer that actually needs
+    /// to specialize an impl method's own *body*, not just match its target
+    /// pattern the way dispatch (`Infer::match_impl`) does. A separate
+    /// method rather than widening `all_impls` itself: `match_impl` runs on
+    /// every algebra-dispatched call during ordinary inference, and has no
+    /// use for the extra `&[FnDecl]` slice it would otherwise have to carry
+    /// around for nothing.
+    pub fn all_impls_with_fns(&self, algebra: &str) -> Vec<(&[GenericParam], Vec<&Type>, &[FnDecl])> {
+        self.algebras
+            .get(algebra)
+            .map(|e| {
+                e.impls
+                    .values()
+                    .map(|i| {
+                        let targets: Vec<&Type> =
+                            std::iter::once(&i.target).chain(i.extra_targets.iter()).collect();
+                        (i.generics.as_slice(), targets, i.fns.as_slice())
                     })
                     .collect()
             })

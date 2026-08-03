@@ -1354,6 +1354,50 @@ fn an_array_type_annotation_with_a_literal_size_round_trips() {
 }
 
 // ---------------------------------------------------------------------
+// constant folding (`const_eval`): pure literal arithmetic in a shape
+// position, general — not tied to any const generic being involved.
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_literal_arithmetic_array_size_folds_to_a_concrete_const() {
+    let ty = infer_src("fn f(a: [f64; 4+3]) -> [f64; 7] { a }");
+    assert_eq!(ty, Ty::Array(Box::new(Ty::Con("f64".to_string())), Box::new(Ty::Const(ConstValue::Int(7)))));
+}
+
+#[test]
+fn a_folded_literal_array_size_still_rejects_a_real_mismatch() {
+    // Proves folding is real (not a no-op that just gives up permissively):
+    // `4+3` must resolve to exactly `7`, not silently accept a `3`-element
+    // literal.
+    let f = lower_one_fn("fn f() -> [i32; 4+3] { [1, 2, 3] }");
+    let registry = builtin_registry();
+    let mut infer = Infer::new(&registry);
+    let err = infer.infer_fn(&f).unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::Unify(_)), "got: {:?}", err.kind);
+}
+
+#[test]
+fn an_unsupported_operator_in_shape_position_stays_permissively_unconstrained() {
+    // `const_eval::eval_binop` only knows `add`/`mul` so far -- `4-3`
+    // (`sub`) must fall through to the existing "not evaluated" placeholder
+    // (same as any other not-yet-inferred array type) rather than crash or
+    // be treated as a hard parse/evaluation error. That placeholder can
+    // never be *exposed* in a function's own signature though (same rule
+    // any other still-unresolved type follows, `check_no_placeholder`) --
+    // this is what proves the fallback path was actually reached, not
+    // skipped some other way.
+    let f = lower_one_fn("fn f(a: [i32; 4-3]) -> [i32; 4-3] { a }");
+    let registry = builtin_registry();
+    let mut infer = Infer::new(&registry);
+    let err = infer.infer_fn(&f).unwrap_err();
+    assert!(
+        matches!(&err.kind, TypeErrorKind::Unresolved(name) if name == "<array-type-not-yet-inferred>"),
+        "got: {:?}",
+        err.kind
+    );
+}
+
+// ---------------------------------------------------------------------
 // const-generics (`Matrix<f64, 3, 3>`): positional `Ty::App` args, mixing
 // type and const generics on the same struct
 // ---------------------------------------------------------------------
@@ -1714,6 +1758,37 @@ fn a_for_loops_variable_is_int_constrained_not_forced_to_a_specific_width() {
     // exactly as well as the default `i32`.
     let ty = infer_src("fn f() -> i64 { let mut acc = 0:i64; for i in 0:i64..10:i64 { acc = i; }; acc }");
     assert_eq!(ty, Ty::Con("i64".to_string()));
+}
+
+#[test]
+fn a_const_generic_used_as_a_for_loop_bound_stays_a_shape_slot_not_a_defaulted_int() {
+    // Regression test: `for i in 0..N` unifies `0`'s own (defaultable)
+    // literal var with `N`'s own shape-slot var (`ExprKind::For`'s own
+    // `unify_at(start_ty, end_ty)`) -- `apply_defaults` must not then
+    // commit `N := Ty::Con("i32")` for real (a *type*), which would
+    // permanently corrupt the array-size slot `N` is meant to stay usable
+    // as (a `Ty::Var`, eventually a `Ty::Const` once a caller pins it
+    // concretely) -- found by direct testing via `examples/matmul.cleave`,
+    // whose own `N`/`M`/`K` bounds, defaulted this way, then failed to
+    // monomorphize at all.
+    let f = lower_one_fn(
+        "fn fill<T: Int, const N: i32>(v: T) -> [T; N] {
+            let mut arr = [v; N];
+            for i in 0..N {
+                arr[i] = v;
+            };
+            arr
+        }",
+    );
+    let registry = builtin_registry();
+    let mut infer = Infer::new(&registry);
+    let ty = infer.infer_fn(&f).unwrap_or_else(|e| panic!("inference failed: {e:?}"));
+    match ty {
+        Ty::Array(_, size) => {
+            assert!(matches!(*size, Ty::Var(_)), "expected `N` to stay an abstract shape slot, got {size:?}")
+        }
+        other => panic!("expected an array type, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------

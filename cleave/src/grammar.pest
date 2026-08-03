@@ -135,8 +135,14 @@ stmt        = { let_stmt | assign_stmt | expr_stmt }
 // all in pest's output, making "was `mut` there?" undetectable otherwise.
 let_stmt    = { "let" ~ mut_kw? ~ ident ~ (":" ~ type_)? ~ "=" ~ expr ~ ";" }
 mut_kw      = { "mut" }
-// reassignment of an existing `let mut` binding — bare `=`, no `let` (see grammar.md)
-assign_stmt = { ident ~ "=" ~ expr ~ ";" }
+// reassignment of an existing `let mut` binding — bare `=`, no `let` (see grammar.md).
+// The target can be a plain name (`x = v;`) or a field/index chain into one
+// (`arr[i] = v;`, `arr[i,j] = v;`, `self.values[i] = v;`) — same shape as
+// `postfix_op` (see below) minus the call-args/method-call alternative, since
+// you can't assign through a method call.
+assign_stmt   = { assign_target ~ "=" ~ expr ~ ";" }
+assign_target = { ident ~ assign_suffix* }
+assign_suffix = { "." ~ ident | "[" ~ expr ~ ("," ~ expr)* ~ "]" }
 expr_stmt   = { expr ~ ";" }
 
 // ---------------------------------------------------------------- expressions
@@ -245,18 +251,23 @@ if_expr = { "if" ~ expr ~ block ~ ("else" ~ (if_expr | block))? }
 while_expr = { "while" ~ expr ~ block }
 for_expr   = { "for" ~ ident ~ "in" ~ additive ~ ".." ~ additive ~ block }
 
-// `[value; N]` -- repeat sugar, desugared at *lowering* time (not inference
-// time, unlike `array_type`'s own `[T; N]` size slot) into N copies of
-// `value`, so `N` is restricted to a literal `numeric_lit` here specifically
-// -- lowering is a purely syntactic pass with no unification/const-generic
-// resolution machinery to fall back on, so it can only ever expand a count
-// it can already read off the token stream directly. `array_repeat`/
-// `array_list` are distinct named rules (not just two shapes folded into
-// one), so lowering can tell which one actually matched -- both produce a
-// flat sequence of `expr` children on their own, indistinguishable from each
-// other without this.
+// `[value; N]` -- repeat sugar. `N` a literal `numeric_lit` desugars at
+// *lowering* time (not inference time, unlike `array_type`'s own `[T; N]`
+// size slot) into N copies of `value` -- lowering is a purely syntactic pass
+// with no unification machinery, so it can only expand a count it can
+// already read off the token stream. `N` an `ident` instead names a const
+// generic of the enclosing fn/impl (`[0.0; N]`); lowering can't expand that
+// (its value isn't known until monomorphization), so it stays a real
+// `ExprKind::ArrayRepeat` node, resolved through ordinary type inference
+// (see `infer.rs`) like everything else -- deliberately restricted to
+// `numeric_lit | ident` rather than a general `expr`: this names a
+// compile-time integer (a literal or a const-generic reference), not a
+// computation. `array_repeat`/`array_list` are distinct named rules (not
+// just two shapes folded into one), so lowering can tell which one actually
+// matched -- both produce a flat sequence of `expr` children on their own,
+// indistinguishable from each other without this.
 array_lit    = { "[" ~ (array_repeat | array_list)? ~ "]" }
-array_repeat = { expr ~ ";" ~ numeric_lit }
+array_repeat = { expr ~ ";" ~ (numeric_lit | ident) }
 array_list   = { expr ~ ("," ~ expr)* }
 
 // ---------------------------------------------------------------- literals

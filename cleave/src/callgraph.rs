@@ -274,7 +274,10 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
                             if f.params.is_empty() {
                                 let ty = Ty::Fn(final_params.clone(), Box::new(final_result.clone()));
                                 let constraints = nullary_constraints.remove(name).unwrap_or_default();
-                                global_env.insert(name.clone(), Scheme { vars: Vec::new(), constraints, ty });
+                                global_env.insert(
+                                    name.clone(),
+                                    Scheme { vars: Vec::new(), constraints, ty, const_widths: HashMap::new() },
+                                );
                             }
                             results
                                 .insert(name.clone(), Ok(FnResult { param_types: final_params, result: final_result }));
@@ -311,7 +314,10 @@ fn collect_calls_block(block: &Block, known: &HashSet<&str>, out: &mut Vec<Strin
     for stmt in &block.stmts {
         match &stmt.kind {
             StmtKind::Let { value, .. } => collect_calls_expr(value, known, out),
-            StmtKind::Assign { value, .. } => collect_calls_expr(value, known, out),
+            StmtKind::Assign { target, value } => {
+                collect_calls_expr(target, known, out);
+                collect_calls_expr(value, known, out);
+            }
             StmtKind::Expr(e) => collect_calls_expr(e, known, out),
         }
     }
@@ -353,6 +359,10 @@ fn collect_calls_expr(expr: &Expr, known: &HashSet<&str>, out: &mut Vec<String>)
             for e in elems {
                 collect_calls_expr(e, known, out);
             }
+        }
+        ExprKind::ArrayRepeat { value, count } => {
+            collect_calls_expr(value, known, out);
+            collect_calls_expr(count, known, out);
         }
         ExprKind::StructLit(_, _, fields) => {
             for (_, v) in fields {

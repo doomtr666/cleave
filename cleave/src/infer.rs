@@ -78,6 +78,7 @@
 //! time. See that module's own doc comment for the algorithm.
 
 use crate::ast::*;
+use crate::const_eval;
 use crate::print::fmt_type;
 use crate::registry::Registry;
 use std::collections::{HashMap, HashSet};
@@ -395,6 +396,18 @@ pub enum TypeErrorKind {
     /// Int` — `Int` is what *governs* legal types there, `i32`/`i64` are the
     /// actual types) — see `Infer::pending_type_name_checks`.
     TypeNameIsAnAlgebra { name: String },
+    /// A generic algebra-impl method's call site whose own concrete
+    /// argument/return types don't unify against *any* candidate impl's own
+    /// declaration-time pattern — found only by `monomorphize.rs`, never by
+    /// ordinary dispatch (`Infer::dispatch_algebra_call`), since dispatch
+    /// only ever needs the impl's own *target* pattern to match, never the
+    /// method's full parameter/return shape armed with whatever an impl's
+    /// own (possibly unsound — e.g. a stub body silently merging two
+    /// generics that should stay independent) declaration-time inference
+    /// happened to produce. See `monomorphize.rs`'s own doc comment for a
+    /// concrete example (a stub matmul body accidentally requiring a square
+    /// shape).
+    MonomorphizationFailed { algebra: String, method: String, tys: String },
 }
 
 impl std::fmt::Display for TypeErrorKind {
@@ -444,6 +457,9 @@ impl std::fmt::Display for TypeErrorKind {
             TypeErrorKind::TypeNameIsAnAlgebra { name } => {
                 write!(f, "`{name}` is an algebra, not a type — did you mean a concrete type it governs?")
             }
+            TypeErrorKind::MonomorphizationFailed { algebra, method, tys } => {
+                write!(f, "`{algebra}::{method}` cannot be specialized for ({tys}): its generic impl body doesn't type-check at this instantiation")
+            }
         }
     }
 }
@@ -458,19 +474,31 @@ impl From<&TypeError> for crate::diag::Diagnostic {
 
 pub type Env = HashMap<String, Scheme>;
 
-/// "`ty` must implement `algebra`" — generated wherever a type is used in a
-/// way that requires some algebra (an arithmetic operator call, a numeric
-/// literal's implicit `Num` requirement), then either checked immediately
-/// (if `ty` is already concrete) or carried along until it can be —
-/// including into an enclosing `let`'s [`Scheme`], via [`Infer::generalize`],
-/// which is what makes `fn add(a, b) { a + b }` able to infer its own
-/// `T: Ring` bound from nothing but usage. `span` is where the constraint
-/// *originated* (kept through renaming at `instantiate` time), so a
-/// violation caught later still points somewhere meaningful.
+/// "`tys` together must satisfy `algebra`" — generated wherever a type (or,
+/// for a multi-generic algebra dispatched with some argument still abstract,
+/// the *whole tuple* of that algebra's own generics — see
+/// `infer_algebra_call`'s deferred branches) is used in a way that requires
+/// some algebra (an arithmetic operator call, a numeric literal's implicit
+/// `Num` requirement), then either checked immediately (if every one of
+/// `tys` is already concrete) or carried along until it can be — including
+/// into an enclosing `let`'s [`Scheme`], via [`Infer::generalize`], which is
+/// what makes `fn add(a, b) { a + b }` able to infer its own `T: Ring` bound
+/// from nothing but usage. Almost always a single-element `Vec` (an ordinary
+/// bound/shape check); more than one element only for a multi-generic
+/// algebra's own deferred dispatch, checked together via `has_matching_impl`
+/// exactly like `match_impl`'s own immediate-dispatch path already does —
+/// checking each element independently could never verify a combined impl
+/// like `MatMul<f32,f32,f32>` exists (found by direct testing:
+/// `examples/matmul.cleave`'s own scalar multiply, deferred because its
+/// enclosing generic `T` is still abstract at declaration time, wrongly
+/// rejected as `no impl MatMul<f32>` under the old per-generic scheme).
+/// `span` is where the constraint *originated* (kept through renaming at
+/// `instantiate` time), so a violation caught later still points somewhere
+/// meaningful.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Constraint {
     pub algebra: String,
-    pub ty: Ty,
+    pub tys: Vec<Ty>,
     pub span: Span,
 }
 
@@ -485,15 +513,23 @@ pub struct Scheme {
     pub vars: Vec<TyVar>,
     pub constraints: Vec<Constraint>,
     pub ty: Ty,
+    /// For whichever of `vars` are const generics (`const N: i32`), their
+    /// own declared type — has to travel through `generalize`/`instantiate`
+    /// exactly like `constraints` does (see those functions' own doc
+    /// comments): a bound carried into this scheme can end up checked
+    /// against one of these vars once resolved to a bare `Ty::Const`, and
+    /// that check needs the *real* declared width, not a guess (see
+    /// `check_pending_constraints`'s own `Ty::Const` bridge).
+    pub const_widths: HashMap<TyVar, Ty>,
 }
 
 impl Scheme {
     pub(crate) fn mono(ty: Ty) -> Self {
-        Scheme { vars: Vec::new(), constraints: Vec::new(), ty }
+        Scheme { vars: Vec::new(), constraints: Vec::new(), ty, const_widths: HashMap::new() }
     }
 }
 
-fn free_vars(ty: &Ty, out: &mut HashSet<TyVar>) {
+pub(crate) fn free_vars(ty: &Ty, out: &mut HashSet<TyVar>) {
     match ty {
         Ty::Var(v) => {
             out.insert(*v);
@@ -517,7 +553,7 @@ fn free_vars(ty: &Ty, out: &mut HashSet<TyVar>) {
     }
 }
 
-fn substitute(ty: &Ty, mapping: &HashMap<TyVar, Ty>) -> Ty {
+pub(crate) fn substitute(ty: &Ty, mapping: &HashMap<TyVar, Ty>) -> Ty {
     match ty {
         Ty::Var(v) => mapping.get(v).cloned().unwrap_or_else(|| ty.clone()),
         Ty::Con(_) | Ty::Const(_) => ty.clone(),
@@ -644,6 +680,19 @@ pub struct Infer<'r> {
     /// `NodeId` to key a side-table entry by (see `grammar.md`/`ast.rs`;
     /// not every syntactic node got the uniform `Node<T>` treatment).
     pub param_types: Vec<Ty>,
+    /// Set only by `infer_impl_fn_generic_with_env` — this impl's own
+    /// target(s) (`Matrix<T,N,M>`, `Matrix<T,M,K>`, `Matrix<T,N,K>` for a
+    /// `MatMul` impl), resolved through the *same* fresh `impl_mapping*`
+    /// `param_types`/the method's own body used, so a caller (`monomorphize.rs`)
+    /// can unify these against a call site's own concrete types and, in the
+    /// very same `Subst`, recover consistent bindings for every one of this
+    /// impl's own generics — `param_types` alone isn't enough for that,
+    /// since an algebra's own return-type-only generic (`C` in `fn mul(a:
+    /// A, b: B) -> C;`) never appears there at all. Empty for every other
+    /// entry point (`infer_fn`, `infer_inherent_impl_fn_generic`, ...) —
+    /// there's no equivalent "target pattern" for a top-level `fn` or an
+    /// inherent method to expose here.
+    pub target_types: Vec<Ty>,
     /// Every type variable `generalize` has ever quantified into some
     /// binding's `Scheme` — `apply_defaults` must never bind one of these.
     /// Found necessary by testing, not by design up front: a self-recursive
@@ -711,6 +760,20 @@ pub struct Infer<'r> {
     /// today, since nothing infers two methods' bodies inside one another,
     /// but harmless either way: each key is its own (struct, name) pair).
     in_progress_methods: HashMap<(String, String), (Vec<Ty>, Ty)>,
+    /// Each const generic's own declared type (`i32`, `i64`, `bool`, ...),
+    /// keyed by its own fresh var — populated once, in `fresh_generics_
+    /// mapping`'s `Const` arm, for every const generic this `Infer` instance
+    /// ever mints a fresh var for. Consulted by `check_pending_constraints`
+    /// when a constraint's own type resolves to a bare `Ty::Const` (a const
+    /// generic referenced as an ordinary value, e.g. a `for` loop bound) —
+    /// without this, nothing could recover which *specific* declared width
+    /// produced that value, since `Ty::Const` itself carries none. Threaded
+    /// through `generalize`/`instantiate_with_mapping` exactly like
+    /// `constraints` is, for the identical reason: a constraint carried into
+    /// a `Scheme` and re-checked at some later instantiation needs this same
+    /// width information to still be available then, not just at the
+    /// original declaration site.
+    const_widths: HashMap<TyVar, Ty>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -729,9 +792,11 @@ impl<'r> Infer<'r> {
             registry,
             node_types: HashMap::new(),
             param_types: Vec::new(),
+            target_types: Vec::new(),
             quantified: HashSet::new(),
             pending_type_name_checks: Vec::new(),
             in_progress_methods: HashMap::new(),
+            const_widths: HashMap::new(),
         }
     }
 
@@ -774,15 +839,19 @@ impl<'r> Infer<'r> {
     /// unconstrained-width `Int` requirement) with "every const-generic must
     /// be an integer" (false — the two are independent questions). Its
     /// declared type (`T` in `const N: T`) *is* still resolved, via
-    /// `ty_from_ast_mapped` — not for the value it produces (discarded), but
-    /// because that's the one universal funnel that queues a
-    /// `pending_type_name_checks` entry if `T` turns out to actually name an
-    /// `algebra` (`const R: Int`, a real bug found by direct user testing —
-    /// `Int` is what constrains a type, not a type itself) rather than a
-    /// real type. The shared core `fn_generics_mapping` delegates to, also
-    /// used directly by struct construction/field access
+    /// `ty_from_ast_mapped` — originally only for the side effect of queuing
+    /// a `pending_type_name_checks` entry if `T` turns out to actually name
+    /// an `algebra` (`const R: Int`, a real bug found by direct user
+    /// testing — `Int` is what constrains a type, not a type itself) rather
+    /// than a real type; also recorded now, in `self.const_widths`, since a
+    /// const generic referenced as an ordinary value (a `for` loop bound,
+    /// say) needs its own real declared width recoverable later, once
+    /// resolved to a bare `Ty::Const` — see `check_pending_constraints`'s
+    /// own `Ty::Const` bridge. The shared core `fn_generics_mapping`
+    /// delegates to, also used directly by struct construction/field access
     /// (`ExprKind::StructLit`/`FieldAccess`), where there's no `FnDecl` to
-    /// read a generics list off of, just `Registry::struct_generics`.
+    /// read a generics list off of, just `Registry::struct_generics` — a
+    /// struct's own const generics get the same width tracking for free.
     fn fresh_generics_mapping(&mut self, generics: &[GenericParam], span: Span) -> HashMap<String, Ty> {
         let mapping = self.fresh_vars_for_generics(generics);
         for g in generics {
@@ -790,15 +859,37 @@ impl<'r> Infer<'r> {
                 GenericParam::Type { name, bounds } => {
                     let ty = mapping[name].clone();
                     for bound in bounds {
-                        self.constraints.push(Constraint { algebra: bound.clone(), ty: ty.clone(), span });
+                        self.constraints.push(Constraint { algebra: bound.clone(), tys: vec![ty.clone()], span });
                     }
                 }
-                GenericParam::Const { ty, .. } => {
-                    self.ty_from_ast_mapped(ty, &mapping);
+                GenericParam::Const { name, ty } => {
+                    let width = self.ty_from_ast_mapped(ty, &mapping);
+                    if let Ty::Var(v) = &mapping[name] {
+                        self.const_widths.insert(*v, width);
+                    }
                 }
             }
         }
         mapping
+    }
+
+    /// Binds each `const N: T` generic's own name into `env` as an ordinary
+    /// value (`Scheme::mono`, the same fresh `Ty::Var` `fresh_generics_mapping`
+    /// already created for it) — without this, `N` only exists in the
+    /// *type*-position mapping (`ty_from_ast_mapped`'s own `HashMap<String,
+    /// Ty>`), so a body referencing `N` as a value (`[0.0; N]`'s own count,
+    /// `ExprKind::ArrayRepeat`) would see an ordinary unbound-name error.
+    /// Called at every real "about to infer a body" entry point (top-level
+    /// `fn`, algebra impl method, inherent impl method) — deliberately not
+    /// folded into `fresh_generics_mapping` itself, which has other callers
+    /// (`has_matching_impl`'s speculative probe, struct-literal generics)
+    /// with no body being inferred and no `env` to seed.
+    fn seed_const_generics(&self, generics: &[GenericParam], mapping: &HashMap<String, Ty>, env: &mut Env) {
+        for g in generics {
+            if let GenericParam::Const { name, .. } = g {
+                env.insert(name.clone(), Scheme::mono(mapping[name].clone()));
+            }
+        }
     }
 
     /// Just the fresh-variable half of `fresh_generics_mapping`, with no
@@ -945,6 +1036,7 @@ impl<'r> Infer<'r> {
         for (p, ty) in f.params.iter().zip(&param_types) {
             env.insert(p.name.clone(), Scheme::mono(ty.clone()));
         }
+        self.seed_const_generics(&f.generics, generics, &mut env);
         let result = self.infer_block(&env, &f.body)?;
         if let Some(ret) = &f.ret {
             let declared = self.ty_from_ast_mapped(ret, generics);
@@ -1087,6 +1179,7 @@ impl<'r> Infer<'r> {
         // bogus `App("Complex", [Con("T")])`.
         let impl_mapping = self.fresh_generics_mapping(impl_generics, fallback_span);
         let target_tys: Vec<Ty> = targets.iter().map(|t| self.ty_from_ast_mapped(t, &impl_mapping)).collect();
+        self.target_types = target_tys.clone();
 
         // The algebra's own generic parameters bind, *positionally*, to
         // this impl's own targets — `T` (the algebra's own, first generic)
@@ -1133,6 +1226,7 @@ impl<'r> Infer<'r> {
             param_types.push(ty.clone());
             env.insert(p.name.clone(), Scheme::mono(ty));
         }
+        self.seed_const_generics(impl_generics, &impl_mapping, &mut env);
 
         let result = self.infer_block(&env, &f.body)?;
 
@@ -1145,7 +1239,14 @@ impl<'r> Infer<'r> {
         let result_span = f.body.tail.as_deref().map(|t| t.span).unwrap_or(fallback_span);
         self.unify_at(result_span, &expected_ret, &result)?;
 
-        self.finish_fn(f, param_types, result)
+        let final_result = self.finish_fn(f, param_types, result)?;
+        // `finish_fn` already re-resolves `self.param_types`/`node_types`
+        // through the final substitution before returning — `target_types`
+        // needs the identical treatment, since it was set (see above)
+        // before body inference (and therefore defaulting/constraint-
+        // checking) had a chance to pin anything down further.
+        self.target_types = self.target_types.iter().map(|t| self.subst.apply(t)).collect();
+        Ok(final_result)
     }
 
     /// Infers one method of an *inherent* impl (`impl<T> Vec2<T> { fn
@@ -1207,8 +1308,16 @@ impl<'r> Infer<'r> {
             self.in_progress_methods.insert(key.clone(), (param_types.clone(), ret_var.clone()));
         }
 
-        let result =
-            self.infer_inherent_impl_fn_raw(outer, &impl_mapping, &target_ty, param_types.clone(), ret_var, f, fallback_span);
+        let result = self.infer_inherent_impl_fn_raw(
+            outer,
+            impl_generics,
+            &impl_mapping,
+            &target_ty,
+            param_types.clone(),
+            ret_var,
+            f,
+            fallback_span,
+        );
 
         if let Some(key) = &self_key {
             self.in_progress_methods.remove(key);
@@ -1228,6 +1337,7 @@ impl<'r> Infer<'r> {
     fn infer_inherent_impl_fn_raw(
         &mut self,
         outer: &Env,
+        impl_generics: &[GenericParam],
         impl_mapping: &HashMap<String, Ty>,
         target_ty: &Ty,
         param_types: Vec<Ty>,
@@ -1250,6 +1360,7 @@ impl<'r> Infer<'r> {
         for (p, ty) in f.params.iter().zip(&param_types) {
             env.insert(p.name.clone(), Scheme::mono(ty.clone()));
         }
+        self.seed_const_generics(impl_generics, impl_mapping, &mut env);
 
         let result = self.infer_block(&env, &f.body)?;
         if let Some(ret) = &f.ret {
@@ -1333,7 +1444,7 @@ impl<'r> Infer<'r> {
             // names`'s own doc comment for why: each entry belongs to
             // whichever one member's body produced it.
             let outcome = self
-                .infer_inherent_impl_fn_raw(outer, &impl_mapping, &target_ty, param_types, ret_var, f, fallback_span)
+                .infer_inherent_impl_fn_raw(outer, impl_generics, &impl_mapping, &target_ty, param_types, ret_var, f, fallback_span)
                 .and_then(|ty| self.check_pending_type_names().map(|()| ty));
             raw_results.insert(f.name.clone(), outcome);
         }
@@ -1541,14 +1652,25 @@ impl<'r> Infer<'r> {
         let var_set: HashSet<TyVar> = vars.iter().copied().collect();
         let mut constraints = Vec::new();
         for c in &self.constraints {
+            let resolved_tys: Vec<Ty> = c.tys.iter().map(|t| self.subst.apply(t)).collect();
             let mut fv = HashSet::new();
-            free_vars(&self.subst.apply(&c.ty), &mut fv);
+            for t in &resolved_tys {
+                free_vars(t, &mut fv);
+            }
             if fv.iter().any(|v| var_set.contains(v)) {
-                constraints.push(Constraint { algebra: c.algebra.clone(), ty: self.subst.apply(&c.ty), span: c.span });
+                constraints.push(Constraint { algebra: c.algebra.clone(), tys: resolved_tys, span: c.span });
             }
         }
 
-        Scheme { vars, constraints, ty }
+        // Any of the just-quantified vars that are const generics carry
+        // their own declared width along too — same reasoning as the
+        // constraint sweep just above (a bound checked later, once this
+        // scheme is instantiated, needs the *real* width, not a guess; see
+        // `check_pending_constraints`'s own `Ty::Const` bridge).
+        let const_widths: HashMap<TyVar, Ty> =
+            self.const_widths.iter().filter(|(v, _)| var_set.contains(v)).map(|(v, t)| (*v, t.clone())).collect();
+
+        Scheme { vars, constraints, ty, const_widths }
     }
 
     /// Every currently-pending constraint that shares at least one free
@@ -1578,12 +1700,16 @@ impl<'r> Infer<'r> {
         free_vars(&self.subst.apply(ty), &mut ty_fv);
         self.constraints
             .iter()
-            .filter(|c| {
+            .filter_map(|c| {
+                let resolved_tys: Vec<Ty> = c.tys.iter().map(|t| self.subst.apply(t)).collect();
                 let mut fv = HashSet::new();
-                free_vars(&self.subst.apply(&c.ty), &mut fv);
-                fv.iter().any(|v| ty_fv.contains(v))
+                for t in &resolved_tys {
+                    free_vars(t, &mut fv);
+                }
+                fv.iter()
+                    .any(|v| ty_fv.contains(v))
+                    .then(|| Constraint { algebra: c.algebra.clone(), tys: resolved_tys, span: c.span })
             })
-            .map(|c| Constraint { algebra: c.algebra.clone(), ty: self.subst.apply(&c.ty), span: c.span })
             .collect()
     }
 
@@ -1620,9 +1746,19 @@ impl<'r> Infer<'r> {
         for c in &scheme.constraints {
             self.constraints.push(Constraint {
                 algebra: c.algebra.clone(),
-                ty: substitute(&c.ty, &mapping),
+                tys: c.tys.iter().map(|t| substitute(t, &mapping)).collect(),
                 span: c.span,
             });
+        }
+        // Re-key `scheme.const_widths` through the same fresh mapping —
+        // without this, a constraint re-queued just above (against a *fresh*
+        // copy of a const generic's own var) would have no way to recover
+        // that var's declared width once `check_pending_constraints` runs
+        // again for *this* instantiation.
+        for (v, width) in &scheme.const_widths {
+            if let Some(Ty::Var(fresh)) = mapping.get(v) {
+                self.const_widths.insert(*fresh, width.clone());
+            }
         }
         (substitute(&scheme.ty, &mapping), mapping)
     }
@@ -1774,7 +1910,7 @@ impl<'r> Infer<'r> {
                 GenericParam::Type { name, bounds } => {
                     let Some(arg_ty) = mapping.get(name) else { return true };
                     let resolved_arg = trial.apply(arg_ty);
-                    bounds.iter().all(|bound| self.has_matching_impl(bound, &resolved_arg))
+                    bounds.iter().all(|bound| self.has_matching_impl(bound, std::slice::from_ref(&resolved_arg)))
                 }
                 GenericParam::Const { .. } => true,
             });
@@ -1824,11 +1960,11 @@ impl<'r> Infer<'r> {
     /// mul`'s implementation from some other algebra `Ring` merely bounds
     /// itself on (or aggregates from), the way a bare existence check can
     /// borrow `Num`'s.
-    fn has_matching_impl(&mut self, algebra: &str, ty: &Ty) -> bool {
-        self.has_matching_impl_inherited(algebra, ty, &mut HashSet::new())
+    fn has_matching_impl(&mut self, algebra: &str, tys: &[Ty]) -> bool {
+        self.has_matching_impl_inherited(algebra, tys, &mut HashSet::new())
     }
 
-    fn has_matching_impl_inherited(&mut self, algebra: &str, ty: &Ty, visited: &mut HashSet<String>) -> bool {
+    fn has_matching_impl_inherited(&mut self, algebra: &str, tys: &[Ty], visited: &mut HashSet<String>) -> bool {
         // Guards against a cyclic bound declaration (`algebra A : B` and
         // `algebra B : A`) looping forever — a malformed program, but one
         // that must fail cleanly (no matching impl found) rather than
@@ -1839,7 +1975,7 @@ impl<'r> Infer<'r> {
         if !visited.insert(algebra.to_string()) {
             return false;
         }
-        if self.match_impl(algebra, std::slice::from_ref(ty), false) {
+        if self.match_impl(algebra, tys, false) {
             return true;
         }
         let reverse_witness = self
@@ -1847,7 +1983,7 @@ impl<'r> Infer<'r> {
             .algebras_bounded_by(algebra)
             .collect::<Vec<_>>()
             .into_iter()
-            .any(|other| self.has_matching_impl_inherited(other, ty, visited));
+            .any(|other| self.has_matching_impl_inherited(other, tys, visited));
         if reverse_witness {
             return true;
         }
@@ -1868,7 +2004,7 @@ impl<'r> Infer<'r> {
         // single sibling can satisfy a multi-ingredient conjunction by
         // accident the way one sibling can satisfy a shared single parent.
         let own_bounds = self.registry.algebra_bounds(algebra).to_vec();
-        own_bounds.len() >= 2 && own_bounds.iter().all(|b| self.has_matching_impl_inherited(b, ty, visited))
+        own_bounds.len() >= 2 && own_bounds.iter().all(|b| self.has_matching_impl_inherited(b, tys, visited))
     }
 
     /// Real, committing dispatch for a (possibly heterogeneous,
@@ -1910,20 +2046,59 @@ impl<'r> Infer<'r> {
             if !self.registry.has_algebra(&c.algebra) {
                 continue;
             }
-            let resolved = self.subst.apply(&c.ty);
-            if let Ty::Var(v) = &resolved {
-                if self.quantified.contains(v) {
-                    continue;
-                }
-            }
-            if is_placeholder(&resolved) {
+            let resolved: Vec<Ty> = c.tys.iter().map(|t| self.subst.apply(t)).collect();
+            if resolved.iter().any(|t| matches!(t, Ty::Var(v) if self.quantified.contains(v))) {
                 continue;
             }
-            if is_fully_concrete(&resolved) && !self.has_matching_impl(&c.algebra, &resolved) {
-                return Err(TypeError {
-                    span: c.span,
-                    kind: TypeErrorKind::MissingImpl { algebra: c.algebra, ty: resolved.to_string() },
-                });
+            if resolved.iter().any(is_placeholder) {
+                continue;
+            }
+            // Still abstract somewhere in the tuple — not everything is
+            // known yet, so there's nothing coherent to check (mirrors
+            // `infer_algebra_call`'s own "still abstract somewhere" gate for
+            // the immediate-dispatch path — same posture, deferred further
+            // rather than guessed at).
+            if !resolved.iter().all(is_fully_concrete) {
+                continue;
+            }
+            // A const generic referenced as an ordinary value (`for i in
+            // 0..N`, say) can resolve here to a bare `Ty::Const` rather than
+            // an ordinary `Ty::Con` — `has_matching_impl` has nothing to
+            // check that against directly (impls are declared for real
+            // types, never for one specific constant value). Bridge each
+            // such element to its own const generic's declared width,
+            // recovered from `self.const_widths` via `c.tys`' own
+            // *original*, pre-resolution var (see that field's own doc
+            // comment — threaded through `generalize`/`instantiate_with_
+            // mapping` exactly like this constraint itself was, so it's
+            // still there for a constraint re-checked at instantiation time,
+            // not just at the original declaration site). Falls back to
+            // this project's own conventional default representation when
+            // untracked (an ordinary array-literal-length `Ty::Const`, e.g.
+            // `[1,2,3]`'s own size, never tied to a declared const generic).
+            // Checked *together*, one call — see `Constraint`'s own doc
+            // comment for why a multi-generic algebra can't be verified any
+            // other way.
+            let checkable: Vec<Ty> = resolved
+                .iter()
+                .zip(&c.tys)
+                .map(|(r, orig)| match r {
+                    Ty::Const(cv) => {
+                        let width = match orig {
+                            Ty::Var(v) => self.const_widths.get(v).cloned(),
+                            _ => None,
+                        };
+                        width.unwrap_or_else(|| match cv {
+                            ConstValue::Int(_) => Ty::Con("i32".to_string()),
+                            ConstValue::Bool(_) => Ty::Con("bool".to_string()),
+                        })
+                    }
+                    _ => r.clone(),
+                })
+                .collect();
+            if !self.has_matching_impl(&c.algebra, &checkable) {
+                let ty = checkable.iter().map(Ty::to_string).collect::<Vec<_>>().join(", ");
+                return Err(TypeError { span: c.span, kind: TypeErrorKind::MissingImpl { algebra: c.algebra, ty } });
             }
         }
         Ok(())
@@ -2041,8 +2216,9 @@ impl<'r> Infer<'r> {
                         Ty::Array(Box::new(elem), Box::new(size_ty))
                     }
                     // Also covers `const_value_from_expr` returning `None`
-                    // outright (an array-size expression this increment
-                    // doesn't evaluate — `[T; N+1]`, a computed size);
+                    // outright — an operator `const_eval` doesn't know yet
+                    // (`[T; N-1]`, today), or one it does but an operand is
+                    // still abstract (`[T; N+M]` before either is concrete);
                     // `is_placeholder` keeps this out of every registry check.
                     _ => Ty::Con("<array-type-not-yet-inferred>".to_string()),
                 }
@@ -2062,17 +2238,32 @@ impl<'r> Infer<'r> {
     /// a single-segment path matching a key in `mapping` becomes that
     /// const-generic's own (fresh, per-call-site) variable, exactly like a
     /// type-generic's bare reference resolves in `ty_from_ast_mapped` above.
-    /// Anything else (an arbitrary expression — no const-expression
-    /// evaluator exists) is `None`, deferred as a placeholder by the caller
-    /// rather than guessed at or hard-rejected. Deliberately *not*
-    /// integer-only: whether the result actually needs to be an integer is
-    /// up to the caller (`TypeKind::Array`'s own arm above pushes that
-    /// constraint itself, since it's the one actual consumer that cares).
+    /// An operator call (`4+3`, `N*2`, ...) — the same desugared shape
+    /// ordinary `+`/`*` already produce, see `ast.rs`'s own `Call` doc
+    /// comment — recurses on both operands and, if *both* resolve to a
+    /// `Ty::Const`, delegates the actual arithmetic to the standalone
+    /// `const_eval` module (deliberately isolated there — see its own module
+    /// doc comment — rather than folded in here, so it stays reusable
+    /// wherever else constant folding is needed later). Anything else (an
+    /// operand still abstract, or an operator `const_eval` doesn't know yet)
+    /// is `None`, deferred as a placeholder by the caller rather than
+    /// guessed at or hard-rejected. Deliberately *not* integer-only:
+    /// whether the result actually needs to be an integer is up to the
+    /// caller (`TypeKind::Array`'s own arm above pushes that constraint
+    /// itself, since it's the one actual consumer that cares).
     fn const_value_from_expr(&mut self, value: &Expr, mapping: &HashMap<String, Ty>) -> Option<Ty> {
         match &value.kind {
             ExprKind::NumberLit { text, .. } => text.parse::<u64>().ok().map(|n| Ty::Const(ConstValue::Int(n))),
             ExprKind::BoolLit(b) => Some(Ty::Const(ConstValue::Bool(*b))),
             ExprKind::Path(p) if p.segments.len() == 1 => mapping.get(&p.segments[0]).cloned(),
+            ExprKind::Call(path, _, args) if path.segments.len() == 1 && args.len() == 2 => {
+                let (Ty::Const(a), Ty::Const(b)) =
+                    (self.const_value_from_expr(&args[0], mapping)?, self.const_value_from_expr(&args[1], mapping)?)
+                else {
+                    return None;
+                };
+                const_eval::eval_binop(&path.segments[0], a, b).map(Ty::Const)
+            }
             _ => None,
         }
     }
@@ -2121,16 +2312,20 @@ impl<'r> Infer<'r> {
                     };
                     env.insert(name.clone(), scheme);
                 }
-                StmtKind::Assign { name, value } => {
-                    // Always a trivial (never-generalized) scheme — `mut`
-                    // bindings are excluded from generalization above — so
-                    // reading `.ty` directly is exact, not an approximation.
-                    let existing = env.get(name).map(|s| s.ty.clone()).ok_or_else(|| TypeError {
-                        span: stmt.span,
-                        kind: TypeErrorKind::UnknownName(name.clone()),
-                    })?;
+                StmtKind::Assign { target, value } => {
+                    // `target` is a plain name, or a field/index chain into
+                    // one — ordinary `infer_expr` handles all three shapes
+                    // uniformly (`Path`, `FieldAccess`, `Index` already have
+                    // their own inference arms; `Index`'s already extracts
+                    // the correct array element type). For the plain-name
+                    // case this is exactly what the old direct `env.get`
+                    // did: the scheme is always trivial (never-generalized —
+                    // `mut` bindings are excluded from generalization above),
+                    // so `instantiate`-ing it is a no-op equivalent to
+                    // reading `.ty` directly.
+                    let target_ty = self.infer_expr(&env, target)?;
                     let value_ty = self.infer_expr(&env, value)?;
-                    self.unify_at(value.span, &existing, &value_ty)?;
+                    self.unify_at(value.span, &target_ty, &value_ty)?;
                 }
                 StmtKind::Expr(e) => {
                     self.infer_expr(&env, e)?;
@@ -2187,11 +2382,15 @@ impl<'r> Infer<'r> {
                         // `check_pending_constraints`), so this is additive,
                         // not a behavior change for a program that never
                         // `use`s `num`.
-                        self.constraints.push(Constraint { algebra: "Num".to_string(), ty: v.clone(), span: expr.span });
+                        self.constraints.push(Constraint {
+                            algebra: "Num".to_string(),
+                            tys: vec![v.clone()],
+                            span: expr.span,
+                        });
                         let shape_algebra = if is_float { "Float" } else { "Int" };
                         self.constraints.push(Constraint {
                             algebra: shape_algebra.to_string(),
-                            ty: v.clone(),
+                            tys: vec![v.clone()],
                             span: expr.span,
                         });
                     }
@@ -2253,7 +2452,7 @@ impl<'r> Infer<'r> {
                 // specifically (no hardcoded width, same "Int, unconstrained
                 // width" posture `ExprKind::Index`'s own bound already
                 // uses), just some real `Int`-impl'd type.
-                self.constraints.push(Constraint { algebra: "Int".to_string(), ty: start_ty.clone(), span: start.span });
+                self.constraints.push(Constraint { algebra: "Int".to_string(), tys: vec![start_ty.clone()], span: start.span });
                 let mut inner_env = env.clone();
                 inner_env.insert(var.clone(), Scheme::mono(start_ty));
                 // `infer_block` clones `inner_env` again internally — the
@@ -2397,6 +2596,18 @@ impl<'r> Infer<'r> {
                 }
                 Ok(Ty::Array(Box::new(elem_ty), Box::new(Ty::Const(ConstValue::Int(elems.len() as u64)))))
             }
+            // `[value; N]`, `N` naming a const generic (the literal-count
+            // case desugars to `ArrayLit` at lowering time instead — see
+            // `grammar.pest`'s `array_repeat`). `count` is an ordinary
+            // `Path` node, resolved through `env` exactly like any other
+            // value reference — it reaches the *same* `Ty::Var` already
+            // seeded for that const generic (see the `fresh_generics_mapping`
+            // callers, which also insert each const generic into `env`).
+            ExprKind::ArrayRepeat { value, count } => {
+                let elem_ty = self.infer_expr(env, value)?;
+                let count_ty = self.infer_expr(env, count)?;
+                Ok(Ty::Array(Box::new(elem_ty), Box::new(count_ty)))
+            }
             ExprKind::Index(base, idx) => {
                 let base_ty = self.infer_expr(env, base)?;
                 let idx_ty = self.infer_expr(env, idx)?;
@@ -2404,7 +2615,7 @@ impl<'r> Infer<'r> {
                 // to be a literal, just `Int`-constrained like any other
                 // integer-typed value (`fibonacci`'s own `T: Int` bound uses
                 // the exact same mechanism).
-                self.constraints.push(Constraint { algebra: "Int".to_string(), ty: idx_ty, span: idx.span });
+                self.constraints.push(Constraint { algebra: "Int".to_string(), tys: vec![idx_ty], span: idx.span });
                 let resolved_base = self.subst.apply(&base_ty);
                 match resolved_base {
                     // Still abstract, or already an unresolved placeholder
@@ -2859,16 +3070,13 @@ impl<'r> Infer<'r> {
 
         if gating.iter().any(is_placeholder) {
             // At least one *input* generic is an "unknown" — a placeholder
-            // for something not type-inferred yet. Deferred per-generic
-            // below, same as the "still abstract" case — neither is
-            // precise enough to check *coherently* once deferred (that
-            // would need a multi-`Ty` `Constraint` variant this increment
-            // doesn't add), but permissive-by-omission here matches this
-            // file's existing posture everywhere else a constraint can't
-            // fully propagate yet, not a new gap.
-            for ty in resolved_generics {
-                self.constraints.push(Constraint { algebra: algebra.to_string(), ty, span: call_span });
-            }
+            // for something not type-inferred yet. Deferred below, same as
+            // the "still abstract" case — one constraint holding the *whole*
+            // tuple together (see `Constraint`'s own doc comment), checked
+            // coherently by `check_pending_constraints` once every element
+            // is concrete, same engine `match_impl`'s immediate-dispatch
+            // path already uses.
+            self.constraints.push(Constraint { algebra: algebra.to_string(), tys: resolved_generics, span: call_span });
         } else if gating.iter().all(is_fully_concrete) {
             // Ready: every *input* generic is known, so dispatch can
             // actually run — commits the match's own bindings for real
@@ -2882,13 +3090,11 @@ impl<'r> Infer<'r> {
         } else {
             // Still abstract somewhere among the *input* generics (a
             // generic caller, or a `Complex<'t9>` whose own argument isn't
-            // pinned down yet) — defer, per-generic: either `generalize`
-            // migrates each into an enclosing `let`'s scheme, or
-            // `check_pending_constraints` catches it once `infer_fn`
-            // finishes, whichever comes first.
-            for ty in resolved_generics {
-                self.constraints.push(Constraint { algebra: algebra.to_string(), ty, span: call_span });
-            }
+            // pinned down yet) — defer, one constraint for the whole tuple:
+            // either `generalize` migrates it into an enclosing `let`'s
+            // scheme, or `check_pending_constraints` catches it once
+            // `infer_fn` finishes, whichever comes first.
+            self.constraints.push(Constraint { algebra: algebra.to_string(), tys: resolved_generics, span: call_span });
         }
 
         Ok(self.subst.apply(&ret_ty))
@@ -2959,6 +3165,25 @@ impl<'r> Infer<'r> {
                 continue;
             };
             if self.quantified.contains(&root) {
+                continue;
+            }
+            // A const generic's own shape-slot var can end up sharing this
+            // same root — merged in by ordinary unification, e.g. `for i in
+            // 0..N` unifying `0`'s own (defaultable) literal var with `N`'s
+            // (see `ExprKind::For`'s own inference). Defaulting it here
+            // would commit `N := Ty::Con("i32")` for real — a *type*,
+            // permanently overwriting the `Ty::Var` this slot must stay as
+            // until monomorphization resolves it to a concrete `Ty::Const`
+            // (a *value*) — found by direct testing: `examples/matmul.cleave`'s
+            // own `N`/`M`/`K` bounds, defaulted this way, then failed to
+            // unify against a real call site's `Ty::Const(2)` during
+            // monomorphization, structurally incompatible with the `Con`
+            // shape defaulting had already locked in. Skipped exactly like
+            // `quantified` above — this variable belongs to const-generic
+            // resolution (`check_pending_constraints`'s own `Ty::Const`
+            // bridge, or monomorphization's reverse-unification), not to
+            // ordinary numeric-literal defaulting.
+            if self.const_widths.contains_key(&root) {
                 continue;
             }
             let concrete = match default {

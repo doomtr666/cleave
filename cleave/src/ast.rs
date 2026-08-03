@@ -199,9 +199,12 @@ impl Path {
 #[derive(Debug, Clone)]
 pub enum StmtKind {
     Let { mutable: bool, name: String, ty: Option<Type>, value: Expr },
-    /// Reassignment of an existing `let mut` binding — bare `name = expr;`,
-    /// never a fresh binding (see `grammar.md`).
-    Assign { name: String, value: Expr },
+    /// Reassignment of an existing `let mut` binding — never a fresh binding
+    /// (see `grammar.md`). `target` is a plain name (`Path`) or a field/index
+    /// chain into one (`FieldAccess`/`Index`, same shapes an ordinary
+    /// expression would use to *read* the same location) — never anything
+    /// else (grammar-restricted, see `grammar.pest`'s `assign_target`).
+    Assign { target: Expr, value: Expr },
     Expr(Expr),
 }
 pub type Stmt = Node<StmtKind>;
@@ -242,6 +245,13 @@ pub enum ExprKind {
     /// nodes by `lower.rs`, same principle as `TypeKind::Array` above.
     Index(Box<Expr>, Box<Expr>),
     ArrayLit(Vec<Expr>),
+    /// `[value; N]` where `N` names a const generic of the enclosing fn/impl
+    /// rather than a literal (the literal case eagerly desugars to `ArrayLit`
+    /// at lowering time instead — see `grammar.pest`'s `array_repeat`
+    /// comment). `count` is a lowered `NumberLit` or `Path` node — resolved
+    /// through ordinary type inference, not expanded into real copies until
+    /// monomorphization knows `N`'s concrete value.
+    ArrayRepeat { value: Box<Expr>, count: Box<Expr> },
     /// `Vec2(x: 1.0, y: 2.0)` — struct construction, named-argument call
     /// syntax rather than Rust-style `Vec2 { x: 1.0, y: 2.0 }` (which would
     /// collide with `if`/`while`/`for`'s own condition-then-block shape —

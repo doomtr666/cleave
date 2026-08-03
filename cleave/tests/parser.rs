@@ -185,11 +185,18 @@ fn array_repeat_literal_parses() {
 }
 
 #[test]
-fn array_repeat_literal_requires_a_literal_count() {
-    // The whole point of restricting this to `numeric_lit` in the grammar
-    // (see its own doc comment) -- a variable count has nothing for
-    // lowering-time desugaring to expand.
-    assert!(CleaveParser::parse(Rule::expr, "[0.0; n]").is_err());
+fn array_repeat_literal_count_can_name_a_const_generic() {
+    // `n` here names a const generic of the enclosing fn/impl -- resolved
+    // through ordinary type inference (`infer.rs`), not expanded at lowering
+    // time the way a literal count is (see `grammar.pest`'s own comment).
+    parses(Rule::expr, "[0.0; n]");
+}
+
+#[test]
+fn array_repeat_literal_count_is_not_a_general_expression() {
+    // Deliberately restricted to `numeric_lit | ident` -- a compile-time
+    // integer (a literal or a const-generic reference), not a computation.
+    assert!(CleaveParser::parse(Rule::expr, "[0.0; n + 1]").is_err());
 }
 
 #[test]

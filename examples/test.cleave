@@ -18,6 +18,12 @@ impl TestAlg<i64> {
     fn gt(x , y) { true }
 }
 
+impl TestAlg<f32> {
+    fn add(x , y) { 42.0 }
+    fn sub(x , y) { 42.0 }
+    fn gt(x , y) { true }
+}
+
 struct Complex<T : Float> {
     real : T,
     imag : T,

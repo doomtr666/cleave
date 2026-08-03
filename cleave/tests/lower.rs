@@ -279,7 +279,10 @@ fn plain_let_is_not_mutable() {
 fn reassignment_is_a_distinct_statement_kind() {
     let f = lower_one_fn("fn f() { let mut a = 0; a = a + 1; a }");
     match &f.body.stmts[1].kind {
-        StmtKind::Assign { name, .. } => assert_eq!(name, "a"),
+        StmtKind::Assign { target, .. } => match &target.kind {
+            ExprKind::Path(p) => assert_eq!(p.segments, vec!["a".to_string()]),
+            other => panic!("expected Path target, got {other:?}"),
+        },
         other => panic!("expected Assign, got {other:?}"),
     }
 }

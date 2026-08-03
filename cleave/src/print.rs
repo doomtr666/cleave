@@ -132,7 +132,7 @@ impl Printer {
                 let ty_ann = ty.as_ref().map(|t| format!(": {}", fmt_type(t))).unwrap_or_default();
                 self.line(format!("let {mut_kw}{name}{ty_ann} = {};", fmt_expr(value)));
             }
-            StmtKind::Assign { name, value } => self.line(format!("{name} = {};", fmt_expr(value))),
+            StmtKind::Assign { target, value } => self.line(format!("{} = {};", fmt_expr(target), fmt_expr(value))),
             StmtKind::Expr(e) => self.line(format!("{};", fmt_expr(e))),
         }
     }
@@ -242,6 +242,7 @@ pub(crate) fn fmt_expr(e: &Expr) -> String {
         }
         ExprKind::Index(base, idx) => format!("{}[{}]", fmt_expr(base), fmt_expr(idx)),
         ExprKind::ArrayLit(elems) => format!("[{}]", elems.iter().map(fmt_expr).collect::<Vec<_>>().join(", ")),
+        ExprKind::ArrayRepeat { value, count } => format!("[{}; {}]", fmt_expr(value), fmt_expr(count)),
         ExprKind::StructLit(path, generics, fields) => format!(
             "{}{}({})",
             fmt_path(path),
@@ -283,7 +284,7 @@ fn fmt_block_inline(b: &Block) -> String {
                 let ty_ann = ty.as_ref().map(|t| format!(": {}", fmt_type(t))).unwrap_or_default();
                 format!("let {mut_kw}{name}{ty_ann} = {};", fmt_expr(value))
             }
-            StmtKind::Assign { name, value } => format!("{name} = {};", fmt_expr(value)),
+            StmtKind::Assign { target, value } => format!("{} = {};", fmt_expr(target), fmt_expr(value)),
             StmtKind::Expr(e) => format!("{};", fmt_expr(e)),
         })
         .collect();

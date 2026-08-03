@@ -1,0 +1,67 @@
+struct Matrix<T: Float, const R: i32, const C: i32> {
+    values: [T; R, C]
+}
+
+// Scalar `+` needs a real backing `impl` too (see below) — but *not* a
+// separate `mul`: `algebras_with_fn` picks a candidate algebra by name+arity
+// alone, with no shape disambiguation at that stage (see `infer_call`,
+// `registry.rs`'s `algebras_with_fn`) — a second algebra also declaring a
+// 2-arg `mul` would make *every* `*` in the program ambiguous, including
+// `ma * mb` in `main`. Scalar multiplication is instead a second, concrete
+// `impl` of the *same* `MatMul` algebra (`impl MatMul<f32,f32,f32>`, below) —
+// dispatch between it and the generic `Matrix` impl is then resolved the
+// normal way, by matching the args' own shape against each impl's target
+// pattern, exactly like `TestAlg<i32>`/`TestAlg<Complex<T>>` already
+// coexist in `examples/test.cleave`.
+algebra Ring<T> {
+    fn add(x: T, y: T) -> T;
+}
+
+impl Ring<f32> {
+    fn add(x, y) { 0.0 }
+}
+
+algebra MatMul<A, B, C> {
+    fn mul(a: A, b: B) -> C;
+}
+
+// Stub, same posture as every other numeric impl in this project today
+// (`stdlib/num/num.cleave`'s `Num`/`Int`/`Float` are pure markers, no
+// methods at all) — there is no primitive arithmetic anywhere yet, only
+// algebra dispatch, so a real body isn't possible before CPS/MLIR codegen
+// exists. Exists purely so `a.values[i,k] * b.values[k,j]` has a real
+// `impl` to resolve against once T is concretely `f32`.
+impl MatMul<f32, f32, f32> {
+    fn mul(x, y) { 0.0 }
+}
+
+impl<T: Float, const N: i32, const M: i32, const K: i32>
+    MatMul<Matrix<T,N,M>, Matrix<T,M,K>, Matrix<T,N,K>> {
+    fn mul(a, b) {
+        let mut result = Matrix(values: [[0.0; K]; N]);
+        for i in 0..N {
+            for j in 0..K {
+                let mut sum = 0.0;
+                for k in 0..M {
+                    sum = sum + a.values[i,k] * b.values[k,j];
+                };
+                result.values[i,j] = sum;
+            };
+        };
+        result
+    }
+}
+
+fn main() {
+    let ma = Matrix::<f32,2,3>(values: [
+        [1.0, 2.0, 3.0],
+        [4.0, 5.0, 6.0]
+    ]);
+    let mb = Matrix::<f32,3,2>(values: [
+        [7.0, 8.0],
+        [9.0, 10.0],
+        [11.0, 12.0]
+    ]);
+    let mc = ma * mb;
+    42
+}

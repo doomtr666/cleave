@@ -389,9 +389,25 @@ impl Lowerer {
 
     fn lower_assign_stmt(&mut self, pair: Pair<Rule>) -> StmtKind {
         let mut inner = pair.into_inner();
-        let name = inner.next().unwrap().as_str().to_string();
+        let target = self.lower_assign_target(inner.next().unwrap());
         let value = self.lower_expr(inner.next().unwrap());
-        StmtKind::Assign { name, value }
+        StmtKind::Assign { target, value }
+    }
+
+    /// `assign_target = { ident ~ assign_suffix* }` — same shape `postfix`
+    /// builds for an ordinary expression (base + folded `[...]`/`.field`
+    /// chain), so the suffix folding reuses `lower_postfix_op` directly
+    /// (`assign_suffix`'s two alternatives are exactly `postfix_op`'s first
+    /// two, minus the call-args/method-call one).
+    fn lower_assign_target(&mut self, pair: Pair<Rule>) -> Expr {
+        let mut inner = pair.into_inner();
+        let ident = inner.next().unwrap();
+        let ident_span = self.span_of(&ident);
+        let mut acc = self.wrap(ident_span, ExprKind::Path(Path { segments: vec![ident.as_str().to_string()] }));
+        for suffix in inner {
+            acc = self.lower_postfix_op(acc, suffix);
+        }
+        acc
     }
 
     // ---------------------------------------------------------------- expressions
@@ -657,31 +673,54 @@ impl Lowerer {
         let Some(body) = pair.into_inner().next() else {
             return self.wrap(span, ExprKind::ArrayLit(Vec::new()));
         };
-        let elems = match body.as_rule() {
-            // `[value; N]` -- re-lowers the *same* parsed `value` pair `N`
-            // times (cheap: `Pair` is a reference into the token stream, not
-            // an owned deep copy) rather than lowering once and cloning the
-            // resulting `Expr`, so each copy gets its own distinct `NodeId`
-            // — every other node in this AST is unique per occurrence (see
-            // `ast.rs`'s own doc comment on `NodeId`), and `node_types`
-            // (keyed by `NodeId`) would silently collapse all `N` copies
-            // into one entry otherwise.
+        match body.as_rule() {
             Rule::array_repeat => {
                 let mut inner = body.into_inner();
                 let value = inner.next().unwrap();
-                let count_text = inner.next().unwrap().as_str();
-                // `numeric_lit`'s own text, possibly `:suffix`-terminated —
-                // a repeat count is never suffixed in practice, but strip it
-                // defensively rather than let `.parse` reject it outright.
-                let count: usize = count_text.split(':').next().unwrap().parse().unwrap_or_else(|e| {
-                    panic!("array-repeat count {count_text:?} is not a valid array size: {e}")
-                });
-                (0..count).map(|_| self.lower_expr(value.clone())).collect()
+                let count = inner.next().unwrap();
+                match count.as_rule() {
+                    // `[value; N]`, `N` a literal — re-lowers the *same*
+                    // parsed `value` pair `N` times (cheap: `Pair` is a
+                    // reference into the token stream, not an owned deep
+                    // copy) rather than lowering once and cloning the
+                    // resulting `Expr`, so each copy gets its own distinct
+                    // `NodeId` — every other node in this AST is unique per
+                    // occurrence (see `ast.rs`'s own doc comment on
+                    // `NodeId`), and `node_types` (keyed by `NodeId`) would
+                    // silently collapse all `N` copies into one entry
+                    // otherwise.
+                    Rule::numeric_lit => {
+                        let count_text = count.as_str();
+                        // `numeric_lit`'s own text, possibly `:suffix`-
+                        // terminated — a repeat count is never suffixed in
+                        // practice, but strip it defensively rather than let
+                        // `.parse` reject it outright.
+                        let n: usize = count_text.split(':').next().unwrap().parse().unwrap_or_else(|e| {
+                            panic!("array-repeat count {count_text:?} is not a valid array size: {e}")
+                        });
+                        let elems = (0..n).map(|_| self.lower_expr(value.clone())).collect();
+                        self.wrap(span, ExprKind::ArrayLit(elems))
+                    }
+                    // `[value; N]`, `N` naming a const generic — its value
+                    // isn't known until monomorphization, so this can't be
+                    // expanded here; kept as a real node, resolved through
+                    // ordinary type inference instead (see `infer.rs`).
+                    Rule::ident => {
+                        let count_span = self.span_of(&count);
+                        let value = Box::new(self.lower_expr(value));
+                        let count =
+                            Box::new(self.wrap(count_span, ExprKind::Path(Path { segments: vec![count.as_str().to_string()] })));
+                        self.wrap(span, ExprKind::ArrayRepeat { value, count })
+                    }
+                    r => unreachable!("array_repeat's own count must be numeric_lit or ident, got {r:?}"),
+                }
             }
-            Rule::array_list => body.into_inner().map(|p| self.lower_expr(p)).collect(),
+            Rule::array_list => {
+                let elems = body.into_inner().map(|p| self.lower_expr(p)).collect();
+                self.wrap(span, ExprKind::ArrayLit(elems))
+            }
             other => unreachable!("array_lit's own body must be array_repeat or array_list, got {other:?}"),
-        };
-        self.wrap(span, ExprKind::ArrayLit(elems))
+        }
     }
 
     fn lower_literal(&mut self, pair: Pair<Rule>) -> Expr {

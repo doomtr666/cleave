@@ -1,6 +1,6 @@
 use cleave::ast::{FileId, Program};
 use cleave::callgraph::infer_program;
-use cleave::infer::Ty;
+use cleave::infer::{ConstValue, Ty};
 use cleave::lower::Lowerer;
 use cleave::parser::{CleaveParser, Rule};
 use cleave::registry::Registry;
@@ -200,6 +200,42 @@ fn a_type_error_in_one_group_does_not_corrupt_an_unrelated_group() {
     let result = infer_program(&program, &registry);
     assert!(result.results.get("broken").unwrap().is_err(), "`broken`'s if-branches disagree (bool vs i32)");
     assert_eq!(ok_result(&result, "fine"), Ty::Con("i32".to_string()));
+}
+
+#[test]
+fn a_const_generic_bounded_for_loop_correctly_dispatches_once_a_caller_instantiates_it() {
+    // Regression test: `N` (a const generic) referenced as an ordinary value
+    // (`for i in 0..N`) merges with `0`'s own `Int`-constrained literal var —
+    // `generalize` sweeps that shared constraint into `fill`'s own `Scheme`
+    // (it shares a free variable with `N`, one of the just-quantified vars),
+    // and `use_it`'s own call site (`fill::<i32, 4>(1)`) re-queues it against
+    // a fresh copy of `N`'s own var, now concretely `Ty::Const(Int(4))`.
+    // Without `Scheme`/`Infer` tracking each const generic's own declared
+    // width across that whole `generalize`/`instantiate` journey (see
+    // `Scheme::const_widths`, threaded exactly like `constraints` already
+    // is), this incorrectly rejects with `no impl Int<4>` — checking the
+    // *value* `4` against `Int` instead of `N`'s own declared width `i32`.
+    let registry = registry_from(
+        "algebra Ring<T> { fn add(a: T, b: T) -> T; }
+        algebra Int<T> {}
+        impl Ring<i32> { fn add(a: i32, b: i32) -> i32 { a } }
+        impl Int<i32> {}",
+    );
+    let program = lower_program(
+        "fn fill<T: Int, const N: i32>(v: T) -> [T; N] {
+            let mut arr = [v; N];
+            for i in 0..N {
+                arr[i] = v;
+            };
+            arr
+        }
+        fn use_it() -> [i32; 4] { fill::<i32, 4>(1) }",
+    );
+    let result = infer_program(&program, &registry);
+    assert_eq!(
+        ok_result(&result, "use_it"),
+        Ty::Array(Box::new(Ty::Con("i32".to_string())), Box::new(Ty::Const(ConstValue::Int(4))))
+    );
 }
 
 #[test]
@@ -526,6 +562,79 @@ fn a_nullary_functions_returned_closure_rejects_a_type_with_no_matching_impl() {
     let err = err_result(&result, "use_bool");
     assert!(
         matches!(&err.kind, cleave::infer::TypeErrorKind::MissingImpl { algebra, .. } if algebra == "Ring"),
+        "got: {:?}",
+        err.kind
+    );
+}
+
+/// Real bug found by direct testing (`for i in 0..N { arr[i] = v; }`, called
+/// as `fill::<f32, 4>(...)`): a bare numeric literal (`0`, the loop's own
+/// start bound) carries a real `Num`/`Int` constraint; `for`'s own inference
+/// unifies that literal's var with `N`'s (the loop's end bound) — so `N`'s
+/// var ends up carrying that constraint too, generalized into `fill`'s own
+/// `Scheme` (it shares a free variable with `N`, one of `fill`'s quantified
+/// vars) and re-checked once instantiated at `main`'s own call site, where
+/// the turbofish pins `N` straight to `Ty::Const(Int(4))`. Before the
+/// `Scheme::const_widths` fix, that check asked `has_matching_impl("Num",
+/// Ty::Const(Int(4)))` directly — nonsensical (impls are declared for real
+/// types, never one specific constant value) — and always failed with `no
+/// impl Num<4>`, regardless of the call.
+#[test]
+fn a_const_generic_used_as_a_for_loop_bound_is_checked_against_its_own_declared_width_at_the_call_site() {
+    let src = "algebra Num<T> {}
+        algebra Int<T> : Num {}
+        algebra Float<T> : Num {}
+        impl Int<i32> {}
+        impl Float<f32> {}
+        fn fill<T: Float, const N: i32>(v: T) -> [T; N] {
+            let mut arr = [v; N];
+            for i in 0..N {
+                arr[i] = v;
+            };
+            arr
+        }
+        fn main() -> [f32; 4] {
+            fill::<f32, 4>(1.0)
+        }";
+    let program = lower_program(src);
+    let registry = registry_from(src);
+    let result = infer_program(&program, &registry);
+    assert!(result.results.get("fill").unwrap().is_ok(), "{:?}", result.results.get("fill"));
+    assert_eq!(ok_result(&result, "main"), Ty::Array(Box::new(Ty::Con("f32".to_string())), Box::new(Ty::Const(ConstValue::Int(4)))));
+}
+
+/// Proves the width bridge checks the *real* declared width, not a blanket
+/// "assume it's fine" (e.g. always default to `i32`) — `const M: i64` used
+/// as a `for` loop bound demands `Int`, and this registry only declares
+/// `impl Int<i32>` (deliberately no `impl Int<i64>`), so `g::<4>(1)` must
+/// still fail on the *real* width. Were the fix instead falling back to a
+/// flat "assume i32" default, this would wrongly succeed.
+#[test]
+fn a_const_generic_used_as_a_for_loop_bound_is_checked_against_its_real_width_not_a_default() {
+    let src = "algebra Num<T> {}
+        algebra Int<T> : Num {}
+        impl Int<i32> {}
+        fn g<const M: i64>(v: i32) -> [i32; M] {
+            let mut arr = [v; M];
+            for i in 0..M {
+                arr[i] = v;
+            };
+            arr
+        }
+        fn main() -> [i32; 4] {
+            g::<4>(1)
+        }";
+    let program = lower_program(src);
+    let registry = registry_from(src);
+    let result = infer_program(&program, &registry);
+    assert!(result.results.get("g").unwrap().is_ok(), "{:?}", result.results.get("g"));
+    let err = err_result(&result, "main");
+    // Whichever of the merged var's own constraints (`Num` and `Int` are
+    // both pushed for a bare numeric literal, see `NumberLit`'s own
+    // inference arm) happens to be checked first — either is equally proof
+    // that the *real* `i64` width was checked, not a default.
+    assert!(
+        matches!(&err.kind, cleave::infer::TypeErrorKind::MissingImpl { algebra, ty } if (algebra == "Int" || algebra == "Num") && ty == "i64"),
         "got: {:?}",
         err.kind
     );
