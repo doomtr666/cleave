@@ -12,11 +12,12 @@ fn dump(src: &str) -> (String, usize) {
 
 #[test]
 fn dumps_resolved_param_and_tail_types_for_unannotated_params() {
-    // `add` needs a real declared `Ring` now — `infer_call` no longer has a
-    // permissive built-in fallback for operator names (see its doc comment).
-    let src = "algebra Ring<T> { fn add(a: T, b: T) -> T; }\n\
-               impl Ring<f64> { fn add(a: f64, b: f64) -> f64 { a } }\n\
-               fn f(a, b) -> f64 { a + b }";
+    // `add` resolves against the real stdlib `Ring` (`stdlib/num/num.cleave`,
+    // always in the prelude — `infer_call` no longer has a permissive
+    // built-in fallback for operator names, see its own doc comment) — no
+    // need to declare a competing local one, which would collide on the
+    // same `add(a: T, b: T) -> T` shape.
+    let src = "fn f(a, b) -> f64 { a + b }";
     let (out, errs) = dump(src);
     assert_eq!(errs, 0, "got:\n{out}");
     assert!(out.contains("fn f(a: f64, b: f64) -> f64"), "got:\n{out}");
@@ -45,8 +46,9 @@ fn dumps_let_and_tail_statements_with_their_own_types() {
 
 #[test]
 fn a_type_error_in_one_function_does_not_stop_the_others() {
-    let src = "algebra Ring<T> { fn add(a: T, b: T) -> T; }\n\
-               fn bad(a: f64, b: i32) -> f64 { a + b }\n\
+    // `add` resolves against the real stdlib `Ring` — see the doc comment
+    // on the test above for why no local algebra is declared here either.
+    let src = "fn bad(a: f64, b: i32) -> f64 { a + b }\n\
                fn good() -> i32 { 1 }";
     let (out, errs) = dump(src);
     assert_eq!(errs, 1, "exactly the one broken function should error, got:\n{out}");
@@ -60,9 +62,10 @@ fn nested_sub_expressions_are_each_annotated_with_their_own_type_not_just_the_ou
     // The whole point of `--dump-inference-pass`: debugging a deeply nested
     // expression needs to see every sub-expression's own type, not just the
     // one type reported for the entire statement/tail line.
-    let src = "algebra Ring<T> { fn add(a: T, b: T) -> T; fn sub(a: T, b: T) -> T; }
-        impl Ring<i32> { fn add(a: i32, b: i32) -> i32 { a } fn sub(a: i32, b: i32) -> i32 { a } }
-        fn f(x: i32) -> i32 { add(sub(x, 1), sub(x, 2)) }";
+    // `add`/`sub` resolve against the real stdlib `Ring` — see the doc
+    // comment above `dumps_resolved_param_and_tail_types_for_unannotated_params`
+    // for why no local algebra is declared here either.
+    let src = "fn f(x: i32) -> i32 { add(sub(x, 1), sub(x, 2)) }";
     let (out, errs) = dump(src);
     assert_eq!(errs, 0, "got:\n{out}");
     assert!(out.contains("sub(x:i32, 1:i32):i32"), "the inner `sub` calls must show their own type, got:\n{out}");
@@ -86,14 +89,9 @@ fn a_generalized_self_recursive_function_does_not_show_a_contradictory_default_i
     // `Infer::quantified` fix, `fibonacci`'s own body hardcoded `x:i32`
     // throughout (an arbitrary default), directly contradicting its own
     // signature (`(x: 't..) -> 't..`, correctly still-generic).
-    let src = "algebra TestAlg<T> {
-            fn add(x: T, y: T) -> T;
-            fn sub(x: T, y: T) -> T;
-            fn gt(x: T, y: T) -> bool;
-        }
-        impl TestAlg<i32> { fn add(x, y) { x } fn sub(x, y) { x } fn gt(x, y) { true } }
-        impl TestAlg<i64> { fn add(x, y) { x } fn sub(x, y) { x } fn gt(x, y) { true } }
-        fn fibonacci(x) {
+    // `add`/`sub`/`gt` all resolve against the real stdlib `Ring`/`Ord` now
+    // — no local algebra needed at all.
+    let src = "fn fibonacci(x) {
             if x > 2 { fibonacci(x - 1) + fibonacci(x - 2) } else { x }
         }
         fn main() -> i64 { fibonacci(42:i64) }";

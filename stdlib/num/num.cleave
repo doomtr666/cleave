@@ -29,3 +29,124 @@ impl Int<i64> {}
 
 impl Float<f32> {}
 impl Float<f64> {}
+
+// Real primitive arithmetic — the base case `doc/type_inference.md`'s
+// "circular-primitive-impl problem" describes: a stub body like `fn add(x,
+// y) { x + y }` has nothing to bottom out into, since every `+`/`*` is
+// itself sugar for algebra dispatch, all the way down, with no intrinsic
+// operation anywhere. `#[mlir(...)]` on a *bodyless* method (legal
+// grammatically anywhere a `fn` appears, but only accepted here — see
+// `Infer::infer_impl_fn_generic_with_env`'s own doc comment) closes that:
+// each impl below names a concrete MLIR instruction the eventual codegen
+// pass will emit directly for a call resolving to it. Those names are
+// placeholder identifiers today — nothing reads them yet, no MLIR backend
+// exists (see `doc/backlog.md`, items 3-4) — this only needs to type-check.
+algebra Ring<T> {
+    fn add(a: T, b: T) -> T;
+    fn sub(a: T, b: T) -> T;
+    fn mul(a: T, b: T) -> T;
+}
+
+impl Ring<i8> {
+    #[mlir(mlir_i8_add)] fn add(a: i8, b: i8) -> i8;
+    #[mlir(mlir_i8_sub)] fn sub(a: i8, b: i8) -> i8;
+    #[mlir(mlir_i8_mul)] fn mul(a: i8, b: i8) -> i8;
+}
+
+impl Ring<i16> {
+    #[mlir(mlir_i16_add)] fn add(a: i16, b: i16) -> i16;
+    #[mlir(mlir_i16_sub)] fn sub(a: i16, b: i16) -> i16;
+    #[mlir(mlir_i16_mul)] fn mul(a: i16, b: i16) -> i16;
+}
+
+impl Ring<i32> {
+    #[mlir(mlir_i32_add)] fn add(a: i32, b: i32) -> i32;
+    #[mlir(mlir_i32_sub)] fn sub(a: i32, b: i32) -> i32;
+    #[mlir(mlir_i32_mul)] fn mul(a: i32, b: i32) -> i32;
+}
+
+impl Ring<i64> {
+    #[mlir(mlir_i64_add)] fn add(a: i64, b: i64) -> i64;
+    #[mlir(mlir_i64_sub)] fn sub(a: i64, b: i64) -> i64;
+    #[mlir(mlir_i64_mul)] fn mul(a: i64, b: i64) -> i64;
+}
+
+impl Ring<f32> {
+    #[mlir(mlir_f32_add)] fn add(a: f32, b: f32) -> f32;
+    #[mlir(mlir_f32_sub)] fn sub(a: f32, b: f32) -> f32;
+    #[mlir(mlir_f32_mul)] fn mul(a: f32, b: f32) -> f32;
+}
+
+impl Ring<f64> {
+    #[mlir(mlir_f64_add)] fn add(a: f64, b: f64) -> f64;
+    #[mlir(mlir_f64_sub)] fn sub(a: f64, b: f64) -> f64;
+    #[mlir(mlir_f64_mul)] fn mul(a: f64, b: f64) -> f64;
+}
+
+// Comparison — same reasoning and shape as `Ring` above. `eq`/`neq` are
+// here rather than under a separate algebra of their own: every numeric
+// type orders *and* equates, and splitting them would only mean two
+// `impl` blocks per type instead of one for no expressive gain yet (unlike
+// `Int`/`Float`, which really are independent, mutually-exclusive shapes).
+algebra Ord<T> {
+    fn lt(a: T, b: T) -> bool;
+    fn le(a: T, b: T) -> bool;
+    fn gt(a: T, b: T) -> bool;
+    fn ge(a: T, b: T) -> bool;
+    fn eq(a: T, b: T) -> bool;
+    fn neq(a: T, b: T) -> bool;
+}
+
+impl Ord<i8> {
+    #[mlir(mlir_i8_lt)] fn lt(a: i8, b: i8) -> bool;
+    #[mlir(mlir_i8_le)] fn le(a: i8, b: i8) -> bool;
+    #[mlir(mlir_i8_gt)] fn gt(a: i8, b: i8) -> bool;
+    #[mlir(mlir_i8_ge)] fn ge(a: i8, b: i8) -> bool;
+    #[mlir(mlir_i8_eq)] fn eq(a: i8, b: i8) -> bool;
+    #[mlir(mlir_i8_neq)] fn neq(a: i8, b: i8) -> bool;
+}
+
+impl Ord<i16> {
+    #[mlir(mlir_i16_lt)] fn lt(a: i16, b: i16) -> bool;
+    #[mlir(mlir_i16_le)] fn le(a: i16, b: i16) -> bool;
+    #[mlir(mlir_i16_gt)] fn gt(a: i16, b: i16) -> bool;
+    #[mlir(mlir_i16_ge)] fn ge(a: i16, b: i16) -> bool;
+    #[mlir(mlir_i16_eq)] fn eq(a: i16, b: i16) -> bool;
+    #[mlir(mlir_i16_neq)] fn neq(a: i16, b: i16) -> bool;
+}
+
+impl Ord<i32> {
+    #[mlir(mlir_i32_lt)] fn lt(a: i32, b: i32) -> bool;
+    #[mlir(mlir_i32_le)] fn le(a: i32, b: i32) -> bool;
+    #[mlir(mlir_i32_gt)] fn gt(a: i32, b: i32) -> bool;
+    #[mlir(mlir_i32_ge)] fn ge(a: i32, b: i32) -> bool;
+    #[mlir(mlir_i32_eq)] fn eq(a: i32, b: i32) -> bool;
+    #[mlir(mlir_i32_neq)] fn neq(a: i32, b: i32) -> bool;
+}
+
+impl Ord<i64> {
+    #[mlir(mlir_i64_lt)] fn lt(a: i64, b: i64) -> bool;
+    #[mlir(mlir_i64_le)] fn le(a: i64, b: i64) -> bool;
+    #[mlir(mlir_i64_gt)] fn gt(a: i64, b: i64) -> bool;
+    #[mlir(mlir_i64_ge)] fn ge(a: i64, b: i64) -> bool;
+    #[mlir(mlir_i64_eq)] fn eq(a: i64, b: i64) -> bool;
+    #[mlir(mlir_i64_neq)] fn neq(a: i64, b: i64) -> bool;
+}
+
+impl Ord<f32> {
+    #[mlir(mlir_f32_lt)] fn lt(a: f32, b: f32) -> bool;
+    #[mlir(mlir_f32_le)] fn le(a: f32, b: f32) -> bool;
+    #[mlir(mlir_f32_gt)] fn gt(a: f32, b: f32) -> bool;
+    #[mlir(mlir_f32_ge)] fn ge(a: f32, b: f32) -> bool;
+    #[mlir(mlir_f32_eq)] fn eq(a: f32, b: f32) -> bool;
+    #[mlir(mlir_f32_neq)] fn neq(a: f32, b: f32) -> bool;
+}
+
+impl Ord<f64> {
+    #[mlir(mlir_f64_lt)] fn lt(a: f64, b: f64) -> bool;
+    #[mlir(mlir_f64_le)] fn le(a: f64, b: f64) -> bool;
+    #[mlir(mlir_f64_gt)] fn gt(a: f64, b: f64) -> bool;
+    #[mlir(mlir_f64_ge)] fn ge(a: f64, b: f64) -> bool;
+    #[mlir(mlir_f64_eq)] fn eq(a: f64, b: f64) -> bool;
+    #[mlir(mlir_f64_neq)] fn neq(a: f64, b: f64) -> bool;
+}

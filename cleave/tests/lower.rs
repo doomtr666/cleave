@@ -20,9 +20,9 @@ fn lower_one_fn(src: &str) -> FnDecl {
     }
 }
 
-fn only_stmt_expr(body: &Block) -> &Expr {
+fn only_stmt_expr(body: &Option<Block>) -> &Expr {
     // helper for tests that just want the tail expression
-    body.tail.as_deref().expect("expected a tail expression")
+    body.as_ref().expect("expected a body").tail.as_deref().expect("expected a tail expression")
 }
 
 #[test]
@@ -257,7 +257,7 @@ fn multidim_array_type_desugars_to_nested_array() {
 #[test]
 fn let_mut_is_detected() {
     let f = lower_one_fn("fn f() { let mut acc = 0; acc }");
-    match &f.body.stmts[0].kind {
+    match &f.body.as_ref().unwrap().stmts[0].kind {
         StmtKind::Let { mutable, name, .. } => {
             assert!(*mutable);
             assert_eq!(name, "acc");
@@ -269,7 +269,7 @@ fn let_mut_is_detected() {
 #[test]
 fn plain_let_is_not_mutable() {
     let f = lower_one_fn("fn f() { let a = 0; a }");
-    match &f.body.stmts[0].kind {
+    match &f.body.as_ref().unwrap().stmts[0].kind {
         StmtKind::Let { mutable, .. } => assert!(!mutable),
         other => panic!("expected Let, got {other:?}"),
     }
@@ -278,7 +278,7 @@ fn plain_let_is_not_mutable() {
 #[test]
 fn reassignment_is_a_distinct_statement_kind() {
     let f = lower_one_fn("fn f() { let mut a = 0; a = a + 1; a }");
-    match &f.body.stmts[1].kind {
+    match &f.body.as_ref().unwrap().stmts[1].kind {
         StmtKind::Assign { target, .. } => match &target.kind {
             ExprKind::Path(p) => assert_eq!(p.segments, vec!["a".to_string()]),
             other => panic!("expected Path target, got {other:?}"),

@@ -110,10 +110,25 @@ impl Printer {
     }
 
     fn print_fn_decl(&mut self, d: &FnDecl) {
+        for attr in &d.attrs {
+            self.line(format!("#[{}({})]", attr.name, attr.args.join(", ")));
+        }
         let ret = d.ret.as_ref().map(|t| format!(" -> {}", fmt_type(t))).unwrap_or_default();
-        self.line(format!("fn {}{}({}){} {{", d.name, fmt_generics(&d.generics), fmt_params(&d.params), ret));
-        self.indented(|p| p.print_block_contents(&d.body));
-        self.line("}");
+        match &d.body {
+            Some(body) => {
+                self.line(format!("fn {}{}({}){} {{", d.name, fmt_generics(&d.generics), fmt_params(&d.params), ret));
+                self.indented(|p| p.print_block_contents(body));
+                self.line("}");
+            }
+            // A bodyless `fn` (only ever legal for an algebra-impl method
+            // with a recognized attribute, checked at inference time, not
+            // here — see `grammar.pest`'s own `fn_decl` comment) — same
+            // semicolon-terminated shape `print_algebra_decl` already uses
+            // for an algebra's own `fn_sig`.
+            None => {
+                self.line(format!("fn {}{}({}){};", d.name, fmt_generics(&d.generics), fmt_params(&d.params), ret));
+            }
+        }
     }
 
     fn print_block_contents(&mut self, b: &Block) {

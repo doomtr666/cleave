@@ -80,7 +80,7 @@
 //! problem, not this one.
 
 use crate::ast::*;
-use crate::infer::{check_no_placeholder, Constraint, Env, Infer, Scheme, Ty, TypeError};
+use crate::infer::{check_no_placeholder, Constraint, Env, Infer, Scheme, Ty, TypeError, TypeErrorKind};
 use crate::registry::Registry;
 use std::collections::{HashMap, HashSet};
 
@@ -117,12 +117,26 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
             _ => None,
         })
         .collect();
+    // A top-level `fn`'s own enclosing `Item` span — `FnDecl` itself
+    // carries none (see `ast.rs`) — needed only to report a bodyless one
+    // (legal grammatically, see `grammar.pest`'s own `fn_decl` comment, but
+    // never legal for a top-level `fn` specifically).
+    let item_spans: HashMap<String, Span> = program
+        .items
+        .iter()
+        .filter_map(|item| match &item.kind {
+            ItemKind::Fn(f) => Some((f.name.clone(), item.span)),
+            _ => None,
+        })
+        .collect();
 
     let known: HashSet<&str> = functions.keys().map(String::as_str).collect();
     let mut graph: HashMap<String, Vec<String>> = HashMap::new();
     for (name, f) in &functions {
         let mut calls = Vec::new();
-        collect_calls_block(&f.body, &known, &mut calls);
+        if let Some(body) = &f.body {
+            collect_calls_block(body, &known, &mut calls);
+        }
         graph.entry(name.clone()).or_default().extend(calls);
     }
 
@@ -150,6 +164,14 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
         let mut raw_results: HashMap<String, Result<Ty, TypeError>> = HashMap::new();
         for name in group {
             let f = functions[name.as_str()];
+            if f.body.is_none() {
+                let span = item_spans[name.as_str()];
+                raw_results.insert(
+                    name.clone(),
+                    Err(TypeError { span, kind: TypeErrorKind::MissingFnBody { name: f.name.clone() } }),
+                );
+                continue;
+            }
             let (param_types, ret_var, generics) = placeholders[name].clone();
             // `check_pending_type_names` right here, per member, not folded
             // into the group-wide `check_pending_constraints` sweep below —

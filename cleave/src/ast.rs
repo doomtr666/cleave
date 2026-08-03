@@ -137,13 +137,33 @@ pub struct InherentImplDecl {
     pub fns: Vec<FnDecl>,
 }
 
+/// `#[mlir(mlir_f32_add_instruction)]` — a general annotation on a `fn`, not
+/// itself interpreted anywhere yet (see `grammar.pest`'s own comment on why
+/// `args` stays bare `ident`s: nothing here is evaluated). The one real
+/// consumer today is `infer.rs`'s own body-presence check on `FnDecl::body`
+/// — `name == "mlir"` is what justifies a bodyless algebra-impl method.
+#[derive(Debug, Clone)]
+pub struct Attribute {
+    pub name: String,
+    pub args: Vec<String>,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone)]
 pub struct FnDecl {
     pub name: String,
+    pub attrs: Vec<Attribute>,
     pub generics: Vec<GenericParam>,
     pub params: Vec<Param>,
     pub ret: Option<Type>,
-    pub body: Block,
+    /// `None` for a bodyless declaration (`fn add(a: T, b: T) -> T;`) —
+    /// legal grammatically anywhere a `fn` appears, but only actually
+    /// accepted, at inference time, for an algebra-impl method carrying a
+    /// recognized body-justifying attribute (see `Infer::infer_impl_fn_
+    /// generic_with_env`'s own doc comment) — a top-level `fn` or inherent-
+    /// impl method with no body is a real, rejected error, not silently
+    /// tolerated.
+    pub body: Option<Block>,
 }
 
 #[derive(Debug, Clone)]

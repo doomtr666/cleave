@@ -97,6 +97,12 @@ impl Lowerer {
 
     fn lower_fn_decl(&mut self, pair: Pair<Rule>) -> FnDecl {
         let mut inner = pair.into_inner().peekable();
+
+        let mut attrs = Vec::new();
+        while matches!(inner.peek().map(|p| p.as_rule()), Some(Rule::attribute)) {
+            attrs.push(self.lower_attribute(inner.next().unwrap()));
+        }
+
         let name = inner.next().unwrap().as_str().to_string();
 
         let generics = if matches!(inner.peek().map(|p| p.as_rule()), Some(Rule::generic_params)) {
@@ -117,8 +123,19 @@ impl Lowerer {
             None
         };
 
-        let body = self.lower_block(inner.next().unwrap());
-        FnDecl { name, generics, params, ret, body }
+        // `(block | ";")` -- a bare `;` is a literal token, producing no
+        // pair of its own, so `None` here is exactly "no `block` pair was
+        // left to consume", not a parse failure.
+        let body = inner.next().map(|p| self.lower_block(p));
+        FnDecl { name, attrs, generics, params, ret, body }
+    }
+
+    fn lower_attribute(&mut self, pair: Pair<Rule>) -> Attribute {
+        let span = self.span_of(&pair);
+        let mut inner = pair.into_inner();
+        let name = inner.next().unwrap().as_str().to_string();
+        let args = inner.map(|p| p.as_str().to_string()).collect();
+        Attribute { name, args, span }
     }
 
     fn lower_generic_params(&mut self, pair: Pair<Rule>) -> Vec<GenericParam> {

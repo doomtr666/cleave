@@ -1,0 +1,9 @@
+fn fibonacci<T: Int>(x : T) -> T {
+    if x > 2 { fibonacci(x-1) + fibonacci(x-2) } else { x }
+}
+
+fn main() {
+    let a = fibonacci(42:i32);
+    let b = fibonacci(42:i64);
+    0
+}

@@ -1,0 +1,21 @@
+struct Complex<T : Float> {
+    real: T,
+    imag: T,
+}
+
+impl <T : Float> Ring<Complex<T>> {
+    fn add(x, y) { Complex(real: x.real + y.real, imag: x.imag + y.imag) }
+    fn sub(x, y) { Complex(real: x.real - y.real, imag: x.imag - y.imag) }
+    fn mul(x, y) {
+        Complex (
+            real: x.real * y.real - x.imag * y.imag,
+            imag: x.real * y.imag + x.imag * y.real
+        )
+    }
+}
+
+fn main() {
+    let z1 = Complex(real: 1.0, imag: 0.0);
+    let z2 = Complex(real: 0.0, imag: 1.0);
+    let zr = (z1 + z2) * (z1 - z2);
+}

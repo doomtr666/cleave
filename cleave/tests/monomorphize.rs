@@ -19,7 +19,7 @@ fn find_call<'a>(program: &'a Program, fn_name: &str, callee: &str) -> &'a Expr 
             _ => None,
         })
         .unwrap_or_else(|| panic!("no fn named `{fn_name}` in program"));
-    find_call_in_block(&f.body, callee).unwrap_or_else(|| panic!("no call to `{callee}` found inside `{fn_name}`"))
+    find_call_in_block(f.body.as_ref().unwrap(), callee).unwrap_or_else(|| panic!("no call to `{callee}` found inside `{fn_name}`"))
 }
 
 fn find_call_in_block<'a>(block: &'a Block, callee: &str) -> Option<&'a Expr> {
@@ -329,6 +329,41 @@ fn a_non_generic_algebra_impl_needs_no_specialization_and_is_unaffected() {
     let program = lower_program(src);
     let (mono, _) = monomorphize(&program, &registry);
     assert!(mono.specializations_of("Ring::add").is_empty());
+}
+
+#[test]
+fn a_bodyless_concrete_impl_still_dispatches_correctly_from_inside_a_generic_siblings_body() {
+    // Regression test: a *concrete* impl with no body at all (the real-
+    // primitive shape, `#[mlir(...)]`-tagged) must still be visible to
+    // `derive_impl_instantiation`'s own "a concrete impl already covers
+    // this call" recognition (`ImplTemplate::is_generic == false`) --
+    // `build_impl_templates` used to skip *every* bodyless method
+    // entirely, concrete or generic, which made `Ring<f32>::add` invisible
+    // and left `Ring<Complex<T>>::add`'s own inner scalar `x.real + y.real`
+    // (real body, needs a real `f32` addition once monomorphized) matching
+    // against nothing but the structurally-incompatible generic template
+    // itself -- wrongly reported as `MonomorphizationFailed` instead of
+    // resolving cleanly. Found by direct testing (`examples/complex.cleave`).
+    let src = "algebra Ring<T> { fn add(a: T, b: T) -> T; }
+         impl Ring<f32> { #[mlir(mlir_f32_add)] fn add(a: f32, b: f32) -> f32; }
+         algebra Float<T> {}
+         impl Float<f32> {}
+         struct Complex<T: Float> { real: T, imag: T }
+         impl<T: Float> Ring<Complex<T>> {
+             fn add(x, y) { Complex(real: x.real + y.real, imag: x.imag + y.imag) }
+         }
+         fn f() -> i32 {
+             let z1 = Complex(real: 1.0, imag: 0.0);
+             let z2 = Complex(real: 0.0, imag: 1.0);
+             let zr = z1 + z2;
+             0
+         }";
+    let registry = registry_from(src);
+    let program = lower_program(src);
+    let (mono, _) = monomorphize(&program, &registry);
+    assert!(mono.errors().is_empty(), "expected no monomorphization errors, got {:?}", mono.errors());
+    let keys = mono.specializations_of("Ring::add");
+    assert_eq!(keys, &["Ring::add<Complex<f32>>".to_string()]);
 }
 
 #[test]

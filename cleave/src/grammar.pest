@@ -26,7 +26,25 @@ use_decl = { "use" ~ path ~ ";" }
 path     = { ident ~ ("::" ~ ident)* }
 
 // ---------------------------------------------------------------- fn
-fn_decl = { "fn" ~ ident ~ generic_params? ~ "(" ~ param_list? ~ ")" ~ ("->" ~ type_)? ~ block }
+
+// `#[mlir(mlir_f32_add_instruction)]` -- a general annotation mechanism,
+// though the one real case so far is a body-justifying attribute on an
+// otherwise-bodyless algebra-impl method (see `fn_decl`'s own trailing
+// `(block | ";")` below). `attribute_arg` stays a bare `ident` on purpose --
+// not a general `expr` -- the same "don't accept more than the one real
+// case needs yet" restriction `array_repeat`'s own count already uses;
+// nothing here is evaluated, just a name the eventual MLIR-lowering pass
+// will read back out.
+attribute     = { "#" ~ "[" ~ ident ~ ("(" ~ attribute_arg ~ ("," ~ attribute_arg)* ~ ")")? ~ "]" }
+attribute_arg = { ident }
+
+// The trailing `(block | ";")` is deliberately permissive here -- *every*
+// `fn` (top-level, algebra-impl, inherent-impl) may omit its body at the
+// grammar level; "must have one unless it's an algebra-impl method carrying
+// a recognized body-justifying attribute" is a *semantic* check
+// (`infer.rs`), not a grammatical one -- same posture `const R: Int`
+// parsing fine and being rejected later already established.
+fn_decl = { attribute* ~ "fn" ~ ident ~ generic_params? ~ "(" ~ param_list? ~ ")" ~ ("->" ~ type_)? ~ (block | ";") }
 
 generic_params = { "<" ~ generic_param ~ ("," ~ generic_param)* ~ ">" }
 generic_param  = { "const" ~ ident ~ ":" ~ type_ | ident ~ (":" ~ bound_list)? }

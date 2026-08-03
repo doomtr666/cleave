@@ -1,6 +1,6 @@
 use cleave::ast::{FileId, Program};
 use cleave::callgraph::infer_program;
-use cleave::infer::{ConstValue, Ty};
+use cleave::infer::{ConstValue, Ty, TypeErrorKind};
 use cleave::lower::Lowerer;
 use cleave::parser::{CleaveParser, Rule};
 use cleave::registry::Registry;
@@ -200,6 +200,19 @@ fn a_type_error_in_one_group_does_not_corrupt_an_unrelated_group() {
     let result = infer_program(&program, &registry);
     assert!(result.results.get("broken").unwrap().is_err(), "`broken`'s if-branches disagree (bool vs i32)");
     assert_eq!(ok_result(&result, "fine"), Ty::Con("i32".to_string()));
+}
+
+#[test]
+fn a_bodyless_top_level_fn_is_rejected() {
+    // Legal grammatically (see `grammar.pest`'s own `fn_decl` comment) but
+    // never legal for a top-level `fn` specifically -- `infer_program`
+    // itself is the one real validation point with an enclosing `Item`'s
+    // own span to report against (`FnDecl` carries none).
+    let registry = builtin_registry();
+    let program = lower_program("fn f(x: i32) -> i32;");
+    let result = infer_program(&program, &registry);
+    let err = result.results.get("f").unwrap().as_ref().unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::MissingFnBody { .. }), "got: {:?}", err.kind);
 }
 
 #[test]

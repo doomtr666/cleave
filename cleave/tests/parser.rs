@@ -62,6 +62,30 @@ fn fn_with_types() {
 }
 
 #[test]
+fn a_bare_attribute_parses() {
+    parses(Rule::attribute, "#[export]");
+}
+
+#[test]
+fn an_attribute_with_an_ident_argument_parses() {
+    parses(Rule::attribute, "#[mlir(mlir_f32_add_instruction)]");
+}
+
+#[test]
+fn a_bodyless_fn_parses() {
+    // Legal grammatically anywhere a `fn` appears (see `grammar.pest`'s own
+    // `fn_decl` comment) -- the restriction to "only inside an algebra
+    // impl, and only with a recognized attribute" is enforced later, by
+    // `infer.rs`, not by the parser.
+    parses(Rule::fn_decl, "fn add(a: i32, b: i32) -> i32;");
+}
+
+#[test]
+fn an_attributed_bodyless_fn_parses() {
+    parses(Rule::fn_decl, "#[mlir(mlir_i32_add)] fn add(a: i32, b: i32) -> i32;");
+}
+
+#[test]
 fn main_entry_point() {
     parses(Rule::fn_decl, "fn main() -> i32 { 0 }");
 }

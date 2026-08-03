@@ -154,7 +154,10 @@ fn dump_program_fn(out: &mut String, errors: &mut Vec<TypeError>, f: &FnDecl, pr
                 .collect();
             let ret = fmt_ty_named(&fn_result.result, &mut names);
             let _ = writeln!(out, "fn {}({}) -> {ret} {{", f.name, params.join(", "));
-            dump_block(out, &f.body, &program_inference.node_types, &mut names, 1);
+            // A bodyless top-level `fn` is rejected by `callgraph::infer_program`
+            // itself (`MissingFnBody`) before it could ever reach `Ok` here.
+            let body = f.body.as_ref().expect("a top-level fn reaching Ok always has a body");
+            dump_block(out, body, &program_inference.node_types, &mut names, 1);
             let _ = writeln!(out, "}}");
         }
         Some(Err(e)) => {
@@ -188,9 +191,27 @@ fn dump_impl_fn(
                 .map(|(p, t)| format!("{}: {}", p.name, fmt_ty_named(t, &mut names)))
                 .collect();
             let ret = fmt_ty_named(&ret, &mut names);
-            let _ = writeln!(out, "fn {}({}) -> {ret} {{", f.name, params.join(", "));
-            dump_block(out, &f.body, &infer.node_types, &mut names, 1);
-            let _ = writeln!(out, "}}");
+            match &f.body {
+                Some(body) => {
+                    let _ = writeln!(out, "fn {}({}) -> {ret} {{", f.name, params.join(", "));
+                    dump_block(out, body, &infer.node_types, &mut names, 1);
+                    let _ = writeln!(out, "}}");
+                }
+                // A bodyless method that type-checked successfully -- legal
+                // only with a recognized attribute (see `Infer::infer_impl_
+                // fn_generic_with_env`'s own doc comment) -- rendered as a
+                // bare signature, same "nothing to show a body for" posture
+                // `--dump-monomorphized` already uses for a never-called
+                // generic method.
+                None => {
+                    let attrs: Vec<String> =
+                        f.attrs.iter().map(|a| format!("#[{}({})]", a.name, a.args.join(", "))).collect();
+                    for attr in &attrs {
+                        let _ = writeln!(out, "{attr}");
+                    }
+                    let _ = writeln!(out, "fn {}({}) -> {ret};", f.name, params.join(", "));
+                }
+            }
         }
         Err(e) => {
             let params: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
@@ -232,7 +253,11 @@ fn dump_inherent_impl_block(
                     .collect();
                 let ret = fmt_ty_named(&ret, &mut names);
                 let _ = writeln!(out, "fn {}({}) -> {ret} {{", f.name, params.join(", "));
-                dump_block(out, &f.body, &infer.node_types, &mut names, 1);
+                // A bodyless inherent method is rejected by `infer_inherent_
+                // impl_fn_raw` itself (`MissingFnBody`) before it could ever
+                // reach `Ok` here.
+                let body = f.body.as_ref().expect("an inherent method reaching Ok always has a body");
+                dump_block(out, body, &infer.node_types, &mut names, 1);
                 let _ = writeln!(out, "}}");
             }
             Some(Err(e)) => {

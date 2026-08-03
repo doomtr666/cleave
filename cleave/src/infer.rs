@@ -408,6 +408,19 @@ pub enum TypeErrorKind {
     /// concrete example (a stub matmul body accidentally requiring a square
     /// shape).
     MonomorphizationFailed { algebra: String, method: String, tys: String },
+    /// A top-level `fn` or inherent-impl method declared with no body
+    /// (`fn foo(x: i32);`) — legal grammatically anywhere a `fn` appears
+    /// (see `grammar.pest`'s own `fn_decl` comment), but only ever actually
+    /// meaningful for an algebra-impl method (see `MissingIntrinsicAttribute`
+    /// below) — there's nothing else a top-level `fn`/inherent method could
+    /// possibly mean by omitting its body.
+    MissingFnBody { name: String },
+    /// An algebra-impl method declared with no body, but carrying none of
+    /// the recognized body-justifying attributes (`#[mlir(...)]` today) —
+    /// the one case a bodyless `fn` *is* legal, but only when something
+    /// tells the eventual codegen pass what to actually do instead of
+    /// running a body that doesn't exist.
+    MissingIntrinsicAttribute { name: String },
 }
 
 impl std::fmt::Display for TypeErrorKind {
@@ -459,6 +472,12 @@ impl std::fmt::Display for TypeErrorKind {
             }
             TypeErrorKind::MonomorphizationFailed { algebra, method, tys } => {
                 write!(f, "`{algebra}::{method}` cannot be specialized for ({tys}): its generic impl body doesn't type-check at this instantiation")
+            }
+            TypeErrorKind::MissingFnBody { name } => {
+                write!(f, "`{name}` has no body — only an algebra-impl method may omit one, and only with a recognized attribute (e.g. `#[mlir(...)]`)")
+            }
+            TypeErrorKind::MissingIntrinsicAttribute { name } => {
+                write!(f, "`{name}` has no body and no recognized attribute justifying that (e.g. `#[mlir(...)]`) — a `fn` without a body needs one")
             }
         }
     }
@@ -638,7 +657,11 @@ fn find_placeholder_name(ty: &Ty) -> Option<String> {
 pub(crate) fn check_no_placeholder(f: &FnDecl, final_result: &Ty, param_types: &[Ty]) -> Result<(), TypeError> {
     let unresolved = find_placeholder_name(final_result).or_else(|| param_types.iter().find_map(find_placeholder_name));
     if let Some(placeholder) = unresolved {
-        if let Some(span) = f.body.tail.as_deref().map(|t| t.span).or_else(|| f.body.stmts.last().map(|s| s.span)) {
+        if let Some(span) = f
+            .body
+            .as_ref()
+            .and_then(|b| b.tail.as_deref().map(|t| t.span).or_else(|| b.stmts.last().map(|s| s.span)))
+        {
             return Err(TypeError { span, kind: TypeErrorKind::Unresolved(placeholder) });
         }
     }
@@ -967,7 +990,8 @@ impl<'r> Infer<'r> {
     /// for `f`'s declared return type (`infer_fn_raw`), which must resolve
     /// `T` to the exact same fresh variable, not a second, unrelated one.
     pub(crate) fn fresh_fn_shape(&mut self, f: &FnDecl) -> (Vec<Ty>, Ty, HashMap<String, Ty>) {
-        let span = f.body.tail.as_deref().map(|t| t.span).or_else(|| f.body.stmts.last().map(|s| s.span));
+        let span =
+            f.body.as_ref().and_then(|b| b.tail.as_deref().map(|t| t.span).or_else(|| b.stmts.last().map(|s| s.span)));
         let generics = span.map(|span| self.fn_generics_mapping(f, span)).unwrap_or_default();
         let param_types = f
             .params
@@ -1032,12 +1056,18 @@ impl<'r> Infer<'r> {
         ret_var: Ty,
         generics: &HashMap<String, Ty>,
     ) -> Result<Ty, TypeError> {
+        // A bodyless top-level `fn` is rejected before this is ever reached
+        // (`callgraph::infer_program`, the one real caller that has an
+        // enclosing `Item`'s own span to report against — `FnDecl` itself
+        // carries none, see `ast.rs`) — `infer_fn` (this method's other,
+        // test-only caller) never constructs one either.
+        let body = f.body.as_ref().expect("infer_fn_raw requires a body; caller must validate first");
         let mut env = outer.clone();
         for (p, ty) in f.params.iter().zip(&param_types) {
             env.insert(p.name.clone(), Scheme::mono(ty.clone()));
         }
         self.seed_const_generics(&f.generics, generics, &mut env);
-        let result = self.infer_block(&env, &f.body)?;
+        let result = self.infer_block(&env, body)?;
         if let Some(ret) = &f.ret {
             let declared = self.ty_from_ast_mapped(ret, generics);
             self.unify_at(ret.span, &declared, &result)?;
@@ -1048,7 +1078,7 @@ impl<'r> Infer<'r> {
         // }`), nothing else would ever connect `ret_var` to the body's real
         // result, silently leaving a self-call checked against a type the
         // function might not actually return.
-        if let Some(span) = f.body.tail.as_deref().map(|t| t.span).or_else(|| f.body.stmts.last().map(|s| s.span)) {
+        if let Some(span) = body.tail.as_deref().map(|t| t.span).or_else(|| body.stmts.last().map(|s| s.span)) {
             self.unify_at(span, &ret_var, &result)?;
         }
         Ok(result)
@@ -1228,16 +1258,39 @@ impl<'r> Infer<'r> {
         }
         self.seed_const_generics(impl_generics, &impl_mapping, &mut env);
 
-        let result = self.infer_block(&env, &f.body)?;
-
         let expected_ret =
             sig.ret.as_ref().map(|t| self.ty_from_ast_mapped(t, &mapping)).unwrap_or_else(|| Ty::Con("()".to_string()));
         if let Some(ret) = &f.ret {
             let declared = self.ty_from_ast_mapped(ret, &impl_mapping);
             self.unify_at(ret.span, &expected_ret, &declared)?;
         }
-        let result_span = f.body.tail.as_deref().map(|t| t.span).unwrap_or(fallback_span);
-        self.unify_at(result_span, &expected_ret, &result)?;
+
+        // A bodyless algebra-impl method (`fn add(x: f32, y: f32) -> f32;`)
+        // is legal only when a recognized attribute justifies it — an
+        // eventual codegen intrinsic, `#[mlir(...)]` today, the only one
+        // this project recognizes so far (see `grammar.pest`'s own
+        // `fn_decl` comment on why the grammar itself stays permissive and
+        // this check lives here instead). The declared return type *is*
+        // the result in that case — there's no body to compute one, and
+        // nothing else here needs a body: `param_types`/`target_types` are
+        // already fully resolved from the signature/impl targets alone.
+        let result = match &f.body {
+            Some(body) => {
+                let result = self.infer_block(&env, body)?;
+                let result_span = body.tail.as_deref().map(|t| t.span).unwrap_or(fallback_span);
+                self.unify_at(result_span, &expected_ret, &result)?;
+                result
+            }
+            None => {
+                if !f.attrs.iter().any(|a| a.name == "mlir") {
+                    return Err(TypeError {
+                        span: fallback_span,
+                        kind: TypeErrorKind::MissingIntrinsicAttribute { name: f.name.clone() },
+                    });
+                }
+                expected_ret.clone()
+            }
+        };
 
         let final_result = self.finish_fn(f, param_types, result)?;
         // `finish_fn` already re-resolves `self.param_types`/`node_types`
@@ -1352,6 +1405,9 @@ impl<'r> Infer<'r> {
         // whose first parameter is annotated (`fn len(v: Vec2) { ... }`)
         // must still agree with the impl's own target, not silently accept
         // a second, independent truth.
+        let Some(body) = &f.body else {
+            return Err(TypeError { span: fallback_span, kind: TypeErrorKind::MissingFnBody { name: f.name.clone() } });
+        };
         if let Some(t) = f.params.first().and_then(|p| p.ty.as_ref()) {
             self.unify_at(t.span, target_ty, &param_types[0])?;
         }
@@ -1362,12 +1418,12 @@ impl<'r> Infer<'r> {
         }
         self.seed_const_generics(impl_generics, impl_mapping, &mut env);
 
-        let result = self.infer_block(&env, &f.body)?;
+        let result = self.infer_block(&env, body)?;
         if let Some(ret) = &f.ret {
             let declared = self.ty_from_ast_mapped(ret, impl_mapping);
             self.unify_at(ret.span, &declared, &result)?;
         }
-        let result_span = f.body.tail.as_deref().map(|t| t.span).unwrap_or(fallback_span);
+        let result_span = body.tail.as_deref().map(|t| t.span).unwrap_or(fallback_span);
         self.unify_at(result_span, &ret_var, &result)?;
         Ok(result)
     }

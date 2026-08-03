@@ -829,7 +829,7 @@ fn node_types_records_every_subexpression_fully_resolved() {
     let registry = Registry::default();
     let mut infer = Infer::new(&registry);
     infer.infer_fn(&f).unwrap_or_else(|e| panic!("{e:?}"));
-    let tail = f.body.tail.as_deref().expect("expected a tail expression");
+    let tail = f.body.as_ref().unwrap().tail.as_deref().expect("expected a tail expression");
     assert_eq!(infer.node_types.get(&tail.id), Some(&Ty::Con("f64".to_string())));
 }
 
@@ -887,6 +887,53 @@ fn impl_method_arity_mismatch_against_the_algebra_is_rejected() {
     let mut infer = Infer::new(&registry);
     let err = infer.infer_impl_fn(&algebra, &target, &f, span).unwrap_err();
     assert!(matches!(err.kind, TypeErrorKind::ArityMismatch { .. }), "got: {:?}", err.kind);
+}
+
+// ---------------------------------------------------------------------
+// attributes (`#[mlir(...)]`) and bodyless `fn`s
+// ---------------------------------------------------------------------
+
+// A bodyless top-level `fn` is validated by `callgraph::infer_program`
+// itself, not by `infer_fn` directly (which has no `Span` to report against
+// other than the body it doesn't have — see `infer_fn_raw`'s own doc
+// comment) — see `tests/callgraph.rs`'s
+// `a_bodyless_top_level_fn_is_rejected`.
+
+#[test]
+fn a_bodyless_inherent_method_is_rejected() {
+    let (target, generics, f, span) =
+        lower_one_inherent_impl("struct Vec2 { x: f64, y: f64 } impl struct Vec2 { fn len(v) -> f64; }");
+    let registry = builtin_registry();
+    let mut infer = Infer::new(&registry);
+    let err = infer.infer_inherent_impl_fn_generic(&cleave::infer::Env::new(), &generics, &target, &f, span).unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::MissingFnBody { .. }), "got: {:?}", err.kind);
+}
+
+#[test]
+fn a_bodyless_algebra_impl_method_with_no_attribute_is_rejected() {
+    let registry = registry_from("algebra TestAlg<T> { fn add(x: T, y: T) -> T; }");
+    let (algebra, target, f, span) = lower_one_impl(
+        "algebra TestAlg<T> { fn add(x: T, y: T) -> T; }
+         impl TestAlg<i32> { fn add(x: i32, y: i32) -> i32; }",
+    );
+    let mut infer = Infer::new(&registry);
+    let err = infer.infer_impl_fn(&algebra, &target, &f, span).unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::MissingIntrinsicAttribute { .. }), "got: {:?}", err.kind);
+}
+
+#[test]
+fn a_bodyless_algebra_impl_method_with_mlir_attribute_type_checks() {
+    let registry = registry_from("algebra TestAlg<T> { fn add(x: T, y: T) -> T; }");
+    let (algebra, target, f, span) = lower_one_impl(
+        "algebra TestAlg<T> { fn add(x: T, y: T) -> T; }
+         impl TestAlg<i32> {
+             #[mlir(mlir_i32_add)]
+             fn add(x: i32, y: i32) -> i32;
+         }",
+    );
+    let mut infer = Infer::new(&registry);
+    let ty = infer.infer_impl_fn(&algebra, &target, &f, span).unwrap();
+    assert_eq!(ty, Ty::Con("i32".to_string()));
 }
 
 // ---------------------------------------------------------------------
@@ -1129,7 +1176,7 @@ fn field_access_on_a_still_abstract_base_stays_a_placeholder_not_an_error() {
     let registry = Registry::default();
     let mut infer = Infer::new(&registry);
     infer.infer_fn(&f).unwrap_or_else(|e| panic!("{e:?}"));
-    let field_access = &f.body.stmts[0];
+    let field_access = &f.body.as_ref().unwrap().stmts[0];
     let StmtKind::Expr(e) = &field_access.kind else { panic!("expected an Expr statement") };
     assert_eq!(infer.node_types.get(&e.id), Some(&Ty::Con("<not-yet-inferred>".to_string())));
 }

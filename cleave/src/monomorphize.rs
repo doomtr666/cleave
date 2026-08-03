@@ -257,8 +257,13 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
         if !scheme.vars.is_empty() {
             continue;
         }
+        // Only ever `None` for a top-level `fn` that `callgraph::infer_program`
+        // itself already rejected (`MissingFnBody`) — such a function never
+        // makes it into `global_env` at all, so the `scheme` lookup above
+        // would already have skipped it.
+        let body = f.body.as_ref().expect("a top-level fn with a global_env scheme always has a body");
         collect_instantiations(
-            &f.body,
+            body,
             &program_inference.node_types,
             &program_inference.global_env,
             &templates,
@@ -285,8 +290,9 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
         let param_types: Vec<Ty> = param_pattern.iter().map(|t| substitute(t, &mapping)).collect();
         let result = substitute(ret_pattern, &mapping);
 
+        let body = f.body.as_ref().expect("a top-level fn with a global_env scheme always has a body");
         let mut exprs = Vec::new();
-        collect_exprs_block(&f.body, &mut exprs);
+        collect_exprs_block(body, &mut exprs);
         let node_types: HashMap<NodeId, Ty> = exprs
             .iter()
             .filter_map(|e| program_inference.node_types.get(&e.id).map(|t| (e.id, substitute(t, &mapping))))
@@ -300,7 +306,7 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
         // matters specifically for a self-recursive call site.
         let mut call_names = HashMap::new();
         collect_instantiations(
-            &f.body,
+            body,
             &node_types,
             &program_inference.global_env,
             &templates,
@@ -313,7 +319,7 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
         mono.by_origin.entry(name).or_default().push(display.clone());
         mono.specializations.insert(
             display,
-            Specialization { params: f.params.clone(), body: f.body.clone(), param_types, result, node_types, call_names },
+            Specialization { params: f.params.clone(), body: body.clone(), param_types, result, node_types, call_names },
         );
     }
 
@@ -367,22 +373,46 @@ fn build_impl_templates(program: &Program, registry: &Registry, global_env: &Env
     for item in &program.items {
         let ItemKind::Impl(d) = &item.kind else { continue };
         let all_targets: Vec<Type> = std::iter::once(d.target.clone()).chain(d.extra_targets.iter().cloned()).collect();
+        let is_generic = !d.generics.is_empty();
         for f in &d.fns {
+            // A *generic* impl's own bodyless method (`#[mlir(...)]`-tagged,
+            // or otherwise) has no body to substitute a specialization's
+            // concrete types into — nothing to monomorphize, skipped.
+            // A *concrete* impl's own bodyless method (the immediate,
+            // real-primitive case — `impl Ring<f32> { #[mlir(...)] fn
+            // add(...); }`) still needs a template built, even with no real
+            // body: `derive_impl_instantiation`'s own structural match
+            // against `is_generic == false` is what recognizes "a concrete
+            // impl already covers this call, no specialization needed" (see
+            // `ImplTemplate::is_generic`'s own doc comment) — skipping it
+            // here entirely made that impl invisible to that check, so a
+            // scalar call inside some *other* generic impl's own body (e.g.
+            // `Complex<T>::add`'s own `x.real + y.real`, once monomorphized
+            // at `T = f32`) wrongly fell through to `NoneMatched` against
+            // the only *visible* (and structurally incompatible) candidate
+            // — found by direct testing.
+            if f.body.is_none() && is_generic {
+                continue;
+            }
             let mut infer = Infer::new(registry);
             let Ok(ret_pattern) = infer.infer_impl_fn_generic_with_env(global_env, &d.algebra, &d.generics, &all_targets, f, item.span)
             else {
                 continue;
             };
+            // Never read for a non-generic template — `derive_impl_
+            // instantiation` returns `NoCandidates` the moment it sees
+            // `is_generic == false`, before ever touching `body`.
+            let body = f.body.clone().unwrap_or(Block { stmts: Vec::new(), tail: None });
             templates.push(ImplTemplate {
                 algebra: d.algebra.clone(),
                 method_name: f.name.clone(),
                 params: f.params.clone(),
-                body: f.body.clone(),
+                body,
                 param_patterns: infer.param_types.clone(),
                 ret_pattern,
                 target_patterns: infer.target_types.clone(),
                 node_types: infer.node_types.clone(),
-                is_generic: !d.generics.is_empty(),
+                is_generic,
             });
         }
     }
@@ -715,11 +745,12 @@ pub fn dump_monomorphized(program: &Program, registry: &Registry) -> (String, Ve
                 }
                 Some(Ok(fn_result)) => match program_inference.global_env.get(&f.name) {
                     Some(scheme) if scheme.vars.is_empty() => {
+                        let body = f.body.as_ref().expect("a top-level fn with a global_env scheme always has a body");
                         dump_one(
                             &mut out,
                             &f.name,
                             &f.params,
-                            &f.body,
+                            body,
                             &fn_result.param_types,
                             &fn_result.result,
                             &program_inference.node_types,
@@ -776,7 +807,26 @@ fn dump_concrete_impl(out: &mut String, errors: &mut Vec<TypeError>, d: &ImplDec
     for f in &d.fns {
         let mut infer = Infer::new(registry);
         match infer.infer_impl_fn_generic_with_env(global_env, &d.algebra, &d.generics, &all_targets, f, span) {
-            Ok(ret) => dump_one(out, &f.name, &f.params, &f.body, &infer.param_types, &ret, &infer.node_types, &HashMap::new()),
+            Ok(ret) => match &f.body {
+                Some(body) => dump_one(out, &f.name, &f.params, body, &infer.param_types, &ret, &infer.node_types, &HashMap::new()),
+                // A bodyless method (`#[mlir(...)]`-tagged) that type-checked
+                // successfully — rendered as a bare signature, same as
+                // `dump.rs`'s own `dump_impl_fn`.
+                None => {
+                    let mut names = TyVarNames::default();
+                    let rendered_params: Vec<String> = f
+                        .params
+                        .iter()
+                        .zip(infer.param_types.iter())
+                        .map(|(p, t)| format!("{}: {}", p.name, fmt_ty_named(t, &mut names)))
+                        .collect();
+                    let ret = fmt_ty_named(&ret, &mut names);
+                    for attr in &f.attrs {
+                        let _ = writeln!(out, "#[{}({})]", attr.name, attr.args.join(", "));
+                    }
+                    let _ = writeln!(out, "fn {}({}) -> {ret};", f.name, rendered_params.join(", "));
+                }
+            },
             Err(e) => {
                 let params: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
                 let _ = writeln!(out, "fn {}({}) {{ /* type error, see diagnostics */ }}", f.name, params.join(", "));

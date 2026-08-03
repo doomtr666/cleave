@@ -99,11 +99,11 @@ fn source_map_is_usable_even_when_compile_fails() {
 #[test]
 fn a_crates_own_files_are_merged_before_joining_the_program() {
     let project = TempProject::new("multi_file_crate");
-    project.write_crate_file("shapes", "sig.cleave", "algebra Ring<T> { fn add(a: T, b: T) -> T; }");
+    project.write_crate_file("shapes", "sig.cleave", "algebra Shapes<T> { fn add(a: T, b: T) -> T; }");
     project.write_crate_file(
         "shapes",
         "axiom.cleave",
-        "algebra Ring<T> { axiom comm(a: T, b: T): add(a,b) == add(b,a); }",
+        "algebra Shapes<T> { axiom comm(a: T, b: T): add(a,b) == add(b,a); }",
     );
 
     let src = "use shapes;\nfn f() -> i32 { 0 }".to_string();
@@ -111,18 +111,18 @@ fn a_crates_own_files_are_merged_before_joining_the_program() {
 
     // Filtered by name, not just `ItemKind::Algebra` — `num` (with its own
     // `Num` algebra) is always loaded too now, via the prelude.
-    let ring_items: Vec<_> = program
+    let shapes_items: Vec<_> = program
         .items
         .iter()
-        .filter(|i| matches!(&i.kind, ItemKind::Algebra(d) if d.name == "Ring"))
+        .filter(|i| matches!(&i.kind, ItemKind::Algebra(d) if d.name == "Shapes"))
         .collect();
-    assert_eq!(ring_items.len(), 1, "the two fragments must merge into one Ring, not stay separate");
+    assert_eq!(shapes_items.len(), 1, "the two fragments must merge into one Shapes, not stay separate");
 }
 
 #[test]
 fn the_same_crate_used_twice_is_only_loaded_once() {
     let project = TempProject::new("dedup_use");
-    project.write_crate_file("shapes", "shapes.cleave", "algebra Ring<T> { fn add(a: T, b: T) -> T; }");
+    project.write_crate_file("shapes", "shapes.cleave", "algebra Shapes<T> { fn add(a: T, b: T) -> T; }");
 
     let a = "use shapes;\nfn f() -> i32 { 0 }".to_string();
     let b = "use shapes;\nfn g() -> i32 { 0 }".to_string();
@@ -131,12 +131,12 @@ fn the_same_crate_used_twice_is_only_loaded_once() {
 
     // Filtered by name, not just `ItemKind::Algebra` — `num` (with its own
     // `Num` algebra) is always loaded too now, via the prelude.
-    let ring_items: Vec<_> = program
+    let shapes_items: Vec<_> = program
         .items
         .iter()
-        .filter(|i| matches!(&i.kind, ItemKind::Algebra(d) if d.name == "Ring"))
+        .filter(|i| matches!(&i.kind, ItemKind::Algebra(d) if d.name == "Shapes"))
         .collect();
-    assert_eq!(ring_items.len(), 1, "loading `shapes` twice must not duplicate its declarations");
+    assert_eq!(shapes_items.len(), 1, "loading `shapes` twice must not duplicate its declarations");
 }
 
 #[test]
@@ -147,7 +147,7 @@ fn node_ids_stay_unique_across_multiple_files() {
     // `infer.rs`'s `node_types` now does. `compile` threads one shared
     // `NodeIdGen` across the entry file *and* every crate file it loads.
     let project = TempProject::new("node_id_uniqueness");
-    project.write_crate_file("shapes", "shapes.cleave", "algebra Ring<T> { fn add(a: T, b: T) -> T; }");
+    project.write_crate_file("shapes", "shapes.cleave", "algebra Shapes<T> { fn add(a: T, b: T) -> T; }");
 
     let src = "use shapes;\nfn f() -> i32 { 0 }\nfn g() -> i32 { 1 }".to_string();
     let program = compile_ok(vec![("main.cleave".to_string(), src)], &project.search_paths());
