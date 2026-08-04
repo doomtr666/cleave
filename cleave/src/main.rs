@@ -15,6 +15,7 @@
 //! pass sit next to each other. More `--dump-*` flags arrive as more passes
 //! do (CPS conversion, ...).
 
+use cleave::cps::{collect_units, convert_program, dump_cps_program};
 use cleave::diag::SourceMap;
 use cleave::driver::compile;
 use cleave::dump::dump_program;
@@ -29,6 +30,7 @@ struct Args {
     dump_ast: bool,
     dump_inference_pass: bool,
     dump_monomorphized: bool,
+    dump_cps: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -36,12 +38,14 @@ fn parse_args() -> Result<Args, String> {
     let mut dump_ast = false;
     let mut dump_inference_pass = false;
     let mut dump_monomorphized = false;
+    let mut dump_cps = false;
 
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--dump-ast" => dump_ast = true,
             "--dump-inference-pass" => dump_inference_pass = true,
             "--dump-monomorphized" => dump_monomorphized = true,
+            "--dump-cps" => dump_cps = true,
             other if other.starts_with("--") => return Err(format!("unknown flag {other:?}")),
             other if path.is_none() => path = Some(PathBuf::from(other)),
             other => return Err(format!("only one input file is supported, got a second argument {other:?}")),
@@ -51,15 +55,15 @@ fn parse_args() -> Result<Args, String> {
     // No `--dump-*` flag at all defaults to today's one real pass, so the
     // common case (`cleave file.cleave`) stays exactly as terse as before
     // these flags existed.
-    if !dump_ast && !dump_inference_pass && !dump_monomorphized {
+    if !dump_ast && !dump_inference_pass && !dump_monomorphized && !dump_cps {
         dump_inference_pass = true;
     }
 
     match path {
-        Some(path) => Ok(Args { path, dump_ast, dump_inference_pass, dump_monomorphized }),
-        None => {
-            Err("usage: cleave <file.cleave> [--dump-ast] [--dump-inference-pass] [--dump-monomorphized]".to_string())
-        }
+        Some(path) => Ok(Args { path, dump_ast, dump_inference_pass, dump_monomorphized, dump_cps }),
+        None => Err(
+            "usage: cleave <file.cleave> [--dump-ast] [--dump-inference-pass] [--dump-monomorphized] [--dump-cps]".to_string(),
+        ),
     }
 }
 
@@ -110,7 +114,8 @@ fn main() -> ExitCode {
     // Only header-separate stages when more than one is being dumped at
     // once — no point labeling the single thing being shown in the common,
     // single-flag (or no-flag) case.
-    let flags_set = [args.dump_ast, args.dump_inference_pass, args.dump_monomorphized].iter().filter(|b| **b).count();
+    let flags_set =
+        [args.dump_ast, args.dump_inference_pass, args.dump_monomorphized, args.dump_cps].iter().filter(|b| **b).count();
     let multiple = flags_set > 1;
     let mut exit = ExitCode::SUCCESS;
 
@@ -153,6 +158,16 @@ fn main() -> ExitCode {
             report(&diags, &sources);
             exit = ExitCode::FAILURE;
         }
+    }
+
+    if args.dump_cps {
+        if multiple {
+            println!("--- cps ---\n");
+        }
+        let registry = Registry::build(&program);
+        let units = collect_units(&program, &registry);
+        let cps_program = convert_program(units);
+        print!("{}", dump_cps_program(&cps_program));
     }
 
     exit

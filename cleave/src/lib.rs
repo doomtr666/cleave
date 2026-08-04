@@ -1,6 +1,7 @@
 pub mod ast;
 pub mod callgraph;
 pub mod const_eval;
+pub mod cps;
 pub mod diag;
 pub mod driver;
 pub mod dump;
