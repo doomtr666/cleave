@@ -7,6 +7,7 @@ pub mod driver;
 pub mod dump;
 pub mod infer;
 pub mod lower;
+pub mod mlir_lower;
 pub mod monomorphize;
 pub mod parser;
 pub mod print;

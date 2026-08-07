@@ -1,0 +1,1354 @@
+//! Lowers a CPS-form program (`cps::CpsProgram`) into MLIR, via `melior`.
+//!
+//! Handles, so far: a top-level function's `return`, straight-line `LetPrim`
+//! chains (`extern` calls, reserved `mlir::dialect::op(...)` calls — see
+//! `lower_raw_mlir_op`'s own doc comment — array construction/read/write,
+//! see `array_memref_type`'s own doc comment, and struct construction/field
+//! access, see `struct_llvm_type`'s own doc comment), a two-armed `if`
+//! producing a value (`scf.if`), a real call to another top-level cleave
+//! `fn` (`func.call`), and a `while`/`for` loop carrying state (`scf.while`,
+//! see `lower_loop`'s own doc comment) — together enough for a genuinely
+//! recursive function (`fib`) *and* an iterative one (a loop-accumulated
+//! sum) to compile and JIT-execute correctly end to end. Grows the same
+//! incremental way `cps.rs` itself did: implement exactly what a real
+//! example needs, panic clearly on anything else, expand next. Still
+//! missing: an `if`/loop whose branches also carry reassigned outer
+//! variables *beyond* the loop's own natural carried state (see `lower_if`'s
+//! own doc comment).
+//!
+//! **Type lowering is data-driven, not hardcoded**, matching `doc/hld.md`'s
+//! own "one generic 'emit this named MLIR op' primitive" thesis one level up
+//! from operations: `ty_to_mlir` looks a cleave type name up in a map built
+//! from every `#[mlir_type("...")]`-tagged algebra `impl`
+//! (`cps::collect_mlir_types`), parsing the declared MLIR type text via
+//! `melior::ir::Type::parse` — no per-type-name Rust match left, beyond
+//! `bool`, which stays a genuine special case (matching `infer.rs`'s own
+//! hardcoded `Ty::Con("bool")` for `if`/`while` conditions — the *only*
+//! other structurally-special type name left anywhere in this compiler).
+//!
+//! `CFunDef`'s own trailing "return continuation" parameter (`CTopLevelFn::
+//! k_ret`) is what makes this tractable without reconstructing real control
+//! flow from scratch: a tail call to *exactly* a function's own `k_ret` is
+//! that function's own `return`, recognized structurally (`App { func:
+//! Var(v), .. } if v == k_ret`). `Fix`/`If` extend the same idea one level
+//! further — see `lower_cexpr`'s own `CExpr::Fix` arm.
+
+use crate::ast::Type as AstType;
+use crate::ast::{Expr, ExprKind, GenericArg, TypeKind};
+use crate::cps::{CExpr, CFunDef, CTopLevelFn, CVal, CVar, CpsProgram, PrimOp, StructSchema};
+use crate::infer::{ConstValue, Ty};
+use melior::{
+    Context,
+    dialect::{
+        arith, func, memref, scf,
+        llvm::{self, LoadStoreOptions},
+    },
+    ir::{
+        Attribute, Block, Identifier, Location, Module, Operation, Region, RegionLike, Type, TypeLike, Value, ValueLike,
+        attribute::{DenseI32ArrayAttribute, FlatSymbolRefAttribute, FloatAttribute, IntegerAttribute, StringAttribute, TypeAttribute},
+        block::BlockLike,
+        operation::OperationBuilder,
+        r#type::{FunctionType, IntegerType, MemRefType, ShapedTypeLike},
+    },
+};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+
+/// What a growing lowering pass needs threaded everywhere. `declared_externs`
+/// is a `RefCell` (rather than a `&mut` threaded alongside everything else)
+/// because declaring a not-yet-seen `extern` symbol is a cross-cutting side
+/// effect on the *module* (appending a new top-level `func.func` declaration
+/// to it) that has to happen from deep inside expression lowering — the same
+/// shape `ensure_extern_declared` needs, and much simpler than threading a
+/// mutable borrow through every recursive call just for this one case.
+/// `signatures` is built once, up front, from every top-level `fn` in the
+/// program (`program.funcs` — self-recursion works fine since a function's
+/// own entry lands here before its own body is ever lowered) — needed
+/// because a real call's own `Fix`-synthesized join continuation (see
+/// `lower_real_call`) carries no cleave-level type of its own, unlike a
+/// `CTopLevelFn`; the callee's own signature is the only place left to get
+/// its argument/result types from.
+struct LowerCtx<'c, 'm> {
+    context: &'c Context,
+    module: &'m Module<'c>,
+    declared_externs: RefCell<HashSet<String>>,
+    signatures: HashMap<String, (Vec<Ty>, Ty)>,
+    /// Cleave type name -> MLIR type text, from every `#[mlir_type(...)]`-
+    /// tagged algebra `impl` (`cps::collect_mlir_types`) — see this file's
+    /// own module doc comment.
+    mlir_types: HashMap<String, String>,
+    /// Every `struct`'s own declared shape (`cps::collect_struct_schemas`) —
+    /// see `struct_llvm_type`'s own doc comment.
+    struct_schemas: HashMap<String, StructSchema>,
+}
+
+/// Builds one MLIR `Module` containing every top-level function in
+/// `program`. `mlir_types`/`struct_schemas` are `cps::collect_mlir_types`/
+/// `cps::collect_struct_schemas`'s own output, run against the *original*
+/// `ast::Program` — kept as separate parameters rather than folded into
+/// `CpsProgram` itself, since both are whole-program, type-level facts with
+/// no per-function home, unlike everything else `CpsProgram` carries.
+pub fn lower_program<'c>(
+    context: &'c Context,
+    program: &CpsProgram,
+    mlir_types: &HashMap<String, String>,
+    struct_schemas: HashMap<String, StructSchema>,
+) -> Module<'c> {
+    let location = Location::unknown(context);
+    let module = Module::new(location);
+    let signatures =
+        program.funcs.iter().map(|f| (f.def.name.clone(), (f.param_types.clone(), f.result.clone()))).collect();
+    {
+        // Scoped so `ctx`'s own borrow of `module` ends before `module` is
+        // moved out below.
+        let ctx = LowerCtx {
+            context,
+            module: &module,
+            declared_externs: RefCell::new(HashSet::new()),
+            signatures,
+            mlir_types: mlir_types.clone(),
+            struct_schemas,
+        };
+        for f in &program.funcs {
+            let op = lower_top_level_fn(&ctx, f);
+            ctx.module.body().append_operation(op);
+        }
+    }
+    module
+}
+
+/// Maps a cleave `Ty` to its MLIR equivalent. `bool` is a genuine special
+/// case (matching `infer.rs`'s own hardcoded `Ty::Con("bool")` for `if`/
+/// `while` conditions — the only other structurally-special type name left
+/// anywhere in this compiler); every other name is looked up in
+/// `ctx.mlir_types` and parsed via `Type::parse` — panics clearly if a type
+/// actually needed was never declared `#[mlir_type(...)]` anywhere, rather
+/// than guessing.
+fn ty_to_mlir<'c>(ctx: &LowerCtx<'c, '_>, ty: &Ty) -> Type<'c> {
+    match ty {
+        Ty::Con(name) if name == "bool" || ctx.mlir_types.contains_key(name) => width_ty(ctx, name),
+        // A `Ty::Con`/`Ty::App` that *isn't* a declared primitive is a
+        // struct — non-generic (`Ty::Con("Vec2")`) or generic-and-
+        // instantiated (`Ty::App("Complex", [Con("f32")])`). A struct value
+        // is always an opaque `!llvm.ptr` — see `struct_llvm_type`'s own
+        // doc comment for why (reference, not value, semantics).
+        Ty::Con(_) | Ty::App(..) => llvm::r#type::pointer(ctx.context, 0),
+        Ty::Array(..) => array_memref_type(ctx, ty).into(),
+        _ => panic!("MLIR lowering doesn't support type `{ty}` yet (only primitive Ty::Con widths, arrays, and structs so far)"),
+    }
+}
+
+/// Flattens a nested `Ty::Array(elem, size)` chain — cleave's own multi-dim
+/// array type is always nested single-dim arrays, never a separate
+/// primitive (`Array(Array(T,C),R)`, see `cps.rs`'s own "Arrays" doc
+/// comment) — into *one* flat, multi-dimensional `memref<d0 x d1 x ... x T>`,
+/// matching how `cps.rs`'s own `collect_index_chain` already collapses a
+/// multi-dim `a[i,j]` access into one combined multi-index `Load`/`Store`
+/// against exactly this flat shape: there's never a nested-memref value to
+/// address in between. Every dimension is a resolved `Ty::Const(ConstValue::
+/// Int(n))` by this stage — cleave has no dynamically-sized arrays.
+fn array_memref_type<'c>(ctx: &LowerCtx<'c, '_>, ty: &Ty) -> MemRefType<'c> {
+    let (dims, leaf_ty) = flatten_array_dims(ty);
+    MemRefType::new(ty_to_mlir(ctx, leaf_ty), &dims, None, None)
+}
+
+fn flatten_array_dims(ty: &Ty) -> (Vec<i64>, &Ty) {
+    let mut dims = Vec::new();
+    let mut cur = ty;
+    while let Ty::Array(elem, size) = cur {
+        let Ty::Const(ConstValue::Int(n)) = size.as_ref() else {
+            panic!("MLIR lowering: array size must be a resolved constant, got `{size}`");
+        };
+        dims.push(*n as i64);
+        cur = elem;
+    }
+    (dims, cur)
+}
+
+fn is_array_ty(ty: &Ty) -> bool {
+    matches!(ty, Ty::Array(..))
+}
+
+/// A cleave `struct` is a **stable reference, mutated in place** — the same
+/// choice `cps.rs`'s own "Arrays" doc comment already makes for arrays, and
+/// for the same underlying reason: a struct value flows around by *identity*
+/// (assignment, passing to a function, returning it), never copied element
+/// by element, and a field write must be visible through every other
+/// reference to the same struct. Concretely: every struct-typed cleave value
+/// is an opaque `!llvm.ptr` (`ty_to_mlir`'s own struct arm) into one
+/// `llvm.alloca`'d slot of this function's own *anonymous* (unnamed, purely
+/// structural) `!llvm.struct<(f0_ty, f1_ty, ...)>` — the `llvm` dialect's
+/// own aggregate type is the natural fit for a *heterogeneous*-field
+/// container (unlike `memref`, which requires one uniform element type
+/// across every slot). `llvm.getelementptr` computes each field's own
+/// address (`lower_struct_construct`/`lower_field_access`), `llvm.load`/
+/// `llvm.store` read/write it — ordinary, generically-typed ops that verify
+/// and execute fine even in an otherwise not-yet-`--convert-to-llvm`-lowered
+/// module, no different in that respect from `arith`/`scf`/`func`'s own
+/// ops. An array-typed field is embedded *inline*, as a (possibly nested)
+/// `!llvm.array<N x T>` — not a `memref`, which can't be an `!llvm.struct`
+/// field at all (confirmed directly: `Type::parse`+`module.verify()`
+/// rejects it, "operand #1 must be primitive LLVM type") — `llvm.
+/// getelementptr` walks straight through the struct *and* the nested array
+/// in one instruction, so `a.values[i,j]` never needs its own separate
+/// allocation, just further indices on the same GEP chain (see
+/// `lower_array_load`'s own doc comment). Struct values carry *no name of
+/// their own* once lowered — `lower_struct_construct`/`lower_field_access`
+/// both need the *cleave-level* struct name (from `PrimOp::Struct`'s own
+/// payload, or `PrimOp::Field`'s own `struct_ty`) to resolve field order/
+/// types, recovering it from an already-lowered MLIR `Value` alone isn't
+/// possible.
+fn struct_llvm_type<'c>(ctx: &LowerCtx<'c, '_>, name: &str, type_args: &[Ty]) -> Type<'c> {
+    let fields = struct_field_types(ctx, name, type_args);
+    let field_mlir: Vec<Type> = fields.iter().map(|(_, t)| ty_to_llvm_field_type(ctx, t)).collect();
+    llvm::r#type::r#struct(ctx.context, &field_mlir, false)
+}
+
+/// A cleave type as it appears *embedded inside* an `!llvm.struct` field —
+/// identical to `ty_to_mlir` for every scalar/struct case (a nested struct
+/// field is, like everything else struct-typed, an opaque `!llvm.ptr`), but
+/// an array becomes an *inline* (possibly nested) `!llvm.array<N x T>`
+/// rather than a `memref` — see `struct_llvm_type`'s own doc comment for why.
+fn ty_to_llvm_field_type<'c>(ctx: &LowerCtx<'c, '_>, ty: &Ty) -> Type<'c> {
+    match ty {
+        Ty::Array(..) => {
+            let (dims, leaf_ty) = flatten_array_dims(ty);
+            let mut t = ty_to_llvm_field_type(ctx, leaf_ty);
+            for &d in dims.iter().rev() {
+                t = llvm::r#type::array(t, d as u32);
+            }
+            t
+        }
+        _ => ty_to_mlir(ctx, ty),
+    }
+}
+
+/// `name`'s own declared fields, in *declaration* order, each resolved to a
+/// concrete `Ty` for *this specific* instantiation (`type_args` — empty for
+/// a non-generic struct) — the field-name -> position mapping both struct
+/// construction (`llvm.insertvalue`) and field access (`llvm.extractvalue`)
+/// need, since neither op's own `position` attribute means anything without
+/// a canonical, whole-program-consistent field order.
+fn struct_field_types(ctx: &LowerCtx<'_, '_>, name: &str, type_args: &[Ty]) -> Vec<(String, Ty)> {
+    let Some(schema) = ctx.struct_schemas.get(name) else {
+        panic!("MLIR lowering: no struct declaration found for `{name}`");
+    };
+    let mapping: HashMap<String, Ty> = schema.generics.iter().cloned().zip(type_args.iter().cloned()).collect();
+    schema.fields.iter().map(|(field_name, field_ast_ty)| (field_name.clone(), resolve_struct_field_ty(field_ast_ty, &mapping))).collect()
+}
+
+/// A small, standalone counterpart to `infer.rs`'s own `ty_from_ast_mapped`
+/// — same core structural recursion (a mapped bare path resolves to the
+/// substituted `Ty`, everything else rebuilds the equivalent `Ty` node), but
+/// without any of the type-checker's own side effects (`pending_type_name_
+/// checks`, fresh-variable allocation for anything not already resolved,
+/// ...) — none of which apply this late: every field type a *fully type-
+/// checked* program's own struct declarations can produce is already either
+/// a mapped generic, a concrete `Path`, or an array over the same, nothing
+/// left unresolved to defer.
+fn resolve_struct_field_ty(ty: &AstType, mapping: &HashMap<String, Ty>) -> Ty {
+    match &ty.kind {
+        TypeKind::Path(path, args) => {
+            let name = path.segments.join("::");
+            if args.is_empty() {
+                if let Some(mapped) = mapping.get(&name) {
+                    return mapped.clone();
+                }
+                Ty::Con(name)
+            } else {
+                let type_args = args
+                    .iter()
+                    .map(|a| match a {
+                        GenericArg::Type(t) => resolve_struct_field_ty(t, mapping),
+                        GenericArg::Const(e) => resolve_struct_field_const(e, mapping),
+                    })
+                    .collect();
+                Ty::App(name, type_args)
+            }
+        }
+        TypeKind::Array(elem, size) => {
+            Ty::Array(Box::new(resolve_struct_field_ty(elem, mapping)), Box::new(resolve_struct_field_const(size, mapping)))
+        }
+        TypeKind::Fn(..) => panic!("MLIR lowering doesn't support a function-typed struct field yet"),
+    }
+}
+
+/// Resolves a struct field's own const-generic-or-literal position (an
+/// array field's size, `values: [T; R, C]`'s own `R`/`C`) — every case a
+/// fully type-checked program's own struct declarations can actually
+/// contain: a bare integer literal, or a bare name mapped to this specific
+/// instantiation's own resolved const-generic argument.
+fn resolve_struct_field_const(expr: &Expr, mapping: &HashMap<String, Ty>) -> Ty {
+    match &expr.kind {
+        ExprKind::NumberLit { text, .. } => {
+            Ty::Const(ConstValue::Int(text.parse().unwrap_or_else(|_| panic!("MLIR lowering: invalid array-size literal `{text}`"))))
+        }
+        ExprKind::Path(p) if p.segments.len() == 1 => mapping
+            .get(&p.segments[0])
+            .cloned()
+            .unwrap_or_else(|| panic!("MLIR lowering: unresolved const-generic `{}` in a struct field's array size", p.segments[0])),
+        other => panic!("MLIR lowering doesn't support this struct field array-size expression yet: {other:?}"),
+    }
+}
+
+/// `ty` is a struct's own concrete type — either `Ty::Con(name)` (no
+/// generics) or `Ty::App(name, type_args)` (instantiated) — factored out
+/// since `PrimOp::Struct`'s own `LetPrim::ty` carries exactly this, with no
+/// separate need to also thread `type_args` through `PrimOp::Struct`'s own
+/// payload.
+fn struct_name_and_args(ty: &Ty) -> (&str, &[Ty]) {
+    match ty {
+        Ty::Con(name) => (name.as_str(), &[]),
+        Ty::App(name, args) => (name.as_str(), args.as_slice()),
+        _ => panic!("MLIR lowering: expected a struct type, got `{ty}`"),
+    }
+}
+
+/// Like `ty_to_mlir`, but from a bare cleave type name (`"i32"`, `"f64"`,
+/// ...) rather than a `Ty` — the form a `PrimOp::RawMlirOp`'s own operand-
+/// type inference sometimes needs when working from an already-lowered
+/// sibling `Value`'s own MLIR type text isn't available, only its name.
+fn width_ty<'c>(ctx: &LowerCtx<'c, '_>, name: &str) -> Type<'c> {
+    if name == "bool" {
+        return IntegerType::new(ctx.context, 1).into();
+    }
+    let Some(text) = ctx.mlir_types.get(name) else {
+        panic!("MLIR lowering: no `#[mlir_type(...)]` declared for type `{name}`");
+    };
+    Type::parse(ctx.context, text).unwrap_or_else(|| panic!("MLIR lowering: invalid MLIR type text `{text}` for `{name}`"))
+}
+
+/// A `()`-returning top-level `fn` (`main()`, no `->` clause at all — `main`
+/// is the only such case any current example actually needs) gets *zero*
+/// MLIR results, not "one result of some unit type" — MLIR itself has no
+/// value type for "nothing", only "zero results" at the op level (`func.
+/// return`/a function's own `FunctionType`). `result_type` below still needs
+/// *some* `Type<'c>` to satisfy `lower_cexpr`'s own non-optional parameter,
+/// but it's never actually consulted in the unit case: a `()`-typed body's
+/// own final `App{k_ret, args}` always has `args == []` (nothing to
+/// materialize), so the placeholder is inert. Scoped to *this* function only
+/// — a unit-typed function reachable through `lower_real_call`/`PrimOp::
+/// Extern` (not just as the program's own entry point) isn't handled yet,
+/// and would still panic clearly in `ty_to_mlir` rather than misbehave.
+fn lower_top_level_fn<'c>(ctx: &LowerCtx<'c, '_>, f: &CTopLevelFn) -> Operation<'c> {
+    let context = ctx.context;
+    let location = Location::unknown(context);
+    let param_types: Vec<Type> = f.param_types.iter().map(|t| ty_to_mlir(ctx, t)).collect();
+    let is_unit = matches!(&f.result, Ty::Con(name) if name == "()");
+    let result_type: Type = if is_unit { IntegerType::new(context, 1).into() } else { ty_to_mlir(ctx, &f.result) };
+    let results: Vec<Type> = if is_unit { vec![] } else { vec![result_type] };
+
+    let block = Block::new(&param_types.iter().map(|&t| (t, location)).collect::<Vec<_>>());
+
+    // `f.def.params` is `[ordinary params..., k_ret]` -- `f.param_types`
+    // covers only the ordinary ones (see `CTopLevelFn`'s own doc comment),
+    // so zip against everything but the last entry.
+    let mut env: HashMap<CVar, Value> = HashMap::new();
+    for (i, &var) in f.def.params[..f.def.params.len() - 1].iter().enumerate() {
+        env.insert(var, block.argument(i).unwrap().into());
+    }
+
+    lower_cexpr(ctx, &block, env, f.k_ret, result_type, None, &f.def.body);
+
+    let region = Region::new();
+    region.append_block(block);
+
+    func::func(
+        context,
+        StringAttribute::new(context, &f.def.name),
+        TypeAttribute::new(FunctionType::new(context, &param_types, &results).into()),
+        region,
+        // Required for `ExecutionEngine::invoke_packed` to find a callable
+        // wrapper at all (found by direct testing: without this, JIT
+        // invocation fails with "Symbols not found: [ _mlir_ciface_<name> ]"
+        // -- `invoke_packed` calls through this specific C-interface
+        // wrapper, not the raw function directly).
+        &[(melior::ir::Identifier::new(context, "llvm.emit_c_interface"), melior::ir::Attribute::unit(context))],
+        location,
+    )
+}
+
+/// `env` is owned, not borrowed, and moved through the recursion — a
+/// `LetPrim` chain extends it one binding at a time (`env.insert` below),
+/// and threading it by value avoids either cloning the whole map per step or
+/// fighting the borrow checker over a `&mut` shared with everything else
+/// `ctx` already carries. Branching (`lower_if`) does need to hand each arm
+/// its own copy, since the two are alternatives, not a sequence — `Value`
+/// itself is `Copy`, so cloning the map is cheap.
+///
+/// `yield_target`: `Some((name, types))` exactly while lowering the
+/// *direct* body of a branch whose value feeds a `Fix`-synthesized
+/// continuation called `name` (an `if`-join, see `lower_if`, or a loop's
+/// own self-recursion, see `lower_loop`) — a tail `App` to *that* label
+/// means `scf.yield`, not a real call or a function return, and `types`
+/// (one per yielded position) is what each yielded `CVal` is materialized
+/// against — needed since, unlike the enclosing function's own single
+/// `result_type`, a join or loop's own carried values aren't necessarily
+/// the same type as the function's overall return value. `None` everywhere
+/// else, including a join/loop's own continuation body once the `scf.if`/
+/// `scf.while` is built (ordinary flow resumes there).
+fn lower_cexpr<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    mut env: HashMap<CVar, Value<'c, 'c>>,
+    k_ret: CVar,
+    result_type: Type<'c>,
+    yield_target: Option<(&str, &[Type<'c>])>,
+    expr: &CExpr,
+) {
+    match expr {
+        // `args == [CVal::Unit]` is a `()`-returning function's own
+        // "nothing to return" — matches `lower_top_level_fn`'s own zero-
+        // result `FunctionType` for the unit case (see its doc comment):
+        // `CVal::Unit` is never lowered into a real MLIR value at all, it's
+        // filtered out here instead of reaching `lower_cval` (which doesn't
+        // support it).
+        CExpr::App { func: CVal::Var(v), args } if *v == k_ret => {
+            let location = Location::unknown(ctx.context);
+            let values: Vec<Value> = args
+                .iter()
+                .filter(|a| !matches!(a, CVal::Unit))
+                .map(|a| lower_cval(ctx.context, block, &env, a, result_type))
+                .collect();
+            block.append_operation(func::r#return(&values, location));
+        }
+        CExpr::App { func: CVal::Label(name), args } if yield_target.is_some_and(|(n, _)| n == name.as_str()) => {
+            let location = Location::unknown(ctx.context);
+            let types = yield_target.unwrap().1;
+            let values: Vec<Value> =
+                args.iter().zip(types).map(|(a, &t)| lower_cval(ctx.context, block, &env, a, t)).collect();
+            block.append_operation(scf::r#yield(&values, location));
+        }
+        CExpr::LetPrim { var, ty, op, args, cont } => {
+            if let Some(value) = lower_prim_op(ctx, block, &env, op, args, ty) {
+                env.insert(*var, value);
+            }
+            lower_cexpr(ctx, block, env, k_ret, result_type, yield_target, cont);
+        }
+        CExpr::Fix { defs, body } => {
+            let [def] = &defs[..] else {
+                panic!("MLIR lowering doesn't support a multi-def `Fix` yet -- see mlir_lower.rs's own module doc comment");
+            };
+            match &**body {
+                CExpr::If { cond, then_branch, else_branch } => {
+                    lower_if(ctx, block, env, k_ret, result_type, yield_target, def, cond, then_branch, else_branch);
+                }
+                // A loop's own *entry*: `def` (the loop's self-recursive
+                // continuation) called directly, with no trailing
+                // continuation label -- distinguishing it from a real
+                // call's own resumption `Fix` below, structurally, by
+                // *which* label `App` targets: itself (a loop) vs. some
+                // other real function (a call).
+                CExpr::App { func: CVal::Label(callee), args } if callee == &def.name => {
+                    lower_loop(ctx, block, env, k_ret, result_type, yield_target, def, args);
+                }
+                CExpr::App { func: CVal::Label(callee), args } if matches!(args.last(), Some(CVal::Label(l)) if l == &def.name) => {
+                    lower_real_call(ctx, block, env, k_ret, result_type, yield_target, def, callee, args);
+                }
+                _ => panic!("MLIR lowering doesn't support this `Fix` shape yet -- see mlir_lower.rs's own module doc comment"),
+            }
+        }
+        _ => panic!(
+            "MLIR lowering doesn't support this CPS shape yet (return, extern/intrinsic LetPrim chains, if-with-result, real calls, and loops, so far) -- see mlir_lower.rs's own module doc comment"
+        ),
+    }
+}
+
+/// A two-armed `if` used as an expression (`Fix{ defs: [join], body: If{..}
+/// }`, `cps.rs`'s own shape for `ExprKind::If`) lowers to `scf.if`: both
+/// arms are lowered into their own fresh, argument-less block with
+/// `yield_label` set to `join`'s own name, so each arm's tail call to it
+/// (`tail_call_join` in `cps.rs`) becomes `scf.yield` instead. The `scf.if`
+/// operation's own result is then bound to the join's single parameter, and
+/// lowering continues into the join's own body (ordinary flow, `yield_label`
+/// reset to whatever it was *before* this `if` — the same one this call
+/// itself received, so a nested `if` inside a bigger one still resolves its
+/// *own* join correctly).
+///
+/// Only a **single-parameter** join is handled -- `join.params.len() == 1`.
+/// `cps.rs`'s own join can carry more (`carried`, one per outer variable
+/// either branch reassigns — see its `ExprKind::If` handling) but that's not
+/// needed for `fib` and isn't implemented yet; a bodyless `else` (`join`
+/// carrying no result at all, `CVal::Unit`) isn't handled either.
+fn lower_if<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: HashMap<CVar, Value<'c, 'c>>,
+    k_ret: CVar,
+    result_type: Type<'c>,
+    yield_target: Option<(&str, &[Type<'c>])>,
+    join: &CFunDef,
+    cond: &CVal,
+    then_branch: &CExpr,
+    else_branch: &CExpr,
+) {
+    let [result_var] = join.params[..] else {
+        panic!(
+            "MLIR lowering doesn't support an `if` whose branches also reassign an outer variable yet (only a single-result join) -- see mlir_lower.rs's own module doc comment"
+        );
+    };
+
+    let context = ctx.context;
+    let location = Location::unknown(context);
+    let bool_ty: Type = IntegerType::new(context, 1).into();
+    let cond_value = lower_cval(context, block, &env, cond, bool_ty);
+
+    // The join's own expected type is assumed identical to the enclosing
+    // function's own `result_type` -- true whenever the `if` this join
+    // belongs to *is* (directly or through further straight-line
+    // `LetPrim`s) the function's own return value, which covers `fib`'s own
+    // shape (`if n < 2 { n } else { ... }` *is* the whole body) but not yet
+    // an `if`-expression feeding some other, differently-typed computation
+    // -- a real, still narrow assumption, not a general "expected type"
+    // mechanism (contrast `lower_loop`, whose own carried-state types come
+    // from the loop's own initial values instead, precisely because they
+    // often do differ from `result_type`).
+    let join_types = [result_type];
+    let then_block = Block::new(&[]);
+    lower_cexpr(ctx, &then_block, env.clone(), k_ret, result_type, Some((&join.name, &join_types)), then_branch);
+    let then_region = Region::new();
+    then_region.append_block(then_block);
+
+    let else_block = Block::new(&[]);
+    lower_cexpr(ctx, &else_block, env.clone(), k_ret, result_type, Some((&join.name, &join_types)), else_branch);
+    let else_region = Region::new();
+    else_region.append_block(else_block);
+
+    let if_op = block.append_operation(scf::r#if(cond_value, &join_types, then_region, else_region, location));
+
+    let mut env = env;
+    env.insert(result_var, if_op.result(0).unwrap().into());
+    lower_cexpr(ctx, block, env, k_ret, result_type, yield_target, &join.body);
+}
+
+/// A `while`/`for` loop (CPS unifies both into the same shape — a self-
+/// recursive continuation carrying loop state, see `doc/backlog.md`'s own
+/// "Stage 3" note) lowers to `scf.while`. Recognized in `lower_cexpr`'s own
+/// `Fix` arm as `Fix{ defs: [loop_def], body: App{Label(name), initial_args}
+/// }` where `name == loop_def.name` — the loop's own *entry*, distinguished
+/// structurally from a real call's own resumption `Fix` by *which* label
+/// the `App` targets (itself, vs. some other real function).
+///
+/// `loop_def`'s own body must itself be `Fix{ defs: [cond_k], body: App{
+/// Label(real_fn), cond_args} }` — the condition, always a real call
+/// (`Ord::lt<...>` etc., since comparisons are real functions now, not
+/// straight-line intrinsics) — whose own continuation `cond_k`'s body is a
+/// *bare* `If` (no synthesized join needed: `cps.rs`'s own `ExprKind::
+/// While`/`For` doc comment notes both arms already terminate on their own,
+/// unlike an `if` used as an expression). That real call is inlined here by
+/// hand (not via `lower_real_call`, which also recurses into ordinary
+/// `lower_cexpr` afterward — the `if` that follows needs special handling
+/// as the region boundary itself, not as ordinary control flow).
+///
+/// The `then` branch's own tail recursion back to `loop_def.name` reuses
+/// `lower_cexpr`'s *existing* `yield_target`-checking `App` arm — passing
+/// `Some((&loop_def.name, &carried_types))` while lowering it turns that
+/// recursive tail-call into `scf.yield` for free, no new recognition
+/// needed. The `else` branch (loop exit) is lowered *after* the `scf.while`
+/// op is built, in the *outer* scope — `loop_def`'s own params bound to the
+/// op's own results, the outer `k_ret`/`yield_target` unchanged (mirrors
+/// `lower_if`'s own "join's continuation runs in ordinary flow" step).
+fn lower_loop<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: HashMap<CVar, Value<'c, 'c>>,
+    k_ret: CVar,
+    result_type: Type<'c>,
+    yield_target: Option<(&str, &[Type<'c>])>,
+    loop_def: &CFunDef,
+    initial_args: &[CVal],
+) {
+    let context = ctx.context;
+    let location = Location::unknown(context);
+
+    let CExpr::Fix { defs: cond_defs, body: cond_body } = &loop_def.body else {
+        panic!("MLIR lowering: a loop's own condition must be a real call -- see mlir_lower.rs's own module doc comment");
+    };
+    let [cond_k] = &cond_defs[..] else {
+        panic!("MLIR lowering doesn't support a multi-def loop condition yet");
+    };
+    let CExpr::App { func: CVal::Label(cond_callee), args: cond_args } = &**cond_body else {
+        panic!("MLIR lowering: a loop's own condition must be a real call -- see mlir_lower.rs's own module doc comment");
+    };
+    let CExpr::If { then_branch, else_branch, .. } = &cond_k.body else {
+        panic!("MLIR lowering: a loop's own condition-continuation must be a bare `if` -- see mlir_lower.rs's own module doc comment");
+    };
+    let [cond_result_var] = cond_k.params[..] else {
+        panic!("MLIR lowering: a loop's own condition call must have exactly one result");
+    };
+
+    // Carried-state types, from `loop_def.carried_types` (`cps.rs`'s own
+    // `ExprKind::While`/`For` conversion, one `Ty` per `loop_def.params`
+    // position) -- *not* derived from `init_values` themselves: a carried
+    // variable's own initial value can be a bare, width-less literal CVal
+    // (`total = 0.0`, never wrapped in a `LetPrim`), and using one shared
+    // `result_type` as `lower_cval`'s own `expected_type` for *every*
+    // initial value (the previous approach) is wrong the moment a loop
+    // carries more than one type, or a type other than the enclosing
+    // function's own result — found by direct testing (see `CFunDef::
+    // carried_types`'s own doc comment for the exact failure this caused).
+    let Some(carried_cleave_types) = &loop_def.carried_types else {
+        panic!("MLIR lowering: a loop's own `CFunDef` must carry `carried_types` -- see mlir_lower.rs's own module doc comment");
+    };
+    let carried_types: Vec<Type> = carried_cleave_types.iter().map(|t| ty_to_mlir(ctx, t)).collect();
+    let init_values: Vec<Value> = initial_args
+        .iter()
+        .zip(&carried_types)
+        .map(|(a, &t)| lower_cval(context, block, &env, a, t))
+        .collect();
+
+    // -- "before" region: receives the carried state, checks the
+    // condition, and either continues (`scf.condition` true) into "after"
+    // or exits the whole `scf.while` op (false) --
+    let before_block = Block::new(&carried_types.iter().map(|&t| (t, location)).collect::<Vec<_>>());
+    // Starts from a *copy* of the outer `env`, not empty — a value bound
+    // outside the loop (an enclosing function's own parameter, an outer
+    // `let`, ...) still dominates this nested region's own blocks in MLIR,
+    // and the loop's own condition/body can reference it freely (only a
+    // *mutated* variable needs to be threaded as explicit carried state —
+    // see `cps.rs`'s own "Mutation across control flow" doc comment; an
+    // untouched outer reference doesn't). Found by direct testing: an empty
+    // `before_env`/`after_env` here previously produced a clean "unbound CPS
+    // variable" panic the moment a loop body referenced *any* outer,
+    // non-carried variable — a real, pre-existing gap, never exercised
+    // before a loop body needed a struct field reached through an outer
+    // (function-parameter-level) struct reference.
+    let mut before_env: HashMap<CVar, Value> = env.clone();
+    for (i, &p) in loop_def.params.iter().enumerate() {
+        before_env.insert(p, before_block.argument(i).unwrap().into());
+    }
+    let Some((cond_param_types, cond_result_ty)) = ctx.signatures.get(cond_callee) else {
+        panic!("MLIR lowering: call to unknown top-level fn `{cond_callee}` in a loop condition");
+    };
+    let cond_result_mlir_ty = ty_to_mlir(ctx, cond_result_ty);
+    // `cond_args`' own last entry is the synthesized continuation label
+    // itself (`emit_call`'s own convention, see `cps.rs`), not a real arg.
+    let real_cond_args = &cond_args[..cond_args.len() - 1];
+    let cond_arg_values: Vec<Value> = real_cond_args
+        .iter()
+        .zip(cond_param_types)
+        .map(|(a, t)| lower_cval(context, &before_block, &before_env, a, ty_to_mlir(ctx, t)))
+        .collect();
+    let cond_call_op = before_block.append_operation(func::call(
+        context,
+        FlatSymbolRefAttribute::new(context, cond_callee),
+        &cond_arg_values,
+        &[cond_result_mlir_ty],
+        location,
+    ));
+    before_env.insert(cond_result_var, cond_call_op.result(0).unwrap().into());
+    let carried_before: Vec<Value> = loop_def.params.iter().map(|p| before_env[p]).collect();
+    before_block.append_operation(scf::condition(cond_call_op.result(0).unwrap().into(), &carried_before, location));
+    let before_region = Region::new();
+    before_region.append_block(before_block);
+
+    // -- "after" region: the loop's own real body, `then_branch`'s own
+    // tail recursion to `loop_def.name` becoming `scf.yield` --
+    let after_block = Block::new(&carried_types.iter().map(|&t| (t, location)).collect::<Vec<_>>());
+    // See `before_env`'s own doc comment above — same fix, same reason.
+    let mut after_env: HashMap<CVar, Value> = env.clone();
+    for (i, &p) in loop_def.params.iter().enumerate() {
+        after_env.insert(p, after_block.argument(i).unwrap().into());
+    }
+    lower_cexpr(ctx, &after_block, after_env, k_ret, result_type, Some((&loop_def.name, &carried_types)), then_branch);
+    let after_region = Region::new();
+    after_region.append_block(after_block);
+
+    let while_op = block.append_operation(scf::r#while(&init_values, &carried_types, before_region, after_region, location));
+
+    // The `else` branch (loop exit) runs in the *outer* scope, ordinary
+    // flow -- `loop_def`'s own params now bound to `scf.while`'s own
+    // results (its carried state as of the moment the condition failed).
+    let mut env = env;
+    for (i, &p) in loop_def.params.iter().enumerate() {
+        env.insert(p, while_op.result(i).unwrap().into());
+    }
+    lower_cexpr(ctx, block, env, k_ret, result_type, yield_target, else_branch);
+}
+
+/// A real call to another top-level cleave `fn` (`emit_call`'s own
+/// `UnitBody::Real` shape in `cps.rs`: `Fix{ defs: [k], body: App{
+/// Label(callee), [...args, Label(k.name)] } }`) lowers to an ordinary
+/// `func.call` -- unlike an `extern` call there's no declaration to emit
+/// (the callee is another `func.func` `lower_program` already builds into
+/// this same module, symbol resolution across the module doesn't care about
+/// textual order, including a function calling itself). The synthesized
+/// continuation `k` is always exactly one parameter (`emit_call` never
+/// builds it any other way), bound to the call's own result, with lowering
+/// continuing straight into `k`'s own body in the same block -- synchronous
+/// control flow, no actual closure needed.
+fn lower_real_call<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: HashMap<CVar, Value<'c, 'c>>,
+    k_ret: CVar,
+    result_type: Type<'c>,
+    yield_target: Option<(&str, &[Type<'c>])>,
+    k: &CFunDef,
+    callee: &str,
+    args: &[CVal],
+) {
+    let [result_var] = k.params[..] else {
+        panic!("MLIR lowering: a real call's own synthesized continuation must have exactly one parameter");
+    };
+    let Some((param_types, result_ty)) = ctx.signatures.get(callee) else {
+        panic!("MLIR lowering: call to unknown top-level fn `{callee}`");
+    };
+    let context = ctx.context;
+    let result_mlir_ty = ty_to_mlir(ctx, result_ty);
+    // `args`' own last entry is the synthesized continuation label itself
+    // (`emit_call`'s own convention, see `cps.rs`), not a real argument.
+    let real_args = &args[..args.len() - 1];
+    let arg_values: Vec<Value> = real_args
+        .iter()
+        .zip(param_types)
+        .map(|(a, t)| lower_cval(context, block, &env, a, ty_to_mlir(ctx, t)))
+        .collect();
+    let location = Location::unknown(context);
+    let call_op = block.append_operation(func::call(
+        context,
+        FlatSymbolRefAttribute::new(context, callee),
+        &arg_values,
+        &[result_mlir_ty],
+        location,
+    ));
+
+    let mut env = env;
+    env.insert(result_var, call_op.result(0).unwrap().into());
+    lower_cexpr(ctx, block, env, k_ret, result_type, yield_target, &k.body);
+}
+
+/// Returns `None` exactly for `PrimOp::Store` — a real effect with zero MLIR
+/// results (`memref.store`), matching `cps.rs`'s own documentation that a
+/// `Store`'s bound result "is unit and never read": `lower_cexpr`'s own
+/// `LetPrim` arm skips the `env.insert` entirely in that case, rather than
+/// fabricating a placeholder value nothing should ever look up.
+/// `ty` is the `LetPrim`'s own declared result type — resolved to an MLIR
+/// `Type` (`ty_to_mlir`) only by the arms that actually need one; `Store`'s
+/// own `ty` is always the unit type `()` (see this function's own doc
+/// comment above), which `ty_to_mlir` doesn't support at all, so it must
+/// never be converted unconditionally here.
+fn lower_prim_op<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    op: &PrimOp,
+    args: &[CVal],
+    ty: &Ty,
+) -> Option<Value<'c, 'c>> {
+    match op {
+        PrimOp::Extern { symbol, param_types } => {
+            let result_ty = ty_to_mlir(ctx, ty);
+            ensure_extern_declared(ctx, symbol, param_types, result_ty);
+            let arg_values: Vec<Value> = args
+                .iter()
+                .zip(param_types)
+                .map(|(a, t)| lower_cval(ctx.context, block, env, a, ty_to_mlir(ctx, t)))
+                .collect();
+            let location = Location::unknown(ctx.context);
+            let call_op = block.append_operation(func::call(
+                ctx.context,
+                FlatSymbolRefAttribute::new(ctx.context, symbol),
+                &arg_values,
+                &[result_ty],
+                location,
+            ));
+            Some(call_op.result(0).unwrap().into())
+        }
+        PrimOp::RawMlirOp { op, attrs } => Some(lower_raw_mlir_op(ctx, block, env, op, attrs, args, ty_to_mlir(ctx, ty))),
+        PrimOp::Array => Some(lower_array_construct(ctx, block, env, ty, args)),
+        PrimOp::ArrayRepeat => Some(lower_array_repeat(ctx, block, env, ty, args)),
+        PrimOp::Load { array_ty } => Some(lower_array_load(ctx, block, env, array_ty, args)),
+        PrimOp::Store { array_ty } => {
+            lower_array_store(ctx, block, env, array_ty, args);
+            None
+        }
+        PrimOp::Struct(_, field_names) => Some(lower_struct_construct(ctx, block, env, ty, field_names, args)),
+        PrimOp::Field { struct_ty, field } => Some(lower_field_access(ctx, block, env, struct_ty, field, args)),
+    }
+}
+
+/// `ExprKind::ArrayLit`'s own CPS conversion (`cps.rs`) is fully generic over
+/// each element `Expr` — a *nested* literal (`[[1,2],[3,4]]`) therefore
+/// produces its inner rows as their own, separately-lowered `PrimOp::Array`
+/// values first, with the *outer* `Array`'s own `args` referencing them, not
+/// scalars. Since this file flattens the whole nested `Ty::Array` chain into
+/// *one* memref (`array_memref_type`), never memref-of-memrefs, such an arg
+/// is copied elementwise into the right slice of the outer memref
+/// (`copy_nested_array`) rather than stored as a reference; an arg is
+/// scalar exactly when `ty`'s own flattened shape is one dimension deep for
+/// that position — a property of the *type*, not of runtime inspection.
+fn lower_array_construct<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    ty: &Ty,
+    args: &[CVal],
+) -> Value<'c, 'c> {
+    let (dims, leaf_ty) = flatten_array_dims(ty);
+    let Some((_, inner_dims)) = dims.split_first() else {
+        panic!("MLIR lowering: `array` prim on a non-array type `{ty}`");
+    };
+    let array_val = alloc_array(ctx, block, MemRefType::new(ty_to_mlir(ctx, leaf_ty), &dims, None, None));
+    if inner_dims.is_empty() {
+        let elem_ty = ty_to_mlir(ctx, leaf_ty);
+        let location = Location::unknown(ctx.context);
+        for (i, arg) in args.iter().enumerate() {
+            let elem_val = lower_cval(ctx.context, block, env, arg, elem_ty);
+            let idx = const_index(ctx, block, i as i64);
+            block.append_operation(memref::store(elem_val, array_val, &[idx], location));
+        }
+    } else {
+        for (i, arg) in args.iter().enumerate() {
+            let src = lower_nested_array_arg(env, arg);
+            let idx = const_index(ctx, block, i as i64);
+            copy_nested_array(ctx, block, src, inner_dims, array_val, &[idx]);
+        }
+    }
+    array_val
+}
+
+/// `[value; N]` — `N` is *not* read from `args[1]` at all: `ty`'s own
+/// flattened outer dimension is already the authoritative, type-checked
+/// count (the same invariant `PrimOp::Array`'s own `args.len()` relies on),
+/// simpler than re-materializing a separate compile-time-constant CVal for a
+/// value this function already has from `ty`.
+fn lower_array_repeat<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    ty: &Ty,
+    args: &[CVal],
+) -> Value<'c, 'c> {
+    let (dims, leaf_ty) = flatten_array_dims(ty);
+    let Some((&outer_dim, inner_dims)) = dims.split_first() else {
+        panic!("MLIR lowering: `array-repeat` prim on a non-array type `{ty}`");
+    };
+    let array_val = alloc_array(ctx, block, MemRefType::new(ty_to_mlir(ctx, leaf_ty), &dims, None, None));
+    let value_arg = &args[0];
+    if inner_dims.is_empty() {
+        let elem_ty = ty_to_mlir(ctx, leaf_ty);
+        let elem_val = lower_cval(ctx.context, block, env, value_arg, elem_ty);
+        let location = Location::unknown(ctx.context);
+        for i in 0..outer_dim {
+            let idx = const_index(ctx, block, i);
+            block.append_operation(memref::store(elem_val, array_val, &[idx], location));
+        }
+    } else {
+        let src = lower_nested_array_arg(env, value_arg);
+        for i in 0..outer_dim {
+            let idx = const_index(ctx, block, i);
+            copy_nested_array(ctx, block, src, inner_dims, array_val, &[idx]);
+        }
+    }
+    array_val
+}
+
+/// A nested array literal/repeat's own element is always an already-built
+/// array value bound to a CPS variable — never a bare literal (arrays have
+/// no literal `CVal` form) — so `expected_type` (as `lower_cval` otherwise
+/// needs for a bare literal) never applies here.
+fn lower_nested_array_arg<'c>(env: &HashMap<CVar, Value<'c, 'c>>, arg: &CVal) -> Value<'c, 'c> {
+    let CVal::Var(v) = arg else {
+        panic!("MLIR lowering: a nested array's own element must be an already-built array value, not a bare literal")
+    };
+    *env.get(v).unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{v}"))
+}
+
+/// `args = [array, index...]`, `array_ty` the array's own concrete cleave
+/// type (`PrimOp::Load`'s own payload, see its doc comment for why).
+/// `collect_index_chain` (`cps.rs`) has already collapsed a whole `a[i,j]`
+/// chain into one multi-index op by this stage. Two representations, picked
+/// by checking `array_val`'s own already-lowered MLIR type: a **standalone**
+/// array is a self-describing `memref` (`memref.load`, indices bridged from
+/// ordinary `i32` to `index` via `arith.index_cast` — MLIR's own
+/// `memref.load`/`store` require `index`-typed operands specifically); a
+/// **struct-embedded** array (reached through a `PrimOp::Field` first — see
+/// `lower_field_access`'s own doc comment) is an opaque `!llvm.ptr` already
+/// positioned at the start of its own (possibly nested) `!llvm.array`, with
+/// no shape of its own to query — `array_ty` supplies it instead, walked via
+/// one combined `llvm.getelementptr` (leading `0` index to stay within this
+/// one array instance, matching `lower_struct_construct`'s own field-GEP
+/// convention) plus `llvm.load`.
+fn lower_array_load<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, env: &HashMap<CVar, Value<'c, 'c>>, array_ty: &Ty, args: &[CVal]) -> Value<'c, 'c> {
+    let CVal::Var(array_var) = &args[0] else {
+        panic!("MLIR lowering: `load`'s own array operand must be a variable");
+    };
+    let array_val = *env.get(array_var).unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{array_var}"));
+    let i32_ty = width_ty(ctx, "i32");
+    let location = Location::unknown(ctx.context);
+    if array_val.r#type().is_mem_ref() {
+        let index_vals: Vec<Value> =
+            args[1..].iter().map(|a| to_index(ctx, block, lower_cval(ctx.context, block, env, a, i32_ty))).collect();
+        let load_op = block.append_operation(memref::load(array_val, &index_vals, location));
+        load_op.result(0).unwrap().into()
+    } else {
+        let (_, leaf_ty) = flatten_array_dims(array_ty);
+        let array_llvm_ty = ty_to_llvm_field_type(ctx, array_ty);
+        let mut gep_indices = vec![const_i32(ctx, block, 0)];
+        gep_indices.extend(args[1..].iter().map(|a| lower_cval(ctx.context, block, env, a, i32_ty)));
+        let leaf_ptr = gep_dynamic(ctx, block, array_val, &gep_indices, array_llvm_ty);
+        let result_ty = ty_to_mlir(ctx, leaf_ty);
+        block.append_operation(llvm::load(ctx.context, leaf_ptr, result_ty, location, LoadStoreOptions::new())).result(0).unwrap().into()
+    }
+}
+
+/// `args = [array, index..., value]` (value last — `cps.rs`'s own
+/// `StmtKind::Assign`'s `Index` arm convention), `array_ty` — see
+/// `lower_array_load`'s own doc comment (same two representations, same
+/// dispatch). The value's own expected type comes from the array's own
+/// element type (`MemRefType::try_from`+`.element()` for the memref case,
+/// `array_ty`'s own flattened leaf for the pointer case) — not from `ty`, a
+/// `Store`'s own `LetPrim::ty` is always `()` (its bound result is unit and
+/// never read, see `lower_prim_op`'s own doc comment).
+fn lower_array_store<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, env: &HashMap<CVar, Value<'c, 'c>>, array_ty: &Ty, args: &[CVal]) {
+    let CVal::Var(array_var) = &args[0] else {
+        panic!("MLIR lowering: `store`'s own array operand must be a variable");
+    };
+    let array_val = *env.get(array_var).unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{array_var}"));
+    let Some((value_arg, index_args)) = args[1..].split_last() else {
+        panic!("MLIR lowering: `store` needs at least an index and a value");
+    };
+    let i32_ty = width_ty(ctx, "i32");
+    let location = Location::unknown(ctx.context);
+    if array_val.r#type().is_mem_ref() {
+        let elem_ty = MemRefType::try_from(array_val.r#type())
+            .unwrap_or_else(|_| panic!("MLIR lowering: `store`'s own array operand isn't a memref"))
+            .element();
+        let index_vals: Vec<Value> =
+            index_args.iter().map(|a| to_index(ctx, block, lower_cval(ctx.context, block, env, a, i32_ty))).collect();
+        let value_val = lower_cval(ctx.context, block, env, value_arg, elem_ty);
+        block.append_operation(memref::store(value_val, array_val, &index_vals, location));
+    } else {
+        let (_, leaf_ty) = flatten_array_dims(array_ty);
+        let array_llvm_ty = ty_to_llvm_field_type(ctx, array_ty);
+        let elem_mlir_ty = ty_to_mlir(ctx, leaf_ty);
+        let mut gep_indices = vec![const_i32(ctx, block, 0)];
+        gep_indices.extend(index_args.iter().map(|a| lower_cval(ctx.context, block, env, a, i32_ty)));
+        let leaf_ptr = gep_dynamic(ctx, block, array_val, &gep_indices, array_llvm_ty);
+        let value_val = lower_cval(ctx.context, block, env, value_arg, elem_mlir_ty);
+        block.append_operation(llvm::store(ctx.context, value_val, leaf_ptr, location, LoadStoreOptions::new()));
+    }
+}
+
+/// `PrimOp::Struct(name, field_names)` — `field_names` is whatever order the
+/// *literal* itself wrote (named construction, `Complex(imag: .., real: ..)`,
+/// can differ from declaration order), which is fine: each field is stored
+/// at its own *declared* `position` (`struct_field_types`'s own canonical
+/// order), not at its position within `field_names` — the GEP index, not
+/// insertion order, is what actually determines the resulting layout.
+/// Allocates one `llvm.alloca`'d slot up front (`alloc_struct`) and returns
+/// its own pointer — see `struct_llvm_type`'s own doc comment for why a
+/// struct is reference-, not value-, typed here. An array-typed field is
+/// filled by copying its already-built (standalone, `memref`-backed) value
+/// element-by-element into the struct's own *embedded* `!llvm.array` slot
+/// (`copy_memref_into_llvm_field`) — not stored as a reference, since the
+/// two representations (`memref` vs inline `!llvm.array`) are different
+/// types entirely (see `struct_llvm_type`'s own doc comment on why a
+/// `memref` can't be an `!llvm.struct` field at all).
+fn lower_struct_construct<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    ty: &Ty,
+    field_names: &[String],
+    args: &[CVal],
+) -> Value<'c, 'c> {
+    let (name, type_args) = struct_name_and_args(ty);
+    let field_types = struct_field_types(ctx, name, type_args);
+    let struct_llvm_ty = struct_llvm_type(ctx, name, type_args);
+    let ptr = alloc_struct(ctx, block, struct_llvm_ty);
+    for (field_name, arg) in field_names.iter().zip(args) {
+        let position = field_types
+            .iter()
+            .position(|(n, _)| n == field_name)
+            .unwrap_or_else(|| panic!("MLIR lowering: struct `{name}` has no field `{field_name}`"));
+        let (_, field_ty) = &field_types[position];
+        let field_ptr = gep(ctx, block, ptr, &[0, position as i64], struct_llvm_ty);
+        if is_array_ty(field_ty) {
+            let src = lower_nested_array_arg(env, arg);
+            let (dims, _) = flatten_array_dims(field_ty);
+            let field_llvm_ty = ty_to_llvm_field_type(ctx, field_ty);
+            copy_memref_into_llvm_field(ctx, block, src, &dims, field_ptr, field_llvm_ty);
+        } else {
+            let field_mlir_ty = ty_to_mlir(ctx, field_ty);
+            let value = lower_cval(ctx.context, block, env, arg, field_mlir_ty);
+            let location = Location::unknown(ctx.context);
+            block.append_operation(llvm::store(ctx.context, value, field_ptr, location, LoadStoreOptions::new()));
+        }
+    }
+    ptr
+}
+
+/// `PrimOp::Field { struct_ty, field }`, `args = [base]` — `struct_ty` is
+/// the base expression's own concrete cleave type (see `PrimOp::Field`'s own
+/// doc comment for why this can't be recovered from the already-lowered
+/// `Value` alone: an opaque `!llvm.ptr` carries no cleave-level struct name
+/// or field layout of its own). A scalar/struct-typed field is *loaded* —
+/// the read gives back the field's own current value (a nested struct's own
+/// value is itself a pointer, per `struct_llvm_type`'s own doc comment, so
+/// "loading" it just reads that pointer out). An **array-typed** field is
+/// *not* loaded at all — `llvm.getelementptr`'s own result (the address of
+/// the field's own embedded `!llvm.array`, still inside this struct's
+/// storage) is returned directly, since a runtime index (`a.values[i,j]`,
+/// `PrimOp::Load`/`Store`) needs an address to GEP further into, not a
+/// (potentially huge) copied-out value.
+fn lower_field_access<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    struct_ty: &Ty,
+    field: &str,
+    args: &[CVal],
+) -> Value<'c, 'c> {
+    let CVal::Var(base_var) = &args[0] else {
+        panic!("MLIR lowering: field access's own base operand must be a variable");
+    };
+    let base_val = *env.get(base_var).unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{base_var}"));
+    let (name, type_args) = struct_name_and_args(struct_ty);
+    let field_types = struct_field_types(ctx, name, type_args);
+    let position = field_types
+        .iter()
+        .position(|(n, _)| n == field)
+        .unwrap_or_else(|| panic!("MLIR lowering: struct `{name}` has no field `{field}`"));
+    let (_, field_ty) = &field_types[position];
+    let struct_llvm_ty = struct_llvm_type(ctx, name, type_args);
+    let field_ptr = gep(ctx, block, base_val, &[0, position as i64], struct_llvm_ty);
+    if is_array_ty(field_ty) {
+        field_ptr
+    } else {
+        let result_ty = ty_to_mlir(ctx, field_ty);
+        let location = Location::unknown(ctx.context);
+        block.append_operation(llvm::load(ctx.context, field_ptr, result_ty, location, LoadStoreOptions::new())).result(0).unwrap().into()
+    }
+}
+
+/// Allocates one **heap**-backed slot shaped `struct_llvm_ty`, returning its
+/// own opaque `!llvm.ptr`, via a real call to `cleave_alloc` (`cleave-rt`,
+/// registered with the JIT the same way `print_i32`/... already are). Not
+/// `llvm.alloca`: found by direct testing — a struct returned from one
+/// function and read by its own caller came back reading garbage, since an
+/// `alloca`'d slot lives in *that function's own* stack frame, gone the
+/// moment it returns, and a struct is a reference passed/returned by
+/// pointer, never copied (see `struct_llvm_type`'s own doc comment) — its
+/// storage has to outlive the call that built it. Deliberately leaked, no
+/// `free` — cleave has no ownership/`drop` story yet (see `cleave_alloc`'s
+/// own doc comment in `cleave-rt`).
+fn alloc_struct<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, struct_llvm_ty: Type<'c>) -> Value<'c, 'c> {
+    let context = ctx.context;
+    let location = Location::unknown(context);
+    let ptr_ty = llvm::r#type::pointer(context, 0);
+    let size = struct_size_bytes(ctx, block, struct_llvm_ty);
+    ensure_extern_declared(ctx, "cleave_alloc", &[Ty::Con("i64".to_string())], ptr_ty);
+    let call_op = block.append_operation(func::call(
+        context,
+        FlatSymbolRefAttribute::new(context, "cleave_alloc"),
+        &[size],
+        &[ptr_ty],
+        location,
+    ));
+    call_op.result(0).unwrap().into()
+}
+
+/// `struct_llvm_ty`'s own byte size, as a real `i64` SSA value — the
+/// standard LLVM IR idiom for `sizeof(T)` with no dedicated op needed:
+/// `getelementptr T, null, 1` (one whole `T` past a null pointer) then
+/// `ptrtoint` gives exactly the byte offset one `T` occupies, padding
+/// included, matching LLVM's own real layout (hand-computing field offsets/
+/// alignment here would risk silently disagreeing with it).
+fn struct_size_bytes<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, struct_llvm_ty: Type<'c>) -> Value<'c, 'c> {
+    let context = ctx.context;
+    let location = Location::unknown(context);
+    let ptr_ty = llvm::r#type::pointer(context, 0);
+    let null: Value = block.append_operation(llvm::zero(ptr_ty, location)).result(0).unwrap().into();
+    let one_past = gep(ctx, block, null, &[1], struct_llvm_ty);
+    let i64_ty = IntegerType::new(context, 64).into();
+    let built = OperationBuilder::new("llvm.ptrtoint", location)
+        .add_operands(&[one_past])
+        .add_results(&[i64_ty])
+        .build()
+        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build llvm.ptrtoint: {e}"));
+    block.append_operation(built).result(0).unwrap().into()
+}
+
+/// Computes `llvm.getelementptr base[indices...]` for indices that are
+/// *every one* a compile-time constant (a field GEP's own position, or a
+/// fully-unrolled in-struct array-copy index, `copy_memref_into_llvm_field`)
+/// — encoded directly into `rawConstantIndices` itself, **not** materialized
+/// as `arith.constant` operands (found by direct testing: MLIR's own GEP
+/// verifier rejects a struct field index that's merely a constant-*valued*
+/// dynamic operand — "expected index N indexing a struct to be constant" —
+/// it must be a real constant baked into the op itself; only `gep_dynamic`,
+/// below, produces dynamic operands, used exclusively for genuinely runtime
+/// array indices, which carry no such restriction).
+fn gep<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, base: Value<'c, 'c>, indices: &[i64], pointee_ty: Type<'c>) -> Value<'c, 'c> {
+    let context = ctx.context;
+    let location = Location::unknown(context);
+    let ptr_ty = llvm::r#type::pointer(context, 0);
+    let raw: Vec<i32> = indices.iter().map(|&i| i as i32).collect();
+    let raw_indices = DenseI32ArrayAttribute::new(context, &raw);
+    let built = OperationBuilder::new("llvm.getelementptr", location)
+        .add_attributes(&[
+            (Identifier::new(context, "rawConstantIndices"), raw_indices.into()),
+            (Identifier::new(context, "elem_type"), TypeAttribute::new(pointee_ty).into()),
+        ])
+        .add_operands(&[base])
+        .add_results(&[ptr_ty])
+        .build()
+        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build llvm.getelementptr: {e}"));
+    block.append_operation(built).result(0).unwrap().into()
+}
+
+/// Like `gep`, but for indices that are already runtime `Value`s (a loop
+/// variable used as an array index) rather than compile-time constants —
+/// built directly via `OperationBuilder` rather than melior's own `llvm::
+/// get_element_ptr_dynamic` (which requires a compile-time-known index
+/// *count*, via a const generic — this file's own callers need a genuinely
+/// runtime-length index list, one per array dimension). `rawConstantIndices`
+/// filled with `i32::MIN` sentinels throughout — melior's own convention
+/// (confirmed in its `get_element_ptr_dynamic`) for "every index here is a
+/// real operand, not a constant" — mixing compile-time-constant and dynamic
+/// indices in one GEP is possible in principle but not needed by any caller
+/// here, so not attempted.
+fn gep_dynamic<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, base: Value<'c, 'c>, indices: &[Value<'c, 'c>], pointee_ty: Type<'c>) -> Value<'c, 'c> {
+    let context = ctx.context;
+    let location = Location::unknown(context);
+    let ptr_ty = llvm::r#type::pointer(context, 0);
+    let raw_indices = DenseI32ArrayAttribute::new(context, &vec![i32::MIN; indices.len()]);
+    let built = OperationBuilder::new("llvm.getelementptr", location)
+        .add_attributes(&[
+            (Identifier::new(context, "rawConstantIndices"), raw_indices.into()),
+            (Identifier::new(context, "elem_type"), TypeAttribute::new(pointee_ty).into()),
+        ])
+        .add_operands(&[base])
+        .add_operands(indices)
+        .add_results(&[ptr_ty])
+        .build()
+        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build llvm.getelementptr: {e}"));
+    block.append_operation(built).result(0).unwrap().into()
+}
+
+fn const_i32<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, n: i64) -> Value<'c, 'c> {
+    let location = Location::unknown(ctx.context);
+    let attribute = IntegerAttribute::new(width_ty(ctx, "i32"), n).into();
+    let op = block.append_operation(arith::constant(ctx.context, attribute, location));
+    op.result(0).unwrap().into()
+}
+
+/// Copies every scalar element of `src` (a flat, standalone `memref` of
+/// shape `dims` — the ordinary array-construction path, `PrimOp::Array`/
+/// `ArrayRepeat`, see `lower_array_construct`'s own doc comment) into the
+/// struct-embedded `!llvm.array` field addressed by `field_ptr`, one
+/// `memref.load`+`llvm.getelementptr`+`llvm.store` triple per element, fully
+/// unrolled — every dimension is a compile-time constant, the same posture
+/// `copy_nested_array` already takes for a nested array literal, applied
+/// across the memref/embedded-`!llvm.array` boundary instead of memref-to-
+/// memref.
+fn copy_memref_into_llvm_field<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    src: Value<'c, 'c>,
+    dims: &[i64],
+    field_ptr: Value<'c, 'c>,
+    field_llvm_ty: Type<'c>,
+) {
+    fn walk<'c>(
+        ctx: &LowerCtx<'c, '_>,
+        block: &Block<'c>,
+        src: Value<'c, 'c>,
+        remaining: &[i64],
+        src_idx: &mut Vec<Value<'c, 'c>>,
+        gep_idx: &mut Vec<i64>,
+        field_ptr: Value<'c, 'c>,
+        field_llvm_ty: Type<'c>,
+    ) {
+        let Some((&dim, rest)) = remaining.split_first() else {
+            let location = Location::unknown(ctx.context);
+            let load_op = block.append_operation(memref::load(src, src_idx, location));
+            let scalar: Value = load_op.result(0).unwrap().into();
+            let dst_ptr = gep(ctx, block, field_ptr, gep_idx, field_llvm_ty);
+            block.append_operation(llvm::store(ctx.context, scalar, dst_ptr, location, LoadStoreOptions::new()));
+            return;
+        };
+        for i in 0..dim {
+            src_idx.push(const_index(ctx, block, i));
+            gep_idx.push(i);
+            walk(ctx, block, src, rest, src_idx, gep_idx, field_ptr, field_llvm_ty);
+            src_idx.pop();
+            gep_idx.pop();
+        }
+    }
+    // Leading `0`: stay within this one array instance (see `gep`'s own doc
+    // comment) -- every subsequent index is a real dimension of `dims`.
+    let mut gep_idx = vec![0i64];
+    walk(ctx, block, src, dims, &mut Vec::new(), &mut gep_idx, field_ptr, field_llvm_ty);
+}
+
+fn alloc_array<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, memref_ty: MemRefType<'c>) -> Value<'c, 'c> {
+    let location = Location::unknown(ctx.context);
+    let op = block.append_operation(memref::alloc(ctx.context, memref_ty, &[], &[], None, location));
+    op.result(0).unwrap().into()
+}
+
+fn const_index<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, n: i64) -> Value<'c, 'c> {
+    let location = Location::unknown(ctx.context);
+    let attribute = IntegerAttribute::new(Type::index(ctx.context), n).into();
+    let op = block.append_operation(arith::constant(ctx.context, attribute, location));
+    op.result(0).unwrap().into()
+}
+
+fn to_index<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, value: Value<'c, 'c>) -> Value<'c, 'c> {
+    let location = Location::unknown(ctx.context);
+    let op = block.append_operation(arith::index_cast(value, Type::index(ctx.context), location));
+    op.result(0).unwrap().into()
+}
+
+/// Copies every scalar element of `src` (a flat memref of shape `dims`,
+/// itself one nested-array "row" — see `lower_array_construct`'s own doc
+/// comment) into `dst` at flat position `dst_prefix ++ idx`, one `memref.
+/// load`+`memref.store` pair per element, every index fully unrolled (every
+/// dimension here is a compile-time constant, cleave has no dynamically-
+/// sized arrays). Correctness-first, not throughput-first — a `memref.
+/// subview`+`memref.copy` bulk version is a possible later optimization, not
+/// attempted here.
+fn copy_nested_array<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    src: Value<'c, 'c>,
+    dims: &[i64],
+    dst: Value<'c, 'c>,
+    dst_prefix: &[Value<'c, 'c>],
+) {
+    fn walk<'c>(
+        ctx: &LowerCtx<'c, '_>,
+        block: &Block<'c>,
+        src: Value<'c, 'c>,
+        remaining: &[i64],
+        idx_acc: &mut Vec<Value<'c, 'c>>,
+        dst: Value<'c, 'c>,
+        dst_prefix: &[Value<'c, 'c>],
+    ) {
+        let Some((&dim, rest)) = remaining.split_first() else {
+            let location = Location::unknown(ctx.context);
+            let load_op = block.append_operation(memref::load(src, idx_acc, location));
+            let scalar: Value = load_op.result(0).unwrap().into();
+            let mut dst_indices = dst_prefix.to_vec();
+            dst_indices.extend(idx_acc.iter().copied());
+            block.append_operation(memref::store(scalar, dst, &dst_indices, location));
+            return;
+        };
+        for i in 0..dim {
+            idx_acc.push(const_index(ctx, block, i));
+            walk(ctx, block, src, rest, idx_acc, dst, dst_prefix);
+            idx_acc.pop();
+        }
+    }
+    walk(ctx, block, src, dims, &mut Vec::new(), dst, dst_prefix);
+}
+
+/// The *entire* hardcoded-in-Rust surface for primitive operations: builds
+/// one MLIR operation, generically, from `op` (the real dialect-qualified
+/// name, e.g. `arith.addi` — reconstructed in `cps.rs::convert_expr` from a
+/// reserved `mlir::dialect::op(...)` call's own path) and `attrs`
+/// (`ExprKind::Call::mlir_attrs`, carried through unchanged: attribute name
+/// -> raw MLIR attribute text, parsed here via `Attribute::parse`). No
+/// per-op-name Rust knowledge anywhere — matches `doc/hld.md`'s own "one
+/// generic 'emit this named MLIR op' primitive" goal directly.
+///
+/// Positional arguments need *some* expected MLIR type to materialize a
+/// bare literal against (`mlir::arith::addi(0, x)`) — since there's no
+/// per-op signature left to consult, this uses the first already-typed
+/// (`CVal::Var`) sibling operand's own MLIR type (`Value::r#type`, always
+/// available once lowered), falling back to the op's own declared result
+/// type for the (rarer) all-literal case.
+fn lower_raw_mlir_op<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    op: &str,
+    attrs: &[(String, String)],
+    args: &[CVal],
+    result_ty: Type<'c>,
+) -> Value<'c, 'c> {
+    let context = ctx.context;
+    let operand_ty = args
+        .iter()
+        .find_map(|a| match a {
+            CVal::Var(v) => env.get(v).map(ValueLike::r#type),
+            _ => None,
+        })
+        .unwrap_or(result_ty);
+    let arg_values: Vec<Value> = args.iter().map(|a| lower_cval(context, block, env, a, operand_ty)).collect();
+    let parsed_attrs: Vec<_> = attrs
+        .iter()
+        .map(|(name, text)| {
+            let attribute = Attribute::parse(context, text)
+                .unwrap_or_else(|| panic!("MLIR lowering: invalid MLIR attribute text `{text}` for `{name}` on `{op}`"));
+            (Identifier::new(context, name), attribute)
+        })
+        .collect();
+    let location = Location::unknown(context);
+    let built = OperationBuilder::new(op, location)
+        .add_operands(&arg_values)
+        .add_attributes(&parsed_attrs)
+        .add_results(&[result_ty])
+        .build()
+        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build op `{op}`: {e}"));
+    let result_op = block.append_operation(built);
+    result_op.result(0).unwrap().into()
+}
+
+/// Emits a `func.func private @symbol(param_types) -> result_ty` declaration
+/// (an *empty* region — zero blocks — is what makes it a declaration rather
+/// than a definition; confirmed against melior's own `compile_external_
+/// function` test) the first time `symbol` is seen, and no-ops on every
+/// later call site for the same symbol.
+fn ensure_extern_declared<'c>(ctx: &LowerCtx<'c, '_>, symbol: &str, param_types: &[Ty], result_ty: Type<'c>) {
+    let mut declared = ctx.declared_externs.borrow_mut();
+    if !declared.insert(symbol.to_string()) {
+        return;
+    }
+    let context = ctx.context;
+    let param_mlir: Vec<Type> = param_types.iter().map(|t| ty_to_mlir(ctx, t)).collect();
+    let location = Location::unknown(context);
+    let decl = func::func(
+        context,
+        StringAttribute::new(context, symbol),
+        TypeAttribute::new(FunctionType::new(context, &param_mlir, &[result_ty]).into()),
+        Region::new(),
+        &[(melior::ir::Identifier::new(context, "sym_visibility"), StringAttribute::new(context, "private").into())],
+        location,
+    );
+    ctx.module.body().append_operation(decl);
+}
+
+/// `expected_type` covers the cases that need it: a bare literal `CVal`
+/// (`CVal::Int`/`Float`/`Bool` carry no width of their own in the CPS IR —
+/// only a surrounding `LetPrim`'s own `ty` field, or an intrinsic/extern
+/// call's own known operand type, normally supplies one) flowing into a
+/// function's own `return`, an `extern`/intrinsic call's own argument list,
+/// or an `if`'s own condition.
+fn lower_cval<'c>(context: &'c Context, block: &Block<'c>, env: &HashMap<CVar, Value<'c, 'c>>, v: &CVal, expected_type: Type<'c>) -> Value<'c, 'c> {
+    match v {
+        CVal::Var(var) => *env.get(var).unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{var}")),
+        CVal::Int(n) => {
+            let location = Location::unknown(context);
+            let attribute = IntegerAttribute::new(expected_type, *n as i64).into();
+            let op = block.append_operation(arith::constant(context, attribute, location));
+            op.result(0).unwrap().into()
+        }
+        CVal::Float(n) => {
+            let location = Location::unknown(context);
+            let attribute = FloatAttribute::new(context, expected_type, *n).into();
+            let op = block.append_operation(arith::constant(context, attribute, location));
+            op.result(0).unwrap().into()
+        }
+        CVal::Bool(b) => {
+            let location = Location::unknown(context);
+            let attribute = IntegerAttribute::new(expected_type, *b as i64).into();
+            let op = block.append_operation(arith::constant(context, attribute, location));
+            op.result(0).unwrap().into()
+        }
+        other => panic!("MLIR lowering doesn't support this CVal shape yet: {other:?}"),
+    }
+}

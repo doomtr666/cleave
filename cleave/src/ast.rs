@@ -99,6 +99,13 @@ pub struct AxiomDecl {
 
 #[derive(Debug, Clone)]
 pub struct ImplDecl {
+    /// `#[mlir_type("i32")]` — declares this impl's own (single, non-generic)
+    /// target type's MLIR representation, generically, the same way a
+    /// bodyless method's `mlir::...` call declares an *operation's* MLIR
+    /// representation — see `mlir_lower.rs`'s own type-lowering doc comment.
+    /// Empty for the overwhelming majority of impls, which say nothing about
+    /// MLIR at all.
+    pub attrs: Vec<Attribute>,
     pub algebra: String,
     /// The impl's *own* generic parameters (`impl<T: Float> TestAlg<Complex<T>>`)
     /// — distinct from the algebra's own `<T>` (`algebra TestAlg<T> { ... }`,
@@ -153,6 +160,23 @@ pub struct Attribute {
 pub struct FnDecl {
     pub name: String,
     pub attrs: Vec<Attribute>,
+    /// `extern fn name(...) -> ...;` — a body-justifying case now legal in
+    /// *both* the places `#[mlir(...)]` alone used to be the only one
+    /// (see `body`'s own doc comment): a top-level `fn`, or an algebra-impl
+    /// method (`extern fn` there is exactly like `#[mlir(...)]` in shape,
+    /// just naming a real external C symbol instead of an MLIR instruction
+    /// — see `Infer::infer_impl_fn_generic_with_env`'s own doc comment).
+    /// The real implementation always lives outside cleave entirely.
+    pub is_extern: bool,
+    /// The C symbol `is_extern` binds to, when it differs from `name` —
+    /// `extern(print_i32) fn print(x: i32) -> i32;`. `None` (the common
+    /// case — a bare `extern fn foo(...);`, no parenthesized override)
+    /// means the symbol *is* `name` itself: sufficient at the top level,
+    /// where a name can only ever mean one thing, but not inside an
+    /// algebra `impl`, where several concrete impls of the very same
+    /// method name (`Print<i32>`'s own `print`, `Print<i64>`'s own
+    /// `print`, ...) each need a genuinely different real symbol.
+    pub extern_symbol: Option<String>,
     pub generics: Vec<GenericParam>,
     pub params: Vec<Param>,
     pub ret: Option<Type>,
@@ -160,8 +184,9 @@ pub struct FnDecl {
     /// legal grammatically anywhere a `fn` appears, but only actually
     /// accepted, at inference time, for an algebra-impl method carrying a
     /// recognized body-justifying attribute (see `Infer::infer_impl_fn_
-    /// generic_with_env`'s own doc comment) — a top-level `fn` or inherent-
-    /// impl method with no body is a real, rejected error, not silently
+    /// generic_with_env`'s own doc comment) or a top-level `fn` marked
+    /// `extern` (see `is_extern` above) — any other bodyless `fn` or
+    /// inherent-impl method is a real, rejected error, not silently
     /// tolerated.
     pub body: Option<Block>,
 }
@@ -258,7 +283,16 @@ pub enum ExprKind {
     /// spelled `::<...>` to pin an instantiation nothing else would
     /// determine (see `grammar.pest`'s `turbofish` comment for why `::<` is
     /// its own token rather than bare `<`).
-    Call(Path, Vec<GenericArg>, Vec<Expr>),
+    /// `mlir_attrs`: named arguments to a reserved `mlir::dialect::op(...)`
+    /// call (`mlir::arith::cmpi(a, b, predicate: "slt")`) — attribute name
+    /// to raw literal text (quotes already stripped), passed verbatim to
+    /// `melior::ir::attribute::Attribute::parse` at MLIR-lowering time.
+    /// Empty for every ordinary call. Kept as raw text, not `Expr`, since
+    /// these never need general-expression evaluation — only `mlir::`-
+    /// prefixed calls are semantically allowed to have any (checked in
+    /// `infer.rs::infer_call`, not enforced grammatically — same posture
+    /// `is_extern`/`#[mlir(...)]` already take elsewhere in this file).
+    Call(Path, Vec<GenericArg>, Vec<Expr>, Vec<(String, String)>),
     FieldAccess(Box<Expr>, String),
     MethodCall(Box<Expr>, String, Vec<Expr>),
     /// Multi-index sugar (`a[i, j]`) is already flattened into nested `Index`

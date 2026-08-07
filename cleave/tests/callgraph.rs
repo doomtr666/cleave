@@ -216,6 +216,23 @@ fn a_bodyless_top_level_fn_is_rejected() {
 }
 
 #[test]
+fn an_extern_fn_is_accepted_bodyless_with_its_declared_signature() {
+    let registry = builtin_registry();
+    let program = lower_program("extern fn f(x: i32) -> i32;");
+    let result = infer_program(&program, &registry);
+    assert_eq!(ok_result(&result, "f"), Ty::Con("i32".to_string()));
+}
+
+#[test]
+fn an_extern_fn_cannot_be_generic() {
+    let registry = builtin_registry();
+    let program = lower_program("extern fn f<T>(x: T) -> T;");
+    let result = infer_program(&program, &registry);
+    let err = result.results.get("f").unwrap().as_ref().unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::ExternFnCannotBeGeneric { .. }), "got: {:?}", err.kind);
+}
+
+#[test]
 fn a_const_generic_bounded_for_loop_correctly_dispatches_once_a_caller_instantiates_it() {
     // Regression test: `N` (a const generic) referenced as an ordinary value
     // (`for i in 0..N`) merges with `0`'s own `Int`-constrained literal var —

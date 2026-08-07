@@ -15,13 +15,19 @@
 //! pass sit next to each other. More `--dump-*` flags arrive as more passes
 //! do (CPS conversion, ...).
 
-use cleave::cps::{collect_units, convert_program, dump_cps_program};
+use cleave::cps::{collect_mlir_types, collect_struct_schemas, collect_units, convert_program, dump_cps_program};
 use cleave::diag::SourceMap;
 use cleave::driver::compile;
 use cleave::dump::dump_program;
+use cleave::mlir_lower::lower_program;
 use cleave::monomorphize::dump_monomorphized;
 use cleave::print::print_program;
 use cleave::registry::Registry;
+use melior::Context;
+use melior::dialect::DialectRegistry;
+use melior::ir::operation::OperationLike;
+use melior::pass;
+use melior::utility::register_all_dialects;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -31,6 +37,8 @@ struct Args {
     dump_inference_pass: bool,
     dump_monomorphized: bool,
     dump_cps: bool,
+    dump_mlir: bool,
+    run: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -39,6 +47,8 @@ fn parse_args() -> Result<Args, String> {
     let mut dump_inference_pass = false;
     let mut dump_monomorphized = false;
     let mut dump_cps = false;
+    let mut dump_mlir = false;
+    let mut run = false;
 
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
@@ -46,23 +56,26 @@ fn parse_args() -> Result<Args, String> {
             "--dump-inference-pass" => dump_inference_pass = true,
             "--dump-monomorphized" => dump_monomorphized = true,
             "--dump-cps" => dump_cps = true,
+            "--dump-mlir" => dump_mlir = true,
+            "--run" => run = true,
             other if other.starts_with("--") => return Err(format!("unknown flag {other:?}")),
             other if path.is_none() => path = Some(PathBuf::from(other)),
             other => return Err(format!("only one input file is supported, got a second argument {other:?}")),
         }
     }
 
-    // No `--dump-*` flag at all defaults to today's one real pass, so the
-    // common case (`cleave file.cleave`) stays exactly as terse as before
-    // these flags existed.
-    if !dump_ast && !dump_inference_pass && !dump_monomorphized && !dump_cps {
+    // No `--dump-*`/`--run` flag at all defaults to today's one real pass,
+    // so the common case (`cleave file.cleave`) stays exactly as terse as
+    // before these flags existed.
+    if !dump_ast && !dump_inference_pass && !dump_monomorphized && !dump_cps && !dump_mlir && !run {
         dump_inference_pass = true;
     }
 
     match path {
-        Some(path) => Ok(Args { path, dump_ast, dump_inference_pass, dump_monomorphized, dump_cps }),
+        Some(path) => Ok(Args { path, dump_ast, dump_inference_pass, dump_monomorphized, dump_cps, dump_mlir, run }),
         None => Err(
-            "usage: cleave <file.cleave> [--dump-ast] [--dump-inference-pass] [--dump-monomorphized] [--dump-cps]".to_string(),
+            "usage: cleave <file.cleave> [--dump-ast] [--dump-inference-pass] [--dump-monomorphized] [--dump-cps] [--dump-mlir] [--run]"
+                .to_string(),
         ),
     }
 }
@@ -114,8 +127,10 @@ fn main() -> ExitCode {
     // Only header-separate stages when more than one is being dumped at
     // once — no point labeling the single thing being shown in the common,
     // single-flag (or no-flag) case.
-    let flags_set =
-        [args.dump_ast, args.dump_inference_pass, args.dump_monomorphized, args.dump_cps].iter().filter(|b| **b).count();
+    let flags_set = [args.dump_ast, args.dump_inference_pass, args.dump_monomorphized, args.dump_cps, args.dump_mlir]
+        .iter()
+        .filter(|b| **b)
+        .count();
     let multiple = flags_set > 1;
     let mut exit = ExitCode::SUCCESS;
 
@@ -165,9 +180,123 @@ fn main() -> ExitCode {
             println!("--- cps ---\n");
         }
         let registry = Registry::build(&program);
+        if let Err(diags) = check_type_errors(&program, &registry) {
+            report(&diags, &sources);
+            exit = ExitCode::FAILURE;
+        } else {
+            let units = collect_units(&program, &registry);
+            let cps_program = convert_program(units);
+            print!("{}", dump_cps_program(&cps_program));
+        }
+    }
+
+    if args.dump_mlir {
+        if multiple {
+            println!("--- mlir ---\n");
+        }
+        let registry = Registry::build(&program);
+        if let Err(diags) = check_type_errors(&program, &registry) {
+            report(&diags, &sources);
+            exit = ExitCode::FAILURE;
+        } else {
+            let units = collect_units(&program, &registry);
+            let cps_program = convert_program(units);
+
+            let dialect_registry = DialectRegistry::new();
+            register_all_dialects(&dialect_registry);
+            let context = Context::new();
+            context.append_dialect_registry(&dialect_registry);
+            context.load_all_available_dialects();
+
+            let mlir_types = collect_mlir_types(&program);
+            let struct_schemas = collect_struct_schemas(&program);
+            let module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
+            if !module.as_operation().verify() {
+                eprintln!("error: generated MLIR module failed verification");
+                exit = ExitCode::FAILURE;
+            } else {
+                print!("{}", module.as_operation());
+            }
+        }
+    }
+
+    if args.run {
+        let registry = Registry::build(&program);
+        // CPS conversion (`collect_units`/`convert_program`, shared by all
+        // three blocks above and below) assumes every reachable unit's own
+        // types are fully concrete -- a program with a real type error
+        // elsewhere (e.g. a mismatched argument type in some *other*
+        // function) can leave a generic function's call sites never seeded
+        // for monomorphization at all, which used to reach CPS conversion
+        // anyway and panic there with a confusing low-level message
+        // (`resolve_call`'s own `could not resolve call to ...` panic,
+        // found by direct testing) instead of this clean diagnostic.
+        if let Err(diags) = check_type_errors(&program, &registry) {
+            report(&diags, &sources);
+            return ExitCode::FAILURE;
+        }
         let units = collect_units(&program, &registry);
         let cps_program = convert_program(units);
-        print!("{}", dump_cps_program(&cps_program));
+
+        let dialect_registry = DialectRegistry::new();
+        register_all_dialects(&dialect_registry);
+        let context = Context::new();
+        context.append_dialect_registry(&dialect_registry);
+        context.load_all_available_dialects();
+
+        let mlir_types = collect_mlir_types(&program);
+        let struct_schemas = collect_struct_schemas(&program);
+        let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
+        if !module.as_operation().verify() {
+            eprintln!("error: generated MLIR module failed verification");
+            return ExitCode::FAILURE;
+        }
+
+        let pass_manager = pass::PassManager::new(&context);
+        // `scf.if` (and any other structured-control-flow op) has no direct
+        // LLVM IR translation of its own -- `-convert-scf-to-cf` lowers it
+        // to the `cf` dialect's ordinary branches first, which `-convert-
+        // to-llvm` (below) *does* know how to translate. Skipping this
+        // produced a hard native crash (STATUS_ACCESS_VIOLATION), not a
+        // clean Rust-level error -- found by direct testing.
+        pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
+        pass_manager.add_pass(pass::conversion::create_to_llvm());
+        if pass_manager.run(&mut module).is_err() {
+            eprintln!("error: MLIR-to-LLVM lowering pass failed");
+            return ExitCode::FAILURE;
+        }
+
+        let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
+        // A short, explicit, hardcoded list -- grows one line per `extern
+        // fn` the Rust-implemented runtime (`cleave-rt`) actually provides.
+        // Registering by real function pointer, not dynamic symbol lookup by
+        // name, is what lets this sidestep the Windows/MSVC CRT-symbol-
+        // visibility questions a raw libc binding would run into.
+        // SAFETY: each `cleave_rt::*` pointer is a real, valid `extern "C"
+        // fn`, live for the process's whole lifetime.
+        unsafe {
+            engine.register_symbol("print_i8", cleave_rt::print_i8 as *mut ());
+            engine.register_symbol("print_i16", cleave_rt::print_i16 as *mut ());
+            engine.register_symbol("print_i32", cleave_rt::print_i32 as *mut ());
+            engine.register_symbol("print_i64", cleave_rt::print_i64 as *mut ());
+            engine.register_symbol("print_f32", cleave_rt::print_f32 as *mut ());
+            engine.register_symbol("print_f64", cleave_rt::print_f64 as *mut ());
+            engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
+        }
+        let mut result: i32 = -1;
+        // SAFETY: `result` is a live, correctly-aligned `i32` on the stack
+        // for the duration of this call, matching exactly what `main`'s own
+        // (verified, i32-returning) MLIR signature writes into.
+        match unsafe { engine.invoke_packed("main", &mut [&mut result as *mut i32 as *mut ()]) } {
+            Ok(()) => {
+                println!("main returned: {result}");
+                return ExitCode::from(result as u8);
+            }
+            Err(error) => {
+                eprintln!("error: failed to invoke `main`: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
     }
 
     exit
@@ -177,6 +306,21 @@ fn report(diags: &[cleave::diag::Diagnostic], sources: &SourceMap) {
     for d in diags {
         eprintln!("{}", sources.render(d));
     }
+}
+
+/// Runs whole-program type inference and monomorphization purely to check
+/// for errors, discarding `dump_monomorphized`'s own text output -- a
+/// mandatory gate before CPS conversion (`collect_units`/`convert_program`),
+/// which assumes every reachable unit's own types are already fully
+/// concrete and has no error-reporting of its own. Without this, a type
+/// error anywhere in the program (not necessarily in the function actually
+/// being compiled) can leave an unrelated generic function's call sites
+/// never seeded for monomorphization, which used to reach CPS conversion
+/// anyway and panic there with a low-level, confusing message instead of
+/// this clean diagnostic -- found by direct testing.
+fn check_type_errors(program: &cleave::ast::Program, registry: &Registry) -> Result<(), Vec<cleave::diag::Diagnostic>> {
+    let (_, errs) = cleave::monomorphize::dump_monomorphized(program, registry);
+    if errs.is_empty() { Ok(()) } else { Err(errs.iter().map(cleave::diag::Diagnostic::from).collect()) }
 }
 
 #[cfg(test)]

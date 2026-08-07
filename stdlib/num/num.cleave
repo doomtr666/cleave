@@ -22,25 +22,30 @@ algebra Num<T> {}
 algebra Int<T> : Num {}
 algebra Float<T> : Num {}
 
-impl Int<i8> {}
-impl Int<i16> {}
-impl Int<i32> {}
-impl Int<i64> {}
+// `#[mlir_type(...)]` declares this impl's own target type's MLIR
+// representation generically — the type-level counterpart to `mlir::...`
+// calls on the operation side below (`doc/hld.md`'s "one generic 'emit this
+// named MLIR op' primitive" thesis, one level up: `mlir_lower.rs::ty_to_mlir`
+// looks the name up here and parses the declared text via
+// `melior::ir::Type::parse`, no per-type-name Rust match left at all).
+#[mlir_type(i8)] impl Int<i8> {}
+#[mlir_type(i16)] impl Int<i16> {}
+#[mlir_type(i32)] impl Int<i32> {}
+#[mlir_type(i64)] impl Int<i64> {}
 
-impl Float<f32> {}
-impl Float<f64> {}
+#[mlir_type(f32)] impl Float<f32> {}
+#[mlir_type(f64)] impl Float<f64> {}
 
 // Real primitive arithmetic — the base case `doc/type_inference.md`'s
 // "circular-primitive-impl problem" describes: a stub body like `fn add(x,
 // y) { x + y }` has nothing to bottom out into, since every `+`/`*` is
 // itself sugar for algebra dispatch, all the way down, with no intrinsic
-// operation anywhere. `#[mlir(...)]` on a *bodyless* method (legal
-// grammatically anywhere a `fn` appears, but only accepted here — see
-// `Infer::infer_impl_fn_generic_with_env`'s own doc comment) closes that:
-// each impl below names a concrete MLIR instruction the eventual codegen
-// pass will emit directly for a call resolving to it. Those names are
-// placeholder identifiers today — nothing reads them yet, no MLIR backend
-// exists (see `doc/backlog.md`, items 3-4) — this only needs to type-check.
+// operation anywhere. A reserved `mlir::dialect::op(...)` call (recognized
+// structurally, not algebra-dispatched — see `infer.rs::infer_expr`'s own
+// `mlir::` branch) closes that: each impl below has a real body whose only
+// content is a direct MLIR op call, the *entire* hardcoded-in-Rust surface
+// for primitive operations shrinking to one generic op-builder
+// (`mlir_lower.rs::lower_raw_mlir_op`) rather than a Rust match per op name.
 algebra Ring<T> {
     fn add(a: T, b: T) -> T;
     fn sub(a: T, b: T) -> T;
@@ -48,39 +53,39 @@ algebra Ring<T> {
 }
 
 impl Ring<i8> {
-    #[mlir(mlir_i8_add)] fn add(a: i8, b: i8) -> i8;
-    #[mlir(mlir_i8_sub)] fn sub(a: i8, b: i8) -> i8;
-    #[mlir(mlir_i8_mul)] fn mul(a: i8, b: i8) -> i8;
+    fn add(a: i8, b: i8) -> i8 { mlir::arith::addi(a, b) }
+    fn sub(a: i8, b: i8) -> i8 { mlir::arith::subi(a, b) }
+    fn mul(a: i8, b: i8) -> i8 { mlir::arith::muli(a, b) }
 }
 
 impl Ring<i16> {
-    #[mlir(mlir_i16_add)] fn add(a: i16, b: i16) -> i16;
-    #[mlir(mlir_i16_sub)] fn sub(a: i16, b: i16) -> i16;
-    #[mlir(mlir_i16_mul)] fn mul(a: i16, b: i16) -> i16;
+    fn add(a: i16, b: i16) -> i16 { mlir::arith::addi(a, b) }
+    fn sub(a: i16, b: i16) -> i16 { mlir::arith::subi(a, b) }
+    fn mul(a: i16, b: i16) -> i16 { mlir::arith::muli(a, b) }
 }
 
 impl Ring<i32> {
-    #[mlir(mlir_i32_add)] fn add(a: i32, b: i32) -> i32;
-    #[mlir(mlir_i32_sub)] fn sub(a: i32, b: i32) -> i32;
-    #[mlir(mlir_i32_mul)] fn mul(a: i32, b: i32) -> i32;
+    fn add(a: i32, b: i32) -> i32 { mlir::arith::addi(a, b) }
+    fn sub(a: i32, b: i32) -> i32 { mlir::arith::subi(a, b) }
+    fn mul(a: i32, b: i32) -> i32 { mlir::arith::muli(a, b) }
 }
 
 impl Ring<i64> {
-    #[mlir(mlir_i64_add)] fn add(a: i64, b: i64) -> i64;
-    #[mlir(mlir_i64_sub)] fn sub(a: i64, b: i64) -> i64;
-    #[mlir(mlir_i64_mul)] fn mul(a: i64, b: i64) -> i64;
+    fn add(a: i64, b: i64) -> i64 { mlir::arith::addi(a, b) }
+    fn sub(a: i64, b: i64) -> i64 { mlir::arith::subi(a, b) }
+    fn mul(a: i64, b: i64) -> i64 { mlir::arith::muli(a, b) }
 }
 
 impl Ring<f32> {
-    #[mlir(mlir_f32_add)] fn add(a: f32, b: f32) -> f32;
-    #[mlir(mlir_f32_sub)] fn sub(a: f32, b: f32) -> f32;
-    #[mlir(mlir_f32_mul)] fn mul(a: f32, b: f32) -> f32;
+    fn add(a: f32, b: f32) -> f32 { mlir::arith::addf(a, b) }
+    fn sub(a: f32, b: f32) -> f32 { mlir::arith::subf(a, b) }
+    fn mul(a: f32, b: f32) -> f32 { mlir::arith::mulf(a, b) }
 }
 
 impl Ring<f64> {
-    #[mlir(mlir_f64_add)] fn add(a: f64, b: f64) -> f64;
-    #[mlir(mlir_f64_sub)] fn sub(a: f64, b: f64) -> f64;
-    #[mlir(mlir_f64_mul)] fn mul(a: f64, b: f64) -> f64;
+    fn add(a: f64, b: f64) -> f64 { mlir::arith::addf(a, b) }
+    fn sub(a: f64, b: f64) -> f64 { mlir::arith::subf(a, b) }
+    fn mul(a: f64, b: f64) -> f64 { mlir::arith::mulf(a, b) }
 }
 
 // Comparison — same reasoning and shape as `Ring` above. `eq`/`neq` are
@@ -88,6 +93,20 @@ impl Ring<f64> {
 // type orders *and* equates, and splitting them would only mean two
 // `impl` blocks per type instead of one for no expressive gain yet (unlike
 // `Int`/`Float`, which really are independent, mutually-exclusive shapes).
+//
+// `arith.cmpi`/`arith.cmpf`'s own `predicate` attribute takes the *raw
+// integer* enum ordinal, not the symbolic name (`Attribute::parse(context,
+// "slt")` fails to parse -- MLIR's symbolic spellings like `slt` are custom
+// *pretty-printer* syntax for specific ops, not something the generic
+// attribute parser understands on its own; confirmed directly by testing
+// both forms against a real `arith.cmpi` and checking `module.verify()`).
+// Ordinals below match melior's own `arith::CmpiPredicate`/`CmpfPredicate`
+// enum declaration order exactly (`melior-0.27.4/src/dialect/arith.rs`):
+// `CmpiPredicate`: Eq=0, Ne=1, Slt=2, Sle=3, Sgt=4, Sge=5 (Ult/Ule/Ugt/Uge
+// unused here — cleave's integers are signed).
+// `CmpfPredicate`: Oeq=1, Ogt=2, Oge=3, Olt=4, Ole=5, One=6 (ordered
+// comparisons — NaN-propagating, matching what this file's own arithmetic
+// already implicitly assumes; the unordered `U*` variants are unused here).
 algebra Ord<T> {
     fn lt(a: T, b: T) -> bool;
     fn le(a: T, b: T) -> bool;
@@ -98,55 +117,55 @@ algebra Ord<T> {
 }
 
 impl Ord<i8> {
-    #[mlir(mlir_i8_lt)] fn lt(a: i8, b: i8) -> bool;
-    #[mlir(mlir_i8_le)] fn le(a: i8, b: i8) -> bool;
-    #[mlir(mlir_i8_gt)] fn gt(a: i8, b: i8) -> bool;
-    #[mlir(mlir_i8_ge)] fn ge(a: i8, b: i8) -> bool;
-    #[mlir(mlir_i8_eq)] fn eq(a: i8, b: i8) -> bool;
-    #[mlir(mlir_i8_neq)] fn neq(a: i8, b: i8) -> bool;
+    fn lt(a: i8, b: i8) -> bool { mlir::arith::cmpi(a, b, predicate: "2 : i64") }
+    fn le(a: i8, b: i8) -> bool { mlir::arith::cmpi(a, b, predicate: "3 : i64") }
+    fn gt(a: i8, b: i8) -> bool { mlir::arith::cmpi(a, b, predicate: "4 : i64") }
+    fn ge(a: i8, b: i8) -> bool { mlir::arith::cmpi(a, b, predicate: "5 : i64") }
+    fn eq(a: i8, b: i8) -> bool { mlir::arith::cmpi(a, b, predicate: "0 : i64") }
+    fn neq(a: i8, b: i8) -> bool { mlir::arith::cmpi(a, b, predicate: "1 : i64") }
 }
 
 impl Ord<i16> {
-    #[mlir(mlir_i16_lt)] fn lt(a: i16, b: i16) -> bool;
-    #[mlir(mlir_i16_le)] fn le(a: i16, b: i16) -> bool;
-    #[mlir(mlir_i16_gt)] fn gt(a: i16, b: i16) -> bool;
-    #[mlir(mlir_i16_ge)] fn ge(a: i16, b: i16) -> bool;
-    #[mlir(mlir_i16_eq)] fn eq(a: i16, b: i16) -> bool;
-    #[mlir(mlir_i16_neq)] fn neq(a: i16, b: i16) -> bool;
+    fn lt(a: i16, b: i16) -> bool { mlir::arith::cmpi(a, b, predicate: "2 : i64") }
+    fn le(a: i16, b: i16) -> bool { mlir::arith::cmpi(a, b, predicate: "3 : i64") }
+    fn gt(a: i16, b: i16) -> bool { mlir::arith::cmpi(a, b, predicate: "4 : i64") }
+    fn ge(a: i16, b: i16) -> bool { mlir::arith::cmpi(a, b, predicate: "5 : i64") }
+    fn eq(a: i16, b: i16) -> bool { mlir::arith::cmpi(a, b, predicate: "0 : i64") }
+    fn neq(a: i16, b: i16) -> bool { mlir::arith::cmpi(a, b, predicate: "1 : i64") }
 }
 
 impl Ord<i32> {
-    #[mlir(mlir_i32_lt)] fn lt(a: i32, b: i32) -> bool;
-    #[mlir(mlir_i32_le)] fn le(a: i32, b: i32) -> bool;
-    #[mlir(mlir_i32_gt)] fn gt(a: i32, b: i32) -> bool;
-    #[mlir(mlir_i32_ge)] fn ge(a: i32, b: i32) -> bool;
-    #[mlir(mlir_i32_eq)] fn eq(a: i32, b: i32) -> bool;
-    #[mlir(mlir_i32_neq)] fn neq(a: i32, b: i32) -> bool;
+    fn lt(a: i32, b: i32) -> bool { mlir::arith::cmpi(a, b, predicate: "2 : i64") }
+    fn le(a: i32, b: i32) -> bool { mlir::arith::cmpi(a, b, predicate: "3 : i64") }
+    fn gt(a: i32, b: i32) -> bool { mlir::arith::cmpi(a, b, predicate: "4 : i64") }
+    fn ge(a: i32, b: i32) -> bool { mlir::arith::cmpi(a, b, predicate: "5 : i64") }
+    fn eq(a: i32, b: i32) -> bool { mlir::arith::cmpi(a, b, predicate: "0 : i64") }
+    fn neq(a: i32, b: i32) -> bool { mlir::arith::cmpi(a, b, predicate: "1 : i64") }
 }
 
 impl Ord<i64> {
-    #[mlir(mlir_i64_lt)] fn lt(a: i64, b: i64) -> bool;
-    #[mlir(mlir_i64_le)] fn le(a: i64, b: i64) -> bool;
-    #[mlir(mlir_i64_gt)] fn gt(a: i64, b: i64) -> bool;
-    #[mlir(mlir_i64_ge)] fn ge(a: i64, b: i64) -> bool;
-    #[mlir(mlir_i64_eq)] fn eq(a: i64, b: i64) -> bool;
-    #[mlir(mlir_i64_neq)] fn neq(a: i64, b: i64) -> bool;
+    fn lt(a: i64, b: i64) -> bool { mlir::arith::cmpi(a, b, predicate: "2 : i64") }
+    fn le(a: i64, b: i64) -> bool { mlir::arith::cmpi(a, b, predicate: "3 : i64") }
+    fn gt(a: i64, b: i64) -> bool { mlir::arith::cmpi(a, b, predicate: "4 : i64") }
+    fn ge(a: i64, b: i64) -> bool { mlir::arith::cmpi(a, b, predicate: "5 : i64") }
+    fn eq(a: i64, b: i64) -> bool { mlir::arith::cmpi(a, b, predicate: "0 : i64") }
+    fn neq(a: i64, b: i64) -> bool { mlir::arith::cmpi(a, b, predicate: "1 : i64") }
 }
 
 impl Ord<f32> {
-    #[mlir(mlir_f32_lt)] fn lt(a: f32, b: f32) -> bool;
-    #[mlir(mlir_f32_le)] fn le(a: f32, b: f32) -> bool;
-    #[mlir(mlir_f32_gt)] fn gt(a: f32, b: f32) -> bool;
-    #[mlir(mlir_f32_ge)] fn ge(a: f32, b: f32) -> bool;
-    #[mlir(mlir_f32_eq)] fn eq(a: f32, b: f32) -> bool;
-    #[mlir(mlir_f32_neq)] fn neq(a: f32, b: f32) -> bool;
+    fn lt(a: f32, b: f32) -> bool { mlir::arith::cmpf(a, b, predicate: "4 : i64") }
+    fn le(a: f32, b: f32) -> bool { mlir::arith::cmpf(a, b, predicate: "5 : i64") }
+    fn gt(a: f32, b: f32) -> bool { mlir::arith::cmpf(a, b, predicate: "2 : i64") }
+    fn ge(a: f32, b: f32) -> bool { mlir::arith::cmpf(a, b, predicate: "3 : i64") }
+    fn eq(a: f32, b: f32) -> bool { mlir::arith::cmpf(a, b, predicate: "1 : i64") }
+    fn neq(a: f32, b: f32) -> bool { mlir::arith::cmpf(a, b, predicate: "6 : i64") }
 }
 
 impl Ord<f64> {
-    #[mlir(mlir_f64_lt)] fn lt(a: f64, b: f64) -> bool;
-    #[mlir(mlir_f64_le)] fn le(a: f64, b: f64) -> bool;
-    #[mlir(mlir_f64_gt)] fn gt(a: f64, b: f64) -> bool;
-    #[mlir(mlir_f64_ge)] fn ge(a: f64, b: f64) -> bool;
-    #[mlir(mlir_f64_eq)] fn eq(a: f64, b: f64) -> bool;
-    #[mlir(mlir_f64_neq)] fn neq(a: f64, b: f64) -> bool;
+    fn lt(a: f64, b: f64) -> bool { mlir::arith::cmpf(a, b, predicate: "4 : i64") }
+    fn le(a: f64, b: f64) -> bool { mlir::arith::cmpf(a, b, predicate: "5 : i64") }
+    fn gt(a: f64, b: f64) -> bool { mlir::arith::cmpf(a, b, predicate: "2 : i64") }
+    fn ge(a: f64, b: f64) -> bool { mlir::arith::cmpf(a, b, predicate: "3 : i64") }
+    fn eq(a: f64, b: f64) -> bool { mlir::arith::cmpf(a, b, predicate: "1 : i64") }
+    fn neq(a: f64, b: f64) -> bool { mlir::arith::cmpf(a, b, predicate: "6 : i64") }
 }

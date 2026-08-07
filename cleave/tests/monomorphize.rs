@@ -36,7 +36,7 @@ fn find_call_in_block<'a>(block: &'a Block, callee: &str) -> Option<&'a Expr> {
 }
 
 fn find_call_in_expr<'a>(expr: &'a Expr, callee: &str) -> Option<&'a Expr> {
-    if let ExprKind::Call(path, _, args) = &expr.kind {
+    if let ExprKind::Call(path, _, args, ..) = &expr.kind {
         if path.segments == [callee.to_string()] {
             return Some(expr);
         }
@@ -334,18 +334,22 @@ fn a_non_generic_algebra_impl_needs_no_specialization_and_is_unaffected() {
 #[test]
 fn a_bodyless_concrete_impl_still_dispatches_correctly_from_inside_a_generic_siblings_body() {
     // Regression test: a *concrete* impl with no body at all (the real-
-    // primitive shape, `#[mlir(...)]`-tagged) must still be visible to
-    // `derive_impl_instantiation`'s own "a concrete impl already covers
-    // this call" recognition (`ImplTemplate::is_generic == false`) --
-    // `build_impl_templates` used to skip *every* bodyless method
-    // entirely, concrete or generic, which made `Ring<f32>::add` invisible
-    // and left `Ring<Complex<T>>::add`'s own inner scalar `x.real + y.real`
-    // (real body, needs a real `f32` addition once monomorphized) matching
-    // against nothing but the structurally-incompatible generic template
-    // itself -- wrongly reported as `MonomorphizationFailed` instead of
-    // resolving cleanly. Found by direct testing (`examples/complex.cleave`).
+    // primitive shape -- `extern`-tagged today; `#[mlir(...)]`-tagged when
+    // this test was first written, before intrinsics got real `mlir::...`-
+    // calling bodies instead, see `mlir_lower.rs`'s own module doc comment
+    // -- either way, a bodyless method the type checker accepts) must still
+    // be visible to `derive_impl_instantiation`'s own "a concrete impl
+    // already covers this call" recognition (`ImplTemplate::is_generic ==
+    // false`) -- `build_impl_templates` used to skip *every* bodyless
+    // method entirely, concrete or generic, which made `Ring<f32>::add`
+    // invisible and left `Ring<Complex<T>>::add`'s own inner scalar
+    // `x.real + y.real` (real body, needs a real `f32` addition once
+    // monomorphized) matching against nothing but the structurally-
+    // incompatible generic template itself -- wrongly reported as
+    // `MonomorphizationFailed` instead of resolving cleanly. Found by
+    // direct testing (`examples/complex.cleave`).
     let src = "algebra Ring<T> { fn add(a: T, b: T) -> T; }
-         impl Ring<f32> { #[mlir(mlir_f32_add)] fn add(a: f32, b: f32) -> f32; }
+         impl Ring<f32> { extern fn add(a: f32, b: f32) -> f32; }
          algebra Float<T> {}
          impl Float<f32> {}
          struct Complex<T: Float> { real: T, imag: T }

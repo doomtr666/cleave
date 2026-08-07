@@ -103,6 +103,15 @@ impl Lowerer {
             attrs.push(self.lower_attribute(inner.next().unwrap()));
         }
 
+        let is_extern = matches!(inner.peek().map(|p| p.as_rule()), Some(Rule::extern_kw));
+        let extern_symbol = if is_extern {
+            // `extern_kw`'s own optional `(symbol)` -- an `ident` pair
+            // inside it if present, nothing if it's a bare `extern`.
+            inner.next().unwrap().into_inner().next().map(|p| p.as_str().to_string())
+        } else {
+            None
+        };
+
         let name = inner.next().unwrap().as_str().to_string();
 
         let generics = if matches!(inner.peek().map(|p| p.as_rule()), Some(Rule::generic_params)) {
@@ -127,7 +136,7 @@ impl Lowerer {
         // pair of its own, so `None` here is exactly "no `block` pair was
         // left to consume", not a parse failure.
         let body = inner.next().map(|p| self.lower_block(p));
-        FnDecl { name, attrs, generics, params, ret, body }
+        FnDecl { name, attrs, is_extern, extern_symbol, generics, params, ret, body }
     }
 
     fn lower_attribute(&mut self, pair: Pair<Rule>) -> Attribute {
@@ -266,6 +275,11 @@ impl Lowerer {
     fn lower_algebra_impl(&mut self, pair: Pair<Rule>) -> ImplDecl {
         let mut inner = pair.into_inner().peekable();
 
+        let mut attrs = Vec::new();
+        while matches!(inner.peek().map(|p| p.as_rule()), Some(Rule::attribute)) {
+            attrs.push(self.lower_attribute(inner.next().unwrap()));
+        }
+
         let generics = if matches!(inner.peek().map(|p| p.as_rule()), Some(Rule::generic_params)) {
             self.lower_generic_params(inner.next().unwrap())
         } else {
@@ -284,7 +298,7 @@ impl Lowerer {
             extra_targets.push(self.lower_type(inner.next().unwrap()));
         }
         let fns = inner.map(|p| self.lower_fn_decl(p)).collect();
-        ImplDecl { algebra, generics, target, extra_targets, fns }
+        ImplDecl { attrs, algebra, generics, target, extra_targets, fns }
     }
 
     fn lower_inherent_impl(&mut self, pair: Pair<Rule>) -> InherentImplDecl {
@@ -496,7 +510,7 @@ impl Lowerer {
             let rhs = lower_operand(self, rhs_pair);
             let name = op_name(op_pair.as_str());
             let span = self.join(acc.span, rhs.span);
-            acc = self.wrap(span, ExprKind::Call(Path::single(name), Vec::new(), vec![acc, rhs]));
+            acc = self.wrap(span, ExprKind::Call(Path::single(name), Vec::new(), vec![acc, rhs], Vec::new()));
         }
         acc
     }
@@ -509,7 +523,7 @@ impl Lowerer {
             Rule::unary => {
                 // "-" ~ unary — the "-" itself is a bare token, not a pair.
                 let operand = self.lower_unary(first);
-                self.wrap(span, ExprKind::Call(Path::single("neg"), Vec::new(), vec![operand]))
+                self.wrap(span, ExprKind::Call(Path::single("neg"), Vec::new(), vec![operand], Vec::new()))
             }
             Rule::postfix => self.lower_postfix(first),
             r => unreachable!("unary: unexpected rule {r:?}"),
@@ -538,11 +552,12 @@ impl Lowerer {
                 // an absent vs. an empty `arg_list` are otherwise indistinguishable.
                 match inner.next() {
                     Some(call_args) => {
-                        let args = call_args
-                            .into_inner()
-                            .next()
-                            .map(|al| self.lower_arg_list(al))
-                            .unwrap_or_default();
+                        // Named (`mlir_attr`) arguments are only meaningful on
+                        // a reserved `mlir::...` *call*, never a method call —
+                        // silently dropped here, same as `MethodCall` itself
+                        // never getting a `mlir::`-recognizing path segment.
+                        let (args, _mlir_attrs) =
+                            call_args.into_inner().next().map(|al| self.lower_arg_list(al)).unwrap_or_default();
                         self.wrap(span, ExprKind::MethodCall(Box::new(base), name, args))
                     }
                     None => self.wrap(span, ExprKind::FieldAccess(Box::new(base), name)),
@@ -563,8 +578,31 @@ impl Lowerer {
         }
     }
 
-    fn lower_arg_list(&mut self, pair: Pair<Rule>) -> Vec<Expr> {
-        pair.into_inner().map(|p| self.lower_expr(p)).collect()
+    /// Positional args and `mlir_attr` pairs (`predicate: "slt"`) may appear
+    /// in any order/interleaving at the grammar level (each `call_arg` tries
+    /// `mlir_attr` before `expr`, see that rule's own comment) but are split
+    /// apart here — see `ast.rs`'s own `ExprKind::Call::mlir_attrs` doc
+    /// comment for why they're not unified into one representation.
+    fn lower_arg_list(&mut self, pair: Pair<Rule>) -> (Vec<Expr>, Vec<(String, String)>) {
+        let mut args = Vec::new();
+        let mut mlir_attrs = Vec::new();
+        for call_arg in pair.into_inner() {
+            let p = call_arg.into_inner().next().unwrap();
+            match p.as_rule() {
+                Rule::mlir_attr => {
+                    let mut inner = p.into_inner();
+                    let name = inner.next().unwrap().as_str().to_string();
+                    // `string_lit` is atomic (`@{...}`), so `.as_str()` includes
+                    // its own surrounding quotes -- stripped here, once, so
+                    // every consumer downstream (`infer.rs`, `mlir_lower.rs`)
+                    // sees just the raw attribute text.
+                    let text = inner.next().unwrap().as_str();
+                    mlir_attrs.push((name, text[1..text.len() - 1].to_string()));
+                }
+                _ => args.push(self.lower_expr(p)),
+            }
+        }
+        (args, mlir_attrs)
     }
 
     fn lower_primary(&mut self, pair: Pair<Rule>) -> Expr {
@@ -617,8 +655,8 @@ impl Lowerer {
         let mut inner = pair.into_inner().peekable();
         let path = self.lower_path(inner.next().unwrap());
         let generics = self.lower_optional_turbofish(&mut inner);
-        let args = inner.next().map(|p| self.lower_arg_list(p)).unwrap_or_default();
-        self.wrap(span, ExprKind::Call(path, generics, args))
+        let (args, mlir_attrs) = inner.next().map(|p| self.lower_arg_list(p)).unwrap_or_default();
+        self.wrap(span, ExprKind::Call(path, generics, args, mlir_attrs))
     }
 
     fn lower_struct_lit(&mut self, pair: Pair<Rule>) -> Expr {

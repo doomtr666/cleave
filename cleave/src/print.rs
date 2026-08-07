@@ -243,13 +243,10 @@ pub(crate) fn fmt_expr(e: &Expr) -> String {
         ExprKind::ImaginaryLit { text, .. } => format!("{text}i"),
         ExprKind::BoolLit(b) => b.to_string(),
         ExprKind::Path(p) => fmt_path(p),
-        ExprKind::Call(path, generics, args) => {
-            format!(
-                "{}{}({})",
-                fmt_path(path),
-                fmt_turbofish(generics),
-                args.iter().map(fmt_expr).collect::<Vec<_>>().join(", ")
-            )
+        ExprKind::Call(path, generics, args, mlir_attrs) => {
+            let mut parts: Vec<String> = args.iter().map(fmt_expr).collect();
+            parts.extend(mlir_attrs.iter().map(|(name, text)| format!("{name}: {text:?}")));
+            format!("{}{}({})", fmt_path(path), fmt_turbofish(generics), parts.join(", "))
         }
         ExprKind::FieldAccess(base, name) => format!("{}.{name}", fmt_expr(base)),
         ExprKind::MethodCall(base, name, args) => {

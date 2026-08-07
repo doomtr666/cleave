@@ -1,0 +1,7 @@
+use io;
+
+fn main() -> i32 {
+    print(42);
+    print(66);
+    0
+}

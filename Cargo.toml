@@ -1,3 +1,19 @@
 [workspace]
-members = ["cleave"]
+members = ["cleave", "cleave-rt"]
 resolver = "3"
+
+[patch.crates-io]
+# See doc/backlog.md item 1 (MLIR lowering) and the mlir-sys PR at
+# https://github.com/mlir-rs/mlir-sys/pull -- three Windows/MSVC static-
+# linking bugs (enum signedness, a doubled `.lib` suffix, and static-lib
+# discovery assuming Unix `lib*.a` naming) all fixed here, none yet released
+# upstream. Vendored locally at C:/dev/mlir-sys (full git history, `origin`
+# tracking the real upstream, `fork` tracking the PR branch) rather than a
+# bare git dependency, so `cargo build` doesn't depend on network access to
+# GitHub at all once cloned.
+mlir-sys = { path = "C:/dev/mlir-sys" }
+# tblgen 0.9.1 (crates.io) fails to build on MSVC -- its own bundled C++
+# wrapper needs C++20, its build.rs forces C++17. Already fixed on `main`,
+# just not released yet -- tracking `main` directly here since there's
+# nothing of ours to patch.
+tblgen = { git = "https://github.com/mlir-rs/tblgen-rs" }

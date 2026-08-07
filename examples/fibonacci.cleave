@@ -1,9 +1,14 @@
+use io;
+
 fn fibonacci<T: Int>(x : T) -> T {
-    if x > 2 { fibonacci(x-1) + fibonacci(x-2) } else { x }
+    if x <= 1 { x } else { fibonacci(x-1) + fibonacci(x-2) }
 }
 
 fn main() {
-    let a = fibonacci(42:i32);
+    let a = fibonacci(16:i32);
+    print(a);
+
     let b = fibonacci(42:i64);
+    print(b);
     0
 }

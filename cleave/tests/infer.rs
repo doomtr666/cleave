@@ -922,13 +922,16 @@ fn a_bodyless_algebra_impl_method_with_no_attribute_is_rejected() {
 }
 
 #[test]
-fn a_bodyless_algebra_impl_method_with_mlir_attribute_type_checks() {
+fn a_bodyless_algebra_impl_method_marked_extern_type_checks() {
+    // `#[mlir(...)]` no longer justifies a bodyless algebra-impl method at
+    // all -- an intrinsic operation gets a real body now (a reserved
+    // `mlir::...` call, see `mlir_lower.rs`'s own module doc comment);
+    // `extern` (a real external C symbol) is the only case left.
     let registry = registry_from("algebra TestAlg<T> { fn add(x: T, y: T) -> T; }");
     let (algebra, target, f, span) = lower_one_impl(
         "algebra TestAlg<T> { fn add(x: T, y: T) -> T; }
          impl TestAlg<i32> {
-             #[mlir(mlir_i32_add)]
-             fn add(x: i32, y: i32) -> i32;
+             extern fn add(x: i32, y: i32) -> i32;
          }",
     );
     let mut infer = Infer::new(&registry);

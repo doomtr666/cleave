@@ -412,15 +412,22 @@ pub enum TypeErrorKind {
     /// (`fn foo(x: i32);`) — legal grammatically anywhere a `fn` appears
     /// (see `grammar.pest`'s own `fn_decl` comment), but only ever actually
     /// meaningful for an algebra-impl method (see `MissingIntrinsicAttribute`
-    /// below) — there's nothing else a top-level `fn`/inherent method could
-    /// possibly mean by omitting its body.
+    /// below) or a top-level `fn` marked `extern` (see `ExternFnCannotBe
+    /// Generic` below) — there's nothing else a top-level `fn`/inherent
+    /// method could possibly mean by omitting its body otherwise.
     MissingFnBody { name: String },
-    /// An algebra-impl method declared with no body, but carrying none of
-    /// the recognized body-justifying attributes (`#[mlir(...)]` today) —
-    /// the one case a bodyless `fn` *is* legal, but only when something
-    /// tells the eventual codegen pass what to actually do instead of
-    /// running a body that doesn't exist.
+    /// An algebra-impl method declared with no body and not `extern` — the
+    /// one case a bodyless `fn` *is* legal, but only for a real external C
+    /// symbol; an intrinsic operation gets a real body (a reserved
+    /// `mlir::...` call) instead, see `mlir_lower.rs`'s own module doc
+    /// comment.
     MissingIntrinsicAttribute { name: String },
+    /// `extern fn foo<T>(x: T) -> T;` — a real C-ABI boundary only ever
+    /// crosses concrete, monomorphized signatures (see `doc/hld.md`'s own
+    /// note on this), so an `extern fn` can't be generic the way an
+    /// ordinary top-level `fn` can; there's no monomorphization pass for it
+    /// to go through in the first place.
+    ExternFnCannotBeGeneric { name: String },
 }
 
 impl std::fmt::Display for TypeErrorKind {
@@ -474,10 +481,13 @@ impl std::fmt::Display for TypeErrorKind {
                 write!(f, "`{algebra}::{method}` cannot be specialized for ({tys}): its generic impl body doesn't type-check at this instantiation")
             }
             TypeErrorKind::MissingFnBody { name } => {
-                write!(f, "`{name}` has no body — only an algebra-impl method may omit one, and only with a recognized attribute (e.g. `#[mlir(...)]`)")
+                write!(f, "`{name}` has no body — a `fn` may only omit one if it's `extern`")
             }
             TypeErrorKind::MissingIntrinsicAttribute { name } => {
-                write!(f, "`{name}` has no body and no recognized attribute justifying that (e.g. `#[mlir(...)]`) — a `fn` without a body needs one")
+                write!(f, "`{name}` has no body and isn't `extern` — an algebra-impl method without a body must be")
+            }
+            TypeErrorKind::ExternFnCannotBeGeneric { name } => {
+                write!(f, "`extern fn {name}` cannot be generic — only concrete, monomorphized signatures can cross a C-ABI boundary")
             }
         }
     }
@@ -1266,14 +1276,17 @@ impl<'r> Infer<'r> {
         }
 
         // A bodyless algebra-impl method (`fn add(x: f32, y: f32) -> f32;`)
-        // is legal only when a recognized attribute justifies it — an
-        // eventual codegen intrinsic, `#[mlir(...)]` today, the only one
-        // this project recognizes so far (see `grammar.pest`'s own
-        // `fn_decl` comment on why the grammar itself stays permissive and
-        // this check lives here instead). The declared return type *is*
-        // the result in that case — there's no body to compute one, and
-        // nothing else here needs a body: `param_types`/`target_types` are
-        // already fully resolved from the signature/impl targets alone.
+        // is legal only when `extern` justifies it (`ast.rs`'s own `FnDecl::
+        // is_extern`/`extern_symbol` — the same body-justifying case a
+        // top-level `fn` gets, legal here too, for a real external C
+        // symbol). An eventual codegen intrinsic no longer needs this at
+        // all: it gets a real body containing a reserved `mlir::...` call
+        // instead (`infer_expr`'s own `mlir::`-recognizing branch) — see
+        // `mlir_lower.rs`'s own module doc comment. The declared return
+        // type *is* the result in the `extern` case — there's no body to
+        // compute one, and nothing else here needs a body: `param_types`/
+        // `target_types` are already fully resolved from the signature/impl
+        // targets alone.
         let result = match &f.body {
             Some(body) => {
                 let result = self.infer_block(&env, body)?;
@@ -1282,7 +1295,7 @@ impl<'r> Infer<'r> {
                 result
             }
             None => {
-                if !f.attrs.iter().any(|a| a.name == "mlir") {
+                if !f.is_extern {
                     return Err(TypeError {
                         span: fallback_span,
                         kind: TypeErrorKind::MissingIntrinsicAttribute { name: f.name.clone() },
@@ -1618,8 +1631,11 @@ impl<'r> Infer<'r> {
     }
 
     /// Unifies and, on failure, attaches `span` — the one place a raw
-    /// `UnifyError` becomes a located `TypeError`.
-    fn unify_at(&mut self, span: Span, a: &Ty, b: &Ty) -> Result<(), TypeError> {
+    /// `UnifyError` becomes a located `TypeError`. `pub(crate)` for the same
+    /// reason `ty_from_ast` is: `callgraph.rs` needs it to bind an `extern
+    /// fn`'s fresh `ret_var` (from `fresh_fn_shape`) to its declared return
+    /// type, with no body to infer one from instead.
+    pub(crate) fn unify_at(&mut self, span: Span, a: &Ty, b: &Ty) -> Result<(), TypeError> {
         unify(&mut self.subst, a, b).map_err(|e| TypeError { span, kind: TypeErrorKind::Unify(e) })
     }
 
@@ -2188,7 +2204,13 @@ impl<'r> Infer<'r> {
         }
     }
 
-    fn ty_from_ast(&mut self, ty: &Type) -> Ty {
+    /// Exposed `pub(crate)` (unlike `ty_from_ast_mapped` below) specifically
+    /// so `callgraph.rs` can resolve an `extern fn`'s declared return type
+    /// directly, the same way it already reuses `fresh_fn_shape` for that
+    /// case's param types — no generics are ever in scope for an `extern
+    /// fn` (rejected outright, see `TypeErrorKind::ExternFnCannotBeGeneric`),
+    /// so the unmapped form is exactly what's needed there.
+    pub(crate) fn ty_from_ast(&mut self, ty: &Type) -> Ty {
         self.ty_from_ast_mapped(ty, &HashMap::new())
     }
 
@@ -2312,7 +2334,7 @@ impl<'r> Infer<'r> {
             ExprKind::NumberLit { text, .. } => text.parse::<u64>().ok().map(|n| Ty::Const(ConstValue::Int(n))),
             ExprKind::BoolLit(b) => Some(Ty::Const(ConstValue::Bool(*b))),
             ExprKind::Path(p) if p.segments.len() == 1 => mapping.get(&p.segments[0]).cloned(),
-            ExprKind::Call(path, _, args) if path.segments.len() == 1 && args.len() == 2 => {
+            ExprKind::Call(path, _, args, ..) if path.segments.len() == 1 && args.len() == 2 => {
                 let (Ty::Const(a), Ty::Const(b)) =
                     (self.const_value_from_expr(&args[0], mapping)?, self.const_value_from_expr(&args[1], mapping)?)
                 else {
@@ -2465,7 +2487,29 @@ impl<'r> Infer<'r> {
                     .ok_or(TypeError { span: expr.span, kind: TypeErrorKind::UnknownName(name) })?;
                 Ok(self.instantiate(&scheme))
             }
-            ExprKind::Call(path, generics, args) => self.infer_call(env, expr.span, path, generics, args),
+            // A reserved raw-MLIR-op call (`mlir::arith::addi(a, b)`) --
+            // skips algebra/top-level-fn resolution entirely: type-check
+            // each positional arg normally (needed so their own types are
+            // known and their CPS conversion is ordinary), and return a
+            // *fresh unification variable* as this call's own result type,
+            // pinned down normally by whatever context needs it (the
+            // enclosing fn's declared return type, a `let`'s own use, ...) --
+            // deliberately not the `<unresolved-call:...>` placeholder
+            // mechanism (`is_placeholder` above), which exists to *error* if
+            // nothing else resolves it; this is meant to resolve the same
+            // unremarkable way any other ordinarily-inferred expression
+            // does. Operand types are never cross-checked against each
+            // other or against the op's own real requirements here -- that
+            // safety net is MLIR's own verifier, not this pass. A deliberate
+            // trade-off, not an oversight: see `mlir_lower.rs`'s own module
+            // doc comment.
+            ExprKind::Call(path, _, args, _) if path.segments.first().map(String::as_str) == Some("mlir") => {
+                for arg in args {
+                    self.infer_expr(env, arg)?;
+                }
+                Ok(self.vars.fresh())
+            }
+            ExprKind::Call(path, generics, args, _) => self.infer_call(env, expr.span, path, generics, args),
             ExprKind::Block(b) => self.infer_block(env, b),
             ExprKind::If { cond, then_branch, else_branch } => {
                 let cond_ty = self.infer_expr(env, cond)?;

@@ -166,6 +166,38 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
             let f = functions[name.as_str()];
             if f.body.is_none() {
                 let span = item_spans[name.as_str()];
+                // `extern fn foo(...) -> ...;` — legal without a body (see
+                // `ast.rs`'s own `FnDecl::is_extern` doc comment): there's
+                // no body to infer, so bind the placeholder's own `ret_var`
+                // straight to the declared return type instead (mirroring
+                // what body inference would otherwise do by unifying it
+                // against the body's own result) and treat that as this
+                // member's outcome, same shape any other successful member
+                // produces below.
+                if f.is_extern {
+                    if !f.generics.is_empty() {
+                        raw_results.insert(
+                            name.clone(),
+                            Err(TypeError { span, kind: TypeErrorKind::ExternFnCannotBeGeneric { name: f.name.clone() } }),
+                        );
+                        continue;
+                    }
+                    // Mirrors `infer_fn_raw`'s own two steps for a real
+                    // body (infer the result, then tie `ret_var` to it) —
+                    // here the declared return type stands in for "what the
+                    // body computed", and the outcome stored is that same
+                    // bare return `Ty`, not `Ty::Fn(params, ret)`, matching
+                    // exactly what `infer_fn_raw` itself returns.
+                    let (_, ret_var, _) = placeholders[name].clone();
+                    let declared_ret =
+                        f.ret.as_ref().map(|t| infer.ty_from_ast(t)).unwrap_or_else(|| Ty::Con("()".to_string()));
+                    let outcome = infer
+                        .unify_at(span, &ret_var, &declared_ret)
+                        .and_then(|()| infer.check_pending_type_names())
+                        .map(|()| declared_ret);
+                    raw_results.insert(name.clone(), outcome);
+                    continue;
+                }
                 raw_results.insert(
                     name.clone(),
                     Err(TypeError { span, kind: TypeErrorKind::MissingFnBody { name: f.name.clone() } }),
@@ -357,7 +389,7 @@ fn collect_calls_expr(expr: &Expr, known: &HashSet<&str>, out: &mut Vec<String>)
                 out.push(name);
             }
         }
-        ExprKind::Call(path, _, args) => {
+        ExprKind::Call(path, _, args, ..) => {
             let name = path.segments.join("::");
             if known.contains(name.as_str()) {
                 out.push(name);

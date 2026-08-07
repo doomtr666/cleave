@@ -257,11 +257,14 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
         if !scheme.vars.is_empty() {
             continue;
         }
-        // Only ever `None` for a top-level `fn` that `callgraph::infer_program`
-        // itself already rejected (`MissingFnBody`) — such a function never
-        // makes it into `global_env` at all, so the `scheme` lookup above
-        // would already have skipped it.
-        let body = f.body.as_ref().expect("a top-level fn with a global_env scheme always has a body");
+        // `None` for a top-level `fn` that `callgraph::infer_program` itself
+        // already rejected (`MissingFnBody`) — such a function never makes
+        // it into `global_env` at all, so the `scheme` lookup above would
+        // already have skipped it -- *or* for an `extern fn` (see `ast.rs`'s
+        // own `FnDecl::is_extern` doc comment), which `callgraph.rs` does
+        // seed into `global_env` (so ordinary calls to it resolve), but
+        // which has no body of its own to scan for further instantiations.
+        let Some(body) = &f.body else { continue };
         collect_instantiations(
             body,
             &program_inference.node_types,
@@ -448,7 +451,7 @@ fn collect_instantiations(
     let mut exprs = Vec::new();
     collect_exprs_block(body, &mut exprs);
     for e in exprs {
-        let ExprKind::Call(path, _, args) = &e.kind else { continue };
+        let ExprKind::Call(path, _, args, ..) = &e.kind else { continue };
         let name = path.segments.join("::");
 
         if let Some(scheme) = global_env.get(&name) {
@@ -613,7 +616,7 @@ fn collect_exprs<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
     out.push(expr);
     match &expr.kind {
         ExprKind::NumberLit { .. } | ExprKind::ImaginaryLit { .. } | ExprKind::BoolLit(_) | ExprKind::Path(_) => {}
-        ExprKind::Call(_, _, args) => args.iter().for_each(|a| collect_exprs(a, out)),
+        ExprKind::Call(_, _, args, ..) => args.iter().for_each(|a| collect_exprs(a, out)),
         ExprKind::FieldAccess(base, _) => collect_exprs(base, out),
         ExprKind::MethodCall(base, _, args) => {
             collect_exprs(base, out);
@@ -744,19 +747,27 @@ pub fn dump_monomorphized(program: &Program, registry: &Registry) -> (String, Ve
                     errors.push(e.clone());
                 }
                 Some(Ok(fn_result)) => match program_inference.global_env.get(&f.name) {
-                    Some(scheme) if scheme.vars.is_empty() => {
-                        let body = f.body.as_ref().expect("a top-level fn with a global_env scheme always has a body");
-                        dump_one(
-                            &mut out,
-                            &f.name,
-                            &f.params,
-                            body,
-                            &fn_result.param_types,
-                            &fn_result.result,
-                            &program_inference.node_types,
-                            mono.seed_call_names(),
-                        );
-                    }
+                    Some(scheme) if scheme.vars.is_empty() => match &f.body {
+                        Some(body) => {
+                            dump_one(
+                                &mut out,
+                                &f.name,
+                                &f.params,
+                                body,
+                                &fn_result.param_types,
+                                &fn_result.result,
+                                &program_inference.node_types,
+                                mono.seed_call_names(),
+                            );
+                        }
+                        // `extern fn` — no body to dump; render its resolved
+                        // signature instead (see `ast.rs`'s own `FnDecl::
+                        // is_extern` doc comment).
+                        None => {
+                            let params: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
+                            let _ = writeln!(out, "extern fn {}({}) -> {};", f.name, params.join(", "), fn_result.result);
+                        }
+                    },
                     Some(_) => {
                         let keys = mono.specializations_of(&f.name);
                         if keys.is_empty() {

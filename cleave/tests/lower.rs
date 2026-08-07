@@ -82,7 +82,7 @@ fn lambda_lowers_with_params_and_body() {
             assert_eq!(params[0].name, "a");
             assert!(ret.is_none());
             match &body.tail.as_deref().unwrap().kind {
-                ExprKind::Call(path, _, _) => assert_eq!(path.segments, vec!["add".to_string()]),
+                ExprKind::Call(path, _, _, ..) => assert_eq!(path.segments, vec!["add".to_string()]),
                 other => panic!("expected desugared add, got {other:?}"),
             }
         }
@@ -124,7 +124,7 @@ fn zero_field_struct_lit_lowers_to_a_call_not_a_struct_lit() {
     // `infer_call` closes the gap for real structs, not `lower.rs`.
     let f = lower_one_fn("fn f() { Empty() }");
     match &only_stmt_expr(&f.body).kind {
-        ExprKind::Call(path, _, args) => {
+        ExprKind::Call(path, _, args, ..) => {
             assert_eq!(path.segments, vec!["Empty".to_string()]);
             assert!(args.is_empty());
         }
@@ -136,7 +136,7 @@ fn zero_field_struct_lit_lowers_to_a_call_not_a_struct_lit() {
 fn operator_desugars_to_call() {
     let f = lower_one_fn("fn add(a, b) { a + b }");
     match &only_stmt_expr(&f.body).kind {
-        ExprKind::Call(path, _, args) => {
+        ExprKind::Call(path, _, args, ..) => {
             assert_eq!(path.segments, vec!["add".to_string()]);
             assert_eq!(args.len(), 2);
         }
@@ -149,10 +149,10 @@ fn operator_chain_is_left_associative() {
     // a - b - c => sub(sub(a, b), c)
     let f = lower_one_fn("fn f(a, b, c) { a - b - c }");
     match &only_stmt_expr(&f.body).kind {
-        ExprKind::Call(outer_path, _, outer_args) => {
+        ExprKind::Call(outer_path, _, outer_args, ..) => {
             assert_eq!(outer_path.segments, vec!["sub".to_string()]);
             match &outer_args[0].kind {
-                ExprKind::Call(inner_path, _, inner_args) => {
+                ExprKind::Call(inner_path, _, inner_args, ..) => {
                     assert_eq!(inner_path.segments, vec!["sub".to_string()]);
                     assert_eq!(inner_args.len(), 2);
                 }
@@ -167,7 +167,7 @@ fn operator_chain_is_left_associative() {
 fn comparison_and_logical_and_implication_desugar() {
     let f = lower_one_fn("fn f(a, b) { a and b implies a or b }");
     match &only_stmt_expr(&f.body).kind {
-        ExprKind::Call(path, _, _) => assert_eq!(path.segments, vec!["implies".to_string()]),
+        ExprKind::Call(path, _, _, ..) => assert_eq!(path.segments, vec!["implies".to_string()]),
         other => panic!("expected implies Call, got {other:?}"),
     }
 }
@@ -176,7 +176,7 @@ fn comparison_and_logical_and_implication_desugar() {
 fn unary_minus_desugars_to_neg() {
     let f = lower_one_fn("fn f(a) { -a }");
     match &only_stmt_expr(&f.body).kind {
-        ExprKind::Call(path, _, args) => {
+        ExprKind::Call(path, _, args, ..) => {
             assert_eq!(path.segments, vec!["neg".to_string()]);
             assert_eq!(args.len(), 1);
         }
@@ -303,7 +303,7 @@ fn numeric_literal_type_suffix_is_split_out() {
 fn imaginary_literal_strips_trailing_i() {
     let f = lower_one_fn("fn f() { 3 + 4i }");
     match &only_stmt_expr(&f.body).kind {
-        ExprKind::Call(_, _, args) => match &args[1].kind {
+        ExprKind::Call(_, _, args, ..) => match &args[1].kind {
             ExprKind::ImaginaryLit { text, .. } => assert_eq!(text, "4"),
             other => panic!("expected ImaginaryLit, got {other:?}"),
         },
@@ -315,7 +315,7 @@ fn imaginary_literal_strips_trailing_i() {
 fn qualified_call_path_has_two_segments() {
     let f = lower_one_fn("fn f(a, b) { Ring::add(a, b) }");
     match &only_stmt_expr(&f.body).kind {
-        ExprKind::Call(path, _, _) => {
+        ExprKind::Call(path, _, _, ..) => {
             assert_eq!(path.segments, vec!["Ring".to_string(), "add".to_string()]);
         }
         other => panic!("expected Call, got {other:?}"),
@@ -326,7 +326,7 @@ fn qualified_call_path_has_two_segments() {
 fn turbofish_on_a_call_lowers_to_explicit_generic_args() {
     let f = lower_one_fn("fn f() { fibonacci::<f64>(1.0) }");
     match &only_stmt_expr(&f.body).kind {
-        ExprKind::Call(path, generics, args) => {
+        ExprKind::Call(path, generics, args, ..) => {
             assert_eq!(path.segments, vec!["fibonacci".to_string()]);
             assert_eq!(args.len(), 1);
             match &generics[..] {
@@ -345,7 +345,7 @@ fn turbofish_on_a_call_lowers_to_explicit_generic_args() {
 fn an_ordinary_call_with_no_turbofish_has_empty_explicit_generics() {
     let f = lower_one_fn("fn f() { fibonacci(1) }");
     match &only_stmt_expr(&f.body).kind {
-        ExprKind::Call(_, generics, _) => assert!(generics.is_empty()),
+        ExprKind::Call(_, generics, _, ..) => assert!(generics.is_empty()),
         other => panic!("expected a Call, got {other:?}"),
     }
 }

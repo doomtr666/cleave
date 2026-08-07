@@ -44,7 +44,24 @@ attribute_arg = { ident }
 // a recognized body-justifying attribute" is a *semantic* check
 // (`infer.rs`), not a grammatical one -- same posture `const R: Int`
 // parsing fine and being rejected later already established.
-fn_decl = { attribute* ~ "fn" ~ ident ~ generic_params? ~ "(" ~ param_list? ~ ")" ~ ("->" ~ type_)? ~ (block | ";") }
+// `extern_kw` is its own named rule (not a bare string literal inline in
+// `fn_decl`) specifically so it surfaces as a distinguishable `Pair` for
+// `lower.rs` to detect via `peek()`, the same way `attribute*`/
+// `generic_params?` already do -- a bare literal token (like the trailing
+// `;` below) produces no pair of its own. `extern fn name(...) -> ...;` --
+// no ABI string (`extern "C"`, as `doc/hld.md` originally sketched): C is
+// implicitly the only ABI this targets, and the signature right there
+// already says everything else needed.
+//
+// `extern`'s own optional `(symbol)` -- distinct from `fn_decl`'s outer
+// `attribute*` -- covers the one case a bare `extern fn name(...)` can't:
+// inside an algebra `impl`, several concrete impls of the *same* method
+// name (`impl Print<i32> { ... fn print ... }`, `impl Print<i64> { ... fn
+// print ... }`) each need to bind a genuinely *different* C symbol, so the
+// symbol can't always just be the method's own name the way it can at the
+// top level (see `ast.rs`'s own `FnDecl::extern_symbol` doc comment).
+fn_decl = { attribute* ~ extern_kw? ~ "fn" ~ ident ~ generic_params? ~ "(" ~ param_list? ~ ")" ~ ("->" ~ type_)? ~ (block | ";") }
+extern_kw = { "extern" ~ ("(" ~ ident ~ ")")? }
 
 generic_params = { "<" ~ generic_param ~ ("," ~ generic_param)* ~ ">" }
 generic_param  = { "const" ~ ident ~ ":" ~ type_ | ident ~ (":" ~ bound_list)? }
@@ -104,7 +121,13 @@ impl_decl = { algebra_impl | inherent_impl }
 // Matrix<T,M,K>, Matrix<T,N,K>>` — three independently-typed parameters, not
 // one type substituted for all three (see `infer.rs`'s own module docs on
 // why a single-target impl can't express that).
-algebra_impl  = { "impl" ~ generic_params? ~ ident ~ "<" ~ type_ ~ ("," ~ type_)* ~ ">" ~ "{" ~ fn_decl* ~ "}" }
+// `attribute*` here specifically (not `inherent_impl`, not `impl_decl` as a
+// whole) is `#[mlir_type("i32")]`'s own home -- declares this impl's target
+// type's MLIR representation generically, the operation-level counterpart
+// to a bodyless method's own `mlir::...` call (see `mlir_lower.rs`'s type-
+// lowering doc comment). Same permissive-at-grammar-level, checked-later
+// posture every other attribute in this file already takes.
+algebra_impl  = { attribute* ~ "impl" ~ generic_params? ~ ident ~ "<" ~ type_ ~ ("," ~ type_)* ~ ">" ~ "{" ~ fn_decl* ~ "}" }
 // `impl struct Vec2 { fn len(v) { ... } }` — no algebra name, no dispatch
 // through the registry; `target` is an ordinary `type_` (usually just a
 // bare struct name, `Vec2`, but can carry its own generic arguments the
@@ -227,7 +250,27 @@ lambda_expr = { "fn" ~ "(" ~ param_list? ~ ")" ~ ("->" ~ type_)? ~ block }
 // qualified calls (`Ring::add(a, b)`) need the same path as plain references —
 // `path`'s single-segment case still covers a bare `add(a, b)`.
 call_expr = { path ~ turbofish? ~ "(" ~ arg_list? ~ ")" }
-arg_list  = { expr ~ ("," ~ expr)* }
+// `mlir_attr` (`predicate: "slt"`) exists for exactly one caller: a
+// reserved `mlir::dialect::op(...)` call's static attributes (see
+// `ast.rs`'s own `ExprKind::Call::mlir_attrs` doc comment) -- legal
+// grammatically on *any* call, same "checked later, not here" posture as
+// everywhere else attributes/`extern` already take in this file; ordinary
+// calls using it are rejected in `infer.rs`, not blocked structurally.
+// `mlir_attr` is tried *before* `expr` in `call_arg` deliberately -- `expr`
+// alone would happily match a bare `predicate` as an ordinary path
+// expression and never backtrack to give `mlir_attr` a chance at the `:`
+// that follows, since PEG commits to the first alternative that fully
+// matches (same "ordering resolves the ambiguity" posture `call_expr`'s own
+// note above `struct_lit` already takes).
+arg_list  = { call_arg ~ ("," ~ call_arg)* }
+call_arg  = { mlir_attr | expr }
+mlir_attr = { ident ~ ":" ~ string_lit }
+// Deliberately *not* part of `literal`/`primary` -- a `mlir_attr`'s own
+// value is the only place this appears anywhere in the grammar, kept
+// syntactically inert everywhere else. No escape sequences: attribute
+// values are short MLIR syntax fragments (`"slt"`, `"2 : i64"`), not
+// general text.
+string_lit = @{ "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
 
 // `fibonacci::<f64>(x)` / `Matrix::<f64, 4, 4>(values: ...)` — explicit type/const-generic
 // arguments at a call or struct-construction site, for when nothing about the arguments

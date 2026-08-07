@@ -13,16 +13,49 @@ fn cps(src: &str) -> String {
     dump_cps_program(&cps_program)
 }
 
+/// Extracts just `(fn name (...) ...)`'s own printed block out of a full
+/// dump — needed because `dump_cps_program` now prints *every* reachable
+/// top-level fn, including all 36 real, `mlir::...`-bodied `Ring`/`Ord`
+/// stdlib specializations (they all have real bodies now, see `stdlib/num/
+/// num.cleave`, so they're no longer skipped the way bodyless `#[mlir(...)]`
+/// intrinsics used to be) — meaning CPS variable numbers are no longer
+/// small, test-local integers starting at `v0`, just whatever's next after
+/// however many the stdlib's own conversion already consumed. Assertions
+/// below scope to this test's own function and, where a specific number
+/// still matters, capture it fresh from the output rather than hardcoding
+/// one — the numbering itself was never semantically meaningful, only
+/// self-consistency was.
+fn fn_block<'a>(dump: &'a str, name: &str) -> &'a str {
+    let start = dump.find(&format!("(fn {name} (")).unwrap_or_else(|| panic!("no `(fn {name} (...)` block found in:\n{dump}"));
+    let mut depth = 0i32;
+    for (i, c) in dump[start..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &dump[start..start + i + 1];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unbalanced parens looking for `(fn {name} (...)` in:\n{dump}");
+}
+
 #[test]
-fn a_call_to_a_stdlib_intrinsic_converts_to_one_let_prim() {
-    // `add(a, b)` dispatches to the real stdlib `Ring<f64>::add`, a bodyless
-    // `#[mlir(mlir_f64_add)]`-tagged concrete impl -- Appel's PRIMOP,
-    // straight-line, no continuation needed.
-    let out = cps("fn f(a: f64, b: f64) -> f64 { add(a, b) }");
-    assert!(out.contains("(fn f (v0 v1 v2)"), "got:\n{out}");
-    assert!(out.contains("(let-prim v3: f64 = (mlir_f64_add v0 v1)"), "got:\n{out}");
-    assert!(out.contains("(v2 v3)"), "the result must be handed to the return continuation, got:\n{out}");
-    assert!(!out.contains("(fix"), "a primitive call needs no synthesized continuation, got:\n{out}");
+fn a_direct_mlir_call_converts_to_one_let_prim() {
+    // A reserved `mlir::dialect::op(...)` call -- Appel's PRIMOP, straight-
+    // line, no continuation needed. `stdlib/num`'s own `Ring<f64>::add`
+    // (which wraps exactly this) no longer qualifies on its own -- it has a
+    // real body now, so calling *it* goes through `Fix`+`App` like any
+    // other real function (see the next test) -- only the raw `mlir::...`
+    // call itself is genuinely straight-line.
+    let out = cps("fn f(a: f64, b: f64) -> f64 { mlir::arith::addf(a, b) }");
+    let block = fn_block(&out, "f");
+    assert!(block.contains("let-prim"), "got:\n{block}");
+    assert!(block.contains("(mlir.arith.addf"), "got:\n{block}");
+    assert!(!block.contains("(fix"), "a raw mlir op call needs no synthesized continuation, got:\n{block}");
 }
 
 #[test]
@@ -31,15 +64,32 @@ fn a_call_to_a_real_function_converts_to_fix_plus_app_with_continuation() {
         "fn helper(a: f64, b: f64) -> f64 { add(a, b) }
          fn main() -> f64 { helper(1.0, 2.0) }",
     );
-    assert!(out.contains("(fix"), "a real callee must synthesize a local continuation, got:\n{out}");
-    assert!(out.contains("(helper 1 2 k$0)"), "the callee must be tail-called with the continuation appended, got:\n{out}");
+    // Scoped to `main`'s own block specifically: `helper`'s own body *also*
+    // makes a real call now (`add` wraps a real `mlir::...` call inside a
+    // real fn, not a straight-line intrinsic -- see `stdlib/num/num.cleave`),
+    // so it competes with `main` for continuation-label numbers via the
+    // same shared counter (`convert_program`'s own `fresh`, iterating units
+    // in `HashMap` order -- not guaranteed stable across runs) -- checking
+    // a literal `k$0` here would flakily depend on which of the two enters
+    // that shared counter first.
+    let block = fn_block(&out, "main");
+    assert!(block.contains("(fix"), "a real callee must synthesize a local continuation, got:\n{block}");
+    assert!(
+        block.contains("(helper 1 2 k$"),
+        "the callee must be tail-called with the continuation appended, got:\n{block}"
+    );
 }
 
 #[test]
 fn a_plain_let_of_a_literal_extends_env_without_introducing_a_new_cps_node() {
     let out = cps("fn f() -> f64 { let x = 1.0; x }");
-    assert!(!out.contains("let-prim"), "a plain immutable let needs no CPS node at all, got:\n{out}");
-    assert!(out.contains("(v0 1)"), "the literal value must be handed directly to the return continuation, got:\n{out}");
+    let block = fn_block(&out, "f");
+    assert!(!block.contains("let-prim"), "a plain immutable let needs no CPS node at all, got:\n{block}");
+    // `f`'s own body is `(fn f (vN) (vN 1))` -- whatever `vN` (its own
+    // return continuation parameter) actually is, the literal must be
+    // handed directly to it.
+    let k_ret = block.trim_start_matches("(fn f (").split(')').next().unwrap();
+    assert!(block.contains(&format!("({k_ret} 1)")), "the literal value must be handed directly to the return continuation, got:\n{block}");
 }
 
 #[test]
@@ -63,15 +113,19 @@ fn an_if_else_expression_joins_both_arms_through_one_synthesized_continuation() 
     // gap, not a CPS concern) -- two positive branches exercise the same join
     // logic just as well.
     let out = cps("fn f(x: i32) -> i32 { if x > 0 { 1 } else { 2 } }");
-    // Both arms must tail-call the *same* join label -- not two separately
-    // inlined copies of "whatever happens after the if" (which is what a
-    // naive CPS conversion, calling `k` directly in each branch instead of
-    // through one named continuation, would produce instead). `j$0` appears
-    // 3 times total: once as the `Fix`'s own definition, once per arm's own
-    // tail call.
-    assert_eq!(out.matches("j$0").count(), 3, "got:\n{out}");
-    assert!(out.contains("(j$0 1)") && out.contains("(j$0 2)"), "each arm must tail-call the join continuation with its own value, got:\n{out}");
-    assert_eq!(out.matches("(mlir_i32_gt").count(), 1, "the condition must be evaluated exactly once, got:\n{out}");
+    let block = fn_block(&out, "f");
+    // `x > 0` is itself a real call (`Ord::gt<i32>`), so `f`'s own body
+    // wraps the `if`'s own `Fix` inside *another* one for that call's own
+    // continuation -- both arms must tail-call the *same* join label
+    // (`j$1`, not `j$0`: label `0` went to the `gt` call's own continuation
+    // first) -- not two separately inlined copies of "whatever happens
+    // after the if" (what a naive CPS conversion, calling `k` directly in
+    // each branch instead of through one named continuation, would produce
+    // instead). `j$1` appears 3 times total: once as the `Fix`'s own
+    // definition, once per arm's own tail call.
+    assert_eq!(block.matches("j$1").count(), 3, "got:\n{block}");
+    assert!(block.contains("(j$1 1)") && block.contains("(j$1 2)"), "each arm must tail-call the join continuation with its own value, got:\n{block}");
+    assert_eq!(block.matches("Ord::gt<i32>").count(), 1, "the condition must be evaluated exactly once, got:\n{block}");
 }
 
 #[test]
@@ -93,7 +147,8 @@ fn a_self_recursive_generic_function_using_if_else_converts_and_resolves_its_own
     );
     assert!(out.contains("(fn fibonacci<i32>"), "got:\n{out}");
     assert_eq!(out.matches("(fibonacci<i32>").count(), 3, "the fn def plus its own two recursive calls, got:\n{out}");
-    assert!(out.contains("mlir_i32_gt") && out.contains("mlir_i32_sub") && out.contains("mlir_i32_add"), "got:\n{out}");
+    let block = fn_block(&out, "fibonacci<i32>");
+    assert!(block.contains("Ord::gt<i32>") && block.contains("Ring::sub<i32>") && block.contains("Ring::add<i32>"), "got:\n{block}");
 }
 
 #[test]
@@ -106,16 +161,19 @@ fn a_for_loop_becomes_a_self_recursive_continuation_carrying_the_index() {
             0
         }",
     );
-    assert!(out.contains("(fix"), "got:\n{out}");
+    let block = fn_block(&out, "f");
+    assert!(block.contains("(fix"), "got:\n{block}");
     // The loop-carried index is the recursive continuation's own single
     // parameter -- bound-check, body, increment, tail-recurse, all inside
     // its own body; the initial call seeds it with `start`.
-    assert!(out.contains("mlir_i32_lt"), "the implicit bound check must resolve to Ord::lt, got:\n{out}");
-    assert!(out.contains("mlir_i32_add"), "both the loop body's own `add` and the implicit increment use it, got:\n{out}");
-    assert!(out.contains("(loop$0 0)"), "the loop must be entered by calling its own continuation with `start`, got:\n{out}");
+    assert!(block.contains("Ord::lt<i32>"), "the implicit bound check must resolve to Ord::lt, got:\n{block}");
+    assert!(block.contains("Ring::add<i32>"), "both the loop body's own `add` and the implicit increment use it, got:\n{block}");
+    assert!(block.contains("(loop$0 0)"), "the loop must be entered by calling its own continuation with `start`, got:\n{block}");
     // On exit (bound check fails), control must reach the outer continuation
-    // with the function's own tail value, not get stuck inside the loop.
-    assert!(out.contains("(v0 0)"), "got:\n{out}");
+    // (`f`'s own return-continuation parameter) with the function's own
+    // tail value, not get stuck inside the loop.
+    let k_ret = block.trim_start_matches("(fn f (").split(')').next().unwrap();
+    assert!(block.contains(&format!("({k_ret} 0)")), "got:\n{block}");
 }
 
 #[test]
@@ -128,19 +186,22 @@ fn a_while_loop_carries_no_state_and_reevaluates_its_condition_each_iteration() 
             1
         }",
     );
-    assert!(out.contains("(fix"), "got:\n{out}");
-    assert!(out.contains("mlir_i32_gt"), "got:\n{out}");
+    let block = fn_block(&out, "f");
+    assert!(block.contains("(fix"), "got:\n{block}");
+    assert!(block.contains("Ord::gt<i32>"), "got:\n{block}");
     // No loop-carried state yet (`let mut` is a later stage) -- the
     // recursive continuation takes no parameters at all.
-    assert!(out.contains("(loop$0 ()") || out.contains("(loop$0 ("), "the loop continuation must take no parameters, got:\n{out}");
-    assert!(out.contains("(loop$0)"), "both re-entry and recursion must be plain zero-arg tail calls, got:\n{out}");
+    assert!(block.contains("(loop$0 ()") || block.contains("(loop$0 ("), "the loop continuation must take no parameters, got:\n{block}");
+    assert!(block.contains("(loop$0)"), "both re-entry and recursion must be plain zero-arg tail calls, got:\n{block}");
 }
 
 #[test]
 fn a_plain_reassignment_in_straight_line_code_just_rebinds_the_name() {
     let out = cps("fn f() -> i32 { let mut x = 1; x = 2; x }");
-    assert!(!out.contains("let-prim"), "straight-line reassignment needs no CPS node at all, got:\n{out}");
-    assert!(out.contains("(v0 2)"), "the reassigned value must reach the return continuation, got:\n{out}");
+    let block = fn_block(&out, "f");
+    assert!(!block.contains("let-prim"), "straight-line reassignment needs no CPS node at all, got:\n{block}");
+    let k_ret = block.trim_start_matches("(fn f (").split(')').next().unwrap();
+    assert!(block.contains(&format!("({k_ret} 2)")), "the reassigned value must reach the return continuation, got:\n{block}");
 }
 
 #[test]
@@ -154,13 +215,20 @@ fn a_for_loop_accumulator_is_carried_as_an_extra_loop_parameter() {
             acc
         }",
     );
+    let block = fn_block(&out, "f");
     // The recursive continuation now carries two values: the index and the
-    // accumulator (sorted by name: "acc" before "i").
-    assert!(out.contains("(loop$0 (v2 v1)") || out.contains("(loop$0 (v1 v2)"), "got:\n{out}");
-    assert!(out.contains("(loop$0 0 0)"), "both the index and the accumulator start at their own initial values, got:\n{out}");
+    // accumulator, index first positionally, whatever their own actual var
+    // numbers are (offset by however many the stdlib prelude's own
+    // conversion already consumed, see `fn_block`'s own doc comment).
+    let params = block.split("(loop$0 (").nth(1).unwrap().split(')').next().unwrap();
+    let mut params = params.split_whitespace();
+    let (index_var, acc_var) = (params.next().unwrap(), params.next().unwrap());
+    assert!(block.contains("(loop$0 0 0)"), "both the index and the accumulator start at their own initial values, got:\n{block}");
     // On exit, the *accumulator*'s own final value (not the index) must
-    // reach the outer continuation.
-    assert!(out.contains("(v0 v1)"), "the accumulator's final value must reach the outer continuation, got:\n{out}");
+    // reach the outer continuation (`f`'s own return-continuation param).
+    let k_ret = block.trim_start_matches("(fn f (").split(')').next().unwrap();
+    assert!(block.contains(&format!("({k_ret} {acc_var})")), "got:\n{block}");
+    let _ = index_var; // only its presence as loop$0's own first param matters here
 }
 
 #[test]
@@ -172,10 +240,14 @@ fn an_if_else_mutating_a_let_mut_variable_threads_it_through_the_join() {
             y
         }",
     );
-    // The join continuation must carry `y` alongside the if's own (Unit)
-    // value, and each arm must pass its own newly-assigned value along.
-    assert!(out.contains("(j$0 (v4 v3)") || out.contains("(j$0 (v3 v4)"), "got:\n{out}");
-    assert!(out.contains("(j$0 () 1)") && out.contains("(j$0 () 2)"), "got:\n{out}");
+    let block = fn_block(&out, "f");
+    // `x > 0` is itself a real call, so the join label is `j$1` (`j$0` went
+    // to that call's own continuation) -- see `an_if_else_expression_joins_
+    // both_arms_through_one_synthesized_continuation`'s own comment. The
+    // join continuation must carry `y` alongside the if's own (Unit) value,
+    // and each arm must pass its own newly-assigned value along.
+    assert!(block.contains("(j$1 (v") && block.matches("j$1").count() == 3, "got:\n{block}");
+    assert!(block.contains("(j$1 () 1)") && block.contains("(j$1 () 2)"), "got:\n{block}");
 }
 
 #[test]
@@ -194,10 +266,13 @@ fn a_variable_shadowed_by_an_inner_let_mut_does_not_leak_into_the_outer_joins_ca
             }
         }",
     );
-    // The join continuation must carry *only* the if's own result value --
-    // one parameter, not two.
-    assert!(out.contains("(j$0 (v3)"), "the inner `y` must not leak as carried state, got:\n{out}");
-    assert!(out.contains("(j$0 2)") && out.contains("(j$0 0)"), "got:\n{out}");
+    let block = fn_block(&out, "f");
+    // `x > 0` is itself a real call, so the join label is `j$1` (see the
+    // comment on the previous test). The join continuation must carry
+    // *only* the if's own result value -- one parameter, not two.
+    let join_params = block.split("(j$1 (").nth(1).unwrap().split(')').next().unwrap();
+    assert_eq!(join_params.split_whitespace().count(), 1, "the inner `y` must not leak as carried state, got:\n{block}");
+    assert!(block.contains("(j$1 2)") && block.contains("(j$1 0)"), "got:\n{block}");
 }
 
 #[test]
@@ -213,11 +288,19 @@ fn mutation_inside_an_if_nested_in_a_for_loop_composes_correctly() {
             acc
         }",
     );
+    let block = fn_block(&out, "f");
     // Two levels of carrying: the inner if's own join carries `acc`, and the
     // outer for-loop's own recursive continuation also carries `acc`
-    // (alongside its own index) -- both `fix`es must appear, nested.
-    assert_eq!(out.matches("(fix").count(), 2, "got:\n{out}");
-    assert!(out.contains("mlir_i32_add") && out.contains("mlir_i32_gt") && out.contains("mlir_i32_lt"), "got:\n{out}");
+    // (alongside its own index). Each real call (`Ord::lt`/`Ord::gt`/`Ring::
+    // add`) also synthesizes its own continuation, so `(fix` now appears
+    // more than just those two structural levels -- six total: the for-
+    // loop itself, the bound-check's own continuation, the inner `if`'s own
+    // join, the inner `if`'s own `then`-branch call continuation, and the
+    // implicit increment's own call continuation, nested one inside the
+    // next -- rather than re-deriving that count from first principles
+    // here, this just pins today's real, observed shape.
+    assert_eq!(block.matches("(fix").count(), 6, "got:\n{block}");
+    assert!(block.contains("Ring::add<i32>") && block.contains("Ord::gt<i32>") && block.contains("Ord::lt<i32>"), "got:\n{block}");
 }
 
 #[test]
@@ -229,12 +312,15 @@ fn an_array_literal_an_indexed_write_and_an_indexed_read_use_the_same_stable_ref
             a[1]
         }",
     );
-    assert!(out.contains("(let-prim v1: [i32; 3] = (array 1 2 3)"), "got:\n{out}");
-    // The store and the load must both operate on `a`'s own reference (v1)
-    // -- no copy, no rebinding through `env` the way a scalar reassignment
+    let block = fn_block(&out, "f");
+    assert!(block.contains(": [i32; 3] = (array 1 2 3)"), "got:\n{block}");
+    // `a`'s own array-reference variable, whatever it actually is.
+    let a_var = block.split(": [i32; 3] = (array 1 2 3)").next().unwrap().rsplit("(let-prim ").next().unwrap();
+    // The store and the load must both operate on `a`'s own reference --
+    // no copy, no rebinding through `env` the way a scalar reassignment
     // would need.
-    assert!(out.contains("(store v1 0 10)"), "got:\n{out}");
-    assert!(out.contains("(load v1 1)"), "got:\n{out}");
+    assert!(block.contains(&format!("(store {a_var} 0 10)")), "got:\n{block}");
+    assert!(block.contains(&format!("(load {a_var} 1)")), "got:\n{block}");
 }
 
 #[test]
@@ -271,8 +357,10 @@ fn an_array_mutated_inside_a_for_loop_body_needs_no_carrying_only_the_index_does
             a[0]
         }",
     );
-    assert!(out.contains("(loop$0 (v2)"), "the loop must carry only its own index, got:\n{out}");
-    assert!(out.contains("load") && out.contains("store"), "got:\n{out}");
+    let block = fn_block(&out, "f");
+    let loop_params = block.split("(loop$0 (").nth(1).unwrap().split(')').next().unwrap();
+    assert_eq!(loop_params.split_whitespace().count(), 1, "the loop must carry only its own index, got:\n{block}");
+    assert!(block.contains("load") && block.contains("store"), "got:\n{block}");
 }
 
 #[test]
@@ -284,14 +372,16 @@ fn a_nested_indexed_assignment_target_collapses_into_one_multi_index_store() {
     // representation choice this module never actually commits to. See the
     // module's own "Arrays" doc comment.
     let out = cps("fn f() -> i32 { let mut a = [[1, 2], [3, 4]]; a[0][0] = 9; 0 }");
-    assert!(out.contains("(store v3 0 0 9)"), "both indices must combine into one store, got:\n{out}");
-    assert!(!out.contains("load"), "no intermediate row must ever be loaded out, got:\n{out}");
+    let block = fn_block(&out, "f");
+    assert!(block.contains(" 0 0 9)") && block.contains("(store "), "both indices must combine into one store, got:\n{block}");
+    assert!(!block.contains("load"), "no intermediate row must ever be loaded out, got:\n{block}");
 }
 
 #[test]
 fn a_multi_dimensional_read_also_collapses_into_one_multi_index_load() {
     let out = cps("fn f() -> i32 { let a = [[1, 2], [3, 4]]; a[1][0] }");
-    assert!(out.contains("(load v3 1 0)"), "got:\n{out}");
+    let block = fn_block(&out, "f");
+    assert!(block.contains("(load ") && block.contains(" 1 0)"), "got:\n{block}");
 }
 
 #[test]

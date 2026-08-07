@@ -1,3 +1,5 @@
+use io;
+
 struct Complex<T : Float> {
     real: T,
     imag: T,
@@ -18,4 +20,8 @@ fn main() {
     let z1 = Complex(real: 1.0, imag: 0.0);
     let z2 = Complex(real: 0.0, imag: 1.0);
     let zr = (z1 + z2) * (z1 - z2);
+    print(zr.real);
+    print(zr.imag);
+
+    0
 }

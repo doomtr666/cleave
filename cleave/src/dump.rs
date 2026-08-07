@@ -339,7 +339,7 @@ fn fmt_expr_typed(e: &Expr, node_types: &NodeTypes, names: &mut TyVarNames, call
         ExprKind::ImaginaryLit { text, .. } => format!("{text}i"),
         ExprKind::BoolLit(b) => b.to_string(),
         ExprKind::Path(p) => p.segments.join("::"),
-        ExprKind::Call(path, generics, args) => {
+        ExprKind::Call(path, generics, args, ..) => {
             // A specialization's own mangled name (`identity<i32>`), when
             // this specific call node has one (see `call_names`'s own doc
             // comment) — the *original* callee path otherwise, exactly as

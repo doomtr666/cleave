@@ -1,0 +1,21 @@
+// One `print` per numeric width, dispatched the same way `Ring`/`Ord` are
+// (`stdlib/num/num.cleave`) -- a caller just writes `print(x)`, and which
+// concrete impl (hence which real C symbol) gets called falls out of `x`'s
+// own type, same as `+`/`<` already do. `extern(...)`'s own parenthesized
+// override is what makes this possible: every impl here shares the *same*
+// cleave-level method name (`print`), but each needs to bind a genuinely
+// different backing symbol -- `print_i32`, `print_i64`, ... -- since a bare
+// `extern fn print(...)` (no override, symbol == name) could only ever mean
+// one of them. Each real symbol is a `cleave-rt` function, prints its
+// argument's decimal form plus a newline, and returns it unchanged (see
+// `cleave-rt/src/lib.rs`).
+algebra Print<T> {
+    fn print(x: T) -> T;
+}
+
+impl Print<i8> { extern(print_i8) fn print(x: i8) -> i8; }
+impl Print<i16> { extern(print_i16) fn print(x: i16) -> i16; }
+impl Print<i32> { extern(print_i32) fn print(x: i32) -> i32; }
+impl Print<i64> { extern(print_i64) fn print(x: i64) -> i64; }
+impl Print<f32> { extern(print_f32) fn print(x: f32) -> f32; }
+impl Print<f64> { extern(print_f64) fn print(x: f64) -> f64; }
