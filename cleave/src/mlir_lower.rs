@@ -765,6 +765,10 @@ fn lower_prim_op<'c>(
         }
         PrimOp::Struct(_, field_names) => Some(lower_struct_construct(ctx, block, env, ty, field_names, args)),
         PrimOp::Field { struct_ty, field } => Some(lower_field_access(ctx, block, env, struct_ty, field, args)),
+        PrimOp::FieldStore { struct_ty, field } => {
+            lower_field_store(ctx, block, env, struct_ty, field, args);
+            None
+        }
     }
 }
 
@@ -965,19 +969,70 @@ fn lower_struct_construct<'c>(
             .unwrap_or_else(|| panic!("MLIR lowering: struct `{name}` has no field `{field_name}`"));
         let (_, field_ty) = &field_types[position];
         let field_ptr = gep(ctx, block, ptr, &[0, position as i64], struct_llvm_ty);
-        if is_array_ty(field_ty) {
-            let src = lower_nested_array_arg(env, arg);
-            let (dims, _) = flatten_array_dims(field_ty);
-            let field_llvm_ty = ty_to_llvm_field_type(ctx, field_ty);
-            copy_memref_into_llvm_field(ctx, block, src, &dims, field_ptr, field_llvm_ty);
-        } else {
-            let field_mlir_ty = ty_to_mlir(ctx, field_ty);
-            let value = lower_cval(ctx.context, block, env, arg, field_mlir_ty);
-            let location = Location::unknown(ctx.context);
-            block.append_operation(llvm::store(ctx.context, value, field_ptr, location, LoadStoreOptions::new()));
-        }
+        store_field(ctx, block, env, field_ty, field_ptr, arg);
     }
     ptr
+}
+
+/// Stores `arg` into a field addressed by `field_ptr` (`field_ty` its own
+/// concrete type) — shared by struct construction (`lower_struct_construct`,
+/// one call per field) and direct field-mutation assignment
+/// (`lower_field_store`, `s.field = v`). An array-typed field is copied
+/// element-by-element from its already-built (standalone, `memref`-backed)
+/// source value into the struct's own *embedded* `!llvm.array` slot
+/// (`copy_memref_into_llvm_field`) — see `struct_llvm_type`'s own doc
+/// comment for why a `memref` can't be an `!llvm.struct` field directly, so
+/// it's never stored as a bare reference.
+fn store_field<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    field_ty: &Ty,
+    field_ptr: Value<'c, 'c>,
+    arg: &CVal,
+) {
+    if is_array_ty(field_ty) {
+        let src = lower_nested_array_arg(env, arg);
+        let (dims, _) = flatten_array_dims(field_ty);
+        let field_llvm_ty = ty_to_llvm_field_type(ctx, field_ty);
+        copy_memref_into_llvm_field(ctx, block, src, &dims, field_ptr, field_llvm_ty);
+    } else {
+        let field_mlir_ty = ty_to_mlir(ctx, field_ty);
+        let value = lower_cval(ctx.context, block, env, arg, field_mlir_ty);
+        let location = Location::unknown(ctx.context);
+        block.append_operation(llvm::store(ctx.context, value, field_ptr, location, LoadStoreOptions::new()));
+    }
+}
+
+/// `PrimOp::FieldStore { struct_ty, field }`, `args = [base, value]` — a
+/// direct field-mutation assignment (`s.field = v`), mirroring `PrimOp::
+/// Store`'s own "real effect, bound result unit and never read" shape for
+/// arrays (see `lower_array_store`'s own doc comment): the struct's own
+/// identity never changes, only the one field's own storage, addressed via
+/// the exact same GEP `lower_struct_construct`/`lower_field_access` already
+/// use.
+fn lower_field_store<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    struct_ty: &Ty,
+    field: &str,
+    args: &[CVal],
+) {
+    let CVal::Var(base_var) = &args[0] else {
+        panic!("MLIR lowering: field mutation's own base operand must be a variable");
+    };
+    let base_val = *env.get(base_var).unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{base_var}"));
+    let (name, type_args) = struct_name_and_args(struct_ty);
+    let field_types = struct_field_types(ctx, name, type_args);
+    let position = field_types
+        .iter()
+        .position(|(n, _)| n == field)
+        .unwrap_or_else(|| panic!("MLIR lowering: struct `{name}` has no field `{field}`"));
+    let (_, field_ty) = &field_types[position];
+    let struct_llvm_ty = struct_llvm_type(ctx, name, type_args);
+    let field_ptr = gep(ctx, block, base_val, &[0, position as i64], struct_llvm_ty);
+    store_field(ctx, block, env, field_ty, field_ptr, &args[1]);
 }
 
 /// `PrimOp::Field { struct_ty, field }`, `args = [base]` — `struct_ty` is

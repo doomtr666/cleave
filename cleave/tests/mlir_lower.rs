@@ -475,11 +475,7 @@ fn a_struct_literal_lowers_to_a_heap_alloc_plus_field_gep_and_stores() {
 /// The real end-to-end proof for scalar fields: construction (`llvm.
 /// alloca`-via-`cleave_alloc` + `llvm.store` per field) followed by field
 /// reads (`llvm.getelementptr` + `llvm.load`) round-trips the exact values
-/// written -- `12` (`5+7`), not a coincidental default. (Direct field-
-/// mutation assignment, `p.a = 10`, is a separate, not-yet-implemented
-/// feature -- `cps.rs` itself panics clearly on it, "CPS Stage 5 doesn't
-/// support a field-mutation assignment target yet" -- so this only proves
-/// the construct/read path, the one every example actually needs.)
+/// written -- `12` (`5+7`), not a coincidental default.
 #[test]
 fn a_struct_literal_construction_and_field_read_computes_the_right_value() {
     let context = context();
@@ -487,6 +483,25 @@ fn a_struct_literal_construction_and_field_read_computes_the_right_value() {
         struct Pair { a: i32, b: i32 }
         fn main() -> i32 {
             let p = Pair(a: 5, b: 7);
+            p.a + p.b
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 12);
+}
+
+/// Direct field-mutation assignment (`p.a = 10`, `PrimOp::FieldStore`) --
+/// mirrors `an_array_literal_write_then_read_computes_the_right_value`'s own
+/// shape for arrays: a real effect through the struct's own stable pointer,
+/// visible on a later read through the *same* reference -- `12` (`10+2`),
+/// not `3` (`1+2`), so a silent copy-instead-of-mutate bug wouldn't pass.
+#[test]
+fn a_struct_field_mutation_write_then_read_computes_the_right_value() {
+    let context = context();
+    let src = "
+        struct Pair { a: i32, b: i32 }
+        fn main() -> i32 {
+            let mut p = Pair(a: 1, b: 2);
+            p.a = 10;
             p.a + p.b
         }
     ";

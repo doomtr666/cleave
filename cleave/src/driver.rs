@@ -112,8 +112,12 @@ impl FileIdGen {
 /// environment where the stdlib isn't shipped) — but one that's found and
 /// genuinely broken (a real parse/merge error) still surfaces normally,
 /// same as any other crate; "missing" and "broken" are different problems.
-/// More names join this list as more of the stdlib gets built.
-const PRELUDE_CRATES: &[&str] = &["num"];
+/// More names join this list as more of the stdlib gets built. `logic`
+/// (`and`/`or`/`xor`/`implies`/`not` on `bool`) joined for the identical
+/// reason `num` did: `if a and b { ... }` should just work, the same as
+/// `a + b` does, not require an explicit `use logic;` for something this
+/// basic.
+const PRELUDE_CRATES: &[&str] = &["num", "logic"];
 
 /// Finds a directory literally named `name` among `search_paths`, in order —
 /// "project root(s), then the shipped stdlib" per `grammar.md`. First match

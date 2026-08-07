@@ -87,12 +87,14 @@ Same rule applies to `if`/`while`/loop bodies (each arm is its own `block`) and 
 
 **The set of operator symbols is fixed and closed — not user-extensible.** What's open is which types support them (via algebra `impl`s), never new symbols/fixity/precedence (avoiding the complexity Haskell/Scala's user-definable operator precedence is known for).
 
-**Minimal operator table** (3 precedence levels, standard mathematical convention, left-associative except noted):
+**Minimal operator table**, low to high precedence, left-associative except noted (superseded the earlier, narrower 4-level sketch below once `and`/`or`/`xor`/`implies`/`not` were actually implemented — kept in sync with `grammar.pest`'s own precedence comment):
 
-1. unary `-`
-2. `*`, `/`
-3. `+`, `-`
-4. comparisons (lowest): `<`, `<=`, `>`, `>=`, `==`, `!=`
+1. `implies` (lowest — `a and b implies c or d` reads as `(a and b) implies (c or d)`)
+2. `and`, `or`, `xor`
+3. comparisons: `<`, `<=`, `>`, `>=`, `==`, `!=`
+4. `+`, `-`
+5. `*`, `/`
+6. unary `-`, unary `not` (highest, tightest-binding prefix operators)
 
 **Explicitly *not* given operator syntax — named functions instead:**
 - Bitwise ops (`bitand`, `bitor`, `bitxor`, `bitnot`, `shl`, `shr`) — rare in numerical/HPC code, no reason to spend a precedence level on them. Also sidesteps C's infamous `&`/`|` vs. `==` precedence trap entirely, since there's no bitwise *symbol* to collide with anything.
@@ -100,9 +102,11 @@ Same rule applies to `if`/`while`/loop bodies (each arm is its own `block`) and 
 - Modulo — named function, not an operator; **naming needs care**: `mod` and `rem` differ in behavior on negative operands (mathematical modulo vs. truncated-division remainder) and must be named/distinguished explicitly, not collapsed into one arbitrarily-chosen name.
 - `++`/`--` (prefix or postfix), rejected entirely, not deferred. Not a clean case of "sugar for a pure function call" at all — it's a mutation-with-embedded-read baked into an expression, position-dependent in meaning, and a well-documented source of unsequenced-behavior bugs (`a[i++] = a[++i]`-style). Saves a few characters against `x = x + 1` at a real, recurring cognitive cost. `x = x + 1` (or a future `+=`) covers the same need with no ambiguity.
 
-**Logical `and` / `or` / `xor`: plain, strict Bool-algebra functions, not special forms.** No short-circuit evaluation, no desugaring to `if` (an earlier, more elaborate proposal — desugar to `if` to get lazy evaluation for free from CPS — was considered and superseded by this simpler one). Both operands are always evaluated, exactly like `add`/`bitand`/any other algebra call — zero special-casing anywhere in the compiler. This is a genuine, deliberate divergence from `&&`/`||` in most mainstream languages, and must be documented clearly as such. If short-circuit/lazy evaluation is genuinely needed (e.g. guarding against evaluating an operand that would error), write the `if` explicitly — the laziness becomes visible in the code rather than hidden behind an innocuous-looking `and`. Judged to cost little in practice for numerically-oriented code, where `and`/`or` mostly combine side-effect-free comparisons.
+**Logical `and` / `or` / `xor` / `implies` / `not`: plain, strict Bool-algebra functions, not special forms.** No short-circuit evaluation, no desugaring to `if` (an earlier, more elaborate proposal — desugar to `if` to get lazy evaluation for free from CPS — was considered and superseded by this simpler one). Both operands (or the one operand, for `not`) are always evaluated, exactly like `add`/`bitand`/any other algebra call — zero special-casing anywhere in the compiler; `not`'s own unary-prefix position is the *only* special-casing, mirroring unary `-`, not a semantic exception. This is a genuine, deliberate divergence from `&&`/`||`/`!` in most mainstream languages, and must be documented clearly as such. If short-circuit/lazy evaluation is genuinely needed (e.g. guarding against evaluating an operand that would error), write the `if` explicitly — the laziness becomes visible in the code rather than hidden behind an innocuous-looking `and`. Judged to cost little in practice for numerically-oriented code, where `and`/`or` mostly combine side-effect-free comparisons.
 
-Written in words (`and`/`or`, not `&&`/`||`), matching Python — familiar to the target audience, and avoids any visual confusion with bitwise symbols (moot anyway since bitwise ops aren't operators here at all).
+Written in words (`and`/`or`/`not`, not `&&`/`||`/`!`), matching Python — familiar to the target audience, and avoids any visual confusion with bitwise symbols (moot anyway since bitwise ops aren't operators here at all). Implemented as ordinary `algebra Logic<T> { ... }` + `impl Logic<bool> { ... }` in the prelude (`stdlib/logic/logic.cleave`), the identical mechanism `stdlib/num/num.cleave` uses for arithmetic/comparison — no different in kind, just a different algebra.
+
+**A real parser pitfall found while implementing `not`, worth recording:** a bare-word keyword token (`"not"`, `"and"`, ...) written as a plain Pest string literal matches as a *prefix* of a longer identifier too (`not_a` parses as the keyword `not` applied to `_a`, silently truncating the intended variable name) unless guarded by a word-boundary lookahead (`"not" ~ !XID_CONTINUE`) — and that guard itself has to be wrapped in an atomic (`@{...}`) rule, since Pest's own implicit whitespace-skipping otherwise runs *before* the lookahead too, checking the character after any following whitespace instead of the one immediately after the keyword (`and 3` would wrongly fail the guard by checking `3`, which — being a digit — *is* itself a valid identifier-continuation character). `grammar.pest`'s `unary_op`/`logical_op`/`implies_op` all carry this guard now; the broader "no reserved-word list at all" gap noted above (keywords still usable as ordinary identifiers *outside* their own operator position) is unrelated and still open.
 
 ## Structs implement algebras, à la Rust
 

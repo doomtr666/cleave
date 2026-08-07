@@ -1,0 +1,32 @@
+// Boolean logic — `and`/`or`/`xor`/`implies`/`not` all desugar to plain
+// calls (`grammar.pest`'s own `logical_op`/`implies_op`/`unary_op` rules,
+// `lower.rs`'s own desugaring), resolved by algebra dispatch exactly like
+// `+`/`<` are — nothing about them is built into the language beyond the
+// surface syntax and its desugared call name. This is the base-case `impl`
+// that actually backs them for `bool`, the same role `stdlib/num/num.cleave`
+// plays for arithmetic/comparison. In the prelude (`driver.rs::PRELUDE_
+// CRATES`) for the same reason `num` is: `if a and b { ... }` should just
+// work without an explicit `use`, the same as `a + b`.
+algebra Logic<T> {
+    fn and(a: T, b: T) -> T;
+    fn or(a: T, b: T) -> T;
+    fn xor(a: T, b: T) -> T;
+    fn implies(a: T, b: T) -> T;
+    fn not(a: T) -> T;
+}
+
+// `and`/`or`/`xor` map straight onto `i1`'s own bitwise ops -- `bool` is
+// already exactly one bit wide, no truthiness coercion involved. `implies`
+// is the standard propositional identity `a implies b == not(a) or b`; MLIR's
+// `arith` dialect has no dedicated `not`, so it's built from the same
+// identity `not(a) == a xor true` used for `not` itself below.
+impl Logic<bool> {
+    fn and(a: bool, b: bool) -> bool { mlir::arith::andi(a, b) }
+    fn or(a: bool, b: bool) -> bool { mlir::arith::ori(a, b) }
+    fn xor(a: bool, b: bool) -> bool { mlir::arith::xori(a, b) }
+    fn implies(a: bool, b: bool) -> bool {
+        let not_a: bool = mlir::arith::xori(a, true);
+        mlir::arith::ori(not_a, b)
+    }
+    fn not(a: bool) -> bool { mlir::arith::xori(a, true) }
+}

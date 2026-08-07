@@ -520,10 +520,14 @@ impl Lowerer {
         let mut inner = pair.into_inner();
         let first = inner.next().unwrap();
         match first.as_rule() {
-            Rule::unary => {
-                // "-" ~ unary — the "-" itself is a bare token, not a pair.
-                let operand = self.lower_unary(first);
-                self.wrap(span, ExprKind::Call(Path::single("neg"), Vec::new(), vec![operand], Vec::new()))
+            Rule::unary_op => {
+                let call_name = match first.as_str() {
+                    "-" => "neg",
+                    "not" => "not",
+                    op => unreachable!("unary_op: unexpected operator {op:?}"),
+                };
+                let operand = self.lower_unary(inner.next().unwrap());
+                self.wrap(span, ExprKind::Call(Path::single(call_name), Vec::new(), vec![operand], Vec::new()))
             }
             Rule::postfix => self.lower_postfix(first),
             r => unreachable!("unary: unexpected rule {r:?}"),

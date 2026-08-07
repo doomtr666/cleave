@@ -349,6 +349,13 @@ pub enum PrimOp {
     /// applies here — recovering it from the base's already-lowered MLIR
     /// `Value` alone isn't possible.
     Field { struct_ty: Ty, field: String },
+    /// `args = [base, value]` — a real effect, mutating `base`'s own field
+    /// in place (a struct is a stable reference, see `mlir_lower.rs::
+    /// struct_llvm_type`'s own doc comment); its own bound result is unit
+    /// and never read, same shape as `Store`'s own doc comment for arrays.
+    /// `struct_ty`/`field` — see `Field`'s own doc comment for why the
+    /// base's own concrete type has to be carried explicitly.
+    FieldStore { struct_ty: Ty, field: String },
     Struct(String, Vec<String>),
     /// `args` are the element values, in order (`ExprKind::ArrayLit`).
     Array,
@@ -612,8 +619,26 @@ fn convert_stmts(stmts: &[Stmt], env: CEnv, ctx: &Ctx, k: &dyn Fn(CEnv) -> CExpr
                     })
                 })
             }
-            ExprKind::FieldAccess(..) => {
-                panic!("CPS Stage 5 doesn't support a field-mutation assignment target (`s.x = v`) yet -- see the module's own \"Arrays\" doc comment (doc/backlog.md)")
+            // A struct is a stable reference mutated in place, same as an
+            // array (see the module's own "Arrays" doc comment) — a field
+            // write is a real effect through the base's own existing
+            // pointer, not a functional update, so this needs no join/
+            // carried-state threading at all, mirroring `Index`'s own arm
+            // just above.
+            ExprKind::FieldAccess(base, field) => {
+                let struct_ty = ctx.node_types[&base.id].clone();
+                convert_expr(base, &env, ctx, &|base_val, env| {
+                    convert_expr(value, env, ctx, &|new_val, env| {
+                        let var = ctx.fresh.var();
+                        CExpr::LetPrim {
+                            var,
+                            ty: Ty::Con("()".to_string()),
+                            op: PrimOp::FieldStore { struct_ty: struct_ty.clone(), field: field.clone() },
+                            args: vec![base_val.clone(), new_val],
+                            cont: Box::new(convert_stmts(rest, env.clone(), ctx, k)),
+                        }
+                    })
+                })
             }
             other => panic!("CPS: unexpected assignment target {other:?}"),
         },
@@ -1228,6 +1253,7 @@ fn dump_cexpr(out: &mut String, expr: &CExpr, depth: usize) {
             indent(out, depth);
             let op_str = match op {
                 PrimOp::Field { field, .. } => format!("field.{field}"),
+                PrimOp::FieldStore { field, .. } => format!("field-store.{field}"),
                 PrimOp::Struct(name, fields) => format!("struct.{name}[{}]", fields.join(",")),
                 PrimOp::Array => "array".to_string(),
                 PrimOp::ArrayRepeat => "array-repeat".to_string(),

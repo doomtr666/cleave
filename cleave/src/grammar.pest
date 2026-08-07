@@ -194,10 +194,24 @@ expr = { implication }
 // standard propositional-logic precedence: implication binds looser than and/or/xor
 // (`a and b implies c or d` reads as `(a and b) implies (c or d)`).
 implication = { logical ~ (implies_op ~ logical)* }
-implies_op  = { "implies" }
+// `!XID_CONTINUE` is a word-boundary guard: without it, a bare-word keyword
+// literal like "implies" also matches as the *prefix* of a longer identifier
+// (`impliesX`, or "not" against "not_a" -- found by direct testing once
+// `unary_op` gained "not", below), silently truncating it and leaving the
+// remainder to parse as a nonsensical, unbound expression. Marked atomic
+// (`@`) — otherwise this rule's own implicit whitespace-skipping runs
+// *before* the lookahead too, checking the character after any following
+// whitespace instead of the one immediately after the keyword (`and 3` would
+// check `!XID_CONTINUE` against `3`, not against the space — and a leading
+// digit *is* itself a valid `XID_CONTINUE` character, so the guard would
+// wrongly fail on the extremely common "keyword followed by a space then a
+// number" case — found by direct testing). Applied to every bare-word
+// keyword in this file's own expression grammar, not just the ones that
+// happened to get hit.
+implies_op = @{ "implies" ~ !XID_CONTINUE }
 
 logical    = { comparison ~ (logical_op ~ comparison)* }
-logical_op = { "and" | "or" | "xor" }
+logical_op = @{ ("and" | "or" | "xor") ~ !XID_CONTINUE }
 
 comparison = { additive ~ (comp_op ~ additive)* }
 comp_op    = { "<=" | ">=" | "==" | "!=" | "<" | ">" }
@@ -208,7 +222,8 @@ add_op   = { "+" | "-" }
 multiplicative = { unary ~ (mul_op ~ unary)* }
 mul_op         = { "*" | "/" }
 
-unary = { "-" ~ unary | postfix }
+unary    = { unary_op ~ unary | postfix }
+unary_op = @{ "-" | ("not" ~ !XID_CONTINUE) }
 
 postfix     = { primary ~ postfix_op* }
 // `a[i, j]` — Fortran-style sugar for nested indexing `a[i][j]`, same desugaring principle

@@ -66,15 +66,18 @@ cleave should follow Rust's approach: "light" (register/SIMD-lane-friendly, e.g.
 
 Every extensibility argument above has an implicit asymmetry left in it: `i32`/`f32` and their operations have, so far, been described as hardcoded into the Rust compiler (fold function, MLIR lowering written by hand), while a community algebra (SPH, a custom `Ring`) goes through the plugin mechanism, declared in cleave source. This is exactly the kind of special-casing this design has eliminated everywhere else (a function body is just a definitional axiom, not a separate mechanism; inlining is just an equality; autodiff is just more axioms) — except this one was never actually closed.
 
-**Resolution:** primitive types are declared as `algebra`s too, in cleave source, using the identical mechanism as any community contribution. Since `i32.add` can't be defined via expansion into something more primitive — it *is* the bottom of the stack — the "MLIR lowering" a plugin can supply (point 4 above) needs a concrete, language-level form: a thin intrinsic that says "this operation *is* this specific MLIR op," expressible directly in cleave source rather than only as hand-written Rust compiler code:
+**Resolution:** primitive types are declared as `algebra`s too, in cleave source, using the identical mechanism as any community contribution. Since `i32.add` can't be defined via expansion into something more primitive — it *is* the bottom of the stack — the "MLIR lowering" a plugin can supply (point 4 above) needs a concrete, language-level form: a thin intrinsic that says "this operation *is* this specific MLIR op," expressible directly in cleave source rather than only as hand-written Rust compiler code. **Implemented and shipping** (`stdlib/num/num.cleave`, `cleave/src/mlir_lower.rs::lower_raw_mlir_op`) — not via a bodyless attribute as first sketched, but as a real function body whose only content is a reserved `mlir::dialect::op(...)` call, recognized structurally by its path's own first segment rather than algebra-dispatched:
 
 ```
-algebra Int32 {
-    #[mlir_lower = "arith.addi"]
-    fn add(a: i32, b: i32) -> i32;
-    axiom assoc_add(a,b,c): add(add(a,b),c) == add(a,add(b,c));
+algebra Ring<T> {
+    fn add(a: T, b: T) -> T;
+}
+impl Ring<i32> {
+    fn add(a: i32, b: i32) -> i32 { mlir::arith::addi(a, b) }
 }
 ```
+
+A real, ordinary function body (not a special bodyless-method form) is what lets a *composite* intrinsic — one whose meaning needs more than a single MLIR op, `abs` built from `subi`+`cmpi`+`select`, say — fall out for free: it's just an ordinary `let`-chain body, each step its own `mlir::...` call, no new sequencing mechanism needed beyond the one leaf-level call form. A static attribute an op needs beyond its bare operands (`arith.cmpi`'s own `predicate`) is a named call-argument whose value is a string literal, carrying the attribute's raw MLIR text verbatim (`mlir::arith::cmpi(a, b, predicate: "2 : i64")`) — scoped to only this one syntactic slot, not a general string type (which would eventually desugar to `i8[]`, kept entirely separate). Type lowering gets the same treatment one level up: `#[mlir_type("i32")]` on the relevant marker `impl` declares a primitive type's own MLIR representation, so `ty_to_mlir` has no per-type-name Rust match left either, beyond `bool` (a genuine structural special case, matching `infer.rs`'s own treatment of it for `if`/`while` conditions).
 
 **Why this matters, concretely:**
 - The Rust compiler's actual hardcoded core shrinks to: the parser, the generic e-graph/algebra-processing engine, and *one* generic "emit this named MLIR op" primitive. Everything else — the entire standard numeric library (`i32`, `f32`, `Complex`, `Ring`, tensors, all of it) — is written *in cleave itself*, as algebra declarations, no different in kind from a community-contributed SPH algebra.

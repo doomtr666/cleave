@@ -384,10 +384,14 @@ fn a_multi_dimensional_read_also_collapses_into_one_multi_index_load() {
     assert!(block.contains("(load ") && block.contains(" 1 0)"), "got:\n{block}");
 }
 
+/// A direct field-mutation assignment (`v.x = 5.0`) converts to a single
+/// `PrimOp::FieldStore` — a real effect through `v`'s own existing pointer
+/// (a struct is a stable reference, mutated in place, same as an array —
+/// see `cps.rs`'s own "Arrays" doc comment), not a functional rebuild of
+/// `v` itself, so no join/carried-state threading is involved.
 #[test]
-#[should_panic(expected = "field-mutation assignment")]
-fn a_field_mutation_assignment_target_is_explicitly_rejected_not_silently_wrong() {
-    cps(
+fn a_field_mutation_assignment_converts_to_one_field_store() {
+    let out = cps(
         "struct Vec2 { x: f64, y: f64 }
          fn f() -> f64 {
             let mut v = Vec2(x: 1.0, y: 2.0);
@@ -395,6 +399,8 @@ fn a_field_mutation_assignment_target_is_explicitly_rejected_not_silently_wrong(
             v.x
          }",
     );
+    let block = fn_block(&out, "f");
+    assert!(block.contains("field-store.x"), "got:\n{block}");
 }
 
 #[test]
