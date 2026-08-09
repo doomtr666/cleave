@@ -1,0 +1,11 @@
+use io;
+
+fn helper(x: i32) -> i32 {
+    let y = 10;
+    10 + x - y
+}
+
+fn main() -> i32 {
+    print(helper(21));
+    0
+}

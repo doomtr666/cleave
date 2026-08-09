@@ -19,6 +19,7 @@ use cleave::cps::{collect_mlir_types, collect_struct_schemas, collect_units, con
 use cleave::diag::SourceMap;
 use cleave::driver::compile;
 use cleave::dump::dump_program;
+use cleave::egraph::optimize_program;
 use cleave::mlir_lower::lower_program;
 use cleave::monomorphize::dump_monomorphized;
 use cleave::print::print_program;
@@ -37,6 +38,8 @@ struct Args {
     dump_inference_pass: bool,
     dump_monomorphized: bool,
     dump_cps: bool,
+    dump_cps_optimized: bool,
+    dump_cps_equivalences: bool,
     dump_mlir: bool,
     run: bool,
 }
@@ -47,6 +50,8 @@ fn parse_args() -> Result<Args, String> {
     let mut dump_inference_pass = false;
     let mut dump_monomorphized = false;
     let mut dump_cps = false;
+    let mut dump_cps_optimized = false;
+    let mut dump_cps_equivalences = false;
     let mut dump_mlir = false;
     let mut run = false;
 
@@ -56,6 +61,8 @@ fn parse_args() -> Result<Args, String> {
             "--dump-inference-pass" => dump_inference_pass = true,
             "--dump-monomorphized" => dump_monomorphized = true,
             "--dump-cps" => dump_cps = true,
+            "--dump-cps-optimized" => dump_cps_optimized = true,
+            "--dump-cps-equivalences" => dump_cps_equivalences = true,
             "--dump-mlir" => dump_mlir = true,
             "--run" => run = true,
             other if other.starts_with("--") => return Err(format!("unknown flag {other:?}")),
@@ -67,14 +74,33 @@ fn parse_args() -> Result<Args, String> {
     // No `--dump-*`/`--run` flag at all defaults to today's one real pass,
     // so the common case (`cleave file.cleave`) stays exactly as terse as
     // before these flags existed.
-    if !dump_ast && !dump_inference_pass && !dump_monomorphized && !dump_cps && !dump_mlir && !run {
+    if !dump_ast
+        && !dump_inference_pass
+        && !dump_monomorphized
+        && !dump_cps
+        && !dump_cps_optimized
+        && !dump_cps_equivalences
+        && !dump_mlir
+        && !run
+    {
         dump_inference_pass = true;
     }
 
     match path {
-        Some(path) => Ok(Args { path, dump_ast, dump_inference_pass, dump_monomorphized, dump_cps, dump_mlir, run }),
+        Some(path) => Ok(Args {
+            path,
+            dump_ast,
+            dump_inference_pass,
+            dump_monomorphized,
+            dump_cps,
+            dump_cps_optimized,
+            dump_cps_equivalences,
+            dump_mlir,
+            run,
+        }),
         None => Err(
-            "usage: cleave <file.cleave> [--dump-ast] [--dump-inference-pass] [--dump-monomorphized] [--dump-cps] [--dump-mlir] [--run]"
+            "usage: cleave <file.cleave> [--dump-ast] [--dump-inference-pass] [--dump-monomorphized] [--dump-cps] \
+             [--dump-cps-optimized] [--dump-cps-equivalences] [--dump-mlir] [--run]"
                 .to_string(),
         ),
     }
@@ -127,10 +153,18 @@ fn main() -> ExitCode {
     // Only header-separate stages when more than one is being dumped at
     // once — no point labeling the single thing being shown in the common,
     // single-flag (or no-flag) case.
-    let flags_set = [args.dump_ast, args.dump_inference_pass, args.dump_monomorphized, args.dump_cps, args.dump_mlir]
-        .iter()
-        .filter(|b| **b)
-        .count();
+    let flags_set = [
+        args.dump_ast,
+        args.dump_inference_pass,
+        args.dump_monomorphized,
+        args.dump_cps,
+        args.dump_cps_optimized,
+        args.dump_cps_equivalences,
+        args.dump_mlir,
+    ]
+    .iter()
+    .filter(|b| **b)
+    .count();
     let multiple = flags_set > 1;
     let mut exit = ExitCode::SUCCESS;
 
@@ -190,6 +224,44 @@ fn main() -> ExitCode {
         }
     }
 
+    if args.dump_cps_optimized {
+        if multiple {
+            println!("--- cps (optimized) ---\n");
+        }
+        let registry = Registry::build(&program);
+        if let Err(diags) = check_type_errors(&program, &registry) {
+            report(&diags, &sources);
+            exit = ExitCode::FAILURE;
+        } else {
+            let units = collect_units(&program, &registry);
+            let cps_program = convert_program(units);
+            let (optimized, _) = optimize_program(cps_program, &registry);
+            print!("{}", dump_cps_program(&optimized));
+        }
+    }
+
+    if args.dump_cps_equivalences {
+        if multiple {
+            println!("--- cps equivalences ---\n");
+        }
+        let registry = Registry::build(&program);
+        if let Err(diags) = check_type_errors(&program, &registry) {
+            report(&diags, &sources);
+            exit = ExitCode::FAILURE;
+        } else {
+            let units = collect_units(&program, &registry);
+            let cps_program = convert_program(units);
+            let (_, explanations) = optimize_program(cps_program, &registry);
+            if explanations.is_empty() {
+                println!("(no axiom rewrites fired)");
+            } else {
+                for e in &explanations {
+                    println!("{e}");
+                }
+            }
+        }
+    }
+
     if args.dump_mlir {
         if multiple {
             println!("--- mlir ---\n");
@@ -201,6 +273,7 @@ fn main() -> ExitCode {
         } else {
             let units = collect_units(&program, &registry);
             let cps_program = convert_program(units);
+            let (cps_program, _) = optimize_program(cps_program, &registry);
 
             let dialect_registry = DialectRegistry::new();
             register_all_dialects(&dialect_registry);
@@ -237,6 +310,7 @@ fn main() -> ExitCode {
         }
         let units = collect_units(&program, &registry);
         let cps_program = convert_program(units);
+        let (cps_program, _) = optimize_program(cps_program, &registry);
 
         let dialect_registry = DialectRegistry::new();
         register_all_dialects(&dialect_registry);

@@ -38,7 +38,9 @@ fn add_one(x: i32) -> i32 { x + 1 }
 fn main() -> i32 { add_one(5) }
 ```
 
-`add_one(5)` → `6`. `a + b` is sugar for `add(a, b)`; `-a` is sugar for `neg(a)`; `a < b`/`a == b` are `lt(a, b)`/`eq(a, b)` — none of these are built into the language for any particular type. They resolve against a declared `algebra`, exactly like any other function call — see "Algebras: how operators actually work" below for the full mechanism. What makes this section short is that the resolution already exists for every primitive numeric width, shipped in the prelude (`stdlib/num/num.cleave`) — you only need to declare your own `impl` when you introduce a *new* type that should support these operators too (`Vec2`, later in this guide).
+`add_one(5)` → `6`. `a + b` is sugar for `add(a, b)`; `-a` is sugar for `neg(a)`; `a < b`/`a == b` are `lt(a, b)`/`eq(a, b)`; `a / b` is `div(a, b)` — none of these are built into the language for any particular type. They resolve against a declared `algebra`, exactly like any other function call — see "Algebras: how operators actually work" below for the full mechanism. What makes this section short is that the resolution already exists for every primitive numeric width, shipped in the prelude (`stdlib/num/num.cleave`) — you only need to declare your own `impl` when you introduce a *new* type that should support these operators too (`Vec2`, later in this guide).
+
+**Modulo/remainder and bitwise operators are deliberately named functions, not operators** (`doc/grammar.md`'s own explicit call — sidesteps burning a precedence level on rarely-used-in-HPC bitwise ops, and the classic C `&`/`|` vs. `==` precedence trap entirely): `rem(a, b)` (truncated remainder, sign follows `a`) and `mod(a, b)` (Euclidean/floored modulo, sign follows `b` — the two genuinely differ on a negative operand, `rem(-17, 5)` is `-2`, `mod(-17, 5)` is `3`) both need a real name each rather than one arbitrarily-chosen symbol; `bitand`/`bitor`/`bitxor`/`bitnot`/`shl`/`shr` (integer widths only, `shr` is the arithmetic/sign-extending right shift) the same way. Called like any ordinary function: `mod(i, 2)`, not `i % 2`.
 
 ## Bindings: `let` and `let mut`
 
@@ -223,17 +225,9 @@ The literal `struct` keyword right after `impl` matters — it's what tells the 
 
 There's no implicit `self` — `v.magnitude_sq()` calls `magnitude_sq` with `v` filling its **first** parameter, an ordinary explicit one. An unannotated first parameter defaults to the enclosing struct's own type, exactly like an algebra impl's own unannotated parameters default to what the algebra declares.
 
-**Real limitation, worth knowing about explicitly rather than hitting by surprise: `v.magnitude_sq()` (dot-call syntax) type-checks but can't be JIT-executed yet** — `cps.rs` has no conversion for it (`doc/backlog.md`). Until that lands, call the method as an ordinary top-level function instead — inherent methods don't gain a bare-name call form automatically either, so declare it as a plain `fn` if you need to actually *run* it:
+`v.magnitude_sq()` runs for real (dot-call syntax, JIT-executed, not just type-checked) — `v.magnitude_sq() == 5.0` for `Vec2(x: 1.0, y: 2.0)`. Works for a generic inherent impl too (`impl<T: Ring> struct Boxed<T> { ... }`), specialized once per concrete type actually reached, the same monomorphization discipline every other generic construct in this project already gets. Two things it does *not* do: an inherent method has no bare-name call form of its own — `magnitude_sq(v)` (not `v.magnitude_sq()`) doesn't resolve to it; declare a separate plain `fn` if you want that form too. And mutual recursion between sibling methods on the *same* impl block works (`w.dec().is_odd()` calling back into a sibling `is_even`) — a method calling into an inherent method on a *different* struct's own impl block, declared *after* it in the file, is untested.
 
-```
-struct Vec2 { x: f64, y: f64 }
-fn magnitude_sq(v: Vec2) -> f64 { v.x * v.x + v.y * v.y }
-fn main() -> i32 {
-    if magnitude_sq(Vec2(x: 1.0, y: 2.0)) == 5.0 { 1 } else { 0 }
-}
-```
-
-A second, separate limitation: an inherent method with no `->` return-type annotation is only usable, at its real inferred type, from *inside its own body* (a self-recursive call). Called from anywhere else, an unannotated inherent method's return type shows up as unresolved. Always write `-> T` on an inherent method whose result another function actually needs, exactly as `magnitude_sq` does above.
+**A real, separate limitation, worth knowing about explicitly rather than hitting by surprise:** an inherent method with no `->` return-type annotation is only usable, at its real inferred type, from *inside its own body* (a self-recursive call). Called from anywhere else, an unannotated inherent method's return type shows up as unresolved. Always write `-> T` on an inherent method whose result another function actually needs, exactly as `magnitude_sq` does above.
 
 ## Generics
 
@@ -383,7 +377,9 @@ fn main() -> i32 { g() }
 
 `(i32) -> i32` — parameter types in parentheses, then `->`, then the return type — is mandatory here (unlike an ordinary `fn`'s own optional return-type annotation): a bare type annotation has no function body nearby to infer a return type *from*.
 
-**This example type-checks but can't be JIT-executed yet** — closure conversion (extracting a lambda's own captures into an explicit record) isn't implemented, `cps.rs` panics on any `Lambda` node it reaches (`doc/backlog.md`). Higher-order functions over *named, top-level* functions aren't affected by this at all — only a lambda *literal* (`fn(x) { ... }`) hits it.
+Runs for real: `g()` returns `6`. Under the hood, a lambda never becomes a runtime value at all — `apply` itself gets specialized once per distinct callable actually passed to it (here, once for `inc`), the same "one concrete copy per instantiation actually reached" discipline monomorphization already applies to a generic `fn`, just keyed by *which callable* instead of *which type*. No runtime closure ABI, no indirect calls, ever — matching this project's own "everything the compiler can settle at compile time, it does" posture. A captured variable (`let base = 100; let f = fn(x) { x + base };`) becomes an explicit extra leading parameter on the lambda's own generated function, filled in with a snapshot of `base`'s value at the `let` itself (not a live reference — reassigning `base` afterward doesn't affect an already-built closure).
+
+A lambda used any other way than `let`-bound-then-called-by-name-or-passed-by-name isn't supported yet: a bare lambda literal passed directly as an argument (`apply(fn(x){x+1}, 5)`, no prior `let`), a lambda returned from a function, or one stored in a struct/array field, all panic cleanly rather than silently misconvert (`doc/backlog.md`).
 
 ## Type inference and defaulting, briefly
 

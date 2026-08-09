@@ -807,6 +807,22 @@ pub struct Infer<'r> {
     /// width information to still be available then, not just at the
     /// original declaration site.
     const_widths: HashMap<TyVar, Ty>,
+    /// Every `let`-bound lambda's own generalized `Scheme`, keyed by the
+    /// `Lambda` expression's own `NodeId` (not the `let`'s) — `node_types`
+    /// alone isn't enough for a lambda: `ExprKind::Lambda` is a syntactic
+    /// value (`is_syntactic_value`), so `let f = fn(x) { x + 1 };` gets
+    /// generalized exactly like a top-level generic `fn` (real Hindley-
+    /// Milner let-polymorphism), and each call site re-instantiates it fresh
+    /// (`infer_call`'s own `env.get(&name)` arm) — meaning the lambda body's
+    /// own `node_types` entries never get pinned to any one concrete type at
+    /// all, they stay unresolved `Ty::Var`s forever. A later pass
+    /// (`monomorphize.rs`) needs the *scheme itself* to reverse-derive each
+    /// concrete instantiation actually used, the same way it already does
+    /// for a generic top-level `fn` — this is what makes that possible.
+    /// Populated at the same `StmtKind::Let` site `node_types`/`env` already
+    /// are, re-resolved through `self.subst` at the same points `node_types`
+    /// is (see `finish_fn`/`infer_impl_fn_generic_with_env`).
+    pub lambda_schemes: HashMap<NodeId, Scheme>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -830,6 +846,7 @@ impl<'r> Infer<'r> {
             pending_type_name_checks: Vec::new(),
             in_progress_methods: HashMap::new(),
             const_widths: HashMap::new(),
+            lambda_schemes: HashMap::new(),
         }
     }
 
@@ -1549,6 +1566,7 @@ impl<'r> Infer<'r> {
         // node entry to match.
         let resolved_nodes: Vec<(NodeId, Ty)> = self.node_types.iter().map(|(id, t)| (*id, self.subst.apply(t))).collect();
         self.node_types = resolved_nodes.into_iter().collect();
+        self.resolve_lambda_schemes();
 
         let mut results = HashMap::new();
         for f in fns {
@@ -1613,6 +1631,7 @@ impl<'r> Infer<'r> {
         let resolved_nodes: Vec<(NodeId, Ty)> =
             self.node_types.iter().map(|(id, t)| (*id, self.subst.apply(t))).collect();
         self.node_types = resolved_nodes.into_iter().collect();
+        self.resolve_lambda_schemes();
 
         let final_result = self.subst.apply(&result);
 
@@ -1743,6 +1762,30 @@ impl<'r> Infer<'r> {
             self.const_widths.iter().filter(|(v, _)| var_set.contains(v)).map(|(v, t)| (*v, t.clone())).collect();
 
         Scheme { vars, constraints, ty, const_widths }
+    }
+
+    /// Re-resolves every `lambda_schemes` entry's own `ty`/`const_widths`
+    /// through the current `self.subst` — mirrors `node_types`'s own final
+    /// resolution sweep (see `finish_fn`/`infer_impl_fn_generic_with_env`)
+    /// and for the identical reason: `generalize` snapshots `self.subst` at
+    /// the moment a `let`-bound lambda is generalized, but a variable free
+    /// in the *enclosing* scope (kept monomorphic on purpose, so excluded
+    /// from `vars`) can still get pinned down further by unification later
+    /// in the same function body. `vars` themselves are never touched here
+    /// (`self.subst` has nothing to say about a variable that's already
+    /// been quantified away) — only the non-quantified remainder can move.
+    fn resolve_lambda_schemes(&mut self) {
+        let resolved: Vec<(NodeId, Scheme)> = self
+            .lambda_schemes
+            .iter()
+            .map(|(id, scheme)| {
+                let mut scheme = scheme.clone();
+                scheme.ty = self.subst.apply(&scheme.ty);
+                scheme.const_widths = scheme.const_widths.iter().map(|(v, t)| (*v, self.subst.apply(t))).collect();
+                (*id, scheme)
+            })
+            .collect();
+        self.lambda_schemes = resolved.into_iter().collect();
     }
 
     /// Every currently-pending constraint that shares at least one free
@@ -2388,6 +2431,9 @@ impl<'r> Infer<'r> {
                     } else {
                         Scheme::mono(value_ty)
                     };
+                    if matches!(value.kind, ExprKind::Lambda { .. }) {
+                        self.lambda_schemes.insert(value.id, scheme.clone());
+                    }
                     env.insert(name.clone(), scheme);
                 }
                 StmtKind::Assign { target, value } => {

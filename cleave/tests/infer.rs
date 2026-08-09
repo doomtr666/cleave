@@ -1428,15 +1428,15 @@ fn a_folded_literal_array_size_still_rejects_a_real_mismatch() {
 
 #[test]
 fn an_unsupported_operator_in_shape_position_stays_permissively_unconstrained() {
-    // `const_eval::eval_binop` only knows `add`/`mul` so far -- `4-3`
-    // (`sub`) must fall through to the existing "not evaluated" placeholder
-    // (same as any other not-yet-inferred array type) rather than crash or
-    // be treated as a hard parse/evaluation error. That placeholder can
-    // never be *exposed* in a function's own signature though (same rule
-    // any other still-unresolved type follows, `check_no_placeholder`) --
-    // this is what proves the fallback path was actually reached, not
-    // skipped some other way.
-    let f = lower_one_fn("fn f(a: [i32; 4-3]) -> [i32; 4-3] { a }");
+    // `const_eval::eval_binop` knows `add`/`mul`/`sub` now -- `4/3` (`div`)
+    // must fall through to the existing "not evaluated" placeholder (same
+    // as any other not-yet-inferred array type) rather than crash or be
+    // treated as a hard parse/evaluation error. That placeholder can never
+    // be *exposed* in a function's own signature though (same rule any
+    // other still-unresolved type follows, `check_no_placeholder`) -- this
+    // is what proves the fallback path was actually reached, not skipped
+    // some other way.
+    let f = lower_one_fn("fn f(a: [i32; 4/3]) -> [i32; 4/3] { a }");
     let registry = builtin_registry();
     let mut infer = Infer::new(&registry);
     let err = infer.infer_fn(&f).unwrap_err();

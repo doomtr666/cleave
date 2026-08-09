@@ -1,4 +1,4 @@
-use cleave::cps::{collect_units, convert_program, dump_cps_program};
+use cleave::cps::{ConcreteUnit, collect_units, convert_program, dump_cps_program};
 use cleave::driver::compile;
 use cleave::registry::Registry;
 
@@ -11,6 +11,16 @@ fn cps(src: &str) -> String {
     let units = collect_units(&program, &registry);
     let cps_program = convert_program(units);
     dump_cps_program(&cps_program)
+}
+
+/// Like `cps`, but returns the raw `ConcreteUnit`s themselves rather than
+/// the converted-and-dumped `CpsProgram` — for inspecting a unit's own
+/// fields directly (`origin`, etc.), not just its converted body's text.
+fn units(src: &str) -> Vec<ConcreteUnit> {
+    let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
+    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+    let registry = Registry::build(&program);
+    collect_units(&program, &registry)
 }
 
 /// Extracts just `(fn name (...) ...)`'s own printed block out of a full
@@ -41,6 +51,27 @@ fn fn_block<'a>(dump: &'a str, name: &str) -> &'a str {
         }
     }
     panic!("unbalanced parens looking for `(fn {name} (...)` in:\n{dump}");
+}
+
+/// Extracts the actual `loop$N`/`j$N`/`k$N` label CPS conversion happened
+/// to mint for this block's own `Fix` — like `fn_block`'s own doc comment
+/// says of CPS variable numbers, the label *number* itself was never
+/// semantically meaningful, only self-consistency was, so it's read fresh
+/// from the output here rather than hardcoded. A new stdlib algebra impl
+/// with its own `if`/loop (processed, alphabetically, before a lowercase-
+/// named user function like `f`/`main` — `convert_program`'s own `fresh`
+/// counter is shared across every unit) shifts every later unit's own
+/// starting label upward; a test asserting a literal `"loop$0"`/`"j$1"`
+/// would silently break the moment the stdlib grows, exactly as it did the
+/// day `div`/`mod`/bitwise ops were added (found by direct testing, not
+/// hypothetical) — this is the fix, not a one-off patch to the hardcoded
+/// numbers themselves.
+fn label<'a>(block: &'a str, prefix: &str) -> &'a str {
+    let needle = format!("({prefix}$");
+    let start = block.find(&needle).unwrap_or_else(|| panic!("no `{prefix}$N` label found in:\n{block}"));
+    let rest = &block[start + 1..];
+    let end = rest.find([' ', ')']).unwrap_or(rest.len());
+    &rest[..end]
 }
 
 #[test]
@@ -116,15 +147,18 @@ fn an_if_else_expression_joins_both_arms_through_one_synthesized_continuation() 
     let block = fn_block(&out, "f");
     // `x > 0` is itself a real call (`Ord::gt<i32>`), so `f`'s own body
     // wraps the `if`'s own `Fix` inside *another* one for that call's own
-    // continuation -- both arms must tail-call the *same* join label
-    // (`j$1`, not `j$0`: label `0` went to the `gt` call's own continuation
-    // first) -- not two separately inlined copies of "whatever happens
-    // after the if" (what a naive CPS conversion, calling `k` directly in
-    // each branch instead of through one named continuation, would produce
-    // instead). `j$1` appears 3 times total: once as the `Fix`'s own
+    // continuation -- both arms must tail-call the *same* join label, not
+    // two separately inlined copies of "whatever happens after the if"
+    // (what a naive CPS conversion, calling `k` directly in each branch
+    // instead of through one named continuation, would produce instead).
+    // The join label appears 3 times total: once as the `Fix`'s own
     // definition, once per arm's own tail call.
-    assert_eq!(block.matches("j$1").count(), 3, "got:\n{block}");
-    assert!(block.contains("(j$1 1)") && block.contains("(j$1 2)"), "each arm must tail-call the join continuation with its own value, got:\n{block}");
+    let j = label(block, "j");
+    assert_eq!(block.matches(j).count(), 3, "got:\n{block}");
+    assert!(
+        block.contains(&format!("({j} 1)")) && block.contains(&format!("({j} 2)")),
+        "each arm must tail-call the join continuation with its own value, got:\n{block}"
+    );
     assert_eq!(block.matches("Ord::gt<i32>").count(), 1, "the condition must be evaluated exactly once, got:\n{block}");
 }
 
@@ -168,7 +202,8 @@ fn a_for_loop_becomes_a_self_recursive_continuation_carrying_the_index() {
     // its own body; the initial call seeds it with `start`.
     assert!(block.contains("Ord::lt<i32>"), "the implicit bound check must resolve to Ord::lt, got:\n{block}");
     assert!(block.contains("Ring::add<i32>"), "both the loop body's own `add` and the implicit increment use it, got:\n{block}");
-    assert!(block.contains("(loop$0 0)"), "the loop must be entered by calling its own continuation with `start`, got:\n{block}");
+    let l = label(block, "loop");
+    assert!(block.contains(&format!("({l} 0)")), "the loop must be entered by calling its own continuation with `start`, got:\n{block}");
     // On exit (bound check fails), control must reach the outer continuation
     // (`f`'s own return-continuation parameter) with the function's own
     // tail value, not get stuck inside the loop.
@@ -191,8 +226,9 @@ fn a_while_loop_carries_no_state_and_reevaluates_its_condition_each_iteration() 
     assert!(block.contains("Ord::gt<i32>"), "got:\n{block}");
     // No loop-carried state yet (`let mut` is a later stage) -- the
     // recursive continuation takes no parameters at all.
-    assert!(block.contains("(loop$0 ()") || block.contains("(loop$0 ("), "the loop continuation must take no parameters, got:\n{block}");
-    assert!(block.contains("(loop$0)"), "both re-entry and recursion must be plain zero-arg tail calls, got:\n{block}");
+    let l = label(block, "loop");
+    assert!(block.contains(&format!("({l} ()")) || block.contains(&format!("({l} (")), "the loop continuation must take no parameters, got:\n{block}");
+    assert!(block.contains(&format!("({l})")), "both re-entry and recursion must be plain zero-arg tail calls, got:\n{block}");
 }
 
 #[test]
@@ -220,15 +256,16 @@ fn a_for_loop_accumulator_is_carried_as_an_extra_loop_parameter() {
     // accumulator, index first positionally, whatever their own actual var
     // numbers are (offset by however many the stdlib prelude's own
     // conversion already consumed, see `fn_block`'s own doc comment).
-    let params = block.split("(loop$0 (").nth(1).unwrap().split(')').next().unwrap();
+    let l = label(block, "loop");
+    let params = block.split(&format!("({l} (")).nth(1).unwrap().split(')').next().unwrap();
     let mut params = params.split_whitespace();
     let (index_var, acc_var) = (params.next().unwrap(), params.next().unwrap());
-    assert!(block.contains("(loop$0 0 0)"), "both the index and the accumulator start at their own initial values, got:\n{block}");
+    assert!(block.contains(&format!("({l} 0 0)")), "both the index and the accumulator start at their own initial values, got:\n{block}");
     // On exit, the *accumulator*'s own final value (not the index) must
     // reach the outer continuation (`f`'s own return-continuation param).
     let k_ret = block.trim_start_matches("(fn f (").split(')').next().unwrap();
     assert!(block.contains(&format!("({k_ret} {acc_var})")), "got:\n{block}");
-    let _ = index_var; // only its presence as loop$0's own first param matters here
+    let _ = index_var; // only its presence as the loop's own first param matters here
 }
 
 #[test]
@@ -241,13 +278,15 @@ fn an_if_else_mutating_a_let_mut_variable_threads_it_through_the_join() {
         }",
     );
     let block = fn_block(&out, "f");
-    // `x > 0` is itself a real call, so the join label is `j$1` (`j$0` went
-    // to that call's own continuation) -- see `an_if_else_expression_joins_
-    // both_arms_through_one_synthesized_continuation`'s own comment. The
-    // join continuation must carry `y` alongside the if's own (Unit) value,
-    // and each arm must pass its own newly-assigned value along.
-    assert!(block.contains("(j$1 (v") && block.matches("j$1").count() == 3, "got:\n{block}");
-    assert!(block.contains("(j$1 () 1)") && block.contains("(j$1 () 2)"), "got:\n{block}");
+    // `x > 0` is itself a real call, so the join label isn't necessarily
+    // `j$0` -- see `an_if_else_expression_joins_both_arms_through_one_
+    // synthesized_continuation`'s own comment (and `label`'s own doc
+    // comment for why this reads the actual label fresh from the output).
+    // The join continuation must carry `y` alongside the if's own (Unit)
+    // value, and each arm must pass its own newly-assigned value along.
+    let j = label(block, "j");
+    assert!(block.contains(&format!("({j} (v")) && block.matches(j).count() == 3, "got:\n{block}");
+    assert!(block.contains(&format!("({j} () 1)")) && block.contains(&format!("({j} () 2)")), "got:\n{block}");
 }
 
 #[test]
@@ -267,12 +306,14 @@ fn a_variable_shadowed_by_an_inner_let_mut_does_not_leak_into_the_outer_joins_ca
         }",
     );
     let block = fn_block(&out, "f");
-    // `x > 0` is itself a real call, so the join label is `j$1` (see the
-    // comment on the previous test). The join continuation must carry
-    // *only* the if's own result value -- one parameter, not two.
-    let join_params = block.split("(j$1 (").nth(1).unwrap().split(')').next().unwrap();
+    // `x > 0` is itself a real call, so the join label isn't necessarily
+    // `j$0` (see the comment on the previous test / `label`'s own doc
+    // comment). The join continuation must carry *only* the if's own
+    // result value -- one parameter, not two.
+    let j = label(block, "j");
+    let join_params = block.split(&format!("({j} (")).nth(1).unwrap().split(')').next().unwrap();
     assert_eq!(join_params.split_whitespace().count(), 1, "the inner `y` must not leak as carried state, got:\n{block}");
-    assert!(block.contains("(j$1 2)") && block.contains("(j$1 0)"), "got:\n{block}");
+    assert!(block.contains(&format!("({j} 2)")) && block.contains(&format!("({j} 0)")), "got:\n{block}");
 }
 
 #[test]
@@ -358,7 +399,8 @@ fn an_array_mutated_inside_a_for_loop_body_needs_no_carrying_only_the_index_does
         }",
     );
     let block = fn_block(&out, "f");
-    let loop_params = block.split("(loop$0 (").nth(1).unwrap().split(')').next().unwrap();
+    let l = label(block, "loop");
+    let loop_params = block.split(&format!("({l} (")).nth(1).unwrap().split(')').next().unwrap();
     assert_eq!(loop_params.split_whitespace().count(), 1, "the loop must carry only its own index, got:\n{block}");
     assert!(block.contains("load") && block.contains("store"), "got:\n{block}");
 }
@@ -411,4 +453,148 @@ fn a_generic_function_called_at_two_types_converts_to_two_separate_specializatio
     );
     assert!(out.contains("(fn double<i32>"), "got:\n{out}");
     assert!(out.contains("(fn double<f32>"), "got:\n{out}");
+}
+
+// ------------------------------------------------------------ closure conversion
+
+/// A `let`-bound lambda with a captured variable converts to a call whose
+/// own leading argument is that capture's `CVal`, gathered at the `let`
+/// itself — `add_base(5)`'s own call site must pass `base` *and* `5`, in
+/// that order, to `<lambda...>`'s own generated unit (see `ConcreteUnit`'s
+/// own widened `params`, `collect_units`'s "Every `let`-bound lambda's own
+/// specialization" doc comment).
+#[test]
+fn a_lambda_call_with_a_captured_variable_passes_the_capture_as_a_leading_argument() {
+    let out = cps("fn main() -> i32 { let base = 100; let add_base = fn(x) { x + base }; add_base(5) }");
+    let block = fn_block(&out, "main");
+    // The `fix`'s own continuation body tail-calls the lambda's own
+    // generated unit (`<lambda#N><i32>`) with two arguments, `base`'s own
+    // value first -- `100` -- then the real argument, `5`.
+    assert!(block.contains("<lambda") && block.contains("100 5"), "got:\n{block}");
+}
+
+/// A lambda that captures *nothing* generates a unit with exactly one
+/// (non-continuation) declared parameter -- no leading capture arguments at
+/// all, distinguishing it structurally from the captured-variable case
+/// above.
+#[test]
+fn a_lambda_with_no_captures_generates_a_unit_with_no_leading_capture_params() {
+    let out = cps("fn main() -> i32 { let f = fn(x) { x + 1 }; f(5) }");
+    let lambda_block_start = out.find("(fn <lambda").unwrap_or_else(|| panic!("no lambda unit found in:\n{out}"));
+    let params_line = &out[lambda_block_start..].lines().next().unwrap();
+    // `(fn <lambda#N><i32> (vA vB)` -- vA is the lambda's own `x`, vB is
+    // `k_ret`; a captured variable would insert a third leading `v` before
+    // both.
+    let param_count = params_line.split('(').nth(2).unwrap().split(')').next().unwrap().split_whitespace().count();
+    assert_eq!(param_count, 2, "expected exactly [x, k_ret], got:\n{params_line}");
+}
+
+/// Calling a `let`-bound lambda's own name resolves via `CVal::Closure`
+/// (Stage A), independent of whether a same-named top-level `fn` also
+/// exists — the local binding must shadow it, mirroring ordinary lexical
+/// scoping for any other name.
+#[test]
+fn a_lambda_bound_name_shadows_a_same_named_top_level_fn() {
+    let out = cps(
+        "fn shadowed(x: i32) -> i32 { x + 1000 }
+         fn main() -> i32 { let shadowed = fn(x) { x + 1 }; shadowed(5) }",
+    );
+    let block = fn_block(&out, "main");
+    // Resolves to the lambda's own generated unit, never the top-level
+    // `shadowed` -- if it fell through to the top-level `fn` instead, this
+    // call would read `(shadowed 5 ...)`, not a `<lambda...>` unit name.
+    assert!(block.contains("<lambda"), "got:\n{block}");
+    assert!(!block.contains("(shadowed "), "must not call the shadowed top-level fn, got:\n{block}");
+}
+
+/// A generic `let`-bound lambda (`id`), called at two different concrete
+/// types from two different call sites, gets two separate specializations —
+/// real Hindley-Milner let-polymorphism for a lambda, exactly mirroring
+/// `a_generic_function_called_at_two_types_converts_to_two_separate_
+/// specializations` above for a top-level `fn`.
+#[test]
+fn a_generic_lambda_called_at_two_types_converts_to_two_separate_specializations() {
+    let out = cps(
+        "fn main() -> i32 {
+            let id = fn(x) { x };
+            let a = id(1:i32);
+            let b = id(1.0:f32);
+            0
+         }",
+    );
+    assert!(out.contains("(fn <lambda") && out.matches("(fn <lambda").count() == 2, "got:\n{out}");
+}
+
+/// Stage B: `apply`'s own body (`f(x)`) is never itself converted — a unit
+/// with a `Ty::Fn`-typed parameter has no runtime representation to call it
+/// through, so only its per-callable specializations (`apply[f=...]`) are
+/// ever emitted. Confirms `convert_program`'s own skip (see its doc comment
+/// on the `Ty::Fn` parameter check) rather than a stray `(fn apply (...)`
+/// with an unresolved call inside it.
+#[test]
+fn the_original_unspecialized_higher_order_callee_is_never_itself_converted() {
+    let out = cps(
+        "fn apply(f: (i32) -> i32, x: i32) -> i32 { f(x) }
+         fn main() -> i32 { let inc = fn(x) { x + 1 }; apply(inc, 5) }",
+    );
+    assert!(!out.contains("(fn apply ("), "the un-specialized `apply` must never be emitted, got:\n{out}");
+    assert!(out.contains("(fn apply[f="), "got:\n{out}");
+}
+
+/// The two open risks the closure-conversion plan flagged explicitly as
+/// needing an explicit guard, not a silent misconversion — a bare lambda
+/// *literal* (no prior `let`) used directly as a call argument. Neither
+/// Stage A's own lambda-call resolution (needs a `let`-bound name) nor
+/// Stage B's own higher-order-argument detection (needs a `Path` argument)
+/// recognizes this shape at all — it falls through to `convert_expr`'s own
+/// `Lambda` catch-all, which panics clearly rather than silently producing
+/// a wrong (or missing) conversion.
+#[test]
+#[should_panic(expected = "CPS doesn't support")]
+fn a_bare_lambda_literal_passed_directly_as_an_argument_panics_cleanly() {
+    cps(
+        "fn apply(f: (i32) -> i32, x: i32) -> i32 { f(x) }
+         fn main() -> i32 { apply(fn(x) { x + 1 }, 5) }",
+    );
+}
+
+// ------------------------------------------------------------ egg integration (Stage 1)
+
+/// A `ConcreteUnit` built from an algebra impl's own method carries its own
+/// `(algebra, method)` origin, structurally — not something a later pass
+/// has to parse back out of the unit's own display name (`"Ring::add<i32>"`,
+/// a one-way `format!`, see `monomorphize.rs::display_impl_instantiation`).
+#[test]
+fn an_algebra_impl_units_own_origin_names_its_algebra_and_method() {
+    let all = units("fn main() -> i32 { 1 + 2 }");
+    let add = all.iter().find(|u| u.name == "Ring::add<i32>").unwrap_or_else(|| {
+        panic!("no `Ring::add<i32>` unit found among: {:?}", all.iter().map(|u| &u.name).collect::<Vec<_>>())
+    });
+    assert_eq!(add.origin, Some(("Ring".to_string(), "add".to_string())));
+}
+
+/// An ordinary top-level `fn`'s own unit has no algebra origin at all.
+#[test]
+fn a_top_level_fns_own_unit_has_no_origin() {
+    let all = units("fn f() -> i32 { 1 } fn main() -> i32 { f() }");
+    let f = all.iter().find(|u| u.name == "f").unwrap();
+    assert_eq!(f.origin, None);
+}
+
+/// `CTopLevelFn` carries its own `origin` too, threaded straight through
+/// from `ConcreteUnit::origin` (Stage 1) — a later e-graph pass, operating
+/// on the *converted* `CpsProgram` rather than the pre-conversion
+/// `ConcreteUnit`s, needs it at that point instead, and it's still not
+/// something worth re-deriving by parsing a unit's own display name.
+#[test]
+fn a_top_level_fns_own_origin_survives_cps_conversion() {
+    let (result, _sources) = compile(vec![("test.cleave".to_string(), "fn main() -> i32 { 1 + 2 }".to_string())], &[]);
+    let program = result.unwrap();
+    let registry = Registry::build(&program);
+    let all_units = collect_units(&program, &registry);
+    let cps_program = convert_program(all_units);
+    let add = cps_program.funcs.iter().find(|f| f.def.name == "Ring::add<i32>").unwrap_or_else(|| {
+        panic!("no `Ring::add<i32>` unit found among: {:?}", cps_program.funcs.iter().map(|f| &f.def.name).collect::<Vec<_>>())
+    });
+    assert_eq!(add.origin, Some(("Ring".to_string(), "add".to_string())));
 }

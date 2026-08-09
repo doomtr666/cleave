@@ -152,6 +152,38 @@ fn all_impls_includes_single_target_impls_too() {
     assert_eq!(impls[0].1.len(), 1);
 }
 
+/// An `axiom` declared inside an `algebra` block is retained by the
+/// `Registry`, not silently discarded the way it used to be (`registry.rs`
+/// previously filtered `AlgebraItemKind::Axiom(_)` straight to `None` while
+/// building `sigs` — never stored anywhere at all) — the first prerequisite
+/// for anything downstream (an e-graph pass) to eventually turn one into a
+/// real rewrite rule.
+#[test]
+fn registry_retains_axioms_declared_on_an_algebra() {
+    let p = program(
+        "algebra Ring<T> {
+            fn add(a: T, b: T) -> T;
+            axiom add_commutative(a, b): add(a, b) == add(b, a);
+         }",
+    );
+    let reg = Registry::build(&p);
+    let axioms = reg.axioms("Ring");
+    assert_eq!(axioms.len(), 1, "expected exactly one retained axiom");
+    assert_eq!(axioms[0].name, "add_commutative");
+    assert_eq!(axioms[0].params.len(), 2);
+}
+
+/// An algebra with no axioms at all still resolves (empty, not missing) --
+/// same convention every other `Registry` accessor in this file already
+/// follows for an absent entry.
+#[test]
+fn registry_axioms_is_empty_not_missing_when_none_are_declared() {
+    let p = program("algebra Ring<T> { fn add(a: T, b: T) -> T; }");
+    let reg = Registry::build(&p);
+    assert!(reg.axioms("Ring").is_empty());
+    assert!(reg.axioms("NoSuchAlgebra").is_empty());
+}
+
 fn vec2_type() -> cleave::ast::Type {
     type_from("Vec2")
 }

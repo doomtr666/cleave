@@ -95,6 +95,12 @@ pub struct ProgramInference {
     /// One entry per top-level `fn` in the program, keyed by name.
     pub results: HashMap<String, Result<FnResult, TypeError>>,
     pub node_types: HashMap<NodeId, Ty>,
+    /// Every `let`-bound lambda's own generalized `Scheme` reached anywhere
+    /// in the program, keyed by the `Lambda` expression's own `NodeId` — see
+    /// `Infer::lambda_schemes`'s own doc comment for why this can't just be
+    /// read out of `node_types`. Aggregated across every SCC group's own
+    /// `Infer` instance exactly the way `node_types` itself is, below.
+    pub lambda_schemes: HashMap<NodeId, Scheme>,
     /// Every top-level `fn`'s finished, generalized `Scheme`, by name — the
     /// same `Env` this pass builds up internally, exposed so `dump.rs` can
     /// seed an `impl` method's own body with it
@@ -145,6 +151,7 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
     let mut global_env: Env = Env::new();
     let mut results: HashMap<String, Result<FnResult, TypeError>> = HashMap::new();
     let mut node_types: HashMap<NodeId, Ty> = HashMap::new();
+    let mut lambda_schemes: HashMap<NodeId, Scheme> = HashMap::new();
 
     for group in &sccs {
         let mut infer = Infer::new(registry);
@@ -348,9 +355,14 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
         }
 
         node_types.extend(infer.node_types.iter().map(|(id, t)| (*id, infer.subst.apply(t))));
+        lambda_schemes.extend(infer.lambda_schemes.iter().map(|(id, s)| {
+            let mut s = s.clone();
+            s.ty = infer.subst.apply(&s.ty);
+            (*id, s)
+        }));
     }
 
-    ProgramInference { results, node_types, global_env }
+    ProgramInference { results, node_types, lambda_schemes, global_env }
 }
 
 // ------------------------------------------------------------ static call-graph scan

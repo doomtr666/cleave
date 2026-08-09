@@ -68,6 +68,15 @@ fn a_compiled_program_actually_runs_and_returns_the_right_value() {
     assert!(module.as_operation().verify());
 
     let pass_manager = pass::PassManager::new(&context);
+    // `num`'s own `Rem::mod` (prelude, unconditionally compiled into every
+    // module regardless of whether the program actually calls it — see
+    // `doc/backlog.md`'s own "dead-code elimination" item) has a real `if`/
+    // `else` body, so `scf.if` is now present in *every* compiled module,
+    // not just ones whose own source uses `if` — `create_to_llvm` alone
+    // can't translate it (needs `create_scf_to_control_flow` first, same
+    // reasoning as `run_i32`'s own doc comment below), found by direct
+    // testing the moment `mod`/`rem` landed in the stdlib.
+    pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
     pass_manager.run(&mut module).expect("lowering to the llvm dialect must succeed");
 
@@ -283,6 +292,15 @@ fn an_extern_fn_call_actually_executes_through_a_registered_symbol() {
     assert!(module.as_operation().verify());
 
     let pass_manager = pass::PassManager::new(&context);
+    // `num`'s own `Rem::mod` (prelude, unconditionally compiled into every
+    // module regardless of whether the program actually calls it — see
+    // `doc/backlog.md`'s own "dead-code elimination" item) has a real `if`/
+    // `else` body, so `scf.if` is now present in *every* compiled module,
+    // not just ones whose own source uses `if` — `create_to_llvm` alone
+    // can't translate it (needs `create_scf_to_control_flow` first, same
+    // reasoning as `run_i32`'s own doc comment below), found by direct
+    // testing the moment `mod`/`rem` landed in the stdlib.
+    pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
     pass_manager.run(&mut module).expect("lowering to the llvm dialect must succeed");
 
@@ -342,6 +360,15 @@ fn an_extern_impl_method_actually_executes_the_right_symbol_at_each_call_site() 
     assert!(module.as_operation().verify());
 
     let pass_manager = pass::PassManager::new(&context);
+    // `num`'s own `Rem::mod` (prelude, unconditionally compiled into every
+    // module regardless of whether the program actually calls it — see
+    // `doc/backlog.md`'s own "dead-code elimination" item) has a real `if`/
+    // `else` body, so `scf.if` is now present in *every* compiled module,
+    // not just ones whose own source uses `if` — `create_to_llvm` alone
+    // can't translate it (needs `create_scf_to_control_flow` first, same
+    // reasoning as `run_i32`'s own doc comment below), found by direct
+    // testing the moment `mod`/`rem` landed in the stdlib.
+    pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
     pass_manager.run(&mut module).expect("lowering to the llvm dialect must succeed");
 
@@ -556,4 +583,387 @@ fn a_loop_carrying_two_different_types_computes_the_right_value() {
         }
     ";
     assert_eq!(run_i32(&context, src), 1);
+}
+
+/// A bodyless-`else` `if` used as a discarded statement, reassigning an
+/// outer variable, *inside* a loop body — `mlir_lower.rs::lower_if` used to
+/// support only a single-parameter join (the `if`'s own value); this needs
+/// two positions at once (the `if`'s own unit value, discarded, plus the
+/// reassigned `saw_three`), confirmed broken before `lower_if` was
+/// generalized to `CFunDef::carried_types` the same way `lower_loop` already
+/// was. `saw_three` only reaches `1` if the write actually happened on
+/// exactly the iteration where `i == 3`.
+#[test]
+fn an_if_with_no_else_reassigning_an_outer_variable_inside_a_loop_computes_the_right_value() {
+    let context = context();
+    let src = "
+        fn main() -> i32 {
+            let mut i = 0;
+            let mut saw_three = 0;
+            while i < 5 {
+                if i == 3 {
+                    saw_three = 1;
+                };
+                i = i + 1;
+            };
+            saw_three
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// The same shape, but with a real (non-unit) `else` too, and *two* outer
+/// variables reassigned across the branches — `evens`/`odds` counted by
+/// which arm actually ran each iteration.
+#[test]
+fn an_if_else_reassigning_two_outer_variables_inside_a_loop_computes_the_right_value() {
+    let context = context();
+    let src = "
+        fn main() -> i32 {
+            let mut i = 0;
+            let mut evens = 0;
+            let mut odds = 0;
+            while i < 6 {
+                if i == 0 or i == 2 or i == 4 {
+                    evens = evens + 1;
+                } else {
+                    odds = odds + 1;
+                };
+                i = i + 1;
+            };
+            evens * 10 + odds
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 33);
+}
+
+/// An `if` carrying *both* a real (used-elsewhere) value *and* a reassigned
+/// outer variable at once — the join's own first position (the `if`'s
+/// value, `-1`/`1`) is deliberately never read by the caller (`classify`'s
+/// own tail is `label`, not the `if` itself), proving the multi-position
+/// join binds each position to the *right* `scf.if` result independently,
+/// not just "whichever one happens to be used."
+#[test]
+fn an_if_with_both_a_value_and_a_carried_variable_computes_the_right_value() {
+    let context = context();
+    let src = "
+        fn classify(n: i32) -> i32 {
+            let mut label = 0;
+            if n < 0 {
+                label = 1;
+                -1
+            } else {
+                label = 2;
+                1
+            };
+            label
+        }
+        fn main() -> i32 { classify(-5) }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+// ------------------------------------------------------------ closure conversion
+
+/// Stage A: a `let`-bound lambda with no captures, called directly by name —
+/// the simplest possible slice of closure conversion, verified end-to-end.
+#[test]
+fn a_lambda_with_no_captures_actually_computes_the_right_value() {
+    let context = context();
+    let src = "fn main() -> i32 { let add_captured = fn(x) { x + 10 }; add_captured(5) }";
+    assert_eq!(run_i32(&context, src), 15);
+}
+
+/// Stage A: a lambda referencing an enclosing-scope variable — its own
+/// generated unit must carry `base` as a leading, spliced-in argument at
+/// every call site (`ConcreteUnit`'s own widened `params`/`param_types`).
+#[test]
+fn a_lambda_that_captures_an_enclosing_variable_actually_computes_the_right_value() {
+    let context = context();
+    let src = "fn main() -> i32 { let base = 100; let add_base = fn(x) { x + base }; add_base(5) }";
+    assert_eq!(run_i32(&context, src), 105);
+}
+
+/// Stage A: a `let`-bound lambda is a syntactic value, so it gets
+/// generalized (real Hindley-Milner let-polymorphism) exactly like a
+/// top-level generic `fn` — `id` gets called at two different concrete
+/// types from two different call sites, each independently specialized
+/// (`LambdaScheme`/`monomorphize.rs`'s own lambda worklist).
+#[test]
+fn a_generic_lambda_is_let_polymorphic_like_a_top_level_generic_fn() {
+    let context = context();
+    let src = "
+        fn main() -> i32 {
+            let id = fn(x) { x };
+            let a = id(1);
+            let b = id(1.5);
+            if b > 1.0 { a } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// A capture is snapshotted at the lambda's own `let` (its current `CVal`
+/// gathered from `env` right then), not captured by reference — a `let mut`
+/// reassignment *after* the closure is built must not be visible to it. This
+/// is one of the two open risks the closure-conversion plan flagged
+/// explicitly as needing its own stated decision plus a test, not an
+/// accident of implementation order (see `CVal::Closure`'s own doc comment).
+#[test]
+fn a_captured_variable_is_snapshotted_at_the_lambda_not_captured_by_reference() {
+    let context = context();
+    let src = "
+        fn main() -> i32 {
+            let mut x = 1;
+            let f = fn() { x };
+            x = 2;
+            f()
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// Stage B: `apply`'s own `f: (i32) -> i32` parameter is fully concrete
+/// (`(i32) -> i32` is just an ordinary type, no generic involved at all) —
+/// so nothing about `apply` itself is generic in `monomorphize.rs`'s sense;
+/// the higher-order specialization (`apply[f=<lambda...>]`, `collect_units`'s
+/// own `build_higher_order_specializations`) is the entire reason this can
+/// resolve at all.
+#[test]
+fn passing_a_lambda_to_a_higher_order_parameter_actually_computes_the_right_value() {
+    let context = context();
+    let src = "
+        fn apply(f: (i32) -> i32, x: i32) -> i32 { f(x) }
+        fn main() -> i32 {
+            let inc = fn(x) { x + 1 };
+            apply(inc, 5)
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 6);
+}
+
+/// Two distinct callables passed to the *same* higher-order callee at two
+/// different call sites must each get their own independent specialization
+/// (`(callee, [erased position -> resolved callable])`, memoized) — proven
+/// by the two results actually differing (`6`, not e.g. `6 + 6` from a
+/// wrongly-shared one).
+#[test]
+fn two_distinct_callables_passed_to_the_same_higher_order_callee_get_separate_specializations() {
+    let context = context();
+    let src = "
+        fn apply(f: (i32) -> i32, x: i32) -> i32 { f(x) }
+        fn main() -> i32 {
+            let inc = fn(x) { x + 1 };
+            let dec = fn(x) { x - 1 };
+            apply(inc, 5) + apply(dec, 5)
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 10);
+}
+
+/// A higher-order call reached indirectly (through an intermediate,
+/// ordinary top-level `fn`, not the same function the lambda was `let`-bound
+/// in) — `doc/user_guide.md`'s own existing higher-order-functions example,
+/// run for real for the first time (previously caveated as "type-checks but
+/// can't run yet").
+#[test]
+fn user_guide_higher_order_example_actually_runs() {
+    let context = context();
+    let src = "
+        fn apply(f: (i32) -> i32, x: i32) -> i32 { f(x) }
+        fn g() -> i32 {
+            let inc = fn(x) { x + 1 };
+            apply(inc, 5)
+        }
+        fn main() -> i32 { g() }
+    ";
+    assert_eq!(run_i32(&context, src), 6);
+}
+
+// ------------------------------------------------------------ div/mod/rem/bitwise (stdlib/num)
+
+#[test]
+fn integer_division_truncates_toward_zero() {
+    let context = context();
+    assert_eq!(run_i32(&context, "fn main() -> i32 { 17 / 5 }"), 3);
+    assert_eq!(run_i32(&context, "fn main() -> i32 { -17 / 5 }"), -3);
+}
+
+#[test]
+fn float_division_computes_the_right_value() {
+    let context = context();
+    let src = "fn main() -> i32 { let d: f64 = 10.0 / 4.0; if d == 2.5 { 1 } else { 0 } }";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `div` works for every declared `Ring<T>` width, not just `i32` — each
+/// one needed its own `mlir::arith::divsi`/`divf` impl (see `stdlib/num/
+/// num.cleave`), not just the algebra's own declaration.
+#[test]
+fn division_works_across_every_ring_width() {
+    let context = context();
+    let src = "
+        fn main() -> i32 {
+            let a8: i8 = 20;
+            let b8: i8 = 3;
+            let d8: i8 = a8 / b8;
+            let a16: i16 = 20;
+            let b16: i16 = 3;
+            let d16: i16 = a16 / b16;
+            let a64: i64 = 20;
+            let b64: i64 = 3;
+            let d64: i64 = a64 / b64;
+            let ok8 = if d8 == 6 { 1 } else { 0 };
+            let ok16 = if d16 == 6 { 1 } else { 0 };
+            let ok64 = if d64 == 6 { 1 } else { 0 };
+            ok8 + ok16 + ok64
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 3);
+}
+
+/// `rem` is truncated-division remainder (sign follows the dividend, same
+/// as MLIR's own `arith.remsi`/C's `%`) — `mod` is Euclidean/floored
+/// (sign follows the divisor, always non-negative for a positive divisor).
+/// The two must actually differ on a negative operand, or the whole reason
+/// `grammar.md` insists on two distinct names would be moot.
+#[test]
+fn mod_and_rem_differ_correctly_on_negative_operands() {
+    let context = context();
+    assert_eq!(run_i32(&context, "fn main() -> i32 { rem(-17, 5) }"), -2);
+    assert_eq!(run_i32(&context, "fn main() -> i32 { mod(-17, 5) }"), 3);
+    // Both operands positive -- rem and mod must agree.
+    assert_eq!(run_i32(&context, "fn main() -> i32 { rem(17, 5) }"), 2);
+    assert_eq!(run_i32(&context, "fn main() -> i32 { mod(17, 5) }"), 2);
+}
+
+#[test]
+fn bitwise_operators_compute_the_right_values() {
+    let context = context();
+    assert_eq!(run_i32(&context, "fn main() -> i32 { bitand(12, 10) }"), 8);
+    assert_eq!(run_i32(&context, "fn main() -> i32 { bitor(12, 10) }"), 14);
+    assert_eq!(run_i32(&context, "fn main() -> i32 { bitxor(12, 10) }"), 6);
+    assert_eq!(run_i32(&context, "fn main() -> i32 { bitnot(0) }"), -1);
+    assert_eq!(run_i32(&context, "fn main() -> i32 { shl(1, 4) }"), 16);
+    assert_eq!(run_i32(&context, "fn main() -> i32 { shr(16, 2) }"), 4);
+    // `shr` is the arithmetic (sign-extending) right shift -- a negative
+    // input must stay negative, not fill with zeros.
+    assert_eq!(run_i32(&context, "fn main() -> i32 { shr(-16, 2) }"), -4);
+}
+
+/// `bitnot` specifically needed a real fix mid-session: an inline `-1`
+/// directly inside the `mlir::arith::xori(a, -1)` call independently
+/// defaults to `i32` (an `mlir::` call's own arguments don't cross-unify —
+/// no real declared signature to unify against), mismatching `a`'s own
+/// width for every `Bitwise<T>` impl but `i32` itself. Fixed with an
+/// explicit `let all_bits: i8 = -1;` intermediate (same idiom as `Logic::
+/// implies`'s own `let not_a: bool = ...`) — verified here across every
+/// non-`i32` width specifically, so a regression to the inline form would
+/// be caught immediately instead of only failing silently for `i8`/`i16`/
+/// `i64` callers nobody happened to test.
+#[test]
+fn bitnot_works_across_every_non_i32_width() {
+    let context = context();
+    let src = "
+        fn main() -> i32 {
+            let a8: i8 = 5;
+            let n8: i8 = bitnot(a8);
+            let a16: i16 = 5;
+            let n16: i16 = bitnot(a16);
+            let a64: i64 = 5;
+            let n64: i64 = bitnot(a64);
+            let ok8 = if n8 == -6 { 1 } else { 0 };
+            let ok16 = if n16 == -6 { 1 } else { 0 };
+            let ok64 = if n64 == -6 { 1 } else { 0 };
+            ok8 + ok16 + ok64
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 3);
+}
+
+// ------------------------------------------------------------ inherent impls
+
+/// `doc/user_guide.md`'s own existing "Inherent impls" example, run for
+/// real via dot-call syntax for the first time (previously caveated as
+/// "type-checks but can't be JIT-executed yet").
+#[test]
+fn a_non_generic_inherent_method_called_via_dot_syntax_actually_runs() {
+    let context = context();
+    let src = "
+        struct Vec2 { x: f64, y: f64 }
+        impl struct Vec2 {
+            fn magnitude_sq(v) -> f64 { v.x * v.x + v.y * v.y }
+        }
+        fn main() -> i32 {
+            let v = Vec2(x: 1.0, y: 2.0);
+            if v.magnitude_sq() == 5.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// Mutual recursion between two sibling inherent methods on the *same*
+/// struct — `infer_inherent_impl_block`'s own stated reason for existing
+/// (both methods inferred together, sharing one `Infer`), now proven all
+/// the way through real execution: `w.dec().is_odd()` calling back into a
+/// sibling `is_even`, and vice versa.
+#[test]
+fn mutually_recursive_inherent_methods_on_the_same_struct_actually_run() {
+    let context = context();
+    let src = "
+        struct Wrapped { n: i32 }
+        impl struct Wrapped {
+            fn dec(w) -> Wrapped { Wrapped(n: w.n - 1) }
+            fn is_even(w) -> bool { if w.n == 0 { true } else { w.dec().is_odd() } }
+            fn is_odd(w) -> bool { if w.n == 0 { false } else { w.dec().is_even() } }
+        }
+        fn main() -> i32 {
+            let w = Wrapped(n: 7);
+            if w.is_odd() { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// A *generic* inherent impl (`impl<T> Boxed<T> { ... }`) — `cps.rs::
+/// collect_units`'s own `InherentImpl` branch reads specializations back
+/// from `monomorphize.rs`'s own inherent-method worklist, mirroring the
+/// generic-algebra-impl case exactly but through `InherentTemplate`/
+/// `derive_inherent_instantiation` instead.
+#[test]
+fn a_generic_inherent_method_called_via_dot_syntax_actually_runs() {
+    let context = context();
+    let src = "
+        struct Boxed<T> { value: T }
+        impl<T: Ring> struct Boxed<T> {
+            fn doubled(b) -> T { add(b.value, b.value) }
+        }
+        fn main() -> i32 {
+            let b = Boxed(value: 21);
+            b.doubled()
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 42);
+}
+
+/// The same generic inherent method, called at *two different* concrete
+/// types from two different call sites — each needs its own independent
+/// specialization (mirrors `a_generic_function_called_at_two_types_
+/// converts_to_two_separate_specializations` in `cleave/tests/cps.rs`, one
+/// level up for inherent impls).
+#[test]
+fn a_generic_inherent_method_called_at_two_types_computes_the_right_value() {
+    let context = context();
+    let src = "
+        struct Boxed<T> { value: T }
+        impl<T: Ring> struct Boxed<T> {
+            fn doubled(b) -> T { add(b.value, b.value) }
+        }
+        fn main() -> i32 {
+            let bi = Boxed(value: 21);
+            let bf = Boxed(value: 1.5);
+            if bf.doubled() == 3.0 { bi.doubled() } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 42);
 }

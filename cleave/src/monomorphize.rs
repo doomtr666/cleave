@@ -220,6 +220,69 @@ struct ImplTemplate {
     is_generic: bool,
 }
 
+/// A generic inherent impl's own declaration-time "template" for one
+/// method — the inherent-impl counterpart to `ImplTemplate`, simpler in one
+/// respect: `Registry::inherent_method`'s own doc comment guarantees at
+/// most one method of a given name exists per struct, so there's no
+/// candidate *search* needed at a call site, only a direct `(struct_name,
+/// method_name)` lookup — no `is_generic`/`ImplMatch`-style "found but none
+/// matched" distinction either, a non-generic inherent impl never builds a
+/// template at all (mirrors `build_impl_templates`'s own treatment of a
+/// concrete algebra impl, one level simpler: nothing here needs to
+/// structurally *recognize* "a concrete impl already covers this," since a
+/// method name can only ever belong to the one impl block that declared
+/// it). No separate `target_patterns` field either — a method's own first
+/// parameter's pattern (`param_patterns[0]`) already *is* the impl's own
+/// target pattern: `inherent_method_param_tys` sets an unannotated first
+/// parameter to `target_ty` directly, and unifies an annotated one against
+/// it, so the two are never independently free variables to track twice.
+struct InherentTemplate {
+    struct_name: String,
+    method_name: String,
+    params: Vec<Param>,
+    body: Block,
+    param_patterns: Vec<Ty>,
+    ret_pattern: Ty,
+    node_types: HashMap<NodeId, Ty>,
+}
+
+/// Builds one `InherentTemplate` per method of every *generic* inherent
+/// impl in the program — mirrors `build_impl_templates`'s own doc comment,
+/// one level simpler (see `InherentTemplate`'s own doc comment for why). A
+/// whole impl block's own methods are inferred together, sharing one
+/// `Infer` (`infer_inherent_impl_block`, real mutual recursion between
+/// sibling methods) — each method's own template shares that same block's
+/// `node_types`, filtered down to its own body's nodes only, same as any
+/// other template/specialization here. A method whose own declaration-time
+/// inference failed is silently skipped, same reasoning as `build_impl_
+/// templates`.
+fn build_inherent_templates(program: &Program, registry: &Registry, global_env: &Env) -> Vec<InherentTemplate> {
+    let mut templates = Vec::new();
+    for item in &program.items {
+        let ItemKind::InherentImpl(d) = &item.kind else { continue };
+        if d.generics.is_empty() {
+            continue;
+        }
+        let TypeKind::Path(p, _) = &d.target.kind else { continue };
+        let struct_name = p.segments.join("::");
+        let mut infer = Infer::new(registry);
+        let results = infer.infer_inherent_impl_block(global_env, &d.generics, &d.target, &d.fns, item.span);
+        for f in &d.fns {
+            let Some(Ok((param_patterns, ret_pattern))) = results.get(&f.name) else { continue };
+            templates.push(InherentTemplate {
+                struct_name: struct_name.clone(),
+                method_name: f.name.clone(),
+                params: f.params.clone(),
+                body: f.body.clone().unwrap_or(Block { stmts: Vec::new(), tail: None }),
+                param_patterns: param_patterns.clone(),
+                ret_pattern: ret_pattern.clone(),
+                node_types: infer.node_types.clone(),
+            });
+        }
+    }
+    templates
+}
+
 /// Runs the whole-program inference pass (`callgraph::infer_program`) and
 /// then both monomorphization worklists over its result — mirrors
 /// `dump.rs`'s own `dump_program`, which runs the identical first step for
@@ -236,6 +299,8 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
         .collect();
 
     let templates = build_impl_templates(program, registry, &program_inference.global_env);
+    let inherent_templates = build_inherent_templates(program, registry, &program_inference.global_env);
+    let lambda_exprs = index_lambda_exprs(program, &program_inference.lambda_schemes);
 
     let mut mono = MonomorphizedProgram {
         specializations: HashMap::new(),
@@ -245,6 +310,8 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
     };
     let mut fn_worklist: Vec<(String, Vec<Ty>)> = Vec::new();
     let mut impl_worklist: Vec<(usize, HashMap<TyVar, Ty>)> = Vec::new();
+    let mut lambda_worklist: Vec<(NodeId, Vec<Ty>)> = Vec::new();
+    let mut inherent_worklist: Vec<(usize, HashMap<TyVar, Ty>)> = Vec::new();
 
     // Seed: every function that itself type-checked to something *fully
     // concrete* (never generalized — a nullary member per the Monomorphism
@@ -270,8 +337,12 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
             &program_inference.node_types,
             &program_inference.global_env,
             &templates,
+            &inherent_templates,
+            &program_inference.lambda_schemes,
             &mut fn_worklist,
             &mut impl_worklist,
+            &mut lambda_worklist,
+            &mut inherent_worklist,
             &mut mono.seed_call_names,
             &mut mono.errors,
         );
@@ -313,8 +384,12 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
             &node_types,
             &program_inference.global_env,
             &templates,
+            &inherent_templates,
+            &program_inference.lambda_schemes,
             &mut fn_worklist,
             &mut impl_worklist,
+            &mut lambda_worklist,
+            &mut inherent_worklist,
             &mut call_names,
             &mut mono.errors,
         );
@@ -347,13 +422,128 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
             &node_types,
             &program_inference.global_env,
             &templates,
+            &inherent_templates,
+            &program_inference.lambda_schemes,
             &mut fn_worklist,
             &mut impl_worklist,
+            &mut lambda_worklist,
+            &mut inherent_worklist,
             &mut call_names,
             &mut mono.errors,
         );
 
         let origin = format!("{}::{}", t.algebra, t.method_name);
+        mono.by_origin.entry(origin).or_default().push(display.clone());
+        mono.specializations.insert(
+            display,
+            Specialization { params: t.params.clone(), body: t.body.clone(), param_types, result, node_types, call_names },
+        );
+    }
+
+    // Lambda worklist -- structurally identical to the top-level-`fn`
+    // worklist just above (same `Specialization` shape, same reverse-
+    // unification via `derive_instantiation`), but a lambda has no top-
+    // level `FnDecl`/`global_env` entry to read `params`/`body`/`scheme`
+    // back from -- `lambda_exprs`/`program_inference.lambda_schemes`
+    // (built/aggregated once, up front) stand in for those. Unlike a top-
+    // level generic `fn`, a lambda's own body `node_types` were never given
+    // a dedicated per-declaration template (no `ImplTemplate`-style struct
+    // needed) -- they're read directly out of the *whole-program*
+    // `program_inference.node_types`, exactly the same map (and the exact
+    // same reasoning) the `fn_worklist` loop above already reads its own
+    // generic pattern from, since ordinary inference records a lambda
+    // body's node types there too, just still generic (pre-instantiation).
+    while let Some((lambda_id, concrete_tys)) = lambda_worklist.pop() {
+        let display = display_lambda_instantiation(lambda_id, &concrete_tys);
+        if mono.specializations.contains_key(&display) {
+            continue;
+        }
+        let (Some(scheme), Some(&lambda_expr)) =
+            (program_inference.lambda_schemes.get(&lambda_id), lambda_exprs.get(&lambda_id))
+        else {
+            continue;
+        };
+        let ExprKind::Lambda { params, body, .. } = &lambda_expr.kind else {
+            continue; // `lambda_exprs` only ever indexes `Lambda` nodes -- defensive, not expected
+        };
+        let Ty::Fn(param_pattern, ret_pattern) = &scheme.ty else {
+            continue; // a lambda's own scheme is always Ty::Fn, mirroring a top-level fn's -- defensive
+        };
+
+        let mapping: HashMap<TyVar, Ty> = scheme.vars.iter().copied().zip(concrete_tys.iter().cloned()).collect();
+        let param_types: Vec<Ty> = param_pattern.iter().map(|t| substitute(t, &mapping)).collect();
+        let result = substitute(ret_pattern, &mapping);
+
+        let mut exprs = Vec::new();
+        collect_exprs_block(body, &mut exprs);
+        let node_types: HashMap<NodeId, Ty> = exprs
+            .iter()
+            .filter_map(|e| program_inference.node_types.get(&e.id).map(|t| (e.id, substitute(t, &mapping))))
+            .collect();
+
+        let mut call_names = HashMap::new();
+        collect_instantiations(
+            body,
+            &node_types,
+            &program_inference.global_env,
+            &templates,
+            &inherent_templates,
+            &program_inference.lambda_schemes,
+            &mut fn_worklist,
+            &mut impl_worklist,
+            &mut lambda_worklist,
+            &mut inherent_worklist,
+            &mut call_names,
+            &mut mono.errors,
+        );
+
+        let origin = format!("<lambda#{}>", lambda_id.0);
+        mono.by_origin.entry(origin).or_default().push(display.clone());
+        mono.specializations.insert(
+            display,
+            Specialization { params: params.clone(), body: body.clone(), param_types, result, node_types, call_names },
+        );
+    }
+
+    // Inherent-method worklist -- structurally identical to the impl_
+    // worklist loop above (same `Specialization` shape, same reverse-
+    // unification via `derive_inherent_instantiation`), just reading back
+    // from `InherentTemplate` instead of `ImplTemplate` and keying `by_
+    // origin` as `"struct::method"` (matching `cps.rs::collect_units`'s own
+    // `InherentImpl` branch, which reads specializations back by that exact
+    // key).
+    while let Some((idx, mapping)) = inherent_worklist.pop() {
+        let t = &inherent_templates[idx];
+        let display = display_inherent_instantiation(t, &mapping);
+        if mono.specializations.contains_key(&display) {
+            continue;
+        }
+
+        let param_types: Vec<Ty> = t.param_patterns.iter().map(|p| substitute(p, &mapping)).collect();
+        let result = substitute(&t.ret_pattern, &mapping);
+
+        let mut exprs = Vec::new();
+        collect_exprs_block(&t.body, &mut exprs);
+        let node_types: HashMap<NodeId, Ty> =
+            exprs.iter().filter_map(|e| t.node_types.get(&e.id).map(|ty| (e.id, substitute(ty, &mapping)))).collect();
+
+        let mut call_names = HashMap::new();
+        collect_instantiations(
+            &t.body,
+            &node_types,
+            &program_inference.global_env,
+            &templates,
+            &inherent_templates,
+            &program_inference.lambda_schemes,
+            &mut fn_worklist,
+            &mut impl_worklist,
+            &mut lambda_worklist,
+            &mut inherent_worklist,
+            &mut call_names,
+            &mut mono.errors,
+        );
+
+        let origin = format!("{}::{}", t.struct_name, t.method_name);
         mono.by_origin.entry(origin).or_default().push(display.clone());
         mono.specializations.insert(
             display,
@@ -422,61 +612,385 @@ fn build_impl_templates(program: &Program, registry: &Registry, global_env: &Env
     templates
 }
 
-/// Walks every `Call` node in `body`; for each whose callee resolves, via
-/// `global_env`, to a *generic* top-level `fn` (`scheme.vars` non-empty),
-/// derives the concrete instantiation this call site actually used and
-/// pushes it onto `fn_worklist`. For a name that *isn't* a top-level `fn`
-/// at all, tries every `ImplTemplate` sharing that method name instead —
-/// `check_no_overlapping_impls` guarantees at most one can coherently
-/// unify against a given concrete query, so the first match found is
-/// pushed onto `impl_worklist` and the search stops. If templates existed
-/// for that name but *none* matched this specific call's own concrete
-/// types, pushes a `MonomorphizationFailed` error instead of silently
-/// dropping the call — see `derive_impl_instantiation`'s own doc comment
-/// for why that's a real, worth-reporting outcome and not the same as "not
-/// an algebra call at all". Either way (on success), records this specific
-/// call node's own resolved mangled name into `call_names` (consulted
-/// later by `dump_block_with_call_names`).
+/// Every `Lambda` expression, anywhere in any top-level `fn`'s body, that
+/// `infer.rs` actually generalized (has a `LambdaScheme` entry) — indexed
+/// once, up front, so the lambda-instantiation worklist (see `monomorphize`)
+/// can read a lambda's own `params`/`body` back from just its `NodeId`, the
+/// same way the fn/impl worklists already read theirs back from `functions`/
+/// `templates`. A lambda with no scheme entry (`let mut`-bound, so never
+/// generalized — see `Infer::lambda_schemes`'s own doc comment) is simply
+/// invisible here: nothing can specialize it via this mechanism, and no
+/// call to it is ever recognized as a lambda call either (`collect_
+/// instantiations_block`'s own scope only ever admits scheme-bearing ones).
+fn index_lambda_exprs<'a>(program: &'a Program, lambda_schemes: &HashMap<NodeId, Scheme>) -> HashMap<NodeId, &'a Expr> {
+    let mut out = HashMap::new();
+    for item in &program.items {
+        let ItemKind::Fn(f) = &item.kind else { continue };
+        let Some(body) = &f.body else { continue };
+        let mut exprs = Vec::new();
+        collect_exprs_block(body, &mut exprs);
+        for e in exprs {
+            if matches!(e.kind, ExprKind::Lambda { .. }) && lambda_schemes.contains_key(&e.id) {
+                out.insert(e.id, e);
+            }
+        }
+    }
+    out
+}
+
+/// Walks every `Call` node in `body`, tracking a shadowing-aware scope of
+/// which local names are currently `let`-bound to a (scheme-bearing) lambda
+/// — same walk shape, same shadowing discipline, as `cps.rs`'s own
+/// `mutated_free_vars`/`mutated_free_vars_expr` pair (see their doc
+/// comments); the two problems are structurally identical ("which local
+/// binding does this name currently refer to, respecting nested-scope
+/// shadowing"), just answering a different question about it.
+///
+/// For each `Call`, checked in this order:
+/// 1. Does the callee name resolve to a lambda currently in scope? If so,
+///    and it unifies (`derive_instantiation`, the exact same reverse-
+///    unification a top-level generic `fn` call already uses — a lambda's
+///    own `Scheme` has the identical `Ty::Fn(params, ret)` shape), push
+///    onto `lambda_worklist`. Checked *first*, deliberately: a local lambda
+///    binding shadowing a same-named top-level `fn` must resolve to the
+///    lambda, not the `fn` (`let f = fn(x){x}; f(5)` even when a top-level
+///    `fn f` also exists).
+/// 2. Otherwise, does it resolve, via `global_env`, to a *generic*
+///    top-level `fn`? Push onto `fn_worklist`.
+/// 3. Otherwise, try every `ImplTemplate` sharing that method name.
+///    `check_no_overlapping_impls` guarantees at most one can coherently
+///    unify against a given concrete query, so the first match found is
+///    pushed onto `impl_worklist` and the search stops. If templates
+///    existed for that name but *none* matched this specific call's own
+///    concrete types, pushes a `MonomorphizationFailed` error instead of
+///    silently dropping the call — see `derive_impl_instantiation`'s own
+///    doc comment for why that's a real, worth-reporting outcome.
+///
+/// Any of the three, on success, records this specific call node's own
+/// resolved mangled name into `call_names` (consulted later by both
+/// `dump_block_with_call_names` and `cps.rs`'s own call resolution).
 #[allow(clippy::too_many_arguments)]
 fn collect_instantiations(
     body: &Block,
     node_types: &HashMap<NodeId, Ty>,
     global_env: &Env,
     templates: &[ImplTemplate],
+    inherent_templates: &[InherentTemplate],
+    lambda_schemes: &HashMap<NodeId, Scheme>,
     fn_worklist: &mut Vec<(String, Vec<Ty>)>,
     impl_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
+    lambda_worklist: &mut Vec<(NodeId, Vec<Ty>)>,
+    inherent_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
     call_names: &mut HashMap<NodeId, String>,
     errors: &mut Vec<TypeError>,
 ) {
-    let mut exprs = Vec::new();
-    collect_exprs_block(body, &mut exprs);
-    for e in exprs {
-        let ExprKind::Call(path, _, args, ..) = &e.kind else { continue };
-        let name = path.segments.join("::");
+    let scope = HashMap::new();
+    collect_instantiations_block(
+        body,
+        node_types,
+        global_env,
+        templates,
+        inherent_templates,
+        lambda_schemes,
+        &scope,
+        fn_worklist,
+        impl_worklist,
+        lambda_worklist,
+        inherent_worklist,
+        call_names,
+        errors,
+    );
+}
 
-        if let Some(scheme) = global_env.get(&name) {
-            if scheme.vars.is_empty() {
-                continue;
+#[allow(clippy::too_many_arguments)]
+fn collect_instantiations_block(
+    block: &Block,
+    node_types: &HashMap<NodeId, Ty>,
+    global_env: &Env,
+    templates: &[ImplTemplate],
+    inherent_templates: &[InherentTemplate],
+    lambda_schemes: &HashMap<NodeId, Scheme>,
+    scope: &HashMap<String, NodeId>,
+    fn_worklist: &mut Vec<(String, Vec<Ty>)>,
+    impl_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
+    lambda_worklist: &mut Vec<(NodeId, Vec<Ty>)>,
+    inherent_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
+    call_names: &mut HashMap<NodeId, String>,
+    errors: &mut Vec<TypeError>,
+) {
+    let mut scope = scope.clone();
+    for stmt in &block.stmts {
+        match &stmt.kind {
+            StmtKind::Let { name, value, .. } => {
+                collect_instantiations_expr(
+                    value,
+                    node_types,
+                    global_env,
+                    templates,
+                    inherent_templates,
+                    lambda_schemes,
+                    &scope,
+                    fn_worklist,
+                    impl_worklist,
+                    lambda_worklist,
+                    inherent_worklist,
+                    call_names,
+                    errors,
+                );
+                if lambda_schemes.contains_key(&value.id) {
+                    scope.insert(name.clone(), value.id);
+                } else {
+                    // Re-`let`-bound to something else (or to an
+                    // un-generalized lambda) -- shadows any outer lambda
+                    // binding of the same name for the rest of this scope.
+                    scope.remove(name);
+                }
             }
-            if let Some(concrete_tys) = derive_instantiation(scheme, e, args, node_types) {
-                call_names.insert(e.id, display_instantiation(&name, &concrete_tys));
-                fn_worklist.push((name, concrete_tys));
+            StmtKind::Assign { target, value } => {
+                collect_instantiations_expr(
+                    target,
+                    node_types,
+                    global_env,
+                    templates,
+                    inherent_templates,
+                    lambda_schemes,
+                    &scope,
+                    fn_worklist,
+                    impl_worklist,
+                    lambda_worklist,
+                    inherent_worklist,
+                    call_names,
+                    errors,
+                );
+                collect_instantiations_expr(
+                    value,
+                    node_types,
+                    global_env,
+                    templates,
+                    inherent_templates,
+                    lambda_schemes,
+                    &scope,
+                    fn_worklist,
+                    impl_worklist,
+                    lambda_worklist,
+                    inherent_worklist,
+                    call_names,
+                    errors,
+                );
             }
-            continue;
+            StmtKind::Expr(e) => collect_instantiations_expr(
+                e,
+                node_types,
+                global_env,
+                templates,
+                inherent_templates,
+                lambda_schemes,
+                &scope,
+                fn_worklist,
+                impl_worklist,
+                lambda_worklist,
+                inherent_worklist,
+                call_names,
+                errors,
+            ),
         }
+    }
+    if let Some(tail) = &block.tail {
+        collect_instantiations_expr(
+            tail,
+            node_types,
+            global_env,
+            templates,
+            inherent_templates,
+            lambda_schemes,
+            &scope,
+            fn_worklist,
+            impl_worklist,
+            lambda_worklist,
+            inherent_worklist,
+            call_names,
+            errors,
+        );
+    }
+}
 
-        match derive_impl_instantiation(templates, &name, e, args, node_types) {
-            ImplMatch::Found(idx, mapping) => {
-                call_names.insert(e.id, display_impl_instantiation(&templates[idx], &mapping));
-                impl_worklist.push((idx, mapping));
+#[allow(clippy::too_many_arguments)]
+fn collect_instantiations_expr(
+    expr: &Expr,
+    node_types: &HashMap<NodeId, Ty>,
+    global_env: &Env,
+    templates: &[ImplTemplate],
+    inherent_templates: &[InherentTemplate],
+    lambda_schemes: &HashMap<NodeId, Scheme>,
+    scope: &HashMap<String, NodeId>,
+    fn_worklist: &mut Vec<(String, Vec<Ty>)>,
+    impl_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
+    lambda_worklist: &mut Vec<(NodeId, Vec<Ty>)>,
+    inherent_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
+    call_names: &mut HashMap<NodeId, String>,
+    errors: &mut Vec<TypeError>,
+) {
+    macro_rules! rec {
+        ($e:expr) => {
+            collect_instantiations_expr(
+                $e,
+                node_types,
+                global_env,
+                templates,
+                inherent_templates,
+                lambda_schemes,
+                scope,
+                fn_worklist,
+                impl_worklist,
+                lambda_worklist,
+                inherent_worklist,
+                call_names,
+                errors,
+            )
+        };
+    }
+    macro_rules! rec_block {
+        ($b:expr, $scope:expr) => {
+            collect_instantiations_block(
+                $b,
+                node_types,
+                global_env,
+                templates,
+                inherent_templates,
+                lambda_schemes,
+                $scope,
+                fn_worklist,
+                impl_worklist,
+                lambda_worklist,
+                inherent_worklist,
+                call_names,
+                errors,
+            )
+        };
+    }
+    match &expr.kind {
+        ExprKind::NumberLit { .. } | ExprKind::ImaginaryLit { .. } | ExprKind::BoolLit(_) | ExprKind::Path(_) => {}
+        ExprKind::Call(path, _, args, ..) => {
+            // A callable passed as a bare argument (`apply(inc, 5)`) — see
+            // `derive_value_instantiation`'s own doc comment for why this
+            // can't just fall out of the ordinary recursive `rec!(a)` walk
+            // just below (a `Path` argument is otherwise a structural
+            // no-op). Checked for *every* argument, not just ones a later
+            // pass (`cps.rs`'s own Stage B) will actually treat as higher-
+            // order — cheap, and correctly a no-op (`scope.get` misses)
+            // for an ordinary, non-lambda-bound argument.
+            for a in args {
+                let ExprKind::Path(p) = &a.kind else { continue };
+                let Some(&lambda_id) = scope.get(&p.segments.join("::")) else { continue };
+                let Some(scheme) = lambda_schemes.get(&lambda_id) else { continue };
+                if let Some(concrete_tys) = derive_value_instantiation(scheme, node_types, a.id) {
+                    call_names.insert(a.id, display_lambda_instantiation(lambda_id, &concrete_tys));
+                    lambda_worklist.push((lambda_id, concrete_tys));
+                }
             }
-            ImplMatch::NoCandidates => {} // not an algebra call, or a non-generic one -- nothing to do here
-            ImplMatch::NoneMatched { algebra, tys } => {
-                errors.push(TypeError {
-                    span: e.span,
-                    kind: TypeErrorKind::MonomorphizationFailed { algebra, method: name, tys },
-                });
+            args.iter().for_each(|a| rec!(a));
+            let name = path.segments.join("::");
+
+            if let Some(&lambda_id) = scope.get(&name) {
+                if let Some(scheme) = lambda_schemes.get(&lambda_id) {
+                    if let Some(concrete_tys) = derive_instantiation(scheme, expr, args, node_types) {
+                        call_names.insert(expr.id, display_lambda_instantiation(lambda_id, &concrete_tys));
+                        lambda_worklist.push((lambda_id, concrete_tys));
+                    }
+                }
+                return;
             }
+
+            if let Some(scheme) = global_env.get(&name) {
+                if !scheme.vars.is_empty() {
+                    if let Some(concrete_tys) = derive_instantiation(scheme, expr, args, node_types) {
+                        call_names.insert(expr.id, display_instantiation(&name, &concrete_tys));
+                        fn_worklist.push((name, concrete_tys));
+                    }
+                }
+                return;
+            }
+
+            match derive_impl_instantiation(templates, &name, expr, args, node_types) {
+                ImplMatch::Found(idx, mapping) => {
+                    call_names.insert(expr.id, display_impl_instantiation(&templates[idx], &mapping));
+                    impl_worklist.push((idx, mapping));
+                }
+                ImplMatch::NoCandidates => {} // not an algebra call, or a non-generic one -- nothing to do here
+                ImplMatch::NoneMatched { algebra, tys } => {
+                    errors.push(TypeError {
+                        span: expr.span,
+                        kind: TypeErrorKind::MonomorphizationFailed { algebra, method: name, tys },
+                    });
+                }
+            }
+        }
+        ExprKind::FieldAccess(base, _) => rec!(base),
+        // `v.method(args)` -- unlike an algebra call, an inherent method's
+        // own struct is *already known* directly from `base`'s own resolved
+        // type (`node_types`), so this is a plain `(struct_name, method_
+        // name)` lookup among `inherent_templates`, not a structural
+        // candidate search (see `InherentTemplate`'s own doc comment for
+        // why there's at most one to find). A non-generic inherent method
+        // needs no entry here at all -- `cps.rs`'s own `resolve_method_call`
+        // falls back to its own bare `struct::method` unit name directly,
+        // the same "no call_names entry needed" shape a non-generic
+        // top-level `fn`/algebra impl already has.
+        ExprKind::MethodCall(base, name, args) => {
+            rec!(base);
+            args.iter().for_each(|a| rec!(a));
+            if let Some(struct_name) = node_types.get(&base.id).and_then(|t| match t {
+                Ty::Con(n) | Ty::App(n, _) => Some(n.clone()),
+                _ => None,
+            }) {
+                if let Some((idx, template)) =
+                    inherent_templates.iter().enumerate().find(|(_, t)| t.struct_name == struct_name && t.method_name == *name)
+                {
+                    if let Some(mapping) = derive_inherent_instantiation(template, expr, base, args, node_types) {
+                        call_names.insert(expr.id, display_inherent_instantiation(template, &mapping));
+                        inherent_worklist.push((idx, mapping));
+                    }
+                }
+            }
+        }
+        ExprKind::Index(base, idx) => {
+            rec!(base);
+            rec!(idx);
+        }
+        ExprKind::ArrayLit(elems) => elems.iter().for_each(|e| rec!(e)),
+        ExprKind::ArrayRepeat { value, count } => {
+            rec!(value);
+            rec!(count);
+        }
+        ExprKind::StructLit(_, _, fields) => fields.iter().for_each(|(_, v)| rec!(v)),
+        ExprKind::If { cond, then_branch, else_branch } => {
+            rec!(cond);
+            rec_block!(then_branch, scope);
+            if let Some(eb) = else_branch {
+                match &**eb {
+                    ElseBranch::If(e) => rec!(e),
+                    ElseBranch::Block(b) => rec_block!(b, scope),
+                }
+            }
+        }
+        ExprKind::While { cond, body } => {
+            rec!(cond);
+            rec_block!(body, scope);
+        }
+        ExprKind::For { var, start, end, body } => {
+            rec!(start);
+            rec!(end);
+            let mut inner = scope.clone();
+            inner.remove(var);
+            rec_block!(body, &inner);
+        }
+        ExprKind::Block(b) => rec_block!(b, scope),
+        ExprKind::Lambda { params, body, .. } => {
+            let mut inner = scope.clone();
+            for p in params {
+                inner.remove(&p.name);
+            }
+            rec_block!(body, &inner);
         }
     }
 }
@@ -589,12 +1103,46 @@ fn derive_impl_instantiation(
     }
 }
 
+/// Like `derive_instantiation`, but for a lambda-bound name used as a bare
+/// *value* (an argument to a higher-order call, `apply(inc, 5)`) rather than
+/// itself being called at this site — unifies `scheme.ty` directly against
+/// the reference's own already-resolved concrete type (`node_types
+/// [node_id]`, pinned by ordinary unification against whatever position it
+/// was passed into — e.g. a higher-order parameter's own declared `Ty::Fn`,
+/// exactly the way an ordinary generic argument gets pinned by the
+/// parameter it's passed to) instead of building a synthetic `Ty::Fn(args,
+/// ret)` query the way a real call site needs to (there's no argument list/
+/// return type of *this* reference's own to build one from — it's a bare
+/// value, not a call). See `cps.rs`'s own closure-conversion module doc
+/// comment ("higher-order calls") for why this needs to exist at all: a
+/// callable passed as a bare argument never becomes a `Call` node of its
+/// own, so `collect_instantiations_expr`'s ordinary per-`Call` detection
+/// alone would never discover that it needs its own specialization built.
+fn derive_value_instantiation(scheme: &Scheme, node_types: &HashMap<NodeId, Ty>, node_id: NodeId) -> Option<Vec<Ty>> {
+    let ty = node_types.get(&node_id)?.clone();
+    let mut trial = Subst::default();
+    unify(&mut trial, &scheme.ty, &ty).ok()?;
+    Some(scheme.vars.iter().map(|v| trial.apply(&Ty::Var(*v))).collect())
+}
+
 fn display_instantiation(name: &str, tys: &[Ty]) -> String {
     if tys.is_empty() {
         name.to_string()
     } else {
         format!("{name}<{}>", tys.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "))
     }
+}
+
+/// A lambda has no source-level name of its own to key its display string
+/// off of (unlike `display_instantiation`) — its own `NodeId` is the only
+/// thing that's actually unique to it (two lambdas bound to the same local
+/// name `f` in two different functions are two different `NodeId`s, and
+/// must render as two different mangled names). `#`, not `::`, deliberately
+/// unparseable as an ordinary path segment — never meant to round-trip
+/// through the grammar, only to be a unique `specializations`/`by_origin`
+/// key and a readable `--dump-monomorphized` label.
+fn display_lambda_instantiation(id: NodeId, tys: &[Ty]) -> String {
+    display_instantiation(&format!("<lambda#{}>", id.0), tys)
 }
 
 /// The impl-side equivalent of `display_instantiation` — described by its
@@ -607,12 +1155,53 @@ fn display_impl_instantiation(t: &ImplTemplate, mapping: &HashMap<TyVar, Ty>) ->
     format!("{}::{}<{}>", t.algebra, t.method_name, targets)
 }
 
+/// The inherent-impl counterpart to `derive_instantiation`/`derive_impl_
+/// instantiation` — no candidate search needed (see `InherentTemplate`'s
+/// own doc comment), so this is called only once the caller already knows,
+/// structurally, which single template applies (matched by `struct_name`/
+/// `method_name` directly). Unifies the template's own `(param_patterns) ->
+/// ret_pattern` against the call's own concrete `(base_ty, arg_tys...) ->
+/// ret_ty` (`base` first, positionally — it fills the method's own first
+/// parameter, an ordinary explicit slot, not a magic `self`), then reads
+/// back bindings for every free variable the template mentions anywhere in
+/// either.
+fn derive_inherent_instantiation(
+    template: &InherentTemplate,
+    call: &Expr,
+    base: &Expr,
+    args: &[Expr],
+    node_types: &HashMap<NodeId, Ty>,
+) -> Option<HashMap<TyVar, Ty>> {
+    let base_ty = node_types.get(&base.id)?.clone();
+    let mut arg_tys = vec![base_ty];
+    arg_tys.extend(args.iter().map(|a| node_types.get(&a.id).cloned()).collect::<Option<Vec<_>>>()?);
+    let ret_ty = node_types.get(&call.id)?.clone();
+    let query = Ty::Fn(arg_tys, Box::new(ret_ty));
+    let pattern = Ty::Fn(template.param_patterns.clone(), Box::new(template.ret_pattern.clone()));
+    let mut trial = Subst::default();
+    unify(&mut trial, &pattern, &query).ok()?;
+    let mut vars = HashSet::new();
+    template.param_patterns.iter().for_each(|p| free_vars(p, &mut vars));
+    free_vars(&template.ret_pattern, &mut vars);
+    Some(vars.into_iter().map(|v| (v, trial.apply(&Ty::Var(v)))).collect())
+}
+
+/// The inherent-impl counterpart to `display_impl_instantiation` — described
+/// by the concrete *receiver* type (`param_patterns[0]`, substituted; see
+/// `InherentTemplate`'s own doc comment for why that's already the target
+/// pattern, no separate field to read), the same "reader thinks in terms of
+/// the operand shapes actually involved" reasoning.
+fn display_inherent_instantiation(t: &InherentTemplate, mapping: &HashMap<TyVar, Ty>) -> String {
+    let target = substitute(&t.param_patterns[0], mapping);
+    format!("{}::{}<{}>", t.struct_name, t.method_name, target)
+}
+
 /// Collects every sub-expression of `expr`, including `expr` itself, into
 /// `out` — mirrors `callgraph.rs`'s own private `collect_calls_expr`
 /// traversal shape (same exhaustive per-`ExprKind` structure), but collects
 /// *every* node reference here, not just `Call`s by name, since this is
 /// also used to build a specialization's own substituted `node_types`.
-fn collect_exprs<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+pub(crate) fn collect_exprs<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
     out.push(expr);
     match &expr.kind {
         ExprKind::NumberLit { .. } | ExprKind::ImaginaryLit { .. } | ExprKind::BoolLit(_) | ExprKind::Path(_) => {}
@@ -656,7 +1245,7 @@ fn collect_exprs<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
     }
 }
 
-fn collect_exprs_block<'a>(block: &'a Block, out: &mut Vec<&'a Expr>) {
+pub(crate) fn collect_exprs_block<'a>(block: &'a Block, out: &mut Vec<&'a Expr>) {
     for stmt in &block.stmts {
         match &stmt.kind {
             StmtKind::Let { value, .. } => collect_exprs(value, out),

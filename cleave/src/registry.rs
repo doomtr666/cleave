@@ -55,6 +55,16 @@ struct AlgebraEntry {
     /// data, see the module doc).
     bounds: Vec<String>,
     sigs: Vec<FnSig>,
+    /// Every `axiom` declared directly on this algebra (`algebra Ring<T> {
+    /// axiom add_commutative(a, b): add(a, b) == add(b, a); }`) — trusted,
+    /// unverified assertions over the algebra's own generic `T` (`doc/
+    /// hld.md`'s own "v1 trust model": no per-concrete-impl soundness gate,
+    /// an axiom holds for every `T` a `Ring` impl exists for, exactly like
+    /// a Rust trait impl is trusted rather than proven). Consumed by a later
+    /// e-graph rewriting pass, once one exists; retained here purely as data
+    /// — same "just data, no validation" stance the rest of this module
+    /// already takes (see its own doc comment).
+    axioms: Vec<AxiomDecl>,
     /// Keyed by the target type's canonical string (`fmt_type`) — same
     /// grouping key `driver.rs` uses to merge `impl` fragments.
     impls: HashMap<String, ImplEntry>,
@@ -93,10 +103,19 @@ impl Registry {
                         AlgebraItemKind::Axiom(_) => None,
                     })
                     .collect();
+                let axioms = d
+                    .items
+                    .iter()
+                    .filter_map(|ai| match &ai.kind {
+                        AlgebraItemKind::Axiom(axiom) => Some(axiom.clone()),
+                        AlgebraItemKind::FnSig(_) => None,
+                    })
+                    .collect();
                 algebras.entry(d.name.clone()).or_insert_with(|| AlgebraEntry {
                     generics: d.generics.clone(),
                     bounds: d.bounds.clone(),
                     sigs,
+                    axioms,
                     impls: HashMap::new(),
                 });
             }
@@ -108,6 +127,7 @@ impl Registry {
                     generics: Vec::new(),
                     bounds: Vec::new(),
                     sigs: Vec::new(),
+                    axioms: Vec::new(),
                     impls: HashMap::new(),
                 });
                 // `fmt_type(target)` alone would collide two *different*
@@ -236,6 +256,14 @@ impl Registry {
     /// module doc).
     pub fn algebra_bounds(&self, algebra: &str) -> &[String] {
         self.algebras.get(algebra).map(|e| e.bounds.as_slice()).unwrap_or(&[])
+    }
+
+    /// Every `axiom` declared on `algebra` — see `AlgebraEntry::axioms`'s own
+    /// doc comment. Empty, not missing, for an algebra with none (mirrors
+    /// `algebra_bounds`'s own convention just above) and for an unknown
+    /// algebra name entirely.
+    pub fn axioms(&self, algebra: &str) -> &[AxiomDecl] {
+        self.algebras.get(algebra).map(|e| e.axioms.as_slice()).unwrap_or(&[])
     }
 
     /// The reverse of `algebra_bounds`: every algebra that names `algebra`

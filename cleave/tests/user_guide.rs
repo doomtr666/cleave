@@ -263,45 +263,20 @@ fn algebras_how_operators_actually_work() {
 
 // ---------------------------------------------------------------- Inherent impls
 
-/// `v.magnitude_sq()` (dot-method-call syntax) type-checks fine (`infer.rs`'s
-/// own dispatch through `registry.inherent_method`), but `cps.rs` has no
-/// `ExprKind::MethodCall` conversion arm at all yet -- confirmed by direct
-/// testing, now `doc/backlog.md`'s own item 9 -- so it can't be JIT-executed
-/// (`run_i32`) the way every other example in this file is. Only the
-/// type-checking half is verified here; `inherent_impl_method_runs` below
-/// proves the *method itself* actually computes correctly, called as an
-/// ordinary function (`magnitude_sq(v)`, always fully supported) instead.
+/// `doc/user_guide.md`'s own "Inherent impls" example, run for real via
+/// dot-call syntax (`v.magnitude_sq()`) -- previously caveated as "type-
+/// checks but can't be JIT-executed yet" (`cps.rs` had no `ExprKind::
+/// MethodCall` conversion arm at all; `doc/backlog.md`'s own item 7).
 #[test]
-fn inherent_impl_method_type_checks() {
+fn inherent_impl_method_computes_the_right_value_via_dot_syntax() {
+    let context = context();
     let src = "
         struct Vec2 { x: f64, y: f64 }
         impl struct Vec2 {
             fn magnitude_sq(v) -> f64 { v.x * v.x + v.y * v.y }
         }
-        fn f(v: Vec2) -> f64 {
-            v.magnitude_sq()
-        }
-        fn main() -> i32 { 0 }
-    ";
-    let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
-    assert!(result.is_ok(), "expected this to type-check: {result:?}");
-}
-
-/// An inherent method's own body (the arithmetic itself) is ordinary and
-/// runs fine -- proven here without going through *either* the still-
-/// unsupported `.method()` dot-call, or a bare `magnitude_sq(v)` call
-/// (inherent methods aren't reachable that way either -- confirmed by
-/// direct testing, a bare call to one leaves the caller's own return type
-/// unresolved). Inlined directly instead: exactly `magnitude_sq`'s own
-/// declared body, called as a plain top-level `fn`.
-#[test]
-fn inherent_impl_method_body_computes_the_right_value() {
-    let context = context();
-    let src = "
-        struct Vec2 { x: f64, y: f64 }
-        fn magnitude_sq(v: Vec2) -> f64 { v.x * v.x + v.y * v.y }
         fn main() -> i32 {
-            if magnitude_sq(Vec2(x: 1.0, y: 2.0)) == 5.0 { 1 } else { 0 }
+            if Vec2(x: 1.0, y: 2.0).magnitude_sq() == 5.0 { 1 } else { 0 }
         }
     ";
     assert_eq!(run_i32(&context, src), 1);
@@ -431,11 +406,8 @@ fn heterogeneous_algebra_matrix_multiplication() {
 // ---------------------------------------------------------------- Higher-order functions
 
 #[test]
-fn higher_order_function_type_checks() {
-    // Lambdas type-check (see doc/user_guide.md's own caveat) but can't be
-    // lowered to MLIR yet -- closure conversion isn't implemented (`doc/
-    // backlog.md` item 3) -- so this only proves the *type-checking* half,
-    // via the driver's own `Result`, not `run_i32`.
+fn higher_order_function_computes_the_right_value() {
+    let context = context();
     let src = "
         fn apply(f: (i32) -> i32, x: i32) -> i32 {
             f(x)
@@ -446,8 +418,7 @@ fn higher_order_function_type_checks() {
         }
         fn main() -> i32 { g() }
     ";
-    let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
-    assert!(result.is_ok(), "expected this to type-check: {result:?}");
+    assert_eq!(run_i32(&context, src), 6);
 }
 
 // ---------------------------------------------------------------- extern fn / print

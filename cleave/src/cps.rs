@@ -126,11 +126,62 @@ pub struct ConcreteUnit {
     pub param_types: Vec<Ty>,
     pub result: Ty,
     pub node_types: HashMap<NodeId, Ty>,
+    /// `Some((algebra, method))` for a unit built from an algebra-impl
+    /// method (concrete or generic-specialized alike) — `None` for a
+    /// top-level `fn`, an inherent-impl method, or a lambda unit. Threaded
+    /// structurally at construction time, in `collect_units`'s own two
+    /// `ItemKind::Impl` branches, where `d.algebra`/`f.name` are already
+    /// directly on hand — deliberately *not* something a later pass has to
+    /// recover by parsing a unit's own display name back apart (`"Ring::
+    /// add<i32>"` is a one-way `format!`, `monomorphize.rs::display_impl_
+    /// instantiation`'s own doc comment; no parser for it exists or should).
+    /// First consumer: a later e-graph pass matching a call site's own
+    /// callee against an `axiom`'s declared algebra/method name directly,
+    /// without caring which concrete instantiation this particular unit is.
+    pub origin: Option<(String, String)>,
     /// This unit's own resolved mangled-callee-name map, exactly as
     /// `monomorphize.rs` already builds it — empty for a concrete impl
     /// method (no specialization involved, see the module's own doc
     /// comment on `call_index` for how those calls resolve instead).
     pub call_names: HashMap<NodeId, String>,
+    /// How many of `params`'/`param_types`' own *leading* entries are
+    /// synthesized capture parameters rather than the unit's own originally
+    /// declared ones — `0` for every ordinary unit (a ordinary `fn`/impl
+    /// method never has any; see `capture_names`'s own doc comment for why
+    /// a Stage-A lambda unit's own are always prepended, never interleaved).
+    /// Consulted only by Stage B's own callee-specialization pass, to know
+    /// how many of a *resolved callable*'s own leading params to splice into
+    /// a specialized callee's own signature as its own new leading params
+    /// (`build_higher_order_specializations`) — a Stage-B-specialized unit's
+    /// own value here is `0` too: nothing downstream needs to treat *it* as
+    /// itself further passable as a callable, out of scope for this pass.
+    pub capture_count: usize,
+    /// **Higher-order calls only** (see the module's own doc comment,
+    /// "Stage B: higher-order calls"). One entry per erased, function-typed
+    /// parameter this unit's own signature *used to* declare before Stage B
+    /// baked one specific passed-in callable directly into it — `String` is
+    /// that erased parameter's own original name, `Vec<String>` is the
+    /// ordered list of this *same* unit's own leading capture-parameter
+    /// names (already present in `params`, above) whose bound `CVal`s
+    /// become that callable's own `CVal::Closure::captures` inside this
+    /// unit's initial `env` (`convert_program`'s own per-unit setup —
+    /// ordinary parameter binding alone never touches a name that isn't in
+    /// `params` at all, which the erased parameter deliberately isn't).
+    /// Empty for every *ordinary* unit (Stage A fn/impl/lambda alike).
+    pub baked_closures: Vec<(String, Vec<String>)>,
+    /// **Higher-order calls only.** For a `Call` node inside *this* unit's
+    /// own body that Stage B recognized as passing a callable (lambda-bound
+    /// or a bare top-level `fn` name) into one of the *callee*'s own
+    /// higher-order parameters: the 0-based positions, among that call's
+    /// own source-level argument list, of every such callable argument —
+    /// `convert_expr`'s own `Call` arm reads this *before* evaluating
+    /// arguments normally, since a callable argument doesn't convert to an
+    /// ordinary `CVal` at all (its own captures get spliced in instead —
+    /// see that arm's own doc comment). `call_names` (above) already
+    /// carries *which* specialized callee unit this same call now resolves
+    /// to — this only carries *which argument positions* were erased to get
+    /// there. Empty for every call that doesn't need this.
+    pub higher_order_args: HashMap<NodeId, Vec<usize>>,
     pub body: UnitBody,
 }
 
@@ -227,6 +278,10 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                         result: fn_result.result.clone(),
                         node_types: program_inference.node_types.clone(),
                         call_names: mono.seed_call_names().clone(),
+                        origin: None,
+                        capture_count: 0,
+                        baked_closures: Vec::new(),
+                        higher_order_args: HashMap::new(),
                         body,
                     });
                 } else {
@@ -238,6 +293,10 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                             result: mono.result(key).clone(),
                             node_types: mono.node_types(key).clone(),
                             call_names: mono.call_names(key).clone(),
+                            origin: None,
+                            capture_count: 0,
+                            baked_closures: Vec::new(),
+                            higher_order_args: HashMap::new(),
                             body: UnitBody::Real(mono.body(key).clone()),
                         });
                     }
@@ -274,6 +333,10 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                         result: ret,
                         node_types: infer.node_types.clone(),
                         call_names: HashMap::new(),
+                        origin: Some((d.algebra.clone(), f.name.clone())),
+                        capture_count: 0,
+                        baked_closures: Vec::new(),
+                        higher_order_args: HashMap::new(),
                         body,
                     });
                 }
@@ -282,8 +345,8 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                 // Generic algebra impl — every specialization actually
                 // reached, already built by `monomorphize`.
                 for f in &d.fns {
-                    let origin = format!("{}::{}", d.algebra, f.name);
-                    for key in mono.specializations_of(&origin) {
+                    let origin_key = format!("{}::{}", d.algebra, f.name);
+                    for key in mono.specializations_of(&origin_key) {
                         units.push(ConcreteUnit {
                             name: key.clone(),
                             params: mono.params(key).to_vec(),
@@ -291,6 +354,73 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                             result: mono.result(key).clone(),
                             node_types: mono.node_types(key).clone(),
                             call_names: mono.call_names(key).clone(),
+                            origin: Some((d.algebra.clone(), f.name.clone())),
+                            capture_count: 0,
+                            baked_closures: Vec::new(),
+                            higher_order_args: HashMap::new(),
+                            body: UnitBody::Real(mono.body(key).clone()),
+                        });
+                    }
+                }
+            }
+            ItemKind::InherentImpl(d) if d.generics.is_empty() => {
+                // Non-generic inherent impl — either a concrete struct with
+                // no generics of its own, or a generic struct impl'd at one
+                // specific instantiation (`impl Vec2<f64> { ... }`). Mirrors
+                // the non-generic-algebra-impl branch above (re-infer
+                // directly, no template needed) but through `infer_
+                // inherent_impl_block` instead of a per-method call — one
+                // shared `Infer` across every method of *this* impl block
+                // gives real mutual recursion between sibling methods for
+                // free (`w.dec().is_odd()` calling back into a sibling
+                // `is_even`), the same way `callgraph::infer_program`
+                // already does for a mutually-recursive top-level `fn`
+                // group.
+                let TypeKind::Path(p, _) = &d.target.kind else { continue };
+                let struct_name = p.segments.join("::");
+                let mut infer = Infer::new(registry);
+                let results = infer.infer_inherent_impl_block(&program_inference.global_env, &d.generics, &d.target, &d.fns, item.span);
+                for f in &d.fns {
+                    let Some(Ok((param_types, result))) = results.get(&f.name) else { continue }; // already reported via --dump-inference-pass
+                    // A bodyless inherent method has no `#[mlir(...)]`/
+                    // `extern`-style intrinsic equivalent yet — nothing to
+                    // build a unit from.
+                    let Some(body) = &f.body else { continue };
+                    units.push(ConcreteUnit {
+                        name: format!("{struct_name}::{}", f.name),
+                        params: f.params.clone(),
+                        param_types: param_types.clone(),
+                        result: result.clone(),
+                        node_types: infer.node_types.clone(),
+                        call_names: HashMap::new(),
+                        origin: None,
+                        capture_count: 0,
+                        baked_closures: Vec::new(),
+                        higher_order_args: HashMap::new(),
+                        body: UnitBody::Real(body.clone()),
+                    });
+                }
+            }
+            ItemKind::InherentImpl(d) => {
+                // Generic inherent impl — every specialization actually
+                // reached, already built by `monomorphize`'s own inherent-
+                // method worklist.
+                let TypeKind::Path(p, _) = &d.target.kind else { continue };
+                let struct_name = p.segments.join("::");
+                for f in &d.fns {
+                    let origin_key = format!("{struct_name}::{}", f.name);
+                    for key in mono.specializations_of(&origin_key) {
+                        units.push(ConcreteUnit {
+                            name: key.clone(),
+                            params: mono.params(key).to_vec(),
+                            param_types: mono.param_types(key).to_vec(),
+                            result: mono.result(key).clone(),
+                            node_types: mono.node_types(key).clone(),
+                            call_names: mono.call_names(key).clone(),
+                            origin: None,
+                            capture_count: 0,
+                            baked_closures: Vec::new(),
+                            higher_order_args: HashMap::new(),
                             body: UnitBody::Real(mono.body(key).clone()),
                         });
                     }
@@ -299,7 +429,269 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
             _ => {}
         }
     }
+
+    // Every `let`-bound lambda's own specialization, discovered and built by
+    // `monomorphize.rs`'s own lambda worklist — one `ConcreteUnit` per
+    // concrete instantiation actually reached, exactly the treatment a
+    // generic top-level `fn`/algebra-impl method already gets above. Unlike
+    // those, a lambda's own `params`/`param_types` here are *widened*:
+    // `lambda_free_vars` (this module's own capture analysis, run once per
+    // specialization — see its own doc comment for why that's safe despite
+    // no shared cache) prepends one leading parameter per free variable the
+    // lambda's own body references from its enclosing scope, in sorted-name
+    // order — the exact same order `convert_stmts`'s own `StmtKind::Let`
+    // arm gathers each capture's own `CVal` in when it builds a `CVal::
+    // Closure` for this same lambda, so positions line up at every call
+    // site. Not iterated via `program.items` (a lambda has no top-level
+    // item of its own) — `program_inference.lambda_schemes`' own keys are
+    // every scheme-bearing (i.e. `let`, non-`let mut`-bound) lambda `NodeId`
+    // in the whole program, reached or not; `specializations_of` on each
+    // one's own mangled origin is empty (not missing) for one never actually
+    // called from any concrete entry point, same convention as an unreached
+    // generic `fn`.
+    for lambda_id in program_inference.lambda_schemes.keys().copied() {
+        let origin = format!("<lambda#{}>", lambda_id.0);
+        for key in mono.specializations_of(&origin) {
+            let own_params = mono.params(key);
+            let body = mono.body(key);
+            let node_types = mono.node_types(key);
+            let captures = lambda_free_vars(own_params, body, node_types);
+            let capture_names = sorted_capture_names(&captures);
+
+            let mut params: Vec<Param> = capture_names.iter().map(|n| Param { name: n.clone(), ty: None }).collect();
+            params.extend(own_params.iter().cloned());
+            let mut param_types: Vec<Ty> = capture_names.iter().map(|n| captures[n].clone()).collect();
+            param_types.extend(mono.param_types(key).iter().cloned());
+
+            units.push(ConcreteUnit {
+                name: key.clone(),
+                params,
+                param_types,
+                result: mono.result(key).clone(),
+                node_types: node_types.clone(),
+                call_names: mono.call_names(key).clone(),
+                origin: None,
+                capture_count: capture_names.len(),
+                baked_closures: Vec::new(),
+                higher_order_args: HashMap::new(),
+                body: UnitBody::Real(body.clone()),
+            });
+        }
+    }
+
+    build_higher_order_specializations(&mut units);
+
     units
+}
+
+/// **Stage B: higher-order calls.** `apply(inc, 5)` — `apply`'s own
+/// declared signature (`f: (i32) -> i32, x: i32`) is fully concrete (no
+/// `monomorphize.rs`-visible type variable anywhere in it: `(i32) -> i32`
+/// is just an ordinary type), so `apply` gets exactly *one* `ConcreteUnit`
+/// from the rest of `collect_units` above, same as any other non-generic
+/// top-level `fn` — nothing about *that* unit says anything about which
+/// concrete callable `f` is bound to at any particular call site. Every
+/// caller passing a *different* callable needs its own specialized copy of
+/// `apply`'s own body, with `f` "erased" (dropped from the signature
+/// entirely — a compile-time-known callable is never a runtime value) and
+/// every call to it *inside* `apply`'s own body redirected straight to
+/// that specific callable's own unit — the exact same "reverse-derive an
+/// instantiation, build one specialization per distinct one reached"
+/// discipline `monomorphize.rs` already uses for an ordinary generic `fn`,
+/// just keyed by "which callable" instead of "which type", and living here
+/// (not there) since it needs `ConcreteUnit`/`CVal` concepts monomorphize.rs
+/// doesn't have.
+///
+/// Two passes, not a full worklist to a fixpoint (out of scope for this
+/// pass — a *nested* higher-order call, one only reachable from *inside* a
+/// just-built specialization, isn't discovered; flag as a follow-up if a
+/// real program hits it):
+///
+/// 1. **Detect.** Walk every already-collected unit's own body (fn/impl/
+///    lambda alike — the *caller* can be any of them) for a `Call` whose
+///    argument list includes at least one `Ty::Fn`-typed, `Path`-shaped
+///    argument that resolves to a known callable — either a lambda-bound
+///    name (`u.call_names`, already populated for exactly this by
+///    `monomorphize.rs`'s own extended argument-scanning — see
+///    `derive_value_instantiation`'s own doc comment) or a bare top-level
+///    `fn`'s own unit name directly. The call's own *callee* is resolved
+///    the same three-tier way `resolve_call` itself would (mirrored here,
+///    not reused, since there's no `Ctx` yet at this point in `collect_
+///    units` — units are still being assembled).
+/// 2. **Specialize.** For each distinct `(callee unit, [erased position ->
+///    resolved callable])` combination actually found (memoized — two call
+///    sites passing the *same* callable to the *same* callee share one
+///    specialization; two passing *different* callables each get their
+///    own, the "two distinct callables" verification case), build one new
+///    `ConcreteUnit`: its own params = every resolved callable's own
+///    leading capture params (`ConcreteUnit::capture_count`), in erased-
+///    position order, followed by the callee's own *remaining* (non-
+///    erased) params unchanged — then every call inside the callee's own
+///    body whose bare name is exactly an erased parameter's own original
+///    name gets a `call_names` override pointing straight at the resolved
+///    callable's own unit, plus a `baked_closures` entry so `convert_
+///    program`'s own per-unit setup binds that erased name to a `CVal::
+///    Closure` over the freshly-spliced-in capture params (see `Concrete
+///    Unit::baked_closures`'s own doc comment for why both pieces are
+///    needed together). Every *caller* of a redirected call gets its own
+///    `call_names` entry overridden to the specialized unit, plus a
+///    `higher_order_args` entry recording which argument positions
+///    `convert_expr`'s own `Call` arm must splice captures into instead of
+///    evaluating normally.
+fn build_higher_order_specializations(units: &mut Vec<ConcreteUnit>) {
+    let call_index = build_call_index(units);
+    let unit_index: HashMap<String, usize> = units.iter().enumerate().map(|(i, u)| (u.name.clone(), i)).collect();
+
+    struct HigherOrderCall {
+        caller_idx: usize,
+        call_id: NodeId,
+        callee_unit_name: String,
+        /// `(argument position, resolved callable's own unit name)`, sorted
+        /// by position — the memoization/display key both need a
+        /// deterministic order.
+        erased: Vec<(usize, String)>,
+    }
+
+    let mut found: Vec<HigherOrderCall> = Vec::new();
+    for (caller_idx, u) in units.iter().enumerate() {
+        let UnitBody::Real(body) = &u.body else { continue };
+        let mut exprs = Vec::new();
+        monomorphize::collect_exprs_block(body, &mut exprs);
+        for e in exprs {
+            let ExprKind::Call(path, _, args, ..) = &e.kind else { continue };
+            let mut erased = Vec::new();
+            for (i, a) in args.iter().enumerate() {
+                if !matches!(u.node_types.get(&a.id), Some(Ty::Fn(..))) {
+                    continue;
+                }
+                let resolved = if let Some(mangled) = u.call_names.get(&a.id) {
+                    Some(mangled.clone())
+                } else if let ExprKind::Path(p) = &a.kind {
+                    let bare = p.segments.join("::");
+                    unit_index.contains_key(&bare).then_some(bare)
+                } else {
+                    None
+                };
+                if let Some(callable) = resolved {
+                    erased.push((i, callable));
+                }
+            }
+            if erased.is_empty() {
+                continue;
+            }
+            let name = path.segments.join("::");
+            let callee_unit_name = if let Some(mangled) = u.call_names.get(&e.id) {
+                mangled.clone()
+            } else if unit_index.contains_key(&name) {
+                name.clone()
+            } else {
+                let arg_tys: Vec<String> = args.iter().map(|a| u.node_types[&a.id].to_string()).collect();
+                let ret_ty = u.node_types[&e.id].to_string();
+                match call_index.get(&(name.clone(), arg_tys, ret_ty)) {
+                    Some(n) => n.clone(),
+                    // Can't resolve the callee itself at all -- not this
+                    // pass's problem to diagnose; leave it for `resolve_
+                    // call`'s own panic once real conversion reaches it.
+                    None => continue,
+                }
+            };
+            found.push(HigherOrderCall { caller_idx, call_id: e.id, callee_unit_name, erased });
+        }
+    }
+
+    if found.is_empty() {
+        return;
+    }
+
+    let mut specialized: HashMap<(String, Vec<(usize, String)>), String> = HashMap::new();
+    let mut new_units: Vec<ConcreteUnit> = Vec::new();
+
+    for call in &found {
+        let key = (call.callee_unit_name.clone(), call.erased.clone());
+        if specialized.contains_key(&key) {
+            continue;
+        }
+        let Some(&callee_idx) = unit_index.get(&call.callee_unit_name) else { continue };
+        let UnitBody::Real(callee_body) = &units[callee_idx].body else { continue };
+        let callee_body = callee_body.clone();
+        let callee_params = units[callee_idx].params.clone();
+        let callee_param_types = units[callee_idx].param_types.clone();
+        let callee_result = units[callee_idx].result.clone();
+        let callee_node_types = units[callee_idx].node_types.clone();
+        let mut inner_call_names = units[callee_idx].call_names.clone();
+
+        let erased_positions: HashSet<usize> = call.erased.iter().map(|(i, _)| *i).collect();
+
+        let mut new_params: Vec<Param> = Vec::new();
+        let mut new_param_types: Vec<Ty> = Vec::new();
+        let mut baked_closures: Vec<(String, Vec<String>)> = Vec::new();
+
+        for (pos, resolved_name) in &call.erased {
+            let erased_param_name = callee_params[*pos].name.clone();
+            let Some(&resolved_idx) = unit_index.get(resolved_name) else { continue };
+            let resolved_unit = &units[resolved_idx];
+            let n = resolved_unit.capture_count;
+            let capture_params: Vec<Param> = resolved_unit.params[..n].to_vec();
+            let capture_types: Vec<Ty> = resolved_unit.param_types[..n].to_vec();
+            let capture_names: Vec<String> = capture_params.iter().map(|p| p.name.clone()).collect();
+            new_params.extend(capture_params);
+            new_param_types.extend(capture_types);
+            baked_closures.push((erased_param_name.clone(), capture_names));
+
+            // Every call inside the callee's own (shared, unmodified) body
+            // whose bare callee name is exactly this erased parameter's own
+            // name resolves directly to the resolved callable's own unit --
+            // reusing `call_names`'s own shape exactly, one override entry
+            // per such call node (there could be more than one, if the
+            // callee calls its own higher-order parameter more than once).
+            let mut inner_exprs = Vec::new();
+            monomorphize::collect_exprs_block(&callee_body, &mut inner_exprs);
+            for ie in inner_exprs {
+                if let ExprKind::Call(ipath, ..) = &ie.kind {
+                    if ipath.segments.join("::") == erased_param_name {
+                        inner_call_names.insert(ie.id, resolved_name.clone());
+                    }
+                }
+            }
+        }
+
+        for (i, p) in callee_params.iter().enumerate() {
+            if !erased_positions.contains(&i) {
+                new_params.push(p.clone());
+                new_param_types.push(callee_param_types[i].clone());
+            }
+        }
+
+        let subs: Vec<String> = call.erased.iter().map(|(i, n)| format!("{}={}", callee_params[*i].name, n)).collect();
+        let specialized_name = format!("{}[{}]", call.callee_unit_name, subs.join(","));
+
+        new_units.push(ConcreteUnit {
+            name: specialized_name.clone(),
+            params: new_params,
+            param_types: new_param_types,
+            result: callee_result,
+            node_types: callee_node_types,
+            call_names: inner_call_names,
+            origin: None,
+            capture_count: 0,
+            baked_closures,
+            higher_order_args: HashMap::new(),
+            body: UnitBody::Real(callee_body),
+        });
+
+        specialized.insert(key, specialized_name);
+    }
+
+    for call in &found {
+        let key = (call.callee_unit_name.clone(), call.erased.clone());
+        let Some(specialized_name) = specialized.get(&key) else { continue };
+        let positions: Vec<usize> = call.erased.iter().map(|(i, _)| *i).collect();
+        let caller = &mut units[call.caller_idx];
+        caller.call_names.insert(call.call_id, specialized_name.clone());
+        caller.higher_order_args.insert(call.call_id, positions);
+    }
+
+    units.extend(new_units);
 }
 
 /// `(bare call name, concrete argument types, concrete return type) -> unit
@@ -336,6 +728,23 @@ pub enum CVal {
     Unit,
     /// A `CFunDef`'s own name, used as a call target.
     Label(String),
+    /// A `let`-bound name currently bound to a lambda, not an ordinary
+    /// runtime value — `captures` are this lambda's own free variables'
+    /// `CVal`s, gathered from `env` *once*, at the `let` itself (snapshot-
+    /// at-definition-time semantics, not by-reference — see `doc/backlog.md`'s
+    /// own closure-conversion item for why that's the stated decision), in
+    /// the same sorted-name order `lambda_free_vars` always produces. Which
+    /// *unit* a given call actually resolves to isn't stored here at all —
+    /// that's `ctx.call_names`' own job, resolved per call site exactly like
+    /// any other generic instantiation (a `let`-bound lambda can itself be
+    /// generic and get called at two different types, each needing its own
+    /// resolution — see `mlir_lower.rs`'s "let polymorphism" test for the
+    /// non-lambda analogue). Deliberately **never** written into a `LetPrim`/
+    /// `App`'s own `args`/`func`, nor returned as an ordinary `k`-continuation
+    /// value — it only ever lives inside `CEnv`, consumed exclusively by
+    /// `convert_expr`'s own `Call`/`Path` arms, and is fully gone by the time
+    /// a `CpsProgram` is built; `mlir_lower.rs` never sees this variant.
+    Closure { captures: Vec<CVal> },
 }
 
 #[derive(Debug, Clone)]
@@ -398,6 +807,7 @@ pub enum PrimOp {
     RawMlirOp { op: String, attrs: Vec<(String, String)> },
 }
 
+#[derive(Debug, Clone)]
 pub enum CExpr {
     LetPrim { var: CVar, ty: Ty, op: PrimOp, args: Vec<CVal>, cont: Box<CExpr> },
     /// `func(args)` — for a *real* callee, `args`' own last entry is, by
@@ -414,6 +824,7 @@ pub enum CExpr {
     If { cond: CVal, then_branch: Box<CExpr>, else_branch: Box<CExpr> },
 }
 
+#[derive(Debug, Clone)]
 pub struct CFunDef {
     pub name: String,
     /// Ordinary parameters, plus — for a *real* top-level function
@@ -463,6 +874,14 @@ pub struct CTopLevelFn {
     /// like a later MLIR-lowering pass can recognize the pattern
     /// unambiguously rather than relying on positional convention.
     pub k_ret: CVar,
+    /// Threaded straight through from `ConcreteUnit::origin` — see its own
+    /// doc comment. `ConcreteUnit` itself doesn't survive past `convert_
+    /// program` (it's consumed converting each unit into a `CTopLevelFn`),
+    /// so anything downstream of *this* IR that still needs a unit's own
+    /// algebra origin (an e-graph pass matching an `axiom`'s declared
+    /// algebra/method against a real call site, say) needs it duplicated
+    /// here rather than parsed back out of `def.name`.
+    pub origin: Option<(String, String)>,
 }
 
 pub struct CpsProgram {
@@ -471,23 +890,31 @@ pub struct CpsProgram {
 
 // ---------------------------------------------------------------- conversion
 
-struct FreshVars {
+/// `pub(crate)`, not private — reused as-is by a later e-graph pass
+/// (`egraph.rs`) to mint fresh `CVar`s/labels while reconstructing a
+/// rewritten segment back into CPS form, the identical need this module's
+/// own conversion already has.
+pub(crate) struct FreshVars {
     next_var: Cell<u32>,
     next_label: Cell<u32>,
 }
 
 impl FreshVars {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         FreshVars { next_var: Cell::new(0), next_label: Cell::new(0) }
     }
 
-    fn var(&self) -> CVar {
+    pub(crate) fn starting_at(next_var: CVar) -> Self {
+        FreshVars { next_var: Cell::new(next_var), next_label: Cell::new(0) }
+    }
+
+    pub(crate) fn var(&self) -> CVar {
         let v = self.next_var.get();
         self.next_var.set(v + 1);
         v
     }
 
-    fn label(&self, hint: &str) -> String {
+    pub(crate) fn label(&self, hint: &str) -> String {
         let n = self.next_label.get();
         self.next_label.set(n + 1);
         format!("{hint}${n}")
@@ -499,6 +926,9 @@ struct Ctx<'a> {
     call_index: &'a CallIndex,
     node_types: &'a HashMap<NodeId, Ty>,
     call_names: &'a HashMap<NodeId, String>,
+    /// Stage B only — see `ConcreteUnit::higher_order_args`'s own doc
+    /// comment.
+    higher_order_args: &'a HashMap<NodeId, Vec<usize>>,
     fresh: &'a FreshVars,
 }
 
@@ -524,13 +954,53 @@ pub fn convert_program(units: Vec<ConcreteUnit>) -> CpsProgram {
     sorted_units.sort_by(|a, b| a.name.cmp(&b.name));
     for unit in sorted_units {
         let UnitBody::Real(body) = &unit.body else { continue };
-        let ctx = Ctx { units: &by_name, call_index: &call_index, node_types: &unit.node_types, call_names: &unit.call_names, fresh: &fresh };
+        // A unit with a `Ty::Fn`-typed parameter of its own can never be
+        // converted/called *as declared* — a lambda has no runtime
+        // representation at all (see `CVal::Closure`'s own doc comment), so
+        // every real call to it necessarily goes through Stage B's own
+        // per-callable redirection instead (`build_higher_order_
+        // specializations`), which erases that very parameter from its own
+        // specialized copy's signature. The *original*, unspecialized unit
+        // stays in `units` regardless (nothing removes it — harmless, and
+        // simpler than trying to prove no caller needs it) but converting
+        // its own body directly would immediately panic on the erased
+        // parameter's own now-unresolvable call (`resolve_call` finds
+        // nothing, since only a Stage-B-produced specialization ever gets a
+        // `call_names` override for it) — skipped here, not emitted at all,
+        // since it's genuinely unreachable by construction: nothing in this
+        // language can produce a runtime value of function type to call it
+        // with in the first place.
+        if unit.param_types.iter().any(|t| matches!(t, Ty::Fn(..))) {
+            continue;
+        }
+        let ctx = Ctx {
+            units: &by_name,
+            call_index: &call_index,
+            node_types: &unit.node_types,
+            call_names: &unit.call_names,
+            higher_order_args: &unit.higher_order_args,
+            fresh: &fresh,
+        };
         let mut env = CEnv::new();
         let mut params = Vec::with_capacity(unit.params.len() + 1);
         for p in &unit.params {
             let v = fresh.var();
             env.insert(p.name.clone(), CVal::Var(v));
             params.push(v);
+        }
+        // Stage B only: an erased, higher-order parameter this unit's own
+        // signature no longer declares at all (see `ConcreteUnit::baked_
+        // closures`'s own doc comment) still needs a name bound in `env` --
+        // to a `CVal::Closure` over whichever of the ordinary params just
+        // bound above are its own resolved callable's leading captures, so
+        // `convert_expr`'s own existing (Stage A) `Call`-arm `CVal::Closure`
+        // handling picks it up exactly like any directly `let`-bound lambda.
+        for (erased_name, capture_param_names) in &unit.baked_closures {
+            let captures: Vec<CVal> = capture_param_names
+                .iter()
+                .map(|n| env.get(n).cloned().unwrap_or_else(|| panic!("CPS: baked closure `{erased_name}`'s own capture param `{n}` unexpectedly unbound")))
+                .collect();
+            env.insert(erased_name.clone(), CVal::Closure { captures });
         }
         let k_ret = fresh.var();
         params.push(k_ret);
@@ -540,6 +1010,7 @@ pub fn convert_program(units: Vec<ConcreteUnit>) -> CpsProgram {
             param_types: unit.param_types.clone(),
             result: unit.result.clone(),
             k_ret,
+            origin: unit.origin.clone(),
         });
     }
     // Deterministic output order — `HashMap` iteration isn't stable.
@@ -564,6 +1035,35 @@ fn convert_stmts(stmts: &[Stmt], env: CEnv, ctx: &Ctx, k: &dyn Fn(CEnv) -> CExpr
         // generalize-vs-monomorphic distinction it drives is `infer.rs`'s
         // own concern, already resolved by the time a fully concrete
         // `ConcreteUnit` reaches this module.
+        // A lambda has no runtime `CVal` of its own -- `convert_expr` never
+        // handles `ExprKind::Lambda` (still an unconditional panic there,
+        // see its own catch-all — that's deliberate: a bare lambda literal
+        // used anywhere *except* directly `let`-bound, e.g. passed straight
+        // as a call argument with no prior `let`, is explicitly out of
+        // scope for this pass, matching `doc/backlog.md`'s own closure-
+        // conversion item). Intercepted here instead: `name` gets bound to
+        // a `CVal::Closure`, snapshotting each of the lambda's own free
+        // variables' *current* `CVal` from `env` right now (see `CVal::
+        // Closure`'s own doc comment for why that's a snapshot, not a
+        // by-reference capture) — which concrete unit a later call to
+        // `name(...)` actually resolves to is deferred to that call site
+        // itself (`ctx.call_names`, exactly like any other generic
+        // instantiation), not decided here.
+        StmtKind::Let { name, value, .. } if matches!(value.kind, ExprKind::Lambda { .. }) => {
+            let ExprKind::Lambda { params, body, .. } = &value.kind else { unreachable!() };
+            let free = lambda_free_vars(params, body, ctx.node_types);
+            let captures: Vec<CVal> = sorted_capture_names(&free)
+                .into_iter()
+                .map(|n| {
+                    env.get(&n)
+                        .cloned()
+                        .unwrap_or_else(|| panic!("CPS: lambda's own captured variable `{n}` unexpectedly unbound at its own `let`"))
+                })
+                .collect();
+            let mut env2 = env.clone();
+            env2.insert(name.clone(), CVal::Closure { captures });
+            convert_stmts(rest, env2, ctx, k)
+        }
         StmtKind::Let { name, value, .. } => {
             let name = name.clone();
             convert_expr(value, &env, ctx, &|v, env| {
@@ -655,6 +1155,20 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
         ExprKind::Path(p) => {
             let name = p.segments.join("::");
             let v = match env.get(&name) {
+                // `name` refers to a lambda, used here as an ordinary value
+                // (aliased to another name, passed as an argument, returned,
+                // stored in a field/array, ...) rather than called directly
+                // by name — none of those are implemented yet (see `CVal::
+                // Closure`'s own doc comment; a lambda *returned* from a
+                // function or stored in a struct/array field is explicitly
+                // out of scope for this pass per `doc/backlog.md`'s own
+                // closure-conversion item) — a clean, explicit panic here
+                // rather than silently letting a `Closure` leak into an
+                // ordinary `LetPrim`/`App` argument position, which
+                // `mlir_lower.rs` has no representation for at all.
+                Some(CVal::Closure { .. }) => {
+                    panic!("CPS: `{name}` names a lambda used as an ordinary value (not called directly by name) -- not supported yet")
+                }
                 Some(v) => v.clone(),
                 // A const generic referenced as an ordinary value (`[v; N]`,
                 // `for i in 0..N`) is never bound as a real parameter/`let`
@@ -727,6 +1241,73 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
             let name = path.segments.join("::");
             let arg_refs: Vec<&Expr> = args.iter().collect();
             let result_ty = ctx.node_types[&expr.id].clone();
+            // Checked *first*, before falling through to `resolve_call`'s
+            // own tiers — a local lambda binding shadowing a same-named
+            // top-level `fn` must resolve to the lambda (`let f = fn(x){x};
+            // f(5)` even when a top-level `fn f` also happens to exist) —
+            // matches `monomorphize.rs`'s own `collect_instantiations_expr`,
+            // which already gives its own scope-tracking the identical
+            // priority for the identical reason.
+            if let Some(CVal::Closure { captures }) = env.get(&name) {
+                let captures = captures.clone();
+                return convert_expr_list(&arg_refs, env, ctx, &|arg_vals, env| {
+                    // Resolved per *this* call site, exactly like any other
+                    // generic instantiation (`ctx.call_names`, built by
+                    // `monomorphize.rs`'s own lambda worklist) — never a
+                    // single fixed unit for the `let`-bound name as a whole,
+                    // since the same lambda can be called at two different
+                    // concrete types from two different call sites (let-
+                    // polymorphism, mirroring an ordinary generic `fn`).
+                    let mangled = ctx.call_names.get(&expr.id).unwrap_or_else(|| {
+                        panic!(
+                            "CPS: call to lambda-bound `{name}` at a call site monomorphize.rs never resolved a specialization for"
+                        )
+                    });
+                    let callee = ctx
+                        .units
+                        .get_key_value(mangled.as_str())
+                        .map(|(k, _)| k.as_str())
+                        .unwrap_or_else(|| panic!("CPS: lambda call resolved to `{mangled}`, but no such unit exists"));
+                    let mut full_args = captures.clone();
+                    full_args.extend(arg_vals);
+                    emit_call(callee, full_args, result_ty.clone(), ctx, env, k)
+                });
+            }
+            // Stage B: one or more of *this* call's own arguments name a
+            // callable (lambda-bound, or a bare top-level `fn`) that `collect_
+            // units`'s own `build_higher_order_specializations` already baked
+            // directly into a specialized callee unit (`ctx.call_names[&expr.
+            // id]`, overridden to that specialized unit's own name — `resolve_
+            // call`'s ordinary first tier already picks it up unchanged, no
+            // special resolution needed here). What *does* need special
+            // handling: an erased argument doesn't convert to an ordinary
+            // `CVal` at all (my own `ExprKind::Path` arm above would panic on
+            // it, on purpose — see its own doc comment) — its own captures get
+            // gathered from `env` and spliced in at that position instead,
+            // exactly the same snapshot mechanism as calling a lambda
+            // directly (Stage A), just landing in the *middle* of an ordinary
+            // argument list here rather than always at the front.
+            if let Some(erased) = ctx.higher_order_args.get(&expr.id) {
+                let mut prelude: Vec<CVal> = Vec::new();
+                for &idx in erased {
+                    let callable_name = match &args[idx].kind {
+                        ExprKind::Path(p) => p.segments.join("::"),
+                        other => panic!("CPS: higher-order argument {idx} of `{name}` must be a bare name, found {other:?}"),
+                    };
+                    if let Some(CVal::Closure { captures }) = env.get(&callable_name) {
+                        prelude.extend(captures.iter().cloned());
+                    }
+                    // Else: a bare top-level `fn` name, with no captures of
+                    // its own — nothing to splice in for this position.
+                }
+                let remaining: Vec<&Expr> = args.iter().enumerate().filter(|(i, _)| !erased.contains(i)).map(|(_, a)| a).collect();
+                return convert_expr_list(&remaining, env, ctx, &move |arg_vals, env| {
+                    let callee = resolve_call(&name, expr, args, ctx);
+                    let mut full_args = prelude.clone();
+                    full_args.extend(arg_vals);
+                    emit_call(callee, full_args, result_ty.clone(), ctx, env, k)
+                });
+            }
             convert_expr_list(&arg_refs, env, ctx, &|arg_vals, env| {
                 let callee = resolve_call(&name, expr, args, ctx);
                 emit_call(callee, arg_vals, result_ty.clone(), ctx, env, k)
@@ -743,17 +1324,19 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
             // module's own "Mutation across control flow" doc comment) —
             // computed once, statically, from the source AST, not from
             // `env` itself.
-            let mut mutated: Vec<String> = mutated_free_vars(then_branch, &HashSet::new(), ctx).into_keys().collect();
+            let mut mutated: HashMap<String, Ty> = mutated_free_vars(then_branch, &HashSet::new(), ctx);
             match else_branch {
                 Some(eb) => match &**eb {
-                    ElseBranch::If(e) => mutated.extend(mutated_free_vars_expr(e, &HashSet::new(), ctx).into_keys()),
-                    ElseBranch::Block(b) => mutated.extend(mutated_free_vars(b, &HashSet::new(), ctx).into_keys()),
+                    ElseBranch::If(e) => mutated.extend(mutated_free_vars_expr(e, &HashSet::new(), ctx)),
+                    ElseBranch::Block(b) => mutated.extend(mutated_free_vars(b, &HashSet::new(), ctx)),
                 },
                 None => {}
             }
-            mutated.sort();
-            mutated.dedup();
-            let carried: Vec<(String, CVar)> = mutated.iter().map(|n| (n.clone(), ctx.fresh.var())).collect();
+            let mut names: Vec<String> = mutated.keys().cloned().collect();
+            names.sort();
+            names.dedup();
+            let carried: Vec<(String, CVar)> = names.iter().map(|n| (n.clone(), ctx.fresh.var())).collect();
+            let carried_types: Vec<Ty> = names.iter().map(|n| mutated[n].clone()).collect();
 
             let result_var = ctx.fresh.var();
             let join_label = ctx.fresh.label("j");
@@ -780,8 +1363,18 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                 k(CVal::Var(result_var), &env2)
             };
 
+            // `join.carried_types`'s own order matches `join_params`
+            // exactly: the `if`'s own value type first (`ctx.node_types` at
+            // this expression's own node), then one `Ty` per carried outer
+            // variable, in the same order `carried` itself was built —
+            // `mlir_lower.rs::lower_if` needs all of them explicitly, the
+            // same reason a loop's own `CFunDef` does (see `CFunDef::
+            // carried_types`'s own doc comment).
+            let mut join_types = vec![ctx.node_types[&expr.id].clone()];
+            join_types.extend(carried_types);
+
             CExpr::Fix {
-                defs: vec![CFunDef { name: join_label, params: join_params, body: join_body, carried_types: None }],
+                defs: vec![CFunDef { name: join_label, params: join_params, body: join_body, carried_types: Some(join_types) }],
                 body: Box::new(CExpr::If { cond: cond_val, then_branch: Box::new(then_cexpr), else_branch: Box::new(else_cexpr) }),
             }
         }),
@@ -956,7 +1549,33 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                 }
             })
         }),
-        other => panic!("CPS doesn't support {other:?} yet -- see doc/backlog.md item 3's own staged roadmap"),
+        // `v.method(args)` — `base` fills the method's own first parameter,
+        // an ordinary explicit positional argument, not a magic `self`
+        // (`infer.rs`'s own `ExprKind::MethodCall` handling already treats
+        // it that way at the type level) — so it converts exactly like any
+        // other real call, `[base, ...args]` evaluated left-to-right, just
+        // resolved through `resolve_method_call` (a struct's own method
+        // namespace, entirely separate from `resolve_call`'s three tiers:
+        // `Registry::inherent_method`'s own doc comment guarantees at most
+        // one method of a given name per struct, so there's no ambiguity to
+        // resolve structurally the way an algebra call needs — either a
+        // direct `call_names` override, for a specialization built from a
+        // generic inherent impl, or the bare `struct::method` name directly).
+        ExprKind::MethodCall(base, name, args) => {
+            let struct_ty = ctx.node_types[&base.id].clone();
+            let struct_name = match &struct_ty {
+                Ty::Con(n) | Ty::App(n, _) => n.clone(),
+                other => panic!("CPS: method call on a non-struct type {other:?} -- infer.rs should have rejected this already"),
+            };
+            let result_ty = ctx.node_types[&expr.id].clone();
+            let mut all_args: Vec<&Expr> = vec![base.as_ref()];
+            all_args.extend(args.iter());
+            convert_expr_list(&all_args, env, ctx, &|arg_vals, env| {
+                let callee = resolve_method_call(&struct_name, name, expr, ctx);
+                emit_call(callee, arg_vals, result_ty.clone(), ctx, env, k)
+            })
+        }
+        other => panic!("CPS doesn't support {other:?} yet -- see doc/backlog.md"),
     }
 }
 
@@ -1089,6 +1708,146 @@ fn mutated_free_vars_expr(expr: &Expr, shadowed: &HashSet<String>, ctx: &Ctx) ->
     }
 }
 
+/// Every free variable an `ExprKind::Lambda`'s own body references (any
+/// `Path` read, not just an assignment target) — excludes the lambda's own
+/// declared params and anything it itself `let`/`for`-binds, mapped to its
+/// own concrete type (read off the reference node itself, `node_types`).
+/// Reliable even *before* this lambda's own generic instantiation is known
+/// (see `monomorphize.rs`'s own lambda-worklist doc comment for the
+/// matching reasoning on the specialization side): a captured name was
+/// never one of *this* lambda's own quantified scheme variables to begin
+/// with (`infer.rs::generalize`'s own `env_fv` exclusion) — its type is
+/// already whatever the *enclosing* scope's own already-concrete binding
+/// has, unaffected by which instantiation of the lambda itself is being
+/// built. Plain `&HashMap<NodeId, Ty>`, not `&Ctx` — called both from here
+/// (a real `Ctx` on hand) and from `collect_units` (building a lambda's own
+/// `ConcreteUnit`, before any `Ctx` exists yet).
+///
+/// Unlike `mutated_free_vars_expr`'s own `Lambda` arm (which explicitly
+/// stops at a nested lambda — "closure conversion isn't implemented yet,"
+/// no longer true here) — this walk *recurses into* a nested lambda's own
+/// body: an inner lambda referencing an outer-outer variable needs that
+/// variable captured at *this*, the outer, lambda's own level too, so its
+/// own generated unit can pass it along as one of the inner unit's own
+/// leading capture arguments.
+///
+/// Consumed at two call sites that must agree on the exact same sorted name
+/// order without ever sharing a cache (`collect_units`'s own per-
+/// specialization unit-building, and `convert_stmts`'s own per-`let`
+/// capture-gathering) — safe because this is a pure, deterministic function
+/// of `(params, body)`'s own structure: two calls over the identical AST
+/// node produce the identical *name* set every time, regardless of which
+/// `node_types` map (a specific specialization's own substituted one, or
+/// the enclosing unit's own) happens to be passed for the *type* lookup.
+fn lambda_free_vars(params: &[Param], body: &Block, node_types: &HashMap<NodeId, Ty>) -> HashMap<String, Ty> {
+    let shadowed: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
+    lambda_free_vars_block(body, &shadowed, node_types)
+}
+
+fn lambda_free_vars_block(block: &Block, shadowed: &HashSet<String>, node_types: &HashMap<NodeId, Ty>) -> HashMap<String, Ty> {
+    let mut local_shadowed = shadowed.clone();
+    let mut free = HashMap::new();
+    for stmt in &block.stmts {
+        match &stmt.kind {
+            StmtKind::Let { name, value, .. } => {
+                free.extend(lambda_free_vars_expr(value, &local_shadowed, node_types));
+                local_shadowed.insert(name.clone());
+            }
+            StmtKind::Assign { target, value } => {
+                free.extend(lambda_free_vars_expr(target, &local_shadowed, node_types));
+                free.extend(lambda_free_vars_expr(value, &local_shadowed, node_types));
+            }
+            StmtKind::Expr(e) => free.extend(lambda_free_vars_expr(e, &local_shadowed, node_types)),
+        }
+    }
+    if let Some(tail) = &block.tail {
+        free.extend(lambda_free_vars_expr(tail, &local_shadowed, node_types));
+    }
+    free
+}
+
+fn lambda_free_vars_expr(expr: &Expr, shadowed: &HashSet<String>, node_types: &HashMap<NodeId, Ty>) -> HashMap<String, Ty> {
+    match &expr.kind {
+        ExprKind::NumberLit { .. } | ExprKind::ImaginaryLit { .. } | ExprKind::BoolLit(_) => HashMap::new(),
+        ExprKind::Path(p) => {
+            let name = p.segments.join("::");
+            if shadowed.contains(&name) {
+                return HashMap::new();
+            }
+            match node_types.get(&expr.id) {
+                Some(ty) => HashMap::from([(name, ty.clone())]),
+                // A const-generic reference (`N` in `[v; N]`), or some other
+                // name this particular `node_types` map doesn't cover -- not
+                // a real captured *value* either way (mirrors `convert_
+                // expr`'s own `ExprKind::Path` arm's identical const-generic
+                // case), nothing to capture.
+                None => HashMap::new(),
+            }
+        }
+        ExprKind::Call(_, _, args, ..) => args.iter().flat_map(|a| lambda_free_vars_expr(a, shadowed, node_types)).collect(),
+        ExprKind::FieldAccess(base, _) => lambda_free_vars_expr(base, shadowed, node_types),
+        ExprKind::MethodCall(base, _, args) => {
+            let mut out = lambda_free_vars_expr(base, shadowed, node_types);
+            out.extend(args.iter().flat_map(|a| lambda_free_vars_expr(a, shadowed, node_types)));
+            out
+        }
+        ExprKind::Index(base, idx) => {
+            let mut out = lambda_free_vars_expr(base, shadowed, node_types);
+            out.extend(lambda_free_vars_expr(idx, shadowed, node_types));
+            out
+        }
+        ExprKind::ArrayLit(elems) => elems.iter().flat_map(|e| lambda_free_vars_expr(e, shadowed, node_types)).collect(),
+        ExprKind::ArrayRepeat { value, count } => {
+            let mut out = lambda_free_vars_expr(value, shadowed, node_types);
+            out.extend(lambda_free_vars_expr(count, shadowed, node_types));
+            out
+        }
+        ExprKind::StructLit(_, _, fields) => fields.iter().flat_map(|(_, v)| lambda_free_vars_expr(v, shadowed, node_types)).collect(),
+        ExprKind::If { cond, then_branch, else_branch } => {
+            let mut out = lambda_free_vars_expr(cond, shadowed, node_types);
+            out.extend(lambda_free_vars_block(then_branch, shadowed, node_types));
+            if let Some(eb) = else_branch {
+                match &**eb {
+                    ElseBranch::If(e) => out.extend(lambda_free_vars_expr(e, shadowed, node_types)),
+                    ElseBranch::Block(b) => out.extend(lambda_free_vars_block(b, shadowed, node_types)),
+                }
+            }
+            out
+        }
+        ExprKind::While { cond, body } => {
+            let mut out = lambda_free_vars_expr(cond, shadowed, node_types);
+            out.extend(lambda_free_vars_block(body, shadowed, node_types));
+            out
+        }
+        ExprKind::For { var, start, end, body } => {
+            let mut out = lambda_free_vars_expr(start, shadowed, node_types);
+            out.extend(lambda_free_vars_expr(end, shadowed, node_types));
+            let mut inner = shadowed.clone();
+            inner.insert(var.clone());
+            out.extend(lambda_free_vars_block(body, &inner, node_types));
+            out
+        }
+        ExprKind::Block(b) => lambda_free_vars_block(b, shadowed, node_types),
+        ExprKind::Lambda { params, body, .. } => {
+            let mut inner = shadowed.clone();
+            inner.extend(params.iter().map(|p| p.name.clone()));
+            lambda_free_vars_block(body, &inner, node_types)
+        }
+    }
+}
+
+/// Sorts a `lambda_free_vars` result's own names deterministically — the
+/// order both `collect_units` (building a lambda unit's own leading capture
+/// parameters) and `convert_stmts` (gathering each capture's own `CVal` at
+/// the `let`) must agree on, with no shared cache between them (see
+/// `lambda_free_vars`'s own doc comment for why recomputing independently
+/// is still safe).
+fn sorted_capture_names(captures: &HashMap<String, Ty>) -> Vec<String> {
+    let mut names: Vec<String> = captures.keys().cloned().collect();
+    names.sort();
+    names
+}
+
 /// Resolves the callee for a call the CPS conversion itself needs to
 /// synthesize (a `for` loop's own implicit bound check/increment) rather
 /// than one that appears as a real `Call` node in the source — so there's no
@@ -1189,6 +1948,25 @@ fn resolve_call<'a>(name: &str, call: &Expr, args: &[Expr], ctx: &Ctx<'a>) -> &'
     }
 }
 
+/// The `MethodCall` equivalent of `resolve_call` — a separate, simpler
+/// resolution namespace: `Registry::inherent_method`'s own doc comment
+/// guarantees at most one method of a given name exists per struct, so
+/// (unlike an algebra call) there's no structural/signature-based candidate
+/// search needed here, just a direct lookup once the struct name is known
+/// (already resolved by the caller, off `base`'s own concrete type).
+fn resolve_method_call<'a>(struct_name: &str, method: &str, call: &Expr, ctx: &Ctx<'a>) -> &'a str {
+    if let Some(mangled) = ctx.call_names.get(&call.id) {
+        return ctx.units.get_key_value(mangled.as_str()).map(|(k, _)| k.as_str()).unwrap_or_else(|| {
+            panic!("CPS: method call_names resolved `{struct_name}::{method}` to `{mangled}`, but no such unit exists")
+        });
+    }
+    let bare = format!("{struct_name}::{method}");
+    ctx.units
+        .get_key_value(bare.as_str())
+        .map(|(k, _)| k.as_str())
+        .unwrap_or_else(|| panic!("CPS: could not resolve method call `{bare}`"))
+}
+
 /// A `let`-bound literal is generalized at its own definition site (`let x =
 /// 1.0;` gives `x` a polymorphic scheme — see `dump.rs`'s own
 /// `dumps_let_and_tail_statements_with_their_own_types` test) — its
@@ -1244,6 +2022,11 @@ fn dump_cval(v: &CVal) -> String {
         CVal::Bool(b) => b.to_string(),
         CVal::Unit => "()".to_string(),
         CVal::Label(name) => name.clone(),
+        // Never expected to actually reach a final `CpsProgram` (see the
+        // variant's own doc comment) -- rendered distinctly, not panicking,
+        // purely so a bug that *did* let one escape shows up legibly in
+        // `--dump-cps` output rather than crashing the dumper itself.
+        CVal::Closure { captures } => format!("<closure [{}]>", captures.iter().map(dump_cval).collect::<Vec<_>>().join(" ")),
     }
 }
 

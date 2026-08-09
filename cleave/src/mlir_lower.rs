@@ -169,6 +169,10 @@ fn is_array_ty(ty: &Ty) -> bool {
     matches!(ty, Ty::Array(..))
 }
 
+fn is_unit_ty(ty: &Ty) -> bool {
+    matches!(ty, Ty::Con(name) if name == "()")
+}
+
 /// A cleave `struct` is a **stable reference, mutated in place** — the same
 /// choice `cps.rs`'s own "Arrays" doc comment already makes for arrays, and
 /// for the same underlying reason: a struct value flows around by *identity*
@@ -334,7 +338,7 @@ fn lower_top_level_fn<'c>(ctx: &LowerCtx<'c, '_>, f: &CTopLevelFn) -> Operation<
     let context = ctx.context;
     let location = Location::unknown(context);
     let param_types: Vec<Type> = f.param_types.iter().map(|t| ty_to_mlir(ctx, t)).collect();
-    let is_unit = matches!(&f.result, Ty::Con(name) if name == "()");
+    let is_unit = is_unit_ty(&f.result);
     let result_type: Type = if is_unit { IntegerType::new(context, 1).into() } else { ty_to_mlir(ctx, &f.result) };
     let results: Vec<Type> = if is_unit { vec![] } else { vec![result_type] };
 
@@ -415,8 +419,17 @@ fn lower_cexpr<'c>(
         CExpr::App { func: CVal::Label(name), args } if yield_target.is_some_and(|(n, _)| n == name.as_str()) => {
             let location = Location::unknown(ctx.context);
             let types = yield_target.unwrap().1;
-            let values: Vec<Value> =
-                args.iter().zip(types).map(|(a, &t)| lower_cval(ctx.context, block, &env, a, t)).collect();
+            // `CVal::Unit` filtered out here, same as the `return` arm above
+            // and for the same reason -- an `if`-join's own value position
+            // is unit for a bodyless-`else`/statement-position `if`
+            // (`if cond { mutate; };`), and `types` (built by `lower_if`)
+            // already excludes that position too, so the two stay aligned.
+            let values: Vec<Value> = args
+                .iter()
+                .filter(|a| !matches!(a, CVal::Unit))
+                .zip(types)
+                .map(|(a, &t)| lower_cval(ctx.context, block, &env, a, t))
+                .collect();
             block.append_operation(scf::r#yield(&values, location));
         }
         CExpr::LetPrim { var, ty, op, args, cont } => {
@@ -459,17 +472,22 @@ fn lower_cexpr<'c>(
 /// arms are lowered into their own fresh, argument-less block with
 /// `yield_label` set to `join`'s own name, so each arm's tail call to it
 /// (`tail_call_join` in `cps.rs`) becomes `scf.yield` instead. The `scf.if`
-/// operation's own result is then bound to the join's single parameter, and
-/// lowering continues into the join's own body (ordinary flow, `yield_label`
-/// reset to whatever it was *before* this `if` — the same one this call
-/// itself received, so a nested `if` inside a bigger one still resolves its
-/// *own* join correctly).
+/// operation's own results are then bound to the join's own params in
+/// order, and lowering continues into the join's own body (ordinary flow,
+/// `yield_label` reset to whatever it was *before* this `if` — the same one
+/// this call itself received, so a nested `if` inside a bigger one still
+/// resolves its *own* join correctly).
 ///
-/// Only a **single-parameter** join is handled -- `join.params.len() == 1`.
-/// `cps.rs`'s own join can carry more (`carried`, one per outer variable
-/// either branch reassigns — see its `ExprKind::If` handling) but that's not
-/// needed for `fib` and isn't implemented yet; a bodyless `else` (`join`
-/// carrying no result at all, `CVal::Unit`) isn't handled either.
+/// `join.params` is `[result_var, ...carried]` — the `if`'s own value,
+/// followed by one entry per outer variable either branch reassigns
+/// (`cps.rs`'s own `ExprKind::If` handling, "Mutation across control flow")
+/// — and `join.carried_types` (populated there too) carries each position's
+/// own real type in the same order, exactly the mechanism `lower_loop`
+/// already established for its own carried state (see `CFunDef::
+/// carried_types`'s own doc comment for why guessing one shared type here
+/// was wrong): an `if` nested inside a loop, whose own branches reassign
+/// some outer flag, is exactly the case that needed this — confirmed
+/// broken before this generalization, found by direct testing.
 fn lower_if<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
@@ -482,28 +500,26 @@ fn lower_if<'c>(
     then_branch: &CExpr,
     else_branch: &CExpr,
 ) {
-    let [result_var] = join.params[..] else {
-        panic!(
-            "MLIR lowering doesn't support an `if` whose branches also reassign an outer variable yet (only a single-result join) -- see mlir_lower.rs's own module doc comment"
-        );
+    let Some(join_cleave_types) = &join.carried_types else {
+        panic!("MLIR lowering: an `if`-join's own `CFunDef` must carry `carried_types` -- see mlir_lower.rs's own module doc comment");
     };
+    // A unit-typed position (most commonly `join.params[0]`, the `if`'s own
+    // value, for a bodyless-`else`/statement-position `if`) carries no real
+    // MLIR value at all -- `ty_to_mlir` has none to give it, and there's
+    // nothing meaningful to yield/carry. `live` is `join.params`' own
+    // indices with a real (non-unit) type, in order -- both the eventual
+    // `scf.if` result list and `join.params`-to-result binding below walk
+    // this instead of `join.params` directly, keeping every position
+    // consistent with the *other* `CVal::Unit`-filtering already needed on
+    // the `scf.yield` side (see that arm's own doc comment).
+    let live: Vec<usize> = (0..join_cleave_types.len()).filter(|&i| !is_unit_ty(&join_cleave_types[i])).collect();
+    let join_types: Vec<Type> = live.iter().map(|&i| ty_to_mlir(ctx, &join_cleave_types[i])).collect();
 
     let context = ctx.context;
     let location = Location::unknown(context);
     let bool_ty: Type = IntegerType::new(context, 1).into();
     let cond_value = lower_cval(context, block, &env, cond, bool_ty);
 
-    // The join's own expected type is assumed identical to the enclosing
-    // function's own `result_type` -- true whenever the `if` this join
-    // belongs to *is* (directly or through further straight-line
-    // `LetPrim`s) the function's own return value, which covers `fib`'s own
-    // shape (`if n < 2 { n } else { ... }` *is* the whole body) but not yet
-    // an `if`-expression feeding some other, differently-typed computation
-    // -- a real, still narrow assumption, not a general "expected type"
-    // mechanism (contrast `lower_loop`, whose own carried-state types come
-    // from the loop's own initial values instead, precisely because they
-    // often do differ from `result_type`).
-    let join_types = [result_type];
     let then_block = Block::new(&[]);
     lower_cexpr(ctx, &then_block, env.clone(), k_ret, result_type, Some((&join.name, &join_types)), then_branch);
     let then_region = Region::new();
@@ -516,8 +532,17 @@ fn lower_if<'c>(
 
     let if_op = block.append_operation(scf::r#if(cond_value, &join_types, then_region, else_region, location));
 
+    // Only `live` positions got a real `scf.if` result at all -- a unit
+    // position's own `join.params` entry is left unbound, matching `PrimOp::
+    // Store`'s own "bound result is unit and never read" convention: nothing
+    // downstream ever actually materializes it as a value (a discarded
+    // statement's own continuation ignores what it's handed), only panics
+    // clearly (`lower_cval`'s own "unbound CPS variable") in the genuine
+    // edge case where something unexpectedly tries to.
     let mut env = env;
-    env.insert(result_var, if_op.result(0).unwrap().into());
+    for (result_idx, &param_idx) in live.iter().enumerate() {
+        env.insert(join.params[param_idx], if_op.result(result_idx).unwrap().into());
+    }
     lower_cexpr(ctx, block, env, k_ret, result_type, yield_target, &join.body);
 }
 

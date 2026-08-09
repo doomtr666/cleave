@@ -14,14 +14,34 @@ impl <T : Float> Ring<Complex<T>> {
             imag: x.real * y.imag + x.imag * y.real
         )
     }
+    fn div(x, y) {
+        let denom = y.real * y.real + y.imag * y.imag;
+        Complex (
+            real: (x.real * y.real + x.imag * y.imag) / denom,
+            imag: (x.imag * y.real - x.real * y.imag) / denom
+        )
+    }
+    fn neg(x) { Complex(real: -x.real, imag: -x.imag) }
 }
 
 fn main() {
     let z1 = Complex(real: 1.0, imag: 0.0);
     let z2 = Complex(real: 0.0, imag: 1.0);
+
+    // (1 + i) * (1 - i) = 1 - i^2 = 2
     let zr = (z1 + z2) * (z1 - z2);
     print(zr.real);
     print(zr.imag);
+
+    // 1 / i = -i
+    let zq = z1 / z2;
+    print(zq.real);
+    print(zq.imag);
+
+    // -(1 + i) = -1 - i
+    let zn = -(z1 + z2);
+    print(zn.real);
+    print(zn.imag);
 
     0
 }

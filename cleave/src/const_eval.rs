@@ -23,6 +23,7 @@ pub fn eval_binop(op: &str, a: ConstValue, b: ConstValue) -> Option<ConstValue> 
     match (op, a, b) {
         ("add", ConstValue::Int(x), ConstValue::Int(y)) => Some(ConstValue::Int(x.wrapping_add(y))),
         ("mul", ConstValue::Int(x), ConstValue::Int(y)) => Some(ConstValue::Int(x.wrapping_mul(y))),
+        ("sub", ConstValue::Int(x), ConstValue::Int(y)) => Some(ConstValue::Int(x.wrapping_sub(y))),
         _ => None,
     }
 }
@@ -42,12 +43,18 @@ mod tests {
     }
 
     #[test]
+    fn sub_subtracts_two_ints() {
+        assert_eq!(eval_binop("sub", ConstValue::Int(10), ConstValue::Int(10)), Some(ConstValue::Int(0)));
+        assert_eq!(eval_binop("sub", ConstValue::Int(4), ConstValue::Int(3)), Some(ConstValue::Int(1)));
+    }
+
+    #[test]
     fn a_bool_operand_is_not_arithmetic() {
         assert_eq!(eval_binop("add", ConstValue::Bool(true), ConstValue::Int(3)), None);
     }
 
     #[test]
     fn an_unrecognized_operator_is_not_evaluated() {
-        assert_eq!(eval_binop("sub", ConstValue::Int(4), ConstValue::Int(3)), None);
+        assert_eq!(eval_binop("div", ConstValue::Int(4), ConstValue::Int(3)), None);
     }
 }

@@ -5,6 +5,7 @@ pub mod cps;
 pub mod diag;
 pub mod driver;
 pub mod dump;
+pub mod egraph;
 pub mod infer;
 pub mod lower;
 pub mod mlir_lower;

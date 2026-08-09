@@ -50,7 +50,41 @@ algebra Ring<T> {
     fn add(a: T, b: T) -> T;
     fn sub(a: T, b: T) -> T;
     fn mul(a: T, b: T) -> T;
+    fn div(a: T, b: T) -> T;
     fn neg(a: T) -> T;
+
+    // Trusted as declared over every `impl Ring<T>` this algebra ever
+    // gets (`hld.md`'s own v1 trust model — no per-impl soundness gate),
+    // matching every impl actually shipped today (`i8`..`i64`, `f32`/`f64`,
+    // and `examples/complex.cleave`'s own `Complex<T>`) — a future `impl
+    // Ring<SomeNonCommutativeThing>` would need its own review before this
+    // stays safe, same open risk `hld.md` already documents for this whole
+    // mechanism generically, not something new introduced here.
+    //
+    // Feeds `egraph.rs`'s equality-saturation pass (`--dump-cps-optimized`/
+    // `--dump-cps-equivalences` to inspect it directly) — applied by default
+    // now, on both `--run` and `--dump-mlir` (see `main.rs`), so a real bug
+    // in an axiom here is a real, silent miscompilation risk, not just a
+    // wrong debug-flag output.
+    axiom add_commutative(a, b): add(a, b) == add(b, a);
+    axiom mul_commutative(a, b): mul(a, b) == mul(b, a);
+    // Only ever fires for an integer `T` in practice — a float literal has
+    // no e-graph representation yet (`egraph.rs`'s own module doc comment:
+    // `CVal::Float` is out of scope for now), so a segment involving `x +
+    // 0.0` simply never finishes translating far enough to match this,
+    // rather than firing unsoundly on it.
+    axiom add_zero(a): add(a, 0) == a;
+    // Associativity of `add`/`sub` — a real, generically true ring law
+    // (`a+b-c = a+(b-c)`), not a bespoke cancellation rule: this is what
+    // lets a case like `10 + x - 10` actually regroup so the two literal
+    // `10`s become siblings of the same node (`sub(10, 10)`) — only *then*
+    // is there a genuinely fully-constant subtree for `ConstantFold` to
+    // fold on its own (it can't look "through" an unrelated `x` in
+    // between), after which `add_zero` above finishes the job. Composes
+    // with `add_commutative`/`ConstantFold`/`add_zero` automatically —
+    // equality saturation's whole point — rather than needing a dedicated
+    // axiom per shape.
+    axiom add_sub_assoc(a, b, c): sub(add(a, b), c) == add(a, sub(b, c));
 }
 
 // Integer negation has no dedicated `arith` op (unlike float — two's-
@@ -62,6 +96,7 @@ impl Ring<i8> {
     fn add(a: i8, b: i8) -> i8 { mlir::arith::addi(a, b) }
     fn sub(a: i8, b: i8) -> i8 { mlir::arith::subi(a, b) }
     fn mul(a: i8, b: i8) -> i8 { mlir::arith::muli(a, b) }
+    fn div(a: i8, b: i8) -> i8 { mlir::arith::divsi(a, b) }
     fn neg(a: i8) -> i8 { mlir::arith::subi(0, a) }
 }
 
@@ -69,6 +104,7 @@ impl Ring<i16> {
     fn add(a: i16, b: i16) -> i16 { mlir::arith::addi(a, b) }
     fn sub(a: i16, b: i16) -> i16 { mlir::arith::subi(a, b) }
     fn mul(a: i16, b: i16) -> i16 { mlir::arith::muli(a, b) }
+    fn div(a: i16, b: i16) -> i16 { mlir::arith::divsi(a, b) }
     fn neg(a: i16) -> i16 { mlir::arith::subi(0, a) }
 }
 
@@ -76,6 +112,7 @@ impl Ring<i32> {
     fn add(a: i32, b: i32) -> i32 { mlir::arith::addi(a, b) }
     fn sub(a: i32, b: i32) -> i32 { mlir::arith::subi(a, b) }
     fn mul(a: i32, b: i32) -> i32 { mlir::arith::muli(a, b) }
+    fn div(a: i32, b: i32) -> i32 { mlir::arith::divsi(a, b) }
     fn neg(a: i32) -> i32 { mlir::arith::subi(0, a) }
 }
 
@@ -83,6 +120,7 @@ impl Ring<i64> {
     fn add(a: i64, b: i64) -> i64 { mlir::arith::addi(a, b) }
     fn sub(a: i64, b: i64) -> i64 { mlir::arith::subi(a, b) }
     fn mul(a: i64, b: i64) -> i64 { mlir::arith::muli(a, b) }
+    fn div(a: i64, b: i64) -> i64 { mlir::arith::divsi(a, b) }
     fn neg(a: i64) -> i64 { mlir::arith::subi(0, a) }
 }
 
@@ -90,6 +128,7 @@ impl Ring<f32> {
     fn add(a: f32, b: f32) -> f32 { mlir::arith::addf(a, b) }
     fn sub(a: f32, b: f32) -> f32 { mlir::arith::subf(a, b) }
     fn mul(a: f32, b: f32) -> f32 { mlir::arith::mulf(a, b) }
+    fn div(a: f32, b: f32) -> f32 { mlir::arith::divf(a, b) }
     fn neg(a: f32) -> f32 { mlir::arith::negf(a) }
 }
 
@@ -97,6 +136,7 @@ impl Ring<f64> {
     fn add(a: f64, b: f64) -> f64 { mlir::arith::addf(a, b) }
     fn sub(a: f64, b: f64) -> f64 { mlir::arith::subf(a, b) }
     fn mul(a: f64, b: f64) -> f64 { mlir::arith::mulf(a, b) }
+    fn div(a: f64, b: f64) -> f64 { mlir::arith::divf(a, b) }
     fn neg(a: f64) -> f64 { mlir::arith::negf(a) }
 }
 
@@ -180,4 +220,131 @@ impl Ord<f64> {
     fn ge(a: f64, b: f64) -> bool { mlir::arith::cmpf(a, b, predicate: "3 : i64") }
     fn eq(a: f64, b: f64) -> bool { mlir::arith::cmpf(a, b, predicate: "1 : i64") }
     fn neq(a: f64, b: f64) -> bool { mlir::arith::cmpf(a, b, predicate: "6 : i64") }
+}
+
+// `mod`/`rem` deliberately never became operators (`grammar.md`'s own
+// "explicitly not given operator syntax" list) — always named functions,
+// dispatched the same structural way every other algebra here is. Two
+// distinct names because they genuinely differ on negative operands: `rem`
+// is truncated-division remainder (sign follows the dividend `a`, same as
+// C/Rust's own `%` and MLIR's `arith.remsi` directly), `mod` is
+// mathematical/Euclidean modulo (sign follows the divisor `b`, always in
+// `[0, b)` for a positive `b`). Integer-only for now — `arith.remf` exists
+// for a float `rem`, but nothing has needed it yet; add when something does.
+algebra Rem<T> {
+    fn rem(a: T, b: T) -> T;
+    fn mod(a: T, b: T) -> T;
+}
+
+// `arith.remsi`'s own result already *is* `rem` directly. `mod` has no
+// single dedicated MLIR op — computed from it: `remsi`'s result and `b`
+// have differing sign exactly when a floored correction is needed (`xor`
+// on `< 0`, not `!=` -- `Ord<bool>` doesn't exist, only `Logic<bool>` does).
+impl Rem<i8> {
+    fn rem(a: i8, b: i8) -> i8 { mlir::arith::remsi(a, b) }
+    fn mod(a: i8, b: i8) -> i8 {
+        let r: i8 = mlir::arith::remsi(a, b);
+        if r != 0 and ((r < 0) xor (b < 0)) { r + b } else { r }
+    }
+}
+
+impl Rem<i16> {
+    fn rem(a: i16, b: i16) -> i16 { mlir::arith::remsi(a, b) }
+    fn mod(a: i16, b: i16) -> i16 {
+        let r: i16 = mlir::arith::remsi(a, b);
+        if r != 0 and ((r < 0) xor (b < 0)) { r + b } else { r }
+    }
+}
+
+impl Rem<i32> {
+    fn rem(a: i32, b: i32) -> i32 { mlir::arith::remsi(a, b) }
+    fn mod(a: i32, b: i32) -> i32 {
+        let r: i32 = mlir::arith::remsi(a, b);
+        if r != 0 and ((r < 0) xor (b < 0)) { r + b } else { r }
+    }
+}
+
+impl Rem<i64> {
+    fn rem(a: i64, b: i64) -> i64 { mlir::arith::remsi(a, b) }
+    fn mod(a: i64, b: i64) -> i64 {
+        let r: i64 = mlir::arith::remsi(a, b);
+        if r != 0 and ((r < 0) xor (b < 0)) { r + b } else { r }
+    }
+}
+
+// Bitwise ops, `grammar.md`'s own explicit call: no operator syntax at all
+// (sidesteps burning a precedence level *and* C's `&`/`|` vs `==` trap) --
+// always named functions, integer-only (a bit pattern on a float is a
+// different, not-yet-needed operation). `shr` is the *arithmetic*
+// (sign-extending) right shift, `arith.shrsi` — cleave's integers are
+// signed (see `Ord<T>`'s own comment on comparison predicates above), so
+// that's the one that actually matches `>>`'s usual meaning on a signed
+// type; `shrui` (logical/zero-filling) isn't exposed here since nothing
+// has needed it yet.
+algebra Bitwise<T> {
+    fn bitand(a: T, b: T) -> T;
+    fn bitor(a: T, b: T) -> T;
+    fn bitxor(a: T, b: T) -> T;
+    fn bitnot(a: T) -> T;
+    fn shl(a: T, b: T) -> T;
+    fn shr(a: T, b: T) -> T;
+}
+
+// No dedicated bitwise-complement op in `arith` either (mirrors `Ring<T>::
+// neg`'s own `subi(0, a)` workaround above) — `a xor -1` (all bits set),
+// through the exact same generic `mlir::...` mechanism as everything else.
+// `-1` needs an explicit `let ...: i8 = -1;` type annotation, not a bare
+// literal inline in the `mlir::...` call — an `mlir::` call's own arguments
+// don't cross-unify with each other (no real declared signature to unify
+// against), so an *inline* `-1` here independently defaults to `i32`
+// regardless of `a`'s own width, mismatching for every width but `i32`
+// itself (found by direct testing: `arith.xori requires the same type for
+// all operands`, for `i8`/`i16`/`i64` specifically) — same reasoning as
+// `Logic<bool>::implies`'s own explicit `let not_a: bool = ...` above.
+impl Bitwise<i8> {
+    fn bitand(a: i8, b: i8) -> i8 { mlir::arith::andi(a, b) }
+    fn bitor(a: i8, b: i8) -> i8 { mlir::arith::ori(a, b) }
+    fn bitxor(a: i8, b: i8) -> i8 { mlir::arith::xori(a, b) }
+    fn bitnot(a: i8) -> i8 {
+        let all_bits: i8 = -1;
+        mlir::arith::xori(a, all_bits)
+    }
+    fn shl(a: i8, b: i8) -> i8 { mlir::arith::shli(a, b) }
+    fn shr(a: i8, b: i8) -> i8 { mlir::arith::shrsi(a, b) }
+}
+
+impl Bitwise<i16> {
+    fn bitand(a: i16, b: i16) -> i16 { mlir::arith::andi(a, b) }
+    fn bitor(a: i16, b: i16) -> i16 { mlir::arith::ori(a, b) }
+    fn bitxor(a: i16, b: i16) -> i16 { mlir::arith::xori(a, b) }
+    fn bitnot(a: i16) -> i16 {
+        let all_bits: i16 = -1;
+        mlir::arith::xori(a, all_bits)
+    }
+    fn shl(a: i16, b: i16) -> i16 { mlir::arith::shli(a, b) }
+    fn shr(a: i16, b: i16) -> i16 { mlir::arith::shrsi(a, b) }
+}
+
+impl Bitwise<i32> {
+    fn bitand(a: i32, b: i32) -> i32 { mlir::arith::andi(a, b) }
+    fn bitor(a: i32, b: i32) -> i32 { mlir::arith::ori(a, b) }
+    fn bitxor(a: i32, b: i32) -> i32 { mlir::arith::xori(a, b) }
+    fn bitnot(a: i32) -> i32 {
+        let all_bits: i32 = -1;
+        mlir::arith::xori(a, all_bits)
+    }
+    fn shl(a: i32, b: i32) -> i32 { mlir::arith::shli(a, b) }
+    fn shr(a: i32, b: i32) -> i32 { mlir::arith::shrsi(a, b) }
+}
+
+impl Bitwise<i64> {
+    fn bitand(a: i64, b: i64) -> i64 { mlir::arith::andi(a, b) }
+    fn bitor(a: i64, b: i64) -> i64 { mlir::arith::ori(a, b) }
+    fn bitxor(a: i64, b: i64) -> i64 { mlir::arith::xori(a, b) }
+    fn bitnot(a: i64) -> i64 {
+        let all_bits: i64 = -1;
+        mlir::arith::xori(a, all_bits)
+    }
+    fn shl(a: i64, b: i64) -> i64 { mlir::arith::shli(a, b) }
+    fn shr(a: i64, b: i64) -> i64 { mlir::arith::shrsi(a, b) }
 }
