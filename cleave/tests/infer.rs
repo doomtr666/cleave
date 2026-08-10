@@ -1,5 +1,5 @@
 ﻿use cleave::ast::{FileId, FnDecl, GenericParam, ItemKind, Program, Span, StmtKind, Type};
-use cleave::infer::{ConstValue, Infer, Ty, TypeErrorKind};
+use cleave::infer::{ConstValue, Infer, Ty, TypeErrorKind, check_mutability};
 use cleave::lower::Lowerer;
 use cleave::parser::{CleaveParser, Rule};
 use cleave::registry::Registry;
@@ -145,6 +145,130 @@ fn unannotated_params_are_inferred_from_a_concrete_sibling() {
 fn unconstrained_int_literal_defaults_to_i32() {
     let ty = infer_src("fn f() -> i32 { 1 }");
     assert_eq!(ty, Ty::Con("i32".to_string()));
+}
+
+/// An array's own size slot is only ever legally a `Ty::Var` (still open,
+/// correct pre-monomorphization state) or a `Ty::Const` (already resolved
+/// to a real value) -- never a bare `Ty::Con` (a plain type name, e.g.
+/// `"i32"`, sitting where a *size* belongs), which can only mean a const
+/// generic's own declared width got wrongly defaulted in its place. Checks
+/// every `Ty::Array` reachable anywhere in `node_types`, recursively (an
+/// array of arrays, or an array embedded in a struct's own generic
+/// argument via `Ty::App`, could each hide one at any depth).
+fn assert_no_corrupted_array_size(ty: &Ty, context: &str) {
+    match ty {
+        Ty::Array(elem, size) => {
+            assert!(
+                !matches!(size.as_ref(), Ty::Con(_)),
+                "found a corrupted array size (a bare Ty::Con, not Ty::Var/Ty::Const) in {context}: {ty}"
+            );
+            assert_no_corrupted_array_size(elem, context);
+            assert_no_corrupted_array_size(size, context);
+        }
+        Ty::App(_, args) => args.iter().for_each(|a| assert_no_corrupted_array_size(a, context)),
+        Ty::Fn(params, ret) => {
+            params.iter().for_each(|p| assert_no_corrupted_array_size(p, context));
+            assert_no_corrupted_array_size(ret, context);
+        }
+        Ty::Var(_) | Ty::Con(_) | Ty::Const(_) => {}
+    }
+}
+
+/// Real bug, found by direct testing (`--dump-inference-pass` on this exact
+/// shape showed `arr`'s own declared type corrupted to the nonsensical
+/// `[i64; i32]`): `unify`'s own bind direction always binds the *left*
+/// operand's variable to point at the right one, and `ExprKind::For` always
+/// unifies `start` before `end`. `for i in 0..N` (`N` as `end`) happens to
+/// bind `0`'s own var *to* `N`'s, leaving `N`'s var as the reachable root
+/// `const_widths`'s own lookup expects -- correct, but only by construction
+/// coincidence. `for i in N..5` (`N` as *start*) binds the opposite way,
+/// silently defeating `apply_defaults`'s own guard: nothing left `N`'s own
+/// declared width (`i64`) recoverable, so the merged variable got
+/// permanently, wrongly defaulted to a bare `i32` -- corrupting every other
+/// place that same variable is used, including an entirely unrelated
+/// array's own declared size a few lines away.
+#[test]
+fn a_const_generic_named_as_the_start_of_a_for_loop_range_does_not_corrupt_an_unrelated_arrays_own_size() {
+    let f = lower_one_fn(
+        "fn f<const N: i64>() -> i64 {
+            let arr = [0:i64; N];
+            let mut acc = 0:i64;
+            for i in N..5 { acc = acc + 1; };
+            arr[0] + acc
+        }",
+    );
+    let registry = builtin_registry();
+    let mut infer = Infer::new(&registry);
+    infer.infer_fn(&f).unwrap_or_else(|e| panic!("inference failed: {e:?}"));
+    for (id, ty) in &infer.node_types {
+        assert_no_corrupted_array_size(ty, &format!("node {id:?}"));
+    }
+}
+
+/// The regression control: `N` as the range's own `end` (`0..N`) already
+/// worked before this fix (the "coincidence" direction described above) --
+/// must keep working identically after it.
+#[test]
+fn a_const_generic_named_as_the_end_of_a_for_loop_range_still_works() {
+    let f = lower_one_fn(
+        "fn f<const N: i64>() -> i64 {
+            let arr = [0:i64; N];
+            let mut acc = 0:i64;
+            for i in 0..N { acc = acc + 1; };
+            arr[0] + acc
+        }",
+    );
+    let registry = builtin_registry();
+    let mut infer = Infer::new(&registry);
+    infer.infer_fn(&f).unwrap_or_else(|e| panic!("inference failed: {e:?}"));
+    for (id, ty) in &infer.node_types {
+        assert_no_corrupted_array_size(ty, &format!("node {id:?}"));
+    }
+}
+
+/// No leftover `Ty::Var` anywhere in `ty`, recursively — mirrors
+/// `tests/monomorphize.rs`'s own `assert_fully_concrete`.
+fn assert_no_unresolved_var(ty: &Ty, context: &str) {
+    match ty {
+        Ty::Var(v) => panic!("found an unresolved Ty::Var({v:?}) in {context} — inference claimed success but left this open"),
+        Ty::Con(_) | Ty::Const(_) => {}
+        Ty::App(_, args) => args.iter().for_each(|a| assert_no_unresolved_var(a, context)),
+        Ty::Fn(params, ret) => {
+            params.iter().for_each(|p| assert_no_unresolved_var(p, context));
+            assert_no_unresolved_var(ret, context);
+        }
+        Ty::Array(elem, size) => {
+            assert_no_unresolved_var(elem, context);
+            assert_no_unresolved_var(size, context);
+        }
+    }
+}
+
+#[test]
+fn a_let_bound_literals_own_use_site_still_defaults_correctly() {
+    // Real bug, found by direct testing (`examples/test_loup.cleave`):
+    // `let a = 16;` is a syntactic value (`is_syntactic_value`), which used
+    // to make it real HM let-generalized — every later reference to `a`
+    // (inside `a + b`) instantiated a *fresh*, independent type variable,
+    // never registered in `pending_defaults` (which only ever recorded
+    // `a`'s own *original* binding-site variable — itself skipped by
+    // `apply_defaults` precisely because it's quantified). Neither variable
+    // ever got defaulted: inference silently "succeeded" (no error at all)
+    // while leaving a real, unresolved `Ty::Var` in `c`'s own node type —
+    // which only surfaced as a Rust panic much later, in CPS conversion,
+    // since nothing else in this function happens to pin `c`'s fresh
+    // variable to anything concrete (no explicit return type, `c` unused).
+    // Fixed by no longer generalizing a bare number/imaginary literal `let`
+    // binding at all (`is_syntactic_value`) — it now binds monomorphically,
+    // same as `let mut` already did, so every later use shares the exact
+    // same variable `pending_defaults` already tracks.
+    let f = lower_one_fn("fn f() { let a = 16; let b = 4; let c = a + b; }");
+    let registry = builtin_registry();
+    let mut infer = Infer::new(&registry);
+    infer.infer_fn(&f).unwrap_or_else(|e| panic!("inference failed: {e:?}"));
+    for (id, ty) in &infer.node_types {
+        assert_no_unresolved_var(ty, &format!("node {id:?}"));
+    }
 }
 
 #[test]
@@ -2159,4 +2283,101 @@ fn non_overlapping_multi_target_impls_differing_in_a_later_target_are_accepted()
     let mut infer = Infer::new(&registry);
     let errors = infer.check_no_overlapping_impls();
     assert!(errors.is_empty(), "got: {errors:?}");
+}
+
+// ---------------------------------------------------------------------
+// mutability checking (`check_mutability`) -- a purely syntactic pass, no
+// type information involved at all, so every test below can freely use a
+// bogus right-hand side (`let p = 0;`) for a "struct"/"array" -- only the
+// *shape* of the assignment target and the binding's own `mut`-ness matter.
+// ---------------------------------------------------------------------
+
+#[test]
+fn reassigning_a_plain_let_is_rejected() {
+    let f = lower_one_fn("fn f() -> i32 { let x = 5; x = 6; x }");
+    let err = check_mutability(&f).expect_err("plain let must not be reassignable");
+    assert!(matches!(err.kind, TypeErrorKind::AssignToImmutable { ref name } if name == "x"), "got: {:?}", err.kind);
+}
+
+#[test]
+fn reassigning_a_let_mut_is_accepted() {
+    let f = lower_one_fn("fn f() -> i32 { let mut x = 5; x = 6; x }");
+    assert!(check_mutability(&f).is_ok());
+}
+
+#[test]
+fn field_assignment_through_a_plain_let_is_rejected() {
+    let f = lower_one_fn("fn f() -> i32 { let p = 0; p.x = 1; 0 }");
+    let err = check_mutability(&f).expect_err("field assignment through a non-mut binding must be rejected");
+    assert!(matches!(err.kind, TypeErrorKind::AssignToImmutable { ref name } if name == "p"), "got: {:?}", err.kind);
+}
+
+#[test]
+fn index_assignment_through_a_plain_let_is_rejected() {
+    let f = lower_one_fn("fn f() -> i32 { let arr = [1, 2, 3]; arr[0] = 9; 0 }");
+    let err = check_mutability(&f).expect_err("index assignment through a non-mut binding must be rejected");
+    assert!(matches!(err.kind, TypeErrorKind::AssignToImmutable { ref name } if name == "arr"), "got: {:?}", err.kind);
+}
+
+#[test]
+fn field_and_index_assignment_through_a_let_mut_is_accepted() {
+    let f = lower_one_fn("fn f() -> i32 { let mut p = 0; p.x = 1; let mut arr = [1, 2, 3]; arr[0] = 9; 0 }");
+    assert!(check_mutability(&f).is_ok());
+}
+
+/// A deeply-nested chain (`s.arr[i].y = v`) still resolves to the *root*
+/// binding's own mutability, however many `.field`/`[index]` steps sit on
+/// top of it.
+#[test]
+fn a_deeply_nested_assignment_target_still_resolves_to_its_own_root_binding() {
+    let f = lower_one_fn("fn f() -> i32 { let s = 0; s.arr[0].y = 1; 0 }");
+    let err = check_mutability(&f).expect_err("a nested chain must still resolve to its own root");
+    assert!(matches!(err.kind, TypeErrorKind::AssignToImmutable { ref name } if name == "s"), "got: {:?}", err.kind);
+}
+
+#[test]
+fn a_function_parameter_can_never_be_reassigned() {
+    let f = lower_one_fn("fn f(x: i32) -> i32 { x = 5; x }");
+    let err = check_mutability(&f).expect_err("a parameter is never `mut` -- no grammar support for it at all");
+    assert!(matches!(err.kind, TypeErrorKind::AssignToImmutable { ref name } if name == "x"), "got: {:?}", err.kind);
+}
+
+#[test]
+fn a_for_loops_own_index_variable_can_never_be_reassigned() {
+    let f = lower_one_fn("fn f() -> i32 { for i in 0..3 { i = 9; }; 0 }");
+    let err = check_mutability(&f).expect_err("a for-loop's own index is never reassignable");
+    assert!(matches!(err.kind, TypeErrorKind::AssignToImmutable { ref name } if name == "i"), "got: {:?}", err.kind);
+}
+
+/// Shadowing correctness, the real reason this needs a scope-aware walk and
+/// not a single flat name-to-mutability map: an inner, non-`mut` `x` in a
+/// nested block shadows the outer `mut` one for the rest of that scope --
+/// assigning to the *inner* `x` must still be rejected, even though some
+/// `x` reachable from an enclosing scope genuinely is mutable.
+#[test]
+fn an_inner_non_mut_shadow_is_still_rejected_even_though_the_outer_binding_is_mutable() {
+    let f = lower_one_fn("fn f() -> i32 { let mut x = 1; if true { let x = 2; x = 3; }; x }");
+    let err = check_mutability(&f).expect_err("the inner, shadowing `x` is not `mut`");
+    assert!(matches!(err.kind, TypeErrorKind::AssignToImmutable { ref name } if name == "x"), "got: {:?}", err.kind);
+}
+
+/// The mirror case: reassigning the *outer* `mut x` from inside a nested
+/// block, with no shadowing in between, is perfectly legal.
+#[test]
+fn reassigning_an_outer_let_mut_from_inside_a_nested_block_is_accepted() {
+    let f = lower_one_fn("fn f() -> i32 { let mut x = 1; if true { x = 3; }; x }");
+    assert!(check_mutability(&f).is_ok());
+}
+
+#[test]
+fn reassigning_a_captured_outer_let_mut_from_inside_a_lambda_is_accepted() {
+    let f = lower_one_fn("fn f() -> i32 { let mut x = 1; let g = fn() { x = 2; }; x }");
+    assert!(check_mutability(&f).is_ok());
+}
+
+#[test]
+fn reassigning_a_captured_outer_plain_let_from_inside_a_lambda_is_rejected() {
+    let f = lower_one_fn("fn f() -> i32 { let x = 1; let g = fn() { x = 2; }; x }");
+    let err = check_mutability(&f).expect_err("the captured outer `x` is not `mut`");
+    assert!(matches!(err.kind, TypeErrorKind::AssignToImmutable { ref name } if name == "x"), "got: {:?}", err.kind);
 }

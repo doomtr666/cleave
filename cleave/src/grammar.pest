@@ -280,11 +280,15 @@ call_expr = { path ~ turbofish? ~ "(" ~ arg_list? ~ ")" }
 arg_list  = { call_arg ~ ("," ~ call_arg)* }
 call_arg  = { mlir_attr | expr }
 mlir_attr = { ident ~ ":" ~ string_lit }
-// Deliberately *not* part of `literal`/`primary` -- a `mlir_attr`'s own
-// value is the only place this appears anywhere in the grammar, kept
-// syntactically inert everywhere else. No escape sequences: attribute
-// values are short MLIR syntax fragments (`"slt"`, `"2 : i64"`), not
-// general text.
+// Also reachable as an ordinary `literal` (below) -- a string expression
+// desugars to an `[i8; N]` array of its own UTF-8 bytes at lowering time
+// (`lower.rs::lower_string_lit`), the same "cleave-defined functions are
+// never genuinely variadic... reduces to an ordinary, safe call" posture
+// `doc/grammar.md`'s own `params`-style section already documents for
+// other constructs -- no new runtime representation of its own. No
+// ambiguity with `mlir_attr` above: a bare string literal in expression
+// position never has a leading `ident ~ ":"` to compete over. No escape
+// sequences yet -- a real, independent follow-up, not attempted here.
 string_lit = @{ "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
 
 // `fibonacci::<f64>(x)` / `Matrix::<f64, 4, 4>(values: ...)` — explicit type/const-generic
@@ -347,7 +351,7 @@ array_repeat = { expr ~ ";" ~ (numeric_lit | ident) }
 array_list   = { expr ~ ("," ~ expr)* }
 
 // ---------------------------------------------------------------- literals
-literal = { imaginary_lit | numeric_lit | bool_lit }
+literal = { imaginary_lit | numeric_lit | bool_lit | string_lit }
 
 // digits, optional fraction, optional exponent — int vs. float is a semantic
 // distinction (presence of '.'/exponent), not a separate grammar production,

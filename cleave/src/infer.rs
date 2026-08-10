@@ -19,24 +19,30 @@
 //!
 //! `let`-generalization (real HM polymorphism, `∀a. ...` schemes) *is*
 //! built: `Env` maps names to a [`Scheme`], not a bare [`Ty`]. A plain,
-//! immutable `let` whose right-hand side is a *syntactic value* (literal,
-//! variable reference, or lambda — see [`is_syntactic_value`]) gets
-//! generalized at the binding site ([`Infer::generalize`]); every later
-//! reference instantiates a fresh copy ([`Infer::instantiate`]), so e.g.
-//! `let id = fn(x) { x }; id(1); id(true);` type-checks even though `id`'s
-//! parameter is never annotated. Two deliberate restrictions, not oversights:
+//! immutable `let` whose right-hand side is a *syntactic value* (a bare
+//! `bool` literal, variable reference, or lambda — see
+//! [`is_syntactic_value`]) gets generalized at the binding site
+//! ([`Infer::generalize`]); every later reference instantiates a fresh copy
+//! ([`Infer::instantiate`]), so e.g. `let id = fn(x) { x }; id(1); id(true);`
+//! type-checks even though `id`'s parameter is never annotated. Deliberate
+//! restrictions, not oversights:
 //! - **`let mut` is never generalized**, regardless of what its value looks
 //!   like — a mutable binding can be reassigned at one instantiation's type
 //!   and read back at another's, which is exactly the classical ML
 //!   ref-cell-polymorphism unsoundness. Simpler and safer than trying to
 //!   reason about aliasing through the value's shape.
-//!
-//! A number literal's own type variable *is* eligible for generalization
-//! (see `generalize`'s doc comment for why an earlier version wrongly
-//! excluded it) — with its `Num` constraint riding along, so
-//! `fn add_one(x) { x + 1 }` correctly generalizes to `∀t. Num t => (t)->t`
-//! and is usable at every numeric type with a registered `Num` impl, not
-//! forced monomorphic the moment a bare literal appears in its body.
+//! - **A bare number/imaginary literal `let` binding (`let a = 16;`) is
+//!   *not* generalized either**, despite being a syntactic value in every
+//!   other sense — see [`is_syntactic_value`]'s own doc comment for the real
+//!   bug this closes (a literal's own numeric-defaulting eligibility,
+//!   `pending_defaults`, is registered once, at the literal itself, never
+//!   re-registered for a fresh `instantiate`-produced copy at a later use
+//!   site). This is narrower than it sounds: a *function* whose body merely
+//!   contains a bare literal (`fn add_one(x) { x + 1 }`) still generalizes
+//!   fine, with its `Num` constraint riding along (`generalize`'s own doc
+//!   comment) — that's the function's own whole-signature scheme, built by
+//!   `callgraph.rs`, an entirely different generalization site than a
+//!   `let`-bound *value* directly aliasing a literal's own variable.
 //!
 //! Also deliberately not done yet, and not hidden:
 //! - Mutability checking (`let mut` vs. plain `let`, see `grammar.md`) — the
@@ -189,7 +195,19 @@ impl TyVarGen {
 // ---------------------------------------------------------------- substitution
 
 #[derive(Debug, Default, Clone)]
-pub struct Subst(HashMap<TyVar, Ty>);
+pub struct Subst {
+    bindings: HashMap<TyVar, Ty>,
+    /// A const generic's own declared width (e.g. `i64` for `const N:
+    /// i64`), keyed by whichever variable currently stands for its value —
+    /// see `bind`'s own doc comment for why this lives here, alongside the
+    /// ordinary bindings, rather than as a separate side-table on `Infer`
+    /// (the shape this used to be, before a real bug was found: a variable
+    /// merged *into* another one via `bind` used to silently lose its own
+    /// entry, since nothing re-keyed it — see `doc/backlog.md`'s own "The
+    /// `Ty::Const`/`Ty::Con` architectural tension" entry for the full
+    /// story, including the exact reproduction that motivated this).
+    const_widths: HashMap<TyVar, Ty>,
+}
 
 impl Subst {
     /// Follows variable chains to the current representative type,
@@ -198,7 +216,7 @@ impl Subst {
     /// outermost shape.
     pub fn apply(&self, ty: &Ty) -> Ty {
         match ty {
-            Ty::Var(v) => match self.0.get(v) {
+            Ty::Var(v) => match self.bindings.get(v) {
                 Some(next) => self.apply(next),
                 None => ty.clone(),
             },
@@ -211,8 +229,44 @@ impl Subst {
         }
     }
 
+    /// A const generic's own value var (`v`) can get merged into *another*
+    /// variable here (e.g. `for i in N..5` unifies `N`'s own var with `5`'s
+    /// literal var) — real bug, found by direct testing: `N`'s own declared
+    /// width used to live in a side-table keyed only by `N`'s *original*
+    /// var, on `Infer` rather than here, so once `v` stopped being the
+    /// reachable root (whichever operand `unify` happens to bind *from*,
+    /// not *to* — order-dependent, not something callers control), every
+    /// later lookup silently missed it, permanently defaulting the merged
+    /// variable to a bare `Ty::Con` instead of leaving it open for
+    /// monomorphization's own reverse-unification. Propagating the width
+    /// forward here, at the one place a merge actually happens, means
+    /// whichever variable the chain eventually resolves through always has
+    /// its own entry — no caller needs to know or care which one that ends
+    /// up being. `.entry().or_insert()`, not an unconditional overwrite: if
+    /// `ty`'s own var is *also* already separately const-tainted (two
+    /// distinct const generics unified together, a narrow edge case), the
+    /// first one's width wins here, and a real mismatch between the two
+    /// still surfaces normally wherever it's actually checked — not
+    /// silently overwritten by whichever happened to be on which side.
     fn bind(&mut self, v: TyVar, ty: Ty) {
-        self.0.insert(v, ty);
+        if let (Some(width), Ty::Var(v2)) = (self.const_widths.get(&v).cloned(), &ty) {
+            self.const_widths.entry(*v2).or_insert(width);
+        }
+        self.bindings.insert(v, ty);
+    }
+
+    /// `v`'s own declared width, if it's (or has since been merged into) a
+    /// const generic's own value slot — `None` for an ordinary type
+    /// variable. Looks up `v` directly, not through `apply` first: `bind`'s
+    /// own forward propagation already guarantees whichever variable a
+    /// caller happens to hold a reference to has its own entry, regardless
+    /// of how many further merges it's since been through.
+    fn const_width(&self, v: TyVar) -> Option<Ty> {
+        self.const_widths.get(&v).cloned()
+    }
+
+    fn set_const_width(&mut self, v: TyVar, width: Ty) {
+        self.const_widths.insert(v, width);
     }
 
     /// Must recurse into `Fn`'s components — a variable can occur *inside* a
@@ -408,6 +462,16 @@ pub enum TypeErrorKind {
     /// concrete example (a stub matmul body accidentally requiring a square
     /// shape).
     MonomorphizationFailed { algebra: String, method: String, tys: String },
+    /// A duck-typed fallback specialization (`monomorphize.rs`'s own
+    /// `detect_duck_typed_fns` -- a generic top-level fn whose body
+    /// couldn't be fully resolved by the ordinary one-shot HM pass, e.g.
+    /// field access on an unannotated parameter) genuinely failed to
+    /// type-check for one specific concrete call site. Unlike
+    /// `MonomorphizationFailed` (a blind "no impl candidate unified", no
+    /// inner detail available), this carries the real `TypeError` a full
+    /// re-inference produced, span and all, pointing at the actual
+    /// offending expression inside the fn's own body.
+    GenericFnInstantiationFailed { name: String, tys: String, inner: Box<TypeError> },
     /// A top-level `fn` or inherent-impl method declared with no body
     /// (`fn foo(x: i32);`) — legal grammatically anywhere a `fn` appears
     /// (see `grammar.pest`'s own `fn_decl` comment), but only ever actually
@@ -428,6 +492,11 @@ pub enum TypeErrorKind {
     /// ordinary top-level `fn` can; there's no monomorphization pass for it
     /// to go through in the first place.
     ExternFnCannotBeGeneric { name: String },
+    /// `x = v` (or `arr[i] = v`/`s.x = v`, resolved down to `x`'s own root
+    /// binding — see `check_mutability`) where `x` was declared with a
+    /// plain `let`, never `let mut` — a purely syntactic check, no type
+    /// information involved at all.
+    AssignToImmutable { name: String },
 }
 
 impl std::fmt::Display for TypeErrorKind {
@@ -480,6 +549,9 @@ impl std::fmt::Display for TypeErrorKind {
             TypeErrorKind::MonomorphizationFailed { algebra, method, tys } => {
                 write!(f, "`{algebra}::{method}` cannot be specialized for ({tys}): its generic impl body doesn't type-check at this instantiation")
             }
+            TypeErrorKind::GenericFnInstantiationFailed { name, tys, inner } => {
+                write!(f, "`{name}` cannot be specialized for ({tys}): {}", inner.kind)
+            }
             TypeErrorKind::MissingFnBody { name } => {
                 write!(f, "`{name}` has no body — a `fn` may only omit one if it's `extern`")
             }
@@ -488,6 +560,9 @@ impl std::fmt::Display for TypeErrorKind {
             }
             TypeErrorKind::ExternFnCannotBeGeneric { name } => {
                 write!(f, "`extern fn {name}` cannot be generic — only concrete, monomorphized signatures can cross a C-ABI boundary")
+            }
+            TypeErrorKind::AssignToImmutable { name } => {
+                write!(f, "cannot assign to `{name}` — declared with `let`, not `let mut`")
             }
         }
     }
@@ -602,11 +677,31 @@ pub(crate) fn substitute(ty: &Ty, mapping: &HashMap<TyVar, Ty>) -> Ty {
 /// function call could in principle return something safely generalizable
 /// too, but distinguishing that from one that can't requires effect
 /// tracking this pass doesn't have.
+///
+/// **Deliberately excludes `NumberLit`/`ImaginaryLit`** — a real bug, found
+/// by direct testing (`examples/test_loup.cleave`): `pending_defaults` (see
+/// `apply_defaults`) registers a defaulting preference exactly once, for a
+/// literal's own *original* type variable, at the point the literal itself
+/// is inferred. Generalizing a bare-literal `let` binding (`let a = 16;`)
+/// means every later reference to `a` instantiates its own *fresh*,
+/// independent variable (`instantiate`) — never registered in `pending_
+/// defaults`, since nothing re-runs literal inference at a use site — while
+/// the *original* variable gets skipped by `apply_defaults` precisely
+/// because it's quantified. Neither ever gets defaulted. If nothing else
+/// later pins that fresh use-site variable to something concrete (an
+/// explicit annotation, an operation with an already-concrete signature),
+/// inference silently "succeeds" — no error anywhere — leaving a real,
+/// unresolved `Ty::Var` that only surfaces as a Rust panic much later, deep
+/// in CPS conversion. `BoolLit`/`Path`/`Lambda` don't have this gap:
+/// `BoolLit`'s own type is already fully concrete (nothing to generalize
+/// over), and `Path`/`Lambda` generalization doesn't depend on `pending_
+/// defaults` at all (a lambda's own body gets fully, separately
+/// re-specialized per instantiation via `monomorphize.rs`'s own lambda
+/// worklist). A bare-literal `let` now binds monomorphically instead — same
+/// as `let mut` already did — so every later use shares the exact same
+/// variable `pending_defaults` already tracks.
 fn is_syntactic_value(expr: &Expr) -> bool {
-    matches!(
-        expr.kind,
-        ExprKind::NumberLit { .. } | ExprKind::ImaginaryLit { .. } | ExprKind::BoolLit(_) | ExprKind::Path(_) | ExprKind::Lambda { .. }
-    )
+    matches!(expr.kind, ExprKind::BoolLit(_) | ExprKind::Path(_) | ExprKind::Lambda { .. })
 }
 
 /// A `Ty::Con` standing in for "not actually known" — `<unresolved-call:...>`
@@ -649,7 +744,7 @@ fn is_fully_concrete(ty: &Ty) -> bool {
 /// parameter or return type is itself a placeholder is just as unresolved as
 /// a bare one, and this is exactly the shape a lambda calling an undeclared
 /// cross-function `fn` produces (`(t) -> <unresolved-call:add>`).
-fn find_placeholder_name(ty: &Ty) -> Option<String> {
+pub(crate) fn find_placeholder_name(ty: &Ty) -> Option<String> {
     match ty {
         Ty::Con(name) if name.starts_with('<') => Some(name.clone()),
         Ty::Con(_) | Ty::Var(_) | Ty::Const(_) => None,
@@ -676,6 +771,122 @@ pub(crate) fn check_no_placeholder(f: &FnDecl, final_result: &Ty, param_types: &
         }
     }
     Ok(())
+}
+
+/// Static, purely syntactic check (no type information needed at all) that
+/// a plain (non-`mut`) `let` binding is never reassigned — `mutable` was
+/// otherwise only ever consulted to decide whether to generalize
+/// (`is_syntactic_value`'s own call site, `infer_block`'s `StmtKind::Let`
+/// arm), nowhere else. Applies uniformly to a bare-name target (`x = v`)
+/// and an indexed/field chain rooted at one (`arr[i] = v`, `s.x = v`,
+/// `s.arr[i].y = v`) via `assign_target_root` — mutating *through* a stable
+/// reference is still mutating the reference's own binding (matching
+/// `cps.rs`'s own "a struct/array is a stable reference" design). A
+/// function's own parameters are always immutable — `grammar.pest`'s own
+/// `param` rule has no `mut` at all, no way to opt in — seeded as such here
+/// since they never go through `StmtKind::Let`.
+pub fn check_mutability(f: &FnDecl) -> Result<(), TypeError> {
+    let Some(body) = &f.body else { return Ok(()) };
+    let scope: HashMap<String, bool> = f.params.iter().map(|p| (p.name.clone(), false)).collect();
+    check_mutability_block(body, &scope)
+}
+
+fn check_mutability_block(block: &Block, scope: &HashMap<String, bool>) -> Result<(), TypeError> {
+    let mut scope = scope.clone();
+    for stmt in &block.stmts {
+        match &stmt.kind {
+            StmtKind::Let { mutable, name, value, .. } => {
+                check_mutability_expr(value, &scope)?;
+                scope.insert(name.clone(), *mutable);
+            }
+            StmtKind::Assign { target, value } => {
+                check_mutability_expr(target, &scope)?;
+                check_mutability_expr(value, &scope)?;
+                if let Some(root) = assign_target_root(target) {
+                    if scope.get(root) == Some(&false) {
+                        return Err(TypeError { span: stmt.span, kind: TypeErrorKind::AssignToImmutable { name: root.to_string() } });
+                    }
+                }
+            }
+            StmtKind::Expr(e) => check_mutability_expr(e, &scope)?,
+        }
+    }
+    if let Some(tail) = &block.tail {
+        check_mutability_expr(tail, &scope)?;
+    }
+    Ok(())
+}
+
+fn check_mutability_expr(expr: &Expr, scope: &HashMap<String, bool>) -> Result<(), TypeError> {
+    match &expr.kind {
+        ExprKind::NumberLit { .. } | ExprKind::ImaginaryLit { .. } | ExprKind::BoolLit(_) | ExprKind::Path(_) => Ok(()),
+        ExprKind::Call(_, _, args, ..) => args.iter().try_for_each(|a| check_mutability_expr(a, scope)),
+        ExprKind::FieldAccess(base, _) => check_mutability_expr(base, scope),
+        ExprKind::MethodCall(base, _, args) => {
+            check_mutability_expr(base, scope)?;
+            args.iter().try_for_each(|a| check_mutability_expr(a, scope))
+        }
+        ExprKind::Index(base, idx) => {
+            check_mutability_expr(base, scope)?;
+            check_mutability_expr(idx, scope)
+        }
+        ExprKind::ArrayLit(elems) => elems.iter().try_for_each(|e| check_mutability_expr(e, scope)),
+        ExprKind::ArrayRepeat { value, count } => {
+            check_mutability_expr(value, scope)?;
+            check_mutability_expr(count, scope)
+        }
+        ExprKind::StructLit(_, _, fields) => fields.iter().try_for_each(|(_, v)| check_mutability_expr(v, scope)),
+        ExprKind::If { cond, then_branch, else_branch } => {
+            check_mutability_expr(cond, scope)?;
+            check_mutability_block(then_branch, scope)?;
+            match else_branch.as_deref() {
+                Some(ElseBranch::If(e)) => check_mutability_expr(e, scope),
+                Some(ElseBranch::Block(b)) => check_mutability_block(b, scope),
+                None => Ok(()),
+            }
+        }
+        ExprKind::While { cond, body } => {
+            check_mutability_expr(cond, scope)?;
+            check_mutability_block(body, scope)
+        }
+        ExprKind::For { var, start, end, body } => {
+            check_mutability_expr(start, scope)?;
+            check_mutability_expr(end, scope)?;
+            let mut inner = scope.clone();
+            inner.insert(var.clone(), false);
+            check_mutability_block(body, &inner)
+        }
+        ExprKind::Block(b) => check_mutability_block(b, scope),
+        // A lambda's own params shadow the outer scope for the duration of
+        // its own body -- still walked, and still against the *outer*
+        // scope layered underneath, so reassigning a captured outer `mut`
+        // variable from inside a lambda is checked exactly like anywhere
+        // else (a real, ordinary violation if that outer binding isn't
+        // `mut`, independent of whether the lambda itself ever gets called
+        // at this point at all).
+        ExprKind::Lambda { params, body, .. } => {
+            let mut inner = scope.clone();
+            for p in params {
+                inner.insert(p.name.clone(), false);
+            }
+            check_mutability_block(body, &inner)
+        }
+    }
+}
+
+/// Walks an assignment target (`x`, or a field/index chain into one —
+/// `arr[i]`, `s.x`, `s.arr[i].y`) down to its own root name — the local
+/// binding whose own mutability actually governs whether the assignment is
+/// legal, regardless of how many `.field`/`[index]` steps sit on top of it.
+/// `None` for anything that isn't a legal assignment-target shape at all
+/// (defensive — the grammar already restricts `StmtKind::Assign`'s own
+/// `target` to these three shapes).
+fn assign_target_root(expr: &Expr) -> Option<&str> {
+    match &expr.kind {
+        ExprKind::Path(p) if p.segments.len() == 1 => Some(&p.segments[0]),
+        ExprKind::FieldAccess(base, _) | ExprKind::Index(base, _) => assign_target_root(base),
+        _ => None,
+    }
 }
 
 pub struct Infer<'r> {
@@ -793,20 +1004,6 @@ pub struct Infer<'r> {
     /// today, since nothing infers two methods' bodies inside one another,
     /// but harmless either way: each key is its own (struct, name) pair).
     in_progress_methods: HashMap<(String, String), (Vec<Ty>, Ty)>,
-    /// Each const generic's own declared type (`i32`, `i64`, `bool`, ...),
-    /// keyed by its own fresh var — populated once, in `fresh_generics_
-    /// mapping`'s `Const` arm, for every const generic this `Infer` instance
-    /// ever mints a fresh var for. Consulted by `check_pending_constraints`
-    /// when a constraint's own type resolves to a bare `Ty::Const` (a const
-    /// generic referenced as an ordinary value, e.g. a `for` loop bound) —
-    /// without this, nothing could recover which *specific* declared width
-    /// produced that value, since `Ty::Const` itself carries none. Threaded
-    /// through `generalize`/`instantiate_with_mapping` exactly like
-    /// `constraints` is, for the identical reason: a constraint carried into
-    /// a `Scheme` and re-checked at some later instantiation needs this same
-    /// width information to still be available then, not just at the
-    /// original declaration site.
-    const_widths: HashMap<TyVar, Ty>,
     /// Every `let`-bound lambda's own generalized `Scheme`, keyed by the
     /// `Lambda` expression's own `NodeId` (not the `let`'s) — `node_types`
     /// alone isn't enough for a lambda: `ExprKind::Lambda` is a syntactic
@@ -845,7 +1042,6 @@ impl<'r> Infer<'r> {
             quantified: HashSet::new(),
             pending_type_name_checks: Vec::new(),
             in_progress_methods: HashMap::new(),
-            const_widths: HashMap::new(),
             lambda_schemes: HashMap::new(),
         }
     }
@@ -893,11 +1089,12 @@ impl<'r> Infer<'r> {
     /// a `pending_type_name_checks` entry if `T` turns out to actually name
     /// an `algebra` (`const R: Int`, a real bug found by direct user
     /// testing — `Int` is what constrains a type, not a type itself) rather
-    /// than a real type; also recorded now, in `self.const_widths`, since a
-    /// const generic referenced as an ordinary value (a `for` loop bound,
-    /// say) needs its own real declared width recoverable later, once
-    /// resolved to a bare `Ty::Const` — see `check_pending_constraints`'s
-    /// own `Ty::Const` bridge. The shared core `fn_generics_mapping`
+    /// than a real type; also recorded now, in `self.subst`'s own const-
+    /// width tracking (see `Subst::bind`'s own doc comment), since a const
+    /// generic referenced as an ordinary value (a `for` loop bound, say)
+    /// needs its own real declared width recoverable later, once resolved
+    /// to a bare `Ty::Const` — see `check_pending_constraints`'s own
+    /// `Ty::Const` bridge. The shared core `fn_generics_mapping`
     /// delegates to, also used directly by struct construction/field access
     /// (`ExprKind::StructLit`/`FieldAccess`), where there's no `FnDecl` to
     /// read a generics list off of, just `Registry::struct_generics` — a
@@ -915,7 +1112,7 @@ impl<'r> Infer<'r> {
                 GenericParam::Const { name, ty } => {
                     let width = self.ty_from_ast_mapped(ty, &mapping);
                     if let Ty::Var(v) = &mapping[name] {
-                        self.const_widths.insert(*v, width);
+                        self.subst.set_const_width(*v, width);
                     }
                 }
             }
@@ -1049,6 +1246,27 @@ impl<'r> Infer<'r> {
     /// method alone only ever sees itself, never a sibling).
     pub fn infer_fn(&mut self, f: &FnDecl) -> Result<Ty, TypeError> {
         let (param_types, ret_var, generics) = self.fresh_fn_shape(f);
+        let mut outer = Env::new();
+        outer.insert(f.name.clone(), Scheme::mono(Ty::Fn(param_types.clone(), Box::new(ret_var.clone()))));
+        let result = self.infer_fn_raw(f, &outer, param_types.clone(), ret_var, &generics)?;
+        self.finish_fn(f, param_types, result)
+    }
+
+    /// Like `infer_fn`, but for `monomorphize.rs`'s own duck-typed
+    /// fallback (`detect_duck_typed_fns`): `param_types` are a call site's
+    /// own already-concrete argument types, substituted in from the very
+    /// start, instead of `fresh_fn_shape`'s own fresh `Ty::Var`s. This is
+    /// what lets a nominally-typed expression that depends on a parameter's
+    /// own concrete shape (field access on what would otherwise be an
+    /// unconstrained generic parameter) resolve for real, instead of
+    /// deferring to a `<not-yet-inferred>` placeholder that ordinary
+    /// generalize-then-substitute monomorphization can never repair
+    /// afterward (see `is_placeholder`'s own doc comment). Self-recursion,
+    /// and any explicitly-annotated parameter alongside the unannotated
+    /// one, both fall out of the exact same mechanism `infer_fn`/`infer_fn_
+    /// raw` already provide -- nothing extra needed here.
+    pub(crate) fn infer_fn_with_concrete_params(&mut self, f: &FnDecl, param_types: Vec<Ty>) -> Result<Ty, TypeError> {
+        let (_, ret_var, generics) = self.fresh_fn_shape(f);
         let mut outer = Env::new();
         outer.insert(f.name.clone(), Scheme::mono(Ty::Fn(param_types.clone(), Box::new(ret_var.clone()))));
         let result = self.infer_fn_raw(f, &outer, param_types.clone(), ret_var, &generics)?;
@@ -1759,7 +1977,7 @@ impl<'r> Infer<'r> {
         // scheme is instantiated, needs the *real* width, not a guess; see
         // `check_pending_constraints`'s own `Ty::Const` bridge).
         let const_widths: HashMap<TyVar, Ty> =
-            self.const_widths.iter().filter(|(v, _)| var_set.contains(v)).map(|(v, t)| (*v, t.clone())).collect();
+            self.subst.const_widths.iter().filter(|(v, _)| var_set.contains(v)).map(|(v, t)| (*v, t.clone())).collect();
 
         Scheme { vars, constraints, ty, const_widths }
     }
@@ -1872,7 +2090,7 @@ impl<'r> Infer<'r> {
         // again for *this* instantiation.
         for (v, width) in &scheme.const_widths {
             if let Some(Ty::Var(fresh)) = mapping.get(v) {
-                self.const_widths.insert(*fresh, width.clone());
+                self.subst.set_const_width(*fresh, width.clone());
             }
         }
         (substitute(&scheme.ty, &mapping), mapping)
@@ -2182,9 +2400,9 @@ impl<'r> Infer<'r> {
             // check that against directly (impls are declared for real
             // types, never for one specific constant value). Bridge each
             // such element to its own const generic's declared width,
-            // recovered from `self.const_widths` via `c.tys`' own
-            // *original*, pre-resolution var (see that field's own doc
-            // comment — threaded through `generalize`/`instantiate_with_
+            // recovered from `self.subst`'s own const-width tracking via
+            // `c.tys`' own *original*, pre-resolution var (see `Subst::
+            // bind`'s own doc comment — threaded through `generalize`/`instantiate_with_
             // mapping` exactly like this constraint itself was, so it's
             // still there for a constraint re-checked at instantiation time,
             // not just at the original declaration site). Falls back to
@@ -2200,7 +2418,7 @@ impl<'r> Infer<'r> {
                 .map(|(r, orig)| match r {
                     Ty::Const(cv) => {
                         let width = match orig {
-                            Ty::Var(v) => self.const_widths.get(v).cloned(),
+                            Ty::Var(v) => self.subst.const_width(*v),
                             _ => None,
                         };
                         width.unwrap_or_else(|| match cv {
@@ -3328,8 +3546,17 @@ impl<'r> Infer<'r> {
             // `quantified` above — this variable belongs to const-generic
             // resolution (`check_pending_constraints`'s own `Ty::Const`
             // bridge, or monomorphization's reverse-unification), not to
-            // ordinary numeric-literal defaulting.
-            if self.const_widths.contains_key(&root) {
+            // ordinary numeric-literal defaulting. `root` is exactly the
+            // right variable to check here, not just a convenient one:
+            // `Subst::bind`'s own forward propagation (see its doc comment)
+            // guarantees `root`'s own entry exists whenever `var`'s chain
+            // ever passed through a const generic's own value slot, however
+            // many merges deep and regardless of which direction each merge
+            // happened to bind — real bug, found and fixed by direct
+            // testing (`for i in N..5`, `N` as the range's own *start*, used
+            // to silently defeat this exact guard before `const_width`
+            // moved into `Subst` itself).
+            if self.subst.const_width(root).is_some() {
                 continue;
             }
             let concrete = match default {

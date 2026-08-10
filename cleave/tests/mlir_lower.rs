@@ -41,6 +41,28 @@ fn a_function_returning_a_bare_literal_lowers_to_a_constant_plus_return() {
     assert!(text.contains("return %c0_i32 : i32") || text.contains("return %"), "got:\n{text}");
 }
 
+/// A real bug, found by direct testing (`examples/axiom_demo.cleave`):
+/// `llvm.emit_c_interface` (and the extra `_mlir_ciface_<name>` wrapper it
+/// generates) used to get attached to *every* top-level fn unconditionally
+/// — needless bloat, since the only function this project ever invokes via
+/// `ExecutionEngine::invoke_packed` is `main` (confirmed: every call site,
+/// `main.rs`'s own `--run` and every test, hardcodes `"main"`); an ordinary
+/// internal call already goes through a plain `call @name`, which never
+/// needs the C-interface wrapper at all. Scoped to `main` alone now.
+#[test]
+fn only_main_gets_the_c_interface_export_attribute() {
+    let context = context();
+    let text = lower(&context, "fn helper(x: i32) -> i32 { x }\nfn main() -> i32 { helper(1) }");
+    assert!(
+        text.contains("func.func @main() -> i32 attributes {llvm.emit_c_interface}"),
+        "main must still carry the export attribute, got:\n{text}"
+    );
+    assert!(
+        !text.contains("func.func @helper(%arg0: i32) -> i32 attributes"),
+        "an ordinary internal function must not carry it, got:\n{text}"
+    );
+}
+
 #[test]
 fn different_integer_widths_lower_to_their_own_mlir_type() {
     let context = context();
@@ -172,6 +194,32 @@ fn a_recursive_function_actually_computes_fibonacci() {
     let context = context();
     let src = "fn fib(n: i32) -> i32 { if n < 2 { n } else { fib(n - 1) + fib(n - 2) } } fn main() -> i32 { fib(10) }";
     assert_eq!(run_i32(&context, src), 55);
+}
+
+/// A `()`-returning function called from another function -- not just as
+/// the program's own entry point -- used to fail MLIR verification
+/// outright (`'func.call' op incorrect number of results for callee`):
+/// `lower_top_level_fn` already declares a `()`-returning callee with
+/// *zero* MLIR results (`is_unit_ty`, applied uniformly to every top-level
+/// fn, not scoped to `main`), but `lower_real_call`'s own call site used to
+/// unconditionally request exactly one result regardless of the callee's
+/// own return type. Found via `examples/vector.cleave`'s own `print_vec`
+/// helper -- an entirely ordinary pattern (a small `()`-returning helper
+/// called from `main`), not a contrived case.
+#[test]
+fn a_unit_returning_function_can_be_called_from_another_function() {
+    let context = context();
+    let src = "
+        fn touch(x: i32) {
+            x + 1;
+        }
+        fn main() -> i32 {
+            touch(1);
+            touch(2);
+            42
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 42);
 }
 
 /// The generic mechanism itself (`PrimOp::RawMlirOp`, `mlir_lower.rs::
@@ -385,6 +433,145 @@ fn an_extern_impl_method_actually_executes_the_right_symbol_at_each_call_site() 
     assert_eq!(out, 0);
 }
 
+/// De-risks the extern/array ABI boundary (see the plan this was built
+/// against, in `doc/backlog.md`'s own "No string support at all" item's
+/// eventual "Done" write-up) *before* string support depends on it: an
+/// `extern fn`'s own declared `Ty::Array` parameter must not be lowered as
+/// an ordinary `memref` argument — MLIR's default `convert-to-llvm`
+/// conversion turns a `memref` crossing any `func.call` boundary into a
+/// descriptor *struct*, not a bare pointer, which no hand-written
+/// `cleave-rt` extern fn could plausibly match. `mlir_lower.rs`'s own
+/// array-aware extern-call lowering extracts a raw pointer + a compile-time
+/// known length explicitly instead, passing `(ptr, len)` as two ordinary
+/// scalar arguments — this is the real, load-bearing proof that mechanism
+/// works, not just that the module verifies.
+#[test]
+fn an_array_argument_crosses_an_extern_call_boundary_correctly() {
+    let context = context();
+    let (result, _sources) =
+        compile(vec![("test.cleave".to_string(), "extern fn sum_bytes(x: [i8; 3]) -> i32; fn main() -> i32 { sum_bytes([1, 2, 3]) }".to_string())], &[]);
+    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+    let registry = Registry::build(&program);
+    let units = collect_units(&program, &registry);
+    let cps_program = convert_program(units);
+    let mlir_types = collect_mlir_types(&program);
+    let struct_schemas = collect_struct_schemas(&program);
+    let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
+    assert!(module.as_operation().verify());
+
+    let pass_manager = pass::PassManager::new(&context);
+    pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
+    pass_manager.add_pass(pass::conversion::create_to_llvm());
+    pass_manager.run(&mut module).expect("lowering to the llvm dialect must succeed");
+
+    let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
+    unsafe {
+        engine.register_symbol("sum_bytes", cleave_rt::sum_bytes as *mut ());
+        engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
+    }
+    let mut out: i32 = -1;
+    unsafe {
+        engine.invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()]).expect("JIT invocation must succeed");
+    }
+    assert_eq!(out, 6, "1 + 2 + 3");
+}
+
+/// A `()`-returning `extern fn` (`extern fn touch_i32(x: i32);`, no `->`
+/// clause) — a real C ABI shape never previously exercised by any real
+/// example: every other `extern fn` in this codebase returns a real value.
+/// `PrimOp::Extern`'s own lowering used to declare/call with `ty_to_mlir(ctx,
+/// ty)` unconditionally, which has no real case for `()` either (falls
+/// through to the generic-struct arm, `!llvm.ptr`) — requesting one bogus
+/// pointer-typed result against a real C symbol that returns nothing at all.
+/// Fixed the same way `lower_real_call`/`lower_top_level_fn` already handle
+/// a unit-returning top-level fn: zero declared/requested MLIR results, and
+/// the cleave-level result is never bound into `env` (nothing downstream can
+/// look up a unit value anyway).
+#[test]
+fn a_unit_returning_extern_fn_can_be_called_correctly() {
+    let context = context();
+    let (result, _sources) = compile(
+        vec![("test.cleave".to_string(), "extern fn touch_i32(x: i32);\nfn main() -> i32 { touch_i32(5); 42 }".to_string())],
+        &[],
+    );
+    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+    let registry = Registry::build(&program);
+    let units = collect_units(&program, &registry);
+    let cps_program = convert_program(units);
+    let mlir_types = collect_mlir_types(&program);
+    let struct_schemas = collect_struct_schemas(&program);
+    let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
+    assert!(module.as_operation().verify());
+    let text = module.as_operation().to_string();
+    // The real, structural proof: the declared extern signature (and its
+    // own call site) must request *zero* results, not a bogus `!llvm.ptr`
+    // (`ty_to_mlir`'s own generic-struct fallback for `()`, before the fix)
+    // that happens not to crash here only because nothing ever reads it.
+    assert!(text.contains("func.func private @touch_i32(i32)") && !text.contains("touch_i32(i32) -> "), "got:\n{text}");
+    assert!(text.contains("call @touch_i32(%c5_i32) : (i32) -> ()"), "got:\n{text}");
+
+    let pass_manager = pass::PassManager::new(&context);
+    pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
+    pass_manager.add_pass(pass::conversion::create_to_llvm());
+    pass_manager.run(&mut module).expect("lowering to the llvm dialect must succeed");
+
+    let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
+    unsafe {
+        engine.register_symbol("touch_i32", cleave_rt::touch_i32 as *mut ());
+        engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
+    }
+    let mut out: i32 = -1;
+    unsafe {
+        engine.invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()]).expect("JIT invocation must succeed");
+    }
+    assert_eq!(out, 42);
+}
+
+/// The real end-to-end proof for string support: `print("hi")` — a string
+/// literal (desugared to an `[i8; 2]` array literal, `lower.rs::
+/// lower_string_lit`) dispatched through the new `impl<const N: i32>
+/// Print<[i8; N]>` (`stdlib/io/io.cleave`), crossing the extern boundary via
+/// the same array-aware lowering `an_array_argument_crosses_an_extern_call_
+/// boundary_correctly` above already proved. `Print<[i8;N]>::print`'s own
+/// declared return type is `[i8; N]` (identity, matching every other
+/// `Print<T>` impl's "prints and returns unchanged" contract) even though
+/// the real `print_bytes` extern symbol returns a plain `i64` byte count —
+/// `mlir_lower.rs`'s own array-return reconciliation must discard that
+/// scalar and thread the original array through, not try to reconstruct a
+/// `[i8;N]` from an `i64`.
+#[test]
+fn a_string_literal_printed_via_print_writes_the_right_bytes_to_stdout() {
+    let context = context();
+    let (result, _sources) = compile(vec![("test.cleave".to_string(), "use io;\nfn main() -> i32 { print(\"hi\"); 0 }".to_string())], &[]);
+    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+    let registry = Registry::build(&program);
+    let units = collect_units(&program, &registry);
+    let cps_program = convert_program(units);
+    let mlir_types = collect_mlir_types(&program);
+    let struct_schemas = collect_struct_schemas(&program);
+    let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
+    assert!(module.as_operation().verify());
+    let text = module.as_operation().to_string();
+    assert!(text.contains("call @print_bytes"), "expected a real call to print_bytes, got:\n{text}");
+    assert!(text.contains("llvm.inttoptr"), "expected the array-aware pointer extraction, got:\n{text}");
+
+    let pass_manager = pass::PassManager::new(&context);
+    pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
+    pass_manager.add_pass(pass::conversion::create_to_llvm());
+    pass_manager.run(&mut module).expect("lowering to the llvm dialect must succeed");
+
+    let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
+    unsafe {
+        engine.register_symbol("print_bytes", cleave_rt::print_bytes as *mut ());
+        engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
+    }
+    let mut out: i32 = -1;
+    unsafe {
+        engine.invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()]).expect("JIT invocation must succeed");
+    }
+    assert_eq!(out, 0);
+}
+
 #[test]
 fn a_while_loop_lowers_to_scf_while() {
     let context = context();
@@ -556,6 +743,88 @@ fn a_struct_with_an_array_field_computes_the_right_value() {
         }
     ";
     assert_eq!(run_i32(&context, src), 12);
+}
+
+/// `doc/backlog.md`'s own "Nested struct-as-field, unverified" item —
+/// "designed for but never actually exercised end to end." A struct field
+/// whose own type is *another* struct: `ty_to_llvm_field_type`'s own
+/// fallback treats it identically to any other struct value (an opaque
+/// `!llvm.ptr`, reference semantics), so a `Triangle`'s own `a`/`b`/`c`
+/// fields are each a real, independent heap-allocated `Point` — proven by
+/// reading through *two* levels of field access (`t.a.x`) and confirming
+/// the three points stay independently addressable, not aliased.
+#[test]
+fn a_struct_field_whose_own_type_is_another_struct_computes_the_right_value() {
+    let context = context();
+    let src = "
+        struct Point { x: i32, y: i32 }
+        struct Triangle { a: Point, b: Point, c: Point }
+        fn main() -> i32 {
+            let t = Triangle(a: Point(x: 1, y: 2), b: Point(x: 10, y: 20), c: Point(x: 100, y: 200));
+            t.a.x + t.b.y + t.c.x
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1 + 20 + 100);
+}
+
+/// The mutation counterpart — a *nested* struct field mutated through two
+/// levels of field access (`t.a.x = ...`), mirrors `a_struct_field_
+/// mutation_write_then_read_computes_the_right_value`'s own "write then
+/// read through the same reference" shape, one level deeper.
+#[test]
+fn a_nested_struct_fields_own_field_mutation_write_then_read_computes_the_right_value() {
+    let context = context();
+    let src = "
+        struct Point { x: i32, y: i32 }
+        struct Triangle { a: Point, b: Point, c: Point }
+        fn main() -> i32 {
+            let mut t = Triangle(a: Point(x: 1, y: 2), b: Point(x: 10, y: 20), c: Point(x: 100, y: 200));
+            t.a.x = 1000;
+            t.a.x + t.b.y + t.c.x
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1000 + 20 + 100);
+}
+
+/// An array whose own *element* type is a struct, not a scalar — used to be
+/// a hard native MLIR crash (`invalid memref element type`, a
+/// `STATUS_STACK_BUFFER_OVERRUN` abort, since `array_memref_type` built a
+/// `memref` unconditionally even for a struct-typed leaf's own opaque
+/// `!llvm.ptr` element type — see `doc/backlog.md`'s own former "Array of
+/// struct elements" item). Fixed: a struct-leaf array now gets a real heap
+/// allocation shaped as an inline `!llvm.array` instead (`array_leaf_is_
+/// struct`, `lower_array_construct`'s own struct-leaf branch).
+#[test]
+fn an_array_of_structs_computes_the_right_value() {
+    let context = context();
+    let src = "
+        struct Point { x: i32, y: i32 }
+        fn main() -> i32 {
+            let pts = [Point(x: 1, y: 2), Point(x: 10, y: 20), Point(x: 100, y: 200)];
+            pts[0].x + pts[1].y + pts[2].x
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1 + 20 + 100);
+}
+
+/// The struct-*field* variant — same root cause as the test above, not a
+/// separate bug: the array literal `[Point(...), Point(...)]` is built via
+/// the ordinary `PrimOp::Array` path regardless of its eventual destination.
+/// Exercises `copy_array_into_llvm_field`'s own pointer-source branch (Stage
+/// 5): the source array is itself `!llvm.ptr`-backed, copied element-by-
+/// element into the struct's own embedded `!llvm.array` field.
+#[test]
+fn a_struct_field_whose_own_type_is_an_array_of_structs_computes_the_right_value() {
+    let context = context();
+    let src = "
+        struct Point { x: i32, y: i32 }
+        struct Path { pts: [Point; 2] }
+        fn main() -> i32 {
+            let p = Path(pts: [Point(x: 1, y: 2), Point(x: 10, y: 20)]);
+            p.pts[0].x + p.pts[1].y
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1 + 20);
 }
 
 /// A loop carrying two *differently*-typed values at once (an `i32` counter

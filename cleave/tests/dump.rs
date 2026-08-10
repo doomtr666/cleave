@@ -28,20 +28,34 @@ fn dumps_resolved_param_and_tail_types_for_unannotated_params() {
 
 #[test]
 fn dumps_let_and_tail_statements_with_their_own_types() {
-    // `x` is generalized at the `let` (a syntactic value, immutable) — its
-    // own definition site correctly shows a still-open type variable, *not*
-    // a misleadingly concrete default (`apply_defaults` must never bind a
-    // variable `generalize` already quantified, see `Infer::quantified`'s
-    // doc comment — found necessary by a real, reproducible case: a
-    // self-recursive top-level `fn` whose own body showed a hardcoded `i32`
-    // for a variable its own signature reported as still-generic). The
-    // *tail*'s own reference is a fresh instantiation, independently pinned
-    // to `i32` by `f`'s declared return type — genuinely concrete, not a
-    // default.
+    // `x` is a bare-literal `let` binding — deliberately *not* generalized
+    // (`is_syntactic_value`'s own doc comment: a real bug, found by direct
+    // testing, where generalizing this exact shape let a use site's own
+    // fresh instantiation silently escape `pending_defaults` entirely).
+    // Both the definition site and the tail's own reference therefore show
+    // the *same* concrete type, pinned by `f`'s declared return type — not
+    // two different renderings of two different variables.
     let (out, errs) = dump("fn f() -> i32 { let x = 1; x }");
     assert_eq!(errs, 0, "got:\n{out}");
-    assert!(out.contains("let x = 1:'a"), "got:\n{out}");
+    assert!(out.contains("let x = 1:i32"), "got:\n{out}");
     assert!(out.contains("x:i32"), "got:\n{out}");
+}
+
+#[test]
+fn a_let_bound_lambda_still_shows_a_still_open_type_variable_at_its_own_definition() {
+    // Unlike a bare-literal `let` (see the test above), a lambda *is* still
+    // genuinely generalized at its own `let` binding (`is_syntactic_value`)
+    // — `id`'s own definition site correctly shows a still-open type
+    // variable, not a misleadingly concrete default (`apply_defaults` must
+    // never bind a variable `generalize` already quantified, see `Infer::
+    // quantified`'s own doc comment — the same invariant `fibonacci`'s own
+    // self-recursion test below also protects, for a top-level `fn`'s own
+    // signature). Each call site's own reference is an independent, freshly
+    // pinned instantiation.
+    let (out, errs) = dump("fn f() -> i32 { let id = fn(x) { x }; id(1) }");
+    assert_eq!(errs, 0, "got:\n{out}");
+    assert!(out.contains("fn(x) { x:'a }:('a) -> 'a"), "lambda's own definition should stay generic, got:\n{out}");
+    assert!(out.contains("id(1:i32):i32"), "the call site's own instantiation should be concrete, got:\n{out}");
 }
 
 #[test]

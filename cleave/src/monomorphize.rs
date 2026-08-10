@@ -86,7 +86,7 @@
 use crate::ast::*;
 use crate::callgraph::{self, ProgramInference};
 use crate::dump::{dump_block_with_call_names, fmt_ty_named, TyVarNames};
-use crate::infer::{free_vars, substitute, unify, Env, Infer, Scheme, Subst, Ty, TyVar, TypeError, TypeErrorKind};
+use crate::infer::{find_placeholder_name, free_vars, substitute, unify, Env, Infer, Scheme, Subst, Ty, TyVar, TypeError, TypeErrorKind};
 use crate::registry::Registry;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -301,6 +301,7 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
     let templates = build_impl_templates(program, registry, &program_inference.global_env);
     let inherent_templates = build_inherent_templates(program, registry, &program_inference.global_env);
     let lambda_exprs = index_lambda_exprs(program, &program_inference.lambda_schemes);
+    let duck_typed_fns = detect_duck_typed_fns(&functions, &program_inference);
 
     let mut mono = MonomorphizedProgram {
         specializations: HashMap::new(),
@@ -353,24 +354,51 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
         if mono.specializations.contains_key(&display) {
             continue;
         }
-        let (Some(&f), Some(scheme)) = (functions.get(name.as_str()), program_inference.global_env.get(&name)) else {
-            continue;
-        };
-        let Ty::Fn(param_pattern, ret_pattern) = &scheme.ty else {
-            continue; // a top-level fn's own scheme is always Ty::Fn — defensive, not expected
-        };
-
-        let mapping: HashMap<TyVar, Ty> = scheme.vars.iter().copied().zip(concrete_tys.iter().cloned()).collect();
-        let param_types: Vec<Ty> = param_pattern.iter().map(|t| substitute(t, &mapping)).collect();
-        let result = substitute(ret_pattern, &mapping);
-
+        let Some(&f) = functions.get(name.as_str()) else { continue };
         let body = f.body.as_ref().expect("a top-level fn with a global_env scheme always has a body");
-        let mut exprs = Vec::new();
-        collect_exprs_block(body, &mut exprs);
-        let node_types: HashMap<NodeId, Ty> = exprs
-            .iter()
-            .filter_map(|e| program_inference.node_types.get(&e.id).map(|t| (e.id, substitute(t, &mapping))))
-            .collect();
+
+        let (param_types, result, node_types) = if duck_typed_fns.contains(&name) {
+            // Duck-typed fallback (`detect_duck_typed_fns`'s own doc
+            // comment) — a real, separate re-inference for this one
+            // concrete call site, not substitution over the shared
+            // declaration-time template: substitution can never resolve an
+            // expression (field access, ...) whose own type genuinely
+            // depends on this call site's own concrete argument types,
+            // which the ordinary one-shot HM pass could never see.
+            let mut infer = Infer::new(registry);
+            match infer.infer_fn_with_concrete_params(f, concrete_tys.clone()) {
+                Ok(result) => {
+                    let mut exprs = Vec::new();
+                    collect_exprs_block(body, &mut exprs);
+                    let node_types: HashMap<NodeId, Ty> =
+                        exprs.iter().filter_map(|e| infer.node_types.get(&e.id).map(|t| (e.id, t.clone()))).collect();
+                    (infer.param_types.clone(), result, node_types)
+                }
+                Err(e) => {
+                    let tys = concrete_tys.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ");
+                    mono.errors.push(TypeError {
+                        span: e.span,
+                        kind: TypeErrorKind::GenericFnInstantiationFailed { name: name.clone(), tys, inner: Box::new(e) },
+                    });
+                    continue;
+                }
+            }
+        } else {
+            let Some(scheme) = program_inference.global_env.get(&name) else { continue };
+            let Ty::Fn(param_pattern, ret_pattern) = &scheme.ty else {
+                continue; // a top-level fn's own scheme is always Ty::Fn — defensive, not expected
+            };
+            let mapping: HashMap<TyVar, Ty> = scheme.vars.iter().copied().zip(concrete_tys.iter().cloned()).collect();
+            let param_types: Vec<Ty> = param_pattern.iter().map(|t| substitute(t, &mapping)).collect();
+            let result = substitute(ret_pattern, &mapping);
+            let mut exprs = Vec::new();
+            collect_exprs_block(body, &mut exprs);
+            let node_types: HashMap<NodeId, Ty> = exprs
+                .iter()
+                .filter_map(|e| program_inference.node_types.get(&e.id).map(|t| (e.id, substitute(t, &mapping))))
+                .collect();
+            (param_types, result, node_types)
+        };
 
         // Scan *this specialization's own* (now fully concrete) node types
         // for further calls into another generic callee — transitive
@@ -561,6 +589,42 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
 /// here). A method whose own declaration-time inference fails is silently
 /// skipped — nothing to monomorphize for a method that doesn't type-check;
 /// `--dump-inference-pass` is where that failure actually gets reported.
+/// Scans every generic top-level `fn` for placeholder residue anywhere in
+/// its own body's declaration-time `node_types` — see `infer.rs`'s own
+/// `is_placeholder` doc comment for what counts (`<not-yet-inferred>`,
+/// `<unresolved-call:...>`, ...). A fn found here can never be correctly
+/// specialized by the ordinary substitution path in the `fn_worklist` loop
+/// below — substitution only ever replaces a `Ty::Var`, and a placeholder is
+/// a `Ty::Con`, permanently baked in by the one-shot HM pass
+/// (`callgraph::infer_program`) regardless of a later call site's own
+/// concrete types. Instead, the `fn_worklist` loop routes anything found
+/// here through `Infer::infer_fn_with_concrete_params` — a real, separate
+/// re-inference per concrete call site, C++-templates-style, deliberately
+/// *not* HM's own "checked once, sound everywhere" discipline (a second,
+/// coexisting mechanism, not a replacement — see this feature's own commit/
+/// discussion for why). Scoped to top-level `fn`s only: a generic algebra-
+/// impl method's own signature is always fully, explicitly declared by its
+/// `algebra`, so it never has an unconstrained parameter to trigger this in
+/// the first place.
+fn detect_duck_typed_fns(functions: &HashMap<&str, &FnDecl>, program_inference: &ProgramInference) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for (name, f) in functions {
+        let Some(scheme) = program_inference.global_env.get(*name) else { continue };
+        if scheme.vars.is_empty() {
+            continue;
+        }
+        let Some(body) = &f.body else { continue };
+        let mut exprs = Vec::new();
+        collect_exprs_block(body, &mut exprs);
+        let has_placeholder =
+            exprs.iter().any(|e| program_inference.node_types.get(&e.id).is_some_and(|t| find_placeholder_name(t).is_some()));
+        if has_placeholder {
+            out.insert((*name).to_string());
+        }
+    }
+    out
+}
+
 fn build_impl_templates(program: &Program, registry: &Registry, global_env: &Env) -> Vec<ImplTemplate> {
     let mut templates = Vec::new();
     for item in &program.items {
@@ -568,25 +632,20 @@ fn build_impl_templates(program: &Program, registry: &Registry, global_env: &Env
         let all_targets: Vec<Type> = std::iter::once(d.target.clone()).chain(d.extra_targets.iter().cloned()).collect();
         let is_generic = !d.generics.is_empty();
         for f in &d.fns {
-            // A *generic* impl's own bodyless method (`#[mlir(...)]`-tagged,
-            // or otherwise) has no body to substitute a specialization's
-            // concrete types into — nothing to monomorphize, skipped.
-            // A *concrete* impl's own bodyless method (the immediate,
-            // real-primitive case — `impl Ring<f32> { #[mlir(...)] fn
-            // add(...); }`) still needs a template built, even with no real
-            // body: `derive_impl_instantiation`'s own structural match
-            // against `is_generic == false` is what recognizes "a concrete
-            // impl already covers this call, no specialization needed" (see
-            // `ImplTemplate::is_generic`'s own doc comment) — skipping it
-            // here entirely made that impl invisible to that check, so a
-            // scalar call inside some *other* generic impl's own body (e.g.
-            // `Complex<T>::add`'s own `x.real + y.real`, once monomorphized
-            // at `T = f32`) wrongly fell through to `NoneMatched` against
-            // the only *visible* (and structurally incompatible) candidate
-            // — found by direct testing.
-            if f.body.is_none() && is_generic {
-                continue;
-            }
+            // A bodyless method (extern-backed, or the old `#[mlir(...)]`
+            // intrinsic tag) never needs body-substitution — nothing here
+            // depends on that distinction, whether the impl itself is
+            // generic or not: a template still gets built either way (see
+            // `body` below, `unwrap_or`-defaulted to empty), only the
+            // *body-substitution machinery* stays inert. A *generic*
+            // extern-backed impl (`impl<const N: i32> Print<[i8; N]> {
+            // extern(print_bytes) fn print(x: [i8; N]) -> [i8; N]; }`, the
+            // first of its kind in this codebase — found missing by direct
+            // testing, not by reading) still needs a real template: the
+            // concrete `N` a given call site reaches is exactly what
+            // `derive_impl_instantiation`/`call_names` exist to record, an
+            // extern-backed method needs that as much as a real one does,
+            // even though there's no cleave-level body to specialize.
             let mut infer = Infer::new(registry);
             let Ok(ret_pattern) = infer.infer_impl_fn_generic_with_env(global_env, &d.algebra, &d.generics, &all_targets, f, item.span)
             else {

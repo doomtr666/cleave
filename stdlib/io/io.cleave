@@ -19,3 +19,17 @@ impl Print<i32> { extern(print_i32) fn print(x: i32) -> i32; }
 impl Print<i64> { extern(print_i64) fn print(x: i64) -> i64; }
 impl Print<f32> { extern(print_f32) fn print(x: f32) -> f32; }
 impl Print<f64> { extern(print_f64) fn print(x: f64) -> f64; }
+
+// A string is a plain `[i8; N]` array (see `doc/backlog.md`'s own "No
+// string support at all" item) — no new representation, just an ordinary
+// generic impl over an array-shaped target, one specialization per
+// distinct literal length actually reached (the same "monomorphize once
+// per concrete instantiation" discipline every other generic construct in
+// this codebase already gets). `print_bytes` (`cleave-rt`) writes the raw
+// bytes to stdout and returns their count as a plain `i64` — a real ABI
+// mismatch against this impl's own declared `[i8; N]` return, resolved by
+// `mlir_lower.rs`'s own array-return reconciliation (discards the extern
+// call's own scalar result, threads the original array through instead,
+// matching every other `Print<T>` impl's "prints and returns unchanged"
+// contract).
+impl<const N: i32> Print<[i8; N]> { extern(print_bytes) fn print(x: [i8; N]) -> [i8; N]; }

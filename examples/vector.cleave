@@ -1,0 +1,35 @@
+use io;
+
+struct vec3<T : Float> {
+    x: T,
+    y: T,
+    z: T,
+}
+
+impl <T: Float> Ring<vec3<T>> {
+    fn add(v1,v2) { 
+        vec3(x: v1.x + v2.x, y: v1.y + v2.y, z: v1.z + v2.z)
+    }
+
+}
+
+fn print_vec(v) {
+    print(v.x);
+    print(v.y);
+    print(v.z);
+}
+
+
+fn main() {
+    
+    let v1 = vec3(x: 1.0, y: 2.0, z : 3.0);
+    let v2 = vec3(x: 1.0, y: 2.0, z : 3.0);
+    let vr = v1 + v2;
+    let va = [v1, v2, vr];
+
+    print_vec(va[0]);
+    print_vec(va[1]);
+    print_vec(va[2]);
+
+    0
+}

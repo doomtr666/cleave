@@ -1,5 +1,5 @@
 use cleave::ast::{Block, Expr, ExprKind, FileId, ItemKind, Program, StmtKind};
-use cleave::infer::{ConstValue, Ty};
+use cleave::infer::{ConstValue, Ty, TypeErrorKind};
 use cleave::lower::Lowerer;
 use cleave::monomorphize::monomorphize;
 use cleave::parser::{CleaveParser, Rule};
@@ -247,6 +247,72 @@ fn a_seed_functions_own_call_to_a_generic_callee_resolves_to_the_right_specializ
     let (mono, _) = monomorphize(&program, &registry);
     let call = find_call(&program, "main", "identity");
     assert_eq!(mono.seed_call_names().get(&call.id), Some(&"identity<i32>".to_string()));
+}
+
+// ---------------------------------------------------------------------
+// the duck-typed fallback (`detect_duck_typed_fns`): a generic top-level
+// `fn` whose unannotated parameter is field-accessed inside its own body.
+// Ordinary HM (checked once, generically, with the parameter as a fully
+// unconstrained `Ty::Var`) can never resolve this -- field access is
+// nominal, so it defers to a `<not-yet-inferred>` sentinel that plain
+// substitution (the ordinary worklist path just above) can never repair
+// afterward. Found via `examples/vector.cleave`'s own `print_vec(v) {
+// print(v.x); ... }`.
+// ---------------------------------------------------------------------
+
+#[test]
+fn an_unannotated_generic_params_own_field_access_resolves_via_the_duck_typed_fallback() {
+    // `v.x`'s own type is deliberately *not* the function's own returned
+    // value (bound to an otherwise-unused `let` instead) -- exactly
+    // mirroring `print_vec`'s own shape, where the buried placeholder never
+    // surfaces in the function's own *exposed* signature (`(t) -> i32`
+    // here, `(t) -> ()` there), which is precisely why ordinary HM doesn't
+    // even notice anything is wrong at declaration time.
+    let src = "struct Point { x: i32, y: i32 }
+        fn get_x(v) -> i32 { let dummy = v.x; 0 }
+        fn main() -> i32 { get_x(Point(x: 5, y: 10)) }";
+    let registry = registry_from(src);
+    let program = lower_program(src);
+    let (mono, _) = monomorphize(&program, &registry);
+    assert!(mono.errors().is_empty(), "expected no errors, got {:?}", mono.errors());
+    let keys = mono.specializations_of("get_x");
+    assert_eq!(keys, &["get_x<Point>".to_string()]);
+    assert_eq!(mono.result(&keys[0]), &Ty::Con("i32".to_string()));
+    // The real proof: `v.x`'s own node type resolved to a genuine, fully
+    // concrete type (`i32`, `Point`'s own declared field type) -- not a
+    // leftover `<not-yet-inferred>` placeholder (`assert_fully_concrete`
+    // only accepts a real `Ty::Con`/`Ty::App`/etc., never a `Ty::Var`, but a
+    // placeholder *is* a `Ty::Con` -- the real check is the `errors().is_
+    // empty()` above plus `specializations_of` actually finding an entry;
+    // this loop additionally guards against a leftover generic `Ty::Var`,
+    // matching every other specialization test in this file).
+    for t in mono.node_types(&keys[0]).values() {
+        assert_fully_concrete(t);
+    }
+}
+
+#[test]
+fn a_duck_typed_fallback_specialization_that_genuinely_fails_reports_the_real_inner_error() {
+    let src = "struct Point { x: i32, y: i32 }
+        fn get_x(v) -> i32 { let dummy = v.x; 0 }
+        fn main() -> i32 { get_x(5) }";
+    let registry = registry_from(src);
+    let program = lower_program(src);
+    let (mono, _) = monomorphize(&program, &registry);
+    assert!(mono.specializations_of("get_x").is_empty(), "a genuinely failing instantiation must not produce a specialization");
+    assert_eq!(mono.errors().len(), 1, "expected exactly one error, got {:?}", mono.errors());
+    match &mono.errors()[0].kind {
+        TypeErrorKind::GenericFnInstantiationFailed { name, tys, inner } => {
+            assert_eq!(name, "get_x");
+            assert_eq!(tys, "i32");
+            assert!(
+                matches!(inner.kind, TypeErrorKind::NoSuchField { .. }),
+                "expected the real inner NoSuchField error, got {:?}",
+                inner.kind
+            );
+        }
+        other => panic!("expected GenericFnInstantiationFailed, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------

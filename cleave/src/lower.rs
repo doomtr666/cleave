@@ -788,8 +788,25 @@ impl Lowerer {
             Rule::imaginary_lit => self.lower_imaginary_lit(inner),
             Rule::numeric_lit => self.lower_numeric_lit(inner),
             Rule::bool_lit => self.lower_bool_lit(inner),
+            Rule::string_lit => self.lower_string_lit(inner),
             r => unreachable!("literal: unexpected rule {r:?}"),
         }
+    }
+
+    /// Full erasure at lowering time, no `ExprKind` of its own — mirrors
+    /// `lower_array_lit`'s own literal-`N` `array_repeat` case exactly: a
+    /// string literal becomes an ordinary `ArrayLit` of `i8`-suffixed
+    /// `NumberLit`s, one per UTF-8 byte (not `char` — nothing elsewhere in
+    /// this compiler has any text-encoding stance to contradict). Each
+    /// byte gets its own fresh `Expr`/`NodeId` via `self.wrap`, the same
+    /// "every node is unique per occurrence" reasoning `array_repeat`'s own
+    /// copies already need (`node_types` is keyed by `NodeId`).
+    fn lower_string_lit(&mut self, pair: Pair<Rule>) -> Expr {
+        let span = self.span_of(&pair);
+        let text = pair.as_str();
+        let content = &text[1..text.len() - 1]; // strip the surrounding quotes
+        let elems = content.bytes().map(|b| self.wrap(span, ExprKind::NumberLit { text: b.to_string(), suffix: Some("i8".to_string()) })).collect();
+        self.wrap(span, ExprKind::ArrayLit(elems))
     }
 
     fn lower_bool_lit(&mut self, pair: Pair<Rule>) -> Expr {

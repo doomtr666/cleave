@@ -345,8 +345,24 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                 // Generic algebra impl — every specialization actually
                 // reached, already built by `monomorphize`.
                 for f in &d.fns {
+                    // A bodyless method (`extern(...)`, or bare `extern fn`)
+                    // needs `UnitBody::Extern`, not `UnitBody::Real` — the
+                    // same distinction the non-generic impl branch above and
+                    // the top-level `fn` branch both already make.
+                    // `monomorphize.rs::build_impl_templates` defaults a
+                    // bodyless method's own template body to an empty
+                    // `Block` (nothing to substitute), so `mono.body(key)`
+                    // would otherwise silently produce a real unit with a
+                    // trivially empty body instead of a real extern call —
+                    // found by direct testing, the first generic *and*
+                    // extern-backed impl this codebase ever declared
+                    // (`impl<const N: i32> Print<[i8; N]>`).
                     let origin_key = format!("{}::{}", d.algebra, f.name);
                     for key in mono.specializations_of(&origin_key) {
+                        let body = match &f.body {
+                            Some(_) => UnitBody::Real(mono.body(key).clone()),
+                            None => UnitBody::Extern(f.extern_symbol.clone().unwrap_or_else(|| f.name.clone())),
+                        };
                         units.push(ConcreteUnit {
                             name: key.clone(),
                             params: mono.params(key).to_vec(),
@@ -358,7 +374,7 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                             capture_count: 0,
                             baked_closures: Vec::new(),
                             higher_order_args: HashMap::new(),
-                            body: UnitBody::Real(mono.body(key).clone()),
+                            body,
                         });
                     }
                 }
@@ -1989,6 +2005,73 @@ fn parse_number(text: &str, ty: &Ty) -> CVal {
         CVal::Float(text.parse().unwrap_or_else(|e| panic!("bad float literal {text:?}: {e}")))
     } else {
         CVal::Int(text.parse().unwrap_or_else(|e| panic!("bad int literal {text:?}: {e}")))
+    }
+}
+
+// ---------------------------------------------------------------- dead-code elimination
+
+/// Drops every `CTopLevelFn` unreachable from the program's own real entry
+/// point (`"main"`) — `collect_units` unconditionally collects a
+/// `ConcreteUnit` for *every* non-generic algebra impl declared anywhere in
+/// the merged program, including the whole prelude (`stdlib/num/num.cleave`'s
+/// own `Ring`/`Ord` × 6 widths chief among them, see `doc/backlog.md`'s own
+/// "Dead-code elimination for unused stdlib specializations" item) —
+/// regardless of whether a given program ever actually calls into them.
+///
+/// Works off already-resolved CPS references (`CVal::Label`), never
+/// re-derives call resolution from the AST — a real call's own callee name
+/// is already unambiguous by this point (`emit_call`'s own `App{func:
+/// Label(name), ..}` shape), matching this module's own "everything past
+/// monomorphization is already concrete" discipline throughout. A `Fix`-
+/// local continuation's own label (e.g. `"k$0"`) gets swept into the
+/// reachable set too along the way — harmless, never collides with a real
+/// top-level unit's own name (`"::"`/`"<...>"` vs. `"$"`-delimited naming
+/// conventions never overlap), just a few extra no-op entries.
+pub fn eliminate_dead_code(program: CpsProgram) -> CpsProgram {
+    let by_name: HashMap<&str, &CTopLevelFn> = program.funcs.iter().map(|f| (f.def.name.as_str(), f)).collect();
+    let mut reachable: HashSet<String> = HashSet::new();
+    let mut worklist: Vec<String> = vec!["main".to_string()];
+    while let Some(name) = worklist.pop() {
+        if !reachable.insert(name.clone()) {
+            continue; // already visited
+        }
+        if let Some(f) = by_name.get(name.as_str()) {
+            collect_called_labels(&f.def.body, &mut worklist);
+        }
+    }
+    CpsProgram { funcs: program.funcs.into_iter().filter(|f| reachable.contains(&f.def.name)).collect() }
+}
+
+fn note_label(v: &CVal, out: &mut Vec<String>) {
+    if let CVal::Label(name) = v {
+        out.push(name.clone());
+    }
+}
+
+fn collect_called_labels(expr: &CExpr, out: &mut Vec<String>) {
+    match expr {
+        CExpr::LetPrim { args, cont, .. } => {
+            for a in args {
+                note_label(a, out);
+            }
+            collect_called_labels(cont, out);
+        }
+        CExpr::App { func, args } => {
+            note_label(func, out);
+            for a in args {
+                note_label(a, out);
+            }
+        }
+        CExpr::Fix { defs, body } => {
+            for d in defs {
+                collect_called_labels(&d.body, out);
+            }
+            collect_called_labels(body, out);
+        }
+        CExpr::If { then_branch, else_branch, .. } => {
+            collect_called_labels(then_branch, out);
+            collect_called_labels(else_branch, out);
+        }
     }
 }
 

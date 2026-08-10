@@ -15,7 +15,7 @@
 //! pass sit next to each other. More `--dump-*` flags arrive as more passes
 //! do (CPS conversion, ...).
 
-use cleave::cps::{collect_mlir_types, collect_struct_schemas, collect_units, convert_program, dump_cps_program};
+use cleave::cps::{collect_mlir_types, collect_struct_schemas, collect_units, convert_program, dump_cps_program, eliminate_dead_code};
 use cleave::diag::SourceMap;
 use cleave::driver::compile;
 use cleave::dump::dump_program;
@@ -41,6 +41,7 @@ struct Args {
     dump_cps_optimized: bool,
     dump_cps_equivalences: bool,
     dump_mlir: bool,
+    dump_mlir_lowered: bool,
     run: bool,
 }
 
@@ -53,6 +54,7 @@ fn parse_args() -> Result<Args, String> {
     let mut dump_cps_optimized = false;
     let mut dump_cps_equivalences = false;
     let mut dump_mlir = false;
+    let mut dump_mlir_lowered = false;
     let mut run = false;
 
     for arg in std::env::args().skip(1) {
@@ -64,6 +66,7 @@ fn parse_args() -> Result<Args, String> {
             "--dump-cps-optimized" => dump_cps_optimized = true,
             "--dump-cps-equivalences" => dump_cps_equivalences = true,
             "--dump-mlir" => dump_mlir = true,
+            "--dump-mlir-lowered" => dump_mlir_lowered = true,
             "--run" => run = true,
             other if other.starts_with("--") => return Err(format!("unknown flag {other:?}")),
             other if path.is_none() => path = Some(PathBuf::from(other)),
@@ -81,6 +84,7 @@ fn parse_args() -> Result<Args, String> {
         && !dump_cps_optimized
         && !dump_cps_equivalences
         && !dump_mlir
+        && !dump_mlir_lowered
         && !run
     {
         dump_inference_pass = true;
@@ -96,11 +100,12 @@ fn parse_args() -> Result<Args, String> {
             dump_cps_optimized,
             dump_cps_equivalences,
             dump_mlir,
+            dump_mlir_lowered,
             run,
         }),
         None => Err(
             "usage: cleave <file.cleave> [--dump-ast] [--dump-inference-pass] [--dump-monomorphized] [--dump-cps] \
-             [--dump-cps-optimized] [--dump-cps-equivalences] [--dump-mlir] [--run]"
+             [--dump-cps-optimized] [--dump-cps-equivalences] [--dump-mlir] [--dump-mlir-lowered] [--run]"
                 .to_string(),
         ),
     }
@@ -161,6 +166,7 @@ fn main() -> ExitCode {
         args.dump_cps_optimized,
         args.dump_cps_equivalences,
         args.dump_mlir,
+        args.dump_mlir_lowered,
     ]
     .iter()
     .filter(|b| **b)
@@ -220,6 +226,7 @@ fn main() -> ExitCode {
         } else {
             let units = collect_units(&program, &registry);
             let cps_program = convert_program(units);
+            let cps_program = eliminate_dead_code(cps_program);
             print!("{}", dump_cps_program(&cps_program));
         }
     }
@@ -235,7 +242,19 @@ fn main() -> ExitCode {
         } else {
             let units = collect_units(&program, &registry);
             let cps_program = convert_program(units);
+            let cps_program = eliminate_dead_code(cps_program);
             let (optimized, _) = optimize_program(cps_program, &registry);
+            // A second sweep: `optimize_program` can itself fold away every
+            // remaining call to a stdlib specialization (e.g. `10 + x - 10`
+            // reducing to `x` via axioms) — the first sweep, run *before*
+            // optimization, has no way to know that in advance, so a unit
+            // only unreachable *after* axiom rewriting would otherwise
+            // survive despite having zero real callers left. Found by
+            // direct testing (`examples/axiom_demo.cleave`): `Ring::add<i32>`/
+            // `Ring::sub<i32>` remained in `--dump-cps-optimized`'s own
+            // output even though `helper`'s optimized body no longer called
+            // either.
+            let optimized = eliminate_dead_code(optimized);
             print!("{}", dump_cps_program(&optimized));
         }
     }
@@ -251,6 +270,7 @@ fn main() -> ExitCode {
         } else {
             let units = collect_units(&program, &registry);
             let cps_program = convert_program(units);
+            let cps_program = eliminate_dead_code(cps_program);
             let (_, explanations) = optimize_program(cps_program, &registry);
             if explanations.is_empty() {
                 println!("(no axiom rewrites fired)");
@@ -273,7 +293,14 @@ fn main() -> ExitCode {
         } else {
             let units = collect_units(&program, &registry);
             let cps_program = convert_program(units);
+            let cps_program = eliminate_dead_code(cps_program);
             let (cps_program, _) = optimize_program(cps_program, &registry);
+            // See `--dump-cps-optimized`'s own comment above: a second
+            // sweep is needed to catch a unit `optimize_program` itself
+            // made unreachable (e.g. an axiom folding away every remaining
+            // call to it), which the first sweep — run before optimization
+            // — has no way to anticipate.
+            let cps_program = eliminate_dead_code(cps_program);
 
             let dialect_registry = DialectRegistry::new();
             register_all_dialects(&dialect_registry);
@@ -289,6 +316,59 @@ fn main() -> ExitCode {
                 exit = ExitCode::FAILURE;
             } else {
                 print!("{}", module.as_operation());
+            }
+        }
+    }
+
+    if args.dump_mlir_lowered {
+        if multiple {
+            println!("--- mlir (lowered) ---\n");
+        }
+        let registry = Registry::build(&program);
+        if let Err(diags) = check_type_errors(&program, &registry) {
+            report(&diags, &sources);
+            exit = ExitCode::FAILURE;
+        } else {
+            let units = collect_units(&program, &registry);
+            let cps_program = convert_program(units);
+            let cps_program = eliminate_dead_code(cps_program);
+            let (cps_program, _) = optimize_program(cps_program, &registry);
+            // See `--dump-cps-optimized`'s own comment above: a second
+            // sweep is needed to catch a unit `optimize_program` itself
+            // made unreachable (e.g. an axiom folding away every remaining
+            // call to it), which the first sweep — run before optimization
+            // — has no way to anticipate.
+            let cps_program = eliminate_dead_code(cps_program);
+
+            let dialect_registry = DialectRegistry::new();
+            register_all_dialects(&dialect_registry);
+            let context = Context::new();
+            context.append_dialect_registry(&dialect_registry);
+            context.load_all_available_dialects();
+
+            let mlir_types = collect_mlir_types(&program);
+            let struct_schemas = collect_struct_schemas(&program);
+            let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
+            if !module.as_operation().verify() {
+                eprintln!("error: generated MLIR module failed verification");
+                exit = ExitCode::FAILURE;
+            } else {
+                // Mirrors `--run`'s own pass pipeline exactly, right up to
+                // (not including) JIT invocation -- this *is* the form that
+                // actually gets handed to the `ExecutionEngine`, `llvm.*`
+                // dialect ops standing in for real textual LLVM IR (melior/
+                // mlir-sys, as vendored, don't expose `mlirTranslateModule
+                // ToLLVMIR` at all -- real `.ll` text isn't reachable
+                // without adding a raw FFI binding ourselves).
+                let pass_manager = pass::PassManager::new(&context);
+                pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
+                pass_manager.add_pass(pass::conversion::create_to_llvm());
+                if pass_manager.run(&mut module).is_err() {
+                    eprintln!("error: MLIR-to-LLVM lowering pass failed");
+                    exit = ExitCode::FAILURE;
+                } else {
+                    print!("{}", module.as_operation());
+                }
             }
         }
     }
@@ -310,7 +390,14 @@ fn main() -> ExitCode {
         }
         let units = collect_units(&program, &registry);
         let cps_program = convert_program(units);
+        let cps_program = eliminate_dead_code(cps_program);
         let (cps_program, _) = optimize_program(cps_program, &registry);
+        // See `--dump-cps-optimized`'s own comment above: a second sweep is
+        // needed to catch a unit `optimize_program` itself made unreachable
+        // (e.g. an axiom folding away every remaining call to it), which
+        // the first sweep — run before optimization — has no way to
+        // anticipate.
+        let cps_program = eliminate_dead_code(cps_program);
 
         let dialect_registry = DialectRegistry::new();
         register_all_dialects(&dialect_registry);
@@ -355,6 +442,7 @@ fn main() -> ExitCode {
             engine.register_symbol("print_i64", cleave_rt::print_i64 as *mut ());
             engine.register_symbol("print_f32", cleave_rt::print_f32 as *mut ());
             engine.register_symbol("print_f64", cleave_rt::print_f64 as *mut ());
+            engine.register_symbol("print_bytes", cleave_rt::print_bytes as *mut ());
             engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
         }
         let mut result: i32 = -1;
@@ -394,7 +482,32 @@ fn report(diags: &[cleave::diag::Diagnostic], sources: &SourceMap) {
 /// this clean diagnostic -- found by direct testing.
 fn check_type_errors(program: &cleave::ast::Program, registry: &Registry) -> Result<(), Vec<cleave::diag::Diagnostic>> {
     let (_, errs) = cleave::monomorphize::dump_monomorphized(program, registry);
-    if errs.is_empty() { Ok(()) } else { Err(errs.iter().map(cleave::diag::Diagnostic::from).collect()) }
+    let mut diags: Vec<cleave::diag::Diagnostic> = errs.iter().map(cleave::diag::Diagnostic::from).collect();
+    diags.extend(check_mutability_errors(program));
+    if diags.is_empty() { Ok(()) } else { Err(diags) }
+}
+
+/// A purely syntactic pass (`cleave::infer::check_mutability`, no type
+/// information needed) run once per `fn` body anywhere in the program — a
+/// top-level `fn`, and every method of every algebra/inherent `impl` — since
+/// none of those go through `callgraph::infer_program`'s own whole-program
+/// walk uniformly enough to hang this off of instead.
+fn check_mutability_errors(program: &cleave::ast::Program) -> Vec<cleave::diag::Diagnostic> {
+    let mut errors = Vec::new();
+    for item in &program.items {
+        let fns: Vec<&cleave::ast::FnDecl> = match &item.kind {
+            cleave::ast::ItemKind::Fn(f) => vec![f],
+            cleave::ast::ItemKind::Impl(d) => d.fns.iter().collect(),
+            cleave::ast::ItemKind::InherentImpl(d) => d.fns.iter().collect(),
+            _ => vec![],
+        };
+        for f in fns {
+            if let Err(e) = cleave::infer::check_mutability(f) {
+                errors.push(cleave::diag::Diagnostic::from(&e));
+            }
+        }
+    }
+    errors
 }
 
 #[cfg(test)]

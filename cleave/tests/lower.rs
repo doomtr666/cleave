@@ -55,6 +55,46 @@ fn array_repeat_literals_own_copies_each_get_a_distinct_node_id() {
     }
 }
 
+/// A string literal has no representation of its own — full erasure at
+/// lowering time, mirroring `array_repeat`'s own literal-`N` case exactly:
+/// `"hi"` becomes an ordinary `ArrayLit` of `i8`-suffixed `NumberLit`s, one
+/// per UTF-8 byte of the string's own text.
+#[test]
+fn string_literal_desugars_to_an_i8_array_literal() {
+    let f = lower_one_fn("fn f() { \"hi\" }");
+    match &only_stmt_expr(&f.body).kind {
+        ExprKind::ArrayLit(elems) => {
+            let bytes: Vec<&str> = elems
+                .iter()
+                .map(|e| match &e.kind {
+                    ExprKind::NumberLit { text, suffix } => {
+                        assert_eq!(suffix.as_deref(), Some("i8"), "expected every byte to be i8-suffixed");
+                        text.as_str()
+                    }
+                    other => panic!("expected NumberLit, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(bytes, vec!["104", "105"], "'h' = 104, 'i' = 105");
+        }
+        other => panic!("expected ArrayLit, got {other:?}"),
+    }
+}
+
+/// Same reasoning as `array_repeat_literals_own_copies_each_get_a_distinct_
+/// node_id` above — `node_types` is keyed by `NodeId`, reusing one across
+/// bytes would silently collapse them.
+#[test]
+fn string_literal_bytes_each_get_a_distinct_node_id() {
+    let f = lower_one_fn("fn f() { \"abc\" }");
+    match &only_stmt_expr(&f.body).kind {
+        ExprKind::ArrayLit(elems) => {
+            let ids: std::collections::HashSet<NodeId> = elems.iter().map(|e| e.id).collect();
+            assert_eq!(ids.len(), 3, "expected 3 distinct NodeIds, got {ids:?}");
+        }
+        other => panic!("expected ArrayLit, got {other:?}"),
+    }
+}
+
 #[test]
 fn array_repeat_literal_with_zero_count_is_an_empty_array() {
     let f = lower_one_fn("fn f() { [1; 0] }");

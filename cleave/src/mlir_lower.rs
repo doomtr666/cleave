@@ -133,9 +133,31 @@ fn ty_to_mlir<'c>(ctx: &LowerCtx<'c, '_>, ty: &Ty) -> Type<'c> {
         // is always an opaque `!llvm.ptr` — see `struct_llvm_type`'s own
         // doc comment for why (reference, not value, semantics).
         Ty::Con(_) | Ty::App(..) => llvm::r#type::pointer(ctx.context, 0),
-        Ty::Array(..) => array_memref_type(ctx, ty).into(),
+        // Two representations, picked by the array's own *leaf* element
+        // type — see `array_leaf_is_struct`'s own doc comment for why: a
+        // struct-typed leaf can't be a `memref` element (`MemRefType::new`
+        // rejects it with a hard native assertion, found by direct
+        // testing, not a clean `Result`), so it gets the same "opaque
+        // `!llvm.ptr`" treatment a struct value already gets everywhere
+        // else, pointing at a real heap allocation instead of a `memref`
+        // descriptor (`lower_array_construct`/`lower_array_repeat` build
+        // it; `lower_array_load`/`lower_array_store` already know how to
+        // read one, since a struct's own array-typed *field* already hands
+        // back exactly this shape).
+        Ty::Array(..) => {
+            if array_leaf_is_struct(ctx, ty) { llvm::r#type::pointer(ctx.context, 0) } else { array_memref_type(ctx, ty).into() }
+        }
         _ => panic!("MLIR lowering doesn't support type `{ty}` yet (only primitive Ty::Con widths, arrays, and structs so far)"),
     }
+}
+
+/// Whether `ty` (an array type) has a struct-typed *leaf* element — the
+/// same primitive-vs-struct distinction `ty_to_mlir`'s own `Ty::Con`/
+/// `Ty::App` arms already draw, applied to an array's own innermost element
+/// instead of the array itself.
+fn array_leaf_is_struct(ctx: &LowerCtx, ty: &Ty) -> bool {
+    let (_, leaf_ty) = flatten_array_dims(ty);
+    matches!(leaf_ty, Ty::Con(name) if name != "bool" && !ctx.mlir_types.contains_key(name)) || matches!(leaf_ty, Ty::App(..))
 }
 
 /// Flattens a nested `Ty::Array(elem, size)` chain — cleave's own multi-dim
@@ -357,17 +379,33 @@ fn lower_top_level_fn<'c>(ctx: &LowerCtx<'c, '_>, f: &CTopLevelFn) -> Operation<
     let region = Region::new();
     region.append_block(block);
 
+    // `llvm.emit_c_interface` (and the extra `_mlir_ciface_<name>` wrapper
+    // function it generates) is required for `ExecutionEngine::invoke_packed`
+    // to find a callable wrapper at all (found by direct testing: without
+    // it, JIT invocation fails with "Symbols not found:
+    // [ _mlir_ciface_<name> ]" -- `invoke_packed` calls through this
+    // specific C-interface wrapper, not the raw function directly) --
+    // but the *only* function this project ever calls via `invoke_packed`
+    // is `main` itself (confirmed directly: every `--run`/test call site
+    // hardcodes `"main"`, never anything else). Attaching it to every
+    // top-level fn unconditionally used to double the function count in
+    // every compiled module for no functional benefit -- an ordinary
+    // internal call already goes through the plain `llvm.call @name`, which
+    // never needs this wrapper. Scoped to `main` alone until a real
+    // `export`/`extern fn`-on-a-definition mechanism (`doc/hld.md`'s own
+    // sketched, not-yet-implemented design for exposing a cleave fn to an
+    // external host) lets a program opt any *other* specific function in.
+    let attrs: &[(melior::ir::Identifier, melior::ir::Attribute)] = if f.def.name == "main" {
+        &[(melior::ir::Identifier::new(context, "llvm.emit_c_interface"), melior::ir::Attribute::unit(context))]
+    } else {
+        &[]
+    };
     func::func(
         context,
         StringAttribute::new(context, &f.def.name),
         TypeAttribute::new(FunctionType::new(context, &param_types, &results).into()),
         region,
-        // Required for `ExecutionEngine::invoke_packed` to find a callable
-        // wrapper at all (found by direct testing: without this, JIT
-        // invocation fails with "Symbols not found: [ _mlir_ciface_<name> ]"
-        // -- `invoke_packed` calls through this specific C-interface
-        // wrapper, not the raw function directly).
-        &[(melior::ir::Identifier::new(context, "llvm.emit_c_interface"), melior::ir::Attribute::unit(context))],
+        attrs,
         location,
     )
 }
@@ -720,7 +758,6 @@ fn lower_real_call<'c>(
         panic!("MLIR lowering: call to unknown top-level fn `{callee}`");
     };
     let context = ctx.context;
-    let result_mlir_ty = ty_to_mlir(ctx, result_ty);
     // `args`' own last entry is the synthesized continuation label itself
     // (`emit_call`'s own convention, see `cps.rs`), not a real argument.
     let real_args = &args[..args.len() - 1];
@@ -730,16 +767,35 @@ fn lower_real_call<'c>(
         .map(|(a, t)| lower_cval(context, block, &env, a, ty_to_mlir(ctx, t)))
         .collect();
     let location = Location::unknown(context);
+    // A `()`-returning callee is declared with *zero* MLIR results
+    // (`lower_top_level_fn`'s own `is_unit`/`results` handling, applied to
+    // every top-level fn, not just `main`) -- the call site must match that
+    // exactly, or MLIR's own verifier rejects it ("incorrect number of
+    // results for callee"), found by direct testing (a real call to a
+    // `()`-returning function used to unconditionally request one result
+    // here regardless of `result_ty`). `emit_call` (`cps.rs`) always
+    // synthesizes a `result_var` regardless of the callee's own return type
+    // -- unlike `PrimOp::Store`'s dedicated "bound result is unit, never
+    // read" convention (`lower_prim_op` returns `None`), a real call has no
+    // such per-callee special case at the CPS level, so it's handled here
+    // instead: `result_var` simply never gets bound into `env` when unit,
+    // matching every other place in this file where a unit-typed value is
+    // never materialized (nothing in the language can do anything with one
+    // besides discard it, so nothing downstream ever looks it up).
+    let is_unit = is_unit_ty(result_ty);
+    let results: Vec<Type> = if is_unit { vec![] } else { vec![ty_to_mlir(ctx, result_ty)] };
     let call_op = block.append_operation(func::call(
         context,
         FlatSymbolRefAttribute::new(context, callee),
         &arg_values,
-        &[result_mlir_ty],
+        &results,
         location,
     ));
 
     let mut env = env;
-    env.insert(result_var, call_op.result(0).unwrap().into());
+    if !is_unit {
+        env.insert(result_var, call_op.result(0).unwrap().into());
+    }
     lower_cexpr(ctx, block, env, k_ret, result_type, yield_target, &k.body);
 }
 
@@ -763,22 +819,74 @@ fn lower_prim_op<'c>(
 ) -> Option<Value<'c, 'c>> {
     match op {
         PrimOp::Extern { symbol, param_types } => {
-            let result_ty = ty_to_mlir(ctx, ty);
-            ensure_extern_declared(ctx, symbol, param_types, result_ty);
-            let arg_values: Vec<Value> = args
-                .iter()
-                .zip(param_types)
-                .map(|(a, t)| lower_cval(ctx.context, block, env, a, ty_to_mlir(ctx, t)))
-                .collect();
+            // A `Ty::Array`-typed *return* is a real ABI mismatch to
+            // reconcile: the cleave-level call (e.g. `Print<[i8;N]>::
+            // print(x) -> x`, an identity contract every other `Print<T>`
+            // impl already has) says `[i8;N]`, but the real C symbol it's
+            // backed by (`print_bytes`) returns a plain scalar -- nothing
+            // in `cleave-rt` could plausibly hand back a `memref` anyway.
+            // The extern symbol's own *declared* return becomes `i64`
+            // (an arbitrary-but-consistent small-scalar convention for
+            // "the real C fn returns some byte count/status, discarded"),
+            // and the cleave-level result reuses whichever argument was
+            // already that same array type -- the identity case this
+            // module's own single real use case needs, not a general
+            // "reconstruct an array from a scalar" mechanism (impossible
+            // anyway).
+            // A `()`-returning extern (`extern fn touch(x: i32);`, no `->`
+            // clause) needs the exact same zero-results treatment `lower_
+            // real_call`/`lower_top_level_fn` already give a unit-returning
+            // top-level fn -- `ty_to_mlir` has no case for `()` at all (it
+            // falls through to the generic-struct arm, `!llvm.ptr`), which
+            // used to silently declare/call against a bogus pointer result
+            // matching nothing the real C symbol underneath actually
+            // returns (found by direct testing: a real, structural ABI
+            // mismatch, though not one that happened to crash on its own —
+            // nothing downstream ever read the bogus value).
+            let is_array_return = matches!(ty, Ty::Array(..));
+            let is_unit_return = is_unit_ty(ty);
+            let results: Vec<Type> = if is_array_return {
+                vec![IntegerType::new(ctx.context, 64).into()]
+            } else if is_unit_return {
+                vec![]
+            } else {
+                vec![ty_to_mlir(ctx, ty)]
+            };
+            ensure_extern_declared(ctx, symbol, param_types, &results);
+            // A `Ty::Array`-typed argument crosses the call boundary as a
+            // raw pointer + a compile-time-known length (two scalars),
+            // never as its own `memref` value directly -- see
+            // `array_ptr_and_len`'s own doc comment.
+            let mut arg_values: Vec<Value> = Vec::new();
+            let mut array_identity: Option<Value> = None;
+            for (a, t) in args.iter().zip(param_types) {
+                let lowered = lower_cval(ctx.context, block, env, a, ty_to_mlir(ctx, t));
+                if matches!(t, Ty::Array(..)) {
+                    if is_array_return && array_identity.is_none() {
+                        array_identity = Some(lowered);
+                    }
+                    let (ptr, len) = array_ptr_and_len(ctx, block, lowered, t);
+                    arg_values.push(ptr);
+                    arg_values.push(len);
+                } else {
+                    arg_values.push(lowered);
+                }
+            }
             let location = Location::unknown(ctx.context);
             let call_op = block.append_operation(func::call(
                 ctx.context,
                 FlatSymbolRefAttribute::new(ctx.context, symbol),
                 &arg_values,
-                &[result_ty],
+                &results,
                 location,
             ));
-            Some(call_op.result(0).unwrap().into())
+            if is_array_return {
+                Some(array_identity.unwrap_or_else(|| panic!("MLIR lowering: extern `{symbol}` declares an array return but has no array-typed argument to reuse as its identity")))
+            } else if is_unit_return {
+                None
+            } else {
+                Some(call_op.result(0).unwrap().into())
+            }
         }
         PrimOp::RawMlirOp { op, attrs } => Some(lower_raw_mlir_op(ctx, block, env, op, attrs, args, ty_to_mlir(ctx, ty))),
         PrimOp::Array => Some(lower_array_construct(ctx, block, env, ty, args)),
@@ -807,6 +915,18 @@ fn lower_prim_op<'c>(
 /// (`copy_nested_array`) rather than stored as a reference; an arg is
 /// scalar exactly when `ty`'s own flattened shape is one dimension deep for
 /// that position — a property of the *type*, not of runtime inspection.
+///
+/// A struct-typed leaf (`[Point; N]`) takes a wholly different path
+/// (`array_leaf_is_struct`): a `memref` can't hold a struct's own opaque
+/// `!llvm.ptr` element type (`MemRefType::new` rejects it with a hard native
+/// assertion, found by direct testing) — instead a real heap allocation
+/// (`alloc_llvm_value`, shaped as the inline `!llvm.array<N x !llvm.ptr>`
+/// `ty_to_llvm_field_type` already builds for a struct's own array-typed
+/// field) is filled one `llvm.getelementptr`+`llvm.store` per element,
+/// mirroring `lower_struct_construct`'s own per-field GEP+store loop. Only a
+/// single-dimension struct-leaf array is handled — a struct-leaf array
+/// nested inside another array is real but rarer, and panics clearly here
+/// rather than being silently mishandled.
 fn lower_array_construct<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
@@ -818,6 +938,22 @@ fn lower_array_construct<'c>(
     let Some((_, inner_dims)) = dims.split_first() else {
         panic!("MLIR lowering: `array` prim on a non-array type `{ty}`");
     };
+    if array_leaf_is_struct(ctx, ty) {
+        assert!(
+            inner_dims.is_empty(),
+            "MLIR lowering: a struct-leaf array nested inside another array (`{ty}`) isn't supported yet -- only a single-dimension struct-leaf array (`[Struct; N]`) is"
+        );
+        let array_llvm_ty = ty_to_llvm_field_type(ctx, ty);
+        let elem_ty = ty_to_mlir(ctx, leaf_ty);
+        let ptr = alloc_llvm_value(ctx, block, array_llvm_ty);
+        let location = Location::unknown(ctx.context);
+        for (i, arg) in args.iter().enumerate() {
+            let elem_val = lower_cval(ctx.context, block, env, arg, elem_ty);
+            let dst_ptr = gep(ctx, block, ptr, &[0, i as i64], array_llvm_ty);
+            block.append_operation(llvm::store(ctx.context, elem_val, dst_ptr, location, LoadStoreOptions::new()));
+        }
+        return ptr;
+    }
     let array_val = alloc_array(ctx, block, MemRefType::new(ty_to_mlir(ctx, leaf_ty), &dims, None, None));
     if inner_dims.is_empty() {
         let elem_ty = ty_to_mlir(ctx, leaf_ty);
@@ -853,8 +989,24 @@ fn lower_array_repeat<'c>(
     let Some((&outer_dim, inner_dims)) = dims.split_first() else {
         panic!("MLIR lowering: `array-repeat` prim on a non-array type `{ty}`");
     };
-    let array_val = alloc_array(ctx, block, MemRefType::new(ty_to_mlir(ctx, leaf_ty), &dims, None, None));
     let value_arg = &args[0];
+    if array_leaf_is_struct(ctx, ty) {
+        assert!(
+            inner_dims.is_empty(),
+            "MLIR lowering: a struct-leaf array nested inside another array (`{ty}`) isn't supported yet -- only a single-dimension struct-leaf array (`[Struct; N]`) is"
+        );
+        let array_llvm_ty = ty_to_llvm_field_type(ctx, ty);
+        let elem_ty = ty_to_mlir(ctx, leaf_ty);
+        let ptr = alloc_llvm_value(ctx, block, array_llvm_ty);
+        let elem_val = lower_cval(ctx.context, block, env, value_arg, elem_ty);
+        let location = Location::unknown(ctx.context);
+        for i in 0..outer_dim {
+            let dst_ptr = gep(ctx, block, ptr, &[0, i], array_llvm_ty);
+            block.append_operation(llvm::store(ctx.context, elem_val, dst_ptr, location, LoadStoreOptions::new()));
+        }
+        return ptr;
+    }
+    let array_val = alloc_array(ctx, block, MemRefType::new(ty_to_mlir(ctx, leaf_ty), &dims, None, None));
     if inner_dims.is_empty() {
         let elem_ty = ty_to_mlir(ctx, leaf_ty);
         let elem_val = lower_cval(ctx.context, block, env, value_arg, elem_ty);
@@ -966,15 +1118,18 @@ fn lower_array_store<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, env: &HashMa
 /// at its own *declared* `position` (`struct_field_types`'s own canonical
 /// order), not at its position within `field_names` — the GEP index, not
 /// insertion order, is what actually determines the resulting layout.
-/// Allocates one `llvm.alloca`'d slot up front (`alloc_struct`) and returns
+/// Allocates one `llvm.alloca`'d slot up front (`alloc_llvm_value`) and returns
 /// its own pointer — see `struct_llvm_type`'s own doc comment for why a
 /// struct is reference-, not value-, typed here. An array-typed field is
-/// filled by copying its already-built (standalone, `memref`-backed) value
-/// element-by-element into the struct's own *embedded* `!llvm.array` slot
-/// (`copy_memref_into_llvm_field`) — not stored as a reference, since the
-/// two representations (`memref` vs inline `!llvm.array`) are different
-/// types entirely (see `struct_llvm_type`'s own doc comment on why a
-/// `memref` can't be an `!llvm.struct` field at all).
+/// filled by copying its already-built standalone value (either
+/// representation — `memref` or, for a struct leaf, `!llvm.ptr` — see
+/// `array_leaf_is_struct`) element-by-element into the struct's own
+/// *embedded* `!llvm.array` slot (`copy_array_into_llvm_field`) — not stored
+/// as a reference, since neither standalone representation is itself a
+/// valid `!llvm.struct` field type (see `struct_llvm_type`'s own doc comment
+/// on why a `memref` can't be one, and `ty_to_mlir`'s own `Ty::Array` arm
+/// doc comment for the analogous reason a struct-leaf array's own top-level
+/// `!llvm.ptr` still isn't the *field*'s own inline `!llvm.array` shape).
 fn lower_struct_construct<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
@@ -986,7 +1141,7 @@ fn lower_struct_construct<'c>(
     let (name, type_args) = struct_name_and_args(ty);
     let field_types = struct_field_types(ctx, name, type_args);
     let struct_llvm_ty = struct_llvm_type(ctx, name, type_args);
-    let ptr = alloc_struct(ctx, block, struct_llvm_ty);
+    let ptr = alloc_llvm_value(ctx, block, struct_llvm_ty);
     for (field_name, arg) in field_names.iter().zip(args) {
         let position = field_types
             .iter()
@@ -1003,11 +1158,11 @@ fn lower_struct_construct<'c>(
 /// concrete type) — shared by struct construction (`lower_struct_construct`,
 /// one call per field) and direct field-mutation assignment
 /// (`lower_field_store`, `s.field = v`). An array-typed field is copied
-/// element-by-element from its already-built (standalone, `memref`-backed)
-/// source value into the struct's own *embedded* `!llvm.array` slot
-/// (`copy_memref_into_llvm_field`) — see `struct_llvm_type`'s own doc
-/// comment for why a `memref` can't be an `!llvm.struct` field directly, so
-/// it's never stored as a bare reference.
+/// element-by-element from its already-built standalone source value (either
+/// representation, see `copy_array_into_llvm_field`'s own doc comment) into
+/// the struct's own *embedded* `!llvm.array` slot — see `struct_llvm_type`'s
+/// own doc comment for why neither standalone representation can be an
+/// `!llvm.struct` field directly, so it's never stored as a bare reference.
 fn store_field<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
@@ -1018,9 +1173,10 @@ fn store_field<'c>(
 ) {
     if is_array_ty(field_ty) {
         let src = lower_nested_array_arg(env, arg);
-        let (dims, _) = flatten_array_dims(field_ty);
+        let (dims, leaf_ty) = flatten_array_dims(field_ty);
         let field_llvm_ty = ty_to_llvm_field_type(ctx, field_ty);
-        copy_memref_into_llvm_field(ctx, block, src, &dims, field_ptr, field_llvm_ty);
+        let elem_mlir_ty = ty_to_mlir(ctx, leaf_ty);
+        copy_array_into_llvm_field(ctx, block, src, &dims, field_ptr, field_llvm_ty, elem_mlir_ty);
     } else {
         let field_mlir_ty = ty_to_mlir(ctx, field_ty);
         let value = lower_cval(ctx.context, block, env, arg, field_mlir_ty);
@@ -1103,8 +1259,8 @@ fn lower_field_access<'c>(
     }
 }
 
-/// Allocates one **heap**-backed slot shaped `struct_llvm_ty`, returning its
-/// own opaque `!llvm.ptr`, via a real call to `cleave_alloc` (`cleave-rt`,
+/// Allocates one **heap**-backed slot shaped `llvm_ty`, returning its own
+/// opaque `!llvm.ptr`, via a real call to `cleave_alloc` (`cleave-rt`,
 /// registered with the JIT the same way `print_i32`/... already are). Not
 /// `llvm.alloca`: found by direct testing — a struct returned from one
 /// function and read by its own caller came back reading garbage, since an
@@ -1113,13 +1269,17 @@ fn lower_field_access<'c>(
 /// pointer, never copied (see `struct_llvm_type`'s own doc comment) — its
 /// storage has to outlive the call that built it. Deliberately leaked, no
 /// `free` — cleave has no ownership/`drop` story yet (see `cleave_alloc`'s
-/// own doc comment in `cleave-rt`).
-fn alloc_struct<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, struct_llvm_ty: Type<'c>) -> Value<'c, 'c> {
+/// own doc comment in `cleave-rt`). Fully generic over *any* LLVM type, not
+/// struct-specific — also used to heap-allocate a struct-leaf array's own
+/// embedded `!llvm.array` (`ty_to_mlir`'s `Ty::Array` arm, `array_leaf_is_
+/// struct`), which needs the exact same "outlives the call that built it"
+/// property a struct does.
+fn alloc_llvm_value<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, llvm_ty: Type<'c>) -> Value<'c, 'c> {
     let context = ctx.context;
     let location = Location::unknown(context);
     let ptr_ty = llvm::r#type::pointer(context, 0);
-    let size = struct_size_bytes(ctx, block, struct_llvm_ty);
-    ensure_extern_declared(ctx, "cleave_alloc", &[Ty::Con("i64".to_string())], ptr_ty);
+    let size = llvm_type_size_bytes(ctx, block, llvm_ty);
+    ensure_extern_declared(ctx, "cleave_alloc", &[Ty::Con("i64".to_string())], &[ptr_ty]);
     let call_op = block.append_operation(func::call(
         context,
         FlatSymbolRefAttribute::new(context, "cleave_alloc"),
@@ -1130,18 +1290,20 @@ fn alloc_struct<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, struct_llvm_ty: T
     call_op.result(0).unwrap().into()
 }
 
-/// `struct_llvm_ty`'s own byte size, as a real `i64` SSA value — the
-/// standard LLVM IR idiom for `sizeof(T)` with no dedicated op needed:
-/// `getelementptr T, null, 1` (one whole `T` past a null pointer) then
-/// `ptrtoint` gives exactly the byte offset one `T` occupies, padding
-/// included, matching LLVM's own real layout (hand-computing field offsets/
-/// alignment here would risk silently disagreeing with it).
-fn struct_size_bytes<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, struct_llvm_ty: Type<'c>) -> Value<'c, 'c> {
+/// `llvm_ty`'s own byte size, as a real `i64` SSA value — the standard LLVM
+/// IR idiom for `sizeof(T)` with no dedicated op needed: `getelementptr T,
+/// null, 1` (one whole `T` past a null pointer) then `ptrtoint` gives
+/// exactly the byte offset one `T` occupies, padding included, matching
+/// LLVM's own real layout (hand-computing field/element offsets/alignment
+/// here would risk silently disagreeing with it). Fully generic over any
+/// LLVM type — `T` can be a struct or an `!llvm.array`, both go through
+/// `alloc_llvm_value` the same way.
+fn llvm_type_size_bytes<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, llvm_ty: Type<'c>) -> Value<'c, 'c> {
     let context = ctx.context;
     let location = Location::unknown(context);
     let ptr_ty = llvm::r#type::pointer(context, 0);
     let null: Value = block.append_operation(llvm::zero(ptr_ty, location)).result(0).unwrap().into();
-    let one_past = gep(ctx, block, null, &[1], struct_llvm_ty);
+    let one_past = gep(ctx, block, null, &[1], llvm_ty);
     let i64_ty = IntegerType::new(context, 64).into();
     let built = OperationBuilder::new("llvm.ptrtoint", location)
         .add_operands(&[one_past])
@@ -1149,6 +1311,55 @@ fn struct_size_bytes<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, struct_llvm_
         .build()
         .unwrap_or_else(|e| panic!("MLIR lowering: failed to build llvm.ptrtoint: {e}"));
     block.append_operation(built).result(0).unwrap().into()
+}
+
+/// Extracts a bare `!llvm.ptr` from an already-lowered `memref` value's own
+/// aligned data pointer, plus the array's own total element count as a
+/// real `i64` — the pair an `extern fn`'s own array-typed parameter
+/// actually crosses the call boundary as. MLIR's default `convert-to-llvm`
+/// conversion (the only pass this pipeline runs — melior's own binding
+/// exposes no options on it, no bare-pointer-calling-convention toggle
+/// available) turns a `memref` crossing any `func.call`/`llvm.call`
+/// boundary into a descriptor *struct* (`{allocatedPtr, alignedPtr, offset,
+/// sizes[], strides[]}`), passed by value — not a bare pointer. No hand-
+/// written `cleave-rt` extern fn could plausibly match that layout, found
+/// by direct testing (a hard `STATUS_ACCESS_VIOLATION` crash, not a clean
+/// panic, before this fix). `memref.extract_aligned_pointer_as_index`/
+/// `llvm.inttoptr` have no melior binding — built directly via
+/// `OperationBuilder`, the identical pattern `llvm_type_size_bytes`'s own
+/// `llvm.ptrtoint` already uses just above. `len` is the array's own *total*
+/// element count (every dimension's own size multiplied together, via
+/// `flatten_array_dims` — already exists for exactly this "collapse a
+/// nested `Ty::Array` chain" need), a compile-time constant materialized
+/// directly, not read off the memref's own runtime descriptor.
+fn array_ptr_and_len<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, memref_value: Value<'c, 'c>, array_ty: &Ty) -> (Value<'c, 'c>, Value<'c, 'c>) {
+    let context = ctx.context;
+    let location = Location::unknown(context);
+    let index_ty = Type::index(context);
+    let built = OperationBuilder::new("memref.extract_aligned_pointer_as_index", location)
+        .add_operands(&[memref_value])
+        .add_results(&[index_ty])
+        .build()
+        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build memref.extract_aligned_pointer_as_index: {e}"));
+    let idx: Value = block.append_operation(built).result(0).unwrap().into();
+
+    let i64_ty: Type = IntegerType::new(context, 64).into();
+    let as_i64: Value = block.append_operation(arith::index_cast(idx, i64_ty, location)).result(0).unwrap().into();
+
+    let ptr_ty = llvm::r#type::pointer(context, 0);
+    let built = OperationBuilder::new("llvm.inttoptr", location)
+        .add_operands(&[as_i64])
+        .add_results(&[ptr_ty])
+        .build()
+        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build llvm.inttoptr: {e}"));
+    let ptr: Value = block.append_operation(built).result(0).unwrap().into();
+
+    let (dims, _leaf_ty) = flatten_array_dims(array_ty);
+    let total: i64 = dims.iter().product();
+    let len_attr = IntegerAttribute::new(i64_ty, total).into();
+    let len: Value = block.append_operation(arith::constant(context, len_attr, location)).result(0).unwrap().into();
+
+    (ptr, len)
 }
 
 /// Computes `llvm.getelementptr base[indices...]` for indices that are
@@ -1215,37 +1426,50 @@ fn const_i32<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, n: i64) -> Value<'c,
     op.result(0).unwrap().into()
 }
 
-/// Copies every scalar element of `src` (a flat, standalone `memref` of
-/// shape `dims` — the ordinary array-construction path, `PrimOp::Array`/
-/// `ArrayRepeat`, see `lower_array_construct`'s own doc comment) into the
-/// struct-embedded `!llvm.array` field addressed by `field_ptr`, one
-/// `memref.load`+`llvm.getelementptr`+`llvm.store` triple per element, fully
-/// unrolled — every dimension is a compile-time constant, the same posture
-/// `copy_nested_array` already takes for a nested array literal, applied
-/// across the memref/embedded-`!llvm.array` boundary instead of memref-to-
-/// memref.
-fn copy_memref_into_llvm_field<'c>(
+/// Copies every scalar element of `src` — a flat, standalone array of shape
+/// `dims`, either representation (`array_leaf_is_struct`): a `memref` (the
+/// ordinary primitive/nested-array-leaf case) or an `!llvm.ptr` to a heap-
+/// allocated `!llvm.array` (a struct leaf, `lower_array_construct`'s own
+/// struct-leaf branch) — into the struct-embedded `!llvm.array` field
+/// addressed by `field_ptr`, one load+`llvm.getelementptr`+`llvm.store`
+/// triple per element, fully unrolled — every dimension is a compile-time
+/// constant, the same posture `copy_nested_array` already takes for a nested
+/// array literal. `src`'s own representation is checked once (`is_mem_ref`)
+/// rather than re-derived per element — mirrors `lower_array_load`/
+/// `lower_array_store`'s own runtime dispatch on the very same predicate.
+/// `elem_mlir_ty` is the leaf's own scalar MLIR type (needed only for the
+/// pointer branch's own `llvm.load` result type — `memref.load` infers it
+/// from the memref's own element type instead).
+fn copy_array_into_llvm_field<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
     src: Value<'c, 'c>,
     dims: &[i64],
     field_ptr: Value<'c, 'c>,
     field_llvm_ty: Type<'c>,
+    elem_mlir_ty: Type<'c>,
 ) {
+    let src_is_mem_ref = src.r#type().is_mem_ref();
     fn walk<'c>(
         ctx: &LowerCtx<'c, '_>,
         block: &Block<'c>,
         src: Value<'c, 'c>,
+        src_is_mem_ref: bool,
         remaining: &[i64],
         src_idx: &mut Vec<Value<'c, 'c>>,
         gep_idx: &mut Vec<i64>,
         field_ptr: Value<'c, 'c>,
         field_llvm_ty: Type<'c>,
+        elem_mlir_ty: Type<'c>,
     ) {
         let Some((&dim, rest)) = remaining.split_first() else {
             let location = Location::unknown(ctx.context);
-            let load_op = block.append_operation(memref::load(src, src_idx, location));
-            let scalar: Value = load_op.result(0).unwrap().into();
+            let scalar: Value = if src_is_mem_ref {
+                block.append_operation(memref::load(src, src_idx, location)).result(0).unwrap().into()
+            } else {
+                let src_ptr = gep(ctx, block, src, gep_idx, field_llvm_ty);
+                block.append_operation(llvm::load(ctx.context, src_ptr, elem_mlir_ty, location, LoadStoreOptions::new())).result(0).unwrap().into()
+            };
             let dst_ptr = gep(ctx, block, field_ptr, gep_idx, field_llvm_ty);
             block.append_operation(llvm::store(ctx.context, scalar, dst_ptr, location, LoadStoreOptions::new()));
             return;
@@ -1253,15 +1477,19 @@ fn copy_memref_into_llvm_field<'c>(
         for i in 0..dim {
             src_idx.push(const_index(ctx, block, i));
             gep_idx.push(i);
-            walk(ctx, block, src, rest, src_idx, gep_idx, field_ptr, field_llvm_ty);
+            walk(ctx, block, src, src_is_mem_ref, rest, src_idx, gep_idx, field_ptr, field_llvm_ty, elem_mlir_ty);
             src_idx.pop();
             gep_idx.pop();
         }
     }
     // Leading `0`: stay within this one array instance (see `gep`'s own doc
-    // comment) -- every subsequent index is a real dimension of `dims`.
+    // comment) -- every subsequent index is a real dimension of `dims`. The
+    // pointer branch reuses this exact same index list to address `src`
+    // too, since `src`'s own inline `!llvm.array` shares the identical
+    // shape/layout as the destination field (same cleave `Ty` on both
+    // sides).
     let mut gep_idx = vec![0i64];
-    walk(ctx, block, src, dims, &mut Vec::new(), &mut gep_idx, field_ptr, field_llvm_ty);
+    walk(ctx, block, src, src_is_mem_ref, dims, &mut Vec::new(), &mut gep_idx, field_ptr, field_llvm_ty, elem_mlir_ty);
 }
 
 fn alloc_array<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, memref_ty: MemRefType<'c>) -> Value<'c, 'c> {
@@ -1383,18 +1611,34 @@ fn lower_raw_mlir_op<'c>(
 /// than a definition; confirmed against melior's own `compile_external_
 /// function` test) the first time `symbol` is seen, and no-ops on every
 /// later call site for the same symbol.
-fn ensure_extern_declared<'c>(ctx: &LowerCtx<'c, '_>, symbol: &str, param_types: &[Ty], result_ty: Type<'c>) {
+fn ensure_extern_declared<'c>(ctx: &LowerCtx<'c, '_>, symbol: &str, param_types: &[Ty], results: &[Type<'c>]) {
     let mut declared = ctx.declared_externs.borrow_mut();
     if !declared.insert(symbol.to_string()) {
         return;
     }
     let context = ctx.context;
-    let param_mlir: Vec<Type> = param_types.iter().map(|t| ty_to_mlir(ctx, t)).collect();
+    // A `Ty::Array` param becomes *two* real scalar params here (`!llvm.ptr`,
+    // `i64`), never a `memref` — see `array_ptr_and_len`'s own doc comment
+    // for why: MLIR's default `convert-to-llvm` conversion turns a `memref`
+    // crossing a `func.call` boundary into a descriptor *struct*, not a bare
+    // pointer, which no hand-written `cleave-rt` extern fn could plausibly
+    // match. The *declared* signature here must agree with what the actual
+    // call site (`lower_prim_op`'s own `PrimOp::Extern` arm) really passes.
+    let param_mlir: Vec<Type> = param_types
+        .iter()
+        .flat_map(|t| {
+            if matches!(t, Ty::Array(..)) {
+                vec![llvm::r#type::pointer(context, 0), IntegerType::new(context, 64).into()]
+            } else {
+                vec![ty_to_mlir(ctx, t)]
+            }
+        })
+        .collect();
     let location = Location::unknown(context);
     let decl = func::func(
         context,
         StringAttribute::new(context, symbol),
-        TypeAttribute::new(FunctionType::new(context, &param_mlir, &[result_ty]).into()),
+        TypeAttribute::new(FunctionType::new(context, &param_mlir, results).into()),
         Region::new(),
         &[(melior::ir::Identifier::new(context, "sym_visibility"), StringAttribute::new(context, "private").into())],
         location,

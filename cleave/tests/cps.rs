@@ -1,4 +1,4 @@
-use cleave::cps::{ConcreteUnit, collect_units, convert_program, dump_cps_program};
+use cleave::cps::{ConcreteUnit, collect_units, convert_program, dump_cps_program, eliminate_dead_code};
 use cleave::driver::compile;
 use cleave::registry::Registry;
 
@@ -597,4 +597,80 @@ fn a_top_level_fns_own_origin_survives_cps_conversion() {
         panic!("no `Ring::add<i32>` unit found among: {:?}", cps_program.funcs.iter().map(|f| &f.def.name).collect::<Vec<_>>())
     });
     assert_eq!(add.origin, Some(("Ring".to_string(), "add".to_string())));
+}
+
+// -------------------------------------------------- dead-code elimination
+
+/// A top-level `fn` never called from `main` (directly or transitively)
+/// gets dropped; one that *is* reachable, and `main` itself, survive.
+#[test]
+fn dead_code_elimination_drops_an_unused_top_level_fn_but_keeps_reachable_ones() {
+    let (result, _sources) = compile(
+        vec![("test.cleave".to_string(), "fn unused(x: i32) -> i32 { x }\nfn used(x: i32) -> i32 { x }\nfn main() -> i32 { used(1) }".to_string())],
+        &[],
+    );
+    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+    let registry = Registry::build(&program);
+    let cps_program = convert_program(collect_units(&program, &registry));
+    let cps_program = eliminate_dead_code(cps_program);
+    let names: Vec<&str> = cps_program.funcs.iter().map(|f| f.def.name.as_str()).collect();
+    assert!(names.contains(&"main"), "got: {names:?}");
+    assert!(names.contains(&"used"), "got: {names:?}");
+    assert!(!names.contains(&"unused"), "got: {names:?}");
+}
+
+/// The real motivating case (`doc/backlog.md`'s own "Dead-code elimination
+/// for unused stdlib specializations" item): `stdlib/num/num.cleave`'s
+/// width specializations (`Ring`/`Ord` × 6 widths) are unconditionally
+/// collected by `collect_units` regardless of what the program actually
+/// uses — DCE must remove every one the program never reaches, keeping
+/// only the ones it does.
+#[test]
+fn dead_code_elimination_drops_unreached_stdlib_specializations() {
+    let (result, _sources) = compile(vec![("test.cleave".to_string(), "fn main() -> i32 { 1 + 2 }".to_string())], &[]);
+    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+    let registry = Registry::build(&program);
+    let cps_program = convert_program(collect_units(&program, &registry));
+    let before = cps_program.funcs.len();
+    let cps_program = eliminate_dead_code(cps_program);
+    let after = cps_program.funcs.len();
+    assert!(after < before, "expected DCE to remove unreached stdlib specializations, before={before} after={after}");
+    let names: Vec<&str> = cps_program.funcs.iter().map(|f| f.def.name.as_str()).collect();
+    assert!(names.contains(&"Ring::add<i32>"), "got: {names:?}");
+    assert!(!names.contains(&"Ring::add<f64>"), "the program never touches f64, got: {names:?}");
+}
+
+/// A second real bug, found by direct testing (`examples/axiom_demo.cleave`):
+/// `main.rs`'s own pipeline used to run DCE only *once*, before `egraph::
+/// optimize_program` — but the axiom pass can itself fold away every
+/// remaining call to a stdlib specialization (`10 + x - 10` reducing to `x`
+/// via `add_commutative`/`add_sub_assoc`/constant-fold/`add_zero`), which
+/// the first sweep has no way to anticipate, since it runs *before*
+/// optimization ever happens. `Ring::add<i32>`/`Ring::sub<i32>` survived a
+/// single DCE pass despite ending up with zero real callers — a second
+/// sweep, run *after* `optimize_program`, is needed to actually remove them.
+#[test]
+fn dead_code_elimination_after_optimization_drops_specializations_the_axioms_folded_away() {
+    let (result, _sources) = compile(
+        vec![(
+            "test.cleave".to_string(),
+            "fn helper(x: i32) -> i32 { let y = 10; 10 + x - y }\nfn main() -> i32 { helper(21) }".to_string(),
+        )],
+        &[],
+    );
+    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+    let registry = Registry::build(&program);
+    let cps_program = convert_program(collect_units(&program, &registry));
+    let cps_program = eliminate_dead_code(cps_program);
+    let names_before: Vec<&str> = cps_program.funcs.iter().map(|f| f.def.name.as_str()).collect();
+    assert!(names_before.contains(&"Ring::add<i32>"), "a single DCE pass, before optimization, can't know these are about to become dead: {names_before:?}");
+    assert!(names_before.contains(&"Ring::sub<i32>"), "got: {names_before:?}");
+
+    let (optimized, _) = cleave::egraph::optimize_program(cps_program, &registry);
+    let optimized = eliminate_dead_code(optimized);
+    let names_after: Vec<&str> = optimized.funcs.iter().map(|f| f.def.name.as_str()).collect();
+    assert!(!names_after.contains(&"Ring::add<i32>"), "the axioms folded away every real call to add<i32>, got: {names_after:?}");
+    assert!(!names_after.contains(&"Ring::sub<i32>"), "the axioms folded away every real call to sub<i32>, got: {names_after:?}");
+    assert!(names_after.contains(&"helper"), "got: {names_after:?}");
+    assert!(names_after.contains(&"main"), "got: {names_after:?}");
 }
