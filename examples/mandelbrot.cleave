@@ -1,0 +1,54 @@
+use io;
+use complex;
+
+// Escape-time iteration count for `c` under `z := z*z + c`, `z0 = 0` — the
+// standard Mandelbrot recurrence, `stdlib/complex/complex.cleave`'s own
+// `Ring<Complex<f64>>` supplying real complex arithmetic (`*`/`+`) with no
+// special-casing here at all. `magnitude_sq() > 4.0` (`|z| > 2`) is the
+// usual escape radius, checked via `Complex<T>`'s own inherent
+// `magnitude_sq` (squared, no `sqrt` — comparing a squared distance against
+// a squared threshold needs no root at all). No `break` in loops yet (`doc/
+// backlog.md`'s own "break value in loops" item) — `escaped`/`count` just
+// latch onto the *first* iteration that crosses the threshold and every
+// later iteration becomes a no-op past that point instead of an early exit.
+fn escape_count(c: Complex<f64>) -> i32 {
+    let mut z = Complex(real: 0.0, imag: 0.0);
+    let mut count = 50;
+    let mut escaped = false;
+    for n in 0..50 {
+        z = z * z + c;
+        if not escaped and (z.magnitude_sq() > 4.0) {
+            escaped = true;
+            count = n;
+        };
+    };
+    count
+}
+
+fn main() {
+    // Classic viewing window, real in [-2.5, 1.0], imag in [-1.25, 1.25].
+    let width = 70;
+    let height = 25;
+    let dx: f64 = 0.05;
+    let dy: f64 = 0.1;
+    // Darkest-to-brightest ASCII ramp, indexed by escape speed — a point
+    // that never escapes (deep in the set) lands on the last entry.
+    let palette = [32:i8, 46:i8, 58:i8, 45:i8, 61:i8, 43:i8, 42:i8, 35:i8, 37:i8, 64:i8];
+
+    let mut py: f64 = -1.25;
+    for row in 0..height {
+        let mut px: f64 = -2.5;
+        let mut line = [32:i8; 71];
+        for col in 0..width {
+            let c = Complex(real: px, imag: py);
+            let n = escape_count(c);
+            let idx = n * 9 / 50;
+            line[col] = palette[idx];
+            px = px + dx;
+        };
+        line[70] = 10:i8;
+        print(line);
+        py = py + dy;
+    };
+    0
+}

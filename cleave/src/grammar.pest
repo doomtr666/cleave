@@ -232,7 +232,14 @@ postfix     = { primary ~ postfix_op* }
 // arguments, `.f()`) is visible — otherwise `.x` (field access) and `.f()`
 // (zero-arg method call) both produce identical pairs (just `ident`), since
 // an empty `arg_list?` and an absent one are indistinguishable on their own.
-postfix_op  = { "." ~ ident ~ call_args? | "[" ~ expr ~ ("," ~ expr)* ~ "]" }
+// The bare `call_args` alternative — "just call whatever's on the left" —
+// is what lets a parenthesized lambda literal (`primary`'s own `"(" ~ expr
+// ~ ")"` alternative) be called directly (`(fn(a,b){a+b})(1,2)`, `lower.rs`'s
+// own `lower_postfix_op` desugars it) — no ambiguity with `call_expr` below,
+// which still greedily consumes a *bare-path* call's own immediate args at
+// the `primary` level; this only ever fires for a *trailing* `(args)` after
+// whatever `primary` already produced.
+postfix_op  = { "." ~ ident ~ call_args? | "[" ~ expr ~ ("," ~ expr)* ~ "]" | call_args }
 call_args   = { "(" ~ arg_list? ~ ")" }
 
 // `call_expr` before `struct_lit`, deliberately: `f()` (a zero-arg call) and
@@ -257,9 +264,8 @@ primary = { if_expr | while_expr | for_expr | array_lit | lambda_expr | call_exp
 // `algebra` and mod+module into `use`). No generics here — a generic
 // anonymous value isn't a need this surfaces yet; can be added later without
 // disrupting this shape. Calling a lambda *literal* directly
-// (`(fn(a,b){a+b})(1,2)`) isn't supported yet — only calling a `let` binding
-// that holds one (`postfix`'s `call_expr` still requires a bare `path` as
-// callee) — deliberately deferred, see infer.rs's module docs.
+// (`(fn(a,b){a+b})(1,2)`) is supported via `postfix_op`'s own bare
+// `call_args` alternative above, desugared in `lower.rs`.
 lambda_expr = { "fn" ~ "(" ~ param_list? ~ ")" ~ ("->" ~ type_)? ~ block }
 
 // qualified calls (`Ring::add(a, b)`) need the same path as plain references —

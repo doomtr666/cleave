@@ -32,6 +32,11 @@ fn lambda_as_let_value() {
 }
 
 #[test]
+fn lambda_literal_called_directly() {
+    parses(Rule::expr, "(fn(a, b) { a + b })(1, 2)");
+}
+
+#[test]
 fn let_binding_no_type() {
     parses(Rule::let_stmt, "let a = c + b;");
 }

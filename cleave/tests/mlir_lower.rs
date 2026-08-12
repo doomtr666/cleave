@@ -1236,3 +1236,393 @@ fn a_generic_inherent_method_called_at_two_types_computes_the_right_value() {
     ";
     assert_eq!(run_i32(&context, src), 42);
 }
+
+/// A self-recursive `let`-bound lambda (`doc/backlog.md`'s own "Self-
+/// recursive `let`-bound lambda" item) — a genuinely separate gap from the
+/// type-inference-layer one already fixed: even once `infer.rs` correctly
+/// types `fact`'s own self-call, `monomorphize.rs`'s call-resolution scope
+/// never saw the self-binding (`StmtKind::Let` only inserted `name ->
+/// value.id` *after* walking the lambda's own body) and the lambda-
+/// worklist's own drain loop re-walked that body from a totally empty
+/// scope regardless — both needed fixing before `cps.rs`'s `resolve_call`
+/// could ever find a unit to call. `5! = 120`, not a panic.
+#[test]
+fn a_self_recursive_let_bound_lambda_actually_runs() {
+    let context = context();
+    let src = "
+        fn main() -> i32 {
+            let fact = fn(n: i32) -> i32 { if n <= 1 { 1 } else { n * fact(n - 1) } };
+            fact(5)
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 120);
+}
+
+/// The same self-recursive lambda, but *unannotated* -- `fact` is generalized
+/// (`is_syntactic_value`) with a genuinely open type variable in its own
+/// scheme, so its own body's `node_types` (as recorded by ordinary, once-
+/// only whole-program inference) are still generic. A real second bug, found
+/// by direct testing right after the annotated case above started passing:
+/// discovering the self-call while walking that still-generic copy of the
+/// body (from `main`'s own initial, "seed scan" walk) reverse-unifies
+/// against open type variables and "succeeds" trivially (unifying `Ty::Var`
+/// against anything always does), producing a bogus, never-actually-
+/// reachable specialization whose own inner calls (`n <= 1`, here) then fail
+/// to resolve against any concrete algebra impl. Guarded by requiring a
+/// `derive_instantiation` result to be fully concrete (no leftover `Ty::
+/// Var`) before ever recording it — the *real* concrete instantiation is
+/// still found separately, from `fact(5)`'s own outer, already-concrete
+/// call site in `main`.
+#[test]
+fn an_unannotated_self_recursive_lambda_still_runs_despite_being_generalized() {
+    let context = context();
+    let src = "
+        fn main() -> i32 {
+            let fact = fn(n) { if n <= 1 { 1 } else { n * fact(n - 1) } };
+            fact(5)
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 120);
+}
+
+/// Same gap, but the self-recursive lambda also *captures* an outer
+/// variable (`step`) -- proves the second, independent half of the fix:
+/// even once `resolve_call` finds the right unit, the self-call must also
+/// re-supply that unit's own captures (its leading params), since the
+/// ordinary "already-bound `CVal::Closure`" fast path in `cps.rs`'s `Call`
+/// arm never fires for a self-call (that binding only ever exists in the
+/// *enclosing* scope's own environment, never inside the lambda's own
+/// separately-converted unit body). A wrong/missing splice here fails loud
+/// (wrong arity/argument types), not silently.
+#[test]
+fn a_capturing_self_recursive_lambda_re_supplies_its_own_captures() {
+    let context = context();
+    let src = "
+        fn main() -> i32 {
+            let step = 2;
+            let count_by = fn(n: i32) -> i32 { if n <= 0 { 0 } else { step + count_by(n - step) } };
+            count_by(10)
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 10);
+}
+
+/// `doc/backlog.md`'s own "Calling a lambda literal directly" item —
+/// `(fn(a, b) { a + b })(1, 2)` used to have no grammar production to parse
+/// at all (`call_expr` only ever accepts a bare `path` callee, and
+/// `postfix_op` had no "just call whatever's on the left" alternative).
+/// Fixed as pure syntactic sugar in `lower.rs`: desugars to `{ let
+/// <synthetic> = <base>; <synthetic>(<args>) }`, reusing the *existing*
+/// let-bound-lambda pipeline wholesale (`infer.rs`'s `lambda_schemes`,
+/// `monomorphize.rs`'s lambda worklist, `cps.rs`'s closure conversion) —
+/// nothing downstream of `lower.rs` needed to change at all.
+#[test]
+fn a_lambda_literal_called_directly_actually_runs() {
+    let context = context();
+    let src = "
+        fn main() -> i32 {
+            (fn(a, b) { a + b })(1, 2)
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 3);
+}
+
+/// Same desugaring, but used mid-expression rather than alone in tail
+/// position — proves the synthesized `Block` composes as an ordinary
+/// sub-expression, not just as a statement/tail on its own.
+#[test]
+fn a_lambda_literal_called_directly_composes_inside_a_larger_expression() {
+    let context = context();
+    let src = "
+        fn main() -> i32 {
+            1 + (fn(x: i32) -> i32 { x * 2 })(5)
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 11);
+}
+
+/// `doc/backlog.md`'s own "Const-generic algebra parameters" item —
+/// `algebra Sum<T, const N: i32> { fn total(x: [T; N]) -> T; }`'s own `N`
+/// used to be silently dropped both at a call site (`infer_algebra_call`'s
+/// own generics mapping) and while conformance-checking an impl's own
+/// method body against the algebra's declared signature (`infer_impl_fn_
+/// generic_with_env`'s identical, separate gap, found by direct testing
+/// once this end-to-end case exercised it) — both fixed the same way,
+/// giving the const generic an ordinary fresh var instead of `None`. No
+/// existing stdlib algebra declares its own const generic, so this
+/// combination was never exercised before; run for real here rather than
+/// just at the type-inference layer, to confirm `monomorphize.rs`/`cps.rs`
+/// also carry it through correctly.
+#[test]
+fn an_algebras_own_const_generic_actually_runs() {
+    let context = context();
+    let src = "
+        algebra Sum<T, const N: i32> {
+            fn total(x: [T; N]) -> T;
+        }
+        impl Sum<i32> {
+            fn total(x) -> i32 { x[0] + x[1] + x[2] }
+        }
+        fn main() -> i32 {
+            total([10, 20, 12])
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 42);
+}
+
+/// `doc/backlog.md`'s own "Explicit turbofish on a const generic, for a
+/// plain top-level `fn`" item — the exact repro. Root cause, confirmed by
+/// direct testing, is *not* a turbofish-arity bug at all: `N`, referenced
+/// as an ordinary body *value* (not a type-position use like `[T; N]`),
+/// shares its own single fresh type-var between two different questions
+/// ("N's own declared type" and "N's own generic identity") -- checking it
+/// against its own declared return type (`-> i32`) used to permanently
+/// collapse that var to `Con("i32")`, destroying its own identity before
+/// `rep`'s own scheme was ever built, leaving turbofish with 0 declared
+/// generics to match against.
+#[test]
+fn explicit_turbofish_on_a_const_generic_actually_runs() {
+    let context = context();
+    let src = "
+        fn rep<const N: i32>(x: i32) -> i32 { N }
+        fn main() -> i32 { rep::<3>(5) }
+    ";
+    assert_eq!(run_i32(&context, src), 3);
+}
+
+/// Same root cause, but with *no* turbofish anywhere -- proves the fix is
+/// general, not specific to the turbofish call site: an inherent method
+/// reading its own struct's const generic as a body value, pinned purely by
+/// the constructed array's own size, the same way an ordinary generic
+/// struct field already works. Found, by direct testing, to already fail
+/// this same way (`CPS: could not resolve method call`) before this fix,
+/// confirming the turbofish repro above was only the easiest way to
+/// *reach* this bug, not its actual cause.
+#[test]
+fn a_const_generic_read_as_a_body_value_with_no_turbofish_actually_runs() {
+    let context = context();
+    let src = "
+        struct Box<T, const N: i32> { data: [T; N] }
+        impl<T, const N: i32> struct Box<T, N> {
+            fn size(b) -> i32 { N }
+        }
+        fn main() -> i32 {
+            Box(data: [1, 2, 3]).size()
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 3);
+}
+
+/// `doc/backlog.md`'s own "Complex literals" item — `2i + 4` used to be
+/// unrepresentable (`ImaginaryLit` always inferred to a placeholder). Fixed
+/// via literal-shape widening, not a general numeric-conversion mechanism
+/// (see this session's own extensive design discussion, now also recorded
+/// in `doc/backlog.md`'s new "Explicit conversion between numeric types"
+/// item): both `2i` and `4` are still-elastic literals here, not already-
+/// concrete values, so this is purely a defaulting question — `4`'s own
+/// `Int` shape constraint is satisfied once it resolves to `Complex<f64>`
+/// (ℤ ⊂ ℂ, unlike `Int` vs `Float`, which stay mutually exclusive exactly
+/// as before). `stdlib/complex/complex.cleave`'s own `Ring<Complex<T>>` is
+/// `examples/complex.cleave`'s own already-proven arithmetic, moved
+/// verbatim into the stdlib. `use complex;` explicitly — not prelude.
+///
+/// `z`'s own `let` carries an explicit `Complex<f64>` annotation — found by
+/// direct testing to be *necessary*, not decorative, and a real, separate,
+/// documented limitation (see `doc/backlog.md`'s own "Complex literals"
+/// Done entry): `z.real`/`z.imag`'s own field-access type resolution
+/// (`infer.rs`'s `ExprKind::FieldAccess`) runs immediately, permanently
+/// recording `<not-yet-inferred>` if `z`'s own base type is still a bare
+/// `Ty::Var` at that point — which it is here, since `2i + 4`'s own
+/// `Complex` defaulting doesn't happen until `apply_defaults` runs, at the
+/// very end of the whole function's inference, strictly after every
+/// statement (including this one) has already been walked. An explicit
+/// annotation pins `z`'s type immediately at its own `let`, sidestepping
+/// the ordering gap entirely — unannotated field access on a value whose
+/// own type comes purely from deferred literal-defaulting is a known,
+/// separate, not-yet-fixed limitation, not something this item's own
+/// literal-widening fix could address without a deeper change to when/how
+/// defaulting runs relative to field-access resolution.
+#[test]
+fn a_complex_literal_added_to_a_plain_int_literal_actually_runs() {
+    let context = context();
+    let src = "
+        use complex;
+        fn main() -> i32 {
+            let z: Complex<f64> = 2i + 4;
+            if z.real == 4.0 and z.imag == 2.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// Same as above, operands reversed (`4 + 2i`) — proves the widening isn't
+/// order-dependent (`add`'s own two arguments are inferred independently,
+/// each carrying its own shape constraint, before dispatch ever runs).
+#[test]
+fn a_plain_int_literal_added_to_a_complex_literal_actually_runs() {
+    let context = context();
+    let src = "
+        use complex;
+        fn main() -> i32 {
+            let z: Complex<f64> = 4 + 2i;
+            if z.real == 4.0 and z.imag == 2.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `Complex<T>`'s own `magnitude_sq`/`magnitude` inherent methods
+/// (`stdlib/complex/complex.cleave`) — `3 + 4i` has magnitude `5` (the
+/// classic 3-4-5 right triangle), checked both ways: `magnitude_sq`
+/// (`real*real + imag*imag`, no `sqrt`, exact) and `magnitude` itself
+/// (`mlir::math::sqrt` on top of it).
+#[test]
+fn complex_magnitude_and_magnitude_sq_compute_correctly() {
+    let context = context();
+    let src = "
+        use complex;
+        fn main() -> i32 {
+            let z: Complex<f64> = 3.0 + 4i;
+            if z.magnitude_sq() == 25.0 and z.magnitude() == 5.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// Real bug, found by direct testing while extending `examples/complex.
+/// cleave`: `apply_defaults` processed `pending_defaults` in plain source
+/// order — when a bare `Float` literal and an `Imaginary` literal end up
+/// sharing the same merged variable (via `+`) with *no* enclosing
+/// annotation to pin the result early (every other complex-literal test
+/// above always has one), whichever literal happened to be written *first*
+/// won the defaulting race. `5.0 + 7.5i` (float literal first) collapsed
+/// the shared variable to a bare `f32`, discarding the imaginary part
+/// entirely and failing with `no impl Complex<f32>`; `7.5i + 5.0`
+/// (imaginary literal first) happened to work purely by accident of
+/// iteration order. Fixed: `Complex` defaults are now always applied
+/// before `Int`/`Float` ones, order-independently (ℤ, ℝ ⊂ ℂ — a bare
+/// shape only ever widens *into* `Complex`, never the reverse).
+///
+/// Neither `z1` nor `z2` is consumed afterward (no field access, no method
+/// call, no annotation) — any of those would themselves force early
+/// unification and mask the exact bug this proves fixed; the real
+/// assertion here is that this compiles and runs at all; before the fix,
+/// `compile(...)` itself failed.
+#[test]
+fn a_float_literal_and_an_imaginary_literal_combine_regardless_of_operand_order() {
+    let context = context();
+    let src = "
+        use complex;
+        fn main() -> i32 {
+            let z1 = 5.0 + 7.5i;
+            let z2 = 7.5i + 5.0;
+            1
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// Real bug, found while building `Convert<From, To>`: a bare numeric
+/// literal inside a generic impl's own body (`Pair`'s `b` field, defaulting
+/// to `f32` rather than staying `T`) silently collapsed the impl's own
+/// generic `T` to a concrete `f32` at *declaration* time — corrupting the
+/// whole template, so a *second*, differently-typed call site (`f64`) could
+/// never reverse-unify against it (`monomorphize.rs`'s own `derive_impl_
+/// instantiation`, `NoneMatched` → `MonomorphizationFailed`). A single-
+/// instantiation test wouldn't catch this at all (an `f32`-only program
+/// happened to work by accident, since that's exactly what the corrupted
+/// template got stuck at) — this specifically invokes the same generic
+/// impl at *two* different concrete types in one program, proving the
+/// template itself stayed properly generic. `Float` deliberately isn't
+/// redeclared here — it's already a real, `#[mlir_type(...)]`-tagged
+/// prelude algebra (`stdlib/num/num.cleave`); a second, local, untagged
+/// `algebra Float<T> {}` was tried first and silently corrupted `ty_to_
+/// mlir`'s own `f64` lowering (a real, separate program-merge gap, found
+/// by direct testing and worth its own future look, not chased further
+/// here) — every existing test in this file already avoids this by relying
+/// on the prelude's own `Float`/`Int` instead of redeclaring either.
+#[test]
+fn a_generic_impls_own_generic_stays_generic_across_multiple_concrete_instantiations() {
+    let context = context();
+    let src = "
+        struct Pair<T> { a: T, b: T }
+        algebra Widen<From, To> { fn widen(x: From) -> To; }
+        impl<T: Float> Widen<T, Pair<T>> {
+            fn widen(x) { Pair(a: x, b: 0.0) }
+        }
+        fn main() -> i32 {
+            let x: f32 = 3.0;
+            let y: f64 = 4.0;
+            let p1: Pair<f32> = widen(x);
+            let p2: Pair<f64> = widen(y);
+            if p1.a == 3.0 and p1.b == 0.0 and p2.a == 4.0 and p2.b == 0.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+// ---------------------------------------------------------------------
+// `doc/backlog.md`'s "Explicit conversion between numeric types" item —
+// `stdlib/convert/convert.cleave`'s `algebra Convert<From, To>` and `.to()`
+// (`lower.rs`'s own postfix desugaring, `x.to()` -> `convert(x)`).
+// ---------------------------------------------------------------------
+
+/// `.to()` on an already-concrete value, with exactly one candidate impl
+/// for that `From` — the ergonomic, common case: no turbofish needed, real
+/// `arith::sitofp` runs under the hood.
+#[test]
+fn to_sugar_converts_an_int_to_a_float_end_to_end() {
+    let context = context();
+    let src = "
+        use convert;
+        fn main() -> i32 {
+            let n: i32 = 7;
+            let f: f64 = n.to();
+            if f == 7.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// The same sugar on a bare literal, not an already-annotated value —
+/// `4.to()` is the far more natural spelling in practice, and exercises
+/// `infer_algebra_call`'s *deferred* path (the literal's own shape var
+/// isn't concrete until `apply_defaults` runs, well after the call itself
+/// was type-checked — see `check_pending_constraints`).
+#[test]
+fn to_sugar_on_a_bare_literal_converts_correctly() {
+    let context = context();
+    let src = "
+        use convert;
+        fn main() -> i32 {
+            let f: f64 = 4.to();
+            if f == 4.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// A second, competing `Convert<i32, _>` impl (declared right here, proving
+/// `Convert` is an ordinary, user-extensible algebra, not a closed set)
+/// makes a bare, turbofish-free `n.to()` genuinely ambiguous — `.to()`
+/// itself has no turbofish grammar (postfix method syntax doesn't carry
+/// one), so disambiguating means dropping to the explicit `convert::<From,
+/// To>(x)` call form instead. Proves that end to end: it dispatches
+/// cleanly and runs the *right* impl body (`i32 -> f64`'s real `sitofp`),
+/// not the competing `i32 -> Widened` one — a real runtime distinction, not
+/// just two differently-typed declarations.
+#[test]
+fn turbofish_on_convert_disambiguates_between_two_real_competing_impls() {
+    let context = context();
+    let src = "
+        use convert;
+        struct Widened { value: i32 }
+        impl Convert<i32, Widened> { fn convert(x) { Widened(value: x) } }
+        fn main() -> i32 {
+            let f: f64 = convert::<i32, f64>(9);
+            if f == 9.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+

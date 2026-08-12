@@ -437,14 +437,21 @@ fn conflicting_literal_shapes_across_a_mutually_recursive_group_are_rejected() {
     // literal is textually anywhere near the other. Both `f` and `g` take a
     // parameter, so they're generalized — `n`'s shared, conflicting-shaped
     // variable is quantified into their scheme rather than defaulted on the
-    // spot (see `Infer::quantified`), so the conflict only actually
-    // surfaces once *something* instantiates that scheme — here, `use_f`.
-    // A never-called mutually-recursive pair with an unsatisfiable (`Int`
-    // *and* `Float` on the same variable) scheme is a real, separate,
-    // deliberately-not-caught gap: nothing checks a scheme's own
-    // constraints for satisfiability at generalization time, only at
-    // instantiation — matching how nothing here proactively checks dead
-    // code for soundness in general.
+    // spot (see `Infer::quantified`).
+    //
+    // Originally written (and named) to document a real, separate gap: a
+    // never-called mutually-recursive pair with an unsatisfiable scheme
+    // used to generalize completely silently, the conflict only ever
+    // surfacing if *something* later instantiated it — see `doc/backlog.md`'s
+    // own "Scheme satisfiability at generalization time" item, now fixed
+    // (`Infer::generalize`'s own doc comment has the full story). Updated
+    // to assert the *new* behavior directly on `f` — the conflict is now
+    // caught immediately, with no external caller needed at all (unlike
+    // `a_mutually_recursive_groups_own_conflicting_shape_constraints_are_
+    // rejected_even_with_no_external_caller` below, which exercises the
+    // same fix through a single shared expression rather than two
+    // recursive `if`/`else` base cases feeding each other through mutual
+    // calls — kept as a distinct, genuinely different shape).
     let registry = dual_type_registry();
     let program = lower_program(
         "fn f(n) {
@@ -452,12 +459,11 @@ fn conflicting_literal_shapes_across_a_mutually_recursive_group_are_rejected() {
         }
         fn g(n) {
             if n > 0 { f(n - 1) } else { 2.0 }
-        }
-        fn use_f() -> i32 { f(5) }",
+        }",
     );
     let result = infer_program(&program, &registry);
-    let err = err_result(&result, "use_f");
-    assert!(matches!(err.kind, cleave::infer::TypeErrorKind::MissingImpl { .. }), "got: {:?}", err.kind);
+    let err = err_result(&result, "f");
+    assert!(matches!(err.kind, cleave::infer::TypeErrorKind::UnsatisfiableScheme { .. }), "got: {:?}", err.kind);
 }
 
 #[test]
@@ -668,4 +674,137 @@ fn a_const_generic_used_as_a_for_loop_bound_is_checked_against_its_real_width_no
         "got: {:?}",
         err.kind
     );
+}
+
+// ---------------------------------------------------------------------
+// An inherent method's own inferred return type reaching an external
+// caller (`infer_inherent_impls_early`) -- previously, a *different*
+// function calling an unannotated inherent method only ever saw the
+// `<not-yet-inferred>` placeholder, regardless of what the method's own
+// body actually computed.
+// ---------------------------------------------------------------------
+
+/// Deliberately *one* combined source, unlike most tests above, which can
+/// freely split the caller and the registry's own fixture into two separate
+/// strings: `Registry::build` scans `program.items` directly for `struct`/
+/// `impl struct` declarations, so the struct and its own inherent impl must
+/// actually be part of the `Program` being inferred, not just known to a
+/// separately-built `Registry` (same reasoning `tests/monomorphize.rs`'s own
+/// `a_generic_algebra_impl_method_is_specialized_at_a_concrete_call_site`
+/// already documents for algebra impls).
+#[test]
+fn an_external_callers_own_return_type_resolves_through_an_unannotated_inherent_method() {
+    let src = "algebra Ring<T> { fn add(a: T, b: T) -> T; }
+        impl Ring<i32> { fn add(a: i32, b: i32) -> i32 { a } }
+        struct Vec2 { x: i32, y: i32 }
+        impl struct Vec2 {
+            fn sum_fields(v) { v.x + v.y }
+        }
+        fn use_it(v: Vec2) -> i32 { v.sum_fields() }";
+    let registry = registry_from(src);
+    let program = lower_program(src);
+    let result = infer_program(&program, &registry);
+    assert_eq!(ok_result(&result, "use_it"), Ty::Con("i32".to_string()));
+}
+
+#[test]
+fn a_generic_inherent_methods_own_return_type_resolves_through_the_call_sites_own_concrete_generic() {
+    let src = "struct Boxed<T> { value: T }
+        impl<T> struct Boxed<T> {
+            fn get(b) { b.value }
+        }
+        fn use_it(b: Boxed<i32>) -> i32 { b.get() }";
+    let registry = registry_from(src);
+    let program = lower_program(src);
+    let result = infer_program(&program, &registry);
+    assert_eq!(ok_result(&result, "use_it"), Ty::Con("i32".to_string()));
+}
+
+/// Graceful degradation, not a regression: an inherent method whose own
+/// return type genuinely depends on a top-level `fn` (not yet visible to
+/// the early pass, since `global_env` doesn't exist until *after* this
+/// pass runs -- see this feature's own design notes) still correctly
+/// defers to a placeholder for an *external* caller, exactly like any
+/// other not-yet-resolvable reference elsewhere in this compiler -- no
+/// crash, no silently wrong type.
+#[test]
+fn an_inherent_methods_own_dependency_on_a_top_level_fn_gracefully_defers_for_an_external_caller() {
+    let src = "fn helper() -> i32 { 42 }
+        struct Vec2 { x: i32, y: i32 }
+        impl struct Vec2 {
+            fn compute(v) { helper() }
+        }
+        fn use_it(v: Vec2) { v.compute() }";
+    let registry = registry_from(src);
+    let program = lower_program(src);
+    let result = infer_program(&program, &registry);
+    // A placeholder surviving all the way to a function's own *exposed*
+    // result type is a real, reported error (`check_no_placeholder`,
+    // matching every other case where that's true throughout this
+    // compiler) -- not a silent success, and specifically not a confusing
+    // type mismatch (which is what happens instead if the placeholder gets
+    // unified against an incompatible concrete type elsewhere, a *worse*
+    // failure mode this test is deliberately not exercising).
+    let err = err_result(&result, "use_it");
+    assert!(matches!(&err.kind, TypeErrorKind::Unresolved(s) if s.starts_with('<')), "got: {:?}", err.kind);
+}
+
+/// `doc/backlog.md`'s own "Explicit turbofish on a const generic, for a
+/// plain top-level `fn`" item. Root cause, confirmed by direct testing, is
+/// not a turbofish-arity bug at all: `N`, referenced as an ordinary body
+/// *value* (`{ N }`, not a type-position use like `[T; N]`), used to share
+/// its own single fresh type-var between "N's own declared type" (`i32`)
+/// and "N's own generic identity" -- checking it against `rep`'s own
+/// declared return type permanently collapsed that var to `Con("i32")`,
+/// destroying its own identity before `rep`'s scheme was ever built, so
+/// `rep` was reported with *zero* declared generics -- turbofish had
+/// nothing to match `::<3>` against. `f`'s own resolved type comes out as
+/// `Ty::Const(ConstValue::Int(3))`, not a bare `Ty::Con("i32")` -- once `N`
+/// is correctly pinned to `3` by the turbofish call, that's genuinely what
+/// `rep::<3>(5)`'s own call-site type *is* (mirrors `--dump-inference-pass`
+/// on this exact source, confirmed directly during development).
+#[test]
+fn explicit_turbofish_on_a_const_generic_resolves_the_calls_own_type() {
+    let registry = Registry::default();
+    let program = lower_program(
+        "fn rep<const N: i32>(x: i32) -> i32 { N }
+         fn f() -> i32 { rep::<3>(5) }",
+    );
+    let result = infer_program(&program, &registry);
+    assert!(result.results.get("rep").unwrap().is_ok(), "{:?}", result.results.get("rep"));
+    assert_eq!(ok_result(&result, "f"), Ty::Const(ConstValue::Int(3)));
+}
+
+/// `doc/backlog.md`'s own "Scheme satisfiability at generalization time"
+/// item — `f`/`g`'s shared quantified `t` carries both an `Int` shape
+/// constraint (from `f`'s `x + 1`) and a `Float` one (from `g`'s own `x +
+/// 1.0`), which can never both hold for any single concrete type — yet
+/// nothing external ever calls into this group, so nothing used to notice.
+/// Confirmed directly by testing before writing the fix: both `f`/`g`
+/// generalized cleanly, reported as `fn f(x: 'a) -> 'a`, no error anywhere
+/// — the fix must fire *here*, at generalization time, with no caller
+/// needed at all, not just "eventually, once someone instantiates it"
+/// (that half already worked, confirmed separately).
+#[test]
+fn a_mutually_recursive_groups_own_conflicting_shape_constraints_are_rejected_even_with_no_external_caller() {
+    let registry = dual_type_registry();
+    let program = lower_program(
+        "fn f(x) { g(x); x + 1 }
+         fn g(x) { f(x); x + 1.0 }",
+    );
+    let result = infer_program(&program, &registry);
+    let err = err_result(&result, "f");
+    assert!(matches!(err.kind, TypeErrorKind::UnsatisfiableScheme { .. }), "got: {:?}", err.kind);
+}
+
+/// Regression guard: two *compatible* single-target constraints sharing one
+/// quantified variable (`Int` and `Ord`, both satisfied by `i32`) must keep
+/// generalizing cleanly — the fix only rejects a genuinely empty
+/// intersection, not "more than one constraint" in general.
+#[test]
+fn compatible_shape_constraints_on_the_same_variable_still_generalize() {
+    let registry = dual_type_registry();
+    let program = lower_program("fn is_positive(x) { gt(x, 0) }");
+    let result = infer_program(&program, &registry);
+    assert!(result.results.get("is_positive").unwrap().is_ok(), "{:?}", result.results.get("is_positive"));
 }

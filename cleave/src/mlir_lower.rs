@@ -147,6 +147,19 @@ fn ty_to_mlir<'c>(ctx: &LowerCtx<'c, '_>, ty: &Ty) -> Type<'c> {
         Ty::Array(..) => {
             if array_leaf_is_struct(ctx, ty) { llvm::r#type::pointer(ctx.context, 0) } else { array_memref_type(ctx, ty).into() }
         }
+        // A bare, resolved const-generic value reaching an ordinary type
+        // position — e.g. a turbofish-pinned `const N: i32`'s own call-site
+        // result type, `Ty::Const(Int(3))` (see `infer.rs`'s own new `unify`
+        // arms reconciling this against an ordinary `Ty::Con`). Widened to
+        // its own natural primitive type: `cps.rs`'s own `ExprKind::Path`
+        // handling already lowers the *value* side of this identical shape
+        // (`Ty::Const(ConstValue::Int(n)) => CVal::Int(n)`) — this is the
+        // missing type-side counterpart. No declared width survives in a
+        // bare `ConstValue::Int` (see `ConstValue`'s own doc comment) — `i32`
+        // is the same default this codebase already uses for an otherwise-
+        // unconstrained integer literal.
+        Ty::Const(ConstValue::Int(_)) => width_ty(ctx, "i32"),
+        Ty::Const(ConstValue::Bool(_)) => width_ty(ctx, "bool"),
         _ => panic!("MLIR lowering doesn't support type `{ty}` yet (only primitive Ty::Con widths, arrays, and structs so far)"),
     }
 }

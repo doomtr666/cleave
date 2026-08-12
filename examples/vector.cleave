@@ -11,6 +11,10 @@ impl <T: Float> Ring<vec3<T>> {
         vec3(x: v1.x + v2.x, y: v1.y + v2.y, z: v1.z + v2.z)
     }
 
+    fn sub(v1,v2) { 
+        vec3(x: v1.x - v2.x, y: v1.y - v2.y, z: v1.z - v2.z)
+    }
+
 }
 
 fn print_vec(v) {

@@ -1,0 +1,56 @@
+// `doc/backlog.md`'s own "Complex literals" item. The runtime
+// representation and arithmetic already existed, proven end to end, as
+// `examples/complex.cleave`'s own user-space `Complex<T>` struct -- this is
+// that exact definition, moved here so a real `4i`/`2i + 4` literal can
+// construct it, not a new primitive type or new MLIR representation.
+//
+// `Complex<T>` names both a marker algebra (this file, mirroring `Int<T>`/
+// `Float<T>` in `stdlib/num/num.cleave` -- the shape a bare imaginary
+// literal defaults to) and the struct below -- legal, if confusing (this
+// codebase already allows a struct and an algebra to share a name;
+// `Registry::has_algebra`/`has_struct` are checked independently), matching
+// how `Int`/`Float` mark *other* concrete types (`i32`, `f64`) without
+// needing a distinct spelling of their own. `use complex;` explicitly --
+// not prelude (matches `io`'s own precedent, not `num`'s): a program that
+// never writes `4i` or `use complex;` sees zero change.
+algebra Complex<T> : Num {}
+
+struct Complex<T: Float> { real: T, imag: T }
+
+impl Complex<Complex<f32>> {}
+impl Complex<Complex<f64>> {}
+
+// `examples/complex.cleave`'s own bodies, verbatim.
+impl<T: Float> Ring<Complex<T>> {
+    fn add(x, y) { Complex(real: x.real + y.real, imag: x.imag + y.imag) }
+    fn sub(x, y) { Complex(real: x.real - y.real, imag: x.imag - y.imag) }
+    fn mul(x, y) {
+        Complex (
+            real: x.real * y.real - x.imag * y.imag,
+            imag: x.real * y.imag + x.imag * y.real
+        )
+    }
+    fn div(x, y) {
+        let denom = y.real * y.real + y.imag * y.imag;
+        Complex (
+            real: (x.real * y.real + x.imag * y.imag) / denom,
+            imag: (x.imag * y.real - x.real * y.imag) / denom
+        )
+    }
+    fn neg(x) { Complex(real: -x.real, imag: -x.imag) }
+}
+
+// `magnitude_sq`/`magnitude` — inherent methods (not `Ring`, not shared with
+// any other numeric type), same shape as `real`/`imag` field access itself.
+// `magnitude_sq` avoids `sqrt` entirely (`real*real + imag*imag`, exact) --
+// the one every escape-radius/threshold check actually wants (comparing a
+// squared distance against a squared threshold needs no root at all).
+// `magnitude` is the real Euclidean norm, `mlir::math::sqrt` on top of it --
+// the same reserved, structurally-recognized `mlir::dialect::op(...)`
+// mechanism every other primitive operation in this stdlib already goes
+// through (`doc/hld.md`'s own "one generic op-emitting primitive" thesis),
+// not a new special case.
+impl<T: Float> struct Complex<T> {
+    fn magnitude_sq(z) -> T { z.real * z.real + z.imag * z.imag }
+    fn magnitude(z) -> T { mlir::math::sqrt(z.magnitude_sq()) }
+}

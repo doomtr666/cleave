@@ -202,11 +202,19 @@ struct ImplTemplate {
     ret_pattern: Ty,
     target_patterns: Vec<Ty>,
     node_types: HashMap<NodeId, Ty>,
-    /// Whether the *impl* (not the algebra) this template came from declared
-    /// any of its own generics — `false` for `impl MatMul<f32,f32,f32>`,
-    /// `true` for `impl<T,N,M,K> MatMul<Matrix<T,N,M>,...>`. A concrete
-    /// impl's own `param_patterns`/`ret_pattern` carry no free variables at
-    /// all (already fully resolved against its own concrete targets) — its
+    /// Whether this template's own resolved `param_patterns`/`ret_pattern`/
+    /// `target_patterns` carry any free variable at all — `false` for
+    /// `impl MatMul<f32,f32,f32>`, `true` for `impl<T,N,M,K>
+    /// MatMul<Matrix<T,N,M>,...>` (the impl's own declared generics, the
+    /// overwhelmingly common source), but *also* `true` for a syntactically
+    /// non-generic impl (`impl Sum<i32> { ... }`) whose method still
+    /// inherits a free variable from the *algebra's* own const generic
+    /// (`algebra Sum<T, const N: i32> { fn total(x: [T; N]) -> T; }` — `N`
+    /// is never fixed by which impl matched, only by the call site) — found
+    /// missing by direct testing, see `build_impl_templates`'s own computation
+    /// of this field for the full story. A truly concrete impl's own
+    /// `param_patterns`/`ret_pattern` carry no free variables at all
+    /// (already fully resolved against its own concrete targets) — its
     /// template exists purely so `derive_impl_instantiation` can recognize
     /// "a concrete impl already covers this call" *structurally*, checking
     /// the whole parameter/return shape together the same way a generic
@@ -266,7 +274,7 @@ fn build_inherent_templates(program: &Program, registry: &Registry, global_env: 
         let TypeKind::Path(p, _) = &d.target.kind else { continue };
         let struct_name = p.segments.join("::");
         let mut infer = Infer::new(registry);
-        let results = infer.infer_inherent_impl_block(global_env, &d.generics, &d.target, &d.fns, item.span);
+        let (_, results) = infer.infer_inherent_impl_block(global_env, &d.generics, &d.target, &d.fns, item.span);
         for f in &d.fns {
             let Some(Ok((param_patterns, ret_pattern))) = results.get(&f.name) else { continue };
             templates.push(InherentTemplate {
@@ -311,7 +319,7 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
     };
     let mut fn_worklist: Vec<(String, Vec<Ty>)> = Vec::new();
     let mut impl_worklist: Vec<(usize, HashMap<TyVar, Ty>)> = Vec::new();
-    let mut lambda_worklist: Vec<(NodeId, Vec<Ty>)> = Vec::new();
+    let mut lambda_worklist: Vec<(NodeId, Vec<Ty>, String)> = Vec::new();
     let mut inherent_worklist: Vec<(usize, HashMap<TyVar, Ty>)> = Vec::new();
 
     // Seed: every function that itself type-checked to something *fully
@@ -340,6 +348,7 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
             &templates,
             &inherent_templates,
             &program_inference.lambda_schemes,
+            HashMap::new(),
             &mut fn_worklist,
             &mut impl_worklist,
             &mut lambda_worklist,
@@ -414,6 +423,7 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
             &templates,
             &inherent_templates,
             &program_inference.lambda_schemes,
+            HashMap::new(),
             &mut fn_worklist,
             &mut impl_worklist,
             &mut lambda_worklist,
@@ -452,6 +462,7 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
             &templates,
             &inherent_templates,
             &program_inference.lambda_schemes,
+            HashMap::new(),
             &mut fn_worklist,
             &mut impl_worklist,
             &mut lambda_worklist,
@@ -481,7 +492,7 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
     // same reasoning) the `fn_worklist` loop above already reads its own
     // generic pattern from, since ordinary inference records a lambda
     // body's node types there too, just still generic (pre-instantiation).
-    while let Some((lambda_id, concrete_tys)) = lambda_worklist.pop() {
+    while let Some((lambda_id, concrete_tys, self_name)) = lambda_worklist.pop() {
         let display = display_lambda_instantiation(lambda_id, &concrete_tys);
         if mono.specializations.contains_key(&display) {
             continue;
@@ -510,6 +521,13 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
             .collect();
 
         let mut call_names = HashMap::new();
+        // Seeded with this lambda's own canonical self-name (recovered
+        // above from `scope`, at whichever call site originally discovered
+        // this specialization -- see `collect_instantiations_expr`'s own
+        // `ExprKind::Call` arm) -- otherwise this re-walk, starting fresh,
+        // could never resolve a self-recursive call inside `body` at all.
+        let mut initial_scope = HashMap::new();
+        initial_scope.insert(self_name, lambda_id);
         collect_instantiations(
             body,
             &node_types,
@@ -517,6 +535,7 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
             &templates,
             &inherent_templates,
             &program_inference.lambda_schemes,
+            initial_scope,
             &mut fn_worklist,
             &mut impl_worklist,
             &mut lambda_worklist,
@@ -563,6 +582,7 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
             &templates,
             &inherent_templates,
             &program_inference.lambda_schemes,
+            HashMap::new(),
             &mut fn_worklist,
             &mut impl_worklist,
             &mut lambda_worklist,
@@ -651,6 +671,28 @@ fn build_impl_templates(program: &Program, registry: &Registry, global_env: &Env
             else {
                 continue;
             };
+            // Whether *this template's own resolved patterns* still carry a
+            // free variable — not just whether the *impl* itself declared
+            // generics (`!d.generics.is_empty()` alone, this method's own
+            // original check): an impl with zero generics of its own
+            // (`impl Sum<i32> { fn total(x) -> i32 { ... } }`) can still
+            // inherit a free variable from the *algebra's* own const
+            // generic (`algebra Sum<T, const N: i32> { fn total(x: [T; N])
+            // -> T; }` — `N` maps to a fresh var in `infer_impl_fn_generic_
+            // with_env`, never fixed by which impl matched, only by
+            // whichever concrete call site this method's own specialization
+            // is eventually built for) — found by direct testing once a
+            // real const-generic-algebra call actually ran: treating this
+            // template as non-generic left `N` permanently unresolved, and
+            // `resolve_call` could never find a matching concrete unit for
+            // it. `derive_impl_instantiation` already gathers free vars from
+            // exactly these three patterns unconditionally once `is_generic`
+            // is true (see its own doc comment) — no other change needed.
+            let mut free = HashSet::new();
+            infer.param_types.iter().for_each(|p| free_vars(p, &mut free));
+            free_vars(&ret_pattern, &mut free);
+            infer.target_types.iter().for_each(|p| free_vars(p, &mut free));
+            let is_generic = is_generic || !free.is_empty();
             // Never read for a non-generic template — `derive_impl_
             // instantiation` returns `NoCandidates` the moment it sees
             // `is_generic == false`, before ever touching `body`.
@@ -736,14 +778,22 @@ fn collect_instantiations(
     templates: &[ImplTemplate],
     inherent_templates: &[InherentTemplate],
     lambda_schemes: &HashMap<NodeId, Scheme>,
+    // Non-empty only when re-walking a lambda specialization's own body
+    // from the `lambda_worklist` drain loop -- seeded with that lambda's
+    // own canonical self-name, so a self-recursive call site inside it can
+    // resolve the same way the initial (whole-function) scan already does.
+    // Empty for every other caller (the seed scan, and the fn/impl/
+    // inherent-worklist drain loops), matching this function's own prior
+    // always-empty behavior for them.
+    initial_scope: HashMap<String, NodeId>,
     fn_worklist: &mut Vec<(String, Vec<Ty>)>,
     impl_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
-    lambda_worklist: &mut Vec<(NodeId, Vec<Ty>)>,
+    lambda_worklist: &mut Vec<(NodeId, Vec<Ty>, String)>,
     inherent_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
     call_names: &mut HashMap<NodeId, String>,
     errors: &mut Vec<TypeError>,
 ) {
-    let scope = HashMap::new();
+    let scope = initial_scope;
     collect_instantiations_block(
         body,
         node_types,
@@ -772,7 +822,7 @@ fn collect_instantiations_block(
     scope: &HashMap<String, NodeId>,
     fn_worklist: &mut Vec<(String, Vec<Ty>)>,
     impl_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
-    lambda_worklist: &mut Vec<(NodeId, Vec<Ty>)>,
+    lambda_worklist: &mut Vec<(NodeId, Vec<Ty>, String)>,
     inherent_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
     call_names: &mut HashMap<NodeId, String>,
     errors: &mut Vec<TypeError>,
@@ -781,6 +831,19 @@ fn collect_instantiations_block(
     for stmt in &block.stmts {
         match &stmt.kind {
             StmtKind::Let { name, value, .. } => {
+                // Self-recursion (`let fact = fn(n) { ... fact(n - 1) ... };`)
+                // -- seeded *before* walking `value`, not after, so a self-
+                // call inside the lambda's own body (reached via this same
+                // walk, through the `ExprKind::Lambda` arm below) can
+                // already resolve `name` via `scope`. Only the *insert*
+                // branch moves earlier: the *removal* branch (a non-lambda
+                // rebinding) must stay after the walk, since `let f = f(1);`
+                // legitimately means "call the outer `f`" and must keep
+                // resolving that way.
+                let is_lambda = lambda_schemes.contains_key(&value.id);
+                if is_lambda {
+                    scope.insert(name.clone(), value.id);
+                }
                 collect_instantiations_expr(
                     value,
                     node_types,
@@ -796,9 +859,7 @@ fn collect_instantiations_block(
                     call_names,
                     errors,
                 );
-                if lambda_schemes.contains_key(&value.id) {
-                    scope.insert(name.clone(), value.id);
-                } else {
+                if !is_lambda {
                     // Re-`let`-bound to something else (or to an
                     // un-generalized lambda) -- shadows any outer lambda
                     // binding of the same name for the rest of this scope.
@@ -884,7 +945,7 @@ fn collect_instantiations_expr(
     scope: &HashMap<String, NodeId>,
     fn_worklist: &mut Vec<(String, Vec<Ty>)>,
     impl_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
-    lambda_worklist: &mut Vec<(NodeId, Vec<Ty>)>,
+    lambda_worklist: &mut Vec<(NodeId, Vec<Ty>, String)>,
     inherent_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
     call_names: &mut HashMap<NodeId, String>,
     errors: &mut Vec<TypeError>,
@@ -940,11 +1001,14 @@ fn collect_instantiations_expr(
             // for an ordinary, non-lambda-bound argument.
             for a in args {
                 let ExprKind::Path(p) = &a.kind else { continue };
-                let Some(&lambda_id) = scope.get(&p.segments.join("::")) else { continue };
+                let arg_name = p.segments.join("::");
+                let Some(&lambda_id) = scope.get(&arg_name) else { continue };
                 let Some(scheme) = lambda_schemes.get(&lambda_id) else { continue };
                 if let Some(concrete_tys) = derive_value_instantiation(scheme, node_types, a.id) {
-                    call_names.insert(a.id, display_lambda_instantiation(lambda_id, &concrete_tys));
-                    lambda_worklist.push((lambda_id, concrete_tys));
+                    if concrete_tys.iter().all(is_fully_concrete) {
+                        call_names.insert(a.id, display_lambda_instantiation(lambda_id, &concrete_tys));
+                        lambda_worklist.push((lambda_id, concrete_tys, arg_name));
+                    }
                 }
             }
             args.iter().for_each(|a| rec!(a));
@@ -953,8 +1017,35 @@ fn collect_instantiations_expr(
             if let Some(&lambda_id) = scope.get(&name) {
                 if let Some(scheme) = lambda_schemes.get(&lambda_id) {
                     if let Some(concrete_tys) = derive_instantiation(scheme, expr, args, node_types) {
-                        call_names.insert(expr.id, display_lambda_instantiation(lambda_id, &concrete_tys));
-                        lambda_worklist.push((lambda_id, concrete_tys));
+                        // A self-recursive call site, reached while walking
+                        // a still-*generic* copy of this lambda's own body
+                        // (its own `node_types` not yet substituted for any
+                        // particular concrete instantiation -- see `scope`'s
+                        // own seeding in the `StmtKind::Let` arm above),
+                        // reverse-unifies against types that are themselves
+                        // still open type variables -- `derive_instantiation`
+                        // happily "succeeds" against them (unifying a `Ty::
+                        // Var` with anything always does), but the resulting
+                        // `concrete_tys` isn't actually concrete at all.
+                        // Recording it here would create a bogus, never-
+                        // reachable specialization (its own body, if ever
+                        // built, could go on to fail resolving *its own*
+                        // calls against non-existent generic-type impls --
+                        // found by direct testing on the unannotated CLI
+                        // repro). Silently deferred instead, the same
+                        // "not concrete yet" posture used everywhere else in
+                        // this pass -- the *real*, concrete instantiation is
+                        // still discovered separately, from whichever
+                        // *external* call site actually pins this lambda's
+                        // own generics down (`fact(5)`'s own outer call,
+                        // here), and correctly re-resolves this exact same
+                        // self-call site during its own drain-loop re-walk
+                        // (`node_types` substituted there -- see `monomorphize`'s
+                        // own lambda-worklist loop).
+                        if concrete_tys.iter().all(is_fully_concrete) {
+                            call_names.insert(expr.id, display_lambda_instantiation(lambda_id, &concrete_tys));
+                            lambda_worklist.push((lambda_id, concrete_tys, name.clone()));
+                        }
                     }
                 }
                 return;
@@ -1052,6 +1143,21 @@ fn collect_instantiations_expr(
             rec_block!(body, &inner);
         }
     }
+}
+
+/// True iff `ty` (recursively) contains no leftover `Ty::Var` — used to
+/// reject a `derive_instantiation`/`derive_value_instantiation` result
+/// that "succeeded" only because it unified against a call site whose own
+/// `node_types` are themselves still generic (a self-recursive call
+/// discovered while walking a still-uninstantiated copy of a lambda's own
+/// body — see the `ExprKind::Call` arm's own doc comment above). Unifying
+/// a bare `Ty::Var` against anything always succeeds, so `derive_
+/// instantiation` alone can't tell "genuinely concrete" from "still open"
+/// apart on its own.
+fn is_fully_concrete(ty: &Ty) -> bool {
+    let mut vars = HashSet::new();
+    free_vars(ty, &mut vars);
+    vars.is_empty()
 }
 
 /// Recovers the concrete type each of `scheme.vars` was instantiated to at
@@ -1354,7 +1460,15 @@ pub fn dump_monomorphized(program: &Program, registry: &Registry) -> (String, Ve
                 let _ = writeln!(out, "algebra {} {{ /* not type-inferred yet */ }}", d.name);
             }
             ItemKind::Impl(d) => {
-                if d.generics.is_empty() {
+                // The algebra's own const generics are checked too, not just
+                // the impl's — see `cps.rs::collect_units`'s identical guard
+                // (and `ImplTemplate::is_generic`'s own doc comment) for why
+                // `d.generics.is_empty()` alone isn't enough: an impl
+                // declaring zero generics of its own can still inherit a
+                // free variable from the algebra's own const generic.
+                let algebra_has_const_generic =
+                    registry.generics(&d.algebra).iter().any(|g| matches!(g, GenericParam::Const { .. }));
+                if d.generics.is_empty() && !algebra_has_const_generic {
                     dump_concrete_impl(&mut out, &mut errors, d, item.span, registry, &program_inference.global_env);
                     continue;
                 }

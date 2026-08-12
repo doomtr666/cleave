@@ -1,8 +1,0 @@
-fn helper(cond: bool, x: i32) -> i32 {
-    let b = if cond { x } else { x };
-    b + 0
-}
-
-fn main() -> i32 {
-    helper(true, 21)
-}

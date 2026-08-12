@@ -44,5 +44,5 @@ fn main() {
         [11.0, 12.0]
     ]);
     let mc = matmul(ma, mb);
-    42
+    0
 }

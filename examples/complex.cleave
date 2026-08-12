@@ -1,32 +1,27 @@
 use io;
+use complex;
+use convert;
 
-struct Complex<T : Float> {
-    real: T,
-    imag: T,
+// `f64 -> Complex<f64>` isn't in `stdlib/convert/convert.cleave` itself
+// (see that file's own doc comment on why) -- an ordinary user-space
+// extension of `Convert`, same as `examples/convert.cleave`.
+impl Convert<f64, Complex<f64>> {
+    fn convert(x) { Complex(real: x, imag: 0.0) }
 }
 
-impl <T : Float> Ring<Complex<T>> {
-    fn add(x, y) { Complex(real: x.real + y.real, imag: x.imag + y.imag) }
-    fn sub(x, y) { Complex(real: x.real - y.real, imag: x.imag - y.imag) }
-    fn mul(x, y) {
-        Complex (
-            real: x.real * y.real - x.imag * y.imag,
-            imag: x.real * y.imag + x.imag * y.real
-        )
-    }
-    fn div(x, y) {
-        let denom = y.real * y.real + y.imag * y.imag;
-        Complex (
-            real: (x.real * y.real + x.imag * y.imag) / denom,
-            imag: (x.imag * y.real - x.real * y.imag) / denom
-        )
-    }
-    fn neg(x) { Complex(real: -x.real, imag: -x.imag) }
+impl Convert<f32, Complex<f32>> {
+    fn convert(x) { Complex(real: x, imag: 0.0) }
 }
 
 fn main() {
-    let z1 = Complex(real: 1.0, imag: 0.0);
-    let z2 = Complex(real: 0.0, imag: 1.0);
+    // A real literal widened via `.to()` -- ℝ ⊂ ℂ. `x: f64` pins the
+    // literal's own width explicitly first -- an unannotated `1.0` defaults
+    // to `f32` (mirroring a bare int literal's own `i32` default), which
+    // `.to()` would then dispatch to `Convert<f32, f64>` instead.
+    let x: f64 = 1.0;
+    let z1: Complex<f64> = x.to();
+    // A bare imaginary literal -- the imaginary unit itself.
+    let z2: Complex<f64> = 1i;
 
     // (1 + i) * (1 - i) = 1 - i^2 = 2
     let zr = (z1 + z2) * (z1 - z2);
@@ -43,5 +38,21 @@ fn main() {
     print(zn.real);
     print(zn.imag);
 
+    // A real and an imaginary literal combined directly, no `.to()`/struct
+    // literal needed -- 3 + 4i, the classic 3-4-5 triangle.
+    let z3: Complex<f64> = 3.0 + 4i;
+    print(z3.magnitude());
+
+    let z4: Complex<f32> = 3.0 + 5.0i;
+    let z5 = z4 + 1.0;
+    let z6 = z5 * z5;
+
+    print(z4.magnitude_sq());
+    print(z5.magnitude_sq());
+    print(z6.magnitude_sq());
+    
+    let z7 = 5.0 + 7.5i;
+    
+    
     0
 }

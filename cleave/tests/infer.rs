@@ -147,6 +147,75 @@ fn unconstrained_int_literal_defaults_to_i32() {
     assert_eq!(ty, Ty::Con("i32".to_string()));
 }
 
+/// `doc/backlog.md`'s own "Complex literals" item — `4i` used to return a
+/// bare `<complex-not-yet-inferred>` placeholder, never really inferred.
+/// Fixed the same way an unsuffixed `NumberLit` already defaults (`Num` +
+/// a shape `Constraint`, a `pending_defaults` fallback) — `4i` defaults to
+/// `Complex<f64>`. `builtin_registry()` declares neither `Num` nor
+/// `Complex`, so both constraints are skipped here (same "additive,
+/// no-op if no stdlib declares it" posture `Int`/`Float` already have) —
+/// this test only proves the *defaulting* half works, independent of
+/// whether a program ever `use`s `complex`.
+#[test]
+fn a_bare_imaginary_literal_infers_as_a_complex_type() {
+    let ty = infer_src("fn f() { 4i }");
+    assert_eq!(ty, Ty::App("Complex".to_string(), vec![Ty::Con("f64".to_string())]));
+}
+
+/// A real gap, previously confirmed by direct testing (`error: type
+/// mismatch: expected \`i32\`, found \`<unresolved-call:fact>\``): a `let`-
+/// bound lambda's own name isn't visible inside its own body at all --
+/// `StmtKind::Let`'s own handling only inserts `name` into `env` *after*
+/// `infer_expr` has already finished inferring the lambda value, so a
+/// self-recursive call inside the body falls through to the same
+/// "unresolved call" placeholder an undeclared name would. Fixed the same
+/// way `infer_fn_raw` already seeds a top-level `fn`'s own self-reference:
+/// a monomorphic placeholder (classical ML `let rec` restriction -- never
+/// generalized, even though the lambda's own outer binding may be), tied
+/// back to what the body actually computed afterward.
+#[test]
+fn a_let_bound_lambda_can_call_itself_recursively() {
+    let ty = infer_src("fn f() -> i32 { let fact = fn(n) { if n <= 1 { 1 } else { n * fact(n - 1) } }; fact(5) }");
+    assert_eq!(ty, Ty::Con("i32".to_string()));
+}
+
+/// The specific edge case `infer_fn_raw`'s own doc comment already flags
+/// for a top-level `fn`'s self-reference, mirrored here: a recursive call
+/// whose own result is simply discarded (a statement, not the tail) must
+/// still correctly tie the seeded placeholder back to the body's real
+/// return type -- otherwise nothing else would ever connect them, silently
+/// leaving that one call site's own recorded node type an unresolved
+/// leftover variable instead of the concrete type the lambda actually
+/// returns. Uses explicit annotations (`n: i32`/`-> i32`) specifically so
+/// the lambda's own return type is pinned concretely regardless of
+/// generalization (an *unannotated* self-recursive lambda's own internal
+/// nodes legitimately stay open type variables once generalized -- see
+/// `a_let_bound_lambda_still_shows_a_still_open_type_variable_at_its_own_
+/// definition` in `tests/dump.rs` -- so a bare "no leftover Ty::Var
+/// anywhere" check isn't the right tool here; this checks the *specific*
+/// recursive-call node ties back to the same concrete type the lambda's
+/// own tail does).
+#[test]
+fn a_let_bound_lambdas_self_recursive_call_still_ties_back_when_its_own_result_is_discarded() {
+    let f = lower_one_fn("fn f() -> i32 { let g = fn(n: i32) -> i32 { g(n - 1); n }; g(5) }");
+    let registry = builtin_registry();
+    let mut infer = Infer::new(&registry);
+    infer.infer_fn(&f).unwrap_or_else(|e| panic!("inference failed: {e:?}"));
+    let recursive_call_ty = infer
+        .node_types
+        .values()
+        .find(|t| matches!(t, Ty::Con(s) if s == "i32"))
+        .unwrap_or_else(|| panic!("expected at least one concretely-resolved i32 node, got {:?}", infer.node_types));
+    assert_eq!(recursive_call_ty, &Ty::Con("i32".to_string()));
+    // Every node reachable from the lambda's own body must have resolved
+    // concretely -- a leftover `Ty::Var` anywhere here specifically means
+    // the tie-back didn't propagate through the explicitly-annotated
+    // (hence non-generalizable-as-open) function type.
+    for (id, ty) in &infer.node_types {
+        assert!(!matches!(ty, Ty::Var(_)), "node {id:?} left as an unresolved Ty::Var({ty}) after inference claimed success");
+    }
+}
+
 /// An array's own size slot is only ever legally a `Ty::Var` (still open,
 /// correct pre-monomorphization state) or a `Ty::Const` (already resolved
 /// to a real value) -- never a bare `Ty::Con` (a plain type name, e.g.
@@ -292,6 +361,24 @@ fn two_literals_with_conflicting_shapes_merged_by_a_shared_generic_are_rejected(
     // literals against each other directly â€” see `infer.rs`'s `NumberLit`
     // handling and `stdlib/num/num.cleave`.
     assert!(matches!(err.kind, TypeErrorKind::MissingImpl { .. }), "got: {:?}", err.kind);
+}
+
+/// `doc/backlog.md`'s own "Scheme satisfiability at generalization time"
+/// item, for a *generalized `let`-bound lambda* specifically (not just a
+/// top-level `fn` via `callgraph.rs`'s own SCC loop) — proves the fix lives
+/// inside `Infer::generalize` itself, the one place both paths share, not
+/// bolted onto just one caller. `h`'s own parameter `x` gets both an `Int`
+/// shape constraint (`x + 1`) and a `Float` one (`x + 1.0`) inside its own
+/// body — never merged with anything *outside* the lambda (unlike `1 +
+/// 2.0`'s own single-expression case above), so nothing forces a concrete
+/// choice before `h` itself gets generalized — and `h` is never called.
+#[test]
+fn a_generalized_let_bound_lambdas_own_conflicting_shape_constraints_are_rejected() {
+    let f = lower_one_fn("fn f() { let h = fn(x) { x + 1; x + 1.0 }; 0 }");
+    let registry = builtin_registry();
+    let mut infer = Infer::new(&registry);
+    let err = infer.infer_fn(&f).unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::UnsatisfiableScheme { .. }), "got: {:?}", err.kind);
 }
 
 #[test]
@@ -1411,6 +1498,44 @@ fn an_impl_declaring_its_own_generic_resolves_the_target_generic_to_a_fresh_vari
     }
 }
 
+#[test]
+fn a_generic_impls_own_generic_is_not_defaulted_away_by_a_body_literal() {
+    // Real bug, found while building `Convert<From, To>`: a bare numeric
+    // literal inside a generic impl's own body (here, `Pair`'s `b` field)
+    // that ends up unified with the impl's own generic `T` (via the
+    // struct's declared field type) used to get silently defaulted by
+    // `apply_defaults` -- collapsing the *template's* own `T` to a
+    // concrete `f32`, corrupting it for every other concrete instantiation
+    // (`monomorphize.rs`'s own `derive_impl_instantiation` could then
+    // never reverse-unify a *different* concrete call site against it
+    // again -- confirmed directly via `--dump-inference-pass`, which
+    // showed `fn widen(x: f32) -> Pair<f32>` instead of staying generic).
+    // `T` must stay a free `Ty::Var` here, exactly like the sibling test
+    // above (no body literal) already proves for `Complex<T>`.
+    let src = "algebra Widen<From, To> { fn widen(x: From) -> To; }
+        struct Pair<T> { a: T, b: T }
+        impl<T: Float> Widen<T, Pair<T>> {
+            fn widen(x) { Pair(a: x, b: 0.0) }
+        }
+        algebra Float<T> {}
+        impl Float<f64> {}";
+    let registry = registry_from(src);
+    let program = lower_program(src);
+    let (algebra, generics, target, extra_targets, f, span) = {
+        let item = program.items.into_iter().find(|item| matches!(&item.kind, ItemKind::Impl(d) if d.algebra == "Widen")).unwrap();
+        match item.kind {
+            ItemKind::Impl(d) => (d.algebra, d.generics, d.target, d.extra_targets, d.fns.into_iter().next().unwrap(), item.span),
+            other => panic!("expected impl, got {other:?}"),
+        }
+    };
+    let all_targets: Vec<Type> = std::iter::once(target).chain(extra_targets).collect();
+    let mut infer = Infer::new(&registry);
+    infer
+        .infer_impl_fn_generic_with_env(&cleave::infer::Env::new(), &algebra, &generics, &all_targets, &f, span)
+        .unwrap();
+    assert!(matches!(infer.param_types.as_slice(), [Ty::Var(_)]), "expected a fresh var, got {:?}", infer.param_types);
+}
+
 // ---------------------------------------------------------------------
 // arrays: literals, indexing, and `[T; N]` type annotations
 // ---------------------------------------------------------------------
@@ -1610,6 +1735,28 @@ fn a_structs_const_generic_is_inferred_from_the_constructed_arrays_actual_size()
 }
 
 #[test]
+fn an_algebras_own_const_generic_ties_correctly_between_its_param_and_return_type() {
+    // `doc/backlog.md`'s own "Const-generic algebra parameters" item --
+    // `infer_algebra_call`'s own hand-rolled generics mapping used to skip
+    // `GenericParam::Const` entirely, so `N` in `[T; N]` never resolved to
+    // anything the call site's own concrete argument shape actually pinned
+    // -- it fell back to a fresh, totally disconnected var instead. `f`
+    // deliberately carries no `-> ...` annotation of its own: the *only*
+    // source of truth for the result's own array size must be `echo`'s
+    // declared signature correctly tying `N` to the literal `[1, 2, 3]`'s
+    // own structurally-known size (`3`), not an outer annotation that could
+    // paper over the bug via a different unification path.
+    let ty = infer_fn_named(
+        "algebra Echo<T, const N: i32> { fn echo(x: [T; N]) -> [T; N]; }
+         impl Echo<i32> { fn echo(x) -> [i32; 3] { x } }
+         fn f() { echo([1, 2, 3]) }",
+        "f",
+    )
+    .unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(ty, Ty::Array(Box::new(Ty::Con("i32".to_string())), Box::new(Ty::Const(ConstValue::Int(3)))));
+}
+
+#[test]
 fn a_structs_const_generic_mismatch_against_the_declared_return_type_is_rejected() {
     let err = infer_fn_named(
         "struct Vec<T, const N: i32> { data: [T; N] }
@@ -1736,6 +1883,34 @@ fn non_overlapping_generic_impls_of_different_target_shapes_are_accepted() {
             fn gt(x , y) { true }
         }
         impl<T: Float> TestAlg<Quaternion<T>> {
+            fn gt(x , y) { true }
+        }";
+    let registry = registry_from(src);
+    let mut infer = Infer::new(&registry);
+    let errors = infer.check_no_overlapping_impls();
+    assert!(errors.is_empty(), "got: {errors:?}");
+}
+
+#[test]
+fn overlapping_generic_impls_with_mutually_exclusive_bounds_are_accepted() {
+    // `Box<T>` with `T: Int` and `Box<T>` with `T: Float` are shape-identical
+    // (`Box<_>`), but `Int` and `Float` share no common concrete type (`Int`
+    // satisfied only by `i32`, `Float` only by `f64`) -- no real call site
+    // could ever need to choose between them, so this is not a genuine
+    // coherence conflict, unlike the shape-only false positive it produces
+    // today.
+    let src = "algebra TestAlg<T> {
+            fn gt(x : T, y : T) -> bool;
+        }
+        struct Box<T> { value : T }
+        algebra Int<T> {}
+        impl Int<i32> {}
+        algebra Float<T> {}
+        impl Float<f64> {}
+        impl<T: Int> TestAlg<Box<T>> {
+            fn gt(x , y) { true }
+        }
+        impl<T: Float> TestAlg<Box<T>> {
             fn gt(x , y) { true }
         }";
     let registry = registry_from(src);
@@ -2158,7 +2333,7 @@ fn two_mutually_recursive_inherent_methods_infer_correctly() {
         }",
     );
     let mut infer = Infer::new(&registry);
-    let results = infer.infer_inherent_impl_block(&cleave::infer::Env::new(), &generics, &target, &fns, span);
+    let (_, results) = infer.infer_inherent_impl_block(&cleave::infer::Env::new(), &generics, &target, &fns, span);
     let is_even = results.get("is_even").unwrap().as_ref().unwrap_or_else(|e| panic!("{e:?}"));
     let is_odd = results.get("is_odd").unwrap().as_ref().unwrap_or_else(|e| panic!("{e:?}"));
     assert_eq!(is_even.1, Ty::Con("bool".to_string()));
@@ -2185,7 +2360,7 @@ fn a_single_self_recursive_method_still_works_through_infer_inherent_impl_block(
         }",
     );
     let mut infer = Infer::new(&registry);
-    let results = infer.infer_inherent_impl_block(&cleave::infer::Env::new(), &generics, &target, &fns, span);
+    let (_, results) = infer.infer_inherent_impl_block(&cleave::infer::Env::new(), &generics, &target, &fns, span);
     let countdown = results.get("countdown").unwrap().as_ref().unwrap_or_else(|e| panic!("{e:?}"));
     assert_eq!(countdown.1, Ty::Con("i32".to_string()));
 }
@@ -2283,6 +2458,74 @@ fn non_overlapping_multi_target_impls_differing_in_a_later_target_are_accepted()
     let mut infer = Infer::new(&registry);
     let errors = infer.check_no_overlapping_impls();
     assert!(errors.is_empty(), "got: {errors:?}");
+}
+
+// ---------------------------------------------------------------------
+// ambiguous algebra dispatch + turbofish disambiguation: `algebra
+// Widen<From, To>` mirrors `Convert<From, To>`'s own shape -- `To` appears
+// only in the return type, so it's never gated by `infer_algebra_call`'s
+// own readiness check (see its own doc comment on `C` in `MatMul<A,B,C>`).
+// Two impls sharing `From` but disagreeing on `To` are structurally
+// distinct *declarations* -- `check_no_overlapping_impls` never flags them,
+// since `f64` and `i64` don't unify against each other -- yet both match a
+// call site whose own `To` is still an unresolved variable.
+// ---------------------------------------------------------------------
+
+const WIDEN_SRC: &str = "algebra Widen<From, To> { fn widen(x: From) -> To; }
+    impl Widen<i32, f64> { fn widen(x) { 0.0 } }
+    impl Widen<i32, i64> { fn widen(x) { 0 } }
+    ";
+
+#[test]
+fn ambiguous_dispatch_across_two_impls_sharing_an_input_shape_is_rejected() {
+    // `x: i32` is already concrete at the call site -- exercises the
+    // *immediate* dispatch path (`infer_algebra_call`'s own `gating`
+    // considers `From` ready right away, so `dispatch_algebra_call` runs
+    // during ordinary inference, not deferred).
+    let src = format!("{WIDEN_SRC} fn f(x: i32) -> i32 {{ widen(x); 0 }}");
+    let err = infer_fn_named(&src, "f").unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::AmbiguousDispatch { .. }), "got: {:?}", err.kind);
+}
+
+#[test]
+fn turbofish_on_an_algebra_call_disambiguates_which_impl_dispatches() {
+    let src = format!("{WIDEN_SRC} fn f() -> f64 {{ widen::<i32, f64>(1) }}");
+    let ty = infer_fn_named(&src, "f").unwrap();
+    assert_eq!(ty, Ty::Con("f64".to_string()));
+}
+
+#[test]
+fn turbofish_on_an_algebra_call_requires_every_generic_not_just_the_ambiguous_one() {
+    let src = format!("{WIDEN_SRC} fn f() -> f64 {{ widen::<f64>(1) }}");
+    let err = infer_fn_named(&src, "f").unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::ArityMismatch { .. }), "got: {:?}", err.kind);
+}
+
+#[test]
+fn a_single_matching_impl_still_dispatches_without_turbofish() {
+    // Regression guard: the new ambiguity check must never fire when only
+    // one impl actually matches -- the overwhelmingly common case (`Ring`,
+    // `MatMul`, ...), already covered elsewhere, re-confirmed here against
+    // the same `Widen`-shaped algebra this section is otherwise testing.
+    let src = "algebra Widen<From, To> { fn widen(x: From) -> To; }
+        impl Widen<i32, f64> { fn widen(x) { 0.0 } }
+        fn f() -> f64 { widen(1) }";
+    let ty = infer_fn_named(src, "f").unwrap();
+    assert_eq!(ty, Ty::Con("f64".to_string()));
+}
+
+#[test]
+fn to_sugar_desugars_to_convert_and_is_ambiguity_checked_the_same_way() {
+    // `.to()` (`lower.rs`'s own postfix desugaring) reaches the exact same
+    // `AmbiguousDispatch` check as a bare `widen(x)` call above -- proves
+    // the desugaring actually produces a real `Call(convert, ...)` node,
+    // not some separate, unchecked path.
+    let src = "algebra Convert<From, To> { fn convert(x: From) -> To; }
+        impl Convert<i32, f64> { fn convert(x) { 0.0 } }
+        impl Convert<i32, i64> { fn convert(x) { 0 } }
+        fn f(x: i32) -> i32 { x.to(); 0 }";
+    let err = infer_fn_named(src, "f").unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::AmbiguousDispatch { .. }), "got: {:?}", err.kind);
 }
 
 // ---------------------------------------------------------------------

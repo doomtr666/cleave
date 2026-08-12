@@ -240,7 +240,7 @@ fn dump_inherent_impl_block(
     fallback_span: Span,
 ) {
     let mut infer = Infer::new(registry);
-    let mut results = infer.infer_inherent_impl_block(global_env, impl_generics, target, fns, fallback_span);
+    let (_, mut results) = infer.infer_inherent_impl_block(global_env, impl_generics, target, fns, fallback_span);
     for f in fns {
         match results.remove(&f.name) {
             Some(Ok((param_types, ret))) => {

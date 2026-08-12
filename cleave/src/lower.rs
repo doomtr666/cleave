@@ -562,7 +562,25 @@ impl Lowerer {
                         // never getting a `mlir::`-recognizing path segment.
                         let (args, _mlir_attrs) =
                             call_args.into_inner().next().map(|al| self.lower_arg_list(al)).unwrap_or_default();
-                        self.wrap(span, ExprKind::MethodCall(Box::new(base), name, args))
+                        // `.to()` — sugar for `convert(x)`, exactly the same
+                        // shape `fold_binary` already uses to desugar `a + b`
+                        // to `add(a, b)` — not a new `MethodCall`-dispatch
+                        // path. `ExprKind::MethodCall` resolves purely via
+                        // inherent-method lookup (`registry.inherent_method`,
+                        // see `infer.rs`'s own handling), a wholly separate
+                        // mechanism from algebra dispatch; `Convert<From,
+                        // To>`'s own `To` is an output-only generic that only
+                        // ever resolves through a real algebra-call dispatch,
+                        // so `.to()` has to reach `infer_call` the same way
+                        // any other operator does. Only the zero-argument
+                        // spelling counts — `convert`'s own declared
+                        // signature takes exactly one argument, the receiver
+                        // itself.
+                        if name == "to" && args.is_empty() {
+                            self.wrap(span, ExprKind::Call(Path::single("convert"), Vec::new(), vec![base], Vec::new()))
+                        } else {
+                            self.wrap(span, ExprKind::MethodCall(Box::new(base), name, args))
+                        }
                     }
                     None => self.wrap(span, ExprKind::FieldAccess(Box::new(base), name)),
                 }
@@ -577,6 +595,31 @@ impl Lowerer {
                     acc = self.wrap(s, ExprKind::Index(Box::new(acc), Box::new(idx)));
                 }
                 acc
+            }
+            // A direct call on whatever `base` is (`(fn(a,b){a+b})(1,2)`) --
+            // `Call`'s own callee is a bare `Path`, so this can't become a
+            // `Call` node directly; desugared instead to `{ let <synthetic>
+            // = <base>; <synthetic>(<args>) }`, reusing the *existing* let-
+            // bound-lambda pipeline wholesale (`infer.rs`'s `lambda_schemes`,
+            // `monomorphize.rs`'s lambda worklist, `cps.rs`'s closure
+            // conversion all key off this exact `StmtKind::Let` shape,
+            // whether hand-written or synthesized here). Deliberately not
+            // restricted to a literal `Lambda` base -- this file never
+            // reports a semantic diagnostic of its own (see the module's own
+            // doc comment, "checked later, not here"); a non-lambda base
+            // (e.g. a redundant `(some_path)(args)`) simply falls through to
+            // the *already-existing* "unresolved call" placeholder in
+            // `infer.rs`, since `lambda_schemes` is only ever populated for a
+            // `let` whose value is syntactically `ExprKind::Lambda`. `base.
+            // id.0` (globally unique) makes the synthetic name collision-
+            // free, and `<`/`#`/`>` can never appear in a real `ident`.
+            Rule::call_args => {
+                let (args, mlir_attrs) = first.into_inner().next().map(|al| self.lower_arg_list(al)).unwrap_or_default();
+                let base_span = base.span;
+                let synthetic = format!("<iife#{}>", base.id.0);
+                let let_stmt = self.wrap(base_span, StmtKind::Let { mutable: false, name: synthetic.clone(), ty: None, value: base });
+                let call = self.wrap(span, ExprKind::Call(Path::single(synthetic), Vec::new(), args, mlir_attrs));
+                self.wrap(span, ExprKind::Block(Block { stmts: vec![let_stmt], tail: Some(Box::new(call)) }))
             }
             r => unreachable!("postfix_op: unexpected rule {r:?}"),
         }

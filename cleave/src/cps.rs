@@ -302,11 +302,30 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                     }
                 }
             }
-            ItemKind::Impl(d) if d.generics.is_empty() => {
+            ItemKind::Impl(d)
+                if d.generics.is_empty() && !registry.generics(&d.algebra).iter().any(|g| matches!(g, GenericParam::Const { .. })) =>
+            {
                 // Non-generic algebra impl — mirrors `monomorphize.rs`'s own
                 // `dump_concrete_impl`, re-inferring directly (no template
                 // needed, it's already fully concrete) rather than reusing
                 // that function's own rendering logic.
+                //
+                // The *algebra's* own const generics are checked too, not
+                // just the impl's (`d.generics.is_empty()` alone, this
+                // guard's original condition) — an impl declaring zero
+                // generics of its own (`impl Sum<i32> { ... }`) can still
+                // inherit a free variable from the algebra's own const
+                // generic (`algebra Sum<T, const N: i32> { fn total(x: [T;
+                // N]) -> T; }` — `N` is never fixed by which impl matched,
+                // only by the call site), found by direct testing: without
+                // this, `infer_impl_fn_generic_with_env` below re-infers the
+                // method in isolation, with no call site to pin `N` down,
+                // leaving it a permanently unresolved var that later panics
+                // in `mlir_lower.rs` — the *correct*, fully-substituted
+                // specialization already exists in `mono`, built by
+                // `monomorphize.rs`'s own `impl_worklist` (see `ImplTemplate::
+                // is_generic`'s own doc comment for the identical fix there),
+                // simply never reached because this branch matched first.
                 let all_targets: Vec<Type> =
                     std::iter::once(d.target.clone()).chain(d.extra_targets.iter().cloned()).collect();
                 for f in &d.fns {
@@ -395,7 +414,7 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                 let TypeKind::Path(p, _) = &d.target.kind else { continue };
                 let struct_name = p.segments.join("::");
                 let mut infer = Infer::new(registry);
-                let results = infer.infer_inherent_impl_block(&program_inference.global_env, &d.generics, &d.target, &d.fns, item.span);
+                let (_, results) = infer.infer_inherent_impl_block(&program_inference.global_env, &d.generics, &d.target, &d.fns, item.span);
                 for f in &d.fns {
                     let Some(Ok((param_types, result))) = results.get(&f.name) else { continue }; // already reported via --dump-inference-pass
                     // A bodyless inherent method has no `#[mlir(...)]`/
@@ -1163,10 +1182,22 @@ fn convert_stmts(stmts: &[Stmt], env: CEnv, ctx: &Ctx, k: &dyn Fn(CEnv) -> CExpr
 
 fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> CExpr) -> CExpr {
     match &expr.kind {
+        // A plain numeric literal widened to `Complex<T>` (`4 + 2i`, `4`'s
+        // own side — see `infer.rs`'s `check_pending_constraints`'s own
+        // `Complex`-widening special case) — real = the literal's own
+        // value, imag = `0`, both materialized at `T`'s own concrete width.
+        ExprKind::NumberLit { text, .. } if matches!(&ctx.node_types[&expr.id], Ty::App(name, _) if name == "Complex") => {
+            complex_literal(ctx, expr, text, "0", env, k)
+        }
         ExprKind::NumberLit { text, .. } => {
             let ty = &ctx.node_types[&expr.id];
             k(parse_number(text, ty), env)
         }
+        // `doc/backlog.md`'s own "Complex literals" item — `4i`'s own
+        // resolved type is always `Complex<T>` (`infer.rs`'s own
+        // `ImaginaryLit` handling never defaults anywhere else) — real =
+        // `0`, imag = the literal's own value.
+        ExprKind::ImaginaryLit { text, .. } => complex_literal(ctx, expr, "0", text, env, k),
         ExprKind::BoolLit(b) => k(CVal::Bool(*b), env),
         ExprKind::Path(p) => {
             let name = p.segments.join("::");
@@ -1326,7 +1357,29 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
             }
             convert_expr_list(&arg_refs, env, ctx, &|arg_vals, env| {
                 let callee = resolve_call(&name, expr, args, ctx);
-                emit_call(callee, arg_vals, result_ty.clone(), ctx, env, k)
+                // A *self*-recursive call to a captured lambda's own unit,
+                // from inside that same unit's own body, is the only way a
+                // call resolving to a `<lambda#...>` unit ever reaches this
+                // plain fallback instead of the `env.get(&name) == Closure`
+                // fast path above (Stage A) — an ordinary reference to a
+                // captured lambda is always caught there first, via a real
+                // `CVal::Closure` bound by its own enclosing `let`. A self-
+                // reference inside the lambda's own separately-converted
+                // unit never gets that binding (its own unit starts a fresh
+                // `env`) — but it needs the *same* captures this very unit
+                // was itself called with, already sitting in `env` under
+                // their own original names (this unit's own leading
+                // `capture_count` params — see `convert_program`'s setup).
+                let mut full_args = Vec::new();
+                if let Some(unit) = ctx.units.get(callee) {
+                    for p in &unit.params[..unit.capture_count] {
+                        full_args.push(env.get(&p.name).cloned().unwrap_or_else(|| {
+                            panic!("CPS: self-recursive call to `{name}` needs its own capture `{}`, unexpectedly unbound", p.name)
+                        }));
+                    }
+                }
+                full_args.extend(arg_vals);
+                emit_call(callee, full_args, result_ty.clone(), ctx, env, k)
             })
         }
         ExprKind::If { cond, then_branch, else_branch } => convert_expr(cond, env, ctx, &|cond_val, env| {
@@ -1591,6 +1644,16 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                 emit_call(callee, arg_vals, result_ty.clone(), ctx, env, k)
             })
         }
+        // A standalone block-as-expression (`{ let y = 1; y + 1 }`, reached
+        // via `primary`'s own `block` alternative -- or synthesized by
+        // `lower.rs`'s own direct-lambda-literal-call desugaring) — was
+        // simply never given an arm here before, unlike `if`/`while`/`for`/
+        // lambda bodies, which each already call `convert_block` directly
+        // off their own dedicated `Block` field. `convert_block` needs
+        // nothing new: it already threads its own cloned `env` through the
+        // block's own statements and hands the tail's value to `k`, exactly
+        // the shape a bare expression position needs.
+        ExprKind::Block(b) => convert_block(b, env, ctx, k),
         other => panic!("CPS doesn't support {other:?} yet -- see doc/backlog.md"),
     }
 }
@@ -1996,6 +2059,33 @@ fn resolve_method_call<'a>(struct_name: &str, method: &str, call: &Expr, ctx: &C
 /// decides the same question) whenever `node_types` hasn't actually pinned a
 /// concrete numeric type here — the concrete-type path stays primary since it
 /// alone accounts for an explicit `:f64`-style suffix on integer-shaped text.
+/// Materializes a `NumberLit`/`ImaginaryLit` that resolved to `Complex<T>`
+/// as a real `PrimOp::Struct` construction — the exact same mechanism
+/// `ExprKind::StructLit` already uses, since a `Complex<T>` value has no
+/// representation of its own beyond the ordinary heap-allocated struct
+/// `stdlib/complex/complex.cleave` declares. `real_text`/`imag_text` are
+/// each parsed at `T`'s own concrete width (`elem_ty`) — a plain literal
+/// widened to `Complex` passes its own text as `real_text` with `imag_text
+/// = "0"`; a bare `4i` does the reverse.
+fn complex_literal(ctx: &Ctx, expr: &Expr, real_text: &str, imag_text: &str, env: &CEnv, k: &dyn Fn(CVal, &CEnv) -> CExpr) -> CExpr {
+    let ty = ctx.node_types[&expr.id].clone();
+    let Ty::App(name, elem_tys) = &ty else {
+        panic!("CPS: a Complex-widened literal's own resolved type must be Complex<T>, got {ty}")
+    };
+    debug_assert_eq!(name, "Complex");
+    let elem_ty = &elem_tys[0];
+    let real = parse_number(real_text, elem_ty);
+    let imag = parse_number(imag_text, elem_ty);
+    let var = ctx.fresh.var();
+    CExpr::LetPrim {
+        var,
+        ty,
+        op: PrimOp::Struct("Complex".to_string(), vec!["real".to_string(), "imag".to_string()]),
+        args: vec![real, imag],
+        cont: Box::new(k(CVal::Var(var), env)),
+    }
+}
+
 fn parse_number(text: &str, ty: &Ty) -> CVal {
     let is_float = match ty {
         Ty::Var(_) => text.contains('.') || text.contains('e') || text.contains('E'),

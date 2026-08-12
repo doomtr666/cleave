@@ -1,0 +1,28 @@
+// `doc/backlog.md`'s "Explicit conversion between numeric types" item.
+// `stdlib/convert/convert.cleave` ships `i32 -> f64` and `f32 -> f64`
+// (dependency-free, like `stdlib/num`). A user program extends `Convert`
+// with its own impls exactly like any other algebra -- here, `f64 ->
+// Complex<f64>` (ℝ ⊂ ℂ), proving the mechanism is genuinely open, not a
+// closed set baked into the compiler.
+use convert;
+use complex;
+use io;
+
+impl Convert<f64, Complex<f64>> {
+    fn convert(x) { Complex(real: x, imag: 0.0) }
+}
+
+fn main() -> i32 {
+    let n: i32 = 3;
+    let f: f64 = n.to();
+    print(f);
+
+    let g: f64 = 4.to();
+    print(g);
+
+    let z: Complex<f64> = f.to();
+    print(z.real);
+    print(z.imag);
+
+    0
+}

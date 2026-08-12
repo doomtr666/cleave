@@ -1,0 +1,44 @@
+// `doc/backlog.md`'s "Explicit conversion between numeric types" item.
+// `i32`/`f64`/`Complex` don't relate to each other as a subset/superset
+// hierarchy the way ℕ ⊂ ℤ ⊂ ℝ ⊂ ℂ do in math -- nothing in the language lets
+// one type widen into another. `Convert<From, To>` is an ordinary,
+// two-target `algebra` (structurally identical to `MatMul<A, B, C>`, `To`
+// an output-only generic never appearing in any parameter, resolved purely
+// by a successful dispatch match) -- no new compiler mechanism needed for
+// the algebra itself. `x.to()` (`lower.rs`'s own postfix-desugaring, same
+// mechanism `a + b` already uses for `add(a, b)`) is sugar for `convert(x)`.
+//
+// Deliberately explicit-only (Rust `From`/`Into`-style), never implicit
+// (C#-style implicit conversion was considered and rejected -- this
+// project's own posture, applied everywhere else, is that nothing is
+// guessed or silently inserted, always checked).
+//
+// Deliberately dependency-free, like `stdlib/num` -- `driver.rs`'s own
+// `compile` doc comment: crate `use` resolution is "deliberately one level
+// deep only," a loaded crate's own `use` statements are never themselves
+// followed. A `Convert<f64, Complex<f64>>` impl belongs here just as
+// naturally, but would force *every* `use convert;` program to also
+// explicitly `use complex;` even to reach the unrelated `f32 -> f64` impl
+// below (confirmed directly: `unknown struct Complex`, reported against
+// this file itself, the moment such an impl was added). A user program
+// wanting that conversion declares its own impl instead (see
+// `examples/convert.cleave`) -- an ordinary extension, not a workaround;
+// matches this project's own posture that new numeric relationships are
+// added via real `algebra`/`impl` declarations, never hardcoded into the
+// compiler.
+//
+// `use convert;` explicitly -- not prelude (matches `io`/`complex`'s own
+// precedent, not `num`'s): a program that never calls `.to()`/`convert(...)`
+// sees zero change.
+
+algebra Convert<From, To> {
+    fn convert(x: From) -> To;
+}
+
+impl Convert<i32, f64> {
+    fn convert(x) { mlir::arith::sitofp(x) }
+}
+
+impl Convert<f32, f64> {
+    fn convert(x) { mlir::arith::extf(x) }
+}

@@ -15,7 +15,7 @@
 
 use crate::ast::*;
 use crate::print::{fmt_generics, fmt_type};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Default)]
 pub struct Registry {
@@ -362,6 +362,55 @@ impl Registry {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Every concrete type name known to satisfy `algebra` — direct impls,
+    /// plus every type reachable transitively through `algebras_bounded_by`
+    /// (the same bound-inheritance relationship `Infer::has_matching_impl`
+    /// already walks for a *single* type probe, here built as a set instead
+    /// — needed so `Infer::generalize`'s own scheme-satisfiability check can
+    /// intersect two algebras' own candidate sets directly). `Num` itself
+    /// has zero *direct* impls anywhere (`stdlib/num/num.cleave`'s own
+    /// comment: every concrete numeric type reaches it only through `Int`/
+    /// `Float`'s own bound) — without the recursive half here, every
+    /// `Num`-constrained variable would come back with an empty candidate
+    /// set and look falsely unsatisfiable.
+    ///
+    /// Deliberately narrow, matching `has_matching_impl`'s own documented
+    /// gaps: only a non-generic, single-target, bare (no generic arguments
+    /// of its own) impl counts — a generic impl (`impl<T> Ring<Complex<T>>`)
+    /// contributes no *one* fixed concrete name, and an algebra satisfied
+    /// only via its own *forward*-aggregate bounds (two or more bounds,
+    /// neither individually implemented — see `has_matching_impl`'s own
+    /// "forward aggregate" case) isn't attempted here either — not needed
+    /// for `Int`/`Float`/`Num`, the only shapes that exist today.
+    pub fn candidates_for(&self, algebra: &str) -> HashSet<String> {
+        self.candidates_for_inner(algebra, &mut HashSet::new())
+    }
+
+    /// `visited` guards against a cyclic bound declaration (`algebra A : B`,
+    /// `algebra B : A`) looping forever — same reasoning, same shape, as
+    /// `Infer::has_matching_impl_inherited`'s own identical guard.
+    fn candidates_for_inner<'a>(&'a self, algebra: &'a str, visited: &mut HashSet<&'a str>) -> HashSet<String> {
+        let mut out = HashSet::new();
+        if !visited.insert(algebra) {
+            return out;
+        }
+        for (generics, targets) in self.all_impls(algebra) {
+            let [target] = targets.as_slice() else { continue };
+            if !generics.is_empty() {
+                continue;
+            }
+            if let TypeKind::Path(path, args) = &target.kind {
+                if args.is_empty() {
+                    out.insert(path.segments.join("::"));
+                }
+            }
+        }
+        for other in self.algebras_bounded_by(algebra) {
+            out.extend(self.candidates_for_inner(other, visited));
+        }
+        out
     }
 
     /// Like `all_impls`, but also hands back each impl's own declared `fn`s
