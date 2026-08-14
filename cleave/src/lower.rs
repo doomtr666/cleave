@@ -586,15 +586,19 @@ impl Lowerer {
                 }
             }
             Rule::expr => {
-                // one or more comma-separated indices — fold left, `a[i,j]` => `a[i][j]`
-                let mut indices = vec![self.lower_expr(first)];
-                indices.extend(inner.map(|p| self.lower_expr(p)));
-                let mut acc = base;
-                for idx in indices {
-                    let s = self.join(acc.span, idx.span);
-                    acc = self.wrap(s, ExprKind::Index(Box::new(acc), Box::new(idx)));
-                }
-                acc
+                // One or more comma-separated indices, collected directly
+                // into one `Index` node — *not* folded into nested single-
+                // index nodes (an earlier version of this did, `a[i,j]` =>
+                // `a[i][j]`): a real array still gets the identical
+                // semantics either way (`infer.rs` peels one dimension per
+                // index), but a `#[mlir_type(...)]`-tagged struct needs the
+                // whole group intact to dispatch one real multi-index
+                // `Index<Container,Elem,K>` call — seeing `m[i,j]` as two
+                // separate single-index steps has nothing sensible to
+                // dispatch the first step to (see `ast.rs`'s own `Index`
+                // doc comment).
+                let indices: Vec<Expr> = std::iter::once(self.lower_expr(first)).chain(inner.map(|p| self.lower_expr(p))).collect();
+                self.wrap(span, ExprKind::Index(Box::new(base), indices))
             }
             // A direct call on whatever `base` is (`(fn(a,b){a+b})(1,2)`) --
             // `Call`'s own callee is a bare `Path`, so this can't become a

@@ -32,6 +32,20 @@ algebra Float<T> : Num {}
 #[mlir_type(i16)] impl Int<i16> {}
 #[mlir_type(i32)] impl Int<i32> {}
 #[mlir_type(i64)] impl Int<i64> {}
+// MLIR's own `index` type — an opaque, target-word-sized integer, the type
+// every `memref`/`tensor` indexing op (`memref.load`, `tensor.extract`, ...)
+// actually requires its own index *operands* to carry (a plain `i32` is
+// rejected by the verifier) — `mlir_lower.rs`'s own array-indexing lowering
+// already builds this conversion itself, internally (`to_index`, `arith.
+// index_cast`), invisible to cleave source; a `#[mlir_type(...)]`-backed
+// struct whose own operators are written directly in cleave source (`v[i]`
+// through a real `Index<Container,Elem>` algebra impl, `stdlib/vector/
+// vector.cleave`) needs to build that exact same conversion itself, so it
+// needs a real cleave-level name for the destination type — no arithmetic
+// of its own needed on it directly, `Int`'s own marker relationship (no
+// required methods, matching `Num`'s identical "pure marker" shape above)
+// is all a bare handle like this needs.
+#[mlir_type(index)] impl Int<index> {}
 
 #[mlir_type(f32)] impl Float<f32> {}
 #[mlir_type(f64)] impl Float<f64> {}

@@ -295,9 +295,20 @@ pub enum ExprKind {
     Call(Path, Vec<GenericArg>, Vec<Expr>, Vec<(String, String)>),
     FieldAccess(Box<Expr>, String),
     MethodCall(Box<Expr>, String, Vec<Expr>),
-    /// Multi-index sugar (`a[i, j]`) is already flattened into nested `Index`
-    /// nodes by `lower.rs`, same principle as `TypeKind::Array` above.
-    Index(Box<Expr>, Box<Expr>),
+    /// One bracket group, `a[i]` or the Fortran-style multi-index sugar
+    /// `a[i, j, ...]` — every comma-separated index collected directly into
+    /// this one node, never flattened into nested `Index` nodes the way an
+    /// earlier version of this type did. `a[i][j]` (two *separate* bracket
+    /// pairs) still produces two nested `Index` nodes, one index each — for
+    /// a real array the two spellings stay semantically equivalent (`infer.
+    /// rs` peels one dimension per index regardless of how many arrive in
+    /// one node), but for a `#[mlir_type(...)]`-tagged struct they are not:
+    /// only `a[i,j]` (one node, `indices.len() == 2`) can dispatch a real
+    /// two-index `Index<Container,Elem,K>` impl — see `infer.rs`'s own
+    /// `ExprKind::Index` doc comment for why a tagged value has no
+    /// meaningful single-step "row" the way an array's own partial index
+    /// does.
+    Index(Box<Expr>, Vec<Expr>),
     ArrayLit(Vec<Expr>),
     /// `[value; N]` where `N` names a const generic of the enclosing fn/impl
     /// rather than a literal (the literal case eagerly desugars to `ArrayLit`

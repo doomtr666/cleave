@@ -52,7 +52,7 @@ fn main() {
     print(z6.magnitude_sq());
     
     let z7 = 5.0 + 7.5i;
-    
-    
+    print(z7.magnitude());
+
     0
 }

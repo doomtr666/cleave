@@ -1,44 +1,21 @@
-struct Matrix<T: Float, const R: i32, const C: i32> {
-    values: [T; R, C]
-}
+use vector;
 
-// `+`/`*` on scalars resolve against the real stdlib `Ring`
-// (`stdlib/num/num.cleave`, always in the prelude) — no local algebra
-// declared here, and deliberately *not* named `mul`: `algebras_with_fn`
-// picks a candidate by name+arity alone, with no shape disambiguation at
-// that stage (see `infer_call`, `registry.rs`'s `algebras_with_fn`) — a
-// second algebra also declaring a 2-arg `mul` would make *every* `*` in the
-// program ambiguous, including a genuinely scalar one. No qualified-call
-// syntax exists yet to disambiguate (`doc/backlog.md`, item 17), so matrix
-// multiplication is an ordinary named method, `matmul`, called directly —
-// not wired to the `*` operator.
-algebra MatMul<A, B, C> {
-    fn matmul(a: A, b: B) -> C;
-}
-
-impl<T: Float, const N: i32, const M: i32, const K: i32>
-    MatMul<Matrix<T,N,M>, Matrix<T,M,K>, Matrix<T,N,K>> {
-    fn matmul(a, b) {
-        let mut result = Matrix(values: [[0.0; K]; N]);
-        for i in 0..N {
-            for j in 0..K {
-                let mut sum = 0.0;
-                for k in 0..M {
-                    sum = sum + a.values[i,k] * b.values[k,j];
-                };
-                result.values[i,j] = sum;
-            };
-        };
-        result
-    }
-}
-
+// `doc/backlog.md`'s own "an ordinary stdlib struct, native MLIR tensor
+// under the hood" item — matmul as a single, structural `linalg.matmul`
+// node, not a hand-written triple-nested loop: the flagship example
+// `doc/hld.md`'s own "don't lower prematurely" thesis is built around
+// (reordering `matmul(matmul(a,b),c)` for FLOP count needs the operation
+// to survive as one recognizable node, never possible once buried in
+// scalar ops). `Matrix<T,R,C>` and `MatMul` both now live in
+// `stdlib/vector/vector.cleave` alongside `Vector`/`Tensor` — general-
+// purpose linear algebra, not specific to this example — so this file is
+// just `use vector;` plus the example's own numbers.
 fn main() {
-    let ma = Matrix::<f32,2,3>(values: [
+    let ma = Matrix(data: [
         [1.0, 2.0, 3.0],
         [4.0, 5.0, 6.0]
     ]);
-    let mb = Matrix::<f32,3,2>(values: [
+    let mb = Matrix(data: [
         [7.0, 8.0],
         [9.0, 10.0],
         [11.0, 12.0]

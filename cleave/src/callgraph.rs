@@ -364,7 +364,18 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
         // reported against every member whose own body-inference otherwise
         // succeeded (a raw-inference failure is already more specific and is
         // left alone).
-        if let Err(e) = infer.check_pending_constraints() {
+        if let Err(e) = infer.check_pending_constraints_and_indices() {
+            for name in group {
+                if let Some(r @ Ok(_)) = raw_results.get_mut(name) {
+                    *r = Err(e.clone());
+                }
+            }
+        }
+        // Same "resolve now that defaulting has run, attribute a failure to
+        // the whole group" posture as `check_pending_constraints` just
+        // above — see `Infer::finish_fn`'s identical pairing for the
+        // single-function path.
+        if let Err(e) = infer.check_pending_field_accesses().and_then(|()| infer.check_pending_method_calls()) {
             for name in group {
                 if let Some(r @ Ok(_)) = raw_results.get_mut(name) {
                     *r = Err(e.clone());
@@ -500,9 +511,9 @@ fn collect_calls_expr(expr: &Expr, known: &HashSet<&str>, out: &mut Vec<String>)
                 collect_calls_expr(a, known, out);
             }
         }
-        ExprKind::Index(b, i) => {
+        ExprKind::Index(b, indices) => {
             collect_calls_expr(b, known, out);
-            collect_calls_expr(i, known, out);
+            indices.iter().for_each(|i| collect_calls_expr(i, known, out));
         }
         ExprKind::ArrayLit(elems) => {
             for e in elems {

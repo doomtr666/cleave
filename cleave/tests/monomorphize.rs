@@ -103,6 +103,10 @@ fn assert_fully_concrete(ty: &Ty) {
                 walk(elem, path);
                 walk(size, path);
             }
+            Ty::ConstExpr(_, a, b) => {
+                walk(a, path);
+                walk(b, path);
+            }
         }
     }
     walk(ty, "<top>");

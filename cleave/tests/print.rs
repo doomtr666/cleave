@@ -55,9 +55,12 @@ fn prints_multidim_array_type_as_nested() {
 }
 
 #[test]
-fn prints_multi_index_as_nested() {
+fn prints_a_multi_index_bracket_group_directly() {
+    // `a[i,j]` is now one `Index` node carrying both indices directly (see
+    // `ast.rs::ExprKind::Index`'s own doc comment) -- printed back out the
+    // same shape, not re-nested into `a[i][j]`.
     let out = print_src("fn f(a, i, j) { a[i, j] }");
-    assert!(out.contains("a[i][j]"), "got:\n{out}");
+    assert!(out.contains("a[i, j]"), "got:\n{out}");
 }
 
 #[test]

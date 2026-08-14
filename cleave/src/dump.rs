@@ -137,6 +137,7 @@ pub(crate) fn fmt_ty_named(ty: &Ty, names: &mut TyVarNames) -> String {
         }
         Ty::Array(elem, size) => format!("[{}; {}]", fmt_ty_named(elem, names), fmt_ty_named(size, names)),
         Ty::Const(n) => n.to_string(),
+        Ty::ConstExpr(op, a, b) => format!("{op}({}, {})", fmt_ty_named(a, names), fmt_ty_named(b, names)),
     }
 }
 
@@ -355,12 +356,8 @@ fn fmt_expr_typed(e: &Expr, node_types: &NodeTypes, names: &mut TyVarNames, call
                 fmt_expr_list_typed(args, node_types, names, call_names)
             )
         }
-        ExprKind::Index(base, idx) => {
-            format!(
-                "{}[{}]",
-                fmt_expr_typed(base, node_types, names, call_names),
-                fmt_expr_typed(idx, node_types, names, call_names)
-            )
+        ExprKind::Index(base, indices) => {
+            format!("{}[{}]", fmt_expr_typed(base, node_types, names, call_names), fmt_expr_list_typed(indices, node_types, names, call_names))
         }
         ExprKind::ArrayLit(elems) => format!("[{}]", fmt_expr_list_typed(elems, node_types, names, call_names)),
         ExprKind::ArrayRepeat { value, count } => format!(

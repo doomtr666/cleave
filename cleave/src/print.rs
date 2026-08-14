@@ -252,7 +252,9 @@ pub(crate) fn fmt_expr(e: &Expr) -> String {
         ExprKind::MethodCall(base, name, args) => {
             format!("{}.{name}({})", fmt_expr(base), args.iter().map(fmt_expr).collect::<Vec<_>>().join(", "))
         }
-        ExprKind::Index(base, idx) => format!("{}[{}]", fmt_expr(base), fmt_expr(idx)),
+        ExprKind::Index(base, indices) => {
+            format!("{}[{}]", fmt_expr(base), indices.iter().map(fmt_expr).collect::<Vec<_>>().join(", "))
+        }
         ExprKind::ArrayLit(elems) => format!("[{}]", elems.iter().map(fmt_expr).collect::<Vec<_>>().join(", ")),
         ExprKind::ArrayRepeat { value, count } => format!("[{}; {}]", fmt_expr(value), fmt_expr(count)),
         ExprKind::StructLit(path, generics, fields) => format!(

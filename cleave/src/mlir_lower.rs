@@ -48,7 +48,7 @@ use melior::{
         attribute::{DenseI32ArrayAttribute, FlatSymbolRefAttribute, FloatAttribute, IntegerAttribute, StringAttribute, TypeAttribute},
         block::BlockLike,
         operation::OperationBuilder,
-        r#type::{FunctionType, IntegerType, MemRefType, ShapedTypeLike},
+        r#type::{FunctionType, IntegerType, MemRefType, RankedTensorType, ShapedTypeLike},
     },
 };
 use std::cell::RefCell;
@@ -126,12 +126,22 @@ pub fn lower_program<'c>(
 /// than guessing.
 fn ty_to_mlir<'c>(ctx: &LowerCtx<'c, '_>, ty: &Ty) -> Type<'c> {
     match ty {
+        // A struct tagged `#[mlir_type(tensor)]`/`#[mlir_type(vector)]` —
+        // checked *before* the ordinary primitive-width lookup just below
+        // (whose own `Type::parse` would choke on the bare keyword
+        // "tensor"/"vector", not a real, complete type text on its own) and
+        // before the generic struct-is-an-opaque-pointer fallback. See
+        // `tagged_struct_native_type`'s own doc comment for the full design.
+        Ty::Con(name) | Ty::App(name, _) if native_shape_keyword(ctx, name).is_some() => {
+            tagged_struct_native_type(ctx, ty)
+        }
         Ty::Con(name) if name == "bool" || ctx.mlir_types.contains_key(name) => width_ty(ctx, name),
-        // A `Ty::Con`/`Ty::App` that *isn't* a declared primitive is a
-        // struct — non-generic (`Ty::Con("Vec2")`) or generic-and-
-        // instantiated (`Ty::App("Complex", [Con("f32")])`). A struct value
-        // is always an opaque `!llvm.ptr` — see `struct_llvm_type`'s own
-        // doc comment for why (reference, not value, semantics).
+        // A `Ty::Con`/`Ty::App` that *isn't* a declared primitive (and isn't
+        // shape-tagged, handled above) is an ordinary struct — non-generic
+        // (`Ty::Con("Vec2")`) or generic-and-instantiated (`Ty::App(
+        // "Complex", [Con("f32")])`). A struct value is always an opaque
+        // `!llvm.ptr` — see `struct_llvm_type`'s own doc comment for why
+        // (reference, not value, semantics).
         Ty::Con(_) | Ty::App(..) => llvm::r#type::pointer(ctx.context, 0),
         // Two representations, picked by the array's own *leaf* element
         // type — see `array_leaf_is_struct`'s own doc comment for why: a
@@ -160,6 +170,18 @@ fn ty_to_mlir<'c>(ctx: &LowerCtx<'c, '_>, ty: &Ty) -> Type<'c> {
         // unconstrained integer literal.
         Ty::Const(ConstValue::Int(_)) => width_ty(ctx, "i32"),
         Ty::Const(ConstValue::Bool(_)) => width_ty(ctx, "bool"),
+        // Should never actually be reached: a `Ty::ConstExpr` (`doc/
+        // backlog.md`'s own "Deferred/symbolic constant folding" item) only
+        // stays unresolved while its own operands do — by the time
+        // monomorphization has produced a real, concrete specialization for
+        // codegen to lower at all, `substitute` has already folded it into a
+        // plain `Ty::Const` (see that function's own doc comment). A
+        // dedicated panic message here, rather than falling into the
+        // generic one below, points straight at the real cause if this
+        // invariant is ever violated.
+        Ty::ConstExpr(..) => {
+            panic!("MLIR lowering: unresolved deferred const expression `{ty}` reached codegen — should have been folded by `substitute` during monomorphization")
+        }
         _ => panic!("MLIR lowering doesn't support type `{ty}` yet (only primitive Ty::Con widths, arrays, and structs so far)"),
     }
 }
@@ -202,6 +224,58 @@ fn flatten_array_dims(ty: &Ty) -> (Vec<i64>, &Ty) {
 
 fn is_array_ty(ty: &Ty) -> bool {
     matches!(ty, Ty::Array(..))
+}
+
+/// `#[mlir_type(...)]`'s own generalization beyond a bare primitive: the
+/// literal keyword `tensor`/`vector` (never itself a complete, parseable
+/// MLIR type — that's exactly what makes it safe to distinguish from an
+/// ordinary primitive's own real type text, e.g. `#[mlir_type(f32)]`'s
+/// `"f32"`) marks a struct whose own sole field — always an array — *is*
+/// its real representation, structurally derived, not templated. See
+/// `tagged_struct_native_type`'s own doc comment for the full mechanism.
+fn native_shape_keyword<'a>(ctx: &'a LowerCtx<'_, '_>, name: &str) -> Option<&'a str> {
+    match ctx.mlir_types.get(name).map(String::as_str) {
+        s @ (Some("tensor") | Some("vector")) => s,
+        _ => None,
+    }
+}
+
+/// A struct tagged `#[mlir_type(tensor)]`/`#[mlir_type(vector)]`
+/// (`stdlib/vector/vector.cleave`'s own `Vector<T,N>`/`Matrix<T,R,C>`) —
+/// unlike every other struct (`struct_llvm_type`'s own "stable reference,
+/// mutated in place" doc comment), this one's real MLIR representation is a
+/// native shaped-type SSA *value*, never a heap-allocated opaque pointer.
+/// No template string/placeholder substitution needed to know its own
+/// shape: the struct's sole field (enforced here — exactly one field,
+/// itself array-typed) already carries its own dims/leaf element type,
+/// fully understood structurally via the *same* `flatten_array_dims` an
+/// ordinary standalone array already uses — `#[mlir_type(...)]` stays
+/// exactly as simple a mechanism as it always was (a bare keyword, no text
+/// to parse or substitute into), just consulted differently for this one
+/// case. This is the real fix for the "closing the loop" gap `Ty::Vector`
+/// (a hardcoded new `Ty` variant, touching every exhaustive match in
+/// `infer.rs`) used to paper over: `Vector`/`Matrix` are ordinary generic
+/// structs, declared entirely in stdlib source, `infer.rs` never needs to
+/// know they're anything special at all.
+fn tagged_struct_native_type<'c>(ctx: &LowerCtx<'c, '_>, ty: &Ty) -> Type<'c> {
+    let (name, type_args) = struct_name_and_args(ty);
+    let keyword = native_shape_keyword(ctx, name)
+        .unwrap_or_else(|| panic!("MLIR lowering: `{name}` has no recognized #[mlir_type(...)] shape keyword"));
+    let fields = struct_field_types(ctx, name, type_args);
+    let [(_, field_ty)] = fields.as_slice() else {
+        panic!(
+            "MLIR lowering: `#[mlir_type({keyword})]` requires exactly one field, `{name}` has {}",
+            fields.len()
+        );
+    };
+    if !matches!(field_ty, Ty::Array(..)) {
+        panic!("MLIR lowering: `#[mlir_type({keyword})]`'s sole field must be an array, `{name}`'s own field is `{field_ty}`");
+    }
+    let (dims, leaf_ty) = flatten_array_dims(field_ty);
+    let leaf = ty_to_mlir(ctx, leaf_ty);
+    let dims_text = dims.iter().map(|d| format!("{d}x")).collect::<String>();
+    Type::parse(ctx.context, &format!("{keyword}<{dims_text}{leaf}>"))
+        .unwrap_or_else(|| panic!("MLIR lowering: failed to parse `{keyword}<{dims_text}{leaf}>`"))
 }
 
 fn is_unit_ty(ty: &Ty) -> bool {
@@ -909,7 +983,13 @@ fn lower_prim_op<'c>(
             lower_array_store(ctx, block, env, array_ty, args);
             None
         }
-        PrimOp::Struct(_, field_names) => Some(lower_struct_construct(ctx, block, env, ty, field_names, args)),
+        PrimOp::Struct(name, field_names) => {
+            if native_shape_keyword(ctx, name).is_some() {
+                Some(lower_tagged_struct_construct(ctx, block, env, ty, args))
+            } else {
+                Some(lower_struct_construct(ctx, block, env, ty, field_names, args))
+            }
+        }
         PrimOp::Field { struct_ty, field } => Some(lower_field_access(ctx, block, env, struct_ty, field, args)),
         PrimOp::FieldStore { struct_ty, field } => {
             lower_field_store(ctx, block, env, struct_ty, field, args);
@@ -1165,6 +1245,91 @@ fn lower_struct_construct<'c>(
         store_field(ctx, block, env, field_ty, field_ptr, arg);
     }
     ptr
+}
+
+/// `PrimOp::Struct` construction for a `#[mlir_type(tensor)]`/`#[mlir_type(
+/// vector)]`-tagged struct (`native_shape_keyword`/`tagged_struct_native_
+/// type`'s own doc comment has the full design) — a genuinely different
+/// path from `lower_struct_construct`, not a variant of it: there's no
+/// `!llvm.struct` allocation at all, the result is a bare native SSA value.
+/// The struct's own sole field (already checked array-typed by `tagged_
+/// struct_native_type`) is constructed exactly like any other standalone
+/// array (`lower_array_construct`, unchanged, already ran to produce
+/// `args`' own single already-lowered `memref` value) — this function's
+/// only job is reading every one of its scalar elements back out
+/// (`flatten_memref_elements`, row-major, the read-side mirror of `copy_
+/// nested_array`'s own write-side walk) and collecting them into one
+/// `{keyword}.from_elements`. Deliberately not optimized to skip the
+/// memref round-trip even when the field's own value expression is
+/// syntactically a literal — "let MLIR have fun with the optimization"
+/// was an explicit, deliberate call: this stays one uniform path
+/// regardless of where the array value came from (a literal, a computed
+/// expression, a variable), rather than special-casing the literal shape
+/// the way `Vector`'s own now-removed reserved-call mechanism used to.
+fn lower_tagged_struct_construct<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    ty: &Ty,
+    args: &[CVal],
+) -> Value<'c, 'c> {
+    let (name, type_args) = struct_name_and_args(ty);
+    let keyword = native_shape_keyword(ctx, name)
+        .unwrap_or_else(|| panic!("MLIR lowering: `{name}` has no recognized #[mlir_type(...)] shape keyword"));
+    let fields = struct_field_types(ctx, name, type_args);
+    let [(_, field_ty)] = fields.as_slice() else {
+        panic!("MLIR lowering: `#[mlir_type({keyword})]` requires exactly one field, `{name}` has {}", fields.len());
+    };
+    let [field_arg] = args else {
+        panic!("MLIR lowering: `{name}` construction expects exactly one argument (its own sole field), got {}", args.len());
+    };
+    let src = lower_nested_array_arg(env, field_arg);
+    let (dims, _leaf_ty) = flatten_array_dims(field_ty);
+    let mut elems = Vec::new();
+    flatten_memref_elements(ctx, block, src, &dims, &mut elems);
+    let native_ty = ty_to_mlir(ctx, ty);
+    let location = Location::unknown(ctx.context);
+    let built = OperationBuilder::new(&format!("{keyword}.from_elements"), location)
+        .add_operands(&elems)
+        .add_results(&[native_ty])
+        .build()
+        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build `{keyword}.from_elements`: {e}"));
+    block.append_operation(built).result(0).unwrap().into()
+}
+
+/// Walks every leaf position of a (possibly multi-dim) memref `src`, in
+/// row-major order, `memref.load`-ing each scalar element into `out` — the
+/// read side of exactly the same walk `copy_nested_array` already does for
+/// writing, every dimension fully unrolled (a compile-time constant,
+/// cleave has no dynamically-sized arrays).
+fn flatten_memref_elements<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    src: Value<'c, 'c>,
+    dims: &[i64],
+    out: &mut Vec<Value<'c, 'c>>,
+) {
+    fn walk<'c>(
+        ctx: &LowerCtx<'c, '_>,
+        block: &Block<'c>,
+        src: Value<'c, 'c>,
+        remaining: &[i64],
+        idx_acc: &mut Vec<Value<'c, 'c>>,
+        out: &mut Vec<Value<'c, 'c>>,
+    ) {
+        let Some((&dim, rest)) = remaining.split_first() else {
+            let location = Location::unknown(ctx.context);
+            let load_op = block.append_operation(memref::load(src, idx_acc, location));
+            out.push(load_op.result(0).unwrap().into());
+            return;
+        };
+        for i in 0..dim {
+            idx_acc.push(const_index(ctx, block, i));
+            walk(ctx, block, src, rest, idx_acc, out);
+            idx_acc.pop();
+        }
+    }
+    walk(ctx, block, src, dims, &mut Vec::new(), out);
 }
 
 /// Stores `arg` into a field addressed by `field_ptr` (`field_ty` its own
@@ -1609,14 +1774,68 @@ fn lower_raw_mlir_op<'c>(
         })
         .collect();
     let location = Location::unknown(context);
-    let built = OperationBuilder::new(op, location)
-        .add_operands(&arg_values)
-        .add_attributes(&parsed_attrs)
-        .add_results(&[result_ty])
-        .build()
-        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build op `{op}`: {e}"));
+    let mut builder =
+        OperationBuilder::new(op, location).add_operands(&arg_values).add_attributes(&parsed_attrs).add_results(&[result_ty]);
+    // The one deliberate, dialect-wide exception to "no per-op-name Rust
+    // knowledge" — see `build_linalg_region`'s own doc comment for why.
+    if op.starts_with("linalg.") {
+        builder = builder.add_regions_vec(vec![build_linalg_region(context, result_ty, arg_values.len())]);
+    }
+    let built = builder.build().unwrap_or_else(|e| panic!("MLIR lowering: failed to build op `{op}`: {e}"));
     let result_op = block.append_operation(built);
     result_op.result(0).unwrap().into()
+}
+
+/// Every *structured* op in the `linalg` dialect needs a real payload
+/// region — even in "named op" form, confirmed by direct testing:
+/// melior/mlir-sys exposes no C++ convenience builder for one (only the
+/// fully generic, `mlirOperationCreate`-style API `lower_raw_mlir_op`
+/// already uses for everything else, which never attaches a region unless
+/// told to — `'linalg.matmul' op requires one region`, a real
+/// verification failure, not a guess). Scoped to the whole `linalg.`
+/// dialect prefix, not one op by name: every structured *contraction*-
+/// family op in it (`matmul`, `batch_matmul`, `dot`, `vecmat`, ...) shares
+/// the identical multiply-accumulate body (`out = out + in0*in1` — the
+/// dialect's own defining semantics for this whole op family, not
+/// something specific to matmul), so synthesizing it generically here is
+/// a real, principled, dialect-family-wide invariant — mirrors `bool`'s
+/// own status as `ty_to_mlir`'s one deliberate structural exception,
+/// rather than a new per-op special case. `result_ty` is the op's own
+/// full (tensor-shaped) result — the block's own scalar argument type is
+/// its element type, recovered via `ShapedTypeLike`; every caller reaching
+/// here is tensor-typed (`tagged_struct_native_type`), so the checked
+/// `RankedTensorType` conversion is expected to always succeed.
+fn build_linalg_region<'c>(context: &'c Context, result_ty: Type<'c>, operand_count: usize) -> Region<'c> {
+    let elem_ty = RankedTensorType::try_from(result_ty)
+        .unwrap_or_else(|e| panic!("MLIR lowering: a `linalg.*` op's own result must be a ranked tensor: {e}"))
+        .element();
+    let location = Location::unknown(context);
+    let block = Block::new(&vec![(elem_ty, location); operand_count]);
+    let args: Vec<Value> = (0..operand_count).map(|i| block.argument(i).unwrap().into()).collect();
+    let (ins, out) = args.split_at(args.len() - 1);
+    let out = out[0];
+    // Every `ins` operand multiplied together (the overwhelmingly common
+    // case is exactly two — `matmul`'s own `a`/`b`), then accumulated into
+    // `out` — `reduce` on a single-element `ins` (a unary contraction, if
+    // one existed) returns that element unchanged, no spurious multiply.
+    let product = ins
+        .iter()
+        .copied()
+        .reduce(|acc, x| {
+            let mulf = block.append_operation(
+                OperationBuilder::new("arith.mulf", location).add_operands(&[acc, x]).add_results(&[elem_ty]).build().unwrap(),
+            );
+            mulf.result(0).unwrap().into()
+        })
+        .unwrap_or(out);
+    let sum = block.append_operation(
+        OperationBuilder::new("arith.addf", location).add_operands(&[out, product]).add_results(&[elem_ty]).build().unwrap(),
+    );
+    let sum_val: Value = sum.result(0).unwrap().into();
+    block.append_operation(OperationBuilder::new("linalg.yield", location).add_operands(&[sum_val]).build().unwrap());
+    let region = Region::new();
+    region.append_block(block);
+    region
 }
 
 /// Emits a `func.func private @symbol(param_types) -> result_ty` declaration

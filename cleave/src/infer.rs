@@ -143,6 +143,34 @@ pub enum Ty {
     /// the moment it's unified against anything but another `Var`/`Const`,
     /// which is the only gap tests need to guard, not a run-time tag).
     Const(ConstValue),
+    /// A const-generic expression (`N+M`, the desugared shape `+` already
+    /// produces everywhere else — see `ast.rs`'s own `Call` doc comment)
+    /// whose operands aren't *both* concrete yet — `doc/backlog.md`'s own
+    /// "Deferred/symbolic constant folding" item. Operator name matches
+    /// `const_eval::eval_binop`'s own desugared names (`"add"`/`"sub"`/
+    /// `"mul"`); operands are always const-shaped (`Var`, `Const`, or a
+    /// nested `ConstExpr`) — not enforced by the type system, same
+    /// permissive-but-structurally-safe posture `Const`'s own doc comment
+    /// above already documents for that variant.
+    ///
+    /// A bare `Ty::Var` const-generic already survives a still-generic
+    /// declaration untouched, resolved later by `substitute` once
+    /// monomorphization supplies a real concrete value — `ConstExpr` needs
+    /// the identical treatment, plus an actual fold step once *both*
+    /// operands get there: `Subst::apply` and `substitute` are the only two
+    /// places that ever need to attempt it (`unify` calls `Subst::apply` on
+    /// both sides before its own match ever runs, so a `ConstExpr` that's
+    /// already resolvable collapses to a real `Const` before `unify` needs
+    /// to know anything special happened). Deliberately *not* eagerly
+    /// "solved" against a single concrete total the way `N+M` against a
+    /// literal array's own length might tempt — `N+M=5` alone never
+    /// uniquely determines `N`/`M`, and guessing would contradict this
+    /// project's own "never silently guessed, always checked" posture
+    /// (matches the recent `AmbiguousDispatch` work) — `unify`'s existing
+    /// catch-all already rejects `ConstExpr` against a bare `Const` cleanly
+    /// once both operands are confirmed still unresolvable, with no new
+    /// code needed for that case specifically.
+    ConstExpr(String, Box<Ty>, Box<Ty>),
 }
 
 /// The value side of `Ty::Const` — a const-generic isn't inherently
@@ -216,6 +244,16 @@ impl Subst {
                 Ty::Fn(params.iter().map(|p| self.apply(p)).collect(), Box::new(self.apply(ret)))
             }
             Ty::Array(elem, size) => Ty::Array(Box::new(self.apply(elem)), Box::new(self.apply(size))),
+            // Fold eagerly the moment both operands resolve all the way to a
+            // concrete `Const` — this runs at the top of every `unify` call
+            // (see its own doc comment), so a `ConstExpr` pinned concrete by,
+            // say, an explicit turbofish earlier in the same inference
+            // collapses to a real `Const` before `unify`'s own match ever
+            // sees it, with no special-casing needed there. Stays symbolic,
+            // with its own operands resolved as far as they currently go,
+            // when either one isn't concrete yet — exactly like a bare
+            // `Ty::Var` already does.
+            Ty::ConstExpr(op, a, b) => fold_const_expr(op, self.apply(a), self.apply(b)),
         }
     }
 
@@ -293,6 +331,7 @@ impl Subst {
             Ty::App(_, args) => args.iter().any(|a| self.occurs(v, a)),
             Ty::Fn(params, ret) => params.iter().any(|p| self.occurs(v, p)) || self.occurs(v, &ret),
             Ty::Array(elem, size) => self.occurs(v, &elem) || self.occurs(v, &size),
+            Ty::ConstExpr(_, a, b) => self.occurs(v, &a) || self.occurs(v, &b),
         }
     }
 }
@@ -321,6 +360,7 @@ impl std::fmt::Display for Ty {
             }
             Ty::Array(elem, size) => write!(f, "[{elem}; {size}]"),
             Ty::Const(v) => write!(f, "{v}"),
+            Ty::ConstExpr(op, a, b) => write!(f, "{op}({a}, {b})"),
         }
     }
 }
@@ -418,6 +458,22 @@ pub fn unify(subst: &mut Subst, a: &Ty, b: &Ty) -> Result<(), UnifyError> {
         (Ty::Array(e1, s1), Ty::Array(e2, s2)) => {
             unify(subst, e1, e2)?;
             unify(subst, s1, s2)
+        }
+        // Two still-symbolic expressions with the same operator — mirrors
+        // `Ty::App`'s own same-name-then-zip-args arm just above. Both sides
+        // already went through `subst.apply` above, so if either one were
+        // actually resolvable it would already be a plain `Ty::Const` by
+        // this point (`fold_const_expr`, called from `Subst::apply`) — this
+        // arm only ever runs when both genuinely still have a free operand.
+        // A `ConstExpr` unified directly against a concrete `Const` (or
+        // against a *different* operator) deliberately has no arm here —
+        // falls through to the ordinary `Mismatch` below, exactly the
+        // "don't guess" behavior wanted for something like `N+M` against a
+        // literal array length alone (`N`/`M` individually still
+        // undetermined — see `Ty::ConstExpr`'s own doc comment).
+        (Ty::ConstExpr(op1, x1, y1), Ty::ConstExpr(op2, x2, y2)) if op1 == op2 => {
+            unify(subst, x1, x2)?;
+            unify(subst, y1, y2)
         }
         _ => Err(UnifyError::Mismatch(a, b)),
     }
@@ -670,7 +726,32 @@ pub type Env = HashMap<String, Scheme>;
 pub struct Constraint {
     pub algebra: String,
     pub tys: Vec<Ty>,
+    /// Positions in `tys` that must already be concrete before dispatch is
+    /// even *attempted* — mirrors `infer_algebra_call`'s own `gating`
+    /// computation (an algebra generic that appears in at least one
+    /// parameter type). A position *not* listed here is output-only (an
+    /// algebra generic appearing only in the return type, `C` in `fn
+    /// mul(a:A,b:B)->C;`) — never independently pinned by anything else, so
+    /// `check_pending_constraints` must not wait for it to already be
+    /// concrete the way it waits for a gating position; it's the committing
+    /// dispatch itself that's supposed to bind it. Ordinary single-target
+    /// bound checks (`Int`/`Float`/`Num`/a declared `T: Bound`) are always
+    /// fully gating by construction — see `all_gating`.
+    pub gating_indices: Vec<usize>,
     pub span: Span,
+}
+
+impl Constraint {
+    /// Every position in `tys` is gating — the ordinary case for a single-
+    /// target bound/shape check (`Int`/`Float`/`Num`, a declared `T: Bound`),
+    /// which has no output-only position to speak of at all. Distinct from
+    /// a real multi-generic algebra-call constraint (`infer_algebra_call`'s
+    /// own deferred pushes), which computes its own, real `gating_indices`
+    /// directly instead of using this constructor.
+    fn all_gating(algebra: String, tys: Vec<Ty>, span: Span) -> Self {
+        let gating_indices = (0..tys.len()).collect();
+        Constraint { algebra, tys, gating_indices, span }
+    }
 }
 
 /// `∀vars. constraints ⇒ ty` — a qualified type scheme (Mark Jones' "Theory
@@ -700,6 +781,23 @@ impl Scheme {
     }
 }
 
+/// Shared by `Subst::apply` and `substitute` — the only two places a
+/// `Ty::ConstExpr` ever needs folding. `a`/`b` are already resolved as far
+/// as the caller's own machinery (subst-chasing or generic-instantiation
+/// substitution) can take them; if both landed on a concrete `Ty::Const`,
+/// delegates to `const_eval::eval_binop` (already designed for exactly this
+/// reuse — see its own module doc comment) and returns the folded result.
+/// Otherwise rebuilds a `ConstExpr` with the partially-resolved operands —
+/// still symbolic, exactly like an unresolved `Ty::Var` would stay.
+fn fold_const_expr(op: &str, a: Ty, b: Ty) -> Ty {
+    if let (Ty::Const(av), Ty::Const(bv)) = (&a, &b) {
+        if let Some(result) = const_eval::eval_binop(op, *av, *bv) {
+            return Ty::Const(result);
+        }
+    }
+    Ty::ConstExpr(op.to_string(), Box::new(a), Box::new(b))
+}
+
 pub(crate) fn free_vars(ty: &Ty, out: &mut HashSet<TyVar>) {
     match ty {
         Ty::Var(v) => {
@@ -721,6 +819,10 @@ pub(crate) fn free_vars(ty: &Ty, out: &mut HashSet<TyVar>) {
             free_vars(elem, out);
             free_vars(size, out);
         }
+        Ty::ConstExpr(_, a, b) => {
+            free_vars(a, out);
+            free_vars(b, out);
+        }
     }
 }
 
@@ -735,6 +837,13 @@ pub(crate) fn substitute(ty: &Ty, mapping: &HashMap<TyVar, Ty>) -> Ty {
         Ty::Array(elem, size) => {
             Ty::Array(Box::new(substitute(elem, mapping)), Box::new(substitute(size, mapping)))
         }
+        // The monomorphization-time fold: `mapping` carries a generic
+        // template's own real, concrete instantiation values (see this
+        // function's own callers in `monomorphize.rs`), so this is where
+        // `N+M` actually turns into a real number once a template gets
+        // specialized for a concrete call site — same `fold_const_expr`
+        // helper `Subst::apply` uses, see its own doc comment.
+        Ty::ConstExpr(op, a, b) => fold_const_expr(op, substitute(a, mapping), substitute(b, mapping)),
     }
 }
 
@@ -804,6 +913,11 @@ fn is_fully_concrete(ty: &Ty) -> bool {
         Ty::App(_, args) => args.iter().all(is_fully_concrete),
         Ty::Fn(params, ret) => params.iter().all(is_fully_concrete) && is_fully_concrete(ret),
         Ty::Array(elem, size) => is_fully_concrete(elem) && is_fully_concrete(size),
+        // Not concrete unless *both* operands are — a `ConstExpr` reaching
+        // this point at all already means `Subst::apply`/`substitute`
+        // couldn't fold it (see `fold_const_expr`), so it's never
+        // spuriously "concrete" by construction.
+        Ty::ConstExpr(_, a, b) => is_fully_concrete(a) && is_fully_concrete(b),
     }
 }
 
@@ -818,6 +932,7 @@ pub(crate) fn find_placeholder_name(ty: &Ty) -> Option<String> {
         Ty::App(_, args) => args.iter().find_map(find_placeholder_name),
         Ty::Fn(params, ret) => params.iter().find_map(find_placeholder_name).or_else(|| find_placeholder_name(ret)),
         Ty::Array(elem, size) => find_placeholder_name(elem).or_else(|| find_placeholder_name(size)),
+        Ty::ConstExpr(_, a, b) => find_placeholder_name(a).or_else(|| find_placeholder_name(b)),
     }
 }
 
@@ -893,9 +1008,9 @@ fn check_mutability_expr(expr: &Expr, scope: &HashMap<String, bool>) -> Result<(
             check_mutability_expr(base, scope)?;
             args.iter().try_for_each(|a| check_mutability_expr(a, scope))
         }
-        ExprKind::Index(base, idx) => {
+        ExprKind::Index(base, indices) => {
             check_mutability_expr(base, scope)?;
-            check_mutability_expr(idx, scope)
+            indices.iter().try_for_each(|i| check_mutability_expr(i, scope))
         }
         ExprKind::ArrayLit(elems) => elems.iter().try_for_each(|e| check_mutability_expr(e, scope)),
         ExprKind::ArrayRepeat { value, count } => {
@@ -1004,6 +1119,34 @@ pub struct Infer<'r> {
     /// there's no equivalent "target pattern" for a top-level `fn` or an
     /// inherent method to expose here.
     pub target_types: Vec<Ty>,
+    /// The currently-being-inferred top-level `fn`/impl-method's own
+    /// generic-parameter-name -> `Ty` mapping (`fresh_fn_shape`'s own
+    /// `generics` for a plain `fn`, `impl_mapping` for an impl method) — set
+    /// once, at the top of whichever of `infer_fn_raw`/`infer_impl_fn_
+    /// generic_with_env` is currently running, consulted by `ty_from_ast`'s
+    /// two generics-aware callers (a `let`'s own type annotation, a nested
+    /// lambda's own parameter/return annotations) instead of resolving
+    /// against an empty map. A real, previously-silent bug, found by direct
+    /// testing while building a generic `matmul` impl (`let acc: Boxed<T> =
+    /// ...;`, referencing the enclosing impl's own generic `T` from inside
+    /// its method body — never exercised before this): every *signature*-
+    /// level reference to an
+    /// enclosing generic (`fn f<T>(x: T)`, an impl's own declared target/
+    /// param/return types) already threads a real mapping through
+    /// `ty_from_ast_mapped` correctly, but any annotation syntactically
+    /// *nested inside the body* used the always-empty `ty_from_ast` instead
+    /// — `T` silently fell through to a bogus, permanently-unmatchable
+    /// `Ty::Con("T")` rather than erroring or resolving correctly, only
+    /// surfacing much later as a confusing `no impl Float<T>`. Deliberately
+    /// *not* threaded as an explicit parameter through `infer_expr`/
+    /// `infer_block`'s entire call graph — every recursive call already
+    /// shares the one enclosing `fn`/impl-method's own body, so a single
+    /// field set once at the top covers the whole body without an invasive,
+    /// cross-cutting signature change everywhere. Left populated (never
+    /// cleared) once a generic body finishes — harmless: nothing reads it
+    /// outside of another `fn`/impl-method's own body inference, which
+    /// always resets it first.
+    active_generics: HashMap<String, Ty>,
     /// Every type variable `generalize` has ever quantified into some
     /// binding's `Scheme` — `apply_defaults` must never bind one of these.
     /// Found necessary by testing, not by design up front: a self-recursive
@@ -1096,6 +1239,68 @@ pub struct Infer<'r> {
     /// before, no behavior change for anything that doesn't call
     /// `with_inherent_patterns`.
     inherent_patterns: Option<&'r HashMap<(String, String), crate::callgraph::InherentMethodPattern>>,
+    /// A field access (`v.foo`) whose own base was still a bare `Ty::Var`
+    /// at the point it was written — e.g. `let z = 4i; z.real`, where `z`'s
+    /// own type only becomes concrete once `apply_defaults` runs, at the
+    /// very end of the whole function's inference. Deferred the same way
+    /// `pending_type_name_checks` already defers a different "not knowable
+    /// yet" question — `check_pending_field_accesses` drains this, once,
+    /// right after `apply_defaults`. Never populated for a base that's
+    /// *already* an unresolved placeholder (`<unresolved-call:...>` and
+    /// friends) — that case genuinely never resolves no matter how long
+    /// this waits, so it keeps returning the placeholder immediately,
+    /// unchanged.
+    pending_field_accesses: Vec<PendingFieldAccess>,
+    /// The `MethodCall` counterpart to `pending_field_accesses` — see its
+    /// own doc comment. `arg_tys`/`arg_spans` are captured already-resolved
+    /// (arguments never depend on the base's own resolution, so they're
+    /// still inferred immediately, same as today) — only the base-dependent
+    /// half (which method, on which struct, with what return type) is
+    /// deferred.
+    pending_method_calls: Vec<PendingMethodCall>,
+    /// The `Index` (`base[i,j,...]`) counterpart to `pending_field_accesses`
+    /// — same reasoning, same shape: `mc[0,0]` right after `let mc =
+    /// matmul(ma, mb);` has `mc`'s own type as a bare `Ty::Var` at the point
+    /// it's written (an algebra call's output-only generic, `C` here, is
+    /// never independently concrete until `MatMul`'s own dispatch actually
+    /// runs — itself deferred until `apply_defaults`/`check_pending_
+    /// constraints` — see `doc/backlog.md`'s own "`check_pending_
+    /// constraints`'s output-only-generic gate" item). `index_tys`/`index_
+    /// spans` are captured already-resolved, mirroring `pending_method_
+    /// calls`'s own identical split — an index's own type never depends on
+    /// the base's, so it's inferred (and `Int`-constrained) immediately
+    /// either way; only "does this end up peeling an array dimension or
+    /// dispatching `Index<Container,Elem,K>`" is what's actually deferred.
+    pending_indices: Vec<PendingIndex>,
+}
+
+/// See `Infer::pending_field_accesses`'s own doc comment.
+struct PendingFieldAccess {
+    base: Ty,
+    field: String,
+    result: TyVar,
+    span: Span,
+}
+
+/// See `Infer::pending_method_calls`'s own doc comment.
+struct PendingMethodCall {
+    base: Ty,
+    method: String,
+    arg_tys: Vec<Ty>,
+    arg_spans: Vec<Span>,
+    base_span: Span,
+    result: TyVar,
+    call_span: Span,
+}
+
+/// See `Infer::pending_indices`'s own doc comment.
+struct PendingIndex {
+    base: Ty,
+    base_span: Span,
+    index_tys: Vec<Ty>,
+    index_spans: Vec<Span>,
+    result: TyVar,
+    span: Span,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1104,8 +1309,8 @@ enum NumberDefault {
     Float,
     /// A bare imaginary literal (`4i`) — see `ExprKind::ImaginaryLit`'s own
     /// handling. Unlike `Int`/`Float`, its default isn't a bare `Ty::Con`
-    /// name — `apply_defaults` builds `App("Complex", [Con("f64")])`
-    /// directly for this variant.
+    /// name — `apply_defaults` builds `App("Complex", [Con("f32")])`
+    /// directly for this variant, matching `Float`'s own default width.
     Complex,
 }
 
@@ -1120,11 +1325,15 @@ impl<'r> Infer<'r> {
             node_types: HashMap::new(),
             param_types: Vec::new(),
             target_types: Vec::new(),
+            active_generics: HashMap::new(),
             quantified: HashSet::new(),
             pending_type_name_checks: Vec::new(),
             in_progress_methods: HashMap::new(),
             lambda_schemes: HashMap::new(),
             inherent_patterns: None,
+            pending_field_accesses: Vec::new(),
+            pending_method_calls: Vec::new(),
+            pending_indices: Vec::new(),
         }
     }
 
@@ -1197,7 +1406,7 @@ impl<'r> Infer<'r> {
                 GenericParam::Type { name, bounds } => {
                     let ty = mapping[name].clone();
                     for bound in bounds {
-                        self.constraints.push(Constraint { algebra: bound.clone(), tys: vec![ty.clone()], span });
+                        self.constraints.push(Constraint::all_gating(bound.clone(), vec![ty.clone()], span));
                     }
                 }
                 GenericParam::Const { name, ty } => {
@@ -1350,6 +1559,202 @@ impl<'r> Infer<'r> {
             .collect()
     }
 
+    /// The core of `ExprKind::FieldAccess` — given an *already concrete*
+    /// (or otherwise not-worth-deferring: a function/array/const value with
+    /// no fields at all) base type, finds `name`'s own declared field type.
+    /// Extracted so `check_pending_field_accesses` can run the exact same
+    /// logic once a deferred base finally becomes concrete, instead of
+    /// duplicating it — see `pending_field_accesses`'s own doc comment for
+    /// why a field access needs deferring at all.
+    fn resolve_field_access(&mut self, resolved: &Ty, name: &str, span: Span) -> Result<Ty, TypeError> {
+        match resolved {
+            // Non-generic struct (or any other bare concrete type — see the
+            // `None` arm below) — field's declared type needs no further
+            // mapping, it can't mention a generic parameter this struct
+            // doesn't have.
+            Ty::Con(struct_name) => match self.registry.struct_fields(struct_name) {
+                Some(fields) => match fields.iter().find(|f| f.name == name) {
+                    Some(field) => Ok(self.ty_from_ast(&field.ty)),
+                    None => Err(TypeError {
+                        span,
+                        kind: TypeErrorKind::NoSuchField { struct_name: struct_name.clone(), field: name.to_string() },
+                    }),
+                },
+                // A concrete, known type that simply isn't a struct at all
+                // (`(1).foo`) — genuinely has no fields, rejected the same
+                // way as a struct missing this specific one.
+                None => Err(TypeError {
+                    span,
+                    kind: TypeErrorKind::NoSuchField { struct_name: struct_name.clone(), field: name.to_string() },
+                }),
+            },
+            // A generic struct, already instantiated at some concrete set
+            // of type arguments — map the struct's own declared generic
+            // parameter names to *these* arguments (positionally, `App`'s
+            // own established convention) before resolving the field's
+            // declared type, so `real: T` on `Complex<f64>` reads back as
+            // `f64`, not the literal, meaningless name `T`.
+            Ty::App(struct_name, type_args) => match self.registry.struct_fields(struct_name) {
+                Some(fields) => match fields.iter().find(|f| f.name == name).cloned() {
+                    Some(field) => {
+                        let mapping = self.zip_struct_generics(struct_name, type_args);
+                        Ok(self.ty_from_ast_mapped(&field.ty, &mapping))
+                    }
+                    None => Err(TypeError {
+                        span,
+                        kind: TypeErrorKind::NoSuchField { struct_name: struct_name.clone(), field: name.to_string() },
+                    }),
+                },
+                None => Err(TypeError {
+                    span,
+                    kind: TypeErrorKind::NoSuchField { struct_name: struct_name.clone(), field: name.to_string() },
+                }),
+            },
+            // Neither has fields — a function value or an array (indexing,
+            // not field access, is how you reach into an array) rejected
+            // the same way as any other fieldless concrete type. `Const`/
+            // `ConstExpr` can't actually reach here in practice (nothing
+            // produces one as an *expression's* type, only inside another
+            // type's size slot), but handled the same way for
+            // exhaustiveness rather than a `todo!()`/panic waiting to be
+            // hit by a future caller. `Var` only ever reaches here via the
+            // deferred path once `check_pending_field_accesses` has already
+            // confirmed it's still unresolved — same "genuinely fieldless"
+            // treatment, not a distinct case.
+            Ty::Fn(..) | Ty::Array(..) | Ty::Const(_) | Ty::ConstExpr(..) | Ty::Var(_) => Err(TypeError {
+                span,
+                kind: TypeErrorKind::NoSuchField { struct_name: resolved.to_string(), field: name.to_string() },
+            }),
+        }
+    }
+
+    /// The `MethodCall` counterpart to `resolve_field_access` — given an
+    /// *already concrete* base type and the call's own already-inferred
+    /// argument types (arguments never depend on the base's own
+    /// resolution, so both the immediate and deferred callers infer them
+    /// up front, unchanged), finds and dispatches `name`. Deliberately
+    /// excludes the `in_progress_methods` self-recursion branch: those
+    /// entries only ever exist *during* a method body's own in-flight
+    /// inference and are always removed before that same call's
+    /// `finish_fn`/defaulting phase runs — by the time a deferred call
+    /// reaches this helper, `in_progress_methods` is structurally
+    /// guaranteed not to contain it, so the immediate call site keeps that
+    /// check inline, before ever calling this. See
+    /// `pending_method_calls`'s own doc comment for why a method call
+    /// needs deferring at all.
+    fn resolve_method_call(
+        &mut self,
+        resolved_base: &Ty,
+        name: &str,
+        arg_tys: &[Ty],
+        arg_spans: &[Span],
+        base_span: Span,
+        call_span: Span,
+    ) -> Result<Ty, TypeError> {
+        let struct_name = match resolved_base {
+            Ty::Con(n) => n.clone(),
+            Ty::App(n, _) => n.clone(),
+            // A function value, array, or const-value — none of these have
+            // methods, rejected the same way `resolve_field_access` rejects
+            // them for fields. `Ty::Var` is included only for
+            // exhaustiveness — the deferred path only ever calls this once
+            // `check_pending_method_calls` has already confirmed the base
+            // is concrete; the immediate path already returned earlier for
+            // a bare `Ty::Var`.
+            Ty::Fn(..) | Ty::Array(..) | Ty::Const(_) | Ty::Var(_) | Ty::ConstExpr(..) => {
+                return Err(TypeError {
+                    span: call_span,
+                    kind: TypeErrorKind::NoSuchMethod { struct_name: resolved_base.to_string(), method: name.to_string() },
+                });
+            }
+        };
+        let Some(entry) = self.registry.inherent_method(&struct_name, name).cloned() else {
+            return Err(TypeError {
+                span: call_span,
+                kind: TypeErrorKind::NoSuchMethod { struct_name, method: name.to_string() },
+            });
+        };
+        // `base` fills the method's own first parameter — an ordinary,
+        // explicit positional argument, not a magic `self` (see
+        // `grammar.pest`'s `inherent_impl` comment for why: this project
+        // doesn't have implicit-anything elsewhere, no reason to invent one
+        // here).
+        if entry.method.params.is_empty() || entry.method.params.len() != arg_tys.len() + 1 {
+            return Err(TypeError {
+                span: call_span,
+                kind: TypeErrorKind::ArityMismatch {
+                    name: name.to_string(),
+                    expected: entry.method.params.len(),
+                    found: arg_tys.len() + 1,
+                },
+            });
+        }
+        // The impl block's own generics (`impl<T: Float> Vec2<T>`) — fresh
+        // per call, bounds pushed as real `Constraint`s exactly like an
+        // algebra impl's own (`fresh_generics_mapping`). `target_ty` —
+        // built *from* `impl_mapping`, so `Boxed<T>` becomes
+        // `App("Boxed", [impl_mapping["T"]])` — is what actually pins those
+        // generics down once unified against `resolved_base` below; a bare
+        // fresh var for `param_tys[0]` would *also* end up correctly
+        // unified with `resolved_base`, but as its own, disconnected
+        // variable, never actually feeding back into `impl_mapping` at all
+        // — a real bug, found by testing: a generic inherent method's own
+        // return type (`T`, resolved through this same `impl_mapping`)
+        // came back as a bare, still-unconstrained variable instead of the
+        // concrete type `base` actually has. Mirrors
+        // `infer_inherent_impl_fn_generic`'s own identical fix for the
+        // exact same reason, on the declaration side.
+        let impl_mapping = self.fresh_generics_mapping(&entry.generics, call_span);
+        let target_ty = self.ty_from_ast_mapped(&entry.target, &impl_mapping);
+        let param_tys = self.inherent_method_param_tys(&entry.method.params, &impl_mapping, &target_ty);
+        self.unify_at(base_span, &param_tys[0], resolved_base)?;
+        for (pt, (at, sp)) in param_tys[1..].iter().zip(arg_tys.iter().zip(arg_spans.iter())) {
+            self.unify_at(*sp, pt, at)?;
+        }
+        // Unlike an algebra call (which always has a real declared
+        // signature, return type included, to fall back on) or a
+        // top-level `fn` call (whose return type was already *inferred*,
+        // once, by the whole-program pass, then generalized into a
+        // reusable `Scheme` — see `callgraph.rs`) — dispatch here never
+        // re-runs the method's own body at the call site (except for the
+        // recursive, `in_progress_methods` case handled by the immediate
+        // caller before ever reaching here), so an inherent method with no
+        // explicit `->` annotation has no return type available *anywhere*
+        // else to report... unless `callgraph::infer_inherent_impls_early`
+        // already ran and published one (`self.inherent_patterns`, opted
+        // into via `with_inherent_patterns` — only
+        // `callgraph::infer_program` itself does today). Its own pattern's
+        // free vars are named by generic-parameter *name*
+        // (`generics_mapping`, built by a *different* `Infer` instance than
+        // this call site's own `impl_mapping`), so reusing it means
+        // cross-referencing by name and remapping through *this* call
+        // site's own fresh vars, not substituting it in directly. Falls
+        // back to the placeholder, same posture as every other
+        // genuinely-unresolved case in this file, for a method whose own
+        // return type couldn't be determined even by that early pass (e.g.
+        // it depends on a top-level `fn`, not yet visible to it — see that
+        // pass's own doc comment for why this is a deliberate, graceful
+        // deferral, not a bug).
+        Ok(entry
+            .method
+            .ret
+            .as_ref()
+            .map(|t| self.ty_from_ast_mapped(t, &impl_mapping))
+            .or_else(|| {
+                let pattern = self.inherent_patterns?.get(&(struct_name.clone(), name.to_string()))?;
+                let remap: HashMap<TyVar, Ty> = pattern
+                    .generics_mapping
+                    .iter()
+                    .filter_map(|(n, t)| match t {
+                        Ty::Var(v) => Some((*v, impl_mapping[n].clone())),
+                        _ => None,
+                    })
+                    .collect();
+                Some(substitute(&pattern.ret_pattern, &remap))
+            })
+            .unwrap_or_else(|| Ty::Con("<not-yet-inferred>".to_string())))
+    }
+
     /// Fresh parameter types (annotated → concrete, else a fresh variable)
     /// plus a fresh return-type variable for `f` — the shape a caller must
     /// know about *before* `f`'s own body has been inferred, so it can be
@@ -1457,6 +1862,7 @@ impl<'r> Infer<'r> {
         // carries none, see `ast.rs`) — `infer_fn` (this method's other,
         // test-only caller) never constructs one either.
         let body = f.body.as_ref().expect("infer_fn_raw requires a body; caller must validate first");
+        self.active_generics = generics.clone();
         let mut env = outer.clone();
         for (p, ty) in f.params.iter().zip(&param_types) {
             env.insert(p.name.clone(), Scheme::mono(ty.clone()));
@@ -1603,6 +2009,7 @@ impl<'r> Infer<'r> {
         // resolved, so `Complex<T>` becomes `App("Complex", [fresh])`, not a
         // bogus `App("Complex", [Con("T")])`.
         let impl_mapping = self.fresh_generics_mapping(impl_generics, fallback_span);
+        self.active_generics = impl_mapping.clone();
         let target_tys: Vec<Ty> = targets.iter().map(|t| self.ty_from_ast_mapped(t, &impl_mapping)).collect();
         self.target_types = target_tys.clone();
 
@@ -1752,6 +2159,7 @@ impl<'r> Infer<'r> {
         fallback_span: Span,
     ) -> Result<Ty, TypeError> {
         let impl_mapping = self.fresh_generics_mapping(impl_generics, fallback_span);
+        self.active_generics = impl_mapping.clone();
         let target_ty = self.ty_from_ast_mapped(target, &impl_mapping);
         let param_types = self.inherent_method_param_tys(&f.params, &impl_mapping, &target_ty);
 
@@ -1889,6 +2297,7 @@ impl<'r> Infer<'r> {
         fallback_span: Span,
     ) -> (HashMap<String, Ty>, HashMap<String, Result<(Vec<Ty>, Ty), TypeError>>) {
         let impl_mapping = self.fresh_generics_mapping(impl_generics, fallback_span);
+        self.active_generics = impl_mapping.clone();
         let target_ty = self.ty_from_ast_mapped(target, &impl_mapping);
         let struct_name = match &target.kind {
             TypeKind::Path(p, _) => Some(p.segments.join("::")),
@@ -1934,7 +2343,18 @@ impl<'r> Infer<'r> {
         // reported against every member whose own raw inference otherwise
         // succeeded (a raw-inference failure is already more specific and
         // is left alone), mirroring `callgraph.rs`'s identical choice.
-        if let Err(e) = self.check_pending_constraints() {
+        if let Err(e) = self.check_pending_constraints_and_indices() {
+            for outcome in raw_results.values_mut() {
+                if outcome.is_ok() {
+                    *outcome = Err(e.clone());
+                }
+            }
+        }
+        // Same "resolve now that defaulting has run, attribute a failure to
+        // the whole block" posture as `check_pending_constraints` just
+        // above — see `finish_fn`'s identical pairing for the single-
+        // function path.
+        if let Err(e) = self.check_pending_field_accesses().and_then(|()| self.check_pending_method_calls()) {
             for outcome in raw_results.values_mut() {
                 if outcome.is_ok() {
                     *outcome = Err(e.clone());
@@ -2006,8 +2426,14 @@ impl<'r> Infer<'r> {
         // After defaulting, since defaulting can turn an abstract
         // `Num`-constrained variable concrete — check it against that
         // default, don't just assume defaulting made it automatically fine.
-        self.check_pending_constraints()?;
+        self.check_pending_constraints_and_indices()?;
         self.check_pending_type_names()?;
+        // Same reasoning as `check_pending_constraints` above — a field
+        // access/method call deferred because its base was still a bare
+        // `Ty::Var` at the point it was written now has its answer, one way
+        // or the other, now that defaulting has run.
+        self.check_pending_field_accesses()?;
+        self.check_pending_method_calls()?;
 
         // Fully re-resolve everything through the final substitution before
         // handing it back — `node_types`/`param_types` may have captured a
@@ -2150,7 +2576,12 @@ impl<'r> Infer<'r> {
                 free_vars(t, &mut fv);
             }
             if fv.iter().any(|v| var_set.contains(v)) {
-                constraints.push(Constraint { algebra: c.algebra.clone(), tys: resolved_tys, span: c.span });
+                constraints.push(Constraint {
+                    algebra: c.algebra.clone(),
+                    tys: resolved_tys,
+                    gating_indices: c.gating_indices.clone(),
+                    span: c.span,
+                });
             }
         }
 
@@ -2253,9 +2684,12 @@ impl<'r> Infer<'r> {
                 for t in &resolved_tys {
                     free_vars(t, &mut fv);
                 }
-                fv.iter()
-                    .any(|v| ty_fv.contains(v))
-                    .then(|| Constraint { algebra: c.algebra.clone(), tys: resolved_tys, span: c.span })
+                fv.iter().any(|v| ty_fv.contains(v)).then(|| Constraint {
+                    algebra: c.algebra.clone(),
+                    tys: resolved_tys,
+                    gating_indices: c.gating_indices.clone(),
+                    span: c.span,
+                })
             })
             .collect()
     }
@@ -2294,6 +2728,7 @@ impl<'r> Infer<'r> {
             self.constraints.push(Constraint {
                 algebra: c.algebra.clone(),
                 tys: c.tys.iter().map(|t| substitute(t, &mapping)).collect(),
+                gating_indices: c.gating_indices.clone(),
                 span: c.span,
             });
         }
@@ -2713,12 +3148,52 @@ impl<'r> Infer<'r> {
             if resolved.iter().any(is_placeholder) {
                 continue;
             }
-            // Still abstract somewhere in the tuple — not everything is
-            // known yet, so there's nothing coherent to check (mirrors
-            // `infer_algebra_call`'s own "still abstract somewhere" gate for
-            // the immediate-dispatch path — same posture, deferred further
-            // rather than guessed at).
-            if !resolved.iter().all(is_fully_concrete) {
+            // Only the *gating* (input-appearing) positions must already be
+            // concrete before dispatch is even attempted — mirrors `infer_
+            // algebra_call`'s own gating check for the immediate-dispatch
+            // path exactly (`Constraint::gating_indices`'s own doc comment).
+            // An output-only position (`Index<Container,Elem,K>`'s own
+            // `Elem`, `MatMul<A,B,C>`'s own `C`) is *not* required concrete
+            // here — it's the committing dispatch below that's supposed to
+            // bind it, not a precondition for attempting one. Still abstract
+            // somewhere among the *gating* positions — unlike the two
+            // genuinely-dead-end cases just above, this one really can
+            // still become ready later: e.g. `print(matmul(ma,mb)[0,0])`'s
+            // own deferred `Print` constraint (`gating_indices` covering its
+            // sole generic, tied to `mc[0,0]`'s own result) can't be
+            // satisfied *within this same pass* — it needs `check_pending_
+            // indices` to run first, which itself needs *this* method's own
+            // earlier entry in the same queue (`MatMul`'s own deferred `C`)
+            // already committed. Re-queued, not dropped, so `Infer::check_
+            // pending_constraints_and_indices`'s own outer fixpoint gets
+            // another chance at it once more of the picture resolves.
+            if c.gating_indices.iter().any(|&i| !is_fully_concrete(&resolved[i])) {
+                self.constraints.push(c);
+                continue;
+            }
+
+            let all_concrete = resolved.iter().all(is_fully_concrete);
+            if !all_concrete {
+                // Gating is satisfied, but some *output-only* position is
+                // still a bare `Ty::Var` — this can only be a real multi-
+                // generic algebra-call constraint (an ordinary single-
+                // target bound check, `Constraint::all_gating`, is always
+                // fully gating by construction, so it always takes the
+                // `all_concrete` branch below instead). `has_matching_impl`
+                // (non-committing — only ever confirms *some* impl exists,
+                // never binds anything) can't resolve this position; only a
+                // real, committing dispatch can, exactly the same one
+                // `infer_algebra_call`'s own immediate path already calls
+                // once *its* gating is satisfied. This is the actual fix for
+                // `doc/backlog.md`'s own "`check_pending_constraints`'s
+                // output-only-generic gate" item — before this, such a
+                // position was silently never bound, discarded forever along
+                // with the rest of `self.constraints` at the top of this
+                // loop's own `std::mem::take`.
+                if !self.dispatch_algebra_call(&c.algebra, &resolved, c.span)? {
+                    let ty = resolved.iter().map(Ty::to_string).collect::<Vec<_>>().join(", ");
+                    return Err(TypeError { span: c.span, kind: TypeErrorKind::MissingImpl { algebra: c.algebra, ty } });
+                }
                 continue;
             }
             // A const generic referenced as an ordinary value (`for i in
@@ -2822,6 +3297,233 @@ impl<'r> Infer<'r> {
         match std::mem::take(&mut self.pending_type_name_checks).into_iter().next() {
             Some((name, span)) => Err(TypeError { span, kind: TypeErrorKind::TypeNameIsAnAlgebra { name } }),
             None => Ok(()),
+        }
+    }
+
+    /// Drains `pending_field_accesses`, called from the same three sites as
+    /// `check_pending_constraints`, right after `apply_defaults` — by then,
+    /// any base whose only concreteness came from literal-defaulting has
+    /// it; anything still a bare `Ty::Var` (or, transitively, a placeholder
+    /// itself — e.g. chained off another entry that never resolved) never
+    /// will. That case unifies `result` against the same
+    /// `<not-yet-inferred>` placeholder the immediate path already returns
+    /// for a genuinely-unresolvable base, so `check_no_placeholder`'s
+    /// existing safety net still catches it downstream, unchanged. A
+    /// resolved base runs the real lookup via `resolve_field_access`, the
+    /// same helper `ExprKind::FieldAccess`'s own immediate path uses.
+    pub(crate) fn check_pending_field_accesses(&mut self) -> Result<(), TypeError> {
+        for pending in std::mem::take(&mut self.pending_field_accesses) {
+            let resolved = self.subst.apply(&pending.base);
+            let field_ty = if matches!(resolved, Ty::Var(_)) || is_placeholder(&resolved) {
+                Ty::Con("<not-yet-inferred>".to_string())
+            } else {
+                self.resolve_field_access(&resolved, &pending.field, pending.span)?
+            };
+            self.unify_at(pending.span, &Ty::Var(pending.result), &field_ty)?;
+        }
+        Ok(())
+    }
+
+    /// The `MethodCall` counterpart to `check_pending_field_accesses` — see
+    /// its own doc comment, and `pending_method_calls`'s, for the shared
+    /// reasoning. `arg_tys` are passed through unresolved (as captured at
+    /// the deferred call site): `unify`/`unify_at` already resolves both
+    /// sides via `self.subst` internally, so there's no need to re-apply
+    /// here first.
+    pub(crate) fn check_pending_method_calls(&mut self) -> Result<(), TypeError> {
+        for pending in std::mem::take(&mut self.pending_method_calls) {
+            let resolved = self.subst.apply(&pending.base);
+            let ret_ty = if matches!(resolved, Ty::Var(_)) || is_placeholder(&resolved) {
+                Ty::Con("<not-yet-inferred>".to_string())
+            } else {
+                self.resolve_method_call(
+                    &resolved,
+                    &pending.method,
+                    &pending.arg_tys,
+                    &pending.arg_spans,
+                    pending.base_span,
+                    pending.call_span,
+                )?
+            };
+            self.unify_at(pending.call_span, &Ty::Var(pending.result), &ret_ty)?;
+        }
+        Ok(())
+    }
+
+    /// Shared tail of `ExprKind::Index`'s own immediate path and `check_
+    /// pending_indices`'s deferred one — extracted so the deferred path can
+    /// reuse it without duplicating it, exactly like `resolve_field_access`'s
+    /// own identical "extracted for the same reason" precedent. `base_ty`
+    /// must already be concrete and not a placeholder (the caller's
+    /// responsibility, same contract `resolve_field_access` already has);
+    /// `index_tys`/`index_spans` are each already-inferred, already-`Int`-
+    /// constrained.
+    fn resolve_index(&mut self, base_ty: Ty, index_tys: &[Ty], index_spans: &[Span], base_span: Span, expr_span: Span) -> Result<Ty, TypeError> {
+        match &base_ty {
+            // A real array: peel one dimension per index, in order — the
+            // direct generalization of what nested single-index `Index`
+            // nodes used to achieve through recursion, now done in one
+            // node/one loop instead (`a[i,j]` and the two-separate-brackets
+            // `a[i][j]` stay equivalent for a real array either way — a
+            // well-defined sub-array type exists at every step). Running out
+            // of array dimensions with indices still remaining (`a[i,j,k]`
+            // on a 2D array) is a direct `Mismatch` here — the same
+            // rejection an over-indexed array always got, just reached
+            // directly instead of indirectly through a failed `Index`-
+            // algebra lookup on whatever scalar leaf type was left over.
+            Ty::Array(..) => {
+                let mut current = base_ty.clone();
+                for span in index_spans {
+                    current = match self.subst.apply(&current) {
+                        Ty::Array(elem, _) => *elem,
+                        Ty::Var(_) => return Ok(Ty::Con("<not-yet-inferred>".to_string())),
+                        other if is_placeholder(&other) => return Ok(Ty::Con("<not-yet-inferred>".to_string())),
+                        other => {
+                            return Err(TypeError {
+                                span: *span,
+                                kind: TypeErrorKind::Unify(UnifyError::Mismatch(
+                                    Ty::Array(Box::new(self.vars.fresh()), Box::new(self.vars.fresh())),
+                                    other,
+                                )),
+                            });
+                        }
+                    };
+                }
+                Ok(self.subst.apply(&current))
+            }
+            // Concrete, resolved, and definitely not an array — not an
+            // immediate error anymore: a `#[mlir_type(...)]`-tagged struct
+            // (`Vector<T,N>`/`Matrix<T,R,C>`/`Tensor<T,D0,D1,D2>`, `stdlib/
+            // vector/vector.cleave`) has no array of its own to index into
+            // directly, so `v[i]`/`m[i,j]` only makes sense through a real
+            // declared `Index<Container, Elem, const K: i32>` impl —
+            // dispatched exactly the way an ordinary bare-name operator call
+            // already falls back through `infer_call`'s own `registry.
+            // algebras_with_fn` lookup (mirrored here, not reused directly,
+            // since there's no real `Expr` call node to hand `infer_call` —
+            // `ExprKind::Index` stays its own dedicated AST shape, for the
+            // mutability-checking `a[i] = x` needs, see
+            // `check_mutability_expr`). The whole bracket group dispatches
+            // as *one* call — every index unified against one shared fresh
+            // `elem_ty` (mirrors `ExprKind::ArrayLit`'s own pairwise-unify
+            // loop exactly, since this literally becomes a real `[i32;K]`
+            // array value at CPS time, `cps.rs`'s own `ExprKind::Index` doc
+            // comment) rather than dispatched index-by-index — unifying
+            // that synthesized array type against the algebra's own
+            // declared `[i32;K]` signature is what forces `elem_ty := i32`
+            // and pins `K := index_tys.len()`, no special-casing needed
+            // here at all. No candidate at all (the overwhelmingly common
+            // case — indexing an `i32`, say) falls through to the same
+            // `Mismatch` as before, unchanged.
+            other => {
+                let elem_ty = self.vars.fresh();
+                for (index_ty, span) in index_tys.iter().zip(index_spans) {
+                    self.unify_at(*span, &elem_ty, index_ty)?;
+                }
+                let idx_array_ty = Ty::Array(Box::new(elem_ty), Box::new(Ty::Const(ConstValue::Int(index_tys.len() as u64))));
+                let candidates = self.registry.algebras_with_fn("index", 2);
+                if candidates.len() > 1 {
+                    return Err(TypeError {
+                        span: expr_span,
+                        kind: TypeErrorKind::AmbiguousOperator {
+                            name: "index".to_string(),
+                            candidates: candidates.into_iter().map(String::from).collect(),
+                        },
+                    });
+                }
+                if let Some(&algebra) = candidates.first() {
+                    self.infer_algebra_call(expr_span, algebra, "index", &[other.clone(), idx_array_ty], &[base_span, expr_span], &[])
+                } else {
+                    Err(TypeError {
+                        span: expr_span,
+                        kind: TypeErrorKind::Unify(UnifyError::Mismatch(
+                            Ty::Array(Box::new(self.vars.fresh()), Box::new(self.vars.fresh())),
+                            other.clone(),
+                        )),
+                    })
+                }
+            }
+        }
+    }
+
+    /// Drains `pending_indices` — see `Infer::pending_indices`'s own doc
+    /// comment. Called (via `check_pending_constraints_and_indices`) right
+    /// after `check_pending_constraints`, so a base type that only became
+    /// concrete *because of* that method's own committing-dispatch fix
+    /// (`mc`'s own `MatMul`-derived type, say) is already resolved by the
+    /// time this runs. A base that's an *already*-unresolved placeholder is
+    /// a genuine dead end (same reasoning as `PendingFieldAccess`'s own
+    /// identical case) and resolves to the same dead `<not-yet-inferred>`
+    /// placeholder the immediate path already returns — `check_no_
+    /// placeholder`'s existing safety net still catches it downstream,
+    /// unchanged. A base that's *still* a bare `Ty::Var` even now, though,
+    /// is re-queued rather than given up on — it can still resolve in a
+    /// later round of `check_pending_constraints_and_indices`'s own outer
+    /// fixpoint (a chain of two-or-more deferred steps, e.g. `matmul(matmul
+    /// (a,b),c)[0,0]`, needs more than one round to fully unwind).
+    pub(crate) fn check_pending_indices(&mut self) -> Result<(), TypeError> {
+        for pending in std::mem::take(&mut self.pending_indices) {
+            let resolved = self.subst.apply(&pending.base);
+            if matches!(resolved, Ty::Var(_)) {
+                self.pending_indices.push(pending);
+                continue;
+            }
+            let result_ty = if is_placeholder(&resolved) {
+                Ty::Con("<not-yet-inferred>".to_string())
+            } else {
+                self.resolve_index(resolved, &pending.index_tys, &pending.index_spans, pending.base_span, pending.span)?
+            };
+            self.unify_at(pending.span, &Ty::Var(pending.result), &result_ty)?;
+        }
+        Ok(())
+    }
+
+    /// Runs `check_pending_constraints`/`check_pending_indices` to a
+    /// fixpoint — needed together, in a loop, not just once each back-to-
+    /// back: found directly while testing `print(matmul(ma,mb)[0,0])` with
+    /// no intervening `let` at all. `check_pending_constraints`'s own single
+    /// pass over `self.constraints` processes `MatMul`'s own deferred `C`
+    /// *and* `Print`'s own deferred constraint (queued after it, sharing the
+    /// same `Vec`) in one linear walk — but `Print`'s own gating depends on
+    /// `mc[0,0]`'s own result, which only `check_pending_indices` resolves,
+    /// and that method hasn't even run yet partway through `check_pending_
+    /// constraints`'s own single pass. One call each, back-to-back, isn't
+    /// enough — `Print`'s own entry needs a *second* look at `check_pending_
+    /// constraints`, after `check_pending_indices` has had its own turn.
+    /// Both methods now re-queue (not drop) whatever isn't ready yet
+    /// specifically so a later round here can pick it back up. Terminates
+    /// because each round either strictly shrinks the combined pending count
+    /// (real progress) or leaves it unchanged — the latter genuinely stuck
+    /// (a base nothing in this body ever pins down, e.g. `fn f(a) { a[0] }`
+    /// with `a` never otherwise constrained): on that final, no-progress
+    /// round, any leftover `pending_indices` entry is collapsed to the same
+    /// dead `<not-yet-inferred>` placeholder `check_pending_field_accesses`'s
+    /// own identical "give up" case already collapses to (`PendingIndex`'s
+    /// own `result` was a real `Ty::Var`, not a placeholder, specifically so
+    /// a *resolvable* chain could still be pinned down across rounds — but
+    /// once no more progress is possible, leaving it a bare, permanently
+    /// free variable would let it silently escape `check_no_placeholder`'s
+    /// own downstream safety net instead of being caught by it, a real
+    /// regression found directly by this project's own existing `indexing_
+    /// an_unresolved_base_defers_as_not_yet_inferred` test). Leftover
+    /// `self.constraints` entries need no equivalent final step — that's
+    /// already `check_pending_constraints`'s own documented "permissive by
+    /// omission" posture for a bound nothing ever pins down, unchanged.
+    pub(crate) fn check_pending_constraints_and_indices(&mut self) -> Result<(), TypeError> {
+        loop {
+            let before = self.constraints.len() + self.pending_indices.len();
+            self.check_pending_constraints()?;
+            self.check_pending_indices()?;
+            let after = self.constraints.len() + self.pending_indices.len();
+            if after == 0 {
+                return Ok(());
+            }
+            if after >= before {
+                for pending in std::mem::take(&mut self.pending_indices) {
+                    self.unify_at(pending.span, &Ty::Var(pending.result), &Ty::Con("<not-yet-inferred>".to_string()))?;
+                }
+                return Ok(());
+            }
         }
     }
 
@@ -2935,33 +3637,42 @@ impl<'r> Infer<'r> {
     /// `Grid<true>`'s `true`) alike, both the same shape of problem — to a
     /// `Ty`. A bare integer or bool literal becomes a resolved `Ty::Const`,
     /// a single-segment path matching a key in `mapping` becomes that
-    /// const-generic's own (fresh, per-call-site) variable, exactly like a
-    /// type-generic's bare reference resolves in `ty_from_ast_mapped` above.
-    /// An operator call (`4+3`, `N*2`, ...) — the same desugared shape
-    /// ordinary `+`/`*` already produce, see `ast.rs`'s own `Call` doc
-    /// comment — recurses on both operands and, if *both* resolve to a
-    /// `Ty::Const`, delegates the actual arithmetic to the standalone
-    /// `const_eval` module (deliberately isolated there — see its own module
-    /// doc comment — rather than folded in here, so it stays reusable
-    /// wherever else constant folding is needed later). Anything else (an
-    /// operand still abstract, or an operator `const_eval` doesn't know yet)
-    /// is `None`, deferred as a placeholder by the caller rather than
-    /// guessed at or hard-rejected. Deliberately *not* integer-only:
-    /// whether the result actually needs to be an integer is up to the
+    /// const-generic's own (fresh, per-call-site) variable, resolved through
+    /// `self.subst` first — a real bug, found by direct testing: an explicit
+    /// turbofish (`Buf::<2, 3>(...)`) already unifies `mapping`'s own fresh
+    /// vars against concrete values *earlier* in the same `StructLit`
+    /// inference, but `mapping` itself is never mutated by that (only
+    /// `self.subst` is), so a bare `mapping.get(name)` used to see the
+    /// original, still-unresolved var and never noticed. An operator call
+    /// (`4+3`, `N*2`, ...) — the same desugared shape ordinary `+`/`*`
+    /// already produce, see `ast.rs`'s own `Call` doc comment — recurses on
+    /// both operands and, if *both* resolve to a `Ty::Const`, delegates the
+    /// actual arithmetic to the standalone `const_eval` module (deliberately
+    /// isolated there — see its own module doc comment — rather than folded
+    /// in here, so it stays reusable wherever else constant folding is
+    /// needed later); an operator `const_eval` doesn't know yet, given two
+    /// already-concrete operands, is `None`, same as before this comment was
+    /// written. If either operand *isn't* concrete yet (an unresolved const
+    /// generic — `doc/backlog.md`'s own "Deferred/symbolic constant
+    /// folding" item), builds a real `Ty::ConstExpr` instead of giving up —
+    /// stays symbolic through a still-generic declaration, exactly like a
+    /// bare `Ty::Var` already does, folded later by `Subst::apply`/
+    /// `substitute` once real values arrive. Deliberately *not* integer-
+    /// only: whether the result actually needs to be an integer is up to the
     /// caller (`TypeKind::Array`'s own arm above pushes that constraint
     /// itself, since it's the one actual consumer that cares).
     fn const_value_from_expr(&mut self, value: &Expr, mapping: &HashMap<String, Ty>) -> Option<Ty> {
         match &value.kind {
             ExprKind::NumberLit { text, .. } => text.parse::<u64>().ok().map(|n| Ty::Const(ConstValue::Int(n))),
             ExprKind::BoolLit(b) => Some(Ty::Const(ConstValue::Bool(*b))),
-            ExprKind::Path(p) if p.segments.len() == 1 => mapping.get(&p.segments[0]).cloned(),
+            ExprKind::Path(p) if p.segments.len() == 1 => mapping.get(&p.segments[0]).map(|t| self.subst.apply(t)),
             ExprKind::Call(path, _, args, ..) if path.segments.len() == 1 && args.len() == 2 => {
-                let (Ty::Const(a), Ty::Const(b)) =
-                    (self.const_value_from_expr(&args[0], mapping)?, self.const_value_from_expr(&args[1], mapping)?)
-                else {
-                    return None;
-                };
-                const_eval::eval_binop(&path.segments[0], a, b).map(Ty::Const)
+                let a = self.const_value_from_expr(&args[0], mapping)?;
+                let b = self.const_value_from_expr(&args[1], mapping)?;
+                if let (Ty::Const(av), Ty::Const(bv)) = (&a, &b) {
+                    return const_eval::eval_binop(&path.segments[0], *av, *bv).map(Ty::Const);
+                }
+                Some(Ty::ConstExpr(path.segments[0].clone(), Box::new(a), Box::new(b)))
             }
             _ => None,
         }
@@ -3038,7 +3749,12 @@ impl<'r> Infer<'r> {
                         self.infer_expr(&env, value)?
                     };
                     if let Some(annotated) = ty {
-                        let declared = self.ty_from_ast(annotated);
+                        // `self.active_generics`, not `ty_from_ast`'s always-
+                        // empty map — a `let`'s own annotation may reference
+                        // the enclosing `fn`/impl-method's own generic
+                        // parameter — see `active_generics`'s own doc
+                        // comment for the real bug this closes.
+                        let declared = self.ty_from_ast_mapped(annotated, &self.active_generics.clone());
                         self.unify_at(annotated.span, &declared, &value_ty)?;
                     }
                     // `let mut` is never generalized — see module docs (the
@@ -3065,6 +3781,31 @@ impl<'r> Infer<'r> {
                     // so `instantiate`-ing it is a no-op equivalent to
                     // reading `.ty` directly.
                     let target_ty = self.infer_expr(&env, target)?;
+                    // Mutation stays exclusively for a real array — unlike
+                    // an ordinary read, `ExprKind::Index`'s own `Index`-
+                    // algebra fallback (see its doc comment) must *not*
+                    // apply to an assignment *target*: `Store` is a real
+                    // effect on a stable reference, but a `#[mlir_type(
+                    // ...)]`-tagged struct's real representation is an
+                    // immutable SSA value, nothing to mutate in place —
+                    // `cps.rs`'s own assignment-target conversion is (and
+                    // stays) hardcoded to a real array's `PrimOp::Store`,
+                    // so this must reject cleanly here rather than let a
+                    // tagged-struct target silently reach it. `base`'s own
+                    // type is already resolved (`infer_expr(target)` just
+                    // above walked into it) — re-read rather than re-infer.
+                    if let ExprKind::Index(base, _) = &target.kind {
+                        let base_ty = self.subst.apply(&self.node_types[&base.id].clone());
+                        if !matches!(base_ty, Ty::Array(..) | Ty::Var(_)) && !is_placeholder(&base_ty) {
+                            return Err(TypeError {
+                                span: target.span,
+                                kind: TypeErrorKind::Unify(UnifyError::Mismatch(
+                                    Ty::Array(Box::new(self.vars.fresh()), Box::new(self.vars.fresh())),
+                                    base_ty,
+                                )),
+                            });
+                        }
+                    }
                     let value_ty = self.infer_expr(&env, value)?;
                     self.unify_at(value.span, &target_ty, &value_ty)?;
                 }
@@ -3123,17 +3864,9 @@ impl<'r> Infer<'r> {
                         // `check_pending_constraints`), so this is additive,
                         // not a behavior change for a program that never
                         // `use`s `num`.
-                        self.constraints.push(Constraint {
-                            algebra: "Num".to_string(),
-                            tys: vec![v.clone()],
-                            span: expr.span,
-                        });
+                        self.constraints.push(Constraint::all_gating("Num".to_string(), vec![v.clone()], expr.span));
                         let shape_algebra = if is_float { "Float" } else { "Int" };
-                        self.constraints.push(Constraint {
-                            algebra: shape_algebra.to_string(),
-                            tys: vec![v.clone()],
-                            span: expr.span,
-                        });
+                        self.constraints.push(Constraint::all_gating(shape_algebra.to_string(), vec![v.clone()], expr.span));
                     }
                     Ok(v)
                 }
@@ -3144,7 +3877,8 @@ impl<'r> Infer<'r> {
             // (`stdlib/complex/complex.cleave`'s own marker algebra — same
             // "additive, no-op if no stdlib declares it" posture `Int`/
             // `Float` already have), and a `pending_defaults` fallback to
-            // `Complex<f64>`. `suffix` is always `None` here today (`lower.
+            // `Complex<f32>`, matching `Float`'s own default width.
+            // `suffix` is always `None` here today (`lower.
             // rs` never constructs one — `grammar.pest`'s own `imaginary_lit`
             // rule has no suffix syntax at all, unlike `numeric_lit`'s own
             // `type_suffix?`) — not handled, matching what's actually
@@ -3153,8 +3887,8 @@ impl<'r> Infer<'r> {
                 let v = self.vars.fresh();
                 if let Ty::Var(id) = v {
                     self.pending_defaults.push((id, NumberDefault::Complex));
-                    self.constraints.push(Constraint { algebra: "Num".to_string(), tys: vec![v.clone()], span: expr.span });
-                    self.constraints.push(Constraint { algebra: "Complex".to_string(), tys: vec![v.clone()], span: expr.span });
+                    self.constraints.push(Constraint::all_gating("Num".to_string(), vec![v.clone()], expr.span));
+                    self.constraints.push(Constraint::all_gating("Complex".to_string(), vec![v.clone()], expr.span));
                 }
                 Ok(v)
             }
@@ -3232,7 +3966,7 @@ impl<'r> Infer<'r> {
                 // specifically (no hardcoded width, same "Int, unconstrained
                 // width" posture `ExprKind::Index`'s own bound already
                 // uses), just some real `Int`-impl'd type.
-                self.constraints.push(Constraint { algebra: "Int".to_string(), tys: vec![start_ty.clone()], span: start.span });
+                self.constraints.push(Constraint::all_gating("Int".to_string(), vec![start_ty.clone()], start.span));
                 let mut inner_env = env.clone();
                 inner_env.insert(var.clone(), Scheme::mono(start_ty));
                 // `infer_block` clones `inner_env` again internally — the
@@ -3244,135 +3978,86 @@ impl<'r> Infer<'r> {
             ExprKind::MethodCall(base, name, args) => {
                 let base_ty = self.infer_expr(env, base)?;
                 let resolved_base = self.subst.apply(&base_ty);
-                // Still abstract, or an already-unresolved placeholder
-                // (chained off another not-yet-inferred expression) — same
-                // "we don't know yet" posture `FieldAccess` already uses.
-                if matches!(resolved_base, Ty::Var(_)) || is_placeholder(&resolved_base) {
-                    return Ok(Ty::Con("<not-yet-inferred>".to_string()));
-                }
-                let struct_name = match &resolved_base {
-                    Ty::Con(n) => n.clone(),
-                    Ty::App(n, _) => n.clone(),
-                    // A function value, array, or const-value — none of
-                    // these have methods, rejected the same way
-                    // `FieldAccess` rejects them for fields. `Ty::Var` is
-                    // included only for exhaustiveness — already returned
-                    // above, never actually reached here.
-                    Ty::Fn(..) | Ty::Array(..) | Ty::Const(_) | Ty::Var(_) => {
-                        return Err(TypeError {
-                            span: expr.span,
-                            kind: TypeErrorKind::NoSuchMethod {
-                                struct_name: resolved_base.to_string(),
-                                method: name.clone(),
-                            },
+                match &resolved_base {
+                    // Still abstract — nothing pinned the base's type down
+                    // *yet*, but it still might (e.g. `apply_defaults`,
+                    // which hasn't run yet at this point in an ordinary
+                    // top-to-bottom pass) — deferred exactly like
+                    // `FieldAccess` defers the same "not knowable yet"
+                    // question, resolved for real once
+                    // `check_pending_method_calls` runs, after defaulting.
+                    // Arguments never depend on the base's own resolution,
+                    // so they're still inferred immediately, right here.
+                    Ty::Var(_) => {
+                        let mut arg_tys = Vec::with_capacity(args.len());
+                        let mut arg_spans = Vec::with_capacity(args.len());
+                        for a in args {
+                            arg_tys.push(self.infer_expr(env, a)?);
+                            arg_spans.push(a.span);
+                        }
+                        let Ty::Var(result) = self.vars.fresh() else { unreachable!("fresh() always returns Ty::Var") };
+                        self.pending_method_calls.push(PendingMethodCall {
+                            base: resolved_base,
+                            method: name.clone(),
+                            arg_tys,
+                            arg_spans,
+                            base_span: base.span,
+                            result,
+                            call_span: expr.span,
                         });
+                        Ok(Ty::Var(result))
                     }
-                };
-                // A (self- or, less commonly, sibling-triggered) recursive
-                // call back into the method *currently* having its own body
-                // inferred — see `in_progress_methods`'s own doc comment.
-                // Reuses that enclosing invocation's own already-resolved
-                // param types and return-type placeholder directly, instead
-                // of re-deriving a fresh instantiation from the registry:
-                // there's exactly one in-flight instantiation to recurse
-                // into, the same one this call is already nested inside.
-                if let Some((param_tys, ret_ty)) = self.in_progress_methods.get(&(struct_name.clone(), name.clone())).cloned() {
-                    self.unify_at(base.span, &param_tys[0], &resolved_base)?;
-                    for (pt, a) in param_tys[1..].iter().zip(args) {
-                        let at = self.infer_expr(env, a)?;
-                        self.unify_at(a.span, pt, &at)?;
+                    // An *already*-unresolved placeholder (a method call
+                    // chained off another not-yet-inferred expression) —
+                    // genuinely never resolves no matter how long this
+                    // waits, so it keeps returning the placeholder
+                    // immediately, unchanged.
+                    Ty::Con(name2) if is_placeholder(&resolved_base) => {
+                        let _ = name2;
+                        Ok(Ty::Con("<not-yet-inferred>".to_string()))
                     }
-                    return Ok(self.subst.apply(&ret_ty));
+                    _ => {
+                        // A (self- or, less commonly, sibling-triggered)
+                        // recursive call back into the method *currently*
+                        // having its own body inferred — see
+                        // `in_progress_methods`'s own doc comment. Reuses
+                        // that enclosing invocation's own already-resolved
+                        // param types and return-type placeholder directly,
+                        // instead of re-deriving a fresh instantiation from
+                        // the registry: there's exactly one in-flight
+                        // instantiation to recurse into, the same one this
+                        // call is already nested inside. Handled here,
+                        // inline, rather than inside `resolve_method_call`:
+                        // `in_progress_methods` entries are always removed
+                        // before that same call's own `finish_fn`/defaulting
+                        // phase runs, so this branch is structurally
+                        // guaranteed irrelevant to the deferred path above.
+                        let struct_name = match &resolved_base {
+                            Ty::Con(n) => Some(n.clone()),
+                            Ty::App(n, _) => Some(n.clone()),
+                            _ => None,
+                        };
+                        if let Some(struct_name) = &struct_name {
+                            if let Some((param_tys, ret_ty)) =
+                                self.in_progress_methods.get(&(struct_name.clone(), name.clone())).cloned()
+                            {
+                                self.unify_at(base.span, &param_tys[0], &resolved_base)?;
+                                for (pt, a) in param_tys[1..].iter().zip(args) {
+                                    let at = self.infer_expr(env, a)?;
+                                    self.unify_at(a.span, pt, &at)?;
+                                }
+                                return Ok(self.subst.apply(&ret_ty));
+                            }
+                        }
+                        let mut arg_tys = Vec::with_capacity(args.len());
+                        let mut arg_spans = Vec::with_capacity(args.len());
+                        for a in args {
+                            arg_tys.push(self.infer_expr(env, a)?);
+                            arg_spans.push(a.span);
+                        }
+                        self.resolve_method_call(&resolved_base, name, &arg_tys, &arg_spans, base.span, expr.span)
+                    }
                 }
-                let Some(entry) = self.registry.inherent_method(&struct_name, name).cloned() else {
-                    return Err(TypeError {
-                        span: expr.span,
-                        kind: TypeErrorKind::NoSuchMethod { struct_name, method: name.clone() },
-                    });
-                };
-                // `base` fills the method's own first parameter — an
-                // ordinary, explicit positional argument, not a magic
-                // `self` (see `grammar.pest`'s `inherent_impl` comment for
-                // why: this project doesn't have implicit-anything
-                // elsewhere, no reason to invent one here).
-                if entry.method.params.is_empty() || entry.method.params.len() != args.len() + 1 {
-                    return Err(TypeError {
-                        span: expr.span,
-                        kind: TypeErrorKind::ArityMismatch {
-                            name: name.clone(),
-                            expected: entry.method.params.len(),
-                            found: args.len() + 1,
-                        },
-                    });
-                }
-                // The impl block's own generics (`impl<T: Float> Vec2<T>`)
-                // — fresh per call, bounds pushed as real `Constraint`s
-                // exactly like an algebra impl's own (`fresh_generics_
-                // mapping`). `target_ty` — built *from* `impl_mapping`, so
-                // `Boxed<T>` becomes `App("Boxed", [impl_mapping["T"]])` —
-                // is what actually pins those generics down once unified
-                // against `resolved_base` below; a bare fresh var for
-                // `param_tys[0]` would *also* end up correctly unified with
-                // `resolved_base`, but as its own, disconnected variable,
-                // never actually feeding back into `impl_mapping` at all —
-                // a real bug, found by testing: a generic inherent method's
-                // own return type (`T`, resolved through this same
-                // `impl_mapping`) came back as a bare, still-unconstrained
-                // variable instead of the concrete type `base` actually
-                // has. Mirrors `infer_inherent_impl_fn_generic`'s own
-                // identical fix for the exact same reason, on the
-                // declaration side.
-                let impl_mapping = self.fresh_generics_mapping(&entry.generics, expr.span);
-                let target_ty = self.ty_from_ast_mapped(&entry.target, &impl_mapping);
-                let param_tys = self.inherent_method_param_tys(&entry.method.params, &impl_mapping, &target_ty);
-                self.unify_at(base.span, &param_tys[0], &resolved_base)?;
-                for (pt, a) in param_tys[1..].iter().zip(args) {
-                    let at = self.infer_expr(env, a)?;
-                    self.unify_at(a.span, pt, &at)?;
-                }
-                // Unlike an algebra call (which always has a real declared
-                // signature, return type included, to fall back on) or a
-                // top-level `fn` call (whose return type was already
-                // *inferred*, once, by the whole-program pass, then
-                // generalized into a reusable `Scheme` — see `callgraph.rs`)
-                // — dispatch here never re-runs the method's own body at the
-                // call site (except for the recursive, `in_progress_methods`
-                // case just above), so an inherent method with no explicit
-                // `->` annotation has no return type available *anywhere*
-                // else to report... unless `callgraph::infer_inherent_impls_
-                // early` already ran and published one (`self.inherent_
-                // patterns`, opted into via `with_inherent_patterns` — only
-                // `callgraph::infer_program` itself does today). Its own
-                // pattern's free vars are named by generic-parameter *name*
-                // (`generics_mapping`, built by a *different* `Infer`
-                // instance than this call site's own `impl_mapping`), so
-                // reusing it means cross-referencing by name and remapping
-                // through *this* call site's own fresh vars, not substituting
-                // it in directly. Falls back to the placeholder, same
-                // posture as every other genuinely-unresolved case in this
-                // file, for a method whose own return type couldn't be
-                // determined even by that early pass (e.g. it depends on a
-                // top-level `fn`, not yet visible to it — see that pass's
-                // own doc comment for why this is a deliberate, graceful
-                // deferral, not a bug).
-                Ok(entry
-                    .method
-                    .ret
-                    .as_ref()
-                    .map(|t| self.ty_from_ast_mapped(t, &impl_mapping))
-                    .or_else(|| {
-                        let pattern = self.inherent_patterns?.get(&(struct_name.clone(), name.clone()))?;
-                        let remap: HashMap<TyVar, Ty> = pattern
-                            .generics_mapping
-                            .iter()
-                            .filter_map(|(n, t)| match t {
-                                Ty::Var(v) => Some((*v, impl_mapping[n].clone())),
-                                _ => None,
-                            })
-                            .collect();
-                        Some(substitute(&pattern.ret_pattern, &remap))
-                    })
-                    .unwrap_or_else(|| Ty::Con("<not-yet-inferred>".to_string())))
             }
             ExprKind::ArrayLit(elems) => {
                 // Every element must agree on one type — checked pairwise
@@ -3402,116 +4087,97 @@ impl<'r> Infer<'r> {
                 let count_ty = self.infer_expr(env, count)?;
                 Ok(Ty::Array(Box::new(elem_ty), Box::new(count_ty)))
             }
-            ExprKind::Index(base, idx) => {
+            // One bracket group, `a[i]` or `a[i,j,...]` — `indices` is
+            // never empty (grammar requires at least one `expr` inside
+            // `[...]`). `base`'s own type decides everything:
+            ExprKind::Index(base, indices) => {
                 let base_ty = self.infer_expr(env, base)?;
-                let idx_ty = self.infer_expr(env, idx)?;
-                // The index itself must be some integer type — doesn't need
-                // to be a literal, just `Int`-constrained like any other
-                // integer-typed value (`fibonacci`'s own `T: Int` bound uses
-                // the exact same mechanism).
-                self.constraints.push(Constraint { algebra: "Int".to_string(), tys: vec![idx_ty], span: idx.span });
                 let resolved_base = self.subst.apply(&base_ty);
-                match resolved_base {
-                    // Still abstract, or already an unresolved placeholder
-                    // (chained off another not-yet-inferred expression) —
-                    // same "we don't know yet" posture as `FieldAccess`.
-                    Ty::Var(_) => Ok(Ty::Con("<not-yet-inferred>".to_string())),
+                // Indices never depend on the base's own resolution —
+                // inferred (and `Int`-constrained) immediately either way,
+                // mirroring `PendingMethodCall`'s own "arguments captured
+                // already-resolved" split (see `Infer::pending_indices`'s
+                // own doc comment) — only what indexing actually *means*
+                // (peel an array dimension, or dispatch `Index<Container,
+                // Elem,K>`) is what's deferred below, when it can't be
+                // decided yet.
+                let mut index_tys: Vec<Ty> = Vec::with_capacity(indices.len());
+                let mut index_spans: Vec<Span> = Vec::with_capacity(indices.len());
+                for idx in indices {
+                    let idx_ty = self.infer_expr(env, idx)?;
+                    self.constraints.push(Constraint::all_gating("Int".to_string(), vec![idx_ty.clone()], idx.span));
+                    index_tys.push(idx_ty);
+                    index_spans.push(idx.span);
+                }
+                match &resolved_base {
+                    // Still abstract — but *not* a dead end the way an
+                    // already-unresolved placeholder is (see the guard just
+                    // below): `mc[0,0]` right after `let mc = matmul(ma,
+                    // mb);` has `mc`'s own type as a bare `Ty::Var` at this
+                    // exact point (an algebra call's output-only generic
+                    // isn't independently concrete until its own dispatch
+                    // runs, itself possibly still deferred — see `doc/
+                    // backlog.md`'s own "`check_pending_constraints`'s
+                    // output-only-generic gate" item), but it *will*
+                    // resolve, later, once `apply_defaults`/`check_pending_
+                    // constraints` have run. Mirrors `FieldAccess`'s own
+                    // identical `Ty::Var(_)` arm exactly: a fresh real
+                    // `Ty::Var` (not a dead `Ty::Con` placeholder) is
+                    // returned so this node can still be pinned down by a
+                    // later unification, and the real resolution is
+                    // deferred to `check_pending_indices`.
+                    Ty::Var(_) => {
+                        let Ty::Var(result) = self.vars.fresh() else { unreachable!("fresh() always returns Ty::Var") };
+                        self.pending_indices.push(PendingIndex {
+                            base: resolved_base,
+                            base_span: base.span,
+                            index_tys,
+                            index_spans,
+                            result,
+                            span: expr.span,
+                        });
+                        Ok(Ty::Var(result))
+                    }
+                    // An *already*-unresolved placeholder (chained off
+                    // another not-yet-inferred expression, e.g. an
+                    // undeclared cross-function call) — genuinely never
+                    // resolves no matter how long this waits, so it keeps
+                    // returning the placeholder immediately, unchanged.
                     _ if is_placeholder(&resolved_base) => Ok(Ty::Con("<not-yet-inferred>".to_string())),
-                    Ty::Array(elem, _) => Ok(self.subst.apply(&elem)),
-                    // Concrete, resolved, and definitely not an array — a
-                    // real type error (indexing an `i32`, a struct, ...),
-                    // not something to defer. Built directly rather than via
-                    // `unify_at` since we already know it can't match: an
-                    // `Array` can only ever structurally unify with another
-                    // `Array` or an unresolved `Var`, both already excluded
-                    // above.
-                    other => Err(TypeError {
-                        span: expr.span,
-                        kind: TypeErrorKind::Unify(UnifyError::Mismatch(
-                            Ty::Array(Box::new(self.vars.fresh()), Box::new(self.vars.fresh())),
-                            other,
-                        )),
-                    }),
+                    _ => self.resolve_index(resolved_base, &index_tys, &index_spans, base.span, expr.span),
                 }
             }
             ExprKind::FieldAccess(base, name) => {
                 let base_ty = self.infer_expr(env, base)?;
                 let resolved = self.subst.apply(&base_ty);
                 match &resolved {
-                    // Still abstract (nothing pinned the base's type down
-                    // yet) — same "we don't know, not yet a failure"
-                    // posture as any other not-yet-inferred construct;
-                    // `is_placeholder` covers an *already*-unresolved base
-                    // (a field access chained off another not-yet-inferred
-                    // expression) the same way.
-                    Ty::Var(_) => Ok(Ty::Con("<not-yet-inferred>".to_string())),
+                    // Still abstract — nothing pinned the base's type down
+                    // *yet*, but it still might (e.g. `apply_defaults`,
+                    // which hasn't run yet at this point in an ordinary
+                    // top-to-bottom pass) — deferred exactly like
+                    // `pending_type_name_checks` defers a different "not
+                    // knowable yet" question, resolved for real once
+                    // `check_pending_field_accesses` runs, after defaulting.
+                    Ty::Var(_) => {
+                        let Ty::Var(result) = self.vars.fresh() else { unreachable!("fresh() always returns Ty::Var") };
+                        self.pending_field_accesses.push(PendingFieldAccess {
+                            base: resolved,
+                            field: name.clone(),
+                            result,
+                            span: expr.span,
+                        });
+                        Ok(Ty::Var(result))
+                    }
+                    // An *already*-unresolved placeholder (a field access
+                    // chained off another not-yet-inferred expression, e.g.
+                    // an undeclared cross-function call) — genuinely never
+                    // resolves no matter how long this waits, so it keeps
+                    // returning the placeholder immediately, unchanged.
                     Ty::Con(name2) if is_placeholder(&resolved) => {
                         let _ = name2;
                         Ok(Ty::Con("<not-yet-inferred>".to_string()))
                     }
-                    // Non-generic struct (or any other bare concrete type —
-                    // see the `None` arm below) — field's declared type
-                    // needs no further mapping, it can't mention a generic
-                    // parameter this struct doesn't have.
-                    Ty::Con(struct_name) => match self.registry.struct_fields(struct_name) {
-                        Some(fields) => match fields.iter().find(|f| &f.name == name) {
-                            Some(field) => Ok(self.ty_from_ast(&field.ty)),
-                            None => Err(TypeError {
-                                span: expr.span,
-                                kind: TypeErrorKind::NoSuchField {
-                                    struct_name: struct_name.clone(),
-                                    field: name.clone(),
-                                },
-                            }),
-                        },
-                        // A concrete, known type that simply isn't a struct
-                        // at all (`(1).foo`) — genuinely has no fields,
-                        // rejected the same way as a struct missing this
-                        // specific one.
-                        None => Err(TypeError {
-                            span: expr.span,
-                            kind: TypeErrorKind::NoSuchField { struct_name: struct_name.clone(), field: name.clone() },
-                        }),
-                    },
-                    // A generic struct, already instantiated at some
-                    // concrete (or still-abstract, doesn't matter — could be
-                    // `Complex<'t9>`) set of type arguments — map the
-                    // struct's own declared generic parameter names to
-                    // *these* arguments (positionally, `App`'s own
-                    // established convention) before resolving the field's
-                    // declared type, so `real: T` on `Complex<f64>` reads
-                    // back as `f64`, not the literal, meaningless name `T`.
-                    Ty::App(struct_name, type_args) => match self.registry.struct_fields(struct_name) {
-                        Some(fields) => match fields.iter().find(|f| &f.name == name).cloned() {
-                            Some(field) => {
-                                let mapping = self.zip_struct_generics(struct_name, type_args);
-                                Ok(self.ty_from_ast_mapped(&field.ty, &mapping))
-                            }
-                            None => Err(TypeError {
-                                span: expr.span,
-                                kind: TypeErrorKind::NoSuchField {
-                                    struct_name: struct_name.clone(),
-                                    field: name.clone(),
-                                },
-                            }),
-                        },
-                        None => Err(TypeError {
-                            span: expr.span,
-                            kind: TypeErrorKind::NoSuchField { struct_name: struct_name.clone(), field: name.clone() },
-                        }),
-                    },
-                    // Neither has fields — a function value or an array
-                    // (indexing, not field access, is how you reach into an
-                    // array) rejected the same way as any other fieldless
-                    // concrete type. `Const` can't actually reach here in
-                    // practice (nothing produces one as an *expression's*
-                    // type, only inside another type's size slot), but is
-                    // handled the same way for exhaustiveness rather than a
-                    // `todo!()`/panic waiting to be hit by a future caller.
-                    Ty::Fn(..) | Ty::Array(..) | Ty::Const(_) => Err(TypeError {
-                        span: expr.span,
-                        kind: TypeErrorKind::NoSuchField { struct_name: resolved.to_string(), field: name.clone() },
-                    }),
+                    _ => self.resolve_field_access(&resolved, name, expr.span),
                 }
             }
             ExprKind::StructLit(path, explicit_generics, fields) => {
@@ -3621,8 +4287,13 @@ impl<'r> Infer<'r> {
                 let mut inner_env = env.clone();
                 let mut param_tys = Vec::with_capacity(params.len());
                 for p in params {
+                    // `active_generics`, not `ty_from_ast`'s always-empty
+                    // map — see that field's own doc comment: a nested
+                    // lambda's own parameter annotation can reference the
+                    // enclosing `fn`/impl-method's own generic just as
+                    // easily as a `let`'s own can.
                     let ty = match &p.ty {
-                        Some(t) => self.ty_from_ast(t),
+                        Some(t) => self.ty_from_ast_mapped(t, &self.active_generics.clone()),
                         None => self.vars.fresh(),
                     };
                     inner_env.insert(p.name.clone(), Scheme::mono(ty.clone()));
@@ -3633,7 +4304,7 @@ impl<'r> Infer<'r> {
                 // else (see `infer_block`'s own doc comment).
                 let body_ty = self.infer_block(&inner_env, body)?;
                 if let Some(r) = ret {
-                    let declared = self.ty_from_ast(r);
+                    let declared = self.ty_from_ast_mapped(r, &self.active_generics.clone());
                     self.unify_at(r.span, &declared, &body_ty)?;
                 }
                 Ok(Ty::Fn(param_tys, Box::new(body_ty)))
@@ -3695,7 +4366,8 @@ impl<'r> Infer<'r> {
             // constrained by the call's own arguments, so an ambiguous
             // dispatch (`dispatch_algebra_call`'s own `AmbiguousDispatch`)
             // has no other way to be resolved.
-            return self.infer_algebra_call(call_span, algebra, &name, &arg_tys, args, explicit_generics);
+            let arg_spans: Vec<Span> = args.iter().map(|a| a.span).collect();
+            return self.infer_algebra_call(call_span, algebra, &name, &arg_tys, &arg_spans, explicit_generics);
         }
 
         if let Some(scheme) = env.get(&name).cloned() {
@@ -3776,7 +4448,7 @@ impl<'r> Infer<'r> {
         algebra: &str,
         name: &str,
         arg_tys: &[Ty],
-        args: &[Expr],
+        arg_spans: &[Span],
         explicit_generics: &[GenericArg],
     ) -> Result<Ty, TypeError> {
         let sig = self
@@ -3785,10 +4457,10 @@ impl<'r> Infer<'r> {
             .cloned()
             .unwrap_or_else(|| unreachable!("registry reported `{algebra}` declares `{name}`, but fn_sig lookup failed"));
 
-        if sig.params.len() != args.len() {
+        if sig.params.len() != arg_spans.len() {
             return Err(TypeError {
                 span: call_span,
-                kind: TypeErrorKind::ArityMismatch { name: name.to_string(), expected: sig.params.len(), found: args.len() },
+                kind: TypeErrorKind::ArityMismatch { name: name.to_string(), expected: sig.params.len(), found: arg_spans.len() },
             });
         }
 
@@ -3846,8 +4518,8 @@ impl<'r> Infer<'r> {
         let ret_ty =
             sig.ret.as_ref().map(|t| self.ty_from_ast_mapped(t, &mapping)).unwrap_or_else(|| Ty::Con("()".to_string()));
 
-        for (pt, (at, a)) in param_tys.iter().zip(arg_tys.iter().zip(args)) {
-            self.unify_at(a.span, pt, at)?;
+        for (pt, (at, span)) in param_tys.iter().zip(arg_tys.iter().zip(arg_spans)) {
+            self.unify_at(*span, pt, at)?;
         }
 
         // Checked against the *algebra's own* generics (positionally
@@ -3888,12 +4560,22 @@ impl<'r> Infer<'r> {
         }
         let mut resolved_generics: Vec<Ty> = Vec::new();
         let mut gating: Vec<Ty> = Vec::new();
+        // Positions in `resolved_generics` that are gating — threaded into
+        // a deferred `Constraint` below (`Constraint::gating_indices`'s own
+        // doc comment) so `check_pending_constraints`, whenever it re-checks
+        // this exact tuple later, knows which position(s) it's still
+        // waiting on and which are output-only and should instead be bound
+        // *by* a real, committing dispatch, not required concrete before
+        // one is even attempted — the fix for `doc/backlog.md`'s own
+        // "`check_pending_constraints`'s output-only-generic gate" item.
+        let mut gating_indices: Vec<usize> = Vec::new();
         for g in &generics {
             let GenericParam::Type { name, .. } = g else { continue };
             let fresh = &mapping[name];
             let resolved = self.subst.apply(fresh);
             if matches!(fresh, Ty::Var(v) if param_free_vars.contains(v)) {
                 gating.push(resolved.clone());
+                gating_indices.push(resolved_generics.len());
             }
             resolved_generics.push(resolved);
         }
@@ -3903,10 +4585,10 @@ impl<'r> Infer<'r> {
             // for something not type-inferred yet. Deferred below, same as
             // the "still abstract" case — one constraint holding the *whole*
             // tuple together (see `Constraint`'s own doc comment), checked
-            // coherently by `check_pending_constraints` once every element
-            // is concrete, same engine `match_impl`'s immediate-dispatch
-            // path already uses.
-            self.constraints.push(Constraint { algebra: algebra.to_string(), tys: resolved_generics, span: call_span });
+            // coherently by `check_pending_constraints` once every gating
+            // element is concrete, same engine `match_impl`'s immediate-
+            // dispatch path already uses.
+            self.constraints.push(Constraint { algebra: algebra.to_string(), tys: resolved_generics, gating_indices, span: call_span });
         } else if gating.iter().all(is_fully_concrete) {
             // Ready: every *input* generic is known, so dispatch can
             // actually run — commits the match's own bindings for real
@@ -3923,8 +4605,12 @@ impl<'r> Infer<'r> {
             // pinned down yet) — defer, one constraint for the whole tuple:
             // either `generalize` migrates it into an enclosing `let`'s
             // scheme, or `check_pending_constraints` catches it once
-            // `infer_fn` finishes, whichever comes first.
-            self.constraints.push(Constraint { algebra: algebra.to_string(), tys: resolved_generics, span: call_span });
+            // `infer_fn` finishes, whichever comes first. The output-only
+            // positions (not in `gating_indices`) stay open `Ty::Var`s in
+            // `resolved_generics` here, on purpose — `check_pending_
+            // constraints` binds them later, it doesn't require them
+            // concrete first.
+            self.constraints.push(Constraint { algebra: algebra.to_string(), tys: resolved_generics, gating_indices, span: call_span });
         }
 
         Ok(self.subst.apply(&ret_ty))
@@ -4044,7 +4730,11 @@ impl<'r> Infer<'r> {
             let default_ty = match default {
                 NumberDefault::Int => Ty::Con("i32".to_string()),
                 NumberDefault::Float => Ty::Con("f32".to_string()),
-                NumberDefault::Complex => Ty::App("Complex".to_string(), vec![Ty::Con("f64".to_string())]),
+                // Matches `Float`'s own default width — no principled reason
+                // for a bare `4i` to default to a wider real/imaginary
+                // component than a bare `4.0` would (real, found by direct
+                // testing: the two used to disagree).
+                NumberDefault::Complex => Ty::App("Complex".to_string(), vec![Ty::Con("f32".to_string())]),
             };
             unify(&mut self.subst, &Ty::Var(root), &default_ty)
                 .expect("defaulting an unbound, non-quantified variable can't fail");

@@ -48,6 +48,70 @@ fn impl_fragments_across_files_are_merged_by_algebra_and_target() {
     }
 }
 
+/// Real bug, found by direct testing while investigating a native MLIR
+/// crash: `#[mlir_type(...)]` (`ImplDecl::attrs`) used to be silently
+/// dropped when an attr-less fragment of the same `impl` (algebra + target
+/// + generics) happened to be merged first — `merge_impl_fragment` only
+/// ever merged `.fns`, never `.attrs`, so whichever fragment was processed
+/// first silently determined the final, merged impl's own attrs, discarding
+/// a *later* fragment's own tag entirely, with no diagnostic anywhere. A
+/// local, unrelated `impl Float<f64> {}` (no tag) processed before
+/// `stdlib/num/num.cleave`'s own `#[mlir_type(f64)] impl Float<f64> {}`
+/// (the entry file's own items are always merged before any resolved
+/// `use`/prelude crate's) reproduced this directly — `f64` silently lost
+/// its own MLIR type text, later crashing `mlir_lower.rs::ty_to_mlir` with
+/// a native assertion instead of a clean, attributable error.
+#[test]
+fn an_attrless_impl_fragment_adopts_a_sibling_fragments_attrs() {
+    let f1 = file(0, "a.cleave", "impl Float<f64> {}");
+    let f2 = file(1, "b.cleave", "#[mlir_type(f64)] impl Float<f64> {}");
+
+    let merged = merge_programs(vec![parse_file(&f1).unwrap(), parse_file(&f2).unwrap()]).unwrap();
+    assert_eq!(merged.items.len(), 1);
+    match &merged.items[0].kind {
+        ItemKind::Impl(d) => assert_eq!(d.attrs.len(), 1, "the tagged fragment's own attr must survive the merge"),
+        other => panic!("expected an impl item, got {other:?}"),
+    }
+}
+
+/// Same as above, fragments in the opposite order — the fix must not just
+/// happen to work because the tagged fragment merges *into* the untagged
+/// one; it has to work regardless of which side is the accumulator.
+#[test]
+fn an_attrless_impl_fragment_adopts_a_sibling_fragments_attrs_reversed_order() {
+    let f1 = file(0, "a.cleave", "#[mlir_type(f64)] impl Float<f64> {}");
+    let f2 = file(1, "b.cleave", "impl Float<f64> {}");
+
+    let merged = merge_programs(vec![parse_file(&f1).unwrap(), parse_file(&f2).unwrap()]).unwrap();
+    assert_eq!(merged.items.len(), 1);
+    match &merged.items[0].kind {
+        ItemKind::Impl(d) => assert_eq!(d.attrs.len(), 1, "the tagged fragment's own attr must survive the merge"),
+        other => panic!("expected an impl item, got {other:?}"),
+    }
+}
+
+#[test]
+fn impl_fragments_disagreeing_on_attrs_is_a_conflict() {
+    let f1 = file(0, "a.cleave", "#[mlir_type(f32)] impl Float<f64> {}");
+    let f2 = file(1, "b.cleave", "#[mlir_type(f64)] impl Float<f64> {}");
+
+    let errs = merge_programs(vec![parse_file(&f1).unwrap(), parse_file(&f2).unwrap()]).unwrap_err();
+    assert_eq!(errs.len(), 1);
+    assert!(errs[0].message.contains("disagree"), "got: {}", errs[0].message);
+}
+
+#[test]
+fn impl_fragments_agreeing_on_attrs_are_not_a_conflict() {
+    let f1 = file(0, "a.cleave", "#[mlir_type(f64)] impl Float<f64> {}");
+    let f2 = file(1, "b.cleave", "#[mlir_type(f64)] impl Float<f64> { fn foo(x: f64) -> f64 { x } }");
+
+    let merged = merge_programs(vec![parse_file(&f1).unwrap(), parse_file(&f2).unwrap()]).unwrap();
+    match &merged.items[0].kind {
+        ItemKind::Impl(d) => assert_eq!(d.attrs.len(), 1),
+        other => panic!("expected an impl item, got {other:?}"),
+    }
+}
+
 #[test]
 fn overloads_with_different_param_types_coexist() {
     let f1 = file(0, "a.cleave", "algebra Ring<T> { fn add(a: T, b: T) -> T; }");

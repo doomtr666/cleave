@@ -1117,22 +1117,23 @@ fn convert_stmts(stmts: &[Stmt], env: CEnv, ctx: &Ctx, k: &dyn Fn(CEnv) -> CExpr
                     convert_stmts(rest, env2, ctx, k)
                 })
             }
-            // A chain of nested `Index` nodes (`a[i,j]`'s own Fortran sugar
-            // *and* a literal `a[i][j]` both desugar to the exact same
-            // `Index(Index(a,i),j)` shape -- indistinguishable after
-            // lowering, and, in this language, semantically identical too: a
-            // multi-dim array's own type is always `Array(Array(T,C),R)`,
-            // never a separate primitive) collapses into *one* combined,
-            // multi-index `Store` — see the module's own "Arrays" doc
-            // comment for why this matters for correctness, not just
-            // efficiency: a write through an *intermediate* single-index
-            // `Load` (getting "the row", then storing into that) would only
-            // be correct if `Load` on an array-of-arrays element aliased the
-            // original storage rather than copying it out — a real, load-
-            // bearing representation choice this module never actually
-            // makes, so this instead never produces that intermediate `Load`
-            // at all: the whole chain resolves to one flat offset in a
-            // single effect.
+            // A chain of one or more `Index` *groups* (`a[i,j]`'s own single
+            // bracket group, or two separate bracket pairs `a[i][j]` — both
+            // still land here, and both still collapse into *one* combined,
+            // multi-index `Store` via `collect_index_chain`, which now walks
+            // group-by-group rather than index-by-index) — see the module's
+            // own "Arrays" doc comment for why this matters for correctness,
+            // not just efficiency: a write through an *intermediate* single-
+            // index `Load` (getting "the row", then storing into that) would
+            // only be correct if `Load` on an array-of-arrays element
+            // aliased the original storage rather than copying it out — a
+            // real, load-bearing representation choice this module never
+            // actually makes, so this instead never produces that
+            // intermediate `Load` at all: the whole chain resolves to one
+            // flat offset in a single effect. `infer.rs`'s own `StmtKind::
+            // Assign` guard already rejects a non-array base before this is
+            // ever reached, so this is always a real array, never an
+            // `Index`-algebra target.
             ExprKind::Index(..) => {
                 let (array_expr, index_exprs) = collect_index_chain(target);
                 let array_ty = ctx.node_types[&array_expr.id].clone();
@@ -1287,6 +1288,7 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
         ExprKind::Call(path, _, args, ..) => {
             let name = path.segments.join("::");
             let arg_refs: Vec<&Expr> = args.iter().collect();
+            let arg_ids: Vec<NodeId> = args.iter().map(|a| a.id).collect();
             let result_ty = ctx.node_types[&expr.id].clone();
             // Checked *first*, before falling through to `resolve_call`'s
             // own tiers — a local lambda binding shadowing a same-named
@@ -1349,14 +1351,14 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                 }
                 let remaining: Vec<&Expr> = args.iter().enumerate().filter(|(i, _)| !erased.contains(i)).map(|(_, a)| a).collect();
                 return convert_expr_list(&remaining, env, ctx, &move |arg_vals, env| {
-                    let callee = resolve_call(&name, expr, args, ctx);
+                    let callee = resolve_call(&name, expr.id, &arg_ids, ctx);
                     let mut full_args = prelude.clone();
                     full_args.extend(arg_vals);
                     emit_call(callee, full_args, result_ty.clone(), ctx, env, k)
                 });
             }
             convert_expr_list(&arg_refs, env, ctx, &|arg_vals, env| {
-                let callee = resolve_call(&name, expr, args, ctx);
+                let callee = resolve_call(&name, expr.id, &arg_ids, ctx);
                 // A *self*-recursive call to a captured lambda's own unit,
                 // from inside that same unit's own body, is the only way a
                 // call resolving to a `<lambda#...>` unit ever reaches this
@@ -1574,8 +1576,15 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
         // Collapses a whole chain of nested `Index` nodes into one combined,
         // multi-index `Load` -- see `StmtKind::Assign`'s own `Index` arm for
         // why (the same reasoning applies to reads, for consistency, even
-        // though a read alone has no aliasing hazard either way).
-        ExprKind::Index(..) => {
+        // though a read alone has no aliasing hazard either way). Only for
+        // a real array base -- checked *before* `collect_index_chain` ever
+        // walks the chain, on `base`'s own direct type, not the (possibly
+        // multi-level) chain-flattened one: chaining is an array-only
+        // optimization, never meaningful for the `Index`-algebra fallback
+        // just below (an algebra-dispatched result chained through another
+        // `[...]` would need its own, separate `Index` impl on `Elem` --
+        // real, natural, and not attempted here).
+        ExprKind::Index(base, _indices) if matches!(ctx.node_types[&base.id], Ty::Array(..)) => {
             let (array_expr, index_exprs) = collect_index_chain(expr);
             let array_ty = ctx.node_types[&array_expr.id].clone();
             convert_expr(array_expr, env, ctx, &|array_val, env| {
@@ -1589,6 +1598,47 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                         op: PrimOp::Load { array_ty: array_ty.clone() },
                         args,
                         cont: Box::new(k(CVal::Var(var), env)),
+                    }
+                })
+            })
+        }
+        // `Index<Container, Elem, const K: i32>` algebra dispatch (see
+        // `infer.rs`'s own `ExprKind::Index` fallback doc comment) -- an
+        // ordinary two-argument algebra call, resolved through the exact
+        // same `resolve_call`/`emit_call` machinery any other bare-name
+        // algebra call already uses, just without a real `ExprKind::Call`
+        // AST node to read a callee name/argument list off of directly
+        // (`ExprKind::Index` stays its own dedicated AST shape — needed for
+        // the mutability-checking `a[i] = x` requires, see `StmtKind::
+        // Assign`'s own `Index` arm). The whole bracket group's own indices
+        // become *one* real `[i32;K]` array value -- an ordinary `PrimOp::
+        // Array` `LetPrim` built directly from the already-converted index
+        // `CVal`s, no different from how any other synthesized intermediate
+        // value gets built here -- fed to `index(...)` as its second
+        // argument; unpacking it back inside the impl body (`idx[0]`, `idx
+        // [1]`, ...) is ordinary array reads, already fully working, no new
+        // lowering needed for either half.
+        ExprKind::Index(base, indices) => {
+            let result_ty = ctx.node_types[&expr.id].clone();
+            let index_exprs: Vec<&Expr> = indices.iter().collect();
+            let idx_array_ty = Ty::Array(Box::new(Ty::Con("i32".to_string())), Box::new(Ty::Const(ConstValue::Int(indices.len() as u64))));
+            convert_expr(base, env, ctx, &|base_val, env| {
+                convert_expr_list(&index_exprs, env, ctx, &|index_vals, env| {
+                    let idx_array_var = ctx.fresh.var();
+                    let callee = resolve_call("index", expr.id, &[base.id], ctx);
+                    CExpr::LetPrim {
+                        var: idx_array_var,
+                        ty: idx_array_ty.clone(),
+                        op: PrimOp::Array,
+                        args: index_vals,
+                        cont: Box::new(emit_call(
+                            callee,
+                            vec![base_val.clone(), CVal::Var(idx_array_var)],
+                            result_ty.clone(),
+                            ctx,
+                            env,
+                            k,
+                        )),
                     }
                 })
             })
@@ -1658,21 +1708,26 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
     }
 }
 
-/// Walks a chain of nested `Index` nodes (`a[i,j]`'s own Fortran-sugar
-/// desugaring, or a literal `a[i][j]` — indistinguishable after lowering,
-/// see the module's own "Arrays" doc comment) down to the innermost
-/// non-`Index` base, returning it alongside every index expression
-/// collected along the way, back in the original *source* order (`a[i,j]`
-/// -> `(a, [i, j])`, not `[j, i]` — the walk itself runs outside-in, so the
-/// collected order is reversed before returning).
+/// Walks a chain of nested `Index` nodes, each carrying its own *group* of
+/// one or more indices (`a[i,j]`'s own single-node, two-index group; a
+/// literal `a[i][j]` — two separate bracket pairs — chains two one-index
+/// groups instead, still reaching the same array element either way, see
+/// the module's own "Arrays" doc comment) down to the innermost non-`Index`
+/// base, returning it alongside every index expression collected along the
+/// way, flattened back into the original *source* order (`a[i,j]` ->
+/// `(a, [i, j])`; `a[i][j]` -> `(a, [i, j])` too — the walk collects whole
+/// groups outside-in, so the *group* order is reversed before flattening,
+/// while each group's own internal (already-source-order) index order stays
+/// untouched).
 fn collect_index_chain(expr: &Expr) -> (&Expr, Vec<&Expr>) {
-    let mut indices = Vec::new();
+    let mut groups: Vec<&Vec<Expr>> = Vec::new();
     let mut current = expr;
-    while let ExprKind::Index(base, idx) = &current.kind {
-        indices.push(idx.as_ref());
+    while let ExprKind::Index(base, group) = &current.kind {
+        groups.push(group);
         current = base;
     }
-    indices.reverse();
+    groups.reverse();
+    let indices: Vec<&Expr> = groups.into_iter().flat_map(|g| g.iter()).collect();
     (current, indices)
 }
 
@@ -1742,9 +1797,9 @@ fn mutated_free_vars_expr(expr: &Expr, shadowed: &HashSet<String>, ctx: &Ctx) ->
             out.extend(args.iter().flat_map(|a| mutated_free_vars_expr(a, shadowed, ctx)));
             out
         }
-        ExprKind::Index(base, idx) => {
+        ExprKind::Index(base, indices) => {
             let mut out = mutated_free_vars_expr(base, shadowed, ctx);
-            out.extend(mutated_free_vars_expr(idx, shadowed, ctx));
+            out.extend(indices.iter().flat_map(|i| mutated_free_vars_expr(i, shadowed, ctx)));
             out
         }
         ExprKind::ArrayLit(elems) => elems.iter().flat_map(|e| mutated_free_vars_expr(e, shadowed, ctx)).collect(),
@@ -1870,9 +1925,9 @@ fn lambda_free_vars_expr(expr: &Expr, shadowed: &HashSet<String>, node_types: &H
             out.extend(args.iter().flat_map(|a| lambda_free_vars_expr(a, shadowed, node_types)));
             out
         }
-        ExprKind::Index(base, idx) => {
+        ExprKind::Index(base, indices) => {
             let mut out = lambda_free_vars_expr(base, shadowed, node_types);
-            out.extend(lambda_free_vars_expr(idx, shadowed, node_types));
+            out.extend(indices.iter().flat_map(|i| lambda_free_vars_expr(i, shadowed, node_types)));
             out
         }
         ExprKind::ArrayLit(elems) => elems.iter().flat_map(|e| lambda_free_vars_expr(e, shadowed, node_types)).collect(),
@@ -2009,8 +2064,8 @@ fn convert_expr_list(exprs: &[&Expr], env: &CEnv, ctx: &Ctx, k: &dyn Fn(Vec<CVal
 /// See the module's own doc comment ("Resolving a call site's own target
 /// unit") for why exactly these three tiers, in this order, are each
 /// necessary and together unambiguous.
-fn resolve_call<'a>(name: &str, call: &Expr, args: &[Expr], ctx: &Ctx<'a>) -> &'a str {
-    if let Some(mangled) = ctx.call_names.get(&call.id) {
+fn resolve_call<'a>(name: &str, call_id: NodeId, arg_ids: &[NodeId], ctx: &Ctx<'a>) -> &'a str {
+    if let Some(mangled) = ctx.call_names.get(&call_id) {
         return ctx.units.get_key_value(mangled.as_str()).map(|(k, _)| k.as_str()).unwrap_or_else(|| {
             panic!("CPS: call_names resolved `{name}` to `{mangled}`, but no such unit exists")
         });
@@ -2018,8 +2073,8 @@ fn resolve_call<'a>(name: &str, call: &Expr, args: &[Expr], ctx: &Ctx<'a>) -> &'
     if let Some((k, _)) = ctx.units.get_key_value(name) {
         return k.as_str();
     }
-    let arg_tys: Vec<String> = args.iter().map(|a| ctx.node_types[&a.id].to_string()).collect();
-    let ret_ty = ctx.node_types[&call.id].to_string();
+    let arg_tys: Vec<String> = arg_ids.iter().map(|id| ctx.node_types[id].to_string()).collect();
+    let ret_ty = ctx.node_types[&call_id].to_string();
     let key = (name.to_string(), arg_tys, ret_ty);
     match ctx.call_index.get(&key) {
         Some(unit_name) => ctx.units.get_key_value(unit_name.as_str()).map(|(k, _)| k.as_str()).unwrap(),

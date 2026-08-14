@@ -86,7 +86,7 @@
 use crate::ast::*;
 use crate::callgraph::{self, ProgramInference};
 use crate::dump::{dump_block_with_call_names, fmt_ty_named, TyVarNames};
-use crate::infer::{find_placeholder_name, free_vars, substitute, unify, Env, Infer, Scheme, Subst, Ty, TyVar, TypeError, TypeErrorKind};
+use crate::infer::{find_placeholder_name, free_vars, substitute, unify, ConstValue, Env, Infer, Scheme, Subst, Ty, TyVar, TypeError, TypeErrorKind};
 use crate::registry::Registry;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -1061,7 +1061,10 @@ fn collect_instantiations_expr(
                 return;
             }
 
-            match derive_impl_instantiation(templates, &name, expr, args, node_types) {
+            let Some(arg_tys): Option<Vec<Ty>> = args.iter().map(|a| node_types.get(&a.id).cloned()).collect() else {
+                return;
+            };
+            match derive_impl_instantiation(templates, &name, expr.id, &arg_tys, node_types) {
                 ImplMatch::Found(idx, mapping) => {
                     call_names.insert(expr.id, display_impl_instantiation(&templates[idx], &mapping));
                     impl_worklist.push((idx, mapping));
@@ -1103,9 +1106,40 @@ fn collect_instantiations_expr(
                 }
             }
         }
-        ExprKind::Index(base, idx) => {
+        ExprKind::Index(base, indices) => {
             rec!(base);
-            rec!(idx);
+            indices.iter().for_each(|i| rec!(i));
+            // A non-array base -- `Index<Container, Elem, const K: i32>`
+            // algebra dispatch (see `infer.rs`'s own `ExprKind::Index`
+            // fallback doc comment) -- mirrors the bare-name-call handling
+            // in `ExprKind::Call` above, structurally: a real array base
+            // needs no entry here at all (`cps.rs`'s own `PrimOp::Load`
+            // needs no `call_names` lookup), the same "no entry needed for
+            // the non-generic/non-dispatched case" posture every other tier
+            // here already has. The whole bracket group's own indices
+            // become one synthetic `[i32;K]` array type here -- mirrors
+            // `cps.rs`'s own identical construction for the real *value* at
+            // CPS-conversion time, `K` known directly from `indices.len()`,
+            // no real `Expr`/`NodeId` needed for "the idx array" at all.
+            if let Some(base_ty) = node_types.get(&base.id).cloned() {
+                if !matches!(base_ty, Ty::Array(..)) {
+                    let idx_array_ty =
+                        Ty::Array(Box::new(Ty::Con("i32".to_string())), Box::new(Ty::Const(ConstValue::Int(indices.len() as u64))));
+                    match derive_impl_instantiation(templates, "index", expr.id, &[base_ty, idx_array_ty], node_types) {
+                        ImplMatch::Found(tmpl_idx, mapping) => {
+                            call_names.insert(expr.id, display_impl_instantiation(&templates[tmpl_idx], &mapping));
+                            impl_worklist.push((tmpl_idx, mapping));
+                        }
+                        ImplMatch::NoCandidates => {}
+                        ImplMatch::NoneMatched { algebra, tys } => {
+                            errors.push(TypeError {
+                                span: expr.span,
+                                kind: TypeErrorKind::MonomorphizationFailed { algebra, method: "index".to_string(), tys },
+                            });
+                        }
+                    }
+                }
+            }
         }
         ExprKind::ArrayLit(elems) => elems.iter().for_each(|e| rec!(e)),
         ExprKind::ArrayRepeat { value, count } => {
@@ -1227,24 +1261,21 @@ enum ImplMatch {
 fn derive_impl_instantiation(
     templates: &[ImplTemplate],
     method: &str,
-    call: &Expr,
-    args: &[Expr],
+    call_id: NodeId,
+    arg_tys: &[Ty],
     node_types: &HashMap<NodeId, Ty>,
 ) -> ImplMatch {
     let candidates: Vec<&ImplTemplate> = templates.iter().filter(|t| t.method_name == method).collect();
     if candidates.is_empty() {
         return ImplMatch::NoCandidates;
     }
-    let Some(arg_tys): Option<Vec<Ty>> = args.iter().map(|a| node_types.get(&a.id).cloned()).collect() else {
+    let Some(ret_ty) = node_types.get(&call_id).cloned() else {
         return ImplMatch::NoCandidates;
     };
-    let Some(ret_ty) = node_types.get(&call.id).cloned() else {
-        return ImplMatch::NoCandidates;
-    };
-    let query = Ty::Fn(arg_tys, Box::new(ret_ty));
+    let query = Ty::Fn(arg_tys.to_vec(), Box::new(ret_ty));
 
     for (idx, t) in templates.iter().enumerate() {
-        if t.method_name != method || t.param_patterns.len() != args.len() {
+        if t.method_name != method || t.param_patterns.len() != arg_tys.len() {
             continue;
         }
         let pattern = Ty::Fn(t.param_patterns.clone(), Box::new(t.ret_pattern.clone()));
@@ -1376,9 +1407,9 @@ pub(crate) fn collect_exprs<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
             collect_exprs(base, out);
             args.iter().for_each(|a| collect_exprs(a, out));
         }
-        ExprKind::Index(base, idx) => {
+        ExprKind::Index(base, indices) => {
             collect_exprs(base, out);
-            collect_exprs(idx, out);
+            indices.iter().for_each(|i| collect_exprs(i, out));
         }
         ExprKind::ArrayLit(elems) => elems.iter().for_each(|e| collect_exprs(e, out)),
         ExprKind::ArrayRepeat { value, count } => {

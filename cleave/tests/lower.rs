@@ -242,14 +242,49 @@ fn field_access_vs_zero_arg_method_call_are_distinguishable() {
     }
 }
 
+/// `a[i,j]` — one bracket group — collects both indices directly into *one*
+/// `Index` node (`indices.len() == 2`), not folded into nested single-index
+/// nodes the way an earlier version of this desugaring did: a tagged
+/// (`#[mlir_type(...)]`) struct's own multi-index `Index<Container,Elem,K>`
+/// dispatch needs the whole group intact (see `ast.rs`'s own `Index` doc
+/// comment) — nesting would leave nothing sensible for an inner single-index
+/// step to dispatch to.
 #[test]
-fn multi_index_desugars_to_nested_index() {
+fn multi_index_collects_into_one_index_node() {
     let f = lower_one_fn("fn f(a, i, j) { a[i, j] }");
     match &only_stmt_expr(&f.body).kind {
-        ExprKind::Index(inner, _j) => match &inner.kind {
-            ExprKind::Index(_base, _i) => {}
-            other => panic!("expected nested Index, got {other:?}"),
-        },
+        ExprKind::Index(base, indices) => {
+            assert!(matches!(&base.kind, ExprKind::Path(p) if p.segments == ["a"]));
+            assert_eq!(indices.len(), 2);
+            assert!(matches!(&indices[0].kind, ExprKind::Path(p) if p.segments == ["i"]));
+            assert!(matches!(&indices[1].kind, ExprKind::Path(p) if p.segments == ["j"]));
+        }
+        other => panic!("expected Index, got {other:?}"),
+    }
+}
+
+/// `a[i][j]` — two *separate* bracket pairs, unlike `a[i,j]` above — still
+/// nests: each bracket is its own `Index` node, one index each. For a real
+/// array the two spellings stay semantically equivalent either way
+/// (`infer.rs` peels one dimension per index regardless of how many arrive
+/// per node); a tagged struct's own `Index` dispatch only ever recognizes
+/// the single-node, whole-group form.
+#[test]
+fn separate_bracket_pairs_still_nest() {
+    let f = lower_one_fn("fn f(a, i, j) { a[i][j] }");
+    match &only_stmt_expr(&f.body).kind {
+        ExprKind::Index(inner, outer_indices) => {
+            assert_eq!(outer_indices.len(), 1);
+            assert!(matches!(&outer_indices[0].kind, ExprKind::Path(p) if p.segments == ["j"]));
+            match &inner.kind {
+                ExprKind::Index(base, inner_indices) => {
+                    assert!(matches!(&base.kind, ExprKind::Path(p) if p.segments == ["a"]));
+                    assert_eq!(inner_indices.len(), 1);
+                    assert!(matches!(&inner_indices[0].kind, ExprKind::Path(p) if p.segments == ["i"]));
+                }
+                other => panic!("expected nested Index, got {other:?}"),
+            }
+        }
         other => panic!("expected Index, got {other:?}"),
     }
 }

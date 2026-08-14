@@ -28,7 +28,7 @@ use melior::Context;
 use melior::dialect::DialectRegistry;
 use melior::ir::operation::OperationLike;
 use melior::pass;
-use melior::utility::register_all_dialects;
+use melior::utility::{parse_pass_pipeline, register_all_dialects};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -360,10 +360,30 @@ fn main() -> ExitCode {
                 // mlir-sys, as vendored, don't expose `mlirTranslateModule
                 // ToLLVMIR` at all -- real `.ll` text isn't reachable
                 // without adding a raw FFI binding ourselves).
+                // Staged as three *separate* `PassManager`s, each run to
+                // completion before the next is even built — see `--run`'s
+                // own identical pipeline below for the full reasoning
+                // (found by direct testing to matter, not just tidier).
                 let pass_manager = pass::PassManager::new(&context);
+                pass_manager.add_pass(pass::linalg::create_convert_elementwise_to_linalg_pass());
+                let ok = pass_manager.run(&mut module).is_ok();
+
+                let pass_manager = pass::PassManager::new(&context);
+                pass::bufferization::register_one_shot_bufferize_pass();
+                let ok = ok
+                    && parse_pass_pipeline(
+                        pass_manager.as_operation_pass_manager(),
+                        "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})",
+                    )
+                    .is_ok()
+                    && pass_manager.run(&mut module).is_ok();
+
+                let pass_manager = pass::PassManager::new(&context);
+                pass_manager.add_pass(pass::linalg::create_convert_linalg_to_loops_pass());
                 pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
                 pass_manager.add_pass(pass::conversion::create_to_llvm());
-                if pass_manager.run(&mut module).is_err() {
+                pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
+                if !ok || pass_manager.run(&mut module).is_err() {
                     eprintln!("error: MLIR-to-LLVM lowering pass failed");
                     exit = ExitCode::FAILURE;
                 } else {
@@ -413,15 +433,69 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
 
+        // Staged as three *separate* `PassManager`s, each run to completion
+        // before the next is even built — found by direct testing to
+        // matter, not just tidier: the identical passes combined into one
+        // single `PassManager`/one `run()` call failed partway (`op was not
+        // bufferized`) even though every individual stage, run to
+        // completion first, succeeds cleanly. Not fully root-caused beyond
+        // that (melior's own pass-manager nesting/ordering semantics across
+        // `add_pass` and a `parse_pass_pipeline`-populated nest — see stage
+        // 2 below — most likely), but empirically robust, so kept as the
+        // working shape rather than chased further.
+        //
+        // Stage 1: a bare `arith.addf` (etc.) on `tensor`-typed operands
+        // (`Ring<Vector<T,N>>`'s own elementwise impls, `stdlib/vector/
+        // vector.cleave`) has no `BufferizableOpInterface` implementation
+        // of its own — only a real structured/named op does — so one-shot-
+        // bufferize (stage 2) can't handle it directly without this first.
         let pass_manager = pass::PassManager::new(&context);
-        // `scf.if` (and any other structured-control-flow op) has no direct
-        // LLVM IR translation of its own -- `-convert-scf-to-cf` lowers it
-        // to the `cf` dialect's ordinary branches first, which `-convert-
-        // to-llvm` (below) *does* know how to translate. Skipping this
-        // produced a hard native crash (STATUS_ACCESS_VIOLATION), not a
-        // clean Rust-level error -- found by direct testing.
+        pass_manager.add_pass(pass::linalg::create_convert_elementwise_to_linalg_pass());
+        if pass_manager.run(&mut module).is_err() {
+            eprintln!("error: MLIR-to-LLVM lowering pass failed");
+            return ExitCode::FAILURE;
+        }
+
+        // Stage 2: `bufferize-function-boundaries=true` — melior's own
+        // zero-argument `create_one_shot_bufferize_pass()` binding has no
+        // way to set this option, so it goes in via a real textual pass-
+        // pipeline string instead (`melior::utility::parse_pass_pipeline`)
+        // — without it, a `tensor`-typed function parameter/return (any
+        // cross-function call involving a `Vector`/`Matrix`) is left
+        // bridged by a `bufferization.to_buffer`/`to_tensor` pair at the
+        // function boundary that nothing later in this pipeline can
+        // legalize (`failed to legalize operation 'bufferization.
+        // to_buffer'`, a real pass failure, found by direct testing) —
+        // this option makes one-shot-bufferize rewrite the function's own
+        // signature directly instead, eliminating the bridge entirely. The
+        // pass must be registered by name first — textual pipeline parsing
+        // looks it up by its own registered name, unlike `add_pass`, which
+        // already has the concrete `Pass` object in hand.
+        let pass_manager = pass::PassManager::new(&context);
+        pass::bufferization::register_one_shot_bufferize_pass();
+        if parse_pass_pipeline(
+            pass_manager.as_operation_pass_manager(),
+            "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})",
+        )
+        .is_err()
+            || pass_manager.run(&mut module).is_err()
+        {
+            eprintln!("error: MLIR-to-LLVM lowering pass failed");
+            return ExitCode::FAILURE;
+        }
+
+        // Stage 3: ordinary lowering to the `llvm` dialect — `scf.if` (and
+        // any other structured-control-flow op) has no direct LLVM IR
+        // translation of its own -- `-convert-scf-to-cf` lowers it to the
+        // `cf` dialect's ordinary branches first, which `-convert-to-llvm`
+        // *does* know how to translate. Skipping this produced a hard
+        // native crash (STATUS_ACCESS_VIOLATION), not a clean Rust-level
+        // error -- found by direct testing.
+        let pass_manager = pass::PassManager::new(&context);
+        pass_manager.add_pass(pass::linalg::create_convert_linalg_to_loops_pass());
         pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
         pass_manager.add_pass(pass::conversion::create_to_llvm());
+        pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
         if pass_manager.run(&mut module).is_err() {
             eprintln!("error: MLIR-to-LLVM lowering pass failed");
             return ExitCode::FAILURE;

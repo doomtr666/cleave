@@ -453,6 +453,14 @@ fn merge_algebra_fragment(item: Item, algebras: &mut Vec<AlgebraAcc>, errors: &m
     }
 }
 
+/// Whether two `impl`s' own attribute lists carry the same semantic content
+/// (name + args, positionally) — `Attribute` derives no `PartialEq` of its
+/// own, and wouldn't want a blind one here anyway: `span` differs between
+/// any two fragments by construction, but that's never a real disagreement.
+fn attrs_match(a: &[Attribute], b: &[Attribute]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.name == y.name && x.args == y.args)
+}
+
 fn merge_impl_fragment(item: Item, impls: &mut Vec<ImplAcc>, errors: &mut Vec<Diagnostic>) {
     let ItemKind::Impl(d) = item.kind else { unreachable!() };
     // Every target folded into one key, comma-joined, not just the first —
@@ -486,6 +494,44 @@ fn merge_impl_fragment(item: Item, impls: &mut Vec<ImplAcc>, errors: &mut Vec<Di
         impls.push(ImplAcc { anchor_id: item.id, anchor_span: item.span, decl: d, seen_fns });
         return;
     };
+
+    // `#[mlir_type(...)]` (the only attribute an `impl` can carry — see
+    // `ImplDecl::attrs`'s own doc comment) is a whole-program, type-level
+    // fact about the target's own MLIR representation, not a per-fragment
+    // detail that could ever legitimately vary between two fragments of
+    // "the same" impl — unlike `.fns` (genuinely split across files on
+    // purpose) merging never touched `.attrs` at all, so whichever fragment
+    // happened to be processed *first* silently determined it, with the
+    // second fragment's own attrs discarded with no diagnostic. Real bug,
+    // found by direct testing: a local, unrelated `impl Float<f64> {}`
+    // (e.g. an ad hoc test fixture, unaware `Float` is already a real
+    // prelude algebra) processed before `stdlib/num/num.cleave`'s own
+    // `#[mlir_type(f64)] impl Float<f64> {}` (the entry file's own items are
+    // always merged before any resolved `use`/prelude crate's — see
+    // `compile`'s own doc comment) silently won, discarding the prelude's
+    // own tag — `mlir_lower.rs::ty_to_mlir` then had nothing to look `f64`
+    // up by, and treated it as an opaque struct pointer instead of a real
+    // float type, all the way down to a native MLIR assertion at codegen
+    // time with no compile-time diagnostic anywhere pointing at the cause.
+    // Fixed the same way a duplicate method (`.fns`, just below) already
+    // is: adopt an empty accumulator's own attrs from whichever fragment
+    // declares them, but a real disagreement between two fragments that
+    // both declare attrs is reported, not silently resolved by fragment
+    // order.
+    if !d.attrs.is_empty() {
+        if acc.decl.attrs.is_empty() {
+            acc.decl.attrs.clone_from(&d.attrs);
+        } else if !attrs_match(&acc.decl.attrs, &d.attrs) {
+            errors.push(Diagnostic::error(
+                format!(
+                    "`impl {}<{target_key}>` fragments disagree on their own attributes (e.g. `#[mlir_type(...)]`) — an earlier fragment already declared different ones",
+                    d.algebra
+                ),
+                item.span,
+            ));
+            return;
+        }
+    }
 
     for f in d.fns {
         let conflict = sig_key(&f.name, &f.params).is_some_and(|key| {

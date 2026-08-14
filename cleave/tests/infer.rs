@@ -151,15 +151,68 @@ fn unconstrained_int_literal_defaults_to_i32() {
 /// bare `<complex-not-yet-inferred>` placeholder, never really inferred.
 /// Fixed the same way an unsuffixed `NumberLit` already defaults (`Num` +
 /// a shape `Constraint`, a `pending_defaults` fallback) — `4i` defaults to
-/// `Complex<f64>`. `builtin_registry()` declares neither `Num` nor
-/// `Complex`, so both constraints are skipped here (same "additive,
-/// no-op if no stdlib declares it" posture `Int`/`Float` already have) —
-/// this test only proves the *defaulting* half works, independent of
-/// whether a program ever `use`s `complex`.
+/// `Complex<f32>`, matching a bare `Float` literal's own `f32` default
+/// (real, found by direct testing: the two used to disagree — `Float`
+/// defaulted to `f32` but `Complex` defaulted to `f64`, no principled
+/// reason for the two to diverge). `builtin_registry()` declares neither
+/// `Num` nor `Complex`, so both constraints are skipped here (same
+/// "additive, no-op if no stdlib declares it" posture `Int`/`Float`
+/// already have) — this test only proves the *defaulting* half works,
+/// independent of whether a program ever `use`s `complex`.
 #[test]
 fn a_bare_imaginary_literal_infers_as_a_complex_type() {
     let ty = infer_src("fn f() { 4i }");
-    assert_eq!(ty, Ty::App("Complex".to_string(), vec![Ty::Con("f64".to_string())]));
+    assert_eq!(ty, Ty::App("Complex".to_string(), vec![Ty::Con("f32".to_string())]));
+}
+
+// ---------------------------------------------------------------------
+// Deferred field-access/method-call resolution -- a value whose only
+// concreteness comes from `apply_defaults` (run once, at the very end of a
+// function's own inference) used to permanently lock a field access or
+// method call on it to `<not-yet-inferred>`, since `ExprKind::FieldAccess`/
+// `ExprKind::MethodCall` resolved their own base's type *immediately*,
+// during the ordinary top-to-bottom pass, long before defaulting ever ran.
+// `pending_field_accesses`/`pending_method_calls` defer that resolution the
+// same way `pending_type_name_checks` already defers a different "not
+// knowable yet" question.
+// ---------------------------------------------------------------------
+
+#[test]
+fn an_unannotated_deferred_defaulted_values_field_access_now_resolves() {
+    let ty = infer_fn_named(
+        "struct Complex<T> { real: T, imag: T }
+         fn f() -> f32 { let z = 4i; z.real }",
+        "f",
+    )
+    .unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(ty, Ty::Con("f32".to_string()));
+}
+
+#[test]
+fn an_unannotated_deferred_defaulted_values_method_call_now_resolves() {
+    let ty = infer_fn_named(
+        "struct Complex<T> { real: T, imag: T }
+         impl<T> struct Complex<T> { fn get_real(z) -> T { z.real } }
+         fn f() -> f32 { let z = 4i; z.get_real() }",
+        "f",
+    )
+    .unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(ty, Ty::Con("f32".to_string()));
+}
+
+#[test]
+fn a_genuinely_unresolvable_bases_field_access_still_fails_cleanly() {
+    // `v` is a totally unannotated parameter -- nothing (no literal
+    // default, no other unification) ever pins its own type, so the
+    // deferred field access can never actually resolve it either. Must
+    // stay a real, reported error -- not a silent, guessed success.
+    let err = infer_fn_named(
+        "struct Vec2 { x: f64, y: f64 }
+         fn f(v) -> f64 { v.x }",
+        "f",
+    )
+    .unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::Unify(_)), "got: {:?}", err.kind);
 }
 
 /// A real gap, previously confirmed by direct testing (`error: type
@@ -240,6 +293,10 @@ fn assert_no_corrupted_array_size(ty: &Ty, context: &str) {
             assert_no_corrupted_array_size(ret, context);
         }
         Ty::Var(_) | Ty::Con(_) | Ty::Const(_) => {}
+        Ty::ConstExpr(_, a, b) => {
+            assert_no_corrupted_array_size(a, context);
+            assert_no_corrupted_array_size(b, context);
+        }
     }
 }
 
@@ -309,6 +366,10 @@ fn assert_no_unresolved_var(ty: &Ty, context: &str) {
         Ty::Array(elem, size) => {
             assert_no_unresolved_var(elem, context);
             assert_no_unresolved_var(size, context);
+        }
+        Ty::ConstExpr(_, a, b) => {
+            assert_no_unresolved_var(a, context);
+            assert_no_unresolved_var(b, context);
         }
     }
 }
@@ -1801,6 +1862,68 @@ fn a_const_generic_is_not_forced_to_be_int_just_by_being_declared() {
         ty,
         Ty::App("Flagged".to_string(), vec![Ty::Con("i32".to_string()), Ty::Const(ConstValue::Bool(true))])
     );
+}
+
+// ---------------------------------------------------------------------
+// `doc/backlog.md`'s own "Deferred/symbolic constant folding" item --
+// `[T; N+M]`, an array size *computed* from two const generics rather than
+// a single bare reference. Two genuinely separate sub-problems: (1) a bare
+// `const_value_from_expr` lookup not resolving through `self.subst`, so an
+// explicit turbofish that already pinned `N`/`M` concretely still wasn't
+// seen; (2) the general case, where `N`/`M` stay abstract at declaration
+// time (a still-generic signature) and the expression itself needs to
+// survive as a real, structured `Ty::ConstExpr` -- not a permanent,
+// un-refinable `<array-type-not-yet-inferred>` placeholder -- so it can be
+// folded later, once monomorphization substitutes real concrete values in.
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_struct_field_array_size_computed_from_two_const_generics_resolves_via_turbofish() {
+    let ty = infer_fn_named(
+        "struct Buf<const N: i32, const M: i32> { data: [i32; N+M] }
+         fn f() -> Buf<2, 3> { Buf::<2, 3>(data: [1, 2, 3, 4, 5]) }",
+        "f",
+    )
+    .unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(ty, Ty::App("Buf".to_string(), vec![Ty::Const(ConstValue::Int(2)), Ty::Const(ConstValue::Int(3))]));
+}
+
+#[test]
+fn a_generic_functions_own_array_size_expression_stays_symbolic_until_concrete() {
+    // No turbofish, no concrete caller anywhere -- `N`/`M` never become
+    // concrete at all here, on purpose: this checks the *declaration* stays
+    // generic (a real `Ty::ConstExpr`, not an error and not a placeholder),
+    // exactly the way a bare `Ty::Var` already survives a generic
+    // declaration untouched.
+    let f = lower_one_fn("fn f<const N: i32, const M: i32>(x: [i32; N+M]) -> i32 { x[0] }");
+    let registry = builtin_registry();
+    let mut infer = Infer::new(&registry);
+    infer.infer_fn(&f).unwrap_or_else(|e| panic!("inference failed: {e:?}"));
+    match &infer.param_types[0] {
+        Ty::Array(elem, size) => {
+            assert_eq!(**elem, Ty::Con("i32".to_string()));
+            assert!(matches!(size.as_ref(), Ty::ConstExpr(op, _, _) if op == "add"), "expected a symbolic ConstExpr, got {size:?}");
+        }
+        other => panic!("expected an array param type, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_underdetermined_const_generic_sum_is_a_clean_mismatch_not_a_placeholder() {
+    // `Buf(data: [1,2,3,4,5])`, no turbofish -- `N`/`M` are never pinned
+    // *individually* by anything (`N+M=5` alone has many solutions), so
+    // this must stay a real, honest rejection -- not a silent guess, and
+    // not the old confusing `<array-type-not-yet-inferred>` placeholder
+    // text either.
+    let err = infer_fn_named(
+        "struct Buf<const N: i32, const M: i32> { data: [i32; N+M] }
+         fn f() -> Buf<2, 3> { Buf(data: [1, 2, 3, 4, 5]) }",
+        "f",
+    )
+    .unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::Unify(_)), "got: {:?}", err.kind);
+    let msg = err.kind.to_string();
+    assert!(!msg.contains("not-yet-inferred"), "got: {msg}");
 }
 
 #[test]

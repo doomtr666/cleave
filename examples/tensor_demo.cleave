@@ -1,0 +1,60 @@
+use io;
+use vector;
+
+// `Vector<T,N>`/`Matrix<T,R,C>`/`Tensor<T,D0,D1,D2>` (`stdlib/vector/
+// vector.cleave`) -- ordinary generic structs, each backed by a real native
+// MLIR `tensor<...>` value under a `#[mlir_type(tensor)]` tag, not a
+// hardcoded compiler type. This example exercises all three together:
+// elementwise `Ring` arithmetic (`Vector`), a real structural `linalg.
+// matmul` (`Matrix`), and a rank-3 shape (`Tensor`) -- read back through
+// the real `v[i]`/`m[i,j]`/`t[i,j,k]` sugar (`Index<Container,Elem,K>`,
+// `doc/backlog.md`'s own "Multi-dimensional Index dispatch" item), not a
+// raw `mlir::tensor::extract` escape hatch. No explicit type annotations
+// needed anywhere below, unlike an earlier version of this file --
+// `check_pending_constraints`'s own output-only-generic gate (`Index`'s
+// `Elem`, `MatMul`'s `C`) and `ExprKind::Index`'s own missing deferred-
+// resolution path (`doc/backlog.md`) are both real, fixed bugs now.
+fn main() {
+    // `Vector<T,N>` -- rank 1. `+` dispatches through the stdlib's own
+    // `Ring<Vector<T,N>>`; `v[i]` dispatches through `Index<Vector<T,N>,T>`.
+    let v1 = Vector(data: [1.0, 2.0, 3.0]);
+    let v2 = Vector(data: [10.0, 20.0, 30.0]);
+    let v3 = v1 + v2;
+    print(v3[0]);
+    print(v3[1]);
+    print(v3[2]);
+
+    // `Matrix<T,R,C>` -- rank 2. `matmul` lowers to one real `linalg.matmul`
+    // op (see `mlir_lower.rs::build_linalg_region`), not a hand-written
+    // triple-nested loop -- the whole point: it stays one recognizable,
+    // reassociation-eligible node for a future cost-driven backend.
+    let ma = Matrix(data: [
+        [1.0, 2.0, 3.0],
+        [4.0, 5.0, 6.0]
+    ]);
+    let mb = Matrix(data: [
+        [7.0, 8.0],
+        [9.0, 10.0],
+        [11.0, 12.0]
+    ]);
+    let mc = matmul(ma, mb);
+    print(mc[0,0]);
+    print(mc[0,1]);
+    print(mc[1,0]);
+    print(mc[1,1]);
+
+    // `Tensor<T,D0,D1,D2>` -- rank 3, the identical mechanism one axis
+    // further: `tagged_struct_native_type`/`lower_tagged_struct_construct`
+    // are both fully shape-generic, driven by however many dims the field's
+    // own array type actually declares, and `Index<Tensor<T,D0,D1,D2>,T>`'s
+    // own `idx: [i32; 3]` dispatches a real 3-index bracket group the same
+    // way `Matrix`'s own 2-index one does.
+    let t = Tensor(data: [
+        [[1.0, 2.0], [3.0, 4.0]],
+        [[5.0, 6.0], [7.0, 8.0]]
+    ]);
+    print(t[0,1,0]);
+    print(t[1,1,1]);
+
+    0
+}

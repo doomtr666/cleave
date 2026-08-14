@@ -6,7 +6,7 @@ use melior::Context;
 use melior::dialect::DialectRegistry;
 use melior::ir::operation::OperationLike;
 use melior::pass;
-use melior::utility::register_all_dialects;
+use melior::utility::{parse_pass_pipeline, register_all_dialects};
 
 fn context() -> Context {
     let dialect_registry = DialectRegistry::new();
@@ -100,6 +100,16 @@ fn a_compiled_program_actually_runs_and_returns_the_right_value() {
     // testing the moment `mod`/`rem` landed in the stdlib.
     pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
+    // Multiple independent conversion passes can each leave `builtin.
+    // unrealized_conversion_cast` bridge ops between their own intermediate
+    // representations behind -- found by direct testing, kept defensively:
+    // real LLVM-IR translation can't handle a bare `unrealized_conversion_
+    // cast` at all (`LLVM Translation failed for operation: builtin.
+    // unrealized_conversion_cast`, a hard native crash). This is the
+    // standard MLIR cleanup for exactly that situation: folds/cancels
+    // chains of these casts away (`cast(cast(x, A->B), B->A) == x`), not a
+    // real lowering step of its own.
+    pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
     pass_manager.run(&mut module).expect("lowering to the llvm dialect must succeed");
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
@@ -135,9 +145,67 @@ fn run_i32(context: &Context, src: &str) -> i32 {
     let mut module = lower_program(context, &cps_program, &mlir_types, struct_schemas);
     assert!(module.as_operation().verify(), "generated MLIR module failed verification");
 
+    // Staged as three *separate* `PassManager`s, each run to completion
+    // before the next is even built — found by direct testing to matter,
+    // not just tidier: the identical passes combined into one single
+    // `PassManager`/one `run()` call failed partway (`op was not
+    // bufferized`) even though every individual stage, run to completion
+    // first, succeeds cleanly. Not fully root-caused beyond that (melior's
+    // own pass-manager nesting/ordering semantics across `add_pass` and a
+    // `parse_pass_pipeline`-populated nested nest — see the bufferize stage
+    // below — most likely), but empirically robust, so kept as the working
+    // shape rather than chased further.
+    //
+    // Stage 1: a bare `arith.addf` (etc.) on `tensor`-typed operands
+    // (`Ring<Vector<T,N>>`'s own elementwise impls, `stdlib/vector/
+    // vector.cleave`) has no `BufferizableOpInterface` implementation of
+    // its own — only a real structured/named op does — so one-shot-
+    // bufferize (stage 2) can't handle it directly without this first.
     let pass_manager = pass::PassManager::new(context);
+    pass_manager.add_pass(pass::linalg::create_convert_elementwise_to_linalg_pass());
+    pass_manager.run(&mut module).expect("convert-elementwise-to-linalg must succeed");
+
+    // Stage 2: `bufferize-function-boundaries=true` — melior's own
+    // generated `create_one_shot_bufferize_pass()` binding takes no
+    // options at all (the underlying C API constructor is zero-argument),
+    // so the option has to go in via a real textual pass-pipeline string
+    // instead (`melior::utility::parse_pass_pipeline`) — without it, a
+    // `tensor`-typed function parameter/return (any cross-function call
+    // involving a `Vector`/`Matrix`) is left bridged by a `bufferization.
+    // to_buffer`/`to_tensor` pair at the function boundary that nothing
+    // later in this pipeline can legalize (`failed to legalize operation
+    // 'bufferization.to_buffer'`, a real pass failure, found by direct
+    // testing) — this option makes one-shot-bufferize rewrite the
+    // function's own signature directly instead, eliminating the bridge
+    // entirely. The pass must be registered by name first — textual
+    // pipeline parsing looks it up by its own registered name, unlike
+    // `add_pass`, which already has the concrete `Pass` object in hand.
+    let pass_manager = pass::PassManager::new(context);
+    pass::bufferization::register_one_shot_bufferize_pass();
+    parse_pass_pipeline(
+        pass_manager.as_operation_pass_manager(),
+        "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})",
+    )
+    .expect("failed to parse the one-shot-bufferize pass pipeline");
+    pass_manager.run(&mut module).expect("one-shot-bufferize must succeed");
+
+    // Stage 3: ordinary lowering to the `llvm` dialect — everything past
+    // this point is plain `memref`/`arith`/`scf`, already fully handled by
+    // this project's own pre-existing pipeline, unchanged.
+    let pass_manager = pass::PassManager::new(context);
+    pass_manager.add_pass(pass::linalg::create_convert_linalg_to_loops_pass());
     pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
+    // Multiple independent conversion passes can each leave `builtin.
+    // unrealized_conversion_cast` bridge ops between their own intermediate
+    // representations behind -- found by direct testing, kept defensively:
+    // real LLVM-IR translation can't handle a bare `unrealized_conversion_
+    // cast` at all (`LLVM Translation failed for operation: builtin.
+    // unrealized_conversion_cast`, a hard native crash). This is the
+    // standard MLIR cleanup for exactly that situation: folds/cancels
+    // chains of these casts away (`cast(cast(x, A->B), B->A) == x`), not a
+    // real lowering step of its own.
+    pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
     pass_manager.run(&mut module).expect("lowering to the llvm dialect must succeed");
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
@@ -350,6 +418,16 @@ fn an_extern_fn_call_actually_executes_through_a_registered_symbol() {
     // testing the moment `mod`/`rem` landed in the stdlib.
     pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
+    // Multiple independent conversion passes can each leave `builtin.
+    // unrealized_conversion_cast` bridge ops between their own intermediate
+    // representations behind -- found by direct testing, kept defensively:
+    // real LLVM-IR translation can't handle a bare `unrealized_conversion_
+    // cast` at all (`LLVM Translation failed for operation: builtin.
+    // unrealized_conversion_cast`, a hard native crash). This is the
+    // standard MLIR cleanup for exactly that situation: folds/cancels
+    // chains of these casts away (`cast(cast(x, A->B), B->A) == x`), not a
+    // real lowering step of its own.
+    pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
     pass_manager.run(&mut module).expect("lowering to the llvm dialect must succeed");
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
@@ -418,6 +496,16 @@ fn an_extern_impl_method_actually_executes_the_right_symbol_at_each_call_site() 
     // testing the moment `mod`/`rem` landed in the stdlib.
     pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
+    // Multiple independent conversion passes can each leave `builtin.
+    // unrealized_conversion_cast` bridge ops between their own intermediate
+    // representations behind -- found by direct testing, kept defensively:
+    // real LLVM-IR translation can't handle a bare `unrealized_conversion_
+    // cast` at all (`LLVM Translation failed for operation: builtin.
+    // unrealized_conversion_cast`, a hard native crash). This is the
+    // standard MLIR cleanup for exactly that situation: folds/cancels
+    // chains of these casts away (`cast(cast(x, A->B), B->A) == x`), not a
+    // real lowering step of its own.
+    pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
     pass_manager.run(&mut module).expect("lowering to the llvm dialect must succeed");
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
@@ -462,6 +550,16 @@ fn an_array_argument_crosses_an_extern_call_boundary_correctly() {
     let pass_manager = pass::PassManager::new(&context);
     pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
+    // Multiple independent conversion passes can each leave `builtin.
+    // unrealized_conversion_cast` bridge ops between their own intermediate
+    // representations behind -- found by direct testing, kept defensively:
+    // real LLVM-IR translation can't handle a bare `unrealized_conversion_
+    // cast` at all (`LLVM Translation failed for operation: builtin.
+    // unrealized_conversion_cast`, a hard native crash). This is the
+    // standard MLIR cleanup for exactly that situation: folds/cancels
+    // chains of these casts away (`cast(cast(x, A->B), B->A) == x`), not a
+    // real lowering step of its own.
+    pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
     pass_manager.run(&mut module).expect("lowering to the llvm dialect must succeed");
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
@@ -513,6 +611,16 @@ fn a_unit_returning_extern_fn_can_be_called_correctly() {
     let pass_manager = pass::PassManager::new(&context);
     pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
+    // Multiple independent conversion passes can each leave `builtin.
+    // unrealized_conversion_cast` bridge ops between their own intermediate
+    // representations behind -- found by direct testing, kept defensively:
+    // real LLVM-IR translation can't handle a bare `unrealized_conversion_
+    // cast` at all (`LLVM Translation failed for operation: builtin.
+    // unrealized_conversion_cast`, a hard native crash). This is the
+    // standard MLIR cleanup for exactly that situation: folds/cancels
+    // chains of these casts away (`cast(cast(x, A->B), B->A) == x`), not a
+    // real lowering step of its own.
+    pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
     pass_manager.run(&mut module).expect("lowering to the llvm dialect must succeed");
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
@@ -558,6 +666,16 @@ fn a_string_literal_printed_via_print_writes_the_right_bytes_to_stdout() {
     let pass_manager = pass::PassManager::new(&context);
     pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
+    // Multiple independent conversion passes can each leave `builtin.
+    // unrealized_conversion_cast` bridge ops between their own intermediate
+    // representations behind -- found by direct testing, kept defensively:
+    // real LLVM-IR translation can't handle a bare `unrealized_conversion_
+    // cast` at all (`LLVM Translation failed for operation: builtin.
+    // unrealized_conversion_cast`, a hard native crash). This is the
+    // standard MLIR cleanup for exactly that situation: folds/cancels
+    // chains of these casts away (`cast(cast(x, A->B), B->A) == x`), not a
+    // real lowering step of its own.
+    pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
     pass_manager.run(&mut module).expect("lowering to the llvm dialect must succeed");
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
@@ -1624,5 +1742,427 @@ fn turbofish_on_convert_disambiguates_between_two_real_competing_impls() {
         }
     ";
     assert_eq!(run_i32(&context, src), 1);
+}
+
+// ---------------------------------------------------------------------
+// `doc/backlog.md`'s "Deferred/symbolic constant folding" item — an array
+// size *computed* from two of a generic fn's own const generics (`[i32;
+// N+M]`), staying symbolic (`Ty::ConstExpr`) through declaration-time
+// inference and only folding into a real concrete size once monomorphized
+// at a real, turbofish-pinned call site.
+// ---------------------------------------------------------------------
+
+/// The real payoff, end to end: `f`'s own generic signature (`c: [i32;
+/// N+M]`) is meaningless until monomorphized. `N`/`M` are each individually
+/// recovered the ordinary way, first — `monomorphize.rs`'s own `derive_
+/// instantiation` reverse-unifies a generic call's own concrete argument
+/// types against the scheme's declared shape, and `a`'s/`b`'s own real
+/// array lengths (2, 3) pin `N`/`M` directly, exactly like any other
+/// generic parameter. *Then* `c`'s own declared `N+M` gets checked: by the
+/// time `unify` reaches `c`'s position (`Ty::Fn`'s own arm unifies
+/// parameters strictly left to right, mutating one shared `Subst`), `N`
+/// and `M` are already bound from `a`/`b`, so `Subst::apply`'s own fold
+/// (called at the top of every `unify`) collapses `N+M` into a real
+/// `Const(5)` *before* the match ever runs — matching `c`'s own actual
+/// 5-element argument cleanly, no special-casing needed. The JIT-computed
+/// sum proves the values themselves, not just the types, came through
+/// correctly.
+///
+/// Deliberately *not* the shape where `N`/`M` appear *only* combined inside
+/// `N+M` (`fn f<const N,M>(x: [i32; N+M]) -> ...`, called via explicit
+/// turbofish alone) — confirmed by direct testing that `derive_
+/// instantiation` never consults a call's own explicit turbofish at all
+/// (`collect_instantiations_expr`'s own `ExprKind::Call` arm discards it,
+/// `(path, _, args, ..)`), only ever reverse-unifying from argument/return
+/// *value* types — so a const generic that never appears on its own,
+/// anywhere in the signature, can't be recovered for monomorphization
+/// purposes this way. A real, separate, narrower gap, flagged in
+/// `doc/backlog.md` rather than fixed here — this test's own shape (each
+/// const generic *also* appearing directly somewhere) is the realistic,
+/// working case this item's own motivating example (`[T; N+M]`) is
+/// actually about.
+#[test]
+fn a_generic_fns_computed_array_size_folds_correctly_at_monomorphization() {
+    let context = context();
+    let src = "
+        fn f<const N: i32, const M: i32>(a: [i32; N], b: [i32; M], c: [i32; N+M]) -> i32 {
+            c[0] + c[1]
+        }
+        fn main() -> i32 {
+            f([1, 2], [3, 4, 5], [10, 20, 30, 40, 50])
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 30);
+}
+
+// ---------------------------------------------------------------------
+// Deferred field-access/method-call resolution — a value whose only
+// concreteness comes from `apply_defaults` used to permanently lock a
+// field access or method call on it to `<not-yet-inferred>` (see
+// `infer.rs`'s own `pending_field_accesses`/`pending_method_calls`).
+// ---------------------------------------------------------------------
+
+/// The real, user-reported repro, end to end: `examples/complex.cleave`'s
+/// own exact shape — `let z7 = 5.0 + 7.5i;` with *no* annotation, then
+/// `.magnitude()` directly. `z7`'s own type only becomes concrete via
+/// `apply_defaults`, well after `.magnitude()`'s own call-site resolution
+/// used to already have given up.
+#[test]
+fn an_unannotated_complex_literals_method_call_actually_runs() {
+    let context = context();
+    let src = "
+        use complex;
+        fn main() -> i32 {
+            let z7 = 3.0 + 4.0i;
+            if z7.magnitude() == 5.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// Same, for plain field access instead of a method call.
+#[test]
+fn an_unannotated_complex_literals_field_access_actually_runs() {
+    let context = context();
+    let src = "
+        use complex;
+        fn main() -> i32 {
+            let z7 = 3.0 + 4.0i;
+            if z7.real == 3.0 and z7.imag == 4.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+// ---------------------------------------------------------------------
+// `Vector<T,N>` (`stdlib/vector/vector.cleave`): an ordinary generic
+// struct, `#[mlir_type(tensor)]`-tagged — its real representation is a
+// native MLIR `tensor<NxT>` value, never the ordinary heap-allocated
+// struct reference. See `doc/backlog.md`'s own entry for the design
+// (supersedes an earlier, reverted `Ty::Vector` hardcoded `Ty` variant).
+// ---------------------------------------------------------------------
+
+/// The smallest possible vertical slice: an ordinary named-field struct
+/// literal (`Vector(data: [...])`) really builds a real MLIR `tensor<3xf32>`
+/// value (`tagged_struct_native_type`/`lower_tagged_struct_construct`), and
+/// `v[i]` — dispatched through the new `Index<Container,Elem>` algebra
+/// fallback, not a field — reads a real element back out of it.
+#[test]
+fn a_tagged_struct_constructs_as_a_real_tensor_and_index_reads_the_right_element() {
+    let context = context();
+    let src = r#"
+        use vector;
+        fn main() -> i32 {
+            let v = Vector(data: [1.0, 2.0, 3.0]);
+            let x0 = v[0];
+            let x1 = v[1];
+            let x2 = v[2];
+            if x0 == 1.0 and x1 == 2.0 and x2 == 3.0 { 1 } else { 0 }
+        }
+    "#;
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `Ring<Vector<T,N>>` (`stdlib/vector/vector.cleave`) — ordinary
+/// elementwise arithmetic (`+` desugars to `Ring::add` the same way it does
+/// for any other `Ring`-impl'd type), `arith.addf` broadcasting structurally
+/// over the `tensor<3xf32>`-typed operands — no new mechanism, and no
+/// awareness anywhere in `stdlib/vector/vector.cleave` that this needs
+/// anything beyond the one-line-per-op shape every other `Ring` impl uses.
+#[test]
+fn elementwise_ring_add_on_tagged_vectors_computes_the_right_values() {
+    let context = context();
+    let src = r#"
+        use vector;
+        fn main() -> i32 {
+            let a = Vector(data: [1.0, 2.0, 3.0]);
+            let b = Vector(data: [10.0, 20.0, 30.0]);
+            let c = a + b;
+            let x0 = c[0];
+            let x1 = c[1];
+            let x2 = c[2];
+            if x0 == 11.0 and x1 == 22.0 and x2 == 33.0 { 1 } else { 0 }
+        }
+    "#;
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// A real, structural `linalg.matmul`-backed matmul on nested `Matrix<T,R,C>`
+/// — now an ordinary stdlib type (`stdlib/vector/vector.cleave`, moved there
+/// alongside `Vector`/`Tensor` — general-purpose linear algebra, not
+/// specific to this test or `examples/matmul.cleave`) — the flagship goal of
+/// this whole item (`doc/hld.md`'s own "don't lower prematurely" thesis,
+/// worked example: `matmul` as one opaque, reassociation-eligible node, not
+/// a hand-written triple-nested loop). 2x3 times 3x2 -> 2x2, the exact same
+/// hand-computed expected values `examples/matmul.cleave` already uses.
+/// Read back via the real `mc[i,j]` sugar directly -- multi-dimensional
+/// `Index` dispatch (`doc/backlog.md`'s own former "not attempted" item),
+/// not a raw `mlir::tensor::extract` escape hatch: `ast.rs::ExprKind::
+/// Index` now carries a whole bracket group's indices on one node, and
+/// `stdlib/vector/vector.cleave`'s own `Index<Matrix<T,R,C>, T>` impl
+/// (`idx: [i32; 2]`) dispatches the whole group as one call. No `let zero:
+/// i32 = ...` workaround needed at the call site any more either -- the
+/// `arith.index_cast`-on-a-bare-literal rough edge (`doc/backlog.md`) lives
+/// entirely *inside* the impl body now (`idx[0]`/`idx[1]`, ordinary array
+/// reads, not raw `mlir::...` calls), invisible to a caller.
+///
+/// `mc` needs no explicit type annotation, unlike an earlier version of
+/// this test: `MatMul<A,B,C>`'s own `C` is exactly the same kind of
+/// output-only generic `Index<Container,Elem,K>`'s own `Elem` is
+/// (`doc/backlog.md`'s own "`check_pending_constraints`'s output-only-
+/// generic gate" item, plus `ExprKind::Index`'s own missing deferred-
+/// resolution path) — both real, fixed bugs now, not workarounds.
+#[test]
+fn a_structural_linalg_matmul_on_tagged_matrices_computes_the_right_values() {
+    let context = context();
+    let src = r##"
+        use vector;
+        fn main() -> i32 {
+            let ma = Matrix(data: [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+            let mb = Matrix(data: [[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]]);
+            let mc = matmul(ma, mb);
+            if mc[0,0] == 58.0 and mc[0,1] == 64.0 and mc[1,0] == 139.0 and mc[1,1] == 154.0 { 1 } else { 0 }
+        }
+    "##;
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `Ring<Matrix<T,R,C>>` (`stdlib/vector/vector.cleave`) — a genuine new
+/// addition, not a regression guard: `Matrix` never had an elementwise `Ring`
+/// impl before it moved into the stdlib (`examples/matmul.cleave`'s own local
+/// declaration only ever exercised `MatMul::matmul`). Mirrors `elementwise_
+/// ring_add_on_tagged_vectors_computes_the_right_values`'s own shape one rank
+/// up: `arith.addf` broadcasting structurally over a `tensor<2x2xf32>`-typed
+/// operand, confirmed directly rather than assumed to just work at rank 2.
+#[test]
+fn elementwise_ring_add_on_tagged_matrices_computes_the_right_values() {
+    let context = context();
+    let src = r#"
+        use vector;
+        fn main() -> i32 {
+            let a = Matrix(data: [[1.0, 2.0], [3.0, 4.0]]);
+            let b = Matrix(data: [[10.0, 20.0], [30.0, 40.0]]);
+            let c = a + b;
+            if c[0,0] == 11.0 and c[1,1] == 44.0 { 1 } else { 0 }
+        }
+    "#;
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `Tensor<T,D0,D1,D2>` (`stdlib/vector/vector.cleave`) — rank 3, never
+/// previously exercised end to end (`Vector`=rank 1, `Matrix`=rank 2 were the
+/// only two shapes any real test/example had built). Confirms the same
+/// generalized `#[mlir_type(tensor)]` mechanism (`tagged_struct_native_type`/
+/// `lower_tagged_struct_construct`, both fully shape-generic already, driven
+/// by `flatten_array_dims` over however many dims the field's own array type
+/// actually has) really does scale past 2 dims with no new Rust code needed —
+/// construction plus a real `t[i,j,k]` read back, through `stdlib/vector/
+/// vector.cleave`'s own `Index<Tensor<T,D0,D1,D2>, T>` impl (`idx: [i32;3]`)
+/// — a real 3-index bracket group, one `Index` node, `indices.len() == 3`.
+#[test]
+fn a_rank_3_tensor_constructs_and_reads_back_the_right_value() {
+    let context = context();
+    let src = r#"
+        use vector;
+        fn main() -> i32 {
+            let t = Tensor(data: [
+                [[1.0, 2.0], [3.0, 4.0]],
+                [[5.0, 6.0], [7.0, 8.0]]
+            ]);
+            if t[0,1,0] == 3.0 and t[1,1,1] == 8.0 { 1 } else { 0 }
+        }
+    "#;
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// The negative counterpart — `m[i,j,k]` (3 indices) on a `Matrix` (rank 2)
+/// must be rejected, not silently accepted with the extra index ignored:
+/// `Matrix`'s own `Index` impl hardcodes `idx: [i32; 2]`, so a 3-element
+/// bracket group builds a `[i32;3]` array whose length doesn't structurally
+/// match `Matrix`'s own hardcoded `idx: [i32; 2]` impl.
+///
+/// `K` is deliberately excluded from `infer_algebra_call`'s own `resolved_
+/// generics` (only an algebra's *type* generics — `Container`, `Elem` — ever
+/// feed `dispatch_algebra_call`'s target-matching; a *const* generic like
+/// `K` is bound separately, by ordinary `unify_at` against the impl's own
+/// declared `idx` parameter type) — so ordinary immediate dispatch accepts
+/// `m[0,0,0]` freely (nothing about `K` blocks it there), and the real
+/// rejection only surfaces one pass later, at monomorphization
+/// (`derive_impl_instantiation`'s own full signature match, which *does*
+/// see `Matrix`'s own literal `[i32;2]` and fails to unify it against a
+/// `[i32;3]` query) — `cleave::monomorphize::dump_monomorphized` runs that
+/// pass; `cleave::dump::dump_program` (ordinary inference alone, as used by
+/// e.g. `named_arguments_on_an_ordinary_call_are_rejected` above) would
+/// wrongly report this program as accepted. `m`'s own explicit `Matrix<f32,
+/// 2,2>` annotation sidesteps the separate, already-documented `doc/
+/// backlog.md` inference gap (`check_pending_constraints`'s output-only-
+/// generic gate) entirely, so this test isolates exactly the one thing it
+/// means to check.
+#[test]
+fn over_indexing_a_matrix_is_rejected() {
+    let (result, _sources) = compile(
+        vec![(
+            "test.cleave".to_string(),
+            "use vector;\nfn main() -> i32 { let m: Matrix<f32,2,2> = Matrix(data: [[1.0, 2.0], [3.0, 4.0]]); if m[0,0,0] == 1.0 { 1 } else { 0 } }"
+                .to_string(),
+        )],
+        &[],
+    );
+    let program = result.unwrap_or_else(|e| panic!("expected a parse/use-resolution success (the type error is caught later): {e:?}"));
+    let registry = Registry::build(&program);
+    let (_, errs) = cleave::monomorphize::dump_monomorphized(&program, &registry);
+    assert!(!errs.is_empty(), "`m[0,0,0]` supplies 3 indices to a rank-2 `Matrix` and must be rejected");
+}
+
+/// The array-side counterpart -- over-indexing a real, plain 2D array
+/// (`a[i,j,k]`, one more index than its own declared rank) must still be
+/// cleanly rejected, exactly as before this session's `Vec<Expr>` rework of
+/// `ExprKind::Index` (recursion-per-level -> one explicit peel-loop, see
+/// `infer.rs`'s own doc comment) -- confirms that rewrite didn't loosen the
+/// existing array-arity check.
+#[test]
+fn over_indexing_a_plain_array_is_rejected() {
+    let (result, _sources) = compile(
+        vec![(
+            "test.cleave".to_string(),
+            "fn main() -> i32 { let a = [[1, 2], [3, 4]]; a[0,0,0] }".to_string(),
+        )],
+        &[],
+    );
+    let program = result.unwrap_or_else(|e| panic!("expected a parse/use-resolution success (the type error is caught later): {e:?}"));
+    let registry = Registry::build(&program);
+    let (_, errs) = cleave::dump::dump_program(&program, &registry);
+    assert!(!errs.is_empty(), "`a[0,0,0]` supplies one more index than this 2D array's own rank and must be rejected");
+}
+
+// ------------------------------------------------------------ check_pending_constraints's output-only-generic gate
+
+/// The real end-to-end proof for `doc/backlog.md`'s own "`check_pending_
+/// constraints`'s output-only-generic gate" item: `print(v[0])`, with *no*
+/// intervening `let x: f32 = v[0];` annotation, used to panic in `cps.rs`'s
+/// own `resolve_call` ("could not resolve call to `print`") rather than
+/// compile and run. `v`'s own element type is still an undefaulted `Ty::Var`
+/// at the point `v[0]` is first seen (defaulting only runs once, at the very
+/// end of `main`'s own inference), so `Index`'s own dispatch defers -- and
+/// its output-only `Elem` generic was never independently pinned by
+/// anything else the way a `==` comparison against a literal would (a bare
+/// `print(...)` call forces nothing on its own). `print_f32` is registered
+/// for real, not just verified structurally -- a wrong dispatch would show
+/// up as a genuine JIT symbol-resolution failure, not just a silently wrong
+/// value.
+#[test]
+fn print_of_an_unannotated_index_result_no_longer_panics() {
+    let context = context();
+    let (result, _sources) = compile(
+        vec![(
+            "test.cleave".to_string(),
+            "use io;\nuse vector;\nfn main() -> i32 { let v = Vector(data: [1.0, 2.0, 3.0]); print(v[0]); 0 }".to_string(),
+        )],
+        &[],
+    );
+    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+    let registry = Registry::build(&program);
+    let units = collect_units(&program, &registry);
+    let cps_program = convert_program(units);
+    let mlir_types = collect_mlir_types(&program);
+    let struct_schemas = collect_struct_schemas(&program);
+    let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
+    assert!(module.as_operation().verify(), "generated MLIR module failed verification");
+
+    let pass_manager = pass::PassManager::new(&context);
+    pass_manager.add_pass(pass::linalg::create_convert_elementwise_to_linalg_pass());
+    pass_manager.run(&mut module).expect("convert-elementwise-to-linalg must succeed");
+
+    let pass_manager = pass::PassManager::new(&context);
+    pass::bufferization::register_one_shot_bufferize_pass();
+    parse_pass_pipeline(
+        pass_manager.as_operation_pass_manager(),
+        "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})",
+    )
+    .expect("failed to parse the one-shot-bufferize pass pipeline");
+    pass_manager.run(&mut module).expect("one-shot-bufferize must succeed");
+
+    let pass_manager = pass::PassManager::new(&context);
+    pass_manager.add_pass(pass::linalg::create_convert_linalg_to_loops_pass());
+    pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
+    pass_manager.add_pass(pass::conversion::create_to_llvm());
+    pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
+    pass_manager.run(&mut module).expect("lowering to the llvm dialect must succeed");
+
+    let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
+    unsafe {
+        engine.register_symbol("print_f32", cleave_rt::print_f32 as *mut ());
+        engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
+    }
+    let mut out: i32 = -1;
+    unsafe {
+        engine.invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()]).expect("JIT invocation must succeed");
+    }
+    assert_eq!(out, 0);
+}
+
+/// The `MatMul<A,B,C>` counterpart -- `C` is exactly the same kind of
+/// output-only generic `Index`'s own `Elem` is (confirmed directly this
+/// session: the original version of the matmul JIT test above only avoided
+/// this by reading `mc` back through a raw `mlir::tensor::extract` call,
+/// which never needed `mc`'s own cleave-level type resolved at all). `mc`
+/// has *no* explicit `Matrix<f32,2,2>` annotation here, unlike the matmul
+/// test above -- `print(mc[0,0])` alone must now be enough.
+#[test]
+fn print_of_an_unannotated_matmul_index_result_no_longer_panics() {
+    let context = context();
+    let (result, _sources) = compile(
+        vec![(
+            "test.cleave".to_string(),
+            "use io;\nuse vector;\nfn main() -> i32 {\n\
+             let ma = Matrix(data: [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);\n\
+             let mb = Matrix(data: [[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]]);\n\
+             let mc = matmul(ma, mb);\n\
+             print(mc[0,0]);\n\
+             0\n\
+             }"
+                .to_string(),
+        )],
+        &[],
+    );
+    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+    let registry = Registry::build(&program);
+    let units = collect_units(&program, &registry);
+    let cps_program = convert_program(units);
+    let mlir_types = collect_mlir_types(&program);
+    let struct_schemas = collect_struct_schemas(&program);
+    let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
+    assert!(module.as_operation().verify(), "generated MLIR module failed verification");
+
+    let pass_manager = pass::PassManager::new(&context);
+    pass_manager.add_pass(pass::linalg::create_convert_elementwise_to_linalg_pass());
+    pass_manager.run(&mut module).expect("convert-elementwise-to-linalg must succeed");
+
+    let pass_manager = pass::PassManager::new(&context);
+    pass::bufferization::register_one_shot_bufferize_pass();
+    parse_pass_pipeline(
+        pass_manager.as_operation_pass_manager(),
+        "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})",
+    )
+    .expect("failed to parse the one-shot-bufferize pass pipeline");
+    pass_manager.run(&mut module).expect("one-shot-bufferize must succeed");
+
+    let pass_manager = pass::PassManager::new(&context);
+    pass_manager.add_pass(pass::linalg::create_convert_linalg_to_loops_pass());
+    pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
+    pass_manager.add_pass(pass::conversion::create_to_llvm());
+    pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
+    pass_manager.run(&mut module).expect("lowering to the llvm dialect must succeed");
+
+    let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
+    unsafe {
+        engine.register_symbol("print_f32", cleave_rt::print_f32 as *mut ());
+        engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
+    }
+    let mut out: i32 = -1;
+    unsafe {
+        engine.invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()]).expect("JIT invocation must succeed");
+    }
+    assert_eq!(out, 0);
 }
 
