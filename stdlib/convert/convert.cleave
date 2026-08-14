@@ -13,19 +13,18 @@
 // project's own posture, applied everywhere else, is that nothing is
 // guessed or silently inserted, always checked).
 //
-// Deliberately dependency-free, like `stdlib/num` -- `driver.rs`'s own
-// `compile` doc comment: crate `use` resolution is "deliberately one level
-// deep only," a loaded crate's own `use` statements are never themselves
-// followed. A `Convert<f64, Complex<f64>>` impl belongs here just as
-// naturally, but would force *every* `use convert;` program to also
-// explicitly `use complex;` even to reach the unrelated `f32 -> f64` impl
-// below (confirmed directly: `unknown struct Complex`, reported against
-// this file itself, the moment such an impl was added). A user program
-// wanting that conversion declares its own impl instead (see
-// `examples/convert.cleave`) -- an ordinary extension, not a workaround;
-// matches this project's own posture that new numeric relationships are
-// added via real `algebra`/`impl` declarations, never hardcoded into the
-// compiler.
+// Used to be deliberately dependency-free, like `stdlib/num`, specifically
+// to work around `driver.rs`'s own former "one level deep only" `use`
+// limitation (a `Convert<f64, Complex<f64>>` impl would have forced *every*
+// `use convert;` program to also explicitly `use complex;`, even to reach
+// the unrelated `f32 -> f64` impl below) -- `doc/backlog.md`'s own "Real
+// transitive `use` resolution" item fixed that for real, so this
+// restriction no longer applies. A `Convert<f64, Complex<f64>>` impl would
+// be a perfectly reasonable addition now; just not added here opportunistically
+// -- a user program wanting that conversion still declares its own impl for
+// now (see `examples/convert.cleave`), matching this project's own posture
+// that new numeric relationships are added via real `algebra`/`impl`
+// declarations, never hardcoded into the compiler.
 //
 // `use convert;` explicitly -- not prelude (matches `io`/`complex`'s own
 // precedent, not `num`'s): a program that never calls `.to()`/`convert(...)`
@@ -36,6 +35,10 @@ algebra Convert<From, To> {
 }
 
 impl Convert<i32, f64> {
+    fn convert(x) { mlir::arith::sitofp(x) }
+}
+
+impl Convert<i32, f32> {
     fn convert(x) { mlir::arith::sitofp(x) }
 }
 

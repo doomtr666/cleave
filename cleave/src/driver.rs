@@ -176,16 +176,25 @@ pub fn load_crate_dir(
 }
 
 /// The top-level entry point: parses `entry_sources`, resolves every
-/// top-level `use` found in them against `extra_search_paths` (with
+/// top-level `use` found in them (and, transitively, every `use` found in
+/// each crate thereby loaded, and so on) against `extra_search_paths` (with
 /// `stdlib_path()` always appended last), loads and merges each resolved
 /// crate's own files, and merges everything — entries and imported crates
 /// alike — into one final `Program`.
 ///
-/// Deliberately one level deep only: a *loaded crate's own* `use`
-/// statements are not themselves followed. Real transitive resolution needs
-/// cycle detection (crate A using crate B using crate A) that this doesn't
-/// attempt yet — fine for now since `stdlib/num` doesn't use anything
-/// itself, not fine as a permanent limitation.
+/// Real transitive resolution, not one level deep: `visit_crate`'s own DFS
+/// scans a *newly loaded* crate's own merged `Program` for further
+/// `ItemKind::Use` items exactly the same way this function's own top-level
+/// scan already does for the entry files, recursing — with real cycle
+/// detection (`stack`, the current DFS path — not just `loaded`, which only
+/// ever dedups) reporting a clean, located diagnostic naming the actual
+/// cycle rather than looping forever or silently truncating. Pushing each
+/// crate's own `Program` in DFS *post-order* (after every one of its own
+/// dependencies has already been visited) means `programs` ends up in a
+/// real topological order, dependencies before dependents — `merge_programs`
+/// itself doesn't strictly require this (a flat, order-independent union),
+/// but it keeps `FileId` assignment deterministic, the same concern
+/// `load_crate_dir`'s own path-sorting already exists for.
 ///
 /// Only a `use` path's *first* segment is resolved to a crate directory —
 /// `use linalg::Matrix;` and `use linalg;` behave identically, pulling in
@@ -223,13 +232,13 @@ pub fn compile(
         return (Err(errors), sources);
     }
 
-    let mut seen_crates = std::collections::HashSet::new();
     let mut wanted: Vec<(String, Span)> = Vec::new();
+    let mut wanted_names = std::collections::HashSet::new();
     for program in &programs {
         for item in &program.items {
             if let ItemKind::Use(path) = &item.kind {
                 let name = path.segments[0].clone();
-                if seen_crates.insert(name.clone()) {
+                if wanted_names.insert(name.clone()) {
                     wanted.push((name, item.span));
                 }
             }
@@ -241,27 +250,46 @@ pub fn compile(
         search_paths.push(std);
     }
 
+    let mut loaded = std::collections::HashSet::new();
+    let mut stack = Vec::new();
     for (name, span) in wanted {
-        match resolve_crate_dir(&name, &search_paths) {
-            Some(dir) => match load_crate_dir(&dir, &mut ids, &mut node_ids, &mut sources) {
-                Ok(p) => programs.push(p),
-                Err(mut e) => errors.append(&mut e),
-            },
-            None => errors.push(Diagnostic::error(format!("cannot find crate `{name}`"), span)),
-        }
+        visit_crate(
+            &name,
+            span,
+            true,
+            &search_paths,
+            &mut ids,
+            &mut node_ids,
+            &mut sources,
+            &mut programs,
+            &mut errors,
+            &mut loaded,
+            &mut stack,
+        );
     }
 
-    // The prelude — see `PRELUDE_CRATES`'s doc comment for why a missing one
-    // is silently skipped here while an explicit `use` above is not.
+    // The prelude — see `PRELUDE_CRATES`'s own doc comment for why a
+    // missing one is silently skipped here (`required: false`, and no real
+    // use-site span to report against even if it weren't) while an explicit
+    // `use` above is not — joins the exact same transitive-discovery
+    // worklist otherwise, a prelude crate's own `use`s followed exactly
+    // like any other's.
     for name in PRELUDE_CRATES {
-        if seen_crates.contains(*name) {
-            continue;
-        }
-        if let Some(dir) = resolve_crate_dir(name, &search_paths) {
-            match load_crate_dir(&dir, &mut ids, &mut node_ids, &mut sources) {
-                Ok(p) => programs.push(p),
-                Err(mut e) => errors.append(&mut e),
-            }
+        if !wanted_names.contains(*name) {
+            let synthetic_span = Span { file: FileId(0), start: 0, end: 0 };
+            visit_crate(
+                name,
+                synthetic_span,
+                false,
+                &search_paths,
+                &mut ids,
+                &mut node_ids,
+                &mut sources,
+                &mut programs,
+                &mut errors,
+                &mut loaded,
+                &mut stack,
+            );
         }
     }
 
@@ -270,6 +298,73 @@ pub fn compile(
     }
 
     (merge_programs(programs), sources)
+}
+
+/// One node of `compile`'s own transitive crate-resolution DFS — see that
+/// function's own doc comment for the overall shape. `required` mirrors
+/// `PRELUDE_CRATES`'s own "missing is silently fine, broken is not"
+/// distinction: `false` only for a top-level prelude entry point that
+/// simply isn't present; every crate discovered *because* something else
+/// really does `use` it (an entry file, or another crate's own `use`) is
+/// always `required: true`, including a prelude crate's own further
+/// dependencies once the prelude crate itself is found.
+#[allow(clippy::too_many_arguments)]
+fn visit_crate(
+    name: &str,
+    span: Span,
+    required: bool,
+    search_paths: &[PathBuf],
+    ids: &mut FileIdGen,
+    node_ids: &mut NodeIdGen,
+    sources: &mut crate::diag::SourceMap,
+    programs: &mut Vec<Program>,
+    errors: &mut Vec<Diagnostic>,
+    loaded: &mut std::collections::HashSet<String>,
+    stack: &mut Vec<String>,
+) {
+    if loaded.contains(name) {
+        return;
+    }
+    if let Some(pos) = stack.iter().position(|n| n == name) {
+        let cycle = stack[pos..].iter().cloned().chain(std::iter::once(name.to_string())).collect::<Vec<_>>().join(" -> ");
+        errors.push(Diagnostic::error(format!("circular crate dependency: {cycle}"), span));
+        loaded.insert(name.to_string());
+        return;
+    }
+
+    let Some(dir) = resolve_crate_dir(name, search_paths) else {
+        if required {
+            errors.push(Diagnostic::error(format!("cannot find crate `{name}`"), span));
+        }
+        loaded.insert(name.to_string());
+        return;
+    };
+
+    stack.push(name.to_string());
+    match load_crate_dir(dir.as_path(), ids, node_ids, sources) {
+        Ok(program) => {
+            let mut deps: Vec<(String, Span)> = Vec::new();
+            let mut dep_names = std::collections::HashSet::new();
+            for item in &program.items {
+                if let ItemKind::Use(path) = &item.kind {
+                    let dep_name = path.segments[0].clone();
+                    if dep_names.insert(dep_name.clone()) {
+                        deps.push((dep_name, item.span));
+                    }
+                }
+            }
+            for (dep_name, dep_span) in deps {
+                visit_crate(&dep_name, dep_span, true, search_paths, ids, node_ids, sources, programs, errors, loaded, stack);
+            }
+            // Post-order: this crate's own `Program` is only pushed *after*
+            // every one of its own dependencies has been — see this
+            // function's own doc comment for why (a real topological order).
+            programs.push(program);
+        }
+        Err(mut e) => errors.append(&mut e),
+    }
+    stack.pop();
+    loaded.insert(name.to_string());
 }
 
 /// `(name, param-type strings)` — `None` if any parameter lacks an

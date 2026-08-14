@@ -172,3 +172,58 @@ fn project_search_path_is_tried_before_stdlib() {
     assert!(registry.has_algebra("Shadowed"), "project search path should win over the stdlib fallback");
     assert!(!registry.has_algebra("Num"), "the real stdlib `num` should not have been loaded instead");
 }
+
+#[test]
+fn a_crates_own_use_is_followed_transitively() {
+    // `driver.rs`'s own former "one level deep" limitation — `a` uses `b`
+    // uses `c`; the entry file only ever writes `use a;` directly. `c`'s
+    // own algebra must still be visible, without the entry needing to name
+    // `b`/`c` itself.
+    let project = TempProject::new("transitive_use");
+    project.write_crate_file("a", "a.cleave", "use b;\nalgebra A {}");
+    project.write_crate_file("b", "b.cleave", "use c;\nalgebra B {}");
+    project.write_crate_file("c", "c.cleave", "algebra C {}");
+
+    let src = "use a;\nfn f() -> i32 { 0 }".to_string();
+    let program = compile_ok(vec![("main.cleave".to_string(), src)], &project.search_paths());
+    let registry = Registry::build(&program);
+    assert!(registry.has_algebra("A"), "the directly-used crate must still load");
+    assert!(registry.has_algebra("B"), "a's own use of b must be followed");
+    assert!(registry.has_algebra("C"), "b's own use of c must be followed transitively through a and b both");
+}
+
+#[test]
+fn a_crate_used_both_directly_and_transitively_loads_once() {
+    // The entry writes `use a; use b;` directly, and `a` *also* uses `b`
+    // itself — `b` must not be loaded/merged twice regardless of which
+    // path discovers it first.
+    let project = TempProject::new("diamond_use");
+    project.write_crate_file("a", "a.cleave", "use b;\nalgebra A {}");
+    project.write_crate_file("b", "b.cleave", "algebra B { fn f(x: T) -> T; }");
+
+    let src = "use a;\nuse b;\nfn f() -> i32 { 0 }".to_string();
+    let program = compile_ok(vec![("main.cleave".to_string(), src)], &project.search_paths());
+    let b_items: Vec<_> = program
+        .items
+        .iter()
+        .filter(|i| matches!(&i.kind, ItemKind::Algebra(d) if d.name == "B"))
+        .collect();
+    assert_eq!(b_items.len(), 1, "b reached via two different paths must still merge into one declaration, got {b_items:?}");
+}
+
+#[test]
+fn a_circular_crate_dependency_is_rejected_cleanly() {
+    // `a` uses `b`, `b` uses `a` — must be a real, located, clearly-worded
+    // diagnostic, not a hang or a silent partial load.
+    let project = TempProject::new("cyclic_use");
+    project.write_crate_file("a", "a.cleave", "use b;\nalgebra A {}");
+    project.write_crate_file("b", "b.cleave", "use a;\nalgebra B {}");
+
+    let src = "use a;\nfn f() -> i32 { 0 }".to_string();
+    let errs = compile_err(vec![("main.cleave".to_string(), src)], &project.search_paths());
+    assert!(!errs.is_empty(), "a circular crate dependency must be rejected");
+    assert!(
+        errs.iter().any(|e| e.message.contains('a') && e.message.contains('b') && e.message.to_lowercase().contains("circular")),
+        "expected a diagnostic naming the actual cycle, got: {errs:?}"
+    );
+}

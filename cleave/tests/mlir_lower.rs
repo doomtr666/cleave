@@ -1679,6 +1679,49 @@ fn a_generic_impls_own_generic_stays_generic_across_multiple_concrete_instantiat
     assert_eq!(run_i32(&context, src), 1);
 }
 
+/// `doc/backlog.md`'s own "`Convert`/output-only-generic premature-commit
+/// bug" item — the mirror image of `a_generic_impls_own_generic_stays_
+/// generic_across_multiple_concrete_instantiations` just above, but for a
+/// call *inside* the generic impl's own body dispatching an algebra whose
+/// gating generic (`Convert<From,To>`'s own `From`) is concrete
+/// *independently* of the enclosing impl's still-abstract `T`, rather than
+/// tied to it the way `Ring<Complex<T>>::add`'s own internal dispatch
+/// already is. `Boxed<T,N>::widen_n`'s own body calls `n_i.to()` — with
+/// *two* real `Convert<i32,_>` impls declared (`stdlib/convert/
+/// convert.cleave`, `f32` and `f64`), this used to either commit `T`
+/// permanently to whichever candidate happened to be tried first (surfacing
+/// as a spurious type mismatch the moment the *other* instantiation's own
+/// concrete argument type was reconciled against it) or a flat-out
+/// `AmbiguousDispatch` — even though neither instantiation's own real call
+/// site is ever actually ambiguous. `N` is routed through `let n_i: i32 =
+/// mlir::arith::addi(N, 0);` before `.to()`, not passed bare — a bare const
+/// generic used directly as a call argument hits a separate, already-
+/// documented `Ty::Const`-vs-`Ty::Con` gap (`doc/backlog.md`), unrelated to
+/// the bug this test is actually about.
+#[test]
+fn an_algebra_call_inside_a_generic_impl_body_resolves_independently_per_instantiation() {
+    let context = context();
+    let src = "
+        use convert;
+        struct Boxed<T, const N: i32> { x: T }
+        algebra WidenN<Container, T> { fn widen_n(c: Container) -> T; }
+        impl<T: Float, const N: i32> WidenN<Boxed<T, N>, T> {
+            fn widen_n(b) {
+                let n_i: i32 = mlir::arith::addi(N, 0);
+                b.x + n_i.to()
+            }
+        }
+        fn main() -> i32 {
+            let b1: Boxed<f32, 3> = Boxed(x: 1.0);
+            let b2: Boxed<f64, 3> = Boxed(x: 1.0);
+            let r1: f32 = widen_n(b1);
+            let r2: f64 = widen_n(b2);
+            if r1 == 4.0 and r2 == 4.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
 // ---------------------------------------------------------------------
 // `doc/backlog.md`'s "Explicit conversion between numeric types" item —
 // `stdlib/convert/convert.cleave`'s `algebra Convert<From, To>` and `.to()`
@@ -2166,3 +2209,75 @@ fn print_of_an_unannotated_matmul_index_result_no_longer_panics() {
     assert_eq!(out, 0);
 }
 
+
+// ------------------------------------------------------------ stdlib/nn -- activations and reductions
+
+/// `Activation<T>` (`stdlib/nn/nn.cleave`) on plain scalars -- the base case
+/// before extending to `Vector<T,N>` below. `relu`/`sigmoid`/`tanh`, each an
+/// ordinary one-or-two-line `mlir::...` body, no different in kind from any
+/// existing `Ring`/`Ord` impl. `sigmoid(0.0) == 0.5` is exact in IEEE 754
+/// (`exp(0)==1.0`, `1+1==2`, `1/2==0.5`), safe to check with `==`.
+#[test]
+fn relu_sigmoid_tanh_compute_correctly_on_scalars() {
+    let context = context();
+    // No `use vector;` here, deliberately — real proof that `driver.rs`'s
+    // own transitive `use` resolution actually works: `nn.cleave`'s own
+    // internal `use vector;` is followed on its own now, even though this
+    // test itself never touches a `Vector` value (nn.cleave's own `Vector`-
+    // based `Activation` impl is merged into any program using `nn` at all,
+    // whole-crate, no per-symbol filtering — it needs `vector` loaded
+    // regardless of whether *this* file ever names it).
+    let src = r#"
+        use nn;
+        fn main() -> i32 {
+            if relu(-2.0) == 0.0 and relu(3.0) == 3.0 and sigmoid(0.0) == 0.5 and tanh(0.0) == 0.0 { 1 } else { 0 }
+        }
+    "#;
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// The `Vector<T,N>` counterpart -- confirms `math.exp`/`math.tanh`/`arith.
+/// maximumf` really do apply directly to a `tensor<Nxf32>`-typed operand the
+/// same way `Ring<Vector<T,N>>::add`'s own `arith.addf` already does (no
+/// per-element loop), the one genuinely unverified-until-tested claim this
+/// item's own plan made. `relu`/`sigmoid` each need a same-shape constant
+/// vector to compare/combine against (`arith.maximumf`/`arith.addf` don't
+/// broadcast a bare scalar into a tensor operand) -- built via the already-
+/// working `[value; N]` array-repeat + ordinary `Vector(data: ...)`
+/// construction, exactly like `stdlib/nn/nn.cleave`'s own impl bodies do.
+#[test]
+fn relu_sigmoid_tanh_compute_correctly_on_vectors() {
+    let context = context();
+    let src = r#"
+        use nn;
+        fn main() -> i32 {
+            let v = Vector(data: [-2.0, 3.0, 0.0]);
+            let r = relu(v);
+            let s = sigmoid(Vector(data: [0.0, 0.0, 0.0]));
+            let t = tanh(Vector(data: [0.0, 0.0, 0.0]));
+            if r[0] == 0.0 and r[1] == 3.0 and r[2] == 0.0
+                and s[0] == 0.5 and s[1] == 0.5 and s[2] == 0.5
+                and t[0] == 0.0 and t[1] == 0.0 and t[2] == 0.0
+            { 1 } else { 0 }
+        }
+    "#;
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `Sum`/`Mean`/`Max` (`stdlib/nn/nn.cleave`) on `Vector<T,N>` -- plain
+/// cleave source (a `for` loop plus this session's own real multi-index
+/// `Index` reads), no MLIR-level reduction op needed at all. `[1.0, 5.0,
+/// 3.0]`: sum 9.0, mean 3.0, max 5.0 -- chosen so no two are equal by
+/// coincidence.
+#[test]
+fn sum_mean_max_of_a_vector_compute_correctly() {
+    let context = context();
+    let src = r#"
+        use nn;
+        fn main() -> i32 {
+            let v = Vector(data: [1.0, 5.0, 3.0]);
+            if sum(v) == 9.0 and mean(v) == 3.0 and max_of(v) == 5.0 { 1 } else { 0 }
+        }
+    "#;
+    assert_eq!(run_i32(&context, src), 1);
+}

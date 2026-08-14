@@ -1,0 +1,143 @@
+// The activation/reduction half of `doc/backlog.md`'s own "toward simple
+// ML" roadmap item — ordinary stdlib algebras and `mlir::...` bodies, no
+// new compiler mechanism: `relu`/`sigmoid`/`tanh` are each a one-or-two-line
+// `mlir::...` call, exactly the same shape every `Ring`/`Ord` impl already
+// uses; `sum`/`mean`/`max_of` are plain cleave source (a `for` loop plus
+// `Vector`'s own real multi-index `Index` read), needing no MLIR-level
+// reduction op at all.
+//
+// This is the first stdlib crate to reference *another* stdlib crate's own
+// types (`Vector`) — `use vector;` right below is followed transitively by
+// `driver.rs`'s own `compile` (real DFS-based crate resolution, with cycle
+// detection, not the former "one level deep only" limitation that used to
+// make this line functionally inert: a program writing only `use nn;`,
+// with no `use vector;` of its own, sees `Vector`/`Ring<Vector<T,N>>`/etc.
+// anyway — `cleave/tests/mlir_lower.rs`'s own `nn` tests are the real proof,
+// none of them write `use vector;` themselves). `mean`'s own `.to()` call
+// needs `convert` too, transitively resolved the identical way.
+use vector;
+use convert;
+
+algebra Activation<T> {
+    fn relu(x: T) -> T;
+    fn sigmoid(x: T) -> T;
+    fn tanh(x: T) -> T;
+}
+
+// `arith.maximumf(x, 0.0)`/`1.0 + ...` — a bare literal operand here is
+// fine (unlike the `arith.index_cast`-on-a-bare-literal rough edge `doc/
+// backlog.md` tracks): that gap is specifically about an op whose operand
+// type genuinely differs from its result type (`index_cast`'s own `i32 ->
+// index`); every op here has identical operand/result types, so `lower_
+// raw_mlir_op`'s own "infer operand type from a `CVal::Var` sibling, else
+// fall back to the result type" heuristic is correct either way.
+// `sigmoid`'s own `negf`'s result is bound through its own explicit `: f32`
+// `let` before being handed to `exp`, not nested directly as `exp`'s own
+// argument expression — a real, recurring rough edge (`doc/backlog.md`),
+// one level deeper than its previously-documented shape: an `mlir::...`
+// call's own result is a fresh, otherwise-unconstrained type variable: an
+// enclosing `let e: f32 = mlir::math::exp(...)` pins `exp`'s *own* result,
+// but never retroactively reaches back into `negf`'s own result nested
+// *inside* it as a bare argument — `exp` itself, being a raw `mlir::...`
+// call too, imposes no type requirement on its own argument at all, so
+// `negf`'s result stayed a permanently-unresolved type variable, reaching
+// codegen and crashing there instead of failing a clean type check up
+// front (found directly: `sigmoid` alone, isolated, first exposed it).
+impl Activation<f32> {
+    fn relu(x) { mlir::arith::maximumf(x, 0.0) }
+    fn sigmoid(x) {
+        let negx: f32 = mlir::arith::negf(x);
+        let e: f32 = mlir::math::exp(negx);
+        1.0 / (1.0 + e)
+    }
+    fn tanh(x) { mlir::math::tanh(x) }
+}
+
+impl Activation<f64> {
+    fn relu(x) { mlir::arith::maximumf(x, 0.0) }
+    fn sigmoid(x) {
+        let negx: f64 = mlir::arith::negf(x);
+        let e: f64 = mlir::math::exp(negx);
+        1.0 / (1.0 + e)
+    }
+    fn tanh(x) { mlir::math::tanh(x) }
+}
+
+// The `Vector<T,N>` counterpart — the *same* three bodies, applied directly
+// to the tensor-backed operand: `math.exp`/`math.tanh`/`arith.maximumf`
+// apply structurally over a `tensor<NxT>`-typed operand exactly the way
+// `Ring<Vector<T,N>>::add`'s own `arith.addf` already does (confirmed
+// directly, not assumed — `cleave/tests/mlir_lower.rs::relu_sigmoid_tanh_
+// compute_correctly_on_vectors`). `relu`/`sigmoid` each need a same-shape
+// constant vector to compare/combine against — `arith.maximumf`/`arith.
+// addf` don't broadcast a bare scalar into a tensor operand — built via the
+// already-working `[value; N]` array-repeat plus ordinary `Vector(data:
+// ...)` construction.
+impl<T: Float, const N: i32> Activation<Vector<T, N>> {
+    fn relu(x) {
+        let zero = Vector(data: [0.0; N]);
+        mlir::arith::maximumf(x, zero)
+    }
+    fn sigmoid(x) {
+        let one: Vector<T, N> = Vector(data: [1.0; N]);
+        let negx: Vector<T, N> = mlir::arith::negf(x);
+        let e: Vector<T, N> = mlir::math::exp(negx);
+        let denom: Vector<T, N> = mlir::arith::addf(one, e);
+        mlir::arith::divf(one, denom)
+    }
+    fn tanh(x) { mlir::math::tanh(x) }
+}
+
+algebra Sum<Container, T> {
+    fn sum(c: Container) -> T;
+}
+
+algebra Mean<Container, T> {
+    fn mean(c: Container) -> T;
+}
+
+// Named `max_of`, not `max` — no real collision exists today, but `max`
+// reads oddly right next to a hypothetical future scalar `max(a,b)`.
+algebra Max<Container, T> {
+    fn max_of(c: Container) -> T;
+}
+
+impl<T: Float, const N: i32> Sum<Vector<T, N>, T> {
+    fn sum(v) {
+        let mut acc = v[0];
+        for i in 1..N { acc = acc + v[i]; };
+        acc
+    }
+}
+
+impl<T: Float, const N: i32> Mean<Vector<T, N>, T> {
+    // `N.to()` (`stdlib/convert/convert.cleave`'s own `Convert<i32,T>`
+    // sugar) — used to be a `mlir::arith::sitofp` workaround instead: an
+    // output-only-generic premature-commit bug meant `N.to()` here would
+    // permanently bind *this* impl's own `T` the moment `From` (`i32`)
+    // looked ready, during mere declaration-checking, well before any real
+    // instantiation ever ran — `doc/backlog.md`'s own "Convert/output-only-
+    // generic premature-commit bug" item, fixed for real now (`infer.rs`'s
+    // `infer_algebra_call` defers instead of committing whenever a still-
+    // open generic fn/impl's own declaration is what's being checked).
+    // `N` still can't be handed to `.to()` bare, though — a bare const
+    // generic used as an ordinary value hits a separate, still-open
+    // `Ty::Const`-vs-`Ty::Con` gap (`doc/backlog.md`), unrelated to the bug
+    // above — `mlir::arith::addi(N, 0)` forces it into a genuine computed
+    // `i32` value first, the same pattern this rough edge already needs
+    // elsewhere.
+    fn mean(v) {
+        let n_i: i32 = mlir::arith::addi(N, 0);
+        sum(v) / n_i.to()
+    }
+}
+
+impl<T: Float, const N: i32> Max<Vector<T, N>, T> {
+    fn max_of(v) {
+        let mut acc = v[0];
+        for i in 1..N {
+            if v[i] > acc { acc = v[i]; };
+        };
+        acc
+    }
+}

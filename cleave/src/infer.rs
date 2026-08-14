@@ -3190,6 +3190,25 @@ impl<'r> Infer<'r> {
                 // position was silently never bound, discarded forever along
                 // with the rest of `self.constraints` at the top of this
                 // loop's own `std::mem::take`.
+                //
+                // Same guard as `infer_algebra_call`'s own `generic_
+                // context_pending` check, and for the identical reason:
+                // `self.active_generics` stays set through `finish_fn`
+                // (called right after body-checking, before it's ever
+                // reset), so a constraint deferred *out of* `infer_algebra_
+                // call` for still being inside a generic fn/impl body would
+                // otherwise land right back here and commit anyway, one
+                // phase later — the exact same premature-bind bug, not
+                // actually fixed, just moved. Re-queued instead, same as
+                // every other still-not-ready case in this loop — real
+                // dispatch waits for `monomorphize.rs` to re-check this per
+                // concrete instantiation instead. (`all_concrete` is already
+                // known false here — the enclosing `if` — so this reduces to
+                // just "are we inside a generic body at all".)
+                if !self.active_generics.is_empty() {
+                    self.constraints.push(c);
+                    continue;
+                }
                 if !self.dispatch_algebra_call(&c.algebra, &resolved, c.span)? {
                     let ty = resolved.iter().map(Ty::to_string).collect::<Vec<_>>().join(", ");
                     return Err(TypeError { span: c.span, kind: TypeErrorKind::MissingImpl { algebra: c.algebra, ty } });
@@ -4580,24 +4599,88 @@ impl<'r> Infer<'r> {
             resolved_generics.push(resolved);
         }
 
-        if gating.iter().any(is_placeholder) {
-            // At least one *input* generic is an "unknown" — a placeholder
-            // for something not type-inferred yet. Deferred below, same as
-            // the "still abstract" case — one constraint holding the *whole*
-            // tuple together (see `Constraint`'s own doc comment), checked
-            // coherently by `check_pending_constraints` once every gating
-            // element is concrete, same engine `match_impl`'s immediate-
-            // dispatch path already uses.
+        // Committing immediately, right here mid-body, the moment *gating*
+        // alone is concrete (this method's own original design, restored
+        // below) is right for the overwhelmingly common case — it's what
+        // lets an output-only generic like `MatMul<A,B,C>`'s own `C` end up
+        // resolved *at all* when nothing downstream ever annotates it
+        // explicitly (`let c = matmul(a,b); c.values[0,0]` — deferring here
+        // would leave `c`'s own type an unresolved var for the rest of the
+        // body, well before `check_pending_constraints` ever gets a chance
+        // to fix it, breaking every subsequent field/index access on it).
+        // Two narrower cases still need to defer instead of committing
+        // outright, layered on top of that general rule:
+        let active_vars_pending = !self.active_generics.is_empty() && !resolved_generics.iter().all(is_fully_concrete);
+
+        if gating.iter().any(is_placeholder) || active_vars_pending {
+            // Either an *input* generic is an outright "unknown" (never
+            // type-inferred), or — `active_vars_pending` — we're still
+            // checking a still-*generic* fn/impl's own declaration (`self.
+            // active_generics` non-empty, set for the whole duration of
+            // that check) and some position, gating or output-only, isn't
+            // concrete yet. The second case matters even with only *one*
+            // matching candidate, where `dispatch_algebra_call` below would
+            // otherwise commit without any ambiguity ever being raised:
+            // found directly, `stdlib/nn/nn.cleave`'s own `mean` calling
+            // `N.to()` (`Convert<i32,T>`, only `Convert<i32,f64>` declared
+            // at the time) — `From` (`i32`) is concrete *independent* of
+            // the enclosing impl's still-abstract `T`, so gating alone said
+            // "ready" and permanently committed `self.subst`'s `T` to
+            // `f64` during mere *declaration*-checking, before any real
+            // instantiation ever ran — wrong the moment an `f32`
+            // instantiation needed a different `T`. Deferred below, same as
+            // the "still abstract" case — one constraint holding the whole
+            // tuple together (`Constraint`'s own doc comment) — resolved
+            // per real instantiation instead, once `quantify_impl_generics`
+            // (called right after this body finishes) marks `T` quantified
+            // and `check_pending_constraints`'s own leading guard skips it
+            // silently, exactly like any other still-open generic bound.
             self.constraints.push(Constraint { algebra: algebra.to_string(), tys: resolved_generics, gating_indices, span: call_span });
         } else if gating.iter().all(is_fully_concrete) {
-            // Ready: every *input* generic is known, so dispatch can
-            // actually run — commits the match's own bindings for real
+            // Ready: every *input* generic is known, and we're not
+            // mid-declaration of a still-open generic either, so dispatch
+            // can actually run — commits the match's own bindings for real
             // (see `dispatch_algebra_call`'s own doc comment for why that's
-            // sound here specifically), which is what lets an
-            // output-only generic like `C` end up resolved at all.
-            if !self.dispatch_algebra_call(algebra, &resolved_generics, call_span)? {
-                let ty = resolved_generics.iter().map(Ty::to_string).collect::<Vec<_>>().join(", ");
-                return Err(TypeError { span: call_span, kind: TypeErrorKind::MissingImpl { algebra: algebra.to_string(), ty } });
+            // sound here specifically), which is what lets an output-only
+            // generic like `C` end up resolved at all.
+            match self.dispatch_algebra_call(algebra, &resolved_generics, call_span) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let ty = resolved_generics.iter().map(Ty::to_string).collect::<Vec<_>>().join(", ");
+                    return Err(TypeError { span: call_span, kind: TypeErrorKind::MissingImpl { algebra: algebra.to_string(), ty } });
+                }
+                // More than one candidate structurally matches, and they
+                // disagree on some still-open position — by construction
+                // this can only happen when that position's own query type
+                // was itself still a bare `Ty::Var` going in (two
+                // *concrete* target patterns can never both unify against
+                // one already-concrete query — `check_no_overlapping_impls`
+                // already rules out two impls agreeing on a shared shape).
+                // So "ambiguous right now" doesn't mean "ambiguous forever"
+                // — the very next statement (an enclosing `let`'s own
+                // annotation, a sibling operand in a binary op, ...) may
+                // still pin that position down through ordinary
+                // unification, entirely outside this dispatch. Found
+                // directly: `let f: f64 = n.to();`, an *ordinary top-level*
+                // call with no enclosing generic body at all, hit a false
+                // `AmbiguousDispatch` the moment a second `Convert<i32,_>`
+                // candidate (`Convert<i32,f32>`) existed, even though this
+                // call's own real target is never actually ambiguous — the
+                // annotation just hadn't been consulted yet. Deferred here
+                // exactly like the cases above; `check_pending_constraints`
+                // gets the *final* say once the whole body (hence every
+                // local unification that could possibly disambiguate it)
+                // has been walked — if it's still ambiguous *then*, that
+                // failure is real and is allowed to propagate.
+                Err(TypeError { kind: TypeErrorKind::AmbiguousDispatch { .. }, .. }) => {
+                    self.constraints.push(Constraint {
+                        algebra: algebra.to_string(),
+                        tys: resolved_generics,
+                        gating_indices,
+                        span: call_span,
+                    });
+                }
+                Err(e) => return Err(e),
             }
         } else {
             // Still abstract somewhere among the *input* generics (a
