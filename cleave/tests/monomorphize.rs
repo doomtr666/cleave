@@ -482,3 +482,49 @@ fn a_multi_target_algebras_own_concrete_impl_dispatches_correctly_from_inside_a_
     let keys = mono.specializations_of("MatMul::mul");
     assert_eq!(keys, &["MatMul::mul<Matrix<f32, 2, 2>, Matrix<f32, 2, 2>, Matrix<f32, 2, 2>>".to_string()]);
 }
+
+#[test]
+fn an_explicit_turbofish_resolves_a_const_generic_that_only_appears_combined_with_another_one() {
+    // `doc/backlog.md`'s own former "explicit turbofish never consulted for
+    // monomorphization" item: `N`/`M` never appear *individually* in
+    // `combined`'s own signature, only combined as `N + M` (the array
+    // size) -- reverse-unifying a call site's own concrete `[i32; 7]`
+    // against `[i32; add('a, 'b)]` alone is genuinely underdetermined
+    // (confirmed directly: without the fix, this panics in
+    // `mlir_lower.rs` with "array size must be a resolved constant, got
+    // `add('t0, 't1)`" -- the call site is silently never seeded for
+    // monomorphization at all, `derive_instantiation`'s reverse-unification
+    // returning `None`). The explicit turbofish supplies `N`/`M`
+    // separately, sidestepping the underdetermined system entirely.
+    let src = "algebra Ring<T> { fn add(a: T, b: T) -> T; }
+        impl Ring<i32> { fn add(a: i32, b: i32) -> i32 { a } }
+        fn combined<const N: i32, const M: i32>(x: [i32; N + M]) -> i32 { 0 }
+        fn f() -> i32 {
+            let a: [i32; 7] = [1, 2, 3, 4, 5, 6, 7];
+            let b: [i32; 3] = [1, 2, 3];
+            combined::<3, 4>(a) + combined::<1, 2>(b)
+        }";
+    let registry = registry_from(src);
+    let program = lower_program(src);
+    let (mono, _) = monomorphize(&program, &registry);
+    assert!(mono.errors().is_empty(), "expected no monomorphization errors, got {:?}", mono.errors());
+    let mut keys = mono.specializations_of("combined").to_vec();
+    keys.sort();
+    assert_eq!(keys, vec!["combined<1, 2>".to_string(), "combined<3, 4>".to_string()]);
+
+    // Each specialization's own array-size const resolved independently and
+    // correctly -- not collapsed together, not swapped, not left symbolic.
+    for key in &keys {
+        for t in mono.param_types(key) {
+            assert_fully_concrete(t);
+        }
+    }
+    assert_eq!(
+        mono.param_types("combined<3, 4>"),
+        &[Ty::Array(Box::new(Ty::Con("i32".to_string())), Box::new(Ty::Const(ConstValue::Int(7))))]
+    );
+    assert_eq!(
+        mono.param_types("combined<1, 2>"),
+        &[Ty::Array(Box::new(Ty::Con("i32".to_string())), Box::new(Ty::Const(ConstValue::Int(3))))]
+    );
+}

@@ -1009,7 +1009,7 @@ fn collect_instantiations_expr(
     }
     match &expr.kind {
         ExprKind::NumberLit { .. } | ExprKind::ImaginaryLit { .. } | ExprKind::BoolLit(_) | ExprKind::Path(_) => {}
-        ExprKind::Call(path, _, args, ..) => {
+        ExprKind::Call(path, generics, args, ..) => {
             // A callable passed as a bare argument (`apply(inc, 5)`) — see
             // `derive_value_instantiation`'s own doc comment for why this
             // can't just fall out of the ordinary recursive `rec!(a)` walk
@@ -1080,7 +1080,7 @@ fn collect_instantiations_expr(
 
             if let Some(&lambda_id) = scope.get(&name) {
                 if let Some(scheme) = lambda_schemes.get(&lambda_id) {
-                    if let Some(concrete_tys) = derive_instantiation(scheme, expr, args, node_types) {
+                    if let Some(concrete_tys) = derive_instantiation(scheme, expr, generics, args, node_types) {
                         // A self-recursive call site, reached while walking
                         // a still-*generic* copy of this lambda's own body
                         // (its own `node_types` not yet substituted for any
@@ -1117,7 +1117,7 @@ fn collect_instantiations_expr(
 
             if let Some(scheme) = global_env.get(&name) {
                 if !scheme.vars.is_empty() {
-                    if let Some(concrete_tys) = derive_instantiation(scheme, expr, args, node_types) {
+                    if let Some(concrete_tys) = derive_instantiation(scheme, expr, generics, args, node_types) {
                         call_names.insert(expr.id, display_instantiation(&name, &concrete_tys));
                         fn_worklist.push((name, concrete_tys));
                     }
@@ -1274,13 +1274,99 @@ fn is_fully_concrete(ty: &Ty) -> bool {
 /// failed to type-check, already excluded upstream — defensive here, not
 /// expected to actually trigger) or the shapes genuinely don't unify (would
 /// mean the whole-program pass itself was unsound — also not expected).
-fn derive_instantiation(scheme: &Scheme, call: &Expr, args: &[Expr], node_types: &HashMap<NodeId, Ty>) -> Option<Vec<Ty>> {
+///
+/// `explicit_generics` — the call's own turbofish (`f::<3, 4>(x)`), unified
+/// against `scheme.vars` *first*, before the ordinary argument/return
+/// reverse-unification below — found necessary (not just belt-and-suspenders)
+/// by direct testing: `doc/backlog.md`'s own former "explicit turbofish
+/// never consulted" item. A const generic that only ever appears *combined*
+/// with another one in a parameter's own type (`fn f<const N, M>(x: [T; N +
+/// M])`, no parameter mentioning `N`/`M` individually) can never be
+/// recovered from `arg_tys`/`ret_ty` alone — unifying `scheme.ty`'s own
+/// still-symbolic `ConstExpr("add", Var(N), Var(M))` against a concrete
+/// array length like `7` is genuinely underdetermined (`unify`'s own
+/// `ConstExpr`-against-`Const` arm has no rule for it, by design — see its
+/// own doc comment) and fails outright. Binding `N`/`M` from the turbofish
+/// into `trial` *before* that reverse-unification runs sidesteps the
+/// problem entirely, with no arithmetic reasoning needed here at all: once
+/// `Var(N)`/`Var(M)` are already bound, `Subst::apply`'s own constant-
+/// folding (`fold_const_expr`) collapses `ConstExpr("add", Const(3),
+/// Const(4))` to `Const(7)` before the two sides are ever compared, so the
+/// ordinary `Array`-vs-`Array` unification just matches.
+fn derive_instantiation(scheme: &Scheme, call: &Expr, explicit_generics: &[GenericArg], args: &[Expr], node_types: &HashMap<NodeId, Ty>) -> Option<Vec<Ty>> {
+    let mut trial = Subst::default();
+    // Arity is already validated by type-checking (`infer_call`'s own
+    // `ArityMismatch`) whenever `explicit_generics` is non-empty at all — the
+    // length check here is defensive, not expected to actually fail; a
+    // mismatch just means this call site gets no turbofish-derived help,
+    // falling back to plain reverse-unification exactly like before this fix.
+    if explicit_generics.len() == scheme.vars.len() {
+        for (v, g) in scheme.vars.iter().zip(explicit_generics) {
+            if let Some(explicit_ty) = concrete_ty_from_generic_arg(g) {
+                unify(&mut trial, &Ty::Var(*v), &explicit_ty).ok()?;
+            }
+        }
+    }
     let arg_tys: Vec<Ty> = args.iter().map(|a| node_types.get(&a.id).cloned()).collect::<Option<_>>()?;
     let ret_ty = node_types.get(&call.id)?.clone();
     let query = Ty::Fn(arg_tys, Box::new(ret_ty));
-    let mut trial = Subst::default();
     unify(&mut trial, &scheme.ty, &query).ok()?;
     Some(scheme.vars.iter().map(|v| trial.apply(&Ty::Var(*v))).collect())
+}
+
+/// Converts one turbofish argument (`f::<i32, 3>`'s `i32`/`3`) to a `Ty` —
+/// `infer.rs`'s own `Infer::generic_arg_to_ty`/`const_value_from_expr`, but
+/// with no `Infer` instance available here (see the module's own "No
+/// `Infer`/`TyVarGen` instance needed" doc comment) and no need for one: by
+/// this pipeline stage type-checking has already run, so an explicit
+/// turbofish argument is always either a literal or an arithmetic
+/// combination of literals — never a still-open reference to some *other*
+/// generic (that case, and any other shape `infer.rs`'s own richer version
+/// handles, falls through to `None` here, same as if no turbofish were
+/// given at all — `derive_instantiation`'s own ordinary reverse-unification
+/// is the fallback, unaffected either way).
+fn concrete_ty_from_generic_arg(g: &GenericArg) -> Option<Ty> {
+    match g {
+        GenericArg::Type(t) => concrete_ty_from_ast(t),
+        GenericArg::Const(e) => concrete_const_from_expr(e),
+    }
+}
+
+fn concrete_ty_from_ast(ty: &Type) -> Option<Ty> {
+    match &ty.kind {
+        TypeKind::Path(p, args) => {
+            let name = p.segments.join("::");
+            if args.is_empty() {
+                return Some(Ty::Con(name));
+            }
+            let type_args: Vec<Ty> = args.iter().map(concrete_ty_from_generic_arg).collect::<Option<_>>()?;
+            Some(Ty::App(name, type_args))
+        }
+        TypeKind::Array(elem, size) => {
+            let elem = concrete_ty_from_ast(elem)?;
+            let size = concrete_const_from_expr(size)?;
+            Some(Ty::Array(Box::new(elem), Box::new(size)))
+        }
+        TypeKind::Fn(params, ret) => {
+            let params = params.iter().map(concrete_ty_from_ast).collect::<Option<_>>()?;
+            let ret = concrete_ty_from_ast(ret)?;
+            Some(Ty::Fn(params, Box::new(ret)))
+        }
+    }
+}
+
+fn concrete_const_from_expr(value: &Expr) -> Option<Ty> {
+    match &value.kind {
+        ExprKind::NumberLit { text, .. } => text.parse::<u64>().ok().map(|n| Ty::Const(ConstValue::Int(n))),
+        ExprKind::BoolLit(b) => Some(Ty::Const(ConstValue::Bool(*b))),
+        ExprKind::Call(path, _, args, ..) if path.segments.len() == 1 && args.len() == 2 => {
+            let a = concrete_const_from_expr(&args[0])?;
+            let b = concrete_const_from_expr(&args[1])?;
+            let (Ty::Const(av), Ty::Const(bv)) = (&a, &b) else { return None };
+            crate::const_eval::eval_binop(&path.segments[0], *av, *bv).map(Ty::Const)
+        }
+        _ => None,
+    }
 }
 
 enum ImplMatch {
