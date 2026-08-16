@@ -1012,6 +1012,51 @@ fn collect_instantiations_expr(
                 }
             }
             args.iter().for_each(|a| rec!(a));
+
+            // Qualified call (`Ring::mul(a, b)`) — `doc/backlog-done.md`'s
+            // own "qualified-call syntax" item, resolved here one step
+            // earlier than the ordinary name-based tiers below, mirroring
+            // `infer.rs::infer_call`'s own qualified-call check. A lambda
+            // or top-level `fn` could never be bound under a name
+            // containing `"::"` in the first place, so tiers 1/2 below are
+            // structurally safe from this either way -- checking first just
+            // keeps the two files' own control flow parallel, and avoids
+            // tier 3's own broader, algebra-blind search (and the collision
+            // it would reintroduce: `build_call_index`'s own bare-name-keyed
+            // map has no way to tell two same-named, same-concrete-type
+            // methods from two *different* algebras apart -- see that
+            // function's own doc comment). `templates.iter().any(..)`, not a
+            // `Registry` lookup (none in scope here) -- a safe proxy for "is
+            // this genuinely a qualified algebra call" at this pipeline
+            // stage: type-checking already ran and would have rejected a
+            // qualified call naming a nonexistent algebra or undeclared
+            // method, so a real algebra name here always has at least one
+            // template by now.
+            if let [algebra, method] = path.segments.as_slice() {
+                if templates.iter().any(|t| &t.algebra == algebra) {
+                    let Some(arg_tys): Option<Vec<Ty>> = args.iter().map(|a| node_types.get(&a.id).cloned()).collect() else {
+                        return;
+                    };
+                    match derive_impl_instantiation(templates, Some(algebra), method, expr.id, &arg_tys, node_types) {
+                        ImplMatch::Found(idx, mapping) => {
+                            call_names.insert(expr.id, display_impl_instantiation(&templates[idx], &mapping));
+                            impl_worklist.push((idx, mapping));
+                        }
+                        ImplMatch::FoundConcrete(idx) => {
+                            call_names.insert(expr.id, display_impl_instantiation(&templates[idx], &HashMap::new()));
+                        }
+                        ImplMatch::NoCandidates => {} // type-checking already validated this qualified call; not expected, harmless if reached
+                        ImplMatch::NoneMatched { algebra, tys } => {
+                            errors.push(TypeError {
+                                span: expr.span,
+                                kind: TypeErrorKind::MonomorphizationFailed { algebra, method: method.clone(), tys },
+                            });
+                        }
+                    }
+                    return;
+                }
+            }
+
             let name = path.segments.join("::");
 
             if let Some(&lambda_id) = scope.get(&name) {
@@ -1064,11 +1109,12 @@ fn collect_instantiations_expr(
             let Some(arg_tys): Option<Vec<Ty>> = args.iter().map(|a| node_types.get(&a.id).cloned()).collect() else {
                 return;
             };
-            match derive_impl_instantiation(templates, &name, expr.id, &arg_tys, node_types) {
+            match derive_impl_instantiation(templates, None, &name, expr.id, &arg_tys, node_types) {
                 ImplMatch::Found(idx, mapping) => {
                     call_names.insert(expr.id, display_impl_instantiation(&templates[idx], &mapping));
                     impl_worklist.push((idx, mapping));
                 }
+                ImplMatch::FoundConcrete(_) => unreachable!("derive_impl_instantiation never returns FoundConcrete when algebra is None"),
                 ImplMatch::NoCandidates => {} // not an algebra call, or a non-generic one -- nothing to do here
                 ImplMatch::NoneMatched { algebra, tys } => {
                     errors.push(TypeError {
@@ -1125,11 +1171,12 @@ fn collect_instantiations_expr(
                 if !matches!(base_ty, Ty::Array(..)) {
                     let idx_array_ty =
                         Ty::Array(Box::new(Ty::Con("i32".to_string())), Box::new(Ty::Const(ConstValue::Int(indices.len() as u64))));
-                    match derive_impl_instantiation(templates, "index", expr.id, &[base_ty, idx_array_ty], node_types) {
+                    match derive_impl_instantiation(templates, None, "index", expr.id, &[base_ty, idx_array_ty], node_types) {
                         ImplMatch::Found(tmpl_idx, mapping) => {
                             call_names.insert(expr.id, display_impl_instantiation(&templates[tmpl_idx], &mapping));
                             impl_worklist.push((tmpl_idx, mapping));
                         }
+                        ImplMatch::FoundConcrete(_) => unreachable!("derive_impl_instantiation never returns FoundConcrete when algebra is None"),
                         ImplMatch::NoCandidates => {}
                         ImplMatch::NoneMatched { algebra, tys } => {
                             errors.push(TypeError {
@@ -1164,6 +1211,12 @@ fn collect_instantiations_expr(
         ExprKind::For { var, start, end, body } => {
             rec!(start);
             rec!(end);
+            let mut inner = scope.clone();
+            inner.remove(var);
+            rec_block!(body, &inner);
+        }
+        ExprKind::ForIn { var, iter, body } => {
+            rec!(iter);
             let mut inner = scope.clone();
             inner.remove(var);
             rec_block!(body, &inner);
@@ -1212,6 +1265,19 @@ fn derive_instantiation(scheme: &Scheme, call: &Expr, args: &[Expr], node_types:
 
 enum ImplMatch {
     Found(usize, HashMap<TyVar, Ty>),
+    /// A *non-generic* template matched, but only reached when `algebra`
+    /// was `Some(_)` (a qualified call, `doc/backlog-done.md`'s own
+    /// "qualified-call syntax" item) — an ordinary, unqualified call in
+    /// this exact situation returns `NoCandidates` instead (see below),
+    /// since `cps.rs`'s own bare-name `call_index` already resolves a
+    /// genuinely unambiguous concrete impl fine on its own. A *qualified*
+    /// call can't trust that: `call_index`'s own key has no algebra in it
+    /// at all, so two different algebras implementing the same method for
+    /// the same concrete types — exactly what a qualified call exists to
+    /// pick between — would silently collide there. Carries the matched
+    /// template's own index so the caller can write `call_names` directly,
+    /// bypassing `call_index` entirely for this call.
+    FoundConcrete(usize),
     /// No `ImplTemplate` shares this method name at all — not an algebra
     /// call in the first place, or a non-generic one (no template is ever
     /// built for those — see `build_impl_templates`) that dispatch will
@@ -1260,12 +1326,19 @@ enum ImplMatch {
 /// no template existed for it at all.
 fn derive_impl_instantiation(
     templates: &[ImplTemplate],
+    // `Some(algebra)` for a qualified call (`doc/backlog-done.md`'s own
+    // "qualified-call syntax" item) — restricts the whole search to that one
+    // algebra's own templates, instead of searching by method name alone.
+    // `None` (every existing caller, before this item) leaves every line
+    // below byte-for-byte the same as before it existed.
+    algebra: Option<&str>,
     method: &str,
     call_id: NodeId,
     arg_tys: &[Ty],
     node_types: &HashMap<NodeId, Ty>,
 ) -> ImplMatch {
-    let candidates: Vec<&ImplTemplate> = templates.iter().filter(|t| t.method_name == method).collect();
+    let owned_by = |t: &&ImplTemplate| t.method_name == method && algebra.map_or(true, |a| t.algebra == a);
+    let candidates: Vec<&ImplTemplate> = templates.iter().filter(owned_by).collect();
     if candidates.is_empty() {
         return ImplMatch::NoCandidates;
     }
@@ -1275,7 +1348,7 @@ fn derive_impl_instantiation(
     let query = Ty::Fn(arg_tys.to_vec(), Box::new(ret_ty));
 
     for (idx, t) in templates.iter().enumerate() {
-        if t.method_name != method || t.param_patterns.len() != arg_tys.len() {
+        if t.method_name != method || t.param_patterns.len() != arg_tys.len() || algebra.is_some_and(|a| t.algebra != a) {
             continue;
         }
         let pattern = Ty::Fn(t.param_patterns.clone(), Box::new(t.ret_pattern.clone()));
@@ -1284,7 +1357,10 @@ fn derive_impl_instantiation(
             continue;
         }
         if !t.is_generic {
-            return ImplMatch::NoCandidates;
+            return match algebra {
+                None => ImplMatch::NoCandidates,
+                Some(_) => ImplMatch::FoundConcrete(idx),
+            };
         }
         let mut vars = HashSet::new();
         t.param_patterns.iter().for_each(|p| free_vars(p, &mut vars));
@@ -1434,6 +1510,10 @@ pub(crate) fn collect_exprs<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
         ExprKind::For { start, end, body, .. } => {
             collect_exprs(start, out);
             collect_exprs(end, out);
+            collect_exprs_block(body, out);
+        }
+        ExprKind::ForIn { iter, body, .. } => {
+            collect_exprs(iter, out);
             collect_exprs_block(body, out);
         }
         ExprKind::Block(b) => collect_exprs_block(b, out),

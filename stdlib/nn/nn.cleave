@@ -22,6 +22,14 @@ algebra Activation<T> {
     fn relu(x: T) -> T;
     fn sigmoid(x: T) -> T;
     fn tanh(x: T) -> T;
+
+    // `d/dx tanh(x) = 1 - tanh(x)^2` -- `doc/backlog-done.md`'s own
+    // "Auto-diff v1 -> algebra-declared rules" item: `sub`/`mul` belong to
+    // `Ring<T>`, not this algebra -- `egraph.rs::build_pattern`'s own
+    // cross-algebra resolution (checks the enclosing algebra first, falls
+    // back to a real registry search when it doesn't declare the method)
+    // is what makes referencing them from here work at all.
+    derivative tanh(x): mul(sub(1, mul(tanh(x), tanh(x))), d(x));
 }
 
 // `arith.maximumf(x, 0.0)`/`1.0 + ...` — a bare literal operand here is

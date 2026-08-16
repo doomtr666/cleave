@@ -82,6 +82,9 @@ impl Printer {
                     AlgebraItemKind::Axiom(ax) => {
                         p.line(format!("axiom {}({}): {};", ax.name, fmt_params(&ax.params), fmt_expr(&ax.body)));
                     }
+                    AlgebraItemKind::DerivativeRule(dr) => {
+                        p.line(format!("derivative {}({}): {};", dr.method, fmt_params(&dr.params), fmt_expr(&dr.body)));
+                    }
                 }
             }
         });
@@ -276,6 +279,9 @@ pub(crate) fn fmt_expr(e: &Expr) -> String {
         ExprKind::While { cond, body } => format!("while {} {}", fmt_expr(cond), fmt_block_inline(body)),
         ExprKind::For { var, start, end, body } => {
             format!("for {var} in {}..{} {}", fmt_expr(start), fmt_expr(end), fmt_block_inline(body))
+        }
+        ExprKind::ForIn { var, iter, body } => {
+            format!("for {var} in {} {}", fmt_expr(iter), fmt_block_inline(body))
         }
         ExprKind::Block(b) => fmt_block_inline(b),
         ExprKind::Lambda { params, ret, body } => {

@@ -78,6 +78,7 @@ impl Lowerer {
                 }
             }
             Rule::fn_decl => ItemKind::Fn(self.lower_fn_decl(inner)),
+            Rule::derive_decl => ItemKind::Fn(self.lower_derive_decl(inner)),
             r => unreachable!("item: unexpected rule {r:?}"),
         };
         self.wrap(span, kind)
@@ -136,7 +137,34 @@ impl Lowerer {
         // pair of its own, so `None` here is exactly "no `block` pair was
         // left to consume", not a parse failure.
         let body = inner.next().map(|p| self.lower_block(p));
-        FnDecl { name, attrs, is_extern, extern_symbol, generics, params, ret, body }
+        FnDecl { name, attrs, is_extern, extern_symbol, generics, params, ret, body, derivative_of: None }
+    }
+
+    /// `fprime = derive(f);` (`grammar.pest`'s own `derive_decl`) — lowers
+    /// straight to an ordinary `FnDecl`, deliberately reusing the same
+    /// `ItemKind::Fn` shape every other top-level `fn` uses (see `ast.rs`'s
+    /// own `FnDecl::derivative_of` doc comment for why: every existing pass
+    /// that already handles `ItemKind::Fn` uniformly — registry, print.rs,
+    /// dump.rs, driver.rs's own merge logic — needs no change at all).
+    /// `params`/`ret` are left empty here on purpose: this lowering step has
+    /// no way to know `f`'s own signature (possibly declared in a different
+    /// file entirely) — filled in by a dedicated later pass, once every
+    /// crate's own items are merged (`driver.rs::compile`).
+    fn lower_derive_decl(&mut self, pair: Pair<Rule>) -> FnDecl {
+        let mut inner = pair.into_inner();
+        let name = inner.next().unwrap().as_str().to_string();
+        let of = inner.next().unwrap().as_str().to_string();
+        FnDecl {
+            name,
+            attrs: Vec::new(),
+            is_extern: false,
+            extern_symbol: None,
+            generics: Vec::new(),
+            params: Vec::new(),
+            ret: None,
+            body: None,
+            derivative_of: Some(of),
+        }
     }
 
     fn lower_attribute(&mut self, pair: Pair<Rule>) -> Attribute {
@@ -241,6 +269,7 @@ impl Lowerer {
         let kind = match inner.as_rule() {
             Rule::fn_sig => AlgebraItemKind::FnSig(self.lower_fn_sig(inner)),
             Rule::axiom_decl => AlgebraItemKind::Axiom(self.lower_axiom_decl(inner)),
+            Rule::derivative_rule_decl => AlgebraItemKind::DerivativeRule(self.lower_derivative_rule_decl(inner)),
             r => unreachable!("algebra_item: unexpected rule {r:?}"),
         };
         self.wrap(span, kind)
@@ -268,6 +297,18 @@ impl Lowerer {
         };
         let body = self.lower_expr(inner.next().unwrap());
         AxiomDecl { name, params, body }
+    }
+
+    fn lower_derivative_rule_decl(&mut self, pair: Pair<Rule>) -> DerivativeRuleDecl {
+        let mut inner = pair.into_inner().peekable();
+        let method = inner.next().unwrap().as_str().to_string();
+        let params = if matches!(inner.peek().map(|p| p.as_rule()), Some(Rule::param_list)) {
+            self.lower_param_list(inner.next().unwrap())
+        } else {
+            Vec::new()
+        };
+        let body = self.lower_expr(inner.next().unwrap());
+        DerivativeRuleDecl { method, params, body }
     }
 
     // ---------------------------------------------------------------- impl
@@ -764,14 +805,26 @@ impl Lowerer {
         self.wrap(span, ExprKind::While { cond, body })
     }
 
+    /// `grammar.pest`'s own `for_expr` funnels *two* real syntactic shapes
+    /// through one rule (`(".." ~ additive)?` is optional) — disambiguated
+    /// here, not in the grammar itself, by checking whether the second child
+    /// is another `additive` (the range form, `ExprKind::For`) or the `block`
+    /// directly (the new element-based form, `ExprKind::ForIn` — `doc/
+    /// backlog-done.md`'s own "`for x in array`" item).
     fn lower_for_expr(&mut self, pair: Pair<Rule>) -> Expr {
         let span = self.span_of(&pair);
         let mut inner = pair.into_inner();
         let var = inner.next().unwrap().as_str().to_string();
-        let start = Box::new(self.lower_additive(inner.next().unwrap()));
-        let end = Box::new(self.lower_additive(inner.next().unwrap()));
-        let body = self.lower_block(inner.next().unwrap());
-        self.wrap(span, ExprKind::For { var, start, end, body })
+        let first = self.lower_additive(inner.next().unwrap());
+        let next = inner.next().unwrap();
+        if next.as_rule() == Rule::additive {
+            let end = Box::new(self.lower_additive(next));
+            let body = self.lower_block(inner.next().unwrap());
+            self.wrap(span, ExprKind::For { var, start: Box::new(first), end, body })
+        } else {
+            let body = self.lower_block(next);
+            self.wrap(span, ExprKind::ForIn { var, iter: Box::new(first), body })
+        }
     }
 
     fn lower_array_lit(&mut self, pair: Pair<Rule>) -> Expr {

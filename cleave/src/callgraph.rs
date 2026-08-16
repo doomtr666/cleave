@@ -253,8 +253,15 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
                 // what body inference would otherwise do by unifying it
                 // against the body's own result) and treat that as this
                 // member's outcome, same shape any other successful member
-                // produces below.
-                if f.is_extern {
+                // produces below. `fprime = derive(f);` (`FnDecl::
+                // derivative_of`) is bodyless for the identical reason —
+                // its own real body doesn't exist as source at all, only
+                // synthesized much later (`egraph.rs::synthesize_
+                // derivatives`, post-CPS) — so it gets the exact same
+                // treatment here: the declared (mechanically synthesized by
+                // `driver.rs`) return type already *is* the answer, no body
+                // to infer.
+                if f.is_extern || f.derivative_of.is_some() {
                     if !f.generics.is_empty() {
                         raw_results.insert(
                             name.clone(),
@@ -274,6 +281,7 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
                     let outcome = infer
                         .unify_at(span, &ret_var, &declared_ret)
                         .and_then(|()| infer.check_pending_type_names())
+                        .and_then(|()| infer.check_pending_div_by_zero())
                         .map(|()| declared_ret);
                     raw_results.insert(name.clone(), outcome);
                     continue;
@@ -292,7 +300,8 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
             // property of the group as a whole.
             let outcome = infer
                 .infer_fn_raw(f, &group_env, param_types, ret_var, &generics)
-                .and_then(|ty| infer.check_pending_type_names().map(|()| ty));
+                .and_then(|ty| infer.check_pending_type_names().map(|()| ty))
+                .and_then(|ty| infer.check_pending_div_by_zero().map(|()| ty));
             raw_results.insert(name.clone(), outcome);
         }
 
@@ -546,6 +555,10 @@ fn collect_calls_expr(expr: &Expr, known: &HashSet<&str>, out: &mut Vec<String>)
         ExprKind::For { start, end, body, .. } => {
             collect_calls_expr(start, known, out);
             collect_calls_expr(end, known, out);
+            collect_calls_block(body, known, out);
+        }
+        ExprKind::ForIn { iter, body, .. } => {
+            collect_calls_expr(iter, known, out);
             collect_calls_block(body, known, out);
         }
         ExprKind::Block(b) => collect_calls_block(b, known, out),

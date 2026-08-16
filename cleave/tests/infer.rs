@@ -914,6 +914,59 @@ fn operator_ambiguous_between_two_algebras_is_rejected() {
 }
 
 #[test]
+fn qualified_call_resolves_to_the_named_algebra_even_when_two_algebras_collide() {
+    // `Ring` and `Tropical` both declare `add(a: T, b: T) -> T` — the exact
+    // ambiguity shape from `operator_ambiguous_between_two_algebras_is_rejected`
+    // above. `Ring::add(...)` disambiguates explicitly instead of relying on
+    // operator sugar's own single-segment path.
+    let src = "
+        algebra Ring<T> { fn add(a: T, b: T) -> T; }
+        algebra Tropical<T> { fn add(a: T, b: T) -> T; }
+        impl Ring<i32> { fn add(a: i32, b: i32) -> i32 { a } }
+        impl Tropical<i32> { fn add(a: i32, b: i32) -> i32 { b } }
+        fn f(a: i32, b: i32) -> i32 { Ring::add(a, b) }
+    ";
+    let ty = infer_fn_named(src, "f").unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(ty, Ty::Con("i32".to_string()));
+}
+
+#[test]
+fn unqualified_call_between_colliding_algebras_still_rejects_as_ambiguous() {
+    // Regression guard: adding qualified-call resolution must not make the
+    // *unqualified* form start silently picking one candidate.
+    let src = "
+        algebra Ring<T> { fn add(a: T, b: T) -> T; }
+        algebra Tropical<T> { fn add(a: T, b: T) -> T; }
+        impl Ring<i32> { fn add(a: i32, b: i32) -> i32 { a } }
+        impl Tropical<i32> { fn add(a: i32, b: i32) -> i32 { b } }
+        fn f(a: i32, b: i32) -> i32 { add(a, b) }
+    ";
+    let err = infer_fn_named(src, "f").unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::AmbiguousOperator { .. }), "got: {:?}", err.kind);
+}
+
+#[test]
+fn qualified_call_naming_a_method_the_algebra_does_not_declare_is_rejected() {
+    let src = "
+        algebra Ring<T> { fn add(a: T, b: T) -> T; }
+        impl Ring<i32> { fn add(a: i32, b: i32) -> i32 { a } }
+        fn f(a: i32, b: i32) -> i32 { Ring::multiply(a, b) }
+    ";
+    let err = infer_fn_named(src, "f").unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::UnknownAlgebraMethod { .. }), "got: {:?}", err.kind);
+}
+
+#[test]
+fn a_two_segment_path_whose_first_segment_is_not_an_algebra_falls_through_unaffected() {
+    // `Ring` here is never declared — the qualified-call branch must not
+    // fire (it's gated on `registry.has_algebra`), so this must not surface
+    // as `UnknownAlgebraMethod`; it falls through to ordinary unresolved-call
+    // handling instead, unchanged from before this feature existed.
+    let err = infer_fn_named("fn f() -> i32 { Ring::whatever(1) }", "f").unwrap_err();
+    assert!(!matches!(err.kind, TypeErrorKind::UnknownAlgebraMethod { .. }), "got: {:?}", err.kind);
+}
+
+#[test]
 fn algebra_generic_parameter_is_instantiated_fresh_not_treated_as_concrete() {
     // `T` in `algebra Ring<T> { fn add(a: T, b: T) -> T; }` must become a
     // fresh type variable per call, not a literal concrete type named "T" â€”
@@ -1738,15 +1791,19 @@ fn a_folded_literal_array_size_still_rejects_a_real_mismatch() {
 
 #[test]
 fn an_unsupported_operator_in_shape_position_stays_permissively_unconstrained() {
-    // `const_eval::eval_binop` knows `add`/`mul`/`sub` now -- `4/3` (`div`)
-    // must fall through to the existing "not evaluated" placeholder (same
-    // as any other not-yet-inferred array type) rather than crash or be
-    // treated as a hard parse/evaluation error. That placeholder can never
-    // be *exposed* in a function's own signature though (same rule any
-    // other still-unresolved type follows, `check_no_placeholder`) -- this
-    // is what proves the fallback path was actually reached, not skipped
-    // some other way.
-    let f = lower_one_fn("fn f(a: [i32; 4/3]) -> [i32; 4/3] { a }");
+    // `const_eval::eval_binop` knows `add`/`mul`/`sub`/`div` now (`mod`
+    // still isn't — a deliberately named function, not an operator,
+    // `doc/backlog-done.md`'s own "More constant-folding operators" entry)
+    // -- `mod(4,3)`, written as an ordinary call rather than through an
+    // operator (nothing desugars to `mod` — `doc/grammar.md`'s own explicit
+    // design call), must fall through to the existing "not evaluated"
+    // placeholder (same as any other not-yet-inferred array type) rather
+    // than crash or be treated as a hard parse/evaluation error. That
+    // placeholder can never be *exposed* in a function's own signature
+    // though (same rule any other still-unresolved type follows, `check_
+    // no_placeholder`) -- this is what proves the fallback path was
+    // actually reached, not skipped some other way.
+    let f = lower_one_fn("fn f(a: [i32; mod(4,3)]) -> [i32; mod(4,3)] { a }");
     let registry = builtin_registry();
     let mut infer = Infer::new(&registry);
     let err = infer.infer_fn(&f).unwrap_err();
@@ -2081,6 +2138,35 @@ fn a_const_generics_own_declared_type_naming_an_algebra_instead_of_a_type_is_rej
     );
 }
 
+/// `More constant-folding operators` (`doc/backlog.md`) — a division whose
+/// own divisor is *already* concretely zero at the point `const_value_from_
+/// expr` first builds it (a literal array size, not through a still-generic
+/// declaration — see `Infer::pending_div_by_zero_checks`'s own doc comment
+/// for the deferred-generic case this deliberately doesn't cover) must be a
+/// real, located compile error, not a `ConstExpr` that silently survives to
+/// `mlir_lower.rs`'s own codegen-time panic. `x`'s own body deliberately
+/// never references the parameter — reaching for `x[0]` would trigger a
+/// *different*, unrelated unification failure first (the array's own
+/// unresolved element type), which would mask this one; type-checkers
+/// report whichever error they reach first, this test isolates the one
+/// under test.
+#[test]
+fn a_literal_division_by_zero_in_an_array_size_is_rejected() {
+    let src = "fn f(x: [i32; 4 / 0]) -> i32 { 0 }";
+    let err = infer_fn_named(src, "f").unwrap_err();
+    assert!(matches!(&err.kind, TypeErrorKind::ConstDivByZero { dividend } if *dividend == 4), "got: {:?}", err.kind);
+}
+
+/// The non-zero-divisor counterpart — confirms `div` support itself works
+/// (not just the by-zero rejection): `8/2` folds to a real `Ty::Const(4)`
+/// array size, type-checking exactly like `[i32; 4]` would.
+#[test]
+fn a_literal_division_in_an_array_size_folds_correctly() {
+    let src = "fn f(x: [i32; 8 / 2]) -> i32 { x[0] }";
+    let ty = infer_fn_named(src, "f").unwrap_or_else(|e| panic!("expected this to type-check, got {e:?}"));
+    assert_eq!(ty.to_string(), "i32");
+}
+
 #[test]
 fn a_const_generics_own_declared_type_naming_a_real_type_is_accepted() {
     let src = "algebra Int<T> {}
@@ -2230,6 +2316,42 @@ fn a_for_loops_variable_is_int_constrained_not_forced_to_a_specific_width() {
     // exactly as well as the default `i32`.
     let ty = infer_src("fn f() -> i64 { let mut acc = 0:i64; for i in 0:i64..10:i64 { acc = i; }; acc }");
     assert_eq!(ty, Ty::Con("i64".to_string()));
+}
+
+/// `doc/backlog-done.md`'s own "`for x in array`" item — `x` binds to the
+/// array's own *element* type, not to `i32` or anything index-shaped.
+#[test]
+fn a_for_in_loops_variable_binds_to_the_arrays_own_element_type() {
+    let ty = infer_src("fn f() -> f64 { let arr: [f64; 3] = [1.0, 2.0, 3.0]; let mut acc: f64 = 0.0; for x in arr { acc = acc + x; }; acc }");
+    assert_eq!(ty, Ty::Con("f64".to_string()));
+}
+
+/// `iter` must be a real array — a non-array `iter` gets the ordinary
+/// `Mismatch` diagnostic, the ordinary "expected [x;y], found z" shape, no
+/// special-cased error kind (see `infer_expr`'s own `ForIn` arm doc comment
+/// for why).
+#[test]
+fn a_for_in_loop_over_a_non_array_is_rejected() {
+    // `true` (a `bool` literal), not a bare number: a number literal's own
+    // type stays an unconstrained fresh var until something pins it, so
+    // unifying *that* against `Ty::Array(..)` would just bind the var to an
+    // array shape instead of rejecting — this needs a type that's already
+    // concretely non-array at the point `ForIn`'s own unification runs.
+    let f = lower_one_fn("fn f() { for x in true { x; }; }");
+    let registry = builtin_registry();
+    let mut infer = Infer::new(&registry);
+    let err = infer.infer_fn(&f).unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::Unify(_)), "got: {:?}", err.kind);
+}
+
+/// Mirrors `a_for_loops_variable_does_not_leak_into_the_enclosing_scope`
+/// exactly, for the new form.
+#[test]
+fn a_for_in_loops_variable_does_not_leak_into_the_enclosing_scope() {
+    let f = lower_one_fn("fn f() { let arr: [i32; 3] = [1, 2, 3]; for x in arr { x }; x }");
+    let registry = builtin_registry();
+    let mut infer = Infer::new(&registry);
+    assert!(infer.infer_fn(&f).is_err(), "`x` must be unbound outside the loop");
 }
 
 #[test]

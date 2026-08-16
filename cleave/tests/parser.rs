@@ -249,6 +249,11 @@ fn for_loop_parses() {
 }
 
 #[test]
+fn for_in_array_parses() {
+    parses(Rule::for_expr, "for x in arr { x }");
+}
+
+#[test]
 fn implication() {
     parses(Rule::expr, "a and b implies c or d");
 }
@@ -421,4 +426,30 @@ fn multi_target_algebra_impl_parses() {
 #[test]
 fn single_target_algebra_impl_still_parses_unchanged() {
     parses(Rule::impl_decl, "impl Ring<Vec2> { fn add(a, b) { a } }");
+}
+
+// ---------------------------------------------------------------- derive (auto-diff)
+
+#[test]
+fn derive_decl_parses() {
+    parses(Rule::derive_decl, "fprime = derive(f);");
+}
+
+#[test]
+fn derive_decl_is_a_valid_top_level_item() {
+    let pair = CleaveParser::parse(Rule::item, "fprime = derive(f);").unwrap().next().unwrap();
+    let inner = pair.into_inner().next().unwrap();
+    assert_eq!(inner.as_rule(), Rule::derive_decl, "got: {:?}", inner.as_rule());
+}
+
+#[test]
+fn derivative_rule_decl_parses() {
+    parses(Rule::derivative_rule_decl, "derivative mul(a, b): add(mul(a, d(b)), mul(d(a), b));");
+}
+
+#[test]
+fn derivative_rule_decl_is_a_valid_algebra_item() {
+    let pair = CleaveParser::parse(Rule::algebra_item, "derivative mul(a, b): add(mul(a, d(b)), mul(d(a), b));").unwrap().next().unwrap();
+    let inner = pair.into_inner().next().unwrap();
+    assert_eq!(inner.as_rule(), Rule::derivative_rule_decl, "got: {:?}", inner.as_rule());
 }

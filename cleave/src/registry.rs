@@ -65,6 +65,12 @@ struct AlgebraEntry {
     /// — same "just data, no validation" stance the rest of this module
     /// already takes (see its own doc comment).
     axioms: Vec<AxiomDecl>,
+    /// Every `derivative` rule declared directly on this algebra (`doc/
+    /// backlog-done.md`'s own "Auto-diff v1" entry) — mirrors `axioms`
+    /// exactly: trusted, unvalidated data, consumed by `egraph.rs::
+    /// derivative_rule_rewrites` to build real e-graph `Rewrite`s per
+    /// reached concrete type.
+    derivative_rules: Vec<DerivativeRuleDecl>,
     /// Keyed by the target type's canonical string (`fmt_type`) — same
     /// grouping key `driver.rs` uses to merge `impl` fragments.
     impls: HashMap<String, ImplEntry>,
@@ -100,7 +106,7 @@ impl Registry {
                     .iter()
                     .filter_map(|ai| match &ai.kind {
                         AlgebraItemKind::FnSig(sig) => Some(sig.clone()),
-                        AlgebraItemKind::Axiom(_) => None,
+                        AlgebraItemKind::Axiom(_) | AlgebraItemKind::DerivativeRule(_) => None,
                     })
                     .collect();
                 let axioms = d
@@ -108,7 +114,15 @@ impl Registry {
                     .iter()
                     .filter_map(|ai| match &ai.kind {
                         AlgebraItemKind::Axiom(axiom) => Some(axiom.clone()),
-                        AlgebraItemKind::FnSig(_) => None,
+                        AlgebraItemKind::FnSig(_) | AlgebraItemKind::DerivativeRule(_) => None,
+                    })
+                    .collect();
+                let derivative_rules = d
+                    .items
+                    .iter()
+                    .filter_map(|ai| match &ai.kind {
+                        AlgebraItemKind::DerivativeRule(dr) => Some(dr.clone()),
+                        AlgebraItemKind::FnSig(_) | AlgebraItemKind::Axiom(_) => None,
                     })
                     .collect();
                 algebras.entry(d.name.clone()).or_insert_with(|| AlgebraEntry {
@@ -116,6 +130,7 @@ impl Registry {
                     bounds: d.bounds.clone(),
                     sigs,
                     axioms,
+                    derivative_rules,
                     impls: HashMap::new(),
                 });
             }
@@ -128,6 +143,7 @@ impl Registry {
                     bounds: Vec::new(),
                     sigs: Vec::new(),
                     axioms: Vec::new(),
+                    derivative_rules: Vec::new(),
                     impls: HashMap::new(),
                 });
                 // `fmt_type(target)` alone would collide two *different*
@@ -264,6 +280,12 @@ impl Registry {
     /// algebra name entirely.
     pub fn axioms(&self, algebra: &str) -> &[AxiomDecl] {
         self.algebras.get(algebra).map(|e| e.axioms.as_slice()).unwrap_or(&[])
+    }
+
+    /// Every `derivative` rule declared on `algebra` — see `AlgebraEntry::
+    /// derivative_rules`'s own doc comment.
+    pub fn derivative_rules(&self, algebra: &str) -> &[DerivativeRuleDecl] {
+        self.algebras.get(algebra).map(|e| e.derivative_rules.as_slice()).unwrap_or(&[])
     }
 
     /// The reverse of `algebra_bounds`: every algebra that names `algebra`

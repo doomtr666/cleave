@@ -184,6 +184,52 @@ fn registry_axioms_is_empty_not_missing_when_none_are_declared() {
     assert!(reg.axioms("NoSuchAlgebra").is_empty());
 }
 
+/// `doc/backlog-done.md`'s own "Auto-diff v1" -> algebra-declared rules
+/// item — a `derivative` rule declared on an algebra is retained the
+/// identical way an `axiom` already is, mirrors `registry_retains_axioms_
+/// declared_on_an_algebra` exactly.
+#[test]
+fn registry_retains_derivative_rules_declared_on_an_algebra() {
+    let p = program(
+        "algebra Ring<T> {
+            fn add(a: T, b: T) -> T;
+            fn mul(a: T, b: T) -> T;
+            derivative mul(a, b): add(mul(a, d(b)), mul(d(a), b));
+         }",
+    );
+    let reg = Registry::build(&p);
+    let rules = reg.derivative_rules("Ring");
+    assert_eq!(rules.len(), 1, "expected exactly one retained derivative rule");
+    assert_eq!(rules[0].method, "mul");
+    assert_eq!(rules[0].params.len(), 2);
+}
+
+/// An algebra with no derivative rules at all still resolves (empty, not
+/// missing) — same convention `axioms` already follows for an absent entry.
+#[test]
+fn registry_derivative_rules_is_empty_not_missing_when_none_are_declared() {
+    let p = program("algebra Ring<T> { fn add(a: T, b: T) -> T; }");
+    let reg = Registry::build(&p);
+    assert!(reg.derivative_rules("Ring").is_empty());
+    assert!(reg.derivative_rules("NoSuchAlgebra").is_empty());
+}
+
+/// An axiom and a `derivative` rule coexist fine on the same algebra —
+/// each retained separately, neither shadowing the other.
+#[test]
+fn axioms_and_derivative_rules_coexist_on_the_same_algebra() {
+    let p = program(
+        "algebra Ring<T> {
+            fn add(a: T, b: T) -> T;
+            axiom add_commutative(a, b): add(a, b) == add(b, a);
+            derivative add(a, b): add(d(a), d(b));
+         }",
+    );
+    let reg = Registry::build(&p);
+    assert_eq!(reg.axioms("Ring").len(), 1);
+    assert_eq!(reg.derivative_rules("Ring").len(), 1);
+}
+
 fn vec2_type() -> cleave::ast::Type {
     type_from("Vec2")
 }

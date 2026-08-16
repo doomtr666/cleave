@@ -77,8 +77,25 @@ pub struct AlgebraDecl {
 pub enum AlgebraItemKind {
     FnSig(FnSig),
     Axiom(AxiomDecl),
+    DerivativeRule(DerivativeRuleDecl),
 }
 pub type AlgebraItem = Node<AlgebraItemKind>;
+
+/// `derivative mul(a, b): add(mul(a, d(b)), mul(d(a), b));` — a declared
+/// rewrite rule for auto-diff (`doc/backlog-done.md`'s own "Auto-diff v1"
+/// entry), letting `stdlib`/user code supply their own instead of every
+/// rule living hard-coded in `egraph.rs`. `method` is the *method's* own
+/// name (`"mul"`) — unlike `AxiomDecl`, no separate rule name: the method
+/// being differentiated already is the identity, nothing else could
+/// disambiguate two derivative rules for the same method anyway. `d(x)`
+/// inside `body` is sugar meaningful only here — see `egraph.rs::build_
+/// pattern`'s own doc comment for how it compiles to a real rewrite.
+#[derive(Debug, Clone)]
+pub struct DerivativeRuleDecl {
+    pub method: String,
+    pub params: Vec<Param>,
+    pub body: Expr,
+}
 
 #[derive(Debug, Clone)]
 pub struct FnSig {
@@ -184,11 +201,22 @@ pub struct FnDecl {
     /// legal grammatically anywhere a `fn` appears, but only actually
     /// accepted, at inference time, for an algebra-impl method carrying a
     /// recognized body-justifying attribute (see `Infer::infer_impl_fn_
-    /// generic_with_env`'s own doc comment) or a top-level `fn` marked
-    /// `extern` (see `is_extern` above) — any other bodyless `fn` or
-    /// inherent-impl method is a real, rejected error, not silently
-    /// tolerated.
+    /// generic_with_env`'s own doc comment), a top-level `fn` marked
+    /// `extern` (see `is_extern` above), or one marked `derivative_of`
+    /// (below) — any other bodyless `fn` or inherent-impl method is a real,
+    /// rejected error, not silently tolerated.
     pub body: Option<Block>,
+    /// `fprime = derive(f);` (`grammar.pest`'s own `derive_decl`) lowers to
+    /// an ordinary top-level `FnDecl` (deliberately no new `ItemKind` —
+    /// see `lower.rs`'s own lowering of it) with this set to `Some("f")`,
+    /// `params`/`ret` left empty by lowering (the parser doesn't know `f`'s
+    /// own signature) and filled in by a dedicated pass afterward
+    /// (`driver.rs::compile`'s own signature-synthesis step, run once every
+    /// crate's own items are merged) — mirrors `is_extern`/`extern_symbol`'s
+    /// own "bodyless is legal, the real implementation lives elsewhere"
+    /// shape exactly, just synthesized by the compiler itself rather than
+    /// naming an external C symbol. `None` for every ordinary `fn`.
+    pub derivative_of: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -333,6 +361,15 @@ pub enum ExprKind {
     /// the parser accepts, without implying semantic support exists yet.
     While { cond: Box<Expr>, body: Block },
     For { var: String, start: Box<Expr>, end: Box<Expr>, body: Block },
+    /// `for x in arr { body }` — element-based iteration over a real,
+    /// homogeneous array (`doc/backlog-done.md`'s own "`for x in array`"
+    /// item). Deliberately its own `ExprKind`, not a variant of `For`
+    /// above: unlike a range bound (always some `Int`-impl'd scalar), `iter`
+    /// must resolve to a real `Ty::Array`, and `var` binds to the array's
+    /// own *element* type, not the counter's — different enough at both
+    /// type-checking and CPS-conversion time that folding it into `For`'s
+    /// own fields would need an awkward `Option`/enum split there instead.
+    ForIn { var: String, iter: Box<Expr>, body: Block },
     Block(Block),
     /// `fn(a, b) { a + b }` — a first-class function value; the same shape
     /// as a top-level `fn`, minus the name (see `grammar.pest`). Captures

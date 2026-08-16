@@ -36,11 +36,15 @@
 //! absent) never collide as strings, and nothing downstream needs a
 //! type-level distinction between them, only the text itself.
 //!
-//! `CVal::Float` is out of scope for this first increment — bare `f64` has
-//! neither `Ord` nor `Hash` (both required by `define_language!`'s own
-//! derives), and adding a dependency (`ordered-float`) isn't worth it before
-//! the integer-only path is even proven. A later translator stage should
-//! panic clearly on encountering one, not silently mishandle it.
+//! `CVal::Float` is representable now (`CleaveLang::Float`, wrapping
+//! `ordered_float::OrderedFloat<f64>` — bare `f64` has neither `Ord` nor
+//! `Hash`, both required by `define_language!`'s own derives) — added once
+//! `doc/backlog.md`'s own auto-diff work actually needed a real float leaf
+//! (`derivative(x,x) → 1.0`, `f32`/`f64`-typed). Deliberately narrow still:
+//! `ConstantFold` stays `Int`-only (`Data = Option<u64>`) — a `Float` leaf
+//! is representable and passes through a segment untouched, but arithmetic
+//! over one (`2.0 * 3.0`) doesn't itself fold to `6.0` yet, a real, separate,
+//! smaller follow-up once something actually needs it.
 
 use egg::{Analysis, DidMerge, Id, Symbol};
 
@@ -56,6 +60,7 @@ egg::define_language! {
     pub enum CleaveLang {
         Op(Symbol, Vec<Id>),
         Int(u64), // matches `cps::CVal::Int(u64)`'s own representation exactly
+        Float(ordered_float::OrderedFloat<f64>), // matches `cps::CVal::Float(f64)` -- wrapped for `Ord`/`Hash`, both required by `define_language!`'s own derives, bare `f64` has neither
         Bool(bool),
         Free(Symbol),
     }
@@ -101,36 +106,120 @@ fn abstract_op_name(symbol: &str) -> Option<&str> {
 #[derive(Default, Clone)]
 pub struct ConstantFold;
 
+/// `ConstantFold`'s own `Analysis::Data` — the existing int-fold value
+/// (`const_int`) plus, since `depends_on_eclass`'s own bug (see `derivative-
+/// independent-zero`'s doc comment), `free_deps`: the set of `Free`
+/// variable symbols this e-class's value is *provably* bounded by. An
+/// upper bound per representation (`make`'s own `Op` arm: the union of its
+/// children's own bounds — a value built from `a`/`b` can only ever depend
+/// on what `a`/`b` themselves depend on, nothing more), *narrowed by
+/// intersection* whenever two representations of the *same* e-class get
+/// merged (`merge`, below): if even one representation of an e-class proves
+/// independence from `w` (an empty bound), the whole e-class, being value-
+/// equal to every one of its own representations, provably is too —
+/// regardless of how many *other*, less-reduced representations happen to
+/// still mention `w` syntactically (`w * 0.0`, e.g. — value-independent of
+/// `w`, but its own naive bound still contains `w`). This is exactly what a
+/// *live* e-graph traversal (`depends_on_eclass`'s own former self) cannot
+/// give soundly: the more saturation progresses, the more such "mentions
+/// `w`, but doesn't truly depend on it" representations accumulate in
+/// *every* e-class, making a live "does any representation mention `w`"
+/// search increasingly, silently wrong. An ordinary `Analysis` field
+/// avoids this the same way `const_int` already does for constant folding:
+/// computed once per e-node, merged compositionally as e-classes combine,
+/// never re-derived by walking the live, ever-growing graph.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FoldData {
+    pub const_int: Option<u64>,
+    pub free_deps: HashSet<Symbol>,
+}
+
 impl Analysis<CleaveLang> for ConstantFold {
-    type Data = Option<u64>;
+    type Data = FoldData;
 
     fn make(egraph: &mut egg::EGraph<CleaveLang, Self>, enode: &CleaveLang, _id: Id) -> Self::Data {
-        let value_of = |id: &Id| egraph[*id].data;
-        match enode {
+        let const_int = (|| match enode {
             CleaveLang::Int(n) => Some(*n),
             CleaveLang::Op(op, args) => {
                 let name = abstract_op_name(op.as_str())?;
-                let [a, b] = args.as_slice() else { return None };
-                let a = crate::infer::ConstValue::Int(value_of(a)?);
-                let b = crate::infer::ConstValue::Int(value_of(b)?);
-                match crate::const_eval::eval_binop(name, a, b)? {
-                    crate::infer::ConstValue::Int(n) => Some(n),
-                    crate::infer::ConstValue::Bool(_) => None,
+                match args.as_slice() {
+                    // `neg` is unary — folds via `eval_binop("sub", 0, a)`
+                    // directly (`Ring<T>::neg`'s own real body already
+                    // computes exactly this, `mlir::arith::subi(0, a)`, for
+                    // every integer width) rather than inventing a separate
+                    // `eval_unop` just for one operator. Safe the same way
+                    // `add`/`mul`/`sub` already are: wrapping subtraction
+                    // gives the identical `u64` bit pattern regardless of
+                    // whether the operand is "meant" to be signed or
+                    // unsigned.
+                    [a] if name == "neg" => {
+                        let a = crate::infer::ConstValue::Int(egraph[*a].data.const_int?);
+                        match crate::const_eval::eval_binop("sub", crate::infer::ConstValue::Int(0), a)? {
+                            crate::infer::ConstValue::Int(n) => Some(n),
+                            crate::infer::ConstValue::Bool(_) => None,
+                        }
+                    }
+                    // `div` is deliberately *not* folded here, unlike every
+                    // other recognized operator — see `const_eval::eval_
+                    // binop`'s own `"div"` arm doc comment: this analysis
+                    // has no width/signedness tag to tell whether a real
+                    // `Ring::div<T>` node's operands are meant as signed or
+                    // unsigned, and division (unlike add/mul/sub/neg)
+                    // genuinely differs between the two for a negative
+                    // operand — folding it here regardless would risk a
+                    // silent wrong answer, not just a missed optimization.
+                    // `eval_binop`'s own `"div"` support stays real and
+                    // used, just only by `infer.rs`'s const-generic
+                    // evaluator, where an array-size operand is always
+                    // non-negative so the ambiguity can't arise.
+                    [_, _] if name == "div" => None,
+                    [a, b] => {
+                        let a = crate::infer::ConstValue::Int(egraph[*a].data.const_int?);
+                        let b = crate::infer::ConstValue::Int(egraph[*b].data.const_int?);
+                        match crate::const_eval::eval_binop(name, a, b)? {
+                            crate::infer::ConstValue::Int(n) => Some(n),
+                            crate::infer::ConstValue::Bool(_) => None,
+                        }
+                    }
+                    _ => None,
                 }
             }
-            CleaveLang::Bool(_) | CleaveLang::Free(_) => None,
-        }
+            // `Float` deliberately doesn't fold, even over two known-Float
+            // operands -- `const_int` stays `Int`-only, a real, separate
+            // follow-up once something actually needs it (module's own doc
+            // comment).
+            CleaveLang::Float(_) | CleaveLang::Bool(_) | CleaveLang::Free(_) => None,
+        })();
+        let free_deps = match enode {
+            CleaveLang::Free(sym) => std::iter::once(*sym).collect(),
+            // `derivative(inner, x)` gets no special case here — `x` (a
+            // `Free`) contributing itself, and `inner`'s own bound, to this
+            // node's own naive bound is sound (an *unreduced* marker's own
+            // eventual value can only depend on what `inner`/`x` already
+            // do); the `merge` below is what actually keeps this from
+            // polluting an e-class that *also* has a genuinely independent
+            // representation.
+            CleaveLang::Op(_, args) => args.iter().flat_map(|id| egraph[*id].data.free_deps.iter().copied()).collect(),
+            CleaveLang::Int(_) | CleaveLang::Float(_) | CleaveLang::Bool(_) => HashSet::new(),
+        };
+        FoldData { const_int, free_deps }
     }
 
     fn merge(&mut self, to: &mut Self::Data, from: Self::Data) -> DidMerge {
-        egg::merge_option(to, from, |a, b| {
+        let int_merge = egg::merge_option(&mut to.const_int, from.const_int, |a, b| {
             assert_eq!(*a, b, "constant-fold analysis disagreed with itself on the same e-class's own value");
             DidMerge(false, false)
-        })
+        });
+        let to_len = to.free_deps.len();
+        let from_len = from.free_deps.len();
+        let intersected: HashSet<Symbol> = to.free_deps.intersection(&from.free_deps).copied().collect();
+        let new_len = intersected.len();
+        to.free_deps = intersected;
+        int_merge | DidMerge(new_len != to_len, new_len != from_len)
     }
 
     fn modify(egraph: &mut egg::EGraph<CleaveLang, Self>, id: Id) {
-        if let Some(n) = egraph[id].data {
+        if let Some(n) = egraph[id].data.const_int {
             let added = egraph.add(CleaveLang::Int(n));
             egraph.union(id, added);
         }
@@ -140,7 +229,7 @@ impl Analysis<CleaveLang> for ConstantFold {
 // ---------------------------------------------------------------- CPS -> e-graph (forward)
 
 use crate::cps::{CExpr, CFunDef, CTopLevelFn, CVal, CVar, PrimOp};
-use crate::infer::Ty;
+use crate::infer::{ConstValue, Ty};
 use egg::EGraph;
 use std::collections::HashMap;
 
@@ -202,6 +291,19 @@ pub struct Forward {
     /// (not the symbol text, which was never meant to be parsed) — see the
     /// module's own doc comment on `Free`.
     pub free_vars: HashMap<Symbol, CVal>,
+    /// The reverse half of `free_vars`, for the one case a caller needs to
+    /// go the other way: given a *specific* external `CVar` (a function's
+    /// own parameter, say — never itself `LetPrim`-bound, so never an `env`
+    /// key — see that field's own doc comment), which e-class does its
+    /// `Free` node live in, if it was ever actually referenced at all.
+    /// Populated alongside `free_vars`, only for `CVal::Var` references
+    /// (the only `CVal` shape with a `CVar` identity to key on at all) —
+    /// found necessary directly: `synthesize_derivatives` needs exactly
+    /// this to build one `derivative(root, param)` node per one of `f`'s
+    /// own parameters, and reading `env` instead (an earlier attempt)
+    /// silently produced `None` for every parameter, since a parameter is
+    /// never `LetPrim`-bound.
+    pub external_vars: HashMap<CVar, egg::Id>,
     /// Every algebra-dispatched unit actually inlined transparently while
     /// building this e-graph (unit name -> its own `origin`) — a later
     /// axiom-to-`Rewrite` translation stage (Stage 4) needs exactly this
@@ -256,6 +358,7 @@ impl Default for Forward {
             egraph: EGraph::default(),
             env: HashMap::new(),
             free_vars: HashMap::new(),
+            external_vars: HashMap::new(),
             reached: HashMap::new(),
             call_units: std::collections::HashSet::new(),
             raw_ops: HashMap::new(),
@@ -377,6 +480,9 @@ impl Forward {
             // foldable the way pure arithmetic is -- stop, unchanged, same
             // as any other unrecognized shape.
             CExpr::Fix { defs, body } => {
+                if let Some(unrolled) = self.try_unroll_for_loop(defs, body, units) {
+                    return unrolled;
+                }
                 if let Some((result_var, unit_name, real_args, rest)) = recognize_real_call(defs, body) {
                     if let Some(callee) = units.get(unit_name) {
                         if is_straight_line(&callee.def.body) {
@@ -409,25 +515,174 @@ impl Forward {
 
     fn cval_to_id(&mut self, v: &CVal) -> Option<egg::Id> {
         match v {
-            CVal::Var(cv) => Some(match self.env.get(cv) {
+            // `env` caches a `LetPrim`-bound var's own e-class; `external_
+            // vars` caches an *external* one's (a function's own
+            // parameter, say) — checked here too, not just exposed as a
+            // side table, or the *same* external `CVar` referenced more
+            // than once within one segment would mint a *different* `Free`
+            // node each time (a distinct synthetic symbol per occurrence,
+            // no natural congruence between them) — silently modeling `x`
+            // used twice as two unrelated values. Found directly, by
+            // testing `derive`: `x * x`'s own two (identical) argument
+            // references used to become `Free(fv0)`/`Free(fv1)`, two
+            // different e-classes, which `derivative(?x,?x) -> 1`'s own
+            // pattern match (requiring the *same* e-class in both
+            // positions) could then only ever satisfy for *one* of the two
+            // occurrences a rule like the product rule's own RHS
+            // introduces — silently computing the wrong derivative instead
+            // of erroring. A pre-existing gap in this module's own design,
+            // not specific to auto-diff: nothing in the axiom/constant-fold
+            // rule set that existed before this needed "the same external
+            // var, referenced twice, really is one value" to hold.
+            CVal::Var(cv) => Some(match self.env.get(cv).or_else(|| self.external_vars.get(cv)) {
                 Some(&id) => id,
                 None => {
                     let sym = Symbol::from(format!("fv{}", self.next_free));
                     self.next_free += 1;
                     self.free_vars.insert(sym, v.clone());
-                    self.egraph.add(CleaveLang::Free(sym))
+                    let id = self.egraph.add(CleaveLang::Free(sym));
+                    self.external_vars.insert(*cv, id);
+                    id
                 }
             }),
             CVal::Int(n) => Some(self.egraph.add(CleaveLang::Int(*n))),
+            CVal::Float(f) => Some(self.egraph.add(CleaveLang::Float((*f).into()))),
             CVal::Bool(b) => Some(self.egraph.add(CleaveLang::Bool(*b))),
             // `Unit` has no e-graph representation (nothing to compute);
-            // `Float` is out of scope for this increment (module doc
-            // comment); `Label`/`Closure` never appear as an ordinary
-            // computed argument. All four simply aren't translatable here.
-            CVal::Unit | CVal::Float(_) | CVal::Label(_) | CVal::Closure { .. } => None,
+            // `Label`/`Closure` never appear as an ordinary computed
+            // argument. Neither is translatable here.
+            CVal::Unit | CVal::Label(_) | CVal::Closure { .. } => None,
         }
     }
+
+    /// Recognizes `cps.rs`'s own `ExprKind::For` lowering shape (`cps.rs`'s
+    /// own `for` arm, ground-truthed via `--dump-cps` on `for i in 0..3 {
+    /// acc = acc + i; }`: a self-recursive `Fix` whose one `CFunDef` carries
+    /// `[i_var, ...carried_params]`, `carried_types: Some(_)` — never
+    /// `recognize_real_call`-shaped, which is exactly why every `for`/`while`
+    /// loop stops `Forward::walk` dead today, unconditionally) and, only
+    /// when both bounds are literal `CVal::Int`s within `MAX_UNROLL_
+    /// ITERATIONS`, mechanically unrolls it: each iteration is walked with
+    /// `i_var` bound to that iteration's own literal e-class and the carried
+    /// vars bound to whatever e-classes the *previous* iteration actually
+    /// produced, splicing straight into the next iteration's own copy of the
+    /// body (or the loop's own exit continuation, on the last one) instead
+    /// of stopping at the recursive tail call. Returns `None` — bail,
+    /// caller falls back to today's "stop, unchanged" behavior — the moment
+    /// any expected piece of this shape doesn't hold; never partially
+    /// unrolls. A non-loop `Fix` (`carried_types: None`) is explicitly
+    /// rejected here so `recognize_real_call`'s own real-call path is
+    /// untouched.
+    ///
+    /// Alpha-renames every *internally* bound `CVar` (a `LetPrim`'s own
+    /// `var`, a nested `Fix`'s own `CFunDef::params`) throughout `expr` to a
+    /// fresh one from `fresh`, threading the growing old-to-new map through
+    /// recursively so every reference sees its own binder's fresh name — a
+    /// reference to a var *not* found in `map` (the loop's own `i_var`/
+    /// carried params, a function parameter, anything bound *outside*
+    /// `expr`) is left untouched, exactly `substitute_var`'s own fallback.
+    /// Needed because `try_unroll_for_loop` walks the *same* `then_branch`
+    /// once per iteration: without this, two different iterations' own
+    /// internal computations (a product-rule/sum-rule expansion's own
+    /// intermediate `derivative(...)` sub-nodes, specifically) can end up
+    /// hash-consed onto each other through nothing but coincidentally
+    /// reused `CVar` numbers, unioning genuinely different values —
+    /// confirmed directly, empirically: without this, a loop mixing two
+    /// different kinds of per-iteration ops (`add` then `load`, `derive_of_
+    /// a_function_containing_a_statically_bounded_for_loop_computes_the_
+    /// correct_derivative`'s own regression shape) produced a real,
+    /// self-referential cycle in the saturated e-graph (an e-class unioned
+    /// with `add(itself, something)`), permanently stuck.
+    fn alpha_rename(expr: &CExpr, map: &mut HashMap<CVar, CVar>, fresh: &FreshVars) -> CExpr {
+        let rename = |v: &CVal, map: &HashMap<CVar, CVar>| match v {
+            CVal::Var(cv) => CVal::Var(*map.get(cv).unwrap_or(cv)),
+            other => other.clone(),
+        };
+        match expr {
+            CExpr::LetPrim { var, ty, op, args, cont } => {
+                let new_args = args.iter().map(|a| rename(a, map)).collect();
+                let new_var = fresh.var();
+                map.insert(*var, new_var);
+                CExpr::LetPrim { var: new_var, ty: ty.clone(), op: op.clone(), args: new_args, cont: Box::new(Self::alpha_rename(cont, map, fresh)) }
+            }
+            CExpr::App { func, args } => CExpr::App { func: rename(func, map), args: args.iter().map(|a| rename(a, map)).collect() },
+            CExpr::Fix { defs, body } => {
+                let new_defs = defs
+                    .iter()
+                    .map(|d| {
+                        let mut inner_map = map.clone();
+                        let new_params: Vec<CVar> = d
+                            .params
+                            .iter()
+                            .map(|&p| {
+                                let np = fresh.var();
+                                inner_map.insert(p, np);
+                                np
+                            })
+                            .collect();
+                        CFunDef { name: d.name.clone(), params: new_params, body: Self::alpha_rename(&d.body, &mut inner_map, fresh), carried_types: d.carried_types.clone() }
+                    })
+                    .collect();
+                CExpr::Fix { defs: new_defs, body: Box::new(Self::alpha_rename(body, map, fresh)) }
+            }
+            CExpr::If { cond, then_branch, else_branch } => {
+                CExpr::If { cond: rename(cond, map), then_branch: Box::new(Self::alpha_rename(then_branch, map, fresh)), else_branch: Box::new(Self::alpha_rename(else_branch, map, fresh)) }
+            }
+        }
+    }
+
+    fn try_unroll_for_loop(&mut self, defs: &[CFunDef], body: &CExpr, units: &HashMap<String, &CTopLevelFn>) -> Option<CExpr> {
+        let [loop_def] = defs else { return None };
+        loop_def.carried_types.as_ref()?;
+        let CExpr::App { func: CVal::Label(call_label), args: init_args } = body else { return None };
+        if call_label != &loop_def.name {
+            return None;
+        }
+        let (&i_var, carried_params) = loop_def.params.split_first()?;
+        let (start_val, carried_init) = init_args.split_first()?;
+        let &CVal::Int(start) = start_val else { return None };
+
+        let CExpr::Fix { defs: cond_defs, body: cond_body } = &loop_def.body else { return None };
+        let (_, _, cmp_args, if_expr) = recognize_real_call(cond_defs, cond_body)?;
+        let [_, CVal::Int(end)] = cmp_args else { return None };
+        let end = *end;
+        let CExpr::If { then_branch, else_branch, .. } = if_expr else { return None };
+        if end.saturating_sub(start) > MAX_UNROLL_ITERATIONS {
+            return None;
+        }
+
+        let mut seed = 0;
+        max_cvar_in_cexpr(&loop_def.body, &mut seed);
+        let fresh = FreshVars::starting_at(seed + 1);
+
+        let mut carried_ids = self.cvals_to_ids(carried_init)?;
+        for idx in start..end {
+            let i_id = self.egraph.add(CleaveLang::Int(idx));
+            self.env.insert(i_var, i_id);
+            for (&p, &id) in carried_params.iter().zip(&carried_ids) {
+                self.env.insert(p, id);
+            }
+            let renamed = Self::alpha_rename(then_branch, &mut HashMap::new(), &fresh);
+            let CExpr::App { func: CVal::Label(l), args } = self.walk(&renamed, units) else { return None };
+            if l != loop_def.name {
+                return None;
+            }
+            carried_ids = self.cvals_to_ids(&args[1..])?;
+        }
+        for (&p, &id) in carried_params.iter().zip(&carried_ids) {
+            self.env.insert(p, id);
+        }
+        Some(self.walk(else_branch, units))
+    }
 }
+
+/// Cap on how many concrete copies `Forward::try_unroll_for_loop` will ever
+/// generate for one loop — a deliberately conservative constant, easy to
+/// raise once real-world use justifies it: past this, unrolling would trade
+/// a clean "stop, unchanged" bail for an e-graph blow-up (equality
+/// saturation's own memory/time cost grows with node count), which is worse
+/// than just not unrolling.
+const MAX_UNROLL_ITERATIONS: u64 = 1024;
 
 /// Recognizes `cps.rs::emit_call`'s own exact `UnitBody::Real` shape --
 /// `Fix{defs: [k], body: App{func: Label(unit_name), args}}` where `k`'s
@@ -450,7 +705,7 @@ fn recognize_real_call<'a>(defs: &'a [CFunDef], body: &'a CExpr) -> Option<(CVar
 
 // ---------------------------------------------------------------- axiom -> Rewrite
 
-use crate::ast::{AxiomDecl, Expr, ExprKind};
+use crate::ast::{AxiomDecl, DerivativeRuleDecl, Expr, ExprKind};
 use crate::registry::Registry;
 use egg::{ENodeOrVar, PatternAst, Rewrite, Var};
 use std::collections::HashSet;
@@ -487,7 +742,7 @@ pub fn axiom_rewrites(registry: &Registry, reached: &HashMap<String, (String, St
     for (algebra, types) in &reached_types {
         for axiom in registry.axioms(algebra) {
             for ty in types {
-                if let Some(rw) = axiom_to_rewrite(algebra, ty, axiom) {
+                if let Some(rw) = axiom_to_rewrite(algebra, ty, axiom, registry) {
                     rules.push(rw);
                 }
             }
@@ -513,57 +768,128 @@ fn concrete_type_of(unit_name: &str) -> Option<&str> {
     (start < end).then(|| &unit_name[start..end])
 }
 
-fn axiom_to_rewrite(algebra: &str, ty: &str, axiom: &AxiomDecl) -> Option<Rewrite<CleaveLang, ConstantFold>> {
+fn axiom_to_rewrite(algebra: &str, ty: &str, axiom: &AxiomDecl, registry: &Registry) -> Option<Rewrite<CleaveLang, ConstantFold>> {
     let params: HashSet<&str> = axiom.params.iter().map(|p| p.name.as_str()).collect();
     let ExprKind::Call(path, _, args, _) = &axiom.body.kind else { return None };
     let [lhs, rhs] = args.as_slice() else { return None };
     if path.segments.join("::") != "eq" {
         return None; // an axiom body that isn't `lhs == rhs` isn't representable yet
     }
+    // No `d(...)` sugar, no referenced-unit bookkeeping -- both are a
+    // `derivative`-rule-only concern (`build_pattern`'s own doc comment).
+    let mut referenced = HashSet::new();
     let mut lhs_ast = PatternAst::default();
-    build_pattern(lhs, algebra, ty, &params, &mut lhs_ast)?;
+    build_pattern(lhs, algebra, ty, &params, None, &mut referenced, registry, &mut lhs_ast)?;
     let mut rhs_ast = PatternAst::default();
-    build_pattern(rhs, algebra, ty, &params, &mut rhs_ast)?;
+    build_pattern(rhs, algebra, ty, &params, None, &mut referenced, registry, &mut rhs_ast)?;
     let name = format!("{}@{algebra}<{ty}>", axiom.name);
     Rewrite::new(name, egg::Pattern::new(lhs_ast), egg::Pattern::new(rhs_ast)).ok()
 }
 
-/// Walks one side of an axiom's own equality, building it up as a
-/// `PatternAst` node by node (never through string parsing — this module
-/// has already hit real ambiguities doing that twice for `CleaveLang`
-/// itself, see its own doc comment; building programmatically sidesteps the
-/// entire class of problem). A bare `Path` matching one of the axiom's own
-/// declared `params` becomes a pattern variable (`?name`); a `Call` becomes
-/// an `Op` node tagged with the substituted concrete unit name, its own
-/// arguments recursively built the same way; a bare integer/bool literal
-/// becomes the matching `CleaveLang` leaf directly (axiom bodies are never
-/// type-checked — `registry.rs` retains them as pure, unvalidated data, see
-/// its own doc comment — so a literal's own text is parsed directly,
-/// `u64`/`bool` only, the same narrowed-to-`Int` scope the rest of this
-/// module already has). Anything else (a field access, a struct literal,
-/// ...) isn't representable in an axiom body yet — returns `None`,
-/// rejecting the whole axiom rather than guessing.
-fn build_pattern(expr: &Expr, algebra: &str, ty: &str, params: &HashSet<&str>, ast: &mut PatternAst<CleaveLang>) -> Option<egg::Id> {
+/// Walks one side of an axiom's (or a `derivative` rule's) own body,
+/// building it up as a `PatternAst` node by node (never through string
+/// parsing — this module has already hit real ambiguities doing that twice
+/// for `CleaveLang` itself, see its own doc comment; building
+/// programmatically sidesteps the entire class of problem). A bare `Path`
+/// matching one of the declared `params` becomes a pattern variable
+/// (`?name`); a bare integer/bool literal becomes the matching `CleaveLang`
+/// leaf directly (axiom/derivative-rule bodies are never type-checked —
+/// `registry.rs` retains them as pure, unvalidated data — so a literal's
+/// own text is parsed directly, no real type inference). Anything else (a
+/// field access, a struct literal, ...) isn't representable yet — returns
+/// `None`, rejecting the whole rule rather than guessing.
+///
+/// A number literal is `CleaveLang::Float` when `ty` is `f32`/`f64`, `Int`
+/// otherwise — found necessary, not assumed: parsing every literal as `u64`
+/// unconditionally (this function's own earlier behavior) meant an axiom
+/// like `Ring<T>`'s own `add_zero(a): add(a, 0) == a;`, instantiated for a
+/// float `T`, built a rule whose own "zero" position could never match a
+/// real runtime `CleaveLang::Float(0.0)` — a different `enode` variant
+/// entirely — so the rule was silently inert for every float instantiation
+/// (`doc/backlog-done.md`'s own `CVal::Float` entry documents this exactly;
+/// fixed here since `Activation::tanh`'s own migrated `derivative` rule,
+/// `1 - tanh(u)²`, needs its literal `1` to actually match).
+///
+/// `d_var: Some(x)` — only ever set while building a `derivative` rule's
+/// own body, `None` for an ordinary axiom — recognizes `d(inner)` (a `Call`
+/// whose path is literally `"d"`, exactly one argument) as sugar for "the
+/// derivative of `inner` with respect to this rule's own implicit
+/// differentiation variable," compiling to `Op("derivative", [inner, x])`
+/// instead of resolving `"d"` as an ordinary algebra method — the *only*
+/// new case; every other `Call` shape is unaffected, and `d_var: None`
+/// (every axiom) never takes this branch at all, so a real algebra method
+/// genuinely named `d` still resolves normally there.
+///
+/// `referenced` collects the concrete unit name (`"{algebra}::{method}
+/// <{ty}>"`) of every ordinary `Call` visited — a `derivative` rule's own
+/// body can reference a unit the function actually being differentiated
+/// never itself called (the product rule always needs `add`, even
+/// differentiating a body that only ever multiplies) — `synthesize_
+/// derivatives` needs this set to know such a reference is valid and to
+/// let `rebuild` recognize it afterward. Unused by `axiom_to_rewrite`
+/// (passed a throwaway set), which has never needed this.
+fn build_pattern(
+    expr: &Expr,
+    algebra: &str,
+    ty: &str,
+    params: &HashSet<&str>,
+    d_var: Option<Var>,
+    referenced: &mut HashSet<String>,
+    registry: &Registry,
+    ast: &mut PatternAst<CleaveLang>,
+) -> Option<egg::Id> {
     match &expr.kind {
         ExprKind::Path(p) => {
             let name = p.segments.join("::");
             if !params.contains(name.as_str()) {
-                return None; // a bare name that isn't one of the axiom's own params -- not representable
+                return None; // a bare name that isn't one of the rule's own params -- not representable
             }
             let var = Var::from(Symbol::from(format!("?{name}")));
             Some(ast.add(ENodeOrVar::Var(var)))
+        }
+        ExprKind::NumberLit { text, .. } if matches!(ty, "f32" | "f64") => {
+            let n: f64 = text.parse().ok()?;
+            Some(ast.add(ENodeOrVar::ENode(CleaveLang::Float(n.into()))))
         }
         ExprKind::NumberLit { text, .. } => {
             let n: u64 = text.parse().ok()?;
             Some(ast.add(ENodeOrVar::ENode(CleaveLang::Int(n))))
         }
         ExprKind::BoolLit(b) => Some(ast.add(ENodeOrVar::ENode(CleaveLang::Bool(*b)))),
+        ExprKind::Call(path, _, call_args, _) if path.segments.join("::") == "d" && d_var.is_some() => {
+            let [inner] = call_args.as_slice() else { return None }; // `d(...)` always takes exactly one argument
+            let inner_id = build_pattern(inner, algebra, ty, params, d_var, referenced, registry, ast)?;
+            let x_id = ast.add(ENodeOrVar::Var(d_var.unwrap()));
+            Some(ast.add(ENodeOrVar::ENode(CleaveLang::Op("derivative".into(), vec![inner_id, x_id]))))
+        }
         ExprKind::Call(path, _, call_args, _) => {
             let method = path.segments.join("::");
-            let unit_name = format!("{algebra}::{method}<{ty}>");
+            // Which algebra actually owns `method` — almost always the
+            // *enclosing* one (`Ring<T>`'s own axioms/derivative rules
+            // calling `add`/`mul`/..., all declared right there), checked
+            // first so every existing single-algebra rule keeps resolving
+            // exactly as before. Falls back to a real registry search
+            // (`Registry::algebras_with_fn`) only when the enclosing
+            // algebra doesn't declare it — needed for real:
+            // `Activation::tanh`'s own derivative rule (`1 - tanh(u)²`)
+            // needs `Ring`'s own `sub`/`mul`, not `Activation`'s (which
+            // doesn't have either). Ambiguous (more than one algebra
+            // declares it) or simply unknown — rejected, not guessed,
+            // same posture as everywhere else `build_pattern` returns
+            // `None`.
+            let owner = if registry.fn_sig(algebra, &method).is_some_and(|sig| sig.params.len() == call_args.len()) {
+                algebra.to_string()
+            } else {
+                match registry.algebras_with_fn(&method, call_args.len()).as_slice() {
+                    [only] => only.to_string(),
+                    _ => return None,
+                }
+            };
+            let unit_name = format!("{owner}::{method}<{ty}>");
+            referenced.insert(unit_name.clone());
             let mut ids = Vec::with_capacity(call_args.len());
             for a in call_args {
-                ids.push(build_pattern(a, algebra, ty, params, ast)?);
+                ids.push(build_pattern(a, algebra, ty, params, d_var, referenced, registry, ast)?);
             }
             Some(ast.add(ENodeOrVar::ENode(CleaveLang::Op(unit_name.into(), ids))))
         }
@@ -613,6 +939,204 @@ pub fn struct_projection_rewrites(
     rules
 }
 
+// ---------------------------------------------------------------- derivative (auto-diff)
+
+use egg::{ConditionalApplier, Language, Subst};
+
+/// `Op("derivative", [expr_id, wrt_id])` — introduced by `synthesize_
+/// derivatives` as a synthetic marker (not a real cleave call — no algebra
+/// named "derivative" exists) wrapping the value being differentiated and
+/// the variable being differentiated with respect to. These rewrite rules
+/// progressively eliminate it during the very same `egg::Runner::run`/
+/// saturation pass that already runs axioms and constant-folding — toward
+/// `doc/backlog.md`'s own auto-diff item, not a bespoke, separate
+/// differentiation engine: chain/sum/product rule plus the two base cases
+/// (`derivative(x,x) → 1`, `derivative(anything-that-doesn't-depend-on-x,
+/// x) → 0`).
+///
+/// `ty` is the concrete numeric type being differentiated over (known
+/// directly from the function being derived, not recovered from `reached`
+/// the way `axiom_rewrites` recovers its own type set) — the base rules
+/// below fire even when *no* algebra is reached at all (`fn f(x: f32) ->
+/// f32 { x }`, the identity function, needs only `derivative(x,x) → 1`, no
+/// `Ring` op in sight). Every other rule (sum/sub/product, the elementary-
+/// function table) is built only for whichever `Ring<ty>`/elementary-
+/// function unit is actually present in `reached` — same "only build what's
+/// actually reached" discipline `axiom_rewrites` already uses; harmless,
+/// not unsound, if a rule never matches anything in a given e-graph.
+pub fn derivative_rewrites(ty: &str, reached: &HashMap<String, (String, String)>, registry: &Registry) -> (Vec<Rewrite<CleaveLang, ConstantFold>>, HashSet<String>) {
+    let (one, zero) =
+        if matches!(ty, "f32" | "f64") { (CleaveLang::Float(1.0.into()), CleaveLang::Float(0.0.into())) } else { (CleaveLang::Int(1), CleaveLang::Int(0)) };
+
+    let mut rules = Vec::new();
+
+    // `derivative(?x, ?x) -> 1` — an ordinary declarative rule: egg's own
+    // pattern semantics already require two occurrences of the same
+    // pattern var to match the same e-class, no custom code needed.
+    // Base cases, both built-in (not declarable — see the module's own
+    // doc comment on why): they're facts about what a variable/a constant
+    // *is*, not an algebraic law belonging to any one algebra.
+    {
+        let mut lhs = PatternAst::default();
+        let x = Var::from(Symbol::from("?x"));
+        let x1 = lhs.add(ENodeOrVar::Var(x));
+        let x2 = lhs.add(ENodeOrVar::Var(x));
+        lhs.add(ENodeOrVar::ENode(CleaveLang::Op("derivative".into(), vec![x1, x2])));
+        let mut rhs = PatternAst::default();
+        rhs.add(ENodeOrVar::ENode(one.clone()));
+        if let Ok(rw) = Rewrite::new("derivative-self", egg::Pattern::new(lhs), egg::Pattern::new(rhs)) {
+            rules.push(rw);
+        }
+    }
+
+    // `derivative(?a, ?x) -> 0`, conditioned on `?a`'s own e-class genuinely
+    // differing from `?x`'s *and* `?x` never actually occurring anywhere
+    // inside `?a`'s own subtree (a real, recursive occurs-check over the
+    // e-graph — `depends_on_eclass`, below — not just "is `?a` shaped like a
+    // leaf"). Originally restricted to leaf shapes (`Free`/`Int`/`Float`/
+    // `Bool`) only; broadened after finding, directly, that a compound-but-
+    // still-`?x`-independent subexpression — `data[i]` (`PrimOp::Load`)
+    // reading from a constant array inside a function being differentiated
+    // w.r.t. a *different* parameter — has no leaf shape at all, so the old
+    // condition left its own `derivative(load(...), ?x)` permanently stuck
+    // (no declared rule applies to `Load` either — it isn't an algebra
+    // method). A bare e-class-inequality check alone would still be
+    // unsound, unchanged from before: `derivative(x*y, x)`'s own `x*y`
+    // subexpression has a *different* e-class than `x` too, but obviously
+    // still depends on it — the occurs-check is exactly what tells the two
+    // cases apart correctly, for *any* compound shape, not just the leaf
+    // ones. Needs a hand-built `ConditionalApplier`, not a plain
+    // declarative pattern — egg's own pattern language has no "not equal
+    // to"/"does not contain" wildcard.
+    {
+        let mut lhs = PatternAst::default();
+        let a = Var::from(Symbol::from("?a"));
+        let x = Var::from(Symbol::from("?x"));
+        let a_id = lhs.add(ENodeOrVar::Var(a));
+        let x_id = lhs.add(ENodeOrVar::Var(x));
+        lhs.add(ENodeOrVar::ENode(CleaveLang::Op("derivative".into(), vec![a_id, x_id])));
+        let mut rhs = PatternAst::default();
+        rhs.add(ENodeOrVar::ENode(zero.clone()));
+        let condition = move |egraph: &mut egg::EGraph<CleaveLang, ConstantFold>, _eclass: Id, subst: &Subst| {
+            let a_class = egraph.find(subst[a]);
+            let x_class = egraph.find(subst[x]);
+            if a_class == x_class {
+                return false;
+            }
+            // `x_class`'s own `free_deps` is exactly `{x}` (a bare `Free`
+            // node, nothing else could have narrowed it further) — checking
+            // disjointness rather than a bare `.contains` reads the same
+            // but stays correct even if `x` were ever something richer than
+            // a single free variable.
+            egraph[x_class].data.free_deps.is_disjoint(&egraph[a_class].data.free_deps)
+        };
+        let applier = ConditionalApplier { condition, applier: egg::Pattern::new(rhs) };
+        if let Ok(rw) = Rewrite::new("derivative-independent-zero", egg::Pattern::new(lhs), applier) {
+            rules.push(rw);
+        }
+    }
+
+    // Everything else — sum/product/chain rule, for whichever algebra/
+    // method — comes entirely from `derivative` rules declared in cleave
+    // source (`stdlib/num`, `stdlib/nn`, or a user's own algebra), not
+    // hard-coded here (`doc/backlog-done.md`'s own "Auto-diff v1 ->
+    // algebra-declared rules" entry).
+    let (declared_rules, referenced) = derivative_rule_rewrites(registry, reached);
+    rules.extend(declared_rules);
+
+    (rules, referenced)
+}
+
+/// Builds one concrete `Rewrite` per `(derivative rule, reached concrete
+/// type)` pair — the `derivative`-rule counterpart of `axiom_rewrites`,
+/// same `reached_types` grouping, same "only build what's actually
+/// reached" discipline (harmless, not unsound, if a rule never matches
+/// anything in a given e-graph). Also returns the union of every built
+/// rule's own referenced-unit set (`build_pattern`'s own doc comment) —
+/// `synthesize_derivatives` needs it to let `rebuild` recognize a unit a
+/// fired rule references that the function actually being differentiated
+/// never itself called.
+fn derivative_rule_rewrites(registry: &Registry, reached: &HashMap<String, (String, String)>) -> (Vec<Rewrite<CleaveLang, ConstantFold>>, HashSet<String>) {
+    let mut reached_types: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for (unit_name, (algebra, _method)) in reached {
+        if let Some(ty) = concrete_type_of(unit_name) {
+            reached_types.entry(algebra.as_str()).or_default().insert(ty);
+        }
+    }
+
+    let mut rules = Vec::new();
+    let mut referenced = HashSet::new();
+    for (algebra, types) in &reached_types {
+        for rule in registry.derivative_rules(algebra) {
+            for ty in types {
+                if let Some((rw, refs)) = derivative_rule_to_rewrite(algebra, ty, rule, registry) {
+                    rules.push(rw);
+                    referenced.extend(refs);
+                }
+            }
+        }
+    }
+    (rules, referenced)
+}
+
+/// `derivative` counterpart of `axiom_to_rewrite`: `derivative mul(a, b):
+/// add(mul(a, d(b)), mul(d(a), b));` becomes `derivative(Ring::mul<ty>(?a,
+/// ?b), ?x) -> Ring::add<ty>(Ring::mul<ty>(?a, derivative(?b,?x)), Ring::
+/// mul<ty>(derivative(?a,?x), ?b))` — the LHS built by hand (the outer
+/// `derivative(method(...), ?x)` wrapper has no source-level `Expr` of its
+/// own to walk), the RHS via `build_pattern` with `d_var: Some(?x)` so
+/// every `d(...)` in the declared body compiles to a nested `derivative`
+/// node sharing the identical `?x`.
+fn derivative_rule_to_rewrite(algebra: &str, ty: &str, rule: &DerivativeRuleDecl, registry: &Registry) -> Option<(Rewrite<CleaveLang, ConstantFold>, HashSet<String>)> {
+    let params: HashSet<&str> = rule.params.iter().map(|p| p.name.as_str()).collect();
+    let x = Var::from(Symbol::from("?x"));
+
+    let mut lhs = PatternAst::default();
+    let mut param_ids = Vec::with_capacity(rule.params.len());
+    for p in &rule.params {
+        param_ids.push(lhs.add(ENodeOrVar::Var(Var::from(Symbol::from(format!("?{}", p.name))))));
+    }
+    let method_id = lhs.add(ENodeOrVar::ENode(CleaveLang::Op(format!("{algebra}::{}<{ty}>", rule.method).into(), param_ids)));
+    let x_id_lhs = lhs.add(ENodeOrVar::Var(x));
+    lhs.add(ENodeOrVar::ENode(CleaveLang::Op("derivative".into(), vec![method_id, x_id_lhs])));
+
+    let mut referenced = HashSet::new();
+    let mut rhs = PatternAst::default();
+    build_pattern(&rule.body, algebra, ty, &params, Some(x), &mut referenced, registry, &mut rhs)?;
+
+    let name = format!("derivative-{algebra}::{}<{ty}>", rule.method);
+    let rw = Rewrite::new(name, egg::Pattern::new(lhs), egg::Pattern::new(rhs)).ok()?;
+    Some((rw, referenced))
+}
+
+/// The cost function extraction must use whenever a `derivative` node might
+/// still be present — plain `AstSize` is the *wrong* tool here: a still-
+/// unreduced `derivative(mul(x,y), x)` (3 nodes) is structurally *smaller*
+/// than its own fully-reduced expansion (`add(mul(x,0), mul(1,y))`, 7+
+/// nodes), so `AstSize` alone would happily keep the tiny, unhelpful
+/// original — the exact opposite of this whole feature's own point (found
+/// directly, by testing: `derivative_of_x_times_y_with_respect_to_x_
+/// eliminates_the_derivative_marker` failed against plain `AstSize` before
+/// this existed). Any live `derivative` node is penalized enormously (not
+/// simply rejected outright — a saturation pass that genuinely can't
+/// eliminate every last one, e.g. an elementary function with no known
+/// derivative rule, should still extract *something* rather than fail to
+/// extract at all) — ordinary `AstSize`-style counting otherwise, so a
+/// fully `derivative`-free result still picks the cheapest *among* those.
+pub struct DerivativeFreeCost;
+
+impl egg::CostFunction<CleaveLang> for DerivativeFreeCost {
+    type Cost = usize;
+
+    fn cost<C>(&mut self, enode: &CleaveLang, mut costs: C) -> Self::Cost
+    where
+        C: FnMut(Id) -> Self::Cost,
+    {
+        let penalty = if matches!(enode, CleaveLang::Op(sym, _) if sym.as_str() == "derivative") { 1_000_000 } else { 0 };
+        enode.fold(1 + penalty, |sum, id| sum.saturating_add(costs(id)))
+    }
+}
+
 // ---------------------------------------------------------------- e-graph -> CPS (backward)
 
 use crate::cps::FreshVars;
@@ -636,6 +1160,22 @@ struct OpTables<'a> {
     array_ops: &'a HashMap<Symbol, Ty>,
     array_repeat_ops: &'a HashMap<Symbol, Ty>,
     load_ops: &'a HashMap<Symbol, (Ty, Ty)>,
+    /// A reconstructed `Free` node's own original `CVal` (`free_vars`
+    /// above) rebinds to a *different* `CVar` before it's used, if it's a
+    /// key here — empty for every existing caller (`optimize_program`'s own
+    /// `rebuild_segment`, splicing an optimized segment back into the
+    /// *same* function it came from, needs no such rebinding). `synthesize_
+    /// derivatives` is the one real user: `fprime`'s own body is built from
+    /// `f`'s own already-translated e-graph, whose `Free` nodes reference
+    /// *`f`'s* own parameter `CVar`s — reused directly, those would mean
+    /// two different top-level functions each declaring a formal parameter
+    /// under the same numeric identity while `f` itself may still be live
+    /// elsewhere in the program (a real correctness issue, found during
+    /// design, not debugging — `max_cvar_in_program`'s own doc comment
+    /// already treats `CVar` uniqueness across the whole program as
+    /// required). This maps each of `f`'s own parameter `CVar`s to a fresh
+    /// one minted for `fprime` instead.
+    param_substitution: &'a HashMap<CVar, CVar>,
 }
 
 /// The mechanical inverse of `Forward::walk` — turns an extracted
@@ -672,10 +1212,15 @@ fn rebuild(recexpr: &RecExpr<CleaveLang>, id: egg::Id, fresh: &FreshVars, tables
     }
     match &recexpr[id] {
         CleaveLang::Int(n) => k(CVal::Int(*n)),
+        CleaveLang::Float(f) => k(CVal::Float((*f).into())),
         CleaveLang::Bool(b) => k(CVal::Bool(*b)),
         CleaveLang::Free(sym) => {
             let v = tables.free_vars.get(sym).unwrap_or_else(|| panic!("egraph: no original CVal recorded for free symbol `{sym}`"));
-            k(v.clone())
+            let v = match v {
+                CVal::Var(cv) => tables.param_substitution.get(cv).map_or_else(|| v.clone(), |&new_cv| CVal::Var(new_cv)),
+                other => other.clone(),
+            };
+            k(v)
         }
         CleaveLang::Op(sym, children) => {
             rebuild_args(recexpr, children, fresh, tables, memo, &|arg_vals| {
@@ -793,7 +1338,8 @@ pub(crate) fn rebuild_segment(
     load_ops: &HashMap<Symbol, (Ty, Ty)>,
     fresh: &FreshVars,
 ) -> CExpr {
-    let tables = OpTables { free_vars, raw_ops, call_units, struct_ops, field_ops, array_ops, array_repeat_ops, load_ops };
+    let no_substitution = HashMap::new();
+    let tables = OpTables { free_vars, raw_ops, call_units, struct_ops, field_ops, array_ops, array_repeat_ops, load_ops, param_substitution: &no_substitution };
     let memo = RefCell::new(HashMap::new());
     rebuild(recexpr, root, fresh, &tables, &memo, &|final_val| substitute_var(boundary, old_root_var, &final_val))
 }
@@ -1042,6 +1588,313 @@ pub fn optimize_program(program: CpsProgram, registry: &Registry) -> (CpsProgram
     (CpsProgram { funcs }, explanations)
 }
 
+// ---------------------------------------------------------------- derivative synthesis (Stage 7)
+
+/// `fprime = derive(f);` (`ast.rs`'s own `FnDecl::derivative_of`) — one
+/// entry per such declaration, built by the caller from `collect_units`'s
+/// own `Vec<ConcreteUnit>` (`u.body`'s own `UnitBody::Derivative(of)`)
+/// *before* `convert_program` consumes it — see `main.rs`'s own call site.
+pub struct DerivativeRequest {
+    pub name: String,
+    pub of: String,
+}
+
+/// The real body-synthesis half of `doc/backlog.md`'s own auto-diff item —
+/// runs once, right after `convert_program` (so every ordinary unit,
+/// `f` included, already has its own real, CPS-converted body to build
+/// from) and before the first `eliminate_dead_code` (so a synthesized
+/// `fprime`'s own real calls are already visible to it). For each request:
+/// walks `f`'s own already-converted body into a fresh e-graph exactly the
+/// way `optimize_program` already does for an ordinary straight-line
+/// segment, adds one `Op("derivative", [root, param])` node per one of
+/// `f`'s own real parameters (skipped — a literal zero built directly,
+/// no e-graph node needed — for a parameter `f`'s own body never actually
+/// references), saturates with `axiom_rewrites`/`struct_projection_
+/// rewrites`/`derivative_rewrites` together (the *same* saturation pass a
+/// real algebraic identity and a derivative rule can both fire within —
+/// this is the actual point of building `derivative` as ordinary e-graph
+/// rewriting rather than a separate engine), extracts each with
+/// `DerivativeFreeCost`, and rebuilds — `N == 1` becomes `fprime`'s whole
+/// body directly, `N > 1` wraps all `N` into one `[T; N]` array (`PrimOp::
+/// Array`, the same construction `[a,b,c]` already lowers to).
+///
+/// A request whose own `of` never became a real unit is silently skipped —
+/// `driver.rs`'s own signature-synthesis pass already rejects that case
+/// earlier, with a real diagnostic; this only guards against being handed a
+/// request malformed in some way that pass didn't anticipate. A request
+/// whose body doesn't translate as one clean straight-line segment reaching
+/// its own return (`Forward::try_unroll_for_loop`'s own cap exceeded, a
+/// branch, an unresolvable loop bound) is *not* silently skipped — it's a
+/// real, collected error below, matching the "no rule reaches it" case.
+/// Used to `continue` silently instead (`req.name`'s own function simply
+/// never added to `new_funcs`, the real failure surfacing three stages
+/// downstream in `mlir_lower.rs` as a confusing "call to unknown top-level
+/// fn" panic) — found directly, empirically, before this was fixed.
+///
+/// Returns `Err` — one message per request that couldn't be fully
+/// differentiated, not the first found (this project's own "see every
+/// conflict, not just the first" posture, `driver.rs::merge_programs`'
+/// own doc comment) — whenever saturation still leaves a live `derivative`
+/// node in a parameter's own best extraction: no rule (built-in base case
+/// or declared `derivative` rule) reaches it, so it's genuinely
+/// undifferentiable with what's in scope, not a bug to guess past. Used to
+/// panic instead (`rebuild` choking on an `Op` symbol none of its own
+/// lookup tables recognized) — real, found directly while building this.
+pub fn synthesize_derivatives(program: CpsProgram, requests: &[DerivativeRequest], registry: &Registry) -> Result<CpsProgram, Vec<String>> {
+    let fresh = FreshVars::starting_at(max_cvar_in_program(&program) + 1);
+    let units: HashMap<String, &CTopLevelFn> = program.funcs.iter().map(|f| (f.def.name.clone(), f)).collect();
+
+    let mut new_funcs = Vec::new();
+    let mut errors = Vec::new();
+
+    for req in requests {
+        let Some(&of_unit) = units.get(req.of.as_str()) else { continue };
+
+        let mut fwd = Forward::default();
+        let boundary = fwd.walk(&of_unit.def.body, &units);
+        // Both of these used to `continue` silently (no error pushed) —
+        // found directly, empirically, before this fix existed: `derive()`
+        // on a function whose own body wasn't fully representable (any
+        // `for`/`while` loop, before `Forward::try_unroll_for_loop`; still
+        // true today for a too-large or branching loop, or a call to a unit
+        // whose own body has a loop) meant `req.name`'s own function was
+        // simply never added to `new_funcs`, with the *real* failure
+        // surfacing three stages downstream, confusingly, in
+        // `mlir_lower.rs` (`panicked ... call to unknown top-level fn
+        // \`grad\``) the moment something else tried to call it. Reusing
+        // the exact same `errors`/`Result` mechanism the `missing.is_empty()`
+        // check just below already established, rather than inventing a
+        // second one.
+        let Some(root_var) = segment_root_var(&boundary, &fwd.env) else {
+            errors.push(format!("cannot derive `{}`: function body is not fully representable (unsupported control flow, e.g. a loop that could not be unrolled, or a branch)", req.name));
+            continue;
+        };
+        let Some(&root_id) = fwd.env.get(&root_var) else {
+            errors.push(format!("cannot derive `{}`: function body is not fully representable (unsupported control flow, e.g. a loop that could not be unrolled, or a branch)", req.name));
+            continue;
+        };
+
+        // `of_unit.def.params`' own trailing entry is `f`'s own `k_ret` —
+        // real parameters are everything before it (`CTopLevelFn::k_ret`'s
+        // own doc comment).
+        let f_params = &of_unit.def.params[..of_unit.def.params.len() - 1];
+
+        // Fresh params for `fprime` itself — never `f`'s own reused (see
+        // `OpTables::param_substitution`'s own doc comment for why).
+        let mut param_substitution = HashMap::new();
+        let mut new_params = Vec::with_capacity(f_params.len() + 1);
+        for &p in f_params {
+            let np = fresh.var();
+            param_substitution.insert(p, np);
+            new_params.push(np);
+        }
+        let k_ret = fresh.var();
+        new_params.push(k_ret);
+
+        // One `derivative` node per `f`'s own parameter, in declared order
+        // — `None` for a parameter `f`'s own body never actually
+        // references anywhere (no `Free` node was ever minted for it). A
+        // parameter is a *free* variable from `Forward::walk`'s own
+        // perspective (never `LetPrim`-bound, so never an `env` key —
+        // that field's own doc comment) — `external_vars` (not `env`) is
+        // the table that actually answers "which e-class does this
+        // specific external `CVar` correspond to" — found directly: an
+        // earlier version of this read `env` instead, which silently
+        // produced `None` for every parameter, since `env` only ever
+        // tracks a segment's own internally-computed values.
+        let derivative_ids: Vec<Option<egg::Id>> =
+            f_params.iter().map(|p| fwd.external_vars.get(p).map(|&param_id| fwd.egraph.add(CleaveLang::Op("derivative".into(), vec![root_id, param_id])))).collect();
+
+        let ty_text = of_unit.result.to_string();
+
+        let mut rules = axiom_rewrites(registry, &fwd.reached);
+        rules.extend(struct_projection_rewrites(&fwd.struct_ops, &fwd.field_ops));
+        let (derivative_rules, referenced) = derivative_rewrites(&ty_text, &fwd.reached, registry);
+        rules.extend(derivative_rules);
+
+        let Forward { egraph, free_vars, raw_ops, mut call_units, struct_ops, field_ops, array_ops, array_repeat_ops, load_ops, .. } = fwd;
+        // A fired `derivative` rule's own RHS can reference a unit `f`'s
+        // own body never itself called (the product rule always needs
+        // `Ring::add<ty>`, even differentiating a body that only ever
+        // multiplies) — `referenced` (`derivative_rewrites`'s own return
+        // value, collected while building the rules actually in play)
+        // names every one; `rebuild`'s own `Op` handling needs each,
+        // confirmed to actually exist somewhere in the whole program
+        // (`units`, built once above — `collect_units` already builds a
+        // `ConcreteUnit` for *every* non-generic algebra-impl method
+        // unconditionally, regardless of whether anything calls it,
+        // mirrors `f` itself always getting a unit), inserted into `call_
+        // units` to recognize it as a real call rather than panicking on
+        // an unrecognized symbol. Found directly, not anticipated: `fn f
+        // (x: f32) -> f32 { x * x }` has no `add` call anywhere, yet its
+        // own derivative's product-rule expansion needs one.
+        call_units.extend(referenced.iter().filter(|name| units.contains_key(name.as_str())).cloned());
+        // `Runner::default()`'s own `iter_limit` (30) is tuned for `optimize_
+        // program`'s ordinary axiom/constant-fold segments, not this pass:
+        // a declared `derivative` rule only ever peels *one* level of
+        // nesting per firing (each application still needs its *own*
+        // saturation iteration to become visible to the next), so a chain
+        // deep enough to need it (e.g. `Forward::try_unroll_for_loop`
+        // unrolling a real, multi-iteration loop before differentiating
+        // through it) can need more than 30 rounds even though it's
+        // otherwise a small, ordinary saturation — found directly: a two-
+        // parameter loss function differentiated through just a 2-iteration
+        // unrolled loop already hit `IterationLimit(30)` (confirmed via
+        // `runner.stop_reason`, not guessed), stopping with `derivative`
+        // markers genuinely still reducible, one more round would have
+        // continued eliminating them. `node_limit`/`time_limit` raised
+        // alongside it for the same reason — `iter_limit` alone would just
+        // trade one silent stop for another.
+        let runner = Runner::default().with_iter_limit(1000).with_node_limit(1_000_000).with_time_limit(std::time::Duration::from_secs(30)).with_egraph(egraph).run(&rules);
+        let tables =
+            OpTables { free_vars: &free_vars, raw_ops: &raw_ops, call_units: &call_units, struct_ops: &struct_ops, field_ops: &field_ops, array_ops: &array_ops, array_repeat_ops: &array_repeat_ops, load_ops: &load_ops, param_substitution: &param_substitution };
+        let extractor = Extractor::new(&runner.egraph, DerivativeFreeCost);
+
+        // A `derivative` node surviving into the *best* extraction means
+        // no rule — built-in base case or declared `derivative` rule —
+        // ever reached it: genuinely undifferentiable with what's in
+        // scope. Checked *before* `rebuild` (which has no lookup-table
+        // entry for a raw `derivative` symbol and would otherwise panic on
+        // exactly this) — one clean, real error instead.
+        let mut missing: Vec<String> = derivative_ids
+            .iter()
+            .flatten()
+            .filter_map(|&id| undifferentiable_unit(&runner.egraph, &extractor, id))
+            .collect();
+        if !missing.is_empty() {
+            missing.sort();
+            missing.dedup();
+            errors.push(format!("cannot derive `{}`: no derivative rule for `{}`", req.name, missing.join("`, `")));
+            continue;
+        }
+
+        let result_ty = of_unit.result.clone();
+        let body = build_param_derivatives(&derivative_ids, &of_unit.param_types, &runner.egraph, &extractor, &fresh, &tables, Vec::new(), &|values| {
+            finish_derivative_body(values, k_ret, &result_ty, &fresh)
+        });
+
+        let n = f_params.len();
+        let result = if n == 1 { of_unit.result.clone() } else { Ty::Array(Box::new(of_unit.result.clone()), Box::new(Ty::Const(ConstValue::Int(n as u64)))) };
+
+        new_funcs.push(CTopLevelFn {
+            def: CFunDef { name: req.name.clone(), params: new_params, body, carried_types: None },
+            param_types: of_unit.param_types.clone(),
+            result,
+            k_ret,
+            origin: None,
+        });
+    }
+
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
+    let mut funcs = program.funcs;
+    funcs.extend(new_funcs);
+    Ok(CpsProgram { funcs })
+}
+
+/// Checks one parameter's own best extraction for a surviving `derivative`
+/// node — `None` if it's fully eliminated, `Some(unit)` naming the inner
+/// op it's still wrapped around (or a generic fallback if the inner
+/// position isn't itself a real op, e.g. a bare `Free`/literal) otherwise.
+fn undifferentiable_unit(egraph: &egg::EGraph<CleaveLang, ConstantFold>, extractor: &Extractor<DerivativeFreeCost, CleaveLang, ConstantFold>, id: egg::Id) -> Option<String> {
+    let (_, best) = extractor.find_best(egraph.find(id));
+    for node in best.as_ref() {
+        let CleaveLang::Op(sym, children) = node else { continue };
+        if sym.as_str() != "derivative" {
+            continue;
+        }
+        let name = children.first().and_then(|&inner| match &best[inner] {
+            CleaveLang::Op(inner_sym, _) => Some(inner_sym.to_string()),
+            _ => None,
+        });
+        return Some(name.unwrap_or_else(|| "<unknown>".to_string()));
+    }
+    None
+}
+
+/// The literal zero of `ty` — `f`'s own parameter `p` was never referenced
+/// anywhere in its body, so `d(f)/dp` is trivially this, no e-graph node
+/// needed at all.
+fn zero_value(ty: &Ty) -> CVal {
+    if matches!(ty.to_string().as_str(), "f32" | "f64") {
+        CVal::Float(0.0)
+    } else {
+        CVal::Int(0)
+    }
+}
+
+/// Sequences one reconstruction per parameter — mirrors `rebuild_args`'s
+/// own shape exactly (build inner-to-outer, `k` names "what happens next
+/// once every value is collected"), just over `derivative_ids`/`param_
+/// types` in lockstep instead of one shared `RecExpr`'s own children:
+/// each parameter's own derivative was extracted as an *independent*
+/// `RecExpr` (a separate `Extractor::find_best` call per `Id`, not one
+/// shared tree), so this can't reuse `rebuild_args` directly.
+#[allow(clippy::too_many_arguments)]
+fn build_param_derivatives(
+    derivative_ids: &[Option<egg::Id>],
+    param_types: &[Ty],
+    egraph: &egg::EGraph<CleaveLang, ConstantFold>,
+    extractor: &Extractor<DerivativeFreeCost, CleaveLang, ConstantFold>,
+    fresh: &FreshVars,
+    tables: &OpTables,
+    acc: Vec<CVal>,
+    k: &dyn Fn(Vec<CVal>) -> CExpr,
+) -> CExpr {
+    let Some((first, rest_ids)) = derivative_ids.split_first() else { return k(acc) };
+    let (first_ty, rest_types) = param_types.split_first().expect("derivative_ids and param_types must be the same length");
+    match first {
+        None => {
+            let mut acc2 = acc.clone();
+            acc2.push(zero_value(first_ty));
+            build_param_derivatives(rest_ids, rest_types, egraph, extractor, fresh, tables, acc2, k)
+        }
+        Some(id) => {
+            let (_, best) = extractor.find_best(egraph.find(*id));
+            // A *fresh* memo per parameter, not one shared across all of
+            // them — a real bug, found by direct testing (the Jacobian
+            // case): each parameter's own derivative is extracted as an
+            // *independent* `RecExpr` (a separate `Extractor::find_best`
+            // call per `Id`), and different `RecExpr`s' own internal ids
+            // are small integers starting fresh from 0 each time, with no
+            // relationship to one another — a memo shared across more than
+            // one `RecExpr` silently reused the *first* parameter's own
+            // cached reconstructions while rebuilding the *second*,
+            // collapsing two genuinely different derivatives (`y+1` and
+            // `x`) down to the same value in both array slots.
+            let memo = RefCell::new(HashMap::new());
+            rebuild(&best, best.root(), fresh, tables, &memo, &|v| {
+                let mut acc2 = acc.clone();
+                acc2.push(v);
+                build_param_derivatives(rest_ids, rest_types, egraph, extractor, fresh, tables, acc2, k)
+            })
+        }
+    }
+}
+
+/// The tail of a synthesized `fprime`'s own body — `N == 1`'s single
+/// reconstructed value tail-calls `k_ret` directly (an ordinary `return`,
+/// same idiom every real top-level fn's own body already ends in); `N > 1`
+/// wraps every value in one `PrimOp::Array` construction first (the
+/// gradient/Jacobian row) before doing the same.
+fn finish_derivative_body(values: Vec<CVal>, k_ret: CVar, result_ty: &Ty, fresh: &FreshVars) -> CExpr {
+    if let [only] = values.as_slice() {
+        return CExpr::App { func: CVal::Var(k_ret), args: vec![only.clone()] };
+    }
+    let n = values.len();
+    let array_ty = Ty::Array(Box::new(result_ty.clone()), Box::new(Ty::Const(ConstValue::Int(n as u64))));
+    let arr_var = fresh.var();
+    CExpr::LetPrim {
+        var: arr_var,
+        ty: array_ty,
+        op: PrimOp::Array,
+        args: values,
+        cont: Box::new(CExpr::App { func: CVal::Var(k_ret), args: vec![CVal::Var(arr_var)] }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1086,10 +1939,40 @@ mod tests {
         let two = egraph.add(CleaveLang::Int(2));
         let add = egraph.add(CleaveLang::Op("Ring::add<i32>".into(), vec![a, two]));
 
-        assert_eq!(egraph[add].data, None);
+        assert_eq!(egraph[add].data.const_int, None);
         let extractor = Extractor::new(&egraph, AstSize);
         let (_, best) = extractor.find_best(add);
         assert_eq!(best.to_string(), "(Ring::add<i32> a 2)", "got {best}");
+    }
+
+    /// `neg` folds via `eval_binop("sub", 0, a)` (`ConstantFold::make`'s own
+    /// unary-arity arm) — `Ring::neg<i32>(5)` should constant-fold to the
+    /// same `u64` bit pattern `0u64.wrapping_sub(5)` gives, matching `Ring<T>
+    /// ::neg`'s own real runtime body (`mlir::arith::subi(0, a)`).
+    #[test]
+    fn neg_folds_a_single_int_literal() {
+        let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
+        let five = egraph.add(CleaveLang::Int(5));
+        let neg = egraph.add(CleaveLang::Op("Ring::neg<i32>".into(), vec![five]));
+        assert_eq!(egraph[neg].data.const_int, Some(0u64.wrapping_sub(5)));
+    }
+
+    /// `div` is deliberately *not* folded by `ConstantFold` (unlike every
+    /// other recognized operator) — see `ConstantFold::make`'s own `"div"`
+    /// doc comment: no width/signedness tag exists to tell whether the
+    /// operands are meant as signed or unsigned, and division (unlike add/
+    /// mul/sub/neg) genuinely differs between the two for a negative
+    /// operand. `Ring::div<i32>(6, 3)` must stay unfolded here even though
+    /// `eval_binop`'s own `"div"` arm (used by `infer.rs`'s const-generic
+    /// evaluator) *can* compute `6/3` — the exclusion is specifically about
+    /// this runtime-facing analysis, not about `eval_binop` itself.
+    #[test]
+    fn div_is_never_folded_by_constant_fold() {
+        let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
+        let six = egraph.add(CleaveLang::Int(6));
+        let three = egraph.add(CleaveLang::Int(3));
+        let div = egraph.add(CleaveLang::Op("Ring::div<i32>".into(), vec![six, three]));
+        assert_eq!(egraph[div].data.const_int, None);
     }
 
     // -------------------------------------------------- axiom -> Rewrite (Stage 4)
@@ -1283,7 +2166,73 @@ mod tests {
         assert!(fwd.env.contains_key(&0) && fwd.env.contains_key(&1), "both LetPrim-bound vars must have their own e-class");
         // (2 + 3) folds to 5, then 5 * 10 folds to 50 -- constant folding
         // firing automatically as each node is added, not a separate step.
-        assert_eq!(fwd.egraph[fwd.env[&1]].data, Some(50));
+        assert_eq!(fwd.egraph[fwd.env[&1]].data.const_int, Some(50));
+    }
+
+    /// `doc/backlog.md`'s own "`CVal::Float` in the e-graph" item — a real
+    /// float literal, as an argument to a raw `mlir::...` op, must not stop
+    /// translation dead the way it used to (`cval_to_id` returning `None`
+    /// for `CVal::Float`, per this module's own former doc comment). Mirrors
+    /// `a_straight_line_letprim_chain_translates_fully_leaving_only_the_tail_
+    /// app_as_boundary` exactly, just with one operand being a real `f32`
+    /// float literal instead of an `Int`.
+    #[test]
+    fn a_letprim_with_a_float_literal_argument_translates_instead_of_stopping() {
+        let f32_ty = || Ty::Con("f32".to_string());
+        let tail = CExpr::App { func: CVal::Var(99), args: vec![CVal::Var(0)] };
+        let expr = CExpr::LetPrim {
+            var: 0,
+            ty: f32_ty(),
+            op: PrimOp::RawMlirOp { op: "arith.mulf".to_string(), attrs: vec![] },
+            args: vec![CVal::Var(10), CVal::Float(2.0)],
+            cont: Box::new(tail.clone()),
+        };
+        let mut fwd = Forward::default();
+        let boundary = fwd.walk(&expr, &HashMap::new());
+        assert!(matches!(boundary, CExpr::App { .. }), "expected the bare tail App as the boundary, got {boundary:?}");
+        assert!(fwd.env.contains_key(&0), "the LetPrim-bound var must have its own e-class -- the float argument must not have stopped translation");
+    }
+
+    /// The other half of `CVal::Float` representability: not just building a
+    /// `CleaveLang::Float` node (proven above), but reconstructing one back
+    /// into a real `CVal::Float` with the *exact* original value — no
+    /// rewrite needs to actually fire for this (unlike `a_fired_rewrite_
+    /// reconstructs_the_cheaper_form`'s own Stage-5 precedent): `rebuild`'s
+    /// own `CleaveLang::Float` leaf arm is exercised identically whether the
+    /// extracted `RecExpr` came from an untouched e-graph or a saturated
+    /// one, so extracting straight from `fwd.egraph` with zero rules run is
+    /// already the exact same code path `optimize_program` uses whenever a
+    /// rewrite *does* fire.
+    #[test]
+    fn a_float_leaf_round_trips_through_extraction_and_rebuild_unchanged() {
+        let f32_ty = || Ty::Con("f32".to_string());
+        let tail = CExpr::App { func: CVal::Var(99), args: vec![CVal::Var(0)] };
+        let expr = CExpr::LetPrim {
+            var: 0,
+            ty: f32_ty(),
+            op: PrimOp::RawMlirOp { op: "arith.mulf".to_string(), attrs: vec![] },
+            args: vec![CVal::Var(10), CVal::Float(2.5)],
+            cont: Box::new(tail.clone()),
+        };
+        let mut fwd = Forward::default();
+        let boundary = fwd.walk(&expr, &HashMap::new());
+        let root_var: CVar = 0;
+        let root_id = fwd.env[&root_var];
+
+        let extractor = Extractor::new(&fwd.egraph, AstSize);
+        let (_, best) = extractor.find_best(root_id);
+
+        let Forward { free_vars, raw_ops, call_units, struct_ops, field_ops, array_ops, array_repeat_ops, load_ops, .. } = fwd;
+        let fresh = FreshVars::new();
+        let rebuilt = rebuild_segment(&best, best.root(), root_var, &boundary, &free_vars, &raw_ops, &call_units, &struct_ops, &field_ops, &array_ops, &array_repeat_ops, &load_ops, &fresh);
+
+        match &rebuilt {
+            CExpr::LetPrim { args, .. } => {
+                let has_float = args.iter().any(|a| matches!(a, CVal::Float(f) if *f == 2.5));
+                assert!(has_float, "expected the reconstructed args to still carry the exact float literal, got {rebuilt:?}");
+            }
+            other => panic!("expected a rebuilt LetPrim carrying the raw mlir op, got {other:?}"),
+        }
     }
 
     /// A real call (`emit_call`'s own `Fix`/`App` shape) to a unit whose own
@@ -1332,7 +2281,7 @@ mod tests {
         assert!(matches!(boundary, CExpr::App { .. }), "translation must continue past the Fix into k$0's own body, got {boundary:?}");
         assert!(fwd.env.contains_key(&5), "the call's own result var must have its own e-class");
         // 2 + 3 folds to 5 through the *callee's* own translated op.
-        assert_eq!(fwd.egraph[fwd.env[&5]].data, Some(5));
+        assert_eq!(fwd.egraph[fwd.env[&5]].data.const_int, Some(5));
         assert_eq!(
             fwd.reached.get("Ring::add<i32>"),
             Some(&("Ring".to_string(), "add".to_string())),
@@ -1379,6 +2328,139 @@ mod tests {
         let mut fwd = Forward::default();
         let boundary = fwd.walk(&expr, &units);
         assert!(matches!(boundary, CExpr::Fix { .. }), "a non-straight-line callee must stop translation at the Fix, got {boundary:?}");
+        assert!(fwd.env.is_empty(), "nothing should have been translated at all");
+    }
+
+    // -------------------------------------------------- for-loop unrolling (Forward::try_unroll_for_loop)
+
+    /// Builds the exact CPS shape `cps.rs`'s own `for` lowering produces for
+    /// `for i in 0..end { acc = acc + i; }` — ground-truthed via `--dump-cps`
+    /// on that exact source, not guessed — parameterized only over `end`'s
+    /// own bound `CVal` so the three tests below can each plug in a
+    /// literal-in-range, non-literal, or too-large bound without repeating
+    /// the whole shape. `Ring::add<i32>` is registered as a real,
+    /// straight-line callee (mirrors `a_real_call_to_a_straight_line_unit_
+    /// is_transparent`'s own callee exactly) since the loop body's own two
+    /// additions (`acc + i`, `i + 1`) need to resolve as real calls during
+    /// unrolling, unlike the loop's own comparison (`Ord::lt<i32>`, never
+    /// itself translated — `try_unroll_for_loop` only ever reads its two
+    /// operands via `recognize_real_call`, it doesn't need a real callee).
+    fn for_loop_fix(end: CVal) -> CExpr {
+        const I: CVar = 1; // v436 in the real dump
+        const ACC: CVar = 0; // v435
+        const COND: CVar = 2; // v437
+        const ACC2: CVar = 3; // v438 = acc + i
+        const I2: CVar = 4; // v439 = i + 1
+        const K_RET: CVar = 99; // f's own outer continuation (v434)
+
+        let then_branch = CExpr::Fix {
+            defs: vec![CFunDef {
+                name: "k1".to_string(),
+                params: vec![ACC2],
+                body: CExpr::Fix {
+                    defs: vec![CFunDef {
+                        name: "k2".to_string(),
+                        params: vec![I2],
+                        body: CExpr::App { func: CVal::Label("loop$0".to_string()), args: vec![CVal::Var(I2), CVal::Var(ACC2)] },
+                        carried_types: None,
+                    }],
+                    body: Box::new(CExpr::App { func: CVal::Label("Ring::add<i32>".to_string()), args: vec![CVal::Var(I), CVal::Int(1), CVal::Label("k2".to_string())] }),
+                },
+                carried_types: None,
+            }],
+            body: Box::new(CExpr::App { func: CVal::Label("Ring::add<i32>".to_string()), args: vec![CVal::Var(ACC), CVal::Var(I), CVal::Label("k1".to_string())] }),
+        };
+        let else_branch = CExpr::App { func: CVal::Var(K_RET), args: vec![CVal::Var(ACC)] };
+        let cond_fix = CExpr::Fix {
+            defs: vec![CFunDef {
+                name: "k_cond".to_string(),
+                params: vec![COND],
+                body: CExpr::If { cond: CVal::Var(COND), then_branch: Box::new(then_branch), else_branch: Box::new(else_branch) },
+                carried_types: None,
+            }],
+            body: Box::new(CExpr::App { func: CVal::Label("Ord::lt<i32>".to_string()), args: vec![CVal::Var(I), end, CVal::Label("k_cond".to_string())] }),
+        };
+        CExpr::Fix {
+            defs: vec![CFunDef { name: "loop$0".to_string(), params: vec![I, ACC], body: cond_fix, carried_types: Some(vec![i32_ty(), i32_ty()]) }],
+            body: Box::new(CExpr::App { func: CVal::Label("loop$0".to_string()), args: vec![CVal::Int(0), CVal::Int(0)] }),
+        }
+    }
+
+    fn ring_add_i32_callee() -> CTopLevelFn {
+        CTopLevelFn {
+            def: CFunDef {
+                name: "Ring::add<i32>".to_string(),
+                params: vec![10, 11, 12],
+                body: CExpr::LetPrim {
+                    var: 20,
+                    ty: i32_ty(),
+                    op: PrimOp::RawMlirOp { op: "arith.addi".to_string(), attrs: vec![] },
+                    args: vec![CVal::Var(10), CVal::Var(11)],
+                    cont: Box::new(CExpr::App { func: CVal::Var(12), args: vec![CVal::Var(20)] }),
+                },
+                carried_types: None,
+            },
+            param_types: vec![i32_ty(), i32_ty()],
+            result: i32_ty(),
+            k_ret: 12,
+            origin: Some(("Ring".to_string(), "add".to_string())),
+        }
+    }
+
+    /// A literal-bounded `for` loop unrolls fully: translation continues
+    /// straight through the loop into the exit continuation (the boundary is
+    /// the `App` calling `f`'s own outer `k_ret`, not the `Fix` itself), and
+    /// the carried variable (`acc`) ends up bound to the *correctly folded*
+    /// final value (`0+0 -> 0`, `0+1 -> 1`, `1+2 -> 3`) — proof the carried
+    /// state actually threads iteration-to-iteration rather than each
+    /// iteration reusing the same initial binding.
+    #[test]
+    fn a_literal_bounded_for_loop_unrolls_and_carries_state_correctly() {
+        let callee = ring_add_i32_callee();
+        let mut units: HashMap<String, &CTopLevelFn> = HashMap::new();
+        units.insert("Ring::add<i32>".to_string(), &callee);
+
+        let expr = for_loop_fix(CVal::Int(3));
+        let mut fwd = Forward::default();
+        let boundary = fwd.walk(&expr, &units);
+
+        assert!(matches!(boundary, CExpr::App { func: CVal::Var(99), .. }), "expected unrolling to continue straight into the loop's own exit continuation, got {boundary:?}");
+        const ACC: CVar = 0;
+        let acc_id = *fwd.env.get(&ACC).expect("the carried `acc` var must have its own e-class after unrolling");
+        assert_eq!(fwd.egraph[acc_id].data.const_int, Some(3), "0+0, then +1, then +2 must fold to 3 -- carried state must thread across iterations, not restart each time");
+    }
+
+    /// A non-literal bound (`end` is a free variable, not a `CVal::Int`)
+    /// must leave translation exactly as conservative as before this
+    /// feature existed: stop at the `Fix`, unchanged, nothing translated.
+    #[test]
+    fn a_for_loop_with_a_non_literal_bound_is_not_unrolled() {
+        let callee = ring_add_i32_callee();
+        let mut units: HashMap<String, &CTopLevelFn> = HashMap::new();
+        units.insert("Ring::add<i32>".to_string(), &callee);
+
+        let expr = for_loop_fix(CVal::Var(50));
+        let mut fwd = Forward::default();
+        let boundary = fwd.walk(&expr, &units);
+
+        assert!(matches!(boundary, CExpr::Fix { .. }), "a non-literal bound must bail, leaving the original Fix as the boundary, got {boundary:?}");
+        assert!(fwd.env.is_empty(), "nothing should have been translated at all");
+    }
+
+    /// A bound exceeding `MAX_UNROLL_ITERATIONS` also bails, exactly like a
+    /// non-literal one — trading a clean "stop, unchanged" for an e-graph
+    /// blow-up would be worse than not unrolling.
+    #[test]
+    fn a_for_loop_exceeding_the_unroll_cap_is_not_unrolled() {
+        let callee = ring_add_i32_callee();
+        let mut units: HashMap<String, &CTopLevelFn> = HashMap::new();
+        units.insert("Ring::add<i32>".to_string(), &callee);
+
+        let expr = for_loop_fix(CVal::Int(MAX_UNROLL_ITERATIONS + 1));
+        let mut fwd = Forward::default();
+        let boundary = fwd.walk(&expr, &units);
+
+        assert!(matches!(boundary, CExpr::Fix { .. }), "a too-large bound must bail, leaving the original Fix as the boundary, got {boundary:?}");
         assert!(fwd.env.is_empty(), "nothing should have been translated at all");
     }
 
@@ -1515,7 +2597,7 @@ mod tests {
         assert!(matches!(boundary, CExpr::App { .. }), "expected the bare tail App as the boundary, got {boundary:?}");
         assert!(fwd.env.contains_key(&0) && fwd.env.contains_key(&1), "both the construction and the field read must have their own e-class");
         assert_eq!(
-            fwd.egraph[fwd.env[&1]].data, None,
+            fwd.egraph[fwd.env[&1]].data.const_int, None,
             "a field read must not constant-fold to its own source literal yet -- no struct-projection knowledge this stage"
         );
     }
@@ -1856,5 +2938,312 @@ mod tests {
         struct_ops.insert(Symbol::from("struct:Pair:x,y"), ("Pair".to_string(), vec!["x".to_string(), "y".to_string()], pair_ty()));
         let rules = struct_projection_rewrites(&struct_ops, &HashMap::new());
         assert!(rules.is_empty());
+    }
+
+    // -------------------------------------------------- derivative (auto-diff)
+
+    fn extract_best(egraph: &EGraph<CleaveLang, ConstantFold>, id: Id) -> String {
+        let extractor = Extractor::new(egraph, DerivativeFreeCost);
+        extractor.find_best(id).1.to_string()
+    }
+
+    /// An empty (but real) `Registry` -- the three base-case tests below
+    /// need no declared `derivative` rule at all, only `derivative_
+    /// rewrites`'s own signature (which now always takes a real `Registry`).
+    fn empty_registry() -> Registry {
+        Registry::build(&crate::ast::Program { items: Vec::new() })
+    }
+
+    /// `derivative(x,x) -> 1` -- the trivial base case: no declared rule
+    /// needed at all (the identity function's own derivative is exactly
+    /// this, with nothing else in sight).
+    #[test]
+    fn derivative_of_a_variable_with_respect_to_itself_is_one() {
+        let reg = empty_registry();
+        let (rules, _) = derivative_rewrites("f32", &HashMap::new(), &reg);
+        let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
+        let x = egraph.add(CleaveLang::Free("x".into()));
+        let d = egraph.add(CleaveLang::Op("derivative".into(), vec![x, x]));
+
+        let runner = egg::Runner::default().with_egraph(egraph).run(&rules);
+        assert_eq!(extract_best(&runner.egraph, runner.egraph.find(d)), "1");
+    }
+
+    /// `derivative(y, x) -> 0` -- a *different* free variable is a leaf
+    /// that doesn't depend on `x`.
+    #[test]
+    fn derivative_of_a_different_free_variable_is_zero() {
+        let reg = empty_registry();
+        let (rules, _) = derivative_rewrites("f32", &HashMap::new(), &reg);
+        let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
+        let x = egraph.add(CleaveLang::Free("x".into()));
+        let y = egraph.add(CleaveLang::Free("y".into()));
+        let d = egraph.add(CleaveLang::Op("derivative".into(), vec![y, x]));
+
+        let runner = egg::Runner::default().with_egraph(egraph).run(&rules);
+        assert_eq!(extract_best(&runner.egraph, runner.egraph.find(d)), "0");
+    }
+
+    /// `derivative(3.0, x) -> 0` -- a literal constant is a leaf that
+    /// doesn't depend on `x` either.
+    #[test]
+    fn derivative_of_a_float_literal_is_zero() {
+        let reg = empty_registry();
+        let (rules, _) = derivative_rewrites("f32", &HashMap::new(), &reg);
+        let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
+        let x = egraph.add(CleaveLang::Free("x".into()));
+        let three = egraph.add(CleaveLang::Float(3.0.into()));
+        let d = egraph.add(CleaveLang::Op("derivative".into(), vec![three, x]));
+
+        let runner = egg::Runner::default().with_egraph(egraph).run(&rules);
+        assert_eq!(extract_best(&runner.egraph, runner.egraph.find(d)), "0");
+    }
+
+    /// `derivative-independent-zero`'s own real, empirically-found bug (see
+    /// `ConstantFold::Data`'s own `free_deps` doc comment): a *still-
+    /// unreduced* `derivative(inner, x)` marker sitting in some e-class (the
+    /// rule hasn't fired on that specific occurrence *yet* — normal,
+    /// expected mid-saturation state) must never make the analysis think
+    /// that e-class "depends on" `x`, just because the marker's own
+    /// *second* child happens to *be* `x` by construction — that's the
+    /// marker's own syntax, not a real value-level dependency. Reproduces
+    /// the exact mechanism directly (no loop/unrolling needed at all):
+    /// unions a literal `0.0`'s own e-class with an unreduced
+    /// `derivative(0.0, w)` node targeting *the same* e-class — simulating
+    /// exactly what a partially-saturated real e-graph looks like whenever
+    /// `derivative-independent-zero` hasn't reduced every occurrence yet.
+    #[test]
+    fn an_unreduced_derivative_markers_own_children_do_not_pollute_free_deps() {
+        let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
+        let w = egraph.add(CleaveLang::Free("w".into()));
+        let zero = egraph.add(CleaveLang::Float(0.0.into()));
+        let deriv_marker = egraph.add(CleaveLang::Op("derivative".into(), vec![zero, w]));
+        egraph.union(zero, deriv_marker);
+        egraph.rebuild();
+        assert!(
+            egraph[zero].data.free_deps.is_empty(),
+            "an unreduced `derivative(_, w)` marker merely sitting in `zero`'s own e-class must not be read as `zero` itself depending on `w`, got {:?}",
+            egraph[zero].data.free_deps
+        );
+    }
+
+    /// The real, deeper generalization of the bug above (found *after* the
+    /// fix above, while testing a second, independent parameter): a live
+    /// e-graph traversal can never be sound here at all, not just "buggy on
+    /// derivative markers specifically" — equality saturation itself
+    /// routinely unions a value-independent expression (`w * 0.0`) into the
+    /// *same* e-class as a value it happens to equal (`0.0`) *regardless of
+    /// `w`*, and the more saturation progresses, the more such "mentions
+    /// `w`, but doesn't truly depend on it" alternatives accumulate in
+    /// *every* e-class — a live "does *any* representation mention `w`"
+    /// search becomes wrong more and more often as saturation runs longer.
+    /// The `Analysis`-based fix (`ConstantFold::Data::free_deps`, merged by
+    /// *intersection*) sidesteps this structurally: as long as *one*
+    /// representation (here, the literal `Float(0.0)` added first) proves
+    /// independence, later unioning in a `w`-mentioning alternative can
+    /// only ever *narrow* the recorded bound, never widen it back.
+    #[test]
+    fn a_value_equal_but_w_mentioning_representation_does_not_pollute_free_deps() {
+        let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
+        let w = egraph.add(CleaveLang::Free("w".into()));
+        let zero = egraph.add(CleaveLang::Float(0.0.into()));
+        assert!(egraph[zero].data.free_deps.is_empty(), "a bare literal must start with no recorded dependencies");
+        let w_times_zero = egraph.add(CleaveLang::Op("Ring::mul<f32>".into(), vec![w, zero]));
+        assert_eq!(egraph[w_times_zero].data.free_deps, HashSet::from([Symbol::from("w")]), "w*0.0's own naive bound must mention w before it's unioned with anything");
+        egraph.union(zero, w_times_zero);
+        egraph.rebuild();
+        assert!(
+            egraph[zero].data.free_deps.is_empty(),
+            "unioning a value-equal-but-w-mentioning representation must narrow (intersect), not widen, the e-class's own recorded dependency bound, got {:?}",
+            egraph[zero].data.free_deps
+        );
+    }
+
+    /// A real `Ring<f32>` with declared `derivative` rules for `add`/`mul`
+    /// (mirrors `a_real_axiom_builds_a_rewrite_that_actually_fires`'s own
+    /// precedent: the real front end, not a hand-built `reached` map with
+    /// no registry behind it) -- `doc/backlog-done.md`'s own "algebra-
+    /// declared rules" item, proven through the actual declared path.
+    // `TestRing`, not `Ring` -- `Ring` is the *real* prelude algebra
+    // (`num`/`logic` are always folded in, `driver.rs`'s own `PRELUDE_
+    // CRATES`, regardless of whether this source `use`s them), so
+    // redeclaring its own `add`/`mul` here would collide as a genuine
+    // duplicate signature -- same precedent `a_real_axiom_builds_a_
+    // rewrite_that_actually_fires` already established.
+    fn ring_f32_with_derivative_rules() -> Registry {
+        let (result, _sources) = crate::driver::compile(
+            vec![(
+                "test.cleave".to_string(),
+                "algebra TestRing<T> {
+                    fn add(a: T, b: T) -> T;
+                    fn mul(a: T, b: T) -> T;
+                    derivative add(a, b): add(d(a), d(b));
+                    derivative mul(a, b): add(mul(a, d(b)), mul(d(a), b));
+                 }"
+                .to_string(),
+            )],
+            &[],
+        );
+        let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+        Registry::build(&program)
+    }
+
+    fn ring_f32_reached() -> HashMap<String, (String, String)> {
+        let mut reached = HashMap::new();
+        reached.insert("TestRing::mul<f32>".to_string(), ("TestRing".to_string(), "mul".to_string()));
+        reached.insert("TestRing::add<f32>".to_string(), ("TestRing".to_string(), "add".to_string()));
+        reached
+    }
+
+    /// The leaf-vs-compound distinction, specifically: `derivative(x*y, x)`
+    /// must *not* fall for the "not literally the same e-class as x" trap
+    /// -- `x*y`'s own e-class genuinely differs from `x`'s, but the whole
+    /// point of the declared product rule is that this still depends on
+    /// `x` (reduces to `1*y + 0*x`, i.e. `y` once `Ring::mul<f32>`'s own
+    /// identity/zero axioms are in play too -- here, with no axioms
+    /// loaded, just confirms it does *not* collapse to the literal `0`
+    /// leaf-zero rule would wrongly produce if it weren't leaf-restricted).
+    #[test]
+    fn derivative_of_a_product_involving_x_does_not_wrongly_collapse_to_zero() {
+        let reg = ring_f32_with_derivative_rules();
+        let reached = ring_f32_reached();
+        let (rules, _) = derivative_rewrites("f32", &reached, &reg);
+
+        let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
+        let x = egraph.add(CleaveLang::Free("x".into()));
+        let y = egraph.add(CleaveLang::Free("y".into()));
+        let xy = egraph.add(CleaveLang::Op("TestRing::mul<f32>".into(), vec![x, y]));
+        let d = egraph.add(CleaveLang::Op("derivative".into(), vec![xy, x]));
+
+        let runner = egg::Runner::default().with_egraph(egraph).run(&rules);
+        let best = extract_best(&runner.egraph, runner.egraph.find(d));
+        assert_ne!(best, "0", "declared product rule must not be short-circuited by the leaf-zero rule, got {best}");
+    }
+
+    /// The declared product rule fires, and — with the two base cases
+    /// folding the inner `derivative(x,x)`/`derivative(y,x)` sub-terms away
+    /// for real — the extracted form no longer mentions `derivative` *at
+    /// all*: the core claim of this whole feature, the e-graph
+    /// progressively eliminating the marker node entirely. `mul(x,0) +
+    /// mul(1,y)` is the mathematically correct (if not maximally
+    /// simplified) result — folding it further to bare `y` needs `mul_
+    /// zero`/`mul_one`-shaped identity axioms `stdlib/num` doesn't declare
+    /// today (only `add_zero`) — a real, natural follow-up, not attempted
+    /// by this rule set.
+    #[test]
+    fn derivative_of_x_times_y_with_respect_to_x_eliminates_the_derivative_marker() {
+        let reg = ring_f32_with_derivative_rules();
+        let reached = ring_f32_reached();
+        let (rules, _) = derivative_rewrites("f32", &reached, &reg);
+
+        let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
+        let x = egraph.add(CleaveLang::Free("x".into()));
+        let y = egraph.add(CleaveLang::Free("y".into()));
+        let xy = egraph.add(CleaveLang::Op("TestRing::mul<f32>".into(), vec![x, y]));
+        let d = egraph.add(CleaveLang::Op("derivative".into(), vec![xy, x]));
+
+        let runner = egg::Runner::default().with_egraph(egraph).run(&rules);
+        let best = extract_best(&runner.egraph, runner.egraph.find(d));
+        assert!(!best.contains("derivative"), "expected every `derivative` marker eliminated, got {best}");
+        assert!(best.contains('y'), "expected the surviving expression to still reference y, got {best}");
+    }
+
+    /// The declared product rule's own referenced-unit set names `add` —
+    /// `f`'s own `x*y` never calls it, but the rule's own RHS needs it.
+    #[test]
+    fn derivative_rewrites_reports_units_the_declared_rules_reference_but_reached_does_not_include() {
+        let reg = ring_f32_with_derivative_rules();
+        let mut reached = HashMap::new();
+        reached.insert("TestRing::mul<f32>".to_string(), ("TestRing".to_string(), "mul".to_string()));
+        let (_, referenced) = derivative_rewrites("f32", &reached, &reg);
+        assert!(referenced.contains("TestRing::add<f32>"), "expected the product rule's own referenced-unit set to name add, got {referenced:?}");
+    }
+
+    /// No declared `derivative` rule at all -- only the two base rules get
+    /// built.
+    #[test]
+    fn only_base_rules_are_built_when_nothing_is_declared() {
+        let reg = empty_registry();
+        let (rules, _) = derivative_rewrites("f32", &HashMap::new(), &reg);
+        assert_eq!(rules.len(), 2, "expected exactly the two base rules (self, leaf-zero)");
+    }
+
+    /// The real, clean "cannot derive" error path — a method with no
+    /// `derivative` rule at all, and no fallback (a bare `Op` node, not a
+    /// leaf, not reducible by anything): `synthesize_derivatives` used to
+    /// panic inside `rebuild` on exactly this shape (an unrecognized
+    /// `derivative` symbol surviving extraction); it now returns a real
+    /// `Err` naming the specific unit, through the *full* real pipeline
+    /// (`crate::driver::compile` -> `collect_units` -> `convert_program`),
+    /// not a synthetic e-graph-only setup.
+    #[test]
+    fn synthesize_derivatives_reports_a_clean_error_instead_of_panicking_when_no_rule_reaches_a_node() {
+        let src = "
+            algebra Foo<T> { fn bar(x: T) -> T; }
+            impl Foo<f32> { fn bar(x) { x } }
+            fn f(x: f32) -> f32 { bar(x) }
+            fprime = derive(f);
+        ";
+        let (result, _sources) = crate::driver::compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
+        let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+        let registry = Registry::build(&program);
+        let units = crate::cps::collect_units(&program, &registry);
+        let requests: Vec<DerivativeRequest> = units
+            .iter()
+            .filter_map(|u| match &u.body {
+                crate::cps::UnitBody::Derivative(of) => Some(DerivativeRequest { name: u.name.clone(), of: of.clone() }),
+                _ => None,
+            })
+            .collect();
+        let cps_program = crate::cps::convert_program(units);
+        let errs = match synthesize_derivatives(cps_program, &requests, &registry) {
+            Err(errs) => errs,
+            Ok(_) => panic!("expected a real error, not a successfully synthesized fprime"),
+        };
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("Foo::bar<f32>"), "expected the error to name the undifferentiable unit, got {errs:?}");
+    }
+
+    /// The empirically-found bug this whole item's second half fixes: before
+    /// it, `derive()`-ing a function whose body contains an untranslatable
+    /// `for` loop (here: one exceeding `MAX_UNROLL_ITERATIONS`, still
+    /// unrollable-in-principle but deliberately not attempted -- see that
+    /// constant's own doc comment) didn't produce an error here at all: the
+    /// `segment_root_var`/`env.get` lookups silently `continue`d, `fprime`
+    /// was never added to `new_funcs`, and the real crash only surfaced
+    /// three stages downstream in `mlir_lower.rs` ("call to unknown
+    /// top-level fn `fprime`") the moment something else called it --
+    /// reproduced directly, via a real `--run`, before this fix existed.
+    #[test]
+    fn synthesize_derivatives_reports_a_clean_error_instead_of_silently_dropping_the_function_when_the_body_is_not_fully_representable() {
+        let src = "
+            fn f(x: f32) -> f32 {
+                let mut total = 0.0;
+                for i in 0..2000 {
+                    total = total + x;
+                };
+                total
+            }
+            fprime = derive(f);
+        ";
+        let (result, _sources) = crate::driver::compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
+        let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+        let registry = Registry::build(&program);
+        let units = crate::cps::collect_units(&program, &registry);
+        let requests: Vec<DerivativeRequest> = units
+            .iter()
+            .filter_map(|u| match &u.body {
+                crate::cps::UnitBody::Derivative(of) => Some(DerivativeRequest { name: u.name.clone(), of: of.clone() }),
+                _ => None,
+            })
+            .collect();
+        let cps_program = crate::cps::convert_program(units);
+        let errs = match synthesize_derivatives(cps_program, &requests, &registry) {
+            Err(errs) => errs,
+            Ok(_) => panic!("expected a real error, not a successfully synthesized fprime"),
+        };
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("cannot derive `fprime`"), "expected the error to name the request, got {errs:?}");
+        assert!(errs[0].contains("not fully representable"), "expected the error to explain why, got {errs:?}");
     }
 }

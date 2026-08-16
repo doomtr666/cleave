@@ -1,0 +1,45 @@
+use io;
+
+// `doc/backlog.md`'s own "toward simple ML" roadmap item's first real
+// example: ordinary least-squares linear regression (`y = w*x + b`) fit by
+// gradient descent, using `derive()` for the gradient -- no hand-derived
+// math anywhere. Needs two things `doc/backlog-done.md` documents:
+// - `Forward::try_unroll_for_loop` ("unroll statically-bounded `for` loops
+//   in the e-graph forward translator"): `loss`'s own accumulation loop
+//   over the (fixed, small) dataset has to unroll into straight-line
+//   arithmetic before `derive()` can see through it at all.
+// - `ConstantFold::Data::free_deps` ("a sound, `Analysis`-based occurs-
+//   check for auto-diff"): differentiating *two* parameters (`w` and `b`)
+//   through the same unrolled, multi-term loop body is exactly the shape
+//   that exposed the live-traversal occurs-check as fundamentally unsound.
+//
+// The four points lie exactly on `y = 2x + 1` (noise-free on purpose) --
+// gradient descent should recover `w = 2`, `b = 1` closely, giving a simple,
+// unambiguous check that the learned parameters are actually right, not
+// just "some numbers came out".
+fn loss(w: f32, b: f32) -> f32 {
+    let xs: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let ys: [f32; 4] = [3.0, 5.0, 7.0, 9.0];
+    let mut total: f32 = 0.0;
+    for i in 0..4 {
+        let pred: f32 = w * xs[i] + b;
+        let err: f32 = pred - ys[i];
+        total = total + err * err;
+    };
+    total
+}
+grad = derive(loss);
+
+fn main() -> i32 {
+    let mut w: f32 = 0.0;
+    let mut b: f32 = 0.0;
+    let lr: f32 = 0.01;
+    for step in 0..500 {
+        let g: [f32; 2] = grad(w, b);
+        w = w - lr * g[0];
+        b = b - lr * g[1];
+    };
+    print(w);
+    print(b);
+    0
+}

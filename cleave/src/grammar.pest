@@ -8,7 +8,7 @@ COMMENT = _{ "//" ~ (!NEWLINE ~ ANY)* }
 
 program = { SOI ~ item* ~ EOI }
 
-item = { use_decl | struct_decl | algebra_decl | impl_decl | fn_decl }
+item = { use_decl | struct_decl | algebra_decl | impl_decl | fn_decl | derive_decl }
 
 // ---------------------------------------------------------------- crates
 // `use linalg;` (or `use linalg::Matrix;`) is the only mechanism — no separate
@@ -63,6 +63,19 @@ attribute_arg = { ident }
 fn_decl = { attribute* ~ extern_kw? ~ "fn" ~ ident ~ generic_params? ~ "(" ~ param_list? ~ ")" ~ ("->" ~ type_)? ~ (block | ";") }
 extern_kw = { "extern" ~ ("(" ~ ident ~ ")")? }
 
+// `fprime = derive(f);` -- toward auto-diff (`doc/backlog.md`), a new
+// top-level item declaring `fprime` as the mechanically-derived derivative
+// of an existing, non-generic top-level `fn` named `f`. Read as an
+// assignment with `derive` applied to `f` ("fprime equals the derivative of
+// f"), not "derive fprime" (considered and rejected: reads as if `fprime`
+// itself were the thing being derived). No parameter list or return type
+// here -- `fprime`'s own signature is computed from `f`'s (see `driver.rs`'s
+// own signature-synthesis pass), never written by hand. No ambiguity with
+// `fn_decl` above: every other `item` alternative starts with a fixed
+// keyword or `#`, `derive_decl` is the only one starting with a bare
+// `ident`.
+derive_decl = { ident ~ "=" ~ "derive" ~ "(" ~ ident ~ ")" ~ ";" }
+
 generic_params = { "<" ~ generic_param ~ ("," ~ generic_param)* ~ ">" }
 generic_param  = { "const" ~ ident ~ ":" ~ type_ | ident ~ (":" ~ bound_list)? }
 bound_list     = { ident ~ ("+" ~ ident)* }
@@ -79,11 +92,19 @@ field       = { ident ~ ":" ~ type_ }
 // "algebra" is the working keyword from hld.md's closing section; naming
 // (vs. a separate axiom-free "signature") is still open, see conversation notes.
 algebra_decl = { "algebra" ~ ident ~ generic_params? ~ (":" ~ bound_list)? ~ "{" ~ algebra_item* ~ "}" }
-algebra_item = { fn_sig | axiom_decl }
+algebra_item = { fn_sig | axiom_decl | derivative_rule_decl }
 fn_sig       = { "fn" ~ ident ~ "(" ~ param_list? ~ ")" ~ ("->" ~ type_)? ~ ";" }
 // the equality itself is just an ordinary `expr` (comparison already handles `==`);
 // no separate "==" token here, or it would conflict with comparison's own greedy parse.
 axiom_decl   = { "axiom" ~ ident ~ "(" ~ param_list? ~ ")" ~ ":" ~ expr ~ ";" }
+// `derivative mul(a, b): add(mul(a, d(b)), mul(d(a), b));` -- a declared
+// rewrite rule for auto-diff (`doc/backlog-done.md`'s own "Auto-diff v1"
+// entry), one algebra item alongside `axiom`. `ident` here is the *method*
+// name being differentiated (`mul`), not a separate rule name -- unlike
+// `axiom_decl`, there's no other identity a derivative rule could need.
+// `d(...)` inside `expr` is sugar recognized specially by `egraph.rs::
+// build_pattern`, not a real call -- see that function's own doc comment.
+derivative_rule_decl = { "derivative" ~ ident ~ "(" ~ param_list? ~ ")" ~ ":" ~ expr ~ ";" }
 
 // ---------------------------------------------------------------- impl
 // Two shapes: an *algebra* impl (dispatches `add`/`gt`/... through the
@@ -335,7 +356,7 @@ if_expr = { "if" ~ expr ~ block ~ ("else" ~ (if_expr | block))? }
 
 // parses (funnel grammar), not yet wired into CPS conversion/the e-graph — see top-of-file note.
 while_expr = { "while" ~ expr ~ block }
-for_expr   = { "for" ~ ident ~ "in" ~ additive ~ ".." ~ additive ~ block }
+for_expr   = { "for" ~ ident ~ "in" ~ additive ~ (".." ~ additive)? ~ block }
 
 // `[value; N]` -- repeat sugar. `N` a literal `numeric_lit` desugars at
 // *lowering* time (not inference time, unlike `array_type`'s own `[T; N]`

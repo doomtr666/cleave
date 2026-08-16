@@ -156,9 +156,23 @@ fn dump_program_fn(out: &mut String, errors: &mut Vec<TypeError>, f: &FnDecl, pr
             let ret = fmt_ty_named(&fn_result.result, &mut names);
             let _ = writeln!(out, "fn {}({}) -> {ret} {{", f.name, params.join(", "));
             // A bodyless top-level `fn` is rejected by `callgraph::infer_program`
-            // itself (`MissingFnBody`) before it could ever reach `Ok` here.
-            let body = f.body.as_ref().expect("a top-level fn reaching Ok always has a body");
-            dump_block(out, body, &program_inference.node_types, &mut names, 1);
+            // itself (`MissingFnBody`) before it could ever reach `Ok` here —
+            // *unless* it's `extern` or `derivative_of`-marked (`fprime =
+            // derive(f);`), both of which `infer_program` deliberately lets
+            // through bodyless (the declared return type stands in for a
+            // body that either lives outside cleave entirely, or is
+            // synthesized much later, post-CPS — see `callgraph.rs`'s own
+            // doc comment on that branch). Found by direct testing: this
+            // used to unconditionally assume a real body and panic the
+            // moment either was actually dumped, a latent gap this session's
+            // own `derive` work was the first thing to reach.
+            match &f.body {
+                Some(body) => dump_block(out, body, &program_inference.node_types, &mut names, 1),
+                None => {
+                    let why = if f.is_extern { "extern" } else { "derive" };
+                    let _ = writeln!(out, "    /* {why}, no cleave-level body */");
+                }
+            }
             let _ = writeln!(out, "}}");
         }
         Some(Err(e)) => {
@@ -400,6 +414,11 @@ fn fmt_expr_typed(e: &Expr, node_types: &NodeTypes, names: &mut TyVarNames, call
             "for {var} in {}..{} {}",
             fmt_expr_typed(start, node_types, names, call_names),
             fmt_expr_typed(end, node_types, names, call_names),
+            fmt_block_inline_typed(body, node_types, names, call_names)
+        ),
+        ExprKind::ForIn { var, iter, body } => format!(
+            "for {var} in {} {}",
+            fmt_expr_typed(iter, node_types, names, call_names),
             fmt_block_inline_typed(body, node_types, names, call_names)
         ),
         ExprKind::Block(b) => fmt_block_inline_typed(b, node_types, names, call_names),

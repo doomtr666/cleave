@@ -224,6 +224,30 @@ fn unary_minus_desugars_to_neg() {
     }
 }
 
+/// `grammar.pest`'s own `for_expr` funnels both shapes through one rule
+/// (`(".." ~ additive)?`) — `lower_for_expr` is what actually tells them
+/// apart. The range form must keep lowering to `ExprKind::For` exactly as
+/// before (a direct regression guard on the grammar's new optional group).
+#[test]
+fn for_range_still_lowers_to_for() {
+    let f = lower_one_fn("fn f(arr) { for i in 0..5 { i } }");
+    match &only_stmt_expr(&f.body).kind {
+        ExprKind::For { var, .. } => assert_eq!(var, "i"),
+        other => panic!("expected ExprKind::For, got {other:?}"),
+    }
+}
+
+/// The new element-based form (`doc/backlog-done.md`'s own "`for x in
+/// array`" item) lowers to the new `ExprKind::ForIn` instead.
+#[test]
+fn for_in_array_lowers_to_for_in() {
+    let f = lower_one_fn("fn f(arr) { for x in arr { x } }");
+    match &only_stmt_expr(&f.body).kind {
+        ExprKind::ForIn { var, .. } => assert_eq!(var, "x"),
+        other => panic!("expected ExprKind::ForIn, got {other:?}"),
+    }
+}
+
 #[test]
 fn field_access_vs_zero_arg_method_call_are_distinguishable() {
     let f_field = lower_one_fn("fn f(v) { v.x }");

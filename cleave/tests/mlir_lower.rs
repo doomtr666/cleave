@@ -1,5 +1,6 @@
-use cleave::cps::{collect_mlir_types, collect_struct_schemas, collect_units, convert_program};
+use cleave::cps::{collect_mlir_types, collect_struct_schemas, collect_units, convert_program, UnitBody};
 use cleave::driver::compile;
+use cleave::egraph::{synthesize_derivatives, DerivativeRequest};
 use cleave::mlir_lower::lower_program;
 use cleave::registry::Registry;
 use melior::Context;
@@ -139,7 +140,20 @@ fn run_i32(context: &Context, src: &str) -> i32 {
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let registry = Registry::build(&program);
     let units = collect_units(&program, &registry);
+    // `fprime = derive(f);` (`doc/backlog.md`'s own auto-diff item) needs
+    // `synthesize_derivatives` run right after `convert_program` -- mirrors
+    // `main.rs`'s own `build_cps_program` exactly (that one's private to
+    // the binary, so this test harness's own shared JIT helper needs the
+    // identical three-step sequence spelled out here instead of reusing it).
+    let requests: Vec<DerivativeRequest> = units
+        .iter()
+        .filter_map(|u| match &u.body {
+            UnitBody::Derivative(of) => Some(DerivativeRequest { name: u.name.clone(), of: of.clone() }),
+            _ => None,
+        })
+        .collect();
     let cps_program = convert_program(units);
+    let cps_program = synthesize_derivatives(cps_program, &requests, &registry).unwrap_or_else(|e| panic!("cannot derive: {e:?}"));
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(context, &cps_program, &mlir_types, struct_schemas);
@@ -715,6 +729,44 @@ fn a_while_loop_actually_computes_the_right_value() {
 fn a_for_loop_with_an_accumulator_actually_computes_the_right_value() {
     let context = context();
     assert_eq!(run_i32(&context, "fn main() -> i32 { let mut acc = 0; for i in 0..10 { acc = acc + i; }; acc }"), 45);
+}
+
+/// `doc/backlog-done.md`'s own "`for x in array`" item — element-based
+/// iteration, the real end-to-end proof: `cps.rs`'s new `ExprKind::ForIn`
+/// arm correctly derives the array's own size from its type (`ctx.node_
+/// types`, not a user-written bound) and binds `x` to the *loaded element*
+/// (via one extra `LetPrim{Load}`), not the index — `1+2+3+4 = 10`, not `10`
+/// (the sum of indices `0+1+2+3`) either, the real discriminator between
+/// "iterating elements" and "iterating indices by coincidence".
+#[test]
+fn a_for_in_loop_over_an_array_sums_its_own_elements_not_its_indices() {
+    let context = context();
+    let src = "fn main() -> i32 { let arr = [1, 2, 3, 4]; let mut total = 0; for x in arr { total = total + x; }; total }";
+    assert_eq!(run_i32(&context, src), 10);
+}
+
+/// A `for x in arr` loop's own carried-state threading (an *outer* mutated
+/// variable, not just the loop-local accumulator) — mirrors `a_loop_
+/// carrying_two_different_types_computes_the_right_value`'s own precedent,
+/// proving `mutated_free_vars`'s new `ForIn` arm actually threads a second,
+/// independently-typed carried value correctly, not just that translation
+/// doesn't crash.
+#[test]
+fn a_for_in_loop_carries_an_outer_mutated_variable_correctly() {
+    let context = context();
+    let src = "
+        fn main() -> i32 {
+            let arr = [1, 2, 3, 4];
+            let mut total = 0;
+            let mut count = 0.0;
+            for x in arr {
+                total = total + x;
+                count = count + 1.0;
+            };
+            if total == 10 and count == 4.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
 }
 
 /// A 1-D array literal (`PrimOp::Array`) lowers to `memref.alloc` plus one
@@ -2279,5 +2331,171 @@ fn sum_mean_max_of_a_vector_compute_correctly() {
             if sum(v) == 9.0 and mean(v) == 3.0 and max_of(v) == 5.0 { 1 } else { 0 }
         }
     "#;
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+// ---------------------------------------------------------------------
+// `doc/backlog.md`'s own "`CVal::Float` in the e-graph" item — a real
+// float literal is now representable inside `egraph.rs`'s own `Forward`/
+// `rebuild` (`CleaveLang::Float`, wrapping `ordered_float::OrderedFloat<f64>`)
+// instead of silently stopping translation the moment it's touched.
+// ---------------------------------------------------------------------
+
+/// A real function whose own body computes over a float literal, run
+/// through the *full* `--run` pipeline (`collect_units` -> `convert_program`
+/// -> `optimize_program` -> `eliminate_dead_code` -> `lower_program` -> JIT)
+/// -- proves `optimize_program` now translates the segment fully (instead of
+/// stopping dead at the literal, per this module's own former doc comment)
+/// and still reconstructs/codegens the exact right numeric result, not just
+/// that construction alone doesn't panic (`egraph.rs`'s own unit tests
+/// already prove that in isolation).
+#[test]
+fn a_float_literal_inside_a_straight_line_segment_still_computes_correctly_through_the_full_pipeline() {
+    let context = context();
+    let src = "
+        fn main() -> i32 {
+            let x: f32 = 3.0;
+            let y: f32 = x * 2.0;
+            if y == 6.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+// ---------------------------------------------------------------------
+// `doc/backlog.md`'s own auto-diff item — `fprime = derive(f);`, a new
+// top-level item mechanically synthesizing `fprime`'s own body via e-graph
+// rewriting (`egraph.rs::synthesize_derivatives`/`derivative_rewrites`) --
+// `f` itself must be an existing, non-generic top-level `fn` with every
+// parameter (and its own return type) the same concrete numeric type.
+// ---------------------------------------------------------------------
+
+/// The single-parameter, scalar-derivative case: `d(x^2)/dx = 2x`, checked
+/// numerically at `x = 3.0` (`fprime(3.0) == 6.0`) through the real `--run`
+/// pipeline, not a synthetic e-graph-only test — proves signature
+/// synthesis (`driver.rs`), `UnitBody::Derivative` (`cps.rs`), and the real
+/// e-graph-based synthesis all work together end to end.
+#[test]
+fn derive_of_a_single_parameter_function_computes_the_scalar_derivative() {
+    let context = context();
+    let src = "
+        fn f(x: f32) -> f32 { x * x }
+        fprime = derive(f);
+        fn main() -> i32 {
+            let d: f32 = fprime(3.0);
+            if d == 6.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// The multi-parameter, Jacobian case: `f(x,y) = x*y + x`, `df/dx = y+1`,
+/// `df/dy = x` -- at `(x,y) = (3.0, 5.0)`, `[6.0, 3.0]`, chosen so neither
+/// component is right by coincidence and neither equals the other. Proves
+/// the `N > 1` array-wrapping path (`PrimOp::Array`, `[f32; 2]`) together
+/// with the "different free variable -> 0" base rule (needed for `y`'s own
+/// term to correctly vanish from `df/dx`, and `x`'s own from `df/dy`).
+#[test]
+fn derive_of_a_two_parameter_function_computes_the_jacobian_as_an_array() {
+    let context = context();
+    let src = "
+        fn f(x: f32, y: f32) -> f32 { x * y + x }
+        fprime = derive(f);
+        fn main() -> i32 {
+            let g: [f32; 2] = fprime(3.0, 5.0);
+            if g[0] == 6.0 and g[1] == 3.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `Forward::try_unroll_for_loop` (`egraph.rs`) -- a literal-bounded `for`
+/// loop written directly in a derived function's own body now unrolls
+/// instead of stopping `Forward::walk` dead. `loss(w) = sum_i(w * data[i])`
+/// over a small local array, summed via a hand-written accumulation loop (no
+/// `sum()` -- calling a *separate* unit whose own body loops is still out of
+/// scope, blocked by the unrelated "multi-level call transparency" gap) --
+/// `d(loss)/dw = sum_i(data[i]) = 1.0 + 2.0 + 3.0 = 6.0`. Also the real
+/// proof `derivative-independent-zero`'s own occurs-check generalization
+/// (`egraph.rs::depends_on_eclass`) is load-bearing: `data[i]` is a compound
+/// `Load` node, not leaf-shaped, so the *old*, leaf-shape-only base rule
+/// would have left `derivative(data[i], w)` permanently stuck.
+#[test]
+fn derive_of_a_function_containing_a_statically_bounded_for_loop_computes_the_correct_derivative() {
+    let context = context();
+    let src = "
+        fn loss(w: f32) -> f32 {
+            let data: [f32; 3] = [1.0, 2.0, 3.0];
+            let mut total = 0.0;
+            for i in 0..3 {
+                total = total + w * data[i];
+            };
+            total
+        }
+        grad = derive(loss);
+        fn main() -> i32 {
+            let d: f32 = grad(10.0);
+            if d == 6.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// The real proof `build_pattern`'s own cross-algebra resolution and
+/// `NumberLit`-type fixes are load-bearing, not speculative: `stdlib/nn`'s
+/// own `Activation::tanh` derivative rule (`1 - tanh(x)^2`) needs `Ring`'s
+/// own `sub`/`mul` (a *different* algebra than the one the rule is declared
+/// on) and a real `Float` literal `1` (matching a real runtime `f32`, not
+/// the `Int`-shaped literal every rule used to build unconditionally).
+/// `expected` is computed independently, via ordinary cleave arithmetic
+/// calling the exact same underlying `Ring`/`Activation` units the
+/// synthesized `fprime` itself calls -- bit-identical IEEE754 results,
+/// checked with a plain `==`, no hand-computed literal to get subtly wrong.
+#[test]
+fn derive_of_tanh_uses_stdlib_nns_own_declared_derivative_rule() {
+    let context = context();
+    let src = "
+        use nn;
+        fn f(x: f32) -> f32 { tanh(x) }
+        fprime = derive(f);
+        fn main() -> i32 {
+            let x: f32 = 0.5;
+            let expected: f32 = 1.0 - tanh(x) * tanh(x);
+            let got: f32 = fprime(x);
+            if got == expected { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+// ---------------------------------------------------------------------
+// `doc/backlog.md`'s "Qualified-call syntax" item (`Ring::mul(a, b)`).
+// ---------------------------------------------------------------------
+
+/// The real proof, not just that it type-checks: `Foo` and `Bar` both
+/// declare `foo(x: i32) -> i32`, and both have an `impl ... <i32>` with a
+/// genuinely different body. Before this feature, `foo(5)` alone would be
+/// rejected as `AmbiguousOperator`; this exercises the *qualified* form for
+/// each one in the same program. This is also the exact collision shape
+/// `cps.rs::build_call_index`'s own key (method name + concrete arg/ret
+/// types, no algebra) can't distinguish — proving `Foo::foo(5)` and
+/// `Bar::foo(5)` actually run their own, different bodies (not silently the
+/// same one, e.g. from a `HashMap::insert` overwrite) is the direct
+/// end-to-end check that `monomorphize.rs` is routing each qualified call
+/// through `call_names` instead.
+#[test]
+fn qualified_calls_to_two_algebras_colliding_on_the_same_method_and_type_run_their_own_bodies() {
+    let context = context();
+    let src = "
+        algebra Foo<T> { fn foo(x: T) -> T; }
+        algebra Bar<T> { fn foo(x: T) -> T; }
+        impl Foo<i32> { fn foo(x) { x + 1 } }
+        impl Bar<i32> { fn foo(x) { x * 2 } }
+        fn main() -> i32 {
+            let a: i32 = Foo::foo(5);
+            let b: i32 = Bar::foo(5);
+            if a == 6 and b == 10 { 1 } else { 0 }
+        }
+    ";
     assert_eq!(run_i32(&context, src), 1);
 }

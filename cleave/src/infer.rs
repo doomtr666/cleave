@@ -610,6 +610,19 @@ pub enum TypeErrorKind {
     /// flagged as overlapping. See `dispatch_algebra_call`'s own doc
     /// comment for the fix and `match_impl`'s for why the two are split.
     AmbiguousDispatch { algebra: String, candidates: Vec<String> },
+    /// A qualified call (`Ring::mul(a, b)`) named a real, declared algebra,
+    /// but that algebra doesn't declare a method by this name (or not at
+    /// this arity) — `infer_call`'s own qualified-call path, checked
+    /// *before* `infer_algebra_call` (which assumes its own caller already
+    /// confirmed this, see its own `unreachable!` on this exact
+    /// precondition).
+    UnknownAlgebraMethod { algebra: String, method: String },
+    /// A const-generic division (`[T; N/M]`, or an explicit turbofish const
+    /// arg) whose divisor is already, concretely, zero — see `Infer::
+    /// pending_div_by_zero_checks`'s own doc comment for why this is
+    /// deferred rather than an immediate error at `const_value_from_expr`'s
+    /// own call site.
+    ConstDivByZero { dividend: u64 },
 }
 
 impl std::fmt::Display for TypeErrorKind {
@@ -686,6 +699,12 @@ impl std::fmt::Display for TypeErrorKind {
                     "ambiguous dispatch for `algebra {algebra}`: could resolve to any of {} — pin the remaining generic(s) explicitly (e.g. `name::<...>(...)`)",
                     candidates.join(", ")
                 )
+            }
+            TypeErrorKind::ConstDivByZero { dividend } => {
+                write!(f, "division by zero in a const-generic expression: `{dividend} / 0`")
+            }
+            TypeErrorKind::UnknownAlgebraMethod { algebra, method } => {
+                write!(f, "`algebra {algebra}` has no method `{method}` at this arity")
             }
         }
     }
@@ -1038,6 +1057,12 @@ fn check_mutability_expr(expr: &Expr, scope: &HashMap<String, bool>) -> Result<(
             inner.insert(var.clone(), false);
             check_mutability_block(body, &inner)
         }
+        ExprKind::ForIn { var, iter, body } => {
+            check_mutability_expr(iter, scope)?;
+            let mut inner = scope.clone();
+            inner.insert(var.clone(), false);
+            check_mutability_block(body, &inner)
+        }
         ExprKind::Block(b) => check_mutability_block(b, scope),
         // A lambda's own params shadow the outer scope for the duration of
         // its own body -- still walked, and still against the *outer*
@@ -1191,6 +1216,25 @@ pub struct Infer<'r> {
     /// `has_matching_impl`'s own doc comment already establishes for
     /// `self.subst`.
     pending_type_name_checks: Vec<(String, Span)>,
+    /// A const-generic division whose own divisor is *already* known,
+    /// concretely, to be zero (`dividend`, `span`) — `(u64, Span)`, checked
+    /// once at `finish_fn` time, the exact same deferred shape as
+    /// `pending_type_name_checks` right above (same reasoning: `const_
+    /// value_from_expr` has no natural `?`-propagation path either, called
+    /// from `ty_from_ast_mapped`'s `Array` arm and `generic_arg_to_ty`).
+    /// Pushed from `const_value_from_expr` itself: `const_eval::eval_binop`
+    /// only ever returns `None` for `"div"` when the divisor is zero (every
+    /// other unrecognized-operator/shape case is handled before reaching
+    /// `"div"` at all), so a zero-divisor is the *only* way a `div` call
+    /// with two already-`Ty::Const` operands can fail there — found
+    /// directly, empirically, while adding `div`/`neg` const-eval support:
+    /// left unchecked, this would otherwise build a `Ty::ConstExpr("div",
+    /// N, 0)` that can never resolve further (both operands are already
+    /// concrete) and silently survive all the way to `mlir_lower.rs`'s own
+    /// codegen-time panic for an unresolved deferred const expression — a
+    /// confusing message, not a real, located compile error, for something
+    /// 100% certain and detectable right here.
+    pending_div_by_zero_checks: Vec<(u64, Span)>,
     /// (struct, method) -> (param types, return-type placeholder) for
     /// whichever *inherent* method is currently having its own body
     /// inferred (`infer_inherent_impl_fn_generic`) — the impl-method
@@ -1328,6 +1372,7 @@ impl<'r> Infer<'r> {
             active_generics: HashMap::new(),
             quantified: HashSet::new(),
             pending_type_name_checks: Vec::new(),
+            pending_div_by_zero_checks: Vec::new(),
             in_progress_methods: HashMap::new(),
             lambda_schemes: HashMap::new(),
             inherent_patterns: None,
@@ -2326,7 +2371,8 @@ impl<'r> Infer<'r> {
             // whichever one member's body produced it.
             let outcome = self
                 .infer_inherent_impl_fn_raw(outer, impl_generics, &impl_mapping, &target_ty, param_types, ret_var, f, fallback_span)
-                .and_then(|ty| self.check_pending_type_names().map(|()| ty));
+                .and_then(|ty| self.check_pending_type_names().map(|()| ty))
+                .and_then(|ty| self.check_pending_div_by_zero().map(|()| ty));
             raw_results.insert(f.name.clone(), outcome);
         }
 
@@ -2428,6 +2474,7 @@ impl<'r> Infer<'r> {
         // default, don't just assume defaulting made it automatically fine.
         self.check_pending_constraints_and_indices()?;
         self.check_pending_type_names()?;
+        self.check_pending_div_by_zero()?;
         // Same reasoning as `check_pending_constraints` above — a field
         // access/method call deferred because its base was still a bare
         // `Ty::Var` at the point it was written now has its answer, one way
@@ -3319,6 +3366,17 @@ impl<'r> Infer<'r> {
         }
     }
 
+    /// Drains `pending_div_by_zero_checks`, failing on the first entry —
+    /// same deferred shape and same reasoning as `check_pending_type_names`
+    /// right above (see that field's own doc comment); called from the
+    /// identical sites for the identical reason.
+    pub(crate) fn check_pending_div_by_zero(&mut self) -> Result<(), TypeError> {
+        match std::mem::take(&mut self.pending_div_by_zero_checks).into_iter().next() {
+            Some((dividend, span)) => Err(TypeError { span, kind: TypeErrorKind::ConstDivByZero { dividend } }),
+            None => Ok(()),
+        }
+    }
+
     /// Drains `pending_field_accesses`, called from the same three sites as
     /// `check_pending_constraints`, right after `apply_defaults` — by then,
     /// any base whose only concreteness came from literal-defaulting has
@@ -3689,6 +3747,17 @@ impl<'r> Infer<'r> {
                 let a = self.const_value_from_expr(&args[0], mapping)?;
                 let b = self.const_value_from_expr(&args[1], mapping)?;
                 if let (Ty::Const(av), Ty::Const(bv)) = (&a, &b) {
+                    // The *only* way `eval_binop("div", ...)` returns `None`
+                    // for two already-concrete operands is a zero divisor
+                    // (see `pending_div_by_zero_checks`'s own doc comment) —
+                    // queue a real, located error rather than letting the
+                    // fallback below build a `ConstExpr` that can never
+                    // resolve further.
+                    if path.segments[0] == "div" {
+                        if let (ConstValue::Int(dividend), ConstValue::Int(0)) = (*av, *bv) {
+                            self.pending_div_by_zero_checks.push((dividend, value.span));
+                        }
+                    }
                     return const_eval::eval_binop(&path.segments[0], *av, *bv).map(Ty::Const);
                 }
                 Some(Ty::ConstExpr(path.segments[0].clone(), Box::new(a), Box::new(b)))
@@ -3991,6 +4060,23 @@ impl<'r> Infer<'r> {
                 // `infer_block` clones `inner_env` again internally — the
                 // same cheap-clone tradeoff `Lambda`'s own handling above
                 // already makes.
+                self.infer_block(&inner_env, body)?;
+                Ok(Ty::Con("()".to_string()))
+            }
+            // `iter` must be a real, homogeneous array — unifying against a
+            // fresh `Ty::Array(elem, size)` directly (not routed through
+            // `resolve_index`'s own dual-path array/algebra-dispatch
+            // machinery, which exists for `arr[i]`'s own `Index<...>`-trait
+            // fallback — irrelevant here, this is specifically about a real
+            // array) gets the ordinary `Mismatch` diagnostic for a non-array
+            // `iter` for free, no new `TypeErrorKind` needed.
+            ExprKind::ForIn { var, iter, body } => {
+                let iter_ty = self.infer_expr(env, iter)?;
+                let elem_ty = self.vars.fresh();
+                let size_ty = self.vars.fresh();
+                self.unify_at(iter.span, &Ty::Array(Box::new(elem_ty.clone()), Box::new(size_ty)), &iter_ty)?;
+                let mut inner_env = env.clone();
+                inner_env.insert(var.clone(), Scheme::mono(elem_ty));
                 self.infer_block(&inner_env, body)?;
                 Ok(Ty::Con("()".to_string()))
             }
@@ -4359,6 +4445,37 @@ impl<'r> Infer<'r> {
         explicit_generics: &[GenericArg],
         args: &[Expr],
     ) -> Result<Ty, TypeError> {
+        // Qualified call (`Ring::mul(a, b)`) — `doc/backlog-done.md`'s own
+        // "qualified-call syntax" item: disambiguates when more than one
+        // algebra would otherwise own this name+arity (`AmbiguousOperator`,
+        // below) by naming the intended algebra explicitly, `doc/grammar.md`'s
+        // own already-documented design for this. Checked *before* the
+        // ordinary unqualified path: a 2-segment `path` whose first segment
+        // names a real, declared algebra is unambiguously a qualified call —
+        // operator sugar (`a * b`) can never accidentally reach here, `lower.
+        // rs`'s own `fold_binary` always builds a single-segment `Path::
+        // single(name)`. Any other 2-segment path (naming something that
+        // isn't a declared algebra) falls through to the unqualified path
+        // below, unchanged.
+        if let [algebra, method] = path.segments.as_slice() {
+            if self.registry.has_algebra(algebra) {
+                let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer_expr(env, a)).collect::<Result<_, _>>()?;
+                // `infer_algebra_call` itself `unreachable!()`s if `fn_sig`
+                // misses — it assumes its own caller already confirmed the
+                // method exists (its one existing caller only ever reaches it
+                // via an already-`algebras_with_fn`-confirmed candidate) — so
+                // this check has to happen here, not there.
+                if !self.registry.fn_sig(algebra, method).is_some_and(|sig| sig.params.len() == args.len()) {
+                    return Err(TypeError {
+                        span: call_span,
+                        kind: TypeErrorKind::UnknownAlgebraMethod { algebra: algebra.clone(), method: method.clone() },
+                    });
+                }
+                let arg_spans: Vec<Span> = args.iter().map(|a| a.span).collect();
+                return self.infer_algebra_call(call_span, algebra, method, &arg_tys, &arg_spans, explicit_generics);
+            }
+        }
+
         let name = path.segments.join("::");
         let arg_tys: Vec<Ty> = args
             .iter()

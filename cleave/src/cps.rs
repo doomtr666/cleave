@@ -118,6 +118,17 @@ pub enum UnitBody {
     /// Carried into `PrimOp::Extern` — see that variant's own doc comment
     /// for why a real C call is a straight-line `LetPrim`, not a `Fix`.
     Extern(String),
+    /// `fprime = derive(f);` (`ast.rs`'s own `FnDecl::derivative_of`) — the
+    /// base function's own name. No `Block` exists for this unit at all
+    /// (there's no cleave-level body to CPS-convert — see `derivative_of`'s
+    /// own doc comment): `convert_program` skips a `Derivative`-bodied unit
+    /// entirely, same as it already does for `Extern` (`let UnitBody::Real
+    /// (body) = &unit.body else { continue };`), *not* because it never
+    /// gets a real body at all — unlike `Extern`, it does, just built much
+    /// later (`egraph.rs::synthesize_derivatives`, which needs `f`'s own
+    /// body *already* CPS-converted first, hence strictly after
+    /// `convert_program` returns, not during it).
+    Derivative(String),
 }
 
 pub struct ConcreteUnit {
@@ -262,13 +273,15 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                     // Non-generic. A bodyless top-level `fn` is rejected by
                     // `callgraph::infer_program` itself (`MissingFnBody`) --
                     // `results` would hold an `Err` there, not `Ok` -- with
-                    // exactly one exception: `f.is_extern` (see `ast.rs`'s
-                    // own `FnDecl::is_extern` doc comment), which
+                    // exactly two exceptions: `f.is_extern` (see `ast.rs`'s
+                    // own `FnDecl::is_extern` doc comment) and `f.
+                    // derivative_of` (`fprime = derive(f);`), both of which
                     // `callgraph.rs` accepts bodyless on purpose. So `f.body`
-                    // is `Some` at this point *unless* `f.is_extern`.
+                    // is `Some` at this point unless one of those two.
                     let body = match &f.body {
                         Some(b) => UnitBody::Real(b.clone()),
                         None if f.is_extern => UnitBody::Extern(f.extern_symbol.clone().unwrap_or_else(|| f.name.clone())),
+                        None if f.derivative_of.is_some() => UnitBody::Derivative(f.derivative_of.clone().unwrap()),
                         None => continue,
                     };
                     units.push(ConcreteUnit {
@@ -1573,6 +1586,85 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                 }
             })
         }),
+        // `doc/backlog-done.md`'s own "`for x in array`" item — element-based
+        // iteration over a real, homogeneous array. Reuses `ExprKind::For`'s
+        // own `Fix`-building shape almost verbatim right above (`mutated_
+        // free_vars`, the `lt`/`add` synthetic-binop resolution, the carried-
+        // vars machinery) rather than reinventing it — `start`/`end` are
+        // always `0`/the array's own known size (`ctx.node_types[&iter.id]`,
+        // guaranteed a concrete `Ty::Array(_, Ty::Const(_))` here, monomorphization
+        // has already run), and `idx_ty` is always plain `i32` (no user-written
+        // bound expression to recover a different width from). The one real
+        // difference: `body_env` gets one extra `LetPrim{Load}` binding `var`
+        // to the *loaded element*, not the index — exactly the way
+        // `ExprKind::Index`'s own conversion just below already builds a
+        // `Load` — so `body` (the user's own AST, referencing `var`) needs no
+        // rewriting at all, it just resolves `var` through the environment
+        // like any other local, same as `var` already resolving to the
+        // *index* CVar in the range-based `For` arm right above.
+        ExprKind::ForIn { var, iter, body } => convert_expr(iter, env, ctx, &|iter_val, env| {
+            let array_ty = ctx.node_types[&iter.id].clone();
+            let (elem_ty, n) = match &array_ty {
+                Ty::Array(elem, size) => match size.as_ref() {
+                    Ty::Const(ConstValue::Int(n)) => ((**elem).clone(), *n),
+                    other => panic!("CPS: for-in over an array with a non-concrete size {other:?} -- should have been resolved by monomorphization"),
+                },
+                other => panic!("CPS: for-in over a non-array type {other:?} -- infer.rs should have rejected this already"),
+            };
+
+            let mut shadowed = HashSet::new();
+            shadowed.insert(var.clone());
+            let mutated: HashMap<String, Ty> = mutated_free_vars(body, &shadowed, ctx);
+            let mut names: Vec<String> = mutated.keys().cloned().collect();
+            names.sort();
+            let carried: Vec<(String, CVar)> = names.iter().map(|n| (n.clone(), ctx.fresh.var())).collect();
+            let carried_types: Vec<Ty> = names.iter().map(|n| mutated[n].clone()).collect();
+
+            let idx_ty = Ty::Con("i32".to_string());
+            let bool_ty = Ty::Con("bool".to_string());
+            let lt_unit = resolve_synthetic_binop("lt", &idx_ty, &bool_ty, ctx).to_string();
+            let add_unit = resolve_synthetic_binop("add", &idx_ty, &idx_ty, ctx).to_string();
+            let i_var = ctx.fresh.var();
+            let loop_label = ctx.fresh.label("loop");
+
+            let mut body_env = env.clone();
+            for (name, v) in &carried {
+                body_env.insert(name.clone(), CVal::Var(*v));
+            }
+
+            let cond_check = emit_call(&lt_unit, vec![CVal::Var(i_var), CVal::Int(n)], bool_ty, ctx, &body_env, &|cond_val, cond_env| {
+                let elem_var = ctx.fresh.var();
+                let mut elem_env = cond_env.clone();
+                elem_env.insert(var.clone(), CVal::Var(elem_var));
+                let then_cexpr = CExpr::LetPrim {
+                    var: elem_var,
+                    ty: elem_ty.clone(),
+                    op: PrimOp::Load { array_ty: array_ty.clone() },
+                    args: vec![iter_val.clone(), CVal::Var(i_var)],
+                    cont: Box::new(convert_block(body, &elem_env, ctx, &|_v, body_end_env| {
+                        emit_call(&add_unit, vec![CVal::Var(i_var), CVal::Int(1)], idx_ty.clone(), ctx, body_end_env, &|next_i, incr_env| {
+                            let mut args = vec![next_i];
+                            args.extend(gather_carried(&carried, incr_env));
+                            CExpr::App { func: CVal::Label(loop_label.clone()), args }
+                        })
+                    })),
+                };
+                let else_cexpr = k(CVal::Unit, cond_env);
+                CExpr::If { cond: cond_val, then_branch: Box::new(then_cexpr), else_branch: Box::new(else_cexpr) }
+            });
+
+            let mut params = vec![i_var];
+            params.extend(carried.iter().map(|(_, v)| *v));
+            let mut init_args = vec![CVal::Int(0)];
+            init_args.extend(gather_carried(&carried, env));
+            let mut all_carried_types = vec![idx_ty.clone()];
+            all_carried_types.extend(carried_types);
+
+            CExpr::Fix {
+                defs: vec![CFunDef { name: loop_label.clone(), params, body: cond_check, carried_types: Some(all_carried_types) }],
+                body: Box::new(CExpr::App { func: CVal::Label(loop_label), args: init_args }),
+            }
+        }),
         // Collapses a whole chain of nested `Index` nodes into one combined,
         // multi-index `Load` -- see `StmtKind::Assign`'s own `Index` arm for
         // why (the same reasoning applies to reads, for consistency, even
@@ -1833,6 +1925,13 @@ fn mutated_free_vars_expr(expr: &Expr, shadowed: &HashSet<String>, ctx: &Ctx) ->
             out.extend(mutated_free_vars(body, &inner, ctx));
             out
         }
+        ExprKind::ForIn { var, iter, body } => {
+            let mut out = mutated_free_vars_expr(iter, shadowed, ctx);
+            let mut inner = shadowed.clone();
+            inner.insert(var.clone());
+            out.extend(mutated_free_vars(body, &inner, ctx));
+            out
+        }
         ExprKind::Block(b) => mutated_free_vars(b, shadowed, ctx),
         // A lambda's own body isn't walked here -- lambdas aren't converted
         // at all yet (closure conversion is a separate, later pass this
@@ -1961,6 +2060,13 @@ fn lambda_free_vars_expr(expr: &Expr, shadowed: &HashSet<String>, node_types: &H
             out.extend(lambda_free_vars_block(body, &inner, node_types));
             out
         }
+        ExprKind::ForIn { var, iter, body } => {
+            let mut out = lambda_free_vars_expr(iter, shadowed, node_types);
+            let mut inner = shadowed.clone();
+            inner.insert(var.clone());
+            out.extend(lambda_free_vars_block(body, &inner, node_types));
+            out
+        }
         ExprKind::Block(b) => lambda_free_vars_block(b, shadowed, node_types),
         ExprKind::Lambda { params, body, .. } => {
             let mut inner = shadowed.clone();
@@ -2032,7 +2138,13 @@ fn emit_call(unit_name: &str, arg_vals: Vec<CVal>, result_ty: Ty, ctx: &Ctx, env
                 cont: Box::new(k(CVal::Var(var), env)),
             }
         }
-        UnitBody::Real(_) => {
+        // `Derivative` shares `Real`'s own calling convention exactly — by
+        // the time any *call site* is converted, `fprime` is semantically
+        // an ordinary, real, continuation-passing callee; its own body
+        // just isn't attached yet at this point in the pipeline (`UnitBody`'s
+        // own doc comment) — nothing here needs to look at that body,
+        // only at `unit_name` itself (resolved later, by name).
+        UnitBody::Real(_) | UnitBody::Derivative(_) => {
             let result_var = ctx.fresh.var();
             let k_label = ctx.fresh.label("k");
             let mut call_args = arg_vals;

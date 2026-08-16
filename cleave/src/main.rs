@@ -15,11 +15,11 @@
 //! pass sit next to each other. More `--dump-*` flags arrive as more passes
 //! do (CPS conversion, ...).
 
-use cleave::cps::{collect_mlir_types, collect_struct_schemas, collect_units, convert_program, dump_cps_program, eliminate_dead_code};
+use cleave::cps::{collect_mlir_types, collect_struct_schemas, collect_units, convert_program, dump_cps_program, eliminate_dead_code, CpsProgram, UnitBody};
 use cleave::diag::SourceMap;
 use cleave::driver::compile;
 use cleave::dump::dump_program;
-use cleave::egraph::optimize_program;
+use cleave::egraph::{optimize_program, synthesize_derivatives, DerivativeRequest};
 use cleave::mlir_lower::lower_program;
 use cleave::monomorphize::dump_monomorphized;
 use cleave::print::print_program;
@@ -224,10 +224,18 @@ fn main() -> ExitCode {
             report(&diags, &sources);
             exit = ExitCode::FAILURE;
         } else {
-            let units = collect_units(&program, &registry);
-            let cps_program = convert_program(units);
-            let cps_program = eliminate_dead_code(cps_program);
-            print!("{}", dump_cps_program(&cps_program));
+            match build_cps_program(&program, &registry) {
+                Ok(cps_program) => {
+                    let cps_program = eliminate_dead_code(cps_program);
+                    print!("{}", dump_cps_program(&cps_program));
+                }
+                Err(errs) => {
+                    for e in &errs {
+                        eprintln!("error: {e}");
+                    }
+                    exit = ExitCode::FAILURE;
+                }
+            }
         }
     }
 
@@ -240,22 +248,31 @@ fn main() -> ExitCode {
             report(&diags, &sources);
             exit = ExitCode::FAILURE;
         } else {
-            let units = collect_units(&program, &registry);
-            let cps_program = convert_program(units);
-            let cps_program = eliminate_dead_code(cps_program);
-            let (optimized, _) = optimize_program(cps_program, &registry);
-            // A second sweep: `optimize_program` can itself fold away every
-            // remaining call to a stdlib specialization (e.g. `10 + x - 10`
-            // reducing to `x` via axioms) — the first sweep, run *before*
-            // optimization, has no way to know that in advance, so a unit
-            // only unreachable *after* axiom rewriting would otherwise
-            // survive despite having zero real callers left. Found by
-            // direct testing (`examples/axiom_demo.cleave`): `Ring::add<i32>`/
-            // `Ring::sub<i32>` remained in `--dump-cps-optimized`'s own
-            // output even though `helper`'s optimized body no longer called
-            // either.
-            let optimized = eliminate_dead_code(optimized);
-            print!("{}", dump_cps_program(&optimized));
+            match build_cps_program(&program, &registry) {
+                Ok(cps_program) => {
+                    let cps_program = eliminate_dead_code(cps_program);
+                    let (optimized, _) = optimize_program(cps_program, &registry);
+                    // A second sweep: `optimize_program` can itself fold away
+                    // every remaining call to a stdlib specialization (e.g.
+                    // `10 + x - 10` reducing to `x` via axioms) — the first
+                    // sweep, run *before* optimization, has no way to know
+                    // that in advance, so a unit only unreachable *after*
+                    // axiom rewriting would otherwise survive despite having
+                    // zero real callers left. Found by direct testing
+                    // (`examples/axiom_demo.cleave`): `Ring::add<i32>`/
+                    // `Ring::sub<i32>` remained in `--dump-cps-optimized`'s
+                    // own output even though `helper`'s optimized body no
+                    // longer called either.
+                    let optimized = eliminate_dead_code(optimized);
+                    print!("{}", dump_cps_program(&optimized));
+                }
+                Err(errs) => {
+                    for e in &errs {
+                        eprintln!("error: {e}");
+                    }
+                    exit = ExitCode::FAILURE;
+                }
+            }
         }
     }
 
@@ -268,15 +285,23 @@ fn main() -> ExitCode {
             report(&diags, &sources);
             exit = ExitCode::FAILURE;
         } else {
-            let units = collect_units(&program, &registry);
-            let cps_program = convert_program(units);
-            let cps_program = eliminate_dead_code(cps_program);
-            let (_, explanations) = optimize_program(cps_program, &registry);
-            if explanations.is_empty() {
-                println!("(no axiom rewrites fired)");
-            } else {
-                for e in &explanations {
-                    println!("{e}");
+            match build_cps_program(&program, &registry) {
+                Ok(cps_program) => {
+                    let cps_program = eliminate_dead_code(cps_program);
+                    let (_, explanations) = optimize_program(cps_program, &registry);
+                    if explanations.is_empty() {
+                        println!("(no axiom rewrites fired)");
+                    } else {
+                        for e in &explanations {
+                            println!("{e}");
+                        }
+                    }
+                }
+                Err(errs) => {
+                    for e in &errs {
+                        eprintln!("error: {e}");
+                    }
+                    exit = ExitCode::FAILURE;
                 }
             }
         }
@@ -291,31 +316,40 @@ fn main() -> ExitCode {
             report(&diags, &sources);
             exit = ExitCode::FAILURE;
         } else {
-            let units = collect_units(&program, &registry);
-            let cps_program = convert_program(units);
-            let cps_program = eliminate_dead_code(cps_program);
-            let (cps_program, _) = optimize_program(cps_program, &registry);
-            // See `--dump-cps-optimized`'s own comment above: a second
-            // sweep is needed to catch a unit `optimize_program` itself
-            // made unreachable (e.g. an axiom folding away every remaining
-            // call to it), which the first sweep — run before optimization
-            // — has no way to anticipate.
-            let cps_program = eliminate_dead_code(cps_program);
+            match build_cps_program(&program, &registry) {
+                Ok(cps_program) => {
+                    let cps_program = eliminate_dead_code(cps_program);
+                    let (cps_program, _) = optimize_program(cps_program, &registry);
+                    // See `--dump-cps-optimized`'s own comment above: a
+                    // second sweep is needed to catch a unit `optimize_
+                    // program` itself made unreachable (e.g. an axiom
+                    // folding away every remaining call to it), which the
+                    // first sweep — run before optimization — has no way to
+                    // anticipate.
+                    let cps_program = eliminate_dead_code(cps_program);
 
-            let dialect_registry = DialectRegistry::new();
-            register_all_dialects(&dialect_registry);
-            let context = Context::new();
-            context.append_dialect_registry(&dialect_registry);
-            context.load_all_available_dialects();
+                    let dialect_registry = DialectRegistry::new();
+                    register_all_dialects(&dialect_registry);
+                    let context = Context::new();
+                    context.append_dialect_registry(&dialect_registry);
+                    context.load_all_available_dialects();
 
-            let mlir_types = collect_mlir_types(&program);
-            let struct_schemas = collect_struct_schemas(&program);
-            let module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
-            if !module.as_operation().verify() {
-                eprintln!("error: generated MLIR module failed verification");
-                exit = ExitCode::FAILURE;
-            } else {
-                print!("{}", module.as_operation());
+                    let mlir_types = collect_mlir_types(&program);
+                    let struct_schemas = collect_struct_schemas(&program);
+                    let module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
+                    if !module.as_operation().verify() {
+                        eprintln!("error: generated MLIR module failed verification");
+                        exit = ExitCode::FAILURE;
+                    } else {
+                        print!("{}", module.as_operation());
+                    }
+                }
+                Err(errs) => {
+                    for e in &errs {
+                        eprintln!("error: {e}");
+                    }
+                    exit = ExitCode::FAILURE;
+                }
             }
         }
     }
@@ -329,65 +363,76 @@ fn main() -> ExitCode {
             report(&diags, &sources);
             exit = ExitCode::FAILURE;
         } else {
-            let units = collect_units(&program, &registry);
-            let cps_program = convert_program(units);
-            let cps_program = eliminate_dead_code(cps_program);
-            let (cps_program, _) = optimize_program(cps_program, &registry);
-            // See `--dump-cps-optimized`'s own comment above: a second
-            // sweep is needed to catch a unit `optimize_program` itself
-            // made unreachable (e.g. an axiom folding away every remaining
-            // call to it), which the first sweep — run before optimization
-            // — has no way to anticipate.
-            let cps_program = eliminate_dead_code(cps_program);
+            match build_cps_program(&program, &registry) {
+                Ok(cps_program) => {
+                    let cps_program = eliminate_dead_code(cps_program);
+                    let (cps_program, _) = optimize_program(cps_program, &registry);
+                    // See `--dump-cps-optimized`'s own comment above: a
+                    // second sweep is needed to catch a unit `optimize_
+                    // program` itself made unreachable (e.g. an axiom
+                    // folding away every remaining call to it), which the
+                    // first sweep — run before optimization — has no way to
+                    // anticipate.
+                    let cps_program = eliminate_dead_code(cps_program);
 
-            let dialect_registry = DialectRegistry::new();
-            register_all_dialects(&dialect_registry);
-            let context = Context::new();
-            context.append_dialect_registry(&dialect_registry);
-            context.load_all_available_dialects();
+                    let dialect_registry = DialectRegistry::new();
+                    register_all_dialects(&dialect_registry);
+                    let context = Context::new();
+                    context.append_dialect_registry(&dialect_registry);
+                    context.load_all_available_dialects();
 
-            let mlir_types = collect_mlir_types(&program);
-            let struct_schemas = collect_struct_schemas(&program);
-            let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
-            if !module.as_operation().verify() {
-                eprintln!("error: generated MLIR module failed verification");
-                exit = ExitCode::FAILURE;
-            } else {
-                // Mirrors `--run`'s own pass pipeline exactly, right up to
-                // (not including) JIT invocation -- this *is* the form that
-                // actually gets handed to the `ExecutionEngine`, `llvm.*`
-                // dialect ops standing in for real textual LLVM IR (melior/
-                // mlir-sys, as vendored, don't expose `mlirTranslateModule
-                // ToLLVMIR` at all -- real `.ll` text isn't reachable
-                // without adding a raw FFI binding ourselves).
-                // Staged as three *separate* `PassManager`s, each run to
-                // completion before the next is even built — see `--run`'s
-                // own identical pipeline below for the full reasoning
-                // (found by direct testing to matter, not just tidier).
-                let pass_manager = pass::PassManager::new(&context);
-                pass_manager.add_pass(pass::linalg::create_convert_elementwise_to_linalg_pass());
-                let ok = pass_manager.run(&mut module).is_ok();
+                    let mlir_types = collect_mlir_types(&program);
+                    let struct_schemas = collect_struct_schemas(&program);
+                    let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
+                    if !module.as_operation().verify() {
+                        eprintln!("error: generated MLIR module failed verification");
+                        exit = ExitCode::FAILURE;
+                    } else {
+                        // Mirrors `--run`'s own pass pipeline exactly, right
+                        // up to (not including) JIT invocation -- this *is*
+                        // the form that actually gets handed to the
+                        // `ExecutionEngine`, `llvm.*` dialect ops standing in
+                        // for real textual LLVM IR (melior/mlir-sys, as
+                        // vendored, don't expose `mlirTranslateModuleToLLVMIR`
+                        // at all -- real `.ll` text isn't reachable without
+                        // adding a raw FFI binding ourselves).
+                        // Staged as three *separate* `PassManager`s, each run
+                        // to completion before the next is even built — see
+                        // `--run`'s own identical pipeline below for the full
+                        // reasoning (found by direct testing to matter, not
+                        // just tidier).
+                        let pass_manager = pass::PassManager::new(&context);
+                        pass_manager.add_pass(pass::linalg::create_convert_elementwise_to_linalg_pass());
+                        let ok = pass_manager.run(&mut module).is_ok();
 
-                let pass_manager = pass::PassManager::new(&context);
-                pass::bufferization::register_one_shot_bufferize_pass();
-                let ok = ok
-                    && parse_pass_pipeline(
-                        pass_manager.as_operation_pass_manager(),
-                        "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})",
-                    )
-                    .is_ok()
-                    && pass_manager.run(&mut module).is_ok();
+                        let pass_manager = pass::PassManager::new(&context);
+                        pass::bufferization::register_one_shot_bufferize_pass();
+                        let ok = ok
+                            && parse_pass_pipeline(
+                                pass_manager.as_operation_pass_manager(),
+                                "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})",
+                            )
+                            .is_ok()
+                            && pass_manager.run(&mut module).is_ok();
 
-                let pass_manager = pass::PassManager::new(&context);
-                pass_manager.add_pass(pass::linalg::create_convert_linalg_to_loops_pass());
-                pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
-                pass_manager.add_pass(pass::conversion::create_to_llvm());
-                pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-                if !ok || pass_manager.run(&mut module).is_err() {
-                    eprintln!("error: MLIR-to-LLVM lowering pass failed");
+                        let pass_manager = pass::PassManager::new(&context);
+                        pass_manager.add_pass(pass::linalg::create_convert_linalg_to_loops_pass());
+                        pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
+                        pass_manager.add_pass(pass::conversion::create_to_llvm());
+                        pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
+                        if !ok || pass_manager.run(&mut module).is_err() {
+                            eprintln!("error: MLIR-to-LLVM lowering pass failed");
+                            exit = ExitCode::FAILURE;
+                        } else {
+                            print!("{}", module.as_operation());
+                        }
+                    }
+                }
+                Err(errs) => {
+                    for e in &errs {
+                        eprintln!("error: {e}");
+                    }
                     exit = ExitCode::FAILURE;
-                } else {
-                    print!("{}", module.as_operation());
                 }
             }
         }
@@ -408,8 +453,15 @@ fn main() -> ExitCode {
             report(&diags, &sources);
             return ExitCode::FAILURE;
         }
-        let units = collect_units(&program, &registry);
-        let cps_program = convert_program(units);
+        let cps_program = match build_cps_program(&program, &registry) {
+            Ok(p) => p,
+            Err(errs) => {
+                for e in &errs {
+                    eprintln!("error: {e}");
+                }
+                return ExitCode::FAILURE;
+            }
+        };
         let cps_program = eliminate_dead_code(cps_program);
         let (cps_program, _) = optimize_program(cps_program, &registry);
         // See `--dump-cps-optimized`'s own comment above: a second sweep is
@@ -554,6 +606,29 @@ fn report(diags: &[cleave::diag::Diagnostic], sources: &SourceMap) {
 /// never seeded for monomorphization, which used to reach CPS conversion
 /// anyway and panic there with a low-level, confusing message instead of
 /// this clean diagnostic -- found by direct testing.
+/// `collect_units` + `convert_program` + `synthesize_derivatives`, bundled
+/// — every one of this file's own six pipeline entry points needs all
+/// three, in this exact order (`synthesize_derivatives` needs `f`'s own
+/// already-CPS-converted body, so strictly after `convert_program`, and
+/// strictly before the first `eliminate_dead_code` so a synthesized
+/// `fprime`'s own real calls are already visible to it) — extracted here
+/// specifically to avoid repeating the `Vec<DerivativeRequest>` extraction
+/// six times over, unlike `eliminate_dead_code`/`optimize_program`'s own
+/// sequencing just after, which genuinely does vary per call site (a second
+/// dead-code sweep here, an explanations dump there) and stays inline.
+fn build_cps_program(program: &cleave::ast::Program, registry: &Registry) -> Result<CpsProgram, Vec<String>> {
+    let units = collect_units(program, registry);
+    let requests: Vec<DerivativeRequest> = units
+        .iter()
+        .filter_map(|u| match &u.body {
+            UnitBody::Derivative(of) => Some(DerivativeRequest { name: u.name.clone(), of: of.clone() }),
+            _ => None,
+        })
+        .collect();
+    let cps_program = convert_program(units);
+    synthesize_derivatives(cps_program, &requests, registry)
+}
+
 fn check_type_errors(program: &cleave::ast::Program, registry: &Registry) -> Result<(), Vec<cleave::diag::Diagnostic>> {
     let (_, errs) = cleave::monomorphize::dump_monomorphized(program, registry);
     let mut diags: Vec<cleave::diag::Diagnostic> = errs.iter().map(cleave::diag::Diagnostic::from).collect();

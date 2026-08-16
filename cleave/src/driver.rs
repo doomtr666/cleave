@@ -297,7 +297,86 @@ pub fn compile(
         return (Err(errors), sources);
     }
 
-    (merge_programs(programs), sources)
+    let result = merge_programs(programs).and_then(|program| synthesize_derive_signatures(program, &mut node_ids));
+    (result, sources)
+}
+
+/// `fprime = derive(f);` (`grammar.pest`'s own `derive_decl`, lowered by
+/// `lower.rs` to an ordinary bodyless `ItemKind::Fn` with `derivative_of:
+/// Some("f")`) has no `params`/`ret` of its own yet at this point —
+/// `lower.rs` has no way to know `f`'s own signature, possibly declared in
+/// a different file entirely, only merged into one `Program` by
+/// `merge_programs`, right before this runs. Mechanically derived, never
+/// written by hand: `f` itself must already be a real, non-generic
+/// function with every parameter *and* its own return type explicitly
+/// declared as the exact same type `T` (checked by comparing each one's
+/// own formatted text — `print.rs::fmt_type` — not full type inference,
+/// which hasn't run yet at this point in the pipeline) — `N == 1`
+/// parameter synthesizes `fn fprime(x: T) -> T` (an ordinary scalar
+/// derivative); `N > 1` synthesizes `fn fprime(x1: T, ..., xN: T) -> [T;
+/// N]` (the gradient/Jacobian row, reusing the array type that already
+/// exists rather than needing tuples, which aren't implemented).
+/// Heterogeneous parameter types, a missing/generic/nullary `f`, or any
+/// unannotated parameter on `f` — every one a real, located `Diagnostic`,
+/// never guessed.
+fn synthesize_derive_signatures(mut program: Program, node_ids: &mut NodeIdGen) -> Result<Program, Vec<Diagnostic>> {
+    let fns: HashMap<String, FnDecl> = program
+        .items
+        .iter()
+        .filter_map(|item| match &item.kind {
+            ItemKind::Fn(f) => Some((f.name.clone(), f.clone())),
+            _ => None,
+        })
+        .collect();
+
+    let mut errors = Vec::new();
+    for item in &mut program.items {
+        let ItemKind::Fn(fprime) = &mut item.kind else { continue };
+        let Some(of) = fprime.derivative_of.clone() else { continue };
+
+        let Some(f) = fns.get(&of) else {
+            errors.push(Diagnostic::error(format!("`derive({of})`: no function named `{of}`"), item.span));
+            continue;
+        };
+        if !f.generics.is_empty() {
+            errors.push(Diagnostic::error(format!("`derive({of})`: `{of}` is generic — only a non-generic function can be derived"), item.span));
+            continue;
+        }
+        if f.params.is_empty() {
+            errors.push(Diagnostic::error(format!("`derive({of})`: `{of}` takes no parameters — nothing to differentiate with respect to"), item.span));
+            continue;
+        }
+        let Some(ret) = &f.ret else {
+            errors.push(Diagnostic::error(format!("`derive({of})`: `{of}` has no declared return type"), item.span));
+            continue;
+        };
+        let Some(param_tys): Option<Vec<&Type>> = f.params.iter().map(|p| p.ty.as_ref()).collect() else {
+            errors.push(Diagnostic::error(format!("`derive({of})`: every parameter of `{of}` must have an explicit type"), item.span));
+            continue;
+        };
+        let ret_text = fmt_type(ret);
+        if param_tys.iter().any(|t| fmt_type(t) != ret_text) {
+            errors.push(Diagnostic::error(
+                format!("`derive({of})`: every parameter of `{of}`, and its own return type, must be the same type `{ret_text}` — heterogeneous types aren't supported yet"),
+                item.span,
+            ));
+            continue;
+        }
+
+        fprime.params = f.params.clone();
+        fprime.ret = Some(if f.params.len() == 1 {
+            ret.clone()
+        } else {
+            let size = Node {
+                id: node_ids.next(),
+                span: ret.span,
+                kind: ExprKind::NumberLit { text: f.params.len().to_string(), suffix: None },
+            };
+            Node { id: node_ids.next(), span: ret.span, kind: TypeKind::Array(Box::new(ret.clone()), Box::new(size)) }
+        });
+    }
+
+    if errors.is_empty() { Ok(program) } else { Err(errors) }
 }
 
 /// One node of `compile`'s own transitive crate-resolution DFS — see that
@@ -395,6 +474,11 @@ struct AlgebraAcc {
     decl: AlgebraDecl,
     seen_fn_sigs: HashMap<(String, Vec<String>), Span>,
     seen_axioms: HashMap<String, Span>,
+    /// Keyed by the method name being differentiated (`DerivativeRuleDecl`
+    /// has no separate rule name of its own, unlike `AxiomDecl` — the
+    /// method already is the identity, mirrors `seen_axioms` exactly
+    /// otherwise).
+    seen_derivative_rules: HashMap<String, Span>,
 }
 
 struct ImplAcc {
@@ -488,6 +572,7 @@ fn merge_algebra_fragment(item: Item, algebras: &mut Vec<AlgebraAcc>, errors: &m
     let Some(acc) = algebras.iter_mut().find(|a| a.decl.name == d.name) else {
         let mut seen_fn_sigs = HashMap::new();
         let mut seen_axioms = HashMap::new();
+        let mut seen_derivative_rules = HashMap::new();
         for it in &d.items {
             match &it.kind {
                 AlgebraItemKind::FnSig(sig) => {
@@ -498,9 +583,12 @@ fn merge_algebra_fragment(item: Item, algebras: &mut Vec<AlgebraAcc>, errors: &m
                 AlgebraItemKind::Axiom(ax) => {
                     seen_axioms.insert(ax.name.clone(), it.span);
                 }
+                AlgebraItemKind::DerivativeRule(dr) => {
+                    seen_derivative_rules.insert(dr.method.clone(), it.span);
+                }
             }
         }
-        algebras.push(AlgebraAcc { anchor_id: item.id, anchor_span: item.span, decl: d, seen_fn_sigs, seen_axioms });
+        algebras.push(AlgebraAcc { anchor_id: item.id, anchor_span: item.span, decl: d, seen_fn_sigs, seen_axioms, seen_derivative_rules });
         return;
     };
 
@@ -532,11 +620,19 @@ fn merge_algebra_fragment(item: Item, algebras: &mut Vec<AlgebraAcc>, errors: &m
                 }
                 dup
             }
+            AlgebraItemKind::DerivativeRule(dr) => {
+                let dup = acc.seen_derivative_rules.contains_key(&dr.method);
+                if !dup {
+                    acc.seen_derivative_rules.insert(dr.method.clone(), new_item.span);
+                }
+                dup
+            }
         };
         if conflict {
             let name = match &new_item.kind {
                 AlgebraItemKind::FnSig(sig) => &sig.name,
                 AlgebraItemKind::Axiom(ax) => &ax.name,
+                AlgebraItemKind::DerivativeRule(dr) => &dr.method,
             };
             errors.push(Diagnostic::error(
                 format!("`{name}` is declared more than once in `algebra {}` (same parameter types)", d.name),

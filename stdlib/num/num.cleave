@@ -99,6 +99,18 @@ algebra Ring<T> {
     // equality saturation's whole point — rather than needing a dedicated
     // axiom per shape.
     axiom add_sub_assoc(a, b, c): sub(add(a, b), c) == add(a, sub(b, c));
+
+    // `doc/backlog-done.md`'s own "Auto-diff v1 -> algebra-declared rules"
+    // item — a derivative rule declared right here, alongside the axioms,
+    // rather than hard-coded in `egraph.rs`: `derivative` is a real
+    // `algebra_item` (`grammar.pest`), converted to an e-graph `Rewrite`
+    // per reached concrete `T` by `egraph.rs::derivative_rule_to_rewrite`,
+    // exactly the way an `axiom` already is. `d(x)` is sugar meaningful
+    // only inside a `derivative` rule's own body — see `egraph.rs::build_
+    // pattern`'s own doc comment.
+    derivative add(a, b): add(d(a), d(b));
+    derivative sub(a, b): sub(d(a), d(b));
+    derivative mul(a, b): add(mul(a, d(b)), mul(d(a), b));
 }
 
 // Integer negation has no dedicated `arith` op (unlike float — two's-

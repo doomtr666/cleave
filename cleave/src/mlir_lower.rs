@@ -179,6 +179,22 @@ fn ty_to_mlir<'c>(ctx: &LowerCtx<'c, '_>, ty: &Ty) -> Type<'c> {
         // dedicated panic message here, rather than falling into the
         // generic one below, points straight at the real cause if this
         // invariant is ever violated.
+        //
+        // One real, known way to reach this despite that invariant: a
+        // divide-by-zero *inside a still-generic declaration* (e.g. `fn f
+        // <const N, const M>() { let x: [T; N/M]; }`, only ever called with
+        // `M = 0` at one specific instantiation) — `infer.rs`'s own
+        // `pending_div_by_zero_checks` only catches the *immediate*, already-
+        // concrete case (a literal or turbofish-pinned divisor), not this
+        // deferred one (`Ty` itself carries no source span for `fold_const_
+        // expr`/`substitute`, deep in generic-instantiation machinery, to
+        // attach a real diagnostic to — `doc/backlog.md`'s own note on this).
+        // Named specifically when recognized, rather than the generic
+        // message below, so this doesn't read as "the invariant broke" when
+        // it's actually a real, if unlocated, division by zero.
+        Ty::ConstExpr(op, _, b) if op == "div" && matches!(b.as_ref(), Ty::Const(ConstValue::Int(0))) => {
+            panic!("MLIR lowering: division by zero in a const-generic expression (`{ty}`), only detected this late because it happens inside a still-generic declaration at one specific instantiation — no source location available here; `doc/backlog.md`'s own note on this")
+        }
         Ty::ConstExpr(..) => {
             panic!("MLIR lowering: unresolved deferred const expression `{ty}` reached codegen — should have been folded by `substitute` during monomorphization")
         }

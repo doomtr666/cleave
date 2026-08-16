@@ -1,5 +1,5 @@
 use cleave::ast::{FileId, ItemKind};
-use cleave::driver::{merge_programs, parse_file, FileSource};
+use cleave::driver::{compile, merge_programs, parse_file, FileSource};
 use cleave::print::print_program;
 
 fn file(id: u32, name: &str, text: &str) -> FileSource {
@@ -253,4 +253,55 @@ fn duplicate_inherent_method_across_files_is_a_conflict() {
     let errs = merge_programs(vec![parse_file(&f1).unwrap(), parse_file(&f2).unwrap()]).unwrap_err();
     assert_eq!(errs.len(), 1);
     assert!(errs[0].message.contains("len"), "got: {}", errs[0].message);
+}
+
+// ---------------------------------------------------------------- derive (auto-diff)
+//
+// `fprime = derive(f);` synthesizes `fprime`'s own signature from `f`'s --
+// `compile()`'s own `synthesize_derive_signatures` pass, run once every
+// crate's own items are merged. Exercised through the real `compile()`
+// entry point (not `merge_programs` alone), since that's where the pass
+// actually runs.
+
+#[test]
+fn a_single_param_derive_synthesizes_a_scalar_signature() {
+    let (result, _sources) = compile(vec![("a.cleave".to_string(), "fn f(x: f32) -> f32 { x }\nfprime = derive(f);".to_string())], &[]);
+    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+    let out = print_program(&program);
+    assert!(out.contains("fn fprime(x: f32) -> f32;"), "got:\n{out}");
+}
+
+#[test]
+fn a_multi_param_derive_synthesizes_an_array_jacobian_signature() {
+    let (result, _sources) =
+        compile(vec![("a.cleave".to_string(), "fn f(x: f32, y: f32) -> f32 { x }\nfprime = derive(f);".to_string())], &[]);
+    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+    let out = print_program(&program);
+    assert!(out.contains("fn fprime(x: f32, y: f32) -> [f32; 2];"), "got:\n{out}");
+}
+
+#[test]
+fn deriving_a_nonexistent_function_is_a_located_error() {
+    let (result, _sources) = compile(vec![("a.cleave".to_string(), "fprime = derive(f);".to_string())], &[]);
+    let errs = result.unwrap_err();
+    assert_eq!(errs.len(), 1);
+    assert!(errs[0].message.contains("f"), "got: {}", errs[0].message);
+}
+
+#[test]
+fn deriving_a_generic_function_is_a_located_error() {
+    let src = "fn f<T: Float>(x: T) -> T { x }\nfprime = derive(f);";
+    let (result, _sources) = compile(vec![("a.cleave".to_string(), src.to_string())], &[]);
+    let errs = result.unwrap_err();
+    assert_eq!(errs.len(), 1);
+    assert!(errs[0].message.contains("generic"), "got: {}", errs[0].message);
+}
+
+#[test]
+fn deriving_a_function_with_heterogeneous_parameter_types_is_a_located_error() {
+    let src = "fn f(x: f32, y: f64) -> f32 { x }\nfprime = derive(f);";
+    let (result, _sources) = compile(vec![("a.cleave".to_string(), src.to_string())], &[]);
+    let errs = result.unwrap_err();
+    assert_eq!(errs.len(), 1);
+    assert!(errs[0].message.contains("same type"), "got: {}", errs[0].message);
 }
