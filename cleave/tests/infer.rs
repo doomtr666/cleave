@@ -2869,3 +2869,53 @@ fn reassigning_a_captured_outer_plain_let_from_inside_a_lambda_is_rejected() {
     let err = check_mutability(&f).expect_err("the captured outer `x` is not `mut`");
     assert!(matches!(err.kind, TypeErrorKind::AssignToImmutable { ref name } if name == "x"), "got: {:?}", err.kind);
 }
+
+// ---------------------------------------------------------------------
+// `doc/backlog-done.md`'s own "break value" item (`break`/`loop { }`).
+// ---------------------------------------------------------------------
+
+#[test]
+fn break_outside_a_loop_is_rejected() {
+    let err = infer_fn_named("fn f() -> i32 { break; 0 }", "f").unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::BreakOutsideLoop), "got: {:?}", err.kind);
+}
+
+#[test]
+fn break_with_a_value_inside_while_is_rejected() {
+    // A bare `break;` (value-less) is legal in any loop kind -- only a real
+    // *value* is restricted to `loop { }` (`while`/`for`/`for-in` always
+    // stay `()`-typed, see `infer.rs`'s own `loop_stack` doc comment) — an
+    // ordinary `Unify` mismatch against the pinned `()` accumulator, not a
+    // bespoke diagnostic. A `bool` literal, not a bare numeric one -- an
+    // unsuffixed number's own type stays an unconstrained variable until
+    // defaulting (well after this test's own `infer_fn_named` call
+    // returns), so it wouldn't produce an immediate `Unify` error the way
+    // an already-concrete `bool` does.
+    let err = infer_fn_named("fn f() -> i32 { while true { break true; }; 0 }", "f").unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::Unify(_)), "got: {:?}", err.kind);
+}
+
+#[test]
+fn loop_with_break_value_returns_the_unified_type() {
+    let ty = infer_fn_named("fn f() -> i32 { loop { break 5; } }", "f").unwrap();
+    assert_eq!(ty, Ty::Con("i32".to_string()));
+}
+
+#[test]
+fn loop_whose_break_values_disagree_is_rejected() {
+    // `5:i32` -- an explicitly-suffixed literal, immediately concrete
+    // (unlike a bare `5`, whose own type stays an unconstrained variable
+    // until defaulting) — needed for a genuine, immediate `Unify` mismatch
+    // against `break true;`'s own already-concrete `bool`.
+    let err = infer_fn_named("fn f() -> i32 { loop { break 5:i32; break true; } }", "f").unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::Unify(_)), "got: {:?}", err.kind);
+}
+
+#[test]
+fn break_does_not_escape_a_lambda_body() {
+    // A `break` lexically inside a loop, but through an intervening lambda
+    // body, must still be rejected -- a lambda can be called later, outside
+    // the loop's own frame, mirroring Rust's identical rule.
+    let err = infer_fn_named("fn f() -> i32 { while true { let g = fn() { break; }; }; 0 }", "f").unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::BreakOutsideLoop), "got: {:?}", err.kind);
+}

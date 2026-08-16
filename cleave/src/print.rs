@@ -152,6 +152,10 @@ impl Printer {
             }
             StmtKind::Assign { target, value } => self.line(format!("{} = {};", fmt_expr(target), fmt_expr(value))),
             StmtKind::Expr(e) => self.line(format!("{};", fmt_expr(e))),
+            StmtKind::Break(value) => match value {
+                Some(v) => self.line(format!("break {};", fmt_expr(v))),
+                None => self.line("break;".to_string()),
+            },
         }
     }
 }
@@ -283,6 +287,7 @@ pub(crate) fn fmt_expr(e: &Expr) -> String {
         ExprKind::ForIn { var, iter, body } => {
             format!("for {var} in {} {}", fmt_expr(iter), fmt_block_inline(body))
         }
+        ExprKind::Loop { body } => format!("loop {}", fmt_block_inline(body)),
         ExprKind::Block(b) => fmt_block_inline(b),
         ExprKind::Lambda { params, ret, body } => {
             let ret_ann = ret.as_ref().map(|t| format!(" -> {}", fmt_type(t))).unwrap_or_default();
@@ -306,6 +311,10 @@ fn fmt_block_inline(b: &Block) -> String {
             }
             StmtKind::Assign { target, value } => format!("{} = {};", fmt_expr(target), fmt_expr(value)),
             StmtKind::Expr(e) => format!("{};", fmt_expr(e)),
+            StmtKind::Break(value) => match value {
+                Some(v) => format!("break {};", fmt_expr(v)),
+                None => "break;".to_string(),
+            },
         })
         .collect();
     if let Some(tail) = &b.tail {

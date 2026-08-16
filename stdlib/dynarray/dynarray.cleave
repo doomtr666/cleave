@@ -1,0 +1,150 @@
+// `DynArray<T>` — a real, growable collection (`doc/backlog.md`'s own
+// former "No dynamic-size collection" item, the confirmed blocker for
+// output-size-unknown-at-compile-time workloads like convex hull/
+// triangulation). Built entirely as an ordinary generic struct + algebra
+// impls + a handful of `cleave-rt` extern fns (`cleave-rt/src/lib.rs`'s own
+// `dynarray_*` functions) — the identical "no new `Ty::Vector`-style
+// compiler variant" discipline `stdlib/vector/vector.cleave`'s own top
+// comment already documents (that file's own earlier version *was* a
+// hardcoded `Ty::Vector`, reverted for exactly this reason). `use dynarray;`
+// explicitly — not prelude, matching `io`/`vector`/`complex`'s own
+// precedent: a program that never constructs one sees zero change.
+use vector; // `Index<Container, Elem, K>` — declared there, reused below.
+
+// A real, opaque, nominal handle type for the raw heap buffer backing a
+// `DynArray<T>` — zero fields, never constructed via `RawBuf(...)` anywhere
+// in this module, only ever produced/consumed by the `RawBuffer<T>` impls
+// below. This also serves as this project's own opaque-pointer story
+// (`doc/backlog.md`'s own separate, now-also-closed "No opaque/foreign-
+// pointer type for FFI-style resources" item): a real, declared, nominal
+// type, distinguishable from a bare `i64`/another opaque handle at the type
+// level, exactly what that item asked for — `mlir_lower.rs::ty_to_mlir`'s
+// own existing struct fallback (any non-primitive `Ty::Con`/`Ty::App` is an
+// opaque `!llvm.ptr`) is all it ever needs, no compiler change at all. One
+// honest residual gap versus a "real" `extern type Handle;`: nothing stops
+// accidentally writing `RawBuf()` (an empty struct literal, legal today,
+// would silently heap-allocate a meaningless zero-byte block) — nothing in
+// this module ever does, but a future FFI use of this same trick should
+// keep that in mind.
+struct RawBuf {}
+
+// The raw, per-width storage primitive `DynArray<T>` itself is built on top
+// of, one `impl` per concrete `T` — exactly `Print<T>`'s own per-width
+// `impl` shape (`stdlib/io/io.cleave`). `alloc`/`grow` are element-*count*
+// based (not bytes) — each impl below hardcodes its own element's byte
+// width when it calls into `cleave-rt`, so cleave source itself never needs
+// a generic `sizeof<T>()` mechanism (none exists). `get`/`set` are a plain,
+// unchecked pointer-offset read/write — no bounds checking, matching this
+// codebase's already-established "no runtime memory-safety enforcement"
+// posture (`stdlib/vector/vector.cleave`'s own `Index` impls, a dynamic
+// index into a real array, have none either).
+algebra RawBuffer<T> {
+    fn alloc(cap: i32) -> RawBuf;
+    fn grow(buf: RawBuf, old_cap: i32, new_cap: i32) -> RawBuf;
+    fn get(buf: RawBuf, i: i32) -> T;
+    fn set(buf: RawBuf, i: i32, x: T);
+}
+
+impl RawBuffer<i8> {
+    extern(dynarray_alloc_i8) fn alloc(cap: i32) -> RawBuf;
+    extern(dynarray_grow_i8) fn grow(buf: RawBuf, old_cap: i32, new_cap: i32) -> RawBuf;
+    extern(dynarray_get_i8) fn get(buf: RawBuf, i: i32) -> i8;
+    extern(dynarray_set_i8) fn set(buf: RawBuf, i: i32, x: i8);
+}
+impl RawBuffer<i16> {
+    extern(dynarray_alloc_i16) fn alloc(cap: i32) -> RawBuf;
+    extern(dynarray_grow_i16) fn grow(buf: RawBuf, old_cap: i32, new_cap: i32) -> RawBuf;
+    extern(dynarray_get_i16) fn get(buf: RawBuf, i: i32) -> i16;
+    extern(dynarray_set_i16) fn set(buf: RawBuf, i: i32, x: i16);
+}
+impl RawBuffer<i32> {
+    extern(dynarray_alloc_i32) fn alloc(cap: i32) -> RawBuf;
+    extern(dynarray_grow_i32) fn grow(buf: RawBuf, old_cap: i32, new_cap: i32) -> RawBuf;
+    extern(dynarray_get_i32) fn get(buf: RawBuf, i: i32) -> i32;
+    extern(dynarray_set_i32) fn set(buf: RawBuf, i: i32, x: i32);
+}
+impl RawBuffer<i64> {
+    extern(dynarray_alloc_i64) fn alloc(cap: i32) -> RawBuf;
+    extern(dynarray_grow_i64) fn grow(buf: RawBuf, old_cap: i32, new_cap: i32) -> RawBuf;
+    extern(dynarray_get_i64) fn get(buf: RawBuf, i: i32) -> i64;
+    extern(dynarray_set_i64) fn set(buf: RawBuf, i: i32, x: i64);
+}
+impl RawBuffer<f32> {
+    extern(dynarray_alloc_f32) fn alloc(cap: i32) -> RawBuf;
+    extern(dynarray_grow_f32) fn grow(buf: RawBuf, old_cap: i32, new_cap: i32) -> RawBuf;
+    extern(dynarray_get_f32) fn get(buf: RawBuf, i: i32) -> f32;
+    extern(dynarray_set_f32) fn set(buf: RawBuf, i: i32, x: f32);
+}
+impl RawBuffer<f64> {
+    extern(dynarray_alloc_f64) fn alloc(cap: i32) -> RawBuf;
+    extern(dynarray_grow_f64) fn grow(buf: RawBuf, old_cap: i32, new_cap: i32) -> RawBuf;
+    extern(dynarray_get_f64) fn get(buf: RawBuf, i: i32) -> f64;
+    extern(dynarray_set_f64) fn set(buf: RawBuf, i: i32, x: f64);
+}
+
+struct DynArray<T> { buf: RawBuf, len: i32, cap: i32 }
+
+// `dynarray_new` takes a real `initial_cap` argument, not a hardcoded
+// constant — not purely an ergonomic choice, a *correctness* one, found by
+// direct testing while writing `examples/convex_hull.cleave` (a real,
+// previously-latent bug, not a `DynArray`-specific one): `callgraph.rs`'s
+// own whole-program pass deliberately never generalizes a *nullary* top-
+// level fn at all (`f.params.is_empty()`, a Haskell-style Monomorphism
+// Restriction — see its own doc comment there), regardless of whether the
+// function is otherwise generic. A `T`-only-in-the-return-type `fn
+// dynarray_new<T>() -> DynArray<T>` (zero value parameters) hit exactly
+// that gate: its own `T` stayed a single, shared, *monomorphic* type
+// variable for the entire compiled program, not freshly instantiated per
+// call site — invisible in every earlier test (each only ever used
+// `DynArray` at one concrete `T` per compiled program), but broke the
+// moment a real program used `DynArray<Point>` alongside *any* other
+// float-fielded struct construction — whichever concrete type happened to
+// resolve that one shared variable first "won" for every other call.
+// `callgraph.rs`'s own nullary check is purely about *argument count*, not
+// whether `T` appears in a parameter — so giving `dynarray_new` a real
+// parameter (an actually-useful one: the caller's own chosen starting
+// capacity) sidesteps the gate entirely, correctly generalized, with zero
+// compiler changes.
+fn dynarray_new<T>(initial_cap: i32) -> DynArray<T> {
+    DynArray(buf: alloc(initial_cap), len: 0, cap: initial_cap)
+}
+
+// `v.push(x)`/`v.get(i)`/`v.set(i,x)`/`v.len()` — ordinary generic
+// *inherent* methods (`impl<T> DynArray<T> { ... }`), a wholly separate
+// dispatch mechanism from the `RawBuffer<T>` algebra above (`infer.rs`'s own
+// `ExprKind::MethodCall` resolves purely via `registry.inherent_method`,
+// never algebra dispatch) — no name collision even though both "levels"
+// happen to use `get`/`set` here. A `DynArray` is a struct, hence already a
+// heap reference (mutated in place, never copied) — `push`'s own `mut v`
+// parameter (`doc/backlog-done.md`'s own note on why a plain, non-`mut`
+// parameter couldn't reassign any of its own fields either, found directly
+// while writing this exact method) is what lets `v.buf`/`v.len`/`v.cap`
+// mutate the struct the *caller's* own variable already points at, not a
+// separate copy.
+impl<T> struct DynArray<T> {
+    fn push(mut v: DynArray<T>, x: T) {
+        if v.len == v.cap {
+            let new_cap: i32 = v.cap * 2;
+            v.buf = grow(v.buf, v.cap, new_cap);
+            v.cap = new_cap;
+        };
+        set(v.buf, v.len, x);
+        v.len = v.len + 1;
+    }
+    fn get(v: DynArray<T>, i: i32) -> T { get(v.buf, i) }
+    fn set(v: DynArray<T>, i: i32, x: T) { set(v.buf, i, x); }
+    fn len(v: DynArray<T>) -> i32 { v.len }
+}
+
+// `v[i]` (read) — reuses `vector`'s own `Index<Container, Elem, K>` fallback
+// dispatch, the exact mechanism `Vector`/`Matrix`/`Tensor` already use for
+// their own non-array element access. Deliberately read-only: `v[i] = x`
+// write syntax is not attempted here — `infer.rs`'s own `StmtKind::Assign`
+// guard rejects a non-array `Index` assignment target outright today (added
+// so a tensor-backed value, immutable by construction, can't be silently
+// "mutated" through `[i]=`) — `DynArray` mutation goes through `.set(i, x)`
+// instead, a real if minor ergonomic gap, not worth reopening that guard
+// for this pass.
+impl<T> Index<DynArray<T>, T> {
+    fn index(v: DynArray<T>, idx: [i32; 1]) -> T { get(v.buf, idx[0]) }
+}

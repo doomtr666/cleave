@@ -111,7 +111,20 @@ fn parse_args() -> Result<Args, String> {
     }
 }
 
+// CPS conversion (`cps.rs::convert_program`) recurses once per statement/
+// subexpression in a unit's own body, so a Rust-level stack frame is spent
+// per AST node converted -- for a large-enough `main` (`tensor_demo.cleave`,
+// found by direct testing) this genuinely exceeds the OS's default main-
+// thread stack (1MB on Windows, unless raised by the linker) well before
+// anything is actually wrong with the program. Running the whole pipeline on
+// a worker thread with a generous, fixed stack sidesteps that platform
+// default entirely -- the same fix rustc's own driver uses for the identical
+// reason, not a workaround for a logic bug.
 fn main() -> ExitCode {
+    std::thread::Builder::new().stack_size(64 * 1024 * 1024).spawn(real_main).unwrap().join().unwrap()
+}
+
+fn real_main() -> ExitCode {
     let args = match parse_args() {
         Ok(a) => a,
         Err(msg) => {
@@ -570,6 +583,34 @@ fn main() -> ExitCode {
             engine.register_symbol("print_f64", cleave_rt::print_f64 as *mut ());
             engine.register_symbol("print_bytes", cleave_rt::print_bytes as *mut ());
             engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
+            engine.register_symbol("dynarray_alloc_i8", cleave_rt::dynarray_alloc_i8 as *mut ());
+            engine.register_symbol("dynarray_grow_i8", cleave_rt::dynarray_grow_i8 as *mut ());
+            engine.register_symbol("dynarray_get_i8", cleave_rt::dynarray_get_i8 as *mut ());
+            engine.register_symbol("dynarray_set_i8", cleave_rt::dynarray_set_i8 as *mut ());
+            engine.register_symbol("dynarray_alloc_i16", cleave_rt::dynarray_alloc_i16 as *mut ());
+            engine.register_symbol("dynarray_grow_i16", cleave_rt::dynarray_grow_i16 as *mut ());
+            engine.register_symbol("dynarray_get_i16", cleave_rt::dynarray_get_i16 as *mut ());
+            engine.register_symbol("dynarray_set_i16", cleave_rt::dynarray_set_i16 as *mut ());
+            engine.register_symbol("dynarray_alloc_i32", cleave_rt::dynarray_alloc_i32 as *mut ());
+            engine.register_symbol("dynarray_grow_i32", cleave_rt::dynarray_grow_i32 as *mut ());
+            engine.register_symbol("dynarray_get_i32", cleave_rt::dynarray_get_i32 as *mut ());
+            engine.register_symbol("dynarray_set_i32", cleave_rt::dynarray_set_i32 as *mut ());
+            engine.register_symbol("dynarray_alloc_i64", cleave_rt::dynarray_alloc_i64 as *mut ());
+            engine.register_symbol("dynarray_grow_i64", cleave_rt::dynarray_grow_i64 as *mut ());
+            engine.register_symbol("dynarray_get_i64", cleave_rt::dynarray_get_i64 as *mut ());
+            engine.register_symbol("dynarray_set_i64", cleave_rt::dynarray_set_i64 as *mut ());
+            engine.register_symbol("dynarray_alloc_f32", cleave_rt::dynarray_alloc_f32 as *mut ());
+            engine.register_symbol("dynarray_grow_f32", cleave_rt::dynarray_grow_f32 as *mut ());
+            engine.register_symbol("dynarray_get_f32", cleave_rt::dynarray_get_f32 as *mut ());
+            engine.register_symbol("dynarray_set_f32", cleave_rt::dynarray_set_f32 as *mut ());
+            engine.register_symbol("dynarray_alloc_f64", cleave_rt::dynarray_alloc_f64 as *mut ());
+            engine.register_symbol("dynarray_grow_f64", cleave_rt::dynarray_grow_f64 as *mut ());
+            engine.register_symbol("dynarray_get_f64", cleave_rt::dynarray_get_f64 as *mut ());
+            engine.register_symbol("dynarray_set_f64", cleave_rt::dynarray_set_f64 as *mut ());
+            engine.register_symbol("dynarray_alloc_ptr", cleave_rt::dynarray_alloc_ptr as *mut ());
+            engine.register_symbol("dynarray_grow_ptr", cleave_rt::dynarray_grow_ptr as *mut ());
+            engine.register_symbol("dynarray_get_ptr", cleave_rt::dynarray_get_ptr as *mut ());
+            engine.register_symbol("dynarray_set_ptr", cleave_rt::dynarray_set_ptr as *mut ());
         }
         let mut result: i32 = -1;
         // SAFETY: `result` is a live, correctly-aligned `i32` on the stack

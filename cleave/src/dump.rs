@@ -324,6 +324,14 @@ pub(crate) fn dump_block_with_call_names(
             StmtKind::Expr(e) => {
                 let _ = writeln!(out, "{pad}{};", fmt_expr_typed(e, node_types, names, call_names));
             }
+            StmtKind::Break(value) => match value {
+                Some(v) => {
+                    let _ = writeln!(out, "{pad}break {};", fmt_expr_typed(v, node_types, names, call_names));
+                }
+                None => {
+                    let _ = writeln!(out, "{pad}break;");
+                }
+            },
         }
     }
     if let Some(tail) = &block.tail {
@@ -421,6 +429,7 @@ fn fmt_expr_typed(e: &Expr, node_types: &NodeTypes, names: &mut TyVarNames, call
             fmt_expr_typed(iter, node_types, names, call_names),
             fmt_block_inline_typed(body, node_types, names, call_names)
         ),
+        ExprKind::Loop { body } => format!("loop {}", fmt_block_inline_typed(body, node_types, names, call_names)),
         ExprKind::Block(b) => fmt_block_inline_typed(b, node_types, names, call_names),
         ExprKind::Lambda { params, ret, body } => {
             let ret_ann = ret.as_ref().map(|t| format!(" -> {}", fmt_type(t))).unwrap_or_default();
@@ -452,6 +461,10 @@ fn fmt_block_inline_typed(b: &Block, node_types: &NodeTypes, names: &mut TyVarNa
                 fmt_expr_typed(value, node_types, names, call_names)
             ),
             StmtKind::Expr(e) => format!("{};", fmt_expr_typed(e, node_types, names, call_names)),
+            StmtKind::Break(value) => match value {
+                Some(v) => format!("break {};", fmt_expr_typed(v, node_types, names, call_names)),
+                None => "break;".to_string(),
+            },
         })
         .collect();
     if let Some(tail) = &b.tail {

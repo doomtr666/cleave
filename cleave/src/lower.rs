@@ -210,10 +210,18 @@ impl Lowerer {
     }
 
     fn lower_param(&mut self, pair: Pair<Rule>) -> Param {
-        let mut inner = pair.into_inner();
-        let name = inner.next().unwrap().as_str().to_string();
-        let ty = inner.next().map(|p| self.lower_type(p));
-        Param { name, ty }
+        let mut mutable = false;
+        let mut name = None;
+        let mut ty = None;
+        for p in pair.into_inner() {
+            match p.as_rule() {
+                Rule::mut_kw => mutable = true,
+                Rule::ident if name.is_none() => name = Some(p.as_str().to_string()),
+                Rule::type_ => ty = Some(self.lower_type(p)),
+                _ => {}
+            }
+        }
+        Param { name: name.unwrap(), ty, mutable }
     }
 
     // ---------------------------------------------------------------- struct
@@ -433,6 +441,10 @@ impl Lowerer {
         let kind = match inner.as_rule() {
             Rule::let_stmt => self.lower_let_stmt(inner),
             Rule::assign_stmt => self.lower_assign_stmt(inner),
+            Rule::break_stmt => {
+                let value = inner.into_inner().next().map(|p| self.lower_expr(p));
+                StmtKind::Break(value)
+            }
             Rule::expr_stmt => {
                 let e = self.lower_expr(inner.into_inner().next().unwrap());
                 StmtKind::Expr(e)
@@ -704,6 +716,7 @@ impl Lowerer {
             Rule::if_expr => self.lower_if_expr(inner),
             Rule::while_expr => self.lower_while_expr(inner),
             Rule::for_expr => self.lower_for_expr(inner),
+            Rule::loop_expr => self.lower_loop_expr(inner),
             Rule::array_lit => self.lower_array_lit(inner),
             Rule::lambda_expr => self.lower_lambda_expr(inner),
             Rule::struct_lit => self.lower_struct_lit(inner),
@@ -803,6 +816,12 @@ impl Lowerer {
         let cond = Box::new(self.lower_expr(inner.next().unwrap()));
         let body = self.lower_block(inner.next().unwrap());
         self.wrap(span, ExprKind::While { cond, body })
+    }
+
+    fn lower_loop_expr(&mut self, pair: Pair<Rule>) -> Expr {
+        let span = self.span_of(&pair);
+        let body = self.lower_block(pair.into_inner().next().unwrap());
+        self.wrap(span, ExprKind::Loop { body })
     }
 
     /// `grammar.pest`'s own `for_expr` funnels *two* real syntactic shapes

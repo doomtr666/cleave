@@ -1,0 +1,86 @@
+use dynarray;
+use io;
+
+// A real, geometry-shaped demo of `DynArray<T>` (`doc/backlog-done.md`'s
+// own "growable collections" item): convex hull was the concrete example
+// that first motivated it — the hull's own size (how many of the input
+// points end up on it) depends on the input's geometry, not just its
+// count, so it can't be a fixed-size `[T; N]` the way every other example
+// so far has gotten away with.
+//
+// Gift wrapping (Jarvis march): start from the leftmost point (guaranteed
+// on the hull), then repeatedly pick the point `next` such that every other
+// point lies to its left (counterclockwise) of the edge `current -> next` —
+// the most "extreme" turn available. Walking that all the way back around
+// to the start traces out the hull in order. `O(n*h)` (`h` = hull size) —
+// simple, no sorting needed, unlike Graham scan.
+struct Point { x: f64, y: f64 }
+
+// `DynArray<T>` only ships `RawBuffer<T>` impls for the primitive widths
+// (`stdlib/dynarray/dynarray.cleave`) — a struct-typed element, like this
+// one, needs its own small impl, reusing the exact same `_ptr`-suffixed
+// `cleave-rt` functions every struct element type shares (every cleave
+// struct value is already an opaque pointer under the hood).
+impl RawBuffer<Point> {
+    extern(dynarray_alloc_ptr) fn alloc(cap: i32) -> RawBuf;
+    extern(dynarray_grow_ptr) fn grow(buf: RawBuf, old_cap: i32, new_cap: i32) -> RawBuf;
+    extern(dynarray_get_ptr) fn get(buf: RawBuf, i: i32) -> Point;
+    extern(dynarray_set_ptr) fn set(buf: RawBuf, i: i32, x: Point);
+}
+
+// The sign of the cross product of `(q - p)` and `(r - p)`: negative means
+// `r` is clockwise of the edge `p -> q`.
+fn orientation(p: Point, q: Point, r: Point) -> f64 {
+    (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x)
+}
+
+fn main() -> i32 {
+    // A square (the true hull) with four extra points strictly inside it —
+    // the interior points must *not* survive into the hull.
+    let points: [Point; 8] = [
+        Point(x: 0.0, y: 0.0),
+        Point(x: 3.0, y: 0.0),
+        Point(x: 3.0, y: 3.0),
+        Point(x: 0.0, y: 3.0),
+        Point(x: 1.0, y: 1.0),
+        Point(x: 2.0, y: 1.0),
+        Point(x: 1.0, y: 2.0),
+        Point(x: 1.5, y: 1.5)
+    ];
+
+    let mut leftmost: i32 = 0;
+    for i in 0..8 {
+        if points[i].x < points[leftmost].x {
+            leftmost = i;
+        };
+    };
+
+    let hull: DynArray<Point> = dynarray_new(4);
+    let mut current: i32 = leftmost;
+    loop {
+        hull.push(points[current]);
+        // Any point other than `current` itself is a valid starting guess
+        // for `next` — the loop below always corrects it.
+        let mut next: i32 = mod(current + 1, 8);
+        for i in 0..8 {
+            let o: f64 = orientation(points[current], points[next], points[i]);
+            if o < 0.0 {
+                next = i;
+            };
+        };
+        current = next;
+        if current == leftmost {
+            break;
+        };
+    };
+
+    print(hull.len());
+    let mut i: i32 = 0;
+    while i < hull.len() {
+        let p: Point = hull.get(i);
+        print(p.x);
+        print(p.y);
+        i = i + 1;
+    };
+    0
+}

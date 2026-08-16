@@ -2499,3 +2499,410 @@ fn qualified_calls_to_two_algebras_colliding_on_the_same_method_and_type_run_the
     ";
     assert_eq!(run_i32(&context, src), 1);
 }
+
+// ---------------------------------------------------------------------
+// `doc/backlog.md`'s "No dynamic-size collection" item — `DynArray<T>`
+// (`stdlib/dynarray/dynarray.cleave`), a real, growable collection built
+// entirely as an ordinary stdlib struct + algebra impls, no `Ty`/grammar
+// changes.
+// ---------------------------------------------------------------------
+
+/// Runs `src` the same way `an_extern_fn_call_actually_executes_through_a_
+/// registered_symbol` does (the simple scf/llvm pipeline — no tensor types
+/// involved here, so `run_i32`'s own fuller bufferize pipeline isn't
+/// needed). Registers every scalar-width `dynarray_*` symbol unconditionally
+/// (`doc/backlog.md`'s own "no dead-code elimination" item — `use dynarray;`
+/// compiles all six `RawBuffer<T>` impls in `stdlib/dynarray/dynarray.cleave`
+/// regardless of which width the test's own program actually calls, exactly
+/// the same reason `num`'s own `Rem::mod` is always present too), plus
+/// `cleave_alloc` (every struct construction needs it) and whichever extra
+/// symbols the caller passes in (the `_ptr` width, only ever declared
+/// locally by a specific test's own `impl RawBuffer<SomeStruct>`, never
+/// unconditionally compiled).
+fn run_i32_with_dynarray_symbols(context: &Context, src: &str, extra_symbols: &[(&str, *mut ())]) -> i32 {
+    let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
+    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+    let registry = Registry::build(&program);
+    let units = collect_units(&program, &registry);
+    let cps_program = convert_program(units);
+    let mlir_types = collect_mlir_types(&program);
+    let struct_schemas = collect_struct_schemas(&program);
+    let mut module = lower_program(context, &cps_program, &mlir_types, struct_schemas);
+    assert!(module.as_operation().verify(), "generated MLIR module failed verification");
+
+    let pass_manager = pass::PassManager::new(context);
+    pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
+    pass_manager.add_pass(pass::conversion::create_to_llvm());
+    pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
+    pass_manager.run(&mut module).expect("lowering to the llvm dialect must succeed");
+
+    let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
+    unsafe {
+        engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
+        engine.register_symbol("dynarray_alloc_i8", cleave_rt::dynarray_alloc_i8 as *mut ());
+        engine.register_symbol("dynarray_grow_i8", cleave_rt::dynarray_grow_i8 as *mut ());
+        engine.register_symbol("dynarray_get_i8", cleave_rt::dynarray_get_i8 as *mut ());
+        engine.register_symbol("dynarray_set_i8", cleave_rt::dynarray_set_i8 as *mut ());
+        engine.register_symbol("dynarray_alloc_i16", cleave_rt::dynarray_alloc_i16 as *mut ());
+        engine.register_symbol("dynarray_grow_i16", cleave_rt::dynarray_grow_i16 as *mut ());
+        engine.register_symbol("dynarray_get_i16", cleave_rt::dynarray_get_i16 as *mut ());
+        engine.register_symbol("dynarray_set_i16", cleave_rt::dynarray_set_i16 as *mut ());
+        engine.register_symbol("dynarray_alloc_i32", cleave_rt::dynarray_alloc_i32 as *mut ());
+        engine.register_symbol("dynarray_grow_i32", cleave_rt::dynarray_grow_i32 as *mut ());
+        engine.register_symbol("dynarray_get_i32", cleave_rt::dynarray_get_i32 as *mut ());
+        engine.register_symbol("dynarray_set_i32", cleave_rt::dynarray_set_i32 as *mut ());
+        engine.register_symbol("dynarray_alloc_i64", cleave_rt::dynarray_alloc_i64 as *mut ());
+        engine.register_symbol("dynarray_grow_i64", cleave_rt::dynarray_grow_i64 as *mut ());
+        engine.register_symbol("dynarray_get_i64", cleave_rt::dynarray_get_i64 as *mut ());
+        engine.register_symbol("dynarray_set_i64", cleave_rt::dynarray_set_i64 as *mut ());
+        engine.register_symbol("dynarray_alloc_f32", cleave_rt::dynarray_alloc_f32 as *mut ());
+        engine.register_symbol("dynarray_grow_f32", cleave_rt::dynarray_grow_f32 as *mut ());
+        engine.register_symbol("dynarray_get_f32", cleave_rt::dynarray_get_f32 as *mut ());
+        engine.register_symbol("dynarray_set_f32", cleave_rt::dynarray_set_f32 as *mut ());
+        engine.register_symbol("dynarray_alloc_f64", cleave_rt::dynarray_alloc_f64 as *mut ());
+        engine.register_symbol("dynarray_grow_f64", cleave_rt::dynarray_grow_f64 as *mut ());
+        engine.register_symbol("dynarray_get_f64", cleave_rt::dynarray_get_f64 as *mut ());
+        engine.register_symbol("dynarray_set_f64", cleave_rt::dynarray_set_f64 as *mut ());
+        for (name, ptr) in extra_symbols {
+            engine.register_symbol(name, *ptr);
+        }
+    }
+    let mut out: i32 = -1;
+    unsafe {
+        engine.invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()]).expect("JIT invocation must succeed");
+    }
+    out
+}
+
+/// Pushes past the initial capacity (4), forcing at least one real
+/// `RawBuffer<i32>::grow`, then reads every element back both via `.get(i)`
+/// and via `v[i]` (the `Index<DynArray<T>,T>` fallback) — proving growth
+/// preserves the earlier elements correctly, not just that the *last* push
+/// landed right. `.len()` folded in here too rather than its own separate
+/// test — a direct, minimal check against the known push count.
+#[test]
+fn a_dynarray_grows_past_its_initial_capacity_and_reads_back_correct_values() {
+    let context = context();
+    let src = "
+        use dynarray;
+        fn main() -> i32 {
+            let v: DynArray<i32> = dynarray_new(4);
+            v.push(10);
+            v.push(20);
+            v.push(30);
+            v.push(40);
+            v.push(50);
+            v.push(60);
+            if v.len() == 6
+                and v.get(0) == 10 and v[0] == 10
+                and v.get(3) == 40 and v[3] == 40
+                and v.get(5) == 60 and v[5] == 60
+            { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32_with_dynarray_symbols(&context, src, &[]), 1);
+}
+
+/// The struct-element proof (`doc/backlog-done.md`'s own note on why this
+/// was scoped into v1 rather than deferred): every cleave struct value is
+/// already an opaque pointer, so `DynArray<Point>` reuses the *exact same*
+/// `_ptr`-suffixed `cleave-rt` functions the scalar-width impls use, via one
+/// small `impl RawBuffer<Point>` written here (mechanical, zero new Rust
+/// code) — direct end-to-end evidence a real heap-referenced struct
+/// round-trips correctly through the raw pointer-width buffer, not just a
+/// scalar.
+#[test]
+fn a_dynarray_of_structs_grows_and_reads_back_correct_field_values() {
+    let context = context();
+    let src = "
+        use dynarray;
+        struct Point { x: f64, y: f64 }
+        impl RawBuffer<Point> {
+            extern(dynarray_alloc_ptr) fn alloc(cap: i32) -> RawBuf;
+            extern(dynarray_grow_ptr) fn grow(buf: RawBuf, old_cap: i32, new_cap: i32) -> RawBuf;
+            extern(dynarray_get_ptr) fn get(buf: RawBuf, i: i32) -> Point;
+            extern(dynarray_set_ptr) fn set(buf: RawBuf, i: i32, x: Point);
+        }
+        fn main() -> i32 {
+            let v: DynArray<Point> = dynarray_new(4);
+            v.push(Point(x: 1.0, y: 2.0));
+            v.push(Point(x: 3.0, y: 4.0));
+            v.push(Point(x: 5.0, y: 6.0));
+            v.push(Point(x: 7.0, y: 8.0));
+            v.push(Point(x: 9.0, y: 10.0));
+            let p0: Point = v.get(0);
+            let p4: Point = v.get(4);
+            if v.len() == 5 and p0.x == 1.0 and p0.y == 2.0 and p4.x == 9.0 and p4.y == 10.0 { 1 } else { 0 }
+        }
+    ";
+    let symbols: &[(&str, *mut ())] = &[
+        ("dynarray_alloc_ptr", cleave_rt::dynarray_alloc_ptr as *mut ()),
+        ("dynarray_grow_ptr", cleave_rt::dynarray_grow_ptr as *mut ()),
+        ("dynarray_get_ptr", cleave_rt::dynarray_get_ptr as *mut ()),
+        ("dynarray_set_ptr", cleave_rt::dynarray_set_ptr as *mut ()),
+    ];
+    assert_eq!(run_i32_with_dynarray_symbols(&context, src, symbols), 1);
+}
+
+/// A real, previously-latent bug, found directly while writing `examples/
+/// convex_hull.cleave` — `callgraph.rs`'s own whole-program pass applies a
+/// Haskell-style Monomorphism Restriction to *any* zero-parameter top-level
+/// fn (`f.params.is_empty()`), regardless of whether it's otherwise generic
+/// — `dynarray_new<T>()`'s own original, argument-less signature hit this
+/// exactly: its `T` was never generalized at all, staying a single, shared,
+/// monomorphic type variable for the *entire compiled program*. Invisible in
+/// every earlier test (each only ever used `DynArray` at one concrete `T`
+/// per compiled program) — this is the direct regression proof: `DynArray<
+/// i32>` and `DynArray<Point>` constructed and used *simultaneously* in the
+/// same program, both resolving to their own correct, independent element
+/// type. Fixed by giving `dynarray_new` a real parameter (`initial_cap: i32`
+/// — genuinely useful on its own, not just a workaround) so it no longer
+/// hits the nullary gate at all.
+#[test]
+fn dynarray_generalizes_correctly_across_two_different_concrete_types_in_one_program() {
+    let context = context();
+    let src = "
+        use dynarray;
+        struct Point { x: f64, y: f64 }
+        impl RawBuffer<Point> {
+            extern(dynarray_alloc_ptr) fn alloc(cap: i32) -> RawBuf;
+            extern(dynarray_grow_ptr) fn grow(buf: RawBuf, old_cap: i32, new_cap: i32) -> RawBuf;
+            extern(dynarray_get_ptr) fn get(buf: RawBuf, i: i32) -> Point;
+            extern(dynarray_set_ptr) fn set(buf: RawBuf, i: i32, x: Point);
+        }
+        fn main() -> i32 {
+            let ints: DynArray<i32> = dynarray_new(4);
+            ints.push(1);
+            ints.push(2);
+            let points: DynArray<Point> = dynarray_new(4);
+            points.push(Point(x: 5.0, y: 6.0));
+            let p0: Point = points.get(0);
+            if ints.len() == 2 and ints.get(0) == 1 and ints.get(1) == 2
+                and points.len() == 1 and p0.x == 5.0 and p0.y == 6.0
+            { 1 } else { 0 }
+        }
+    ";
+    let symbols: &[(&str, *mut ())] = &[
+        ("dynarray_alloc_ptr", cleave_rt::dynarray_alloc_ptr as *mut ()),
+        ("dynarray_grow_ptr", cleave_rt::dynarray_grow_ptr as *mut ()),
+        ("dynarray_get_ptr", cleave_rt::dynarray_get_ptr as *mut ()),
+        ("dynarray_set_ptr", cleave_rt::dynarray_set_ptr as *mut ()),
+    ];
+    assert_eq!(run_i32_with_dynarray_symbols(&context, src, symbols), 1);
+}
+
+// ---------------------------------------------------------------------
+// `doc/backlog.md`'s "a while-loop condition needing more than one chained
+// real call breaks `lower_loop`" item.
+// ---------------------------------------------------------------------
+
+/// `i < hull.len()` needs *two* sequential real calls before the branch
+/// (`DynArray::len<...>`, then `Ord::lt<i32>` against its result) — found
+/// directly while writing `examples/convex_hull.cleave`, where
+/// `mlir_lower.rs::lower_loop` used to panic (`"a loop's own condition-
+/// continuation must be a bare \`if\`"`), since it only ever handled a
+/// condition CPS-converting to *exactly one* call. Real end-to-end proof,
+/// not just that it lowers cleanly: pushes 3 elements, loops while `i` is
+/// less than the *live* `hull.len()` (not a value cached before the loop),
+/// printing each one — a wrong loop bound would either skip elements or
+/// read out of bounds, not just fail to compile.
+#[test]
+fn a_while_condition_needing_two_chained_calls_lowers_and_runs_correctly() {
+    let context = context();
+    let src = "
+        use dynarray;
+        fn main() -> i32 {
+            let hull: DynArray<i32> = dynarray_new(4);
+            hull.push(10);
+            hull.push(20);
+            hull.push(30);
+            let mut i: i32 = 0;
+            let mut sum: i32 = 0;
+            while i < hull.len() {
+                sum = sum + hull.get(i);
+                i = i + 1;
+            };
+            if i == 3 and sum == 60 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32_with_dynarray_symbols(&context, src, &[]), 1);
+}
+
+// ---------------------------------------------------------------------
+// `doc/backlog-done.md`'s own "break value" item (`break`/`loop { }`).
+// ---------------------------------------------------------------------
+
+/// Sums until a threshold, `break;` instead of relying purely on the
+/// condition — asserts the early-exit sum, not just "didn't crash": a
+/// wrong guard (e.g. one that doesn't actually stop `sum = sum + i;` from
+/// running once more) would silently produce `10` (`0+1+2+3+4`) instead of
+/// the correct `10` too by coincidence at `i==5`, so the real proof is at
+/// `i==3` instead, where a bug would show `6` (correct) vs `9` (one extra
+/// iteration snuck through) — deliberately not the boundary an accidental
+/// off-by-one could hide behind.
+#[test]
+fn a_while_loop_exits_early_via_a_bare_break() {
+    let context = context();
+    let src = "
+        fn main() -> i32 {
+            let mut i: i32 = 0;
+            let mut sum: i32 = 0;
+            while i < 100 {
+                if i == 3 {
+                    break;
+                };
+                sum = sum + i;
+                i = i + 1;
+            };
+            sum
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 3);
+}
+
+/// `break` several stack frames deep (`if` inside `while`) — proves it
+/// isn't limited to a top-level statement in the loop body, and that
+/// nothing textually *after* the `if` (in the same loop-body block) runs
+/// once broken (`doc/backlog-done.md`'s own note on the real bug this
+/// caught directly: an earlier version of this fix let `sum = sum + i;`
+/// keep executing once more after the break, with stale values).
+#[test]
+fn a_break_inside_a_nested_if_inside_a_while_exits_the_correct_loop() {
+    let context = context();
+    let src = "
+        fn main() -> i32 {
+            let mut i: i32 = 0;
+            let mut sum: i32 = 0;
+            while i < 100 {
+                if i == 5 {
+                    break;
+                };
+                sum = sum + i;
+                i = i + 1;
+            };
+            sum
+        }
+    ";
+    // 0+1+2+3+4 -- `i == 5` itself never contributes.
+    assert_eq!(run_i32(&context, src), 10);
+}
+
+#[test]
+fn a_for_loop_can_break_early() {
+    let context = context();
+    let src = "
+        fn main() -> i32 {
+            let mut sum: i32 = 0;
+            for i in 0..100 {
+                if i == 5 {
+                    break;
+                };
+                sum = sum + i;
+            };
+            sum
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 10);
+}
+
+#[test]
+fn a_for_in_loop_can_break_early() {
+    let context = context();
+    let src = "
+        fn main() -> i32 {
+            let arr: [i32; 6] = [10, 20, 30, 40, 50, 60];
+            let mut sum: i32 = 0;
+            for x in arr {
+                if x == 40 {
+                    break;
+                };
+                sum = sum + x;
+            };
+            sum
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 60);
+}
+
+/// `let x = loop { ... break 5; };` — the only loop kind that can produce a
+/// real value via `break`.
+#[test]
+fn a_loop_expr_returns_the_value_from_break() {
+    let context = context();
+    let src = "
+        fn main() -> i32 {
+            let mut n: i32 = 0;
+            let x: i32 = loop {
+                n = n + 1;
+                if n == 7 {
+                    break n * 10;
+                };
+            };
+            x
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 70);
+}
+
+/// A break inside an *inner* loop must not affect the *outer* loop's own
+/// iteration count — each `break` targets its nearest enclosing loop only.
+#[test]
+fn nested_loops_break_only_the_innermost_one() {
+    let context = context();
+    let src = "
+        fn main() -> i32 {
+            let mut outer_count: i32 = 0;
+            let mut inner_total: i32 = 0;
+            for o in 0..3 {
+                outer_count = outer_count + 1;
+                let mut i: i32 = 0;
+                while i < 100 {
+                    if i == 4 {
+                        break;
+                    };
+                    inner_total = inner_total + 1;
+                    i = i + 1;
+                };
+            };
+            if outer_count == 3 and inner_total == 12 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// The "zero cost when unused" requirement (`cps.rs::loop_contains_break`'s
+/// own doc comment), checked directly, not just assumed: an ordinary loop
+/// containing no `break` anywhere must not gain any of the guard machinery
+/// (no `__loop_running` carried slot, no extra `Logic::and` call folded into
+/// its own condition) — the generated MLIR text has no trace of it. A
+/// silent regression here (every existing loop suddenly guarded) would be
+/// the single most damaging possible mistake in this feature.
+#[test]
+fn a_loop_with_no_break_produces_no_guard_machinery() {
+    let context = context();
+    let src = "
+        fn main() -> i32 {
+            let mut i: i32 = 0;
+            let mut sum: i32 = 0;
+            while i < 10 {
+                sum = sum + i;
+                i = i + 1;
+            };
+            sum
+        }
+    ";
+    let text = lower(&context, src);
+    // `Logic::and<...>` itself is *always* present in some form -- not just
+    // its own declaration (the prelude compiles every function in
+    // unconditionally, `doc/backlog.md`'s own "no dead-code elimination"
+    // item), but even a real *call* to it, from `Rem::mod`'s own
+    // pre-existing, unrelated body (integer modulo sign-correction) —
+    // checking the whole module's own text isn't precise enough. `main`
+    // sorts last among this module's own functions (`convert_program`'s own
+    // alphabetical ordering — every algebra-qualified name starts
+    // uppercase, sorting before lowercase `main` in ASCII), so everything
+    // after `func.func @main` is `main`'s own body specifically.
+    let main_text = text.split("func.func @main").nth(1).unwrap_or_else(|| panic!("no `@main` found in:\n{text}"));
+    assert!(!main_text.contains("Logic::and"), "an unguarded loop's own `main` must not call `Logic::and` at all, got:\n{main_text}");
+    assert_eq!(run_i32(&context, src), 45);
+}

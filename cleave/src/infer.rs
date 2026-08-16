@@ -617,6 +617,12 @@ pub enum TypeErrorKind {
     /// confirmed this, see its own `unreachable!` on this exact
     /// precondition).
     UnknownAlgebraMethod { algebra: String, method: String },
+    /// `break;`/`break value;` with no enclosing loop at all (`Infer::
+    /// loop_stack` empty at the statement) — includes a `break` lexically
+    /// inside a loop but *through* an intervening lambda body (`ExprKind::
+    /// Lambda` temporarily empties the stack while checking one) — a break
+    /// must not escape a closure boundary, mirroring Rust's identical rule.
+    BreakOutsideLoop,
     /// A const-generic division (`[T; N/M]`, or an explicit turbofish const
     /// arg) whose divisor is already, concretely, zero — see `Infer::
     /// pending_div_by_zero_checks`'s own doc comment for why this is
@@ -706,6 +712,7 @@ impl std::fmt::Display for TypeErrorKind {
             TypeErrorKind::UnknownAlgebraMethod { algebra, method } => {
                 write!(f, "`algebra {algebra}` has no method `{method}` at this arity")
             }
+            TypeErrorKind::BreakOutsideLoop => write!(f, "`break` outside a loop"),
         }
     }
 }
@@ -988,7 +995,7 @@ pub(crate) fn check_no_placeholder(f: &FnDecl, final_result: &Ty, param_types: &
 /// since they never go through `StmtKind::Let`.
 pub fn check_mutability(f: &FnDecl) -> Result<(), TypeError> {
     let Some(body) = &f.body else { return Ok(()) };
-    let scope: HashMap<String, bool> = f.params.iter().map(|p| (p.name.clone(), false)).collect();
+    let scope: HashMap<String, bool> = f.params.iter().map(|p| (p.name.clone(), p.mutable)).collect();
     check_mutability_block(body, &scope)
 }
 
@@ -1010,6 +1017,11 @@ fn check_mutability_block(block: &Block, scope: &HashMap<String, bool>) -> Resul
                 }
             }
             StmtKind::Expr(e) => check_mutability_expr(e, &scope)?,
+            StmtKind::Break(value) => {
+                if let Some(v) = value {
+                    check_mutability_expr(v, &scope)?;
+                }
+            }
         }
     }
     if let Some(tail) = &block.tail {
@@ -1063,6 +1075,7 @@ fn check_mutability_expr(expr: &Expr, scope: &HashMap<String, bool>) -> Result<(
             inner.insert(var.clone(), false);
             check_mutability_block(body, &inner)
         }
+        ExprKind::Loop { body } => check_mutability_block(body, scope),
         ExprKind::Block(b) => check_mutability_block(b, scope),
         // A lambda's own params shadow the outer scope for the duration of
         // its own body -- still walked, and still against the *outer*
@@ -1194,6 +1207,20 @@ pub struct Infer<'r> {
     /// with nothing to stop that read from disagreeing with what the
     /// `Scheme` itself promises.
     quantified: HashSet<TyVar>,
+    /// One entry per currently-open loop, its own **accumulator type** — the
+    /// type every `break`/`break value` inside it (directly, not through a
+    /// nested loop) unifies against. `While`/`For`/`ForIn` pin this to
+    /// `Ty::Con("()")` immediately on push (their own natural, non-break
+    /// exit has no value to reconcile a `break value` against — mirrors
+    /// Rust's identical restriction); `Loop` seeds a fresh `Ty::Var`, later
+    /// read back as the whole expression's own type, exactly like a `let`'s
+    /// own scheme is read back after `generalize`. A `break` outside any
+    /// loop (`loop_stack.is_empty()`) is `TypeErrorKind::BreakOutsideLoop`.
+    /// `ExprKind::Lambda` temporarily swaps this for an empty `Vec` while
+    /// checking its own body — a `break` must not escape through a closure
+    /// boundary (the same rule Rust enforces, for the same soundness
+    /// reason: a lambda can be called later, outside the loop's own frame).
+    loop_stack: Vec<Ty>,
     /// A bare name in *type* position that resolves to a known `algebra`
     /// (and isn't also a known `struct`) — `(name, span)`, checked once at
     /// `finish_fn` time, same deferred shape as `constraints`/
@@ -1371,6 +1398,7 @@ impl<'r> Infer<'r> {
             target_types: Vec::new(),
             active_generics: HashMap::new(),
             quantified: HashSet::new(),
+            loop_stack: Vec::new(),
             pending_type_name_checks: Vec::new(),
             pending_div_by_zero_checks: Vec::new(),
             in_progress_methods: HashMap::new(),
@@ -3900,6 +3928,28 @@ impl<'r> Infer<'r> {
                 StmtKind::Expr(e) => {
                     self.infer_expr(&env, e)?;
                 }
+                StmtKind::Break(value) => {
+                    let Some(accumulator) = self.loop_stack.last().cloned() else {
+                        return Err(TypeError { span: stmt.span, kind: TypeErrorKind::BreakOutsideLoop });
+                    };
+                    // A bare `break;` is `break ();` for typing purposes —
+                    // legal in *any* loop kind, since `While`/`For`/`ForIn`
+                    // pin their own accumulator to `Ty::Con("()")` on push
+                    // (see `loop_stack`'s own doc comment): a `break value;`
+                    // whose value isn't `()` naturally, mechanically fails to
+                    // unify against it — an ordinary `Unify` mismatch, not a
+                    // bespoke diagnostic, the same way `if`/`else` branch
+                    // mismatches already work.
+                    match value {
+                        Some(v) => {
+                            let value_ty = self.infer_expr(&env, v)?;
+                            self.unify_at(v.span, &accumulator, &value_ty)?;
+                        }
+                        None => {
+                            self.unify_at(stmt.span, &accumulator, &Ty::Con("()".to_string()))?;
+                        }
+                    }
+                }
             }
         }
         match &block.tail {
@@ -4034,16 +4084,24 @@ impl<'r> Infer<'r> {
                     }
                 }
             }
-            // A `while`/`for` loop's own value is always `()`, unconditionally
-            // — same reasoning as an `if` with no `else` (see that arm's own
-            // comment just above): the body might run zero times (`while`)
-            // or its per-iteration result is discarded either way (there's
-            // no `break value` mechanism), so nothing meaningful could ever
-            // come out of evaluating one as an expression.
+            // A `while`/`for`/`for-in` loop's own value is always `()`,
+            // unconditionally — same reasoning as an `if` with no `else`
+            // (see that arm's own comment just above): the body might run
+            // zero times, or its per-iteration result is discarded either
+            // way, and a `break value;` inside one is rejected (an ordinary
+            // `Unify` mismatch against the pinned `()` accumulator pushed
+            // here) — only `ExprKind::Loop`, below, can produce a real
+            // value. `loop_stack` is pushed/popped around the body's own
+            // inference regardless of whether it actually contains a
+            // `break` — cheap, and lets a `break` inside a *nested* loop
+            // correctly see its own nearest enclosing entry.
             ExprKind::While { cond, body } => {
                 let cond_ty = self.infer_expr(env, cond)?;
                 self.unify_at(cond.span, &Ty::Con("bool".to_string()), &cond_ty)?;
-                self.infer_block(env, body)?;
+                self.loop_stack.push(Ty::Con("()".to_string()));
+                let result = self.infer_block(env, body);
+                self.loop_stack.pop();
+                result?;
                 Ok(Ty::Con("()".to_string()))
             }
             ExprKind::For { var, start, end, body } => {
@@ -4060,7 +4118,10 @@ impl<'r> Infer<'r> {
                 // `infer_block` clones `inner_env` again internally — the
                 // same cheap-clone tradeoff `Lambda`'s own handling above
                 // already makes.
-                self.infer_block(&inner_env, body)?;
+                self.loop_stack.push(Ty::Con("()".to_string()));
+                let result = self.infer_block(&inner_env, body);
+                self.loop_stack.pop();
+                result?;
                 Ok(Ty::Con("()".to_string()))
             }
             // `iter` must be a real, homogeneous array — unifying against a
@@ -4077,8 +4138,28 @@ impl<'r> Infer<'r> {
                 self.unify_at(iter.span, &Ty::Array(Box::new(elem_ty.clone()), Box::new(size_ty)), &iter_ty)?;
                 let mut inner_env = env.clone();
                 inner_env.insert(var.clone(), Scheme::mono(elem_ty));
-                self.infer_block(&inner_env, body)?;
+                self.loop_stack.push(Ty::Con("()".to_string()));
+                let result = self.infer_block(&inner_env, body);
+                self.loop_stack.pop();
+                result?;
                 Ok(Ty::Con("()".to_string()))
+            }
+            // `loop { ... break value; ... }` — unconditional, the only loop
+            // kind that can produce a real value: a fresh accumulator var,
+            // unified against by every `break` directly inside it (see
+            // `loop_stack`'s own doc comment), read back here exactly like a
+            // `let`'s own scheme is read back after `generalize`. A `loop`
+            // with no `break` anywhere inside it simply never gets its
+            // accumulator unified against anything — stays a bare, permissive
+            // `Ty::Var`, the same "under-determined stays permissive" posture
+            // an empty array literal's own element type already has.
+            ExprKind::Loop { body } => {
+                let accumulator = self.vars.fresh();
+                self.loop_stack.push(accumulator.clone());
+                let result = self.infer_block(env, body);
+                self.loop_stack.pop();
+                result?;
+                Ok(self.subst.apply(&accumulator))
             }
             ExprKind::MethodCall(base, name, args) => {
                 let base_ty = self.infer_expr(env, base)?;
@@ -4407,7 +4488,15 @@ impl<'r> Infer<'r> {
                 // `infer_block` clones `inner_env` again internally — fine,
                 // it's the same cheap-clone tradeoff already made everywhere
                 // else (see `infer_block`'s own doc comment).
-                let body_ty = self.infer_block(&inner_env, body)?;
+                //
+                // `loop_stack` swapped for empty while checking the body —
+                // a `break` must not escape through a closure boundary (see
+                // `loop_stack`'s own doc comment), even when the lambda is
+                // lexically written inside a loop.
+                let outer_loop_stack = std::mem::take(&mut self.loop_stack);
+                let body_ty = self.infer_block(&inner_env, body);
+                self.loop_stack = outer_loop_stack;
+                let body_ty = body_ty?;
                 if let Some(r) = ret {
                     let declared = self.ty_from_ast_mapped(r, &self.active_generics.clone());
                     self.unify_at(r.span, &declared, &body_ty)?;

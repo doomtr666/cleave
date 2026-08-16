@@ -104,7 +104,7 @@ use crate::ast::*;
 use crate::infer::{ConstValue, Infer, Ty};
 use crate::monomorphize;
 use crate::registry::Registry;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
@@ -506,7 +506,7 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
             let captures = lambda_free_vars(own_params, body, node_types);
             let capture_names = sorted_capture_names(&captures);
 
-            let mut params: Vec<Param> = capture_names.iter().map(|n| Param { name: n.clone(), ty: None }).collect();
+            let mut params: Vec<Param> = capture_names.iter().map(|n| Param { name: n.clone(), ty: None, mutable: false }).collect();
             params.extend(own_params.iter().cloned());
             let mut param_types: Vec<Ty> = capture_names.iter().map(|n| captures[n].clone()).collect();
             param_types.extend(mono.param_types(key).iter().cloned());
@@ -978,6 +978,71 @@ struct Ctx<'a> {
     /// comment.
     higher_order_args: &'a HashMap<NodeId, Vec<usize>>,
     fresh: &'a FreshVars,
+    /// One entry per currently-open, break-guarded loop (`While`/`For`/
+    /// `ForIn`/`Loop` — only ones `loop_contains_break` found to actually
+    /// need one), nearest-enclosing last — read by both `StmtKind::Break`'s
+    /// own conversion (`convert_stmts`) and `ExprKind::If`'s own (which
+    /// needs to know whether to thread `running`/`break_val` through its own
+    /// join too — see `BreakTarget`'s own doc comment for why). A
+    /// `RefCell`, not a new parameter threaded through `convert_expr`/
+    /// `convert_block`'s own signatures (which would mean touching every
+    /// one of their many recursive call sites): `Ctx` is already threaded
+    /// everywhere as `&Ctx`, and conversion is single-threaded/synchronous
+    /// (build, don't execute, the CPS tree), so a push-before-body/pop-
+    /// after stack here is sound and far less invasive. Always empty at the
+    /// start of a unit's own conversion (`Ctx` is rebuilt fresh per unit) —
+    /// a break can never leak across units, which is also why `infer.rs`'s
+    /// own, separate `loop_stack` already rejects one outside any loop
+    /// before this module ever sees the program at all.
+    break_targets: RefCell<Vec<BreakTarget>>,
+}
+
+/// The currently-open, break-guarded loop's own two synthetic carried slots
+/// — everything `ExprKind::If`'s own conversion needs to decide whether (and
+/// how) to thread `running`/`break_val` through its own join. Two real
+/// things found directly by testing, neither obvious upfront, that shaped
+/// the final design (`ExprKind::If`'s own conversion, `continue_after`,
+/// below `convert_stmts`):
+///
+/// **Reaching the loop is *not* a direct jump.** An earlier design had
+/// `break`'s own conversion build `App{Label(loop_label), ..}` itself,
+/// bypassing whatever continuation it was given — hit a real `scf.if`
+/// verification failure ("region successor needs 0 inputs"): both of an
+/// `scf.if`'s own regions must `scf.yield` the exact same arity every time,
+/// so a bare tail-call to some *other* label from deep inside one region
+/// doesn't type-check as far as MLIR's own structured control flow is
+/// concerned. Fixed by having `break` call the *current* continuation `k`
+/// instead, with `running`/`break_val` overridden in the env it hands over —
+/// an ordinary tail-call `lower_if`/`lower_loop` already know how to lower,
+/// no new MLIR shape needed.
+///
+/// **Threading `running`/`break_val` through every intervening `if`-join
+/// (as an ordinary outer-mutated variable — `ExprKind::If`'s own conversion
+/// checks `loop_contains_break` on its own branches for exactly this,
+/// pushing these same two `CVar`s into its own `carried` list when needed)
+/// is necessary, but *not* sufficient by itself.** Confirmed by a second,
+/// independent test failure (wrong numeric result, not a crash): once
+/// `running` correctly reads `false` after the `if`, *ordinary* control flow
+/// still continued normally past it — anything textually following the `if`
+/// in the same block (`sum = sum + i;` in the actual repro) kept executing
+/// once more, with stale values, before the loop's own *next* condition
+/// check finally caught `running == false`. The missing piece: `running`
+/// being readable as `false` isn't the same as something *acting* on it —
+/// `convert_stmts`'s own `continue_after` helper is what actually stops
+/// "the rest of this block" from running once broken, checked once per
+/// statement-sequencing point, not here.
+#[derive(Clone)]
+struct BreakTarget {
+    running: CVar,
+    /// `None` for `While`/`For`/`ForIn` (their own accumulator is always
+    /// `()` — nothing meaningful to carry, see `infer.rs`'s own
+    /// `loop_stack`) and for a `Loop` whose own resolved type happens to be
+    /// `()` too — `Some((var, ty))` only when a `break value;` inside this
+    /// loop could carry something real; `ty` is needed so an intermediate
+    /// `if`'s own join (see this struct's own doc comment) can build a
+    /// correctly-typed carried slot without needing access to the original
+    /// `Loop` node itself.
+    break_val: Option<(CVar, Ty)>,
 }
 
 type CEnv = HashMap<String, CVal>;
@@ -1028,6 +1093,7 @@ pub fn convert_program(units: Vec<ConcreteUnit>) -> CpsProgram {
             call_names: &unit.call_names,
             higher_order_args: &unit.higher_order_args,
             fresh: &fresh,
+            break_targets: RefCell::new(Vec::new()),
         };
         let mut env = CEnv::new();
         let mut params = Vec::with_capacity(unit.params.len() + 1);
@@ -1073,10 +1139,127 @@ fn convert_block(block: &Block, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -
     })
 }
 
+/// Continues converting `rest` (the remaining statements in the *current*
+/// block) — unless `might_break` (the statement just converted, via
+/// `stmt_contains_break`, might have just set `running := false`), in which
+/// case `rest`'s own conversion is guarded: reads `running` directly from
+/// `env` and, if `false`, skips `rest` entirely, reaching `k` immediately
+/// instead — otherwise `rest` runs normally, itself eventually reaching the
+/// *same* `k`. This — not `ExprKind::If`'s own join — is where `break`'s
+/// own "stop everything, right here" semantics is actually enforced, found
+/// directly by testing, the hard way: an earlier version of this fix
+/// threaded `running`/`break_val` through every enclosing `if`'s own join
+/// (still necessary, and still done — see `ExprKind::If`'s own conversion)
+/// but stopped there, letting the join unconditionally call `k` regardless
+/// of `running`'s own value — which type-checked and ran, but produced a
+/// silently *wrong* number: `sum = sum + i;`, textually following an `if i
+/// == 5 { break; }`, kept right on executing (with stale, post-break
+/// values) every single time, since nothing was actually stopping it.
+/// `running` only ever *reads* correctly here because `ExprKind::If`'s own
+/// join already threaded it through; this function is what actually *acts*
+/// on it.
+///
+/// Reuses the exact join-building shape `ExprKind::If`'s own conversion
+/// already uses for a real, source-level `if` (`Fix{defs:[join], body:
+/// If{...}}`, `tail_call_join`) — synthesized here rather than built from
+/// real source syntax, since there's no actual `if`-expression in the
+/// user's own source at this exact point; both arms already terminate on
+/// their own once they reach `k`, so this needs a real join (`k` itself is
+/// opaque, can't be "checked" from outside — the whole reason this can't
+/// just be `if running { convert_stmts(rest,...) } else { k(...) }` as a
+/// bare Rust `if`).
+fn continue_after(rest: &[Stmt], env: CEnv, ctx: &Ctx, might_break: bool, k: &dyn Fn(CEnv) -> CExpr) -> CExpr {
+    if !might_break {
+        return convert_stmts(rest, env, ctx, k);
+    }
+    let running = env
+        .get("__loop_running")
+        .cloned()
+        .unwrap_or_else(|| panic!("CPS: expected `__loop_running` to already be bound by this point"));
+
+    // Whatever `rest` itself mutates in an *enclosing* scope — needed so
+    // the "skip" path still hands `k` the correct, unmodified values for
+    // anything `rest` would otherwise have gone on to reassign.
+    let mutated = mutated_free_vars_stmts(rest, &HashSet::new(), ctx);
+    let mut names: Vec<String> = mutated.keys().cloned().collect();
+    names.sort();
+    let carried: Vec<(String, CVar)> = names.iter().map(|n| (n.clone(), ctx.fresh.var())).collect();
+    let carried_types: Vec<Ty> = names.iter().map(|n| mutated[n].clone()).collect();
+
+    let join_label = ctx.fresh.label("j");
+    let then_cexpr = convert_stmts(rest, env.clone(), ctx, &|env2| tail_call_join(&env2, CVal::Unit, &carried, &join_label));
+    let else_cexpr = tail_call_join(&env, CVal::Unit, &carried, &join_label);
+
+    let result_var = ctx.fresh.var();
+    let mut join_params = vec![result_var];
+    join_params.extend(carried.iter().map(|(_, v)| *v));
+    let join_body = {
+        let mut env2 = env.clone();
+        for (name, var) in &carried {
+            env2.insert(name.clone(), CVal::Var(*var));
+        }
+        k(env2)
+    };
+    // Position 0 (the "value") is always unit here (this join has no real
+    // source-level `if`-expression's own value, only a statement sequence)
+    // — `lower_if` already filters a unit-typed value position out of its
+    // own `scf.if` results, matching a bodyless/statement-position real
+    // `if`'s own identical treatment.
+    let mut join_types = vec![Ty::Con("()".to_string())];
+    join_types.extend(carried_types);
+
+    CExpr::Fix {
+        defs: vec![CFunDef { name: join_label, params: join_params, body: join_body, carried_types: Some(join_types) }],
+        body: Box::new(CExpr::If { cond: running, then_branch: Box::new(then_cexpr), else_branch: Box::new(else_cexpr) }),
+    }
+}
+
+/// The same per-statement scan `mutated_free_vars` already does, applied to
+/// a raw statement *slice* directly — no `block.tail` to also account for
+/// (used only by `continue_after`, above, for "what does `rest` itself
+/// mutate," and `rest` is always a suffix of some block's own `stmts`,
+/// never that block's own trailing tail expression).
+fn mutated_free_vars_stmts(stmts: &[Stmt], shadowed: &HashSet<String>, ctx: &Ctx) -> HashMap<String, Ty> {
+    let mut local_shadowed = shadowed.clone();
+    let mut escaping = HashMap::new();
+    for stmt in stmts {
+        match &stmt.kind {
+            StmtKind::Let { name, value, .. } => {
+                escaping.extend(mutated_free_vars_expr(value, &local_shadowed, ctx));
+                local_shadowed.insert(name.clone());
+            }
+            StmtKind::Assign { target, value } => {
+                escaping.extend(mutated_free_vars_expr(value, &local_shadowed, ctx));
+                if let ExprKind::Path(p) = &target.kind {
+                    let name = p.segments.join("::");
+                    if !local_shadowed.contains(&name) {
+                        escaping.insert(name, ctx.node_types[&target.id].clone());
+                    }
+                }
+            }
+            StmtKind::Expr(e) => escaping.extend(mutated_free_vars_expr(e, &local_shadowed, ctx)),
+            StmtKind::Break(value) => {
+                if let Some(v) = value {
+                    escaping.extend(mutated_free_vars_expr(v, &local_shadowed, ctx));
+                }
+            }
+        }
+    }
+    escaping
+}
+
 fn convert_stmts(stmts: &[Stmt], env: CEnv, ctx: &Ctx, k: &dyn Fn(CEnv) -> CExpr) -> CExpr {
     let Some((stmt, rest)) = stmts.split_first() else {
         return k(env);
     };
+    // Whether *this* statement (its own value expression, or a nested `if`
+    // inside it) could have set `running := false` — checked once, up
+    // front, and threaded into every one of this match's own "now continue
+    // with `rest`" calls below (`continue_after`, not `convert_stmts`
+    // directly) — see `continue_after`'s own doc comment for why this,
+    // rather than `ExprKind::If`'s own join, is where `break`'s "stop
+    // everything, right here" semantics actually has to be enforced.
+    let might_break = stmt_contains_break(stmt);
     match &stmt.kind {
         // `mutable` doesn't matter to conversion itself -- both an ordinary
         // `let` and a `let mut` just (re)bind a name in `env`; the ML-style
@@ -1110,24 +1293,24 @@ fn convert_stmts(stmts: &[Stmt], env: CEnv, ctx: &Ctx, k: &dyn Fn(CEnv) -> CExpr
                 .collect();
             let mut env2 = env.clone();
             env2.insert(name.clone(), CVal::Closure { captures });
-            convert_stmts(rest, env2, ctx, k)
+            continue_after(rest, env2, ctx, might_break, k)
         }
         StmtKind::Let { name, value, .. } => {
             let name = name.clone();
             convert_expr(value, &env, ctx, &|v, env| {
                 let mut env2 = env.clone();
                 env2.insert(name.clone(), v);
-                convert_stmts(rest, env2, ctx, k)
+                continue_after(rest, env2, ctx, might_break, k)
             })
         }
-        StmtKind::Expr(e) => convert_expr(e, &env, ctx, &|_v, env| convert_stmts(rest, env.clone(), ctx, k)),
+        StmtKind::Expr(e) => convert_expr(e, &env, ctx, &|_v, env| continue_after(rest, env.clone(), ctx, might_break, k)),
         StmtKind::Assign { target, value } => match &target.kind {
             ExprKind::Path(p) => {
                 let name = p.segments.join("::");
                 convert_expr(value, &env, ctx, &|v, env| {
                     let mut env2 = env.clone();
                     env2.insert(name.clone(), v);
-                    convert_stmts(rest, env2, ctx, k)
+                    continue_after(rest, env2, ctx, might_break, k)
                 })
             }
             // A chain of one or more `Index` *groups* (`a[i,j]`'s own single
@@ -1162,7 +1345,7 @@ fn convert_stmts(stmts: &[Stmt], env: CEnv, ctx: &Ctx, k: &dyn Fn(CEnv) -> CExpr
                                 ty: Ty::Con("()".to_string()),
                                 op: PrimOp::Store { array_ty: array_ty.clone() },
                                 args,
-                                cont: Box::new(convert_stmts(rest, env.clone(), ctx, k)),
+                                cont: Box::new(continue_after(rest, env.clone(), ctx, might_break, k)),
                             }
                         })
                     })
@@ -1184,13 +1367,61 @@ fn convert_stmts(stmts: &[Stmt], env: CEnv, ctx: &Ctx, k: &dyn Fn(CEnv) -> CExpr
                             ty: Ty::Con("()".to_string()),
                             op: PrimOp::FieldStore { struct_ty: struct_ty.clone(), field: field.clone() },
                             args: vec![base_val.clone(), new_val],
-                            cont: Box::new(convert_stmts(rest, env.clone(), ctx, k)),
+                            cont: Box::new(continue_after(rest, env.clone(), ctx, might_break, k)),
                         }
                     })
                 })
             }
             other => panic!("CPS: unexpected assignment target {other:?}"),
         },
+        // `break;`/`break value;` — *not* a direct jump to the target loop's
+        // own label (an earlier design tried exactly that, and hit a real,
+        // confirmed-by-testing `scf.if` verification failure: its own
+        // regions must `scf.yield` the *same* arity every time, so a break
+        // nested inside an `if` can't just skip past it at the MLIR level).
+        // Instead: call the *current* continuation `k` (whatever it already
+        // is — an enclosing `if`'s own join-tail-call, or the loop's own
+        // natural per-iteration one, if this `break` sits directly in the
+        // loop body) with `running`/`break_val` overridden in the env handed
+        // to it — the exact same "carry an outer mutation through" mechanism
+        // `ExprKind::If`'s own conversion already uses for an *ordinary*
+        // reassignment, reused here rather than reinvented (that arm checks
+        // `loop_contains_break` on its own branches and threads these same
+        // two `CVar`s through its own join whenever needed — see
+        // `BreakTarget`'s own doc comment for the full picture). The next
+        // condition check naturally exits through the loop's own *existing*
+        // natural-exit path once `running` reads false. `rest` (whatever
+        // textually follows this `break` in the same block) is never
+        // converted at all — dead code, exactly mirroring how the loop's
+        // own natural tail-recursion already never invokes the *outer* `k`
+        // either. `infer.rs`'s own `loop_stack` already guarantees a target
+        // exists; the `RefCell`'s own borrow is dropped *before* converting
+        // `value`, not held across it — `value` can itself contain a nested
+        // loop with its own `break`, which would need its own `borrow_mut`
+        // on the same `Ctx`.
+        StmtKind::Break(value) => {
+            let target = ctx
+                .break_targets
+                .borrow()
+                .last()
+                .cloned()
+                .unwrap_or_else(|| panic!("CPS: `break` outside any loop -- infer.rs should have rejected this already"));
+            match value {
+                Some(v) => convert_expr(v, &env, ctx, &|break_val, break_env| {
+                    let mut modified_env = break_env.clone();
+                    modified_env.insert("__loop_running".to_string(), CVal::Bool(false));
+                    if target.break_val.is_some() {
+                        modified_env.insert("__break_value".to_string(), break_val);
+                    }
+                    k(modified_env)
+                }),
+                None => {
+                    let mut modified_env = env.clone();
+                    modified_env.insert("__loop_running".to_string(), CVal::Bool(false));
+                    k(modified_env)
+                }
+            }
+        }
     }
 }
 
@@ -1419,8 +1650,40 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
             let mut names: Vec<String> = mutated.keys().cloned().collect();
             names.sort();
             names.dedup();
-            let carried: Vec<(String, CVar)> = names.iter().map(|n| (n.clone(), ctx.fresh.var())).collect();
-            let carried_types: Vec<Ty> = names.iter().map(|n| mutated[n].clone()).collect();
+            let mut carried: Vec<(String, CVar)> = names.iter().map(|n| (n.clone(), ctx.fresh.var())).collect();
+            let mut carried_types: Vec<Ty> = names.iter().map(|n| mutated[n].clone()).collect();
+
+            // `break` support (`doc/backlog-done.md`'s own "break value"
+            // item): if either branch contains a `break` targeting an
+            // *enclosing* loop (not a further-nested one — the exact same
+            // scoping `loop_contains_break` already uses for the loop-
+            // conversion sites), this if's own join must *also* carry
+            // `running`/`break_val` through, exactly like an ordinary
+            // outer-mutated variable — `scf.if`'s own structural typing
+            // requires both regions to `scf.yield` the same arity regardless
+            // of which one actually ran, so a `break` can't just "skip past"
+            // this join at the MLIR level (see `BreakTarget`'s own doc
+            // comment for the full story, including the real verification
+            // failure this was found by).
+            let branch_has_break = loop_contains_break(then_branch)
+                || match else_branch {
+                    Some(eb) => match &**eb {
+                        ElseBranch::If(e) => expr_contains_break(e),
+                        ElseBranch::Block(b) => loop_contains_break(b),
+                    },
+                    None => false,
+                };
+            if branch_has_break {
+                let target = ctx.break_targets.borrow().last().cloned().unwrap_or_else(|| {
+                    panic!("CPS: an `if` branch contains `break` but no loop is currently open -- infer.rs should have rejected this already")
+                });
+                carried.push(("__loop_running".to_string(), target.running));
+                carried_types.push(Ty::Con("bool".to_string()));
+                if let Some((bv, bv_ty)) = &target.break_val {
+                    carried.push(("__break_value".to_string(), *bv));
+                    carried_types.push(bv_ty.clone());
+                }
+            }
 
             let result_var = ctx.fresh.var();
             let join_label = ctx.fresh.label("j");
@@ -1444,6 +1707,15 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                 for (name, var) in &carried {
                     env2.insert(name.clone(), CVal::Var(*var));
                 }
+                // Just an ordinary call to `k` — `running`/`break_val`
+                // (already correctly threaded into `env2` above whenever
+                // this if's own branches contained a `break`) are *read*,
+                // not acted on, here. Actually stopping "the rest of the
+                // block" from running once broken is `continue_after`'s own
+                // job (see its own doc comment for why it has to live there
+                // instead of here — a real bug, found by testing, in an
+                // earlier version of this fix that tried to short-circuit
+                // right at this join instead).
                 k(CVal::Var(result_var), &env2)
             };
 
@@ -1478,8 +1750,21 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
             let mut names: Vec<String> = mutated.keys().cloned().collect();
             names.sort();
             names.dedup();
-            let carried: Vec<(String, CVar)> = names.iter().map(|n| (n.clone(), ctx.fresh.var())).collect();
-            let carried_types: Vec<Ty> = names.iter().map(|n| mutated[n].clone()).collect();
+            let mut carried: Vec<(String, CVar)> = names.iter().map(|n| (n.clone(), ctx.fresh.var())).collect();
+            let mut carried_types: Vec<Ty> = names.iter().map(|n| mutated[n].clone()).collect();
+            let mut init_args = gather_carried(&carried, env);
+
+            // `break` support (`doc/backlog-done.md`'s own "break value"
+            // item) — only added when the body actually contains one
+            // (`loop_contains_break`), so a loop that never breaks compiles
+            // to exactly the same MLIR as before this feature existed.
+            let guarded = loop_contains_break(body);
+            let running_var = ctx.fresh.var();
+            if guarded {
+                carried.push(("__loop_running".to_string(), running_var));
+                carried_types.push(Ty::Con("bool".to_string()));
+                init_args.push(CVal::Bool(true));
+            }
 
             let loop_label = ctx.fresh.label("loop");
             let mut loop_env = env.clone();
@@ -1487,17 +1772,46 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                 loop_env.insert(name.clone(), CVal::Var(*var));
             }
 
+            if guarded {
+                ctx.break_targets.borrow_mut().push(BreakTarget { running: running_var, break_val: None });
+            }
+
             let check = convert_expr(cond, &loop_env, ctx, &|cond_val, cond_env| {
-                let then_cexpr = convert_block(body, cond_env, ctx, &|_v, body_env| CExpr::App {
-                    func: CVal::Label(loop_label.clone()),
-                    args: gather_carried(&carried, body_env),
-                });
-                let else_cexpr = k(CVal::Unit, cond_env);
-                CExpr::If { cond: cond_val, then_branch: Box::new(then_cexpr), else_branch: Box::new(else_cexpr) }
+                // Built via a closure, called (not captured-and-moved) from
+                // either branch below — `then_cexpr`/`else_cexpr` need to be
+                // *freshly constructed* each time, not built once outside
+                // and moved into an `&dyn Fn` closure (which `emit_call`'s
+                // own `k` parameter is — moving a captured value out of an
+                // `Fn` closure's body doesn't type-check, even though this
+                // one is only ever actually invoked once).
+                let build_if = |c: CVal, e: &CEnv| {
+                    let then_cexpr = convert_block(body, e, ctx, &|_v, body_env| CExpr::App {
+                        func: CVal::Label(loop_label.clone()),
+                        args: gather_carried(&carried, body_env),
+                    });
+                    let else_cexpr = k(CVal::Unit, e);
+                    CExpr::If { cond: c, then_branch: Box::new(then_cexpr), else_branch: Box::new(else_cexpr) }
+                };
+                if guarded {
+                    // `running AND cond` — the exact chained-call condition
+                    // shape `mlir_lower.rs::lower_loop` already walks
+                    // (`doc/backlog-done.md`'s own "a while-loop condition
+                    // needing more than one chained real call" item).
+                    // `Logic` is a prelude crate, so `Logic::and<bool>` is
+                    // always a resolvable unit name.
+                    emit_call("Logic::and<bool>", vec![CVal::Var(running_var), cond_val], Ty::Con("bool".to_string()), ctx, cond_env, &|and_val, and_env| {
+                        build_if(and_val, and_env)
+                    })
+                } else {
+                    build_if(cond_val, cond_env)
+                }
             });
 
+            if guarded {
+                ctx.break_targets.borrow_mut().pop();
+            }
+
             let params: Vec<CVar> = carried.iter().map(|(_, v)| *v).collect();
-            let init_args = gather_carried(&carried, env);
             CExpr::Fix {
                 defs: vec![CFunDef { name: loop_label.clone(), params, body: check, carried_types: Some(carried_types) }],
                 body: Box::new(CExpr::App { func: CVal::Label(loop_label), args: init_args }),
@@ -1517,8 +1831,10 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                 let mutated: HashMap<String, Ty> = mutated_free_vars(body, &shadowed, ctx);
                 let mut names: Vec<String> = mutated.keys().cloned().collect();
                 names.sort();
-                let carried: Vec<(String, CVar)> = names.iter().map(|n| (n.clone(), ctx.fresh.var())).collect();
-                let carried_types: Vec<Ty> = names.iter().map(|n| mutated[n].clone()).collect();
+                let mut carried: Vec<(String, CVar)> = names.iter().map(|n| (n.clone(), ctx.fresh.var())).collect();
+                let mut carried_types: Vec<Ty> = names.iter().map(|n| mutated[n].clone()).collect();
+                let mut init_args = vec![start_val.clone()];
+                init_args.extend(gather_carried(&carried, env));
 
                 // `lt`/`add` are never written as calls in the source (the
                 // grammar bakes the count-up directly into `for`), so
@@ -1555,28 +1871,53 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                 let i_var = ctx.fresh.var();
                 let loop_label = ctx.fresh.label("loop");
 
+                // Break support (see `ExprKind::While`'s own identical
+                // comment) — only added when `body` actually contains one.
+                let guarded = loop_contains_break(body);
+                let running_var = ctx.fresh.var();
+                if guarded {
+                    carried.push(("__loop_running".to_string(), running_var));
+                    carried_types.push(Ty::Con("bool".to_string()));
+                    init_args.push(CVal::Bool(true));
+                }
+
                 let mut body_env = env.clone();
                 body_env.insert(var.clone(), CVal::Var(i_var));
                 for (name, v) in &carried {
                     body_env.insert(name.clone(), CVal::Var(*v));
                 }
 
+                if guarded {
+                    ctx.break_targets.borrow_mut().push(BreakTarget { running: running_var, break_val: None });
+                }
+
                 let cond_check = emit_call(&lt_unit, vec![CVal::Var(i_var), end_val], bool_ty, ctx, &body_env, &|cond_val, cond_env| {
-                    let then_cexpr = convert_block(body, cond_env, ctx, &|_v, body_end_env| {
-                        emit_call(&add_unit, vec![CVal::Var(i_var), CVal::Int(1)], idx_ty.clone(), ctx, body_end_env, &|next_i, incr_env| {
-                            let mut args = vec![next_i];
-                            args.extend(gather_carried(&carried, incr_env));
-                            CExpr::App { func: CVal::Label(loop_label.clone()), args }
+                    let build_if = |c: CVal, e: &CEnv| {
+                        let then_cexpr = convert_block(body, e, ctx, &|_v, body_end_env| {
+                            emit_call(&add_unit, vec![CVal::Var(i_var), CVal::Int(1)], idx_ty.clone(), ctx, body_end_env, &|next_i, incr_env| {
+                                let mut args = vec![next_i];
+                                args.extend(gather_carried(&carried, incr_env));
+                                CExpr::App { func: CVal::Label(loop_label.clone()), args }
+                            })
+                        });
+                        let else_cexpr = k(CVal::Unit, e);
+                        CExpr::If { cond: c, then_branch: Box::new(then_cexpr), else_branch: Box::new(else_cexpr) }
+                    };
+                    if guarded {
+                        emit_call("Logic::and<bool>", vec![CVal::Var(running_var), cond_val], Ty::Con("bool".to_string()), ctx, cond_env, &|and_val, and_env| {
+                            build_if(and_val, and_env)
                         })
-                    });
-                    let else_cexpr = k(CVal::Unit, cond_env);
-                    CExpr::If { cond: cond_val, then_branch: Box::new(then_cexpr), else_branch: Box::new(else_cexpr) }
+                    } else {
+                        build_if(cond_val, cond_env)
+                    }
                 });
+
+                if guarded {
+                    ctx.break_targets.borrow_mut().pop();
+                }
 
                 let mut params = vec![i_var];
                 params.extend(carried.iter().map(|(_, v)| *v));
-                let mut init_args = vec![start_val.clone()];
-                init_args.extend(gather_carried(&carried, env));
                 let mut all_carried_types = vec![idx_ty.clone()];
                 all_carried_types.extend(carried_types);
 
@@ -1617,8 +1958,10 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
             let mutated: HashMap<String, Ty> = mutated_free_vars(body, &shadowed, ctx);
             let mut names: Vec<String> = mutated.keys().cloned().collect();
             names.sort();
-            let carried: Vec<(String, CVar)> = names.iter().map(|n| (n.clone(), ctx.fresh.var())).collect();
-            let carried_types: Vec<Ty> = names.iter().map(|n| mutated[n].clone()).collect();
+            let mut carried: Vec<(String, CVar)> = names.iter().map(|n| (n.clone(), ctx.fresh.var())).collect();
+            let mut carried_types: Vec<Ty> = names.iter().map(|n| mutated[n].clone()).collect();
+            let mut init_args = vec![CVal::Int(0)];
+            init_args.extend(gather_carried(&carried, env));
 
             let idx_ty = Ty::Con("i32".to_string());
             let bool_ty = Ty::Con("bool".to_string());
@@ -1627,36 +1970,61 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
             let i_var = ctx.fresh.var();
             let loop_label = ctx.fresh.label("loop");
 
+            // Break support (see `ExprKind::While`'s own identical comment)
+            // — only added when `body` actually contains one.
+            let guarded = loop_contains_break(body);
+            let running_var = ctx.fresh.var();
+            if guarded {
+                carried.push(("__loop_running".to_string(), running_var));
+                carried_types.push(Ty::Con("bool".to_string()));
+                init_args.push(CVal::Bool(true));
+            }
+
             let mut body_env = env.clone();
             for (name, v) in &carried {
                 body_env.insert(name.clone(), CVal::Var(*v));
             }
 
+            if guarded {
+                ctx.break_targets.borrow_mut().push(BreakTarget { running: running_var, break_val: None });
+            }
+
             let cond_check = emit_call(&lt_unit, vec![CVal::Var(i_var), CVal::Int(n)], bool_ty, ctx, &body_env, &|cond_val, cond_env| {
-                let elem_var = ctx.fresh.var();
-                let mut elem_env = cond_env.clone();
-                elem_env.insert(var.clone(), CVal::Var(elem_var));
-                let then_cexpr = CExpr::LetPrim {
-                    var: elem_var,
-                    ty: elem_ty.clone(),
-                    op: PrimOp::Load { array_ty: array_ty.clone() },
-                    args: vec![iter_val.clone(), CVal::Var(i_var)],
-                    cont: Box::new(convert_block(body, &elem_env, ctx, &|_v, body_end_env| {
-                        emit_call(&add_unit, vec![CVal::Var(i_var), CVal::Int(1)], idx_ty.clone(), ctx, body_end_env, &|next_i, incr_env| {
-                            let mut args = vec![next_i];
-                            args.extend(gather_carried(&carried, incr_env));
-                            CExpr::App { func: CVal::Label(loop_label.clone()), args }
-                        })
-                    })),
+                let build_if = |c: CVal, e: &CEnv| {
+                    let elem_var = ctx.fresh.var();
+                    let mut elem_env = e.clone();
+                    elem_env.insert(var.clone(), CVal::Var(elem_var));
+                    let then_cexpr = CExpr::LetPrim {
+                        var: elem_var,
+                        ty: elem_ty.clone(),
+                        op: PrimOp::Load { array_ty: array_ty.clone() },
+                        args: vec![iter_val.clone(), CVal::Var(i_var)],
+                        cont: Box::new(convert_block(body, &elem_env, ctx, &|_v, body_end_env| {
+                            emit_call(&add_unit, vec![CVal::Var(i_var), CVal::Int(1)], idx_ty.clone(), ctx, body_end_env, &|next_i, incr_env| {
+                                let mut args = vec![next_i];
+                                args.extend(gather_carried(&carried, incr_env));
+                                CExpr::App { func: CVal::Label(loop_label.clone()), args }
+                            })
+                        })),
+                    };
+                    let else_cexpr = k(CVal::Unit, e);
+                    CExpr::If { cond: c, then_branch: Box::new(then_cexpr), else_branch: Box::new(else_cexpr) }
                 };
-                let else_cexpr = k(CVal::Unit, cond_env);
-                CExpr::If { cond: cond_val, then_branch: Box::new(then_cexpr), else_branch: Box::new(else_cexpr) }
+                if guarded {
+                    emit_call("Logic::and<bool>", vec![CVal::Var(running_var), cond_val], Ty::Con("bool".to_string()), ctx, cond_env, &|and_val, and_env| {
+                        build_if(and_val, and_env)
+                    })
+                } else {
+                    build_if(cond_val, cond_env)
+                }
             });
+
+            if guarded {
+                ctx.break_targets.borrow_mut().pop();
+            }
 
             let mut params = vec![i_var];
             params.extend(carried.iter().map(|(_, v)| *v));
-            let mut init_args = vec![CVal::Int(0)];
-            init_args.extend(gather_carried(&carried, env));
             let mut all_carried_types = vec![idx_ty.clone()];
             all_carried_types.extend(carried_types);
 
@@ -1665,6 +2033,83 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                 body: Box::new(CExpr::App { func: CVal::Label(loop_label), args: init_args }),
             }
         }),
+        // `loop { ... break value; ... }` (`doc/backlog-done.md`'s own
+        // "break value" item) — unconditional, exited only via `break`; the
+        // only loop kind that can produce a real value (`While`/`For`/
+        // `ForIn` always stay `()`-typed, see `infer.rs`'s own
+        // `loop_stack`). Closest in shape to `While`, but with no user
+        // condition at all — its own condition is simply the synthetic
+        // `running` flag, read directly (`CVal::Var`, no call needed at
+        // all) — the "zero calls before the terminal `If`" case
+        // `mlir_lower.rs::lower_loop`'s own condition-chain walk now also
+        // accepts, a natural generalization of "one or more calls" to
+        // "zero or more". Unlike `While`/`For`/`ForIn`, the guard here is
+        // never optional — a `loop` has no other condition to fall back
+        // on, so `running`/the break-value slot (if the loop's own
+        // resolved type isn't `()`) are always present.
+        ExprKind::Loop { body } => {
+            let mutated: HashMap<String, Ty> = mutated_free_vars(body, &HashSet::new(), ctx);
+            let mut names: Vec<String> = mutated.keys().cloned().collect();
+            names.sort();
+            let mut carried: Vec<(String, CVar)> = names.iter().map(|n| (n.clone(), ctx.fresh.var())).collect();
+            let mut carried_types: Vec<Ty> = names.iter().map(|n| mutated[n].clone()).collect();
+            let mut init_args = gather_carried(&carried, env);
+
+            let running_var = ctx.fresh.var();
+            carried.push(("__loop_running".to_string(), running_var));
+            carried_types.push(Ty::Con("bool".to_string()));
+            init_args.push(CVal::Bool(true));
+
+            let result_ty = ctx.node_types[&expr.id].clone();
+            let break_val_var = if matches!(&result_ty, Ty::Con(s) if s == "()") { None } else { Some(ctx.fresh.var()) };
+            if let Some(bv) = break_val_var {
+                carried.push(("__break_value".to_string(), bv));
+                carried_types.push(result_ty);
+                init_args.push(CVal::Unit);
+            }
+
+            let loop_label = ctx.fresh.label("loop");
+            let mut loop_env = env.clone();
+            for (name, var) in &carried {
+                loop_env.insert(name.clone(), CVal::Var(*var));
+            }
+
+            ctx.break_targets.borrow_mut().push(BreakTarget {
+                running: running_var,
+                break_val: break_val_var.map(|bv| (bv, ctx.node_types[&expr.id].clone())),
+            });
+
+            // A `loop` never falls through its own body to reach `k`
+            // naturally — the only way out is a `break` (`StmtKind::Break`,
+            // `convert_stmts`), converted into a direct tail-call back to
+            // `loop_label` with `running := false` (and, if this loop has a
+            // `break_val` slot, that slot set to the given value). The
+            // *next* condition check then sees `running == false` and takes
+            // this `else` branch — the same "exit through the loop's own
+            // next natural check" shape `While`/`For`/`ForIn` already use
+            // when guarded.
+            let then_cexpr = convert_block(body, &loop_env, ctx, &|_v, body_env| CExpr::App {
+                func: CVal::Label(loop_label.clone()),
+                args: gather_carried(&carried, body_env),
+            });
+            let else_val = match break_val_var {
+                Some(bv) => CVal::Var(bv),
+                None => CVal::Unit,
+            };
+            let check = CExpr::If {
+                cond: CVal::Var(running_var),
+                then_branch: Box::new(then_cexpr),
+                else_branch: Box::new(k(else_val, &loop_env)),
+            };
+
+            ctx.break_targets.borrow_mut().pop();
+
+            let params: Vec<CVar> = carried.iter().map(|(_, v)| *v).collect();
+            CExpr::Fix {
+                defs: vec![CFunDef { name: loop_label.clone(), params, body: check, carried_types: Some(carried_types) }],
+                body: Box::new(CExpr::App { func: CVal::Label(loop_label), args: init_args }),
+            }
+        }
         // Collapses a whole chain of nested `Index` nodes into one combined,
         // multi-index `Load` -- see `StmtKind::Assign`'s own `Index` arm for
         // why (the same reasoning applies to reads, for consistency, even
@@ -1839,6 +2284,57 @@ fn gather_carried(carried: &[(String, CVar)], env: &CEnv) -> Vec<CVal> {
         .collect()
 }
 
+/// Whether `block` contains a `break` (directly, or through nested `if`s and
+/// plain sub-blocks) that would target *this* loop specifically — stops at
+/// (doesn't descend into) a nested `While`/`For`/`ForIn`/`Loop`'s own body,
+/// since a `break` there targets *that* loop instead, matching the identical
+/// scoping rule `infer.rs`'s own `loop_stack` already enforces. Called once
+/// by each of the four loop-conversion sites to decide whether the "still
+/// running" guard machinery (`BreakTarget`, the synthetic carried slots) is
+/// needed at all — a loop that never breaks must compile to *exactly* the
+/// same MLIR it always has, zero added cost.
+fn loop_contains_break(block: &Block) -> bool {
+    block.stmts.iter().any(stmt_contains_break) || block.tail.as_deref().is_some_and(expr_contains_break)
+}
+
+fn stmt_contains_break(stmt: &Stmt) -> bool {
+    match &stmt.kind {
+        StmtKind::Break(_) => true,
+        StmtKind::Let { value, .. } => expr_contains_break(value),
+        StmtKind::Assign { target, value } => expr_contains_break(target) || expr_contains_break(value),
+        StmtKind::Expr(e) => expr_contains_break(e),
+    }
+}
+
+fn expr_contains_break(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::NumberLit { .. } | ExprKind::ImaginaryLit { .. } | ExprKind::BoolLit(_) | ExprKind::Path(_) => false,
+        ExprKind::Call(_, _, args, ..) => args.iter().any(expr_contains_break),
+        ExprKind::FieldAccess(base, _) => expr_contains_break(base),
+        ExprKind::MethodCall(base, _, args) => expr_contains_break(base) || args.iter().any(expr_contains_break),
+        ExprKind::Index(base, indices) => expr_contains_break(base) || indices.iter().any(expr_contains_break),
+        ExprKind::ArrayLit(elems) => elems.iter().any(expr_contains_break),
+        ExprKind::ArrayRepeat { value, count } => expr_contains_break(value) || expr_contains_break(count),
+        ExprKind::StructLit(_, _, fields) => fields.iter().any(|(_, v)| expr_contains_break(v)),
+        ExprKind::If { cond, then_branch, else_branch } => {
+            expr_contains_break(cond)
+                || loop_contains_break(then_branch)
+                || else_branch.as_deref().is_some_and(|eb| match eb {
+                    ElseBranch::If(e) => expr_contains_break(e),
+                    ElseBranch::Block(b) => loop_contains_break(b),
+                })
+        }
+        // A nested loop owns any `break` inside its own body — stop here,
+        // don't descend (see this function's own doc comment).
+        ExprKind::While { .. } | ExprKind::For { .. } | ExprKind::ForIn { .. } | ExprKind::Loop { .. } => false,
+        ExprKind::Block(b) => loop_contains_break(b),
+        // A lambda's own body is a separate scope a `break` can never escape
+        // (`infer.rs`'s own `loop_stack` suspension already rejects one that
+        // tries) — nothing to find here even if one were textually present.
+        ExprKind::Lambda { .. } => false,
+    }
+}
+
 /// Every name from an *enclosing* scope that `block` might reassign via a
 /// bare-path `StmtKind::Assign`, transitively through any nested `if`/
 /// `while`/`for`, mapped to its own concrete type (`ctx.node_types`, read
@@ -1871,6 +2367,11 @@ fn mutated_free_vars(block: &Block, shadowed: &HashSet<String>, ctx: &Ctx) -> Ha
                 }
             }
             StmtKind::Expr(e) => escaping.extend(mutated_free_vars_expr(e, &local_shadowed, ctx)),
+            StmtKind::Break(value) => {
+                if let Some(v) = value {
+                    escaping.extend(mutated_free_vars_expr(v, &local_shadowed, ctx));
+                }
+            }
         }
     }
     if let Some(tail) = &block.tail {
@@ -1932,6 +2433,7 @@ fn mutated_free_vars_expr(expr: &Expr, shadowed: &HashSet<String>, ctx: &Ctx) ->
             out.extend(mutated_free_vars(body, &inner, ctx));
             out
         }
+        ExprKind::Loop { body } => mutated_free_vars(body, shadowed, ctx),
         ExprKind::Block(b) => mutated_free_vars(b, shadowed, ctx),
         // A lambda's own body isn't walked here -- lambdas aren't converted
         // at all yet (closure conversion is a separate, later pass this
@@ -1991,6 +2493,11 @@ fn lambda_free_vars_block(block: &Block, shadowed: &HashSet<String>, node_types:
                 free.extend(lambda_free_vars_expr(value, &local_shadowed, node_types));
             }
             StmtKind::Expr(e) => free.extend(lambda_free_vars_expr(e, &local_shadowed, node_types)),
+            StmtKind::Break(value) => {
+                if let Some(v) = value {
+                    free.extend(lambda_free_vars_expr(v, &local_shadowed, node_types));
+                }
+            }
         }
     }
     if let Some(tail) = &block.tail {
@@ -2067,6 +2574,7 @@ fn lambda_free_vars_expr(expr: &Expr, shadowed: &HashSet<String>, node_types: &H
             out.extend(lambda_free_vars_block(body, &inner, node_types));
             out
         }
+        ExprKind::Loop { body } => lambda_free_vars_block(body, shadowed, node_types),
         ExprKind::Block(b) => lambda_free_vars_block(b, shadowed, node_types),
         ExprKind::Lambda { params, body, .. } => {
             let mut inner = shadowed.clone();

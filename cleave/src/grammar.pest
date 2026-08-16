@@ -81,7 +81,13 @@ generic_param  = { "const" ~ ident ~ ":" ~ type_ | ident ~ (":" ~ bound_list)? }
 bound_list     = { ident ~ ("+" ~ ident)* }
 
 param_list = { param ~ ("," ~ param)* }
-param      = { ident ~ (":" ~ type_)? }
+// `mut_kw?` mirrors `let_stmt`'s own identical `mut` marker -- a parameter
+// mutable enough to have its own fields reassigned through it (`v.buf = x`,
+// `check_mutability`'s own `assign_target_root` walks a field-assignment
+// target all the way down to its root variable and checks *that* variable's
+// declared mutability) needs the same opt-in a `let mut` local already
+// needs; every parameter defaulted to immutable before this.
+param      = { mut_kw? ~ ident ~ (":" ~ type_)? }
 
 // ---------------------------------------------------------------- struct
 struct_decl = { "struct" ~ ident ~ generic_params? ~ "{" ~ field_list? ~ "}" }
@@ -191,7 +197,14 @@ array_type  = { "[" ~ type_ ~ ";" ~ expr ~ ("," ~ expr)* ~ "]" }
 
 // ---------------------------------------------------------------- statements / blocks
 block       = { "{" ~ stmt* ~ expr? ~ "}" }
-stmt        = { let_stmt | assign_stmt | expr_stmt }
+stmt        = { let_stmt | assign_stmt | break_stmt | expr_stmt }
+// A statement, not a general expression -- `break` never sensibly appears
+// as a block's own tail value or mid-expression, so keeping it out of
+// `expr`/`primary` entirely sidesteps ever having to give it its own type
+// there. `expr?` is the optional value -- legal only inside `loop { }`
+// (`while`/`for` stay `()`-typed; `infer.rs` enforces this via ordinary
+// unification, not here).
+break_stmt  = { "break" ~ expr? ~ ";" }
 // `mut` wrapped in its own rule (rather than a bare literal) so its presence
 // is actually visible as a pair — a bare string literal leaves no trace at
 // all in pest's output, making "was `mut` there?" undetectable otherwise.
@@ -275,7 +288,7 @@ call_args   = { "(" ~ arg_list? ~ ")" }
 // `infer_call`'s own fallback, which special-cases exactly this one
 // remaining case (a zero-arg call naming a known, zero-field struct) rather
 // than leaving it as a silent "unresolved call".
-primary = { if_expr | while_expr | for_expr | array_lit | lambda_expr | call_expr | struct_lit | literal | path | "(" ~ expr ~ ")" | block }
+primary = { if_expr | while_expr | for_expr | loop_expr | array_lit | lambda_expr | call_expr | struct_lit | literal | path | "(" ~ expr ~ ")" | block }
 
 // `fn(a, b) { a + b }` — the same shape as `fn_decl`, minus the name: an
 // anonymous function value is "a `fn` without a name", not a separate
@@ -357,6 +370,11 @@ if_expr = { "if" ~ expr ~ block ~ ("else" ~ (if_expr | block))? }
 // parses (funnel grammar), not yet wired into CPS conversion/the e-graph — see top-of-file note.
 while_expr = { "while" ~ expr ~ block }
 for_expr   = { "for" ~ ident ~ "in" ~ additive ~ (".." ~ additive)? ~ block }
+// Unconditional -- no condition of its own, exited only via `break`
+// (`break_stmt`, above) — the only loop kind that can produce a value
+// (`while`/`for` always stay `()`-typed; only `loop` has no other, ambiguous
+// "natural" exit value to reconcile a `break value` against).
+loop_expr  = { "loop" ~ block }
 
 // `[value; N]` -- repeat sugar. `N` a literal `numeric_lit` desugars at
 // *lowering* time (not inference time, unlike `array_type`'s own `[T; N]`

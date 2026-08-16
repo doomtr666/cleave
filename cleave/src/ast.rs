@@ -225,6 +225,13 @@ pub struct Param {
     /// Absent when relying on inferred/implicit-monomorphization typing
     /// (`fn add(a, b) { a + b }`) — see `grammar.md`.
     pub ty: Option<Type>,
+    /// `fn f(mut v: T)` — mirrors `let mut`'s own identical marker; without
+    /// it, `infer.rs::check_mutability` treats `v` as immutable, which also
+    /// blocks reassigning any of *its own fields* through it (`v.x = ...`,
+    /// `assign_target_root` walks a field-assignment target down to its
+    /// root variable) — found directly needed the first time a real method
+    /// mutated a struct passed to it as a plain parameter, not just a local.
+    pub mutable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -279,6 +286,13 @@ pub enum StmtKind {
     /// else (grammar-restricted, see `grammar.pest`'s `assign_target`).
     Assign { target: Expr, value: Expr },
     Expr(Expr),
+    /// `break;`/`break value;` — a statement, not a general expression (see
+    /// `grammar.pest`'s own `break_stmt` doc comment for why). Legal inside
+    /// any loop kind; a value is only legal inside `ExprKind::Loop` — a bare
+    /// `break;` is treated as `break ();` for typing purposes (`infer.rs`),
+    /// so this is `None` either way at the AST level, the distinction is
+    /// purely "was there an expression here or not."
+    Break(Option<Expr>),
 }
 pub type Stmt = Node<StmtKind>;
 
@@ -370,6 +384,15 @@ pub enum ExprKind {
     /// type-checking and CPS-conversion time that folding it into `For`'s
     /// own fields would need an awkward `Option`/enum split there instead.
     ForIn { var: String, iter: Box<Expr>, body: Block },
+    /// `loop { ... break value; ... }` — unconditional, exited only via
+    /// `break` (`StmtKind::Break`). The only loop kind that can produce a
+    /// non-`()` value: `while`/`for`/`for-in` always stay `()`-typed (their
+    /// own natural, non-break exit has no value to reconcile a `break
+    /// value` against), but `loop` has no other exit at all, so every
+    /// `break` inside it (directly, not through a nested loop) unifies
+    /// against one shared accumulator type, which becomes this expression's
+    /// own overall type (`infer.rs`'s own `loop_stack`).
+    Loop { body: Block },
     Block(Block),
     /// `fn(a, b) { a + b }` — a first-class function value; the same shape
     /// as a top-level `fn`, minus the name (see `grammar.pest`). Captures

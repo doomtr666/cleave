@@ -913,6 +913,25 @@ fn collect_instantiations_block(
                 call_names,
                 errors,
             ),
+            StmtKind::Break(value) => {
+                if let Some(v) = value {
+                    collect_instantiations_expr(
+                        v,
+                        node_types,
+                        global_env,
+                        templates,
+                        inherent_templates,
+                        lambda_schemes,
+                        &scope,
+                        fn_worklist,
+                        impl_worklist,
+                        lambda_worklist,
+                        inherent_worklist,
+                        call_names,
+                        errors,
+                    );
+                }
+            }
         }
     }
     if let Some(tail) = &block.tail {
@@ -1221,6 +1240,7 @@ fn collect_instantiations_expr(
             inner.remove(var);
             rec_block!(body, &inner);
         }
+        ExprKind::Loop { body } => rec_block!(body, scope),
         ExprKind::Block(b) => rec_block!(b, scope),
         ExprKind::Lambda { params, body, .. } => {
             let mut inner = scope.clone();
@@ -1516,6 +1536,7 @@ pub(crate) fn collect_exprs<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
             collect_exprs(iter, out);
             collect_exprs_block(body, out);
         }
+        ExprKind::Loop { body } => collect_exprs_block(body, out),
         ExprKind::Block(b) => collect_exprs_block(b, out),
         ExprKind::Lambda { body, .. } => collect_exprs_block(body, out),
     }
@@ -1530,6 +1551,11 @@ pub(crate) fn collect_exprs_block<'a>(block: &'a Block, out: &mut Vec<&'a Expr>)
                 collect_exprs(value, out);
             }
             StmtKind::Expr(e) => collect_exprs(e, out),
+            StmtKind::Break(value) => {
+                if let Some(v) = value {
+                    collect_exprs(v, out);
+                }
+            }
         }
     }
     if let Some(tail) = &block.tail {

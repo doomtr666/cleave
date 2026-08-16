@@ -477,7 +477,7 @@ fn lower_top_level_fn<'c>(ctx: &LowerCtx<'c, '_>, f: &CTopLevelFn) -> Operation<
         env.insert(var, block.argument(i).unwrap().into());
     }
 
-    lower_cexpr(ctx, &block, env, f.k_ret, result_type, None, &f.def.body);
+    lower_cexpr(ctx, &block, env, f.k_ret, result_type, &[], &f.def.body);
 
     let region = Region::new();
     region.append_block(block);
@@ -521,24 +521,33 @@ fn lower_top_level_fn<'c>(ctx: &LowerCtx<'c, '_>, f: &CTopLevelFn) -> Operation<
 /// its own copy, since the two are alternatives, not a sequence — `Value`
 /// itself is `Copy`, so cloning the map is cheap.
 ///
-/// `yield_target`: `Some((name, types))` exactly while lowering the
-/// *direct* body of a branch whose value feeds a `Fix`-synthesized
-/// continuation called `name` (an `if`-join, see `lower_if`, or a loop's
-/// own self-recursion, see `lower_loop`) — a tail `App` to *that* label
-/// means `scf.yield`, not a real call or a function return, and `types`
-/// (one per yielded position) is what each yielded `CVal` is materialized
-/// against — needed since, unlike the enclosing function's own single
-/// `result_type`, a join or loop's own carried values aren't necessarily
-/// the same type as the function's overall return value. `None` everywhere
-/// else, including a join/loop's own continuation body once the `scf.if`/
-/// `scf.while` is built (ordinary flow resumes there).
+/// `yield_targets`: every `Fix`-synthesized continuation (`if`-join, see
+/// `lower_if`, or a loop's own self-recursion, see `lower_loop`) whose own
+/// body is *currently* being lowered, outermost first — a stack, not a
+/// single slot: a tail `App` to *any* of these names means `scf.yield`
+/// against that specific entry's own `types` (one per yielded position,
+/// needed since, unlike the enclosing function's own single `result_type`,
+/// a join or loop's own carried values aren't necessarily the same type as
+/// the function's overall return value), never a real call or a function
+/// return. A stack, not the single innermost entry, because of `break`
+/// (`doc/backlog-done.md`'s own "break value" item, found directly while
+/// implementing it): a `break` nested inside an `if` (itself nested inside
+/// the loop it targets) tail-calls the *loop's* own label directly, past
+/// the `if`-join sitting between them — recognizing that needs every
+/// still-open enclosing target visible, not just the immediately-enclosing
+/// one. `lower_if`/`lower_loop` each *push* their own new entry onto this
+/// stack (a fresh `Vec` built at that one call site, not a mutation of the
+/// caller's own) while lowering their *own* branches/body, then use the
+/// original, unpushed slice for whatever runs after the join/loop — ordinary
+/// flow resumes there, with that join/loop's own name no longer a valid
+/// target. Empty at a function's own top-level body.
 fn lower_cexpr<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
     mut env: HashMap<CVar, Value<'c, 'c>>,
     k_ret: CVar,
     result_type: Type<'c>,
-    yield_target: Option<(&str, &[Type<'c>])>,
+    yield_targets: &[(&str, &[Type<'c>])],
     expr: &CExpr,
 ) {
     match expr {
@@ -557,9 +566,9 @@ fn lower_cexpr<'c>(
                 .collect();
             block.append_operation(func::r#return(&values, location));
         }
-        CExpr::App { func: CVal::Label(name), args } if yield_target.is_some_and(|(n, _)| n == name.as_str()) => {
+        CExpr::App { func: CVal::Label(name), args } if yield_targets.iter().any(|(n, _)| *n == name.as_str()) => {
             let location = Location::unknown(ctx.context);
-            let types = yield_target.unwrap().1;
+            let (_, types) = yield_targets.iter().find(|(n, _)| *n == name.as_str()).unwrap();
             // `CVal::Unit` filtered out here, same as the `return` arm above
             // and for the same reason -- an `if`-join's own value position
             // is unit for a bodyless-`else`/statement-position `if`
@@ -568,7 +577,7 @@ fn lower_cexpr<'c>(
             let values: Vec<Value> = args
                 .iter()
                 .filter(|a| !matches!(a, CVal::Unit))
-                .zip(types)
+                .zip(*types)
                 .map(|(a, &t)| lower_cval(ctx.context, block, &env, a, t))
                 .collect();
             block.append_operation(scf::r#yield(&values, location));
@@ -577,7 +586,7 @@ fn lower_cexpr<'c>(
             if let Some(value) = lower_prim_op(ctx, block, &env, op, args, ty) {
                 env.insert(*var, value);
             }
-            lower_cexpr(ctx, block, env, k_ret, result_type, yield_target, cont);
+            lower_cexpr(ctx, block, env, k_ret, result_type, yield_targets, cont);
         }
         CExpr::Fix { defs, body } => {
             let [def] = &defs[..] else {
@@ -585,7 +594,7 @@ fn lower_cexpr<'c>(
             };
             match &**body {
                 CExpr::If { cond, then_branch, else_branch } => {
-                    lower_if(ctx, block, env, k_ret, result_type, yield_target, def, cond, then_branch, else_branch);
+                    lower_if(ctx, block, env, k_ret, result_type, yield_targets, def, cond, then_branch, else_branch);
                 }
                 // A loop's own *entry*: `def` (the loop's self-recursive
                 // continuation) called directly, with no trailing
@@ -594,10 +603,10 @@ fn lower_cexpr<'c>(
                 // *which* label `App` targets: itself (a loop) vs. some
                 // other real function (a call).
                 CExpr::App { func: CVal::Label(callee), args } if callee == &def.name => {
-                    lower_loop(ctx, block, env, k_ret, result_type, yield_target, def, args);
+                    lower_loop(ctx, block, env, k_ret, result_type, yield_targets, def, args);
                 }
                 CExpr::App { func: CVal::Label(callee), args } if matches!(args.last(), Some(CVal::Label(l)) if l == &def.name) => {
-                    lower_real_call(ctx, block, env, k_ret, result_type, yield_target, def, callee, args);
+                    lower_real_call(ctx, block, env, k_ret, result_type, yield_targets, def, callee, args);
                 }
                 _ => panic!("MLIR lowering doesn't support this `Fix` shape yet -- see mlir_lower.rs's own module doc comment"),
             }
@@ -635,7 +644,7 @@ fn lower_if<'c>(
     env: HashMap<CVar, Value<'c, 'c>>,
     k_ret: CVar,
     result_type: Type<'c>,
-    yield_target: Option<(&str, &[Type<'c>])>,
+    yield_targets: &[(&str, &[Type<'c>])],
     join: &CFunDef,
     cond: &CVal,
     then_branch: &CExpr,
@@ -661,13 +670,21 @@ fn lower_if<'c>(
     let bool_ty: Type = IntegerType::new(context, 1).into();
     let cond_value = lower_cval(context, block, &env, cond, bool_ty);
 
+    // Pushed onto a *fresh* `Vec` for the two branches below — the original
+    // `yield_targets` (without this entry) is what the join's own
+    // continuation, after the `scf.if` is built, uses instead (see
+    // `lower_cexpr`'s own doc comment for why this needs to be a stack, not
+    // a single replaced slot).
+    let mut inner_targets: Vec<(&str, &[Type<'c>])> = yield_targets.to_vec();
+    inner_targets.push((&join.name, &join_types));
+
     let then_block = Block::new(&[]);
-    lower_cexpr(ctx, &then_block, env.clone(), k_ret, result_type, Some((&join.name, &join_types)), then_branch);
+    lower_cexpr(ctx, &then_block, env.clone(), k_ret, result_type, &inner_targets, then_branch);
     let then_region = Region::new();
     then_region.append_block(then_block);
 
     let else_block = Block::new(&[]);
-    lower_cexpr(ctx, &else_block, env.clone(), k_ret, result_type, Some((&join.name, &join_types)), else_branch);
+    lower_cexpr(ctx, &else_block, env.clone(), k_ret, result_type, &inner_targets, else_branch);
     let else_region = Region::new();
     else_region.append_block(else_block);
 
@@ -684,7 +701,7 @@ fn lower_if<'c>(
     for (result_idx, &param_idx) in live.iter().enumerate() {
         env.insert(join.params[param_idx], if_op.result(result_idx).unwrap().into());
     }
-    lower_cexpr(ctx, block, env, k_ret, result_type, yield_target, &join.body);
+    lower_cexpr(ctx, block, env, k_ret, result_type, yield_targets, &join.body);
 }
 
 /// A `while`/`for` loop (CPS unifies both into the same shape — a self-
@@ -707,40 +724,71 @@ fn lower_if<'c>(
 /// as the region boundary itself, not as ordinary control flow).
 ///
 /// The `then` branch's own tail recursion back to `loop_def.name` reuses
-/// `lower_cexpr`'s *existing* `yield_target`-checking `App` arm — passing
-/// `Some((&loop_def.name, &carried_types))` while lowering it turns that
-/// recursive tail-call into `scf.yield` for free, no new recognition
-/// needed. The `else` branch (loop exit) is lowered *after* the `scf.while`
-/// op is built, in the *outer* scope — `loop_def`'s own params bound to the
-/// op's own results, the outer `k_ret`/`yield_target` unchanged (mirrors
-/// `lower_if`'s own "join's continuation runs in ordinary flow" step).
+/// `lower_cexpr`'s *existing* `yield_targets`-checking `App` arm — pushing
+/// `(&loop_def.name, &carried_types)` onto the stack while lowering it turns
+/// that recursive tail-call into `scf.yield` for free, no new recognition
+/// needed (also what lets a `break` nested inside an `if` inside this loop's
+/// own body find `loop_def.name` past the `if`-join sitting between them —
+/// see `lower_cexpr`'s own doc comment). The `else` branch (loop exit) is
+/// lowered *after* the `scf.while` op is built, in the *outer* scope —
+/// `loop_def`'s own params bound to the op's own results, the outer
+/// `k_ret`/`yield_targets` unchanged (mirrors `lower_if`'s own "join's
+/// continuation runs in ordinary flow" step).
 fn lower_loop<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
     env: HashMap<CVar, Value<'c, 'c>>,
     k_ret: CVar,
     result_type: Type<'c>,
-    yield_target: Option<(&str, &[Type<'c>])>,
+    yield_targets: &[(&str, &[Type<'c>])],
     loop_def: &CFunDef,
     initial_args: &[CVal],
 ) {
     let context = ctx.context;
     let location = Location::unknown(context);
 
-    let CExpr::Fix { defs: cond_defs, body: cond_body } = &loop_def.body else {
-        panic!("MLIR lowering: a loop's own condition must be a real call -- see mlir_lower.rs's own module doc comment");
-    };
-    let [cond_k] = &cond_defs[..] else {
-        panic!("MLIR lowering doesn't support a multi-def loop condition yet");
-    };
-    let CExpr::App { func: CVal::Label(cond_callee), args: cond_args } = &**cond_body else {
-        panic!("MLIR lowering: a loop's own condition must be a real call -- see mlir_lower.rs's own module doc comment");
-    };
-    let CExpr::If { then_branch, else_branch, .. } = &cond_k.body else {
-        panic!("MLIR lowering: a loop's own condition-continuation must be a bare `if` -- see mlir_lower.rs's own module doc comment");
-    };
-    let [cond_result_var] = cond_k.params[..] else {
-        panic!("MLIR lowering: a loop's own condition call must have exactly one result");
+    // A loop's own condition is *zero or more* sequential real calls, not
+    // always exactly one — `i < hull.len()` needs two (`DynArray::len<...>`,
+    // then `Ord::lt<i32>` against its result), found directly while writing
+    // `examples/convex_hull.cleave` (`doc/backlog-done.md`'s own "a while-
+    // loop condition needing more than one chained real call" item); a bare
+    // `loop { }` needs *zero* — its own condition is just the synthetic
+    // `running` flag, read directly, no call at all (`doc/backlog-done.md`'s
+    // own "break value" item). Walked here as a chain of `Fix{defs:[k],
+    // body: App{Label(callee), args}}` layers, each `k`'s own body either
+    // another such layer or, terminally, the bare `If` — mirrors the exact
+    // same "keep following the next `Fix`" shape ordinary straight-line
+    // lowering already uses (`lower_real_call`'s own recursive continuation-
+    // following), just walked by hand in a loop here since each call in the
+    // chain has to land in the "before" block below, ending in `scf.
+    // condition`, not an ordinary recursive `lower_cexpr` step.
+    struct CondCall<'e> {
+        callee: &'e str,
+        args: &'e [CVal],
+        result_var: CVar,
+    }
+    let mut cond_calls: Vec<CondCall> = Vec::new();
+    let mut cursor: &CExpr = &loop_def.body;
+    let (cond, then_branch, else_branch) = loop {
+        match cursor {
+            CExpr::If { cond, then_branch, else_branch } => break (cond, then_branch, else_branch),
+            CExpr::Fix { defs: cond_defs, body: cond_body } => {
+                let [cond_k] = &cond_defs[..] else {
+                    panic!("MLIR lowering doesn't support a multi-def loop condition yet");
+                };
+                let CExpr::App { func: CVal::Label(cond_callee), args: cond_args } = &**cond_body else {
+                    panic!("MLIR lowering: a loop's own condition must be a real call -- see mlir_lower.rs's own module doc comment");
+                };
+                let [cond_result_var] = cond_k.params[..] else {
+                    panic!("MLIR lowering: a loop's own condition call must have exactly one result");
+                };
+                cond_calls.push(CondCall { callee: cond_callee, args: cond_args, result_var: cond_result_var });
+                cursor = &cond_k.body;
+            }
+            _ => panic!(
+                "MLIR lowering: a loop's own condition must be a chain of real calls ending in a bare `if` (or a bare `if` directly) -- see mlir_lower.rs's own module doc comment"
+            ),
+        }
     };
 
     // Carried-state types, from `loop_def.carried_types` (`cps.rs`'s own
@@ -783,28 +831,45 @@ fn lower_loop<'c>(
     for (i, &p) in loop_def.params.iter().enumerate() {
         before_env.insert(p, before_block.argument(i).unwrap().into());
     }
-    let Some((cond_param_types, cond_result_ty)) = ctx.signatures.get(cond_callee) else {
-        panic!("MLIR lowering: call to unknown top-level fn `{cond_callee}` in a loop condition");
-    };
-    let cond_result_mlir_ty = ty_to_mlir(ctx, cond_result_ty);
-    // `cond_args`' own last entry is the synthesized continuation label
-    // itself (`emit_call`'s own convention, see `cps.rs`), not a real arg.
-    let real_cond_args = &cond_args[..cond_args.len() - 1];
-    let cond_arg_values: Vec<Value> = real_cond_args
-        .iter()
-        .zip(cond_param_types)
-        .map(|(a, t)| lower_cval(context, &before_block, &before_env, a, ty_to_mlir(ctx, t)))
-        .collect();
-    let cond_call_op = before_block.append_operation(func::call(
-        context,
-        FlatSymbolRefAttribute::new(context, cond_callee),
-        &cond_arg_values,
-        &[cond_result_mlir_ty],
-        location,
-    ));
-    before_env.insert(cond_result_var, cond_call_op.result(0).unwrap().into());
+    // Emit every call in the condition's own chain, in order (empty for a
+    // bare `loop { }` — see this function's own doc comment above), each one
+    // seeing the previous ones' results already bound in `before_env` (only
+    // relevant for arguments referencing an earlier call's own result, e.g.
+    // `Ord::lt`'s second argument here referencing `hull.len()`'s).
+    for cond_call in &cond_calls {
+        let Some((cond_param_types, cond_result_ty)) = ctx.signatures.get(cond_call.callee) else {
+            panic!("MLIR lowering: call to unknown top-level fn `{}` in a loop condition", cond_call.callee);
+        };
+        let cond_result_mlir_ty = ty_to_mlir(ctx, cond_result_ty);
+        // `args`' own last entry is the synthesized continuation label
+        // itself (`emit_call`'s own convention, see `cps.rs`), not a real arg.
+        let real_cond_args = &cond_call.args[..cond_call.args.len() - 1];
+        let cond_arg_values: Vec<Value> = real_cond_args
+            .iter()
+            .zip(cond_param_types)
+            .map(|(a, t)| lower_cval(context, &before_block, &before_env, a, ty_to_mlir(ctx, t)))
+            .collect();
+        let cond_call_op = before_block.append_operation(func::call(
+            context,
+            FlatSymbolRefAttribute::new(context, cond_call.callee),
+            &cond_arg_values,
+            &[cond_result_mlir_ty],
+            location,
+        ));
+        let result: Value = cond_call_op.result(0).unwrap().into();
+        before_env.insert(cond_call.result_var, result);
+    }
+    // The terminal `If`'s own `cond` — when `cond_calls` is non-empty,
+    // this is a bare `CVal::Var` naming the *last* call's own result,
+    // already bound in `before_env` just above; when empty (a bare `loop`,
+    // whose own "condition" is just the synthetic `running` flag, read
+    // directly, no call needed at all), it resolves straight through
+    // `before_env`'s own pre-existing carried-param bindings instead. One
+    // `lower_cval` call handles both uniformly.
+    let bool_ty: Type = IntegerType::new(context, 1).into();
+    let cond_result = lower_cval(context, &before_block, &before_env, cond, bool_ty);
     let carried_before: Vec<Value> = loop_def.params.iter().map(|p| before_env[p]).collect();
-    before_block.append_operation(scf::condition(cond_call_op.result(0).unwrap().into(), &carried_before, location));
+    before_block.append_operation(scf::condition(cond_result, &carried_before, location));
     let before_region = Region::new();
     before_region.append_block(before_block);
 
@@ -816,7 +881,13 @@ fn lower_loop<'c>(
     for (i, &p) in loop_def.params.iter().enumerate() {
         after_env.insert(p, after_block.argument(i).unwrap().into());
     }
-    lower_cexpr(ctx, &after_block, after_env, k_ret, result_type, Some((&loop_def.name, &carried_types)), then_branch);
+    // Pushed onto a *fresh* `Vec` for the body — the original `yield_targets`
+    // (without this entry) is what the loop-exit continuation, after the
+    // `scf.while` is built, uses instead (see `lower_cexpr`'s own doc
+    // comment for why this needs to be a stack, not a single replaced slot).
+    let mut inner_targets: Vec<(&str, &[Type<'c>])> = yield_targets.to_vec();
+    inner_targets.push((&loop_def.name, &carried_types));
+    lower_cexpr(ctx, &after_block, after_env, k_ret, result_type, &inner_targets, then_branch);
     let after_region = Region::new();
     after_region.append_block(after_block);
 
@@ -829,7 +900,7 @@ fn lower_loop<'c>(
     for (i, &p) in loop_def.params.iter().enumerate() {
         env.insert(p, while_op.result(i).unwrap().into());
     }
-    lower_cexpr(ctx, block, env, k_ret, result_type, yield_target, else_branch);
+    lower_cexpr(ctx, block, env, k_ret, result_type, yield_targets, else_branch);
 }
 
 /// A real call to another top-level cleave `fn` (`emit_call`'s own
@@ -849,7 +920,7 @@ fn lower_real_call<'c>(
     env: HashMap<CVar, Value<'c, 'c>>,
     k_ret: CVar,
     result_type: Type<'c>,
-    yield_target: Option<(&str, &[Type<'c>])>,
+    yield_targets: &[(&str, &[Type<'c>])],
     k: &CFunDef,
     callee: &str,
     args: &[CVal],
@@ -899,7 +970,7 @@ fn lower_real_call<'c>(
     if !is_unit {
         env.insert(result_var, call_op.result(0).unwrap().into());
     }
-    lower_cexpr(ctx, block, env, k_ret, result_type, yield_target, &k.body);
+    lower_cexpr(ctx, block, env, k_ret, result_type, yield_targets, &k.body);
 }
 
 /// Returns `None` exactly for `PrimOp::Store` — a real effect with zero MLIR
@@ -1920,6 +1991,24 @@ fn lower_cval<'c>(context: &'c Context, block: &Block<'c>, env: &HashMap<CVar, V
             let attribute = IntegerAttribute::new(expected_type, *b as i64).into();
             let op = block.append_operation(arith::constant(context, attribute, location));
             op.result(0).unwrap().into()
+        }
+        // `CVal::Unit` reaching *this* function specifically (as opposed to
+        // the several other places in this module that already filter it
+        // out before ever calling `lower_cval`) means a genuinely never-
+        // read placeholder of some *other*, real type — `doc/backlog-done.
+        // md`'s own "break value" item: `ExprKind::Loop`'s own conversion
+        // (`cps.rs`) seeds its `break_val` carried slot's very first,
+        // pre-any-break value with `CVal::Unit` (there's no other type-
+        // agnostic "nothing yet" value available at the CPS level for an
+        // arbitrary, possibly non-unit carried type) — a real value only
+        // ever lands there via an actual `break value;`, so this is only
+        // ever the *first* iteration's own unread initial value. `llvm.mlir.
+        // undef` is MLIR's own standard "a real value of this type, content
+        // deliberately unspecified" primitive — exactly this case, not a
+        // hack: works for any `expected_type`, builtin or dialect-specific.
+        CVal::Unit => {
+            let location = Location::unknown(context);
+            block.append_operation(llvm::undef(expected_type, location)).result(0).unwrap().into()
         }
         other => panic!("MLIR lowering doesn't support this CVal shape yet: {other:?}"),
     }

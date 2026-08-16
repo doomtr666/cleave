@@ -27,6 +27,8 @@ fn find_call_in_block<'a>(block: &'a Block, callee: &str) -> Option<&'a Expr> {
         let value = match &stmt.kind {
             StmtKind::Let { value, .. } | StmtKind::Assign { value, .. } => value,
             StmtKind::Expr(e) => e,
+            StmtKind::Break(Some(v)) => v,
+            StmtKind::Break(None) => continue,
         };
         if let Some(found) = find_call_in_expr(value, callee) {
             return Some(found);

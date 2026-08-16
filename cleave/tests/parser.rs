@@ -254,6 +254,17 @@ fn for_in_array_parses() {
 }
 
 #[test]
+fn loop_expr_parses() {
+    parses(Rule::loop_expr, "loop { break; }");
+}
+
+#[test]
+fn break_with_and_without_a_value_parses() {
+    parses(Rule::break_stmt, "break;");
+    parses(Rule::break_stmt, "break 5;");
+}
+
+#[test]
 fn implication() {
     parses(Rule::expr, "a and b implies c or d");
 }

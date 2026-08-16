@@ -488,6 +488,11 @@ fn collect_calls_block(block: &Block, known: &HashSet<&str>, out: &mut Vec<Strin
                 collect_calls_expr(value, known, out);
             }
             StmtKind::Expr(e) => collect_calls_expr(e, known, out),
+            StmtKind::Break(value) => {
+                if let Some(v) = value {
+                    collect_calls_expr(v, known, out);
+                }
+            }
         }
     }
     if let Some(tail) = &block.tail {
@@ -561,6 +566,7 @@ fn collect_calls_expr(expr: &Expr, known: &HashSet<&str>, out: &mut Vec<String>)
             collect_calls_expr(iter, known, out);
             collect_calls_block(body, known, out);
         }
+        ExprKind::Loop { body } => collect_calls_block(body, known, out),
         ExprKind::Block(b) => collect_calls_block(b, known, out),
         ExprKind::Lambda { body, .. } => collect_calls_block(body, known, out),
     }
