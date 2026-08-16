@@ -113,6 +113,28 @@ struct Specialization {
     /// `fibonacci<i32>`, whichever specialization happened to be processed
     /// last).
     call_names: HashMap<NodeId, String>,
+    /// Mirrors `ast::FnDecl::is_extern`/`extern_symbol` — needed here, not
+    /// just read off whichever `FnDecl` happens to be at hand, because
+    /// `cps.rs::collect_units`'s own `ItemKind::Impl` branch iterates every
+    /// impl of an algebra sharing a method name (`Print<i8>`, `Print<[i8;
+    /// N]>`, `Print<Wrapper<A>>`, ... all named `print`) and, for *each*
+    /// one, re-queries `specializations_of("Algebra::method")` — the full,
+    /// shared list of every specialization under that origin, not just the
+    /// ones *this* impl produced. A real bug, found by direct testing the
+    /// first time two *generic* impls of the same algebra/method coexisted
+    /// (`impl<const N: i32> Print<[i8; N]>` alongside a second generic
+    /// `Print<...>` impl): deriving `UnitBody::Extern`/`UnitBody::Real` from
+    /// *that* impl's own `FnDecl` rather than from the specialization
+    /// actually being processed silently rebuilt an unrelated, already-
+    /// correct specialization with the *wrong* impl's own body/extern-ness,
+    /// and the resulting duplicate `ConcreteUnit` (same name, wrong body)
+    /// silently overwrote the correct one in `convert_program`'s own
+    /// `by_name` map. Recording each specialization's own extern-ness
+    /// directly here — read back via `MonomorphizedProgram::is_extern`/
+    /// `extern_symbol` — is the real fix: `collect_units` now asks the
+    /// specialization itself, never the current outer-loop impl.
+    is_extern: bool,
+    extern_symbol: Option<String>,
 }
 
 pub struct MonomorphizedProgram {
@@ -174,6 +196,14 @@ impl MonomorphizedProgram {
         &self.specializations[key].call_names
     }
 
+    pub fn is_extern(&self, key: &str) -> bool {
+        self.specializations[key].is_extern
+    }
+
+    pub fn extern_symbol(&self, key: &str) -> Option<&str> {
+        self.specializations[key].extern_symbol.as_deref()
+    }
+
     pub fn seed_call_names(&self) -> &HashMap<NodeId, String> {
         &self.seed_call_names
     }
@@ -226,6 +256,12 @@ struct ImplTemplate {
     /// it is the *concatenation* `"f32f32f32"`, never any individual `"f32"`
     /// alone).
     is_generic: bool,
+    /// Mirrors `ast::FnDecl::is_extern`/`extern_symbol` — see
+    /// `Specialization`'s own identical fields for why this needs to travel
+    /// with the template, not be re-read from the impl currently being
+    /// iterated.
+    is_extern: bool,
+    extern_symbol: Option<String>,
 }
 
 /// A generic inherent impl's own declaration-time "template" for one
@@ -435,7 +471,16 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
         mono.by_origin.entry(name).or_default().push(display.clone());
         mono.specializations.insert(
             display,
-            Specialization { params: f.params.clone(), body: body.clone(), param_types, result, node_types, call_names },
+            Specialization {
+                params: f.params.clone(),
+                body: body.clone(),
+                param_types,
+                result,
+                node_types,
+                call_names,
+                is_extern: f.is_extern,
+                extern_symbol: f.extern_symbol.clone(),
+            },
         );
     }
 
@@ -475,7 +520,16 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
         mono.by_origin.entry(origin).or_default().push(display.clone());
         mono.specializations.insert(
             display,
-            Specialization { params: t.params.clone(), body: t.body.clone(), param_types, result, node_types, call_names },
+            Specialization {
+                params: t.params.clone(),
+                body: t.body.clone(),
+                param_types,
+                result,
+                node_types,
+                call_names,
+                is_extern: t.is_extern,
+                extern_symbol: t.extern_symbol.clone(),
+            },
         );
     }
 
@@ -548,7 +602,7 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
         mono.by_origin.entry(origin).or_default().push(display.clone());
         mono.specializations.insert(
             display,
-            Specialization { params: params.clone(), body: body.clone(), param_types, result, node_types, call_names },
+            Specialization { params: params.clone(), body: body.clone(), param_types, result, node_types, call_names, is_extern: false, extern_symbol: None },
         );
     }
 
@@ -595,7 +649,7 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
         mono.by_origin.entry(origin).or_default().push(display.clone());
         mono.specializations.insert(
             display,
-            Specialization { params: t.params.clone(), body: t.body.clone(), param_types, result, node_types, call_names },
+            Specialization { params: t.params.clone(), body: t.body.clone(), param_types, result, node_types, call_names, is_extern: false, extern_symbol: None },
         );
     }
 
@@ -707,6 +761,8 @@ fn build_impl_templates(program: &Program, registry: &Registry, global_env: &Env
                 target_patterns: infer.target_types.clone(),
                 node_types: infer.node_types.clone(),
                 is_generic,
+                is_extern: f.is_extern,
+                extern_symbol: f.extern_symbol.clone(),
             });
         }
     }

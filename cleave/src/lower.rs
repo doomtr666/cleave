@@ -373,6 +373,7 @@ impl Lowerer {
         match first.as_rule() {
             Rule::array_type => self.lower_array_type(first),
             Rule::fn_type => self.lower_fn_type(first),
+            Rule::tuple_type => self.lower_tuple_type(first),
             // `path`'s optional generic-arg list is flattened as trailing
             // siblings of `path` within this same `type_` pair, not nested
             // under a separate sub-rule — collect whatever remains.
@@ -393,6 +394,17 @@ impl Lowerer {
         let mut types: Vec<Type> = pair.into_inner().map(|p| self.lower_type(p)).collect();
         let ret = Box::new(types.pop().expect("fn_type always has at least a return type"));
         self.wrap(span, TypeKind::Fn(types, ret))
+    }
+
+    /// `(T1, T2)` desugars straight to the ordinary generic-struct-type
+    /// syntax `__Tuple2<T1, T2>` already produces — see `ast::tuple_struct_
+    /// name`'s own doc comment for why this needs no new `TypeKind` variant.
+    fn lower_tuple_type(&mut self, pair: Pair<Rule>) -> Type {
+        let span = self.span_of(&pair);
+        let elems: Vec<Type> = pair.into_inner().map(|p| self.lower_type(p)).collect();
+        let name = tuple_struct_name(elems.len());
+        let args = elems.into_iter().map(GenericArg::Type).collect();
+        self.wrap(span, TypeKind::Path(Path::single(name), args))
     }
 
     fn lower_generic_arg(&mut self, pair: Pair<Rule>) -> GenericArg {
@@ -602,7 +614,12 @@ impl Lowerer {
         let mut inner = pair.into_inner();
         let first = inner.next().unwrap();
         match first.as_rule() {
-            Rule::ident => {
+            // `t.0`/`t.1` — a tuple field access reuses the exact same
+            // `FieldAccess`/`MethodCall` branching an ordinary `.ident` does,
+            // just with the raw digit text as the field/method name (see
+            // `grammar.pest`'s own `tuple_index` doc comment for why no
+            // separate AST shape is needed at all).
+            Rule::ident | Rule::tuple_index => {
                 let name = first.as_str().to_string();
                 // `call_args`'s mere presence (even with zero arguments, `.f()`)
                 // distinguishes a method call from plain field access (`.x`) —
@@ -720,6 +737,7 @@ impl Lowerer {
             Rule::array_lit => self.lower_array_lit(inner),
             Rule::lambda_expr => self.lower_lambda_expr(inner),
             Rule::struct_lit => self.lower_struct_lit(inner),
+            Rule::tuple_lit => self.lower_tuple_lit(inner),
             Rule::call_expr => self.lower_call_expr(inner),
             Rule::literal => self.lower_literal(inner),
             Rule::path => {
@@ -771,6 +789,19 @@ impl Lowerer {
         let generics = self.lower_optional_turbofish(&mut inner);
         let fields = inner.next().map(|p| self.lower_field_init_list(p)).unwrap_or_default();
         self.wrap(span, ExprKind::StructLit(path, generics, fields))
+    }
+
+    /// `(a, b)` desugars straight to `__Tuple2(0: a, 1: b)` — the ordinary
+    /// struct-construction shape `__Tuple2`'s own synthesized declaration
+    /// (`driver.rs::synthesize_tuple_structs`) already expects, field types
+    /// inferred purely from `a`/`b`'s own types exactly like any other
+    /// struct literal's generic fields already are (no turbofish needed).
+    fn lower_tuple_lit(&mut self, pair: Pair<Rule>) -> Expr {
+        let span = self.span_of(&pair);
+        let elems: Vec<Expr> = pair.into_inner().map(|p| self.lower_expr(p)).collect();
+        let name = tuple_struct_name(elems.len());
+        let fields = elems.into_iter().enumerate().map(|(i, e)| (i.to_string(), e)).collect();
+        self.wrap(span, ExprKind::StructLit(Path::single(name), Vec::new(), fields))
     }
 
     /// Consumes a leading `Rule::turbofish` pair off `inner` if present,

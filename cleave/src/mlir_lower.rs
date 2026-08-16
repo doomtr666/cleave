@@ -1578,46 +1578,65 @@ fn llvm_type_size_bytes<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, llvm_ty: 
     block.append_operation(built).result(0).unwrap().into()
 }
 
-/// Extracts a bare `!llvm.ptr` from an already-lowered `memref` value's own
-/// aligned data pointer, plus the array's own total element count as a
-/// real `i64` — the pair an `extern fn`'s own array-typed parameter
-/// actually crosses the call boundary as. MLIR's default `convert-to-llvm`
-/// conversion (the only pass this pipeline runs — melior's own binding
-/// exposes no options on it, no bare-pointer-calling-convention toggle
-/// available) turns a `memref` crossing any `func.call`/`llvm.call`
-/// boundary into a descriptor *struct* (`{allocatedPtr, alignedPtr, offset,
-/// sizes[], strides[]}`), passed by value — not a bare pointer. No hand-
-/// written `cleave-rt` extern fn could plausibly match that layout, found
-/// by direct testing (a hard `STATUS_ACCESS_VIOLATION` crash, not a clean
-/// panic, before this fix). `memref.extract_aligned_pointer_as_index`/
-/// `llvm.inttoptr` have no melior binding — built directly via
-/// `OperationBuilder`, the identical pattern `llvm_type_size_bytes`'s own
-/// `llvm.ptrtoint` already uses just above. `len` is the array's own *total*
-/// element count (every dimension's own size multiplied together, via
-/// `flatten_array_dims` — already exists for exactly this "collapse a
-/// nested `Ty::Array` chain" need), a compile-time constant materialized
-/// directly, not read off the memref's own runtime descriptor.
-fn array_ptr_and_len<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, memref_value: Value<'c, 'c>, array_ty: &Ty) -> (Value<'c, 'c>, Value<'c, 'c>) {
+/// Extracts a bare `!llvm.ptr` from an already-lowered array value's own
+/// data pointer, plus the array's own total element count as a real `i64`
+/// — the pair an `extern fn`'s own array-typed parameter actually crosses
+/// the call boundary as. Two possible *input* representations for the same
+/// cleave-level array type, mirroring `copy_array_into_llvm_field`'s own
+/// identical `is_mem_ref` branch (see its own doc comment): a standalone
+/// array (a local/parameter) is a real `memref`, but the *same* array type
+/// read back out of a struct/tuple field (`lower_field_access`'s own
+/// `is_array_ty` branch) is already a bare `!llvm.ptr` into that struct's
+/// own inline storage, never a `memref` at all — found by direct testing,
+/// passing a tuple's own string-typed field (`x.0: [i8;N]`) straight into
+/// `Print<[i8;N]>::print` (`examples`-motivated: `print(("x=", x))`).
+/// Passing an already-bare pointer through `memref.extract_aligned_pointer_
+/// as_index` fails MLIR verification outright (wrong operand kind) — no
+/// extraction needed for it at all, it already *is* the value this
+/// function exists to produce.
+///
+/// The `memref` branch: MLIR's default `convert-to-llvm` conversion (the
+/// only pass this pipeline runs — melior's own binding exposes no options
+/// on it, no bare-pointer-calling-convention toggle available) turns a
+/// `memref` crossing any `func.call`/`llvm.call` boundary into a
+/// descriptor *struct* (`{allocatedPtr, alignedPtr, offset, sizes[],
+/// strides[]}`), passed by value — not a bare pointer. No hand-written
+/// `cleave-rt` extern fn could plausibly match that layout, found by direct
+/// testing (a hard `STATUS_ACCESS_VIOLATION` crash, not a clean panic,
+/// before this fix). `memref.extract_aligned_pointer_as_index`/`llvm.
+/// inttoptr` have no melior binding — built directly via `OperationBuilder`,
+/// the identical pattern `llvm_type_size_bytes`'s own `llvm.ptrtoint`
+/// already uses just above.
+///
+/// `len` is the array's own *total* element count (every dimension's own
+/// size multiplied together, via `flatten_array_dims` — already exists for
+/// exactly this "collapse a nested `Ty::Array` chain" need), a compile-time
+/// constant materialized directly either way, never read off a runtime
+/// descriptor.
+fn array_ptr_and_len<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, array_value: Value<'c, 'c>, array_ty: &Ty) -> (Value<'c, 'c>, Value<'c, 'c>) {
     let context = ctx.context;
     let location = Location::unknown(context);
-    let index_ty = Type::index(context);
-    let built = OperationBuilder::new("memref.extract_aligned_pointer_as_index", location)
-        .add_operands(&[memref_value])
-        .add_results(&[index_ty])
-        .build()
-        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build memref.extract_aligned_pointer_as_index: {e}"));
-    let idx: Value = block.append_operation(built).result(0).unwrap().into();
-
     let i64_ty: Type = IntegerType::new(context, 64).into();
-    let as_i64: Value = block.append_operation(arith::index_cast(idx, i64_ty, location)).result(0).unwrap().into();
 
-    let ptr_ty = llvm::r#type::pointer(context, 0);
-    let built = OperationBuilder::new("llvm.inttoptr", location)
-        .add_operands(&[as_i64])
-        .add_results(&[ptr_ty])
-        .build()
-        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build llvm.inttoptr: {e}"));
-    let ptr: Value = block.append_operation(built).result(0).unwrap().into();
+    let ptr: Value = if array_value.r#type().is_mem_ref() {
+        let index_ty = Type::index(context);
+        let built = OperationBuilder::new("memref.extract_aligned_pointer_as_index", location)
+            .add_operands(&[array_value])
+            .add_results(&[index_ty])
+            .build()
+            .unwrap_or_else(|e| panic!("MLIR lowering: failed to build memref.extract_aligned_pointer_as_index: {e}"));
+        let idx: Value = block.append_operation(built).result(0).unwrap().into();
+        let as_i64: Value = block.append_operation(arith::index_cast(idx, i64_ty, location)).result(0).unwrap().into();
+        let ptr_ty = llvm::r#type::pointer(context, 0);
+        let built = OperationBuilder::new("llvm.inttoptr", location)
+            .add_operands(&[as_i64])
+            .add_results(&[ptr_ty])
+            .build()
+            .unwrap_or_else(|e| panic!("MLIR lowering: failed to build llvm.inttoptr: {e}"));
+        block.append_operation(built).result(0).unwrap().into()
+    } else {
+        array_value
+    };
 
     let (dims, _leaf_ty) = flatten_array_dims(array_ty);
     let total: i64 = dims.iter().product();

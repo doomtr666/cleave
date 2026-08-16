@@ -1,4 +1,4 @@
-﻿use cleave::ast::{FileId, FnDecl, GenericParam, ItemKind, Program, Span, StmtKind, Type};
+﻿use cleave::ast::{Field, FileId, FnDecl, GenericParam, Item, ItemKind, Node, NodeId, Program, Span, StmtKind, StructDecl, Type, TypeKind, tuple_struct_name};
 use cleave::infer::{ConstValue, Infer, Ty, TypeErrorKind, check_mutability};
 use cleave::lower::Lowerer;
 use cleave::parser::{CleaveParser, Rule};
@@ -11,6 +11,34 @@ fn lower_program(src: &str) -> Program {
         .next()
         .unwrap();
     Lowerer::new(FileId(0)).lower_program(pair)
+}
+
+/// Injects a synthesized `struct __TupleN<T0, ..., T(N-1)> { 0: T0, ...,
+/// (N-1): T(N-1) }` directly as AST data — mirrors `driver.rs::
+/// synthesize_tuple_structs` (only ever run for real inside `driver::
+/// compile`, which this file's own `lower_program`/`infer_fn_named` helpers
+/// deliberately bypass to test `Infer` in isolation). A numeric field name
+/// like `"0"` can never be *parsed* from source at all (`grammar.pest`'s own
+/// `field` rule requires a real `ident`) — this is the one, deliberate way
+/// around that, exactly mirroring how `driver.rs` itself builds one, not a
+/// test-only shortcut. High, clearly-out-of-range synthetic `NodeId`s are
+/// safe here — this file's own `lower_program` always starts fresh at 0,
+/// and no test source anywhere near this file's own size could reach them.
+fn inject_tuple_struct(mut program: Program, arity: usize) -> Program {
+    let synthetic_span = Span { file: FileId(0), start: 0, end: 0 };
+    let generic_names: Vec<String> = (0..arity).map(|i| format!("T{i}")).collect();
+    let generics = generic_names.iter().map(|name| GenericParam::Type { name: name.clone(), bounds: Vec::new() }).collect();
+    let fields = generic_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| Field {
+            name: i.to_string(),
+            ty: Node { id: NodeId(900_000 + i as u32), span: synthetic_span, kind: TypeKind::Path(cleave::ast::Path::single(name.clone()), Vec::new()) },
+        })
+        .collect();
+    let decl = StructDecl { name: tuple_struct_name(arity), generics, fields };
+    program.items.push(Item { id: NodeId(900_000 + 100 + arity as u32), span: synthetic_span, kind: ItemKind::Struct(decl) });
+    program
 }
 
 fn lower_one_fn(src: &str) -> FnDecl {
@@ -2918,4 +2946,72 @@ fn break_does_not_escape_a_lambda_body() {
     // the loop's own frame, mirroring Rust's identical rule.
     let err = infer_fn_named("fn f() -> i32 { while true { let g = fn() { break; }; }; 0 }", "f").unwrap_err();
     assert!(matches!(err.kind, TypeErrorKind::BreakOutsideLoop), "got: {:?}", err.kind);
+}
+
+// `(T1, T2)`/`(a, b)`/`t.0` desugar entirely at `lower.rs` time into
+// ordinary generic-struct syntax naming a synthesized `__TupleN` struct
+// (`ast::tuple_struct_name`) — real declarations only ever injected by
+// `driver.rs::compile`'s own `synthesize_tuple_structs`, a step this file's
+// own `infer_fn_named` helper (raw `lower_program` + `Registry::build`, no
+// `driver::compile`) never runs. `infer_fn_named_with_tuples` below injects
+// the same synthesized struct(s) directly as AST data instead
+// (`inject_tuple_struct`) — keeps this file's own established "test `Infer`
+// in isolation" posture, and doubles as a direct illustration that a tuple
+// really is just an ordinary struct under the hood, nothing magic.
+fn infer_fn_named_with_tuples(src: &str, name: &str, arities: &[usize]) -> Result<Ty, cleave::infer::TypeError> {
+    let mut program = lower_program(src);
+    for &arity in arities {
+        program = inject_tuple_struct(program, arity);
+    }
+    let registry = Registry::build(&program);
+    let f = program
+        .items
+        .iter()
+        .find_map(|item| match &item.kind {
+            ItemKind::Fn(f) if f.name == name => Some(f.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no fn named `{name}` in {src:?}"));
+    let mut infer = Infer::new(&registry);
+    infer.infer_fn(&f)
+}
+
+#[test]
+fn a_tuple_literal_infers_the_synthesized_struct_type() {
+    let ty = infer_fn_named_with_tuples("fn f() -> (i32, f64) { (1, 2.0) }", "f", &[2]).unwrap();
+    assert_eq!(ty, Ty::App("__Tuple2".to_string(), vec![Ty::Con("i32".to_string()), Ty::Con("f64".to_string())]));
+}
+
+#[test]
+fn tuple_field_access_resolves_the_right_element_type() {
+    let ty = infer_fn_named_with_tuples("fn f() -> f64 { let t: (i32, f64) = (1, 2.0); t.1 }", "f", &[2]).unwrap();
+    assert_eq!(ty, Ty::Con("f64".to_string()));
+}
+
+#[test]
+fn a_three_element_tuple_infers_and_reads_back_correctly() {
+    let ty = infer_fn_named_with_tuples("fn f() -> bool { let t: (i32, f64, bool) = (1, 2.0, true); t.2 }", "f", &[3]).unwrap();
+    assert_eq!(ty, Ty::Con("bool".to_string()));
+}
+
+#[test]
+fn out_of_range_tuple_field_access_is_rejected() {
+    let err = infer_fn_named_with_tuples("fn f() -> i32 { let t: (i32, f64) = (1, 2.0); t.2 }", "f", &[2]).unwrap_err();
+    // Falls out of the ordinary "unknown struct field" error a real named
+    // struct's own out-of-range/misspelled field access already produces —
+    // no bespoke tuple diagnostic needed, `t.2` is simply not a declared
+    // field of `__Tuple2`.
+    assert!(matches!(err.kind, TypeErrorKind::NoSuchField { .. }), "got: {:?}", err.kind);
+}
+
+#[test]
+fn a_function_over_an_explicitly_annotated_tuple_parameter_infers_correctly() {
+    let ty = infer_fn_named_with_tuples("fn first(t: (i32, bool)) -> i32 { t.0 }", "first", &[2]).unwrap();
+    assert_eq!(ty, Ty::Con("i32".to_string()));
+}
+
+#[test]
+fn a_nested_tuple_infers_and_reads_back_correctly() {
+    let ty = infer_fn_named_with_tuples("fn f() -> i32 { let t: ((i32, i32), i32) = ((1, 2), 3); t.0.1 }", "f", &[2]).unwrap();
+    assert_eq!(ty, Ty::Con("i32".to_string()));
 }

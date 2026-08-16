@@ -380,20 +380,30 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                     // A bodyless method (`extern(...)`, or bare `extern fn`)
                     // needs `UnitBody::Extern`, not `UnitBody::Real` — the
                     // same distinction the non-generic impl branch above and
-                    // the top-level `fn` branch both already make.
-                    // `monomorphize.rs::build_impl_templates` defaults a
-                    // bodyless method's own template body to an empty
-                    // `Block` (nothing to substitute), so `mono.body(key)`
-                    // would otherwise silently produce a real unit with a
-                    // trivially empty body instead of a real extern call —
-                    // found by direct testing, the first generic *and*
-                    // extern-backed impl this codebase ever declared
-                    // (`impl<const N: i32> Print<[i8; N]>`).
+                    // the top-level `fn` branch both already make. Read back
+                    // from the *specialization itself* (`mono.is_extern`/
+                    // `extern_symbol`), never from this loop's own `f` --
+                    // `specializations_of(origin_key)` returns *every*
+                    // specialization sharing this algebra+method name, from
+                    // *any* impl that declares one (`Print<i8>`, `Print<[i8;
+                    // N]>`, `Print<Wrapper<A>>`, ... all named `print`), not
+                    // just the ones `f`'s own impl produced -- deriving
+                    // extern-ness from `f` here silently rebuilt an unrelated
+                    // impl's own specialization using *this* impl's body/
+                    // extern-ness instead of its own, a real bug found by
+                    // direct testing the first time two *generic* impls of
+                    // the same algebra/method coexisted (`Print<[i8;N]>`
+                    // alongside a second generic `Print<...>` impl): the
+                    // resulting duplicate `ConcreteUnit` (same name, wrong
+                    // body) silently overwrote the correct one in `convert_
+                    // program`'s own `by_name` map, reaching MLIR as an empty
+                    // function body instead of the real extern call.
                     let origin_key = format!("{}::{}", d.algebra, f.name);
                     for key in mono.specializations_of(&origin_key) {
-                        let body = match &f.body {
-                            Some(_) => UnitBody::Real(mono.body(key).clone()),
-                            None => UnitBody::Extern(f.extern_symbol.clone().unwrap_or_else(|| f.name.clone())),
+                        let body = if mono.is_extern(key) {
+                            UnitBody::Extern(mono.extern_symbol(key).map(String::from).unwrap_or_else(|| f.name.clone()))
+                        } else {
+                            UnitBody::Real(mono.body(key).clone())
                         };
                         units.push(ConcreteUnit {
                             name: key.clone(),

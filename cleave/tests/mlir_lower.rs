@@ -2906,3 +2906,90 @@ fn a_loop_with_no_break_produces_no_guard_machinery() {
     assert!(!main_text.contains("Logic::and"), "an unguarded loop's own `main` must not call `Logic::and` at all, got:\n{main_text}");
     assert_eq!(run_i32(&context, src), 45);
 }
+
+// `(T1,T2)`/`(a,b)`/`t.0` — `doc/backlog.md`'s own former "Tuples as a
+// language feature" item, desugared entirely at `lower.rs` time into
+// ordinary generic-struct syntax naming a synthesized `__TupleN` struct
+// (`driver.rs::synthesize_tuple_structs`, injected into every compiled
+// program automatically — see its own doc comment) — no new `Ty`/CPS/MLIR
+// primitive anywhere, these tests exercise the *existing* struct pipeline
+// through the tuple sugar, not a new lowering path.
+
+#[test]
+fn a_tuple_constructs_and_reads_both_fields_back_correctly() {
+    let context = context();
+    let out = run_i32(&context, "fn main() -> i32 { let t: (i32, i32) = (3, 4); t.0 * 10 + t.1 }");
+    assert_eq!(out, 34);
+}
+
+#[test]
+fn a_heterogeneous_tuple_reads_a_non_i32_field_back_correctly() {
+    let context = context();
+    // `t.1` stays `f64`-typed all the way through (no `i32`-narrowing
+    // `Convert` impl exists, or is needed) -- folded into the `i32` return
+    // via a comparison instead, matching `run_i32`'s own return type.
+    let out = run_i32(&context, "fn main() -> i32 { let t: (i32, f64) = (3, 4.5); if t.1 == 4.5 { t.0 } else { -1 } }");
+    assert_eq!(out, 3);
+}
+
+#[test]
+fn a_nested_tuple_reads_back_correctly_through_a_chained_field_access() {
+    let context = context();
+    let out = run_i32(&context, "fn main() -> i32 { let t: ((i32, i32), i32) = ((1, 2), 3); t.0.0 * 100 + t.0.1 * 10 + t.1 }");
+    assert_eq!(out, 123);
+}
+
+#[test]
+fn a_tuple_field_is_mutable_through_a_let_mut_binding() {
+    let context = context();
+    let out = run_i32(&context, "fn main() -> i32 { let mut t: (i32, i32) = (10, 20); t.0 = 99; t.0 + t.1 }");
+    assert_eq!(out, 119);
+}
+
+#[test]
+fn a_function_over_an_explicit_tuple_parameter_type_returns_the_right_element() {
+    let context = context();
+    let out = run_i32(&context, "fn first(t: (i32, bool)) -> i32 { t.0 }\nfn main() -> i32 { first((7, true)) }");
+    assert_eq!(out, 7);
+}
+
+/// The real end-to-end validation this whole feature was built to satisfy —
+/// `doc/backlog.md`'s own former "Multi-argument, heterogeneous `print`"
+/// item: `print(("x=", x, "y=", y))`, a genuinely heterogeneous tuple
+/// (two string literals, an `i32`, an `f64`) dispatched through `stdlib/io/
+/// io.cleave`'s own `impl<A: Print, ...> Print<(A, ...)>` — each element
+/// independently dispatched to whichever `Print<T>` impl matches its own
+/// concrete type, unrolled by hand (no variadic generics — deliberately
+/// deferred, see `doc/backlog.md`'s own "variadic generics" item) across
+/// four separately-written impls (arity 2 through 4). Also the real
+/// end-to-end proof for two separate, pre-existing bugs found *while*
+/// building this validation (both fixed, not tuple-specific): a string
+/// literal is itself `[i8;N]`, an array-typed field once it's read back out
+/// of the tuple's own storage (`x.0`) — crossing `Print<[i8;N]>`'s own
+/// extern-call boundary needs `mlir_lower.rs::array_ptr_and_len`'s own
+/// `!llvm.ptr`-vs-`memref` branch (an array field is never a real `memref`,
+/// only a standalone one is); and reaching `Print<[i8;N]>::print` at all,
+/// once a *second* generic `Print<...>` impl exists in the same crate,
+/// needed `monomorphize.rs`/`cps.rs`'s own per-specialization extern-ness
+/// fix (a real, previously-latent duplicate-specialization bug, invisible
+/// until two generic impls of the same algebra/method coexisted for the
+/// first time).
+#[test]
+fn a_multi_argument_heterogeneous_print_call_prints_every_element_in_order() {
+    let context = context();
+    // `run_i32` registers no `print_*` symbols at all -- `run_i32_with_
+    // dynarray_symbols`'s own `extra_symbols` slot is the established way
+    // any other test needing them supplies its own, unrelated to `DynArray`
+    // itself (its own base set of registered symbols is just a superset,
+    // harmless when unused).
+    let out = run_i32_with_dynarray_symbols(
+        &context,
+        "use io;\nfn main() -> i32 { let x: i32 = 3; let y: f64 = 4.5; print((\"x=\", x, \"y=\", y)); 0 }",
+        &[
+            ("print_i32", cleave_rt::print_i32 as *mut ()),
+            ("print_f64", cleave_rt::print_f64 as *mut ()),
+            ("print_bytes", cleave_rt::print_bytes as *mut ()),
+        ],
+    );
+    assert_eq!(out, 0);
+}

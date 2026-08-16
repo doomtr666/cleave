@@ -464,3 +464,72 @@ fn derivative_rule_decl_is_a_valid_algebra_item() {
     let inner = pair.into_inner().next().unwrap();
     assert_eq!(inner.as_rule(), Rule::derivative_rule_decl, "got: {:?}", inner.as_rule());
 }
+
+#[test]
+fn tuple_type_parses() {
+    parses(Rule::type_, "(i32, f64)");
+}
+
+#[test]
+fn tuple_type_with_more_than_two_elements_parses() {
+    parses(Rule::type_, "(i32, f64, bool, i32)");
+}
+
+#[test]
+fn nested_tuple_type_parses() {
+    parses(Rule::type_, "((i32, i32), bool)");
+}
+
+#[test]
+fn tuple_type_with_a_trailing_comma_parses() {
+    parses(Rule::type_, "(i32, f64,)");
+}
+
+#[test]
+fn tuple_literal_parses() {
+    parses(Rule::expr, "(1, 2.0)");
+}
+
+#[test]
+fn tuple_literal_with_more_than_two_elements_parses() {
+    parses(Rule::expr, "(1, 2.0, true)");
+}
+
+#[test]
+fn a_single_parenthesized_expression_is_still_ordinary_grouping_not_a_tuple() {
+    let pair = CleaveParser::parse(Rule::expr, "(1 + 2)").unwrap().next().unwrap();
+    // Walks down to `primary` and confirms it took the bare-grouping
+    // alternative, not `tuple_lit` — a tuple literal needs at least one
+    // top-level `,`, which `(1 + 2)` never has.
+    fn find_primary(pair: pest::iterators::Pair<Rule>) -> Option<pest::iterators::Pair<Rule>> {
+        if pair.as_rule() == Rule::primary {
+            return Some(pair);
+        }
+        pair.into_inner().find_map(find_primary)
+    }
+    let primary = find_primary(pair).expect("no `primary` found");
+    let inner = primary.into_inner().next();
+    assert_ne!(inner.map(|p| p.as_rule()), Some(Rule::tuple_lit));
+}
+
+#[test]
+fn tuple_field_access_parses() {
+    parses(Rule::expr, "t.0");
+}
+
+#[test]
+fn chained_tuple_field_access_into_a_nested_tuple_parses() {
+    // `t.0.1` — confirms the PEG grammar splits this into two separate
+    // `postfix_op`s (`.0` then `.1`), not misparsed as some single merged
+    // token — found worth checking directly, not assumed (this grammar has
+    // no separate lexer pass to worry about, but that's exactly the kind of
+    // thing worth confirming rather than guessing).
+    let pair = CleaveParser::parse(Rule::expr, "t.0.1").unwrap().next().unwrap();
+    let text = pair.as_str();
+    assert_eq!(text, "t.0.1");
+}
+
+#[test]
+fn tuple_field_assignment_target_parses() {
+    parses(Rule::assign_stmt, "t.0 = 5;");
+}

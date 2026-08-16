@@ -168,21 +168,29 @@ inherent_impl = { "impl" ~ generic_params? ~ "struct" ~ type_ ~ "{" ~ fn_decl* ~
 // ---------------------------------------------------------------- types
 // arrays are the 1D primitive (see grammar.md, "Primitives + arrays") — Matrix/Tensor
 // (multi-dim, strided) are algebras built on top, not a separate native array type.
-type_       = { fn_type | array_type | path ~ ("<" ~ generic_arg ~ ("," ~ generic_arg)* ~ ">")? }
+type_       = { fn_type | tuple_type | array_type | path ~ ("<" ~ generic_arg ~ ("," ~ generic_arg)* ~ ">")? }
 // A function type, for annotating a higher-order-function parameter
 // (`fn apply(f: (i32) -> i32, x: i32) -> i32 { f(x) }`) — mirrors `Ty::Fn`
 // (already used internally for a lambda's own inferred type) with actual
-// surface syntax to *write* one, previously missing entirely. `(` can't
-// otherwise start a `type_` (no parenthesized-type grouping exists), so
-// there's no ambiguity to resolve by ordering here, unlike `expr`'s own
-// `(` overload (parenthesized expr vs. call arguments) — `type_` has no
-// such second meaning for a leading `(` to compete with. The return type is
-// mandatory, unlike `fn_decl`'s own optional `-> type_` (a function
-// *declaration* can leave its return type to be inferred from its body;
-// a type *annotation* has no body to infer anything from, so nothing to
-// default to `()` from — matches every other type-annotation position in
-// this grammar, all of which are fully explicit, never partially inferred).
+// surface syntax to *write* one, previously missing entirely. Tried before
+// `tuple_type` (below) — both start with `(`, but `fn_type` requires a
+// trailing `-> type_` a tuple type never has, so PEG falls through to
+// `tuple_type` cleanly on any real tuple type, no explicit disambiguation
+// needed. The return type is mandatory, unlike `fn_decl`'s own optional
+// `-> type_` (a function *declaration* can leave its return type to be
+// inferred from its body; a type *annotation* has no body to infer
+// anything from, so nothing to default to `()` from — matches every other
+// type-annotation position in this grammar, all of which are fully
+// explicit, never partially inferred).
 fn_type     = { "(" ~ (type_ ~ ("," ~ type_)*)? ~ ")" ~ "->" ~ type_ }
+// `(T1, T2, ...)` — arity 2+ only (`("," ~ type_)+` requires at least one
+// comma): a 0-tuple would just be `()`, cleave's own existing unit type
+// spelling, and a 1-tuple has no motivating use case yet — both easy to add
+// later (the 1-tuple would need a mandatory trailing comma, `(T,)`, to stay
+// unambiguous against a parenthesized single type, which doesn't exist as
+// its own grammar position today either). See `lower.rs::lower_tuple_type`'s
+// own doc comment for how this desugars — no new `Ty`/AST variant at all.
+tuple_type  = { "(" ~ type_ ~ ("," ~ type_)+ ~ ","? ~ ")" }
 // a generic argument is either a type or a const-generic value — numeric (`Matrix<f64, 3,
 // 3>`'s dimensions) or boolean (`Grid<true>`'s flag). `numeric_lit`/`bool_lit` are tried
 // *before* `type_`, not after: a bare number could never start a `path` (idents can't begin
@@ -217,7 +225,7 @@ mut_kw      = { "mut" }
 // you can't assign through a method call.
 assign_stmt   = { assign_target ~ "=" ~ expr ~ ";" }
 assign_target = { ident ~ assign_suffix* }
-assign_suffix = { "." ~ ident | "[" ~ expr ~ ("," ~ expr)* ~ "]" }
+assign_suffix = { "." ~ (tuple_index | ident) | "[" ~ expr ~ ("," ~ expr)* ~ "]" }
 expr_stmt   = { expr ~ ";" }
 
 // ---------------------------------------------------------------- expressions
@@ -273,8 +281,16 @@ postfix     = { primary ~ postfix_op* }
 // which still greedily consumes a *bare-path* call's own immediate args at
 // the `primary` level; this only ever fires for a *trailing* `(args)` after
 // whatever `primary` already produced.
-postfix_op  = { "." ~ ident ~ call_args? | "[" ~ expr ~ ("," ~ expr)* ~ "]" | call_args }
+postfix_op  = { "." ~ (tuple_index | ident) ~ call_args? | "[" ~ expr ~ ("," ~ expr)* ~ "]" | call_args }
 call_args   = { "(" ~ arg_list? ~ ")" }
+// `t.0`/`t.1` — a tuple's own field access (`lower.rs`'s own tuple desugar
+// synthesizes plain numeric field names, "0"/"1"/..., so this needs no
+// separate AST shape from an ordinary `.ident` struct field access at all,
+// just a second token kind `postfix_op`/`assign_suffix` can each match
+// right after the `.`). Tried before `ident` in both — `ident` itself can
+// never start with a digit, so there's no real ambiguity to resolve by
+// ordering, this just keeps `tuple_index` matched first for clarity.
+tuple_index = @{ ASCII_DIGIT+ }
 
 // `call_expr` before `struct_lit`, deliberately: `f()` (a zero-arg call) and
 // `Empty()` (a zero-*field* struct construction) are syntactically
@@ -288,7 +304,17 @@ call_args   = { "(" ~ arg_list? ~ ")" }
 // `infer_call`'s own fallback, which special-cases exactly this one
 // remaining case (a zero-arg call naming a known, zero-field struct) rather
 // than leaving it as a silent "unresolved call".
-primary = { if_expr | while_expr | for_expr | loop_expr | array_lit | lambda_expr | call_expr | struct_lit | literal | path | "(" ~ expr ~ ")" | block }
+primary = { if_expr | while_expr | for_expr | loop_expr | array_lit | lambda_expr | call_expr | struct_lit | literal | path | tuple_lit | "(" ~ expr ~ ")" | block }
+
+// `(a, b, ...)` — arity 2+ (see `tuple_type`'s own doc comment for why),
+// tried before the bare grouping-paren alternative just after it: PEG
+// commits to the first alternative that fully matches, and a genuine tuple
+// literal always has at least one top-level `,` a mere `(expr)` grouping
+// never does, so ordering alone resolves this with no lookahead needed —
+// `(a)` (grouping) can never also match `tuple_lit` (which requires `,`),
+// and `(a, b)` can never match the grouping alternative (which expects `)`
+// immediately after the first `expr`, not `,`).
+tuple_lit = { "(" ~ expr ~ ("," ~ expr)+ ~ ","? ~ ")" }
 
 // `fn(a, b) { a + b }` — the same shape as `fn_decl`, minus the name: an
 // anonymous function value is "a `fn` without a name", not a separate

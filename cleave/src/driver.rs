@@ -297,8 +297,50 @@ pub fn compile(
         return (Err(errors), sources);
     }
 
-    let result = merge_programs(programs).and_then(|program| synthesize_derive_signatures(program, &mut node_ids));
+    let result = merge_programs(programs)
+        .and_then(|program| synthesize_derive_signatures(program, &mut node_ids))
+        .map(|program| synthesize_tuple_structs(program, &mut node_ids));
     (result, sources)
+}
+
+/// The tuple-arity ceiling this compiler understands — see `synthesize_
+/// tuple_structs`'s own doc comment. Trivially raised later; chosen to
+/// cover realistic near-term use (a multi-argument `print` call, mainly)
+/// with room to spare, not as a hard architectural limit.
+const MAX_TUPLE_ARITY: usize = 4;
+
+/// Injects one synthesized `struct __TupleN<T0, ..., T(N-1)> { 0: T0, ...,
+/// (N-1): T(N-1) }` per arity 2..=`MAX_TUPLE_ARITY`, into every compiled
+/// program — `lower.rs`'s own `lower_tuple_type`/`lower_tuple_lit` already
+/// desugar `(T1,T2)`/`(a,b)` into ordinary generic-struct syntax naming
+/// exactly these structs (`ast::tuple_struct_name`), so this is the other
+/// half: the real declaration those names resolve against. Unconditional,
+/// every compile, the same posture `compile`'s own prelude merge already
+/// takes for `num`/`logic` — monomorphization only ever specializes a
+/// struct that's actually reachable from a concrete entry point, so an
+/// unused synthesized arity costs nothing at runtime, and this avoids
+/// needing a whole-program "which arities does this program actually use"
+/// scan. Infallible — unlike `synthesize_derive_signatures`, there's no way
+/// for this to fail: every synthesized declaration is well-formed by
+/// construction (fresh, unbounded generic names, no bounds, referencing
+/// only its own fields).
+fn synthesize_tuple_structs(mut program: Program, node_ids: &mut NodeIdGen) -> Program {
+    let synthetic_span = Span { file: FileId(0), start: 0, end: 0 };
+    for arity in 2..=MAX_TUPLE_ARITY {
+        let generic_names: Vec<String> = (0..arity).map(|i| format!("T{i}")).collect();
+        let generics = generic_names.iter().map(|name| GenericParam::Type { name: name.clone(), bounds: Vec::new() }).collect();
+        let fields = generic_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| Field {
+                name: i.to_string(),
+                ty: Node { id: node_ids.next(), span: synthetic_span, kind: TypeKind::Path(Path::single(name.clone()), Vec::new()) },
+            })
+            .collect();
+        let decl = StructDecl { name: tuple_struct_name(arity), generics, fields };
+        program.items.push(Node { id: node_ids.next(), span: synthetic_span, kind: ItemKind::Struct(decl) });
+    }
+    program
 }
 
 /// `fprime = derive(f);` (`grammar.pest`'s own `derive_decl`, lowered by

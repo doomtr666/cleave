@@ -33,3 +33,41 @@ impl Print<f64> { extern(print_f64) fn print(x: f64) -> f64; }
 // matching every other `Print<T>` impl's "prints and returns unchanged"
 // contract).
 impl<const N: i32> Print<[i8; N]> { extern(print_bytes) fn print(x: [i8; N]) -> [i8; N]; }
+
+// A heterogeneous, fixed-arity `print` — `print(("x=", x, "y=", y))` — needs
+// its own impl per arity actually used, no variadic generics to write one
+// generically (`doc/backlog.md`'s own "variadic generics" item, deliberately
+// deferred; not needed for this at all) — the identical, already-established
+// posture `stdlib/vector/vector.cleave`'s own `Vector`/`Matrix`/`Tensor` take
+// (concretely-ranked, added when actually needed, not speculatively). A
+// tuple's own type/literal/field-access syntax (`(A,B)`/`(a,b)`/`x.0`) is
+// ordinary generic-struct sugar (`ast::tuple_struct_name`, `driver.rs::
+// synthesize_tuple_structs`) — these three impls are otherwise completely
+// unremarkable generic algebra impls, needing no tuple-specific machinery of
+// their own at all. `A: Print`/`B: Print`/... bounds each element's own
+// recursive `print(x.N)` call to a real, concrete dispatch once monomorphized
+// (a bare, unbounded `A` would leave `print(x.0)` unresolvable).
+impl<A: Print, B: Print> Print<(A, B)> {
+    fn print(x: (A, B)) -> (A, B) {
+        print(x.0);
+        print(x.1);
+        x
+    }
+}
+impl<A: Print, B: Print, C: Print> Print<(A, B, C)> {
+    fn print(x: (A, B, C)) -> (A, B, C) {
+        print(x.0);
+        print(x.1);
+        print(x.2);
+        x
+    }
+}
+impl<A: Print, B: Print, C: Print, D: Print> Print<(A, B, C, D)> {
+    fn print(x: (A, B, C, D)) -> (A, B, C, D) {
+        print(x.0);
+        print(x.1);
+        print(x.2);
+        print(x.3);
+        x
+    }
+}

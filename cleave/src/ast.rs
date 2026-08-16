@@ -240,6 +240,23 @@ pub enum GenericParam {
     Const { name: String, ty: Type },
 }
 
+/// A tuple (`(T1, T2, ...)` as a type, `(a, b, ...)` as a value, `t.0`/`t.1`
+/// for field access) is *not* its own AST/`Ty` shape at all — `lower.rs`
+/// desugars all three straight into the exact AST an ordinary generic
+/// struct's own type/literal/field-access syntax already produces, naming
+/// a synthesized struct declaration reserved for this arity. `driver.rs`'s
+/// own `synthesize_tuple_structs` injects the matching real `StructDecl`s
+/// (`struct __Tuple2<T0, T1> { 0: T0, 1: T1 }`, ...) into every compiled
+/// program — see its own doc comment for why unconditionally, and for the
+/// arity ceiling. `__`-prefixed matches this codebase's existing convention
+/// for a reserved, unwritable-from-source name (`cps.rs`'s `"__loop_
+/// running"`/`"__break_value"`). Shared by `lower.rs` (which needs to *name*
+/// the struct a `(T1,T2)`/`(a,b)` desugars to) and `driver.rs` (which needs
+/// to *declare* it) so the two can never drift apart.
+pub fn tuple_struct_name(arity: usize) -> String {
+    format!("__Tuple{arity}")
+}
+
 // ---------------------------------------------------------------- types
 
 #[derive(Debug, Clone)]
