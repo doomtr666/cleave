@@ -957,7 +957,23 @@ impl Lowerer {
                             Box::new(self.wrap(count_span, ExprKind::Path(Path { segments: vec![count.as_str().to_string()] })));
                         self.wrap(span, ExprKind::ArrayRepeat { value, count })
                     }
-                    r => unreachable!("array_repeat's own count must be numeric_lit or ident, got {r:?}"),
+                    // `[value; Dims...]` — a whole *pack* reference, not one
+                    // named const generic (`doc/backlog.md`'s own "Toward a
+                    // matmul-based tensorial XOR" follow-on) — mirrors `lower_
+                    // array_dim`'s own identical extraction (the pack's own
+                    // bare name, discarding the ordinary `Path` shape),
+                    // duplicated rather than shared since `pack_ref`'s own
+                    // pest shape here (`ident ~ pack_marker`, matched whole)
+                    // differs from `array_dim`'s (`expr ~ pack_marker?`,
+                    // matched via its own inner `expr` first).
+                    Rule::pack_ref => {
+                        let count_span = self.span_of(&count);
+                        let value = Box::new(self.lower_expr(value));
+                        let name = count.into_inner().next().unwrap().as_str().to_string();
+                        let count = Box::new(self.wrap(count_span, ExprKind::PackRef(name)));
+                        self.wrap(span, ExprKind::ArrayRepeat { value, count })
+                    }
+                    r => unreachable!("array_repeat's own count must be numeric_lit, pack_ref, or ident, got {r:?}"),
                 }
             }
             Rule::array_list => {

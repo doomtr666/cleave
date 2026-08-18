@@ -461,14 +461,21 @@ loop_expr  = { "loop" ~ block }
 // (its value isn't known until monomorphization), so it stays a real
 // `ExprKind::ArrayRepeat` node, resolved through ordinary type inference
 // (see `infer.rs`) like everything else -- deliberately restricted to
-// `numeric_lit | ident` rather than a general `expr`: this names a
-// compile-time integer (a literal or a const-generic reference), not a
-// computation. `array_repeat`/`array_list` are distinct named rules (not
-// just two shapes folded into one), so lowering can tell which one actually
-// matched -- both produce a flat sequence of `expr` children on their own,
+// `numeric_lit | pack_ref | ident` rather than a general `expr`: this names
+// a compile-time integer (a literal, a const-generic reference, or —
+// `doc/backlog.md`'s own "Toward a matmul-based tensorial XOR" item's own
+// follow-on, needed to build a same-shaped zero for a pack-generic type
+// like `Tensor<T,Dims...>` from ordinary cleave source — a whole *pack*
+// reference, `Dims...`), not a computation. `pack_ref` tried before the bare
+// `ident` alternative, same reasoning `type_`'s own ordering already uses:
+// an ordinary `ident` alone never itself consumes a trailing `...`, so
+// there's no real ambiguity, just keeping the more specific alternative
+// first. `array_repeat`/`array_list` are distinct named rules (not just two
+// shapes folded into one), so lowering can tell which one actually matched
+// -- both produce a flat sequence of `expr` children on their own,
 // indistinguishable from each other without this.
 array_lit    = { "[" ~ (array_repeat | array_list)? ~ "]" }
-array_repeat = { expr ~ ";" ~ (numeric_lit | ident) }
+array_repeat = { expr ~ ";" ~ (numeric_lit | pack_ref | ident) }
 array_list   = { expr ~ ("," ~ expr)* }
 
 // ---------------------------------------------------------------- literals

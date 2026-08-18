@@ -2237,6 +2237,22 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                 }
             })
         }
+        // `[value; Dims...]` — a whole *pack* reference (`doc/backlog.md`'s
+        // own "Toward a matmul-based tensorial XOR" follow-on) — `count`
+        // itself never needs converting at all: a pack reference has no
+        // runtime value of its own, only a *shape*. By this point (post-
+        // monomorphization) `ctx.node_types[&expr.id]` is already the real,
+        // fully-resolved nested `Ty::Array` chain (`infer.rs::substitute`'s
+        // own pack-expansion fix) — `convert_array_repeat_over_resolved_
+        // dims` reads the real dimension count directly off it, building
+        // one real `PrimOp::ArrayRepeat` per nesting level, innermost
+        // first — exactly the same shape a hand-written `[[value; d2]; d1]`
+        // already produces via ordinary nested `ExprKind::ArrayRepeat`
+        // conversion (the `ident` branch just below), just generated here
+        // instead of written out by hand.
+        ExprKind::ArrayRepeat { value, count } if matches!(count.kind, ExprKind::PackRef(_)) => {
+            convert_array_repeat_over_resolved_dims(value, &ctx.node_types[&expr.id], env, ctx, k)
+        }
         ExprKind::ArrayRepeat { value, count } => convert_expr(value, env, ctx, &|value_val, env| {
             convert_expr(count, env, ctx, &|count_val, env| {
                 let var = ctx.fresh.var();
@@ -2286,6 +2302,43 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
         // the shape a bare expression position needs.
         ExprKind::Block(b) => convert_block(b, env, ctx, k),
         other => panic!("CPS doesn't support {other:?} yet -- see doc/backlog.md"),
+    }
+}
+
+/// `[value; Dims...]`'s own CPS conversion (`ExprKind::ArrayRepeat`'s own
+/// `count.kind` guard, above) — `ty` is the *real*, fully-resolved nested
+/// `Ty::Array` chain (`infer.rs::substitute`'s own pack-expansion fix
+/// already turned the symbolic one-level `Array(elem, Pack(v))` into this
+/// by the time CPS conversion runs, post-monomorphization). Peels one
+/// `Ty::Array` level per recursive call — reaching the base case (a
+/// non-`Array` element type) converts `value` exactly once, ordinarily;
+/// unwinding back out wraps one real `PrimOp::ArrayRepeat` per level,
+/// innermost first, each one's own `value` argument being the *previous*
+/// level's own freshly-bound result — byte-for-byte the same CPS shape a
+/// hand-written `[[value; d2]; d1]` already produces via two ordinary,
+/// syntactically-nested `ExprKind::ArrayRepeat` conversions (this function
+/// exists only because a pack's own real dimension count isn't visible in
+/// the source text to write out by hand).
+fn convert_array_repeat_over_resolved_dims(value: &Expr, ty: &Ty, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> CExpr) -> CExpr {
+    match ty {
+        Ty::Array(elem_ty, size) => {
+            let Ty::Const(ConstValue::Int(n)) = size.as_ref() else {
+                panic!("CPS: array-repeat over a pack resolved to a non-concrete dimension {size:?} -- monomorphization should already have resolved every real dim");
+            };
+            let n = *n;
+            let level_ty = ty.clone();
+            convert_array_repeat_over_resolved_dims(value, elem_ty, env, ctx, &move |inner_val, env| {
+                let var = ctx.fresh.var();
+                CExpr::LetPrim {
+                    var,
+                    ty: level_ty.clone(),
+                    op: PrimOp::ArrayRepeat,
+                    args: vec![inner_val, CVal::Int(n)],
+                    cont: Box::new(k(CVal::Var(var), env)),
+                }
+            })
+        }
+        _ => convert_expr(value, env, ctx, k),
     }
 }
 

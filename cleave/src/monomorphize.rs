@@ -550,6 +550,7 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
         // call site in the program ever reaches directly.
         let target_tys: Vec<Ty> = t.target_patterns.iter().map(|p| substitute(p, &mapping)).collect();
         seed_derivative_rule_references(registry, &t.algebra, &t.method_name, &target_tys, &templates, &mut impl_worklist);
+        seed_ring_zero(&t.algebra, &target_tys, &templates, &mut impl_worklist);
 
         let origin = format!("{}::{}", t.algebra, t.method_name);
         mono.by_origin.entry(origin).or_default().push(display.clone());
@@ -1665,6 +1666,31 @@ fn seed_derivative_rule_references(
         .filter_map(|(rule_p, sig_p)| Some((rule_p.name.as_str(), infer.ty_from_ast_mapped(sig_p.ty.as_ref()?, &type_env))))
         .collect();
     resolve_derivative_rule_expr_ty(&rule.body, algebra, &type_env, &param_tys, registry, &mut infer, templates, impl_worklist);
+}
+
+/// A sibling of `seed_derivative_rule_references`, same call site, same
+/// worklist-injection mechanism — but a *different* trigger: not "some
+/// `derivative` rule's own body references this," since nothing declared
+/// anywhere ever references `Ring::zero` at all. `egraph.rs`'s own built-in
+/// `derivative-independent-zero` rule can call `Ring::zero<X>` *dynamically*
+/// for any type `X` reached inside a `derive()`d function (`doc/backlog.md`'s
+/// own "Real pack-generic `[value; Dims...]` array-repeat" item's own
+/// follow-on — `zero()`, a real `Ring<T>`-declared method now, replacing
+/// `egraph.rs::build_zero`'s own hand-built construction), with no
+/// `derivative` rule anywhere in the loop. Scoped to `Ring` specifically
+/// (the one algebra `derivative-independent-zero` ever needs a zero from)
+/// and to *generic* `Ring<X>` impls only — a non-generic one (`Ring<f32>`,
+/// `Ring<f64>`) needs no seeding at all, `cps.rs::collect_units` already
+/// includes every non-generic impl's own methods (`zero()` included)
+/// unconditionally, the same reason `find_impl_for_target` itself already
+/// only ever matches a generic template.
+fn seed_ring_zero(algebra: &str, target_tys: &[Ty], templates: &[ImplTemplate], impl_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>) {
+    if algebra != "Ring" {
+        return;
+    }
+    if let Some((idx, mapping)) = find_impl_for_target(templates, "Ring", "zero", target_tys) {
+        impl_worklist.push((idx, mapping));
+    }
 }
 
 /// Like `derive_instantiation`, for the algebra-impl side: tries every

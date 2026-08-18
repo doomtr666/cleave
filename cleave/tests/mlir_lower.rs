@@ -2123,6 +2123,42 @@ fn a_rank_3_tensor_constructs_and_reads_back_the_right_value() {
     assert_eq!(run_i32(&context, src), 1);
 }
 
+/// `doc/backlog.md`'s own "Real pack-generic `[value; Dims...]` array-
+/// repeat" item — `[value; Dims...]` (a whole *pack* reference as an
+/// array-repeat's own count, not one named const generic) now builds a
+/// real, same-shaped, repeated-value construction from ordinary cleave
+/// source — the missing piece `derivative-independent-zero`'s own `build_
+/// zero` (`egraph.rs`) had to hand-recognize structurally instead, before
+/// this. Checked at three different ranks through the same pack-generic
+/// impl, not just one shape happening to work: rank 1 (`Tensor<f32,3>`),
+/// rank 2 (`Tensor<f32,2,2>`), rank 3 (`Tensor<f32,2,2,2>`), reading back
+/// elements at both extremes (`[0,...]` and the last valid index) of each.
+#[test]
+fn array_repeat_over_a_whole_pack_builds_a_same_shaped_tensor_at_every_rank() {
+    let context = context();
+    let src = r#"
+        use linalg;
+        algebra Filled<T> {
+            fn filled() -> T;
+        }
+        impl<T: Float, const Dims...: i32> Filled<Tensor<T, Dims...>> {
+            fn filled() -> Tensor<T, Dims...> {
+                Tensor::<T, Dims...>(data: [7.0; Dims...])
+            }
+        }
+        fn main() -> i32 {
+            let v: Tensor<f32, 3> = Filled::filled();
+            let m: Tensor<f32, 2, 2> = Filled::filled();
+            let t: Tensor<f32, 2, 2, 2> = Filled::filled();
+            if v[0] == 7.0 and v[2] == 7.0
+                and m[0,0] == 7.0 and m[1,1] == 7.0
+                and t[0,0,0] == 7.0 and t[1,1,1] == 7.0
+            { 1 } else { 0 }
+        }
+    "#;
+    assert_eq!(run_i32(&context, src), 1);
+}
+
 /// The negative counterpart — `m[i,j,k]` (3 indices) on a rank-2 `Tensor`
 /// must be rejected, not silently accepted with the extra index ignored:
 /// `Index<Tensor<T,Dims...>,T>`'s own `idx: [i32; Dims.len()]` pins `K` to
@@ -2765,6 +2801,36 @@ fn derive_through_matmul_against_a_constant_identity_matrix_uses_the_product_rul
         }
     ";
     assert_eq!(run_i32_with_optimization_pass(&context, src), 1);
+}
+
+/// `doc/backlog.md`'s own "`Ring<T>` gained a real `zero()`" item — a real,
+/// long-latent `linalg::matmul` bug, found integrating `Ring::zero()` into
+/// `derivative-independent-zero`: `matmul`'s own accumulator used to be
+/// `mlir::tensor::empty()`, genuinely *uninitialized* memory, on the
+/// strength of a comment claiming `linalg.matmul` "computes the entire
+/// result itself, never accumulates" — wrong (`linalg.matmul` is BLAS-GEMM
+/// semantics, `C := A@B + C`; confirmed directly via `--dump-mlir-lowered`,
+/// past `convert-linalg-to-loops`, which genuinely loads the accumulator's
+/// own current value before adding into it). Every prior test happened to
+/// get zero-initialized memory back from the allocator anyway, purely by
+/// allocator behavior, never guaranteed — masking this for as long as
+/// `matmul` existed. `matmul(a, Ring::zero())` is the minimal, direct
+/// reproduction: the result must be *exactly* the zero matrix regardless of
+/// `a`'s own values — a wrong, uninitialized accumulator would instead
+/// leak whatever garbage previously occupied that memory into the result.
+#[test]
+fn matmul_against_a_real_zero_tensor_gives_exactly_zero_not_uninitialized_garbage() {
+    let context = context();
+    let src = "
+        use linalg;
+        fn main() -> i32 {
+            let a = Tensor::<f32,2,2>(data:[[1.0,2.0],[3.0,4.0]]);
+            let z: Tensor<f32,2,2> = Ring::zero();
+            let c = matmul(a, z);
+            if c[0,0] == 0.0 and c[0,1] == 0.0 and c[1,0] == 0.0 and c[1,1] == 0.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
 }
 
 // The real target this whole item was chasing (`doc/backlog.md`'s own

@@ -331,7 +331,19 @@ impl Subst {
             Ty::Fn(params, ret) => {
                 Ty::Fn(params.iter().map(|p| self.apply(p)).collect(), Box::new(self.apply(ret)))
             }
-            Ty::Array(elem, size) => Ty::Array(Box::new(self.apply(elem)), Box::new(self.apply(size))),
+            // `size` resolving to a whole `PackResolved` list means this one
+            // syntactic level stands for however many real nesting levels
+            // the pack has — expanded into the real nested chain, mirroring
+            // `substitute`'s own identical `Ty::Array` fix, needed for the
+            // exact same reason (`[value; Dims...]`, `ExprKind::ArrayRepeat`'s
+            // own inference arm).
+            Ty::Array(elem, size) => {
+                let elem = self.apply(elem);
+                match self.apply(size) {
+                    Ty::PackResolved(dims) => dims.into_iter().rev().fold(elem, |acc, dim| Ty::Array(Box::new(acc), Box::new(dim))),
+                    size => Ty::Array(Box::new(elem), Box::new(size)),
+                }
+            }
             // Fold eagerly the moment both operands resolve all the way to a
             // concrete `Const` — this runs at the top of every `unify` call
             // (see its own doc comment), so a `ConstExpr` pinned concrete by,
@@ -538,6 +550,28 @@ pub fn unify(subst: &mut Subst, a: &Ty, b: &Ty) -> Result<(), UnifyError> {
             Ok(())
         }
         (Ty::Var(v1), Ty::Var(v2)) if v1 == v2 => Ok(()),
+        // `Ty::Pack` reaching `unify` bare (not nested inside an enclosing
+        // `App`'s own args list — that case is handled entirely separately,
+        // below) was never expected before `[value; Dims...]` (`ExprKind::
+        // ArrayRepeat`'s own pack-count support, `doc/backlog.md`'s own
+        // "Toward a matmul-based tensorial XOR" follow-on): a `Ty::Array`'s
+        // own `size` field can now genuinely be a still-open `Ty::Pack`
+        // (`[T; Dims...]`'s own inferred type before `Dims` resolves), and
+        // the very same array-repeat expression's own declared-vs-inferred
+        // check (`infer_struct_lit_with_pack`) unifies *two* independently-
+        // built `Ty::Array(_, Pack(v))` values against each other — both
+        // reading the *same* `self.active_generics["Dims"]` var, so always
+        // the *same* `v` in practice. Only that narrow, safe case is handled
+        // here (mirroring `Ty::Var`'s own identical same-var shortcut just
+        // above) — deliberately not a general "bind a Pack against anything"
+        // arm the way `Ty::Var`'s own below is: a `Pack` conceptually stands
+        // for a *list* of types, so binding it against an arbitrary
+        // non-list `Ty` the way a plain type variable can would be
+        // unsound, not just unneeded. Two *different*, still-open packs
+        // meeting here falls through to the ordinary `Mismatch` below, a
+        // real, flagged gap (never reached by anything currently reachable)
+        // rather than a guess.
+        (Ty::Pack(v1), Ty::Pack(v2)) if v1 == v2 => Ok(()),
         (Ty::Var(v), _) => {
             if subst.occurs(*v, &b) {
                 return Err(UnifyError::Occurs(*v, b));
@@ -1087,8 +1121,24 @@ pub(crate) fn substitute(ty: &Ty, mapping: &HashMap<TyVar, Ty>) -> Ty {
         Ty::Fn(params, ret) => {
             Ty::Fn(params.iter().map(|p| substitute(p, mapping)).collect(), Box::new(substitute(ret, mapping)))
         }
+        // `size` resolving to a whole `PackResolved` list (`[value; Dims...]`
+        // — `ExprKind::ArrayRepeat`'s own inference arm builds exactly this
+        // shape, `Ty::Array(elem, Ty::Pack(v))`, mirroring how a struct
+        // field's own `[T; Dims...]` declared type already does) means this
+        // one syntactic level actually stands for *however many* real
+        // nesting levels the pack turns out to have — expanded here into the
+        // real nested `Ty::Array` chain, the exact same `rev().fold` shape
+        // `mlir_lower.rs::resolve_struct_field_ty_with_pack` already uses
+        // for the identical surface shape in a struct field's own type.
+        // Every other case (`size` resolving to an ordinary `Const`/`Var`,
+        // the overwhelmingly common one) is unchanged, one level, byte-for-
+        // byte what this arm already did before.
         Ty::Array(elem, size) => {
-            Ty::Array(Box::new(substitute(elem, mapping)), Box::new(substitute(size, mapping)))
+            let elem = substitute(elem, mapping);
+            match substitute(size, mapping) {
+                Ty::PackResolved(dims) => dims.into_iter().rev().fold(elem, |acc, dim| Ty::Array(Box::new(acc), Box::new(dim))),
+                size => Ty::Array(Box::new(elem), Box::new(size)),
+            }
         }
         // The monomorphization-time fold: `mapping` carries a generic
         // template's own real, concrete instantiation values (see this
@@ -4725,9 +4775,29 @@ impl<'r> Infer<'r> {
             // value reference — it reaches the *same* `Ty::Var` already
             // seeded for that const generic (see the `fresh_generics_mapping`
             // callers, which also insert each const generic into `env`).
+            //
+            // `[value; Dims...]` — a whole *pack* reference — can't go
+            // through `env`/`infer_expr` the same way: `Dims` alone is never
+            // an ordinary bound value (only `Dims.len()` is recognized, via
+            // `pack_len_from_method_call`), so `infer_expr` on a bare
+            // `ExprKind::PackRef` panics outright (it's not meant to be
+            // reached as an *ordinary* expression). Resolved instead exactly
+            // the way a struct field's own `[T; Dims...]` declared type is,
+            // at the *type* level — `self.active_generics` (the enclosing
+            // impl's own generic-name -> `Ty` map, `generic_arg_to_ty`'s own
+            // doc comment) — giving `Ty::Array(elem, Ty::Pack(v))`, one
+            // level, symbolic (mirrors `ty_from_ast_mapped`'s own `TypeKind::
+            // Array` handling of the identical surface shape in type
+            // position) until monomorphization resolves `v` to a real list
+            // of dims and `substitute`'s own new `Ty::Array` pack-expansion
+            // (below) turns it into the real nested chain.
             ExprKind::ArrayRepeat { value, count } => {
                 let elem_ty = self.infer_expr(env, value)?;
-                let count_ty = self.infer_expr(env, count)?;
+                let count_ty = if let ExprKind::PackRef(name) = &count.kind {
+                    self.active_generics.get(name).cloned().unwrap_or_else(|| self.vars.fresh())
+                } else {
+                    self.infer_expr(env, count)?
+                };
                 Ok(Ty::Array(Box::new(elem_ty), Box::new(count_ty)))
             }
             // One bracket group, `a[i]` or `a[i,j,...]` — `indices` is

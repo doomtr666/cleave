@@ -326,11 +326,39 @@ fn is_pure_prim_op(op: &PrimOp) -> bool {
 /// Found by direct testing while extending this module to translate
 /// `Struct`/`Field` further, which makes translation reach a real `print`
 /// call for the first time.
-fn is_straight_line(expr: &CExpr) -> bool {
+fn is_straight_line(expr: &CExpr, units: &HashMap<String, &CTopLevelFn>) -> bool {
     match expr {
-        CExpr::LetPrim { op, cont, .. } => is_pure_prim_op(op) && is_straight_line(cont),
+        CExpr::LetPrim { op, cont, .. } => is_pure_prim_op(op) && is_straight_line(cont, units),
         CExpr::App { .. } => true,
-        CExpr::Fix { .. } | CExpr::If { .. } => false,
+        CExpr::If { .. } => false,
+        // A real call to a *zero-argument* callee (`Ring::zero()`,
+        // `MatMul::matmul`'s own accumulator init — `doc/backlog.md`'s own
+        // "Toward a matmul-based tensorial XOR" item's own correctness-bug
+        // follow-on) can never depend on the enclosing chain's own values
+        // at all — it takes nothing — so treating it as "just another pure
+        // primop" is always sound, *as long as its own body is itself a
+        // pure chain* (`is_transparent_chain`, checked recursively — a
+        // zero-arg call could still be effectful in principle, e.g. a
+        // hypothetical `read_random_seed()`, so `real_args.is_empty()`
+        // alone isn't sufficient on its own). Found necessary directly, not
+        // anticipated: `MatMul::matmul`'s own body gaining a real call to
+        // `Ring::zero()` made it stop being straight-line by the letter of
+        // the old, `Fix`-always-rejects rule, silently falling through to
+        // multi-level *inlining* instead and losing `matmul`'s own named
+        // identity — the one thing its own declared `derivative matmul(a,
+        // b): ...` rule needs to ever match anything again. Scoped
+        // narrowly to zero-argument callees specifically (not e.g. "any
+        // algebra-origin'd callee," tried first and reverted: that broke
+        // `Activation::sigmoid`, which has no declared `derivative` rule of
+        // its own at all and *needs* to stay on the inlining path, not
+        // collapse to a permanently-undifferentiable opaque node).
+        CExpr::Fix { defs, body } => match recognize_real_call(defs, body) {
+            Some((_, unit_name, real_args, rest)) if real_args.is_empty() => {
+                units.get(unit_name).is_some_and(|callee| is_transparent_chain(&callee.def.body, units, &mut HashSet::new()))
+                    && is_straight_line(rest, units)
+            }
+            _ => false,
+        },
     }
 }
 
@@ -357,7 +385,7 @@ fn is_transparent_chain(expr: &CExpr, units: &HashMap<String, &CTopLevelFn>, vis
         CExpr::Fix { defs, body } => {
             let Some((_, unit_name, _, rest)) = recognize_real_call(defs, body) else { return false };
             let Some(callee) = units.get(unit_name) else { return false };
-            if is_straight_line(&callee.def.body) {
+            if is_straight_line(&callee.def.body, units) {
                 return is_transparent_chain(rest, units, visiting);
             }
             if !visiting.insert(unit_name.to_string()) {
@@ -608,7 +636,7 @@ impl Forward {
                 }
                 if let Some((result_var, unit_name, real_args, rest)) = recognize_real_call(defs, body) {
                     if let Some(callee) = units.get(unit_name) {
-                        if is_straight_line(&callee.def.body) {
+                        if is_straight_line(&callee.def.body, units) {
                             if let Some(arg_ids) = self.cvals_to_ids(real_args) {
                                 let id = self.egraph.add(CleaveLang::Op(unit_name.into(), arg_ids));
                                 self.env.insert(result_var, id);
@@ -1349,7 +1377,12 @@ use egg::{Applier, Language, Subst};
 /// function unit is actually present in `reached` — same "only build what's
 /// actually reached" discipline `axiom_rewrites` already uses; harmless,
 /// not unsound, if a rule never matches anything in a given e-graph.
-pub fn derivative_rewrites(ty: &str, reached: &HashMap<String, (String, String)>, registry: &Registry) -> (Vec<Rewrite<CleaveLang, ConstantFold>>, HashSet<String>) {
+pub fn derivative_rewrites(
+    ty: &str,
+    reached: &HashMap<String, (String, String)>,
+    registry: &Registry,
+    unit_names: &HashSet<String>,
+) -> (Vec<Rewrite<CleaveLang, ConstantFold>>, HashSet<String>, std::sync::Arc<std::sync::Mutex<HashSet<String>>>) {
     let one = if matches!(ty, "f32" | "f64") { CleaveLang::Float(1.0.into()) } else { CleaveLang::Int(1) };
 
     let mut rules = Vec::new();
@@ -1403,15 +1436,29 @@ pub fn derivative_rewrites(ty: &str, reached: &HashMap<String, (String, String)>
     // minimal probe: an identity-matrix literal fed into `matmul`, once
     // `MatMul::matmul`'s own new product rule needed differentiating
     // through it, crashed MLIR lowering ("a nested array's own element
-    // must be an already-built array value, not a bare literal"). Needs
-    // `?a`'s own concrete `Ty` (`ConstantFold::known_types`'s own doc
-    // comment) to build a properly-shaped zero; when that `Ty` isn't known,
-    // or isn't a shape `build_zero` knows how to decompose, the rule simply
-    // doesn't fire for that e-class — sound, not a guess: the full
-    // recursive chain-rule expansion (already present in the same e-class
-    // regardless) is what supplies the correct answer there instead, this
-    // rule staying a pure optimization shortcut, never the sole source of
-    // truth.
+    // must be an already-built array value, not a bare literal").
+    //
+    // Fixed twice, in fact — the first pass (`build_zero` hand-recognizing
+    // "a single-field, pack-generic struct" structurally, in Rust) worked
+    // but was exactly the kind of hardcoded-in-the-compiler logic this
+    // project's own discipline says new functionality should never need,
+    // raised directly by the project owner. The real fix: `Ring<T>` gained
+    // a genuine `zero()` method (`stdlib/num/num.cleave` — the additive
+    // identity only ever means anything relative to `add`, so it belongs
+    // there, not a separate algebra), with a real `linalg::Tensor<T,Dims
+    // ...>` impl built from ordinary cleave source (`doc/backlog.md`'s own
+    // "Real pack-generic `[value; Dims...]` array-repeat" item was the
+    // missing piece that unblocked writing it at all). This rule's own job
+    // shrinks to just calling it — `Ring::zero<ty>()`, resolved at
+    // rewrite-*application* time since `?a`'s own `Ty` is only known then —
+    // when that unit doesn't actually exist for `ty` (`unit_names`, snapshot
+    // ed once, owned, since `Applier` impls must be `Send + Sync + 'static`
+    // and so can't hold a borrowed `&HashMap`), the rule simply doesn't fire
+    // for that e-class — sound, not a guess: the full recursive chain-rule
+    // expansion, already present in the same e-class regardless, supplies
+    // the correct answer there instead, this rule staying a pure
+    // optimization shortcut, never the sole source of truth.
+    let zero_calls_used = std::sync::Arc::new(std::sync::Mutex::new(HashSet::new()));
     {
         let a = Var::from(Symbol::from("?a"));
         let x = Var::from(Symbol::from("?x"));
@@ -1419,17 +1466,8 @@ pub fn derivative_rewrites(ty: &str, reached: &HashMap<String, (String, String)>
         let a_id = lhs.add(ENodeOrVar::Var(a));
         let x_id = lhs.add(ENodeOrVar::Var(x));
         lhs.add(ENodeOrVar::ENode(CleaveLang::Op("derivative".into(), vec![a_id, x_id])));
-        let tensor_like: HashMap<String, String> = registry
-            .struct_names()
-            .filter_map(|name| {
-                let [field] = registry.struct_fields(name)? else { return None };
-                if !registry.struct_generics(name).last()?.is_variadic() {
-                    return None;
-                }
-                Some((name.to_string(), field.name.clone()))
-            })
-            .collect();
-        let applier = IndependentZeroApplier { a, x, tensor_like };
+        let applier =
+            IndependentZeroApplier { a, x, unit_names: unit_names.clone(), zero_calls_used: std::sync::Arc::clone(&zero_calls_used) };
         if let Ok(rw) = Rewrite::new("derivative-independent-zero", egg::Pattern::new(lhs), applier) {
             rules.push(rw);
         }
@@ -1443,7 +1481,7 @@ pub fn derivative_rewrites(ty: &str, reached: &HashMap<String, (String, String)>
     let (declared_rules, referenced) = derivative_rule_rewrites(registry, reached);
     rules.extend(declared_rules);
 
-    (rules, referenced)
+    (rules, referenced, zero_calls_used)
 }
 
 /// `derivative-independent-zero`'s own custom `Applier` (`derivative_
@@ -1459,12 +1497,24 @@ pub fn derivative_rewrites(ty: &str, reached: &HashMap<String, (String, String)>
 struct IndependentZeroApplier {
     a: Var,
     x: Var,
-    /// Single-field, pack-generic struct name -> that sole field's own
-    /// declared name (`linalg::Tensor`'s own `data`) — `build_zero`'s own
-    /// doc comment. Snapshotted once, owned, since `Applier` implementations
-    /// must be `Send + Sync + 'static` (`Rewrite::new`'s own bound) and so
-    /// can't hold a borrowed `&Registry`.
-    tensor_like: HashMap<String, String>,
+    /// Every unit name that actually exists anywhere in the whole program
+    /// (`synthesize_derivatives`'s own `units.keys()`) — snapshotted once,
+    /// owned, since `Applier` implementations must be `Send + Sync +
+    /// 'static` (`Rewrite::new`'s own bound) and so can't hold a borrowed
+    /// `&HashMap`. `build_zero`'s own existence check against this is what
+    /// keeps this rule from ever emitting a call to a `Ring::zero<ty>` that
+    /// was never actually monomorphized (a type with no `Ring` impl at all,
+    /// say) — bailing instead, the same "don't guess" posture as everywhere
+    /// else in this module.
+    unit_names: HashSet<String>,
+    /// Every `Ring::zero<ty>` unit name this rule actually fired for, during
+    /// this whole saturation run — read back by `synthesize_derivatives`
+    /// *after* `Runner::run` returns (via the `Arc` this shares), the same
+    /// reason `derivative_rule_rewrites`'s own `referenced` set exists: a
+    /// unit reached only through a dynamically-fired rewrite, never through
+    /// an ordinary call site, still needs `rebuild`'s own `call_units` to
+    /// recognize it as a real call rather than panicking on it.
+    zero_calls_used: std::sync::Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 impl Applier<CleaveLang, ConstantFold> for IndependentZeroApplier {
@@ -1503,7 +1553,7 @@ impl Applier<CleaveLang, ConstantFold> for IndependentZeroApplier {
             return vec![eclass];
         }
         let Some(ty) = egraph[a_class].data.own_ty.clone() else { return vec![] }; // shape unknown -- don't guess, let the chain rule supply the answer elsewhere
-        let Some(zero_id) = build_zero(egraph, &ty, &self.tensor_like) else { return vec![] };
+        let Some(zero_id) = build_zero(egraph, &ty, &self.unit_names, &self.zero_calls_used) else { return vec![] };
         egraph.union(eclass, zero_id);
         vec![eclass]
     }
@@ -1513,57 +1563,28 @@ impl Applier<CleaveLang, ConstantFold> for IndependentZeroApplier {
     }
 }
 
-/// Builds a same-*shaped* zero e-node for `ty`, recursively — the direct
-/// fix for `derivative_rewrites`'s own found bug (a bare scalar `0.0`
-/// silently standing in for a whole independent tensor/array). Three shapes
-/// recognized, matching exactly what's reachable through `linalg::Tensor`
-/// plus ordinary arrays; anything else (a genuinely multi-field struct, an
-/// algebra-`Op` node whose own result type isn't tracked at all —
-/// `ConstantFold::known_types`'s own doc comment) returns `None` rather
-/// than guessing, same posture as every other "build what's reachable, bail
-/// otherwise" function in this module:
-/// - A scalar numeric `Con` — the original literal `0`/`0.0`.
-/// - `Array(elem, size)` — a same-size array of recursively-built zero
-///   elements, symbol-for-symbol matching what `Forward::walk`'s own
-///   `PrimOp::Array` arm would have built for a real literal of this shape
-///   (`format!("array:{ty}:{n}")`, `ty` here *being* this exact `Array`
-///   value, not reconstructed by hand).
-/// - `App(struct_name, args)` where `struct_name` is single-field and
-///   pack-generic (`tensor_like`, `IndependentZeroApplier`'s own doc
-///   comment) — `linalg::Tensor<T, Dims...>`'s own shape specifically,
-///   recognized *structurally* (a variadic trailing generic, one field),
-///   not by hardcoding the name "Tensor": `args`' own first element is
-///   taken as the element type, every remaining element must already be a
-///   resolved `Ty::Const` (the pack's own concrete dimensions) — bails if
-///   not, rather than trusting a struct that merely *looks* similar. The
-///   field's own type is rebuilt as nested nested `Array`s around those
-///   dims (`[ElemTy; Dims...]`'s own real monomorphized shape), then this
-///   same function recurses on it.
-fn build_zero(egraph: &mut egg::EGraph<CleaveLang, ConstantFold>, ty: &Ty, tensor_like: &HashMap<String, String>) -> Option<egg::Id> {
-    match ty {
-        Ty::Con(name) if matches!(name.as_str(), "f32" | "f64") => Some(egraph.add(CleaveLang::Float(0.0.into()))),
-        Ty::Con(_) => Some(egraph.add(CleaveLang::Int(0))),
-        Ty::Array(elem, size) => {
-            let Ty::Const(ConstValue::Int(n)) = **size else { return None };
-            let elem_id = build_zero(egraph, elem, tensor_like)?;
-            let sym = Symbol::from(format!("array:{ty}:{n}"));
-            egraph.analysis.known_types.entry(sym).or_insert_with(|| ty.clone());
-            Some(egraph.add(CleaveLang::Op(sym, vec![elem_id; n as usize])))
-        }
-        Ty::App(struct_name, args) => {
-            let field_name = tensor_like.get(struct_name)?;
-            let (elem_ty, dims) = args.split_first()?;
-            if dims.is_empty() || !dims.iter().all(|d| matches!(d, Ty::Const(_))) {
-                return None; // not shaped like `[ElemTy; Dims...]` -- bail rather than guess
-            }
-            let field_ty = dims.iter().rev().fold(elem_ty.clone(), |acc, d| Ty::Array(Box::new(acc), Box::new(d.clone())));
-            let data_id = build_zero(egraph, &field_ty, tensor_like)?;
-            let struct_sym = Symbol::from(format!("struct:{ty}:{field_name}"));
-            egraph.analysis.known_types.entry(struct_sym).or_insert_with(|| ty.clone());
-            Some(egraph.add(CleaveLang::Op(struct_sym, vec![data_id])))
-        }
-        _ => None,
+/// Builds `Ring::zero<ty>()` — a real call to the real, stdlib-declared
+/// `Ring<T>::zero()` (`derivative_rewrites`'s own doc comment on why this
+/// replaced an earlier, hand-built-in-Rust version) — `None`, rather than
+/// guessing, when that exact unit was never actually monomorphized
+/// (`unit_names`): a type with no `Ring` impl at all (a plain multi-field
+/// struct, say) has no `zero()` to call, and this rule staying a pure
+/// optimization shortcut (`derivative_rewrites`'s own doc comment) means
+/// that's fine — the chain rule supplies the answer there instead.
+fn build_zero(
+    egraph: &mut egg::EGraph<CleaveLang, ConstantFold>,
+    ty: &Ty,
+    unit_names: &HashSet<String>,
+    zero_calls_used: &std::sync::Mutex<HashSet<String>>,
+) -> Option<egg::Id> {
+    let unit_name = format!("Ring::zero<{ty}>");
+    if !unit_names.contains(&unit_name) {
+        return None;
     }
+    zero_calls_used.lock().unwrap().insert(unit_name.clone());
+    let sym = Symbol::from(unit_name);
+    egraph.analysis.known_types.entry(sym).or_insert_with(|| ty.clone());
+    Some(egraph.add(CleaveLang::Op(sym, vec![])))
 }
 
 /// Builds one concrete `Rewrite` per `(derivative rule, reached concrete
@@ -2208,6 +2229,11 @@ pub struct DerivativeRequest {
 pub fn synthesize_derivatives(program: CpsProgram, requests: &[DerivativeRequest], registry: &Registry) -> Result<CpsProgram, Vec<String>> {
     let fresh = FreshVars::starting_at(max_cvar_in_program(&program) + 1);
     let units: HashMap<String, &CTopLevelFn> = program.funcs.iter().map(|f| (f.def.name.clone(), f)).collect();
+    // `derivative_rewrites`'s own `IndependentZeroApplier` needs this to
+    // know whether a `Ring::zero<ty>` it might dynamically call actually
+    // exists anywhere in the program — same reason `call_units` below
+    // filters `referenced` the identical way.
+    let unit_names: HashSet<String> = units.keys().cloned().collect();
 
     let mut new_funcs = Vec::new();
     let mut errors = Vec::new();
@@ -2277,7 +2303,7 @@ pub fn synthesize_derivatives(program: CpsProgram, requests: &[DerivativeRequest
         let mut rules = axiom_rewrites(registry, &fwd.reached);
         rules.extend(struct_projection_rewrites(&fwd.struct_ops, &fwd.field_ops));
         rules.extend(construction_derivative_rewrites(&fwd.struct_ops, &fwd.array_ops));
-        let (derivative_rules, referenced) = derivative_rewrites(&ty_text, &fwd.reached, registry);
+        let (derivative_rules, referenced, zero_calls_used) = derivative_rewrites(&ty_text, &fwd.reached, registry, &unit_names);
         rules.extend(derivative_rules);
 
         let Forward { egraph, free_vars, raw_ops, mut call_units, struct_ops, field_ops, array_ops, array_repeat_ops, load_ops, .. } = fwd;
@@ -2314,6 +2340,14 @@ pub fn synthesize_derivatives(program: CpsProgram, requests: &[DerivativeRequest
         // alongside it for the same reason — `iter_limit` alone would just
         // trade one silent stop for another.
         let runner = Runner::default().with_iter_limit(1000).with_node_limit(1_000_000).with_time_limit(std::time::Duration::from_secs(30)).with_egraph(egraph).run(&rules);
+        // `IndependentZeroApplier`'s own `zero_calls_used` (`egraph.rs`'s own
+        // doc comment on it) is only populated *during* saturation, unlike
+        // `referenced` above (known before the runner ever starts) — read
+        // back only now, after `run` returns. Already filtered to units that
+        // actually exist (`build_zero`'s own `unit_names` check), so no
+        // second `units.contains_key` filter is needed here the way
+        // `referenced`'s own extend above needs one.
+        call_units.extend(zero_calls_used.lock().unwrap().iter().cloned());
         let tables =
             OpTables { free_vars: &free_vars, raw_ops: &raw_ops, call_units: &call_units, struct_ops: &struct_ops, field_ops: &field_ops, array_ops: &array_ops, array_repeat_ops: &array_repeat_ops, load_ops: &load_ops, param_substitution: &param_substitution };
         let extractor = Extractor::new(&runner.egraph, DerivativeFreeCost);
@@ -3049,7 +3083,7 @@ mod tests {
             args: vec![CVal::Var(10)],
             cont: Box::new(CExpr::App { func: CVal::Var(11), args: vec![CVal::Var(20)] }),
         };
-        assert!(!is_straight_line(&body), "an Extern effect must not be judged straight-line, no Fix/If needed to reject it");
+        assert!(!is_straight_line(&body, &HashMap::new()), "an Extern effect must not be judged straight-line, no Fix/If needed to reject it");
     }
 
     /// The integration-level counterpart: a real call to a unit whose own
@@ -3528,7 +3562,7 @@ mod tests {
     #[test]
     fn derivative_of_a_variable_with_respect_to_itself_is_one() {
         let reg = empty_registry();
-        let (rules, _) = derivative_rewrites("f32", &HashMap::new(), &reg);
+        let (rules, _, _) = derivative_rewrites("f32", &HashMap::new(), &reg, &HashSet::new());
         let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
         let x = egraph.add(CleaveLang::Free("x".into()));
         let d = egraph.add(CleaveLang::Op("derivative".into(), vec![x, x]));
@@ -3537,12 +3571,22 @@ mod tests {
         assert_eq!(extract_best(&runner.egraph, runner.egraph.find(d)), "1");
     }
 
-    /// `derivative(y, x) -> 0` -- a *different* free variable is a leaf
-    /// that doesn't depend on `x`.
+    /// `derivative(y, x) -> Ring::zero<f32>()` -- a *different* free
+    /// variable is a leaf that doesn't depend on `x`. The zero is a real
+    /// call now, not a bare literal `0` (`derivative_rewrites`'s own doc
+    /// comment on why `build_zero` calls the real, stdlib-declared `Ring::
+    /// zero<f32>` instead) -- it only ever evaluates to the number zero at
+    /// *runtime* (real MLIR/JIT execution), not inside the e-graph itself,
+    /// so extraction correctly leaves the call in place rather than folding
+    /// it to a literal.
     #[test]
     fn derivative_of_a_different_free_variable_is_zero() {
         let reg = empty_registry();
-        let (rules, _) = derivative_rewrites("f32", &HashMap::new(), &reg);
+        // A hand-built test e-graph, bypassing the real compiler pipeline
+        // entirely, has to assert this unit "exists" itself, the same way
+        // it already has to populate `known_types` below.
+        let unit_names: HashSet<String> = HashSet::from(["Ring::zero<f32>".to_string()]);
+        let (rules, _, _) = derivative_rewrites("f32", &HashMap::new(), &reg, &unit_names);
         let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
         let x = egraph.add(CleaveLang::Free("x".into()));
         // `own_ty` (`ConstantFold::known_types`'s own doc comment) — real
@@ -3554,7 +3598,7 @@ mod tests {
         let d = egraph.add(CleaveLang::Op("derivative".into(), vec![y, x]));
 
         let runner = egg::Runner::default().with_egraph(egraph).run(&rules);
-        assert_eq!(extract_best(&runner.egraph, runner.egraph.find(d)), "0");
+        assert_eq!(extract_best(&runner.egraph, runner.egraph.find(d)), "Ring::zero<f32>");
     }
 
     /// `derivative(3.0, x) -> 0` -- a literal constant is a leaf that
@@ -3562,7 +3606,7 @@ mod tests {
     #[test]
     fn derivative_of_a_float_literal_is_zero() {
         let reg = empty_registry();
-        let (rules, _) = derivative_rewrites("f32", &HashMap::new(), &reg);
+        let (rules, _, _) = derivative_rewrites("f32", &HashMap::new(), &reg, &HashSet::new());
         let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
         let x = egraph.add(CleaveLang::Free("x".into()));
         let three = egraph.add(CleaveLang::Float(3.0.into()));
@@ -3680,7 +3724,7 @@ mod tests {
     fn derivative_of_a_product_involving_x_does_not_wrongly_collapse_to_zero() {
         let reg = ring_f32_with_derivative_rules();
         let reached = ring_f32_reached();
-        let (rules, _) = derivative_rewrites("f32", &reached, &reg);
+        let (rules, _, _) = derivative_rewrites("f32", &reached, &reg, &HashSet::new());
 
         let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
         let x = egraph.add(CleaveLang::Free("x".into()));
@@ -3707,7 +3751,12 @@ mod tests {
     fn derivative_of_x_times_y_with_respect_to_x_eliminates_the_derivative_marker() {
         let reg = ring_f32_with_derivative_rules();
         let reached = ring_f32_reached();
-        let (rules, _) = derivative_rewrites("f32", &reached, &reg);
+        // `build_zero` now calls the real `Ring::zero<f32>` (`derivative_
+        // rewrites`'s own doc comment) -- asserted to "exist" here the same
+        // way `derivative_of_a_different_free_variable_is_zero` already
+        // does, for the identical reason.
+        let unit_names: HashSet<String> = HashSet::from(["Ring::zero<f32>".to_string()]);
+        let (rules, _, _) = derivative_rewrites("f32", &reached, &reg, &unit_names);
 
         let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
         let x = egraph.add(CleaveLang::Free("x".into()));
@@ -3733,7 +3782,7 @@ mod tests {
         let reg = ring_f32_with_derivative_rules();
         let mut reached = HashMap::new();
         reached.insert("TestRing::mul<f32>".to_string(), ("TestRing".to_string(), "mul".to_string()));
-        let (_, referenced) = derivative_rewrites("f32", &reached, &reg);
+        let (_, referenced, _) = derivative_rewrites("f32", &reached, &reg, &HashSet::new());
         assert!(referenced.contains("TestRing::add<f32>"), "expected the product rule's own referenced-unit set to name add, got {referenced:?}");
     }
 
@@ -3742,7 +3791,7 @@ mod tests {
     #[test]
     fn only_base_rules_are_built_when_nothing_is_declared() {
         let reg = empty_registry();
-        let (rules, _) = derivative_rewrites("f32", &HashMap::new(), &reg);
+        let (rules, _, _) = derivative_rewrites("f32", &HashMap::new(), &reg, &HashSet::new());
         assert_eq!(rules.len(), 2, "expected exactly the two base rules (self, leaf-zero)");
     }
 

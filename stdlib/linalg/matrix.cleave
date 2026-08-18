@@ -27,12 +27,28 @@ algebra MatMul<A, B, C> {
 impl<T: Float, const N: i32, const M: i32, const K: i32>
     MatMul<Tensor<T,N,M>, Tensor<T,M,K>, Tensor<T,N,K>> {
     fn matmul(a, b) {
-        // `tensor.empty()` — zero operands, shape from its own declared
-        // result type alone — is all `linalg.matmul`'s required `outs`
-        // operand needs: the op computes the *entire* result itself, it
-        // never accumulates into whatever `outs` previously held, so no
-        // real zero-initialization is needed the way `vector.contract`'s
-        // own accumulator once needed (see `doc/backlog.md`).
+        // A *real*, genuinely zero-filled accumulator — `Ring::zero()`
+        // (`doc/backlog.md`'s own "Real pack-generic `[value; Dims...]`
+        // array-repeat" item is what made writing this at all possible).
+        // `tensor.empty()` (uninitialized memory, used here originally) was
+        // a real, if long-latent, correctness bug: `linalg.matmul` is
+        // documented as `C := A @ B + C` (BLAS GEMM semantics), not "compute
+        // the whole result, `outs` is only a shape hint" as this impl's own
+        // comment used to (wrongly) claim — confirmed directly, not assumed,
+        // once `convert-linalg-to-loops` is in the pipeline (`--dump-mlir-
+        // lowered`, not just `--dump-mlir`): the lowered loop body genuinely
+        // *loads* the accumulator's own current value before adding into it
+        // (`C[i,j] = load; C[i,j] += A[i,k]*B[k,j]`). Every prior test/
+        // example happened to get zero-initialized memory from the
+        // allocator anyway (fresh `malloc` is *often* zero, especially early
+        // in a program, purely by allocator behavior, never guaranteed) —
+        // masking this for as long as this impl has existed. Found directly
+        // via a real, reproducible failure: `matmul(a, Ring::zero())` gave
+        // tiny nonzero noise (once real garbage, not zero, happened to sit
+        // in the reused allocation) instead of exactly `a`'s own values
+        // unchanged, the moment a genuinely different allocation pattern
+        // (one more function call and array-repeat construction ahead of
+        // it) shifted which heap memory `tensor.empty()` actually got.
         // `operandSegmentSizes` (2 `ins`, 1 `outs`) is an ordinary
         // attribute, the same generic mechanism every other `mlir::...`
         // call already uses — `linalg.matmul`'s own payload *region*
@@ -40,7 +56,7 @@ impl<T: Float, const N: i32, const M: i32, const K: i32>
         // project's generic op-builder needed a real, dialect-family-wide
         // exception; see `mlir_lower.rs::build_linalg_region`'s own doc
         // comment for exactly why and how it's scoped.
-        let init: Tensor<T,N,K> = mlir::tensor::empty();
+        let init: Tensor<T,N,K> = Ring::zero();
         mlir::linalg::matmul(a, b, init, operandSegmentSizes: "array<i32: 2, 1>")
     }
 }

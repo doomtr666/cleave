@@ -69,6 +69,14 @@ impl<T: Float, const Dims...: i32> Ring<Tensor<T, Dims...>> {
     fn mul(a: Tensor<T, Dims...>, b: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::arith::mulf(a, b) }
     fn div(a: Tensor<T, Dims...>, b: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::arith::divf(a, b) }
     fn neg(a: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::arith::negf(a) }
+    // A same-shaped tensor of zeros — built from ordinary cleave source now
+    // (`doc/backlog.md`'s own "Real pack-generic `[value; Dims...]` array-
+    // repeat" item was the missing piece), not hand-recognized structurally
+    // by the compiler the way `egraph.rs::build_zero` used to. Bare `zero()`
+    // — dispatched by the *expected* type at this call site (`data`'s own
+    // declared element type `T`), the same output-only-generic resolution
+    // every other zero-arg-input call here already relies on.
+    fn zero() -> Tensor<T, Dims...> { Tensor::<T, Dims...>(data: [zero(); Dims...]) }
 }
 
 // `v[i]`/`m[i,j]`/`t[i,j,k]` — `Tensor` has no `.x`/`.y`/`.z` of its own to

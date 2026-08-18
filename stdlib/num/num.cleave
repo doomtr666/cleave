@@ -66,6 +66,18 @@ algebra Ring<T> {
     fn mul(a: T, b: T) -> T;
     fn div(a: T, b: T) -> T;
     fn neg(a: T) -> T;
+    // The additive identity — "zero", genuinely a `Ring<T>`-owned concept
+    // (it only means anything relative to `add`), not a separate algebra:
+    // raised directly by the project owner while looking at `egraph.rs::
+    // build_zero` (`derivative-independent-zero`'s own zero-construction),
+    // which used to hand-recognize a pack-generic struct's own shape
+    // *structurally*, in Rust — exactly the kind of hardcoded logic new
+    // functionality is supposed to go through `algebra`+stdlib for instead.
+    // Zero-arg, dispatched purely by the *expected* return type at each
+    // call site (no argument of its own to pin `T` — same "output-only
+    // generic" shape `MatMul`'s own `C` already needs, resolved the
+    // identical way).
+    fn zero() -> T;
 
     // Trusted as declared over every `impl Ring<T>` this algebra ever
     // gets (`hld.md`'s own v1 trust model — no per-impl soundness gate),
@@ -135,6 +147,7 @@ impl Ring<i8> {
     fn mul(a: i8, b: i8) -> i8 { mlir::arith::muli(a, b) }
     fn div(a: i8, b: i8) -> i8 { mlir::arith::divsi(a, b) }
     fn neg(a: i8) -> i8 { mlir::arith::subi(0, a) }
+    fn zero() -> i8 { 0 }
 }
 
 impl Ring<i16> {
@@ -143,6 +156,7 @@ impl Ring<i16> {
     fn mul(a: i16, b: i16) -> i16 { mlir::arith::muli(a, b) }
     fn div(a: i16, b: i16) -> i16 { mlir::arith::divsi(a, b) }
     fn neg(a: i16) -> i16 { mlir::arith::subi(0, a) }
+    fn zero() -> i16 { 0 }
 }
 
 impl Ring<i32> {
@@ -151,6 +165,7 @@ impl Ring<i32> {
     fn mul(a: i32, b: i32) -> i32 { mlir::arith::muli(a, b) }
     fn div(a: i32, b: i32) -> i32 { mlir::arith::divsi(a, b) }
     fn neg(a: i32) -> i32 { mlir::arith::subi(0, a) }
+    fn zero() -> i32 { 0 }
 }
 
 impl Ring<i64> {
@@ -159,6 +174,7 @@ impl Ring<i64> {
     fn mul(a: i64, b: i64) -> i64 { mlir::arith::muli(a, b) }
     fn div(a: i64, b: i64) -> i64 { mlir::arith::divsi(a, b) }
     fn neg(a: i64) -> i64 { mlir::arith::subi(0, a) }
+    fn zero() -> i64 { 0 }
 }
 
 impl Ring<f32> {
@@ -167,6 +183,7 @@ impl Ring<f32> {
     fn mul(a: f32, b: f32) -> f32 { mlir::arith::mulf(a, b) }
     fn div(a: f32, b: f32) -> f32 { mlir::arith::divf(a, b) }
     fn neg(a: f32) -> f32 { mlir::arith::negf(a) }
+    fn zero() -> f32 { 0.0 }
 }
 
 impl Ring<f64> {
@@ -175,6 +192,7 @@ impl Ring<f64> {
     fn mul(a: f64, b: f64) -> f64 { mlir::arith::mulf(a, b) }
     fn div(a: f64, b: f64) -> f64 { mlir::arith::divf(a, b) }
     fn neg(a: f64) -> f64 { mlir::arith::negf(a) }
+    fn zero() -> f64 { 0.0 }
 }
 
 // Named, individually-differentiable transcendental primitives — `exp`/
