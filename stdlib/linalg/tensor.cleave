@@ -1,0 +1,125 @@
+// `Tensor<T, const Dims...: i32>` — ordinary, entirely stdlib-declared
+// generic struct, no different in kind from `Complex<T>` (`stdlib/complex/
+// complex.cleave`), except for its own `#[mlir_type(tensor)]` tag: the
+// same mechanism that already declares a primitive's own MLIR
+// representation (`stdlib/num/num.cleave`), generalized — see
+// `mlir_lower.rs`'s own `tagged_struct_native_type` doc comment for the
+// full design. Its real representation is a native MLIR `tensor<...>`
+// value, an immutable SSA value, never the ordinary heap-allocated
+// reference every other struct gets — `data`'s own declared array type is
+// *only* how the compiler learns the shape structurally; a value of this
+// type is never actually memref-backed at runtime. `use linalg;`
+// explicitly — not prelude, matching `io`/`complex`'s own precedent: a
+// program that never constructs one sees zero change.
+//
+// One variadic-rank type, not three separately-declared ones (`Vector<T,N>`
+// /`Matrix<T,R,C>`/`Tensor<T,D0,D1,D2>`, this crate's own earlier shape,
+// back when it was `stdlib/vector/vector.cleave`) — `doc/backlog.md` has
+// the full story of the two things that had to exist first: `Ty::Pack`/
+// `Ty::PackResolved` (an algebra impl generic over the pack, e.g. `Ring`
+// below, needed to stay *symbolic* through declaration-time inference,
+// only resolving once a real call site unifies against it) and `Ty::
+// PackLen` (`Dims.len()`, needed so `Index`'s own `idx: [i32; K]`
+// parameter isn't a fixed literal arity). Construction always needs an
+// explicit turbofish now (`Tensor::<f64,3>(...)`, never bare `Tensor(data:
+// ...)`) — inferring a pack's own arity purely from a field literal's
+// shape isn't supported (`TypeErrorKind::VariadicStructNeedsTurbofish`), a
+// deliberate, accepted trade-off, not an oversight.
+//
+// Even further back: an even earlier version made `Vector` a hardcoded new
+// `Ty::Vector` Rust variant — exactly the "closing the loop" anti-pattern
+// `doc/hld.md` warns against — reverted in favor of an ordinary tagged
+// struct, which needed no `Ty`/grammar changes at all for *that* step.
+//
+// This crate is `linalg`, not `vector` — `matrix.cleave`, alongside this
+// file, is where a rank-2-*specific* operation (`matmul`, which contracts
+// one individually-named dimension, not "however many dims" the way
+// everything below is) lives; a rank-1-specific file (`vector.cleave`,
+// dot/cross product, norm, ...) isn't created yet — added when something
+// actually needs one, not speculatively.
+struct Tensor<T: Float, const Dims...: i32> { data: [T; Dims...] }
+
+// `#[mlir_type(...)]` only ever decorates an `impl` block (`ast.rs`'s own
+// `ImplDecl::attrs` — a bare `struct` declaration has no `attrs` of its
+// own at all), the same way it already does for a primitive (`stdlib/num/
+// num.cleave`'s `#[mlir_type(i32)] impl Int<i32> {}`) — `NativeShape<T>`
+// is a trivial, zero-axiom marker algebra existing *purely* to be that
+// `impl`'s own target carrier, mirroring `Int`/`Float`'s own identical
+// "empty marker impl, the real content lives entirely in the tag" shape,
+// just without also doubling as a real bound anything needs to check —
+// `collect_mlir_types` (`cps.rs`) never even reads the algebra's own name,
+// only the tagged `impl`'s target type and the attribute text itself.
+algebra NativeShape<T> {}
+
+#[mlir_type(tensor)]
+impl<T: Float, const Dims...: i32> NativeShape<Tensor<T, Dims...>> {}
+
+// Elementwise `Ring` — `arith.addf`/`subf`/`mulf`/`divf`/`negf` already
+// broadcast structurally over a `tensor<...>`-typed SSA operand, at any
+// rank (confirmed directly for rank 1/2/3/4 alike, not assumed), so this
+// impl is the *exact* one-line-per-op shape every scalar `Ring` impl in
+// `stdlib/num/num.cleave` already uses — no new mechanism, no awareness
+// anywhere that this is anything but an ordinary `Ring`-impl'd type. One
+// impl covers every rank now — `Dims` never resolves until a real call
+// site does (`Ty::Pack` staying symbolic through this impl's own
+// declaration-time inference is exactly what makes that possible).
+impl<T: Float, const Dims...: i32> Ring<Tensor<T, Dims...>> {
+    fn add(a: Tensor<T, Dims...>, b: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::arith::addf(a, b) }
+    fn sub(a: Tensor<T, Dims...>, b: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::arith::subf(a, b) }
+    fn mul(a: Tensor<T, Dims...>, b: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::arith::mulf(a, b) }
+    fn div(a: Tensor<T, Dims...>, b: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::arith::divf(a, b) }
+    fn neg(a: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::arith::negf(a) }
+}
+
+// `v[i]`/`m[i,j]`/`t[i,j,k]` — `Tensor` has no `.x`/`.y`/`.z` of its own to
+// speak of (its sole field is the *whole* `data` array), so element read
+// goes through an ordinary algebra instead of field access: `infer.rs`'s
+// own `ExprKind::Index` handling falls back to dispatching `Index<Container,
+// Elem, K>` whenever the base isn't a real array (see its own doc comment).
+// A whole bracket group (`m[i,j]`, one `ast.rs::ExprKind::Index` node, not
+// nested — see that type's own doc comment for why `m[i][j]`, written as
+// two separate bracket pairs, deliberately does *not* reach this the same
+// way) dispatches as *one* call: every index becomes one real `[i32; K]`
+// array value at CPS time (`cps.rs`'s own `ExprKind::Index` doc comment).
+//
+// One impl covers every rank, same as `Ring` above: `K` is no longer a
+// literal (`Vector` always 1, `Matrix` always 2, ...) but `Dims.len()`
+// (`Ty::PackLen`) — resolved per call site, so `v[2]` (rank 1) and
+// `m[1,0]` (rank 2) both dispatch through this *same* impl correctly, each
+// pinning `K` to its own real rank. `m[i,j,k]` on a genuinely rank-2 value
+// still gets rejected the same way it always did — `K`'s own value is
+// fixed by the *value's* real rank the moment it's monomorphized, an extra
+// index still doesn't unify against it.
+//
+// Passing `idx` straight through, not unpacked into individual `index`-
+// typed operands (`idx[0]`, `idx[1]`, ...) the way this used to read: `mlir
+// ::tensor::extract`'s own variadic-index-array form (`lower_tensor_
+// extract_spread`, `mlir_lower.rs`) does that unpacking (plus the `i32 ->
+// index` conversion every real operand needs) internally now, since the
+// real number of indices isn't known until `Dims`/`K` resolve — no longer
+// expressible as a fixed number of separate `let i0: index = ...;`
+// statements written out here. Read-only, deliberately: mutation stays
+// exclusively for a real array (see `infer.rs`'s own `StmtKind::Assign`
+// guard) — a tensor-backed value is immutable by construction, no
+// `IndexMut`-equivalent attempted.
+algebra Index<Container, Elem, const K: i32> {
+    fn index(c: Container, idx: [i32; K]) -> Elem;
+
+    // `d/dx[c[idx]] = (dc/dx)[idx]` — reading one element out of a
+    // container and differentiating commute: the derivative of "the value
+    // at position `idx`" is "the derivative, read at that same position."
+    // `idx` itself is never wrapped in `d(...)` — an array of integer
+    // indices isn't a differentiable quantity, it's reused as-is, exactly
+    // the same shape `Ring<T>`'s own product rule already uses for an
+    // operand that stays undifferentiated on one side (`mul(a, d(b))`).
+    // Found missing directly: indexing into a `Tensor` had no path to a
+    // derivative at all before this — `doc/backlog.md`'s own "toward
+    // tensorial ML" item.
+    derivative index(c, idx): index(d(c), idx);
+}
+
+impl<T: Float, const Dims...: i32> Index<Tensor<T, Dims...>, T> {
+    fn index(t: Tensor<T, Dims...>, idx: [i32; Dims.len()]) -> T {
+        mlir::tensor::extract(t, idx)
+    }
+}

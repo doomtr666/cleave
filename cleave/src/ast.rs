@@ -236,8 +236,32 @@ pub struct Param {
 
 #[derive(Debug, Clone)]
 pub enum GenericParam {
-    Type { name: String, bounds: Vec<String> },
-    Const { name: String, ty: Type },
+    /// `variadic`: a trailing `...` (`Args...`) — a *pack*, matching zero or
+    /// more actual type arguments at a concrete call/construction site,
+    /// rather than exactly one (`doc/backlog.md`'s own "Variadic generics"
+    /// item). Only meaningful as the *last* generic in a declared list —
+    /// not enforced at this level (mirrors `grammar.pest`'s own "accept a
+    /// superset, narrow semantically" posture); `infer.rs` is where real
+    /// pack support (and this restriction) actually lands.
+    Type { name: String, bounds: Vec<String>, variadic: bool },
+    /// `variadic`: `const Dims: i32...` — a const-generic pack (`Tensor<T,
+    /// const Dims: i32...>`'s own motivating case), the const-generic
+    /// counterpart to `Type`'s own `variadic` field above.
+    Const { name: String, ty: Type, variadic: bool },
+}
+
+impl GenericParam {
+    pub fn name(&self) -> &str {
+        match self {
+            GenericParam::Type { name, .. } | GenericParam::Const { name, .. } => name,
+        }
+    }
+
+    pub fn is_variadic(&self) -> bool {
+        match self {
+            GenericParam::Type { variadic, .. } | GenericParam::Const { variadic, .. } => *variadic,
+        }
+    }
 }
 
 /// A tuple (`(T1, T2, ...)` as a type, `(a, b, ...)` as a value, `t.0`/`t.1`
@@ -264,13 +288,27 @@ pub enum TypeKind {
     Path(Path, Vec<GenericArg>),
     /// Single dimension only — the Fortran-style multi-dim sugar (`[f64; 3, 4]`)
     /// is already flattened into nested `Array`s by `lower.rs`, matching
-    /// `grammar.md`'s "desugars at AST-building time" note.
+    /// `grammar.md`'s "desugars at AST-building time" note. A dimension can
+    /// itself be `ExprKind::PackRef` (`[T; Dims...]`) — stays exactly this
+    /// shape (one `Array` level, whose own size expression is the pack
+    /// reference) until a concrete call/construction site resolves `Dims`
+    /// to a real list, at which point it expands into the ordinary nested-
+    /// `Array` shape a literal `[T; d0, d1, ...]` already produces — see
+    /// `doc/backlog.md`'s own "Variadic generics" item.
     Array(Box<Type>, Box<Expr>),
     /// A function type (`(i32) -> i32`), for annotating a higher-order
     /// function's own parameter — the return type is always present (see
     /// `grammar.pest`'s `fn_type` comment for why it's not optional here the
     /// way `fn_decl`'s own `-> type_` is).
     Fn(Vec<Type>, Box<Type>),
+    /// `Args...` as a *whole* type (a function parameter/struct field) —
+    /// `doc/backlog.md`'s own "Variadic generics" item, `print`'s own
+    /// motivating case (`fn print(args: Args...)`). Once the named pack
+    /// resolves to a concrete list of types at a call site, this position
+    /// becomes exactly the tuple formed from that list (`ast::tuple_struct_
+    /// name`) — reusing the tuple feature directly, no new runtime
+    /// representation needed.
+    PackRef(String),
 }
 pub type Type = Node<TypeKind>;
 
@@ -416,6 +454,15 @@ pub enum ExprKind {
     /// aren't resolved here (closure conversion, structural per `hld.md`, is
     /// a later pass) — this is just the surface shape.
     Lambda { params: Vec<Param>, ret: Option<Type>, body: Block },
+    /// `Dims...` used as *one array dimension's own size expression*
+    /// (`[T; Dims...]`, inside `TypeKind::Array`'s own size slot — see its
+    /// doc comment) — `doc/backlog.md`'s own "Variadic generics" item. Not
+    /// a general-purpose expression (nothing resolves one anywhere else
+    /// yet); kept as an ordinary `ExprKind` variant rather than a bespoke
+    /// field on `TypeKind::Array` because a size expression is already
+    /// `Box<Expr>` there, so this reuses that exact slot with no shape
+    /// change needed.
+    PackRef(String),
 }
 pub type Expr = Node<ExprKind>;
 

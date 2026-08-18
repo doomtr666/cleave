@@ -95,6 +95,9 @@ fn assert_fully_concrete(ty: &Ty) {
     fn walk(ty: &Ty, path: &str) {
         match ty {
             Ty::Var(v) => panic!("found a leftover Ty::Var({v:?}) at {path} in supposedly-monomorphized type {ty}"),
+            Ty::Pack(v) => panic!("found a leftover Ty::Pack({v:?}) at {path} in supposedly-monomorphized type {ty}"),
+            Ty::PackLen(v) => panic!("found a leftover Ty::PackLen({v:?}) at {path} in supposedly-monomorphized type {ty}"),
+            Ty::PackResolved(elems) => elems.iter().for_each(|e| walk(e, path)),
             Ty::Con(_) | Ty::Const(_) => {}
             Ty::App(_, args) => args.iter().for_each(|a| walk(a, path)),
             Ty::Fn(params, ret) => {

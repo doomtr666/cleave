@@ -34,11 +34,16 @@ fn main() -> i32 {
     let mut w: f32 = 0.0;
     let mut b: f32 = 0.0;
     let lr: f32 = 0.01;
-    for step in 0..500 {
+
+    print("start learning...");
+
+    for step in 0..10 {
         let g: [f32; 2] = grad(w, b);
         w = w - lr * g[0];
         b = b - lr * g[1];
     };
+
+    print("done !");
     print(w);
     print(b);
     0

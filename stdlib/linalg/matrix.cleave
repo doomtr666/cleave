@@ -1,0 +1,46 @@
+// `MatMul` — rank-2-*specific*, deliberately not pack-generic like `Ring`/
+// `Index` in `tensor.cleave`: matmul contracts one *specific* dimension
+// (`Tensor<T,N,M>`'s own trailing `M` against `Tensor<T,M,K>`'s own leading
+// `M`) — a real, individually-named relationship between two operands' own
+// dimensions, not "however many dims, treated uniformly" the way
+// elementwise ops or a flat index array are. `N`/`M`/`K` stay ordinary,
+// individually-declared const generics; `Tensor<T,N,M>` is just an
+// ordinary two-generic instantiation of `tensor.cleave`'s own pack-generic
+// struct — ordinary generic-struct-reference machinery, unrelated to any
+// of that file's own pack work, resolves it ordinarily.
+//
+// `+`/`*` on scalars resolve against the real stdlib `Ring` (always in the
+// prelude) — no algebra declared for `matmul` shares a name with `mul`,
+// and deliberately so: `algebras_with_fn` picks a candidate by name+arity
+// alone, with no shape disambiguation at that stage (see `infer_call`,
+// `registry.rs`'s `algebras_with_fn`) — a second algebra also declaring a
+// 2-arg `mul` would make *every* `*` in a program ambiguous, including a
+// genuinely scalar one. No qualified-call syntax exists yet to
+// disambiguate (`doc/backlog.md`, "Qualified-call syntax"), so matrix
+// multiplication is an ordinary named method, `matmul`, called directly —
+// not wired to `*`.
+algebra MatMul<A, B, C> {
+    fn matmul(a: A, b: B) -> C;
+    derivative matmul(a, b): add(matmul(d(a), b), matmul(a, d(b)));
+}
+
+impl<T: Float, const N: i32, const M: i32, const K: i32>
+    MatMul<Tensor<T,N,M>, Tensor<T,M,K>, Tensor<T,N,K>> {
+    fn matmul(a, b) {
+        // `tensor.empty()` — zero operands, shape from its own declared
+        // result type alone — is all `linalg.matmul`'s required `outs`
+        // operand needs: the op computes the *entire* result itself, it
+        // never accumulates into whatever `outs` previously held, so no
+        // real zero-initialization is needed the way `vector.contract`'s
+        // own accumulator once needed (see `doc/backlog.md`).
+        // `operandSegmentSizes` (2 `ins`, 1 `outs`) is an ordinary
+        // attribute, the same generic mechanism every other `mlir::...`
+        // call already uses — `linalg.matmul`'s own payload *region*
+        // (the actual multiply-accumulate body) is the one place this
+        // project's generic op-builder needed a real, dialect-family-wide
+        // exception; see `mlir_lower.rs::build_linalg_region`'s own doc
+        // comment for exactly why and how it's scoped.
+        let init: Tensor<T,N,K> = mlir::tensor::empty();
+        mlir::linalg::matmul(a, b, init, operandSegmentSizes: "array<i32: 2, 1>")
+    }
+}

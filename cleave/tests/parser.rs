@@ -533,3 +533,46 @@ fn chained_tuple_field_access_into_a_nested_tuple_parses() {
 fn tuple_field_assignment_target_parses() {
     parses(Rule::assign_stmt, "t.0 = 5;");
 }
+
+// `doc/backlog.md`'s own "Variadic generics" item, Milestone 1: grammar/AST
+// only, no semantic support yet -- these confirm the surface syntax parses,
+// not that anything downstream understands it (see `infer.rs`'s own
+// deliberate panics on an unresolved `PackRef` reaching ordinary
+// inference).
+
+#[test]
+fn a_const_generic_pack_parses() {
+    parses(Rule::generic_params, "<T, const Dims...: i32>");
+}
+
+#[test]
+fn a_type_generic_pack_parses() {
+    parses(Rule::generic_params, "<Args...>");
+}
+
+#[test]
+fn an_ordinary_non_variadic_generic_list_still_parses_unchanged() {
+    // Regression guard -- the optional trailing `pack_marker` must never
+    // become load-bearing for the common, non-variadic case.
+    parses(Rule::generic_params, "<T, const N: i32>");
+}
+
+#[test]
+fn a_pack_reference_in_an_array_dimension_parses() {
+    parses(Rule::type_, "[T; Dims...]");
+}
+
+#[test]
+fn a_pack_reference_as_a_whole_type_parses() {
+    parses(Rule::type_, "Args...");
+}
+
+#[test]
+fn a_struct_declaring_a_const_generic_pack_used_as_array_dims_parses() {
+    parses(Rule::struct_decl, "struct Tensor<T, const Dims...: i32> { data: [T; Dims...] }");
+}
+
+#[test]
+fn a_function_declaring_a_type_generic_pack_parses() {
+    parses(Rule::fn_decl, "fn print<Args...>(args: Args...) -> Args... { args }");
+}

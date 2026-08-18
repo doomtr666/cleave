@@ -103,8 +103,27 @@ fn abstract_op_name(symbol: &str) -> Option<&str> {
 /// e-class already resolves to it through ordinary e-class sharing — the
 /// ANF/CPS-variable-reuse mechanism the forward translator relies on for
 /// copy-propagation is the exact same mechanism, not a separate pass.
+/// `known_types` -- a `Free`/`Struct`/`Array` node's own concrete `Ty`,
+/// keyed by the exact same `Symbol` its own `CleaveLang::Op`/`Free` node
+/// uses, populated by `Forward` (a top-level function's own declared
+/// parameter types for `Free`; a `LetPrim`'s own declared type for a
+/// construction) *before* the corresponding node is ever added to the
+/// e-graph -- read back by `make`'s own `Free`/`Op` arms below to seed
+/// `FoldData::own_ty`. Lives here (an `Analysis` field, reachable from
+/// `make` via `egraph.analysis`, since `Analysis::make` itself takes no
+/// `&self`) rather than as a `build_zero`-local parameter, since `make`
+/// needs it too. Deliberately *not* populated for every other node kind
+/// (a raw `mlir::...` op, an algebra-dispatched call's own result, ...) --
+/// `derivative-independent-zero`'s own custom `Applier` only ever *needs*
+/// a real `Ty` for the two shapes it actually knows how to build a
+/// same-shaped zero for (`build_zero`'s own doc comment); anywhere else,
+/// `own_ty` staying `None` correctly means "this rule doesn't try to
+/// shortcut here," falling back to full recursive chain-rule expansion
+/// elsewhere in the same e-class -- a missed optimization, never unsound.
 #[derive(Default, Clone)]
-pub struct ConstantFold;
+pub struct ConstantFold {
+    known_types: HashMap<Symbol, Ty>,
+}
 
 /// `ConstantFold`'s own `Analysis::Data` — the existing int-fold value
 /// (`const_int`) plus, since `depends_on_eclass`'s own bug (see `derivative-
@@ -132,6 +151,17 @@ pub struct ConstantFold;
 pub struct FoldData {
     pub const_int: Option<u64>,
     pub free_deps: HashSet<Symbol>,
+    /// This e-class's own concrete cleave `Ty`, when known (`ConstantFold::
+    /// known_types`'s own doc comment) -- used by `derivative-independent-
+    /// zero`'s own custom `Applier` (`build_zero`) to build a same-*shaped*
+    /// zero rather than always a bare scalar one. `merge`'s own policy on
+    /// disagreement (below) drops it to `None` rather than trusting either
+    /// side or panicking -- a real, if never-yet-observed, safety margin:
+    /// unlike `const_int`, two representations of one e-class disagreeing
+    /// here would be a genuine type-soundness violation, not just a
+    /// tolerable "haven't proven convergence yet" state, so this analysis
+    /// doesn't assert it away.
+    pub own_ty: Option<Ty>,
 }
 
 impl Analysis<CleaveLang> for ConstantFold {
@@ -202,7 +232,21 @@ impl Analysis<CleaveLang> for ConstantFold {
             CleaveLang::Op(_, args) => args.iter().flat_map(|id| egraph[*id].data.free_deps.iter().copied()).collect(),
             CleaveLang::Int(_) | CleaveLang::Float(_) | CleaveLang::Bool(_) => HashSet::new(),
         };
-        FoldData { const_int, free_deps }
+        // `Free`'s own declared type (`Forward`'s own `param_types`, a
+        // top-level function's own parameter types) and a construction's
+        // own declared type (`Forward`'s own `LetPrim`-declared `ty`) both
+        // reach here purely via `egraph.analysis.known_types`, keyed by
+        // this exact node's own symbol -- populated *before* the node was
+        // added (`ConstantFold`'s own doc comment). Every other node kind
+        // (a raw `mlir::...` op, an algebra-dispatched call, ...)
+        // deliberately stays `None` here -- see that same doc comment for
+        // why that's sufficient, not a gap.
+        let own_ty = match enode {
+            CleaveLang::Free(sym) => egraph.analysis.known_types.get(sym).cloned(),
+            CleaveLang::Op(sym, _) => egraph.analysis.known_types.get(sym).cloned(),
+            CleaveLang::Int(_) | CleaveLang::Float(_) | CleaveLang::Bool(_) => None,
+        };
+        FoldData { const_int, free_deps, own_ty }
     }
 
     fn merge(&mut self, to: &mut Self::Data, from: Self::Data) -> DidMerge {
@@ -215,7 +259,20 @@ impl Analysis<CleaveLang> for ConstantFold {
         let intersected: HashSet<Symbol> = to.free_deps.intersection(&from.free_deps).copied().collect();
         let new_len = intersected.len();
         to.free_deps = intersected;
-        int_merge | DidMerge(new_len != to_len, new_len != from_len)
+        let ty_merge = match (&to.own_ty, from.own_ty) {
+            (Some(t1), Some(t2)) if *t1 == t2 => DidMerge(false, false),
+            (Some(_), Some(_)) => {
+                to.own_ty = None; // a real type-soundness violation if this ever fires -- safer to drop than to trust either side
+                DidMerge(true, true)
+            }
+            (Some(_), None) => DidMerge(false, false),
+            (None, t2 @ Some(_)) => {
+                to.own_ty = t2;
+                DidMerge(true, false)
+            }
+            (None, None) => DidMerge(false, false),
+        };
+        int_merge | DidMerge(new_len != to_len, new_len != from_len) | ty_merge
     }
 
     fn modify(egraph: &mut egg::EGraph<CleaveLang, Self>, id: Id) {
@@ -274,6 +331,51 @@ fn is_straight_line(expr: &CExpr) -> bool {
         CExpr::LetPrim { op, cont, .. } => is_pure_prim_op(op) && is_straight_line(cont),
         CExpr::App { .. } => true,
         CExpr::Fix { .. } | CExpr::If { .. } => false,
+    }
+}
+
+/// Multi-level call transparency (`doc/backlog.md`'s own item, the "natural
+/// follow-up" `is_straight_line`'s own doc comment above already names) —
+/// whether `expr` is a *chain* of real calls to other units, each of which
+/// is itself either `is_straight_line` (a single primop — `Ring::add<f32>`)
+/// or (recursively) another such chain, with no loop/branch/effect
+/// anywhere. `Forward::walk`'s own `Fix` arm uses this to decide whether to
+/// walk *into* a callee's own body (true multi-level inlining) rather than
+/// collapsing it into one opaque `Op` node (`is_straight_line`'s own,
+/// single-level case — still the right call for a genuinely atomic unit:
+/// its own identity as a *named* op is exactly what a declared axiom/
+/// derivative rule needs to match against, which is why the two cases stay
+/// distinct rather than merging into one check). `visiting` guards against
+/// two units transitively calling each other (mutual recursion would
+/// otherwise recurse forever here, before `Forward::walk` ever gets a
+/// chance to see real recursion and reject it the ordinary way).
+fn is_transparent_chain(expr: &CExpr, units: &HashMap<String, &CTopLevelFn>, visiting: &mut HashSet<String>) -> bool {
+    match expr {
+        CExpr::LetPrim { op, cont, .. } => is_pure_prim_op(op) && is_transparent_chain(cont, units, visiting),
+        CExpr::App { .. } => true,
+        CExpr::If { .. } => false,
+        CExpr::Fix { defs, body } => {
+            let Some((_, unit_name, _, rest)) = recognize_real_call(defs, body) else { return false };
+            let Some(callee) = units.get(unit_name) else { return false };
+            if is_straight_line(&callee.def.body) {
+                return is_transparent_chain(rest, units, visiting);
+            }
+            if !visiting.insert(unit_name.to_string()) {
+                return false; // already being checked higher up this same call chain -- mutually recursive, reject
+            }
+            // `unit_name` comes back out of `visiting` *before* checking
+            // `rest` — real, found-by-testing bug in an earlier version:
+            // keeping it in scope across both checks made a second,
+            // sequential *sibling* call to the very same unit (`sigmoid`
+            // called twice inside one `forward`, neither call nested inside
+            // the other) look identical to genuine mutual recursion and get
+            // wrongly rejected — `visiting` must only ever track units
+            // actually on the current *ancestor* chain, not ones already
+            // fully checked and returned from.
+            let body_ok = is_transparent_chain(&callee.def.body, units, visiting);
+            visiting.remove(unit_name);
+            body_ok && is_transparent_chain(rest, units, visiting)
+        }
     }
 }
 
@@ -349,6 +451,20 @@ pub struct Forward {
     /// its original `(the base's own concrete array `Ty`, the read value's
     /// own concrete `Ty`)` — mirrors `field_ops`'s own reasoning exactly.
     pub load_ops: HashMap<Symbol, (Ty, Ty)>,
+    /// A top-level function's own real parameters (`CTopLevelFn::def.
+    /// params`, excluding the trailing `k_ret`) -> their own declared `Ty`
+    /// (`CTopLevelFn::param_types`, same order) -- set by the caller
+    /// (`synthesize_derivatives`/`optimize_program`) right after `Forward::
+    /// default()`, before `walk` ever runs. The *only* source `cval_to_id`'s
+    /// own `Free`-minting branch has for a free variable's own type
+    /// (`ConstantFold::known_types`'s own doc comment) -- every `Free` node
+    /// this translation ever mints traces back to one of `f`'s own
+    /// parameters (nothing else is free at this level, `walk` only ever
+    /// being called on one whole top-level function's own body), so this
+    /// one map is sufficient, no per-callee threading needed even through
+    /// multi-level call transparency's own inlining (an inlined callee's
+    /// own parameters are bound via `self.env`, never minted as `Free`).
+    pub param_types: HashMap<CVar, Ty>,
     next_free: u32,
 }
 
@@ -367,6 +483,7 @@ impl Default for Forward {
             array_ops: HashMap::new(),
             array_repeat_ops: HashMap::new(),
             load_ops: HashMap::new(),
+            param_types: HashMap::new(),
             next_free: 0,
         }
     }
@@ -382,7 +499,7 @@ impl Forward {
     /// is recorded in `self.env`; the boundary's own remaining `CVal::Var`
     /// references (into the segment, or genuinely free) are resolved the
     /// identical way a *later* reference inside the segment would be.
-    pub fn walk(&mut self, expr: &CExpr, units: &HashMap<String, &CTopLevelFn>) -> CExpr {
+    pub(crate) fn walk(&mut self, expr: &CExpr, units: &HashMap<String, &CTopLevelFn>, fresh: &FreshVars) -> CExpr {
         match expr {
             CExpr::LetPrim { var, ty, op: PrimOp::RawMlirOp { op, attrs }, args, cont } => {
                 let Some(arg_ids) = self.cvals_to_ids(args) else {
@@ -396,9 +513,10 @@ impl Forward {
                 let symbol = format!("{op}:{ty}:{attrs:?}");
                 let sym = Symbol::from(symbol);
                 self.raw_ops.entry(sym).or_insert_with(|| (op.clone(), ty.clone(), attrs.clone()));
+                self.egraph.analysis.known_types.entry(sym).or_insert_with(|| ty.clone());
                 let id = self.egraph.add(CleaveLang::Op(sym, arg_ids));
                 self.env.insert(*var, id);
-                self.walk(cont, units)
+                self.walk(cont, units, fresh)
             }
             // Construction and a field read are both pure (no aliasing
             // effect from either alone -- see `mlir_lower.rs::alloc_struct`'s
@@ -415,9 +533,10 @@ impl Forward {
                 let symbol = format!("struct:{ty}:{}", field_names.join(","));
                 let sym = Symbol::from(symbol);
                 self.struct_ops.entry(sym).or_insert_with(|| (struct_name.clone(), field_names.clone(), ty.clone()));
+                self.egraph.analysis.known_types.entry(sym).or_insert_with(|| ty.clone());
                 let id = self.egraph.add(CleaveLang::Op(sym, arg_ids));
                 self.env.insert(*var, id);
-                self.walk(cont, units)
+                self.walk(cont, units, fresh)
             }
             CExpr::LetPrim { var, ty, op: PrimOp::Field { struct_ty, field }, args, cont } => {
                 let Some(arg_ids) = self.cvals_to_ids(args) else {
@@ -426,9 +545,10 @@ impl Forward {
                 let symbol = format!("field:{struct_ty}:{field}");
                 let sym = Symbol::from(symbol);
                 self.field_ops.entry(sym).or_insert_with(|| (struct_ty.clone(), field.clone(), ty.clone()));
+                self.egraph.analysis.known_types.entry(sym).or_insert_with(|| ty.clone());
                 let id = self.egraph.add(CleaveLang::Op(sym, arg_ids));
                 self.env.insert(*var, id);
-                self.walk(cont, units)
+                self.walk(cont, units, fresh)
             }
             // Construction/read, mirroring `Struct`/`Field` above exactly --
             // an array is also a stable heap reference (`cps.rs::PrimOp::
@@ -445,9 +565,10 @@ impl Forward {
                 };
                 let sym = Symbol::from(format!("array:{ty}:{}", args.len()));
                 self.array_ops.entry(sym).or_insert_with(|| ty.clone());
+                self.egraph.analysis.known_types.entry(sym).or_insert_with(|| ty.clone());
                 let id = self.egraph.add(CleaveLang::Op(sym, arg_ids));
                 self.env.insert(*var, id);
-                self.walk(cont, units)
+                self.walk(cont, units, fresh)
             }
             CExpr::LetPrim { var, ty, op: PrimOp::ArrayRepeat, args, cont } => {
                 let Some(arg_ids) = self.cvals_to_ids(args) else {
@@ -455,9 +576,10 @@ impl Forward {
                 };
                 let sym = Symbol::from(format!("array-repeat:{ty}"));
                 self.array_repeat_ops.entry(sym).or_insert_with(|| ty.clone());
+                self.egraph.analysis.known_types.entry(sym).or_insert_with(|| ty.clone());
                 let id = self.egraph.add(CleaveLang::Op(sym, arg_ids));
                 self.env.insert(*var, id);
-                self.walk(cont, units)
+                self.walk(cont, units, fresh)
             }
             CExpr::LetPrim { var, ty, op: PrimOp::Load { array_ty }, args, cont } => {
                 let Some(arg_ids) = self.cvals_to_ids(args) else {
@@ -471,16 +593,17 @@ impl Forward {
                 // disambiguate what a symbol means).
                 let sym = Symbol::from(format!("load:{array_ty}:{ty}:{}", args.len()));
                 self.load_ops.entry(sym).or_insert_with(|| (array_ty.clone(), ty.clone()));
+                self.egraph.analysis.known_types.entry(sym).or_insert_with(|| ty.clone());
                 let id = self.egraph.add(CleaveLang::Op(sym, arg_ids));
                 self.env.insert(*var, id);
-                self.walk(cont, units)
+                self.walk(cont, units, fresh)
             }
             // Any other `PrimOp` (`FieldStore`/`Store`/`Extern`) is a real
             // mutation effect or an external call, never freely reorderable/
             // foldable the way pure arithmetic is -- stop, unchanged, same
             // as any other unrecognized shape.
             CExpr::Fix { defs, body } => {
-                if let Some(unrolled) = self.try_unroll_for_loop(defs, body, units) {
+                if let Some(unrolled) = self.try_unroll_for_loop(defs, body, units, fresh) {
                     return unrolled;
                 }
                 if let Some((result_var, unit_name, real_args, rest)) = recognize_real_call(defs, body) {
@@ -493,7 +616,48 @@ impl Forward {
                                 if let Some(origin) = &callee.origin {
                                     self.reached.insert(unit_name.to_string(), origin.clone());
                                 }
-                                return self.walk(rest, units);
+                                return self.walk(rest, units, fresh);
+                            }
+                        } else if is_transparent_chain(&callee.def.body, units, &mut HashSet::new()) {
+                            // Multi-level transparency (`doc/backlog.md`'s
+                            // own item) — `callee`'s own body isn't a single
+                            // primop (so it can't become one opaque `Op`
+                            // node the way `Ring::add<f32>` does — nothing
+                            // declares an axiom/derivative rule keyed by
+                            // *its* own name), but it's still a pure chain
+                            // of further real calls, no loop/branch/effect
+                            // anywhere in it — walking straight through it
+                            // is semantically identical to inlining its own
+                            // body at this call site. `callee`'s own body is
+                            // alpha-renamed first (`fresh`, shared across
+                            // this *whole* translation, never a fresh-per-
+                            // call-site instance) — the *same* callee
+                            // inlined more than once (`sigmoid(a)` and
+                            // `sigmoid(b)` in the same loss function) must
+                            // not let its own internal temporaries alias
+                            // across the two call sites in `self.env`,
+                            // exactly the reason `try_unroll_for_loop`
+                            // above needs identical treatment for repeated
+                            // loop iterations.
+                            if let Some(arg_ids) = self.cvals_to_ids(real_args) {
+                                let ordinary_params = &callee.def.params[..callee.def.params.len().saturating_sub(1)];
+                                let mut map: HashMap<CVar, CVar> = HashMap::new();
+                                let renamed_params: Vec<CVar> = ordinary_params.iter().map(|_| fresh.var()).collect();
+                                for (&orig, &renamed) in ordinary_params.iter().zip(&renamed_params) {
+                                    map.insert(orig, renamed);
+                                }
+                                let renamed_body = Self::alpha_rename(&callee.def.body, &mut map, fresh);
+                                for (&renamed, &id) in renamed_params.iter().zip(&arg_ids) {
+                                    self.env.insert(renamed, id);
+                                }
+                                if let CExpr::App { args: ret_args, .. } = self.walk(&renamed_body, units, fresh) {
+                                    if let Some((ret_val, _)) = ret_args.split_last() {
+                                        if let Some(ret_id) = self.cval_to_id(ret_val) {
+                                            self.env.insert(result_var, ret_id);
+                                            return self.walk(rest, units, fresh);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -540,6 +704,13 @@ impl Forward {
                     let sym = Symbol::from(format!("fv{}", self.next_free));
                     self.next_free += 1;
                     self.free_vars.insert(sym, v.clone());
+                    // `own_ty` (`ConstantFold::known_types`'s own doc
+                    // comment) needs this recorded *before* `egraph.add`
+                    // below -- `Analysis::make` reads it back while the
+                    // node is being inserted.
+                    if let Some(ty) = self.param_types.get(cv) {
+                        self.egraph.analysis.known_types.insert(sym, ty.clone());
+                    }
                     let id = self.egraph.add(CleaveLang::Free(sym));
                     self.external_vars.insert(*cv, id);
                     id
@@ -631,7 +802,7 @@ impl Forward {
         }
     }
 
-    fn try_unroll_for_loop(&mut self, defs: &[CFunDef], body: &CExpr, units: &HashMap<String, &CTopLevelFn>) -> Option<CExpr> {
+    fn try_unroll_for_loop(&mut self, defs: &[CFunDef], body: &CExpr, units: &HashMap<String, &CTopLevelFn>, fresh: &FreshVars) -> Option<CExpr> {
         let [loop_def] = defs else { return None };
         loop_def.carried_types.as_ref()?;
         let CExpr::App { func: CVal::Label(call_label), args: init_args } = body else { return None };
@@ -651,10 +822,6 @@ impl Forward {
             return None;
         }
 
-        let mut seed = 0;
-        max_cvar_in_cexpr(&loop_def.body, &mut seed);
-        let fresh = FreshVars::starting_at(seed + 1);
-
         let mut carried_ids = self.cvals_to_ids(carried_init)?;
         for idx in start..end {
             let i_id = self.egraph.add(CleaveLang::Int(idx));
@@ -662,8 +829,8 @@ impl Forward {
             for (&p, &id) in carried_params.iter().zip(&carried_ids) {
                 self.env.insert(p, id);
             }
-            let renamed = Self::alpha_rename(then_branch, &mut HashMap::new(), &fresh);
-            let CExpr::App { func: CVal::Label(l), args } = self.walk(&renamed, units) else { return None };
+            let renamed = Self::alpha_rename(then_branch, &mut HashMap::new(), fresh);
+            let CExpr::App { func: CVal::Label(l), args } = self.walk(&renamed, units, fresh) else { return None };
             if l != loop_def.name {
                 return None;
             }
@@ -672,7 +839,7 @@ impl Forward {
         for (&p, &id) in carried_params.iter().zip(&carried_ids) {
             self.env.insert(p, id);
         }
-        Some(self.walk(else_branch, units))
+        Some(self.walk(else_branch, units, fresh))
     }
 }
 
@@ -768,8 +935,73 @@ fn concrete_type_of(unit_name: &str) -> Option<&str> {
     (start < end).then(|| &unit_name[start..end])
 }
 
+/// Splits a multi-target algebra's own combined type string (`concrete_
+/// type_of`'s own doc comment: `"Tensor<f32, 2>, f32"` for `Index<Container,
+/// Elem, K>`) back into its individual pieces, on *top-level* commas only —
+/// a bare `.split(", ")` would wrongly cut inside a nested generic's own
+/// argument list (`Tensor<f32, 2>` itself contains a `, `). Mirrors exactly
+/// how the combined string was built in the first place (`cps.rs`'s own
+/// `targets_str = infer.target_types.iter().map(Ty::to_string).collect::
+/// <Vec<_>>().join(", ")`), just run in reverse.
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(s[start..i].trim());
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(s[start..].trim());
+    parts
+}
+
+/// A multi-target algebra's own declared generic *names*, in order
+/// (`MatMul<A, B, C>` -> `["A", "B", "C"]`), matched positionally against
+/// `split_top_level_commas(ty)` -- the substitution a `derivative`/`axiom`
+/// rule's own body needs to know which of its own params (declared, in the
+/// algebra's own `fn` signature, against generic names like `A`/`B`/`C`)
+/// resolves to which *concrete* type at this particular reached
+/// instantiation. Only `GenericParam::Type` entries participate -- a
+/// `const` generic (`Index<Container, Elem, const K: i32>`'s own `K`) is
+/// never part of the combined type-target string in the first place (`cps.
+/// rs`'s own `target_types`, built separately from const-generic
+/// substitution). Collapses to one trivial entry for the overwhelmingly
+/// common single-generic algebra (`Ring<T>`) -- `ty` unchanged, exactly the
+/// flat string every axiom/derivative rule already assumed before this.
+fn generic_substitution(algebra: &str, ty: &str, registry: &Registry) -> HashMap<String, String> {
+    let names = registry.generics(algebra).iter().filter(|g| !matches!(g, crate::ast::GenericParam::Const { .. })).map(|g| g.name());
+    names.zip(split_top_level_commas(ty)).map(|(name, part)| (name.to_string(), part.to_string())).collect()
+}
+
+/// Resolves one *declared* type (from an algebra's own `fn` signature --
+/// always written against that algebra's own generic names, e.g. `fn matmul
+/// (a: A, b: B) -> C;`) to its concrete value at one reached instantiation,
+/// via `subst` (`generic_substitution`'s own output). Only ever succeeds
+/// when the declared type is *exactly* one bare generic name (every
+/// existing algebra signature in this codebase's own stdlib is written this
+/// way) -- a more structured declared type (`Index<Container,Elem,K>`'s own
+/// `idx: [i32; K]`) isn't resolved here, `None` rather than a guess, the
+/// same conservative posture `build_pattern` already takes throughout.
+fn resolve_declared_type(declared: &crate::ast::Type, subst: &HashMap<String, String>) -> Option<String> {
+    subst.get(&crate::print::fmt_type(declared)).cloned()
+}
+
 fn axiom_to_rewrite(algebra: &str, ty: &str, axiom: &AxiomDecl, registry: &Registry) -> Option<Rewrite<CleaveLang, ConstantFold>> {
-    let params: HashSet<&str> = axiom.params.iter().map(|p| p.name.as_str()).collect();
+    // Every axiom in this codebase is declared on a single-generic algebra
+    // (`Ring<T>`'s own `add_commutative`, ...) -- every param shares the
+    // one flat `ty` uniformly, the same assumption this function has always
+    // made (`build_pattern`'s own doc comment: "no cross-algebra resolution
+    // attempted" for axioms specifically). `derivative_rule_type_env`
+    // builds the *real*, per-param substitution `derivative` rules need
+    // instead (multi-target algebras, e.g. `MatMul<A,B,C>`).
+    let type_env: HashMap<&str, String> = axiom.params.iter().map(|p| (p.name.as_str(), ty.to_string())).collect();
     let ExprKind::Call(path, _, args, _) = &axiom.body.kind else { return None };
     let [lhs, rhs] = args.as_slice() else { return None };
     if path.segments.join("::") != "eq" {
@@ -779,9 +1011,9 @@ fn axiom_to_rewrite(algebra: &str, ty: &str, axiom: &AxiomDecl, registry: &Regis
     // `derivative`-rule-only concern (`build_pattern`'s own doc comment).
     let mut referenced = HashSet::new();
     let mut lhs_ast = PatternAst::default();
-    build_pattern(lhs, algebra, ty, &params, None, &mut referenced, registry, &mut lhs_ast)?;
+    build_pattern(lhs, algebra, ty, &type_env, None, &mut referenced, registry, &mut lhs_ast)?;
     let mut rhs_ast = PatternAst::default();
-    build_pattern(rhs, algebra, ty, &params, None, &mut referenced, registry, &mut rhs_ast)?;
+    build_pattern(rhs, algebra, ty, &type_env, None, &mut referenced, registry, &mut rhs_ast)?;
     let name = format!("{}@{algebra}<{ty}>", axiom.name);
     Rewrite::new(name, egg::Pattern::new(lhs_ast), egg::Pattern::new(rhs_ast)).ok()
 }
@@ -828,39 +1060,55 @@ fn axiom_to_rewrite(algebra: &str, ty: &str, axiom: &AxiomDecl, registry: &Regis
 /// derivatives` needs this set to know such a reference is valid and to
 /// let `rebuild` recognize it afterward. Unused by `axiom_to_rewrite`
 /// (passed a throwaway set), which has never needed this.
+///
+/// Returns the built node's own `Id` alongside its own resolved concrete
+/// type, when known (`None` for a bare literal, which carries no type of
+/// its own) — needed so an *enclosing* call to a genuinely different
+/// algebra (`Ring::add`, called from inside `MatMul<A,B,C>`'s own product
+/// rule) can work out which single concrete type to instantiate `Ring` at,
+/// rather than reusing whatever multi-target combined string the
+/// *enclosing* rule's own `ty` happens to be (`MatMul::matmul<A,B,C>`'s own
+/// combined "A,B,C" string is not a real `Ring<T>` instantiation at all).
+/// `type_env` (param name -> concrete type, built once by the caller —
+/// `derivative_rule_type_env` for a real `derivative` rule, a trivial
+/// flat map in `axiom_to_rewrite`) is what makes a `Path` leaf's own type
+/// known in the first place.
 fn build_pattern(
     expr: &Expr,
     algebra: &str,
     ty: &str,
-    params: &HashSet<&str>,
+    type_env: &HashMap<&str, String>,
     d_var: Option<Var>,
     referenced: &mut HashSet<String>,
     registry: &Registry,
     ast: &mut PatternAst<CleaveLang>,
-) -> Option<egg::Id> {
+) -> Option<(egg::Id, Option<String>)> {
     match &expr.kind {
         ExprKind::Path(p) => {
             let name = p.segments.join("::");
-            if !params.contains(name.as_str()) {
+            let Some(resolved_ty) = type_env.get(name.as_str()) else {
                 return None; // a bare name that isn't one of the rule's own params -- not representable
-            }
+            };
             let var = Var::from(Symbol::from(format!("?{name}")));
-            Some(ast.add(ENodeOrVar::Var(var)))
+            Some((ast.add(ENodeOrVar::Var(var)), Some(resolved_ty.clone())))
         }
         ExprKind::NumberLit { text, .. } if matches!(ty, "f32" | "f64") => {
             let n: f64 = text.parse().ok()?;
-            Some(ast.add(ENodeOrVar::ENode(CleaveLang::Float(n.into()))))
+            Some((ast.add(ENodeOrVar::ENode(CleaveLang::Float(n.into()))), None))
         }
         ExprKind::NumberLit { text, .. } => {
             let n: u64 = text.parse().ok()?;
-            Some(ast.add(ENodeOrVar::ENode(CleaveLang::Int(n))))
+            Some((ast.add(ENodeOrVar::ENode(CleaveLang::Int(n))), None))
         }
-        ExprKind::BoolLit(b) => Some(ast.add(ENodeOrVar::ENode(CleaveLang::Bool(*b)))),
+        ExprKind::BoolLit(b) => Some((ast.add(ENodeOrVar::ENode(CleaveLang::Bool(*b))), None)),
         ExprKind::Call(path, _, call_args, _) if path.segments.join("::") == "d" && d_var.is_some() => {
             let [inner] = call_args.as_slice() else { return None }; // `d(...)` always takes exactly one argument
-            let inner_id = build_pattern(inner, algebra, ty, params, d_var, referenced, registry, ast)?;
+            let (inner_id, inner_ty) = build_pattern(inner, algebra, ty, type_env, d_var, referenced, registry, ast)?;
             let x_id = ast.add(ENodeOrVar::Var(d_var.unwrap()));
-            Some(ast.add(ENodeOrVar::ENode(CleaveLang::Op("derivative".into(), vec![inner_id, x_id]))))
+            // Differentiating distributes component-wise (`construction_
+            // derivative_rewrites`'s own doc comment) -- `d(inner)` always
+            // has the exact same shape/type as `inner` itself.
+            Some((ast.add(ENodeOrVar::ENode(CleaveLang::Op("derivative".into(), vec![inner_id, x_id]))), inner_ty))
         }
         ExprKind::Call(path, _, call_args, _) => {
             let method = path.segments.join("::");
@@ -885,13 +1133,58 @@ fn build_pattern(
                     _ => return None,
                 }
             };
-            let unit_name = format!("{owner}::{method}<{ty}>");
-            referenced.insert(unit_name.clone());
             let mut ids = Vec::with_capacity(call_args.len());
+            let mut arg_types: Vec<Option<String>> = Vec::with_capacity(call_args.len());
             for a in call_args {
-                ids.push(build_pattern(a, algebra, ty, params, d_var, referenced, registry, ast)?);
+                let (id, arg_ty) = build_pattern(a, algebra, ty, type_env, d_var, referenced, registry, ast)?;
+                ids.push(id);
+                arg_types.push(arg_ty);
             }
-            Some(ast.add(ENodeOrVar::ENode(CleaveLang::Op(unit_name.into(), ids))))
+            // Same algebra as the one this whole rule is declared on --
+            // reuse the outer, possibly multi-target combined `ty` string
+            // unchanged, exactly like every rule already did before this:
+            // a recursive self-call (`MatMul::matmul` calling itself inside
+            // its own product rule, `Index::index` likewise) is inherently
+            // the *same* multi-target instantiation as the enclosing rule,
+            // not something to re-derive from its own arguments' types.
+            // Otherwise (a genuinely *different* algebra, e.g. `Ring::add`
+            // called from inside `MatMul`'s own rule): every such target in
+            // this codebase's stdlib is single-generic (`Ring<T>`,
+            // `Transcendental<T>`), so the one concrete type its own
+            // (type-bearing) arguments agree on *is* that generic's own
+            // concrete value -- a genuinely multi-generic *different*-
+            // algebra callee bails (`None`) rather than guessing, matching
+            // this function's posture everywhere else.
+            let call_ty = if owner == algebra {
+                ty.to_string()
+            } else {
+                let mut agreed: Option<&str> = None;
+                for t in arg_types.iter().flatten() {
+                    match agreed {
+                        None => agreed = Some(t.as_str()),
+                        Some(a) if a == t.as_str() => {}
+                        Some(_) => return None,
+                    }
+                }
+                agreed?.to_string()
+            };
+            let unit_name = format!("{owner}::{method}<{call_ty}>");
+            referenced.insert(unit_name.clone());
+            // This call's own result type, for whoever (if anyone) embeds
+            // it as an argument to a further, enclosing call -- `owner`'s
+            // own declared return type (e.g. `MatMul::matmul`'s own `C`),
+            // substituted through `owner`'s own generic-name mapping at
+            // `call_ty`. `None` (rather than falling back to `call_ty`
+            // itself) when the declared return type isn't a bare generic
+            // name `resolve_declared_type` can resolve -- an enclosing
+            // different-algebra call needing it then correctly bails too,
+            // rather than silently building a wrong unit name from it.
+            let result_ty = registry
+                .fn_sig(&owner, &method)
+                .and_then(|sig| sig.ret.as_ref())
+                .and_then(|ret| resolve_declared_type(ret, &generic_substitution(&owner, &call_ty, registry)));
+            let call_id = ast.add(ENodeOrVar::ENode(CleaveLang::Op(unit_name.into(), ids)));
+            Some((call_id, result_ty))
         }
         _ => None,
     }
@@ -939,9 +1232,101 @@ pub fn struct_projection_rewrites(
     rules
 }
 
+/// `d(Struct(f1:e1, ..., fn:en)) = Struct(f1:d(e1), ..., fn:d(en))` and
+/// `d([e1, ..., en]) = [d(e1), ..., d(en)]` -- differentiating a
+/// construction distributes component-wise onto its own arguments: the
+/// derivative of "build a value out of these pieces" is "build the same
+/// shape out of the pieces' own derivatives," the direct algebraic
+/// meaning agreed on before writing this (see `doc/backlog.md`'s own
+/// "toward tensorial ML" item). Built-in, not declarable via cleave
+/// source -- same reason `derivative-self`/`derivative-independent-zero`
+/// above are hardcoded rather than registry-declared: `PrimOp::Struct`/
+/// `PrimOp::Array` aren't algebra methods with a fixed, nameable
+/// signature a `derivative` item could ever attach to. One concrete rule
+/// per actually-reached struct/array shape, mirroring `struct_projection_
+/// rewrites`'s own "only build what this translation actually touched"
+/// discipline, just above -- harmless, not unsound, if a rule never
+/// matches anything in a given e-graph.
+fn construction_derivative_rewrites(
+    struct_ops: &HashMap<Symbol, (String, Vec<String>, Ty)>,
+    array_ops: &HashMap<Symbol, Ty>,
+) -> Vec<Rewrite<CleaveLang, ConstantFold>> {
+    let mut rules = Vec::new();
+    let x = Var::from(Symbol::from("?__diff_x"));
+
+    for (struct_sym, (_struct_name, field_names, struct_ty)) in struct_ops {
+        let field_vars: Vec<Var> = field_names.iter().map(|f| Var::from(Symbol::from(format!("?{f}")))).collect();
+
+        let mut lhs = PatternAst::default();
+        let field_ids: Vec<egg::Id> = field_vars.iter().map(|&v| lhs.add(ENodeOrVar::Var(v))).collect();
+        let struct_id = lhs.add(ENodeOrVar::ENode(CleaveLang::Op(*struct_sym, field_ids)));
+        let x_id_lhs = lhs.add(ENodeOrVar::Var(x));
+        lhs.add(ENodeOrVar::ENode(CleaveLang::Op("derivative".into(), vec![struct_id, x_id_lhs])));
+
+        let mut rhs = PatternAst::default();
+        let x_id_rhs = rhs.add(ENodeOrVar::Var(x));
+        let d_field_ids: Vec<egg::Id> = field_vars
+            .iter()
+            .map(|&v| {
+                let f_id = rhs.add(ENodeOrVar::Var(v));
+                rhs.add(ENodeOrVar::ENode(CleaveLang::Op("derivative".into(), vec![f_id, x_id_rhs])))
+            })
+            .collect();
+        rhs.add(ENodeOrVar::ENode(CleaveLang::Op(*struct_sym, d_field_ids)));
+
+        // `struct_ty` (the full, concrete type text -- e.g. `Tensor<f32,
+        // 1, 2>`), not the bare `struct_name` (`Tensor`) alone -- otherwise
+        // two differently-shaped instantiations of the same pack-generic
+        // struct (`Tensor<f32,1,2>` and `Tensor<f32,2,2>`, say, both
+        // reached in one translation) built two *different* rules sharing
+        // one *name*, a real, found-by-testing egg warning ("Duplicated
+        // rule names may affect rule reporting and scheduling") — harmless
+        // functionally (each rule's own pattern is still distinct,
+        // correctly matched independently), but not a name collision this
+        // module should actually produce.
+        let name = format!("derivative-construction:{struct_ty}");
+        if let Ok(rw) = Rewrite::new(name, egg::Pattern::new(lhs), egg::Pattern::new(rhs)) {
+            rules.push(rw);
+        }
+    }
+
+    for (array_sym, ty) in array_ops {
+        // The element count lives only inside the symbol string itself
+        // (`array:{ty}:{count}`, `Forward::walk`'s own `PrimOp::Array` arm)
+        // -- `array_ops`'s value is the element type alone, so the arity
+        // has to be parsed back out here rather than read off a field.
+        let Some(count) = array_sym.as_str().rsplit(':').next().and_then(|n| n.parse::<usize>().ok()) else { continue };
+        let elem_vars: Vec<Var> = (0..count).map(|i| Var::from(Symbol::from(format!("?e{i}")))).collect();
+
+        let mut lhs = PatternAst::default();
+        let elem_ids: Vec<egg::Id> = elem_vars.iter().map(|&v| lhs.add(ENodeOrVar::Var(v))).collect();
+        let array_id = lhs.add(ENodeOrVar::ENode(CleaveLang::Op(*array_sym, elem_ids)));
+        let x_id_lhs = lhs.add(ENodeOrVar::Var(x));
+        lhs.add(ENodeOrVar::ENode(CleaveLang::Op("derivative".into(), vec![array_id, x_id_lhs])));
+
+        let mut rhs = PatternAst::default();
+        let x_id_rhs = rhs.add(ENodeOrVar::Var(x));
+        let d_elem_ids: Vec<egg::Id> = elem_vars
+            .iter()
+            .map(|&v| {
+                let e_id = rhs.add(ENodeOrVar::Var(v));
+                rhs.add(ENodeOrVar::ENode(CleaveLang::Op("derivative".into(), vec![e_id, x_id_rhs])))
+            })
+            .collect();
+        rhs.add(ENodeOrVar::ENode(CleaveLang::Op(*array_sym, d_elem_ids)));
+
+        let name = format!("derivative-construction:array:{ty}:{count}");
+        if let Ok(rw) = Rewrite::new(name, egg::Pattern::new(lhs), egg::Pattern::new(rhs)) {
+            rules.push(rw);
+        }
+    }
+
+    rules
+}
+
 // ---------------------------------------------------------------- derivative (auto-diff)
 
-use egg::{ConditionalApplier, Language, Subst};
+use egg::{Applier, Language, Subst};
 
 /// `Op("derivative", [expr_id, wrt_id])` — introduced by `synthesize_
 /// derivatives` as a synthetic marker (not a real cleave call — no algebra
@@ -965,8 +1350,7 @@ use egg::{ConditionalApplier, Language, Subst};
 /// actually reached" discipline `axiom_rewrites` already uses; harmless,
 /// not unsound, if a rule never matches anything in a given e-graph.
 pub fn derivative_rewrites(ty: &str, reached: &HashMap<String, (String, String)>, registry: &Registry) -> (Vec<Rewrite<CleaveLang, ConstantFold>>, HashSet<String>) {
-    let (one, zero) =
-        if matches!(ty, "f32" | "f64") { (CleaveLang::Float(1.0.into()), CleaveLang::Float(0.0.into())) } else { (CleaveLang::Int(1), CleaveLang::Int(0)) };
+    let one = if matches!(ty, "f32" | "f64") { CleaveLang::Float(1.0.into()) } else { CleaveLang::Int(1) };
 
     let mut rules = Vec::new();
 
@@ -1005,32 +1389,47 @@ pub fn derivative_rewrites(ty: &str, reached: &HashMap<String, (String, String)>
     // subexpression has a *different* e-class than `x` too, but obviously
     // still depends on it — the occurs-check is exactly what tells the two
     // cases apart correctly, for *any* compound shape, not just the leaf
-    // ones. Needs a hand-built `ConditionalApplier`, not a plain
-    // declarative pattern — egg's own pattern language has no "not equal
-    // to"/"does not contain" wildcard.
+    // ones.
+    //
+    // The "0" itself is no longer a single fixed literal (`IndependentZero
+    // Applier`/`build_zero`, below) — found directly, not anticipated,
+    // building the tensorial `examples/xor.cleave` reformulation: `?a`
+    // isn't always scalar (`d(x)/dw` where `x` is itself a whole
+    // independent `linalg::Tensor` input) — a bare scalar `0.0` unioned
+    // into that e-class is a real type-soundness violation (a scalar
+    // masquerading as a tensor), silently *cheaper* than the correctly-
+    // shaped answer the chain rule separately builds in the very same
+    // e-class, so extraction preferred the wrong one. Confirmed via a
+    // minimal probe: an identity-matrix literal fed into `matmul`, once
+    // `MatMul::matmul`'s own new product rule needed differentiating
+    // through it, crashed MLIR lowering ("a nested array's own element
+    // must be an already-built array value, not a bare literal"). Needs
+    // `?a`'s own concrete `Ty` (`ConstantFold::known_types`'s own doc
+    // comment) to build a properly-shaped zero; when that `Ty` isn't known,
+    // or isn't a shape `build_zero` knows how to decompose, the rule simply
+    // doesn't fire for that e-class — sound, not a guess: the full
+    // recursive chain-rule expansion (already present in the same e-class
+    // regardless) is what supplies the correct answer there instead, this
+    // rule staying a pure optimization shortcut, never the sole source of
+    // truth.
     {
-        let mut lhs = PatternAst::default();
         let a = Var::from(Symbol::from("?a"));
         let x = Var::from(Symbol::from("?x"));
+        let mut lhs = PatternAst::default();
         let a_id = lhs.add(ENodeOrVar::Var(a));
         let x_id = lhs.add(ENodeOrVar::Var(x));
         lhs.add(ENodeOrVar::ENode(CleaveLang::Op("derivative".into(), vec![a_id, x_id])));
-        let mut rhs = PatternAst::default();
-        rhs.add(ENodeOrVar::ENode(zero.clone()));
-        let condition = move |egraph: &mut egg::EGraph<CleaveLang, ConstantFold>, _eclass: Id, subst: &Subst| {
-            let a_class = egraph.find(subst[a]);
-            let x_class = egraph.find(subst[x]);
-            if a_class == x_class {
-                return false;
-            }
-            // `x_class`'s own `free_deps` is exactly `{x}` (a bare `Free`
-            // node, nothing else could have narrowed it further) — checking
-            // disjointness rather than a bare `.contains` reads the same
-            // but stays correct even if `x` were ever something richer than
-            // a single free variable.
-            egraph[x_class].data.free_deps.is_disjoint(&egraph[a_class].data.free_deps)
-        };
-        let applier = ConditionalApplier { condition, applier: egg::Pattern::new(rhs) };
+        let tensor_like: HashMap<String, String> = registry
+            .struct_names()
+            .filter_map(|name| {
+                let [field] = registry.struct_fields(name)? else { return None };
+                if !registry.struct_generics(name).last()?.is_variadic() {
+                    return None;
+                }
+                Some((name.to_string(), field.name.clone()))
+            })
+            .collect();
+        let applier = IndependentZeroApplier { a, x, tensor_like };
         if let Ok(rw) = Rewrite::new("derivative-independent-zero", egg::Pattern::new(lhs), applier) {
             rules.push(rw);
         }
@@ -1045,6 +1444,126 @@ pub fn derivative_rewrites(ty: &str, reached: &HashMap<String, (String, String)>
     rules.extend(declared_rules);
 
     (rules, referenced)
+}
+
+/// `derivative-independent-zero`'s own custom `Applier` (`derivative_
+/// rewrites`'s own doc comment on why the "0" has to be dynamically
+/// shaped, not a fixed literal) — a genuinely dynamic decision (which e-
+/// class matched `?a`, and what `Ty` it turns out to have, are only known
+/// at rewrite-*application* time, not when this rule is built), so a plain
+/// declarative `egg::Pattern` RHS can't express it at all. Folds the old
+/// `ConditionalApplier`'s own disjointness condition directly into `apply_
+/// one` (rather than keeping a separate `Condition`) since building the
+/// zero and checking whether it's even possible are the same lookup
+/// (`egraph[a_class].data.own_ty`) — no reason to compute it twice.
+struct IndependentZeroApplier {
+    a: Var,
+    x: Var,
+    /// Single-field, pack-generic struct name -> that sole field's own
+    /// declared name (`linalg::Tensor`'s own `data`) — `build_zero`'s own
+    /// doc comment. Snapshotted once, owned, since `Applier` implementations
+    /// must be `Send + Sync + 'static` (`Rewrite::new`'s own bound) and so
+    /// can't hold a borrowed `&Registry`.
+    tensor_like: HashMap<String, String>,
+}
+
+impl Applier<CleaveLang, ConstantFold> for IndependentZeroApplier {
+    fn apply_one(
+        &self,
+        egraph: &mut egg::EGraph<CleaveLang, ConstantFold>,
+        eclass: Id,
+        subst: &Subst,
+        _searcher_ast: Option<&PatternAst<CleaveLang>>,
+        _rule_name: Symbol,
+    ) -> Vec<Id> {
+        let a_class = egraph.find(subst[self.a]);
+        let x_class = egraph.find(subst[self.x]);
+        if a_class == x_class {
+            return vec![];
+        }
+        // `x_class`'s own `free_deps` is exactly `{x}` (a bare `Free` node,
+        // nothing else could have narrowed it further) — checking
+        // disjointness rather than a bare `.contains` reads the same but
+        // stays correct even if `x` were ever something richer than a
+        // single free variable.
+        if !egraph[x_class].data.free_deps.is_disjoint(&egraph[a_class].data.free_deps) {
+            return vec![];
+        }
+        // A bare literal's own *kind* (`CleaveLang::Float`/`Int`) already
+        // tells us it's scalar, unambiguously, with no need for `own_ty` at
+        // all -- checked first, directly off `a_class`'s own e-nodes, so
+        // `derivative(3.0, x) -> 0` keeps working even where nothing (a
+        // hand-built test e-graph, say, bypassing `Forward` entirely) ever
+        // populated `ConstantFold::known_types`.
+        let is_float = egraph[a_class].nodes.iter().any(|n| matches!(n, CleaveLang::Float(_)));
+        let is_int = egraph[a_class].nodes.iter().any(|n| matches!(n, CleaveLang::Int(_)));
+        if is_float || is_int {
+            let zero_id = if is_float { egraph.add(CleaveLang::Float(0.0.into())) } else { egraph.add(CleaveLang::Int(0)) };
+            egraph.union(eclass, zero_id);
+            return vec![eclass];
+        }
+        let Some(ty) = egraph[a_class].data.own_ty.clone() else { return vec![] }; // shape unknown -- don't guess, let the chain rule supply the answer elsewhere
+        let Some(zero_id) = build_zero(egraph, &ty, &self.tensor_like) else { return vec![] };
+        egraph.union(eclass, zero_id);
+        vec![eclass]
+    }
+
+    fn vars(&self) -> Vec<Var> {
+        vec![self.a, self.x]
+    }
+}
+
+/// Builds a same-*shaped* zero e-node for `ty`, recursively — the direct
+/// fix for `derivative_rewrites`'s own found bug (a bare scalar `0.0`
+/// silently standing in for a whole independent tensor/array). Three shapes
+/// recognized, matching exactly what's reachable through `linalg::Tensor`
+/// plus ordinary arrays; anything else (a genuinely multi-field struct, an
+/// algebra-`Op` node whose own result type isn't tracked at all —
+/// `ConstantFold::known_types`'s own doc comment) returns `None` rather
+/// than guessing, same posture as every other "build what's reachable, bail
+/// otherwise" function in this module:
+/// - A scalar numeric `Con` — the original literal `0`/`0.0`.
+/// - `Array(elem, size)` — a same-size array of recursively-built zero
+///   elements, symbol-for-symbol matching what `Forward::walk`'s own
+///   `PrimOp::Array` arm would have built for a real literal of this shape
+///   (`format!("array:{ty}:{n}")`, `ty` here *being* this exact `Array`
+///   value, not reconstructed by hand).
+/// - `App(struct_name, args)` where `struct_name` is single-field and
+///   pack-generic (`tensor_like`, `IndependentZeroApplier`'s own doc
+///   comment) — `linalg::Tensor<T, Dims...>`'s own shape specifically,
+///   recognized *structurally* (a variadic trailing generic, one field),
+///   not by hardcoding the name "Tensor": `args`' own first element is
+///   taken as the element type, every remaining element must already be a
+///   resolved `Ty::Const` (the pack's own concrete dimensions) — bails if
+///   not, rather than trusting a struct that merely *looks* similar. The
+///   field's own type is rebuilt as nested nested `Array`s around those
+///   dims (`[ElemTy; Dims...]`'s own real monomorphized shape), then this
+///   same function recurses on it.
+fn build_zero(egraph: &mut egg::EGraph<CleaveLang, ConstantFold>, ty: &Ty, tensor_like: &HashMap<String, String>) -> Option<egg::Id> {
+    match ty {
+        Ty::Con(name) if matches!(name.as_str(), "f32" | "f64") => Some(egraph.add(CleaveLang::Float(0.0.into()))),
+        Ty::Con(_) => Some(egraph.add(CleaveLang::Int(0))),
+        Ty::Array(elem, size) => {
+            let Ty::Const(ConstValue::Int(n)) = **size else { return None };
+            let elem_id = build_zero(egraph, elem, tensor_like)?;
+            let sym = Symbol::from(format!("array:{ty}:{n}"));
+            egraph.analysis.known_types.entry(sym).or_insert_with(|| ty.clone());
+            Some(egraph.add(CleaveLang::Op(sym, vec![elem_id; n as usize])))
+        }
+        Ty::App(struct_name, args) => {
+            let field_name = tensor_like.get(struct_name)?;
+            let (elem_ty, dims) = args.split_first()?;
+            if dims.is_empty() || !dims.iter().all(|d| matches!(d, Ty::Const(_))) {
+                return None; // not shaped like `[ElemTy; Dims...]` -- bail rather than guess
+            }
+            let field_ty = dims.iter().rev().fold(elem_ty.clone(), |acc, d| Ty::Array(Box::new(acc), Box::new(d.clone())));
+            let data_id = build_zero(egraph, &field_ty, tensor_like)?;
+            let struct_sym = Symbol::from(format!("struct:{ty}:{field_name}"));
+            egraph.analysis.known_types.entry(struct_sym).or_insert_with(|| ty.clone());
+            Some(egraph.add(CleaveLang::Op(struct_sym, vec![data_id])))
+        }
+        _ => None,
+    }
 }
 
 /// Builds one concrete `Rewrite` per `(derivative rule, reached concrete
@@ -1083,13 +1602,57 @@ fn derivative_rule_rewrites(registry: &Registry, reached: &HashMap<String, (Stri
 /// add(mul(a, d(b)), mul(d(a), b));` becomes `derivative(Ring::mul<ty>(?a,
 /// ?b), ?x) -> Ring::add<ty>(Ring::mul<ty>(?a, derivative(?b,?x)), Ring::
 /// mul<ty>(derivative(?a,?x), ?b))` — the LHS built by hand (the outer
-/// `derivative(method(...), ?x)` wrapper has no source-level `Expr` of its
-/// own to walk), the RHS via `build_pattern` with `d_var: Some(?x)` so
-/// every `d(...)` in the declared body compiles to a nested `derivative`
-/// node sharing the identical `?x`.
+/// `derivative(method(...), ?__diff_x)` wrapper has no source-level `Expr`
+/// of its own to walk), the RHS via `build_pattern` with `d_var: Some(?
+/// __diff_x)` so every `d(...)` in the declared body compiles to a nested
+/// `derivative` node sharing the identical `?__diff_x`.
+///
+/// The differentiation variable's own pattern symbol is deliberately
+/// `__diff_x`, not a bare `x` — a real, found-by-testing bug: an earlier
+/// version used literal `?x`, which silently *collided* with a declared
+/// parameter genuinely named `x` (`fn exp(x: T) -> T; derivative exp(x):
+/// mul(exp(x), d(x));`, `stdlib/num/num.cleave`'s own `Transcendental<T>`)
+/// — `param_ids` below, keyed off each parameter's own real name, would
+/// then bind *the same* egg pattern variable `?x` the rule's own LHS
+/// already uses for "the differentiation variable," forcing them to match
+/// the *same* e-class: the rule then only ever fired when the method was
+/// applied *directly* to the exact variable being differentiated (`exp(w)`
+/// w.r.t. `w`), never through any composition (`exp(exp(w))`, `exp(-w)`,
+/// ...), silently leaving the derivative marker permanently stuck —
+/// invisible on `Ring<T>` (whose own params are always named `a`/`b`,
+/// never `x`) purely by naming coincidence, not because the bug didn't
+/// apply there too.
+///
+/// Each param's own concrete type (`type_env` below, `build_pattern`'s own
+/// doc comment) comes from the algebra's own declared signature for
+/// `rule.method` (`fn matmul(a: A, b: B) -> C;`), substituted positionally
+/// through `generic_substitution` -- needed for real once a multi-target
+/// algebra's own product rule (`MatMul<A,B,C>`'s `derivative matmul(a, b):
+/// add(matmul(d(a), b), matmul(a, d(b)));`) has to call a genuinely
+/// *different*, single-target algebra (`Ring::add`): the outer `add` call's
+/// own operands are both type `C` specifically, not the whole "A,B,C"
+/// combined `ty` string the enclosing `matmul` rule was built for — found
+/// directly, not anticipated, via a minimal probe that panicked building an
+/// `Op` node literally named `Ring::add<Tensor<f32,2,2>, Tensor<f32,2,2>,
+/// Tensor<f32,2,2>>`, a unit that could never actually exist. Falls back to
+/// the flat `ty` for any param whose own declared type isn't a bare generic
+/// name (`resolve_declared_type`'s own doc comment) — harmless: such a
+/// param only feeds a *same*-algebra recursive call in practice (`Index`'s
+/// own `idx: [i32; K]`), which ignores `type_env` entirely and reuses `ty`
+/// unchanged regardless.
 fn derivative_rule_to_rewrite(algebra: &str, ty: &str, rule: &DerivativeRuleDecl, registry: &Registry) -> Option<(Rewrite<CleaveLang, ConstantFold>, HashSet<String>)> {
-    let params: HashSet<&str> = rule.params.iter().map(|p| p.name.as_str()).collect();
-    let x = Var::from(Symbol::from("?x"));
+    let sig = registry.fn_sig(algebra, &rule.method)?;
+    let subst = generic_substitution(algebra, ty, registry);
+    let type_env: HashMap<&str, String> = rule
+        .params
+        .iter()
+        .zip(&sig.params)
+        .map(|(rule_p, sig_p)| {
+            let resolved = sig_p.ty.as_ref().and_then(|declared| resolve_declared_type(declared, &subst)).unwrap_or_else(|| ty.to_string());
+            (rule_p.name.as_str(), resolved)
+        })
+        .collect();
+    let x = Var::from(Symbol::from("?__diff_x"));
 
     let mut lhs = PatternAst::default();
     let mut param_ids = Vec::with_capacity(rule.params.len());
@@ -1102,7 +1665,7 @@ fn derivative_rule_to_rewrite(algebra: &str, ty: &str, rule: &DerivativeRuleDecl
 
     let mut referenced = HashSet::new();
     let mut rhs = PatternAst::default();
-    build_pattern(&rule.body, algebra, ty, &params, Some(x), &mut referenced, registry, &mut rhs)?;
+    build_pattern(&rule.body, algebra, ty, &type_env, Some(x), &mut referenced, registry, &mut rhs)?;
 
     let name = format!("derivative-{algebra}::{}<{ty}>", rule.method);
     let rw = Rewrite::new(name, egg::Pattern::new(lhs), egg::Pattern::new(rhs)).ok()?;
@@ -1526,7 +2089,9 @@ pub fn optimize_program(program: CpsProgram, registry: &Registry) -> (CpsProgram
         // not one enabled only after the fact on a `Runner`'s own copy (see
         // this same function's own note on `with_egraph` below).
         fwd.egraph = fwd.egraph.with_explanations_enabled();
-        let boundary = fwd.walk(&f.def.body, &units);
+        let real_params = &f.def.params[..f.def.params.len() - 1];
+        fwd.param_types = real_params.iter().copied().zip(f.param_types.iter().cloned()).collect();
+        let boundary = fwd.walk(&f.def.body, &units, &fresh);
         let Some(root_var) = segment_root_var(&boundary, &fwd.env) else { continue };
         let Some(&root_id) = fwd.env.get(&root_var) else { continue };
 
@@ -1651,7 +2216,9 @@ pub fn synthesize_derivatives(program: CpsProgram, requests: &[DerivativeRequest
         let Some(&of_unit) = units.get(req.of.as_str()) else { continue };
 
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&of_unit.def.body, &units);
+        let real_params = &of_unit.def.params[..of_unit.def.params.len() - 1];
+        fwd.param_types = real_params.iter().copied().zip(of_unit.param_types.iter().cloned()).collect();
+        let boundary = fwd.walk(&of_unit.def.body, &units, &fresh);
         // Both of these used to `continue` silently (no error pushed) —
         // found directly, empirically, before this fix existed: `derive()`
         // on a function whose own body wasn't fully representable (any
@@ -1709,6 +2276,7 @@ pub fn synthesize_derivatives(program: CpsProgram, requests: &[DerivativeRequest
 
         let mut rules = axiom_rewrites(registry, &fwd.reached);
         rules.extend(struct_projection_rewrites(&fwd.struct_ops, &fwd.field_ops));
+        rules.extend(construction_derivative_rewrites(&fwd.struct_ops, &fwd.array_ops));
         let (derivative_rules, referenced) = derivative_rewrites(&ty_text, &fwd.reached, registry);
         rules.extend(derivative_rules);
 
@@ -2102,7 +2670,7 @@ mod tests {
         };
 
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &units);
+        let boundary = fwd.walk(&expr, &units, &FreshVars::new());
         assert!(matches!(boundary, CExpr::App { .. }));
         let root_var: CVar = 5;
         let root_id = fwd.env[&root_var];
@@ -2161,7 +2729,7 @@ mod tests {
             }),
         };
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &HashMap::new());
+        let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
         assert!(matches!(boundary, CExpr::App { .. }), "expected the bare tail App as the boundary, got {boundary:?}");
         assert!(fwd.env.contains_key(&0) && fwd.env.contains_key(&1), "both LetPrim-bound vars must have their own e-class");
         // (2 + 3) folds to 5, then 5 * 10 folds to 50 -- constant folding
@@ -2188,7 +2756,7 @@ mod tests {
             cont: Box::new(tail.clone()),
         };
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &HashMap::new());
+        let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
         assert!(matches!(boundary, CExpr::App { .. }), "expected the bare tail App as the boundary, got {boundary:?}");
         assert!(fwd.env.contains_key(&0), "the LetPrim-bound var must have its own e-class -- the float argument must not have stopped translation");
     }
@@ -2215,7 +2783,7 @@ mod tests {
             cont: Box::new(tail.clone()),
         };
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &HashMap::new());
+        let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
         let root_var: CVar = 0;
         let root_id = fwd.env[&root_var];
 
@@ -2277,7 +2845,7 @@ mod tests {
             }),
         };
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &units);
+        let boundary = fwd.walk(&expr, &units, &FreshVars::new());
         assert!(matches!(boundary, CExpr::App { .. }), "translation must continue past the Fix into k$0's own body, got {boundary:?}");
         assert!(fwd.env.contains_key(&5), "the call's own result var must have its own e-class");
         // 2 + 3 folds to 5 through the *callee's* own translated op.
@@ -2326,7 +2894,7 @@ mod tests {
             }),
         };
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &units);
+        let boundary = fwd.walk(&expr, &units, &FreshVars::new());
         assert!(matches!(boundary, CExpr::Fix { .. }), "a non-straight-line callee must stop translation at the Fix, got {boundary:?}");
         assert!(fwd.env.is_empty(), "nothing should have been translated at all");
     }
@@ -2422,7 +2990,7 @@ mod tests {
 
         let expr = for_loop_fix(CVal::Int(3));
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &units);
+        let boundary = fwd.walk(&expr, &units, &FreshVars::new());
 
         assert!(matches!(boundary, CExpr::App { func: CVal::Var(99), .. }), "expected unrolling to continue straight into the loop's own exit continuation, got {boundary:?}");
         const ACC: CVar = 0;
@@ -2441,7 +3009,7 @@ mod tests {
 
         let expr = for_loop_fix(CVal::Var(50));
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &units);
+        let boundary = fwd.walk(&expr, &units, &FreshVars::new());
 
         assert!(matches!(boundary, CExpr::Fix { .. }), "a non-literal bound must bail, leaving the original Fix as the boundary, got {boundary:?}");
         assert!(fwd.env.is_empty(), "nothing should have been translated at all");
@@ -2458,7 +3026,7 @@ mod tests {
 
         let expr = for_loop_fix(CVal::Int(MAX_UNROLL_ITERATIONS + 1));
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &units);
+        let boundary = fwd.walk(&expr, &units, &FreshVars::new());
 
         assert!(matches!(boundary, CExpr::Fix { .. }), "a too-large bound must bail, leaving the original Fix as the boundary, got {boundary:?}");
         assert!(fwd.env.is_empty(), "nothing should have been translated at all");
@@ -2525,7 +3093,7 @@ mod tests {
             }),
         };
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &units);
+        let boundary = fwd.walk(&expr, &units, &FreshVars::new());
         assert!(matches!(boundary, CExpr::Fix { .. }), "an effectful callee must stop translation at the Fix, got {boundary:?}");
         assert!(fwd.env.is_empty(), "nothing should have been translated at all");
     }
@@ -2541,7 +3109,7 @@ mod tests {
             else_branch: Box::new(CExpr::App { func: CVal::Var(9), args: vec![CVal::Int(2)] }),
         };
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &HashMap::new());
+        let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
         assert!(matches!(boundary, CExpr::If { .. }));
         assert!(fwd.env.is_empty());
         assert!(fwd.free_vars.is_empty(), "nothing was translated, so nothing should have been treated as free either");
@@ -2566,7 +3134,7 @@ mod tests {
             cont: Box::new(CExpr::App { func: CVal::Var(99), args: vec![CVal::Var(0)] }),
         };
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &HashMap::new());
+        let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
         assert!(matches!(boundary, CExpr::App { .. }), "expected the bare tail App as the boundary, got {boundary:?}");
         assert!(fwd.env.contains_key(&0), "the struct-construction-bound var must have its own e-class");
     }
@@ -2593,7 +3161,7 @@ mod tests {
             }),
         };
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &HashMap::new());
+        let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
         assert!(matches!(boundary, CExpr::App { .. }), "expected the bare tail App as the boundary, got {boundary:?}");
         assert!(fwd.env.contains_key(&0) && fwd.env.contains_key(&1), "both the construction and the field read must have their own e-class");
         assert_eq!(
@@ -2626,7 +3194,7 @@ mod tests {
             cont: Box::new(build()),
         };
         let mut fwd = Forward::default();
-        let _boundary = fwd.walk(&expr, &HashMap::new());
+        let _boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
         assert_eq!(fwd.env[&0], fwd.env[&1], "two structurally identical constructions must hashcons to the same e-class");
     }
 
@@ -2648,7 +3216,7 @@ mod tests {
             cont: Box::new(CExpr::App { func: CVal::Var(99), args: vec![CVal::Var(0)] }),
         };
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &HashMap::new());
+        let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
         assert!(matches!(boundary, CExpr::App { .. }), "expected the bare tail App as the boundary, got {boundary:?}");
         assert!(fwd.env.contains_key(&0), "the array-literal-bound var must have its own e-class");
     }
@@ -2664,7 +3232,7 @@ mod tests {
             cont: Box::new(CExpr::App { func: CVal::Var(99), args: vec![CVal::Var(0)] }),
         };
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &HashMap::new());
+        let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
         assert!(matches!(boundary, CExpr::App { .. }), "expected the bare tail App as the boundary, got {boundary:?}");
         assert!(fwd.env.contains_key(&0), "the array-repeat-bound var must have its own e-class");
     }
@@ -2688,7 +3256,7 @@ mod tests {
             }),
         };
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &HashMap::new());
+        let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
         assert!(matches!(boundary, CExpr::App { .. }), "expected the bare tail App as the boundary, got {boundary:?}");
         assert!(fwd.env.contains_key(&0) && fwd.env.contains_key(&1), "both the array literal and the load must have their own e-class");
     }
@@ -2716,7 +3284,7 @@ mod tests {
             }),
         };
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &HashMap::new());
+        let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
         let root_var: CVar = 1;
         let root_id = fwd.env[&root_var];
 
@@ -2760,7 +3328,7 @@ mod tests {
             }),
         };
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &HashMap::new());
+        let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
         let root_var: CVar = 1;
         let root_id = fwd.env[&root_var];
 
@@ -2809,7 +3377,7 @@ mod tests {
             }),
         };
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &HashMap::new());
+        let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
         let root_var: CVar = 2;
         let root_id = fwd.env[&root_var];
 
@@ -2853,7 +3421,7 @@ mod tests {
             cont: Box::new(CExpr::App { func: CVal::Var(99), args: vec![CVal::Var(0)] }),
         };
         let mut fwd = Forward::default();
-        let _boundary_ignored = fwd.walk(&expr, &HashMap::new());
+        let _boundary_ignored = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
 
         let boundary = CExpr::Fix {
             defs: vec![CFunDef {
@@ -2892,7 +3460,7 @@ mod tests {
             }),
         };
         let mut fwd = Forward::default();
-        let _boundary_ignored = fwd.walk(&expr, &HashMap::new());
+        let _boundary_ignored = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
 
         let boundary = CExpr::App { func: CVal::Var(99), args: vec![CVal::Var(0), CVal::Var(1)] };
         assert_eq!(segment_root_var(&boundary, &fwd.env), None);
@@ -2977,6 +3545,11 @@ mod tests {
         let (rules, _) = derivative_rewrites("f32", &HashMap::new(), &reg);
         let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
         let x = egraph.add(CleaveLang::Free("x".into()));
+        // `own_ty` (`ConstantFold::known_types`'s own doc comment) — real
+        // code populates this via `Forward` before ever adding the `Free`
+        // node; a hand-built test e-graph has to do the same for `build_
+        // zero` to know `y` is scalar rather than bailing.
+        egraph.analysis.known_types.insert(Symbol::from("y"), Ty::Con("f32".to_string()));
         let y = egraph.add(CleaveLang::Free("y".into()));
         let d = egraph.add(CleaveLang::Op("derivative".into(), vec![y, x]));
 
@@ -3138,6 +3711,11 @@ mod tests {
 
         let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
         let x = egraph.add(CleaveLang::Free("x".into()));
+        // `own_ty` (`ConstantFold::known_types`'s own doc comment) -- `y`'s
+        // own independence from `x` needs it to build a same-shaped zero
+        // (`build_zero`), for the product rule's own `d(y)` sub-term to
+        // fully reduce.
+        egraph.analysis.known_types.insert(Symbol::from("y"), Ty::Con("f32".to_string()));
         let y = egraph.add(CleaveLang::Free("y".into()));
         let xy = egraph.add(CleaveLang::Op("TestRing::mul<f32>".into(), vec![x, y]));
         let d = egraph.add(CleaveLang::Op("derivative".into(), vec![xy, x]));

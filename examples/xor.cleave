@@ -1,0 +1,80 @@
+use io;
+use nn;
+
+// XOR via a tiny 2-input, 2-hidden-neuron, 1-output network trained by real
+// gradient descent (`derive()`, no hand-derived math anywhere) -- the
+// concrete milestone `doc/backlog.md`'s own "toward simple ML" roadmap item
+// was aiming at. XOR specifically, not just another linear-regression-style
+// fit (`examples/linear_regression.cleave`): it isn't linearly separable, so
+// a single neuron provably cannot learn it -- a real hidden layer is
+// required, exercising real *composed* differentiable primitives (`sigmoid`,
+// itself built from `exp`/`neg`/`add`/`div`, called three times per forward
+// pass) through *two* levels of named function calls (`loss` -> `forward` ->
+// `sigmoid`), not just inline arithmetic.
+//
+// Trained by stochastic gradient descent (one example at a time), not full-
+// batch over all four points in a single `derive()`d function -- deliberate,
+// not incidental: `doc/backlog.md`'s own "`derive()`'s own saturation grows
+// combinatorially" item is real and was hit directly building this example
+// (`loss` looping over all four points internally, batched, made the e-graph
+// saturation pass blow past its own 30-second wall-clock limit before fully
+// converging -- confirmed via `runner.stop_reason`, not guessed). One
+// forward pass per `derive()`d call keeps the differentiated expression
+// small enough to saturate comfortably; cycling through the four examples
+// many times over still reaches a good fit. `x1`/`x2`/`y` are ordinary
+// parameters of `loss` alongside the real weights -- `derive()` computes a
+// partial for *every* parameter, so `grad`'s own returned array has three
+// unused entries (the partials with respect to the data, not the weights)
+// at the front; only indices 3..12 (the nine real weights/biases) are
+// actually used for the update.
+fn forward(x1: f32, x2: f32, w1: f32, w2: f32, w3: f32, w4: f32, w5: f32, w6: f32, b1: f32, b2: f32, b3: f32) -> f32 {
+    let h1 = sigmoid(x1 * w1 + x2 * w2 + b1);
+    let h2 = sigmoid(x1 * w3 + x2 * w4 + b2);
+    sigmoid(h1 * w5 + h2 * w6 + b3)
+}
+
+fn loss(x1: f32, x2: f32, y: f32, w1: f32, w2: f32, w3: f32, w4: f32, w5: f32, w6: f32, b1: f32, b2: f32, b3: f32) -> f32 {
+    let pred = forward(x1, x2, w1, w2, w3, w4, w5, w6, b1, b2, b3);
+    let err = pred - y;
+    err * err
+}
+
+grad = derive(loss);
+
+fn main() -> i32 {
+    // Broken symmetry on purpose (`w3`/`w4` mirror `w1`/`w2`'s own sign
+    // pattern) -- identical starting weights for both hidden neurons would
+    // keep them computing the exact same function forever (their own
+    // gradients would always match too), never able to specialize into the
+    // two different features XOR's own hidden layer actually needs.
+    let mut w1: f32 = 0.5; let mut w2: f32 = 0.5;
+    let mut w3: f32 = 0.5; let mut w4: f32 = -0.5;
+    let mut w5: f32 = 1.0; let mut w6: f32 = -1.0;
+    let mut b1: f32 = -0.2; let mut b2: f32 = -0.2; let mut b3: f32 = 0.0;
+    let lr: f32 = 1.0;
+
+    let x1s: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+    let x2s: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
+    let ys: [f32; 4] = [0.0, 1.0, 1.0, 0.0];
+
+    print("training...");
+    for step in 0..4000 {
+        // Cycle through the four examples in order, one per step -- `step %
+        // 4`, spelled out via `/` since cleave has no `%` operator of its
+        // own yet.
+        let i: i32 = step - (step / 4) * 4;
+        let g = grad(x1s[i], x2s[i], ys[i], w1, w2, w3, w4, w5, w6, b1, b2, b3);
+        w1 = w1 - lr * g[3]; w2 = w2 - lr * g[4];
+        w3 = w3 - lr * g[5]; w4 = w4 - lr * g[6];
+        w5 = w5 - lr * g[7]; w6 = w6 - lr * g[8];
+        b1 = b1 - lr * g[9]; b2 = b2 - lr * g[10]; b3 = b3 - lr * g[11];
+    };
+    print("done !");
+
+    // Expected: close to 0, 1, 1, 0.
+    print(forward(0.0, 0.0, w1, w2, w3, w4, w5, w6, b1, b2, b3));
+    print(forward(0.0, 1.0, w1, w2, w3, w4, w5, w6, b1, b2, b3));
+    print(forward(1.0, 0.0, w1, w2, w3, w4, w5, w6, b1, b2, b3));
+    print(forward(1.0, 1.0, w1, w2, w3, w4, w5, w6, b1, b2, b3));
+    0
+}

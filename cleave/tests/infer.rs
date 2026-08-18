@@ -1,5 +1,5 @@
 ﻿use cleave::ast::{Field, FileId, FnDecl, GenericParam, Item, ItemKind, Node, NodeId, Program, Span, StmtKind, StructDecl, Type, TypeKind, tuple_struct_name};
-use cleave::infer::{ConstValue, Infer, Ty, TypeErrorKind, check_mutability};
+use cleave::infer::{unify, ConstValue, Infer, Subst, Ty, TyVarGen, TypeErrorKind, check_mutability};
 use cleave::lower::Lowerer;
 use cleave::parser::{CleaveParser, Rule};
 use cleave::registry::Registry;
@@ -27,7 +27,7 @@ fn lower_program(src: &str) -> Program {
 fn inject_tuple_struct(mut program: Program, arity: usize) -> Program {
     let synthetic_span = Span { file: FileId(0), start: 0, end: 0 };
     let generic_names: Vec<String> = (0..arity).map(|i| format!("T{i}")).collect();
-    let generics = generic_names.iter().map(|name| GenericParam::Type { name: name.clone(), bounds: Vec::new() }).collect();
+    let generics = generic_names.iter().map(|name| GenericParam::Type { name: name.clone(), bounds: Vec::new(), variadic: false }).collect();
     let fields = generic_names
         .iter()
         .enumerate()
@@ -320,7 +320,8 @@ fn assert_no_corrupted_array_size(ty: &Ty, context: &str) {
             params.iter().for_each(|p| assert_no_corrupted_array_size(p, context));
             assert_no_corrupted_array_size(ret, context);
         }
-        Ty::Var(_) | Ty::Con(_) | Ty::Const(_) => {}
+        Ty::Var(_) | Ty::Con(_) | Ty::Const(_) | Ty::Pack(_) | Ty::PackLen(_) => {}
+        Ty::PackResolved(elems) => elems.iter().for_each(|e| assert_no_corrupted_array_size(e, context)),
         Ty::ConstExpr(_, a, b) => {
             assert_no_corrupted_array_size(a, context);
             assert_no_corrupted_array_size(b, context);
@@ -385,6 +386,9 @@ fn a_const_generic_named_as_the_end_of_a_for_loop_range_still_works() {
 fn assert_no_unresolved_var(ty: &Ty, context: &str) {
     match ty {
         Ty::Var(v) => panic!("found an unresolved Ty::Var({v:?}) in {context} — inference claimed success but left this open"),
+        Ty::Pack(v) => panic!("found an unresolved Ty::Pack({v:?}) in {context} — inference claimed success but left this open"),
+        Ty::PackLen(v) => panic!("found an unresolved Ty::PackLen({v:?}) in {context} — inference claimed success but left this open"),
+        Ty::PackResolved(elems) => elems.iter().for_each(|e| assert_no_unresolved_var(e, context)),
         Ty::Con(_) | Ty::Const(_) => {}
         Ty::App(_, args) => args.iter().for_each(|a| assert_no_unresolved_var(a, context)),
         Ty::Fn(params, ret) => {
@@ -3014,4 +3018,218 @@ fn a_function_over_an_explicitly_annotated_tuple_parameter_infers_correctly() {
 fn a_nested_tuple_infers_and_reads_back_correctly() {
     let ty = infer_fn_named_with_tuples("fn f() -> i32 { let t: ((i32, i32), i32) = ((1, 2), 3); t.0.1 }", "f", &[2]).unwrap();
     assert_eq!(ty, Ty::Con("i32".to_string()));
+}
+
+// `doc/backlog.md`'s own "Variadic generics" item — a const-generic *pack*
+// (`struct Tensor<T, const Dims...: i32> { data: [T; Dims...] }`), resolved
+// via an explicit turbofish at a construction site (`Infer::infer_struct_
+// lit_with_pack`/`ty_from_ast_mapped_with_pack`) — confirmed working for an
+// ordinary (heap-allocated) struct's own construction and field access;
+// making the same struct work as a `#[mlir_type(tensor)]`-tagged native
+// value, or as the target of an algebra impl that's itself generic over the
+// pack (`impl<T, Dims...> Ring<Tensor<T, Dims...>>`), needs a genuinely
+// deeper mechanism (a symbolic pack flowing through unification itself) not
+// attempted here — found by direct testing, flagged in `doc/backlog.md`
+// rather than assumed to already work.
+
+#[test]
+fn a_const_generic_pack_construction_resolves_the_flattened_type_args() {
+    let ty = infer_fn_named(
+        "struct Tensor<T, const Dims...: i32> { data: [T; Dims...] }
+         fn f() -> i32 {
+             let t = Tensor::<f64, 2, 3>(data: [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+             0
+         }",
+        "f",
+    );
+    assert!(ty.is_ok(), "expected Ok, got {ty:?}");
+}
+
+#[test]
+fn a_const_generic_pack_construction_rejects_a_shape_not_matching_the_turbofish() {
+    // Turbofish says 2x3 (Dims = [2,3]), but the field literal's own shape
+    // is 3x2 — an ordinary `Unify` mismatch, no bespoke pack diagnostic
+    // needed, exactly matching how a non-pack `[T; N]` field already
+    // rejects a wrongly-shaped literal.
+    let err = infer_fn_named(
+        "struct Tensor<T, const Dims...: i32> { data: [T; Dims...] }
+         fn f() -> i32 {
+             let t = Tensor::<f64, 2, 3>(data: [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]);
+             0
+         }",
+        "f",
+    )
+    .unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::Unify(_)), "got: {:?}", err.kind);
+}
+
+#[test]
+fn constructing_a_pack_generic_struct_with_no_turbofish_is_rejected() {
+    let err = infer_fn_named(
+        "struct Tensor<T, const Dims...: i32> { data: [T; Dims...] }
+         fn f() -> i32 {
+             let t = Tensor(data: [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+             0
+         }",
+        "f",
+    )
+    .unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::VariadicStructNeedsTurbofish { .. }), "got: {:?}", err.kind);
+}
+
+#[test]
+fn constructing_a_pack_generic_struct_with_too_short_a_turbofish_is_rejected() {
+    // Two non-pack generics (`T`, `U`) need two turbofish slots before any
+    // remaining argument can belong to the pack — supplying only one is
+    // too few even for those, let alone any pack elements.
+    let err = infer_fn_named(
+        "struct Labeled<T, U, const Dims...: i32> { tag: U, data: [T; Dims...] }
+         fn f() -> i32 {
+             let t = Labeled::<f64>(tag: 1, data: [1.0, 2.0, 3.0]);
+             0
+         }",
+        "f",
+    )
+    .unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::VariadicStructNeedsTurbofish { .. }), "got: {:?}", err.kind);
+}
+
+// Real unit tests directly on `unify`/`Subst`, no wiring to declarations at
+// all — the plan's own step 1 verification for the deeper "algebra impls
+// generic over a pack" mechanism (`doc/backlog.md`'s own "Variadic
+// generics" item): a symbolic `Ty::Pack` in one side's own trailing `App`
+// argument absorbs however many concrete elements the other side has left
+// over, resolving to `Ty::PackResolved` — and the ordinary, no-pack-
+// anywhere case stays byte-for-byte what it already was (a real regression
+// guard, not just reasoning — every one of these fails loudly if `unify`'s
+// own pack-aware rewrite of the `(App, App)` arm regressed the common
+// case).
+
+fn fresh_var(tygen: &mut TyVarGen) -> cleave::infer::TyVar {
+    let Ty::Var(v) = tygen.fresh() else { unreachable!("TyVarGen::fresh always returns Ty::Var") };
+    v
+}
+
+#[test]
+fn unify_matches_a_trailing_pack_against_the_callers_own_remaining_args() {
+    let mut tygen = TyVarGen::default();
+    let t = fresh_var(&mut tygen);
+    let p = fresh_var(&mut tygen);
+    let pattern = Ty::App("Tensor".to_string(), vec![Ty::Var(t), Ty::Pack(p)]);
+    let query = Ty::App(
+        "Tensor".to_string(),
+        vec![Ty::Con("f64".to_string()), Ty::Const(ConstValue::Int(3)), Ty::Const(ConstValue::Int(4)), Ty::Const(ConstValue::Int(5))],
+    );
+    let mut subst = Subst::default();
+    unify(&mut subst, &pattern, &query).unwrap_or_else(|e| panic!("unify failed: {e:?}"));
+    assert_eq!(subst.apply(&Ty::Var(t)), Ty::Con("f64".to_string()));
+    assert_eq!(
+        subst.apply(&Ty::Pack(p)),
+        Ty::PackResolved(vec![Ty::Const(ConstValue::Int(3)), Ty::Const(ConstValue::Int(4)), Ty::Const(ConstValue::Int(5))])
+    );
+    // Spliced flat through an enclosing `App`, not left nested — the shape
+    // every real consumer (struct field resolution, MLIR lowering) needs.
+    assert_eq!(subst.apply(&pattern), query);
+}
+
+#[test]
+fn unify_matches_a_pack_symmetrically_when_the_query_side_has_it() {
+    let mut tygen = TyVarGen::default();
+    let p = fresh_var(&mut tygen);
+    let pattern = Ty::App("Tensor".to_string(), vec![Ty::Con("i32".to_string()), Ty::Const(ConstValue::Int(2)), Ty::Const(ConstValue::Int(2))]);
+    let query = Ty::App("Tensor".to_string(), vec![Ty::Con("i32".to_string()), Ty::Pack(p)]);
+    let mut subst = Subst::default();
+    unify(&mut subst, &pattern, &query).unwrap_or_else(|e| panic!("unify failed: {e:?}"));
+    assert_eq!(
+        subst.apply(&Ty::Pack(p)),
+        Ty::PackResolved(vec![Ty::Const(ConstValue::Int(2)), Ty::Const(ConstValue::Int(2))])
+    );
+}
+
+#[test]
+fn unify_still_requires_exact_arity_when_neither_side_has_a_pack() {
+    let pattern = Ty::App("Vec2".to_string(), vec![Ty::Con("f64".to_string()), Ty::Con("f64".to_string())]);
+    let query = Ty::App("Vec2".to_string(), vec![Ty::Con("f64".to_string())]);
+    let mut subst = Subst::default();
+    assert!(unify(&mut subst, &pattern, &query).is_err(), "expected an arity mismatch to be rejected, exactly as before packs existed");
+}
+
+#[test]
+fn unify_rejects_a_pack_side_with_fewer_query_args_than_its_own_non_pack_prefix() {
+    let mut tygen = TyVarGen::default();
+    let t1 = fresh_var(&mut tygen);
+    let t2 = fresh_var(&mut tygen);
+    let p = fresh_var(&mut tygen);
+    // Two non-pack slots (`t1`, `t2`) need at least two query args before
+    // the pack could absorb anything — a query with only one is too few.
+    let pattern = Ty::App("Foo".to_string(), vec![Ty::Var(t1), Ty::Var(t2), Ty::Pack(p)]);
+    let query = Ty::App("Foo".to_string(), vec![Ty::Con("i32".to_string())]);
+    let mut subst = Subst::default();
+    assert!(unify(&mut subst, &pattern, &query).is_err());
+}
+
+#[test]
+fn unify_rejects_two_still_open_packs_meeting_each_other() {
+    // Deliberately out of scope for this pass (`doc/backlog.md`'s own
+    // note) — a real, flagged gap, not silently accepted.
+    let mut tygen = TyVarGen::default();
+    let p1 = fresh_var(&mut tygen);
+    let p2 = fresh_var(&mut tygen);
+    let a = Ty::App("Foo".to_string(), vec![Ty::Pack(p1)]);
+    let b = Ty::App("Foo".to_string(), vec![Ty::Pack(p2)]);
+    let mut subst = Subst::default();
+    assert!(unify(&mut subst, &a, &b).is_err());
+}
+
+#[test]
+fn unify_succeeds_trivially_when_both_sides_share_the_same_open_pack_variable() {
+    // The common case at declaration time: an algebra's own expected type
+    // and an impl's explicitly-annotated declaration are both built from
+    // the same `impl_mapping`, so they carry the *identical* pack `TyVar`,
+    // not two different ones — this must unify (checking the non-pack
+    // prefix), not fall into the "two different open packs" `Mismatch` case
+    // just above. A real bug found via `Ring<Box3<T, Dims...>>` failing
+    // declaration-time inference with "expected `Box3<'t0, 't1...>`, found
+    // `Box3<'t0, 't1...>`" — identical on display, but the old code treated
+    // any `(Some(_), Some(_))` pair as a mismatch regardless of identity.
+    let mut tygen = TyVarGen::default();
+    let t = fresh_var(&mut tygen);
+    let p = fresh_var(&mut tygen);
+    let a = Ty::App("Box3".to_string(), vec![Ty::Var(t), Ty::Pack(p)]);
+    let b = Ty::App("Box3".to_string(), vec![Ty::Var(t), Ty::Pack(p)]);
+    let mut subst = Subst::default();
+    assert!(unify(&mut subst, &a, &b).is_ok());
+}
+
+#[test]
+fn pack_len_stays_symbolic_until_the_underlying_pack_resolves_then_folds() {
+    // `Ty::PackLen` mirrors `Ty::ConstExpr`'s own "fold when concrete, stay
+    // symbolic otherwise" shape (`doc/backlog.md`'s own "Variadic generics"
+    // item — needed for `Index<Tensor<T,Dims...>,T>`'s own `idx: [i32;
+    // Dims.len()]` parameter).
+    let mut tygen = TyVarGen::default();
+    let p = fresh_var(&mut tygen);
+    let mut subst = Subst::default();
+    // Unresolved: `apply` leaves it as-is.
+    assert_eq!(subst.apply(&Ty::PackLen(p)), Ty::PackLen(p));
+    // Resolves the pack the same way a real `Tensor<f64,3,4,5>` call site
+    // would (`unify`'s own pack-aware `(App,App)` arm, `Subst::bind_pack`).
+    let a = Ty::App("Tensor".to_string(), vec![Ty::Pack(p)]);
+    let b = Ty::App("Tensor".to_string(), vec![Ty::Const(ConstValue::Int(3)), Ty::Const(ConstValue::Int(4)), Ty::Const(ConstValue::Int(5))]);
+    unify(&mut subst, &a, &b).unwrap();
+    assert_eq!(subst.apply(&Ty::PackLen(p)), Ty::Const(ConstValue::Int(3)));
+}
+
+#[test]
+fn a_pack_generic_structs_own_field_reads_back_the_correct_nested_element_type() {
+    let ty = infer_fn_named(
+        "struct Tensor<T, const Dims...: i32> { data: [T; Dims...] }
+         fn f() -> f64 {
+             let t = Tensor::<f64, 2, 3>(data: [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+             t.data[0, 0]
+         }",
+        "f",
+    )
+    .unwrap();
+    assert_eq!(ty, Ty::Con("f64".to_string()));
 }

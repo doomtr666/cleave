@@ -328,7 +328,7 @@ fn synthesize_tuple_structs(mut program: Program, node_ids: &mut NodeIdGen) -> P
     let synthetic_span = Span { file: FileId(0), start: 0, end: 0 };
     for arity in 2..=MAX_TUPLE_ARITY {
         let generic_names: Vec<String> = (0..arity).map(|i| format!("T{i}")).collect();
-        let generics = generic_names.iter().map(|name| GenericParam::Type { name: name.clone(), bounds: Vec::new() }).collect();
+        let generics = generic_names.iter().map(|name| GenericParam::Type { name: name.clone(), bounds: Vec::new(), variadic: false }).collect();
         let fields = generic_names
             .iter()
             .enumerate()
@@ -500,11 +500,11 @@ fn generics_match(a: &[GenericParam], b: &[GenericParam]) -> bool {
         return false;
     }
     a.iter().zip(b).all(|(x, y)| match (x, y) {
-        (GenericParam::Type { name: n1, bounds: b1 }, GenericParam::Type { name: n2, bounds: b2 }) => {
-            n1 == n2 && b1 == b2
+        (GenericParam::Type { name: n1, bounds: b1, variadic: v1 }, GenericParam::Type { name: n2, bounds: b2, variadic: v2 }) => {
+            n1 == n2 && b1 == b2 && v1 == v2
         }
-        (GenericParam::Const { name: n1, ty: t1 }, GenericParam::Const { name: n2, ty: t2 }) => {
-            n1 == n2 && fmt_type(t1) == fmt_type(t2)
+        (GenericParam::Const { name: n1, ty: t1, variadic: v1 }, GenericParam::Const { name: n2, ty: t2, variadic: v2 }) => {
+            n1 == n2 && fmt_type(t1) == fmt_type(t2) && v1 == v2
         }
         _ => false,
     })

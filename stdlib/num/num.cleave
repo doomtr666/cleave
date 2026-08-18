@@ -39,8 +39,8 @@ algebra Float<T> : Num {}
 // already builds this conversion itself, internally (`to_index`, `arith.
 // index_cast`), invisible to cleave source; a `#[mlir_type(...)]`-backed
 // struct whose own operators are written directly in cleave source (`v[i]`
-// through a real `Index<Container,Elem>` algebra impl, `stdlib/vector/
-// vector.cleave`) needs to build that exact same conversion itself, so it
+// through a real `Index<Container,Elem>` algebra impl, `stdlib/linalg/
+// tensor.cleave`) needs to build that exact same conversion itself, so it
 // needs a real cleave-level name for the destination type — no arithmetic
 // of its own needed on it directly, `Int`'s own marker relationship (no
 // required methods, matching `Num`'s identical "pure marker" shape above)
@@ -111,6 +111,17 @@ algebra Ring<T> {
     derivative add(a, b): add(d(a), d(b));
     derivative sub(a, b): sub(d(a), d(b));
     derivative mul(a, b): add(mul(a, d(b)), mul(d(a), b));
+    // The quotient rule (`d(a/b) = (d(a)*b - a*d(b)) / b^2`) and negation's
+    // own trivial rule (`d(-a) = -d(a)`) — `Ring`'s own remaining two ops,
+    // completing the set alongside `add`/`sub`/`mul` above. Found missing
+    // while chasing a real, separate gap: `sigmoid` (`stdlib/nn/nn.cleave`)
+    // needs `div`'s own derivative to be differentiable at all through
+    // `1.0 / (1.0 + exp(-x))`, and previously had no path to it whatsoever
+    // (its own hand-differentiated closed form lived on `Activation<T>`
+    // instead — see `Transcendental<T>`'s own doc comment below for why
+    // that was the wrong layer).
+    derivative div(a, b): div(sub(mul(d(a), b), mul(a, d(b))), mul(b, b));
+    derivative neg(a): neg(d(a));
 }
 
 // Integer negation has no dedicated `arith` op (unlike float — two's-
@@ -164,6 +175,44 @@ impl Ring<f64> {
     fn mul(a: f64, b: f64) -> f64 { mlir::arith::mulf(a, b) }
     fn div(a: f64, b: f64) -> f64 { mlir::arith::divf(a, b) }
     fn neg(a: f64) -> f64 { mlir::arith::negf(a) }
+}
+
+// Named, individually-differentiable transcendental primitives — `exp`/
+// `tanh` (more added when actually needed, not speculatively: `log`/`sin`/
+// `cos`/... follow the identical shape). `Ring<T>`'s own `add`/`sub`/`mul`/
+// `div`/`neg` already establish the pattern this follows: a `derivative`
+// rule declared right alongside the primitive operation it belongs to, not
+// wherever some downstream consumer happens to need it first.
+//
+// Found via a real, concrete case: `stdlib/nn/nn.cleave`'s own `Activation
+// <T>::tanh` used to carry `tanh`'s own derivative rule directly (`Activation
+// <T> { ... derivative tanh(x): ...; }`) — the wrong layer, an ML-specific
+// algebra owning a fact that's actually about the *math function* tanh on
+// `f32`/`f64`, nothing to do with activations specifically. Worse,
+// `sigmoid` (built from `exp`/`neg`/`div`, all previously either
+// undifferentiated raw `mlir::...` calls or missing their own rule) had no
+// path to a derivative at all short of its own hand-written closed form —
+// moving `exp` here (plus `Ring`'s own now-completed `div`/`neg` rules,
+// just above) means `sigmoid`'s derivative now composes automatically via
+// ordinary chain-rule saturation, the same mechanism that already handles
+// any other multi-primitive expression (`x*x + y*y`), no hand-written
+// `derivative sigmoid` needed at all.
+algebra Transcendental<T> {
+    fn exp(x: T) -> T;
+    fn tanh(x: T) -> T;
+
+    derivative exp(x): mul(exp(x), d(x));
+    derivative tanh(x): mul(sub(1, mul(tanh(x), tanh(x))), d(x));
+}
+
+impl Transcendental<f32> {
+    fn exp(x: f32) -> f32 { mlir::math::exp(x) }
+    fn tanh(x: f32) -> f32 { mlir::math::tanh(x) }
+}
+
+impl Transcendental<f64> {
+    fn exp(x: f64) -> f64 { mlir::math::exp(x) }
+    fn tanh(x: f64) -> f64 { mlir::math::tanh(x) }
 }
 
 // Comparison — same reasoning and shape as `Ring` above. `eq`/`neq` are

@@ -34,7 +34,7 @@
 //! further — see `lower_cexpr`'s own `CExpr::Fix` arm.
 
 use crate::ast::Type as AstType;
-use crate::ast::{Expr, ExprKind, GenericArg, TypeKind};
+use crate::ast::{tuple_struct_name, Expr, ExprKind, GenericArg, TypeKind};
 use crate::cps::{CExpr, CFunDef, CTopLevelFn, CVal, CVar, CpsProgram, PrimOp, StructSchema};
 use crate::infer::{ConstValue, Ty};
 use melior::{
@@ -48,7 +48,7 @@ use melior::{
         attribute::{DenseI32ArrayAttribute, FlatSymbolRefAttribute, FloatAttribute, IntegerAttribute, StringAttribute, TypeAttribute},
         block::BlockLike,
         operation::OperationBuilder,
-        r#type::{FunctionType, IntegerType, MemRefType, RankedTensorType, ShapedTypeLike},
+        r#type::{DimSize, FunctionType, IntegerType, MemRefType, RankedTensorType, ShapedTypeLike},
     },
 };
 use std::cell::RefCell;
@@ -257,7 +257,7 @@ fn native_shape_keyword<'a>(ctx: &'a LowerCtx<'_, '_>, name: &str) -> Option<&'a
 }
 
 /// A struct tagged `#[mlir_type(tensor)]`/`#[mlir_type(vector)]`
-/// (`stdlib/vector/vector.cleave`'s own `Vector<T,N>`/`Matrix<T,R,C>`) —
+/// (`stdlib/linalg/tensor.cleave`'s own `Vector<T,N>`/`Matrix<T,R,C>`) —
 /// unlike every other struct (`struct_llvm_type`'s own "stable reference,
 /// mutated in place" doc comment), this one's real MLIR representation is a
 /// native shaped-type SSA *value*, never a heap-allocated opaque pointer.
@@ -362,8 +362,50 @@ fn struct_field_types(ctx: &LowerCtx<'_, '_>, name: &str, type_args: &[Ty]) -> V
     let Some(schema) = ctx.struct_schemas.get(name) else {
         panic!("MLIR lowering: no struct declaration found for `{name}`");
     };
-    let mapping: HashMap<String, Ty> = schema.generics.iter().cloned().zip(type_args.iter().cloned()).collect();
-    schema.fields.iter().map(|(field_name, field_ast_ty)| (field_name.clone(), resolve_struct_field_ty(field_ast_ty, &mapping))).collect()
+    // A pack-generic struct (`doc/backlog.md`'s own "Variadic generics"
+    // item) needs a genuinely different zip: every non-pack generic 1:1
+    // against `type_args`, then *everything remaining* belongs to the
+    // pack — `Ty::App`'s own type-args list is already fully flat either
+    // way (`Box3<f64,3,4,5>`'s own `[f64,3,4,5]`, no separate "this part is
+    // a pack" marker needed there at all, exactly as many entries as the
+    // construction site's own turbofish supplied — see `infer.rs::infer_
+    // struct_lit_with_pack`'s own doc comment for where that list was
+    // built).
+    if schema.has_pack {
+        let non_pack = &schema.generics[..schema.generics.len() - 1];
+        let pack_name = schema.generics.last().expect("has_pack implies at least one generic");
+        let mapping: HashMap<String, Ty> = non_pack.iter().cloned().zip(type_args.iter().cloned()).collect();
+        let pack_tys = &type_args[non_pack.len().min(type_args.len())..];
+        schema
+            .fields
+            .iter()
+            .map(|(field_name, field_ast_ty)| (field_name.clone(), resolve_struct_field_ty_with_pack(field_ast_ty, &mapping, pack_name, pack_tys)))
+            .collect()
+    } else {
+        let mapping: HashMap<String, Ty> = schema.generics.iter().cloned().zip(type_args.iter().cloned()).collect();
+        schema.fields.iter().map(|(field_name, field_ast_ty)| (field_name.clone(), resolve_struct_field_ty(field_ast_ty, &mapping))).collect()
+    }
+}
+
+/// The pack-aware counterpart to `resolve_struct_field_ty` — identical for
+/// every ordinary shape (delegated to directly), plus the same two pack
+/// positions `infer.rs::ty_from_ast_mapped_with_pack` already handles at
+/// type-checking time: a whole array-dimension list (`[T; Dims...]`,
+/// expands to nested `Ty::Array` levels) or a whole field type (`Args...`,
+/// becomes the tuple formed from `pack_tys`). Shallow, deliberately, same
+/// reasoning as its `infer.rs` counterpart's own doc comment.
+fn resolve_struct_field_ty_with_pack(ty: &AstType, mapping: &HashMap<String, Ty>, pack_name: &str, pack_tys: &[Ty]) -> Ty {
+    match &ty.kind {
+        TypeKind::Array(elem, size) if matches!(&size.kind, ExprKind::PackRef(n) if n == pack_name) => {
+            let elem_ty = resolve_struct_field_ty(elem, mapping);
+            pack_tys.iter().rev().fold(elem_ty, |acc, dim| Ty::Array(Box::new(acc), Box::new(dim.clone())))
+        }
+        TypeKind::PackRef(name) if name == pack_name => {
+            let tuple_name = tuple_struct_name(pack_tys.len());
+            if pack_tys.is_empty() { Ty::Con(tuple_name) } else { Ty::App(tuple_name, pack_tys.to_vec()) }
+        }
+        _ => resolve_struct_field_ty(ty, mapping),
+    }
 }
 
 /// A small, standalone counterpart to `infer.rs`'s own `ty_from_ast_mapped`
@@ -399,6 +441,11 @@ fn resolve_struct_field_ty(ty: &AstType, mapping: &HashMap<String, Ty>) -> Ty {
             Ty::Array(Box::new(resolve_struct_field_ty(elem, mapping)), Box::new(resolve_struct_field_const(size, mapping)))
         }
         TypeKind::Fn(..) => panic!("MLIR lowering doesn't support a function-typed struct field yet"),
+        // `doc/backlog.md`'s own "Variadic generics" item -- grammar/AST
+        // exist (Milestone 1), nothing resolves a pack to a concrete list
+        // yet, so a struct field can never legitimately still be one by the
+        // time a fully type-checked program reaches MLIR lowering.
+        TypeKind::PackRef(name) => panic!("MLIR lowering: unresolved pack reference `{name}...` reached a struct field's own type -- variadic generics aren't semantically supported yet"),
     }
 }
 
@@ -1243,6 +1290,23 @@ fn lower_array_load<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, env: &HashMap
             args[1..].iter().map(|a| to_index(ctx, block, lower_cval(ctx.context, block, env, a, i32_ty))).collect();
         let load_op = block.append_operation(memref::load(array_val, &index_vals, location));
         load_op.result(0).unwrap().into()
+    } else if array_val.r#type().is_tensor() {
+        // A `#[mlir_type(tensor)]`-tagged struct's own field, read back
+        // through `lower_field_access`'s identity path — a bare native
+        // `tensor<...>` SSA value, never a memref or `!llvm.ptr`. `tensor.
+        // extract` is the read-only, purely functional equivalent of
+        // `memref.load` for this representation.
+        let (_, leaf_ty) = flatten_array_dims(array_ty);
+        let index_vals: Vec<Value> =
+            args[1..].iter().map(|a| to_index(ctx, block, lower_cval(ctx.context, block, env, a, i32_ty))).collect();
+        let result_ty = ty_to_mlir(ctx, leaf_ty);
+        let built = OperationBuilder::new("tensor.extract", location)
+            .add_operands(&[array_val])
+            .add_operands(&index_vals)
+            .add_results(&[result_ty])
+            .build()
+            .unwrap_or_else(|e| panic!("MLIR lowering: failed to build tensor.extract: {e}"));
+        block.append_operation(built).result(0).unwrap().into()
     } else {
         let (_, leaf_ty) = flatten_array_dims(array_ty);
         let array_llvm_ty = ty_to_llvm_field_type(ctx, array_ty);
@@ -1272,7 +1336,15 @@ fn lower_array_store<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, env: &HashMa
     };
     let i32_ty = width_ty(ctx, "i32");
     let location = Location::unknown(ctx.context);
-    if array_val.r#type().is_mem_ref() {
+    if array_val.r#type().is_tensor() {
+        // See `lower_array_load`'s identical check: a native `tensor<...>`
+        // SSA value is purely functional (`tensor.insert` would produce a
+        // *new* value, not mutate this one in place) and nothing here
+        // rebinds the CPS variable this array came from to that new value
+        // — out of scope for now, panics clearly rather than silently
+        // discarding the write.
+        panic!("MLIR lowering: index-assignment into a `#[mlir_type(...)]`-tagged native value isn't supported yet");
+    } else if array_val.r#type().is_mem_ref() {
         let elem_ty = MemRefType::try_from(array_val.r#type())
             .unwrap_or_else(|_| panic!("MLIR lowering: `store`'s own array operand isn't a memref"))
             .element();
@@ -1470,6 +1542,11 @@ fn lower_field_store<'c>(
     };
     let base_val = *env.get(base_var).unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{base_var}"));
     let (name, type_args) = struct_name_and_args(struct_ty);
+    // See `lower_field_access`'s identical check: a tag-tensor struct has no
+    // address of its own to store into at all.
+    if native_shape_keyword(ctx, name).is_some() {
+        panic!("MLIR lowering: `{name}` is a `#[mlir_type(...)]`-tagged native value, its own field can't be mutated in place");
+    }
     let field_types = struct_field_types(ctx, name, type_args);
     let position = field_types
         .iter()
@@ -1507,6 +1584,14 @@ fn lower_field_access<'c>(
     };
     let base_val = *env.get(base_var).unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{base_var}"));
     let (name, type_args) = struct_name_and_args(struct_ty);
+    // A `#[mlir_type(tensor)]`/`#[mlir_type(vector)]`-tagged struct has no
+    // `!llvm.struct` storage at all (`lower_tagged_struct_construct`'s own
+    // doc comment) — its sole field (enforced array-typed, exactly one, by
+    // `tagged_struct_native_type`) *is* the struct's own native SSA value,
+    // so accessing it is a bare identity, never a real GEP into anything.
+    if native_shape_keyword(ctx, name).is_some() {
+        return base_val;
+    }
     let field_types = struct_field_types(ctx, name, type_args);
     let position = field_types
         .iter()
@@ -1845,7 +1930,10 @@ fn copy_nested_array<'c>(
 /// (`ExprKind::Call::mlir_attrs`, carried through unchanged: attribute name
 /// -> raw MLIR attribute text, parsed here via `Attribute::parse`). No
 /// per-op-name Rust knowledge anywhere — matches `doc/hld.md`'s own "one
-/// generic 'emit this named MLIR op' primitive" goal directly.
+/// generic 'emit this named MLIR op' primitive" goal directly, with one
+/// deliberate exception (`tensor.extract`'s own variadic-index-array form,
+/// checked first, see below) alongside the pre-existing `linalg.` one
+/// (`build_linalg_region`'s own doc comment).
 ///
 /// Positional arguments need *some* expected MLIR type to materialize a
 /// bare literal against (`mlir::arith::addi(0, x)`) — since there's no
@@ -1853,6 +1941,47 @@ fn copy_nested_array<'c>(
 /// (`CVal::Var`) sibling operand's own MLIR type (`Value::r#type`, always
 /// available once lowered), falling back to the op's own declared result
 /// type for the (rarer) all-literal case.
+/// `tensor.extract`'s own variadic-index-array form — see `lower_raw_mlir_
+/// op`'s own doc comment for why this exists. `idx_val`'s own static length
+/// (`ShapedTypeLike::dim_size`, always static — cleave has no dynamically-
+/// sized arrays) is read directly off its already-lowered `memref` type,
+/// each element loaded out via an ordinary `memref.load` (constant index,
+/// fully unrolled, same shape `flatten_memref_elements` already uses) and
+/// cast to `index` (`to_index`, the type every real `tensor.extract`/
+/// `tensor.insert` index operand needs, `i32`'s own array element type
+/// otherwise mismatching it).
+fn lower_tensor_extract_spread<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    tensor_val: Value<'c, 'c>,
+    idx_array_val: Value<'c, 'c>,
+    result_ty: Type<'c>,
+) -> Value<'c, 'c> {
+    let context = ctx.context;
+    let location = Location::unknown(context);
+    let memref_ty = MemRefType::try_from(idx_array_val.r#type())
+        .unwrap_or_else(|e| panic!("MLIR lowering: `tensor.extract`'s own index-array argument isn't a memref: {e}"));
+    let DimSize::Static(k) = memref_ty
+        .dim_size(0)
+        .unwrap_or_else(|e| panic!("MLIR lowering: `tensor.extract`'s own index-array argument has no dimension 0: {e}"))
+    else {
+        panic!("MLIR lowering: `tensor.extract`'s own index-array argument must have a static length");
+    };
+    let mut operands = vec![tensor_val];
+    for i in 0..k as i64 {
+        let idx = const_index(ctx, block, i);
+        let load_op = block.append_operation(memref::load(idx_array_val, &[idx], location));
+        let scalar: Value = load_op.result(0).unwrap().into();
+        operands.push(to_index(ctx, block, scalar));
+    }
+    let built = OperationBuilder::new("tensor.extract", location)
+        .add_operands(&operands)
+        .add_results(&[result_ty])
+        .build()
+        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build tensor.extract: {e}"));
+    block.append_operation(built).result(0).unwrap().into()
+}
+
 fn lower_raw_mlir_op<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
@@ -1862,6 +1991,33 @@ fn lower_raw_mlir_op<'c>(
     args: &[CVal],
     result_ty: Type<'c>,
 ) -> Value<'c, 'c> {
+    // `tensor.extract`'s own real MLIR arity is "one index operand per
+    // tensor dimension" — fine for a fixed rank (`Index<Vector<T,N>,T>`'s
+    // own `mlir::tensor::extract(v, i0)`, still handled by the fully
+    // generic path below, untouched), but a *pack*-generic `Index` impl
+    // (`Index<Tensor<T,Dims...>,T>`) only knows its own rank once
+    // monomorphized, and needs to pass however many indices that turns out
+    // to be — packed into one `idx: [i32; Dims.len()]` array parameter,
+    // never spread at the cleave call site (no general pack-expansion
+    // syntax exists, deliberately — see `doc/backlog.md`'s own note). This
+    // reads that array's own already-known static length straight off its
+    // already-lowered `memref` type and splices its elements in as the
+    // real op's own separate index operands — the same shape `lower_
+    // tagged_struct_construct` already uses for `tensor.from_elements`
+    // (read every element out of an array value, feed them to an op
+    // builder), just applied to `tensor.extract` too. Only fires when the
+    // call's own second argument is genuinely array-typed (`i0: i32` isn't
+    // a memref, so `Index<Vector<T,N>,T>`'s own existing call shape falls
+    // straight through to the generic path below, unchanged).
+    if op == "tensor.extract" {
+        if let [CVal::Var(base_var), CVal::Var(idx_var)] = args {
+            if let (Some(&base_val), Some(&idx_val)) = (env.get(base_var), env.get(idx_var)) {
+                if idx_val.r#type().is_mem_ref() {
+                    return lower_tensor_extract_spread(ctx, block, base_val, idx_val, result_ty);
+                }
+            }
+        }
+    }
     let context = ctx.context;
     let operand_ty = args
         .iter()

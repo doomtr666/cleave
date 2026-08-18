@@ -4,12 +4,12 @@
 // triangulation). Built entirely as an ordinary generic struct + algebra
 // impls + a handful of `cleave-rt` extern fns (`cleave-rt/src/lib.rs`'s own
 // `dynarray_*` functions) — the identical "no new `Ty::Vector`-style
-// compiler variant" discipline `stdlib/vector/vector.cleave`'s own top
+// compiler variant" discipline `stdlib/linalg/tensor.cleave`'s own top
 // comment already documents (that file's own earlier version *was* a
 // hardcoded `Ty::Vector`, reverted for exactly this reason). `use dynarray;`
 // explicitly — not prelude, matching `io`/`vector`/`complex`'s own
 // precedent: a program that never constructs one sees zero change.
-use vector; // `Index<Container, Elem, K>` — declared there, reused below.
+use linalg; // `Index<Container, Elem, K>` — declared there, reused below.
 
 // A real, opaque, nominal handle type for the raw heap buffer backing a
 // `DynArray<T>` — zero fields, never constructed via `RawBuf(...)` anywhere
@@ -36,7 +36,7 @@ struct RawBuf {}
 // a generic `sizeof<T>()` mechanism (none exists). `get`/`set` are a plain,
 // unchecked pointer-offset read/write — no bounds checking, matching this
 // codebase's already-established "no runtime memory-safety enforcement"
-// posture (`stdlib/vector/vector.cleave`'s own `Index` impls, a dynamic
+// posture (`stdlib/linalg/tensor.cleave`'s own `Index` impls, a dynamic
 // index into a real array, have none either).
 algebra RawBuffer<T> {
     fn alloc(cap: i32) -> RawBuf;
@@ -137,8 +137,8 @@ impl<T> struct DynArray<T> {
 }
 
 // `v[i]` (read) — reuses `vector`'s own `Index<Container, Elem, K>` fallback
-// dispatch, the exact mechanism `Vector`/`Matrix`/`Tensor` already use for
-// their own non-array element access. Deliberately read-only: `v[i] = x`
+// dispatch, the exact mechanism `Tensor` already uses for its own non-array
+// element access. Deliberately read-only: `v[i] = x`
 // write syntax is not attempted here — `infer.rs`'s own `StmtKind::Assign`
 // guard rejects a non-array `Index` assignment target outright today (added
 // so a tensor-backed value, immutable by construction, can't be silently

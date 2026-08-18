@@ -101,6 +101,60 @@ use std::collections::{HashMap, HashSet};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ty {
     Var(TyVar),
+    /// A still-*symbolic* pack (`doc/backlog.md`'s own "Variadic generics"
+    /// item) — the "however many" counterpart to `Var`'s own "one, not yet
+    /// known": `Tensor<T, const Dims...: i32>`'s own declaration-time
+    /// target pattern is `App("Tensor", [Var(t), Pack(dims)])`, meant to
+    /// unify against a call site's `App("Tensor", [Con("f64"), Const(3),
+    /// Const(4), Const(5)])` by matching `t` normally and letting `dims`
+    /// absorb *everything remaining* (`[3,4,5]`), whatever that count turns
+    /// out to be — `unify`'s own `(App, App)` arm is the only place that
+    /// actually does this. Resolves through `Subst`'s own *ordinary*
+    /// `bindings` table, exactly like `Var` does (`Subst::bind_pack` just
+    /// binds `v -> PackResolved(elems)`, see that variant's own doc
+    /// comment for why this — not a separate `TyVar -> Vec<Ty>` table —
+    /// turned out to be the right call: it's what lets `monomorphize.rs`'s
+    /// own already-existing "read every free var back via `apply(&Ty::
+    /// Var(v))`" machinery, and `substitute`'s own 17 existing call sites,
+    /// need zero signature changes to become pack-aware). Embedded as an
+    /// ordinary node inside `App`'s own args list (never a separate field
+    /// on `Scheme`/`ImplTemplate`) so the *existing* `free_vars`-driven
+    /// `generalize`/`instantiate` machinery quantifies a pack var for free,
+    /// the same way it already does for an ordinary nested `Var`.
+    Pack(TyVar),
+    /// A *resolved* pack's own concrete elements (`Tensor<f64,3,4,5>`'s own
+    /// `Dims` resolving to `[Const(3),Const(4),Const(5)]`) — never built
+    /// directly by ordinary code, only ever produced by `unify`'s own
+    /// pack-aware `(App, App)` arm binding a `Ty::Pack(v)` (`Subst::
+    /// bind_pack`), and consumed by `Subst::apply`/`substitute`'s own
+    /// `App` arms, which *splice* it into the enclosing `App`'s own args
+    /// list rather than keeping it as one nested element — the same
+    /// "however many, flattened in place" shape `Ty::App`'s own arg list
+    /// already has for an *ordinary*, non-pack instantiation (`Tensor<f64,
+    /// 3,4,5>`'s own `type_args` is just `[f64,3,4,5]`, four flat entries,
+    /// no marker anywhere saying "the last three came from a pack" — this
+    /// variant only exists transiently, while a pack var's own binding is
+    /// being read back or spliced, never as part of a "finished," fully-
+    /// substituted `Ty::App`'s own args). A bare, unspliced `PackResolved`
+    /// reaching anywhere else (MLIR lowering, `Display`, ...) is a real
+    /// bug, not a shape those consumers need to understand — every one of
+    /// them treats it as "not fully concrete yet"/an unreachable case,
+    /// mirroring how a stray `Ty::Var` reaching codegen already is.
+    PackResolved(Vec<Ty>),
+    /// A pack's own *length*, as a const-generic value (`Dims.len()`,
+    /// `doc/backlog.md`'s own "Variadic generics" item — needed to declare
+    /// e.g. `Index<Tensor<T,Dims...>,T>::index`'s own `idx: [i32;
+    /// Dims.len()]` parameter, since `K` there has to match whatever rank
+    /// `Dims` turns out to be, not a fixed literal). Symbolic exactly like
+    /// `Ty::ConstExpr` — folds to a real `Ty::Const(Int(n))` the moment the
+    /// underlying pack var resolves (`Subst::apply`/`substitute`, mirroring
+    /// `fold_const_expr`'s own "fold when concrete, stay symbolic
+    /// otherwise" shape), never resolved eagerly here. Built only by
+    /// recognizing the surface shape `<pack-name>.len()` — an ordinary
+    /// zero-arg `ExprKind::MethodCall` whose base names an in-scope pack
+    /// generic — no new grammar or AST node needed at all: `[i32; Dims.len()]`
+    /// already parses as an ordinary array-dimension `expr` today.
+    PackLen(TyVar),
     Con(String),
     /// A generic type applied to its own type arguments, *in the generic
     /// struct/algebra's own declaration order* — `Complex<T>` is
@@ -238,8 +292,42 @@ impl Subst {
                 Some(next) => self.apply(next),
                 None => ty.clone(),
             },
+            // Resolves through the same `bindings` table an ordinary `Var`
+            // does (`Subst::bind_pack` binds `v -> PackResolved(elems)`) —
+            // still symbolic (unbound) is left as-is, same idle state a
+            // still-open `Var` has.
+            Ty::Pack(v) => match self.bindings.get(v) {
+                Some(next) => self.apply(next),
+                None => ty.clone(),
+            },
+            // Only ever meaningful *inside* an enclosing `App`'s own args
+            // list, which splices these elements in place rather than
+            // keeping this as one nested element (see the `App` arm just
+            // below, and this variant's own doc comment) — re-applies each
+            // element for freshness, same reasoning as `Var`'s own chain-
+            // following. Reachable bare here only via `apply`'s own direct
+            // recursion from that `App` arm, never as a genuinely top-level
+            // query.
+            Ty::PackResolved(elems) => Ty::PackResolved(elems.iter().map(|e| self.apply(e)).collect()),
+            // Folds the moment the underlying pack var resolves — reuses
+            // `Ty::Pack`'s own chase above rather than looking `v` up in
+            // `bindings` a second, separate way, so it agrees exactly with
+            // what `apply(&Ty::Pack(v))` would report.
+            Ty::PackLen(v) => match self.apply(&Ty::Pack(*v)) {
+                Ty::PackResolved(elems) => Ty::Const(ConstValue::Int(elems.len() as u64)),
+                _ => ty.clone(),
+            },
             Ty::Con(_) | Ty::Const(_) => ty.clone(),
-            Ty::App(name, args) => Ty::App(name.clone(), args.iter().map(|a| self.apply(a)).collect()),
+            Ty::App(name, args) => {
+                let mut out = Vec::with_capacity(args.len());
+                for a in args {
+                    match self.apply(a) {
+                        Ty::PackResolved(elems) => out.extend(elems),
+                        other => out.push(other),
+                    }
+                }
+                Ty::App(name.clone(), out)
+            }
             Ty::Fn(params, ret) => {
                 Ty::Fn(params.iter().map(|p| self.apply(p)).collect(), Box::new(self.apply(ret)))
             }
@@ -320,6 +408,15 @@ impl Subst {
         self.const_widths.insert(v, width);
     }
 
+    /// Binds `v` to its own resolved pack elements — through the *ordinary*
+    /// `bindings` table (`Ty::Pack`'s own doc comment explains why this,
+    /// not a separate `TyVar -> Vec<Ty>` side table, turned out to be the
+    /// right call). `apply(&Ty::Var(v))`/`apply(&Ty::Pack(v))` both read it
+    /// straight back via the same lookup an ordinary binding already uses.
+    fn bind_pack(&mut self, v: TyVar, elems: Vec<Ty>) {
+        self.bind(v, Ty::PackResolved(elems));
+    }
+
     /// Must recurse into `Fn`'s components — a variable can occur *inside* a
     /// function type (`'a = ('a) -> Int`) just as easily as anywhere else;
     /// missing that recursion here would silently defeat the whole point of
@@ -327,6 +424,13 @@ impl Subst {
     fn occurs(&self, v: TyVar, ty: &Ty) -> bool {
         match self.apply(ty) {
             Ty::Var(v2) => v == v2,
+            // A pack var can't occur *inside* another type the way an
+            // ordinary var can (it only ever appears as a direct `App`
+            // argument, never nested one level deeper by construction) —
+            // equality is the whole check, mirroring `Var`'s own arm.
+            Ty::Pack(v2) => v == v2,
+            Ty::PackResolved(elems) => elems.iter().any(|e| self.occurs(v, e)),
+            Ty::PackLen(v2) => v == v2,
             Ty::Con(_) | Ty::Const(_) => false,
             Ty::App(_, args) => args.iter().any(|a| self.occurs(v, a)),
             Ty::Fn(params, ret) => params.iter().any(|p| self.occurs(v, p)) || self.occurs(v, &ret),
@@ -350,6 +454,11 @@ impl std::fmt::Display for Ty {
         match self {
             Ty::Con(name) => write!(f, "{name}"),
             Ty::Var(TyVar(id)) => write!(f, "'t{id}"),
+            Ty::Pack(TyVar(id)) => write!(f, "'t{id}..."),
+            Ty::PackResolved(elems) => {
+                write!(f, "{}", elems.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "))
+            }
+            Ty::PackLen(TyVar(id)) => write!(f, "'t{id}...len()"),
             Ty::App(name, args) => {
                 let args = args.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ");
                 write!(f, "{name}<{args}>")
@@ -449,11 +558,69 @@ pub fn unify(subst: &mut Subst, a: &Ty, b: &Ty) -> Result<(), UnifyError> {
             }
             unify(subst, r1, r2)
         }
-        (Ty::App(n1, a1), Ty::App(n2, a2)) if n1 == n2 && a1.len() == a2.len() => {
-            for (x, y) in a1.iter().zip(a2) {
-                unify(subst, x, y)?;
+        // `doc/backlog.md`'s own "Variadic generics" item: same name
+        // required exactly as before, but arity is no longer required to
+        // match exactly — if one side's own args end in a still-open
+        // `Ty::Pack` (already `subst.apply`'d above, so a *resolved* pack
+        // would already have been spliced flat into this very list, never
+        // reaching this match as a bare `Pack` at all), the non-pack
+        // prefix unifies pairwise as usual and the pack absorbs whatever
+        // the *other* side has left over, however many that turns out to
+        // be. Neither side ending in an open pack is byte-for-byte the
+        // original behavior (guarded, not just reasoned about — see the
+        // `a1.len() != a2.len()` check inside the `(None, None)` arm,
+        // still a real, immediate `Mismatch`). Both sides ending in an
+        // open pack (two still-symbolic declarations meeting each other)
+        // is deliberately out of scope for this pass — falls through to
+        // `Mismatch`, a known, flagged gap, not silently wrong.
+        (Ty::App(n1, a1), Ty::App(n2, a2)) if n1 == n2 => {
+            let trailing_pack = |args: &[Ty]| match args.last() {
+                Some(Ty::Pack(v)) => Some(*v),
+                _ => None,
+            };
+            match (trailing_pack(a1), trailing_pack(a2)) {
+                (None, None) => {
+                    if a1.len() != a2.len() {
+                        return Err(UnifyError::Mismatch(a.clone(), b.clone()));
+                    }
+                    for (x, y) in a1.iter().zip(a2) {
+                        unify(subst, x, y)?;
+                    }
+                    Ok(())
+                }
+                (Some(v1), Some(v2)) if v1 == v2 => {
+                    if a1.len() != a2.len() {
+                        return Err(UnifyError::Mismatch(a.clone(), b.clone()));
+                    }
+                    for (x, y) in a1[..a1.len() - 1].iter().zip(&a2[..a2.len() - 1]) {
+                        unify(subst, x, y)?;
+                    }
+                    Ok(())
+                }
+                (Some(_), Some(_)) => Err(UnifyError::Mismatch(a.clone(), b.clone())),
+                (Some(v), None) => {
+                    let prefix_len = a1.len() - 1;
+                    if a2.len() < prefix_len {
+                        return Err(UnifyError::Mismatch(a.clone(), b.clone()));
+                    }
+                    for (x, y) in a1[..prefix_len].iter().zip(&a2[..prefix_len]) {
+                        unify(subst, x, y)?;
+                    }
+                    subst.bind_pack(v, a2[prefix_len..].to_vec());
+                    Ok(())
+                }
+                (None, Some(v)) => {
+                    let prefix_len = a2.len() - 1;
+                    if a1.len() < prefix_len {
+                        return Err(UnifyError::Mismatch(a.clone(), b.clone()));
+                    }
+                    for (x, y) in a1[..prefix_len].iter().zip(&a2[..prefix_len]) {
+                        unify(subst, x, y)?;
+                    }
+                    subst.bind_pack(v, a1[prefix_len..].to_vec());
+                    Ok(())
+                }
             }
-            Ok(())
         }
         (Ty::Array(e1, s1), Ty::Array(e2, s2)) => {
             unify(subst, e1, e2)?;
@@ -629,6 +796,14 @@ pub enum TypeErrorKind {
     /// deferred rather than an immediate error at `const_value_from_expr`'s
     /// own call site.
     ConstDivByZero { dividend: u64 },
+    /// Constructing a struct whose own last declared generic is a *pack*
+    /// (`doc/backlog.md`'s own "Variadic generics" item, `Tensor<T, const
+    /// Dims: i32...>`) without an explicit turbofish supplying at least as
+    /// many arguments as there are non-pack generics — a genuine, deliberate
+    /// v1 restriction: inferring a pack's own arity purely from field values
+    /// (the way an ordinary, single-slot generic already can) isn't
+    /// supported yet, only turbofish-driven resolution is.
+    VariadicStructNeedsTurbofish { struct_name: String, min_generics: usize },
 }
 
 impl std::fmt::Display for TypeErrorKind {
@@ -713,6 +888,12 @@ impl std::fmt::Display for TypeErrorKind {
                 write!(f, "`algebra {algebra}` has no method `{method}` at this arity")
             }
             TypeErrorKind::BreakOutsideLoop => write!(f, "`break` outside a loop"),
+            TypeErrorKind::VariadicStructNeedsTurbofish { struct_name, min_generics } => {
+                write!(
+                    f,
+                    "`{struct_name}` has a variadic generic — constructing it needs an explicit turbofish with at least {min_generics} argument(s) (e.g. `{struct_name}::<...>(...)`); inferring a pack's own arity from field values isn't supported yet"
+                )
+            }
         }
     }
 }
@@ -829,6 +1010,23 @@ pub(crate) fn free_vars(ty: &Ty, out: &mut HashSet<TyVar>) {
         Ty::Var(v) => {
             out.insert(*v);
         }
+        // Quantified exactly like an ordinary `Var` — this is the whole
+        // reason `Ty::Pack` is embedded as an ordinary `App` argument
+        // rather than a separate field on `Scheme`: `generalize`'s own
+        // free-var scan (which calls this) picks a pack var up for free the
+        // moment it appears anywhere inside a declaration's own pattern, no
+        // separate pack-tracking mechanism needed on `Scheme` itself.
+        Ty::Pack(v) => {
+            out.insert(*v);
+        }
+        Ty::PackResolved(elems) => {
+            for e in elems {
+                free_vars(e, out);
+            }
+        }
+        Ty::PackLen(v) => {
+            out.insert(*v);
+        }
         Ty::Con(_) | Ty::Const(_) => {}
         Ty::App(_, args) => {
             for a in args {
@@ -852,11 +1050,40 @@ pub(crate) fn free_vars(ty: &Ty, out: &mut HashSet<TyVar>) {
     }
 }
 
+/// The `monomorphize.rs` counterpart to `Subst::apply` — a standalone
+/// function rather than a `Subst` method since its callers hold a bare
+/// `HashMap<TyVar, Ty>` (a template's own concrete instantiation values),
+/// not a full `Subst`. A pack var's own resolved binding lives in `mapping`
+/// the exact same way an ordinary var's does (`Ty::PackResolved(elems)`,
+/// not a separate list-valued table — see `Ty::Pack`'s own doc comment for
+/// why), so this lookup needs no special-casing to find it; only the
+/// *consumer* (`App`'s own arm, just below) needs to know to splice a
+/// `PackResolved` result instead of nesting it.
 pub(crate) fn substitute(ty: &Ty, mapping: &HashMap<TyVar, Ty>) -> Ty {
     match ty {
-        Ty::Var(v) => mapping.get(v).cloned().unwrap_or_else(|| ty.clone()),
+        Ty::Var(v) | Ty::Pack(v) => mapping.get(v).cloned().unwrap_or_else(|| ty.clone()),
+        // Only ever meaningful spliced into an enclosing `App`'s own args
+        // list (the arm just below) — reachable bare here only via this
+        // function's own direct recursion from that arm.
+        Ty::PackResolved(elems) => Ty::PackResolved(elems.iter().map(|e| substitute(e, mapping)).collect()),
+        // Mirrors `Subst::apply`'s own `Ty::PackLen` arm — folds to a real
+        // `Const` the moment `mapping` has the underlying pack var's own
+        // resolved binding, stays symbolic otherwise.
+        Ty::PackLen(v) => match mapping.get(v).cloned().map(|t| substitute(&t, mapping)) {
+            Some(Ty::PackResolved(elems)) => Ty::Const(ConstValue::Int(elems.len() as u64)),
+            _ => ty.clone(),
+        },
         Ty::Con(_) | Ty::Const(_) => ty.clone(),
-        Ty::App(name, args) => Ty::App(name.clone(), args.iter().map(|a| substitute(a, mapping)).collect()),
+        Ty::App(name, args) => {
+            let mut out = Vec::with_capacity(args.len());
+            for a in args {
+                match substitute(a, mapping) {
+                    Ty::PackResolved(elems) => out.extend(elems),
+                    other => out.push(other),
+                }
+            }
+            Ty::App(name.clone(), out)
+        }
         Ty::Fn(params, ret) => {
             Ty::Fn(params.iter().map(|p| substitute(p, mapping)).collect(), Box::new(substitute(ret, mapping)))
         }
@@ -935,6 +1162,18 @@ fn is_placeholder(ty: &Ty) -> bool {
 fn is_fully_concrete(ty: &Ty) -> bool {
     match ty {
         Ty::Var(_) => false,
+        // A still-unresolved pack is exactly as "not concrete yet" as an
+        // ordinary open `Var` — a bound one never reaches here as `Pack`
+        // at all (`Subst::apply`/`substitute` already splice a resolved
+        // pack's own elements into the enclosing `App` before this ever
+        // sees it).
+        Ty::Pack(_) => false,
+        // Concrete iff every one of its own elements is — mirrors `App`'s
+        // own identical arm just below.
+        Ty::PackResolved(elems) => elems.iter().all(is_fully_concrete),
+        // Same "not concrete yet" treatment as `Ty::Pack` — a resolved one
+        // already folded to `Ty::Const` before reaching here.
+        Ty::PackLen(_) => false,
         Ty::Con(_) | Ty::Const(_) => true,
         Ty::App(_, args) => args.iter().all(is_fully_concrete),
         Ty::Fn(params, ret) => params.iter().all(is_fully_concrete) && is_fully_concrete(ret),
@@ -954,7 +1193,8 @@ fn is_fully_concrete(ty: &Ty) -> bool {
 pub(crate) fn find_placeholder_name(ty: &Ty) -> Option<String> {
     match ty {
         Ty::Con(name) if name.starts_with('<') => Some(name.clone()),
-        Ty::Con(_) | Ty::Var(_) | Ty::Const(_) => None,
+        Ty::Con(_) | Ty::Var(_) | Ty::Const(_) | Ty::Pack(_) | Ty::PackLen(_) => None,
+        Ty::PackResolved(elems) => elems.iter().find_map(find_placeholder_name),
         Ty::App(_, args) => args.iter().find_map(find_placeholder_name),
         Ty::Fn(params, ret) => params.iter().find_map(find_placeholder_name).or_else(|| find_placeholder_name(ret)),
         Ty::Array(elem, size) => find_placeholder_name(elem).or_else(|| find_placeholder_name(size)),
@@ -1032,7 +1272,7 @@ fn check_mutability_block(block: &Block, scope: &HashMap<String, bool>) -> Resul
 
 fn check_mutability_expr(expr: &Expr, scope: &HashMap<String, bool>) -> Result<(), TypeError> {
     match &expr.kind {
-        ExprKind::NumberLit { .. } | ExprKind::ImaginaryLit { .. } | ExprKind::BoolLit(_) | ExprKind::Path(_) => Ok(()),
+        ExprKind::NumberLit { .. } | ExprKind::ImaginaryLit { .. } | ExprKind::BoolLit(_) | ExprKind::Path(_) | ExprKind::PackRef(_) => Ok(()),
         ExprKind::Call(_, _, args, ..) => args.iter().try_for_each(|a| check_mutability_expr(a, scope)),
         ExprKind::FieldAccess(base, _) => check_mutability_expr(base, scope),
         ExprKind::MethodCall(base, _, args) => {
@@ -1476,13 +1716,13 @@ impl<'r> Infer<'r> {
         let mapping = self.fresh_vars_for_generics(generics);
         for g in generics {
             match g {
-                GenericParam::Type { name, bounds } => {
+                GenericParam::Type { name, bounds, .. } => {
                     let ty = mapping[name].clone();
                     for bound in bounds {
                         self.constraints.push(Constraint::all_gating(bound.clone(), vec![ty.clone()], span));
                     }
                 }
-                GenericParam::Const { name, ty } => {
+                GenericParam::Const { name, ty, .. } => {
                     let width = self.ty_from_ast_mapped(ty, &mapping);
                     if let Ty::Var(v) = &mapping[name] {
                         self.subst.set_const_width(*v, width);
@@ -1491,6 +1731,107 @@ impl<'r> Infer<'r> {
             }
         }
         mapping
+    }
+
+    /// The pack-aware counterpart to `ExprKind::StructLit`'s own ordinary
+    /// construction path, taken when `struct_generics`'s own last entry is
+    /// a pack (`doc/backlog.md`'s own "Variadic generics" item —
+    /// `Tensor<T, const Dims: i32...>`'s own motivating case). A pack can't
+    /// be squeezed into the ordinary `HashMap<String, Ty>` mapping every
+    /// other generic-resolution path here uses (one name resolves to
+    /// *several* types, not one) — resolved as a separate `Vec<Ty>`
+    /// instead, positional against the turbofish's own trailing arguments.
+    ///
+    /// **Turbofish-driven only, deliberately, for this first cut**: a
+    /// pack's own arity has no other source to infer it from — an ordinary
+    /// generic can fall back on "whatever type the field value turns out to
+    /// be," but nothing about a field's own *value* tells you how many
+    /// *dimensions* a pack expanded to (`[T; Dims...]`'s own field value is
+    /// one already-flat, already-nested array, not obviously "3 dims" vs.
+    /// "a differently-shaped 2 dims" from its type alone without deeper
+    /// unification machinery this cut doesn't build). `TypeErrorKind::
+    /// VariadicStructNeedsTurbofish` if the turbofish is missing or too
+    /// short.
+    #[allow(clippy::too_many_arguments)]
+    fn infer_struct_lit_with_pack(
+        &mut self,
+        env: &Env,
+        span: Span,
+        struct_name: &str,
+        struct_generics: &[GenericParam],
+        explicit_generics: &[GenericArg],
+        fields: &[(String, Expr)],
+        declared_fields: &[Field],
+    ) -> Result<Ty, TypeError> {
+        let non_pack = &struct_generics[..struct_generics.len() - 1];
+        let pack_generic = struct_generics.last().expect("checked non-empty by the caller");
+        if explicit_generics.len() < non_pack.len() {
+            return Err(TypeError {
+                span,
+                kind: TypeErrorKind::VariadicStructNeedsTurbofish { struct_name: struct_name.to_string(), min_generics: non_pack.len() },
+            });
+        }
+
+        // Non-pack generics resolve exactly as the ordinary path does —
+        // fresh vars, unified against their own turbofish slot.
+        let mapping = self.fresh_generics_mapping(non_pack, span);
+        for (g, explicit) in non_pack.iter().zip(explicit_generics) {
+            let fresh = mapping[g.name()].clone();
+            let explicit_ty = self.generic_arg_to_ty(explicit);
+            self.unify_at(span, &fresh, &explicit_ty)?;
+        }
+        // The pack itself: every remaining turbofish argument, in order —
+        // resolved directly (not through a fresh var first), since there's
+        // no field-value-driven inference to reconcile against here, unlike
+        // the non-pack case above.
+        let pack_tys: Vec<Ty> = explicit_generics[non_pack.len()..].iter().map(|g| self.generic_arg_to_ty(g)).collect();
+
+        let mut seen: HashSet<String> = HashSet::new();
+        for (name, value) in fields {
+            let Some(decl_field) = declared_fields.iter().find(|f| &f.name == name).cloned() else {
+                return Err(TypeError { span: value.span, kind: TypeErrorKind::NoSuchField { struct_name: struct_name.to_string(), field: name.clone() } });
+            };
+            if !seen.insert(name.clone()) {
+                return Err(TypeError { span: value.span, kind: TypeErrorKind::DuplicateField { struct_name: struct_name.to_string(), field: name.clone() } });
+            }
+            let value_ty = self.infer_expr(env, value)?;
+            let declared_ty = self.ty_from_ast_mapped_with_pack(&decl_field.ty, &mapping, pack_generic.name(), &pack_tys);
+            self.unify_at(value.span, &declared_ty, &value_ty)?;
+        }
+        if let Some(missing) = declared_fields.iter().find(|f| !seen.contains(&f.name)) {
+            return Err(TypeError { span, kind: TypeErrorKind::MissingField { struct_name: struct_name.to_string(), field: missing.name.clone() } });
+        }
+
+        let mut type_args: Vec<Ty> = non_pack.iter().map(|g| mapping[g.name()].clone()).collect();
+        type_args.extend(pack_tys);
+        Ok(Ty::App(struct_name.to_string(), type_args))
+    }
+
+    /// Resolves a struct field's own declared type at a pack-generic
+    /// construction site — identical to `ty_from_ast_mapped` for every
+    /// ordinary shape (delegated to directly), plus the two positions a
+    /// pack can appear in (`TypeKind::Array`'s own doc comment): a whole
+    /// array-dimension list (`[T; Dims...]`, expands to nested `Ty::Array`
+    /// levels, one per `pack_tys` element) or a whole field type
+    /// (`Args...`, becomes the tuple formed from `pack_tys`, reusing
+    /// `ast::tuple_struct_name` directly). Shallow, deliberately — only
+    /// the field's own *top-level* shape is checked for a pack reference,
+    /// not arbitrary nested positions (`Tensor`/a future variadic `print`
+    /// alike only ever need a pack at the top level of one field/parameter,
+    /// see `doc/backlog.md`'s own "Variadic generics" item for the fuller
+    /// scope this deliberately doesn't attempt yet).
+    fn ty_from_ast_mapped_with_pack(&mut self, ty: &Type, mapping: &HashMap<String, Ty>, pack_name: &str, pack_tys: &[Ty]) -> Ty {
+        match &ty.kind {
+            TypeKind::Array(elem, size) if matches!(&size.kind, ExprKind::PackRef(name) if name == pack_name) => {
+                let elem_ty = self.ty_from_ast_mapped(elem, mapping);
+                pack_tys.iter().rev().fold(elem_ty, |acc, dim| Ty::Array(Box::new(acc), Box::new(dim.clone())))
+            }
+            TypeKind::PackRef(name) if name == pack_name => {
+                let name = tuple_struct_name(pack_tys.len());
+                if pack_tys.is_empty() { Ty::Con(name) } else { Ty::App(name, pack_tys.to_vec()) }
+            }
+            _ => self.ty_from_ast_mapped(ty, mapping),
+        }
     }
 
     /// Protects an impl's own generic parameters (`T` in `impl<T: Float>
@@ -1579,10 +1920,21 @@ impl<'r> Infer<'r> {
     /// there instead, against whatever the probe's *trial* substitution
     /// resolved each parameter to).
     fn fresh_vars_for_generics(&mut self, generics: &[GenericParam]) -> HashMap<String, Ty> {
+        // A `variadic` generic (`doc/backlog.md`'s own "Variadic generics"
+        // item, `const Dims...: i32`/`Args...`) mints a *symbolic pack*
+        // (`Ty::Pack`) instead of an ordinary `Ty::Var` — this one change
+        // is what makes every other site that reads a name back out of the
+        // resulting mapping (`ty_from_ast_mapped`'s existing bare-name
+        // lookup chief among them) pick the pack up for free, with no
+        // further special-casing needed there at all.
+        let fresh = |v: &mut Self, variadic: bool| {
+            let Ty::Var(id) = v.vars.fresh() else { unreachable!("TyVarGen::fresh always returns Ty::Var") };
+            if variadic { Ty::Pack(id) } else { Ty::Var(id) }
+        };
         generics
             .iter()
             .map(|g| match g {
-                GenericParam::Type { name, .. } => (name.clone(), self.vars.fresh()),
+                GenericParam::Type { name, variadic, .. } => (name.clone(), fresh(self, *variadic)),
                 // A const-generic (`const N: i32`) maps to a fresh var
                 // exactly like a type-generic does -- there's no separate
                 // "const" unification universe, just the same `Ty::Var`,
@@ -1600,7 +1952,7 @@ impl<'r> Infer<'r> {
                 // catching a *width* mismatch between two differently-typed
                 // consts would need `Ty::Const` to carry its own type too,
                 // not attempted in this increment.
-                GenericParam::Const { name, .. } => (name.clone(), self.vars.fresh()),
+                GenericParam::Const { name, variadic, .. } => (name.clone(), fresh(self, *variadic)),
             })
             .collect()
     }
@@ -1670,8 +2022,28 @@ impl<'r> Infer<'r> {
             Ty::App(struct_name, type_args) => match self.registry.struct_fields(struct_name) {
                 Some(fields) => match fields.iter().find(|f| f.name == name).cloned() {
                     Some(field) => {
-                        let mapping = self.zip_struct_generics(struct_name, type_args);
-                        Ok(self.ty_from_ast_mapped(&field.ty, &mapping))
+                        // A pack-generic struct (`doc/backlog.md`'s own
+                        // "Variadic generics" item) needs the same pack-aware
+                        // resolution `infer_struct_lit_with_pack`'s own
+                        // construction-site path already uses — `type_args`
+                        // is already fully flat either way (`Box3<f64,2,2,
+                        // 2>`'s own `[f64,2,2,2]`), just longer than
+                        // `struct_generics`' own declared-name count once a
+                        // pack is involved; `zip_struct_generics`'s own pure
+                        // 1:1 zip would otherwise silently drop everything
+                        // past the pack's own first slot.
+                        let struct_generics = self.registry.struct_generics(struct_name).to_vec();
+                        if struct_generics.last().is_some_and(GenericParam::is_variadic) {
+                            let non_pack = &struct_generics[..struct_generics.len() - 1];
+                            let pack_generic = struct_generics.last().expect("checked non-empty above");
+                            let mapping: HashMap<String, Ty> =
+                                non_pack.iter().zip(type_args).map(|(g, t)| (g.name().to_string(), t.clone())).collect();
+                            let pack_tys = &type_args[non_pack.len().min(type_args.len())..];
+                            Ok(self.ty_from_ast_mapped_with_pack(&field.ty, &mapping, pack_generic.name(), pack_tys))
+                        } else {
+                            let mapping = self.zip_struct_generics(struct_name, type_args);
+                            Ok(self.ty_from_ast_mapped(&field.ty, &mapping))
+                        }
                     }
                     None => Err(TypeError {
                         span,
@@ -1694,7 +2066,7 @@ impl<'r> Infer<'r> {
             // deferred path once `check_pending_field_accesses` has already
             // confirmed it's still unresolved — same "genuinely fieldless"
             // treatment, not a distinct case.
-            Ty::Fn(..) | Ty::Array(..) | Ty::Const(_) | Ty::ConstExpr(..) | Ty::Var(_) => Err(TypeError {
+            Ty::Fn(..) | Ty::Array(..) | Ty::Const(_) | Ty::ConstExpr(..) | Ty::Var(_) | Ty::Pack(_) | Ty::PackResolved(_) | Ty::PackLen(_) => Err(TypeError {
                 span,
                 kind: TypeErrorKind::NoSuchField { struct_name: resolved.to_string(), field: name.to_string() },
             }),
@@ -1734,7 +2106,7 @@ impl<'r> Infer<'r> {
             // `check_pending_method_calls` has already confirmed the base
             // is concrete; the immediate path already returned earlier for
             // a bare `Ty::Var`.
-            Ty::Fn(..) | Ty::Array(..) | Ty::Const(_) | Ty::Var(_) | Ty::ConstExpr(..) => {
+            Ty::Fn(..) | Ty::Array(..) | Ty::Const(_) | Ty::Var(_) | Ty::ConstExpr(..) | Ty::Pack(_) | Ty::PackResolved(_) | Ty::PackLen(_) => {
                 return Err(TypeError {
                     span: call_span,
                     kind: TypeErrorKind::NoSuchMethod { struct_name: resolved_base.to_string(), method: name.to_string() },
@@ -2936,7 +3308,7 @@ impl<'r> Infer<'r> {
                         let mut groups: Vec<(Ty, Vec<&str>)> = Vec::new();
                         for (generics, mapping) in [(*generics_a, &mapping_a), (*generics_b, &mapping_b)] {
                             for g in generics {
-                                if let GenericParam::Type { name, bounds } = g {
+                                if let GenericParam::Type { name, bounds, .. } = g {
                                     if bounds.is_empty() {
                                         continue;
                                     }
@@ -3010,7 +3382,7 @@ impl<'r> Infer<'r> {
                 continue;
             }
             let bounds_satisfied = generics.iter().all(|g| match g {
-                GenericParam::Type { name, bounds } => {
+                GenericParam::Type { name, bounds, .. } => {
                     let Some(arg_ty) = mapping.get(name) else { return true };
                     let resolved_arg = trial.apply(arg_ty);
                     bounds.iter().all(|bound| self.has_matching_impl(bound, std::slice::from_ref(&resolved_arg)))
@@ -3498,8 +3870,8 @@ impl<'r> Infer<'r> {
             }
             // Concrete, resolved, and definitely not an array — not an
             // immediate error anymore: a `#[mlir_type(...)]`-tagged struct
-            // (`Vector<T,N>`/`Matrix<T,R,C>`/`Tensor<T,D0,D1,D2>`, `stdlib/
-            // vector/vector.cleave`) has no array of its own to index into
+            // (`Tensor<T, const Dims...: i32>`, `stdlib/linalg/tensor.
+            // cleave`) has no array of its own to index into
             // directly, so `v[i]`/`m[i,j]` only makes sense through a real
             // declared `Index<Container, Elem, const K: i32>` impl —
             // dispatched exactly the way an ordinary bare-name operator call
@@ -3648,7 +4020,15 @@ impl<'r> Infer<'r> {
     /// parameter (`T` in `algebra Ring<T> { fn add(a: T, b: T) -> T; }`) with
     /// a fresh variable per call, rather than treating `T` as if it were a
     /// concrete type spelled "T".
-    fn ty_from_ast_mapped(&mut self, ty: &Type, mapping: &HashMap<String, Ty>) -> Ty {
+    ///
+    /// `pub(crate)` (unlike most of `Infer`'s own internals) — `monomorphize.
+    /// rs`'s own preemptive-monomorphization pass (`doc/backlog.md`'s own
+    /// "Toward a matmul-based tensorial XOR"'s "Bug 3" entry) needs exactly
+    /// this: resolving a `derivative`-rule-referenced method's own declared
+    /// parameter/return types (e.g. `Ring<T>::add`'s own `T`) against a
+    /// concrete, already-fully-resolved substitution, with `mapping` this
+    /// time holding real concrete `Ty`s rather than fresh vars.
+    pub(crate) fn ty_from_ast_mapped(&mut self, ty: &Type, mapping: &HashMap<String, Ty>) -> Ty {
         match &ty.kind {
             TypeKind::Path(p, args) => {
                 let name = p.segments.join("::");
@@ -3733,6 +4113,57 @@ impl<'r> Infer<'r> {
                 params.iter().map(|p| self.ty_from_ast_mapped(p, mapping)).collect(),
                 Box::new(self.ty_from_ast_mapped(ret, mapping)),
             ),
+            // `Args...` used as a whole type (`doc/backlog.md`'s own
+            // "Variadic generics" item) -- an ordinary bare-name lookup
+            // against `mapping`, exactly like a non-variadic generic
+            // reference just above (`TypeKind::Path`'s own identical
+            // lookup) -- `fresh_vars_for_generics` is what actually makes
+            // this resolve to a real `Ty::Pack`/`Ty::PackResolved` rather
+            // than an ordinary `Ty::Var`/concrete type, not this site; this
+            // is just the read. A name genuinely missing from `mapping`
+            // (referencing a pack that was never declared, or a typo) is a
+            // real bug either way -- panics with the same clarity the old,
+            // unconditional version did.
+            TypeKind::PackRef(name) => mapping
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| panic!("type inference: pack reference `{name}...` has no matching declared generic in scope")),
+        }
+    }
+
+    /// Recognizes `<pack-name>.len()` — a bare zero-arg method call whose
+    /// receiver is a single-segment path naming an in-scope *pack* generic
+    /// (`mapping.get(name)` resolving to `Ty::Pack`/`Ty::PackResolved`, not
+    /// an ordinary type/const) — and returns its own const-generic length,
+    /// symbolic (`Ty::PackLen`) or already-resolved (`Ty::Const`) as
+    /// appropriate. Deliberately *not* a new grammar rule or AST node: `.len()`
+    /// parses as an ordinary `ExprKind::MethodCall` already, ambiguity-free
+    /// with a genuine method call since no non-pack generic name is ever a
+    /// legal receiver for one at this same syntactic position (an ordinary
+    /// value never appears in an array-dimension slot, and — in expression
+    /// position — a real variable named the same as a pack generic can't
+    /// coexist, generics and `let`-bindings share no namespace). `None` for
+    /// anything else (a genuine method call, or `.len()` on something that
+    /// isn't a pack at all) — the caller falls back to its own ordinary
+    /// handling unchanged.
+    fn pack_len_from_method_call(
+        &self,
+        mapping: &HashMap<String, Ty>,
+        base: &Expr,
+        method: &str,
+        args: &[Expr],
+    ) -> Option<Ty> {
+        if method != "len" || !args.is_empty() {
+            return None;
+        }
+        let ExprKind::Path(p) = &base.kind else { return None };
+        if p.segments.len() != 1 {
+            return None;
+        }
+        match self.subst.apply(mapping.get(&p.segments[0])?) {
+            Ty::Pack(v) => Some(Ty::PackLen(v)),
+            Ty::PackResolved(elems) => Some(Ty::Const(ConstValue::Int(elems.len() as u64))),
+            _ => None,
         }
     }
 
@@ -3771,6 +4202,17 @@ impl<'r> Infer<'r> {
             ExprKind::NumberLit { text, .. } => text.parse::<u64>().ok().map(|n| Ty::Const(ConstValue::Int(n))),
             ExprKind::BoolLit(b) => Some(Ty::Const(ConstValue::Bool(*b))),
             ExprKind::Path(p) if p.segments.len() == 1 => mapping.get(&p.segments[0]).map(|t| self.subst.apply(t)),
+            // `Dims...` in an array-dimension position (`[T; Dims...]`,
+            // `doc/backlog.md`'s own "Variadic generics" item) — the exact
+            // same bare-name-against-`mapping` lookup the `Path` arm just
+            // above already does for a non-pack const-generic reference;
+            // `fresh_vars_for_generics` is what makes this resolve to a
+            // real pack rather than an ordinary value, not this site.
+            ExprKind::PackRef(name) => mapping.get(name).map(|t| self.subst.apply(t)),
+            // `Dims.len()` in an array-dimension position (`[i32;
+            // Dims.len()]`, `doc/backlog.md`'s own "Variadic generics" item)
+            // — see `pack_len_from_method_call`'s own doc comment.
+            ExprKind::MethodCall(base, method, args) => self.pack_len_from_method_call(mapping, base, method, args),
             ExprKind::Call(path, _, args, ..) if path.segments.len() == 1 && args.len() == 2 => {
                 let a = self.const_value_from_expr(&args[0], mapping)?;
                 let b = self.const_value_from_expr(&args[1], mapping)?;
@@ -3795,20 +4237,24 @@ impl<'r> Infer<'r> {
     }
 
     /// Resolves one explicit turbofish argument (`Matrix::<f64, 4, 4>`'s
-    /// `f64`/`4`, `fibonacci::<f64>`'s `f64`) to a `Ty` — always against an
-    /// *empty* generics mapping, unlike `ty_from_ast_mapped`'s other
-    /// callers: a turbofish argument naming one of the *enclosing*
-    /// function's own generic parameters by name (`fn g<U>() { f::<U>(x) }`)
-    /// isn't resolved correctly by this — it isn't threaded through
-    /// `infer_call`'s own signature — same "not attempted this increment,
-    /// flagged rather than silently wrong" posture as everywhere else a real
-    /// gap shows up in this file. The overwhelmingly common case (a concrete
-    /// type/const, `f64`/`4`/`true`) is unaffected by this limitation.
+    /// `f64`/`4`, `fibonacci::<f64>`'s `f64`) to a `Ty` — against `self.
+    /// active_generics`, so a turbofish argument naming one of the
+    /// *enclosing* fn/impl's own generic parameters by name (`fn g<U>() {
+    /// f::<U>(x) }`, or `Tensor::<T,N>(...)` inside `impl<T,const N:i32>
+    /// Zeroed<Tensor<T,N>>`'s own body) resolves to that enclosing generic,
+    /// not a bogus literal type named "T"/const named "N" — a real,
+    /// previously-documented gap (this comment used to describe it as
+    /// unfixed), found blocking exactly the second case directly: `no impl
+    /// Float<T>` from treating a turbofish `T` as a literal type name
+    /// instead of the impl's own `T: Float`. Safe for every other caller
+    /// too — `active_generics` is empty whenever none of this matters (a
+    /// top-level, non-generic call site), so the overwhelmingly common case
+    /// (a concrete type/const, `f64`/`4`/`true`) is unaffected either way.
     fn generic_arg_to_ty(&mut self, g: &GenericArg) -> Ty {
         match g {
-            GenericArg::Type(t) => self.ty_from_ast(t),
+            GenericArg::Type(t) => self.ty_from_ast_mapped(t, &self.active_generics.clone()),
             GenericArg::Const(e) => {
-                self.const_value_from_expr(e, &HashMap::new()).unwrap_or_else(|| self.vars.fresh())
+                self.const_value_from_expr(e, &self.active_generics.clone()).unwrap_or_else(|| self.vars.fresh())
             }
         }
     }
@@ -4162,6 +4608,17 @@ impl<'r> Infer<'r> {
                 Ok(self.subst.apply(&accumulator))
             }
             ExprKind::MethodCall(base, name, args) => {
+                // `Dims.len()` — checked *before* `base` is inferred as an
+                // ordinary expression: a pack generic's own name is never
+                // inserted into `env` (it's tracked via `self.active_
+                // generics`, a type-level mapping, not a value one), so
+                // `infer_expr` on a bare `Dims` would otherwise fail with
+                // `UnknownName` before this ever gets a chance to run. See
+                // `pack_len_from_method_call`'s own doc comment for why this
+                // can't collide with a genuine method call.
+                if let Some(pack_len) = self.pack_len_from_method_call(&self.active_generics.clone(), base, name, args) {
+                    return Ok(pack_len);
+                }
                 let base_ty = self.infer_expr(env, base)?;
                 let resolved_base = self.subst.apply(&base_ty);
                 match &resolved_base {
@@ -4387,6 +4844,20 @@ impl<'r> Infer<'r> {
                 // convention `Ty::App`'s argument list, and `zip_struct_
                 // generics`, already use.
                 let struct_generics = self.registry.struct_generics(&struct_name).to_vec();
+
+                // A struct whose own last declared generic is a *pack*
+                // (`doc/backlog.md`'s own "Variadic generics" item) needs a
+                // genuinely different construction path — a pack can't be
+                // represented as one more `name -> Ty` entry in an ordinary
+                // `HashMap<String, Ty>` mapping (it resolves to *several*
+                // types, not one), and its own arity isn't knowable from the
+                // struct's own declaration at all, only from a concrete
+                // construction site. See `Self::infer_struct_lit_with_pack`'s
+                // own doc comment for the full design.
+                if struct_generics.last().is_some_and(GenericParam::is_variadic) {
+                    return self.infer_struct_lit_with_pack(env, expr.span, &struct_name, &struct_generics, explicit_generics, fields, &declared_fields);
+                }
+
                 let generics_mapping = self.fresh_generics_mapping(&struct_generics, expr.span);
                 if !explicit_generics.is_empty() {
                     if explicit_generics.len() != struct_generics.len() {
@@ -4503,6 +4974,13 @@ impl<'r> Infer<'r> {
                 }
                 Ok(Ty::Fn(param_tys, Box::new(body_ty)))
             }
+            // `Dims...` reached as an ordinary expression -- only ever
+            // meaningful as an array dimension's own size expression
+            // (`TypeKind::Array`), resolved through `ty_from_ast_mapped`'s
+            // own dedicated arm, never through general expression
+            // inference. Grammar/AST exist (Milestone 1 of `doc/backlog.md`'s
+            // own "Variadic generics" item); nothing resolves a pack yet.
+            ExprKind::PackRef(name) => panic!("type inference: pack reference `{name}...` reached ordinary expression inference -- variadic generics aren't semantically supported yet (only the grammar/AST exist so far)"),
         }
     }
 

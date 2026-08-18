@@ -77,8 +77,36 @@ extern_kw = { "extern" ~ ("(" ~ ident ~ ")")? }
 derive_decl = { ident ~ "=" ~ "derive" ~ "(" ~ ident ~ ")" ~ ";" }
 
 generic_params = { "<" ~ generic_param ~ ("," ~ generic_param)* ~ ">" }
-generic_param  = { "const" ~ ident ~ ":" ~ type_ | ident ~ (":" ~ bound_list)? }
+// A trailing `...` right after the declared *name* (before any `:`-
+// introduced bound/type clause) marks a *pack* — "however many" of this
+// generic, not exactly one (`const Dims...: i32`, `Args...`) — the
+// foundation for real variadic generics (`doc/backlog.md`'s own item,
+// resolved via direct discussion into "one unified pack mechanism," not two
+// special-cased features for the const-generic-rank and type-generic-arity
+// cases separately). Deliberately placed *before* `: type_`/`: bound_list`,
+// not after — `type_` can itself end in a trailing `...` (`pack_ref`,
+// needed so `Args...` parses as a *type*, e.g. a parameter's own `args:
+// Args...`), so a marker placed *after* `": " ~ type_` would be genuinely
+// ambiguous: `const Dims: i32...` could just as well parse as one ordinary,
+// non-variadic `Dims` whose own declared type happens to be the *type*
+// `i32...` — found by direct testing, not assumed (a real, confusing
+// misparse: `variadic` silently landed `false`, and the const's own `ty`
+// field silently became a `PackRef` instead of an ordinary `i32` path).
+// Only meaningful as the *last* generic in a list (nothing after a pack
+// could ever be positionally addressed once it starts consuming "everything
+// remaining") -- not enforced here, at the grammar level, matching this
+// grammar's own established "accept a superset, narrow semantically"
+// posture elsewhere (e.g. a bodyless non-`extern` `fn`, or a zero-generic
+// `impl` still parsing `generic_params?`); checked in `infer.rs` once real
+// semantic support for packs exists.
+generic_param  = { "const" ~ ident ~ pack_marker? ~ ":" ~ type_ | ident ~ pack_marker? ~ (":" ~ bound_list)? }
 bound_list     = { ident ~ ("+" ~ ident)* }
+// Wrapped in its own named rule (rather than a bare `"..."?` literal) so its
+// mere *presence* is actually visible as a pair to `lower.rs` — a bare
+// string literal leaves no trace at all in pest's own output, the same
+// reasoning `mut_kw`/`extern_kw` already established for their own
+// identical "was this marker there or not?" need.
+pack_marker    = { "..." }
 
 param_list = { param ~ ("," ~ param)* }
 // `mut_kw?` mirrors `let_stmt`'s own identical `mut` marker -- a parameter
@@ -168,7 +196,18 @@ inherent_impl = { "impl" ~ generic_params? ~ "struct" ~ type_ ~ "{" ~ fn_decl* ~
 // ---------------------------------------------------------------- types
 // arrays are the 1D primitive (see grammar.md, "Primitives + arrays") — Matrix/Tensor
 // (multi-dim, strided) are algebras built on top, not a separate native array type.
-type_       = { fn_type | tuple_type | array_type | path ~ ("<" ~ generic_arg ~ ("," ~ generic_arg)* ~ ">")? }
+type_       = { fn_type | tuple_type | pack_ref | array_type | path ~ ("<" ~ generic_arg ~ ("," ~ generic_arg)* ~ ">")? }
+// `Args...` as a whole type (a function parameter/struct field) — once
+// `Args` (a declared type-generic *pack*, `generic_param`'s own trailing
+// `...`) resolves to a concrete list at a call/construction site, this
+// position becomes exactly the tuple formed from that list (`print`'s own
+// motivating case: `fn print(args: Args...)`) — see `lower.rs`'s own
+// pack-reference lowering for why no new runtime representation is needed.
+// Tried before the bare `path` alternative -- an ordinary path never itself
+// consumes a trailing `...`, so there's no real ambiguity to resolve by
+// ordering, this just keeps `pack_ref` matched first when the ellipsis is
+// actually present.
+pack_ref    = { ident ~ pack_marker }
 // A function type, for annotating a higher-order-function parameter
 // (`fn apply(f: (i32) -> i32, x: i32) -> i32 { f(x) }`) — mirrors `Ty::Fn`
 // (already used internally for a lambda's own inferred type) with actual
@@ -201,7 +240,18 @@ tuple_type  = { "(" ~ type_ ~ ("," ~ type_)+ ~ ","? ~ ")" }
 generic_arg = { numeric_lit | bool_lit | type_ }
 // Fortran-style sugar: `[f64; 3, 4]` for a fixed-size 3x4 block, desugars (at AST-building
 // time, not here) to the nested form `[[f64; 4]; 3]` — same semantics/layout either way.
-array_type  = { "[" ~ type_ ~ ";" ~ expr ~ ("," ~ expr)* ~ "]" }
+array_type  = { "[" ~ type_ ~ ";" ~ array_dim ~ ("," ~ array_dim)* ~ "]" }
+// One array dimension — an ordinary `expr` (a literal, or a bare const-
+// generic reference, exactly as today), or a *pack* reference (`Dims...`,
+// `Tensor<T, const Dims: i32...> { data: [T; Dims...] }`'s own motivating
+// case) — once `Dims` resolves to a concrete list at a construction site,
+// `[T; Dims...]` becomes exactly `[T; d0, d1, ...]`, the *already-existing*
+// multi-dim sugar just above, fed a list that came from resolving a pack
+// instead of literal syntax. Not restricted to the *last* dimension here —
+// matches `generic_param`'s own "accept a superset, narrow semantically"
+// posture (a pack only makes semantic sense once, and last, but that's an
+// `infer.rs` concern, not a grammar one).
+array_dim   = { expr ~ pack_marker? }
 
 // ---------------------------------------------------------------- statements / blocks
 block       = { "{" ~ stmt* ~ expr? ~ "}" }

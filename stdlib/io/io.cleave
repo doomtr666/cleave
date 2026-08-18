@@ -35,11 +35,15 @@ impl Print<f64> { extern(print_f64) fn print(x: f64) -> f64; }
 impl<const N: i32> Print<[i8; N]> { extern(print_bytes) fn print(x: [i8; N]) -> [i8; N]; }
 
 // A heterogeneous, fixed-arity `print` — `print(("x=", x, "y=", y))` — needs
-// its own impl per arity actually used, no variadic generics to write one
-// generically (`doc/backlog.md`'s own "variadic generics" item, deliberately
-// deferred; not needed for this at all) — the identical, already-established
-// posture `stdlib/vector/vector.cleave`'s own `Vector`/`Matrix`/`Tensor` take
-// (concretely-ranked, added when actually needed, not speculatively). A
+// its own impl per arity actually used. Unlike `stdlib/linalg/tensor.cleave`
+// 's own `Tensor<T, const Dims...: i32>`, real variadic generics (`doc/
+// backlog.md`'s own "Variadic generics" item) don't help *this* problem: a
+// pack there is homogeneous (every dim is the same kind of thing, an `i32`)
+// and never itself iterated per-element at the *type* level, but `("x=", x,
+// "y=", y)`'s own elements are genuinely different types needing genuinely
+// different `print` dispatches — a still-separate, deferred problem (`doc/
+// backlog.md`'s own note on why a heterogeneous compile-time unroll is a
+// different mechanism, not the same one). A
 // tuple's own type/literal/field-access syntax (`(A,B)`/`(a,b)`/`x.0`) is
 // ordinary generic-struct sugar (`ast::tuple_struct_name`, `driver.rs::
 // synthesize_tuple_structs`) — these three impls are otherwise completely

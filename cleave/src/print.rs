@@ -177,9 +177,9 @@ pub(crate) fn fmt_generics(generics: &[GenericParam]) -> String {
     let parts: Vec<String> = generics
         .iter()
         .map(|g| match g {
-            GenericParam::Type { name, bounds } if bounds.is_empty() => name.clone(),
-            GenericParam::Type { name, bounds } => format!("{name}: {}", bounds.join(" + ")),
-            GenericParam::Const { name, ty } => format!("const {name}: {}", fmt_type(ty)),
+            GenericParam::Type { name, bounds, variadic } if bounds.is_empty() => format!("{name}{}", if *variadic { "..." } else { "" }),
+            GenericParam::Type { name, bounds, variadic } => format!("{name}: {}{}", bounds.join(" + "), if *variadic { "..." } else { "" }),
+            GenericParam::Const { name, ty, variadic } => format!("const {name}: {}{}", fmt_type(ty), if *variadic { "..." } else { "" }),
         })
         .collect();
     format!("<{}>", parts.join(", "))
@@ -223,6 +223,7 @@ pub(crate) fn fmt_type(ty: &Type) -> String {
         TypeKind::Fn(params, ret) => {
             format!("({}) -> {}", params.iter().map(fmt_type).collect::<Vec<_>>().join(", "), fmt_type(ret))
         }
+        TypeKind::PackRef(name) => format!("{name}..."),
     }
 }
 
@@ -250,6 +251,7 @@ pub(crate) fn fmt_expr(e: &Expr) -> String {
         ExprKind::ImaginaryLit { text, .. } => format!("{text}i"),
         ExprKind::BoolLit(b) => b.to_string(),
         ExprKind::Path(p) => fmt_path(p),
+        ExprKind::PackRef(name) => format!("{name}..."),
         ExprKind::Call(path, generics, args, mlir_attrs) => {
             let mut parts: Vec<String> = args.iter().map(fmt_expr).collect();
             parts.extend(mlir_attrs.iter().map(|(name, text)| format!("{name}: {text:?}")));

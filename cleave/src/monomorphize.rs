@@ -161,6 +161,21 @@ pub struct MonomorphizedProgram {
     /// this happens (candidates existed for a call's own method name, but
     /// none of them could actually be instantiated at its concrete types).
     errors: Vec<TypeError>,
+    /// Exposed so `cps.rs::collect_units`'s own *non-generic*-impl branch
+    /// (which re-infers each concrete impl method directly, rather than
+    /// reusing a `Specialization` — see its own doc comment for why) can
+    /// still run the identical qualified-call discovery `collect_
+    /// instantiations_expr` already does for every *reachability-driven*
+    /// specialization, instead of hardcoding `call_names: HashMap::new()`
+    /// — a real, found-by-testing gap: a qualified call (`Transcendental::
+    /// tanh(x)`) inside a fully-concrete impl's own body (`Activation<f64>
+    /// ::tanh`, `stdlib/nn/nn.cleave`) was never discoverable at all
+    /// through `collect_units`'s own independent, template-free path,
+    /// panicking at CPS-lowering time (`could not resolve call`) rather
+    /// than failing a clean type check, or — for the reachable case —
+    /// working at all.
+    templates: Vec<ImplTemplate>,
+    inherent_templates: Vec<InherentTemplate>,
 }
 
 impl MonomorphizedProgram {
@@ -211,6 +226,14 @@ impl MonomorphizedProgram {
     pub fn errors(&self) -> &[TypeError] {
         &self.errors
     }
+
+    pub(crate) fn templates(&self) -> &[ImplTemplate] {
+        &self.templates
+    }
+
+    pub(crate) fn inherent_templates(&self) -> &[InherentTemplate] {
+        &self.inherent_templates
+    }
 }
 
 /// A generic algebra-impl method's own declaration-time "template" — built
@@ -223,7 +246,8 @@ impl MonomorphizedProgram {
 /// (including `target_patterns`, which `param_patterns` alone doesn't
 /// always cover — see the module's own doc comment) gives one consistent
 /// answer.
-struct ImplTemplate {
+#[derive(Clone)]
+pub(crate) struct ImplTemplate {
     algebra: String,
     method_name: String,
     params: Vec<Param>,
@@ -280,7 +304,8 @@ struct ImplTemplate {
 /// target pattern: `inherent_method_param_tys` sets an unannotated first
 /// parameter to `target_ty` directly, and unifies an annotated one against
 /// it, so the two are never independently free variables to track twice.
-struct InherentTemplate {
+#[derive(Clone)]
+pub(crate) struct InherentTemplate {
     struct_name: String,
     method_name: String,
     params: Vec<Param>,
@@ -352,6 +377,8 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
         by_origin: HashMap::new(),
         seed_call_names: HashMap::new(),
         errors: Vec::new(),
+        templates: templates.clone(),
+        inherent_templates: inherent_templates.clone(),
     };
     let mut fn_worklist: Vec<(String, Vec<Ty>)> = Vec::new();
     let mut impl_worklist: Vec<(usize, HashMap<TyVar, Ty>)> = Vec::new();
@@ -515,6 +542,14 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
             &mut call_names,
             &mut mono.errors,
         );
+
+        // `seed_derivative_rule_references`'s own doc comment -- a
+        // `derivative` rule declared on `t.algebra` can reference a
+        // *different* algebra's own generic-impl method, at this exact
+        // specialization's own resolved target type(s), that no ordinary
+        // call site in the program ever reaches directly.
+        let target_tys: Vec<Ty> = t.target_patterns.iter().map(|p| substitute(p, &mapping)).collect();
+        seed_derivative_rule_references(registry, &t.algebra, &t.method_name, &target_tys, &templates, &mut impl_worklist);
 
         let origin = format!("{}::{}", t.algebra, t.method_name);
         mono.by_origin.entry(origin).or_default().push(display.clone());
@@ -827,7 +862,7 @@ fn index_lambda_exprs<'a>(program: &'a Program, lambda_schemes: &HashMap<NodeId,
 /// resolved mangled name into `call_names` (consulted later by both
 /// `dump_block_with_call_names` and `cps.rs`'s own call resolution).
 #[allow(clippy::too_many_arguments)]
-fn collect_instantiations(
+pub(crate) fn collect_instantiations(
     body: &Block,
     node_types: &HashMap<NodeId, Ty>,
     global_env: &Env,
@@ -1064,7 +1099,7 @@ fn collect_instantiations_expr(
         };
     }
     match &expr.kind {
-        ExprKind::NumberLit { .. } | ExprKind::ImaginaryLit { .. } | ExprKind::BoolLit(_) | ExprKind::Path(_) => {}
+        ExprKind::NumberLit { .. } | ExprKind::ImaginaryLit { .. } | ExprKind::BoolLit(_) | ExprKind::Path(_) | ExprKind::PackRef(_) => {}
         ExprKind::Call(path, generics, args, ..) => {
             // A callable passed as a bare argument (`apply(inc, 5)`) — see
             // `derive_value_instantiation`'s own doc comment for why this
@@ -1117,8 +1152,25 @@ fn collect_instantiations_expr(
                             call_names.insert(expr.id, display_impl_instantiation(&templates[idx], &mapping));
                             impl_worklist.push((idx, mapping));
                         }
+                        // Same as `Found` just above, but with an empty (no-op)
+                        // mapping — a real, found-by-testing gap: `FoundConcrete`
+                        // recorded *this* call site's own `call_names` entry
+                        // correctly, but never enqueued the matched template's
+                        // own body onto `impl_worklist` the way `Found` does,
+                        // so nothing ever walked *its* body looking for further
+                        // nested calls. Invisible until a fully-concrete impl's
+                        // own body made a *qualified* call into a different
+                        // algebra for the first time (`Activation<f32>::tanh`
+                        // calling `Transcendental::tanh(x)`, `stdlib/nn/
+                        // nn.cleave`) — an ordinary bare call from a concrete
+                        // impl already resolves fine without this, through
+                        // `cps.rs`'s own `call_index` fallback (see `ImplMatch::
+                        // FoundConcrete`'s own doc comment), which is exactly
+                        // why this went unnoticed until a *qualified* one
+                        // needed `call_names` specifically.
                         ImplMatch::FoundConcrete(idx) => {
                             call_names.insert(expr.id, display_impl_instantiation(&templates[idx], &HashMap::new()));
+                            impl_worklist.push((idx, HashMap::new()));
                         }
                         ImplMatch::NoCandidates => {} // type-checking already validated this qualified call; not expected, harmless if reached
                         ImplMatch::NoneMatched { algebra, tys } => {
@@ -1408,6 +1460,12 @@ fn concrete_ty_from_ast(ty: &Type) -> Option<Ty> {
             let ret = concrete_ty_from_ast(ret)?;
             Some(Ty::Fn(params, Box::new(ret)))
         }
+        // `doc/backlog.md`'s own "Variadic generics" item -- grammar/AST
+        // exist (Milestone 1), nothing resolves a pack yet -- `None`, the
+        // same "can't resolve this turbofish argument, fall back to
+        // ordinary reverse-unification" posture this function's own doc
+        // comment already documents for any other not-yet-handled shape.
+        TypeKind::PackRef(_) => None,
     }
 }
 
@@ -1450,6 +1508,163 @@ enum ImplMatch {
     /// reporting failure (see `derive_impl_instantiation`'s own doc
     /// comment), not silently treated the same as `NoCandidates`.
     NoneMatched { algebra: String, tys: String },
+}
+
+/// Finds the `ImplTemplate` (if any) whose own `target_patterns` unify
+/// against `target_tys` — the impl-side counterpart of `Infer::dispatch_
+/// algebra_call`'s own simpler "target alone" matching, not `derive_impl_
+/// instantiation`'s fuller param/return-shape matching just below (which
+/// exists to *disambiguate* two algebras sharing one method name). Here
+/// `algebra`/`method` are already known exactly — read directly off a
+/// `derivative` rule's own declaration (`seed_derivative_rule_references`,
+/// below) — so there's nothing to disambiguate, just "does some generic
+/// impl of this exact algebra/method cover this exact target." Mirrors
+/// `derive_impl_instantiation`'s own free-var read-back exactly. `None`
+/// for a *non*-generic template too — `collect_units` already includes
+/// those unconditionally, nothing to seed.
+fn find_impl_for_target(templates: &[ImplTemplate], algebra: &str, method: &str, target_tys: &[Ty]) -> Option<(usize, HashMap<TyVar, Ty>)> {
+    for (idx, t) in templates.iter().enumerate() {
+        if t.algebra != algebra || t.method_name != method || t.target_patterns.len() != target_tys.len() || !t.is_generic {
+            continue;
+        }
+        let mut trial = Subst::default();
+        if t.target_patterns.iter().zip(target_tys).any(|(pat, concrete)| unify(&mut trial, pat, concrete).is_err()) {
+            continue;
+        }
+        let mut vars = HashSet::new();
+        t.param_patterns.iter().for_each(|p| free_vars(p, &mut vars));
+        free_vars(&t.ret_pattern, &mut vars);
+        t.target_patterns.iter().for_each(|p| free_vars(p, &mut vars));
+        let mapping: HashMap<TyVar, Ty> = vars.into_iter().map(|v| (v, trial.apply(&Ty::Var(v)))).collect();
+        return Some((idx, mapping));
+    }
+    None
+}
+
+/// For a `derivative` rule's own body, resolves each subexpression's own
+/// concrete `Ty` bottom-up — mirrors `egraph.rs::build_pattern`'s own
+/// identical cross-algebra resolution, duplicated here rather than shared,
+/// since `egraph.rs` depends on `egg`, which this module must not. Whenever
+/// a call into a genuinely *different* algebra is found, seeds that
+/// algebra/method/target instantiation into `impl_worklist` (via `find_
+/// impl_for_target`) if a template covers it — see `seed_derivative_rule_
+/// references`'s own doc comment for why this needs to happen here, this
+/// early, rather than relying on `synthesize_derivatives`'s own later
+/// `referenced`-set mechanism.
+fn resolve_derivative_rule_expr_ty(
+    expr: &Expr,
+    algebra: &str,
+    type_env: &HashMap<String, Ty>,
+    param_tys: &HashMap<&str, Ty>,
+    registry: &Registry,
+    infer: &mut Infer,
+    templates: &[ImplTemplate],
+    impl_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
+) -> Option<Ty> {
+    match &expr.kind {
+        ExprKind::Path(p) => param_tys.get(p.segments.join("::").as_str()).cloned(),
+        ExprKind::NumberLit { .. } | ExprKind::BoolLit(_) => None,
+        // `d(...)` sugar (`egraph.rs::build_pattern`'s own doc comment) --
+        // differentiating distributes component-wise, so `d(inner)` always
+        // has the exact same type as `inner` itself.
+        ExprKind::Call(path, _, args, _) if path.segments.join("::") == "d" => {
+            let [inner] = args.as_slice() else { return None };
+            resolve_derivative_rule_expr_ty(inner, algebra, type_env, param_tys, registry, infer, templates, impl_worklist)
+        }
+        ExprKind::Call(path, _, args, _) => {
+            let method = path.segments.join("::");
+            let arg_tys: Vec<Ty> = args
+                .iter()
+                .filter_map(|a| resolve_derivative_rule_expr_ty(a, algebra, type_env, param_tys, registry, infer, templates, impl_worklist))
+                .collect();
+            let owner = if registry.fn_sig(algebra, &method).is_some_and(|s| s.params.len() == args.len()) {
+                algebra.to_string()
+            } else {
+                match registry.algebras_with_fn(&method, args.len()).as_slice() {
+                    [only] => only.to_string(),
+                    _ => return None,
+                }
+            };
+            if owner == algebra {
+                // Same-algebra recursive self-call (`MatMul::matmul` calling
+                // itself inside its own rule) -- its own result type is this
+                // algebra's own declared return type, substituted through
+                // the *enclosing* instantiation's own `type_env` -- nothing
+                // to seed, `t`'s own specialization already covers it.
+                return registry.fn_sig(&owner, &method)?.ret.as_ref().map(|ret| infer.ty_from_ast_mapped(ret, type_env));
+            }
+            // A genuinely different algebra -- every one actually called
+            // this way across the whole stdlib today is single-generic
+            // (`Ring<T>`, `Transcendental<T>`), so the one concrete type its
+            // own arguments agree on *is* that generic's own concrete
+            // value -- mirrors `egraph.rs::build_pattern`'s own identical
+            // reasoning and identical bail-on-disagreement posture.
+            let mut agreed: Option<Ty> = None;
+            for t in &arg_tys {
+                match &agreed {
+                    None => agreed = Some(t.clone()),
+                    Some(a) if a == t => {}
+                    Some(_) => return None,
+                }
+            }
+            let target_ty = agreed?;
+            if let Some((idx, mapping)) = find_impl_for_target(templates, &owner, &method, std::slice::from_ref(&target_ty)) {
+                impl_worklist.push((idx, mapping));
+            }
+            Some(target_ty)
+        }
+        _ => None,
+    }
+}
+
+/// `doc/backlog.md`'s own "Toward a matmul-based tensorial XOR"/"Bug 3"
+/// entry: a `derivative` rule's own synthesized reference to a *different*
+/// algebra's generic-impl method (`MatMul`'s own product rule needing
+/// `Ring::add<Tensor<f32,2,2>>`) is otherwise discovered far too late —
+/// `synthesize_derivatives`/`derivative_rule_rewrites` run *after*
+/// monomorphization has already finished, so nothing during the e-graph
+/// rewriting stage can retroactively make `collect_units` build a concrete
+/// unit for a generic impl that was never a real call site to begin with.
+/// Confirmed directly, not guessed: a program calling `matmul` but never
+/// calling `Ring::add` on a `Tensor` anywhere else used to panic extracting
+/// the synthesized derivative (`egraph: extracted Op node "Ring::add<...>"
+/// is in none of this module's own lookup tables`) — the identical program
+/// with one throwaway direct `a + b` call added, purely to force
+/// monomorphization, differentiated correctly.
+///
+/// Called from *inside* the `impl_worklist` drain loop, right alongside the
+/// existing `collect_instantiations` call that discovers ordinary call-
+/// based instantiations — deliberately, not as a separate outer fixed-point
+/// pass: `impl_worklist` is drained with an ordinary `while let Some(...) =
+/// impl_worklist.pop()`, so an entry *pushed* here, mid-loop, is picked up
+/// naturally by that same loop's own later iterations, no extra plumbing
+/// needed for the fixed point (a newly-seeded unit's own `derivative` rules,
+/// if it has any, get the identical treatment in *its* own turn).
+fn seed_derivative_rule_references(
+    registry: &Registry,
+    algebra: &str,
+    method: &str,
+    target_tys: &[Ty],
+    templates: &[ImplTemplate],
+    impl_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
+) {
+    let Some(rule) = registry.derivative_rules(algebra).iter().find(|r| r.method == method) else { return };
+    let Some(sig) = registry.fn_sig(algebra, method) else { return };
+    let type_env: HashMap<String, Ty> = registry
+        .generics(algebra)
+        .iter()
+        .filter(|g| !matches!(g, GenericParam::Const { .. }))
+        .map(|g| g.name().to_string())
+        .zip(target_tys.iter().cloned())
+        .collect();
+    let mut infer = Infer::new(registry);
+    let param_tys: HashMap<&str, Ty> = rule
+        .params
+        .iter()
+        .zip(&sig.params)
+        .filter_map(|(rule_p, sig_p)| Some((rule_p.name.as_str(), infer.ty_from_ast_mapped(sig_p.ty.as_ref()?, &type_env))))
+        .collect();
+    resolve_derivative_rule_expr_ty(&rule.body, algebra, &type_env, &param_tys, registry, &mut infer, templates, impl_worklist);
 }
 
 /// Like `derive_instantiation`, for the algebra-impl side: tries every
@@ -1638,7 +1853,7 @@ fn display_inherent_instantiation(t: &InherentTemplate, mapping: &HashMap<TyVar,
 pub(crate) fn collect_exprs<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
     out.push(expr);
     match &expr.kind {
-        ExprKind::NumberLit { .. } | ExprKind::ImaginaryLit { .. } | ExprKind::BoolLit(_) | ExprKind::Path(_) => {}
+        ExprKind::NumberLit { .. } | ExprKind::ImaginaryLit { .. } | ExprKind::BoolLit(_) | ExprKind::Path(_) | ExprKind::PackRef(_) => {}
         ExprKind::Call(_, _, args, ..) => args.iter().for_each(|a| collect_exprs(a, out)),
         ExprKind::FieldAccess(base, _) => collect_exprs(base, out),
         ExprKind::MethodCall(base, _, args) => {

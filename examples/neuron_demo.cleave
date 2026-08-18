@@ -1,17 +1,17 @@
 use io;
-use vector;
+use linalg;
 use nn;
 
 // A single artificial neuron's forward pass -- the concrete "simple ML"
 // milestone `doc/backlog.md`'s own roadmap item was aiming at: a dot
-// product (elementwise `*`, `Ring<Vector<T,N>>`, already existing) reduced
-// to a scalar (`sum`, `stdlib/nn/nn.cleave`, this item's own addition),
-// plus a bias and a nonlinearity (`sigmoid`, also this item's own
-// addition). No raw `mlir::...` escape hatches anywhere in this file
+// product (elementwise `*`, `Ring<Tensor<T,Dims...>>`, already existing)
+// reduced to a scalar (`sum`, `stdlib/nn/nn.cleave`, this item's own
+// addition), plus a bias and a nonlinearity (`sigmoid`, also this item's
+// own addition). No raw `mlir::...` escape hatches anywhere in this file
 // itself -- every piece is an ordinary stdlib algebra call.
 fn main() {
-    let weights = Vector(data: [0.5, -0.6, 0.1]);
-    let inputs = Vector(data: [1.0, 2.0, 3.0]);
+    let weights = Tensor::<f32, 3>(data: [0.5, -0.6, 0.1]);
+    let inputs = Tensor::<f32, 3>(data: [1.0, 2.0, 3.0]);
     let bias = 0.2;
 
     let z = sum(weights * inputs) + bias;

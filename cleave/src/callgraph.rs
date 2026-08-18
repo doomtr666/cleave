@@ -503,6 +503,11 @@ fn collect_calls_block(block: &Block, known: &HashSet<&str>, out: &mut Vec<Strin
 fn collect_calls_expr(expr: &Expr, known: &HashSet<&str>, out: &mut Vec<String>) {
     match &expr.kind {
         ExprKind::NumberLit { .. } | ExprKind::ImaginaryLit { .. } | ExprKind::BoolLit(_) => {}
+        // A pack reference (`Dims...`, only ever an array dimension's own
+        // size expression today — see `TypeKind::Array`'s own doc comment)
+        // names no callable, nothing to collect — a leaf, like the literals
+        // just above.
+        ExprKind::PackRef(_) => {}
         ExprKind::Path(p) => {
             let name = p.segments.join("::");
             if known.contains(name.as_str()) {

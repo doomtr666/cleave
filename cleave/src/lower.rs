@@ -180,7 +180,19 @@ impl Lowerer {
     }
 
     fn lower_generic_param(&mut self, pair: Pair<Rule>) -> GenericParam {
-        let inner: Vec<_> = pair.into_inner().collect();
+        let mut inner: Vec<_> = pair.into_inner().collect();
+        // A `pack_marker` pair, right after the leading `ident`
+        // (`Args...`/`const Dims...: i32`) -- stripped out first, its own
+        // mere presence recorded as `variadic`, so the rest of this
+        // function's own dispatch-by-shape logic stays exactly as it was
+        // before packs existed (`doc/backlog.md`'s own "Variadic generics"
+        // item). Placed right after the name, not at the end -- see
+        // `grammar.pest`'s own `generic_param` doc comment for the real
+        // ambiguity that ordering avoids.
+        let variadic = matches!(inner.get(1).map(Pair::as_rule), Some(Rule::pack_marker));
+        if variadic {
+            inner.remove(1);
+        }
         // `"const" ~ ident ~ ":" ~ type_` yields [ident, type_]; a bare/bounded
         // type param yields [ident] or [ident, bound_list] — disambiguated by
         // the second pair's rule, since "const" itself is a bare literal token
@@ -189,14 +201,14 @@ impl Lowerer {
             2 if inner[1].as_rule() == Rule::type_ => {
                 let name = inner[0].as_str().to_string();
                 let ty = self.lower_type(inner[1].clone());
-                GenericParam::Const { name, ty }
+                GenericParam::Const { name, ty, variadic }
             }
             2 => {
                 let name = inner[0].as_str().to_string();
                 let bounds = self.lower_bound_list(inner[1].clone());
-                GenericParam::Type { name, bounds }
+                GenericParam::Type { name, bounds, variadic }
             }
-            1 => GenericParam::Type { name: inner[0].as_str().to_string(), bounds: Vec::new() },
+            1 => GenericParam::Type { name: inner[0].as_str().to_string(), bounds: Vec::new(), variadic },
             n => unreachable!("generic_param: unexpected arity {n}"),
         }
     }
@@ -374,6 +386,10 @@ impl Lowerer {
             Rule::array_type => self.lower_array_type(first),
             Rule::fn_type => self.lower_fn_type(first),
             Rule::tuple_type => self.lower_tuple_type(first),
+            Rule::pack_ref => {
+                let name = first.into_inner().next().unwrap().as_str().to_string();
+                self.wrap(span, TypeKind::PackRef(name))
+            }
             // `path`'s optional generic-arg list is flattened as trailing
             // siblings of `path` within this same `type_` pair, not nested
             // under a separate sub-rule — collect whatever remains.
@@ -424,12 +440,32 @@ impl Lowerer {
         let mut inner: Vec<_> = pair.into_inner().collect();
         let dims: Vec<Pair<Rule>> = inner.split_off(1);
         let elem = self.lower_type(inner.remove(0));
-        let dims: Vec<Expr> = dims.into_iter().map(|p| self.lower_expr(p)).collect();
+        let dims: Vec<Expr> = dims.into_iter().map(|p| self.lower_array_dim(p)).collect();
         let mut acc = elem;
         for dim in dims.into_iter().rev() {
             acc = self.wrap(span, TypeKind::Array(Box::new(acc), Box::new(dim)));
         }
         acc
+    }
+
+    /// One `array_dim` — an ordinary `expr`, or (`doc/backlog.md`'s own
+    /// "Variadic generics" item) a pack reference (`Dims...`): the pack's
+    /// own bare name, discarding the ordinary `Path` shape `lower_expr`
+    /// would otherwise build for it, since `ExprKind::PackRef` only ever
+    /// needs the raw name — see `TypeKind::Array`'s own doc comment for how
+    /// this size slot later expands once `Dims` resolves to a concrete list.
+    fn lower_array_dim(&mut self, pair: Pair<Rule>) -> Expr {
+        let span = self.span_of(&pair);
+        let mut inner = pair.into_inner();
+        let expr = self.lower_expr(inner.next().unwrap());
+        if matches!(inner.next().map(|p| p.as_rule()), Some(Rule::pack_marker)) {
+            let ExprKind::Path(path) = &expr.kind else {
+                panic!("array_dim: a pack marker's own preceding expr must be a bare path, got {:?}", expr.kind);
+            };
+            self.wrap(span, ExprKind::PackRef(path.segments.join("::")))
+        } else {
+            expr
+        }
     }
 
     // ---------------------------------------------------------------- blocks / statements

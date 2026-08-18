@@ -510,8 +510,8 @@ fn real_main() -> ExitCode {
         // working shape rather than chased further.
         //
         // Stage 1: a bare `arith.addf` (etc.) on `tensor`-typed operands
-        // (`Ring<Vector<T,N>>`'s own elementwise impls, `stdlib/vector/
-        // vector.cleave`) has no `BufferizableOpInterface` implementation
+        // (`Ring<Tensor<T,Dims...>>`'s own elementwise impls, `stdlib/linalg/
+        // tensor.cleave`) has no `BufferizableOpInterface` implementation
         // of its own — only a real structured/named op does — so one-shot-
         // bufferize (stage 2) can't handle it directly without this first.
         let pass_manager = pass::PassManager::new(&context);

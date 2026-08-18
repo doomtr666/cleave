@@ -126,6 +126,9 @@ impl TyVarNames {
 pub(crate) fn fmt_ty_named(ty: &Ty, names: &mut TyVarNames) -> String {
     match ty {
         Ty::Var(v) => format!("'{}", names.get(*v)),
+        Ty::Pack(v) => format!("'{}...", names.get(*v)),
+        Ty::PackResolved(elems) => elems.iter().map(|e| fmt_ty_named(e, names)).collect::<Vec<_>>().join(", "),
+        Ty::PackLen(v) => format!("'{}...len()", names.get(*v)),
         Ty::Con(name) => name.clone(),
         Ty::App(name, args) => {
             let args = args.iter().map(|a| fmt_ty_named(a, names)).collect::<Vec<_>>().join(", ");
@@ -362,6 +365,7 @@ fn fmt_expr_typed(e: &Expr, node_types: &NodeTypes, names: &mut TyVarNames, call
         ExprKind::ImaginaryLit { text, .. } => format!("{text}i"),
         ExprKind::BoolLit(b) => b.to_string(),
         ExprKind::Path(p) => p.segments.join("::"),
+        ExprKind::PackRef(name) => format!("{name}..."),
         ExprKind::Call(path, generics, args, ..) => {
             // A specialization's own mangled name (`identity<i32>`), when
             // this specific call node has one (see `call_names`'s own doc

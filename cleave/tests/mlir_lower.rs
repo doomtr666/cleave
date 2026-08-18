@@ -1,6 +1,6 @@
-use cleave::cps::{collect_mlir_types, collect_struct_schemas, collect_units, convert_program, UnitBody};
+use cleave::cps::{collect_mlir_types, collect_struct_schemas, collect_units, convert_program, eliminate_dead_code, UnitBody};
 use cleave::driver::compile;
-use cleave::egraph::{synthesize_derivatives, DerivativeRequest};
+use cleave::egraph::{optimize_program, synthesize_derivatives, DerivativeRequest};
 use cleave::mlir_lower::lower_program;
 use cleave::registry::Registry;
 use melior::Context;
@@ -154,8 +154,45 @@ fn run_i32(context: &Context, src: &str) -> i32 {
         .collect();
     let cps_program = convert_program(units);
     let cps_program = synthesize_derivatives(cps_program, &requests, &registry).unwrap_or_else(|e| panic!("cannot derive: {e:?}"));
-    let mlir_types = collect_mlir_types(&program);
-    let struct_schemas = collect_struct_schemas(&program);
+    run_i32_from_cps(context, &program, cps_program)
+}
+
+/// Like `run_i32`, but also runs `optimize_program` (+ the surrounding
+/// `eliminate_dead_code` sweeps) — matching `main.rs`'s own real `--run`
+/// pipeline, which `run_i32` itself does not (`doc/backlog.md`'s own
+/// "`run_i32` skips `check_type_errors`, unlike `main.rs`" entry already
+/// flags the same class of pre-existing test-harness/CLI divergence).
+/// Needed for real, not speculatively: `linalg::MatMul`'s own product-rule-
+/// synthesized derivative tree, freshly extracted and *un*-simplified,
+/// panics MLIR lowering under plain `run_i32` while the exact same source
+/// runs correctly through the real CLI — the only difference between the
+/// two pipelines being this step. Kept as a *separate* function rather than
+/// added to `run_i32` itself — tried first, reverted: it broke five other,
+/// already-passing tests elsewhere in this file, too invasive a change to
+/// a helper 125+ tests already share for a gap only this one test hits.
+fn run_i32_with_optimization_pass(context: &Context, src: &str) -> i32 {
+    let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
+    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+    let registry = Registry::build(&program);
+    let units = collect_units(&program, &registry);
+    let requests: Vec<DerivativeRequest> = units
+        .iter()
+        .filter_map(|u| match &u.body {
+            UnitBody::Derivative(of) => Some(DerivativeRequest { name: u.name.clone(), of: of.clone() }),
+            _ => None,
+        })
+        .collect();
+    let cps_program = convert_program(units);
+    let cps_program = synthesize_derivatives(cps_program, &requests, &registry).unwrap_or_else(|e| panic!("cannot derive: {e:?}"));
+    let cps_program = eliminate_dead_code(cps_program);
+    let (cps_program, _) = optimize_program(cps_program, &registry);
+    let cps_program = eliminate_dead_code(cps_program);
+    run_i32_from_cps(context, &program, cps_program)
+}
+
+fn run_i32_from_cps(context: &Context, program: &cleave::ast::Program, cps_program: cleave::cps::CpsProgram) -> i32 {
+    let mlir_types = collect_mlir_types(program);
+    let struct_schemas = collect_struct_schemas(program);
     let mut module = lower_program(context, &cps_program, &mlir_types, struct_schemas);
     assert!(module.as_operation().verify(), "generated MLIR module failed verification");
 
@@ -171,8 +208,8 @@ fn run_i32(context: &Context, src: &str) -> i32 {
     // shape rather than chased further.
     //
     // Stage 1: a bare `arith.addf` (etc.) on `tensor`-typed operands
-    // (`Ring<Vector<T,N>>`'s own elementwise impls, `stdlib/vector/
-    // vector.cleave`) has no `BufferizableOpInterface` implementation of
+    // (`Ring<Tensor<T,Dims...>>`'s own elementwise impls, `stdlib/linalg/
+    // tensor.cleave`) has no `BufferizableOpInterface` implementation of
     // its own — only a real structured/named op does — so one-shot-
     // bufferize (stage 2) can't handle it directly without this first.
     let pass_manager = pass::PassManager::new(context);
@@ -1930,25 +1967,30 @@ fn an_unannotated_complex_literals_field_access_actually_runs() {
 }
 
 // ---------------------------------------------------------------------
-// `Vector<T,N>` (`stdlib/vector/vector.cleave`): an ordinary generic
-// struct, `#[mlir_type(tensor)]`-tagged — its real representation is a
-// native MLIR `tensor<NxT>` value, never the ordinary heap-allocated
-// struct reference. See `doc/backlog.md`'s own entry for the design
-// (supersedes an earlier, reverted `Ty::Vector` hardcoded `Ty` variant).
+// `Tensor<T, const Dims...: i32>` (`stdlib/linalg/tensor.cleave`): one
+// pack-generic struct, `#[mlir_type(tensor)]`-tagged — its real
+// representation is a native MLIR `tensor<...>` value, never the ordinary
+// heap-allocated struct reference. See `doc/backlog.md`'s own entry for
+// the design (supersedes an earlier, reverted `Ty::Vector` hardcoded `Ty`
+// variant, and — later — three separately-declared concretely-ranked
+// structs, before `Ty::Pack`/`Ty::PackLen` existed). Every construction
+// below needs an explicit turbofish: a pack's own arity is never inferred
+// from a field literal's shape alone.
 // ---------------------------------------------------------------------
 
 /// The smallest possible vertical slice: an ordinary named-field struct
-/// literal (`Vector(data: [...])`) really builds a real MLIR `tensor<3xf32>`
-/// value (`tagged_struct_native_type`/`lower_tagged_struct_construct`), and
-/// `v[i]` — dispatched through the new `Index<Container,Elem>` algebra
-/// fallback, not a field — reads a real element back out of it.
+/// literal (`Tensor::<f32,3>(data: [...])`) really builds a real MLIR
+/// `tensor<3xf32>` value (`tagged_struct_native_type`/`lower_tagged_struct_
+/// construct`), and `v[i]` — dispatched through the new `Index<Container,
+/// Elem>` algebra fallback, not a field — reads a real element back out of
+/// it.
 #[test]
 fn a_tagged_struct_constructs_as_a_real_tensor_and_index_reads_the_right_element() {
     let context = context();
     let src = r#"
-        use vector;
+        use linalg;
         fn main() -> i32 {
-            let v = Vector(data: [1.0, 2.0, 3.0]);
+            let v = Tensor::<f32, 3>(data: [1.0, 2.0, 3.0]);
             let x0 = v[0];
             let x1 = v[1];
             let x2 = v[2];
@@ -1958,20 +2000,20 @@ fn a_tagged_struct_constructs_as_a_real_tensor_and_index_reads_the_right_element
     assert_eq!(run_i32(&context, src), 1);
 }
 
-/// `Ring<Vector<T,N>>` (`stdlib/vector/vector.cleave`) — ordinary
+/// `Ring<Tensor<T,Dims...>>` (`stdlib/linalg/tensor.cleave`) — ordinary
 /// elementwise arithmetic (`+` desugars to `Ring::add` the same way it does
 /// for any other `Ring`-impl'd type), `arith.addf` broadcasting structurally
 /// over the `tensor<3xf32>`-typed operands — no new mechanism, and no
-/// awareness anywhere in `stdlib/vector/vector.cleave` that this needs
+/// awareness anywhere in `stdlib/linalg/tensor.cleave` that this needs
 /// anything beyond the one-line-per-op shape every other `Ring` impl uses.
 #[test]
 fn elementwise_ring_add_on_tagged_vectors_computes_the_right_values() {
     let context = context();
     let src = r#"
-        use vector;
+        use linalg;
         fn main() -> i32 {
-            let a = Vector(data: [1.0, 2.0, 3.0]);
-            let b = Vector(data: [10.0, 20.0, 30.0]);
+            let a = Tensor::<f32, 3>(data: [1.0, 2.0, 3.0]);
+            let b = Tensor::<f32, 3>(data: [10.0, 20.0, 30.0]);
             let c = a + b;
             let x0 = c[0];
             let x1 = c[1];
@@ -1982,24 +2024,24 @@ fn elementwise_ring_add_on_tagged_vectors_computes_the_right_values() {
     assert_eq!(run_i32(&context, src), 1);
 }
 
-/// A real, structural `linalg.matmul`-backed matmul on nested `Matrix<T,R,C>`
-/// — now an ordinary stdlib type (`stdlib/vector/vector.cleave`, moved there
-/// alongside `Vector`/`Tensor` — general-purpose linear algebra, not
-/// specific to this test or `examples/matmul.cleave`) — the flagship goal of
-/// this whole item (`doc/hld.md`'s own "don't lower prematurely" thesis,
-/// worked example: `matmul` as one opaque, reassociation-eligible node, not
-/// a hand-written triple-nested loop). 2x3 times 3x2 -> 2x2, the exact same
-/// hand-computed expected values `examples/matmul.cleave` already uses.
-/// Read back via the real `mc[i,j]` sugar directly -- multi-dimensional
-/// `Index` dispatch (`doc/backlog.md`'s own former "not attempted" item),
-/// not a raw `mlir::tensor::extract` escape hatch: `ast.rs::ExprKind::
-/// Index` now carries a whole bracket group's indices on one node, and
-/// `stdlib/vector/vector.cleave`'s own `Index<Matrix<T,R,C>, T>` impl
-/// (`idx: [i32; 2]`) dispatches the whole group as one call. No `let zero:
-/// i32 = ...` workaround needed at the call site any more either -- the
-/// `arith.index_cast`-on-a-bare-literal rough edge (`doc/backlog.md`) lives
-/// entirely *inside* the impl body now (`idx[0]`/`idx[1]`, ordinary array
-/// reads, not raw `mlir::...` calls), invisible to a caller.
+/// A real, structural `linalg.matmul`-backed matmul on a nested rank-2
+/// `Tensor<T,R,C>` — an ordinary stdlib type (`stdlib/linalg/
+/// tensor.cleave`) — the flagship goal of this whole item (`doc/hld.md`'s
+/// own "don't lower prematurely" thesis, worked example: `matmul` as one
+/// opaque, reassociation-eligible node, not a hand-written triple-nested
+/// loop). 2x3 times 3x2 -> 2x2, the exact same hand-computed expected
+/// values `examples/matmul.cleave` already uses. Read back via the real
+/// `mc[i,j]` sugar directly -- multi-dimensional `Index` dispatch (`doc/
+/// backlog.md`'s own former "not attempted" item), not a raw `mlir::tensor
+/// ::extract` escape hatch: `ast.rs::ExprKind::Index` now carries a whole
+/// bracket group's indices on one node, and `stdlib/linalg/tensor.cleave`'s
+/// own `Index<Tensor<T,Dims...>, T>` impl (`idx: [i32; Dims.len()]`)
+/// dispatches the whole group as one call. No `let zero: i32 = ...`
+/// workaround needed at the call site any more either -- the `arith.
+/// index_cast`-on-a-bare-literal rough edge (`doc/backlog.md`) lives
+/// entirely *inside* the impl body now (via `mlir::tensor::extract`'s own
+/// variadic-index-array form, `lower_tensor_extract_spread`), invisible to
+/// a caller.
 ///
 /// `mc` needs no explicit type annotation, unlike an earlier version of
 /// this test: `MatMul<A,B,C>`'s own `C` is exactly the same kind of
@@ -2011,10 +2053,10 @@ fn elementwise_ring_add_on_tagged_vectors_computes_the_right_values() {
 fn a_structural_linalg_matmul_on_tagged_matrices_computes_the_right_values() {
     let context = context();
     let src = r##"
-        use vector;
+        use linalg;
         fn main() -> i32 {
-            let ma = Matrix(data: [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
-            let mb = Matrix(data: [[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]]);
+            let ma = Tensor::<f32, 2, 3>(data: [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+            let mb = Tensor::<f32, 3, 2>(data: [[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]]);
             let mc = matmul(ma, mb);
             if mc[0,0] == 58.0 and mc[0,1] == 64.0 and mc[1,0] == 139.0 and mc[1,1] == 154.0 { 1 } else { 0 }
         }
@@ -2022,21 +2064,20 @@ fn a_structural_linalg_matmul_on_tagged_matrices_computes_the_right_values() {
     assert_eq!(run_i32(&context, src), 1);
 }
 
-/// `Ring<Matrix<T,R,C>>` (`stdlib/vector/vector.cleave`) — a genuine new
-/// addition, not a regression guard: `Matrix` never had an elementwise `Ring`
-/// impl before it moved into the stdlib (`examples/matmul.cleave`'s own local
-/// declaration only ever exercised `MatMul::matmul`). Mirrors `elementwise_
-/// ring_add_on_tagged_vectors_computes_the_right_values`'s own shape one rank
-/// up: `arith.addf` broadcasting structurally over a `tensor<2x2xf32>`-typed
-/// operand, confirmed directly rather than assumed to just work at rank 2.
+/// `Ring<Tensor<T,Dims...>>` at rank 2 (`stdlib/linalg/tensor.cleave`) —
+/// mirrors `elementwise_ring_add_on_tagged_vectors_computes_the_right_
+/// values`'s own shape one rank up: `arith.addf` broadcasting structurally
+/// over a `tensor<2x2xf32>`-typed operand, confirmed directly rather than
+/// assumed to just work at rank 2 — the *same* impl as the rank-1 test
+/// above, not a separate one.
 #[test]
 fn elementwise_ring_add_on_tagged_matrices_computes_the_right_values() {
     let context = context();
     let src = r#"
-        use vector;
+        use linalg;
         fn main() -> i32 {
-            let a = Matrix(data: [[1.0, 2.0], [3.0, 4.0]]);
-            let b = Matrix(data: [[10.0, 20.0], [30.0, 40.0]]);
+            let a = Tensor::<f32, 2, 2>(data: [[1.0, 2.0], [3.0, 4.0]]);
+            let b = Tensor::<f32, 2, 2>(data: [[10.0, 20.0], [30.0, 40.0]]);
             let c = a + b;
             if c[0,0] == 11.0 and c[1,1] == 44.0 { 1 } else { 0 }
         }
@@ -2044,23 +2085,35 @@ fn elementwise_ring_add_on_tagged_matrices_computes_the_right_values() {
     assert_eq!(run_i32(&context, src), 1);
 }
 
-/// `Tensor<T,D0,D1,D2>` (`stdlib/vector/vector.cleave`) — rank 3, never
-/// previously exercised end to end (`Vector`=rank 1, `Matrix`=rank 2 were the
-/// only two shapes any real test/example had built). Confirms the same
-/// generalized `#[mlir_type(tensor)]` mechanism (`tagged_struct_native_type`/
-/// `lower_tagged_struct_construct`, both fully shape-generic already, driven
-/// by `flatten_array_dims` over however many dims the field's own array type
-/// actually has) really does scale past 2 dims with no new Rust code needed —
-/// construction plus a real `t[i,j,k]` read back, through `stdlib/vector/
-/// vector.cleave`'s own `Index<Tensor<T,D0,D1,D2>, T>` impl (`idx: [i32;3]`)
-/// — a real 3-index bracket group, one `Index` node, `indices.len() == 3`.
+/// `Tensor<T, const Dims...: i32>` (`stdlib/linalg/tensor.cleave`) at rank
+/// 3 — confirms the same generalized `#[mlir_type(tensor)]` mechanism
+/// (`tagged_struct_native_type`/`lower_tagged_struct_construct`, both fully
+/// shape-generic already, driven by `flatten_array_dims` over however many
+/// dims the field's own array type actually has) really does scale past 2
+/// dims with no new Rust code needed — construction plus a real `t[i,j,k]`
+/// read back, through the *same* pack-generic `Index<Tensor<T,Dims...>, T>`
+/// impl the rank-1/rank-2 tests above also exercise, not a separate one.
+///
+/// Found a real, separate bug while fixing this test up for the pack
+/// migration (not a pack bug itself): `run_i32` never calls `check_type_
+/// errors` the way `main.rs` does before codegen, so a genuinely ill-typed
+/// program (the old, pre-migration `Tensor(data: ...)` with no turbofish,
+/// now correctly rejected — `TypeErrorKind::VariadicStructNeedsTurbofish`)
+/// sails straight through into a malformed module instead of failing this
+/// one test cleanly, crashing the *entire* test binary (`Symbols not found:
+/// [ _mlir__mlir_ciface_main ]`, `STATUS_STACK_BUFFER_OVERRUN`) — confirmed
+/// directly, not guessed: the exact same source cleanly reports `` `Tensor`
+/// has a variadic generic ... `` through the real CLI (`main.rs`'s own
+/// `--run`, which *does* call `check_type_errors`). Noted in `doc/
+/// backlog.md` rather than fixed here — a `run_i32` robustness gap, a
+/// different concern from this item.
 #[test]
 fn a_rank_3_tensor_constructs_and_reads_back_the_right_value() {
     let context = context();
     let src = r#"
-        use vector;
+        use linalg;
         fn main() -> i32 {
-            let t = Tensor(data: [
+            let t = Tensor::<f32, 2, 2, 2>(data: [
                 [[1.0, 2.0], [3.0, 4.0]],
                 [[5.0, 6.0], [7.0, 8.0]]
             ]);
@@ -2070,11 +2123,12 @@ fn a_rank_3_tensor_constructs_and_reads_back_the_right_value() {
     assert_eq!(run_i32(&context, src), 1);
 }
 
-/// The negative counterpart — `m[i,j,k]` (3 indices) on a `Matrix` (rank 2)
+/// The negative counterpart — `m[i,j,k]` (3 indices) on a rank-2 `Tensor`
 /// must be rejected, not silently accepted with the extra index ignored:
-/// `Matrix`'s own `Index` impl hardcodes `idx: [i32; 2]`, so a 3-element
+/// `Index<Tensor<T,Dims...>,T>`'s own `idx: [i32; Dims.len()]` pins `K` to
+/// `m`'s own real rank (2) the moment it's monomorphized, so a 3-element
 /// bracket group builds a `[i32;3]` array whose length doesn't structurally
-/// match `Matrix`'s own hardcoded `idx: [i32; 2]` impl.
+/// match.
 ///
 /// `K` is deliberately excluded from `infer_algebra_call`'s own `resolved_
 /// generics` (only an algebra's *type* generics — `Container`, `Elem` — ever
@@ -2084,21 +2138,20 @@ fn a_rank_3_tensor_constructs_and_reads_back_the_right_value() {
 /// `m[0,0,0]` freely (nothing about `K` blocks it there), and the real
 /// rejection only surfaces one pass later, at monomorphization
 /// (`derive_impl_instantiation`'s own full signature match, which *does*
-/// see `Matrix`'s own literal `[i32;2]` and fails to unify it against a
-/// `[i32;3]` query) — `cleave::monomorphize::dump_monomorphized` runs that
-/// pass; `cleave::dump::dump_program` (ordinary inference alone, as used by
-/// e.g. `named_arguments_on_an_ordinary_call_are_rejected` above) would
-/// wrongly report this program as accepted. `m`'s own explicit `Matrix<f32,
-/// 2,2>` annotation sidesteps the separate, already-documented `doc/
-/// backlog.md` inference gap (`check_pending_constraints`'s output-only-
-/// generic gate) entirely, so this test isolates exactly the one thing it
-/// means to check.
+/// see `m`'s own real rank and fails to unify it against a `[i32;3]`
+/// query) — `cleave::monomorphize::dump_monomorphized` runs that pass;
+/// `cleave::dump::dump_program` (ordinary inference alone, as used by e.g.
+/// `named_arguments_on_an_ordinary_call_are_rejected` above) would wrongly
+/// report this program as accepted. `m`'s own explicit `Tensor<f32,2,2>`
+/// annotation sidesteps the separate, already-documented `doc/backlog.md`
+/// inference gap (`check_pending_constraints`'s output-only-generic gate)
+/// entirely, so this test isolates exactly the one thing it means to check.
 #[test]
 fn over_indexing_a_matrix_is_rejected() {
     let (result, _sources) = compile(
         vec![(
             "test.cleave".to_string(),
-            "use vector;\nfn main() -> i32 { let m: Matrix<f32,2,2> = Matrix(data: [[1.0, 2.0], [3.0, 4.0]]); if m[0,0,0] == 1.0 { 1 } else { 0 } }"
+            "use linalg;\nfn main() -> i32 { let m: Tensor<f32,2,2> = Tensor::<f32,2,2>(data: [[1.0, 2.0], [3.0, 4.0]]); if m[0,0,0] == 1.0 { 1 } else { 0 } }"
                 .to_string(),
         )],
         &[],
@@ -2106,7 +2159,7 @@ fn over_indexing_a_matrix_is_rejected() {
     let program = result.unwrap_or_else(|e| panic!("expected a parse/use-resolution success (the type error is caught later): {e:?}"));
     let registry = Registry::build(&program);
     let (_, errs) = cleave::monomorphize::dump_monomorphized(&program, &registry);
-    assert!(!errs.is_empty(), "`m[0,0,0]` supplies 3 indices to a rank-2 `Matrix` and must be rejected");
+    assert!(!errs.is_empty(), "`m[0,0,0]` supplies 3 indices to a rank-2 `Tensor` and must be rejected");
 }
 
 /// The array-side counterpart -- over-indexing a real, plain 2D array
@@ -2151,7 +2204,7 @@ fn print_of_an_unannotated_index_result_no_longer_panics() {
     let (result, _sources) = compile(
         vec![(
             "test.cleave".to_string(),
-            "use io;\nuse vector;\nfn main() -> i32 { let v = Vector(data: [1.0, 2.0, 3.0]); print(v[0]); 0 }".to_string(),
+            "use io;\nuse linalg;\nfn main() -> i32 { let v = Tensor::<f32,3>(data: [1.0, 2.0, 3.0]); print(v[0]); 0 }".to_string(),
         )],
         &[],
     );
@@ -2201,7 +2254,7 @@ fn print_of_an_unannotated_index_result_no_longer_panics() {
 /// session: the original version of the matmul JIT test above only avoided
 /// this by reading `mc` back through a raw `mlir::tensor::extract` call,
 /// which never needed `mc`'s own cleave-level type resolved at all). `mc`
-/// has *no* explicit `Matrix<f32,2,2>` annotation here, unlike the matmul
+/// has *no* explicit `Tensor<f32,2,2>` annotation here, unlike the matmul
 /// test above -- `print(mc[0,0])` alone must now be enough.
 #[test]
 fn print_of_an_unannotated_matmul_index_result_no_longer_panics() {
@@ -2209,9 +2262,9 @@ fn print_of_an_unannotated_matmul_index_result_no_longer_panics() {
     let (result, _sources) = compile(
         vec![(
             "test.cleave".to_string(),
-            "use io;\nuse vector;\nfn main() -> i32 {\n\
-             let ma = Matrix(data: [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);\n\
-             let mb = Matrix(data: [[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]]);\n\
+            "use io;\nuse linalg;\nfn main() -> i32 {\n\
+             let ma = Tensor::<f32,2,3>(data: [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);\n\
+             let mb = Tensor::<f32,3,2>(data: [[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]]);\n\
              let mc = matmul(ma, mb);\n\
              print(mc[0,0]);\n\
              0\n\
@@ -2265,37 +2318,40 @@ fn print_of_an_unannotated_matmul_index_result_no_longer_panics() {
 // ------------------------------------------------------------ stdlib/nn -- activations and reductions
 
 /// `Activation<T>` (`stdlib/nn/nn.cleave`) on plain scalars -- the base case
-/// before extending to `Vector<T,N>` below. `relu`/`sigmoid`/`tanh`, each an
+/// before extending to `Tensor<T,N>` below. `relu`/`sigmoid`/`tanh`, each an
 /// ordinary one-or-two-line `mlir::...` body, no different in kind from any
 /// existing `Ring`/`Ord` impl. `sigmoid(0.0) == 0.5` is exact in IEEE 754
 /// (`exp(0)==1.0`, `1+1==2`, `1/2==0.5`), safe to check with `==`.
 #[test]
 fn relu_sigmoid_tanh_compute_correctly_on_scalars() {
     let context = context();
-    // No `use vector;` here, deliberately — real proof that `driver.rs`'s
+    // No `use linalg;` here, deliberately — real proof that `driver.rs`'s
     // own transitive `use` resolution actually works: `nn.cleave`'s own
-    // internal `use vector;` is followed on its own now, even though this
-    // test itself never touches a `Vector` value (nn.cleave's own `Vector`-
+    // internal `use linalg;` is followed on its own now, even though this
+    // test itself never touches a `Tensor` value (nn.cleave's own `Tensor`-
     // based `Activation` impl is merged into any program using `nn` at all,
     // whole-crate, no per-symbol filtering — it needs `vector` loaded
     // regardless of whether *this* file ever names it).
+    // `Activation::tanh` — qualified, not bare `tanh(0.0)` — ambiguous
+    // between `Activation<f32>` and `Transcendental<f32>` (`stdlib/num/
+    // num.cleave`) now that both declare a 1-arg `tanh`.
     let src = r#"
         use nn;
         fn main() -> i32 {
-            if relu(-2.0) == 0.0 and relu(3.0) == 3.0 and sigmoid(0.0) == 0.5 and tanh(0.0) == 0.0 { 1 } else { 0 }
+            if relu(-2.0) == 0.0 and relu(3.0) == 3.0 and sigmoid(0.0) == 0.5 and Activation::tanh(0.0) == 0.0 { 1 } else { 0 }
         }
     "#;
     assert_eq!(run_i32(&context, src), 1);
 }
 
-/// The `Vector<T,N>` counterpart -- confirms `math.exp`/`math.tanh`/`arith.
+/// The `Tensor<T,N>` counterpart -- confirms `math.exp`/`math.tanh`/`arith.
 /// maximumf` really do apply directly to a `tensor<Nxf32>`-typed operand the
-/// same way `Ring<Vector<T,N>>::add`'s own `arith.addf` already does (no
-/// per-element loop), the one genuinely unverified-until-tested claim this
-/// item's own plan made. `relu`/`sigmoid` each need a same-shape constant
-/// vector to compare/combine against (`arith.maximumf`/`arith.addf` don't
-/// broadcast a bare scalar into a tensor operand) -- built via the already-
-/// working `[value; N]` array-repeat + ordinary `Vector(data: ...)`
+/// same way `Ring<Tensor<T,Dims...>>::add`'s own `arith.addf` already does
+/// (no per-element loop), the one genuinely unverified-until-tested claim
+/// this item's own plan made. `relu`/`sigmoid` each need a same-shape
+/// constant vector to compare/combine against (`arith.maximumf`/`arith.addf`
+/// don't broadcast a bare scalar into a tensor operand) -- built via the
+/// already-working `[value; N]` array-repeat + `Tensor::<T,N>(data: ...)`
 /// construction, exactly like `stdlib/nn/nn.cleave`'s own impl bodies do.
 #[test]
 fn relu_sigmoid_tanh_compute_correctly_on_vectors() {
@@ -2303,10 +2359,10 @@ fn relu_sigmoid_tanh_compute_correctly_on_vectors() {
     let src = r#"
         use nn;
         fn main() -> i32 {
-            let v = Vector(data: [-2.0, 3.0, 0.0]);
+            let v = Tensor::<f32, 3>(data: [-2.0, 3.0, 0.0]);
             let r = relu(v);
-            let s = sigmoid(Vector(data: [0.0, 0.0, 0.0]));
-            let t = tanh(Vector(data: [0.0, 0.0, 0.0]));
+            let s = sigmoid(Tensor::<f32, 3>(data: [0.0, 0.0, 0.0]));
+            let t = Activation::tanh(Tensor::<f32, 3>(data: [0.0, 0.0, 0.0]));
             if r[0] == 0.0 and r[1] == 3.0 and r[2] == 0.0
                 and s[0] == 0.5 and s[1] == 0.5 and s[2] == 0.5
                 and t[0] == 0.0 and t[1] == 0.0 and t[2] == 0.0
@@ -2316,7 +2372,7 @@ fn relu_sigmoid_tanh_compute_correctly_on_vectors() {
     assert_eq!(run_i32(&context, src), 1);
 }
 
-/// `Sum`/`Mean`/`Max` (`stdlib/nn/nn.cleave`) on `Vector<T,N>` -- plain
+/// `Sum`/`Mean`/`Max` (`stdlib/nn/nn.cleave`) on `Tensor<T,N>` -- plain
 /// cleave source (a `for` loop plus this session's own real multi-index
 /// `Index` reads), no MLIR-level reduction op needed at all. `[1.0, 5.0,
 /// 3.0]`: sum 9.0, mean 3.0, max 5.0 -- chosen so no two are equal by
@@ -2327,7 +2383,7 @@ fn sum_mean_max_of_a_vector_compute_correctly() {
     let src = r#"
         use nn;
         fn main() -> i32 {
-            let v = Vector(data: [1.0, 5.0, 3.0]);
+            let v = Tensor::<f32, 3>(data: [1.0, 5.0, 3.0]);
             if sum(v) == 9.0 and mean(v) == 3.0 and max_of(v) == 5.0 { 1 } else { 0 }
         }
     "#;
@@ -2454,15 +2510,306 @@ fn derive_of_a_function_containing_a_statically_bounded_for_loop_computes_the_co
 #[test]
 fn derive_of_tanh_uses_stdlib_nns_own_declared_derivative_rule() {
     let context = context();
+    // `Transcendental::tanh` — qualified, not bare `tanh(x)` — `Activation
+    // <T>` and `Transcendental<T>` (`stdlib/num/num.cleave`) both declare a
+    // 1-arg `tanh` now (`tanh`'s own derivative rule moved to `Transcendental
+    // <T>`, the math function's real home — `doc/backlog.md`'s own note),
+    // so an unqualified call is genuinely ambiguous.
     let src = "
         use nn;
-        fn f(x: f32) -> f32 { tanh(x) }
+        fn f(x: f32) -> f32 { Transcendental::tanh(x) }
         fprime = derive(f);
         fn main() -> i32 {
             let x: f32 = 0.5;
-            let expected: f32 = 1.0 - tanh(x) * tanh(x);
+            let t: f32 = Transcendental::tanh(x);
+            let expected: f32 = 1.0 - t * t;
             let got: f32 = fprime(x);
             if got == expected { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// A real, general, pre-existing bug in `derivative_rule_to_rewrite`
+/// (`egraph.rs`), found while giving `stdlib/num/num.cleave`'s new
+/// `Transcendental<T>` its own `exp`/`tanh` derivative rules: the
+/// differentiation variable's own internal pattern symbol used to be the
+/// literal `?x` — silently *colliding* with a declared parameter genuinely
+/// named `x` (`fn exp(x: T) -> T; derivative exp(x): mul(exp(x), d(x));`).
+/// The rule then only ever matched when the method was applied *directly*
+/// to the exact variable being differentiated (`exp(w)` w.r.t. `w`), never
+/// through any real composition — invisible on `Ring<T>` (whose own params
+/// are always named `a`/`b`) purely by naming coincidence. `exp(exp(w))`
+/// is the minimal repro: `exp` composed with *itself*, no other algebra
+/// involved at all, so this isn't about cross-algebra resolution — it's
+/// specifically the `?x` collision. `d/dw[exp(exp(w))] = exp(exp(w)) *
+/// exp(w)`, computed independently the same way the sibling test above
+/// does.
+#[test]
+fn derive_through_a_composed_transcendental_call_whose_own_param_is_named_x() {
+    let context = context();
+    let src = "
+        fn f(w: f32) -> f32 { exp(exp(w)) }
+        fprime = derive(f);
+        fn main() -> i32 {
+            let w: f32 = 1.0;
+            let inner: f32 = exp(w);
+            let outer: f32 = exp(inner);
+            let expected: f32 = outer * inner;
+            let got: f32 = fprime(w);
+            if got == expected { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `Ring<T>`'s own `div`/`neg` never had a `derivative` rule at all before
+/// this — only `add`/`sub`/`mul` did — a real, found-by-testing gap (not
+/// speculative): `stdlib/nn/nn.cleave`'s own `sigmoid` needs the quotient
+/// rule to be differentiable through `1.0 / (1.0 + exp(-x))` at all. `d/dw
+/// [1/w] = -1/w^2`, computed independently.
+#[test]
+fn derive_through_ring_div_uses_the_quotient_rule() {
+    let context = context();
+    let src = "
+        fn f(w: f32) -> f32 { 1.0 / w }
+        fprime = derive(f);
+        fn main() -> i32 {
+            let w: f32 = 2.0;
+            let expected: f32 = -1.0 / (w * w);
+            let got: f32 = fprime(w);
+            if got == expected { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `doc/backlog.md`'s own "Multi-level call transparency" item — done, not
+/// just discussed: `Forward::walk`'s own `Fix` arm now recognizes a callee
+/// whose own body is itself a *chain* of further pure calls (`is_
+/// transparent_chain`), not just a single primop (`is_straight_line`), and
+/// walks straight *into* it instead of stopping — `sigmoid(w)`, a named
+/// call to `stdlib/nn/nn.cleave`'s own `Activation<f32>::sigmoid` (whose
+/// own body chains `neg`/`exp`/`add`/`div`), differentiates correctly now,
+/// where it used to fail with "unsupported control flow" even though the
+/// exact same body written *inline* already worked. `d/dw[sigmoid(w)^2] =
+/// 2*sigmoid(w)^2*(1-sigmoid(w))`, computed independently the same way the
+/// sibling tests above do.
+#[test]
+fn derive_through_a_named_call_to_a_multi_primitive_stdlib_function() {
+    let context = context();
+    let src = "
+        use nn;
+        fn loss(w: f32) -> f32 {
+            let s = sigmoid(w);
+            s * s
+        }
+        fprime = derive(loss);
+        fn main() -> i32 {
+            let w: f32 = 0.5;
+            let s: f32 = sigmoid(w);
+            let expected: f32 = 2.0 * s * s * (1.0 - s);
+            let got: f32 = fprime(w);
+            if got == expected { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// The real reason multi-level transparency needed alpha-renaming, not
+/// just recursion: `sigmoid` called *twice* in the same function, with
+/// *different* arguments (`sigmoid(w1)`, `sigmoid(w2)`) — a real, found-by-
+/// testing bug in an early version of `is_transparent_chain`/`Forward::
+/// walk`'s own inlining: without renaming each inlined copy's own internal
+/// temporaries, the second call's own translation would silently alias the
+/// first's in `self.env` (`try_unroll_for_loop`'s own identical concern for
+/// repeated loop iterations). `d(s1*s2)/dw1 = s1*(1-s1)*s2`, `d(s1*s2)/dw2
+/// = s1*s2*(1-s2)`, computed independently — checked with a tolerance, not
+/// `==`: the two sides reach the same value through a genuinely different
+/// sequence of multiplications (the synthesized gradient's own operand
+/// order comes from the product rule's own expansion, not this test's
+/// hand-written one), so an exact bit-for-bit match isn't guaranteed by
+/// IEEE 754 even when both are mathematically correct — confirmed directly
+/// (`0.19213304` vs `0.19213302`), not assumed.
+#[test]
+fn derive_through_two_separate_calls_to_the_same_multi_primitive_function() {
+    let context = context();
+    let src = "
+        use nn;
+        fn loss(w1: f32, w2: f32) -> f32 {
+            let s1 = sigmoid(w1);
+            let s2 = sigmoid(w2);
+            s1 * s2
+        }
+        fprime = derive(loss);
+        fn main() -> i32 {
+            let w1: f32 = 0.5;
+            let w2: f32 = 1.5;
+            let s1: f32 = sigmoid(w1);
+            let s2: f32 = sigmoid(w2);
+            let expected0: f32 = s1 * (1.0 - s1) * s2;
+            let expected1: f32 = s1 * s2 * (1.0 - s2);
+            let got = fprime(w1, w2);
+            let diff0: f32 = got[0] - expected0;
+            let diff1: f32 = got[1] - expected1;
+            let abs0: f32 = if diff0 < 0.0 { 0.0 - diff0 } else { diff0 };
+            let abs1: f32 = if diff1 < 0.0 { 0.0 - diff1 } else { diff1 };
+            if abs0 < 0.0001 and abs1 < 0.0001 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// Differentiating a *construction* itself — `egraph.rs::construction_
+/// derivative_rewrites`, the built-in, non-declarable rule (`PrimOp::Struct`/
+/// `PrimOp::Array` aren't algebra methods, so no `derivative` item in cleave
+/// source could ever attach to them) distributing `d(...)` component-wise
+/// onto a construction's own arguments: `d(Struct(f1:e1,...)) = Struct(f1:
+/// d(e1),...)`. Found missing while reaching for a tensorial reformulation of
+/// `examples/xor.cleave` (packing scalar weights into a `linalg::Tensor`
+/// before using them) — `d(w[0])` where `w = Tensor::<f32,2>(data:[w1,w2])`
+/// had no path to a derivative at all before this, confirmed directly via a
+/// minimal probe (indexing alone, no arithmetic) before implementing the
+/// fix. `f(w1,w2) = w[0] + w[1]*w[1]`, `df/dw1 = 1`, `df/dw2 = 2*w2` — proves
+/// the rule composes correctly with `Index`'s own derivative rule (`stdlib/
+/// linalg/tensor.cleave`) and `Ring`'s product rule, not just that
+/// construction alone differentiates in isolation.
+#[test]
+fn derive_through_a_tagged_tensor_constructed_from_parameters_and_indexed_back() {
+    let context = context();
+    let src = "
+        use linalg;
+        fn f(w1: f32, w2: f32) -> f32 {
+            let w = Tensor::<f32,2>(data:[w1, w2]);
+            w[0] + w[1] * w[1]
+        }
+        fprime = derive(f);
+        fn main() -> i32 {
+            let w1: f32 = 3.0;
+            let w2: f32 = 5.0;
+            let expected0: f32 = 1.0;
+            let expected1: f32 = 2.0 * w2;
+            let got = fprime(w1, w2);
+            if got[0] == expected0 and got[1] == expected1 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// Same `construction_derivative_rewrites` rule, exercised through an
+/// ordinary user-declared struct (`PrimOp::Struct`, the `struct_projection_
+/// rewrites` field-read path) rather than a `#[mlir_type(tensor)]`-tagged
+/// one — proves the rule is genuinely generic over *any* reached struct
+/// shape, not something that only happens to work for `linalg::Tensor`.
+/// `p = Point(x: x, y: y*y)`, `d(p.x + p.y)/dx = 1`, `d(...)/dy = 2*y`.
+#[test]
+fn derive_through_a_plain_struct_constructed_from_parameters_and_read_back() {
+    let context = context();
+    let src = "
+        struct Point { x: f32, y: f32 }
+        fn f(x: f32, y: f32) -> f32 {
+            let p = Point(x: x, y: y * y);
+            p.x + p.y
+        }
+        fprime = derive(f);
+        fn main() -> i32 {
+            let x: f32 = 3.0;
+            let y: f32 = 5.0;
+            let expected0: f32 = 1.0;
+            let expected1: f32 = 2.0 * y;
+            let got = fprime(x, y);
+            if got[0] == expected0 and got[1] == expected1 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `doc/backlog.md`'s own "Toward a matmul-based tensorial XOR" item —
+/// three real, separate bugs, all fixed here:
+///
+/// 1. `linalg::MatMul<A,B,C>`'s own new `derivative matmul(a, b): add(matmul
+///    (d(a), b), matmul(a, d(b)));` needs its outer `add` call resolved at
+///    `C` alone (a single concrete `Tensor` type), not the whole "A,B,C"
+///    combined string `MatMul`'s own multi-target algebra reports —
+///    `build_pattern`'s own per-parameter type environment (`egraph.rs`)
+///    is what makes that resolve correctly now.
+/// 2. `d(b)/da*` (the identity matrix `b` doesn't depend on any of the
+///    `a*` parameters `a` is built from) needs a *tensor-shaped* zero, not
+///    a bare scalar `0.0` — `derivative-independent-zero`'s own new
+///    `IndependentZeroApplier`/`build_zero` (`egraph.rs`).
+/// 3. `Ring<Tensor<f32,2,2>>::add` (the sum in `MatMul`'s own product rule
+///    above) is a *generic* impl — nothing in this source ever calls it
+///    directly (only `matmul` itself is called), so without `monomorphize.
+///    rs`'s own new `seed_derivative_rule_references` it would never get a
+///    real concrete unit built at all (`doc/backlog.md`'s own "Bug 3" entry
+///    — this test used to need a throwaway direct `a + b` call added purely
+///    to force monomorphization; no longer necessary).
+///
+/// `c = matmul(a, identity)`, `f = c[0,0] + c[1,1] = trace(a) = a1 + a4` —
+/// `df/da1 = 1`, `df/da2 = 0`, `df/da3 = 0`, `df/da4 = 1`.
+#[test]
+fn derive_through_matmul_against_a_constant_identity_matrix_uses_the_product_rule_and_a_typed_zero() {
+    let context = context();
+    let src = "
+        use linalg;
+        fn f(a1: f32, a2: f32, a3: f32, a4: f32) -> f32 {
+            let a = Tensor::<f32,2,2>(data:[[a1, a2], [a3, a4]]);
+            let b = Tensor::<f32,2,2>(data:[[1.0, 0.0], [0.0, 1.0]]);
+            let c = matmul(a, b);
+            c[0,0] + c[1,1]
+        }
+        fprime = derive(f);
+        fn main() -> i32 {
+            let g = fprime(1.0, 2.0, 3.0, 4.0);
+            if g[0] == 1.0 and g[1] == 0.0 and g[2] == 0.0 and g[3] == 1.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32_with_optimization_pass(&context, src), 1);
+}
+
+// The real target this whole item was chasing (`doc/backlog.md`'s own
+// "toward simple ML" roadmap item) — a genuine 2-input, 2-hidden-neuron,
+// 1-output network, differentiated end to end through two levels of named
+// function calls (`loss` -> `forward` -> `sigmoid`, `forward` itself calling
+// `sigmoid` three times) — is `examples/xor.cleave`, not a test here: a
+// *single* forward pass through this exact shape (no `for` loop at all)
+// already takes over 30 real seconds to saturate (confirmed directly, not
+// guessed — the same `derive()`-saturation-cost item tracked below, but
+// specifically about *nesting depth*, not batch size or parameter count: a
+// *minimal* two-level-nested case, four parameters total, was equally slow).
+// Too slow and too close to `synthesize_derivatives`'s own hardcoded 30-
+// second wall-clock limit to belong in the ordinary, fast-running test
+// suite — `examples/xor.cleave`'s own real, end-to-end training run (via the
+// examples sweep, not `cargo test`) is where this shape is actually
+// exercised and verified (a real, correctly-trained XOR truth table, not
+// just a single gradient check).
+
+/// A real, separate bug found in the same investigation: a *qualified*
+/// call (`Transcendental::tanh(x)`) inside a fully-concrete, non-generic
+/// impl's own body (`Activation<f32>::tanh`, `stdlib/nn/nn.cleave`) used
+/// to have no path to its own `call_names` entry at all — `monomorphize.rs`
+/// `ImplMatch::FoundConcrete` recorded the *outer* call site correctly but
+/// never enqueued the matched template's own body onto `impl_worklist`
+/// (unlike `ImplMatch::Found`), so nothing ever walked *its* body looking
+/// for the nested qualified call; separately, `cps.rs::collect_units`'s
+/// own non-generic-impl branch (which compiles *every* concrete impl
+/// unconditionally, regardless of reachability) hardcoded `call_names:
+/// HashMap::new()`, needing the identical discovery run directly against
+/// its own re-inferred body. Both fixed together — this test specifically
+/// exercises the second path (`Activation<f64>::tanh`, never reached from
+/// `main` at all, only present because `use nn;` merges the whole crate),
+/// confirmed by direct testing to crash the JIT natively before the fix
+/// (`could not resolve call to Transcendental::tanh`), not just fail
+/// cleanly.
+#[test]
+fn a_qualified_call_inside_a_concrete_impls_own_body_resolves_correctly() {
+    let context = context();
+    let src = "
+        use nn;
+        fn main() -> i32 {
+            let t: f32 = Activation::tanh(0.5);
+            let expected: f32 = Transcendental::tanh(0.5);
+            if t == expected { 1 } else { 0 }
         }
     ";
     assert_eq!(run_i32(&context, src), 1);
@@ -2992,4 +3339,181 @@ fn a_multi_argument_heterogeneous_print_call_prints_every_element_in_order() {
         ],
     );
     assert_eq!(out, 0);
+}
+
+/// `doc/backlog.md`'s own "Variadic generics" item — a const-generic pack
+/// (`struct Tensor<T, const Dims...: i32> { data: [T; Dims...] }`),
+/// resolved via an explicit turbofish at a construction site, constructs
+/// and reads its own field back correctly for an ordinary (heap-allocated)
+/// struct — the real end-to-end proof, not just a type-checking one. See
+/// `an_algebra_impl_generic_over_a_pack_computes_through_a_tagged_native_
+/// tensor_correctly`, below, for the `#[mlir_type(tensor)]`-tagged
+/// native-value case (`Vector`/`Matrix`/`Tensor`'s own real representation)
+/// generic over a pack — a separate, deeper mechanism, now also working.
+#[test]
+fn a_const_generic_pack_struct_constructs_and_reads_its_field_back_correctly() {
+    let context = context();
+    let src = "struct Tensor<T, const Dims...: i32> { data: [T; Dims...] }
+        fn main() -> i32 {
+            let t = Tensor::<i32, 2, 3>(data: [[1, 2, 3], [4, 5, 6]]);
+            t.data[1, 2]
+        }";
+    assert_eq!(run_i32(&context, src), 6);
+}
+
+#[test]
+fn a_const_generic_pack_struct_supports_a_different_rank_at_a_different_call_site() {
+    // Two separate concrete instantiations of the *same* pack-generic
+    // struct, at genuinely different ranks (2 dims vs. 3 dims) — proving
+    // the pack's own arity is resolved independently per construction
+    // site, not baked in once globally.
+    let context = context();
+    let src = "struct Tensor<T, const Dims...: i32> { data: [T; Dims...] }
+        fn main() -> i32 {
+            let a = Tensor::<i32, 4>(data: [10, 20, 30, 40]);
+            let b = Tensor::<i32, 2, 2, 2>(data: [[[1, 2], [3, 4]], [[5, 6], [7, 8]]]);
+            a.data[2] + b.data[1, 0, 1]
+        }";
+    assert_eq!(run_i32(&context, src), 36);
+}
+
+/// The deeper half of the pack mechanism: a `#[mlir_type(tensor)]`-tagged
+/// struct (`stdlib/linalg/tensor.cleave`'s own `Tensor`, a native MLIR
+/// `tensor<...>` SSA value, never a heap-allocated reference) generic over
+/// a pack, *and* a real algebra impl (`Ring`, real bodies — `mlir::arith::
+/// addf`, not an empty tag impl) generic over the same pack — one impl
+/// covering every rank, the mechanism `stdlib/linalg/tensor.cleave`'s own
+/// `Ring<Tensor<T,Dims...>>` now actually uses. Needed `Ty::Pack`/`Ty::
+/// PackResolved` (symbolic packs
+/// surviving declaration-time inference, only resolving once a real call
+/// site unifies against them) plus two real, separately-fixed bugs: `unify`
+/// treating two *identical* open pack variables meeting each other as a
+/// mismatch (the common case at declaration time — an algebra's own
+/// expected type and an impl's own annotated declaration share the same
+/// pack `TyVar`, from the same `impl_mapping`), and `lower_field_access`/
+/// `lower_array_load` never having a case for a tagged struct's own native
+/// tensor representation at all (always assumed a `memref` or `!llvm.ptr`,
+/// silently never exercised by the existing stdlib because `Vector`/
+/// `Matrix`/`Tensor`'s own `Index` impls read through the reserved `mlir::
+/// tensor::extract` intrinsic instead of ordinary field-access syntax) — see
+/// `doc/backlog.md`'s own note for both.
+#[test]
+fn an_algebra_impl_generic_over_a_pack_computes_through_a_tagged_native_tensor_correctly() {
+    let context = context();
+    let src = "
+        struct Box3<T: Float, const Dims...: i32> { data: [T; Dims...] }
+
+        algebra NativeShape<T> {}
+        #[mlir_type(tensor)]
+        impl<T: Float, const Dims...: i32> NativeShape<Box3<T, Dims...>> {}
+
+        impl<T: Float, const Dims...: i32> Ring<Box3<T, Dims...>> {
+            fn add(a: Box3<T, Dims...>, b: Box3<T, Dims...>) -> Box3<T, Dims...> { mlir::arith::addf(a, b) }
+            fn sub(a: Box3<T, Dims...>, b: Box3<T, Dims...>) -> Box3<T, Dims...> { mlir::arith::subf(a, b) }
+            fn mul(a: Box3<T, Dims...>, b: Box3<T, Dims...>) -> Box3<T, Dims...> { mlir::arith::mulf(a, b) }
+            fn div(a: Box3<T, Dims...>, b: Box3<T, Dims...>) -> Box3<T, Dims...> { mlir::arith::divf(a, b) }
+            fn neg(a: Box3<T, Dims...>) -> Box3<T, Dims...> { mlir::arith::negf(a) }
+        }
+
+        fn main() -> i32 {
+            let a = Box3::<f64, 2, 2>(data: [[1.0, 2.0], [3.0, 4.0]]);
+            let b = Box3::<f64, 2, 2>(data: [[10.0, 10.0], [10.0, 10.0]]);
+            let c = a + b;
+            if c.data[0, 0] == 11.0 and c.data[1, 1] == 14.0 { 1 } else { 0 }
+        }";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `mlir::tensor::extract`'s own variadic-index-array form
+/// (`lower_tensor_extract_spread`, `mlir_lower.rs`) — a pack-generic
+/// `Index<Box3<T,Dims...>,T>` impl passes a single `idx: [i32; 2]` array
+/// straight through to `mlir::tensor::extract(t, idx)`, instead of
+/// spreading it into separate scalar arguments at the cleave call site (no
+/// such spread syntax exists — see `doc/backlog.md`'s own note). Both the
+/// raw intrinsic call *and* the real `t[i,j]` sugar (dispatched through
+/// `Index`, exactly like `Vector`/`Matrix`/`Tensor`'s own existing,
+/// fixed-arity impls, `stdlib/linalg/tensor.cleave`) are checked — the
+/// second is the one that actually matters for the migration, the first
+/// isolates the new lowering mechanism on its own.
+#[test]
+fn a_pack_generic_index_impl_extracts_through_a_variadic_index_array() {
+    let context = context();
+    let src = "
+        use linalg;
+        struct Box3<T: Float, const Dims...: i32> { data: [T; Dims...] }
+        #[mlir_type(tensor)]
+        impl<T: Float, const Dims...: i32> NativeShape<Box3<T, Dims...>> {}
+        impl<T: Float, const Dims...: i32> Index<Box3<T, Dims...>, T> {
+            fn index(t: Box3<T, Dims...>, idx: [i32; 2]) -> T { mlir::tensor::extract(t, idx) }
+        }
+        fn main() -> i32 {
+            let a = Box3::<f64, 2, 2>(data: [[1.0, 2.0], [3.0, 4.0]]);
+            let idx = [1, 0];
+            let direct: f64 = mlir::tensor::extract(a, idx);
+            let sugared = a[1, 0];
+            if direct == 3.0 and sugared == 3.0 { 1 } else { 0 }
+        }";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `Ty::PackLen` (`Dims.len()`) — the other half needed for a *single*
+/// `Index<Tensor<T,Dims...>,T>` impl to cover every rank (matching how
+/// `Ring<Tensor<T,Dims...>>` already does, see the test above): the impl's
+/// own `idx: [i32; Dims.len()]` parameter no longer hardcodes a literal
+/// arity, so this one impl is exercised at *two* genuinely different ranks
+/// (1 and 2) in the same program — proving `Dims.len()` resolves
+/// independently per call site, the same regression this whole pack
+/// mechanism already guards for ordinary construction (`a_const_generic_
+/// pack_struct_supports_a_different_rank_at_a_different_call_site`).
+#[test]
+fn a_pack_generic_index_impl_using_dims_len_covers_every_rank_in_one_impl() {
+    let context = context();
+    let src = "
+        use linalg;
+        struct Box3<T: Float, const Dims...: i32> { data: [T; Dims...] }
+        #[mlir_type(tensor)]
+        impl<T: Float, const Dims...: i32> NativeShape<Box3<T, Dims...>> {}
+        impl<T: Float, const Dims...: i32> Index<Box3<T, Dims...>, T> {
+            fn index(t: Box3<T, Dims...>, idx: [i32; Dims.len()]) -> T { mlir::tensor::extract(t, idx) }
+        }
+        fn main() -> i32 {
+            let v = Box3::<f64, 4>(data: [10.0, 20.0, 30.0, 40.0]);
+            let m = Box3::<f64, 2, 2>(data: [[1.0, 2.0], [3.0, 4.0]]);
+            let x = v[2] + m[1, 0];
+            if x == 33.0 { 1 } else { 0 }
+        }";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// A real, pre-existing bug found migrating `stdlib/linalg/tensor.cleave`
+/// onto one pack-generic `Tensor` (not itself about packs): a generic
+/// impl's own body constructing a struct via an explicit turbofish that
+/// names the *impl's own* enclosing generics (`Tensor::<T,N>(...)` inside
+/// `impl<T,const N:i32> Zeroed<Tensor<T,N>>`) used to resolve `T`/`N`
+/// against an *empty* generics mapping (`generic_arg_to_ty`'s own doc
+/// comment used to describe this as a known, deliberately-unfixed gap) —
+/// `T` became a bogus literal type genuinely spelled `"T"`, failing its own
+/// `Float` bound with `no impl Float<T>`. Needed for `stdlib/nn/nn.cleave`'s
+/// own `Activation<Tensor<T,N>>::relu`, which builds a same-shape zero/one
+/// constant this same way. Fixed by resolving through `self.active_
+/// generics` instead — the same lookup table `ty_from_ast_mapped`'s other
+/// callers already use for "a bare name referencing the enclosing
+/// declaration's own generic."
+#[test]
+fn a_turbofish_inside_a_generic_impl_body_resolves_the_impls_own_enclosing_generics() {
+    let context = context();
+    let src = "
+        struct Box3<T: Float, const N: i32> { data: [T; N] }
+        algebra NativeShape<T> {}
+        #[mlir_type(tensor)]
+        impl<T: Float, const N: i32> NativeShape<Box3<T, N>> {}
+        algebra Zeroed<T> { fn zeroed() -> T; }
+        impl<T: Float, const N: i32> Zeroed<Box3<T, N>> {
+            fn zeroed() -> Box3<T, N> { Box3::<T, N>(data: [0.0; N]) }
+        }
+        fn main() -> i32 {
+            let z: Box3<f64, 3> = zeroed();
+            if z.data[0] == 0.0 and z.data[1] == 0.0 and z.data[2] == 0.0 { 1 } else { 0 }
+        }";
+    assert_eq!(run_i32(&context, src), 1);
 }

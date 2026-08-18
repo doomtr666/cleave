@@ -108,7 +108,7 @@ pub unsafe extern "C" fn print_bytes(ptr: *const u8, len: i64) -> i64 {
 /// growable collection (`doc/backlog.md`'s own former "No dynamic-size
 /// collection" item), built entirely as an ordinary stdlib struct + algebra
 /// impls, the same "no new `Ty::Vector`-style compiler variant" discipline
-/// `stdlib/vector/vector.cleave`'s own top comment already documents.
+/// `stdlib/linalg/tensor.cleave`'s own top comment already documents.
 ///
 /// The one shared, byte-count-based growth primitive -- every per-width
 /// `dynarray_grow_*`/`dynarray_alloc_*` below (see `dynarray_width!` further

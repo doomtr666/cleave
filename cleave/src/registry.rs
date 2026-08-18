@@ -311,6 +311,16 @@ impl Registry {
     /// A declared struct's own fields, in declaration order — `None` if
     /// `name` doesn't name a known struct at all (distinct from `Some(&[])`,
     /// a genuinely empty struct).
+    /// Every struct name this registry knows about — used by `egraph.rs`'s
+    /// own `derivative-independent-zero` rule to snapshot, once (`Applier`
+    /// implementations must be `Send + Sync + 'static`, so they can't hold
+    /// a borrowed `&Registry` themselves), which single-field pack-generic
+    /// structs (`linalg::Tensor`'s own shape) it knows how to build a
+    /// same-shaped zero for.
+    pub fn struct_names(&self) -> impl Iterator<Item = &str> {
+        self.structs.keys().map(String::as_str)
+    }
+
     pub fn struct_fields(&self, name: &str) -> Option<&[Field]> {
         self.structs.get(name).map(|e| e.fields.as_slice())
     }

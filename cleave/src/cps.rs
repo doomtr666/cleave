@@ -233,6 +233,13 @@ pub fn collect_mlir_types(program: &Program) -> HashMap<String, String> {
 /// the type-checker's own side effects, which no longer apply this late).
 pub struct StructSchema {
     pub generics: Vec<String>,
+    /// Whether `generics`' own *last* entry is a pack (`doc/backlog.md`'s
+    /// own "Variadic generics" item, `Tensor<T, const Dims...: i32>`'s own
+    /// motivating case) — `mlir_lower.rs::struct_field_types` needs this to
+    /// zip `generics` against a concrete instantiation's own (possibly
+    /// longer) `type_args` list correctly: every non-pack generic 1:1, then
+    /// everything remaining belongs to the pack.
+    pub has_pack: bool,
     pub fields: Vec<(String, Type)>,
 }
 
@@ -244,16 +251,10 @@ pub fn collect_struct_schemas(program: &Program) -> HashMap<String, StructSchema
     let mut schemas = HashMap::new();
     for item in &program.items {
         let ItemKind::Struct(d) = &item.kind else { continue };
-        let generics = d
-            .generics
-            .iter()
-            .map(|g| match g {
-                GenericParam::Type { name, .. } => name.clone(),
-                GenericParam::Const { name, .. } => name.clone(),
-            })
-            .collect();
+        let has_pack = d.generics.last().is_some_and(GenericParam::is_variadic);
+        let generics = d.generics.iter().map(|g| g.name().to_string()).collect();
         let fields = d.fields.iter().map(|f| (f.name.clone(), f.ty.clone())).collect();
-        schemas.insert(d.name.clone(), StructSchema { generics, fields });
+        schemas.insert(d.name.clone(), StructSchema { generics, has_pack, fields });
     }
     schemas
 }
@@ -357,6 +358,39 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                         Some(b) => UnitBody::Real(b.clone()),
                         None => UnitBody::Extern(f.extern_symbol.clone().unwrap_or_else(|| f.name.clone())),
                     };
+                    // A *qualified* call inside this method's own body
+                    // (`Transcendental::tanh(x)` inside `Activation<f64>::
+                    // tanh`, say) needs its own `call_names` entry the exact
+                    // same way a reachability-driven specialization's own
+                    // body does (`monomorphize.rs`'s own `collect_
+                    // instantiations`/`ImplMatch::FoundConcrete`) — an
+                    // ordinary bare/unqualified call already resolves fine
+                    // without this, through `resolve_call`'s own tier-3
+                    // `call_index` fallback, which is why this was never hit
+                    // until a concrete impl's own body made its *first*
+                    // qualified call into a different algebra. Only the
+                    // qualified-call discovery itself matters here — a
+                    // throwaway `fn_worklist`/`lambda_worklist`/`inherent_
+                    // worklist`/`impl_worklist` means a call from *this* body
+                    // into a still-*generic* fn/impl needing its own further
+                    // specialization isn't discovered this way (a real,
+                    // narrower, separate gap — no known case needs it yet).
+                    let mut call_names = HashMap::new();
+                    monomorphize::collect_instantiations(
+                        &f.body.clone().unwrap_or(Block { stmts: Vec::new(), tail: None }),
+                        &infer.node_types,
+                        &program_inference.global_env,
+                        mono.templates(),
+                        mono.inherent_templates(),
+                        &program_inference.lambda_schemes,
+                        HashMap::new(),
+                        &mut Vec::new(),
+                        &mut Vec::new(),
+                        &mut Vec::new(),
+                        &mut Vec::new(),
+                        &mut call_names,
+                        &mut Vec::new(),
+                    );
                     let targets_str = infer.target_types.iter().map(Ty::to_string).collect::<Vec<_>>().join(", ");
                     units.push(ConcreteUnit {
                         name: format!("{}::{}<{targets_str}>", d.algebra, f.name),
@@ -364,7 +398,7 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                         param_types: infer.param_types.clone(),
                         result: ret,
                         node_types: infer.node_types.clone(),
-                        call_names: HashMap::new(),
+                        call_names,
                         origin: Some((d.algebra.clone(), f.name.clone())),
                         capture_count: 0,
                         baked_closures: Vec::new(),
@@ -2318,7 +2352,7 @@ fn stmt_contains_break(stmt: &Stmt) -> bool {
 
 fn expr_contains_break(expr: &Expr) -> bool {
     match &expr.kind {
-        ExprKind::NumberLit { .. } | ExprKind::ImaginaryLit { .. } | ExprKind::BoolLit(_) | ExprKind::Path(_) => false,
+        ExprKind::NumberLit { .. } | ExprKind::ImaginaryLit { .. } | ExprKind::BoolLit(_) | ExprKind::Path(_) | ExprKind::PackRef(_) => false,
         ExprKind::Call(_, _, args, ..) => args.iter().any(expr_contains_break),
         ExprKind::FieldAccess(base, _) => expr_contains_break(base),
         ExprKind::MethodCall(base, _, args) => expr_contains_break(base) || args.iter().any(expr_contains_break),
@@ -2392,7 +2426,7 @@ fn mutated_free_vars(block: &Block, shadowed: &HashSet<String>, ctx: &Ctx) -> Ha
 
 fn mutated_free_vars_expr(expr: &Expr, shadowed: &HashSet<String>, ctx: &Ctx) -> HashMap<String, Ty> {
     match &expr.kind {
-        ExprKind::NumberLit { .. } | ExprKind::ImaginaryLit { .. } | ExprKind::BoolLit(_) | ExprKind::Path(_) => HashMap::new(),
+        ExprKind::NumberLit { .. } | ExprKind::ImaginaryLit { .. } | ExprKind::BoolLit(_) | ExprKind::Path(_) | ExprKind::PackRef(_) => HashMap::new(),
         ExprKind::Call(_, _, args, ..) => args.iter().flat_map(|a| mutated_free_vars_expr(a, shadowed, ctx)).collect(),
         ExprKind::FieldAccess(base, _) => mutated_free_vars_expr(base, shadowed, ctx),
         ExprKind::MethodCall(base, _, args) => {
@@ -2518,7 +2552,7 @@ fn lambda_free_vars_block(block: &Block, shadowed: &HashSet<String>, node_types:
 
 fn lambda_free_vars_expr(expr: &Expr, shadowed: &HashSet<String>, node_types: &HashMap<NodeId, Ty>) -> HashMap<String, Ty> {
     match &expr.kind {
-        ExprKind::NumberLit { .. } | ExprKind::ImaginaryLit { .. } | ExprKind::BoolLit(_) => HashMap::new(),
+        ExprKind::NumberLit { .. } | ExprKind::ImaginaryLit { .. } | ExprKind::BoolLit(_) | ExprKind::PackRef(_) => HashMap::new(),
         ExprKind::Path(p) => {
             let name = p.segments.join("::");
             if shadowed.contains(&name) {
