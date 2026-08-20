@@ -11,5 +11,7 @@ pub mod lower;
 pub mod mlir_lower;
 pub mod monomorphize;
 pub mod parser;
+pub mod pipeline;
 pub mod print;
 pub mod registry;
+pub mod rust_bindings;

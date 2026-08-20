@@ -783,6 +783,11 @@ pub enum TypeErrorKind {
     /// ordinary top-level `fn` can; there's no monomorphization pass for it
     /// to go through in the first place.
     ExternFnCannotBeGeneric { name: String },
+    /// `export fn foo<T>(x: T) -> T { ... }` — the same reasoning as
+    /// `ExternFnCannotBeGeneric`, mirrored for the opposite direction: only
+    /// a concrete, monomorphized signature can be handed a stable real
+    /// symbol and made callable from an external host at all.
+    ExportFnCannotBeGeneric { name: String },
     /// `x = v` (or `arr[i] = v`/`s.x = v`, resolved down to `x`'s own root
     /// binding — see `check_mutability`) where `x` was declared with a
     /// plain `let`, never `let mut` — a purely syntactic check, no type
@@ -901,6 +906,9 @@ impl std::fmt::Display for TypeErrorKind {
             }
             TypeErrorKind::ExternFnCannotBeGeneric { name } => {
                 write!(f, "`extern fn {name}` cannot be generic — only concrete, monomorphized signatures can cross a C-ABI boundary")
+            }
+            TypeErrorKind::ExportFnCannotBeGeneric { name } => {
+                write!(f, "`export fn {name}` cannot be generic — only concrete, monomorphized signatures can cross a C-ABI boundary")
             }
             TypeErrorKind::AssignToImmutable { name } => {
                 write!(f, "cannot assign to `{name}` — declared with `let`, not `let mut`")

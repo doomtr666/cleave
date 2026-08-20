@@ -587,3 +587,28 @@ fn single_target_algebra_impl_has_empty_extra_targets() {
         other => panic!("expected Impl, got {other:?}"),
     }
 }
+
+#[test]
+fn export_fn_sets_is_export_and_leaves_symbol_none_without_an_override() {
+    let f = lower_one_fn("export fn f(x: i32) -> i32 { x }");
+    assert!(f.is_export);
+    assert!(f.export_symbol.is_none());
+    assert!(!f.is_extern);
+    assert!(f.body.is_some(), "export fn keeps its real body");
+}
+
+#[test]
+fn export_fn_with_a_parenthesized_symbol_sets_export_symbol() {
+    let f = lower_one_fn("export(my_symbol) fn f(x: i32) -> i32 { x }");
+    assert!(f.is_export);
+    assert_eq!(f.export_symbol.as_deref(), Some("my_symbol"));
+}
+
+#[test]
+fn extern_and_export_are_mutually_exclusive_at_the_grammar_level() {
+    // `fn_decl`'s own `(extern_kw | export_kw)?` alternation admits at most
+    // one -- `extern export fn`/`export extern fn` should fail to parse,
+    // not silently pick one.
+    let result = CleaveParser::parse(Rule::program, "extern export fn f(x: i32) -> i32;");
+    assert!(result.is_err(), "expected a parse error for `extern export fn`");
+}

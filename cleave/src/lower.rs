@@ -113,6 +113,13 @@ impl Lowerer {
             None
         };
 
+        let is_export = matches!(inner.peek().map(|p| p.as_rule()), Some(Rule::export_kw));
+        let export_symbol = if is_export {
+            inner.next().unwrap().into_inner().next().map(|p| p.as_str().to_string())
+        } else {
+            None
+        };
+
         let name = inner.next().unwrap().as_str().to_string();
 
         let generics = if matches!(inner.peek().map(|p| p.as_rule()), Some(Rule::generic_params)) {
@@ -137,7 +144,7 @@ impl Lowerer {
         // pair of its own, so `None` here is exactly "no `block` pair was
         // left to consume", not a parse failure.
         let body = inner.next().map(|p| self.lower_block(p));
-        FnDecl { name, attrs, is_extern, extern_symbol, generics, params, ret, body, derivative_of: None }
+        FnDecl { name, attrs, is_extern, extern_symbol, is_export, export_symbol, generics, params, ret, body, derivative_of: None }
     }
 
     /// `fprime = derive(f);` (`grammar.pest`'s own `derive_decl`) — lowers
@@ -159,6 +166,8 @@ impl Lowerer {
             attrs: Vec::new(),
             is_extern: false,
             extern_symbol: None,
+            is_export: false,
+            export_symbol: None,
             generics: Vec::new(),
             params: Vec::new(),
             ret: None,

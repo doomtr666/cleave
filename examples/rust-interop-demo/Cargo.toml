@@ -1,0 +1,16 @@
+[package]
+name = "rust-interop-demo"
+version = "0.1.0"
+edition = "2024"
+
+# A member of the root cleave workspace (not standalone) -- tried standing
+# entirely alone first, but that loses the root workspace's own
+# `[patch.crates-io]` (the local `mlir-sys` fix and the `tblgen` MSVC-C++20
+# fix, both needed transitively via `cleave` -> `melior`), so it hit the
+# exact "tblgen requires /std:c++20 on MSVC" bug that patch exists to work
+# around. A real external consumer of a compiled cleave library wouldn't
+# depend on `cleave`/`melior` itself at all (only on the already-built
+# `.o`/staticlib), so this constraint is specific to living *inside* this
+# workspace as a from-source example, not a real-world limitation.
+[build-dependencies]
+cleave-build = { path = "../../cleave-build" }

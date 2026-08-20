@@ -1,0 +1,13 @@
+[package]
+name = "cleave-build"
+version = "0.1.0"
+edition = "2024"
+
+# A build-time helper only (`[build-dependencies]` in a consuming crate),
+# analogous to `ispc_compile` in the `ispc-rs` ecosystem -- except it calls
+# straight into `cleave::pipeline` *in process* rather than shelling out to
+# a separately-installed compiler binary: `cleave` is already a Rust
+# library, unlike ISPC, so there's no subprocess/PATH-finding step to get
+# right at all.
+[dependencies]
+cleave = { path = "../cleave" }

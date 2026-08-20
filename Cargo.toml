@@ -1,5 +1,5 @@
 [workspace]
-members = ["cleave", "cleave-rt"]
+members = ["cleave", "cleave-rt", "cleave-build", "examples/rust-interop-demo"]
 resolver = "3"
 
 [patch.crates-io]

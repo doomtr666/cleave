@@ -619,6 +619,27 @@ fn dead_code_elimination_drops_an_unused_top_level_fn_but_keeps_reachable_ones()
     assert!(!names.contains(&"unused"), "got: {names:?}");
 }
 
+/// An `export fn` is, by its own definition, a second root alongside
+/// `main` -- an external host calls it directly, `main` itself may never
+/// call it at all. `eliminate_dead_code`'s own worklist must seed every
+/// exported unit's name, not just `"main"`, or a real, intentional export
+/// with no cleave-side caller would be silently deleted before
+/// `mlir_lower.rs` ever saw it.
+#[test]
+fn dead_code_elimination_keeps_an_export_fn_unreachable_from_main() {
+    let (result, _sources) = compile(
+        vec![("test.cleave".to_string(), "export fn kernel(x: i32) -> i32 { x }\nfn main() -> i32 { 1 }".to_string())],
+        &[],
+    );
+    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+    let registry = Registry::build(&program);
+    let cps_program = convert_program(collect_units(&program, &registry));
+    let cps_program = eliminate_dead_code(cps_program);
+    let names: Vec<&str> = cps_program.funcs.iter().map(|f| f.def.name.as_str()).collect();
+    assert!(names.contains(&"main"), "got: {names:?}");
+    assert!(names.contains(&"kernel"), "export fn `kernel` has no cleave-side caller and must still survive DCE, got: {names:?}");
+}
+
 /// The real motivating case (`doc/backlog.md`'s own "Dead-code elimination
 /// for unused stdlib specializations" item): `stdlib/num/num.cleave`'s
 /// width specializations (`Ring`/`Ord` × 6 widths) are unconditionally

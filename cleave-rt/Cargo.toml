@@ -2,3 +2,15 @@
 name = "cleave-rt"
 version = "0.1.0"
 edition = "2024"
+
+# `staticlib` alongside the default `rlib`: the JIT path (`main.rs`'s
+# `--run`) still links this crate as an ordinary Rust dependency and
+# registers each function by real pointer (`ExecutionEngine::register_
+# symbol`), never touching the archive at all -- but a real `.o` produced by
+# `--emit-object` (Axis B/A) needs its unresolved `cleave_rt::*` symbol
+# references resolved by a genuine external linker afterward, which can only
+# link against a real static archive, not a `.rlib` (Rust's own metadata-
+# carrying format, not meant for a non-Rust or non-this-compiler-version
+# linker to consume).
+[lib]
+crate-type = ["rlib", "staticlib"]

@@ -233,6 +233,40 @@ fn an_extern_fn_cannot_be_generic() {
 }
 
 #[test]
+fn an_export_fn_is_accepted_with_a_real_body_and_typed_normally() {
+    // `export fn` is `extern fn`'s inverse direction (`ast.rs`'s own
+    // `FnDecl::is_export` doc comment) -- a real cleave body, typed exactly
+    // like an ordinary `fn`, just also flagged callable from outside cleave.
+    let registry = builtin_registry();
+    let program = lower_program("export fn f(x: i32) -> i32 { x }");
+    let result = infer_program(&program, &registry);
+    assert_eq!(ok_result(&result, "f"), Ty::Con("i32".to_string()));
+}
+
+#[test]
+fn a_bodyless_export_fn_is_rejected() {
+    // Unlike `extern fn`, `export fn` does NOT justify a missing body --
+    // it exports a real cleave definition, not a foreign declaration.
+    // `is_export` is deliberately not added to `MissingFnBody`'s own
+    // whitelist (`is_extern`/`derivative_of`), so this falls through to the
+    // same rejection an ordinary bodyless top-level `fn` gets.
+    let registry = builtin_registry();
+    let program = lower_program("export fn f(x: i32) -> i32;");
+    let result = infer_program(&program, &registry);
+    let err = result.results.get("f").unwrap().as_ref().unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::MissingFnBody { .. }), "got: {:?}", err.kind);
+}
+
+#[test]
+fn an_export_fn_cannot_be_generic() {
+    let registry = builtin_registry();
+    let program = lower_program("export fn f<T>(x: T) -> T { x }");
+    let result = infer_program(&program, &registry);
+    let err = result.results.get("f").unwrap().as_ref().unwrap_err();
+    assert!(matches!(err.kind, TypeErrorKind::ExportFnCannotBeGeneric { .. }), "got: {:?}", err.kind);
+}
+
+#[test]
 fn a_const_generic_bounded_for_loop_correctly_dispatches_once_a_caller_instantiates_it() {
     // Regression test: `N` (a const generic) referenced as an ordinary value
     // (`for i in 0..N`) merges with `0`'s own `Int`-constrained literal var —

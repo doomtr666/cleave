@@ -9,32 +9,45 @@
 //! `extern "C"` on each function is the calling-convention marker MLIR's own
 //! generated `func.call`/`llvm.call` needs to match; it's required
 //! regardless of how the pointer reaches the JIT.
+//!
+//! `#[unsafe(no_mangle)]` on every one: irrelevant to the JIT path (which registers
+//! by real function pointer, never by name lookup), but required once a real
+//! `.o`/staticlib is linked by an external linker (`--emit-object`, Axis
+//! B/A) — without it, Rust's own name-mangling means no `extern fn`/
+//! `export fn` call site anywhere could actually resolve against the real
+//! symbol by its plain name.
 
+#[unsafe(no_mangle)]
 pub extern "C" fn print_i8(x: i8) -> i8 {
     println!("{x}");
     x
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn print_i16(x: i16) -> i16 {
     println!("{x}");
     x
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn print_i32(x: i32) -> i32 {
     println!("{x}");
     x
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn print_i64(x: i64) -> i64 {
     println!("{x}");
     x
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn print_f32(x: f32) -> f32 {
     println!("{x}");
     x
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn print_f64(x: f64) -> f64 {
     println!("{x}");
     x
@@ -51,6 +64,7 @@ pub extern "C" fn print_f64(x: f64) -> f64 {
 /// `drop`/ownership story yet, matching this project's current "no memory
 /// management design yet" scope; not a bug to fix here, a real gap to
 /// revisit once one exists.
+#[unsafe(no_mangle)]
 pub extern "C" fn cleave_alloc(size: i64) -> *mut u8 {
     let layout = std::alloc::Layout::from_size_align(size as usize, 16).expect("cleave_alloc: invalid layout");
     unsafe { std::alloc::alloc(layout) }
@@ -69,6 +83,7 @@ pub extern "C" fn cleave_alloc(size: i64) -> *mut u8 {
 /// construction: only `mlir_lower.rs`'s own array-to-extern-call lowering
 /// ever calls this, always with a real array's own storage and its own
 /// exact declared length.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn sum_bytes(ptr: *const i8, len: i64) -> i32 {
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
     bytes.iter().map(|&b| b as i32).sum()
@@ -82,6 +97,7 @@ pub unsafe extern "C" fn sum_bytes(ptr: *const i8, len: i64) -> i32 {
 /// discarded-`i64` reconciliation), so `mlir_lower.rs`'s `PrimOp::Extern`
 /// lowering had never needed to declare/call an extern symbol with *zero*
 /// results at all.
+#[unsafe(no_mangle)]
 pub extern "C" fn touch_i32(_x: i32) {}
 
 /// Writes `len` bytes starting at `ptr` to stdout as raw text — backs
@@ -97,6 +113,7 @@ pub extern "C" fn touch_i32(_x: i32) {}
 /// # Safety
 /// `ptr` must point to at least `len` readable bytes — guaranteed by
 /// construction, same reasoning as `sum_bytes` above.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn print_bytes(ptr: *const u8, len: i64) -> i64 {
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
     use std::io::Write;
@@ -126,6 +143,7 @@ pub unsafe extern "C" fn print_bytes(ptr: *const u8, len: i64) -> i64 {
 /// own *final* buffer is never freed once the `DynArray` value itself is
 /// discarded -- cleave has no `drop`/ownership story anywhere yet, not a new
 /// gap this introduces.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cleave_realloc(ptr: *mut u8, old_size: i64, new_size: i64) -> *mut u8 {
     let new_layout = std::alloc::Layout::from_size_align(new_size as usize, 16).expect("cleave_realloc: invalid layout");
     if old_size == 0 {
@@ -150,9 +168,11 @@ pub unsafe extern "C" fn cleave_realloc(ptr: *mut u8, old_size: i64, new_size: i
 /// struct type -- only a new `impl RawBuffer<Struct>` on the cleave side.
 macro_rules! dynarray_width {
     ($elem:ty, $alloc:ident, $grow:ident, $get:ident, $set:ident) => {
+        #[unsafe(no_mangle)]
         pub extern "C" fn $alloc(cap: i32) -> *mut $elem {
             unsafe { cleave_realloc(std::ptr::null_mut(), 0, cap as i64 * std::mem::size_of::<$elem>() as i64) as *mut $elem }
         }
+        #[unsafe(no_mangle)]
         pub extern "C" fn $grow(old: *mut $elem, old_cap: i32, new_cap: i32) -> *mut $elem {
             unsafe {
                 cleave_realloc(
@@ -169,11 +189,13 @@ macro_rules! dynarray_width {
         /// with its own real, currently-allocated buffer and an in-bounds
         /// index (no bounds checking, matching this codebase's existing
         /// "no runtime memory-safety enforcement" posture elsewhere).
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn $get(buf: *const $elem, i: i32) -> $elem {
             unsafe { *buf.add(i as usize) }
         }
         /// # Safety
         /// Same as `$get` above.
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn $set(buf: *mut $elem, i: i32, v: $elem) {
             unsafe {
                 *buf.add(i as usize) = v;

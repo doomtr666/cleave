@@ -541,18 +541,37 @@ fn lower_top_level_fn<'c>(ctx: &LowerCtx<'c, '_>, f: &CTopLevelFn) -> Operation<
     // top-level fn unconditionally used to double the function count in
     // every compiled module for no functional benefit -- an ordinary
     // internal call already goes through the plain `llvm.call @name`, which
-    // never needs this wrapper. Scoped to `main` alone until a real
-    // `export`/`extern fn`-on-a-definition mechanism (`doc/hld.md`'s own
-    // sketched, not-yet-implemented design for exposing a cleave fn to an
-    // external host) lets a program opt any *other* specific function in.
+    // never needs this wrapper. An `export fn` (`ast.rs`'s own `FnDecl::
+    // is_export` doc comment) does NOT need it either, as long as its
+    // signature stays scalar-only (the MVP scope `collect_units` enforces
+    // today): a scalar-argument `func.func`'s own LLVM form after
+    // `-convert-to-llvm` already has an ordinary, directly C-ABI-callable
+    // signature, no memref-descriptor unpacking involved -- unlike
+    // `invoke_packed`, a real linked caller (Rust FFI) can call the raw
+    // symbol as-is. Revisit once a `Tensor`/struct crosses an `export fn`
+    // boundary: *that* case needs the descriptor shape this wrapper exists
+    // for, matched by a `#[repr(C)]` type on the Rust side -- not attempted
+    // here.
     let attrs: &[(melior::ir::Identifier, melior::ir::Attribute)] = if f.def.name == "main" {
         &[(melior::ir::Identifier::new(context, "llvm.emit_c_interface"), melior::ir::Attribute::unit(context))]
     } else {
         &[]
     };
+    // An exported unit's real LLVM symbol is its `export_symbol` override
+    // when given, else its own cleave name unchanged. NOTE (known, scoped
+    // gap, not silently wrong): overriding the symbol here does *not*
+    // rewrite any internal cleave-side call to this same function -- those
+    // still resolve to `f.def.name` (`emit_call`'s own `CVal::Label`
+    // resolution, upstream of this file). Fine for this MVP's actual target
+    // (a leaf kernel exported for an external host, no cleave-side caller of
+    // its own) but a real bug if some *other* cleave unit ever called an
+    // `export(other_symbol)`-renamed function internally -- not attempted
+    // to fix here, would need the internal-call-name resolution itself
+    // (`cps.rs`) to keep tracking the unrenamed name separately.
+    let symbol_name: &str = if f.is_export { f.export_symbol.as_deref().unwrap_or(&f.def.name) } else { &f.def.name };
     func::func(
         context,
-        StringAttribute::new(context, &f.def.name),
+        StringAttribute::new(context, symbol_name),
         TypeAttribute::new(FunctionType::new(context, &param_types, &results).into()),
         region,
         attrs,

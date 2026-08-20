@@ -292,6 +292,14 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
                 );
                 continue;
             }
+            if f.is_export && !f.generics.is_empty() {
+                let span = item_spans[name.as_str()];
+                raw_results.insert(
+                    name.clone(),
+                    Err(TypeError { span, kind: TypeErrorKind::ExportFnCannotBeGeneric { name: f.name.clone() } }),
+                );
+                continue;
+            }
             let (param_types, ret_var, generics) = placeholders[name].clone();
             // `check_pending_type_names` right here, per member, not folded
             // into the group-wide `check_pending_constraints` sweep below —

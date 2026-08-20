@@ -150,6 +150,14 @@ pub struct ConcreteUnit {
     /// callee against an `axiom`'s declared algebra/method name directly,
     /// without caring which concrete instantiation this particular unit is.
     pub origin: Option<(String, String)>,
+    /// Mirrors `ast::FnDecl::is_export`/`export_symbol` — `true` only for
+    /// the non-generic top-level-`fn` branch of `collect_units` (MVP export
+    /// scope: a fully concrete signature only), `false`/`None` everywhere
+    /// else (impl methods, generic specializations, lambda units). Read
+    /// downstream by `mlir_lower.rs` to pick the real exported LLVM symbol
+    /// name for this unit.
+    pub is_export: bool,
+    pub export_symbol: Option<String>,
     /// This unit's own resolved mangled-callee-name map, exactly as
     /// `monomorphize.rs` already builds it — empty for a concrete impl
     /// method (no specialization involved, see the module's own doc
@@ -293,6 +301,8 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                         node_types: program_inference.node_types.clone(),
                         call_names: mono.seed_call_names().clone(),
                         origin: None,
+                        is_export: f.is_export,
+                        export_symbol: f.export_symbol.clone(),
                         capture_count: 0,
                         baked_closures: Vec::new(),
                         higher_order_args: HashMap::new(),
@@ -308,6 +318,8 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                             node_types: mono.node_types(key).clone(),
                             call_names: mono.call_names(key).clone(),
                             origin: None,
+                            is_export: false,
+                            export_symbol: None,
                             capture_count: 0,
                             baked_closures: Vec::new(),
                             higher_order_args: HashMap::new(),
@@ -400,6 +412,8 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                         node_types: infer.node_types.clone(),
                         call_names,
                         origin: Some((d.algebra.clone(), f.name.clone())),
+                        is_export: false,
+                        export_symbol: None,
                         capture_count: 0,
                         baked_closures: Vec::new(),
                         higher_order_args: HashMap::new(),
@@ -447,6 +461,8 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                             node_types: mono.node_types(key).clone(),
                             call_names: mono.call_names(key).clone(),
                             origin: Some((d.algebra.clone(), f.name.clone())),
+                            is_export: false,
+                            export_symbol: None,
                             capture_count: 0,
                             baked_closures: Vec::new(),
                             higher_order_args: HashMap::new(),
@@ -486,6 +502,8 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                         node_types: infer.node_types.clone(),
                         call_names: HashMap::new(),
                         origin: None,
+                        is_export: false,
+                        export_symbol: None,
                         capture_count: 0,
                         baked_closures: Vec::new(),
                         higher_order_args: HashMap::new(),
@@ -510,6 +528,8 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                             node_types: mono.node_types(key).clone(),
                             call_names: mono.call_names(key).clone(),
                             origin: None,
+                            is_export: false,
+                            export_symbol: None,
                             capture_count: 0,
                             baked_closures: Vec::new(),
                             higher_order_args: HashMap::new(),
@@ -563,6 +583,8 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                 node_types: node_types.clone(),
                 call_names: mono.call_names(key).clone(),
                 origin: None,
+                is_export: false,
+                export_symbol: None,
                 capture_count: capture_names.len(),
                 baked_closures: Vec::new(),
                 higher_order_args: HashMap::new(),
@@ -765,6 +787,8 @@ fn build_higher_order_specializations(units: &mut Vec<ConcreteUnit>) {
             node_types: callee_node_types,
             call_names: inner_call_names,
             origin: None,
+            is_export: false,
+            export_symbol: None,
             capture_count: 0,
             baked_closures,
             higher_order_args: HashMap::new(),
@@ -974,6 +998,12 @@ pub struct CTopLevelFn {
     /// algebra/method against a real call site, say) needs it duplicated
     /// here rather than parsed back out of `def.name`.
     pub origin: Option<(String, String)>,
+    /// Threaded straight through from `ConcreteUnit::is_export`/
+    /// `export_symbol` — see their own doc comments. Consulted by
+    /// `mlir_lower.rs` to pick this function's real exported LLVM symbol
+    /// name, alongside the existing `def.name == "main"` check.
+    pub is_export: bool,
+    pub export_symbol: Option<String>,
 }
 
 pub struct CpsProgram {
@@ -1169,6 +1199,8 @@ pub fn convert_program(units: Vec<ConcreteUnit>) -> CpsProgram {
             result: unit.result.clone(),
             k_ret,
             origin: unit.origin.clone(),
+            is_export: unit.is_export,
+            export_symbol: unit.export_symbol.clone(),
         });
     }
     // Deterministic output order — `HashMap` iteration isn't stable.
@@ -2892,7 +2924,14 @@ fn parse_number(text: &str, ty: &Ty) -> CVal {
 pub fn eliminate_dead_code(program: CpsProgram) -> CpsProgram {
     let by_name: HashMap<&str, &CTopLevelFn> = program.funcs.iter().map(|f| (f.def.name.as_str(), f)).collect();
     let mut reachable: HashSet<String> = HashSet::new();
-    let mut worklist: Vec<String> = vec!["main".to_string()];
+    // `main` is one root among possibly several: an `export fn` is, by its
+    // own definition, an entry point an external host calls directly --
+    // cleave's own `main` may never call it at all (that's the entire
+    // point of exporting a standalone, Rust-callable kernel with no cleave-
+    // side driver). Without seeding every exported unit's own name here
+    // too, a real `export fn` unreachable from `main` would be silently
+    // deleted before `mlir_lower.rs` ever sees it.
+    let mut worklist: Vec<String> = std::iter::once("main".to_string()).chain(program.funcs.iter().filter(|f| f.is_export).map(|f| f.def.name.clone())).collect();
     while let Some(name) = worklist.pop() {
         if !reachable.insert(name.clone()) {
             continue; // already visited

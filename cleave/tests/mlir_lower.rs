@@ -493,6 +493,30 @@ fn an_extern_fn_call_actually_executes_through_a_registered_symbol() {
     assert_eq!(out, 42);
 }
 
+/// `export fn` lowers to an ordinary public `func.func` under its own
+/// cleave name -- no `sym_visibility: "private"` (that's `extern`'s own
+/// declaration-only case, `mlir_lower.rs:2137` at the time of writing), and
+/// (deliberately, for a scalar signature -- see `lower_top_level_fn`'s own
+/// doc comment) no `llvm.emit_c_interface` either, unlike `main`.
+#[test]
+fn an_export_fn_lowers_to_an_ordinary_public_func_under_its_own_name() {
+    let context = context();
+    let text = lower(&context, "export fn kernel(x: i32) -> i32 { x }\nfn main() -> i32 { 1 }");
+    assert!(text.contains("func.func @kernel(%arg0: i32) -> i32"), "got:\n{text}");
+    assert!(!text.contains("private @kernel"), "an export fn must stay publicly visible, got:\n{text}");
+}
+
+/// `export(symbol)`'s own parenthesized override renames the real emitted
+/// LLVM symbol, mirroring `extern(symbol)`'s identical shape in the
+/// opposite direction.
+#[test]
+fn an_export_fn_with_a_symbol_override_lowers_under_the_overridden_name() {
+    let context = context();
+    let text = lower(&context, "export(real_kernel_symbol) fn kernel(x: i32) -> i32 { x }\nfn main() -> i32 { 1 }");
+    assert!(text.contains("func.func @real_kernel_symbol"), "got:\n{text}");
+    assert!(!text.contains("@kernel("), "the plain cleave name must not appear as its own symbol once overridden, got:\n{text}");
+}
+
 /// `extern(...)`'s own parenthesized override -- the case a bare `extern fn`
 /// can't cover: two algebra-impl methods sharing the *same* cleave-level
 /// name (`print`) but each binding a genuinely different real C symbol

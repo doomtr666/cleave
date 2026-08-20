@@ -194,6 +194,20 @@ pub struct FnDecl {
     /// method name (`Print<i32>`'s own `print`, `Print<i64>`'s own
     /// `print`, ...) each need a genuinely different real symbol.
     pub extern_symbol: Option<String>,
+    /// `export fn name(...) -> ... { body }` — the inverse direction from
+    /// `is_extern`: a real cleave definition (body *required*, unlike
+    /// `extern`), made callable from an external host under a stable C-ABI
+    /// symbol. Deliberately a distinct flag/keyword rather than "`is_extern`
+    /// with a body present" — `extern` and `export` are different facts
+    /// ("an implementation exists outside cleave" vs. "make this one
+    /// callable from outside cleave"), not two shapes of the same one; see
+    /// `grammar.pest`'s own `export_kw` doc comment. MVP scope: only a
+    /// top-level `fn` with a fully concrete (non-generic) signature may set
+    /// this — see wherever exported units are collected.
+    pub is_export: bool,
+    /// Mirrors `extern_symbol`'s own role: the real exported C symbol, when
+    /// it differs from `name`. `None` means the symbol *is* `name` itself.
+    pub export_symbol: Option<String>,
     pub generics: Vec<GenericParam>,
     pub params: Vec<Param>,
     pub ret: Option<Type>,

@@ -15,13 +15,14 @@
 //! pass sit next to each other. More `--dump-*` flags arrive as more passes
 //! do (CPS conversion, ...).
 
-use cleave::cps::{collect_mlir_types, collect_struct_schemas, collect_units, convert_program, dump_cps_program, eliminate_dead_code, CpsProgram, UnitBody};
+use cleave::cps::{collect_mlir_types, collect_struct_schemas, dump_cps_program, eliminate_dead_code};
 use cleave::diag::SourceMap;
 use cleave::driver::compile;
 use cleave::dump::dump_program;
-use cleave::egraph::{optimize_program, synthesize_derivatives, DerivativeRequest};
+use cleave::egraph::optimize_program;
 use cleave::mlir_lower::lower_program;
 use cleave::monomorphize::dump_monomorphized;
+use cleave::pipeline::{build_cps_program, check_type_errors};
 use cleave::print::print_program;
 use cleave::registry::Registry;
 use melior::Context;
@@ -43,6 +44,8 @@ struct Args {
     dump_mlir: bool,
     dump_mlir_lowered: bool,
     run: bool,
+    emit_object: Option<PathBuf>,
+    emit_bindings: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -56,8 +59,11 @@ fn parse_args() -> Result<Args, String> {
     let mut dump_mlir = false;
     let mut dump_mlir_lowered = false;
     let mut run = false;
+    let mut emit_object = None;
+    let mut emit_bindings = None;
 
-    for arg in std::env::args().skip(1) {
+    let mut args_iter = std::env::args().skip(1);
+    while let Some(arg) = args_iter.next() {
         match arg.as_str() {
             "--dump-ast" => dump_ast = true,
             "--dump-inference-pass" => dump_inference_pass = true,
@@ -68,15 +74,23 @@ fn parse_args() -> Result<Args, String> {
             "--dump-mlir" => dump_mlir = true,
             "--dump-mlir-lowered" => dump_mlir_lowered = true,
             "--run" => run = true,
+            "--emit-object" => {
+                let value = args_iter.next().ok_or_else(|| "--emit-object requires a path argument".to_string())?;
+                emit_object = Some(PathBuf::from(value));
+            }
+            "--emit-bindings" => {
+                let value = args_iter.next().ok_or_else(|| "--emit-bindings requires a path argument".to_string())?;
+                emit_bindings = Some(PathBuf::from(value));
+            }
             other if other.starts_with("--") => return Err(format!("unknown flag {other:?}")),
             other if path.is_none() => path = Some(PathBuf::from(other)),
             other => return Err(format!("only one input file is supported, got a second argument {other:?}")),
         }
     }
 
-    // No `--dump-*`/`--run` flag at all defaults to today's one real pass,
-    // so the common case (`cleave file.cleave`) stays exactly as terse as
-    // before these flags existed.
+    // No `--dump-*`/`--run`/`--emit-object` flag at all defaults to today's
+    // one real pass, so the common case (`cleave file.cleave`) stays exactly
+    // as terse as before these flags existed.
     if !dump_ast
         && !dump_inference_pass
         && !dump_monomorphized
@@ -86,6 +100,8 @@ fn parse_args() -> Result<Args, String> {
         && !dump_mlir
         && !dump_mlir_lowered
         && !run
+        && emit_object.is_none()
+        && emit_bindings.is_none()
     {
         dump_inference_pass = true;
     }
@@ -102,10 +118,13 @@ fn parse_args() -> Result<Args, String> {
             dump_mlir,
             dump_mlir_lowered,
             run,
+            emit_object,
+            emit_bindings,
         }),
         None => Err(
             "usage: cleave <file.cleave> [--dump-ast] [--dump-inference-pass] [--dump-monomorphized] [--dump-cps] \
-             [--dump-cps-optimized] [--dump-cps-equivalences] [--dump-mlir] [--dump-mlir-lowered] [--run]"
+             [--dump-cps-optimized] [--dump-cps-equivalences] [--dump-mlir] [--dump-mlir-lowered] [--run] \
+             [--emit-object <path>] [--emit-bindings <path>]"
                 .to_string(),
         ),
     }
@@ -628,6 +647,24 @@ fn real_main() -> ExitCode {
         }
     }
 
+    if args.emit_object.is_some() || args.emit_bindings.is_some() {
+        let registry = Registry::build(&program);
+        if let Err(errs) =
+            cleave::pipeline::emit_from_program(&program, &registry, &sources, args.emit_object.as_deref(), args.emit_bindings.as_deref())
+        {
+            for e in &errs {
+                eprintln!("error: {e}");
+            }
+            return ExitCode::FAILURE;
+        }
+        if let Some(p) = &args.emit_object {
+            println!("wrote {}", p.display());
+        }
+        if let Some(p) = &args.emit_bindings {
+            println!("wrote {}", p.display());
+        }
+    }
+
     exit
 }
 
@@ -637,68 +674,10 @@ fn report(diags: &[cleave::diag::Diagnostic], sources: &SourceMap) {
     }
 }
 
-/// Runs whole-program type inference and monomorphization purely to check
-/// for errors, discarding `dump_monomorphized`'s own text output -- a
-/// mandatory gate before CPS conversion (`collect_units`/`convert_program`),
-/// which assumes every reachable unit's own types are already fully
-/// concrete and has no error-reporting of its own. Without this, a type
-/// error anywhere in the program (not necessarily in the function actually
-/// being compiled) can leave an unrelated generic function's call sites
-/// never seeded for monomorphization, which used to reach CPS conversion
-/// anyway and panic there with a low-level, confusing message instead of
-/// this clean diagnostic -- found by direct testing.
-/// `collect_units` + `convert_program` + `synthesize_derivatives`, bundled
-/// — every one of this file's own six pipeline entry points needs all
-/// three, in this exact order (`synthesize_derivatives` needs `f`'s own
-/// already-CPS-converted body, so strictly after `convert_program`, and
-/// strictly before the first `eliminate_dead_code` so a synthesized
-/// `fprime`'s own real calls are already visible to it) — extracted here
-/// specifically to avoid repeating the `Vec<DerivativeRequest>` extraction
-/// six times over, unlike `eliminate_dead_code`/`optimize_program`'s own
-/// sequencing just after, which genuinely does vary per call site (a second
-/// dead-code sweep here, an explanations dump there) and stays inline.
-fn build_cps_program(program: &cleave::ast::Program, registry: &Registry) -> Result<CpsProgram, Vec<String>> {
-    let units = collect_units(program, registry);
-    let requests: Vec<DerivativeRequest> = units
-        .iter()
-        .filter_map(|u| match &u.body {
-            UnitBody::Derivative(of) => Some(DerivativeRequest { name: u.name.clone(), of: of.clone() }),
-            _ => None,
-        })
-        .collect();
-    let cps_program = convert_program(units);
-    synthesize_derivatives(cps_program, &requests, registry)
-}
-
-fn check_type_errors(program: &cleave::ast::Program, registry: &Registry) -> Result<(), Vec<cleave::diag::Diagnostic>> {
-    let (_, errs) = cleave::monomorphize::dump_monomorphized(program, registry);
-    let mut diags: Vec<cleave::diag::Diagnostic> = errs.iter().map(cleave::diag::Diagnostic::from).collect();
-    diags.extend(check_mutability_errors(program));
-    if diags.is_empty() { Ok(()) } else { Err(diags) }
-}
-
-/// A purely syntactic pass (`cleave::infer::check_mutability`, no type
-/// information needed) run once per `fn` body anywhere in the program — a
-/// top-level `fn`, and every method of every algebra/inherent `impl` — since
-/// none of those go through `callgraph::infer_program`'s own whole-program
-/// walk uniformly enough to hang this off of instead.
-fn check_mutability_errors(program: &cleave::ast::Program) -> Vec<cleave::diag::Diagnostic> {
-    let mut errors = Vec::new();
-    for item in &program.items {
-        let fns: Vec<&cleave::ast::FnDecl> = match &item.kind {
-            cleave::ast::ItemKind::Fn(f) => vec![f],
-            cleave::ast::ItemKind::Impl(d) => d.fns.iter().collect(),
-            cleave::ast::ItemKind::InherentImpl(d) => d.fns.iter().collect(),
-            _ => vec![],
-        };
-        for f in fns {
-            if let Err(e) = cleave::infer::check_mutability(f) {
-                errors.push(cleave::diag::Diagnostic::from(&e));
-            }
-        }
-    }
-    errors
-}
+// `build_cps_program`/`check_type_errors` now live in `cleave::pipeline`
+// (imported above) -- shared with `cleave-build`'s own in-process build-
+// script API, which needs the identical pipeline glue outside this binary
+// entirely. See that module's own doc comment.
 
 #[cfg(test)]
 mod stdlib_smoke {

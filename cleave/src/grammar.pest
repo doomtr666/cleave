@@ -60,8 +60,22 @@ attribute_arg = { ident }
 // print ... }`) each need to bind a genuinely *different* C symbol, so the
 // symbol can't always just be the method's own name the way it can at the
 // top level (see `ast.rs`'s own `FnDecl::extern_symbol` doc comment).
-fn_decl = { attribute* ~ extern_kw? ~ "fn" ~ ident ~ generic_params? ~ "(" ~ param_list? ~ ")" ~ ("->" ~ type_)? ~ (block | ";") }
+// `export_kw` is `extern_kw`'s inverse, not its mirror-by-body-presence:
+// `extern fn` says a real implementation lives *outside* cleave already
+// (bodyless, `ast.rs`'s own `FnDecl::is_extern` doc comment); `export fn`
+// says *this* cleave definition (body required) should be made callable
+// from outside cleave, under a stable, real symbol -- a different
+// direction, not a different shape of the same fact, hence its own keyword
+// rather than overloading `extern fn` by whether a body happens to be
+// present. The `(extern_kw | export_kw)?` alternation below gives mutual
+// exclusion for free at the grammar level -- no separate semantic check
+// needed to reject `extern export fn` or similar.
+fn_decl = { attribute* ~ (extern_kw | export_kw)? ~ "fn" ~ ident ~ generic_params? ~ "(" ~ param_list? ~ ")" ~ ("->" ~ type_)? ~ (block | ";") }
 extern_kw = { "extern" ~ ("(" ~ ident ~ ")")? }
+// Same optional `(symbol)` override as `extern_kw`, same reason: inside an
+// algebra `impl`, several concrete impls of the same method name each need
+// a genuinely different real exported symbol.
+export_kw = { "export" ~ ("(" ~ ident ~ ")")? }
 
 // `fprime = derive(f);` -- toward auto-diff (`doc/backlog.md`), a new
 // top-level item declaring `fprime` as the mechanically-derived derivative

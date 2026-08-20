@@ -1,0 +1,8 @@
+// A minimal `export fn` demo -- see `doc/backlog.md`'s "Rust-callable
+// cleave" item. Deliberately no `fn main()` here: a cleave source file
+// meant to become a Rust-callable library shouldn't declare one -- it
+// would collide with the *host*'s own `main` once linked in (found by
+// direct testing while building this mechanism).
+export fn cleave_add(a: i32, b: i32) -> i32 {
+    a + b
+}

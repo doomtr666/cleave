@@ -2384,6 +2384,8 @@ pub fn synthesize_derivatives(program: CpsProgram, requests: &[DerivativeRequest
             result,
             k_ret,
             origin: None,
+            is_export: false,
+            export_symbol: None,
         });
     }
 
@@ -2684,6 +2686,8 @@ mod tests {
             result: i32_ty(),
             k_ret: 12,
             origin: Some(("TestRing".to_string(), "add".to_string())),
+            is_export: false,
+            export_symbol: None,
         };
         let mut units: HashMap<String, &CTopLevelFn> = HashMap::new();
         units.insert("TestRing::add<i32>".to_string(), &callee);
@@ -2861,6 +2865,8 @@ mod tests {
             result: i32_ty(),
             k_ret: 12,
             origin: Some(("Ring".to_string(), "add".to_string())),
+            is_export: false,
+            export_symbol: None,
         };
         let mut units: HashMap<String, &CTopLevelFn> = HashMap::new();
         units.insert("Ring::add<i32>".to_string(), &callee);
@@ -2911,6 +2917,8 @@ mod tests {
             result: i32_ty(),
             k_ret: 11,
             origin: None,
+            is_export: false,
+            export_symbol: None,
         };
         let mut units: HashMap<String, &CTopLevelFn> = HashMap::new();
         units.insert("branchy".to_string(), &callee);
@@ -3006,6 +3014,8 @@ mod tests {
             result: i32_ty(),
             k_ret: 12,
             origin: Some(("Ring".to_string(), "add".to_string())),
+            is_export: false,
+            export_symbol: None,
         }
     }
 
@@ -3110,6 +3120,8 @@ mod tests {
             result: i32_ty(),
             k_ret: 11,
             origin: Some(("Print".to_string(), "print".to_string())),
+            is_export: false,
+            export_symbol: None,
         };
         let mut units: HashMap<String, &CTopLevelFn> = HashMap::new();
         units.insert("Print<i32>::print".to_string(), &callee);
