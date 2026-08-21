@@ -46,6 +46,7 @@ struct Args {
     run: bool,
     emit_object: Option<PathBuf>,
     emit_bindings: Option<PathBuf>,
+    emit_exe: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -61,6 +62,7 @@ fn parse_args() -> Result<Args, String> {
     let mut run = false;
     let mut emit_object = None;
     let mut emit_bindings = None;
+    let mut emit_exe = None;
 
     let mut args_iter = std::env::args().skip(1);
     while let Some(arg) = args_iter.next() {
@@ -82,6 +84,10 @@ fn parse_args() -> Result<Args, String> {
                 let value = args_iter.next().ok_or_else(|| "--emit-bindings requires a path argument".to_string())?;
                 emit_bindings = Some(PathBuf::from(value));
             }
+            "--emit-exe" => {
+                let value = args_iter.next().ok_or_else(|| "--emit-exe requires a path argument".to_string())?;
+                emit_exe = Some(PathBuf::from(value));
+            }
             other if other.starts_with("--") => return Err(format!("unknown flag {other:?}")),
             other if path.is_none() => path = Some(PathBuf::from(other)),
             other => return Err(format!("only one input file is supported, got a second argument {other:?}")),
@@ -102,6 +108,7 @@ fn parse_args() -> Result<Args, String> {
         && !run
         && emit_object.is_none()
         && emit_bindings.is_none()
+        && emit_exe.is_none()
     {
         dump_inference_pass = true;
     }
@@ -120,11 +127,12 @@ fn parse_args() -> Result<Args, String> {
             run,
             emit_object,
             emit_bindings,
+            emit_exe,
         }),
         None => Err(
             "usage: cleave <file.cleave> [--dump-ast] [--dump-inference-pass] [--dump-monomorphized] [--dump-cps] \
              [--dump-cps-optimized] [--dump-cps-equivalences] [--dump-mlir] [--dump-mlir-lowered] [--run] \
-             [--emit-object <path>] [--emit-bindings <path>]"
+             [--emit-object <path>] [--emit-bindings <path>] [--emit-exe <path>]"
                 .to_string(),
         ),
     }
@@ -586,50 +594,11 @@ fn real_main() -> ExitCode {
         }
 
         let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
-        // A short, explicit, hardcoded list -- grows one line per `extern
-        // fn` the Rust-implemented runtime (`cleave-rt`) actually provides.
-        // Registering by real function pointer, not dynamic symbol lookup by
-        // name, is what lets this sidestep the Windows/MSVC CRT-symbol-
-        // visibility questions a raw libc binding would run into.
-        // SAFETY: each `cleave_rt::*` pointer is a real, valid `extern "C"
-        // fn`, live for the process's whole lifetime.
+        // SAFETY: see `cleave::pipeline::register_cleave_rt_symbols`'s own
+        // doc comment -- shared with `--emit-object`, which needs the
+        // identical registration for a reason specific to it (see there).
         unsafe {
-            engine.register_symbol("print_i8", cleave_rt::print_i8 as *mut ());
-            engine.register_symbol("print_i16", cleave_rt::print_i16 as *mut ());
-            engine.register_symbol("print_i32", cleave_rt::print_i32 as *mut ());
-            engine.register_symbol("print_i64", cleave_rt::print_i64 as *mut ());
-            engine.register_symbol("print_f32", cleave_rt::print_f32 as *mut ());
-            engine.register_symbol("print_f64", cleave_rt::print_f64 as *mut ());
-            engine.register_symbol("print_bytes", cleave_rt::print_bytes as *mut ());
-            engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
-            engine.register_symbol("dynarray_alloc_i8", cleave_rt::dynarray_alloc_i8 as *mut ());
-            engine.register_symbol("dynarray_grow_i8", cleave_rt::dynarray_grow_i8 as *mut ());
-            engine.register_symbol("dynarray_get_i8", cleave_rt::dynarray_get_i8 as *mut ());
-            engine.register_symbol("dynarray_set_i8", cleave_rt::dynarray_set_i8 as *mut ());
-            engine.register_symbol("dynarray_alloc_i16", cleave_rt::dynarray_alloc_i16 as *mut ());
-            engine.register_symbol("dynarray_grow_i16", cleave_rt::dynarray_grow_i16 as *mut ());
-            engine.register_symbol("dynarray_get_i16", cleave_rt::dynarray_get_i16 as *mut ());
-            engine.register_symbol("dynarray_set_i16", cleave_rt::dynarray_set_i16 as *mut ());
-            engine.register_symbol("dynarray_alloc_i32", cleave_rt::dynarray_alloc_i32 as *mut ());
-            engine.register_symbol("dynarray_grow_i32", cleave_rt::dynarray_grow_i32 as *mut ());
-            engine.register_symbol("dynarray_get_i32", cleave_rt::dynarray_get_i32 as *mut ());
-            engine.register_symbol("dynarray_set_i32", cleave_rt::dynarray_set_i32 as *mut ());
-            engine.register_symbol("dynarray_alloc_i64", cleave_rt::dynarray_alloc_i64 as *mut ());
-            engine.register_symbol("dynarray_grow_i64", cleave_rt::dynarray_grow_i64 as *mut ());
-            engine.register_symbol("dynarray_get_i64", cleave_rt::dynarray_get_i64 as *mut ());
-            engine.register_symbol("dynarray_set_i64", cleave_rt::dynarray_set_i64 as *mut ());
-            engine.register_symbol("dynarray_alloc_f32", cleave_rt::dynarray_alloc_f32 as *mut ());
-            engine.register_symbol("dynarray_grow_f32", cleave_rt::dynarray_grow_f32 as *mut ());
-            engine.register_symbol("dynarray_get_f32", cleave_rt::dynarray_get_f32 as *mut ());
-            engine.register_symbol("dynarray_set_f32", cleave_rt::dynarray_set_f32 as *mut ());
-            engine.register_symbol("dynarray_alloc_f64", cleave_rt::dynarray_alloc_f64 as *mut ());
-            engine.register_symbol("dynarray_grow_f64", cleave_rt::dynarray_grow_f64 as *mut ());
-            engine.register_symbol("dynarray_get_f64", cleave_rt::dynarray_get_f64 as *mut ());
-            engine.register_symbol("dynarray_set_f64", cleave_rt::dynarray_set_f64 as *mut ());
-            engine.register_symbol("dynarray_alloc_ptr", cleave_rt::dynarray_alloc_ptr as *mut ());
-            engine.register_symbol("dynarray_grow_ptr", cleave_rt::dynarray_grow_ptr as *mut ());
-            engine.register_symbol("dynarray_get_ptr", cleave_rt::dynarray_get_ptr as *mut ());
-            engine.register_symbol("dynarray_set_ptr", cleave_rt::dynarray_set_ptr as *mut ());
+            cleave::pipeline::register_cleave_rt_symbols(&engine);
         }
         let mut result: i32 = -1;
         // SAFETY: `result` is a live, correctly-aligned `i32` on the stack
@@ -663,6 +632,17 @@ fn real_main() -> ExitCode {
         if let Some(p) = &args.emit_bindings {
             println!("wrote {}", p.display());
         }
+    }
+
+    if let Some(exe_path) = &args.emit_exe {
+        let registry = Registry::build(&program);
+        if let Err(errs) = cleave::pipeline::emit_exe(&program, &registry, &sources, exe_path) {
+            for e in &errs {
+                eprintln!("error: {e}");
+            }
+            return ExitCode::FAILURE;
+        }
+        println!("wrote {}", exe_path.display());
     }
 
     exit

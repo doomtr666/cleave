@@ -88,13 +88,7 @@ pub fn emit_from_program(
     bindings_path: Option<&Path>,
 ) -> Result<(), Vec<String>> {
     check_type_errors(program, registry).map_err(|errs| render_all(&errs, sources))?;
-
-    let cps_program = build_cps_program(program, registry)?;
-    let cps_program = eliminate_dead_code(cps_program);
-    let (cps_program, _) = optimize_program(cps_program, registry);
-    // See `--dump-cps-optimized`'s own comment in `main.rs`: a second sweep
-    // is needed to catch a unit `optimize_program` itself made unreachable.
-    let cps_program = eliminate_dead_code(cps_program);
+    let cps_program = build_optimized_cps(program, registry)?;
 
     if let Some(bindings_path) = bindings_path {
         let bindings = crate::rust_bindings::generate_rust_bindings(&cps_program.funcs)?;
@@ -107,6 +101,17 @@ pub fn emit_from_program(
     }
 
     Ok(())
+}
+
+/// `build_cps_program` + the standard `eliminate_dead_code` / `optimize_
+/// program` / `eliminate_dead_code` sequencing every pipeline entry point
+/// needs (see `--dump-cps-optimized`'s own comment in `main.rs` for why the
+/// second sweep is needed) -- shared by `emit_from_program` and `emit_exe`.
+fn build_optimized_cps(program: &Program, registry: &Registry) -> Result<CpsProgram, Vec<String>> {
+    let cps_program = build_cps_program(program, registry)?;
+    let cps_program = eliminate_dead_code(cps_program);
+    let (cps_program, _) = optimize_program(cps_program, registry);
+    Ok(eliminate_dead_code(cps_program))
 }
 
 /// Parses/merges/resolves `sources_in` from scratch (`driver::compile`'s
@@ -124,6 +129,72 @@ pub fn compile_and_emit(
     let program = result.map_err(|errs| render_all(&errs, &sources))?;
     let registry = Registry::build(&program);
     emit_from_program(&program, &registry, &sources, object_path, bindings_path)
+}
+
+/// Registers every real `cleave-rt` function by pointer against `engine` --
+/// shared by `--run` (`main.rs`) and `emit_object` below. A short, explicit,
+/// hardcoded list, growing one line per `extern fn` `cleave-rt` provides;
+/// registering by real function pointer, not dynamic symbol lookup by name,
+/// sidesteps the Windows/MSVC CRT-symbol-visibility questions a raw libc
+/// binding would run into.
+///
+/// Needed for *object emission* too, not just real JIT invocation, found by
+/// direct testing: `ExecutionEngine::new`/`dump_to_object_file` apparently
+/// still needs every externally-called symbol resolvable at construction
+/// time even though nothing is ever actually invoked through this engine
+/// instance -- omitting registration crashed hard (`STATUS_STACK_BUFFER_
+/// OVERRUN`) the moment a compiled program called a real `extern fn`
+/// (`print_i32`, say), where every earlier `--emit-object` test happened to
+/// only exercise `export fn`s with no `extern fn` calls in their own
+/// bodies, so this went unnoticed until a program mixing both was tried.
+/// The registered pointer only satisfies the engine's own internal
+/// requirement, though -- confirmed directly (`llvm-nm` on the emitted
+/// `.o`) that the real external symbol still comes out as an ordinary
+/// undefined (`U`) relocation, not a baked-in address: the actual object
+/// file is unaffected, still meant to be resolved later by a real linker
+/// against `cleave-rt`'s own staticlib.
+///
+/// SAFETY: each `cleave_rt::*` pointer is a real, valid `extern "C" fn`,
+/// live for the process's whole lifetime.
+pub unsafe fn register_cleave_rt_symbols(engine: &melior::ExecutionEngine) {
+    unsafe {
+        engine.register_symbol("print_i8", cleave_rt::print_i8 as *mut ());
+        engine.register_symbol("print_i16", cleave_rt::print_i16 as *mut ());
+        engine.register_symbol("print_i32", cleave_rt::print_i32 as *mut ());
+        engine.register_symbol("print_i64", cleave_rt::print_i64 as *mut ());
+        engine.register_symbol("print_f32", cleave_rt::print_f32 as *mut ());
+        engine.register_symbol("print_f64", cleave_rt::print_f64 as *mut ());
+        engine.register_symbol("print_bytes", cleave_rt::print_bytes as *mut ());
+        engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
+        engine.register_symbol("dynarray_alloc_i8", cleave_rt::dynarray_alloc_i8 as *mut ());
+        engine.register_symbol("dynarray_grow_i8", cleave_rt::dynarray_grow_i8 as *mut ());
+        engine.register_symbol("dynarray_get_i8", cleave_rt::dynarray_get_i8 as *mut ());
+        engine.register_symbol("dynarray_set_i8", cleave_rt::dynarray_set_i8 as *mut ());
+        engine.register_symbol("dynarray_alloc_i16", cleave_rt::dynarray_alloc_i16 as *mut ());
+        engine.register_symbol("dynarray_grow_i16", cleave_rt::dynarray_grow_i16 as *mut ());
+        engine.register_symbol("dynarray_get_i16", cleave_rt::dynarray_get_i16 as *mut ());
+        engine.register_symbol("dynarray_set_i16", cleave_rt::dynarray_set_i16 as *mut ());
+        engine.register_symbol("dynarray_alloc_i32", cleave_rt::dynarray_alloc_i32 as *mut ());
+        engine.register_symbol("dynarray_grow_i32", cleave_rt::dynarray_grow_i32 as *mut ());
+        engine.register_symbol("dynarray_get_i32", cleave_rt::dynarray_get_i32 as *mut ());
+        engine.register_symbol("dynarray_set_i32", cleave_rt::dynarray_set_i32 as *mut ());
+        engine.register_symbol("dynarray_alloc_i64", cleave_rt::dynarray_alloc_i64 as *mut ());
+        engine.register_symbol("dynarray_grow_i64", cleave_rt::dynarray_grow_i64 as *mut ());
+        engine.register_symbol("dynarray_get_i64", cleave_rt::dynarray_get_i64 as *mut ());
+        engine.register_symbol("dynarray_set_i64", cleave_rt::dynarray_set_i64 as *mut ());
+        engine.register_symbol("dynarray_alloc_f32", cleave_rt::dynarray_alloc_f32 as *mut ());
+        engine.register_symbol("dynarray_grow_f32", cleave_rt::dynarray_grow_f32 as *mut ());
+        engine.register_symbol("dynarray_get_f32", cleave_rt::dynarray_get_f32 as *mut ());
+        engine.register_symbol("dynarray_set_f32", cleave_rt::dynarray_set_f32 as *mut ());
+        engine.register_symbol("dynarray_alloc_f64", cleave_rt::dynarray_alloc_f64 as *mut ());
+        engine.register_symbol("dynarray_grow_f64", cleave_rt::dynarray_grow_f64 as *mut ());
+        engine.register_symbol("dynarray_get_f64", cleave_rt::dynarray_get_f64 as *mut ());
+        engine.register_symbol("dynarray_set_f64", cleave_rt::dynarray_set_f64 as *mut ());
+        engine.register_symbol("dynarray_alloc_ptr", cleave_rt::dynarray_alloc_ptr as *mut ());
+        engine.register_symbol("dynarray_grow_ptr", cleave_rt::dynarray_grow_ptr as *mut ());
+        engine.register_symbol("dynarray_get_ptr", cleave_rt::dynarray_get_ptr as *mut ());
+        engine.register_symbol("dynarray_set_ptr", cleave_rt::dynarray_set_ptr as *mut ());
+    }
 }
 
 /// The three-stage MLIR-to-`llvm`-dialect lowering pipeline `--run`/`--dump-
@@ -172,12 +243,11 @@ fn emit_object(program: &Program, cps_program: &CpsProgram, object_path: &Path) 
         return Err(vec!["MLIR-to-LLVM lowering pass failed (to-llvm)".to_string()]);
     }
 
-    // `enable_object_dump = true` (the JIT path always passes `false`) --
-    // no symbol registration (JIT-only), no `invoke_packed`: an unresolved
-    // call into `cleave-rt` stays an ordinary external symbol reference in
-    // the emitted object, resolved later by a real linker against
-    // `cleave-rt`'s own staticlib.
     let engine = melior::ExecutionEngine::new(&module, 2, &[], true, false);
+    // SAFETY: see `register_cleave_rt_symbols`'s own doc comment.
+    unsafe {
+        register_cleave_rt_symbols(&engine);
+    }
     let Some(object_path_str) = object_path.to_str() else {
         return Err(vec![format!("object path {object_path:?} is not valid UTF-8")]);
     };
@@ -185,3 +255,123 @@ fn emit_object(program: &Program, cps_program: &CpsProgram, object_path: &Path) 
     Ok(())
 }
 
+/// The fixed internal symbol cleave's own `fn main()` gets renamed to when
+/// compiling a standalone executable (`emit_exe` below) -- never seen by a
+/// cleave program's own author, purely an implementation detail of the
+/// generated Rust shim's own linking. See `emit_exe`'s own doc comment for
+/// why a rename is needed at all.
+const EXE_ENTRY_SYMBOL: &str = "__cleave_program_main";
+
+/// Compiles `program` all the way to a real, standalone `.exe` at
+/// `exe_path` -- `emit_object` plus a real link step (`emit_object`/`--
+/// emit-object` alone only ever produces a `.o`, still needing an external
+/// linker to become anything runnable).
+///
+/// The real work here, beyond `emit_object`: cleave's own compiled `main`
+/// gets the literal LLVM/object-file symbol name `main` (`mlir_lower.rs`'s
+/// own `lower_top_level_fn`) -- which collides with a *real* Rust binary's
+/// own `fn main()` (confirmed directly: linking two objects that both
+/// define `main` fails with `duplicate symbol: main`, and an ordinary
+/// `rustc`-compiled `fn main()` genuinely does emit a real, unmangled
+/// `main` symbol of its own, needed by `std`'s own runtime-startup code to
+/// call back into it). So this reuses the *already-existing* `export fn`
+/// symbol-override mechanism (`ast.rs`'s own `FnDecl::is_export`/
+/// `export_symbol`, `mlir_lower.rs`'s own resulting symbol-name logic) to
+/// rename just `main`'s own emitted symbol to `EXE_ENTRY_SYMBOL` -- no new
+/// MLIR-lowering code needed at all, just flipping the same two fields a
+/// real `export fn` would set, directly on the `CTopLevelFn` found by name
+/// after CPS conversion.
+///
+/// The actual link step shells out to `rustc` (first `std::process::
+/// Command` use in this codebase) against a tiny, generated Rust "shim"
+/// source (`fn main() { std::process::exit(unsafe { EXE_ENTRY_SYMBOL() })
+/// }` for an `i32`-returning cleave `main`, just a bare call for a unit-
+/// returning one) -- not a raw system linker (`clang`/`lld-link` directly),
+/// found necessary by direct testing: `cleave-rt` links Rust's own `std`,
+/// which needs a real, sizeable list of Windows system libraries
+/// (`ws2_32`, `ntdll`, `userenv`, `bcrypt`, ...) that only `rustc`'s own
+/// linker invocation knows how to supply correctly and keeps up to date --
+/// a bare `clang -o exe kernel.o cleave_rt.lib` left ~30 unresolved
+/// external symbols. `rustc` still only *drives* the link, though: nothing
+/// here hardcodes MSVC's own `link.exe` as the actual linker backend --
+/// `rustc`'s own default on this platform is used as-is (this project's
+/// own MLIR dependency doesn't remove the need for a working Rust
+/// toolchain to build `cleave` itself in the first place, so requiring one
+/// again here adds no new prerequisite).
+pub fn emit_exe(program: &Program, registry: &Registry, sources: &SourceMap, exe_path: &Path) -> Result<(), Vec<String>> {
+    check_type_errors(program, registry).map_err(|errs| render_all(&errs, sources))?;
+    let mut cps_program = build_optimized_cps(program, registry)?;
+
+    let Some(main_fn) = cps_program.funcs.iter_mut().find(|f| f.def.name == "main") else {
+        return Err(vec!["no `fn main()` found -- a standalone executable needs a real entry point".to_string()]);
+    };
+    main_fn.is_export = true;
+    main_fn.export_symbol = Some(EXE_ENTRY_SYMBOL.to_string());
+    let main_returns_i32 = !matches!(&main_fn.result, crate::infer::Ty::Con(name) if name == "()");
+
+    // A process id alone isn't a unique enough work-dir name -- found by
+    // direct testing (`cargo test`'s own default parallel test execution
+    // runs multiple `emit_exe` calls concurrently, *within the same test
+    // process*, so several calls sharing one PID clobbered each other's
+    // `program.o`/`shim.rs` mid-flight, non-deterministically linking
+    // whichever call's files happened to still be on disk). A monotonic
+    // counter, unique per call within this process, added alongside the PID
+    // (still useful for a human skimming `%TEMP%`) closes the gap.
+    static WORK_DIR_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let call_id = WORK_DIR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let work_dir = std::env::temp_dir().join(format!("cleave_emit_exe_{}_{call_id}", std::process::id()));
+    std::fs::create_dir_all(&work_dir).map_err(|e| vec![format!("failed to create a temp directory: {e}")])?;
+    let object_path = work_dir.join("program.o");
+    let shim_path = work_dir.join("shim.rs");
+
+    emit_object(program, &cps_program, &object_path)?;
+
+    let shim_src = if main_returns_i32 {
+        format!("unsafe extern \"C\" {{ fn {EXE_ENTRY_SYMBOL}() -> i32; }}\nfn main() {{ std::process::exit(unsafe {{ {EXE_ENTRY_SYMBOL}() }}); }}\n")
+    } else {
+        format!("unsafe extern \"C\" {{ fn {EXE_ENTRY_SYMBOL}(); }}\nfn main() {{ unsafe {{ {EXE_ENTRY_SYMBOL}() }}; }}\n")
+    };
+    std::fs::write(&shim_path, shim_src).map_err(|e| vec![format!("failed to write {}: {e}", shim_path.display())])?;
+
+    let runtime_dir = cleave_rt_search_dir()?;
+    let status = std::process::Command::new("rustc")
+        .arg(&shim_path)
+        .arg("-o")
+        .arg(exe_path)
+        .arg("-C")
+        .arg(format!("link-arg={}", object_path.display()))
+        .arg("-L")
+        .arg(&runtime_dir)
+        .arg("-l")
+        .arg("cleave_rt")
+        .status();
+    let _ = std::fs::remove_dir_all(&work_dir);
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(vec![format!("rustc failed while linking the final executable (exit status: {s})")]),
+        Err(e) => Err(vec![format!("failed to run `rustc` (is it on PATH?): {e}")]),
+    }
+}
+
+/// `cleave_rt.lib`/`libcleave_rt.a` sits alongside `cleave.exe` itself in an
+/// ordinary `cargo build`/`cargo run` -- both land in the same
+/// `target/<profile>/` directory. A `cargo test`-built test binary is one
+/// level deeper (`target/<profile>/deps/`), where only a *hash-suffixed*
+/// copy exists (Cargo's own convention for a dependency built once but
+/// consumed by several test binaries) -- found directly testing this exact
+/// code path from `tests/pipeline.rs`, so both layouts are checked here,
+/// preferring the running executable's own immediate directory first.
+/// Known, deliberate limitation beyond that: a `cleave` binary copied/
+/// installed somewhere with neither layout nearby won't find one.
+fn cleave_rt_search_dir() -> Result<PathBuf, Vec<String>> {
+    let exe = std::env::current_exe().map_err(|e| vec![format!("failed to locate the running cleave executable: {e}")])?;
+    let candidates = exe.ancestors().skip(1).take(2);
+    for dir in candidates {
+        if dir.join("cleave_rt.lib").exists() || dir.join("libcleave_rt.a").exists() {
+            return Ok(dir.to_path_buf());
+        }
+    }
+    exe.parent()
+        .map(|p| p.to_path_buf())
+        .ok_or_else(|| vec![format!("cleave executable path {} has no parent directory", exe.display())])
+}
