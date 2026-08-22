@@ -21,16 +21,37 @@
 //! real use ever needs several independently-cached objects linked
 //! together.
 //!
-//! Deliberately not published/generalized beyond this workspace yet: the
-//! `cleave-rt` staticlib is located by walking up from `OUT_DIR` to the
-//! shared `target/<profile>/` directory (see `runtime_search_dir` below) --
-//! correct for an ordinary, non-cross-compiled build within *this*
-//! workspace, not yet handling a `--target <triple>` build (which inserts
-//! an extra `target/<triple>/` path segment) or a consumer outside this
-//! workspace's own `cleave-rt`.
+//! Deliberately not published/generalized beyond this workspace yet:
+//! `cleave-rt` is located as a fixed sibling directory of `cleave-build`
+//! itself (`env!("CARGO_MANIFEST_DIR")/../cleave-rt` -- compile-time, *this*
+//! crate's own directory, not whichever consumer's build script ends up
+//! running this code -- see `build_cleave_rt`'s own doc comment) -- correct
+//! for *this* workspace's own fixed layout, not a consumer outside it.
+//!
+//! `cleave-rt`'s own staticlib is built by this module directly (a nested
+//! `cargo build` invocation, into its own dedicated target directory under
+//! `OUT_DIR`) rather than assumed to already exist -- found by direct
+//! testing that it's genuinely necessary: Cargo does *not* materialize a
+//! dependency's extra declared `crate-type`s (`cleave-rt/Cargo.toml`'s own
+//! `["rlib", "staticlib"]`) just because it's pulled in transitively (via
+//! `cleave` here) -- only an ordinary `rlib` gets built and linked into
+//! `cleave` itself. Only `cargo build -p cleave-rt` (or `--workspace`),
+//! naming it as a build *target* in its own right, produces the `.lib`/
+//! `.a`. An earlier version of this module assumed the artifact would
+//! simply already be there (reasoning: "Cargo must have built cleave-rt
+//! already to build `cleave`/`cleave-build` itself") -- true for the
+//! `.rlib`, but not the `.lib`, and this went unnoticed until a `--release`
+//! build (never separately `cargo build -p cleave-rt --release`d by hand
+//! the way `--debug` happened to have been) hit `LNK1181: cannot open
+//! input file 'cleave_rt.lib'`. A dedicated target directory (rather than
+//! reusing the outer build's own shared one) sidesteps any risk of lock
+//! contention between this nested `cargo build` and the outer one already
+//! in progress -- the cost is `cleave-rt` (small, fast to compile, no heavy
+//! dependencies) rebuilding once per consuming crate rather than being
+//! shared, an acceptable trade for correctness here.
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Convenience wrapper matching `ispc::compile_library`'s own shape:
 /// `cleave_build::compile_library("kernel", &["src/kernel.cleave"])`.
@@ -102,23 +123,45 @@ impl Build {
 
         println!("cargo:rustc-link-arg={}", object_path.display());
         println!("cargo:rustc-link-lib=static=cleave_rt");
-        println!("cargo:rustc-link-search=native={}", runtime_search_dir().display());
+        println!("cargo:rustc-link-search=native={}", build_cleave_rt(&out_dir).display());
     }
 }
 
-/// `OUT_DIR` for a build script is `target/<profile>/build/<pkg>-<hash>/out`
-/// -- three levels up is the shared `target/<profile>/` directory every
-/// crate-type artifact in this workspace's build lands in, including
-/// `cleave-rt`'s own `cleave_rt.lib`/`.a` (`cleave-rt/Cargo.toml`'s own
-/// `crate-type = ["rlib", "staticlib"]`). Reliable *because* `cleave-rt` is
-/// a transitive dependency of `cleave-build` itself (via `cleave`) -- Cargo
-/// must already have built it before a consumer's `build.rs` (which itself
-/// depends on `cleave-build`) can even run.
-fn runtime_search_dir() -> PathBuf {
-    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("cleave-build must run inside a build script (OUT_DIR unset)"));
-    out_dir
-        .ancestors()
-        .nth(3)
-        .unwrap_or_else(|| panic!("cleave-build: OUT_DIR {} has an unexpected shape", out_dir.display()))
-        .to_path_buf()
+/// Builds `cleave-rt`'s own staticlib into `<out_dir>/cleave-rt-target/
+/// <profile>/` (a dedicated target directory, not the outer build's shared
+/// one -- see the module's own doc comment for why) and returns that
+/// directory, ready for `cargo:rustc-link-search=native=...`.
+fn build_cleave_rt(out_dir: &Path) -> PathBuf {
+    // `env!` (compile-time), not `env::var` (runtime): this code runs
+    // *inside* the consuming crate's own build script process, where a
+    // runtime `CARGO_MANIFEST_DIR` lookup would give *that* crate's own
+    // directory (found by direct testing: `rust-interop-demo`'s, producing
+    // a nonsensical `.../rust-interop-demo/../cleave-rt` path that doesn't
+    // exist) -- `env!` instead bakes in *this* crate's (`cleave-build`'s)
+    // own manifest directory at the point `cleave-build` itself was
+    // compiled, which is what "a fixed sibling in this workspace's own
+    // layout" actually needs to be relative to.
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let cleave_rt_manifest = manifest_dir.join("../cleave-rt/Cargo.toml");
+
+    // `PROFILE` (a build-script env var Cargo always sets) is exactly
+    // "debug" or "release" -- conveniently, the same two strings Cargo's
+    // own target-directory naming uses, so no separate translation needed
+    // between "which profile is the outer build using" and "which
+    // subdirectory will the nested build's own output land in".
+    let profile = env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
+    let target_dir = out_dir.join("cleave-rt-target");
+
+    let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let mut cmd = std::process::Command::new(cargo);
+    cmd.arg("build").arg("--manifest-path").arg(&cleave_rt_manifest).arg("--target-dir").arg(&target_dir).arg("--quiet");
+    if profile == "release" {
+        cmd.arg("--release");
+    }
+    let status = cmd
+        .status()
+        .unwrap_or_else(|e| panic!("cleave-build: failed to run `cargo build` for cleave-rt's own staticlib: {e}"));
+    assert!(status.success(), "cleave-build: `cargo build` for cleave-rt's own staticlib failed (exit status: {status})");
+
+    target_dir.join(profile)
 }
