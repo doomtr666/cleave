@@ -308,7 +308,9 @@ impl Subst {
             // following. Reachable bare here only via `apply`'s own direct
             // recursion from that `App` arm, never as a genuinely top-level
             // query.
-            Ty::PackResolved(elems) => Ty::PackResolved(elems.iter().map(|e| self.apply(e)).collect()),
+            Ty::PackResolved(elems) => {
+                Ty::PackResolved(elems.iter().map(|e| self.apply(e)).collect())
+            }
             // Folds the moment the underlying pack var resolves — reuses
             // `Ty::Pack`'s own chase above rather than looking `v` up in
             // `bindings` a second, separate way, so it agrees exactly with
@@ -328,9 +330,10 @@ impl Subst {
                 }
                 Ty::App(name.clone(), out)
             }
-            Ty::Fn(params, ret) => {
-                Ty::Fn(params.iter().map(|p| self.apply(p)).collect(), Box::new(self.apply(ret)))
-            }
+            Ty::Fn(params, ret) => Ty::Fn(
+                params.iter().map(|p| self.apply(p)).collect(),
+                Box::new(self.apply(ret)),
+            ),
             // `size` resolving to a whole `PackResolved` list means this one
             // syntactic level stands for however many real nesting levels
             // the pack has — expanded into the real nested chain, mirroring
@@ -340,7 +343,10 @@ impl Subst {
             Ty::Array(elem, size) => {
                 let elem = self.apply(elem);
                 match self.apply(size) {
-                    Ty::PackResolved(dims) => dims.into_iter().rev().fold(elem, |acc, dim| Ty::Array(Box::new(acc), Box::new(dim))),
+                    Ty::PackResolved(dims) => dims
+                        .into_iter()
+                        .rev()
+                        .fold(elem, |acc, dim| Ty::Array(Box::new(acc), Box::new(dim))),
                     size => Ty::Array(Box::new(elem), Box::new(size)),
                 }
             }
@@ -468,15 +474,31 @@ impl std::fmt::Display for Ty {
             Ty::Var(TyVar(id)) => write!(f, "'t{id}"),
             Ty::Pack(TyVar(id)) => write!(f, "'t{id}..."),
             Ty::PackResolved(elems) => {
-                write!(f, "{}", elems.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "))
+                write!(
+                    f,
+                    "{}",
+                    elems
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
             }
             Ty::PackLen(TyVar(id)) => write!(f, "'t{id}...len()"),
             Ty::App(name, args) => {
-                let args = args.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ");
+                let args = args
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 write!(f, "{name}<{args}>")
             }
             Ty::Fn(params, ret) => {
-                let params = params.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ");
+                let params = params
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 write!(f, "({params}) -> {ret}")
             }
             Ty::Array(elem, size) => write!(f, "[{elem}; {size}]"),
@@ -494,8 +516,7 @@ impl std::fmt::Display for Ty {
 /// expressions". Appended to the relevant `Display` impls below rather than
 /// left for the reader to have to already know the rule and reconstruct it
 /// from a bare `no impl Num<()>`/`found ()`.
-const UNIT_DISCARD_HINT: &str =
-    "(note: `()` usually means a block's last expression was followed by a `;`, discarding its value — check whether that `;` should be removed so it becomes the block's tail instead)";
+const UNIT_DISCARD_HINT: &str = "(note: `()` usually means a block's last expression was followed by a `;`, discarding its value — check whether that `;` should be removed so it becomes the block's tail instead)";
 
 fn is_unit(ty: &Ty) -> bool {
     matches!(ty, Ty::Con(name) if name == "()")
@@ -541,12 +562,16 @@ pub fn unify(subst: &mut Subst, a: &Ty, b: &Ty) -> Result<(), UnifyError> {
         // that value against any ordinary type it flows into (a caller's
         // own return-type check, an argument position, ...) would hard-fail
         // with no rule to reconcile the two shapes at all.
-        (Ty::Const(ConstValue::Int(_)), Ty::Con(n)) | (Ty::Con(n), Ty::Const(ConstValue::Int(_)))
+        (Ty::Const(ConstValue::Int(_)), Ty::Con(n))
+        | (Ty::Con(n), Ty::Const(ConstValue::Int(_)))
             if matches!(n.as_str(), "i8" | "i16" | "i32" | "i64") =>
         {
             Ok(())
         }
-        (Ty::Const(ConstValue::Bool(_)), Ty::Con(n)) | (Ty::Con(n), Ty::Const(ConstValue::Bool(_))) if n == "bool" => {
+        (Ty::Const(ConstValue::Bool(_)), Ty::Con(n))
+        | (Ty::Con(n), Ty::Const(ConstValue::Bool(_)))
+            if n == "bool" =>
+        {
             Ok(())
         }
         (Ty::Var(v1), Ty::Var(v2)) if v1 == v2 => Ok(()),
@@ -692,7 +717,11 @@ pub struct TypeError {
 pub enum TypeErrorKind {
     Unify(UnifyError),
     UnknownName(String),
-    ArityMismatch { name: String, expected: usize, found: usize },
+    ArityMismatch {
+        name: String,
+        expected: usize,
+        found: usize,
+    },
     NotCallable(Ty),
     /// More than one declared algebra owns this name+arity — not a
     /// "someone's overriding an existing algebra" signal (root-ownership
@@ -701,10 +730,16 @@ pub enum TypeErrorKind {
     /// like Rust's ambiguous trait methods: reject, require explicit
     /// qualification (not implemented yet — there's no qualified-call syntax
     /// wired to bypass this today, so this is currently a hard stop).
-    AmbiguousOperator { name: String, candidates: Vec<String> },
+    AmbiguousOperator {
+        name: String,
+        candidates: Vec<String>,
+    },
     /// The one candidate algebra exists and its signature matched, but no
     /// `impl <algebra><ty>` was ever declared.
-    MissingImpl { algebra: String, ty: String },
+    MissingImpl {
+        algebra: String,
+        ty: String,
+    },
     /// A placeholder (`<unresolved-call:...>`, ...) survived all the way to
     /// this function's own exposed return or parameter type — see
     /// `infer_fn`'s check. Carries the placeholder string itself for the
@@ -712,35 +747,56 @@ pub enum TypeErrorKind {
     Unresolved(String),
     /// An `impl <algebra><target>` provides a method the algebra never
     /// declared a signature for at all — see `infer_impl_fn`.
-    NotDeclaredByAlgebra { algebra: String, name: String },
+    NotDeclaredByAlgebra {
+        algebra: String,
+        name: String,
+    },
     /// A struct literal (`Vec2(x: 1.0, y: 2.0)`) whose path doesn't name any
     /// declared `struct`.
     UnknownStruct(String),
     /// A struct literal supplied a field name the struct never declared, or
     /// a field-access expression (`a.foo`) named a field that `a`'s own
     /// (concrete, known) struct type doesn't have.
-    NoSuchField { struct_name: String, field: String },
+    NoSuchField {
+        struct_name: String,
+        field: String,
+    },
     /// A struct literal never supplied a value for one of the struct's own
     /// declared fields — every field is required, there's no partial
     /// construction/defaulting.
-    MissingField { struct_name: String, field: String },
+    MissingField {
+        struct_name: String,
+        field: String,
+    },
     /// A struct literal supplied the same field name more than once.
-    DuplicateField { struct_name: String, field: String },
+    DuplicateField {
+        struct_name: String,
+        field: String,
+    },
     /// A method-call expression (`v.foo(...)`) whose base is a known,
     /// concrete type with no inherent method by that name — either no
     /// `impl` on that struct declares it, or the base isn't a struct at all
     /// (a function value, array, or const — none of which have methods).
-    NoSuchMethod { struct_name: String, method: String },
+    NoSuchMethod {
+        struct_name: String,
+        method: String,
+    },
     /// Two `impl`s of the same algebra declare their own generic target
     /// patterns in a way that could both match a common instantiation
     /// (`impl<T: Float> Ring<Complex<T>>` and `impl<T: Ord> Ring<Complex<T>>`
     /// — some `Complex<X>` satisfying both bounds would have no principled
     /// way to pick one) — see `Infer::check_no_overlapping_impls`.
-    OverlappingImpls { algebra: String, a: String, b: String },
+    OverlappingImpls {
+        algebra: String,
+        a: String,
+        b: String,
+    },
     /// A type annotation named a declared `algebra`, not a type (`const R:
     /// Int` — `Int` is what *governs* legal types there, `i32`/`i64` are the
     /// actual types) — see `Infer::pending_type_name_checks`.
-    TypeNameIsAnAlgebra { name: String },
+    TypeNameIsAnAlgebra {
+        name: String,
+    },
     /// A generic algebra-impl method's call site whose own concrete
     /// argument/return types don't unify against *any* candidate impl's own
     /// declaration-time pattern — found only by `monomorphize.rs`, never by
@@ -752,7 +808,11 @@ pub enum TypeErrorKind {
     /// happened to produce. See `monomorphize.rs`'s own doc comment for a
     /// concrete example (a stub matmul body accidentally requiring a square
     /// shape).
-    MonomorphizationFailed { algebra: String, method: String, tys: String },
+    MonomorphizationFailed {
+        algebra: String,
+        method: String,
+        tys: String,
+    },
     /// A duck-typed fallback specialization (`monomorphize.rs`'s own
     /// `detect_duck_typed_fns` -- a generic top-level fn whose body
     /// couldn't be fully resolved by the ordinary one-shot HM pass, e.g.
@@ -762,7 +822,11 @@ pub enum TypeErrorKind {
     /// inner detail available), this carries the real `TypeError` a full
     /// re-inference produced, span and all, pointing at the actual
     /// offending expression inside the fn's own body.
-    GenericFnInstantiationFailed { name: String, tys: String, inner: Box<TypeError> },
+    GenericFnInstantiationFailed {
+        name: String,
+        tys: String,
+        inner: Box<TypeError>,
+    },
     /// A top-level `fn` or inherent-impl method declared with no body
     /// (`fn foo(x: i32);`) — legal grammatically anywhere a `fn` appears
     /// (see `grammar.pest`'s own `fn_decl` comment), but only ever actually
@@ -770,29 +834,39 @@ pub enum TypeErrorKind {
     /// below) or a top-level `fn` marked `extern` (see `ExternFnCannotBe
     /// Generic` below) — there's nothing else a top-level `fn`/inherent
     /// method could possibly mean by omitting its body otherwise.
-    MissingFnBody { name: String },
+    MissingFnBody {
+        name: String,
+    },
     /// An algebra-impl method declared with no body and not `extern` — the
     /// one case a bodyless `fn` *is* legal, but only for a real external C
     /// symbol; an intrinsic operation gets a real body (a reserved
     /// `mlir::...` call) instead, see `mlir_lower.rs`'s own module doc
     /// comment.
-    MissingIntrinsicAttribute { name: String },
+    MissingIntrinsicAttribute {
+        name: String,
+    },
     /// `extern fn foo<T>(x: T) -> T;` — a real C-ABI boundary only ever
     /// crosses concrete, monomorphized signatures (see `doc/hld.md`'s own
     /// note on this), so an `extern fn` can't be generic the way an
     /// ordinary top-level `fn` can; there's no monomorphization pass for it
     /// to go through in the first place.
-    ExternFnCannotBeGeneric { name: String },
+    ExternFnCannotBeGeneric {
+        name: String,
+    },
     /// `export fn foo<T>(x: T) -> T { ... }` — the same reasoning as
     /// `ExternFnCannotBeGeneric`, mirrored for the opposite direction: only
     /// a concrete, monomorphized signature can be handed a stable real
     /// symbol and made callable from an external host at all.
-    ExportFnCannotBeGeneric { name: String },
+    ExportFnCannotBeGeneric {
+        name: String,
+    },
     /// `x = v` (or `arr[i] = v`/`s.x = v`, resolved down to `x`'s own root
     /// binding — see `check_mutability`) where `x` was declared with a
     /// plain `let`, never `let mut` — a purely syntactic check, no type
     /// information involved at all.
-    AssignToImmutable { name: String },
+    AssignToImmutable {
+        name: String,
+    },
     /// A scheme's own quantified variable carries two (or more) single-
     /// target shape constraints whose candidate concrete types (`Registry::
     /// candidates_for`) share no common type at all — e.g. `Int t` and
@@ -800,7 +874,9 @@ pub enum TypeErrorKind {
     /// concrete type, caught at `generalize`'s own time rather than only
     /// once (if ever) something later instantiates the scheme — see
     /// `Infer::generalize`'s own doc comment.
-    UnsatisfiableScheme { algebras: Vec<String> },
+    UnsatisfiableScheme {
+        algebras: Vec<String>,
+    },
     /// A committing dispatch (`dispatch_algebra_call`) found more than one
     /// impl whose target pattern matches the call's own query tuple, and
     /// they don't all agree on how they resolve whatever position(s) were
@@ -815,14 +891,20 @@ pub enum TypeErrorKind {
     /// Complex<f64>>`) never unify against one another, so they're never
     /// flagged as overlapping. See `dispatch_algebra_call`'s own doc
     /// comment for the fix and `match_impl`'s for why the two are split.
-    AmbiguousDispatch { algebra: String, candidates: Vec<String> },
+    AmbiguousDispatch {
+        algebra: String,
+        candidates: Vec<String>,
+    },
     /// A qualified call (`Ring::mul(a, b)`) named a real, declared algebra,
     /// but that algebra doesn't declare a method by this name (or not at
     /// this arity) — `infer_call`'s own qualified-call path, checked
     /// *before* `infer_algebra_call` (which assumes its own caller already
     /// confirmed this, see its own `unreachable!` on this exact
     /// precondition).
-    UnknownAlgebraMethod { algebra: String, method: String },
+    UnknownAlgebraMethod {
+        algebra: String,
+        method: String,
+    },
     /// `break;`/`break value;` with no enclosing loop at all (`Infer::
     /// loop_stack` empty at the statement) — includes a `break` lexically
     /// inside a loop but *through* an intervening lambda body (`ExprKind::
@@ -834,7 +916,9 @@ pub enum TypeErrorKind {
     /// pending_div_by_zero_checks`'s own doc comment for why this is
     /// deferred rather than an immediate error at `const_value_from_expr`'s
     /// own call site.
-    ConstDivByZero { dividend: u64 },
+    ConstDivByZero {
+        dividend: u64,
+    },
     /// Constructing a struct whose own last declared generic is a *pack*
     /// (`doc/backlog.md`'s own "Variadic generics" item, `Tensor<T, const
     /// Dims: i32...>`) without an explicit turbofish supplying at least as
@@ -842,7 +926,10 @@ pub enum TypeErrorKind {
     /// v1 restriction: inferring a pack's own arity purely from field values
     /// (the way an ordinary, single-slot generic already can) isn't
     /// supported yet, only turbofish-driven resolution is.
-    VariadicStructNeedsTurbofish { struct_name: String, min_generics: usize },
+    VariadicStructNeedsTurbofish {
+        struct_name: String,
+        min_generics: usize,
+    },
 }
 
 impl std::fmt::Display for TypeErrorKind {
@@ -850,12 +937,20 @@ impl std::fmt::Display for TypeErrorKind {
         match self {
             TypeErrorKind::Unify(e) => write!(f, "{e}"),
             TypeErrorKind::UnknownName(name) => write!(f, "unknown identifier `{name}`"),
-            TypeErrorKind::ArityMismatch { name, expected, found } => {
+            TypeErrorKind::ArityMismatch {
+                name,
+                expected,
+                found,
+            } => {
                 write!(f, "`{name}` expects {expected} argument(s), found {found}")
             }
             TypeErrorKind::NotCallable(ty) => write!(f, "`{ty}` is not callable"),
             TypeErrorKind::AmbiguousOperator { name, candidates } => {
-                write!(f, "`{name}` is ambiguous between: {}", candidates.join(", "))
+                write!(
+                    f,
+                    "`{name}` is ambiguous between: {}",
+                    candidates.join(", ")
+                )
             }
             TypeErrorKind::MissingImpl { algebra, ty } => {
                 write!(f, "no `impl {algebra}<{ty}>`")?;
@@ -875,13 +970,22 @@ impl std::fmt::Display for TypeErrorKind {
                 write!(f, "no field `{field}` on `{struct_name}`")
             }
             TypeErrorKind::MissingField { struct_name, field } => {
-                write!(f, "`struct {struct_name}` construction is missing field `{field}`")
+                write!(
+                    f,
+                    "`struct {struct_name}` construction is missing field `{field}`"
+                )
             }
-            TypeErrorKind::NoSuchMethod { struct_name, method } => {
+            TypeErrorKind::NoSuchMethod {
+                struct_name,
+                method,
+            } => {
                 write!(f, "no method `{method}` on `{struct_name}`")
             }
             TypeErrorKind::DuplicateField { struct_name, field } => {
-                write!(f, "field `{field}` given more than once constructing `struct {struct_name}`")
+                write!(
+                    f,
+                    "field `{field}` given more than once constructing `struct {struct_name}`"
+                )
             }
             TypeErrorKind::OverlappingImpls { algebra, a, b } => {
                 write!(
@@ -890,33 +994,69 @@ impl std::fmt::Display for TypeErrorKind {
                 )
             }
             TypeErrorKind::TypeNameIsAnAlgebra { name } => {
-                write!(f, "`{name}` is an algebra, not a type — did you mean a concrete type it governs?")
+                write!(
+                    f,
+                    "`{name}` is an algebra, not a type — did you mean a concrete type it governs?"
+                )
             }
-            TypeErrorKind::MonomorphizationFailed { algebra, method, tys } => {
-                write!(f, "`{algebra}::{method}` cannot be specialized for ({tys}): its generic impl body doesn't type-check at this instantiation")
+            TypeErrorKind::MonomorphizationFailed {
+                algebra,
+                method,
+                tys,
+            } => {
+                write!(
+                    f,
+                    "`{algebra}::{method}` cannot be specialized for ({tys}): its generic impl body doesn't type-check at this instantiation"
+                )
             }
             TypeErrorKind::GenericFnInstantiationFailed { name, tys, inner } => {
-                write!(f, "`{name}` cannot be specialized for ({tys}): {}", inner.kind)
+                write!(
+                    f,
+                    "`{name}` cannot be specialized for ({tys}): {}",
+                    inner.kind
+                )
             }
             TypeErrorKind::MissingFnBody { name } => {
-                write!(f, "`{name}` has no body — a `fn` may only omit one if it's `extern`")
+                write!(
+                    f,
+                    "`{name}` has no body — a `fn` may only omit one if it's `extern`"
+                )
             }
             TypeErrorKind::MissingIntrinsicAttribute { name } => {
-                write!(f, "`{name}` has no body and isn't `extern` — an algebra-impl method without a body must be")
+                write!(
+                    f,
+                    "`{name}` has no body and isn't `extern` — an algebra-impl method without a body must be"
+                )
             }
             TypeErrorKind::ExternFnCannotBeGeneric { name } => {
-                write!(f, "`extern fn {name}` cannot be generic — only concrete, monomorphized signatures can cross a C-ABI boundary")
+                write!(
+                    f,
+                    "`extern fn {name}` cannot be generic — only concrete, monomorphized signatures can cross a C-ABI boundary"
+                )
             }
             TypeErrorKind::ExportFnCannotBeGeneric { name } => {
-                write!(f, "`export fn {name}` cannot be generic — only concrete, monomorphized signatures can cross a C-ABI boundary")
+                write!(
+                    f,
+                    "`export fn {name}` cannot be generic — only concrete, monomorphized signatures can cross a C-ABI boundary"
+                )
             }
             TypeErrorKind::AssignToImmutable { name } => {
-                write!(f, "cannot assign to `{name}` — declared with `let`, not `let mut`")
+                write!(
+                    f,
+                    "cannot assign to `{name}` — declared with `let`, not `let mut`"
+                )
             }
             TypeErrorKind::UnsatisfiableScheme { algebras } => {
-                write!(f, "no single type can ever satisfy all of: {} — this generic can never be called", algebras.join(", "))
+                write!(
+                    f,
+                    "no single type can ever satisfy all of: {} — this generic can never be called",
+                    algebras.join(", ")
+                )
             }
-            TypeErrorKind::AmbiguousDispatch { algebra, candidates } => {
+            TypeErrorKind::AmbiguousDispatch {
+                algebra,
+                candidates,
+            } => {
                 write!(
                     f,
                     "ambiguous dispatch for `algebra {algebra}`: could resolve to any of {} — pin the remaining generic(s) explicitly (e.g. `name::<...>(...)`)",
@@ -924,13 +1064,22 @@ impl std::fmt::Display for TypeErrorKind {
                 )
             }
             TypeErrorKind::ConstDivByZero { dividend } => {
-                write!(f, "division by zero in a const-generic expression: `{dividend} / 0`")
+                write!(
+                    f,
+                    "division by zero in a const-generic expression: `{dividend} / 0`"
+                )
             }
             TypeErrorKind::UnknownAlgebraMethod { algebra, method } => {
-                write!(f, "`algebra {algebra}` has no method `{method}` at this arity")
+                write!(
+                    f,
+                    "`algebra {algebra}` has no method `{method}` at this arity"
+                )
             }
             TypeErrorKind::BreakOutsideLoop => write!(f, "`break` outside a loop"),
-            TypeErrorKind::VariadicStructNeedsTurbofish { struct_name, min_generics } => {
+            TypeErrorKind::VariadicStructNeedsTurbofish {
+                struct_name,
+                min_generics,
+            } => {
                 write!(
                     f,
                     "`{struct_name}` has a variadic generic — constructing it needs an explicit turbofish with at least {min_generics} argument(s) (e.g. `{struct_name}::<...>(...)`); inferring a pack's own arity from field values isn't supported yet"
@@ -999,7 +1148,12 @@ impl Constraint {
     /// directly instead of using this constructor.
     fn all_gating(algebra: String, tys: Vec<Ty>, span: Span) -> Self {
         let gating_indices = (0..tys.len()).collect();
-        Constraint { algebra, tys, gating_indices, span }
+        Constraint {
+            algebra,
+            tys,
+            gating_indices,
+            span,
+        }
     }
 }
 
@@ -1026,7 +1180,12 @@ pub struct Scheme {
 
 impl Scheme {
     pub(crate) fn mono(ty: Ty) -> Self {
-        Scheme { vars: Vec::new(), constraints: Vec::new(), ty, const_widths: HashMap::new() }
+        Scheme {
+            vars: Vec::new(),
+            constraints: Vec::new(),
+            ty,
+            const_widths: HashMap::new(),
+        }
     }
 }
 
@@ -1107,7 +1266,9 @@ pub(crate) fn substitute(ty: &Ty, mapping: &HashMap<TyVar, Ty>) -> Ty {
         // Only ever meaningful spliced into an enclosing `App`'s own args
         // list (the arm just below) — reachable bare here only via this
         // function's own direct recursion from that arm.
-        Ty::PackResolved(elems) => Ty::PackResolved(elems.iter().map(|e| substitute(e, mapping)).collect()),
+        Ty::PackResolved(elems) => {
+            Ty::PackResolved(elems.iter().map(|e| substitute(e, mapping)).collect())
+        }
         // Mirrors `Subst::apply`'s own `Ty::PackLen` arm — folds to a real
         // `Const` the moment `mapping` has the underlying pack var's own
         // resolved binding, stays symbolic otherwise.
@@ -1126,9 +1287,10 @@ pub(crate) fn substitute(ty: &Ty, mapping: &HashMap<TyVar, Ty>) -> Ty {
             }
             Ty::App(name.clone(), out)
         }
-        Ty::Fn(params, ret) => {
-            Ty::Fn(params.iter().map(|p| substitute(p, mapping)).collect(), Box::new(substitute(ret, mapping)))
-        }
+        Ty::Fn(params, ret) => Ty::Fn(
+            params.iter().map(|p| substitute(p, mapping)).collect(),
+            Box::new(substitute(ret, mapping)),
+        ),
         // `size` resolving to a whole `PackResolved` list (`[value; Dims...]`
         // — `ExprKind::ArrayRepeat`'s own inference arm builds exactly this
         // shape, `Ty::Array(elem, Ty::Pack(v))`, mirroring how a struct
@@ -1144,7 +1306,10 @@ pub(crate) fn substitute(ty: &Ty, mapping: &HashMap<TyVar, Ty>) -> Ty {
         Ty::Array(elem, size) => {
             let elem = substitute(elem, mapping);
             match substitute(size, mapping) {
-                Ty::PackResolved(dims) => dims.into_iter().rev().fold(elem, |acc, dim| Ty::Array(Box::new(acc), Box::new(dim))),
+                Ty::PackResolved(dims) => dims
+                    .into_iter()
+                    .rev()
+                    .fold(elem, |acc, dim| Ty::Array(Box::new(acc), Box::new(dim))),
                 size => Ty::Array(Box::new(elem), Box::new(size)),
             }
         }
@@ -1154,7 +1319,9 @@ pub(crate) fn substitute(ty: &Ty, mapping: &HashMap<TyVar, Ty>) -> Ty {
         // `N+M` actually turns into a real number once a template gets
         // specialized for a concrete call site — same `fold_const_expr`
         // helper `Subst::apply` uses, see its own doc comment.
-        Ty::ConstExpr(op, a, b) => fold_const_expr(op, substitute(a, mapping), substitute(b, mapping)),
+        Ty::ConstExpr(op, a, b) => {
+            fold_const_expr(op, substitute(a, mapping), substitute(b, mapping))
+        }
     }
 }
 
@@ -1188,7 +1355,10 @@ pub(crate) fn substitute(ty: &Ty, mapping: &HashMap<TyVar, Ty>) -> Ty {
 /// as `let mut` already did — so every later use shares the exact same
 /// variable `pending_defaults` already tracks.
 fn is_syntactic_value(expr: &Expr) -> bool {
-    matches!(expr.kind, ExprKind::BoolLit(_) | ExprKind::Path(_) | ExprKind::Lambda { .. })
+    matches!(
+        expr.kind,
+        ExprKind::BoolLit(_) | ExprKind::Path(_) | ExprKind::Lambda { .. }
+    )
 }
 
 /// A `Ty::Con` standing in for "not actually known" — `<unresolved-call:...>`
@@ -1254,8 +1424,13 @@ pub(crate) fn find_placeholder_name(ty: &Ty) -> Option<String> {
         Ty::Con(_) | Ty::Var(_) | Ty::Const(_) | Ty::Pack(_) | Ty::PackLen(_) => None,
         Ty::PackResolved(elems) => elems.iter().find_map(find_placeholder_name),
         Ty::App(_, args) => args.iter().find_map(find_placeholder_name),
-        Ty::Fn(params, ret) => params.iter().find_map(find_placeholder_name).or_else(|| find_placeholder_name(ret)),
-        Ty::Array(elem, size) => find_placeholder_name(elem).or_else(|| find_placeholder_name(size)),
+        Ty::Fn(params, ret) => params
+            .iter()
+            .find_map(find_placeholder_name)
+            .or_else(|| find_placeholder_name(ret)),
+        Ty::Array(elem, size) => {
+            find_placeholder_name(elem).or_else(|| find_placeholder_name(size))
+        }
         Ty::ConstExpr(_, a, b) => find_placeholder_name(a).or_else(|| find_placeholder_name(b)),
     }
 }
@@ -1265,15 +1440,24 @@ pub(crate) fn find_placeholder_name(ty: &Ty) -> Option<String> {
 /// so the whole-program orchestrator (`callgraph.rs`) can run the exact same
 /// check once per group member, after resolving through the group's final
 /// substitution, instead of duplicating this logic.
-pub(crate) fn check_no_placeholder(f: &FnDecl, final_result: &Ty, param_types: &[Ty]) -> Result<(), TypeError> {
-    let unresolved = find_placeholder_name(final_result).or_else(|| param_types.iter().find_map(find_placeholder_name));
+pub(crate) fn check_no_placeholder(
+    f: &FnDecl,
+    final_result: &Ty,
+    param_types: &[Ty],
+) -> Result<(), TypeError> {
+    let unresolved = find_placeholder_name(final_result)
+        .or_else(|| param_types.iter().find_map(find_placeholder_name));
     if let Some(placeholder) = unresolved {
-        if let Some(span) = f
-            .body
-            .as_ref()
-            .and_then(|b| b.tail.as_deref().map(|t| t.span).or_else(|| b.stmts.last().map(|s| s.span)))
-        {
-            return Err(TypeError { span, kind: TypeErrorKind::Unresolved(placeholder) });
+        if let Some(span) = f.body.as_ref().and_then(|b| {
+            b.tail
+                .as_deref()
+                .map(|t| t.span)
+                .or_else(|| b.stmts.last().map(|s| s.span))
+        }) {
+            return Err(TypeError {
+                span,
+                kind: TypeErrorKind::Unresolved(placeholder),
+            });
         }
     }
     Ok(())
@@ -1293,7 +1477,11 @@ pub(crate) fn check_no_placeholder(f: &FnDecl, final_result: &Ty, param_types: &
 /// since they never go through `StmtKind::Let`.
 pub fn check_mutability(f: &FnDecl) -> Result<(), TypeError> {
     let Some(body) = &f.body else { return Ok(()) };
-    let scope: HashMap<String, bool> = f.params.iter().map(|p| (p.name.clone(), p.mutable)).collect();
+    let scope: HashMap<String, bool> = f
+        .params
+        .iter()
+        .map(|p| (p.name.clone(), p.mutable))
+        .collect();
     check_mutability_block(body, &scope)
 }
 
@@ -1301,7 +1489,12 @@ fn check_mutability_block(block: &Block, scope: &HashMap<String, bool>) -> Resul
     let mut scope = scope.clone();
     for stmt in &block.stmts {
         match &stmt.kind {
-            StmtKind::Let { mutable, name, value, .. } => {
+            StmtKind::Let {
+                mutable,
+                name,
+                value,
+                ..
+            } => {
                 check_mutability_expr(value, &scope)?;
                 scope.insert(name.clone(), *mutable);
             }
@@ -1310,7 +1503,12 @@ fn check_mutability_block(block: &Block, scope: &HashMap<String, bool>) -> Resul
                 check_mutability_expr(value, &scope)?;
                 if let Some(root) = assign_target_root(target) {
                     if scope.get(root) == Some(&false) {
-                        return Err(TypeError { span: stmt.span, kind: TypeErrorKind::AssignToImmutable { name: root.to_string() } });
+                        return Err(TypeError {
+                            span: stmt.span,
+                            kind: TypeErrorKind::AssignToImmutable {
+                                name: root.to_string(),
+                            },
+                        });
                     }
                 }
             }
@@ -1330,24 +1528,41 @@ fn check_mutability_block(block: &Block, scope: &HashMap<String, bool>) -> Resul
 
 fn check_mutability_expr(expr: &Expr, scope: &HashMap<String, bool>) -> Result<(), TypeError> {
     match &expr.kind {
-        ExprKind::NumberLit { .. } | ExprKind::ImaginaryLit { .. } | ExprKind::BoolLit(_) | ExprKind::Path(_) | ExprKind::PackRef(_) => Ok(()),
-        ExprKind::Call(_, _, args, ..) => args.iter().try_for_each(|a| check_mutability_expr(a, scope)),
+        ExprKind::NumberLit { .. }
+        | ExprKind::ImaginaryLit { .. }
+        | ExprKind::BoolLit(_)
+        | ExprKind::Path(_)
+        | ExprKind::PackRef(_) => Ok(()),
+        ExprKind::Call(_, _, args, ..) => args
+            .iter()
+            .try_for_each(|a| check_mutability_expr(a, scope)),
         ExprKind::FieldAccess(base, _) => check_mutability_expr(base, scope),
         ExprKind::MethodCall(base, _, args) => {
             check_mutability_expr(base, scope)?;
-            args.iter().try_for_each(|a| check_mutability_expr(a, scope))
+            args.iter()
+                .try_for_each(|a| check_mutability_expr(a, scope))
         }
         ExprKind::Index(base, indices) => {
             check_mutability_expr(base, scope)?;
-            indices.iter().try_for_each(|i| check_mutability_expr(i, scope))
+            indices
+                .iter()
+                .try_for_each(|i| check_mutability_expr(i, scope))
         }
-        ExprKind::ArrayLit(elems) => elems.iter().try_for_each(|e| check_mutability_expr(e, scope)),
+        ExprKind::ArrayLit(elems) => elems
+            .iter()
+            .try_for_each(|e| check_mutability_expr(e, scope)),
         ExprKind::ArrayRepeat { value, count } => {
             check_mutability_expr(value, scope)?;
             check_mutability_expr(count, scope)
         }
-        ExprKind::StructLit(_, _, fields) => fields.iter().try_for_each(|(_, v)| check_mutability_expr(v, scope)),
-        ExprKind::If { cond, then_branch, else_branch } => {
+        ExprKind::StructLit(_, _, fields) => fields
+            .iter()
+            .try_for_each(|(_, v)| check_mutability_expr(v, scope)),
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
             check_mutability_expr(cond, scope)?;
             check_mutability_block(then_branch, scope)?;
             match else_branch.as_deref() {
@@ -1360,7 +1575,12 @@ fn check_mutability_expr(expr: &Expr, scope: &HashMap<String, bool>) -> Result<(
             check_mutability_expr(cond, scope)?;
             check_mutability_block(body, scope)
         }
-        ExprKind::For { var, start, end, body } => {
+        ExprKind::For {
+            var,
+            start,
+            end,
+            body,
+        } => {
             check_mutability_expr(start, scope)?;
             check_mutability_expr(end, scope)?;
             let mut inner = scope.clone();
@@ -1607,7 +1827,8 @@ pub struct Infer<'r> {
     /// falls back to the `<not-yet-inferred>` placeholder exactly like
     /// before, no behavior change for anything that doesn't call
     /// `with_inherent_patterns`.
-    inherent_patterns: Option<&'r HashMap<(String, String), crate::callgraph::InherentMethodPattern>>,
+    inherent_patterns:
+        Option<&'r HashMap<(String, String), crate::callgraph::InherentMethodPattern>>,
     /// A field access (`v.foo`) whose own base was still a bare `Ty::Var`
     /// at the point it was written — e.g. `let z = 4i; z.real`, where `z`'s
     /// own type only becomes concrete once `apply_defaults` runs, at the
@@ -1712,7 +1933,10 @@ impl<'r> Infer<'r> {
     /// inherent_impls_early`'s own output) when `ExprKind::MethodCall`'s own
     /// dispatch hits an unannotated inherent method — builder-style, so
     /// `callgraph::infer_program` can chain it directly onto `Infer::new`.
-    pub fn with_inherent_patterns(mut self, patterns: &'r HashMap<(String, String), crate::callgraph::InherentMethodPattern>) -> Self {
+    pub fn with_inherent_patterns(
+        mut self,
+        patterns: &'r HashMap<(String, String), crate::callgraph::InherentMethodPattern>,
+    ) -> Self {
         self.inherent_patterns = Some(patterns);
         self
     }
@@ -1770,14 +1994,22 @@ impl<'r> Infer<'r> {
     /// (`ExprKind::StructLit`/`FieldAccess`), where there's no `FnDecl` to
     /// read a generics list off of, just `Registry::struct_generics` — a
     /// struct's own const generics get the same width tracking for free.
-    fn fresh_generics_mapping(&mut self, generics: &[GenericParam], span: Span) -> HashMap<String, Ty> {
+    fn fresh_generics_mapping(
+        &mut self,
+        generics: &[GenericParam],
+        span: Span,
+    ) -> HashMap<String, Ty> {
         let mapping = self.fresh_vars_for_generics(generics);
         for g in generics {
             match g {
                 GenericParam::Type { name, bounds, .. } => {
                     let ty = mapping[name].clone();
                     for bound in bounds {
-                        self.constraints.push(Constraint::all_gating(bound.clone(), vec![ty.clone()], span));
+                        self.constraints.push(Constraint::all_gating(
+                            bound.clone(),
+                            vec![ty.clone()],
+                            span,
+                        ));
                     }
                 }
                 GenericParam::Const { name, ty, .. } => {
@@ -1822,11 +2054,16 @@ impl<'r> Infer<'r> {
         declared_fields: &[Field],
     ) -> Result<Ty, TypeError> {
         let non_pack = &struct_generics[..struct_generics.len() - 1];
-        let pack_generic = struct_generics.last().expect("checked non-empty by the caller");
+        let pack_generic = struct_generics
+            .last()
+            .expect("checked non-empty by the caller");
         if explicit_generics.len() < non_pack.len() {
             return Err(TypeError {
                 span,
-                kind: TypeErrorKind::VariadicStructNeedsTurbofish { struct_name: struct_name.to_string(), min_generics: non_pack.len() },
+                kind: TypeErrorKind::VariadicStructNeedsTurbofish {
+                    struct_name: struct_name.to_string(),
+                    min_generics: non_pack.len(),
+                },
             });
         }
 
@@ -1842,22 +2079,48 @@ impl<'r> Infer<'r> {
         // resolved directly (not through a fresh var first), since there's
         // no field-value-driven inference to reconcile against here, unlike
         // the non-pack case above.
-        let pack_tys: Vec<Ty> = explicit_generics[non_pack.len()..].iter().map(|g| self.generic_arg_to_ty(g)).collect();
+        let pack_tys: Vec<Ty> = explicit_generics[non_pack.len()..]
+            .iter()
+            .map(|g| self.generic_arg_to_ty(g))
+            .collect();
 
         let mut seen: HashSet<String> = HashSet::new();
         for (name, value) in fields {
             let Some(decl_field) = declared_fields.iter().find(|f| &f.name == name).cloned() else {
-                return Err(TypeError { span: value.span, kind: TypeErrorKind::NoSuchField { struct_name: struct_name.to_string(), field: name.clone() } });
+                return Err(TypeError {
+                    span: value.span,
+                    kind: TypeErrorKind::NoSuchField {
+                        struct_name: struct_name.to_string(),
+                        field: name.clone(),
+                    },
+                });
             };
             if !seen.insert(name.clone()) {
-                return Err(TypeError { span: value.span, kind: TypeErrorKind::DuplicateField { struct_name: struct_name.to_string(), field: name.clone() } });
+                return Err(TypeError {
+                    span: value.span,
+                    kind: TypeErrorKind::DuplicateField {
+                        struct_name: struct_name.to_string(),
+                        field: name.clone(),
+                    },
+                });
             }
             let value_ty = self.infer_expr(env, value)?;
-            let declared_ty = self.ty_from_ast_mapped_with_pack(&decl_field.ty, &mapping, pack_generic.name(), &pack_tys);
+            let declared_ty = self.ty_from_ast_mapped_with_pack(
+                &decl_field.ty,
+                &mapping,
+                pack_generic.name(),
+                &pack_tys,
+            );
             self.unify_at(value.span, &declared_ty, &value_ty)?;
         }
         if let Some(missing) = declared_fields.iter().find(|f| !seen.contains(&f.name)) {
-            return Err(TypeError { span, kind: TypeErrorKind::MissingField { struct_name: struct_name.to_string(), field: missing.name.clone() } });
+            return Err(TypeError {
+                span,
+                kind: TypeErrorKind::MissingField {
+                    struct_name: struct_name.to_string(),
+                    field: missing.name.clone(),
+                },
+            });
         }
 
         let mut type_args: Vec<Ty> = non_pack.iter().map(|g| mapping[g.name()].clone()).collect();
@@ -1878,15 +2141,28 @@ impl<'r> Infer<'r> {
     /// alike only ever need a pack at the top level of one field/parameter,
     /// see `doc/backlog.md`'s own "Variadic generics" item for the fuller
     /// scope this deliberately doesn't attempt yet).
-    fn ty_from_ast_mapped_with_pack(&mut self, ty: &Type, mapping: &HashMap<String, Ty>, pack_name: &str, pack_tys: &[Ty]) -> Ty {
+    fn ty_from_ast_mapped_with_pack(
+        &mut self,
+        ty: &Type,
+        mapping: &HashMap<String, Ty>,
+        pack_name: &str,
+        pack_tys: &[Ty],
+    ) -> Ty {
         match &ty.kind {
-            TypeKind::Array(elem, size) if matches!(&size.kind, ExprKind::PackRef(name) if name == pack_name) => {
+            TypeKind::Array(elem, size) if matches!(&size.kind, ExprKind::PackRef(name) if name == pack_name) =>
+            {
                 let elem_ty = self.ty_from_ast_mapped(elem, mapping);
-                pack_tys.iter().rev().fold(elem_ty, |acc, dim| Ty::Array(Box::new(acc), Box::new(dim.clone())))
+                pack_tys.iter().rev().fold(elem_ty, |acc, dim| {
+                    Ty::Array(Box::new(acc), Box::new(dim.clone()))
+                })
             }
             TypeKind::PackRef(name) if name == pack_name => {
                 let name = tuple_struct_name(pack_tys.len());
-                if pack_tys.is_empty() { Ty::Con(name) } else { Ty::App(name, pack_tys.to_vec()) }
+                if pack_tys.is_empty() {
+                    Ty::Con(name)
+                } else {
+                    Ty::App(name, pack_tys.to_vec())
+                }
             }
             _ => self.ty_from_ast_mapped(ty, mapping),
         }
@@ -1962,7 +2238,12 @@ impl<'r> Infer<'r> {
     /// folded into `fresh_generics_mapping` itself, which has other callers
     /// (`has_matching_impl`'s speculative probe, struct-literal generics)
     /// with no body being inferred and no `env` to seed.
-    fn seed_const_generics(&self, generics: &[GenericParam], mapping: &HashMap<String, Ty>, env: &mut Env) {
+    fn seed_const_generics(
+        &self,
+        generics: &[GenericParam],
+        mapping: &HashMap<String, Ty>,
+        env: &mut Env,
+    ) {
         for g in generics {
             if let GenericParam::Const { name, .. } = g {
                 env.insert(name.clone(), Scheme::mono(mapping[name].clone()));
@@ -1986,7 +2267,9 @@ impl<'r> Infer<'r> {
         // lookup chief among them) pick the pack up for free, with no
         // further special-casing needed there at all.
         let fresh = |v: &mut Self, variadic: bool| {
-            let Ty::Var(id) = v.vars.fresh() else { unreachable!("TyVarGen::fresh always returns Ty::Var") };
+            let Ty::Var(id) = v.vars.fresh() else {
+                unreachable!("TyVarGen::fresh always returns Ty::Var")
+            };
             if variadic { Ty::Pack(id) } else { Ty::Var(id) }
         };
         generics
@@ -2010,7 +2293,9 @@ impl<'r> Infer<'r> {
                 // catching a *width* mismatch between two differently-typed
                 // consts would need `Ty::Const` to carry its own type too,
                 // not attempted in this increment.
-                GenericParam::Const { name, variadic, .. } => (name.clone(), fresh(self, *variadic)),
+                GenericParam::Const { name, variadic, .. } => {
+                    (name.clone(), fresh(self, *variadic))
+                }
             })
             .collect()
     }
@@ -2049,7 +2334,12 @@ impl<'r> Infer<'r> {
     /// logic once a deferred base finally becomes concrete, instead of
     /// duplicating it — see `pending_field_accesses`'s own doc comment for
     /// why a field access needs deferring at all.
-    fn resolve_field_access(&mut self, resolved: &Ty, name: &str, span: Span) -> Result<Ty, TypeError> {
+    fn resolve_field_access(
+        &mut self,
+        resolved: &Ty,
+        name: &str,
+        span: Span,
+    ) -> Result<Ty, TypeError> {
         match resolved {
             // Non-generic struct (or any other bare concrete type — see the
             // `None` arm below) — field's declared type needs no further
@@ -2060,7 +2350,10 @@ impl<'r> Infer<'r> {
                     Some(field) => Ok(self.ty_from_ast(&field.ty)),
                     None => Err(TypeError {
                         span,
-                        kind: TypeErrorKind::NoSuchField { struct_name: struct_name.clone(), field: name.to_string() },
+                        kind: TypeErrorKind::NoSuchField {
+                            struct_name: struct_name.clone(),
+                            field: name.to_string(),
+                        },
                     }),
                 },
                 // A concrete, known type that simply isn't a struct at all
@@ -2068,7 +2361,10 @@ impl<'r> Infer<'r> {
                 // way as a struct missing this specific one.
                 None => Err(TypeError {
                     span,
-                    kind: TypeErrorKind::NoSuchField { struct_name: struct_name.clone(), field: name.to_string() },
+                    kind: TypeErrorKind::NoSuchField {
+                        struct_name: struct_name.clone(),
+                        field: name.to_string(),
+                    },
                 }),
             },
             // A generic struct, already instantiated at some concrete set
@@ -2091,13 +2387,25 @@ impl<'r> Infer<'r> {
                         // 1:1 zip would otherwise silently drop everything
                         // past the pack's own first slot.
                         let struct_generics = self.registry.struct_generics(struct_name).to_vec();
-                        if struct_generics.last().is_some_and(GenericParam::is_variadic) {
+                        if struct_generics
+                            .last()
+                            .is_some_and(GenericParam::is_variadic)
+                        {
                             let non_pack = &struct_generics[..struct_generics.len() - 1];
-                            let pack_generic = struct_generics.last().expect("checked non-empty above");
-                            let mapping: HashMap<String, Ty> =
-                                non_pack.iter().zip(type_args).map(|(g, t)| (g.name().to_string(), t.clone())).collect();
+                            let pack_generic =
+                                struct_generics.last().expect("checked non-empty above");
+                            let mapping: HashMap<String, Ty> = non_pack
+                                .iter()
+                                .zip(type_args)
+                                .map(|(g, t)| (g.name().to_string(), t.clone()))
+                                .collect();
                             let pack_tys = &type_args[non_pack.len().min(type_args.len())..];
-                            Ok(self.ty_from_ast_mapped_with_pack(&field.ty, &mapping, pack_generic.name(), pack_tys))
+                            Ok(self.ty_from_ast_mapped_with_pack(
+                                &field.ty,
+                                &mapping,
+                                pack_generic.name(),
+                                pack_tys,
+                            ))
                         } else {
                             let mapping = self.zip_struct_generics(struct_name, type_args);
                             Ok(self.ty_from_ast_mapped(&field.ty, &mapping))
@@ -2105,12 +2413,18 @@ impl<'r> Infer<'r> {
                     }
                     None => Err(TypeError {
                         span,
-                        kind: TypeErrorKind::NoSuchField { struct_name: struct_name.clone(), field: name.to_string() },
+                        kind: TypeErrorKind::NoSuchField {
+                            struct_name: struct_name.clone(),
+                            field: name.to_string(),
+                        },
                     }),
                 },
                 None => Err(TypeError {
                     span,
-                    kind: TypeErrorKind::NoSuchField { struct_name: struct_name.clone(), field: name.to_string() },
+                    kind: TypeErrorKind::NoSuchField {
+                        struct_name: struct_name.clone(),
+                        field: name.to_string(),
+                    },
                 }),
             },
             // Neither has fields — a function value or an array (indexing,
@@ -2124,9 +2438,19 @@ impl<'r> Infer<'r> {
             // deferred path once `check_pending_field_accesses` has already
             // confirmed it's still unresolved — same "genuinely fieldless"
             // treatment, not a distinct case.
-            Ty::Fn(..) | Ty::Array(..) | Ty::Const(_) | Ty::ConstExpr(..) | Ty::Var(_) | Ty::Pack(_) | Ty::PackResolved(_) | Ty::PackLen(_) => Err(TypeError {
+            Ty::Fn(..)
+            | Ty::Array(..)
+            | Ty::Const(_)
+            | Ty::ConstExpr(..)
+            | Ty::Var(_)
+            | Ty::Pack(_)
+            | Ty::PackResolved(_)
+            | Ty::PackLen(_) => Err(TypeError {
                 span,
-                kind: TypeErrorKind::NoSuchField { struct_name: resolved.to_string(), field: name.to_string() },
+                kind: TypeErrorKind::NoSuchField {
+                    struct_name: resolved.to_string(),
+                    field: name.to_string(),
+                },
             }),
         }
     }
@@ -2164,17 +2488,30 @@ impl<'r> Infer<'r> {
             // `check_pending_method_calls` has already confirmed the base
             // is concrete; the immediate path already returned earlier for
             // a bare `Ty::Var`.
-            Ty::Fn(..) | Ty::Array(..) | Ty::Const(_) | Ty::Var(_) | Ty::ConstExpr(..) | Ty::Pack(_) | Ty::PackResolved(_) | Ty::PackLen(_) => {
+            Ty::Fn(..)
+            | Ty::Array(..)
+            | Ty::Const(_)
+            | Ty::Var(_)
+            | Ty::ConstExpr(..)
+            | Ty::Pack(_)
+            | Ty::PackResolved(_)
+            | Ty::PackLen(_) => {
                 return Err(TypeError {
                     span: call_span,
-                    kind: TypeErrorKind::NoSuchMethod { struct_name: resolved_base.to_string(), method: name.to_string() },
+                    kind: TypeErrorKind::NoSuchMethod {
+                        struct_name: resolved_base.to_string(),
+                        method: name.to_string(),
+                    },
                 });
             }
         };
         let Some(entry) = self.registry.inherent_method(&struct_name, name).cloned() else {
             return Err(TypeError {
                 span: call_span,
-                kind: TypeErrorKind::NoSuchMethod { struct_name, method: name.to_string() },
+                kind: TypeErrorKind::NoSuchMethod {
+                    struct_name,
+                    method: name.to_string(),
+                },
             });
         };
         // `base` fills the method's own first parameter — an ordinary,
@@ -2209,9 +2546,13 @@ impl<'r> Infer<'r> {
         // exact same reason, on the declaration side.
         let impl_mapping = self.fresh_generics_mapping(&entry.generics, call_span);
         let target_ty = self.ty_from_ast_mapped(&entry.target, &impl_mapping);
-        let param_tys = self.inherent_method_param_tys(&entry.method.params, &impl_mapping, &target_ty);
+        let param_tys =
+            self.inherent_method_param_tys(&entry.method.params, &impl_mapping, &target_ty);
         self.unify_at(base_span, &param_tys[0], resolved_base)?;
-        for (pt, (at, sp)) in param_tys[1..].iter().zip(arg_tys.iter().zip(arg_spans.iter())) {
+        for (pt, (at, sp)) in param_tys[1..]
+            .iter()
+            .zip(arg_tys.iter().zip(arg_spans.iter()))
+        {
             self.unify_at(*sp, pt, at)?;
         }
         // Unlike an algebra call (which always has a real declared
@@ -2244,7 +2585,9 @@ impl<'r> Infer<'r> {
             .as_ref()
             .map(|t| self.ty_from_ast_mapped(t, &impl_mapping))
             .or_else(|| {
-                let pattern = self.inherent_patterns?.get(&(struct_name.clone(), name.to_string()))?;
+                let pattern = self
+                    .inherent_patterns?
+                    .get(&(struct_name.clone(), name.to_string()))?;
                 let remap: HashMap<TyVar, Ty> = pattern
                     .generics_mapping
                     .iter()
@@ -2272,9 +2615,15 @@ impl<'r> Infer<'r> {
     /// for `f`'s declared return type (`infer_fn_raw`), which must resolve
     /// `T` to the exact same fresh variable, not a second, unrelated one.
     pub(crate) fn fresh_fn_shape(&mut self, f: &FnDecl) -> (Vec<Ty>, Ty, HashMap<String, Ty>) {
-        let span =
-            f.body.as_ref().and_then(|b| b.tail.as_deref().map(|t| t.span).or_else(|| b.stmts.last().map(|s| s.span)));
-        let generics = span.map(|span| self.fn_generics_mapping(f, span)).unwrap_or_default();
+        let span = f.body.as_ref().and_then(|b| {
+            b.tail
+                .as_deref()
+                .map(|t| t.span)
+                .or_else(|| b.stmts.last().map(|s| s.span))
+        });
+        let generics = span
+            .map(|span| self.fn_generics_mapping(f, span))
+            .unwrap_or_default();
         let param_types = f
             .params
             .iter()
@@ -2305,7 +2654,10 @@ impl<'r> Infer<'r> {
     pub fn infer_fn(&mut self, f: &FnDecl) -> Result<Ty, TypeError> {
         let (param_types, ret_var, generics) = self.fresh_fn_shape(f);
         let mut outer = Env::new();
-        outer.insert(f.name.clone(), Scheme::mono(Ty::Fn(param_types.clone(), Box::new(ret_var.clone()))));
+        outer.insert(
+            f.name.clone(),
+            Scheme::mono(Ty::Fn(param_types.clone(), Box::new(ret_var.clone()))),
+        );
         let result = self.infer_fn_raw(f, &outer, param_types.clone(), ret_var, &generics)?;
         self.finish_fn(f, param_types, result)
     }
@@ -2323,10 +2675,17 @@ impl<'r> Infer<'r> {
     /// and any explicitly-annotated parameter alongside the unannotated
     /// one, both fall out of the exact same mechanism `infer_fn`/`infer_fn_
     /// raw` already provide -- nothing extra needed here.
-    pub(crate) fn infer_fn_with_concrete_params(&mut self, f: &FnDecl, param_types: Vec<Ty>) -> Result<Ty, TypeError> {
+    pub(crate) fn infer_fn_with_concrete_params(
+        &mut self,
+        f: &FnDecl,
+        param_types: Vec<Ty>,
+    ) -> Result<Ty, TypeError> {
         let (_, ret_var, generics) = self.fresh_fn_shape(f);
         let mut outer = Env::new();
-        outer.insert(f.name.clone(), Scheme::mono(Ty::Fn(param_types.clone(), Box::new(ret_var.clone()))));
+        outer.insert(
+            f.name.clone(),
+            Scheme::mono(Ty::Fn(param_types.clone(), Box::new(ret_var.clone()))),
+        );
         let result = self.infer_fn_raw(f, &outer, param_types.clone(), ret_var, &generics)?;
         self.finish_fn(f, param_types, result)
     }
@@ -2364,7 +2723,10 @@ impl<'r> Infer<'r> {
         // enclosing `Item`'s own span to report against — `FnDecl` itself
         // carries none, see `ast.rs`) — `infer_fn` (this method's other,
         // test-only caller) never constructs one either.
-        let body = f.body.as_ref().expect("infer_fn_raw requires a body; caller must validate first");
+        let body = f
+            .body
+            .as_ref()
+            .expect("infer_fn_raw requires a body; caller must validate first");
         self.active_generics = generics.clone();
         let mut env = outer.clone();
         for (p, ty) in f.params.iter().zip(&param_types) {
@@ -2382,7 +2744,12 @@ impl<'r> Infer<'r> {
         // }`), nothing else would ever connect `ret_var` to the body's real
         // result, silently leaving a self-call checked against a type the
         // function might not actually return.
-        if let Some(span) = body.tail.as_deref().map(|t| t.span).or_else(|| body.stmts.last().map(|s| s.span)) {
+        if let Some(span) = body
+            .tail
+            .as_deref()
+            .map(|t| t.span)
+            .or_else(|| body.stmts.last().map(|s| s.span))
+        {
             self.unify_at(span, &ret_var, &result)?;
         }
         Ok(result)
@@ -2491,7 +2858,10 @@ impl<'r> Infer<'r> {
         let Some(sig) = self.registry.fn_sig(algebra, &f.name).cloned() else {
             return Err(TypeError {
                 span: fallback_span,
-                kind: TypeErrorKind::NotDeclaredByAlgebra { algebra: algebra.to_string(), name: f.name.clone() },
+                kind: TypeErrorKind::NotDeclaredByAlgebra {
+                    algebra: algebra.to_string(),
+                    name: f.name.clone(),
+                },
             });
         };
         if sig.params.len() != f.params.len() {
@@ -2513,7 +2883,10 @@ impl<'r> Infer<'r> {
         // bogus `App("Complex", [Con("T")])`.
         let impl_mapping = self.fresh_generics_mapping(impl_generics, fallback_span);
         self.active_generics = impl_mapping.clone();
-        let target_tys: Vec<Ty> = targets.iter().map(|t| self.ty_from_ast_mapped(t, &impl_mapping)).collect();
+        let target_tys: Vec<Ty> = targets
+            .iter()
+            .map(|t| self.ty_from_ast_mapped(t, &impl_mapping))
+            .collect();
         self.target_types = target_tys.clone();
 
         // The algebra's own generic parameters bind, *positionally*, to
@@ -2528,7 +2901,9 @@ impl<'r> Infer<'r> {
                 // `.next()` per `Type` generic, in declaration order — the
                 // *positional* correspondence `targets` (and `target_tys`,
                 // built from it in the same order) already establishes.
-                GenericParam::Type { name, .. } => target_ty_iter.next().map(|ty| (name.clone(), ty.clone())),
+                GenericParam::Type { name, .. } => {
+                    target_ty_iter.next().map(|ty| (name.clone(), ty.clone()))
+                }
                 // A `Const` generic on the algebra's own side consumes no
                 // target slot — unlike `T`, it's never fixed by which impl
                 // matched, only by whichever concrete call site this
@@ -2570,8 +2945,11 @@ impl<'r> Infer<'r> {
         }
         self.seed_const_generics(impl_generics, &impl_mapping, &mut env);
 
-        let expected_ret =
-            sig.ret.as_ref().map(|t| self.ty_from_ast_mapped(t, &mapping)).unwrap_or_else(|| Ty::Con("()".to_string()));
+        let expected_ret = sig
+            .ret
+            .as_ref()
+            .map(|t| self.ty_from_ast_mapped(t, &mapping))
+            .unwrap_or_else(|| Ty::Con("()".to_string()));
         if let Some(ret) = &f.ret {
             let declared = self.ty_from_ast_mapped(ret, &impl_mapping);
             self.unify_at(ret.span, &expected_ret, &declared)?;
@@ -2592,7 +2970,11 @@ impl<'r> Infer<'r> {
         let result = match &f.body {
             Some(body) => {
                 let result = self.infer_block(&env, body)?;
-                let result_span = body.tail.as_deref().map(|t| t.span).unwrap_or(fallback_span);
+                let result_span = body
+                    .tail
+                    .as_deref()
+                    .map(|t| t.span)
+                    .unwrap_or(fallback_span);
                 self.unify_at(result_span, &expected_ret, &result)?;
                 result
             }
@@ -2600,7 +2982,9 @@ impl<'r> Infer<'r> {
                 if !f.is_extern {
                     return Err(TypeError {
                         span: fallback_span,
-                        kind: TypeErrorKind::MissingIntrinsicAttribute { name: f.name.clone() },
+                        kind: TypeErrorKind::MissingIntrinsicAttribute {
+                            name: f.name.clone(),
+                        },
                     });
                 }
                 expected_ret.clone()
@@ -2614,7 +2998,11 @@ impl<'r> Infer<'r> {
         // needs the identical treatment, since it was set (see above)
         // before body inference (and therefore defaulting/constraint-
         // checking) had a chance to pin anything down further.
-        self.target_types = self.target_types.iter().map(|t| self.subst.apply(t)).collect();
+        self.target_types = self
+            .target_types
+            .iter()
+            .map(|t| self.subst.apply(t))
+            .collect();
         Ok(final_result)
     }
 
@@ -2671,11 +3059,15 @@ impl<'r> Infer<'r> {
         // for why this lives there rather than in `env`: a recursive call
         // goes through `ExprKind::MethodCall`'s own dispatch, which never
         // consults `env` for its callee at all.
-        let self_key =
-            if let TypeKind::Path(p, _) = &target.kind { Some((p.segments.join("::"), f.name.clone())) } else { None };
+        let self_key = if let TypeKind::Path(p, _) = &target.kind {
+            Some((p.segments.join("::"), f.name.clone()))
+        } else {
+            None
+        };
         let ret_var = self.vars.fresh();
         if let Some(key) = &self_key {
-            self.in_progress_methods.insert(key.clone(), (param_types.clone(), ret_var.clone()));
+            self.in_progress_methods
+                .insert(key.clone(), (param_types.clone(), ret_var.clone()));
         }
 
         let result = self.infer_inherent_impl_fn_raw(
@@ -2725,7 +3117,12 @@ impl<'r> Infer<'r> {
         // must still agree with the impl's own target, not silently accept
         // a second, independent truth.
         let Some(body) = &f.body else {
-            return Err(TypeError { span: fallback_span, kind: TypeErrorKind::MissingFnBody { name: f.name.clone() } });
+            return Err(TypeError {
+                span: fallback_span,
+                kind: TypeErrorKind::MissingFnBody {
+                    name: f.name.clone(),
+                },
+            });
         };
         if let Some(t) = f.params.first().and_then(|p| p.ty.as_ref()) {
             self.unify_at(t.span, target_ty, &param_types[0])?;
@@ -2742,7 +3139,11 @@ impl<'r> Infer<'r> {
             let declared = self.ty_from_ast_mapped(ret, impl_mapping);
             self.unify_at(ret.span, &declared, &result)?;
         }
-        let result_span = body.tail.as_deref().map(|t| t.span).unwrap_or(fallback_span);
+        let result_span = body
+            .tail
+            .as_deref()
+            .map(|t| t.span)
+            .unwrap_or(fallback_span);
         self.unify_at(result_span, &ret_var, &result)?;
         Ok(result)
     }
@@ -2798,7 +3199,10 @@ impl<'r> Infer<'r> {
         target: &Type,
         fns: &[FnDecl],
         fallback_span: Span,
-    ) -> (HashMap<String, Ty>, HashMap<String, Result<(Vec<Ty>, Ty), TypeError>>) {
+    ) -> (
+        HashMap<String, Ty>,
+        HashMap<String, Result<(Vec<Ty>, Ty), TypeError>>,
+    ) {
         let impl_mapping = self.fresh_generics_mapping(impl_generics, fallback_span);
         self.active_generics = impl_mapping.clone();
         let target_ty = self.ty_from_ast_mapped(target, &impl_mapping);
@@ -2815,7 +3219,10 @@ impl<'r> Infer<'r> {
             let param_types = self.inherent_method_param_tys(&f.params, &impl_mapping, &target_ty);
             let ret_var = self.vars.fresh();
             if let Some(name) = &struct_name {
-                self.in_progress_methods.insert((name.clone(), f.name.clone()), (param_types.clone(), ret_var.clone()));
+                self.in_progress_methods.insert(
+                    (name.clone(), f.name.clone()),
+                    (param_types.clone(), ret_var.clone()),
+                );
             }
             placeholders.insert(f.name.clone(), (param_types, ret_var));
         }
@@ -2828,7 +3235,16 @@ impl<'r> Infer<'r> {
             // names`'s own doc comment for why: each entry belongs to
             // whichever one member's body produced it.
             let outcome = self
-                .infer_inherent_impl_fn_raw(outer, impl_generics, &impl_mapping, &target_ty, param_types, ret_var, f, fallback_span)
+                .infer_inherent_impl_fn_raw(
+                    outer,
+                    impl_generics,
+                    &impl_mapping,
+                    &target_ty,
+                    param_types,
+                    ret_var,
+                    f,
+                    fallback_span,
+                )
                 .and_then(|ty| self.check_pending_type_names().map(|()| ty))
                 .and_then(|ty| self.check_pending_div_by_zero().map(|()| ty));
             raw_results.insert(f.name.clone(), outcome);
@@ -2836,7 +3252,8 @@ impl<'r> Infer<'r> {
 
         if let Some(name) = &struct_name {
             for f in fns {
-                self.in_progress_methods.remove(&(name.clone(), f.name.clone()));
+                self.in_progress_methods
+                    .remove(&(name.clone(), f.name.clone()));
             }
         }
 
@@ -2858,7 +3275,10 @@ impl<'r> Infer<'r> {
         // the whole block" posture as `check_pending_constraints` just
         // above — see `finish_fn`'s identical pairing for the single-
         // function path.
-        if let Err(e) = self.check_pending_field_accesses().and_then(|()| self.check_pending_method_calls()) {
+        if let Err(e) = self
+            .check_pending_field_accesses()
+            .and_then(|()| self.check_pending_method_calls())
+        {
             for outcome in raw_results.values_mut() {
                 if outcome.is_ok() {
                     *outcome = Err(e.clone());
@@ -2875,7 +3295,11 @@ impl<'r> Infer<'r> {
         // constraints`/unification elsewhere may have pinned it fully
         // concrete, but nothing had gone back to update the already-recorded
         // node entry to match.
-        let resolved_nodes: Vec<(NodeId, Ty)> = self.node_types.iter().map(|(id, t)| (*id, self.subst.apply(t))).collect();
+        let resolved_nodes: Vec<(NodeId, Ty)> = self
+            .node_types
+            .iter()
+            .map(|(id, t)| (*id, self.subst.apply(t)))
+            .collect();
         self.node_types = resolved_nodes.into_iter().collect();
         self.resolve_lambda_schemes();
 
@@ -2884,7 +3308,8 @@ impl<'r> Infer<'r> {
             let (param_types, _) = &placeholders[&f.name];
             let outcome = raw_results.remove(&f.name).unwrap();
             let resolved = outcome.map(|result_ty| {
-                let final_params: Vec<Ty> = param_types.iter().map(|t| self.subst.apply(t)).collect();
+                let final_params: Vec<Ty> =
+                    param_types.iter().map(|t| self.subst.apply(t)).collect();
                 let final_result = self.subst.apply(&result_ty);
                 (final_params, final_result)
             });
@@ -2910,7 +3335,12 @@ impl<'r> Infer<'r> {
     /// here — callers do that with whatever they specifically have on hand
     /// (a concrete `resolved_base` at a call site, only `target_ty` itself
     /// at declaration time).
-    fn inherent_method_param_tys(&mut self, params: &[Param], impl_mapping: &HashMap<String, Ty>, target_ty: &Ty) -> Vec<Ty> {
+    fn inherent_method_param_tys(
+        &mut self,
+        params: &[Param],
+        impl_mapping: &HashMap<String, Ty>,
+        target_ty: &Ty,
+    ) -> Vec<Ty> {
         params
             .iter()
             .enumerate()
@@ -2946,8 +3376,11 @@ impl<'r> Infer<'r> {
         // further; callers should never need to know that and re-apply
         // `subst` themselves.
         self.param_types = param_types.iter().map(|t| self.subst.apply(t)).collect();
-        let resolved_nodes: Vec<(NodeId, Ty)> =
-            self.node_types.iter().map(|(id, t)| (*id, self.subst.apply(t))).collect();
+        let resolved_nodes: Vec<(NodeId, Ty)> = self
+            .node_types
+            .iter()
+            .map(|(id, t)| (*id, self.subst.apply(t)))
+            .collect();
         self.node_types = resolved_nodes.into_iter().collect();
         self.resolve_lambda_schemes();
 
@@ -2973,7 +3406,10 @@ impl<'r> Infer<'r> {
     /// fn`'s fresh `ret_var` (from `fresh_fn_shape`) to its declared return
     /// type, with no body to infer one from instead.
     pub(crate) fn unify_at(&mut self, span: Span, a: &Ty, b: &Ty) -> Result<(), TypeError> {
-        unify(&mut self.subst, a, b).map_err(|e| TypeError { span, kind: TypeErrorKind::Unify(e) })
+        unify(&mut self.subst, a, b).map_err(|e| TypeError {
+            span,
+            kind: TypeErrorKind::Unify(e),
+        })
     }
 
     /// `∀vars. ty` where `vars` = free variables of `ty` that are free
@@ -3116,8 +3552,12 @@ impl<'r> Infer<'r> {
             if cs.len() < 2 {
                 continue;
             }
-            if let Some(algebras) = self.unsatisfiable_bounds(cs.iter().map(|c| c.algebra.as_str())) {
-                return Err(TypeError { span: cs[0].span, kind: TypeErrorKind::UnsatisfiableScheme { algebras } });
+            if let Some(algebras) = self.unsatisfiable_bounds(cs.iter().map(|c| c.algebra.as_str()))
+            {
+                return Err(TypeError {
+                    span: cs[0].span,
+                    kind: TypeErrorKind::UnsatisfiableScheme { algebras },
+                });
             }
         }
 
@@ -3126,10 +3566,20 @@ impl<'r> Infer<'r> {
         // constraint sweep just above (a bound checked later, once this
         // scheme is instantiated, needs the *real* width, not a guess; see
         // `check_pending_constraints`'s own `Ty::Const` bridge).
-        let const_widths: HashMap<TyVar, Ty> =
-            self.subst.const_widths.iter().filter(|(v, _)| var_set.contains(v)).map(|(v, t)| (*v, t.clone())).collect();
+        let const_widths: HashMap<TyVar, Ty> = self
+            .subst
+            .const_widths
+            .iter()
+            .filter(|(v, _)| var_set.contains(v))
+            .map(|(v, t)| (*v, t.clone()))
+            .collect();
 
-        Ok(Scheme { vars, constraints, ty, const_widths })
+        Ok(Scheme {
+            vars,
+            constraints,
+            ty,
+            const_widths,
+        })
     }
 
     /// Re-resolves every `lambda_schemes` entry's own `ty`/`const_widths`
@@ -3149,7 +3599,11 @@ impl<'r> Infer<'r> {
             .map(|(id, scheme)| {
                 let mut scheme = scheme.clone();
                 scheme.ty = self.subst.apply(&scheme.ty);
-                scheme.const_widths = scheme.const_widths.iter().map(|(v, t)| (*v, self.subst.apply(t))).collect();
+                scheme.const_widths = scheme
+                    .const_widths
+                    .iter()
+                    .map(|(v, t)| (*v, self.subst.apply(t)))
+                    .collect();
                 (*id, scheme)
             })
             .collect();
@@ -3228,7 +3682,11 @@ impl<'r> Infer<'r> {
     /// there would show up as `generic_arg_to_ty`'s unification landing on
     /// the wrong variable rather than a clean rejection.
     fn instantiate_with_mapping(&mut self, scheme: &Scheme) -> (Ty, HashMap<TyVar, Ty>) {
-        let mapping: HashMap<TyVar, Ty> = scheme.vars.iter().map(|v| (*v, self.vars.fresh())).collect();
+        let mapping: HashMap<TyVar, Ty> = scheme
+            .vars
+            .iter()
+            .map(|v| (*v, self.vars.fresh()))
+            .collect();
         for c in &scheme.constraints {
             self.constraints.push(Constraint {
                 algebra: c.algebra.clone(),
@@ -3265,7 +3723,10 @@ impl<'r> Infer<'r> {
     /// and `check_no_overlapping_impls`'s bound-satisfiability gate — both
     /// are really asking the identical question over two different sources
     /// of "which bounds land on the same variable."
-    fn unsatisfiable_bounds<'a>(&self, algebras: impl Iterator<Item = &'a str>) -> Option<Vec<String>> {
+    fn unsatisfiable_bounds<'a>(
+        &self,
+        algebras: impl Iterator<Item = &'a str>,
+    ) -> Option<Vec<String>> {
         let mut names: Vec<&str> = Vec::new();
         let mut candidates: Option<HashSet<String>> = None;
         for algebra in algebras {
@@ -3331,7 +3792,12 @@ impl<'r> Infer<'r> {
     /// involved, just two patterns compared to each other).
     pub fn check_no_overlapping_impls(&mut self) -> Vec<TypeError> {
         let mut errors = Vec::new();
-        for algebra in self.registry.algebra_names().map(str::to_string).collect::<Vec<_>>() {
+        for algebra in self
+            .registry
+            .algebra_names()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+        {
             // `all_impls` (every target, single or multi, generic or fully
             // concrete alike) rather than `generic_impls` (single-target
             // generic only) — a heterogeneous algebra's own impls need the
@@ -3364,7 +3830,9 @@ impl<'r> Infer<'r> {
                         // group exactly when the shape match just above
                         // actually merged their variables together.
                         let mut groups: Vec<(Ty, Vec<&str>)> = Vec::new();
-                        for (generics, mapping) in [(*generics_a, &mapping_a), (*generics_b, &mapping_b)] {
+                        for (generics, mapping) in
+                            [(*generics_a, &mapping_a), (*generics_b, &mapping_b)]
+                        {
                             for g in generics {
                                 if let GenericParam::Type { name, bounds, .. } = g {
                                     if bounds.is_empty() {
@@ -3372,17 +3840,27 @@ impl<'r> Infer<'r> {
                                     }
                                     let root = trial.apply(&mapping[name]);
                                     match groups.iter_mut().find(|(r, _)| *r == root) {
-                                        Some((_, bs)) => bs.extend(bounds.iter().map(String::as_str)),
-                                        None => groups.push((root, bounds.iter().map(String::as_str).collect())),
+                                        Some((_, bs)) => {
+                                            bs.extend(bounds.iter().map(String::as_str))
+                                        }
+                                        None => groups.push((
+                                            root,
+                                            bounds.iter().map(String::as_str).collect(),
+                                        )),
                                     }
                                 }
                             }
                         }
-                        let bounds_admit_a_shared_type =
-                            groups.iter().all(|(_, bs)| self.unsatisfiable_bounds(bs.iter().copied()).is_none());
+                        let bounds_admit_a_shared_type = groups
+                            .iter()
+                            .all(|(_, bs)| self.unsatisfiable_bounds(bs.iter().copied()).is_none());
                         if bounds_admit_a_shared_type {
-                            let fmt_targets =
-                                |ts: &[&Type]| ts.iter().map(|t| fmt_type(t)).collect::<Vec<_>>().join(", ");
+                            let fmt_targets = |ts: &[&Type]| {
+                                ts.iter()
+                                    .map(|t| fmt_type(t))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            };
                             errors.push(TypeError {
                                 span: targets_b[0].span,
                                 kind: TypeErrorKind::OverlappingImpls {
@@ -3441,9 +3919,13 @@ impl<'r> Infer<'r> {
             }
             let bounds_satisfied = generics.iter().all(|g| match g {
                 GenericParam::Type { name, bounds, .. } => {
-                    let Some(arg_ty) = mapping.get(name) else { return true };
+                    let Some(arg_ty) = mapping.get(name) else {
+                        return true;
+                    };
                     let resolved_arg = trial.apply(arg_ty);
-                    bounds.iter().all(|bound| self.has_matching_impl(bound, std::slice::from_ref(&resolved_arg)))
+                    bounds.iter().all(|bound| {
+                        self.has_matching_impl(bound, std::slice::from_ref(&resolved_arg))
+                    })
                 }
                 GenericParam::Const { .. } => true,
             });
@@ -3518,7 +4000,12 @@ impl<'r> Infer<'r> {
         self.has_matching_impl_inherited(algebra, tys, &mut HashSet::new())
     }
 
-    fn has_matching_impl_inherited(&mut self, algebra: &str, tys: &[Ty], visited: &mut HashSet<String>) -> bool {
+    fn has_matching_impl_inherited(
+        &mut self,
+        algebra: &str,
+        tys: &[Ty],
+        visited: &mut HashSet<String>,
+    ) -> bool {
         // Guards against a cyclic bound declaration (`algebra A : B` and
         // `algebra B : A`) looping forever — a malformed program, but one
         // that must fail cleanly (no matching impl found) rather than
@@ -3558,7 +4045,10 @@ impl<'r> Infer<'r> {
         // single sibling can satisfy a multi-ingredient conjunction by
         // accident the way one sibling can satisfy a shared single parent.
         let own_bounds = self.registry.algebra_bounds(algebra).to_vec();
-        own_bounds.len() >= 2 && own_bounds.iter().all(|b| self.has_matching_impl_inherited(b, tys, visited))
+        own_bounds.len() >= 2
+            && own_bounds
+                .iter()
+                .all(|b| self.has_matching_impl_inherited(b, tys, visited))
     }
 
     /// Real, committing dispatch for a (possibly heterogeneous,
@@ -3594,7 +4084,12 @@ impl<'r> Infer<'r> {
     /// (`infer_algebra_call`'s own `explicit_generics` handling), which
     /// pins the free position *before* this is ever reached, collapsing
     /// `matching_impls` back down to a single candidate.
-    fn dispatch_algebra_call(&mut self, algebra: &str, tys: &[Ty], span: Span) -> Result<bool, TypeError> {
+    fn dispatch_algebra_call(
+        &mut self,
+        algebra: &str,
+        tys: &[Ty],
+        span: Span,
+    ) -> Result<bool, TypeError> {
         if let [ty] = tys {
             if self.registry.has_impl_named(algebra, &ty.to_string()) {
                 return Ok(true);
@@ -3605,14 +4100,27 @@ impl<'r> Infer<'r> {
             return Ok(false);
         }
         if matches.len() > 1 {
-            let resolved: Vec<Vec<Ty>> =
-                matches.iter().map(|trial| tys.iter().map(|q| trial.apply(q)).collect()).collect();
+            let resolved: Vec<Vec<Ty>> = matches
+                .iter()
+                .map(|trial| tys.iter().map(|q| trial.apply(q)).collect())
+                .collect();
             if resolved[1..].iter().any(|r| r != &resolved[0]) {
                 let candidates = resolved
                     .iter()
-                    .map(|r| format!("{algebra}<{}>", r.iter().map(Ty::to_string).collect::<Vec<_>>().join(", ")))
+                    .map(|r| {
+                        format!(
+                            "{algebra}<{}>",
+                            r.iter().map(Ty::to_string).collect::<Vec<_>>().join(", ")
+                        )
+                    })
                     .collect();
-                return Err(TypeError { span, kind: TypeErrorKind::AmbiguousDispatch { algebra: algebra.to_string(), candidates } });
+                return Err(TypeError {
+                    span,
+                    kind: TypeErrorKind::AmbiguousDispatch {
+                        algebra: algebra.to_string(),
+                        candidates,
+                    },
+                });
             }
         }
         self.subst = matches.into_iter().next().unwrap();
@@ -3647,7 +4155,10 @@ impl<'r> Infer<'r> {
                 continue;
             }
             let resolved: Vec<Ty> = c.tys.iter().map(|t| self.subst.apply(t)).collect();
-            if resolved.iter().any(|t| matches!(t, Ty::Var(v) if self.quantified.contains(v))) {
+            if resolved
+                .iter()
+                .any(|t| matches!(t, Ty::Var(v) if self.quantified.contains(v)))
+            {
                 continue;
             }
             if resolved.iter().any(is_placeholder) {
@@ -3672,7 +4183,10 @@ impl<'r> Infer<'r> {
             // already committed. Re-queued, not dropped, so `Infer::check_
             // pending_constraints_and_indices`'s own outer fixpoint gets
             // another chance at it once more of the picture resolves.
-            if c.gating_indices.iter().any(|&i| !is_fully_concrete(&resolved[i])) {
+            if c.gating_indices
+                .iter()
+                .any(|&i| !is_fully_concrete(&resolved[i]))
+            {
                 self.constraints.push(c);
                 continue;
             }
@@ -3715,8 +4229,18 @@ impl<'r> Infer<'r> {
                     continue;
                 }
                 if !self.dispatch_algebra_call(&c.algebra, &resolved, c.span)? {
-                    let ty = resolved.iter().map(Ty::to_string).collect::<Vec<_>>().join(", ");
-                    return Err(TypeError { span: c.span, kind: TypeErrorKind::MissingImpl { algebra: c.algebra, ty } });
+                    let ty = resolved
+                        .iter()
+                        .map(Ty::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(TypeError {
+                        span: c.span,
+                        kind: TypeErrorKind::MissingImpl {
+                            algebra: c.algebra,
+                            ty,
+                        },
+                    });
                 }
                 continue;
             }
@@ -3768,8 +4292,8 @@ impl<'r> Infer<'r> {
             // exclusive with *each other* exactly as before — `1 + 2.0` is
             // untouched by this — this only ever fires when the resolved
             // type is genuinely `Complex<T>`, matching ℤ, ℝ ⊂ ℂ.
-            let widened_to_complex =
-                matches!(c.algebra.as_str(), "Int" | "Float") && matches!(&checkable[..], [Ty::App(name, _)] if name == "Complex");
+            let widened_to_complex = matches!(c.algebra.as_str(), "Int" | "Float")
+                && matches!(&checkable[..], [Ty::App(name, _)] if name == "Complex");
             // No separate ambiguity check needed here the way `dispatch_
             // algebra_call` needs one: by this point `checkable` is already
             // fully concrete in *every* position (the `is_fully_concrete`
@@ -3789,8 +4313,18 @@ impl<'r> Infer<'r> {
             // ever *both* match one single fully concrete tuple in the
             // first place. `has_matching_impl` stays the right tool.
             if !widened_to_complex && !self.has_matching_impl(&c.algebra, &checkable) {
-                let ty = checkable.iter().map(Ty::to_string).collect::<Vec<_>>().join(", ");
-                return Err(TypeError { span: c.span, kind: TypeErrorKind::MissingImpl { algebra: c.algebra, ty } });
+                let ty = checkable
+                    .iter()
+                    .map(Ty::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(TypeError {
+                    span: c.span,
+                    kind: TypeErrorKind::MissingImpl {
+                        algebra: c.algebra,
+                        ty,
+                    },
+                });
             }
         }
         Ok(())
@@ -3818,8 +4352,14 @@ impl<'r> Infer<'r> {
     /// per member, right after that member's own `infer_fn_raw` call, not
     /// once for the whole group.
     pub(crate) fn check_pending_type_names(&mut self) -> Result<(), TypeError> {
-        match std::mem::take(&mut self.pending_type_name_checks).into_iter().next() {
-            Some((name, span)) => Err(TypeError { span, kind: TypeErrorKind::TypeNameIsAnAlgebra { name } }),
+        match std::mem::take(&mut self.pending_type_name_checks)
+            .into_iter()
+            .next()
+        {
+            Some((name, span)) => Err(TypeError {
+                span,
+                kind: TypeErrorKind::TypeNameIsAnAlgebra { name },
+            }),
             None => Ok(()),
         }
     }
@@ -3829,8 +4369,14 @@ impl<'r> Infer<'r> {
     /// right above (see that field's own doc comment); called from the
     /// identical sites for the identical reason.
     pub(crate) fn check_pending_div_by_zero(&mut self) -> Result<(), TypeError> {
-        match std::mem::take(&mut self.pending_div_by_zero_checks).into_iter().next() {
-            Some((dividend, span)) => Err(TypeError { span, kind: TypeErrorKind::ConstDivByZero { dividend } }),
+        match std::mem::take(&mut self.pending_div_by_zero_checks)
+            .into_iter()
+            .next()
+        {
+            Some((dividend, span)) => Err(TypeError {
+                span,
+                kind: TypeErrorKind::ConstDivByZero { dividend },
+            }),
             None => Ok(()),
         }
     }
@@ -3893,7 +4439,14 @@ impl<'r> Infer<'r> {
     /// responsibility, same contract `resolve_field_access` already has);
     /// `index_tys`/`index_spans` are each already-inferred, already-`Int`-
     /// constrained.
-    fn resolve_index(&mut self, base_ty: Ty, index_tys: &[Ty], index_spans: &[Span], base_span: Span, expr_span: Span) -> Result<Ty, TypeError> {
+    fn resolve_index(
+        &mut self,
+        base_ty: Ty,
+        index_tys: &[Ty],
+        index_spans: &[Span],
+        base_span: Span,
+        expr_span: Span,
+    ) -> Result<Ty, TypeError> {
         match &base_ty {
             // A real array: peel one dimension per index, in order — the
             // direct generalization of what nested single-index `Index`
@@ -3912,12 +4465,17 @@ impl<'r> Infer<'r> {
                     current = match self.subst.apply(&current) {
                         Ty::Array(elem, _) => *elem,
                         Ty::Var(_) => return Ok(Ty::Con("<not-yet-inferred>".to_string())),
-                        other if is_placeholder(&other) => return Ok(Ty::Con("<not-yet-inferred>".to_string())),
+                        other if is_placeholder(&other) => {
+                            return Ok(Ty::Con("<not-yet-inferred>".to_string()));
+                        }
                         other => {
                             return Err(TypeError {
                                 span: *span,
                                 kind: TypeErrorKind::Unify(UnifyError::Mismatch(
-                                    Ty::Array(Box::new(self.vars.fresh()), Box::new(self.vars.fresh())),
+                                    Ty::Array(
+                                        Box::new(self.vars.fresh()),
+                                        Box::new(self.vars.fresh()),
+                                    ),
                                     other,
                                 )),
                             });
@@ -3955,7 +4513,10 @@ impl<'r> Infer<'r> {
                 for (index_ty, span) in index_tys.iter().zip(index_spans) {
                     self.unify_at(*span, &elem_ty, index_ty)?;
                 }
-                let idx_array_ty = Ty::Array(Box::new(elem_ty), Box::new(Ty::Const(ConstValue::Int(index_tys.len() as u64))));
+                let idx_array_ty = Ty::Array(
+                    Box::new(elem_ty),
+                    Box::new(Ty::Const(ConstValue::Int(index_tys.len() as u64))),
+                );
                 let candidates = self.registry.algebras_with_fn("index", 2);
                 if candidates.len() > 1 {
                     return Err(TypeError {
@@ -3967,7 +4528,14 @@ impl<'r> Infer<'r> {
                     });
                 }
                 if let Some(&algebra) = candidates.first() {
-                    self.infer_algebra_call(expr_span, algebra, "index", &[other.clone(), idx_array_ty], &[base_span, expr_span], &[])
+                    self.infer_algebra_call(
+                        expr_span,
+                        algebra,
+                        "index",
+                        &[other.clone(), idx_array_ty],
+                        &[base_span, expr_span],
+                        &[],
+                    )
                 } else {
                     Err(TypeError {
                         span: expr_span,
@@ -4006,7 +4574,13 @@ impl<'r> Infer<'r> {
             let result_ty = if is_placeholder(&resolved) {
                 Ty::Con("<not-yet-inferred>".to_string())
             } else {
-                self.resolve_index(resolved, &pending.index_tys, &pending.index_spans, pending.base_span, pending.span)?
+                self.resolve_index(
+                    resolved,
+                    &pending.index_tys,
+                    &pending.index_spans,
+                    pending.base_span,
+                    pending.span,
+                )?
             };
             self.unify_at(pending.span, &Ty::Var(pending.result), &result_ty)?;
         }
@@ -4055,7 +4629,11 @@ impl<'r> Infer<'r> {
             }
             if after >= before {
                 for pending in std::mem::take(&mut self.pending_indices) {
-                    self.unify_at(pending.span, &Ty::Var(pending.result), &Ty::Con("<not-yet-inferred>".to_string()))?;
+                    self.unify_at(
+                        pending.span,
+                        &Ty::Var(pending.result),
+                        &Ty::Con("<not-yet-inferred>".to_string()),
+                    )?;
                 }
                 return Ok(());
             }
@@ -4214,7 +4792,9 @@ impl<'r> Infer<'r> {
         if method != "len" || !args.is_empty() {
             return None;
         }
-        let ExprKind::Path(p) = &base.kind else { return None };
+        let ExprKind::Path(p) = &base.kind else {
+            return None;
+        };
         if p.segments.len() != 1 {
             return None;
         }
@@ -4257,9 +4837,14 @@ impl<'r> Infer<'r> {
     /// itself, since it's the one actual consumer that cares).
     fn const_value_from_expr(&mut self, value: &Expr, mapping: &HashMap<String, Ty>) -> Option<Ty> {
         match &value.kind {
-            ExprKind::NumberLit { text, .. } => text.parse::<u64>().ok().map(|n| Ty::Const(ConstValue::Int(n))),
+            ExprKind::NumberLit { text, .. } => text
+                .parse::<u64>()
+                .ok()
+                .map(|n| Ty::Const(ConstValue::Int(n))),
             ExprKind::BoolLit(b) => Some(Ty::Const(ConstValue::Bool(*b))),
-            ExprKind::Path(p) if p.segments.len() == 1 => mapping.get(&p.segments[0]).map(|t| self.subst.apply(t)),
+            ExprKind::Path(p) if p.segments.len() == 1 => {
+                mapping.get(&p.segments[0]).map(|t| self.subst.apply(t))
+            }
             // `Dims...` in an array-dimension position (`[T; Dims...]`,
             // `doc/backlog.md`'s own "Variadic generics" item) — the exact
             // same bare-name-against-`mapping` lookup the `Path` arm just
@@ -4270,7 +4855,9 @@ impl<'r> Infer<'r> {
             // `Dims.len()` in an array-dimension position (`[i32;
             // Dims.len()]`, `doc/backlog.md`'s own "Variadic generics" item)
             // — see `pack_len_from_method_call`'s own doc comment.
-            ExprKind::MethodCall(base, method, args) => self.pack_len_from_method_call(mapping, base, method, args),
+            ExprKind::MethodCall(base, method, args) => {
+                self.pack_len_from_method_call(mapping, base, method, args)
+            }
             ExprKind::Call(path, _, args, ..) if path.segments.len() == 1 && args.len() == 2 => {
                 let a = self.const_value_from_expr(&args[0], mapping)?;
                 let b = self.const_value_from_expr(&args[1], mapping)?;
@@ -4288,7 +4875,11 @@ impl<'r> Infer<'r> {
                     }
                     return const_eval::eval_binop(&path.segments[0], *av, *bv).map(Ty::Const);
                 }
-                Some(Ty::ConstExpr(path.segments[0].clone(), Box::new(a), Box::new(b)))
+                Some(Ty::ConstExpr(
+                    path.segments[0].clone(),
+                    Box::new(a),
+                    Box::new(b),
+                ))
             }
             _ => None,
         }
@@ -4311,9 +4902,9 @@ impl<'r> Infer<'r> {
     fn generic_arg_to_ty(&mut self, g: &GenericArg) -> Ty {
         match g {
             GenericArg::Type(t) => self.ty_from_ast_mapped(t, &self.active_generics.clone()),
-            GenericArg::Const(e) => {
-                self.const_value_from_expr(e, &self.active_generics.clone()).unwrap_or_else(|| self.vars.fresh())
-            }
+            GenericArg::Const(e) => self
+                .const_value_from_expr(e, &self.active_generics.clone())
+                .unwrap_or_else(|| self.vars.fresh()),
         }
     }
 
@@ -4327,7 +4918,12 @@ impl<'r> Infer<'r> {
         let mut env = env.clone();
         for stmt in &block.stmts {
             match &stmt.kind {
-                StmtKind::Let { mutable, name, ty, value } => {
+                StmtKind::Let {
+                    mutable,
+                    name,
+                    ty,
+                    value,
+                } => {
                     // A lambda's own body may reference `name` itself
                     // (self-recursion, `let g = fn(n) { ... g(n) ... };`) —
                     // real bug, found by direct testing (`error: type
@@ -4348,7 +4944,8 @@ impl<'r> Infer<'r> {
                     // placeholder simply goes unused.
                     let value_ty = if let ExprKind::Lambda { params, .. } = &value.kind {
                         let mut seeded_env = env.clone();
-                        let param_vars: Vec<Ty> = params.iter().map(|_| self.vars.fresh()).collect();
+                        let param_vars: Vec<Ty> =
+                            params.iter().map(|_| self.vars.fresh()).collect();
                         let ret_var = self.vars.fresh();
                         let self_ty = Ty::Fn(param_vars, Box::new(ret_var));
                         seeded_env.insert(name.clone(), Scheme::mono(self_ty.clone()));
@@ -4374,7 +4971,8 @@ impl<'r> Infer<'r> {
                         // the enclosing `fn`/impl-method's own generic
                         // parameter — see `active_generics`'s own doc
                         // comment for the real bug this closes.
-                        let declared = self.ty_from_ast_mapped(annotated, &self.active_generics.clone());
+                        let declared =
+                            self.ty_from_ast_mapped(annotated, &self.active_generics.clone());
                         self.unify_at(annotated.span, &declared, &value_ty)?;
                     }
                     // `let mut` is never generalized — see module docs (the
@@ -4416,11 +5014,16 @@ impl<'r> Infer<'r> {
                     // above walked into it) — re-read rather than re-infer.
                     if let ExprKind::Index(base, _) = &target.kind {
                         let base_ty = self.subst.apply(&self.node_types[&base.id].clone());
-                        if !matches!(base_ty, Ty::Array(..) | Ty::Var(_)) && !is_placeholder(&base_ty) {
+                        if !matches!(base_ty, Ty::Array(..) | Ty::Var(_))
+                            && !is_placeholder(&base_ty)
+                        {
                             return Err(TypeError {
                                 span: target.span,
                                 kind: TypeErrorKind::Unify(UnifyError::Mismatch(
-                                    Ty::Array(Box::new(self.vars.fresh()), Box::new(self.vars.fresh())),
+                                    Ty::Array(
+                                        Box::new(self.vars.fresh()),
+                                        Box::new(self.vars.fresh()),
+                                    ),
                                     base_ty,
                                 )),
                             });
@@ -4434,7 +5037,10 @@ impl<'r> Infer<'r> {
                 }
                 StmtKind::Break(value) => {
                     let Some(accumulator) = self.loop_stack.last().cloned() else {
-                        return Err(TypeError { span: stmt.span, kind: TypeErrorKind::BreakOutsideLoop });
+                        return Err(TypeError {
+                            span: stmt.span,
+                            kind: TypeErrorKind::BreakOutsideLoop,
+                        });
                     };
                     // A bare `break;` is `break ();` for typing purposes —
                     // legal in *any* loop kind, since `While`/`For`/`ForIn`
@@ -4479,8 +5085,13 @@ impl<'r> Infer<'r> {
                 None => {
                     let v = self.vars.fresh();
                     if let Ty::Var(id) = v {
-                        let is_float = text.contains('.') || text.contains('e') || text.contains('E');
-                        let default = if is_float { NumberDefault::Float } else { NumberDefault::Int };
+                        let is_float =
+                            text.contains('.') || text.contains('e') || text.contains('E');
+                        let default = if is_float {
+                            NumberDefault::Float
+                        } else {
+                            NumberDefault::Int
+                        };
                         self.pending_defaults.push((id, default));
                         // "Num" *and* "Int"/"Float", explicitly, even though
                         // `algebra Int<T> : Num`/`Float<T> : Num` (see
@@ -4506,9 +5117,17 @@ impl<'r> Infer<'r> {
                         // `check_pending_constraints`), so this is additive,
                         // not a behavior change for a program that never
                         // `use`s `num`.
-                        self.constraints.push(Constraint::all_gating("Num".to_string(), vec![v.clone()], expr.span));
+                        self.constraints.push(Constraint::all_gating(
+                            "Num".to_string(),
+                            vec![v.clone()],
+                            expr.span,
+                        ));
                         let shape_algebra = if is_float { "Float" } else { "Int" };
-                        self.constraints.push(Constraint::all_gating(shape_algebra.to_string(), vec![v.clone()], expr.span));
+                        self.constraints.push(Constraint::all_gating(
+                            shape_algebra.to_string(),
+                            vec![v.clone()],
+                            expr.span,
+                        ));
                     }
                     Ok(v)
                 }
@@ -4529,18 +5148,26 @@ impl<'r> Infer<'r> {
                 let v = self.vars.fresh();
                 if let Ty::Var(id) = v {
                     self.pending_defaults.push((id, NumberDefault::Complex));
-                    self.constraints.push(Constraint::all_gating("Num".to_string(), vec![v.clone()], expr.span));
-                    self.constraints.push(Constraint::all_gating("Complex".to_string(), vec![v.clone()], expr.span));
+                    self.constraints.push(Constraint::all_gating(
+                        "Num".to_string(),
+                        vec![v.clone()],
+                        expr.span,
+                    ));
+                    self.constraints.push(Constraint::all_gating(
+                        "Complex".to_string(),
+                        vec![v.clone()],
+                        expr.span,
+                    ));
                 }
                 Ok(v)
             }
             ExprKind::BoolLit(_) => Ok(Ty::Con("bool".to_string())),
             ExprKind::Path(p) => {
                 let name = p.segments.join("::");
-                let scheme = env
-                    .get(&name)
-                    .cloned()
-                    .ok_or(TypeError { span: expr.span, kind: TypeErrorKind::UnknownName(name) })?;
+                let scheme = env.get(&name).cloned().ok_or(TypeError {
+                    span: expr.span,
+                    kind: TypeErrorKind::UnknownName(name),
+                })?;
                 Ok(self.instantiate(&scheme))
             }
             // A reserved raw-MLIR-op call (`mlir::arith::addi(a, b)`) --
@@ -4559,15 +5186,23 @@ impl<'r> Infer<'r> {
             // safety net is MLIR's own verifier, not this pass. A deliberate
             // trade-off, not an oversight: see `mlir_lower.rs`'s own module
             // doc comment.
-            ExprKind::Call(path, _, args, _) if path.segments.first().map(String::as_str) == Some("mlir") => {
+            ExprKind::Call(path, _, args, _)
+                if path.segments.first().map(String::as_str) == Some("mlir") =>
+            {
                 for arg in args {
                     self.infer_expr(env, arg)?;
                 }
                 Ok(self.vars.fresh())
             }
-            ExprKind::Call(path, generics, args, _) => self.infer_call(env, expr.span, path, generics, args),
+            ExprKind::Call(path, generics, args, _) => {
+                self.infer_call(env, expr.span, path, generics, args)
+            }
             ExprKind::Block(b) => self.infer_block(env, b),
-            ExprKind::If { cond, then_branch, else_branch } => {
+            ExprKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
                 let cond_ty = self.infer_expr(env, cond)?;
                 self.unify_at(cond.span, &Ty::Con("bool".to_string()), &cond_ty)?;
                 let then_ty = self.infer_block(env, then_branch)?;
@@ -4608,7 +5243,12 @@ impl<'r> Infer<'r> {
                 result?;
                 Ok(Ty::Con("()".to_string()))
             }
-            ExprKind::For { var, start, end, body } => {
+            ExprKind::For {
+                var,
+                start,
+                end,
+                body,
+            } => {
                 let start_ty = self.infer_expr(env, start)?;
                 let end_ty = self.infer_expr(env, end)?;
                 self.unify_at(end.span, &start_ty, &end_ty)?;
@@ -4616,7 +5256,11 @@ impl<'r> Infer<'r> {
                 // specifically (no hardcoded width, same "Int, unconstrained
                 // width" posture `ExprKind::Index`'s own bound already
                 // uses), just some real `Int`-impl'd type.
-                self.constraints.push(Constraint::all_gating("Int".to_string(), vec![start_ty.clone()], start.span));
+                self.constraints.push(Constraint::all_gating(
+                    "Int".to_string(),
+                    vec![start_ty.clone()],
+                    start.span,
+                ));
                 let mut inner_env = env.clone();
                 inner_env.insert(var.clone(), Scheme::mono(start_ty));
                 // `infer_block` clones `inner_env` again internally — the
@@ -4639,7 +5283,11 @@ impl<'r> Infer<'r> {
                 let iter_ty = self.infer_expr(env, iter)?;
                 let elem_ty = self.vars.fresh();
                 let size_ty = self.vars.fresh();
-                self.unify_at(iter.span, &Ty::Array(Box::new(elem_ty.clone()), Box::new(size_ty)), &iter_ty)?;
+                self.unify_at(
+                    iter.span,
+                    &Ty::Array(Box::new(elem_ty.clone()), Box::new(size_ty)),
+                    &iter_ty,
+                )?;
                 let mut inner_env = env.clone();
                 inner_env.insert(var.clone(), Scheme::mono(elem_ty));
                 self.loop_stack.push(Ty::Con("()".to_string()));
@@ -4674,7 +5322,9 @@ impl<'r> Infer<'r> {
                 // `UnknownName` before this ever gets a chance to run. See
                 // `pack_len_from_method_call`'s own doc comment for why this
                 // can't collide with a genuine method call.
-                if let Some(pack_len) = self.pack_len_from_method_call(&self.active_generics.clone(), base, name, args) {
+                if let Some(pack_len) =
+                    self.pack_len_from_method_call(&self.active_generics.clone(), base, name, args)
+                {
                     return Ok(pack_len);
                 }
                 let base_ty = self.infer_expr(env, base)?;
@@ -4696,7 +5346,9 @@ impl<'r> Infer<'r> {
                             arg_tys.push(self.infer_expr(env, a)?);
                             arg_spans.push(a.span);
                         }
-                        let Ty::Var(result) = self.vars.fresh() else { unreachable!("fresh() always returns Ty::Var") };
+                        let Ty::Var(result) = self.vars.fresh() else {
+                            unreachable!("fresh() always returns Ty::Var")
+                        };
                         self.pending_method_calls.push(PendingMethodCall {
                             base: resolved_base,
                             method: name.clone(),
@@ -4739,8 +5391,10 @@ impl<'r> Infer<'r> {
                             _ => None,
                         };
                         if let Some(struct_name) = &struct_name {
-                            if let Some((param_tys, ret_ty)) =
-                                self.in_progress_methods.get(&(struct_name.clone(), name.clone())).cloned()
+                            if let Some((param_tys, ret_ty)) = self
+                                .in_progress_methods
+                                .get(&(struct_name.clone(), name.clone()))
+                                .cloned()
                             {
                                 self.unify_at(base.span, &param_tys[0], &resolved_base)?;
                                 for (pt, a) in param_tys[1..].iter().zip(args) {
@@ -4756,7 +5410,14 @@ impl<'r> Infer<'r> {
                             arg_tys.push(self.infer_expr(env, a)?);
                             arg_spans.push(a.span);
                         }
-                        self.resolve_method_call(&resolved_base, name, &arg_tys, &arg_spans, base.span, expr.span)
+                        self.resolve_method_call(
+                            &resolved_base,
+                            name,
+                            &arg_tys,
+                            &arg_spans,
+                            base.span,
+                            expr.span,
+                        )
                     }
                 }
             }
@@ -4774,7 +5435,10 @@ impl<'r> Infer<'r> {
                     let t = self.infer_expr(env, e)?;
                     self.unify_at(e.span, &elem_ty, &t)?;
                 }
-                Ok(Ty::Array(Box::new(elem_ty), Box::new(Ty::Const(ConstValue::Int(elems.len() as u64)))))
+                Ok(Ty::Array(
+                    Box::new(elem_ty),
+                    Box::new(Ty::Const(ConstValue::Int(elems.len() as u64))),
+                ))
             }
             // `[value; N]`, `N` naming a const generic (the literal-count
             // case desugars to `ArrayLit` at lowering time instead — see
@@ -4802,7 +5466,10 @@ impl<'r> Infer<'r> {
             ExprKind::ArrayRepeat { value, count } => {
                 let elem_ty = self.infer_expr(env, value)?;
                 let count_ty = if let ExprKind::PackRef(name) = &count.kind {
-                    self.active_generics.get(name).cloned().unwrap_or_else(|| self.vars.fresh())
+                    self.active_generics
+                        .get(name)
+                        .cloned()
+                        .unwrap_or_else(|| self.vars.fresh())
                 } else {
                     self.infer_expr(env, count)?
                 };
@@ -4826,7 +5493,11 @@ impl<'r> Infer<'r> {
                 let mut index_spans: Vec<Span> = Vec::with_capacity(indices.len());
                 for idx in indices {
                     let idx_ty = self.infer_expr(env, idx)?;
-                    self.constraints.push(Constraint::all_gating("Int".to_string(), vec![idx_ty.clone()], idx.span));
+                    self.constraints.push(Constraint::all_gating(
+                        "Int".to_string(),
+                        vec![idx_ty.clone()],
+                        idx.span,
+                    ));
                     index_tys.push(idx_ty);
                     index_spans.push(idx.span);
                 }
@@ -4848,7 +5519,9 @@ impl<'r> Infer<'r> {
                     // later unification, and the real resolution is
                     // deferred to `check_pending_indices`.
                     Ty::Var(_) => {
-                        let Ty::Var(result) = self.vars.fresh() else { unreachable!("fresh() always returns Ty::Var") };
+                        let Ty::Var(result) = self.vars.fresh() else {
+                            unreachable!("fresh() always returns Ty::Var")
+                        };
                         self.pending_indices.push(PendingIndex {
                             base: resolved_base,
                             base_span: base.span,
@@ -4864,8 +5537,16 @@ impl<'r> Infer<'r> {
                     // undeclared cross-function call) — genuinely never
                     // resolves no matter how long this waits, so it keeps
                     // returning the placeholder immediately, unchanged.
-                    _ if is_placeholder(&resolved_base) => Ok(Ty::Con("<not-yet-inferred>".to_string())),
-                    _ => self.resolve_index(resolved_base, &index_tys, &index_spans, base.span, expr.span),
+                    _ if is_placeholder(&resolved_base) => {
+                        Ok(Ty::Con("<not-yet-inferred>".to_string()))
+                    }
+                    _ => self.resolve_index(
+                        resolved_base,
+                        &index_tys,
+                        &index_spans,
+                        base.span,
+                        expr.span,
+                    ),
                 }
             }
             ExprKind::FieldAccess(base, name) => {
@@ -4880,7 +5561,9 @@ impl<'r> Infer<'r> {
                     // knowable yet" question, resolved for real once
                     // `check_pending_field_accesses` runs, after defaulting.
                     Ty::Var(_) => {
-                        let Ty::Var(result) = self.vars.fresh() else { unreachable!("fresh() always returns Ty::Var") };
+                        let Ty::Var(result) = self.vars.fresh() else {
+                            unreachable!("fresh() always returns Ty::Var")
+                        };
                         self.pending_field_accesses.push(PendingFieldAccess {
                             base: resolved,
                             field: name.clone(),
@@ -4903,8 +5586,15 @@ impl<'r> Infer<'r> {
             }
             ExprKind::StructLit(path, explicit_generics, fields) => {
                 let struct_name = path.segments.join("::");
-                let Some(declared_fields) = self.registry.struct_fields(&struct_name).map(<[Field]>::to_vec) else {
-                    return Err(TypeError { span: expr.span, kind: TypeErrorKind::UnknownStruct(struct_name) });
+                let Some(declared_fields) = self
+                    .registry
+                    .struct_fields(&struct_name)
+                    .map(<[Field]>::to_vec)
+                else {
+                    return Err(TypeError {
+                        span: expr.span,
+                        kind: TypeErrorKind::UnknownStruct(struct_name),
+                    });
                 };
                 // Fresh variables for the struct's own generic parameters
                 // (if any), one per construction site — exactly like an
@@ -4932,8 +5622,19 @@ impl<'r> Infer<'r> {
                 // struct's own declaration at all, only from a concrete
                 // construction site. See `Self::infer_struct_lit_with_pack`'s
                 // own doc comment for the full design.
-                if struct_generics.last().is_some_and(GenericParam::is_variadic) {
-                    return self.infer_struct_lit_with_pack(env, expr.span, &struct_name, &struct_generics, explicit_generics, fields, &declared_fields);
+                if struct_generics
+                    .last()
+                    .is_some_and(GenericParam::is_variadic)
+                {
+                    return self.infer_struct_lit_with_pack(
+                        env,
+                        expr.span,
+                        &struct_name,
+                        &struct_generics,
+                        explicit_generics,
+                        fields,
+                        &declared_fields,
+                    );
                 }
 
                 let generics_mapping = self.fresh_generics_mapping(&struct_generics, expr.span);
@@ -4961,10 +5662,15 @@ impl<'r> Infer<'r> {
 
                 let mut seen: HashSet<String> = HashSet::new();
                 for (name, value) in fields {
-                    let Some(decl_field) = declared_fields.iter().find(|f| &f.name == name).cloned() else {
+                    let Some(decl_field) =
+                        declared_fields.iter().find(|f| &f.name == name).cloned()
+                    else {
                         return Err(TypeError {
                             span: value.span,
-                            kind: TypeErrorKind::NoSuchField { struct_name: struct_name.clone(), field: name.clone() },
+                            kind: TypeErrorKind::NoSuchField {
+                                struct_name: struct_name.clone(),
+                                field: name.clone(),
+                            },
                         });
                     };
                     if !seen.insert(name.clone()) {
@@ -5058,7 +5764,9 @@ impl<'r> Infer<'r> {
             // own dedicated arm, never through general expression
             // inference. Grammar/AST exist (Milestone 1 of `doc/backlog.md`'s
             // own "Variadic generics" item); nothing resolves a pack yet.
-            ExprKind::PackRef(name) => panic!("type inference: pack reference `{name}...` reached ordinary expression inference -- variadic generics aren't semantically supported yet (only the grammar/AST exist so far)"),
+            ExprKind::PackRef(name) => panic!(
+                "type inference: pack reference `{name}...` reached ordinary expression inference -- variadic generics aren't semantically supported yet (only the grammar/AST exist so far)"
+            ),
         }
     }
 
@@ -5104,20 +5812,37 @@ impl<'r> Infer<'r> {
         // below, unchanged.
         if let [algebra, method] = path.segments.as_slice() {
             if self.registry.has_algebra(algebra) {
-                let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer_expr(env, a)).collect::<Result<_, _>>()?;
+                let arg_tys: Vec<Ty> = args
+                    .iter()
+                    .map(|a| self.infer_expr(env, a))
+                    .collect::<Result<_, _>>()?;
                 // `infer_algebra_call` itself `unreachable!()`s if `fn_sig`
                 // misses — it assumes its own caller already confirmed the
                 // method exists (its one existing caller only ever reaches it
                 // via an already-`algebras_with_fn`-confirmed candidate) — so
                 // this check has to happen here, not there.
-                if !self.registry.fn_sig(algebra, method).is_some_and(|sig| sig.params.len() == args.len()) {
+                if !self
+                    .registry
+                    .fn_sig(algebra, method)
+                    .is_some_and(|sig| sig.params.len() == args.len())
+                {
                     return Err(TypeError {
                         span: call_span,
-                        kind: TypeErrorKind::UnknownAlgebraMethod { algebra: algebra.clone(), method: method.clone() },
+                        kind: TypeErrorKind::UnknownAlgebraMethod {
+                            algebra: algebra.clone(),
+                            method: method.clone(),
+                        },
                     });
                 }
                 let arg_spans: Vec<Span> = args.iter().map(|a| a.span).collect();
-                return self.infer_algebra_call(call_span, algebra, method, &arg_tys, &arg_spans, explicit_generics);
+                return self.infer_algebra_call(
+                    call_span,
+                    algebra,
+                    method,
+                    &arg_tys,
+                    &arg_spans,
+                    explicit_generics,
+                );
             }
         }
 
@@ -5148,7 +5873,14 @@ impl<'r> Infer<'r> {
             // dispatch (`dispatch_algebra_call`'s own `AmbiguousDispatch`)
             // has no other way to be resolved.
             let arg_spans: Vec<Span> = args.iter().map(|a| a.span).collect();
-            return self.infer_algebra_call(call_span, algebra, &name, &arg_tys, &arg_spans, explicit_generics);
+            return self.infer_algebra_call(
+                call_span,
+                algebra,
+                &name,
+                &arg_tys,
+                &arg_spans,
+                explicit_generics,
+            );
         }
 
         if let Some(scheme) = env.get(&name).cloned() {
@@ -5184,7 +5916,11 @@ impl<'r> Infer<'r> {
                     if param_tys.len() != args.len() {
                         return Err(TypeError {
                             span: call_span,
-                            kind: TypeErrorKind::ArityMismatch { name, expected: param_tys.len(), found: args.len() },
+                            kind: TypeErrorKind::ArityMismatch {
+                                name,
+                                expected: param_tys.len(),
+                                found: args.len(),
+                            },
                         });
                     }
                     for (pt, (t, a)) in param_tys.iter().zip(arg_tys.iter().zip(args)) {
@@ -5192,9 +5928,17 @@ impl<'r> Infer<'r> {
                     }
                     Ok(*ret_ty)
                 }
-                other => Err(TypeError { span: call_span, kind: TypeErrorKind::NotCallable(other) }),
+                other => Err(TypeError {
+                    span: call_span,
+                    kind: TypeErrorKind::NotCallable(other),
+                }),
             }
-        } else if args.is_empty() && self.registry.struct_fields(&name).is_some_and(<[Field]>::is_empty) {
+        } else if args.is_empty()
+            && self
+                .registry
+                .struct_fields(&name)
+                .is_some_and(<[Field]>::is_empty)
+        {
             // `Empty()` — a zero-*field* struct's own construction syntax is
             // grammatically identical to a zero-arg call (see
             // `grammar.pest`'s `primary` comment: `call_expr` is tried
@@ -5236,12 +5980,20 @@ impl<'r> Infer<'r> {
             .registry
             .fn_sig(algebra, name)
             .cloned()
-            .unwrap_or_else(|| unreachable!("registry reported `{algebra}` declares `{name}`, but fn_sig lookup failed"));
+            .unwrap_or_else(|| {
+                unreachable!(
+                    "registry reported `{algebra}` declares `{name}`, but fn_sig lookup failed"
+                )
+            });
 
         if sig.params.len() != arg_spans.len() {
             return Err(TypeError {
                 span: call_span,
-                kind: TypeErrorKind::ArityMismatch { name: name.to_string(), expected: sig.params.len(), found: arg_spans.len() },
+                kind: TypeErrorKind::ArityMismatch {
+                    name: name.to_string(),
+                    expected: sig.params.len(),
+                    found: arg_spans.len(),
+                },
             });
         }
 
@@ -5296,8 +6048,11 @@ impl<'r> Infer<'r> {
                 None => self.vars.fresh(),
             })
             .collect();
-        let ret_ty =
-            sig.ret.as_ref().map(|t| self.ty_from_ast_mapped(t, &mapping)).unwrap_or_else(|| Ty::Con("()".to_string()));
+        let ret_ty = sig
+            .ret
+            .as_ref()
+            .map(|t| self.ty_from_ast_mapped(t, &mapping))
+            .unwrap_or_else(|| Ty::Con("()".to_string()));
 
         for (pt, (at, span)) in param_tys.iter().zip(arg_tys.iter().zip(arg_spans)) {
             self.unify_at(*span, pt, at)?;
@@ -5351,7 +6106,9 @@ impl<'r> Infer<'r> {
         // "`check_pending_constraints`'s output-only-generic gate" item.
         let mut gating_indices: Vec<usize> = Vec::new();
         for g in &generics {
-            let GenericParam::Type { name, .. } = g else { continue };
+            let GenericParam::Type { name, .. } = g else {
+                continue;
+            };
             let fresh = &mapping[name];
             let resolved = self.subst.apply(fresh);
             if matches!(fresh, Ty::Var(v) if param_free_vars.contains(v)) {
@@ -5372,7 +6129,8 @@ impl<'r> Infer<'r> {
         // to fix it, breaking every subsequent field/index access on it).
         // Two narrower cases still need to defer instead of committing
         // outright, layered on top of that general rule:
-        let active_vars_pending = !self.active_generics.is_empty() && !resolved_generics.iter().all(is_fully_concrete);
+        let active_vars_pending =
+            !self.active_generics.is_empty() && !resolved_generics.iter().all(is_fully_concrete);
 
         if gating.iter().any(is_placeholder) || active_vars_pending {
             // Either an *input* generic is an outright "unknown" (never
@@ -5397,7 +6155,12 @@ impl<'r> Infer<'r> {
             // (called right after this body finishes) marks `T` quantified
             // and `check_pending_constraints`'s own leading guard skips it
             // silently, exactly like any other still-open generic bound.
-            self.constraints.push(Constraint { algebra: algebra.to_string(), tys: resolved_generics, gating_indices, span: call_span });
+            self.constraints.push(Constraint {
+                algebra: algebra.to_string(),
+                tys: resolved_generics,
+                gating_indices,
+                span: call_span,
+            });
         } else if gating.iter().all(is_fully_concrete) {
             // Ready: every *input* generic is known, and we're not
             // mid-declaration of a still-open generic either, so dispatch
@@ -5408,8 +6171,18 @@ impl<'r> Infer<'r> {
             match self.dispatch_algebra_call(algebra, &resolved_generics, call_span) {
                 Ok(true) => {}
                 Ok(false) => {
-                    let ty = resolved_generics.iter().map(Ty::to_string).collect::<Vec<_>>().join(", ");
-                    return Err(TypeError { span: call_span, kind: TypeErrorKind::MissingImpl { algebra: algebra.to_string(), ty } });
+                    let ty = resolved_generics
+                        .iter()
+                        .map(Ty::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(TypeError {
+                        span: call_span,
+                        kind: TypeErrorKind::MissingImpl {
+                            algebra: algebra.to_string(),
+                            ty,
+                        },
+                    });
                 }
                 // More than one candidate structurally matches, and they
                 // disagree on some still-open position — by construction
@@ -5434,7 +6207,10 @@ impl<'r> Infer<'r> {
                 // local unification that could possibly disambiguate it)
                 // has been walked — if it's still ambiguous *then*, that
                 // failure is real and is allowed to propagate.
-                Err(TypeError { kind: TypeErrorKind::AmbiguousDispatch { .. }, .. }) => {
+                Err(TypeError {
+                    kind: TypeErrorKind::AmbiguousDispatch { .. },
+                    ..
+                }) => {
                     self.constraints.push(Constraint {
                         algebra: algebra.to_string(),
                         tys: resolved_generics,
@@ -5455,7 +6231,12 @@ impl<'r> Infer<'r> {
             // `resolved_generics` here, on purpose — `check_pending_
             // constraints` binds them later, it doesn't require them
             // concrete first.
-            self.constraints.push(Constraint { algebra: algebra.to_string(), tys: resolved_generics, gating_indices, span: call_span });
+            self.constraints.push(Constraint {
+                algebra: algebra.to_string(),
+                tys: resolved_generics,
+                gating_indices,
+                span: call_span,
+            });
         }
 
         Ok(self.subst.apply(&ret_ty))
@@ -5579,11 +6360,12 @@ impl<'r> Infer<'r> {
                 // for a bare `4i` to default to a wider real/imaginary
                 // component than a bare `4.0` would (real, found by direct
                 // testing: the two used to disagree).
-                NumberDefault::Complex => Ty::App("Complex".to_string(), vec![Ty::Con("f32".to_string())]),
+                NumberDefault::Complex => {
+                    Ty::App("Complex".to_string(), vec![Ty::Con("f32".to_string())])
+                }
             };
             unify(&mut self.subst, &Ty::Var(root), &default_ty)
                 .expect("defaulting an unbound, non-quantified variable can't fail");
         }
     }
 }
-

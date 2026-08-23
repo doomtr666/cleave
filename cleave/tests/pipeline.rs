@@ -34,10 +34,21 @@ fn emitting_an_object_for_a_program_that_calls_a_real_extern_fn_does_not_crash()
     let object_path = dir.join("out.o");
 
     let src = "extern fn print_i32(x: i32) -> i32;\nfn main() -> i32 { print_i32(42) }".to_string();
-    let result = compile_and_emit(vec![("test.cleave".to_string(), src)], &[], Some(&object_path), None);
+    let result = compile_and_emit(
+        vec![("test.cleave".to_string(), src)],
+        &[],
+        Some(&object_path),
+        None,
+    );
 
-    assert!(result.is_ok(), "expected a successful object emission, got: {result:?}");
-    assert!(object_path.exists(), "expected an object file to actually be written");
+    assert!(
+        result.is_ok(),
+        "expected a successful object emission, got: {result:?}"
+    );
+    assert!(
+        object_path.exists(),
+        "expected an object file to actually be written"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -58,12 +69,25 @@ fn an_i32_returning_main_compiles_links_and_runs_as_a_real_standalone_exe() {
 
     let src = "extern fn print_i32(x: i32) -> i32;\nfn main() -> i32 { print_i32(1234); 7 }";
     let result = build_exe(src, &exe_path);
-    assert!(result.is_ok(), "expected a successful exe build, got: {result:?}");
+    assert!(
+        result.is_ok(),
+        "expected a successful exe build, got: {result:?}"
+    );
     assert!(exe_path.exists(), "expected a real .exe to be written");
 
-    let output = Command::new(&exe_path).output().unwrap_or_else(|e| panic!("failed to run the built exe: {e}"));
-    assert_eq!(output.status.code(), Some(7), "expected the process exit code to be main's own return value");
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "1234", "expected print_i32's own stdout output");
+    let output = Command::new(&exe_path)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run the built exe: {e}"));
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "expected the process exit code to be main's own return value"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "1234",
+        "expected print_i32's own stdout output"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -73,15 +97,23 @@ fn an_i32_returning_main_compiles_links_and_runs_as_a_real_standalone_exe() {
 /// `std::process::exit`, exit code defaults to the process's ordinary `0`.
 #[test]
 fn a_unit_returning_main_compiles_links_and_runs_as_a_real_standalone_exe() {
-    let dir = std::env::temp_dir().join(format!("cleave_pipeline_exe_unit_test_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "cleave_pipeline_exe_unit_test_{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let exe_path = dir.join("prog.exe");
 
     let src = "extern fn print_i32(x: i32) -> i32;\nfn main() { print_i32(9999); }";
     let result = build_exe(src, &exe_path);
-    assert!(result.is_ok(), "expected a successful exe build, got: {result:?}");
+    assert!(
+        result.is_ok(),
+        "expected a successful exe build, got: {result:?}"
+    );
 
-    let output = Command::new(&exe_path).output().unwrap_or_else(|e| panic!("failed to run the built exe: {e}"));
+    let output = Command::new(&exe_path)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run the built exe: {e}"));
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "9999");
 
@@ -93,12 +125,21 @@ fn a_unit_returning_main_compiles_links_and_runs_as_a_real_standalone_exe() {
 /// error -- not a panic, not a confusing downstream linker failure.
 #[test]
 fn emit_exe_without_a_main_fn_is_a_clean_error() {
-    let dir = std::env::temp_dir().join(format!("cleave_pipeline_exe_nomain_test_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "cleave_pipeline_exe_nomain_test_{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let exe_path = dir.join("prog.exe");
 
-    let result = build_exe("export fn cleave_add(a: i32, b: i32) -> i32 { a + b }", &exe_path);
-    assert!(result.is_err(), "expected an error, no `main` exists to become the exe's own entry point");
+    let result = build_exe(
+        "export fn cleave_add(a: i32, b: i32) -> i32 { a + b }",
+        &exe_path,
+    );
+    assert!(
+        result.is_err(),
+        "expected an error, no `main` exists to become the exe's own entry point"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

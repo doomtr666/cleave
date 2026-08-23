@@ -14,9 +14,11 @@
 // with no `use linalg;` of its own, sees `Tensor`/`Ring<Tensor<T,N>>`/etc.
 // anyway — `cleave/tests/mlir_lower.rs`'s own `nn` tests are the real proof,
 // none of them write `use linalg;` themselves). `mean`'s own `.to()` call
-// needs `convert` too, transitively resolved the identical way.
+// needs `convert` too, transitively resolved the identical way. `dense_
+// xavier`/`dense_he`'s own `uniform`/`normal` calls need `rand` the same way.
 use linalg;
 use convert;
+use rand;
 
 algebra Activation<T> {
     fn relu(x: T) -> T;
@@ -63,35 +65,179 @@ impl Activation<f64> {
     fn tanh(x) { Transcendental::tanh(x) }
 }
 
-// The `Tensor<T,N>` counterpart — the *same* three bodies, applied directly
-// to the tensor-backed operand: `math.exp`/`math.tanh`/`arith.maximumf`
-// apply structurally over a `tensor<NxT>`-typed operand exactly the way
-// `Ring<Tensor<T,Dims...>>::add`'s own `arith.addf` already does (confirmed
-// directly, not assumed — `cleave/tests/mlir_lower.rs::relu_sigmoid_tanh_
-// compute_correctly_on_vectors`). `relu`/`sigmoid` each need a same-shape
-// constant vector to compare/combine against — `arith.maximumf`/`arith.
-// addf` don't broadcast a bare scalar into a tensor operand — built via the
-// already-working `[value; N]` array-repeat plus `Tensor::<T,N>(data:...)`
-// construction. The explicit turbofish here (never bare `Tensor(data:
-// ...)`, a genuine pack-generic struct now) resolving `T`/`N` to *this
-// impl's own* enclosing generics, not a bogus literal type spelled "T",
-// needed a real, separately-fixed bug (`generic_arg_to_ty` used to resolve
-// a turbofish argument against an empty generics mapping unconditionally —
-// see `cleave/tests/mlir_lower.rs::a_turbofish_inside_a_generic_impl_body_
-// resolves_the_impls_own_enclosing_generics`).
-impl<T: Float, const N: i32> Activation<Tensor<T, N>> {
+// The `Tensor<T,Dims...>` counterpart — pack-generic over *any* rank (was
+// rank-1-only, `Tensor<T,N>`, until this generalization): `relu`/`tanh` stay
+// raw `mlir::...` calls applied directly over the tensor-backed operand
+// (`arith.maximumf`/`math.tanh` apply structurally at any rank exactly the
+// way `Ring<Tensor<T,Dims...>>::add`'s own `arith.addf` already does,
+// confirmed directly — `cleave/tests/mlir_lower.rs::relu_sigmoid_tanh_
+// compute_correctly_on_vectors`) — `relu`/`tanh` have no `derivative` rule
+// of their own either way, scalar or `Tensor`, a known, narrower, separate
+// gap this impl doesn't attempt to close (differentiating *through* either
+// one isn't exercised anywhere reached by `derive()` yet).
+//
+// `sigmoid` is different: `Dense::forward` (`examples/xor_tensor.cleave`)
+// needs to differentiate all the way *through* it, so it composes from real,
+// named, individually-differentiable calls -- `Ring::neg`/`add`/`div` (this
+// same file's own `Ring<Tensor<T,Dims...>>` above) and `Transcendental::exp`
+// (`stdlib/linalg/tensor.cleave`'s new `impl<T,Dims...> Transcendental<
+// Tensor<T,Dims...>>`) -- the *exact* same shape its own scalar sibling just
+// above already uses (`1.0 / (1.0 + exp(-x))`), not the raw `mlir::arith::
+// negf`/`addf`/`divf` calls an earlier version of this impl used. Found
+// directly, by testing `Dense`/`Network`: a raw-op body, even though
+// numerically identical, is *purely* a chain of pure primops with no real
+// call in it at all -- `egraph.rs::is_straight_line` -- so `Forward::walk`
+// treated it as one opaque, unnamed node (the same treatment a genuinely
+// atomic op like `matmul` gets, correctly, because *it* has a declared
+// `derivative` rule to match against). `sigmoid` has no such rule (by
+// design -- see `Activation<T>`'s own doc comment: its derivative is meant
+// to compose automatically from its own primitives), so an opaque `sigmoid`
+// node could never differentiate at all -- silently stuck as a raw,
+// unresolved `derivative(...)` marker for *any* leaf reachable only through
+// it, rather than a clean error. `stdlib/num/num.cleave`'s own `Transcendental
+// <T>` doc comment already tells this identical story for the scalar case
+// ("sigmoid... had no path to a derivative at all short of its own hand-
+// written closed form... moving `exp` here... means sigmoid's derivative now
+// composes automatically via ordinary chain-rule saturation") -- this is
+// that same fix, just not yet carried over to the pack-generic case until
+// now. `one`, a same-shape broadcast tensor of `1.0`, still can't be
+// avoided (`Ring::add`/`div` require *matching* operand types, and a bare
+// `1.0` literal is `T`, not `Tensor<T,Dims...>`) -- built via `[value;
+// Dims...]` plus `Tensor::<T,Dims...>(data:...)`, same as `relu` below.
+impl<T: Float, const Dims...: i32> Activation<Tensor<T, Dims...>> {
     fn relu(x) {
-        let zero = Tensor::<T, N>(data: [0.0; N]);
+        let zero = Tensor::<T, Dims...>(data: [0.0; Dims...]);
         mlir::arith::maximumf(x, zero)
     }
     fn sigmoid(x) {
-        let one: Tensor<T, N> = Tensor::<T, N>(data: [1.0; N]);
-        let negx: Tensor<T, N> = mlir::arith::negf(x);
-        let e: Tensor<T, N> = mlir::math::exp(negx);
-        let denom: Tensor<T, N> = mlir::arith::addf(one, e);
-        mlir::arith::divf(one, denom)
+        let one: Tensor<T, Dims...> = Tensor::<T, Dims...>(data: [1.0; Dims...]);
+        one / (one + exp(-x))
     }
     fn tanh(x) { mlir::math::tanh(x) }
+}
+
+// A fully-connected layer -- ordinary stdlib struct plus inherent impl, same
+// shape as `Complex<T>::magnitude`/`magnitude_sq` (`stdlib/complex/
+// complex.cleave`), no new compiler mechanism: `forward` is just `matmul`
+// (`linalg::matrix.cleave`) followed by a bias add (`Ring<Tensor<...>>::
+// add`, via `+`), both already proven independently. This is the `Dense`
+// the session's own `Network`/`xor_tensor.cleave` rewrite bundles multiple
+// of, replacing the eleven loose scalar parameters that example used to
+// take.
+//
+// Deliberately *no* activation baked in here -- an earlier version of this
+// impl called `sigmoid` directly at the end of `forward`, inherited
+// unquestioned from `examples/xor_tensor.cleave`'s own pre-`Dense`
+// `sigmoid2` helper (which *did* fuse linear+activation), without stepping
+// back to ask whether that was the right split. It wasn't: a real, reusable
+// `Dense` needs to stay just the affine transform, exactly like `nn.Linear`
+// in every other framework -- the *caller* composes whichever activation it
+// wants (`sigmoid`, `relu`, or none at all, for a final logit) on top,
+// ordinarily, as a real separate call. Nothing about `derive()` needs the
+// activation fused in either way -- confirmed directly, not assumed: `Ring
+// ::neg`/`add`/`div`/`Transcendental::exp` (`sigmoid`'s own composition,
+// above) differentiate correctly through an ordinary call site exactly like
+// `Dense::forward`'s own call site does.
+struct Dense<T: Float, const In: i32, const Out: i32> { w: Tensor<T, In, Out>, b: Tensor<T, 1, Out> }
+
+impl<T: Float, const In: i32, const Out: i32> struct Dense<T, In, Out> {
+    // `x` is a single `1 x In` row (one training example), matching
+    // `matmul`'s own `Tensor<T,N,M> x Tensor<T,M,K> -> Tensor<T,N,K>` shape
+    // with `N=1` -- the same single-example-at-a-time reasoning `examples/
+    // xor.cleave`/`xor_tensor.cleave` already document for their own SGD
+    // loop.
+    fn forward(layer, x: Tensor<T, 1, In>) -> Tensor<T, 1, Out> {
+        matmul(x, layer.w) + layer.b
+    }
+}
+
+// `Init<T>::xavier`/`he` -- real weight initialization, `doc/backlog.md`'s
+// own "No weight-initialization helpers" item finally closed now that `rand`
+// (`stdlib/rand/rand.cleave`) exists to build it on.
+//
+// A real, if narrow, algebra -- not `Dense`-inherent methods (an inherent
+// method call always needs a real receiver whose own type drives dispatch,
+// `registry.rs`'s own `inherent_method` doc comment: "dispatch always starts
+// from a resolved struct name" -- a constructor has no `Dense` value yet to
+// call one on) -- and, a real, found-by-testing surprise, *not* a plain top-
+// level generic function either, even though that's the shape every other
+// helper in this file (`random_matrix`, this session's own validation probe)
+// already used successfully. `fn dense_xavier<T,In,Out>() -> Dense<T,In,Out>`
+// (zero real value parameters, every one of its three generics determined
+// *purely* by the caller's own expected-type context, e.g. `let d: Dense<f32,
+// 2,2> = dense_xavier();`) hit a genuine compiler gap: unlike `Ring::zero()`
+// (also zero-arg, also purely output-type-determined, and already proven to
+// work everywhere), an ordinary top-level generic *function* call in this
+// same shape doesn't get that expected-type context propagated into its own
+// body at all -- confirmed directly: `.to()` (`Convert`) inside the body came
+// back "ambiguous dispatch ... could resolve to Convert<i32,f32> or
+// Convert<i32,f64>" even with the call site's own type fully pinned one level
+// up. Turbofish doesn't rescue it either -- a *second*, independent bug: any
+// call to a zero-*value*-parameter generic function with an explicit turbofish
+// (`dense_xavier::<f32>()`) is misdiagnosed as a real *argument* ("expects 0
+// argument(s), found 1"), the turbofish's own generic count apparently
+// counted as call arguments. Neither investigated further here (both flagged
+// in `doc/backlog.md`) -- routing through `Init<T>` instead sidesteps both at
+// once, reusing `Ring::zero()`'s own already-proven algebra-dispatch
+// resolution path rather than the broken one.
+algebra Init<T> {
+    fn xavier() -> T;
+    fn he() -> T;
+}
+
+// `[[zero(); Out]; In]` (a same-shape placeholder, pure, so array-repeat's
+// own "evaluate once, broadcast" behavior is fine here) then a real nested
+// loop with indexed writes (`w[i][j] = ...`, ordinary multi-index `Store`,
+// not `[value; Dims...]`, which cannot fill a tensor with independent draws
+// at all -- see `rand.cleave`'s own doc comment) -- exactly the mechanism
+// already proven end to end by the session's own `random_matrix` validation
+// probe.
+//
+// `In`/`Out` (bare const generics) can't be handed to `.to()` directly --
+// the same `Ty::Const`-vs-`Ty::Con` gap `Mean::mean`'s own doc comment above
+// already documents and works around, identically here: `mlir::arith::addi
+// (In, 0)` forces each into a real, computed `i32` value first.
+//
+// Bias is zero-initialized in both -- the standard convention, and `Ring::
+// zero()` already does exactly this for a `Tensor`-typed field.
+impl<T: Float + Rand + Ring, const In: i32, const Out: i32> Init<Dense<T, In, Out>> {
+    // Xavier/Glorot uniform (Glorot & Bengio, 2010) -- `limit = sqrt(6 /
+    // (fan_in + fan_out))`, weight ~ `Uniform(-limit, limit)` -- the standard
+    // choice for a `sigmoid`/`tanh`-activated layer (`examples/xor_tensor.
+    // cleave`'s own).
+    fn xavier() {
+        let fan_in_i: i32 = mlir::arith::addi(In, 0);
+        let fan_out_i: i32 = mlir::arith::addi(Out, 0);
+        let fan_in: T = fan_in_i.to();
+        let fan_out: T = fan_out_i.to();
+        let limit: T = mlir::math::sqrt(6.0 / (fan_in + fan_out));
+        let mut w: [[T; Out]; In] = [[zero(); Out]; In];
+        for i in 0..In {
+            for j in 0..Out {
+                w[i][j] = uniform(-limit, limit);
+            };
+        };
+        Dense(w: Tensor::<T, In, Out>(data: w), b: Ring::zero())
+    }
+
+    // He normal (He et al., 2015) -- `std = sqrt(2 / fan_in)`, weight ~
+    // `Normal(0, std)` -- the standard choice for a `relu`-activated layer.
+    // Not used by `examples/xor_tensor.cleave` (its own network is `sigmoid`
+    // throughout, so `xavier` above is the one it actually needs), but real
+    // and tested independently -- a network with a `relu` hidden layer needs
+    // exactly this.
+    fn he() {
+        let fan_in_i: i32 = mlir::arith::addi(In, 0);
+        let fan_in: T = fan_in_i.to();
+        let std: T = mlir::math::sqrt(2.0 / fan_in);
+        let mut w: [[T; Out]; In] = [[zero(); Out]; In];
+        for i in 0..In {
+            for j in 0..Out {
+                w[i][j] = normal(0.0, std);
+            };
+        };
+        Dense(w: Tensor::<T, In, Out>(data: w), b: Ring::zero())
+    }
 }
 
 algebra Sum<Container, T> {

@@ -26,9 +26,15 @@ fn stdlib_num_declares_impls_for_core_numeric_types() {
     let registry = load_num_registry();
     assert!(registry.has_algebra("Num"));
     for ty in ["i8", "i16", "i32", "i64", "f32", "f64"] {
-        assert!(satisfies_bound(&registry, "Num", ty), "expected {ty} to satisfy a `Num` bound");
+        assert!(
+            satisfies_bound(&registry, "Num", ty),
+            "expected {ty} to satisfy a `Num` bound"
+        );
     }
-    assert!(!satisfies_bound(&registry, "Num", "bool"), "bool must not be considered Num");
+    assert!(
+        !satisfies_bound(&registry, "Num", "bool"),
+        "bool must not be considered Num"
+    );
 }
 
 #[test]
@@ -42,12 +48,24 @@ fn stdlib_num_splits_int_and_float_as_independent_algebras() {
     assert!(registry.has_algebra("Int"));
     assert!(registry.has_algebra("Float"));
     for ty in ["i8", "i16", "i32", "i64"] {
-        assert!(satisfies_bound(&registry, "Int", ty), "expected {ty} to satisfy an `Int` bound");
-        assert!(!satisfies_bound(&registry, "Float", ty), "{ty} must not be considered Float");
+        assert!(
+            satisfies_bound(&registry, "Int", ty),
+            "expected {ty} to satisfy an `Int` bound"
+        );
+        assert!(
+            !satisfies_bound(&registry, "Float", ty),
+            "{ty} must not be considered Float"
+        );
     }
     for ty in ["f32", "f64"] {
-        assert!(satisfies_bound(&registry, "Float", ty), "expected {ty} to satisfy a `Float` bound");
-        assert!(!satisfies_bound(&registry, "Int", ty), "{ty} must not be considered Int");
+        assert!(
+            satisfies_bound(&registry, "Float", ty),
+            "expected {ty} to satisfy a `Float` bound"
+        );
+        assert!(
+            !satisfies_bound(&registry, "Int", ty),
+            "{ty} must not be considered Int"
+        );
     }
 }
 
@@ -70,7 +88,10 @@ fn load_num_registry() -> Registry {
 /// inheritance) isn't `pub`.
 fn satisfies_bound(registry: &Registry, bound: &str, ty: &str) -> bool {
     let src = format!("fn f<T: {bound}>(x: T) -> {ty} {{ x }}");
-    let pair = CleaveParser::parse(Rule::program, &src).unwrap().next().unwrap();
+    let pair = CleaveParser::parse(Rule::program, &src)
+        .unwrap()
+        .next()
+        .unwrap();
     let program = Lowerer::new(FileId(0)).lower_program(pair);
     let f = match &program.items[0].kind {
         ItemKind::Fn(f) => f.clone(),

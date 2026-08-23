@@ -1,6 +1,9 @@
-use cleave::cps::{collect_mlir_types, collect_struct_schemas, collect_units, convert_program, eliminate_dead_code, UnitBody};
+use cleave::cps::{
+    UnitBody, collect_mlir_types, collect_struct_schemas, collect_units, convert_program,
+    eliminate_dead_code,
+};
 use cleave::driver::compile;
-use cleave::egraph::{optimize_program, synthesize_derivatives, DerivativeRequest};
+use cleave::egraph::{DerivativeRequest, optimize_program, synthesize_derivatives};
 use cleave::mlir_lower::lower_program;
 use cleave::registry::Registry;
 use melior::Context;
@@ -29,7 +32,10 @@ fn lower(context: &Context, src: &str) -> String {
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let module = lower_program(context, &cps_program, &mlir_types, struct_schemas);
-    assert!(module.as_operation().verify(), "generated MLIR module failed verification");
+    assert!(
+        module.as_operation().verify(),
+        "generated MLIR module failed verification"
+    );
     module.as_operation().to_string()
 }
 
@@ -39,7 +45,10 @@ fn a_function_returning_a_bare_literal_lowers_to_a_constant_plus_return() {
     let text = lower(&context, "fn main() -> i32 { 0 }");
     assert!(text.contains("func.func @main() -> i32"), "got:\n{text}");
     assert!(text.contains("arith.constant 0 : i32"), "got:\n{text}");
-    assert!(text.contains("return %c0_i32 : i32") || text.contains("return %"), "got:\n{text}");
+    assert!(
+        text.contains("return %c0_i32 : i32") || text.contains("return %"),
+        "got:\n{text}"
+    );
 }
 
 /// A real bug, found by direct testing (`examples/axiom_demo.cleave`):
@@ -53,7 +62,10 @@ fn a_function_returning_a_bare_literal_lowers_to_a_constant_plus_return() {
 #[test]
 fn only_main_gets_the_c_interface_export_attribute() {
     let context = context();
-    let text = lower(&context, "fn helper(x: i32) -> i32 { x }\nfn main() -> i32 { helper(1) }");
+    let text = lower(
+        &context,
+        "fn helper(x: i32) -> i32 { x }\nfn main() -> i32 { helper(1) }",
+    );
     assert!(
         text.contains("func.func @main() -> i32 attributes {llvm.emit_c_interface}"),
         "main must still carry the export attribute, got:\n{text}"
@@ -80,7 +92,13 @@ fn different_integer_widths_lower_to_their_own_mlir_type() {
 #[test]
 fn a_compiled_program_actually_runs_and_returns_the_right_value() {
     let context = context();
-    let (result, _sources) = compile(vec![("test.cleave".to_string(), "fn main() -> i32 { 17 }".to_string())], &[]);
+    let (result, _sources) = compile(
+        vec![(
+            "test.cleave".to_string(),
+            "fn main() -> i32 { 17 }".to_string(),
+        )],
+        &[],
+    );
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let registry = Registry::build(&program);
     let units = collect_units(&program, &registry);
@@ -111,7 +129,9 @@ fn a_compiled_program_actually_runs_and_returns_the_right_value() {
     // chains of these casts away (`cast(cast(x, A->B), B->A) == x`), not a
     // real lowering step of its own.
     pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-    pass_manager.run(&mut module).expect("lowering to the llvm dialect must succeed");
+    pass_manager
+        .run(&mut module)
+        .expect("lowering to the llvm dialect must succeed");
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     // Registered unconditionally, harmless if unused -- any struct
@@ -123,7 +143,9 @@ fn a_compiled_program_actually_runs_and_returns_the_right_value() {
     }
     let mut out: i32 = -1;
     unsafe {
-        engine.invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()]).expect("JIT invocation must succeed");
+        engine
+            .invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()])
+            .expect("JIT invocation must succeed");
     }
     assert_eq!(out, 17);
 }
@@ -148,12 +170,17 @@ fn run_i32(context: &Context, src: &str) -> i32 {
     let requests: Vec<DerivativeRequest> = units
         .iter()
         .filter_map(|u| match &u.body {
-            UnitBody::Derivative(of) => Some(DerivativeRequest { name: u.name.clone(), of: of.clone() }),
+            UnitBody::Derivative(of) => Some(DerivativeRequest {
+                name: u.name.clone(),
+                of: of.clone(),
+            }),
             _ => None,
         })
         .collect();
     let cps_program = convert_program(units);
-    let cps_program = synthesize_derivatives(cps_program, &requests, &registry).unwrap_or_else(|e| panic!("cannot derive: {e:?}"));
+    let struct_schemas = collect_struct_schemas(&program);
+    let cps_program = synthesize_derivatives(cps_program, &requests, &registry, &struct_schemas)
+        .unwrap_or_else(|e| panic!("cannot derive: {e:?}"));
     run_i32_from_cps(context, &program, cps_program)
 }
 
@@ -178,23 +205,35 @@ fn run_i32_with_optimization_pass(context: &Context, src: &str) -> i32 {
     let requests: Vec<DerivativeRequest> = units
         .iter()
         .filter_map(|u| match &u.body {
-            UnitBody::Derivative(of) => Some(DerivativeRequest { name: u.name.clone(), of: of.clone() }),
+            UnitBody::Derivative(of) => Some(DerivativeRequest {
+                name: u.name.clone(),
+                of: of.clone(),
+            }),
             _ => None,
         })
         .collect();
     let cps_program = convert_program(units);
-    let cps_program = synthesize_derivatives(cps_program, &requests, &registry).unwrap_or_else(|e| panic!("cannot derive: {e:?}"));
+    let struct_schemas = collect_struct_schemas(&program);
+    let cps_program = synthesize_derivatives(cps_program, &requests, &registry, &struct_schemas)
+        .unwrap_or_else(|e| panic!("cannot derive: {e:?}"));
     let cps_program = eliminate_dead_code(cps_program);
     let (cps_program, _) = optimize_program(cps_program, &registry);
     let cps_program = eliminate_dead_code(cps_program);
     run_i32_from_cps(context, &program, cps_program)
 }
 
-fn run_i32_from_cps(context: &Context, program: &cleave::ast::Program, cps_program: cleave::cps::CpsProgram) -> i32 {
+fn run_i32_from_cps(
+    context: &Context,
+    program: &cleave::ast::Program,
+    cps_program: cleave::cps::CpsProgram,
+) -> i32 {
     let mlir_types = collect_mlir_types(program);
     let struct_schemas = collect_struct_schemas(program);
     let mut module = lower_program(context, &cps_program, &mlir_types, struct_schemas);
-    assert!(module.as_operation().verify(), "generated MLIR module failed verification");
+    assert!(
+        module.as_operation().verify(),
+        "generated MLIR module failed verification"
+    );
 
     // Staged as three *separate* `PassManager`s, each run to completion
     // before the next is even built — found by direct testing to matter,
@@ -214,7 +253,9 @@ fn run_i32_from_cps(context: &Context, program: &cleave::ast::Program, cps_progr
     // bufferize (stage 2) can't handle it directly without this first.
     let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::linalg::create_convert_elementwise_to_linalg_pass());
-    pass_manager.run(&mut module).expect("convert-elementwise-to-linalg must succeed");
+    pass_manager
+        .run(&mut module)
+        .expect("convert-elementwise-to-linalg must succeed");
 
     // Stage 2: `bufferize-function-boundaries=true` — melior's own
     // generated `create_one_shot_bufferize_pass()` binding takes no
@@ -238,7 +279,9 @@ fn run_i32_from_cps(context: &Context, program: &cleave::ast::Program, cps_progr
         "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})",
     )
     .expect("failed to parse the one-shot-bufferize pass pipeline");
-    pass_manager.run(&mut module).expect("one-shot-bufferize must succeed");
+    pass_manager
+        .run(&mut module)
+        .expect("one-shot-bufferize must succeed");
 
     // Stage 3: ordinary lowering to the `llvm` dialect — everything past
     // this point is plain `memref`/`arith`/`scf`, already fully handled by
@@ -257,19 +300,33 @@ fn run_i32_from_cps(context: &Context, program: &cleave::ast::Program, cps_progr
     // chains of these casts away (`cast(cast(x, A->B), B->A) == x`), not a
     // real lowering step of its own.
     pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-    pass_manager.run(&mut module).expect("lowering to the llvm dialect must succeed");
+    pass_manager
+        .run(&mut module)
+        .expect("lowering to the llvm dialect must succeed");
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     // Registered unconditionally, harmless if unused -- any struct
     // construction anywhere in the program (not just a top-level return)
     // needs `cleave_alloc` (see `mlir_lower.rs::alloc_struct`'s own doc
-    // comment).
+    // comment). `memrefCopy` the same way -- `cleave_rt::memrefCopy`'s own
+    // doc comment has the full story (`one-shot-bufferize`'s own generated
+    // `memref.copy` calls need it once a tensor value is big enough to need
+    // a real defensive copy, first hit by `derive_through_dense_forward_
+    // computes_the_right_gradient`, just below).
     unsafe {
         engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
+        engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
+        engine.register_symbol("rand_seed", cleave_rt::rand_seed as *mut ());
+        engine.register_symbol("rand_uniform_f32", cleave_rt::rand_uniform_f32 as *mut ());
+        engine.register_symbol("rand_uniform_f64", cleave_rt::rand_uniform_f64 as *mut ());
+        engine.register_symbol("rand_normal_f32", cleave_rt::rand_normal_f32 as *mut ());
+        engine.register_symbol("rand_normal_f64", cleave_rt::rand_normal_f64 as *mut ());
     }
     let mut out: i32 = -1;
     unsafe {
-        engine.invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()]).expect("JIT invocation must succeed");
+        engine
+            .invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()])
+            .expect("JIT invocation must succeed");
     }
     out
 }
@@ -298,8 +355,14 @@ fn an_if_expression_lowers_to_scf_if() {
 #[test]
 fn an_if_expression_actually_picks_the_right_branch() {
     let context = context();
-    assert_eq!(run_i32(&context, "fn main() -> i32 { if 1 < 2 { 10 } else { 20 } }"), 10);
-    assert_eq!(run_i32(&context, "fn main() -> i32 { if 2 < 1 { 10 } else { 20 } }"), 20);
+    assert_eq!(
+        run_i32(&context, "fn main() -> i32 { if 1 < 2 { 10 } else { 20 } }"),
+        10
+    );
+    assert_eq!(
+        run_i32(&context, "fn main() -> i32 { if 2 < 1 { 10 } else { 20 } }"),
+        20
+    );
 }
 
 /// The real end-to-end proof for recursion: a genuinely recursive function
@@ -359,7 +422,10 @@ fn a_direct_mlir_call_lowers_to_the_named_op_with_no_declaration() {
 #[test]
 fn a_direct_mlir_call_actually_computes_the_right_value() {
     let context = context();
-    assert_eq!(run_i32(&context, "fn main() -> i32 { mlir::arith::addi(2, 3) }"), 5);
+    assert_eq!(
+        run_i32(&context, "fn main() -> i32 { mlir::arith::addi(2, 3) }"),
+        5
+    );
 }
 
 /// The predicate attribute is the one genuinely non-uniform case (`arith.
@@ -373,10 +439,28 @@ fn a_direct_mlir_call_actually_computes_the_right_value() {
 #[test]
 fn a_comparison_with_a_named_predicate_attribute_lowers_and_executes_correctly() {
     let context = context();
-    let text = lower(&context, "fn main() -> i32 { if mlir::arith::cmpi(1, 2, predicate: \"2 : i64\") { 10 } else { 20 } }");
-    assert!(text.contains("arith.cmpi") && text.contains("slt"), "got:\n{text}");
-    assert_eq!(run_i32(&context, "fn main() -> i32 { if mlir::arith::cmpi(1, 2, predicate: \"2 : i64\") { 10 } else { 20 } }"), 10);
-    assert_eq!(run_i32(&context, "fn main() -> i32 { if mlir::arith::cmpi(2, 1, predicate: \"2 : i64\") { 10 } else { 20 } }"), 20);
+    let text = lower(
+        &context,
+        "fn main() -> i32 { if mlir::arith::cmpi(1, 2, predicate: \"2 : i64\") { 10 } else { 20 } }",
+    );
+    assert!(
+        text.contains("arith.cmpi") && text.contains("slt"),
+        "got:\n{text}"
+    );
+    assert_eq!(
+        run_i32(
+            &context,
+            "fn main() -> i32 { if mlir::arith::cmpi(1, 2, predicate: \"2 : i64\") { 10 } else { 20 } }"
+        ),
+        10
+    );
+    assert_eq!(
+        run_i32(
+            &context,
+            "fn main() -> i32 { if mlir::arith::cmpi(2, 1, predicate: \"2 : i64\") { 10 } else { 20 } }"
+        ),
+        20
+    );
 }
 
 /// A composite, multi-step primitive (the case that motivated moving to
@@ -421,21 +505,35 @@ fn a_composite_multi_step_mlir_body_executes_correctly() {
 /// instead specifically because it actually runs inference.
 #[test]
 fn named_arguments_on_an_ordinary_call_are_rejected() {
-    let (result, _sources) =
-        compile(vec![("test.cleave".to_string(), "fn foo(x: i32) -> i32 { x } fn main() -> i32 { foo(x: \"5\") }".to_string())], &[]);
-    let program = result.unwrap_or_else(|e| panic!("expected a parse/use-resolution success (the type error is caught later): {e:?}"));
+    let (result, _sources) = compile(
+        vec![(
+            "test.cleave".to_string(),
+            "fn foo(x: i32) -> i32 { x } fn main() -> i32 { foo(x: \"5\") }".to_string(),
+        )],
+        &[],
+    );
+    let program = result.unwrap_or_else(|e| {
+        panic!("expected a parse/use-resolution success (the type error is caught later): {e:?}")
+    });
     let registry = Registry::build(&program);
     let (_, errs) = cleave::dump::dump_program(&program, &registry);
-    assert!(!errs.is_empty(), "`foo(x: \"5\")` supplies zero real positional arguments to a one-parameter fn and must be rejected");
+    assert!(
+        !errs.is_empty(),
+        "`foo(x: \"5\")` supplies zero real positional arguments to a one-parameter fn and must be rejected"
+    );
 }
 
-const EXTERN_PRINT_SRC: &str = "extern fn print_i32(x: i32) -> i32; fn main() -> i32 { print_i32(42) }";
+const EXTERN_PRINT_SRC: &str =
+    "extern fn print_i32(x: i32) -> i32; fn main() -> i32 { print_i32(42) }";
 
 #[test]
 fn an_extern_fn_call_lowers_to_a_private_declaration_plus_a_real_call() {
     let context = context();
     let text = lower(&context, EXTERN_PRINT_SRC);
-    assert!(text.contains("func.func private @print_i32(i32) -> i32"), "got:\n{text}");
+    assert!(
+        text.contains("func.func private @print_i32(i32) -> i32"),
+        "got:\n{text}"
+    );
     assert!(text.contains("call @print_i32"), "got:\n{text}");
 }
 
@@ -448,7 +546,10 @@ fn an_extern_fn_call_lowers_to_a_private_declaration_plus_a_real_call() {
 #[test]
 fn an_extern_fn_call_actually_executes_through_a_registered_symbol() {
     let context = context();
-    let (result, _sources) = compile(vec![("test.cleave".to_string(), EXTERN_PRINT_SRC.to_string())], &[]);
+    let (result, _sources) = compile(
+        vec![("test.cleave".to_string(), EXTERN_PRINT_SRC.to_string())],
+        &[],
+    );
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let registry = Registry::build(&program);
     let units = collect_units(&program, &registry);
@@ -479,7 +580,9 @@ fn an_extern_fn_call_actually_executes_through_a_registered_symbol() {
     // chains of these casts away (`cast(cast(x, A->B), B->A) == x`), not a
     // real lowering step of its own.
     pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-    pass_manager.run(&mut module).expect("lowering to the llvm dialect must succeed");
+    pass_manager
+        .run(&mut module)
+        .expect("lowering to the llvm dialect must succeed");
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {
@@ -488,7 +591,9 @@ fn an_extern_fn_call_actually_executes_through_a_registered_symbol() {
     }
     let mut out: i32 = -1;
     unsafe {
-        engine.invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()]).expect("JIT invocation must succeed");
+        engine
+            .invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()])
+            .expect("JIT invocation must succeed");
     }
     assert_eq!(out, 42);
 }
@@ -501,9 +606,18 @@ fn an_extern_fn_call_actually_executes_through_a_registered_symbol() {
 #[test]
 fn an_export_fn_lowers_to_an_ordinary_public_func_under_its_own_name() {
     let context = context();
-    let text = lower(&context, "export fn kernel(x: i32) -> i32 { x }\nfn main() -> i32 { 1 }");
-    assert!(text.contains("func.func @kernel(%arg0: i32) -> i32"), "got:\n{text}");
-    assert!(!text.contains("private @kernel"), "an export fn must stay publicly visible, got:\n{text}");
+    let text = lower(
+        &context,
+        "export fn kernel(x: i32) -> i32 { x }\nfn main() -> i32 { 1 }",
+    );
+    assert!(
+        text.contains("func.func @kernel(%arg0: i32) -> i32"),
+        "got:\n{text}"
+    );
+    assert!(
+        !text.contains("private @kernel"),
+        "an export fn must stay publicly visible, got:\n{text}"
+    );
 }
 
 /// `export(symbol)`'s own parenthesized override renames the real emitted
@@ -512,9 +626,18 @@ fn an_export_fn_lowers_to_an_ordinary_public_func_under_its_own_name() {
 #[test]
 fn an_export_fn_with_a_symbol_override_lowers_under_the_overridden_name() {
     let context = context();
-    let text = lower(&context, "export(real_kernel_symbol) fn kernel(x: i32) -> i32 { x }\nfn main() -> i32 { 1 }");
-    assert!(text.contains("func.func @real_kernel_symbol"), "got:\n{text}");
-    assert!(!text.contains("@kernel("), "the plain cleave name must not appear as its own symbol once overridden, got:\n{text}");
+    let text = lower(
+        &context,
+        "export(real_kernel_symbol) fn kernel(x: i32) -> i32 { x }\nfn main() -> i32 { 1 }",
+    );
+    assert!(
+        text.contains("func.func @real_kernel_symbol"),
+        "got:\n{text}"
+    );
+    assert!(
+        !text.contains("@kernel("),
+        "the plain cleave name must not appear as its own symbol once overridden, got:\n{text}"
+    );
 }
 
 /// `extern(...)`'s own parenthesized override -- the case a bare `extern fn`
@@ -536,8 +659,14 @@ fn main() -> i32 { print(42); print(66:i64); 0 }
 fn an_extern_impl_methods_override_binds_a_distinct_symbol_per_impl() {
     let context = context();
     let text = lower(&context, EXTERN_IMPL_PRINT_SRC);
-    assert!(text.contains("func.func private @print_i32(i32) -> i32"), "got:\n{text}");
-    assert!(text.contains("func.func private @print_i64(i64) -> i64"), "got:\n{text}");
+    assert!(
+        text.contains("func.func private @print_i32(i32) -> i32"),
+        "got:\n{text}"
+    );
+    assert!(
+        text.contains("func.func private @print_i64(i64) -> i64"),
+        "got:\n{text}"
+    );
     assert!(text.contains("call @print_i32"), "got:\n{text}");
     assert!(text.contains("call @print_i64"), "got:\n{text}");
 }
@@ -550,7 +679,10 @@ fn an_extern_impl_methods_override_binds_a_distinct_symbol_per_impl() {
 #[test]
 fn an_extern_impl_method_actually_executes_the_right_symbol_at_each_call_site() {
     let context = context();
-    let (result, _sources) = compile(vec![("test.cleave".to_string(), EXTERN_IMPL_PRINT_SRC.to_string())], &[]);
+    let (result, _sources) = compile(
+        vec![("test.cleave".to_string(), EXTERN_IMPL_PRINT_SRC.to_string())],
+        &[],
+    );
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let registry = Registry::build(&program);
     let units = collect_units(&program, &registry);
@@ -581,7 +713,9 @@ fn an_extern_impl_method_actually_executes_the_right_symbol_at_each_call_site() 
     // chains of these casts away (`cast(cast(x, A->B), B->A) == x`), not a
     // real lowering step of its own.
     pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-    pass_manager.run(&mut module).expect("lowering to the llvm dialect must succeed");
+    pass_manager
+        .run(&mut module)
+        .expect("lowering to the llvm dialect must succeed");
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {
@@ -591,7 +725,9 @@ fn an_extern_impl_method_actually_executes_the_right_symbol_at_each_call_site() 
     }
     let mut out: i32 = -1;
     unsafe {
-        engine.invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()]).expect("JIT invocation must succeed");
+        engine
+            .invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()])
+            .expect("JIT invocation must succeed");
     }
     assert_eq!(out, 0);
 }
@@ -611,8 +747,14 @@ fn an_extern_impl_method_actually_executes_the_right_symbol_at_each_call_site() 
 #[test]
 fn an_array_argument_crosses_an_extern_call_boundary_correctly() {
     let context = context();
-    let (result, _sources) =
-        compile(vec![("test.cleave".to_string(), "extern fn sum_bytes(x: [i8; 3]) -> i32; fn main() -> i32 { sum_bytes([1, 2, 3]) }".to_string())], &[]);
+    let (result, _sources) = compile(
+        vec![(
+            "test.cleave".to_string(),
+            "extern fn sum_bytes(x: [i8; 3]) -> i32; fn main() -> i32 { sum_bytes([1, 2, 3]) }"
+                .to_string(),
+        )],
+        &[],
+    );
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let registry = Registry::build(&program);
     let units = collect_units(&program, &registry);
@@ -635,7 +777,9 @@ fn an_array_argument_crosses_an_extern_call_boundary_correctly() {
     // chains of these casts away (`cast(cast(x, A->B), B->A) == x`), not a
     // real lowering step of its own.
     pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-    pass_manager.run(&mut module).expect("lowering to the llvm dialect must succeed");
+    pass_manager
+        .run(&mut module)
+        .expect("lowering to the llvm dialect must succeed");
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {
@@ -644,7 +788,9 @@ fn an_array_argument_crosses_an_extern_call_boundary_correctly() {
     }
     let mut out: i32 = -1;
     unsafe {
-        engine.invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()]).expect("JIT invocation must succeed");
+        engine
+            .invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()])
+            .expect("JIT invocation must succeed");
     }
     assert_eq!(out, 6, "1 + 2 + 3");
 }
@@ -664,7 +810,10 @@ fn an_array_argument_crosses_an_extern_call_boundary_correctly() {
 fn a_unit_returning_extern_fn_can_be_called_correctly() {
     let context = context();
     let (result, _sources) = compile(
-        vec![("test.cleave".to_string(), "extern fn touch_i32(x: i32);\nfn main() -> i32 { touch_i32(5); 42 }".to_string())],
+        vec![(
+            "test.cleave".to_string(),
+            "extern fn touch_i32(x: i32);\nfn main() -> i32 { touch_i32(5); 42 }".to_string(),
+        )],
         &[],
     );
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
@@ -680,8 +829,14 @@ fn a_unit_returning_extern_fn_can_be_called_correctly() {
     // own call site) must request *zero* results, not a bogus `!llvm.ptr`
     // (`ty_to_mlir`'s own generic-struct fallback for `()`, before the fix)
     // that happens not to crash here only because nothing ever reads it.
-    assert!(text.contains("func.func private @touch_i32(i32)") && !text.contains("touch_i32(i32) -> "), "got:\n{text}");
-    assert!(text.contains("call @touch_i32(%c5_i32) : (i32) -> ()"), "got:\n{text}");
+    assert!(
+        text.contains("func.func private @touch_i32(i32)") && !text.contains("touch_i32(i32) -> "),
+        "got:\n{text}"
+    );
+    assert!(
+        text.contains("call @touch_i32(%c5_i32) : (i32) -> ()"),
+        "got:\n{text}"
+    );
 
     let pass_manager = pass::PassManager::new(&context);
     pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
@@ -696,7 +851,9 @@ fn a_unit_returning_extern_fn_can_be_called_correctly() {
     // chains of these casts away (`cast(cast(x, A->B), B->A) == x`), not a
     // real lowering step of its own.
     pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-    pass_manager.run(&mut module).expect("lowering to the llvm dialect must succeed");
+    pass_manager
+        .run(&mut module)
+        .expect("lowering to the llvm dialect must succeed");
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {
@@ -705,7 +862,9 @@ fn a_unit_returning_extern_fn_can_be_called_correctly() {
     }
     let mut out: i32 = -1;
     unsafe {
-        engine.invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()]).expect("JIT invocation must succeed");
+        engine
+            .invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()])
+            .expect("JIT invocation must succeed");
     }
     assert_eq!(out, 42);
 }
@@ -725,7 +884,13 @@ fn a_unit_returning_extern_fn_can_be_called_correctly() {
 #[test]
 fn a_string_literal_printed_via_print_writes_the_right_bytes_to_stdout() {
     let context = context();
-    let (result, _sources) = compile(vec![("test.cleave".to_string(), "use io;\nfn main() -> i32 { print(\"hi\"); 0 }".to_string())], &[]);
+    let (result, _sources) = compile(
+        vec![(
+            "test.cleave".to_string(),
+            "use io;\nfn main() -> i32 { print(\"hi\"); 0 }".to_string(),
+        )],
+        &[],
+    );
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let registry = Registry::build(&program);
     let units = collect_units(&program, &registry);
@@ -735,8 +900,14 @@ fn a_string_literal_printed_via_print_writes_the_right_bytes_to_stdout() {
     let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
     assert!(module.as_operation().verify());
     let text = module.as_operation().to_string();
-    assert!(text.contains("call @print_bytes"), "expected a real call to print_bytes, got:\n{text}");
-    assert!(text.contains("llvm.inttoptr"), "expected the array-aware pointer extraction, got:\n{text}");
+    assert!(
+        text.contains("call @print_bytes"),
+        "expected a real call to print_bytes, got:\n{text}"
+    );
+    assert!(
+        text.contains("llvm.inttoptr"),
+        "expected the array-aware pointer extraction, got:\n{text}"
+    );
 
     let pass_manager = pass::PassManager::new(&context);
     pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
@@ -751,7 +922,9 @@ fn a_string_literal_printed_via_print_writes_the_right_bytes_to_stdout() {
     // chains of these casts away (`cast(cast(x, A->B), B->A) == x`), not a
     // real lowering step of its own.
     pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-    pass_manager.run(&mut module).expect("lowering to the llvm dialect must succeed");
+    pass_manager
+        .run(&mut module)
+        .expect("lowering to the llvm dialect must succeed");
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {
@@ -760,7 +933,9 @@ fn a_string_literal_printed_via_print_writes_the_right_bytes_to_stdout() {
     }
     let mut out: i32 = -1;
     unsafe {
-        engine.invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()]).expect("JIT invocation must succeed");
+        engine
+            .invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()])
+            .expect("JIT invocation must succeed");
     }
     assert_eq!(out, 0);
 }
@@ -768,7 +943,10 @@ fn a_string_literal_printed_via_print_writes_the_right_bytes_to_stdout() {
 #[test]
 fn a_while_loop_lowers_to_scf_while() {
     let context = context();
-    let text = lower(&context, "fn main() -> i32 { let mut acc = 0; while acc < 5 { acc = acc + 1; }; acc }");
+    let text = lower(
+        &context,
+        "fn main() -> i32 { let mut acc = 0; while acc < 5 { acc = acc + 1; }; acc }",
+    );
     assert!(text.contains("scf.while"), "got:\n{text}");
     assert!(text.contains("scf.condition"), "got:\n{text}");
     assert!(text.contains("scf.yield"), "got:\n{text}");
@@ -777,7 +955,13 @@ fn a_while_loop_lowers_to_scf_while() {
 #[test]
 fn a_while_loop_actually_computes_the_right_value() {
     let context = context();
-    assert_eq!(run_i32(&context, "fn main() -> i32 { let mut acc = 0; while acc < 5 { acc = acc + 1; }; acc }"), 5);
+    assert_eq!(
+        run_i32(
+            &context,
+            "fn main() -> i32 { let mut acc = 0; while acc < 5 { acc = acc + 1; }; acc }"
+        ),
+        5
+    );
 }
 
 /// The real end-to-end proof for loops carrying *more than one* value at
@@ -789,7 +973,13 @@ fn a_while_loop_actually_computes_the_right_value() {
 #[test]
 fn a_for_loop_with_an_accumulator_actually_computes_the_right_value() {
     let context = context();
-    assert_eq!(run_i32(&context, "fn main() -> i32 { let mut acc = 0; for i in 0..10 { acc = acc + i; }; acc }"), 45);
+    assert_eq!(
+        run_i32(
+            &context,
+            "fn main() -> i32 { let mut acc = 0; for i in 0..10 { acc = acc + i; }; acc }"
+        ),
+        45
+    );
 }
 
 /// `doc/backlog-done.md`'s own "`for x in array`" item — element-based
@@ -839,7 +1029,10 @@ fn a_for_in_loop_carries_an_outer_mutated_variable_correctly() {
 fn an_array_literal_lowers_to_alloc_plus_stores() {
     let context = context();
     let text = lower(&context, "fn main() -> i32 { let a = [1, 2, 3]; a[0] }");
-    assert!(text.contains("memref.alloc() : memref<3xi32>"), "got:\n{text}");
+    assert!(
+        text.contains("memref.alloc() : memref<3xi32>"),
+        "got:\n{text}"
+    );
     assert!(text.contains("memref.store"), "got:\n{text}");
     assert!(text.contains("memref.load"), "got:\n{text}");
     assert!(text.contains("arith.index_cast"), "got:\n{text}");
@@ -869,8 +1062,14 @@ fn an_array_literal_write_then_read_computes_the_right_value() {
 #[test]
 fn a_nested_array_literal_lowers_and_computes_the_right_value() {
     let context = context();
-    let text = lower(&context, "fn main() -> i32 { let a = [[1, 2, 3], [4, 5, 6]]; a[0, 0] }");
-    assert!(text.contains("memref.alloc() : memref<2x3xi32>"), "got:\n{text}");
+    let text = lower(
+        &context,
+        "fn main() -> i32 { let a = [[1, 2, 3], [4, 5, 6]]; a[0, 0] }",
+    );
+    assert!(
+        text.contains("memref.alloc() : memref<2x3xi32>"),
+        "got:\n{text}"
+    );
     let src = "
         fn main() -> i32 {
             let mut a = [[1, 2, 3], [4, 5, 6]];
@@ -910,7 +1109,10 @@ fn array_repeat_including_nested_computes_the_right_value() {
 #[test]
 fn a_struct_literal_lowers_to_a_heap_alloc_plus_field_gep_and_stores() {
     let context = context();
-    let text = lower(&context, "struct Pair { a: i32, b: i32 } fn main() -> i32 { let p = Pair(a: 1, b: 2); p.a + p.b }");
+    let text = lower(
+        &context,
+        "struct Pair { a: i32, b: i32 } fn main() -> i32 { let p = Pair(a: 1, b: 2); p.a + p.b }",
+    );
     assert!(text.contains("call @cleave_alloc"), "got:\n{text}");
     assert!(text.contains("llvm.getelementptr"), "got:\n{text}");
     assert!(text.contains("llvm.store"), "got:\n{text}");
@@ -2216,10 +2418,15 @@ fn over_indexing_a_matrix_is_rejected() {
         )],
         &[],
     );
-    let program = result.unwrap_or_else(|e| panic!("expected a parse/use-resolution success (the type error is caught later): {e:?}"));
+    let program = result.unwrap_or_else(|e| {
+        panic!("expected a parse/use-resolution success (the type error is caught later): {e:?}")
+    });
     let registry = Registry::build(&program);
     let (_, errs) = cleave::monomorphize::dump_monomorphized(&program, &registry);
-    assert!(!errs.is_empty(), "`m[0,0,0]` supplies 3 indices to a rank-2 `Tensor` and must be rejected");
+    assert!(
+        !errs.is_empty(),
+        "`m[0,0,0]` supplies 3 indices to a rank-2 `Tensor` and must be rejected"
+    );
 }
 
 /// The array-side counterpart -- over-indexing a real, plain 2D array
@@ -2237,10 +2444,15 @@ fn over_indexing_a_plain_array_is_rejected() {
         )],
         &[],
     );
-    let program = result.unwrap_or_else(|e| panic!("expected a parse/use-resolution success (the type error is caught later): {e:?}"));
+    let program = result.unwrap_or_else(|e| {
+        panic!("expected a parse/use-resolution success (the type error is caught later): {e:?}")
+    });
     let registry = Registry::build(&program);
     let (_, errs) = cleave::dump::dump_program(&program, &registry);
-    assert!(!errs.is_empty(), "`a[0,0,0]` supplies one more index than this 2D array's own rank and must be rejected");
+    assert!(
+        !errs.is_empty(),
+        "`a[0,0,0]` supplies one more index than this 2D array's own rank and must be rejected"
+    );
 }
 
 // ------------------------------------------------------------ check_pending_constraints's output-only-generic gate
@@ -2275,11 +2487,16 @@ fn print_of_an_unannotated_index_result_no_longer_panics() {
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
-    assert!(module.as_operation().verify(), "generated MLIR module failed verification");
+    assert!(
+        module.as_operation().verify(),
+        "generated MLIR module failed verification"
+    );
 
     let pass_manager = pass::PassManager::new(&context);
     pass_manager.add_pass(pass::linalg::create_convert_elementwise_to_linalg_pass());
-    pass_manager.run(&mut module).expect("convert-elementwise-to-linalg must succeed");
+    pass_manager
+        .run(&mut module)
+        .expect("convert-elementwise-to-linalg must succeed");
 
     let pass_manager = pass::PassManager::new(&context);
     pass::bufferization::register_one_shot_bufferize_pass();
@@ -2288,14 +2505,18 @@ fn print_of_an_unannotated_index_result_no_longer_panics() {
         "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})",
     )
     .expect("failed to parse the one-shot-bufferize pass pipeline");
-    pass_manager.run(&mut module).expect("one-shot-bufferize must succeed");
+    pass_manager
+        .run(&mut module)
+        .expect("one-shot-bufferize must succeed");
 
     let pass_manager = pass::PassManager::new(&context);
     pass_manager.add_pass(pass::linalg::create_convert_linalg_to_loops_pass());
     pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
     pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-    pass_manager.run(&mut module).expect("lowering to the llvm dialect must succeed");
+    pass_manager
+        .run(&mut module)
+        .expect("lowering to the llvm dialect must succeed");
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {
@@ -2304,7 +2525,9 @@ fn print_of_an_unannotated_index_result_no_longer_panics() {
     }
     let mut out: i32 = -1;
     unsafe {
-        engine.invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()]).expect("JIT invocation must succeed");
+        engine
+            .invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()])
+            .expect("JIT invocation must succeed");
     }
     assert_eq!(out, 0);
 }
@@ -2329,7 +2552,7 @@ fn print_of_an_unannotated_matmul_index_result_no_longer_panics() {
              print(mc[0,0]);\n\
              0\n\
              }"
-                .to_string(),
+            .to_string(),
         )],
         &[],
     );
@@ -2340,11 +2563,16 @@ fn print_of_an_unannotated_matmul_index_result_no_longer_panics() {
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
-    assert!(module.as_operation().verify(), "generated MLIR module failed verification");
+    assert!(
+        module.as_operation().verify(),
+        "generated MLIR module failed verification"
+    );
 
     let pass_manager = pass::PassManager::new(&context);
     pass_manager.add_pass(pass::linalg::create_convert_elementwise_to_linalg_pass());
-    pass_manager.run(&mut module).expect("convert-elementwise-to-linalg must succeed");
+    pass_manager
+        .run(&mut module)
+        .expect("convert-elementwise-to-linalg must succeed");
 
     let pass_manager = pass::PassManager::new(&context);
     pass::bufferization::register_one_shot_bufferize_pass();
@@ -2353,14 +2581,18 @@ fn print_of_an_unannotated_matmul_index_result_no_longer_panics() {
         "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})",
     )
     .expect("failed to parse the one-shot-bufferize pass pipeline");
-    pass_manager.run(&mut module).expect("one-shot-bufferize must succeed");
+    pass_manager
+        .run(&mut module)
+        .expect("one-shot-bufferize must succeed");
 
     let pass_manager = pass::PassManager::new(&context);
     pass_manager.add_pass(pass::linalg::create_convert_linalg_to_loops_pass());
     pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
     pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-    pass_manager.run(&mut module).expect("lowering to the llvm dialect must succeed");
+    pass_manager
+        .run(&mut module)
+        .expect("lowering to the llvm dialect must succeed");
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {
@@ -2369,11 +2601,12 @@ fn print_of_an_unannotated_matmul_index_result_no_longer_panics() {
     }
     let mut out: i32 = -1;
     unsafe {
-        engine.invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()]).expect("JIT invocation must succeed");
+        engine
+            .invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()])
+            .expect("JIT invocation must succeed");
     }
     assert_eq!(out, 0);
 }
-
 
 // ------------------------------------------------------------ stdlib/nn -- activations and reductions
 
@@ -2432,6 +2665,32 @@ fn relu_sigmoid_tanh_compute_correctly_on_vectors() {
     assert_eq!(run_i32(&context, src), 1);
 }
 
+/// `Activation<Tensor<T,Dims...>>` is pack-generic now (was `Tensor<T,N>`,
+/// rank-1 only) -- this is the actual, previously-unverified claim: a
+/// genuinely rank-2 tensor (`Tensor<f32,1,3>`, the shape `Dense::forward`'s
+/// own output takes) works through the identical impl body with no special
+/// casing, confirming the `N` -> `Dims...` generalization is as mechanical
+/// as it looked (reusing the same pack-generic array-repeat `Ring<Tensor<T,
+/// Dims...>>::zero()` already proved for `[zero(); Dims...]`).
+#[test]
+fn relu_sigmoid_tanh_compute_correctly_on_a_rank_2_tensor() {
+    let context = context();
+    let src = r#"
+        use nn;
+        fn main() -> i32 {
+            let v = Tensor::<f32, 1, 3>(data: [[-2.0, 3.0, 0.0]]);
+            let r = relu(v);
+            let s = sigmoid(Tensor::<f32, 1, 3>(data: [[0.0, 0.0, 0.0]]));
+            let t = Activation::tanh(Tensor::<f32, 1, 3>(data: [[0.0, 0.0, 0.0]]));
+            if r[0, 0] == 0.0 and r[0, 1] == 3.0 and r[0, 2] == 0.0
+                and s[0, 0] == 0.5 and s[0, 1] == 0.5 and s[0, 2] == 0.5
+                and t[0, 0] == 0.0 and t[0, 1] == 0.0 and t[0, 2] == 0.0
+            { 1 } else { 0 }
+        }
+    "#;
+    assert_eq!(run_i32(&context, src), 1);
+}
+
 /// `Sum`/`Mean`/`Max` (`stdlib/nn/nn.cleave`) on `Tensor<T,N>` -- plain
 /// cleave source (a `for` loop plus this session's own real multi-index
 /// `Index` reads), no MLIR-level reduction op needed at all. `[1.0, 5.0,
@@ -2447,6 +2706,364 @@ fn sum_mean_max_of_a_vector_compute_correctly() {
             if sum(v) == 9.0 and mean(v) == 3.0 and max_of(v) == 5.0 { 1 } else { 0 }
         }
     "#;
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `Dense<T,In,Out>` (`stdlib/nn/nn.cleave`) -- the fully-connected-layer
+/// helper the session's own `Network`/`xor_tensor.cleave` rewrite bundles
+/// multiple of. `layer.forward(x)` needs `matmul` and `+` (`Ring::add`) to
+/// resolve correctly from *inside* a generic inherent-impl method body -- a
+/// real, found-by-testing monomorphization bug, not anticipated by the plan
+/// that added `Dense`: `monomorphize`'s own four worklists (`fn`/`impl`/
+/// `lambda`/`inherent`) used to drain in one fixed sequential pass, each
+/// fully emptied before the next started; `Dense::forward` (an `inherent_
+/// worklist` entry, drained *last*) calling `matmul` (a still-generic
+/// `impl_worklist` entry, drained *third*) pushed new work onto a worklist
+/// whose own draining loop had already finished, silently dropping it --
+/// `MatMul::matmul<...>` got a real, correctly-mangled `call_names` entry
+/// but no actual specialization, surfacing only as `cps.rs`'s own "call_
+/// names resolved ... but no such unit exists" panic. No prior generic
+/// inherent method's own body ever called a still-generic *algebra* method
+/// (`Complex`/`DynArray`'s own inherent methods only ever call concrete/
+/// extern ops), so this never came up before `Dense`. Fixed generally in
+/// `monomorphize.rs`: the four worklists now redrain to a real fixed point
+/// (loop until all four are empty at once), not a single one-shot pass.
+///
+/// `Dense::forward` deliberately applies *no* activation of its own (`nn.
+/// cleave`'s own doc comment on it) -- an earlier version fused `sigmoid`
+/// into the end of it, inherited unquestioned from `examples/xor_tensor.
+/// cleave`'s own pre-`Dense` `sigmoid2` helper; raised directly and
+/// reverted, since a real reusable `Dense` needs to stay just the affine
+/// transform, the caller composing whichever activation it wants on top.
+/// `x = [0, 1]`, `w = [[1,0],[0,-1]]`, `b = [0,0]` -- `matmul(x,w)+b =
+/// [0,-1]` exactly, checked directly (both representable, no tolerance
+/// needed).
+#[test]
+fn dense_layer_forward_computes_the_right_values() {
+    let context = context();
+    let src = "
+        use nn;
+        use linalg;
+        fn main() -> i32 {
+            let layer: Dense<f32, 2, 2> = Dense(
+                w: Tensor::<f32, 2, 2>(data: [[1.0, 0.0], [0.0, -1.0]]),
+                b: Tensor::<f32, 1, 2>(data: [[0.0, 0.0]])
+            );
+            let x: Tensor<f32, 1, 2> = Tensor::<f32, 1, 2>(data: [[0.0, 1.0]]);
+            let h = layer.forward(x);
+            if h[0, 0] == 0.0 and h[0, 1] == -1.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `derive()` through `Dense::forward` -- the actual point of `Dense`, and a
+/// genuinely deeper composition than `dense_layer_forward_computes_the_
+/// right_values` just above needed to check (that one never differentiates
+/// at all). Three more real, separate bugs were found and fixed getting
+/// *here*, none anticipated by the plan that scoped `Dense`:
+///
+/// 1. `Activation<Tensor<T,Dims...>>::sigmoid`'s own body used raw `mlir::
+///    arith::negf`/`addf`/`divf` calls directly -- a *purely* pure-primop
+///    chain (`egraph.rs::is_straight_line`), so `Forward::walk` treated it
+///    as one opaque, unnamed node, the same treatment a genuinely atomic op
+///    like `matmul` correctly gets (it has a declared `derivative` rule to
+///    match against). `sigmoid` has none (by design -- composes from its
+///    own primitives instead), so an opaque `sigmoid` node could never
+///    differentiate at all. Fixed by rewriting its body to compose from
+///    real, named, already-differentiable calls instead (`Ring::neg`/`add`/
+///    `div`, a new `Transcendental<Tensor<T,Dims...>>::exp`), the exact
+///    shape its own scalar sibling already used -- see `stdlib/nn/nn.cleave`
+///    and `stdlib/linalg/tensor.cleave`'s own doc comments for the fuller
+///    story.
+/// 2. Cross-leaf independence (`egraph.rs::inject_cross_leaf_independence`)
+///    used to be injected only *within* one `Tensor` field's own leaves --
+///    correct for a struct with a single `Tensor` field, but `Dense` has
+///    two (`w`, `b`), and nothing told the solver `net.w`'s leaves and `net.
+///    b`'s leaves are independent of *each other*. Fixed by injecting it
+///    once, centrally, over a whole top-level parameter's *entire* leaf set.
+/// 3. `Ring<T>`'s own `derivative div(a,b): div(sub(...),...)` references
+///    `sub`/`mul` -- *same* algebra as `div` itself, which `monomorphize.rs`
+///    ::`resolve_derivative_rule_expr_ty` used to treat as "nothing to
+///    seed, `t`'s own specialization already covers it" — true only for a
+///    literally self-recursive call (`MatMul::matmul` calling itself), not
+///    for a *different* method of the same algebra. `Ring::sub<f32>`/`Ring::
+///    mul<f32>` happen to always be called directly elsewhere in every
+///    scalar-only test that exists, coincidentally masking this; `Ring::
+///    sub<Tensor<f32,1,2>>` is never called anywhere in ordinary source
+///    here, so it was never monomorphized, surfacing as `cps.rs`'s own
+///    "call_names resolved ... but no such unit exists" panic.
+///
+/// `w = identity`, `b = 0` -- gradients computed independently in cleave
+/// source itself (via the same stdlib `sigmoid`, not hand-copied constants),
+/// checked with a tolerance, same posture as every other `derive()`
+/// numeric-correctness test in this file.
+/// `main.rs`'s own `fn main()` runs the whole pipeline on a dedicated 64MB-
+/// stack worker thread, precisely because CPS conversion recurses once per
+/// AST node and a big-enough program exceeds the OS default (1MB on Windows)
+/// well before anything is actually wrong -- found necessary here for the
+/// identical reason, empirically: this test's own synthesized derivative
+/// (through `Dense::forward`'s inlined `matmul`/`add` and a separate,
+/// sibling `sigmoid` call, times 9 leaves) genuinely overflows an ordinary
+/// `#[test]` thread's own smaller
+/// default stack (`STATUS_STACK_OVERFLOW`), even though the identical source
+/// runs fine through the real CLI. Scoped to just this one test, not `run_
+/// i32` itself -- `run_i32_with_optimization_pass`'s own doc comment already
+/// documents why touching that shared 130+-test helper for one outlier's own
+/// need was tried and reverted before.
+#[test]
+fn derive_through_dense_forward_computes_the_right_gradient() {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(derive_through_dense_forward_computes_the_right_gradient_body)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn derive_through_dense_forward_computes_the_right_gradient_body() {
+    let context = context();
+    let src = "
+        use nn;
+        use linalg;
+        fn loss(x1: f32, x2: f32, y: f32, layer: Dense<f32, 2, 2>) -> f32 {
+            let x = Tensor::<f32, 1, 2>(data: [[x1, x2]]);
+            let h = sigmoid(layer.forward(x));
+            let pred = h[0, 0] + h[0, 1];
+            let err = pred - y;
+            err * err
+        }
+        grad = derive(loss);
+        fn main() -> i32 {
+            let x1: f32 = 3.0;
+            let x2: f32 = 4.0;
+            let y: f32 = 0.0;
+            let layer: Dense<f32, 2, 2> = Dense(
+                w: Tensor::<f32, 2, 2>(data: [[1.0, 0.0], [0.0, 1.0]]),
+                b: Tensor::<f32, 1, 2>(data: [[0.0, 0.0]])
+            );
+            let s0: f32 = sigmoid(x1);
+            let s1: f32 = sigmoid(x2);
+            let err: f32 = s0 + s1 - y;
+            let d0: f32 = s0 * (1.0 - s0);
+            let d1: f32 = s1 * (1.0 - s1);
+            let expected_w00: f32 = 2.0 * err * d0 * x1;
+            let expected_w01: f32 = 2.0 * err * d1 * x1;
+            let expected_w10: f32 = 2.0 * err * d0 * x2;
+            let expected_w11: f32 = 2.0 * err * d1 * x2;
+            let expected_b0: f32 = 2.0 * err * d0;
+            let expected_b1: f32 = 2.0 * err * d1;
+            let g = grad(x1, x2, y, layer);
+            let diff_w00: f32 = g.3.w[0, 0] - expected_w00;
+            let diff_w01: f32 = g.3.w[0, 1] - expected_w01;
+            let diff_w10: f32 = g.3.w[1, 0] - expected_w10;
+            let diff_w11: f32 = g.3.w[1, 1] - expected_w11;
+            let diff_b0: f32 = g.3.b[0, 0] - expected_b0;
+            let diff_b1: f32 = g.3.b[0, 1] - expected_b1;
+            let abs_w00: f32 = if diff_w00 < 0.0 { 0.0 - diff_w00 } else { diff_w00 };
+            let abs_w01: f32 = if diff_w01 < 0.0 { 0.0 - diff_w01 } else { diff_w01 };
+            let abs_w10: f32 = if diff_w10 < 0.0 { 0.0 - diff_w10 } else { diff_w10 };
+            let abs_w11: f32 = if diff_w11 < 0.0 { 0.0 - diff_w11 } else { diff_w11 };
+            let abs_b0: f32 = if diff_b0 < 0.0 { 0.0 - diff_b0 } else { diff_b0 };
+            let abs_b1: f32 = if diff_b1 < 0.0 { 0.0 - diff_b1 } else { diff_b1 };
+            if abs_w00 < 0.0001 and abs_w01 < 0.0001 and abs_w10 < 0.0001 and abs_w11 < 0.0001
+                and abs_b0 < 0.0001 and abs_b1 < 0.0001
+            { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `stdlib/rand/rand.cleave` -- confirms the central risk that plan was
+/// actually written to de-risk: does the e-graph-based optimizer (`Forward::
+/// walk`, run on *every* program's own body via `optimize_program`, not just
+/// a `derive()`d one) ever fold two *separate* source-level `rand_uniform_
+/// f32()` calls into one (same name, same empty argument list -- exactly
+/// the shape ordinary hashconsing would treat as one shared node)? It
+/// doesn't: `PrimOp::Extern` is one of the handful of primops `Forward::
+/// walk` treats as a real effect and stops translating at (never reordered/
+/// folded, unlike a pure arithmetic op), so two calls stay two independent
+/// draws -- checked here directly, not just reasoned about. Also confirms
+/// `rand_seed` makes the stream genuinely reproducible.
+#[test]
+fn rand_uniform_gives_independent_reproducible_draws() {
+    let context = context();
+    let src = "
+        use rand;
+        fn main() -> i32 {
+            rand_seed(42);
+            let a: f32 = rand_uniform_f32();
+            let b: f32 = rand_uniform_f32();
+            rand_seed(42);
+            let c: f32 = rand_uniform_f32();
+            let in_range = a >= 0.0 and a < 1.0 and b >= 0.0 and b < 1.0;
+            if a != b and a == c and in_range { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `Rand<T>::uniform`/`normal` (the actual cleave-level API `rand.cleave`
+/// exposes, not the raw `cleave-rt` primitives just above) compose their own
+/// affine transform correctly, dispatched via `Ring<T>` like every other
+/// numeric op in this stdlib.
+#[test]
+fn rand_uniform_and_normal_algebra_methods_compute_correctly() {
+    let context = context();
+    let src = "
+        use rand;
+        fn main() -> i32 {
+            rand_seed(7);
+            let u: f32 = Rand::uniform(-2.0, 2.0);
+            let in_range = u >= -2.0 and u < 2.0;
+            let n: f32 = Rand::normal(10.0, 0.001);
+            // `std = 0.001` -- a normal draw this tight around its own mean
+            // is, for any practical purpose, guaranteed within +/-0.1.
+            let diff: f32 = n - 10.0;
+            let abs_diff: f32 = if diff < 0.0 { 0.0 - diff } else { diff };
+            if in_range and abs_diff < 0.1 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// Stage 3 of the plan this feature was built from: not a real init helper
+/// (Xavier/He are explicitly future work, `doc/backlog.md`), just enough to
+/// prove the *mechanism* a real one will need actually works end to end --
+/// a genuine nested loop with indexed writes (`buf[i][j] = ...`, `cps.rs`'s
+/// own multi-index `Store`, already proven elsewhere, not a new mechanism)
+/// filling a real mutable `[[T;C];R]` array one independent draw at a time,
+/// then handed to `Tensor::<T,R,C>(data: buf)`. `T: Float + Rand` (two
+/// simultaneous bounds on the same generic) is the one genuinely unverified
+/// risk the plan flagged going in -- `infer.rs`'s own bound-checking code
+/// iterates every bound in a `T: A + B` list, not just the first, so this
+/// was expected to work, and does.
+///
+/// `random_matrix(-1.0, 1.0)` here, deliberately *no* explicit turbofish --
+/// a real, separate, found-by-testing bug: `random_matrix::<f32, 2, 2>(...)`
+/// (three generics -- one type, two const -- on an ordinary top-level fn
+/// call, not a variadic struct construction) mis-binds the const args,
+/// surfacing as a genuine type error one level in (`expected f32, found 2`)
+/// and, without it, a downstream CPS failure resolving `zero()`'s own call
+/// (`could not resolve call to zero`) that looked at first like an array-
+/// repeat/generic-`zero()` gap but wasn't -- `--dump-inference-pass`
+/// confirmed `zero()`'s own declaration-time type is the correct symbolic
+/// `T` either way, turbofish present or not. Not investigated further here,
+/// out of scope for this plan -- flagged in `doc/backlog.md` instead. Every
+/// generic here (`T`, `R`, `C`) is already fully determined by `main`'s own
+/// `let m: Tensor<f32, 2, 2> = ...` annotation, so no turbofish is actually
+/// needed at this call site at all -- ordinary output-context inference,
+/// the usual path, sidesteps the bug entirely rather than working around it.
+#[test]
+fn a_tensor_can_be_filled_with_independent_random_draws_via_nested_indexed_writes() {
+    let context = context();
+    let src = "
+        use rand;
+        use linalg;
+        fn random_matrix<T: Float + Rand + Ring, const R: i32, const C: i32>(lo: T, hi: T) -> Tensor<T, R, C> {
+            let mut buf: [[T; C]; R] = [[zero(); C]; R];
+            for i in 0..R {
+                for j in 0..C {
+                    buf[i][j] = uniform(lo, hi);
+                };
+            };
+            Tensor::<T, R, C>(data: buf)
+        }
+        fn main() -> i32 {
+            rand_seed(3);
+            let m: Tensor<f32, 2, 2> = random_matrix(-1.0, 1.0);
+            let all_in_range = m[0, 0] >= -1.0 and m[0, 0] < 1.0
+                and m[0, 1] >= -1.0 and m[0, 1] < 1.0
+                and m[1, 0] >= -1.0 and m[1, 0] < 1.0
+                and m[1, 1] >= -1.0 and m[1, 1] < 1.0;
+            // Not *every* entry identical -- the exact failure mode `[value;
+            // Dims...]` (broadcast-one-draw) would have produced.
+            let not_degenerate = m[0, 0] != m[0, 1] or m[0, 0] != m[1, 0] or m[0, 0] != m[1, 1];
+            if all_in_range and not_degenerate { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `Init<T>::xavier`/`he` (`stdlib/nn/nn.cleave`) -- the real weight-init
+/// helpers `doc/backlog.md`'s own "No weight-initialization helpers" item
+/// asked for, now that `rand` exists. Deliberately an `algebra` (`Init<T>`),
+/// not the plain top-level generic function `random_matrix` above used --
+/// two real, separate, found-by-testing bugs specific to a *zero-value-
+/// argument* generic call (`fn dense_xavier<T,In,Out>() -> Dense<T,In,Out>`,
+/// every generic determined purely by the caller's own expected-type
+/// context): the call site's own type never propagated into the body at all
+/// (an internal `.to()` came back "ambiguous dispatch"), and an explicit
+/// turbofish to work around that was itself misdiagnosed as a real argument
+/// ("expects 0 argument(s), found 1"). `Ring::zero()` -- also zero-arg, also
+/// purely output-type-determined -- already works everywhere, so routing
+/// through the identical algebra-dispatch mechanism (`Init<Dense<T,In,Out>>
+/// ::xavier()`) sidesteps both bugs at once rather than fixing either
+/// (flagged in `doc/backlog.md`, not investigated further).
+///
+/// `Dense<f32,2,3>` -- `limit = sqrt(6/(2+3))`, computed independently here
+/// (not a hand-copied constant), checked against every one of the six
+/// generated weights, plus non-degeneracy (not every entry identical -- the
+/// `[value; Dims...]` broadcast failure mode this whole design avoids).
+#[test]
+fn init_xavier_generates_weights_within_the_correct_glorot_bound() {
+    let context = context();
+    let src = "
+        use nn;
+        use linalg;
+        fn main() -> i32 {
+            rand_seed(11);
+            let d: Dense<f32, 2, 3> = Init::xavier();
+            let limit: f32 = mlir::math::sqrt(6.0 / 5.0);
+            let neg_limit: f32 = 0.0 - limit;
+            let in_range = d.w[0, 0] >= neg_limit and d.w[0, 0] < limit
+                and d.w[0, 1] >= neg_limit and d.w[0, 1] < limit
+                and d.w[0, 2] >= neg_limit and d.w[0, 2] < limit
+                and d.w[1, 0] >= neg_limit and d.w[1, 0] < limit
+                and d.w[1, 1] >= neg_limit and d.w[1, 1] < limit
+                and d.w[1, 2] >= neg_limit and d.w[1, 2] < limit;
+            let not_degenerate = d.w[0, 0] != d.w[0, 1] or d.w[0, 0] != d.w[1, 2];
+            let bias_is_zero = d.b[0, 0] == 0.0 and d.b[0, 1] == 0.0 and d.b[0, 2] == 0.0;
+            if in_range and not_degenerate and bias_is_zero { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `Init<T>::he` -- statistical sanity over many independent `Dense`
+/// constructions rather than an exact-bound check (a normal distribution has
+/// no hard cutoff, unlike Xavier's uniform range above): sample mean near 0,
+/// standard deviation in the right order of magnitude for `std = sqrt(2/4) =
+/// 0.7071...` (`Dense<f32,4,1>`, `fan_in = 4`), same loose-bound posture as
+/// `cleave-rt`'s own `rand_normal_f32_is_not_degenerate` test.
+#[test]
+fn init_he_generates_weights_with_the_right_statistics() {
+    let context = context();
+    let src = "
+        use nn;
+        use linalg;
+        fn main() -> i32 {
+            rand_seed(5);
+            let mut sum: f32 = 0.0;
+            let mut sum_sq: f32 = 0.0;
+            let mut any_far: i32 = 0;
+            for i in 0..200 {
+                let d: Dense<f32, 4, 1> = Init::he();
+                sum = sum + d.w[0, 0] + d.w[1, 0] + d.w[2, 0] + d.w[3, 0];
+                sum_sq = sum_sq + d.w[0, 0] * d.w[0, 0] + d.w[1, 0] * d.w[1, 0]
+                    + d.w[2, 0] * d.w[2, 0] + d.w[3, 0] * d.w[3, 0];
+                let abs0: f32 = if d.w[0, 0] < 0.0 { 0.0 - d.w[0, 0] } else { d.w[0, 0] };
+                if abs0 > 0.3 { any_far = 1; };
+            };
+            let n: f32 = 800.0;
+            let mean: f32 = sum / n;
+            let mean_abs: f32 = if mean < 0.0 { 0.0 - mean } else { mean };
+            let var: f32 = sum_sq / n;
+            // `std = sqrt(2/4) ~= 0.7071`, `var ~= 0.5` -- a loose band
+            // around that, not exact-value tolerance.
+            if mean_abs < 0.1 and var > 0.2 and var < 1.0 and any_far == 1 { 1 } else { 0 }
+        }
+    ";
     assert_eq!(run_i32(&context, src), 1);
 }
 
@@ -2466,7 +3083,8 @@ fn sum_mean_max_of_a_vector_compute_correctly() {
 /// that construction alone doesn't panic (`egraph.rs`'s own unit tests
 /// already prove that in isolation).
 #[test]
-fn a_float_literal_inside_a_straight_line_segment_still_computes_correctly_through_the_full_pipeline() {
+fn a_float_literal_inside_a_straight_line_segment_still_computes_correctly_through_the_full_pipeline()
+ {
     let context = context();
     let src = "
         fn main() -> i32 {
@@ -2508,18 +3126,19 @@ fn derive_of_a_single_parameter_function_computes_the_scalar_derivative() {
 /// The multi-parameter, Jacobian case: `f(x,y) = x*y + x`, `df/dx = y+1`,
 /// `df/dy = x` -- at `(x,y) = (3.0, 5.0)`, `[6.0, 3.0]`, chosen so neither
 /// component is right by coincidence and neither equals the other. Proves
-/// the `N > 1` array-wrapping path (`PrimOp::Array`, `[f32; 2]`) together
+/// the `N > 1` tuple-wrapping path (`__Tuple2`, ordinary struct construction
+/// -- `driver.rs::synthesize_derive_signatures`'s own doc comment) together
 /// with the "different free variable -> 0" base rule (needed for `y`'s own
 /// term to correctly vanish from `df/dx`, and `x`'s own from `df/dy`).
 #[test]
-fn derive_of_a_two_parameter_function_computes_the_jacobian_as_an_array() {
+fn derive_of_a_two_parameter_function_computes_the_jacobian_as_a_tuple() {
     let context = context();
     let src = "
         fn f(x: f32, y: f32) -> f32 { x * y + x }
         fprime = derive(f);
         fn main() -> i32 {
-            let g: [f32; 2] = fprime(3.0, 5.0);
-            if g[0] == 6.0 and g[1] == 3.0 { 1 } else { 0 }
+            let g: (f32, f32) = fprime(3.0, 5.0);
+            if g.0 == 6.0 and g.1 == 3.0 { 1 } else { 0 }
         }
     ";
     assert_eq!(run_i32(&context, src), 1);
@@ -2710,8 +3329,8 @@ fn derive_through_two_separate_calls_to_the_same_multi_primitive_function() {
             let expected0: f32 = s1 * (1.0 - s1) * s2;
             let expected1: f32 = s1 * s2 * (1.0 - s2);
             let got = fprime(w1, w2);
-            let diff0: f32 = got[0] - expected0;
-            let diff1: f32 = got[1] - expected1;
+            let diff0: f32 = got.0 - expected0;
+            let diff1: f32 = got.1 - expected1;
             let abs0: f32 = if diff0 < 0.0 { 0.0 - diff0 } else { diff0 };
             let abs1: f32 = if diff1 < 0.0 { 0.0 - diff1 } else { diff1 };
             if abs0 < 0.0001 and abs1 < 0.0001 { 1 } else { 0 }
@@ -2750,7 +3369,7 @@ fn derive_through_a_tagged_tensor_constructed_from_parameters_and_indexed_back()
             let expected0: f32 = 1.0;
             let expected1: f32 = 2.0 * w2;
             let got = fprime(w1, w2);
-            if got[0] == expected0 and got[1] == expected1 { 1 } else { 0 }
+            if got.0 == expected0 and got.1 == expected1 { 1 } else { 0 }
         }
     ";
     assert_eq!(run_i32(&context, src), 1);
@@ -2778,7 +3397,7 @@ fn derive_through_a_plain_struct_constructed_from_parameters_and_read_back() {
             let expected0: f32 = 1.0;
             let expected1: f32 = 2.0 * y;
             let got = fprime(x, y);
-            if got[0] == expected0 and got[1] == expected1 { 1 } else { 0 }
+            if got.0 == expected0 and got.1 == expected1 { 1 } else { 0 }
         }
     ";
     assert_eq!(run_i32(&context, src), 1);
@@ -2808,7 +3427,8 @@ fn derive_through_a_plain_struct_constructed_from_parameters_and_read_back() {
 /// `c = matmul(a, identity)`, `f = c[0,0] + c[1,1] = trace(a) = a1 + a4` —
 /// `df/da1 = 1`, `df/da2 = 0`, `df/da3 = 0`, `df/da4 = 1`.
 #[test]
-fn derive_through_matmul_against_a_constant_identity_matrix_uses_the_product_rule_and_a_typed_zero() {
+fn derive_through_matmul_against_a_constant_identity_matrix_uses_the_product_rule_and_a_typed_zero()
+{
     let context = context();
     let src = "
         use linalg;
@@ -2821,10 +3441,99 @@ fn derive_through_matmul_against_a_constant_identity_matrix_uses_the_product_rul
         fprime = derive(f);
         fn main() -> i32 {
             let g = fprime(1.0, 2.0, 3.0, 4.0);
-            if g[0] == 1.0 and g[1] == 0.0 and g[2] == 0.0 and g[3] == 1.0 { 1 } else { 0 }
+            if g.0 == 1.0 and g.1 == 0.0 and g.2 == 0.0 and g.3 == 1.0 { 1 } else { 0 }
         }
     ";
     assert_eq!(run_i32_with_optimization_pass(&context, src), 1);
+}
+
+/// `doc/backlog.md`'s own "gradient w.r.t. a struct parameter" item —
+/// `derive()` on a function taking an ordinary, non-`Tensor` struct
+/// parameter, recursing into its own field via a plain `Field` projection
+/// (no eta-expansion needed at all — see `egraph.rs::build_param_shape`'s
+/// own doc comment for why that's specific to `Tensor` leaves). `loss = (w*x
+/// - y)^2`, `w=2, x=3, y=1` -> `pred=6, err=5, d(loss)/dw = 2*err*x = 30`.
+#[test]
+fn derive_of_a_loss_taking_an_ordinary_struct_parameter_computes_the_right_gradient() {
+    let context = context();
+    let src = "
+        struct Weight { w: f32 }
+        fn loss(x: f32, y: f32, p: Weight) -> f32 {
+            let pred = p.w * x;
+            let err = pred - y;
+            err * err
+        }
+        grad = derive(loss);
+        fn main() -> i32 {
+            let p = Weight(w: 2.0);
+            let g = grad(3.0, 1.0, p);
+            if g.2.w == 30.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// The real target: `derive()` on a function taking a struct parameter
+/// whose own field is `Tensor`-shaped — needs every piece together (`Index::
+/// index` eta-expansion + reconstruction union so the chain rule can
+/// differentiate *through* an operand that's otherwise opaque; the cross-
+/// leaf independence fix, since `p.w[0,0]`/`p.w[0,1]` both report the same
+/// `free_deps = {p}` and are otherwise indistinguishable to the general
+/// `derivative-independent-zero` rule; and `Forward::walk`'s own `known_
+/// types` fix for a real call's own return type, without which saturation
+/// never terminates cleanly — see `egraph.rs`'s own doc comments on each).
+/// Also the real end-to-end proof that a `Tensor`-typed *struct field*
+/// actually lowers and runs (`mlir_lower.rs::store_native_shape_field`/
+/// `load_native_shape_field`, needed once this got as far as real MLIR
+/// codegen — found directly: `'llvm.store' op operand #0 must be LLVM type
+/// with size, but got 'tensor<1x2xf32>'`, before those existed).
+///
+/// `loss = (w[0,0]*x + w[0,1] - y)^2`, `w=[2,3], x=4, y=5` -> `pred=11,
+/// err=6, d/dw00 = 2*err*x = 48`, `d/dw01 = 2*err = 12`.
+#[test]
+fn derive_of_a_loss_taking_a_struct_parameter_with_a_tensor_field_computes_the_right_gradient() {
+    let context = context();
+    let src = "
+        use linalg;
+        struct Pair { w: Tensor<f32, 1, 2> }
+        fn loss(x: f32, y: f32, p: Pair) -> f32 {
+            let pred = p.w[0, 0] * x + p.w[0, 1];
+            let err = pred - y;
+            err * err
+        }
+        grad = derive(loss);
+        fn main() -> i32 {
+            let p = Pair(w: Tensor::<f32, 1, 2>(data: [[2.0, 3.0]]));
+            let g = grad(4.0, 5.0, p);
+            if g.2.w[0, 0] == 48.0 and g.2.w[0, 1] == 12.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// The cross-leaf independence fix specifically, isolated: `p.w[0,1]` is
+/// never referenced anywhere in `loss`'s own body at all — its own gradient
+/// must still resolve to a clean `0.0`, not get stuck (`egraph.rs::build_
+/// param_shape`'s own doc comment on why the general `derivative-
+/// independent-zero` rule can't discover this on its own for two leaves of
+/// the same tensor).
+#[test]
+fn derive_of_a_loss_ignoring_one_tensor_field_element_gives_it_a_clean_zero_gradient() {
+    let context = context();
+    let src = "
+        use linalg;
+        struct Pair { w: Tensor<f32, 1, 2> }
+        fn loss(x: f32, p: Pair) -> f32 {
+            p.w[0, 0] * x
+        }
+        grad = derive(loss);
+        fn main() -> i32 {
+            let p = Pair(w: Tensor::<f32, 1, 2>(data: [[2.0, 3.0]]));
+            let g = grad(4.0, p);
+            if g.1.w[0, 0] == 4.0 and g.1.w[0, 1] == 0.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
 }
 
 /// `doc/backlog.md`'s own "`Ring<T>` gained a real `zero()`" item — a real,
@@ -2956,7 +3665,11 @@ fn qualified_calls_to_two_algebras_colliding_on_the_same_method_and_type_run_the
 /// symbols the caller passes in (the `_ptr` width, only ever declared
 /// locally by a specific test's own `impl RawBuffer<SomeStruct>`, never
 /// unconditionally compiled).
-fn run_i32_with_dynarray_symbols(context: &Context, src: &str, extra_symbols: &[(&str, *mut ())]) -> i32 {
+fn run_i32_with_dynarray_symbols(
+    context: &Context,
+    src: &str,
+    extra_symbols: &[(&str, *mut ())],
+) -> i32 {
     let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let registry = Registry::build(&program);
@@ -2965,13 +3678,18 @@ fn run_i32_with_dynarray_symbols(context: &Context, src: &str, extra_symbols: &[
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(context, &cps_program, &mlir_types, struct_schemas);
-    assert!(module.as_operation().verify(), "generated MLIR module failed verification");
+    assert!(
+        module.as_operation().verify(),
+        "generated MLIR module failed verification"
+    );
 
     let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
     pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-    pass_manager.run(&mut module).expect("lowering to the llvm dialect must succeed");
+    pass_manager
+        .run(&mut module)
+        .expect("lowering to the llvm dialect must succeed");
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {
@@ -2980,23 +3698,38 @@ fn run_i32_with_dynarray_symbols(context: &Context, src: &str, extra_symbols: &[
         engine.register_symbol("dynarray_grow_i8", cleave_rt::dynarray_grow_i8 as *mut ());
         engine.register_symbol("dynarray_get_i8", cleave_rt::dynarray_get_i8 as *mut ());
         engine.register_symbol("dynarray_set_i8", cleave_rt::dynarray_set_i8 as *mut ());
-        engine.register_symbol("dynarray_alloc_i16", cleave_rt::dynarray_alloc_i16 as *mut ());
+        engine.register_symbol(
+            "dynarray_alloc_i16",
+            cleave_rt::dynarray_alloc_i16 as *mut (),
+        );
         engine.register_symbol("dynarray_grow_i16", cleave_rt::dynarray_grow_i16 as *mut ());
         engine.register_symbol("dynarray_get_i16", cleave_rt::dynarray_get_i16 as *mut ());
         engine.register_symbol("dynarray_set_i16", cleave_rt::dynarray_set_i16 as *mut ());
-        engine.register_symbol("dynarray_alloc_i32", cleave_rt::dynarray_alloc_i32 as *mut ());
+        engine.register_symbol(
+            "dynarray_alloc_i32",
+            cleave_rt::dynarray_alloc_i32 as *mut (),
+        );
         engine.register_symbol("dynarray_grow_i32", cleave_rt::dynarray_grow_i32 as *mut ());
         engine.register_symbol("dynarray_get_i32", cleave_rt::dynarray_get_i32 as *mut ());
         engine.register_symbol("dynarray_set_i32", cleave_rt::dynarray_set_i32 as *mut ());
-        engine.register_symbol("dynarray_alloc_i64", cleave_rt::dynarray_alloc_i64 as *mut ());
+        engine.register_symbol(
+            "dynarray_alloc_i64",
+            cleave_rt::dynarray_alloc_i64 as *mut (),
+        );
         engine.register_symbol("dynarray_grow_i64", cleave_rt::dynarray_grow_i64 as *mut ());
         engine.register_symbol("dynarray_get_i64", cleave_rt::dynarray_get_i64 as *mut ());
         engine.register_symbol("dynarray_set_i64", cleave_rt::dynarray_set_i64 as *mut ());
-        engine.register_symbol("dynarray_alloc_f32", cleave_rt::dynarray_alloc_f32 as *mut ());
+        engine.register_symbol(
+            "dynarray_alloc_f32",
+            cleave_rt::dynarray_alloc_f32 as *mut (),
+        );
         engine.register_symbol("dynarray_grow_f32", cleave_rt::dynarray_grow_f32 as *mut ());
         engine.register_symbol("dynarray_get_f32", cleave_rt::dynarray_get_f32 as *mut ());
         engine.register_symbol("dynarray_set_f32", cleave_rt::dynarray_set_f32 as *mut ());
-        engine.register_symbol("dynarray_alloc_f64", cleave_rt::dynarray_alloc_f64 as *mut ());
+        engine.register_symbol(
+            "dynarray_alloc_f64",
+            cleave_rt::dynarray_alloc_f64 as *mut (),
+        );
         engine.register_symbol("dynarray_grow_f64", cleave_rt::dynarray_grow_f64 as *mut ());
         engine.register_symbol("dynarray_get_f64", cleave_rt::dynarray_get_f64 as *mut ());
         engine.register_symbol("dynarray_set_f64", cleave_rt::dynarray_set_f64 as *mut ());
@@ -3006,7 +3739,9 @@ fn run_i32_with_dynarray_symbols(context: &Context, src: &str, extra_symbols: &[
     }
     let mut out: i32 = -1;
     unsafe {
-        engine.invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()]).expect("JIT invocation must succeed");
+        engine
+            .invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()])
+            .expect("JIT invocation must succeed");
     }
     out
 }
@@ -3073,7 +3808,10 @@ fn a_dynarray_of_structs_grows_and_reads_back_correct_field_values() {
         }
     ";
     let symbols: &[(&str, *mut ())] = &[
-        ("dynarray_alloc_ptr", cleave_rt::dynarray_alloc_ptr as *mut ()),
+        (
+            "dynarray_alloc_ptr",
+            cleave_rt::dynarray_alloc_ptr as *mut (),
+        ),
         ("dynarray_grow_ptr", cleave_rt::dynarray_grow_ptr as *mut ()),
         ("dynarray_get_ptr", cleave_rt::dynarray_get_ptr as *mut ()),
         ("dynarray_set_ptr", cleave_rt::dynarray_set_ptr as *mut ()),
@@ -3120,7 +3858,10 @@ fn dynarray_generalizes_correctly_across_two_different_concrete_types_in_one_pro
         }
     ";
     let symbols: &[(&str, *mut ())] = &[
-        ("dynarray_alloc_ptr", cleave_rt::dynarray_alloc_ptr as *mut ()),
+        (
+            "dynarray_alloc_ptr",
+            cleave_rt::dynarray_alloc_ptr as *mut (),
+        ),
         ("dynarray_grow_ptr", cleave_rt::dynarray_grow_ptr as *mut ()),
         ("dynarray_get_ptr", cleave_rt::dynarray_get_ptr as *mut ()),
         ("dynarray_set_ptr", cleave_rt::dynarray_set_ptr as *mut ()),
@@ -3339,8 +4080,14 @@ fn a_loop_with_no_break_produces_no_guard_machinery() {
     // alphabetical ordering — every algebra-qualified name starts
     // uppercase, sorting before lowercase `main` in ASCII), so everything
     // after `func.func @main` is `main`'s own body specifically.
-    let main_text = text.split("func.func @main").nth(1).unwrap_or_else(|| panic!("no `@main` found in:\n{text}"));
-    assert!(!main_text.contains("Logic::and"), "an unguarded loop's own `main` must not call `Logic::and` at all, got:\n{main_text}");
+    let main_text = text
+        .split("func.func @main")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no `@main` found in:\n{text}"));
+    assert!(
+        !main_text.contains("Logic::and"),
+        "an unguarded loop's own `main` must not call `Logic::and` at all, got:\n{main_text}"
+    );
     assert_eq!(run_i32(&context, src), 45);
 }
 
@@ -3355,7 +4102,10 @@ fn a_loop_with_no_break_produces_no_guard_machinery() {
 #[test]
 fn a_tuple_constructs_and_reads_both_fields_back_correctly() {
     let context = context();
-    let out = run_i32(&context, "fn main() -> i32 { let t: (i32, i32) = (3, 4); t.0 * 10 + t.1 }");
+    let out = run_i32(
+        &context,
+        "fn main() -> i32 { let t: (i32, i32) = (3, 4); t.0 * 10 + t.1 }",
+    );
     assert_eq!(out, 34);
 }
 
@@ -3365,28 +4115,40 @@ fn a_heterogeneous_tuple_reads_a_non_i32_field_back_correctly() {
     // `t.1` stays `f64`-typed all the way through (no `i32`-narrowing
     // `Convert` impl exists, or is needed) -- folded into the `i32` return
     // via a comparison instead, matching `run_i32`'s own return type.
-    let out = run_i32(&context, "fn main() -> i32 { let t: (i32, f64) = (3, 4.5); if t.1 == 4.5 { t.0 } else { -1 } }");
+    let out = run_i32(
+        &context,
+        "fn main() -> i32 { let t: (i32, f64) = (3, 4.5); if t.1 == 4.5 { t.0 } else { -1 } }",
+    );
     assert_eq!(out, 3);
 }
 
 #[test]
 fn a_nested_tuple_reads_back_correctly_through_a_chained_field_access() {
     let context = context();
-    let out = run_i32(&context, "fn main() -> i32 { let t: ((i32, i32), i32) = ((1, 2), 3); t.0.0 * 100 + t.0.1 * 10 + t.1 }");
+    let out = run_i32(
+        &context,
+        "fn main() -> i32 { let t: ((i32, i32), i32) = ((1, 2), 3); t.0.0 * 100 + t.0.1 * 10 + t.1 }",
+    );
     assert_eq!(out, 123);
 }
 
 #[test]
 fn a_tuple_field_is_mutable_through_a_let_mut_binding() {
     let context = context();
-    let out = run_i32(&context, "fn main() -> i32 { let mut t: (i32, i32) = (10, 20); t.0 = 99; t.0 + t.1 }");
+    let out = run_i32(
+        &context,
+        "fn main() -> i32 { let mut t: (i32, i32) = (10, 20); t.0 = 99; t.0 + t.1 }",
+    );
     assert_eq!(out, 119);
 }
 
 #[test]
 fn a_function_over_an_explicit_tuple_parameter_type_returns_the_right_element() {
     let context = context();
-    let out = run_i32(&context, "fn first(t: (i32, bool)) -> i32 { t.0 }\nfn main() -> i32 { first((7, true)) }");
+    let out = run_i32(
+        &context,
+        "fn first(t: (i32, bool)) -> i32 { t.0 }\nfn main() -> i32 { first((7, true)) }",
+    );
     assert_eq!(out, 7);
 }
 

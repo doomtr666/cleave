@@ -257,11 +257,19 @@ pub enum GenericParam {
     /// not enforced at this level (mirrors `grammar.pest`'s own "accept a
     /// superset, narrow semantically" posture); `infer.rs` is where real
     /// pack support (and this restriction) actually lands.
-    Type { name: String, bounds: Vec<String>, variadic: bool },
+    Type {
+        name: String,
+        bounds: Vec<String>,
+        variadic: bool,
+    },
     /// `variadic`: `const Dims: i32...` — a const-generic pack (`Tensor<T,
     /// const Dims: i32...>`'s own motivating case), the const-generic
     /// counterpart to `Type`'s own `variadic` field above.
-    Const { name: String, ty: Type, variadic: bool },
+    Const {
+        name: String,
+        ty: Type,
+        variadic: bool,
+    },
 }
 
 impl GenericParam {
@@ -339,7 +347,9 @@ pub struct Path {
 
 impl Path {
     pub fn single(name: impl Into<String>) -> Self {
-        Path { segments: vec![name.into()] }
+        Path {
+            segments: vec![name.into()],
+        }
     }
 }
 
@@ -347,13 +357,21 @@ impl Path {
 
 #[derive(Debug, Clone)]
 pub enum StmtKind {
-    Let { mutable: bool, name: String, ty: Option<Type>, value: Expr },
+    Let {
+        mutable: bool,
+        name: String,
+        ty: Option<Type>,
+        value: Expr,
+    },
     /// Reassignment of an existing `let mut` binding — never a fresh binding
     /// (see `grammar.md`). `target` is a plain name (`Path`) or a field/index
     /// chain into one (`FieldAccess`/`Index`, same shapes an ordinary
     /// expression would use to *read* the same location) — never anything
     /// else (grammar-restricted, see `grammar.pest`'s `assign_target`).
-    Assign { target: Expr, value: Expr },
+    Assign {
+        target: Expr,
+        value: Expr,
+    },
     Expr(Expr),
     /// `break;`/`break value;` — a statement, not a general expression (see
     /// `grammar.pest`'s own `break_stmt` doc comment for why). Legal inside
@@ -379,8 +397,14 @@ pub enum ExprKind {
     /// here — final numeric type (default/override/inferred-from-context) is a
     /// type-inference concern, not an AST-construction one (see `grammar.md`,
     /// "Type conversion" / literal contextual inference).
-    NumberLit { text: String, suffix: Option<String> },
-    ImaginaryLit { text: String, suffix: Option<String> },
+    NumberLit {
+        text: String,
+        suffix: Option<String>,
+    },
+    ImaginaryLit {
+        text: String,
+        suffix: Option<String>,
+    },
     BoolLit(bool),
     Path(Path),
     /// Operator uses already desugar to this at construction time (`a + b` =>
@@ -427,7 +451,10 @@ pub enum ExprKind {
     /// comment). `count` is a lowered `NumberLit` or `Path` node — resolved
     /// through ordinary type inference, not expanded into real copies until
     /// monomorphization knows `N`'s concrete value.
-    ArrayRepeat { value: Box<Expr>, count: Box<Expr> },
+    ArrayRepeat {
+        value: Box<Expr>,
+        count: Box<Expr>,
+    },
     /// `Vec2(x: 1.0, y: 2.0)` — struct construction, named-argument call
     /// syntax rather than Rust-style `Vec2 { x: 1.0, y: 2.0 }` (which would
     /// collide with `if`/`while`/`for`'s own condition-then-block shape —
@@ -438,12 +465,24 @@ pub enum ExprKind {
     /// carries (`Matrix::<f64, 4, 4>(values: ...)`) — usually empty, since a
     /// struct's own generics are normally inferred from its field values.
     StructLit(Path, Vec<GenericArg>, Vec<(String, Expr)>),
-    If { cond: Box<Expr>, then_branch: Block, else_branch: Option<Box<ElseBranch>> },
+    If {
+        cond: Box<Expr>,
+        then_branch: Block,
+        else_branch: Option<Box<ElseBranch>>,
+    },
     /// Parses (the grammar is a funnel — see `grammar.pest`) but not yet wired
     /// into CPS conversion/the e-graph; kept here so the AST can represent what
     /// the parser accepts, without implying semantic support exists yet.
-    While { cond: Box<Expr>, body: Block },
-    For { var: String, start: Box<Expr>, end: Box<Expr>, body: Block },
+    While {
+        cond: Box<Expr>,
+        body: Block,
+    },
+    For {
+        var: String,
+        start: Box<Expr>,
+        end: Box<Expr>,
+        body: Block,
+    },
     /// `for x in arr { body }` — element-based iteration over a real,
     /// homogeneous array (`doc/backlog-done.md`'s own "`for x in array`"
     /// item). Deliberately its own `ExprKind`, not a variant of `For`
@@ -452,7 +491,11 @@ pub enum ExprKind {
     /// own *element* type, not the counter's — different enough at both
     /// type-checking and CPS-conversion time that folding it into `For`'s
     /// own fields would need an awkward `Option`/enum split there instead.
-    ForIn { var: String, iter: Box<Expr>, body: Block },
+    ForIn {
+        var: String,
+        iter: Box<Expr>,
+        body: Block,
+    },
     /// `loop { ... break value; ... }` — unconditional, exited only via
     /// `break` (`StmtKind::Break`). The only loop kind that can produce a
     /// non-`()` value: `while`/`for`/`for-in` always stay `()`-typed (their
@@ -461,13 +504,19 @@ pub enum ExprKind {
     /// `break` inside it (directly, not through a nested loop) unifies
     /// against one shared accumulator type, which becomes this expression's
     /// own overall type (`infer.rs`'s own `loop_stack`).
-    Loop { body: Block },
+    Loop {
+        body: Block,
+    },
     Block(Block),
     /// `fn(a, b) { a + b }` — a first-class function value; the same shape
     /// as a top-level `fn`, minus the name (see `grammar.pest`). Captures
     /// aren't resolved here (closure conversion, structural per `hld.md`, is
     /// a later pass) — this is just the surface shape.
-    Lambda { params: Vec<Param>, ret: Option<Type>, body: Block },
+    Lambda {
+        params: Vec<Param>,
+        ret: Option<Type>,
+        body: Block,
+    },
     /// `Dims...` used as *one array dimension's own size expression*
     /// (`[T; Dims...]`, inside `TypeKind::Array`'s own size slot — see its
     /// doc comment) — `doc/backlog.md`'s own "Variadic generics" item. Not

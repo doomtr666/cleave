@@ -80,7 +80,9 @@
 //! problem, not this one.
 
 use crate::ast::*;
-use crate::infer::{check_no_placeholder, Constraint, Env, Infer, Scheme, Ty, TypeError, TypeErrorKind};
+use crate::infer::{
+    Constraint, Env, Infer, Scheme, Ty, TypeError, TypeErrorKind, check_no_placeholder,
+};
 use crate::registry::Registry;
 use std::collections::{HashMap, HashSet};
 
@@ -154,17 +156,27 @@ pub struct InherentMethodPattern {
 /// check still happens unaffected, via `dump.rs`/`monomorphize.rs`'s own
 /// existing calls to `infer_inherent_impl_block`, which already run after
 /// `global_env` is complete and pass it through.
-pub fn infer_inherent_impls_early(program: &Program, registry: &Registry) -> HashMap<(String, String), InherentMethodPattern> {
+pub fn infer_inherent_impls_early(
+    program: &Program,
+    registry: &Registry,
+) -> HashMap<(String, String), InherentMethodPattern> {
     let mut out = HashMap::new();
     let empty_env = Env::new();
     for item in &program.items {
-        let ItemKind::InherentImpl(d) = &item.kind else { continue };
-        let TypeKind::Path(p, _) = &d.target.kind else { continue };
+        let ItemKind::InherentImpl(d) = &item.kind else {
+            continue;
+        };
+        let TypeKind::Path(p, _) = &d.target.kind else {
+            continue;
+        };
         let struct_name = p.segments.join("::");
         let mut infer = Infer::new(registry);
-        let (generics_mapping, results) = infer.infer_inherent_impl_block(&empty_env, &d.generics, &d.target, &d.fns, item.span);
+        let (generics_mapping, results) =
+            infer.infer_inherent_impl_block(&empty_env, &d.generics, &d.target, &d.fns, item.span);
         for f in &d.fns {
-            let Some(Ok((param_patterns, ret_pattern))) = results.get(&f.name) else { continue };
+            let Some(Ok((param_patterns, ret_pattern))) = results.get(&f.name) else {
+                continue;
+            };
             out.insert(
                 (struct_name.clone(), f.name.clone()),
                 InherentMethodPattern {
@@ -237,7 +249,10 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
         for name in group {
             let f = functions[name.as_str()];
             let (param_types, ret_var, generics) = infer.fresh_fn_shape(f);
-            group_env.insert(name.clone(), Scheme::mono(Ty::Fn(param_types.clone(), Box::new(ret_var.clone()))));
+            group_env.insert(
+                name.clone(),
+                Scheme::mono(Ty::Fn(param_types.clone(), Box::new(ret_var.clone()))),
+            );
             placeholders.insert(name.clone(), (param_types, ret_var, generics));
         }
 
@@ -265,7 +280,12 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
                     if !f.generics.is_empty() {
                         raw_results.insert(
                             name.clone(),
-                            Err(TypeError { span, kind: TypeErrorKind::ExternFnCannotBeGeneric { name: f.name.clone() } }),
+                            Err(TypeError {
+                                span,
+                                kind: TypeErrorKind::ExternFnCannotBeGeneric {
+                                    name: f.name.clone(),
+                                },
+                            }),
                         );
                         continue;
                     }
@@ -276,8 +296,11 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
                     // bare return `Ty`, not `Ty::Fn(params, ret)`, matching
                     // exactly what `infer_fn_raw` itself returns.
                     let (_, ret_var, _) = placeholders[name].clone();
-                    let declared_ret =
-                        f.ret.as_ref().map(|t| infer.ty_from_ast(t)).unwrap_or_else(|| Ty::Con("()".to_string()));
+                    let declared_ret = f
+                        .ret
+                        .as_ref()
+                        .map(|t| infer.ty_from_ast(t))
+                        .unwrap_or_else(|| Ty::Con("()".to_string()));
                     let outcome = infer
                         .unify_at(span, &ret_var, &declared_ret)
                         .and_then(|()| infer.check_pending_type_names())
@@ -288,7 +311,12 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
                 }
                 raw_results.insert(
                     name.clone(),
-                    Err(TypeError { span, kind: TypeErrorKind::MissingFnBody { name: f.name.clone() } }),
+                    Err(TypeError {
+                        span,
+                        kind: TypeErrorKind::MissingFnBody {
+                            name: f.name.clone(),
+                        },
+                    }),
                 );
                 continue;
             }
@@ -296,7 +324,12 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
                 let span = item_spans[name.as_str()];
                 raw_results.insert(
                     name.clone(),
-                    Err(TypeError { span, kind: TypeErrorKind::ExportFnCannotBeGeneric { name: f.name.clone() } }),
+                    Err(TypeError {
+                        span,
+                        kind: TypeErrorKind::ExportFnCannotBeGeneric {
+                            name: f.name.clone(),
+                        },
+                    }),
                 );
                 continue;
             }
@@ -392,7 +425,10 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
         // the whole group" posture as `check_pending_constraints` just
         // above — see `Infer::finish_fn`'s identical pairing for the
         // single-function path.
-        if let Err(e) = infer.check_pending_field_accesses().and_then(|()| infer.check_pending_method_calls()) {
+        if let Err(e) = infer
+            .check_pending_field_accesses()
+            .and_then(|()| infer.check_pending_method_calls())
+        {
             for name in group {
                 if let Some(r @ Ok(_)) = raw_results.get_mut(name) {
                     *r = Err(e.clone());
@@ -412,7 +448,8 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
                 Ok(result_ty) => {
                     let f = functions[name.as_str()];
                     let (param_types, _, _) = &placeholders[name];
-                    let final_params: Vec<Ty> = param_types.iter().map(|t| infer.subst.apply(t)).collect();
+                    let final_params: Vec<Ty> =
+                        param_types.iter().map(|t| infer.subst.apply(t)).collect();
                     let final_result = infer.subst.apply(&result_ty);
 
                     match check_no_placeholder(f, &final_result, &final_params) {
@@ -444,15 +481,27 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
                             // would silently lose a real, checkable
                             // requirement).
                             if f.params.is_empty() {
-                                let ty = Ty::Fn(final_params.clone(), Box::new(final_result.clone()));
-                                let constraints = nullary_constraints.remove(name).unwrap_or_default();
+                                let ty =
+                                    Ty::Fn(final_params.clone(), Box::new(final_result.clone()));
+                                let constraints =
+                                    nullary_constraints.remove(name).unwrap_or_default();
                                 global_env.insert(
                                     name.clone(),
-                                    Scheme { vars: Vec::new(), constraints, ty, const_widths: HashMap::new() },
+                                    Scheme {
+                                        vars: Vec::new(),
+                                        constraints,
+                                        ty,
+                                        const_widths: HashMap::new(),
+                                    },
                                 );
                             }
-                            results
-                                .insert(name.clone(), Ok(FnResult { param_types: final_params, result: final_result }));
+                            results.insert(
+                                name.clone(),
+                                Ok(FnResult {
+                                    param_types: final_params,
+                                    result: final_result,
+                                }),
+                            );
                         }
                         Err(e) => {
                             results.insert(name.clone(), Err(e));
@@ -465,7 +514,12 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
             }
         }
 
-        node_types.extend(infer.node_types.iter().map(|(id, t)| (*id, infer.subst.apply(t))));
+        node_types.extend(
+            infer
+                .node_types
+                .iter()
+                .map(|(id, t)| (*id, infer.subst.apply(t))),
+        );
         lambda_schemes.extend(infer.lambda_schemes.iter().map(|(id, s)| {
             let mut s = s.clone();
             s.ty = infer.subst.apply(&s.ty);
@@ -473,7 +527,12 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
         }));
     }
 
-    ProgramInference { results, node_types, lambda_schemes, global_env }
+    ProgramInference {
+        results,
+        node_types,
+        lambda_schemes,
+        global_env,
+    }
 }
 
 // ------------------------------------------------------------ static call-graph scan
@@ -540,7 +599,9 @@ fn collect_calls_expr(expr: &Expr, known: &HashSet<&str>, out: &mut Vec<String>)
         }
         ExprKind::Index(b, indices) => {
             collect_calls_expr(b, known, out);
-            indices.iter().for_each(|i| collect_calls_expr(i, known, out));
+            indices
+                .iter()
+                .for_each(|i| collect_calls_expr(i, known, out));
         }
         ExprKind::ArrayLit(elems) => {
             for e in elems {
@@ -556,7 +617,11 @@ fn collect_calls_expr(expr: &Expr, known: &HashSet<&str>, out: &mut Vec<String>)
                 collect_calls_expr(v, known, out);
             }
         }
-        ExprKind::If { cond, then_branch, else_branch } => {
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
             collect_calls_expr(cond, known, out);
             collect_calls_block(then_branch, known, out);
             if let Some(eb) = else_branch {
@@ -570,7 +635,9 @@ fn collect_calls_expr(expr: &Expr, known: &HashSet<&str>, out: &mut Vec<String>)
             collect_calls_expr(cond, known, out);
             collect_calls_block(body, known, out);
         }
-        ExprKind::For { start, end, body, .. } => {
+        ExprKind::For {
+            start, end, body, ..
+        } => {
             collect_calls_expr(start, known, out);
             collect_calls_expr(end, known, out);
             collect_calls_block(body, known, out);
@@ -655,7 +722,10 @@ impl<'a> Tarjan<'a> {
         if self.low_link[name] == self.index_of[name] {
             let mut group = Vec::new();
             loop {
-                let w = self.stack.pop().expect("root's own strongconnect pushed it, so the stack can't be empty");
+                let w = self
+                    .stack
+                    .pop()
+                    .expect("root's own strongconnect pushed it, so the stack can't be empty");
                 self.on_stack.remove(&w);
                 let is_root = w == name;
                 group.push(w);

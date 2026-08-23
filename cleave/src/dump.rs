@@ -53,11 +53,14 @@ pub fn dump_program(program: &Program, registry: &Registry) -> (String, Vec<Type
             }
             ItemKind::Fn(f) => dump_program_fn(&mut out, &mut errors, f, &program_inference),
             ItemKind::Impl(d) => {
-                let targets: Vec<String> =
-                    std::iter::once(&d.target).chain(d.extra_targets.iter()).map(fmt_type).collect();
+                let targets: Vec<String> = std::iter::once(&d.target)
+                    .chain(d.extra_targets.iter())
+                    .map(fmt_type)
+                    .collect();
                 let _ = writeln!(out, "impl {}<{}> {{", d.algebra, targets.join(", "));
-                let all_targets: Vec<Type> =
-                    std::iter::once(d.target.clone()).chain(d.extra_targets.iter().cloned()).collect();
+                let all_targets: Vec<Type> = std::iter::once(d.target.clone())
+                    .chain(d.extra_targets.iter().cloned())
+                    .collect();
                 for f in &d.fns {
                     dump_impl_fn(
                         &mut out,
@@ -117,7 +120,11 @@ impl TyVarNames {
             .or_insert_with(|| {
                 let letter = (b'a' + (next % 26) as u8) as char;
                 let suffix = next / 26;
-                if suffix == 0 { letter.to_string() } else { format!("{letter}{suffix}") }
+                if suffix == 0 {
+                    letter.to_string()
+                } else {
+                    format!("{letter}{suffix}")
+                }
             })
             .clone()
     }
@@ -127,26 +134,51 @@ pub(crate) fn fmt_ty_named(ty: &Ty, names: &mut TyVarNames) -> String {
     match ty {
         Ty::Var(v) => format!("'{}", names.get(*v)),
         Ty::Pack(v) => format!("'{}...", names.get(*v)),
-        Ty::PackResolved(elems) => elems.iter().map(|e| fmt_ty_named(e, names)).collect::<Vec<_>>().join(", "),
+        Ty::PackResolved(elems) => elems
+            .iter()
+            .map(|e| fmt_ty_named(e, names))
+            .collect::<Vec<_>>()
+            .join(", "),
         Ty::PackLen(v) => format!("'{}...len()", names.get(*v)),
         Ty::Con(name) => name.clone(),
         Ty::App(name, args) => {
-            let args = args.iter().map(|a| fmt_ty_named(a, names)).collect::<Vec<_>>().join(", ");
+            let args = args
+                .iter()
+                .map(|a| fmt_ty_named(a, names))
+                .collect::<Vec<_>>()
+                .join(", ");
             format!("{name}<{args}>")
         }
         Ty::Fn(params, ret) => {
-            let params = params.iter().map(|p| fmt_ty_named(p, names)).collect::<Vec<_>>().join(", ");
+            let params = params
+                .iter()
+                .map(|p| fmt_ty_named(p, names))
+                .collect::<Vec<_>>()
+                .join(", ");
             format!("({params}) -> {}", fmt_ty_named(ret, names))
         }
-        Ty::Array(elem, size) => format!("[{}; {}]", fmt_ty_named(elem, names), fmt_ty_named(size, names)),
+        Ty::Array(elem, size) => format!(
+            "[{}; {}]",
+            fmt_ty_named(elem, names),
+            fmt_ty_named(size, names)
+        ),
         Ty::Const(n) => n.to_string(),
-        Ty::ConstExpr(op, a, b) => format!("{op}({}, {})", fmt_ty_named(a, names), fmt_ty_named(b, names)),
+        Ty::ConstExpr(op, a, b) => format!(
+            "{op}({}, {})",
+            fmt_ty_named(a, names),
+            fmt_ty_named(b, names)
+        ),
     }
 }
 
 /// Renders one top-level `fn`, using the already-computed whole-program
 /// result (`callgraph::infer_program`) rather than inferring it again here.
-fn dump_program_fn(out: &mut String, errors: &mut Vec<TypeError>, f: &FnDecl, program_inference: &ProgramInference) {
+fn dump_program_fn(
+    out: &mut String,
+    errors: &mut Vec<TypeError>,
+    f: &FnDecl,
+    program_inference: &ProgramInference,
+) {
     match program_inference.results.get(&f.name) {
         Some(Ok(fn_result)) => {
             let mut names = TyVarNames::default();
@@ -180,10 +212,18 @@ fn dump_program_fn(out: &mut String, errors: &mut Vec<TypeError>, f: &FnDecl, pr
         }
         Some(Err(e)) => {
             let params: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
-            let _ = writeln!(out, "fn {}({}) {{ /* type error, see diagnostics */ }}", f.name, params.join(", "));
+            let _ = writeln!(
+                out,
+                "fn {}({}) {{ /* type error, see diagnostics */ }}",
+                f.name,
+                params.join(", ")
+            );
             errors.push(e.clone());
         }
-        None => unreachable!("`{}` is a top-level `fn` item but callgraph::infer_program has no entry for it", f.name),
+        None => unreachable!(
+            "`{}` is a top-level `fn` item but callgraph::infer_program has no entry for it",
+            f.name
+        ),
     }
 }
 
@@ -199,7 +239,14 @@ fn dump_impl_fn(
     fallback_span: Span,
 ) {
     let mut infer = Infer::new(registry);
-    match infer.infer_impl_fn_generic_with_env(global_env, algebra, impl_generics, targets, f, fallback_span) {
+    match infer.infer_impl_fn_generic_with_env(
+        global_env,
+        algebra,
+        impl_generics,
+        targets,
+        f,
+        fallback_span,
+    ) {
         Ok(ret) => {
             let mut names = TyVarNames::default();
             let params: Vec<String> = f
@@ -222,8 +269,11 @@ fn dump_impl_fn(
                 // `--dump-monomorphized` already uses for a never-called
                 // generic method.
                 None => {
-                    let attrs: Vec<String> =
-                        f.attrs.iter().map(|a| format!("#[{}({})]", a.name, a.args.join(", "))).collect();
+                    let attrs: Vec<String> = f
+                        .attrs
+                        .iter()
+                        .map(|a| format!("#[{}({})]", a.name, a.args.join(", ")))
+                        .collect();
                     for attr in &attrs {
                         let _ = writeln!(out, "{attr}");
                     }
@@ -233,7 +283,12 @@ fn dump_impl_fn(
         }
         Err(e) => {
             let params: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
-            let _ = writeln!(out, "fn {}({}) {{ /* type error, see diagnostics */ }}", f.name, params.join(", "));
+            let _ = writeln!(
+                out,
+                "fn {}({}) {{ /* type error, see diagnostics */ }}",
+                f.name,
+                params.join(", ")
+            );
             errors.push(e);
         }
     }
@@ -258,7 +313,8 @@ fn dump_inherent_impl_block(
     fallback_span: Span,
 ) {
     let mut infer = Infer::new(registry);
-    let (_, mut results) = infer.infer_inherent_impl_block(global_env, impl_generics, target, fns, fallback_span);
+    let (_, mut results) =
+        infer.infer_inherent_impl_block(global_env, impl_generics, target, fns, fallback_span);
     for f in fns {
         match results.remove(&f.name) {
             Some(Ok((param_types, ret))) => {
@@ -274,23 +330,40 @@ fn dump_inherent_impl_block(
                 // A bodyless inherent method is rejected by `infer_inherent_
                 // impl_fn_raw` itself (`MissingFnBody`) before it could ever
                 // reach `Ok` here.
-                let body = f.body.as_ref().expect("an inherent method reaching Ok always has a body");
+                let body = f
+                    .body
+                    .as_ref()
+                    .expect("an inherent method reaching Ok always has a body");
                 dump_block(out, body, &infer.node_types, &mut names, 1);
                 let _ = writeln!(out, "}}");
             }
             Some(Err(e)) => {
                 let params: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
-                let _ = writeln!(out, "fn {}({}) {{ /* type error, see diagnostics */ }}", f.name, params.join(", "));
+                let _ = writeln!(
+                    out,
+                    "fn {}({}) {{ /* type error, see diagnostics */ }}",
+                    f.name,
+                    params.join(", ")
+                );
                 errors.push(e);
             }
             // `infer_inherent_impl_block` always inserts exactly one entry
             // per `fns` -- unreachable outside a bug in that invariant.
-            None => unreachable!("infer_inherent_impl_block did not report a result for `{}`", f.name),
+            None => unreachable!(
+                "infer_inherent_impl_block did not report a result for `{}`",
+                f.name
+            ),
         }
     }
 }
 
-pub(crate) fn dump_block(out: &mut String, block: &Block, node_types: &NodeTypes, names: &mut TyVarNames, indent: usize) {
+pub(crate) fn dump_block(
+    out: &mut String,
+    block: &Block,
+    node_types: &NodeTypes,
+    names: &mut TyVarNames,
+    indent: usize,
+) {
     dump_block_with_call_names(out, block, node_types, names, indent, &HashMap::new());
 }
 
@@ -312,9 +385,18 @@ pub(crate) fn dump_block_with_call_names(
     let pad = "    ".repeat(indent);
     for stmt in &block.stmts {
         match &stmt.kind {
-            StmtKind::Let { mutable, name, value, .. } => {
+            StmtKind::Let {
+                mutable,
+                name,
+                value,
+                ..
+            } => {
                 let mut_kw = if *mutable { "mut " } else { "" };
-                let _ = writeln!(out, "{pad}let {mut_kw}{name} = {};", fmt_expr_typed(value, node_types, names, call_names));
+                let _ = writeln!(
+                    out,
+                    "{pad}let {mut_kw}{name} = {};",
+                    fmt_expr_typed(value, node_types, names, call_names)
+                );
             }
             StmtKind::Assign { target, value } => {
                 let _ = writeln!(
@@ -325,11 +407,19 @@ pub(crate) fn dump_block_with_call_names(
                 );
             }
             StmtKind::Expr(e) => {
-                let _ = writeln!(out, "{pad}{};", fmt_expr_typed(e, node_types, names, call_names));
+                let _ = writeln!(
+                    out,
+                    "{pad}{};",
+                    fmt_expr_typed(e, node_types, names, call_names)
+                );
             }
             StmtKind::Break(value) => match value {
                 Some(v) => {
-                    let _ = writeln!(out, "{pad}break {};", fmt_expr_typed(v, node_types, names, call_names));
+                    let _ = writeln!(
+                        out,
+                        "{pad}break {};",
+                        fmt_expr_typed(v, node_types, names, call_names)
+                    );
                 }
                 None => {
                     let _ = writeln!(out, "{pad}break;");
@@ -338,7 +428,11 @@ pub(crate) fn dump_block_with_call_names(
         }
     }
     if let Some(tail) = &block.tail {
-        let _ = writeln!(out, "{pad}{}", fmt_expr_typed(tail, node_types, names, call_names));
+        let _ = writeln!(
+            out,
+            "{pad}{}",
+            fmt_expr_typed(tail, node_types, names, call_names)
+        );
     }
 }
 
@@ -352,11 +446,20 @@ pub(crate) fn dump_block_with_call_names(
 /// tests) — this is a separate renderer specifically for
 /// `--dump-inference-pass`, where seeing only the outermost type per line
 /// isn't enough to actually debug a deeply nested expression.
-fn fmt_expr_typed(e: &Expr, node_types: &NodeTypes, names: &mut TyVarNames, call_names: &HashMap<NodeId, String>) -> String {
+fn fmt_expr_typed(
+    e: &Expr,
+    node_types: &NodeTypes,
+    names: &mut TyVarNames,
+    call_names: &HashMap<NodeId, String>,
+) -> String {
     // A suffixed literal is already fully annotated by its own suffix
     // (`1:i32`) — looking `node_types` up too would just repeat the same
     // information a second time.
-    if let ExprKind::NumberLit { text, suffix: Some(s) } = &e.kind {
+    if let ExprKind::NumberLit {
+        text,
+        suffix: Some(s),
+    } = &e.kind
+    {
         return format!("{text}:{s}");
     }
 
@@ -371,10 +474,20 @@ fn fmt_expr_typed(e: &Expr, node_types: &NodeTypes, names: &mut TyVarNames, call
             // this specific call node has one (see `call_names`'s own doc
             // comment) — the *original* callee path otherwise, exactly as
             // before this parameter existed.
-            let name = call_names.get(&e.id).cloned().unwrap_or_else(|| path.segments.join("::"));
-            format!("{name}{}({})", fmt_turbofish(generics), fmt_expr_list_typed(args, node_types, names, call_names))
+            let name = call_names
+                .get(&e.id)
+                .cloned()
+                .unwrap_or_else(|| path.segments.join("::"));
+            format!(
+                "{name}{}({})",
+                fmt_turbofish(generics),
+                fmt_expr_list_typed(args, node_types, names, call_names)
+            )
         }
-        ExprKind::FieldAccess(base, name) => format!("{}.{name}", fmt_expr_typed(base, node_types, names, call_names)),
+        ExprKind::FieldAccess(base, name) => format!(
+            "{}.{name}",
+            fmt_expr_typed(base, node_types, names, call_names)
+        ),
         ExprKind::MethodCall(base, name, args) => {
             format!(
                 "{}.{name}({})",
@@ -383,9 +496,16 @@ fn fmt_expr_typed(e: &Expr, node_types: &NodeTypes, names: &mut TyVarNames, call
             )
         }
         ExprKind::Index(base, indices) => {
-            format!("{}[{}]", fmt_expr_typed(base, node_types, names, call_names), fmt_expr_list_typed(indices, node_types, names, call_names))
+            format!(
+                "{}[{}]",
+                fmt_expr_typed(base, node_types, names, call_names),
+                fmt_expr_list_typed(indices, node_types, names, call_names)
+            )
         }
-        ExprKind::ArrayLit(elems) => format!("[{}]", fmt_expr_list_typed(elems, node_types, names, call_names)),
+        ExprKind::ArrayLit(elems) => format!(
+            "[{}]",
+            fmt_expr_list_typed(elems, node_types, names, call_names)
+        ),
         ExprKind::ArrayRepeat { value, count } => format!(
             "[{}; {}]",
             fmt_expr_typed(value, node_types, names, call_names),
@@ -397,21 +517,33 @@ fn fmt_expr_typed(e: &Expr, node_types: &NodeTypes, names: &mut TyVarNames, call
             fmt_turbofish(generics),
             fields
                 .iter()
-                .map(|(name, v)| format!("{name}: {}", fmt_expr_typed(v, node_types, names, call_names)))
+                .map(|(name, v)| format!(
+                    "{name}: {}",
+                    fmt_expr_typed(v, node_types, names, call_names)
+                ))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        ExprKind::If { cond, then_branch, else_branch } => {
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
             let mut s = format!(
                 "if {} {}",
                 fmt_expr_typed(cond, node_types, names, call_names),
                 fmt_block_inline_typed(then_branch, node_types, names, call_names)
             );
             if let Some(eb) = else_branch {
-                let _ = write!(s, " else {}", match &**eb {
-                    ElseBranch::If(i) => fmt_expr_typed(i, node_types, names, call_names),
-                    ElseBranch::Block(b) => fmt_block_inline_typed(b, node_types, names, call_names),
-                });
+                let _ = write!(
+                    s,
+                    " else {}",
+                    match &**eb {
+                        ElseBranch::If(i) => fmt_expr_typed(i, node_types, names, call_names),
+                        ElseBranch::Block(b) =>
+                            fmt_block_inline_typed(b, node_types, names, call_names),
+                    }
+                );
             }
             s
         }
@@ -422,7 +554,12 @@ fn fmt_expr_typed(e: &Expr, node_types: &NodeTypes, names: &mut TyVarNames, call
                 fmt_block_inline_typed(body, node_types, names, call_names)
             )
         }
-        ExprKind::For { var, start, end, body } => format!(
+        ExprKind::For {
+            var,
+            start,
+            end,
+            body,
+        } => format!(
             "for {var} in {}..{} {}",
             fmt_expr_typed(start, node_types, names, call_names),
             fmt_expr_typed(end, node_types, names, call_names),
@@ -433,31 +570,66 @@ fn fmt_expr_typed(e: &Expr, node_types: &NodeTypes, names: &mut TyVarNames, call
             fmt_expr_typed(iter, node_types, names, call_names),
             fmt_block_inline_typed(body, node_types, names, call_names)
         ),
-        ExprKind::Loop { body } => format!("loop {}", fmt_block_inline_typed(body, node_types, names, call_names)),
+        ExprKind::Loop { body } => format!(
+            "loop {}",
+            fmt_block_inline_typed(body, node_types, names, call_names)
+        ),
         ExprKind::Block(b) => fmt_block_inline_typed(b, node_types, names, call_names),
         ExprKind::Lambda { params, ret, body } => {
-            let ret_ann = ret.as_ref().map(|t| format!(" -> {}", fmt_type(t))).unwrap_or_default();
-            format!("fn({}){ret_ann} {}", fmt_params(params), fmt_block_inline_typed(body, node_types, names, call_names))
+            let ret_ann = ret
+                .as_ref()
+                .map(|t| format!(" -> {}", fmt_type(t)))
+                .unwrap_or_default();
+            format!(
+                "fn({}){ret_ann} {}",
+                fmt_params(params),
+                fmt_block_inline_typed(body, node_types, names, call_names)
+            )
         }
     };
-    let ty = node_types.get(&e.id).map(|t| fmt_ty_named(t, names)).unwrap_or_else(|| "?".to_string());
+    let ty = node_types
+        .get(&e.id)
+        .map(|t| fmt_ty_named(t, names))
+        .unwrap_or_else(|| "?".to_string());
     format!("{base}:{ty}")
 }
 
-fn fmt_expr_list_typed(exprs: &[Expr], node_types: &NodeTypes, names: &mut TyVarNames, call_names: &HashMap<NodeId, String>) -> String {
-    exprs.iter().map(|e| fmt_expr_typed(e, node_types, names, call_names)).collect::<Vec<_>>().join(", ")
+fn fmt_expr_list_typed(
+    exprs: &[Expr],
+    node_types: &NodeTypes,
+    names: &mut TyVarNames,
+    call_names: &HashMap<NodeId, String>,
+) -> String {
+    exprs
+        .iter()
+        .map(|e| fmt_expr_typed(e, node_types, names, call_names))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Like `print.rs`'s own `fmt_block_inline`, but every statement/tail inside
 /// is rendered via `fmt_expr_typed`.
-fn fmt_block_inline_typed(b: &Block, node_types: &NodeTypes, names: &mut TyVarNames, call_names: &HashMap<NodeId, String>) -> String {
+fn fmt_block_inline_typed(
+    b: &Block,
+    node_types: &NodeTypes,
+    names: &mut TyVarNames,
+    call_names: &HashMap<NodeId, String>,
+) -> String {
     let mut parts: Vec<String> = b
         .stmts
         .iter()
         .map(|s| match &s.kind {
-            StmtKind::Let { mutable, name, value, .. } => {
+            StmtKind::Let {
+                mutable,
+                name,
+                value,
+                ..
+            } => {
                 let mut_kw = if *mutable { "mut " } else { "" };
-                format!("let {mut_kw}{name} = {};", fmt_expr_typed(value, node_types, names, call_names))
+                format!(
+                    "let {mut_kw}{name} = {};",
+                    fmt_expr_typed(value, node_types, names, call_names)
+                )
             }
             StmtKind::Assign { target, value } => format!(
                 "{} = {};",
@@ -466,7 +638,10 @@ fn fmt_block_inline_typed(b: &Block, node_types: &NodeTypes, names: &mut TyVarNa
             ),
             StmtKind::Expr(e) => format!("{};", fmt_expr_typed(e, node_types, names, call_names)),
             StmtKind::Break(value) => match value {
-                Some(v) => format!("break {};", fmt_expr_typed(v, node_types, names, call_names)),
+                Some(v) => format!(
+                    "break {};",
+                    fmt_expr_typed(v, node_types, names, call_names)
+                ),
                 None => "break;".to_string(),
             },
         })

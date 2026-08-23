@@ -1,5 +1,10 @@
-﻿use cleave::ast::{Field, FileId, FnDecl, GenericParam, Item, ItemKind, Node, NodeId, Program, Span, StmtKind, StructDecl, Type, TypeKind, tuple_struct_name};
-use cleave::infer::{unify, ConstValue, Infer, Subst, Ty, TyVarGen, TypeErrorKind, check_mutability};
+use cleave::ast::{
+    Field, FileId, FnDecl, GenericParam, Item, ItemKind, Node, NodeId, Program, Span, StmtKind,
+    StructDecl, Type, TypeKind, tuple_struct_name,
+};
+use cleave::infer::{
+    ConstValue, Infer, Subst, Ty, TyVarGen, TypeErrorKind, check_mutability, unify,
+};
 use cleave::lower::Lowerer;
 use cleave::parser::{CleaveParser, Rule};
 use cleave::registry::Registry;
@@ -25,25 +30,52 @@ fn lower_program(src: &str) -> Program {
 /// safe here — this file's own `lower_program` always starts fresh at 0,
 /// and no test source anywhere near this file's own size could reach them.
 fn inject_tuple_struct(mut program: Program, arity: usize) -> Program {
-    let synthetic_span = Span { file: FileId(0), start: 0, end: 0 };
+    let synthetic_span = Span {
+        file: FileId(0),
+        start: 0,
+        end: 0,
+    };
     let generic_names: Vec<String> = (0..arity).map(|i| format!("T{i}")).collect();
-    let generics = generic_names.iter().map(|name| GenericParam::Type { name: name.clone(), bounds: Vec::new(), variadic: false }).collect();
+    let generics = generic_names
+        .iter()
+        .map(|name| GenericParam::Type {
+            name: name.clone(),
+            bounds: Vec::new(),
+            variadic: false,
+        })
+        .collect();
     let fields = generic_names
         .iter()
         .enumerate()
         .map(|(i, name)| Field {
             name: i.to_string(),
-            ty: Node { id: NodeId(900_000 + i as u32), span: synthetic_span, kind: TypeKind::Path(cleave::ast::Path::single(name.clone()), Vec::new()) },
+            ty: Node {
+                id: NodeId(900_000 + i as u32),
+                span: synthetic_span,
+                kind: TypeKind::Path(cleave::ast::Path::single(name.clone()), Vec::new()),
+            },
         })
         .collect();
-    let decl = StructDecl { name: tuple_struct_name(arity), generics, fields };
-    program.items.push(Item { id: NodeId(900_000 + 100 + arity as u32), span: synthetic_span, kind: ItemKind::Struct(decl) });
+    let decl = StructDecl {
+        name: tuple_struct_name(arity),
+        generics,
+        fields,
+    };
+    program.items.push(Item {
+        id: NodeId(900_000 + 100 + arity as u32),
+        span: synthetic_span,
+        kind: ItemKind::Struct(decl),
+    });
     program
 }
 
 fn lower_one_fn(src: &str) -> FnDecl {
     let program = lower_program(src);
-    assert_eq!(program.items.len(), 1, "expected exactly one item in {src:?}");
+    assert_eq!(
+        program.items.len(),
+        1,
+        "expected exactly one item in {src:?}"
+    );
     match program.items.into_iter().next().unwrap().kind {
         ItemKind::Fn(f) => f,
         other => panic!("expected a fn item, got {other:?}"),
@@ -56,7 +88,11 @@ fn lower_one_impl(src: &str) -> (String, Type, FnDecl, Span) {
     let program = lower_program(src);
     for item in program.items {
         if let ItemKind::Impl(d) = item.kind {
-            let f = d.fns.into_iter().next().expect("expected at least one fn in the impl");
+            let f = d
+                .fns
+                .into_iter()
+                .next()
+                .expect("expected at least one fn in the impl");
             return (d.algebra, d.target, f, item.span);
         }
     }
@@ -70,7 +106,11 @@ fn lower_one_inherent_impl(src: &str) -> (Type, Vec<GenericParam>, FnDecl, Span)
     let program = lower_program(src);
     for item in program.items {
         if let ItemKind::InherentImpl(d) = item.kind {
-            let f = d.fns.into_iter().next().expect("expected at least one fn in the impl");
+            let f = d
+                .fns
+                .into_iter()
+                .next()
+                .expect("expected at least one fn in the impl");
             return (d.target, d.generics, f, item.span);
         }
     }
@@ -142,7 +182,9 @@ fn infer_src(src: &str) -> Ty {
     let f = lower_one_fn(src);
     let registry = builtin_registry();
     let mut infer = Infer::new(&registry);
-    infer.infer_fn(&f).unwrap_or_else(|e| panic!("inference failed for {src:?}: {e:?}"))
+    infer
+        .infer_fn(&f)
+        .unwrap_or_else(|e| panic!("inference failed for {src:?}: {e:?}"))
 }
 
 #[test]
@@ -190,7 +232,10 @@ fn unconstrained_int_literal_defaults_to_i32() {
 #[test]
 fn a_bare_imaginary_literal_infers_as_a_complex_type() {
     let ty = infer_src("fn f() { 4i }");
-    assert_eq!(ty, Ty::App("Complex".to_string(), vec![Ty::Con("f32".to_string())]));
+    assert_eq!(
+        ty,
+        Ty::App("Complex".to_string(), vec![Ty::Con("f32".to_string())])
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -240,7 +285,11 @@ fn a_genuinely_unresolvable_bases_field_access_still_fails_cleanly() {
         "f",
     )
     .unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::Unify(_)), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::Unify(_)),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 /// A real gap, previously confirmed by direct testing (`error: type
@@ -256,7 +305,9 @@ fn a_genuinely_unresolvable_bases_field_access_still_fails_cleanly() {
 /// back to what the body actually computed afterward.
 #[test]
 fn a_let_bound_lambda_can_call_itself_recursively() {
-    let ty = infer_src("fn f() -> i32 { let fact = fn(n) { if n <= 1 { 1 } else { n * fact(n - 1) } }; fact(5) }");
+    let ty = infer_src(
+        "fn f() -> i32 { let fact = fn(n) { if n <= 1 { 1 } else { n * fact(n - 1) } }; fact(5) }",
+    );
     assert_eq!(ty, Ty::Con("i32".to_string()));
 }
 
@@ -281,19 +332,29 @@ fn a_let_bound_lambdas_self_recursive_call_still_ties_back_when_its_own_result_i
     let f = lower_one_fn("fn f() -> i32 { let g = fn(n: i32) -> i32 { g(n - 1); n }; g(5) }");
     let registry = builtin_registry();
     let mut infer = Infer::new(&registry);
-    infer.infer_fn(&f).unwrap_or_else(|e| panic!("inference failed: {e:?}"));
+    infer
+        .infer_fn(&f)
+        .unwrap_or_else(|e| panic!("inference failed: {e:?}"));
     let recursive_call_ty = infer
         .node_types
         .values()
         .find(|t| matches!(t, Ty::Con(s) if s == "i32"))
-        .unwrap_or_else(|| panic!("expected at least one concretely-resolved i32 node, got {:?}", infer.node_types));
+        .unwrap_or_else(|| {
+            panic!(
+                "expected at least one concretely-resolved i32 node, got {:?}",
+                infer.node_types
+            )
+        });
     assert_eq!(recursive_call_ty, &Ty::Con("i32".to_string()));
     // Every node reachable from the lambda's own body must have resolved
     // concretely -- a leftover `Ty::Var` anywhere here specifically means
     // the tie-back didn't propagate through the explicitly-annotated
     // (hence non-generalizable-as-open) function type.
     for (id, ty) in &infer.node_types {
-        assert!(!matches!(ty, Ty::Var(_)), "node {id:?} left as an unresolved Ty::Var({ty}) after inference claimed success");
+        assert!(
+            !matches!(ty, Ty::Var(_)),
+            "node {id:?} left as an unresolved Ty::Var({ty}) after inference claimed success"
+        );
     }
 }
 
@@ -315,13 +376,19 @@ fn assert_no_corrupted_array_size(ty: &Ty, context: &str) {
             assert_no_corrupted_array_size(elem, context);
             assert_no_corrupted_array_size(size, context);
         }
-        Ty::App(_, args) => args.iter().for_each(|a| assert_no_corrupted_array_size(a, context)),
+        Ty::App(_, args) => args
+            .iter()
+            .for_each(|a| assert_no_corrupted_array_size(a, context)),
         Ty::Fn(params, ret) => {
-            params.iter().for_each(|p| assert_no_corrupted_array_size(p, context));
+            params
+                .iter()
+                .for_each(|p| assert_no_corrupted_array_size(p, context));
             assert_no_corrupted_array_size(ret, context);
         }
         Ty::Var(_) | Ty::Con(_) | Ty::Const(_) | Ty::Pack(_) | Ty::PackLen(_) => {}
-        Ty::PackResolved(elems) => elems.iter().for_each(|e| assert_no_corrupted_array_size(e, context)),
+        Ty::PackResolved(elems) => elems
+            .iter()
+            .for_each(|e| assert_no_corrupted_array_size(e, context)),
         Ty::ConstExpr(_, a, b) => {
             assert_no_corrupted_array_size(a, context);
             assert_no_corrupted_array_size(b, context);
@@ -343,7 +410,8 @@ fn assert_no_corrupted_array_size(ty: &Ty, context: &str) {
 /// place that same variable is used, including an entirely unrelated
 /// array's own declared size a few lines away.
 #[test]
-fn a_const_generic_named_as_the_start_of_a_for_loop_range_does_not_corrupt_an_unrelated_arrays_own_size() {
+fn a_const_generic_named_as_the_start_of_a_for_loop_range_does_not_corrupt_an_unrelated_arrays_own_size()
+ {
     let f = lower_one_fn(
         "fn f<const N: i64>() -> i64 {
             let arr = [0:i64; N];
@@ -354,7 +422,9 @@ fn a_const_generic_named_as_the_start_of_a_for_loop_range_does_not_corrupt_an_un
     );
     let registry = builtin_registry();
     let mut infer = Infer::new(&registry);
-    infer.infer_fn(&f).unwrap_or_else(|e| panic!("inference failed: {e:?}"));
+    infer
+        .infer_fn(&f)
+        .unwrap_or_else(|e| panic!("inference failed: {e:?}"));
     for (id, ty) in &infer.node_types {
         assert_no_corrupted_array_size(ty, &format!("node {id:?}"));
     }
@@ -375,7 +445,9 @@ fn a_const_generic_named_as_the_end_of_a_for_loop_range_still_works() {
     );
     let registry = builtin_registry();
     let mut infer = Infer::new(&registry);
-    infer.infer_fn(&f).unwrap_or_else(|e| panic!("inference failed: {e:?}"));
+    infer
+        .infer_fn(&f)
+        .unwrap_or_else(|e| panic!("inference failed: {e:?}"));
     for (id, ty) in &infer.node_types {
         assert_no_corrupted_array_size(ty, &format!("node {id:?}"));
     }
@@ -385,14 +457,26 @@ fn a_const_generic_named_as_the_end_of_a_for_loop_range_still_works() {
 /// `tests/monomorphize.rs`'s own `assert_fully_concrete`.
 fn assert_no_unresolved_var(ty: &Ty, context: &str) {
     match ty {
-        Ty::Var(v) => panic!("found an unresolved Ty::Var({v:?}) in {context} — inference claimed success but left this open"),
-        Ty::Pack(v) => panic!("found an unresolved Ty::Pack({v:?}) in {context} — inference claimed success but left this open"),
-        Ty::PackLen(v) => panic!("found an unresolved Ty::PackLen({v:?}) in {context} — inference claimed success but left this open"),
-        Ty::PackResolved(elems) => elems.iter().for_each(|e| assert_no_unresolved_var(e, context)),
+        Ty::Var(v) => panic!(
+            "found an unresolved Ty::Var({v:?}) in {context} — inference claimed success but left this open"
+        ),
+        Ty::Pack(v) => panic!(
+            "found an unresolved Ty::Pack({v:?}) in {context} — inference claimed success but left this open"
+        ),
+        Ty::PackLen(v) => panic!(
+            "found an unresolved Ty::PackLen({v:?}) in {context} — inference claimed success but left this open"
+        ),
+        Ty::PackResolved(elems) => elems
+            .iter()
+            .for_each(|e| assert_no_unresolved_var(e, context)),
         Ty::Con(_) | Ty::Const(_) => {}
-        Ty::App(_, args) => args.iter().for_each(|a| assert_no_unresolved_var(a, context)),
+        Ty::App(_, args) => args
+            .iter()
+            .for_each(|a| assert_no_unresolved_var(a, context)),
         Ty::Fn(params, ret) => {
-            params.iter().for_each(|p| assert_no_unresolved_var(p, context));
+            params
+                .iter()
+                .for_each(|p| assert_no_unresolved_var(p, context));
             assert_no_unresolved_var(ret, context);
         }
         Ty::Array(elem, size) => {
@@ -427,7 +511,9 @@ fn a_let_bound_literals_own_use_site_still_defaults_correctly() {
     let f = lower_one_fn("fn f() { let a = 16; let b = 4; let c = a + b; }");
     let registry = builtin_registry();
     let mut infer = Infer::new(&registry);
-    infer.infer_fn(&f).unwrap_or_else(|e| panic!("inference failed: {e:?}"));
+    infer
+        .infer_fn(&f)
+        .unwrap_or_else(|e| panic!("inference failed: {e:?}"));
     for (id, ty) in &infer.node_types {
         assert_no_unresolved_var(ty, &format!("node {id:?}"));
     }
@@ -453,7 +539,11 @@ fn two_literals_with_conflicting_shapes_merged_by_a_shared_generic_are_rejected(
     // from `1`'s own default), not by `apply_defaults` comparing the two
     // literals against each other directly â€” see `infer.rs`'s `NumberLit`
     // handling and `stdlib/num/num.cleave`.
-    assert!(matches!(err.kind, TypeErrorKind::MissingImpl { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::MissingImpl { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 /// `doc/backlog.md`'s own "Scheme satisfiability at generalization time"
@@ -471,7 +561,11 @@ fn a_generalized_let_bound_lambdas_own_conflicting_shape_constraints_are_rejecte
     let registry = builtin_registry();
     let mut infer = Infer::new(&registry);
     let err = infer.infer_fn(&f).unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::UnsatisfiableScheme { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::UnsatisfiableScheme { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -496,7 +590,11 @@ fn a_bare_int_shaped_literal_forced_into_a_float_context_is_now_rejected() {
     let registry = builtin_registry();
     let mut infer = Infer::new(&registry);
     let err = infer.infer_fn(&f).unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::MissingImpl { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::MissingImpl { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -558,7 +656,10 @@ fn if_branches_with_mismatched_types_are_rejected() {
     let f = lower_one_fn("fn f(c: bool) { if c { 1:i32 } else { 1.0:f64 } }");
     let registry = Registry::default();
     let mut infer = Infer::new(&registry);
-    assert!(infer.infer_fn(&f).is_err(), "i32 and f64 branches should not unify");
+    assert!(
+        infer.infer_fn(&f).is_err(),
+        "i32 and f64 branches should not unify"
+    );
 }
 
 #[test]
@@ -576,7 +677,13 @@ fn logical_ops_require_bool_operands() {
 #[test]
 fn lambda_infers_a_function_type() {
     let ty = infer_src("fn f() { fn(a: f64, b: f64) { a + b } }");
-    assert_eq!(ty, Ty::Fn(vec![Ty::Con("f64".to_string()), Ty::Con("f64".to_string())], Box::new(Ty::Con("f64".to_string()))));
+    assert_eq!(
+        ty,
+        Ty::Fn(
+            vec![Ty::Con("f64".to_string()), Ty::Con("f64".to_string())],
+            Box::new(Ty::Con("f64".to_string()))
+        )
+    );
 }
 
 #[test]
@@ -646,7 +753,11 @@ fn algebra_bound_inheritance_does_not_apply_to_an_unrelated_type() {
     let f = lower_one_fn("fn f<T: Num>(x: T) -> f64 { x }");
     let mut infer = Infer::new(&registry);
     let err = infer.infer_fn(&f).unwrap_err();
-    assert!(matches!(&err.kind, TypeErrorKind::MissingImpl { algebra, .. } if algebra == "Num"), "got: {:?}", err.kind);
+    assert!(
+        matches!(&err.kind, TypeErrorKind::MissingImpl { algebra, .. } if algebra == "Num"),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -658,7 +769,11 @@ fn cyclic_algebra_bounds_reject_cleanly_instead_of_looping_forever() {
     let f = lower_one_fn("fn f<T: A>(x: T) -> i32 { x }");
     let mut infer = Infer::new(&registry);
     let err = infer.infer_fn(&f).unwrap_err();
-    assert!(matches!(&err.kind, TypeErrorKind::MissingImpl { algebra, .. } if algebra == "A"), "got: {:?}", err.kind);
+    assert!(
+        matches!(&err.kind, TypeErrorKind::MissingImpl { algebra, .. } if algebra == "A"),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -741,7 +856,10 @@ fn lambda_declared_return_type_constrains_the_body() {
     let ty = infer.infer_fn(&f).unwrap();
     match ty {
         Ty::Fn(params, ret) => {
-            assert_eq!(params, vec![Ty::Con("f64".to_string()), Ty::Con("i32".to_string())]);
+            assert_eq!(
+                params,
+                vec![Ty::Con("f64".to_string()), Ty::Con("i32".to_string())]
+            );
             assert_eq!(*ret, Ty::Con("f64".to_string()));
         }
         other => panic!("expected a Ty::Fn, got {other:?}"),
@@ -759,7 +877,10 @@ fn calling_a_bound_lambda_with_wrong_arity_is_rejected() {
     let f = lower_one_fn("fn f() { let g = fn(a: f64, b: f64) { a }; g(1.0) }");
     let registry = Registry::default();
     let mut infer = Infer::new(&registry);
-    assert!(infer.infer_fn(&f).is_err(), "calling a 2-arg lambda with 1 arg must fail");
+    assert!(
+        infer.infer_fn(&f).is_err(),
+        "calling a 2-arg lambda with 1 arg must fail"
+    );
 }
 
 #[test]
@@ -777,7 +898,10 @@ fn lambda_params_do_not_leak_into_the_enclosing_scope() {
     let f = lower_one_fn("fn f() { let g = fn(a: f64) { a }; a }");
     let registry = Registry::default();
     let mut infer = Infer::new(&registry);
-    assert!(infer.infer_fn(&f).is_err(), "`a` must be unbound outside the lambda");
+    assert!(
+        infer.infer_fn(&f).is_err(),
+        "`a` must be unbound outside the lambda"
+    );
 }
 
 #[test]
@@ -787,7 +911,10 @@ fn let_inside_if_branch_does_not_leak_into_enclosing_scope() {
     let f = lower_one_fn("fn f(c: bool) { if c { let x = 1; x } else { 0 }; x }");
     let registry = Registry::default();
     let mut infer = Infer::new(&registry);
-    assert!(infer.infer_fn(&f).is_err(), "`x` must be unbound outside the if-branch that declared it");
+    assert!(
+        infer.infer_fn(&f).is_err(),
+        "`x` must be unbound outside the if-branch that declared it"
+    );
 }
 
 #[test]
@@ -819,7 +946,10 @@ fn let_mut_lambda_is_not_generalized() {
     let f = lower_one_fn("fn f() { let mut id = fn(x) { x }; let _a = id(1.0:f64); id(true) }");
     let registry = Registry::default();
     let mut infer = Infer::new(&registry);
-    assert!(infer.infer_fn(&f).is_err(), "a `let mut` lambda must not be usable at two different types");
+    assert!(
+        infer.infer_fn(&f).is_err(),
+        "a `let mut` lambda must not be usable at two different types"
+    );
 }
 
 #[test]
@@ -835,7 +965,10 @@ fn let_mut_reassignment_is_checked_against_the_original_type() {
     );
     let registry = Registry::default();
     let mut infer = Infer::new(&registry);
-    assert!(infer.infer_fn(&f).is_err(), "reassigning `id` to an incompatible function type must be rejected");
+    assert!(
+        infer.infer_fn(&f).is_err(),
+        "reassigning `id` to an incompatible function type must be rejected"
+    );
 }
 
 fn registry_from(src: &str) -> Registry {
@@ -864,7 +997,11 @@ fn operator_call_without_a_matching_impl_is_rejected() {
     let f = lower_one_fn("fn f(a: bool, b: bool) -> bool { a + b }");
     let mut infer = Infer::new(&registry);
     let err = infer.infer_fn(&f).unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::MissingImpl { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::MissingImpl { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -890,7 +1027,10 @@ fn missing_impl_against_unit_hints_at_a_discarded_tail() {
     let mut infer = Infer::new(&registry);
     let err = infer.infer_fn(&f).unwrap_err();
     let message = err.kind.to_string();
-    assert!(message.contains("no `impl") && message.contains("<()>`"), "got: {message}");
+    assert!(
+        message.contains("no `impl") && message.contains("<()>`"),
+        "got: {message}"
+    );
     assert!(message.contains("discarding its value"), "got: {message}");
 }
 
@@ -901,7 +1041,10 @@ fn unify_mismatch_against_a_found_unit_hints_at_a_discarded_tail() {
     let mut infer = Infer::new(&registry);
     let err = infer.infer_fn(&f).unwrap_err();
     let message = err.kind.to_string();
-    assert!(message.contains("expected `i32`, found `()`"), "got: {message}");
+    assert!(
+        message.contains("expected `i32`, found `()`"),
+        "got: {message}"
+    );
     assert!(message.contains("discarding its value"), "got: {message}");
 }
 
@@ -919,7 +1062,10 @@ fn unify_mismatch_against_an_expected_unit_does_not_hint() {
     let mut infer = Infer::new(&registry);
     let err = infer.infer_fn(&f).unwrap_err();
     let message = err.kind.to_string();
-    assert!(message.contains("expected `()`, found `i32`"), "got: {message}");
+    assert!(
+        message.contains("expected `()`, found `i32`"),
+        "got: {message}"
+    );
     assert!(!message.contains("discarding its value"), "got: {message}");
 }
 
@@ -974,7 +1120,11 @@ fn unqualified_call_between_colliding_algebras_still_rejects_as_ambiguous() {
         fn f(a: i32, b: i32) -> i32 { add(a, b) }
     ";
     let err = infer_fn_named(src, "f").unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::AmbiguousOperator { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::AmbiguousOperator { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -985,7 +1135,11 @@ fn qualified_call_naming_a_method_the_algebra_does_not_declare_is_rejected() {
         fn f(a: i32, b: i32) -> i32 { Ring::multiply(a, b) }
     ";
     let err = infer_fn_named(src, "f").unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::UnknownAlgebraMethod { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::UnknownAlgebraMethod { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -995,7 +1149,11 @@ fn a_two_segment_path_whose_first_segment_is_not_an_algebra_falls_through_unaffe
     // as `UnknownAlgebraMethod`; it falls through to ordinary unresolved-call
     // handling instead, unchanged from before this feature existed.
     let err = infer_fn_named("fn f() -> i32 { Ring::whatever(1) }", "f").unwrap_err();
-    assert!(!matches!(err.kind, TypeErrorKind::UnknownAlgebraMethod { .. }), "got: {:?}", err.kind);
+    assert!(
+        !matches!(err.kind, TypeErrorKind::UnknownAlgebraMethod { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -1029,7 +1187,11 @@ fn numeric_literal_rejected_when_unified_with_a_non_numeric_type_and_num_is_regi
     let f = lower_one_fn("fn f(a: bool) -> bool { let x = 1; x + a }");
     let mut infer = Infer::new(&registry);
     let err = infer.infer_fn(&f).unwrap_err();
-    assert!(matches!(&err.kind, TypeErrorKind::MissingImpl { algebra, .. } if algebra == "Num"), "got: {:?}", err.kind);
+    assert!(
+        matches!(&err.kind, TypeErrorKind::MissingImpl { algebra, .. } if algebra == "Num"),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -1059,7 +1221,11 @@ fn generalized_lambda_carries_its_algebra_constraint_to_call_sites() {
     let f = lower_one_fn("fn f() { let g = fn(x) { x + x }; g(true) }");
     let mut infer = Infer::new(&registry);
     let err = infer.infer_fn(&f).unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::MissingImpl { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::MissingImpl { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -1087,7 +1253,11 @@ fn operator_with_zero_candidates_is_rejected_not_permissive() {
     let f = lower_one_fn("fn f(a: f64, b: f64) { a + b }");
     let mut infer = Infer::new(&registry);
     let err = infer.infer_fn(&f).unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::Unresolved(ref p) if p == "<unresolved-call:add>"), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::Unresolved(ref p) if p == "<unresolved-call:add>"),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -1100,7 +1270,11 @@ fn unresolved_call_surviving_to_the_final_type_is_rejected() {
     let registry = Registry::default();
     let mut infer = Infer::new(&registry);
     let err = infer.infer_fn(&f).unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::Unresolved(_)), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::Unresolved(_)),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -1155,7 +1329,11 @@ fn calling_a_non_function_binding_is_not_callable() {
     let registry = Registry::default();
     let mut infer = Infer::new(&registry);
     let err = infer.infer_fn(&f).unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::NotCallable(_)), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::NotCallable(_)),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -1163,7 +1341,10 @@ fn unknown_identifier_is_reported() {
     let f = lower_one_fn("fn f() { y }");
     let registry = Registry::default();
     let mut infer = Infer::new(&registry);
-    assert!(infer.infer_fn(&f).is_err(), "unbound identifier `y` must be rejected");
+    assert!(
+        infer.infer_fn(&f).is_err(),
+        "unbound identifier `y` must be rejected"
+    );
 }
 
 #[test]
@@ -1172,7 +1353,10 @@ fn param_types_are_resolved_for_unannotated_params() {
     let registry = builtin_registry();
     let mut infer = Infer::new(&registry);
     infer.infer_fn(&f).unwrap_or_else(|e| panic!("{e:?}"));
-    assert_eq!(infer.param_types, vec![Ty::Con("f64".to_string()), Ty::Con("f64".to_string())]);
+    assert_eq!(
+        infer.param_types,
+        vec![Ty::Con("f64".to_string()), Ty::Con("f64".to_string())]
+    );
 }
 
 #[test]
@@ -1186,8 +1370,17 @@ fn node_types_records_every_subexpression_fully_resolved() {
     let registry = Registry::default();
     let mut infer = Infer::new(&registry);
     infer.infer_fn(&f).unwrap_or_else(|e| panic!("{e:?}"));
-    let tail = f.body.as_ref().unwrap().tail.as_deref().expect("expected a tail expression");
-    assert_eq!(infer.node_types.get(&tail.id), Some(&Ty::Con("f64".to_string())));
+    let tail = f
+        .body
+        .as_ref()
+        .unwrap()
+        .tail
+        .as_deref()
+        .expect("expected a tail expression");
+    assert_eq!(
+        infer.node_types.get(&tail.id),
+        Some(&Ty::Con("f64".to_string()))
+    );
 }
 
 #[test]
@@ -1202,8 +1395,13 @@ fn impl_method_unannotated_params_are_seeded_from_the_algebra_signature() {
          impl TestAlg<i32> { fn add(x, y) { x } }",
     );
     let mut infer = Infer::new(&registry);
-    let ret = infer.infer_impl_fn(&algebra, &target, &f, span).unwrap_or_else(|e| panic!("{e:?}"));
-    assert_eq!(infer.param_types, vec![Ty::Con("i32".to_string()), Ty::Con("i32".to_string())]);
+    let ret = infer
+        .infer_impl_fn(&algebra, &target, &f, span)
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(
+        infer.param_types,
+        vec![Ty::Con("i32".to_string()), Ty::Con("i32".to_string())]
+    );
     assert_eq!(ret, Ty::Con("i32".to_string()));
 }
 
@@ -1230,8 +1428,14 @@ fn impl_method_not_declared_by_the_algebra_is_rejected() {
          impl TestAlg<i32> { fn multiply(x: i32, y: i32) -> i32 { x } }",
     );
     let mut infer = Infer::new(&registry);
-    let err = infer.infer_impl_fn(&algebra, &target, &f, span).unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::NotDeclaredByAlgebra { .. }), "got: {:?}", err.kind);
+    let err = infer
+        .infer_impl_fn(&algebra, &target, &f, span)
+        .unwrap_err();
+    assert!(
+        matches!(err.kind, TypeErrorKind::NotDeclaredByAlgebra { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -1242,8 +1446,14 @@ fn impl_method_arity_mismatch_against_the_algebra_is_rejected() {
          impl TestAlg<i32> { fn add(x: i32, y: i32, z: i32) -> i32 { x } }",
     );
     let mut infer = Infer::new(&registry);
-    let err = infer.infer_impl_fn(&algebra, &target, &f, span).unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::ArityMismatch { .. }), "got: {:?}", err.kind);
+    let err = infer
+        .infer_impl_fn(&algebra, &target, &f, span)
+        .unwrap_err();
+    assert!(
+        matches!(err.kind, TypeErrorKind::ArityMismatch { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -1258,12 +1468,19 @@ fn impl_method_arity_mismatch_against_the_algebra_is_rejected() {
 
 #[test]
 fn a_bodyless_inherent_method_is_rejected() {
-    let (target, generics, f, span) =
-        lower_one_inherent_impl("struct Vec2 { x: f64, y: f64 } impl struct Vec2 { fn len(v) -> f64; }");
+    let (target, generics, f, span) = lower_one_inherent_impl(
+        "struct Vec2 { x: f64, y: f64 } impl struct Vec2 { fn len(v) -> f64; }",
+    );
     let registry = builtin_registry();
     let mut infer = Infer::new(&registry);
-    let err = infer.infer_inherent_impl_fn_generic(&cleave::infer::Env::new(), &generics, &target, &f, span).unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::MissingFnBody { .. }), "got: {:?}", err.kind);
+    let err = infer
+        .infer_inherent_impl_fn_generic(&cleave::infer::Env::new(), &generics, &target, &f, span)
+        .unwrap_err();
+    assert!(
+        matches!(err.kind, TypeErrorKind::MissingFnBody { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -1274,8 +1491,14 @@ fn a_bodyless_algebra_impl_method_with_no_attribute_is_rejected() {
          impl TestAlg<i32> { fn add(x: i32, y: i32) -> i32; }",
     );
     let mut infer = Infer::new(&registry);
-    let err = infer.infer_impl_fn(&algebra, &target, &f, span).unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::MissingIntrinsicAttribute { .. }), "got: {:?}", err.kind);
+    let err = infer
+        .infer_impl_fn(&algebra, &target, &f, span)
+        .unwrap_err();
+    assert!(
+        matches!(err.kind, TypeErrorKind::MissingIntrinsicAttribute { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -1350,13 +1573,21 @@ fn struct_lit_field_value_is_checked_against_its_declared_type() {
         "f",
     )
     .unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::Unify(_)), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::Unify(_)),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
 fn struct_lit_naming_an_unknown_struct_is_rejected() {
     let err = infer_fn_named("fn f() { Vec2(x: 1.0, y: 2.0) }", "f").unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::UnknownStruct(_)), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::UnknownStruct(_)),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -1415,7 +1646,10 @@ fn generic_struct_lit_infers_its_own_type_argument_from_field_values() {
         "f",
     )
     .unwrap();
-    assert_eq!(ty, Ty::App("Pair".to_string(), vec![Ty::Con("f64".to_string())]));
+    assert_eq!(
+        ty,
+        Ty::App("Pair".to_string(), vec![Ty::Con("f64".to_string())])
+    );
 }
 
 #[test]
@@ -1457,7 +1691,11 @@ fn declaring_a_generic_struct_return_type_without_its_own_type_argument_is_a_rea
         "f",
     )
     .unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::Unify(_)), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::Unify(_)),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -1499,7 +1737,11 @@ fn field_access_on_a_generic_struct_still_abstract_type_argument_stays_that_vari
     // function's own exposed type correctly gets rejected as unresolved â€”
     // matches `field_access_on_a_still_abstract_base_stays_a_placeholder_not_an_error`'s
     // own reasoning for the non-generic case.
-    assert!(matches!(err.kind, TypeErrorKind::Unresolved(_)), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::Unresolved(_)),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -1520,7 +1762,11 @@ fn field_access_naming_an_undeclared_field_is_rejected() {
 #[test]
 fn field_access_on_a_non_struct_concrete_type_is_rejected() {
     let err = infer_fn_named("fn f(x: i32) -> i32 { x.foo }", "f").unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::NoSuchField { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::NoSuchField { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -1537,8 +1783,13 @@ fn field_access_on_a_still_abstract_base_stays_a_placeholder_not_an_error() {
     let mut infer = Infer::new(&registry);
     infer.infer_fn(&f).unwrap_or_else(|e| panic!("{e:?}"));
     let field_access = &f.body.as_ref().unwrap().stmts[0];
-    let StmtKind::Expr(e) = &field_access.kind else { panic!("expected an Expr statement") };
-    assert_eq!(infer.node_types.get(&e.id), Some(&Ty::Con("<not-yet-inferred>".to_string())));
+    let StmtKind::Expr(e) = &field_access.kind else {
+        panic!("expected an Expr statement")
+    };
+    assert_eq!(
+        infer.node_types.get(&e.id),
+        Some(&Ty::Con("<not-yet-inferred>".to_string()))
+    );
 }
 
 #[test]
@@ -1593,8 +1844,13 @@ fn an_impl_target_generic_left_undeclared_on_the_impl_itself_is_treated_as_a_bog
         }
     };
     let mut infer = Infer::new(&registry);
-    infer.infer_impl_fn_generic(&algebra, &generics, &target, &f, span).unwrap();
-    assert_eq!(infer.param_types, vec![Ty::App("Complex".to_string(), vec![Ty::Con("T".to_string())]); 2]);
+    infer
+        .infer_impl_fn_generic(&algebra, &generics, &target, &f, span)
+        .unwrap();
+    assert_eq!(
+        infer.param_types,
+        vec![Ty::App("Complex".to_string(), vec![Ty::Con("T".to_string())]); 2]
+    );
 }
 
 #[test]
@@ -1632,12 +1888,17 @@ fn an_impl_declaring_its_own_generic_resolves_the_target_generic_to_a_fresh_vari
         }
     };
     let mut infer = Infer::new(&registry);
-    infer.infer_impl_fn_generic(&algebra, &generics, &target, &f, span).unwrap();
+    infer
+        .infer_impl_fn_generic(&algebra, &generics, &target, &f, span)
+        .unwrap();
     match &infer.param_types[..] {
         [Ty::App(name, args), Ty::App(name2, args2)] => {
             assert_eq!(name, "Complex");
             assert_eq!(name2, "Complex");
-            assert!(matches!(args.as_slice(), [Ty::Var(_)]), "expected a fresh var, got {args:?}");
+            assert!(
+                matches!(args.as_slice(), [Ty::Var(_)]),
+                "expected a fresh var, got {args:?}"
+            );
             assert_eq!(args, args2, "both params should share the same fresh var");
         }
         other => panic!("expected two App(\"Complex\", [Var(_)]) param types, got {other:?}"),
@@ -1668,18 +1929,40 @@ fn a_generic_impls_own_generic_is_not_defaulted_away_by_a_body_literal() {
     let registry = registry_from(src);
     let program = lower_program(src);
     let (algebra, generics, target, extra_targets, f, span) = {
-        let item = program.items.into_iter().find(|item| matches!(&item.kind, ItemKind::Impl(d) if d.algebra == "Widen")).unwrap();
+        let item = program
+            .items
+            .into_iter()
+            .find(|item| matches!(&item.kind, ItemKind::Impl(d) if d.algebra == "Widen"))
+            .unwrap();
         match item.kind {
-            ItemKind::Impl(d) => (d.algebra, d.generics, d.target, d.extra_targets, d.fns.into_iter().next().unwrap(), item.span),
+            ItemKind::Impl(d) => (
+                d.algebra,
+                d.generics,
+                d.target,
+                d.extra_targets,
+                d.fns.into_iter().next().unwrap(),
+                item.span,
+            ),
             other => panic!("expected impl, got {other:?}"),
         }
     };
     let all_targets: Vec<Type> = std::iter::once(target).chain(extra_targets).collect();
     let mut infer = Infer::new(&registry);
     infer
-        .infer_impl_fn_generic_with_env(&cleave::infer::Env::new(), &algebra, &generics, &all_targets, &f, span)
+        .infer_impl_fn_generic_with_env(
+            &cleave::infer::Env::new(),
+            &algebra,
+            &generics,
+            &all_targets,
+            &f,
+            span,
+        )
         .unwrap();
-    assert!(matches!(infer.param_types.as_slice(), [Ty::Var(_)]), "expected a fresh var, got {:?}", infer.param_types);
+    assert!(
+        matches!(infer.param_types.as_slice(), [Ty::Var(_)]),
+        "expected a fresh var, got {:?}",
+        infer.param_types
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -1689,7 +1972,13 @@ fn a_generic_impls_own_generic_is_not_defaulted_away_by_a_body_literal() {
 #[test]
 fn array_literal_infers_element_type_and_literal_size() {
     let ty = infer_src("fn f() -> [i32; 3] { [1, 2, 3] }");
-    assert_eq!(ty, Ty::Array(Box::new(Ty::Con("i32".to_string())), Box::new(Ty::Const(ConstValue::Int(3)))));
+    assert_eq!(
+        ty,
+        Ty::Array(
+            Box::new(Ty::Con("i32".to_string())),
+            Box::new(Ty::Const(ConstValue::Int(3)))
+        )
+    );
 }
 
 #[test]
@@ -1697,7 +1986,10 @@ fn empty_array_literal_has_size_zero_and_an_unconstrained_element_type() {
     let ty = infer_src("fn f() { [] }");
     match ty {
         Ty::Array(elem, size) => {
-            assert!(matches!(*elem, Ty::Var(_)), "expected an unconstrained element var, got {elem:?}");
+            assert!(
+                matches!(*elem, Ty::Var(_)),
+                "expected an unconstrained element var, got {elem:?}"
+            );
             assert_eq!(*size, Ty::Const(ConstValue::Int(0)));
         }
         other => panic!("expected an Array, got {other:?}"),
@@ -1709,7 +2001,10 @@ fn array_literal_with_mismatched_element_types_is_rejected() {
     let f = lower_one_fn("fn f() { [1, true] }");
     let registry = builtin_registry();
     let mut infer = Infer::new(&registry);
-    assert!(infer.infer_fn(&f).is_err(), "an int and a bool must not unify as one array's element type");
+    assert!(
+        infer.infer_fn(&f).is_err(),
+        "an int and a bool must not unify as one array's element type"
+    );
 }
 
 #[test]
@@ -1724,7 +2019,11 @@ fn indexing_a_non_array_is_rejected() {
     let registry = builtin_registry();
     let mut infer = Infer::new(&registry);
     let err = infer.infer_fn(&f).unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::Unify(_)), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::Unify(_)),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -1738,7 +2037,11 @@ fn indexing_with_a_non_integer_index_is_rejected() {
     let registry = builtin_registry();
     let mut infer = Infer::new(&registry);
     let err = infer.infer_fn(&f).unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::MissingImpl { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::MissingImpl { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -1754,7 +2057,11 @@ fn indexing_an_unresolved_base_defers_as_not_yet_inferred() {
     let registry = builtin_registry();
     let mut infer = Infer::new(&registry);
     let err = infer.infer_fn(&f).unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::Unresolved(_)), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::Unresolved(_)),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -1777,7 +2084,11 @@ fn arrays_of_different_literal_sizes_do_not_unify() {
     let registry = builtin_registry();
     let mut infer = Infer::new(&registry);
     let err = infer.infer_fn(&f).unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::Unify(_)), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::Unify(_)),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -1789,13 +2100,23 @@ fn a_declared_array_return_type_checks_the_literals_actual_size() {
     let registry = builtin_registry();
     let mut infer = Infer::new(&registry);
     let err = infer.infer_fn(&f).unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::Unify(_)), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::Unify(_)),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
 fn an_array_type_annotation_with_a_literal_size_round_trips() {
     let ty = infer_src("fn f(a: [f64; 4]) -> [f64; 4] { a }");
-    assert_eq!(ty, Ty::Array(Box::new(Ty::Con("f64".to_string())), Box::new(Ty::Const(ConstValue::Int(4)))));
+    assert_eq!(
+        ty,
+        Ty::Array(
+            Box::new(Ty::Con("f64".to_string())),
+            Box::new(Ty::Const(ConstValue::Int(4)))
+        )
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -1806,7 +2127,13 @@ fn an_array_type_annotation_with_a_literal_size_round_trips() {
 #[test]
 fn a_literal_arithmetic_array_size_folds_to_a_concrete_const() {
     let ty = infer_src("fn f(a: [f64; 4+3]) -> [f64; 7] { a }");
-    assert_eq!(ty, Ty::Array(Box::new(Ty::Con("f64".to_string())), Box::new(Ty::Const(ConstValue::Int(7)))));
+    assert_eq!(
+        ty,
+        Ty::Array(
+            Box::new(Ty::Con("f64".to_string())),
+            Box::new(Ty::Const(ConstValue::Int(7)))
+        )
+    );
 }
 
 #[test]
@@ -1818,7 +2145,11 @@ fn a_folded_literal_array_size_still_rejects_a_real_mismatch() {
     let registry = builtin_registry();
     let mut infer = Infer::new(&registry);
     let err = infer.infer_fn(&f).unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::Unify(_)), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::Unify(_)),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -1862,7 +2193,11 @@ fn a_const_generic_type_annotation_builds_positional_app_args() {
         ty,
         Ty::App(
             "Matrix".to_string(),
-            vec![Ty::Con("f64".to_string()), Ty::Const(ConstValue::Int(3)), Ty::Const(ConstValue::Int(4))],
+            vec![
+                Ty::Con("f64".to_string()),
+                Ty::Const(ConstValue::Int(3)),
+                Ty::Const(ConstValue::Int(4))
+            ],
         )
     );
 }
@@ -1881,7 +2216,13 @@ fn a_structs_const_generic_is_inferred_from_the_constructed_arrays_actual_size()
         "f",
     )
     .unwrap();
-    assert_eq!(ty, Ty::App("Vec".to_string(), vec![Ty::Con("i32".to_string()), Ty::Const(ConstValue::Int(3))]));
+    assert_eq!(
+        ty,
+        Ty::App(
+            "Vec".to_string(),
+            vec![Ty::Con("i32".to_string()), Ty::Const(ConstValue::Int(3))]
+        )
+    );
 }
 
 #[test]
@@ -1903,7 +2244,13 @@ fn an_algebras_own_const_generic_ties_correctly_between_its_param_and_return_typ
         "f",
     )
     .unwrap_or_else(|e| panic!("{e:?}"));
-    assert_eq!(ty, Ty::Array(Box::new(Ty::Con("i32".to_string())), Box::new(Ty::Const(ConstValue::Int(3)))));
+    assert_eq!(
+        ty,
+        Ty::Array(
+            Box::new(Ty::Con("i32".to_string())),
+            Box::new(Ty::Const(ConstValue::Int(3)))
+        )
+    );
 }
 
 #[test]
@@ -1914,7 +2261,11 @@ fn a_structs_const_generic_mismatch_against_the_declared_return_type_is_rejected
         "f",
     )
     .unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::Unify(_)), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::Unify(_)),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -1930,7 +2281,13 @@ fn field_access_on_a_struct_with_a_const_generic_resolves_the_type_generic_field
         "f",
     )
     .unwrap();
-    assert_eq!(ty, Ty::Array(Box::new(Ty::Con("i32".to_string())), Box::new(Ty::Const(ConstValue::Int(3)))));
+    assert_eq!(
+        ty,
+        Ty::Array(
+            Box::new(Ty::Con("i32".to_string())),
+            Box::new(Ty::Const(ConstValue::Int(3)))
+        )
+    );
 }
 
 #[test]
@@ -1949,7 +2306,13 @@ fn a_const_generic_is_not_forced_to_be_int_just_by_being_declared() {
     .unwrap();
     assert_eq!(
         ty,
-        Ty::App("Flagged".to_string(), vec![Ty::Con("i32".to_string()), Ty::Const(ConstValue::Bool(true))])
+        Ty::App(
+            "Flagged".to_string(),
+            vec![
+                Ty::Con("i32".to_string()),
+                Ty::Const(ConstValue::Bool(true))
+            ]
+        )
     );
 }
 
@@ -1974,7 +2337,13 @@ fn a_struct_field_array_size_computed_from_two_const_generics_resolves_via_turbo
         "f",
     )
     .unwrap_or_else(|e| panic!("{e:?}"));
-    assert_eq!(ty, Ty::App("Buf".to_string(), vec![Ty::Const(ConstValue::Int(2)), Ty::Const(ConstValue::Int(3))]));
+    assert_eq!(
+        ty,
+        Ty::App(
+            "Buf".to_string(),
+            vec![Ty::Const(ConstValue::Int(2)), Ty::Const(ConstValue::Int(3))]
+        )
+    );
 }
 
 #[test]
@@ -1987,11 +2356,16 @@ fn a_generic_functions_own_array_size_expression_stays_symbolic_until_concrete()
     let f = lower_one_fn("fn f<const N: i32, const M: i32>(x: [i32; N+M]) -> i32 { x[0] }");
     let registry = builtin_registry();
     let mut infer = Infer::new(&registry);
-    infer.infer_fn(&f).unwrap_or_else(|e| panic!("inference failed: {e:?}"));
+    infer
+        .infer_fn(&f)
+        .unwrap_or_else(|e| panic!("inference failed: {e:?}"));
     match &infer.param_types[0] {
         Ty::Array(elem, size) => {
             assert_eq!(**elem, Ty::Con("i32".to_string()));
-            assert!(matches!(size.as_ref(), Ty::ConstExpr(op, _, _) if op == "add"), "expected a symbolic ConstExpr, got {size:?}");
+            assert!(
+                matches!(size.as_ref(), Ty::ConstExpr(op, _, _) if op == "add"),
+                "expected a symbolic ConstExpr, got {size:?}"
+            );
         }
         other => panic!("expected an array param type, got {other:?}"),
     }
@@ -2010,7 +2384,11 @@ fn an_underdetermined_const_generic_sum_is_a_clean_mismatch_not_a_placeholder() 
         "f",
     )
     .unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::Unify(_)), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::Unify(_)),
+        "got: {:?}",
+        err.kind
+    );
     let msg = err.kind.to_string();
     assert!(!msg.contains("not-yet-inferred"), "got: {msg}");
 }
@@ -2026,7 +2404,11 @@ fn a_bool_literal_used_directly_as_an_array_size_is_rejected() {
     let registry = builtin_registry();
     let mut infer = Infer::new(&registry);
     let err = infer.infer_fn(&f).unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::Unresolved(_)), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::Unresolved(_)),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -2039,7 +2421,13 @@ fn a_const_generics_declared_type_satisfying_int_is_accepted() {
         "f",
     )
     .unwrap();
-    assert_eq!(ty, Ty::App("Vec".to_string(), vec![Ty::Con("i32".to_string()), Ty::Const(ConstValue::Int(3))]));
+    assert_eq!(
+        ty,
+        Ty::App(
+            "Vec".to_string(),
+            vec![Ty::Con("i32".to_string()), Ty::Const(ConstValue::Int(3))]
+        )
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -2076,7 +2464,11 @@ fn overlapping_generic_impls_of_the_same_algebra_are_rejected() {
     let mut infer = Infer::new(&registry);
     let errors = infer.check_no_overlapping_impls();
     assert_eq!(errors.len(), 1, "got: {errors:?}");
-    assert!(matches!(errors[0].kind, TypeErrorKind::OverlappingImpls { .. }), "got: {:?}", errors[0].kind);
+    assert!(
+        matches!(errors[0].kind, TypeErrorKind::OverlappingImpls { .. }),
+        "got: {:?}",
+        errors[0].kind
+    );
 }
 
 #[test]
@@ -2186,7 +2578,11 @@ fn a_const_generics_own_declared_type_naming_an_algebra_instead_of_a_type_is_rej
 fn a_literal_division_by_zero_in_an_array_size_is_rejected() {
     let src = "fn f(x: [i32; 4 / 0]) -> i32 { 0 }";
     let err = infer_fn_named(src, "f").unwrap_err();
-    assert!(matches!(&err.kind, TypeErrorKind::ConstDivByZero { dividend } if *dividend == 4), "got: {:?}", err.kind);
+    assert!(
+        matches!(&err.kind, TypeErrorKind::ConstDivByZero { dividend } if *dividend == 4),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 /// The non-zero-divisor counterpart — confirms `div` support itself works
@@ -2195,7 +2591,8 @@ fn a_literal_division_by_zero_in_an_array_size_is_rejected() {
 #[test]
 fn a_literal_division_in_an_array_size_folds_correctly() {
     let src = "fn f(x: [i32; 8 / 2]) -> i32 { x[0] }";
-    let ty = infer_fn_named(src, "f").unwrap_or_else(|e| panic!("expected this to type-check, got {e:?}"));
+    let ty = infer_fn_named(src, "f")
+        .unwrap_or_else(|e| panic!("expected this to type-check, got {e:?}"));
     assert_eq!(ty.to_string(), "i32");
 }
 
@@ -2226,7 +2623,11 @@ fn turbofish_conflicting_with_the_arguments_own_type_is_rejected() {
     let registry = builtin_registry();
     let mut infer = Infer::new(&registry);
     let err = infer.infer_fn(&f).unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::Unify(_)), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::Unify(_)),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -2235,7 +2636,11 @@ fn turbofish_arity_mismatch_against_a_generic_lambda_is_rejected() {
     let registry = builtin_registry();
     let mut infer = Infer::new(&registry);
     let err = infer.infer_fn(&f).unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::ArityMismatch { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::ArityMismatch { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -2249,7 +2654,13 @@ fn turbofish_on_struct_construction_pins_type_and_const_generics() {
         "f",
     )
     .unwrap();
-    assert_eq!(ty, Ty::App("Vec".to_string(), vec![Ty::Con("f64".to_string()), Ty::Const(ConstValue::Int(3))]));
+    assert_eq!(
+        ty,
+        Ty::App(
+            "Vec".to_string(),
+            vec![Ty::Con("f64".to_string()), Ty::Const(ConstValue::Int(3))]
+        )
+    );
 }
 
 #[test]
@@ -2269,7 +2680,11 @@ fn turbofish_on_struct_construction_forcing_a_bare_int_literal_into_float_is_sti
         "f",
     )
     .unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::MissingImpl { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::MissingImpl { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -2280,7 +2695,11 @@ fn turbofish_on_struct_construction_arity_mismatch_is_rejected() {
         "f",
     )
     .unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::ArityMismatch { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::ArityMismatch { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -2291,7 +2710,11 @@ fn turbofish_on_struct_construction_conflicting_with_the_field_values_size_is_re
         "f",
     )
     .unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::Unify(_)), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::Unify(_)),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -2312,7 +2735,10 @@ fn a_while_loops_condition_must_be_bool() {
     let f = lower_one_fn("fn f() { while 1 { 2 } }");
     let registry = builtin_registry();
     let mut infer = Infer::new(&registry);
-    assert!(infer.infer_fn(&f).is_err(), "a non-bool condition must be rejected");
+    assert!(
+        infer.infer_fn(&f).is_err(),
+        "a non-bool condition must be rejected"
+    );
 }
 
 #[test]
@@ -2330,7 +2756,11 @@ fn a_for_loops_start_and_end_must_agree_in_type() {
     let registry = builtin_registry();
     let mut infer = Infer::new(&registry);
     let err = infer.infer_fn(&f).unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::MissingImpl { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::MissingImpl { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -2338,7 +2768,10 @@ fn a_for_loops_variable_does_not_leak_into_the_enclosing_scope() {
     let f = lower_one_fn("fn f() { for i in 0..10 { i }; i }");
     let registry = builtin_registry();
     let mut infer = Infer::new(&registry);
-    assert!(infer.infer_fn(&f).is_err(), "`i` must be unbound outside the loop");
+    assert!(
+        infer.infer_fn(&f).is_err(),
+        "`i` must be unbound outside the loop"
+    );
 }
 
 #[test]
@@ -2346,7 +2779,9 @@ fn a_for_loops_variable_is_int_constrained_not_forced_to_a_specific_width() {
     // No hardcoded width -- the same "constrained, not blessed" posture
     // `ExprKind::Index`'s own bound already uses. `i64` bounds must work
     // exactly as well as the default `i32`.
-    let ty = infer_src("fn f() -> i64 { let mut acc = 0:i64; for i in 0:i64..10:i64 { acc = i; }; acc }");
+    let ty = infer_src(
+        "fn f() -> i64 { let mut acc = 0:i64; for i in 0:i64..10:i64 { acc = i; }; acc }",
+    );
     assert_eq!(ty, Ty::Con("i64".to_string()));
 }
 
@@ -2354,7 +2789,9 @@ fn a_for_loops_variable_is_int_constrained_not_forced_to_a_specific_width() {
 /// array's own *element* type, not to `i32` or anything index-shaped.
 #[test]
 fn a_for_in_loops_variable_binds_to_the_arrays_own_element_type() {
-    let ty = infer_src("fn f() -> f64 { let arr: [f64; 3] = [1.0, 2.0, 3.0]; let mut acc: f64 = 0.0; for x in arr { acc = acc + x; }; acc }");
+    let ty = infer_src(
+        "fn f() -> f64 { let arr: [f64; 3] = [1.0, 2.0, 3.0]; let mut acc: f64 = 0.0; for x in arr { acc = acc + x; }; acc }",
+    );
     assert_eq!(ty, Ty::Con("f64".to_string()));
 }
 
@@ -2373,7 +2810,11 @@ fn a_for_in_loop_over_a_non_array_is_rejected() {
     let registry = builtin_registry();
     let mut infer = Infer::new(&registry);
     let err = infer.infer_fn(&f).unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::Unify(_)), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::Unify(_)),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 /// Mirrors `a_for_loops_variable_does_not_leak_into_the_enclosing_scope`
@@ -2383,7 +2824,10 @@ fn a_for_in_loops_variable_does_not_leak_into_the_enclosing_scope() {
     let f = lower_one_fn("fn f() { let arr: [i32; 3] = [1, 2, 3]; for x in arr { x }; x }");
     let registry = builtin_registry();
     let mut infer = Infer::new(&registry);
-    assert!(infer.infer_fn(&f).is_err(), "`x` must be unbound outside the loop");
+    assert!(
+        infer.infer_fn(&f).is_err(),
+        "`x` must be unbound outside the loop"
+    );
 }
 
 #[test]
@@ -2408,10 +2852,15 @@ fn a_const_generic_used_as_a_for_loop_bound_stays_a_shape_slot_not_a_defaulted_i
     );
     let registry = builtin_registry();
     let mut infer = Infer::new(&registry);
-    let ty = infer.infer_fn(&f).unwrap_or_else(|e| panic!("inference failed: {e:?}"));
+    let ty = infer
+        .infer_fn(&f)
+        .unwrap_or_else(|e| panic!("inference failed: {e:?}"));
     match ty {
         Ty::Array(_, size) => {
-            assert!(matches!(*size, Ty::Var(_)), "expected `N` to stay an abstract shape slot, got {size:?}")
+            assert!(
+                matches!(*size, Ty::Var(_)),
+                "expected `N` to stay an abstract shape slot, got {size:?}"
+            )
         }
         other => panic!("expected an array type, got {other:?}"),
     }
@@ -2484,7 +2933,11 @@ fn method_call_with_a_wrong_argument_type_is_rejected() {
         "f",
     )
     .unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::Unify(_)), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::Unify(_)),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -2496,7 +2949,11 @@ fn method_call_with_wrong_arity_is_rejected() {
         "f",
     )
     .unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::ArityMismatch { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::ArityMismatch { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -2507,7 +2964,11 @@ fn method_call_on_an_unknown_method_is_rejected() {
         "f",
     )
     .unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::NoSuchMethod { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::NoSuchMethod { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -2516,7 +2977,11 @@ fn method_call_on_a_non_struct_base_is_rejected() {
     let registry = builtin_registry();
     let mut infer = Infer::new(&registry);
     let err = infer.infer_fn(&f).unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::NoSuchMethod { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::NoSuchMethod { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -2610,9 +3075,18 @@ fn two_mutually_recursive_inherent_methods_infer_correctly() {
         }",
     );
     let mut infer = Infer::new(&registry);
-    let (_, results) = infer.infer_inherent_impl_block(&cleave::infer::Env::new(), &generics, &target, &fns, span);
-    let is_even = results.get("is_even").unwrap().as_ref().unwrap_or_else(|e| panic!("{e:?}"));
-    let is_odd = results.get("is_odd").unwrap().as_ref().unwrap_or_else(|e| panic!("{e:?}"));
+    let (_, results) =
+        infer.infer_inherent_impl_block(&cleave::infer::Env::new(), &generics, &target, &fns, span);
+    let is_even = results
+        .get("is_even")
+        .unwrap()
+        .as_ref()
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    let is_odd = results
+        .get("is_odd")
+        .unwrap()
+        .as_ref()
+        .unwrap_or_else(|e| panic!("{e:?}"));
     assert_eq!(is_even.1, Ty::Con("bool".to_string()));
     assert_eq!(is_odd.1, Ty::Con("bool".to_string()));
 }
@@ -2637,8 +3111,13 @@ fn a_single_self_recursive_method_still_works_through_infer_inherent_impl_block(
         }",
     );
     let mut infer = Infer::new(&registry);
-    let (_, results) = infer.infer_inherent_impl_block(&cleave::infer::Env::new(), &generics, &target, &fns, span);
-    let countdown = results.get("countdown").unwrap().as_ref().unwrap_or_else(|e| panic!("{e:?}"));
+    let (_, results) =
+        infer.infer_inherent_impl_block(&cleave::infer::Env::new(), &generics, &target, &fns, span);
+    let countdown = results
+        .get("countdown")
+        .unwrap()
+        .as_ref()
+        .unwrap_or_else(|e| panic!("{e:?}"));
     assert_eq!(countdown.1, Ty::Con("i32".to_string()));
 }
 
@@ -2672,7 +3151,14 @@ fn matmul_resolves_the_output_shape_from_the_two_input_shapes() {
     let ty = infer_fn_named(&src, "f").unwrap();
     assert_eq!(
         ty,
-        Ty::App("Matrix".to_string(), vec![Ty::Con("f32".to_string()), Ty::Const(ConstValue::Int(2)), Ty::Const(ConstValue::Int(5))])
+        Ty::App(
+            "Matrix".to_string(),
+            vec![
+                Ty::Con("f32".to_string()),
+                Ty::Const(ConstValue::Int(2)),
+                Ty::Const(ConstValue::Int(5))
+            ]
+        )
     );
 }
 
@@ -2688,7 +3174,11 @@ fn matmul_rejects_a_mismatched_middle_dimension() {
          }}"
     );
     let err = infer_fn_named(&src, "f").unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::MissingImpl { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::MissingImpl { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -2704,7 +3194,11 @@ fn matmul_element_type_must_also_agree() {
          }}"
     );
     let err = infer_fn_named(&src, "f").unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::MissingImpl { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::MissingImpl { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -2721,7 +3215,11 @@ fn overlapping_multi_target_impls_of_the_same_algebra_are_rejected() {
     let mut infer = Infer::new(&registry);
     let errors = infer.check_no_overlapping_impls();
     assert_eq!(errors.len(), 1, "got: {errors:?}");
-    assert!(matches!(errors[0].kind, TypeErrorKind::OverlappingImpls { .. }), "got: {:?}", errors[0].kind);
+    assert!(
+        matches!(errors[0].kind, TypeErrorKind::OverlappingImpls { .. }),
+        "got: {:?}",
+        errors[0].kind
+    );
 }
 
 #[test]
@@ -2761,7 +3259,11 @@ fn ambiguous_dispatch_across_two_impls_sharing_an_input_shape_is_rejected() {
     // during ordinary inference, not deferred).
     let src = format!("{WIDEN_SRC} fn f(x: i32) -> i32 {{ widen(x); 0 }}");
     let err = infer_fn_named(&src, "f").unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::AmbiguousDispatch { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::AmbiguousDispatch { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -2775,7 +3277,11 @@ fn turbofish_on_an_algebra_call_disambiguates_which_impl_dispatches() {
 fn turbofish_on_an_algebra_call_requires_every_generic_not_just_the_ambiguous_one() {
     let src = format!("{WIDEN_SRC} fn f() -> f64 {{ widen::<f64>(1) }}");
     let err = infer_fn_named(&src, "f").unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::ArityMismatch { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::ArityMismatch { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -2802,7 +3308,11 @@ fn to_sugar_desugars_to_convert_and_is_ambiguity_checked_the_same_way() {
         impl Convert<i32, i64> { fn convert(x) { 0 } }
         fn f(x: i32) -> i32 { x.to(); 0 }";
     let err = infer_fn_named(src, "f").unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::AmbiguousDispatch { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::AmbiguousDispatch { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -2816,7 +3326,11 @@ fn to_sugar_desugars_to_convert_and_is_ambiguity_checked_the_same_way() {
 fn reassigning_a_plain_let_is_rejected() {
     let f = lower_one_fn("fn f() -> i32 { let x = 5; x = 6; x }");
     let err = check_mutability(&f).expect_err("plain let must not be reassignable");
-    assert!(matches!(err.kind, TypeErrorKind::AssignToImmutable { ref name } if name == "x"), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::AssignToImmutable { ref name } if name == "x"),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -2828,20 +3342,32 @@ fn reassigning_a_let_mut_is_accepted() {
 #[test]
 fn field_assignment_through_a_plain_let_is_rejected() {
     let f = lower_one_fn("fn f() -> i32 { let p = 0; p.x = 1; 0 }");
-    let err = check_mutability(&f).expect_err("field assignment through a non-mut binding must be rejected");
-    assert!(matches!(err.kind, TypeErrorKind::AssignToImmutable { ref name } if name == "p"), "got: {:?}", err.kind);
+    let err = check_mutability(&f)
+        .expect_err("field assignment through a non-mut binding must be rejected");
+    assert!(
+        matches!(err.kind, TypeErrorKind::AssignToImmutable { ref name } if name == "p"),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
 fn index_assignment_through_a_plain_let_is_rejected() {
     let f = lower_one_fn("fn f() -> i32 { let arr = [1, 2, 3]; arr[0] = 9; 0 }");
-    let err = check_mutability(&f).expect_err("index assignment through a non-mut binding must be rejected");
-    assert!(matches!(err.kind, TypeErrorKind::AssignToImmutable { ref name } if name == "arr"), "got: {:?}", err.kind);
+    let err = check_mutability(&f)
+        .expect_err("index assignment through a non-mut binding must be rejected");
+    assert!(
+        matches!(err.kind, TypeErrorKind::AssignToImmutable { ref name } if name == "arr"),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
 fn field_and_index_assignment_through_a_let_mut_is_accepted() {
-    let f = lower_one_fn("fn f() -> i32 { let mut p = 0; p.x = 1; let mut arr = [1, 2, 3]; arr[0] = 9; 0 }");
+    let f = lower_one_fn(
+        "fn f() -> i32 { let mut p = 0; p.x = 1; let mut arr = [1, 2, 3]; arr[0] = 9; 0 }",
+    );
     assert!(check_mutability(&f).is_ok());
 }
 
@@ -2852,21 +3378,34 @@ fn field_and_index_assignment_through_a_let_mut_is_accepted() {
 fn a_deeply_nested_assignment_target_still_resolves_to_its_own_root_binding() {
     let f = lower_one_fn("fn f() -> i32 { let s = 0; s.arr[0].y = 1; 0 }");
     let err = check_mutability(&f).expect_err("a nested chain must still resolve to its own root");
-    assert!(matches!(err.kind, TypeErrorKind::AssignToImmutable { ref name } if name == "s"), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::AssignToImmutable { ref name } if name == "s"),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
 fn a_function_parameter_can_never_be_reassigned() {
     let f = lower_one_fn("fn f(x: i32) -> i32 { x = 5; x }");
-    let err = check_mutability(&f).expect_err("a parameter is never `mut` -- no grammar support for it at all");
-    assert!(matches!(err.kind, TypeErrorKind::AssignToImmutable { ref name } if name == "x"), "got: {:?}", err.kind);
+    let err = check_mutability(&f)
+        .expect_err("a parameter is never `mut` -- no grammar support for it at all");
+    assert!(
+        matches!(err.kind, TypeErrorKind::AssignToImmutable { ref name } if name == "x"),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
 fn a_for_loops_own_index_variable_can_never_be_reassigned() {
     let f = lower_one_fn("fn f() -> i32 { for i in 0..3 { i = 9; }; 0 }");
     let err = check_mutability(&f).expect_err("a for-loop's own index is never reassignable");
-    assert!(matches!(err.kind, TypeErrorKind::AssignToImmutable { ref name } if name == "i"), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::AssignToImmutable { ref name } if name == "i"),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 /// Shadowing correctness, the real reason this needs a scope-aware walk and
@@ -2878,7 +3417,11 @@ fn a_for_loops_own_index_variable_can_never_be_reassigned() {
 fn an_inner_non_mut_shadow_is_still_rejected_even_though_the_outer_binding_is_mutable() {
     let f = lower_one_fn("fn f() -> i32 { let mut x = 1; if true { let x = 2; x = 3; }; x }");
     let err = check_mutability(&f).expect_err("the inner, shadowing `x` is not `mut`");
-    assert!(matches!(err.kind, TypeErrorKind::AssignToImmutable { ref name } if name == "x"), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::AssignToImmutable { ref name } if name == "x"),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 /// The mirror case: reassigning the *outer* `mut x` from inside a nested
@@ -2899,7 +3442,11 @@ fn reassigning_a_captured_outer_let_mut_from_inside_a_lambda_is_accepted() {
 fn reassigning_a_captured_outer_plain_let_from_inside_a_lambda_is_rejected() {
     let f = lower_one_fn("fn f() -> i32 { let x = 1; let g = fn() { x = 2; }; x }");
     let err = check_mutability(&f).expect_err("the captured outer `x` is not `mut`");
-    assert!(matches!(err.kind, TypeErrorKind::AssignToImmutable { ref name } if name == "x"), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::AssignToImmutable { ref name } if name == "x"),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -2909,7 +3456,11 @@ fn reassigning_a_captured_outer_plain_let_from_inside_a_lambda_is_rejected() {
 #[test]
 fn break_outside_a_loop_is_rejected() {
     let err = infer_fn_named("fn f() -> i32 { break; 0 }", "f").unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::BreakOutsideLoop), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::BreakOutsideLoop),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -2924,7 +3475,11 @@ fn break_with_a_value_inside_while_is_rejected() {
     // returns), so it wouldn't produce an immediate `Unify` error the way
     // an already-concrete `bool` does.
     let err = infer_fn_named("fn f() -> i32 { while true { break true; }; 0 }", "f").unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::Unify(_)), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::Unify(_)),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -2939,8 +3494,13 @@ fn loop_whose_break_values_disagree_is_rejected() {
     // (unlike a bare `5`, whose own type stays an unconstrained variable
     // until defaulting) — needed for a genuine, immediate `Unify` mismatch
     // against `break true;`'s own already-concrete `bool`.
-    let err = infer_fn_named("fn f() -> i32 { loop { break 5:i32; break true; } }", "f").unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::Unify(_)), "got: {:?}", err.kind);
+    let err =
+        infer_fn_named("fn f() -> i32 { loop { break 5:i32; break true; } }", "f").unwrap_err();
+    assert!(
+        matches!(err.kind, TypeErrorKind::Unify(_)),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -2948,8 +3508,16 @@ fn break_does_not_escape_a_lambda_body() {
     // A `break` lexically inside a loop, but through an intervening lambda
     // body, must still be rejected -- a lambda can be called later, outside
     // the loop's own frame, mirroring Rust's identical rule.
-    let err = infer_fn_named("fn f() -> i32 { while true { let g = fn() { break; }; }; 0 }", "f").unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::BreakOutsideLoop), "got: {:?}", err.kind);
+    let err = infer_fn_named(
+        "fn f() -> i32 { while true { let g = fn() { break; }; }; 0 }",
+        "f",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err.kind, TypeErrorKind::BreakOutsideLoop),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 // `(T1, T2)`/`(a, b)`/`t.0` desugar entirely at `lower.rs` time into
@@ -2962,7 +3530,11 @@ fn break_does_not_escape_a_lambda_body() {
 // (`inject_tuple_struct`) — keeps this file's own established "test `Infer`
 // in isolation" posture, and doubles as a direct illustration that a tuple
 // really is just an ordinary struct under the hood, nothing magic.
-fn infer_fn_named_with_tuples(src: &str, name: &str, arities: &[usize]) -> Result<Ty, cleave::infer::TypeError> {
+fn infer_fn_named_with_tuples(
+    src: &str,
+    name: &str,
+    arities: &[usize],
+) -> Result<Ty, cleave::infer::TypeError> {
     let mut program = lower_program(src);
     for &arity in arities {
         program = inject_tuple_struct(program, arity);
@@ -2983,40 +3555,71 @@ fn infer_fn_named_with_tuples(src: &str, name: &str, arities: &[usize]) -> Resul
 #[test]
 fn a_tuple_literal_infers_the_synthesized_struct_type() {
     let ty = infer_fn_named_with_tuples("fn f() -> (i32, f64) { (1, 2.0) }", "f", &[2]).unwrap();
-    assert_eq!(ty, Ty::App("__Tuple2".to_string(), vec![Ty::Con("i32".to_string()), Ty::Con("f64".to_string())]));
+    assert_eq!(
+        ty,
+        Ty::App(
+            "__Tuple2".to_string(),
+            vec![Ty::Con("i32".to_string()), Ty::Con("f64".to_string())]
+        )
+    );
 }
 
 #[test]
 fn tuple_field_access_resolves_the_right_element_type() {
-    let ty = infer_fn_named_with_tuples("fn f() -> f64 { let t: (i32, f64) = (1, 2.0); t.1 }", "f", &[2]).unwrap();
+    let ty = infer_fn_named_with_tuples(
+        "fn f() -> f64 { let t: (i32, f64) = (1, 2.0); t.1 }",
+        "f",
+        &[2],
+    )
+    .unwrap();
     assert_eq!(ty, Ty::Con("f64".to_string()));
 }
 
 #[test]
 fn a_three_element_tuple_infers_and_reads_back_correctly() {
-    let ty = infer_fn_named_with_tuples("fn f() -> bool { let t: (i32, f64, bool) = (1, 2.0, true); t.2 }", "f", &[3]).unwrap();
+    let ty = infer_fn_named_with_tuples(
+        "fn f() -> bool { let t: (i32, f64, bool) = (1, 2.0, true); t.2 }",
+        "f",
+        &[3],
+    )
+    .unwrap();
     assert_eq!(ty, Ty::Con("bool".to_string()));
 }
 
 #[test]
 fn out_of_range_tuple_field_access_is_rejected() {
-    let err = infer_fn_named_with_tuples("fn f() -> i32 { let t: (i32, f64) = (1, 2.0); t.2 }", "f", &[2]).unwrap_err();
+    let err = infer_fn_named_with_tuples(
+        "fn f() -> i32 { let t: (i32, f64) = (1, 2.0); t.2 }",
+        "f",
+        &[2],
+    )
+    .unwrap_err();
     // Falls out of the ordinary "unknown struct field" error a real named
     // struct's own out-of-range/misspelled field access already produces —
     // no bespoke tuple diagnostic needed, `t.2` is simply not a declared
     // field of `__Tuple2`.
-    assert!(matches!(err.kind, TypeErrorKind::NoSuchField { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::NoSuchField { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
 fn a_function_over_an_explicitly_annotated_tuple_parameter_infers_correctly() {
-    let ty = infer_fn_named_with_tuples("fn first(t: (i32, bool)) -> i32 { t.0 }", "first", &[2]).unwrap();
+    let ty = infer_fn_named_with_tuples("fn first(t: (i32, bool)) -> i32 { t.0 }", "first", &[2])
+        .unwrap();
     assert_eq!(ty, Ty::Con("i32".to_string()));
 }
 
 #[test]
 fn a_nested_tuple_infers_and_reads_back_correctly() {
-    let ty = infer_fn_named_with_tuples("fn f() -> i32 { let t: ((i32, i32), i32) = ((1, 2), 3); t.0.1 }", "f", &[2]).unwrap();
+    let ty = infer_fn_named_with_tuples(
+        "fn f() -> i32 { let t: ((i32, i32), i32) = ((1, 2), 3); t.0.1 }",
+        "f",
+        &[2],
+    )
+    .unwrap();
     assert_eq!(ty, Ty::Con("i32".to_string()));
 }
 
@@ -3060,7 +3663,11 @@ fn a_const_generic_pack_construction_rejects_a_shape_not_matching_the_turbofish(
         "f",
     )
     .unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::Unify(_)), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::Unify(_)),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -3074,7 +3681,11 @@ fn constructing_a_pack_generic_struct_with_no_turbofish_is_rejected() {
         "f",
     )
     .unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::VariadicStructNeedsTurbofish { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::VariadicStructNeedsTurbofish { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -3091,7 +3702,11 @@ fn constructing_a_pack_generic_struct_with_too_short_a_turbofish_is_rejected() {
         "f",
     )
     .unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::VariadicStructNeedsTurbofish { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::VariadicStructNeedsTurbofish { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 // Real unit tests directly on `unify`/`Subst`, no wiring to declarations at
@@ -3106,7 +3721,9 @@ fn constructing_a_pack_generic_struct_with_too_short_a_turbofish_is_rejected() {
 // case).
 
 fn fresh_var(tygen: &mut TyVarGen) -> cleave::infer::TyVar {
-    let Ty::Var(v) = tygen.fresh() else { unreachable!("TyVarGen::fresh always returns Ty::Var") };
+    let Ty::Var(v) = tygen.fresh() else {
+        unreachable!("TyVarGen::fresh always returns Ty::Var")
+    };
     v
 }
 
@@ -3118,14 +3735,23 @@ fn unify_matches_a_trailing_pack_against_the_callers_own_remaining_args() {
     let pattern = Ty::App("Tensor".to_string(), vec![Ty::Var(t), Ty::Pack(p)]);
     let query = Ty::App(
         "Tensor".to_string(),
-        vec![Ty::Con("f64".to_string()), Ty::Const(ConstValue::Int(3)), Ty::Const(ConstValue::Int(4)), Ty::Const(ConstValue::Int(5))],
+        vec![
+            Ty::Con("f64".to_string()),
+            Ty::Const(ConstValue::Int(3)),
+            Ty::Const(ConstValue::Int(4)),
+            Ty::Const(ConstValue::Int(5)),
+        ],
     );
     let mut subst = Subst::default();
     unify(&mut subst, &pattern, &query).unwrap_or_else(|e| panic!("unify failed: {e:?}"));
     assert_eq!(subst.apply(&Ty::Var(t)), Ty::Con("f64".to_string()));
     assert_eq!(
         subst.apply(&Ty::Pack(p)),
-        Ty::PackResolved(vec![Ty::Const(ConstValue::Int(3)), Ty::Const(ConstValue::Int(4)), Ty::Const(ConstValue::Int(5))])
+        Ty::PackResolved(vec![
+            Ty::Const(ConstValue::Int(3)),
+            Ty::Const(ConstValue::Int(4)),
+            Ty::Const(ConstValue::Int(5))
+        ])
     );
     // Spliced flat through an enclosing `App`, not left nested — the shape
     // every real consumer (struct field resolution, MLIR lowering) needs.
@@ -3136,22 +3762,41 @@ fn unify_matches_a_trailing_pack_against_the_callers_own_remaining_args() {
 fn unify_matches_a_pack_symmetrically_when_the_query_side_has_it() {
     let mut tygen = TyVarGen::default();
     let p = fresh_var(&mut tygen);
-    let pattern = Ty::App("Tensor".to_string(), vec![Ty::Con("i32".to_string()), Ty::Const(ConstValue::Int(2)), Ty::Const(ConstValue::Int(2))]);
-    let query = Ty::App("Tensor".to_string(), vec![Ty::Con("i32".to_string()), Ty::Pack(p)]);
+    let pattern = Ty::App(
+        "Tensor".to_string(),
+        vec![
+            Ty::Con("i32".to_string()),
+            Ty::Const(ConstValue::Int(2)),
+            Ty::Const(ConstValue::Int(2)),
+        ],
+    );
+    let query = Ty::App(
+        "Tensor".to_string(),
+        vec![Ty::Con("i32".to_string()), Ty::Pack(p)],
+    );
     let mut subst = Subst::default();
     unify(&mut subst, &pattern, &query).unwrap_or_else(|e| panic!("unify failed: {e:?}"));
     assert_eq!(
         subst.apply(&Ty::Pack(p)),
-        Ty::PackResolved(vec![Ty::Const(ConstValue::Int(2)), Ty::Const(ConstValue::Int(2))])
+        Ty::PackResolved(vec![
+            Ty::Const(ConstValue::Int(2)),
+            Ty::Const(ConstValue::Int(2))
+        ])
     );
 }
 
 #[test]
 fn unify_still_requires_exact_arity_when_neither_side_has_a_pack() {
-    let pattern = Ty::App("Vec2".to_string(), vec![Ty::Con("f64".to_string()), Ty::Con("f64".to_string())]);
+    let pattern = Ty::App(
+        "Vec2".to_string(),
+        vec![Ty::Con("f64".to_string()), Ty::Con("f64".to_string())],
+    );
     let query = Ty::App("Vec2".to_string(), vec![Ty::Con("f64".to_string())]);
     let mut subst = Subst::default();
-    assert!(unify(&mut subst, &pattern, &query).is_err(), "expected an arity mismatch to be rejected, exactly as before packs existed");
+    assert!(
+        unify(&mut subst, &pattern, &query).is_err(),
+        "expected an arity mismatch to be rejected, exactly as before packs existed"
+    );
 }
 
 #[test]
@@ -3162,7 +3807,10 @@ fn unify_rejects_a_pack_side_with_fewer_query_args_than_its_own_non_pack_prefix(
     let p = fresh_var(&mut tygen);
     // Two non-pack slots (`t1`, `t2`) need at least two query args before
     // the pack could absorb anything — a query with only one is too few.
-    let pattern = Ty::App("Foo".to_string(), vec![Ty::Var(t1), Ty::Var(t2), Ty::Pack(p)]);
+    let pattern = Ty::App(
+        "Foo".to_string(),
+        vec![Ty::Var(t1), Ty::Var(t2), Ty::Pack(p)],
+    );
     let query = Ty::App("Foo".to_string(), vec![Ty::Con("i32".to_string())]);
     let mut subst = Subst::default();
     assert!(unify(&mut subst, &pattern, &query).is_err());
@@ -3215,7 +3863,14 @@ fn pack_len_stays_symbolic_until_the_underlying_pack_resolves_then_folds() {
     // Resolves the pack the same way a real `Tensor<f64,3,4,5>` call site
     // would (`unify`'s own pack-aware `(App,App)` arm, `Subst::bind_pack`).
     let a = Ty::App("Tensor".to_string(), vec![Ty::Pack(p)]);
-    let b = Ty::App("Tensor".to_string(), vec![Ty::Const(ConstValue::Int(3)), Ty::Const(ConstValue::Int(4)), Ty::Const(ConstValue::Int(5))]);
+    let b = Ty::App(
+        "Tensor".to_string(),
+        vec![
+            Ty::Const(ConstValue::Int(3)),
+            Ty::Const(ConstValue::Int(4)),
+            Ty::Const(ConstValue::Int(5)),
+        ],
+    );
     unify(&mut subst, &a, &b).unwrap();
     assert_eq!(subst.apply(&Ty::PackLen(p)), Ty::Const(ConstValue::Int(3)));
 }

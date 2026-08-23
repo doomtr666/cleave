@@ -28,7 +28,10 @@ fn prints_struct_lit_with_named_fields() {
 #[test]
 fn prints_lambda_with_annotations() {
     let out = print_src("fn f() { fn(a: f64, b: f64) -> f64 { a } }");
-    assert!(out.contains("fn(a: f64, b: f64) -> f64 { a }"), "got:\n{out}");
+    assert!(
+        out.contains("fn(a: f64, b: f64) -> f64 { a }"),
+        "got:\n{out}"
+    );
 }
 
 #[test]
@@ -37,7 +40,10 @@ fn prints_desugared_operators_not_resugared() {
     // lowering actually produced, not hiding it back behind sugar.
     let out = print_src("fn f(a, b) { a + b }");
     assert!(out.contains("add(a, b)"), "got:\n{out}");
-    assert!(!out.contains(" + "), "should not re-sugar back to '+', got:\n{out}");
+    assert!(
+        !out.contains(" + "),
+        "should not re-sugar back to '+', got:\n{out}"
+    );
 }
 
 #[test]
@@ -90,7 +96,11 @@ fn main() -> i32 {
     assert!(out.contains("struct Vec2 {"));
     assert!(out.contains("x: f64,"));
     assert!(out.contains("algebra Ring<T> {"));
-    assert!(out.contains("axiom assoc_add(a: T, b: T, c: T): eq(add(add(a, b), c), add(a, add(b, c)));"));
+    assert!(
+        out.contains(
+            "axiom assoc_add(a: T, b: T, c: T): eq(add(add(a, b), c), add(a, add(b, c)));"
+        )
+    );
     assert!(out.contains("impl Ring<Vec2> {"));
     assert!(out.contains("fn main() -> i32 {"));
     assert!(out.contains("let mut acc = 0;"));

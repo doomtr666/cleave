@@ -77,7 +77,11 @@ fn resolve_signature(f: &CTopLevelFn) -> Result<ExportedSignature<'_>, String> {
             }
         }
     };
-    Ok(ExportedSignature { symbol, param_types, ret_type })
+    Ok(ExportedSignature {
+        symbol,
+        param_types,
+        ret_type,
+    })
 }
 
 /// Every `export fn` reachable in `funcs` (ordinarily a `CpsProgram::funcs`
@@ -85,7 +89,9 @@ fn resolve_signature(f: &CTopLevelFn) -> Result<ExportedSignature<'_>, String> {
 /// bindings` wiring), rendered as one `extern "C" { fn ...; }` Rust source
 /// file. `Err` lists every signature this module can't map, not just the
 /// first — a real compile-time report, not a panic on the first offender.
-pub fn generate_rust_bindings<'a>(funcs: impl IntoIterator<Item = &'a CTopLevelFn>) -> Result<String, Vec<String>> {
+pub fn generate_rust_bindings<'a>(
+    funcs: impl IntoIterator<Item = &'a CTopLevelFn>,
+) -> Result<String, Vec<String>> {
     let mut signatures = Vec::new();
     let mut errors = Vec::new();
     for f in funcs {

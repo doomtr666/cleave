@@ -54,8 +54,14 @@ fn a_let_bound_lambda_still_shows_a_still_open_type_variable_at_its_own_definiti
     // pinned instantiation.
     let (out, errs) = dump("fn f() -> i32 { let id = fn(x) { x }; id(1) }");
     assert_eq!(errs, 0, "got:\n{out}");
-    assert!(out.contains("fn(x) { x:'a }:('a) -> 'a"), "lambda's own definition should stay generic, got:\n{out}");
-    assert!(out.contains("id(1:i32):i32"), "the call site's own instantiation should be concrete, got:\n{out}");
+    assert!(
+        out.contains("fn(x) { x:'a }:('a) -> 'a"),
+        "lambda's own definition should stay generic, got:\n{out}"
+    );
+    assert!(
+        out.contains("id(1:i32):i32"),
+        "the call site's own instantiation should be concrete, got:\n{out}"
+    );
 }
 
 #[test]
@@ -65,9 +71,15 @@ fn a_type_error_in_one_function_does_not_stop_the_others() {
     let src = "fn bad(a: f64, b: i32) -> f64 { a + b }\n\
                fn good() -> i32 { 1 }";
     let (out, errs) = dump(src);
-    assert_eq!(errs, 1, "exactly the one broken function should error, got:\n{out}");
+    assert_eq!(
+        errs, 1,
+        "exactly the one broken function should error, got:\n{out}"
+    );
     assert!(out.contains("type error"), "got:\n{out}");
-    assert!(out.contains("fn good() -> i32"), "the working function must still be dumped, got:\n{out}");
+    assert!(
+        out.contains("fn good() -> i32"),
+        "the working function must still be dumped, got:\n{out}"
+    );
     assert!(out.contains("1:i32"), "got:\n{out}");
 }
 
@@ -82,7 +94,10 @@ fn nested_sub_expressions_are_each_annotated_with_their_own_type_not_just_the_ou
     let src = "fn f(x: i32) -> i32 { add(sub(x, 1), sub(x, 2)) }";
     let (out, errs) = dump(src);
     assert_eq!(errs, 0, "got:\n{out}");
-    assert!(out.contains("sub(x:i32, 1:i32):i32"), "the inner `sub` calls must show their own type, got:\n{out}");
+    assert!(
+        out.contains("sub(x:i32, 1:i32):i32"),
+        "the inner `sub` calls must show their own type, got:\n{out}"
+    );
     assert!(
         out.contains("add(sub(x:i32, 1:i32):i32, sub(x:i32, 2:i32):i32):i32"),
         "got:\n{out}"

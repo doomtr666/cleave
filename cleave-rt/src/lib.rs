@@ -210,4 +210,261 @@ dynarray_width!(i32, dynarray_alloc_i32, dynarray_grow_i32, dynarray_get_i32, dy
 dynarray_width!(i64, dynarray_alloc_i64, dynarray_grow_i64, dynarray_get_i64, dynarray_set_i64);
 dynarray_width!(f32, dynarray_alloc_f32, dynarray_grow_f32, dynarray_get_f32, dynarray_set_f32);
 dynarray_width!(f64, dynarray_alloc_f64, dynarray_grow_f64, dynarray_get_f64, dynarray_set_f64);
+
+/// MLIR's own `memref.copy` runtime helper (`mlir::ExecutionEngine::
+/// CRunnerUtils.h`'s own `memrefCopy`), reimplemented here rather than
+/// loaded from the real `mlir_c_runner_utils.dll` (`I:/Dev/llvm-mlir-22`'s
+/// own real MLIR 22 build, confirmed to genuinely export it via `dumpbin /
+/// exports` -- not a stub or a missing build) -- `one-shot-bufferize`'s own
+/// generated `memref.copy` calls need it the moment a tensor value is big
+/// enough to need a real defensive copy before a write (`Dense`/`Network`,
+/// `examples/xor_tensor.cleave`, is the first cleave program ever to trigger
+/// one — every prior example's own lowered IR has zero `memref.copy` calls
+/// at all, confirmed directly via `--dump-mlir-lowered`), and this project's
+/// own JIT (`melior::ExecutionEngine::new`) never had any shared library
+/// loaded alongside the lowered module to satisfy it. Loading the real DLL
+/// was tried first and abandoned: passing more than one path in `melior`'s
+/// own `shared_library_paths` array (needed since `mlir_c_runner_utils.dll`
+/// itself depends on the sibling `mlir_float16_utils.dll`, confirmed via
+/// `dumpbin /dependents`, and `I:/Dev/llvm-mlir-22/bin` was never on this
+/// process's own DLL search path) corrupted the *first* path into the
+/// second with no separator between them (`Failed to create MemoryBuffer
+/// for: ...dllI:/Dev/...`) -- a real bug somewhere in `melior`'s/MLIR's own
+/// C API glue around a non-null-terminated `MlirStringRef`, not this
+/// project's own code, and not worth chasing further versus just owning a
+/// small, correct reimplementation here instead — matches this crate's own
+/// existing posture (`dynarray_*` above already reimplements, rather than
+/// links against, the array-growth runtime a real language would often
+/// pull from an external allocator library).
+///
+/// ABI, read directly from the real header (no `.cpp` shipped alongside it,
+/// only headers -- this project's own MLIR 22 install is headers + prebuilt
+/// libs, not full source) -- `UnrankedMemRefType<char>{ rank: i64, descriptor
+/// : *mut c_void }`, `descriptor` pointing to a `{ basePtr, data, offset,
+/// sizes[rank], strides[rank] }` ranked-memref descriptor (the ordinary
+/// `memref`-to-`llvm` ABI this project's own `mlir_lower.rs` already
+/// produces everywhere else) -- `sizes`/`strides` read directly as raw byte
+/// offsets into `descriptor` rather than through a typed Rust struct: their
+/// own length depends on `rank`, a *runtime* value, not expressible as an
+/// ordinary fixed-layout `#[repr(C)]` struct field.
+///
+/// A plain element-by-element strided copy, not the real implementation's
+/// own presumably-more-optimized one (a contiguous-run fast path, likely) --
+/// semantically identical either way, and every shape this project's own
+/// `Tensor<T,Dims...>` ever produces is tiny (single-digit element counts),
+/// so the performance difference is immaterial here.
+#[repr(C)]
+pub struct UnrankedMemRef {
+    rank: i64,
+    descriptor: *mut u8,
+}
+
+/// # Safety
+/// `src`/`dst` must each point to a live `UnrankedMemRef` whose own
+/// `descriptor` points to a real ranked-memref descriptor of that same
+/// struct's own `rank`, exactly the shape MLIR's own `memref.copy` lowering
+/// always produces -- never called directly from cleave source, only ever
+/// invoked by the JIT itself, on `mlir_lower.rs`'s own generated code.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memrefCopy(elem_size: i64, src: *const UnrankedMemRef, dst: *const UnrankedMemRef) {
+    unsafe {
+        let elem_size = elem_size as usize;
+        let rank = (*src).rank as usize;
+        let src_desc = (*src).descriptor;
+        let dst_desc = (*dst).descriptor;
+
+        let read_i64 = |base: *mut u8, byte_off: usize| -> i64 {
+            std::ptr::read_unaligned(base.add(byte_off) as *const i64)
+        };
+        let read_ptr =
+            |base: *mut u8, byte_off: usize| -> *mut u8 { std::ptr::read_unaligned(base.add(byte_off) as *const *mut u8) };
+
+        // Layout: `basePtr: *mut u8` (8 bytes, unused here), `data: *mut u8`
+        // (8), `offset: i64` (8), then `sizes`/`strides`, each `rank` `i64`s.
+        let src_data = read_ptr(src_desc, 8);
+        let dst_data = read_ptr(dst_desc, 8);
+        let src_offset = read_i64(src_desc, 16);
+        let dst_offset = read_i64(dst_desc, 16);
+        let sizes_off = 24;
+        let strides_off = 24 + rank * 8;
+
+        if rank == 0 {
+            std::ptr::copy_nonoverlapping(
+                src_data.add(src_offset as usize * elem_size),
+                dst_data.add(dst_offset as usize * elem_size),
+                elem_size,
+            );
+            return;
+        }
+
+        let sizes: Vec<i64> = (0..rank).map(|i| read_i64(src_desc, sizes_off + i * 8)).collect();
+        let src_strides: Vec<i64> = (0..rank).map(|i| read_i64(src_desc, strides_off + i * 8)).collect();
+        let dst_strides: Vec<i64> = (0..rank).map(|i| read_i64(dst_desc, strides_off + i * 8)).collect();
+
+        let total: i64 = sizes.iter().product();
+        let mut indices = vec![0i64; rank];
+        for _ in 0..total {
+            let mut src_off = src_offset;
+            let mut dst_off = dst_offset;
+            for i in 0..rank {
+                src_off += indices[i] * src_strides[i];
+                dst_off += indices[i] * dst_strides[i];
+            }
+            std::ptr::copy_nonoverlapping(
+                src_data.add(src_off as usize * elem_size),
+                dst_data.add(dst_off as usize * elem_size),
+                elem_size,
+            );
+            for i in (0..rank).rev() {
+                indices[i] += 1;
+                if indices[i] < sizes[i] {
+                    break;
+                }
+                indices[i] = 0;
+            }
+        }
+    }
+}
 dynarray_width!(*mut u8, dynarray_alloc_ptr, dynarray_grow_ptr, dynarray_get_ptr, dynarray_set_ptr);
+
+/// A minimal PRNG for `stdlib/rand/rand.cleave` — PCG32 (O'Neill, public
+/// domain), the "one-sequence" variant: a single 64-bit state, advanced by a
+/// fixed linear congruential step, output-permuted through an xorshift +
+/// variable rotation to hide the LCG's own well-known low-bit weakness. No
+/// new dependency (`cleave-rt/Cargo.toml` has none at all today) -- the
+/// same reasoning that led to hand-reimplementing `memrefCopy` above rather
+/// than loading a real DLL: this is a small, public, easily-verified-by-hand
+/// algorithm, not worth a crate for. `Ordering::Relaxed` throughout -- this
+/// runtime is already implicitly single-threaded everywhere else (every
+/// other piece of mutable state here, `cleave_alloc`'s own allocator
+/// included, assumes the same).
+static PCG_STATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x853c_49e6_748f_ea9b);
+const PCG_MULT: u64 = 6364136223846793005;
+const PCG_INC: u64 = 1442695040888963407;
+
+fn pcg32_next_u32() -> u32 {
+    let old = PCG_STATE.load(std::sync::atomic::Ordering::Relaxed);
+    let new = old.wrapping_mul(PCG_MULT).wrapping_add(PCG_INC);
+    PCG_STATE.store(new, std::sync::atomic::Ordering::Relaxed);
+    let xorshifted = (((old >> 18) ^ old) >> 27) as u32;
+    let rot = (old >> 59) as u32;
+    xorshifted.rotate_right(rot)
+}
+
+/// Reseeds the global generator -- `s` becomes the PRNG's own next `state`
+/// directly (no separate stream/sequence parameter, matching `PCG_INC`
+/// being a fixed constant above). Two calls with the same seed reproduce
+/// the exact same following sequence, by construction.
+#[unsafe(no_mangle)]
+pub extern "C" fn rand_seed(s: i64) {
+    PCG_STATE.store(s as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Canonical uniform `[0,1)` -- the standard "top N mantissa bits of a raw
+/// word, divided by 2^N" construction: every representable output is
+/// exactly reachable and uniformly likely, no rounding bias at the
+/// boundaries. `f32` has a 24-bit mantissa (23 explicit + the implicit
+/// leading 1), so the top 24 bits of one `pcg32_next_u32()` draw are
+/// exactly enough.
+#[unsafe(no_mangle)]
+pub extern "C" fn rand_uniform_f32() -> f32 {
+    (pcg32_next_u32() >> 8) as f32 * (1.0 / (1u32 << 24) as f32)
+}
+
+/// Same construction as `rand_uniform_f32`, scaled up to `f64`'s own 53-bit
+/// mantissa -- one `pcg32_next_u32()` draw alone is short of that, so two
+/// draws are combined into one 64-bit word first.
+#[unsafe(no_mangle)]
+pub extern "C" fn rand_uniform_f64() -> f64 {
+    let hi = pcg32_next_u32() as u64;
+    let lo = pcg32_next_u32() as u64;
+    let combined = (hi << 32) | lo;
+    (combined >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+}
+
+/// Standard normal `N(0,1)` via the Box-Muller transform, consuming two
+/// independent uniform draws per call. `u1` is floored at a tiny epsilon --
+/// `rand_uniform_f32`'s own `[0,1)` range includes exactly `0.0`, and
+/// `ln(0.0)` is `-inf` -- astronomically unlikely (1 in 2^24) but a real,
+/// cheap-to-avoid edge case, not worth leaving in.
+#[unsafe(no_mangle)]
+pub extern "C" fn rand_normal_f32() -> f32 {
+    let u1 = rand_uniform_f32().max(1e-7);
+    let u2 = rand_uniform_f32();
+    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
+}
+
+/// `f64` counterpart of `rand_normal_f32`, same construction.
+#[unsafe(no_mangle)]
+pub extern "C" fn rand_normal_f64() -> f64 {
+    let u1 = rand_uniform_f64().max(1e-15);
+    let u2 = rand_uniform_f64();
+    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+}
+
+#[cfg(test)]
+mod rand_tests {
+    use super::*;
+
+    /// Every RNG behavior check lives in *one* `#[test]` deliberately --
+    /// `PCG_STATE` is one process-wide global, and `cargo test` runs
+    /// `#[test]` functions on separate threads *in parallel* by default;
+    /// found directly, by testing: splitting these into several separate
+    /// tests raced on that shared state (one test's own `rand_seed` call
+    /// landing between another's own seed and its first draw), an
+    /// intermittent failure with no bug in the RNG itself. One test means
+    /// one thread, no race -- the same fix as making any global-state test
+    /// sequential, not specific to this RNG.
+    #[test]
+    fn pcg32_behaves_correctly() {
+        // PCG32's own reference sequence for state `42`, `inc` fixed to
+        // `PCG_INC` above -- computed independently against the public PCG
+        // minimal-C reference implementation (one LCG step from `old = 42`,
+        // then the xorshift+rotate output permutation), not just re-derived
+        // from this same Rust code -- a real cross-check, not a tautology.
+        // `first == 0` is not a bug: `42`'s own top bits are all zero, and
+        // the output permutation reads `old` *before* the LCG step mixes it,
+        // so a small enough seed's very first output can legitimately be
+        // `0` -- confirmed against the reference computation, not assumed.
+        PCG_STATE.store(42, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(pcg32_next_u32(), 0);
+        assert_eq!(pcg32_next_u32(), 1971522493);
+        assert_eq!(pcg32_next_u32(), 242089394);
+
+        // Reproducibility: reseeding to the exact same state replays the
+        // exact same sequence.
+        PCG_STATE.store(42, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(pcg32_next_u32(), 0);
+        assert_eq!(pcg32_next_u32(), 1971522493);
+
+        // `rand_seed` (the extern fn cleave itself calls) end to end, not
+        // just the raw PCG32 step.
+        rand_seed(1234);
+        let a0 = rand_uniform_f32();
+        let a1 = rand_uniform_f32();
+        rand_seed(1234);
+        let b0 = rand_uniform_f32();
+        let b1 = rand_uniform_f32();
+        assert_eq!(a0, b0);
+        assert_eq!(a1, b1);
+        assert_ne!(a0, a1);
+
+        rand_seed(7);
+        for _ in 0..1000 {
+            let x = rand_uniform_f32();
+            assert!((0.0..1.0).contains(&x), "{x} out of [0,1)");
+        }
+
+        rand_seed(99);
+        let draws: Vec<f32> = (0..1000).map(|_| rand_normal_f32()).collect();
+        let mean: f32 = draws.iter().sum::<f32>() / draws.len() as f32;
+        // A real, if loose, sanity bound -- N(0,1)'s own sample mean over
+        // 1000 draws should land well within +/-0.2 almost always; this is
+        // not a statistical rigor test, just a guard against a broken
+        // implementation returning something wildly non-normal (e.g.
+        // always ~0, or unbounded).
+        assert!(mean.abs() < 0.2, "sample mean {mean} too far from 0");
+        assert!(draws.iter().any(|&x| x < -0.5));
+        assert!(draws.iter().any(|&x| x > 0.5));
+    }
+}

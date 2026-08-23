@@ -5,7 +5,11 @@ fn parses(rule: Rule, input: &str) {
     match CleaveParser::parse(rule, input) {
         Ok(mut pairs) => {
             let pair = pairs.next().unwrap();
-            assert_eq!(pair.as_span().as_str(), input, "did not consume the whole input");
+            assert_eq!(
+                pair.as_span().as_str(),
+                input,
+                "did not consume the whole input"
+            );
         }
         Err(e) => panic!("failed to parse {input:?} as {rule:?}: {e}"),
     }
@@ -87,7 +91,10 @@ fn a_bodyless_fn_parses() {
 
 #[test]
 fn an_attributed_bodyless_fn_parses() {
-    parses(Rule::fn_decl, "#[mlir(mlir_i32_add)] fn add(a: i32, b: i32) -> i32;");
+    parses(
+        Rule::fn_decl,
+        "#[mlir(mlir_i32_add)] fn add(a: i32, b: i32) -> i32;",
+    );
 }
 
 #[test]
@@ -132,16 +139,32 @@ fn zero_arg_call_is_not_parsed_as_a_struct_literal() {
     // a zero-*field* struct construction are syntactically identical, and
     // `call_expr` must win — checked here by inspecting *which* alternative
     // `primary` actually picked, not just that something parsed.
-    let pair = CleaveParser::parse(Rule::primary, "f()").unwrap().next().unwrap();
+    let pair = CleaveParser::parse(Rule::primary, "f()")
+        .unwrap()
+        .next()
+        .unwrap();
     let inner = pair.into_inner().next().unwrap();
-    assert_eq!(inner.as_rule(), Rule::call_expr, "got: {:?}", inner.as_rule());
+    assert_eq!(
+        inner.as_rule(),
+        Rule::call_expr,
+        "got: {:?}",
+        inner.as_rule()
+    );
 }
 
 #[test]
 fn named_field_call_is_parsed_as_a_struct_literal() {
-    let pair = CleaveParser::parse(Rule::primary, "Vec2(x: 1.0, y: 2.0)").unwrap().next().unwrap();
+    let pair = CleaveParser::parse(Rule::primary, "Vec2(x: 1.0, y: 2.0)")
+        .unwrap()
+        .next()
+        .unwrap();
     let inner = pair.into_inner().next().unwrap();
-    assert_eq!(inner.as_rule(), Rule::struct_lit, "got: {:?}", inner.as_rule());
+    assert_eq!(
+        inner.as_rule(),
+        Rule::struct_lit,
+        "got: {:?}",
+        inner.as_rule()
+    );
 }
 
 #[test]
@@ -291,7 +314,10 @@ fn qualified_call() {
 
 #[test]
 fn qualified_type() {
-    parses(Rule::fn_decl, "fn f(a: linalg::Matrix<f64, 3, 3>) -> f64 { 0.0 }");
+    parses(
+        Rule::fn_decl,
+        "fn f(a: linalg::Matrix<f64, 3, 3>) -> f64 { 0.0 }",
+    );
 }
 
 #[test]
@@ -306,9 +332,17 @@ fn bool_const_generic_argument_is_not_parsed_as_a_bogus_type_path() {
     // otherwise happily parse as an ordinary `path`, the same class of
     // ambiguity `zero_arg_call_is_not_parsed_as_a_struct_literal` guards for
     // calls vs. struct literals. `bool_lit` must win the race, not `type_`.
-    let pair = CleaveParser::parse(Rule::generic_arg, "true").unwrap().next().unwrap();
+    let pair = CleaveParser::parse(Rule::generic_arg, "true")
+        .unwrap()
+        .next()
+        .unwrap();
     let inner = pair.into_inner().next().unwrap();
-    assert_eq!(inner.as_rule(), Rule::bool_lit, "got: {:?}", inner.as_rule());
+    assert_eq!(
+        inner.as_rule(),
+        Rule::bool_lit,
+        "got: {:?}",
+        inner.as_rule()
+    );
 }
 
 #[test]
@@ -318,7 +352,8 @@ fn two_files_same_crate_directory() {
     // items; which crate they belong to is the compiler driver's job (which directory
     // it found them in when resolving a `use`), not something expressed in the grammar.
     let file_a = "struct Vec2 { x: f64, y: f64 }";
-    let file_b = "impl Ring<Vec2> { fn add(a: Vec2, b: Vec2) -> Vec2 { Vec2(a.x + b.x, a.y + b.y) } }";
+    let file_b =
+        "impl Ring<Vec2> { fn add(a: Vec2, b: Vec2) -> Vec2 { Vec2(a.x + b.x, a.y + b.y) } }";
     parses(Rule::program, file_a);
     parses(Rule::program, file_b);
 }
@@ -365,14 +400,25 @@ fn turbofish_is_not_confused_with_comparison_chains() {
     // inspecting *which* alternative `primary` picked, not just that
     // something parsed — same style as `zero_arg_call_is_not_parsed_as_a_
     // struct_literal`.
-    let pair = CleaveParser::parse(Rule::primary, "f::<i32>(x)").unwrap().next().unwrap();
+    let pair = CleaveParser::parse(Rule::primary, "f::<i32>(x)")
+        .unwrap()
+        .next()
+        .unwrap();
     let inner = pair.into_inner().next().unwrap();
-    assert_eq!(inner.as_rule(), Rule::call_expr, "got: {:?}", inner.as_rule());
+    assert_eq!(
+        inner.as_rule(),
+        Rule::call_expr,
+        "got: {:?}",
+        inner.as_rule()
+    );
 }
 
 #[test]
 fn function_type_annotation_parses() {
-    parses(Rule::fn_decl, "fn apply(f: (i32) -> i32, x: i32) -> i32 { f(x) }");
+    parses(
+        Rule::fn_decl,
+        "fn apply(f: (i32) -> i32, x: i32) -> i32 { f(x) }",
+    );
 }
 
 #[test]
@@ -387,27 +433,48 @@ fn function_type_with_multiple_params_parses() {
 
 #[test]
 fn inherent_impl_on_a_bare_struct_name_parses() {
-    parses(Rule::impl_decl, "impl struct Vec2 {\n    fn len(v) { v.x }\n}");
+    parses(
+        Rule::impl_decl,
+        "impl struct Vec2 {\n    fn len(v) { v.x }\n}",
+    );
 }
 
 #[test]
 fn inherent_impl_on_a_generic_struct_parses() {
-    parses(Rule::impl_decl, "impl<T> struct Matrix<T> {\n    fn get(m) { m }\n}");
+    parses(
+        Rule::impl_decl,
+        "impl<T> struct Matrix<T> {\n    fn get(m) { m }\n}",
+    );
 }
 
 #[test]
 fn inherent_impl_is_distinguished_from_an_algebra_impl_by_the_struct_keyword() {
-    let pair =
-        CleaveParser::parse(Rule::impl_decl, "impl struct Vec2 { fn len(v) { v.x } }").unwrap().next().unwrap();
+    let pair = CleaveParser::parse(Rule::impl_decl, "impl struct Vec2 { fn len(v) { v.x } }")
+        .unwrap()
+        .next()
+        .unwrap();
     let inner = pair.into_inner().next().unwrap();
-    assert_eq!(inner.as_rule(), Rule::inherent_impl, "got: {:?}", inner.as_rule());
+    assert_eq!(
+        inner.as_rule(),
+        Rule::inherent_impl,
+        "got: {:?}",
+        inner.as_rule()
+    );
 }
 
 #[test]
 fn algebra_impl_is_still_recognized_as_such() {
-    let pair = CleaveParser::parse(Rule::impl_decl, "impl Ring<Vec2> { fn add(a, b) { a } }").unwrap().next().unwrap();
+    let pair = CleaveParser::parse(Rule::impl_decl, "impl Ring<Vec2> { fn add(a, b) { a } }")
+        .unwrap()
+        .next()
+        .unwrap();
     let inner = pair.into_inner().next().unwrap();
-    assert_eq!(inner.as_rule(), Rule::algebra_impl, "got: {:?}", inner.as_rule());
+    assert_eq!(
+        inner.as_rule(),
+        Rule::algebra_impl,
+        "got: {:?}",
+        inner.as_rule()
+    );
 }
 
 #[test]
@@ -418,12 +485,20 @@ fn a_single_generic_struct_target_is_no_longer_ambiguous_with_an_algebra_impl() 
     // its own single-type target, and fully matches, wrongly, since
     // `algebra_impl` is tried first. The `struct` keyword makes the two
     // shapes unambiguous at the very first token that differs.
-    let pair = CleaveParser::parse(Rule::impl_decl, "impl<T> struct Boxed<T> { fn get(b) { b } }")
-        .unwrap()
-        .next()
-        .unwrap();
+    let pair = CleaveParser::parse(
+        Rule::impl_decl,
+        "impl<T> struct Boxed<T> { fn get(b) { b } }",
+    )
+    .unwrap()
+    .next()
+    .unwrap();
     let inner = pair.into_inner().next().unwrap();
-    assert_eq!(inner.as_rule(), Rule::inherent_impl, "got: {:?}", inner.as_rule());
+    assert_eq!(
+        inner.as_rule(),
+        Rule::inherent_impl,
+        "got: {:?}",
+        inner.as_rule()
+    );
 }
 
 #[test]
@@ -448,21 +523,43 @@ fn derive_decl_parses() {
 
 #[test]
 fn derive_decl_is_a_valid_top_level_item() {
-    let pair = CleaveParser::parse(Rule::item, "fprime = derive(f);").unwrap().next().unwrap();
+    let pair = CleaveParser::parse(Rule::item, "fprime = derive(f);")
+        .unwrap()
+        .next()
+        .unwrap();
     let inner = pair.into_inner().next().unwrap();
-    assert_eq!(inner.as_rule(), Rule::derive_decl, "got: {:?}", inner.as_rule());
+    assert_eq!(
+        inner.as_rule(),
+        Rule::derive_decl,
+        "got: {:?}",
+        inner.as_rule()
+    );
 }
 
 #[test]
 fn derivative_rule_decl_parses() {
-    parses(Rule::derivative_rule_decl, "derivative mul(a, b): add(mul(a, d(b)), mul(d(a), b));");
+    parses(
+        Rule::derivative_rule_decl,
+        "derivative mul(a, b): add(mul(a, d(b)), mul(d(a), b));",
+    );
 }
 
 #[test]
 fn derivative_rule_decl_is_a_valid_algebra_item() {
-    let pair = CleaveParser::parse(Rule::algebra_item, "derivative mul(a, b): add(mul(a, d(b)), mul(d(a), b));").unwrap().next().unwrap();
+    let pair = CleaveParser::parse(
+        Rule::algebra_item,
+        "derivative mul(a, b): add(mul(a, d(b)), mul(d(a), b));",
+    )
+    .unwrap()
+    .next()
+    .unwrap();
     let inner = pair.into_inner().next().unwrap();
-    assert_eq!(inner.as_rule(), Rule::derivative_rule_decl, "got: {:?}", inner.as_rule());
+    assert_eq!(
+        inner.as_rule(),
+        Rule::derivative_rule_decl,
+        "got: {:?}",
+        inner.as_rule()
+    );
 }
 
 #[test]
@@ -497,7 +594,10 @@ fn tuple_literal_with_more_than_two_elements_parses() {
 
 #[test]
 fn a_single_parenthesized_expression_is_still_ordinary_grouping_not_a_tuple() {
-    let pair = CleaveParser::parse(Rule::expr, "(1 + 2)").unwrap().next().unwrap();
+    let pair = CleaveParser::parse(Rule::expr, "(1 + 2)")
+        .unwrap()
+        .next()
+        .unwrap();
     // Walks down to `primary` and confirms it took the bare-grouping
     // alternative, not `tuple_lit` — a tuple literal needs at least one
     // top-level `,`, which `(1 + 2)` never has.
@@ -524,7 +624,10 @@ fn chained_tuple_field_access_into_a_nested_tuple_parses() {
     // token — found worth checking directly, not assumed (this grammar has
     // no separate lexer pass to worry about, but that's exactly the kind of
     // thing worth confirming rather than guessing).
-    let pair = CleaveParser::parse(Rule::expr, "t.0.1").unwrap().next().unwrap();
+    let pair = CleaveParser::parse(Rule::expr, "t.0.1")
+        .unwrap()
+        .next()
+        .unwrap();
     let text = pair.as_str();
     assert_eq!(text, "t.0.1");
 }
@@ -569,10 +672,16 @@ fn a_pack_reference_as_a_whole_type_parses() {
 
 #[test]
 fn a_struct_declaring_a_const_generic_pack_used_as_array_dims_parses() {
-    parses(Rule::struct_decl, "struct Tensor<T, const Dims...: i32> { data: [T; Dims...] }");
+    parses(
+        Rule::struct_decl,
+        "struct Tensor<T, const Dims...: i32> { data: [T; Dims...] }",
+    );
 }
 
 #[test]
 fn a_function_declaring_a_type_generic_pack_parses() {
-    parses(Rule::fn_decl, "fn print<Args...>(args: Args...) -> Args... { args }");
+    parses(
+        Rule::fn_decl,
+        "fn print<Args...>(args: Args...) -> Args... { args }",
+    );
 }

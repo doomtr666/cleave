@@ -217,10 +217,18 @@ pub struct ConcreteUnit {
 pub fn collect_mlir_types(program: &Program) -> HashMap<String, String> {
     let mut types = HashMap::new();
     for item in &program.items {
-        let ItemKind::Impl(d) = &item.kind else { continue };
-        let Some(attr) = d.attrs.iter().find(|a| a.name == "mlir_type") else { continue };
-        let Some(text) = attr.args.first() else { continue };
-        let TypeKind::Path(path, _) = &d.target.kind else { continue };
+        let ItemKind::Impl(d) = &item.kind else {
+            continue;
+        };
+        let Some(attr) = d.attrs.iter().find(|a| a.name == "mlir_type") else {
+            continue;
+        };
+        let Some(text) = attr.args.first() else {
+            continue;
+        };
+        let TypeKind::Path(path, _) = &d.target.kind else {
+            continue;
+        };
         types.insert(path.segments.join("::"), text.clone());
     }
     types
@@ -258,11 +266,24 @@ pub struct StructSchema {
 pub fn collect_struct_schemas(program: &Program) -> HashMap<String, StructSchema> {
     let mut schemas = HashMap::new();
     for item in &program.items {
-        let ItemKind::Struct(d) = &item.kind else { continue };
+        let ItemKind::Struct(d) = &item.kind else {
+            continue;
+        };
         let has_pack = d.generics.last().is_some_and(GenericParam::is_variadic);
         let generics = d.generics.iter().map(|g| g.name().to_string()).collect();
-        let fields = d.fields.iter().map(|f| (f.name.clone(), f.ty.clone())).collect();
-        schemas.insert(d.name.clone(), StructSchema { generics, has_pack, fields });
+        let fields = d
+            .fields
+            .iter()
+            .map(|f| (f.name.clone(), f.ty.clone()))
+            .collect();
+        schemas.insert(
+            d.name.clone(),
+            StructSchema {
+                generics,
+                has_pack,
+                fields,
+            },
+        );
     }
     schemas
 }
@@ -276,7 +297,9 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
     for item in &program.items {
         match &item.kind {
             ItemKind::Fn(f) => {
-                let Some(Ok(fn_result)) = program_inference.results.get(&f.name) else { continue };
+                let Some(Ok(fn_result)) = program_inference.results.get(&f.name) else {
+                    continue;
+                };
                 let keys = mono.specializations_of(&f.name);
                 if keys.is_empty() {
                     // Non-generic. A bodyless top-level `fn` is rejected by
@@ -289,8 +312,12 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                     // is `Some` at this point unless one of those two.
                     let body = match &f.body {
                         Some(b) => UnitBody::Real(b.clone()),
-                        None if f.is_extern => UnitBody::Extern(f.extern_symbol.clone().unwrap_or_else(|| f.name.clone())),
-                        None if f.derivative_of.is_some() => UnitBody::Derivative(f.derivative_of.clone().unwrap()),
+                        None if f.is_extern => UnitBody::Extern(
+                            f.extern_symbol.clone().unwrap_or_else(|| f.name.clone()),
+                        ),
+                        None if f.derivative_of.is_some() => {
+                            UnitBody::Derivative(f.derivative_of.clone().unwrap())
+                        }
                         None => continue,
                     };
                     units.push(ConcreteUnit {
@@ -329,7 +356,11 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                 }
             }
             ItemKind::Impl(d)
-                if d.generics.is_empty() && !registry.generics(&d.algebra).iter().any(|g| matches!(g, GenericParam::Const { .. })) =>
+                if d.generics.is_empty()
+                    && !registry
+                        .generics(&d.algebra)
+                        .iter()
+                        .any(|g| matches!(g, GenericParam::Const { .. })) =>
             {
                 // Non-generic algebra impl — mirrors `monomorphize.rs`'s own
                 // `dump_concrete_impl`, re-inferring directly (no template
@@ -352,13 +383,19 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                 // `monomorphize.rs`'s own `impl_worklist` (see `ImplTemplate::
                 // is_generic`'s own doc comment for the identical fix there),
                 // simply never reached because this branch matched first.
-                let all_targets: Vec<Type> =
-                    std::iter::once(d.target.clone()).chain(d.extra_targets.iter().cloned()).collect();
+                let all_targets: Vec<Type> = std::iter::once(d.target.clone())
+                    .chain(d.extra_targets.iter().cloned())
+                    .collect();
                 for f in &d.fns {
                     let mut infer = Infer::new(registry);
-                    let Ok(ret) =
-                        infer.infer_impl_fn_generic_with_env(&program_inference.global_env, &d.algebra, &d.generics, &all_targets, f, item.span)
-                    else {
+                    let Ok(ret) = infer.infer_impl_fn_generic_with_env(
+                        &program_inference.global_env,
+                        &d.algebra,
+                        &d.generics,
+                        &all_targets,
+                        f,
+                        item.span,
+                    ) else {
                         continue; // already reported via --dump-inference-pass
                     };
                     // `infer_impl_fn_generic_with_env` above already rejects
@@ -368,7 +405,9 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                     // only ever means `extern` by the time this is reached.
                     let body = match &f.body {
                         Some(b) => UnitBody::Real(b.clone()),
-                        None => UnitBody::Extern(f.extern_symbol.clone().unwrap_or_else(|| f.name.clone())),
+                        None => UnitBody::Extern(
+                            f.extern_symbol.clone().unwrap_or_else(|| f.name.clone()),
+                        ),
                     };
                     // A *qualified* call inside this method's own body
                     // (`Transcendental::tanh(x)` inside `Activation<f64>::
@@ -389,7 +428,10 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                     // narrower, separate gap — no known case needs it yet).
                     let mut call_names = HashMap::new();
                     monomorphize::collect_instantiations(
-                        &f.body.clone().unwrap_or(Block { stmts: Vec::new(), tail: None }),
+                        &f.body.clone().unwrap_or(Block {
+                            stmts: Vec::new(),
+                            tail: None,
+                        }),
                         &infer.node_types,
                         &program_inference.global_env,
                         mono.templates(),
@@ -403,7 +445,12 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                         &mut call_names,
                         &mut Vec::new(),
                     );
-                    let targets_str = infer.target_types.iter().map(Ty::to_string).collect::<Vec<_>>().join(", ");
+                    let targets_str = infer
+                        .target_types
+                        .iter()
+                        .map(Ty::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     units.push(ConcreteUnit {
                         name: format!("{}::{}<{targets_str}>", d.algebra, f.name),
                         params: f.params.clone(),
@@ -449,7 +496,11 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                     let origin_key = format!("{}::{}", d.algebra, f.name);
                     for key in mono.specializations_of(&origin_key) {
                         let body = if mono.is_extern(key) {
-                            UnitBody::Extern(mono.extern_symbol(key).map(String::from).unwrap_or_else(|| f.name.clone()))
+                            UnitBody::Extern(
+                                mono.extern_symbol(key)
+                                    .map(String::from)
+                                    .unwrap_or_else(|| f.name.clone()),
+                            )
                         } else {
                             UnitBody::Real(mono.body(key).clone())
                         };
@@ -484,12 +535,22 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                 // `is_even`), the same way `callgraph::infer_program`
                 // already does for a mutually-recursive top-level `fn`
                 // group.
-                let TypeKind::Path(p, _) = &d.target.kind else { continue };
+                let TypeKind::Path(p, _) = &d.target.kind else {
+                    continue;
+                };
                 let struct_name = p.segments.join("::");
                 let mut infer = Infer::new(registry);
-                let (_, results) = infer.infer_inherent_impl_block(&program_inference.global_env, &d.generics, &d.target, &d.fns, item.span);
+                let (_, results) = infer.infer_inherent_impl_block(
+                    &program_inference.global_env,
+                    &d.generics,
+                    &d.target,
+                    &d.fns,
+                    item.span,
+                );
                 for f in &d.fns {
-                    let Some(Ok((param_types, result))) = results.get(&f.name) else { continue }; // already reported via --dump-inference-pass
+                    let Some(Ok((param_types, result))) = results.get(&f.name) else {
+                        continue;
+                    }; // already reported via --dump-inference-pass
                     // A bodyless inherent method has no `#[mlir(...)]`/
                     // `extern`-style intrinsic equivalent yet — nothing to
                     // build a unit from.
@@ -515,7 +576,9 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                 // Generic inherent impl — every specialization actually
                 // reached, already built by `monomorphize`'s own inherent-
                 // method worklist.
-                let TypeKind::Path(p, _) = &d.target.kind else { continue };
+                let TypeKind::Path(p, _) = &d.target.kind else {
+                    continue;
+                };
                 let struct_name = p.segments.join("::");
                 for f in &d.fns {
                     let origin_key = format!("{struct_name}::{}", f.name);
@@ -570,9 +633,17 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
             let captures = lambda_free_vars(own_params, body, node_types);
             let capture_names = sorted_capture_names(&captures);
 
-            let mut params: Vec<Param> = capture_names.iter().map(|n| Param { name: n.clone(), ty: None, mutable: false }).collect();
+            let mut params: Vec<Param> = capture_names
+                .iter()
+                .map(|n| Param {
+                    name: n.clone(),
+                    ty: None,
+                    mutable: false,
+                })
+                .collect();
             params.extend(own_params.iter().cloned());
-            let mut param_types: Vec<Ty> = capture_names.iter().map(|n| captures[n].clone()).collect();
+            let mut param_types: Vec<Ty> =
+                capture_names.iter().map(|n| captures[n].clone()).collect();
             param_types.extend(mono.param_types(key).iter().cloned());
 
             units.push(ConcreteUnit {
@@ -654,7 +725,11 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
 ///    evaluating normally.
 fn build_higher_order_specializations(units: &mut Vec<ConcreteUnit>) {
     let call_index = build_call_index(units);
-    let unit_index: HashMap<String, usize> = units.iter().enumerate().map(|(i, u)| (u.name.clone(), i)).collect();
+    let unit_index: HashMap<String, usize> = units
+        .iter()
+        .enumerate()
+        .map(|(i, u)| (u.name.clone(), i))
+        .collect();
 
     struct HigherOrderCall {
         caller_idx: usize,
@@ -668,11 +743,15 @@ fn build_higher_order_specializations(units: &mut Vec<ConcreteUnit>) {
 
     let mut found: Vec<HigherOrderCall> = Vec::new();
     for (caller_idx, u) in units.iter().enumerate() {
-        let UnitBody::Real(body) = &u.body else { continue };
+        let UnitBody::Real(body) = &u.body else {
+            continue;
+        };
         let mut exprs = Vec::new();
         monomorphize::collect_exprs_block(body, &mut exprs);
         for e in exprs {
-            let ExprKind::Call(path, _, args, ..) = &e.kind else { continue };
+            let ExprKind::Call(path, _, args, ..) = &e.kind else {
+                continue;
+            };
             let mut erased = Vec::new();
             for (i, a) in args.iter().enumerate() {
                 if !matches!(u.node_types.get(&a.id), Some(Ty::Fn(..))) {
@@ -699,7 +778,10 @@ fn build_higher_order_specializations(units: &mut Vec<ConcreteUnit>) {
             } else if unit_index.contains_key(&name) {
                 name.clone()
             } else {
-                let arg_tys: Vec<String> = args.iter().map(|a| u.node_types[&a.id].to_string()).collect();
+                let arg_tys: Vec<String> = args
+                    .iter()
+                    .map(|a| u.node_types[&a.id].to_string())
+                    .collect();
                 let ret_ty = u.node_types[&e.id].to_string();
                 match call_index.get(&(name.clone(), arg_tys, ret_ty)) {
                     Some(n) => n.clone(),
@@ -709,7 +791,12 @@ fn build_higher_order_specializations(units: &mut Vec<ConcreteUnit>) {
                     None => continue,
                 }
             };
-            found.push(HigherOrderCall { caller_idx, call_id: e.id, callee_unit_name, erased });
+            found.push(HigherOrderCall {
+                caller_idx,
+                call_id: e.id,
+                callee_unit_name,
+                erased,
+            });
         }
     }
 
@@ -725,8 +812,12 @@ fn build_higher_order_specializations(units: &mut Vec<ConcreteUnit>) {
         if specialized.contains_key(&key) {
             continue;
         }
-        let Some(&callee_idx) = unit_index.get(&call.callee_unit_name) else { continue };
-        let UnitBody::Real(callee_body) = &units[callee_idx].body else { continue };
+        let Some(&callee_idx) = unit_index.get(&call.callee_unit_name) else {
+            continue;
+        };
+        let UnitBody::Real(callee_body) = &units[callee_idx].body else {
+            continue;
+        };
         let callee_body = callee_body.clone();
         let callee_params = units[callee_idx].params.clone();
         let callee_param_types = units[callee_idx].param_types.clone();
@@ -742,12 +833,15 @@ fn build_higher_order_specializations(units: &mut Vec<ConcreteUnit>) {
 
         for (pos, resolved_name) in &call.erased {
             let erased_param_name = callee_params[*pos].name.clone();
-            let Some(&resolved_idx) = unit_index.get(resolved_name) else { continue };
+            let Some(&resolved_idx) = unit_index.get(resolved_name) else {
+                continue;
+            };
             let resolved_unit = &units[resolved_idx];
             let n = resolved_unit.capture_count;
             let capture_params: Vec<Param> = resolved_unit.params[..n].to_vec();
             let capture_types: Vec<Ty> = resolved_unit.param_types[..n].to_vec();
-            let capture_names: Vec<String> = capture_params.iter().map(|p| p.name.clone()).collect();
+            let capture_names: Vec<String> =
+                capture_params.iter().map(|p| p.name.clone()).collect();
             new_params.extend(capture_params);
             new_param_types.extend(capture_types);
             baked_closures.push((erased_param_name.clone(), capture_names));
@@ -776,7 +870,11 @@ fn build_higher_order_specializations(units: &mut Vec<ConcreteUnit>) {
             }
         }
 
-        let subs: Vec<String> = call.erased.iter().map(|(i, n)| format!("{}={}", callee_params[*i].name, n)).collect();
+        let subs: Vec<String> = call
+            .erased
+            .iter()
+            .map(|(i, n)| format!("{}={}", callee_params[*i].name, n))
+            .collect();
         let specialized_name = format!("{}[{}]", call.callee_unit_name, subs.join(","));
 
         new_units.push(ConcreteUnit {
@@ -800,10 +898,14 @@ fn build_higher_order_specializations(units: &mut Vec<ConcreteUnit>) {
 
     for call in &found {
         let key = (call.callee_unit_name.clone(), call.erased.clone());
-        let Some(specialized_name) = specialized.get(&key) else { continue };
+        let Some(specialized_name) = specialized.get(&key) else {
+            continue;
+        };
         let positions: Vec<usize> = call.erased.iter().map(|(i, _)| *i).collect();
         let caller = &mut units[call.caller_idx];
-        caller.call_names.insert(call.call_id, specialized_name.clone());
+        caller
+            .call_names
+            .insert(call.call_id, specialized_name.clone());
         caller.higher_order_args.insert(call.call_id, positions);
     }
 
@@ -860,7 +962,9 @@ pub enum CVal {
     /// value — it only ever lives inside `CEnv`, consumed exclusively by
     /// `convert_expr`'s own `Call`/`Path` arms, and is fully gone by the time
     /// a `CpsProgram` is built; `mlir_lower.rs` never sees this variant.
-    Closure { captures: Vec<CVal> },
+    Closure {
+        captures: Vec<CVal>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -873,14 +977,20 @@ pub enum PrimOp {
     /// field order (hence `llvm.extractvalue`'s own required `position`)
     /// applies here — recovering it from the base's already-lowered MLIR
     /// `Value` alone isn't possible.
-    Field { struct_ty: Ty, field: String },
+    Field {
+        struct_ty: Ty,
+        field: String,
+    },
     /// `args = [base, value]` — a real effect, mutating `base`'s own field
     /// in place (a struct is a stable reference, see `mlir_lower.rs::
     /// struct_llvm_type`'s own doc comment); its own bound result is unit
     /// and never read, same shape as `Store`'s own doc comment for arrays.
     /// `struct_ty`/`field` — see `Field`'s own doc comment for why the
     /// base's own concrete type has to be carried explicitly.
-    FieldStore { struct_ty: Ty, field: String },
+    FieldStore {
+        struct_ty: Ty,
+        field: String,
+    },
     Struct(String, Vec<String>),
     /// `args` are the element values, in order (`ExprKind::ArrayLit`).
     Array,
@@ -895,11 +1005,15 @@ pub enum PrimOp {
     /// own — see `mlir_lower.rs`'s own `struct_llvm_type`/`lower_array_load`
     /// doc comments); recovering the element type/dimensions from the
     /// already-lowered `Value` alone only works for the first case.
-    Load { array_ty: Ty },
+    Load {
+        array_ty: Ty,
+    },
     /// `args = [array, index..., value]` — a real effect, mutating `array`
     /// in place; its own bound result is unit and never read. `array_ty` —
     /// see `Load`'s own doc comment.
-    Store { array_ty: Ty },
+    Store {
+        array_ty: Ty,
+    },
     /// A call to a real, separately-compiled C-ABI symbol (`UnitBody::
     /// Extern`) — `param_types` is threaded through explicitly (from the
     /// callee's own `ConcreteUnit::param_types`, already on hand at
@@ -908,7 +1022,10 @@ pub enum PrimOp {
     /// each argument's *expected* MLIR type — a bare literal argument
     /// carries no width of its own in this IR, the same gap `LetPrim`'s own
     /// `ty` field exists to close for the result alone.
-    Extern { symbol: String, param_types: Vec<Ty> },
+    Extern {
+        symbol: String,
+        param_types: Vec<Ty>,
+    },
     /// A reserved `mlir::dialect::op(...)` call (`ExprKind::Call` whose path
     /// starts with `"mlir"`, recognized structurally in `convert_expr` —
     /// see that match arm's own doc comment) — `op` is the real MLIR
@@ -920,24 +1037,40 @@ pub enum PrimOp {
     /// surface for primitive operations now -- no per-op-name Rust match
     /// left anywhere, matching `doc/hld.md`'s own "one generic 'emit this
     /// named MLIR op' primitive" goal.
-    RawMlirOp { op: String, attrs: Vec<(String, String)> },
+    RawMlirOp {
+        op: String,
+        attrs: Vec<(String, String)>,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub enum CExpr {
-    LetPrim { var: CVar, ty: Ty, op: PrimOp, args: Vec<CVal>, cont: Box<CExpr> },
+    LetPrim {
+        var: CVar,
+        ty: Ty,
+        op: PrimOp,
+        args: Vec<CVal>,
+        cont: Box<CExpr>,
+    },
     /// `func(args)` — for a *real* callee, `args`' own last entry is, by
     /// convention, the continuation to invoke with the result. A `PrimOp`
     /// never appears here — that's a `LetPrim`.
     App { func: CVal, args: Vec<CVal> },
     /// Introduces one or more local, single-use continuations — what a
     /// later, separate closure-conversion pass eventually flattens away.
-    Fix { defs: Vec<CFunDef>, body: Box<CExpr> },
+    Fix {
+        defs: Vec<CFunDef>,
+        body: Box<CExpr>,
+    },
     /// Both arms are expected to end by tail-calling the same synthesized
     /// join continuation (see `convert_expr`'s own `ExprKind::If` arm) —
     /// `CExpr` itself doesn't enforce that, it's a convention of how this
     /// module builds one.
-    If { cond: CVal, then_branch: Box<CExpr>, else_branch: Box<CExpr> },
+    If {
+        cond: CVal,
+        then_branch: Box<CExpr>,
+        else_branch: Box<CExpr>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1023,11 +1156,17 @@ pub(crate) struct FreshVars {
 
 impl FreshVars {
     pub(crate) fn new() -> Self {
-        FreshVars { next_var: Cell::new(0), next_label: Cell::new(0) }
+        FreshVars {
+            next_var: Cell::new(0),
+            next_label: Cell::new(0),
+        }
     }
 
     pub(crate) fn starting_at(next_var: CVar) -> Self {
-        FreshVars { next_var: Cell::new(next_var), next_label: Cell::new(0) }
+        FreshVars {
+            next_var: Cell::new(next_var),
+            next_label: Cell::new(0),
+        }
     }
 
     pub(crate) fn var(&self) -> CVar {
@@ -1126,7 +1265,8 @@ type CEnv = HashMap<String, CVal>;
 /// directly at their own call sites instead).
 pub fn convert_program(units: Vec<ConcreteUnit>) -> CpsProgram {
     let call_index = build_call_index(&units);
-    let by_name: HashMap<String, ConcreteUnit> = units.into_iter().map(|u| (u.name.clone(), u)).collect();
+    let by_name: HashMap<String, ConcreteUnit> =
+        units.into_iter().map(|u| (u.name.clone(), u)).collect();
     let fresh = FreshVars::new();
     let mut funcs = Vec::new();
     // Sorted, not raw `by_name.values()` -- `HashMap` iteration order isn't
@@ -1140,7 +1280,9 @@ pub fn convert_program(units: Vec<ConcreteUnit>) -> CpsProgram {
     let mut sorted_units: Vec<&ConcreteUnit> = by_name.values().collect();
     sorted_units.sort_by(|a, b| a.name.cmp(&b.name));
     for unit in sorted_units {
-        let UnitBody::Real(body) = &unit.body else { continue };
+        let UnitBody::Real(body) = &unit.body else {
+            continue;
+        };
         // A unit with a `Ty::Fn`-typed parameter of its own can never be
         // converted/called *as declared* — a lambda has no runtime
         // representation at all (see `CVal::Closure`'s own doc comment), so
@@ -1192,9 +1334,17 @@ pub fn convert_program(units: Vec<ConcreteUnit>) -> CpsProgram {
         }
         let k_ret = fresh.var();
         params.push(k_ret);
-        let cexpr = convert_block(body, &env, &ctx, &|v, _env| CExpr::App { func: CVal::Var(k_ret), args: vec![v] });
+        let cexpr = convert_block(body, &env, &ctx, &|v, _env| CExpr::App {
+            func: CVal::Var(k_ret),
+            args: vec![v],
+        });
         funcs.push(CTopLevelFn {
-            def: CFunDef { name: unit.name.clone(), params, body: cexpr, carried_types: None },
+            def: CFunDef {
+                name: unit.name.clone(),
+                params,
+                body: cexpr,
+                carried_types: None,
+            },
             param_types: unit.param_types.clone(),
             result: unit.result.clone(),
             k_ret,
@@ -1244,14 +1394,19 @@ fn convert_block(block: &Block, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -
 /// opaque, can't be "checked" from outside — the whole reason this can't
 /// just be `if running { convert_stmts(rest,...) } else { k(...) }` as a
 /// bare Rust `if`).
-fn continue_after(rest: &[Stmt], env: CEnv, ctx: &Ctx, might_break: bool, k: &dyn Fn(CEnv) -> CExpr) -> CExpr {
+fn continue_after(
+    rest: &[Stmt],
+    env: CEnv,
+    ctx: &Ctx,
+    might_break: bool,
+    k: &dyn Fn(CEnv) -> CExpr,
+) -> CExpr {
     if !might_break {
         return convert_stmts(rest, env, ctx, k);
     }
-    let running = env
-        .get("__loop_running")
-        .cloned()
-        .unwrap_or_else(|| panic!("CPS: expected `__loop_running` to already be bound by this point"));
+    let running = env.get("__loop_running").cloned().unwrap_or_else(|| {
+        panic!("CPS: expected `__loop_running` to already be bound by this point")
+    });
 
     // Whatever `rest` itself mutates in an *enclosing* scope — needed so
     // the "skip" path still hands `k` the correct, unmodified values for
@@ -1263,7 +1418,9 @@ fn continue_after(rest: &[Stmt], env: CEnv, ctx: &Ctx, might_break: bool, k: &dy
     let carried_types: Vec<Ty> = names.iter().map(|n| mutated[n].clone()).collect();
 
     let join_label = ctx.fresh.label("j");
-    let then_cexpr = convert_stmts(rest, env.clone(), ctx, &|env2| tail_call_join(&env2, CVal::Unit, &carried, &join_label));
+    let then_cexpr = convert_stmts(rest, env.clone(), ctx, &|env2| {
+        tail_call_join(&env2, CVal::Unit, &carried, &join_label)
+    });
     let else_cexpr = tail_call_join(&env, CVal::Unit, &carried, &join_label);
 
     let result_var = ctx.fresh.var();
@@ -1285,8 +1442,17 @@ fn continue_after(rest: &[Stmt], env: CEnv, ctx: &Ctx, might_break: bool, k: &dy
     join_types.extend(carried_types);
 
     CExpr::Fix {
-        defs: vec![CFunDef { name: join_label, params: join_params, body: join_body, carried_types: Some(join_types) }],
-        body: Box::new(CExpr::If { cond: running, then_branch: Box::new(then_cexpr), else_branch: Box::new(else_cexpr) }),
+        defs: vec![CFunDef {
+            name: join_label,
+            params: join_params,
+            body: join_body,
+            carried_types: Some(join_types),
+        }],
+        body: Box::new(CExpr::If {
+            cond: running,
+            then_branch: Box::new(then_cexpr),
+            else_branch: Box::new(else_cexpr),
+        }),
     }
 }
 
@@ -1295,7 +1461,11 @@ fn continue_after(rest: &[Stmt], env: CEnv, ctx: &Ctx, might_break: bool, k: &dy
 /// (used only by `continue_after`, above, for "what does `rest` itself
 /// mutate," and `rest` is always a suffix of some block's own `stmts`,
 /// never that block's own trailing tail expression).
-fn mutated_free_vars_stmts(stmts: &[Stmt], shadowed: &HashSet<String>, ctx: &Ctx) -> HashMap<String, Ty> {
+fn mutated_free_vars_stmts(
+    stmts: &[Stmt],
+    shadowed: &HashSet<String>,
+    ctx: &Ctx,
+) -> HashMap<String, Ty> {
     let mut local_shadowed = shadowed.clone();
     let mut escaping = HashMap::new();
     for stmt in stmts {
@@ -1357,7 +1527,9 @@ fn convert_stmts(stmts: &[Stmt], env: CEnv, ctx: &Ctx, k: &dyn Fn(CEnv) -> CExpr
         // itself (`ctx.call_names`, exactly like any other generic
         // instantiation), not decided here.
         StmtKind::Let { name, value, .. } if matches!(value.kind, ExprKind::Lambda { .. }) => {
-            let ExprKind::Lambda { params, body, .. } = &value.kind else { unreachable!() };
+            let ExprKind::Lambda { params, body, .. } = &value.kind else {
+                unreachable!()
+            };
             let free = lambda_free_vars(params, body, ctx.node_types);
             let captures: Vec<CVal> = sorted_capture_names(&free)
                 .into_iter()
@@ -1379,7 +1551,9 @@ fn convert_stmts(stmts: &[Stmt], env: CEnv, ctx: &Ctx, k: &dyn Fn(CEnv) -> CExpr
                 continue_after(rest, env2, ctx, might_break, k)
             })
         }
-        StmtKind::Expr(e) => convert_expr(e, &env, ctx, &|_v, env| continue_after(rest, env.clone(), ctx, might_break, k)),
+        StmtKind::Expr(e) => convert_expr(e, &env, ctx, &|_v, env| {
+            continue_after(rest, env.clone(), ctx, might_break, k)
+        }),
         StmtKind::Assign { target, value } => match &target.kind {
             ExprKind::Path(p) => {
                 let name = p.segments.join("::");
@@ -1419,9 +1593,17 @@ fn convert_stmts(stmts: &[Stmt], env: CEnv, ctx: &Ctx, k: &dyn Fn(CEnv) -> CExpr
                             CExpr::LetPrim {
                                 var,
                                 ty: Ty::Con("()".to_string()),
-                                op: PrimOp::Store { array_ty: array_ty.clone() },
+                                op: PrimOp::Store {
+                                    array_ty: array_ty.clone(),
+                                },
                                 args,
-                                cont: Box::new(continue_after(rest, env.clone(), ctx, might_break, k)),
+                                cont: Box::new(continue_after(
+                                    rest,
+                                    env.clone(),
+                                    ctx,
+                                    might_break,
+                                    k,
+                                )),
                             }
                         })
                     })
@@ -1441,7 +1623,10 @@ fn convert_stmts(stmts: &[Stmt], env: CEnv, ctx: &Ctx, k: &dyn Fn(CEnv) -> CExpr
                         CExpr::LetPrim {
                             var,
                             ty: Ty::Con("()".to_string()),
-                            op: PrimOp::FieldStore { struct_ty: struct_ty.clone(), field: field.clone() },
+                            op: PrimOp::FieldStore {
+                                struct_ty: struct_ty.clone(),
+                                field: field.clone(),
+                            },
                             args: vec![base_val.clone(), new_val],
                             cont: Box::new(continue_after(rest, env.clone(), ctx, might_break, k)),
                         }
@@ -1535,7 +1720,9 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                 // ordinary `LetPrim`/`App` argument position, which
                 // `mlir_lower.rs` has no representation for at all.
                 Some(CVal::Closure { .. }) => {
-                    panic!("CPS: `{name}` names a lambda used as an ordinary value (not called directly by name) -- not supported yet")
+                    panic!(
+                        "CPS: `{name}` names a lambda used as an ordinary value (not called directly by name) -- not supported yet"
+                    )
                 }
                 Some(v) => v.clone(),
                 // A const generic referenced as an ordinary value (`[v; N]`,
@@ -1562,7 +1749,10 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                 CExpr::LetPrim {
                     var,
                     ty: ctx.node_types[&expr.id].clone(),
-                    op: PrimOp::Field { struct_ty: struct_ty.clone(), field: field.clone() },
+                    op: PrimOp::Field {
+                        struct_ty: struct_ty.clone(),
+                        field: field.clone(),
+                    },
                     args: vec![base_val],
                     cont: Box::new(k(CVal::Var(var), env)),
                 }
@@ -1589,7 +1779,9 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
         // checking. Straight-line like `PrimOp::Extern`: an MLIR op is
         // always synchronous, no `Fix`/continuation needed just because its
         // meaning happens to live outside the algebra registry.
-        ExprKind::Call(path, _, args, mlir_attrs) if path.segments.first().map(String::as_str) == Some("mlir") => {
+        ExprKind::Call(path, _, args, mlir_attrs)
+            if path.segments.first().map(String::as_str) == Some("mlir") =>
+        {
             let op = path.segments[1..].join(".");
             let arg_refs: Vec<&Expr> = args.iter().collect();
             let result_ty = ctx.node_types[&expr.id].clone();
@@ -1599,7 +1791,10 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                 CExpr::LetPrim {
                     var,
                     ty: result_ty.clone(),
-                    op: PrimOp::RawMlirOp { op: op.clone(), attrs: attrs.clone() },
+                    op: PrimOp::RawMlirOp {
+                        op: op.clone(),
+                        attrs: attrs.clone(),
+                    },
                     args: arg_vals,
                     cont: Box::new(k(CVal::Var(var), env)),
                 }
@@ -1636,7 +1831,11 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                         .units
                         .get_key_value(mangled.as_str())
                         .map(|(k, _)| k.as_str())
-                        .unwrap_or_else(|| panic!("CPS: lambda call resolved to `{mangled}`, but no such unit exists"));
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "CPS: lambda call resolved to `{mangled}`, but no such unit exists"
+                            )
+                        });
                     let mut full_args = captures.clone();
                     full_args.extend(arg_vals);
                     emit_call(callee, full_args, result_ty.clone(), ctx, env, k)
@@ -1661,7 +1860,9 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                 for &idx in erased {
                     let callable_name = match &args[idx].kind {
                         ExprKind::Path(p) => p.segments.join("::"),
-                        other => panic!("CPS: higher-order argument {idx} of `{name}` must be a bare name, found {other:?}"),
+                        other => panic!(
+                            "CPS: higher-order argument {idx} of `{name}` must be a bare name, found {other:?}"
+                        ),
                     };
                     if let Some(CVal::Closure { captures }) = env.get(&callable_name) {
                         prelude.extend(captures.iter().cloned());
@@ -1669,7 +1870,12 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                     // Else: a bare top-level `fn` name, with no captures of
                     // its own — nothing to splice in for this position.
                 }
-                let remaining: Vec<&Expr> = args.iter().enumerate().filter(|(i, _)| !erased.contains(i)).map(|(_, a)| a).collect();
+                let remaining: Vec<&Expr> = args
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !erased.contains(i))
+                    .map(|(_, a)| a)
+                    .collect();
                 return convert_expr_list(&remaining, env, ctx, &move |arg_vals, env| {
                     let callee = resolve_call(&name, expr.id, &arg_ids, ctx);
                     let mut full_args = prelude.clone();
@@ -1704,7 +1910,11 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                 emit_call(callee, full_args, result_ty.clone(), ctx, env, k)
             })
         }
-        ExprKind::If { cond, then_branch, else_branch } => convert_expr(cond, env, ctx, &|cond_val, env| {
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => convert_expr(cond, env, ctx, &|cond_val, env| {
             // Both arms tail-call the same synthesized join continuation
             // rather than each inlining `k` directly — otherwise "what
             // happens after the if" would be duplicated into every branch
@@ -1715,18 +1925,24 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
             // module's own "Mutation across control flow" doc comment) —
             // computed once, statically, from the source AST, not from
             // `env` itself.
-            let mut mutated: HashMap<String, Ty> = mutated_free_vars(then_branch, &HashSet::new(), ctx);
+            let mut mutated: HashMap<String, Ty> =
+                mutated_free_vars(then_branch, &HashSet::new(), ctx);
             match else_branch {
                 Some(eb) => match &**eb {
-                    ElseBranch::If(e) => mutated.extend(mutated_free_vars_expr(e, &HashSet::new(), ctx)),
-                    ElseBranch::Block(b) => mutated.extend(mutated_free_vars(b, &HashSet::new(), ctx)),
+                    ElseBranch::If(e) => {
+                        mutated.extend(mutated_free_vars_expr(e, &HashSet::new(), ctx))
+                    }
+                    ElseBranch::Block(b) => {
+                        mutated.extend(mutated_free_vars(b, &HashSet::new(), ctx))
+                    }
                 },
                 None => {}
             }
             let mut names: Vec<String> = mutated.keys().cloned().collect();
             names.sort();
             names.dedup();
-            let mut carried: Vec<(String, CVar)> = names.iter().map(|n| (n.clone(), ctx.fresh.var())).collect();
+            let mut carried: Vec<(String, CVar)> =
+                names.iter().map(|n| (n.clone(), ctx.fresh.var())).collect();
             let mut carried_types: Vec<Ty> = names.iter().map(|n| mutated[n].clone()).collect();
 
             // `break` support (`doc/backlog-done.md`'s own "break value"
@@ -1764,14 +1980,17 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
             let result_var = ctx.fresh.var();
             let join_label = ctx.fresh.label("j");
 
-            let then_cexpr =
-                convert_block(then_branch, env, ctx, &|v, branch_env| tail_call_join(branch_env, v, &carried, &join_label));
+            let then_cexpr = convert_block(then_branch, env, ctx, &|v, branch_env| {
+                tail_call_join(branch_env, v, &carried, &join_label)
+            });
             let else_cexpr = match else_branch {
                 Some(eb) => match &**eb {
-                    ElseBranch::If(e) => convert_expr(e, env, ctx, &|v, branch_env| tail_call_join(branch_env, v, &carried, &join_label)),
-                    ElseBranch::Block(b) => {
-                        convert_block(b, env, ctx, &|v, branch_env| tail_call_join(branch_env, v, &carried, &join_label))
-                    }
+                    ElseBranch::If(e) => convert_expr(e, env, ctx, &|v, branch_env| {
+                        tail_call_join(branch_env, v, &carried, &join_label)
+                    }),
+                    ElseBranch::Block(b) => convert_block(b, env, ctx, &|v, branch_env| {
+                        tail_call_join(branch_env, v, &carried, &join_label)
+                    }),
                 },
                 None => tail_call_join(env, CVal::Unit, &carried, &join_label),
             };
@@ -1806,8 +2025,17 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
             join_types.extend(carried_types);
 
             CExpr::Fix {
-                defs: vec![CFunDef { name: join_label, params: join_params, body: join_body, carried_types: Some(join_types) }],
-                body: Box::new(CExpr::If { cond: cond_val, then_branch: Box::new(then_cexpr), else_branch: Box::new(else_cexpr) }),
+                defs: vec![CFunDef {
+                    name: join_label,
+                    params: join_params,
+                    body: join_body,
+                    carried_types: Some(join_types),
+                }],
+                body: Box::new(CExpr::If {
+                    cond: cond_val,
+                    then_branch: Box::new(then_cexpr),
+                    else_branch: Box::new(else_cexpr),
+                }),
             }
         }),
         ExprKind::While { cond, body } => {
@@ -1821,12 +2049,14 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
             // shared join — no separate join continuation is needed here:
             // each arm already terminates on its own, `k` is only ever
             // reached via the exit path.
-            let mut mutated: HashMap<String, Ty> = mutated_free_vars_expr(cond, &HashSet::new(), ctx);
+            let mut mutated: HashMap<String, Ty> =
+                mutated_free_vars_expr(cond, &HashSet::new(), ctx);
             mutated.extend(mutated_free_vars(body, &HashSet::new(), ctx));
             let mut names: Vec<String> = mutated.keys().cloned().collect();
             names.sort();
             names.dedup();
-            let mut carried: Vec<(String, CVar)> = names.iter().map(|n| (n.clone(), ctx.fresh.var())).collect();
+            let mut carried: Vec<(String, CVar)> =
+                names.iter().map(|n| (n.clone(), ctx.fresh.var())).collect();
             let mut carried_types: Vec<Ty> = names.iter().map(|n| mutated[n].clone()).collect();
             let mut init_args = gather_carried(&carried, env);
 
@@ -1849,7 +2079,10 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
             }
 
             if guarded {
-                ctx.break_targets.borrow_mut().push(BreakTarget { running: running_var, break_val: None });
+                ctx.break_targets.borrow_mut().push(BreakTarget {
+                    running: running_var,
+                    break_val: None,
+                });
             }
 
             let check = convert_expr(cond, &loop_env, ctx, &|cond_val, cond_env| {
@@ -1866,7 +2099,11 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                         args: gather_carried(&carried, body_env),
                     });
                     let else_cexpr = k(CVal::Unit, e);
-                    CExpr::If { cond: c, then_branch: Box::new(then_cexpr), else_branch: Box::new(else_cexpr) }
+                    CExpr::If {
+                        cond: c,
+                        then_branch: Box::new(then_cexpr),
+                        else_branch: Box::new(else_cexpr),
+                    }
                 };
                 if guarded {
                     // `running AND cond` — the exact chained-call condition
@@ -1875,9 +2112,14 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                     // needing more than one chained real call" item).
                     // `Logic` is a prelude crate, so `Logic::and<bool>` is
                     // always a resolvable unit name.
-                    emit_call("Logic::and<bool>", vec![CVal::Var(running_var), cond_val], Ty::Con("bool".to_string()), ctx, cond_env, &|and_val, and_env| {
-                        build_if(and_val, and_env)
-                    })
+                    emit_call(
+                        "Logic::and<bool>",
+                        vec![CVal::Var(running_var), cond_val],
+                        Ty::Con("bool".to_string()),
+                        ctx,
+                        cond_env,
+                        &|and_val, and_env| build_if(and_val, and_env),
+                    )
                 } else {
                     build_if(cond_val, cond_env)
                 }
@@ -1889,11 +2131,24 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
 
             let params: Vec<CVar> = carried.iter().map(|(_, v)| *v).collect();
             CExpr::Fix {
-                defs: vec![CFunDef { name: loop_label.clone(), params, body: check, carried_types: Some(carried_types) }],
-                body: Box::new(CExpr::App { func: CVal::Label(loop_label), args: init_args }),
+                defs: vec![CFunDef {
+                    name: loop_label.clone(),
+                    params,
+                    body: check,
+                    carried_types: Some(carried_types),
+                }],
+                body: Box::new(CExpr::App {
+                    func: CVal::Label(loop_label),
+                    args: init_args,
+                }),
             }
         }
-        ExprKind::For { var, start, end, body } => convert_expr(start, env, ctx, &|start_val, env| {
+        ExprKind::For {
+            var,
+            start,
+            end,
+            body,
+        } => convert_expr(start, env, ctx, &|start_val, env| {
             convert_expr(end, env, ctx, &|end_val, env| {
                 // The loop's own index is threaded exactly like `for`'s own
                 // one intrinsic piece of carried state always was (see
@@ -1907,7 +2162,8 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                 let mutated: HashMap<String, Ty> = mutated_free_vars(body, &shadowed, ctx);
                 let mut names: Vec<String> = mutated.keys().cloned().collect();
                 names.sort();
-                let mut carried: Vec<(String, CVar)> = names.iter().map(|n| (n.clone(), ctx.fresh.var())).collect();
+                let mut carried: Vec<(String, CVar)> =
+                    names.iter().map(|n| (n.clone(), ctx.fresh.var())).collect();
                 let mut carried_types: Vec<Ty> = names.iter().map(|n| mutated[n].clone()).collect();
                 let mut init_args = vec![start_val.clone()];
                 init_args.extend(gather_carried(&carried, env));
@@ -1964,29 +2220,58 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                 }
 
                 if guarded {
-                    ctx.break_targets.borrow_mut().push(BreakTarget { running: running_var, break_val: None });
+                    ctx.break_targets.borrow_mut().push(BreakTarget {
+                        running: running_var,
+                        break_val: None,
+                    });
                 }
 
-                let cond_check = emit_call(&lt_unit, vec![CVal::Var(i_var), end_val], bool_ty, ctx, &body_env, &|cond_val, cond_env| {
-                    let build_if = |c: CVal, e: &CEnv| {
-                        let then_cexpr = convert_block(body, e, ctx, &|_v, body_end_env| {
-                            emit_call(&add_unit, vec![CVal::Var(i_var), CVal::Int(1)], idx_ty.clone(), ctx, body_end_env, &|next_i, incr_env| {
-                                let mut args = vec![next_i];
-                                args.extend(gather_carried(&carried, incr_env));
-                                CExpr::App { func: CVal::Label(loop_label.clone()), args }
-                            })
-                        });
-                        let else_cexpr = k(CVal::Unit, e);
-                        CExpr::If { cond: c, then_branch: Box::new(then_cexpr), else_branch: Box::new(else_cexpr) }
-                    };
-                    if guarded {
-                        emit_call("Logic::and<bool>", vec![CVal::Var(running_var), cond_val], Ty::Con("bool".to_string()), ctx, cond_env, &|and_val, and_env| {
-                            build_if(and_val, and_env)
-                        })
-                    } else {
-                        build_if(cond_val, cond_env)
-                    }
-                });
+                let cond_check = emit_call(
+                    &lt_unit,
+                    vec![CVal::Var(i_var), end_val],
+                    bool_ty,
+                    ctx,
+                    &body_env,
+                    &|cond_val, cond_env| {
+                        let build_if = |c: CVal, e: &CEnv| {
+                            let then_cexpr = convert_block(body, e, ctx, &|_v, body_end_env| {
+                                emit_call(
+                                    &add_unit,
+                                    vec![CVal::Var(i_var), CVal::Int(1)],
+                                    idx_ty.clone(),
+                                    ctx,
+                                    body_end_env,
+                                    &|next_i, incr_env| {
+                                        let mut args = vec![next_i];
+                                        args.extend(gather_carried(&carried, incr_env));
+                                        CExpr::App {
+                                            func: CVal::Label(loop_label.clone()),
+                                            args,
+                                        }
+                                    },
+                                )
+                            });
+                            let else_cexpr = k(CVal::Unit, e);
+                            CExpr::If {
+                                cond: c,
+                                then_branch: Box::new(then_cexpr),
+                                else_branch: Box::new(else_cexpr),
+                            }
+                        };
+                        if guarded {
+                            emit_call(
+                                "Logic::and<bool>",
+                                vec![CVal::Var(running_var), cond_val],
+                                Ty::Con("bool".to_string()),
+                                ctx,
+                                cond_env,
+                                &|and_val, and_env| build_if(and_val, and_env),
+                            )
+                        } else {
+                            build_if(cond_val, cond_env)
+                        }
+                    },
+                );
 
                 if guarded {
                     ctx.break_targets.borrow_mut().pop();
@@ -1998,8 +2283,16 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                 all_carried_types.extend(carried_types);
 
                 CExpr::Fix {
-                    defs: vec![CFunDef { name: loop_label.clone(), params, body: cond_check, carried_types: Some(all_carried_types) }],
-                    body: Box::new(CExpr::App { func: CVal::Label(loop_label), args: init_args }),
+                    defs: vec![CFunDef {
+                        name: loop_label.clone(),
+                        params,
+                        body: cond_check,
+                        carried_types: Some(all_carried_types),
+                    }],
+                    body: Box::new(CExpr::App {
+                        func: CVal::Label(loop_label),
+                        args: init_args,
+                    }),
                 }
             })
         }),
@@ -2024,9 +2317,13 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
             let (elem_ty, n) = match &array_ty {
                 Ty::Array(elem, size) => match size.as_ref() {
                     Ty::Const(ConstValue::Int(n)) => ((**elem).clone(), *n),
-                    other => panic!("CPS: for-in over an array with a non-concrete size {other:?} -- should have been resolved by monomorphization"),
+                    other => panic!(
+                        "CPS: for-in over an array with a non-concrete size {other:?} -- should have been resolved by monomorphization"
+                    ),
                 },
-                other => panic!("CPS: for-in over a non-array type {other:?} -- infer.rs should have rejected this already"),
+                other => panic!(
+                    "CPS: for-in over a non-array type {other:?} -- infer.rs should have rejected this already"
+                ),
             };
 
             let mut shadowed = HashSet::new();
@@ -2034,7 +2331,8 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
             let mutated: HashMap<String, Ty> = mutated_free_vars(body, &shadowed, ctx);
             let mut names: Vec<String> = mutated.keys().cloned().collect();
             names.sort();
-            let mut carried: Vec<(String, CVar)> = names.iter().map(|n| (n.clone(), ctx.fresh.var())).collect();
+            let mut carried: Vec<(String, CVar)> =
+                names.iter().map(|n| (n.clone(), ctx.fresh.var())).collect();
             let mut carried_types: Vec<Ty> = names.iter().map(|n| mutated[n].clone()).collect();
             let mut init_args = vec![CVal::Int(0)];
             init_args.extend(gather_carried(&carried, env));
@@ -2062,38 +2360,74 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
             }
 
             if guarded {
-                ctx.break_targets.borrow_mut().push(BreakTarget { running: running_var, break_val: None });
+                ctx.break_targets.borrow_mut().push(BreakTarget {
+                    running: running_var,
+                    break_val: None,
+                });
             }
 
-            let cond_check = emit_call(&lt_unit, vec![CVal::Var(i_var), CVal::Int(n)], bool_ty, ctx, &body_env, &|cond_val, cond_env| {
-                let build_if = |c: CVal, e: &CEnv| {
-                    let elem_var = ctx.fresh.var();
-                    let mut elem_env = e.clone();
-                    elem_env.insert(var.clone(), CVal::Var(elem_var));
-                    let then_cexpr = CExpr::LetPrim {
-                        var: elem_var,
-                        ty: elem_ty.clone(),
-                        op: PrimOp::Load { array_ty: array_ty.clone() },
-                        args: vec![iter_val.clone(), CVal::Var(i_var)],
-                        cont: Box::new(convert_block(body, &elem_env, ctx, &|_v, body_end_env| {
-                            emit_call(&add_unit, vec![CVal::Var(i_var), CVal::Int(1)], idx_ty.clone(), ctx, body_end_env, &|next_i, incr_env| {
-                                let mut args = vec![next_i];
-                                args.extend(gather_carried(&carried, incr_env));
-                                CExpr::App { func: CVal::Label(loop_label.clone()), args }
-                            })
-                        })),
+            let cond_check = emit_call(
+                &lt_unit,
+                vec![CVal::Var(i_var), CVal::Int(n)],
+                bool_ty,
+                ctx,
+                &body_env,
+                &|cond_val, cond_env| {
+                    let build_if = |c: CVal, e: &CEnv| {
+                        let elem_var = ctx.fresh.var();
+                        let mut elem_env = e.clone();
+                        elem_env.insert(var.clone(), CVal::Var(elem_var));
+                        let then_cexpr = CExpr::LetPrim {
+                            var: elem_var,
+                            ty: elem_ty.clone(),
+                            op: PrimOp::Load {
+                                array_ty: array_ty.clone(),
+                            },
+                            args: vec![iter_val.clone(), CVal::Var(i_var)],
+                            cont: Box::new(convert_block(
+                                body,
+                                &elem_env,
+                                ctx,
+                                &|_v, body_end_env| {
+                                    emit_call(
+                                        &add_unit,
+                                        vec![CVal::Var(i_var), CVal::Int(1)],
+                                        idx_ty.clone(),
+                                        ctx,
+                                        body_end_env,
+                                        &|next_i, incr_env| {
+                                            let mut args = vec![next_i];
+                                            args.extend(gather_carried(&carried, incr_env));
+                                            CExpr::App {
+                                                func: CVal::Label(loop_label.clone()),
+                                                args,
+                                            }
+                                        },
+                                    )
+                                },
+                            )),
+                        };
+                        let else_cexpr = k(CVal::Unit, e);
+                        CExpr::If {
+                            cond: c,
+                            then_branch: Box::new(then_cexpr),
+                            else_branch: Box::new(else_cexpr),
+                        }
                     };
-                    let else_cexpr = k(CVal::Unit, e);
-                    CExpr::If { cond: c, then_branch: Box::new(then_cexpr), else_branch: Box::new(else_cexpr) }
-                };
-                if guarded {
-                    emit_call("Logic::and<bool>", vec![CVal::Var(running_var), cond_val], Ty::Con("bool".to_string()), ctx, cond_env, &|and_val, and_env| {
-                        build_if(and_val, and_env)
-                    })
-                } else {
-                    build_if(cond_val, cond_env)
-                }
-            });
+                    if guarded {
+                        emit_call(
+                            "Logic::and<bool>",
+                            vec![CVal::Var(running_var), cond_val],
+                            Ty::Con("bool".to_string()),
+                            ctx,
+                            cond_env,
+                            &|and_val, and_env| build_if(and_val, and_env),
+                        )
+                    } else {
+                        build_if(cond_val, cond_env)
+                    }
+                },
+            );
 
             if guarded {
                 ctx.break_targets.borrow_mut().pop();
@@ -2105,8 +2439,16 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
             all_carried_types.extend(carried_types);
 
             CExpr::Fix {
-                defs: vec![CFunDef { name: loop_label.clone(), params, body: cond_check, carried_types: Some(all_carried_types) }],
-                body: Box::new(CExpr::App { func: CVal::Label(loop_label), args: init_args }),
+                defs: vec![CFunDef {
+                    name: loop_label.clone(),
+                    params,
+                    body: cond_check,
+                    carried_types: Some(all_carried_types),
+                }],
+                body: Box::new(CExpr::App {
+                    func: CVal::Label(loop_label),
+                    args: init_args,
+                }),
             }
         }),
         // `loop { ... break value; ... }` (`doc/backlog-done.md`'s own
@@ -2127,7 +2469,8 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
             let mutated: HashMap<String, Ty> = mutated_free_vars(body, &HashSet::new(), ctx);
             let mut names: Vec<String> = mutated.keys().cloned().collect();
             names.sort();
-            let mut carried: Vec<(String, CVar)> = names.iter().map(|n| (n.clone(), ctx.fresh.var())).collect();
+            let mut carried: Vec<(String, CVar)> =
+                names.iter().map(|n| (n.clone(), ctx.fresh.var())).collect();
             let mut carried_types: Vec<Ty> = names.iter().map(|n| mutated[n].clone()).collect();
             let mut init_args = gather_carried(&carried, env);
 
@@ -2137,7 +2480,11 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
             init_args.push(CVal::Bool(true));
 
             let result_ty = ctx.node_types[&expr.id].clone();
-            let break_val_var = if matches!(&result_ty, Ty::Con(s) if s == "()") { None } else { Some(ctx.fresh.var()) };
+            let break_val_var = if matches!(&result_ty, Ty::Con(s) if s == "()") {
+                None
+            } else {
+                Some(ctx.fresh.var())
+            };
             if let Some(bv) = break_val_var {
                 carried.push(("__break_value".to_string(), bv));
                 carried_types.push(result_ty);
@@ -2182,8 +2529,16 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
 
             let params: Vec<CVar> = carried.iter().map(|(_, v)| *v).collect();
             CExpr::Fix {
-                defs: vec![CFunDef { name: loop_label.clone(), params, body: check, carried_types: Some(carried_types) }],
-                body: Box::new(CExpr::App { func: CVal::Label(loop_label), args: init_args }),
+                defs: vec![CFunDef {
+                    name: loop_label.clone(),
+                    params,
+                    body: check,
+                    carried_types: Some(carried_types),
+                }],
+                body: Box::new(CExpr::App {
+                    func: CVal::Label(loop_label),
+                    args: init_args,
+                }),
             }
         }
         // Collapses a whole chain of nested `Index` nodes into one combined,
@@ -2208,7 +2563,9 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                     CExpr::LetPrim {
                         var,
                         ty: ctx.node_types[&expr.id].clone(),
-                        op: PrimOp::Load { array_ty: array_ty.clone() },
+                        op: PrimOp::Load {
+                            array_ty: array_ty.clone(),
+                        },
                         args,
                         cont: Box::new(k(CVal::Var(var), env)),
                     }
@@ -2234,7 +2591,10 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
         ExprKind::Index(base, indices) => {
             let result_ty = ctx.node_types[&expr.id].clone();
             let index_exprs: Vec<&Expr> = indices.iter().collect();
-            let idx_array_ty = Ty::Array(Box::new(Ty::Con("i32".to_string())), Box::new(Ty::Const(ConstValue::Int(indices.len() as u64))));
+            let idx_array_ty = Ty::Array(
+                Box::new(Ty::Con("i32".to_string())),
+                Box::new(Ty::Const(ConstValue::Int(indices.len() as u64))),
+            );
             convert_expr(base, env, ctx, &|base_val, env| {
                 convert_expr_list(&index_exprs, env, ctx, &|index_vals, env| {
                     let idx_array_var = ctx.fresh.var();
@@ -2285,18 +2645,20 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
         ExprKind::ArrayRepeat { value, count } if matches!(count.kind, ExprKind::PackRef(_)) => {
             convert_array_repeat_over_resolved_dims(value, &ctx.node_types[&expr.id], env, ctx, k)
         }
-        ExprKind::ArrayRepeat { value, count } => convert_expr(value, env, ctx, &|value_val, env| {
-            convert_expr(count, env, ctx, &|count_val, env| {
-                let var = ctx.fresh.var();
-                CExpr::LetPrim {
-                    var,
-                    ty: ctx.node_types[&expr.id].clone(),
-                    op: PrimOp::ArrayRepeat,
-                    args: vec![value_val.clone(), count_val],
-                    cont: Box::new(k(CVal::Var(var), env)),
-                }
+        ExprKind::ArrayRepeat { value, count } => {
+            convert_expr(value, env, ctx, &|value_val, env| {
+                convert_expr(count, env, ctx, &|count_val, env| {
+                    let var = ctx.fresh.var();
+                    CExpr::LetPrim {
+                        var,
+                        ty: ctx.node_types[&expr.id].clone(),
+                        op: PrimOp::ArrayRepeat,
+                        args: vec![value_val.clone(), count_val],
+                        cont: Box::new(k(CVal::Var(var), env)),
+                    }
+                })
             })
-        }),
+        }
         // `v.method(args)` — `base` fills the method's own first parameter,
         // an ordinary explicit positional argument, not a magic `self`
         // (`infer.rs`'s own `ExprKind::MethodCall` handling already treats
@@ -2313,7 +2675,9 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
             let struct_ty = ctx.node_types[&base.id].clone();
             let struct_name = match &struct_ty {
                 Ty::Con(n) | Ty::App(n, _) => n.clone(),
-                other => panic!("CPS: method call on a non-struct type {other:?} -- infer.rs should have rejected this already"),
+                other => panic!(
+                    "CPS: method call on a non-struct type {other:?} -- infer.rs should have rejected this already"
+                ),
             };
             let result_ty = ctx.node_types[&expr.id].clone();
             let mut all_args: Vec<&Expr> = vec![base.as_ref()];
@@ -2351,24 +2715,38 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
 /// syntactically-nested `ExprKind::ArrayRepeat` conversions (this function
 /// exists only because a pack's own real dimension count isn't visible in
 /// the source text to write out by hand).
-fn convert_array_repeat_over_resolved_dims(value: &Expr, ty: &Ty, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> CExpr) -> CExpr {
+fn convert_array_repeat_over_resolved_dims(
+    value: &Expr,
+    ty: &Ty,
+    env: &CEnv,
+    ctx: &Ctx,
+    k: &dyn Fn(CVal, &CEnv) -> CExpr,
+) -> CExpr {
     match ty {
         Ty::Array(elem_ty, size) => {
             let Ty::Const(ConstValue::Int(n)) = size.as_ref() else {
-                panic!("CPS: array-repeat over a pack resolved to a non-concrete dimension {size:?} -- monomorphization should already have resolved every real dim");
+                panic!(
+                    "CPS: array-repeat over a pack resolved to a non-concrete dimension {size:?} -- monomorphization should already have resolved every real dim"
+                );
             };
             let n = *n;
             let level_ty = ty.clone();
-            convert_array_repeat_over_resolved_dims(value, elem_ty, env, ctx, &move |inner_val, env| {
-                let var = ctx.fresh.var();
-                CExpr::LetPrim {
-                    var,
-                    ty: level_ty.clone(),
-                    op: PrimOp::ArrayRepeat,
-                    args: vec![inner_val, CVal::Int(n)],
-                    cont: Box::new(k(CVal::Var(var), env)),
-                }
-            })
+            convert_array_repeat_over_resolved_dims(
+                value,
+                elem_ty,
+                env,
+                ctx,
+                &move |inner_val, env| {
+                    let var = ctx.fresh.var();
+                    CExpr::LetPrim {
+                        var,
+                        ty: level_ty.clone(),
+                        op: PrimOp::ArrayRepeat,
+                        args: vec![inner_val, CVal::Int(n)],
+                        cont: Box::new(k(CVal::Var(var), env)),
+                    }
+                },
+            )
         }
         _ => convert_expr(value, env, ctx, k),
     }
@@ -2400,16 +2778,28 @@ fn collect_index_chain(expr: &Expr) -> (&Expr, Vec<&Expr>) {
 /// Every enclosing-scope name a branch's/loop's own join/recursive
 /// continuation must carry as an extra argument alongside its "value" one —
 /// see the module's own "Mutation across control flow" doc comment.
-fn tail_call_join(branch_env: &CEnv, value: CVal, carried: &[(String, CVar)], join_label: &str) -> CExpr {
+fn tail_call_join(
+    branch_env: &CEnv,
+    value: CVal,
+    carried: &[(String, CVar)],
+    join_label: &str,
+) -> CExpr {
     let mut args = vec![value];
     args.extend(gather_carried(carried, branch_env));
-    CExpr::App { func: CVal::Label(join_label.to_string()), args }
+    CExpr::App {
+        func: CVal::Label(join_label.to_string()),
+        args,
+    }
 }
 
 fn gather_carried(carried: &[(String, CVar)], env: &CEnv) -> Vec<CVal> {
     carried
         .iter()
-        .map(|(name, _)| env.get(name).cloned().unwrap_or_else(|| panic!("CPS: `{name}` unexpectedly unbound at a branch/loop join")))
+        .map(|(name, _)| {
+            env.get(name).cloned().unwrap_or_else(|| {
+                panic!("CPS: `{name}` unexpectedly unbound at a branch/loop join")
+            })
+        })
         .collect()
 }
 
@@ -2423,29 +2813,46 @@ fn gather_carried(carried: &[(String, CVar)], env: &CEnv) -> Vec<CVal> {
 /// needed at all — a loop that never breaks must compile to *exactly* the
 /// same MLIR it always has, zero added cost.
 fn loop_contains_break(block: &Block) -> bool {
-    block.stmts.iter().any(stmt_contains_break) || block.tail.as_deref().is_some_and(expr_contains_break)
+    block.stmts.iter().any(stmt_contains_break)
+        || block.tail.as_deref().is_some_and(expr_contains_break)
 }
 
 fn stmt_contains_break(stmt: &Stmt) -> bool {
     match &stmt.kind {
         StmtKind::Break(_) => true,
         StmtKind::Let { value, .. } => expr_contains_break(value),
-        StmtKind::Assign { target, value } => expr_contains_break(target) || expr_contains_break(value),
+        StmtKind::Assign { target, value } => {
+            expr_contains_break(target) || expr_contains_break(value)
+        }
         StmtKind::Expr(e) => expr_contains_break(e),
     }
 }
 
 fn expr_contains_break(expr: &Expr) -> bool {
     match &expr.kind {
-        ExprKind::NumberLit { .. } | ExprKind::ImaginaryLit { .. } | ExprKind::BoolLit(_) | ExprKind::Path(_) | ExprKind::PackRef(_) => false,
+        ExprKind::NumberLit { .. }
+        | ExprKind::ImaginaryLit { .. }
+        | ExprKind::BoolLit(_)
+        | ExprKind::Path(_)
+        | ExprKind::PackRef(_) => false,
         ExprKind::Call(_, _, args, ..) => args.iter().any(expr_contains_break),
         ExprKind::FieldAccess(base, _) => expr_contains_break(base),
-        ExprKind::MethodCall(base, _, args) => expr_contains_break(base) || args.iter().any(expr_contains_break),
-        ExprKind::Index(base, indices) => expr_contains_break(base) || indices.iter().any(expr_contains_break),
+        ExprKind::MethodCall(base, _, args) => {
+            expr_contains_break(base) || args.iter().any(expr_contains_break)
+        }
+        ExprKind::Index(base, indices) => {
+            expr_contains_break(base) || indices.iter().any(expr_contains_break)
+        }
         ExprKind::ArrayLit(elems) => elems.iter().any(expr_contains_break),
-        ExprKind::ArrayRepeat { value, count } => expr_contains_break(value) || expr_contains_break(count),
+        ExprKind::ArrayRepeat { value, count } => {
+            expr_contains_break(value) || expr_contains_break(count)
+        }
         ExprKind::StructLit(_, _, fields) => fields.iter().any(|(_, v)| expr_contains_break(v)),
-        ExprKind::If { cond, then_branch, else_branch } => {
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
             expr_contains_break(cond)
                 || loop_contains_break(then_branch)
                 || else_branch.as_deref().is_some_and(|eb| match eb {
@@ -2455,7 +2862,10 @@ fn expr_contains_break(expr: &Expr) -> bool {
         }
         // A nested loop owns any `break` inside its own body — stop here,
         // don't descend (see this function's own doc comment).
-        ExprKind::While { .. } | ExprKind::For { .. } | ExprKind::ForIn { .. } | ExprKind::Loop { .. } => false,
+        ExprKind::While { .. }
+        | ExprKind::For { .. }
+        | ExprKind::ForIn { .. }
+        | ExprKind::Loop { .. } => false,
         ExprKind::Block(b) => loop_contains_break(b),
         // A lambda's own body is a separate scope a `break` can never escape
         // (`infer.rs`'s own `loop_stack` suspension already rejects one that
@@ -2509,29 +2919,57 @@ fn mutated_free_vars(block: &Block, shadowed: &HashSet<String>, ctx: &Ctx) -> Ha
     escaping
 }
 
-fn mutated_free_vars_expr(expr: &Expr, shadowed: &HashSet<String>, ctx: &Ctx) -> HashMap<String, Ty> {
+fn mutated_free_vars_expr(
+    expr: &Expr,
+    shadowed: &HashSet<String>,
+    ctx: &Ctx,
+) -> HashMap<String, Ty> {
     match &expr.kind {
-        ExprKind::NumberLit { .. } | ExprKind::ImaginaryLit { .. } | ExprKind::BoolLit(_) | ExprKind::Path(_) | ExprKind::PackRef(_) => HashMap::new(),
-        ExprKind::Call(_, _, args, ..) => args.iter().flat_map(|a| mutated_free_vars_expr(a, shadowed, ctx)).collect(),
+        ExprKind::NumberLit { .. }
+        | ExprKind::ImaginaryLit { .. }
+        | ExprKind::BoolLit(_)
+        | ExprKind::Path(_)
+        | ExprKind::PackRef(_) => HashMap::new(),
+        ExprKind::Call(_, _, args, ..) => args
+            .iter()
+            .flat_map(|a| mutated_free_vars_expr(a, shadowed, ctx))
+            .collect(),
         ExprKind::FieldAccess(base, _) => mutated_free_vars_expr(base, shadowed, ctx),
         ExprKind::MethodCall(base, _, args) => {
             let mut out = mutated_free_vars_expr(base, shadowed, ctx);
-            out.extend(args.iter().flat_map(|a| mutated_free_vars_expr(a, shadowed, ctx)));
+            out.extend(
+                args.iter()
+                    .flat_map(|a| mutated_free_vars_expr(a, shadowed, ctx)),
+            );
             out
         }
         ExprKind::Index(base, indices) => {
             let mut out = mutated_free_vars_expr(base, shadowed, ctx);
-            out.extend(indices.iter().flat_map(|i| mutated_free_vars_expr(i, shadowed, ctx)));
+            out.extend(
+                indices
+                    .iter()
+                    .flat_map(|i| mutated_free_vars_expr(i, shadowed, ctx)),
+            );
             out
         }
-        ExprKind::ArrayLit(elems) => elems.iter().flat_map(|e| mutated_free_vars_expr(e, shadowed, ctx)).collect(),
+        ExprKind::ArrayLit(elems) => elems
+            .iter()
+            .flat_map(|e| mutated_free_vars_expr(e, shadowed, ctx))
+            .collect(),
         ExprKind::ArrayRepeat { value, count } => {
             let mut out = mutated_free_vars_expr(value, shadowed, ctx);
             out.extend(mutated_free_vars_expr(count, shadowed, ctx));
             out
         }
-        ExprKind::StructLit(_, _, fields) => fields.iter().flat_map(|(_, v)| mutated_free_vars_expr(v, shadowed, ctx)).collect(),
-        ExprKind::If { cond, then_branch, else_branch } => {
+        ExprKind::StructLit(_, _, fields) => fields
+            .iter()
+            .flat_map(|(_, v)| mutated_free_vars_expr(v, shadowed, ctx))
+            .collect(),
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
             let mut out = mutated_free_vars_expr(cond, shadowed, ctx);
             out.extend(mutated_free_vars(then_branch, shadowed, ctx));
             if let Some(eb) = else_branch {
@@ -2547,7 +2985,12 @@ fn mutated_free_vars_expr(expr: &Expr, shadowed: &HashSet<String>, ctx: &Ctx) ->
             out.extend(mutated_free_vars(body, shadowed, ctx));
             out
         }
-        ExprKind::For { var, start, end, body } => {
+        ExprKind::For {
+            var,
+            start,
+            end,
+            body,
+        } => {
             let mut out = mutated_free_vars_expr(start, shadowed, ctx);
             out.extend(mutated_free_vars_expr(end, shadowed, ctx));
             let mut inner = shadowed.clone();
@@ -2603,12 +3046,20 @@ fn mutated_free_vars_expr(expr: &Expr, shadowed: &HashSet<String>, ctx: &Ctx) ->
 /// node produce the identical *name* set every time, regardless of which
 /// `node_types` map (a specific specialization's own substituted one, or
 /// the enclosing unit's own) happens to be passed for the *type* lookup.
-fn lambda_free_vars(params: &[Param], body: &Block, node_types: &HashMap<NodeId, Ty>) -> HashMap<String, Ty> {
+fn lambda_free_vars(
+    params: &[Param],
+    body: &Block,
+    node_types: &HashMap<NodeId, Ty>,
+) -> HashMap<String, Ty> {
     let shadowed: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
     lambda_free_vars_block(body, &shadowed, node_types)
 }
 
-fn lambda_free_vars_block(block: &Block, shadowed: &HashSet<String>, node_types: &HashMap<NodeId, Ty>) -> HashMap<String, Ty> {
+fn lambda_free_vars_block(
+    block: &Block,
+    shadowed: &HashSet<String>,
+    node_types: &HashMap<NodeId, Ty>,
+) -> HashMap<String, Ty> {
     let mut local_shadowed = shadowed.clone();
     let mut free = HashMap::new();
     for stmt in &block.stmts {
@@ -2635,9 +3086,16 @@ fn lambda_free_vars_block(block: &Block, shadowed: &HashSet<String>, node_types:
     free
 }
 
-fn lambda_free_vars_expr(expr: &Expr, shadowed: &HashSet<String>, node_types: &HashMap<NodeId, Ty>) -> HashMap<String, Ty> {
+fn lambda_free_vars_expr(
+    expr: &Expr,
+    shadowed: &HashSet<String>,
+    node_types: &HashMap<NodeId, Ty>,
+) -> HashMap<String, Ty> {
     match &expr.kind {
-        ExprKind::NumberLit { .. } | ExprKind::ImaginaryLit { .. } | ExprKind::BoolLit(_) | ExprKind::PackRef(_) => HashMap::new(),
+        ExprKind::NumberLit { .. }
+        | ExprKind::ImaginaryLit { .. }
+        | ExprKind::BoolLit(_)
+        | ExprKind::PackRef(_) => HashMap::new(),
         ExprKind::Path(p) => {
             let name = p.segments.join("::");
             if shadowed.contains(&name) {
@@ -2653,32 +3111,54 @@ fn lambda_free_vars_expr(expr: &Expr, shadowed: &HashSet<String>, node_types: &H
                 None => HashMap::new(),
             }
         }
-        ExprKind::Call(_, _, args, ..) => args.iter().flat_map(|a| lambda_free_vars_expr(a, shadowed, node_types)).collect(),
+        ExprKind::Call(_, _, args, ..) => args
+            .iter()
+            .flat_map(|a| lambda_free_vars_expr(a, shadowed, node_types))
+            .collect(),
         ExprKind::FieldAccess(base, _) => lambda_free_vars_expr(base, shadowed, node_types),
         ExprKind::MethodCall(base, _, args) => {
             let mut out = lambda_free_vars_expr(base, shadowed, node_types);
-            out.extend(args.iter().flat_map(|a| lambda_free_vars_expr(a, shadowed, node_types)));
+            out.extend(
+                args.iter()
+                    .flat_map(|a| lambda_free_vars_expr(a, shadowed, node_types)),
+            );
             out
         }
         ExprKind::Index(base, indices) => {
             let mut out = lambda_free_vars_expr(base, shadowed, node_types);
-            out.extend(indices.iter().flat_map(|i| lambda_free_vars_expr(i, shadowed, node_types)));
+            out.extend(
+                indices
+                    .iter()
+                    .flat_map(|i| lambda_free_vars_expr(i, shadowed, node_types)),
+            );
             out
         }
-        ExprKind::ArrayLit(elems) => elems.iter().flat_map(|e| lambda_free_vars_expr(e, shadowed, node_types)).collect(),
+        ExprKind::ArrayLit(elems) => elems
+            .iter()
+            .flat_map(|e| lambda_free_vars_expr(e, shadowed, node_types))
+            .collect(),
         ExprKind::ArrayRepeat { value, count } => {
             let mut out = lambda_free_vars_expr(value, shadowed, node_types);
             out.extend(lambda_free_vars_expr(count, shadowed, node_types));
             out
         }
-        ExprKind::StructLit(_, _, fields) => fields.iter().flat_map(|(_, v)| lambda_free_vars_expr(v, shadowed, node_types)).collect(),
-        ExprKind::If { cond, then_branch, else_branch } => {
+        ExprKind::StructLit(_, _, fields) => fields
+            .iter()
+            .flat_map(|(_, v)| lambda_free_vars_expr(v, shadowed, node_types))
+            .collect(),
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
             let mut out = lambda_free_vars_expr(cond, shadowed, node_types);
             out.extend(lambda_free_vars_block(then_branch, shadowed, node_types));
             if let Some(eb) = else_branch {
                 match &**eb {
                     ElseBranch::If(e) => out.extend(lambda_free_vars_expr(e, shadowed, node_types)),
-                    ElseBranch::Block(b) => out.extend(lambda_free_vars_block(b, shadowed, node_types)),
+                    ElseBranch::Block(b) => {
+                        out.extend(lambda_free_vars_block(b, shadowed, node_types))
+                    }
                 }
             }
             out
@@ -2688,7 +3168,12 @@ fn lambda_free_vars_expr(expr: &Expr, shadowed: &HashSet<String>, node_types: &H
             out.extend(lambda_free_vars_block(body, shadowed, node_types));
             out
         }
-        ExprKind::For { var, start, end, body } => {
+        ExprKind::For {
+            var,
+            start,
+            end,
+            body,
+        } => {
             let mut out = lambda_free_vars_expr(start, shadowed, node_types);
             out.extend(lambda_free_vars_expr(end, shadowed, node_types));
             let mut inner = shadowed.clone();
@@ -2734,9 +3219,17 @@ fn sorted_capture_names(captures: &HashMap<String, Ty>) -> Vec<String> {
 /// `Ring`/`Ord` intrinsic in practice, but resolved the same general way
 /// regardless.
 fn resolve_synthetic_binop<'a>(name: &str, ty: &Ty, ret_ty: &Ty, ctx: &Ctx<'a>) -> &'a str {
-    let key = (name.to_string(), vec![ty.to_string(), ty.to_string()], ret_ty.to_string());
+    let key = (
+        name.to_string(),
+        vec![ty.to_string(), ty.to_string()],
+        ret_ty.to_string(),
+    );
     match ctx.call_index.get(&key) {
-        Some(unit_name) => ctx.units.get_key_value(unit_name.as_str()).map(|(k, _)| k.as_str()).unwrap(),
+        Some(unit_name) => ctx
+            .units
+            .get_key_value(unit_name.as_str())
+            .map(|(k, _)| k.as_str())
+            .unwrap(),
         // A known, currently-open gap for a `for`-loop whose *bound itself*
         // names a const generic (`for i in 0..N`): `ty` here can come back
         // as `Ty::Const(<N's own concrete value>)` (a *value*) rather than
@@ -2748,7 +3241,9 @@ fn resolve_synthetic_binop<'a>(name: &str, ty: &Ty, ret_ty: &Ty, ctx: &Ctx<'a>) 
         // specifically. See `doc/backlog.md`. Panicking here (rather than
         // guessing a width) is deliberate -- this is a real, unresolved gap,
         // not something to silently paper over.
-        None => panic!("CPS: could not resolve implicit `{name}({ty}, {ty}) -> {ret_ty}` needed for a for/while loop bound"),
+        None => panic!(
+            "CPS: could not resolve implicit `{name}({ty}, {ty}) -> {ret_ty}` needed for a for/while loop bound"
+        ),
     }
 }
 
@@ -2758,7 +3253,14 @@ fn resolve_synthetic_binop<'a>(name: &str, ty: &Ty, ret_ty: &Ty, ctx: &Ctx<'a>) 
 /// `App` with it appended (Appel's APP) — see the module's own doc comment.
 /// A call never itself mutates `env` (only `Assign` does) — `k` is always
 /// invoked with the very same `env` the call started with.
-fn emit_call(unit_name: &str, arg_vals: Vec<CVal>, result_ty: Ty, ctx: &Ctx, env: &CEnv, k: &dyn Fn(CVal, &CEnv) -> CExpr) -> CExpr {
+fn emit_call(
+    unit_name: &str,
+    arg_vals: Vec<CVal>,
+    result_ty: Ty,
+    ctx: &Ctx,
+    env: &CEnv,
+    k: &dyn Fn(CVal, &CEnv) -> CExpr,
+) -> CExpr {
     let unit = &ctx.units[unit_name];
     match &unit.body {
         // A real C-ABI call, but straight-line, not `Fix`+`App`: it returns
@@ -2770,7 +3272,10 @@ fn emit_call(unit_name: &str, arg_vals: Vec<CVal>, result_ty: Ty, ctx: &Ctx, env
             CExpr::LetPrim {
                 var,
                 ty: result_ty,
-                op: PrimOp::Extern { symbol: symbol.clone(), param_types: unit.param_types.clone() },
+                op: PrimOp::Extern {
+                    symbol: symbol.clone(),
+                    param_types: unit.param_types.clone(),
+                },
                 args: arg_vals,
                 cont: Box::new(k(CVal::Var(var), env)),
             }
@@ -2787,8 +3292,16 @@ fn emit_call(unit_name: &str, arg_vals: Vec<CVal>, result_ty: Ty, ctx: &Ctx, env
             let mut call_args = arg_vals;
             call_args.push(CVal::Label(k_label.clone()));
             CExpr::Fix {
-                defs: vec![CFunDef { name: k_label, params: vec![result_var], body: k(CVal::Var(result_var), env), carried_types: None }],
-                body: Box::new(CExpr::App { func: CVal::Label(unit_name.to_string()), args: call_args }),
+                defs: vec![CFunDef {
+                    name: k_label,
+                    params: vec![result_var],
+                    body: k(CVal::Var(result_var), env),
+                    carried_types: None,
+                }],
+                body: Box::new(CExpr::App {
+                    func: CVal::Label(unit_name.to_string()),
+                    args: call_args,
+                }),
             }
         }
     }
@@ -2796,8 +3309,19 @@ fn emit_call(unit_name: &str, arg_vals: Vec<CVal>, result_ty: Ty, ctx: &Ctx, env
 
 /// Converts a list of expressions left-to-right, sequentially — evaluation
 /// order is observable and must stay sequential, never flattened/reordered.
-fn convert_expr_list(exprs: &[&Expr], env: &CEnv, ctx: &Ctx, k: &dyn Fn(Vec<CVal>, &CEnv) -> CExpr) -> CExpr {
-    fn go(exprs: &[&Expr], env: &CEnv, ctx: &Ctx, acc: Vec<CVal>, k: &dyn Fn(Vec<CVal>, &CEnv) -> CExpr) -> CExpr {
+fn convert_expr_list(
+    exprs: &[&Expr],
+    env: &CEnv,
+    ctx: &Ctx,
+    k: &dyn Fn(Vec<CVal>, &CEnv) -> CExpr,
+) -> CExpr {
+    fn go(
+        exprs: &[&Expr],
+        env: &CEnv,
+        ctx: &Ctx,
+        acc: Vec<CVal>,
+        k: &dyn Fn(Vec<CVal>, &CEnv) -> CExpr,
+    ) -> CExpr {
         let Some((first, rest)) = exprs.split_first() else {
             return k(acc, env);
         };
@@ -2815,18 +3339,29 @@ fn convert_expr_list(exprs: &[&Expr], env: &CEnv, ctx: &Ctx, k: &dyn Fn(Vec<CVal
 /// necessary and together unambiguous.
 fn resolve_call<'a>(name: &str, call_id: NodeId, arg_ids: &[NodeId], ctx: &Ctx<'a>) -> &'a str {
     if let Some(mangled) = ctx.call_names.get(&call_id) {
-        return ctx.units.get_key_value(mangled.as_str()).map(|(k, _)| k.as_str()).unwrap_or_else(|| {
-            panic!("CPS: call_names resolved `{name}` to `{mangled}`, but no such unit exists")
-        });
+        return ctx
+            .units
+            .get_key_value(mangled.as_str())
+            .map(|(k, _)| k.as_str())
+            .unwrap_or_else(|| {
+                panic!("CPS: call_names resolved `{name}` to `{mangled}`, but no such unit exists")
+            });
     }
     if let Some((k, _)) = ctx.units.get_key_value(name) {
         return k.as_str();
     }
-    let arg_tys: Vec<String> = arg_ids.iter().map(|id| ctx.node_types[id].to_string()).collect();
+    let arg_tys: Vec<String> = arg_ids
+        .iter()
+        .map(|id| ctx.node_types[id].to_string())
+        .collect();
     let ret_ty = ctx.node_types[&call_id].to_string();
     let key = (name.to_string(), arg_tys, ret_ty);
     match ctx.call_index.get(&key) {
-        Some(unit_name) => ctx.units.get_key_value(unit_name.as_str()).map(|(k, _)| k.as_str()).unwrap(),
+        Some(unit_name) => ctx
+            .units
+            .get_key_value(unit_name.as_str())
+            .map(|(k, _)| k.as_str())
+            .unwrap(),
         None => panic!("CPS: could not resolve call to `{name}` ({key:?})"),
     }
 }
@@ -2871,7 +3406,14 @@ fn resolve_method_call<'a>(struct_name: &str, method: &str, call: &Expr, ctx: &C
 /// each parsed at `T`'s own concrete width (`elem_ty`) — a plain literal
 /// widened to `Complex` passes its own text as `real_text` with `imag_text
 /// = "0"`; a bare `4i` does the reverse.
-fn complex_literal(ctx: &Ctx, expr: &Expr, real_text: &str, imag_text: &str, env: &CEnv, k: &dyn Fn(CVal, &CEnv) -> CExpr) -> CExpr {
+fn complex_literal(
+    ctx: &Ctx,
+    expr: &Expr,
+    real_text: &str,
+    imag_text: &str,
+    env: &CEnv,
+    k: &dyn Fn(CVal, &CEnv) -> CExpr,
+) -> CExpr {
     let ty = ctx.node_types[&expr.id].clone();
     let Ty::App(name, elem_tys) = &ty else {
         panic!("CPS: a Complex-widened literal's own resolved type must be Complex<T>, got {ty}")
@@ -2884,7 +3426,10 @@ fn complex_literal(ctx: &Ctx, expr: &Expr, real_text: &str, imag_text: &str, env
     CExpr::LetPrim {
         var,
         ty,
-        op: PrimOp::Struct("Complex".to_string(), vec!["real".to_string(), "imag".to_string()]),
+        op: PrimOp::Struct(
+            "Complex".to_string(),
+            vec!["real".to_string(), "imag".to_string()],
+        ),
         args: vec![real, imag],
         cont: Box::new(k(CVal::Var(var), env)),
     }
@@ -2896,9 +3441,15 @@ fn parse_number(text: &str, ty: &Ty) -> CVal {
         _ => matches!(ty.to_string().as_str(), "f32" | "f64"),
     };
     if is_float {
-        CVal::Float(text.parse().unwrap_or_else(|e| panic!("bad float literal {text:?}: {e}")))
+        CVal::Float(
+            text.parse()
+                .unwrap_or_else(|e| panic!("bad float literal {text:?}: {e}")),
+        )
     } else {
-        CVal::Int(text.parse().unwrap_or_else(|e| panic!("bad int literal {text:?}: {e}")))
+        CVal::Int(
+            text.parse()
+                .unwrap_or_else(|e| panic!("bad int literal {text:?}: {e}")),
+        )
     }
 }
 
@@ -2922,7 +3473,11 @@ fn parse_number(text: &str, ty: &Ty) -> CVal {
 /// top-level unit's own name (`"::"`/`"<...>"` vs. `"$"`-delimited naming
 /// conventions never overlap), just a few extra no-op entries.
 pub fn eliminate_dead_code(program: CpsProgram) -> CpsProgram {
-    let by_name: HashMap<&str, &CTopLevelFn> = program.funcs.iter().map(|f| (f.def.name.as_str(), f)).collect();
+    let by_name: HashMap<&str, &CTopLevelFn> = program
+        .funcs
+        .iter()
+        .map(|f| (f.def.name.as_str(), f))
+        .collect();
     let mut reachable: HashSet<String> = HashSet::new();
     // `main` is one root among possibly several: an `export fn` is, by its
     // own definition, an entry point an external host calls directly --
@@ -2931,7 +3486,15 @@ pub fn eliminate_dead_code(program: CpsProgram) -> CpsProgram {
     // side driver). Without seeding every exported unit's own name here
     // too, a real `export fn` unreachable from `main` would be silently
     // deleted before `mlir_lower.rs` ever sees it.
-    let mut worklist: Vec<String> = std::iter::once("main".to_string()).chain(program.funcs.iter().filter(|f| f.is_export).map(|f| f.def.name.clone())).collect();
+    let mut worklist: Vec<String> = std::iter::once("main".to_string())
+        .chain(
+            program
+                .funcs
+                .iter()
+                .filter(|f| f.is_export)
+                .map(|f| f.def.name.clone()),
+        )
+        .collect();
     while let Some(name) = worklist.pop() {
         if !reachable.insert(name.clone()) {
             continue; // already visited
@@ -2940,7 +3503,13 @@ pub fn eliminate_dead_code(program: CpsProgram) -> CpsProgram {
             collect_called_labels(&f.def.body, &mut worklist);
         }
     }
-    CpsProgram { funcs: program.funcs.into_iter().filter(|f| reachable.contains(&f.def.name)).collect() }
+    CpsProgram {
+        funcs: program
+            .funcs
+            .into_iter()
+            .filter(|f| reachable.contains(&f.def.name))
+            .collect(),
+    }
 }
 
 fn note_label(v: &CVal, out: &mut Vec<String>) {
@@ -2969,7 +3538,11 @@ fn collect_called_labels(expr: &CExpr, out: &mut Vec<String>) {
             }
             collect_called_labels(body, out);
         }
-        CExpr::If { then_branch, else_branch, .. } => {
+        CExpr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
             collect_called_labels(then_branch, out);
             collect_called_labels(else_branch, out);
         }
@@ -2984,7 +3557,13 @@ pub fn dump_cps_program(program: &CpsProgram) -> String {
         if i > 0 {
             out.push('\n');
         }
-        let params = f.def.params.iter().map(|v| format!("v{v}")).collect::<Vec<_>>().join(" ");
+        let params = f
+            .def
+            .params
+            .iter()
+            .map(|v| format!("v{v}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let _ = writeln!(out, "(fn {} ({params})", f.def.name);
         dump_cexpr(&mut out, &f.def.body, 1);
         let _ = writeln!(out, ")");
@@ -3010,13 +3589,22 @@ fn dump_cval(v: &CVal) -> String {
         // variant's own doc comment) -- rendered distinctly, not panicking,
         // purely so a bug that *did* let one escape shows up legibly in
         // `--dump-cps` output rather than crashing the dumper itself.
-        CVal::Closure { captures } => format!("<closure [{}]>", captures.iter().map(dump_cval).collect::<Vec<_>>().join(" ")),
+        CVal::Closure { captures } => format!(
+            "<closure [{}]>",
+            captures.iter().map(dump_cval).collect::<Vec<_>>().join(" ")
+        ),
     }
 }
 
 fn dump_cexpr(out: &mut String, expr: &CExpr, depth: usize) {
     match expr {
-        CExpr::LetPrim { var, ty, op, args, cont } => {
+        CExpr::LetPrim {
+            var,
+            ty,
+            op,
+            args,
+            cont,
+        } => {
             indent(out, depth);
             let op_str = match op {
                 PrimOp::Field { field, .. } => format!("field.{field}"),
@@ -3028,7 +3616,10 @@ fn dump_cexpr(out: &mut String, expr: &CExpr, depth: usize) {
                 PrimOp::Store { .. } => "store".to_string(),
                 PrimOp::Extern { symbol, .. } => format!("extern.{symbol}"),
                 PrimOp::RawMlirOp { op, attrs } => {
-                    let attrs_str: String = attrs.iter().map(|(name, text)| format!(" {name}={text:?}")).collect();
+                    let attrs_str: String = attrs
+                        .iter()
+                        .map(|(name, text)| format!(" {name}={text:?}"))
+                        .collect();
                     format!("mlir.{op}{attrs_str}")
                 }
             };
@@ -3052,7 +3643,12 @@ fn dump_cexpr(out: &mut String, expr: &CExpr, depth: usize) {
             let _ = writeln!(out, "(fix");
             for d in defs {
                 indent(out, depth + 1);
-                let params = d.params.iter().map(|v| format!("v{v}")).collect::<Vec<_>>().join(" ");
+                let params = d
+                    .params
+                    .iter()
+                    .map(|v| format!("v{v}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 let _ = writeln!(out, "({} ({params})", d.name);
                 dump_cexpr(out, &d.body, depth + 2);
                 indent(out, depth + 1);
@@ -3062,7 +3658,11 @@ fn dump_cexpr(out: &mut String, expr: &CExpr, depth: usize) {
             indent(out, depth);
             out.push_str(")\n");
         }
-        CExpr::If { cond, then_branch, else_branch } => {
+        CExpr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
             indent(out, depth);
             let _ = writeln!(out, "(if {}", dump_cval(cond));
             dump_cexpr(out, then_branch, depth + 1);

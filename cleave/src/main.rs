@@ -15,7 +15,9 @@
 //! pass sit next to each other. More `--dump-*` flags arrive as more passes
 //! do (CPS conversion, ...).
 
-use cleave::cps::{collect_mlir_types, collect_struct_schemas, dump_cps_program, eliminate_dead_code};
+use cleave::cps::{
+    collect_mlir_types, collect_struct_schemas, dump_cps_program, eliminate_dead_code,
+};
 use cleave::diag::SourceMap;
 use cleave::driver::compile;
 use cleave::dump::dump_program;
@@ -77,20 +79,30 @@ fn parse_args() -> Result<Args, String> {
             "--dump-mlir-lowered" => dump_mlir_lowered = true,
             "--run" => run = true,
             "--emit-object" => {
-                let value = args_iter.next().ok_or_else(|| "--emit-object requires a path argument".to_string())?;
+                let value = args_iter
+                    .next()
+                    .ok_or_else(|| "--emit-object requires a path argument".to_string())?;
                 emit_object = Some(PathBuf::from(value));
             }
             "--emit-bindings" => {
-                let value = args_iter.next().ok_or_else(|| "--emit-bindings requires a path argument".to_string())?;
+                let value = args_iter
+                    .next()
+                    .ok_or_else(|| "--emit-bindings requires a path argument".to_string())?;
                 emit_bindings = Some(PathBuf::from(value));
             }
             "--emit-exe" => {
-                let value = args_iter.next().ok_or_else(|| "--emit-exe requires a path argument".to_string())?;
+                let value = args_iter
+                    .next()
+                    .ok_or_else(|| "--emit-exe requires a path argument".to_string())?;
                 emit_exe = Some(PathBuf::from(value));
             }
             other if other.starts_with("--") => return Err(format!("unknown flag {other:?}")),
             other if path.is_none() => path = Some(PathBuf::from(other)),
-            other => return Err(format!("only one input file is supported, got a second argument {other:?}")),
+            other => {
+                return Err(format!(
+                    "only one input file is supported, got a second argument {other:?}"
+                ));
+            }
         }
     }
 
@@ -148,7 +160,12 @@ fn parse_args() -> Result<Args, String> {
 // default entirely -- the same fix rustc's own driver uses for the identical
 // reason, not a workaround for a logic bug.
 fn main() -> ExitCode {
-    std::thread::Builder::new().stack_size(64 * 1024 * 1024).spawn(real_main).unwrap().join().unwrap()
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(real_main)
+        .unwrap()
+        .join()
+        .unwrap()
 }
 
 fn real_main() -> ExitCode {
@@ -183,7 +200,11 @@ fn real_main() -> ExitCode {
     // The file's own directory is a project search path — a sibling
     // directory next to it, named after a crate, resolves a `use` the same
     // way a real project root would (see `driver.rs`/`grammar.md`).
-    let project_dir = args.path.parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let project_dir = args
+        .path
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
     let file_name = args.path.display().to_string();
 
     let (result, sources) = compile(vec![(file_name, text)], &[project_dir]);
@@ -423,7 +444,8 @@ fn real_main() -> ExitCode {
 
                     let mlir_types = collect_mlir_types(&program);
                     let struct_schemas = collect_struct_schemas(&program);
-                    let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
+                    let mut module =
+                        lower_program(&context, &cps_program, &mlir_types, struct_schemas);
                     if !module.as_operation().verify() {
                         eprintln!("error: generated MLIR module failed verification");
                         exit = ExitCode::FAILURE;
@@ -442,7 +464,8 @@ fn real_main() -> ExitCode {
                         // reasoning (found by direct testing to matter, not
                         // just tidier).
                         let pass_manager = pass::PassManager::new(&context);
-                        pass_manager.add_pass(pass::linalg::create_convert_elementwise_to_linalg_pass());
+                        pass_manager
+                            .add_pass(pass::linalg::create_convert_elementwise_to_linalg_pass());
                         let ok = pass_manager.run(&mut module).is_ok();
 
                         let pass_manager = pass::PassManager::new(&context);
@@ -459,7 +482,8 @@ fn real_main() -> ExitCode {
                         pass_manager.add_pass(pass::linalg::create_convert_linalg_to_loops_pass());
                         pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
                         pass_manager.add_pass(pass::conversion::create_to_llvm());
-                        pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
+                        pass_manager
+                            .add_pass(pass::conversion::create_reconcile_unrealized_casts());
                         if !ok || pass_manager.run(&mut module).is_err() {
                             eprintln!("error: MLIR-to-LLVM lowering pass failed");
                             exit = ExitCode::FAILURE;
@@ -618,9 +642,13 @@ fn real_main() -> ExitCode {
 
     if args.emit_object.is_some() || args.emit_bindings.is_some() {
         let registry = Registry::build(&program);
-        if let Err(errs) =
-            cleave::pipeline::emit_from_program(&program, &registry, &sources, args.emit_object.as_deref(), args.emit_bindings.as_deref())
-        {
+        if let Err(errs) = cleave::pipeline::emit_from_program(
+            &program,
+            &registry,
+            &sources,
+            args.emit_object.as_deref(),
+            args.emit_bindings.as_deref(),
+        ) {
             for e in &errs {
                 eprintln!("error: {e}");
             }

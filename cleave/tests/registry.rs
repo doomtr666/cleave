@@ -29,7 +29,10 @@ fn reports_no_impl_for_untargeted_type() {
          impl Ring<Vec2> { fn add(a: Vec2, b: Vec2) -> Vec2 { a } }",
     );
     let reg = Registry::build(&p);
-    assert!(!reg.has_impl("Ring", &bool_type()), "no `impl Ring<bool>` was ever declared");
+    assert!(
+        !reg.has_impl("Ring", &bool_type()),
+        "no `impl Ring<bool>` was ever declared"
+    );
 }
 
 #[test]
@@ -50,7 +53,11 @@ fn finds_candidate_algebras_by_name_and_arity() {
     let reg = Registry::build(&p);
     let mut candidates = reg.algebras_with_fn("add", 2);
     candidates.sort();
-    assert_eq!(candidates, vec!["Ring", "Tropical"], "both declare a 2-arg `add`");
+    assert_eq!(
+        candidates,
+        vec!["Ring", "Tropical"],
+        "both declare a 2-arg `add`"
+    );
 }
 
 #[test]
@@ -74,7 +81,10 @@ fn axioms_are_not_counted_as_fn_signatures() {
         "algebra Ring<T> { fn add(a: T, b: T) -> T; axiom comm(a: T, b: T): add(a,b) == add(b,a); }",
     );
     let reg = Registry::build(&p);
-    assert!(reg.fn_sig("Ring", "comm").is_none(), "an axiom name isn't a callable signature");
+    assert!(
+        reg.fn_sig("Ring", "comm").is_none(),
+        "an axiom name isn't a callable signature"
+    );
     assert!(reg.algebras_with_fn("comm", 2).is_empty());
 }
 
@@ -101,14 +111,20 @@ fn generic_impls_with_the_same_bare_target_shape_but_different_bounds_both_survi
          impl<T: Ord> Ring<Complex<T>> { fn add(a: Complex<T>, b: Complex<T>) -> Complex<T> { a } }",
     );
     let reg = Registry::build(&p);
-    assert_eq!(reg.generic_impls("Ring").len(), 2, "both impls should be indexed, not just one");
+    assert_eq!(
+        reg.generic_impls("Ring").len(),
+        2,
+        "both impls should be indexed, not just one"
+    );
 }
 
 #[test]
 fn finds_an_inherent_method_by_struct_and_method_name() {
     let p = program("struct Vec2 { x: f64, y: f64 }\nimpl struct Vec2 {\n    fn len(v) { v.x }\n}");
     let reg = Registry::build(&p);
-    let entry = reg.inherent_method("Vec2", "len").expect("Vec2 declares an inherent `len`");
+    let entry = reg
+        .inherent_method("Vec2", "len")
+        .expect("Vec2 declares an inherent `len`");
     assert_eq!(entry.method.name, "len");
     assert!(entry.generics.is_empty());
 }
@@ -123,9 +139,13 @@ fn no_inherent_method_for_an_unknown_name_or_struct() {
 
 #[test]
 fn generic_inherent_impls_own_generics_are_indexed() {
-    let p = program("struct Matrix<T> { data: T }\nimpl<T: Float> struct Matrix<T> {\n    fn get(m) { m }\n}");
+    let p = program(
+        "struct Matrix<T> { data: T }\nimpl<T: Float> struct Matrix<T> {\n    fn get(m) { m }\n}",
+    );
     let reg = Registry::build(&p);
-    let entry = reg.inherent_method("Matrix", "get").expect("Matrix declares an inherent `get`");
+    let entry = reg
+        .inherent_method("Matrix", "get")
+        .expect("Matrix declares an inherent `get`");
     assert_eq!(entry.generics.len(), 1);
 }
 
@@ -145,7 +165,9 @@ fn all_impls_returns_every_target_in_declaration_order() {
 
 #[test]
 fn all_impls_includes_single_target_impls_too() {
-    let p = program("algebra Ring<T> { fn add(a: T, b: T) -> T; }\nimpl Ring<i32> { fn add(a, b) { a } }");
+    let p = program(
+        "algebra Ring<T> { fn add(a: T, b: T) -> T; }\nimpl Ring<i32> { fn add(a, b) { a } }",
+    );
     let reg = Registry::build(&p);
     let impls = reg.all_impls("Ring");
     assert_eq!(impls.len(), 1);
@@ -199,7 +221,11 @@ fn registry_retains_derivative_rules_declared_on_an_algebra() {
     );
     let reg = Registry::build(&p);
     let rules = reg.derivative_rules("Ring");
-    assert_eq!(rules.len(), 1, "expected exactly one retained derivative rule");
+    assert_eq!(
+        rules.len(),
+        1,
+        "expected exactly one retained derivative rule"
+    );
     assert_eq!(rules[0].method, "mul");
     assert_eq!(rules[0].params.len(), 2);
 }

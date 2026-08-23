@@ -79,6 +79,54 @@ impl<T: Float, const Dims...: i32> Ring<Tensor<T, Dims...>> {
     fn zero() -> Tensor<T, Dims...> { Tensor::<T, Dims...>(data: [zero(); Dims...]) }
 }
 
+// `Transcendental<Tensor<T,Dims...>>::exp` -- needed so `Activation<Tensor<T,
+// Dims...>>::sigmoid` (`stdlib/nn/nn.cleave`) can compose from real, named,
+// individually-differentiable calls (`Ring::neg`/`add`/`div` above, `exp`
+// here) the *same* way its own scalar sibling (`Activation<f32>::sigmoid`)
+// already does, instead of a raw `mlir::math::exp` call with no name of its
+// own to attach a derivative to. `stdlib/num/num.cleave`'s own `Transcendental
+// <T>` doc comment already tells this exact story for the scalar case
+// ("sigmoid... had no path to a derivative at all short of its own hand-
+// written closed form... moving `exp` here... means sigmoid's derivative now
+// composes automatically via ordinary chain-rule saturation") -- this impl
+// is that same lesson, just not yet applied to the pack-generic `Tensor`
+// case until `Dense`/`Network` (`examples/xor_tensor.cleave`) needed to
+// differentiate all the way through it. `derivative exp(x): mul(exp(x),
+// d(x));`, already declared on the algebra itself (`num.cleave`), applies
+// here unchanged -- `mul`/`exp` both resolve against *this* impl's own
+// `Tensor<T,Dims...>` once `Forward::walk`'s multi-level inlining reaches it.
+impl<T: Float, const Dims...: i32> Transcendental<Tensor<T, Dims...>> {
+    fn exp(x: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::math::exp(x) }
+}
+
+// `Tensor * scalar` (`SGD`'s own `w = w - lr * grad`, needed once a weight
+// lives inside a `Tensor` field rather than a bare scalar -- `examples/
+// xor_tensor.cleave`'s own `Network`/`Dense` rewrite is what this was added
+// for) -- `Ring<T>` alone can't express it (`fn mul(a: T, b: T) -> T`, both
+// operands always the *same* type), so a real, separate, heterogeneous
+// algebra, mirroring `MatMul<A,B,C>`'s own "not every numeric op is same-
+// type" precedent. `[s; Dims...]` broadcasts the scalar into a same-shape
+// tensor first (the exact pack-generic array-repeat `Ring<Tensor<T,Dims...>>
+// ::zero()` already uses for `[zero(); Dims...]`, just with a real value
+// instead of a literal `0.0`/`1.0`), then an ordinary elementwise `arith.
+// mulf` -- no new mechanism, same shape as every other impl in this file.
+algebra Scale<Container, T> {
+    fn scale(c: Container, s: T) -> Container;
+    // `d/dx[c*s] = d(c)*s + c*d(s)` -- the ordinary product rule, same shape
+    // as `MatMul`'s own (`matrix.cleave`) -- not needed by `examples/
+    // xor_tensor.cleave`'s own fixed learning rate (`s` never itself depends
+    // on a `derive()`d parameter there), but costs nothing to declare
+    // correctly now rather than leave `scale` derivative-less.
+    derivative scale(c, s): add(scale(d(c), s), scale(c, d(s)));
+}
+
+impl<T: Float, const Dims...: i32> Scale<Tensor<T, Dims...>, T> {
+    fn scale(c, s) {
+        let broadcast: Tensor<T, Dims...> = Tensor::<T, Dims...>(data: [s; Dims...]);
+        mlir::arith::mulf(c, broadcast)
+    }
+}
+
 // `v[i]`/`m[i,j]`/`t[i,j,k]` — `Tensor` has no `.x`/`.y`/`.z` of its own to
 // speak of (its sole field is the *whole* `data` array), so element read
 // goes through an ordinary algebra instead of field access: `infer.rs`'s

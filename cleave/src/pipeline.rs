@@ -8,7 +8,8 @@
 
 use crate::ast::Program;
 use crate::cps::{
-    CpsProgram, UnitBody, collect_mlir_types, collect_struct_schemas, collect_units, convert_program, eliminate_dead_code,
+    CpsProgram, UnitBody, collect_mlir_types, collect_struct_schemas, collect_units,
+    convert_program, eliminate_dead_code,
 };
 use crate::diag::{Diagnostic, SourceMap};
 use crate::egraph::{DerivativeRequest, optimize_program, synthesize_derivatives};
@@ -24,17 +25,24 @@ use std::path::{Path, PathBuf};
 /// `collect_units` + `convert_program` + `synthesize_derivatives`, bundled
 /// -- see the module's own doc comment for why every pipeline entry point
 /// needs all three, in this exact order.
-pub fn build_cps_program(program: &Program, registry: &Registry) -> Result<CpsProgram, Vec<String>> {
+pub fn build_cps_program(
+    program: &Program,
+    registry: &Registry,
+) -> Result<CpsProgram, Vec<String>> {
     let units = collect_units(program, registry);
     let requests: Vec<DerivativeRequest> = units
         .iter()
         .filter_map(|u| match &u.body {
-            UnitBody::Derivative(of) => Some(DerivativeRequest { name: u.name.clone(), of: of.clone() }),
+            UnitBody::Derivative(of) => Some(DerivativeRequest {
+                name: u.name.clone(),
+                of: of.clone(),
+            }),
             _ => None,
         })
         .collect();
     let cps_program = convert_program(units);
-    synthesize_derivatives(cps_program, &requests, registry)
+    let struct_schemas = collect_struct_schemas(program);
+    synthesize_derivatives(cps_program, &requests, registry, &struct_schemas)
 }
 
 /// Runs whole-program type inference and monomorphization purely to check
@@ -131,6 +139,24 @@ pub fn compile_and_emit(
     emit_from_program(&program, &registry, &sources, object_path, bindings_path)
 }
 
+/// Shared libraries the JIT's own `ExecutionEngine` needs loaded *alongside*
+/// the lowered module, for symbols the lowered `llvm` dialect calls but never
+/// defines itself -- `memrefCopy` (`mlir::ExecutionEngine::CRunnerUtils`),
+/// the runtime helper `one-shot-bufferize` inserts a real call to once a
+/// tensor value needs a defensive copy before a write it can't otherwise
+/// prove safe. Every program up to and including this session's own `Dense`/
+/// `Network` work happened to need no such copy at all (confirmed directly:
+/// `--dump-mlir-lowered` on every prior example has zero `memrefCopy` calls),
+/// so this was never missing *for those* -- but the gap was always there:
+/// `ExecutionEngine::new`'s own `shared_library_paths` parameter was `&[]`
+/// unconditionally, on both call sites, so a program needing it would always
+/// have crashed exactly the way this one did (`JIT session error: Symbols
+/// not found: [ memrefCopy ]`) the moment a big enough derivative expression
+/// finally triggered a real defensive copy. `mlir_c_runner_utils.dll` (not
+/// `mlir_runner_utils.dll`, its sibling — the latter is the *print*/timing
+/// helper library, a separate concern) really does export it (confirmed
+/// directly: `dumpbin /exports` on the actual `.dll`), built alongside this
+/// project's own real, non-"compiler-only" MLIR 22 install (`.cargo/config.
 /// Registers every real `cleave-rt` function by pointer against `engine` --
 /// shared by `--run` (`main.rs`) and `emit_object` below. A short, explicit,
 /// hardcoded list, growing one line per `extern fn` `cleave-rt` provides;
@@ -156,8 +182,22 @@ pub fn compile_and_emit(
 ///
 /// SAFETY: each `cleave_rt::*` pointer is a real, valid `extern "C" fn`,
 /// live for the process's whole lifetime.
+///
+/// `memrefCopy` belongs here too, even though it isn't a cleave `extern fn`
+/// any cleave source ever calls directly -- `cleave_rt::memrefCopy`'s own
+/// doc comment has the full story: it's this project's own reimplementation
+/// of an MLIR runtime helper (`mlir::ExecutionEngine::CRunnerUtils.h`),
+/// needed because `one-shot-bufferize`'s own lowering calls it directly by
+/// name whenever a tensor value needs a real defensive copy, and this
+/// engine has no shared library loaded to satisfy that on its own.
 pub unsafe fn register_cleave_rt_symbols(engine: &melior::ExecutionEngine) {
     unsafe {
+        engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
+        engine.register_symbol("rand_seed", cleave_rt::rand_seed as *mut ());
+        engine.register_symbol("rand_uniform_f32", cleave_rt::rand_uniform_f32 as *mut ());
+        engine.register_symbol("rand_uniform_f64", cleave_rt::rand_uniform_f64 as *mut ());
+        engine.register_symbol("rand_normal_f32", cleave_rt::rand_normal_f32 as *mut ());
+        engine.register_symbol("rand_normal_f64", cleave_rt::rand_normal_f64 as *mut ());
         engine.register_symbol("print_i8", cleave_rt::print_i8 as *mut ());
         engine.register_symbol("print_i16", cleave_rt::print_i16 as *mut ());
         engine.register_symbol("print_i32", cleave_rt::print_i32 as *mut ());
@@ -170,27 +210,45 @@ pub unsafe fn register_cleave_rt_symbols(engine: &melior::ExecutionEngine) {
         engine.register_symbol("dynarray_grow_i8", cleave_rt::dynarray_grow_i8 as *mut ());
         engine.register_symbol("dynarray_get_i8", cleave_rt::dynarray_get_i8 as *mut ());
         engine.register_symbol("dynarray_set_i8", cleave_rt::dynarray_set_i8 as *mut ());
-        engine.register_symbol("dynarray_alloc_i16", cleave_rt::dynarray_alloc_i16 as *mut ());
+        engine.register_symbol(
+            "dynarray_alloc_i16",
+            cleave_rt::dynarray_alloc_i16 as *mut (),
+        );
         engine.register_symbol("dynarray_grow_i16", cleave_rt::dynarray_grow_i16 as *mut ());
         engine.register_symbol("dynarray_get_i16", cleave_rt::dynarray_get_i16 as *mut ());
         engine.register_symbol("dynarray_set_i16", cleave_rt::dynarray_set_i16 as *mut ());
-        engine.register_symbol("dynarray_alloc_i32", cleave_rt::dynarray_alloc_i32 as *mut ());
+        engine.register_symbol(
+            "dynarray_alloc_i32",
+            cleave_rt::dynarray_alloc_i32 as *mut (),
+        );
         engine.register_symbol("dynarray_grow_i32", cleave_rt::dynarray_grow_i32 as *mut ());
         engine.register_symbol("dynarray_get_i32", cleave_rt::dynarray_get_i32 as *mut ());
         engine.register_symbol("dynarray_set_i32", cleave_rt::dynarray_set_i32 as *mut ());
-        engine.register_symbol("dynarray_alloc_i64", cleave_rt::dynarray_alloc_i64 as *mut ());
+        engine.register_symbol(
+            "dynarray_alloc_i64",
+            cleave_rt::dynarray_alloc_i64 as *mut (),
+        );
         engine.register_symbol("dynarray_grow_i64", cleave_rt::dynarray_grow_i64 as *mut ());
         engine.register_symbol("dynarray_get_i64", cleave_rt::dynarray_get_i64 as *mut ());
         engine.register_symbol("dynarray_set_i64", cleave_rt::dynarray_set_i64 as *mut ());
-        engine.register_symbol("dynarray_alloc_f32", cleave_rt::dynarray_alloc_f32 as *mut ());
+        engine.register_symbol(
+            "dynarray_alloc_f32",
+            cleave_rt::dynarray_alloc_f32 as *mut (),
+        );
         engine.register_symbol("dynarray_grow_f32", cleave_rt::dynarray_grow_f32 as *mut ());
         engine.register_symbol("dynarray_get_f32", cleave_rt::dynarray_get_f32 as *mut ());
         engine.register_symbol("dynarray_set_f32", cleave_rt::dynarray_set_f32 as *mut ());
-        engine.register_symbol("dynarray_alloc_f64", cleave_rt::dynarray_alloc_f64 as *mut ());
+        engine.register_symbol(
+            "dynarray_alloc_f64",
+            cleave_rt::dynarray_alloc_f64 as *mut (),
+        );
         engine.register_symbol("dynarray_grow_f64", cleave_rt::dynarray_grow_f64 as *mut ());
         engine.register_symbol("dynarray_get_f64", cleave_rt::dynarray_get_f64 as *mut ());
         engine.register_symbol("dynarray_set_f64", cleave_rt::dynarray_set_f64 as *mut ());
-        engine.register_symbol("dynarray_alloc_ptr", cleave_rt::dynarray_alloc_ptr as *mut ());
+        engine.register_symbol(
+            "dynarray_alloc_ptr",
+            cleave_rt::dynarray_alloc_ptr as *mut (),
+        );
         engine.register_symbol("dynarray_grow_ptr", cleave_rt::dynarray_grow_ptr as *mut ());
         engine.register_symbol("dynarray_get_ptr", cleave_rt::dynarray_get_ptr as *mut ());
         engine.register_symbol("dynarray_set_ptr", cleave_rt::dynarray_set_ptr as *mut ());
@@ -202,7 +260,11 @@ pub unsafe fn register_cleave_rt_symbols(engine: &melior::ExecutionEngine) {
 /// (`ExecutionEngine::dump_to_object_file`) rather than JIT invocation --
 /// see `main.rs`'s own original version of this block for the full
 /// reasoning behind each stage; kept identical here, just parameterized.
-fn emit_object(program: &Program, cps_program: &CpsProgram, object_path: &Path) -> Result<(), Vec<String>> {
+fn emit_object(
+    program: &Program,
+    cps_program: &CpsProgram,
+    object_path: &Path,
+) -> Result<(), Vec<String>> {
     let dialect_registry = DialectRegistry::new();
     register_all_dialects(&dialect_registry);
     let context = Context::new();
@@ -213,13 +275,17 @@ fn emit_object(program: &Program, cps_program: &CpsProgram, object_path: &Path) 
     let struct_schemas = collect_struct_schemas(program);
     let mut module = lower_program(&context, cps_program, &mlir_types, struct_schemas);
     if !module.as_operation().verify() {
-        return Err(vec!["generated MLIR module failed verification".to_string()]);
+        return Err(vec![
+            "generated MLIR module failed verification".to_string(),
+        ]);
     }
 
     let pass_manager = pass::PassManager::new(&context);
     pass_manager.add_pass(pass::linalg::create_convert_elementwise_to_linalg_pass());
     if pass_manager.run(&mut module).is_err() {
-        return Err(vec!["MLIR-to-LLVM lowering pass failed (elementwise-to-linalg)".to_string()]);
+        return Err(vec![
+            "MLIR-to-LLVM lowering pass failed (elementwise-to-linalg)".to_string(),
+        ]);
     }
 
     let pass_manager = pass::PassManager::new(&context);
@@ -231,7 +297,9 @@ fn emit_object(program: &Program, cps_program: &CpsProgram, object_path: &Path) 
     .is_err()
         || pass_manager.run(&mut module).is_err()
     {
-        return Err(vec!["MLIR-to-LLVM lowering pass failed (one-shot-bufferize)".to_string()]);
+        return Err(vec![
+            "MLIR-to-LLVM lowering pass failed (one-shot-bufferize)".to_string(),
+        ]);
     }
 
     let pass_manager = pass::PassManager::new(&context);
@@ -240,7 +308,9 @@ fn emit_object(program: &Program, cps_program: &CpsProgram, object_path: &Path) 
     pass_manager.add_pass(pass::conversion::create_to_llvm());
     pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
     if pass_manager.run(&mut module).is_err() {
-        return Err(vec!["MLIR-to-LLVM lowering pass failed (to-llvm)".to_string()]);
+        return Err(vec![
+            "MLIR-to-LLVM lowering pass failed (to-llvm)".to_string(),
+        ]);
     }
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], true, false);
@@ -249,7 +319,9 @@ fn emit_object(program: &Program, cps_program: &CpsProgram, object_path: &Path) 
         register_cleave_rt_symbols(&engine);
     }
     let Some(object_path_str) = object_path.to_str() else {
-        return Err(vec![format!("object path {object_path:?} is not valid UTF-8")]);
+        return Err(vec![format!(
+            "object path {object_path:?} is not valid UTF-8"
+        )]);
     };
     engine.dump_to_object_file(object_path_str);
     Ok(())
@@ -298,12 +370,19 @@ const EXE_ENTRY_SYMBOL: &str = "__cleave_program_main";
 /// own MLIR dependency doesn't remove the need for a working Rust
 /// toolchain to build `cleave` itself in the first place, so requiring one
 /// again here adds no new prerequisite).
-pub fn emit_exe(program: &Program, registry: &Registry, sources: &SourceMap, exe_path: &Path) -> Result<(), Vec<String>> {
+pub fn emit_exe(
+    program: &Program,
+    registry: &Registry,
+    sources: &SourceMap,
+    exe_path: &Path,
+) -> Result<(), Vec<String>> {
     check_type_errors(program, registry).map_err(|errs| render_all(&errs, sources))?;
     let mut cps_program = build_optimized_cps(program, registry)?;
 
     let Some(main_fn) = cps_program.funcs.iter_mut().find(|f| f.def.name == "main") else {
-        return Err(vec!["no `fn main()` found -- a standalone executable needs a real entry point".to_string()]);
+        return Err(vec![
+            "no `fn main()` found -- a standalone executable needs a real entry point".to_string(),
+        ]);
     };
     main_fn.is_export = true;
     main_fn.export_symbol = Some(EXE_ENTRY_SYMBOL.to_string());
@@ -319,19 +398,26 @@ pub fn emit_exe(program: &Program, registry: &Registry, sources: &SourceMap, exe
     // (still useful for a human skimming `%TEMP%`) closes the gap.
     static WORK_DIR_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let call_id = WORK_DIR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let work_dir = std::env::temp_dir().join(format!("cleave_emit_exe_{}_{call_id}", std::process::id()));
-    std::fs::create_dir_all(&work_dir).map_err(|e| vec![format!("failed to create a temp directory: {e}")])?;
+    let work_dir =
+        std::env::temp_dir().join(format!("cleave_emit_exe_{}_{call_id}", std::process::id()));
+    std::fs::create_dir_all(&work_dir)
+        .map_err(|e| vec![format!("failed to create a temp directory: {e}")])?;
     let object_path = work_dir.join("program.o");
     let shim_path = work_dir.join("shim.rs");
 
     emit_object(program, &cps_program, &object_path)?;
 
     let shim_src = if main_returns_i32 {
-        format!("unsafe extern \"C\" {{ fn {EXE_ENTRY_SYMBOL}() -> i32; }}\nfn main() {{ std::process::exit(unsafe {{ {EXE_ENTRY_SYMBOL}() }}); }}\n")
+        format!(
+            "unsafe extern \"C\" {{ fn {EXE_ENTRY_SYMBOL}() -> i32; }}\nfn main() {{ std::process::exit(unsafe {{ {EXE_ENTRY_SYMBOL}() }}); }}\n"
+        )
     } else {
-        format!("unsafe extern \"C\" {{ fn {EXE_ENTRY_SYMBOL}(); }}\nfn main() {{ unsafe {{ {EXE_ENTRY_SYMBOL}() }}; }}\n")
+        format!(
+            "unsafe extern \"C\" {{ fn {EXE_ENTRY_SYMBOL}(); }}\nfn main() {{ unsafe {{ {EXE_ENTRY_SYMBOL}() }}; }}\n"
+        )
     };
-    std::fs::write(&shim_path, shim_src).map_err(|e| vec![format!("failed to write {}: {e}", shim_path.display())])?;
+    std::fs::write(&shim_path, shim_src)
+        .map_err(|e| vec![format!("failed to write {}: {e}", shim_path.display())])?;
 
     let runtime_dir = cleave_rt_search_dir()?;
     let status = std::process::Command::new("rustc")
@@ -348,7 +434,9 @@ pub fn emit_exe(program: &Program, registry: &Registry, sources: &SourceMap, exe
     let _ = std::fs::remove_dir_all(&work_dir);
     match status {
         Ok(s) if s.success() => Ok(()),
-        Ok(s) => Err(vec![format!("rustc failed while linking the final executable (exit status: {s})")]),
+        Ok(s) => Err(vec![format!(
+            "rustc failed while linking the final executable (exit status: {s})"
+        )]),
         Err(e) => Err(vec![format!("failed to run `rustc` (is it on PATH?): {e}")]),
     }
 }
@@ -364,14 +452,21 @@ pub fn emit_exe(program: &Program, registry: &Registry, sources: &SourceMap, exe
 /// Known, deliberate limitation beyond that: a `cleave` binary copied/
 /// installed somewhere with neither layout nearby won't find one.
 fn cleave_rt_search_dir() -> Result<PathBuf, Vec<String>> {
-    let exe = std::env::current_exe().map_err(|e| vec![format!("failed to locate the running cleave executable: {e}")])?;
+    let exe = std::env::current_exe().map_err(|e| {
+        vec![format!(
+            "failed to locate the running cleave executable: {e}"
+        )]
+    })?;
     let candidates = exe.ancestors().skip(1).take(2);
     for dir in candidates {
         if dir.join("cleave_rt.lib").exists() || dir.join("libcleave_rt.a").exists() {
             return Ok(dir.to_path_buf());
         }
     }
-    exe.parent()
-        .map(|p| p.to_path_buf())
-        .ok_or_else(|| vec![format!("cleave executable path {} has no parent directory", exe.display())])
+    exe.parent().map(|p| p.to_path_buf()).ok_or_else(|| {
+        vec![format!(
+            "cleave executable path {} has no parent directory",
+            exe.display()
+        )]
+    })
 }

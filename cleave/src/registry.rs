@@ -125,27 +125,31 @@ impl Registry {
                         AlgebraItemKind::FnSig(_) | AlgebraItemKind::Axiom(_) => None,
                     })
                     .collect();
-                algebras.entry(d.name.clone()).or_insert_with(|| AlgebraEntry {
-                    generics: d.generics.clone(),
-                    bounds: d.bounds.clone(),
-                    sigs,
-                    axioms,
-                    derivative_rules,
-                    impls: HashMap::new(),
-                });
+                algebras
+                    .entry(d.name.clone())
+                    .or_insert_with(|| AlgebraEntry {
+                        generics: d.generics.clone(),
+                        bounds: d.bounds.clone(),
+                        sigs,
+                        axioms,
+                        derivative_rules,
+                        impls: HashMap::new(),
+                    });
             }
         }
 
         for item in &program.items {
             if let ItemKind::Impl(d) = &item.kind {
-                let entry = algebras.entry(d.algebra.clone()).or_insert_with(|| AlgebraEntry {
-                    generics: Vec::new(),
-                    bounds: Vec::new(),
-                    sigs: Vec::new(),
-                    axioms: Vec::new(),
-                    derivative_rules: Vec::new(),
-                    impls: HashMap::new(),
-                });
+                let entry = algebras
+                    .entry(d.algebra.clone())
+                    .or_insert_with(|| AlgebraEntry {
+                        generics: Vec::new(),
+                        bounds: Vec::new(),
+                        sigs: Vec::new(),
+                        axioms: Vec::new(),
+                        derivative_rules: Vec::new(),
+                        impls: HashMap::new(),
+                    });
                 // `fmt_type(target)` alone would collide two *different*
                 // generic impls sharing the same bare target shape but
                 // different bounds (`impl<T: Float> Ring<Complex<T>>` vs.
@@ -160,7 +164,12 @@ impl Registry {
                 // reason — two heterogeneous impls sharing a first target
                 // but differing afterward must stay distinct too.
                 let extra_targets_key: String = d.extra_targets.iter().map(fmt_type).collect();
-                let key = format!("{}{}{}", fmt_type(&d.target), extra_targets_key, fmt_generics(&d.generics));
+                let key = format!(
+                    "{}{}{}",
+                    fmt_type(&d.target),
+                    extra_targets_key,
+                    fmt_generics(&d.generics)
+                );
                 entry.impls.insert(
                     key,
                     ImplEntry {
@@ -180,11 +189,18 @@ impl Registry {
         let mut structs: HashMap<String, StructEntry> = HashMap::new();
         for item in &program.items {
             if let ItemKind::Struct(d) = &item.kind {
-                structs.insert(d.name.clone(), StructEntry { generics: d.generics.clone(), fields: d.fields.clone() });
+                structs.insert(
+                    d.name.clone(),
+                    StructEntry {
+                        generics: d.generics.clone(),
+                        fields: d.fields.clone(),
+                    },
+                );
             }
         }
 
-        let mut inherent_methods: HashMap<String, HashMap<String, InherentMethodEntry>> = HashMap::new();
+        let mut inherent_methods: HashMap<String, HashMap<String, InherentMethodEntry>> =
+            HashMap::new();
         for item in &program.items {
             if let ItemKind::InherentImpl(d) = &item.kind {
                 // Only a bare/generic *path* target names a struct at all —
@@ -196,18 +212,31 @@ impl Registry {
                 // validation" stance (a real diagnostic for this, if
                 // wanted, belongs in `infer.rs` alongside its other
                 // `pending_type_name_checks`-style checks, not here).
-                let TypeKind::Path(p, _) = &d.target.kind else { continue };
+                let TypeKind::Path(p, _) = &d.target.kind else {
+                    continue;
+                };
                 let struct_name = p.segments.join("::");
                 for f in &d.fns {
-                    inherent_methods.entry(struct_name.clone()).or_default().insert(
-                        f.name.clone(),
-                        InherentMethodEntry { generics: d.generics.clone(), target: d.target.clone(), method: f.clone() },
-                    );
+                    inherent_methods
+                        .entry(struct_name.clone())
+                        .or_default()
+                        .insert(
+                            f.name.clone(),
+                            InherentMethodEntry {
+                                generics: d.generics.clone(),
+                                target: d.target.clone(),
+                                method: f.clone(),
+                            },
+                        );
                 }
             }
         }
 
-        Registry { algebras, structs, inherent_methods }
+        Registry {
+            algebras,
+            structs,
+            inherent_methods,
+        }
     }
 
     /// Does `algebra` have an `impl` for this concrete target type? String
@@ -222,7 +251,9 @@ impl Registry {
     /// that only have their own internal type representation at hand, with
     /// no AST node (and no `NodeId`/`Span` to invent one from) to point to.
     pub fn has_impl_named(&self, algebra: &str, type_name: &str) -> bool {
-        self.algebras.get(algebra).is_some_and(|e| e.impls.contains_key(type_name))
+        self.algebras
+            .get(algebra)
+            .is_some_and(|e| e.impls.contains_key(type_name))
     }
 
     /// Names of every declared algebra that has a `fn` signature named
@@ -238,7 +269,12 @@ impl Registry {
     pub fn algebras_with_fn(&self, fn_name: &str, arity: usize) -> Vec<&str> {
         self.algebras
             .iter()
-            .filter(|(_, entry)| entry.sigs.iter().any(|s| s.name == fn_name && s.params.len() == arity))
+            .filter(|(_, entry)| {
+                entry
+                    .sigs
+                    .iter()
+                    .any(|s| s.name == fn_name && s.params.len() == arity)
+            })
             .map(|(name, _)| name.as_str())
             .collect()
     }
@@ -247,7 +283,11 @@ impl Registry {
     /// checking argument types against the algebra's own declared
     /// parameter/return types.
     pub fn fn_sig(&self, algebra: &str, fn_name: &str) -> Option<&FnSig> {
-        self.algebras.get(algebra)?.sigs.iter().find(|s| s.name == fn_name)
+        self.algebras
+            .get(algebra)?
+            .sigs
+            .iter()
+            .find(|s| s.name == fn_name)
     }
 
     /// The algebra's own generic parameters (`<T>` in `algebra Ring<T>`) —
@@ -255,7 +295,10 @@ impl Registry {
     /// with fresh inference type variables, rather than treating `T` as a
     /// bare concrete type named `"T"`.
     pub fn generics(&self, algebra: &str) -> &[GenericParam] {
-        self.algebras.get(algebra).map(|e| e.generics.as_slice()).unwrap_or(&[])
+        self.algebras
+            .get(algebra)
+            .map(|e| e.generics.as_slice())
+            .unwrap_or(&[])
     }
 
     pub fn has_algebra(&self, algebra: &str) -> bool {
@@ -271,7 +314,10 @@ impl Registry {
     /// `Infer::match_impl`, not here (`Registry` stays just data, see the
     /// module doc).
     pub fn algebra_bounds(&self, algebra: &str) -> &[String] {
-        self.algebras.get(algebra).map(|e| e.bounds.as_slice()).unwrap_or(&[])
+        self.algebras
+            .get(algebra)
+            .map(|e| e.bounds.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Every `axiom` declared on `algebra` — see `AlgebraEntry::axioms`'s own
@@ -279,13 +325,19 @@ impl Registry {
     /// `algebra_bounds`'s own convention just above) and for an unknown
     /// algebra name entirely.
     pub fn axioms(&self, algebra: &str) -> &[AxiomDecl] {
-        self.algebras.get(algebra).map(|e| e.axioms.as_slice()).unwrap_or(&[])
+        self.algebras
+            .get(algebra)
+            .map(|e| e.axioms.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Every `derivative` rule declared on `algebra` — see `AlgebraEntry::
     /// derivative_rules`'s own doc comment.
     pub fn derivative_rules(&self, algebra: &str) -> &[DerivativeRuleDecl] {
-        self.algebras.get(algebra).map(|e| e.derivative_rules.as_slice()).unwrap_or(&[])
+        self.algebras
+            .get(algebra)
+            .map(|e| e.derivative_rules.as_slice())
+            .unwrap_or(&[])
     }
 
     /// The reverse of `algebra_bounds`: every algebra that names `algebra`
@@ -293,8 +345,14 @@ impl Registry {
     /// by("Num")`, once `algebra Int<T> : Num` / `algebra Float<T> : Num`
     /// exist) — what `Infer::has_matching_impl` walks to check "does some
     /// *other*, more specific algebra's impl count as this one too".
-    pub fn algebras_bounded_by<'a>(&'a self, algebra: &'a str) -> impl Iterator<Item = &'a str> + 'a {
-        self.algebras.iter().filter(move |(_, e)| e.bounds.iter().any(|b| b == algebra)).map(|(name, _)| name.as_str())
+    pub fn algebras_bounded_by<'a>(
+        &'a self,
+        algebra: &'a str,
+    ) -> impl Iterator<Item = &'a str> + 'a {
+        self.algebras
+            .iter()
+            .filter(move |(_, e)| e.bounds.iter().any(|b| b == algebra))
+            .map(|(name, _)| name.as_str())
     }
 
     /// Every declared algebra's name — used by `Infer::check_no_overlapping_impls`
@@ -331,13 +389,20 @@ impl Registry {
     /// the concrete argument a particular value was built with (field
     /// access) — see `infer.rs`'s `StructLit`/`FieldAccess` handling.
     pub fn struct_generics(&self, name: &str) -> &[GenericParam] {
-        self.structs.get(name).map(|e| e.generics.as_slice()).unwrap_or(&[])
+        self.structs
+            .get(name)
+            .map(|e| e.generics.as_slice())
+            .unwrap_or(&[])
     }
 
     /// The struct's own inherent method named `method_name`, if any — see
     /// `InherentMethodEntry`'s own doc comment for why this is a plain
     /// lookup, no ambiguity/candidate handling.
-    pub fn inherent_method(&self, struct_name: &str, method_name: &str) -> Option<&InherentMethodEntry> {
+    pub fn inherent_method(
+        &self,
+        struct_name: &str,
+        method_name: &str,
+    ) -> Option<&InherentMethodEntry> {
         self.inherent_methods.get(struct_name)?.get(method_name)
     }
 
@@ -387,8 +452,9 @@ impl Registry {
                 e.impls
                     .values()
                     .map(|i| {
-                        let targets: Vec<&Type> =
-                            std::iter::once(&i.target).chain(i.extra_targets.iter()).collect();
+                        let targets: Vec<&Type> = std::iter::once(&i.target)
+                            .chain(i.extra_targets.iter())
+                            .collect();
                         (i.generics.as_slice(), targets)
                     })
                     .collect()
@@ -423,13 +489,19 @@ impl Registry {
     /// `visited` guards against a cyclic bound declaration (`algebra A : B`,
     /// `algebra B : A`) looping forever — same reasoning, same shape, as
     /// `Infer::has_matching_impl_inherited`'s own identical guard.
-    fn candidates_for_inner<'a>(&'a self, algebra: &'a str, visited: &mut HashSet<&'a str>) -> HashSet<String> {
+    fn candidates_for_inner<'a>(
+        &'a self,
+        algebra: &'a str,
+        visited: &mut HashSet<&'a str>,
+    ) -> HashSet<String> {
         let mut out = HashSet::new();
         if !visited.insert(algebra) {
             return out;
         }
         for (generics, targets) in self.all_impls(algebra) {
-            let [target] = targets.as_slice() else { continue };
+            let [target] = targets.as_slice() else {
+                continue;
+            };
             if !generics.is_empty() {
                 continue;
             }
@@ -453,15 +525,19 @@ impl Registry {
     /// every algebra-dispatched call during ordinary inference, and has no
     /// use for the extra `&[FnDecl]` slice it would otherwise have to carry
     /// around for nothing.
-    pub fn all_impls_with_fns(&self, algebra: &str) -> Vec<(&[GenericParam], Vec<&Type>, &[FnDecl])> {
+    pub fn all_impls_with_fns(
+        &self,
+        algebra: &str,
+    ) -> Vec<(&[GenericParam], Vec<&Type>, &[FnDecl])> {
         self.algebras
             .get(algebra)
             .map(|e| {
                 e.impls
                     .values()
                     .map(|i| {
-                        let targets: Vec<&Type> =
-                            std::iter::once(&i.target).chain(i.extra_targets.iter()).collect();
+                        let targets: Vec<&Type> = std::iter::once(&i.target)
+                            .chain(i.extra_targets.iter())
+                            .collect();
                         (i.generics.as_slice(), targets, i.fns.as_slice())
                     })
                     .collect()

@@ -13,7 +13,11 @@ fn lower_program(src: &str) -> Program {
 
 fn lower_one_fn(src: &str) -> FnDecl {
     let program = lower_program(src);
-    assert_eq!(program.items.len(), 1, "expected exactly one item in {src:?}");
+    assert_eq!(
+        program.items.len(),
+        1,
+        "expected exactly one item in {src:?}"
+    );
     match program.items.into_iter().next().unwrap().kind {
         ItemKind::Fn(f) => f,
         other => panic!("expected a fn item, got {other:?}"),
@@ -22,7 +26,11 @@ fn lower_one_fn(src: &str) -> FnDecl {
 
 fn only_stmt_expr(body: &Option<Block>) -> &Expr {
     // helper for tests that just want the tail expression
-    body.as_ref().expect("expected a body").tail.as_deref().expect("expected a tail expression")
+    body.as_ref()
+        .expect("expected a body")
+        .tail
+        .as_deref()
+        .expect("expected a tail expression")
 }
 
 #[test]
@@ -68,7 +76,11 @@ fn string_literal_desugars_to_an_i8_array_literal() {
                 .iter()
                 .map(|e| match &e.kind {
                     ExprKind::NumberLit { text, suffix } => {
-                        assert_eq!(suffix.as_deref(), Some("i8"), "expected every byte to be i8-suffixed");
+                        assert_eq!(
+                            suffix.as_deref(),
+                            Some("i8"),
+                            "expected every byte to be i8-suffixed"
+                        );
                         text.as_str()
                     }
                     other => panic!("expected NumberLit, got {other:?}"),
@@ -122,7 +134,9 @@ fn lambda_lowers_with_params_and_body() {
             assert_eq!(params[0].name, "a");
             assert!(ret.is_none());
             match &body.tail.as_deref().unwrap().kind {
-                ExprKind::Call(path, _, _, ..) => assert_eq!(path.segments, vec!["add".to_string()]),
+                ExprKind::Call(path, _, _, ..) => {
+                    assert_eq!(path.segments, vec!["add".to_string()])
+                }
                 other => panic!("expected desugared add, got {other:?}"),
             }
         }
@@ -304,7 +318,9 @@ fn separate_bracket_pairs_still_nest() {
                 ExprKind::Index(base, inner_indices) => {
                     assert!(matches!(&base.kind, ExprKind::Path(p) if p.segments == ["a"]));
                     assert_eq!(inner_indices.len(), 1);
-                    assert!(matches!(&inner_indices[0].kind, ExprKind::Path(p) if p.segments == ["i"]));
+                    assert!(
+                        matches!(&inner_indices[0].kind, ExprKind::Path(p) if p.segments == ["i"])
+                    );
                 }
                 other => panic!("expected nested Index, got {other:?}"),
             }
@@ -513,7 +529,11 @@ fn bool_const_generic_argument_lowers_to_a_bool_lit_generic_arg() {
             assert_eq!(path.segments, vec!["Grid".to_string()]);
             assert_eq!(args.len(), 2);
             match &args[1] {
-                GenericArg::Const(e) => assert!(matches!(e.kind, ExprKind::BoolLit(true)), "got: {:?}", e.kind),
+                GenericArg::Const(e) => assert!(
+                    matches!(e.kind, ExprKind::BoolLit(true)),
+                    "got: {:?}",
+                    e.kind
+                ),
                 other => panic!("expected a const generic arg, got {other:?}"),
             }
         }
@@ -523,7 +543,8 @@ fn bool_const_generic_argument_lowers_to_a_bool_lit_generic_arg() {
 
 #[test]
 fn inherent_impl_lowers_to_its_own_item_kind() {
-    let program = lower_program("struct Vec2 { x: f64 }\nimpl struct Vec2 {\n    fn len(v) { v.x }\n}");
+    let program =
+        lower_program("struct Vec2 { x: f64 }\nimpl struct Vec2 {\n    fn len(v) { v.x }\n}");
     assert_eq!(program.items.len(), 2);
     match &program.items[1].kind {
         ItemKind::InherentImpl(d) => {
@@ -544,7 +565,9 @@ fn inherent_impl_lowers_to_its_own_item_kind() {
 
 #[test]
 fn generic_inherent_impl_carries_its_own_generics_and_target_args() {
-    let program = lower_program("struct Matrix<T> { data: T }\nimpl<T: Float> struct Matrix<T> {\n    fn get(m) { m }\n}");
+    let program = lower_program(
+        "struct Matrix<T> { data: T }\nimpl<T: Float> struct Matrix<T> {\n    fn get(m) { m }\n}",
+    );
     match &program.items[1].kind {
         ItemKind::InherentImpl(d) => {
             assert_eq!(d.generics.len(), 1);
@@ -570,7 +593,11 @@ fn multi_target_algebra_impl_populates_extra_targets() {
         ItemKind::Impl(d) => {
             assert_eq!(d.algebra, "MatMul");
             assert_eq!(d.generics.len(), 1);
-            assert_eq!(d.extra_targets.len(), 2, "T, T -- two targets beyond the first");
+            assert_eq!(
+                d.extra_targets.len(),
+                2,
+                "T, T -- two targets beyond the first"
+            );
         }
         other => panic!("expected Impl, got {other:?}"),
     }
@@ -610,5 +637,8 @@ fn extern_and_export_are_mutually_exclusive_at_the_grammar_level() {
     // one -- `extern export fn`/`export extern fn` should fail to parse,
     // not silently pick one.
     let result = CleaveParser::parse(Rule::program, "extern export fn f(x: i32) -> i32;");
-    assert!(result.is_err(), "expected a parse error for `extern export fn`");
+    assert!(
+        result.is_err(),
+        "expected a parse error for `extern export fn`"
+    );
 }

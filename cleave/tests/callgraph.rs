@@ -76,7 +76,10 @@ fn ok_result(results: &cleave::callgraph::ProgramInference, name: &str) -> Ty {
         .clone()
 }
 
-fn err_result(results: &cleave::callgraph::ProgramInference, name: &str) -> cleave::infer::TypeError {
+fn err_result(
+    results: &cleave::callgraph::ProgramInference,
+    name: &str,
+) -> cleave::infer::TypeError {
     results
         .results
         .get(name)
@@ -106,8 +109,15 @@ fn self_recursive_function_resolves_via_its_own_placeholder() {
         fn use_fibonacci() -> i32 { fibonacci(42) }",
     );
     let result = infer_program(&program, &registry);
-    assert!(result.results.get("fibonacci").unwrap().is_ok(), "{:?}", result.results.get("fibonacci"));
-    assert_eq!(ok_result(&result, "use_fibonacci"), Ty::Con("i32".to_string()));
+    assert!(
+        result.results.get("fibonacci").unwrap().is_ok(),
+        "{:?}",
+        result.results.get("fibonacci")
+    );
+    assert_eq!(
+        ok_result(&result, "use_fibonacci"),
+        Ty::Con("i32".to_string())
+    );
 }
 
 #[test]
@@ -183,8 +193,16 @@ fn defaulting_is_deferred_until_the_whole_mutually_recursive_group_is_known() {
         fn use_f() -> i32 { f(5) }",
     );
     let result = infer_program(&program, &registry);
-    assert!(result.results.get("f").unwrap().is_ok(), "{:?}", result.results.get("f"));
-    assert!(result.results.get("g").unwrap().is_ok(), "{:?}", result.results.get("g"));
+    assert!(
+        result.results.get("f").unwrap().is_ok(),
+        "{:?}",
+        result.results.get("f")
+    );
+    assert!(
+        result.results.get("g").unwrap().is_ok(),
+        "{:?}",
+        result.results.get("g")
+    );
     assert_eq!(ok_result(&result, "use_f"), Ty::Con("i32".to_string()));
 }
 
@@ -198,7 +216,10 @@ fn a_type_error_in_one_group_does_not_corrupt_an_unrelated_group() {
         fn fine() -> i32 { 42 }",
     );
     let result = infer_program(&program, &registry);
-    assert!(result.results.get("broken").unwrap().is_err(), "`broken`'s if-branches disagree (bool vs i32)");
+    assert!(
+        result.results.get("broken").unwrap().is_err(),
+        "`broken`'s if-branches disagree (bool vs i32)"
+    );
     assert_eq!(ok_result(&result, "fine"), Ty::Con("i32".to_string()));
 }
 
@@ -212,7 +233,11 @@ fn a_bodyless_top_level_fn_is_rejected() {
     let program = lower_program("fn f(x: i32) -> i32;");
     let result = infer_program(&program, &registry);
     let err = result.results.get("f").unwrap().as_ref().unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::MissingFnBody { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::MissingFnBody { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -229,7 +254,11 @@ fn an_extern_fn_cannot_be_generic() {
     let program = lower_program("extern fn f<T>(x: T) -> T;");
     let result = infer_program(&program, &registry);
     let err = result.results.get("f").unwrap().as_ref().unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::ExternFnCannotBeGeneric { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::ExternFnCannotBeGeneric { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -254,7 +283,11 @@ fn a_bodyless_export_fn_is_rejected() {
     let program = lower_program("export fn f(x: i32) -> i32;");
     let result = infer_program(&program, &registry);
     let err = result.results.get("f").unwrap().as_ref().unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::MissingFnBody { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::MissingFnBody { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -263,7 +296,11 @@ fn an_export_fn_cannot_be_generic() {
     let program = lower_program("export fn f<T>(x: T) -> T { x }");
     let result = infer_program(&program, &registry);
     let err = result.results.get("f").unwrap().as_ref().unwrap_err();
-    assert!(matches!(err.kind, TypeErrorKind::ExportFnCannotBeGeneric { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::ExportFnCannotBeGeneric { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -298,7 +335,10 @@ fn a_const_generic_bounded_for_loop_correctly_dispatches_once_a_caller_instantia
     let result = infer_program(&program, &registry);
     assert_eq!(
         ok_result(&result, "use_it"),
-        Ty::Array(Box::new(Ty::Con("i32".to_string())), Box::new(Ty::Const(ConstValue::Int(4))))
+        Ty::Array(
+            Box::new(Ty::Con("i32".to_string())),
+            Box::new(Ty::Const(ConstValue::Int(4)))
+        )
     );
 }
 
@@ -361,7 +401,8 @@ fn a_nullary_function_is_not_generalized_monomorphism_restriction() {
 // ---------------------------------------------------------------------
 
 #[test]
-fn two_calls_to_a_generalized_function_merged_via_an_operator_with_conflicting_types_are_rejected() {
+fn two_calls_to_a_generalized_function_merged_via_an_operator_with_conflicting_types_are_rejected()
+{
     // The exact real-world repro: `fibonacci`, self-recursive and
     // generalized (see `self_recursive_function_resolves_via_its_own_placeholder`),
     // called twice with *different* concrete types and then forced together
@@ -379,14 +420,22 @@ fn two_calls_to_a_generalized_function_merged_via_an_operator_with_conflicting_t
         fn use_both() -> i32 { fibonacci(42) + fibonacci(42.0) }",
     );
     let result = infer_program(&program, &registry);
-    assert!(result.results.get("fibonacci").unwrap().is_ok(), "{:?}", result.results.get("fibonacci"));
+    assert!(
+        result.results.get("fibonacci").unwrap().is_ok(),
+        "{:?}",
+        result.results.get("fibonacci")
+    );
     let err = err_result(&result, "use_both");
     // `MissingImpl`, not `Unify` — the conflict is caught by the literal's
     // own `Int`/`Float` constraint failing against whichever concrete type
     // the merge settled on (see `infer.rs`'s `NumberLit` handling), not by
     // `apply_defaults` comparing the two literals against each other
     // directly.
-    assert!(matches!(err.kind, cleave::infer::TypeErrorKind::MissingImpl { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, cleave::infer::TypeErrorKind::MissingImpl { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -445,9 +494,17 @@ fn fibonacci_with_bare_int_literals_in_its_own_body_cannot_be_called_with_a_floa
         fn use_as_float() -> f32 { fibonacci(42.0) }",
     );
     let result = infer_program(&program, &registry);
-    assert!(result.results.get("fibonacci").unwrap().is_ok(), "{:?}", result.results.get("fibonacci"));
+    assert!(
+        result.results.get("fibonacci").unwrap().is_ok(),
+        "{:?}",
+        result.results.get("fibonacci")
+    );
     let err = err_result(&result, "use_as_float");
-    assert!(matches!(err.kind, cleave::infer::TypeErrorKind::MissingImpl { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, cleave::infer::TypeErrorKind::MissingImpl { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -497,7 +554,14 @@ fn conflicting_literal_shapes_across_a_mutually_recursive_group_are_rejected() {
     );
     let result = infer_program(&program, &registry);
     let err = err_result(&result, "f");
-    assert!(matches!(err.kind, cleave::infer::TypeErrorKind::UnsatisfiableScheme { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(
+            err.kind,
+            cleave::infer::TypeErrorKind::UnsatisfiableScheme { .. }
+        ),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 #[test]
@@ -512,8 +576,16 @@ fn same_literal_shape_across_a_mutually_recursive_group_succeeds() {
         }",
     );
     let result = infer_program(&program, &registry);
-    assert!(result.results.get("f").unwrap().is_ok(), "{:?}", result.results.get("f"));
-    assert!(result.results.get("g").unwrap().is_ok(), "{:?}", result.results.get("g"));
+    assert!(
+        result.results.get("f").unwrap().is_ok(),
+        "{:?}",
+        result.results.get("f")
+    );
+    assert!(
+        result.results.get("g").unwrap().is_ok(),
+        "{:?}",
+        result.results.get("g")
+    );
 }
 
 #[test]
@@ -533,7 +605,10 @@ fn a_nullary_function_is_callable_from_another_function() {
     );
     let result = infer_program(&program, &registry);
     assert_eq!(ok_result(&result, "constant"), Ty::Con("i32".to_string()));
-    assert_eq!(ok_result(&result, "use_constant"), Ty::Con("i32".to_string()));
+    assert_eq!(
+        ok_result(&result, "use_constant"),
+        Ty::Con("i32".to_string())
+    );
 }
 
 #[test]
@@ -591,7 +666,11 @@ fn a_higher_order_function_rejects_a_lambda_with_the_wrong_return_type() {
     let registry = registry_from(src);
     let result = infer_program(&program, &registry);
     let err = err_result(&result, "g");
-    assert!(matches!(err.kind, cleave::infer::TypeErrorKind::Unify(_)), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, cleave::infer::TypeErrorKind::Unify(_)),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -611,7 +690,11 @@ fn a_nullary_functions_returned_closure_still_enforces_its_own_constraint() {
         fn use_i32() -> i32 { let f = make_adder(); f(5) }",
     );
     let result = infer_program(&program, &registry);
-    assert!(result.results.get("make_adder").unwrap().is_ok(), "{:?}", result.results.get("make_adder"));
+    assert!(
+        result.results.get("make_adder").unwrap().is_ok(),
+        "{:?}",
+        result.results.get("make_adder")
+    );
     assert_eq!(ok_result(&result, "use_i32"), Ty::Con("i32".to_string()));
 }
 
@@ -650,7 +733,8 @@ fn a_nullary_functions_returned_closure_rejects_a_type_with_no_matching_impl() {
 /// types, never one specific constant value) — and always failed with `no
 /// impl Num<4>`, regardless of the call.
 #[test]
-fn a_const_generic_used_as_a_for_loop_bound_is_checked_against_its_own_declared_width_at_the_call_site() {
+fn a_const_generic_used_as_a_for_loop_bound_is_checked_against_its_own_declared_width_at_the_call_site()
+ {
     let src = "algebra Num<T> {}
         algebra Int<T> : Num {}
         algebra Float<T> : Num {}
@@ -669,8 +753,18 @@ fn a_const_generic_used_as_a_for_loop_bound_is_checked_against_its_own_declared_
     let program = lower_program(src);
     let registry = registry_from(src);
     let result = infer_program(&program, &registry);
-    assert!(result.results.get("fill").unwrap().is_ok(), "{:?}", result.results.get("fill"));
-    assert_eq!(ok_result(&result, "main"), Ty::Array(Box::new(Ty::Con("f32".to_string())), Box::new(Ty::Const(ConstValue::Int(4)))));
+    assert!(
+        result.results.get("fill").unwrap().is_ok(),
+        "{:?}",
+        result.results.get("fill")
+    );
+    assert_eq!(
+        ok_result(&result, "main"),
+        Ty::Array(
+            Box::new(Ty::Con("f32".to_string())),
+            Box::new(Ty::Const(ConstValue::Int(4)))
+        )
+    );
 }
 
 /// Proves the width bridge checks the *real* declared width, not a blanket
@@ -697,7 +791,11 @@ fn a_const_generic_used_as_a_for_loop_bound_is_checked_against_its_real_width_no
     let program = lower_program(src);
     let registry = registry_from(src);
     let result = infer_program(&program, &registry);
-    assert!(result.results.get("g").unwrap().is_ok(), "{:?}", result.results.get("g"));
+    assert!(
+        result.results.get("g").unwrap().is_ok(),
+        "{:?}",
+        result.results.get("g")
+    );
     let err = err_result(&result, "main");
     // Whichever of the merged var's own constraints (`Num` and `Int` are
     // both pushed for a bare numeric literal, see `NumberLit`'s own
@@ -742,7 +840,8 @@ fn an_external_callers_own_return_type_resolves_through_an_unannotated_inherent_
 }
 
 #[test]
-fn a_generic_inherent_methods_own_return_type_resolves_through_the_call_sites_own_concrete_generic() {
+fn a_generic_inherent_methods_own_return_type_resolves_through_the_call_sites_own_concrete_generic()
+{
     let src = "struct Boxed<T> { value: T }
         impl<T> struct Boxed<T> {
             fn get(b) { b.value }
@@ -780,7 +879,11 @@ fn an_inherent_methods_own_dependency_on_a_top_level_fn_gracefully_defers_for_an
     // unified against an incompatible concrete type elsewhere, a *worse*
     // failure mode this test is deliberately not exercising).
     let err = err_result(&result, "use_it");
-    assert!(matches!(&err.kind, TypeErrorKind::Unresolved(s) if s.starts_with('<')), "got: {:?}", err.kind);
+    assert!(
+        matches!(&err.kind, TypeErrorKind::Unresolved(s) if s.starts_with('<')),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 /// `doc/backlog.md`'s own "Explicit turbofish on a const generic, for a
@@ -805,7 +908,11 @@ fn explicit_turbofish_on_a_const_generic_resolves_the_calls_own_type() {
          fn f() -> i32 { rep::<3>(5) }",
     );
     let result = infer_program(&program, &registry);
-    assert!(result.results.get("rep").unwrap().is_ok(), "{:?}", result.results.get("rep"));
+    assert!(
+        result.results.get("rep").unwrap().is_ok(),
+        "{:?}",
+        result.results.get("rep")
+    );
     assert_eq!(ok_result(&result, "f"), Ty::Const(ConstValue::Int(3)));
 }
 
@@ -820,7 +927,8 @@ fn explicit_turbofish_on_a_const_generic_resolves_the_calls_own_type() {
 /// needed at all, not just "eventually, once someone instantiates it"
 /// (that half already worked, confirmed separately).
 #[test]
-fn a_mutually_recursive_groups_own_conflicting_shape_constraints_are_rejected_even_with_no_external_caller() {
+fn a_mutually_recursive_groups_own_conflicting_shape_constraints_are_rejected_even_with_no_external_caller()
+ {
     let registry = dual_type_registry();
     let program = lower_program(
         "fn f(x) { g(x); x + 1 }
@@ -828,7 +936,11 @@ fn a_mutually_recursive_groups_own_conflicting_shape_constraints_are_rejected_ev
     );
     let result = infer_program(&program, &registry);
     let err = err_result(&result, "f");
-    assert!(matches!(err.kind, TypeErrorKind::UnsatisfiableScheme { .. }), "got: {:?}", err.kind);
+    assert!(
+        matches!(err.kind, TypeErrorKind::UnsatisfiableScheme { .. }),
+        "got: {:?}",
+        err.kind
+    );
 }
 
 /// Regression guard: two *compatible* single-target constraints sharing one
@@ -840,5 +952,9 @@ fn compatible_shape_constraints_on_the_same_variable_still_generalize() {
     let registry = dual_type_registry();
     let program = lower_program("fn is_positive(x) { gt(x, 0) }");
     let result = infer_program(&program, &registry);
-    assert!(result.results.get("is_positive").unwrap().is_ok(), "{:?}", result.results.get("is_positive"));
+    assert!(
+        result.results.get("is_positive").unwrap().is_ok(),
+        "{:?}",
+        result.results.get("is_positive")
+    );
 }

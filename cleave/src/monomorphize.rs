@@ -85,8 +85,13 @@
 
 use crate::ast::*;
 use crate::callgraph::{self, ProgramInference};
-use crate::dump::{dump_block_with_call_names, fmt_ty_named, TyVarNames};
-use crate::infer::{find_placeholder_name, free_vars, substitute, unify, ConstValue, Env, Infer, Scheme, Subst, Ty, TyVar, TypeError, TypeErrorKind};
+use crate::cps::{StructSchema, collect_struct_schemas};
+use crate::dump::{TyVarNames, dump_block_with_call_names, fmt_ty_named};
+use crate::infer::{
+    ConstValue, Env, Infer, Scheme, Subst, Ty, TyVar, TypeError, TypeErrorKind,
+    find_placeholder_name, free_vars, substitute, unify,
+};
+use crate::mlir_lower::struct_field_types;
 use crate::registry::Registry;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -325,24 +330,38 @@ pub(crate) struct InherentTemplate {
 /// other template/specialization here. A method whose own declaration-time
 /// inference failed is silently skipped, same reasoning as `build_impl_
 /// templates`.
-fn build_inherent_templates(program: &Program, registry: &Registry, global_env: &Env) -> Vec<InherentTemplate> {
+fn build_inherent_templates(
+    program: &Program,
+    registry: &Registry,
+    global_env: &Env,
+) -> Vec<InherentTemplate> {
     let mut templates = Vec::new();
     for item in &program.items {
-        let ItemKind::InherentImpl(d) = &item.kind else { continue };
+        let ItemKind::InherentImpl(d) = &item.kind else {
+            continue;
+        };
         if d.generics.is_empty() {
             continue;
         }
-        let TypeKind::Path(p, _) = &d.target.kind else { continue };
+        let TypeKind::Path(p, _) = &d.target.kind else {
+            continue;
+        };
         let struct_name = p.segments.join("::");
         let mut infer = Infer::new(registry);
-        let (_, results) = infer.infer_inherent_impl_block(global_env, &d.generics, &d.target, &d.fns, item.span);
+        let (_, results) =
+            infer.infer_inherent_impl_block(global_env, &d.generics, &d.target, &d.fns, item.span);
         for f in &d.fns {
-            let Some(Ok((param_patterns, ret_pattern))) = results.get(&f.name) else { continue };
+            let Some(Ok((param_patterns, ret_pattern))) = results.get(&f.name) else {
+                continue;
+            };
             templates.push(InherentTemplate {
                 struct_name: struct_name.clone(),
                 method_name: f.name.clone(),
                 params: f.params.clone(),
-                body: f.body.clone().unwrap_or(Block { stmts: Vec::new(), tail: None }),
+                body: f.body.clone().unwrap_or(Block {
+                    stmts: Vec::new(),
+                    tail: None,
+                }),
                 param_patterns: param_patterns.clone(),
                 ret_pattern: ret_pattern.clone(),
                 node_types: infer.node_types.clone(),
@@ -356,7 +375,10 @@ fn build_inherent_templates(program: &Program, registry: &Registry, global_env: 
 /// then both monomorphization worklists over its result — mirrors
 /// `dump.rs`'s own `dump_program`, which runs the identical first step for
 /// its own, separate purpose.
-pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedProgram, ProgramInference) {
+pub fn monomorphize(
+    program: &Program,
+    registry: &Registry,
+) -> (MonomorphizedProgram, ProgramInference) {
     let program_inference = callgraph::infer_program(program, registry);
     let functions: HashMap<&str, &FnDecl> = program
         .items
@@ -368,7 +390,8 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
         .collect();
 
     let templates = build_impl_templates(program, registry, &program_inference.global_env);
-    let inherent_templates = build_inherent_templates(program, registry, &program_inference.global_env);
+    let inherent_templates =
+        build_inherent_templates(program, registry, &program_inference.global_env);
     let lambda_exprs = index_lambda_exprs(program, &program_inference.lambda_schemes);
     let duck_typed_fns = detect_duck_typed_fns(&functions, &program_inference);
 
@@ -385,6 +408,37 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
     let mut lambda_worklist: Vec<(NodeId, Vec<Ty>, String)> = Vec::new();
     let mut inherent_worklist: Vec<(usize, HashMap<TyVar, Ty>)> = Vec::new();
 
+    // `seed_derive_tensor_field_indices`'s own doc comment -- every
+    // `derive()`d function's own parameter types need every `Tensor`-typed
+    // field, at any struct-nesting depth, seeded into `impl_worklist` up
+    // front: `egraph.rs::synthesize_derivatives` (run later, once monomorph-
+    // ization is done) needs a real `Index::index<Tensor<...>,...>` unit to
+    // already exist for each one, whether or not the program's own source
+    // ever indexes it explicitly.
+    let struct_schemas = collect_struct_schemas(program);
+    for item in &program.items {
+        let ItemKind::Fn(f) = &item.kind else {
+            continue;
+        };
+        let Some(of_name) = &f.derivative_of else {
+            continue;
+        };
+        let Some(scheme) = program_inference.global_env.get(of_name.as_str()) else {
+            continue;
+        };
+        let Ty::Fn(param_tys, _) = &scheme.ty else {
+            continue;
+        };
+        for param_ty in param_tys {
+            seed_derive_tensor_field_indices(
+                param_ty,
+                &struct_schemas,
+                &templates,
+                &mut impl_worklist,
+            );
+        }
+    }
+
     // Seed: every function that itself type-checked to something *fully
     // concrete* (never generalized — a nullary member per the Monomorphism
     // Restriction, or a parameterized one whose own scheme just happens to
@@ -392,7 +446,9 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
     // fully resolved — scan it directly for calls into a generic callee,
     // whichever worklist it belongs to.
     for (name, f) in &functions {
-        let Some(scheme) = program_inference.global_env.get(*name) else { continue };
+        let Some(scheme) = program_inference.global_env.get(*name) else {
+            continue;
+        };
         if !scheme.vars.is_empty() {
             continue;
         }
@@ -421,272 +477,405 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
         );
     }
 
-    while let Some((name, concrete_tys)) = fn_worklist.pop() {
-        let display = display_instantiation(&name, &concrete_tys);
-        if mono.specializations.contains_key(&display) {
-            continue;
-        }
-        let Some(&f) = functions.get(name.as_str()) else { continue };
-        let body = f.body.as_ref().expect("a top-level fn with a global_env scheme always has a body");
-
-        let (param_types, result, node_types) = if duck_typed_fns.contains(&name) {
-            // Duck-typed fallback (`detect_duck_typed_fns`'s own doc
-            // comment) — a real, separate re-inference for this one
-            // concrete call site, not substitution over the shared
-            // declaration-time template: substitution can never resolve an
-            // expression (field access, ...) whose own type genuinely
-            // depends on this call site's own concrete argument types,
-            // which the ordinary one-shot HM pass could never see.
-            let mut infer = Infer::new(registry);
-            match infer.infer_fn_with_concrete_params(f, concrete_tys.clone()) {
-                Ok(result) => {
-                    let mut exprs = Vec::new();
-                    collect_exprs_block(body, &mut exprs);
-                    let node_types: HashMap<NodeId, Ty> =
-                        exprs.iter().filter_map(|e| infer.node_types.get(&e.id).map(|t| (e.id, t.clone()))).collect();
-                    (infer.param_types.clone(), result, node_types)
-                }
-                Err(e) => {
-                    let tys = concrete_tys.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ");
-                    mono.errors.push(TypeError {
-                        span: e.span,
-                        kind: TypeErrorKind::GenericFnInstantiationFailed { name: name.clone(), tys, inner: Box::new(e) },
-                    });
-                    continue;
-                }
+    // The four worklists below aren't independent — draining one can push
+    // fresh work onto an *earlier* one (found directly, not anticipated: a
+    // generic inherent-impl method's body calling a still-generic algebra
+    // method — `Dense::forward` calling `matmul`, `stdlib/nn/nn.cleave` —
+    // discovered only while draining `inherent_worklist`, last in sequence,
+    // yet needing a new `impl_worklist` entry, third-to-last; every prior
+    // generic inherent method's own body only ever called concrete/extern
+    // ops, so this never came up before). Single-pass sequential draining
+    // (fn -> impl -> lambda -> inherent, each fully emptied before the next
+    // starts) silently drops any such "backward" push once its own loop has
+    // already finished — the callee never gets a `mono.specializations`
+    // entry at all, yet `call_names` (computed *during* that same drain)
+    // still records the mangled name as if it existed, so the failure only
+    // surfaces much later, as `cps.rs`'s own "call_names resolved ... but no
+    // such unit exists" panic. Fixed by re-running all four passes to a real
+    // fixed point — `mono.specializations.contains_key` already guards every
+    // loop body against redoing (or infinitely repeating) already-finished
+    // work, so an extra pass over an empty worklist is always a cheap no-op.
+    loop {
+        while let Some((name, concrete_tys)) = fn_worklist.pop() {
+            let display = display_instantiation(&name, &concrete_tys);
+            if mono.specializations.contains_key(&display) {
+                continue;
             }
-        } else {
-            let Some(scheme) = program_inference.global_env.get(&name) else { continue };
-            let Ty::Fn(param_pattern, ret_pattern) = &scheme.ty else {
-                continue; // a top-level fn's own scheme is always Ty::Fn — defensive, not expected
+            let Some(&f) = functions.get(name.as_str()) else {
+                continue;
             };
-            let mapping: HashMap<TyVar, Ty> = scheme.vars.iter().copied().zip(concrete_tys.iter().cloned()).collect();
-            let param_types: Vec<Ty> = param_pattern.iter().map(|t| substitute(t, &mapping)).collect();
+            let body = f
+                .body
+                .as_ref()
+                .expect("a top-level fn with a global_env scheme always has a body");
+
+            let (param_types, result, node_types) = if duck_typed_fns.contains(&name) {
+                // Duck-typed fallback (`detect_duck_typed_fns`'s own doc
+                // comment) — a real, separate re-inference for this one
+                // concrete call site, not substitution over the shared
+                // declaration-time template: substitution can never resolve an
+                // expression (field access, ...) whose own type genuinely
+                // depends on this call site's own concrete argument types,
+                // which the ordinary one-shot HM pass could never see.
+                let mut infer = Infer::new(registry);
+                match infer.infer_fn_with_concrete_params(f, concrete_tys.clone()) {
+                    Ok(result) => {
+                        let mut exprs = Vec::new();
+                        collect_exprs_block(body, &mut exprs);
+                        let node_types: HashMap<NodeId, Ty> = exprs
+                            .iter()
+                            .filter_map(|e| infer.node_types.get(&e.id).map(|t| (e.id, t.clone())))
+                            .collect();
+                        (infer.param_types.clone(), result, node_types)
+                    }
+                    Err(e) => {
+                        let tys = concrete_tys
+                            .iter()
+                            .map(|t| t.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        mono.errors.push(TypeError {
+                            span: e.span,
+                            kind: TypeErrorKind::GenericFnInstantiationFailed {
+                                name: name.clone(),
+                                tys,
+                                inner: Box::new(e),
+                            },
+                        });
+                        continue;
+                    }
+                }
+            } else {
+                let Some(scheme) = program_inference.global_env.get(&name) else {
+                    continue;
+                };
+                let Ty::Fn(param_pattern, ret_pattern) = &scheme.ty else {
+                    continue; // a top-level fn's own scheme is always Ty::Fn — defensive, not expected
+                };
+                let mapping: HashMap<TyVar, Ty> = scheme
+                    .vars
+                    .iter()
+                    .copied()
+                    .zip(concrete_tys.iter().cloned())
+                    .collect();
+                let param_types: Vec<Ty> = param_pattern
+                    .iter()
+                    .map(|t| substitute(t, &mapping))
+                    .collect();
+                let result = substitute(ret_pattern, &mapping);
+                let mut exprs = Vec::new();
+                collect_exprs_block(body, &mut exprs);
+                let node_types: HashMap<NodeId, Ty> = exprs
+                    .iter()
+                    .filter_map(|e| {
+                        program_inference
+                            .node_types
+                            .get(&e.id)
+                            .map(|t| (e.id, substitute(t, &mapping)))
+                    })
+                    .collect();
+                (param_types, result, node_types)
+            };
+
+            // Scan *this specialization's own* (now fully concrete) node types
+            // for further calls into another generic callee — transitive
+            // instantiation, exactly like the seed step above. `call_names`
+            // here is local to *this one* specialization — see
+            // `Specialization::call_names`'s own doc comment for why that
+            // matters specifically for a self-recursive call site.
+            let mut call_names = HashMap::new();
+            collect_instantiations(
+                body,
+                &node_types,
+                &program_inference.global_env,
+                &templates,
+                &inherent_templates,
+                &program_inference.lambda_schemes,
+                HashMap::new(),
+                &mut fn_worklist,
+                &mut impl_worklist,
+                &mut lambda_worklist,
+                &mut inherent_worklist,
+                &mut call_names,
+                &mut mono.errors,
+            );
+
+            mono.by_origin
+                .entry(name)
+                .or_default()
+                .push(display.clone());
+            mono.specializations.insert(
+                display,
+                Specialization {
+                    params: f.params.clone(),
+                    body: body.clone(),
+                    param_types,
+                    result,
+                    node_types,
+                    call_names,
+                    is_extern: f.is_extern,
+                    extern_symbol: f.extern_symbol.clone(),
+                },
+            );
+        }
+
+        while let Some((idx, mapping)) = impl_worklist.pop() {
+            let t = &templates[idx];
+            let display = display_impl_instantiation(t, &mapping);
+            if mono.specializations.contains_key(&display) {
+                continue;
+            }
+
+            let param_types: Vec<Ty> = t
+                .param_patterns
+                .iter()
+                .map(|p| substitute(p, &mapping))
+                .collect();
+            let result = substitute(&t.ret_pattern, &mapping);
+
+            let mut exprs = Vec::new();
+            collect_exprs_block(&t.body, &mut exprs);
+            let node_types: HashMap<NodeId, Ty> = exprs
+                .iter()
+                .filter_map(|e| {
+                    t.node_types
+                        .get(&e.id)
+                        .map(|ty| (e.id, substitute(ty, &mapping)))
+                })
+                .collect();
+
+            let mut call_names = HashMap::new();
+            collect_instantiations(
+                &t.body,
+                &node_types,
+                &program_inference.global_env,
+                &templates,
+                &inherent_templates,
+                &program_inference.lambda_schemes,
+                HashMap::new(),
+                &mut fn_worklist,
+                &mut impl_worklist,
+                &mut lambda_worklist,
+                &mut inherent_worklist,
+                &mut call_names,
+                &mut mono.errors,
+            );
+
+            // `seed_derivative_rule_references`'s own doc comment -- a
+            // `derivative` rule declared on `t.algebra` can reference a
+            // *different* algebra's own generic-impl method, at this exact
+            // specialization's own resolved target type(s), that no ordinary
+            // call site in the program ever reaches directly.
+            let target_tys: Vec<Ty> = t
+                .target_patterns
+                .iter()
+                .map(|p| substitute(p, &mapping))
+                .collect();
+            seed_derivative_rule_references(
+                registry,
+                &t.algebra,
+                &t.method_name,
+                &target_tys,
+                &templates,
+                &mut impl_worklist,
+            );
+            seed_ring_zero(&t.algebra, &target_tys, &templates, &mut impl_worklist);
+
+            let origin = format!("{}::{}", t.algebra, t.method_name);
+            mono.by_origin
+                .entry(origin)
+                .or_default()
+                .push(display.clone());
+            mono.specializations.insert(
+                display,
+                Specialization {
+                    params: t.params.clone(),
+                    body: t.body.clone(),
+                    param_types,
+                    result,
+                    node_types,
+                    call_names,
+                    is_extern: t.is_extern,
+                    extern_symbol: t.extern_symbol.clone(),
+                },
+            );
+        }
+
+        // Lambda worklist -- structurally identical to the top-level-`fn`
+        // worklist just above (same `Specialization` shape, same reverse-
+        // unification via `derive_instantiation`), but a lambda has no top-
+        // level `FnDecl`/`global_env` entry to read `params`/`body`/`scheme`
+        // back from -- `lambda_exprs`/`program_inference.lambda_schemes`
+        // (built/aggregated once, up front) stand in for those. Unlike a top-
+        // level generic `fn`, a lambda's own body `node_types` were never given
+        // a dedicated per-declaration template (no `ImplTemplate`-style struct
+        // needed) -- they're read directly out of the *whole-program*
+        // `program_inference.node_types`, exactly the same map (and the exact
+        // same reasoning) the `fn_worklist` loop above already reads its own
+        // generic pattern from, since ordinary inference records a lambda
+        // body's node types there too, just still generic (pre-instantiation).
+        while let Some((lambda_id, concrete_tys, self_name)) = lambda_worklist.pop() {
+            let display = display_lambda_instantiation(lambda_id, &concrete_tys);
+            if mono.specializations.contains_key(&display) {
+                continue;
+            }
+            let (Some(scheme), Some(&lambda_expr)) = (
+                program_inference.lambda_schemes.get(&lambda_id),
+                lambda_exprs.get(&lambda_id),
+            ) else {
+                continue;
+            };
+            let ExprKind::Lambda { params, body, .. } = &lambda_expr.kind else {
+                continue; // `lambda_exprs` only ever indexes `Lambda` nodes -- defensive, not expected
+            };
+            let Ty::Fn(param_pattern, ret_pattern) = &scheme.ty else {
+                continue; // a lambda's own scheme is always Ty::Fn, mirroring a top-level fn's -- defensive
+            };
+
+            let mapping: HashMap<TyVar, Ty> = scheme
+                .vars
+                .iter()
+                .copied()
+                .zip(concrete_tys.iter().cloned())
+                .collect();
+            let param_types: Vec<Ty> = param_pattern
+                .iter()
+                .map(|t| substitute(t, &mapping))
+                .collect();
             let result = substitute(ret_pattern, &mapping);
+
             let mut exprs = Vec::new();
             collect_exprs_block(body, &mut exprs);
             let node_types: HashMap<NodeId, Ty> = exprs
                 .iter()
-                .filter_map(|e| program_inference.node_types.get(&e.id).map(|t| (e.id, substitute(t, &mapping))))
+                .filter_map(|e| {
+                    program_inference
+                        .node_types
+                        .get(&e.id)
+                        .map(|t| (e.id, substitute(t, &mapping)))
+                })
                 .collect();
-            (param_types, result, node_types)
-        };
 
-        // Scan *this specialization's own* (now fully concrete) node types
-        // for further calls into another generic callee — transitive
-        // instantiation, exactly like the seed step above. `call_names`
-        // here is local to *this one* specialization — see
-        // `Specialization::call_names`'s own doc comment for why that
-        // matters specifically for a self-recursive call site.
-        let mut call_names = HashMap::new();
-        collect_instantiations(
-            body,
-            &node_types,
-            &program_inference.global_env,
-            &templates,
-            &inherent_templates,
-            &program_inference.lambda_schemes,
-            HashMap::new(),
-            &mut fn_worklist,
-            &mut impl_worklist,
-            &mut lambda_worklist,
-            &mut inherent_worklist,
-            &mut call_names,
-            &mut mono.errors,
-        );
+            let mut call_names = HashMap::new();
+            // Seeded with this lambda's own canonical self-name (recovered
+            // above from `scope`, at whichever call site originally discovered
+            // this specialization -- see `collect_instantiations_expr`'s own
+            // `ExprKind::Call` arm) -- otherwise this re-walk, starting fresh,
+            // could never resolve a self-recursive call inside `body` at all.
+            let mut initial_scope = HashMap::new();
+            initial_scope.insert(self_name, lambda_id);
+            collect_instantiations(
+                body,
+                &node_types,
+                &program_inference.global_env,
+                &templates,
+                &inherent_templates,
+                &program_inference.lambda_schemes,
+                initial_scope,
+                &mut fn_worklist,
+                &mut impl_worklist,
+                &mut lambda_worklist,
+                &mut inherent_worklist,
+                &mut call_names,
+                &mut mono.errors,
+            );
 
-        mono.by_origin.entry(name).or_default().push(display.clone());
-        mono.specializations.insert(
-            display,
-            Specialization {
-                params: f.params.clone(),
-                body: body.clone(),
-                param_types,
-                result,
-                node_types,
-                call_names,
-                is_extern: f.is_extern,
-                extern_symbol: f.extern_symbol.clone(),
-            },
-        );
-    }
-
-    while let Some((idx, mapping)) = impl_worklist.pop() {
-        let t = &templates[idx];
-        let display = display_impl_instantiation(t, &mapping);
-        if mono.specializations.contains_key(&display) {
-            continue;
+            let origin = format!("<lambda#{}>", lambda_id.0);
+            mono.by_origin
+                .entry(origin)
+                .or_default()
+                .push(display.clone());
+            mono.specializations.insert(
+                display,
+                Specialization {
+                    params: params.clone(),
+                    body: body.clone(),
+                    param_types,
+                    result,
+                    node_types,
+                    call_names,
+                    is_extern: false,
+                    extern_symbol: None,
+                },
+            );
         }
 
-        let param_types: Vec<Ty> = t.param_patterns.iter().map(|p| substitute(p, &mapping)).collect();
-        let result = substitute(&t.ret_pattern, &mapping);
+        // Inherent-method worklist -- structurally identical to the impl_
+        // worklist loop above (same `Specialization` shape, same reverse-
+        // unification via `derive_inherent_instantiation`), just reading back
+        // from `InherentTemplate` instead of `ImplTemplate` and keying `by_
+        // origin` as `"struct::method"` (matching `cps.rs::collect_units`'s own
+        // `InherentImpl` branch, which reads specializations back by that exact
+        // key).
+        while let Some((idx, mapping)) = inherent_worklist.pop() {
+            let t = &inherent_templates[idx];
+            let display = display_inherent_instantiation(t, &mapping);
+            if mono.specializations.contains_key(&display) {
+                continue;
+            }
 
-        let mut exprs = Vec::new();
-        collect_exprs_block(&t.body, &mut exprs);
-        let node_types: HashMap<NodeId, Ty> =
-            exprs.iter().filter_map(|e| t.node_types.get(&e.id).map(|ty| (e.id, substitute(ty, &mapping)))).collect();
+            let param_types: Vec<Ty> = t
+                .param_patterns
+                .iter()
+                .map(|p| substitute(p, &mapping))
+                .collect();
+            let result = substitute(&t.ret_pattern, &mapping);
 
-        let mut call_names = HashMap::new();
-        collect_instantiations(
-            &t.body,
-            &node_types,
-            &program_inference.global_env,
-            &templates,
-            &inherent_templates,
-            &program_inference.lambda_schemes,
-            HashMap::new(),
-            &mut fn_worklist,
-            &mut impl_worklist,
-            &mut lambda_worklist,
-            &mut inherent_worklist,
-            &mut call_names,
-            &mut mono.errors,
-        );
+            let mut exprs = Vec::new();
+            collect_exprs_block(&t.body, &mut exprs);
+            let node_types: HashMap<NodeId, Ty> = exprs
+                .iter()
+                .filter_map(|e| {
+                    t.node_types
+                        .get(&e.id)
+                        .map(|ty| (e.id, substitute(ty, &mapping)))
+                })
+                .collect();
 
-        // `seed_derivative_rule_references`'s own doc comment -- a
-        // `derivative` rule declared on `t.algebra` can reference a
-        // *different* algebra's own generic-impl method, at this exact
-        // specialization's own resolved target type(s), that no ordinary
-        // call site in the program ever reaches directly.
-        let target_tys: Vec<Ty> = t.target_patterns.iter().map(|p| substitute(p, &mapping)).collect();
-        seed_derivative_rule_references(registry, &t.algebra, &t.method_name, &target_tys, &templates, &mut impl_worklist);
-        seed_ring_zero(&t.algebra, &target_tys, &templates, &mut impl_worklist);
+            let mut call_names = HashMap::new();
+            collect_instantiations(
+                &t.body,
+                &node_types,
+                &program_inference.global_env,
+                &templates,
+                &inherent_templates,
+                &program_inference.lambda_schemes,
+                HashMap::new(),
+                &mut fn_worklist,
+                &mut impl_worklist,
+                &mut lambda_worklist,
+                &mut inherent_worklist,
+                &mut call_names,
+                &mut mono.errors,
+            );
 
-        let origin = format!("{}::{}", t.algebra, t.method_name);
-        mono.by_origin.entry(origin).or_default().push(display.clone());
-        mono.specializations.insert(
-            display,
-            Specialization {
-                params: t.params.clone(),
-                body: t.body.clone(),
-                param_types,
-                result,
-                node_types,
-                call_names,
-                is_extern: t.is_extern,
-                extern_symbol: t.extern_symbol.clone(),
-            },
-        );
-    }
-
-    // Lambda worklist -- structurally identical to the top-level-`fn`
-    // worklist just above (same `Specialization` shape, same reverse-
-    // unification via `derive_instantiation`), but a lambda has no top-
-    // level `FnDecl`/`global_env` entry to read `params`/`body`/`scheme`
-    // back from -- `lambda_exprs`/`program_inference.lambda_schemes`
-    // (built/aggregated once, up front) stand in for those. Unlike a top-
-    // level generic `fn`, a lambda's own body `node_types` were never given
-    // a dedicated per-declaration template (no `ImplTemplate`-style struct
-    // needed) -- they're read directly out of the *whole-program*
-    // `program_inference.node_types`, exactly the same map (and the exact
-    // same reasoning) the `fn_worklist` loop above already reads its own
-    // generic pattern from, since ordinary inference records a lambda
-    // body's node types there too, just still generic (pre-instantiation).
-    while let Some((lambda_id, concrete_tys, self_name)) = lambda_worklist.pop() {
-        let display = display_lambda_instantiation(lambda_id, &concrete_tys);
-        if mono.specializations.contains_key(&display) {
-            continue;
-        }
-        let (Some(scheme), Some(&lambda_expr)) =
-            (program_inference.lambda_schemes.get(&lambda_id), lambda_exprs.get(&lambda_id))
-        else {
-            continue;
-        };
-        let ExprKind::Lambda { params, body, .. } = &lambda_expr.kind else {
-            continue; // `lambda_exprs` only ever indexes `Lambda` nodes -- defensive, not expected
-        };
-        let Ty::Fn(param_pattern, ret_pattern) = &scheme.ty else {
-            continue; // a lambda's own scheme is always Ty::Fn, mirroring a top-level fn's -- defensive
-        };
-
-        let mapping: HashMap<TyVar, Ty> = scheme.vars.iter().copied().zip(concrete_tys.iter().cloned()).collect();
-        let param_types: Vec<Ty> = param_pattern.iter().map(|t| substitute(t, &mapping)).collect();
-        let result = substitute(ret_pattern, &mapping);
-
-        let mut exprs = Vec::new();
-        collect_exprs_block(body, &mut exprs);
-        let node_types: HashMap<NodeId, Ty> = exprs
-            .iter()
-            .filter_map(|e| program_inference.node_types.get(&e.id).map(|t| (e.id, substitute(t, &mapping))))
-            .collect();
-
-        let mut call_names = HashMap::new();
-        // Seeded with this lambda's own canonical self-name (recovered
-        // above from `scope`, at whichever call site originally discovered
-        // this specialization -- see `collect_instantiations_expr`'s own
-        // `ExprKind::Call` arm) -- otherwise this re-walk, starting fresh,
-        // could never resolve a self-recursive call inside `body` at all.
-        let mut initial_scope = HashMap::new();
-        initial_scope.insert(self_name, lambda_id);
-        collect_instantiations(
-            body,
-            &node_types,
-            &program_inference.global_env,
-            &templates,
-            &inherent_templates,
-            &program_inference.lambda_schemes,
-            initial_scope,
-            &mut fn_worklist,
-            &mut impl_worklist,
-            &mut lambda_worklist,
-            &mut inherent_worklist,
-            &mut call_names,
-            &mut mono.errors,
-        );
-
-        let origin = format!("<lambda#{}>", lambda_id.0);
-        mono.by_origin.entry(origin).or_default().push(display.clone());
-        mono.specializations.insert(
-            display,
-            Specialization { params: params.clone(), body: body.clone(), param_types, result, node_types, call_names, is_extern: false, extern_symbol: None },
-        );
-    }
-
-    // Inherent-method worklist -- structurally identical to the impl_
-    // worklist loop above (same `Specialization` shape, same reverse-
-    // unification via `derive_inherent_instantiation`), just reading back
-    // from `InherentTemplate` instead of `ImplTemplate` and keying `by_
-    // origin` as `"struct::method"` (matching `cps.rs::collect_units`'s own
-    // `InherentImpl` branch, which reads specializations back by that exact
-    // key).
-    while let Some((idx, mapping)) = inherent_worklist.pop() {
-        let t = &inherent_templates[idx];
-        let display = display_inherent_instantiation(t, &mapping);
-        if mono.specializations.contains_key(&display) {
-            continue;
+            let origin = format!("{}::{}", t.struct_name, t.method_name);
+            mono.by_origin
+                .entry(origin)
+                .or_default()
+                .push(display.clone());
+            mono.specializations.insert(
+                display,
+                Specialization {
+                    params: t.params.clone(),
+                    body: t.body.clone(),
+                    param_types,
+                    result,
+                    node_types,
+                    call_names,
+                    is_extern: false,
+                    extern_symbol: None,
+                },
+            );
         }
 
-        let param_types: Vec<Ty> = t.param_patterns.iter().map(|p| substitute(p, &mapping)).collect();
-        let result = substitute(&t.ret_pattern, &mapping);
-
-        let mut exprs = Vec::new();
-        collect_exprs_block(&t.body, &mut exprs);
-        let node_types: HashMap<NodeId, Ty> =
-            exprs.iter().filter_map(|e| t.node_types.get(&e.id).map(|ty| (e.id, substitute(ty, &mapping)))).collect();
-
-        let mut call_names = HashMap::new();
-        collect_instantiations(
-            &t.body,
-            &node_types,
-            &program_inference.global_env,
-            &templates,
-            &inherent_templates,
-            &program_inference.lambda_schemes,
-            HashMap::new(),
-            &mut fn_worklist,
-            &mut impl_worklist,
-            &mut lambda_worklist,
-            &mut inherent_worklist,
-            &mut call_names,
-            &mut mono.errors,
-        );
-
-        let origin = format!("{}::{}", t.struct_name, t.method_name);
-        mono.by_origin.entry(origin).or_default().push(display.clone());
-        mono.specializations.insert(
-            display,
-            Specialization { params: t.params.clone(), body: t.body.clone(), param_types, result, node_types, call_names, is_extern: false, extern_symbol: None },
-        );
+        if fn_worklist.is_empty()
+            && impl_worklist.is_empty()
+            && lambda_worklist.is_empty()
+            && inherent_worklist.is_empty()
+        {
+            break;
+        }
     }
 
     (mono, program_inference)
@@ -716,18 +905,27 @@ pub fn monomorphize(program: &Program, registry: &Registry) -> (MonomorphizedPro
 /// impl method's own signature is always fully, explicitly declared by its
 /// `algebra`, so it never has an unconstrained parameter to trigger this in
 /// the first place.
-fn detect_duck_typed_fns(functions: &HashMap<&str, &FnDecl>, program_inference: &ProgramInference) -> HashSet<String> {
+fn detect_duck_typed_fns(
+    functions: &HashMap<&str, &FnDecl>,
+    program_inference: &ProgramInference,
+) -> HashSet<String> {
     let mut out = HashSet::new();
     for (name, f) in functions {
-        let Some(scheme) = program_inference.global_env.get(*name) else { continue };
+        let Some(scheme) = program_inference.global_env.get(*name) else {
+            continue;
+        };
         if scheme.vars.is_empty() {
             continue;
         }
         let Some(body) = &f.body else { continue };
         let mut exprs = Vec::new();
         collect_exprs_block(body, &mut exprs);
-        let has_placeholder =
-            exprs.iter().any(|e| program_inference.node_types.get(&e.id).is_some_and(|t| find_placeholder_name(t).is_some()));
+        let has_placeholder = exprs.iter().any(|e| {
+            program_inference
+                .node_types
+                .get(&e.id)
+                .is_some_and(|t| find_placeholder_name(t).is_some())
+        });
         if has_placeholder {
             out.insert((*name).to_string());
         }
@@ -735,11 +933,19 @@ fn detect_duck_typed_fns(functions: &HashMap<&str, &FnDecl>, program_inference: 
     out
 }
 
-fn build_impl_templates(program: &Program, registry: &Registry, global_env: &Env) -> Vec<ImplTemplate> {
+fn build_impl_templates(
+    program: &Program,
+    registry: &Registry,
+    global_env: &Env,
+) -> Vec<ImplTemplate> {
     let mut templates = Vec::new();
     for item in &program.items {
-        let ItemKind::Impl(d) = &item.kind else { continue };
-        let all_targets: Vec<Type> = std::iter::once(d.target.clone()).chain(d.extra_targets.iter().cloned()).collect();
+        let ItemKind::Impl(d) = &item.kind else {
+            continue;
+        };
+        let all_targets: Vec<Type> = std::iter::once(d.target.clone())
+            .chain(d.extra_targets.iter().cloned())
+            .collect();
         let is_generic = !d.generics.is_empty();
         for f in &d.fns {
             // A bodyless method (extern-backed, or the old `#[mlir(...)]`
@@ -757,8 +963,14 @@ fn build_impl_templates(program: &Program, registry: &Registry, global_env: &Env
             // extern-backed method needs that as much as a real one does,
             // even though there's no cleave-level body to specialize.
             let mut infer = Infer::new(registry);
-            let Ok(ret_pattern) = infer.infer_impl_fn_generic_with_env(global_env, &d.algebra, &d.generics, &all_targets, f, item.span)
-            else {
+            let Ok(ret_pattern) = infer.infer_impl_fn_generic_with_env(
+                global_env,
+                &d.algebra,
+                &d.generics,
+                &all_targets,
+                f,
+                item.span,
+            ) else {
                 continue;
             };
             // Whether *this template's own resolved patterns* still carry a
@@ -779,14 +991,23 @@ fn build_impl_templates(program: &Program, registry: &Registry, global_env: &Env
             // exactly these three patterns unconditionally once `is_generic`
             // is true (see its own doc comment) — no other change needed.
             let mut free = HashSet::new();
-            infer.param_types.iter().for_each(|p| free_vars(p, &mut free));
+            infer
+                .param_types
+                .iter()
+                .for_each(|p| free_vars(p, &mut free));
             free_vars(&ret_pattern, &mut free);
-            infer.target_types.iter().for_each(|p| free_vars(p, &mut free));
+            infer
+                .target_types
+                .iter()
+                .for_each(|p| free_vars(p, &mut free));
             let is_generic = is_generic || !free.is_empty();
             // Never read for a non-generic template — `derive_impl_
             // instantiation` returns `NoCandidates` the moment it sees
             // `is_generic == false`, before ever touching `body`.
-            let body = f.body.clone().unwrap_or(Block { stmts: Vec::new(), tail: None });
+            let body = f.body.clone().unwrap_or(Block {
+                stmts: Vec::new(),
+                tail: None,
+            });
             templates.push(ImplTemplate {
                 algebra: d.algebra.clone(),
                 method_name: f.name.clone(),
@@ -815,10 +1036,15 @@ fn build_impl_templates(program: &Program, registry: &Registry, global_env: &Env
 /// invisible here: nothing can specialize it via this mechanism, and no
 /// call to it is ever recognized as a lambda call either (`collect_
 /// instantiations_block`'s own scope only ever admits scheme-bearing ones).
-fn index_lambda_exprs<'a>(program: &'a Program, lambda_schemes: &HashMap<NodeId, Scheme>) -> HashMap<NodeId, &'a Expr> {
+fn index_lambda_exprs<'a>(
+    program: &'a Program,
+    lambda_schemes: &HashMap<NodeId, Scheme>,
+) -> HashMap<NodeId, &'a Expr> {
     let mut out = HashMap::new();
     for item in &program.items {
-        let ItemKind::Fn(f) = &item.kind else { continue };
+        let ItemKind::Fn(f) = &item.kind else {
+            continue;
+        };
         let Some(body) = &f.body else { continue };
         let mut exprs = Vec::new();
         collect_exprs_block(body, &mut exprs);
@@ -1100,7 +1326,11 @@ fn collect_instantiations_expr(
         };
     }
     match &expr.kind {
-        ExprKind::NumberLit { .. } | ExprKind::ImaginaryLit { .. } | ExprKind::BoolLit(_) | ExprKind::Path(_) | ExprKind::PackRef(_) => {}
+        ExprKind::NumberLit { .. }
+        | ExprKind::ImaginaryLit { .. }
+        | ExprKind::BoolLit(_)
+        | ExprKind::Path(_)
+        | ExprKind::PackRef(_) => {}
         ExprKind::Call(path, generics, args, ..) => {
             // A callable passed as a bare argument (`apply(inc, 5)`) — see
             // `derive_value_instantiation`'s own doc comment for why this
@@ -1113,11 +1343,16 @@ fn collect_instantiations_expr(
             for a in args {
                 let ExprKind::Path(p) = &a.kind else { continue };
                 let arg_name = p.segments.join("::");
-                let Some(&lambda_id) = scope.get(&arg_name) else { continue };
-                let Some(scheme) = lambda_schemes.get(&lambda_id) else { continue };
+                let Some(&lambda_id) = scope.get(&arg_name) else {
+                    continue;
+                };
+                let Some(scheme) = lambda_schemes.get(&lambda_id) else {
+                    continue;
+                };
                 if let Some(concrete_tys) = derive_value_instantiation(scheme, node_types, a.id) {
                     if concrete_tys.iter().all(is_fully_concrete) {
-                        call_names.insert(a.id, display_lambda_instantiation(lambda_id, &concrete_tys));
+                        call_names
+                            .insert(a.id, display_lambda_instantiation(lambda_id, &concrete_tys));
                         lambda_worklist.push((lambda_id, concrete_tys, arg_name));
                     }
                 }
@@ -1145,12 +1380,26 @@ fn collect_instantiations_expr(
             // template by now.
             if let [algebra, method] = path.segments.as_slice() {
                 if templates.iter().any(|t| &t.algebra == algebra) {
-                    let Some(arg_tys): Option<Vec<Ty>> = args.iter().map(|a| node_types.get(&a.id).cloned()).collect() else {
+                    let Some(arg_tys): Option<Vec<Ty>> = args
+                        .iter()
+                        .map(|a| node_types.get(&a.id).cloned())
+                        .collect()
+                    else {
                         return;
                     };
-                    match derive_impl_instantiation(templates, Some(algebra), method, expr.id, &arg_tys, node_types) {
+                    match derive_impl_instantiation(
+                        templates,
+                        Some(algebra),
+                        method,
+                        expr.id,
+                        &arg_tys,
+                        node_types,
+                    ) {
                         ImplMatch::Found(idx, mapping) => {
-                            call_names.insert(expr.id, display_impl_instantiation(&templates[idx], &mapping));
+                            call_names.insert(
+                                expr.id,
+                                display_impl_instantiation(&templates[idx], &mapping),
+                            );
                             impl_worklist.push((idx, mapping));
                         }
                         // Same as `Found` just above, but with an empty (no-op)
@@ -1170,14 +1419,21 @@ fn collect_instantiations_expr(
                         // why this went unnoticed until a *qualified* one
                         // needed `call_names` specifically.
                         ImplMatch::FoundConcrete(idx) => {
-                            call_names.insert(expr.id, display_impl_instantiation(&templates[idx], &HashMap::new()));
+                            call_names.insert(
+                                expr.id,
+                                display_impl_instantiation(&templates[idx], &HashMap::new()),
+                            );
                             impl_worklist.push((idx, HashMap::new()));
                         }
                         ImplMatch::NoCandidates => {} // type-checking already validated this qualified call; not expected, harmless if reached
                         ImplMatch::NoneMatched { algebra, tys } => {
                             errors.push(TypeError {
                                 span: expr.span,
-                                kind: TypeErrorKind::MonomorphizationFailed { algebra, method: method.clone(), tys },
+                                kind: TypeErrorKind::MonomorphizationFailed {
+                                    algebra,
+                                    method: method.clone(),
+                                    tys,
+                                },
                             });
                         }
                     }
@@ -1189,7 +1445,9 @@ fn collect_instantiations_expr(
 
             if let Some(&lambda_id) = scope.get(&name) {
                 if let Some(scheme) = lambda_schemes.get(&lambda_id) {
-                    if let Some(concrete_tys) = derive_instantiation(scheme, expr, generics, args, node_types) {
+                    if let Some(concrete_tys) =
+                        derive_instantiation(scheme, expr, generics, args, node_types)
+                    {
                         // A self-recursive call site, reached while walking
                         // a still-*generic* copy of this lambda's own body
                         // (its own `node_types` not yet substituted for any
@@ -1216,7 +1474,10 @@ fn collect_instantiations_expr(
                         // (`node_types` substituted there -- see `monomorphize`'s
                         // own lambda-worklist loop).
                         if concrete_tys.iter().all(is_fully_concrete) {
-                            call_names.insert(expr.id, display_lambda_instantiation(lambda_id, &concrete_tys));
+                            call_names.insert(
+                                expr.id,
+                                display_lambda_instantiation(lambda_id, &concrete_tys),
+                            );
                             lambda_worklist.push((lambda_id, concrete_tys, name.clone()));
                         }
                     }
@@ -1226,7 +1487,9 @@ fn collect_instantiations_expr(
 
             if let Some(scheme) = global_env.get(&name) {
                 if !scheme.vars.is_empty() {
-                    if let Some(concrete_tys) = derive_instantiation(scheme, expr, generics, args, node_types) {
+                    if let Some(concrete_tys) =
+                        derive_instantiation(scheme, expr, generics, args, node_types)
+                    {
                         call_names.insert(expr.id, display_instantiation(&name, &concrete_tys));
                         fn_worklist.push((name, concrete_tys));
                     }
@@ -1234,20 +1497,33 @@ fn collect_instantiations_expr(
                 return;
             }
 
-            let Some(arg_tys): Option<Vec<Ty>> = args.iter().map(|a| node_types.get(&a.id).cloned()).collect() else {
+            let Some(arg_tys): Option<Vec<Ty>> = args
+                .iter()
+                .map(|a| node_types.get(&a.id).cloned())
+                .collect()
+            else {
                 return;
             };
             match derive_impl_instantiation(templates, None, &name, expr.id, &arg_tys, node_types) {
                 ImplMatch::Found(idx, mapping) => {
-                    call_names.insert(expr.id, display_impl_instantiation(&templates[idx], &mapping));
+                    call_names.insert(
+                        expr.id,
+                        display_impl_instantiation(&templates[idx], &mapping),
+                    );
                     impl_worklist.push((idx, mapping));
                 }
-                ImplMatch::FoundConcrete(_) => unreachable!("derive_impl_instantiation never returns FoundConcrete when algebra is None"),
+                ImplMatch::FoundConcrete(_) => unreachable!(
+                    "derive_impl_instantiation never returns FoundConcrete when algebra is None"
+                ),
                 ImplMatch::NoCandidates => {} // not an algebra call, or a non-generic one -- nothing to do here
                 ImplMatch::NoneMatched { algebra, tys } => {
                     errors.push(TypeError {
                         span: expr.span,
-                        kind: TypeErrorKind::MonomorphizationFailed { algebra, method: name, tys },
+                        kind: TypeErrorKind::MonomorphizationFailed {
+                            algebra,
+                            method: name,
+                            tys,
+                        },
                     });
                 }
             }
@@ -1270,11 +1546,16 @@ fn collect_instantiations_expr(
                 Ty::Con(n) | Ty::App(n, _) => Some(n.clone()),
                 _ => None,
             }) {
-                if let Some((idx, template)) =
-                    inherent_templates.iter().enumerate().find(|(_, t)| t.struct_name == struct_name && t.method_name == *name)
+                if let Some((idx, template)) = inherent_templates
+                    .iter()
+                    .enumerate()
+                    .find(|(_, t)| t.struct_name == struct_name && t.method_name == *name)
                 {
-                    if let Some(mapping) = derive_inherent_instantiation(template, expr, base, args, node_types) {
-                        call_names.insert(expr.id, display_inherent_instantiation(template, &mapping));
+                    if let Some(mapping) =
+                        derive_inherent_instantiation(template, expr, base, args, node_types)
+                    {
+                        call_names
+                            .insert(expr.id, display_inherent_instantiation(template, &mapping));
                         inherent_worklist.push((idx, mapping));
                     }
                 }
@@ -1297,19 +1578,37 @@ fn collect_instantiations_expr(
             // no real `Expr`/`NodeId` needed for "the idx array" at all.
             if let Some(base_ty) = node_types.get(&base.id).cloned() {
                 if !matches!(base_ty, Ty::Array(..)) {
-                    let idx_array_ty =
-                        Ty::Array(Box::new(Ty::Con("i32".to_string())), Box::new(Ty::Const(ConstValue::Int(indices.len() as u64))));
-                    match derive_impl_instantiation(templates, None, "index", expr.id, &[base_ty, idx_array_ty], node_types) {
+                    let idx_array_ty = Ty::Array(
+                        Box::new(Ty::Con("i32".to_string())),
+                        Box::new(Ty::Const(ConstValue::Int(indices.len() as u64))),
+                    );
+                    match derive_impl_instantiation(
+                        templates,
+                        None,
+                        "index",
+                        expr.id,
+                        &[base_ty, idx_array_ty],
+                        node_types,
+                    ) {
                         ImplMatch::Found(tmpl_idx, mapping) => {
-                            call_names.insert(expr.id, display_impl_instantiation(&templates[tmpl_idx], &mapping));
+                            call_names.insert(
+                                expr.id,
+                                display_impl_instantiation(&templates[tmpl_idx], &mapping),
+                            );
                             impl_worklist.push((tmpl_idx, mapping));
                         }
-                        ImplMatch::FoundConcrete(_) => unreachable!("derive_impl_instantiation never returns FoundConcrete when algebra is None"),
+                        ImplMatch::FoundConcrete(_) => unreachable!(
+                            "derive_impl_instantiation never returns FoundConcrete when algebra is None"
+                        ),
                         ImplMatch::NoCandidates => {}
                         ImplMatch::NoneMatched { algebra, tys } => {
                             errors.push(TypeError {
                                 span: expr.span,
-                                kind: TypeErrorKind::MonomorphizationFailed { algebra, method: "index".to_string(), tys },
+                                kind: TypeErrorKind::MonomorphizationFailed {
+                                    algebra,
+                                    method: "index".to_string(),
+                                    tys,
+                                },
                             });
                         }
                     }
@@ -1322,7 +1621,11 @@ fn collect_instantiations_expr(
             rec!(count);
         }
         ExprKind::StructLit(_, _, fields) => fields.iter().for_each(|(_, v)| rec!(v)),
-        ExprKind::If { cond, then_branch, else_branch } => {
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
             rec!(cond);
             rec_block!(then_branch, scope);
             if let Some(eb) = else_branch {
@@ -1336,7 +1639,12 @@ fn collect_instantiations_expr(
             rec!(cond);
             rec_block!(body, scope);
         }
-        ExprKind::For { var, start, end, body } => {
+        ExprKind::For {
+            var,
+            start,
+            end,
+            body,
+        } => {
             rec!(start);
             rec!(end);
             let mut inner = scope.clone();
@@ -1402,7 +1710,13 @@ fn is_fully_concrete(ty: &Ty) -> bool {
 /// folding (`fold_const_expr`) collapses `ConstExpr("add", Const(3),
 /// Const(4))` to `Const(7)` before the two sides are ever compared, so the
 /// ordinary `Array`-vs-`Array` unification just matches.
-fn derive_instantiation(scheme: &Scheme, call: &Expr, explicit_generics: &[GenericArg], args: &[Expr], node_types: &HashMap<NodeId, Ty>) -> Option<Vec<Ty>> {
+fn derive_instantiation(
+    scheme: &Scheme,
+    call: &Expr,
+    explicit_generics: &[GenericArg],
+    args: &[Expr],
+    node_types: &HashMap<NodeId, Ty>,
+) -> Option<Vec<Ty>> {
     let mut trial = Subst::default();
     // Arity is already validated by type-checking (`infer_call`'s own
     // `ArityMismatch`) whenever `explicit_generics` is non-empty at all — the
@@ -1416,11 +1730,20 @@ fn derive_instantiation(scheme: &Scheme, call: &Expr, explicit_generics: &[Gener
             }
         }
     }
-    let arg_tys: Vec<Ty> = args.iter().map(|a| node_types.get(&a.id).cloned()).collect::<Option<_>>()?;
+    let arg_tys: Vec<Ty> = args
+        .iter()
+        .map(|a| node_types.get(&a.id).cloned())
+        .collect::<Option<_>>()?;
     let ret_ty = node_types.get(&call.id)?.clone();
     let query = Ty::Fn(arg_tys, Box::new(ret_ty));
     unify(&mut trial, &scheme.ty, &query).ok()?;
-    Some(scheme.vars.iter().map(|v| trial.apply(&Ty::Var(*v))).collect())
+    Some(
+        scheme
+            .vars
+            .iter()
+            .map(|v| trial.apply(&Ty::Var(*v)))
+            .collect(),
+    )
 }
 
 /// Converts one turbofish argument (`f::<i32, 3>`'s `i32`/`3`) to a `Ty` —
@@ -1448,7 +1771,10 @@ fn concrete_ty_from_ast(ty: &Type) -> Option<Ty> {
             if args.is_empty() {
                 return Some(Ty::Con(name));
             }
-            let type_args: Vec<Ty> = args.iter().map(concrete_ty_from_generic_arg).collect::<Option<_>>()?;
+            let type_args: Vec<Ty> = args
+                .iter()
+                .map(concrete_ty_from_generic_arg)
+                .collect::<Option<_>>()?;
             Some(Ty::App(name, type_args))
         }
         TypeKind::Array(elem, size) => {
@@ -1457,7 +1783,10 @@ fn concrete_ty_from_ast(ty: &Type) -> Option<Ty> {
             Some(Ty::Array(Box::new(elem), Box::new(size)))
         }
         TypeKind::Fn(params, ret) => {
-            let params = params.iter().map(concrete_ty_from_ast).collect::<Option<_>>()?;
+            let params = params
+                .iter()
+                .map(concrete_ty_from_ast)
+                .collect::<Option<_>>()?;
             let ret = concrete_ty_from_ast(ret)?;
             Some(Ty::Fn(params, Box::new(ret)))
         }
@@ -1472,12 +1801,17 @@ fn concrete_ty_from_ast(ty: &Type) -> Option<Ty> {
 
 fn concrete_const_from_expr(value: &Expr) -> Option<Ty> {
     match &value.kind {
-        ExprKind::NumberLit { text, .. } => text.parse::<u64>().ok().map(|n| Ty::Const(ConstValue::Int(n))),
+        ExprKind::NumberLit { text, .. } => text
+            .parse::<u64>()
+            .ok()
+            .map(|n| Ty::Const(ConstValue::Int(n))),
         ExprKind::BoolLit(b) => Some(Ty::Const(ConstValue::Bool(*b))),
         ExprKind::Call(path, _, args, ..) if path.segments.len() == 1 && args.len() == 2 => {
             let a = concrete_const_from_expr(&args[0])?;
             let b = concrete_const_from_expr(&args[1])?;
-            let (Ty::Const(av), Ty::Const(bv)) = (&a, &b) else { return None };
+            let (Ty::Const(av), Ty::Const(bv)) = (&a, &b) else {
+                return None;
+            };
             crate::const_eval::eval_binop(&path.segments[0], *av, *bv).map(Ty::Const)
         }
         _ => None,
@@ -1508,7 +1842,10 @@ enum ImplMatch {
     /// unified against this call's own concrete types — a real, worth-
     /// reporting failure (see `derive_impl_instantiation`'s own doc
     /// comment), not silently treated the same as `NoCandidates`.
-    NoneMatched { algebra: String, tys: String },
+    NoneMatched {
+        algebra: String,
+        tys: String,
+    },
 }
 
 /// Finds the `ImplTemplate` (if any) whose own `target_patterns` unify
@@ -1523,20 +1860,40 @@ enum ImplMatch {
 /// `derive_impl_instantiation`'s own free-var read-back exactly. `None`
 /// for a *non*-generic template too — `collect_units` already includes
 /// those unconditionally, nothing to seed.
-fn find_impl_for_target(templates: &[ImplTemplate], algebra: &str, method: &str, target_tys: &[Ty]) -> Option<(usize, HashMap<TyVar, Ty>)> {
+fn find_impl_for_target(
+    templates: &[ImplTemplate],
+    algebra: &str,
+    method: &str,
+    target_tys: &[Ty],
+) -> Option<(usize, HashMap<TyVar, Ty>)> {
     for (idx, t) in templates.iter().enumerate() {
-        if t.algebra != algebra || t.method_name != method || t.target_patterns.len() != target_tys.len() || !t.is_generic {
+        if t.algebra != algebra
+            || t.method_name != method
+            || t.target_patterns.len() != target_tys.len()
+            || !t.is_generic
+        {
             continue;
         }
         let mut trial = Subst::default();
-        if t.target_patterns.iter().zip(target_tys).any(|(pat, concrete)| unify(&mut trial, pat, concrete).is_err()) {
+        if t.target_patterns
+            .iter()
+            .zip(target_tys)
+            .any(|(pat, concrete)| unify(&mut trial, pat, concrete).is_err())
+        {
             continue;
         }
         let mut vars = HashSet::new();
-        t.param_patterns.iter().for_each(|p| free_vars(p, &mut vars));
+        t.param_patterns
+            .iter()
+            .for_each(|p| free_vars(p, &mut vars));
         free_vars(&t.ret_pattern, &mut vars);
-        t.target_patterns.iter().for_each(|p| free_vars(p, &mut vars));
-        let mapping: HashMap<TyVar, Ty> = vars.into_iter().map(|v| (v, trial.apply(&Ty::Var(v)))).collect();
+        t.target_patterns
+            .iter()
+            .for_each(|p| free_vars(p, &mut vars));
+        let mapping: HashMap<TyVar, Ty> = vars
+            .into_iter()
+            .map(|v| (v, trial.apply(&Ty::Var(v))))
+            .collect();
         return Some((idx, mapping));
     }
     None
@@ -1569,16 +1926,41 @@ fn resolve_derivative_rule_expr_ty(
         // differentiating distributes component-wise, so `d(inner)` always
         // has the exact same type as `inner` itself.
         ExprKind::Call(path, _, args, _) if path.segments.join("::") == "d" => {
-            let [inner] = args.as_slice() else { return None };
-            resolve_derivative_rule_expr_ty(inner, algebra, type_env, param_tys, registry, infer, templates, impl_worklist)
+            let [inner] = args.as_slice() else {
+                return None;
+            };
+            resolve_derivative_rule_expr_ty(
+                inner,
+                algebra,
+                type_env,
+                param_tys,
+                registry,
+                infer,
+                templates,
+                impl_worklist,
+            )
         }
         ExprKind::Call(path, _, args, _) => {
             let method = path.segments.join("::");
             let arg_tys: Vec<Ty> = args
                 .iter()
-                .filter_map(|a| resolve_derivative_rule_expr_ty(a, algebra, type_env, param_tys, registry, infer, templates, impl_worklist))
+                .filter_map(|a| {
+                    resolve_derivative_rule_expr_ty(
+                        a,
+                        algebra,
+                        type_env,
+                        param_tys,
+                        registry,
+                        infer,
+                        templates,
+                        impl_worklist,
+                    )
+                })
                 .collect();
-            let owner = if registry.fn_sig(algebra, &method).is_some_and(|s| s.params.len() == args.len()) {
+            let owner = if registry
+                .fn_sig(algebra, &method)
+                .is_some_and(|s| s.params.len() == args.len())
+            {
                 algebra.to_string()
             } else {
                 match registry.algebras_with_fn(&method, args.len()).as_slice() {
@@ -1586,33 +1968,67 @@ fn resolve_derivative_rule_expr_ty(
                     _ => return None,
                 }
             };
-            if owner == algebra {
-                // Same-algebra recursive self-call (`MatMul::matmul` calling
-                // itself inside its own rule) -- its own result type is this
-                // algebra's own declared return type, substituted through
-                // the *enclosing* instantiation's own `type_env` -- nothing
-                // to seed, `t`'s own specialization already covers it.
-                return registry.fn_sig(&owner, &method)?.ret.as_ref().map(|ret| infer.ty_from_ast_mapped(ret, type_env));
-            }
-            // A genuinely different algebra -- every one actually called
-            // this way across the whole stdlib today is single-generic
-            // (`Ring<T>`, `Transcendental<T>`), so the one concrete type its
-            // own arguments agree on *is* that generic's own concrete
-            // value -- mirrors `egraph.rs::build_pattern`'s own identical
-            // reasoning and identical bail-on-disagreement posture.
+            // The one concrete type this call's own arguments agree on --
+            // every algebra ever called this way across the whole stdlib
+            // today is single-generic (`Ring<T>`, `Transcendental<T>`), so
+            // agreement alone pins its concrete value -- mirrors `egraph.rs
+            // ::build_pattern`'s own identical reasoning and identical bail-
+            // on-disagreement posture (`agreed` left `None` on disagreement,
+            // handled below rather than an early `return None` directly in
+            // the loop, so a same-algebra call — see below — can still
+            // return its own declared type even when this doesn't apply).
             let mut agreed: Option<Ty> = None;
             for t in &arg_tys {
                 match &agreed {
                     None => agreed = Some(t.clone()),
                     Some(a) if a == t => {}
-                    Some(_) => return None,
+                    Some(_) => {
+                        agreed = None;
+                        break;
+                    }
                 }
             }
-            let target_ty = agreed?;
-            if let Some((idx, mapping)) = find_impl_for_target(templates, &owner, &method, std::slice::from_ref(&target_ty)) {
-                impl_worklist.push((idx, mapping));
+            // Seeded regardless of same-algebra vs. cross-algebra --
+            // `owner == algebra` used to skip this entirely ("`t`'s own
+            // specialization already covers it"), which is only true when
+            // the call is *literally* self-recursive (`MatMul::matmul`
+            // calling itself). A *different* method of the *same* algebra
+            // (`Ring<T>`'s own `derivative div(a,b): div(sub(...),...)`,
+            // referencing `sub`/`mul` alongside `div`) is a separate `Impl
+            // Template`, monomorphized independently -- found missing
+            // directly, by testing `Ring<Tensor<f32,1,2>>::div` (`Dense::
+            // forward`'s `sigmoid`, `stdlib/nn/nn.cleave`): `Ring::sub<
+            // Tensor<f32,1,2>>`/`Ring::mul<Tensor<f32,1,2>>` are never
+            // called from ordinary source anywhere in that program, unlike
+            // the `f32` case, where `sub`/`mul` happen to *also* be called
+            // directly elsewhere (`err*err`, `pred-y`), coincidentally
+            // masking this exact gap in every scalar-only test until now.
+            // Surfaced identically to the already-known cross-algebra gap
+            // this function's own doc comment documents: `cps.rs`'s "call_
+            // names resolved ... but no such unit exists"-style panic,
+            // extracting a derivative that references a never-monomorphized
+            // unit.
+            if let Some(target_ty) = &agreed {
+                if let Some((idx, mapping)) = find_impl_for_target(
+                    templates,
+                    &owner,
+                    &method,
+                    std::slice::from_ref(target_ty),
+                ) {
+                    impl_worklist.push((idx, mapping));
+                }
             }
-            Some(target_ty)
+            if owner == algebra {
+                // Same-algebra call — its own result type is this algebra's
+                // own declared return type, substituted through the
+                // *enclosing* instantiation's own `type_env`.
+                return registry
+                    .fn_sig(&owner, &method)?
+                    .ret
+                    .as_ref()
+                    .map(|ret| infer.ty_from_ast_mapped(ret, type_env));
+            }
+            agreed
         }
         _ => None,
     }
@@ -1649,8 +2065,16 @@ fn seed_derivative_rule_references(
     templates: &[ImplTemplate],
     impl_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
 ) {
-    let Some(rule) = registry.derivative_rules(algebra).iter().find(|r| r.method == method) else { return };
-    let Some(sig) = registry.fn_sig(algebra, method) else { return };
+    let Some(rule) = registry
+        .derivative_rules(algebra)
+        .iter()
+        .find(|r| r.method == method)
+    else {
+        return;
+    };
+    let Some(sig) = registry.fn_sig(algebra, method) else {
+        return;
+    };
     let type_env: HashMap<String, Ty> = registry
         .generics(algebra)
         .iter()
@@ -1663,9 +2087,23 @@ fn seed_derivative_rule_references(
         .params
         .iter()
         .zip(&sig.params)
-        .filter_map(|(rule_p, sig_p)| Some((rule_p.name.as_str(), infer.ty_from_ast_mapped(sig_p.ty.as_ref()?, &type_env))))
+        .filter_map(|(rule_p, sig_p)| {
+            Some((
+                rule_p.name.as_str(),
+                infer.ty_from_ast_mapped(sig_p.ty.as_ref()?, &type_env),
+            ))
+        })
         .collect();
-    resolve_derivative_rule_expr_ty(&rule.body, algebra, &type_env, &param_tys, registry, &mut infer, templates, impl_worklist);
+    resolve_derivative_rule_expr_ty(
+        &rule.body,
+        algebra,
+        &type_env,
+        &param_tys,
+        registry,
+        &mut infer,
+        templates,
+        impl_worklist,
+    );
 }
 
 /// A sibling of `seed_derivative_rule_references`, same call site, same
@@ -1684,12 +2122,70 @@ fn seed_derivative_rule_references(
 /// includes every non-generic impl's own methods (`zero()` included)
 /// unconditionally, the same reason `find_impl_for_target` itself already
 /// only ever matches a generic template.
-fn seed_ring_zero(algebra: &str, target_tys: &[Ty], templates: &[ImplTemplate], impl_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>) {
+fn seed_ring_zero(
+    algebra: &str,
+    target_tys: &[Ty],
+    templates: &[ImplTemplate],
+    impl_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
+) {
     if algebra != "Ring" {
         return;
     }
     if let Some((idx, mapping)) = find_impl_for_target(templates, "Ring", "zero", target_tys) {
         impl_worklist.push((idx, mapping));
+    }
+}
+
+/// Seeds `Index<Tensor<T,Dims...>, T>::index` for every `Tensor`-typed field
+/// reachable (recursively, through however many levels of nested struct)
+/// from a `derive()`d function's own parameter types — `egraph.rs::build_
+/// param_shape`'s own eta-expansion needs a real, already-monomorphized
+/// `Index::index<Tensor<...>, ...>` unit for *every* such field, even one no
+/// ordinary call site in the program ever indexes explicitly (`examples/
+/// xor_tensor.cleave`'s own `net.l1.w` -- passed straight to `matmul`, never
+/// written as `net.l1.w[i,j]` anywhere), so ordinary reachability-driven
+/// monomorphization alone can never seed it. The exact same "referenced only
+/// dynamically, from inside `derive()`'s own machinery, never from any real
+/// call site" shape `seed_ring_zero` just above already handles for `Ring::
+/// zero` -- found missing directly, by testing `Dense`/`Network` (the first
+/// program to ever pass a struct with a *nested* struct's own `Tensor` field
+/// into `derive()`), the same "not anticipated by the plan, found only once
+/// something with real depth was tried" pattern as `Dense::forward`'s own
+/// worklist-ordering bug just above.
+fn seed_derive_tensor_field_indices(
+    ty: &Ty,
+    struct_schemas: &HashMap<String, StructSchema>,
+    templates: &[ImplTemplate],
+    impl_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
+) {
+    // `Ty::Con(name)` (a non-generic struct, `Network`) and `Ty::App(name,
+    // args)` (a generic one, `Dense<f32,2,2>`) both name a real struct here
+    // -- `Ty::Con` is just `Ty::App` with zero args, the same collapse
+    // `struct_field_types`'s own callers elsewhere already rely on.
+    let (name, args): (&str, &[Ty]) = match ty {
+        Ty::Con(name) => (name, &[]),
+        Ty::App(name, args) => (name, args),
+        _ => return,
+    };
+    if name == "Tensor" {
+        let Some(elem_ty) = args.first() else { return };
+        if let Some((idx, mapping)) =
+            find_impl_for_target(templates, "Index", "index", &[ty.clone(), elem_ty.clone()])
+        {
+            impl_worklist.push((idx, mapping));
+        }
+        return;
+    }
+    // A scalar (`f32`, `i32`, ...) or any other non-struct type name has no
+    // fields to walk -- `struct_schemas` only ever indexes real `struct`
+    // declarations, and `struct_field_types` panics on a miss (it assumes
+    // its caller already knows `name` names a real struct, true everywhere
+    // else it's called from), so this must be checked *before* calling it.
+    if !struct_schemas.contains_key(name) {
+        return;
+    }
+    for (_, field_ty) in struct_field_types(struct_schemas, name, args) {
+        seed_derive_tensor_field_indices(&field_ty, struct_schemas, templates, impl_worklist);
     }
 }
 
@@ -1740,7 +2236,8 @@ fn derive_impl_instantiation(
     arg_tys: &[Ty],
     node_types: &HashMap<NodeId, Ty>,
 ) -> ImplMatch {
-    let owned_by = |t: &&ImplTemplate| t.method_name == method && algebra.map_or(true, |a| t.algebra == a);
+    let owned_by =
+        |t: &&ImplTemplate| t.method_name == method && algebra.map_or(true, |a| t.algebra == a);
     let candidates: Vec<&ImplTemplate> = templates.iter().filter(owned_by).collect();
     if candidates.is_empty() {
         return ImplMatch::NoCandidates;
@@ -1751,7 +2248,10 @@ fn derive_impl_instantiation(
     let query = Ty::Fn(arg_tys.to_vec(), Box::new(ret_ty));
 
     for (idx, t) in templates.iter().enumerate() {
-        if t.method_name != method || t.param_patterns.len() != arg_tys.len() || algebra.is_some_and(|a| t.algebra != a) {
+        if t.method_name != method
+            || t.param_patterns.len() != arg_tys.len()
+            || algebra.is_some_and(|a| t.algebra != a)
+        {
             continue;
         }
         let pattern = Ty::Fn(t.param_patterns.clone(), Box::new(t.ret_pattern.clone()));
@@ -1766,10 +2266,17 @@ fn derive_impl_instantiation(
             };
         }
         let mut vars = HashSet::new();
-        t.param_patterns.iter().for_each(|p| free_vars(p, &mut vars));
+        t.param_patterns
+            .iter()
+            .for_each(|p| free_vars(p, &mut vars));
         free_vars(&t.ret_pattern, &mut vars);
-        t.target_patterns.iter().for_each(|p| free_vars(p, &mut vars));
-        let mapping: HashMap<TyVar, Ty> = vars.into_iter().map(|v| (v, trial.apply(&Ty::Var(v)))).collect();
+        t.target_patterns
+            .iter()
+            .for_each(|p| free_vars(p, &mut vars));
+        let mapping: HashMap<TyVar, Ty> = vars
+            .into_iter()
+            .map(|v| (v, trial.apply(&Ty::Var(v))))
+            .collect();
         return ImplMatch::Found(idx, mapping);
     }
     ImplMatch::NoneMatched {
@@ -1793,18 +2300,34 @@ fn derive_impl_instantiation(
 /// callable passed as a bare argument never becomes a `Call` node of its
 /// own, so `collect_instantiations_expr`'s ordinary per-`Call` detection
 /// alone would never discover that it needs its own specialization built.
-fn derive_value_instantiation(scheme: &Scheme, node_types: &HashMap<NodeId, Ty>, node_id: NodeId) -> Option<Vec<Ty>> {
+fn derive_value_instantiation(
+    scheme: &Scheme,
+    node_types: &HashMap<NodeId, Ty>,
+    node_id: NodeId,
+) -> Option<Vec<Ty>> {
     let ty = node_types.get(&node_id)?.clone();
     let mut trial = Subst::default();
     unify(&mut trial, &scheme.ty, &ty).ok()?;
-    Some(scheme.vars.iter().map(|v| trial.apply(&Ty::Var(*v))).collect())
+    Some(
+        scheme
+            .vars
+            .iter()
+            .map(|v| trial.apply(&Ty::Var(*v)))
+            .collect(),
+    )
 }
 
 fn display_instantiation(name: &str, tys: &[Ty]) -> String {
     if tys.is_empty() {
         name.to_string()
     } else {
-        format!("{name}<{}>", tys.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "))
+        format!(
+            "{name}<{}>",
+            tys.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     }
 }
 
@@ -1826,7 +2349,12 @@ fn display_lambda_instantiation(id: NodeId, tys: &[Ty]) -> String {
 /// reader thinks of a `MatMul` call in terms of the operand/result shapes
 /// actually involved, not the impl's own declaration.
 fn display_impl_instantiation(t: &ImplTemplate, mapping: &HashMap<TyVar, Ty>) -> String {
-    let targets = t.target_patterns.iter().map(|p| substitute(p, mapping).to_string()).collect::<Vec<_>>().join(", ");
+    let targets = t
+        .target_patterns
+        .iter()
+        .map(|p| substitute(p, mapping).to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
     format!("{}::{}<{}>", t.algebra, t.method_name, targets)
 }
 
@@ -1849,16 +2377,30 @@ fn derive_inherent_instantiation(
 ) -> Option<HashMap<TyVar, Ty>> {
     let base_ty = node_types.get(&base.id)?.clone();
     let mut arg_tys = vec![base_ty];
-    arg_tys.extend(args.iter().map(|a| node_types.get(&a.id).cloned()).collect::<Option<Vec<_>>>()?);
+    arg_tys.extend(
+        args.iter()
+            .map(|a| node_types.get(&a.id).cloned())
+            .collect::<Option<Vec<_>>>()?,
+    );
     let ret_ty = node_types.get(&call.id)?.clone();
     let query = Ty::Fn(arg_tys, Box::new(ret_ty));
-    let pattern = Ty::Fn(template.param_patterns.clone(), Box::new(template.ret_pattern.clone()));
+    let pattern = Ty::Fn(
+        template.param_patterns.clone(),
+        Box::new(template.ret_pattern.clone()),
+    );
     let mut trial = Subst::default();
     unify(&mut trial, &pattern, &query).ok()?;
     let mut vars = HashSet::new();
-    template.param_patterns.iter().for_each(|p| free_vars(p, &mut vars));
+    template
+        .param_patterns
+        .iter()
+        .for_each(|p| free_vars(p, &mut vars));
     free_vars(&template.ret_pattern, &mut vars);
-    Some(vars.into_iter().map(|v| (v, trial.apply(&Ty::Var(v)))).collect())
+    Some(
+        vars.into_iter()
+            .map(|v| (v, trial.apply(&Ty::Var(v))))
+            .collect(),
+    )
 }
 
 /// The inherent-impl counterpart to `display_impl_instantiation` — described
@@ -1879,7 +2421,11 @@ fn display_inherent_instantiation(t: &InherentTemplate, mapping: &HashMap<TyVar,
 pub(crate) fn collect_exprs<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
     out.push(expr);
     match &expr.kind {
-        ExprKind::NumberLit { .. } | ExprKind::ImaginaryLit { .. } | ExprKind::BoolLit(_) | ExprKind::Path(_) | ExprKind::PackRef(_) => {}
+        ExprKind::NumberLit { .. }
+        | ExprKind::ImaginaryLit { .. }
+        | ExprKind::BoolLit(_)
+        | ExprKind::Path(_)
+        | ExprKind::PackRef(_) => {}
         ExprKind::Call(_, _, args, ..) => args.iter().for_each(|a| collect_exprs(a, out)),
         ExprKind::FieldAccess(base, _) => collect_exprs(base, out),
         ExprKind::MethodCall(base, _, args) => {
@@ -1896,7 +2442,11 @@ pub(crate) fn collect_exprs<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
             collect_exprs(count, out);
         }
         ExprKind::StructLit(_, _, fields) => fields.iter().for_each(|(_, v)| collect_exprs(v, out)),
-        ExprKind::If { cond, then_branch, else_branch } => {
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
             collect_exprs(cond, out);
             collect_exprs_block(then_branch, out);
             if let Some(eb) = else_branch {
@@ -1910,7 +2460,9 @@ pub(crate) fn collect_exprs<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
             collect_exprs(cond, out);
             collect_exprs_block(body, out);
         }
-        ExprKind::For { start, end, body, .. } => {
+        ExprKind::For {
+            start, end, body, ..
+        } => {
             collect_exprs(start, out);
             collect_exprs(end, out);
             collect_exprs_block(body, out);
@@ -1986,10 +2538,19 @@ pub fn dump_monomorphized(program: &Program, registry: &Registry) -> (String, Ve
                 // `d.generics.is_empty()` alone isn't enough: an impl
                 // declaring zero generics of its own can still inherit a
                 // free variable from the algebra's own const generic.
-                let algebra_has_const_generic =
-                    registry.generics(&d.algebra).iter().any(|g| matches!(g, GenericParam::Const { .. }));
+                let algebra_has_const_generic = registry
+                    .generics(&d.algebra)
+                    .iter()
+                    .any(|g| matches!(g, GenericParam::Const { .. }));
                 if d.generics.is_empty() && !algebra_has_const_generic {
-                    dump_concrete_impl(&mut out, &mut errors, d, item.span, registry, &program_inference.global_env);
+                    dump_concrete_impl(
+                        &mut out,
+                        &mut errors,
+                        d,
+                        item.span,
+                        registry,
+                        &program_inference.global_env,
+                    );
                     continue;
                 }
                 for f in &d.fns {
@@ -2025,7 +2586,12 @@ pub fn dump_monomorphized(program: &Program, registry: &Registry) -> (String, Ve
             ItemKind::Fn(f) => match program_inference.results.get(&f.name) {
                 Some(Err(e)) => {
                     let params: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
-                    let _ = writeln!(out, "fn {}({}) {{ /* type error, see diagnostics */ }}", f.name, params.join(", "));
+                    let _ = writeln!(
+                        out,
+                        "fn {}({}) {{ /* type error, see diagnostics */ }}",
+                        f.name,
+                        params.join(", ")
+                    );
                     errors.push(e.clone());
                 }
                 Some(Ok(fn_result)) => match program_inference.global_env.get(&f.name) {
@@ -2046,8 +2612,15 @@ pub fn dump_monomorphized(program: &Program, registry: &Registry) -> (String, Ve
                         // signature instead (see `ast.rs`'s own `FnDecl::
                         // is_extern` doc comment).
                         None => {
-                            let params: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
-                            let _ = writeln!(out, "extern fn {}({}) -> {};", f.name, params.join(", "), fn_result.result);
+                            let params: Vec<String> =
+                                f.params.iter().map(|p| p.name.clone()).collect();
+                            let _ = writeln!(
+                                out,
+                                "extern fn {}({}) -> {};",
+                                f.name,
+                                params.join(", "),
+                                fn_result.result
+                            );
                         }
                     },
                     Some(_) => {
@@ -2072,9 +2645,15 @@ pub fn dump_monomorphized(program: &Program, registry: &Registry) -> (String, Ve
                             );
                         }
                     }
-                    None => unreachable!("`{}` type-checked successfully but has no scheme in global_env", f.name),
+                    None => unreachable!(
+                        "`{}` type-checked successfully but has no scheme in global_env",
+                        f.name
+                    ),
                 },
-                None => unreachable!("`{}` is a top-level `fn` item but callgraph::infer_program has no entry for it", f.name),
+                None => unreachable!(
+                    "`{}` is a top-level `fn` item but callgraph::infer_program has no entry for it",
+                    f.name
+                ),
             },
         }
     }
@@ -2093,15 +2672,43 @@ pub fn dump_monomorphized(program: &Program, registry: &Registry) -> (String, Ve
 /// all — rendered with its own real, type-checked body directly, the same
 /// way `dump.rs`'s own `--dump-inference-pass` already does, since nothing
 /// here can improve on an already-fully-concrete method.
-fn dump_concrete_impl(out: &mut String, errors: &mut Vec<TypeError>, d: &ImplDecl, span: Span, registry: &Registry, global_env: &Env) {
-    let targets: Vec<String> = std::iter::once(&d.target).chain(d.extra_targets.iter()).map(crate::print::fmt_type).collect();
+fn dump_concrete_impl(
+    out: &mut String,
+    errors: &mut Vec<TypeError>,
+    d: &ImplDecl,
+    span: Span,
+    registry: &Registry,
+    global_env: &Env,
+) {
+    let targets: Vec<String> = std::iter::once(&d.target)
+        .chain(d.extra_targets.iter())
+        .map(crate::print::fmt_type)
+        .collect();
     let _ = writeln!(out, "impl {}<{}> {{", d.algebra, targets.join(", "));
-    let all_targets: Vec<Type> = std::iter::once(d.target.clone()).chain(d.extra_targets.iter().cloned()).collect();
+    let all_targets: Vec<Type> = std::iter::once(d.target.clone())
+        .chain(d.extra_targets.iter().cloned())
+        .collect();
     for f in &d.fns {
         let mut infer = Infer::new(registry);
-        match infer.infer_impl_fn_generic_with_env(global_env, &d.algebra, &d.generics, &all_targets, f, span) {
+        match infer.infer_impl_fn_generic_with_env(
+            global_env,
+            &d.algebra,
+            &d.generics,
+            &all_targets,
+            f,
+            span,
+        ) {
             Ok(ret) => match &f.body {
-                Some(body) => dump_one(out, &f.name, &f.params, body, &infer.param_types, &ret, &infer.node_types, &HashMap::new()),
+                Some(body) => dump_one(
+                    out,
+                    &f.name,
+                    &f.params,
+                    body,
+                    &infer.param_types,
+                    &ret,
+                    &infer.node_types,
+                    &HashMap::new(),
+                ),
                 // A bodyless method (`#[mlir(...)]`-tagged) that type-checked
                 // successfully — rendered as a bare signature, same as
                 // `dump.rs`'s own `dump_impl_fn`.
@@ -2117,12 +2724,22 @@ fn dump_concrete_impl(out: &mut String, errors: &mut Vec<TypeError>, d: &ImplDec
                     for attr in &f.attrs {
                         let _ = writeln!(out, "#[{}({})]", attr.name, attr.args.join(", "));
                     }
-                    let _ = writeln!(out, "fn {}({}) -> {ret};", f.name, rendered_params.join(", "));
+                    let _ = writeln!(
+                        out,
+                        "fn {}({}) -> {ret};",
+                        f.name,
+                        rendered_params.join(", ")
+                    );
                 }
             },
             Err(e) => {
                 let params: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
-                let _ = writeln!(out, "fn {}({}) {{ /* type error, see diagnostics */ }}", f.name, params.join(", "));
+                let _ = writeln!(
+                    out,
+                    "fn {}({}) {{ /* type error, see diagnostics */ }}",
+                    f.name,
+                    params.join(", ")
+                );
                 errors.push(e);
             }
         }
@@ -2142,10 +2759,18 @@ fn dump_one(
     call_names: &HashMap<NodeId, String>,
 ) {
     let mut names = TyVarNames::default();
-    let rendered_params: Vec<String> =
-        params.iter().zip(param_types.iter()).map(|(p, t)| format!("{}: {}", p.name, fmt_ty_named(t, &mut names))).collect();
+    let rendered_params: Vec<String> = params
+        .iter()
+        .zip(param_types.iter())
+        .map(|(p, t)| format!("{}: {}", p.name, fmt_ty_named(t, &mut names)))
+        .collect();
     let ret = fmt_ty_named(result, &mut names);
-    let _ = writeln!(out, "fn {}({}) -> {ret} {{", mangled_name, rendered_params.join(", "));
+    let _ = writeln!(
+        out,
+        "fn {}({}) -> {ret} {{",
+        mangled_name,
+        rendered_params.join(", ")
+    );
     dump_block_with_call_names(out, body, node_types, &mut names, 1, call_names);
     let _ = writeln!(out, "}}");
 }

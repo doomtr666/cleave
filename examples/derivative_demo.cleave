@@ -11,15 +11,20 @@ use io;
 //
 // `loss(x, y) = x^2 + y^2` -- a toy squared-error-style loss, exactly the
 // shape a real gradient-descent step would need the gradient of.
-// `grad = derive(loss);` synthesizes `grad(x, y) -> [f32; 2]`, the Jacobian
-// row `[d(loss)/dx, d(loss)/dy] = [2x, 2y]` -- `f`'s own arity (2 parameters)
-// determines `grad`'s own return shape mechanically, never written by hand.
+// `grad = derive(loss);` synthesizes `grad(x, y) -> (f32, f32)`, the
+// Jacobian row `(d(loss)/dx, d(loss)/dy) = (2x, 2y)` -- `f`'s own arity (2
+// parameters) determines `grad`'s own return shape mechanically, never
+// written by hand. A tuple, not an array: each entry's own type is that
+// *parameter's* own type, which lets a struct-typed parameter's own
+// gradient be struct-shaped too (`doc/backlog.md`'s own "gradient w.r.t. a
+// struct parameter" item) -- irrelevant here (both parameters are already
+// `f32`), but this is why `g.0`/`g.1`, not `g[0]`/`g[1]`.
 fn loss(x: f32, y: f32) -> f32 { x * x + y * y }
 grad = derive(loss);
 
 fn main() -> i32 {
     let g = grad(3.0, 4.0);
-    print(g[0]); // 6.0  =  2 * 3.0
-    print(g[1]); // 8.0  =  2 * 4.0
+    print(g.0); // 6.0  =  2 * 3.0
+    print(g.1); // 8.0  =  2 * 4.0
     0
 }

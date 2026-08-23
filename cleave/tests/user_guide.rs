@@ -41,7 +41,10 @@ fn build_module<'c>(context: &'c Context, src: &str) -> melior::ir::Module<'c> {
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let module = lower_program(context, &cps_program, &mlir_types, struct_schemas);
-    assert!(module.as_operation().verify(), "generated MLIR module failed verification");
+    assert!(
+        module.as_operation().verify(),
+        "generated MLIR module failed verification"
+    );
     module
 }
 
@@ -56,7 +59,9 @@ fn run_i32(context: &Context, src: &str) -> i32 {
     let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
-    pass_manager.run(&mut module).expect("lowering to the llvm dialect must succeed");
+    pass_manager
+        .run(&mut module)
+        .expect("lowering to the llvm dialect must succeed");
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     // Registered unconditionally, harmless if unused -- any struct
@@ -73,7 +78,9 @@ fn run_i32(context: &Context, src: &str) -> i32 {
     }
     let mut out: i32 = -1;
     unsafe {
-        engine.invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()]).expect("JIT invocation must succeed");
+        engine
+            .invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()])
+            .expect("JIT invocation must succeed");
     }
     out
 }
@@ -91,7 +98,13 @@ fn hello_cleave() {
 #[test]
 fn arithmetic_on_primitive_types_just_works() {
     let context = context();
-    assert_eq!(run_i32(&context, "fn add_one(x: i32) -> i32 { x + 1 } fn main() -> i32 { add_one(5) }"), 6);
+    assert_eq!(
+        run_i32(
+            &context,
+            "fn add_one(x: i32) -> i32 { x + 1 } fn main() -> i32 { add_one(5) }"
+        ),
+        6
+    );
 }
 
 // ---------------------------------------------------------------- Bindings
@@ -116,13 +129,25 @@ fn let_and_let_mut() {
 #[test]
 fn unannotated_function_infers_a_polymorphic_type() {
     let context = context();
-    assert_eq!(run_i32(&context, "fn add_one(x) { x + 1 } fn main() -> i32 { add_one(5) }"), 6);
+    assert_eq!(
+        run_i32(
+            &context,
+            "fn add_one(x) { x + 1 } fn main() -> i32 { add_one(5) }"
+        ),
+        6
+    );
 }
 
 #[test]
 fn annotated_function_signature() {
     let context = context();
-    assert_eq!(run_i32(&context, "fn add_one(x: i32) -> i32 { x + 1 } fn main() -> i32 { add_one(5) }"), 6);
+    assert_eq!(
+        run_i32(
+            &context,
+            "fn add_one(x: i32) -> i32 { x + 1 } fn main() -> i32 { add_one(5) }"
+        ),
+        6
+    );
 }
 
 #[test]
@@ -440,7 +465,10 @@ fn extern_fn_print_returns_its_argument_unchanged() {
 #[test]
 fn unsuffixed_literal_defaults_to_i32() {
     let context = context();
-    assert_eq!(run_i32(&context, "fn f() -> i32 { 1 } fn main() -> i32 { f() }"), 1);
+    assert_eq!(
+        run_i32(&context, "fn f() -> i32 { 1 } fn main() -> i32 { f() }"),
+        1
+    );
 }
 
 #[test]

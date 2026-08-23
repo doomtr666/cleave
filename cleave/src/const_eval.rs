@@ -56,38 +56,65 @@ mod tests {
 
     #[test]
     fn add_sums_two_ints() {
-        assert_eq!(eval_binop("add", ConstValue::Int(4), ConstValue::Int(3)), Some(ConstValue::Int(7)));
+        assert_eq!(
+            eval_binop("add", ConstValue::Int(4), ConstValue::Int(3)),
+            Some(ConstValue::Int(7))
+        );
     }
 
     #[test]
     fn mul_multiplies_two_ints() {
-        assert_eq!(eval_binop("mul", ConstValue::Int(4), ConstValue::Int(3)), Some(ConstValue::Int(12)));
+        assert_eq!(
+            eval_binop("mul", ConstValue::Int(4), ConstValue::Int(3)),
+            Some(ConstValue::Int(12))
+        );
     }
 
     #[test]
     fn sub_subtracts_two_ints() {
-        assert_eq!(eval_binop("sub", ConstValue::Int(10), ConstValue::Int(10)), Some(ConstValue::Int(0)));
-        assert_eq!(eval_binop("sub", ConstValue::Int(4), ConstValue::Int(3)), Some(ConstValue::Int(1)));
+        assert_eq!(
+            eval_binop("sub", ConstValue::Int(10), ConstValue::Int(10)),
+            Some(ConstValue::Int(0))
+        );
+        assert_eq!(
+            eval_binop("sub", ConstValue::Int(4), ConstValue::Int(3)),
+            Some(ConstValue::Int(1))
+        );
     }
 
     #[test]
     fn a_bool_operand_is_not_arithmetic() {
-        assert_eq!(eval_binop("add", ConstValue::Bool(true), ConstValue::Int(3)), None);
+        assert_eq!(
+            eval_binop("add", ConstValue::Bool(true), ConstValue::Int(3)),
+            None
+        );
     }
 
     #[test]
     fn an_unrecognized_operator_is_not_evaluated() {
-        assert_eq!(eval_binop("mod", ConstValue::Int(4), ConstValue::Int(3)), None);
+        assert_eq!(
+            eval_binop("mod", ConstValue::Int(4), ConstValue::Int(3)),
+            None
+        );
     }
 
     #[test]
     fn div_divides_two_ints_truncating() {
-        assert_eq!(eval_binop("div", ConstValue::Int(7), ConstValue::Int(2)), Some(ConstValue::Int(3)));
-        assert_eq!(eval_binop("div", ConstValue::Int(4), ConstValue::Int(4)), Some(ConstValue::Int(1)));
+        assert_eq!(
+            eval_binop("div", ConstValue::Int(7), ConstValue::Int(2)),
+            Some(ConstValue::Int(3))
+        );
+        assert_eq!(
+            eval_binop("div", ConstValue::Int(4), ConstValue::Int(4)),
+            Some(ConstValue::Int(1))
+        );
     }
 
     #[test]
     fn div_by_zero_is_not_evaluated_rather_than_panicking() {
-        assert_eq!(eval_binop("div", ConstValue::Int(4), ConstValue::Int(0)), None);
+        assert_eq!(
+            eval_binop("div", ConstValue::Int(4), ConstValue::Int(0)),
+            None
+        );
     }
 }

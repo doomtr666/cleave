@@ -18,7 +18,10 @@ pub struct Lowerer {
 
 impl Lowerer {
     pub fn new(file: FileId) -> Self {
-        Lowerer { file, ids: NodeIdGen::default() }
+        Lowerer {
+            file,
+            ids: NodeIdGen::default(),
+        }
     }
 
     /// Like `new`, but continuing an existing `NodeIdGen` rather than
@@ -38,15 +41,27 @@ impl Lowerer {
 
     fn span_of(&self, pair: &Pair<Rule>) -> Span {
         let s = pair.as_span();
-        Span { file: self.file, start: s.start(), end: s.end() }
+        Span {
+            file: self.file,
+            start: s.start(),
+            end: s.end(),
+        }
     }
 
     fn join(&self, a: Span, b: Span) -> Span {
-        Span { file: self.file, start: a.start, end: b.end }
+        Span {
+            file: self.file,
+            start: a.start,
+            end: b.end,
+        }
     }
 
     fn wrap<T>(&mut self, span: Span, kind: T) -> Node<T> {
-        Node { id: self.ids.next(), span, kind }
+        Node {
+            id: self.ids.next(),
+            span,
+            kind,
+        }
     }
 
     // ---------------------------------------------------------------- program / items
@@ -73,7 +88,9 @@ impl Lowerer {
                 let variant = inner.into_inner().next().unwrap();
                 match variant.as_rule() {
                     Rule::algebra_impl => ItemKind::Impl(self.lower_algebra_impl(variant)),
-                    Rule::inherent_impl => ItemKind::InherentImpl(self.lower_inherent_impl(variant)),
+                    Rule::inherent_impl => {
+                        ItemKind::InherentImpl(self.lower_inherent_impl(variant))
+                    }
                     r => unreachable!("impl_decl: unexpected rule {r:?}"),
                 }
             }
@@ -108,21 +125,34 @@ impl Lowerer {
         let extern_symbol = if is_extern {
             // `extern_kw`'s own optional `(symbol)` -- an `ident` pair
             // inside it if present, nothing if it's a bare `extern`.
-            inner.next().unwrap().into_inner().next().map(|p| p.as_str().to_string())
+            inner
+                .next()
+                .unwrap()
+                .into_inner()
+                .next()
+                .map(|p| p.as_str().to_string())
         } else {
             None
         };
 
         let is_export = matches!(inner.peek().map(|p| p.as_rule()), Some(Rule::export_kw));
         let export_symbol = if is_export {
-            inner.next().unwrap().into_inner().next().map(|p| p.as_str().to_string())
+            inner
+                .next()
+                .unwrap()
+                .into_inner()
+                .next()
+                .map(|p| p.as_str().to_string())
         } else {
             None
         };
 
         let name = inner.next().unwrap().as_str().to_string();
 
-        let generics = if matches!(inner.peek().map(|p| p.as_rule()), Some(Rule::generic_params)) {
+        let generics = if matches!(
+            inner.peek().map(|p| p.as_rule()),
+            Some(Rule::generic_params)
+        ) {
             self.lower_generic_params(inner.next().unwrap())
         } else {
             Vec::new()
@@ -144,7 +174,19 @@ impl Lowerer {
         // pair of its own, so `None` here is exactly "no `block` pair was
         // left to consume", not a parse failure.
         let body = inner.next().map(|p| self.lower_block(p));
-        FnDecl { name, attrs, is_extern, extern_symbol, is_export, export_symbol, generics, params, ret, body, derivative_of: None }
+        FnDecl {
+            name,
+            attrs,
+            is_extern,
+            extern_symbol,
+            is_export,
+            export_symbol,
+            generics,
+            params,
+            ret,
+            body,
+            derivative_of: None,
+        }
     }
 
     /// `fprime = derive(f);` (`grammar.pest`'s own `derive_decl`) — lowers
@@ -185,7 +227,9 @@ impl Lowerer {
     }
 
     fn lower_generic_params(&mut self, pair: Pair<Rule>) -> Vec<GenericParam> {
-        pair.into_inner().map(|p| self.lower_generic_param(p)).collect()
+        pair.into_inner()
+            .map(|p| self.lower_generic_param(p))
+            .collect()
     }
 
     fn lower_generic_param(&mut self, pair: Pair<Rule>) -> GenericParam {
@@ -215,9 +259,17 @@ impl Lowerer {
             2 => {
                 let name = inner[0].as_str().to_string();
                 let bounds = self.lower_bound_list(inner[1].clone());
-                GenericParam::Type { name, bounds, variadic }
+                GenericParam::Type {
+                    name,
+                    bounds,
+                    variadic,
+                }
             }
-            1 => GenericParam::Type { name: inner[0].as_str().to_string(), bounds: Vec::new(), variadic },
+            1 => GenericParam::Type {
+                name: inner[0].as_str().to_string(),
+                bounds: Vec::new(),
+                variadic,
+            },
             n => unreachable!("generic_param: unexpected arity {n}"),
         }
     }
@@ -242,7 +294,11 @@ impl Lowerer {
                 _ => {}
             }
         }
-        Param { name: name.unwrap(), ty, mutable }
+        Param {
+            name: name.unwrap(),
+            ty,
+            mutable,
+        }
     }
 
     // ---------------------------------------------------------------- struct
@@ -250,7 +306,10 @@ impl Lowerer {
     fn lower_struct_decl(&mut self, pair: Pair<Rule>) -> StructDecl {
         let mut inner = pair.into_inner().peekable();
         let name = inner.next().unwrap().as_str().to_string();
-        let generics = if matches!(inner.peek().map(|p| p.as_rule()), Some(Rule::generic_params)) {
+        let generics = if matches!(
+            inner.peek().map(|p| p.as_rule()),
+            Some(Rule::generic_params)
+        ) {
             self.lower_generic_params(inner.next().unwrap())
         } else {
             Vec::new()
@@ -259,7 +318,11 @@ impl Lowerer {
             Some(p) => self.lower_field_list(p),
             None => Vec::new(),
         };
-        StructDecl { name, generics, fields }
+        StructDecl {
+            name,
+            generics,
+            fields,
+        }
     }
 
     fn lower_field_list(&mut self, pair: Pair<Rule>) -> Vec<Field> {
@@ -278,7 +341,10 @@ impl Lowerer {
     fn lower_algebra_decl(&mut self, pair: Pair<Rule>) -> AlgebraDecl {
         let mut inner = pair.into_inner().peekable();
         let name = inner.next().unwrap().as_str().to_string();
-        let generics = if matches!(inner.peek().map(|p| p.as_rule()), Some(Rule::generic_params)) {
+        let generics = if matches!(
+            inner.peek().map(|p| p.as_rule()),
+            Some(Rule::generic_params)
+        ) {
             self.lower_generic_params(inner.next().unwrap())
         } else {
             Vec::new()
@@ -289,7 +355,12 @@ impl Lowerer {
             Vec::new()
         };
         let items = inner.map(|p| self.lower_algebra_item(p)).collect();
-        AlgebraDecl { name, generics, bounds, items }
+        AlgebraDecl {
+            name,
+            generics,
+            bounds,
+            items,
+        }
     }
 
     fn lower_algebra_item(&mut self, pair: Pair<Rule>) -> AlgebraItem {
@@ -298,7 +369,9 @@ impl Lowerer {
         let kind = match inner.as_rule() {
             Rule::fn_sig => AlgebraItemKind::FnSig(self.lower_fn_sig(inner)),
             Rule::axiom_decl => AlgebraItemKind::Axiom(self.lower_axiom_decl(inner)),
-            Rule::derivative_rule_decl => AlgebraItemKind::DerivativeRule(self.lower_derivative_rule_decl(inner)),
+            Rule::derivative_rule_decl => {
+                AlgebraItemKind::DerivativeRule(self.lower_derivative_rule_decl(inner))
+            }
             r => unreachable!("algebra_item: unexpected rule {r:?}"),
         };
         self.wrap(span, kind)
@@ -337,7 +410,11 @@ impl Lowerer {
             Vec::new()
         };
         let body = self.lower_expr(inner.next().unwrap());
-        DerivativeRuleDecl { method, params, body }
+        DerivativeRuleDecl {
+            method,
+            params,
+            body,
+        }
     }
 
     // ---------------------------------------------------------------- impl
@@ -350,7 +427,10 @@ impl Lowerer {
             attrs.push(self.lower_attribute(inner.next().unwrap()));
         }
 
-        let generics = if matches!(inner.peek().map(|p| p.as_rule()), Some(Rule::generic_params)) {
+        let generics = if matches!(
+            inner.peek().map(|p| p.as_rule()),
+            Some(Rule::generic_params)
+        ) {
             self.lower_generic_params(inner.next().unwrap())
         } else {
             Vec::new()
@@ -368,13 +448,23 @@ impl Lowerer {
             extra_targets.push(self.lower_type(inner.next().unwrap()));
         }
         let fns = inner.map(|p| self.lower_fn_decl(p)).collect();
-        ImplDecl { attrs, algebra, generics, target, extra_targets, fns }
+        ImplDecl {
+            attrs,
+            algebra,
+            generics,
+            target,
+            extra_targets,
+            fns,
+        }
     }
 
     fn lower_inherent_impl(&mut self, pair: Pair<Rule>) -> InherentImplDecl {
         let mut inner = pair.into_inner().peekable();
 
-        let generics = if matches!(inner.peek().map(|p| p.as_rule()), Some(Rule::generic_params)) {
+        let generics = if matches!(
+            inner.peek().map(|p| p.as_rule()),
+            Some(Rule::generic_params)
+        ) {
             self.lower_generic_params(inner.next().unwrap())
         } else {
             Vec::new()
@@ -382,7 +472,11 @@ impl Lowerer {
 
         let target = self.lower_type(inner.next().unwrap());
         let fns = inner.map(|p| self.lower_fn_decl(p)).collect();
-        InherentImplDecl { generics, target, fns }
+        InherentImplDecl {
+            generics,
+            target,
+            fns,
+        }
     }
 
     // ---------------------------------------------------------------- types
@@ -417,7 +511,11 @@ impl Lowerer {
     fn lower_fn_type(&mut self, pair: Pair<Rule>) -> Type {
         let span = self.span_of(&pair);
         let mut types: Vec<Type> = pair.into_inner().map(|p| self.lower_type(p)).collect();
-        let ret = Box::new(types.pop().expect("fn_type always has at least a return type"));
+        let ret = Box::new(
+            types
+                .pop()
+                .expect("fn_type always has at least a return type"),
+        );
         self.wrap(span, TypeKind::Fn(types, ret))
     }
 
@@ -469,7 +567,10 @@ impl Lowerer {
         let expr = self.lower_expr(inner.next().unwrap());
         if matches!(inner.next().map(|p| p.as_rule()), Some(Rule::pack_marker)) {
             let ExprKind::Path(path) = &expr.kind else {
-                panic!("array_dim: a pack marker's own preceding expr must be a bare path, got {:?}", expr.kind);
+                panic!(
+                    "array_dim: a pack marker's own preceding expr must be a bare path, got {:?}",
+                    expr.kind
+                );
             };
             self.wrap(span, ExprKind::PackRef(path.segments.join("::")))
         } else {
@@ -525,7 +626,12 @@ impl Lowerer {
                 _ => {}
             }
         }
-        StmtKind::Let { mutable, name: name.unwrap(), ty, value: value.unwrap() }
+        StmtKind::Let {
+            mutable,
+            name: name.unwrap(),
+            ty,
+            value: value.unwrap(),
+        }
     }
 
     fn lower_assign_stmt(&mut self, pair: Pair<Rule>) -> StmtKind {
@@ -544,7 +650,12 @@ impl Lowerer {
         let mut inner = pair.into_inner();
         let ident = inner.next().unwrap();
         let ident_span = self.span_of(&ident);
-        let mut acc = self.wrap(ident_span, ExprKind::Path(Path { segments: vec![ident.as_str().to_string()] }));
+        let mut acc = self.wrap(
+            ident_span,
+            ExprKind::Path(Path {
+                segments: vec![ident.as_str().to_string()],
+            }),
+        );
         for suffix in inner {
             acc = self.lower_postfix_op(acc, suffix);
         }
@@ -620,7 +731,10 @@ impl Lowerer {
             let rhs = lower_operand(self, rhs_pair);
             let name = op_name(op_pair.as_str());
             let span = self.join(acc.span, rhs.span);
-            acc = self.wrap(span, ExprKind::Call(Path::single(name), Vec::new(), vec![acc, rhs], Vec::new()));
+            acc = self.wrap(
+                span,
+                ExprKind::Call(Path::single(name), Vec::new(), vec![acc, rhs], Vec::new()),
+            );
         }
         acc
     }
@@ -637,7 +751,15 @@ impl Lowerer {
                     op => unreachable!("unary_op: unexpected operator {op:?}"),
                 };
                 let operand = self.lower_unary(inner.next().unwrap());
-                self.wrap(span, ExprKind::Call(Path::single(call_name), Vec::new(), vec![operand], Vec::new()))
+                self.wrap(
+                    span,
+                    ExprKind::Call(
+                        Path::single(call_name),
+                        Vec::new(),
+                        vec![operand],
+                        Vec::new(),
+                    ),
+                )
             }
             Rule::postfix => self.lower_postfix(first),
             r => unreachable!("unary: unexpected rule {r:?}"),
@@ -675,8 +797,11 @@ impl Lowerer {
                         // a reserved `mlir::...` *call*, never a method call —
                         // silently dropped here, same as `MethodCall` itself
                         // never getting a `mlir::`-recognizing path segment.
-                        let (args, _mlir_attrs) =
-                            call_args.into_inner().next().map(|al| self.lower_arg_list(al)).unwrap_or_default();
+                        let (args, _mlir_attrs) = call_args
+                            .into_inner()
+                            .next()
+                            .map(|al| self.lower_arg_list(al))
+                            .unwrap_or_default();
                         // `.to()` — sugar for `convert(x)`, exactly the same
                         // shape `fold_binary` already uses to desugar `a + b`
                         // to `add(a, b)` — not a new `MethodCall`-dispatch
@@ -692,7 +817,15 @@ impl Lowerer {
                         // signature takes exactly one argument, the receiver
                         // itself.
                         if name == "to" && args.is_empty() {
-                            self.wrap(span, ExprKind::Call(Path::single("convert"), Vec::new(), vec![base], Vec::new()))
+                            self.wrap(
+                                span,
+                                ExprKind::Call(
+                                    Path::single("convert"),
+                                    Vec::new(),
+                                    vec![base],
+                                    Vec::new(),
+                                ),
+                            )
                         } else {
                             self.wrap(span, ExprKind::MethodCall(Box::new(base), name, args))
                         }
@@ -712,7 +845,9 @@ impl Lowerer {
                 // separate single-index steps has nothing sensible to
                 // dispatch the first step to (see `ast.rs`'s own `Index`
                 // doc comment).
-                let indices: Vec<Expr> = std::iter::once(self.lower_expr(first)).chain(inner.map(|p| self.lower_expr(p))).collect();
+                let indices: Vec<Expr> = std::iter::once(self.lower_expr(first))
+                    .chain(inner.map(|p| self.lower_expr(p)))
+                    .collect();
                 self.wrap(span, ExprKind::Index(Box::new(base), indices))
             }
             // A direct call on whatever `base` is (`(fn(a,b){a+b})(1,2)`) --
@@ -733,12 +868,33 @@ impl Lowerer {
             // id.0` (globally unique) makes the synthetic name collision-
             // free, and `<`/`#`/`>` can never appear in a real `ident`.
             Rule::call_args => {
-                let (args, mlir_attrs) = first.into_inner().next().map(|al| self.lower_arg_list(al)).unwrap_or_default();
+                let (args, mlir_attrs) = first
+                    .into_inner()
+                    .next()
+                    .map(|al| self.lower_arg_list(al))
+                    .unwrap_or_default();
                 let base_span = base.span;
                 let synthetic = format!("<iife#{}>", base.id.0);
-                let let_stmt = self.wrap(base_span, StmtKind::Let { mutable: false, name: synthetic.clone(), ty: None, value: base });
-                let call = self.wrap(span, ExprKind::Call(Path::single(synthetic), Vec::new(), args, mlir_attrs));
-                self.wrap(span, ExprKind::Block(Block { stmts: vec![let_stmt], tail: Some(Box::new(call)) }))
+                let let_stmt = self.wrap(
+                    base_span,
+                    StmtKind::Let {
+                        mutable: false,
+                        name: synthetic.clone(),
+                        ty: None,
+                        value: base,
+                    },
+                );
+                let call = self.wrap(
+                    span,
+                    ExprKind::Call(Path::single(synthetic), Vec::new(), args, mlir_attrs),
+                );
+                self.wrap(
+                    span,
+                    ExprKind::Block(Block {
+                        stmts: vec![let_stmt],
+                        tail: Some(Box::new(call)),
+                    }),
+                )
             }
             r => unreachable!("postfix_op: unexpected rule {r:?}"),
         }
@@ -823,7 +979,10 @@ impl Lowerer {
         let mut inner = pair.into_inner().peekable();
         let path = self.lower_path(inner.next().unwrap());
         let generics = self.lower_optional_turbofish(&mut inner);
-        let (args, mlir_attrs) = inner.next().map(|p| self.lower_arg_list(p)).unwrap_or_default();
+        let (args, mlir_attrs) = inner
+            .next()
+            .map(|p| self.lower_arg_list(p))
+            .unwrap_or_default();
         self.wrap(span, ExprKind::Call(path, generics, args, mlir_attrs))
     }
 
@@ -832,7 +991,10 @@ impl Lowerer {
         let mut inner = pair.into_inner().peekable();
         let path = self.lower_path(inner.next().unwrap());
         let generics = self.lower_optional_turbofish(&mut inner);
-        let fields = inner.next().map(|p| self.lower_field_init_list(p)).unwrap_or_default();
+        let fields = inner
+            .next()
+            .map(|p| self.lower_field_init_list(p))
+            .unwrap_or_default();
         self.wrap(span, ExprKind::StructLit(path, generics, fields))
     }
 
@@ -845,16 +1007,31 @@ impl Lowerer {
         let span = self.span_of(&pair);
         let elems: Vec<Expr> = pair.into_inner().map(|p| self.lower_expr(p)).collect();
         let name = tuple_struct_name(elems.len());
-        let fields = elems.into_iter().enumerate().map(|(i, e)| (i.to_string(), e)).collect();
-        self.wrap(span, ExprKind::StructLit(Path::single(name), Vec::new(), fields))
+        let fields = elems
+            .into_iter()
+            .enumerate()
+            .map(|(i, e)| (i.to_string(), e))
+            .collect();
+        self.wrap(
+            span,
+            ExprKind::StructLit(Path::single(name), Vec::new(), fields),
+        )
     }
 
     /// Consumes a leading `Rule::turbofish` pair off `inner` if present,
     /// returning its generic arguments — shared by `lower_call_expr`/
     /// `lower_struct_lit`, the two constructs that can carry one.
-    fn lower_optional_turbofish(&mut self, inner: &mut std::iter::Peekable<Pairs<Rule>>) -> Vec<GenericArg> {
+    fn lower_optional_turbofish(
+        &mut self,
+        inner: &mut std::iter::Peekable<Pairs<Rule>>,
+    ) -> Vec<GenericArg> {
         if matches!(inner.peek().map(|p| p.as_rule()), Some(Rule::turbofish)) {
-            inner.next().unwrap().into_inner().map(|p| self.lower_generic_arg(p)).collect()
+            inner
+                .next()
+                .unwrap()
+                .into_inner()
+                .map(|p| self.lower_generic_arg(p))
+                .collect()
         } else {
             Vec::new()
         }
@@ -883,7 +1060,14 @@ impl Lowerer {
                 r => unreachable!("if_expr else: unexpected rule {r:?}"),
             })
         });
-        self.wrap(span, ExprKind::If { cond, then_branch, else_branch })
+        self.wrap(
+            span,
+            ExprKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            },
+        )
     }
 
     fn lower_while_expr(&mut self, pair: Pair<Rule>) -> Expr {
@@ -915,10 +1099,25 @@ impl Lowerer {
         if next.as_rule() == Rule::additive {
             let end = Box::new(self.lower_additive(next));
             let body = self.lower_block(inner.next().unwrap());
-            self.wrap(span, ExprKind::For { var, start: Box::new(first), end, body })
+            self.wrap(
+                span,
+                ExprKind::For {
+                    var,
+                    start: Box::new(first),
+                    end,
+                    body,
+                },
+            )
         } else {
             let body = self.lower_block(next);
-            self.wrap(span, ExprKind::ForIn { var, iter: Box::new(first), body })
+            self.wrap(
+                span,
+                ExprKind::ForIn {
+                    var,
+                    iter: Box::new(first),
+                    body,
+                },
+            )
         }
     }
 
@@ -962,8 +1161,12 @@ impl Lowerer {
                     Rule::ident => {
                         let count_span = self.span_of(&count);
                         let value = Box::new(self.lower_expr(value));
-                        let count =
-                            Box::new(self.wrap(count_span, ExprKind::Path(Path { segments: vec![count.as_str().to_string()] })));
+                        let count = Box::new(self.wrap(
+                            count_span,
+                            ExprKind::Path(Path {
+                                segments: vec![count.as_str().to_string()],
+                            }),
+                        ));
                         self.wrap(span, ExprKind::ArrayRepeat { value, count })
                     }
                     // `[value; Dims...]` — a whole *pack* reference, not one
@@ -982,14 +1185,18 @@ impl Lowerer {
                         let count = Box::new(self.wrap(count_span, ExprKind::PackRef(name)));
                         self.wrap(span, ExprKind::ArrayRepeat { value, count })
                     }
-                    r => unreachable!("array_repeat's own count must be numeric_lit, pack_ref, or ident, got {r:?}"),
+                    r => unreachable!(
+                        "array_repeat's own count must be numeric_lit, pack_ref, or ident, got {r:?}"
+                    ),
                 }
             }
             Rule::array_list => {
                 let elems = body.into_inner().map(|p| self.lower_expr(p)).collect();
                 self.wrap(span, ExprKind::ArrayLit(elems))
             }
-            other => unreachable!("array_lit's own body must be array_repeat or array_list, got {other:?}"),
+            other => unreachable!(
+                "array_lit's own body must be array_repeat or array_list, got {other:?}"
+            ),
         }
     }
 
@@ -1016,7 +1223,18 @@ impl Lowerer {
         let span = self.span_of(&pair);
         let text = pair.as_str();
         let content = &text[1..text.len() - 1]; // strip the surrounding quotes
-        let elems = content.bytes().map(|b| self.wrap(span, ExprKind::NumberLit { text: b.to_string(), suffix: Some("i8".to_string()) })).collect();
+        let elems = content
+            .bytes()
+            .map(|b| {
+                self.wrap(
+                    span,
+                    ExprKind::NumberLit {
+                        text: b.to_string(),
+                        suffix: Some("i8".to_string()),
+                    },
+                )
+            })
+            .collect();
         self.wrap(span, ExprKind::ArrayLit(elems))
     }
 
@@ -1033,14 +1251,26 @@ impl Lowerer {
     fn lower_numeric_lit(&mut self, pair: Pair<Rule>) -> Expr {
         let span = self.span_of(&pair);
         let (text, suffix) = split_type_suffix(pair.as_str());
-        self.wrap(span, ExprKind::NumberLit { text: text.to_string(), suffix })
+        self.wrap(
+            span,
+            ExprKind::NumberLit {
+                text: text.to_string(),
+                suffix,
+            },
+        )
     }
 
     fn lower_imaginary_lit(&mut self, pair: Pair<Rule>) -> Expr {
         let span = self.span_of(&pair);
         let text = pair.as_str();
         let number_part = &text[..text.len() - 1]; // strip trailing "i"
-        self.wrap(span, ExprKind::ImaginaryLit { text: number_part.to_string(), suffix: None })
+        self.wrap(
+            span,
+            ExprKind::ImaginaryLit {
+                text: number_part.to_string(),
+                suffix: None,
+            },
+        )
     }
 }
 

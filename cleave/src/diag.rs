@@ -21,7 +21,11 @@ pub struct Diagnostic {
 
 impl Diagnostic {
     pub fn error(message: impl Into<String>, span: Span) -> Self {
-        Diagnostic { severity: Severity::Error, message: message.into(), span: Some(span) }
+        Diagnostic {
+            severity: Severity::Error,
+            message: message.into(),
+            span: Some(span),
+        }
     }
 
     /// Converts a pest parse error, whose own byte offset (`err.location`)
@@ -33,7 +37,14 @@ impl Diagnostic {
             pest::error::InputLocation::Pos(p) => p,
             pest::error::InputLocation::Span((s, _)) => s,
         };
-        Diagnostic::error(err.variant.message().into_owned(), Span { file, start: offset, end: offset })
+        Diagnostic::error(
+            err.variant.message().into_owned(),
+            Span {
+                file,
+                start: offset,
+                end: offset,
+            },
+        )
     }
 }
 

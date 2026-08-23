@@ -19,7 +19,8 @@ fn find_call<'a>(program: &'a Program, fn_name: &str, callee: &str) -> &'a Expr 
             _ => None,
         })
         .unwrap_or_else(|| panic!("no fn named `{fn_name}` in program"));
-    find_call_in_block(f.body.as_ref().unwrap(), callee).unwrap_or_else(|| panic!("no call to `{callee}` found inside `{fn_name}`"))
+    find_call_in_block(f.body.as_ref().unwrap(), callee)
+        .unwrap_or_else(|| panic!("no call to `{callee}` found inside `{fn_name}`"))
 }
 
 fn find_call_in_block<'a>(block: &'a Block, callee: &str) -> Option<&'a Expr> {
@@ -34,7 +35,10 @@ fn find_call_in_block<'a>(block: &'a Block, callee: &str) -> Option<&'a Expr> {
             return Some(found);
         }
     }
-    block.tail.as_deref().and_then(|t| find_call_in_expr(t, callee))
+    block
+        .tail
+        .as_deref()
+        .and_then(|t| find_call_in_expr(t, callee))
 }
 
 fn find_call_in_expr<'a>(expr: &'a Expr, callee: &str) -> Option<&'a Expr> {
@@ -49,12 +53,18 @@ fn find_call_in_expr<'a>(expr: &'a Expr, callee: &str) -> Option<&'a Expr> {
         }
     }
     match &expr.kind {
-        ExprKind::If { cond, then_branch, else_branch } => find_call_in_expr(cond, callee)
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => find_call_in_expr(cond, callee)
             .or_else(|| find_call_in_block(then_branch, callee))
-            .or_else(|| else_branch.as_deref().and_then(|eb| match eb {
-                cleave::ast::ElseBranch::If(e) => find_call_in_expr(e, callee),
-                cleave::ast::ElseBranch::Block(b) => find_call_in_block(b, callee),
-            })),
+            .or_else(|| {
+                else_branch.as_deref().and_then(|eb| match eb {
+                    cleave::ast::ElseBranch::If(e) => find_call_in_expr(e, callee),
+                    cleave::ast::ElseBranch::Block(b) => find_call_in_block(b, callee),
+                })
+            }),
         _ => None,
     }
 }
@@ -94,9 +104,15 @@ fn builtin_registry() -> Registry {
 fn assert_fully_concrete(ty: &Ty) {
     fn walk(ty: &Ty, path: &str) {
         match ty {
-            Ty::Var(v) => panic!("found a leftover Ty::Var({v:?}) at {path} in supposedly-monomorphized type {ty}"),
-            Ty::Pack(v) => panic!("found a leftover Ty::Pack({v:?}) at {path} in supposedly-monomorphized type {ty}"),
-            Ty::PackLen(v) => panic!("found a leftover Ty::PackLen({v:?}) at {path} in supposedly-monomorphized type {ty}"),
+            Ty::Var(v) => panic!(
+                "found a leftover Ty::Var({v:?}) at {path} in supposedly-monomorphized type {ty}"
+            ),
+            Ty::Pack(v) => panic!(
+                "found a leftover Ty::Pack({v:?}) at {path} in supposedly-monomorphized type {ty}"
+            ),
+            Ty::PackLen(v) => panic!(
+                "found a leftover Ty::PackLen({v:?}) at {path} in supposedly-monomorphized type {ty}"
+            ),
             Ty::PackResolved(elems) => elems.iter().for_each(|e| walk(e, path)),
             Ty::Con(_) | Ty::Const(_) => {}
             Ty::App(_, args) => args.iter().for_each(|a| walk(a, path)),
@@ -128,7 +144,10 @@ fn a_generic_function_called_at_two_types_produces_two_specializations() {
     let (mono, _) = monomorphize(&program, &registry);
     let mut keys = mono.specializations_of("identity").to_vec();
     keys.sort();
-    assert_eq!(keys, vec!["identity<f64>".to_string(), "identity<i32>".to_string()]);
+    assert_eq!(
+        keys,
+        vec!["identity<f64>".to_string(), "identity<i32>".to_string()]
+    );
 
     for key in &keys {
         for t in mono.node_types(key).values() {
@@ -164,8 +183,14 @@ fn two_mutually_recursive_generic_functions_each_get_exactly_one_specialization(
         fn main() -> bool { is_even(4) }",
     );
     let (mono, _) = monomorphize(&program, &registry);
-    assert_eq!(mono.specializations_of("is_even"), &["is_even<i32>".to_string()]);
-    assert_eq!(mono.specializations_of("is_odd"), &["is_odd<i32>".to_string()]);
+    assert_eq!(
+        mono.specializations_of("is_even"),
+        &["is_even<i32>".to_string()]
+    );
+    assert_eq!(
+        mono.specializations_of("is_odd"),
+        &["is_odd<i32>".to_string()]
+    );
     assert_eq!(mono.result("is_even<i32>"), &Ty::Con("bool".to_string()));
     assert_eq!(mono.result("is_odd<i32>"), &Ty::Con("bool".to_string()));
 }
@@ -179,10 +204,16 @@ fn a_generic_function_calling_another_generic_function_transitively_instantiates
         fn use_it() -> i32 { wrapper(1) }",
     );
     let (mono, _) = monomorphize(&program, &registry);
-    assert_eq!(mono.specializations_of("wrapper"), &["wrapper<i32>".to_string()]);
+    assert_eq!(
+        mono.specializations_of("wrapper"),
+        &["wrapper<i32>".to_string()]
+    );
     // Discovered transitively (from inside `wrapper<i32>`'s own body), not
     // directly from any concrete entry point calling `identity` itself.
-    assert_eq!(mono.specializations_of("identity"), &["identity<i32>".to_string()]);
+    assert_eq!(
+        mono.specializations_of("identity"),
+        &["identity<i32>".to_string()]
+    );
 }
 
 #[test]
@@ -194,7 +225,10 @@ fn calling_the_same_instantiation_from_two_call_sites_does_not_duplicate_it() {
         fn b() -> i32 { identity(2) }",
     );
     let (mono, _) = monomorphize(&program, &registry);
-    assert_eq!(mono.specializations_of("identity"), &["identity<i32>".to_string()]);
+    assert_eq!(
+        mono.specializations_of("identity"),
+        &["identity<i32>".to_string()]
+    );
 }
 
 #[test]
@@ -239,11 +273,20 @@ fn a_self_recursive_generic_functions_own_call_names_do_not_leak_across_instanti
     let (mono, _) = monomorphize(&program, &registry);
     let mut keys = mono.specializations_of("fibonacci").to_vec();
     keys.sort();
-    assert_eq!(keys, vec!["fibonacci<i32>".to_string(), "fibonacci<i64>".to_string()]);
+    assert_eq!(
+        keys,
+        vec!["fibonacci<i32>".to_string(), "fibonacci<i64>".to_string()]
+    );
 
     let call = find_call(&program, "fibonacci", "fibonacci");
-    assert_eq!(mono.call_names("fibonacci<i32>").get(&call.id), Some(&"fibonacci<i32>".to_string()));
-    assert_eq!(mono.call_names("fibonacci<i64>").get(&call.id), Some(&"fibonacci<i64>".to_string()));
+    assert_eq!(
+        mono.call_names("fibonacci<i32>").get(&call.id),
+        Some(&"fibonacci<i32>".to_string())
+    );
+    assert_eq!(
+        mono.call_names("fibonacci<i64>").get(&call.id),
+        Some(&"fibonacci<i64>".to_string())
+    );
 }
 
 #[test]
@@ -255,7 +298,10 @@ fn a_seed_functions_own_call_to_a_generic_callee_resolves_to_the_right_specializ
     );
     let (mono, _) = monomorphize(&program, &registry);
     let call = find_call(&program, "main", "identity");
-    assert_eq!(mono.seed_call_names().get(&call.id), Some(&"identity<i32>".to_string()));
+    assert_eq!(
+        mono.seed_call_names().get(&call.id),
+        Some(&"identity<i32>".to_string())
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -283,7 +329,11 @@ fn an_unannotated_generic_params_own_field_access_resolves_via_the_duck_typed_fa
     let registry = registry_from(src);
     let program = lower_program(src);
     let (mono, _) = monomorphize(&program, &registry);
-    assert!(mono.errors().is_empty(), "expected no errors, got {:?}", mono.errors());
+    assert!(
+        mono.errors().is_empty(),
+        "expected no errors, got {:?}",
+        mono.errors()
+    );
     let keys = mono.specializations_of("get_x");
     assert_eq!(keys, &["get_x<Point>".to_string()]);
     assert_eq!(mono.result(&keys[0]), &Ty::Con("i32".to_string()));
@@ -308,8 +358,16 @@ fn a_duck_typed_fallback_specialization_that_genuinely_fails_reports_the_real_in
     let registry = registry_from(src);
     let program = lower_program(src);
     let (mono, _) = monomorphize(&program, &registry);
-    assert!(mono.specializations_of("get_x").is_empty(), "a genuinely failing instantiation must not produce a specialization");
-    assert_eq!(mono.errors().len(), 1, "expected exactly one error, got {:?}", mono.errors());
+    assert!(
+        mono.specializations_of("get_x").is_empty(),
+        "a genuinely failing instantiation must not produce a specialization"
+    );
+    assert_eq!(
+        mono.errors().len(),
+        1,
+        "expected exactly one error, got {:?}",
+        mono.errors()
+    );
     match &mono.errors()[0].kind {
         TypeErrorKind::GenericFnInstantiationFailed { name, tys, inner } => {
             assert_eq!(name, "get_x");
@@ -353,10 +411,20 @@ fn a_generic_algebra_impl_method_is_specialized_at_a_concrete_call_site() {
     let program = lower_program(src);
     let (mono, _) = monomorphize(&program, &registry);
     let keys = mono.specializations_of("MatMul::mul");
-    assert_eq!(keys, &["MatMul::mul<Matrix<f32, 2, 2>, Matrix<f32, 2, 2>, Matrix<f32, 2, 2>>".to_string()]);
+    assert_eq!(
+        keys,
+        &["MatMul::mul<Matrix<f32, 2, 2>, Matrix<f32, 2, 2>, Matrix<f32, 2, 2>>".to_string()]
+    );
     assert_eq!(
         mono.result(&keys[0]),
-        &Ty::App("Matrix".to_string(), vec![Ty::Con("f32".to_string()), Ty::Const(ConstValue::Int(2)), Ty::Const(ConstValue::Int(2))])
+        &Ty::App(
+            "Matrix".to_string(),
+            vec![
+                Ty::Con("f32".to_string()),
+                Ty::Const(ConstValue::Int(2)),
+                Ty::Const(ConstValue::Int(2))
+            ]
+        )
     );
 
     // The call site itself must show the mangled name too, not the bare
@@ -366,7 +434,8 @@ fn a_generic_algebra_impl_method_is_specialized_at_a_concrete_call_site() {
 }
 
 #[test]
-fn a_stub_bodys_declaration_time_type_error_is_a_real_unification_conflict_for_a_rectangular_instantiation() {
+fn a_stub_bodys_declaration_time_type_error_is_a_real_unification_conflict_for_a_rectangular_instantiation()
+ {
     // Not a monomorphization bug -- a real, pre-existing consequence of the
     // stub body `fn mul(a, b) { a }` (used throughout this project's own
     // examples/tests, standing in for a real matmul implementation): its
@@ -392,7 +461,10 @@ fn a_stub_bodys_declaration_time_type_error_is_a_real_unification_conflict_for_a
     let registry = registry_from(src);
     let program = lower_program(src);
     let (mono, _) = monomorphize(&program, &registry);
-    assert!(mono.specializations_of("MatMul::mul").is_empty(), "the M=K-merged template cannot satisfy a rectangular call");
+    assert!(
+        mono.specializations_of("MatMul::mul").is_empty(),
+        "the M=K-merged template cannot satisfy a rectangular call"
+    );
 }
 
 #[test]
@@ -440,7 +512,11 @@ fn a_bodyless_concrete_impl_still_dispatches_correctly_from_inside_a_generic_sib
     let registry = registry_from(src);
     let program = lower_program(src);
     let (mono, _) = monomorphize(&program, &registry);
-    assert!(mono.errors().is_empty(), "expected no monomorphization errors, got {:?}", mono.errors());
+    assert!(
+        mono.errors().is_empty(),
+        "expected no monomorphization errors, got {:?}",
+        mono.errors()
+    );
     let keys = mono.specializations_of("Ring::add");
     assert_eq!(keys, &["Ring::add<Complex<f32>>".to_string()]);
 }
@@ -481,9 +557,16 @@ fn a_multi_target_algebras_own_concrete_impl_dispatches_correctly_from_inside_a_
     let registry = registry_from(src);
     let program = lower_program(src);
     let (mono, _) = monomorphize(&program, &registry);
-    assert!(mono.errors().is_empty(), "expected no monomorphization errors, got {:?}", mono.errors());
+    assert!(
+        mono.errors().is_empty(),
+        "expected no monomorphization errors, got {:?}",
+        mono.errors()
+    );
     let keys = mono.specializations_of("MatMul::mul");
-    assert_eq!(keys, &["MatMul::mul<Matrix<f32, 2, 2>, Matrix<f32, 2, 2>, Matrix<f32, 2, 2>>".to_string()]);
+    assert_eq!(
+        keys,
+        &["MatMul::mul<Matrix<f32, 2, 2>, Matrix<f32, 2, 2>, Matrix<f32, 2, 2>>".to_string()]
+    );
 }
 
 #[test]
@@ -510,10 +593,17 @@ fn an_explicit_turbofish_resolves_a_const_generic_that_only_appears_combined_wit
     let registry = registry_from(src);
     let program = lower_program(src);
     let (mono, _) = monomorphize(&program, &registry);
-    assert!(mono.errors().is_empty(), "expected no monomorphization errors, got {:?}", mono.errors());
+    assert!(
+        mono.errors().is_empty(),
+        "expected no monomorphization errors, got {:?}",
+        mono.errors()
+    );
     let mut keys = mono.specializations_of("combined").to_vec();
     keys.sort();
-    assert_eq!(keys, vec!["combined<1, 2>".to_string(), "combined<3, 4>".to_string()]);
+    assert_eq!(
+        keys,
+        vec!["combined<1, 2>".to_string(), "combined<3, 4>".to_string()]
+    );
 
     // Each specialization's own array-size const resolved independently and
     // correctly -- not collapsed together, not swapped, not left symbolic.
@@ -524,10 +614,16 @@ fn an_explicit_turbofish_resolves_a_const_generic_that_only_appears_combined_wit
     }
     assert_eq!(
         mono.param_types("combined<3, 4>"),
-        &[Ty::Array(Box::new(Ty::Con("i32".to_string())), Box::new(Ty::Const(ConstValue::Int(7))))]
+        &[Ty::Array(
+            Box::new(Ty::Con("i32".to_string())),
+            Box::new(Ty::Const(ConstValue::Int(7)))
+        )]
     );
     assert_eq!(
         mono.param_types("combined<1, 2>"),
-        &[Ty::Array(Box::new(Ty::Con("i32".to_string())), Box::new(Ty::Const(ConstValue::Int(3))))]
+        &[Ty::Array(
+            Box::new(Ty::Con("i32".to_string())),
+            Box::new(Ty::Const(ConstValue::Int(3)))
+        )]
     );
 }

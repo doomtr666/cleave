@@ -34,21 +34,28 @@
 //! further — see `lower_cexpr`'s own `CExpr::Fix` arm.
 
 use crate::ast::Type as AstType;
-use crate::ast::{tuple_struct_name, Expr, ExprKind, GenericArg, TypeKind};
+use crate::ast::{Expr, ExprKind, GenericArg, TypeKind, tuple_struct_name};
 use crate::cps::{CExpr, CFunDef, CTopLevelFn, CVal, CVar, CpsProgram, PrimOp, StructSchema};
 use crate::infer::{ConstValue, Ty};
 use melior::{
     Context,
     dialect::{
-        arith, func, memref, scf,
+        arith, func,
         llvm::{self, LoadStoreOptions},
+        memref, scf,
     },
     ir::{
-        Attribute, Block, Identifier, Location, Module, Operation, Region, RegionLike, Type, TypeLike, Value, ValueLike,
-        attribute::{DenseI32ArrayAttribute, FlatSymbolRefAttribute, FloatAttribute, IntegerAttribute, StringAttribute, TypeAttribute},
+        Attribute, Block, Identifier, Location, Module, Operation, Region, RegionLike, Type,
+        TypeLike, Value, ValueLike,
+        attribute::{
+            DenseI32ArrayAttribute, FlatSymbolRefAttribute, FloatAttribute, IntegerAttribute,
+            StringAttribute, TypeAttribute,
+        },
         block::BlockLike,
         operation::OperationBuilder,
-        r#type::{DimSize, FunctionType, IntegerType, MemRefType, RankedTensorType, ShapedTypeLike},
+        r#type::{
+            DimSize, FunctionType, IntegerType, MemRefType, RankedTensorType, ShapedTypeLike,
+        },
     },
 };
 use std::cell::RefCell;
@@ -96,8 +103,16 @@ pub fn lower_program<'c>(
 ) -> Module<'c> {
     let location = Location::unknown(context);
     let module = Module::new(location);
-    let signatures =
-        program.funcs.iter().map(|f| (f.def.name.clone(), (f.param_types.clone(), f.result.clone()))).collect();
+    let signatures = program
+        .funcs
+        .iter()
+        .map(|f| {
+            (
+                f.def.name.clone(),
+                (f.param_types.clone(), f.result.clone()),
+            )
+        })
+        .collect();
     {
         // Scoped so `ctx`'s own borrow of `module` ends before `module` is
         // moved out below.
@@ -155,7 +170,11 @@ fn ty_to_mlir<'c>(ctx: &LowerCtx<'c, '_>, ty: &Ty) -> Type<'c> {
         // read one, since a struct's own array-typed *field* already hands
         // back exactly this shape).
         Ty::Array(..) => {
-            if array_leaf_is_struct(ctx, ty) { llvm::r#type::pointer(ctx.context, 0) } else { array_memref_type(ctx, ty).into() }
+            if array_leaf_is_struct(ctx, ty) {
+                llvm::r#type::pointer(ctx.context, 0)
+            } else {
+                array_memref_type(ctx, ty).into()
+            }
         }
         // A bare, resolved const-generic value reaching an ordinary type
         // position — e.g. a turbofish-pinned `const N: i32`'s own call-site
@@ -192,13 +211,21 @@ fn ty_to_mlir<'c>(ctx: &LowerCtx<'c, '_>, ty: &Ty) -> Type<'c> {
         // Named specifically when recognized, rather than the generic
         // message below, so this doesn't read as "the invariant broke" when
         // it's actually a real, if unlocated, division by zero.
-        Ty::ConstExpr(op, _, b) if op == "div" && matches!(b.as_ref(), Ty::Const(ConstValue::Int(0))) => {
-            panic!("MLIR lowering: division by zero in a const-generic expression (`{ty}`), only detected this late because it happens inside a still-generic declaration at one specific instantiation — no source location available here; `doc/backlog.md`'s own note on this")
+        Ty::ConstExpr(op, _, b)
+            if op == "div" && matches!(b.as_ref(), Ty::Const(ConstValue::Int(0))) =>
+        {
+            panic!(
+                "MLIR lowering: division by zero in a const-generic expression (`{ty}`), only detected this late because it happens inside a still-generic declaration at one specific instantiation — no source location available here; `doc/backlog.md`'s own note on this"
+            )
         }
         Ty::ConstExpr(..) => {
-            panic!("MLIR lowering: unresolved deferred const expression `{ty}` reached codegen — should have been folded by `substitute` during monomorphization")
+            panic!(
+                "MLIR lowering: unresolved deferred const expression `{ty}` reached codegen — should have been folded by `substitute` during monomorphization"
+            )
         }
-        _ => panic!("MLIR lowering doesn't support type `{ty}` yet (only primitive Ty::Con widths, arrays, and structs so far)"),
+        _ => panic!(
+            "MLIR lowering doesn't support type `{ty}` yet (only primitive Ty::Con widths, arrays, and structs so far)"
+        ),
     }
 }
 
@@ -208,7 +235,8 @@ fn ty_to_mlir<'c>(ctx: &LowerCtx<'c, '_>, ty: &Ty) -> Type<'c> {
 /// instead of the array itself.
 fn array_leaf_is_struct(ctx: &LowerCtx, ty: &Ty) -> bool {
     let (_, leaf_ty) = flatten_array_dims(ty);
-    matches!(leaf_ty, Ty::Con(name) if name != "bool" && !ctx.mlir_types.contains_key(name)) || matches!(leaf_ty, Ty::App(..))
+    matches!(leaf_ty, Ty::Con(name) if name != "bool" && !ctx.mlir_types.contains_key(name))
+        || matches!(leaf_ty, Ty::App(..))
 }
 
 /// Flattens a nested `Ty::Array(elem, size)` chain — cleave's own multi-dim
@@ -240,6 +268,20 @@ fn flatten_array_dims(ty: &Ty) -> (Vec<i64>, &Ty) {
 
 fn is_array_ty(ty: &Ty) -> bool {
     matches!(ty, Ty::Array(..))
+}
+
+/// Whether `ty` is a `#[mlir_type(tensor)]`/`#[mlir_type(vector)]`-tagged
+/// struct (`native_shape_keyword`'s own doc comment) — `None` for anything
+/// else, including a plain scalar. Checks the shape first (`struct_name_
+/// and_args` panics on a non-struct-shaped `Ty`), unlike every other
+/// caller of `native_shape_keyword`, which already knows its own `ty` is
+/// struct-shaped going in — this one doesn't (a struct *field*'s own type
+/// can be anything).
+fn native_shape_field_keyword<'a>(ctx: &'a LowerCtx<'_, '_>, ty: &Ty) -> Option<&'a str> {
+    match ty {
+        Ty::Con(name) | Ty::App(name, _) => native_shape_keyword(ctx, name),
+        _ => None,
+    }
 }
 
 /// `#[mlir_type(...)]`'s own generalization beyond a bare primitive: the
@@ -275,9 +317,10 @@ fn native_shape_keyword<'a>(ctx: &'a LowerCtx<'_, '_>, name: &str) -> Option<&'a
 /// know they're anything special at all.
 fn tagged_struct_native_type<'c>(ctx: &LowerCtx<'c, '_>, ty: &Ty) -> Type<'c> {
     let (name, type_args) = struct_name_and_args(ty);
-    let keyword = native_shape_keyword(ctx, name)
-        .unwrap_or_else(|| panic!("MLIR lowering: `{name}` has no recognized #[mlir_type(...)] shape keyword"));
-    let fields = struct_field_types(ctx, name, type_args);
+    let keyword = native_shape_keyword(ctx, name).unwrap_or_else(|| {
+        panic!("MLIR lowering: `{name}` has no recognized #[mlir_type(...)] shape keyword")
+    });
+    let fields = struct_field_types(&ctx.struct_schemas, name, type_args);
     let [(_, field_ty)] = fields.as_slice() else {
         panic!(
             "MLIR lowering: `#[mlir_type({keyword})]` requires exactly one field, `{name}` has {}",
@@ -285,7 +328,9 @@ fn tagged_struct_native_type<'c>(ctx: &LowerCtx<'c, '_>, ty: &Ty) -> Type<'c> {
         );
     };
     if !matches!(field_ty, Ty::Array(..)) {
-        panic!("MLIR lowering: `#[mlir_type({keyword})]`'s sole field must be an array, `{name}`'s own field is `{field_ty}`");
+        panic!(
+            "MLIR lowering: `#[mlir_type({keyword})]`'s sole field must be an array, `{name}`'s own field is `{field_ty}`"
+        );
     }
     let (dims, leaf_ty) = flatten_array_dims(field_ty);
     let leaf = ty_to_mlir(ctx, leaf_ty);
@@ -328,17 +373,45 @@ fn is_unit_ty(ty: &Ty) -> bool {
 /// types, recovering it from an already-lowered MLIR `Value` alone isn't
 /// possible.
 fn struct_llvm_type<'c>(ctx: &LowerCtx<'c, '_>, name: &str, type_args: &[Ty]) -> Type<'c> {
-    let fields = struct_field_types(ctx, name, type_args);
-    let field_mlir: Vec<Type> = fields.iter().map(|(_, t)| ty_to_llvm_field_type(ctx, t)).collect();
+    let fields = struct_field_types(&ctx.struct_schemas, name, type_args);
+    let field_mlir: Vec<Type> = fields
+        .iter()
+        .map(|(_, t)| ty_to_llvm_field_type(ctx, t))
+        .collect();
     llvm::r#type::r#struct(ctx.context, &field_mlir, false)
 }
 
 /// A cleave type as it appears *embedded inside* an `!llvm.struct` field —
-/// identical to `ty_to_mlir` for every scalar/struct case (a nested struct
-/// field is, like everything else struct-typed, an opaque `!llvm.ptr`), but
-/// an array becomes an *inline* (possibly nested) `!llvm.array<N x T>`
-/// rather than a `memref` — see `struct_llvm_type`'s own doc comment for why.
+/// identical to `ty_to_mlir` for every ordinary scalar/struct case (a
+/// nested struct field is, like everything else struct-typed, an opaque
+/// `!llvm.ptr`), but an array becomes an *inline* (possibly nested)
+/// `!llvm.array<N x T>` rather than a `memref` — see `struct_llvm_type`'s
+/// own doc comment for why.
+///
+/// A `#[mlir_type(tensor)]`/`#[mlir_type(vector)]`-tagged field (`Tensor`/
+/// `Vector`/`Matrix`) gets the *identical* inline-array treatment, keyed off
+/// its own sole (array-typed) field's own shape — `ty_to_mlir` alone would
+/// give the *raw* native MLIR type (`tensor<1x2xf32>`, right for a bare
+/// function parameter/local, where MLIR natively handles such a value) and
+/// that's never a sized LLVM type an `!llvm.struct` field can actually hold
+/// — found directly: `'llvm.store' op operand #0 must be LLVM type with
+/// size, but got 'tensor<1x2xf32>'`, the moment an ordinary struct (`Dense`/
+/// `Network`, `doc/backlog.md`'s own "gradient w.r.t. a struct parameter"
+/// item) first tried to wrap a real `Tensor` field. `store_native_shape_
+/// field`/`load_native_shape_field` are this representation's own
+/// write/read halves.
 fn ty_to_llvm_field_type<'c>(ctx: &LowerCtx<'c, '_>, ty: &Ty) -> Type<'c> {
+    if let Some(keyword) = native_shape_field_keyword(ctx, ty) {
+        let (name, type_args) = struct_name_and_args(ty);
+        let fields = struct_field_types(&ctx.struct_schemas, name, type_args);
+        let [(_, inner_ty)] = fields.as_slice() else {
+            panic!(
+                "MLIR lowering: `#[mlir_type({keyword})]` requires exactly one field, `{name}` has {}",
+                fields.len()
+            );
+        };
+        return ty_to_llvm_field_type(ctx, inner_ty);
+    }
     match ty {
         Ty::Array(..) => {
             let (dims, leaf_ty) = flatten_array_dims(ty);
@@ -358,8 +431,19 @@ fn ty_to_llvm_field_type<'c>(ctx: &LowerCtx<'c, '_>, ty: &Ty) -> Type<'c> {
 /// construction (`llvm.insertvalue`) and field access (`llvm.extractvalue`)
 /// need, since neither op's own `position` attribute means anything without
 /// a canonical, whole-program-consistent field order.
-fn struct_field_types(ctx: &LowerCtx<'_, '_>, name: &str, type_args: &[Ty]) -> Vec<(String, Ty)> {
-    let Some(schema) = ctx.struct_schemas.get(name) else {
+///
+/// Takes `struct_schemas` directly (not `ctx: &LowerCtx`, the only thing it
+/// ever read off `ctx`) and is `pub` — `egraph.rs::synthesize_derivatives`
+/// reuses this exact function to resolve a struct-typed `derive()` parameter
+/// (or one of its own fields) down to its real field shape when building the
+/// leaf-enumeration/reassembly machinery for a struct-shaped gradient, the
+/// identical need this already served for MLIR lowering.
+pub fn struct_field_types(
+    struct_schemas: &HashMap<String, StructSchema>,
+    name: &str,
+    type_args: &[Ty],
+) -> Vec<(String, Ty)> {
+    let Some(schema) = struct_schemas.get(name) else {
         panic!("MLIR lowering: no struct declaration found for `{name}`");
     };
     // A pack-generic struct (`doc/backlog.md`'s own "Variadic generics"
@@ -373,17 +457,43 @@ fn struct_field_types(ctx: &LowerCtx<'_, '_>, name: &str, type_args: &[Ty]) -> V
     // built).
     if schema.has_pack {
         let non_pack = &schema.generics[..schema.generics.len() - 1];
-        let pack_name = schema.generics.last().expect("has_pack implies at least one generic");
-        let mapping: HashMap<String, Ty> = non_pack.iter().cloned().zip(type_args.iter().cloned()).collect();
+        let pack_name = schema
+            .generics
+            .last()
+            .expect("has_pack implies at least one generic");
+        let mapping: HashMap<String, Ty> = non_pack
+            .iter()
+            .cloned()
+            .zip(type_args.iter().cloned())
+            .collect();
         let pack_tys = &type_args[non_pack.len().min(type_args.len())..];
         schema
             .fields
             .iter()
-            .map(|(field_name, field_ast_ty)| (field_name.clone(), resolve_struct_field_ty_with_pack(field_ast_ty, &mapping, pack_name, pack_tys)))
+            .map(|(field_name, field_ast_ty)| {
+                (
+                    field_name.clone(),
+                    resolve_struct_field_ty_with_pack(field_ast_ty, &mapping, pack_name, pack_tys),
+                )
+            })
             .collect()
     } else {
-        let mapping: HashMap<String, Ty> = schema.generics.iter().cloned().zip(type_args.iter().cloned()).collect();
-        schema.fields.iter().map(|(field_name, field_ast_ty)| (field_name.clone(), resolve_struct_field_ty(field_ast_ty, &mapping))).collect()
+        let mapping: HashMap<String, Ty> = schema
+            .generics
+            .iter()
+            .cloned()
+            .zip(type_args.iter().cloned())
+            .collect();
+        schema
+            .fields
+            .iter()
+            .map(|(field_name, field_ast_ty)| {
+                (
+                    field_name.clone(),
+                    resolve_struct_field_ty(field_ast_ty, &mapping),
+                )
+            })
+            .collect()
     }
 }
 
@@ -394,15 +504,27 @@ fn struct_field_types(ctx: &LowerCtx<'_, '_>, name: &str, type_args: &[Ty]) -> V
 /// expands to nested `Ty::Array` levels) or a whole field type (`Args...`,
 /// becomes the tuple formed from `pack_tys`). Shallow, deliberately, same
 /// reasoning as its `infer.rs` counterpart's own doc comment.
-fn resolve_struct_field_ty_with_pack(ty: &AstType, mapping: &HashMap<String, Ty>, pack_name: &str, pack_tys: &[Ty]) -> Ty {
+fn resolve_struct_field_ty_with_pack(
+    ty: &AstType,
+    mapping: &HashMap<String, Ty>,
+    pack_name: &str,
+    pack_tys: &[Ty],
+) -> Ty {
     match &ty.kind {
-        TypeKind::Array(elem, size) if matches!(&size.kind, ExprKind::PackRef(n) if n == pack_name) => {
+        TypeKind::Array(elem, size) if matches!(&size.kind, ExprKind::PackRef(n) if n == pack_name) =>
+        {
             let elem_ty = resolve_struct_field_ty(elem, mapping);
-            pack_tys.iter().rev().fold(elem_ty, |acc, dim| Ty::Array(Box::new(acc), Box::new(dim.clone())))
+            pack_tys.iter().rev().fold(elem_ty, |acc, dim| {
+                Ty::Array(Box::new(acc), Box::new(dim.clone()))
+            })
         }
         TypeKind::PackRef(name) if name == pack_name => {
             let tuple_name = tuple_struct_name(pack_tys.len());
-            if pack_tys.is_empty() { Ty::Con(tuple_name) } else { Ty::App(tuple_name, pack_tys.to_vec()) }
+            if pack_tys.is_empty() {
+                Ty::Con(tuple_name)
+            } else {
+                Ty::App(tuple_name, pack_tys.to_vec())
+            }
         }
         _ => resolve_struct_field_ty(ty, mapping),
     }
@@ -437,15 +559,20 @@ fn resolve_struct_field_ty(ty: &AstType, mapping: &HashMap<String, Ty>) -> Ty {
                 Ty::App(name, type_args)
             }
         }
-        TypeKind::Array(elem, size) => {
-            Ty::Array(Box::new(resolve_struct_field_ty(elem, mapping)), Box::new(resolve_struct_field_const(size, mapping)))
+        TypeKind::Array(elem, size) => Ty::Array(
+            Box::new(resolve_struct_field_ty(elem, mapping)),
+            Box::new(resolve_struct_field_const(size, mapping)),
+        ),
+        TypeKind::Fn(..) => {
+            panic!("MLIR lowering doesn't support a function-typed struct field yet")
         }
-        TypeKind::Fn(..) => panic!("MLIR lowering doesn't support a function-typed struct field yet"),
         // `doc/backlog.md`'s own "Variadic generics" item -- grammar/AST
         // exist (Milestone 1), nothing resolves a pack to a concrete list
         // yet, so a struct field can never legitimately still be one by the
         // time a fully type-checked program reaches MLIR lowering.
-        TypeKind::PackRef(name) => panic!("MLIR lowering: unresolved pack reference `{name}...` reached a struct field's own type -- variadic generics aren't semantically supported yet"),
+        TypeKind::PackRef(name) => panic!(
+            "MLIR lowering: unresolved pack reference `{name}...` reached a struct field's own type -- variadic generics aren't semantically supported yet"
+        ),
     }
 }
 
@@ -457,13 +584,21 @@ fn resolve_struct_field_ty(ty: &AstType, mapping: &HashMap<String, Ty>) -> Ty {
 fn resolve_struct_field_const(expr: &Expr, mapping: &HashMap<String, Ty>) -> Ty {
     match &expr.kind {
         ExprKind::NumberLit { text, .. } => {
-            Ty::Const(ConstValue::Int(text.parse().unwrap_or_else(|_| panic!("MLIR lowering: invalid array-size literal `{text}`"))))
+            Ty::Const(ConstValue::Int(text.parse().unwrap_or_else(|_| {
+                panic!("MLIR lowering: invalid array-size literal `{text}`")
+            })))
         }
-        ExprKind::Path(p) if p.segments.len() == 1 => mapping
-            .get(&p.segments[0])
-            .cloned()
-            .unwrap_or_else(|| panic!("MLIR lowering: unresolved const-generic `{}` in a struct field's array size", p.segments[0])),
-        other => panic!("MLIR lowering doesn't support this struct field array-size expression yet: {other:?}"),
+        ExprKind::Path(p) if p.segments.len() == 1 => {
+            mapping.get(&p.segments[0]).cloned().unwrap_or_else(|| {
+                panic!(
+                    "MLIR lowering: unresolved const-generic `{}` in a struct field's array size",
+                    p.segments[0]
+                )
+            })
+        }
+        other => panic!(
+            "MLIR lowering doesn't support this struct field array-size expression yet: {other:?}"
+        ),
     }
 }
 
@@ -491,7 +626,8 @@ fn width_ty<'c>(ctx: &LowerCtx<'c, '_>, name: &str) -> Type<'c> {
     let Some(text) = ctx.mlir_types.get(name) else {
         panic!("MLIR lowering: no `#[mlir_type(...)]` declared for type `{name}`");
     };
-    Type::parse(ctx.context, text).unwrap_or_else(|| panic!("MLIR lowering: invalid MLIR type text `{text}` for `{name}`"))
+    Type::parse(ctx.context, text)
+        .unwrap_or_else(|| panic!("MLIR lowering: invalid MLIR type text `{text}` for `{name}`"))
 }
 
 /// A `()`-returning top-level `fn` (`main()`, no `->` clause at all — `main`
@@ -511,10 +647,19 @@ fn lower_top_level_fn<'c>(ctx: &LowerCtx<'c, '_>, f: &CTopLevelFn) -> Operation<
     let location = Location::unknown(context);
     let param_types: Vec<Type> = f.param_types.iter().map(|t| ty_to_mlir(ctx, t)).collect();
     let is_unit = is_unit_ty(&f.result);
-    let result_type: Type = if is_unit { IntegerType::new(context, 1).into() } else { ty_to_mlir(ctx, &f.result) };
+    let result_type: Type = if is_unit {
+        IntegerType::new(context, 1).into()
+    } else {
+        ty_to_mlir(ctx, &f.result)
+    };
     let results: Vec<Type> = if is_unit { vec![] } else { vec![result_type] };
 
-    let block = Block::new(&param_types.iter().map(|&t| (t, location)).collect::<Vec<_>>());
+    let block = Block::new(
+        &param_types
+            .iter()
+            .map(|&t| (t, location))
+            .collect::<Vec<_>>(),
+    );
 
     // `f.def.params` is `[ordinary params..., k_ret]` -- `f.param_types`
     // covers only the ordinary ones (see `CTopLevelFn`'s own doc comment),
@@ -553,7 +698,10 @@ fn lower_top_level_fn<'c>(ctx: &LowerCtx<'c, '_>, f: &CTopLevelFn) -> Operation<
     // for, matched by a `#[repr(C)]` type on the Rust side -- not attempted
     // here.
     let attrs: &[(melior::ir::Identifier, melior::ir::Attribute)] = if f.def.name == "main" {
-        &[(melior::ir::Identifier::new(context, "llvm.emit_c_interface"), melior::ir::Attribute::unit(context))]
+        &[(
+            melior::ir::Identifier::new(context, "llvm.emit_c_interface"),
+            melior::ir::Attribute::unit(context),
+        )]
     } else {
         &[]
     };
@@ -568,7 +716,11 @@ fn lower_top_level_fn<'c>(ctx: &LowerCtx<'c, '_>, f: &CTopLevelFn) -> Operation<
     // `export(other_symbol)`-renamed function internally -- not attempted
     // to fix here, would need the internal-call-name resolution itself
     // (`cps.rs`) to keep tracking the unrenamed name separately.
-    let symbol_name: &str = if f.is_export { f.export_symbol.as_deref().unwrap_or(&f.def.name) } else { &f.def.name };
+    let symbol_name: &str = if f.is_export {
+        f.export_symbol.as_deref().unwrap_or(&f.def.name)
+    } else {
+        &f.def.name
+    };
     func::func(
         context,
         StringAttribute::new(context, symbol_name),
@@ -623,7 +775,10 @@ fn lower_cexpr<'c>(
         // `CVal::Unit` is never lowered into a real MLIR value at all, it's
         // filtered out here instead of reaching `lower_cval` (which doesn't
         // support it).
-        CExpr::App { func: CVal::Var(v), args } if *v == k_ret => {
+        CExpr::App {
+            func: CVal::Var(v),
+            args,
+        } if *v == k_ret => {
             let location = Location::unknown(ctx.context);
             let values: Vec<Value> = args
                 .iter()
@@ -632,9 +787,15 @@ fn lower_cexpr<'c>(
                 .collect();
             block.append_operation(func::r#return(&values, location));
         }
-        CExpr::App { func: CVal::Label(name), args } if yield_targets.iter().any(|(n, _)| *n == name.as_str()) => {
+        CExpr::App {
+            func: CVal::Label(name),
+            args,
+        } if yield_targets.iter().any(|(n, _)| *n == name.as_str()) => {
             let location = Location::unknown(ctx.context);
-            let (_, types) = yield_targets.iter().find(|(n, _)| *n == name.as_str()).unwrap();
+            let (_, types) = yield_targets
+                .iter()
+                .find(|(n, _)| *n == name.as_str())
+                .unwrap();
             // `CVal::Unit` filtered out here, same as the `return` arm above
             // and for the same reason -- an `if`-join's own value position
             // is unit for a bodyless-`else`/statement-position `if`
@@ -648,7 +809,13 @@ fn lower_cexpr<'c>(
                 .collect();
             block.append_operation(scf::r#yield(&values, location));
         }
-        CExpr::LetPrim { var, ty, op, args, cont } => {
+        CExpr::LetPrim {
+            var,
+            ty,
+            op,
+            args,
+            cont,
+        } => {
             if let Some(value) = lower_prim_op(ctx, block, &env, op, args, ty) {
                 env.insert(*var, value);
             }
@@ -656,11 +823,28 @@ fn lower_cexpr<'c>(
         }
         CExpr::Fix { defs, body } => {
             let [def] = &defs[..] else {
-                panic!("MLIR lowering doesn't support a multi-def `Fix` yet -- see mlir_lower.rs's own module doc comment");
+                panic!(
+                    "MLIR lowering doesn't support a multi-def `Fix` yet -- see mlir_lower.rs's own module doc comment"
+                );
             };
             match &**body {
-                CExpr::If { cond, then_branch, else_branch } => {
-                    lower_if(ctx, block, env, k_ret, result_type, yield_targets, def, cond, then_branch, else_branch);
+                CExpr::If {
+                    cond,
+                    then_branch,
+                    else_branch,
+                } => {
+                    lower_if(
+                        ctx,
+                        block,
+                        env,
+                        k_ret,
+                        result_type,
+                        yield_targets,
+                        def,
+                        cond,
+                        then_branch,
+                        else_branch,
+                    );
                 }
                 // A loop's own *entry*: `def` (the loop's self-recursive
                 // continuation) called directly, with no trailing
@@ -668,13 +852,40 @@ fn lower_cexpr<'c>(
                 // call's own resumption `Fix` below, structurally, by
                 // *which* label `App` targets: itself (a loop) vs. some
                 // other real function (a call).
-                CExpr::App { func: CVal::Label(callee), args } if callee == &def.name => {
-                    lower_loop(ctx, block, env, k_ret, result_type, yield_targets, def, args);
+                CExpr::App {
+                    func: CVal::Label(callee),
+                    args,
+                } if callee == &def.name => {
+                    lower_loop(
+                        ctx,
+                        block,
+                        env,
+                        k_ret,
+                        result_type,
+                        yield_targets,
+                        def,
+                        args,
+                    );
                 }
-                CExpr::App { func: CVal::Label(callee), args } if matches!(args.last(), Some(CVal::Label(l)) if l == &def.name) => {
-                    lower_real_call(ctx, block, env, k_ret, result_type, yield_targets, def, callee, args);
+                CExpr::App {
+                    func: CVal::Label(callee),
+                    args,
+                } if matches!(args.last(), Some(CVal::Label(l)) if l == &def.name) => {
+                    lower_real_call(
+                        ctx,
+                        block,
+                        env,
+                        k_ret,
+                        result_type,
+                        yield_targets,
+                        def,
+                        callee,
+                        args,
+                    );
                 }
-                _ => panic!("MLIR lowering doesn't support this `Fix` shape yet -- see mlir_lower.rs's own module doc comment"),
+                _ => panic!(
+                    "MLIR lowering doesn't support this `Fix` shape yet -- see mlir_lower.rs's own module doc comment"
+                ),
             }
         }
         _ => panic!(
@@ -717,7 +928,9 @@ fn lower_if<'c>(
     else_branch: &CExpr,
 ) {
     let Some(join_cleave_types) = &join.carried_types else {
-        panic!("MLIR lowering: an `if`-join's own `CFunDef` must carry `carried_types` -- see mlir_lower.rs's own module doc comment");
+        panic!(
+            "MLIR lowering: an `if`-join's own `CFunDef` must carry `carried_types` -- see mlir_lower.rs's own module doc comment"
+        );
     };
     // A unit-typed position (most commonly `join.params[0]`, the `if`'s own
     // value, for a bodyless-`else`/statement-position `if`) carries no real
@@ -728,8 +941,13 @@ fn lower_if<'c>(
     // this instead of `join.params` directly, keeping every position
     // consistent with the *other* `CVal::Unit`-filtering already needed on
     // the `scf.yield` side (see that arm's own doc comment).
-    let live: Vec<usize> = (0..join_cleave_types.len()).filter(|&i| !is_unit_ty(&join_cleave_types[i])).collect();
-    let join_types: Vec<Type> = live.iter().map(|&i| ty_to_mlir(ctx, &join_cleave_types[i])).collect();
+    let live: Vec<usize> = (0..join_cleave_types.len())
+        .filter(|&i| !is_unit_ty(&join_cleave_types[i]))
+        .collect();
+    let join_types: Vec<Type> = live
+        .iter()
+        .map(|&i| ty_to_mlir(ctx, &join_cleave_types[i]))
+        .collect();
 
     let context = ctx.context;
     let location = Location::unknown(context);
@@ -745,16 +963,38 @@ fn lower_if<'c>(
     inner_targets.push((&join.name, &join_types));
 
     let then_block = Block::new(&[]);
-    lower_cexpr(ctx, &then_block, env.clone(), k_ret, result_type, &inner_targets, then_branch);
+    lower_cexpr(
+        ctx,
+        &then_block,
+        env.clone(),
+        k_ret,
+        result_type,
+        &inner_targets,
+        then_branch,
+    );
     let then_region = Region::new();
     then_region.append_block(then_block);
 
     let else_block = Block::new(&[]);
-    lower_cexpr(ctx, &else_block, env.clone(), k_ret, result_type, &inner_targets, else_branch);
+    lower_cexpr(
+        ctx,
+        &else_block,
+        env.clone(),
+        k_ret,
+        result_type,
+        &inner_targets,
+        else_branch,
+    );
     let else_region = Region::new();
     else_region.append_block(else_block);
 
-    let if_op = block.append_operation(scf::r#if(cond_value, &join_types, then_region, else_region, location));
+    let if_op = block.append_operation(scf::r#if(
+        cond_value,
+        &join_types,
+        then_region,
+        else_region,
+        location,
+    ));
 
     // Only `live` positions got a real `scf.if` result at all -- a unit
     // position's own `join.params` entry is left unbound, matching `PrimOp::
@@ -765,9 +1005,20 @@ fn lower_if<'c>(
     // edge case where something unexpectedly tries to.
     let mut env = env;
     for (result_idx, &param_idx) in live.iter().enumerate() {
-        env.insert(join.params[param_idx], if_op.result(result_idx).unwrap().into());
+        env.insert(
+            join.params[param_idx],
+            if_op.result(result_idx).unwrap().into(),
+        );
     }
-    lower_cexpr(ctx, block, env, k_ret, result_type, yield_targets, &join.body);
+    lower_cexpr(
+        ctx,
+        block,
+        env,
+        k_ret,
+        result_type,
+        yield_targets,
+        &join.body,
+    );
 }
 
 /// A `while`/`for` loop (CPS unifies both into the same shape — a self-
@@ -837,18 +1088,37 @@ fn lower_loop<'c>(
     let mut cursor: &CExpr = &loop_def.body;
     let (cond, then_branch, else_branch) = loop {
         match cursor {
-            CExpr::If { cond, then_branch, else_branch } => break (cond, then_branch, else_branch),
-            CExpr::Fix { defs: cond_defs, body: cond_body } => {
+            CExpr::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => break (cond, then_branch, else_branch),
+            CExpr::Fix {
+                defs: cond_defs,
+                body: cond_body,
+            } => {
                 let [cond_k] = &cond_defs[..] else {
                     panic!("MLIR lowering doesn't support a multi-def loop condition yet");
                 };
-                let CExpr::App { func: CVal::Label(cond_callee), args: cond_args } = &**cond_body else {
-                    panic!("MLIR lowering: a loop's own condition must be a real call -- see mlir_lower.rs's own module doc comment");
+                let CExpr::App {
+                    func: CVal::Label(cond_callee),
+                    args: cond_args,
+                } = &**cond_body
+                else {
+                    panic!(
+                        "MLIR lowering: a loop's own condition must be a real call -- see mlir_lower.rs's own module doc comment"
+                    );
                 };
                 let [cond_result_var] = cond_k.params[..] else {
-                    panic!("MLIR lowering: a loop's own condition call must have exactly one result");
+                    panic!(
+                        "MLIR lowering: a loop's own condition call must have exactly one result"
+                    );
                 };
-                cond_calls.push(CondCall { callee: cond_callee, args: cond_args, result_var: cond_result_var });
+                cond_calls.push(CondCall {
+                    callee: cond_callee,
+                    args: cond_args,
+                    result_var: cond_result_var,
+                });
                 cursor = &cond_k.body;
             }
             _ => panic!(
@@ -868,9 +1138,14 @@ fn lower_loop<'c>(
     // function's own result — found by direct testing (see `CFunDef::
     // carried_types`'s own doc comment for the exact failure this caused).
     let Some(carried_cleave_types) = &loop_def.carried_types else {
-        panic!("MLIR lowering: a loop's own `CFunDef` must carry `carried_types` -- see mlir_lower.rs's own module doc comment");
+        panic!(
+            "MLIR lowering: a loop's own `CFunDef` must carry `carried_types` -- see mlir_lower.rs's own module doc comment"
+        );
     };
-    let carried_types: Vec<Type> = carried_cleave_types.iter().map(|t| ty_to_mlir(ctx, t)).collect();
+    let carried_types: Vec<Type> = carried_cleave_types
+        .iter()
+        .map(|t| ty_to_mlir(ctx, t))
+        .collect();
     let init_values: Vec<Value> = initial_args
         .iter()
         .zip(&carried_types)
@@ -880,7 +1155,12 @@ fn lower_loop<'c>(
     // -- "before" region: receives the carried state, checks the
     // condition, and either continues (`scf.condition` true) into "after"
     // or exits the whole `scf.while` op (false) --
-    let before_block = Block::new(&carried_types.iter().map(|&t| (t, location)).collect::<Vec<_>>());
+    let before_block = Block::new(
+        &carried_types
+            .iter()
+            .map(|&t| (t, location))
+            .collect::<Vec<_>>(),
+    );
     // Starts from a *copy* of the outer `env`, not empty — a value bound
     // outside the loop (an enclosing function's own parameter, an outer
     // `let`, ...) still dominates this nested region's own blocks in MLIR,
@@ -904,7 +1184,10 @@ fn lower_loop<'c>(
     // `Ord::lt`'s second argument here referencing `hull.len()`'s).
     for cond_call in &cond_calls {
         let Some((cond_param_types, cond_result_ty)) = ctx.signatures.get(cond_call.callee) else {
-            panic!("MLIR lowering: call to unknown top-level fn `{}` in a loop condition", cond_call.callee);
+            panic!(
+                "MLIR lowering: call to unknown top-level fn `{}` in a loop condition",
+                cond_call.callee
+            );
         };
         let cond_result_mlir_ty = ty_to_mlir(ctx, cond_result_ty);
         // `args`' own last entry is the synthesized continuation label
@@ -941,7 +1224,12 @@ fn lower_loop<'c>(
 
     // -- "after" region: the loop's own real body, `then_branch`'s own
     // tail recursion to `loop_def.name` becoming `scf.yield` --
-    let after_block = Block::new(&carried_types.iter().map(|&t| (t, location)).collect::<Vec<_>>());
+    let after_block = Block::new(
+        &carried_types
+            .iter()
+            .map(|&t| (t, location))
+            .collect::<Vec<_>>(),
+    );
     // See `before_env`'s own doc comment above — same fix, same reason.
     let mut after_env: HashMap<CVar, Value> = env.clone();
     for (i, &p) in loop_def.params.iter().enumerate() {
@@ -953,11 +1241,25 @@ fn lower_loop<'c>(
     // comment for why this needs to be a stack, not a single replaced slot).
     let mut inner_targets: Vec<(&str, &[Type<'c>])> = yield_targets.to_vec();
     inner_targets.push((&loop_def.name, &carried_types));
-    lower_cexpr(ctx, &after_block, after_env, k_ret, result_type, &inner_targets, then_branch);
+    lower_cexpr(
+        ctx,
+        &after_block,
+        after_env,
+        k_ret,
+        result_type,
+        &inner_targets,
+        then_branch,
+    );
     let after_region = Region::new();
     after_region.append_block(after_block);
 
-    let while_op = block.append_operation(scf::r#while(&init_values, &carried_types, before_region, after_region, location));
+    let while_op = block.append_operation(scf::r#while(
+        &init_values,
+        &carried_types,
+        before_region,
+        after_region,
+        location,
+    ));
 
     // The `else` branch (loop exit) runs in the *outer* scope, ordinary
     // flow -- `loop_def`'s own params now bound to `scf.while`'s own
@@ -966,7 +1268,15 @@ fn lower_loop<'c>(
     for (i, &p) in loop_def.params.iter().enumerate() {
         env.insert(p, while_op.result(i).unwrap().into());
     }
-    lower_cexpr(ctx, block, env, k_ret, result_type, yield_targets, else_branch);
+    lower_cexpr(
+        ctx,
+        block,
+        env,
+        k_ret,
+        result_type,
+        yield_targets,
+        else_branch,
+    );
 }
 
 /// A real call to another top-level cleave `fn` (`emit_call`'s own
@@ -992,7 +1302,9 @@ fn lower_real_call<'c>(
     args: &[CVal],
 ) {
     let [result_var] = k.params[..] else {
-        panic!("MLIR lowering: a real call's own synthesized continuation must have exactly one parameter");
+        panic!(
+            "MLIR lowering: a real call's own synthesized continuation must have exactly one parameter"
+        );
     };
     let Some((param_types, result_ty)) = ctx.signatures.get(callee) else {
         panic!("MLIR lowering: call to unknown top-level fn `{callee}`");
@@ -1023,7 +1335,11 @@ fn lower_real_call<'c>(
     // never materialized (nothing in the language can do anything with one
     // besides discard it, so nothing downstream ever looks it up).
     let is_unit = is_unit_ty(result_ty);
-    let results: Vec<Type> = if is_unit { vec![] } else { vec![ty_to_mlir(ctx, result_ty)] };
+    let results: Vec<Type> = if is_unit {
+        vec![]
+    } else {
+        vec![ty_to_mlir(ctx, result_ty)]
+    };
     let call_op = block.append_operation(func::call(
         context,
         FlatSymbolRefAttribute::new(context, callee),
@@ -1058,7 +1374,10 @@ fn lower_prim_op<'c>(
     ty: &Ty,
 ) -> Option<Value<'c, 'c>> {
     match op {
-        PrimOp::Extern { symbol, param_types } => {
+        PrimOp::Extern {
+            symbol,
+            param_types,
+        } => {
             // A `Ty::Array`-typed *return* is a real ABI mismatch to
             // reconcile: the cleave-level call (e.g. `Print<[i8;N]>::
             // print(x) -> x`, an identity contract every other `Print<T>`
@@ -1128,7 +1447,15 @@ fn lower_prim_op<'c>(
                 Some(call_op.result(0).unwrap().into())
             }
         }
-        PrimOp::RawMlirOp { op, attrs } => Some(lower_raw_mlir_op(ctx, block, env, op, attrs, args, ty_to_mlir(ctx, ty))),
+        PrimOp::RawMlirOp { op, attrs } => Some(lower_raw_mlir_op(
+            ctx,
+            block,
+            env,
+            op,
+            attrs,
+            args,
+            ty_to_mlir(ctx, ty),
+        )),
         PrimOp::Array => Some(lower_array_construct(ctx, block, env, ty, args)),
         PrimOp::ArrayRepeat => Some(lower_array_repeat(ctx, block, env, ty, args)),
         PrimOp::Load { array_ty } => Some(lower_array_load(ctx, block, env, array_ty, args)),
@@ -1140,10 +1467,19 @@ fn lower_prim_op<'c>(
             if native_shape_keyword(ctx, name).is_some() {
                 Some(lower_tagged_struct_construct(ctx, block, env, ty, args))
             } else {
-                Some(lower_struct_construct(ctx, block, env, ty, field_names, args))
+                Some(lower_struct_construct(
+                    ctx,
+                    block,
+                    env,
+                    ty,
+                    field_names,
+                    args,
+                ))
             }
         }
-        PrimOp::Field { struct_ty, field } => Some(lower_field_access(ctx, block, env, struct_ty, field, args)),
+        PrimOp::Field { struct_ty, field } => {
+            Some(lower_field_access(ctx, block, env, struct_ty, field, args))
+        }
         PrimOp::FieldStore { struct_ty, field } => {
             lower_field_store(ctx, block, env, struct_ty, field, args);
             None
@@ -1196,11 +1532,21 @@ fn lower_array_construct<'c>(
         for (i, arg) in args.iter().enumerate() {
             let elem_val = lower_cval(ctx.context, block, env, arg, elem_ty);
             let dst_ptr = gep(ctx, block, ptr, &[0, i as i64], array_llvm_ty);
-            block.append_operation(llvm::store(ctx.context, elem_val, dst_ptr, location, LoadStoreOptions::new()));
+            block.append_operation(llvm::store(
+                ctx.context,
+                elem_val,
+                dst_ptr,
+                location,
+                LoadStoreOptions::new(),
+            ));
         }
         return ptr;
     }
-    let array_val = alloc_array(ctx, block, MemRefType::new(ty_to_mlir(ctx, leaf_ty), &dims, None, None));
+    let array_val = alloc_array(
+        ctx,
+        block,
+        MemRefType::new(ty_to_mlir(ctx, leaf_ty), &dims, None, None),
+    );
     if inner_dims.is_empty() {
         let elem_ty = ty_to_mlir(ctx, leaf_ty);
         let location = Location::unknown(ctx.context);
@@ -1248,11 +1594,21 @@ fn lower_array_repeat<'c>(
         let location = Location::unknown(ctx.context);
         for i in 0..outer_dim {
             let dst_ptr = gep(ctx, block, ptr, &[0, i], array_llvm_ty);
-            block.append_operation(llvm::store(ctx.context, elem_val, dst_ptr, location, LoadStoreOptions::new()));
+            block.append_operation(llvm::store(
+                ctx.context,
+                elem_val,
+                dst_ptr,
+                location,
+                LoadStoreOptions::new(),
+            ));
         }
         return ptr;
     }
-    let array_val = alloc_array(ctx, block, MemRefType::new(ty_to_mlir(ctx, leaf_ty), &dims, None, None));
+    let array_val = alloc_array(
+        ctx,
+        block,
+        MemRefType::new(ty_to_mlir(ctx, leaf_ty), &dims, None, None),
+    );
     if inner_dims.is_empty() {
         let elem_ty = ty_to_mlir(ctx, leaf_ty);
         let elem_val = lower_cval(ctx.context, block, env, value_arg, elem_ty);
@@ -1277,9 +1633,12 @@ fn lower_array_repeat<'c>(
 /// needs for a bare literal) never applies here.
 fn lower_nested_array_arg<'c>(env: &HashMap<CVar, Value<'c, 'c>>, arg: &CVal) -> Value<'c, 'c> {
     let CVal::Var(v) = arg else {
-        panic!("MLIR lowering: a nested array's own element must be an already-built array value, not a bare literal")
+        panic!(
+            "MLIR lowering: a nested array's own element must be an already-built array value, not a bare literal"
+        )
     };
-    *env.get(v).unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{v}"))
+    *env.get(v)
+        .unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{v}"))
 }
 
 /// `args = [array, index...]`, `array_ty` the array's own concrete cleave
@@ -1297,16 +1656,26 @@ fn lower_nested_array_arg<'c>(env: &HashMap<CVar, Value<'c, 'c>>, arg: &CVal) ->
 /// one combined `llvm.getelementptr` (leading `0` index to stay within this
 /// one array instance, matching `lower_struct_construct`'s own field-GEP
 /// convention) plus `llvm.load`.
-fn lower_array_load<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, env: &HashMap<CVar, Value<'c, 'c>>, array_ty: &Ty, args: &[CVal]) -> Value<'c, 'c> {
+fn lower_array_load<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    array_ty: &Ty,
+    args: &[CVal],
+) -> Value<'c, 'c> {
     let CVal::Var(array_var) = &args[0] else {
         panic!("MLIR lowering: `load`'s own array operand must be a variable");
     };
-    let array_val = *env.get(array_var).unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{array_var}"));
+    let array_val = *env
+        .get(array_var)
+        .unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{array_var}"));
     let i32_ty = width_ty(ctx, "i32");
     let location = Location::unknown(ctx.context);
     if array_val.r#type().is_mem_ref() {
-        let index_vals: Vec<Value> =
-            args[1..].iter().map(|a| to_index(ctx, block, lower_cval(ctx.context, block, env, a, i32_ty))).collect();
+        let index_vals: Vec<Value> = args[1..]
+            .iter()
+            .map(|a| to_index(ctx, block, lower_cval(ctx.context, block, env, a, i32_ty)))
+            .collect();
         let load_op = block.append_operation(memref::load(array_val, &index_vals, location));
         load_op.result(0).unwrap().into()
     } else if array_val.r#type().is_tensor() {
@@ -1316,8 +1685,10 @@ fn lower_array_load<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, env: &HashMap
         // extract` is the read-only, purely functional equivalent of
         // `memref.load` for this representation.
         let (_, leaf_ty) = flatten_array_dims(array_ty);
-        let index_vals: Vec<Value> =
-            args[1..].iter().map(|a| to_index(ctx, block, lower_cval(ctx.context, block, env, a, i32_ty))).collect();
+        let index_vals: Vec<Value> = args[1..]
+            .iter()
+            .map(|a| to_index(ctx, block, lower_cval(ctx.context, block, env, a, i32_ty)))
+            .collect();
         let result_ty = ty_to_mlir(ctx, leaf_ty);
         let built = OperationBuilder::new("tensor.extract", location)
             .add_operands(&[array_val])
@@ -1330,10 +1701,24 @@ fn lower_array_load<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, env: &HashMap
         let (_, leaf_ty) = flatten_array_dims(array_ty);
         let array_llvm_ty = ty_to_llvm_field_type(ctx, array_ty);
         let mut gep_indices = vec![const_i32(ctx, block, 0)];
-        gep_indices.extend(args[1..].iter().map(|a| lower_cval(ctx.context, block, env, a, i32_ty)));
+        gep_indices.extend(
+            args[1..]
+                .iter()
+                .map(|a| lower_cval(ctx.context, block, env, a, i32_ty)),
+        );
         let leaf_ptr = gep_dynamic(ctx, block, array_val, &gep_indices, array_llvm_ty);
         let result_ty = ty_to_mlir(ctx, leaf_ty);
-        block.append_operation(llvm::load(ctx.context, leaf_ptr, result_ty, location, LoadStoreOptions::new())).result(0).unwrap().into()
+        block
+            .append_operation(llvm::load(
+                ctx.context,
+                leaf_ptr,
+                result_ty,
+                location,
+                LoadStoreOptions::new(),
+            ))
+            .result(0)
+            .unwrap()
+            .into()
     }
 }
 
@@ -1345,11 +1730,19 @@ fn lower_array_load<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, env: &HashMap
 /// `array_ty`'s own flattened leaf for the pointer case) — not from `ty`, a
 /// `Store`'s own `LetPrim::ty` is always `()` (its bound result is unit and
 /// never read, see `lower_prim_op`'s own doc comment).
-fn lower_array_store<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, env: &HashMap<CVar, Value<'c, 'c>>, array_ty: &Ty, args: &[CVal]) {
+fn lower_array_store<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    array_ty: &Ty,
+    args: &[CVal],
+) {
     let CVal::Var(array_var) = &args[0] else {
         panic!("MLIR lowering: `store`'s own array operand must be a variable");
     };
-    let array_val = *env.get(array_var).unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{array_var}"));
+    let array_val = *env
+        .get(array_var)
+        .unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{array_var}"));
     let Some((value_arg, index_args)) = args[1..].split_last() else {
         panic!("MLIR lowering: `store` needs at least an index and a value");
     };
@@ -1362,13 +1755,17 @@ fn lower_array_store<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, env: &HashMa
         // rebinds the CPS variable this array came from to that new value
         // — out of scope for now, panics clearly rather than silently
         // discarding the write.
-        panic!("MLIR lowering: index-assignment into a `#[mlir_type(...)]`-tagged native value isn't supported yet");
+        panic!(
+            "MLIR lowering: index-assignment into a `#[mlir_type(...)]`-tagged native value isn't supported yet"
+        );
     } else if array_val.r#type().is_mem_ref() {
         let elem_ty = MemRefType::try_from(array_val.r#type())
             .unwrap_or_else(|_| panic!("MLIR lowering: `store`'s own array operand isn't a memref"))
             .element();
-        let index_vals: Vec<Value> =
-            index_args.iter().map(|a| to_index(ctx, block, lower_cval(ctx.context, block, env, a, i32_ty))).collect();
+        let index_vals: Vec<Value> = index_args
+            .iter()
+            .map(|a| to_index(ctx, block, lower_cval(ctx.context, block, env, a, i32_ty)))
+            .collect();
         let value_val = lower_cval(ctx.context, block, env, value_arg, elem_ty);
         block.append_operation(memref::store(value_val, array_val, &index_vals, location));
     } else {
@@ -1376,10 +1773,20 @@ fn lower_array_store<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, env: &HashMa
         let array_llvm_ty = ty_to_llvm_field_type(ctx, array_ty);
         let elem_mlir_ty = ty_to_mlir(ctx, leaf_ty);
         let mut gep_indices = vec![const_i32(ctx, block, 0)];
-        gep_indices.extend(index_args.iter().map(|a| lower_cval(ctx.context, block, env, a, i32_ty)));
+        gep_indices.extend(
+            index_args
+                .iter()
+                .map(|a| lower_cval(ctx.context, block, env, a, i32_ty)),
+        );
         let leaf_ptr = gep_dynamic(ctx, block, array_val, &gep_indices, array_llvm_ty);
         let value_val = lower_cval(ctx.context, block, env, value_arg, elem_mlir_ty);
-        block.append_operation(llvm::store(ctx.context, value_val, leaf_ptr, location, LoadStoreOptions::new()));
+        block.append_operation(llvm::store(
+            ctx.context,
+            value_val,
+            leaf_ptr,
+            location,
+            LoadStoreOptions::new(),
+        ));
     }
 }
 
@@ -1410,14 +1817,16 @@ fn lower_struct_construct<'c>(
     args: &[CVal],
 ) -> Value<'c, 'c> {
     let (name, type_args) = struct_name_and_args(ty);
-    let field_types = struct_field_types(ctx, name, type_args);
+    let field_types = struct_field_types(&ctx.struct_schemas, name, type_args);
     let struct_llvm_ty = struct_llvm_type(ctx, name, type_args);
     let ptr = alloc_llvm_value(ctx, block, struct_llvm_ty);
     for (field_name, arg) in field_names.iter().zip(args) {
         let position = field_types
             .iter()
             .position(|(n, _)| n == field_name)
-            .unwrap_or_else(|| panic!("MLIR lowering: struct `{name}` has no field `{field_name}`"));
+            .unwrap_or_else(|| {
+                panic!("MLIR lowering: struct `{name}` has no field `{field_name}`")
+            });
         let (_, field_ty) = &field_types[position];
         let field_ptr = gep(ctx, block, ptr, &[0, position as i64], struct_llvm_ty);
         store_field(ctx, block, env, field_ty, field_ptr, arg);
@@ -1452,14 +1861,21 @@ fn lower_tagged_struct_construct<'c>(
     args: &[CVal],
 ) -> Value<'c, 'c> {
     let (name, type_args) = struct_name_and_args(ty);
-    let keyword = native_shape_keyword(ctx, name)
-        .unwrap_or_else(|| panic!("MLIR lowering: `{name}` has no recognized #[mlir_type(...)] shape keyword"));
-    let fields = struct_field_types(ctx, name, type_args);
+    let keyword = native_shape_keyword(ctx, name).unwrap_or_else(|| {
+        panic!("MLIR lowering: `{name}` has no recognized #[mlir_type(...)] shape keyword")
+    });
+    let fields = struct_field_types(&ctx.struct_schemas, name, type_args);
     let [(_, field_ty)] = fields.as_slice() else {
-        panic!("MLIR lowering: `#[mlir_type({keyword})]` requires exactly one field, `{name}` has {}", fields.len());
+        panic!(
+            "MLIR lowering: `#[mlir_type({keyword})]` requires exactly one field, `{name}` has {}",
+            fields.len()
+        );
     };
     let [field_arg] = args else {
-        panic!("MLIR lowering: `{name}` construction expects exactly one argument (its own sole field), got {}", args.len());
+        panic!(
+            "MLIR lowering: `{name}` construction expects exactly one argument (its own sole field), got {}",
+            args.len()
+        );
     };
     let src = lower_nested_array_arg(env, field_arg);
     let (dims, _leaf_ty) = flatten_array_dims(field_ty);
@@ -1471,7 +1887,9 @@ fn lower_tagged_struct_construct<'c>(
         .add_operands(&elems)
         .add_results(&[native_ty])
         .build()
-        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build `{keyword}.from_elements`: {e}"));
+        .unwrap_or_else(|e| {
+            panic!("MLIR lowering: failed to build `{keyword}.from_elements`: {e}")
+        });
     block.append_operation(built).result(0).unwrap().into()
 }
 
@@ -1527,18 +1945,226 @@ fn store_field<'c>(
     field_ptr: Value<'c, 'c>,
     arg: &CVal,
 ) {
-    if is_array_ty(field_ty) {
+    if native_shape_field_keyword(ctx, field_ty).is_some() {
+        store_native_shape_field(ctx, block, env, field_ty, field_ptr, arg);
+    } else if is_array_ty(field_ty) {
         let src = lower_nested_array_arg(env, arg);
         let (dims, leaf_ty) = flatten_array_dims(field_ty);
         let field_llvm_ty = ty_to_llvm_field_type(ctx, field_ty);
         let elem_mlir_ty = ty_to_mlir(ctx, leaf_ty);
-        copy_array_into_llvm_field(ctx, block, src, &dims, field_ptr, field_llvm_ty, elem_mlir_ty);
+        copy_array_into_llvm_field(
+            ctx,
+            block,
+            src,
+            &dims,
+            field_ptr,
+            field_llvm_ty,
+            elem_mlir_ty,
+        );
     } else {
         let field_mlir_ty = ty_to_mlir(ctx, field_ty);
         let value = lower_cval(ctx.context, block, env, arg, field_mlir_ty);
         let location = Location::unknown(ctx.context);
-        block.append_operation(llvm::store(ctx.context, value, field_ptr, location, LoadStoreOptions::new()));
+        block.append_operation(llvm::store(
+            ctx.context,
+            value,
+            field_ptr,
+            location,
+            LoadStoreOptions::new(),
+        ));
     }
+}
+
+/// Stores a `Tensor`/`Vector`-typed field's own value (a real native SSA
+/// value, e.g. `tensor<1x2xf32>` — never an `!llvm.struct` allocation of
+/// its own, `lower_tagged_struct_construct`'s own doc comment) into its
+/// embedded, inline `!llvm.array` representation (`ty_to_llvm_field_type`'s
+/// own doc comment). One `tensor.extract` (constant indices, fully
+/// unrolled — every dimension is compile-time-known) + `llvm.store` pair
+/// per flat position, row-major — the write-side mirror of `load_native_
+/// shape_field` below.
+fn store_native_shape_field<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    field_ty: &Ty,
+    field_ptr: Value<'c, 'c>,
+    arg: &CVal,
+) {
+    let (name, type_args) = struct_name_and_args(field_ty);
+    let keyword = native_shape_keyword(ctx, name)
+        .expect("caller already confirmed this is native-shape-tagged");
+    let fields = struct_field_types(&ctx.struct_schemas, name, type_args);
+    let [(_, inner_ty)] = fields.as_slice() else {
+        panic!(
+            "MLIR lowering: `#[mlir_type({keyword})]` requires exactly one field, `{name}` has {}",
+            fields.len()
+        );
+    };
+    let (dims, leaf_ty) = flatten_array_dims(inner_ty);
+    let native_ty = ty_to_mlir(ctx, field_ty);
+    let value = lower_cval(ctx.context, block, env, arg, native_ty);
+    let field_llvm_ty = ty_to_llvm_field_type(ctx, field_ty);
+    let elem_mlir_ty = ty_to_mlir(ctx, leaf_ty);
+
+    #[allow(clippy::too_many_arguments)]
+    fn walk<'c>(
+        ctx: &LowerCtx<'c, '_>,
+        block: &Block<'c>,
+        value: Value<'c, 'c>,
+        remaining: &[i64],
+        idx_acc: &mut Vec<Value<'c, 'c>>,
+        gep_idx: &mut Vec<i64>,
+        field_ptr: Value<'c, 'c>,
+        field_llvm_ty: Type<'c>,
+        elem_mlir_ty: Type<'c>,
+    ) {
+        let location = Location::unknown(ctx.context);
+        let Some((&dim, rest)) = remaining.split_first() else {
+            let built = OperationBuilder::new("tensor.extract", location)
+                .add_operands(&[value])
+                .add_operands(idx_acc)
+                .add_results(&[elem_mlir_ty])
+                .build()
+                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build tensor.extract: {e}"));
+            let scalar: Value = block.append_operation(built).result(0).unwrap().into();
+            let dst_ptr = gep(ctx, block, field_ptr, gep_idx, field_llvm_ty);
+            block.append_operation(llvm::store(
+                ctx.context,
+                scalar,
+                dst_ptr,
+                location,
+                LoadStoreOptions::new(),
+            ));
+            return;
+        };
+        for i in 0..dim {
+            idx_acc.push(const_index(ctx, block, i));
+            gep_idx.push(i);
+            walk(
+                ctx,
+                block,
+                value,
+                rest,
+                idx_acc,
+                gep_idx,
+                field_ptr,
+                field_llvm_ty,
+                elem_mlir_ty,
+            );
+            idx_acc.pop();
+            gep_idx.pop();
+        }
+    }
+    // Leading `0`: stay within this one field instance (`gep`'s own doc
+    // comment), same convention `copy_array_into_llvm_field` already uses.
+    let mut gep_idx = vec![0i64];
+    walk(
+        ctx,
+        block,
+        value,
+        &dims,
+        &mut Vec::new(),
+        &mut gep_idx,
+        field_ptr,
+        field_llvm_ty,
+        elem_mlir_ty,
+    );
+}
+
+/// Reads a `Tensor`/`Vector`-typed field's own value back out of its
+/// embedded, inline `!llvm.array` representation — the read-side mirror of
+/// `store_native_shape_field`. One `llvm.getelementptr`+`llvm.load` pair
+/// per flat position (row-major), combined into one `{keyword}.from_
+/// elements` — the identical technique `lower_tagged_struct_construct`
+/// already uses to build a *fresh* native value from scratch, just sourced
+/// from a struct's own field storage here instead of a freshly-lowered
+/// standalone array argument.
+fn load_native_shape_field<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    field_ty: &Ty,
+    field_ptr: Value<'c, 'c>,
+) -> Value<'c, 'c> {
+    let (name, type_args) = struct_name_and_args(field_ty);
+    let keyword = native_shape_keyword(ctx, name)
+        .expect("caller already confirmed this is native-shape-tagged");
+    let fields = struct_field_types(&ctx.struct_schemas, name, type_args);
+    let [(_, inner_ty)] = fields.as_slice() else {
+        panic!(
+            "MLIR lowering: `#[mlir_type({keyword})]` requires exactly one field, `{name}` has {}",
+            fields.len()
+        );
+    };
+    let (dims, leaf_ty) = flatten_array_dims(inner_ty);
+    let field_llvm_ty = ty_to_llvm_field_type(ctx, field_ty);
+    let elem_mlir_ty = ty_to_mlir(ctx, leaf_ty);
+
+    fn walk<'c>(
+        ctx: &LowerCtx<'c, '_>,
+        block: &Block<'c>,
+        remaining: &[i64],
+        gep_idx: &mut Vec<i64>,
+        field_ptr: Value<'c, 'c>,
+        field_llvm_ty: Type<'c>,
+        elem_mlir_ty: Type<'c>,
+        out: &mut Vec<Value<'c, 'c>>,
+    ) {
+        let Some((&dim, rest)) = remaining.split_first() else {
+            let location = Location::unknown(ctx.context);
+            let src_ptr = gep(ctx, block, field_ptr, gep_idx, field_llvm_ty);
+            let scalar = block
+                .append_operation(llvm::load(
+                    ctx.context,
+                    src_ptr,
+                    elem_mlir_ty,
+                    location,
+                    LoadStoreOptions::new(),
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            out.push(scalar);
+            return;
+        };
+        for i in 0..dim {
+            gep_idx.push(i);
+            walk(
+                ctx,
+                block,
+                rest,
+                gep_idx,
+                field_ptr,
+                field_llvm_ty,
+                elem_mlir_ty,
+                out,
+            );
+            gep_idx.pop();
+        }
+    }
+    let mut gep_idx = vec![0i64];
+    let mut elems = Vec::new();
+    walk(
+        ctx,
+        block,
+        &dims,
+        &mut gep_idx,
+        field_ptr,
+        field_llvm_ty,
+        elem_mlir_ty,
+        &mut elems,
+    );
+
+    let native_ty = ty_to_mlir(ctx, field_ty);
+    let location = Location::unknown(ctx.context);
+    let built = OperationBuilder::new(&format!("{keyword}.from_elements"), location)
+        .add_operands(&elems)
+        .add_results(&[native_ty])
+        .build()
+        .unwrap_or_else(|e| {
+            panic!("MLIR lowering: failed to build `{keyword}.from_elements`: {e}")
+        });
+    block.append_operation(built).result(0).unwrap().into()
 }
 
 /// `PrimOp::FieldStore { struct_ty, field }`, `args = [base, value]` — a
@@ -1559,14 +2185,18 @@ fn lower_field_store<'c>(
     let CVal::Var(base_var) = &args[0] else {
         panic!("MLIR lowering: field mutation's own base operand must be a variable");
     };
-    let base_val = *env.get(base_var).unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{base_var}"));
+    let base_val = *env
+        .get(base_var)
+        .unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{base_var}"));
     let (name, type_args) = struct_name_and_args(struct_ty);
     // See `lower_field_access`'s identical check: a tag-tensor struct has no
     // address of its own to store into at all.
     if native_shape_keyword(ctx, name).is_some() {
-        panic!("MLIR lowering: `{name}` is a `#[mlir_type(...)]`-tagged native value, its own field can't be mutated in place");
+        panic!(
+            "MLIR lowering: `{name}` is a `#[mlir_type(...)]`-tagged native value, its own field can't be mutated in place"
+        );
     }
-    let field_types = struct_field_types(ctx, name, type_args);
+    let field_types = struct_field_types(&ctx.struct_schemas, name, type_args);
     let position = field_types
         .iter()
         .position(|(n, _)| n == field)
@@ -1601,7 +2231,9 @@ fn lower_field_access<'c>(
     let CVal::Var(base_var) = &args[0] else {
         panic!("MLIR lowering: field access's own base operand must be a variable");
     };
-    let base_val = *env.get(base_var).unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{base_var}"));
+    let base_val = *env
+        .get(base_var)
+        .unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{base_var}"));
     let (name, type_args) = struct_name_and_args(struct_ty);
     // A `#[mlir_type(tensor)]`/`#[mlir_type(vector)]`-tagged struct has no
     // `!llvm.struct` storage at all (`lower_tagged_struct_construct`'s own
@@ -1611,7 +2243,7 @@ fn lower_field_access<'c>(
     if native_shape_keyword(ctx, name).is_some() {
         return base_val;
     }
-    let field_types = struct_field_types(ctx, name, type_args);
+    let field_types = struct_field_types(&ctx.struct_schemas, name, type_args);
     let position = field_types
         .iter()
         .position(|(n, _)| n == field)
@@ -1619,12 +2251,24 @@ fn lower_field_access<'c>(
     let (_, field_ty) = &field_types[position];
     let struct_llvm_ty = struct_llvm_type(ctx, name, type_args);
     let field_ptr = gep(ctx, block, base_val, &[0, position as i64], struct_llvm_ty);
-    if is_array_ty(field_ty) {
+    if native_shape_field_keyword(ctx, field_ty).is_some() {
+        load_native_shape_field(ctx, block, field_ty, field_ptr)
+    } else if is_array_ty(field_ty) {
         field_ptr
     } else {
         let result_ty = ty_to_mlir(ctx, field_ty);
         let location = Location::unknown(ctx.context);
-        block.append_operation(llvm::load(ctx.context, field_ptr, result_ty, location, LoadStoreOptions::new())).result(0).unwrap().into()
+        block
+            .append_operation(llvm::load(
+                ctx.context,
+                field_ptr,
+                result_ty,
+                location,
+                LoadStoreOptions::new(),
+            ))
+            .result(0)
+            .unwrap()
+            .into()
     }
 }
 
@@ -1643,12 +2287,21 @@ fn lower_field_access<'c>(
 /// embedded `!llvm.array` (`ty_to_mlir`'s `Ty::Array` arm, `array_leaf_is_
 /// struct`), which needs the exact same "outlives the call that built it"
 /// property a struct does.
-fn alloc_llvm_value<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, llvm_ty: Type<'c>) -> Value<'c, 'c> {
+fn alloc_llvm_value<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    llvm_ty: Type<'c>,
+) -> Value<'c, 'c> {
     let context = ctx.context;
     let location = Location::unknown(context);
     let ptr_ty = llvm::r#type::pointer(context, 0);
     let size = llvm_type_size_bytes(ctx, block, llvm_ty);
-    ensure_extern_declared(ctx, "cleave_alloc", &[Ty::Con("i64".to_string())], &[ptr_ty]);
+    ensure_extern_declared(
+        ctx,
+        "cleave_alloc",
+        &[Ty::Con("i64".to_string())],
+        &[ptr_ty],
+    );
     let call_op = block.append_operation(func::call(
         context,
         FlatSymbolRefAttribute::new(context, "cleave_alloc"),
@@ -1667,11 +2320,19 @@ fn alloc_llvm_value<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, llvm_ty: Type
 /// here would risk silently disagreeing with it). Fully generic over any
 /// LLVM type — `T` can be a struct or an `!llvm.array`, both go through
 /// `alloc_llvm_value` the same way.
-fn llvm_type_size_bytes<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, llvm_ty: Type<'c>) -> Value<'c, 'c> {
+fn llvm_type_size_bytes<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    llvm_ty: Type<'c>,
+) -> Value<'c, 'c> {
     let context = ctx.context;
     let location = Location::unknown(context);
     let ptr_ty = llvm::r#type::pointer(context, 0);
-    let null: Value = block.append_operation(llvm::zero(ptr_ty, location)).result(0).unwrap().into();
+    let null: Value = block
+        .append_operation(llvm::zero(ptr_ty, location))
+        .result(0)
+        .unwrap()
+        .into();
     let one_past = gep(ctx, block, null, &[1], llvm_ty);
     let i64_ty = IntegerType::new(context, 64).into();
     let built = OperationBuilder::new("llvm.ptrtoint", location)
@@ -1717,7 +2378,12 @@ fn llvm_type_size_bytes<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, llvm_ty: 
 /// exactly this "collapse a nested `Ty::Array` chain" need), a compile-time
 /// constant materialized directly either way, never read off a runtime
 /// descriptor.
-fn array_ptr_and_len<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, array_value: Value<'c, 'c>, array_ty: &Ty) -> (Value<'c, 'c>, Value<'c, 'c>) {
+fn array_ptr_and_len<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    array_value: Value<'c, 'c>,
+    array_ty: &Ty,
+) -> (Value<'c, 'c>, Value<'c, 'c>) {
     let context = ctx.context;
     let location = Location::unknown(context);
     let i64_ty: Type = IntegerType::new(context, 64).into();
@@ -1728,9 +2394,17 @@ fn array_ptr_and_len<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, array_value:
             .add_operands(&[array_value])
             .add_results(&[index_ty])
             .build()
-            .unwrap_or_else(|e| panic!("MLIR lowering: failed to build memref.extract_aligned_pointer_as_index: {e}"));
+            .unwrap_or_else(|e| {
+                panic!(
+                    "MLIR lowering: failed to build memref.extract_aligned_pointer_as_index: {e}"
+                )
+            });
         let idx: Value = block.append_operation(built).result(0).unwrap().into();
-        let as_i64: Value = block.append_operation(arith::index_cast(idx, i64_ty, location)).result(0).unwrap().into();
+        let as_i64: Value = block
+            .append_operation(arith::index_cast(idx, i64_ty, location))
+            .result(0)
+            .unwrap()
+            .into();
         let ptr_ty = llvm::r#type::pointer(context, 0);
         let built = OperationBuilder::new("llvm.inttoptr", location)
             .add_operands(&[as_i64])
@@ -1745,7 +2419,11 @@ fn array_ptr_and_len<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, array_value:
     let (dims, _leaf_ty) = flatten_array_dims(array_ty);
     let total: i64 = dims.iter().product();
     let len_attr = IntegerAttribute::new(i64_ty, total).into();
-    let len: Value = block.append_operation(arith::constant(context, len_attr, location)).result(0).unwrap().into();
+    let len: Value = block
+        .append_operation(arith::constant(context, len_attr, location))
+        .result(0)
+        .unwrap()
+        .into();
 
     (ptr, len)
 }
@@ -1760,7 +2438,13 @@ fn array_ptr_and_len<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, array_value:
 /// it must be a real constant baked into the op itself; only `gep_dynamic`,
 /// below, produces dynamic operands, used exclusively for genuinely runtime
 /// array indices, which carry no such restriction).
-fn gep<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, base: Value<'c, 'c>, indices: &[i64], pointee_ty: Type<'c>) -> Value<'c, 'c> {
+fn gep<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    base: Value<'c, 'c>,
+    indices: &[i64],
+    pointee_ty: Type<'c>,
+) -> Value<'c, 'c> {
     let context = ctx.context;
     let location = Location::unknown(context);
     let ptr_ty = llvm::r#type::pointer(context, 0);
@@ -1768,8 +2452,14 @@ fn gep<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, base: Value<'c, 'c>, indic
     let raw_indices = DenseI32ArrayAttribute::new(context, &raw);
     let built = OperationBuilder::new("llvm.getelementptr", location)
         .add_attributes(&[
-            (Identifier::new(context, "rawConstantIndices"), raw_indices.into()),
-            (Identifier::new(context, "elem_type"), TypeAttribute::new(pointee_ty).into()),
+            (
+                Identifier::new(context, "rawConstantIndices"),
+                raw_indices.into(),
+            ),
+            (
+                Identifier::new(context, "elem_type"),
+                TypeAttribute::new(pointee_ty).into(),
+            ),
         ])
         .add_operands(&[base])
         .add_results(&[ptr_ty])
@@ -1789,15 +2479,27 @@ fn gep<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, base: Value<'c, 'c>, indic
 /// real operand, not a constant" — mixing compile-time-constant and dynamic
 /// indices in one GEP is possible in principle but not needed by any caller
 /// here, so not attempted.
-fn gep_dynamic<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, base: Value<'c, 'c>, indices: &[Value<'c, 'c>], pointee_ty: Type<'c>) -> Value<'c, 'c> {
+fn gep_dynamic<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    base: Value<'c, 'c>,
+    indices: &[Value<'c, 'c>],
+    pointee_ty: Type<'c>,
+) -> Value<'c, 'c> {
     let context = ctx.context;
     let location = Location::unknown(context);
     let ptr_ty = llvm::r#type::pointer(context, 0);
     let raw_indices = DenseI32ArrayAttribute::new(context, &vec![i32::MIN; indices.len()]);
     let built = OperationBuilder::new("llvm.getelementptr", location)
         .add_attributes(&[
-            (Identifier::new(context, "rawConstantIndices"), raw_indices.into()),
-            (Identifier::new(context, "elem_type"), TypeAttribute::new(pointee_ty).into()),
+            (
+                Identifier::new(context, "rawConstantIndices"),
+                raw_indices.into(),
+            ),
+            (
+                Identifier::new(context, "elem_type"),
+                TypeAttribute::new(pointee_ty).into(),
+            ),
         ])
         .add_operands(&[base])
         .add_operands(indices)
@@ -1853,19 +2555,50 @@ fn copy_array_into_llvm_field<'c>(
         let Some((&dim, rest)) = remaining.split_first() else {
             let location = Location::unknown(ctx.context);
             let scalar: Value = if src_is_mem_ref {
-                block.append_operation(memref::load(src, src_idx, location)).result(0).unwrap().into()
+                block
+                    .append_operation(memref::load(src, src_idx, location))
+                    .result(0)
+                    .unwrap()
+                    .into()
             } else {
                 let src_ptr = gep(ctx, block, src, gep_idx, field_llvm_ty);
-                block.append_operation(llvm::load(ctx.context, src_ptr, elem_mlir_ty, location, LoadStoreOptions::new())).result(0).unwrap().into()
+                block
+                    .append_operation(llvm::load(
+                        ctx.context,
+                        src_ptr,
+                        elem_mlir_ty,
+                        location,
+                        LoadStoreOptions::new(),
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into()
             };
             let dst_ptr = gep(ctx, block, field_ptr, gep_idx, field_llvm_ty);
-            block.append_operation(llvm::store(ctx.context, scalar, dst_ptr, location, LoadStoreOptions::new()));
+            block.append_operation(llvm::store(
+                ctx.context,
+                scalar,
+                dst_ptr,
+                location,
+                LoadStoreOptions::new(),
+            ));
             return;
         };
         for i in 0..dim {
             src_idx.push(const_index(ctx, block, i));
             gep_idx.push(i);
-            walk(ctx, block, src, src_is_mem_ref, rest, src_idx, gep_idx, field_ptr, field_llvm_ty, elem_mlir_ty);
+            walk(
+                ctx,
+                block,
+                src,
+                src_is_mem_ref,
+                rest,
+                src_idx,
+                gep_idx,
+                field_ptr,
+                field_llvm_ty,
+                elem_mlir_ty,
+            );
             src_idx.pop();
             gep_idx.pop();
         }
@@ -1877,12 +2610,34 @@ fn copy_array_into_llvm_field<'c>(
     // shape/layout as the destination field (same cleave `Ty` on both
     // sides).
     let mut gep_idx = vec![0i64];
-    walk(ctx, block, src, src_is_mem_ref, dims, &mut Vec::new(), &mut gep_idx, field_ptr, field_llvm_ty, elem_mlir_ty);
+    walk(
+        ctx,
+        block,
+        src,
+        src_is_mem_ref,
+        dims,
+        &mut Vec::new(),
+        &mut gep_idx,
+        field_ptr,
+        field_llvm_ty,
+        elem_mlir_ty,
+    );
 }
 
-fn alloc_array<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, memref_ty: MemRefType<'c>) -> Value<'c, 'c> {
+fn alloc_array<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    memref_ty: MemRefType<'c>,
+) -> Value<'c, 'c> {
     let location = Location::unknown(ctx.context);
-    let op = block.append_operation(memref::alloc(ctx.context, memref_ty, &[], &[], None, location));
+    let op = block.append_operation(memref::alloc(
+        ctx.context,
+        memref_ty,
+        &[],
+        &[],
+        None,
+        location,
+    ));
     op.result(0).unwrap().into()
 }
 
@@ -1978,13 +2733,15 @@ fn lower_tensor_extract_spread<'c>(
 ) -> Value<'c, 'c> {
     let context = ctx.context;
     let location = Location::unknown(context);
-    let memref_ty = MemRefType::try_from(idx_array_val.r#type())
-        .unwrap_or_else(|e| panic!("MLIR lowering: `tensor.extract`'s own index-array argument isn't a memref: {e}"));
-    let DimSize::Static(k) = memref_ty
-        .dim_size(0)
-        .unwrap_or_else(|e| panic!("MLIR lowering: `tensor.extract`'s own index-array argument has no dimension 0: {e}"))
-    else {
-        panic!("MLIR lowering: `tensor.extract`'s own index-array argument must have a static length");
+    let memref_ty = MemRefType::try_from(idx_array_val.r#type()).unwrap_or_else(|e| {
+        panic!("MLIR lowering: `tensor.extract`'s own index-array argument isn't a memref: {e}")
+    });
+    let DimSize::Static(k) = memref_ty.dim_size(0).unwrap_or_else(|e| {
+        panic!("MLIR lowering: `tensor.extract`'s own index-array argument has no dimension 0: {e}")
+    }) else {
+        panic!(
+            "MLIR lowering: `tensor.extract`'s own index-array argument must have a static length"
+        );
     };
     let mut operands = vec![tensor_val];
     for i in 0..k as i64 {
@@ -2045,24 +2802,36 @@ fn lower_raw_mlir_op<'c>(
             _ => None,
         })
         .unwrap_or(result_ty);
-    let arg_values: Vec<Value> = args.iter().map(|a| lower_cval(context, block, env, a, operand_ty)).collect();
+    let arg_values: Vec<Value> = args
+        .iter()
+        .map(|a| lower_cval(context, block, env, a, operand_ty))
+        .collect();
     let parsed_attrs: Vec<_> = attrs
         .iter()
         .map(|(name, text)| {
-            let attribute = Attribute::parse(context, text)
-                .unwrap_or_else(|| panic!("MLIR lowering: invalid MLIR attribute text `{text}` for `{name}` on `{op}`"));
+            let attribute = Attribute::parse(context, text).unwrap_or_else(|| {
+                panic!("MLIR lowering: invalid MLIR attribute text `{text}` for `{name}` on `{op}`")
+            });
             (Identifier::new(context, name), attribute)
         })
         .collect();
     let location = Location::unknown(context);
-    let mut builder =
-        OperationBuilder::new(op, location).add_operands(&arg_values).add_attributes(&parsed_attrs).add_results(&[result_ty]);
+    let mut builder = OperationBuilder::new(op, location)
+        .add_operands(&arg_values)
+        .add_attributes(&parsed_attrs)
+        .add_results(&[result_ty]);
     // The one deliberate, dialect-wide exception to "no per-op-name Rust
     // knowledge" — see `build_linalg_region`'s own doc comment for why.
     if op.starts_with("linalg.") {
-        builder = builder.add_regions_vec(vec![build_linalg_region(context, result_ty, arg_values.len())]);
+        builder = builder.add_regions_vec(vec![build_linalg_region(
+            context,
+            result_ty,
+            arg_values.len(),
+        )]);
     }
-    let built = builder.build().unwrap_or_else(|e| panic!("MLIR lowering: failed to build op `{op}`: {e}"));
+    let built = builder
+        .build()
+        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build op `{op}`: {e}"));
     let result_op = block.append_operation(built);
     result_op.result(0).unwrap().into()
 }
@@ -2086,13 +2855,21 @@ fn lower_raw_mlir_op<'c>(
 /// its element type, recovered via `ShapedTypeLike`; every caller reaching
 /// here is tensor-typed (`tagged_struct_native_type`), so the checked
 /// `RankedTensorType` conversion is expected to always succeed.
-fn build_linalg_region<'c>(context: &'c Context, result_ty: Type<'c>, operand_count: usize) -> Region<'c> {
+fn build_linalg_region<'c>(
+    context: &'c Context,
+    result_ty: Type<'c>,
+    operand_count: usize,
+) -> Region<'c> {
     let elem_ty = RankedTensorType::try_from(result_ty)
-        .unwrap_or_else(|e| panic!("MLIR lowering: a `linalg.*` op's own result must be a ranked tensor: {e}"))
+        .unwrap_or_else(|e| {
+            panic!("MLIR lowering: a `linalg.*` op's own result must be a ranked tensor: {e}")
+        })
         .element();
     let location = Location::unknown(context);
     let block = Block::new(&vec![(elem_ty, location); operand_count]);
-    let args: Vec<Value> = (0..operand_count).map(|i| block.argument(i).unwrap().into()).collect();
+    let args: Vec<Value> = (0..operand_count)
+        .map(|i| block.argument(i).unwrap().into())
+        .collect();
     let (ins, out) = args.split_at(args.len() - 1);
     let out = out[0];
     // Every `ins` operand multiplied together (the overwhelmingly common
@@ -2104,16 +2881,29 @@ fn build_linalg_region<'c>(context: &'c Context, result_ty: Type<'c>, operand_co
         .copied()
         .reduce(|acc, x| {
             let mulf = block.append_operation(
-                OperationBuilder::new("arith.mulf", location).add_operands(&[acc, x]).add_results(&[elem_ty]).build().unwrap(),
+                OperationBuilder::new("arith.mulf", location)
+                    .add_operands(&[acc, x])
+                    .add_results(&[elem_ty])
+                    .build()
+                    .unwrap(),
             );
             mulf.result(0).unwrap().into()
         })
         .unwrap_or(out);
     let sum = block.append_operation(
-        OperationBuilder::new("arith.addf", location).add_operands(&[out, product]).add_results(&[elem_ty]).build().unwrap(),
+        OperationBuilder::new("arith.addf", location)
+            .add_operands(&[out, product])
+            .add_results(&[elem_ty])
+            .build()
+            .unwrap(),
     );
     let sum_val: Value = sum.result(0).unwrap().into();
-    block.append_operation(OperationBuilder::new("linalg.yield", location).add_operands(&[sum_val]).build().unwrap());
+    block.append_operation(
+        OperationBuilder::new("linalg.yield", location)
+            .add_operands(&[sum_val])
+            .build()
+            .unwrap(),
+    );
     let region = Region::new();
     region.append_block(block);
     region
@@ -2124,7 +2914,12 @@ fn build_linalg_region<'c>(context: &'c Context, result_ty: Type<'c>, operand_co
 /// than a definition; confirmed against melior's own `compile_external_
 /// function` test) the first time `symbol` is seen, and no-ops on every
 /// later call site for the same symbol.
-fn ensure_extern_declared<'c>(ctx: &LowerCtx<'c, '_>, symbol: &str, param_types: &[Ty], results: &[Type<'c>]) {
+fn ensure_extern_declared<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    symbol: &str,
+    param_types: &[Ty],
+    results: &[Type<'c>],
+) {
     let mut declared = ctx.declared_externs.borrow_mut();
     if !declared.insert(symbol.to_string()) {
         return;
@@ -2141,7 +2936,10 @@ fn ensure_extern_declared<'c>(ctx: &LowerCtx<'c, '_>, symbol: &str, param_types:
         .iter()
         .flat_map(|t| {
             if matches!(t, Ty::Array(..)) {
-                vec![llvm::r#type::pointer(context, 0), IntegerType::new(context, 64).into()]
+                vec![
+                    llvm::r#type::pointer(context, 0),
+                    IntegerType::new(context, 64).into(),
+                ]
             } else {
                 vec![ty_to_mlir(ctx, t)]
             }
@@ -2153,7 +2951,10 @@ fn ensure_extern_declared<'c>(ctx: &LowerCtx<'c, '_>, symbol: &str, param_types:
         StringAttribute::new(context, symbol),
         TypeAttribute::new(FunctionType::new(context, &param_mlir, results).into()),
         Region::new(),
-        &[(melior::ir::Identifier::new(context, "sym_visibility"), StringAttribute::new(context, "private").into())],
+        &[(
+            melior::ir::Identifier::new(context, "sym_visibility"),
+            StringAttribute::new(context, "private").into(),
+        )],
         location,
     );
     ctx.module.body().append_operation(decl);
@@ -2165,9 +2966,17 @@ fn ensure_extern_declared<'c>(ctx: &LowerCtx<'c, '_>, symbol: &str, param_types:
 /// call's own known operand type, normally supplies one) flowing into a
 /// function's own `return`, an `extern`/intrinsic call's own argument list,
 /// or an `if`'s own condition.
-fn lower_cval<'c>(context: &'c Context, block: &Block<'c>, env: &HashMap<CVar, Value<'c, 'c>>, v: &CVal, expected_type: Type<'c>) -> Value<'c, 'c> {
+fn lower_cval<'c>(
+    context: &'c Context,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    v: &CVal,
+    expected_type: Type<'c>,
+) -> Value<'c, 'c> {
     match v {
-        CVal::Var(var) => *env.get(var).unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{var}")),
+        CVal::Var(var) => *env
+            .get(var)
+            .unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{var}")),
         CVal::Int(n) => {
             let location = Location::unknown(context);
             let attribute = IntegerAttribute::new(expected_type, *n as i64).into();
@@ -2202,7 +3011,11 @@ fn lower_cval<'c>(context: &'c Context, block: &Block<'c>, env: &HashMap<CVar, V
         // hack: works for any `expected_type`, builtin or dialect-specific.
         CVal::Unit => {
             let location = Location::unknown(context);
-            block.append_operation(llvm::undef(expected_type, location)).result(0).unwrap().into()
+            block
+                .append_operation(llvm::undef(expected_type, location))
+                .result(0)
+                .unwrap()
+                .into()
         }
         other => panic!("MLIR lowering doesn't support this CVal shape yet: {other:?}"),
     }

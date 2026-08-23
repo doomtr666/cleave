@@ -51,9 +51,15 @@ fn num_is_available_without_any_explicit_use() {
     // `num` is in the prelude (`driver::PRELUDE_CRATES`) — a program that
     // never writes `use num;` at all must still see its `Num` algebra,
     // same as Rust's own prelude never needing `use std::vec::Vec;`.
-    let program = compile_ok(vec![("main.cleave".to_string(), "fn f() -> i32 { 0 }".to_string())], &[]);
+    let program = compile_ok(
+        vec![("main.cleave".to_string(), "fn f() -> i32 { 0 }".to_string())],
+        &[],
+    );
     let registry = Registry::build(&program);
-    assert!(registry.has_algebra("Num"), "the prelude should have loaded `num` without an explicit `use`");
+    assert!(
+        registry.has_algebra("Num"),
+        "the prelude should have loaded `num` without an explicit `use`"
+    );
 }
 
 #[test]
@@ -61,7 +67,10 @@ fn use_num_pulls_in_the_real_stdlib() {
     let src = "use num;\nfn f() -> i32 { 0 }".to_string();
     let program = compile_ok(vec![("main.cleave".to_string(), src)], &[]);
     let registry = Registry::build(&program);
-    assert!(registry.has_algebra("Num"), "`use num;` should pull in stdlib's Num algebra");
+    assert!(
+        registry.has_algebra("Num"),
+        "`use num;` should pull in stdlib's Num algebra"
+    );
 }
 
 #[test]
@@ -70,9 +79,15 @@ fn qualified_use_path_behaves_identically_to_bare_crate_name() {
     project.write_crate_file("linalg", "linalg.cleave", "algebra VectorSpace<T> {}");
 
     let src = "use linalg::Matrix;\nfn f() -> i32 { 0 }".to_string();
-    let program = compile_ok(vec![("main.cleave".to_string(), src)], &project.search_paths());
+    let program = compile_ok(
+        vec![("main.cleave".to_string(), src)],
+        &project.search_paths(),
+    );
     let registry = Registry::build(&program);
-    assert!(registry.has_algebra("VectorSpace"), "only the first path segment should matter for resolution");
+    assert!(
+        registry.has_algebra("VectorSpace"),
+        "only the first path segment should matter for resolution"
+    );
 }
 
 #[test]
@@ -80,7 +95,11 @@ fn unknown_crate_reports_a_located_diagnostic() {
     let src = "use nonexistent_crate_xyz;\nfn f() -> i32 { 0 }".to_string();
     let errs = compile_err(vec![("main.cleave".to_string(), src)], &[]);
     assert_eq!(errs.len(), 1);
-    assert!(errs[0].message.contains("nonexistent_crate_xyz"), "got: {}", errs[0].message);
+    assert!(
+        errs[0].message.contains("nonexistent_crate_xyz"),
+        "got: {}",
+        errs[0].message
+    );
 }
 
 #[test]
@@ -99,7 +118,11 @@ fn source_map_is_usable_even_when_compile_fails() {
 #[test]
 fn a_crates_own_files_are_merged_before_joining_the_program() {
     let project = TempProject::new("multi_file_crate");
-    project.write_crate_file("shapes", "sig.cleave", "algebra Shapes<T> { fn add(a: T, b: T) -> T; }");
+    project.write_crate_file(
+        "shapes",
+        "sig.cleave",
+        "algebra Shapes<T> { fn add(a: T, b: T) -> T; }",
+    );
     project.write_crate_file(
         "shapes",
         "axiom.cleave",
@@ -107,7 +130,10 @@ fn a_crates_own_files_are_merged_before_joining_the_program() {
     );
 
     let src = "use shapes;\nfn f() -> i32 { 0 }".to_string();
-    let program = compile_ok(vec![("main.cleave".to_string(), src)], &project.search_paths());
+    let program = compile_ok(
+        vec![("main.cleave".to_string(), src)],
+        &project.search_paths(),
+    );
 
     // Filtered by name, not just `ItemKind::Algebra` — `num` (with its own
     // `Num` algebra) is always loaded too now, via the prelude.
@@ -116,18 +142,28 @@ fn a_crates_own_files_are_merged_before_joining_the_program() {
         .iter()
         .filter(|i| matches!(&i.kind, ItemKind::Algebra(d) if d.name == "Shapes"))
         .collect();
-    assert_eq!(shapes_items.len(), 1, "the two fragments must merge into one Shapes, not stay separate");
+    assert_eq!(
+        shapes_items.len(),
+        1,
+        "the two fragments must merge into one Shapes, not stay separate"
+    );
 }
 
 #[test]
 fn the_same_crate_used_twice_is_only_loaded_once() {
     let project = TempProject::new("dedup_use");
-    project.write_crate_file("shapes", "shapes.cleave", "algebra Shapes<T> { fn add(a: T, b: T) -> T; }");
+    project.write_crate_file(
+        "shapes",
+        "shapes.cleave",
+        "algebra Shapes<T> { fn add(a: T, b: T) -> T; }",
+    );
 
     let a = "use shapes;\nfn f() -> i32 { 0 }".to_string();
     let b = "use shapes;\nfn g() -> i32 { 0 }".to_string();
-    let program =
-        compile_ok(vec![("a.cleave".to_string(), a), ("b.cleave".to_string(), b)], &project.search_paths());
+    let program = compile_ok(
+        vec![("a.cleave".to_string(), a), ("b.cleave".to_string(), b)],
+        &project.search_paths(),
+    );
 
     // Filtered by name, not just `ItemKind::Algebra` — `num` (with its own
     // `Num` algebra) is always loaded too now, via the prelude.
@@ -136,7 +172,11 @@ fn the_same_crate_used_twice_is_only_loaded_once() {
         .iter()
         .filter(|i| matches!(&i.kind, ItemKind::Algebra(d) if d.name == "Shapes"))
         .collect();
-    assert_eq!(shapes_items.len(), 1, "loading `shapes` twice must not duplicate its declarations");
+    assert_eq!(
+        shapes_items.len(),
+        1,
+        "loading `shapes` twice must not duplicate its declarations"
+    );
 }
 
 #[test]
@@ -147,16 +187,27 @@ fn node_ids_stay_unique_across_multiple_files() {
     // `infer.rs`'s `node_types` now does. `compile` threads one shared
     // `NodeIdGen` across the entry file *and* every crate file it loads.
     let project = TempProject::new("node_id_uniqueness");
-    project.write_crate_file("shapes", "shapes.cleave", "algebra Shapes<T> { fn add(a: T, b: T) -> T; }");
+    project.write_crate_file(
+        "shapes",
+        "shapes.cleave",
+        "algebra Shapes<T> { fn add(a: T, b: T) -> T; }",
+    );
 
     let src = "use shapes;\nfn f() -> i32 { 0 }\nfn g() -> i32 { 1 }".to_string();
-    let program = compile_ok(vec![("main.cleave".to_string(), src)], &project.search_paths());
+    let program = compile_ok(
+        vec![("main.cleave".to_string(), src)],
+        &project.search_paths(),
+    );
 
     let ids: Vec<u32> = program.items.iter().map(|i| i.id.0).collect();
     let mut sorted = ids.clone();
     sorted.sort_unstable();
     sorted.dedup();
-    assert_eq!(sorted.len(), ids.len(), "every item across entry + used crate must have a distinct NodeId, got {ids:?}");
+    assert_eq!(
+        sorted.len(),
+        ids.len(),
+        "every item across entry + used crate must have a distinct NodeId, got {ids:?}"
+    );
 }
 
 #[test]
@@ -167,10 +218,19 @@ fn project_search_path_is_tried_before_stdlib() {
     project.write_crate_file("num", "num.cleave", "algebra Shadowed {}");
 
     let src = "use num;\nfn f() -> i32 { 0 }".to_string();
-    let program = compile_ok(vec![("main.cleave".to_string(), src)], &project.search_paths());
+    let program = compile_ok(
+        vec![("main.cleave".to_string(), src)],
+        &project.search_paths(),
+    );
     let registry = Registry::build(&program);
-    assert!(registry.has_algebra("Shadowed"), "project search path should win over the stdlib fallback");
-    assert!(!registry.has_algebra("Num"), "the real stdlib `num` should not have been loaded instead");
+    assert!(
+        registry.has_algebra("Shadowed"),
+        "project search path should win over the stdlib fallback"
+    );
+    assert!(
+        !registry.has_algebra("Num"),
+        "the real stdlib `num` should not have been loaded instead"
+    );
 }
 
 #[test]
@@ -185,11 +245,23 @@ fn a_crates_own_use_is_followed_transitively() {
     project.write_crate_file("c", "c.cleave", "algebra C {}");
 
     let src = "use a;\nfn f() -> i32 { 0 }".to_string();
-    let program = compile_ok(vec![("main.cleave".to_string(), src)], &project.search_paths());
+    let program = compile_ok(
+        vec![("main.cleave".to_string(), src)],
+        &project.search_paths(),
+    );
     let registry = Registry::build(&program);
-    assert!(registry.has_algebra("A"), "the directly-used crate must still load");
-    assert!(registry.has_algebra("B"), "a's own use of b must be followed");
-    assert!(registry.has_algebra("C"), "b's own use of c must be followed transitively through a and b both");
+    assert!(
+        registry.has_algebra("A"),
+        "the directly-used crate must still load"
+    );
+    assert!(
+        registry.has_algebra("B"),
+        "a's own use of b must be followed"
+    );
+    assert!(
+        registry.has_algebra("C"),
+        "b's own use of c must be followed transitively through a and b both"
+    );
 }
 
 #[test]
@@ -202,13 +274,20 @@ fn a_crate_used_both_directly_and_transitively_loads_once() {
     project.write_crate_file("b", "b.cleave", "algebra B { fn f(x: T) -> T; }");
 
     let src = "use a;\nuse b;\nfn f() -> i32 { 0 }".to_string();
-    let program = compile_ok(vec![("main.cleave".to_string(), src)], &project.search_paths());
+    let program = compile_ok(
+        vec![("main.cleave".to_string(), src)],
+        &project.search_paths(),
+    );
     let b_items: Vec<_> = program
         .items
         .iter()
         .filter(|i| matches!(&i.kind, ItemKind::Algebra(d) if d.name == "B"))
         .collect();
-    assert_eq!(b_items.len(), 1, "b reached via two different paths must still merge into one declaration, got {b_items:?}");
+    assert_eq!(
+        b_items.len(),
+        1,
+        "b reached via two different paths must still merge into one declaration, got {b_items:?}"
+    );
 }
 
 #[test]
@@ -220,10 +299,18 @@ fn a_circular_crate_dependency_is_rejected_cleanly() {
     project.write_crate_file("b", "b.cleave", "use a;\nalgebra B {}");
 
     let src = "use a;\nfn f() -> i32 { 0 }".to_string();
-    let errs = compile_err(vec![("main.cleave".to_string(), src)], &project.search_paths());
-    assert!(!errs.is_empty(), "a circular crate dependency must be rejected");
+    let errs = compile_err(
+        vec![("main.cleave".to_string(), src)],
+        &project.search_paths(),
+    );
     assert!(
-        errs.iter().any(|e| e.message.contains('a') && e.message.contains('b') && e.message.to_lowercase().contains("circular")),
+        !errs.is_empty(),
+        "a circular crate dependency must be rejected"
+    );
+    assert!(
+        errs.iter().any(|e| e.message.contains('a')
+            && e.message.contains('b')
+            && e.message.to_lowercase().contains("circular")),
         "expected a diagnostic naming the actual cycle, got: {errs:?}"
     );
 }

@@ -38,9 +38,9 @@ fn main() -> i32 {
     print("start learning...");
 
     for step in 0..10 {
-        let g: [f32; 2] = grad(w, b);
-        w = w - lr * g[0];
-        b = b - lr * g[1];
+        let g: (f32, f32) = grad(w, b);
+        w = w - lr * g.0;
+        b = b - lr * g.1;
     };
 
     print("done !");

@@ -70,20 +70,48 @@ impl Printer {
     }
 
     fn print_algebra_decl(&mut self, d: &AlgebraDecl) {
-        let bounds = if d.bounds.is_empty() { String::new() } else { format!(": {}", d.bounds.join(" + ")) };
-        self.line(format!("algebra {}{}{} {{", d.name, fmt_generics(&d.generics), bounds));
+        let bounds = if d.bounds.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", d.bounds.join(" + "))
+        };
+        self.line(format!(
+            "algebra {}{}{} {{",
+            d.name,
+            fmt_generics(&d.generics),
+            bounds
+        ));
         self.indented(|p| {
             for item in &d.items {
                 match &item.kind {
                     AlgebraItemKind::FnSig(sig) => {
-                        let ret = sig.ret.as_ref().map(|t| format!(" -> {}", fmt_type(t))).unwrap_or_default();
-                        p.line(format!("fn {}({}){};", sig.name, fmt_params(&sig.params), ret));
+                        let ret = sig
+                            .ret
+                            .as_ref()
+                            .map(|t| format!(" -> {}", fmt_type(t)))
+                            .unwrap_or_default();
+                        p.line(format!(
+                            "fn {}({}){};",
+                            sig.name,
+                            fmt_params(&sig.params),
+                            ret
+                        ));
                     }
                     AlgebraItemKind::Axiom(ax) => {
-                        p.line(format!("axiom {}({}): {};", ax.name, fmt_params(&ax.params), fmt_expr(&ax.body)));
+                        p.line(format!(
+                            "axiom {}({}): {};",
+                            ax.name,
+                            fmt_params(&ax.params),
+                            fmt_expr(&ax.body)
+                        ));
                     }
                     AlgebraItemKind::DerivativeRule(dr) => {
-                        p.line(format!("derivative {}({}): {};", dr.method, fmt_params(&dr.params), fmt_expr(&dr.body)));
+                        p.line(format!(
+                            "derivative {}({}): {};",
+                            dr.method,
+                            fmt_params(&dr.params),
+                            fmt_expr(&dr.body)
+                        ));
                     }
                 }
             }
@@ -92,8 +120,16 @@ impl Printer {
     }
 
     fn print_impl_decl(&mut self, d: &ImplDecl) {
-        let targets: Vec<String> = std::iter::once(&d.target).chain(d.extra_targets.iter()).map(fmt_type).collect();
-        self.line(format!("impl{} {}<{}> {{", fmt_generics(&d.generics), d.algebra, targets.join(", ")));
+        let targets: Vec<String> = std::iter::once(&d.target)
+            .chain(d.extra_targets.iter())
+            .map(fmt_type)
+            .collect();
+        self.line(format!(
+            "impl{} {}<{}> {{",
+            fmt_generics(&d.generics),
+            d.algebra,
+            targets.join(", ")
+        ));
         self.indented(|p| {
             for f in &d.fns {
                 p.print_fn_decl(f);
@@ -103,7 +139,11 @@ impl Printer {
     }
 
     fn print_inherent_impl_decl(&mut self, d: &InherentImplDecl) {
-        self.line(format!("impl{} {} {{", fmt_generics(&d.generics), fmt_type(&d.target)));
+        self.line(format!(
+            "impl{} {} {{",
+            fmt_generics(&d.generics),
+            fmt_type(&d.target)
+        ));
         self.indented(|p| {
             for f in &d.fns {
                 p.print_fn_decl(f);
@@ -116,10 +156,20 @@ impl Printer {
         for attr in &d.attrs {
             self.line(format!("#[{}({})]", attr.name, attr.args.join(", ")));
         }
-        let ret = d.ret.as_ref().map(|t| format!(" -> {}", fmt_type(t))).unwrap_or_default();
+        let ret = d
+            .ret
+            .as_ref()
+            .map(|t| format!(" -> {}", fmt_type(t)))
+            .unwrap_or_default();
         match &d.body {
             Some(body) => {
-                self.line(format!("fn {}{}({}){} {{", d.name, fmt_generics(&d.generics), fmt_params(&d.params), ret));
+                self.line(format!(
+                    "fn {}{}({}){} {{",
+                    d.name,
+                    fmt_generics(&d.generics),
+                    fmt_params(&d.params),
+                    ret
+                ));
                 self.indented(|p| p.print_block_contents(body));
                 self.line("}");
             }
@@ -129,7 +179,13 @@ impl Printer {
             // semicolon-terminated shape `print_algebra_decl` already uses
             // for an algebra's own `fn_sig`.
             None => {
-                self.line(format!("fn {}{}({}){};", d.name, fmt_generics(&d.generics), fmt_params(&d.params), ret));
+                self.line(format!(
+                    "fn {}{}({}){};",
+                    d.name,
+                    fmt_generics(&d.generics),
+                    fmt_params(&d.params),
+                    ret
+                ));
             }
         }
     }
@@ -145,12 +201,22 @@ impl Printer {
 
     fn print_stmt(&mut self, s: &Stmt) {
         match &s.kind {
-            StmtKind::Let { mutable, name, ty, value } => {
+            StmtKind::Let {
+                mutable,
+                name,
+                ty,
+                value,
+            } => {
                 let mut_kw = if *mutable { "mut " } else { "" };
-                let ty_ann = ty.as_ref().map(|t| format!(": {}", fmt_type(t))).unwrap_or_default();
+                let ty_ann = ty
+                    .as_ref()
+                    .map(|t| format!(": {}", fmt_type(t)))
+                    .unwrap_or_default();
                 self.line(format!("let {mut_kw}{name}{ty_ann} = {};", fmt_expr(value)));
             }
-            StmtKind::Assign { target, value } => self.line(format!("{} = {};", fmt_expr(target), fmt_expr(value))),
+            StmtKind::Assign { target, value } => {
+                self.line(format!("{} = {};", fmt_expr(target), fmt_expr(value)))
+            }
             StmtKind::Expr(e) => self.line(format!("{};", fmt_expr(e))),
             StmtKind::Break(value) => match value {
                 Some(v) => self.line(format!("break {};", fmt_expr(v))),
@@ -177,9 +243,25 @@ pub(crate) fn fmt_generics(generics: &[GenericParam]) -> String {
     let parts: Vec<String> = generics
         .iter()
         .map(|g| match g {
-            GenericParam::Type { name, bounds, variadic } if bounds.is_empty() => format!("{name}{}", if *variadic { "..." } else { "" }),
-            GenericParam::Type { name, bounds, variadic } => format!("{name}: {}{}", bounds.join(" + "), if *variadic { "..." } else { "" }),
-            GenericParam::Const { name, ty, variadic } => format!("const {name}: {}{}", fmt_type(ty), if *variadic { "..." } else { "" }),
+            GenericParam::Type {
+                name,
+                bounds,
+                variadic,
+            } if bounds.is_empty() => format!("{name}{}", if *variadic { "..." } else { "" }),
+            GenericParam::Type {
+                name,
+                bounds,
+                variadic,
+            } => format!(
+                "{name}: {}{}",
+                bounds.join(" + "),
+                if *variadic { "..." } else { "" }
+            ),
+            GenericParam::Const { name, ty, variadic } => format!(
+                "const {name}: {}{}",
+                fmt_type(ty),
+                if *variadic { "..." } else { "" }
+            ),
         })
         .collect();
     format!("<{}>", parts.join(", "))
@@ -221,7 +303,11 @@ pub(crate) fn fmt_type(ty: &Type) -> String {
         }
         TypeKind::Array(elem, dim) => format!("[{}; {}]", fmt_type(elem), fmt_expr(dim)),
         TypeKind::Fn(params, ret) => {
-            format!("({}) -> {}", params.iter().map(fmt_type).collect::<Vec<_>>().join(", "), fmt_type(ret))
+            format!(
+                "({}) -> {}",
+                params.iter().map(fmt_type).collect::<Vec<_>>().join(", "),
+                fmt_type(ret)
+            )
         }
         TypeKind::PackRef(name) => format!("{name}..."),
     }
@@ -235,8 +321,13 @@ pub(crate) fn fmt_turbofish(args: &[GenericArg]) -> String {
     if args.is_empty() {
         return String::new();
     }
-    let args: Vec<String> =
-        args.iter().map(|a| match a { GenericArg::Type(t) => fmt_type(t), GenericArg::Const(e) => fmt_expr(e) }).collect();
+    let args: Vec<String> = args
+        .iter()
+        .map(|a| match a {
+            GenericArg::Type(t) => fmt_type(t),
+            GenericArg::Const(e) => fmt_expr(e),
+        })
+        .collect();
     format!("::<{}>", args.join(", "))
 }
 
@@ -254,37 +345,83 @@ pub(crate) fn fmt_expr(e: &Expr) -> String {
         ExprKind::PackRef(name) => format!("{name}..."),
         ExprKind::Call(path, generics, args, mlir_attrs) => {
             let mut parts: Vec<String> = args.iter().map(fmt_expr).collect();
-            parts.extend(mlir_attrs.iter().map(|(name, text)| format!("{name}: {text:?}")));
-            format!("{}{}({})", fmt_path(path), fmt_turbofish(generics), parts.join(", "))
+            parts.extend(
+                mlir_attrs
+                    .iter()
+                    .map(|(name, text)| format!("{name}: {text:?}")),
+            );
+            format!(
+                "{}{}({})",
+                fmt_path(path),
+                fmt_turbofish(generics),
+                parts.join(", ")
+            )
         }
         ExprKind::FieldAccess(base, name) => format!("{}.{name}", fmt_expr(base)),
         ExprKind::MethodCall(base, name, args) => {
-            format!("{}.{name}({})", fmt_expr(base), args.iter().map(fmt_expr).collect::<Vec<_>>().join(", "))
+            format!(
+                "{}.{name}({})",
+                fmt_expr(base),
+                args.iter().map(fmt_expr).collect::<Vec<_>>().join(", ")
+            )
         }
         ExprKind::Index(base, indices) => {
-            format!("{}[{}]", fmt_expr(base), indices.iter().map(fmt_expr).collect::<Vec<_>>().join(", "))
+            format!(
+                "{}[{}]",
+                fmt_expr(base),
+                indices.iter().map(fmt_expr).collect::<Vec<_>>().join(", ")
+            )
         }
-        ExprKind::ArrayLit(elems) => format!("[{}]", elems.iter().map(fmt_expr).collect::<Vec<_>>().join(", ")),
-        ExprKind::ArrayRepeat { value, count } => format!("[{}; {}]", fmt_expr(value), fmt_expr(count)),
+        ExprKind::ArrayLit(elems) => format!(
+            "[{}]",
+            elems.iter().map(fmt_expr).collect::<Vec<_>>().join(", ")
+        ),
+        ExprKind::ArrayRepeat { value, count } => {
+            format!("[{}; {}]", fmt_expr(value), fmt_expr(count))
+        }
         ExprKind::StructLit(path, generics, fields) => format!(
             "{}{}({})",
             fmt_path(path),
             fmt_turbofish(generics),
-            fields.iter().map(|(name, v)| format!("{name}: {}", fmt_expr(v))).collect::<Vec<_>>().join(", ")
+            fields
+                .iter()
+                .map(|(name, v)| format!("{name}: {}", fmt_expr(v)))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
-        ExprKind::If { cond, then_branch, else_branch } => {
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
             let mut s = format!("if {} {}", fmt_expr(cond), fmt_block_inline(then_branch));
             if let Some(eb) = else_branch {
-                let _ = write!(s, " else {}", match &**eb {
-                    ElseBranch::If(i) => fmt_expr(i),
-                    ElseBranch::Block(b) => fmt_block_inline(b),
-                });
+                let _ = write!(
+                    s,
+                    " else {}",
+                    match &**eb {
+                        ElseBranch::If(i) => fmt_expr(i),
+                        ElseBranch::Block(b) => fmt_block_inline(b),
+                    }
+                );
             }
             s
         }
-        ExprKind::While { cond, body } => format!("while {} {}", fmt_expr(cond), fmt_block_inline(body)),
-        ExprKind::For { var, start, end, body } => {
-            format!("for {var} in {}..{} {}", fmt_expr(start), fmt_expr(end), fmt_block_inline(body))
+        ExprKind::While { cond, body } => {
+            format!("while {} {}", fmt_expr(cond), fmt_block_inline(body))
+        }
+        ExprKind::For {
+            var,
+            start,
+            end,
+            body,
+        } => {
+            format!(
+                "for {var} in {}..{} {}",
+                fmt_expr(start),
+                fmt_expr(end),
+                fmt_block_inline(body)
+            )
         }
         ExprKind::ForIn { var, iter, body } => {
             format!("for {var} in {} {}", fmt_expr(iter), fmt_block_inline(body))
@@ -292,8 +429,15 @@ pub(crate) fn fmt_expr(e: &Expr) -> String {
         ExprKind::Loop { body } => format!("loop {}", fmt_block_inline(body)),
         ExprKind::Block(b) => fmt_block_inline(b),
         ExprKind::Lambda { params, ret, body } => {
-            let ret_ann = ret.as_ref().map(|t| format!(" -> {}", fmt_type(t))).unwrap_or_default();
-            format!("fn({}){ret_ann} {}", fmt_params(params), fmt_block_inline(body))
+            let ret_ann = ret
+                .as_ref()
+                .map(|t| format!(" -> {}", fmt_type(t)))
+                .unwrap_or_default();
+            format!(
+                "fn({}){ret_ann} {}",
+                fmt_params(params),
+                fmt_block_inline(body)
+            )
         }
     }
 }
@@ -306,12 +450,22 @@ fn fmt_block_inline(b: &Block) -> String {
         .stmts
         .iter()
         .map(|s| match &s.kind {
-            StmtKind::Let { mutable, name, ty, value } => {
+            StmtKind::Let {
+                mutable,
+                name,
+                ty,
+                value,
+            } => {
                 let mut_kw = if *mutable { "mut " } else { "" };
-                let ty_ann = ty.as_ref().map(|t| format!(": {}", fmt_type(t))).unwrap_or_default();
+                let ty_ann = ty
+                    .as_ref()
+                    .map(|t| format!(": {}", fmt_type(t)))
+                    .unwrap_or_default();
                 format!("let {mut_kw}{name}{ty_ann} = {};", fmt_expr(value))
             }
-            StmtKind::Assign { target, value } => format!("{} = {};", fmt_expr(target), fmt_expr(value)),
+            StmtKind::Assign { target, value } => {
+                format!("{} = {};", fmt_expr(target), fmt_expr(value))
+            }
             StmtKind::Expr(e) => format!("{};", fmt_expr(e)),
             StmtKind::Break(value) => match value {
                 Some(v) => format!("break {};", fmt_expr(v)),

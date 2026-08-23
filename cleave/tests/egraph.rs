@@ -4,7 +4,9 @@
 //! JIT-executes to the identical runtime value — not just that
 //! `optimize_program` compiles or that its own text output looks plausible.
 
-use cleave::cps::{collect_mlir_types, collect_struct_schemas, collect_units, convert_program, dump_cps_program};
+use cleave::cps::{
+    collect_mlir_types, collect_struct_schemas, collect_units, convert_program, dump_cps_program,
+};
 use cleave::driver::compile;
 use cleave::egraph::optimize_program;
 use cleave::mlir_lower::lower_program;
@@ -31,16 +33,25 @@ fn context() -> Context {
 /// from the unoptimized AST, never touched by `optimize_program`) can be
 /// reused to run both the naive and the axiom-optimized form of the
 /// identical program.
-fn run(context: &Context, program: &cleave::ast::Program, cps_program: &cleave::cps::CpsProgram) -> i32 {
+fn run(
+    context: &Context,
+    program: &cleave::ast::Program,
+    cps_program: &cleave::cps::CpsProgram,
+) -> i32 {
     let mlir_types = collect_mlir_types(program);
     let struct_schemas = collect_struct_schemas(program);
     let mut module = lower_program(context, cps_program, &mlir_types, struct_schemas);
-    assert!(module.as_operation().verify(), "generated MLIR module failed verification");
+    assert!(
+        module.as_operation().verify(),
+        "generated MLIR module failed verification"
+    );
 
     let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
-    pass_manager.run(&mut module).expect("lowering to the llvm dialect must succeed");
+    pass_manager
+        .run(&mut module)
+        .expect("lowering to the llvm dialect must succeed");
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     // SAFETY: a real, valid `extern "C" fn`, live for the process's whole
@@ -52,7 +63,9 @@ fn run(context: &Context, program: &cleave::ast::Program, cps_program: &cleave::
     // SAFETY: `out` is a live, correctly-aligned `i32` on the stack for the
     // duration of this call, matching the verified `i32`-returning `main`.
     unsafe {
-        engine.invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()]).expect("JIT invocation must succeed");
+        engine
+            .invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()])
+            .expect("JIT invocation must succeed");
     }
     out
 }
@@ -88,26 +101,55 @@ fn an_axiom_folds_a_real_call_away_and_the_optimized_program_still_executes_to_t
     let naive_units = collect_units(&program, &registry);
     let naive_cps = convert_program(naive_units);
     let naive_dump = dump_cps_program(&naive_cps);
-    let naive_helper = naive_dump.split("(fn helper").nth(1).expect("`helper` must be in the naive dump");
-    assert!(naive_helper.contains("Ring::add<i32>"), "the naive form must still call `Ring::add<i32>`, got:\n{naive_helper}");
+    let naive_helper = naive_dump
+        .split("(fn helper")
+        .nth(1)
+        .expect("`helper` must be in the naive dump");
+    assert!(
+        naive_helper.contains("Ring::add<i32>"),
+        "the naive form must still call `Ring::add<i32>`, got:\n{naive_helper}"
+    );
 
     let optimize_units = collect_units(&program, &registry);
     let optimize_cps = convert_program(optimize_units);
     let (optimized, explanations) = optimize_program(optimize_cps, &registry);
-    assert!(!explanations.is_empty(), "the axiom must have fired on at least one function");
-    assert!(explanations.iter().any(|e| e.contains("helper")), "expected an explanation naming `helper` specifically, got {explanations:?}");
+    assert!(
+        !explanations.is_empty(),
+        "the axiom must have fired on at least one function"
+    );
+    assert!(
+        explanations.iter().any(|e| e.contains("helper")),
+        "expected an explanation naming `helper` specifically, got {explanations:?}"
+    );
 
     let optimized_dump = dump_cps_program(&optimized);
-    let optimized_helper = optimized_dump.split("(fn helper").nth(1).expect("`helper` must be in the optimized dump");
-    assert!(!optimized_helper.contains("Ring::add<i32>"), "the axiom should have folded the call away entirely, got:\n{optimized_helper}");
-    assert_ne!(naive_helper, optimized_helper, "`helper`'s own CPS must be observably different after optimization");
+    let optimized_helper = optimized_dump
+        .split("(fn helper")
+        .nth(1)
+        .expect("`helper` must be in the optimized dump");
+    assert!(
+        !optimized_helper.contains("Ring::add<i32>"),
+        "the axiom should have folded the call away entirely, got:\n{optimized_helper}"
+    );
+    assert_ne!(
+        naive_helper, optimized_helper,
+        "`helper`'s own CPS must be observably different after optimization"
+    );
 
     // The real proof, not just that the CPS text changed: both forms still
     // execute to the identical runtime value.
     let naive_units_for_run = collect_units(&program, &registry);
     let naive_cps_for_run = convert_program(naive_units_for_run);
-    assert_eq!(run(&context, &program, &naive_cps_for_run), 21, "the naive (unoptimized) program's own result");
-    assert_eq!(run(&context, &program, &optimized), 21, "the axiom-optimized program must produce the identical result");
+    assert_eq!(
+        run(&context, &program, &naive_cps_for_run),
+        21,
+        "the naive (unoptimized) program's own result"
+    );
+    assert_eq!(
+        run(&context, &program, &optimized),
+        21,
+        "the axiom-optimized program must produce the identical result"
+    );
 }
 
 /// The Struct/Field extension's own end-to-end proof — deliberately *not*
@@ -121,7 +163,8 @@ fn an_axiom_folds_a_real_call_away_and_the_optimized_program_still_executes_to_t
 /// it was constructed from — only then does `add_zero`'s own pattern have
 /// anything to match, folding `p.x + p.y` down to a bare `p.x` read.
 #[test]
-fn a_struct_field_read_lets_add_zero_fold_a_real_call_away_and_the_optimized_program_still_executes_to_the_same_value() {
+fn a_struct_field_read_lets_add_zero_fold_a_real_call_away_and_the_optimized_program_still_executes_to_the_same_value()
+ {
     let context = context();
     let src = "struct Pair { x: i32, y: i32 }
 
@@ -140,22 +183,51 @@ fn a_struct_field_read_lets_add_zero_fold_a_real_call_away_and_the_optimized_pro
     let naive_units = collect_units(&program, &registry);
     let naive_cps = convert_program(naive_units);
     let naive_dump = dump_cps_program(&naive_cps);
-    let naive_helper = naive_dump.split("(fn helper").nth(1).expect("`helper` must be in the naive dump");
-    assert!(naive_helper.contains("Ring::add<i32>"), "the naive form must still call `Ring::add<i32>`, got:\n{naive_helper}");
+    let naive_helper = naive_dump
+        .split("(fn helper")
+        .nth(1)
+        .expect("`helper` must be in the naive dump");
+    assert!(
+        naive_helper.contains("Ring::add<i32>"),
+        "the naive form must still call `Ring::add<i32>`, got:\n{naive_helper}"
+    );
 
     let optimize_units = collect_units(&program, &registry);
     let optimize_cps = convert_program(optimize_units);
     let (optimized, explanations) = optimize_program(optimize_cps, &registry);
-    assert!(!explanations.is_empty(), "the struct-projection rewrite plus add_zero must have fired on at least one function");
-    assert!(explanations.iter().any(|e| e.contains("helper")), "expected an explanation naming `helper` specifically, got {explanations:?}");
+    assert!(
+        !explanations.is_empty(),
+        "the struct-projection rewrite plus add_zero must have fired on at least one function"
+    );
+    assert!(
+        explanations.iter().any(|e| e.contains("helper")),
+        "expected an explanation naming `helper` specifically, got {explanations:?}"
+    );
 
     let optimized_dump = dump_cps_program(&optimized);
-    let optimized_helper = optimized_dump.split("(fn helper").nth(1).expect("`helper` must be in the optimized dump");
-    assert!(!optimized_helper.contains("Ring::add<i32>"), "the axiom should have folded the call away entirely, got:\n{optimized_helper}");
-    assert_ne!(naive_helper, optimized_helper, "`helper`'s own CPS must be observably different after optimization");
+    let optimized_helper = optimized_dump
+        .split("(fn helper")
+        .nth(1)
+        .expect("`helper` must be in the optimized dump");
+    assert!(
+        !optimized_helper.contains("Ring::add<i32>"),
+        "the axiom should have folded the call away entirely, got:\n{optimized_helper}"
+    );
+    assert_ne!(
+        naive_helper, optimized_helper,
+        "`helper`'s own CPS must be observably different after optimization"
+    );
 
     let naive_units_for_run = collect_units(&program, &registry);
     let naive_cps_for_run = convert_program(naive_units_for_run);
-    assert_eq!(run(&context, &program, &naive_cps_for_run), 21, "the naive (unoptimized) program's own result");
-    assert_eq!(run(&context, &program, &optimized), 21, "the axiom-optimized program must produce the identical result");
+    assert_eq!(
+        run(&context, &program, &naive_cps_for_run),
+        21,
+        "the naive (unoptimized) program's own result"
+    );
+    assert_eq!(
+        run(&context, &program, &optimized),
+        21,
+        "the axiom-optimized program must produce the identical result"
+    );
 }

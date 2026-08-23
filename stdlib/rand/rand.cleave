@@ -1,0 +1,53 @@
+// A minimal, seedable source of randomness — `doc/backlog.md`'s own "No
+// weight-initialization helpers" item's own prerequisite: before a real
+// Xavier/He init helper can exist for `Dense` (`stdlib/nn/nn.cleave`),
+// something has to be able to produce independent random numbers at all,
+// which nothing in cleave could do before this. `use rand;` explicitly —
+// not prelude, matching `io`/`dynarray`/`linalg`'s own precedent: a program
+// that never calls into this sees zero change.
+//
+// Backed by a real PCG32 generator in `cleave-rt` (`cleave-rt/src/lib.rs`'s
+// own `rand_seed`/`rand_uniform_f32`/`rand_uniform_f64`/`rand_normal_f32`/
+// `rand_normal_f64`) — a single global stream, reseedable, deterministic for
+// a given seed (found necessary directly, by testing: `cargo test`'s own
+// default *parallel* test execution raced multiple `#[test]`s against that
+// one shared generator state before `cleave-rt`'s own tests were
+// consolidated into a single test — the same caution applies to any cleave
+// program that might someday run more than one logical "stream" at once;
+// not attempted here, a single global stream is all this needs today).
+//
+// `[value; Dims...]` (`stdlib/linalg/tensor.cleave`'s own pack-generic
+// array-repeat) cannot be used to fill a `Tensor` with independent random
+// values — confirmed directly, not assumed: `mlir_lower.rs::lower_array_
+// repeat` evaluates `value` exactly *once* and broadcasts that single
+// result into every position (correct for `Ring::zero()`'s own `[zero();
+// Dims...]`, a pure, homogeneous constant — silently wrong for a random
+// fill, which would broadcast one draw across an entire matrix). Filling a
+// `Tensor` with real per-element noise instead needs a genuine loop with
+// indexed writes (`buf[i][j] = uniform(lo, hi);`) — ordinary, already-
+// working machinery (`cps.rs`'s own multi-index `Store`, the same one a
+// nested `a[i][j]` read already uses), not a new mechanism; left to
+// `Dense`'s own future init helpers to use, not built here.
+extern fn rand_seed(s: i64);
+extern fn rand_uniform_f32() -> f32;
+extern fn rand_uniform_f64() -> f64;
+extern fn rand_normal_f32() -> f32;
+extern fn rand_normal_f64() -> f64;
+
+algebra Rand<T> {
+    fn uniform(lo: T, hi: T) -> T;
+    fn normal(mean: T, std: T) -> T;
+}
+
+// `uniform`/`normal` compose the affine transform (scale/shift) in ordinary
+// cleave source, dispatched through `Ring<T>` (already proven) — only the
+// hard part, generating the canonical `[0,1)`/`N(0,1)` draw itself, lives in
+// `cleave-rt`.
+impl Rand<f32> {
+    fn uniform(lo, hi) { lo + (hi - lo) * rand_uniform_f32() }
+    fn normal(mean, std) { mean + std * rand_normal_f32() }
+}
+impl Rand<f64> {
+    fn uniform(lo, hi) { lo + (hi - lo) * rand_uniform_f64() }
+    fn normal(mean, std) { mean + std * rand_normal_f64() }
+}

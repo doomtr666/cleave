@@ -184,7 +184,11 @@ impl Analysis<CleaveLang> for ConstantFold {
                     // unsigned.
                     [a] if name == "neg" => {
                         let a = crate::infer::ConstValue::Int(egraph[*a].data.const_int?);
-                        match crate::const_eval::eval_binop("sub", crate::infer::ConstValue::Int(0), a)? {
+                        match crate::const_eval::eval_binop(
+                            "sub",
+                            crate::infer::ConstValue::Int(0),
+                            a,
+                        )? {
                             crate::infer::ConstValue::Int(n) => Some(n),
                             crate::infer::ConstValue::Bool(_) => None,
                         }
@@ -229,7 +233,10 @@ impl Analysis<CleaveLang> for ConstantFold {
             // do); the `merge` below is what actually keeps this from
             // polluting an e-class that *also* has a genuinely independent
             // representation.
-            CleaveLang::Op(_, args) => args.iter().flat_map(|id| egraph[*id].data.free_deps.iter().copied()).collect(),
+            CleaveLang::Op(_, args) => args
+                .iter()
+                .flat_map(|id| egraph[*id].data.free_deps.iter().copied())
+                .collect(),
             CleaveLang::Int(_) | CleaveLang::Float(_) | CleaveLang::Bool(_) => HashSet::new(),
         };
         // `Free`'s own declared type (`Forward`'s own `param_types`, a
@@ -246,17 +253,28 @@ impl Analysis<CleaveLang> for ConstantFold {
             CleaveLang::Op(sym, _) => egraph.analysis.known_types.get(sym).cloned(),
             CleaveLang::Int(_) | CleaveLang::Float(_) | CleaveLang::Bool(_) => None,
         };
-        FoldData { const_int, free_deps, own_ty }
+        FoldData {
+            const_int,
+            free_deps,
+            own_ty,
+        }
     }
 
     fn merge(&mut self, to: &mut Self::Data, from: Self::Data) -> DidMerge {
         let int_merge = egg::merge_option(&mut to.const_int, from.const_int, |a, b| {
-            assert_eq!(*a, b, "constant-fold analysis disagreed with itself on the same e-class's own value");
+            assert_eq!(
+                *a, b,
+                "constant-fold analysis disagreed with itself on the same e-class's own value"
+            );
             DidMerge(false, false)
         });
         let to_len = to.free_deps.len();
         let from_len = from.free_deps.len();
-        let intersected: HashSet<Symbol> = to.free_deps.intersection(&from.free_deps).copied().collect();
+        let intersected: HashSet<Symbol> = to
+            .free_deps
+            .intersection(&from.free_deps)
+            .copied()
+            .collect();
         let new_len = intersected.len();
         to.free_deps = intersected;
         let ty_merge = match (&to.own_ty, from.own_ty) {
@@ -285,8 +303,9 @@ impl Analysis<CleaveLang> for ConstantFold {
 
 // ---------------------------------------------------------------- CPS -> e-graph (forward)
 
-use crate::cps::{CExpr, CFunDef, CTopLevelFn, CVal, CVar, PrimOp};
+use crate::cps::{CExpr, CFunDef, CTopLevelFn, CVal, CVar, PrimOp, StructSchema};
 use crate::infer::{ConstValue, Ty};
+use crate::mlir_lower::struct_field_types;
 use egg::EGraph;
 use std::collections::HashMap;
 
@@ -302,7 +321,15 @@ use std::collections::HashMap;
 /// *call* to something containing them is safe to treat as one opaque node,
 /// never requires descending into that callee's own body.
 fn is_pure_prim_op(op: &PrimOp) -> bool {
-    matches!(op, PrimOp::RawMlirOp { .. } | PrimOp::Field { .. } | PrimOp::Struct(..) | PrimOp::Array | PrimOp::ArrayRepeat | PrimOp::Load { .. })
+    matches!(
+        op,
+        PrimOp::RawMlirOp { .. }
+            | PrimOp::Field { .. }
+            | PrimOp::Struct(..)
+            | PrimOp::Array
+            | PrimOp::ArrayRepeat
+            | PrimOp::Load { .. }
+    )
 }
 
 /// Whether `expr`'s own body contains no real control flow (`Fix`/`If`) and
@@ -354,8 +381,9 @@ fn is_straight_line(expr: &CExpr, units: &HashMap<String, &CTopLevelFn>) -> bool
         // collapse to a permanently-undifferentiable opaque node).
         CExpr::Fix { defs, body } => match recognize_real_call(defs, body) {
             Some((_, unit_name, real_args, rest)) if real_args.is_empty() => {
-                units.get(unit_name).is_some_and(|callee| is_transparent_chain(&callee.def.body, units, &mut HashSet::new()))
-                    && is_straight_line(rest, units)
+                units.get(unit_name).is_some_and(|callee| {
+                    is_transparent_chain(&callee.def.body, units, &mut HashSet::new())
+                }) && is_straight_line(rest, units)
             }
             _ => false,
         },
@@ -377,14 +405,24 @@ fn is_straight_line(expr: &CExpr, units: &HashMap<String, &CTopLevelFn>) -> bool
 /// two units transitively calling each other (mutual recursion would
 /// otherwise recurse forever here, before `Forward::walk` ever gets a
 /// chance to see real recursion and reject it the ordinary way).
-fn is_transparent_chain(expr: &CExpr, units: &HashMap<String, &CTopLevelFn>, visiting: &mut HashSet<String>) -> bool {
+fn is_transparent_chain(
+    expr: &CExpr,
+    units: &HashMap<String, &CTopLevelFn>,
+    visiting: &mut HashSet<String>,
+) -> bool {
     match expr {
-        CExpr::LetPrim { op, cont, .. } => is_pure_prim_op(op) && is_transparent_chain(cont, units, visiting),
+        CExpr::LetPrim { op, cont, .. } => {
+            is_pure_prim_op(op) && is_transparent_chain(cont, units, visiting)
+        }
         CExpr::App { .. } => true,
         CExpr::If { .. } => false,
         CExpr::Fix { defs, body } => {
-            let Some((_, unit_name, _, rest)) = recognize_real_call(defs, body) else { return false };
-            let Some(callee) = units.get(unit_name) else { return false };
+            let Some((_, unit_name, _, rest)) = recognize_real_call(defs, body) else {
+                return false;
+            };
+            let Some(callee) = units.get(unit_name) else {
+                return false;
+            };
             if is_straight_line(&callee.def.body, units) {
                 return is_transparent_chain(rest, units, visiting);
             }
@@ -527,9 +565,20 @@ impl Forward {
     /// is recorded in `self.env`; the boundary's own remaining `CVal::Var`
     /// references (into the segment, or genuinely free) are resolved the
     /// identical way a *later* reference inside the segment would be.
-    pub(crate) fn walk(&mut self, expr: &CExpr, units: &HashMap<String, &CTopLevelFn>, fresh: &FreshVars) -> CExpr {
+    pub(crate) fn walk(
+        &mut self,
+        expr: &CExpr,
+        units: &HashMap<String, &CTopLevelFn>,
+        fresh: &FreshVars,
+    ) -> CExpr {
         match expr {
-            CExpr::LetPrim { var, ty, op: PrimOp::RawMlirOp { op, attrs }, args, cont } => {
+            CExpr::LetPrim {
+                var,
+                ty,
+                op: PrimOp::RawMlirOp { op, attrs },
+                args,
+                cont,
+            } => {
                 let Some(arg_ids) = self.cvals_to_ids(args) else {
                     return expr.clone(); // an unrepresentable argument (Unit/Float/Label/Closure) -- stop here, unchanged
                 };
@@ -540,8 +589,14 @@ impl Forward {
                 // identity.
                 let symbol = format!("{op}:{ty}:{attrs:?}");
                 let sym = Symbol::from(symbol);
-                self.raw_ops.entry(sym).or_insert_with(|| (op.clone(), ty.clone(), attrs.clone()));
-                self.egraph.analysis.known_types.entry(sym).or_insert_with(|| ty.clone());
+                self.raw_ops
+                    .entry(sym)
+                    .or_insert_with(|| (op.clone(), ty.clone(), attrs.clone()));
+                self.egraph
+                    .analysis
+                    .known_types
+                    .entry(sym)
+                    .or_insert_with(|| ty.clone());
                 let id = self.egraph.add(CleaveLang::Op(sym, arg_ids));
                 self.env.insert(*var, id);
                 self.walk(cont, units, fresh)
@@ -554,26 +609,50 @@ impl Forward {
             // symbol for the same reason `RawMlirOp`'s own `ty` is: two
             // structurally-different-typed struct ops must never wrongly
             // share one node identity.
-            CExpr::LetPrim { var, ty, op: PrimOp::Struct(struct_name, field_names), args, cont } => {
+            CExpr::LetPrim {
+                var,
+                ty,
+                op: PrimOp::Struct(struct_name, field_names),
+                args,
+                cont,
+            } => {
                 let Some(arg_ids) = self.cvals_to_ids(args) else {
                     return expr.clone();
                 };
                 let symbol = format!("struct:{ty}:{}", field_names.join(","));
                 let sym = Symbol::from(symbol);
-                self.struct_ops.entry(sym).or_insert_with(|| (struct_name.clone(), field_names.clone(), ty.clone()));
-                self.egraph.analysis.known_types.entry(sym).or_insert_with(|| ty.clone());
+                self.struct_ops
+                    .entry(sym)
+                    .or_insert_with(|| (struct_name.clone(), field_names.clone(), ty.clone()));
+                self.egraph
+                    .analysis
+                    .known_types
+                    .entry(sym)
+                    .or_insert_with(|| ty.clone());
                 let id = self.egraph.add(CleaveLang::Op(sym, arg_ids));
                 self.env.insert(*var, id);
                 self.walk(cont, units, fresh)
             }
-            CExpr::LetPrim { var, ty, op: PrimOp::Field { struct_ty, field }, args, cont } => {
+            CExpr::LetPrim {
+                var,
+                ty,
+                op: PrimOp::Field { struct_ty, field },
+                args,
+                cont,
+            } => {
                 let Some(arg_ids) = self.cvals_to_ids(args) else {
                     return expr.clone();
                 };
                 let symbol = format!("field:{struct_ty}:{field}");
                 let sym = Symbol::from(symbol);
-                self.field_ops.entry(sym).or_insert_with(|| (struct_ty.clone(), field.clone(), ty.clone()));
-                self.egraph.analysis.known_types.entry(sym).or_insert_with(|| ty.clone());
+                self.field_ops
+                    .entry(sym)
+                    .or_insert_with(|| (struct_ty.clone(), field.clone(), ty.clone()));
+                self.egraph
+                    .analysis
+                    .known_types
+                    .entry(sym)
+                    .or_insert_with(|| ty.clone());
                 let id = self.egraph.add(CleaveLang::Op(sym, arg_ids));
                 self.env.insert(*var, id);
                 self.walk(cont, units, fresh)
@@ -587,29 +666,57 @@ impl Forward {
             // `segment_root_var`'s own "exactly one referenced segment var"
             // rule already closes the aliasing question generically, not
             // just for structs.
-            CExpr::LetPrim { var, ty, op: PrimOp::Array, args, cont } => {
+            CExpr::LetPrim {
+                var,
+                ty,
+                op: PrimOp::Array,
+                args,
+                cont,
+            } => {
                 let Some(arg_ids) = self.cvals_to_ids(args) else {
                     return expr.clone();
                 };
                 let sym = Symbol::from(format!("array:{ty}:{}", args.len()));
                 self.array_ops.entry(sym).or_insert_with(|| ty.clone());
-                self.egraph.analysis.known_types.entry(sym).or_insert_with(|| ty.clone());
+                self.egraph
+                    .analysis
+                    .known_types
+                    .entry(sym)
+                    .or_insert_with(|| ty.clone());
                 let id = self.egraph.add(CleaveLang::Op(sym, arg_ids));
                 self.env.insert(*var, id);
                 self.walk(cont, units, fresh)
             }
-            CExpr::LetPrim { var, ty, op: PrimOp::ArrayRepeat, args, cont } => {
+            CExpr::LetPrim {
+                var,
+                ty,
+                op: PrimOp::ArrayRepeat,
+                args,
+                cont,
+            } => {
                 let Some(arg_ids) = self.cvals_to_ids(args) else {
                     return expr.clone();
                 };
                 let sym = Symbol::from(format!("array-repeat:{ty}"));
-                self.array_repeat_ops.entry(sym).or_insert_with(|| ty.clone());
-                self.egraph.analysis.known_types.entry(sym).or_insert_with(|| ty.clone());
+                self.array_repeat_ops
+                    .entry(sym)
+                    .or_insert_with(|| ty.clone());
+                self.egraph
+                    .analysis
+                    .known_types
+                    .entry(sym)
+                    .or_insert_with(|| ty.clone());
                 let id = self.egraph.add(CleaveLang::Op(sym, arg_ids));
                 self.env.insert(*var, id);
                 self.walk(cont, units, fresh)
             }
-            CExpr::LetPrim { var, ty, op: PrimOp::Load { array_ty }, args, cont } => {
+            CExpr::LetPrim {
+                var,
+                ty,
+                op: PrimOp::Load { array_ty },
+                args,
+                cont,
+            } => {
                 let Some(arg_ids) = self.cvals_to_ids(args) else {
                     return expr.clone();
                 };
@@ -620,8 +727,14 @@ impl Forward {
                 // op in this module: never rely on children arity alone to
                 // disambiguate what a symbol means).
                 let sym = Symbol::from(format!("load:{array_ty}:{ty}:{}", args.len()));
-                self.load_ops.entry(sym).or_insert_with(|| (array_ty.clone(), ty.clone()));
-                self.egraph.analysis.known_types.entry(sym).or_insert_with(|| ty.clone());
+                self.load_ops
+                    .entry(sym)
+                    .or_insert_with(|| (array_ty.clone(), ty.clone()));
+                self.egraph
+                    .analysis
+                    .known_types
+                    .entry(sym)
+                    .or_insert_with(|| ty.clone());
                 let id = self.egraph.add(CleaveLang::Op(sym, arg_ids));
                 self.env.insert(*var, id);
                 self.walk(cont, units, fresh)
@@ -634,10 +747,40 @@ impl Forward {
                 if let Some(unrolled) = self.try_unroll_for_loop(defs, body, units, fresh) {
                     return unrolled;
                 }
-                if let Some((result_var, unit_name, real_args, rest)) = recognize_real_call(defs, body) {
+                if let Some((result_var, unit_name, real_args, rest)) =
+                    recognize_real_call(defs, body)
+                {
                     if let Some(callee) = units.get(unit_name) {
                         if is_straight_line(&callee.def.body, units) {
                             if let Some(arg_ids) = self.cvals_to_ids(real_args) {
+                                // A real call's own return type is known
+                                // (`callee.result`) the moment it's first
+                                // translated -- recorded here so `own_ty`
+                                // (`ConstantFold::make`'s own `known_types`
+                                // lookup, keyed by this exact symbol) is
+                                // populated *before* `egraph.add` ever runs
+                                // for it, not after: hashconsing means
+                                // whichever call site adds a given node
+                                // first is the one whose `known_types` state
+                                // `Analysis::make` actually sees -- a later
+                                // populate-after-the-fact (`egraph.rs::
+                                // synthesize_derivatives`'s own struct/
+                                // `Tensor` leaf-enumeration, `build_param_
+                                // shape`) is too late once the *source*
+                                // itself already built the identical call
+                                // node first. Found directly: `derivative-
+                                // independent-zero` (`IndependentZeroApplier`)
+                                // silently never fired for a real call's own
+                                // result used as the "a" side of a
+                                // `derivative(a,x)` — `own_ty` was `None`,
+                                // and the whole saturation ran to its
+                                // `iter_limit` without ever discovering that,
+                                // rather than failing fast.
+                                self.egraph
+                                    .analysis
+                                    .known_types
+                                    .entry(Symbol::from(unit_name))
+                                    .or_insert_with(|| callee.result.clone());
                                 let id = self.egraph.add(CleaveLang::Op(unit_name.into(), arg_ids));
                                 self.env.insert(result_var, id);
                                 self.call_units.insert(unit_name.to_string());
@@ -646,7 +789,8 @@ impl Forward {
                                 }
                                 return self.walk(rest, units, fresh);
                             }
-                        } else if is_transparent_chain(&callee.def.body, units, &mut HashSet::new()) {
+                        } else if is_transparent_chain(&callee.def.body, units, &mut HashSet::new())
+                        {
                             // Multi-level transparency (`doc/backlog.md`'s
                             // own item) — `callee`'s own body isn't a single
                             // primop (so it can't become one opaque `Op`
@@ -668,17 +812,23 @@ impl Forward {
                             // above needs identical treatment for repeated
                             // loop iterations.
                             if let Some(arg_ids) = self.cvals_to_ids(real_args) {
-                                let ordinary_params = &callee.def.params[..callee.def.params.len().saturating_sub(1)];
+                                let ordinary_params =
+                                    &callee.def.params[..callee.def.params.len().saturating_sub(1)];
                                 let mut map: HashMap<CVar, CVar> = HashMap::new();
-                                let renamed_params: Vec<CVar> = ordinary_params.iter().map(|_| fresh.var()).collect();
-                                for (&orig, &renamed) in ordinary_params.iter().zip(&renamed_params) {
+                                let renamed_params: Vec<CVar> =
+                                    ordinary_params.iter().map(|_| fresh.var()).collect();
+                                for (&orig, &renamed) in ordinary_params.iter().zip(&renamed_params)
+                                {
                                     map.insert(orig, renamed);
                                 }
-                                let renamed_body = Self::alpha_rename(&callee.def.body, &mut map, fresh);
+                                let renamed_body =
+                                    Self::alpha_rename(&callee.def.body, &mut map, fresh);
                                 for (&renamed, &id) in renamed_params.iter().zip(&arg_ids) {
                                     self.env.insert(renamed, id);
                                 }
-                                if let CExpr::App { args: ret_args, .. } = self.walk(&renamed_body, units, fresh) {
+                                if let CExpr::App { args: ret_args, .. } =
+                                    self.walk(&renamed_body, units, fresh)
+                                {
                                     if let Some((ret_val, _)) = ret_args.split_last() {
                                         if let Some(ret_id) = self.cval_to_id(ret_val) {
                                             self.env.insert(result_var, ret_id);
@@ -726,24 +876,26 @@ impl Forward {
             // not specific to auto-diff: nothing in the axiom/constant-fold
             // rule set that existed before this needed "the same external
             // var, referenced twice, really is one value" to hold.
-            CVal::Var(cv) => Some(match self.env.get(cv).or_else(|| self.external_vars.get(cv)) {
-                Some(&id) => id,
-                None => {
-                    let sym = Symbol::from(format!("fv{}", self.next_free));
-                    self.next_free += 1;
-                    self.free_vars.insert(sym, v.clone());
-                    // `own_ty` (`ConstantFold::known_types`'s own doc
-                    // comment) needs this recorded *before* `egraph.add`
-                    // below -- `Analysis::make` reads it back while the
-                    // node is being inserted.
-                    if let Some(ty) = self.param_types.get(cv) {
-                        self.egraph.analysis.known_types.insert(sym, ty.clone());
+            CVal::Var(cv) => Some(
+                match self.env.get(cv).or_else(|| self.external_vars.get(cv)) {
+                    Some(&id) => id,
+                    None => {
+                        let sym = Symbol::from(format!("fv{}", self.next_free));
+                        self.next_free += 1;
+                        self.free_vars.insert(sym, v.clone());
+                        // `own_ty` (`ConstantFold::known_types`'s own doc
+                        // comment) needs this recorded *before* `egraph.add`
+                        // below -- `Analysis::make` reads it back while the
+                        // node is being inserted.
+                        if let Some(ty) = self.param_types.get(cv) {
+                            self.egraph.analysis.known_types.insert(sym, ty.clone());
+                        }
+                        let id = self.egraph.add(CleaveLang::Free(sym));
+                        self.external_vars.insert(*cv, id);
+                        id
                     }
-                    let id = self.egraph.add(CleaveLang::Free(sym));
-                    self.external_vars.insert(*cv, id);
-                    id
-                }
-            }),
+                },
+            ),
             CVal::Int(n) => Some(self.egraph.add(CleaveLang::Int(*n))),
             CVal::Float(f) => Some(self.egraph.add(CleaveLang::Float((*f).into()))),
             CVal::Bool(b) => Some(self.egraph.add(CleaveLang::Bool(*b))),
@@ -798,13 +950,28 @@ impl Forward {
             other => other.clone(),
         };
         match expr {
-            CExpr::LetPrim { var, ty, op, args, cont } => {
+            CExpr::LetPrim {
+                var,
+                ty,
+                op,
+                args,
+                cont,
+            } => {
                 let new_args = args.iter().map(|a| rename(a, map)).collect();
                 let new_var = fresh.var();
                 map.insert(*var, new_var);
-                CExpr::LetPrim { var: new_var, ty: ty.clone(), op: op.clone(), args: new_args, cont: Box::new(Self::alpha_rename(cont, map, fresh)) }
+                CExpr::LetPrim {
+                    var: new_var,
+                    ty: ty.clone(),
+                    op: op.clone(),
+                    args: new_args,
+                    cont: Box::new(Self::alpha_rename(cont, map, fresh)),
+                }
             }
-            CExpr::App { func, args } => CExpr::App { func: rename(func, map), args: args.iter().map(|a| rename(a, map)).collect() },
+            CExpr::App { func, args } => CExpr::App {
+                func: rename(func, map),
+                args: args.iter().map(|a| rename(a, map)).collect(),
+            },
             CExpr::Fix { defs, body } => {
                 let new_defs = defs
                     .iter()
@@ -819,33 +986,76 @@ impl Forward {
                                 np
                             })
                             .collect();
-                        CFunDef { name: d.name.clone(), params: new_params, body: Self::alpha_rename(&d.body, &mut inner_map, fresh), carried_types: d.carried_types.clone() }
+                        CFunDef {
+                            name: d.name.clone(),
+                            params: new_params,
+                            body: Self::alpha_rename(&d.body, &mut inner_map, fresh),
+                            carried_types: d.carried_types.clone(),
+                        }
                     })
                     .collect();
-                CExpr::Fix { defs: new_defs, body: Box::new(Self::alpha_rename(body, map, fresh)) }
+                CExpr::Fix {
+                    defs: new_defs,
+                    body: Box::new(Self::alpha_rename(body, map, fresh)),
+                }
             }
-            CExpr::If { cond, then_branch, else_branch } => {
-                CExpr::If { cond: rename(cond, map), then_branch: Box::new(Self::alpha_rename(then_branch, map, fresh)), else_branch: Box::new(Self::alpha_rename(else_branch, map, fresh)) }
-            }
+            CExpr::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => CExpr::If {
+                cond: rename(cond, map),
+                then_branch: Box::new(Self::alpha_rename(then_branch, map, fresh)),
+                else_branch: Box::new(Self::alpha_rename(else_branch, map, fresh)),
+            },
         }
     }
 
-    fn try_unroll_for_loop(&mut self, defs: &[CFunDef], body: &CExpr, units: &HashMap<String, &CTopLevelFn>, fresh: &FreshVars) -> Option<CExpr> {
+    fn try_unroll_for_loop(
+        &mut self,
+        defs: &[CFunDef],
+        body: &CExpr,
+        units: &HashMap<String, &CTopLevelFn>,
+        fresh: &FreshVars,
+    ) -> Option<CExpr> {
         let [loop_def] = defs else { return None };
         loop_def.carried_types.as_ref()?;
-        let CExpr::App { func: CVal::Label(call_label), args: init_args } = body else { return None };
+        let CExpr::App {
+            func: CVal::Label(call_label),
+            args: init_args,
+        } = body
+        else {
+            return None;
+        };
         if call_label != &loop_def.name {
             return None;
         }
         let (&i_var, carried_params) = loop_def.params.split_first()?;
         let (start_val, carried_init) = init_args.split_first()?;
-        let &CVal::Int(start) = start_val else { return None };
+        let &CVal::Int(start) = start_val else {
+            return None;
+        };
 
-        let CExpr::Fix { defs: cond_defs, body: cond_body } = &loop_def.body else { return None };
+        let CExpr::Fix {
+            defs: cond_defs,
+            body: cond_body,
+        } = &loop_def.body
+        else {
+            return None;
+        };
         let (_, _, cmp_args, if_expr) = recognize_real_call(cond_defs, cond_body)?;
-        let [_, CVal::Int(end)] = cmp_args else { return None };
+        let [_, CVal::Int(end)] = cmp_args else {
+            return None;
+        };
         let end = *end;
-        let CExpr::If { then_branch, else_branch, .. } = if_expr else { return None };
+        let CExpr::If {
+            then_branch,
+            else_branch,
+            ..
+        } = if_expr
+        else {
+            return None;
+        };
         if end.saturating_sub(start) > MAX_UNROLL_ITERATIONS {
             return None;
         }
@@ -858,7 +1068,13 @@ impl Forward {
                 self.env.insert(p, id);
             }
             let renamed = Self::alpha_rename(then_branch, &mut HashMap::new(), fresh);
-            let CExpr::App { func: CVal::Label(l), args } = self.walk(&renamed, units, fresh) else { return None };
+            let CExpr::App {
+                func: CVal::Label(l),
+                args,
+            } = self.walk(&renamed, units, fresh)
+            else {
+                return None;
+            };
             if l != loop_def.name {
                 return None;
             }
@@ -887,10 +1103,31 @@ const MAX_UNROLL_ITERATIONS: u64 = 1024;
 /// on `k` is part of the match: an `if`-join/loop's own synthesized
 /// continuation always sets `Some(_)` there instead (see `CFunDef::
 /// carried_types`'s own doc comment), so this can't be confused with either.
-fn recognize_real_call<'a>(defs: &'a [CFunDef], body: &'a CExpr) -> Option<(CVar, &'a str, &'a [CVal], &'a CExpr)> {
-    let [CFunDef { name: k_name, params, body: rest, carried_types: None }] = defs else { return None };
-    let [result_var] = params.as_slice() else { return None };
-    let CExpr::App { func: CVal::Label(unit_name), args } = body else { return None };
+fn recognize_real_call<'a>(
+    defs: &'a [CFunDef],
+    body: &'a CExpr,
+) -> Option<(CVar, &'a str, &'a [CVal], &'a CExpr)> {
+    let [
+        CFunDef {
+            name: k_name,
+            params,
+            body: rest,
+            carried_types: None,
+        },
+    ] = defs
+    else {
+        return None;
+    };
+    let [result_var] = params.as_slice() else {
+        return None;
+    };
+    let CExpr::App {
+        func: CVal::Label(unit_name),
+        args,
+    } = body
+    else {
+        return None;
+    };
     let (last, real_args) = args.split_last()?;
     if !matches!(last, CVal::Label(l) if l == k_name) {
         return None;
@@ -900,7 +1137,7 @@ fn recognize_real_call<'a>(defs: &'a [CFunDef], body: &'a CExpr) -> Option<(CVar
 
 // ---------------------------------------------------------------- axiom -> Rewrite
 
-use crate::ast::{AxiomDecl, DerivativeRuleDecl, Expr, ExprKind};
+use crate::ast::{AxiomDecl, DerivativeRuleDecl, Expr, ExprKind, tuple_struct_name};
 use crate::registry::Registry;
 use egg::{ENodeOrVar, PatternAst, Rewrite, Var};
 use std::collections::HashSet;
@@ -925,11 +1162,17 @@ use std::collections::HashSet;
 /// substitution that doesn't correspond to any unit actually reached is
 /// harmless, not unsound: the resulting rule simply never matches anything
 /// in this particular e-graph.
-pub fn axiom_rewrites(registry: &Registry, reached: &HashMap<String, (String, String)>) -> Vec<Rewrite<CleaveLang, ConstantFold>> {
+pub fn axiom_rewrites(
+    registry: &Registry,
+    reached: &HashMap<String, (String, String)>,
+) -> Vec<Rewrite<CleaveLang, ConstantFold>> {
     let mut reached_types: HashMap<&str, HashSet<&str>> = HashMap::new();
     for (unit_name, (algebra, _method)) in reached {
         if let Some(ty) = concrete_type_of(unit_name) {
-            reached_types.entry(algebra.as_str()).or_default().insert(ty);
+            reached_types
+                .entry(algebra.as_str())
+                .or_default()
+                .insert(ty);
         }
     }
 
@@ -1004,8 +1247,15 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
 /// common single-generic algebra (`Ring<T>`) -- `ty` unchanged, exactly the
 /// flat string every axiom/derivative rule already assumed before this.
 fn generic_substitution(algebra: &str, ty: &str, registry: &Registry) -> HashMap<String, String> {
-    let names = registry.generics(algebra).iter().filter(|g| !matches!(g, crate::ast::GenericParam::Const { .. })).map(|g| g.name());
-    names.zip(split_top_level_commas(ty)).map(|(name, part)| (name.to_string(), part.to_string())).collect()
+    let names = registry
+        .generics(algebra)
+        .iter()
+        .filter(|g| !matches!(g, crate::ast::GenericParam::Const { .. }))
+        .map(|g| g.name());
+    names
+        .zip(split_top_level_commas(ty))
+        .map(|(name, part)| (name.to_string(), part.to_string()))
+        .collect()
 }
 
 /// Resolves one *declared* type (from an algebra's own `fn` signature --
@@ -1017,11 +1267,19 @@ fn generic_substitution(algebra: &str, ty: &str, registry: &Registry) -> HashMap
 /// way) -- a more structured declared type (`Index<Container,Elem,K>`'s own
 /// `idx: [i32; K]`) isn't resolved here, `None` rather than a guess, the
 /// same conservative posture `build_pattern` already takes throughout.
-fn resolve_declared_type(declared: &crate::ast::Type, subst: &HashMap<String, String>) -> Option<String> {
+fn resolve_declared_type(
+    declared: &crate::ast::Type,
+    subst: &HashMap<String, String>,
+) -> Option<String> {
     subst.get(&crate::print::fmt_type(declared)).cloned()
 }
 
-fn axiom_to_rewrite(algebra: &str, ty: &str, axiom: &AxiomDecl, registry: &Registry) -> Option<Rewrite<CleaveLang, ConstantFold>> {
+fn axiom_to_rewrite(
+    algebra: &str,
+    ty: &str,
+    axiom: &AxiomDecl,
+    registry: &Registry,
+) -> Option<Rewrite<CleaveLang, ConstantFold>> {
     // Every axiom in this codebase is declared on a single-generic algebra
     // (`Ring<T>`'s own `add_commutative`, ...) -- every param shares the
     // one flat `ty` uniformly, the same assumption this function has always
@@ -1029,9 +1287,17 @@ fn axiom_to_rewrite(algebra: &str, ty: &str, axiom: &AxiomDecl, registry: &Regis
     // attempted" for axioms specifically). `derivative_rule_type_env`
     // builds the *real*, per-param substitution `derivative` rules need
     // instead (multi-target algebras, e.g. `MatMul<A,B,C>`).
-    let type_env: HashMap<&str, String> = axiom.params.iter().map(|p| (p.name.as_str(), ty.to_string())).collect();
-    let ExprKind::Call(path, _, args, _) = &axiom.body.kind else { return None };
-    let [lhs, rhs] = args.as_slice() else { return None };
+    let type_env: HashMap<&str, String> = axiom
+        .params
+        .iter()
+        .map(|p| (p.name.as_str(), ty.to_string()))
+        .collect();
+    let ExprKind::Call(path, _, args, _) = &axiom.body.kind else {
+        return None;
+    };
+    let [lhs, rhs] = args.as_slice() else {
+        return None;
+    };
     if path.segments.join("::") != "eq" {
         return None; // an axiom body that isn't `lhs == rhs` isn't representable yet
     }
@@ -1039,9 +1305,27 @@ fn axiom_to_rewrite(algebra: &str, ty: &str, axiom: &AxiomDecl, registry: &Regis
     // `derivative`-rule-only concern (`build_pattern`'s own doc comment).
     let mut referenced = HashSet::new();
     let mut lhs_ast = PatternAst::default();
-    build_pattern(lhs, algebra, ty, &type_env, None, &mut referenced, registry, &mut lhs_ast)?;
+    build_pattern(
+        lhs,
+        algebra,
+        ty,
+        &type_env,
+        None,
+        &mut referenced,
+        registry,
+        &mut lhs_ast,
+    )?;
     let mut rhs_ast = PatternAst::default();
-    build_pattern(rhs, algebra, ty, &type_env, None, &mut referenced, registry, &mut rhs_ast)?;
+    build_pattern(
+        rhs,
+        algebra,
+        ty,
+        &type_env,
+        None,
+        &mut referenced,
+        registry,
+        &mut rhs_ast,
+    )?;
     let name = format!("{}@{algebra}<{ty}>", axiom.name);
     Rewrite::new(name, egg::Pattern::new(lhs_ast), egg::Pattern::new(rhs_ast)).ok()
 }
@@ -1122,21 +1406,36 @@ fn build_pattern(
         }
         ExprKind::NumberLit { text, .. } if matches!(ty, "f32" | "f64") => {
             let n: f64 = text.parse().ok()?;
-            Some((ast.add(ENodeOrVar::ENode(CleaveLang::Float(n.into()))), None))
+            Some((
+                ast.add(ENodeOrVar::ENode(CleaveLang::Float(n.into()))),
+                None,
+            ))
         }
         ExprKind::NumberLit { text, .. } => {
             let n: u64 = text.parse().ok()?;
             Some((ast.add(ENodeOrVar::ENode(CleaveLang::Int(n))), None))
         }
         ExprKind::BoolLit(b) => Some((ast.add(ENodeOrVar::ENode(CleaveLang::Bool(*b))), None)),
-        ExprKind::Call(path, _, call_args, _) if path.segments.join("::") == "d" && d_var.is_some() => {
-            let [inner] = call_args.as_slice() else { return None }; // `d(...)` always takes exactly one argument
-            let (inner_id, inner_ty) = build_pattern(inner, algebra, ty, type_env, d_var, referenced, registry, ast)?;
+        ExprKind::Call(path, _, call_args, _)
+            if path.segments.join("::") == "d" && d_var.is_some() =>
+        {
+            let [inner] = call_args.as_slice() else {
+                return None;
+            }; // `d(...)` always takes exactly one argument
+            let (inner_id, inner_ty) = build_pattern(
+                inner, algebra, ty, type_env, d_var, referenced, registry, ast,
+            )?;
             let x_id = ast.add(ENodeOrVar::Var(d_var.unwrap()));
             // Differentiating distributes component-wise (`construction_
             // derivative_rewrites`'s own doc comment) -- `d(inner)` always
             // has the exact same shape/type as `inner` itself.
-            Some((ast.add(ENodeOrVar::ENode(CleaveLang::Op("derivative".into(), vec![inner_id, x_id]))), inner_ty))
+            Some((
+                ast.add(ENodeOrVar::ENode(CleaveLang::Op(
+                    "derivative".into(),
+                    vec![inner_id, x_id],
+                ))),
+                inner_ty,
+            ))
         }
         ExprKind::Call(path, _, call_args, _) => {
             let method = path.segments.join("::");
@@ -1153,10 +1452,16 @@ fn build_pattern(
             // declares it) or simply unknown — rejected, not guessed,
             // same posture as everywhere else `build_pattern` returns
             // `None`.
-            let owner = if registry.fn_sig(algebra, &method).is_some_and(|sig| sig.params.len() == call_args.len()) {
+            let owner = if registry
+                .fn_sig(algebra, &method)
+                .is_some_and(|sig| sig.params.len() == call_args.len())
+            {
                 algebra.to_string()
             } else {
-                match registry.algebras_with_fn(&method, call_args.len()).as_slice() {
+                match registry
+                    .algebras_with_fn(&method, call_args.len())
+                    .as_slice()
+                {
                     [only] => only.to_string(),
                     _ => return None,
                 }
@@ -1164,7 +1469,8 @@ fn build_pattern(
             let mut ids = Vec::with_capacity(call_args.len());
             let mut arg_types: Vec<Option<String>> = Vec::with_capacity(call_args.len());
             for a in call_args {
-                let (id, arg_ty) = build_pattern(a, algebra, ty, type_env, d_var, referenced, registry, ast)?;
+                let (id, arg_ty) =
+                    build_pattern(a, algebra, ty, type_env, d_var, referenced, registry, ast)?;
                 ids.push(id);
                 arg_types.push(arg_ty);
             }
@@ -1210,7 +1516,9 @@ fn build_pattern(
             let result_ty = registry
                 .fn_sig(&owner, &method)
                 .and_then(|sig| sig.ret.as_ref())
-                .and_then(|ret| resolve_declared_type(ret, &generic_substitution(&owner, &call_ty, registry)));
+                .and_then(|ret| {
+                    resolve_declared_type(ret, &generic_substitution(&owner, &call_ty, registry))
+                });
             let call_id = ast.add(ENodeOrVar::ENode(CleaveLang::Op(unit_name.into(), ids)));
             Some((call_id, result_ty))
         }
@@ -1235,7 +1543,7 @@ pub fn struct_projection_rewrites(
     field_ops: &HashMap<Symbol, (Ty, String, Ty)>,
 ) -> Vec<Rewrite<CleaveLang, ConstantFold>> {
     let mut rules = Vec::new();
-    for (struct_sym, (struct_name, field_names, struct_ty)) in struct_ops {
+    for (struct_sym, (_struct_name, field_names, struct_ty)) in struct_ops {
         for field_name in field_names {
             let field_sym = Symbol::from(format!("field:{struct_ty}:{field_name}"));
             if !field_ops.contains_key(&field_sym) {
@@ -1243,16 +1551,38 @@ pub fn struct_projection_rewrites(
             }
 
             let mut lhs_ast = PatternAst::default();
-            let struct_children: Vec<egg::Id> =
-                field_names.iter().map(|f| lhs_ast.add(ENodeOrVar::Var(Var::from(Symbol::from(format!("?{f}")))))).collect();
-            let struct_id = lhs_ast.add(ENodeOrVar::ENode(CleaveLang::Op(*struct_sym, struct_children)));
-            lhs_ast.add(ENodeOrVar::ENode(CleaveLang::Op(field_sym, vec![struct_id])));
+            let struct_children: Vec<egg::Id> = field_names
+                .iter()
+                .map(|f| lhs_ast.add(ENodeOrVar::Var(Var::from(Symbol::from(format!("?{f}"))))))
+                .collect();
+            let struct_id = lhs_ast.add(ENodeOrVar::ENode(CleaveLang::Op(
+                *struct_sym,
+                struct_children,
+            )));
+            lhs_ast.add(ENodeOrVar::ENode(CleaveLang::Op(
+                field_sym,
+                vec![struct_id],
+            )));
 
             let mut rhs_ast = PatternAst::default();
-            rhs_ast.add(ENodeOrVar::Var(Var::from(Symbol::from(format!("?{field_name}")))));
+            rhs_ast.add(ENodeOrVar::Var(Var::from(Symbol::from(format!(
+                "?{field_name}"
+            )))));
 
-            let name = format!("struct-projection:{struct_name}.{field_name}");
-            if let Ok(rw) = Rewrite::new(name, egg::Pattern::new(lhs_ast), egg::Pattern::new(rhs_ast)) {
+            // `struct_ty` (the concrete instantiation, e.g. `Dense<f32, 2,
+            // 2>`), not `struct_name` (the bare, shared struct name,
+            // `Dense`) -- two *different* concrete instantiations of the
+            // same generic struct (`Network`'s own `l1: Dense<f32,2,2>` and
+            // `l2: Dense<f32,2,1>`) each get their own real rewrite here,
+            // and `Rewrite::new` requires a globally unique name -- found
+            // directly, by testing `Network`: egg's own "duplicated rule
+            // name" warning on `struct-projection:Dense.w`, harmless for
+            // correctness (a rule's own name is metadata, not part of its
+            // matching semantics) but real, avoidable noise.
+            let name = format!("struct-projection:{struct_ty}.{field_name}");
+            if let Ok(rw) =
+                Rewrite::new(name, egg::Pattern::new(lhs_ast), egg::Pattern::new(rhs_ast))
+            {
                 rules.push(rw);
             }
         }
@@ -1283,13 +1613,22 @@ fn construction_derivative_rewrites(
     let x = Var::from(Symbol::from("?__diff_x"));
 
     for (struct_sym, (_struct_name, field_names, struct_ty)) in struct_ops {
-        let field_vars: Vec<Var> = field_names.iter().map(|f| Var::from(Symbol::from(format!("?{f}")))).collect();
+        let field_vars: Vec<Var> = field_names
+            .iter()
+            .map(|f| Var::from(Symbol::from(format!("?{f}"))))
+            .collect();
 
         let mut lhs = PatternAst::default();
-        let field_ids: Vec<egg::Id> = field_vars.iter().map(|&v| lhs.add(ENodeOrVar::Var(v))).collect();
+        let field_ids: Vec<egg::Id> = field_vars
+            .iter()
+            .map(|&v| lhs.add(ENodeOrVar::Var(v)))
+            .collect();
         let struct_id = lhs.add(ENodeOrVar::ENode(CleaveLang::Op(*struct_sym, field_ids)));
         let x_id_lhs = lhs.add(ENodeOrVar::Var(x));
-        lhs.add(ENodeOrVar::ENode(CleaveLang::Op("derivative".into(), vec![struct_id, x_id_lhs])));
+        lhs.add(ENodeOrVar::ENode(CleaveLang::Op(
+            "derivative".into(),
+            vec![struct_id, x_id_lhs],
+        )));
 
         let mut rhs = PatternAst::default();
         let x_id_rhs = rhs.add(ENodeOrVar::Var(x));
@@ -1297,7 +1636,10 @@ fn construction_derivative_rewrites(
             .iter()
             .map(|&v| {
                 let f_id = rhs.add(ENodeOrVar::Var(v));
-                rhs.add(ENodeOrVar::ENode(CleaveLang::Op("derivative".into(), vec![f_id, x_id_rhs])))
+                rhs.add(ENodeOrVar::ENode(CleaveLang::Op(
+                    "derivative".into(),
+                    vec![f_id, x_id_rhs],
+                )))
             })
             .collect();
         rhs.add(ENodeOrVar::ENode(CleaveLang::Op(*struct_sym, d_field_ids)));
@@ -1323,14 +1665,29 @@ fn construction_derivative_rewrites(
         // (`array:{ty}:{count}`, `Forward::walk`'s own `PrimOp::Array` arm)
         // -- `array_ops`'s value is the element type alone, so the arity
         // has to be parsed back out here rather than read off a field.
-        let Some(count) = array_sym.as_str().rsplit(':').next().and_then(|n| n.parse::<usize>().ok()) else { continue };
-        let elem_vars: Vec<Var> = (0..count).map(|i| Var::from(Symbol::from(format!("?e{i}")))).collect();
+        let Some(count) = array_sym
+            .as_str()
+            .rsplit(':')
+            .next()
+            .and_then(|n| n.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        let elem_vars: Vec<Var> = (0..count)
+            .map(|i| Var::from(Symbol::from(format!("?e{i}"))))
+            .collect();
 
         let mut lhs = PatternAst::default();
-        let elem_ids: Vec<egg::Id> = elem_vars.iter().map(|&v| lhs.add(ENodeOrVar::Var(v))).collect();
+        let elem_ids: Vec<egg::Id> = elem_vars
+            .iter()
+            .map(|&v| lhs.add(ENodeOrVar::Var(v)))
+            .collect();
         let array_id = lhs.add(ENodeOrVar::ENode(CleaveLang::Op(*array_sym, elem_ids)));
         let x_id_lhs = lhs.add(ENodeOrVar::Var(x));
-        lhs.add(ENodeOrVar::ENode(CleaveLang::Op("derivative".into(), vec![array_id, x_id_lhs])));
+        lhs.add(ENodeOrVar::ENode(CleaveLang::Op(
+            "derivative".into(),
+            vec![array_id, x_id_lhs],
+        )));
 
         let mut rhs = PatternAst::default();
         let x_id_rhs = rhs.add(ENodeOrVar::Var(x));
@@ -1338,7 +1695,10 @@ fn construction_derivative_rewrites(
             .iter()
             .map(|&v| {
                 let e_id = rhs.add(ENodeOrVar::Var(v));
-                rhs.add(ENodeOrVar::ENode(CleaveLang::Op("derivative".into(), vec![e_id, x_id_rhs])))
+                rhs.add(ENodeOrVar::ENode(CleaveLang::Op(
+                    "derivative".into(),
+                    vec![e_id, x_id_rhs],
+                )))
             })
             .collect();
         rhs.add(ENodeOrVar::ENode(CleaveLang::Op(*array_sym, d_elem_ids)));
@@ -1382,8 +1742,16 @@ pub fn derivative_rewrites(
     reached: &HashMap<String, (String, String)>,
     registry: &Registry,
     unit_names: &HashSet<String>,
-) -> (Vec<Rewrite<CleaveLang, ConstantFold>>, HashSet<String>, std::sync::Arc<std::sync::Mutex<HashSet<String>>>) {
-    let one = if matches!(ty, "f32" | "f64") { CleaveLang::Float(1.0.into()) } else { CleaveLang::Int(1) };
+) -> (
+    Vec<Rewrite<CleaveLang, ConstantFold>>,
+    HashSet<String>,
+    std::sync::Arc<std::sync::Mutex<HashSet<String>>>,
+) {
+    let one = if matches!(ty, "f32" | "f64") {
+        CleaveLang::Float(1.0.into())
+    } else {
+        CleaveLang::Int(1)
+    };
 
     let mut rules = Vec::new();
 
@@ -1398,10 +1766,17 @@ pub fn derivative_rewrites(
         let x = Var::from(Symbol::from("?x"));
         let x1 = lhs.add(ENodeOrVar::Var(x));
         let x2 = lhs.add(ENodeOrVar::Var(x));
-        lhs.add(ENodeOrVar::ENode(CleaveLang::Op("derivative".into(), vec![x1, x2])));
+        lhs.add(ENodeOrVar::ENode(CleaveLang::Op(
+            "derivative".into(),
+            vec![x1, x2],
+        )));
         let mut rhs = PatternAst::default();
         rhs.add(ENodeOrVar::ENode(one.clone()));
-        if let Ok(rw) = Rewrite::new("derivative-self", egg::Pattern::new(lhs), egg::Pattern::new(rhs)) {
+        if let Ok(rw) = Rewrite::new(
+            "derivative-self",
+            egg::Pattern::new(lhs),
+            egg::Pattern::new(rhs),
+        ) {
             rules.push(rw);
         }
     }
@@ -1465,10 +1840,21 @@ pub fn derivative_rewrites(
         let mut lhs = PatternAst::default();
         let a_id = lhs.add(ENodeOrVar::Var(a));
         let x_id = lhs.add(ENodeOrVar::Var(x));
-        lhs.add(ENodeOrVar::ENode(CleaveLang::Op("derivative".into(), vec![a_id, x_id])));
-        let applier =
-            IndependentZeroApplier { a, x, unit_names: unit_names.clone(), zero_calls_used: std::sync::Arc::clone(&zero_calls_used) };
-        if let Ok(rw) = Rewrite::new("derivative-independent-zero", egg::Pattern::new(lhs), applier) {
+        lhs.add(ENodeOrVar::ENode(CleaveLang::Op(
+            "derivative".into(),
+            vec![a_id, x_id],
+        )));
+        let applier = IndependentZeroApplier {
+            a,
+            x,
+            unit_names: unit_names.clone(),
+            zero_calls_used: std::sync::Arc::clone(&zero_calls_used),
+        };
+        if let Ok(rw) = Rewrite::new(
+            "derivative-independent-zero",
+            egg::Pattern::new(lhs),
+            applier,
+        ) {
             rules.push(rw);
         }
     }
@@ -1536,7 +1922,11 @@ impl Applier<CleaveLang, ConstantFold> for IndependentZeroApplier {
         // disjointness rather than a bare `.contains` reads the same but
         // stays correct even if `x` were ever something richer than a
         // single free variable.
-        if !egraph[x_class].data.free_deps.is_disjoint(&egraph[a_class].data.free_deps) {
+        if !egraph[x_class]
+            .data
+            .free_deps
+            .is_disjoint(&egraph[a_class].data.free_deps)
+        {
             return vec![];
         }
         // A bare literal's own *kind* (`CleaveLang::Float`/`Int`) already
@@ -1545,15 +1935,29 @@ impl Applier<CleaveLang, ConstantFold> for IndependentZeroApplier {
         // `derivative(3.0, x) -> 0` keeps working even where nothing (a
         // hand-built test e-graph, say, bypassing `Forward` entirely) ever
         // populated `ConstantFold::known_types`.
-        let is_float = egraph[a_class].nodes.iter().any(|n| matches!(n, CleaveLang::Float(_)));
-        let is_int = egraph[a_class].nodes.iter().any(|n| matches!(n, CleaveLang::Int(_)));
+        let is_float = egraph[a_class]
+            .nodes
+            .iter()
+            .any(|n| matches!(n, CleaveLang::Float(_)));
+        let is_int = egraph[a_class]
+            .nodes
+            .iter()
+            .any(|n| matches!(n, CleaveLang::Int(_)));
         if is_float || is_int {
-            let zero_id = if is_float { egraph.add(CleaveLang::Float(0.0.into())) } else { egraph.add(CleaveLang::Int(0)) };
+            let zero_id = if is_float {
+                egraph.add(CleaveLang::Float(0.0.into()))
+            } else {
+                egraph.add(CleaveLang::Int(0))
+            };
             egraph.union(eclass, zero_id);
             return vec![eclass];
         }
-        let Some(ty) = egraph[a_class].data.own_ty.clone() else { return vec![] }; // shape unknown -- don't guess, let the chain rule supply the answer elsewhere
-        let Some(zero_id) = build_zero(egraph, &ty, &self.unit_names, &self.zero_calls_used) else { return vec![] };
+        let Some(ty) = egraph[a_class].data.own_ty.clone() else {
+            return vec![];
+        }; // shape unknown -- don't guess, let the chain rule supply the answer elsewhere
+        let Some(zero_id) = build_zero(egraph, &ty, &self.unit_names, &self.zero_calls_used) else {
+            return vec![];
+        };
         egraph.union(eclass, zero_id);
         vec![eclass]
     }
@@ -1583,7 +1987,11 @@ fn build_zero(
     }
     zero_calls_used.lock().unwrap().insert(unit_name.clone());
     let sym = Symbol::from(unit_name);
-    egraph.analysis.known_types.entry(sym).or_insert_with(|| ty.clone());
+    egraph
+        .analysis
+        .known_types
+        .entry(sym)
+        .or_insert_with(|| ty.clone());
     Some(egraph.add(CleaveLang::Op(sym, vec![])))
 }
 
@@ -1596,11 +2004,17 @@ fn build_zero(
 /// `synthesize_derivatives` needs it to let `rebuild` recognize a unit a
 /// fired rule references that the function actually being differentiated
 /// never itself called.
-fn derivative_rule_rewrites(registry: &Registry, reached: &HashMap<String, (String, String)>) -> (Vec<Rewrite<CleaveLang, ConstantFold>>, HashSet<String>) {
+fn derivative_rule_rewrites(
+    registry: &Registry,
+    reached: &HashMap<String, (String, String)>,
+) -> (Vec<Rewrite<CleaveLang, ConstantFold>>, HashSet<String>) {
     let mut reached_types: HashMap<&str, HashSet<&str>> = HashMap::new();
     for (unit_name, (algebra, _method)) in reached {
         if let Some(ty) = concrete_type_of(unit_name) {
-            reached_types.entry(algebra.as_str()).or_default().insert(ty);
+            reached_types
+                .entry(algebra.as_str())
+                .or_default()
+                .insert(ty);
         }
     }
 
@@ -1661,7 +2075,12 @@ fn derivative_rule_rewrites(registry: &Registry, reached: &HashMap<String, (Stri
 /// param only feeds a *same*-algebra recursive call in practice (`Index`'s
 /// own `idx: [i32; K]`), which ignores `type_env` entirely and reuses `ty`
 /// unchanged regardless.
-fn derivative_rule_to_rewrite(algebra: &str, ty: &str, rule: &DerivativeRuleDecl, registry: &Registry) -> Option<(Rewrite<CleaveLang, ConstantFold>, HashSet<String>)> {
+fn derivative_rule_to_rewrite(
+    algebra: &str,
+    ty: &str,
+    rule: &DerivativeRuleDecl,
+    registry: &Registry,
+) -> Option<(Rewrite<CleaveLang, ConstantFold>, HashSet<String>)> {
     let sig = registry.fn_sig(algebra, &rule.method)?;
     let subst = generic_substitution(algebra, ty, registry);
     let type_env: HashMap<&str, String> = rule
@@ -1669,7 +2088,11 @@ fn derivative_rule_to_rewrite(algebra: &str, ty: &str, rule: &DerivativeRuleDecl
         .iter()
         .zip(&sig.params)
         .map(|(rule_p, sig_p)| {
-            let resolved = sig_p.ty.as_ref().and_then(|declared| resolve_declared_type(declared, &subst)).unwrap_or_else(|| ty.to_string());
+            let resolved = sig_p
+                .ty
+                .as_ref()
+                .and_then(|declared| resolve_declared_type(declared, &subst))
+                .unwrap_or_else(|| ty.to_string());
             (rule_p.name.as_str(), resolved)
         })
         .collect();
@@ -1678,15 +2101,33 @@ fn derivative_rule_to_rewrite(algebra: &str, ty: &str, rule: &DerivativeRuleDecl
     let mut lhs = PatternAst::default();
     let mut param_ids = Vec::with_capacity(rule.params.len());
     for p in &rule.params {
-        param_ids.push(lhs.add(ENodeOrVar::Var(Var::from(Symbol::from(format!("?{}", p.name))))));
+        param_ids.push(lhs.add(ENodeOrVar::Var(Var::from(Symbol::from(format!(
+            "?{}",
+            p.name
+        ))))));
     }
-    let method_id = lhs.add(ENodeOrVar::ENode(CleaveLang::Op(format!("{algebra}::{}<{ty}>", rule.method).into(), param_ids)));
+    let method_id = lhs.add(ENodeOrVar::ENode(CleaveLang::Op(
+        format!("{algebra}::{}<{ty}>", rule.method).into(),
+        param_ids,
+    )));
     let x_id_lhs = lhs.add(ENodeOrVar::Var(x));
-    lhs.add(ENodeOrVar::ENode(CleaveLang::Op("derivative".into(), vec![method_id, x_id_lhs])));
+    lhs.add(ENodeOrVar::ENode(CleaveLang::Op(
+        "derivative".into(),
+        vec![method_id, x_id_lhs],
+    )));
 
     let mut referenced = HashSet::new();
     let mut rhs = PatternAst::default();
-    build_pattern(&rule.body, algebra, ty, &type_env, Some(x), &mut referenced, registry, &mut rhs)?;
+    build_pattern(
+        &rule.body,
+        algebra,
+        ty,
+        &type_env,
+        Some(x),
+        &mut referenced,
+        registry,
+        &mut rhs,
+    )?;
 
     let name = format!("derivative-{algebra}::{}<{ty}>", rule.method);
     let rw = Rewrite::new(name, egg::Pattern::new(lhs), egg::Pattern::new(rhs)).ok()?;
@@ -1716,7 +2157,11 @@ impl egg::CostFunction<CleaveLang> for DerivativeFreeCost {
     where
         C: FnMut(Id) -> Self::Cost,
     {
-        let penalty = if matches!(enode, CleaveLang::Op(sym, _) if sym.as_str() == "derivative") { 1_000_000 } else { 0 };
+        let penalty = if matches!(enode, CleaveLang::Op(sym, _) if sym.as_str() == "derivative") {
+            1_000_000
+        } else {
+            0
+        };
         enode.fold(1 + penalty, |sum, id| sum.saturating_add(costs(id)))
     }
 }
@@ -1784,7 +2229,14 @@ struct OpTables<'a> {
 /// map, each borrow scoped to one statement so runtime borrow conflicts
 /// can't arise (nothing here ever holds a `Ref`/`RefMut` across a nested
 /// call).
-fn rebuild(recexpr: &RecExpr<CleaveLang>, id: egg::Id, fresh: &FreshVars, tables: &OpTables, memo: &RefCell<HashMap<egg::Id, CVal>>, k: &dyn Fn(CVal) -> CExpr) -> CExpr {
+fn rebuild(
+    recexpr: &RecExpr<CleaveLang>,
+    id: egg::Id,
+    fresh: &FreshVars,
+    tables: &OpTables,
+    memo: &RefCell<HashMap<egg::Id, CVal>>,
+    k: &dyn Fn(CVal) -> CExpr,
+) -> CExpr {
     // `.cloned()` right here, not `if let Some(v) = memo.borrow().get(&id)`
     // -- the latter keeps the `Ref` guard alive for the whole `if let`
     // *body* (`v` borrows from it), so a `k` that recurses into another
@@ -1799,9 +2251,14 @@ fn rebuild(recexpr: &RecExpr<CleaveLang>, id: egg::Id, fresh: &FreshVars, tables
         CleaveLang::Float(f) => k(CVal::Float((*f).into())),
         CleaveLang::Bool(b) => k(CVal::Bool(*b)),
         CleaveLang::Free(sym) => {
-            let v = tables.free_vars.get(sym).unwrap_or_else(|| panic!("egraph: no original CVal recorded for free symbol `{sym}`"));
+            let v = tables.free_vars.get(sym).unwrap_or_else(|| {
+                panic!("egraph: no original CVal recorded for free symbol `{sym}`")
+            });
             let v = match v {
-                CVal::Var(cv) => tables.param_substitution.get(cv).map_or_else(|| v.clone(), |&new_cv| CVal::Var(new_cv)),
+                CVal::Var(cv) => tables
+                    .param_substitution
+                    .get(cv)
+                    .map_or_else(|| v.clone(), |&new_cv| CVal::Var(new_cv)),
                 other => other.clone(),
             };
             k(v)
@@ -1815,7 +2272,10 @@ fn rebuild(recexpr: &RecExpr<CleaveLang>, id: egg::Id, fresh: &FreshVars, tables
                     CExpr::LetPrim {
                         var,
                         ty: ty.clone(),
-                        op: PrimOp::RawMlirOp { op: op.clone(), attrs: attrs.clone() },
+                        op: PrimOp::RawMlirOp {
+                            op: op.clone(),
+                            attrs: attrs.clone(),
+                        },
                         args: arg_vals,
                         cont: Box::new(k(CVal::Var(var))),
                     }
@@ -1835,25 +2295,42 @@ fn rebuild(recexpr: &RecExpr<CleaveLang>, id: egg::Id, fresh: &FreshVars, tables
                     CExpr::LetPrim {
                         var,
                         ty: ty.clone(),
-                        op: PrimOp::Field { struct_ty: struct_ty.clone(), field: field.clone() },
+                        op: PrimOp::Field {
+                            struct_ty: struct_ty.clone(),
+                            field: field.clone(),
+                        },
                         args: arg_vals,
                         cont: Box::new(k(CVal::Var(var))),
                     }
                 } else if let Some(ty) = tables.array_ops.get(sym) {
                     let var = fresh.var();
                     memo.borrow_mut().insert(id, CVal::Var(var));
-                    CExpr::LetPrim { var, ty: ty.clone(), op: PrimOp::Array, args: arg_vals, cont: Box::new(k(CVal::Var(var))) }
+                    CExpr::LetPrim {
+                        var,
+                        ty: ty.clone(),
+                        op: PrimOp::Array,
+                        args: arg_vals,
+                        cont: Box::new(k(CVal::Var(var))),
+                    }
                 } else if let Some(ty) = tables.array_repeat_ops.get(sym) {
                     let var = fresh.var();
                     memo.borrow_mut().insert(id, CVal::Var(var));
-                    CExpr::LetPrim { var, ty: ty.clone(), op: PrimOp::ArrayRepeat, args: arg_vals, cont: Box::new(k(CVal::Var(var))) }
+                    CExpr::LetPrim {
+                        var,
+                        ty: ty.clone(),
+                        op: PrimOp::ArrayRepeat,
+                        args: arg_vals,
+                        cont: Box::new(k(CVal::Var(var))),
+                    }
                 } else if let Some((array_ty, ty)) = tables.load_ops.get(sym) {
                     let var = fresh.var();
                     memo.borrow_mut().insert(id, CVal::Var(var));
                     CExpr::LetPrim {
                         var,
                         ty: ty.clone(),
-                        op: PrimOp::Load { array_ty: array_ty.clone() },
+                        op: PrimOp::Load {
+                            array_ty: array_ty.clone(),
+                        },
                         args: arg_vals,
                         cont: Box::new(k(CVal::Var(var))),
                     }
@@ -1864,8 +2341,16 @@ fn rebuild(recexpr: &RecExpr<CleaveLang>, id: egg::Id, fresh: &FreshVars, tables
                     let mut call_args = arg_vals;
                     call_args.push(CVal::Label(k_label.clone()));
                     CExpr::Fix {
-                        defs: vec![CFunDef { name: k_label, params: vec![result_var], body: k(CVal::Var(result_var)), carried_types: None }],
-                        body: Box::new(CExpr::App { func: CVal::Label(name.to_string()), args: call_args }),
+                        defs: vec![CFunDef {
+                            name: k_label,
+                            params: vec![result_var],
+                            body: k(CVal::Var(result_var)),
+                            carried_types: None,
+                        }],
+                        body: Box::new(CExpr::App {
+                            func: CVal::Label(name.to_string()),
+                            args: call_args,
+                        }),
                     }
                 } else {
                     // A rewrite rule (an axiom) introduced a symbol neither
@@ -1875,16 +2360,35 @@ fn rebuild(recexpr: &RecExpr<CleaveLang>, id: egg::Id, fresh: &FreshVars, tables
                     // worth-panicking-on bug if it ever did: silently
                     // guessing how to lower an unknown op would be far
                     // worse.
-                    panic!("egraph: extracted `Op` node `{name}` is in none of this module's own lookup tables, nor a known real call");
+                    panic!(
+                        "egraph: extracted `Op` node `{name}` is in none of this module's own lookup tables, nor a known real call"
+                    );
                 }
             })
         }
     }
 }
 
-fn rebuild_args(recexpr: &RecExpr<CleaveLang>, ids: &[egg::Id], fresh: &FreshVars, tables: &OpTables, memo: &RefCell<HashMap<egg::Id, CVal>>, k: &dyn Fn(Vec<CVal>) -> CExpr) -> CExpr {
-    fn go(recexpr: &RecExpr<CleaveLang>, ids: &[egg::Id], fresh: &FreshVars, tables: &OpTables, memo: &RefCell<HashMap<egg::Id, CVal>>, acc: Vec<CVal>, k: &dyn Fn(Vec<CVal>) -> CExpr) -> CExpr {
-        let Some((first, rest)) = ids.split_first() else { return k(acc) };
+fn rebuild_args(
+    recexpr: &RecExpr<CleaveLang>,
+    ids: &[egg::Id],
+    fresh: &FreshVars,
+    tables: &OpTables,
+    memo: &RefCell<HashMap<egg::Id, CVal>>,
+    k: &dyn Fn(Vec<CVal>) -> CExpr,
+) -> CExpr {
+    fn go(
+        recexpr: &RecExpr<CleaveLang>,
+        ids: &[egg::Id],
+        fresh: &FreshVars,
+        tables: &OpTables,
+        memo: &RefCell<HashMap<egg::Id, CVal>>,
+        acc: Vec<CVal>,
+        k: &dyn Fn(Vec<CVal>) -> CExpr,
+    ) -> CExpr {
+        let Some((first, rest)) = ids.split_first() else {
+            return k(acc);
+        };
         rebuild(recexpr, *first, fresh, tables, memo, &|v| {
             let mut acc2 = acc.clone();
             acc2.push(v);
@@ -1923,25 +2427,52 @@ pub(crate) fn rebuild_segment(
     fresh: &FreshVars,
 ) -> CExpr {
     let no_substitution = HashMap::new();
-    let tables = OpTables { free_vars, raw_ops, call_units, struct_ops, field_ops, array_ops, array_repeat_ops, load_ops, param_substitution: &no_substitution };
+    let tables = OpTables {
+        free_vars,
+        raw_ops,
+        call_units,
+        struct_ops,
+        field_ops,
+        array_ops,
+        array_repeat_ops,
+        load_ops,
+        param_substitution: &no_substitution,
+    };
     let memo = RefCell::new(HashMap::new());
-    rebuild(recexpr, root, fresh, &tables, &memo, &|final_val| substitute_var(boundary, old_root_var, &final_val))
+    rebuild(recexpr, root, fresh, &tables, &memo, &|final_val| {
+        substitute_var(boundary, old_root_var, &final_val)
+    })
 }
 
 /// Replaces every occurrence of `CVal::Var(from)` with `to`, throughout
 /// `expr` — used by `rebuild_segment` to patch the boundary's own
 /// reference to the segment's original final value.
 fn substitute_var(expr: &CExpr, from: CVar, to: &CVal) -> CExpr {
-    let sub = |v: &CVal| if matches!(v, CVal::Var(cv) if *cv == from) { to.clone() } else { v.clone() };
+    let sub = |v: &CVal| {
+        if matches!(v, CVal::Var(cv) if *cv == from) {
+            to.clone()
+        } else {
+            v.clone()
+        }
+    };
     match expr {
-        CExpr::LetPrim { var, ty, op, args, cont } => CExpr::LetPrim {
+        CExpr::LetPrim {
+            var,
+            ty,
+            op,
+            args,
+            cont,
+        } => CExpr::LetPrim {
             var: *var,
             ty: ty.clone(),
             op: op.clone(),
             args: args.iter().map(sub).collect(),
             cont: Box::new(substitute_var(cont, from, to)),
         },
-        CExpr::App { func, args } => CExpr::App { func: sub(func), args: args.iter().map(sub).collect() },
+        CExpr::App { func, args } => CExpr::App {
+            func: sub(func),
+            args: args.iter().map(sub).collect(),
+        },
         CExpr::Fix { defs, body } => CExpr::Fix {
             defs: defs
                 .iter()
@@ -1954,7 +2485,11 @@ fn substitute_var(expr: &CExpr, from: CVar, to: &CVal) -> CExpr {
                 .collect(),
             body: Box::new(substitute_var(body, from, to)),
         },
-        CExpr::If { cond, then_branch, else_branch } => CExpr::If {
+        CExpr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => CExpr::If {
             cond: sub(cond),
             then_branch: Box::new(substitute_var(then_branch, from, to)),
             else_branch: Box::new(substitute_var(else_branch, from, to)),
@@ -1996,7 +2531,11 @@ fn collect_var_refs(expr: &CExpr, out: &mut HashSet<CVar>) {
             }
             collect_var_refs(body, out);
         }
-        CExpr::If { cond, then_branch, else_branch } => {
+        CExpr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
             note(cond, out);
             collect_var_refs(then_branch, out);
             collect_var_refs(else_branch, out);
@@ -2051,7 +2590,11 @@ fn max_cvar_in_cexpr(expr: &CExpr, max: &mut CVar) {
             }
             max_cvar_in_cexpr(body, max);
         }
-        CExpr::If { then_branch, else_branch, .. } => {
+        CExpr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
             max_cvar_in_cexpr(then_branch, max);
             max_cvar_in_cexpr(else_branch, max);
         }
@@ -2096,7 +2639,11 @@ fn max_cvar_in_program(program: &CpsProgram) -> CVar {
 /// debugging tool, given a real CLI surface here rather than later.
 pub fn optimize_program(program: CpsProgram, registry: &Registry) -> (CpsProgram, Vec<String>) {
     let fresh = FreshVars::starting_at(max_cvar_in_program(&program) + 1);
-    let units: HashMap<String, &CTopLevelFn> = program.funcs.iter().map(|f| (f.def.name.clone(), f)).collect();
+    let units: HashMap<String, &CTopLevelFn> = program
+        .funcs
+        .iter()
+        .map(|f| (f.def.name.clone(), f))
+        .collect();
 
     let mut new_bodies: HashMap<String, CExpr> = HashMap::new();
     let mut explanations = Vec::new();
@@ -2111,10 +2658,18 @@ pub fn optimize_program(program: CpsProgram, registry: &Registry) -> (CpsProgram
         // this same function's own note on `with_egraph` below).
         fwd.egraph = fwd.egraph.with_explanations_enabled();
         let real_params = &f.def.params[..f.def.params.len() - 1];
-        fwd.param_types = real_params.iter().copied().zip(f.param_types.iter().cloned()).collect();
+        fwd.param_types = real_params
+            .iter()
+            .copied()
+            .zip(f.param_types.iter().cloned())
+            .collect();
         let boundary = fwd.walk(&f.def.body, &units, &fresh);
-        let Some(root_var) = segment_root_var(&boundary, &fwd.env) else { continue };
-        let Some(&root_id) = fwd.env.get(&root_var) else { continue };
+        let Some(root_var) = segment_root_var(&boundary, &fwd.env) else {
+            continue;
+        };
+        let Some(&root_id) = fwd.env.get(&root_var) else {
+            continue;
+        };
 
         let mut rules = axiom_rewrites(registry, &fwd.reached);
         rules.extend(struct_projection_rewrites(&fwd.struct_ops, &fwd.field_ops));
@@ -2129,7 +2684,18 @@ pub fn optimize_program(program: CpsProgram, registry: &Registry) -> (CpsProgram
         // the original pre-rewrite tree, silently defeating the "did
         // anything actually change" comparison below.
         let original = fwd.egraph.id_to_expr(root_id);
-        let Forward { egraph, free_vars, raw_ops, call_units, struct_ops, field_ops, array_ops, array_repeat_ops, load_ops, .. } = fwd;
+        let Forward {
+            egraph,
+            free_vars,
+            raw_ops,
+            call_units,
+            struct_ops,
+            field_ops,
+            array_ops,
+            array_repeat_ops,
+            load_ops,
+            ..
+        } = fwd;
         // `with_egraph` *replaces* the runner's own `egraph` field wholesale
         // -- calling it before `with_explanations_enabled` (which mutates
         // the runner's current egraph in place) silently discards the flag,
@@ -2137,7 +2703,10 @@ pub fn optimize_program(program: CpsProgram, registry: &Registry) -> (CpsProgram
         // "explanations not enabled" despite the call sitting right above
         // it). Order matters here specifically because of that replace-vs-
         // mutate asymmetry between the two builder methods.
-        let mut runner = Runner::default().with_egraph(egraph).with_explanations_enabled().run(&rules);
+        let mut runner = Runner::default()
+            .with_egraph(egraph)
+            .with_explanations_enabled()
+            .run(&rules);
         let root_id = runner.egraph.find(root_id);
         let extractor = Extractor::new(&runner.egraph, AstSize);
         let (_, best) = extractor.find_best(root_id);
@@ -2155,8 +2724,28 @@ pub fn optimize_program(program: CpsProgram, registry: &Registry) -> (CpsProgram
             continue; // saturation ran, but extraction picked the exact original form back -- nothing to report or rebuild
         }
 
-        explanations.push(format!("{}: {}", f.def.name, runner.explain_equivalence(&original, &best).get_flat_string()));
-        let rebuilt = rebuild_segment(&best, best.root(), root_var, &boundary, &free_vars, &raw_ops, &call_units, &struct_ops, &field_ops, &array_ops, &array_repeat_ops, &load_ops, &fresh);
+        explanations.push(format!(
+            "{}: {}",
+            f.def.name,
+            runner
+                .explain_equivalence(&original, &best)
+                .get_flat_string()
+        ));
+        let rebuilt = rebuild_segment(
+            &best,
+            best.root(),
+            root_var,
+            &boundary,
+            &free_vars,
+            &raw_ops,
+            &call_units,
+            &struct_ops,
+            &field_ops,
+            &array_ops,
+            &array_repeat_ops,
+            &load_ops,
+            &fresh,
+        );
         new_bodies.insert(f.def.name.clone(), rebuilt);
     }
     drop(units);
@@ -2226,9 +2815,18 @@ pub struct DerivativeRequest {
 /// undifferentiable with what's in scope, not a bug to guess past. Used to
 /// panic instead (`rebuild` choking on an `Op` symbol none of its own
 /// lookup tables recognized) — real, found directly while building this.
-pub fn synthesize_derivatives(program: CpsProgram, requests: &[DerivativeRequest], registry: &Registry) -> Result<CpsProgram, Vec<String>> {
+pub fn synthesize_derivatives(
+    program: CpsProgram,
+    requests: &[DerivativeRequest],
+    registry: &Registry,
+    struct_schemas: &HashMap<String, StructSchema>,
+) -> Result<CpsProgram, Vec<String>> {
     let fresh = FreshVars::starting_at(max_cvar_in_program(&program) + 1);
-    let units: HashMap<String, &CTopLevelFn> = program.funcs.iter().map(|f| (f.def.name.clone(), f)).collect();
+    let units: HashMap<String, &CTopLevelFn> = program
+        .funcs
+        .iter()
+        .map(|f| (f.def.name.clone(), f))
+        .collect();
     // `derivative_rewrites`'s own `IndependentZeroApplier` needs this to
     // know whether a `Ring::zero<ty>` it might dynamically call actually
     // exists anywhere in the program — same reason `call_units` below
@@ -2239,11 +2837,17 @@ pub fn synthesize_derivatives(program: CpsProgram, requests: &[DerivativeRequest
     let mut errors = Vec::new();
 
     for req in requests {
-        let Some(&of_unit) = units.get(req.of.as_str()) else { continue };
+        let Some(&of_unit) = units.get(req.of.as_str()) else {
+            continue;
+        };
 
         let mut fwd = Forward::default();
         let real_params = &of_unit.def.params[..of_unit.def.params.len() - 1];
-        fwd.param_types = real_params.iter().copied().zip(of_unit.param_types.iter().cloned()).collect();
+        fwd.param_types = real_params
+            .iter()
+            .copied()
+            .zip(of_unit.param_types.iter().cloned())
+            .collect();
         let boundary = fwd.walk(&of_unit.def.body, &units, &fresh);
         // Both of these used to `continue` silently (no error pushed) —
         // found directly, empirically, before this fix existed: `derive()`
@@ -2284,29 +2888,100 @@ pub fn synthesize_derivatives(program: CpsProgram, requests: &[DerivativeRequest
         let k_ret = fresh.var();
         new_params.push(k_ret);
 
-        // One `derivative` node per `f`'s own parameter, in declared order
-        // — `None` for a parameter `f`'s own body never actually
-        // references anywhere (no `Free` node was ever minted for it). A
-        // parameter is a *free* variable from `Forward::walk`'s own
-        // perspective (never `LetPrim`-bound, so never an `env` key —
-        // that field's own doc comment) — `external_vars` (not `env`) is
-        // the table that actually answers "which e-class does this
-        // specific external `CVar` correspond to" — found directly: an
-        // earlier version of this read `env` instead, which silently
-        // produced `None` for every parameter, since `env` only ever
-        // tracks a segment's own internally-computed values.
-        let derivative_ids: Vec<Option<egg::Id>> =
-            f_params.iter().map(|p| fwd.external_vars.get(p).map(|&param_id| fwd.egraph.add(CleaveLang::Op("derivative".into(), vec![root_id, param_id])))).collect();
+        // One `ParamShape` per `f`'s own parameter, in declared order —
+        // `None` for a parameter `f`'s own body never actually references
+        // anywhere (no `Free` node was ever minted for it). A parameter is
+        // a *free* variable from `Forward::walk`'s own perspective (never
+        // `LetPrim`-bound, so never an `env` key — that field's own doc
+        // comment) — `external_vars` (not `env`) is the table that
+        // actually answers "which e-class does this specific external
+        // `CVar` correspond to" — found directly: an earlier version of
+        // this read `env` instead, which silently produced `None` for
+        // every parameter, since `env` only ever tracks a segment's own
+        // internally-computed values.
+        //
+        // A plain scalar parameter's own shape is a single `Leaf` (see
+        // `build_param_shape`'s own doc comment) — `wrap_derivative_nodes`
+        // then turns every leaf (whether that one, or one of a struct/
+        // `Tensor` parameter's own many) into the real `Op("derivative",
+        // [root,leaf])` node the rest of this function already expected
+        // one of, per parameter, before struct-parameter support existed.
+        let mut shape_referenced: HashSet<String> = HashSet::new();
+        let mut shape_error: Option<String> = None;
+        let param_shapes: Vec<Option<ParamShape>> = f_params
+            .iter()
+            .zip(of_unit.param_types.iter())
+            .map(|(p, ty)| {
+                if shape_error.is_some() {
+                    return None;
+                }
+                let &param_id = fwd.external_vars.get(p)?;
+                match build_param_shape(
+                    param_id,
+                    ty,
+                    &mut fwd.egraph,
+                    &mut fwd.struct_ops,
+                    &mut fwd.array_ops,
+                    &mut fwd.field_ops,
+                    struct_schemas,
+                    &unit_names,
+                    &mut shape_referenced,
+                ) {
+                    Ok(shape) => {
+                        // *Before* `wrap_derivative_nodes` -- it needs each
+                        // leaf's own raw variable id (`net.l1.w[0,0]` itself),
+                        // not the `Op("derivative",[root,leaf])` node that
+                        // call replaces every leaf with (see its own doc
+                        // comment) -- `inject_cross_leaf_independence` builds
+                        // `derivative(leaf_j, leaf_i)` facts, which need the
+                        // *raw* leaves on both sides, not two already-wrapped
+                        // ones (a real, found-by-testing bug in an earlier
+                        // version of this fix: called after wrapping, it
+                        // silently unioned nonsense `derivative(derivative(
+                        // root,leaf_j), derivative(root,leaf_i))` facts,
+                        // never touching the real leaf pairs at all).
+                        let mut leaves: Vec<(egg::Id, Ty)> = Vec::new();
+                        collect_leaf_ids_and_types(&shape, &mut leaves);
+                        inject_cross_leaf_independence(&leaves, &mut fwd.egraph);
+                        Some(wrap_derivative_nodes(shape, root_id, &mut fwd.egraph))
+                    }
+                    Err(e) => {
+                        shape_error = Some(e);
+                        None
+                    }
+                }
+            })
+            .collect();
+        if let Some(e) = shape_error {
+            errors.push(format!("cannot derive `{}`: {e}", req.name));
+            continue;
+        }
 
         let ty_text = of_unit.result.to_string();
 
         let mut rules = axiom_rewrites(registry, &fwd.reached);
         rules.extend(struct_projection_rewrites(&fwd.struct_ops, &fwd.field_ops));
-        rules.extend(construction_derivative_rewrites(&fwd.struct_ops, &fwd.array_ops));
-        let (derivative_rules, referenced, zero_calls_used) = derivative_rewrites(&ty_text, &fwd.reached, registry, &unit_names);
+        rules.extend(construction_derivative_rewrites(
+            &fwd.struct_ops,
+            &fwd.array_ops,
+        ));
+        let (derivative_rules, mut referenced, zero_calls_used) =
+            derivative_rewrites(&ty_text, &fwd.reached, registry, &unit_names);
+        referenced.extend(shape_referenced);
         rules.extend(derivative_rules);
 
-        let Forward { egraph, free_vars, raw_ops, mut call_units, struct_ops, field_ops, array_ops, array_repeat_ops, load_ops, .. } = fwd;
+        let Forward {
+            egraph,
+            free_vars,
+            raw_ops,
+            mut call_units,
+            struct_ops,
+            field_ops,
+            array_ops,
+            array_repeat_ops,
+            load_ops,
+            ..
+        } = fwd;
         // A fired `derivative` rule's own RHS can reference a unit `f`'s
         // own body never itself called (the product rule always needs
         // `Ring::add<ty>`, even differentiating a body that only ever
@@ -2322,7 +2997,12 @@ pub fn synthesize_derivatives(program: CpsProgram, requests: &[DerivativeRequest
         // an unrecognized symbol. Found directly, not anticipated: `fn f
         // (x: f32) -> f32 { x * x }` has no `add` call anywhere, yet its
         // own derivative's product-rule expansion needs one.
-        call_units.extend(referenced.iter().filter(|name| units.contains_key(name.as_str())).cloned());
+        call_units.extend(
+            referenced
+                .iter()
+                .filter(|name| units.contains_key(name.as_str()))
+                .cloned(),
+        );
         // `Runner::default()`'s own `iter_limit` (30) is tuned for `optimize_
         // program`'s ordinary axiom/constant-fold segments, not this pass:
         // a declared `derivative` rule only ever peels *one* level of
@@ -2339,7 +3019,12 @@ pub fn synthesize_derivatives(program: CpsProgram, requests: &[DerivativeRequest
         // continued eliminating them. `node_limit`/`time_limit` raised
         // alongside it for the same reason — `iter_limit` alone would just
         // trade one silent stop for another.
-        let runner = Runner::default().with_iter_limit(1000).with_node_limit(1_000_000).with_time_limit(std::time::Duration::from_secs(30)).with_egraph(egraph).run(&rules);
+        let runner = Runner::default()
+            .with_iter_limit(1000)
+            .with_node_limit(1_000_000)
+            .with_time_limit(std::time::Duration::from_secs(30))
+            .with_egraph(egraph)
+            .run(&rules);
         // `IndependentZeroApplier`'s own `zero_calls_used` (`egraph.rs`'s own
         // doc comment on it) is only populated *during* saturation, unlike
         // `referenced` above (known before the runner ever starts) — read
@@ -2348,8 +3033,17 @@ pub fn synthesize_derivatives(program: CpsProgram, requests: &[DerivativeRequest
         // second `units.contains_key` filter is needed here the way
         // `referenced`'s own extend above needs one.
         call_units.extend(zero_calls_used.lock().unwrap().iter().cloned());
-        let tables =
-            OpTables { free_vars: &free_vars, raw_ops: &raw_ops, call_units: &call_units, struct_ops: &struct_ops, field_ops: &field_ops, array_ops: &array_ops, array_repeat_ops: &array_repeat_ops, load_ops: &load_ops, param_substitution: &param_substitution };
+        let tables = OpTables {
+            free_vars: &free_vars,
+            raw_ops: &raw_ops,
+            call_units: &call_units,
+            struct_ops: &struct_ops,
+            field_ops: &field_ops,
+            array_ops: &array_ops,
+            array_repeat_ops: &array_repeat_ops,
+            load_ops: &load_ops,
+            param_substitution: &param_substitution,
+        };
         let extractor = Extractor::new(&runner.egraph, DerivativeFreeCost);
 
         // A `derivative` node surviving into the *best* extraction means
@@ -2358,28 +3052,56 @@ pub fn synthesize_derivatives(program: CpsProgram, requests: &[DerivativeRequest
         // scope. Checked *before* `rebuild` (which has no lookup-table
         // entry for a raw `derivative` symbol and would otherwise panic on
         // exactly this) — one clean, real error instead.
-        let mut missing: Vec<String> = derivative_ids
+        let mut leaf_ids: Vec<egg::Id> = Vec::new();
+        for shape in param_shapes.iter().flatten() {
+            collect_leaf_ids(shape, &mut leaf_ids);
+        }
+        let mut missing: Vec<String> = leaf_ids
             .iter()
-            .flatten()
             .filter_map(|&id| undifferentiable_unit(&runner.egraph, &extractor, id))
             .collect();
         if !missing.is_empty() {
             missing.sort();
             missing.dedup();
-            errors.push(format!("cannot derive `{}`: no derivative rule for `{}`", req.name, missing.join("`, `")));
+            errors.push(format!(
+                "cannot derive `{}`: no derivative rule for `{}`",
+                req.name,
+                missing.join("`, `")
+            ));
             continue;
         }
 
-        let result_ty = of_unit.result.clone();
-        let body = build_param_derivatives(&derivative_ids, &of_unit.param_types, &runner.egraph, &extractor, &fresh, &tables, Vec::new(), &|values| {
-            finish_derivative_body(values, k_ret, &result_ty, &fresh)
-        });
+        let value_types = of_unit.param_types.clone();
+        let body = build_param_derivatives_from_shapes(
+            &param_shapes,
+            &of_unit.param_types,
+            &runner.egraph,
+            &extractor,
+            &fresh,
+            &tables,
+            Vec::new(),
+            &|values| finish_derivative_body(values, &value_types, k_ret, &fresh),
+        );
 
         let n = f_params.len();
-        let result = if n == 1 { of_unit.result.clone() } else { Ty::Array(Box::new(of_unit.result.clone()), Box::new(Ty::Const(ConstValue::Int(n as u64)))) };
+        // Mirrors `driver.rs::synthesize_derive_signatures`'s own
+        // synthesized return type exactly -- one tuple field per
+        // parameter, that parameter's own type (not `of_unit.result`,
+        // `f`'s own return type, which plays no role here -- see that
+        // function's own doc comment).
+        let result = if n == 1 {
+            of_unit.param_types[0].clone()
+        } else {
+            Ty::App(tuple_struct_name(n), of_unit.param_types.clone())
+        };
 
         new_funcs.push(CTopLevelFn {
-            def: CFunDef { name: req.name.clone(), params: new_params, body, carried_types: None },
+            def: CFunDef {
+                name: req.name.clone(),
+                params: new_params,
+                body,
+                carried_types: None,
+            },
             param_types: of_unit.param_types.clone(),
             result,
             k_ret,
@@ -2402,10 +3124,16 @@ pub fn synthesize_derivatives(program: CpsProgram, requests: &[DerivativeRequest
 /// node — `None` if it's fully eliminated, `Some(unit)` naming the inner
 /// op it's still wrapped around (or a generic fallback if the inner
 /// position isn't itself a real op, e.g. a bare `Free`/literal) otherwise.
-fn undifferentiable_unit(egraph: &egg::EGraph<CleaveLang, ConstantFold>, extractor: &Extractor<DerivativeFreeCost, CleaveLang, ConstantFold>, id: egg::Id) -> Option<String> {
+fn undifferentiable_unit(
+    egraph: &egg::EGraph<CleaveLang, ConstantFold>,
+    extractor: &Extractor<DerivativeFreeCost, CleaveLang, ConstantFold>,
+    id: egg::Id,
+) -> Option<String> {
     let (_, best) = extractor.find_best(egraph.find(id));
     for node in best.as_ref() {
-        let CleaveLang::Op(sym, children) = node else { continue };
+        let CleaveLang::Op(sym, children) = node else {
+            continue;
+        };
         if sym.as_str() != "derivative" {
             continue;
         }
@@ -2429,16 +3157,152 @@ fn zero_value(ty: &Ty) -> CVal {
     }
 }
 
-/// Sequences one reconstruction per parameter — mirrors `rebuild_args`'s
-/// own shape exactly (build inner-to-outer, `k` names "what happens next
-/// once every value is collected"), just over `derivative_ids`/`param_
-/// types` in lockstep instead of one shared `RecExpr`'s own children:
-/// each parameter's own derivative was extracted as an *independent*
-/// `RecExpr` (a separate `Extractor::find_best` call per `Id`, not one
-/// shared tree), so this can't reuse `rebuild_args` directly.
+/// Recursively replaces every `ParamShape::Leaf`'s own raw id (`net.w[0,0]`
+/// itself, say) with the real `Op("derivative",[root,leaf])` node — kept as
+/// a separate pass *after* `build_param_shape` returns, not folded into it
+/// directly, because a `Tensor` leaf's own raw id is needed *unwrapped*
+/// first, for the eta-expansion reconstruction `build_param_shape` unions
+/// with the parameter's own e-class (`net.w`'s own e-class must equal
+/// `Tensor(data:[net.w[0,0], ...])`, never `Tensor(data:[derivative(root,
+/// net.w[0,0]), ...])`) — only *after* that reconstruction exists does it
+/// make sense to ask "what's the derivative of this leaf".
+fn wrap_derivative_nodes(
+    shape: ParamShape,
+    root_id: egg::Id,
+    egraph: &mut egg::EGraph<CleaveLang, ConstantFold>,
+) -> ParamShape {
+    match shape {
+        ParamShape::Leaf(id, ty) => {
+            let deriv_id = egraph.add(CleaveLang::Op("derivative".into(), vec![root_id, id]));
+            ParamShape::Leaf(deriv_id, ty)
+        }
+        ParamShape::Tensor {
+            elems,
+            elem_ty,
+            dims,
+            ty,
+        } => {
+            let elems = elems
+                .into_iter()
+                .map(|e| wrap_derivative_nodes(e, root_id, egraph))
+                .collect();
+            ParamShape::Tensor {
+                elems,
+                elem_ty,
+                dims,
+                ty,
+            }
+        }
+        ParamShape::Struct { name, fields, ty } => {
+            let fields = fields
+                .into_iter()
+                .map(|(n, s)| (n, wrap_derivative_nodes(s, root_id, egraph)))
+                .collect();
+            ParamShape::Struct { name, fields, ty }
+        }
+    }
+}
+
+/// Every `Leaf`'s own id in `shape`, in the same order `reassemble_shape`
+/// will later walk them — used only for the pre-`rebuild` "did every leaf
+/// actually differentiate" check (`undifferentiable_unit`).
+fn collect_leaf_ids(shape: &ParamShape, out: &mut Vec<egg::Id>) {
+    match shape {
+        ParamShape::Leaf(id, _) => out.push(*id),
+        ParamShape::Tensor { elems, .. } => elems.iter().for_each(|e| collect_leaf_ids(e, out)),
+        ParamShape::Struct { fields, .. } => {
+            fields.iter().for_each(|(_, s)| collect_leaf_ids(s, out))
+        }
+    }
+}
+
+/// `collect_leaf_ids`'s own type-carrying sibling — `inject_cross_leaf_
+/// independence` needs each leaf's own scalar `Ty` to build a correctly-
+/// typed zero for it, which the bare-`egg::Id` version doesn't keep.
+fn collect_leaf_ids_and_types(shape: &ParamShape, out: &mut Vec<(egg::Id, Ty)>) {
+    match shape {
+        ParamShape::Leaf(id, ty) => out.push((*id, ty.clone())),
+        ParamShape::Tensor { elems, .. } => elems
+            .iter()
+            .for_each(|e| collect_leaf_ids_and_types(e, out)),
+        ParamShape::Struct { fields, .. } => fields
+            .iter()
+            .for_each(|(_, s)| collect_leaf_ids_and_types(s, out)),
+    }
+}
+
+/// Two *distinct* leaves of the same top-level `derive()`d parameter are
+/// independent -- `derivative(leaf_j, leaf_i) = 0` for `i != j` -- but the
+/// general-purpose `derivative-independent-zero` rule (`IndependentZero
+/// Applier`, keyed on `ConstantFold::free_deps` disjointness) can't discover
+/// that on its own: `free_deps` tracks *which top-level parameter* an
+/// expression depends on, not *which specific leaf* of it -- `net.l1.w[0,0]`
+/// and `net.l1.b[0,1]` (two leaves of *different* `Tensor` fields, nested two
+/// levels deep inside the same `Network` parameter) both report `free_deps =
+/// {net}`, indistinguishable to that check, so it never fires between them.
+/// Scoped to *one whole parameter's* entire leaf set (every leaf from every
+/// nested `Tensor`/`Struct` level combined), not just the leaves of one
+/// individual `Tensor` field -- found directly, by testing `Network`/`Dense`
+/// (the first program with *more than one* `Tensor` field reachable from a
+/// single `derive()`d struct parameter): scoping this per-`Tensor` instead
+/// (an earlier version of this fix) correctly handled independence *within*
+/// one field's own leaves but missed it *across* sibling fields (`net.l1.w`
+/// vs `net.l1.b`, `net.l1.*` vs `net.l2.*`), surfacing as the identical "no
+/// derivative rule for `Ring::mul<f32>`" symptom a single unused sibling
+/// leaf already causes without this fix at all.
+///
+/// Extending `free_deps` itself to per-leaf granularity was considered and
+/// rejected: `ConstantFold::merge`'s own *intersection* semantics
+/// (deliberately narrowing `free_deps` across two unioned-equal forms of the
+/// same value) would silently corrupt the eta-expansion's own reconstruction
+/// union -- `p.w`'s inherited `{p}` intersected against a reconstructed
+/// form's synthetic per-leaf names would collapse to the empty set, wrongly
+/// marking `p.w` itself independent of everything. Injecting these facts
+/// directly instead -- exactly the same technique `IndependentZeroApplier`
+/// itself already uses (`egraph.union`) -- sidesteps `free_deps` entirely
+/// for this specific, already-fully-known set of sibling leaves, without
+/// touching that shared analysis at all. `O(K^2)` unions for a `K`-leaf
+/// parameter -- a real but bounded cost, acceptable at this design's own
+/// already-established scale (forward-mode, one saturation pass per leaf
+/// regardless -- see the module's own note on why this doesn't scale to a
+/// real transformer's parameter count).
+fn inject_cross_leaf_independence(
+    leaves: &[(egg::Id, Ty)],
+    egraph: &mut egg::EGraph<CleaveLang, ConstantFold>,
+) {
+    for (i, &(leaf_i, _)) in leaves.iter().enumerate() {
+        for (j, &(leaf_j, ref ty_j)) in leaves.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            let is_float = matches!(ty_j, Ty::Con(name) if matches!(name.as_str(), "f32" | "f64"));
+            let leaf_zero = if is_float {
+                CleaveLang::Float(0.0.into())
+            } else {
+                CleaveLang::Int(0)
+            };
+            let leaf_zero_id = egraph.add(leaf_zero);
+            let cross_id = egraph.add(CleaveLang::Op("derivative".into(), vec![leaf_j, leaf_i]));
+            egraph.union(cross_id, leaf_zero_id);
+        }
+    }
+}
+
+/// Sequences one reconstruction per top-level parameter — mirrors
+/// `rebuild_args`'s own shape exactly (build inner-to-outer, `k` names
+/// "what happens next once every value is collected"), just over
+/// `param_shapes`/`param_types` in lockstep instead of one shared
+/// `RecExpr`'s own children. `None` (a parameter never referenced at all)
+/// stays the plain scalar `zero_value` it always was — a genuinely unused
+/// struct-typed parameter is a real, narrow, documented gap (`ParamShape`'s
+/// own doc comment), not attempted here. `Some(shape)` — whether a plain
+/// scalar `Leaf` (today's only case before struct-parameter support) or a
+/// real `Tensor`/`Struct` tree — delegates to `reassemble_shape`, which
+/// already performs the identical per-leaf extract-and-rebuild dance this
+/// function used to do inline for the always-scalar case.
 #[allow(clippy::too_many_arguments)]
-fn build_param_derivatives(
-    derivative_ids: &[Option<egg::Id>],
+fn build_param_derivatives_from_shapes(
+    shapes: &[Option<ParamShape>],
     param_types: &[Ty],
     egraph: &egg::EGraph<CleaveLang, ConstantFold>,
     extractor: &Extractor<DerivativeFreeCost, CleaveLang, ConstantFold>,
@@ -2447,62 +3311,589 @@ fn build_param_derivatives(
     acc: Vec<CVal>,
     k: &dyn Fn(Vec<CVal>) -> CExpr,
 ) -> CExpr {
-    let Some((first, rest_ids)) = derivative_ids.split_first() else { return k(acc) };
-    let (first_ty, rest_types) = param_types.split_first().expect("derivative_ids and param_types must be the same length");
+    let Some((first, rest)) = shapes.split_first() else {
+        return k(acc);
+    };
+    let (first_ty, rest_types) = param_types
+        .split_first()
+        .expect("shapes and param_types must be the same length");
     match first {
         None => {
             let mut acc2 = acc.clone();
             acc2.push(zero_value(first_ty));
-            build_param_derivatives(rest_ids, rest_types, egraph, extractor, fresh, tables, acc2, k)
+            build_param_derivatives_from_shapes(
+                rest, rest_types, egraph, extractor, fresh, tables, acc2, k,
+            )
         }
-        Some(id) => {
-            let (_, best) = extractor.find_best(egraph.find(*id));
-            // A *fresh* memo per parameter, not one shared across all of
-            // them — a real bug, found by direct testing (the Jacobian
-            // case): each parameter's own derivative is extracted as an
-            // *independent* `RecExpr` (a separate `Extractor::find_best`
-            // call per `Id`), and different `RecExpr`s' own internal ids
-            // are small integers starting fresh from 0 each time, with no
-            // relationship to one another — a memo shared across more than
-            // one `RecExpr` silently reused the *first* parameter's own
-            // cached reconstructions while rebuilding the *second*,
-            // collapsing two genuinely different derivatives (`y+1` and
-            // `x`) down to the same value in both array slots.
-            let memo = RefCell::new(HashMap::new());
-            rebuild(&best, best.root(), fresh, tables, &memo, &|v| {
-                let mut acc2 = acc.clone();
-                acc2.push(v);
-                build_param_derivatives(rest_ids, rest_types, egraph, extractor, fresh, tables, acc2, k)
-            })
-        }
+        Some(shape) => reassemble_shape(shape, egraph, extractor, fresh, tables, &|v| {
+            let mut acc2 = acc.clone();
+            acc2.push(v);
+            build_param_derivatives_from_shapes(
+                rest, rest_types, egraph, extractor, fresh, tables, acc2, k,
+            )
+        }),
     }
 }
 
 /// The tail of a synthesized `fprime`'s own body — `N == 1`'s single
 /// reconstructed value tail-calls `k_ret` directly (an ordinary `return`,
 /// same idiom every real top-level fn's own body already ends in); `N > 1`
-/// wraps every value in one `PrimOp::Array` construction first (the
-/// gradient/Jacobian row) before doing the same.
-fn finish_derivative_body(values: Vec<CVal>, k_ret: CVar, result_ty: &Ty, fresh: &FreshVars) -> CExpr {
+/// wraps every value in one `__TupleN` construction first (the gradient/
+/// Jacobian row — `driver.rs::synthesize_derive_signatures`'s own doc
+/// comment on why this is a tuple, not an array: each entry's own type is
+/// that *parameter's* own type, not `f`'s return type, so a homogeneous
+/// array can't represent it in general once a struct-typed parameter is
+/// involved) before doing the same. `value_types[i]` must be `values[i]`'s
+/// own real type — the caller's responsibility, exactly mirroring
+/// `driver.rs`'s own synthesized tuple-type construction (`ast::
+/// tuple_struct_name`, one field per parameter, named "0","1",... — a
+/// tuple is an ordinary struct here, no new construction kind needed).
+fn finish_derivative_body(
+    values: Vec<CVal>,
+    value_types: &[Ty],
+    k_ret: CVar,
+    fresh: &FreshVars,
+) -> CExpr {
     if let [only] = values.as_slice() {
-        return CExpr::App { func: CVal::Var(k_ret), args: vec![only.clone()] };
+        return CExpr::App {
+            func: CVal::Var(k_ret),
+            args: vec![only.clone()],
+        };
     }
     let n = values.len();
-    let array_ty = Ty::Array(Box::new(result_ty.clone()), Box::new(Ty::Const(ConstValue::Int(n as u64))));
-    let arr_var = fresh.var();
+    let struct_name = tuple_struct_name(n);
+    let field_names: Vec<String> = (0..n).map(|i| i.to_string()).collect();
+    let tuple_ty = Ty::App(struct_name.clone(), value_types.to_vec());
+    let tuple_var = fresh.var();
     CExpr::LetPrim {
-        var: arr_var,
-        ty: array_ty,
-        op: PrimOp::Array,
+        var: tuple_var,
+        ty: tuple_ty,
+        op: PrimOp::Struct(struct_name, field_names),
         args: values,
-        cont: Box::new(CExpr::App { func: CVal::Var(k_ret), args: vec![CVal::Var(arr_var)] }),
+        cont: Box::new(CExpr::App {
+            func: CVal::Var(k_ret),
+            args: vec![CVal::Var(tuple_var)],
+        }),
     }
+}
+
+// ---------------------------------------------------------------- gradient w.r.t. a struct parameter
+
+/// A single top-level `derive()` parameter's own differentiation shape —
+/// `Leaf` for an ordinary scalar (today's only case before this, unchanged
+/// in behavior); `Tensor` for a `linalg::Tensor<T,Dims...>`-shaped value,
+/// expanded element-wise (row-major, matching its own `data: [T;Dims...]`
+/// field); `Struct` for any other struct type, recursed into field-by-
+/// field. Built once, before saturation (`build_param_shape`, adding
+/// whatever new e-graph nodes each leaf needs — see its own doc comment for
+/// why a `Tensor` leaf needs real new nodes, not just a lookup); consumed
+/// twice: every `Leaf`'s own id becomes one `Op("derivative",[root,leaf])`
+/// (mirroring today's one-node-per-top-level-parameter loop, just over
+/// more, differently-shaped leaves); after saturation, `reassemble_shape`
+/// walks the identical tree back into a real value of the original
+/// parameter's own shape.
+///
+/// Scope, deliberately narrow for now (a real, reported error outside it,
+/// never silently wrong): a `Tensor` leaf's own element type must itself be
+/// scalar (no `Tensor<Tensor<...>,...>`); a `Struct` field can itself be
+/// `Tensor`- or `Struct`-shaped (recursion), but not a bare array (`[T;N]`
+/// with no wrapping struct) or anything else `Ty` can express (`Ty::Fn`, an
+/// unresolved `Ty::Var`, ...) — `build_param_shape` reports these as a
+/// clean `derive()` error rather than guessing.
+enum ParamShape {
+    Leaf(egg::Id, Ty),
+    Tensor {
+        elems: Vec<ParamShape>,
+        elem_ty: Ty,
+        dims: Vec<i64>,
+        ty: Ty,
+    },
+    Struct {
+        name: String,
+        fields: Vec<(String, ParamShape)>,
+        ty: Ty,
+    },
+}
+
+fn is_scalar_width(name: &str) -> bool {
+    matches!(name, "i8" | "i16" | "i32" | "i64" | "f32" | "f64" | "bool")
+}
+
+/// `Tensor<T,Dims...>`'s own concrete instantiation (`Ty::App("Tensor",
+/// [elem, dim0, dim1, ...])`, confirmed directly via `--dump-cps` against a
+/// real `Tensor::<f32,2,2>(...)` construction) split into its element type
+/// and its own dims as plain `i64`s — `None` if `args` doesn't actually
+/// have this shape (an unresolved generic, say), never guessed.
+fn tensor_shape(args: &[Ty]) -> Option<(Ty, Vec<i64>)> {
+    let (elem_ty, dim_tys) = args.split_first()?;
+    let dims: Option<Vec<i64>> = dim_tys
+        .iter()
+        .map(|t| match t {
+            Ty::Const(ConstValue::Int(n)) => Some(*n as i64),
+            _ => None,
+        })
+        .collect();
+    Some((elem_ty.clone(), dims?))
+}
+
+/// Row-major decomposition of a flat position into per-dimension indices —
+/// the same convention a real `Tensor::<T,Dims...>(data: [[...],...])`
+/// construction's own nested-array layout already uses.
+fn unflatten(flat: i64, dims: &[i64]) -> Vec<i64> {
+    let mut result = Vec::with_capacity(dims.len());
+    let mut remaining = flat;
+    for i in 0..dims.len() {
+        let stride: i64 = dims[i + 1..].iter().product();
+        result.push(remaining / stride.max(1));
+        remaining %= stride.max(1);
+    }
+    result
+}
+
+/// Recursively builds `ty`'s own `ParamShape` rooted at `base_id` — the
+/// e-graph-side half of "gradient w.r.t. a struct parameter". Two real
+/// cases beyond a plain scalar:
+///
+/// - **`Tensor<T,Dims...>`**: reading one element goes through a real,
+///   user-declared algebra call (`Index::index<Container,Elem>`,
+///   `stdlib/linalg/tensor.cleave`), never through `PrimOp::Load` — a
+///   `Tensor` value has no separately-addressable `.data` array at the MLIR
+///   level, only `mlir::tensor::extract` on the whole tensor value itself
+///   (`Index<Tensor<T,Dims...>,T>`'s own declared body). One `Index::index`
+///   call is built per flat position (row-major), *reusing the exact same
+///   `unit_names` existence check `build_zero` already established — no
+///   guessing a unit into existence that was never actually monomorphized.
+///   These same leaf ids then get **eta-expanded**: unioned (`egraph.
+///   union`) with an explicit `Tensor::<T,Dims...>(data:[[...],...])`
+///   reconstruction built from themselves — the same trick `xor_tensor.
+///   cleave` already relies on by hand (assembling loose scalar weights
+///   into a tensor *in source*, letting `construction_derivative_rewrites`
+///   differentiate through the construction) — mechanized here for a
+///   tensor that arrives as a struct field instead of loose scalars: once
+///   `net.w`'s own e-class *also* contains this reconstructed form, any
+///   operation consuming it opaquely (`matmul`'s own product rule, `d(a) =
+///   ...`) can differentiate *through* it via the ordinary, already-proven
+///   distributivity rule, with no new rewrite rule needed at all.
+/// - **any other struct type**: recurses into each of `struct_schemas`'s
+///   own declared fields (`mlir_lower::struct_field_types`, the identical
+///   function MLIR lowering itself uses to resolve a struct's own field
+///   shapes) via an ordinary `Field(base, name)` projection — no eta-
+///   expansion needed here: nothing ever consumes a general struct
+///   parameter *opaquely* the way `matmul` consumes a `Tensor` (in this
+///   design, a struct parameter is always immediately projected into its
+///   own fields, never handed whole into some other product-rule-shaped
+///   algebra call) — see the module's own "gradient w.r.t. a struct
+///   parameter" design note for why this asymmetry is deliberate, not an
+///   oversight.
+///
+/// `referenced` collects every dynamically-referenced unit name this needs
+/// (`Index::index<...>`) — folded into `call_units` by the caller exactly
+/// like `derivative_rewrites`' own `referenced` already is, so `rebuild`
+/// recognizes it as a real call rather than panicking on an unrecognized
+/// symbol.
+#[allow(clippy::too_many_arguments)]
+fn build_param_shape(
+    base_id: egg::Id,
+    ty: &Ty,
+    egraph: &mut egg::EGraph<CleaveLang, ConstantFold>,
+    struct_ops: &mut HashMap<Symbol, (String, Vec<String>, Ty)>,
+    array_ops: &mut HashMap<Symbol, Ty>,
+    field_ops: &mut HashMap<Symbol, (Ty, String, Ty)>,
+    struct_schemas: &HashMap<String, StructSchema>,
+    unit_names: &HashSet<String>,
+    referenced: &mut HashSet<String>,
+) -> Result<ParamShape, String> {
+    if let Ty::Con(name) = ty {
+        if is_scalar_width(name) {
+            return Ok(ParamShape::Leaf(base_id, ty.clone()));
+        }
+    }
+    if let Ty::App(name, args) = ty {
+        if name == "Tensor" {
+            let Some((elem_ty, dims)) = tensor_shape(args) else {
+                return Err(format!("derive(): unsupported `Tensor` shape `{ty}`"));
+            };
+            let Ty::Con(elem_name) = &elem_ty else {
+                return Err(format!(
+                    "derive(): a `Tensor` leaf's own element type must be scalar, got `{elem_ty}`"
+                ));
+            };
+            if !is_scalar_width(elem_name) {
+                return Err(format!(
+                    "derive(): a `Tensor` leaf's own element type must be scalar, got `{elem_ty}`"
+                ));
+            }
+
+            let index_unit = format!("Index::index<{ty}, {elem_ty}>");
+            if !unit_names.contains(&index_unit) {
+                return Err(format!(
+                    "derive(): `{index_unit}` isn't reachable — a struct-typed parameter's own `Tensor` field needs a real, monomorphized `Index` impl"
+                ));
+            }
+            referenced.insert(index_unit.clone());
+            let index_sym = Symbol::from(index_unit);
+            egraph
+                .analysis
+                .known_types
+                .entry(index_sym)
+                .or_insert_with(|| elem_ty.clone());
+
+            let idx_ty = Ty::Array(
+                Box::new(Ty::Con("i32".to_string())),
+                Box::new(Ty::Const(ConstValue::Int(dims.len() as u64))),
+            );
+            let idx_array_sym = Symbol::from(format!("array:{idx_ty}:{}", dims.len()));
+            array_ops
+                .entry(idx_array_sym)
+                .or_insert_with(|| idx_ty.clone());
+            egraph
+                .analysis
+                .known_types
+                .entry(idx_array_sym)
+                .or_insert_with(|| idx_ty.clone());
+
+            let total: i64 = dims.iter().product();
+            let mut leaf_ids = Vec::with_capacity(total as usize);
+            for flat in 0..total {
+                let idx_ids: Vec<egg::Id> = unflatten(flat, &dims)
+                    .into_iter()
+                    .map(|i| egraph.add(CleaveLang::Int(i as u64)))
+                    .collect();
+                let idx_id = egraph.add(CleaveLang::Op(idx_array_sym, idx_ids));
+                leaf_ids.push(egraph.add(CleaveLang::Op(index_sym, vec![base_id, idx_id])));
+            }
+
+            // Cross-leaf independence among these `leaf_ids` is injected
+            // once, centrally, for the *whole* top-level parameter's entire
+            // leaf set (not just this one `Tensor` field's own) -- see
+            // `inject_cross_leaf_independence`'s own doc comment for why
+            // scoping it here alone isn't enough once a struct parameter has
+            // more than one `Tensor` field.
+            let (data_id, _) = nest_construction(&leaf_ids, &dims, &elem_ty, egraph, array_ops);
+            let struct_sym = Symbol::from(format!("struct:{ty}:data"));
+            struct_ops
+                .entry(struct_sym)
+                .or_insert_with(|| ("Tensor".to_string(), vec!["data".to_string()], ty.clone()));
+            egraph
+                .analysis
+                .known_types
+                .entry(struct_sym)
+                .or_insert_with(|| ty.clone());
+            let recon_id = egraph.add(CleaveLang::Op(struct_sym, vec![data_id]));
+            egraph.union(base_id, recon_id);
+
+            let elems = leaf_ids
+                .into_iter()
+                .map(|id| ParamShape::Leaf(id, elem_ty.clone()))
+                .collect();
+            return Ok(ParamShape::Tensor {
+                elems,
+                elem_ty,
+                dims,
+                ty: ty.clone(),
+            });
+        }
+    }
+
+    let struct_name = match ty {
+        Ty::Con(name) => Some(name.clone()),
+        Ty::App(name, _) => Some(name.clone()),
+        _ => None,
+    };
+    if let Some(name) = struct_name {
+        if struct_schemas.contains_key(&name) {
+            let type_args = match ty {
+                Ty::App(_, args) => args.clone(),
+                _ => Vec::new(),
+            };
+            let fields = struct_field_types(struct_schemas, &name, &type_args);
+            let mut built = Vec::with_capacity(fields.len());
+            for (field_name, field_ty) in &fields {
+                let field_sym = Symbol::from(format!("field:{ty}:{field_name}"));
+                field_ops
+                    .entry(field_sym)
+                    .or_insert_with(|| (ty.clone(), field_name.clone(), field_ty.clone()));
+                egraph
+                    .analysis
+                    .known_types
+                    .entry(field_sym)
+                    .or_insert_with(|| field_ty.clone());
+                let field_id = egraph.add(CleaveLang::Op(field_sym, vec![base_id]));
+                let sub = build_param_shape(
+                    field_id,
+                    field_ty,
+                    egraph,
+                    struct_ops,
+                    array_ops,
+                    field_ops,
+                    struct_schemas,
+                    unit_names,
+                    referenced,
+                )?;
+                built.push((field_name.clone(), sub));
+            }
+            return Ok(ParamShape::Struct {
+                name,
+                fields: built,
+                ty: ty.clone(),
+            });
+        }
+    }
+
+    Err(format!(
+        "derive(): parameter type `{ty}` isn't supported for a struct/tensor gradient yet"
+    ))
+}
+
+/// The e-graph-side half of nesting a flat list of leaves back into a real
+/// multi-dimensional array construction, row-major — used both for the
+/// eta-expansion reconstruction above (`build_param_shape`) and mirrored,
+/// at the CPS/`CVal` level, by `nest_array_cvals` below for the real
+/// post-saturation reassembly. Returns the built id alongside its own
+/// `Ty`, so an outer recursive call (one dimension level up) knows what
+/// element type *its* own array construction wraps.
+fn nest_construction(
+    flat: &[egg::Id],
+    dims: &[i64],
+    elem_ty: &Ty,
+    egraph: &mut egg::EGraph<CleaveLang, ConstantFold>,
+    array_ops: &mut HashMap<Symbol, Ty>,
+) -> (egg::Id, Ty) {
+    let (&n, rest_dims) = dims.split_first().expect("dims must be non-empty");
+    if rest_dims.is_empty() {
+        let ty = Ty::Array(
+            Box::new(elem_ty.clone()),
+            Box::new(Ty::Const(ConstValue::Int(n as u64))),
+        );
+        let sym = Symbol::from(format!("array:{ty}:{n}"));
+        array_ops.entry(sym).or_insert_with(|| ty.clone());
+        egraph
+            .analysis
+            .known_types
+            .entry(sym)
+            .or_insert_with(|| ty.clone());
+        return (egraph.add(CleaveLang::Op(sym, flat.to_vec())), ty);
+    }
+    let chunk_size = rest_dims.iter().product::<i64>() as usize;
+    let mut sub_ids = Vec::with_capacity(n as usize);
+    let mut sub_ty = elem_ty.clone();
+    for chunk in flat.chunks(chunk_size) {
+        let (id, ty) = nest_construction(chunk, rest_dims, elem_ty, egraph, array_ops);
+        sub_ids.push(id);
+        sub_ty = ty;
+    }
+    let ty = Ty::Array(
+        Box::new(sub_ty),
+        Box::new(Ty::Const(ConstValue::Int(n as u64))),
+    );
+    let sym = Symbol::from(format!("array:{ty}:{n}"));
+    array_ops.entry(sym).or_insert_with(|| ty.clone());
+    egraph
+        .analysis
+        .known_types
+        .entry(sym)
+        .or_insert_with(|| ty.clone());
+    (egraph.add(CleaveLang::Op(sym, sub_ids)), ty)
+}
+
+/// Extracts+rebuilds every `Leaf` in `shapes`, in order, accumulating each
+/// one's own real `CVal` — the generalization of `build_param_derivatives`'s
+/// own "one entry at a time, in CPS" pattern to an arbitrary `ParamShape`
+/// tree instead of just a flat top-level parameter list (reused for both:
+/// `build_param_derivatives`'s own struct-typed-parameter case delegates
+/// here directly).
+fn reassemble_many(
+    shapes: &[ParamShape],
+    egraph: &egg::EGraph<CleaveLang, ConstantFold>,
+    extractor: &Extractor<DerivativeFreeCost, CleaveLang, ConstantFold>,
+    fresh: &FreshVars,
+    tables: &OpTables,
+    acc: Vec<CVal>,
+    k: &dyn Fn(Vec<CVal>) -> CExpr,
+) -> CExpr {
+    let Some((first, rest)) = shapes.split_first() else {
+        return k(acc);
+    };
+    reassemble_shape(first, egraph, extractor, fresh, tables, &|v| {
+        let mut acc2 = acc.clone();
+        acc2.push(v);
+        reassemble_many(rest, egraph, extractor, fresh, tables, acc2, k)
+    })
+}
+
+/// One `ParamShape` node's own real, reconstructed `CVal` — `Leaf` extracts
+/// and rebuilds exactly like `build_param_derivatives` already does for an
+/// ordinary scalar parameter; `Tensor`/`Struct` first reassemble their own
+/// children (`reassemble_many`), then wrap the result in one `LetPrim`
+/// (`PrimOp::Array` nested per dimension, then the `Tensor`'s own one-field
+/// struct wrapper — mirroring `nest_construction`'s own e-graph-side
+/// nesting exactly, just now building real `CExpr`/`CVal` forms instead of
+/// e-graph nodes; an ordinary `PrimOp::Struct` for any other struct type).
+fn reassemble_shape(
+    shape: &ParamShape,
+    egraph: &egg::EGraph<CleaveLang, ConstantFold>,
+    extractor: &Extractor<DerivativeFreeCost, CleaveLang, ConstantFold>,
+    fresh: &FreshVars,
+    tables: &OpTables,
+    k: &dyn Fn(CVal) -> CExpr,
+) -> CExpr {
+    match shape {
+        ParamShape::Leaf(id, _ty) => {
+            let (_, best) = extractor.find_best(egraph.find(*id));
+            let memo = RefCell::new(HashMap::new());
+            rebuild(&best, best.root(), fresh, tables, &memo, k)
+        }
+        ParamShape::Tensor {
+            elems,
+            elem_ty,
+            dims,
+            ty,
+        } => reassemble_many(
+            elems,
+            egraph,
+            extractor,
+            fresh,
+            tables,
+            Vec::new(),
+            &|vals| {
+                nest_array_cvals(&vals, dims, elem_ty, fresh, &|data_val, _data_ty| {
+                    let var = fresh.var();
+                    CExpr::LetPrim {
+                        var,
+                        ty: ty.clone(),
+                        op: PrimOp::Struct("Tensor".to_string(), vec!["data".to_string()]),
+                        args: vec![data_val],
+                        cont: Box::new(k(CVal::Var(var))),
+                    }
+                })
+            },
+        ),
+        ParamShape::Struct { name, fields, ty } => {
+            let field_names: Vec<String> = fields.iter().map(|(n, _)| n.clone()).collect();
+            let shapes: Vec<&ParamShape> = fields.iter().map(|(_, s)| s).collect();
+            reassemble_many_owned(
+                &shapes,
+                egraph,
+                extractor,
+                fresh,
+                tables,
+                Vec::new(),
+                &|vals| {
+                    let var = fresh.var();
+                    CExpr::LetPrim {
+                        var,
+                        ty: ty.clone(),
+                        op: PrimOp::Struct(name.clone(), field_names.clone()),
+                        args: vals,
+                        cont: Box::new(k(CVal::Var(var))),
+                    }
+                },
+            )
+        }
+    }
+}
+
+/// `reassemble_many`'s own counterpart for a list of `&ParamShape`
+/// references (`ParamShape::Struct`'s own fields are stored as `(String,
+/// ParamShape)` pairs, not a bare `Vec<ParamShape>`, so its own "reassemble
+/// every child" call needs to walk references instead of owned values).
+fn reassemble_many_owned(
+    shapes: &[&ParamShape],
+    egraph: &egg::EGraph<CleaveLang, ConstantFold>,
+    extractor: &Extractor<DerivativeFreeCost, CleaveLang, ConstantFold>,
+    fresh: &FreshVars,
+    tables: &OpTables,
+    acc: Vec<CVal>,
+    k: &dyn Fn(Vec<CVal>) -> CExpr,
+) -> CExpr {
+    let Some((&first, rest)) = shapes.split_first() else {
+        return k(acc);
+    };
+    reassemble_shape(first, egraph, extractor, fresh, tables, &|v| {
+        let mut acc2 = acc.clone();
+        acc2.push(v);
+        reassemble_many_owned(rest, egraph, extractor, fresh, tables, acc2, k)
+    })
+}
+
+/// The `CVal`-level mirror of `nest_construction` — nests a flat list of
+/// already-reassembled leaf `CVal`s back into a real multi-dimensional
+/// `PrimOp::Array` construction, row-major, matching `dims` exactly. Hands
+/// the continuation both the built value and its own `Ty` (needed one
+/// recursion level up, to know what the *next* array level's own element
+/// type is), the same reason `nest_construction` returns both.
+fn nest_array_cvals(
+    flat: &[CVal],
+    dims: &[i64],
+    elem_ty: &Ty,
+    fresh: &FreshVars,
+    k: &dyn Fn(CVal, Ty) -> CExpr,
+) -> CExpr {
+    let (&n, rest_dims) = dims.split_first().expect("dims must be non-empty");
+    if rest_dims.is_empty() {
+        let ty = Ty::Array(
+            Box::new(elem_ty.clone()),
+            Box::new(Ty::Const(ConstValue::Int(n as u64))),
+        );
+        let var = fresh.var();
+        return CExpr::LetPrim {
+            var,
+            ty: ty.clone(),
+            op: PrimOp::Array,
+            args: flat.to_vec(),
+            cont: Box::new(k(CVal::Var(var), ty)),
+        };
+    }
+    let chunk_size = rest_dims.iter().product::<i64>() as usize;
+    let chunks: Vec<&[CVal]> = flat.chunks(chunk_size).collect();
+    nest_array_chunks(&chunks, rest_dims, elem_ty, fresh, n, Vec::new(), None, k)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn nest_array_chunks(
+    chunks: &[&[CVal]],
+    rest_dims: &[i64],
+    elem_ty: &Ty,
+    fresh: &FreshVars,
+    n: i64,
+    acc: Vec<CVal>,
+    sub_ty: Option<Ty>,
+    k: &dyn Fn(CVal, Ty) -> CExpr,
+) -> CExpr {
+    let Some((first, rest)) = chunks.split_first() else {
+        let ty = Ty::Array(
+            Box::new(sub_ty.expect("at least one chunk")),
+            Box::new(Ty::Const(ConstValue::Int(n as u64))),
+        );
+        let var = fresh.var();
+        return CExpr::LetPrim {
+            var,
+            ty: ty.clone(),
+            op: PrimOp::Array,
+            args: acc,
+            cont: Box::new(k(CVal::Var(var), ty)),
+        };
+    };
+    nest_array_cvals(first, rest_dims, elem_ty, fresh, &|v, new_sub_ty| {
+        let mut acc2 = acc.clone();
+        acc2.push(v);
+        nest_array_chunks(
+            rest,
+            rest_dims,
+            elem_ty,
+            fresh,
+            n,
+            acc2,
+            Some(new_sub_ty),
+            k,
+        )
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egg::{EGraph, Extractor, AstSize};
+    use egg::{AstSize, EGraph, Extractor};
 
     /// Proves both the `Language` shape and the folding `Analysis` are
     /// usable in isolation, before anything CPS-shaped touches either:
@@ -2530,7 +3921,11 @@ mod tests {
         // for this module's own unit tests, so this sidesteps it entirely.
         let extractor = Extractor::new(&egraph, AstSize);
         let (_, best) = extractor.find_best(add);
-        assert_eq!(best.to_string(), "5", "expected the folded literal, got {best}");
+        assert_eq!(
+            best.to_string(),
+            "5",
+            "expected the folded literal, got {best}"
+        );
     }
 
     /// A node whose own children aren't both known constants doesn't fold
@@ -2605,19 +4000,34 @@ mod tests {
         let registry = Registry::build(&program);
 
         let mut reached = HashMap::new();
-        reached.insert("TestRing::add<i32>".to_string(), ("TestRing".to_string(), "add".to_string()));
+        reached.insert(
+            "TestRing::add<i32>".to_string(),
+            ("TestRing".to_string(), "add".to_string()),
+        );
         let rules = axiom_rewrites(&registry, &reached);
-        assert_eq!(rules.len(), 1, "expected exactly one rewrite, for the one reached type");
+        assert_eq!(
+            rules.len(),
+            1,
+            "expected exactly one rewrite, for the one reached type"
+        );
 
         let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
         let a = egraph.add(CleaveLang::Free("a".into()));
         let b = egraph.add(CleaveLang::Free("b".into()));
         let ab = egraph.add(CleaveLang::Op("TestRing::add<i32>".into(), vec![a, b]));
         let ba = egraph.add(CleaveLang::Op("TestRing::add<i32>".into(), vec![b, a]));
-        assert_ne!(egraph.find(ab), egraph.find(ba), "must not be equivalent *before* the rule runs");
+        assert_ne!(
+            egraph.find(ab),
+            egraph.find(ba),
+            "must not be equivalent *before* the rule runs"
+        );
 
         let runner = egg::Runner::default().with_egraph(egraph).run(&rules);
-        assert_eq!(runner.egraph.find(ab), runner.egraph.find(ba), "commutativity must make the two forms equivalent");
+        assert_eq!(
+            runner.egraph.find(ab),
+            runner.egraph.find(ba),
+            "commutativity must make the two forms equivalent"
+        );
     }
 
     /// An axiom belonging to an algebra with no reached instantiation at
@@ -2676,9 +4086,15 @@ mod tests {
                 body: CExpr::LetPrim {
                     var: 20,
                     ty: i32_ty(),
-                    op: PrimOp::RawMlirOp { op: "arith.addi".to_string(), attrs: vec![] },
+                    op: PrimOp::RawMlirOp {
+                        op: "arith.addi".to_string(),
+                        attrs: vec![],
+                    },
                     args: vec![CVal::Var(10), CVal::Var(11)],
-                    cont: Box::new(CExpr::App { func: CVal::Var(12), args: vec![CVal::Var(20)] }),
+                    cont: Box::new(CExpr::App {
+                        func: CVal::Var(12),
+                        args: vec![CVal::Var(20)],
+                    }),
                 },
                 carried_types: None,
             },
@@ -2698,7 +4114,10 @@ mod tests {
             defs: vec![CFunDef {
                 name: "k$0".to_string(),
                 params: vec![5],
-                body: CExpr::App { func: CVal::Var(99), args: vec![CVal::Var(5)] },
+                body: CExpr::App {
+                    func: CVal::Var(99),
+                    args: vec![CVal::Var(5)],
+                },
                 carried_types: None,
             }],
             body: Box::new(CExpr::App {
@@ -2716,13 +4135,38 @@ mod tests {
         let rules = axiom_rewrites(&registry, &fwd.reached);
         assert_eq!(rules.len(), 1);
 
-        let Forward { egraph, free_vars, raw_ops, call_units, struct_ops, field_ops, array_ops, array_repeat_ops, load_ops, .. } = fwd;
+        let Forward {
+            egraph,
+            free_vars,
+            raw_ops,
+            call_units,
+            struct_ops,
+            field_ops,
+            array_ops,
+            array_repeat_ops,
+            load_ops,
+            ..
+        } = fwd;
         let runner = egg::Runner::default().with_egraph(egraph).run(&rules);
         let extractor = Extractor::new(&runner.egraph, AstSize);
         let (_, best) = extractor.find_best(runner.egraph.find(root_id));
 
         let fresh = FreshVars::new();
-        let rebuilt = rebuild_segment(&best, best.root(), root_var, &boundary, &free_vars, &raw_ops, &call_units, &struct_ops, &field_ops, &array_ops, &array_repeat_ops, &load_ops, &fresh);
+        let rebuilt = rebuild_segment(
+            &best,
+            best.root(),
+            root_var,
+            &boundary,
+            &free_vars,
+            &raw_ops,
+            &call_units,
+            &struct_ops,
+            &field_ops,
+            &array_ops,
+            &array_repeat_ops,
+            &load_ops,
+            &fresh,
+        );
 
         // Everything folded away: the reconstructed form is a bare `App`
         // (the boundary itself), its own reference to `root_var` patched
@@ -2730,9 +4174,14 @@ mod tests {
         // no `Fix`, the call to `TestRing::add<i32>` never happens at all.
         match &rebuilt {
             CExpr::App { args, .. } => {
-                assert!(matches!(args.as_slice(), [CVal::Var(0)]), "expected the boundary patched straight to `x` (Var(0)), got {rebuilt:?}");
+                assert!(
+                    matches!(args.as_slice(), [CVal::Var(0)]),
+                    "expected the boundary patched straight to `x` (Var(0)), got {rebuilt:?}"
+                );
             }
-            other => panic!("expected a bare App, the whole computation having folded away -- got {other:?}"),
+            other => panic!(
+                "expected a bare App, the whole computation having folded away -- got {other:?}"
+            ),
         }
     }
 
@@ -2752,24 +4201,39 @@ mod tests {
     /// e-graph node).
     #[test]
     fn a_straight_line_letprim_chain_translates_fully_leaving_only_the_tail_app_as_boundary() {
-        let tail = CExpr::App { func: CVal::Var(99), args: vec![CVal::Var(1)] };
+        let tail = CExpr::App {
+            func: CVal::Var(99),
+            args: vec![CVal::Var(1)],
+        };
         let expr = CExpr::LetPrim {
             var: 0,
             ty: i32_ty(),
-            op: PrimOp::RawMlirOp { op: "arith.addi".to_string(), attrs: vec![] },
+            op: PrimOp::RawMlirOp {
+                op: "arith.addi".to_string(),
+                attrs: vec![],
+            },
             args: vec![CVal::Int(2), CVal::Int(3)],
             cont: Box::new(CExpr::LetPrim {
                 var: 1,
                 ty: i32_ty(),
-                op: PrimOp::RawMlirOp { op: "arith.muli".to_string(), attrs: vec![] },
+                op: PrimOp::RawMlirOp {
+                    op: "arith.muli".to_string(),
+                    attrs: vec![],
+                },
                 args: vec![CVal::Var(0), CVal::Int(10)],
                 cont: Box::new(tail.clone()),
             }),
         };
         let mut fwd = Forward::default();
         let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
-        assert!(matches!(boundary, CExpr::App { .. }), "expected the bare tail App as the boundary, got {boundary:?}");
-        assert!(fwd.env.contains_key(&0) && fwd.env.contains_key(&1), "both LetPrim-bound vars must have their own e-class");
+        assert!(
+            matches!(boundary, CExpr::App { .. }),
+            "expected the bare tail App as the boundary, got {boundary:?}"
+        );
+        assert!(
+            fwd.env.contains_key(&0) && fwd.env.contains_key(&1),
+            "both LetPrim-bound vars must have their own e-class"
+        );
         // (2 + 3) folds to 5, then 5 * 10 folds to 50 -- constant folding
         // firing automatically as each node is added, not a separate step.
         assert_eq!(fwd.egraph[fwd.env[&1]].data.const_int, Some(50));
@@ -2785,18 +4249,30 @@ mod tests {
     #[test]
     fn a_letprim_with_a_float_literal_argument_translates_instead_of_stopping() {
         let f32_ty = || Ty::Con("f32".to_string());
-        let tail = CExpr::App { func: CVal::Var(99), args: vec![CVal::Var(0)] };
+        let tail = CExpr::App {
+            func: CVal::Var(99),
+            args: vec![CVal::Var(0)],
+        };
         let expr = CExpr::LetPrim {
             var: 0,
             ty: f32_ty(),
-            op: PrimOp::RawMlirOp { op: "arith.mulf".to_string(), attrs: vec![] },
+            op: PrimOp::RawMlirOp {
+                op: "arith.mulf".to_string(),
+                attrs: vec![],
+            },
             args: vec![CVal::Var(10), CVal::Float(2.0)],
             cont: Box::new(tail.clone()),
         };
         let mut fwd = Forward::default();
         let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
-        assert!(matches!(boundary, CExpr::App { .. }), "expected the bare tail App as the boundary, got {boundary:?}");
-        assert!(fwd.env.contains_key(&0), "the LetPrim-bound var must have its own e-class -- the float argument must not have stopped translation");
+        assert!(
+            matches!(boundary, CExpr::App { .. }),
+            "expected the bare tail App as the boundary, got {boundary:?}"
+        );
+        assert!(
+            fwd.env.contains_key(&0),
+            "the LetPrim-bound var must have its own e-class -- the float argument must not have stopped translation"
+        );
     }
 
     /// The other half of `CVal::Float` representability: not just building a
@@ -2812,11 +4288,17 @@ mod tests {
     #[test]
     fn a_float_leaf_round_trips_through_extraction_and_rebuild_unchanged() {
         let f32_ty = || Ty::Con("f32".to_string());
-        let tail = CExpr::App { func: CVal::Var(99), args: vec![CVal::Var(0)] };
+        let tail = CExpr::App {
+            func: CVal::Var(99),
+            args: vec![CVal::Var(0)],
+        };
         let expr = CExpr::LetPrim {
             var: 0,
             ty: f32_ty(),
-            op: PrimOp::RawMlirOp { op: "arith.mulf".to_string(), attrs: vec![] },
+            op: PrimOp::RawMlirOp {
+                op: "arith.mulf".to_string(),
+                attrs: vec![],
+            },
             args: vec![CVal::Var(10), CVal::Float(2.5)],
             cont: Box::new(tail.clone()),
         };
@@ -2828,14 +4310,43 @@ mod tests {
         let extractor = Extractor::new(&fwd.egraph, AstSize);
         let (_, best) = extractor.find_best(root_id);
 
-        let Forward { free_vars, raw_ops, call_units, struct_ops, field_ops, array_ops, array_repeat_ops, load_ops, .. } = fwd;
+        let Forward {
+            free_vars,
+            raw_ops,
+            call_units,
+            struct_ops,
+            field_ops,
+            array_ops,
+            array_repeat_ops,
+            load_ops,
+            ..
+        } = fwd;
         let fresh = FreshVars::new();
-        let rebuilt = rebuild_segment(&best, best.root(), root_var, &boundary, &free_vars, &raw_ops, &call_units, &struct_ops, &field_ops, &array_ops, &array_repeat_ops, &load_ops, &fresh);
+        let rebuilt = rebuild_segment(
+            &best,
+            best.root(),
+            root_var,
+            &boundary,
+            &free_vars,
+            &raw_ops,
+            &call_units,
+            &struct_ops,
+            &field_ops,
+            &array_ops,
+            &array_repeat_ops,
+            &load_ops,
+            &fresh,
+        );
 
         match &rebuilt {
             CExpr::LetPrim { args, .. } => {
-                let has_float = args.iter().any(|a| matches!(a, CVal::Float(f) if *f == 2.5));
-                assert!(has_float, "expected the reconstructed args to still carry the exact float literal, got {rebuilt:?}");
+                let has_float = args
+                    .iter()
+                    .any(|a| matches!(a, CVal::Float(f) if *f == 2.5));
+                assert!(
+                    has_float,
+                    "expected the reconstructed args to still carry the exact float literal, got {rebuilt:?}"
+                );
             }
             other => panic!("expected a rebuilt LetPrim carrying the raw mlir op, got {other:?}"),
         }
@@ -2855,9 +4366,15 @@ mod tests {
                 body: CExpr::LetPrim {
                     var: 20,
                     ty: i32_ty(),
-                    op: PrimOp::RawMlirOp { op: "arith.addi".to_string(), attrs: vec![] },
+                    op: PrimOp::RawMlirOp {
+                        op: "arith.addi".to_string(),
+                        attrs: vec![],
+                    },
                     args: vec![CVal::Var(10), CVal::Var(11)],
-                    cont: Box::new(CExpr::App { func: CVal::Var(12), args: vec![CVal::Var(20)] }),
+                    cont: Box::new(CExpr::App {
+                        func: CVal::Var(12),
+                        args: vec![CVal::Var(20)],
+                    }),
                 },
                 carried_types: None,
             },
@@ -2876,7 +4393,10 @@ mod tests {
             defs: vec![CFunDef {
                 name: "k$0".to_string(),
                 params: vec![5],
-                body: CExpr::App { func: CVal::Var(99), args: vec![CVal::Var(5)] },
+                body: CExpr::App {
+                    func: CVal::Var(99),
+                    args: vec![CVal::Var(5)],
+                },
                 carried_types: None,
             }],
             body: Box::new(CExpr::App {
@@ -2886,8 +4406,14 @@ mod tests {
         };
         let mut fwd = Forward::default();
         let boundary = fwd.walk(&expr, &units, &FreshVars::new());
-        assert!(matches!(boundary, CExpr::App { .. }), "translation must continue past the Fix into k$0's own body, got {boundary:?}");
-        assert!(fwd.env.contains_key(&5), "the call's own result var must have its own e-class");
+        assert!(
+            matches!(boundary, CExpr::App { .. }),
+            "translation must continue past the Fix into k$0's own body, got {boundary:?}"
+        );
+        assert!(
+            fwd.env.contains_key(&5),
+            "the call's own result var must have its own e-class"
+        );
         // 2 + 3 folds to 5 through the *callee's* own translated op.
         assert_eq!(fwd.egraph[fwd.env[&5]].data.const_int, Some(5));
         assert_eq!(
@@ -2908,8 +4434,14 @@ mod tests {
                 params: vec![10, 11],
                 body: CExpr::If {
                     cond: CVal::Bool(true),
-                    then_branch: Box::new(CExpr::App { func: CVal::Var(11), args: vec![CVal::Int(1)] }),
-                    else_branch: Box::new(CExpr::App { func: CVal::Var(11), args: vec![CVal::Int(2)] }),
+                    then_branch: Box::new(CExpr::App {
+                        func: CVal::Var(11),
+                        args: vec![CVal::Int(1)],
+                    }),
+                    else_branch: Box::new(CExpr::App {
+                        func: CVal::Var(11),
+                        args: vec![CVal::Int(2)],
+                    }),
                 },
                 carried_types: None,
             },
@@ -2927,7 +4459,10 @@ mod tests {
             defs: vec![CFunDef {
                 name: "k$0".to_string(),
                 params: vec![5],
-                body: CExpr::App { func: CVal::Var(99), args: vec![CVal::Var(5)] },
+                body: CExpr::App {
+                    func: CVal::Var(99),
+                    args: vec![CVal::Var(5)],
+                },
                 carried_types: None,
             }],
             body: Box::new(CExpr::App {
@@ -2937,8 +4472,14 @@ mod tests {
         };
         let mut fwd = Forward::default();
         let boundary = fwd.walk(&expr, &units, &FreshVars::new());
-        assert!(matches!(boundary, CExpr::Fix { .. }), "a non-straight-line callee must stop translation at the Fix, got {boundary:?}");
-        assert!(fwd.env.is_empty(), "nothing should have been translated at all");
+        assert!(
+            matches!(boundary, CExpr::Fix { .. }),
+            "a non-straight-line callee must stop translation at the Fix, got {boundary:?}"
+        );
+        assert!(
+            fwd.env.is_empty(),
+            "nothing should have been translated at all"
+        );
     }
 
     // -------------------------------------------------- for-loop unrolling (Forward::try_unroll_for_loop)
@@ -2971,28 +4512,55 @@ mod tests {
                     defs: vec![CFunDef {
                         name: "k2".to_string(),
                         params: vec![I2],
-                        body: CExpr::App { func: CVal::Label("loop$0".to_string()), args: vec![CVal::Var(I2), CVal::Var(ACC2)] },
+                        body: CExpr::App {
+                            func: CVal::Label("loop$0".to_string()),
+                            args: vec![CVal::Var(I2), CVal::Var(ACC2)],
+                        },
                         carried_types: None,
                     }],
-                    body: Box::new(CExpr::App { func: CVal::Label("Ring::add<i32>".to_string()), args: vec![CVal::Var(I), CVal::Int(1), CVal::Label("k2".to_string())] }),
+                    body: Box::new(CExpr::App {
+                        func: CVal::Label("Ring::add<i32>".to_string()),
+                        args: vec![CVal::Var(I), CVal::Int(1), CVal::Label("k2".to_string())],
+                    }),
                 },
                 carried_types: None,
             }],
-            body: Box::new(CExpr::App { func: CVal::Label("Ring::add<i32>".to_string()), args: vec![CVal::Var(ACC), CVal::Var(I), CVal::Label("k1".to_string())] }),
+            body: Box::new(CExpr::App {
+                func: CVal::Label("Ring::add<i32>".to_string()),
+                args: vec![CVal::Var(ACC), CVal::Var(I), CVal::Label("k1".to_string())],
+            }),
         };
-        let else_branch = CExpr::App { func: CVal::Var(K_RET), args: vec![CVal::Var(ACC)] };
+        let else_branch = CExpr::App {
+            func: CVal::Var(K_RET),
+            args: vec![CVal::Var(ACC)],
+        };
         let cond_fix = CExpr::Fix {
             defs: vec![CFunDef {
                 name: "k_cond".to_string(),
                 params: vec![COND],
-                body: CExpr::If { cond: CVal::Var(COND), then_branch: Box::new(then_branch), else_branch: Box::new(else_branch) },
+                body: CExpr::If {
+                    cond: CVal::Var(COND),
+                    then_branch: Box::new(then_branch),
+                    else_branch: Box::new(else_branch),
+                },
                 carried_types: None,
             }],
-            body: Box::new(CExpr::App { func: CVal::Label("Ord::lt<i32>".to_string()), args: vec![CVal::Var(I), end, CVal::Label("k_cond".to_string())] }),
+            body: Box::new(CExpr::App {
+                func: CVal::Label("Ord::lt<i32>".to_string()),
+                args: vec![CVal::Var(I), end, CVal::Label("k_cond".to_string())],
+            }),
         };
         CExpr::Fix {
-            defs: vec![CFunDef { name: "loop$0".to_string(), params: vec![I, ACC], body: cond_fix, carried_types: Some(vec![i32_ty(), i32_ty()]) }],
-            body: Box::new(CExpr::App { func: CVal::Label("loop$0".to_string()), args: vec![CVal::Int(0), CVal::Int(0)] }),
+            defs: vec![CFunDef {
+                name: "loop$0".to_string(),
+                params: vec![I, ACC],
+                body: cond_fix,
+                carried_types: Some(vec![i32_ty(), i32_ty()]),
+            }],
+            body: Box::new(CExpr::App {
+                func: CVal::Label("loop$0".to_string()),
+                args: vec![CVal::Int(0), CVal::Int(0)],
+            }),
         }
     }
 
@@ -3004,9 +4572,15 @@ mod tests {
                 body: CExpr::LetPrim {
                     var: 20,
                     ty: i32_ty(),
-                    op: PrimOp::RawMlirOp { op: "arith.addi".to_string(), attrs: vec![] },
+                    op: PrimOp::RawMlirOp {
+                        op: "arith.addi".to_string(),
+                        attrs: vec![],
+                    },
                     args: vec![CVal::Var(10), CVal::Var(11)],
-                    cont: Box::new(CExpr::App { func: CVal::Var(12), args: vec![CVal::Var(20)] }),
+                    cont: Box::new(CExpr::App {
+                        func: CVal::Var(12),
+                        args: vec![CVal::Var(20)],
+                    }),
                 },
                 carried_types: None,
             },
@@ -3036,10 +4610,26 @@ mod tests {
         let mut fwd = Forward::default();
         let boundary = fwd.walk(&expr, &units, &FreshVars::new());
 
-        assert!(matches!(boundary, CExpr::App { func: CVal::Var(99), .. }), "expected unrolling to continue straight into the loop's own exit continuation, got {boundary:?}");
+        assert!(
+            matches!(
+                boundary,
+                CExpr::App {
+                    func: CVal::Var(99),
+                    ..
+                }
+            ),
+            "expected unrolling to continue straight into the loop's own exit continuation, got {boundary:?}"
+        );
         const ACC: CVar = 0;
-        let acc_id = *fwd.env.get(&ACC).expect("the carried `acc` var must have its own e-class after unrolling");
-        assert_eq!(fwd.egraph[acc_id].data.const_int, Some(3), "0+0, then +1, then +2 must fold to 3 -- carried state must thread across iterations, not restart each time");
+        let acc_id = *fwd
+            .env
+            .get(&ACC)
+            .expect("the carried `acc` var must have its own e-class after unrolling");
+        assert_eq!(
+            fwd.egraph[acc_id].data.const_int,
+            Some(3),
+            "0+0, then +1, then +2 must fold to 3 -- carried state must thread across iterations, not restart each time"
+        );
     }
 
     /// A non-literal bound (`end` is a free variable, not a `CVal::Int`)
@@ -3055,8 +4645,14 @@ mod tests {
         let mut fwd = Forward::default();
         let boundary = fwd.walk(&expr, &units, &FreshVars::new());
 
-        assert!(matches!(boundary, CExpr::Fix { .. }), "a non-literal bound must bail, leaving the original Fix as the boundary, got {boundary:?}");
-        assert!(fwd.env.is_empty(), "nothing should have been translated at all");
+        assert!(
+            matches!(boundary, CExpr::Fix { .. }),
+            "a non-literal bound must bail, leaving the original Fix as the boundary, got {boundary:?}"
+        );
+        assert!(
+            fwd.env.is_empty(),
+            "nothing should have been translated at all"
+        );
     }
 
     /// A bound exceeding `MAX_UNROLL_ITERATIONS` also bails, exactly like a
@@ -3072,8 +4668,14 @@ mod tests {
         let mut fwd = Forward::default();
         let boundary = fwd.walk(&expr, &units, &FreshVars::new());
 
-        assert!(matches!(boundary, CExpr::Fix { .. }), "a too-large bound must bail, leaving the original Fix as the boundary, got {boundary:?}");
-        assert!(fwd.env.is_empty(), "nothing should have been translated at all");
+        assert!(
+            matches!(boundary, CExpr::Fix { .. }),
+            "a too-large bound must bail, leaving the original Fix as the boundary, got {boundary:?}"
+        );
+        assert!(
+            fwd.env.is_empty(),
+            "nothing should have been translated at all"
+        );
     }
 
     // -------------------------------------------------- is_straight_line effectfulness (Stage A)
@@ -3089,11 +4691,20 @@ mod tests {
         let body = CExpr::LetPrim {
             var: 20,
             ty: i32_ty(),
-            op: PrimOp::Extern { symbol: "print_i32".to_string(), param_types: vec![i32_ty()] },
+            op: PrimOp::Extern {
+                symbol: "print_i32".to_string(),
+                param_types: vec![i32_ty()],
+            },
             args: vec![CVal::Var(10)],
-            cont: Box::new(CExpr::App { func: CVal::Var(11), args: vec![CVal::Var(20)] }),
+            cont: Box::new(CExpr::App {
+                func: CVal::Var(11),
+                args: vec![CVal::Var(20)],
+            }),
         };
-        assert!(!is_straight_line(&body, &HashMap::new()), "an Extern effect must not be judged straight-line, no Fix/If needed to reject it");
+        assert!(
+            !is_straight_line(&body, &HashMap::new()),
+            "an Extern effect must not be judged straight-line, no Fix/If needed to reject it"
+        );
     }
 
     /// The integration-level counterpart: a real call to a unit whose own
@@ -3110,9 +4721,15 @@ mod tests {
                 body: CExpr::LetPrim {
                     var: 20,
                     ty: i32_ty(),
-                    op: PrimOp::Extern { symbol: "print_i32".to_string(), param_types: vec![i32_ty()] },
+                    op: PrimOp::Extern {
+                        symbol: "print_i32".to_string(),
+                        param_types: vec![i32_ty()],
+                    },
                     args: vec![CVal::Var(10)],
-                    cont: Box::new(CExpr::App { func: CVal::Var(11), args: vec![CVal::Var(20)] }),
+                    cont: Box::new(CExpr::App {
+                        func: CVal::Var(11),
+                        args: vec![CVal::Var(20)],
+                    }),
                 },
                 carried_types: None,
             },
@@ -3130,7 +4747,10 @@ mod tests {
             defs: vec![CFunDef {
                 name: "k$0".to_string(),
                 params: vec![5],
-                body: CExpr::App { func: CVal::Var(99), args: vec![CVal::Var(5)] },
+                body: CExpr::App {
+                    func: CVal::Var(99),
+                    args: vec![CVal::Var(5)],
+                },
                 carried_types: None,
             }],
             body: Box::new(CExpr::App {
@@ -3140,8 +4760,14 @@ mod tests {
         };
         let mut fwd = Forward::default();
         let boundary = fwd.walk(&expr, &units, &FreshVars::new());
-        assert!(matches!(boundary, CExpr::Fix { .. }), "an effectful callee must stop translation at the Fix, got {boundary:?}");
-        assert!(fwd.env.is_empty(), "nothing should have been translated at all");
+        assert!(
+            matches!(boundary, CExpr::Fix { .. }),
+            "an effectful callee must stop translation at the Fix, got {boundary:?}"
+        );
+        assert!(
+            fwd.env.is_empty(),
+            "nothing should have been translated at all"
+        );
     }
 
     /// A body that's real control flow from the very start (`If`) never
@@ -3151,14 +4777,23 @@ mod tests {
     fn a_body_starting_with_if_translates_nothing() {
         let expr = CExpr::If {
             cond: CVal::Bool(true),
-            then_branch: Box::new(CExpr::App { func: CVal::Var(9), args: vec![CVal::Int(1)] }),
-            else_branch: Box::new(CExpr::App { func: CVal::Var(9), args: vec![CVal::Int(2)] }),
+            then_branch: Box::new(CExpr::App {
+                func: CVal::Var(9),
+                args: vec![CVal::Int(1)],
+            }),
+            else_branch: Box::new(CExpr::App {
+                func: CVal::Var(9),
+                args: vec![CVal::Int(2)],
+            }),
         };
         let mut fwd = Forward::default();
         let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
         assert!(matches!(boundary, CExpr::If { .. }));
         assert!(fwd.env.is_empty());
-        assert!(fwd.free_vars.is_empty(), "nothing was translated, so nothing should have been treated as free either");
+        assert!(
+            fwd.free_vars.is_empty(),
+            "nothing was translated, so nothing should have been treated as free either"
+        );
     }
 
     // -------------------------------------------------- Struct/Field forward translation (Stage B)
@@ -3177,12 +4812,21 @@ mod tests {
             ty: pair_ty(),
             op: PrimOp::Struct("Pair".to_string(), vec!["x".to_string(), "y".to_string()]),
             args: vec![CVal::Int(21), CVal::Int(0)],
-            cont: Box::new(CExpr::App { func: CVal::Var(99), args: vec![CVal::Var(0)] }),
+            cont: Box::new(CExpr::App {
+                func: CVal::Var(99),
+                args: vec![CVal::Var(0)],
+            }),
         };
         let mut fwd = Forward::default();
         let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
-        assert!(matches!(boundary, CExpr::App { .. }), "expected the bare tail App as the boundary, got {boundary:?}");
-        assert!(fwd.env.contains_key(&0), "the struct-construction-bound var must have its own e-class");
+        assert!(
+            matches!(boundary, CExpr::App { .. }),
+            "expected the bare tail App as the boundary, got {boundary:?}"
+        );
+        assert!(
+            fwd.env.contains_key(&0),
+            "the struct-construction-bound var must have its own e-class"
+        );
     }
 
     /// A field read right after the struct construction that produced it --
@@ -3201,15 +4845,27 @@ mod tests {
             cont: Box::new(CExpr::LetPrim {
                 var: 1,
                 ty: i32_ty(),
-                op: PrimOp::Field { struct_ty: pair_ty(), field: "y".to_string() },
+                op: PrimOp::Field {
+                    struct_ty: pair_ty(),
+                    field: "y".to_string(),
+                },
                 args: vec![CVal::Var(0)],
-                cont: Box::new(CExpr::App { func: CVal::Var(99), args: vec![CVal::Var(1)] }),
+                cont: Box::new(CExpr::App {
+                    func: CVal::Var(99),
+                    args: vec![CVal::Var(1)],
+                }),
             }),
         };
         let mut fwd = Forward::default();
         let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
-        assert!(matches!(boundary, CExpr::App { .. }), "expected the bare tail App as the boundary, got {boundary:?}");
-        assert!(fwd.env.contains_key(&0) && fwd.env.contains_key(&1), "both the construction and the field read must have their own e-class");
+        assert!(
+            matches!(boundary, CExpr::App { .. }),
+            "expected the bare tail App as the boundary, got {boundary:?}"
+        );
+        assert!(
+            fwd.env.contains_key(&0) && fwd.env.contains_key(&1),
+            "both the construction and the field read must have their own e-class"
+        );
         assert_eq!(
             fwd.egraph[fwd.env[&1]].data.const_int, None,
             "a field read must not constant-fold to its own source literal yet -- no struct-projection knowledge this stage"
@@ -3230,7 +4886,10 @@ mod tests {
             ty: pair_ty(),
             op: PrimOp::Struct("Pair".to_string(), vec!["x".to_string(), "y".to_string()]),
             args: vec![CVal::Int(1), CVal::Int(2)],
-            cont: Box::new(CExpr::App { func: CVal::Var(99), args: vec![CVal::Var(1)] }),
+            cont: Box::new(CExpr::App {
+                func: CVal::Var(99),
+                args: vec![CVal::Var(1)],
+            }),
         };
         let expr = CExpr::LetPrim {
             var: 0,
@@ -3241,13 +4900,19 @@ mod tests {
         };
         let mut fwd = Forward::default();
         let _boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
-        assert_eq!(fwd.env[&0], fwd.env[&1], "two structurally identical constructions must hashcons to the same e-class");
+        assert_eq!(
+            fwd.env[&0], fwd.env[&1],
+            "two structurally identical constructions must hashcons to the same e-class"
+        );
     }
 
     // -------------------------------------------------- Array/ArrayRepeat/Load forward translation
 
     fn array_ty() -> Ty {
-        Ty::Array(Box::new(i32_ty()), Box::new(Ty::Const(crate::infer::ConstValue::Int(2))))
+        Ty::Array(
+            Box::new(i32_ty()),
+            Box::new(Ty::Const(crate::infer::ConstValue::Int(2))),
+        )
     }
 
     /// An array literal (`[1, 2]`), mirrors the struct-construction test
@@ -3259,12 +4924,21 @@ mod tests {
             ty: array_ty(),
             op: PrimOp::Array,
             args: vec![CVal::Int(1), CVal::Int(2)],
-            cont: Box::new(CExpr::App { func: CVal::Var(99), args: vec![CVal::Var(0)] }),
+            cont: Box::new(CExpr::App {
+                func: CVal::Var(99),
+                args: vec![CVal::Var(0)],
+            }),
         };
         let mut fwd = Forward::default();
         let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
-        assert!(matches!(boundary, CExpr::App { .. }), "expected the bare tail App as the boundary, got {boundary:?}");
-        assert!(fwd.env.contains_key(&0), "the array-literal-bound var must have its own e-class");
+        assert!(
+            matches!(boundary, CExpr::App { .. }),
+            "expected the bare tail App as the boundary, got {boundary:?}"
+        );
+        assert!(
+            fwd.env.contains_key(&0),
+            "the array-literal-bound var must have its own e-class"
+        );
     }
 
     /// `[0; 2]`, mirrors the array-literal test.
@@ -3275,12 +4949,21 @@ mod tests {
             ty: array_ty(),
             op: PrimOp::ArrayRepeat,
             args: vec![CVal::Int(0), CVal::Int(2)],
-            cont: Box::new(CExpr::App { func: CVal::Var(99), args: vec![CVal::Var(0)] }),
+            cont: Box::new(CExpr::App {
+                func: CVal::Var(99),
+                args: vec![CVal::Var(0)],
+            }),
         };
         let mut fwd = Forward::default();
         let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
-        assert!(matches!(boundary, CExpr::App { .. }), "expected the bare tail App as the boundary, got {boundary:?}");
-        assert!(fwd.env.contains_key(&0), "the array-repeat-bound var must have its own e-class");
+        assert!(
+            matches!(boundary, CExpr::App { .. }),
+            "expected the bare tail App as the boundary, got {boundary:?}"
+        );
+        assert!(
+            fwd.env.contains_key(&0),
+            "the array-repeat-bound var must have its own e-class"
+        );
     }
 
     /// A single-index read right after the array literal that produced it
@@ -3296,15 +4979,26 @@ mod tests {
             cont: Box::new(CExpr::LetPrim {
                 var: 1,
                 ty: i32_ty(),
-                op: PrimOp::Load { array_ty: array_ty() },
+                op: PrimOp::Load {
+                    array_ty: array_ty(),
+                },
                 args: vec![CVal::Var(0), CVal::Int(0)],
-                cont: Box::new(CExpr::App { func: CVal::Var(99), args: vec![CVal::Var(1)] }),
+                cont: Box::new(CExpr::App {
+                    func: CVal::Var(99),
+                    args: vec![CVal::Var(1)],
+                }),
             }),
         };
         let mut fwd = Forward::default();
         let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
-        assert!(matches!(boundary, CExpr::App { .. }), "expected the bare tail App as the boundary, got {boundary:?}");
-        assert!(fwd.env.contains_key(&0) && fwd.env.contains_key(&1), "both the array literal and the load must have their own e-class");
+        assert!(
+            matches!(boundary, CExpr::App { .. }),
+            "expected the bare tail App as the boundary, got {boundary:?}"
+        );
+        assert!(
+            fwd.env.contains_key(&0) && fwd.env.contains_key(&1),
+            "both the array literal and the load must have their own e-class"
+        );
     }
 
     // -------------------------------------------------- Struct/Field backward reconstruction (Stage C)
@@ -3324,9 +5018,15 @@ mod tests {
             cont: Box::new(CExpr::LetPrim {
                 var: 1,
                 ty: i32_ty(),
-                op: PrimOp::Field { struct_ty: pair_ty(), field: "x".to_string() },
+                op: PrimOp::Field {
+                    struct_ty: pair_ty(),
+                    field: "x".to_string(),
+                },
                 args: vec![CVal::Var(0)],
-                cont: Box::new(CExpr::App { func: CVal::Var(99), args: vec![CVal::Var(1)] }),
+                cont: Box::new(CExpr::App {
+                    func: CVal::Var(99),
+                    args: vec![CVal::Var(1)],
+                }),
             }),
         };
         let mut fwd = Forward::default();
@@ -3334,15 +5034,44 @@ mod tests {
         let root_var: CVar = 1;
         let root_id = fwd.env[&root_var];
 
-        let Forward { egraph, free_vars, raw_ops, call_units, struct_ops, field_ops, array_ops, array_repeat_ops, load_ops, .. } = fwd;
+        let Forward {
+            egraph,
+            free_vars,
+            raw_ops,
+            call_units,
+            struct_ops,
+            field_ops,
+            array_ops,
+            array_repeat_ops,
+            load_ops,
+            ..
+        } = fwd;
         let extractor = Extractor::new(&egraph, AstSize);
         let (_, best) = extractor.find_best(root_id);
 
         let fresh = FreshVars::new();
-        let rebuilt = rebuild_segment(&best, best.root(), root_var, &boundary, &free_vars, &raw_ops, &call_units, &struct_ops, &field_ops, &array_ops, &array_repeat_ops, &load_ops, &fresh);
+        let rebuilt = rebuild_segment(
+            &best,
+            best.root(),
+            root_var,
+            &boundary,
+            &free_vars,
+            &raw_ops,
+            &call_units,
+            &struct_ops,
+            &field_ops,
+            &array_ops,
+            &array_repeat_ops,
+            &load_ops,
+            &fresh,
+        );
 
         match &rebuilt {
-            CExpr::LetPrim { op: PrimOp::Struct(name, fields), cont, .. } => {
+            CExpr::LetPrim {
+                op: PrimOp::Struct(name, fields),
+                cont,
+                ..
+            } => {
                 assert_eq!(name, "Pair");
                 assert_eq!(fields, &vec!["x".to_string(), "y".to_string()]);
                 assert!(
@@ -3350,7 +5079,9 @@ mod tests {
                     "expected the field read to follow the construction, got {cont:?}"
                 );
             }
-            other => panic!("expected a LetPrim{{Struct}} at the root of the rebuilt segment, got {other:?}"),
+            other => panic!(
+                "expected a LetPrim{{Struct}} at the root of the rebuilt segment, got {other:?}"
+            ),
         }
     }
 
@@ -3368,9 +5099,14 @@ mod tests {
             cont: Box::new(CExpr::LetPrim {
                 var: 1,
                 ty: i32_ty(),
-                op: PrimOp::Load { array_ty: array_ty() },
+                op: PrimOp::Load {
+                    array_ty: array_ty(),
+                },
                 args: vec![CVal::Var(0), CVal::Int(0)],
-                cont: Box::new(CExpr::App { func: CVal::Var(99), args: vec![CVal::Var(1)] }),
+                cont: Box::new(CExpr::App {
+                    func: CVal::Var(99),
+                    args: vec![CVal::Var(1)],
+                }),
             }),
         };
         let mut fwd = Forward::default();
@@ -3378,19 +5114,60 @@ mod tests {
         let root_var: CVar = 1;
         let root_id = fwd.env[&root_var];
 
-        let Forward { egraph, free_vars, raw_ops, call_units, struct_ops, field_ops, array_ops, array_repeat_ops, load_ops, .. } = fwd;
+        let Forward {
+            egraph,
+            free_vars,
+            raw_ops,
+            call_units,
+            struct_ops,
+            field_ops,
+            array_ops,
+            array_repeat_ops,
+            load_ops,
+            ..
+        } = fwd;
         let extractor = Extractor::new(&egraph, AstSize);
         let (_, best) = extractor.find_best(root_id);
 
         let fresh = FreshVars::new();
-        let rebuilt = rebuild_segment(&best, best.root(), root_var, &boundary, &free_vars, &raw_ops, &call_units, &struct_ops, &field_ops, &array_ops, &array_repeat_ops, &load_ops, &fresh);
+        let rebuilt = rebuild_segment(
+            &best,
+            best.root(),
+            root_var,
+            &boundary,
+            &free_vars,
+            &raw_ops,
+            &call_units,
+            &struct_ops,
+            &field_ops,
+            &array_ops,
+            &array_repeat_ops,
+            &load_ops,
+            &fresh,
+        );
 
         match &rebuilt {
-            CExpr::LetPrim { op: PrimOp::Array, args, cont, .. } => {
+            CExpr::LetPrim {
+                op: PrimOp::Array,
+                args,
+                cont,
+                ..
+            } => {
                 assert_eq!(args.len(), 2);
-                assert!(matches!(cont.as_ref(), CExpr::LetPrim { op: PrimOp::Load { .. }, .. }), "expected the load to follow the construction, got {cont:?}");
+                assert!(
+                    matches!(
+                        cont.as_ref(),
+                        CExpr::LetPrim {
+                            op: PrimOp::Load { .. },
+                            ..
+                        }
+                    ),
+                    "expected the load to follow the construction, got {cont:?}"
+                );
             }
-            other => panic!("expected a LetPrim{{Array}} at the root of the rebuilt segment, got {other:?}"),
+            other => panic!(
+                "expected a LetPrim{{Array}} at the root of the rebuilt segment, got {other:?}"
+            ),
         }
     }
 
@@ -3411,14 +5188,23 @@ mod tests {
             cont: Box::new(CExpr::LetPrim {
                 var: 1,
                 ty: i32_ty(),
-                op: PrimOp::Field { struct_ty: pair_ty(), field: "x".to_string() },
+                op: PrimOp::Field {
+                    struct_ty: pair_ty(),
+                    field: "x".to_string(),
+                },
                 args: vec![CVal::Var(0)],
                 cont: Box::new(CExpr::LetPrim {
                     var: 2,
                     ty: i32_ty(),
-                    op: PrimOp::RawMlirOp { op: "arith.addi".to_string(), attrs: vec![] },
+                    op: PrimOp::RawMlirOp {
+                        op: "arith.addi".to_string(),
+                        attrs: vec![],
+                    },
                     args: vec![CVal::Var(1), CVal::Var(1)],
-                    cont: Box::new(CExpr::App { func: CVal::Var(99), args: vec![CVal::Var(2)] }),
+                    cont: Box::new(CExpr::App {
+                        func: CVal::Var(99),
+                        args: vec![CVal::Var(2)],
+                    }),
                 }),
             }),
         };
@@ -3427,19 +5213,55 @@ mod tests {
         let root_var: CVar = 2;
         let root_id = fwd.env[&root_var];
 
-        let Forward { egraph, free_vars, raw_ops, call_units, struct_ops, field_ops, array_ops, array_repeat_ops, load_ops, .. } = fwd;
+        let Forward {
+            egraph,
+            free_vars,
+            raw_ops,
+            call_units,
+            struct_ops,
+            field_ops,
+            array_ops,
+            array_repeat_ops,
+            load_ops,
+            ..
+        } = fwd;
         let extractor = Extractor::new(&egraph, AstSize);
         let (_, best) = extractor.find_best(root_id);
 
         let fresh = FreshVars::new();
-        let rebuilt = rebuild_segment(&best, best.root(), root_var, &boundary, &free_vars, &raw_ops, &call_units, &struct_ops, &field_ops, &array_ops, &array_repeat_ops, &load_ops, &fresh);
+        let rebuilt = rebuild_segment(
+            &best,
+            best.root(),
+            root_var,
+            &boundary,
+            &free_vars,
+            &raw_ops,
+            &call_units,
+            &struct_ops,
+            &field_ops,
+            &array_ops,
+            &array_repeat_ops,
+            &load_ops,
+            &fresh,
+        );
 
         fn count_struct_letprims(expr: &CExpr) -> usize {
             match expr {
-                CExpr::LetPrim { op, cont, .. } => (matches!(op, PrimOp::Struct(..)) as usize) + count_struct_letprims(cont),
+                CExpr::LetPrim { op, cont, .. } => {
+                    (matches!(op, PrimOp::Struct(..)) as usize) + count_struct_letprims(cont)
+                }
                 CExpr::App { .. } => 0,
-                CExpr::Fix { defs, body } => defs.iter().map(|d| count_struct_letprims(&d.body)).sum::<usize>() + count_struct_letprims(body),
-                CExpr::If { then_branch, else_branch, .. } => count_struct_letprims(then_branch) + count_struct_letprims(else_branch),
+                CExpr::Fix { defs, body } => {
+                    defs.iter()
+                        .map(|d| count_struct_letprims(&d.body))
+                        .sum::<usize>()
+                        + count_struct_letprims(body)
+                }
+                CExpr::If {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => count_struct_letprims(then_branch) + count_struct_letprims(else_branch),
             }
         }
         assert_eq!(
@@ -3462,9 +5284,15 @@ mod tests {
         let expr = CExpr::LetPrim {
             var: 0,
             ty: i32_ty(),
-            op: PrimOp::RawMlirOp { op: "arith.addi".to_string(), attrs: vec![] },
+            op: PrimOp::RawMlirOp {
+                op: "arith.addi".to_string(),
+                attrs: vec![],
+            },
             args: vec![CVal::Int(2), CVal::Int(3)],
-            cont: Box::new(CExpr::App { func: CVal::Var(99), args: vec![CVal::Var(0)] }),
+            cont: Box::new(CExpr::App {
+                func: CVal::Var(99),
+                args: vec![CVal::Var(0)],
+            }),
         };
         let mut fwd = Forward::default();
         let _boundary_ignored = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
@@ -3473,7 +5301,10 @@ mod tests {
             defs: vec![CFunDef {
                 name: "k$0".to_string(),
                 params: vec![50],
-                body: CExpr::App { func: CVal::Var(51), args: vec![CVal::Var(50)] },
+                body: CExpr::App {
+                    func: CVal::Var(51),
+                    args: vec![CVal::Var(50)],
+                },
                 carried_types: None,
             }],
             body: Box::new(CExpr::App {
@@ -3495,20 +5326,32 @@ mod tests {
         let expr = CExpr::LetPrim {
             var: 0,
             ty: i32_ty(),
-            op: PrimOp::RawMlirOp { op: "arith.addi".to_string(), attrs: vec![] },
+            op: PrimOp::RawMlirOp {
+                op: "arith.addi".to_string(),
+                attrs: vec![],
+            },
             args: vec![CVal::Int(2), CVal::Int(3)],
             cont: Box::new(CExpr::LetPrim {
                 var: 1,
                 ty: i32_ty(),
-                op: PrimOp::RawMlirOp { op: "arith.muli".to_string(), attrs: vec![] },
+                op: PrimOp::RawMlirOp {
+                    op: "arith.muli".to_string(),
+                    attrs: vec![],
+                },
                 args: vec![CVal::Var(0), CVal::Int(10)],
-                cont: Box::new(CExpr::App { func: CVal::Var(99), args: vec![CVal::Var(1)] }),
+                cont: Box::new(CExpr::App {
+                    func: CVal::Var(99),
+                    args: vec![CVal::Var(1)],
+                }),
             }),
         };
         let mut fwd = Forward::default();
         let _boundary_ignored = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
 
-        let boundary = CExpr::App { func: CVal::Var(99), args: vec![CVal::Var(0), CVal::Var(1)] };
+        let boundary = CExpr::App {
+            func: CVal::Var(99),
+            args: vec![CVal::Var(0), CVal::Var(1)],
+        };
         assert_eq!(segment_root_var(&boundary, &fwd.env), None);
     }
 
@@ -3523,24 +5366,43 @@ mod tests {
     fn struct_projection_rewrites_unions_a_field_read_with_its_own_constructor_arg() {
         let mut struct_ops = HashMap::new();
         let struct_sym = Symbol::from("struct:Pair:x,y");
-        struct_ops.insert(struct_sym, ("Pair".to_string(), vec!["x".to_string(), "y".to_string()], pair_ty()));
+        struct_ops.insert(
+            struct_sym,
+            (
+                "Pair".to_string(),
+                vec!["x".to_string(), "y".to_string()],
+                pair_ty(),
+            ),
+        );
 
         let mut field_ops = HashMap::new();
         let field_sym = Symbol::from("field:Pair:y");
         field_ops.insert(field_sym, (pair_ty(), "y".to_string(), i32_ty()));
 
         let rules = struct_projection_rewrites(&struct_ops, &field_ops);
-        assert_eq!(rules.len(), 1, "expected exactly one rule, for the one field actually read");
+        assert_eq!(
+            rules.len(),
+            1,
+            "expected exactly one rule, for the one field actually read"
+        );
 
         let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
         let a = egraph.add(CleaveLang::Free("a".into()));
         let b = egraph.add(CleaveLang::Free("b".into()));
         let s = egraph.add(CleaveLang::Op(struct_sym, vec![a, b]));
         let field_y = egraph.add(CleaveLang::Op(field_sym, vec![s]));
-        assert_ne!(egraph.find(field_y), egraph.find(b), "must not be equivalent before the rule runs");
+        assert_ne!(
+            egraph.find(field_y),
+            egraph.find(b),
+            "must not be equivalent before the rule runs"
+        );
 
         let runner = egg::Runner::default().with_egraph(egraph).run(&rules);
-        assert_eq!(runner.egraph.find(field_y), runner.egraph.find(b), "field(struct(a,b), y) must union with b");
+        assert_eq!(
+            runner.egraph.find(field_y),
+            runner.egraph.find(b),
+            "field(struct(a,b), y) must union with b"
+        );
     }
 
     /// A field that was constructed but never actually read anywhere
@@ -3549,7 +5411,14 @@ mod tests {
     #[test]
     fn no_projection_rewrite_is_built_for_a_field_never_read() {
         let mut struct_ops = HashMap::new();
-        struct_ops.insert(Symbol::from("struct:Pair:x,y"), ("Pair".to_string(), vec!["x".to_string(), "y".to_string()], pair_ty()));
+        struct_ops.insert(
+            Symbol::from("struct:Pair:x,y"),
+            (
+                "Pair".to_string(),
+                vec!["x".to_string(), "y".to_string()],
+                pair_ty(),
+            ),
+        );
         let rules = struct_projection_rewrites(&struct_ops, &HashMap::new());
         assert!(rules.is_empty());
     }
@@ -3605,12 +5474,18 @@ mod tests {
         // code populates this via `Forward` before ever adding the `Free`
         // node; a hand-built test e-graph has to do the same for `build_
         // zero` to know `y` is scalar rather than bailing.
-        egraph.analysis.known_types.insert(Symbol::from("y"), Ty::Con("f32".to_string()));
+        egraph
+            .analysis
+            .known_types
+            .insert(Symbol::from("y"), Ty::Con("f32".to_string()));
         let y = egraph.add(CleaveLang::Free("y".into()));
         let d = egraph.add(CleaveLang::Op("derivative".into(), vec![y, x]));
 
         let runner = egg::Runner::default().with_egraph(egraph).run(&rules);
-        assert_eq!(extract_best(&runner.egraph, runner.egraph.find(d)), "Ring::zero<f32>");
+        assert_eq!(
+            extract_best(&runner.egraph, runner.egraph.find(d)),
+            "Ring::zero<f32>"
+        );
     }
 
     /// `derivative(3.0, x) -> 0` -- a literal constant is a leaf that
@@ -3676,9 +5551,16 @@ mod tests {
         let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
         let w = egraph.add(CleaveLang::Free("w".into()));
         let zero = egraph.add(CleaveLang::Float(0.0.into()));
-        assert!(egraph[zero].data.free_deps.is_empty(), "a bare literal must start with no recorded dependencies");
+        assert!(
+            egraph[zero].data.free_deps.is_empty(),
+            "a bare literal must start with no recorded dependencies"
+        );
         let w_times_zero = egraph.add(CleaveLang::Op("Ring::mul<f32>".into(), vec![w, zero]));
-        assert_eq!(egraph[w_times_zero].data.free_deps, HashSet::from([Symbol::from("w")]), "w*0.0's own naive bound must mention w before it's unioned with anything");
+        assert_eq!(
+            egraph[w_times_zero].data.free_deps,
+            HashSet::from([Symbol::from("w")]),
+            "w*0.0's own naive bound must mention w before it's unioned with anything"
+        );
         egraph.union(zero, w_times_zero);
         egraph.rebuild();
         assert!(
@@ -3719,8 +5601,14 @@ mod tests {
 
     fn ring_f32_reached() -> HashMap<String, (String, String)> {
         let mut reached = HashMap::new();
-        reached.insert("TestRing::mul<f32>".to_string(), ("TestRing".to_string(), "mul".to_string()));
-        reached.insert("TestRing::add<f32>".to_string(), ("TestRing".to_string(), "add".to_string()));
+        reached.insert(
+            "TestRing::mul<f32>".to_string(),
+            ("TestRing".to_string(), "mul".to_string()),
+        );
+        reached.insert(
+            "TestRing::add<f32>".to_string(),
+            ("TestRing".to_string(), "add".to_string()),
+        );
         reached
     }
 
@@ -3746,7 +5634,10 @@ mod tests {
 
         let runner = egg::Runner::default().with_egraph(egraph).run(&rules);
         let best = extract_best(&runner.egraph, runner.egraph.find(d));
-        assert_ne!(best, "0", "declared product rule must not be short-circuited by the leaf-zero rule, got {best}");
+        assert_ne!(
+            best, "0",
+            "declared product rule must not be short-circuited by the leaf-zero rule, got {best}"
+        );
     }
 
     /// The declared product rule fires, and — with the two base cases
@@ -3776,26 +5667,42 @@ mod tests {
         // own independence from `x` needs it to build a same-shaped zero
         // (`build_zero`), for the product rule's own `d(y)` sub-term to
         // fully reduce.
-        egraph.analysis.known_types.insert(Symbol::from("y"), Ty::Con("f32".to_string()));
+        egraph
+            .analysis
+            .known_types
+            .insert(Symbol::from("y"), Ty::Con("f32".to_string()));
         let y = egraph.add(CleaveLang::Free("y".into()));
         let xy = egraph.add(CleaveLang::Op("TestRing::mul<f32>".into(), vec![x, y]));
         let d = egraph.add(CleaveLang::Op("derivative".into(), vec![xy, x]));
 
         let runner = egg::Runner::default().with_egraph(egraph).run(&rules);
         let best = extract_best(&runner.egraph, runner.egraph.find(d));
-        assert!(!best.contains("derivative"), "expected every `derivative` marker eliminated, got {best}");
-        assert!(best.contains('y'), "expected the surviving expression to still reference y, got {best}");
+        assert!(
+            !best.contains("derivative"),
+            "expected every `derivative` marker eliminated, got {best}"
+        );
+        assert!(
+            best.contains('y'),
+            "expected the surviving expression to still reference y, got {best}"
+        );
     }
 
     /// The declared product rule's own referenced-unit set names `add` —
     /// `f`'s own `x*y` never calls it, but the rule's own RHS needs it.
     #[test]
-    fn derivative_rewrites_reports_units_the_declared_rules_reference_but_reached_does_not_include() {
+    fn derivative_rewrites_reports_units_the_declared_rules_reference_but_reached_does_not_include()
+    {
         let reg = ring_f32_with_derivative_rules();
         let mut reached = HashMap::new();
-        reached.insert("TestRing::mul<f32>".to_string(), ("TestRing".to_string(), "mul".to_string()));
+        reached.insert(
+            "TestRing::mul<f32>".to_string(),
+            ("TestRing".to_string(), "mul".to_string()),
+        );
         let (_, referenced, _) = derivative_rewrites("f32", &reached, &reg, &HashSet::new());
-        assert!(referenced.contains("TestRing::add<f32>"), "expected the product rule's own referenced-unit set to name add, got {referenced:?}");
+        assert!(
+            referenced.contains("TestRing::add<f32>"),
+            "expected the product rule's own referenced-unit set to name add, got {referenced:?}"
+        );
     }
 
     /// No declared `derivative` rule at all -- only the two base rules get
@@ -3804,7 +5711,11 @@ mod tests {
     fn only_base_rules_are_built_when_nothing_is_declared() {
         let reg = empty_registry();
         let (rules, _, _) = derivative_rewrites("f32", &HashMap::new(), &reg, &HashSet::new());
-        assert_eq!(rules.len(), 2, "expected exactly the two base rules (self, leaf-zero)");
+        assert_eq!(
+            rules.len(),
+            2,
+            "expected exactly the two base rules (self, leaf-zero)"
+        );
     }
 
     /// The real, clean "cannot derive" error path — a method with no
@@ -3816,31 +5727,40 @@ mod tests {
     /// (`crate::driver::compile` -> `collect_units` -> `convert_program`),
     /// not a synthetic e-graph-only setup.
     #[test]
-    fn synthesize_derivatives_reports_a_clean_error_instead_of_panicking_when_no_rule_reaches_a_node() {
+    fn synthesize_derivatives_reports_a_clean_error_instead_of_panicking_when_no_rule_reaches_a_node()
+     {
         let src = "
             algebra Foo<T> { fn bar(x: T) -> T; }
             impl Foo<f32> { fn bar(x) { x } }
             fn f(x: f32) -> f32 { bar(x) }
             fprime = derive(f);
         ";
-        let (result, _sources) = crate::driver::compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
+        let (result, _sources) =
+            crate::driver::compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
         let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
         let registry = Registry::build(&program);
         let units = crate::cps::collect_units(&program, &registry);
         let requests: Vec<DerivativeRequest> = units
             .iter()
             .filter_map(|u| match &u.body {
-                crate::cps::UnitBody::Derivative(of) => Some(DerivativeRequest { name: u.name.clone(), of: of.clone() }),
+                crate::cps::UnitBody::Derivative(of) => Some(DerivativeRequest {
+                    name: u.name.clone(),
+                    of: of.clone(),
+                }),
                 _ => None,
             })
             .collect();
         let cps_program = crate::cps::convert_program(units);
-        let errs = match synthesize_derivatives(cps_program, &requests, &registry) {
+        let errs = match synthesize_derivatives(cps_program, &requests, &registry, &HashMap::new())
+        {
             Err(errs) => errs,
             Ok(_) => panic!("expected a real error, not a successfully synthesized fprime"),
         };
         assert_eq!(errs.len(), 1);
-        assert!(errs[0].contains("Foo::bar<f32>"), "expected the error to name the undifferentiable unit, got {errs:?}");
+        assert!(
+            errs[0].contains("Foo::bar<f32>"),
+            "expected the error to name the undifferentiable unit, got {errs:?}"
+        );
     }
 
     /// The empirically-found bug this whole item's second half fixes: before
@@ -3854,7 +5774,8 @@ mod tests {
     /// top-level fn `fprime`") the moment something else called it --
     /// reproduced directly, via a real `--run`, before this fix existed.
     #[test]
-    fn synthesize_derivatives_reports_a_clean_error_instead_of_silently_dropping_the_function_when_the_body_is_not_fully_representable() {
+    fn synthesize_derivatives_reports_a_clean_error_instead_of_silently_dropping_the_function_when_the_body_is_not_fully_representable()
+     {
         let src = "
             fn f(x: f32) -> f32 {
                 let mut total = 0.0;
@@ -3865,24 +5786,35 @@ mod tests {
             }
             fprime = derive(f);
         ";
-        let (result, _sources) = crate::driver::compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
+        let (result, _sources) =
+            crate::driver::compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
         let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
         let registry = Registry::build(&program);
         let units = crate::cps::collect_units(&program, &registry);
         let requests: Vec<DerivativeRequest> = units
             .iter()
             .filter_map(|u| match &u.body {
-                crate::cps::UnitBody::Derivative(of) => Some(DerivativeRequest { name: u.name.clone(), of: of.clone() }),
+                crate::cps::UnitBody::Derivative(of) => Some(DerivativeRequest {
+                    name: u.name.clone(),
+                    of: of.clone(),
+                }),
                 _ => None,
             })
             .collect();
         let cps_program = crate::cps::convert_program(units);
-        let errs = match synthesize_derivatives(cps_program, &requests, &registry) {
+        let errs = match synthesize_derivatives(cps_program, &requests, &registry, &HashMap::new())
+        {
             Err(errs) => errs,
             Ok(_) => panic!("expected a real error, not a successfully synthesized fprime"),
         };
         assert_eq!(errs.len(), 1);
-        assert!(errs[0].contains("cannot derive `fprime`"), "expected the error to name the request, got {errs:?}");
-        assert!(errs[0].contains("not fully representable"), "expected the error to explain why, got {errs:?}");
+        assert!(
+            errs[0].contains("cannot derive `fprime`"),
+            "expected the error to name the request, got {errs:?}"
+        );
+        assert!(
+            errs[0].contains("not fully representable"),
+            "expected the error to explain why, got {errs:?}"
+        );
     }
 }

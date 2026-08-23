@@ -77,7 +77,10 @@ pub fn parse_file(src: &FileSource) -> Result<Program, Diagnostic> {
 /// a side-table key for e.g. inferred types, see `infer.rs`) uniquely
 /// identifies a node across an *entire* multi-file compilation, not just
 /// within whichever single file happened to produce it.
-pub fn parse_file_with_ids(src: &FileSource, ids: NodeIdGen) -> Result<(Program, NodeIdGen), Diagnostic> {
+pub fn parse_file_with_ids(
+    src: &FileSource,
+    ids: NodeIdGen,
+) -> Result<(Program, NodeIdGen), Diagnostic> {
     let pair = CleaveParser::parse(Rule::program, &src.text)
         .map_err(|e| Diagnostic::from_pest(&e, src.id))?
         .next()
@@ -123,7 +126,10 @@ const PRELUDE_CRATES: &[&str] = &["num", "logic"];
 /// "project root(s), then the shipped stdlib" per `grammar.md`. First match
 /// wins; callers are expected to pass `stdlib_path()` last in the list.
 pub fn resolve_crate_dir(name: &str, search_paths: &[PathBuf]) -> Option<PathBuf> {
-    search_paths.iter().map(|root| root.join(name)).find(|p| p.is_dir())
+    search_paths
+        .iter()
+        .map(|root| root.join(name))
+        .find(|p| p.is_dir())
 }
 
 /// Reads every `*.cleave` file directly inside `dir` (not recursive — a
@@ -155,7 +161,8 @@ pub fn load_crate_dir(
     let mut errors = Vec::new();
     let mut programs = Vec::new();
     for path in paths {
-        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("failed to read {path:?}: {e}"));
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {path:?}: {e}"));
         let id = ids.next();
         let name = path.display().to_string();
         sources.add(id, name.clone(), text.clone());
@@ -276,7 +283,11 @@ pub fn compile(
     // like any other's.
     for name in PRELUDE_CRATES {
         if !wanted_names.contains(*name) {
-            let synthetic_span = Span { file: FileId(0), start: 0, end: 0 };
+            let synthetic_span = Span {
+                file: FileId(0),
+                start: 0,
+                end: 0,
+            };
             visit_crate(
                 name,
                 synthetic_span,
@@ -304,10 +315,12 @@ pub fn compile(
 }
 
 /// The tuple-arity ceiling this compiler understands — see `synthesize_
-/// tuple_structs`'s own doc comment. Trivially raised later; chosen to
-/// cover realistic near-term use (a multi-argument `print` call, mainly)
-/// with room to spare, not as a hard architectural limit.
-const MAX_TUPLE_ARITY: usize = 4;
+/// tuple_structs`'s own doc comment. Trivially raised later; not a hard
+/// architectural limit. Raised from 4 to 16 once `derive()`'s own
+/// synthesized Jacobian (`synthesize_derive_signatures` below) started
+/// always returning a tuple, regardless of how many parameters `f` has —
+/// `examples/xor.cleave`'s own `loss` alone already has 12.
+const MAX_TUPLE_ARITY: usize = 16;
 
 /// Injects one synthesized `struct __TupleN<T0, ..., T(N-1)> { 0: T0, ...,
 /// (N-1): T(N-1) }` per arity 2..=`MAX_TUPLE_ARITY`, into every compiled
@@ -325,20 +338,43 @@ const MAX_TUPLE_ARITY: usize = 4;
 /// construction (fresh, unbounded generic names, no bounds, referencing
 /// only its own fields).
 fn synthesize_tuple_structs(mut program: Program, node_ids: &mut NodeIdGen) -> Program {
-    let synthetic_span = Span { file: FileId(0), start: 0, end: 0 };
+    let synthetic_span = Span {
+        file: FileId(0),
+        start: 0,
+        end: 0,
+    };
     for arity in 2..=MAX_TUPLE_ARITY {
         let generic_names: Vec<String> = (0..arity).map(|i| format!("T{i}")).collect();
-        let generics = generic_names.iter().map(|name| GenericParam::Type { name: name.clone(), bounds: Vec::new(), variadic: false }).collect();
+        let generics = generic_names
+            .iter()
+            .map(|name| GenericParam::Type {
+                name: name.clone(),
+                bounds: Vec::new(),
+                variadic: false,
+            })
+            .collect();
         let fields = generic_names
             .iter()
             .enumerate()
             .map(|(i, name)| Field {
                 name: i.to_string(),
-                ty: Node { id: node_ids.next(), span: synthetic_span, kind: TypeKind::Path(Path::single(name.clone()), Vec::new()) },
+                ty: Node {
+                    id: node_ids.next(),
+                    span: synthetic_span,
+                    kind: TypeKind::Path(Path::single(name.clone()), Vec::new()),
+                },
             })
             .collect();
-        let decl = StructDecl { name: tuple_struct_name(arity), generics, fields };
-        program.items.push(Node { id: node_ids.next(), span: synthetic_span, kind: ItemKind::Struct(decl) });
+        let decl = StructDecl {
+            name: tuple_struct_name(arity),
+            generics,
+            fields,
+        };
+        program.items.push(Node {
+            id: node_ids.next(),
+            span: synthetic_span,
+            kind: ItemKind::Struct(decl),
+        });
     }
     program
 }
@@ -350,18 +386,27 @@ fn synthesize_tuple_structs(mut program: Program, node_ids: &mut NodeIdGen) -> P
 /// a different file entirely, only merged into one `Program` by
 /// `merge_programs`, right before this runs. Mechanically derived, never
 /// written by hand: `f` itself must already be a real, non-generic
-/// function with every parameter *and* its own return type explicitly
-/// declared as the exact same type `T` (checked by comparing each one's
-/// own formatted text — `print.rs::fmt_type` — not full type inference,
-/// which hasn't run yet at this point in the pipeline) — `N == 1`
-/// parameter synthesizes `fn fprime(x: T) -> T` (an ordinary scalar
-/// derivative); `N > 1` synthesizes `fn fprime(x1: T, ..., xN: T) -> [T;
-/// N]` (the gradient/Jacobian row, reusing the array type that already
-/// exists rather than needing tuples, which aren't implemented).
-/// Heterogeneous parameter types, a missing/generic/nullary `f`, or any
-/// unannotated parameter on `f` — every one a real, located `Diagnostic`,
+/// function with every parameter explicitly typed (checked structurally,
+/// not full type inference, which hasn't run yet at this point in the
+/// pipeline) — `N == 1` parameter synthesizes `fn fprime(x: T) -> T` (an
+/// ordinary scalar derivative); `N > 1` synthesizes `fn fprime(x1: T1, ...,
+/// xN: TN) -> (T1, ..., TN)` (the gradient/Jacobian row, one tuple entry
+/// per parameter, in declared order).
+///
+/// Each Jacobian entry's own type is that *parameter's* own declared type,
+/// not `f`'s return type — the gradient of a scalar loss with respect to a
+/// `Tensor`-typed parameter is itself `Tensor`-shaped, not scalar-shaped;
+/// `f`'s own return type plays no role in the synthesized signature at all
+/// beyond needing to exist. Parameter types no longer need to match each
+/// other (or the return type) — heterogeneous parameters, including a
+/// struct-typed one, are exactly the point (`doc/backlog.md`'s own "gradient
+/// w.r.t. a struct parameter" item). A missing/generic/nullary `f`, or any
+/// unannotated parameter on `f`, is still a real, located `Diagnostic`,
 /// never guessed.
-fn synthesize_derive_signatures(mut program: Program, node_ids: &mut NodeIdGen) -> Result<Program, Vec<Diagnostic>> {
+fn synthesize_derive_signatures(
+    mut program: Program,
+    node_ids: &mut NodeIdGen,
+) -> Result<Program, Vec<Diagnostic>> {
     let fns: HashMap<String, FnDecl> = program
         .items
         .iter()
@@ -373,52 +418,69 @@ fn synthesize_derive_signatures(mut program: Program, node_ids: &mut NodeIdGen) 
 
     let mut errors = Vec::new();
     for item in &mut program.items {
-        let ItemKind::Fn(fprime) = &mut item.kind else { continue };
-        let Some(of) = fprime.derivative_of.clone() else { continue };
+        let ItemKind::Fn(fprime) = &mut item.kind else {
+            continue;
+        };
+        let Some(of) = fprime.derivative_of.clone() else {
+            continue;
+        };
 
         let Some(f) = fns.get(&of) else {
-            errors.push(Diagnostic::error(format!("`derive({of})`: no function named `{of}`"), item.span));
+            errors.push(Diagnostic::error(
+                format!("`derive({of})`: no function named `{of}`"),
+                item.span,
+            ));
             continue;
         };
         if !f.generics.is_empty() {
-            errors.push(Diagnostic::error(format!("`derive({of})`: `{of}` is generic — only a non-generic function can be derived"), item.span));
+            errors.push(Diagnostic::error(
+                format!(
+                    "`derive({of})`: `{of}` is generic — only a non-generic function can be derived"
+                ),
+                item.span,
+            ));
             continue;
         }
         if f.params.is_empty() {
             errors.push(Diagnostic::error(format!("`derive({of})`: `{of}` takes no parameters — nothing to differentiate with respect to"), item.span));
             continue;
         }
-        let Some(ret) = &f.ret else {
-            errors.push(Diagnostic::error(format!("`derive({of})`: `{of}` has no declared return type"), item.span));
-            continue;
-        };
-        let Some(param_tys): Option<Vec<&Type>> = f.params.iter().map(|p| p.ty.as_ref()).collect() else {
-            errors.push(Diagnostic::error(format!("`derive({of})`: every parameter of `{of}` must have an explicit type"), item.span));
-            continue;
-        };
-        let ret_text = fmt_type(ret);
-        if param_tys.iter().any(|t| fmt_type(t) != ret_text) {
+        if f.ret.is_none() {
             errors.push(Diagnostic::error(
-                format!("`derive({of})`: every parameter of `{of}`, and its own return type, must be the same type `{ret_text}` — heterogeneous types aren't supported yet"),
+                format!("`derive({of})`: `{of}` has no declared return type"),
                 item.span,
             ));
             continue;
         }
+        let Some(param_tys): Option<Vec<Type>> = f.params.iter().map(|p| p.ty.clone()).collect()
+        else {
+            errors.push(Diagnostic::error(
+                format!("`derive({of})`: every parameter of `{of}` must have an explicit type"),
+                item.span,
+            ));
+            continue;
+        };
 
         fprime.params = f.params.clone();
-        fprime.ret = Some(if f.params.len() == 1 {
-            ret.clone()
+        fprime.ret = Some(if param_tys.len() == 1 {
+            param_tys.into_iter().next().unwrap()
         } else {
-            let size = Node {
+            let span = param_tys[0].span;
+            let name = tuple_struct_name(param_tys.len());
+            let args = param_tys.into_iter().map(GenericArg::Type).collect();
+            Node {
                 id: node_ids.next(),
-                span: ret.span,
-                kind: ExprKind::NumberLit { text: f.params.len().to_string(), suffix: None },
-            };
-            Node { id: node_ids.next(), span: ret.span, kind: TypeKind::Array(Box::new(ret.clone()), Box::new(size)) }
+                span,
+                kind: TypeKind::Path(Path::single(name), args),
+            }
         });
     }
 
-    if errors.is_empty() { Ok(program) } else { Err(errors) }
+    if errors.is_empty() {
+        Ok(program)
+    } else {
+        Err(errors)
+    }
 }
 
 /// One node of `compile`'s own transitive crate-resolution DFS — see that
@@ -447,15 +509,26 @@ fn visit_crate(
         return;
     }
     if let Some(pos) = stack.iter().position(|n| n == name) {
-        let cycle = stack[pos..].iter().cloned().chain(std::iter::once(name.to_string())).collect::<Vec<_>>().join(" -> ");
-        errors.push(Diagnostic::error(format!("circular crate dependency: {cycle}"), span));
+        let cycle = stack[pos..]
+            .iter()
+            .cloned()
+            .chain(std::iter::once(name.to_string()))
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        errors.push(Diagnostic::error(
+            format!("circular crate dependency: {cycle}"),
+            span,
+        ));
         loaded.insert(name.to_string());
         return;
     }
 
     let Some(dir) = resolve_crate_dir(name, search_paths) else {
         if required {
-            errors.push(Diagnostic::error(format!("cannot find crate `{name}`"), span));
+            errors.push(Diagnostic::error(
+                format!("cannot find crate `{name}`"),
+                span,
+            ));
         }
         loaded.insert(name.to_string());
         return;
@@ -475,7 +548,19 @@ fn visit_crate(
                 }
             }
             for (dep_name, dep_span) in deps {
-                visit_crate(&dep_name, dep_span, true, search_paths, ids, node_ids, sources, programs, errors, loaded, stack);
+                visit_crate(
+                    &dep_name,
+                    dep_span,
+                    true,
+                    search_paths,
+                    ids,
+                    node_ids,
+                    sources,
+                    programs,
+                    errors,
+                    loaded,
+                    stack,
+                );
             }
             // Post-order: this crate's own `Program` is only pushed *after*
             // every one of its own dependencies has been — see this
@@ -500,12 +585,30 @@ fn generics_match(a: &[GenericParam], b: &[GenericParam]) -> bool {
         return false;
     }
     a.iter().zip(b).all(|(x, y)| match (x, y) {
-        (GenericParam::Type { name: n1, bounds: b1, variadic: v1 }, GenericParam::Type { name: n2, bounds: b2, variadic: v2 }) => {
-            n1 == n2 && b1 == b2 && v1 == v2
-        }
-        (GenericParam::Const { name: n1, ty: t1, variadic: v1 }, GenericParam::Const { name: n2, ty: t2, variadic: v2 }) => {
-            n1 == n2 && fmt_type(t1) == fmt_type(t2) && v1 == v2
-        }
+        (
+            GenericParam::Type {
+                name: n1,
+                bounds: b1,
+                variadic: v1,
+            },
+            GenericParam::Type {
+                name: n2,
+                bounds: b2,
+                variadic: v2,
+            },
+        ) => n1 == n2 && b1 == b2 && v1 == v2,
+        (
+            GenericParam::Const {
+                name: n1,
+                ty: t1,
+                variadic: v1,
+            },
+            GenericParam::Const {
+                name: n2,
+                ty: t2,
+                variadic: v2,
+            },
+        ) => n1 == n2 && fmt_type(t1) == fmt_type(t2) && v1 == v2,
         _ => false,
     })
 }
@@ -571,7 +674,10 @@ pub fn merge_programs(programs: Vec<Program>) -> Result<Program, Vec<Diagnostic>
                 ItemKind::Use(_) => items.push(item),
                 ItemKind::Struct(d) => {
                     if struct_names.contains(&d.name) {
-                        errors.push(Diagnostic::error(format!("duplicate struct `{}`", d.name), item.span));
+                        errors.push(Diagnostic::error(
+                            format!("duplicate struct `{}`", d.name),
+                            item.span,
+                        ));
                         continue;
                     }
                     struct_names.push(d.name.clone());
@@ -579,7 +685,10 @@ pub fn merge_programs(programs: Vec<Program>) -> Result<Program, Vec<Diagnostic>
                 }
                 ItemKind::Fn(d) => {
                     if fn_names.contains(&d.name) {
-                        errors.push(Diagnostic::error(format!("duplicate fn `{}`", d.name), item.span));
+                        errors.push(Diagnostic::error(
+                            format!("duplicate fn `{}`", d.name),
+                            item.span,
+                        ));
                         continue;
                     }
                     fn_names.push(d.name.clone());
@@ -587,7 +696,9 @@ pub fn merge_programs(programs: Vec<Program>) -> Result<Program, Vec<Diagnostic>
                 }
                 ItemKind::Algebra(_) => merge_algebra_fragment(item, &mut algebras, &mut errors),
                 ItemKind::Impl(_) => merge_impl_fragment(item, &mut impls, &mut errors),
-                ItemKind::InherentImpl(_) => merge_inherent_impl_fragment(item, &mut inherent_impls, &mut errors),
+                ItemKind::InherentImpl(_) => {
+                    merge_inherent_impl_fragment(item, &mut inherent_impls, &mut errors)
+                }
             }
         }
     }
@@ -597,19 +708,37 @@ pub fn merge_programs(programs: Vec<Program>) -> Result<Program, Vec<Diagnostic>
     }
 
     for acc in algebras {
-        items.push(Node { id: acc.anchor_id, span: acc.anchor_span, kind: ItemKind::Algebra(acc.decl) });
+        items.push(Node {
+            id: acc.anchor_id,
+            span: acc.anchor_span,
+            kind: ItemKind::Algebra(acc.decl),
+        });
     }
     for acc in impls {
-        items.push(Node { id: acc.anchor_id, span: acc.anchor_span, kind: ItemKind::Impl(acc.decl) });
+        items.push(Node {
+            id: acc.anchor_id,
+            span: acc.anchor_span,
+            kind: ItemKind::Impl(acc.decl),
+        });
     }
     for acc in inherent_impls {
-        items.push(Node { id: acc.anchor_id, span: acc.anchor_span, kind: ItemKind::InherentImpl(acc.decl) });
+        items.push(Node {
+            id: acc.anchor_id,
+            span: acc.anchor_span,
+            kind: ItemKind::InherentImpl(acc.decl),
+        });
     }
     Ok(Program { items })
 }
 
-fn merge_algebra_fragment(item: Item, algebras: &mut Vec<AlgebraAcc>, errors: &mut Vec<Diagnostic>) {
-    let ItemKind::Algebra(d) = item.kind else { unreachable!() };
+fn merge_algebra_fragment(
+    item: Item,
+    algebras: &mut Vec<AlgebraAcc>,
+    errors: &mut Vec<Diagnostic>,
+) {
+    let ItemKind::Algebra(d) = item.kind else {
+        unreachable!()
+    };
 
     let Some(acc) = algebras.iter_mut().find(|a| a.decl.name == d.name) else {
         let mut seen_fn_sigs = HashMap::new();
@@ -630,7 +759,14 @@ fn merge_algebra_fragment(item: Item, algebras: &mut Vec<AlgebraAcc>, errors: &m
                 }
             }
         }
-        algebras.push(AlgebraAcc { anchor_id: item.id, anchor_span: item.span, decl: d, seen_fn_sigs, seen_axioms, seen_derivative_rules });
+        algebras.push(AlgebraAcc {
+            anchor_id: item.id,
+            anchor_span: item.span,
+            decl: d,
+            seen_fn_sigs,
+            seen_axioms,
+            seen_derivative_rules,
+        });
         return;
     };
 
@@ -665,7 +801,8 @@ fn merge_algebra_fragment(item: Item, algebras: &mut Vec<AlgebraAcc>, errors: &m
             AlgebraItemKind::DerivativeRule(dr) => {
                 let dup = acc.seen_derivative_rules.contains_key(&dr.method);
                 if !dup {
-                    acc.seen_derivative_rules.insert(dr.method.clone(), new_item.span);
+                    acc.seen_derivative_rules
+                        .insert(dr.method.clone(), new_item.span);
                 }
                 dup
             }
@@ -677,7 +814,10 @@ fn merge_algebra_fragment(item: Item, algebras: &mut Vec<AlgebraAcc>, errors: &m
                 AlgebraItemKind::DerivativeRule(dr) => &dr.method,
             };
             errors.push(Diagnostic::error(
-                format!("`{name}` is declared more than once in `algebra {}` (same parameter types)", d.name),
+                format!(
+                    "`{name}` is declared more than once in `algebra {}` (same parameter types)",
+                    d.name
+                ),
                 new_item.span,
             ));
             continue;
@@ -691,11 +831,16 @@ fn merge_algebra_fragment(item: Item, algebras: &mut Vec<AlgebraAcc>, errors: &m
 /// own, and wouldn't want a blind one here anyway: `span` differs between
 /// any two fragments by construction, but that's never a real disagreement.
 fn attrs_match(a: &[Attribute], b: &[Attribute]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.name == y.name && x.args == y.args)
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| x.name == y.name && x.args == y.args)
 }
 
 fn merge_impl_fragment(item: Item, impls: &mut Vec<ImplAcc>, errors: &mut Vec<Diagnostic>) {
-    let ItemKind::Impl(d) = item.kind else { unreachable!() };
+    let ItemKind::Impl(d) = item.kind else {
+        unreachable!()
+    };
     // Every target folded into one key, comma-joined, not just the first —
     // two heterogeneous impls sharing a first target but differing in a
     // later one (`impl<...> MatMul<Matrix<T,N,M>, X, Y>` vs. `..., Z, W>`)
@@ -704,8 +849,13 @@ fn merge_impl_fragment(item: Item, impls: &mut Vec<ImplAcc>, errors: &mut Vec<Di
     // (not bare-concatenated) both to avoid a pathological cross-target
     // string collision and because this same key doubles as the conflict
     // error message's own rendering below.
-    let target_key_of =
-        |t: &ImplDecl| -> String { std::iter::once(&t.target).chain(t.extra_targets.iter()).map(fmt_type).collect::<Vec<_>>().join(", ") };
+    let target_key_of = |t: &ImplDecl| -> String {
+        std::iter::once(&t.target)
+            .chain(t.extra_targets.iter())
+            .map(fmt_type)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     let target_key = target_key_of(&d);
     // The impl's own generics (bounds included) are part of its identity,
     // not just the bare target shape — `impl<T: Float> Ring<Complex<T>>`
@@ -716,7 +866,9 @@ fn merge_impl_fragment(item: Item, impls: &mut Vec<ImplAcc>, errors: &mut Vec<Di
     let generics_key = fmt_generics(&d.generics);
 
     let Some(acc) = impls.iter_mut().find(|a| {
-        a.decl.algebra == d.algebra && target_key_of(&a.decl) == target_key && fmt_generics(&a.decl.generics) == generics_key
+        a.decl.algebra == d.algebra
+            && target_key_of(&a.decl) == target_key
+            && fmt_generics(&a.decl.generics) == generics_key
     }) else {
         let mut seen_fns = HashMap::new();
         for f in &d.fns {
@@ -724,7 +876,12 @@ fn merge_impl_fragment(item: Item, impls: &mut Vec<ImplAcc>, errors: &mut Vec<Di
                 seen_fns.insert(key, item.span);
             }
         }
-        impls.push(ImplAcc { anchor_id: item.id, anchor_span: item.span, decl: d, seen_fns });
+        impls.push(ImplAcc {
+            anchor_id: item.id,
+            anchor_span: item.span,
+            decl: d,
+            seen_fns,
+        });
         return;
     };
 
@@ -792,30 +949,43 @@ fn merge_impl_fragment(item: Item, impls: &mut Vec<ImplAcc>, errors: &mut Vec<Di
     }
 }
 
-fn merge_inherent_impl_fragment(item: Item, impls: &mut Vec<InherentImplAcc>, errors: &mut Vec<Diagnostic>) {
-    let ItemKind::InherentImpl(d) = item.kind else { unreachable!() };
+fn merge_inherent_impl_fragment(
+    item: Item,
+    impls: &mut Vec<InherentImplAcc>,
+    errors: &mut Vec<Diagnostic>,
+) {
+    let ItemKind::InherentImpl(d) = item.kind else {
+        unreachable!()
+    };
     let target_key = fmt_type(&d.target);
     // Same reasoning as `merge_impl_fragment`'s own `generics_key` — the
     // impl's own generics are part of its identity, not just the bare
     // target shape.
     let generics_key = fmt_generics(&d.generics);
 
-    let Some(acc) = impls
-        .iter_mut()
-        .find(|a| fmt_type(&a.decl.target) == target_key && fmt_generics(&a.decl.generics) == generics_key)
-    else {
+    let Some(acc) = impls.iter_mut().find(|a| {
+        fmt_type(&a.decl.target) == target_key && fmt_generics(&a.decl.generics) == generics_key
+    }) else {
         let mut seen_fns = HashMap::new();
         for f in &d.fns {
             seen_fns.insert(f.name.clone(), item.span);
         }
-        impls.push(InherentImplAcc { anchor_id: item.id, anchor_span: item.span, decl: d, seen_fns });
+        impls.push(InherentImplAcc {
+            anchor_id: item.id,
+            anchor_span: item.span,
+            decl: d,
+            seen_fns,
+        });
         return;
     };
 
     for f in d.fns {
         if acc.seen_fns.contains_key(&f.name) {
             errors.push(Diagnostic::error(
-                format!("`{}` is implemented more than once in `impl {target_key}`", f.name),
+                format!(
+                    "`{}` is implemented more than once in `impl {target_key}`",
+                    f.name
+                ),
                 item.span,
             ));
             continue;
