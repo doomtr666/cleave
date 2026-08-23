@@ -1,0 +1,47 @@
+// `doc/backlog.md`'s own "No `Optimizer` abstraction" item: a real,
+// generic, stateful optimizer -- `Optimizer<Opt, Model>`, `Opt` a plain
+// hyperparameter-holder struct (`Sgd { lr }`, `Momentum { lr, beta }`), not
+// a value threaded through call arguments the way `Scale<Container,T>`'s
+// own scalar factor is -- SGD and Momentum need genuinely different
+// hyperparameters, so each optimizer gets its own struct field set, the
+// same "config lives in struct fields" shape `Dense`/`Init` already use,
+// rather than forcing every optimizer's `step` to share one fixed argument
+// list.
+//
+// `State` reuses `Model` directly -- a velocity has exactly the same shape
+// as a weight, so there's no need for a separate "shadow" struct per model
+// shape the way a naive design might reach for.
+use linalg;
+
+struct Sgd { lr: f32 }
+struct Momentum { lr: f32, beta: f32 }
+
+algebra Optimizer<Opt, Model> {
+    fn init_state(opt: Opt, model: Model) -> Model;
+    fn step(opt: Opt, model: Model, grad: Model, state: Model) -> (Model, Model);
+}
+
+// Leaf level -- the only level that actually needs to know what an
+// optimizer *is*; every level above this one (`stdlib/nn/nn.cleave`'s own
+// `Dense`-level impl, and any user struct's own `Network`-level one) is
+// generic over `Opt` itself and never touches these bodies at all, just
+// forwards into them.
+impl<T: Float + Ring, const Dims...: i32> Optimizer<Sgd, Tensor<T, Dims...>> {
+    fn init_state(opt, model) { Ring::zero() }
+    fn step(opt, model, grad, state) {
+        (Ring::sub(model, Scale::scale(grad, opt.lr)), state)
+    }
+}
+
+// Momentum (exponential moving average of the gradient, the standard
+// formulation): `v <- beta*v + (1-beta)*grad`, `model <- model - lr*v`.
+// `state` carries `v` between steps -- the whole reason this algebra
+// threads `state` through `step` at all, rather than `Sgd`'s simpler
+// "ignore it" shape.
+impl<T: Float + Ring, const Dims...: i32> Optimizer<Momentum, Tensor<T, Dims...>> {
+    fn init_state(opt, model) { Ring::zero() }
+    fn step(opt, model, grad, state) {
+        let v: Tensor<T, Dims...> = Ring::add(Scale::scale(state, opt.beta), Scale::scale(grad, 1.0 - opt.beta));
+        (Ring::sub(model, Scale::scale(v, opt.lr)), v)
+    }
+}

@@ -477,6 +477,42 @@ fn two_independent_instantiations_of_a_generalized_function_at_different_types_d
     assert_eq!(ok_result(&result, "use_both"), Ty::Con("i32".to_string()));
 }
 
+/// A **generic, but nullary** (zero real value parameters) top-level `fn`
+/// used to be excluded from generalization entirely, unconditionally, by an
+/// over-broad application of the Monomorphism Restriction (`callgraph.rs`'s
+/// own former `f.params.is_empty()` check, with no regard for whether `f`
+/// even *had* any generics to restrict) — every one of its own declared
+/// generics stayed permanently un-quantified, so `apply_defaults` silently
+/// committed them to *some* concrete default the moment the first (only, in
+/// the buggy version) caller's own context resolved anything, permanently
+/// wrong for every other caller. Found directly, by testing `stdlib/nn/nn.
+/// cleave`'s own `Init<T>::xavier`/`he` (an early version, before routing
+/// through an algebra sidestepped the bug instead of fixing it) — a real,
+/// separate compiler bug from the turbofish-ordering one below, not the same
+/// root cause. `make<T: Zero>() -> T { zero() }` here mirrors that shape
+/// minimally: zero real parameters, `T` determined purely by each call
+/// site's own expected-type context — `use_both` calls it at *two different*
+/// concrete types from two independent `let`s, exactly the scenario that
+/// used to permanently wrong-default the second one.
+#[test]
+fn a_nullary_but_generic_function_is_still_generalized_and_usable_at_different_types() {
+    let registry = registry_from(
+        "algebra Zero<T> { fn zero() -> T; }
+        impl Zero<i32> { fn zero() -> i32 { 0 } }
+        impl Zero<f32> { fn zero() -> f32 { 0.0 } }",
+    );
+    let program = lower_program(
+        "fn make<T: Zero>() -> T { zero() }
+        fn use_both() -> i32 {
+            let a: i32 = make();
+            let b: f32 = make();
+            0
+        }",
+    );
+    let result = infer_program(&program, &registry);
+    assert_eq!(ok_result(&result, "use_both"), Ty::Con("i32".to_string()));
+}
+
 #[test]
 fn fibonacci_with_bare_int_literals_in_its_own_body_cannot_be_called_with_a_float() {
     // A direct, surprising-at-first consequence of literal shape becoming a

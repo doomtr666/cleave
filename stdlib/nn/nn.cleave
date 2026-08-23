@@ -15,10 +15,14 @@
 // anyway — `cleave/tests/mlir_lower.rs`'s own `nn` tests are the real proof,
 // none of them write `use linalg;` themselves). `mean`'s own `.to()` call
 // needs `convert` too, transitively resolved the identical way. `dense_
-// xavier`/`dense_he`'s own `uniform`/`normal` calls need `rand` the same way.
+// xavier`/`dense_he`'s own `uniform`/`normal` calls need `rand` the same
+// way; `Optimizer<Opt, Dense<T,In,Out>>` below needs `optim` (`Optimizer`
+// itself, plus `Sgd`/`Momentum`'s own leaf-level `Tensor` impls it forwards
+// into) for the identical reason.
 use linalg;
 use convert;
 use rand;
+use optim;
 
 algebra Activation<T> {
     fn relu(x: T) -> T;
@@ -185,13 +189,11 @@ algebra Init<T> {
     fn he() -> T;
 }
 
-// `[[zero(); Out]; In]` (a same-shape placeholder, pure, so array-repeat's
-// own "evaluate once, broadcast" behavior is fine here) then a real nested
-// loop with indexed writes (`w[i][j] = ...`, ordinary multi-index `Store`,
-// not `[value; Dims...]`, which cannot fill a tensor with independent draws
-// at all -- see `rand.cleave`'s own doc comment) -- exactly the mechanism
-// already proven end to end by the session's own `random_matrix` validation
-// probe.
+// `[[uniform(lo, hi); Out]; In]` -- `array-repeat` now evaluates its own
+// value expression independently at every leaf position (fixed directly in
+// `cps.rs`, no longer "evaluate once, broadcast"), so this fills the whole
+// tensor with independent draws in one expression, same as it always could
+// for a pure value like `Ring::zero()`.
 //
 // `In`/`Out` (bare const generics) can't be handed to `.to()` directly --
 // the same `Ty::Const`-vs-`Ty::Con` gap `Mean::mean`'s own doc comment above
@@ -211,13 +213,7 @@ impl<T: Float + Rand + Ring, const In: i32, const Out: i32> Init<Dense<T, In, Ou
         let fan_in: T = fan_in_i.to();
         let fan_out: T = fan_out_i.to();
         let limit: T = mlir::math::sqrt(6.0 / (fan_in + fan_out));
-        let mut w: [[T; Out]; In] = [[zero(); Out]; In];
-        for i in 0..In {
-            for j in 0..Out {
-                w[i][j] = uniform(-limit, limit);
-            };
-        };
-        Dense(w: Tensor::<T, In, Out>(data: w), b: Ring::zero())
+        Dense(w: Tensor::<T, In, Out>(data: [[uniform(-limit, limit); Out]; In]), b: Ring::zero())
     }
 
     // He normal (He et al., 2015) -- `std = sqrt(2 / fan_in)`, weight ~
@@ -230,13 +226,24 @@ impl<T: Float + Rand + Ring, const In: i32, const Out: i32> Init<Dense<T, In, Ou
         let fan_in_i: i32 = mlir::arith::addi(In, 0);
         let fan_in: T = fan_in_i.to();
         let std: T = mlir::math::sqrt(2.0 / fan_in);
-        let mut w: [[T; Out]; In] = [[zero(); Out]; In];
-        for i in 0..In {
-            for j in 0..Out {
-                w[i][j] = normal(0.0, std);
-            };
-        };
-        Dense(w: Tensor::<T, In, Out>(data: w), b: Ring::zero())
+        Dense(w: Tensor::<T, In, Out>(data: [[normal(0.0, std); Out]; In]), b: Ring::zero())
+    }
+}
+
+// `doc/backlog.md`'s own "Optimizer" item -- one impl, generic over `Opt`
+// itself, covers *every* optimizer `optim.cleave` ever declares a leaf-level
+// impl for (`Sgd`, `Momentum`, and anything added later) -- the body never
+// calls a method on `opt` directly, only forwards it into `Optimizer::step`/
+// `init_state` on `.w`/`.b`, which redispatch on their own to whichever
+// concrete optimizer `opt` actually is. No bound needed on `Opt` at all.
+impl<Opt, T: Float + Ring, const In: i32, const Out: i32> Optimizer<Opt, Dense<T, In, Out>> {
+    fn init_state(opt, model) {
+        Dense(w: Optimizer::init_state(opt, model.w), b: Optimizer::init_state(opt, model.b))
+    }
+    fn step(opt, model, grad, state) {
+        let rw = Optimizer::step(opt, model.w, grad.w, state.w);
+        let rb = Optimizer::step(opt, model.b, grad.b, state.b);
+        (Dense(w: rw.0, b: rb.0), Dense(w: rw.1, b: rb.1))
     }
 }
 

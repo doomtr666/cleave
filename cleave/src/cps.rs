@@ -444,6 +444,7 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                         &mut Vec::new(),
                         &mut call_names,
                         &mut Vec::new(),
+                        registry,
                     );
                     let targets_str = infer
                         .target_types
@@ -2636,27 +2637,63 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
         // monomorphization) `ctx.node_types[&expr.id]` is already the real,
         // fully-resolved nested `Ty::Array` chain (`infer.rs::substitute`'s
         // own pack-expansion fix) — `convert_array_repeat_over_resolved_
-        // dims` reads the real dimension count directly off it, building
-        // one real `PrimOp::ArrayRepeat` per nesting level, innermost
-        // first — exactly the same shape a hand-written `[[value; d2]; d1]`
-        // already produces via ordinary nested `ExprKind::ArrayRepeat`
-        // conversion (the `ident` branch just below), just generated here
-        // instead of written out by hand.
+        // dims` reads the real dimension count directly off it and walks
+        // every level itself, since a whole pack collapses however many
+        // dimensions into this *one* AST node — unlike the ordinary branch
+        // just below, `value` here is always the true leaf expression, never
+        // itself another `ArrayRepeat` node one level of nesting has to
+        // walk into.
         ExprKind::ArrayRepeat { value, count } if matches!(count.kind, ExprKind::PackRef(_)) => {
             convert_array_repeat_over_resolved_dims(value, &ctx.node_types[&expr.id], env, ctx, k)
         }
-        ExprKind::ArrayRepeat { value, count } => {
-            convert_expr(value, env, ctx, &|value_val, env| {
-                convert_expr(count, env, ctx, &|count_val, env| {
-                    let var = ctx.fresh.var();
-                    CExpr::LetPrim {
-                        var,
-                        ty: ctx.node_types[&expr.id].clone(),
-                        op: PrimOp::ArrayRepeat,
-                        args: vec![value_val.clone(), count_val],
-                        cont: Box::new(k(CVal::Var(var), env)),
-                    }
-                })
+        // Every other spelling — a literal count (`[value; 3]`) or a bare
+        // ident naming a single const generic (`[value; N]`) — one real
+        // AST node, one dimension. A *hand-written* multi-dimensional
+        // repeat (`[[value; d2]; d1]`) is two of these nodes, syntactically
+        // nested — `value` at the outer one is literally the inner
+        // `ArrayRepeat` expression, not a bare leaf, so converting it is
+        // itself a recursive call back into this same `ExprKind::ArrayRepeat`
+        // match arm, one level at a time, entirely through ordinary AST
+        // recursion — *not* through `convert_array_repeat_over_resolved_
+        // dims`'s own type-level walking, which assumes the opposite (one
+        // AST node encoding every level at once, the pack case above) and
+        // would double up the nesting if reused here (found directly, by
+        // testing: an earlier version of this fix routed both branches
+        // through that one function, producing a genuinely doubly-nested
+        // value — a real array stored where a scalar leaf was expected —
+        // and a native `memref.store` type-mismatch verification failure).
+        //
+        // `value` is converted `n` times, independently — same idiom
+        // `ExprKind::ArrayLit` just above already uses (`convert_expr_list`),
+        // collected into a plain `PrimOp::Array` rather than `PrimOp::
+        // ArrayRepeat` — see `convert_array_repeat_over_resolved_dims`'s own
+        // doc comment for why evaluating `value` once and broadcasting it,
+        // the previous behavior here too, is only correct for a
+        // referentially transparent `value`.
+        ExprKind::ArrayRepeat { value, .. } => {
+            let Ty::Array(_, size) = &ctx.node_types[&expr.id] else {
+                panic!(
+                    "CPS: array-repeat's own type isn't an array (`{:?}`) -- infer.rs should already guarantee this",
+                    ctx.node_types[&expr.id]
+                );
+            };
+            let Ty::Const(ConstValue::Int(n)) = size.as_ref() else {
+                panic!(
+                    "CPS: array-repeat's own count didn't resolve to a concrete dimension ({size:?}) -- monomorphization should already have resolved it"
+                );
+            };
+            let copies: Vec<&Expr> = std::iter::repeat(value.as_ref())
+                .take(*n as usize)
+                .collect();
+            convert_expr_list(&copies, env, ctx, &|elem_vals, env| {
+                let var = ctx.fresh.var();
+                CExpr::LetPrim {
+                    var,
+                    ty: ctx.node_types[&expr.id].clone(),
+                    op: PrimOp::Array,
+                    args: elem_vals,
+                    cont: Box::new(k(CVal::Var(var), env)),
+                }
             })
         }
         // `v.method(args)` — `base` fills the method's own first parameter,
@@ -2701,20 +2738,38 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
     }
 }
 
-/// `[value; Dims...]`'s own CPS conversion (`ExprKind::ArrayRepeat`'s own
-/// `count.kind` guard, above) — `ty` is the *real*, fully-resolved nested
-/// `Ty::Array` chain (`infer.rs::substitute`'s own pack-expansion fix
-/// already turned the symbolic one-level `Array(elem, Pack(v))` into this
-/// by the time CPS conversion runs, post-monomorphization). Peels one
-/// `Ty::Array` level per recursive call — reaching the base case (a
-/// non-`Array` element type) converts `value` exactly once, ordinarily;
-/// unwinding back out wraps one real `PrimOp::ArrayRepeat` per level,
-/// innermost first, each one's own `value` argument being the *previous*
-/// level's own freshly-bound result — byte-for-byte the same CPS shape a
-/// hand-written `[[value; d2]; d1]` already produces via two ordinary,
-/// syntactically-nested `ExprKind::ArrayRepeat` conversions (this function
-/// exists only because a pack's own real dimension count isn't visible in
-/// the source text to write out by hand).
+/// `[value; N]`/`[value; Dims...]`'s own CPS conversion — `ty` is the
+/// *real*, fully-resolved nested `Ty::Array` chain (`infer.rs::substitute`'s
+/// own pack-expansion fix already turned a symbolic one-level `Array(elem,
+/// Pack(v))` into this by the time CPS conversion runs, post-
+/// monomorphization; an ordinary named/literal count was already concrete
+/// either way). Peels one `Ty::Array` level per recursive call, building
+/// `n` genuinely *independent* copies at each level (`go`, below — the
+/// identical sequential-conversion idiom `convert_expr_list` just above
+/// already uses, substituting a recursive call to *this* function for
+/// `convert_expr` so a deeper level is independent too, not just the
+/// outermost one) and collecting them via `PrimOp::Array` — reaching the
+/// base case (a non-`Array` element type) converts `value` exactly once per
+/// slot, ordinarily.
+///
+/// Used to convert `value` exactly *once* total and broadcast that single
+/// result to every position via `PrimOp::ArrayRepeat` — correct only for a
+/// referentially transparent `value` (`Ring::zero()`'s own `[zero();
+/// Dims...]`, a literal, ...), where evaluating it once or `n` times gives
+/// the identical result either way. Silently wrong the moment `value` has a
+/// real effect (`stdlib/rand/rand.cleave`'s own `Rand<T>::uniform`/`normal`,
+/// ultimately a real `extern fn` call) — `[uniform(lo,hi); Dims...]` used to
+/// broadcast *one* draw across the entire tensor instead of filling it with
+/// independent noise, defeating the whole point of a random weight init.
+/// Found directly, by testing, not a hypothetical: `doc/backlog.md`'s own
+/// former "cannot be used to fill a tensor with independent draws" item,
+/// worked around at the time (an explicit nested loop with indexed writes,
+/// `w[i][j] = uniform(lo,hi);`) rather than fixed at the root — this *is*
+/// that fix. Evaluating a pure `value` `n` times instead of once is strictly
+/// more expensive (real, if negligible at this project's own tensor scale —
+/// a few elements) but never *wrong*: referential transparency means the
+/// result is identical either way, so this is a pure correctness fix, not a
+/// behavior change, for every existing caller.
 fn convert_array_repeat_over_resolved_dims(
     value: &Expr,
     ty: &Ty,
@@ -2729,24 +2784,34 @@ fn convert_array_repeat_over_resolved_dims(
                     "CPS: array-repeat over a pack resolved to a non-concrete dimension {size:?} -- monomorphization should already have resolved every real dim"
                 );
             };
-            let n = *n;
             let level_ty = ty.clone();
-            convert_array_repeat_over_resolved_dims(
-                value,
-                elem_ty,
-                env,
-                ctx,
-                &move |inner_val, env| {
+            fn go(
+                remaining: u64,
+                value: &Expr,
+                elem_ty: &Ty,
+                level_ty: &Ty,
+                env: &CEnv,
+                ctx: &Ctx,
+                acc: Vec<CVal>,
+                k: &dyn Fn(CVal, &CEnv) -> CExpr,
+            ) -> CExpr {
+                if remaining == 0 {
                     let var = ctx.fresh.var();
-                    CExpr::LetPrim {
+                    return CExpr::LetPrim {
                         var,
                         ty: level_ty.clone(),
-                        op: PrimOp::ArrayRepeat,
-                        args: vec![inner_val, CVal::Int(n)],
+                        op: PrimOp::Array,
+                        args: acc,
                         cont: Box::new(k(CVal::Var(var), env)),
-                    }
-                },
-            )
+                    };
+                }
+                convert_array_repeat_over_resolved_dims(value, elem_ty, env, ctx, &|v, env| {
+                    let mut acc2 = acc.clone();
+                    acc2.push(v);
+                    go(remaining - 1, value, elem_ty, level_ty, env, ctx, acc2, k)
+                })
+            }
+            go(*n, value, elem_ty, &level_ty, env, ctx, Vec::new(), k)
         }
         _ => convert_expr(value, env, ctx, k),
     }

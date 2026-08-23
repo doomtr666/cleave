@@ -261,6 +261,21 @@ pub(crate) struct ImplTemplate {
     ret_pattern: Ty,
     target_patterns: Vec<Ty>,
     node_types: HashMap<NodeId, Ty>,
+    /// Every one of this impl's own declared *type* generics that carries a
+    /// non-empty bound list — the fresh `Ty` (`active_generics`'s own value,
+    /// the exact same fresh var/pack already baked into `param_patterns`/
+    /// `target_patterns`/`ret_pattern` above) paired with its own bound
+    /// names. `find_impl_for_target`'s own bound-check reads this: a purely
+    /// *structural* pattern match (its own original, and still primary,
+    /// selection criterion) can't tell `impl<T: Float+Ring> Optimizer<Sgd,
+    /// T>` apart from `impl<Opt> Optimizer<Opt, Pair>` for a query of
+    /// `(Sgd, Pair)` — both unify structurally (`T:=Pair`, `Opt:=Sgd`) — only
+    /// checking the bound (`Pair` doesn't implement `Float`/`Ring`) rules the
+    /// first one out. See `find_impl_for_target`'s own doc comment for the
+    /// full story (a real, previously-latent dispatch bug, found and fixed
+    /// building a genuinely generic-over-its-own-optimizer `Optimizer<Opt,
+    /// Model>` composing impl).
+    generic_bounds: Vec<(Ty, Vec<String>)>,
     /// Whether this template's own resolved `param_patterns`/`ret_pattern`/
     /// `target_patterns` carry any free variable at all — `false` for
     /// `impl MatMul<f32,f32,f32>`, `true` for `impl<T,N,M,K>
@@ -434,6 +449,7 @@ pub fn monomorphize(
                 param_ty,
                 &struct_schemas,
                 &templates,
+                registry,
                 &mut impl_worklist,
             );
         }
@@ -474,6 +490,7 @@ pub fn monomorphize(
             &mut inherent_worklist,
             &mut mono.seed_call_names,
             &mut mono.errors,
+            registry,
         );
     }
 
@@ -598,6 +615,7 @@ pub fn monomorphize(
                 &mut inherent_worklist,
                 &mut call_names,
                 &mut mono.errors,
+                registry,
             );
 
             mono.by_origin
@@ -659,6 +677,7 @@ pub fn monomorphize(
                 &mut inherent_worklist,
                 &mut call_names,
                 &mut mono.errors,
+                registry,
             );
 
             // `seed_derivative_rule_references`'s own doc comment -- a
@@ -679,7 +698,13 @@ pub fn monomorphize(
                 &templates,
                 &mut impl_worklist,
             );
-            seed_ring_zero(&t.algebra, &target_tys, &templates, &mut impl_worklist);
+            seed_ring_zero(
+                &t.algebra,
+                &target_tys,
+                &templates,
+                registry,
+                &mut impl_worklist,
+            );
 
             let origin = format!("{}::{}", t.algebra, t.method_name);
             mono.by_origin
@@ -778,6 +803,7 @@ pub fn monomorphize(
                 &mut inherent_worklist,
                 &mut call_names,
                 &mut mono.errors,
+                registry,
             );
 
             let origin = format!("<lambda#{}>", lambda_id.0);
@@ -847,6 +873,7 @@ pub fn monomorphize(
                 &mut inherent_worklist,
                 &mut call_names,
                 &mut mono.errors,
+                registry,
             );
 
             let origin = format!("{}::{}", t.struct_name, t.method_name);
@@ -1001,6 +1028,26 @@ fn build_impl_templates(
                 .iter()
                 .for_each(|p| free_vars(p, &mut free));
             let is_generic = is_generic || !free.is_empty();
+            // `active_generics` (set by `infer_impl_fn_generic_with_env`
+            // just above, left populated after it returns — see that
+            // field's own doc comment) is the exact fresh `Ty` each of
+            // `d.generics`'s own declared names minted for *this* impl —
+            // the same one already baked into `param_patterns`/`target_
+            // patterns`/`ret_pattern` above. Paired with each declared
+            // generic's own bound list (only `Type` generics carry bounds
+            // at all; skipped when empty, matching `check_no_overlapping_
+            // impls`'s own identical filter) — `find_impl_for_target`'s own
+            // bound-check reads this back.
+            let generic_bounds: Vec<(Ty, Vec<String>)> = d
+                .generics
+                .iter()
+                .filter_map(|g| match g {
+                    GenericParam::Type { name, bounds, .. } if !bounds.is_empty() => {
+                        Some((infer.active_generics.get(name)?.clone(), bounds.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
             // Never read for a non-generic template — `derive_impl_
             // instantiation` returns `NoCandidates` the moment it sees
             // `is_generic == false`, before ever touching `body`.
@@ -1017,6 +1064,7 @@ fn build_impl_templates(
                 ret_pattern,
                 target_patterns: infer.target_types.clone(),
                 node_types: infer.node_types.clone(),
+                generic_bounds,
                 is_generic,
                 is_extern: f.is_extern,
                 extern_symbol: f.extern_symbol.clone(),
@@ -1110,6 +1158,7 @@ pub(crate) fn collect_instantiations(
     inherent_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
     call_names: &mut HashMap<NodeId, String>,
     errors: &mut Vec<TypeError>,
+    registry: &Registry,
 ) {
     let scope = initial_scope;
     collect_instantiations_block(
@@ -1126,6 +1175,7 @@ pub(crate) fn collect_instantiations(
         inherent_worklist,
         call_names,
         errors,
+        registry,
     );
 }
 
@@ -1144,6 +1194,7 @@ fn collect_instantiations_block(
     inherent_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
     call_names: &mut HashMap<NodeId, String>,
     errors: &mut Vec<TypeError>,
+    registry: &Registry,
 ) {
     let mut scope = scope.clone();
     for stmt in &block.stmts {
@@ -1176,6 +1227,7 @@ fn collect_instantiations_block(
                     inherent_worklist,
                     call_names,
                     errors,
+                    registry,
                 );
                 if !is_lambda {
                     // Re-`let`-bound to something else (or to an
@@ -1199,6 +1251,7 @@ fn collect_instantiations_block(
                     inherent_worklist,
                     call_names,
                     errors,
+                    registry,
                 );
                 collect_instantiations_expr(
                     value,
@@ -1214,6 +1267,7 @@ fn collect_instantiations_block(
                     inherent_worklist,
                     call_names,
                     errors,
+                    registry,
                 );
             }
             StmtKind::Expr(e) => collect_instantiations_expr(
@@ -1230,6 +1284,7 @@ fn collect_instantiations_block(
                 inherent_worklist,
                 call_names,
                 errors,
+                registry,
             ),
             StmtKind::Break(value) => {
                 if let Some(v) = value {
@@ -1247,6 +1302,7 @@ fn collect_instantiations_block(
                         inherent_worklist,
                         call_names,
                         errors,
+                        registry,
                     );
                 }
             }
@@ -1267,6 +1323,7 @@ fn collect_instantiations_block(
             inherent_worklist,
             call_names,
             errors,
+            registry,
         );
     }
 }
@@ -1286,6 +1343,7 @@ fn collect_instantiations_expr(
     inherent_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
     call_names: &mut HashMap<NodeId, String>,
     errors: &mut Vec<TypeError>,
+    registry: &Registry,
 ) {
     macro_rules! rec {
         ($e:expr) => {
@@ -1303,6 +1361,7 @@ fn collect_instantiations_expr(
                 inherent_worklist,
                 call_names,
                 errors,
+                registry,
             )
         };
     }
@@ -1322,6 +1381,7 @@ fn collect_instantiations_expr(
                 inherent_worklist,
                 call_names,
                 errors,
+                registry,
             )
         };
     }
@@ -1389,6 +1449,7 @@ fn collect_instantiations_expr(
                     };
                     match derive_impl_instantiation(
                         templates,
+                        registry,
                         Some(algebra),
                         method,
                         expr.id,
@@ -1504,7 +1565,9 @@ fn collect_instantiations_expr(
             else {
                 return;
             };
-            match derive_impl_instantiation(templates, None, &name, expr.id, &arg_tys, node_types) {
+            match derive_impl_instantiation(
+                templates, registry, None, &name, expr.id, &arg_tys, node_types,
+            ) {
                 ImplMatch::Found(idx, mapping) => {
                     call_names.insert(
                         expr.id,
@@ -1584,6 +1647,7 @@ fn collect_instantiations_expr(
                     );
                     match derive_impl_instantiation(
                         templates,
+                        registry,
                         None,
                         "index",
                         expr.id,
@@ -1849,19 +1913,47 @@ enum ImplMatch {
 }
 
 /// Finds the `ImplTemplate` (if any) whose own `target_patterns` unify
-/// against `target_tys` — the impl-side counterpart of `Infer::dispatch_
-/// algebra_call`'s own simpler "target alone" matching, not `derive_impl_
-/// instantiation`'s fuller param/return-shape matching just below (which
-/// exists to *disambiguate* two algebras sharing one method name). Here
-/// `algebra`/`method` are already known exactly — read directly off a
-/// `derivative` rule's own declaration (`seed_derivative_rule_references`,
-/// below) — so there's nothing to disambiguate, just "does some generic
-/// impl of this exact algebra/method cover this exact target." Mirrors
-/// `derive_impl_instantiation`'s own free-var read-back exactly. `None`
-/// for a *non*-generic template too — `collect_units` already includes
-/// those unconditionally, nothing to seed.
+/// against `target_tys`, *and* whose own declared bounds the resulting
+/// substitution actually satisfies — the impl-side counterpart of `Infer::
+/// dispatch_algebra_call`'s own simpler "target alone" matching, not
+/// `derive_impl_instantiation`'s fuller param/return-shape matching just
+/// below (which exists to *disambiguate* two algebras sharing one method
+/// name). Here `algebra`/`method` are already known exactly — read directly
+/// off a `derivative` rule's own declaration (`seed_derivative_rule_
+/// references`, below) — so there's nothing to disambiguate *between
+/// algebras*, just "does some generic impl of this exact algebra/method
+/// cover this exact target." Mirrors `derive_impl_instantiation`'s own
+/// free-var read-back exactly. `None` for a *non*-generic template too —
+/// `collect_units` already includes those unconditionally, nothing to seed.
+///
+/// The bound-check is real, not defensive boilerplate — a genuine, previously-
+/// latent bug, found and fixed building a composing `impl<Opt> Optimizer
+/// <Opt, Dense<T,In,Out>>` (`doc/backlog.md`'s own "Optimizer" item):
+/// `impl<T: Float+Ring> Optimizer<Sgd, T>` and `impl<Opt> Optimizer<Opt,
+/// Pair>` both unify *structurally* against a query of `(Sgd, Pair)` (`T:=
+/// Pair`, `Opt:=Sgd`) — this function's own loop, before this fix, returned
+/// whichever came first in `templates`' own iteration order with no regard
+/// for whether `T`'s own declared `Float+Ring` bound actually holds for the
+/// type it just got unified against (`Pair`, which implements neither) —
+/// silently handing a doomed specialization request to the caller, only
+/// failing much later, confusingly, as `TypeErrorKind::MonomorphizationFailed`
+/// deep inside the wrong impl's own body. `Infer::matching_impls` (this
+/// function's own inference-side counterpart, driving ordinary call-site
+/// dispatch) already checks this correctly — this function is a genuinely
+/// separate, structural-only search over `ImplTemplate`s (built once, ahead
+/// of time, by `build_impl_templates`) rather than the registry's own raw
+/// declarations, and had simply never grown the same check. Each rejected-
+/// on-bounds candidate now falls through to the next (a plain `continue`,
+/// same shape the structural-mismatch check just above already uses) —
+/// this module's own top-of-file doc comment's claim that `check_no_
+/// overlapping_impls` alone "guarantees at most one impl ... can coherently
+/// apply" turned out not to hold in practice (that check is never actually
+/// invoked by the real compile pipeline — `doc/backlog.md` has the fuller
+/// story, logged separately, not fixed here) — this function no longer
+/// depends on that guarantee holding, it verifies bounds itself directly.
 fn find_impl_for_target(
     templates: &[ImplTemplate],
+    registry: &Registry,
     algebra: &str,
     method: &str,
     target_tys: &[Ty],
@@ -1880,6 +1972,16 @@ fn find_impl_for_target(
             .zip(target_tys)
             .any(|(pat, concrete)| unify(&mut trial, pat, concrete).is_err())
         {
+            continue;
+        }
+        let bounds_satisfied = t.generic_bounds.iter().all(|(var, bounds)| {
+            let resolved = trial.apply(var);
+            let mut infer = Infer::new(registry);
+            bounds
+                .iter()
+                .all(|bound| infer.has_matching_impl(bound, std::slice::from_ref(&resolved)))
+        });
+        if !bounds_satisfied {
             continue;
         }
         let mut vars = HashSet::new();
@@ -2011,6 +2113,7 @@ fn resolve_derivative_rule_expr_ty(
             if let Some(target_ty) = &agreed {
                 if let Some((idx, mapping)) = find_impl_for_target(
                     templates,
+                    registry,
                     &owner,
                     &method,
                     std::slice::from_ref(target_ty),
@@ -2126,12 +2229,15 @@ fn seed_ring_zero(
     algebra: &str,
     target_tys: &[Ty],
     templates: &[ImplTemplate],
+    registry: &Registry,
     impl_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
 ) {
     if algebra != "Ring" {
         return;
     }
-    if let Some((idx, mapping)) = find_impl_for_target(templates, "Ring", "zero", target_tys) {
+    if let Some((idx, mapping)) =
+        find_impl_for_target(templates, registry, "Ring", "zero", target_tys)
+    {
         impl_worklist.push((idx, mapping));
     }
 }
@@ -2156,6 +2262,7 @@ fn seed_derive_tensor_field_indices(
     ty: &Ty,
     struct_schemas: &HashMap<String, StructSchema>,
     templates: &[ImplTemplate],
+    registry: &Registry,
     impl_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
 ) {
     // `Ty::Con(name)` (a non-generic struct, `Network`) and `Ty::App(name,
@@ -2169,9 +2276,13 @@ fn seed_derive_tensor_field_indices(
     };
     if name == "Tensor" {
         let Some(elem_ty) = args.first() else { return };
-        if let Some((idx, mapping)) =
-            find_impl_for_target(templates, "Index", "index", &[ty.clone(), elem_ty.clone()])
-        {
+        if let Some((idx, mapping)) = find_impl_for_target(
+            templates,
+            registry,
+            "Index",
+            "index",
+            &[ty.clone(), elem_ty.clone()],
+        ) {
             impl_worklist.push((idx, mapping));
         }
         return;
@@ -2185,15 +2296,21 @@ fn seed_derive_tensor_field_indices(
         return;
     }
     for (_, field_ty) in struct_field_types(struct_schemas, name, args) {
-        seed_derive_tensor_field_indices(&field_ty, struct_schemas, templates, impl_worklist);
+        seed_derive_tensor_field_indices(
+            &field_ty,
+            struct_schemas,
+            templates,
+            registry,
+            impl_worklist,
+        );
     }
 }
 
 /// Like `derive_instantiation`, for the algebra-impl side: tries every
 /// template named `method`, unifying its own `(param_patterns) -> ret_
 /// pattern` against this call's own concrete `(arg_tys) -> ret_ty`, in one
-/// shared trial `Subst` per candidate. On the first (and, per `check_no_
-/// overlapping_impls`, only ever possible) match, reads back concrete
+/// shared trial `Subst` per candidate. On the first match whose own bounds
+/// the resulting substitution actually satisfies, reads back concrete
 /// bindings for *every* free variable the template mentions anywhere —
 /// `param_patterns`/`ret_pattern` *and* `target_patterns`, since an
 /// algebra generic appearing only in the impl's own target (`C` in `fn
@@ -2201,16 +2318,32 @@ fn seed_derive_tensor_field_indices(
 /// same reasoning `infer_algebra_call`'s own "input vs. output-only
 /// generics" split exists for.
 ///
-/// If candidates existed but none matched, that's *usually* a real,
-/// surfaced failure (`ImplMatch::NoneMatched`) — found by direct testing
-/// (and direct feedback: silently treating it the same as "never called"
-/// hid a genuine, pre-existing bug in a stub impl body). Ordinary dispatch
-/// (`Infer::dispatch_algebra_call`) only ever needs an impl's own *target*
-/// pattern to match — it never re-checks the method's full parameter/
-/// return shape the way this does, so a call that type-checks fine under
-/// ordinary inference can still fail *here*, honestly, if the impl's own
-/// declaration-time inference left its generics over-constrained (a stub
-/// body silently merging two generics that should stay independent, say).
+/// The bound-check (`t.generic_bounds`, same field, same reasoning as
+/// `find_impl_for_target`'s own — see that function's doc comment for the
+/// full story) is not defensive: this function used to trust `check_no_
+/// overlapping_impls` to guarantee at most one *structural* match could
+/// ever exist, and return the first one unconditionally — a real, found-by-
+/// testing bug, since that guarantee doesn't actually hold in practice
+/// (`check_no_overlapping_impls` is never invoked by the real compile
+/// pipeline at all, `doc/backlog.md` has the fuller story) and a purely
+/// structural match can't distinguish `impl<T: Float+Ring> Optimizer<Sgd,
+/// T>` from `impl<Opt> Optimizer<Opt, Pair>` for a call site needing
+/// `Optimizer::step(Sgd_value, Pair_value, ...)` — both unify (`T:=Pair`,
+/// `Opt:=Sgd`), only the first one's own bound (`Pair` doesn't implement
+/// `Float`/`Ring`) rules it out. A rejected-on-bounds candidate now falls
+/// through to the next, same as a structurally-mismatched one already did.
+///
+/// If candidates existed but none matched (structurally, or on bounds),
+/// that's *usually* a real, surfaced failure (`ImplMatch::NoneMatched`) —
+/// found by direct testing (and direct feedback: silently treating it the
+/// same as "never called" hid a genuine, pre-existing bug in a stub impl
+/// body). Ordinary dispatch (`Infer::dispatch_algebra_call`) only ever
+/// needs an impl's own *target* pattern to match — it never re-checks the
+/// method's full parameter/return shape the way this does, so a call that
+/// type-checks fine under ordinary inference can still fail *here*,
+/// honestly, if the impl's own declaration-time inference left its
+/// generics over-constrained (a stub body silently merging two generics
+/// that should stay independent, say).
 ///
 /// *Not* an error, though, if this call never needed a generic impl in the
 /// first place: `TestAlg<i32>` (concrete) and `TestAlg<Complex<T>>`
@@ -2225,6 +2358,7 @@ fn seed_derive_tensor_field_indices(
 /// no template existed for it at all.
 fn derive_impl_instantiation(
     templates: &[ImplTemplate],
+    registry: &Registry,
     // `Some(algebra)` for a qualified call (`doc/backlog-done.md`'s own
     // "qualified-call syntax" item) — restricts the whole search to that one
     // algebra's own templates, instead of searching by method name alone.
@@ -2264,6 +2398,16 @@ fn derive_impl_instantiation(
                 None => ImplMatch::NoCandidates,
                 Some(_) => ImplMatch::FoundConcrete(idx),
             };
+        }
+        let bounds_satisfied = t.generic_bounds.iter().all(|(var, bounds)| {
+            let resolved = trial.apply(var);
+            let mut infer = Infer::new(registry);
+            bounds
+                .iter()
+                .all(|bound| infer.has_matching_impl(bound, std::slice::from_ref(&resolved)))
+        });
+        if !bounds_satisfied {
+            continue;
         }
         let mut vars = HashSet::new();
         t.param_patterns

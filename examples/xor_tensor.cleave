@@ -35,6 +35,23 @@ use linalg;
 // own time limit) so it can be a real `matmul` left operand directly.
 struct Network { l1: Dense<f32, 2, 2>, l2: Dense<f32, 2, 1> }
 
+// `doc/backlog.md`'s own "Optimizer" item -- `Network` is a user struct, not
+// stdlib (like `Init<Dense<...>>`, nothing generic in `stdlib/nn/nn.cleave`
+// can already know its exact field shape), so it needs this one small,
+// concrete composing impl -- generic over `Opt` itself, exactly like
+// `optim`'s own `Dense`-level impl, so `main()`'s own training loop stays a
+// single call regardless of which optimizer `opt` actually is.
+impl<Opt> Optimizer<Opt, Network> {
+    fn init_state(opt, model) {
+        Network(l1: Optimizer::init_state(opt, model.l1), l2: Optimizer::init_state(opt, model.l2))
+    }
+    fn step(opt, model, grad, state) {
+        let r1 = Optimizer::step(opt, model.l1, grad.l1, state.l1);
+        let r2 = Optimizer::step(opt, model.l2, grad.l2, state.l2);
+        (Network(l1: r1.0, l2: r2.0), Network(l1: r1.1, l2: r2.1))
+    }
+}
+
 fn forward(x1: f32, x2: f32, net: Network) -> f32 {
     let x = Tensor::<f32, 1, 2>(data: [[x1, x2]]);
     let h = sigmoid(net.l1.forward(x));
@@ -66,7 +83,15 @@ fn main() -> i32 {
     // stable, repeatable `--run`.
     rand_seed(2);
     let mut net: Network = Network(l1: Init::xavier(), l2: Init::xavier());
-    let lr: f32 = 1.0;
+    // `doc/backlog.md`'s own "Optimizer" item -- plain SGD, same math as
+    // before (`net -= lr*grad`), but now through the generic `Optimizer<Opt,
+    // Model>` algebra (`stdlib/optim/optim.cleave`) instead of four
+    // hand-written `Ring::sub`/`Scale::scale` lines, one per `Dense` field.
+    // `opt` carries its own hyperparameters (just `lr` for `Sgd`) -- were
+    // this `Momentum(lr: ..., beta: ...)` instead, nothing else in this loop
+    // would need to change at all, the actual point of this abstraction.
+    let opt = Sgd(lr: 1.0);
+    let mut state: Network = Optimizer::init_state(opt, net);
 
     let x1s: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
     let x2s: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
@@ -81,10 +106,9 @@ fn main() -> i32 {
         // `Network`-shaped gradient, one `Tensor` per `Dense` field, same
         // shape as `net` itself.
         let g = grad(x1s[i], x2s[i], ys[i], net);
-        net.l1.w = Ring::sub(net.l1.w, Scale::scale(g.3.l1.w, lr));
-        net.l1.b = Ring::sub(net.l1.b, Scale::scale(g.3.l1.b, lr));
-        net.l2.w = Ring::sub(net.l2.w, Scale::scale(g.3.l2.w, lr));
-        net.l2.b = Ring::sub(net.l2.b, Scale::scale(g.3.l2.b, lr));
+        let r = Optimizer::step(opt, net, g.3, state);
+        net = r.0;
+        state = r.1;
     };
     print("done !");
 

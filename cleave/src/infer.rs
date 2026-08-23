@@ -1702,7 +1702,7 @@ pub struct Infer<'r> {
     /// cleared) once a generic body finishes — harmless: nothing reads it
     /// outside of another `fn`/impl-method's own body inference, which
     /// always resets it first.
-    active_generics: HashMap<String, Ty>,
+    pub(crate) active_generics: HashMap<String, Ty>,
     /// Every type variable `generalize` has ever quantified into some
     /// binding's `Scheme` — `apply_defaults` must never bind one of these.
     /// Found necessary by testing, not by design up front: a self-recursive
@@ -3460,7 +3460,48 @@ impl<'r> Infer<'r> {
     /// actually knowable: right here. See the satisfiability check just
     /// below `constraints`' own construction for the (deliberately narrow —
     /// single-target constraints only) check itself.
-    pub(crate) fn generalize(&mut self, env: &Env, ty: &Ty) -> Result<Scheme, TypeError> {
+    /// `own_generics`, when `Some`, names a *declared* generics list (a top-
+    /// level `fn`'s own `f.generics`) alongside the fresh-var mapping
+    /// originally minted for it (`fresh_generics_mapping`'s own return) —
+    /// used to build `scheme.vars` in real *declaration* order instead of
+    /// the free-var-scan-then-numeric-sort this method used unconditionally
+    /// before. `None` for every other caller (`let`-bound lambda
+    /// generalization, `infer.rs`'s own one other call site) — there's no
+    /// syntactically declared generics list for an inferred closure's own
+    /// type variables to begin with, so the scan-and-sort fallback is the
+    /// only option there, unchanged.
+    ///
+    /// Found necessary directly, by testing, not anticipated: the old scan-
+    /// and-sort approach silently assumed a declared generic's own fresh
+    /// `TyVar` stays the lowest-numbered (hence first-sorted) representative
+    /// of whatever it's unified with by the time the whole body is done —
+    /// true only as long as nothing *later*-minted ever becomes the union-
+    /// find survivor instead. `unify`'s own `(Ty::Var(v), _) => bind(v, _)`
+    /// binds whichever side is the var *to* the other, with no id-ordering
+    /// preference at all — a function whose own body calls *another*
+    /// generic construct sharing a type-generic name (`fn random_matrix<T,
+    /// R,C>(...) { ... Tensor::<T,R,C>(...) ... }`, `Tensor`'s own struct
+    /// generics reminted and unified against the caller's `T`/`R`/`C` during
+    /// that construction) can end up with e.g. `R`'s own final representative
+    /// being a *later*-minted variable from `Tensor`'s own instantiation,
+    /// numerically higher than `T`'s — scrambling `scheme.vars`'s own order
+    /// relative to declaration order. Silent in the ordinary case (nothing
+    /// downstream cares what order `scheme.vars` lists in) but a real,
+    /// reproducible bug for explicit turbofish (`random_matrix::<f32,2,2>
+    /// (...)`, `infer_call`'s own zip against `explicit_generics`), which
+    /// zips positionally and assumes that order matches what the caller
+    /// wrote — surfaced as a nonsensical `expected f32, found 2` type
+    /// mismatch. Resolving each *declared* generic's own original var
+    /// through the current substitution, one at a time, in the order it was
+    /// actually written, sidesteps the whole "which side survived the union-
+    /// find" question entirely: whichever concrete-or-still-open type that
+    /// specific var chases to *is* correct, regardless of its own numeric id.
+    pub(crate) fn generalize(
+        &mut self,
+        env: &Env,
+        ty: &Ty,
+        own_generics: Option<(&[GenericParam], &HashMap<String, Ty>)>,
+    ) -> Result<Scheme, TypeError> {
         let ty = self.subst.apply(ty);
         let mut ty_fv = HashSet::new();
         free_vars(&ty, &mut ty_fv);
@@ -3473,8 +3514,51 @@ impl<'r> Infer<'r> {
             env_fv.extend(fv.into_iter().filter(|v| !scheme.vars.contains(v)));
         }
 
-        let mut vars: Vec<TyVar> = ty_fv.into_iter().filter(|v| !env_fv.contains(v)).collect();
-        vars.sort();
+        let vars: Vec<TyVar> = match own_generics {
+            Some((generics_list, mapping)) => {
+                let mut seen = HashSet::new();
+                let mut ordered: Vec<TyVar> = generics_list
+                    .iter()
+                    .filter_map(|g| {
+                        let fresh = mapping.get(g.name())?;
+                        match self.subst.apply(fresh) {
+                            Ty::Var(v) | Ty::Pack(v) if !env_fv.contains(&v) && seen.insert(v) => {
+                                Some(v)
+                            }
+                            _ => None,
+                        }
+                    })
+                    .collect();
+                // `f.generics` names only the *explicitly declared* generics
+                // — a function can also be generic purely by inference
+                // (`fn identity(x) { x }`, no `<T>` at all, `x`'s own type
+                // never annotated) with no entry here to resolve at all.
+                // Any free var not already captured above — appended via
+                // the old scan-and-sort, deterministic but with no
+                // declaration order to preserve since none was ever written
+                // — covers exactly that case, same as `None` below does
+                // unconditionally. Found necessary directly, by testing:
+                // without this, `identity`'s own unannotated parameter type
+                // was silently dropped from `scheme.vars` entirely (`f.
+                // generics` is empty for it), collapsing two independent
+                // `identity(42)`/`identity(42.0)` call sites into one shared,
+                // wrongly-conflicting variable instead of two fresh
+                // instantiations.
+                let mut rest: Vec<TyVar> = ty_fv
+                    .into_iter()
+                    .filter(|v| !env_fv.contains(v) && seen.insert(*v))
+                    .collect();
+                rest.sort();
+                ordered.extend(rest);
+                ordered
+            }
+            None => {
+                let mut vars: Vec<TyVar> =
+                    ty_fv.into_iter().filter(|v| !env_fv.contains(v)).collect();
+                vars.sort();
+                vars
+            }
+        };
         // Recorded so `apply_defaults` never binds one of these afterward —
         // see `quantified`'s own doc comment.
         self.quantified.extend(vars.iter().copied());
@@ -3996,7 +4080,7 @@ impl<'r> Infer<'r> {
     /// mul`'s implementation from some other algebra `Ring` merely bounds
     /// itself on (or aggregates from), the way a bare existence check can
     /// borrow `Num`'s.
-    fn has_matching_impl(&mut self, algebra: &str, tys: &[Ty]) -> bool {
+    pub(crate) fn has_matching_impl(&mut self, algebra: &str, tys: &[Ty]) -> bool {
         self.has_matching_impl_inherited(algebra, tys, &mut HashSet::new())
     }
 
@@ -4978,7 +5062,7 @@ impl<'r> Infer<'r> {
                     // `let mut` is never generalized — see module docs (the
                     // ref-cell-polymorphism unsoundness this avoids).
                     let scheme = if !mutable && is_syntactic_value(value) {
-                        self.generalize(&env, &value_ty)?
+                        self.generalize(&env, &value_ty, None)?
                     } else {
                         Scheme::mono(value_ty)
                     };

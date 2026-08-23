@@ -2985,6 +2985,155 @@ fn a_tensor_can_be_filled_with_independent_random_draws_via_nested_indexed_write
     assert_eq!(run_i32(&context, src), 1);
 }
 
+/// The real payoff of the `cps.rs` array-repeat fix, over the previous
+/// test's own hand-written nested loop: `[uniform(lo, hi); Dims...]`
+/// directly, inside an impl generic over a whole pack (`Dims...`, not one
+/// fixed rank like `Dense`'s own `In`/`Out`) -- one expression fills a
+/// tensor of *any* rank with independent draws, mirroring `array_repeat_
+/// over_a_whole_pack_builds_a_same_shaped_tensor_at_every_rank`'s own
+/// multi-rank shape but for an impure per-leaf value instead of a pure
+/// constant, which is exactly the case `[value; Dims...]` used to get wrong
+/// (evaluate once, broadcast). Checked at rank 1 and rank 3 through the
+/// *same* algebra impl, not two separate ones -- and non-degeneracy checked
+/// at rank 3 specifically, since that's the shape most likely to expose the
+/// old double-broadcast bug (more independent leaves for a
+/// broadcast-one-draw regression to collide on by chance).
+///
+/// An algebra impl on purpose, not a plain top-level `fn` -- found, while
+/// writing this test, that a top-level fn generic over a whole pack
+/// (`fn random_fill<T, const Dims...: i32>(...)`) fails to monomorphize
+/// correctly when called at *two different ranks* from the same program
+/// (`expected Tensor<f32,2,2,2>, found Tensor<'t9,'t11>` -- a real, separate
+/// bug, logged in `doc/backlog.md`, out of scope for this fix). An algebra
+/// impl generic over the same pack, the pattern `Ring<Tensor<T,Dims...>>`
+/// and `Filled<Tensor<T,Dims...>>` above already use, has no such problem
+/// -- *unless* its own body also calls into a second, unrelated algebra
+/// (here, `uniform`'s own `Rand<T>` dispatch): that combination, instantiated
+/// at two ranks in one program, hangs on a real infinite-recursion stack
+/// overflow -- a second, deeper, and also separate bug, also logged in
+/// `doc/backlog.md`, also out of scope here. So each rank below is checked
+/// via its *own*, separately compiled program instead of two calls sharing
+/// one -- sidesteps both bugs while still proving the actual claim this
+/// test exists for (`[uniform(...); Dims...]` truly fills independently, at
+/// more than one rank, through one pack-generic impl).
+#[test]
+fn array_repeat_over_a_whole_pack_fills_a_tensor_with_independent_random_draws_at_any_rank() {
+    let context = context();
+    let rand_fill_src = |ty: &str, checks: &str| -> String {
+        format!(
+            "
+            use rand;
+            use linalg;
+            algebra RandomFilled<T> {{
+                fn random_fill() -> T;
+            }}
+            impl<T: Float + Rand + Ring, const Dims...: i32> RandomFilled<Tensor<T, Dims...>> {{
+                fn random_fill() {{
+                    Tensor::<T, Dims...>(data: [uniform(-1.0, 1.0); Dims...])
+                }}
+            }}
+            fn main() -> i32 {{
+                rand_seed(7);
+                let v: {ty} = RandomFilled::random_fill();
+                {checks}
+            }}
+            "
+        )
+    };
+    let rank1 = rand_fill_src(
+        "Tensor<f32, 4>",
+        "let in_range = v[0] >= -1.0 and v[0] < 1.0
+                and v[1] >= -1.0 and v[1] < 1.0
+                and v[2] >= -1.0 and v[2] < 1.0
+                and v[3] >= -1.0 and v[3] < 1.0;
+            let not_degenerate = v[0] != v[1] or v[1] != v[2] or v[2] != v[3];
+            if in_range and not_degenerate { 1 } else { 0 }",
+    );
+    let rank3 = rand_fill_src(
+        "Tensor<f32, 2, 2, 2>",
+        "let in_range = v[0,0,0] >= -1.0 and v[0,0,0] < 1.0
+                and v[1,1,1] >= -1.0 and v[1,1,1] < 1.0;
+            let not_degenerate = v[0,0,0] != v[0,0,1] or v[0,0,0] != v[0,1,0]
+                or v[0,0,0] != v[1,0,0] or v[0,0,0] != v[1,1,1];
+            if in_range and not_degenerate { 1 } else { 0 }",
+    );
+    assert_eq!(run_i32(&context, &rank1), 1);
+    assert_eq!(run_i32(&context, &rank3), 1);
+}
+
+/// The turbofish-ordering bug the test above's own doc comment flagged and
+/// worked around (dropping the turbofish entirely) -- now fixed for real,
+/// tested here with the turbofish restored. Root cause (`Infer::generalize`'s
+/// own doc comment, `infer.rs`, has the full story): `scheme.vars` used to
+/// be built by scanning every free variable in the function's own fully-
+/// substituted type and sorting the ids *numerically*, on the assumption
+/// that a declared generic's own originally-minted `TyVar` always stays the
+/// lowest-numbered (hence first-sorted) representative of whatever it later
+/// gets unified with. `Tensor::<T,R,C>(data:...)` inside `random_matrix`'s
+/// own body reminted its *own* fresh vars for `Tensor`'s own generics and
+/// unified them against the caller's `T`/`R`/`C` -- `unify`'s own `(Ty::Var
+/// (v), _) => bind(v, _)` binds whichever side is the var *to* the other
+/// with no id-ordering preference at all, so `R`'s own final representative
+/// could easily end up being one of `Tensor`'s own *later*-minted vars,
+/// numerically higher than `T`'s -- scrambling `scheme.vars`'s order
+/// relative to the declaration order `explicit_generics` (the turbofish
+/// itself) is zipped against in `infer_call`. Surfaced as a nonsensical
+/// `expected f32, found 2` type mismatch. Fixed by building `scheme.vars`
+/// from the function's own *declared* generics list directly (resolving
+/// each one's own original var through the current substitution, in the
+/// order it was actually written) instead of recovering order via a
+/// numeric-sort heuristic after the fact.
+#[test]
+fn explicit_turbofish_on_a_generic_function_whose_body_shares_generic_names_with_another_construction_resolves_in_declaration_order()
+ {
+    let context = context();
+    let src = "
+        use rand;
+        use linalg;
+        fn random_matrix<T: Float + Rand + Ring, const R: i32, const C: i32>(lo: T, hi: T) -> Tensor<T, R, C> {
+            let mut buf: [[T; C]; R] = [[zero(); C]; R];
+            for i in 0..R {
+                for j in 0..C {
+                    buf[i][j] = uniform(lo, hi);
+                };
+            };
+            Tensor::<T, R, C>(data: buf)
+        }
+        fn main() -> i32 {
+            rand_seed(3);
+            let m: Tensor<f32, 2, 2> = random_matrix::<f32, 2, 2>(-1.0, 1.0);
+            let all_in_range = m[0, 0] >= -1.0 and m[0, 0] < 1.0
+                and m[0, 1] >= -1.0 and m[0, 1] < 1.0
+                and m[1, 0] >= -1.0 and m[1, 0] < 1.0
+                and m[1, 1] >= -1.0 and m[1, 1] < 1.0;
+            let not_degenerate = m[0, 0] != m[0, 1] or m[0, 0] != m[1, 0] or m[0, 0] != m[1, 1];
+            if all_in_range and not_degenerate { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// The counterpart bug (zero-*value*-parameter generic function, `stdlib/nn/
+/// nn.cleave`'s `Init<T>::xavier`/`he`'s own doc comment has the full story)
+/// -- also now fixed by the same `Infer::generalize` change, confirmed here
+/// with an explicit turbofish specifically (the shape that used to be
+/// misdiagnosed as a real *argument*, `"expects 0 argument(s), found 1"`).
+#[test]
+fn explicit_turbofish_on_a_zero_value_parameter_generic_function_resolves_correctly() {
+    let context = context();
+    let src = "
+        use linalg;
+        fn make_zero_matrix<T: Float, const R: i32, const C: i32>() -> Tensor<T, R, C> {
+            Tensor::<T, R, C>(data: [[zero(); C]; R])
+        }
+        fn main() -> i32 {
+            let m = make_zero_matrix::<f32, 2, 2>();
+            if m[0, 0] == 0.0 and m[1, 1] == 0.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
 /// `Init<T>::xavier`/`he` (`stdlib/nn/nn.cleave`) -- the real weight-init
 /// helpers `doc/backlog.md`'s own "No weight-initialization helpers" item
 /// asked for, now that `rand` exists. Deliberately an `algebra` (`Init<T>`),
@@ -4366,6 +4515,222 @@ fn a_turbofish_inside_a_generic_impl_body_resolves_the_impls_own_enclosing_gener
         fn main() -> i32 {
             let z: Box3<f64, 3> = zeroed();
             if z.data[0] == 0.0 and z.data[1] == 0.0 and z.data[2] == 0.0 { 1 } else { 0 }
+        }";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// A real, previously-latent dispatch bug, found and fixed building a
+/// genuinely composing `Optimizer<Opt, Model>` algebra (`doc/backlog.md`'s
+/// own "Optimizer" item): `impl<T: Float+Ring> Optimizer<Sgd, T>` and
+/// `impl<Opt> Optimizer<Opt, Pair>` both unify *structurally* against a
+/// call needing `Optimizer::step(Sgd_value, Pair_value, ...)` (`T:=Pair`,
+/// `Opt:=Sgd`) — only `T`'s own declared `Float+Ring` bound (which `Pair`
+/// satisfies neither of) tells them apart. Two genuinely separate call-
+/// resolution functions in `monomorphize.rs` shared this exact flaw —
+/// `derive_impl_instantiation` (drives this test's own top-level `main()`
+/// call) and `find_impl_for_target` (drives the narrower `derivative`-
+/// rule/`Ring::zero`/`Index`-seeding paths, not exercised by this
+/// particular program) — both used to pick the first *structurally*
+/// matching template, in whatever order `templates` happened to iterate,
+/// with no regard for whether the match's own bounds actually held; fixed
+/// by having both verify each candidate's own `ImplTemplate::generic_
+/// bounds` before accepting it, falling through to the next candidate on a
+/// bound failure exactly like a structural mismatch already did. Before the
+/// fix, this exact program failed deep inside the *wrong* impl's own body
+/// (`Ring::sub`/`Scale::scale` asked to specialize for `(Pair,Pair)` —
+/// `Pair` was never meant to unify with `Optimizer<Sgd, T>`'s own `T` at
+/// all) rather than resolving to the correct, structurally-more-specific
+/// `Optimizer<Opt, Pair>`.
+#[test]
+fn dispatch_between_a_bound_generic_impl_and_an_unbound_but_structurally_specific_one_picks_the_bound_satisfying_candidate()
+ {
+    let context = context();
+    let src = "
+        use linalg;
+        struct Sgd { lr: f32 }
+        impl Scale<f32, f32> { fn scale(c, s) { c * s } }
+        algebra Optimizer<Opt, Model> {
+            fn step(opt: Opt, model: Model, grad: Model) -> Model;
+        }
+        impl<T: Float + Ring> Optimizer<Sgd, T> {
+            fn step(opt, model, grad) { Ring::sub(model, Scale::scale(grad, opt.lr)) }
+        }
+        struct Pair { a: f32, b: f32 }
+        impl<Opt> Optimizer<Opt, Pair> {
+            fn step(opt, model, grad) {
+                Pair(a: Optimizer::step(opt, model.a, grad.a), b: Optimizer::step(opt, model.b, grad.b))
+            }
+        }
+        fn main() -> i32 {
+            let opt = Sgd(lr: 0.5);
+            let p = Pair(a: 1.0, b: 2.0);
+            let g = Pair(a: 0.1, b: 0.2);
+            let p2: Pair = Optimizer::step(opt, p, g);
+            if p2.a > 0.94 and p2.a < 0.96 and p2.b > 1.89 and p2.b < 1.91 { 1 } else { 0 }
+        }";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `Optimizer<Sgd, Tensor<T,Dims...>>::step` (`stdlib/optim/optim.cleave`)
+/// -- one step, exact expected value: `model - lr*grad`. `state` is
+/// carried through completely unchanged for `Sgd` (it has none of its own
+/// to update) -- checked too, since a `Ring::zero()`-initialized state
+/// silently becoming something *else* would be its own real bug.
+#[test]
+fn optimizer_sgd_step_computes_the_exact_expected_value() {
+    let context = context();
+    let src = "
+        use optim;
+        use linalg;
+        fn main() -> i32 {
+            let opt = Sgd(lr: 0.5);
+            let model: Tensor<f32, 3> = Tensor::<f32, 3>(data: [1.0, 2.0, 3.0]);
+            let grad: Tensor<f32, 3> = Tensor::<f32, 3>(data: [0.1, 0.2, 0.3]);
+            let state: Tensor<f32, 3> = Optimizer::init_state(opt, model);
+            let r = Optimizer::step(opt, model, grad, state);
+            let m: Tensor<f32, 3> = r.0;
+            let s: Tensor<f32, 3> = r.1;
+            if m[0] == 0.95 and m[1] == 1.9 and m[2] == 2.85
+                and s[0] == 0.0 and s[1] == 0.0 and s[2] == 0.0
+            { 1 } else { 0 }
+        }";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `Optimizer<Momentum, Tensor<T,Dims...>>::step` -- *two* consecutive
+/// steps with two different gradients, exact expected values -- the real
+/// point being the second step's own expected value only comes out right
+/// if `state` (the velocity `v`) was genuinely threaded through from the
+/// first step, not silently reset. `v1 = (1-beta)*grad1` (`state0` is
+/// zero), `model1 = model0 - lr*v1`; `v2 = beta*v1 + (1-beta)*grad2`,
+/// `model2 = model1 - lr*v2` -- computed independently here (`beta=0.9,
+/// lr=0.5`): `v1 = 0.01`, `model1 = 0.995`; `v2 = 0.029`, `model2 =
+/// 0.9805`. A state-reset bug would instead give `v2 = 0.02`, `model2 =
+/// 0.985` -- a different, wrong value this test would catch.
+#[test]
+fn optimizer_momentum_carries_its_own_state_correctly_across_two_steps() {
+    let context = context();
+    let src = "
+        use optim;
+        use linalg;
+        fn main() -> i32 {
+            let opt = Momentum(lr: 0.5, beta: 0.9);
+            let model0: Tensor<f32, 1> = Tensor::<f32, 1>(data: [1.0]);
+            let state0: Tensor<f32, 1> = Optimizer::init_state(opt, model0);
+            let grad1: Tensor<f32, 1> = Tensor::<f32, 1>(data: [0.1]);
+            let r1 = Optimizer::step(opt, model0, grad1, state0);
+            let model1: Tensor<f32, 1> = r1.0;
+            let state1: Tensor<f32, 1> = r1.1;
+            let grad2: Tensor<f32, 1> = Tensor::<f32, 1>(data: [0.2]);
+            let r2 = Optimizer::step(opt, model1, grad2, state1);
+            let model2: Tensor<f32, 1> = r2.0;
+            let ok1 = model1[0] > 0.9949 and model1[0] < 0.9951;
+            let ok2 = model2[0] > 0.9804 and model2[0] < 0.9806;
+            if ok1 and ok2 { 1 } else { 0 }
+        }";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `Optimizer<Opt, Dense<T,In,Out>>` (`stdlib/nn/nn.cleave`) -- confirms the
+/// one composing impl, generic over `Opt` itself, actually recurses
+/// correctly into `.w`/`.b` (through `Sgd`'s own leaf-level `Tensor` impl,
+/// already checked in isolation above) -- `lr: 1.0` so `new = old - grad`
+/// exactly, easy to check by hand for every element of both fields.
+#[test]
+fn optimizer_composes_correctly_one_level_up_through_dense() {
+    let context = context();
+    let src = "
+        use nn;
+        fn main() -> i32 {
+            let opt = Sgd(lr: 1.0);
+            let w: Tensor<f32, 2, 2> = Tensor::<f32, 2, 2>(data: [[1.0, 2.0], [3.0, 4.0]]);
+            let b: Tensor<f32, 1, 2> = Tensor::<f32, 1, 2>(data: [[5.0, 6.0]]);
+            let model: Dense<f32, 2, 2> = Dense(w: w, b: b);
+            let gw: Tensor<f32, 2, 2> = Tensor::<f32, 2, 2>(data: [[0.1, 0.1], [0.1, 0.1]]);
+            let gb: Tensor<f32, 1, 2> = Tensor::<f32, 1, 2>(data: [[0.1, 0.1]]);
+            let grad: Dense<f32, 2, 2> = Dense(w: gw, b: gb);
+            let state: Dense<f32, 2, 2> = Optimizer::init_state(opt, model);
+            let r = Optimizer::step(opt, model, grad, state);
+            let m: Dense<f32, 2, 2> = r.0;
+            if m.w[0, 0] > 0.899 and m.w[0, 0] < 0.901
+                and m.w[1, 1] > 3.899 and m.w[1, 1] < 3.901
+                and m.b[0, 0] > 4.899 and m.b[0, 0] < 4.901
+                and m.b[0, 1] > 5.899 and m.b[0, 1] < 5.901
+            { 1 } else { 0 }
+        }";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// The real, end-to-end proof: the exact same `Network`/`Dense` shape and
+/// training loop `examples/xor_tensor.cleave` itself uses (`Optimizer::
+/// step`/`init_state`, one call, no per-field lines) but trained with
+/// `Momentum` instead of `Sgd` -- confirms the composing `Dense`/`Network`
+/// impls genuinely work for a *second* optimizer with no changes of their
+/// own, the actual point of making them generic over `Opt` rather than
+/// duplicating one impl per optimizer. Not checked against an exact
+/// reference output (unlike `examples/xor_tensor.cleave`'s own `Sgd` run --
+/// different optimizer, different trajectory) -- checked for genuine
+/// convergence instead, the same `~0,1,1,0` shape, within the same step
+/// budget.
+#[test]
+fn optimizer_momentum_trains_a_real_network_to_convergence() {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(optimizer_momentum_trains_a_real_network_to_convergence_body)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn optimizer_momentum_trains_a_real_network_to_convergence_body() {
+    let context = context();
+    let src = "
+        use io;
+        use nn;
+        use linalg;
+        struct Network { l1: Dense<f32, 2, 2>, l2: Dense<f32, 2, 1> }
+        impl<Opt> Optimizer<Opt, Network> {
+            fn init_state(opt, model) {
+                Network(l1: Optimizer::init_state(opt, model.l1), l2: Optimizer::init_state(opt, model.l2))
+            }
+            fn step(opt, model, grad, state) {
+                let r1 = Optimizer::step(opt, model.l1, grad.l1, state.l1);
+                let r2 = Optimizer::step(opt, model.l2, grad.l2, state.l2);
+                (Network(l1: r1.0, l2: r2.0), Network(l1: r1.1, l2: r2.1))
+            }
+        }
+        fn forward(x1: f32, x2: f32, net: Network) -> f32 {
+            let x = Tensor::<f32, 1, 2>(data: [[x1, x2]]);
+            let h = sigmoid(net.l1.forward(x));
+            let out = sigmoid(net.l2.forward(h));
+            out[0, 0]
+        }
+        fn loss(x1: f32, x2: f32, y: f32, net: Network) -> f32 {
+            let pred = forward(x1, x2, net);
+            let err = pred - y;
+            err * err
+        }
+        grad = derive(loss);
+        fn main() -> i32 {
+            rand_seed(2);
+            let mut net: Network = Network(l1: Init::xavier(), l2: Init::xavier());
+            let opt = Momentum(lr: 0.5, beta: 0.9);
+            let mut state: Network = Optimizer::init_state(opt, net);
+            let x1s: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+            let x2s: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
+            let ys: [f32; 4] = [0.0, 1.0, 1.0, 0.0];
+            for step in 0..4000 {
+                let i: i32 = step - (step / 4) * 4;
+                let g = grad(x1s[i], x2s[i], ys[i], net);
+                let r = Optimizer::step(opt, net, g.3, state);
+                net = r.0;
+                state = r.1;
+            };
+            let p00 = forward(0.0, 0.0, net);
+            let p01 = forward(0.0, 1.0, net);
+            let p10 = forward(1.0, 0.0, net);
+            let p11 = forward(1.0, 1.0, net);
+            if p00 < 0.5 and p01 > 0.5 and p10 > 0.5 and p11 < 0.5 { 1 } else { 0 }
         }";
     assert_eq!(run_i32(&context, src), 1);
 }

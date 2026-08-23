@@ -360,26 +360,57 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
         // straight to `i32` and permanently monomorphized before
         // `generalize` ever ran.
         //
-        // A **nullary** member is deliberately *not* generalized at all —
-        // this is Haskell's Monomorphism Restriction, applied for the same
-        // reason it exists there: a binding with no parameters can't accept
-        // any caller-supplied type information at its call sites the way a
+        // A nullary member with *no declared generics of its own* is
+        // deliberately not generalized at all — this is Haskell's
+        // Monomorphism Restriction, applied for the same reason it exists
+        // there: a binding with no parameters can't accept any caller-
+        // supplied type information at its call sites the way a
         // parameterized one can, so "generalizing" it would only mean
         // silently recomputing a fresh, possibly differently-defaulted
         // result at every use — surprising, and pointless for something that
         // takes no input to begin with. It also keeps `main` itself (always
-        // nullary) reporting a concrete signature rather than a spuriously
-        // "generic" one.
+        // nullary, never generic) reporting a concrete signature rather than
+        // a spuriously "generic" one.
+        //
+        // `f.generics.is_empty()` narrows this from a plain `f.params.is_
+        // empty()` check (an earlier version of this condition) — found
+        // wrong by direct testing: `stdlib/nn/nn.cleave`'s own `dense_
+        // xavier`/`dense_he` (an early version of `Init<T>::xavier`/`he`,
+        // before routing through an algebra instead) were nullary *and*
+        // generic (`fn dense_xavier<T,In,Out>() -> Dense<T,In,Out>`), every
+        // one of their three generics determined purely by the caller's own
+        // expected-type context (`let d: Dense<f32,2,2> = dense_xavier();`),
+        // exactly the shape `Ring::zero()` already handles correctly via a
+        // completely different mechanism (algebra output-only-generic
+        // dispatch, not this one at all). Skipping `generalize` here left
+        // `T`/`In`/`Out` un-quantified, so `apply_defaults` (which only ever
+        // skips an *already-quantified* variable) silently defaulted `T` to
+        // whatever a stray unconstrained literal inside the body happened to
+        // default to (`i32`, here) — surfacing as `no impl Float<i32>`, a
+        // constraint failure against a type the caller never asked for and
+        // the declaration never really committed to. The reasoning above
+        // (recomputing a "differently-defaulted result at every use") never
+        // actually applied to this case at all: a generic nullary function
+        // *is* still an ordinary function, re-invoked fresh at every call
+        // site regardless of its own arity — the Monomorphism Restriction's
+        // real concern is a `let`-bound *value* silently becoming shared
+        // across uses, which a top-level `fn` (this project's only nullary-
+        // callable shape; there's no separate `let`-bound-thunk ambiguity
+        // the way Haskell's own value/function distinction has) never is.
+        // Every existing nullary, non-generic case (`main`, `fn make() ->
+        // Vec2 {...}`) is completely unaffected — `f.generics.is_empty()`
+        // was already true for every one of them, so this is a pure
+        // narrowing, not a behavior change for anything already working.
         let mut nullary_constraints: HashMap<String, Vec<Constraint>> = HashMap::new();
         for name in group {
             let Ok(_) = &raw_results[name] else { continue };
             let f = functions[name.as_str()];
-            let (param_types, ret_var, _) = &placeholders[name];
+            let (param_types, ret_var, own_generics_mapping) = &placeholders[name];
             let final_fn_ty = Ty::Fn(
                 param_types.iter().map(|t| infer.subst.apply(t)).collect(),
                 Box::new(infer.subst.apply(ret_var)),
             );
-            if f.params.is_empty() {
+            if f.params.is_empty() && f.generics.is_empty() {
                 // Not generalized (Monomorphism Restriction — see below) —
                 // but a pending constraint on a variable this nullary
                 // member's own returned type still exposes must still
@@ -393,8 +424,18 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
             }
             // Generalized against `global_env` — the group's own siblings
             // (`group_env`) must not count as "free in the environment", see
-            // module docs.
-            match infer.generalize(&global_env, &final_fn_ty) {
+            // module docs. `Some((&f.generics, own_generics_mapping))` — not
+            // the free-var-scan-and-sort fallback — builds `scheme.vars` in
+            // real declaration order, robust against a later-minted variable
+            // (from a generic call/construction inside this member's own
+            // body) becoming the union-find survivor for one of `f`'s own
+            // declared generics — see `Infer::generalize`'s own doc comment
+            // for the real, found-by-testing bug this closes.
+            match infer.generalize(
+                &global_env,
+                &final_fn_ty,
+                Some((&f.generics, own_generics_mapping)),
+            ) {
                 Ok(scheme) => {
                     global_env.insert(name.clone(), scheme);
                 }
@@ -479,8 +520,15 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
                             // `Infer::constraints_touching`'s own doc
                             // comment for why an empty constraint list here
                             // would silently lose a real, checkable
-                            // requirement).
-                            if f.params.is_empty() {
+                            // requirement). `&& f.generics.is_empty()` here
+                            // too, matching the first loop's own narrowed
+                            // condition -- a *generic* nullary member already
+                            // got a real, correctly-quantified `Scheme`
+                            // inserted by `generalize` up in the first loop;
+                            // this branch firing unconditionally for it too
+                            // would silently overwrite that with an empty-
+                            // `vars` one, undoing the fix.
+                            if f.params.is_empty() && f.generics.is_empty() {
                                 let ty =
                                     Ty::Fn(final_params.clone(), Box::new(final_result.clone()));
                                 let constraints =
