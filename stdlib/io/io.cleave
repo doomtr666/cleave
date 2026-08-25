@@ -9,6 +9,21 @@
 // one of them. Each real symbol is a `cleave-rt` function, prints its
 // argument's decimal form plus a newline, and returns it unchanged (see
 // `cleave-rt/src/lib.rs`).
+// `use dynarray;`/`use display;` -- needed by the new `Display<T>`-backed
+// `Print<T>` impls further down (arrays/tensors of a `Display`-able
+// element type), not by the scalar/string/tuple impls above them, which
+// predate `Display<T>` entirely and stay untouched.
+use dynarray;
+use display;
+
+// Flushes a `DynArray<i8>`'s own already-built buffer straight to stdout --
+// `stdlib/display/display.cleave`'s own doc comment (`Display<T>`) explains
+// why this is a separate primitive from `print_bytes` (an ordinary `[i8;N]`
+// array's own ABI) rather than reusing it: `out.buf` is already a bare
+// opaque pointer (`RawBuf`, `stdlib/dynarray/dynarray.cleave`), not an
+// array value needing `mlir_lower.rs`'s own array-aware extraction.
+extern fn print_dynarray_bytes(buf: RawBuf, len: i32) -> i32;
+
 algebra Print<T> {
     fn print(x: T) -> T;
 }
@@ -72,6 +87,44 @@ impl<A: Print, B: Print, C: Print, D: Print> Print<(A, B, C, D)> {
         print(x.1);
         print(x.2);
         print(x.3);
+        x
+    }
+}
+
+// `[T;N]` -- its own **concrete**-target impl, deliberately not a single
+// `impl<T: Display> Print<T>` blanket: `i8`..`f64` already have their own
+// concrete `Print<T>` impls above, and once those same scalars also have a
+// `Display<T>` impl (`stdlib/display/display.cleave` -- needed anyway, to
+// format an *element* of an array), a blanket `impl<T: Display> Print<T>`
+// would structurally overlap them (both would bound-satisfy a call like
+// `print(5)`), resolved only by template iteration order -- not
+// deterministic by design, exactly the class of bug `find_impl_for_target`/
+// `derive_impl_instantiation` (`monomorphize.rs`) just learned to bounds-
+// check rather than silently pick a winner from. `[T;N]`'s own target is
+// structurally distinct from every existing `Print<T>` impl's own target,
+// so there's no overlap to resolve here.
+//
+impl<T: Display, const N: i32> Print<[T; N]> {
+    fn print(x) {
+        let mut out: DynArray<i8> = dynarray_new(32);
+        out = Display::display(x, out);
+        print_dynarray_bytes(out.buf, out.len);
+        x
+    }
+}
+impl<T: Display, const N: i32> Print<Tensor<T, N>> {
+    fn print(x) {
+        let mut out: DynArray<i8> = dynarray_new(32);
+        out = Display::display(x, out);
+        print_dynarray_bytes(out.buf, out.len);
+        x
+    }
+}
+impl<T: Display, const R: i32, const C: i32> Print<Tensor<T, R, C>> {
+    fn print(x) {
+        let mut out: DynArray<i8> = dynarray_new(32);
+        out = Display::display(x, out);
+        print_dynarray_bytes(out.buf, out.len);
         x
     }
 }

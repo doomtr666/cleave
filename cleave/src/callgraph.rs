@@ -111,6 +111,22 @@ pub struct ProgramInference {
     /// `infer_call`'s unresolved-call placeholder (see that method's own
     /// doc comment for the bug this closes).
     pub global_env: Env,
+    /// `infer_inherent_impls_early`'s own output, computed once at the top
+    /// of this pass (needed internally, to seed every per-`fn` `Infer`
+    /// instance below via `with_inherent_patterns`) and exposed here too —
+    /// any *other* caller building its own fresh `Infer` to re-infer a
+    /// non-generic algebra impl's body (`cps.rs::collect_units`'s own
+    /// separate re-inference, not reusing this pass's own per-`fn` `Infer`
+    /// instances) needs the identical seeding, for the identical reason: a
+    /// call to an inherent method with no explicit `->` annotation
+    /// otherwise has no way to learn that method's own (possibly non-unit)
+    /// return type, and silently falls back to the unresolved-placeholder
+    /// type instead — found directly, building `Display<i32>::display`
+    /// (`stdlib/display/display.cleave`), whose own body calls `DynArray<
+    /// i8>::push` (no `->` annotation, implicitly unit) from inside a
+    /// *non-generic* algebra impl; see `doc/backlog.md` for the fuller
+    /// story.
+    pub inherent_patterns: HashMap<(String, String), InherentMethodPattern>,
 }
 
 /// One inherent method's own return type, inferred *early* (before
@@ -237,9 +253,21 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
     let mut results: HashMap<String, Result<FnResult, TypeError>> = HashMap::new();
     let mut node_types: HashMap<NodeId, Ty> = HashMap::new();
     let mut lambda_schemes: HashMap<NodeId, Scheme> = HashMap::new();
+    // Carried from each group's own finished `Infer` into the next group's
+    // fresh one — see `Infer::with_var_counter_starting_at`'s own doc
+    // comment for the real, found-by-testing collision this prevents:
+    // without it, every group's `TyVarGen` independently restarts at `0`,
+    // so a raw `TyVar` id is not a unique identity across groups, and
+    // `generalize`'s own `env_fv` check (run against `global_env`, built by
+    // *earlier* groups' own separate `Infer` instances) can wrongly treat a
+    // later group's brand-new generic parameter as "already free in the
+    // environment" purely by numeric coincidence.
+    let mut next_var_id: u32 = 0;
 
     for group in &sccs {
-        let mut infer = Infer::new(registry).with_inherent_patterns(&inherent_patterns);
+        let mut infer = Infer::new(registry)
+            .with_inherent_patterns(&inherent_patterns)
+            .with_var_counter_starting_at(next_var_id);
 
         // Seed every member's placeholder before inferring *any* of their
         // bodies — visible to every other member (mutual recursion) and to
@@ -573,6 +601,7 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
             s.ty = infer.subst.apply(&s.ty);
             (*id, s)
         }));
+        next_var_id = infer.var_counter();
     }
 
     ProgramInference {
@@ -580,6 +609,7 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
         node_types,
         lambda_schemes,
         global_env,
+        inherent_patterns,
     }
 }
 

@@ -75,6 +75,57 @@ fn run_i32(context: &Context, src: &str) -> i32 {
         engine.register_symbol("print_i64", cleave_rt::print_i64 as *mut ());
         engine.register_symbol("print_f32", cleave_rt::print_f32 as *mut ());
         engine.register_symbol("print_f64", cleave_rt::print_f64 as *mut ());
+        engine.register_symbol("print_bytes", cleave_rt::print_bytes as *mut ());
+        // `use io;` now transitively pulls in `stdlib/display/display.cleave`
+        // (non-generic `Display<i32>`/`Display<f32>`/`Display<f64>`, eagerly
+        // compiled) and `stdlib/dynarray/dynarray.cleave` (every `RawBuffer
+        // <T>` width, same reason) -- registered unconditionally, harmless
+        // if unused, same reasoning as the `print_*` symbols above.
+        engine.register_symbol(
+            "print_dynarray_bytes",
+            cleave_rt::print_dynarray_bytes as *mut (),
+        );
+        engine.register_symbol("format_f32", cleave_rt::format_f32 as *mut ());
+        engine.register_symbol("format_f64", cleave_rt::format_f64 as *mut ());
+        engine.register_symbol("dynarray_alloc_i8", cleave_rt::dynarray_alloc_i8 as *mut ());
+        engine.register_symbol("dynarray_grow_i8", cleave_rt::dynarray_grow_i8 as *mut ());
+        engine.register_symbol("dynarray_get_i8", cleave_rt::dynarray_get_i8 as *mut ());
+        engine.register_symbol("dynarray_set_i8", cleave_rt::dynarray_set_i8 as *mut ());
+        engine.register_symbol(
+            "dynarray_alloc_i16",
+            cleave_rt::dynarray_alloc_i16 as *mut (),
+        );
+        engine.register_symbol("dynarray_grow_i16", cleave_rt::dynarray_grow_i16 as *mut ());
+        engine.register_symbol("dynarray_get_i16", cleave_rt::dynarray_get_i16 as *mut ());
+        engine.register_symbol("dynarray_set_i16", cleave_rt::dynarray_set_i16 as *mut ());
+        engine.register_symbol(
+            "dynarray_alloc_i32",
+            cleave_rt::dynarray_alloc_i32 as *mut (),
+        );
+        engine.register_symbol("dynarray_grow_i32", cleave_rt::dynarray_grow_i32 as *mut ());
+        engine.register_symbol("dynarray_get_i32", cleave_rt::dynarray_get_i32 as *mut ());
+        engine.register_symbol("dynarray_set_i32", cleave_rt::dynarray_set_i32 as *mut ());
+        engine.register_symbol(
+            "dynarray_alloc_i64",
+            cleave_rt::dynarray_alloc_i64 as *mut (),
+        );
+        engine.register_symbol("dynarray_grow_i64", cleave_rt::dynarray_grow_i64 as *mut ());
+        engine.register_symbol("dynarray_get_i64", cleave_rt::dynarray_get_i64 as *mut ());
+        engine.register_symbol("dynarray_set_i64", cleave_rt::dynarray_set_i64 as *mut ());
+        engine.register_symbol(
+            "dynarray_alloc_f32",
+            cleave_rt::dynarray_alloc_f32 as *mut (),
+        );
+        engine.register_symbol("dynarray_grow_f32", cleave_rt::dynarray_grow_f32 as *mut ());
+        engine.register_symbol("dynarray_get_f32", cleave_rt::dynarray_get_f32 as *mut ());
+        engine.register_symbol("dynarray_set_f32", cleave_rt::dynarray_set_f32 as *mut ());
+        engine.register_symbol(
+            "dynarray_alloc_f64",
+            cleave_rt::dynarray_alloc_f64 as *mut (),
+        );
+        engine.register_symbol("dynarray_grow_f64", cleave_rt::dynarray_grow_f64 as *mut ());
+        engine.register_symbol("dynarray_get_f64", cleave_rt::dynarray_get_f64 as *mut ());
+        engine.register_symbol("dynarray_set_f64", cleave_rt::dynarray_set_f64 as *mut ());
     }
     let mut out: i32 = -1;
     unsafe {

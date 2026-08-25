@@ -205,6 +205,12 @@ pub unsafe fn register_cleave_rt_symbols(engine: &melior::ExecutionEngine) {
         engine.register_symbol("print_f32", cleave_rt::print_f32 as *mut ());
         engine.register_symbol("print_f64", cleave_rt::print_f64 as *mut ());
         engine.register_symbol("print_bytes", cleave_rt::print_bytes as *mut ());
+        engine.register_symbol(
+            "print_dynarray_bytes",
+            cleave_rt::print_dynarray_bytes as *mut (),
+        );
+        engine.register_symbol("format_f32", cleave_rt::format_f32 as *mut ());
+        engine.register_symbol("format_f64", cleave_rt::format_f64 as *mut ());
         engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
         engine.register_symbol("dynarray_alloc_i8", cleave_rt::dynarray_alloc_i8 as *mut ());
         engine.register_symbol("dynarray_grow_i8", cleave_rt::dynarray_grow_i8 as *mut ());

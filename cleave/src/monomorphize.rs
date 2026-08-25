@@ -84,7 +84,7 @@
 //! b: B) -> C;`, exactly `MatMul`'s own shape).
 
 use crate::ast::*;
-use crate::callgraph::{self, ProgramInference};
+use crate::callgraph::{self, InherentMethodPattern, ProgramInference};
 use crate::cps::{StructSchema, collect_struct_schemas};
 use crate::dump::{TyVarNames, dump_block_with_call_names, fmt_ty_named};
 use crate::infer::{
@@ -404,7 +404,12 @@ pub fn monomorphize(
         })
         .collect();
 
-    let templates = build_impl_templates(program, registry, &program_inference.global_env);
+    let templates = build_impl_templates(
+        program,
+        registry,
+        &program_inference.global_env,
+        &program_inference.inherent_patterns,
+    );
     let inherent_templates =
         build_inherent_templates(program, registry, &program_inference.global_env);
     let lambda_exprs = index_lambda_exprs(program, &program_inference.lambda_schemes);
@@ -479,6 +484,57 @@ pub fn monomorphize(
         collect_instantiations(
             body,
             &program_inference.node_types,
+            &program_inference.global_env,
+            &templates,
+            &inherent_templates,
+            &program_inference.lambda_schemes,
+            HashMap::new(),
+            &mut fn_worklist,
+            &mut impl_worklist,
+            &mut lambda_worklist,
+            &mut inherent_worklist,
+            &mut mono.seed_call_names,
+            &mut mono.errors,
+            registry,
+        );
+    }
+
+    // Seed: every *non-generic* algebra-impl method's own body also needs
+    // scanning for further calls, the identical reason every non-generic
+    // top-level `fn`'s body just got scanned above. `cps.rs::collect_units`
+    // re-infers a non-generic impl's own body *itself* (a separate concern
+    // -- it needs `Infer::infer_impl_fn_generic_with_env`'s own real
+    // inference result to build the unit's `param_types`/`node_types`, not
+    // just this template's already-resolved ones) but, until now, fed that
+    // re-inference's own `collect_instantiations` call nothing but
+    // throwaway worklists for `fn_worklist`/`impl_worklist`/`lambda_
+    // worklist`/`inherent_worklist` -- only `call_names` was ever kept.
+    // Its own doc comment already named the exact consequence, as an
+    // accepted, narrow gap: "a call from *this* body into a still-*generic*
+    // fn/impl needing its own further specialization isn't discovered this
+    // way ... no known case needs it yet." A real case now does: `Display
+    // <i32>::display` (`stdlib/display/display.cleave`, a non-generic
+    // impl) calls `out.push(...)`, an inherent method on the *generic*
+    // `DynArray<T>` (`stdlib/dynarray/dynarray.cleave`) -- needing its own
+    // `DynArray::push<i8>` specialization built, exactly like `Dense::
+    // forward` calling `matmul` needed one for `impl_worklist` (the
+    // "backward push" fixed-point item just below this one). Scanning
+    // *here*, with the real worklists, means `mono` already contains
+    // whatever gets discovered by the time this function returns --
+    // `cps.rs::collect_units`'s own generic-impl/generic-inherent-impl
+    // branches already read `mono.specializations_of(...)` unconditionally,
+    // so no change is needed there at all, only here. `templates` already
+    // has one `ImplTemplate` per impl, concrete or generic alike (`build_
+    // impl_templates`'s own doc comment) -- `!t.is_generic` alone identifies
+    // the non-generic ones, the identical condition `cps.rs::collect_units`
+    // itself gates its own separate re-inference branch on.
+    for t in &templates {
+        if t.is_generic {
+            continue;
+        }
+        collect_instantiations(
+            &t.body,
+            &t.node_types,
             &program_inference.global_env,
             &templates,
             &inherent_templates,
@@ -964,6 +1020,7 @@ fn build_impl_templates(
     program: &Program,
     registry: &Registry,
     global_env: &Env,
+    inherent_patterns: &HashMap<(String, String), InherentMethodPattern>,
 ) -> Vec<ImplTemplate> {
     let mut templates = Vec::new();
     for item in &program.items {
@@ -989,7 +1046,7 @@ fn build_impl_templates(
             // `derive_impl_instantiation`/`call_names` exist to record, an
             // extern-backed method needs that as much as a real one does,
             // even though there's no cleave-level body to specialize.
-            let mut infer = Infer::new(registry);
+            let mut infer = Infer::new(registry).with_inherent_patterns(inherent_patterns);
             let Ok(ret_pattern) = infer.infer_impl_fn_generic_with_env(
                 global_env,
                 &d.algebra,

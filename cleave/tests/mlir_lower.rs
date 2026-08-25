@@ -21,6 +21,79 @@ fn context() -> Context {
     context
 }
 
+/// Registers every `stdlib/dynarray/dynarray.cleave` + `stdlib/display/
+/// display.cleave` + `stdlib/io/io.cleave` runtime symbol this test file's
+/// own several independent, hand-built `ExecutionEngine` harnesses might
+/// need, unconditionally, harmless if unused. Once `stdlib/io/io.cleave`
+/// started `use dynarray;`/`use display;` for its own new `Display<T>`-
+/// backed `Print<T>` impls, `use io;` alone (already used by the
+/// overwhelming majority of tests in this file) started transitively
+/// pulling in *every* `RawBuffer<T>` impl for *every* scalar width
+/// (`stdlib/dynarray/dynarray.cleave`'s own six `impl RawBuffer<...>`
+/// blocks, all non-generic, hence eagerly compiled into any program
+/// reaching them at all — `cps.rs::collect_units`'s own "non-generic impl"
+/// branch, unconditional, regardless of whether `DynArray<i16>` etc. is
+/// ever actually *constructed*) — not just the `i8`-width one `Display<T>`
+/// itself actually uses. A single shared helper here, instead of hand-
+/// listing the same ~30 symbols at each of this file's own several
+/// `ExecutionEngine::new` call sites, keeps them from drifting out of sync.
+fn register_io_symbols(engine: &melior::ExecutionEngine) {
+    unsafe {
+        engine.register_symbol("print_i8", cleave_rt::print_i8 as *mut ());
+        engine.register_symbol("print_i16", cleave_rt::print_i16 as *mut ());
+        engine.register_symbol("print_i32", cleave_rt::print_i32 as *mut ());
+        engine.register_symbol("print_i64", cleave_rt::print_i64 as *mut ());
+        engine.register_symbol("print_f32", cleave_rt::print_f32 as *mut ());
+        engine.register_symbol("print_f64", cleave_rt::print_f64 as *mut ());
+        engine.register_symbol("print_bytes", cleave_rt::print_bytes as *mut ());
+        engine.register_symbol(
+            "print_dynarray_bytes",
+            cleave_rt::print_dynarray_bytes as *mut (),
+        );
+        engine.register_symbol("format_f32", cleave_rt::format_f32 as *mut ());
+        engine.register_symbol("format_f64", cleave_rt::format_f64 as *mut ());
+        engine.register_symbol("dynarray_alloc_i8", cleave_rt::dynarray_alloc_i8 as *mut ());
+        engine.register_symbol("dynarray_grow_i8", cleave_rt::dynarray_grow_i8 as *mut ());
+        engine.register_symbol("dynarray_get_i8", cleave_rt::dynarray_get_i8 as *mut ());
+        engine.register_symbol("dynarray_set_i8", cleave_rt::dynarray_set_i8 as *mut ());
+        engine.register_symbol(
+            "dynarray_alloc_i16",
+            cleave_rt::dynarray_alloc_i16 as *mut (),
+        );
+        engine.register_symbol("dynarray_grow_i16", cleave_rt::dynarray_grow_i16 as *mut ());
+        engine.register_symbol("dynarray_get_i16", cleave_rt::dynarray_get_i16 as *mut ());
+        engine.register_symbol("dynarray_set_i16", cleave_rt::dynarray_set_i16 as *mut ());
+        engine.register_symbol(
+            "dynarray_alloc_i32",
+            cleave_rt::dynarray_alloc_i32 as *mut (),
+        );
+        engine.register_symbol("dynarray_grow_i32", cleave_rt::dynarray_grow_i32 as *mut ());
+        engine.register_symbol("dynarray_get_i32", cleave_rt::dynarray_get_i32 as *mut ());
+        engine.register_symbol("dynarray_set_i32", cleave_rt::dynarray_set_i32 as *mut ());
+        engine.register_symbol(
+            "dynarray_alloc_i64",
+            cleave_rt::dynarray_alloc_i64 as *mut (),
+        );
+        engine.register_symbol("dynarray_grow_i64", cleave_rt::dynarray_grow_i64 as *mut ());
+        engine.register_symbol("dynarray_get_i64", cleave_rt::dynarray_get_i64 as *mut ());
+        engine.register_symbol("dynarray_set_i64", cleave_rt::dynarray_set_i64 as *mut ());
+        engine.register_symbol(
+            "dynarray_alloc_f32",
+            cleave_rt::dynarray_alloc_f32 as *mut (),
+        );
+        engine.register_symbol("dynarray_grow_f32", cleave_rt::dynarray_grow_f32 as *mut ());
+        engine.register_symbol("dynarray_get_f32", cleave_rt::dynarray_get_f32 as *mut ());
+        engine.register_symbol("dynarray_set_f32", cleave_rt::dynarray_set_f32 as *mut ());
+        engine.register_symbol(
+            "dynarray_alloc_f64",
+            cleave_rt::dynarray_alloc_f64 as *mut (),
+        );
+        engine.register_symbol("dynarray_grow_f64", cleave_rt::dynarray_grow_f64 as *mut ());
+        engine.register_symbol("dynarray_get_f64", cleave_rt::dynarray_get_f64 as *mut ());
+        engine.register_symbol("dynarray_set_f64", cleave_rt::dynarray_set_f64 as *mut ());
+    }
+}
+
 /// Compiles `src` all the way through CPS conversion and MLIR lowering,
 /// returning the verified module's own printed text.
 fn lower(context: &Context, src: &str) -> String {
@@ -322,6 +395,10 @@ fn run_i32_from_cps(
         engine.register_symbol("rand_normal_f32", cleave_rt::rand_normal_f32 as *mut ());
         engine.register_symbol("rand_normal_f64", cleave_rt::rand_normal_f64 as *mut ());
     }
+    // `use io;` now transitively pulls in `stdlib/display/display.cleave`
+    // and `stdlib/dynarray/dynarray.cleave` -- see `register_io_symbols`'s
+    // own doc comment.
+    register_io_symbols(&engine);
     let mut out: i32 = -1;
     unsafe {
         engine
@@ -928,9 +1005,9 @@ fn a_string_literal_printed_via_print_writes_the_right_bytes_to_stdout() {
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {
-        engine.register_symbol("print_bytes", cleave_rt::print_bytes as *mut ());
         engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
     }
+    register_io_symbols(&engine);
     let mut out: i32 = -1;
     unsafe {
         engine
@@ -2520,9 +2597,9 @@ fn print_of_an_unannotated_index_result_no_longer_panics() {
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {
-        engine.register_symbol("print_f32", cleave_rt::print_f32 as *mut ());
         engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
     }
+    register_io_symbols(&engine);
     let mut out: i32 = -1;
     unsafe {
         engine
@@ -2596,9 +2673,9 @@ fn print_of_an_unannotated_matmul_index_result_no_longer_panics() {
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {
-        engine.register_symbol("print_f32", cleave_rt::print_f32 as *mut ());
         engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
     }
+    register_io_symbols(&engine);
     let mut out: i32 = -1;
     unsafe {
         engine
@@ -3843,45 +3920,9 @@ fn run_i32_with_dynarray_symbols(
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {
         engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
-        engine.register_symbol("dynarray_alloc_i8", cleave_rt::dynarray_alloc_i8 as *mut ());
-        engine.register_symbol("dynarray_grow_i8", cleave_rt::dynarray_grow_i8 as *mut ());
-        engine.register_symbol("dynarray_get_i8", cleave_rt::dynarray_get_i8 as *mut ());
-        engine.register_symbol("dynarray_set_i8", cleave_rt::dynarray_set_i8 as *mut ());
-        engine.register_symbol(
-            "dynarray_alloc_i16",
-            cleave_rt::dynarray_alloc_i16 as *mut (),
-        );
-        engine.register_symbol("dynarray_grow_i16", cleave_rt::dynarray_grow_i16 as *mut ());
-        engine.register_symbol("dynarray_get_i16", cleave_rt::dynarray_get_i16 as *mut ());
-        engine.register_symbol("dynarray_set_i16", cleave_rt::dynarray_set_i16 as *mut ());
-        engine.register_symbol(
-            "dynarray_alloc_i32",
-            cleave_rt::dynarray_alloc_i32 as *mut (),
-        );
-        engine.register_symbol("dynarray_grow_i32", cleave_rt::dynarray_grow_i32 as *mut ());
-        engine.register_symbol("dynarray_get_i32", cleave_rt::dynarray_get_i32 as *mut ());
-        engine.register_symbol("dynarray_set_i32", cleave_rt::dynarray_set_i32 as *mut ());
-        engine.register_symbol(
-            "dynarray_alloc_i64",
-            cleave_rt::dynarray_alloc_i64 as *mut (),
-        );
-        engine.register_symbol("dynarray_grow_i64", cleave_rt::dynarray_grow_i64 as *mut ());
-        engine.register_symbol("dynarray_get_i64", cleave_rt::dynarray_get_i64 as *mut ());
-        engine.register_symbol("dynarray_set_i64", cleave_rt::dynarray_set_i64 as *mut ());
-        engine.register_symbol(
-            "dynarray_alloc_f32",
-            cleave_rt::dynarray_alloc_f32 as *mut (),
-        );
-        engine.register_symbol("dynarray_grow_f32", cleave_rt::dynarray_grow_f32 as *mut ());
-        engine.register_symbol("dynarray_get_f32", cleave_rt::dynarray_get_f32 as *mut ());
-        engine.register_symbol("dynarray_set_f32", cleave_rt::dynarray_set_f32 as *mut ());
-        engine.register_symbol(
-            "dynarray_alloc_f64",
-            cleave_rt::dynarray_alloc_f64 as *mut (),
-        );
-        engine.register_symbol("dynarray_grow_f64", cleave_rt::dynarray_grow_f64 as *mut ());
-        engine.register_symbol("dynarray_get_f64", cleave_rt::dynarray_get_f64 as *mut ());
-        engine.register_symbol("dynarray_set_f64", cleave_rt::dynarray_set_f64 as *mut ());
+    }
+    register_io_symbols(&engine);
+    unsafe {
         for (name, ptr) in extra_symbols {
             engine.register_symbol(name, *ptr);
         }
@@ -4325,19 +4366,13 @@ fn a_function_over_an_explicit_tuple_parameter_type_returns_the_right_element() 
 #[test]
 fn a_multi_argument_heterogeneous_print_call_prints_every_element_in_order() {
     let context = context();
-    // `run_i32` registers no `print_*` symbols at all -- `run_i32_with_
-    // dynarray_symbols`'s own `extra_symbols` slot is the established way
-    // any other test needing them supplies its own, unrelated to `DynArray`
-    // itself (its own base set of registered symbols is just a superset,
-    // harmless when unused).
+    // `run_i32_with_dynarray_symbols`'s own base set (`register_io_symbols`)
+    // already covers every `print_*`/`Display<T>` symbol this needs --
+    // `extra_symbols` is for anything genuinely *outside* that (none here).
     let out = run_i32_with_dynarray_symbols(
         &context,
         "use io;\nfn main() -> i32 { let x: i32 = 3; let y: f64 = 4.5; print((\"x=\", x, \"y=\", y)); 0 }",
-        &[
-            ("print_i32", cleave_rt::print_i32 as *mut ()),
-            ("print_f64", cleave_rt::print_f64 as *mut ()),
-            ("print_bytes", cleave_rt::print_bytes as *mut ()),
-        ],
+        &[],
     );
     assert_eq!(out, 0);
 }
@@ -4732,5 +4767,336 @@ fn optimizer_momentum_trains_a_real_network_to_convergence_body() {
             let p11 = forward(1.0, 1.0, net);
             if p00 < 0.5 and p01 > 0.5 and p10 > 0.5 and p11 < 0.5 { 1 } else { 0 }
         }";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// A real, previously-latent infinite-recursion bug, found and fixed
+/// building `stdlib/display/display.cleave`'s own `Display<T>` (`doc/
+/// backlog.md`'s own "print générique" item): once *two* structurally-
+/// different generic impls of the same algebra both bound generically on
+/// that *same* algebra (`Wrap<[T;N]>` and `Wrap<Box3<T>>` below, both
+/// `T: Wrap`), calling `wrap` on a value whose own element type is still an
+/// unconstrained type variable at declaration-check time hung the compiler
+/// forever, a real native stack overflow, not a controlled type error.
+///
+/// Root cause: `Infer::matching_impls`'s own bound-satisfaction check
+/// (`bounds_satisfied`) asked `has_matching_impl` whether a *still fully
+/// unconstrained* type variable satisfies a candidate's own declared bound
+/// — for a bound naming an algebra with its own further generic, self-
+/// bounding impl, that recurses back into `matching_impls` with *another*
+/// fresh, equally unconstrained variable, forever. Fixed by treating a
+/// not-yet-concrete bound argument as *permissively* satisfied (skip the
+/// check entirely, the same "nothing to check yet isn't the same as a
+/// check that failed" posture `check_pending_constraints` already
+/// establishes one level up) rather than actually searching for a match —
+/// `has_matching_impl` is never even called on it.
+#[test]
+fn two_overlapping_generic_impls_each_bounded_on_their_own_algebra_dont_hang_the_compiler() {
+    let context = context();
+    let src = "
+        algebra Wrap<T> {
+            fn wrap(x: T) -> i32;
+        }
+        impl Wrap<i32> {
+            fn wrap(x) { x }
+        }
+        impl<T: Wrap, const N: i32> Wrap<[T; N]> {
+            fn wrap(a) { wrap(a[0]) }
+        }
+        struct Box3<T> { v: T }
+        impl<T: Wrap> Wrap<Box3<T>> {
+            fn wrap(b) { wrap(b.v) }
+        }
+        fn main() -> i32 {
+            let b: Box3<i32> = Box3(v: 5);
+            wrap(b)
+        }";
+    assert_eq!(run_i32(&context, src), 5);
+}
+
+/// `Display<i32>` (`stdlib/display/display.cleave`) -- exact byte-by-byte
+/// check, negative and positive, the two real ways a hand-rolled digit
+/// formatter can go wrong (sign handling, digit order). `Display::display`
+/// returns the `DynArray<i8>` directly, inspectable in cleave itself before
+/// any `print`/stdout involvement -- a more precise assertion than
+/// capturing stdout would give.
+#[test]
+fn display_i32_produces_the_exact_expected_bytes() {
+    let context = context();
+    let src = "
+        use display;
+        fn main() -> i32 {
+            let mut out: DynArray<i8> = dynarray_new(8);
+            out = Display::display(-42, out);
+            if out.len() == 3 and out.get(0) == 45 and out.get(1) == 52 and out.get(2) == 50 { 1 } else { 0 }
+        }";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `Display<f32>` -- exact byte-by-byte check, via the new `format_f32`
+/// extern (`cleave-rt`), same `format!(\"{x}\")` `print_f32` itself already
+/// uses.
+#[test]
+fn display_f32_produces_the_exact_expected_bytes() {
+    let context = context();
+    let src = "
+        use display;
+        fn main() -> i32 {
+            let mut out: DynArray<i8> = dynarray_new(8);
+            out = Display::display(3.5, out);
+            if out.len() == 3 and out.get(0) == 51 and out.get(1) == 46 and out.get(2) == 53 { 1 } else { 0 }
+        }";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `Display<[T;N]>` -- exact bracketed, comma-separated rendering,
+/// `\"[1, 2, 3]\"` byte for byte, confirming the array-of-scalars
+/// composition (`Display::display` recursing into `Display<i32>` per
+/// element) works correctly -- the actual real-world shape `print([1,2,3])`
+/// uses.
+#[test]
+fn display_of_an_int_array_renders_brackets_and_commas_correctly() {
+    let context = context();
+    let src = r#"
+        use display;
+        fn main() -> i32 {
+            let mut out: DynArray<i8> = dynarray_new(16);
+            out = Display::display([1, 2, 3], out);
+            let expected: [i8; 9] = [91, 49, 44, 32, 50, 44, 32, 51, 93]; // "[1, 2, 3]"
+            let mut ok: i32 = 1;
+            if out.len() != 9 { ok = 0; };
+            for i in 0..9 {
+                if out.get(i) != expected[i] { ok = 0; };
+            };
+            ok
+        }"#;
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// A real, previously-latent type-inference bug, found and fixed building
+/// `Display<Tensor<T,Dims...>>` (`stdlib/display/display.cleave`, `doc/
+/// backlog.md`'s own "print générique" item): `t[0]` (`Index<Tensor<T,N>,
+/// T>`, an *algebra* dispatch, unlike an ordinary array's direct `PrimOp::
+/// Load`) correctly *defers* while `T` is still abstract mid-declaration
+/// of an enclosing generic impl -- but deferring used to leave `Index`'s
+/// own output-only `Elem` generic (`t[0]`'s own type) as a genuinely
+/// orphaned fresh variable, never unified with `T` at all, silently
+/// defaulted to `i32` by the time a *second* dispatch (`wrap` again, here)
+/// needed a concrete answer -- confirmed directly via `--dump-cps-
+/// optimized`: `Wrap::wrap<Tensor<f32,3>>` itself calling `Wrap::
+/// wrap<i32>`, not `<f32>`, before the fix.
+///
+/// Fixed in `Infer::infer_algebra_call` (`cleave/src/infer.rs`): committing
+/// a deferred dispatch immediately is still sound whenever exactly one impl
+/// matches *and* every position it would newly pin down resolves only to
+/// variables `self.active_generics` already owns (`Elem := T`, the same
+/// openness carried forward under a new name, no new guess) -- see
+/// `Infer::unambiguous_and_preserves_openness`'s own doc comment for the
+/// full reasoning, including why this must *not* fire for `Convert<From,
+/// To>`-shaped cases (`stdlib/nn/nn.cleave`'s own `mean`, `N.to()`), which
+/// still correctly defer.
+#[test]
+fn tensor_index_result_dispatches_to_the_correct_algebra_impl_even_while_still_generic() {
+    let context = context();
+    let src = "
+        use linalg;
+        algebra Wrap<T> {
+            fn wrap(x: T) -> i32;
+        }
+        impl Wrap<i32> {
+            fn wrap(x) { x }
+        }
+        impl Wrap<f32> {
+            fn wrap(x) { 999 }
+        }
+        impl<T: Wrap, const N: i32> Wrap<Tensor<T, N>> {
+            fn wrap(t) { Wrap::wrap(t[0]) }
+        }
+        fn main() -> i32 {
+            let v: Tensor<f32, 3> = Tensor::<f32, 3>(data: [1.0, 2.0, 3.0]);
+            Wrap::wrap(v)
+        }";
+    assert_eq!(run_i32(&context, src), 999);
+}
+
+/// A self-recursive generic top-level `fn`, called at two different
+/// concrete types in the same program, alongside an algebra `impl` whose
+/// own body triggers a *deferred-but-immediately-committed* dispatch (the
+/// same `Wrap<Tensor<T,N>>` shape as the test just above). Each top-level
+/// `fn` is inferred in its own group by `callgraph::infer_program`
+/// (`cleave/src/callgraph.rs`), one `Infer` instance per group, each
+/// restarting its own `TyVar` numbering at 0 -- so a later group's brand
+/// new generic parameter can numerically collide with some unrelated, still
+/// -free variable left over in an earlier group's already-finished
+/// `scheme.ty`. `Infer::generalize`'s own `env_fv` check (run against
+/// `global_env`, accumulated across groups) doesn't know these two `0`s
+/// aren't the same variable -- found for real via `examples/fibonacci.
+/// cleave`: it silently generalized `fibonacci<T: Int>` as monomorphic
+/// (locked to whichever concrete type its *first* call site used) instead
+/// of polymorphic, so the *second* call site failed to unify. Fixed by
+/// threading one monotonic `TyVar` counter across the whole group loop
+/// (`Infer::with_var_counter_starting_at`/`var_counter`) instead of letting
+/// each group's own `Infer::new` restart at 0. This test doesn't even need
+/// `Wrap`'s own dispatch to *matter* semantically -- its only job is to
+/// shift enough extra top-level declarations/groups through the loop
+/// before `fibonacci`'s own group to make a collision likely, the same way
+/// `use display;`/`use linalg;` incidentally did in the original report.
+#[test]
+fn a_self_recursive_generic_fn_called_at_two_concrete_types_stays_polymorphic_even_with_other_algebra_impls_present()
+ {
+    let context = context();
+    let src = "
+        use display;
+        algebra Wrap<T> {
+            fn wrap(x: T) -> i32;
+        }
+        impl Wrap<i32> {
+            fn wrap(x) { x }
+        }
+        impl Wrap<f32> {
+            fn wrap(x) { 999 }
+        }
+        impl<T: Wrap, const N: i32> Wrap<Tensor<T, N>> {
+            fn wrap(t) { Wrap::wrap(t[0]) }
+        }
+        fn fibonacci<T: Int>(x: T) -> T {
+            if x <= 1 { x } else { fibonacci(x-1) + fibonacci(x-2) }
+        }
+        fn main() -> i32 {
+            let a: i32 = fibonacci(16:i32);
+            let b: i64 = fibonacci(42:i64);
+            if b == 267914296:i64 { a } else { -1 }
+        }";
+    assert_eq!(run_i32(&context, src), 987);
+}
+
+/// A pack-generic top-level `fn` (`const Dims...: i32`), called at two
+/// different *ranks* in the same program — `random_fill::<f32,[4]>` then
+/// `random_fill::<f32,[2,2,2]>`. Broke the same way the fibonacci case just
+/// above did, but for a genuinely different underlying reason: `Infer::
+/// instantiate_with_mapping` (`cleave/src/infer.rs`) minted *every* fresh
+/// replacement for a generalized scheme's own `scheme.vars` as a bare `Ty::
+/// Var` (`TyVarGen::fresh` always returns one) — silently downgrading a
+/// pack-kind generic (`Ty::Pack`, what `const Dims...: i32` actually mints,
+/// `Infer::fresh_vars_for_generics`) into an ordinary scalar var on *every*
+/// re-instantiation. A single call site still happened to work (nothing yet
+/// forced the corrupted var back into pack shape until unification against
+/// a concrete `Tensor<_, N>` did it structurally), but a second call site
+/// at a different rank got its own fresh-but-still-scalar var with no
+/// pack-ness left to recover, escaping monomorphization as a bare
+/// unresolved type variable. Fixed by recovering each `scheme.vars` entry's
+/// real kind from `scheme.ty` itself (`collect_pack_vars`, scanning for
+/// `Ty::Pack(v)` occurrences) before minting its fresh replacement.
+#[test]
+fn a_pack_generic_top_level_fn_called_at_two_different_ranks_monomorphizes_both() {
+    let context = context();
+    let src = "
+        use linalg;
+        fn fill<T: Ring, const Dims...: i32>(v: T) -> Tensor<T, Dims...> {
+            Tensor::<T, Dims...>(data: [v; Dims...])
+        }
+        fn main() -> i32 {
+            let a: Tensor<f32, 4> = fill(2.0);
+            let b: Tensor<f32, 2, 2, 2> = fill(3.0);
+            let mut ok: i32 = 1;
+            for i in 0..4 { if a[i] != 2.0 { ok = 0; }; };
+            for i in 0..2 {
+                for j in 0..2 {
+                    for k in 0..2 {
+                        if b[i, j, k] != 3.0 { ok = 0; };
+                    };
+                };
+            };
+            ok
+        }";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// The algebra-impl counterpart of the test just above — same pack-generic-
+/// called-at-two-ranks shape, but through `impl<T, const Dims...: i32>
+/// SomeAlgebra<Tensor<T,Dims...>>` rather than a plain top-level `fn`, and
+/// with the impl's own body calling into a *second* algebra (`Rand::
+/// uniform`, via `Rand<T>`) rather than just constructing directly.
+/// Previously didn't fail cleanly — it hung the compiler outright (an
+/// unbounded stack overflow), isolated at the time to needing *both* two
+/// ranks in one program *and* a nested cross-algebra call inside the pack-
+/// generic impl body (dropping either condition alone worked fine). Fixed
+/// by the exact same root-cause fix as the top-level-`fn` case above — this
+/// path also goes through `Infer::instantiate_with_mapping` (an algebra
+/// impl's own generalized method scheme gets re-instantiated per call site
+/// exactly like a top-level `fn`'s does), so the corrupted-pack-var
+/// mechanism was identical underneath, just reached through a different
+/// front door. This test's own real job is simply completing at all,
+/// within the harness's ordinary timeout, rather than hanging.
+#[test]
+fn an_algebra_impl_generic_over_a_pack_calling_a_second_algebra_works_at_two_ranks_in_one_program() {
+    let context = context();
+    let src = "
+        use linalg;
+        use rand;
+        algebra RandomFilled<T> { fn random_fill() -> T; }
+        impl<T: Float + Rand + Ring, const Dims...: i32> RandomFilled<Tensor<T, Dims...>> {
+            fn random_fill() { Tensor::<T, Dims...>(data: [Rand::uniform(-1.0, 1.0); Dims...]) }
+        }
+        fn main() -> i32 {
+            let v: Tensor<f32, 4> = RandomFilled::random_fill();
+            let t: Tensor<f32, 2, 2, 2> = RandomFilled::random_fill();
+            0
+        }";
+    assert_eq!(run_i32(&context, src), 0);
+}
+
+/// `Display<Tensor<T,N>>` (rank 1) -- exact byte-for-byte rendering,
+/// fractional values specifically (an integer-valued `f32` like `1.0`
+/// prints as `"1"`, not `"1.0"` -- Rust's own `Display` for floats omits a
+/// trailing `.0`, the *same* `print_f32` already does -- so this wouldn't
+/// actually distinguish correct `f32` dispatch from the old, wrong `i32`
+/// default; a fractional value does).
+#[test]
+fn display_of_a_rank_1_tensor_renders_correctly() {
+    let context = context();
+    let src = r#"
+        use display;
+        use linalg;
+        fn main() -> i32 {
+            let t: Tensor<f32, 2> = Tensor::<f32, 2>(data: [1.5, 2.5]);
+            let mut out: DynArray<i8> = dynarray_new(16);
+            out = Display::display(t, out);
+            let expected: [i8; 10] = [91, 49, 46, 53, 44, 32, 50, 46, 53, 93]; // "[1.5, 2.5]"
+            let mut ok: i32 = 1;
+            if out.len() != 10 { ok = 0; };
+            for i in 0..10 {
+                if out.get(i) != expected[i] { ok = 0; };
+            };
+            ok
+        }"#;
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `Display<Tensor<T,R,C>>` (rank 2) -- exact byte-for-byte rendering,
+/// nested brackets -- `print(net.l1.w)`, this whole item's own real
+/// motivating case.
+#[test]
+fn display_of_a_rank_2_tensor_renders_correctly() {
+    let context = context();
+    let src = r#"
+        use display;
+        use linalg;
+        fn main() -> i32 {
+            let t: Tensor<f32, 2, 2> = Tensor::<f32, 2, 2>(data: [[1.5, 2.5], [3.5, 4.5]]);
+            let mut out: DynArray<i8> = dynarray_new(32);
+            out = Display::display(t, out);
+            // "[[1.5, 2.5], [3.5, 4.5]]"
+            let expected: [i8; 24] = [
+                91, 91, 49, 46, 53, 44, 32, 50, 46, 53, 93, 44, 32,
+                91, 51, 46, 53, 44, 32, 52, 46, 53, 93, 93
+            ];
+            let mut ok: i32 = 1;
+            if out.len() != 24 { ok = 0; };
+            for i in 0..24 {
+                if out.get(i) != expected[i] { ok = 0; };
+            };
+            ok
+        }"#;
     assert_eq!(run_i32(&context, src), 1);
 }

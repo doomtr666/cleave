@@ -121,6 +121,76 @@ pub unsafe extern "C" fn print_bytes(ptr: *const u8, len: i64) -> i64 {
     len
 }
 
+/// Writes `len` bytes starting at `buf` to stdout as raw text -- `Print<T>`'s
+/// own scalar/string impls (`stdlib/io/io.cleave`) each hardcode their own
+/// backing extern (`print_i32`, `print_bytes`, ...); the new `Display<T>`-
+/// backed impls (arrays/tensors/tuples of a `Display`-able element type,
+/// `stdlib/display/display.cleave`) all build one `DynArray<i8>` buffer the
+/// identical way regardless of the underlying type, so they share this one
+/// flush primitive instead of each declaring their own. Structurally
+/// identical to `print_bytes` above -- the only real difference is the
+/// argument shape: a `DynArray<i8>`'s own `buf` field is already a bare,
+/// opaque pointer by construction (`RawBuf`'s own doc comment,
+/// `stdlib/dynarray/dynarray.cleave`), not an array-typed value needing
+/// `mlir_lower.rs`'s own array-aware `(ptr,len)` extraction the way
+/// `print_bytes`'s own `[i8;N]` argument does -- passed straight through as
+/// an ordinary opaque-pointer argument instead.
+///
+/// # Safety
+/// `buf` must point to at least `len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn print_dynarray_bytes(buf: *const u8, len: i32) -> i32 {
+    let bytes = unsafe { std::slice::from_raw_parts(buf, len as usize) };
+    use std::io::Write;
+    std::io::stdout()
+        .write_all(bytes)
+        .expect("print_dynarray_bytes: stdout write failed");
+    len
+}
+
+/// Writes `x`'s own decimal `Display` form into `out` (at least 24 bytes,
+/// enough for any `f32`/`f64` this project's own `format!("{x}")` -- the
+/// *same* formatting `print_f32`/`print_f64` above already use, so a float
+/// reads identically whether it reached stdout via the old direct `Print<T>`
+/// path or the new `Display<T>`-composed one -- ever produces), returns the
+/// real byte count written. Backs `Display<f32>`/`Display<f64>`
+/// (`stdlib/display/display.cleave`) -- the one part of `Display<T>` that
+/// genuinely needs a real extern rather than being expressible in ordinary
+/// cleave source (integer digit-extraction is plain arithmetic, easy to
+/// write by hand in cleave; a correct, shortest-round-trip float-to-decimal
+/// algorithm is not something to hand-reimplement). Confirmed directly, not
+/// assumed, that writing through an array-typed extern *argument* (rather
+/// than only ever reading one, every prior array-argument extern in this
+/// codebase's own precedent) is actually visible to cleave code once the
+/// call returns -- a throwaway probe extern, since removed, wrote known
+/// bytes into a `[i8;4]` argument and cleave correctly read them back.
+///
+/// Rust's own unadorned `{}` float `Display` never uses scientific
+/// notation, so a genuinely extreme value (a denormal near `f64::MIN_
+/// POSITIVE`, say) can format to *far* more than 24 bytes -- ordinary
+/// training/inference values (this project's own actual use so far) never
+/// come close, so the buffer stays small for that overwhelmingly common
+/// case; an extreme value is truncated to `CAP` bytes rather than
+/// overflowing the caller's buffer or panicking the whole JIT session, a
+/// real but accepted, honestly-not-round-trippable v1 limitation.
+///
+/// # Safety
+/// `out` must point to at least `CAP` (24) writable bytes.
+macro_rules! format_float {
+    ($name:ident, $ty:ty) => {
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $name(x: $ty, out: *mut u8) -> i32 {
+            const CAP: usize = 24;
+            let s = format!("{x}");
+            let bytes = &s.as_bytes()[..s.len().min(CAP)];
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len()) };
+            bytes.len() as i32
+        }
+    };
+}
+format_float!(format_f32, f32);
+format_float!(format_f64, f64);
+
 /// Backs `stdlib/dynarray/dynarray.cleave`'s `DynArray<T>` -- a real,
 /// growable collection (`doc/backlog.md`'s own former "No dynamic-size
 /// collection" item), built entirely as an ordinary stdlib struct + algebra

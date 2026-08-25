@@ -262,6 +262,22 @@ impl TyVarGen {
         self.0 += 1;
         Ty::Var(v)
     }
+
+    /// Current high-water mark — one past the highest `TyVar` id minted so
+    /// far. Lets a caller chain a *new* `TyVarGen` to start exactly where
+    /// this one left off (`starting_at`, below), so two temporally-adjacent
+    /// but otherwise-independent `Infer` instances never mint the same raw
+    /// id. See `Infer::with_var_counter`'s own doc comment for why this
+    /// matters — found by testing, not a hypothetical.
+    pub fn high_water_mark(&self) -> u32 {
+        self.0
+    }
+
+    /// A generator that starts minting from `start` rather than `0` — see
+    /// `high_water_mark`'s own doc comment.
+    pub fn starting_at(start: u32) -> Self {
+        TyVarGen(start)
+    }
 }
 
 // ---------------------------------------------------------------- substitution
@@ -1251,6 +1267,52 @@ pub(crate) fn free_vars(ty: &Ty, out: &mut HashSet<TyVar>) {
     }
 }
 
+/// Like `free_vars`, but collects only the subset that appear specifically
+/// as `Ty::Pack(v)` (never as a bare `Ty::Var(v)`, `Ty::PackLen(v)`, or
+/// inside an already-`PackResolved` list) — needed by `instantiate_with_
+/// mapping` to know which of `scheme.vars` must be re-minted as a fresh
+/// `Ty::Pack` rather than a fresh `Ty::Var` (see that function's own doc
+/// comment for the real bug this closes). Deliberately a fresh, narrower
+/// scan rather than reusing `free_vars`'s own single merged `HashSet` —
+/// `generalize`'s own free-var scan is correct to merge the two kinds
+/// (`Ty::Pack`'s own doc comment explains why: a pack var is quantified
+/// exactly like an ordinary one, no separate tracking needed *there*), but
+/// re-minting on the way back out through `instantiate` is a genuinely
+/// different question, needing the kind distinction `free_vars` throws away
+/// by design.
+fn collect_pack_vars(ty: &Ty, out: &mut HashSet<TyVar>) {
+    match ty {
+        Ty::Pack(v) => {
+            out.insert(*v);
+        }
+        Ty::Var(_) | Ty::PackLen(_) | Ty::Con(_) | Ty::Const(_) => {}
+        Ty::PackResolved(elems) => {
+            for e in elems {
+                collect_pack_vars(e, out);
+            }
+        }
+        Ty::App(_, args) => {
+            for a in args {
+                collect_pack_vars(a, out);
+            }
+        }
+        Ty::Fn(params, ret) => {
+            for p in params {
+                collect_pack_vars(p, out);
+            }
+            collect_pack_vars(ret, out);
+        }
+        Ty::Array(elem, size) => {
+            collect_pack_vars(elem, out);
+            collect_pack_vars(size, out);
+        }
+        Ty::ConstExpr(_, a, b) => {
+            collect_pack_vars(a, out);
+            collect_pack_vars(b, out);
+        }
+    }
+}
+
 /// The `monomorphize.rs` counterpart to `Subst::apply` — a standalone
 /// function rather than a `Subst` method since its callers hold a bare
 /// `HashMap<TyVar, Ty>` (a template's own concrete instantiation values),
@@ -1939,6 +2001,49 @@ impl<'r> Infer<'r> {
     ) -> Self {
         self.inherent_patterns = Some(patterns);
         self
+    }
+
+    /// Starts this instance's own `TyVar` numbering at `start` instead of
+    /// `0` — builder-style, chains onto `Infer::new` exactly like `with_
+    /// inherent_patterns`. Needed whenever *several, temporally-sequential*
+    /// `Infer` instances feed their own finished output into a shared,
+    /// longer-lived structure that a *later* instance's own live `Subst`
+    /// might still get applied against — `callgraph::infer_program`'s own
+    /// per-SCC-group loop is exactly this: each group gets a fresh `Infer`
+    /// (mutual recursion within a group needs its own clean slate), but
+    /// `generalize`'s own `env_fv` computation (`Infer::generalize`, this
+    /// file) applies *this* instance's `self.subst` to every scheme already
+    /// sitting in `global_env` — schemes built by *earlier* groups' own,
+    /// separate `Infer` instances. Without a shared, monotonically
+    /// increasing counter across the whole loop, every group's `TyVarGen`
+    /// restarts at `0`, so a raw `TyVar` id is *not* a unique identity
+    /// across groups — group B's own fresh `T` can numerically collide with
+    /// some unrelated, still-free (never quantified into its own scheme)
+    /// variable left over in group A's finished `scheme.ty`. When that
+    /// happens, `env_fv` wrongly includes group B's own `T`, `generalize`
+    /// refuses to quantify it, and group B's function is left permanently
+    /// monomorphic at whatever concrete type its *first* call site happened
+    /// to need — found for real via `examples/fibonacci.cleave`, a self-
+    /// recursive generic `fn` called at two different concrete types in the
+    /// same program, which only failed once enough *other* top-level `fn`s
+    /// (pulled in transitively by a `use`) shifted the two groups' own
+    /// independent `TyVarGen` counts into an unlucky collision — genuinely
+    /// nondeterministic-looking from the outside, but entirely explained by
+    /// this. Threading one counter across the whole loop (`TyVarGen::high_
+    /// water_mark`/`starting_at`) removes the collision at its root, rather
+    /// than special-casing `generalize` itself (which is correct as-is for
+    /// its *other* call site, generalizing a `let`-bound lambda against its
+    /// own function's own live, same-instance local `env`).
+    pub fn with_var_counter_starting_at(mut self, start: u32) -> Self {
+        self.vars = TyVarGen::starting_at(start);
+        self
+    }
+
+    /// This instance's own `TyVarGen` high-water mark — see `with_var_
+    /// counter_starting_at`'s own doc comment for why a caller needs this to
+    /// seed the *next*, temporally-adjacent instance.
+    pub fn var_counter(&self) -> u32 {
+        self.vars.high_water_mark()
     }
 
     /// Maps `f`'s own declared generic type parameters (`fn f<T: Int>(x: T)
@@ -3766,10 +3871,40 @@ impl<'r> Infer<'r> {
     /// there would show up as `generic_arg_to_ty`'s unification landing on
     /// the wrong variable rather than a clean rejection.
     fn instantiate_with_mapping(&mut self, scheme: &Scheme) -> (Ty, HashMap<TyVar, Ty>) {
+        // Which of `scheme.vars` are actually pack-kind (`Dims...`-shaped)
+        // generics, not ordinary scalar ones — recovered by scanning `scheme
+        // .ty` itself for `Ty::Pack(v)` occurrences (`collect_pack_vars`,
+        // mirroring `generalize`'s own free-var scan, just narrower), since
+        // `Scheme` deliberately carries no separate per-var kind tag (`Ty::
+        // Pack`'s own doc comment). Needed here specifically: minting every
+        // fresh replacement as a bare `Ty::Var` (`self.vars.fresh()` always
+        // returns one) silently turned a pack-generic top-level `fn`'s own
+        // `Dims` into an ordinary scalar var on *every* re-instantiation —
+        // any single call site still happened to work (nothing yet forced
+        // the corrupted var back into pack shape until unification against
+        // a concrete `Tensor<_, N>` did it structurally), but a *second*
+        // call site at a different rank, in the same program, got its own
+        // fresh-but-still-scalar var, with nothing left to tell monomorphize
+        // it was ever meant to expand into several concrete dims at all —
+        // found for real via a top-level `fn random_fill<T,const Dims...:
+        // i32>(...) -> Tensor<T,Dims...>` called at two different ranks
+        // (`doc/backlog.md`).
+        let mut pack_vars = HashSet::new();
+        collect_pack_vars(&scheme.ty, &mut pack_vars);
         let mapping: HashMap<TyVar, Ty> = scheme
             .vars
             .iter()
-            .map(|v| (*v, self.vars.fresh()))
+            .map(|v| {
+                let Ty::Var(fresh) = self.vars.fresh() else {
+                    unreachable!("TyVarGen::fresh always returns Ty::Var")
+                };
+                let replacement = if pack_vars.contains(v) {
+                    Ty::Pack(fresh)
+                } else {
+                    Ty::Var(fresh)
+                };
+                (*v, replacement)
+            })
             .collect();
         for c in &scheme.constraints {
             self.constraints.push(Constraint {
@@ -3783,9 +3918,12 @@ impl<'r> Infer<'r> {
         // without this, a constraint re-queued just above (against a *fresh*
         // copy of a const generic's own var) would have no way to recover
         // that var's declared width once `check_pending_constraints` runs
-        // again for *this* instantiation.
+        // again for *this* instantiation. A const generic can itself be
+        // variadic (`const Dims...: i32`, exactly the case above), so the
+        // fresh replacement may be a `Ty::Pack` now, not just `Ty::Var` —
+        // both carry the same underlying fresh id, extracted uniformly.
         for (v, width) in &scheme.const_widths {
-            if let Some(Ty::Var(fresh)) = mapping.get(v) {
+            if let Some(Ty::Var(fresh) | Ty::Pack(fresh)) = mapping.get(v) {
                 self.subst.set_const_width(*fresh, width.clone());
             }
         }
@@ -4007,9 +4145,31 @@ impl<'r> Infer<'r> {
                         return true;
                     };
                     let resolved_arg = trial.apply(arg_ty);
-                    bounds.iter().all(|bound| {
-                        self.has_matching_impl(bound, std::slice::from_ref(&resolved_arg))
-                    })
+                    // A still-open `resolved_arg` (a genuinely unconstrained
+                    // `Ty::Var`, not yet pinned to any concrete type) can't
+                    // be meaningfully checked against a bound at all yet —
+                    // "does an unknown type implement X" isn't a real
+                    // question until the type itself is known. Treated
+                    // permissively (bound assumed satisfied), the same
+                    // "nothing to check yet isn't the same as a check that
+                    // failed" posture `check_pending_constraints`'s own doc
+                    // comment already establishes for an identical situation
+                    // one level up. Skipping `has_matching_impl` here
+                    // entirely (not just "it happens to return true") is
+                    // load-bearing, not just an optimization: calling it on
+                    // an unconstrained var, when the bound names an algebra
+                    // with its own candidate impl that *also* bounds
+                    // generically on that same algebra (`impl<T: Wrap, ...>
+                    // Wrap<Tensor<T,N>>`, found building `Display<T>`'s own
+                    // compound impls), recurses into `matching_impls` again
+                    // with *another* fresh, still-unconstrained var for that
+                    // candidate's own bound check — forever, a real,
+                    // confirmed infinite regress (stack overflow), not
+                    // hypothetical.
+                    !is_fully_concrete(&resolved_arg)
+                        || bounds.iter().all(|bound| {
+                            self.has_matching_impl(bound, std::slice::from_ref(&resolved_arg))
+                        })
                 }
                 GenericParam::Const { .. } => true,
             });
@@ -4209,6 +4369,91 @@ impl<'r> Infer<'r> {
         }
         self.subst = matches.into_iter().next().unwrap();
         Ok(true)
+    }
+
+    /// Whether committing `algebra`'s own dispatch against `query` *right
+    /// now* is provably sound even though `query` isn't fully concrete yet
+    /// and we're still mid-declaration of a generic fn/impl (`self.active_
+    /// generics` non-empty — the caller's own `active_vars_pending` case,
+    /// which normally defers unconditionally). Sound exactly when: (a)
+    /// exactly one impl of `algebra` structurally matches `query` at all,
+    /// and (b) every position `query` doesn't yet pin down resolves,
+    /// through that *one* candidate's own trial substitution, to a type
+    /// variable that's *already* one of this declaration's own known-
+    /// symbolic generics — never to a genuinely *new* concrete type the
+    /// candidate itself introduces.
+    ///
+    /// Found and built for `Index<Container,Elem,K>` (`stdlib/linalg/
+    /// tensor.cleave`'s own `impl<T,Dims...> Index<Tensor<T,Dims...>,T>`,
+    /// the *only* impl of `Index` for a `Tensor` — a real, previously-
+    /// latent bug, not hypothetical: `t[0]` inside a still-generic `impl<T,
+    /// N> SomeAlgebra<Tensor<T,N>>`'s own body used to always defer
+    /// (`active_vars_pending`, `Container = Tensor<T,N>` not concrete yet)
+    /// — correctly avoiding a premature commit — but deferring left `Elem`
+    /// (the type of `t[0]`) as a genuinely *orphaned*, never-unified fresh
+    /// variable: nothing about deferring the call also unifies `Elem`
+    /// against `Index`'s own declared target pattern (which *would*
+    /// correctly bind `Elem := T`, the container's own inner argument,
+    /// structurally, regardless of what `T` itself later resolves to). A
+    /// *second* algebra call consuming `t[0]` (any recursive same-algebra
+    /// dispatch on it, the shape `Display<Tensor<T,N>>::display` — `doc/
+    /// backlog.md`'s own "print générique" item — needed) would then see
+    /// `Elem` silently defaulted to `i32` by `apply_defaults`, at the end
+    /// of this same declaration's own body inference, and wrongly commit
+    /// to whatever concrete impl `i32` happens to match — confirmed
+    /// directly via `--dump-cps-optimized`, not guessed: `Display::
+    /// display<Tensor<f32,3>>` itself calling `Display::display<i32>`.
+    ///
+    /// Committing `Elem := T` right now (this method returning `true`) is
+    /// sound precisely *because* `T` is still exactly as open as it always
+    /// was — nothing new is decided, the same openness is just carried
+    /// forward under `Elem`'s own name instead of losing the connection
+    /// entirely. This must stay `false`, deferring exactly like before, for
+    /// `Convert<From,To>`-shaped cases (`stdlib/nn/nn.cleave`'s own `mean`,
+    /// `N.to()`, `active_vars_pending`'s own sibling doc comment) — there,
+    /// even though only *one* `Convert<i32,_>` impl exists today too, its
+    /// own `To` resolves to a genuinely new, independently-declared literal
+    /// (`f64`) with no structural relationship to `From` (`i32`) at all —
+    /// committing early there means guessing an answer a *different* real
+    /// call site (needing `Convert<i32,f32>`, once that impl exists) could
+    /// still legitimately disagree with. The `Ty::Var`-in-`active_generics`
+    /// check below is exactly what tells these two cases apart: `Elem`
+    /// resolves to (an alias of) `T`, already one of `active_generics`'s
+    /// own values; `To` resolves to `f64`, which never was.
+    fn unambiguous_and_preserves_openness(&mut self, algebra: &str, query: &[Ty]) -> bool {
+        let matches = self.matching_impls(algebra, query);
+        let [trial] = matches.as_slice() else {
+            return false;
+        };
+        // `trial`, not `self.subst` — `trial` is `matching_impls`'s own
+        // clone-plus-candidate-bindings, so it alone reflects where each
+        // `active_generics` var's own union-find representative *actually*
+        // ends up once this specific candidate's own bindings are folded
+        // in (`unify`'s own bind direction has no preference for keeping
+        // the *older* variable as representative — found directly: for
+        // `Index<Tensor<T,Dims...>,T>`, the candidate's own fresh `Elem`
+        // var ends up as `T`'s own representative, not the other way
+        // around). Comparing against the older, still-unmerged `self.subst`
+        // here compared two different names for the same equivalence
+        // class and never matched.
+        let mut active_vars: HashSet<TyVar> = HashSet::new();
+        for ty in self.active_generics.clone().values() {
+            free_vars(&trial.apply(ty), &mut active_vars);
+        }
+        // Not just "resolves to a *bare* `Ty::Var` in `active_vars`" —
+        // `Index`'s own `Container` position resolves to a *structured*
+        // type built *from* one (`Tensor<T,N>`, `T`/`N` both still
+        // `active_generics`' own vars, wrapped in `Ty::App`), not a bare
+        // var itself. Safe under the identical reasoning either way: every
+        // free variable the resolved type actually contains is already
+        // one of this declaration's own known-symbolic generics, nothing
+        // genuinely new.
+        query.iter().all(|q| {
+            let resolved = trial.apply(q);
+            let mut resolved_vars = HashSet::new();
+            free_vars(&resolved, &mut resolved_vars);
+            resolved_vars.iter().all(|v| active_vars.contains(v))
+        })
     }
 
     /// Checks every constraint still pending against the registry, once —
@@ -6216,7 +6461,18 @@ impl<'r> Infer<'r> {
         let active_vars_pending =
             !self.active_generics.is_empty() && !resolved_generics.iter().all(is_fully_concrete);
 
-        if gating.iter().any(is_placeholder) || active_vars_pending {
+        // Even mid-declaration, committing now can still be sound — see
+        // `unambiguous_and_preserves_openness`'s own doc comment (the
+        // `Index<Tensor<T,Dims...>,T>` case this exists for). Gated on
+        // `gating` having no outright placeholder first, same as the
+        // ordinary "ready" branch below — nothing to usefully check yet if
+        // an *input* type was never resolved at all.
+        let commit_despite_active_vars = active_vars_pending
+            && gating.iter().all(|g| !is_placeholder(g))
+            && self.unambiguous_and_preserves_openness(algebra, &resolved_generics);
+
+        if gating.iter().any(is_placeholder) || (active_vars_pending && !commit_despite_active_vars)
+        {
             // Either an *input* generic is an outright "unknown" (never
             // type-inferred), or — `active_vars_pending` — we're still
             // checking a still-*generic* fn/impl's own declaration (`self.
@@ -6245,9 +6501,11 @@ impl<'r> Infer<'r> {
                 gating_indices,
                 span: call_span,
             });
-        } else if gating.iter().all(is_fully_concrete) {
+        } else if gating.iter().all(is_fully_concrete) || commit_despite_active_vars {
             // Ready: every *input* generic is known, and we're not
-            // mid-declaration of a still-open generic either, so dispatch
+            // mid-declaration of a still-open generic either (or, per
+            // `commit_despite_active_vars`, we are, but committing now is
+            // still provably sound — see its own doc comment), so dispatch
             // can actually run — commits the match's own bindings for real
             // (see `dispatch_algebra_call`'s own doc comment for why that's
             // sound here specifically), which is what lets an output-only

@@ -1,0 +1,239 @@
+// A real, composable textual representation, decoupled from the *effect*
+// of printing it (`stdlib/io/io.cleave`'s own `Print<T>`, still the only
+// thing that ever touches stdout) -- the Rust `Display`/`println!` split.
+// `display(x, out)` appends `x`'s own decimal/bracketed form onto `out` (a
+// growable `DynArray<i8>`, `stdlib/dynarray/dynarray.cleave` -- mutated in
+// place, since a struct is always a shared heap reference in this
+// language, same "no threading needed, just call `.push` and let the
+// caller's own value change" reasoning `DynArray<T>::push` itself already
+// relies on) and returns it, matching `Print<T>`'s own "operate, return
+// unchanged" contract so a caller can chain (`out = Display::display(a,
+// out); out = Display::display(b, out);`).
+use dynarray;
+use linalg;
+
+algebra Display<T> {
+    fn display(x: T, out: DynArray<i8>) -> DynArray<i8>;
+}
+
+// `i32` only, deliberately -- not `i8`/`i16`/`i64` too. The digit-extraction
+// loop below needs each digit (0-9, always in range) turned into an *array
+// index* to look it up in a literal `[i8;10]` ASCII table -- indexing
+// always takes an `i32`, so this only comes out even (no cast needed
+// anywhere) when the value being formatted is *itself* already `i32`
+// (`x - (x/10)*10` stays `i32`-typed throughout, no conversion). For any
+// other integer width, that same digit value would need a real int-to-int
+// conversion first (`i64 -> i32` to index the table, or `i32 -> i8` to
+// narrow the final ASCII byte) -- and `stdlib/convert/convert.cleave`
+// today has *no* integer-to-integer `Convert<From,To>` impls at all, only
+// int-to-float ones. Confirmed directly, not assumed, that the obvious
+// escape hatch doesn't help either: `mlir::arith::trunci` fails MLIR
+// verification through this project's own raw-op lowering (`'arith.trunci'
+// op operand type 'i8' and result type 'i8' are cast incompatible` --
+// `lower_raw_mlir_op`'s own operand-type-inference heuristic guesses the
+// *result* type for the operand too, wrong for any op where they
+// genuinely differ, unlike every existing `mlir::arith::...` call this
+// stdlib already relies on). A real, separate gap -- `i8`/`i16`/`i64`
+// `Display` needs real integer-narrowing/widening `Convert` impls (and
+// possibly a `lower_raw_mlir_op` fix) first, logged in `doc/backlog.md`,
+// not attempted here. `i32`/`f32`/`f64` alone already cover this item's
+// own real motivation (`print`ing an `f32` `Tensor`).
+fn display_digits_i32(x: i32, mut out: DynArray<i8>) {
+    if x >= 10 { display_digits_i32(x / 10, out); };
+    let d: i32 = x - (x / 10) * 10;
+    let digits: [i8; 10] = [48, 49, 50, 51, 52, 53, 54, 55, 56, 57];
+    out.push(digits[d]);
+}
+
+impl Display<i32> {
+    fn display(x, mut out) {
+        if x < 0 {
+            out.push(45); // '-'
+            // `0 - i32::MIN` overflows (unrepresentable) -- a real, known,
+            // accepted edge case, not attempted here; every practical value
+            // this project actually formats (weights, gradients, indices)
+            // is nowhere near it.
+            display_digits_i32(mlir::arith::subi(0, x), out);
+        } else {
+            display_digits_i32(x, out);
+        };
+        out
+    }
+}
+
+// `f32`/`f64`: the one real extern this whole item needs -- a correct,
+// shortest-round-trip decimal formatter isn't reasonable to hand-roll in
+// cleave source. `format_f32`/`format_f64` (`cleave-rt`) write into a
+// fixed, caller-owned `[i8;24]` (confirmed directly that an extern can
+// write through an array-typed *argument*, not just read one, before this
+// was built on top of it), returning the real byte count; copied one byte
+// at a time into the real, growable `out` via the already-proven
+// `DynArray<i8>::push`. Uses the *exact* `format!("{x}")` `print_f32`/
+// `print_f64` themselves already use, so a float reads identically
+// whether it reaches stdout via the old direct `Print<T>` path or this new
+// `Display<T>`-composed one.
+extern fn format_f32(x: f32, out: [i8; 24]) -> i32;
+extern fn format_f64(x: f64, out: [i8; 24]) -> i32;
+
+impl Display<f32> {
+    fn display(x, mut out) {
+        let buf: [i8; 24] = [0; 24];
+        let n: i32 = format_f32(x, buf);
+        for i in 0..n { out.push(buf[i]); };
+        out
+    }
+}
+impl Display<f64> {
+    fn display(x, mut out) {
+        let buf: [i8; 24] = [0; 24];
+        let n: i32 = format_f64(x, buf);
+        for i in 0..n { out.push(buf[i]); };
+        out
+    }
+}
+
+// Ordinary fixed arrays -- `T != i8` deliberately: `[i8;N]` already means
+// "a string" (`Print<[i8;N]>`, `stdlib/io/io.cleave`) -- raw bytes, no
+// brackets/commas -- and this project has no separate `String` type to
+// tell the two meanings apart at the type level, so a numeric `[i8;N]`
+// display is not attempted here (would collide with the existing string
+// impl's own target the moment `Display<i8>` existed too, which it
+// doesn't, deliberately, above).
+// The first element is printed *before* the loop, which then only ever
+// runs `1..N` -- deliberately, not `0..N` with an `if i > 0` guard around
+// the separator. Found by direct testing, a real, separate, deeper
+// compiler bug, logged in `doc/backlog.md`, not fixed here: a `for` loop's
+// own index variable, when the range's *upper bound* is itself a generic
+// const parameter (`R`/`N`/... here, not a literal or a concrete-at-this-
+// point value), is sometimes typed as that const's own *resolved value*
+// instead of `i32` the moment it's used in an arithmetic or comparison
+// expression directly (`i > 0`, `acc + i`) -- confirmed via a minimal,
+// Display-independent repro (`for i in 0..R { if i > 0 {...} }` inside a
+// plain generic top-level `fn`, nothing to do with this file). Using the
+// index *only* to index an array (`x[i]`), never in arithmetic/comparison,
+// is unaffected -- already proven safe throughout this codebase (`Dense`'s
+// own init loops, `examples/convex_hull.cleave`) -- so restructuring to
+// avoid the one unsafe use entirely sidesteps it cleanly, arguably a more
+// idiomatic join-style rendering anyway (empty-array-N=0 not handled,
+// an accepted, narrow edge case no real caller hits).
+impl<T: Display, const N: i32> Display<[T; N]> {
+    fn display(x, mut out) {
+        out.push(91); // '['
+        out = Display::display(x[0], out);
+        for i in 1..N {
+            out.push(44); // ','
+            out.push(32); // ' '
+            out = Display::display(x[i], out);
+        };
+        out.push(93); // ']'
+        out
+    }
+}
+
+// `Tensor<T,N>` (rank 1) and `Tensor<T,R,C>` (rank 2) -- not pack-generic
+// over `Dims...`, same reason `Sum`/`Mean`/`Max` (`stdlib/nn/nn.cleave`)
+// never generalized past a concrete rank either: a per-element walk needs
+// a compile-time-known index *count*. Rank 2 specifically because `Dense.
+// w`/`Dense.b` are rank 2 -- `print(net.l1.w)`, this item's own real
+// motivating case. Same "first element before the loop, then `1..N`"
+// restructuring as `Display<[T;N]>` above, same reason.
+//
+// This used to be silently broken -- `Display::display(x[i], out)`'s own
+// recursive dispatch always resolved to `Display::display<i32>` regardless
+// of `T`'s real value, root-caused for real (`doc/backlog.md` has the full
+// story): `x[i]`'s own type comes from `Index<Tensor<T,Dims...>,T>`, an
+// *algebra* dispatch (unlike an ordinary array's direct `PrimOp::Load`) —
+// while `T` is still abstract (mid-declaration of this very impl), that
+// dispatch correctly *deferred*, but deferring left `Index`'s own output-
+// only `Elem` generic (`x[i]`'s own type) as a genuinely orphaned fresh
+// variable, never unified with `T` at all, silently defaulted to `i32` by
+// the time a *second* dispatch (`Display::display` on it) needed a
+// concrete answer. Fixed at the root, not worked around: `Infer::
+// infer_algebra_call` (`cleave/src/infer.rs`) now recognizes that
+// committing a deferred dispatch immediately is still sound whenever
+// exactly one impl matches *and* every position it would newly pin down
+// resolves only to variables `self.active_generics` already owns —
+// `Elem := T` is exactly this (the same openness carried forward under a
+// new name, no new guess), unlike `Convert<From,To>`'s own genuinely
+// context-dependent case, which still correctly defers.
+impl<T: Display, const N: i32> Display<Tensor<T, N>> {
+    fn display(x, mut out) {
+        out.push(91);
+        out = Display::display(x[0], out);
+        for i in 1..N {
+            out.push(44);
+            out.push(32);
+            out = Display::display(x[i], out);
+        };
+        out.push(93);
+        out
+    }
+}
+impl<T: Display, const R: i32, const C: i32> Display<Tensor<T, R, C>> {
+    fn display(x, mut out) {
+        out.push(91);
+        out.push(91);
+        out = Display::display(x[0, 0], out);
+        for j in 1..C {
+            out.push(44);
+            out.push(32);
+            out = Display::display(x[0, j], out);
+        };
+        out.push(93);
+        for i in 1..R {
+            out.push(44);
+            out.push(32);
+            out.push(91);
+            out = Display::display(x[i, 0], out);
+            for j in 1..C {
+                out.push(44);
+                out.push(32);
+                out = Display::display(x[i, j], out);
+            };
+            out.push(93);
+        };
+        out.push(93);
+        out
+    }
+}
+
+// Mirrors `Print<(A,B)>`/`(A,B,C)`/`(A,B,C,D)` (`stdlib/io/io.cleave`)
+// exactly -- comma-separated, no brackets (a tuple isn't a homogeneous
+// collection the way an array/tensor is, so it reads more like "several
+// values" than "one bracketed thing").
+impl<A: Display, B: Display> Display<(A, B)> {
+    fn display(x, mut out) {
+        out = Display::display(x.0, out);
+        out.push(44);
+        out.push(32);
+        out = Display::display(x.1, out);
+        out
+    }
+}
+impl<A: Display, B: Display, C: Display> Display<(A, B, C)> {
+    fn display(x, mut out) {
+        out = Display::display(x.0, out);
+        out.push(44);
+        out.push(32);
+        out = Display::display(x.1, out);
+        out.push(44);
+        out.push(32);
+        out = Display::display(x.2, out);
+        out
+    }
+}
+impl<A: Display, B: Display, C: Display, D: Display> Display<(A, B, C, D)> {
+    fn display(x, mut out) {
+        out = Display::display(x.0, out);
+        out.push(44);
+        out.push(32);
+        out = Display::display(x.1, out);
+        out.push(44);
+        out.push(32);
+        out = Display::display(x.2, out);
+        out.push(44);
+        out.push(32);
+        out = Display::display(x.3, out);
+        out
+    }
+}

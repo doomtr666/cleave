@@ -387,7 +387,8 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                     .chain(d.extra_targets.iter().cloned())
                     .collect();
                 for f in &d.fns {
-                    let mut infer = Infer::new(registry);
+                    let mut infer = Infer::new(registry)
+                        .with_inherent_patterns(&program_inference.inherent_patterns);
                     let Ok(ret) = infer.infer_impl_fn_generic_with_env(
                         &program_inference.global_env,
                         &d.algebra,
