@@ -417,9 +417,23 @@ mlir_attr = { ident ~ ":" ~ string_lit }
 // `doc/grammar.md`'s own `params`-style section already documents for
 // other constructs -- no new runtime representation of its own. No
 // ambiguity with `mlir_attr` above: a bare string literal in expression
-// position never has a leading `ident ~ ":"` to compete over. No escape
-// sequences yet -- a real, independent follow-up, not attempted here.
-string_lit = @{ "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
+// position never has a leading `ident ~ ":"` to compete over. `"\\" ~ ANY`
+// tried before the plain `!"\"" ~ ANY` fallback -- a `\` consumes whatever
+// character follows it unconditionally (so `\"` inside the string doesn't
+// end it early), leaving *which* escapes are actually meaningful (`\n`,
+// `\t`, ...) to `lower.rs::decode_escapes`, not this grammar; an
+// unrecognized one is a lowering-time error, same posture `array_repeat`'s
+// own count check already takes for a different structurally-valid-but-
+// semantically-malformed literal.
+string_lit = @{ "\"" ~ ( "\\" ~ ANY | !"\"" ~ ANY )* ~ "\"" }
+// `'a'`/`'\n'` -- a byte literal, not a Unicode `char` (this compiler has
+// no text-encoding stance beyond raw bytes anywhere else, `lower_string_
+// lit`'s own doc comment). Exactly one character-or-escape between the
+// quotes (no `*`/`+` the way `string_lit` has) -- a raw, un-escaped multi-
+// byte UTF-8 character is the one shape this grammar can't reject on its
+// own; `lower.rs::lower_char_lit` catches it once `decode_escapes` doesn't
+// produce exactly one byte.
+char_lit = @{ "'" ~ ( "\\" ~ ANY | !"'" ~ ANY ) ~ "'" }
 
 // `fibonacci::<f64>(x)` / `Matrix::<f64, 4, 4>(values: ...)` — explicit type/const-generic
 // arguments at a call or struct-construction site, for when nothing about the arguments
@@ -493,7 +507,7 @@ array_repeat = { expr ~ ";" ~ (numeric_lit | pack_ref | ident) }
 array_list   = { expr ~ ("," ~ expr)* }
 
 // ---------------------------------------------------------------- literals
-literal = { imaginary_lit | numeric_lit | bool_lit | string_lit }
+literal = { imaginary_lit | numeric_lit | bool_lit | char_lit | string_lit }
 
 // digits, optional fraction, optional exponent — int vs. float is a semantic
 // distinction (presence of '.'/exponent), not a separate grammar production,

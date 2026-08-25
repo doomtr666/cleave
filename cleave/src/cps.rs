@@ -301,6 +301,52 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                     continue;
                 };
                 let keys = mono.specializations_of(&f.name);
+                // `keys.is_empty()` alone is *not* the same thing as "non-
+                // generic" -- it also holds for a genuinely generic `fn`
+                // that simply has no call sites anywhere in the program (no
+                // instantiation was ever requested, so `mono.specializations_
+                // of` has nothing to report). Building a unit directly from
+                // `fn_result`/`program_inference.node_types` in that case
+                // bakes in whatever still-open type variables its own
+                // declaration-time inference left behind ('a, unresolved) --
+                // `resolve_call` then panics the moment CPS conversion tries
+                // to resolve a call inside that body against them (`could
+                // not resolve call to ...`, an unresolved-var key that never
+                // matches anything in `call_index`). Found for real: no
+                // top-level generic `fn` in this codebase had ever gone
+                // uncalled before `println<T: Print>` (`stdlib/io/io.cleave`)
+                // -- a real, generally-useful helper with no reason every
+                // program using `io` would necessarily call it. The correct
+                // outcome for an uncalled generic `fn` is exactly the same
+                // as for an uncalled non-generic one that was never reached
+                // either: no unit at all, nothing to compile.
+                //
+                // Checked directly against `fn_result`'s own resolved
+                // `param_types`/`result` (not `program_inference.global_env`'s
+                // own stored `scheme.vars`) -- found necessary, not just a
+                // style choice: an `export fn` with an entirely empty,
+                // implicit-unit body (`export fn touch(x: i32) { }`) can
+                // legitimately end up with a *non-empty* `scheme.vars` (its
+                // own return-type var gets quantified by `generalize` before
+                // that same group's own later unification pins it to `()`,
+                // a real, separate, pre-existing quirk in how `callgraph::
+                // infer_program` resolves an implicit-unit return -- not
+                // this bug, not fixed here) despite `fn_result` itself
+                // already being fully concrete by the time this file ever
+                // sees it. `fn_result` is what this file actually builds the
+                // unit from, so it's what needs checking.
+                let is_open = fn_result
+                    .param_types
+                    .iter()
+                    .chain(std::iter::once(&fn_result.result))
+                    .any(|t| {
+                        let mut vars = std::collections::HashSet::new();
+                        crate::infer::free_vars(t, &mut vars);
+                        !vars.is_empty()
+                    });
+                if keys.is_empty() && is_open {
+                    continue;
+                }
                 if keys.is_empty() {
                     // Non-generic. A bodyless top-level `fn` is rejected by
                     // `callgraph::infer_program` itself (`MissingFnBody`) --

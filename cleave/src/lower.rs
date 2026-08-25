@@ -1206,6 +1206,7 @@ impl Lowerer {
             Rule::imaginary_lit => self.lower_imaginary_lit(inner),
             Rule::numeric_lit => self.lower_numeric_lit(inner),
             Rule::bool_lit => self.lower_bool_lit(inner),
+            Rule::char_lit => self.lower_char_lit(inner),
             Rule::string_lit => self.lower_string_lit(inner),
             r => unreachable!("literal: unexpected rule {r:?}"),
         }
@@ -1214,17 +1215,18 @@ impl Lowerer {
     /// Full erasure at lowering time, no `ExprKind` of its own — mirrors
     /// `lower_array_lit`'s own literal-`N` `array_repeat` case exactly: a
     /// string literal becomes an ordinary `ArrayLit` of `i8`-suffixed
-    /// `NumberLit`s, one per UTF-8 byte (not `char` — nothing elsewhere in
-    /// this compiler has any text-encoding stance to contradict). Each
-    /// byte gets its own fresh `Expr`/`NodeId` via `self.wrap`, the same
-    /// "every node is unique per occurrence" reasoning `array_repeat`'s own
-    /// copies already need (`node_types` is keyed by `NodeId`).
+    /// `NumberLit`s, one per byte (not `char` — nothing elsewhere in this
+    /// compiler has any text-encoding stance to contradict), *after*
+    /// `decode_escapes` resolves any `\n`/`\t`/... first. Each byte gets its
+    /// own fresh `Expr`/`NodeId` via `self.wrap`, the same "every node is
+    /// unique per occurrence" reasoning `array_repeat`'s own copies already
+    /// need (`node_types` is keyed by `NodeId`).
     fn lower_string_lit(&mut self, pair: Pair<Rule>) -> Expr {
         let span = self.span_of(&pair);
         let text = pair.as_str();
         let content = &text[1..text.len() - 1]; // strip the surrounding quotes
-        let elems = content
-            .bytes()
+        let elems = decode_escapes(content)
+            .into_iter()
             .map(|b| {
                 self.wrap(
                     span,
@@ -1236,6 +1238,38 @@ impl Lowerer {
             })
             .collect();
         self.wrap(span, ExprKind::ArrayLit(elems))
+    }
+
+    /// `'a'`/`'\n'` — full erasure at lowering time too, exactly like
+    /// `lower_string_lit`'s own "no `ExprKind` of its own" posture: sugar
+    /// for a plain `i8`-suffixed `NumberLit`, nothing new for the rest of
+    /// the compiler to learn about (inference, CPS, MLIR lowering all see
+    /// an ordinary suffixed integer literal, same as writing `10:i8` by
+    /// hand). Reuses the exact same `decode_escapes` a string literal's own
+    /// content goes through; `char_lit`'s own grammar already guarantees
+    /// exactly one character-or-escape between the quotes, so decoding must
+    /// land on exactly one byte — a raw, un-escaped multi-byte UTF-8
+    /// character is the one shape the grammar can't reject on its own,
+    /// caught here instead.
+    fn lower_char_lit(&mut self, pair: Pair<Rule>) -> Expr {
+        let span = self.span_of(&pair);
+        let text = pair.as_str();
+        let content = &text[1..text.len() - 1]; // strip the surrounding quotes
+        let bytes = decode_escapes(content);
+        let [byte] = bytes.as_slice() else {
+            panic!(
+                "char literal {text} is {} bytes, not 1 -- multi-byte characters aren't \
+                 supported (this compiler has no text-encoding stance beyond raw bytes)",
+                bytes.len()
+            );
+        };
+        self.wrap(
+            span,
+            ExprKind::NumberLit {
+                text: byte.to_string(),
+                suffix: Some("i8".to_string()),
+            },
+        )
     }
 
     fn lower_bool_lit(&mut self, pair: Pair<Rule>) -> Expr {
@@ -1279,4 +1313,52 @@ fn split_type_suffix(text: &str) -> (&str, Option<String>) {
         Some(idx) => (&text[..idx], Some(text[idx + 1..].to_string())),
         None => (text, None),
     }
+}
+
+/// Decodes the standard backslash escapes this project supports (`\n`,
+/// `\t`, `\r`, `\\`, `\"`, `\'`, `\0`) inside a string/char literal's own
+/// already-quote-stripped content — shared by `lower_string_lit` and
+/// `lower_char_lit`. Grammar alone only guarantees a `\` is followed by
+/// *some* character (`string_lit`/`char_lit`'s own `"\\" ~ ANY` arm), not
+/// that it's one of these; an unrecognized escape is a hard compile-time
+/// error (`panic!`, matching this file's own existing convention for a
+/// structurally-valid-but-semantically-malformed literal — `lower_array_
+/// lit`'s own array-repeat count check, above, takes the identical
+/// posture). Byte-oriented throughout (`u8`, not `char`) — matches `lower_
+/// string_lit`'s own pre-existing "not `char` — nothing elsewhere in this
+/// compiler has any text-encoding stance to contradict" byte-per-`NumberLit`
+/// design; an un-escaped character passes through as its own raw UTF-8
+/// bytes unchanged (this function only ever *interprets* an explicit `\`,
+/// never touches anything else) — exactly how an ordinary string literal
+/// already behaved before escapes existed at all, still true for any byte
+/// that isn't part of an escape sequence.
+fn decode_escapes(content: &str) -> Vec<u8> {
+    let bytes = content.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            let Some(&next) = bytes.get(i + 1) else {
+                panic!("literal {content:?} ends with a bare trailing '\\'");
+            };
+            out.push(match next {
+                b'n' => b'\n',
+                b't' => b'\t',
+                b'r' => b'\r',
+                b'\\' => b'\\',
+                b'"' => b'"',
+                b'\'' => b'\'',
+                b'0' => 0,
+                other => panic!(
+                    "unrecognized escape sequence '\\{}' in {content:?} -- supported: \\n \\t \\r \\\\ \\\" \\' \\0",
+                    other as char
+                ),
+            });
+            i += 2;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    out
 }

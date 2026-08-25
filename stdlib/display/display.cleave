@@ -41,14 +41,14 @@ algebra Display<T> {
 fn display_digits_i32(x: i32, mut out: DynArray<i8>) {
     if x >= 10 { display_digits_i32(x / 10, out); };
     let d: i32 = x - (x / 10) * 10;
-    let digits: [i8; 10] = [48, 49, 50, 51, 52, 53, 54, 55, 56, 57];
+    let digits: [i8; 10] = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
     out.push(digits[d]);
 }
 
 impl Display<i32> {
     fn display(x, mut out) {
         if x < 0 {
-            out.push(45); // '-'
+            out.push('-');
             // `0 - i32::MIN` overflows (unrepresentable) -- a real, known,
             // accepted edge case, not attempted here; every practical value
             // this project actually formats (weights, gradients, indices)
@@ -118,14 +118,14 @@ impl Display<f64> {
 // an accepted, narrow edge case no real caller hits).
 impl<T: Display, const N: i32> Display<[T; N]> {
     fn display(x, mut out) {
-        out.push(91); // '['
+        out.push('[');
         out = Display::display(x[0], out);
         for i in 1..N {
-            out.push(44); // ','
-            out.push(32); // ' '
+            out.push(',');
+            out.push(' ');
             out = Display::display(x[i], out);
         };
-        out.push(93); // ']'
+        out.push(']');
         out
     }
 }
@@ -158,41 +158,41 @@ impl<T: Display, const N: i32> Display<[T; N]> {
 // context-dependent case, which still correctly defers.
 impl<T: Display, const N: i32> Display<Tensor<T, N>> {
     fn display(x, mut out) {
-        out.push(91);
+        out.push('[');
         out = Display::display(x[0], out);
         for i in 1..N {
-            out.push(44);
-            out.push(32);
+            out.push(',');
+            out.push(' ');
             out = Display::display(x[i], out);
         };
-        out.push(93);
+        out.push(']');
         out
     }
 }
 impl<T: Display, const R: i32, const C: i32> Display<Tensor<T, R, C>> {
     fn display(x, mut out) {
-        out.push(91);
-        out.push(91);
+        out.push('[');
+        out.push('[');
         out = Display::display(x[0, 0], out);
         for j in 1..C {
-            out.push(44);
-            out.push(32);
+            out.push(',');
+            out.push(' ');
             out = Display::display(x[0, j], out);
         };
-        out.push(93);
+        out.push(']');
         for i in 1..R {
-            out.push(44);
-            out.push(32);
-            out.push(91);
+            out.push(',');
+            out.push(' ');
+            out.push('[');
             out = Display::display(x[i, 0], out);
             for j in 1..C {
-                out.push(44);
-                out.push(32);
+                out.push(',');
+                out.push(' ');
                 out = Display::display(x[i, j], out);
             };
-            out.push(93);
+            out.push(']');
         };
-        out.push(93);
+        out.push(']');
         out
     }
 }
@@ -204,8 +204,8 @@ impl<T: Display, const R: i32, const C: i32> Display<Tensor<T, R, C>> {
 impl<A: Display, B: Display> Display<(A, B)> {
     fn display(x, mut out) {
         out = Display::display(x.0, out);
-        out.push(44);
-        out.push(32);
+        out.push(',');
+        out.push(' ');
         out = Display::display(x.1, out);
         out
     }
@@ -213,11 +213,11 @@ impl<A: Display, B: Display> Display<(A, B)> {
 impl<A: Display, B: Display, C: Display> Display<(A, B, C)> {
     fn display(x, mut out) {
         out = Display::display(x.0, out);
-        out.push(44);
-        out.push(32);
+        out.push(',');
+        out.push(' ');
         out = Display::display(x.1, out);
-        out.push(44);
-        out.push(32);
+        out.push(',');
+        out.push(' ');
         out = Display::display(x.2, out);
         out
     }
@@ -225,14 +225,14 @@ impl<A: Display, B: Display, C: Display> Display<(A, B, C)> {
 impl<A: Display, B: Display, C: Display, D: Display> Display<(A, B, C, D)> {
     fn display(x, mut out) {
         out = Display::display(x.0, out);
-        out.push(44);
-        out.push(32);
+        out.push(',');
+        out.push(' ');
         out = Display::display(x.1, out);
-        out.push(44);
-        out.push(32);
+        out.push(',');
+        out.push(' ');
         out = Display::display(x.2, out);
-        out.push(44);
-        out.push(32);
+        out.push(',');
+        out.push(' ');
         out = Display::display(x.3, out);
         out
     }

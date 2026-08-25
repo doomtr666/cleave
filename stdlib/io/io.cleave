@@ -128,3 +128,20 @@ impl<T: Display, const R: i32, const C: i32> Print<Tensor<T, R, C>> {
         x
     }
 }
+
+// `print`'s own trailing-newline counterpart -- a single, ordinary generic
+// `fn` bound on `Print` itself, not a parallel `Println<T>` algebra with its
+// own impl per type: `print(x)` already dispatches correctly for *any* `T`
+// with a `Print<T>` impl, so wrapping it once, generically, covers every
+// existing and future `Print<T>` impl automatically, with zero boilerplate
+// duplicated per type (unlike `Print<T>` itself, which genuinely needs one
+// impl per width -- each binds a *different* backing extern; `println` binds
+// none of its own). `print(['\n'])` reuses the *existing* `Print<[i8;N]>`
+// impl above to write the single newline byte -- no new runtime symbol
+// needed, matching this project's own "extend through the existing algebra
+// mechanism, not a new primitive" discipline.
+fn println<T: Print>(x: T) -> T {
+    print(x);
+    print(['\n']);
+    x
+}

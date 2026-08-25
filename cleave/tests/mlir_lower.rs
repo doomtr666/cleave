@@ -5,6 +5,7 @@ use cleave::cps::{
 use cleave::driver::compile;
 use cleave::egraph::{DerivativeRequest, optimize_program, synthesize_derivatives};
 use cleave::mlir_lower::lower_program;
+use cleave::pipeline::check_type_errors;
 use cleave::registry::Registry;
 use melior::Context;
 use melior::dialect::DialectRegistry;
@@ -230,10 +231,24 @@ fn a_compiled_program_actually_runs_and_returns_the_right_value() {
 /// to_llvm` *does* know how to translate. Skipping this produced a hard
 /// native crash (`STATUS_ACCESS_VIOLATION`), not a clean Rust-level error --
 /// found by direct testing, same fix applied in `main.rs`'s own `--run`.
+///
+/// `check_type_errors` runs first, exactly like every one of `main.rs`'s own
+/// `--run`/`--emit-*` call sites already do -- `doc/backlog.md`'s own former
+/// "`run_i32` skips `check_type_errors`" entry: without it, a genuinely
+/// invalid test source (one whose own error a per-function inference pass
+/// doesn't happen to catch -- `TypeErrorKind::VariadicStructNeedsTurbofish`
+/// was the one found by direct testing) reached CPS/MLIR lowering anyway and
+/// crashed the *whole test binary* natively (`Symbols not found`,
+/// `STATUS_STACK_BUFFER_OVERRUN`) instead of failing cleanly as just that one
+/// test. A clean `panic!` here reports the real diagnostic and fails only
+/// the calling test, matching every other assertion failure in this file.
 fn run_i32(context: &Context, src: &str) -> i32 {
     let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let registry = Registry::build(&program);
+    if let Err(diags) = check_type_errors(&program, &registry) {
+        panic!("type check failed: {diags:?}");
+    }
     let units = collect_units(&program, &registry);
     // `fprime = derive(f);` (`doc/backlog.md`'s own auto-diff item) needs
     // `synthesize_derivatives` run right after `convert_program` -- mirrors
@@ -1015,6 +1030,70 @@ fn a_string_literal_printed_via_print_writes_the_right_bytes_to_stdout() {
             .expect("JIT invocation must succeed");
     }
     assert_eq!(out, 0);
+}
+
+/// A generic top-level `fn` with *no call site anywhere in the program*
+/// used to crash CPS conversion outright (`could not resolve call to ...`,
+/// an unresolved-type-variable key never matching anything in `call_index`)
+/// -- found for real adding `println<T: Print>` (`stdlib/io/io.cleave`) to
+/// the prelude-adjacent `io` crate: no top-level generic `fn` in this
+/// codebase had ever gone genuinely uncalled before (every prior one was
+/// always reached from *some* test/example), so `cps.rs::collect_units`'s
+/// own `keys.is_empty()` check -- meant to detect "non-generic, no
+/// instantiations to iterate, build one direct unit" -- had never been
+/// exercised against a function that was *also* generic, where
+/// `keys.is_empty()` is equally true for the completely different reason
+/// "genuinely generic, simply never called." Fixed by additionally checking
+/// `fn_result`'s own concreteness before treating a `keys.is_empty()` fn as
+/// buildable directly. This test's own `unused<T: Print>` is never called
+/// anywhere in `main` -- its only job is to exist, uncalled, alongside a
+/// program that otherwise runs fine.
+#[test]
+fn an_uncalled_generic_top_level_fn_does_not_crash_compilation() {
+    let context = context();
+    let src = "
+        use io;
+        fn unused<T: Print>(x: T) -> T {
+            print(x)
+        }
+        fn main() -> i32 {
+            print(1);
+            0
+        }";
+    assert_eq!(run_i32(&context, src), 0);
+}
+
+/// `'x'`/`'\n'` -- a char literal is full erasure at lowering time (`lower.
+/// rs::lower_char_lit`), sugar for a plain `i8`-suffixed `NumberLit`; end to
+/// end, it must behave *exactly* like writing the byte value out by hand.
+#[test]
+fn a_char_literal_evaluates_to_its_ascii_byte_value() {
+    let context = context();
+    let src = "
+        fn main() -> i32 {
+            let a: i8 = 'x';
+            let n: i8 = '\\n';
+            let bs: i8 = '\\\\';
+            let q: i8 = '\\'';
+            if a == 120:i8 and n == 10:i8 and bs == 92:i8 and q == 39:i8 { 1 } else { 0 }
+        }";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// A string literal's own escapes (`\n`/`\t`/`\\`/`\"`) decode to their real
+/// byte values end to end, not just at the AST level (`tests/lower.rs`'s own
+/// `string_literal_escapes_decode_to_their_real_byte_values` covers that
+/// half) -- indexed directly as the `[i8; N]` array a string literal always
+/// desugars to.
+#[test]
+fn a_string_literal_with_escapes_indexes_to_the_right_decoded_bytes() {
+    let context = context();
+    let src = r#"
+        fn main() -> i32 {
+            let s: [i8; 4] = "a\tb\n";
+            if s[0] == 97:i8 and s[1] == 9:i8 and s[2] == 98:i8 and s[3] == 10:i8 { 1 } else { 0 }
+        }"#;
+    assert_eq!(run_i32(&context, src), 1);
 }
 
 #[test]

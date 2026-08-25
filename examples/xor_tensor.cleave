@@ -97,9 +97,27 @@ fn main() -> i32 {
     let x2s: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
     let ys: [f32; 4] = [0.0, 1.0, 1.0, 0.0];
 
-    print("training...");
+    println("training...");
     for step in 0..4000 {
-        let i: i32 = step - (step / 4) * 4;
+        let i: i32 = rem(step, 4);
+        // Checkpoint every 500 steps: the *total* loss across all four XOR
+        // points (not just `loss(x1s[i], ...)`, this step's own single
+        // example -- SGD cycles through one point at a time, so that alone
+        // would read as noisy, not a real convergence curve), a plain sum
+        // of four `loss` calls against the network's current weights,
+        // *before* this step's own update -- cheap (four extra forward
+        // passes every 500 steps, not every step) and a real, direct
+        // observation of what the training loop is actually driving down.
+        if rem(step, 500) == 0 {
+            let total_loss = loss(x1s[0], x2s[0], ys[0], net)
+                + loss(x1s[1], x2s[1], ys[1], net)
+                + loss(x1s[2], x2s[2], ys[2], net)
+                + loss(x1s[3], x2s[3], ys[3], net);
+            print("step ");
+            print(step);
+            print(" loss ");
+            println(total_loss);
+        };
         // `grad`'s own returned Jacobian has one entry per `loss` parameter,
         // in declared order -- `g.0`/`g.1`/`g.2` are the unused partials
         // w.r.t. the data (`x1`, `x2`, `y`), `g.3` is the real one: a whole
@@ -110,12 +128,12 @@ fn main() -> i32 {
         net = r.0;
         state = r.1;
     };
-    print("done !");
+    println("done !");
 
     // Expected: close to 0, 1, 1, 0.
-    print(forward(0.0, 0.0, net));
-    print(forward(0.0, 1.0, net));
-    print(forward(1.0, 0.0, net));
-    print(forward(1.0, 1.0, net));
+    println(forward(0.0, 0.0, net));
+    println(forward(0.0, 1.0, net));
+    println(forward(1.0, 0.0, net));
+    println(forward(1.0, 1.0, net));
     0
 }

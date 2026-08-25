@@ -17,39 +17,52 @@
 //! `export fn` call site anywhere could actually resolve against the real
 //! symbol by its plain name.
 
+// No trailing newline -- `print`/`Print<T>` (`stdlib/io/io.cleave`) writes
+// exactly the bytes its argument's own decimal form is, nothing more, the
+// same "operate, return unchanged" contract `print_bytes`/
+// `print_dynarray_bytes` (below) already honor for a string/`Display`-built
+// buffer. A caller wanting a trailing newline uses `println` (`stdlib/io/
+// io.cleave`, a plain `T: Print`-bound wrapper -- `print(x); print(['\n']);`
+// -- no separate runtime symbol needed for it at all). Found for real, not
+// hypothetical: these used to hardcode `println!`, silently appending `\n`
+// for *every* scalar while every string/array/tensor/tuple `Print<T>` impl
+// (routed through `print_bytes`/`print_dynarray_bytes`, plain `write_all`,
+// never `println!`) added none -- a genuine inconsistency, reported
+// directly (`print("step "); print(step);` produced an invisible newline
+// between them that wasn't written anywhere in the calling code).
 #[unsafe(no_mangle)]
 pub extern "C" fn print_i8(x: i8) -> i8 {
-    println!("{x}");
+    print!("{x}");
     x
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn print_i16(x: i16) -> i16 {
-    println!("{x}");
+    print!("{x}");
     x
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn print_i32(x: i32) -> i32 {
-    println!("{x}");
+    print!("{x}");
     x
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn print_i64(x: i64) -> i64 {
-    println!("{x}");
+    print!("{x}");
     x
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn print_f32(x: f32) -> f32 {
-    println!("{x}");
+    print!("{x}");
     x
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn print_f64(x: f64) -> f64 {
-    println!("{x}");
+    print!("{x}");
     x
 }
 

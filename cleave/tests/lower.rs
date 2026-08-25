@@ -107,6 +107,75 @@ fn string_literal_bytes_each_get_a_distinct_node_id() {
     }
 }
 
+/// Grammar-level escapes -- `\n`/`\t`/`\r`/`\\`/`\"`/`\'`/`\0` -- are decoded
+/// at lowering time (`lower.rs::decode_escapes`), before the per-byte
+/// `NumberLit` split; a `\` no longer terminates the string on the next
+/// `"` (`\"` inside the text) and no longer contributes two raw bytes to
+/// the array.
+#[test]
+fn string_literal_escapes_decode_to_their_real_byte_values() {
+    let f = lower_one_fn(r#"fn f() { "a\tb\nc\\d\"e\0f\'g" }"#);
+    match &only_stmt_expr(&f.body).kind {
+        ExprKind::ArrayLit(elems) => {
+            let bytes: Vec<&str> = elems
+                .iter()
+                .map(|e| match &e.kind {
+                    ExprKind::NumberLit { text, suffix } => {
+                        assert_eq!(suffix.as_deref(), Some("i8"));
+                        text.as_str()
+                    }
+                    other => panic!("expected NumberLit, got {other:?}"),
+                })
+                .collect();
+            // a, \t, b, \n, c, \\, d, \", e, \0, f, ', g
+            assert_eq!(
+                bytes,
+                vec![
+                    "97", "9", "98", "10", "99", "92", "100", "34", "101", "0", "102", "39", "103"
+                ]
+            );
+        }
+        other => panic!("expected ArrayLit, got {other:?}"),
+    }
+}
+
+/// `'a'`/`'\n'` -- a char literal has no representation of its own either,
+/// exactly like a string literal: full erasure into a plain `i8`-suffixed
+/// `NumberLit`, sugar for writing the byte value out by hand.
+#[test]
+fn char_literal_desugars_to_an_i8_suffixed_number_lit() {
+    let f = lower_one_fn("fn f() { 'x' }");
+    match &only_stmt_expr(&f.body).kind {
+        ExprKind::NumberLit { text, suffix } => {
+            assert_eq!(suffix.as_deref(), Some("i8"));
+            assert_eq!(text, "120", "'x' = 120");
+        }
+        other => panic!("expected NumberLit, got {other:?}"),
+    }
+}
+
+#[test]
+fn char_literal_escapes_decode_to_their_real_byte_values() {
+    let cases: &[(&str, &str)] = &[
+        (r"'\n'", "10"),
+        (r"'\t'", "9"),
+        (r"'\r'", "13"),
+        (r"'\\'", "92"),
+        (r"'\''", "39"),
+        (r"'\0'", "0"),
+    ];
+    for (src, expected) in cases {
+        let f = lower_one_fn(&format!("fn f() {{ {src} }}"));
+        match &only_stmt_expr(&f.body).kind {
+            ExprKind::NumberLit { text, suffix } => {
+                assert_eq!(suffix.as_deref(), Some("i8"), "for {src}");
+                assert_eq!(text, expected, "for {src}");
+            }
+            other => panic!("expected NumberLit, got {other:?} for {src}"),
+        }
+    }
+}
+
 #[test]
 fn array_repeat_literal_with_zero_count_is_an_empty_array() {
     let f = lower_one_fn("fn f() { [1; 0] }");

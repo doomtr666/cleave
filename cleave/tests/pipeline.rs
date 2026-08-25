@@ -120,6 +120,46 @@ fn a_unit_returning_main_compiles_links_and_runs_as_a_real_standalone_exe() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `print`/`println` (`stdlib/io/io.cleave`) newline behavior, checked
+/// against a real exe's own *exact* stdout bytes -- not `.trim()`'d, unlike
+/// the test just above, since a stray/missing newline is exactly the bug
+/// this guards: `print` used to hardcode a trailing `\n` for every scalar
+/// (`cleave-rt`'s own `print_i32`/... used to call `println!`), silently
+/// inconsistent with every string/array/tensor/tuple `Print<T>` impl (routed
+/// through `print_bytes`, never added one) -- found directly
+/// (`print("step "); print(step);` produced an invisible newline neither
+/// call actually wrote). `print` now never appends one; `println` (a plain
+/// `T: Print`-bound wrapper) always does.
+#[test]
+fn print_never_appends_a_newline_and_println_always_does() {
+    let dir = std::env::temp_dir().join(format!(
+        "cleave_pipeline_exe_println_test_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exe_path = dir.join("prog.exe");
+
+    let src = "use io;\nfn main() { print(1); print(2); println(3); print(4); }";
+    let result = build_exe(src, &exe_path);
+    assert!(
+        result.is_ok(),
+        "expected a successful exe build, got: {result:?}"
+    );
+
+    let output = Command::new(&exe_path)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run the built exe: {e}"));
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "123\n4",
+        "print(1); print(2); println(3) run together with no separator until \
+         println(3)'s own trailing newline; the final print(4) has none"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A program with no `fn main()` at all (e.g. a pure `export fn` library
 /// source, never meant to become a standalone exe) is a clean, reported
 /// error -- not a panic, not a confusing downstream linker failure.
