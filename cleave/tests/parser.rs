@@ -563,6 +563,37 @@ fn derivative_rule_decl_is_a_valid_algebra_item() {
 }
 
 #[test]
+fn adjoint_rule_decl_parses() {
+    parses(
+        Rule::adjoint_rule_decl,
+        "adjoint mul(a, b), u: (mul(u, b), mul(u, a));",
+    );
+}
+
+#[test]
+fn adjoint_rule_decl_with_a_single_parameter_parses_a_bare_expr_body() {
+    parses(Rule::adjoint_rule_decl, "adjoint neg(a), u: neg(u);");
+}
+
+#[test]
+fn adjoint_rule_decl_is_a_valid_algebra_item() {
+    let pair = CleaveParser::parse(
+        Rule::algebra_item,
+        "adjoint mul(a, b), u: (mul(u, b), mul(u, a));",
+    )
+    .unwrap()
+    .next()
+    .unwrap();
+    let inner = pair.into_inner().next().unwrap();
+    assert_eq!(
+        inner.as_rule(),
+        Rule::adjoint_rule_decl,
+        "got: {:?}",
+        inner.as_rule()
+    );
+}
+
+#[test]
 fn tuple_type_parses() {
     parses(Rule::type_, "(i32, f64)");
 }

@@ -1,0 +1,9 @@
+[package]
+name = "digits-interop"
+version = "0.1.0"
+edition = "2024"
+
+# See `examples/rust-interop-demo/Cargo.toml`'s own identical comment for why
+# this lives inside the root workspace rather than standing alone.
+[build-dependencies]
+cleave-build = { path = "../../cleave-build" }

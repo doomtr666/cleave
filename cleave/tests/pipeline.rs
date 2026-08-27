@@ -53,6 +53,49 @@ fn emitting_an_object_for_a_program_that_calls_a_real_extern_fn_does_not_crash()
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Same shape as the test just above, but for a genuinely *custom* `extern
+/// fn` -- one not in `cleave-rt`'s own fixed set at all, the real-Rust-
+/// interop case (`examples/digits-interop`, a consuming crate providing its
+/// own externs, linked in by an ordinary linker only *after* this object is
+/// emitted). `register_cleave_rt_symbols` alone can't satisfy `melior::
+/// ExecutionEngine::new`'s own "every external symbol resolvable at
+/// construction time" requirement for a name it's never heard of -- found
+/// for real building `digits-interop`'s own data-loading kernel, the exact
+/// `STATUS_STACK_BUFFER_OVERRUN` crash `register_cleave_rt_symbols`'s own
+/// doc comment already describes for the *known*-symbol case, this time for
+/// an unknown one. Fixed by `register_unresolved_extern_stubs` (`pipeline.
+/// rs`), registering an inert stub for anything not already known.
+#[test]
+fn emitting_an_object_for_a_program_with_a_genuinely_custom_extern_fn_does_not_crash() {
+    let dir = std::env::temp_dir().join(format!(
+        "cleave_pipeline_custom_extern_test_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let object_path = dir.join("out.o");
+
+    let src = "extern fn totally_custom_host_fn(x: i32) -> i32;\n\
+               fn main() -> i32 { totally_custom_host_fn(42) }"
+        .to_string();
+    let result = compile_and_emit(
+        vec![("test.cleave".to_string(), src)],
+        &[],
+        Some(&object_path),
+        None,
+    );
+
+    assert!(
+        result.is_ok(),
+        "expected a successful object emission, got: {result:?}"
+    );
+    assert!(
+        object_path.exists(),
+        "expected an object file to actually be written"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The real end-to-end proof for `emit_exe`: an `i32`-returning `main` that
 /// calls a real `extern fn` gets compiled all the way to a standalone
 /// `.exe`, run as a genuinely separate process (not through cleave's own

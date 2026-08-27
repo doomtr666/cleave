@@ -69,14 +69,29 @@ impl<T: Float, const Dims...: i32> Ring<Tensor<T, Dims...>> {
     fn mul(a: Tensor<T, Dims...>, b: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::arith::mulf(a, b) }
     fn div(a: Tensor<T, Dims...>, b: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::arith::divf(a, b) }
     fn neg(a: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::arith::negf(a) }
-    // A same-shaped tensor of zeros — built from ordinary cleave source now
-    // (`doc/backlog.md`'s own "Real pack-generic `[value; Dims...]` array-
-    // repeat" item was the missing piece), not hand-recognized structurally
-    // by the compiler the way `egraph.rs::build_zero` used to. Bare `zero()`
-    // — dispatched by the *expected* type at this call site (`data`'s own
-    // declared element type `T`), the same output-only-generic resolution
-    // every other zero-arg-input call here already relies on.
-    fn zero() -> Tensor<T, Dims...> { Tensor::<T, Dims...>(data: [zero(); Dims...]) }
+    // A same-shaped tensor of zeros — a real, O(1)-sized `tensor.splat`
+    // call, not `[zero(); Dims...]`'s own array-repeat (`doc/backlog.md`'s
+    // own "digits-interop" item: found directly, by measuring, that array-
+    // repeat's own "evaluate the value expression independently at every
+    // leaf position" semantics — genuinely needed for `Init<T>::xavier`'s
+    // own *independent* random draws, `dense_xavier` below — is *wrong* to
+    // pay for `zero()` too: every position gets the *identical* value here,
+    // so paying for one MLIR-level `tensor.splat` covers all of them, no
+    // scalar-width-times-N unrolled copies of anything). Cut a 2048-element
+    // `Tensor<f32,64,32>`'s own `Ring::zero()` from thousands of duplicated
+    // constant/store lines down to one op — confirmed directly, not
+    // assumed, chasing a real compile-time blowup in `Optimizer::init_
+    // state<Sgd,Dense<f32,64,32>>` (which calls this for its own zero-
+    // initialized momentum tensor). `z`'s own explicit `T` annotation is
+    // load-bearing, not stylistic: `mlir::...` calls never type-check their
+    // own arguments against the op's real signature (`infer.rs`'s own
+    // module doc comment), so a bare, unannotated `zero()` argument here
+    // would have no way to know it must resolve to *this* impl's own `T`
+    // specifically, not some other `Ring::zero()`.
+    fn zero() -> Tensor<T, Dims...> {
+        let z: T = zero();
+        mlir::tensor::splat(z)
+    }
 }
 
 // `Transcendental<Tensor<T,Dims...>>::exp` -- needed so `Activation<Tensor<T,

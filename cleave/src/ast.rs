@@ -78,6 +78,7 @@ pub enum AlgebraItemKind {
     FnSig(FnSig),
     Axiom(AxiomDecl),
     DerivativeRule(DerivativeRuleDecl),
+    AdjointRule(AdjointRuleDecl),
 }
 pub type AlgebraItem = Node<AlgebraItemKind>;
 
@@ -94,6 +95,27 @@ pub type AlgebraItem = Node<AlgebraItemKind>;
 pub struct DerivativeRuleDecl {
     pub method: String,
     pub params: Vec<Param>,
+    pub body: Expr,
+}
+
+/// `adjoint mul(a, b), u: (mul(u, b), mul(u, a));` — a declared reverse-
+/// mode (VJP) rewrite rule, `doc/backlog.md`'s own "reverse-mode
+/// differentiation" item: given `u`, the upstream adjoint of this method's
+/// own *output*, `body` computes the contribution to send back to each of
+/// `params`, in the same declared order — a bare `Expr` when `params.len()
+/// == 1` (nothing to disambiguate), a `tuple_lit`-shaped `Expr` of exactly
+/// `params.len()` entries otherwise (`lower_adjoint_rule_decl`'s own arity
+/// check, a real diagnostic, not assumed sound by the grammar alone — see
+/// `grammar.pest`'s own `adjoint_rule_decl` doc comment for why arity can't
+/// be checked at parse time). `upstream` is `u`'s own declared name — unlike
+/// `d(x)` inside a `derivative` rule (grammar-level sugar, `egraph.rs::
+/// build_pattern`), an adjoint rule's own body references it as an
+/// ordinary bound variable, no special syntax needed.
+#[derive(Debug, Clone)]
+pub struct AdjointRuleDecl {
+    pub method: String,
+    pub params: Vec<Param>,
+    pub upstream: String,
     pub body: Expr,
 }
 
@@ -231,6 +253,19 @@ pub struct FnDecl {
     /// shape exactly, just synthesized by the compiler itself rather than
     /// naming an external C symbol. `None` for every ordinary `fn`.
     pub derivative_of: Option<String>,
+    /// Distinguishes `gw = grad(f);` (`grammar.pest`'s own `grad_decl`) from
+    /// `fprime = derive(f);` — both lower to the identical `FnDecl` shape
+    /// above (`derivative_of: Some("f")`, signature synthesized the same
+    /// way, `driver.rs::synthesize_derive_signatures`), since a `grad`
+    /// request needs everything a `derive` request already needs (which
+    /// function, what its own parameter/return types are) plus exactly one
+    /// more fact: which *keyword* asked for it, since that decides which
+    /// differentiation algorithm actually runs (`derive` — general-purpose,
+    /// forward-mode; `grad` — reverse-mode, scalar-output-only, `doc/
+    /// backlog.md`'s own "reverse-mode differentiation" item). Always
+    /// `false` when `derivative_of` is `None` (an ordinary `fn` was never
+    /// asked to be differentiated at all either way).
+    pub is_grad: bool,
 }
 
 #[derive(Debug, Clone)]

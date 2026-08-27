@@ -117,7 +117,42 @@ impl Build {
             }
         }
 
-        if let Err(errs) = cleave::pipeline::compile_and_emit(sources, &project_dirs, Some(&object_path), Some(&bindings_path)) {
+        // Run on a dedicated, generously-sized stack -- `doc/backlog.md`'s
+        // own "Multi-level call transparency in the e-graph forward
+        // translator" item: `derive()`'s own recursive e-graph exploration
+        // can recurse deep enough to overflow the *default* 2MB stack a
+        // thread gets (confirmed there for `cargo test`'s own worker
+        // threads, fixed on that side by setting `RUST_MIN_STACK=64MiB`
+        // before running). A build script has no equivalent escape hatch of
+        // its own to reach for -- it just *is* whatever thread Cargo spawns
+        // it on, with whatever default stack that thread got, no env var a
+        // build-script author can set from inside their own `build.rs` to
+        // change it after the fact. Found for real, not hypothetical:
+        // `examples/digits-interop`'s own kernel (a real, wider-than-`xor`
+        // MLP -- `doc/backlog.md`'s own "Char literals"/`println` items'
+        // neighbor, "stress the system to find bugs" in practice) hit this
+        // exact crash (`STATUS_STACK_OVERFLOW`) the first time anything
+        // bigger than `xor_tensor.cleave`'s own 2-neuron network was ever
+        // compiled through `cleave-build` specifically. `std::thread::scope`
+        // (stable since 1.63) lets the spawned thread still borrow `sources`
+        // /`project_dirs`/the two `Path`s directly, no cloning into `'static`
+        // needed just to give it its own stack.
+        let result = std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(1024 * 1024 * 1024)
+                .spawn_scoped(scope, || {
+                    cleave::pipeline::compile_and_emit(
+                        sources,
+                        &project_dirs,
+                        Some(&object_path),
+                        Some(&bindings_path),
+                    )
+                })
+                .expect("cleave-build: failed to spawn the compile thread")
+                .join()
+                .unwrap_or_else(|e| std::panic::resume_unwind(e))
+        });
+        if let Err(errs) = result {
             panic!("cleave-build: failed to compile `{name}`:\n{}", errs.join("\n"));
         }
 

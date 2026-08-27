@@ -96,6 +96,7 @@ impl Lowerer {
             }
             Rule::fn_decl => ItemKind::Fn(self.lower_fn_decl(inner)),
             Rule::derive_decl => ItemKind::Fn(self.lower_derive_decl(inner)),
+            Rule::grad_decl => ItemKind::Fn(self.lower_grad_decl(inner)),
             r => unreachable!("item: unexpected rule {r:?}"),
         };
         self.wrap(span, kind)
@@ -186,6 +187,7 @@ impl Lowerer {
             ret,
             body,
             derivative_of: None,
+            is_grad: false,
         }
     }
 
@@ -215,6 +217,30 @@ impl Lowerer {
             ret: None,
             body: None,
             derivative_of: Some(of),
+            is_grad: false,
+        }
+    }
+
+    /// `gw = grad(loss);` (`grammar.pest`'s own `grad_decl`) — mechanical
+    /// mirror of `lower_derive_decl` just above, `is_grad: true` the one
+    /// real difference (`ast.rs`'s own `FnDecl::is_grad` doc comment).
+    fn lower_grad_decl(&mut self, pair: Pair<Rule>) -> FnDecl {
+        let mut inner = pair.into_inner();
+        let name = inner.next().unwrap().as_str().to_string();
+        let of = inner.next().unwrap().as_str().to_string();
+        FnDecl {
+            name,
+            attrs: Vec::new(),
+            is_extern: false,
+            extern_symbol: None,
+            is_export: false,
+            export_symbol: None,
+            generics: Vec::new(),
+            params: Vec::new(),
+            ret: None,
+            body: None,
+            derivative_of: Some(of),
+            is_grad: true,
         }
     }
 
@@ -372,6 +398,9 @@ impl Lowerer {
             Rule::derivative_rule_decl => {
                 AlgebraItemKind::DerivativeRule(self.lower_derivative_rule_decl(inner))
             }
+            Rule::adjoint_rule_decl => {
+                AlgebraItemKind::AdjointRule(self.lower_adjoint_rule_decl(inner))
+            }
             r => unreachable!("algebra_item: unexpected rule {r:?}"),
         };
         self.wrap(span, kind)
@@ -413,6 +442,61 @@ impl Lowerer {
         DerivativeRuleDecl {
             method,
             params,
+            body,
+        }
+    }
+
+    /// `adjoint mul(a, b), u: (mul(u, b), mul(u, a));` — mechanical mirror
+    /// of `lower_derivative_rule_decl` just above, plus the one real check
+    /// grammar alone can't make (`grammar.pest`'s own `adjoint_rule_decl`
+    /// doc comment): a `tuple_lit` body is *already* an ordinary
+    /// `ExprKind::StructLit` by the time `lower_expr` returns it
+    /// (`lower_tuple_lit`, this file), so a body whose own tuple arity
+    /// disagrees with `method`'s own declared parameter count is caught
+    /// here, structurally, the same `panic!`-on-a-structurally-valid-but-
+    /// semantically-malformed-construct posture this file already uses
+    /// elsewhere (`lower_array_lit`'s own array-repeat count check).
+    fn lower_adjoint_rule_decl(&mut self, pair: Pair<Rule>) -> AdjointRuleDecl {
+        let mut inner = pair.into_inner().peekable();
+        let method = inner.next().unwrap().as_str().to_string();
+        let params = if matches!(inner.peek().map(|p| p.as_rule()), Some(Rule::param_list)) {
+            self.lower_param_list(inner.next().unwrap())
+        } else {
+            Vec::new()
+        };
+        let upstream = inner.next().unwrap().as_str().to_string();
+        let body = self.lower_expr(inner.next().unwrap());
+
+        let tuple_arity = match &body.kind {
+            ExprKind::StructLit(path, _, fields)
+                if path.segments.len() == 1
+                    && fields.len() >= 2
+                    && path.segments[0] == tuple_struct_name(fields.len()) =>
+            {
+                Some(fields.len())
+            }
+            _ => None,
+        };
+        match tuple_arity {
+            Some(n) if n != params.len() => panic!(
+                "adjoint {method}(...): rule body is a {n}-tuple, but `{method}` has {} \
+                 parameter(s) -- expected exactly one contribution per parameter, in \
+                 declared order",
+                params.len()
+            ),
+            None if params.len() != 1 => panic!(
+                "adjoint {method}(...): rule body is a single expression, but `{method}` has \
+                 {} parameters -- expected a {}-tuple, one contribution per parameter",
+                params.len(),
+                params.len()
+            ),
+            _ => {}
+        }
+
+        AdjointRuleDecl {
+            method,
+            params,
+            upstream,
             body,
         }
     }

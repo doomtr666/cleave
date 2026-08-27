@@ -6,7 +6,7 @@
 //! thing whether it's invoked from the command line or from someone else's
 //! `build.rs`.
 
-use crate::ast::Program;
+use crate::ast::{ItemKind, Program};
 use crate::cps::{
     CpsProgram, UnitBody, collect_mlir_types, collect_struct_schemas, collect_units,
     convert_program, eliminate_dead_code,
@@ -33,9 +33,10 @@ pub fn build_cps_program(
     let requests: Vec<DerivativeRequest> = units
         .iter()
         .filter_map(|u| match &u.body {
-            UnitBody::Derivative(of) => Some(DerivativeRequest {
+            UnitBody::Derivative(of, is_grad) => Some(DerivativeRequest {
                 name: u.name.clone(),
                 of: of.clone(),
+                is_grad: *is_grad,
             }),
             _ => None,
         })
@@ -118,7 +119,7 @@ pub fn emit_from_program(
 fn build_optimized_cps(program: &Program, registry: &Registry) -> Result<CpsProgram, Vec<String>> {
     let cps_program = build_cps_program(program, registry)?;
     let cps_program = eliminate_dead_code(cps_program);
-    let (cps_program, _) = optimize_program(cps_program, registry);
+    let (cps_program, _) = optimize_program(cps_program, registry, false);
     Ok(eliminate_dead_code(cps_program))
 }
 
@@ -323,6 +324,7 @@ fn emit_object(
     // SAFETY: see `register_cleave_rt_symbols`'s own doc comment.
     unsafe {
         register_cleave_rt_symbols(&engine);
+        register_unresolved_extern_stubs(&engine, program);
     }
     let Some(object_path_str) = object_path.to_str() else {
         return Err(vec![format!(
@@ -332,6 +334,110 @@ fn emit_object(
     engine.dump_to_object_file(object_path_str);
     Ok(())
 }
+
+/// `register_cleave_rt_symbols`'s own doc comment establishes that `Execution
+/// Engine::new`/`dump_to_object_file` needs *every* externally-called symbol
+/// resolvable at construction time, even for object-only emission where
+/// nothing is ever actually invoked through this engine instance — but that
+/// registration only ever covers `cleave-rt`'s own fixed, known set. A
+/// program declaring its *own* `extern fn` (real Rust interop, `examples/
+/// digits-interop/src/kernel.cleave` — the whole point of `export fn`/`--
+/// emit-object` existing at all: a consuming Rust crate provides its own
+/// externs, compiled into the *same final binary* by an ordinary linker
+/// afterward, not by this engine) has no way to satisfy that requirement at
+/// this point in the pipeline — the real implementation lives in the
+/// consuming crate, which hasn't even been compiled yet when this object is
+/// being emitted. Found for real, not hypothetical: the very first program
+/// with a genuinely custom `extern fn` (not one of `cleave-rt`'s own) hit
+/// exactly the `STATUS_STACK_BUFFER_OVERRUN` crash `register_cleave_rt_
+/// symbols`'s own doc comment already describes for the *known*-symbol case,
+/// just for an *unknown* one instead.
+///
+/// The fix mirrors that same doc comment's own confirmed finding — "the
+/// registered pointer only satisfies the engine's own internal requirement
+/// ... the actual object file is unaffected, still meant to be resolved
+/// later by a real linker" — so *what* gets registered here doesn't matter
+/// at all, only *that* something does: every `extern fn` in `program` not
+/// already in `KNOWN_CLEAVE_RT_SYMBOLS` gets the same inert stub pointer.
+/// The emitted object's own undefined relocation for that symbol is
+/// unaffected either way (confirmed the identical way that doc comment
+/// already did, via `llvm-nm`), so this is sound regardless of the stub's
+/// own signature mismatch against the real one.
+///
+/// SAFETY: `dummy_extern_stub`'s own address is a real, valid, live-for-the-
+/// whole-process function pointer — its signature never has to match the
+/// real extern's own, since it's provably never called through this engine.
+unsafe fn register_unresolved_extern_stubs(engine: &melior::ExecutionEngine, program: &Program) {
+    extern "C" fn dummy_extern_stub() {}
+    for item in &program.items {
+        let ItemKind::Fn(f) = &item.kind else { continue };
+        if !f.is_extern {
+            continue;
+        }
+        let symbol = f.extern_symbol.as_deref().unwrap_or(&f.name);
+        if KNOWN_CLEAVE_RT_SYMBOLS.contains(&symbol) {
+            continue;
+        }
+        // SAFETY: forwarded from this function's own contract.
+        unsafe {
+            engine.register_symbol(symbol, dummy_extern_stub as *mut ());
+        }
+    }
+}
+
+/// Every symbol `register_cleave_rt_symbols` registers, by name — kept as an
+/// explicit, separate list (not derived from that function's own body)
+/// purely because the real registration there is one hardcoded `register_
+/// symbol` call per real function pointer, not a loop over data; a new
+/// `cleave-rt` extern needs a line added in *both* places (the doc comment
+/// on each cross-references the other).
+const KNOWN_CLEAVE_RT_SYMBOLS: &[&str] = &[
+    "memrefCopy",
+    "rand_seed",
+    "rand_uniform_f32",
+    "rand_uniform_f64",
+    "rand_normal_f32",
+    "rand_normal_f64",
+    "print_i8",
+    "print_i16",
+    "print_i32",
+    "print_i64",
+    "print_f32",
+    "print_f64",
+    "print_bytes",
+    "print_dynarray_bytes",
+    "format_f32",
+    "format_f64",
+    "cleave_alloc",
+    "dynarray_alloc_i8",
+    "dynarray_grow_i8",
+    "dynarray_get_i8",
+    "dynarray_set_i8",
+    "dynarray_alloc_i16",
+    "dynarray_grow_i16",
+    "dynarray_get_i16",
+    "dynarray_set_i16",
+    "dynarray_alloc_i32",
+    "dynarray_grow_i32",
+    "dynarray_get_i32",
+    "dynarray_set_i32",
+    "dynarray_alloc_i64",
+    "dynarray_grow_i64",
+    "dynarray_get_i64",
+    "dynarray_set_i64",
+    "dynarray_alloc_f32",
+    "dynarray_grow_f32",
+    "dynarray_get_f32",
+    "dynarray_set_f32",
+    "dynarray_alloc_f64",
+    "dynarray_grow_f64",
+    "dynarray_get_f64",
+    "dynarray_set_f64",
+    "dynarray_alloc_ptr",
+    "dynarray_grow_ptr",
+    "dynarray_get_ptr",
+    "dynarray_set_ptr",
+];
 
 /// The fixed internal symbol cleave's own `fn main()` gets renamed to when
 /// compiling a standalone executable (`emit_exe` below) -- never seen by a

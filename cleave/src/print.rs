@@ -113,6 +113,15 @@ impl Printer {
                             fmt_expr(&dr.body)
                         ));
                     }
+                    AlgebraItemKind::AdjointRule(ar) => {
+                        p.line(format!(
+                            "adjoint {}({}), {}: {};",
+                            ar.method,
+                            fmt_params(&ar.params),
+                            ar.upstream,
+                            fmt_expr(&ar.body)
+                        ));
+                    }
                 }
             }
         });

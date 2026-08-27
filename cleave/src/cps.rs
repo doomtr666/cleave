@@ -119,16 +119,21 @@ pub enum UnitBody {
     /// for why a real C call is a straight-line `LetPrim`, not a `Fix`.
     Extern(String),
     /// `fprime = derive(f);` (`ast.rs`'s own `FnDecl::derivative_of`) — the
-    /// base function's own name. No `Block` exists for this unit at all
-    /// (there's no cleave-level body to CPS-convert — see `derivative_of`'s
-    /// own doc comment): `convert_program` skips a `Derivative`-bodied unit
-    /// entirely, same as it already does for `Extern` (`let UnitBody::Real
-    /// (body) = &unit.body else { continue };`), *not* because it never
-    /// gets a real body at all — unlike `Extern`, it does, just built much
-    /// later (`egraph.rs::synthesize_derivatives`, which needs `f`'s own
-    /// body *already* CPS-converted first, hence strictly after
-    /// `convert_program` returns, not during it).
-    Derivative(String),
+    /// base function's own name, plus `FnDecl::is_grad` (`true` for `gw =
+    /// grad(f);` instead — reverse-mode, `doc/backlog.md`'s own "reverse-
+    /// mode differentiation" item, a real, different algorithm, not just a
+    /// naming difference), carried through so whichever pass eventually
+    /// builds this unit's own real body (see below) knows which one to run.
+    /// No `Block` exists for this unit at all (there's no cleave-level body
+    /// to CPS-convert — see `derivative_of`'s own doc comment):
+    /// `convert_program` skips a `Derivative`-bodied unit entirely, same as
+    /// it already does for `Extern` (`let UnitBody::Real (body) = &unit.body
+    /// else { continue };`), *not* because it never gets a real body at all
+    /// — unlike `Extern`, it does, just built much later (`egraph.rs::
+    /// synthesize_derivatives`, which needs `f`'s own body *already* CPS-
+    /// converted first, hence strictly after `convert_program` returns, not
+    /// during it).
+    Derivative(String, bool),
 }
 
 pub struct ConcreteUnit {
@@ -362,7 +367,7 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                             f.extern_symbol.clone().unwrap_or_else(|| f.name.clone()),
                         ),
                         None if f.derivative_of.is_some() => {
-                            UnitBody::Derivative(f.derivative_of.clone().unwrap())
+                            UnitBody::Derivative(f.derivative_of.clone().unwrap(), f.is_grad)
                         }
                         None => continue,
                     };
@@ -3398,7 +3403,7 @@ fn emit_call(
         // just isn't attached yet at this point in the pipeline (`UnitBody`'s
         // own doc comment) — nothing here needs to look at that body,
         // only at `unit_name` itself (resolved later, by name).
-        UnitBody::Real(_) | UnitBody::Derivative(_) => {
+        UnitBody::Real(_) | UnitBody::Derivative(_, _) => {
             let result_var = ctx.fresh.var();
             let k_label = ctx.fresh.label("k");
             let mut call_args = arg_vals;

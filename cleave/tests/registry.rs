@@ -256,6 +256,53 @@ fn axioms_and_derivative_rules_coexist_on_the_same_algebra() {
     assert_eq!(reg.derivative_rules("Ring").len(), 1);
 }
 
+/// `doc/backlog.md`'s own "reverse-mode differentiation" item — an
+/// `adjoint` rule declared on an algebra is retained the identical way a
+/// `derivative` rule already is, mirrors `registry_retains_derivative_
+/// rules_declared_on_an_algebra` exactly.
+#[test]
+fn registry_retains_adjoint_rules_declared_on_an_algebra() {
+    let p = program(
+        "algebra Ring<T> {
+            fn add(a: T, b: T) -> T;
+            fn mul(a: T, b: T) -> T;
+            adjoint mul(a, b), u: (mul(u, b), mul(u, a));
+         }",
+    );
+    let reg = Registry::build(&p);
+    let rules = reg.adjoint_rules("Ring");
+    assert_eq!(rules.len(), 1, "expected exactly one retained adjoint rule");
+    assert_eq!(rules[0].method, "mul");
+    assert_eq!(rules[0].params.len(), 2);
+    assert_eq!(rules[0].upstream, "u");
+}
+
+/// An algebra with no adjoint rules at all still resolves (empty, not
+/// missing) — same convention `axioms`/`derivative_rules` already follow.
+#[test]
+fn registry_adjoint_rules_is_empty_not_missing_when_none_are_declared() {
+    let p = program("algebra Ring<T> { fn add(a: T, b: T) -> T; }");
+    let reg = Registry::build(&p);
+    assert!(reg.adjoint_rules("Ring").is_empty());
+    assert!(reg.adjoint_rules("NoSuchAlgebra").is_empty());
+}
+
+/// `derivative`/`adjoint` rules coexist fine on the same algebra during the
+/// reverse-mode migration — each retained separately.
+#[test]
+fn derivative_and_adjoint_rules_coexist_on_the_same_algebra() {
+    let p = program(
+        "algebra Ring<T> {
+            fn add(a: T, b: T) -> T;
+            derivative add(a, b): add(d(a), d(b));
+            adjoint add(a, b), u: (u, u);
+         }",
+    );
+    let reg = Registry::build(&p);
+    assert_eq!(reg.derivative_rules("Ring").len(), 1);
+    assert_eq!(reg.adjoint_rules("Ring").len(), 1);
+}
+
 fn vec2_type() -> cleave::ast::Type {
     type_from("Vec2")
 }

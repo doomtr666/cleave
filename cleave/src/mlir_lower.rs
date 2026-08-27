@@ -388,18 +388,24 @@ fn struct_llvm_type<'c>(ctx: &LowerCtx<'c, '_>, name: &str, type_args: &[Ty]) ->
 /// `!llvm.array<N x T>` rather than a `memref` — see `struct_llvm_type`'s
 /// own doc comment for why.
 ///
-/// A `#[mlir_type(tensor)]`/`#[mlir_type(vector)]`-tagged field (`Tensor`/
-/// `Vector`/`Matrix`) gets the *identical* inline-array treatment, keyed off
-/// its own sole (array-typed) field's own shape — `ty_to_mlir` alone would
-/// give the *raw* native MLIR type (`tensor<1x2xf32>`, right for a bare
-/// function parameter/local, where MLIR natively handles such a value) and
-/// that's never a sized LLVM type an `!llvm.struct` field can actually hold
-/// — found directly: `'llvm.store' op operand #0 must be LLVM type with
-/// size, but got 'tensor<1x2xf32>'`, the moment an ordinary struct (`Dense`/
-/// `Network`, `doc/backlog.md`'s own "gradient w.r.t. a struct parameter"
-/// item) first tried to wrap a real `Tensor` field. `store_native_shape_
-/// field`/`load_native_shape_field` are this representation's own
-/// write/read halves.
+/// A `#[mlir_type(tensor)]`-tagged field (`Tensor`) gets a *different* sized
+/// LLVM type — `ty_to_mlir` alone would give the *raw* native MLIR type
+/// (`tensor<1x2xf32>`, right for a bare function parameter/local, where MLIR
+/// natively handles such a value) and that's never a sized LLVM type an
+/// `!llvm.struct` field can actually hold — found directly: `'llvm.store' op
+/// operand #0 must be LLVM type with size, but got 'tensor<1x2xf32>'`, the
+/// moment an ordinary struct (`Dense`/`Network`, `doc/backlog.md`'s own
+/// "gradient w.r.t. a struct parameter" item) first tried to wrap a real
+/// `Tensor` field. Originally (and for a long stretch of this project,
+/// numerically correct throughout) this was the *identical* inline-array
+/// treatment an ordinary untagged array field still gets just below — found,
+/// much later, by direct re-measurement at real network scale (`doc/backlog.
+/// md`'s own "digits-interop" perf item), to be the dominant real compile-
+/// time cost: every struct-field crossing a large `Tensor` value makes pays
+/// one MLIR op *per element*, in both directions. Now a real memref
+/// descriptor instead (`memref_descriptor_llvm_type`'s own doc comment) —
+/// `store_native_shape_field`/`load_native_shape_field` are this
+/// representation's own O(1) write/read halves.
 fn ty_to_llvm_field_type<'c>(ctx: &LowerCtx<'c, '_>, ty: &Ty) -> Type<'c> {
     if let Some(keyword) = native_shape_field_keyword(ctx, ty) {
         let (name, type_args) = struct_name_and_args(ty);
@@ -410,7 +416,17 @@ fn ty_to_llvm_field_type<'c>(ctx: &LowerCtx<'c, '_>, ty: &Ty) -> Type<'c> {
                 fields.len()
             );
         };
-        return ty_to_llvm_field_type(ctx, inner_ty);
+        // A `Tensor`-tagged field's own storage is a real memref descriptor
+        // (`memref_descriptor_llvm_type`'s own doc comment), not an inline
+        // flattened array the way an *ordinary* (untagged) array field still
+        // is just below — `store_native_shape_field`/`load_native_shape_
+        // field` are this representation's own O(1) write/read halves.
+        assert_eq!(
+            keyword, "tensor",
+            "MLIR lowering: O(1) native-shape field storage needs a real memref-backed form, which `#[mlir_type(vector)]` doesn't have"
+        );
+        let (dims, _leaf_ty) = flatten_array_dims(inner_ty);
+        return memref_descriptor_llvm_type(ctx.context, dims.len());
     }
     match ty {
         Ty::Array(..) => {
@@ -1975,14 +1991,55 @@ fn store_field<'c>(
     }
 }
 
+/// The exact LLVM struct layout MLIR's own `finalize-memref-to-llvm`
+/// conversion (part of `pipeline.rs`'s own `to-llvm` pass stage) uses for a
+/// statically-shaped memref's own descriptor — `(allocated_ptr, aligned_ptr,
+/// offset, sizes[rank], strides[rank])` — confirmed directly, not guessed:
+/// `mlir-opt --finalize-memref-to-llvm` on a real, standalone `memref.alloc`
+/// probe (`I:/Dev/llvm-mlir-22/bin/mlir-opt.exe`, this exact toolchain) prints
+/// this exact shape. Letting a `Tensor`/`Vector`-typed struct field *be* this
+/// descriptor (`ty_to_llvm_field_type`'s own native-shape-tagged branch,
+/// below) — rather than the field's own fully-flattened `!llvm.array` — is
+/// what lets `store_native_shape_field`/`load_native_shape_field` become
+/// real O(1) aggregate loads/stores instead of one op per element: a
+/// `builtin.unrealized_conversion_cast` between a `memref<...>` value and
+/// this exact struct shape is a genuine identity materialization once
+/// `finalize-memref-to-llvm` runs — confirmed directly, the same way: both
+/// directions (`memref -> this struct`, `this struct -> memref`) resolve to
+/// clean, cast-free code under `--finalize-memref-to-llvm --reconcile-
+/// unrealized-casts`, no leftover `unrealized_conversion_cast` in the
+/// output, not a guess about `egg`-style "should fold" wishful thinking.
+fn memref_descriptor_llvm_type<'c>(context: &'c Context, rank: usize) -> Type<'c> {
+    let ptr = Type::parse(context, "!llvm.ptr")
+        .unwrap_or_else(|| panic!("MLIR lowering: failed to parse `!llvm.ptr`"));
+    let i64_ty: Type = IntegerType::new(context, 64).into();
+    let dims_ty = llvm::r#type::array(i64_ty, rank as u32);
+    llvm::r#type::r#struct(context, &[ptr, ptr, i64_ty, dims_ty, dims_ty], false)
+}
+
 /// Stores a `Tensor`/`Vector`-typed field's own value (a real native SSA
-/// value, e.g. `tensor<1x2xf32>` — never an `!llvm.struct` allocation of
+/// value, e.g. `tensor<64x32xf32>` — never an `!llvm.struct` allocation of
 /// its own, `lower_tagged_struct_construct`'s own doc comment) into its
-/// embedded, inline `!llvm.array` representation (`ty_to_llvm_field_type`'s
-/// own doc comment). One `tensor.extract` (constant indices, fully
-/// unrolled — every dimension is compile-time-known) + `llvm.store` pair
-/// per flat position, row-major — the write-side mirror of `load_native_
-/// shape_field` below.
+/// embedded field storage — a real O(1) aggregate store, not one `tensor.
+/// extract`+`llvm.store` pair per element. Found necessary directly: the
+/// original per-element version (kept working, numerically verified, for a
+/// long stretch of this project) turned out to dominate real compile time at
+/// real network scale (`doc/backlog.md`'s own "digits-interop" perf item) —
+/// `Optimizer::step<Sgd,Network>` alone reached 34,033 lines of MLIR for one
+/// real 64x32/32x10 two-layer network, almost entirely this same per-element
+/// pattern, in *both* directions, at every struct-field crossing a `Tensor`
+/// value makes (`Dense`'s own `w`/`b`, `Network`'s own `l1`/`l2`, layered on
+/// top of each other for `Optimizer::step`'s own field-by-field recursion).
+///
+/// Real fix, not a workaround: `bufferization.to_buffer` (tensor -> memref,
+/// one op, the exact reverse of `Ring<Tensor<T,Dims...>>::zero()`'s own
+/// `tensor.splat`-adjacent `bufferization.to_tensor` fix — see `stdlib/nn/
+/// nn.cleave`'s `Init<Dense<T,In,Out>>::xavier`/`he`, which already uses `to_
+/// tensor` from cleave source directly), then `builtin.unrealized_conversion_
+/// cast` to this field's own real storage type (`memref_descriptor_llvm_
+/// type`'s own doc comment — a real, empirically-confirmed identity
+/// materialization, not a guess), then one ordinary aggregate `llvm.store` —
+/// no different in kind from storing any other non-array field.
 fn store_native_shape_field<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
@@ -2001,85 +2058,59 @@ fn store_native_shape_field<'c>(
             fields.len()
         );
     };
+    // See `load_native_shape_field`'s own identical assertion for why.
+    assert_eq!(
+        keyword, "tensor",
+        "MLIR lowering: O(1) native-shape field storage needs a real memref-backed form, which `#[mlir_type(vector)]` doesn't have"
+    );
     let (dims, leaf_ty) = flatten_array_dims(inner_ty);
     let native_ty = ty_to_mlir(ctx, field_ty);
     let value = lower_cval(ctx.context, block, env, arg, native_ty);
-    let field_llvm_ty = ty_to_llvm_field_type(ctx, field_ty);
     let elem_mlir_ty = ty_to_mlir(ctx, leaf_ty);
+    let location = Location::unknown(ctx.context);
 
-    #[allow(clippy::too_many_arguments)]
-    fn walk<'c>(
-        ctx: &LowerCtx<'c, '_>,
-        block: &Block<'c>,
-        value: Value<'c, 'c>,
-        remaining: &[i64],
-        idx_acc: &mut Vec<Value<'c, 'c>>,
-        gep_idx: &mut Vec<i64>,
-        field_ptr: Value<'c, 'c>,
-        field_llvm_ty: Type<'c>,
-        elem_mlir_ty: Type<'c>,
-    ) {
-        let location = Location::unknown(ctx.context);
-        let Some((&dim, rest)) = remaining.split_first() else {
-            let built = OperationBuilder::new("tensor.extract", location)
-                .add_operands(&[value])
-                .add_operands(idx_acc)
-                .add_results(&[elem_mlir_ty])
-                .build()
-                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build tensor.extract: {e}"));
-            let scalar: Value = block.append_operation(built).result(0).unwrap().into();
-            let dst_ptr = gep(ctx, block, field_ptr, gep_idx, field_llvm_ty);
-            block.append_operation(llvm::store(
-                ctx.context,
-                scalar,
-                dst_ptr,
-                location,
-                LoadStoreOptions::new(),
-            ));
-            return;
-        };
-        for i in 0..dim {
-            idx_acc.push(const_index(ctx, block, i));
-            gep_idx.push(i);
-            walk(
-                ctx,
-                block,
-                value,
-                rest,
-                idx_acc,
-                gep_idx,
-                field_ptr,
-                field_llvm_ty,
-                elem_mlir_ty,
-            );
-            idx_acc.pop();
-            gep_idx.pop();
-        }
-    }
-    // Leading `0`: stay within this one field instance (`gep`'s own doc
-    // comment), same convention `copy_array_into_llvm_field` already uses.
-    let mut gep_idx = vec![0i64];
-    walk(
-        ctx,
-        block,
-        value,
-        &dims,
-        &mut Vec::new(),
-        &mut gep_idx,
+    let memref_ty: Type = MemRefType::new(elem_mlir_ty, &dims, None, None).into();
+    // `bufferization.to_buffer`, not the older `to_memref` name some MLIR
+    // docs/versions use — confirmed directly against this exact toolchain
+    // (`mlir-opt`, `I:/Dev/llvm-mlir-22`): `to_memref` verifies as an
+    // unregistered op here, `to_buffer` is this version's real name for the
+    // identical tensor -> memref direction (`bufferization.to_tensor`'s own
+    // real, unrenamed counterpart).
+    let to_buffer = OperationBuilder::new("bufferization.to_buffer", location)
+        .add_operands(&[value])
+        .add_results(&[memref_ty])
+        .build()
+        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build bufferization.to_buffer: {e}"));
+    let memref_val: Value = block.append_operation(to_buffer).result(0).unwrap().into();
+
+    let descriptor_ty = memref_descriptor_llvm_type(ctx.context, dims.len());
+    let cast = OperationBuilder::new("builtin.unrealized_conversion_cast", location)
+        .add_operands(&[memref_val])
+        .add_results(&[descriptor_ty])
+        .build()
+        .unwrap_or_else(|e| {
+            panic!("MLIR lowering: failed to build unrealized_conversion_cast: {e}")
+        });
+    let descriptor_val: Value = block.append_operation(cast).result(0).unwrap().into();
+
+    block.append_operation(llvm::store(
+        ctx.context,
+        descriptor_val,
         field_ptr,
-        field_llvm_ty,
-        elem_mlir_ty,
-    );
+        location,
+        LoadStoreOptions::new(),
+    ));
 }
 
 /// Reads a `Tensor`/`Vector`-typed field's own value back out of its
-/// embedded, inline `!llvm.array` representation — the read-side mirror of
-/// `store_native_shape_field`. One `llvm.getelementptr`+`llvm.load` pair
-/// per flat position (row-major), combined into one `{keyword}.from_
-/// elements` — the identical technique `lower_tagged_struct_construct`
-/// already uses to build a *fresh* native value from scratch, just sourced
-/// from a struct's own field storage here instead of a freshly-lowered
-/// standalone array argument.
+/// embedded field storage — the read-side mirror of `store_native_shape_
+/// field`'s own doc comment (same real fix, same reasoning): one ordinary
+/// aggregate `llvm.load`, `builtin.unrealized_conversion_cast` back to
+/// `memref<...>`, then `bufferization.to_tensor ... restrict` (the identical
+/// pattern `Init::xavier`/`he` already use from cleave source, `restrict`
+/// required by One-Shot Analysis — found directly, a real MLIR verifier
+/// error without it, not guessed) — no per-element `llvm.getelementptr`+
+/// `llvm.load` walk at all.
 fn load_native_shape_field<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
@@ -2097,74 +2128,52 @@ fn load_native_shape_field<'c>(
         );
     };
     let (dims, leaf_ty) = flatten_array_dims(inner_ty);
-    let field_llvm_ty = ty_to_llvm_field_type(ctx, field_ty);
     let elem_mlir_ty = ty_to_mlir(ctx, leaf_ty);
-
-    fn walk<'c>(
-        ctx: &LowerCtx<'c, '_>,
-        block: &Block<'c>,
-        remaining: &[i64],
-        gep_idx: &mut Vec<i64>,
-        field_ptr: Value<'c, 'c>,
-        field_llvm_ty: Type<'c>,
-        elem_mlir_ty: Type<'c>,
-        out: &mut Vec<Value<'c, 'c>>,
-    ) {
-        let Some((&dim, rest)) = remaining.split_first() else {
-            let location = Location::unknown(ctx.context);
-            let src_ptr = gep(ctx, block, field_ptr, gep_idx, field_llvm_ty);
-            let scalar = block
-                .append_operation(llvm::load(
-                    ctx.context,
-                    src_ptr,
-                    elem_mlir_ty,
-                    location,
-                    LoadStoreOptions::new(),
-                ))
-                .result(0)
-                .unwrap()
-                .into();
-            out.push(scalar);
-            return;
-        };
-        for i in 0..dim {
-            gep_idx.push(i);
-            walk(
-                ctx,
-                block,
-                rest,
-                gep_idx,
-                field_ptr,
-                field_llvm_ty,
-                elem_mlir_ty,
-                out,
-            );
-            gep_idx.pop();
-        }
-    }
-    let mut gep_idx = vec![0i64];
-    let mut elems = Vec::new();
-    walk(
-        ctx,
-        block,
-        &dims,
-        &mut gep_idx,
-        field_ptr,
-        field_llvm_ty,
-        elem_mlir_ty,
-        &mut elems,
-    );
-
-    let native_ty = ty_to_mlir(ctx, field_ty);
     let location = Location::unknown(ctx.context);
-    let built = OperationBuilder::new(&format!("{keyword}.from_elements"), location)
-        .add_operands(&elems)
-        .add_results(&[native_ty])
+
+    let descriptor_ty = memref_descriptor_llvm_type(ctx.context, dims.len());
+    let descriptor_val: Value = block
+        .append_operation(llvm::load(
+            ctx.context,
+            field_ptr,
+            descriptor_ty,
+            location,
+            LoadStoreOptions::new(),
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+
+    let memref_ty: Type = MemRefType::new(elem_mlir_ty, &dims, None, None).into();
+    let cast = OperationBuilder::new("builtin.unrealized_conversion_cast", location)
+        .add_operands(&[descriptor_val])
+        .add_results(&[memref_ty])
         .build()
         .unwrap_or_else(|e| {
-            panic!("MLIR lowering: failed to build `{keyword}.from_elements`: {e}")
+            panic!("MLIR lowering: failed to build unrealized_conversion_cast: {e}")
         });
-    block.append_operation(built).result(0).unwrap().into()
+    let memref_val: Value = block.append_operation(cast).result(0).unwrap().into();
+
+    let native_ty = ty_to_mlir(ctx, field_ty);
+    let restrict = Attribute::parse(ctx.context, "unit")
+        .unwrap_or_else(|| panic!("MLIR lowering: failed to parse `unit` attribute"));
+    // `bufferization.to_tensor`/`to_buffer` (`store_native_shape_field`'s own
+    // doc comment) are specific to the `tensor`/`memref` pair, not a
+    // `{keyword}`-generic pair the way `{keyword}.from_elements` above used
+    // to be — `#[mlir_type(vector)]` (structurally supported, currently
+    // unused anywhere in stdlib) has no memref-backed form at all, so this
+    // whole O(1) path is real only for `keyword == "tensor"`.
+    assert_eq!(
+        keyword, "tensor",
+        "MLIR lowering: O(1) native-shape field access needs a real memref-backed form, which `#[mlir_type(vector)]` doesn't have"
+    );
+    let to_tensor = OperationBuilder::new("bufferization.to_tensor", location)
+        .add_operands(&[memref_val])
+        .add_attributes(&[(Identifier::new(ctx.context, "restrict"), restrict)])
+        .add_results(&[native_ty])
+        .build()
+        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build bufferization.to_tensor: {e}"));
+    block.append_operation(to_tensor).result(0).unwrap().into()
 }
 
 /// `PrimOp::FieldStore { struct_ty, field }`, `args = [base, value]` — a

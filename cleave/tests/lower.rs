@@ -33,6 +33,27 @@ fn only_stmt_expr(body: &Option<Block>) -> &Expr {
         .expect("expected a tail expression")
 }
 
+fn lower_one_algebra(src: &str) -> AlgebraDecl {
+    let program = lower_program(src);
+    assert_eq!(
+        program.items.len(),
+        1,
+        "expected exactly one item in {src:?}"
+    );
+    match program.items.into_iter().next().unwrap().kind {
+        ItemKind::Algebra(d) => d,
+        other => panic!("expected an algebra item, got {other:?}"),
+    }
+}
+
+fn only_adjoint_rule(d: &AlgebraDecl) -> &AdjointRuleDecl {
+    assert_eq!(d.items.len(), 1, "expected exactly one algebra item");
+    match &d.items[0].kind {
+        AlgebraItemKind::AdjointRule(ar) => ar,
+        other => panic!("expected an AdjointRule item, got {other:?}"),
+    }
+}
+
 #[test]
 fn array_repeat_literal_desugars_to_n_copies() {
     let f = lower_one_fn("fn f() { [0.0; 4] }");
@@ -710,4 +731,53 @@ fn extern_and_export_are_mutually_exclusive_at_the_grammar_level() {
         result.is_err(),
         "expected a parse error for `extern export fn`"
     );
+}
+
+// ---------------------------------------------------------------- adjoint rule decl
+
+#[test]
+fn adjoint_rule_decl_lowers_with_method_params_upstream_and_body() {
+    let d = lower_one_algebra(
+        "algebra Ring<T> { adjoint mul(a, b), u: (mul(u, b), mul(u, a)); }",
+    );
+    let ar = only_adjoint_rule(&d);
+    assert_eq!(ar.method, "mul");
+    assert_eq!(ar.params.len(), 2);
+    assert_eq!(ar.params[0].name, "a");
+    assert_eq!(ar.params[1].name, "b");
+    assert_eq!(ar.upstream, "u");
+    // The body is a 2-arity tuple -- already desugared to `__Tuple2`
+    // construction by the time it reaches here (`lower_tuple_lit`), same as
+    // any other tuple literal in this compiler.
+    match &ar.body.kind {
+        ExprKind::StructLit(path, _, fields) => {
+            assert_eq!(path.segments, vec!["__Tuple2".to_string()]);
+            assert_eq!(fields.len(), 2);
+        }
+        other => panic!("expected a StructLit (desugared tuple), got {other:?}"),
+    }
+}
+
+#[test]
+fn adjoint_rule_decl_with_one_param_lowers_a_bare_expr_body() {
+    let d = lower_one_algebra("algebra Ring<T> { adjoint neg(a), u: neg(u); }");
+    let ar = only_adjoint_rule(&d);
+    assert_eq!(ar.params.len(), 1);
+    assert!(
+        !matches!(&ar.body.kind, ExprKind::StructLit(path, _, _) if path.segments == ["__Tuple2".to_string()]),
+        "a single-param rule's own body should stay a bare expr, not a tuple"
+    );
+}
+
+#[test]
+#[should_panic(expected = "rule body is a 2-tuple")]
+fn adjoint_rule_decl_rejects_a_tuple_body_with_the_wrong_arity() {
+    // `mul` has 2 params but the body is written as if it had 1.
+    lower_one_algebra("algebra Ring<T> { adjoint neg(a), u: (mul(u, a), u); }");
+}
+
+#[test]
+#[should_panic(expected = "rule body is a single expression")]
+fn adjoint_rule_decl_rejects_a_bare_expr_body_when_arity_is_greater_than_one() {
+    lower_one_algebra("algebra Ring<T> { adjoint mul(a, b), u: mul(u, a); }");
 }

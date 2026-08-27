@@ -71,6 +71,12 @@ struct AlgebraEntry {
     /// derivative_rule_rewrites` to build real e-graph `Rewrite`s per
     /// reached concrete type.
     derivative_rules: Vec<DerivativeRuleDecl>,
+    /// Every `adjoint` rule declared directly on this algebra (`doc/
+    /// backlog.md`'s own "reverse-mode differentiation" item) — mirrors
+    /// `derivative_rules` exactly: trusted, unvalidated data, consumed by
+    /// the reverse-mode backward pass to look up each reached (algebra,
+    /// method, concrete type)'s own declared contribution rule.
+    adjoint_rules: Vec<AdjointRuleDecl>,
     /// Keyed by the target type's canonical string (`fmt_type`) — same
     /// grouping key `driver.rs` uses to merge `impl` fragments.
     impls: HashMap<String, ImplEntry>,
@@ -106,7 +112,9 @@ impl Registry {
                     .iter()
                     .filter_map(|ai| match &ai.kind {
                         AlgebraItemKind::FnSig(sig) => Some(sig.clone()),
-                        AlgebraItemKind::Axiom(_) | AlgebraItemKind::DerivativeRule(_) => None,
+                        AlgebraItemKind::Axiom(_)
+                        | AlgebraItemKind::DerivativeRule(_)
+                        | AlgebraItemKind::AdjointRule(_) => None,
                     })
                     .collect();
                 let axioms = d
@@ -114,7 +122,9 @@ impl Registry {
                     .iter()
                     .filter_map(|ai| match &ai.kind {
                         AlgebraItemKind::Axiom(axiom) => Some(axiom.clone()),
-                        AlgebraItemKind::FnSig(_) | AlgebraItemKind::DerivativeRule(_) => None,
+                        AlgebraItemKind::FnSig(_)
+                        | AlgebraItemKind::DerivativeRule(_)
+                        | AlgebraItemKind::AdjointRule(_) => None,
                     })
                     .collect();
                 let derivative_rules = d
@@ -122,7 +132,19 @@ impl Registry {
                     .iter()
                     .filter_map(|ai| match &ai.kind {
                         AlgebraItemKind::DerivativeRule(dr) => Some(dr.clone()),
-                        AlgebraItemKind::FnSig(_) | AlgebraItemKind::Axiom(_) => None,
+                        AlgebraItemKind::FnSig(_)
+                        | AlgebraItemKind::Axiom(_)
+                        | AlgebraItemKind::AdjointRule(_) => None,
+                    })
+                    .collect();
+                let adjoint_rules = d
+                    .items
+                    .iter()
+                    .filter_map(|ai| match &ai.kind {
+                        AlgebraItemKind::AdjointRule(ar) => Some(ar.clone()),
+                        AlgebraItemKind::FnSig(_)
+                        | AlgebraItemKind::Axiom(_)
+                        | AlgebraItemKind::DerivativeRule(_) => None,
                     })
                     .collect();
                 algebras
@@ -133,6 +155,7 @@ impl Registry {
                         sigs,
                         axioms,
                         derivative_rules,
+                        adjoint_rules,
                         impls: HashMap::new(),
                     });
             }
@@ -148,6 +171,7 @@ impl Registry {
                         sigs: Vec::new(),
                         axioms: Vec::new(),
                         derivative_rules: Vec::new(),
+                        adjoint_rules: Vec::new(),
                         impls: HashMap::new(),
                     });
                 // `fmt_type(target)` alone would collide two *different*
@@ -337,6 +361,15 @@ impl Registry {
         self.algebras
             .get(algebra)
             .map(|e| e.derivative_rules.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Every `adjoint` rule declared on `algebra` — see `AlgebraEntry::
+    /// adjoint_rules`'s own doc comment.
+    pub fn adjoint_rules(&self, algebra: &str) -> &[AdjointRuleDecl] {
+        self.algebras
+            .get(algebra)
+            .map(|e| e.adjoint_rules.as_slice())
             .unwrap_or(&[])
     }
 

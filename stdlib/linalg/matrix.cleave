@@ -22,6 +22,43 @@
 algebra MatMul<A, B, C> {
     fn matmul(a: A, b: B) -> C;
     derivative matmul(a, b): add(matmul(d(a), b), matmul(a, d(b)));
+    // The real linear-algebra adjoint of matrix multiplication: for
+    // `Z = H*W` (`H: R^{n x m}`, `W: R^{m x k}`), `dH = dZ*W^T`, `dW = H^T*dZ`
+    // — the two transposes are the two adjoints of the same bilinear map,
+    // one per argument (`⟨Av,w⟩ = ⟨v,A^*w⟩`, `A^* = A^T` for a real matrix
+    // under the standard inner product). Needs `Transpose<A,B>` (just
+    // below) — unlike the `derivative` rule above (which recurses through
+    // `d(a)`/`d(b)` and never itself needs a transpose), the reverse-mode
+    // rule must physically reorient each operand to route the upstream
+    // adjoint `u` back through the correct contracted dimension.
+    adjoint matmul(a, b), u: (matmul(u, transpose(b)), matmul(transpose(a), u));
+}
+
+// The adjoint's own real dependency, not matmul's: `A: R^{n x m} -> A^T:
+// R^{m x n}`. Deliberately its own algebra, rank-2-specific like `MatMul`
+// itself (not pack-generic like `Ring`/`Index` in `tensor.cleave`) — a
+// transpose permutes two *specific*, individually-named dimensions, the
+// same reason `MatMul` itself isn't pack-generic either (see its own doc
+// comment above).
+algebra Transpose<A, B> {
+    fn transpose(a: A) -> B;
+}
+
+impl<T: Float, const N: i32, const M: i32> Transpose<Tensor<T,N,M>, Tensor<T,M,N>> {
+    fn transpose(a) {
+        // Reuses `matmul`'s own established fix exactly (see its own impl
+        // body's doc comment): `linalg.transpose` is a structured op with a
+        // real payload region (`mlir_lower.rs::build_linalg_region`,
+        // generic across the whole `linalg.` dialect prefix) that computes
+        // `out := out + in` per element, not "the whole result, `outs` is
+        // only a shape hint" — a genuinely zero-filled `Ring::zero()`
+        // accumulator makes that degenerate to a plain copy (`0 + in = in`)
+        // at each of `permutation`'s own remapped positions, exactly
+        // transpose's own semantics. `permutation: "array<i64: 1, 0>"` is
+        // the only 2D permutation this impl needs — swap the two axes.
+        let init: Tensor<T,M,N> = Ring::zero();
+        mlir::linalg::transpose(a, init, permutation: "array<i64: 1, 0>")
+    }
 }
 
 impl<T: Float, const N: i32, const M: i32, const K: i32>

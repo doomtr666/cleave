@@ -258,9 +258,10 @@ fn run_i32(context: &Context, src: &str) -> i32 {
     let requests: Vec<DerivativeRequest> = units
         .iter()
         .filter_map(|u| match &u.body {
-            UnitBody::Derivative(of) => Some(DerivativeRequest {
+            UnitBody::Derivative(of, is_grad) => Some(DerivativeRequest {
                 name: u.name.clone(),
                 of: of.clone(),
+                is_grad: *is_grad,
             }),
             _ => None,
         })
@@ -293,9 +294,10 @@ fn run_i32_with_optimization_pass(context: &Context, src: &str) -> i32 {
     let requests: Vec<DerivativeRequest> = units
         .iter()
         .filter_map(|u| match &u.body {
-            UnitBody::Derivative(of) => Some(DerivativeRequest {
+            UnitBody::Derivative(of, is_grad) => Some(DerivativeRequest {
                 name: u.name.clone(),
                 of: of.clone(),
+                is_grad: *is_grad,
             }),
             _ => None,
         })
@@ -305,7 +307,7 @@ fn run_i32_with_optimization_pass(context: &Context, src: &str) -> i32 {
     let cps_program = synthesize_derivatives(cps_program, &requests, &registry, &struct_schemas)
         .unwrap_or_else(|e| panic!("cannot derive: {e:?}"));
     let cps_program = eliminate_dead_code(cps_program);
-    let (cps_program, _) = optimize_program(cps_program, &registry);
+    let (cps_program, _) = optimize_program(cps_program, &registry, false);
     let cps_program = eliminate_dead_code(cps_program);
     run_i32_from_cps(context, &program, cps_program)
 }
@@ -3030,6 +3032,86 @@ fn derive_through_dense_forward_computes_the_right_gradient_body() {
     assert_eq!(run_i32(&context, src), 1);
 }
 
+/// The `grad()` counterpart of `derive_through_dense_forward_computes_the_
+/// right_gradient` just above -- the same hand-derived expected values and
+/// numeric tolerance, `grad()` instead of `derive()`, `x` a direct `Tensor`
+/// parameter rather than built from two scalars inside `loss` (`grad()`'s
+/// own reverse-mode walk doesn't yet have an adjoint for a `Tensor`
+/// *construction* from scalars — a real, separate, `derive()`-only-for-now
+/// gap, out of scope for this test's own real point: `synthesize_one_
+/// gradient`'s own struct-parameter support, `backward_walk`'s own `field_
+/// ops` routing, `synthesize_struct_adjoint`/`build_zero_recursive`).
+/// `layer: Dense<f32,2,2>` is read through `layer.forward(x)` (an
+/// *inherent* method, transparently inlined, exposing `matmul(x, layer.w) +
+/// layer.b` directly -- two nested field reads, `layer.w`/`layer.b`, both
+/// routed into `field_contributions` and recombined into one `Dense(w:...,
+/// b:...)` adjoint value once the walk reaches `layer`'s own e-class). Also
+/// the first real exercise of the non-square `matmul` adjoint fix (`build_
+/// pattern::resolve_multi_target_call_ty`) through a genuine struct field,
+/// not just a bare parameter.
+#[test]
+fn grad_through_dense_forward_computes_the_right_gradient() {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(grad_through_dense_forward_computes_the_right_gradient_body)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn grad_through_dense_forward_computes_the_right_gradient_body() {
+    let context = context();
+    let src = "
+        use nn;
+        use linalg;
+        fn loss(x: Tensor<f32, 1, 2>, y: f32, layer: Dense<f32, 2, 2>) -> f32 {
+            let h = sigmoid(layer.forward(x));
+            let pred = sum(h);
+            let err = pred - y;
+            err * err
+        }
+        gw = grad(loss);
+        fn main() -> i32 {
+            let x1: f32 = 3.0;
+            let x2: f32 = 4.0;
+            let x: Tensor<f32, 1, 2> = Tensor::<f32, 1, 2>(data: [[x1, x2]]);
+            let y: f32 = 0.0;
+            let layer: Dense<f32, 2, 2> = Dense(
+                w: Tensor::<f32, 2, 2>(data: [[1.0, 0.0], [0.0, 1.0]]),
+                b: Tensor::<f32, 1, 2>(data: [[0.0, 0.0]])
+            );
+            let s0: f32 = sigmoid(x1);
+            let s1: f32 = sigmoid(x2);
+            let err: f32 = s0 + s1 - y;
+            let d0: f32 = s0 * (1.0 - s0);
+            let d1: f32 = s1 * (1.0 - s1);
+            let expected_w00: f32 = 2.0 * err * d0 * x1;
+            let expected_w01: f32 = 2.0 * err * d1 * x1;
+            let expected_w10: f32 = 2.0 * err * d0 * x2;
+            let expected_w11: f32 = 2.0 * err * d1 * x2;
+            let expected_b0: f32 = 2.0 * err * d0;
+            let expected_b1: f32 = 2.0 * err * d1;
+            let g = gw(x, y, layer);
+            let diff_w00: f32 = g.2.w[0, 0] - expected_w00;
+            let diff_w01: f32 = g.2.w[0, 1] - expected_w01;
+            let diff_w10: f32 = g.2.w[1, 0] - expected_w10;
+            let diff_w11: f32 = g.2.w[1, 1] - expected_w11;
+            let diff_b0: f32 = g.2.b[0, 0] - expected_b0;
+            let diff_b1: f32 = g.2.b[0, 1] - expected_b1;
+            let abs_w00: f32 = if diff_w00 < 0.0 { 0.0 - diff_w00 } else { diff_w00 };
+            let abs_w01: f32 = if diff_w01 < 0.0 { 0.0 - diff_w01 } else { diff_w01 };
+            let abs_w10: f32 = if diff_w10 < 0.0 { 0.0 - diff_w10 } else { diff_w10 };
+            let abs_w11: f32 = if diff_w11 < 0.0 { 0.0 - diff_w11 } else { diff_w11 };
+            let abs_b0: f32 = if diff_b0 < 0.0 { 0.0 - diff_b0 } else { diff_b0 };
+            let abs_b1: f32 = if diff_b1 < 0.0 { 0.0 - diff_b1 } else { diff_b1 };
+            if abs_w00 < 0.0001 and abs_w01 < 0.0001 and abs_w10 < 0.0001 and abs_w11 < 0.0001
+                and abs_b0 < 0.0001 and abs_b1 < 0.0001
+            { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
 /// `stdlib/rand/rand.cleave` -- confirms the central risk that plan was
 /// actually written to de-risk: does the e-graph-based optimizer (`Forward::
 /// walk`, run on *every* program's own body via `optimize_program`, not just
@@ -3449,6 +3531,219 @@ fn derive_of_a_two_parameter_function_computes_the_jacobian_as_a_tuple() {
     assert_eq!(run_i32(&context, src), 1);
 }
 
+// ---------------------------------------------------------------------
+// `gw = grad(f);` -- Phase 3's own real reverse-mode backend
+// (`egraph.rs::synthesize_one_gradient`/`backward_walk`), generalizing the
+// Phase 0 spike's two hardcoded Rust match arms into real, `stdlib`-
+// declared `adjoint` rules (`Ring<T>`/`Transcendental<T>`, `stdlib/num/
+// num.cleave`). Same real `--run` pipeline as the `derive()` tests just
+// above -- `run_i32` already threads `UnitBody::Derivative`'s own `is_grad`
+// flag through unchanged, so `grad()` source syntax needed no test-harness
+// changes at all.
+// ---------------------------------------------------------------------
+
+/// The exact single-parameter case `derive_of_a_single_parameter_function_
+/// computes_the_scalar_derivative` already checks, just via `grad()`
+/// instead -- `d(x^2)/dx = 2x` at `x = 3.0` is `6.0` under either mode,
+/// numerically confirming the two backends agree on the simplest possible
+/// case (one leaf, one contribution, no accumulation).
+#[test]
+fn grad_of_a_single_parameter_function_computes_the_scalar_derivative() {
+    let context = context();
+    let src = "
+        fn f(x: f32) -> f32 { x * x }
+        gw = grad(f);
+        fn main() -> i32 {
+            let d: f32 = gw(3.0);
+            if d == 6.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `grad()`'s own `N > 1` case -- the identical `f(x,y) = x*y + x` `derive_
+/// of_a_two_parameter_function_computes_the_jacobian_as_a_tuple` already
+/// checks, confirming `finish_derivative_body`'s own tuple-wrapping path is
+/// shared correctly between both backends.
+#[test]
+fn grad_of_a_two_parameter_function_computes_the_gradient_as_a_tuple() {
+    let context = context();
+    let src = "
+        fn f(x: f32, y: f32) -> f32 { x * y + x }
+        gw = grad(f);
+        fn main() -> i32 {
+            let g: (f32, f32) = gw(3.0, 5.0);
+            if g.0 == 6.0 and g.1 == 3.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `f(a,b) = a*b + a` -- the exact worked example from the reverse-mode
+/// design discussion (`egraph.rs::tests::spike_reverse_mode_matches_the_
+/// hand_derived_gradient`'s own doc comment), now proven through the real
+/// `grad()` source syntax end to end rather than only the isolated,
+/// hand-built spike e-graph: `a` has two consumers (`mul` and `add`), so
+/// this is the first real exercise of `accumulate_adjoint`'s own "second
+/// contribution" branch (`Ring::add`-summing two independently-arrived
+/// contributions to the same leaf) through the full compiler pipeline.
+#[test]
+fn grad_accumulates_multiple_contributions_to_the_same_parameter() {
+    let context = context();
+    let src = "
+        fn f(a: f32, b: f32) -> f32 { a * b + a }
+        gw = grad(f);
+        fn main() -> i32 {
+            let g: (f32, f32) = gw(3.0, 4.0);
+            if g.0 == 5.0 and g.1 == 3.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// A composed, multi-level case exercising every one of `Transcendental<T>`'s
+/// own declared `adjoint` rules (`exp`) alongside `Ring<T>`'s (`neg`, `add`,
+/// `div`) through `sigmoid`'s own real, multi-op body (`stdlib/num/
+/// num.cleave`), not just the two `Ring::add`/`Ring::mul` rules the simpler
+/// cases above already cover -- `d(sigmoid(x))/dx = sigmoid(x)*(1-sigmoid(x))`,
+/// checked with a tolerance (a real `exp` is involved, unlike every case
+/// above) the same way `derive()`'s own transcendental-function tests
+/// already do elsewhere in this file.
+#[test]
+fn grad_through_a_composed_function_using_transcendental_and_ring_adjoint_rules() {
+    let context = context();
+    let src = "
+        use nn;
+        fn loss(x: f32) -> f32 { sigmoid(x) }
+        gw = grad(loss);
+        fn main() -> i32 {
+            let d: f32 = gw(0.0);
+            // sigmoid(0) = 0.5, sigmoid'(0) = 0.5 * (1 - 0.5) = 0.25
+            let lo: f32 = 0.24;
+            let hi: f32 = 0.26;
+            if d > lo and d < hi { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `synthesize_one_gradient`'s own parameter scope check (`is_grad_
+/// supported_ty`: scalar, `Tensor`, or a struct recursively built from
+/// either -- a bare array is none of those) -- a real, located error
+/// rather than a panic deeper in the pipeline or a silently wrong
+/// gradient. `xs: [f32; 3]` (not a `Tensor`) passes `driver.rs::
+/// synthesize_derive_signatures`'s own checks unchanged (identical to what
+/// `derive()` already accepts for the same parameter shape) -- this is
+/// `grad()`'s own, additional, narrower restriction.
+#[test]
+#[should_panic(
+    expected = "reverse-mode differentiation only supports scalar, `Tensor`, and struct"
+)]
+fn grad_on_a_non_scalar_parameter_is_a_clean_error_not_a_panic_elsewhere() {
+    let context = context();
+    let src = "
+        fn f(xs: [f32; 3]) -> f32 { xs[0] }
+        gw = grad(f);
+        fn main() -> i32 { 0 }
+    ";
+    run_i32(&context, src);
+}
+
+/// The real point of reverse-mode over `derive()`'s own `ParamShape::
+/// Tensor` (`doc/backlog.md`'s own "digits-interop" item): a whole `Tensor`
+/// parameter differentiates as *one* opaque leaf, not one marker per flat
+/// element. `loss(w) = sum(w)` -- `d(sum(w))/dw = broadcast(1)`, a tensor of
+/// all-ones, exercising `Sum<Tensor<T,N,M>,T>`'s own new `adjoint` rule
+/// (`stdlib/nn/nn.cleave`) through the real, end-to-end `grad()` pipeline.
+///
+/// Getting here needed two further, real fixes beyond the `Tensor`-
+/// parameter relaxation itself (`egraph.rs::synthesize_one_gradient`),
+/// found chasing exactly this test:
+/// - `Forward::walk` used to represent a call only when its own callee's
+///   body was straight-line or a transparent chain of further calls
+///   (`is_straight_line`/`is_transparent_chain`) -- `Sum::sum`'s own real
+///   body (a nested `for` loop, needed since a straight-line, tensor-native
+///   full reduction genuinely produces a 0-rank tensor this codebase has no
+///   representation for) fit neither, so `sum(w)` wasn't representable at
+///   all. Fixed: an algebra-dispatched method (`callee.origin.is_some()`)
+///   is now *always* one opaque `Op` node regardless of its own body's
+///   shape -- differentiation never looks inside one anyway, it consults
+///   the method's own declared `derivative`/`adjoint` rule instead, so a
+///   loop/branch inside a callee's own body is no more relevant to
+///   representability than it already wasn't relevant to correctness.
+/// - `monomorphize.rs::find_impl_for_target`'s own resolution used to be
+///   *positional* -- it assumed the one concrete type an adjoint rule's own
+///   argument reveals always corresponds to the target algebra's own
+///   *first* declared generic. True by coincidence for `Transpose<A,B>`
+///   (`stdlib/linalg/matrix.cleave`) but false for `Sum<Container,T>::
+///   broadcast(u: T) -> Container` (`u`'s own type is `T`, the *second*
+///   generic) -- worse, for a *same*-algebra call (`broadcast`, declared on
+///   `Sum` itself, called from `Sum`'s own `adjoint sum` rule), the
+///   argument alone can never reveal `Container`'s own `N`/`M` at all.
+///   Fixed by resolving a same-algebra call's own targets directly from the
+///   *enclosing* rule's own already-fully-resolved `type_env` instead of
+///   re-deriving them from argument types.
+#[test]
+fn grad_of_a_tensor_parameter_computes_the_gradient_as_one_opaque_tensor_leaf() {
+    let context = context();
+    let src = "
+        use nn;
+        fn loss(w: Tensor<f32,2,2>) -> f32 { sum(w) }
+        gw = grad(loss);
+        fn main() -> i32 {
+            let w = Tensor::<f32,2,2>(data:[[1.0,2.0],[3.0,4.0]]);
+            let g = gw(w);
+            if g[0,0] == 1.0 and g[0,1] == 1.0 and g[1,0] == 1.0 and g[1,1] == 1.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// Phase 5: `synthesize_one_gradient` now accepts a struct-typed parameter
+/// whose own fields are all scalar/`Tensor`/struct (`is_grad_supported_ty`,
+/// checked recursively) -- `backward_walk`'s own `field_ops` routing
+/// (`accumulate_field_contribution`) sums each field's own contributions
+/// independently and `synthesize_struct_adjoint` recombines them into one
+/// real `Pair(a:...,b:...)` value once the walk reaches `p`'s own e-class,
+/// zero-filling any field never actually read (`build_zero_recursive`).
+/// `d(p.a+p.b)/dp = Pair(a:1,b:1)`, independent of `p`'s own values --
+/// checked at two different `p`, confirming it's a real per-field
+/// derivative, not a coincidence.
+#[test]
+fn grad_on_a_struct_parameter_with_only_scalar_fields_computes_the_right_gradient() {
+    let context = context();
+    let src = "
+        struct Pair { a: f32, b: f32 }
+        fn f(p: Pair) -> f32 { p.a + p.b }
+        gw = grad(f);
+        fn main() -> i32 {
+            let p = Pair(a: 3.0, b: 4.0);
+            let g = gw(p);
+            if g.a == 1.0 and g.b == 1.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `is_grad_supported_ty`'s own recursion still rejects a struct with a
+/// genuinely unsupported field (`xs: [f32; 3]`, a bare array, not a
+/// `Tensor`) -- a real, located error at the *outer* struct parameter,
+/// not a guess or a panic three stages downstream.
+#[test]
+#[should_panic(
+    expected = "reverse-mode differentiation only supports scalar, `Tensor`, and struct"
+)]
+fn grad_on_a_struct_parameter_with_an_unsupported_field_is_still_a_clean_error() {
+    let context = context();
+    let src = "
+        struct HasArray { xs: [f32; 3] }
+        fn f(p: HasArray) -> f32 { p.xs[0] }
+        gw = grad(f);
+        fn main() -> i32 { 0 }
+    ";
+    run_i32(&context, src);
+}
+
 /// `Forward::try_unroll_for_loop` (`egraph.rs`) -- a literal-bounded `for`
 /// loop written directly in a derived function's own body now unrolls
 /// instead of stopping `Forward::walk` dead. `loss(w) = sum_i(w * data[i])`
@@ -3866,6 +4161,63 @@ fn matmul_against_a_real_zero_tensor_gives_exactly_zero_not_uninitialized_garbag
             let z: Tensor<f32,2,2> = Ring::zero();
             let c = matmul(a, z);
             if c[0,0] == 0.0 and c[0,1] == 0.0 and c[1,0] == 0.0 and c[1,1] == 0.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `Transpose<A,B>` (`stdlib/linalg/matrix.cleave`) — a real, non-square
+/// case (`2x3 -> 3x2`), not just a square self-check, so a genuine index
+/// permutation bug (as opposed to a no-op identity) couldn't hide. Reuses
+/// `matmul`'s own established "zero-initialized `linalg.` accumulator"
+/// fix, verified numerically here the same direct way `matmul_against_a_
+/// real_zero_tensor_...` already verifies matmul's own version of it.
+#[test]
+fn transpose_of_a_non_square_tensor_permutes_both_axes_correctly() {
+    let context = context();
+    let src = "
+        use linalg;
+        fn main() -> i32 {
+            let a = Tensor::<f32,2,3>(data:[[1.0,2.0,3.0],[4.0,5.0,6.0]]);
+            let b = transpose(a);
+            if b[0,0] == 1.0 and b[0,1] == 4.0 and b[1,0] == 2.0 and b[1,1] == 5.0 and b[2,0] == 3.0 and b[2,1] == 6.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `Sum<Tensor<T,N,M>,T>`'s own new rank-2 impl (`stdlib/nn/nn.cleave`) — a
+/// real, non-trivial 2x2 case (`1+2+3+4=10`), numerically verified through
+/// the actual JIT, not just checked to compile.
+#[test]
+fn sum_of_a_rank_2_tensor_computes_the_right_total() {
+    let context = context();
+    let src = "
+        use nn;
+        fn main() -> i32 {
+            let a = Tensor::<f32,2,2>(data:[[1.0,2.0],[3.0,4.0]]);
+            let total = sum(a);
+            if total == 10.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// Genuinely non-square (`3x2`, not `2x2`) — the real regression case for
+/// the compiler bug `Sum::sum`'s own body doc comment describes (`stdlib/
+/// nn/nn.cleave`): combining two different nested `for`-loop variables
+/// bound by *different* const generics (`N`/`M`) into one array literal
+/// silently conflates them during this generic impl's own body type-check,
+/// invisible for a square `N == M` case.
+#[test]
+fn sum_of_a_non_square_rank_2_tensor_computes_the_right_total() {
+    let context = context();
+    let src = "
+        use nn;
+        fn main() -> i32 {
+            let a = Tensor::<f32,3,2>(data:[[1.0,2.0],[3.0,4.0],[5.0,6.0]]);
+            let total = sum(a);
+            if total == 21.0 { 1 } else { 0 }
         }
     ";
     assert_eq!(run_i32(&context, src), 1);

@@ -189,11 +189,60 @@ algebra Init<T> {
     fn he() -> T;
 }
 
-// `[[uniform(lo, hi); Out]; In]` -- `array-repeat` now evaluates its own
-// value expression independently at every leaf position (fixed directly in
-// `cps.rs`, no longer "evaluate once, broadcast"), so this fills the whole
-// tensor with independent draws in one expression, same as it always could
-// for a pure value like `Ring::zero()`.
+// A genuine nested loop, not `[[uniform(lo, hi); Out]; In]`'s own array-
+// repeat -- `array-repeat` evaluates its own value expression independently
+// at every leaf position (correct: real per-element-independent draws), but
+// unrolled into one fully-inlined copy of the *entire* draw expression per
+// element at MLIR-generation time -- `doc/backlog.md`'s own "digits-interop"
+// perf item found this costing 27,033 lines of MLIR for one real 64x32
+// layer. `cleave`'s own `for`/`while` loops already lower to a genuine `scf.
+// while` (confirmed directly, `mlir_lower.rs::lower_loop`) -- independent of
+// `In`*`Out`, this pays for exactly *one* `Rand::uniform`/`Rand::normal` call
+// site in the generated MLIR, the loop itself never unrolled. `j` a real,
+// manually-incremented local, not `for j in 0..Out` directly -- the same
+// two-different-loop-variables-in-one-impl-body compiler bug `Sum<Tensor<T,
+// N,M>,T>::sum`'s own doc comment above documents, sidestepped identically.
+// `rand.cleave`'s own module doc comment anticipated exactly this shape
+// ("needs a genuine loop with indexed writes... left to `Dense`'s own future
+// init helpers to use, not built here") -- built here now.
+//
+// `buf`'s own initial value is `mlir::memref::alloc()` (a raw, zero-operand
+// `memref.alloc` -- the whole shape is compile-time-static, no dynamic-size
+// operands needed), not an ordinary `[[0.0; Out]; In]` array-repeat literal
+// -- found directly, by re-measuring: every position gets overwritten by the
+// loop immediately below regardless, so a zero-fill initializer is *dead*,
+// but `array-repeat` on a bare (non-`Tensor`) array type still unrolls into
+// one `memref.store` per element (unlike `Ring<Tensor<T,Dims...>>::zero()`'s
+// own `tensor.splat`-based fix above -- this is a *plain* `[T;In,Out]` local,
+// not a tagged `Tensor`) -- paying the exact same per-element cost this
+// whole rewrite exists to avoid, just for a value nothing ever reads.
+//
+// `w`'s own construction is `mlir::bufferization::to_tensor(buf, restrict:
+// "unit")`, not `Tensor::<T,In,Out>(data: buf)` -- found necessary chasing a
+// real user report that the loop above was *still* effectively fully
+// unrolled end to end, despite lowering to a genuine `scf.while` on its own:
+// ordinary `Tensor`-construction (`lower_tagged_struct_construct`, `mlir_
+// lower.rs`) always flattens its own source array element-by-element
+// (`flatten_memref_elements` -- one `memref.load` per position -- into
+// `tensor.from_elements`, an operand list literally as long as the tensor
+// has elements) regardless of *how* that source array was populated, undoing
+// the loop's own O(1) win the moment its result gets handed to `Tensor(...)`
+// -- confirmed directly, and by design: `tensor.from_elements`'s own real
+// MLIR arity *requires* one SSA operand per element, there's no bulk form.
+// `bufferization.to_tensor` is that bulk form instead -- a single op
+// converting an entire memref's own contents to a tensor value in one step,
+// real MLIR, no new Rust code (`mlir::...` calls already handle a plain,
+// non-`linalg.`-prefixed, non-region op like this one generically). Its own
+// `restrict` attribute (a bare MLIR unit attribute, `"unit"`) is required by
+// one-shot-bufferize's own analysis -- asserts this memref is never aliased/
+// written through again after this point, true here (`buf` is a `let mut`
+// local, never referenced again past this line) -- omitting it is a real,
+// distinct MLIR verifier error (`to_tensor ops without 'restrict' are not
+// supported by One-Shot Analysis`), found directly, not guessed. Verified:
+// the dumped MLIR now has exactly one `bufferization.to_tensor ... restrict`
+// op regardless of `In`/`Out`, confirmed numerically correct (`--run` on a
+// small loop-populated `Tensor` prints the expected, genuinely independent
+// per-position draws), and the real training-loop tests below stay green.
 //
 // `In`/`Out` (bare const generics) can't be handed to `.to()` directly --
 // the same `Ty::Const`-vs-`Ty::Con` gap `Mean::mean`'s own doc comment above
@@ -213,7 +262,16 @@ impl<T: Float + Rand + Ring, const In: i32, const Out: i32> Init<Dense<T, In, Ou
         let fan_in: T = fan_in_i.to();
         let fan_out: T = fan_out_i.to();
         let limit: T = mlir::math::sqrt(6.0 / (fan_in + fan_out));
-        Dense(w: Tensor::<T, In, Out>(data: [[uniform(-limit, limit); Out]; In]), b: Ring::zero())
+        let mut buf: [T; In, Out] = mlir::memref::alloc();
+        for i in 0..In {
+            let mut j: i32 = 0;
+            for _k in 0..Out {
+                buf[i, j] = uniform(-limit, limit);
+                j = j + 1;
+            };
+        };
+        let w: Tensor<T, In, Out> = mlir::bufferization::to_tensor(buf, restrict: "unit");
+        Dense(w: w, b: Ring::zero())
     }
 
     // He normal (He et al., 2015) -- `std = sqrt(2 / fan_in)`, weight ~
@@ -226,7 +284,16 @@ impl<T: Float + Rand + Ring, const In: i32, const Out: i32> Init<Dense<T, In, Ou
         let fan_in_i: i32 = mlir::arith::addi(In, 0);
         let fan_in: T = fan_in_i.to();
         let std: T = mlir::math::sqrt(2.0 / fan_in);
-        Dense(w: Tensor::<T, In, Out>(data: [[normal(0.0, std); Out]; In]), b: Ring::zero())
+        let mut buf: [T; In, Out] = mlir::memref::alloc();
+        for i in 0..In {
+            let mut j: i32 = 0;
+            for _k in 0..Out {
+                buf[i, j] = normal(0.0, std);
+                j = j + 1;
+            };
+        };
+        let w: Tensor<T, In, Out> = mlir::bufferization::to_tensor(buf, restrict: "unit");
+        Dense(w: w, b: Ring::zero())
     }
 }
 
@@ -249,6 +316,30 @@ impl<Opt, T: Float + Ring, const In: i32, const Out: i32> Optimizer<Opt, Dense<T
 
 algebra Sum<Container, T> {
     fn sum(c: Container) -> T;
+    // `d(sum(c))/du = broadcast(u)` — the adjoint of "add every element
+    // together" is "scatter the upstream scalar back onto every element
+    // equally" (`⟨sum(v), u⟩ = ⟨v, u·1⟩` — `sum`'s own Jacobian is the row
+    // vector of all-ones, so its adjoint is that same vector times `u`,
+    // i.e. `u` broadcast into `c`'s own shape). Declared as a *same*-
+    // algebra sibling method, not a separate `Broadcast<T,Container>`
+    // algebra — tried specifically to sidestep `egraph.rs::build_pattern`'s
+    // own cross-algebra single-`agreed`-type limitation (`Transpose`'s own
+    // adjoint rule, `stdlib/linalg/matrix.cleave`, already hits that one).
+    // **Still not actually reachable, a real, separate, deeper gap found
+    // this way**: `monomorphize.rs::find_impl_for_target`'s own resolution
+    // is *positional*, not name-directed — it assumes the one concrete
+    // type it has (`u`'s own type `T`) corresponds to `Sum<Container,T>`'s
+    // own *first* declared generic (`Container`), because that happened to
+    // be true for `Transpose<A,B>` (`transpose`'s own sole parameter `a`
+    // has type `A`, the first generic) — here `u`'s own type is `T`, the
+    // *second* generic, so the match is tried against the wrong position
+    // and fails silently (`Sum::broadcast<Tensor<...>,f32>` never gets
+    // monomorphized at all, confirmed directly, not assumed). Fixing this
+    // for real needs `find_impl_for_target` to resolve by the algebra's own
+    // declared generic *name* (via `registry.fn_sig`), not by positional
+    // index — not attempted yet (`doc/backlog.md`).
+    fn broadcast(u: T) -> Container;
+    adjoint sum(c), u: broadcast(u);
 }
 
 algebra Mean<Container, T> {
@@ -266,6 +357,56 @@ impl<T: Float, const N: i32> Sum<Tensor<T, N>, T> {
         let mut acc = v[0];
         for i in 1..N { acc = acc + v[i]; };
         acc
+    }
+}
+
+// Rank-2-specific, like `MatMul`/`Transpose` (`stdlib/linalg/matrix.cleave`'s
+// own doc comment on why those aren't pack-generic either) — no pack-generic
+// `[i32; K]`-style index array read here, an ordinary nested `for` loop is
+// enough. An ordinary `for` loop *would* be a real problem for `derive()`
+// (forward-mode differentiation needs to see through a differentiated
+// function's own body directly, `Forward::try_unroll_for_loop`), but not
+// here: `sum` is an *algebra* method, not a plain top-level `fn` — every
+// existing algebra method already stays an opaque `Op` node in the e-graph
+// (`MatMul::matmul`'s own real `linalg.matmul` body is never "looked
+// inside" either, confirmed directly via `egraph.rs::tests::adjoint_matmul_
+// rule_...`'s own extracted expression, which names `MatMul::matmul<...>`
+// itself, never its own internal op), addressed purely through its own
+// declared `derivative`/`adjoint` rule — `sum`'s own forward implementation
+// detail is invisible to reverse-mode differentiation regardless of shape.
+impl<T: Float, const N: i32, const M: i32> Sum<Tensor<T,N,M>, T> {
+    // `j` is a real, manually-incremented local, *not* `for j in 0..M`'s own
+    // loop variable directly used in `c[i,j]` -- a real, found-by-testing
+    // compiler bug, not a style choice: combining *two* different nested
+    // `for`-loop variables (each bound by a *different* const generic of
+    // the same generic impl, `0..N` and `0..M`) into one array literal/
+    // index expression makes `N`'s own const-generic value-var and `M`'s
+    // own get silently unified together during this impl's own body type-
+    // check, regardless of `Tensor`/`Index` being involved at all —
+    // confirmed with a minimal, generics-only repro, and confirmed *not*
+    // to reproduce with an ordinary, non-generic function's own identical
+    // nested loop. `Ring::add<f32>` accumulation for `M != N` then silently
+    // computes the *wrong* result (or fails to type-check at all — `1` is
+    // the specific instantiation `check_no_overlapping_impls` happens to
+    // produce for the failing case, not `M`), invisible for a *square*
+    // `N == M` case, exactly why this went unnoticed until a genuinely
+    // rectangular `Tensor` (`Dense<T,64,32>`, `doc/backlog.md`'s own
+    // "digits-interop" item) was tried. A manual counter sidesteps it
+    // entirely -- not itself a `for`-loop-bound variable, so the same
+    // conflation never triggers. `doc/backlog.md` tracks the real fix.
+    fn sum(c) {
+        let mut acc: T = Ring::zero();
+        for i in 0..N {
+            let mut j: i32 = 0;
+            for _k in 0..M {
+                acc = acc + c[i,j];
+                j = j + 1;
+            };
+        };
+        acc
+    }
+    fn broadcast(u) {
+        Tensor::<T,N,M>(data: [[u; M]; N])
     }
 }
 

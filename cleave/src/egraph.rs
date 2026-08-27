@@ -445,6 +445,41 @@ fn is_transparent_chain(
     }
 }
 
+/// Whether `expr` contains no real effect (`is_pure_prim_op`) *anywhere*,
+/// regardless of loops/branches — unlike `is_straight_line` (which also
+/// rejects *any* `Fix`/`If` at all, straight-line by name) and unlike
+/// `is_transparent_chain` (which only ever recurses into a further real
+/// call, never a raw loop/branch structure), this only cares about
+/// observable side effects, recursing straight through `If`/`Fix` instead
+/// of rejecting them — never through a further real *call* (a `Fix`'s own
+/// `defs` are local continuations, e.g. a desugared loop body, not other
+/// top-level units, so no `units` lookup is ever needed here at all, unlike
+/// its two siblings). `Forward::walk`'s own `Fix` arm uses this to decide
+/// whether an algebra-dispatched method whose own body isn't `is_straight_
+/// line` (a real `for` loop, say — `Sum<Tensor<T,N,M>,T>::sum`, `stdlib/nn/
+/// nn.cleave`) can still safely become one opaque `Op` node: differentiation
+/// never looks inside an algebra method's own body regardless (its own
+/// declared `derivative`/`adjoint` rule is the actual source of truth), the
+/// *only* real constraint left is that folding the call into one freely-
+/// reorderable/CSE-able node must not be unsound — exactly what `is_pure_
+/// prim_op` already exists to guarantee (`is_straight_line`'s own doc
+/// comment: `Print<T>::print`'s real `Extern` effect must never be judged
+/// safe to fold this way, loop or no loop).
+fn is_pure(expr: &CExpr) -> bool {
+    match expr {
+        CExpr::LetPrim { op, cont, .. } => is_pure_prim_op(op) && is_pure(cont),
+        CExpr::App { .. } => true,
+        CExpr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => is_pure(then_branch) && is_pure(else_branch),
+        CExpr::Fix { defs, body } => {
+            defs.iter().all(|d| is_pure(&d.body)) && is_pure(body)
+        }
+    }
+}
+
 /// Forward CPS-segment-to-e-graph translation state — one instance per
 /// segment being translated. `env` records, for every `LetPrim`-bound
 /// `CVar` successfully translated so far, which e-class it now corresponds
@@ -751,7 +786,51 @@ impl Forward {
                     recognize_real_call(defs, body)
                 {
                     if let Some(callee) = units.get(unit_name) {
-                        if is_straight_line(&callee.def.body, units) {
+                        // An algebra-dispatched method (`callee.origin.
+                        // is_some()`) whose own body is neither straight-
+                        // line nor a transparent chain (both checked first,
+                        // unchanged — `sigmoid`, a *plain* top-level `fn`
+                        // whose own composed body of further algebra calls
+                        // must still fully inline, not become one opaque
+                        // node with no declared rule of its own) still
+                        // becomes one opaque `Op` node, *provided its own
+                        // body has no real effect anywhere* (`is_pure`, not
+                        // `is_straight_line` — a real loop/branch is fine, an
+                        // `Extern` effect never is, regardless of loops) —
+                        // differentiation never looks inside an algebra
+                        // method's own body at all regardless, it consults
+                        // the method's own declared `derivative`/`adjoint`
+                        // rule instead. `is_straight_line` alone used to gate
+                        // opacity — sound for every existing algebra method
+                        // (a raw `mlir::...` call has no loop/branch to begin
+                        // with), but wrongly rejected a real one whose own
+                        // body happens to use an ordinary `for` loop
+                        // (`Sum<Tensor<T,N,M>,T>::sum`, `stdlib/nn/nn.cleave`
+                        // — a real reduction; a straight-line, tensor-native
+                        // full reduction would need a 0-rank tensor this
+                        // codebase has no representation for): `sum(w)` used
+                        // to not be representable *at all*, confirmed
+                        // empirically, purely because its own internal loop
+                        // was never meant to be looked at in the first
+                        // place. The naive first fix (`callee.origin.
+                        // is_some()` alone, no purity check) was a real,
+                        // caught regression: `Print<T>::print`'s own body
+                        // (`LetPrim{op:Extern{..}} -> App`, `is_straight_
+                        // line`'s own doc comment) is *also* algebra-
+                        // dispatched (`Print<T>`) — `a_real_call_to_an_
+                        // effectful_unit_stops_at_the_fix` caught it folding
+                        // a real, order-dependent `print` effect into a
+                        // freely-reorderable opaque node, exactly the class
+                        // of unsoundness `is_straight_line`'s own effect
+                        // check exists to prevent.
+                        let straight = is_straight_line(&callee.def.body, units);
+                        let transparent = !straight
+                            && is_transparent_chain(&callee.def.body, units, &mut HashSet::new());
+                        if straight
+                            || (callee.origin.is_some()
+                                && !transparent
+                                && is_pure(&callee.def.body))
+                        {
                             if let Some(arg_ids) = self.cvals_to_ids(real_args) {
                                 // A real call's own return type is known
                                 // (`callee.result`) the moment it's first
@@ -789,8 +868,7 @@ impl Forward {
                                 }
                                 return self.walk(rest, units, fresh);
                             }
-                        } else if is_transparent_chain(&callee.def.body, units, &mut HashSet::new())
-                        {
+                        } else if transparent {
                             // Multi-level transparency (`doc/backlog.md`'s
                             // own item) — `callee`'s own body isn't a single
                             // primop (so it can't become one opaque `Op`
@@ -1137,7 +1215,10 @@ fn recognize_real_call<'a>(
 
 // ---------------------------------------------------------------- axiom -> Rewrite
 
-use crate::ast::{AxiomDecl, DerivativeRuleDecl, Expr, ExprKind, tuple_struct_name};
+use crate::ast::{
+    AdjointRuleDecl, AxiomDecl, DerivativeRuleDecl, Expr, ExprKind, GenericArg, Type, TypeKind,
+    tuple_struct_name,
+};
 use crate::registry::Registry;
 use egg::{ENodeOrVar, PatternAst, Rewrite, Var};
 use std::collections::HashSet;
@@ -1272,6 +1353,151 @@ fn resolve_declared_type(
     subst: &HashMap<String, String>,
 ) -> Option<String> {
     subst.get(&crate::print::fmt_type(declared)).cloned()
+}
+
+/// Resolves *every* target type of a genuinely multi-target *cross*-algebra
+/// callee (`Transpose<A,B>`, called from `MatMul`'s own `adjoint` rule) from
+/// however many of its own targets a call's own arguments actually pin —
+/// `build_pattern`'s own `call_ty` used to just take the *one* type its own
+/// arguments agree on as the *entire* target string, silently wrong the
+/// moment the callee has more than one target and they aren't all the same
+/// (`Transpose<A,B>`'s own `B` is only equal to `A` for a square matrix —
+/// found directly: `Dense`'s own `In != Out` layers extract a `Transpose::
+/// transpose<...>` reference naming a unit that was never actually
+/// monomorphized, `monomorphize.rs::seed_adjoint_rule_references`'s own
+/// generic-name-directed fix builds the *real* multi-target name correctly).
+///
+/// Purely textual (`build_pattern`'s own whole representation here —
+/// `ty: &str`, no structured `Ty` in scope), matching one declared impl's
+/// own target-type ASTs (`Registry::all_impls`) structurally against the
+/// concrete type text already known, via `match_type_pattern`/`resolve_
+/// type_pattern` just below — general, not `Transpose`-specific: any future
+/// multi-target algebra whose own impl uses the same flat `Name<arg0, arg1,
+/// ...>` shape (the only one this codebase's stdlib ever declares) resolves
+/// the identical way. `known` pairs a target *index* (`owner`'s own
+/// declared generics, in order) with the concrete text a call argument's
+/// own declared type (a bare name matching that generic) already pinned —
+/// `owner`'s remaining targets, if any, fall out of unifying against the
+/// *one* declared impl whose own pattern actually matches every pinned
+/// position; `None`, not a guess, if no declared impl matches, or the match
+/// leaves some target unresolved.
+fn resolve_multi_target_call_ty(
+    owner: &str,
+    known: &[(usize, &str)],
+    registry: &Registry,
+) -> Option<String> {
+    'templates: for (_, targets) in registry.all_impls(owner) {
+        if known.iter().any(|&(idx, _)| idx >= targets.len()) {
+            continue;
+        }
+        let mut subst: HashMap<String, String> = HashMap::new();
+        for &(idx, concrete) in known {
+            if !match_type_pattern(targets[idx], concrete, &mut subst) {
+                continue 'templates;
+            }
+        }
+        let mut resolved = Vec::with_capacity(targets.len());
+        for t in &targets {
+            match resolve_type_pattern(t, &subst) {
+                Some(s) => resolved.push(s),
+                None => continue 'templates,
+            }
+        }
+        return Some(resolved.join(", "));
+    }
+    None
+}
+
+/// Structurally matches one declared impl target pattern (`Tensor<T,N,M>`)
+/// against a concrete type's own already-known text (`Tensor<f32, 64, 32>`),
+/// extending `subst` (pattern generic name -> concrete text) for each of the
+/// pattern's own generic-name arguments — a bare name already bound must
+/// agree with what's already there (the *same* `T` reused across two
+/// targets, `Transpose<Tensor<T,N,M>,Tensor<T,M,N>>`'s own `T`, must resolve
+/// to the identical concrete text both times). Flat, one level deep — the
+/// only shape any impl in this codebase's own stdlib actually declares
+/// (`Name<arg0, arg1, ...>`, each argument itself either a bare pattern name
+/// or, on the concrete side, already fully resolved) — `false`, not a
+/// guess, for anything deeper (a nested compound argument on either side).
+fn match_type_pattern(pattern: &Type, concrete: &str, subst: &mut HashMap<String, String>) -> bool {
+    let TypeKind::Path(p, gens) = &pattern.kind else {
+        return false;
+    };
+    let name = p.segments.join("::");
+    if gens.is_empty() {
+        // A bare name: one of the impl's own pattern generics (bind or
+        // check agreement) if never seen among any *concrete* leaf name
+        // this codebase's stdlib impls ever declare bare in a target
+        // position — every real one (`Ring<f32>`, say) has no generic
+        // parameters needing resolution *from* it in the first place
+        // (`resolve_multi_target_call_ty`'s own callers only ever reach
+        // here for a genuinely *generic* impl), so treating every bare
+        // name as a pattern variable is sound in practice.
+        return match subst.get(&name) {
+            Some(existing) => existing == concrete,
+            None => {
+                subst.insert(name, concrete.to_string());
+                true
+            }
+        };
+    }
+    let Some(open) = concrete.find('<') else {
+        return false;
+    };
+    let Some(close) = concrete.rfind('>') else {
+        return false;
+    };
+    if concrete[..open] != name {
+        return false;
+    }
+    let parts = split_top_level_commas(&concrete[open + 1..close]);
+    if parts.len() != gens.len() {
+        return false;
+    }
+    gens.iter().zip(parts).all(|(garg, part)| match garg {
+        GenericArg::Type(t) => match_type_pattern(t, part, subst),
+        GenericArg::Const(e) => {
+            let ExprKind::Path(path) = &e.kind else {
+                return false; // a literal int on the *pattern* side isn't expected here -- every const generic this codebase declares is a bare name
+            };
+            let cname = path.segments.join("::");
+            match subst.get(&cname) {
+                Some(existing) => existing == part,
+                None => {
+                    subst.insert(cname, part.to_string());
+                    true
+                }
+            }
+        }
+    })
+}
+
+/// `match_type_pattern`'s own inverse — rebuilds one declared target
+/// pattern's own concrete text from an already-complete `subst`. `None`,
+/// not a guess, the moment any generic name the pattern references was
+/// never actually bound (`resolve_multi_target_call_ty`'s own caller then
+/// correctly tries the next candidate impl, or gives up honestly).
+fn resolve_type_pattern(pattern: &Type, subst: &HashMap<String, String>) -> Option<String> {
+    let TypeKind::Path(p, gens) = &pattern.kind else {
+        return None;
+    };
+    let name = p.segments.join("::");
+    if gens.is_empty() {
+        return subst.get(&name).cloned();
+    }
+    let mut parts = Vec::with_capacity(gens.len());
+    for g in gens {
+        parts.push(match g {
+            GenericArg::Type(t) => resolve_type_pattern(t, subst)?,
+            GenericArg::Const(e) => {
+                let ExprKind::Path(path) = &e.kind else {
+                    return None;
+                };
+                subst.get(&path.segments.join("::")).cloned()?
+            }
+        });
+    }
+    Some(format!("{name}<{}>", parts.join(", ")))
 }
 
 fn axiom_to_rewrite(
@@ -1474,24 +1700,65 @@ fn build_pattern(
                 ids.push(id);
                 arg_types.push(arg_ty);
             }
-            // Same algebra as the one this whole rule is declared on --
-            // reuse the outer, possibly multi-target combined `ty` string
-            // unchanged, exactly like every rule already did before this:
-            // a recursive self-call (`MatMul::matmul` calling itself inside
-            // its own product rule, `Index::index` likewise) is inherently
-            // the *same* multi-target instantiation as the enclosing rule,
-            // not something to re-derive from its own arguments' types.
-            // Otherwise (a genuinely *different* algebra, e.g. `Ring::add`
-            // called from inside `MatMul`'s own rule): every such target in
-            // this codebase's stdlib is single-generic (`Ring<T>`,
-            // `Transcendental<T>`), so the one concrete type its own
-            // (type-bearing) arguments agree on *is* that generic's own
-            // concrete value -- a genuinely multi-generic *different*-
-            // algebra callee bails (`None`) rather than guessing, matching
-            // this function's posture everywhere else.
-            let call_ty = if owner == algebra {
+            let owner_generics: Vec<&str> = registry
+                .generics(&owner)
+                .iter()
+                .filter(|g| !matches!(g, crate::ast::GenericParam::Const { .. }))
+                .map(|g| g.name())
+                .collect();
+            // Every one of `owner`'s own declared targets this call's real
+            // arguments actually pin: each argument whose own declared type
+            // (`sig.params[i].ty`) is a bare name matching one of `owner`'s
+            // own generics pins that generic's own real position -- used
+            // below for *any* multi-target `owner` (same algebra or cross),
+            // not just cross-algebra: a *same*-algebra recursive call
+            // (`MatMul::matmul` calling itself inside its own `derivative`
+            // rule's `d(a)`/`d(b)`-wrapped arguments) genuinely reuses the
+            // *identical* instantiation as the enclosing rule (found here
+            // too, harmlessly, since `d(x)`'s own type always equals `x`'s),
+            // but an `adjoint` rule's own recursive call (`matmul(u,
+            // transpose(b))`, `MatMul`'s own new adjoint rule) does *not* --
+            // `u`'s own shape is the upstream adjoint's, genuinely different
+            // from `a`'s own -- found directly, empirically: naively reusing
+            // `ty` unchanged here named a real, existing unit (the forward
+            // call's own instantiation) but fed it arguments of the *wrong*
+            // shape for it, a real, silent dimensional-mismatch bug, not
+            // just a missing-unit one.
+            let known: Vec<(usize, &str)> = registry
+                .fn_sig(&owner, &method)
+                .into_iter()
+                .flat_map(|sig| arg_types.iter().zip(&sig.params))
+                .filter_map(|(arg_ty, sig_param)| {
+                    let concrete = arg_ty.as_deref()?;
+                    let declared = sig_param.ty.as_ref()?;
+                    let TypeKind::Path(p, gens) = &declared.kind else {
+                        return None;
+                    };
+                    if !gens.is_empty() || p.segments.len() != 1 {
+                        return None;
+                    }
+                    let idx = owner_generics.iter().position(|g| *g == p.segments[0])?;
+                    Some((idx, concrete))
+                })
+                .collect();
+            let call_ty = if owner_generics.len() > 1 {
+                match resolve_multi_target_call_ty(&owner, &known, registry) {
+                    Some(s) => s,
+                    // Same-algebra, nothing pinned (or the match genuinely
+                    // failed) — falling back to the enclosing instantiation
+                    // unchanged is still *safe* here (unlike the cross-
+                    // algebra case, where there's no such fallback and this
+                    // must bail): `ty` is, by construction, always a real,
+                    // valid instantiation of this exact algebra already.
+                    None if owner == algebra => ty.to_string(),
+                    None => return None,
+                }
+            } else if owner == algebra {
                 ty.to_string()
             } else {
+                // Single-target cross-algebra (`Ring<T>`, `Transcendental
+                // <T>`) — every argument's own type must agree, `owner`'s
+                // one generic has no other position it could be.
                 let mut agreed: Option<&str> = None;
                 for t in arg_types.iter().flatten() {
                     match agreed {
@@ -1949,8 +2216,28 @@ impl Applier<CleaveLang, ConstantFold> for IndependentZeroApplier {
             } else {
                 egraph.add(CleaveLang::Int(0))
             };
-            egraph.union(eclass, zero_id);
-            return vec![eclass];
+            // `union`'s own `bool` -- whether `eclass`/`zero_id` were
+            // genuinely *distinct* e-classes before this call, not yet
+            // whether *anything* changed -- was silently discarded here,
+            // always reporting `vec![eclass]` ("real progress made")
+            // regardless. Once this rule has already fired once for a given
+            // `eclass` (a real, common case: the *same* `derivative(a,x)`
+            // marker's own e-class keeps getting re-searched every
+            // iteration, since `union` merges e-classes without deleting
+            // the original matched nodes), every *later* firing is a pure
+            // no-op union -- but egg's own `Runner` has no way to know that
+            // unless told via this exact return value, so it never reaches
+            // `Saturated`: found directly, via `runner.iterations`, on a
+            // real 64x8-scale `derive()` call -- tens of identical
+            // iterations, `applied=[("derivative-independent-zero",
+            // 19075)]`, zero node/class-count change between them, burning
+            // the *entire* 30s time limit on pure no-op re-application while
+            // the real chain-rule work had already genuinely finished many
+            // iterations earlier.
+            if egraph.union(eclass, zero_id) {
+                return vec![eclass];
+            }
+            return vec![];
         }
         let Some(ty) = egraph[a_class].data.own_ty.clone() else {
             return vec![];
@@ -1958,8 +2245,12 @@ impl Applier<CleaveLang, ConstantFold> for IndependentZeroApplier {
         let Some(zero_id) = build_zero(egraph, &ty, &self.unit_names, &self.zero_calls_used) else {
             return vec![];
         };
-        egraph.union(eclass, zero_id);
-        vec![eclass]
+        // See the scalar branch's own doc comment just above -- identical
+        // reasoning, identical fix.
+        if egraph.union(eclass, zero_id) {
+            return vec![eclass];
+        }
+        vec![]
     }
 
     fn vars(&self) -> Vec<Var> {
@@ -2637,7 +2928,35 @@ fn max_cvar_in_program(program: &CpsProgram) -> CVar {
 /// actually changed — `--dump-cps-equivalences`'s own data source; `hld.md`
 /// already names `explain_equivalence` this whole mechanism's primary
 /// debugging tool, given a real CLI surface here rather than later.
-pub fn optimize_program(program: CpsProgram, registry: &Registry) -> (CpsProgram, Vec<String>) {
+/// `want_explanations` -- `egg`'s own `with_explanations_enabled`/`explain_
+/// equivalence` machinery is *not* free, found directly by instrumenting
+/// this whole function after `examples/digits-interop` (`doc/backlog.md`'s
+/// own "digits-interop" perf item) kept compiling slowly even after fixing
+/// the two real `array-repeat` costs documented there: on a real, modest
+/// `Tensor<f32,12,12>` reduction (`Sum::sum`, 614 e-graph nodes after
+/// saturation -- saturating in 2 iterations, under 10ms), `explain_
+/// equivalence` alone -- reconstructing a full rewrite-chain *proof*
+/// connecting the original and optimized forms, not just extracting the
+/// optimized form itself (`Extractor::find_best`, already done above,
+/// unaffected by this flag) -- took **10.3 seconds**. Confirmed this pays
+/// for every function whose segment changed under saturation, regardless of
+/// whether anything downstream ever reads the resulting string: of this
+/// function's own six call sites, only `main.rs`'s own `--dump-cps-
+/// equivalences` flag actually consumes `explanations` (`Vec<String>`) --
+/// every real compile path (`build_optimized_cps`, used by `--run`/
+/// `emit_object`/`emit_exe`/`cleave-build`, plus `--dump-cps-optimized`
+/// itself) already discarded it with `_`, paying this cost for nothing.
+/// Skips `with_explanations_enabled` on both the initial e-graph *and* the
+/// `Runner` (not just skipping the final `explain_equivalence` call) when
+/// `false` -- `egg`'s own explanation bookkeeping adds overhead to every
+/// union/rewrite step along the way, not just the final proof-reconstruction
+/// call, so disabling it only at the last step would still leave the
+/// cheaper (but non-zero) per-step cost in place for every real compile.
+pub fn optimize_program(
+    program: CpsProgram,
+    registry: &Registry,
+    want_explanations: bool,
+) -> (CpsProgram, Vec<String>) {
     let fresh = FreshVars::starting_at(max_cvar_in_program(&program) + 1);
     let units: HashMap<String, &CTopLevelFn> = program
         .funcs
@@ -2656,7 +2975,9 @@ pub fn optimize_program(program: CpsProgram, registry: &Registry) -> (CpsProgram
         // further down needs it on the exact egraph nodes were added to,
         // not one enabled only after the fact on a `Runner`'s own copy (see
         // this same function's own note on `with_egraph` below).
-        fwd.egraph = fwd.egraph.with_explanations_enabled();
+        if want_explanations {
+            fwd.egraph = fwd.egraph.with_explanations_enabled();
+        }
         let real_params = &f.def.params[..f.def.params.len() - 1];
         fwd.param_types = real_params
             .iter()
@@ -2703,10 +3024,36 @@ pub fn optimize_program(program: CpsProgram, registry: &Registry) -> (CpsProgram
         // "explanations not enabled" despite the call sitting right above
         // it). Order matters here specifically because of that replace-vs-
         // mutate asymmetry between the two builder methods.
-        let mut runner = Runner::default()
+        // No explicit `with_time_limit`/`with_node_limit` used to be set here
+        // at all -- `Runner::default()`'s own limits (`egg`'s own defaults),
+        // unlike `synthesize_derivatives`'s own Runner just below (`with_
+        // iter_limit(1000).with_node_limit(1_000_000).with_time_limit(30s)`).
+        // Invisible for every network tried before this session's own
+        // "stress the system" pass (`examples/digits-interop`): xor.cleave's
+        // own tiny tensors (2x2/2x1) let this pass saturate in 2 iterations,
+        // 479 nodes, "effectively instant" (`doc/backlog.md`'s own
+        // measurement) -- but a real-scale network (64x8, say) with no cap
+        // at all here ran for *minutes*, confirmed directly (`--dump-cps-
+        // optimized`, which stops before MLIR lowering entirely, took the
+        // *identical* wall time as the full `--run` pipeline for the same
+        // source, isolating the cost to this pass or `derive()`'s own,
+        // nowhere near MLIR/JIT). Given `derive()`'s own already-capped pass
+        // runs first and hands *this* one an already-large post-derivative
+        // expression, an uncapped rule-matching search over it here is
+        // exactly the kind of unbounded cost a "stress the system" pass was
+        // meant to surface. Capped identically to `synthesize_derivatives`'s
+        // own values below, same safety-net posture, not a claim that this
+        // magically makes a big network fast -- just bounded instead of
+        // open-ended.
+        let mut runner_builder = Runner::default()
             .with_egraph(egraph)
-            .with_explanations_enabled()
-            .run(&rules);
+            .with_iter_limit(1000)
+            .with_node_limit(1_000_000)
+            .with_time_limit(std::time::Duration::from_secs(30));
+        if want_explanations {
+            runner_builder = runner_builder.with_explanations_enabled();
+        }
+        let mut runner = runner_builder.run(&rules);
         let root_id = runner.egraph.find(root_id);
         let extractor = Extractor::new(&runner.egraph, AstSize);
         let (_, best) = extractor.find_best(root_id);
@@ -2723,14 +3070,12 @@ pub fn optimize_program(program: CpsProgram, registry: &Registry) -> (CpsProgram
         if best.to_string() == original.to_string() {
             continue; // saturation ran, but extraction picked the exact original form back -- nothing to report or rebuild
         }
-
-        explanations.push(format!(
-            "{}: {}",
-            f.def.name,
-            runner
+        if want_explanations {
+            let explanation = runner
                 .explain_equivalence(&original, &best)
-                .get_flat_string()
-        ));
+                .get_flat_string();
+            explanations.push(format!("{}: {}", f.def.name, explanation));
+        }
         let rebuilt = rebuild_segment(
             &best,
             best.root(),
@@ -2772,6 +3117,14 @@ pub fn optimize_program(program: CpsProgram, registry: &Registry) -> (CpsProgram
 pub struct DerivativeRequest {
     pub name: String,
     pub of: String,
+    /// `true` for `gw = grad(f);`, `false` for `fprime = derive(f);` —
+    /// `cps.rs`'s own `UnitBody::Derivative`'s own doc comment. Currently
+    /// read nowhere yet (`synthesize_derivatives` below is still forward-
+    /// mode-only, `doc/backlog.md`'s own "reverse-mode differentiation"
+    /// item) — carried through the request itself so a future reverse-mode
+    /// dispatch point has it on hand without needing to re-derive it from
+    /// `program`.
+    pub is_grad: bool,
 }
 
 /// The real body-synthesis half of `doc/backlog.md`'s own auto-diff item —
@@ -2837,6 +3190,32 @@ pub fn synthesize_derivatives(
     let mut errors = Vec::new();
 
     for req in requests {
+        // A `grad()`-sourced request must *not* run the forward-mode
+        // algorithm below — wrong results, no error, exactly the "confusing
+        // failure three stages downstream" class of bug this function's own
+        // next comment already warns about for a different case. Dispatched
+        // to `synthesize_one_gradient` (Phase 3's own real reverse-mode
+        // backend, scalar-parameter scope only for now) instead, entirely
+        // separately from every line below this — `derive()`'s own forward-
+        // mode path stays completely untouched by `grad()`'s existence.
+        if req.is_grad {
+            let Some(&of_unit) = units.get(req.of.as_str()) else {
+                continue;
+            };
+            match synthesize_one_gradient(
+                req,
+                of_unit,
+                &units,
+                registry,
+                &fresh,
+                struct_schemas,
+                &unit_names,
+            ) {
+                Ok(f) => new_funcs.push(f),
+                Err(e) => errors.push(e),
+            }
+            continue;
+        }
         let Some(&of_unit) = units.get(req.of.as_str()) else {
             continue;
         };
@@ -2959,16 +3338,41 @@ pub fn synthesize_derivatives(
 
         let ty_text = of_unit.result.to_string();
 
-        let mut rules = axiom_rewrites(registry, &fwd.reached);
-        rules.extend(struct_projection_rewrites(&fwd.struct_ops, &fwd.field_ops));
-        rules.extend(construction_derivative_rewrites(
+        // Split into two *sequential* saturation passes, not one merged
+        // rule set -- found directly, in discussion, to be the real driver
+        // of a measured catastrophic blowup (293,197 e-graph nodes after
+        // just 2s of saturation on a `Tensor<f32,64,8>`-scale case, vs ~479
+        // nodes *total* for `xor.cleave`'s own tiny 2x2 one): every declared
+        // `derivative` rule only ever peels *one* level of nesting per
+        // firing (bounded by the differentiated body's own structural
+        // depth -- see `derivative_rewrites`'s own `iter_limit` doc comment
+        // just below), but the *ordinary axioms* (`axiom_rewrites` --
+        // commutativity, associativity, ...) were running in the exact same
+        // saturation, and *those* are genuinely combinatorial by design
+        // (equality saturation explores every equivalent rewriting, doubling
+        // representations per commutative operation -- already documented
+        // as the dominant cost driver for a different item, `doc/backlog.
+        // md`'s own "derive()'s own saturation grows combinatorially").
+        // Nothing about resolving a `derivative(...)` marker needs that
+        // exploration at all -- these are two unrelated jobs that happened
+        // to share one `Runner`. Pass A resolves every marker using only
+        // the rules that can ever make one disappear; Pass B, an ordinary
+        // axiom-only simplification, runs *after*, on the now-marker-free
+        // result -- structurally identical to what `optimize_program` (run
+        // later in the real pipeline, `pipeline.rs::build_cps_program`)
+        // already does, just no longer wastefully interleaved with Pass A's
+        // own, unrelated, already-bounded work.
+        let mut pass_a_rules =
+            struct_projection_rewrites(&fwd.struct_ops, &fwd.field_ops);
+        pass_a_rules.extend(construction_derivative_rewrites(
             &fwd.struct_ops,
             &fwd.array_ops,
         ));
         let (derivative_rules, mut referenced, zero_calls_used) =
             derivative_rewrites(&ty_text, &fwd.reached, registry, &unit_names);
         referenced.extend(shape_referenced);
-        rules.extend(derivative_rules);
+        pass_a_rules.extend(derivative_rules);
+        let axiom_rules = axiom_rewrites(registry, &fwd.reached);
 
         let Forward {
             egraph,
@@ -3024,7 +3428,22 @@ pub fn synthesize_derivatives(
             .with_node_limit(1_000_000)
             .with_time_limit(std::time::Duration::from_secs(30))
             .with_egraph(egraph)
-            .run(&rules);
+            .run(&pass_a_rules);
+        // Pass B — ordinary axiom simplification (commutativity,
+        // associativity, constant-folding, ...) on the now marker-free
+        // result of Pass A above. Deliberately a *separate* `Runner`, not
+        // folded back into Pass A's own rule set — see this function's own
+        // "split into two sequential saturation passes" doc comment further
+        // up for why sharing one `Runner` between these two genuinely
+        // different jobs was the real cost driver. Same limits as Pass A,
+        // for the same reason `Runner::default()`'s own tuned-for-`optimize_
+        // program` values didn't fit that pass either.
+        let runner = Runner::default()
+            .with_iter_limit(1000)
+            .with_node_limit(1_000_000)
+            .with_time_limit(std::time::Duration::from_secs(30))
+            .with_egraph(runner.egraph)
+            .run(&axiom_rules);
         // `IndependentZeroApplier`'s own `zero_calls_used` (`egraph.rs`'s own
         // doc comment on it) is only populated *during* saturation, unlike
         // `referenced` above (known before the runner ever starts) — read
@@ -3118,6 +3537,729 @@ pub fn synthesize_derivatives(
     let mut funcs = program.funcs;
     funcs.extend(new_funcs);
     Ok(CpsProgram { funcs })
+}
+
+// ---------------------------------------------------------------- reverse-mode differentiation (grad())
+
+/// Whether `ty` is something `grad()` can accept as a top-level parameter
+/// (or, recursively, a struct field): a plain scalar, a whole `Tensor<T,
+/// Dims...>` with a scalar element type, or a struct every one of whose own
+/// declared fields recursively passes this same check. `false`, a real,
+/// located error at the call site — never a guess, never a panic three
+/// stages downstream in `mlir_lower.rs`.
+fn is_grad_supported_ty(ty: &Ty, struct_schemas: &HashMap<String, StructSchema>) -> bool {
+    if matches!(ty, Ty::Con(name) if is_scalar_width(name)) {
+        return true;
+    }
+    if let Ty::App(name, args) = ty {
+        if name == "Tensor" {
+            return tensor_shape(args)
+                .is_some_and(|(elem, _)| matches!(&elem, Ty::Con(n) if is_scalar_width(n)));
+        }
+    }
+    let struct_name = match ty {
+        Ty::Con(name) => name.as_str(),
+        Ty::App(name, _) => name.as_str(),
+        _ => return false,
+    };
+    if !struct_schemas.contains_key(struct_name) {
+        return false;
+    }
+    let type_args = match ty {
+        Ty::App(_, args) => args.clone(),
+        _ => Vec::new(),
+    };
+    struct_field_types(struct_schemas, struct_name, &type_args)
+        .iter()
+        .all(|(_, field_ty)| is_grad_supported_ty(field_ty, struct_schemas))
+}
+
+/// `gw = grad(f);` (`req.is_grad`) — Phase 3's own real reverse-mode
+/// backend, generalizing the Phase 0 spike (`mod tests::spike_backward_
+/// walk`) from two hardcoded Rust match arms into real, `stdlib`-declared
+/// `adjoint` rules (`Registry::adjoint_rules`), instantiated directly into
+/// the live e-graph (`EGraph::add_instantiation`) rather than compiled into
+/// an `egg::Rewrite` — propagation here is a one-shot reverse-topological
+/// Rust walk (the spike's own validated mechanism), not saturation, so
+/// there's no `Runner` to hand a `Rewrite` set to in the first place.
+///
+/// Scope, deliberately narrow for now, matching this whole plan's own
+/// Phase 3 (a real, reported error outside it, never silently wrong): every
+/// real parameter of `f` must be a plain scalar (`is_scalar_width`), a
+/// whole `Tensor<T,Dims...>`, or a struct recursively built from either
+/// (`Dense`/`Network`) — `is_grad_supported_ty` checks this upfront, a
+/// real, located error otherwise, rather than a guess or a confusing
+/// failure downstream. Every operation actually reached differentiating
+/// `f`'s own body must be a declared algebra method with a real `adjoint`
+/// rule for it, or an ordinary struct field read (`backward_walk`'s own
+/// `field_ops` routing) — a struct *construction*/array op inside `f`'s own
+/// body, or an algebra method with no declared `adjoint` rule, is still a
+/// real, located error instead of a guess.
+#[allow(clippy::too_many_arguments)]
+fn synthesize_one_gradient(
+    req: &DerivativeRequest,
+    of_unit: &CTopLevelFn,
+    units: &HashMap<String, &CTopLevelFn>,
+    registry: &Registry,
+    fresh: &FreshVars,
+    struct_schemas: &HashMap<String, StructSchema>,
+    unit_names: &HashSet<String>,
+) -> Result<CTopLevelFn, String> {
+    let mut fwd = Forward::default();
+    let f_params = &of_unit.def.params[..of_unit.def.params.len() - 1];
+    fwd.param_types = f_params
+        .iter()
+        .copied()
+        .zip(of_unit.param_types.iter().cloned())
+        .collect();
+    let boundary = fwd.walk(&of_unit.def.body, units, fresh);
+    let unrepresentable = || {
+        format!(
+            "cannot compute grad(`{}`): function body is not fully representable (unsupported control flow, e.g. a loop that could not be unrolled, or a branch)",
+            req.name
+        )
+    };
+    let Some(root_var) = segment_root_var(&boundary, &fwd.env) else {
+        return Err(unrepresentable());
+    };
+    let Some(&root_id) = fwd.env.get(&root_var) else {
+        return Err(unrepresentable());
+    };
+
+    // A whole `Tensor<T,Dims...>` parameter is accepted as one opaque leaf
+    // (`param_shapes` below just wraps its own e-class directly, exactly
+    // like a scalar) — the actual design point of reverse-mode over
+    // `derive()`'s own `ParamShape::Tensor` (one `Index::index` leaf *per
+    // flat element*, `doc/backlog.md`'s own "digits-interop" item): the
+    // whole tensor differentiates as a single unit, cost independent of its
+    // own size. A struct-typed parameter (`Dense`/`Network`) recurses field
+    // by field via `backward_walk`'s own `field_ops` routing instead —
+    // every leaf field must itself be scalar/`Tensor`/struct, checked
+    // recursively here up front.
+    for ty in &of_unit.param_types {
+        if !is_grad_supported_ty(ty, struct_schemas) {
+            return Err(format!(
+                "cannot compute grad(`{}`): reverse-mode differentiation only supports scalar, `Tensor`, and struct (recursively built from either) parameters for now, got `{ty}`",
+                req.name
+            ));
+        }
+    }
+
+    let mut param_substitution = HashMap::new();
+    let mut new_params = Vec::with_capacity(f_params.len() + 1);
+    for &p in f_params {
+        let np = fresh.var();
+        param_substitution.insert(p, np);
+        new_params.push(np);
+    }
+    let k_ret = fresh.var();
+    new_params.push(k_ret);
+
+    let root_ty = of_unit.result.to_string();
+    let seed = if matches!(root_ty.as_str(), "f32" | "f64") {
+        fwd.egraph.add(CleaveLang::Float(1.0.into()))
+    } else {
+        fwd.egraph.add(CleaveLang::Int(1))
+    };
+
+    // Every top-level parameter's own e-class -> its own declared `Ty` —
+    // `backward_walk`'s own only source for "what struct type is this" for
+    // a struct-typed parameter's own e-class specifically (an intermediate
+    // struct value reached via a field read instead resolves its own type
+    // from `field_ops`, `backward_walk`'s own doc comment).
+    let known_types: HashMap<egg::Id, Ty> = f_params
+        .iter()
+        .zip(of_unit.param_types.iter())
+        .filter_map(|(p, ty)| Some((fwd.egraph.find(*fwd.external_vars.get(p)?), ty.clone())))
+        .collect();
+
+    let mut referenced = HashSet::new();
+    let zero_calls_used: std::sync::Mutex<HashSet<String>> = std::sync::Mutex::new(HashSet::new());
+    let adjoints = backward_walk(
+        &mut fwd.egraph,
+        root_id,
+        seed,
+        &fwd.reached,
+        &fwd.field_ops,
+        struct_schemas,
+        &mut fwd.struct_ops,
+        unit_names,
+        &zero_calls_used,
+        &known_types,
+        registry,
+        &mut referenced,
+    )
+    .map_err(|e| format!("cannot compute grad(`{}`): {e}", req.name))?;
+    referenced.extend(zero_calls_used.into_inner().unwrap());
+
+    let param_shapes: Vec<Option<ParamShape>> = f_params
+        .iter()
+        .zip(of_unit.param_types.iter())
+        .map(|(p, ty)| {
+            let &param_id = fwd.external_vars.get(p)?;
+            let id = adjoints.get(&fwd.egraph.find(param_id)).copied()?;
+            Some(ParamShape::Leaf(id, ty.clone()))
+        })
+        .collect();
+
+    let mut call_units = fwd.call_units.clone();
+    call_units.extend(referenced.into_iter().filter(|name| units.contains_key(name.as_str())));
+
+    let Forward {
+        egraph,
+        free_vars,
+        raw_ops,
+        struct_ops,
+        field_ops,
+        array_ops,
+        array_repeat_ops,
+        load_ops,
+        ..
+    } = fwd;
+    let tables = OpTables {
+        free_vars: &free_vars,
+        raw_ops: &raw_ops,
+        call_units: &call_units,
+        struct_ops: &struct_ops,
+        field_ops: &field_ops,
+        array_ops: &array_ops,
+        array_repeat_ops: &array_repeat_ops,
+        load_ops: &load_ops,
+        param_substitution: &param_substitution,
+    };
+    let extractor = Extractor::new(&egraph, DerivativeFreeCost);
+
+    let value_types = of_unit.param_types.clone();
+    let body = build_param_derivatives_from_shapes(
+        &param_shapes,
+        &of_unit.param_types,
+        &egraph,
+        &extractor,
+        fresh,
+        &tables,
+        Vec::new(),
+        &|values| finish_derivative_body(values, &value_types, k_ret, fresh),
+    );
+
+    let n = f_params.len();
+    let result = if n == 1 {
+        of_unit.param_types[0].clone()
+    } else {
+        Ty::App(tuple_struct_name(n), of_unit.param_types.clone())
+    };
+
+    Ok(CTopLevelFn {
+        def: CFunDef {
+            name: req.name.clone(),
+            params: new_params,
+            body,
+            carried_types: None,
+        },
+        param_types: of_unit.param_types.clone(),
+        result,
+        k_ret,
+        origin: None,
+        is_export: false,
+        export_symbol: None,
+    })
+}
+
+/// One reverse-topological pass over `egraph`, seeded `adjoints[root] =
+/// seed`, accumulating every parameter's own total gradient — the real
+/// counterpart of the Phase 0 spike's own `spike_backward_walk`, generalized
+/// to consult `reached` (the concrete `(algebra, method)` a given `Op`
+/// symbol was actually dispatched to, `Forward::reached`'s own doc comment)
+/// and `Registry::adjoint_rules` instead of two hardcoded Rust match arms.
+/// Uses `snapshot_backward_order`'s own pre-walk snapshot for the identical,
+/// found-by-testing reason the spike itself needed one (this module's own
+/// note on `mod tests::spike_backward_walk`): a contribution built via
+/// `EGraph::add_instantiation` can coincidentally union with an unrelated
+/// e-class purely by numeric equality, and re-querying the live e-graph
+/// after that happened would silently double-propagate through it.
+///
+/// A node reached with a live adjoint but no known `(algebra, method)`
+/// (a struct/field/array op, or a call this e-graph's own `reached` map
+/// never recorded) or a known method with no declared `adjoint` rule is a
+/// real `Err`, not a silently-stopped-here partial gradient — the identical
+/// posture `synthesize_derivatives`' own "no derivative rule for X" check
+/// already established for the forward-mode path.
+/// A struct-typed value's own adjoint is never one single contribution the
+/// way a scalar/`Tensor` one is — it arrives piecemeal, one declared field
+/// at a time (`net.l1`'s own gradient only exists once *every* field of
+/// `net` that was ever read anywhere has contributed, or been zero-filled
+/// for the ones that weren't). `field_contributions` accumulates those,
+/// keyed by `(base's own e-class, field name)` — `backward_walk`'s own main
+/// loop, right before processing `id` normally, checks whether *this* id
+/// has any entries of its own here and, if so, synthesizes its combined
+/// struct-shaped adjoint from them first (`synthesize_struct_adjoint`) —
+/// after which `id`'s own defining `field:...` op (if it has one, i.e. `id`
+/// is itself a field read into some *further* base) propagates that
+/// synthesized value onward exactly like any other adjoint.
+#[allow(clippy::too_many_arguments)]
+fn backward_walk(
+    egraph: &mut egg::EGraph<CleaveLang, ConstantFold>,
+    root: egg::Id,
+    seed: egg::Id,
+    reached: &HashMap<String, (String, String)>,
+    field_ops: &HashMap<Symbol, (Ty, String, Ty)>,
+    struct_schemas: &HashMap<String, StructSchema>,
+    struct_ops: &mut HashMap<Symbol, (String, Vec<String>, Ty)>,
+    unit_names: &HashSet<String>,
+    zero_calls_used: &std::sync::Mutex<HashSet<String>>,
+    known_types: &HashMap<egg::Id, Ty>,
+    registry: &Registry,
+    referenced: &mut HashSet<String>,
+) -> Result<HashMap<egg::Id, egg::Id>, String> {
+    let (order, defs) = snapshot_backward_order(egraph, root);
+    let mut adjoints: HashMap<egg::Id, egg::Id> = HashMap::new();
+    let mut field_contributions: HashMap<(egg::Id, String), egg::Id> = HashMap::new();
+    adjoints.insert(egraph.find(root), seed);
+
+    for &id in order.iter().rev() {
+        let own_fields: Vec<String> = field_contributions
+            .keys()
+            .filter(|(base, _)| *base == id)
+            .map(|(_, f)| f.clone())
+            .collect();
+        if !own_fields.is_empty() {
+            let ty = known_types.get(&id).cloned().or_else(|| {
+                defs.get(&id)
+                    .and_then(|(name, _)| field_ops.get(name))
+                    .map(|(_, _, field_ty)| field_ty.clone())
+            });
+            let Some(ty) = ty else {
+                return Err(format!(
+                    "internal error: a struct-typed value (e-class {id:?}) has field contributions but its own type is unknown"
+                ));
+            };
+            let synthesized = synthesize_struct_adjoint(
+                egraph,
+                id,
+                &ty,
+                &field_contributions,
+                unit_names,
+                zero_calls_used,
+                struct_ops,
+                struct_schemas,
+            )?;
+            adjoints.insert(id, synthesized);
+        }
+
+        let Some(&u) = adjoints.get(&id) else {
+            continue; // never reached from root -- no gradient flows here
+        };
+        let Some((name, children)) = defs.get(&id).cloned() else {
+            continue; // a leaf -- nothing further to propagate through
+        };
+        let name_str = name.as_str();
+
+        if let Some((_, field_name, field_ty)) = field_ops.get(&name) {
+            let Some(&base) = children.first() else {
+                return Err(format!(
+                    "internal error: field read `{name_str}` has no base operand"
+                ));
+            };
+            accumulate_field_contribution(
+                &mut field_contributions,
+                egraph,
+                base,
+                field_name.clone(),
+                u,
+                &field_ty.to_string(),
+                referenced,
+            );
+            continue;
+        }
+
+        let Some((algebra, method)) = reached.get(name_str) else {
+            // A node this walk has no adjoint handling for (a struct/array
+            // *construction* -- field *reads* are routed above; a real,
+            // separate, still-unbuilt "distribute the upstream adjoint back
+            // onto each constructor argument" rule, mirroring forward-
+            // mode's own `construction_derivative_rewrites`) is only a real
+            // problem if its own gradient could ever actually matter --
+            // i.e., if it depends on *some* differentiation parameter at
+            // all. `free_deps` (`ConstantFold`'s own analysis, already
+            // computed) answers this exactly: empty means no `Free` leaf
+            // anywhere in this id's own defining subtree, a pure constant
+            // (`Activation<Tensor<T,Dims...>>::sigmoid`'s own internal `one
+            // = Tensor::<T,Dims...>(data:[1.0;Dims...])`, `stdlib/nn/
+            // nn.cleave`, is exactly this shape) -- its own adjoint is
+            // *provably* never read by anything downstream, safe to drop
+            // silently, not a guess (the intersection-on-merge semantics
+            // `ConstantFold::merge` already documents can only ever
+            // *narrow* `free_deps`, never wrongly report "no dependency"
+            // for a node that genuinely has one through every one of its
+            // own defining paths). A genuinely parameter-dependent
+            // construction still can't be differentiated through yet --
+            // the same real, located error as before.
+            if egraph[id].data.free_deps.is_empty() {
+                continue;
+            }
+            return Err(format!(
+                "reverse-mode differentiation doesn't support this operation yet (`{name_str}`)"
+            ));
+        };
+        let Some(ty) = concrete_type_of(name_str) else {
+            return Err(format!("cannot resolve the concrete type of `{name_str}`"));
+        };
+        let Some(rule) = registry
+            .adjoint_rules(algebra)
+            .iter()
+            .find(|r| r.method == *method)
+        else {
+            return Err(format!("no adjoint rule for `{algebra}::{method}`"));
+        };
+        let Some(contributions) =
+            apply_adjoint_rule(egraph, algebra, ty, rule, &children, u, registry, referenced)
+        else {
+            return Err(format!(
+                "adjoint `{algebra}::{method}` couldn't be applied to `{name_str}` — check its own declared rule body"
+            ));
+        };
+        for (target, contribution, contribution_ty) in contributions {
+            accumulate_adjoint(
+                &mut adjoints,
+                egraph,
+                target,
+                contribution,
+                &contribution_ty,
+                referenced,
+            );
+        }
+    }
+    Ok(adjoints)
+}
+
+/// Accumulates one more contribution into `base`'s own running `field_name`
+/// adjoint — `accumulate_adjoint`'s own sibling, summing via `Ring::add<ty>`
+/// exactly the same way, just keyed by `(base, field_name)` in `field_
+/// contributions` instead of directly by e-class in `adjoints` (a struct-
+/// typed `base` has no `Ring::add` of its own to sum a *whole* contribution
+/// with — each of its own fields sums independently instead, `backward_
+/// walk`'s own doc comment).
+fn accumulate_field_contribution(
+    field_contributions: &mut HashMap<(egg::Id, String), egg::Id>,
+    egraph: &mut egg::EGraph<CleaveLang, ConstantFold>,
+    base: egg::Id,
+    field_name: String,
+    contribution: egg::Id,
+    ty: &str,
+    referenced: &mut HashSet<String>,
+) {
+    let base = egraph.find(base);
+    let key = (base, field_name);
+    match field_contributions.get(&key).copied() {
+        Some(existing) => {
+            referenced.insert(format!("Ring::add<{ty}>"));
+            let summed = egraph.add(CleaveLang::Op(
+                format!("Ring::add<{ty}>").into(),
+                vec![existing, contribution],
+            ));
+            field_contributions.insert(key, summed);
+        }
+        None => {
+            field_contributions.insert(key, contribution);
+        }
+    }
+}
+
+/// Builds `id`'s own combined struct-shaped adjoint (`Op("struct:{ty}:...",
+/// [field_0, field_1, ...])`, the identical construction shape `Forward::
+/// walk`'s own `PrimOp::Struct` translation already builds for a real
+/// source-level struct literal) from whichever of its own declared fields
+/// `field_contributions` actually has an entry for — any field never read
+/// anywhere gets a real zero instead (`build_zero_recursive`), not skipped:
+/// the *whole* struct value must exist for `rebuild` to reconstruct a real
+/// `PrimOp::Struct` call downstream. `struct_ops` gains a fresh entry for
+/// this exact construction if `id`'s own type was never actually
+/// *constructed* anywhere in `f`'s own real body (`net.l1.forward(x)` only
+/// ever *reads* `net`'s own fields, never builds a new `Network`/`Dense`) —
+/// the identical "register a new construction dynamically" step `build_
+/// param_shape`'s own `Tensor` eta-expansion already needs for the same
+/// reason.
+#[allow(clippy::too_many_arguments)]
+fn synthesize_struct_adjoint(
+    egraph: &mut egg::EGraph<CleaveLang, ConstantFold>,
+    id: egg::Id,
+    ty: &Ty,
+    field_contributions: &HashMap<(egg::Id, String), egg::Id>,
+    unit_names: &HashSet<String>,
+    zero_calls_used: &std::sync::Mutex<HashSet<String>>,
+    struct_ops: &mut HashMap<Symbol, (String, Vec<String>, Ty)>,
+    struct_schemas: &HashMap<String, StructSchema>,
+) -> Result<egg::Id, String> {
+    let struct_name = match ty {
+        Ty::Con(name) => name.clone(),
+        Ty::App(name, _) => name.clone(),
+        _ => return Err(format!("cannot compute grad(...): `{ty}` isn't a struct type")),
+    };
+    if !struct_schemas.contains_key(&struct_name) {
+        return Err(format!("cannot compute grad(...): `{ty}` isn't a declared struct"));
+    }
+    let type_args = match ty {
+        Ty::App(_, args) => args.clone(),
+        _ => Vec::new(),
+    };
+    let fields = struct_field_types(struct_schemas, &struct_name, &type_args);
+    let mut field_ids = Vec::with_capacity(fields.len());
+    for (field_name, field_ty) in &fields {
+        let field_id = match field_contributions.get(&(id, field_name.clone())) {
+            Some(&existing) => existing,
+            None => build_zero_recursive(
+                egraph,
+                field_ty,
+                unit_names,
+                zero_calls_used,
+                struct_ops,
+                struct_schemas,
+            )
+            .ok_or_else(|| {
+                format!(
+                    "cannot compute grad(...): no zero value for field `{field_name}: {field_ty}`"
+                )
+            })?,
+        };
+        field_ids.push(field_id);
+    }
+    let field_names: Vec<String> = fields.iter().map(|(n, _)| n.clone()).collect();
+    let sym = Symbol::from(format!("struct:{ty}:{}", field_names.join(",")));
+    struct_ops
+        .entry(sym)
+        .or_insert_with(|| (struct_name, field_names, ty.clone()));
+    egraph
+        .analysis
+        .known_types
+        .entry(sym)
+        .or_insert_with(|| ty.clone());
+    Ok(egraph.add(CleaveLang::Op(sym, field_ids)))
+}
+
+/// `build_zero`'s own recursive counterpart — a real `Ring::zero<ty>()`
+/// call when one exists, otherwise (a struct type with no `Ring` impl of
+/// its own — `Dense`/`Network`, exactly the shape a real gradient's own
+/// zero-filled, never-read field needs) zero-fills each of its own declared
+/// fields the identical way and constructs the struct directly.
+fn build_zero_recursive(
+    egraph: &mut egg::EGraph<CleaveLang, ConstantFold>,
+    ty: &Ty,
+    unit_names: &HashSet<String>,
+    zero_calls_used: &std::sync::Mutex<HashSet<String>>,
+    struct_ops: &mut HashMap<Symbol, (String, Vec<String>, Ty)>,
+    struct_schemas: &HashMap<String, StructSchema>,
+) -> Option<egg::Id> {
+    if let Some(id) = build_zero(egraph, ty, unit_names, zero_calls_used) {
+        return Some(id);
+    }
+    let struct_name = match ty {
+        Ty::Con(name) => name.clone(),
+        Ty::App(name, _) => name.clone(),
+        _ => return None,
+    };
+    if !struct_schemas.contains_key(&struct_name) {
+        return None;
+    }
+    let type_args = match ty {
+        Ty::App(_, args) => args.clone(),
+        _ => Vec::new(),
+    };
+    let fields = struct_field_types(struct_schemas, &struct_name, &type_args);
+    let mut field_ids = Vec::with_capacity(fields.len());
+    for (_, field_ty) in &fields {
+        field_ids.push(build_zero_recursive(
+            egraph,
+            field_ty,
+            unit_names,
+            zero_calls_used,
+            struct_ops,
+            struct_schemas,
+        )?);
+    }
+    let field_names: Vec<String> = fields.iter().map(|(n, _)| n.clone()).collect();
+    let sym = Symbol::from(format!("struct:{ty}:{}", field_names.join(",")));
+    struct_ops
+        .entry(sym)
+        .or_insert_with(|| (struct_name, field_names, ty.clone()));
+    egraph
+        .analysis
+        .known_types
+        .entry(sym)
+        .or_insert_with(|| ty.clone());
+    Some(egraph.add(CleaveLang::Op(sym, field_ids)))
+}
+
+/// `root`'s own real defining structure, snapshotted once via a plain DFS-
+/// postorder — see `backward_walk`'s own doc comment for why a snapshot,
+/// not a live re-query. Sound here for the identical reason the spike's own
+/// version is (this e-graph is never saturated before this walk runs, so
+/// aside from `ConstantFold`'s own automatic literal-folding — which only
+/// ever *adds* an alternate, cheaper e-node into an already-existing
+/// e-class, never removes the original — each e-class has exactly one real
+/// definition).
+fn snapshot_backward_order(
+    egraph: &egg::EGraph<CleaveLang, ConstantFold>,
+    root: egg::Id,
+) -> (Vec<egg::Id>, HashMap<egg::Id, (Symbol, Vec<egg::Id>)>) {
+    let mut order = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut defs: HashMap<egg::Id, (Symbol, Vec<egg::Id>)> = HashMap::new();
+    fn visit(
+        egraph: &egg::EGraph<CleaveLang, ConstantFold>,
+        id: egg::Id,
+        seen: &mut std::collections::HashSet<egg::Id>,
+        order: &mut Vec<egg::Id>,
+        defs: &mut HashMap<egg::Id, (Symbol, Vec<egg::Id>)>,
+    ) {
+        let id = egraph.find(id);
+        if !seen.insert(id) {
+            return;
+        }
+        if let Some(CleaveLang::Op(name, children)) = egraph[id]
+            .nodes
+            .iter()
+            .find(|n| matches!(n, CleaveLang::Op(..)))
+        {
+            defs.insert(id, (*name, children.clone()));
+            for &c in children.clone().iter() {
+                visit(egraph, c, seen, order, defs);
+            }
+        }
+        order.push(id);
+    }
+    visit(egraph, root, &mut seen, &mut order, &mut defs);
+    (order, defs)
+}
+
+/// Accumulates one more contribution into `target`'s own running adjoint —
+/// the production counterpart of the Phase 0 spike's own `spike_contribute`,
+/// generalized to a real concrete type (`Ring::add<{ty}>`, not a hardcoded
+/// `i32`) — `ty` is the contribution's own resolved type (`apply_adjoint_
+/// rule`'s own `type_env`, not re-derived from the live e-graph: an
+/// intermediate node's own `ConstantFold::own_ty` is `None` far more often
+/// than not, populated only for `Free`/`Struct`/`Array` symbols — see
+/// `ConstantFold::make`'s own doc comment).
+///
+/// `referenced` gains `Ring::add<{ty}>` whenever this actually builds one —
+/// found directly needed, not anticipated: `f(x) = x * x` reaches this
+/// branch (`x` is *both* of `mul`'s own operands, so its own adjoint rule's
+/// two contributions both target the same leaf) even though `f`'s own
+/// forward body never calls `add` anywhere at all, so `fwd.call_units`
+/// alone never has it — `rebuild` then panics on a `Ring::add<f32>` node
+/// none of its own lookup tables recognize, the identical "unrecognized
+/// symbol" class of bug `derivative_rewrites`' own `referenced` set already
+/// exists to prevent for the forward-mode path.
+fn accumulate_adjoint(
+    adjoints: &mut HashMap<egg::Id, egg::Id>,
+    egraph: &mut egg::EGraph<CleaveLang, ConstantFold>,
+    target: egg::Id,
+    contribution: egg::Id,
+    ty: &str,
+    referenced: &mut HashSet<String>,
+) {
+    let target = egraph.find(target);
+    match adjoints.get(&target).copied() {
+        Some(existing) => {
+            referenced.insert(format!("Ring::add<{ty}>"));
+            let summed = egraph.add(CleaveLang::Op(
+                format!("Ring::add<{ty}>").into(),
+                vec![existing, contribution],
+            ));
+            adjoints.insert(target, summed);
+        }
+        None => {
+            adjoints.insert(target, contribution);
+        }
+    }
+}
+
+/// Instantiates one declared `adjoint` rule directly into the live e-graph
+/// for one real call site (`algebra::method<ty>(...children)`, upstream
+/// adjoint `u`) — the reverse-mode counterpart of `derivative_rule_to_
+/// rewrite`, just building a concrete value (`EGraph::add_instantiation`)
+/// instead of compiling an `egg::Rewrite`, since there's no saturation here
+/// to hand a rewrite set to. Returns one `(target, contribution,
+/// contribution's own resolved type)` triple per rule parameter, in the
+/// same order as `children` (`AdjointRuleDecl`'s own doc comment: "body
+/// computes the contribution to send back to each of `params`, in the same
+/// declared order").
+///
+/// `None` whenever the rule can't actually be applied here: an arity
+/// mismatch between the rule's own declared parameters and this call's real
+/// arguments (a user-declared-rule/algebra-signature mismatch `lower_
+/// adjoint_rule_decl`'s own arity check doesn't itself cross-check), a
+/// tuple-shaped body whose own field names aren't a clean `0..params.len()`
+/// permutation, or anything `build_pattern` itself already rejects (a call
+/// to an ambiguous/unknown method, an unrepresentable literal, ...) —
+/// `backward_walk`'s own caller turns this into one real, located error.
+#[allow(clippy::too_many_arguments)]
+fn apply_adjoint_rule(
+    egraph: &mut egg::EGraph<CleaveLang, ConstantFold>,
+    algebra: &str,
+    ty: &str,
+    rule: &AdjointRuleDecl,
+    children: &[egg::Id],
+    u: egg::Id,
+    registry: &Registry,
+    referenced: &mut HashSet<String>,
+) -> Option<Vec<(egg::Id, egg::Id, String)>> {
+    if rule.params.len() != children.len() {
+        return None;
+    }
+    let sig = registry.fn_sig(algebra, &rule.method)?;
+    let subst_ty = generic_substitution(algebra, ty, registry);
+    let mut type_env: HashMap<&str, String> = rule
+        .params
+        .iter()
+        .zip(&sig.params)
+        .map(|(rule_p, sig_p)| {
+            let resolved = sig_p
+                .ty
+                .as_ref()
+                .and_then(|declared| resolve_declared_type(declared, &subst_ty))
+                .unwrap_or_else(|| ty.to_string());
+            (rule_p.name.as_str(), resolved)
+        })
+        .collect();
+    let upstream_ty = sig
+        .ret
+        .as_ref()
+        .and_then(|ret| resolve_declared_type(ret, &subst_ty))
+        .unwrap_or_else(|| ty.to_string());
+    type_env.insert(rule.upstream.as_str(), upstream_ty);
+
+    let bodies: Vec<&Expr> = if rule.params.len() > 1 {
+        match &rule.body.kind {
+            ExprKind::StructLit(_, _, fields) => {
+                let mut ordered: Vec<(usize, &Expr)> = fields
+                    .iter()
+                    .filter_map(|(n, e)| n.parse::<usize>().ok().map(|i| (i, e)))
+                    .collect();
+                if ordered.len() != rule.params.len() {
+                    return None;
+                }
+                ordered.sort_by_key(|(i, _)| *i);
+                ordered.into_iter().map(|(_, e)| e).collect()
+            }
+            _ => return None,
+        }
+    } else {
+        vec![&rule.body]
+    };
+
+    let mut subst = Subst::default();
+    for (p, &child) in rule.params.iter().zip(children) {
+        subst.insert(Var::from(Symbol::from(format!("?{}", p.name))), child);
+    }
+    subst.insert(Var::from(Symbol::from(format!("?{}", rule.upstream))), u);
+
+    let mut out = Vec::with_capacity(bodies.len());
+    for ((p, body), &target) in rule.params.iter().zip(bodies).zip(children) {
+        let mut ast = PatternAst::default();
+        build_pattern(body, algebra, ty, &type_env, None, referenced, registry, &mut ast)?;
+        let contribution = egraph.add_instantiation(&ast, &subst);
+        out.push((target, contribution, type_env[p.name.as_str()].clone()));
+    }
+    Some(out)
 }
 
 /// Checks one parameter's own best extraction for a surviving `derivative`
@@ -4707,6 +5849,64 @@ mod tests {
         );
     }
 
+    /// `is_pure`'s own real distinction from `is_straight_line`/`is_
+    /// transparent_chain`: a `Fix` (a loop/branch's own desugared shape) is
+    /// never disqualifying by itself, only a real effect anywhere inside
+    /// it is -- the mechanism `Forward::walk` relies on to still treat
+    /// `Sum<Tensor<T,N,M>,T>::sum`'s own real nested-`for`-loop body
+    /// (`stdlib/nn/nn.cleave`) as one opaque `Op` node.
+    #[test]
+    fn is_pure_accepts_a_loop_with_no_real_effect_but_rejects_one_hiding_an_extern() {
+        let pure_loop = CExpr::Fix {
+            defs: vec![CFunDef {
+                name: "loop_body".to_string(),
+                params: vec![],
+                body: CExpr::App {
+                    func: CVal::Var(0),
+                    args: vec![],
+                },
+                carried_types: None,
+            }],
+            body: Box::new(CExpr::App {
+                func: CVal::Var(1),
+                args: vec![],
+            }),
+        };
+        assert!(
+            is_pure(&pure_loop),
+            "a loop with no real effect anywhere must still be judged pure"
+        );
+
+        let effectful_loop = CExpr::Fix {
+            defs: vec![CFunDef {
+                name: "loop_body".to_string(),
+                params: vec![],
+                body: CExpr::LetPrim {
+                    var: 20,
+                    ty: i32_ty(),
+                    op: PrimOp::Extern {
+                        symbol: "print_i32".to_string(),
+                        param_types: vec![i32_ty()],
+                    },
+                    args: vec![CVal::Var(10)],
+                    cont: Box::new(CExpr::App {
+                        func: CVal::Var(11),
+                        args: vec![CVal::Var(20)],
+                    }),
+                },
+                carried_types: None,
+            }],
+            body: Box::new(CExpr::App {
+                func: CVal::Var(1),
+                args: vec![],
+            }),
+        };
+        assert!(
+            !is_pure(&effectful_loop),
+            "a real Extern effect hidden inside a loop's own body must still be rejected"
+        );
+    }
+
     /// The integration-level counterpart: a real call to a unit whose own
     /// impurity comes from an `Extern` op (not an `If`, unlike the sibling
     /// test above) must still stop translation at the `Fix` -- proving the
@@ -5743,9 +6943,10 @@ mod tests {
         let requests: Vec<DerivativeRequest> = units
             .iter()
             .filter_map(|u| match &u.body {
-                crate::cps::UnitBody::Derivative(of) => Some(DerivativeRequest {
+                crate::cps::UnitBody::Derivative(of, is_grad) => Some(DerivativeRequest {
                     name: u.name.clone(),
                     of: of.clone(),
+                    is_grad: *is_grad,
                 }),
                 _ => None,
             })
@@ -5794,9 +6995,10 @@ mod tests {
         let requests: Vec<DerivativeRequest> = units
             .iter()
             .filter_map(|u| match &u.body {
-                crate::cps::UnitBody::Derivative(of) => Some(DerivativeRequest {
+                crate::cps::UnitBody::Derivative(of, is_grad) => Some(DerivativeRequest {
                     name: u.name.clone(),
                     of: of.clone(),
+                    is_grad: *is_grad,
                 }),
                 _ => None,
             })
@@ -5815,6 +7017,278 @@ mod tests {
         assert!(
             errs[0].contains("not fully representable"),
             "expected the error to explain why, got {errs:?}"
+        );
+    }
+
+    // -------------------------------------------------- reverse-mode spike (Phase 0)
+
+    /// Accumulates `contribution` into `target`'s own running adjoint total
+    /// -- the first contribution to a given e-class is recorded as-is; a
+    /// *second* one is summed with the first via a real `Ring::add` node
+    /// (benefiting from `ConstantFold` for free, same as any other e-graph
+    /// node), mirroring `IndependentZeroApplier`'s own established "a
+    /// custom Rust step where a plain declarative rewrite can't express the
+    /// needed logic" precedent -- "sum all adjoint contributions reaching
+    /// this e-class" isn't a local pattern match (rewrite rules match
+    /// *one* fixed shape, not "everything seen so far for this e-class"),
+    /// so this is deliberately plain Rust, not another `egg::Rewrite`.
+    fn spike_contribute(
+        adjoints: &mut HashMap<Id, Id>,
+        egraph: &mut EGraph<CleaveLang, ConstantFold>,
+        target: Id,
+        contribution: Id,
+    ) {
+        let target = egraph.find(target);
+        match adjoints.get(&target).copied() {
+            Some(existing) => {
+                let summed = egraph.add(CleaveLang::Op(
+                    "Ring::add<i32>".into(),
+                    vec![existing, contribution],
+                ));
+                adjoints.insert(target, summed);
+            }
+            None => {
+                adjoints.insert(target, contribution);
+            }
+        }
+    }
+
+    /// Phase 0 spike -- hand-rolled reverse-mode propagation (a plain Rust
+    /// reverse-topological walk, *not* `egg::Rewrite`/`Runner`), proving the
+    /// core mechanism before Phase 1+ wires it through real, cleave-source-
+    /// declared `adjoint` rules. `Ring::add`/`Ring::mul`'s own adjoint logic
+    /// is hardcoded directly in Rust here, deliberately -- matches this
+    /// whole plan's own Phase 0 scope ("2 hardcoded Rust closures... no
+    /// grammar/stdlib changes yet"), not a design decision for the real
+    /// mechanism.
+    ///
+    /// Reverse-topological order is a plain DFS-postorder from `root`: sound
+    /// here specifically because this e-graph is never saturated (no
+    /// rewrite ever runs over it before this walk), so — aside from
+    /// `ConstantFold`'s own automatic literal-folding, which only ever
+    /// *adds* an alternate, cheaper e-node into an already-existing e-class,
+    /// never removes the original — each e-class has exactly one real
+    /// definition, found by searching for the one `CleaveLang::Op` node
+    /// among an e-class's own alternatives rather than assuming insertion
+    /// order.
+    fn spike_backward_walk(egraph: &mut EGraph<CleaveLang, ConstantFold>, root: Id) -> HashMap<Id, Id> {
+        let mut order = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        // Snapshotted *once*, per id, during this initial walk -- consulted
+        // later instead of re-querying `egraph[id].nodes` live. Found
+        // necessary directly, not anticipated: building a contribution
+        // expression below (`egraph.add(Op("Ring::mul<i32>",[u,a]))`) can
+        // numerically coincide with an *existing*, unrelated e-class (e.g.
+        // `mul(1,a)` folds to the same literal `a` itself already is) --
+        // `ConstantFold` then unions the two, silently injecting a spurious
+        // `Op` alternative into a real leaf's own e-class. Re-querying
+        // `egraph[id].nodes` *after* that happened made a leaf look like it
+        // was "really" computed via that op, double-propagating through it.
+        // Snapshotting each id's own real defining op *before* any
+        // contribution expression is ever built sidesteps this permanently
+        // -- the defining structure of the *original* forward computation
+        // can never change after this point, regardless of what gets added
+        // to the shared e-graph later.
+        let mut defs: HashMap<Id, (Symbol, Vec<Id>)> = HashMap::new();
+        fn visit(
+            egraph: &EGraph<CleaveLang, ConstantFold>,
+            id: Id,
+            seen: &mut std::collections::HashSet<Id>,
+            order: &mut Vec<Id>,
+            defs: &mut HashMap<Id, (Symbol, Vec<Id>)>,
+        ) {
+            let id = egraph.find(id);
+            if !seen.insert(id) {
+                return;
+            }
+            if let Some(CleaveLang::Op(name, children)) =
+                egraph[id].nodes.iter().find(|n| matches!(n, CleaveLang::Op(..)))
+            {
+                defs.insert(id, (*name, children.clone()));
+                for &c in children.clone().iter() {
+                    visit(egraph, c, seen, order, defs);
+                }
+            }
+            order.push(id);
+        }
+        visit(egraph, root, &mut seen, &mut order, &mut defs);
+
+        let mut adjoints: HashMap<Id, Id> = HashMap::new();
+        let one = egraph.add(CleaveLang::Int(1));
+        adjoints.insert(egraph.find(root), one);
+
+        for &id in order.iter().rev() {
+            let Some(&u) = adjoints.get(&id) else {
+                continue; // never reached from root -- no gradient flows here
+            };
+            let Some((name, children)) = defs.get(&id).cloned() else {
+                continue; // a leaf -- nothing further to propagate through
+            };
+            match (name.as_str(), children.as_slice()) {
+                ("Ring::add<i32>", [a, b]) => {
+                    let (a, b) = (*a, *b);
+                    spike_contribute(&mut adjoints, egraph, a, u);
+                    spike_contribute(&mut adjoints, egraph, b, u);
+                }
+                ("Ring::mul<i32>", [a, b]) => {
+                    let (a, b) = (*a, *b);
+                    let ub = egraph.add(CleaveLang::Op("Ring::mul<i32>".into(), vec![u, b]));
+                    let ua = egraph.add(CleaveLang::Op("Ring::mul<i32>".into(), vec![u, a]));
+                    spike_contribute(&mut adjoints, egraph, a, ub);
+                    spike_contribute(&mut adjoints, egraph, b, ua);
+                }
+                _ => {}
+            }
+        }
+        adjoints
+    }
+
+    /// `f(a,b) = a*b + a`, `a=3, b=4` -- the exact worked example from the
+    /// design discussion: `df/da = b+1 = 5`, `df/db = a = 3`. `a` has two
+    /// consumers (`mul` and `add`), so this also exercises real
+    /// accumulation (`spike_contribute`'s own "second contribution" branch),
+    /// not just single-use propagation.
+    #[test]
+    fn spike_reverse_mode_matches_the_hand_derived_gradient() {
+        let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
+        let a = egraph.add(CleaveLang::Int(3));
+        let b = egraph.add(CleaveLang::Int(4));
+        let c = egraph.add(CleaveLang::Op("Ring::mul<i32>".into(), vec![a, b])); // a*b = 12
+        let d = egraph.add(CleaveLang::Op("Ring::add<i32>".into(), vec![c, a])); // c+a = 15
+
+        let adjoints = spike_backward_walk(&mut egraph, d);
+
+        let extractor = Extractor::new(&egraph, AstSize);
+        let da = adjoints[&egraph.find(a)];
+        let db = adjoints[&egraph.find(b)];
+        let (_, da_best) = extractor.find_best(da);
+        let (_, db_best) = extractor.find_best(db);
+        assert_eq!(da_best.to_string(), "5", "expected df/da = b+1 = 5, got {da_best}");
+        assert_eq!(db_best.to_string(), "3", "expected df/db = a = 3, got {db_best}");
+    }
+
+    /// `MatMul::matmul`'s own new `adjoint` rule (`stdlib/linalg/matrix.
+    /// cleave`) — `Z = A*B`, hand-derived: `dA = dZ*B^T`, `dB = A^T*dZ`.
+    /// Exercises `backward_walk`/`apply_adjoint_rule` directly (not through
+    /// `synthesize_one_gradient`, which still rejects a `Tensor`-shaped
+    /// parameter — Phase 4/5's own scope) on the real e-graph `Forward::
+    /// walk` builds from a real, compiled `matmul(a,b)` call, seeded with an
+    /// opaque `dC` upstream adjoint (standing in for "whatever the rest of
+    /// a real loss function's own gradient turned out to be" — this test
+    /// only checks the *local* rule, not a full scalar-loss pipeline, which
+    /// would additionally need `Index::index`'s own adjoint (`doc/backlog.
+    /// md`'s own "no existing stdlib/example code needs `tensor.insert`"
+    /// gap) — a separate, later checkpoint). Checked structurally, the same
+    /// way `spike_reverse_mode_matches_the_hand_derived_gradient` checks its
+    /// own scalar case, rather than by JIT-executing real numbers.
+    ///
+    /// **Genuinely non-square on purpose** (`2x3` times `3x4`, every one of
+    /// `a`/`b`/`transpose(a)`/`transpose(b)` a *different* shape) — a real,
+    /// previously-broken case: `build_pattern`'s own cross-algebra call-name
+    /// resolution used to only ever recover *one* concrete type from
+    /// argument agreement, silently misnaming `Transpose::transpose<...>`
+    /// (a *single*-type-argument string) whenever `Transpose<A,B>`'s own
+    /// `B` genuinely differs from `A` — exactly `Dense`'s own real shape
+    /// (`In != Out`). Fixed via `resolve_multi_target_call_ty`/`match_type_
+    /// pattern`/`resolve_type_pattern`, structurally matching `Registry::
+    /// all_impls`'s own declared target patterns against however many
+    /// concrete types a call's own arguments pin — general, not `Transpose`-
+    /// specific.
+    #[test]
+    fn adjoint_matmul_rule_produces_the_real_transpose_based_gradient_formula_for_a_non_square_case()
+     {
+        let src = "
+            use linalg;
+            fn f(a: Tensor<f32,2,3>, b: Tensor<f32,3,4>) -> Tensor<f32,2,4> { matmul(a, b) }
+        ";
+        let (result, _sources) =
+            crate::driver::compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
+        let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+        let registry = Registry::build(&program);
+        let units = crate::cps::collect_units(&program, &registry);
+        let cps_program = crate::cps::convert_program(units);
+        let f_unit = cps_program
+            .funcs
+            .iter()
+            .find(|u| u.def.name == "f")
+            .expect("`f` not found among the compiled top-level units");
+
+        let fresh = FreshVars::starting_at(max_cvar_in_program(&cps_program) + 1);
+        let unit_map: HashMap<String, &CTopLevelFn> = cps_program
+            .funcs
+            .iter()
+            .map(|u| (u.def.name.clone(), u))
+            .collect();
+
+        let mut fwd = Forward::default();
+        let real_params = &f_unit.def.params[..f_unit.def.params.len() - 1];
+        fwd.param_types = real_params
+            .iter()
+            .copied()
+            .zip(f_unit.param_types.iter().cloned())
+            .collect();
+        let boundary = fwd.walk(&f_unit.def.body, &unit_map, &fresh);
+        let root_var = segment_root_var(&boundary, &fwd.env)
+            .expect("`f`'s own body is not fully representable");
+        let root_id = *fwd.env.get(&root_var).expect("root var not in `fwd.env`");
+
+        let seed = fwd.egraph.add(CleaveLang::Free(Symbol::from("dC")));
+        let mut referenced = HashSet::new();
+        let empty_struct_schemas = HashMap::new();
+        let empty_unit_names = HashSet::new();
+        let zero_calls_used = std::sync::Mutex::new(HashSet::new());
+        let empty_known_types = HashMap::new();
+        let adjoints = backward_walk(
+            &mut fwd.egraph,
+            root_id,
+            seed,
+            &fwd.reached,
+            &fwd.field_ops,
+            &empty_struct_schemas,
+            &mut fwd.struct_ops,
+            &empty_unit_names,
+            &zero_calls_used,
+            &empty_known_types,
+            &registry,
+            &mut referenced,
+        )
+        .unwrap_or_else(|e| panic!("backward walk failed: {e}"));
+
+        let a_id = *fwd
+            .external_vars
+            .get(&real_params[0])
+            .expect("`a` never referenced");
+        let b_id = *fwd
+            .external_vars
+            .get(&real_params[1])
+            .expect("`b` never referenced");
+
+        let extractor = Extractor::new(&fwd.egraph, AstSize);
+        let (_, da) = extractor.find_best(adjoints[&fwd.egraph.find(a_id)]);
+        let (_, db) = extractor.find_best(adjoints[&fwd.egraph.find(b_id)]);
+
+        // `dA = matmul(dC, transpose(b))`, `dB = matmul(transpose(a), dC)`
+        // — the exact hand-derived formula, checked structurally (`egg`'s
+        // own s-expression `Display`, mirroring the scalar spike test's own
+        // `assert_eq!` posture). Every one of the four instantiations below
+        // is dimensionally distinct (`a:2x3`, `b:3x4`, `transpose(a):3x2`,
+        // `transpose(b):4x3`, `dC:2x4`) — genuinely exercises the fix, not
+        // just its own naming: `matmul(dC, transpose(b))` is a real `2x4 ·
+        // 4x3 -> 2x3` instantiation, *different* from the forward call's
+        // own `2x3 · 3x4 -> 2x4` — reusing the forward instantiation's own
+        // unit name here (the pre-fix bug) would silently feed it operands
+        // of the wrong shape.
+        assert_eq!(
+            da.to_string(),
+            "(\"MatMul::matmul<Tensor<f32, 2, 4>, Tensor<f32, 4, 3>, Tensor<f32, 2, 3>>\" dC \
+             (\"Transpose::transpose<Tensor<f32, 3, 4>, Tensor<f32, 4, 3>>\" fv1))",
+            "expected dA = matmul(dC, transpose(b)), got {da}"
+        );
+        assert_eq!(
+            db.to_string(),
+            "(\"MatMul::matmul<Tensor<f32, 3, 2>, Tensor<f32, 2, 4>, Tensor<f32, 3, 4>>\" \
+             (\"Transpose::transpose<Tensor<f32, 2, 3>, Tensor<f32, 3, 2>>\" fv0) dC)",
+            "expected dB = matmul(transpose(a), dC), got {db}"
         );
     }
 }

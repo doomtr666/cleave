@@ -1,0 +1,141 @@
+// A real, non-toy classification problem: the UCI "Optical Recognition of
+// Handwritten Digits" dataset (8x8 grayscale, 10 classes, 3823 training /
+// 1797 test samples) -- loaded from the real files on disk via Rust
+// (`../data.rs`'s own doc comment explains why: cleave has no file I/O of
+// its own), fed in one scalar at a time through `extern fn`.
+//
+// Deliberately WIDE, not DEEP: a single hidden layer (64 -> H -> 10),
+// scaled up from `examples/xor_tensor.cleave`'s own 2-hidden-neuron network
+// -- `doc/backlog.md`'s own "Multi-level call transparency" item found that
+// `derive()`'s own e-graph saturation cost compounds sharply with *nesting
+// depth*, not size, so this stays exactly as shallow as xor_tensor's own
+// proven-safe two-layer shape, just with much bigger tensors and a much
+// longer training loop -- the actual point of this exercise (`doc/
+// backlog.md`'s "No memory deallocation" item: every allocation here leaks,
+// and this is the first program in this codebase's own history to run a
+// training loop long/large enough for that to actually matter).
+use nn;
+use linalg;
+
+extern fn train_len() -> i32;
+extern fn train_pixel(sample: i32, pixel: i32) -> f32;
+extern fn train_label(sample: i32) -> i32;
+extern fn train_target(sample: i32, class: i32) -> f32;
+extern fn test_len() -> i32;
+extern fn test_pixel(sample: i32, pixel: i32) -> f32;
+extern fn test_label(sample: i32) -> i32;
+extern fn test_target(sample: i32, class: i32) -> f32;
+
+struct Network { l1: Dense<f32, 64, 32>, l2: Dense<f32, 32, 10> }
+
+impl<Opt> Optimizer<Opt, Network> {
+    fn init_state(opt, model) {
+        Network(l1: Optimizer::init_state(opt, model.l1), l2: Optimizer::init_state(opt, model.l2))
+    }
+    fn step(opt, model, grad, state) {
+        let r1 = Optimizer::step(opt, model.l1, grad.l1, state.l1);
+        let r2 = Optimizer::step(opt, model.l2, grad.l2, state.l2);
+        (Network(l1: r1.0, l2: r2.0), Network(l1: r1.1, l2: r2.1))
+    }
+}
+
+fn load_train_input(sample: i32) -> Tensor<f32, 1, 64> {
+    let mut pixels: [f32; 64] = [0.0; 64];
+    for i in 0..64 { pixels[i] = train_pixel(sample, i); };
+    Tensor::<f32, 1, 64>(data: [pixels])
+}
+
+fn load_train_target(sample: i32) -> Tensor<f32, 1, 10> {
+    let mut t: [f32; 10] = [0.0; 10];
+    for i in 0..10 { t[i] = train_target(sample, i); };
+    Tensor::<f32, 1, 10>(data: [t])
+}
+
+fn load_test_input(sample: i32) -> Tensor<f32, 1, 64> {
+    let mut pixels: [f32; 64] = [0.0; 64];
+    for i in 0..64 { pixels[i] = test_pixel(sample, i); };
+    Tensor::<f32, 1, 64>(data: [pixels])
+}
+
+// No final activation -- raw logits, matching `Dense::forward`'s own "no
+// activation baked in, the caller composes whichever it wants" design
+// (`stdlib/nn/nn.cleave`). `loss` below regresses these directly against a
+// one-hot target (plain sum-of-squares, not softmax/cross-entropy -- no
+// such algebra exists in this stdlib yet, and building one is a separate,
+// later step, not needed to get a real training loop running first).
+fn forward(x: Tensor<f32, 1, 64>, net: Network) -> Tensor<f32, 1, 10> {
+    let h = sigmoid(net.l1.forward(x));
+    net.l2.forward(h)
+}
+
+// Stays tensor-native throughout, never decomposed into scalars -- `err`
+// is one real `Ring<Tensor<f32,1,10>>::sub` call, `err*err` one real
+// `Ring<Tensor<f32,1,10>>::mul` (elementwise/Hadamard), `sum(...)` one real
+// `Sum<Tensor<f32,1,10>,f32>::sum` (`stdlib/nn/nn.cleave`) -- each of these
+// has a real, declared `adjoint` rule, unlike `Index::index` (reading
+// `pred[0,i]`/`y[0,i]` directly, an earlier, `derive()`-only version of
+// this file's own manually-unrolled 10-term sum-of-squares used), which
+// doesn't (`doc/backlog.md`'s own "no existing stdlib/example code needs
+// `tensor.insert`" gap) -- `grad()`'s own reverse-mode backend needs
+// exactly this shape to differentiate through at all.
+fn loss(x: Tensor<f32, 1, 64>, y: Tensor<f32, 1, 10>, net: Network) -> f32 {
+    let pred = forward(x, net);
+    let err = pred - y;
+    sum(err * err)
+}
+
+// `grad()`, not `derive()` -- `doc/backlog.md`'s own "Reverse-mode (`grad()`)
+// differentiation" item: `derive()`'s own per-element `ParamShape::Tensor`
+// expansion is exactly what made this kernel intractable in the first
+// place (293,197 e-graph nodes for a single `Tensor<f32,64,8>` weight,
+// measured directly) -- `grad()` differentiates `net` as a *whole*, one
+// opaque leaf per `Tensor`/scalar field, cost independent of `l1`'s own
+// `64x32` or `l2`'s own `32x10` (both genuinely non-square -- the real
+// case `egraph.rs::build_pattern`'s own `resolve_multi_target_call_ty` fix
+// was built for).
+net_grad = grad(loss);
+
+fn argmax10(pred: Tensor<f32, 1, 10>) -> i32 {
+    let mut best: i32 = 0;
+    let mut best_val: f32 = pred[0, 0];
+    for c in 1..10 {
+        if pred[0, c] > best_val {
+            best_val = pred[0, c];
+            best = c;
+        };
+    };
+    best
+}
+
+fn evaluate(net: Network) -> f32 {
+    let n: i32 = test_len();
+    let mut correct: i32 = 0;
+    for s in 0..n {
+        let x = load_test_input(s);
+        let predicted: i32 = argmax10(forward(x, net));
+        let label: i32 = test_label(s);
+        if predicted == label { correct = correct + 1; };
+    };
+    let correct_f: f32 = correct.to();
+    let n_f: f32 = n.to();
+    correct_f / n_f
+}
+
+export fn train_and_evaluate(epochs: i32, lr: f32, seed: i64) -> f32 {
+    rand_seed(seed);
+    let mut net: Network = Network(l1: Init::xavier(), l2: Init::xavier());
+    let opt = Sgd(lr: lr);
+    let mut state: Network = Optimizer::init_state(opt, net);
+    let n: i32 = train_len();
+    for epoch in 0..epochs {
+        for s in 0..n {
+            let x = load_train_input(s);
+            let y = load_train_target(s);
+            let g = net_grad(x, y, net);
+            let r = Optimizer::step(opt, net, g.2, state);
+            net = r.0;
+            state = r.1;
+        };
+    };
+    evaluate(net)
+}

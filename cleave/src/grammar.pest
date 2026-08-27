@@ -8,7 +8,7 @@ COMMENT = _{ "//" ~ (!NEWLINE ~ ANY)* }
 
 program = { SOI ~ item* ~ EOI }
 
-item = { use_decl | struct_decl | algebra_decl | impl_decl | fn_decl | derive_decl }
+item = { use_decl | struct_decl | algebra_decl | impl_decl | fn_decl | derive_decl | grad_decl }
 
 // ---------------------------------------------------------------- crates
 // `use linalg;` (or `use linalg::Matrix;`) is the only mechanism — no separate
@@ -89,6 +89,22 @@ export_kw = { "export" ~ ("(" ~ ident ~ ")")? }
 // keyword or `#`, `derive_decl` is the only one starting with a bare
 // `ident`.
 derive_decl = { ident ~ "=" ~ "derive" ~ "(" ~ ident ~ ")" ~ ";" }
+// `gw = grad(loss);` -- `doc/backlog.md`'s own "reverse-mode differentiation"
+// item: a *separate* keyword from `derive`, deliberately, not a silent
+// swap of what `derive` itself means -- `derive` stays general-purpose
+// forward-mode symbolic differentiation (any output shape, any number of
+// differentiation targets, at a real, measured cost that scales with *how
+// many* targets there are simultaneously); `grad` is a narrower, reverse-
+// mode-specific operation with its own real contract (`f`'s own return
+// type must be a scalar `Float` -- checked structurally by `driver.rs`'s
+// own signature-synthesis pass, the identical place `derive_decl`'s own
+// checks already live), computing every parameter's own gradient in one
+// pass regardless of how many there are. Grammatically identical to
+// `derive_decl` otherwise -- same "bare `ident ~ '=' ~ keyword ~ (...)`"
+// shape, no ambiguity between the two: PEG's own ordered choice already
+// disambiguates on the literal keyword ("derive" vs "grad") the moment
+// either alternative gets past its own leading `ident ~ "="`.
+grad_decl = { ident ~ "=" ~ "grad" ~ "(" ~ ident ~ ")" ~ ";" }
 
 generic_params = { "<" ~ generic_param ~ ("," ~ generic_param)* ~ ">" }
 // A trailing `...` right after the declared *name* (before any `:`-
@@ -140,7 +156,7 @@ field       = { ident ~ ":" ~ type_ }
 // "algebra" is the working keyword from hld.md's closing section; naming
 // (vs. a separate axiom-free "signature") is still open, see conversation notes.
 algebra_decl = { "algebra" ~ ident ~ generic_params? ~ (":" ~ bound_list)? ~ "{" ~ algebra_item* ~ "}" }
-algebra_item = { fn_sig | axiom_decl | derivative_rule_decl }
+algebra_item = { fn_sig | axiom_decl | derivative_rule_decl | adjoint_rule_decl }
 fn_sig       = { "fn" ~ ident ~ "(" ~ param_list? ~ ")" ~ ("->" ~ type_)? ~ ";" }
 // the equality itself is just an ordinary `expr` (comparison already handles `==`);
 // no separate "==" token here, or it would conflict with comparison's own greedy parse.
@@ -153,6 +169,25 @@ axiom_decl   = { "axiom" ~ ident ~ "(" ~ param_list? ~ ")" ~ ":" ~ expr ~ ";" }
 // `d(...)` inside `expr` is sugar recognized specially by `egraph.rs::
 // build_pattern`, not a real call -- see that function's own doc comment.
 derivative_rule_decl = { "derivative" ~ ident ~ "(" ~ param_list? ~ ")" ~ ":" ~ expr ~ ";" }
+// `adjoint mul(a, b), u: (mul(u, b), mul(u, a));` -- a declared reverse-mode
+// (VJP/adjoint) rewrite rule, structurally a sibling of `derivative_rule_
+// decl` just above, not a replacement for it (both may coexist during the
+// reverse-mode migration -- see `doc/backlog.md`'s own item). `ident` here
+// is the *method* being differentiated, same as `derivative_rule_decl`; the
+// second `~ "," ~ ident` binds the name for the *upstream* adjoint (this
+// method's own output's cotangent, e.g. `u` above) -- the one real
+// grammatical difference from `derivative_rule_decl`, since a reverse-mode
+// rule needs that value as an explicit input its own body can reference,
+// where a forward-mode `derivative` rule never does (it differentiates
+// *of* something, never propagates a value *into* its own rule). The body
+// is an ordinary `expr` -- for an arity-2+ method, a `tuple_lit` (already
+// existing grammar, no new syntax) with one entry per parameter, in
+// declared order; for arity-1, a bare `expr`. Arity itself isn't checked
+// here (a `tuple_lit` and a parenthesized single `expr` are structurally
+// ambiguous without knowing `params.len()` first) -- `lower.rs`'s own
+// `lower_adjoint_rule_decl` checks it against the real declared param
+// count, a real diagnostic, not a panic.
+adjoint_rule_decl = { "adjoint" ~ ident ~ "(" ~ param_list? ~ ")" ~ "," ~ ident ~ ":" ~ expr ~ ";" }
 
 // ---------------------------------------------------------------- impl
 // Two shapes: an *algebra* impl (dispatches `add`/`gt`/... through the

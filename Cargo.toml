@@ -1,5 +1,14 @@
 [workspace]
-members = ["cleave", "cleave-rt", "cleave-build", "examples/rust-interop-demo"]
+members = ["cleave", "cleave-rt", "cleave-build", "examples/rust-interop-demo", "examples/digits-interop"]
+# `digits-interop`'s own `build.rs` compiles a real MLP kernel through
+# `derive()` -- currently far too slow to sit in the ordinary `cargo build/
+# test --workspace` sweep (`doc/backlog.md`'s own "derive() doesn't scale to
+# real tensor-shaped parameters" item, actively being redesigned). Excluded
+# from `default-members` so a bare `cargo build`/`test` (no `--workspace`)
+# skips it; `--workspace` explicitly still walks every member regardless of
+# this list, so build/test *that* deliberately, not by habit, while this is
+# unresolved. Re-include in `default-members` once the redesign lands.
+default-members = ["cleave", "cleave-rt", "cleave-build", "examples/rust-interop-demo"]
 resolver = "3"
 
 [patch.crates-io]

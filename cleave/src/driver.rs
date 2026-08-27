@@ -424,10 +424,19 @@ fn synthesize_derive_signatures(
         let Some(of) = fprime.derivative_of.clone() else {
             continue;
         };
+        // `derive`/`grad` share every check below (both need the same
+        // "which function, what does its own signature look like" facts) —
+        // `keyword` only changes which name each diagnostic reports, so an
+        // error about a `grad(...)` request never wrongly says `derive(...)`
+        // (`ast.rs`'s own `FnDecl::is_grad` doc comment on why these two
+        // keywords share this one synthesis pass rather than each getting
+        // their own copy).
+        let is_grad = fprime.is_grad;
+        let keyword = if is_grad { "grad" } else { "derive" };
 
         let Some(f) = fns.get(&of) else {
             errors.push(Diagnostic::error(
-                format!("`derive({of})`: no function named `{of}`"),
+                format!("`{keyword}({of})`: no function named `{of}`"),
                 item.span,
             ));
             continue;
@@ -435,27 +444,60 @@ fn synthesize_derive_signatures(
         if !f.generics.is_empty() {
             errors.push(Diagnostic::error(
                 format!(
-                    "`derive({of})`: `{of}` is generic — only a non-generic function can be derived"
+                    "`{keyword}({of})`: `{of}` is generic — only a non-generic function can be derived"
                 ),
                 item.span,
             ));
             continue;
         }
         if f.params.is_empty() {
-            errors.push(Diagnostic::error(format!("`derive({of})`: `{of}` takes no parameters — nothing to differentiate with respect to"), item.span));
+            errors.push(Diagnostic::error(format!("`{keyword}({of})`: `{of}` takes no parameters — nothing to differentiate with respect to"), item.span));
             continue;
         }
         if f.ret.is_none() {
             errors.push(Diagnostic::error(
-                format!("`derive({of})`: `{of}` has no declared return type"),
+                format!("`{keyword}({of})`: `{of}` has no declared return type"),
                 item.span,
             ));
             continue;
         }
+        // `grad`'s own real, narrower contract (`ast.rs`'s own `FnDecl::
+        // is_grad` doc comment): reverse-mode differentiation computes
+        // every parameter's own gradient in *one* pass specifically because
+        // there's exactly one scalar output to seed the backward walk from
+        // (`⟨Av,w⟩ = ⟨v,A*w⟩`-style adjoint composition, `doc/backlog.md`'s
+        // own fuller story) — a non-scalar or non-`Float` return type has no
+        // such single seed, so this is a real, structural, located error,
+        // not silently accepted and wrongly computed. `derive` has no such
+        // restriction (general forward-mode differentiation), so this check
+        // only ever runs for `is_grad`. Checked purely structurally (the
+        // declared `Type`'s own `Path` segments), same posture every other
+        // check in this function already takes — full type inference
+        // hasn't run yet at this point in the pipeline.
+        if is_grad {
+            let ret = f.ret.as_ref().unwrap();
+            let is_scalar_float = matches!(
+                &ret.kind,
+                TypeKind::Path(path, _)
+                    if path.segments.len() == 1
+                        && matches!(path.segments[0].as_str(), "f32" | "f64")
+            );
+            if !is_scalar_float {
+                errors.push(Diagnostic::error(
+                    format!(
+                        "`grad({of})`: `{of}` must return a scalar `f32`/`f64` — reverse-mode \
+                         differentiation needs exactly one scalar output to seed the backward \
+                         pass from; use `derive({of})` instead for a non-scalar result"
+                    ),
+                    item.span,
+                ));
+                continue;
+            }
+        }
         let Some(param_tys): Option<Vec<Type>> = f.params.iter().map(|p| p.ty.clone()).collect()
         else {
             errors.push(Diagnostic::error(
-                format!("`derive({of})`: every parameter of `{of}` must have an explicit type"),
+                format!("`{keyword}({of})`: every parameter of `{of}` must have an explicit type"),
                 item.span,
             ));
             continue;
@@ -624,6 +666,10 @@ struct AlgebraAcc {
     /// method already is the identity, mirrors `seen_axioms` exactly
     /// otherwise).
     seen_derivative_rules: HashMap<String, Span>,
+    /// Mirrors `seen_derivative_rules` exactly, for `adjoint` rules —
+    /// `AdjointRuleDecl` has the same "no separate rule name, the method
+    /// being differentiated already is the identity" shape.
+    seen_adjoint_rules: HashMap<String, Span>,
 }
 
 struct ImplAcc {
@@ -744,6 +790,7 @@ fn merge_algebra_fragment(
         let mut seen_fn_sigs = HashMap::new();
         let mut seen_axioms = HashMap::new();
         let mut seen_derivative_rules = HashMap::new();
+        let mut seen_adjoint_rules = HashMap::new();
         for it in &d.items {
             match &it.kind {
                 AlgebraItemKind::FnSig(sig) => {
@@ -757,6 +804,9 @@ fn merge_algebra_fragment(
                 AlgebraItemKind::DerivativeRule(dr) => {
                     seen_derivative_rules.insert(dr.method.clone(), it.span);
                 }
+                AlgebraItemKind::AdjointRule(ar) => {
+                    seen_adjoint_rules.insert(ar.method.clone(), it.span);
+                }
             }
         }
         algebras.push(AlgebraAcc {
@@ -766,6 +816,7 @@ fn merge_algebra_fragment(
             seen_fn_sigs,
             seen_axioms,
             seen_derivative_rules,
+            seen_adjoint_rules,
         });
         return;
     };
@@ -806,12 +857,21 @@ fn merge_algebra_fragment(
                 }
                 dup
             }
+            AlgebraItemKind::AdjointRule(ar) => {
+                let dup = acc.seen_adjoint_rules.contains_key(&ar.method);
+                if !dup {
+                    acc.seen_adjoint_rules
+                        .insert(ar.method.clone(), new_item.span);
+                }
+                dup
+            }
         };
         if conflict {
             let name = match &new_item.kind {
                 AlgebraItemKind::FnSig(sig) => &sig.name,
                 AlgebraItemKind::Axiom(ax) => &ax.name,
                 AlgebraItemKind::DerivativeRule(dr) => &dr.method,
+                AlgebraItemKind::AdjointRule(ar) => &ar.method,
             };
             errors.push(Diagnostic::error(
                 format!(

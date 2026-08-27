@@ -761,6 +761,14 @@ pub fn monomorphize(
                 registry,
                 &mut impl_worklist,
             );
+            seed_adjoint_rule_references(
+                registry,
+                &t.algebra,
+                &t.method_name,
+                &target_tys,
+                &templates,
+                &mut impl_worklist,
+            );
 
             let origin = format!("{}::{}", t.algebra, t.method_name);
             mono.by_origin
@@ -2013,20 +2021,31 @@ fn find_impl_for_target(
     registry: &Registry,
     algebra: &str,
     method: &str,
-    target_tys: &[Ty],
+    target_tys: &[Option<Ty>],
 ) -> Option<(usize, HashMap<TyVar, Ty>)> {
     for (idx, t) in templates.iter().enumerate() {
         if t.algebra != algebra
             || t.method_name != method
-            || t.target_patterns.len() != target_tys.len()
+            || target_tys.len() > t.target_patterns.len()
             || !t.is_generic
         {
             continue;
         }
         let mut trial = Subst::default();
+        // A `None` entry (a target position no caller could resolve, e.g.
+        // `Transpose<A,B>`'s own `B` before this whole function's own
+        // "fewer concrete targets" relaxation just below existed at all —
+        // `find_impl_for_target`'s own callers only ever supply *some*
+        // prefix positions, `resolve_derivative_rule_expr_ty`'s own doc
+        // comment on why: only one concrete type is ever recoverable from a
+        // call's own argument-type agreement) is simply skipped here, not
+        // unified against at all — its own free variables get pinned later,
+        // by *another* target pattern that shares them, or this candidate
+        // is rejected below (`fully_resolved`) if nothing ever does.
         if t.target_patterns
             .iter()
             .zip(target_tys)
+            .filter_map(|(pat, concrete)| concrete.as_ref().map(|c| (pat, c)))
             .any(|(pat, concrete)| unify(&mut trial, pat, concrete).is_err())
         {
             continue;
@@ -2053,6 +2072,31 @@ fn find_impl_for_target(
             .into_iter()
             .map(|v| (v, trial.apply(&Ty::Var(v))))
             .collect();
+        // Fewer concrete targets than this template declares (an output-
+        // only trailing generic, e.g. `Transpose<A,B>`'s own `B` — nothing
+        // ever calls `transpose` with `B` given explicitly, it falls out of
+        // `A`'s own shape) is only a valid match when every *other* target
+        // pattern's own free variables were already pinned by the ones
+        // actually supplied above — found directly, needed for real:
+        // `MatMul`'s own new `adjoint` rule (`stdlib/linalg/matrix.cleave`)
+        // is the first rule anywhere in this codebase to reference a
+        // genuinely multi-target *different* algebra cross-algebra
+        // (`resolve_derivative_rule_expr_ty`'s own single-`agreed`-type
+        // limitation only ever supplies `A`, never `B`) — `Transpose`'s own
+        // `B` happens to reuse the exact same `T`/`N`/`M` vars `A` already
+        // pins, so this still resolves soundly. A future, genuinely
+        // independent trailing generic (unconstrained by any supplied
+        // target) would leave a raw `Ty::Var` in `mapping` here — rejected,
+        // not guessed, the same posture this whole function already takes
+        // for a bounds mismatch just above.
+        let fully_resolved = mapping.values().all(|resolved| {
+            let mut free = HashSet::new();
+            free_vars(resolved, &mut free);
+            free.is_empty()
+        });
+        if !fully_resolved {
+            continue;
+        }
         return Some((idx, mapping));
     }
     None
@@ -2167,21 +2211,128 @@ fn resolve_derivative_rule_expr_ty(
             // names resolved ... but no such unit exists"-style panic,
             // extracting a derivative that references a never-monomorphized
             // unit.
-            if let Some(target_ty) = &agreed {
-                if let Some((idx, mapping)) = find_impl_for_target(
-                    templates,
-                    registry,
-                    &owner,
-                    &method,
-                    std::slice::from_ref(target_ty),
-                ) {
-                    impl_worklist.push((idx, mapping));
+            // `owner`'s own declared generic parameters, in order -- needed
+            // to place each argument's own resolved type at the *right*
+            // target position, rather than assuming the one type a call's
+            // own arguments agree on (`agreed`, just above) always
+            // corresponds to `owner`'s own *first* declared generic.
+            let owner_generics: Vec<&str> = registry
+                .generics(&owner)
+                .iter()
+                .filter(|g| !matches!(g, GenericParam::Const { .. }))
+                .map(|g| g.name())
+                .collect();
+            // Each argument whose own declared type (`sig.params[i].ty`,
+            // `owner`'s own fn signature) is a bare, unqualified name
+            // matching one of `owner`'s own generics pins that generic's
+            // own real position — used for *any* multi-target `owner`
+            // (same algebra or cross), not just cross-algebra: a same-
+            // algebra recursive call's own arguments do *not* generally
+            // share the *enclosing* rule's own instantiation the way a
+            // `derivative` rule's own `d(a)`/`d(b)`-wrapped arguments do
+            // (found directly, empirically, the exact same way `egraph.rs
+            // ::build_pattern`'s own identical fix was: `MatMul`'s own
+            // adjoint rule's `matmul(u, transpose(b))`/`matmul(transpose(a),
+            // u)` are each a *third*, genuinely different instantiation
+            // from both the forward call and each other — reusing `type_
+            // env` unconditionally here seeded the *wrong* unit, or none
+            // at all, exactly mirroring that earlier, now-fixed bug).
+            let target_tys: Vec<Option<Ty>> = registry
+                .fn_sig(&owner, &method)
+                .into_iter()
+                .flat_map(|sig| arg_tys.iter().zip(&sig.params))
+                .fold(vec![None; owner_generics.len()], |mut acc, (arg_ty, sig_param)| {
+                    if let Some(declared) = &sig_param.ty {
+                        if let TypeKind::Path(p, gens) = &declared.kind {
+                            if gens.is_empty() && p.segments.len() == 1 {
+                                if let Some(idx) =
+                                    owner_generics.iter().position(|g| *g == p.segments[0])
+                                {
+                                    acc[idx] = Some(arg_ty.clone());
+                                }
+                            }
+                        }
+                    }
+                    acc
+                });
+            // Tried *unfilled* first, deliberately — a still-open position
+            // (`C` in `matmul(transpose(a), u)`, `MatMul`'s own adjoint
+            // rule: neither argument maps to it, it's the *return* type)
+            // that unification can *itself* pin from the other, filled
+            // ones (`A`/`B` alone determine `N`/`M`/`K`, hence `C`, for
+            // `MatMul`) must be left to do so — pre-filling it from the
+            // *enclosing* rule's own `type_env` would silently substitute
+            // a *different* recursive instantiation's own value there
+            // (found directly, empirically: `matmul(transpose(a), u)`'s
+            // own real `C` is `Tensor<f32,2,2>`, the enclosing forward
+            // call's own `C` is `Tensor<f32,1,2>` — genuinely different).
+            // Retried *with* the `type_env` fallback only if the unfilled
+            // attempt didn't fully resolve — `Sum::broadcast(u: T) ->
+            // Container`'s own real, opposite case: `Container`'s own `N`/
+            // `M` appear *nowhere else* in the template, so leaving it
+            // `None` can never be pinned by unification at all, and the
+            // enclosing rule's own `type_env` (the *only* other source
+            // that could ever know it) is the correct, and only, fallback.
+            let seed_result = if target_tys.iter().any(Option::is_some) {
+                find_impl_for_target(templates, registry, &owner, &method, &target_tys)
+            } else {
+                None
+            };
+            let seed_result = seed_result.or_else(|| {
+                if owner != algebra {
+                    return None;
                 }
+                let mut filled = target_tys.clone();
+                for (slot, name) in filled.iter_mut().zip(&owner_generics) {
+                    if slot.is_none() {
+                        *slot = type_env.get(*name).cloned();
+                    }
+                }
+                find_impl_for_target(templates, registry, &owner, &method, &filled)
+            });
+            if let Some((idx, mapping)) = seed_result {
+                    // This call's own *real*, resolved return type — needed
+                    // whenever it's itself nested inside a further,
+                    // enclosing call (`transpose(a)` inside `matmul
+                    // (transpose(a), u)`, `MatMul`'s own adjoint rule): the
+                    // matched template's own `target_patterns[ret_idx]`
+                    // (still in terms of *its own* `TyVar`s), substituted
+                    // through `mapping` (`find_impl_for_target`'s own
+                    // return value, every one of those vars now fully
+                    // resolved) — the identical value `egraph.rs::build_
+                    // pattern`'s own `result_ty` computation reaches via
+                    // `resolve_declared_type`/`generic_substitution`, just
+                    // built from structured `Ty`s here instead of text.
+                    // Returning `agreed`/`type_env`-based guesses here
+                    // (this function's own previous behavior) is what
+                    // silently seeded the *wrong* instantiation for a non-
+                    // square `transpose` nested this way — found directly,
+                    // empirically, chasing exactly this case.
+                    let owner_ret_ty = registry
+                        .fn_sig(&owner, &method)
+                        .and_then(|sig| sig.ret.clone())
+                        .and_then(|ret| match &ret.kind {
+                            TypeKind::Path(p, gens)
+                                if gens.is_empty() && p.segments.len() == 1 =>
+                            {
+                                owner_generics.iter().position(|g| *g == p.segments[0])
+                            }
+                            _ => None,
+                        })
+                        .map(|ret_idx| substitute(&templates[idx].target_patterns[ret_idx], &mapping));
+                    impl_worklist.push((idx, mapping));
+                    if let Some(ret_ty) = owner_ret_ty {
+                        return Some(ret_ty);
+                    }
             }
             if owner == algebra {
                 // Same-algebra call — its own result type is this algebra's
                 // own declared return type, substituted through the
-                // *enclosing* instantiation's own `type_env`.
+                // *enclosing* instantiation's own `type_env`. Only reached
+                // when the resolution just above couldn't determine a real
+                // return type (e.g. nothing pinned at all) — a safe
+                // fallback specifically because it's *this* rule's own
+                // enclosing instantiation, not a guess about some other one.
                 return registry
                     .fn_sig(&owner, &method)?
                     .ret
@@ -2267,6 +2418,95 @@ fn seed_derivative_rule_references(
 }
 
 /// A sibling of `seed_derivative_rule_references`, same call site, same
+/// worklist-injection mechanism, but for a declared `adjoint` rule instead
+/// of a `derivative` one — `MatMul`'s own adjoint rule needs `Transpose::
+/// transpose<Tensor<...>>`, which no ordinary call site in a program that
+/// only ever calls `matmul` directly (never `transpose`) reaches at all —
+/// found directly, the identical "extracted expression references a
+/// symbol `rebuild`/`collect_units` never actually monomorphized" class of
+/// gap `seed_derivative_rule_references`'s own doc comment already
+/// documents for the forward-mode path (`egraph.rs`'s own reverse-mode
+/// tests confirmed this empirically: `Transpose::transpose<...>` simply
+/// never appeared in `collect_units`'s own output for a program calling
+/// only `matmul`).
+///
+/// `param_tys` gains one entry beyond `seed_derivative_rule_references`'s
+/// own: `rule.upstream`'s own type, the algebra method's own declared
+/// return type (`sig.ret`) resolved through the same `type_env` — an
+/// `adjoint` rule's body references it as an ordinary bound variable, no
+/// special `d(...)`-style syntax (`AdjointRuleDecl`'s own doc comment).
+/// A tuple-shaped body (`rule.params.len() > 1`) is walked field by field —
+/// `resolve_derivative_rule_expr_ty` itself has no `ExprKind::StructLit`
+/// case (a `derivative` rule's own body is always a single expression,
+/// never a tuple), so each contribution expression is resolved
+/// independently instead of trying to teach that shared function a new
+/// top-level shape it otherwise never needs.
+fn seed_adjoint_rule_references(
+    registry: &Registry,
+    algebra: &str,
+    method: &str,
+    target_tys: &[Ty],
+    templates: &[ImplTemplate],
+    impl_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
+) {
+    let Some(rule) = registry
+        .adjoint_rules(algebra)
+        .iter()
+        .find(|r| r.method == method)
+    else {
+        return;
+    };
+    let Some(sig) = registry.fn_sig(algebra, method) else {
+        return;
+    };
+    let type_env: HashMap<String, Ty> = registry
+        .generics(algebra)
+        .iter()
+        .filter(|g| !matches!(g, GenericParam::Const { .. }))
+        .map(|g| g.name().to_string())
+        .zip(target_tys.iter().cloned())
+        .collect();
+    let mut infer = Infer::new(registry);
+    let mut param_tys: HashMap<&str, Ty> = rule
+        .params
+        .iter()
+        .zip(&sig.params)
+        .filter_map(|(rule_p, sig_p)| {
+            Some((
+                rule_p.name.as_str(),
+                infer.ty_from_ast_mapped(sig_p.ty.as_ref()?, &type_env),
+            ))
+        })
+        .collect();
+    if let Some(ret) = sig.ret.as_ref() {
+        param_tys.insert(
+            rule.upstream.as_str(),
+            infer.ty_from_ast_mapped(ret, &type_env),
+        );
+    }
+    let bodies: Vec<&Expr> = if rule.params.len() > 1 {
+        match &rule.body.kind {
+            ExprKind::StructLit(_, _, fields) => fields.iter().map(|(_, e)| e).collect(),
+            _ => return,
+        }
+    } else {
+        vec![&rule.body]
+    };
+    for body in bodies {
+        resolve_derivative_rule_expr_ty(
+            body,
+            algebra,
+            &type_env,
+            &param_tys,
+            registry,
+            &mut infer,
+            templates,
+            impl_worklist,
+        );
+    }
+}
+
+/// A sibling of `seed_derivative_rule_references`, same call site, same
 /// worklist-injection mechanism — but a *different* trigger: not "some
 /// `derivative` rule's own body references this," since nothing declared
 /// anywhere ever references `Ring::zero` at all. `egraph.rs`'s own built-in
@@ -2292,8 +2532,9 @@ fn seed_ring_zero(
     if algebra != "Ring" {
         return;
     }
+    let target_tys: Vec<Option<Ty>> = target_tys.iter().cloned().map(Some).collect();
     if let Some((idx, mapping)) =
-        find_impl_for_target(templates, registry, "Ring", "zero", target_tys)
+        find_impl_for_target(templates, registry, "Ring", "zero", &target_tys)
     {
         impl_worklist.push((idx, mapping));
     }
@@ -2338,7 +2579,7 @@ fn seed_derive_tensor_field_indices(
             registry,
             "Index",
             "index",
-            &[ty.clone(), elem_ty.clone()],
+            &[Some(ty.clone()), Some(elem_ty.clone())],
         ) {
             impl_worklist.push((idx, mapping));
         }

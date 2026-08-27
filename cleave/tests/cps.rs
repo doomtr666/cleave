@@ -908,7 +908,7 @@ fn dead_code_elimination_after_optimization_drops_specializations_the_axioms_fol
         "got: {names_before:?}"
     );
 
-    let (optimized, _) = cleave::egraph::optimize_program(cps_program, &registry);
+    let (optimized, _) = cleave::egraph::optimize_program(cps_program, &registry, false);
     let optimized = eliminate_dead_code(optimized);
     let names_after: Vec<&str> = optimized
         .funcs

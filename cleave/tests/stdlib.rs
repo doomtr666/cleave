@@ -69,6 +69,39 @@ fn stdlib_num_splits_int_and_float_as_independent_algebras() {
     }
 }
 
+/// `doc/backlog.md`'s own "reverse-mode differentiation" item — the real
+/// stdlib file parses and loads with the new `adjoint` rules declared
+/// alongside the existing `derivative` ones (not just the isolated-`Registry
+/// ::build`-on-a-hand-written-snippet tests `tests/registry.rs` already
+/// has) — proves the actual `stdlib/num/num.cleave` source is well-formed,
+/// not just that the grammar/lowering/registry mechanism works in
+/// isolation.
+#[test]
+fn stdlib_num_declares_adjoint_rules_alongside_derivative_rules() {
+    let registry = load_num_registry();
+    let ring_adjoints = registry.adjoint_rules("Ring");
+    let ring_methods: std::collections::HashSet<&str> =
+        ring_adjoints.iter().map(|r| r.method.as_str()).collect();
+    assert_eq!(
+        ring_methods,
+        std::collections::HashSet::from(["add", "sub", "mul", "div", "neg"]),
+        "expected exactly the 5 Ring adjoint rules"
+    );
+    // `derivative` rules still present too -- coexistence, not replacement,
+    // during the migration.
+    assert_eq!(registry.derivative_rules("Ring").len(), 5);
+
+    let trans_adjoints = registry.adjoint_rules("Transcendental");
+    let trans_methods: std::collections::HashSet<&str> =
+        trans_adjoints.iter().map(|r| r.method.as_str()).collect();
+    assert_eq!(
+        trans_methods,
+        std::collections::HashSet::from(["exp", "tanh"]),
+        "expected exactly the 2 Transcendental adjoint rules"
+    );
+    assert_eq!(registry.derivative_rules("Transcendental").len(), 2);
+}
+
 fn load_num_registry() -> Registry {
     let path = stdlib_path().unwrap().join("num").join("num.cleave");
     let src = fs::read_to_string(&path).unwrap_or_else(|e| panic!("failed to read {path:?}: {e}"));

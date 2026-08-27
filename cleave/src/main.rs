@@ -161,7 +161,7 @@ fn parse_args() -> Result<Args, String> {
 // reason, not a workaround for a logic bug.
 fn main() -> ExitCode {
     std::thread::Builder::new()
-        .stack_size(64 * 1024 * 1024)
+        .stack_size(1024 * 1024 * 1024)
         .spawn(real_main)
         .unwrap()
         .join()
@@ -312,7 +312,7 @@ fn real_main() -> ExitCode {
             match build_cps_program(&program, &registry) {
                 Ok(cps_program) => {
                     let cps_program = eliminate_dead_code(cps_program);
-                    let (optimized, _) = optimize_program(cps_program, &registry);
+                    let (optimized, _) = optimize_program(cps_program, &registry, false);
                     // A second sweep: `optimize_program` can itself fold away
                     // every remaining call to a stdlib specialization (e.g.
                     // `10 + x - 10` reducing to `x` via axioms) — the first
@@ -349,7 +349,7 @@ fn real_main() -> ExitCode {
             match build_cps_program(&program, &registry) {
                 Ok(cps_program) => {
                     let cps_program = eliminate_dead_code(cps_program);
-                    let (_, explanations) = optimize_program(cps_program, &registry);
+                    let (_, explanations) = optimize_program(cps_program, &registry, true);
                     if explanations.is_empty() {
                         println!("(no axiom rewrites fired)");
                     } else {
@@ -380,7 +380,7 @@ fn real_main() -> ExitCode {
             match build_cps_program(&program, &registry) {
                 Ok(cps_program) => {
                     let cps_program = eliminate_dead_code(cps_program);
-                    let (cps_program, _) = optimize_program(cps_program, &registry);
+                    let (cps_program, _) = optimize_program(cps_program, &registry, false);
                     // See `--dump-cps-optimized`'s own comment above: a
                     // second sweep is needed to catch a unit `optimize_
                     // program` itself made unreachable (e.g. an axiom
@@ -427,7 +427,7 @@ fn real_main() -> ExitCode {
             match build_cps_program(&program, &registry) {
                 Ok(cps_program) => {
                     let cps_program = eliminate_dead_code(cps_program);
-                    let (cps_program, _) = optimize_program(cps_program, &registry);
+                    let (cps_program, _) = optimize_program(cps_program, &registry, false);
                     // See `--dump-cps-optimized`'s own comment above: a
                     // second sweep is needed to catch a unit `optimize_
                     // program` itself made unreachable (e.g. an axiom
@@ -527,7 +527,7 @@ fn real_main() -> ExitCode {
             }
         };
         let cps_program = eliminate_dead_code(cps_program);
-        let (cps_program, _) = optimize_program(cps_program, &registry);
+        let (cps_program, _) = optimize_program(cps_program, &registry, false);
         // See `--dump-cps-optimized`'s own comment above: a second sweep is
         // needed to catch a unit `optimize_program` itself made unreachable
         // (e.g. an axiom folding away every remaining call to it), which

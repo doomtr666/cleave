@@ -112,7 +112,7 @@ fn an_axiom_folds_a_real_call_away_and_the_optimized_program_still_executes_to_t
 
     let optimize_units = collect_units(&program, &registry);
     let optimize_cps = convert_program(optimize_units);
-    let (optimized, explanations) = optimize_program(optimize_cps, &registry);
+    let (optimized, explanations) = optimize_program(optimize_cps, &registry, true);
     assert!(
         !explanations.is_empty(),
         "the axiom must have fired on at least one function"
@@ -194,7 +194,7 @@ fn a_struct_field_read_lets_add_zero_fold_a_real_call_away_and_the_optimized_pro
 
     let optimize_units = collect_units(&program, &registry);
     let optimize_cps = convert_program(optimize_units);
-    let (optimized, explanations) = optimize_program(optimize_cps, &registry);
+    let (optimized, explanations) = optimize_program(optimize_cps, &registry, true);
     assert!(
         !explanations.is_empty(),
         "the struct-projection rewrite plus add_zero must have fired on at least one function"

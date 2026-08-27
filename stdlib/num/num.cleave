@@ -134,6 +134,33 @@ algebra Ring<T> {
     // that was the wrong layer).
     derivative div(a, b): div(sub(mul(d(a), b), mul(a, d(b))), mul(b, b));
     derivative neg(a): neg(d(a));
+
+    // `doc/backlog.md`'s own "reverse-mode differentiation" item — a
+    // parallel, *reverse*-mode counterpart to the `derivative` rules just
+    // above, not a replacement for them (both coexist during the
+    // migration). Where a `derivative` rule answers "what is d(this call)/
+    // d(x)" for one differentiation variable `x` at a time (forward mode —
+    // cost scales with the *number* of variables being differentiated
+    // simultaneously, the real, measured blowup a large `Tensor`-shaped
+    // parameter hits, `doc/backlog.md`'s own fuller story), an `adjoint`
+    // rule answers "given `u`, the upstream adjoint of this call's own
+    // *output*, what contribution flows back to each input" — the real
+    // linear-algebra adjoint of each operation (`⟨Av,w⟩ = ⟨v,A*w⟩`, `A* =
+    // A^T` for a real matrix), computed once per operation regardless of
+    // how many leaves are ultimately being differentiated. `Ring<Tensor<T,
+    // Dims...>>` (`stdlib/linalg/tensor.cleave`) needs no adjoint rules of
+    // its own — inherits these exactly the way it already inherits the
+    // `derivative` rules above, since both are declared once, here, on the
+    // algebra itself.
+    adjoint add(a, b), u: (u, u);
+    adjoint sub(a, b), u: (u, neg(u));
+    adjoint mul(a, b), u: (mul(u, b), mul(u, a));
+    // Same quotient-rule shape as `derivative div`'s own adjoint would be,
+    // rewritten from `d(a/b) = (d(a)*b - a*d(b))/b^2` into its own reverse
+    // form: `da = u/b`, `db = -u*a/(b*b)` — verified directly (product
+    // rule + quotient rule, `d(1/b) = -1/b^2`), not copied blind.
+    adjoint div(a, b), u: (div(u, b), neg(div(mul(u, a), mul(b, b))));
+    adjoint neg(a), u: neg(u);
 }
 
 // Integer negation has no dedicated `arith` op (unlike float — two's-
@@ -221,6 +248,14 @@ algebra Transcendental<T> {
 
     derivative exp(x): mul(exp(x), d(x));
     derivative tanh(x): mul(sub(1, mul(tanh(x), tanh(x))), d(x));
+
+    // Reverse-mode counterparts — `Ring<T>`'s own `adjoint` rules just
+    // above have the fuller doc comment on why these coexist with the
+    // `derivative` rules rather than replacing them. Single-parameter
+    // methods, so each body is a bare `expr` (the one contribution), not a
+    // tuple — `grammar.pest`'s own `adjoint_rule_decl` doc comment.
+    adjoint exp(x), u: mul(u, exp(x));
+    adjoint tanh(x), u: mul(u, sub(1, mul(tanh(x), tanh(x))));
 }
 
 impl Transcendental<f32> {
