@@ -2931,7 +2931,7 @@ fn max_cvar_in_cexpr(expr: &CExpr, max: &mut CVar) {
 /// because reconstruction happens *after* `convert_program`'s own
 /// `FreshVars` (internal to that pass, unreachable from here) has already
 /// been discarded, its own count lost with it.
-fn max_cvar_in_program(program: &CpsProgram) -> CVar {
+pub(crate) fn max_cvar_in_program(program: &CpsProgram) -> CVar {
     let mut max = 0;
     for f in &program.funcs {
         for p in &f.def.params {

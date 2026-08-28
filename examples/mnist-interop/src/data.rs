@@ -113,13 +113,19 @@ fn load(cache_dir: &Path, images_name: &str, labels_name: &str) -> Dataset {
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", images_path.display()));
     let labels_bytes = std::fs::read(&labels_path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", labels_path.display()));
-    let pixels = parse_idx3_images(&images_bytes);
-    let labels = parse_idx1_labels(&labels_bytes);
+    let mut pixels = parse_idx3_images(&images_bytes);
+    let mut labels = parse_idx1_labels(&labels_bytes);
     assert_eq!(
         pixels.len() / PIXELS_PER_IMAGE,
         labels.len(),
         "image count doesn't match label count"
     );
+    // TEMP bisection scaffold -- remove once done.
+    if let Ok(cap) = std::env::var("MNIST_DEBUG_CAP") {
+        let cap: usize = cap.parse().expect("MNIST_DEBUG_CAP must be an integer");
+        labels.truncate(cap);
+        pixels.truncate(cap * PIXELS_PER_IMAGE);
+    }
     Dataset { pixels, labels }
 }
 

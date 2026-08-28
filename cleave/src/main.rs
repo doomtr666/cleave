@@ -325,6 +325,19 @@ fn real_main() -> ExitCode {
                     // own output even though `helper`'s optimized body no
                     // longer called either.
                     let optimized = eliminate_dead_code(optimized);
+                    // Last CPS-to-CPS step, strictly after the e-graph pass
+                    // -- see `cleave::refcount`'s own module doc comment
+                    // and `pipeline.rs::build_optimized_cps`'s own
+                    // identical step. Included here too so this flag
+                    // actually shows the CPS `--emit-object`/`--run` lower,
+                    // not an earlier, pre-refcounting snapshot of it.
+                    let struct_schemas = collect_struct_schemas(&program);
+                    let mlir_types = collect_mlir_types(&program);
+                    let optimized = cleave::refcount::insert_refcounting(
+                        optimized,
+                        &struct_schemas,
+                        &mlir_types,
+                    );
                     print!("{}", dump_cps_program(&optimized));
                 }
                 Err(errs) => {
@@ -478,6 +491,23 @@ fn real_main() -> ExitCode {
                             .is_ok()
                             && pass_manager.run(&mut module).is_ok();
 
+                        // Tensor-payload deallocation -- see `pipeline.rs::
+                        // emit_object`'s own identical stage for the full
+                        // story (tried, reverted twice, root-caused and
+                        // fixed at the true source, `mlir_lower.rs::load_
+                        // native_shape_field`'s own doc comment).
+                        let pass_manager = pass::PassManager::new(&context);
+                        pass_manager.add_pass(
+                            pass::bufferization::create_ownership_based_buffer_deallocation_pass(),
+                        );
+                        pass_manager.add_pass(
+                            pass::bufferization::create_buffer_deallocation_simplification_pass(),
+                        );
+                        pass_manager
+                            .add_pass(pass::bufferization::create_lower_deallocations_pass());
+                        pass_manager.add_pass(pass::conversion::create_bufferization_to_mem_ref());
+                        let ok = ok && pass_manager.run(&mut module).is_ok();
+
                         let pass_manager = pass::PassManager::new(&context);
                         pass_manager.add_pass(pass::linalg::create_convert_linalg_to_loops_pass());
                         pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
@@ -534,6 +564,16 @@ fn real_main() -> ExitCode {
         // the first sweep — run before optimization — has no way to
         // anticipate.
         let cps_program = eliminate_dead_code(cps_program);
+        // Last CPS-to-CPS step, strictly after the e-graph pass -- see
+        // `cleave::refcount`'s own module doc comment for why, and
+        // `pipeline.rs::build_optimized_cps`'s own identical step.
+        let mlir_types = collect_mlir_types(&program);
+        let struct_schemas = collect_struct_schemas(&program);
+        let cps_program = cleave::refcount::insert_refcounting(
+            cps_program,
+            &struct_schemas,
+            &mlir_types,
+        );
 
         let dialect_registry = DialectRegistry::new();
         register_all_dialects(&dialect_registry);
@@ -541,8 +581,6 @@ fn real_main() -> ExitCode {
         context.append_dialect_registry(&dialect_registry);
         context.load_all_available_dialects();
 
-        let mlir_types = collect_mlir_types(&program);
-        let struct_schemas = collect_struct_schemas(&program);
         let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
         if !module.as_operation().verify() {
             eprintln!("error: generated MLIR module failed verification");
@@ -596,6 +634,20 @@ fn real_main() -> ExitCode {
         .is_err()
             || pass_manager.run(&mut module).is_err()
         {
+            eprintln!("error: MLIR-to-LLVM lowering pass failed");
+            return ExitCode::FAILURE;
+        }
+
+        // Tensor-payload deallocation -- see `pipeline.rs::emit_object`'s
+        // own identical stage for the full story (tried, reverted twice,
+        // root-caused and fixed at the true source, `mlir_lower.rs::load_
+        // native_shape_field`'s own doc comment).
+        let pass_manager = pass::PassManager::new(&context);
+        pass_manager.add_pass(pass::bufferization::create_ownership_based_buffer_deallocation_pass());
+        pass_manager.add_pass(pass::bufferization::create_buffer_deallocation_simplification_pass());
+        pass_manager.add_pass(pass::bufferization::create_lower_deallocations_pass());
+        pass_manager.add_pass(pass::conversion::create_bufferization_to_mem_ref());
+        if pass_manager.run(&mut module).is_err() {
             eprintln!("error: MLIR-to-LLVM lowering pass failed");
             return ExitCode::FAILURE;
         }

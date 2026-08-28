@@ -58,6 +58,9 @@ fn run(
     // lifetime — mirrors `main.rs`'s own registration exactly.
     unsafe {
         engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
+        engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
+        engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
+        engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
     }
     let mut out: i32 = -1;
     // SAFETY: `out` is a live, correctly-aligned `i32` on the stack for the

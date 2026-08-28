@@ -69,6 +69,9 @@ fn run_i32(context: &Context, src: &str) -> i32 {
     // `mlir_lower.rs::alloc_struct`'s own doc comment).
     unsafe {
         engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
+        engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
+        engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
+        engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
         engine.register_symbol("print_i8", cleave_rt::print_i8 as *mut ());
         engine.register_symbol("print_i16", cleave_rt::print_i16 as *mut ());
         engine.register_symbol("print_i32", cleave_rt::print_i32 as *mut ());

@@ -14,6 +14,7 @@ use crate::cps::{
 use crate::diag::{Diagnostic, SourceMap};
 use crate::egraph::{DerivativeRequest, optimize_program, synthesize_derivatives};
 use crate::mlir_lower::lower_program;
+use crate::refcount::insert_refcounting;
 use crate::registry::Registry;
 use melior::Context;
 use melior::dialect::DialectRegistry;
@@ -120,7 +121,14 @@ fn build_optimized_cps(program: &Program, registry: &Registry) -> Result<CpsProg
     let cps_program = build_cps_program(program, registry)?;
     let cps_program = eliminate_dead_code(cps_program);
     let (cps_program, _) = optimize_program(cps_program, registry, false);
-    Ok(eliminate_dead_code(cps_program))
+    let cps_program = eliminate_dead_code(cps_program);
+    // Last CPS-to-CPS step, strictly after the e-graph pass -- see
+    // `refcount`'s own module doc comment for why (it has no notion of
+    // `Retain`/`Release`'s own effectful ordering, inserting them earlier
+    // risks its own rewriting scrambling them).
+    let struct_schemas = collect_struct_schemas(program);
+    let mlir_types = collect_mlir_types(program);
+    Ok(insert_refcounting(cps_program, &struct_schemas, &mlir_types))
 }
 
 /// Parses/merges/resolves `sources_in` from scratch (`driver::compile`'s
@@ -213,6 +221,9 @@ pub unsafe fn register_cleave_rt_symbols(engine: &melior::ExecutionEngine) {
         engine.register_symbol("format_f32", cleave_rt::format_f32 as *mut ());
         engine.register_symbol("format_f64", cleave_rt::format_f64 as *mut ());
         engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
+        engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
+        engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
+        engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
         engine.register_symbol("dynarray_alloc_i8", cleave_rt::dynarray_alloc_i8 as *mut ());
         engine.register_symbol("dynarray_grow_i8", cleave_rt::dynarray_grow_i8 as *mut ());
         engine.register_symbol("dynarray_get_i8", cleave_rt::dynarray_get_i8 as *mut ());
@@ -306,6 +317,40 @@ fn emit_object(
     {
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (one-shot-bufferize)".to_string(),
+        ]);
+    }
+
+    // Tensor *payload* deallocation — tried here twice before and
+    // reverted both times (`doc/backlog.md`, "MLIR's own buffer-
+    // deallocation pipeline corrupts memory against cleave's current
+    // struct/tensor-field ABI"); real end-to-end training crashed with
+    // `STATUS_ACCESS_VIOLATION` (or, on the retest, silently trained to
+    // random-guess accuracy — no crash, still wrong). Root-caused
+    // precisely this time, by hand, against this exact toolchain: a
+    // struct's own `Tensor` field, read via `load_native_shape_field`
+    // (`mlir_lower.rs`), used to cast the field's own storage directly
+    // into a `memref` and hand it to `bufferization.to_tensor ...
+    // restrict` — `restrict` is a promise of *exclusive* ownership, a real
+    // lie for a struct field (the struct itself still owns and reuses that
+    // same storage) — confirmed directly to cause both silent in-place
+    // corruption of the struct's own field (One-Shot Bufferize, trusting
+    // the promise, computes straight back into it) and, once this pass
+    // runs, premature deallocation of the struct's own storage (this
+    // pass, trusting the same promise, frees it the moment the "exclusive"
+    // reference's own last use passes). Fixed at the true source
+    // (`load_native_shape_field`'s own doc comment has the full story): a
+    // defensive `memref.alloc`+`memref.copy` before `to_tensor ... restrict
+    // writable`, so the promise is genuinely true and this pass — reused
+    // here as-is, no longer worked around — frees the *copy*, never the
+    // struct's own storage.
+    let pass_manager = pass::PassManager::new(&context);
+    pass_manager.add_pass(pass::bufferization::create_ownership_based_buffer_deallocation_pass());
+    pass_manager.add_pass(pass::bufferization::create_buffer_deallocation_simplification_pass());
+    pass_manager.add_pass(pass::bufferization::create_lower_deallocations_pass());
+    pass_manager.add_pass(pass::conversion::create_bufferization_to_mem_ref());
+    if pass_manager.run(&mut module).is_err() {
+        return Err(vec![
+            "MLIR-to-LLVM lowering pass failed (buffer-deallocation)".to_string(),
         ]);
     }
 
@@ -409,6 +454,9 @@ const KNOWN_CLEAVE_RT_SYMBOLS: &[&str] = &[
     "format_f32",
     "format_f64",
     "cleave_alloc",
+    "cleave_alloc_rc",
+    "cleave_retain",
+    "cleave_release",
     "dynarray_alloc_i8",
     "dynarray_grow_i8",
     "dynarray_get_i8",

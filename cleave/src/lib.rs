@@ -13,5 +13,6 @@ pub mod monomorphize;
 pub mod parser;
 pub mod pipeline;
 pub mod print;
+pub mod refcount;
 pub mod registry;
 pub mod rust_bindings;

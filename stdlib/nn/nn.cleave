@@ -96,9 +96,26 @@ impl Step<f64> {
 // mlir`'s `bool -> i1` mapping composing with `Tensor`'s own pack-generic
 // shape the same way it already does for `T = f32`/`i32`/etc.) -- checked
 // directly, not assumed.
+//
+// `zero`'s own construction is `mlir::tensor::splat`, not `[0.0; Dims...]`
+// -- the exact same array-repeat cost `Ring<Tensor<T,Dims...>>::zero()`
+// (`stdlib/linalg/tensor.cleave`) was already found and fixed for, just
+// never carried over here when `Step<T>` was added: `[0.0; Dims...]`
+// evaluates its own value expression *independently* at every leaf
+// position, right for `Init::xavier`'s own genuinely-independent random
+// draws but wasted on the *identical* value at every position. Found
+// directly, not assumed, at real MNIST scale (`examples/mnist-interop`):
+// `Step::step<Tensor<f32,1,512>>` alone reached over 13,000 lines of MLIR
+// for what should be a same-sized elementwise compare — `net_grad`'s own
+// backward pass calls this once per hidden layer, so this alone dominated
+// its total size. `z`'s own explicit `T` annotation is load-bearing, not
+// stylistic — see `Ring::zero()`'s own identical fix for why (`mlir::...`
+// calls never type-check their own arguments against the op's real
+// signature).
 impl<T: Float, const Dims...: i32> Step<Tensor<T, Dims...>> {
     fn step(x) {
-        let zero: Tensor<T, Dims...> = Tensor::<T, Dims...>(data: [0.0; Dims...]);
+        let z: T = zero();
+        let zero: Tensor<T, Dims...> = mlir::tensor::splat(z);
         let cond: Tensor<bool, Dims...> = mlir::arith::cmpf(x, zero, predicate: "2 : i64");
         mlir::arith::uitofp(cond)
     }
@@ -169,17 +186,22 @@ impl Activation<f64> {
 // written closed form... moving `exp` here... means sigmoid's derivative now
 // composes automatically via ordinary chain-rule saturation") -- this is
 // that same fix, just not yet carried over to the pack-generic case until
-// now. `one`, a same-shape broadcast tensor of `1.0`, still can't be
-// avoided (`Ring::add`/`div` require *matching* operand types, and a bare
-// `1.0` literal is `T`, not `Tensor<T,Dims...>`) -- built via `[value;
-// Dims...]` plus `Tensor::<T,Dims...>(data:...)`, same as `relu` below.
+// now. `one`/`zero`, a same-shape broadcast tensor, still can't be avoided
+// (`Ring::add`/`div`/`maximumf` require *matching* operand types, and a
+// bare `0.0`/`1.0` literal is `T`, not `Tensor<T,Dims...>`) -- built via
+// `mlir::tensor::splat`, not `[value; Dims...]` -- `Step<Tensor<T,Dims
+// ...>>::step`'s own identical fix, just above, has the full story (the
+// same array-repeat cost, found at real MNIST scale: `Activation::relu<
+// Tensor<f32,1,512>>` alone reached nearly 13,000 lines of MLIR).
 impl<T: Float, const Dims...: i32> Activation<Tensor<T, Dims...>> {
     fn relu(x) {
-        let zero = Tensor::<T, Dims...>(data: [0.0; Dims...]);
+        let z: T = zero();
+        let zero: Tensor<T, Dims...> = mlir::tensor::splat(z);
         mlir::arith::maximumf(x, zero)
     }
     fn sigmoid(x) {
-        let one: Tensor<T, Dims...> = Tensor::<T, Dims...>(data: [1.0; Dims...]);
+        let o: T = one();
+        let one: Tensor<T, Dims...> = mlir::tensor::splat(o);
         one / (one + exp(-x))
     }
     fn tanh(x) { mlir::math::tanh(x) }

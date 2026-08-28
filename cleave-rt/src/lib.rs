@@ -74,13 +74,213 @@ pub extern "C" fn print_f64(x: f64) -> f64 {
 /// doesn't, found by direct testing (a struct returned from one function and
 /// read by its caller came back reading garbage/reused stack memory once
 /// heap allocation wasn't yet in place). Deliberately leaks — cleave has no
-/// `drop`/ownership story yet, matching this project's current "no memory
-/// management design yet" scope; not a bug to fix here, a real gap to
-/// revisit once one exists.
+/// `drop`/ownership story yet. **The real fix, in progress**: `doc/hld.md`'s
+/// own "Memory management" section — `cleave_alloc_rc`/`cleave_retain`/
+/// `cleave_release` below are Phase 0 of it (the always-on, no-static-
+/// analysis-needed reference-counting fallback, correct on its own before
+/// any region/pool specialization exists) — not yet wired into `mlir_lower.
+/// rs`'s own struct/tensor construction, so this function itself still
+/// leaks unconditionally for now.
 #[unsafe(no_mangle)]
 pub extern "C" fn cleave_alloc(size: i64) -> *mut u8 {
     let layout = std::alloc::Layout::from_size_align(size as usize, 16).expect("cleave_alloc: invalid layout");
     unsafe { std::alloc::alloc(layout) }
+}
+
+/// The header `cleave_alloc_rc` prepends to every allocation it makes —
+/// `refcount` first (what `cleave_retain`/`cleave_release` touch on every
+/// call, so it wants to be at a fixed, zero offset from the header's own
+/// base rather than computed from `data_size`), `data_size` second (needed
+/// only once, at the final `cleave_release` that actually frees, to
+/// reconstruct the exact `Layout` `std::alloc::dealloc` requires — Rust's
+/// own allocator API has no "figure out my own layout" query, unlike a
+/// libc-style `malloc`/`free` pair). 16 bytes total, matching `cleave_
+/// alloc`'s own existing 16-byte alignment (`repr(C)` to fix the field
+/// order/no-padding layout `RC_HEADER_SIZE`'s own arithmetic below assumes —
+/// Rust's default struct layout is otherwise free to reorder fields).
+#[repr(C)]
+struct RcHeader {
+    refcount: i64,
+    data_size: i64,
+}
+
+const RC_HEADER_SIZE: usize = std::mem::size_of::<RcHeader>();
+
+/// Read `ptr`'s own header — every `cleave_alloc_rc`-returned pointer sits
+/// exactly `RC_HEADER_SIZE` bytes after its own header's base, unconditionally
+/// (`cleave_alloc_rc`'s own doc comment), so this offset is never optional or
+/// guessed.
+///
+/// # Safety
+/// `ptr` must be a pointer this same `cleave_alloc_rc` returned, not yet
+/// freed by a `cleave_release` that reached zero — the same "only ever call
+/// this on a value the matching allocator itself produced" contract every
+/// other raw-pointer function in this file already carries.
+unsafe fn rc_header(ptr: *mut u8) -> *mut RcHeader {
+    unsafe { ptr.sub(RC_HEADER_SIZE) as *mut RcHeader }
+}
+
+/// `doc/hld.md`'s own "Memory management" section, Phase 0 — the always-on,
+/// no-escape-analysis-needed reference-counting fallback (Swift ARC's own
+/// "correct by itself before any elision" starting point, not a novel
+/// scheme): every allocation starts with `refcount = 1` (the reference its
+/// own construction site holds), `cleave_retain` on every real aliasing
+/// event (a second simultaneously-live binding/field-store of the same
+/// value), `cleave_release` wherever a binding's own scope ends without the
+/// value escaping further — freed for real only once the count reaches
+/// zero. `Ordering::Relaxed`-equivalent (plain, non-atomic reads/writes, no
+/// `Atomic*` type at all) deliberately — `doc/hld.md`'s own "Threading"
+/// paragraph in that section: this whole scheme is single-threaded by
+/// design, the same existing assumption `pcg32_next_u32`'s own doc comment
+/// below already states for this runtime's other mutable state (`cleave_
+/// alloc`'s own allocator included).
+///
+/// A *new*, parallel primitive rather than a change to `cleave_alloc` itself
+/// — not yet wired into `mlir_lower.rs`'s own construction/lowering (a
+/// separate, larger step: deciding *where* retain/release calls get
+/// inserted needs real CPS-level escape-analysis work, `doc/hld.md`'s own
+/// still-open "exactly where retain/release operations get inserted" item)
+/// — so nothing existing changes behavior by this landing.
+#[unsafe(no_mangle)]
+pub extern "C" fn cleave_alloc_rc(data_size: i64) -> *mut u8 {
+    let total = RC_HEADER_SIZE + data_size as usize;
+    let layout = std::alloc::Layout::from_size_align(total, 16).expect("cleave_alloc_rc: invalid layout");
+    unsafe {
+        let base = std::alloc::alloc(layout);
+        assert!(!base.is_null(), "cleave_alloc_rc: allocation failed");
+        let header = base as *mut RcHeader;
+        (*header).refcount = 1;
+        (*header).data_size = data_size;
+        base.add(RC_HEADER_SIZE)
+    }
+}
+
+/// # Safety
+/// See `rc_header`'s own safety contract — `ptr` must be a live `cleave_
+/// alloc_rc` result.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cleave_retain(ptr: *mut u8) {
+    unsafe {
+        let header = rc_header(ptr);
+        (*header).refcount += 1;
+    }
+}
+
+/// Decrements `ptr`'s own refcount; once it reaches zero, actually frees the
+/// whole allocation (header included) using the exact `Layout` `data_size`
+/// (recorded at `cleave_alloc_rc` time) reconstructs — `std::alloc::dealloc`
+/// requires the identical layout `alloc` was given, not just a matching
+/// pointer. Returns whether this specific call actually freed it (refcount
+/// reached zero) — `mlir_lower.rs::lower_release_cascade` needs this: a
+/// struct's own cascade into its refcounted fields (a nested struct, or a
+/// `#[mlir_type(tensor)]`-tagged field's own payload — neither has its own
+/// separate liveness check, `store_native_shape_field`'s own doc comment)
+/// is only sound *inside* the branch where the container itself was
+/// genuinely destroyed, not on every call (found by direct testing, a real
+/// `STATUS_HEAP_CORRUPTION`: cascading unconditionally frees a field a
+/// *second*, still-live alias of the very same container still needs, the
+/// moment that alias's own count merely drops from 2 to 1).
+///
+/// # Safety
+/// See `rc_header`'s own safety contract — `ptr` must be a live `cleave_
+/// alloc_rc` result, and (ordinary reference-counting discipline) this must
+/// be called at most once per real reference this value's refcount was
+/// actually incremented for — a redundant release below the true reference
+/// count is a real use-after-free once every *counted* reference has
+/// separately been released too, the same hazard any refcounting scheme has.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cleave_release(ptr: *mut u8) -> bool {
+    unsafe {
+        let header = rc_header(ptr);
+        (*header).refcount -= 1;
+        if (*header).refcount == 0 {
+            let data_size = (*header).data_size;
+            let total = RC_HEADER_SIZE + data_size as usize;
+            let layout =
+                std::alloc::Layout::from_size_align(total, 16).expect("cleave_release: invalid layout");
+            std::alloc::dealloc(header as *mut u8, layout);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Reads `ptr`'s own current refcount without changing it — a real,
+/// necessary observation point for tests (see `rc_tests` below); not part
+/// of the "real" `extern fn` surface `mlir_lower.rs`-generated code ever
+/// calls, so no `#[unsafe(no_mangle)]`/`extern "C"` needed.
+///
+/// # Safety
+/// See `rc_header`'s own safety contract.
+#[cfg(test)]
+unsafe fn rc_count(ptr: *mut u8) -> i64 {
+    unsafe { (*rc_header(ptr)).refcount }
+}
+
+#[cfg(test)]
+mod rc_tests {
+    use super::*;
+
+    #[test]
+    fn a_fresh_allocation_starts_at_refcount_one() {
+        unsafe {
+            let ptr = cleave_alloc_rc(8);
+            assert_eq!(rc_count(ptr), 1);
+            cleave_release(ptr);
+        }
+    }
+
+    #[test]
+    fn retain_increments_and_release_decrements() {
+        unsafe {
+            let ptr = cleave_alloc_rc(8);
+            cleave_retain(ptr);
+            assert_eq!(rc_count(ptr), 2);
+            cleave_release(ptr);
+            assert_eq!(rc_count(ptr), 1);
+            cleave_release(ptr);
+        }
+    }
+
+    #[test]
+    fn the_underlying_data_region_is_genuinely_readable_and_writable() {
+        // Real proof this isn't just header bookkeeping — the returned
+        // pointer is a real, correctly-offset, correctly-sized data region,
+        // not just something that satisfies the refcount tests alone.
+        unsafe {
+            let ptr = cleave_alloc_rc(8) as *mut i64;
+            *ptr = 0x1234_5678_9abc_def0;
+            assert_eq!(*ptr, 0x1234_5678_9abc_def0);
+            cleave_release(ptr as *mut u8);
+        }
+    }
+
+    // A "release-to-zero actually calls dealloc, not just zeroes the count"
+    // test was tried here and removed, not left red: it asserted a fresh
+    // allocation reuses the just-freed address, found directly to be
+    // unreliable against the real system allocator (Windows' own allocator
+    // doesn't guarantee immediate reuse the way some allocators' fast paths
+    // do) — a real, non-deterministic property this test can't black-box
+    // verify without a custom `#[global_allocator]` tracking wrapper, not
+    // worth building for this one check. `cleave_release`'s own source is
+    // a five-line, directly-readable `if refcount == 0 { dealloc(...) }` —
+    // the refcount-reaches-zero tests above already cover the part that's
+    // actually load-bearing.
+
+    #[test]
+    fn multiple_independent_allocations_track_separate_counts() {
+        unsafe {
+            let a = cleave_alloc_rc(8);
+            let b = cleave_alloc_rc(8);
+            cleave_retain(a);
+            assert_eq!(rc_count(a), 2);
+            assert_eq!(rc_count(b), 1);
+            cleave_release(a);
+            cleave_release(a);
+            cleave_release(b);
+        }
+    }
 }
 
 /// De-risks the extern/array ABI boundary in isolation, before string

@@ -15,6 +15,7 @@
 // `Optimizer`, all already real and tested, is what this stresses.
 use nn;
 use linalg;
+use io;
 
 extern fn train_len() -> i32;
 extern fn train_pixel(sample: i32, pixel: i32) -> f32;
@@ -140,6 +141,7 @@ export fn train_and_evaluate(epochs: i32, lr: f32, seed: i64) -> f32 {
     let opt = Sgd(lr: lr);
     let mut state: Network = Optimizer::init_state(opt, net);
     let n: i32 = train_len();
+
     for epoch in 0..epochs {
         for s in 0..n {
             let x = load_train_input(s);
@@ -149,6 +151,9 @@ export fn train_and_evaluate(epochs: i32, lr: f32, seed: i64) -> f32 {
             net = r.0;
             state = r.1;
         };
+
+        print("Epoch ");
+        println(epoch);
     };
     evaluate(net)
 }

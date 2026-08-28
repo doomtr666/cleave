@@ -214,6 +214,9 @@ fn a_compiled_program_actually_runs_and_returns_the_right_value() {
     // comment).
     unsafe {
         engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
+        engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
+        engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
+        engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
     }
     let mut out: i32 = -1;
     unsafe {
@@ -405,6 +408,9 @@ fn run_i32_from_cps(
     // computes_the_right_gradient`, just below).
     unsafe {
         engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
+        engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
+        engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
+        engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
         engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
         engine.register_symbol("rand_seed", cleave_rt::rand_seed as *mut ());
         engine.register_symbol("rand_uniform_f32", cleave_rt::rand_uniform_f32 as *mut ());
@@ -682,6 +688,9 @@ fn an_extern_fn_call_actually_executes_through_a_registered_symbol() {
     unsafe {
         engine.register_symbol("print_i32", cleave_rt::print_i32 as *mut ());
         engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
+        engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
+        engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
+        engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
     }
     let mut out: i32 = -1;
     unsafe {
@@ -816,6 +825,9 @@ fn an_extern_impl_method_actually_executes_the_right_symbol_at_each_call_site() 
         engine.register_symbol("print_i32", cleave_rt::print_i32 as *mut ());
         engine.register_symbol("print_i64", cleave_rt::print_i64 as *mut ());
         engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
+        engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
+        engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
+        engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
     }
     let mut out: i32 = -1;
     unsafe {
@@ -879,6 +891,9 @@ fn an_array_argument_crosses_an_extern_call_boundary_correctly() {
     unsafe {
         engine.register_symbol("sum_bytes", cleave_rt::sum_bytes as *mut ());
         engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
+        engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
+        engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
+        engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
     }
     let mut out: i32 = -1;
     unsafe {
@@ -953,6 +968,9 @@ fn a_unit_returning_extern_fn_can_be_called_correctly() {
     unsafe {
         engine.register_symbol("touch_i32", cleave_rt::touch_i32 as *mut ());
         engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
+        engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
+        engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
+        engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
     }
     let mut out: i32 = -1;
     unsafe {
@@ -1023,6 +1041,9 @@ fn a_string_literal_printed_via_print_writes_the_right_bytes_to_stdout() {
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {
         engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
+        engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
+        engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
+        engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
     }
     register_io_symbols(&engine);
     let mut out: i32 = -1;
@@ -2679,6 +2700,9 @@ fn print_of_an_unannotated_index_result_no_longer_panics() {
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {
         engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
+        engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
+        engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
+        engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
     }
     register_io_symbols(&engine);
     let mut out: i32 = -1;
@@ -2755,6 +2779,9 @@ fn print_of_an_unannotated_matmul_index_result_no_longer_panics() {
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {
         engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
+        engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
+        engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
+        engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
     }
     register_io_symbols(&engine);
     let mut out: i32 = -1;
@@ -4351,6 +4378,9 @@ fn run_i32_with_dynarray_symbols(
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {
         engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
+        engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
+        engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
+        engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
     }
     register_io_symbols(&engine);
     unsafe {

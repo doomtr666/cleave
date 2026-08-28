@@ -1094,6 +1094,37 @@ pub enum PrimOp {
         op: String,
         attrs: Vec<(String, String)>,
     },
+    /// `args = [ptr]` — a real effect, incrementing the refcount header
+    /// `cleave_alloc_rc` (`cleave-rt`) already prepends to every struct
+    /// allocation; its own bound result is unit and never read, same shape
+    /// as `FieldStore`/`Store`'s own doc comments. `Ty` is `ptr`'s own
+    /// concrete struct type — carried through for the same reason `Field`/
+    /// `FieldStore` carry `struct_ty` explicitly (an already-lowered
+    /// `!llvm.ptr` has no cleave-level type of its own to recover it from;
+    /// `mlir_lower.rs` needs a real `Ty` to declare `cleave_retain`'s own
+    /// extern signature through the ordinary `Ty -> MLIR type` path, not a
+    /// synthesized placeholder name). Inserted by `refcount::insert_
+    /// refcounting`, never written by hand or produced by ordinary
+    /// `convert_expr` — exactly one case needs it today: storing an
+    /// *existing* struct-typed value into another struct's own field
+    /// (`PrimOp::FieldStore`) creates a second, independent reference to
+    /// the same allocation that will eventually be released on its own
+    /// (when the *containing* struct itself is — not yet, cascading
+    /// release into nested struct fields is a separate, later piece), so
+    /// the refcount has to reflect two owners, not one. See `doc/hld.md`'s
+    /// own "Memory management" section — this is the "conservative
+    /// refcount" half of the aliasing story it settles on.
+    Retain(Ty),
+    /// `args = [ptr]` — the other half of `Retain`'s own doc comment:
+    /// decrements the refcount, freeing the underlying allocation at zero
+    /// (`cleave_release`, `cleave-rt`). `Ty` — see `Retain`'s own doc
+    /// comment. Inserted by `refcount::insert_refcounting` at every point
+    /// a struct-typed value's own CPS-visible lifetime ends without
+    /// escaping (returned, or still needed by a live continuation) — see
+    /// that module's own doc comment for the full analysis (ownership,
+    /// not last-use: sound without any dataflow fixpoint, by
+    /// construction).
+    Release(Ty),
 }
 
 #[derive(Debug, Clone)]
@@ -3739,6 +3770,8 @@ fn dump_cexpr(out: &mut String, expr: &CExpr, depth: usize) {
                         .collect();
                     format!("mlir.{op}{attrs_str}")
                 }
+                PrimOp::Retain(_) => "retain".to_string(),
+                PrimOp::Release(_) => "release".to_string(),
             };
             let args_str = args.iter().map(dump_cval).collect::<Vec<_>>().join(" ");
             let _ = writeln!(out, "(let-prim v{var}: {ty} = ({op_str} {args_str})");

@@ -48,8 +48,8 @@ use melior::{
         Attribute, Block, Identifier, Location, Module, Operation, Region, RegionLike, Type,
         TypeLike, Value, ValueLike,
         attribute::{
-            DenseI32ArrayAttribute, FlatSymbolRefAttribute, FloatAttribute, IntegerAttribute,
-            StringAttribute, TypeAttribute,
+            DenseI32ArrayAttribute, DenseI64ArrayAttribute, FlatSymbolRefAttribute, FloatAttribute,
+            IntegerAttribute, StringAttribute, TypeAttribute,
         },
         block::BlockLike,
         operation::OperationBuilder,
@@ -1500,6 +1500,20 @@ fn lower_prim_op<'c>(
             lower_field_store(ctx, block, env, struct_ty, field, args);
             None
         }
+        PrimOp::Retain(rc_ty) => {
+            lower_refcount_call(ctx, block, env, "cleave_retain", rc_ty, args);
+            None
+        }
+        PrimOp::Release(rc_ty) => {
+            let CVal::Var(ptr_var) = &args[0] else {
+                panic!("MLIR lowering: `cleave_release`'s own operand must be a variable");
+            };
+            let ptr_val = *env
+                .get(ptr_var)
+                .unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{ptr_var}"));
+            lower_release_cascade(ctx, block, rc_ty, ptr_val);
+            None
+        }
     }
 }
 
@@ -2035,11 +2049,45 @@ fn memref_descriptor_llvm_type<'c>(context: &'c Context, rank: usize) -> Type<'c
 /// one op, the exact reverse of `Ring<Tensor<T,Dims...>>::zero()`'s own
 /// `tensor.splat`-adjacent `bufferization.to_tensor` fix — see `stdlib/nn/
 /// nn.cleave`'s `Init<Dense<T,In,Out>>::xavier`/`he`, which already uses `to_
-/// tensor` from cleave source directly), then `builtin.unrealized_conversion_
-/// cast` to this field's own real storage type (`memref_descriptor_llvm_
-/// type`'s own doc comment — a real, empirically-confirmed identity
-/// materialization, not a guess), then one ordinary aggregate `llvm.store` —
-/// no different in kind from storing any other non-array field.
+/// tensor` from cleave source directly), then a copy into a fresh, `cleave_
+/// alloc_rc`'d buffer (see below for why), then one ordinary aggregate
+/// `llvm.store` of a hand-built descriptor — no different in kind from
+/// storing any other non-array field.
+///
+/// **Why the payload itself is copied into a `cleave_alloc_rc`'d buffer,
+/// not just cast in place the way `load_native_shape_field` used to — found
+/// by direct testing, a real, load-bearing fix, not caution for its own
+/// sake.** Casting `bufferization.to_buffer`'s own result straight into the
+/// field's descriptor bits (this function's own earlier form) makes the
+/// *only* remaining real use of that memref, from `--buffer-deallocation-
+/// pipeline`'s own point of view, the opaque `unrealized_conversion_cast` —
+/// invisible to it, so it concludes the memref has no further use and
+/// inserts a `memref.dealloc` for it *immediately after this store*,
+/// confirmed directly (`mlir-opt`, this exact toolchain): the struct's own
+/// field is left holding a pointer to memory that was freed the very next
+/// instruction. A `memref.alloc`'d buffer can't be told "you're wrong, this
+/// one's mine" after the fact — `load_native_shape_field`'s own read-side
+/// fix works by making the *promise* to that pass true (a genuinely
+/// exclusive copy); there's no equivalent move here, since the struct's own
+/// field storage is what needs to keep the data *alive*, past the point
+/// where any MLIR-tracked memref could still validly represent it. The
+/// real fix: don't let `--buffer-deallocation-pipeline` ever see the buffer
+/// that ends up in the struct's own field at all — allocate it through
+/// `cleave_alloc_rc` (`alloc_llvm_value`, the exact same choke point every
+/// struct's own allocation already goes through) instead of `memref.alloc`,
+/// copy the computed value's own data into it via a raw `llvm.intr.memcpy`
+/// (bypassing `memref.copy`, which needs a real `memref`-typed destination
+/// — this one is deliberately *not* one), then hand-build the field's own
+/// descriptor bits directly (`memref_descriptor_llvm_type`'s own confirmed
+/// layout: `allocated_ptr`/`aligned_ptr` both the fresh pointer — `cleave_
+/// alloc_rc` already hands back one ready-to-use pointer, no separate
+/// alignment-rounding step the way raw `malloc` needs — `offset` zero,
+/// `sizes`/`strides` both compile-time constants, row-major, since cleave
+/// has no dynamically-shaped tensors to begin with). The *source* memref
+/// (`bufferization.to_buffer`'s own result) stays entirely ordinary,
+/// `memref.alloc`/`--buffer-deallocation-pipeline`-tracked exactly like any
+/// other intermediate tensor value — correctly freed once the `memcpy`
+/// reads its own last byte, never touching the struct's own field.
 fn store_native_shape_field<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
@@ -2067,7 +2115,8 @@ fn store_native_shape_field<'c>(
     let native_ty = ty_to_mlir(ctx, field_ty);
     let value = lower_cval(ctx.context, block, env, arg, native_ty);
     let elem_mlir_ty = ty_to_mlir(ctx, leaf_ty);
-    let location = Location::unknown(ctx.context);
+    let context = ctx.context;
+    let location = Location::unknown(context);
 
     let memref_ty: Type = MemRefType::new(elem_mlir_ty, &dims, None, None).into();
     // `bufferization.to_buffer`, not the older `to_memref` name some MLIR
@@ -2083,18 +2132,148 @@ fn store_native_shape_field<'c>(
         .unwrap_or_else(|e| panic!("MLIR lowering: failed to build bufferization.to_buffer: {e}"));
     let memref_val: Value = block.append_operation(to_buffer).result(0).unwrap().into();
 
-    let descriptor_ty = memref_descriptor_llvm_type(ctx.context, dims.len());
-    let cast = OperationBuilder::new("builtin.unrealized_conversion_cast", location)
+    // Source data pointer — the identical extraction `array_ptr_and_len`
+    // already uses for the unrelated "array crossing an extern fn boundary"
+    // case, reused here as-is.
+    let index_ty = Type::index(context);
+    let extract = OperationBuilder::new("memref.extract_aligned_pointer_as_index", location)
         .add_operands(&[memref_val])
-        .add_results(&[descriptor_ty])
+        .add_results(&[index_ty])
         .build()
         .unwrap_or_else(|e| {
-            panic!("MLIR lowering: failed to build unrealized_conversion_cast: {e}")
+            panic!("MLIR lowering: failed to build memref.extract_aligned_pointer_as_index: {e}")
         });
-    let descriptor_val: Value = block.append_operation(cast).result(0).unwrap().into();
+    let src_idx: Value = block.append_operation(extract).result(0).unwrap().into();
+    let i64_ty: Type = IntegerType::new(context, 64).into();
+    let src_i64: Value = block
+        .append_operation(arith::index_cast(src_idx, i64_ty, location))
+        .result(0)
+        .unwrap()
+        .into();
+    let ptr_ty = llvm::r#type::pointer(context, 0);
+    let src_ptr: Value = block
+        .append_operation(
+            OperationBuilder::new("llvm.inttoptr", location)
+                .add_operands(&[src_i64])
+                .add_results(&[ptr_ty])
+                .build()
+                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build llvm.inttoptr: {e}")),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    // Fresh, `cleave_alloc_rc`'d destination — sized as a flat `!llvm.array`
+    // of every element, matching `alloc_llvm_value`'s own generic "any LLVM
+    // type" contract exactly the way a struct-leaf array already uses it.
+    let total_elems: u32 = dims.iter().product::<i64>() as u32;
+    let flat_array_ty = llvm::r#type::array(elem_mlir_ty, total_elems);
+    let dest_ptr = alloc_llvm_value(ctx, block, flat_array_ty);
+    let size = llvm_type_size_bytes(ctx, block, flat_array_ty);
+    let is_volatile = Attribute::parse(context, "false")
+        .unwrap_or_else(|| panic!("MLIR lowering: failed to parse `false` attribute"));
+    block.append_operation(
+        OperationBuilder::new("llvm.intr.memcpy", location)
+            .add_operands(&[dest_ptr, src_ptr, size])
+            .add_attributes(&[(Identifier::new(context, "isVolatile"), is_volatile)])
+            .build()
+            .unwrap_or_else(|e| panic!("MLIR lowering: failed to build llvm.intr.memcpy: {e}")),
+    );
+
+    // Hand-built descriptor — `memref_descriptor_llvm_type`'s own confirmed
+    // `(allocated_ptr, aligned_ptr, offset, sizes[rank], strides[rank])`
+    // layout, row-major strides (cleave's own tensors are always
+    // statically, fully shaped — no dynamic dimension to account for).
+    let descriptor_ty = memref_descriptor_llvm_type(context, dims.len());
+    let zero_i64: Value = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(i64_ty, 0).into(),
+            location,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let mut descriptor_val: Value = block
+        .append_operation(llvm::poison(descriptor_ty, location))
+        .result(0)
+        .unwrap()
+        .into();
+    for pos in [0i64, 1] {
+        descriptor_val = block
+            .append_operation(llvm::insert_value(
+                context,
+                descriptor_val,
+                DenseI64ArrayAttribute::new(context, &[pos]),
+                dest_ptr,
+                location,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+    }
+    descriptor_val = block
+        .append_operation(llvm::insert_value(
+            context,
+            descriptor_val,
+            DenseI64ArrayAttribute::new(context, &[2]),
+            zero_i64,
+            location,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let mut stride = 1i64;
+    let mut strides = vec![0i64; dims.len()];
+    for i in (0..dims.len()).rev() {
+        strides[i] = stride;
+        stride *= dims[i];
+    }
+    for (i, &dim) in dims.iter().enumerate() {
+        let dim_val: Value = block
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(i64_ty, dim).into(),
+                location,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        descriptor_val = block
+            .append_operation(llvm::insert_value(
+                context,
+                descriptor_val,
+                DenseI64ArrayAttribute::new(context, &[3, i as i64]),
+                dim_val,
+                location,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let stride_val: Value = block
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(i64_ty, strides[i]).into(),
+                location,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        descriptor_val = block
+            .append_operation(llvm::insert_value(
+                context,
+                descriptor_val,
+                DenseI64ArrayAttribute::new(context, &[4, i as i64]),
+                stride_val,
+                location,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+    }
 
     block.append_operation(llvm::store(
-        ctx.context,
+        context,
         descriptor_val,
         field_ptr,
         location,
@@ -2106,11 +2285,36 @@ fn store_native_shape_field<'c>(
 /// embedded field storage — the read-side mirror of `store_native_shape_
 /// field`'s own doc comment (same real fix, same reasoning): one ordinary
 /// aggregate `llvm.load`, `builtin.unrealized_conversion_cast` back to
-/// `memref<...>`, then `bufferization.to_tensor ... restrict` (the identical
-/// pattern `Init::xavier`/`he` already use from cleave source, `restrict`
-/// required by One-Shot Analysis — found directly, a real MLIR verifier
-/// error without it, not guessed) — no per-element `llvm.getelementptr`+
-/// `llvm.load` walk at all.
+/// `memref<...>`, a defensive `memref.alloc`+`memref.copy` (see below for
+/// why this is load-bearing, not optional), then `bufferization.to_tensor
+/// ... restrict writable` (the identical `restrict` pattern `Init::xavier`/
+/// `he` already use from cleave source, required by One-Shot Analysis —
+/// found directly, a real MLIR verifier error without it, not guessed) —
+/// no per-element `llvm.getelementptr`+`llvm.load` walk at all.
+///
+/// **The defensive copy is a real, load-bearing fix, not caution for its
+/// own sake — found by direct testing, two distinct real bugs, both
+/// stemming from the same root cause.** `restrict` is `to_tensor`'s own
+/// promise to One-Shot Analysis that *no other reference to this same
+/// buffer exists* — a real lie for a struct field read, since the struct
+/// itself still holds (and will go on using) the exact same underlying
+/// storage `unrealized_conversion_cast` just exposed. Casting the struct's
+/// own field storage directly and calling it `restrict` was confirmed,
+/// directly, to cause: (1) **silent data corruption** — One-Shot
+/// Bufferize, trusting the (false) exclusivity promise, is free to
+/// compute *in place* into that same buffer (confirmed directly: a
+/// `linalg.generic` consuming this value wrote its own result straight
+/// back into the struct's own storage) — reading a field could silently
+/// mutate it; (2) once `--buffer-deallocation-pipeline` (`doc/backlog.md`)
+/// is reintroduced, a **real `STATUS_ACCESS_VIOLATION`/wrong-value bug** —
+/// the pass, trusting the same promise, frees the struct's own storage
+/// once this "exclusively owned" value's own last use passes, leaving a
+/// dangling field. A fresh, genuinely-exclusive copy closes both: nothing
+/// downstream can alias the struct's own storage through this value
+/// anymore, so `restrict`'s promise becomes true, and `--buffer-
+/// deallocation-pipeline` freeing this copy once *it's* done is correct —
+/// exactly the shape confirmed directly, by hand, against this exact
+/// toolchain (`mlir-opt`) before landing here.
 fn load_native_shape_field<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
@@ -2154,8 +2358,28 @@ fn load_native_shape_field<'c>(
         });
     let memref_val: Value = block.append_operation(cast).result(0).unwrap().into();
 
+    // Defensive copy — see this function's own doc comment above for why
+    // aliasing the struct's own field storage directly and calling it
+    // `restrict` is unsound, confirmed by direct testing. `alloc_array`
+    // already builds exactly this `memref.alloc(memref_ty)` shape for the
+    // unrelated "materialize a local array" case; reused here as-is.
+    let fresh_ty = MemRefType::new(elem_mlir_ty, &dims, None, None);
+    let fresh_val = alloc_array(ctx, block, fresh_ty);
+    let copy = OperationBuilder::new("memref.copy", location)
+        .add_operands(&[memref_val, fresh_val])
+        .build()
+        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build memref.copy: {e}"));
+    block.append_operation(copy);
+
     let native_ty = ty_to_mlir(ctx, field_ty);
     let restrict = Attribute::parse(ctx.context, "unit")
+        .unwrap_or_else(|| panic!("MLIR lowering: failed to parse `unit` attribute"));
+    // `writable`, alongside `restrict` — `fresh_val` really is a fresh,
+    // exclusively-owned local allocation this function just populated, so
+    // (unlike the direct-alias version this replaced) this is no longer a
+    // false promise; letting One-Shot Bufferize compute in place into it
+    // where profitable is exactly the intended, sound optimization.
+    let writable = Attribute::parse(ctx.context, "unit")
         .unwrap_or_else(|| panic!("MLIR lowering: failed to parse `unit` attribute"));
     // `bufferization.to_tensor`/`to_buffer` (`store_native_shape_field`'s own
     // doc comment) are specific to the `tensor`/`memref` pair, not a
@@ -2168,8 +2392,11 @@ fn load_native_shape_field<'c>(
         "MLIR lowering: O(1) native-shape field access needs a real memref-backed form, which `#[mlir_type(vector)]` doesn't have"
     );
     let to_tensor = OperationBuilder::new("bufferization.to_tensor", location)
-        .add_operands(&[memref_val])
-        .add_attributes(&[(Identifier::new(ctx.context, "restrict"), restrict)])
+        .add_operands(&[fresh_val])
+        .add_attributes(&[
+            (Identifier::new(ctx.context, "restrict"), restrict),
+            (Identifier::new(ctx.context, "writable"), writable),
+        ])
         .add_results(&[native_ty])
         .build()
         .unwrap_or_else(|e| panic!("MLIR lowering: failed to build bufferization.to_tensor: {e}"));
@@ -2281,21 +2508,276 @@ fn lower_field_access<'c>(
     }
 }
 
+/// `PrimOp::Retain(rc_ty)`/`PrimOp::Release(rc_ty)`, `args = [ptr]` — a real
+/// call to `cleave_retain`/`cleave_release` (`cleave-rt`), the runtime half
+/// of `refcount::insert_refcounting`'s own analysis (that module's own doc
+/// comment has the full design). `rc_ty` only matters here for `ensure_
+/// extern_declared`'s own signature -- any struct `Ty` maps to `!llvm.ptr`
+/// via `ty_to_mlir`'s generic struct fallback, so the *specific* struct
+/// name is irrelevant to the declared C signature, just needed because
+/// `ensure_extern_declared` takes cleave-level `Ty`s, not raw MLIR types,
+/// like every other extern declaration in this file. `args[0]` is always a
+/// `CVal::Var` in practice (a struct-typed value is never a bare literal in
+/// this IR), read directly out of `env` — no need to re-lower it through
+/// `lower_cval`, its own `!llvm.ptr` value is already sitting there from
+/// wherever it was constructed.
+fn lower_refcount_call<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    symbol: &str,
+    rc_ty: &Ty,
+    args: &[CVal],
+) {
+    let CVal::Var(ptr_var) = &args[0] else {
+        panic!("MLIR lowering: `{symbol}`'s own operand must be a variable");
+    };
+    let ptr_val = *env
+        .get(ptr_var)
+        .unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{ptr_var}"));
+    let context = ctx.context;
+    let location = Location::unknown(context);
+    ensure_extern_declared(ctx, symbol, std::slice::from_ref(rc_ty), &[]);
+    block.append_operation(func::call(
+        context,
+        FlatSymbolRefAttribute::new(context, symbol),
+        &[ptr_val],
+        &[],
+        location,
+    ));
+}
+
+/// A raw, already-lowered `!llvm.ptr` version of `lower_refcount_call`'s
+/// own `cleave_release` half — no `CVal`/`env` lookup, for the intermediate
+/// pointers `lower_release_cascade` reads directly out of a struct's own
+/// fields (never bound to a real CPS variable of their own). `rc_ty` only
+/// matters for `ensure_extern_declared`'s own signature — see `lower_
+/// refcount_call`'s own doc comment for why any struct `Ty` works equally
+/// well there. Returns the real `i1` result `cleave_release` (`cleave-rt`)
+/// now hands back — whether *this* call actually freed the allocation
+/// (refcount reached zero) — `lower_release_cascade`'s own doc comment has
+/// the full story for why this is load-bearing, not just informational.
+fn emit_cleave_release<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    rc_ty: &Ty,
+    ptr_val: Value<'c, 'c>,
+) -> Value<'c, 'c> {
+    let context = ctx.context;
+    let location = Location::unknown(context);
+    let bool_ty: Type = IntegerType::new(context, 1).into();
+    ensure_extern_declared(ctx, "cleave_release", std::slice::from_ref(rc_ty), &[bool_ty]);
+    let call_op = block.append_operation(func::call(
+        context,
+        FlatSymbolRefAttribute::new(context, "cleave_release"),
+        &[ptr_val],
+        &[bool_ty],
+        location,
+    ));
+    call_op.result(0).unwrap().into()
+}
+
+/// Cascades a struct's own release into every refcounted field it holds,
+/// then releases the struct itself — the general fix `PrimOp::Release`'s
+/// own doc comment (`cps.rs`) flags as still needed: `cleave_release` on
+/// its own is flat, and a struct's own tensor-typed field, since `store_
+/// native_shape_field`'s own fix, is *always* an independently `cleave_
+/// alloc_rc`'d payload uniquely owned by that one field (tensors are
+/// copied, never aliased, on every store — no retain-on-store needed for
+/// them the way an *existing* struct value being embedded needs, `rewrite_
+/// body`'s own doc comment) — releasing the container without also
+/// releasing it just leaks it, unconditionally, on every single
+/// replacement (found by direct testing: `examples/mnist-interop`'s own
+/// real training run, `Optimizer::step` replacing `net`/`state` every
+/// iteration, ran out of memory — `cleave_alloc_rc: allocation failed` —
+/// once the tensor-payload leak this closes was the only one left).
+///
+/// Every child field's own pointer is read out *before* releasing
+/// anything — the struct's own storage (and hence every field read through
+/// it) becomes invalid the moment its own `cleave_release` call actually
+/// frees it — but the cascade into those children only actually *runs*
+/// inside a real `scf.if`, gated on `cleave_release`'s own returned `i1`
+/// (`emit_cleave_release`'s own doc comment): whether the struct itself
+/// was genuinely destroyed by *this* call, not merely had its own count
+/// decremented while a second, still-live reference (another struct
+/// embedding the exact same pointer, retained at construction time —
+/// `rewrite_body`'s own retain-on-construction logic) keeps it alive.
+/// **Load-bearing, found by direct testing, a real `STATUS_HEAP_
+/// CORRUPTION`: cascading unconditionally — this function's own first
+/// version — frees a nested struct's own tensor field the moment *any*
+/// one of possibly several live references to it is released, not just
+/// the last one** (`examples/digits-interop`'s own real `Optimizer::step`:
+/// a freshly built `Dense` is retained again immediately, embedded into a
+/// `Network`, then its own now-redundant local binding released — count 2
+/// down to 1, very much still alive — the original, unconditional cascade
+/// freed its tensor fields right there anyway). Children released depth-
+/// first, the struct itself first-and-outermost this time (its own count
+/// has to be known *before* deciding whether to touch its fields at all,
+/// the reverse of naive destructor order) — safe regardless, since nothing
+/// after this point ever reads through `ptr` again either way. A `#[mlir_
+/// type(tensor)]`-tagged struct itself never reaches here directly
+/// (`refcount::is_refcounted` excludes it — it has no `cleave_alloc_rc`'d
+/// storage of its own to release, `lower_tagged_struct_construct`'s own
+/// doc comment) — only as a *field* of another struct, the tensor-field
+/// branch below.
+fn lower_release_cascade<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    struct_ty: &Ty,
+    ptr: Value<'c, 'c>,
+) {
+    let (name, type_args) = struct_name_and_args(struct_ty);
+    let field_types = struct_field_types(&ctx.struct_schemas, name, type_args);
+    let struct_llvm_ty = struct_llvm_type(ctx, name, type_args);
+    let context = ctx.context;
+    let location = Location::unknown(context);
+
+    enum PendingChild<'c> {
+        Tensor(Value<'c, 'c>),
+        Struct(Ty, Value<'c, 'c>),
+    }
+    let mut pending: Vec<PendingChild<'c>> = Vec::new();
+
+    for (position, (_, field_ty)) in field_types.iter().enumerate() {
+        let field_ptr = gep(ctx, block, ptr, &[0, position as i64], struct_llvm_ty);
+        if let Some(keyword) = native_shape_field_keyword(ctx, field_ty) {
+            assert_eq!(
+                keyword, "tensor",
+                "MLIR lowering: cascading release needs a real memref-backed form, which `#[mlir_type(vector)]` doesn't have"
+            );
+            // Read the field's own descriptor and pull its `allocated_ptr`
+            // straight out (position 0, `memref_descriptor_llvm_type`'s own
+            // confirmed layout) — no need for the full `load_native_shape_
+            // field` machinery (`to_tensor`, the defensive copy) here,
+            // this pointer is only ever handed to `cleave_release`, never
+            // read as tensor data.
+            let (fname, ftype_args) = struct_name_and_args(field_ty);
+            let inner_fields = struct_field_types(&ctx.struct_schemas, fname, ftype_args);
+            let [(_, inner_ty)] = inner_fields.as_slice() else {
+                panic!(
+                    "MLIR lowering: `#[mlir_type(tensor)]` requires exactly one field, `{fname}` has {}",
+                    inner_fields.len()
+                );
+            };
+            let (dims, _leaf_ty) = flatten_array_dims(inner_ty);
+            let descriptor_ty = memref_descriptor_llvm_type(context, dims.len());
+            let descriptor_val: Value = block
+                .append_operation(llvm::load(
+                    context,
+                    field_ptr,
+                    descriptor_ty,
+                    location,
+                    LoadStoreOptions::new(),
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let ptr_ty = llvm::r#type::pointer(context, 0);
+            let base_ptr: Value = block
+                .append_operation(llvm::extract_value(
+                    context,
+                    descriptor_val,
+                    DenseI64ArrayAttribute::new(context, &[0]),
+                    ptr_ty,
+                    location,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            pending.push(PendingChild::Tensor(base_ptr));
+        } else if matches!(field_ty, Ty::Con(_) | Ty::App(..))
+            && ctx.struct_schemas.contains_key(struct_name_and_args(field_ty).0)
+        {
+            // An ordinary nested struct field — an opaque `!llvm.ptr`,
+            // exactly like any other struct-typed value (`struct_llvm_
+            // type`'s own doc comment) — read it, recurse once the
+            // container's own fate is known.
+            let child_ty = ty_to_mlir(ctx, field_ty);
+            let child_val: Value = block
+                .append_operation(llvm::load(
+                    context,
+                    field_ptr,
+                    child_ty,
+                    location,
+                    LoadStoreOptions::new(),
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            pending.push(PendingChild::Struct(field_ty.clone(), child_val));
+        }
+        // Else: a primitive/array-of-primitive field — nothing refcounted
+        // to release.
+    }
+
+    let freed = emit_cleave_release(ctx, block, struct_ty, ptr);
+    if pending.is_empty() {
+        // No refcounted fields at all — the ordinary flat release above is
+        // the whole story, no `scf.if` needed to gate an empty cascade.
+        return;
+    }
+
+    let then_block = Block::new(&[]);
+    for child in pending {
+        match child {
+            PendingChild::Tensor(child_ptr) => {
+                // `struct_ty` (the *containing* struct), not the tensor
+                // field's own type — this is only for `ensure_extern_
+                // declared`'s own signature, and a `#[mlir_type(tensor)]`-
+                // tagged type maps to a real `tensor<...>` under `ty_to_
+                // mlir` (its own *native* MLIR type), wrong for `cleave_
+                // release`'s own always-`!llvm.ptr` real C signature
+                // (found by direct testing: a real verification failure,
+                // `operand type mismatch: expected tensor<...>`).
+                // `struct_ty` is guaranteed non-tensor-tagged here (this
+                // function's own doc comment), so it maps to `!llvm.ptr`
+                // correctly, exactly like every other `cleave_release`
+                // call — tensors have no further nesting, the returned
+                // `i1` is simply unused.
+                emit_cleave_release(ctx, &then_block, struct_ty, child_ptr);
+            }
+            PendingChild::Struct(child_ty, child_val) => {
+                lower_release_cascade(ctx, &then_block, &child_ty, child_val);
+            }
+        }
+    }
+    then_block.append_operation(scf::r#yield(&[], location));
+    let then_region = Region::new();
+    then_region.append_block(then_block);
+
+    let else_block = Block::new(&[]);
+    else_block.append_operation(scf::r#yield(&[], location));
+    let else_region = Region::new();
+    else_region.append_block(else_block);
+
+    block.append_operation(scf::r#if(freed, &[], then_region, else_region, location));
+}
+
 /// Allocates one **heap**-backed slot shaped `llvm_ty`, returning its own
-/// opaque `!llvm.ptr`, via a real call to `cleave_alloc` (`cleave-rt`,
-/// registered with the JIT the same way `print_i32`/... already are). Not
-/// `llvm.alloca`: found by direct testing — a struct returned from one
+/// opaque `!llvm.ptr`, via a real call to `cleave_alloc_rc` (`cleave-rt`,
+/// registered with the JIT the same way `print_i32`/... already are) — not
+/// `cleave_alloc` any more: `doc/hld.md`'s own "Memory management" section,
+/// Phase 0 (`cleave_alloc_rc`'s own doc comment in `cleave-rt` has the
+/// fuller story). Every value this allocates now starts life with a real
+/// refcount header (invisible to every existing GEP-based field access —
+/// `cleave_alloc_rc` returns a pointer already offset *past* its own
+/// header, byte-for-byte identical to what `cleave_alloc` used to hand
+/// back), but nothing here inserts a matching `cleave_release` yet — that's
+/// real, separate, higher-stakes work (deciding *where* a value's own scope
+/// genuinely ends), not yet built. This swap alone changes no observable
+/// behavior (still leaks, refcount frozen at whatever it started at,
+/// verified directly against the full test suite) — it validates the
+/// allocator swap is transparent before any release call is added on top.
+/// Not `llvm.alloca`: found by direct testing — a struct returned from one
 /// function and read by its own caller came back reading garbage, since an
 /// `alloca`'d slot lives in *that function's own* stack frame, gone the
 /// moment it returns, and a struct is a reference passed/returned by
 /// pointer, never copied (see `struct_llvm_type`'s own doc comment) — its
-/// storage has to outlive the call that built it. Deliberately leaked, no
-/// `free` — cleave has no ownership/`drop` story yet (see `cleave_alloc`'s
-/// own doc comment in `cleave-rt`). Fully generic over *any* LLVM type, not
-/// struct-specific — also used to heap-allocate a struct-leaf array's own
-/// embedded `!llvm.array` (`ty_to_mlir`'s `Ty::Array` arm, `array_leaf_is_
-/// struct`), which needs the exact same "outlives the call that built it"
-/// property a struct does.
+/// storage has to outlive the call that built it. Fully generic over *any*
+/// LLVM type, not struct-specific — also used to heap-allocate a struct-leaf
+/// array's own embedded `!llvm.array` (`ty_to_mlir`'s `Ty::Array` arm,
+/// `array_leaf_is_struct`), which needs the exact same "outlives the call
+/// that built it" property a struct does.
 fn alloc_llvm_value<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
@@ -2307,13 +2789,13 @@ fn alloc_llvm_value<'c>(
     let size = llvm_type_size_bytes(ctx, block, llvm_ty);
     ensure_extern_declared(
         ctx,
-        "cleave_alloc",
+        "cleave_alloc_rc",
         &[Ty::Con("i64".to_string())],
         &[ptr_ty],
     );
     let call_op = block.append_operation(func::call(
         context,
-        FlatSymbolRefAttribute::new(context, "cleave_alloc"),
+        FlatSymbolRefAttribute::new(context, "cleave_alloc_rc"),
         &[size],
         &[ptr_ty],
         location,
