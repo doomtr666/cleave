@@ -24,7 +24,7 @@ use cleave::dump::dump_program;
 use cleave::egraph::optimize_program;
 use cleave::mlir_lower::lower_program;
 use cleave::monomorphize::dump_monomorphized;
-use cleave::pipeline::{build_cps_program, check_type_errors};
+use cleave::pipeline::{build_cps_program, check_type_errors, mark_mulf_addf_contract};
 use cleave::print::print_program;
 use cleave::registry::Registry;
 use melior::Context;
@@ -476,9 +476,20 @@ fn real_main() -> ExitCode {
                         // `--run`'s own identical pipeline below for the full
                         // reasoning (found by direct testing to matter, not
                         // just tidier).
+                        // Inline + fuse elementwise ops, *before*
+                        // bufferization -- see `pipeline.rs::emit_object`'s
+                        // own identical stage for the full story (found via
+                        // VTune against a real training run: an SGD update
+                        // lowers to two separate `func.func`s called via
+                        // `call`, each bufferizing its own scratch buffer;
+                        // inlining puts producer and consumer in one body so
+                        // fusion can collapse them into one).
                         let pass_manager = pass::PassManager::new(&context);
+                        pass_manager.add_pass(pass::transform::create_inliner());
                         pass_manager
                             .add_pass(pass::linalg::create_convert_elementwise_to_linalg_pass());
+                        pass_manager
+                            .add_pass(pass::linalg::create_linalg_elementwise_op_fusion_pass());
                         let ok = pass_manager.run(&mut module).is_ok();
 
                         let pass_manager = pass::PassManager::new(&context);
@@ -510,6 +521,14 @@ fn real_main() -> ExitCode {
 
                         let pass_manager = pass::PassManager::new(&context);
                         pass_manager.add_pass(pass::linalg::create_convert_linalg_to_loops_pass());
+                        let ok = ok && pass_manager.run(&mut module).is_ok();
+
+                        // FMA fusion -- see `pipeline.rs::emit_object`'s own
+                        // identical stage (and `mark_mulf_addf_contract`'s
+                        // own doc comment) for the full story.
+                        mark_mulf_addf_contract(&context, &mut module);
+
+                        let pass_manager = pass::PassManager::new(&context);
                         pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
                         pass_manager.add_pass(pass::conversion::create_to_llvm());
                         pass_manager
@@ -603,8 +622,26 @@ fn real_main() -> ExitCode {
         // tensor.cleave`) has no `BufferizableOpInterface` implementation
         // of its own — only a real structured/named op does — so one-shot-
         // bufferize (stage 2) can't handle it directly without this first.
+        // Inline, then fuse elementwise tensor ops, *before* bufferization
+        // -- see `pipeline.rs::emit_object`'s own identical stage for the
+        // full story (found via VTune against a real training run,
+        // `examples/mnist-interop`: 75% of wall time inside `Optimizer::
+        // step<Sgd,Network>`, almost all in unlisted callees -- allocation/
+        // copy/free traffic, not compute. Root cause: an SGD update,
+        // `stdlib/optim/optim.cleave`'s own `Ring::sub(model, Scale::scale
+        // (grad, opt.lr))`, lowers to *two separate* `func.func`s called via
+        // ordinary `call` ops -- cleave's own CPS-level inlining never
+        // collapses a cross-algebra dispatch call, so One-Shot Bufferize
+        // materializes two scratch buffers where one would do. `--inline`
+        // puts producer and consumer back in one function body; `--linalg-
+        // fuse-elementwise-ops` (after `--convert-elementwise-to-linalg`)
+        // then fuses them into one `linalg.generic`, one buffer -- verified
+        // directly against this toolchain, and end-to-end against this
+        // exact kernel with zero verification failures at any later stage).
         let pass_manager = pass::PassManager::new(&context);
+        pass_manager.add_pass(pass::transform::create_inliner());
         pass_manager.add_pass(pass::linalg::create_convert_elementwise_to_linalg_pass());
+        pass_manager.add_pass(pass::linalg::create_linalg_elementwise_op_fusion_pass());
         if pass_manager.run(&mut module).is_err() {
             eprintln!("error: MLIR-to-LLVM lowering pass failed");
             return ExitCode::FAILURE;
@@ -661,6 +698,17 @@ fn real_main() -> ExitCode {
         // error -- found by direct testing.
         let pass_manager = pass::PassManager::new(&context);
         pass_manager.add_pass(pass::linalg::create_convert_linalg_to_loops_pass());
+        if pass_manager.run(&mut module).is_err() {
+            eprintln!("error: MLIR-to-LLVM lowering pass failed");
+            return ExitCode::FAILURE;
+        }
+
+        // FMA fusion -- see `pipeline.rs::emit_object`'s own identical
+        // stage (and `mark_mulf_addf_contract`'s own doc comment) for the
+        // full story.
+        mark_mulf_addf_contract(&context, &mut module);
+
+        let pass_manager = pass::PassManager::new(&context);
         pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
         pass_manager.add_pass(pass::conversion::create_to_llvm());
         pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());

@@ -18,7 +18,9 @@ use crate::refcount::insert_refcounting;
 use crate::registry::Registry;
 use melior::Context;
 use melior::dialect::DialectRegistry;
-use melior::ir::operation::OperationLike;
+use melior::ir::{BlockLike, Module, RegionLike};
+use melior::ir::attribute::Attribute;
+use melior::ir::operation::{OperationLike, OperationMutLike, OperationRefMut};
 use melior::pass;
 use melior::utility::{parse_pass_pipeline, register_all_dialects};
 use std::path::{Path, PathBuf};
@@ -273,6 +275,48 @@ pub unsafe fn register_cleave_rt_symbols(engine: &melior::ExecutionEngine) {
     }
 }
 
+/// Stamps every `arith.mulf`/`arith.addf` op in `module` with a
+/// `fastmath<contract>` attribute -- see the pipeline stage that calls this
+/// (`emit_object`, and its two identical copies in `main.rs`) for why: it's
+/// the permission `--math-uplift-to-fma` needs before it will fuse a
+/// `mulf`+`addf` pair into one `math.fma`, found to be required (not
+/// optional) by direct testing against this toolchain. No typed MLIR pass
+/// does this -- there's no generic "permit contraction everywhere" pass in
+/// this toolchain (`mlir-opt --help` checked directly) -- so this walks the
+/// module by hand, the same nested region/block/operation traversal a real
+/// MLIR C++ pass would do internally. Not built on melior's own
+/// `OperationMutLike::walk_mut`: that closure is `for<'x, 'y> FnMut(...)`
+/// (a real MLIR C++ walk visits operations at many different nested
+/// lifetimes), which can't accept a single `Attribute<'c>` captured from
+/// outside at one fixed lifetime -- found directly (`E0521`, "argument
+/// requires that `'c` must outlive `'static`") rather than assumed; a
+/// plain recursive walk sidesteps it by staying at one lifetime throughout.
+pub fn mark_mulf_addf_contract<'c>(context: &'c Context, module: &mut Module<'c>) {
+    let contract = Attribute::parse(context, "#arith.fastmath<contract>")
+        .expect("`#arith.fastmath<contract>` is a fixed, always-valid attribute literal");
+    stamp_op_and_children(module.as_operation_mut(), contract);
+}
+
+fn stamp_op_and_children<'c>(mut op: OperationRefMut<'c, '_>, contract: Attribute<'c>) {
+    if matches!(
+        op.name().as_string_ref().as_str(),
+        Ok("arith.mulf" | "arith.addf")
+    ) {
+        op.set_attribute("fastmath", contract);
+    }
+    for region in op.regions() {
+        let mut next_block = region.first_block();
+        while let Some(block) = next_block {
+            let mut next_op = block.first_operation_mut();
+            while let Some(child) = next_op {
+                next_op = child.next_in_block_mut();
+                stamp_op_and_children(child, contract);
+            }
+            next_block = block.next_in_region();
+        }
+    }
+}
+
 /// The three-stage MLIR-to-`llvm`-dialect lowering pipeline `--run`/`--dump-
 /// mlir-lowered` also use, ending in a real `.o` written to `object_path`
 /// (`ExecutionEngine::dump_to_object_file`) rather than JIT invocation --
@@ -298,11 +342,55 @@ fn emit_object(
         ]);
     }
 
+    // Inline, then fuse elementwise tensor ops, *before* bufferization --
+    // found directly with VTune against a real training run
+    // (`examples/mnist-interop`): 75% of wall time was inside
+    // `Optimizer::step<Sgd,Network>`, and its own self time was near zero --
+    // almost everything was in unlisted callees, i.e. allocation/copy/free
+    // traffic, not compute. Root cause, confirmed by reading the raw
+    // (pre-pipeline) MLIR directly: an SGD update (`stdlib/optim/optim.
+    // cleave`'s own `Ring::sub(model, Scale::scale(grad, opt.lr))`) lowers
+    // to *two separate* `func.func`s (`Ring::sub<...>`, `Scale::scale<...>`)
+    // called via ordinary `call` ops -- cleave's own CPS-level inlining
+    // (`doc/hld.md`, "Memory management") only ever collapses same-file,
+    // non-algebra-dispatch calls; a cross-algebra dispatch like this one is
+    // resolved to a concrete monomorphized function but stays a real CPS
+    // `App`, never inlined. One-Shot Bufferize therefore materializes *two*
+    // scratch buffers (one per function's own tensor result) instead of
+    // one, every time this pattern appears -- and it's the dominant shape
+    // in `forward`/`loss`/`Optimizer::step` alike, not a one-off.
+    //
+    // `--inline` (MLIR's own generic, dialect-agnostic inliner, `Transforms`
+    // library) closes exactly this gap: flattening these calls into their
+    // call sites puts producer and consumer in the same function body,
+    // where `--linalg-fuse-elementwise-ops` (after `--convert-elementwise-
+    // to-linalg` turns the now-inlined `arith.subf`/`arith.mulf` chain into
+    // `linalg.generic` ops) can fuse them into *one* kernel writing *one*
+    // buffer, instead of two kernels chained through an intermediate one --
+    // confirmed directly against this exact toolchain (`mlir-opt --inline
+    // --convert-elementwise-to-linalg --linalg-fuse-elementwise-ops` on a
+    // minimal SGD-update probe): two `linalg.generic` ops with a
+    // materialized intermediate collapse into one `linalg.generic` whose
+    // body computes `mul` then `sub` directly, no intermediate at all.
+    //
+    // Verified safe at real scale before wiring in, not assumed: run
+    // end-to-end (inline -> elementwise-to-linalg -> fuse -> one-shot-
+    // bufferize -> buffer-deallocation -> linalg-to-loops -> to-llvm) on
+    // `examples/mnist-interop`'s own real kernel -- zero verification
+    // failures at any stage, `train_and_evaluate` itself (the `export fn`
+    // Rust calls by symbol name) survives inlining intact (never a call
+    // target of its own, so never itself inlined away), and MLIR-level
+    // compile time stays sub-second (static IR size grows roughly 2x from
+    // call-site duplication, same shape as any inliner, not the exponential
+    // blowup a previous compile-time investigation hit and fixed
+    // elsewhere -- `doc/backlog.md`'s own "real root cause of the 738s").
     let pass_manager = pass::PassManager::new(&context);
+    pass_manager.add_pass(pass::transform::create_inliner());
     pass_manager.add_pass(pass::linalg::create_convert_elementwise_to_linalg_pass());
+    pass_manager.add_pass(pass::linalg::create_linalg_elementwise_op_fusion_pass());
     if pass_manager.run(&mut module).is_err() {
         return Err(vec![
-            "MLIR-to-LLVM lowering pass failed (elementwise-to-linalg)".to_string(),
+            "MLIR-to-LLVM lowering pass failed (inline/elementwise-to-linalg/fuse)".to_string(),
         ]);
     }
 
@@ -356,6 +444,48 @@ fn emit_object(
 
     let pass_manager = pass::PassManager::new(&context);
     pass_manager.add_pass(pass::linalg::create_convert_linalg_to_loops_pass());
+    if pass_manager.run(&mut module).is_err() {
+        return Err(vec![
+            "MLIR-to-LLVM lowering pass failed (linalg-to-loops)".to_string(),
+        ]);
+    }
+
+    // FMA fusion -- found by disassembling a real emitted object file
+    // (`kernel.o`, `examples/mnist-interop`): the matmul accumulation loop
+    // (`linalg.matmul`'s own lowering, right above, `acc = acc + a[i,k]*b
+    // [k,j]`) already vectorizes to AVX-512 (`%zmm`) on this host by
+    // default, but *never* to a fused multiply-add (`vfmaddXXXps`) --
+    // always a separate `vmulps`+`vaddps` pair, even though the CPU
+    // supports it. Root cause, confirmed directly: LLVM will not contract
+    // a separate `fmul`+`fadd` into one `fma` unless explicitly permitted
+    // (correct IEEE-754-strict default -- contraction changes the last
+    // rounding step) -- `arith.mulf`/`arith.addf` need a `fastmath
+    // <contract>` attribute for the LLVM dialect ops they lower to
+    // (`llvm.fmul`/`llvm.fadd`) to carry the matching `fastmathFlags =
+    // #llvm.fastmath<contract>`, confirmed to survive `--convert-to-llvm`
+    // unchanged on a minimal handwritten case.
+    //
+    // MLIR's own `--math-uplift-to-fma` pass (rewrites the pair to an
+    // explicit `math.fma` *before* this point) was tried first and
+    // reverted: it does get a real `vfmadd`, but overwhelmingly the
+    // *scalar* single-lane form (`vfmadd132ss`, 1222 occurrences vs. 132
+    // packed `vfmadd132ps`, measured directly on `digits-interop`'s own
+    // real object file) -- explicit `math.fma`/`llvm.intr.fma` calls,
+    // materialized this early, are far harder for LLVM's own loop
+    // vectorizer to recognize and pack across iterations than a plain
+    // `fmul`+`fadd` pair is; a real, measured *regression* end-to-end on
+    // `examples/mnist-interop` (294s fused-only -> 324s with the uplift
+    // pass added) confirmed this wasn't just a disassembly curiosity.
+    // Leaving the pair as plain `arith.mulf`/`arith.addf`, merely stamped
+    // `contract`, defers the actual fuse-or-not decision to LLVM's own
+    // backend, *after* its vectorizer has already run (exactly how `clang
+    // -ffp-contract=fast` works, and why: the vectorizer sees an ordinary,
+    // easy-to-pack `fmul`/`fadd` pair, and only the final instruction-
+    // selection step -- which already knows the target has native packed
+    // FMA -- decides to fuse, on the now-already-vectorized form).
+    mark_mulf_addf_contract(&context, &mut module);
+
+    let pass_manager = pass::PassManager::new(&context);
     pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
     pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
