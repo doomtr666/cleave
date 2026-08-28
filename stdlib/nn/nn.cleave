@@ -37,6 +37,71 @@ algebra Activation<T> {
     // <T>::tanh`'s own impls below delegate to it via a qualified call
     // (`Transcendental::tanh(x)`), so its derivative composes for free
     // through the delegation, no rule needed here at all.
+
+    // `relu`'s own real `adjoint` rule -- correctly missing until now
+    // (this algebra's own original doc comment used to say so directly:
+    // "a known, narrower, separate gap... differentiating through either
+    // one isn't exercised anywhere reached by `derive()` yet") -- needed
+    // the moment `grad()` differentiates through a real `ReLU`-activated
+    // network deep enough that `sigmoid`'s own vanishing-gradient problem
+    // matters (`examples/mnist-interop`). `relu'(x) = 1` where `x > 0`,
+    // `0` otherwise (the subgradient convention at exactly `x = 0` doesn't
+    // matter in practice) -- `Step<T>::step` below, a small, dedicated
+    // algebra existing only to carry this one value as an adjoint rule's
+    // own payload, never itself a `derive()`/`grad()` target.
+    adjoint relu(x), u: mul(u, step(x));
+}
+
+// `relu`'s own adjoint (just above) needs this, and only this -- not a
+// general-purpose "sign" or "Heaviside" primitive for the rest of the
+// stdlib to reach for, kept exactly as narrow as the one real need.
+algebra Step<T> {
+    fn step(x: T) -> T;
+}
+
+// `arith.uitofp` (unsigned-int-to-float, `i1`'s own `0`/`1` reads correctly
+// as an unsigned bit pattern either way), not `arith.select` -- found
+// directly, by testing: building a real `arith.select` through this
+// project's own fully-generic `mlir::...` mechanism (`lower_raw_mlir_op`)
+// crashes MLIR's own internal type/attribute uniquing (`StorageUniquer
+// Support.h`, an assertion failure, not a clean verifier error) even with
+// every operand already a properly-typed value — `Convert<i32,f32>`'s own
+// `arith.sitofp` (`stdlib/convert/convert.cleave`) already proves the
+// *general* "operand type differs from result type" shape works fine
+// through this same generic mechanism, so the problem is specific to
+// `select`'s own 3-operand shape somehow, not heterogeneous types in
+// general — not investigated further (a real, separate compiler gap,
+// `select` specifically unusable via `mlir::...` today), just routed
+// around with a single-operand conversion instead, which needs no `zero`/
+// `one` operand pair, no `select` at all, one op fewer besides.
+impl Step<f32> {
+    fn step(x) {
+        let cond: bool = Ord::gt(x, 0.0);
+        mlir::arith::uitofp(cond)
+    }
+}
+
+impl Step<f64> {
+    fn step(x) {
+        let cond: bool = Ord::gt(x, 0.0);
+        mlir::arith::uitofp(cond)
+    }
+}
+
+// The `Tensor<T,Dims...>` counterpart, elementwise -- `arith.cmpf`/`arith.
+// uitofp` apply structurally over a shaped operand exactly the way `arith.
+// maximumf` already does for `Activation<Tensor<T,Dims...>>::relu` itself,
+// confirmed directly the same way. `cond`'s own real MLIR type is a same-
+// shaped tensor of `i1` (`Tensor<bool, Dims...>`'s own native form, `ty_to_
+// mlir`'s `bool -> i1` mapping composing with `Tensor`'s own pack-generic
+// shape the same way it already does for `T = f32`/`i32`/etc.) -- checked
+// directly, not assumed.
+impl<T: Float, const Dims...: i32> Step<Tensor<T, Dims...>> {
+    fn step(x) {
+        let zero: Tensor<T, Dims...> = Tensor::<T, Dims...>(data: [0.0; Dims...]);
+        let cond: Tensor<bool, Dims...> = mlir::arith::cmpf(x, zero, predicate: "2 : i64");
+        mlir::arith::uitofp(cond)
+    }
 }
 
 // `arith.maximumf(x, 0.0)`/`1.0 + ...` — a bare literal operand here is

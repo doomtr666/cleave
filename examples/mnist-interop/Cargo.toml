@@ -1,0 +1,18 @@
+[package]
+name = "mnist-interop"
+version = "0.1.0"
+edition = "2024"
+
+# See `examples/rust-interop-demo/Cargo.toml`'s own identical comment for why
+# this lives inside the root workspace rather than standing alone.
+[build-dependencies]
+cleave-build = { path = "../../cleave-build" }
+
+# `data.rs`'s own doc comment: fetches the real MNIST IDX files over HTTP
+# (once, cached locally) rather than shipping ~11MB of binary data in the
+# repo -- `ureq` (blocking, minimal-dependency HTTP client, no async runtime
+# needed for a one-shot startup download) and `flate2` (the files are
+# gzip-compressed at the source) are the only two dependencies this needs.
+[dependencies]
+ureq = "3"
+flate2 = "1"

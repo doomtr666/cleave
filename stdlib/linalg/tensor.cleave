@@ -120,11 +120,7 @@ impl<T: Float, const Dims...: i32> Transcendental<Tensor<T, Dims...>> {
 // for) -- `Ring<T>` alone can't express it (`fn mul(a: T, b: T) -> T`, both
 // operands always the *same* type), so a real, separate, heterogeneous
 // algebra, mirroring `MatMul<A,B,C>`'s own "not every numeric op is same-
-// type" precedent. `[s; Dims...]` broadcasts the scalar into a same-shape
-// tensor first (the exact pack-generic array-repeat `Ring<Tensor<T,Dims...>>
-// ::zero()` already uses for `[zero(); Dims...]`, just with a real value
-// instead of a literal `0.0`/`1.0`), then an ordinary elementwise `arith.
-// mulf` -- no new mechanism, same shape as every other impl in this file.
+// type" precedent.
 algebra Scale<Container, T> {
     fn scale(c: Container, s: T) -> Container;
     // `d/dx[c*s] = d(c)*s + c*d(s)` -- the ordinary product rule, same shape
@@ -135,9 +131,26 @@ algebra Scale<Container, T> {
     derivative scale(c, s): add(scale(d(c), s), scale(c, d(s)));
 }
 
+// `mlir::tensor::splat(s)` broadcasts the scalar into a same-shape tensor in
+// one real O(1) MLIR op, not `[s; Dims...]`'s own array-repeat -- the exact
+// same fix `Ring<Tensor<T,Dims...>>::zero()` already got (`doc/backlog.md`'s
+// own "digits-interop" perf item), just not carried over here at the time,
+// since nothing had exercised `scale` at real scale yet. Found the hard way,
+// much later (`examples/mnist-interop`): `[s; Dims...]`'s own "evaluate
+// independently at every leaf position" semantics is correct in general
+// (needed for `Init::xavier`'s genuinely-independent draws) but *wrong* to
+// pay here — `s` (the learning rate) is the identical value at every
+// position, so array-repeat unrolled a full `tensor.from_elements`-style
+// expansion per element; at real network scale (`Tensor<f32,512,256>`,
+// 131,072 elements — `Optimizer::step`'s own `Scale::scale(grad, opt.lr)`
+// call for one real hidden layer), this didn't just compile slowly, it
+// genuinely overflowed the compiler's own 1GiB worker-thread stack
+// (`main.rs`'s own `thread::Builder::stack_size`) — a real crash, not just
+// a slow build, isolated directly to this one call via a minimal standalone
+// probe before touching this file.
 impl<T: Float, const Dims...: i32> Scale<Tensor<T, Dims...>, T> {
     fn scale(c, s) {
-        let broadcast: Tensor<T, Dims...> = Tensor::<T, Dims...>(data: [s; Dims...]);
+        let broadcast: Tensor<T, Dims...> = mlir::tensor::splat(s);
         mlir::arith::mulf(c, broadcast)
     }
 }

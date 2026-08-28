@@ -567,6 +567,28 @@ pub struct Forward {
     /// own parameters are bound via `self.env`, never minted as `Free`).
     pub param_types: HashMap<CVar, Ty>,
     next_free: u32,
+    /// Remaining unroll budget, shared across *every* `try_unroll_for_loop`
+    /// call this `Forward` ever makes (sibling loops *and* nested ones
+    /// alike) — not, as `MAX_UNROLL_ITERATIONS`'s own original doc comment
+    /// implied, a per-loop cap checked independently at each level. A real,
+    /// found-by-crashing bug: `Sum<Tensor<T,N,M>,T>::sum`'s own real body
+    /// (`stdlib/nn/nn.cleave`, a nested `for i in 0..N { for _k in 0..M {
+    /// ... } }`) checked each loop's own `end-start` against the constant
+    /// separately — `N=512`/`M=256` each individually pass (under 1024), so
+    /// *both* levels unrolled, multiplying to 512*256=131,072 total e-graph
+    /// nodes built via deep, genuinely recursive Rust calls (`try_unroll_
+    /// for_loop`'s own per-iteration recursion into `self.walk`) — enough to
+    /// overflow even `main.rs`'s own already-raised 1GiB worker-thread
+    /// stack outright (confirmed directly: a minimal standalone probe
+    /// isolating `Scale::scale`+`sum` on a real `Tensor<f32,512,256>`,
+    /// `examples/mnist-interop`'s own real hidden-layer shape, crashes the
+    /// same way). One shared budget, decremented by each loop's own real
+    /// iteration count *before* it unrolls (not after — an already-large
+    /// enclosing loop must see a shrunk budget before deciding whether a
+    /// nested one still fits), makes the *product* across nested levels
+    /// respect the same cap the constant's own doc comment always intended,
+    /// not just each level in isolation.
+    unroll_budget: u64,
 }
 
 impl Default for Forward {
@@ -586,6 +608,7 @@ impl Default for Forward {
             load_ops: HashMap::new(),
             param_types: HashMap::new(),
             next_free: 0,
+            unroll_budget: MAX_UNROLL_ITERATIONS,
         }
     }
 }
@@ -1134,9 +1157,17 @@ impl Forward {
         else {
             return None;
         };
-        if end.saturating_sub(start) > MAX_UNROLL_ITERATIONS {
+        let iterations = end.saturating_sub(start).max(0) as u64;
+        if iterations > self.unroll_budget {
             return None;
         }
+        // Decremented *before* unrolling, not after — see `unroll_budget`'s
+        // own doc comment: an enclosing loop must charge its own iterations
+        // against the shared budget before any nested loop inside its own
+        // body gets a chance to check what's left, so the real *product*
+        // across nested levels is what respects the cap, not each level
+        // checked in isolation.
+        self.unroll_budget -= iterations;
 
         let mut carried_ids = self.cvals_to_ids(carried_init)?;
         for idx in start..end {
@@ -1171,7 +1202,7 @@ impl Forward {
 /// a clean "stop, unchanged" bail for an e-graph blow-up (equality
 /// saturation's own memory/time cost grows with node count), which is worse
 /// than just not unrolling.
-const MAX_UNROLL_ITERATIONS: u64 = 1024;
+const MAX_UNROLL_ITERATIONS: u64 = 256;
 
 /// Recognizes `cps.rs::emit_call`'s own exact `UnitBody::Real` shape --
 /// `Fix{defs: [k], body: App{func: Label(unit_name), args}}` where `k`'s

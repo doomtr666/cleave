@@ -1,0 +1,154 @@
+// The real MNIST handwritten-digit dataset (28x28 grayscale, 10 classes,
+// 60,000 training / 10,000 test images) -- loaded over HTTP and cached
+// locally via Rust (`../data.rs`'s own doc comment explains why: cleave has
+// no file I/O or network access of its own), fed in one scalar at a time
+// through `extern fn`, the same mechanism `examples/digits-interop` already
+// proved out at UCI-digits scale (8x8, 64 pixels). This is the deliberately
+// "fattest reasonable" version reachable with today's stdlib alone (`doc/
+// backlog.md`'s own "digits-interop" perf item just closed the compile-time
+// wall that used to make anything bigger than 64->32->10 impractical to even
+// try) -- a real, deep, wide `ReLU` MLP (784 -> 512 -> 256 -> 128 -> 10), not
+// a toy. No convolution/pooling/softmax+cross-entropy -- those are real,
+// separate, much bigger stdlib undertakings (new algebras of their own),
+// deliberately out of scope for this iteration; plain sum-of-squares
+// regression against a one-hot target, `Dense`/`Activation`/`Sum`/`Init`/
+// `Optimizer`, all already real and tested, is what this stresses.
+use nn;
+use linalg;
+
+extern fn train_len() -> i32;
+extern fn train_pixel(sample: i32, pixel: i32) -> f32;
+extern fn train_label(sample: i32) -> i32;
+extern fn train_target(sample: i32, class: i32) -> f32;
+extern fn test_len() -> i32;
+extern fn test_pixel(sample: i32, pixel: i32) -> f32;
+extern fn test_label(sample: i32) -> i32;
+extern fn test_target(sample: i32, class: i32) -> f32;
+
+struct Network {
+    l1: Dense<f32, 784, 512>,
+    l2: Dense<f32, 512, 256>,
+    l3: Dense<f32, 256, 128>,
+    l4: Dense<f32, 128, 10>
+}
+
+impl<Opt> Optimizer<Opt, Network> {
+    fn init_state(opt, model) {
+        Network(
+            l1: Optimizer::init_state(opt, model.l1),
+            l2: Optimizer::init_state(opt, model.l2),
+            l3: Optimizer::init_state(opt, model.l3),
+            l4: Optimizer::init_state(opt, model.l4)
+        )
+    }
+    fn step(opt, model, grad, state) {
+        let r1 = Optimizer::step(opt, model.l1, grad.l1, state.l1);
+        let r2 = Optimizer::step(opt, model.l2, grad.l2, state.l2);
+        let r3 = Optimizer::step(opt, model.l3, grad.l3, state.l3);
+        let r4 = Optimizer::step(opt, model.l4, grad.l4, state.l4);
+        (
+            Network(l1: r1.0, l2: r2.0, l3: r3.0, l4: r4.0),
+            Network(l1: r1.1, l2: r2.1, l3: r3.1, l4: r4.1)
+        )
+    }
+}
+
+fn load_train_input(sample: i32) -> Tensor<f32, 1, 784> {
+    let mut pixels: [f32; 784] = mlir::memref::alloc();
+    for i in 0..784 { pixels[i] = train_pixel(sample, i); };
+    Tensor::<f32, 1, 784>(data: [pixels])
+}
+
+fn load_train_target(sample: i32) -> Tensor<f32, 1, 10> {
+    let mut t: [f32; 10] = [0.0; 10];
+    for i in 0..10 { t[i] = train_target(sample, i); };
+    Tensor::<f32, 1, 10>(data: [t])
+}
+
+fn load_test_input(sample: i32) -> Tensor<f32, 1, 784> {
+    let mut pixels: [f32; 784] = mlir::memref::alloc();
+    for i in 0..784 { pixels[i] = test_pixel(sample, i); };
+    Tensor::<f32, 1, 784>(data: [pixels])
+}
+
+// No final activation -- raw logits, matching `examples/digits-interop`'s
+// own identical design (`Dense::forward`'s own "no activation baked in"
+// stance, `stdlib/nn/nn.cleave`). `ReLU` between every hidden layer -- the
+// standard choice for a network this deep (avoids `sigmoid`'s own vanishing-
+// gradient problem at four layers), matching `Init::he()` below.
+fn forward(x: Tensor<f32, 1, 784>, net: Network) -> Tensor<f32, 1, 10> {
+    let h1 = relu(net.l1.forward(x));
+    let h2 = relu(net.l2.forward(h1));
+    let h3 = relu(net.l3.forward(h2));
+    net.l4.forward(h3)
+}
+
+// Stays tensor-native throughout -- `examples/digits-interop`'s own identical
+// `loss` doc comment for why this exact shape (`Ring::sub`/`Ring::mul`/
+// `Sum::sum`, each with a real declared `adjoint` rule) is what `grad()`'s
+// own reverse-mode backend needs to differentiate through at all.
+fn loss(x: Tensor<f32, 1, 784>, y: Tensor<f32, 1, 10>, net: Network) -> f32 {
+    let pred = forward(x, net);
+    let err = pred - y;
+    sum(err * err)
+}
+
+// `grad()`, not `derive()` -- `doc/backlog.md`'s own "Reverse-mode (`grad()`)
+// differentiation" item: cost independent of any single layer's own shape,
+// the real point of this whole mechanism, now exercised at real MNIST scale
+// (four genuinely non-square layers) instead of just the two `digits-
+// interop` already proved out.
+net_grad = grad(loss);
+
+fn argmax10(pred: Tensor<f32, 1, 10>) -> i32 {
+    let mut best: i32 = 0;
+    let mut best_val: f32 = pred[0, 0];
+    for c in 1..10 {
+        if pred[0, c] > best_val {
+            best_val = pred[0, c];
+            best = c;
+        };
+    };
+    best
+}
+
+fn evaluate(net: Network) -> f32 {
+    let n: i32 = test_len();
+    let mut correct: i32 = 0;
+    for s in 0..n {
+        let x = load_test_input(s);
+        let predicted: i32 = argmax10(forward(x, net));
+        let label: i32 = test_label(s);
+        if predicted == label { correct = correct + 1; };
+    };
+    let correct_f: f32 = correct.to();
+    let n_f: f32 = n.to();
+    correct_f / n_f
+}
+
+// `He` init on every `ReLU`-activated hidden layer (`l1`/`l2`/`l3`),
+// `Xavier` on the final, unactivated output layer -- standard convention,
+// `stdlib/nn/nn.cleave`'s own `Init<T>::xavier`/`he` doc comments.
+export fn train_and_evaluate(epochs: i32, lr: f32, seed: i64) -> f32 {
+    rand_seed(seed);
+    let mut net: Network = Network(
+        l1: Init::he(),
+        l2: Init::he(),
+        l3: Init::he(),
+        l4: Init::xavier()
+    );
+    let opt = Sgd(lr: lr);
+    let mut state: Network = Optimizer::init_state(opt, net);
+    let n: i32 = train_len();
+    for epoch in 0..epochs {
+        for s in 0..n {
+            let x = load_train_input(s);
+            let y = load_train_target(s);
+            let g = net_grad(x, y, net);
+            let r = Optimizer::step(opt, net, g.2, state);
+            net = r.0;
+            state = r.1;
+        };
+    };
+    evaluate(net)
+}
