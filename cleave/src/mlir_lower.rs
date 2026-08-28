@@ -713,13 +713,33 @@ fn lower_top_level_fn<'c>(ctx: &LowerCtx<'c, '_>, f: &CTopLevelFn) -> Operation<
     // boundary: *that* case needs the descriptor shape this wrapper exists
     // for, matched by a `#[repr(C)]` type on the Rust side -- not attempted
     // here.
-    let attrs: &[(melior::ir::Identifier, melior::ir::Attribute)] = if f.def.name == "main" {
-        &[(
+    // `sym_visibility = "private"` on every function that is neither `main`
+    // (needs public visibility for `invoke_packed`'s own by-name lookup)
+    // nor an `export fn` (needs it for a real external/Rust caller to link
+    // against the raw symbol) -- found necessary, not decorative: `--affine-
+    // super-vectorize` (`mlir_lower.rs`'s own... no, `pipeline.rs`'s own
+    // structured-vectorization stage) hard-errors on a *dead* function
+    // still carrying a cross-function-boundary (`strided<[?,?],offset:?>`)
+    // memref shape -- `--inline` (the pipeline's own first stage) leaves
+    // the original, now-unreferenced declaration of every inlined call
+    // behind rather than deleting it, and `--symbol-dce` (run right after)
+    // only ever removes a symbol that's *both* unreferenced *and* private —
+    // every function used to default to MLIR's own public visibility here,
+    // so none of them ever qualified. Every internal algebra-dispatch/
+    // helper function is *never* called from outside this module (only
+    // `main`/exports are), so `private` costs nothing real.
+    let attrs: Vec<(melior::ir::Identifier, melior::ir::Attribute)> = if f.def.name == "main" {
+        vec![(
             melior::ir::Identifier::new(context, "llvm.emit_c_interface"),
             melior::ir::Attribute::unit(context),
         )]
+    } else if f.is_export {
+        vec![]
     } else {
-        &[]
+        vec![(
+            melior::ir::Identifier::new(context, "sym_visibility"),
+            StringAttribute::new(context, "private").into(),
+        )]
     };
     // An exported unit's real LLVM symbol is its `export_symbol` override
     // when given, else its own cleave name unchanged. NOTE (known, scoped
@@ -742,7 +762,7 @@ fn lower_top_level_fn<'c>(ctx: &LowerCtx<'c, '_>, f: &CTopLevelFn) -> Operation<
         StringAttribute::new(context, symbol_name),
         TypeAttribute::new(FunctionType::new(context, &param_types, &results).into()),
         region,
-        attrs,
+        &attrs,
         location,
     )
 }

@@ -442,11 +442,30 @@ fn emit_object(
         ]);
     }
 
+    // `--symbol-dce`, right after `--inline` (above) made every inlined
+    // call site's own original callee declaration dead weight -- only
+    // actually removable now that `lower_program` (`mlir_lower.rs`) marks
+    // every non-`main`/non-export function `sym_visibility = "private"`;
+    // `--symbol-dce` only ever deletes a symbol that's *both* unreferenced
+    // and private. Not just tidiness: leaving these dead, now-unreferenced
+    // declarations in place is exactly what made the structured-
+    // vectorization stage below hard-fail (see its own doc comment).
     let pass_manager = pass::PassManager::new(&context);
-    pass_manager.add_pass(pass::linalg::create_convert_linalg_to_loops_pass());
+    pass_manager.add_pass(pass::transform::create_symbol_dce());
     if pass_manager.run(&mut module).is_err() {
         return Err(vec![
-            "MLIR-to-LLVM lowering pass failed (linalg-to-loops)".to_string(),
+            "MLIR-to-LLVM lowering pass failed (symbol-dce)".to_string(),
+        ]);
+    }
+
+    // `--convert-linalg-to-affine-loops`, not the ordinary `-to-loops`
+    // (`scf.for`) -- see the structured-vectorization stage right below for
+    // why: `--affine-super-vectorize` only operates on `affine.for`.
+    let pass_manager = pass::PassManager::new(&context);
+    pass_manager.add_pass(pass::linalg::create_convert_linalg_to_affine_loops_pass());
+    if pass_manager.run(&mut module).is_err() {
+        return Err(vec![
+            "MLIR-to-LLVM lowering pass failed (linalg-to-affine-loops)".to_string(),
         ]);
     }
 
@@ -485,7 +504,63 @@ fn emit_object(
     // FMA -- decides to fuse, on the now-already-vectorized form).
     mark_mulf_addf_contract(&context, &mut module);
 
+    // Structured vectorization -- found and verified directly against this
+    // toolchain, not assumed: `--affine-super-vectorize` (MLIR's own
+    // `affine.for`-level auto-vectorizer) genuinely packs the matmul
+    // accumulation loop into real `vector.transfer_read`/`write` on
+    // `vector<16xf32>` (16 = AVX-512's own width for `f32` on this host --
+    // still correct, just needing more than one register, on a narrower
+    // target) -- confirmed end-to-end down to clean `llvm.fmul`/`llvm.fadd`
+    // on `vector<16xf32>`, zero leftover `unrealized_conversion_cast`,
+    // `--convert-vector-to-llvm` below resolves it fully. `mark_mulf_addf_
+    // contract` runs *before* this stage specifically so the `fastmath
+    // <contract>` attribute survives vectorization onto the now-vector-
+    // typed `arith.mulf`/`addf` pair -- letting LLVM's backend fuse them
+    // into a *packed* `vfmaddXXXps` at instruction-selection time, the
+    // fix for the scalar-FMA regression noted above, now compounded with
+    // deterministic (not opportunistic) vectorization instead of hoping
+    // LLVM's own loop vectorizer recognizes the pattern on its own.
+    //
+    // `--affine-super-vectorize` errors ("NYI: non-trivial layout map") on
+    // any *cross-function-boundary* memref (the `strided<[?,?],offset:?>`
+    // shape `bufferize-function-boundaries=true` gives every tensor-typed
+    // function parameter/return) -- `--inline` (above) already moves every
+    // *real* call site's own computation onto purely local, non-strided
+    // memrefs, which vectorize cleanly, but the *original*, now-
+    // unreferenced callee declarations were still left behind (`--inline`
+    // never deletes them on its own) carrying that same strided shape --
+    // confirmed directly (not assumed) that melior's own `PassManager::run`
+    // treats this as a genuine failure (`Result::Err`), unlike raw `mlir-
+    // opt`'s own exit code on the same input, which stayed 0 despite the
+    // identical diagnostic -- a real, load-bearing discrepancy between the
+    // two, found by testing both, not just one. Fixed at the source, not
+    // worked around here: `--symbol-dce` above, now actually able to see
+    // these declarations as private+unreferenced (`lower_program`'s own
+    // `sym_visibility` stamping, `mlir_lower.rs`), removes them before this
+    // stage ever runs.
+    // `AffineVectorize` is restricted to run *on* `func.func`, not
+    // `builtin.module` directly (found directly: melior's own returned
+    // parse error names this exactly -- "restricted to 'func.func' ...
+    // did you intend to nest?") -- needs the same `outer(inner(...))`
+    // nesting `mlir-opt`'s own `--pass-pipeline=` flag would, unlike `one-
+    // shot-bufferize` above, which really does run at the module level.
     let pass_manager = pass::PassManager::new(&context);
+    pass::affine::register_affine_vectorize();
+    if parse_pass_pipeline(
+        pass_manager.as_operation_pass_manager(),
+        "builtin.module(func.func(affine-super-vectorize{virtual-vector-size=16}))",
+    )
+    .is_err()
+        || pass_manager.run(&mut module).is_err()
+    {
+        return Err(vec![
+            "MLIR-to-LLVM lowering pass failed (affine-super-vectorize)".to_string(),
+        ]);
+    }
+
+    let pass_manager = pass::PassManager::new(&context);
+    pass_manager.add_pass(pass::conversion::create_lower_affine());
+    pass_manager.add_pass(pass::conversion::create_vector_to_llvm());
     pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
     pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());

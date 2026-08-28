@@ -519,8 +519,18 @@ fn real_main() -> ExitCode {
                         pass_manager.add_pass(pass::conversion::create_bufferization_to_mem_ref());
                         let ok = ok && pass_manager.run(&mut module).is_ok();
 
+                        // `--symbol-dce` -- see `pipeline.rs::emit_object`'s
+                        // own identical stage for the full story.
                         let pass_manager = pass::PassManager::new(&context);
-                        pass_manager.add_pass(pass::linalg::create_convert_linalg_to_loops_pass());
+                        pass_manager.add_pass(pass::transform::create_symbol_dce());
+                        let ok = ok && pass_manager.run(&mut module).is_ok();
+
+                        // `--convert-linalg-to-affine-loops`, not `-to-loops`
+                        // -- see `pipeline.rs::emit_object`'s own identical
+                        // stage for the full story.
+                        let pass_manager = pass::PassManager::new(&context);
+                        pass_manager
+                            .add_pass(pass::linalg::create_convert_linalg_to_affine_loops_pass());
                         let ok = ok && pass_manager.run(&mut module).is_ok();
 
                         // FMA fusion -- see `pipeline.rs::emit_object`'s own
@@ -528,7 +538,22 @@ fn real_main() -> ExitCode {
                         // own doc comment) for the full story.
                         mark_mulf_addf_contract(&context, &mut module);
 
+                        // Structured vectorization -- see `pipeline.rs::
+                        // emit_object`'s own identical stage for the full
+                        // story.
                         let pass_manager = pass::PassManager::new(&context);
+                        pass::affine::register_affine_vectorize();
+                        let ok = ok
+                            && parse_pass_pipeline(
+                                pass_manager.as_operation_pass_manager(),
+                                "builtin.module(func.func(affine-super-vectorize{virtual-vector-size=16}))",
+                            )
+                            .is_ok()
+                            && pass_manager.run(&mut module).is_ok();
+
+                        let pass_manager = pass::PassManager::new(&context);
+                        pass_manager.add_pass(pass::conversion::create_lower_affine());
+                        pass_manager.add_pass(pass::conversion::create_vector_to_llvm());
                         pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
                         pass_manager.add_pass(pass::conversion::create_to_llvm());
                         pass_manager
@@ -689,15 +714,26 @@ fn real_main() -> ExitCode {
             return ExitCode::FAILURE;
         }
 
+        // `--symbol-dce` -- see `pipeline.rs::emit_object`'s own identical
+        // stage for the full story.
+        let pass_manager = pass::PassManager::new(&context);
+        pass_manager.add_pass(pass::transform::create_symbol_dce());
+        if pass_manager.run(&mut module).is_err() {
+            eprintln!("error: MLIR-to-LLVM lowering pass failed");
+            return ExitCode::FAILURE;
+        }
+
         // Stage 3: ordinary lowering to the `llvm` dialect — `scf.if` (and
         // any other structured-control-flow op) has no direct LLVM IR
         // translation of its own -- `-convert-scf-to-cf` lowers it to the
         // `cf` dialect's ordinary branches first, which `-convert-to-llvm`
         // *does* know how to translate. Skipping this produced a hard
         // native crash (STATUS_ACCESS_VIOLATION), not a clean Rust-level
-        // error -- found by direct testing.
+        // error -- found by direct testing. `--convert-linalg-to-affine-
+        // loops`, not `-to-loops` -- see `pipeline.rs::emit_object`'s own
+        // identical stage for the full story.
         let pass_manager = pass::PassManager::new(&context);
-        pass_manager.add_pass(pass::linalg::create_convert_linalg_to_loops_pass());
+        pass_manager.add_pass(pass::linalg::create_convert_linalg_to_affine_loops_pass());
         if pass_manager.run(&mut module).is_err() {
             eprintln!("error: MLIR-to-LLVM lowering pass failed");
             return ExitCode::FAILURE;
@@ -708,7 +744,24 @@ fn real_main() -> ExitCode {
         // full story.
         mark_mulf_addf_contract(&context, &mut module);
 
+        // Structured vectorization -- see `pipeline.rs::emit_object`'s own
+        // identical stage for the full story.
         let pass_manager = pass::PassManager::new(&context);
+        pass::affine::register_affine_vectorize();
+        if parse_pass_pipeline(
+            pass_manager.as_operation_pass_manager(),
+            "builtin.module(func.func(affine-super-vectorize{virtual-vector-size=16}))",
+        )
+        .is_err()
+            || pass_manager.run(&mut module).is_err()
+        {
+            eprintln!("error: MLIR-to-LLVM lowering pass failed");
+            return ExitCode::FAILURE;
+        }
+
+        let pass_manager = pass::PassManager::new(&context);
+        pass_manager.add_pass(pass::conversion::create_lower_affine());
+        pass_manager.add_pass(pass::conversion::create_vector_to_llvm());
         pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
         pass_manager.add_pass(pass::conversion::create_to_llvm());
         pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());

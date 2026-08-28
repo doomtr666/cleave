@@ -516,7 +516,21 @@ fn a_direct_mlir_call_lowers_to_the_named_op_with_no_declaration() {
     assert!(text.contains("arith.addi"), "got:\n{text}");
     // Unlike `extern`, a raw MLIR op call needs no `func.func` declaration
     // at all -- it's not a symbol to resolve, just an op to emit directly.
-    assert!(!text.contains("func.func private"), "got:\n{text}");
+    // Checked precisely by symbol name, not by a blanket "no `func.func
+    // private` anywhere in the dump" -- `lower_program` now stamps every
+    // *other*, genuinely internal function (`Ring::zero<...>` and friends,
+    // pulled in by `use num;` regardless of whether this program's own
+    // `main` ever calls them) `sym_visibility = "private"` too (`pipeline.
+    // rs`'s own structured-vectorization stage needs `--symbol-dce` to see
+    // them as removable), which MLIR's own pretty-printer renders as this
+    // same `func.func private` prefix -- unrelated to this test's actual
+    // claim, which is specifically about `arith.addi` never needing a
+    // declared symbol of its own.
+    assert!(
+        !text.contains("func.func private @\"arith.addi\"")
+            && !text.contains("func.func private @arith.addi"),
+        "got:\n{text}"
+    );
 }
 
 #[test]

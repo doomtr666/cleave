@@ -9,7 +9,7 @@ fn main() {
     data::init(&format!("{manifest_dir}/.cache"));
 
     let start = std::time::Instant::now();
-    let accuracy = unsafe { train_and_evaluate(1, 0.05, 1) };
+    let accuracy = unsafe { train_and_evaluate(10, 0.001, 1) };
     let elapsed = start.elapsed();
     println!("test accuracy: {accuracy}");
     println!("elapsed: {elapsed:?}");
