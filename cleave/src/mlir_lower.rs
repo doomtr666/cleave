@@ -87,6 +87,25 @@ struct LowerCtx<'c, 'm> {
     /// Every `struct`'s own declared shape (`cps::collect_struct_schemas`) —
     /// see `struct_llvm_type`'s own doc comment.
     struct_schemas: HashMap<String, StructSchema>,
+    /// Every top-level function name `region_analysis::find_region_local_
+    /// functions` proved safe to lower with `cleave_alloc_local` at each of
+    /// its own construction sites — see that module's own doc comment for
+    /// the real analysis, and `alloc_llvm_value`'s own doc comment for how
+    /// this set actually gets consulted.
+    region_local_fns: HashSet<String>,
+    /// Whether the top-level function *currently* being lowered
+    /// (`lower_top_level_fn`, which sets this once per function, before
+    /// lowering that function's own body) is in `region_local_fns` — a
+    /// `Cell`, not threaded as an ordinary parameter, for the same reason
+    /// `declared_externs` above is a `RefCell`: a cross-cutting fact about
+    /// *which function's body* is presently being lowered, needed deep
+    /// inside `alloc_llvm_value` (many call frames down from `lower_top_
+    /// level_fn` itself), not something worth threading as an explicit
+    /// parameter through every intervening `lower_cexpr`/`lower_prim_op`
+    /// call. Never actually re-entrant (this project lowers one top-level
+    /// function's own body at a time, start to finish, before moving to the
+    /// next), so a plain `Cell<bool>` — not a stack — is enough.
+    currently_region_local: std::cell::Cell<bool>,
 }
 
 /// Builds one MLIR `Module` containing every top-level function in
@@ -113,6 +132,7 @@ pub fn lower_program<'c>(
             )
         })
         .collect();
+    let region_local_fns = crate::region_analysis::find_region_local_functions(program);
     {
         // Scoped so `ctx`'s own borrow of `module` ends before `module` is
         // moved out below.
@@ -123,6 +143,8 @@ pub fn lower_program<'c>(
             signatures,
             mlir_types: mlir_types.clone(),
             struct_schemas,
+            region_local_fns,
+            currently_region_local: std::cell::Cell::new(false),
         };
         for f in &program.funcs {
             let op = lower_top_level_fn(&ctx, f);
@@ -685,6 +707,8 @@ fn lower_top_level_fn<'c>(ctx: &LowerCtx<'c, '_>, f: &CTopLevelFn) -> Operation<
         env.insert(var, block.argument(i).unwrap().into());
     }
 
+    ctx.currently_region_local
+        .set(ctx.region_local_fns.contains(&f.def.name));
     lower_cexpr(ctx, &block, env, f.k_ret, result_type, &[], &f.def.body);
 
     let region = Region::new();
@@ -795,13 +819,22 @@ fn lower_top_level_fn<'c>(ctx: &LowerCtx<'c, '_>, f: &CTopLevelFn) -> Operation<
 /// original, unpushed slice for whatever runs after the join/loop — ordinary
 /// flow resumes there, with that join/loop's own name no longer a valid
 /// target. Empty at a function's own top-level body.
+///
+/// Each entry's own third field (`YieldTarget`'s own doc comment) is `Some
+/// (region_handle)` for a *loop's* own self-recursive target (`lower_loop`
+/// pushes it, having just called `cleave_region_enter` itself) and `None`
+/// for an ordinary `if`-join (`lower_if` never closes a region — only a
+/// loop's own tail-recursive "continue" genuinely marks the end of one
+/// iteration).
+type YieldTarget<'c, 'a> = (&'a str, &'a [Type<'c>], Option<Value<'c, 'c>>);
+
 fn lower_cexpr<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
     mut env: HashMap<CVar, Value<'c, 'c>>,
     k_ret: CVar,
     result_type: Type<'c>,
-    yield_targets: &[(&str, &[Type<'c>])],
+    yield_targets: &[YieldTarget<'c, '_>],
     expr: &CExpr,
 ) {
     match expr {
@@ -826,11 +859,11 @@ fn lower_cexpr<'c>(
         CExpr::App {
             func: CVal::Label(name),
             args,
-        } if yield_targets.iter().any(|(n, _)| *n == name.as_str()) => {
+        } if yield_targets.iter().any(|(n, _, _)| *n == name.as_str()) => {
             let location = Location::unknown(ctx.context);
-            let (_, types) = yield_targets
+            let (_, types, region_handle) = yield_targets
                 .iter()
-                .find(|(n, _)| *n == name.as_str())
+                .find(|(n, _, _)| *n == name.as_str())
                 .unwrap();
             // `CVal::Unit` filtered out here, same as the `return` arm above
             // and for the same reason -- an `if`-join's own value position
@@ -843,6 +876,28 @@ fn lower_cexpr<'c>(
                 .zip(*types)
                 .map(|(a, &t)| lower_cval(ctx.context, block, &env, a, t))
                 .collect();
+            // A loop's own "continue" target carries a real region handle
+            // (`YieldTarget`'s own doc comment) -- this iteration's own
+            // region closes exactly here, right before yielding the next
+            // iteration's carried state, the mirror image of `lower_loop`'s
+            // own `cleave_region_enter` at the body's start. An `if`-join's
+            // own target never does (`region_handle` is `None`) -- an `if`
+            // is not an iteration boundary.
+            if let Some(handle) = region_handle {
+                ensure_extern_declared(
+                    ctx,
+                    "cleave_region_exit",
+                    &[Ty::Con("i64".to_string())],
+                    &[],
+                );
+                block.append_operation(func::call(
+                    ctx.context,
+                    FlatSymbolRefAttribute::new(ctx.context, "cleave_region_exit"),
+                    &[*handle],
+                    &[],
+                    location,
+                ));
+            }
             block.append_operation(scf::r#yield(&values, location));
         }
         CExpr::LetPrim {
@@ -957,7 +1012,7 @@ fn lower_if<'c>(
     env: HashMap<CVar, Value<'c, 'c>>,
     k_ret: CVar,
     result_type: Type<'c>,
-    yield_targets: &[(&str, &[Type<'c>])],
+    yield_targets: &[YieldTarget<'c, '_>],
     join: &CFunDef,
     cond: &CVal,
     then_branch: &CExpr,
@@ -995,8 +1050,9 @@ fn lower_if<'c>(
     // continuation, after the `scf.if` is built, uses instead (see
     // `lower_cexpr`'s own doc comment for why this needs to be a stack, not
     // a single replaced slot).
-    let mut inner_targets: Vec<(&str, &[Type<'c>])> = yield_targets.to_vec();
-    inner_targets.push((&join.name, &join_types));
+    let mut inner_targets: Vec<YieldTarget<'c, '_>> = yield_targets.to_vec();
+    // `None` -- an `if`-join is never an iteration boundary, see `YieldTarget`'s own doc comment.
+    inner_targets.push((&join.name, &join_types, None));
 
     let then_block = Block::new(&[]);
     lower_cexpr(
@@ -1093,7 +1149,7 @@ fn lower_loop<'c>(
     env: HashMap<CVar, Value<'c, 'c>>,
     k_ret: CVar,
     result_type: Type<'c>,
-    yield_targets: &[(&str, &[Type<'c>])],
+    yield_targets: &[YieldTarget<'c, '_>],
     loop_def: &CFunDef,
     initial_args: &[CVal],
 ) {
@@ -1271,12 +1327,56 @@ fn lower_loop<'c>(
     for (i, &p) in loop_def.params.iter().enumerate() {
         after_env.insert(p, after_block.argument(i).unwrap().into());
     }
+
+    // `doc/hld.md`'s own "Memory management" section, the arena's first
+    // real application (`region_analysis.rs`'s own module doc comment has
+    // the full reasoning): one region per loop *iteration*, opened here at
+    // the very start of the body, closed by `lower_cexpr`'s own `App`-to-
+    // `yield_targets` arm right before this same iteration's own tail-call
+    // (`YieldTarget`'s own doc comment) — spanning the *whole* iteration,
+    // not just an individual call within it, because a region-local
+    // function's own result can genuinely need to stay valid past its own
+    // call returning (`net_grad`'s own `g.2`, read afterward by `Optimizer
+    // ::step`, is exactly this shape) — safe to open unconditionally, even
+    // around calls that are *not* region-local (`Optimizer::step`'s own
+    // allocation sites never call `cleave_alloc_local` at all, regardless
+    // of whether a region happens to be open around their execution — the
+    // decision was already made once, per allocation *site*, at compile
+    // time, `alloc_llvm_value`'s own doc comment).
+    let i64_ty: Type = IntegerType::new(context, 64).into();
+    ensure_extern_declared(
+        ctx,
+        "cleave_region_enter",
+        &[Ty::Con("i64".to_string())],
+        &[i64_ty],
+    );
+    let zero_size = after_block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(i64_ty, 0).into(),
+            location,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let region_handle: Value = after_block
+        .append_operation(func::call(
+            context,
+            FlatSymbolRefAttribute::new(context, "cleave_region_enter"),
+            &[zero_size],
+            &[i64_ty],
+            location,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+
     // Pushed onto a *fresh* `Vec` for the body — the original `yield_targets`
     // (without this entry) is what the loop-exit continuation, after the
     // `scf.while` is built, uses instead (see `lower_cexpr`'s own doc
     // comment for why this needs to be a stack, not a single replaced slot).
-    let mut inner_targets: Vec<(&str, &[Type<'c>])> = yield_targets.to_vec();
-    inner_targets.push((&loop_def.name, &carried_types));
+    let mut inner_targets: Vec<YieldTarget<'c, '_>> = yield_targets.to_vec();
+    inner_targets.push((&loop_def.name, &carried_types, Some(region_handle)));
     lower_cexpr(
         ctx,
         &after_block,
@@ -1332,7 +1432,7 @@ fn lower_real_call<'c>(
     env: HashMap<CVar, Value<'c, 'c>>,
     k_ret: CVar,
     result_type: Type<'c>,
-    yield_targets: &[(&str, &[Type<'c>])],
+    yield_targets: &[YieldTarget<'c, '_>],
     k: &CFunDef,
     callee: &str,
     args: &[CVal],
@@ -2781,6 +2881,23 @@ fn lower_release_cascade<'c>(
 /// array's own embedded `!llvm.array` (`ty_to_mlir`'s `Ty::Array` arm,
 /// `array_leaf_is_struct`), which needs the exact same "outlives the call
 /// that built it" property a struct does.
+/// **Picks `cleave_alloc_rc` vs `cleave_alloc_local` here, once, per
+/// construction site** — the *only* place this decision gets made, since
+/// `alloc_llvm_value` is already the one shared allocation primitive every
+/// struct/array construction goes through (this function's own doc comment
+/// above). `ctx.currently_region_local` (set once per top-level function,
+/// `lower_top_level_fn`) is the deciding fact: `true` exactly when *this*
+/// function's own name is in `region_analysis::find_region_local_
+/// functions`'s own returned set — i.e., this function has exactly one
+/// call site in the whole program, inside a loop, and its own result never
+/// reaches that loop's own carried (escaping) state (`region_analysis.rs`'s
+/// own module doc comment has the full reasoning). `cleave_alloc_local`'s
+/// own `handle` parameter is passed as a literal `0` — never actually read
+/// (`cleave-rt::cleave_alloc_local`'s own doc comment: correctness comes
+/// from `REGION_DEPTH` being genuinely nonzero at the call, checked by
+/// `assert_region_open`, not from the handle's own value) — so there's no
+/// need to thread the real region handle `lower_loop`'s own `cleave_region_
+/// enter` call returns all the way down to here.
 fn alloc_llvm_value<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
@@ -2790,16 +2907,31 @@ fn alloc_llvm_value<'c>(
     let location = Location::unknown(context);
     let ptr_ty = llvm::r#type::pointer(context, 0);
     let size = llvm_type_size_bytes(ctx, block, llvm_ty);
+    let i64_ty: Type = IntegerType::new(context, 64).into();
+    let (symbol, call_args): (&str, Vec<Value>) = if ctx.currently_region_local.get() {
+        let zero_handle = block
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(i64_ty, 0).into(),
+                location,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        ("cleave_alloc_local", vec![zero_handle, size])
+    } else {
+        ("cleave_alloc_rc", vec![size])
+    };
     ensure_extern_declared(
         ctx,
-        "cleave_alloc_rc",
-        &[Ty::Con("i64".to_string())],
+        symbol,
+        &vec![Ty::Con("i64".to_string()); call_args.len()],
         &[ptr_ty],
     );
     let call_op = block.append_operation(func::call(
         context,
-        FlatSymbolRefAttribute::new(context, "cleave_alloc_rc"),
-        &[size],
+        FlatSymbolRefAttribute::new(context, symbol),
+        &call_args,
         &[ptr_ty],
         location,
     ));

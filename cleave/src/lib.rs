@@ -15,5 +15,7 @@ pub mod parser;
 pub mod pipeline;
 pub mod print;
 pub mod refcount;
+pub mod region_analysis;
 pub mod registry;
 pub mod rust_bindings;
+pub mod unify_alloc;

@@ -17,6 +17,7 @@ use crate::egraph::{DerivativeRequest, optimize_program, synthesize_derivatives}
 use crate::mlir_lower::lower_program;
 use crate::refcount::insert_refcounting;
 use crate::registry::Registry;
+use crate::unify_alloc::unify_tensor_allocations;
 use melior::Context;
 use melior::dialect::DialectRegistry;
 use melior::ir::{BlockLike, Module, RegionLike};
@@ -227,6 +228,10 @@ pub unsafe fn register_cleave_rt_symbols(engine: &melior::ExecutionEngine) {
         engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
         engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
         engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
+        engine.register_symbol("cleave_release_void", cleave_rt::cleave_release_void as *mut ());
+        engine.register_symbol("cleave_alloc_local", cleave_rt::cleave_alloc_local as *mut ());
+        engine.register_symbol("cleave_region_enter", cleave_rt::cleave_region_enter as *mut ());
+        engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
         engine.register_symbol("dynarray_alloc_i8", cleave_rt::dynarray_alloc_i8 as *mut ());
         engine.register_symbol("dynarray_grow_i8", cleave_rt::dynarray_grow_i8 as *mut ());
         engine.register_symbol("dynarray_get_i8", cleave_rt::dynarray_get_i8 as *mut ());
@@ -582,6 +587,12 @@ fn emit_object(
             "MLIR-to-LLVM lowering pass failed (to-llvm)".to_string(),
         ]);
     }
+
+    // Gives cleave sole ownership of every tensor payload's own physical
+    // memory -- see `unify_alloc.rs`'s own module doc comment for why this
+    // runs *here* specifically (right after `--convert-to-llvm`, not
+    // before) and why a blanket rename is sound.
+    unify_tensor_allocations(&context, &mut module);
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], true, false);
     // SAFETY: see `register_cleave_rt_symbols`'s own doc comment.

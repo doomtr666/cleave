@@ -141,6 +141,28 @@ unsafe fn rc_header(ptr: *mut u8) -> *mut RcHeader {
 /// inserted needs real CPS-level escape-analysis work, `doc/hld.md`'s own
 /// still-open "exactly where retain/release operations get inserted" item)
 /// — so nothing existing changes behavior by this landing.
+/// **Deliberately *not* region-aware, on purpose, after a real design
+/// correction** (`doc/backlog.md` — an earlier version of this function
+/// *did* implicitly draw from the arena whenever a `cleave_region_enter`
+/// was open anywhere in the dynamic call stack, reverted once a real
+/// target case showed why that's unsound: `Optimizer::step`'s own call, in
+/// `examples/mnist-interop`'s real training loop, runs *nested inside* the
+/// exact same open region `net_grad`'s own call needs — for `g.2` (`net_
+/// grad`'s own result) to stay valid for the whole time `Optimizer::step`
+/// is reading it, the region can't close before `Optimizer::step` returns,
+/// but `Optimizer::step`'s *own* newly-built `w`/`b` tensors are precisely
+/// what escapes *past* that same `region_exit` (they become next
+/// iteration's `net`/`state`). A single ambient "is some region open" flag
+/// cannot tell these two calls' own allocation sites apart — they're both
+/// live at the exact same moment. The only sound place to make that
+/// distinction is per allocation *site*, at compile time, not per dynamic
+/// call at runtime — matching `doc/hld.md`'s own four-operation interface
+/// more literally than the reverted version did: `alloc_escaping` (this
+/// function, unconditionally heap-backed, the *default* for anything not
+/// individually proven local) and `alloc_local` (`cleave_alloc_local`,
+/// below — explicit, opt-in, only ever emitted at a site the compiler has
+/// actually proven safe) are two genuinely different entry points, not one
+/// function silently branching on ambient state.
 #[unsafe(no_mangle)]
 pub extern "C" fn cleave_alloc_rc(data_size: i64) -> *mut u8 {
     let total = RC_HEADER_SIZE + data_size as usize;
@@ -194,15 +216,257 @@ pub unsafe extern "C" fn cleave_release(ptr: *mut u8) -> bool {
         let header = rc_header(ptr);
         (*header).refcount -= 1;
         if (*header).refcount == 0 {
-            let data_size = (*header).data_size;
-            let total = RC_HEADER_SIZE + data_size as usize;
-            let layout =
-                std::alloc::Layout::from_size_align(total, 16).expect("cleave_release: invalid layout");
-            std::alloc::dealloc(header as *mut u8, layout);
+            // Arena-backed (`cleave_alloc_rc`'s own doc comment): never
+            // individually freed here — the matching `cleave_region_exit`
+            // reclaims it in bulk, along with everything else allocated
+            // since. Still correctly reports `true` below either way: a
+            // struct's own cascading release into its refcounted fields
+            // (`mlir_lower.rs::lower_release_cascade`) must still fire
+            // once *this* container's own count genuinely reaches zero,
+            // regardless of which physical allocator backs it.
+            if !is_in_arena(header as *mut u8) {
+                let data_size = (*header).data_size;
+                let total = RC_HEADER_SIZE + data_size as usize;
+                let layout = std::alloc::Layout::from_size_align(total, 16)
+                    .expect("cleave_release: invalid layout");
+                std::alloc::dealloc(header as *mut u8, layout);
+            }
             true
         } else {
             false
         }
+    }
+}
+
+/// Total bytes reserved for the CPU-backend arena (`doc/hld.md`'s own
+/// "Memory management" section: "one large reserved VM region... pages
+/// committed lazily, exactly like an ordinary thread's own call stack").
+/// A real OS-level `VirtualAlloc`-style lazy-commit reservation is the
+/// eventual target (matching that section's own wording exactly) — this
+/// first cut allocates the whole capacity eagerly, through the ordinary
+/// system allocator, the simplest correct thing that already gives every
+/// `cleave_region_enter`/`cleave_alloc_local`/`cleave_region_exit` call
+/// below a real, working backing store to test against. 256 MiB: bigger
+/// than any single training-loop iteration's own local footprint this
+/// project's own real workload (`examples/mnist-interop`, per-sample
+/// tensors well under a megabyte) plausibly needs — a real number to
+/// revisit once a real workload's own peak region depth is measured, not
+/// a permanent ceiling; `cleave_alloc_local`'s own overflow check exists
+/// specifically so exceeding it fails loudly rather than corrupting
+/// whatever memory happens to sit past the reserved region.
+const ARENA_CAPACITY: usize = 256 * 1024 * 1024;
+
+/// The arena's own base address, lazily allocated on first use —
+/// `AtomicUsize` (an address, not a `*mut u8`) purely so this can be a
+/// `static` at all (raw pointers aren't `Sync`) — the same reasoning
+/// `PCG_STATE`'s own doc comment gives for using an atomic type here
+/// despite this runtime being single-threaded by design throughout
+/// (`doc/hld.md`'s own "Threading" paragraph, which explicitly names this
+/// exact region/pool/refcount scheme as staying non-atomic by design):
+/// `Ordering::Relaxed` everywhere below, no real concurrency, just a
+/// `Sync`-satisfying container for otherwise-plain mutable state.
+static ARENA_BASE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Byte offset of the arena's own current bump cursor, relative to
+/// `ARENA_BASE` — `cleave_region_enter`/`cleave_alloc_local`/`cleave_
+/// region_exit` below are the only three operations that ever touch it.
+static ARENA_CURSOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// How many `cleave_region_enter` calls are currently open, without a
+/// matching `cleave_region_exit` yet. **Not** consulted by `cleave_alloc_
+/// rc` (that function's own doc comment has the real design reasoning why
+/// not) — this exists purely so `cleave_alloc_local` can debug-assert it's
+/// never emitted at a site with no region actually open, a real compiler-
+/// bug detector, not a runtime branch point. A *count*, not a bool,
+/// because regions nest (`rc_tests`'s own nesting coverage, below) — an
+/// inner `region_exit`, with an outer region still open, must leave this
+/// above zero.
+static REGION_DEPTH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Returns the arena's own base address, allocating the whole reserved
+/// region on the very first call (from whichever of the three arena
+/// functions below runs first — deliberately not tied to process startup,
+/// so a program that never uses the arena at all never pays for it).
+fn arena_base() -> *mut u8 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let existing = ARENA_BASE.load(Relaxed);
+    if existing != 0 {
+        return existing as *mut u8;
+    }
+    let layout =
+        std::alloc::Layout::from_size_align(ARENA_CAPACITY, 64).expect("cleave_region_enter: invalid arena layout");
+    let base = unsafe { std::alloc::alloc(layout) };
+    assert!(!base.is_null(), "cleave_region_enter: arena allocation failed");
+    ARENA_BASE.store(base as usize, Relaxed);
+    base
+}
+
+/// Bumps `size` bytes off the arena's own cursor, 16-byte aligned — matches
+/// `cleave_alloc_rc`'s own `Layout::from_size_align(total, 16)` exactly
+/// (not this project's own 64-byte vectorization width: checked directly,
+/// the disassembled tensor-payload accesses reached through `cleave_
+/// alloc_rc` already use the *unaligned* masked-load/store forms, `vmovups
+/// `/`llvm.intr.masked.load`, not `vmovaps` — 64-byte alignment was never
+/// actually assumed for this allocator's own output, only for the
+/// unrelated, separately-`alignment = 64`-tagged `memref.alloc()` locals
+/// `mlir_lower.rs::alloc_llvm_value` builds) — bumps the cursor forward,
+/// returns the pre-bump address. The one real bump-allocation primitive:
+/// `cleave_alloc_local` (`doc/hld.md`'s own named entry point) is this
+/// function's only caller.
+fn arena_bump(size: usize) -> *mut u8 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let base = arena_base();
+    let cursor = ARENA_CURSOR.load(Relaxed);
+    let aligned = (cursor + 15) & !15;
+    let new_cursor = aligned + size;
+    assert!(
+        new_cursor <= ARENA_CAPACITY,
+        "cleave arena exhausted ({new_cursor} > {ARENA_CAPACITY} bytes) -- \
+         a real overflow path (grow, or fall back to the ordinary allocator) is not built yet"
+    );
+    ARENA_CURSOR.store(new_cursor, Relaxed);
+    unsafe { base.add(aligned) }
+}
+
+/// Whether `ptr` falls inside the arena's own reserved address range —
+/// `cleave_release`'s own arena-vs-heap decision (its own doc comment).
+/// `ARENA_BASE == 0` (the arena has never been used at all in this
+/// process) short-circuits to `false` directly, rather than comparing
+/// against a base of `0` — a real heap pointer is never `0`, but relying
+/// on that coincidence instead of checking explicitly would be the kind
+/// of "probably fine" this codebase's own established discipline avoids.
+fn is_in_arena(ptr: *mut u8) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let base = ARENA_BASE.load(Relaxed);
+    if base == 0 {
+        return false;
+    }
+    let addr = ptr as usize;
+    addr >= base && addr < base + ARENA_CAPACITY
+}
+
+/// `doc/hld.md`'s own `region_enter(size) -> handle` — the CPU backend for
+/// it ("`region_enter`/`region_exit` as pointer arithmetic... exactly like
+/// an ordinary thread's own call stack", same section). `size` is accepted
+/// (matching that interface's own signature — a future caller may want to
+/// pre-validate against it) but not consumed by one eager bump here:
+/// `cleave_alloc_local` below does the actual per-value bumping, each call
+/// already knowing its own exact size, and nothing between `region_enter`/
+/// `region_exit` needs `size` for anything else yet. The *handle* returned
+/// is simply the cursor's own value at entry — `cleave_region_exit`
+/// rewinds straight back to it, discarding everything allocated since,
+/// unconditionally, matching the region scheme's own "provably dead the
+/// instant the tail call fires" premise (`doc/hld.md`, same section):
+/// nothing is meant to call `cleave_region_enter` for a value the compiler
+/// hasn't already proven doesn't escape past the matching `region_exit`.
+/// A plain `i64` offset, not a pointer — an arena that later grows (or
+/// moves) can still honor an old handle; a raw `*mut u8` captured before a
+/// hypothetical reallocation couldn't.
+#[unsafe(no_mangle)]
+pub extern "C" fn cleave_region_enter(_size: i64) -> i64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    arena_base();
+    REGION_DEPTH.fetch_add(1, Relaxed);
+    ARENA_CURSOR.load(Relaxed) as i64
+}
+
+/// `doc/hld.md`'s own `alloc_local(handle, size) -> ptr` — carves `size`
+/// bytes out of the arena at the current cursor (16-byte aligned — see
+/// `arena_bump`'s own doc comment for why 16, not this project's own
+/// 64-byte vectorization width), bumps the cursor forward. `handle` (the region this
+/// allocation conceptually belongs to) isn't itself read here —
+/// correctness only needs the matching `cleave_region_exit` to eventually
+/// rewind past it, not a per-allocation check against it (nesting is a
+/// strict stack discipline by construction, enforced by `region_enter`/
+/// `region_exit` call *pairing*, not by this function auditing individual
+/// allocations against their own handle).
+///
+/// **Writes the exact same `RcHeader` `cleave_alloc_rc` does, at the same
+/// relative offset** — not a separate, lighter-weight shape. The compiler
+/// picks `cleave_alloc_rc` vs `cleave_alloc_local` once, per allocation
+/// *site*, at compile time (`cleave_alloc_rc`'s own doc comment); every
+/// `cleave_retain`/`cleave_release` call downstream is emitted by the
+/// *same* codegen either way, with no idea which allocator actually backed
+/// the value it's touching — so both must produce an identical header, or
+/// retain/release would read garbage off a bare arena allocation with no
+/// header at all. `size` is `data_size` alone, matching `cleave_alloc_rc`'s
+/// own parameter convention exactly — the header's own extra bytes are
+/// accounted for here, not by the caller.
+///
+/// `REGION_DEPTH == 0` at this call is *always* a genuine compiler bug
+/// (this function must only ever be emitted at a site already inside a
+/// matching `region_enter`/`region_exit` pair) — `assert_region_open`
+/// (right below) catches it loudly and unconditionally (not gated behind
+/// `debug_assertions` — this project's own established convention is
+/// testing under `cargo test --release`, which disables it by default; a
+/// check that only exists in debug builds would never actually run under
+/// that workflow), the same posture `cleave_alloc_rc`'s own `assert!(!
+/// base.is_null(), ...)` already takes on its own always-on allocation-
+/// failure check. A separate, plain (not `extern "C"`) function rather
+/// than an inline `assert!` here, purely so this crate's own tests can
+/// `catch_unwind` it directly: a panic *inside* an `extern "C"` function
+/// cannot unwind at all (confirmed directly — Rust aborts the whole
+/// process instead, `panic_cannot_unwind`, not something `catch_unwind`
+/// can observe), so the only way to test this check's own panic behavior
+/// is to keep it in an ordinary Rust function `cleave_alloc_local` merely
+/// calls into.
+fn assert_region_open() {
+    use std::sync::atomic::Ordering::Relaxed;
+    assert!(
+        REGION_DEPTH.load(Relaxed) > 0,
+        "cleave_alloc_local called with no region open -- a real compiler bug, \
+         never a legitimate runtime condition"
+    );
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn cleave_alloc_local(_handle: i64, size: i64) -> *mut u8 {
+    assert_region_open();
+    let total = RC_HEADER_SIZE + size as usize;
+    let base = arena_bump(total);
+    unsafe {
+        let header = base as *mut RcHeader;
+        (*header).refcount = 1;
+        (*header).data_size = size;
+        base.add(RC_HEADER_SIZE)
+    }
+}
+
+/// `doc/hld.md`'s own `region_exit(handle)` — "a pointer rewind, nothing
+/// more" (that section's own words, for the CPU backend specifically):
+/// every byte allocated since the matching `region_enter` becomes
+/// available for reuse, unconditionally, no per-object bookkeeping, no
+/// `cleave_release` calls needed for anything that lived purely in this
+/// region.
+#[unsafe(no_mangle)]
+pub extern "C" fn cleave_region_exit(handle: i64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    ARENA_CURSOR.store(handle as usize, Relaxed);
+    REGION_DEPTH.fetch_sub(1, Relaxed);
+}
+
+/// `cleave_release`'s own `bool` result ("did this call actually free the
+/// block"), discarded — matches `free`'s own `(ptr) -> ()` C signature
+/// exactly. Exists purely so `unify_alloc.rs`'s own `llvm.call @free` ->
+/// `llvm.call @cleave_release_void` rewrite can be a **plain callee-symbol
+/// rename**, nothing else: melior's own `remove_from_parent` is confirmed
+/// unsafe to call at all on real ops from this pipeline (`dps_rewrite.rs`'s
+/// own doc comment on `memcpy`, and — checked again here, since a *
+/// different* op kind isn't automatically covered by that same finding —
+/// on `memref.dealloc`/`memref.alloc` too: erasing either one succeeds at
+/// the call site itself but corrupts internal state that only crashes
+/// later, at module teardown), so *rebuilding* a call op with a different
+/// result arity (`free`'s `()` vs `cleave_release`'s own `i1`) is exactly
+/// the kind of erase-and-replace this project's own established discipline
+/// avoids wherever a same-shape alternative exists instead. `llvm.call
+/// @malloc(size) -> ptr` already matches `cleave_alloc_rc`'s own real
+/// signature byte-for-byte, needing no such wrapper at all — this one
+/// exists only because `free`'s own C signature returns nothing.
+///
+/// # Safety
+/// See `rc_header`'s own safety contract — `ptr` must be a live `cleave_
+/// alloc_rc` result.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cleave_release_void(ptr: *mut u8) {
+    unsafe {
+        cleave_release(ptr);
     }
 }
 
@@ -222,55 +486,75 @@ unsafe fn rc_count(ptr: *mut u8) -> i64 {
 mod rc_tests {
     use super::*;
 
+    /// One test, deliberately, covering `cleave_alloc_rc`/`cleave_retain`/
+    /// `cleave_release`/`cleave_release_void` *and* the arena (`cleave_
+    /// region_enter`/`cleave_alloc_local`/`cleave_region_exit`) together —
+    /// the same reasoning `rand_tests::pcg32_behaves_correctly` already
+    /// gives for consolidating everything touching one piece of shared
+    /// global state into a single test: `REGION_DEPTH`/`ARENA_CURSOR` are
+    /// process-wide, and splitting the arena-touching checks into separate
+    /// `#[test]` fns would let one test's own open region race another's
+    /// `cleave_alloc_local` call (or the "no region open" check just
+    /// below) into seeing state left behind by a *different*, concurrently
+    /// running test — an intermittent failure with no bug in either
+    /// mechanism. `cleave_alloc_rc` itself no longer touches this state at
+    /// all (`cleave_alloc_rc`'s own doc comment — a real design correction,
+    /// not the original plan) — kept consolidated anyway, since it's
+    /// simplest to keep every test that touches *any* of this file's own
+    /// shared global mutable state (PCG state excepted, already its own
+    /// separate consolidated test) in one place, not because it strictly
+    /// needs to be any more.
     #[test]
-    fn a_fresh_allocation_starts_at_refcount_one() {
+    fn refcounting_and_the_arena_behave_correctly() {
+        // `cleave_alloc_local` outside any open region is a real compiler
+        // bug (its own doc comment) — the assertion exists to catch it
+        // loudly, unconditionally (not debug-only — this project's own
+        // tests run under `--release`). Checked here, first, before this
+        // same test opens any region of its own, so `REGION_DEPTH` is
+        // genuinely `0` at this point (no other test touches this state
+        // concurrently — see this test's own doc comment above for why
+        // that matters).
+        {
+            let result = std::panic::catch_unwind(assert_region_open);
+            assert!(result.is_err(), "assert_region_open with no open region should panic");
+        }
+
         unsafe {
+            // -- Ordinary (no region open) `cleave_alloc_rc` --
             let ptr = cleave_alloc_rc(8);
             assert_eq!(rc_count(ptr), 1);
+            assert!(
+                !is_in_arena(ptr),
+                "no region is open here -- this must be an ordinary heap allocation"
+            );
             cleave_release(ptr);
-        }
-    }
 
-    #[test]
-    fn retain_increments_and_release_decrements() {
-        unsafe {
             let ptr = cleave_alloc_rc(8);
             cleave_retain(ptr);
             assert_eq!(rc_count(ptr), 2);
             cleave_release(ptr);
             assert_eq!(rc_count(ptr), 1);
             cleave_release(ptr);
-        }
-    }
 
-    #[test]
-    fn the_underlying_data_region_is_genuinely_readable_and_writable() {
-        // Real proof this isn't just header bookkeeping — the returned
-        // pointer is a real, correctly-offset, correctly-sized data region,
-        // not just something that satisfies the refcount tests alone.
-        unsafe {
+            // Real proof this isn't just header bookkeeping — the returned
+            // pointer is a real, correctly-offset, correctly-sized data
+            // region, not just something that satisfies the refcount
+            // checks alone.
             let ptr = cleave_alloc_rc(8) as *mut i64;
             *ptr = 0x1234_5678_9abc_def0;
             assert_eq!(*ptr, 0x1234_5678_9abc_def0);
             cleave_release(ptr as *mut u8);
-        }
-    }
 
-    // A "release-to-zero actually calls dealloc, not just zeroes the count"
-    // test was tried here and removed, not left red: it asserted a fresh
-    // allocation reuses the just-freed address, found directly to be
-    // unreliable against the real system allocator (Windows' own allocator
-    // doesn't guarantee immediate reuse the way some allocators' fast paths
-    // do) — a real, non-deterministic property this test can't black-box
-    // verify without a custom `#[global_allocator]` tracking wrapper, not
-    // worth building for this one check. `cleave_release`'s own source is
-    // a five-line, directly-readable `if refcount == 0 { dealloc(...) }` —
-    // the refcount-reaches-zero tests above already cover the part that's
-    // actually load-bearing.
+            // A "release-to-zero actually calls dealloc, not just zeroes
+            // the count" check was tried here and removed, not left red:
+            // it asserted a fresh allocation reuses the just-freed
+            // address, found directly to be unreliable against the real
+            // system allocator (Windows' own allocator doesn't guarantee
+            // immediate reuse the way some allocators' fast paths do) — a
+            // real, non-deterministic property this test can't black-box
+            // verify without a custom `#[global_allocator]` tracking
+            // wrapper, not worth building for this one check.
 
-    #[test]
-    fn multiple_independent_allocations_track_separate_counts() {
-        unsafe {
             let a = cleave_alloc_rc(8);
             let b = cleave_alloc_rc(8);
             cleave_retain(a);
@@ -279,8 +563,128 @@ mod rc_tests {
             cleave_release(a);
             cleave_release(a);
             cleave_release(b);
+
+            let ptr = cleave_alloc_rc(8) as *mut i64;
+            *ptr = 42;
+            cleave_retain(ptr as *mut u8);
+            assert_eq!(rc_count(ptr as *mut u8), 2);
+            cleave_release_void(ptr as *mut u8);
+            assert_eq!(
+                rc_count(ptr as *mut u8),
+                1,
+                "one release_void call should drop the count by exactly one, same as release"
+            );
+            // Second (final) release through the real `cleave_release` --
+            // confirms `release_void`'s own first call genuinely shares the
+            // same header/count `cleave_release` itself uses, not a
+            // separate bookkeeping path.
+            assert!(
+                cleave_release(ptr as *mut u8),
+                "the final release should report that it actually freed the block"
+            );
+        }
+
+        // -- The arena itself, `cleave_region_enter`/`cleave_alloc_local`/
+        // `cleave_region_exit` --
+
+        // A single allocation is real, writable memory of the requested
+        // size — not just an address that satisfies bookkeeping alone.
+        let h0 = cleave_region_enter(64);
+        let p0 = cleave_alloc_local(h0, 64) as *mut i64;
+        unsafe {
+            *p0 = 0x1234_5678_9abc_def0;
+            assert_eq!(*p0, 0x1234_5678_9abc_def0);
+        }
+        cleave_region_exit(h0);
+
+        // Two allocations in the same region land at different,
+        // non-overlapping addresses.
+        let h1 = cleave_region_enter(256);
+        let a = cleave_alloc_local(h1, 64);
+        let b = cleave_alloc_local(h1, 64);
+        assert_ne!(a, b, "two live allocations must not overlap");
+        unsafe {
+            std::ptr::write_bytes(a, 0xaa, 64);
+            std::ptr::write_bytes(b, 0xbb, 64);
+            assert_eq!(*a, 0xaa, "writing through `b` must not have touched `a`");
+            assert_eq!(*b, 0xbb);
+        }
+        cleave_region_exit(h1);
+
+        // `region_exit` really rewinds — a fresh allocation right after
+        // reuses the exact address just freed (the bump cursor moved
+        // back, not forward past it).
+        let h2 = cleave_region_enter(64);
+        let reused = cleave_alloc_local(h2, 64);
+        assert_eq!(reused, a, "region_exit should have rewound the cursor back to `a`'s own address");
+        cleave_region_exit(h2);
+
+        // Nesting: entering a second region *inside* a still-open one,
+        // exiting the inner one, must leave the outer region's own
+        // already-live allocation completely untouched.
+        let outer = cleave_region_enter(128);
+        let outer_ptr = cleave_alloc_local(outer, 64) as *mut i64;
+        unsafe {
+            *outer_ptr = 111;
+        }
+        let inner = cleave_region_enter(64);
+        let inner_ptr = cleave_alloc_local(inner, 64) as *mut i64;
+        unsafe {
+            *inner_ptr = 222;
+        }
+        cleave_region_exit(inner);
+        unsafe {
+            assert_eq!(*outer_ptr, 111, "exiting the nested inner region corrupted the outer one's own live data");
+        }
+        cleave_region_exit(outer);
+
+        // 16-byte alignment, unconditionally (`arena_bump`'s own doc
+        // comment has the real reasoning for 16, not 64).
+        let h3 = cleave_region_enter(256);
+        let p = cleave_alloc_local(h3, 17) as usize; // an odd size on purpose
+        assert_eq!(p % 16, 0, "alloc_local's own result must be 16-byte aligned");
+        cleave_region_exit(h3);
+
+        // -- `cleave_alloc_local`, refcount-header-compatible --
+        // `cleave_alloc_rc` is deliberately *not* region-aware any more
+        // (its own doc comment has the real design correction) -- a
+        // program that never opens a region gets ordinary heap allocation
+        // throughout, unconditionally.
+        unsafe {
+            let heap_ptr = cleave_alloc_rc(8);
+            assert!(!is_in_arena(heap_ptr), "no region open -- cleave_alloc_rc must stay heap-backed");
+            cleave_release(heap_ptr);
+        }
+
+        // `cleave_alloc_local` writes the *exact same* header shape --
+        // real, correctly-offset `refcount`/`data_size` fields, not just
+        // raw bump-allocated bytes -- so `cleave_retain`/`cleave_release`
+        // (emitted identically by the same codegen regardless of which
+        // allocator actually backed a given value) work on it exactly as
+        // they would on a `cleave_alloc_rc` result.
+        unsafe {
+            let h = cleave_region_enter(64);
+            let ptr = cleave_alloc_local(h, 8);
+            assert!(is_in_arena(ptr), "should be arena-backed inside an open region");
+            assert_eq!(rc_count(ptr), 1, "cleave_alloc_local must write a real, correct RcHeader");
+            cleave_retain(ptr);
+            assert_eq!(rc_count(ptr), 2);
+            // Dropping back to a live count of 1 must *not* attempt to
+            // free anything (arena-backed) -- if it wrongly tried to
+            // `dealloc` arena memory, this would crash outright.
+            assert!(!cleave_release(ptr), "should not report freed while still retained");
+            // Reaching zero on an arena-backed allocation reports `true`
+            // (needed for cascading release, `cleave_release`'s own doc
+            // comment) but must not crash by trying to `dealloc` memory
+            // that was never individually `alloc`'d.
+            assert!(
+                cleave_release(ptr),
+                "reaching zero must still report true even when arena-backed, for cascading release"
+            );
+            cleave_region_exit(h);
         }
     }
+
 }
 
 /// De-risks the extern/array ABI boundary in isolation, before string

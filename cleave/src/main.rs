@@ -569,6 +569,9 @@ fn real_main() -> ExitCode {
                             eprintln!("error: MLIR-to-LLVM lowering pass failed");
                             exit = ExitCode::FAILURE;
                         } else {
+                            // See `unify_alloc.rs`'s own module doc comment
+                            // for why this runs here specifically.
+                            cleave::unify_alloc::unify_tensor_allocations(&context, &mut module);
                             print!("{}", module.as_operation());
                         }
                     }
@@ -781,6 +784,10 @@ fn real_main() -> ExitCode {
             eprintln!("error: MLIR-to-LLVM lowering pass failed");
             return ExitCode::FAILURE;
         }
+
+        // See `unify_alloc.rs`'s own module doc comment for why this runs
+        // here specifically.
+        cleave::unify_alloc::unify_tensor_allocations(&context, &mut module);
 
         let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
         // SAFETY: see `cleave::pipeline::register_cleave_rt_symbols`'s own

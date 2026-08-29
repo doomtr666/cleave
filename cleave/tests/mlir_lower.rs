@@ -217,6 +217,10 @@ fn a_compiled_program_actually_runs_and_returns_the_right_value() {
         engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
         engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
         engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
+        engine.register_symbol("cleave_release_void", cleave_rt::cleave_release_void as *mut ());
+        engine.register_symbol("cleave_alloc_local", cleave_rt::cleave_alloc_local as *mut ());
+        engine.register_symbol("cleave_region_enter", cleave_rt::cleave_region_enter as *mut ());
+        engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
     }
     let mut out: i32 = -1;
     unsafe {
@@ -411,6 +415,10 @@ fn run_i32_from_cps(
         engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
         engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
         engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
+        engine.register_symbol("cleave_release_void", cleave_rt::cleave_release_void as *mut ());
+        engine.register_symbol("cleave_alloc_local", cleave_rt::cleave_alloc_local as *mut ());
+        engine.register_symbol("cleave_region_enter", cleave_rt::cleave_region_enter as *mut ());
+        engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
         engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
         engine.register_symbol("rand_seed", cleave_rt::rand_seed as *mut ());
         engine.register_symbol("rand_uniform_f32", cleave_rt::rand_uniform_f32 as *mut ());
@@ -5574,4 +5582,69 @@ fn display_of_a_rank_2_tensor_renders_correctly() {
             ok
         }"#;
     assert_eq!(run_i32(&context, src), 1);
+}
+
+/// Real, end-to-end exercise of `region_analysis`/`cleave_alloc_local`/
+/// `cleave_region_enter`/`cleave_region_exit` wired together
+/// (`mlir_lower.rs::alloc_llvm_value`/`lower_loop`) -- `make_boxed`'s own
+/// result (`b`) is read once, through a field projection (`b.v`), by an
+/// ordinary arithmetic op feeding the loop's own carried `acc`; `b` itself
+/// (and the `Boxed` struct it names) never reaches the carried state, so
+/// `region_analysis::find_region_local_functions` should mark `make_boxed`
+/// region-local -- meaning every one of its own 5 iterations' worth of
+/// `Boxed` construction draws from the *same* arena slot, reused after each
+/// `cleave_region_exit` rewinds the cursor back. A wrong wiring here (a
+/// dominance bug, a premature rewind, a wrong allocator choice) would show
+/// up as a wrong sum, not just a crash -- the decisive check.
+#[test]
+fn a_loop_calling_a_region_local_struct_returning_function_computes_correctly() {
+    let context = context();
+    let src = r#"
+        struct Boxed { v: i32 }
+
+        fn make_boxed(x: i32) -> Boxed { Boxed(v: x * 2) }
+
+        fn main() -> i32 {
+            let mut acc: i32 = 0;
+            for i in 0..5 {
+                let b = make_boxed(i);
+                acc = acc + b.v;
+            };
+            acc
+        }
+        "#;
+    // sum of 2*i for i in 0..5 = 2*(0+1+2+3+4) = 20.
+    assert_eq!(run_i32(&context, src), 20);
+}
+
+/// The same shape as above, but with a *nested* struct field (`b.inner.v`)
+/// and a *nested* loop (an outer loop running the inner one twice) -- two
+/// real generalizations worth checking directly, not assumed to follow from
+/// the flat, single-loop case: field-projection tracing through more than
+/// one hop, and `REGION_DEPTH` genuinely nesting (an inner loop's own
+/// `region_exit` must not close the *outer* loop's own still-open region).
+#[test]
+fn region_locality_holds_with_nested_fields_and_a_nested_loop() {
+    let context = context();
+    let src = r#"
+        struct Inner { v: i32 }
+        struct Outer { inner: Inner }
+
+        fn make_outer(x: i32) -> Outer { Outer(inner: Inner(v: x * 3)) }
+
+        fn main() -> i32 {
+            let mut total: i32 = 0;
+            for _pass in 0..2 {
+                let mut acc: i32 = 0;
+                for i in 0..4 {
+                    let o = make_outer(i);
+                    acc = acc + o.inner.v;
+                };
+                total = total + acc;
+            };
+            total
+        }
+        "#;
+    // Inner sum: 3*(0+1+2+3) = 18, run twice by the outer loop -> 36.
+    assert_eq!(run_i32(&context, src), 36);
 }
