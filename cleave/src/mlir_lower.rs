@@ -2031,7 +2031,27 @@ fn lower_tagged_struct_construct<'c>(
     let (dims, _leaf_ty) = flatten_array_dims(field_ty);
     let mut elems = Vec::new();
     flatten_memref_elements(ctx, block, src, &dims, &mut elems);
+
+    // A region-local variant of this construction was tried here (build the
+    // memref explicitly via `cleave_alloc_local`, skip `tensor.from_
+    // elements` entirely — closing a real gap: `load_train_input`/`load_
+    // train_target`, `region_analysis.rs`'s own tests confirm, get marked
+    // region-local correctly but their own tensor-shaped return never
+    // reached `cleave_alloc_local` through the *ordinary* path below,
+    // `tensor.from_elements`'s own physical backing deferred all the way to
+    // One-Shot Bufferize, long after `--inline` has erased which function it
+    // came from). Reverted, not kept: measured directly (VTune, `examples/
+    // mnist-interop`) to reintroduce ~63s of real `memcpy` traffic — the
+    // hand-built memref (via `unrealized_conversion_cast` on a from-scratch
+    // descriptor) is opaque to One-Shot Bufferize's own alias analysis in a
+    // way `tensor.from_elements` itself isn't, so bufferization can no
+    // longer prove downstream reads are copy-free the way it can for the
+    // ordinary path — a real, measured regression, not a hypothetical one.
+    // The struct-boundary half of the region-local mechanism (`alloc_llvm_
+    // value`'s own doc comment) still stands; only this tensor-construction
+    // extension specifically was undone.
     let native_ty = ty_to_mlir(ctx, ty);
+
     let location = Location::unknown(ctx.context);
     let built = OperationBuilder::new(&format!("{keyword}.from_elements"), location)
         .add_operands(&elems)

@@ -5648,3 +5648,14 @@ fn region_locality_holds_with_nested_fields_and_a_nested_loop() {
     // Inner sum: 3*(0+1+2+3) = 18, run twice by the outer loop -> 36.
     assert_eq!(run_i32(&context, src), 36);
 }
+
+// A region-local branch for `Tensor`-typed construction (`lower_tagged_
+// struct_construct`, closing the real gap that `load_train_input`/`load_
+// train_target` were marked region-local but never actually reached
+// `cleave_alloc_local`) was tried here and reverted, not kept -- measured
+// directly (VTune, `examples/mnist-interop`) to reintroduce ~63s of real
+// `memcpy` traffic: the hand-built memref it produced was opaque to One-
+// Shot Bufferize's own alias analysis in a way `tensor.from_elements`
+// itself isn't, so bufferization could no longer prove downstream reads
+// were copy-free the way it can for the ordinary path. The struct-boundary
+// half of the region-local mechanism (the two tests above) still stands.
