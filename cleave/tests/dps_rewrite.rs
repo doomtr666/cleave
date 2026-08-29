@@ -8,11 +8,11 @@
 //! then continues to a real JIT invocation so every test here checks an
 //! *actual computed value*, not just "the verifier didn't complain."
 //!
-//! Every test here uses a plain elementwise op (`Ring::sub`), never
-//! `matmul` -- found the hard way, not by design up front: `linalg.matmul`
-//! genuinely *reads* its own `outs` operand as a reduction accumulator, so
-//! it's deliberately excluded from the rewrite entirely (`dps_rewrite.rs`'s
-//! own doc comment on that exact check has the full story).
+//! Most tests here use a plain elementwise op (`Ring::sub`); a few exercise
+//! `matmul` and the field-forwarding (`Strategy::Passthrough`) shapes too --
+//! see `dps_rewrite.rs`'s own `Strategy` doc comment for why all three need
+//! their own real, distinct safety proof, never assumed from an op's name
+//! alone.
 
 use cleave::cps::{collect_mlir_types, collect_struct_schemas, collect_units, convert_program};
 use cleave::driver::compile;
@@ -300,15 +300,24 @@ fn a_multiply_used_value_is_left_on_the_safe_fallback_path() {
     assert_eq!(value, 99.0, "a[2,3] - b[2,3] should be 99.0");
 }
 
-/// `linalg.matmul` must never match at all -- it genuinely reads its own
-/// `outs` operand as a reduction accumulator (`Ring::zero()`-seeded), so
-/// redirecting it to an uninitialized destination would silently corrupt
-/// the result. A real `matmul`-into-field store must still compute the
-/// right answer, on the always-correct fallback path.
+/// `matmul` (`mlir_lower.rs::build_matmul_no_seed`) builds a genuinely
+/// seed-free `linalg.generic` -- its own `outs` operand is read
+/// conditionally (a reduction-index `arith.select`, never on the branch
+/// that's actually chosen), seeded by `tensor.empty()` rather than a real
+/// zero-splat constant. `dps_rewrite.rs` recognizes this shape as safe to
+/// redirect too (`match_candidate`'s own doc comment on the `linalg.
+/// generic` match arm) -- this test is the numeric half: the rewritten
+/// computation must still give the right answer, not just look
+/// structurally plausible (`matmul_gets_no_seed_and_still_neuters_its_own_
+/// copy`, right below, is the structural half of this same check).
 #[test]
-fn matmul_into_a_struct_field_is_never_rewritten_and_still_computes_correctly() {
+fn matmul_into_a_struct_field_is_rewritten_and_still_computes_correctly() {
     let context = context();
-    let src = r#"
+    let value = run_f32_with_rewrite(&context, MATMUL_SOURCE);
+    assert_eq!(value, 7.0, "matmul(a, identity)[1,2] should equal a[1,2]");
+}
+
+const MATMUL_SOURCE: &str = r#"
         use linalg;
 
         struct Boxed { v: Tensor<f32, 4, 4> }
@@ -334,6 +343,162 @@ fn matmul_into_a_struct_field_is_never_rewritten_and_still_computes_correctly() 
             boxed.v[1, 2]
         }
         "#;
+
+/// Structural check that `matmul` gets *no* zero-fill at all any more (the
+/// whole point of `build_matmul_no_seed` -- a real, measured `memset` this
+/// rewrite used to have to re-establish explicitly, eliminated instead of
+/// preserved -- see that function's own doc comment) *and* that its own
+/// redundant struct-field-store copy still gets neutered exactly the way
+/// the plain elementwise case does -- proving both optimizations compose:
+/// no seed, and no copy.
+#[test]
+fn matmul_gets_no_seed_and_still_neuters_its_own_copy() {
+    let context = context();
+    let text = bufferized_text(&context, MATMUL_SOURCE);
+    assert!(
+        !text.contains("linalg.fill"),
+        "matmul should no longer need any re-seed at all, got:\n{text}"
+    );
+    let memcpy_line = text
+        .lines()
+        .find(|line| line.contains("llvm.intr.memcpy"))
+        .unwrap_or_else(|| panic!("expected a `llvm.intr.memcpy` line, got:\n{text}"));
+    let size_operand = memcpy_line
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(args, _)| args)
+        .unwrap_or_else(|| panic!("could not parse memcpy operands from:\n{memcpy_line}"))
+        .split(',')
+        .nth(2)
+        .map(str::trim)
+        .unwrap_or_else(|| panic!("expected a third (size) operand in:\n{memcpy_line}"));
+    let zero_def = format!("{size_operand} = arith.constant 0 : i64");
+    assert!(
+        text.contains(&zero_def),
+        "expected {size_operand} to be defined as a zero i64 constant, got:\n{text}"
+    );
+}
+
+/// `Strategy::Passthrough`'s own real-world shape (`Sgd`'s own state field,
+/// `stdlib/optim/optim.cleave`): a struct field written not from a fresh
+/// computation at all, but from an *unmodified read* of some other struct's
+/// own field -- `a.v` here, straight through with no `Ring::*` call in
+/// between. `load_native_shape_field`'s own read never copies (that
+/// function's own doc comment), so the value stored into `boxed.v` is
+/// exactly the same live payload `a.v` already reads from -- no fresh
+/// computation for a `linalg.generic`/`linalg.matmul` producer to redirect,
+/// which is exactly what makes this a third, structurally distinct case
+/// from the other two.
+const PASSTHROUGH_SOURCE: &str = r#"
+        use linalg;
+
+        struct Boxed { v: Tensor<f32, 4, 4> }
+
+        fn passthrough(a: Boxed) -> Boxed {
+            Boxed(v: a.v)
+        }
+"#;
+
+#[test]
+fn a_struct_field_written_from_an_unmodified_read_of_another_field_computes_the_right_value() {
+    let context = context();
+    let a = tensor_literal(100.0);
+    let src = format!(
+        r#"
+        {PASSTHROUGH_SOURCE}
+        fn main() -> f32 {{
+            let a: Tensor<f32, 4, 4> = {a};
+            let boxed = Boxed(v: a);
+            let forwarded = passthrough(boxed);
+            forwarded.v[1, 2]
+        }}
+        "#
+    );
+    let value = run_f32_with_rewrite(&context, &src);
+    // a[1,2] = 100 + 6 = 106, unchanged by a pure passthrough.
+    assert_eq!(value, 106.0, "a plain field forward should not change the value");
+}
+
+/// Structural check that the passthrough case actually took `Strategy::
+/// Passthrough`'s own path (share the source pointer directly, `cleave_
+/// retain` it once) rather than silently falling back to the always-correct
+/// copy-based path -- both the real `cleave_retain` call and the neutered
+/// (zero-size) memcpy must be present, proving the rewrite fired and closed
+/// the loop on ownership correctly, not just that the numeric result above
+/// happens to come out right (a leaked-but-still-readable buffer would also
+/// pass the numeric test, right up until it's freed out from under a second
+/// live owner).
+#[test]
+fn the_passthrough_case_retains_the_shared_pointer_and_neuters_its_own_copy() {
+    let context = context();
+    let a = tensor_literal(100.0);
+    let src = format!(
+        r#"
+        {PASSTHROUGH_SOURCE}
+        fn main() -> f32 {{
+            let a: Tensor<f32, 4, 4> = {a};
+            let boxed = Boxed(v: a);
+            let forwarded = passthrough(boxed);
+            forwarded.v[0, 0]
+        }}
+        "#
+    );
+    let text = bufferized_text(&context, &src);
+    assert!(
+        text.contains("call @cleave_retain"),
+        "expected a real cleave_retain call sharing the source pointer, got:\n{text}"
+    );
+    // Two `llvm.intr.memcpy`s exist in this source: the *first* is `let
+    // boxed = Boxed(v: a)` -- a plain literal-to-field write, not caught by
+    // this rewrite at all (its own value comes from `tensor.from_elements`,
+    // none of the three recognized producer shapes) -- and the *second* is
+    // `passthrough`'s own `Boxed(v: a.v)`, the one this test is actually
+    // about. `.last()`, not `.find()` (the first match), picks the right
+    // one.
+    let memcpy_line = text
+        .lines()
+        .filter(|line| line.contains("llvm.intr.memcpy"))
+        .last()
+        .unwrap_or_else(|| panic!("expected a `llvm.intr.memcpy` line, got:\n{text}"));
+    let size_operand = memcpy_line
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(args, _)| args)
+        .unwrap_or_else(|| panic!("could not parse memcpy operands from:\n{memcpy_line}"))
+        .split(',')
+        .nth(2)
+        .map(str::trim)
+        .unwrap_or_else(|| panic!("expected a third (size) operand in:\n{memcpy_line}"));
+    let zero_def = format!("{size_operand} = arith.constant 0 : i64");
+    assert!(
+        text.contains(&zero_def),
+        "expected {size_operand} to be defined as a zero i64 constant, got:\n{text}"
+    );
+}
+
+/// A reduction spanning *multiple* SIMD-vector-width iterations (`--affine-
+/// super-vectorize{virtual-vector-size=16}`, `pipeline.rs`'s own real
+/// setting -- `K=64` here is 4 full vector widths, not just one) --
+/// `matmul_into_a_struct_field_is_rewritten_and_still_computes_correctly`'s
+/// own `K=4` is too small to meaningfully stress the reduction-index
+/// `arith.select` (`build_matmul_no_seed`'s own doc comment) across more
+/// than a single vectorized iteration. All-ones operands give an *exactly*
+/// representable expected value (every output element is exactly `K`, no
+/// rounding ambiguity to hide a real accumulation-order bug behind) --
+/// `assert_eq!`, not an epsilon comparison, is deliberate.
+#[test]
+fn matmul_reduction_is_correct_across_more_than_one_vector_width() {
+    let context = context();
+    let src = r#"
+        use linalg;
+
+        fn main() -> f32 {
+            let a: Tensor<f32, 4, 64> = Tensor::<f32, 4, 64>(data: [[1.0; 64]; 4]);
+            let b: Tensor<f32, 64, 4> = Tensor::<f32, 64, 4>(data: [[1.0; 4]; 64]);
+            let c = matmul(a, b);
+            c[2, 3]
+        }
+        "#;
     let value = run_f32_with_rewrite(&context, src);
-    assert_eq!(value, 7.0, "matmul(a, identity)[1,2] should equal a[1,2]");
+    assert_eq!(value, 64.0, "sum of 64 ones should be exactly 64.0");
 }

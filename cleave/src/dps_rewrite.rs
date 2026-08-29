@@ -49,9 +49,10 @@ use melior::ir::attribute::{
 use melior::ir::operation::{
     OperationBuilder, OperationLike, OperationMutLike, OperationRef, OperationResult,
 };
-use melior::ir::r#type::{IntegerType, MemRefType};
+use melior::ir::r#type::{IntegerType, MemRefType, RankedTensorType};
 use melior::ir::{
-    BlockLike, Identifier, Location, Module, RegionLike, ShapedTypeLike, Type, Value, ValueLike,
+    BlockLike, Identifier, Location, Module, Region, RegionLike, ShapedTypeLike, Type, Value,
+    ValueLike,
 };
 use melior::dialect::{arith, func, llvm};
 
@@ -78,12 +79,49 @@ pub fn eliminate_redundant_field_store_copies<'c>(context: &'c Context, module: 
     }
 }
 
+/// Which of the two shapes `match_candidate` found, and the extra bit each
+/// one needs `rewrite_one` to know beyond `Candidate::producer` itself. `Copy`
+/// (holds nothing but a `usize`) so `rewrite_one` can match on `candidate.
+/// strategy` more than once without fighting the borrow checker over a field
+/// of a struct that also holds non-`Copy` op/value handles.
+#[derive(Clone, Copy)]
+enum Strategy {
+    /// `linalg.generic` (`linalg.matmul`/`linalg.transpose`/plain
+    /// elementwise ops all build this shape -- `match_candidate`'s own doc
+    /// comment on this variant's match site has the full story) -- a fresh
+    /// computation, needs a real destination buffer, no re-seed: whatever
+    /// `outs` holds is already provably don't-care, either because the
+    /// region never reads it at all, or because it was seeded from `tensor.
+    /// empty()` in the first place.
+    Overwrite { outs_index: usize },
+    /// `bufferization.to_tensor`, feeding straight from `load_native_shape_
+    /// field`'s own emission shape -- not a computation at all, `value` is an
+    /// unmodified read of some *other* struct's own tensor field. No fresh
+    /// destination, no linalg op to redirect: `rewrite_one` retains `Candidate
+    /// ::src_ptr` and reuses it directly as the new destination pointer.
+    Passthrough,
+}
+
 /// One matched occurrence of the pattern -- every op in the chain, already
 /// verified to exist and to have the right shape, plus everything the
 /// rewrite needs to build the replacement.
 struct Candidate<'c, 'a> {
+    /// The op that produced the stored value -- `linalg.generic` for
+    /// `Strategy::Overwrite` (the op `rewrite_one` redirects `outs` on), or
+    /// the `bufferization.to_tensor` itself for
+    /// `Strategy::Passthrough` (used there only as an anchor: the position
+    /// everything new gets inserted before). Always has exactly one result,
+    /// checked in `match_candidate`.
     producer: OperationRef<'c, 'a>,
-    outs_index: usize,
+    strategy: Strategy,
+    /// The pointer `memcpy` copies *from* -- for `Strategy::Passthrough`,
+    /// this already points at a real, live `cleave_alloc_rc`'d payload (`load
+    /// _native_shape_field`'s own read never copies -- see that function's
+    /// own doc comment), so `rewrite_one` reuses it directly as the new
+    /// destination pointer instead of building anything fresh, retaining it
+    /// once to reflect the new shared owner. Unused by the other two
+    /// strategies (they build a brand new destination instead).
+    src_ptr: Value<'c, 'a>,
     /// Neutered (its own size operand zeroed), not erased -- see `rewrite_
     /// one`'s own doc comment on why.
     memcpy: OperationRef<'c, 'a>,
@@ -234,77 +272,161 @@ fn match_candidate<'c, 'a>(
     if !op_name_is(extract_ptr, "memref.extract_aligned_pointer_as_index") {
         return None;
     }
-    let to_buffer = defining_op(extract_ptr.operand(0).ok()?)?;
-    if !op_name_is(to_buffer, "bufferization.to_buffer") {
-        return None;
-    }
+    // What `extract_ptr` operates on tells apart the two shapes.
+    // `Overwrite` goes through `bufferization.to_buffer` -- a fresh
+    // `tensor<...>`-typed computation genuinely needs bufferizing to get a
+    // pointer at all. `Strategy::Passthrough` does
+    // *not*: `store_native_shape_field` always builds `to_buffer(value)`
+    // unconditionally (`mlir_lower.rs`'s own code, checked directly, has no
+    // special case for this at all) -- but when `value` is itself `load_
+    // native_shape_field`'s own `to_tensor(cast(load(...)))` result, `--
+    // inline`'s own post-inline cleanup (confirmed directly: this project
+    // runs no separate `--canonicalize` stage at all, so this fold is
+    // coming from the inliner's own simplification pass, not from anything
+    // this rewrite or `pipeline.rs` added on purpose) folds the trivial `to
+    // _buffer(to_tensor(x)) -> x` round trip away before this rewrite ever
+    // runs -- confirmed directly, not assumed, the hard way: an earlier
+    // version of this matcher looked for `bufferization.to_tensor` as the
+    // producer feeding a `to_buffer` exactly the way `Overwrite`'s own
+    // shape works, and it silently never fired at all on this exact,
+    // structurally real case (`Sgd`'s own state passthrough, `stdlib/optim
+    // /optim.cleave`) -- `extract_ptr`'s own operand traced straight to the
+    // `unrealized_conversion_cast` underneath the vanished `to_tensor`,
+    // with no `to_buffer` anywhere in between to match against.
+    let extract_src = defining_op(extract_ptr.operand(0).ok()?)?;
 
-    let value = to_buffer.operand(0).ok()?;
-    let producer = defining_op(value)?;
-    // `linalg.matmul` (and any other reduction-shaped named op) genuinely
-    // *reads* its own `outs` operand -- it's the reduction's own starting
-    // accumulator, not a shape placeholder (confirmed the hard way: an
-    // earlier version of this matcher accepted `linalg.matmul` too, and its
-    // first real test caught exactly this -- `outs` seeded by a real
-    // `Ring::zero()`-derived constant, which this rewrite would have
-    // silently discarded in favor of an *uninitialized* destination buffer,
-    // corrupting the reduction with garbage). `linalg.generic` is only
-    // safe when its own `outs` block argument is *provably unused* inside
-    // the region body -- checked explicitly below, never assumed from the
-    // op name alone.
-    if !op_name_is(producer, "linalg.generic") {
-        return None;
-    }
-    let result = OperationResult::try_from(value).ok()?;
-    if result.result_number() != 0 || producer.result_count() != 1 {
-        return None;
-    }
-    let outs_index = producer.operand_count().checked_sub(1)?;
-    let region = producer.region(0).ok()?;
-    let body = region.first_block()?;
-    let outs_arg: melior::ir::Value = body.argument(outs_index).ok()?.into();
-    if count_uses(body, outs_arg) != 0 {
-        return None;
-    }
-
-    // `%value` must have exactly one real use in the whole module -- the
-    // `to_buffer` above -- for this rewrite to be sound at all (see this
-    // module's own doc comment: redirecting the producer's own destination
-    // changes nothing for a use count of 1, but a second, unrelated reader
-    // of `%value` would silently start reading through a `cleave_alloc_rc`'d
-    // buffer with no retain of its own, a real, if narrow, correctness
-    // risk). No `getUses()`-equivalent is exposed by melior's own bindings
-    // (checked directly) -- counted by hand instead, the same way `--symbol
-    // -dce`-style analyses would.
-    if count_uses(module.body(), value) != 1 {
-        return None;
-    }
-
-    // Still a `tensor<...>` here -- this rewrite runs *before* One-Shot
-    // Bufferize (`dps_rewrite.rs`'s own module doc comment) -- `MemRefType`
-    // doesn't apply yet; found directly (`MemRefType::try_from` on a real
-    // `tensor<4x4xf32>` fails silently via `.ok()?`, the exact reason an
-    // early version of this matcher never fired on a genuinely matching
-    // case at all).
-    let tensor_ty = melior::ir::r#type::RankedTensorType::try_from(result.r#type()).ok()?;
-    let elem_type = tensor_ty.element();
-    let rank = tensor_ty.rank();
-    let mut dims = Vec::with_capacity(rank);
-    for i in 0..rank {
-        // Cleave tensors are always statically, fully shaped -- `Dynamic`
-        // should never occur; bail rather than guess if it somehow does.
-        match tensor_ty.dim_size(i).ok()? {
-            melior::ir::r#type::DimSize::Static(size) => dims.push(size as i64),
-            melior::ir::r#type::DimSize::Dynamic => return None,
+    let (strategy, producer, elem_type, dims) = if op_name_is(extract_src, "bufferization.to_buffer")
+    {
+        let to_buffer = extract_src;
+        let value = to_buffer.operand(0).ok()?;
+        let producer = defining_op(value)?;
+        let result = OperationResult::try_from(value).ok()?;
+        if result.result_number() != 0 || producer.result_count() != 1 {
+            return None;
         }
-    }
+
+        // `linalg.generic` (`linalg.matmul`/`linalg.transpose` both build
+        // this now -- `build_matmul_no_seed`/`build_transpose_no_seed`'s
+        // own doc comments -- as does the common elementwise shape,
+        // `--convert-elementwise-to-linalg`'s own output for `Ring::sub`/
+        // `Scale::scale` and friends): safe whenever its own `outs` block
+        // argument is either
+        //
+        // - *provably unused* inside the region body at all (`transpose`,
+        //   plain elementwise ops -- a pure overwrite, any seed value is
+        //   fine, don't-care by construction), or
+        // - referenced, but only ever fed by `tensor.empty()` (`matmul`) --
+        //   `tensor.empty()` is MLIR's own "genuinely uninitialized, don't-
+        //   care" placeholder; a producer that seeds its *own* accumulator
+        //   from one has *already* committed to tolerating arbitrary
+        //   garbage there (confirmed directly for matmul specifically,
+        //   `build_matmul_no_seed`'s own doc comment: its region only ever
+        //   reads `outs`'s value on the one reduction-index branch it never
+        //   *selects*) -- so redirecting *which* arbitrary garbage sits
+        //   there (a struct's own freshly allocated field storage, instead
+        //   of a separate scratch `tensor.empty()`) changes nothing about
+        //   the result.
+        //
+        // A version of this matcher used to also accept `linalg.matmul`
+        // (the *named* op) seeded by a real zero-splat constant, re-
+        // establishing that same zero-fill explicitly (`linalg.fill`) on
+        // the new destination -- dead since `build_matmul_no_seed` stopped
+        // needing a seed at all (a real, measured `memset` eliminated,
+        // ~9.7% of wall time on `examples/mnist-interop`, not this
+        // rewrite's own concern to preserve).
+        let strategy = if op_name_is(producer, "linalg.generic") {
+            let outs_index = producer.operand_count().checked_sub(1)?;
+            let region = producer.region(0).ok()?;
+            let body = region.first_block()?;
+            let outs_arg: melior::ir::Value = body.argument(outs_index).ok()?.into();
+            if count_uses(body, outs_arg) != 0 {
+                let outs_operand = producer.operand(outs_index).ok()?;
+                let seed = defining_op(outs_operand)?;
+                if !op_name_is(seed, "tensor.empty") {
+                    return None;
+                }
+            }
+            Strategy::Overwrite { outs_index }
+        } else {
+            return None;
+        };
+
+        // `%value` must have exactly one real use in the whole module --
+        // the `to_buffer` above -- for this rewrite to be sound at all (see
+        // this module's own doc comment: redirecting the producer's own
+        // destination changes nothing for a use count of 1, but a second,
+        // unrelated reader of `%value` would silently start reading
+        // through a `cleave_alloc_rc`'d buffer with no retain of its own, a
+        // real, if narrow, correctness risk). No `getUses()`-equivalent is
+        // exposed by melior's own bindings (checked directly) -- counted by
+        // hand instead, the same way `--symbol-dce`-style analyses would.
+        if count_uses(module.body(), value) != 1 {
+            return None;
+        }
+
+        // Still a `tensor<...>` here -- this rewrite runs *before* One-Shot
+        // Bufferize (`dps_rewrite.rs`'s own module doc comment) --
+        // `MemRefType` doesn't apply yet; found directly (`MemRefType::
+        // try_from` on a real `tensor<4x4xf32>` fails silently via `.ok()?`
+        // , the exact reason an early version of this matcher never fired
+        // on a genuinely matching case at all).
+        let tensor_ty = RankedTensorType::try_from(result.r#type()).ok()?;
+        let elem_type = tensor_ty.element();
+        let rank = tensor_ty.rank();
+        let mut dims = Vec::with_capacity(rank);
+        for i in 0..rank {
+            // Cleave tensors are always statically, fully shaped --
+            // `Dynamic` should never occur; bail rather than guess if it
+            // somehow does.
+            match tensor_ty.dim_size(i).ok()? {
+                melior::ir::r#type::DimSize::Static(size) => dims.push(size as i64),
+                melior::ir::r#type::DimSize::Dynamic => return None,
+            }
+        }
+        (strategy, producer, elem_type, dims)
+    } else if op_name_is(extract_src, "builtin.unrealized_conversion_cast") {
+        // `Strategy::Passthrough` -- not a computation at all. `extract_src`
+        // is itself `load_native_shape_field`'s own memref-materializing
+        // cast, feeding `extract_ptr` directly (the `to_tensor`/`to_buffer`
+        // pair that would normally sit here already folded away -- this
+        // block's own doc comment above has the story). `memref_val` is the
+        // exact same live payload some *other* struct's field already
+        // reads from -- `Candidate::src_ptr` (computed at the very top of
+        // this function, from `memcpy`'s own operand(1)) already *is* the
+        // raw pointer extracted from it, so nothing further needs building
+        // here beyond confirming the shape and reading its type.
+        let memref_val = extract_ptr.operand(0).ok()?;
+        let read_descriptor = defining_op(extract_src.operand(0).ok()?)?;
+        if !op_name_is(read_descriptor, "llvm.load") {
+            return None;
+        }
+        // Same "exactly one real use" safety posture as the other two
+        // strategies -- see the doc comment on that same check above.
+        if count_uses(module.body(), memref_val) != 1 {
+            return None;
+        }
+        let memref_ty = MemRefType::try_from(memref_val.r#type()).ok()?;
+        let elem_type = memref_ty.element();
+        let rank = memref_ty.rank();
+        let mut dims = Vec::with_capacity(rank);
+        for i in 0..rank {
+            match memref_ty.dim_size(i).ok()? {
+                melior::ir::r#type::DimSize::Static(size) => dims.push(size as i64),
+                melior::ir::r#type::DimSize::Dynamic => return None,
+            }
+        }
+        (Strategy::Passthrough, extract_src, elem_type, dims)
+    } else {
+        return None;
+    };
 
     let private_size_chain =
         alloc_chain_is_private.then_some((size_zero, size_gep, size_ptrtoint));
 
     Some(Candidate {
         producer,
-        outs_index,
+        strategy,
+        src_ptr,
         memcpy,
         dest_ptr,
         alloc_call,
@@ -466,158 +588,214 @@ fn rewrite_one<'c>(
         .producer
         .block()
         .expect("candidate ops were just found live in a block");
-
-    // Fast path: the size/alloc chain is exclusively this store's own
-    // (`Candidate::private_size_chain`'s own doc comment) -- just relocate
-    // it, zero extra allocation, zero leak. Slow path (CSE-shared): build a
-    // fresh one and neuter the old call's own size instead, accepting a
-    // small, bounded, but real per-store cost rather than risk the
-    // dominance failures relocating a *shared* chain caused directly,
-    // reproducibly, on `examples/mnist-interop`'s own real kernel (absent
-    // from every hand-written test) -- `Candidate::alloc_call`'s own doc
-    // comment has the measured regression neutering exists to fix.
-    let relocated = candidate.private_size_chain.is_some();
-    let new_dest_ptr = if let Some((size_zero, size_gep, size_ptrtoint)) =
-        candidate.private_size_chain
-    {
-        as_mut(size_zero).move_before(candidate.producer);
-        as_mut(size_gep).move_before(candidate.producer);
-        as_mut(size_ptrtoint).move_before(candidate.producer);
-        as_mut(candidate.alloc_call).move_before(candidate.producer);
-        candidate.dest_ptr
-    } else {
-        build_fresh_alloc(
-            context,
-            block,
-            candidate.producer,
-            candidate.elem_type,
-            &candidate.dims,
-        )
-    };
-
-    // Build a real `memref<dims x elem>` view of `new_dest_ptr` -- the same
-    // hand-built-descriptor-plus-`unrealized_conversion_cast` trick `load_
-    // native_shape_field` already relies on, in reverse: there, struct bits
-    // become a memref to read; here, a raw pointer becomes a memref to
-    // write into. Identity layout, no strides needed -- `new_dest_ptr` is a
-    // brand new, densely packed allocation, never aliased or reshaped.
-    let rank = candidate.dims.len();
-    let descriptor_ty = memref_descriptor_llvm_type(context, rank);
     let i64_ty: Type = IntegerType::new(context, 64).into();
-    let zero_i64 = block.insert_operation_before(
-        candidate.producer,
-        arith::constant(context, IntegerAttribute::new(i64_ty, 0).into(), location),
-    );
-    let poison = block.insert_operation_before(candidate.producer, llvm::poison(descriptor_ty, location));
-    let mut descriptor_val: Value = poison.result(0).unwrap().into();
-    for pos in [0i64, 1] {
-        let inserted = block.insert_operation_before(
-            candidate.producer,
-            llvm::insert_value(
-                context,
-                descriptor_val,
-                DenseI64ArrayAttribute::new(context, &[pos]),
-                new_dest_ptr,
-                location,
-            ),
-        );
-        descriptor_val = inserted.result(0).unwrap().into();
-    }
-    let zero_offset: Value = zero_i64.result(0).unwrap().into();
-    let inserted = block.insert_operation_before(
-        candidate.producer,
-        llvm::insert_value(
-            context,
-            descriptor_val,
-            DenseI64ArrayAttribute::new(context, &[2]),
-            zero_offset,
-            location,
-        ),
-    );
-    descriptor_val = inserted.result(0).unwrap().into();
-    // Row-major sizes/strides -- cleave's tensors are always statically,
-    // fully shaped, matching `store_native_shape_field`'s own identical
-    // descriptor-build (mirrored here, not reinvented).
-    let mut stride = 1i64;
-    let mut strides = vec![0i64; rank];
-    for i in (0..rank).rev() {
-        strides[i] = stride;
-        stride *= candidate.dims[i];
-    }
-    for i in 0..rank {
-        let size_const = block.insert_operation_before(
-            candidate.producer,
-            arith::constant(
-                context,
-                IntegerAttribute::new(i64_ty, candidate.dims[i]).into(),
-                location,
-            ),
-        );
-        let inserted = block.insert_operation_before(
-            candidate.producer,
-            llvm::insert_value(
-                context,
-                descriptor_val,
-                DenseI64ArrayAttribute::new(context, &[3, i as i64]),
-                size_const.result(0).unwrap().into(),
-                location,
-            ),
-        );
-        descriptor_val = inserted.result(0).unwrap().into();
-        let stride_const = block.insert_operation_before(
-            candidate.producer,
-            arith::constant(
-                context,
-                IntegerAttribute::new(i64_ty, strides[i]).into(),
-                location,
-            ),
-        );
-        let inserted = block.insert_operation_before(
-            candidate.producer,
-            llvm::insert_value(
-                context,
-                descriptor_val,
-                DenseI64ArrayAttribute::new(context, &[4, i as i64]),
-                stride_const.result(0).unwrap().into(),
-                location,
-            ),
-        );
-        descriptor_val = inserted.result(0).unwrap().into();
-    }
 
-    let memref_ty: Type = MemRefType::new(candidate.elem_type, &candidate.dims, None, None).into();
-    let cast = block.insert_operation_before(
-        candidate.producer,
-        OperationBuilder::new("builtin.unrealized_conversion_cast", location)
-            .add_operands(&[descriptor_val])
-            .add_results(&[memref_ty])
-            .build()
-            .unwrap_or_else(|e| {
-                panic!("dps_rewrite: failed to build unrealized_conversion_cast: {e}")
-            }),
-    );
-    let dest_memref: Value = cast.result(0).unwrap().into();
+    // `relocated` mirrors `Candidate::private_size_chain`'s own doc comment
+    // for `Strategy::Overwrite`: `true` only when the
+    // *existing* alloc/size chain was relocated in place rather than left
+    // behind for the tail below to neuter+release. `Strategy::Passthrough`
+    // never relocates -- it needs no allocation at all, fresh or relocated
+    // (`Candidate::src_ptr`'s own doc comment), so its old `alloc_call` is
+    // always genuinely dead and must always take the neuter+release path,
+    // exactly like the slow (fresh-build) path of the other two strategies.
+    let (new_dest_ptr, relocated) = match candidate.strategy {
+        Strategy::Passthrough => {
+            // Not a fresh computation at all -- `src_ptr` already points at
+            // a real, live `cleave_alloc_rc`'d payload (`load_native_shape_
+            // field`'s own read never copies). Share it directly: one more
+            // `cleave_retain` reflects the new second owner, no allocation,
+            // no descriptor build, no linalg op to redirect at all.
+            //
+            // Inserted right before `memcpy`, *not* before `candidate.
+            // producer` -- `producer` here is the `unrealized_conversion_
+            // cast` that `src_ptr`'s own extraction chain (`extract_ptr`/
+            // `index_cast`/`inttoptr`) is built *from*, so it comes
+            // *earlier* in program order than `src_ptr` itself. Inserting a
+            // use of `src_ptr` before its own definition is a real
+            // dominance violation (confirmed directly, not assumed: this
+            // exact mistake, tried first, failed verification -- "operand
+            // #0 does not dominate this use"). `memcpy` already uses `src_
+            // ptr` as its own second operand, so it's guaranteed to be
+            // dominated by it.
+            ensure_cleave_retain_declared(context, module_body);
+            block.insert_operation_before(
+                candidate.memcpy,
+                func::call(
+                    context,
+                    FlatSymbolRefAttribute::new(context, "cleave_retain"),
+                    &[candidate.src_ptr],
+                    &[],
+                    location,
+                ),
+            );
+            (candidate.src_ptr, false)
+        }
+        Strategy::Overwrite { outs_index } => {
+            // Fast path: the size/alloc chain is exclusively this store's
+            // own (`Candidate::private_size_chain`'s own doc comment) --
+            // just relocate it, zero extra allocation, zero leak. Slow path
+            // (CSE-shared): build a fresh one and neuter the old call's own
+            // size instead, accepting a small, bounded, but real per-store
+            // cost rather than risk the dominance failures relocating a
+            // *shared* chain caused directly, reproducibly, on `examples/
+            // mnist-interop`'s own real kernel (absent from every hand-
+            // written test) -- `Candidate::alloc_call`'s own doc comment has
+            // the measured regression neutering exists to fix.
+            let relocated = candidate.private_size_chain.is_some();
+            let new_dest_ptr = if let Some((size_zero, size_gep, size_ptrtoint)) =
+                candidate.private_size_chain
+            {
+                as_mut(size_zero).move_before(candidate.producer);
+                as_mut(size_gep).move_before(candidate.producer);
+                as_mut(size_ptrtoint).move_before(candidate.producer);
+                as_mut(candidate.alloc_call).move_before(candidate.producer);
+                candidate.dest_ptr
+            } else {
+                build_fresh_alloc(
+                    context,
+                    block,
+                    candidate.producer,
+                    candidate.elem_type,
+                    &candidate.dims,
+                )
+            };
 
-    let tensor_ty = candidate.producer.result(0).unwrap().r#type();
-    let restrict = Attribute::parse(context, "unit")
-        .unwrap_or_else(|| panic!("dps_rewrite: failed to parse `unit` attribute"));
-    let writable = Attribute::parse(context, "unit")
-        .unwrap_or_else(|| panic!("dps_rewrite: failed to parse `unit` attribute"));
-    let to_tensor = block.insert_operation_before(
-        candidate.producer,
-        OperationBuilder::new("bufferization.to_tensor", location)
-            .add_operands(&[dest_memref])
-            .add_results(&[tensor_ty])
-            .add_attributes(&[
-                (Identifier::new(context, "restrict"), restrict),
-                (Identifier::new(context, "writable"), writable),
-            ])
-            .build()
-            .unwrap_or_else(|e| panic!("dps_rewrite: failed to build bufferization.to_tensor: {e}")),
-    );
-    let dest_tensor: Value = to_tensor.result(0).unwrap().into();
+            // Build a real `memref<dims x elem>` view of `new_dest_ptr` --
+            // the same hand-built-descriptor-plus-`unrealized_conversion_
+            // cast` trick `load_native_shape_field` already relies on, in
+            // reverse: there, struct bits become a memref to read; here, a
+            // raw pointer becomes a memref to write into. Identity layout,
+            // no strides needed -- `new_dest_ptr` is a brand new, densely
+            // packed allocation, never aliased or reshaped.
+            let rank = candidate.dims.len();
+            let descriptor_ty = memref_descriptor_llvm_type(context, rank);
+            let zero_i64 = block.insert_operation_before(
+                candidate.producer,
+                arith::constant(context, IntegerAttribute::new(i64_ty, 0).into(), location),
+            );
+            let poison = block
+                .insert_operation_before(candidate.producer, llvm::poison(descriptor_ty, location));
+            let mut descriptor_val: Value = poison.result(0).unwrap().into();
+            for pos in [0i64, 1] {
+                let inserted = block.insert_operation_before(
+                    candidate.producer,
+                    llvm::insert_value(
+                        context,
+                        descriptor_val,
+                        DenseI64ArrayAttribute::new(context, &[pos]),
+                        new_dest_ptr,
+                        location,
+                    ),
+                );
+                descriptor_val = inserted.result(0).unwrap().into();
+            }
+            let zero_offset: Value = zero_i64.result(0).unwrap().into();
+            let inserted = block.insert_operation_before(
+                candidate.producer,
+                llvm::insert_value(
+                    context,
+                    descriptor_val,
+                    DenseI64ArrayAttribute::new(context, &[2]),
+                    zero_offset,
+                    location,
+                ),
+            );
+            descriptor_val = inserted.result(0).unwrap().into();
+            // Row-major sizes/strides -- cleave's tensors are always
+            // statically, fully shaped, matching `store_native_shape_field`
+            // 's own identical descriptor-build (mirrored here, not
+            // reinvented).
+            let mut stride = 1i64;
+            let mut strides = vec![0i64; rank];
+            for i in (0..rank).rev() {
+                strides[i] = stride;
+                stride *= candidate.dims[i];
+            }
+            for i in 0..rank {
+                let size_const = block.insert_operation_before(
+                    candidate.producer,
+                    arith::constant(
+                        context,
+                        IntegerAttribute::new(i64_ty, candidate.dims[i]).into(),
+                        location,
+                    ),
+                );
+                let inserted = block.insert_operation_before(
+                    candidate.producer,
+                    llvm::insert_value(
+                        context,
+                        descriptor_val,
+                        DenseI64ArrayAttribute::new(context, &[3, i as i64]),
+                        size_const.result(0).unwrap().into(),
+                        location,
+                    ),
+                );
+                descriptor_val = inserted.result(0).unwrap().into();
+                let stride_const = block.insert_operation_before(
+                    candidate.producer,
+                    arith::constant(
+                        context,
+                        IntegerAttribute::new(i64_ty, strides[i]).into(),
+                        location,
+                    ),
+                );
+                let inserted = block.insert_operation_before(
+                    candidate.producer,
+                    llvm::insert_value(
+                        context,
+                        descriptor_val,
+                        DenseI64ArrayAttribute::new(context, &[4, i as i64]),
+                        stride_const.result(0).unwrap().into(),
+                        location,
+                    ),
+                );
+                descriptor_val = inserted.result(0).unwrap().into();
+            }
 
-    as_mut(candidate.producer).set_operand(candidate.outs_index, dest_tensor);
+            let memref_ty: Type =
+                MemRefType::new(candidate.elem_type, &candidate.dims, None, None).into();
+            let cast = block.insert_operation_before(
+                candidate.producer,
+                OperationBuilder::new("builtin.unrealized_conversion_cast", location)
+                    .add_operands(&[descriptor_val])
+                    .add_results(&[memref_ty])
+                    .build()
+                    .unwrap_or_else(|e| {
+                        panic!("dps_rewrite: failed to build unrealized_conversion_cast: {e}")
+                    }),
+            );
+            let dest_memref: Value = cast.result(0).unwrap().into();
+
+            let tensor_ty = candidate.producer.result(0).unwrap().r#type();
+            let restrict = Attribute::parse(context, "unit")
+                .unwrap_or_else(|| panic!("dps_rewrite: failed to parse `unit` attribute"));
+            let writable = Attribute::parse(context, "unit")
+                .unwrap_or_else(|| panic!("dps_rewrite: failed to parse `unit` attribute"));
+            let to_tensor = block.insert_operation_before(
+                candidate.producer,
+                OperationBuilder::new("bufferization.to_tensor", location)
+                    .add_operands(&[dest_memref])
+                    .add_results(&[tensor_ty])
+                    .add_attributes(&[
+                        (Identifier::new(context, "restrict"), restrict),
+                        (Identifier::new(context, "writable"), writable),
+                    ])
+                    .build()
+                    .unwrap_or_else(|e| {
+                        panic!("dps_rewrite: failed to build bufferization.to_tensor: {e}")
+                    }),
+            );
+            let dest_tensor: Value = to_tensor.result(0).unwrap().into();
+
+            // No re-seed needed for either producer shape that reaches here
+            // any more (`Strategy::Overwrite`'s own doc comment): whatever
+            // `outs` held before -- unused entirely, or `tensor.empty()`'s
+            // own genuine garbage -- redirecting it to `dest_tensor` is
+            // exactly as safe as the value it replaces.
+            as_mut(candidate.producer).set_operand(outs_index, dest_tensor);
+            (new_dest_ptr, relocated)
+        }
+    };
 
     // The whole copy tail is dead weight now -- `%value` (the producer's
     // own result) still exists and is still what the struct's field
@@ -718,6 +896,41 @@ fn rewrite_one<'c>(
     }
 }
 
+/// Declares `cleave_retain` if this module doesn't already have it -- the
+/// `Strategy::Passthrough` mirror of `ensure_cleave_release_declared` right
+/// below (same reasoning: cheap to check, a real verification failure to
+/// declare the same symbol twice).
+fn ensure_cleave_retain_declared<'c>(context: &'c Context, module_body: melior::ir::BlockRef<'c, '_>) {
+    let mut next = module_body.first_operation();
+    while let Some(op) = next {
+        if op_name_is(op, "func.func")
+            && op
+                .attribute("sym_name")
+                .map(|a| a.to_string() == "\"cleave_retain\"")
+                .unwrap_or(false)
+        {
+            return;
+        }
+        next = op.next_in_block();
+    }
+    let location = Location::unknown(context);
+    let ptr_ty = llvm::r#type::pointer(context, 0);
+    let decl = func::func(
+        context,
+        melior::ir::attribute::StringAttribute::new(context, "cleave_retain"),
+        melior::ir::attribute::TypeAttribute::new(
+            melior::ir::r#type::FunctionType::new(context, &[ptr_ty], &[]).into(),
+        ),
+        Region::new(),
+        &[(
+            Identifier::new(context, "sym_visibility"),
+            melior::ir::attribute::StringAttribute::new(context, "private").into(),
+        )],
+        location,
+    );
+    module_body.append_operation(decl);
+}
+
 /// Declares `cleave_release` if this module doesn't already have it --
 /// virtually always true already in practice (any real program with a
 /// struct-field `Tensor` write, the precondition for this whole rewrite to
@@ -746,7 +959,7 @@ fn ensure_cleave_release_declared<'c>(context: &'c Context, module_body: melior:
         melior::ir::attribute::TypeAttribute::new(
             melior::ir::r#type::FunctionType::new(context, &[ptr_ty], &[bool_ty]).into(),
         ),
-        melior::ir::Region::new(),
+        Region::new(),
         &[(
             Identifier::new(context, "sym_visibility"),
             melior::ir::attribute::StringAttribute::new(context, "private").into(),

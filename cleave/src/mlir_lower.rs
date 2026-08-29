@@ -2303,38 +2303,42 @@ fn store_native_shape_field<'c>(
 
 /// Reads a `Tensor`/`Vector`-typed field's own value back out of its
 /// embedded field storage — the read-side mirror of `store_native_shape_
-/// field`'s own doc comment (same real fix, same reasoning): one ordinary
-/// aggregate `llvm.load`, `builtin.unrealized_conversion_cast` back to
-/// `memref<...>`, a defensive `memref.alloc`+`memref.copy` (see below for
-/// why this is load-bearing, not optional), then `bufferization.to_tensor
-/// ... restrict writable` (the identical `restrict` pattern `Init::xavier`/
-/// `he` already use from cleave source, required by One-Shot Analysis —
-/// found directly, a real MLIR verifier error without it, not guessed) —
-/// no per-element `llvm.getelementptr`+`llvm.load` walk at all.
+/// field`'s own doc comment: one ordinary aggregate `llvm.load`, `builtin.
+/// unrealized_conversion_cast` back to `memref<...>`, then straight into
+/// `bufferization.to_tensor ... restrict` (`restrict` alone, no `writable`
+/// -- see below for why this, not a defensive copy, is the real fix) — no
+/// per-element `llvm.getelementptr`+`llvm.load` walk at all, and (unlike an
+/// earlier version of this function) no copy at all either.
 ///
-/// **The defensive copy is a real, load-bearing fix, not caution for its
-/// own sake — found by direct testing, two distinct real bugs, both
-/// stemming from the same root cause.** `restrict` is `to_tensor`'s own
-/// promise to One-Shot Analysis that *no other reference to this same
-/// buffer exists* — a real lie for a struct field read, since the struct
-/// itself still holds (and will go on using) the exact same underlying
-/// storage `unrealized_conversion_cast` just exposed. Casting the struct's
-/// own field storage directly and calling it `restrict` was confirmed,
-/// directly, to cause: (1) **silent data corruption** — One-Shot
-/// Bufferize, trusting the (false) exclusivity promise, is free to
-/// compute *in place* into that same buffer (confirmed directly: a
-/// `linalg.generic` consuming this value wrote its own result straight
-/// back into the struct's own storage) — reading a field could silently
-/// mutate it; (2) once `--buffer-deallocation-pipeline` (`doc/backlog.md`)
-/// is reintroduced, a **real `STATUS_ACCESS_VIOLATION`/wrong-value bug** —
-/// the pass, trusting the same promise, frees the struct's own storage
-/// once this "exclusively owned" value's own last use passes, leaving a
-/// dangling field. A fresh, genuinely-exclusive copy closes both: nothing
-/// downstream can alias the struct's own storage through this value
-/// anymore, so `restrict`'s promise becomes true, and `--buffer-
-/// deallocation-pipeline` freeing this copy once *it's* done is correct —
-/// exactly the shape confirmed directly, by hand, against this exact
-/// toolchain (`mlir-opt`) before landing here.
+/// **`restrict` alone, without `writable`, is both required and
+/// sufficient — found by direct testing against this exact toolchain, not
+/// assumed.** `restrict` is mandatory: One-Shot Analysis rejects a bare
+/// `to_tensor` outright ("to_tensor ops without `restrict` are not
+/// supported"), so there is no weaker option to fall back to. The real
+/// question this function's own earlier version got wrong was pairing it
+/// with `writable` unconditionally — `writable` is what actually invites
+/// both failure modes a defensive copy used to exist to prevent: (1)
+/// **silent data corruption** — with `writable`, One-Shot Bufferize is
+/// free to compute some *other* op's result straight back into this same
+/// buffer, in place (confirmed directly: a `linalg.generic` consuming this
+/// value wrote its own result into the struct's own storage); (2) once
+/// `--buffer-deallocation-pipeline` runs, a **real `STATUS_ACCESS_
+/// VIOLATION`** — the pass, trusting the "exclusively *owned*" half of the
+/// promise, frees the struct's own storage once this value's own last use
+/// passes. Neither risk is real for a value that's genuinely never written
+/// to: a field read, in cleave's own always-reconstruct-never-mutate
+/// discipline (`doc/hld.md`'s own `struct_llvm_type` doc comment), is
+/// *never* the target of an in-place write anywhere downstream — only
+/// `writable` ever grants that permission in the first place, `restrict`
+/// alone just says "nothing else aliases *this specific SSA value*",
+/// which is true regardless of how many separate reads of the same
+/// underlying field exist elsewhere, each with its own independent cast.
+/// Confirmed directly, by hand, against this exact toolchain (`mlir-opt`):
+/// a `restrict`-but-not-`writable` `to_tensor` is used as-is, with no
+/// buffer materialized for it, by a consuming `linalg.generic`'s own
+/// `ins()`, and `--buffer-deallocation-pipeline` never inserts a `memref.
+/// dealloc` for it at all — only for the *other*, genuinely-owned buffers
+/// (`tensor.empty()`-seeded intermediates) in the same function.
 fn load_native_shape_field<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
@@ -2378,28 +2382,8 @@ fn load_native_shape_field<'c>(
         });
     let memref_val: Value = block.append_operation(cast).result(0).unwrap().into();
 
-    // Defensive copy — see this function's own doc comment above for why
-    // aliasing the struct's own field storage directly and calling it
-    // `restrict` is unsound, confirmed by direct testing. `alloc_array`
-    // already builds exactly this `memref.alloc(memref_ty)` shape for the
-    // unrelated "materialize a local array" case; reused here as-is.
-    let fresh_ty = MemRefType::new(elem_mlir_ty, &dims, None, None);
-    let fresh_val = alloc_array(ctx, block, fresh_ty);
-    let copy = OperationBuilder::new("memref.copy", location)
-        .add_operands(&[memref_val, fresh_val])
-        .build()
-        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build memref.copy: {e}"));
-    block.append_operation(copy);
-
     let native_ty = ty_to_mlir(ctx, field_ty);
     let restrict = Attribute::parse(ctx.context, "unit")
-        .unwrap_or_else(|| panic!("MLIR lowering: failed to parse `unit` attribute"));
-    // `writable`, alongside `restrict` — `fresh_val` really is a fresh,
-    // exclusively-owned local allocation this function just populated, so
-    // (unlike the direct-alias version this replaced) this is no longer a
-    // false promise; letting One-Shot Bufferize compute in place into it
-    // where profitable is exactly the intended, sound optimization.
-    let writable = Attribute::parse(ctx.context, "unit")
         .unwrap_or_else(|| panic!("MLIR lowering: failed to parse `unit` attribute"));
     // `bufferization.to_tensor`/`to_buffer` (`store_native_shape_field`'s own
     // doc comment) are specific to the `tensor`/`memref` pair, not a
@@ -2411,12 +2395,11 @@ fn load_native_shape_field<'c>(
         keyword, "tensor",
         "MLIR lowering: O(1) native-shape field access needs a real memref-backed form, which `#[mlir_type(vector)]` doesn't have"
     );
+    // `restrict`, deliberately alone (no `writable`) -- see this function's
+    // own doc comment for the full story.
     let to_tensor = OperationBuilder::new("bufferization.to_tensor", location)
-        .add_operands(&[fresh_val])
-        .add_attributes(&[
-            (Identifier::new(ctx.context, "restrict"), restrict),
-            (Identifier::new(ctx.context, "writable"), writable),
-        ])
+        .add_operands(&[memref_val])
+        .add_attributes(&[(Identifier::new(ctx.context, "restrict"), restrict)])
         .add_results(&[native_ty])
         .build()
         .unwrap_or_else(|e| panic!("MLIR lowering: failed to build bufferization.to_tensor: {e}"));
@@ -3215,10 +3198,13 @@ fn copy_nested_array<'c>(
 /// (`ExprKind::Call::mlir_attrs`, carried through unchanged: attribute name
 /// -> raw MLIR attribute text, parsed here via `Attribute::parse`). No
 /// per-op-name Rust knowledge anywhere — matches `doc/hld.md`'s own "one
-/// generic 'emit this named MLIR op' primitive" goal directly, with one
-/// deliberate exception (`tensor.extract`'s own variadic-index-array form,
-/// checked first, see below) alongside the pre-existing `linalg.` one
-/// (`build_linalg_region`'s own doc comment).
+/// generic 'emit this named MLIR op' primitive" goal directly, with three
+/// deliberate exceptions, each checked first, before the generic path:
+/// `tensor.extract`'s own variadic-index-array form (see below), and
+/// `linalg.matmul`/`linalg.transpose` (`build_matmul_no_seed`'s own doc
+/// comment — both need a real payload region, which the fully generic
+/// builder never attaches, and matmul specifically needs one shaped a
+/// particular way its own verifier requires).
 ///
 /// Positional arguments need *some* expected MLIR type to materialize a
 /// bare literal against (`mlir::arith::addi(0, x)`) — since there's no
@@ -3305,6 +3291,18 @@ fn lower_raw_mlir_op<'c>(
             }
         }
     }
+    // `linalg.matmul`/`linalg.transpose` — see `build_matmul_no_seed`'s own
+    // doc comment for why these two need real, dedicated Rust code (not the
+    // generic `linalg.`-prefix path just below, and not the *named* ops
+    // that path used to build): both now build their own seed-free
+    // destination internally (`tensor.empty()`, from `result_ty` alone),
+    // so neither reaches here with a third (`init`) argument any more.
+    if op == "linalg.matmul" {
+        return build_matmul_no_seed(ctx, block, env, args, result_ty);
+    }
+    if op == "linalg.transpose" {
+        return build_transpose_no_seed(ctx, block, env, args, attrs, result_ty);
+    }
     let context = ctx.context;
     let operand_ty = args
         .iter()
@@ -3327,19 +3325,10 @@ fn lower_raw_mlir_op<'c>(
         })
         .collect();
     let location = Location::unknown(context);
-    let mut builder = OperationBuilder::new(op, location)
+    let builder = OperationBuilder::new(op, location)
         .add_operands(&arg_values)
         .add_attributes(&parsed_attrs)
         .add_results(&[result_ty]);
-    // The one deliberate, dialect-wide exception to "no per-op-name Rust
-    // knowledge" — see `build_linalg_region`'s own doc comment for why.
-    if op.starts_with("linalg.") {
-        builder = builder.add_regions_vec(vec![build_linalg_region(
-            context,
-            result_ty,
-            arg_values.len(),
-        )]);
-    }
     let built = builder
         .build()
         .unwrap_or_else(|e| panic!("MLIR lowering: failed to build op `{op}`: {e}"));
@@ -3347,77 +3336,276 @@ fn lower_raw_mlir_op<'c>(
     result_op.result(0).unwrap().into()
 }
 
-/// Every *structured* op in the `linalg` dialect needs a real payload
-/// region — even in "named op" form, confirmed by direct testing:
-/// melior/mlir-sys exposes no C++ convenience builder for one (only the
-/// fully generic, `mlirOperationCreate`-style API `lower_raw_mlir_op`
-/// already uses for everything else, which never attaches a region unless
-/// told to — `'linalg.matmul' op requires one region`, a real
-/// verification failure, not a guess). Scoped to the whole `linalg.`
-/// dialect prefix, not one op by name: every structured *contraction*-
-/// family op in it (`matmul`, `batch_matmul`, `dot`, `vecmat`, ...) shares
-/// the identical multiply-accumulate body (`out = out + in0*in1` — the
-/// dialect's own defining semantics for this whole op family, not
-/// something specific to matmul), so synthesizing it generically here is
-/// a real, principled, dialect-family-wide invariant — mirrors `bool`'s
-/// own status as `ty_to_mlir`'s one deliberate structural exception,
-/// rather than a new per-op special case. `result_ty` is the op's own
-/// full (tensor-shaped) result — the block's own scalar argument type is
-/// its element type, recovered via `ShapedTypeLike`; every caller reaching
-/// here is tensor-typed (`tagged_struct_native_type`), so the checked
-/// `RankedTensorType` conversion is expected to always succeed.
-fn build_linalg_region<'c>(
-    context: &'c Context,
+/// Builds `A @ B` (`Tensor<T,N,M> x Tensor<T,M,K> -> Tensor<T,N,K>`) as a
+/// genuinely seed-free `linalg.generic` — no `Ring::zero()`, no `linalg.
+/// fill`, no physical zero-initialization of the destination at all.
+///
+/// **Why this needs real, dedicated Rust code, not the generic `mlir::...`
+/// path every other primitive uses**: `linalg.matmul` (the *named* op this
+/// used to build, via a shared, dialect-family-wide payload-region builder)
+/// is documented as `C := A@B + C` — real BLAS GEMM accumulate semantics,
+/// confirmed the hard way (`stdlib/linalg/matrix.cleave`'s own `matmul`
+/// impl doc comment has the full story of the correctness bug a stale,
+/// uninitialized destination caused the *first* time this code tried
+/// skipping the seed) — and its own verifier *rejects* any payload region
+/// shaped differently from the canonical multiply-then-add (confirmed
+/// directly against this toolchain: `mlir-opt` on a hand-built `arith.
+/// select`-based alternative fails with "expected add/mul op in the
+/// body"). There is no way to keep the *named* op and still avoid a real,
+/// physical seed. `linalg.generic` — the fully generic structured-op form,
+/// with explicit indexing maps built by hand below — has no such
+/// restriction.
+///
+/// **The trick, verified directly against this toolchain (`mlir-opt`, a
+/// scratch probe carried through `--one-shot-bufferize --buffer-
+/// deallocation-pipeline --convert-linalg-to-affine-loops --affine-super-
+/// vectorize --lower-affine --convert-vector-to-llvm --convert-to-llvm`)
+/// before being written here**: the payload region reads `linalg.index 2`
+/// (the current position along the contracted `k` dimension — matmul's own
+/// reduction dim, always the *last* of its three iteration dims by MLIR's
+/// own named-op convention, mirrored here in the hand-built indexing maps)
+/// and `arith.select`s between `a*b` (at `k == 0`, ignoring `outs`'s own
+/// value entirely) and `outs + a*b` (at `k > 0`, accumulating as usual).
+/// Mathematically identical to the zero-seeded version in exact arithmetic
+/// (`0.0 + x == x`, exact under IEEE-754 for any finite `x`) — and confirmed
+/// structurally to survive vectorization unchanged: the `select` lowers to
+/// an ordinary masked `vector.select`/`llvm.select`, no different from any
+/// other elementwise op already in the loop body. `outs`'s own seed
+/// (`tensor.empty()`, genuinely uninitialized) never actually reaches the
+/// final result: the discarded `k == 0` branch's own `outs + a*b` *is*
+/// computed (IEEE-754 float arithmetic on garbage bits is always well-
+/// defined, never UB, just an unspecified *value* — unlike, say, reading
+/// garbage as a pointer) but never *selected*. This is the exact bug this
+/// impl's own history already ran into once (see the doc comment this
+/// replaced, in `stdlib/linalg/matrix.cleave`) — the difference is that bug
+/// came from a region that read `outs` *unconditionally*; this one only
+/// ever reads it on the branch it never picks.
+fn build_matmul_no_seed<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    args: &[CVal],
     result_ty: Type<'c>,
-    operand_count: usize,
-) -> Region<'c> {
+) -> Value<'c, 'c> {
+    let context = ctx.context;
+    let location = Location::unknown(context);
+    let [a_arg, b_arg] = args else {
+        panic!(
+            "MLIR lowering: `mlir::linalg::matmul` needs exactly two operands (`a`, `b`), got {}",
+            args.len()
+        );
+    };
+    // `expected_type` only matters for a bare-literal `CVal` (`lower_cval`'s
+    // own doc comment) — `a`/`b` are always already-typed tensor values here,
+    // so what's passed is irrelevant; `result_ty` is simply whatever is
+    // already on hand.
+    let a = lower_cval(context, block, env, a_arg, result_ty);
+    let b = lower_cval(context, block, env, b_arg, result_ty);
     let elem_ty = RankedTensorType::try_from(result_ty)
         .unwrap_or_else(|e| {
-            panic!("MLIR lowering: a `linalg.*` op's own result must be a ranked tensor: {e}")
+            panic!("MLIR lowering: matmul's own result must be a ranked tensor: {e}")
         })
         .element();
-    let location = Location::unknown(context);
-    let block = Block::new(&vec![(elem_ty, location); operand_count]);
-    let args: Vec<Value> = (0..operand_count)
-        .map(|i| block.argument(i).unwrap().into())
-        .collect();
-    let (ins, out) = args.split_at(args.len() - 1);
-    let out = out[0];
-    // Every `ins` operand multiplied together (the overwhelmingly common
-    // case is exactly two — `matmul`'s own `a`/`b`), then accumulated into
-    // `out` — `reduce` on a single-element `ins` (a unary contraction, if
-    // one existed) returns that element unchanged, no spurious multiply.
-    let product = ins
-        .iter()
-        .copied()
-        .reduce(|acc, x| {
-            let mulf = block.append_operation(
-                OperationBuilder::new("arith.mulf", location)
-                    .add_operands(&[acc, x])
-                    .add_results(&[elem_ty])
-                    .build()
-                    .unwrap(),
-            );
-            mulf.result(0).unwrap().into()
-        })
-        .unwrap_or(out);
-    let sum = block.append_operation(
-        OperationBuilder::new("arith.addf", location)
-            .add_operands(&[out, product])
-            .add_results(&[elem_ty])
-            .build()
-            .unwrap(),
-    );
-    let sum_val: Value = sum.result(0).unwrap().into();
-    block.append_operation(
+    let init = block
+        .append_operation(
+            OperationBuilder::new("tensor.empty", location)
+                .add_results(&[result_ty])
+                .build()
+                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build tensor.empty: {e}")),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    let index_ty = Type::index(context);
+    let payload = Block::new(&[(elem_ty, location), (elem_ty, location), (elem_ty, location)]);
+    let av: Value = payload.argument(0).unwrap().into();
+    let bv: Value = payload.argument(1).unwrap().into();
+    let cv: Value = payload.argument(2).unwrap().into();
+    let k: Value = payload
+        .append_operation(
+            OperationBuilder::new("linalg.index", location)
+                .add_attributes(&[(
+                    Identifier::new(context, "dim"),
+                    IntegerAttribute::new(IntegerType::new(context, 64).into(), 2).into(),
+                )])
+                .add_results(&[index_ty])
+                .build()
+                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build linalg.index: {e}")),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let zero_index: Value = payload
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(index_ty, 0).into(),
+            location,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let is_first: Value = payload
+        .append_operation(
+            OperationBuilder::new("arith.cmpi", location)
+                .add_attributes(&[(
+                    Identifier::new(context, "predicate"),
+                    IntegerAttribute::new(IntegerType::new(context, 64).into(), 0).into(),
+                )])
+                .add_operands(&[k, zero_index])
+                .add_results(&[IntegerType::new(context, 1).into()])
+                .build()
+                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build arith.cmpi: {e}")),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let prod: Value = payload
+        .append_operation(
+            OperationBuilder::new("arith.mulf", location)
+                .add_operands(&[av, bv])
+                .add_results(&[elem_ty])
+                .build()
+                .unwrap(),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let acc: Value = payload
+        .append_operation(
+            OperationBuilder::new("arith.addf", location)
+                .add_operands(&[cv, prod])
+                .add_results(&[elem_ty])
+                .build()
+                .unwrap(),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let sum: Value = payload
+        .append_operation(
+            OperationBuilder::new("arith.select", location)
+                .add_operands(&[is_first, prod, acc])
+                .add_results(&[elem_ty])
+                .build()
+                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build arith.select: {e}")),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    payload.append_operation(
         OperationBuilder::new("linalg.yield", location)
-            .add_operands(&[sum_val])
+            .add_operands(&[sum])
             .build()
             .unwrap(),
     );
     let region = Region::new();
-    region.append_block(block);
-    region
+    region.append_block(payload);
+
+    let indexing_maps = Attribute::parse(
+        context,
+        "[affine_map<(i,j,k) -> (i,k)>, affine_map<(i,j,k) -> (k,j)>, affine_map<(i,j,k) -> (i,j)>]",
+    )
+    .unwrap_or_else(|| panic!("MLIR lowering: failed to parse matmul's own indexing_maps"));
+    let iterator_types = Attribute::parse(
+        context,
+        "[#linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>, #linalg.iterator_type<reduction>]",
+    )
+    .unwrap_or_else(|| panic!("MLIR lowering: failed to parse matmul's own iterator_types"));
+    let built = OperationBuilder::new("linalg.generic", location)
+        .add_operands(&[a, b, init])
+        .add_attributes(&[
+            (Identifier::new(context, "indexing_maps"), indexing_maps),
+            (Identifier::new(context, "iterator_types"), iterator_types),
+            (
+                Identifier::new(context, "operandSegmentSizes"),
+                DenseI32ArrayAttribute::new(context, &[2, 1]).into(),
+            ),
+        ])
+        .add_regions_vec(vec![region])
+        .add_results(&[result_ty])
+        .build()
+        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build matmul's own linalg.generic: {e}"));
+    block.append_operation(built).result(0).unwrap().into()
+}
+
+/// Builds `A^T` as a genuinely seed-free `linalg.transpose` — no `Ring::
+/// zero()`, no physical zero-initialization of the destination at all.
+///
+/// Unlike `matmul` (`build_matmul_no_seed`'s own doc comment), `linalg.
+/// transpose` has no reduction dimension whatsoever — every output element
+/// is touched *exactly once* (a pure permutation, not a contraction) — so
+/// the old shared payload-region builder's `out = out + in` body was never
+/// actually *needed* here at all, only *tolerated*: with a genuinely zero-
+/// filled `out`, `0 + in == in`, the same answer a plain `linalg.yield %av`
+/// (never reading `out` at all) gives directly, with no seed required.
+/// Confirmed directly, not assumed: a hand-built `linalg.transpose` with a
+/// pure-yield region round-trips cleanly through `mlir-opt` (verifies, and
+/// pretty-prints back to the same sugared `linalg.transpose ins(...) outs
+/// (...) permutation = [...]` form a `Ring::zero()`-seeded one already did)
+/// — unlike `linalg.matmul`, this named op's own verifier does not require
+/// the canonical multiply-accumulate shape.
+fn build_transpose_no_seed<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    args: &[CVal],
+    attrs: &[(String, String)],
+    result_ty: Type<'c>,
+) -> Value<'c, 'c> {
+    let context = ctx.context;
+    let location = Location::unknown(context);
+    let [a_arg] = args else {
+        panic!(
+            "MLIR lowering: `mlir::linalg::transpose` needs exactly one operand (`a`), got {}",
+            args.len()
+        );
+    };
+    let a = lower_cval(context, block, env, a_arg, result_ty);
+    let elem_ty = RankedTensorType::try_from(result_ty)
+        .unwrap_or_else(|e| {
+            panic!("MLIR lowering: transpose's own result must be a ranked tensor: {e}")
+        })
+        .element();
+    let init = block
+        .append_operation(
+            OperationBuilder::new("tensor.empty", location)
+                .add_results(&[result_ty])
+                .build()
+                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build tensor.empty: {e}")),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let parsed_attrs: Vec<_> = attrs
+        .iter()
+        .map(|(name, text)| {
+            let attribute = Attribute::parse(context, text).unwrap_or_else(|| {
+                panic!("MLIR lowering: invalid MLIR attribute text `{text}` for `{name}` on `linalg.transpose`")
+            });
+            (Identifier::new(context, name), attribute)
+        })
+        .collect();
+
+    let payload = Block::new(&[(elem_ty, location), (elem_ty, location)]);
+    let av: Value = payload.argument(0).unwrap().into();
+    payload.append_operation(
+        OperationBuilder::new("linalg.yield", location)
+            .add_operands(&[av])
+            .build()
+            .unwrap(),
+    );
+    let region = Region::new();
+    region.append_block(payload);
+
+    let built = OperationBuilder::new("linalg.transpose", location)
+        .add_operands(&[a, init])
+        .add_attributes(&parsed_attrs)
+        .add_regions_vec(vec![region])
+        .add_results(&[result_ty])
+        .build()
+        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build linalg.transpose: {e}"));
+    block.append_operation(built).result(0).unwrap().into()
 }
 
 /// Emits a `func.func private @symbol(param_types) -> result_ty` declaration
