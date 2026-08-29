@@ -2043,7 +2043,7 @@ fn store_field<'c>(
 /// clean, cast-free code under `--finalize-memref-to-llvm --reconcile-
 /// unrealized-casts`, no leftover `unrealized_conversion_cast` in the
 /// output, not a guess about `egg`-style "should fold" wishful thinking.
-fn memref_descriptor_llvm_type<'c>(context: &'c Context, rank: usize) -> Type<'c> {
+pub(crate) fn memref_descriptor_llvm_type<'c>(context: &'c Context, rank: usize) -> Type<'c> {
     let ptr = Type::parse(context, "!llvm.ptr")
         .unwrap_or_else(|| panic!("MLIR lowering: failed to parse `!llvm.ptr`"));
     let i64_ty: Type = IntegerType::new(context, 64).into();

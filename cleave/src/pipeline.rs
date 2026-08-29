@@ -12,6 +12,7 @@ use crate::cps::{
     convert_program, eliminate_dead_code,
 };
 use crate::diag::{Diagnostic, SourceMap};
+use crate::dps_rewrite::eliminate_redundant_field_store_copies;
 use crate::egraph::{DerivativeRequest, optimize_program, synthesize_derivatives};
 use crate::mlir_lower::lower_program;
 use crate::refcount::insert_refcounting;
@@ -393,6 +394,18 @@ fn emit_object(
             "MLIR-to-LLVM lowering pass failed (inline/elementwise-to-linalg/fuse)".to_string(),
         ]);
     }
+
+    // Destination-passing rewrite -- see `dps_rewrite.rs`'s own module doc
+    // comment for the full story (VTune, `examples/mnist-interop`: ~38% of
+    // wall time in unresolved `memcpy`-shaped frames, ~12% more in malloc/
+    // free -- `store_native_shape_field`'s own struct-field-write scratch
+    // copy). Runs *here* specifically -- after `--inline`/`--linalg-fuse-
+    // elementwise-ops` (just above) have already collapsed cross-function
+    // calls into single-function bodies, which is what makes the pattern
+    // this rewrite looks for reachable at all -- and *before* One-Shot
+    // Bufferize (right below), since it operates on the still-`tensor`-
+    // typed, pre-bufferization form of the IR.
+    eliminate_redundant_field_store_copies(&context, &mut module);
 
     let pass_manager = pass::PassManager::new(&context);
     pass::bufferization::register_one_shot_bufferize_pass();

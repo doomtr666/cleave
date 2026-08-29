@@ -20,6 +20,7 @@ use cleave::cps::{
 };
 use cleave::diag::SourceMap;
 use cleave::driver::compile;
+use cleave::dps_rewrite::eliminate_redundant_field_store_copies;
 use cleave::dump::dump_program;
 use cleave::egraph::optimize_program;
 use cleave::mlir_lower::lower_program;
@@ -492,6 +493,12 @@ fn real_main() -> ExitCode {
                             .add_pass(pass::linalg::create_linalg_elementwise_op_fusion_pass());
                         let ok = pass_manager.run(&mut module).is_ok();
 
+                        // Destination-passing rewrite -- see `pipeline.rs::
+                        // emit_object`'s own identical stage (and `dps_
+                        // rewrite.rs`'s own module doc comment) for the
+                        // full story.
+                        eliminate_redundant_field_store_copies(&context, &mut module);
+
                         let pass_manager = pass::PassManager::new(&context);
                         pass::bufferization::register_one_shot_bufferize_pass();
                         let ok = ok
@@ -671,6 +678,11 @@ fn real_main() -> ExitCode {
             eprintln!("error: MLIR-to-LLVM lowering pass failed");
             return ExitCode::FAILURE;
         }
+
+        // Destination-passing rewrite -- see `pipeline.rs::emit_object`'s
+        // own identical stage (and `dps_rewrite.rs`'s own module doc
+        // comment) for the full story.
+        eliminate_redundant_field_store_copies(&context, &mut module);
 
         // Stage 2: `bufferize-function-boundaries=true` — melior's own
         // zero-argument `create_one_shot_bufferize_pass()` binding has no
