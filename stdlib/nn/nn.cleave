@@ -497,6 +497,82 @@ impl<T: Float, const N: i32, const M: i32> Sum<Tensor<T,N,M>, T> {
     }
 }
 
+// `Broadcast0<Row,Batch>` — real batch-dimension broadcast, added for
+// `dense_forward`'s own broadcast bias-add below: `Dense<T,In,Out>::b` is
+// stored `Tensor<T,1,Out>` for every `Dense` value regardless of how many
+// rows a given call batches together, so adding it to a `Tensor<T,B,Out>`
+// batch of activations needs a real broadcast along axis 0 first —
+// `Ring<Tensor<T,Dims...>>::add` only ever accepts two operands of the
+// *identical* shape, no implicit broadcasting. Mirrors `Sum<Container,T>`/
+// `Sum::broadcast` immediately above exactly — a real reduce/broadcast
+// adjoint pair, `reduce0` undoing `broadcast0` and vice versa (`⟨
+// broadcast0(r), u⟩ = ⟨r, reduce0(u)⟩` — the same "adjoint of a linear map
+// built from a 0/1 selection matrix is its own transpose" reasoning
+// `Sum`'s own doc comment already has), declared as a *same*-algebra
+// sibling pair for the identical reason `Sum`'s own avoids a second
+// cross-algebra reference. Reduces only along axis 0 (never *all* axes
+// down to a bare scalar), so this never hits the "0-rank tensor" wall a
+// full reduction would (`doc/backlog.md`) — `reduce0`'s own result is a
+// genuine rank-2 `Tensor<T,1,M>`, not a scalar.
+algebra Broadcast0<Row, Batch> {
+    fn broadcast0(r: Row) -> Batch;
+    fn reduce0(b: Batch) -> Row;
+    adjoint broadcast0(r), u: reduce0(u);
+    adjoint reduce0(b), u: broadcast0(u);
+}
+
+impl<T: Float, const B: i32, const M: i32> Broadcast0<Tensor<T,1,M>, Tensor<T,B,M>> {
+    // Same manual-counter-for-the-second-generic shape `Sum::sum` above
+    // already established, for the identical reason (`doc/backlog.md`) —
+    // `B`/`M` are two different const generics of this same impl; only one
+    // of the two indices used inside `data[i,j]`/`r[0,j]`/`b[i,j]` may come
+    // from a real `for`-loop-bound variable at a time, or their own value-
+    // vars get silently unified together during this impl's own body
+    // type-check.
+    fn broadcast0(r) {
+        let mut data: [[T; M]; B] = mlir::memref::alloc();
+        for i in 0..B {
+            let mut j: i32 = 0;
+            for _k in 0..M {
+                data[i,j] = r[0,j];
+                j = j + 1;
+            };
+        };
+        Tensor::<T,B,M>(data: data)
+    }
+    fn reduce0(b) {
+        let mut data: [[T; M]; 1] = mlir::memref::alloc();
+        for j in 0..M {
+            let mut acc: T = Ring::zero();
+            let mut i: i32 = 0;
+            for _k in 0..B {
+                acc = acc + b[i,j];
+                i = i + 1;
+            };
+            data[0,j] = acc;
+        };
+        Tensor::<T,1,M>(data: data)
+    }
+}
+
+// A real batch-dimension generalization of `Dense::forward` above
+// (`Tensor<T,1,In> -> Tensor<T,1,Out>`, `Dense`'s own inherent method,
+// kept as-is and still the right call for a single row) — a free
+// top-level function, not a second inherent method on `Dense`, because
+// `B` needs to be a generic *owned by the call itself* (it varies per
+// call site, never per `Dense` value) and an inherent-impl method's own
+// additional generics aren't picked up by inference at all (`doc/backlog.
+// md`'s own "An inherent-impl method's own generics..." item, found and
+// worked around this exact way) — a plain top-level generic `fn`, already
+// a proven-working shape (`dynarray_new<T>`, every algebra-impl method,
+// and — combining a bound *and* several const generics at once, the
+// specific untested combination this needed — `cleave/tests/mlir_lower.
+// rs`'s own `a_top_level_fn_combines_a_bounded_type_generic_with_several_
+// const_generics`), sidesteps that gap entirely.
+fn dense_forward<T: Float, const B: i32, const In: i32, const Out: i32>(layer: Dense<T,In,Out>, x: Tensor<T,B,In>) -> Tensor<T,B,Out> {
+    matmul(x, layer.w) + broadcast0(layer.b)
+}
+
 impl<T: Float, const N: i32> Mean<Tensor<T, N>, T> {
     // `N.to()` (`stdlib/convert/convert.cleave`'s own `Convert<i32,T>`
     // sugar) — used to be a `mlir::arith::sitofp` workaround instead: an

@@ -81,6 +81,10 @@ fn run_i32(src: &str) -> i32 {
         engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
         engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
         engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
+        engine.register_symbol("cleave_release_void", cleave_rt::cleave_release_void as *mut ());
+        engine.register_symbol("cleave_alloc_local", cleave_rt::cleave_alloc_local as *mut ());
+        engine.register_symbol("cleave_region_enter", cleave_rt::cleave_region_enter as *mut ());
+        engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
     }
     let mut out: i32 = -1;
     // SAFETY: `out` is a live, correctly-aligned `i32` on the stack for the

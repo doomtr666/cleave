@@ -338,6 +338,20 @@ fn emit_object(
     let context = Context::new();
     context.append_dialect_registry(&dialect_registry);
     context.load_all_available_dialects();
+    // Needed for the OpenMP parallelization stage below -- `omp.parallel`/
+    // `omp.wsloop`/`omp.loop_nest` deliberately survive every MLIR-level
+    // pass (confirmed directly: `--convert-openmp-to-llvm` only legalizes
+    // the *operand/region types* inside them to the `llvm` dialect, never
+    // eliminates the ops themselves) and are only ever turned into real
+    // LLVM IR (`__kmpc_fork_call`/`__kmpc_for_static_init_*`/...) at final
+    // translation time, via a *separate* registration
+    // (`mlirRegisterAllLLVMTranslations`, wrapped here) from `register_all_
+    // dialects` above -- confirmed missing before this line by direct
+    // testing: `mlir-translate --mlir-to-llvmir` on a hand-built module
+    // with these passes applied produces genuine `__kmpc_*` calls, but
+    // omitting the equivalent registration on this `Context` is exactly
+    // the kind of gap that fails silently or late, not at parse time.
+    melior::utility::register_all_llvm_translations(&context);
 
     let mlir_types = collect_mlir_types(program);
     let struct_schemas = collect_struct_schemas(program);
@@ -487,6 +501,57 @@ fn emit_object(
         ]);
     }
 
+    // OpenMP parallelization -- marks every linalg-derived loop nest's own
+    // *outermost* dimension `affine.parallel` when it's genuinely safe (no
+    // loop-carried dependence), one thread's worth of work per outer-loop
+    // iteration. Scoped deliberately narrow: only linalg-derived loops (the
+    // ones this pass ever sees, `affine.for` from `--convert-linalg-to-
+    // affine-loops` just above) -- never cleave's own hand-written `for`
+    // loops (`Sum::sum`'s own manual-counter loop, the training loop, ...),
+    // which lower via a completely different path (`mlir_lower.rs::lower_
+    // loop`, `scf.while`, never `affine.for`) this pass never touches. This
+    // scoping is *why* it's sound without any change to `cleave-rt`: a
+    // linalg-derived kernel body (matmul's `mulf`/`addf`/`select`, an
+    // elementwise op, ...) is pure arithmetic over already-materialized
+    // memref slices -- it never calls `cleave_alloc_rc`/`cleave_alloc_
+    // local`/`cleave_retain`/`cleave_release`, so running several of its
+    // outer-loop iterations on different OS threads at once never touches
+    // `cleave-rt`'s own arena globals (`ARENA_BASE`/`ARENA_CURSOR`/`REGION_
+    // DEPTH`, deliberately single-threaded `Ordering::Relaxed` atomics --
+    // see `cleave-rt/src/lib.rs`'s own doc comments). Parallelizing
+    // anything *outside* this scope (the training loop itself, say) would
+    // need that assumption revisited first -- not attempted here.
+    //
+    // `--affine-parallelize{max-nested=1}` must run *before* `--affine-
+    // super-vectorize` below, not after -- found by direct `mlir-opt`
+    // testing, not assumed: `affine-parallelize`'s own dependence analysis
+    // only recognizes plain `affine.load`/`affine.store`, not the `vector.
+    // transfer_read`/`write` pairs vectorization introduces, so run second
+    // it silently parallelizes nothing at all (confirmed: identical output,
+    // zero `affine.parallel` produced). `max-nested=1` deliberately caps
+    // this to the *outermost* dimension only -- matmul's own loop nest is
+    // `i (parallel, dim0) > j (parallel, dim1, the one `affine-super-
+    // vectorize` packs into `vector<16xf32>` lanes) > k (reduction, the
+    // accumulation)`; parallelizing `j` too would fight over the same
+    // vectorization the FMA-fusion work earlier in this pipeline already
+    // depends on, and `k` is never a parallelize candidate at all (`--
+    // parallel-reductions` defaults `false`, correctly -- accumulation is
+    // genuinely loop-carried). One thread per row of the output is coarse-
+    // grained but real, sound, and doesn't disturb the SIMD lane packing.
+    let pass_manager = pass::PassManager::new(&context);
+    pass::affine::register_affine_parallelize();
+    if parse_pass_pipeline(
+        pass_manager.as_operation_pass_manager(),
+        "builtin.module(func.func(affine-parallelize{max-nested=1}))",
+    )
+    .is_err()
+        || pass_manager.run(&mut module).is_err()
+    {
+        return Err(vec![
+            "MLIR-to-LLVM lowering pass failed (affine-parallelize)".to_string(),
+        ]);
+    }
+
     // FMA fusion -- found by disassembling a real emitted object file
     // (`kernel.o`, `examples/mnist-interop`): the matmul accumulation loop
     // (`linalg.matmul`'s own lowering, right above, `acc = acc + a[i,k]*b
@@ -576,15 +641,91 @@ fn emit_object(
         ]);
     }
 
+    // `--lower-affine`, on its own -- turns the `affine.parallel` the
+    // parallelize stage above produced into `scf.parallel`, and every
+    // remaining `affine.for` (`j`/`k`, still scalar/vector but *not*
+    // OS-thread-parallel) into ordinary `scf.for`. Run as its own pass,
+    // strictly before `--convert-scf-to-openmp` right below -- the next
+    // stage's own `scf.parallel` lowering needs to see it, not `affine.
+    // parallel`.
     let pass_manager = pass::PassManager::new(&context);
     pass_manager.add_pass(pass::conversion::create_lower_affine());
+    if pass_manager.run(&mut module).is_err() {
+        return Err(vec![
+            "MLIR-to-LLVM lowering pass failed (lower-affine)".to_string(),
+        ]);
+    }
+
+    // `--convert-scf-to-openmp` -- the one pass in this whole stage that
+    // actually turns `scf.parallel` into `omp.parallel`/`omp.wsloop`/`omp.
+    // loop_nest`, one real OS thread per outer-loop chunk (`libomp`,
+    // `cleave-rt`'s build now links, provides the actual thread pool at
+    // runtime -- see `doc/backlog.md`'s own OpenMP entry). Load-bearing
+    // that this runs on its own, in this exact spot, before anything else
+    // touches the `scf.for` loops still nested inside that `scf.parallel`
+    // (`j`/`k`, from `--lower-affine` just above) -- found by direct `mlir-
+    // opt` testing, not assumed: this pass wraps the loop body in a `memref.
+    // alloca_scope`, whose own verifier requires a *single-block* region.
+    // That's still true right here (the nested `scf.for`s are each one
+    // structured op, not yet an unrolled multi-block CFG) -- but running
+    // `--convert-scf-to-cf` *before* this point (to "get it out of the
+    // way" early) would have already broken it, and running this pass
+    // *after* `--convert-scf-to-cf` runs anywhere near these loops breaks
+    // it just the same, the moment that pass ever touches them. The actual
+    // fix, verified end-to-end via `mlir-opt`/`mlir-translate` on a real
+    // matmul kernel down to genuine `__kmpc_fork_call`/`__kmpc_for_static_
+    // init_*`/`__kmpc_barrier` calls: `--convert-to-llvm` (below) lowers
+    // `memref.alloca_scope` itself via its own dialect-interface mechanism,
+    // *while the nested loops are still structured* -- only *after* that
+    // succeeds is `--convert-scf-to-cf` safe to run on what's left (the
+    // scoping constraint is gone with `memref.alloca_scope` itself), hence
+    // the *second* `--convert-to-llvm` invocation further below to finish
+    // the job. `scf` itself has no `ConvertToLLVMPatternInterface` of its
+    // own (confirmed: a lone `--convert-to-llvm`, with no explicit `--
+    // convert-scf-to-cf` anywhere, leaves every `scf.for` completely
+    // untouched) -- the two-pass split below is the real fix, not a
+    // roundabout way of doing one pass's job.
+    let pass_manager = pass::PassManager::new(&context);
+    pass_manager.add_pass(pass::conversion::create_scf_to_open_mp());
+    if pass_manager.run(&mut module).is_err() {
+        return Err(vec![
+            "MLIR-to-LLVM lowering pass failed (scf-to-openmp)".to_string(),
+        ]);
+    }
+
+    // First `--convert-to-llvm`: alongside `--convert-vector-to-llvm`
+    // (unchanged from before this stage existed) and `--convert-openmp-to-
+    // llvm` (legalizes every operand/region type *inside* the `omp.*` ops
+    // to the `llvm` dialect -- the ops themselves deliberately survive,
+    // see `register_all_llvm_translations`'s own call-site comment above
+    // for why), this is specifically what needs to see `memref.alloca_
+    // scope` while it's still single-block, per the comment above.
+    let pass_manager = pass::PassManager::new(&context);
     pass_manager.add_pass(pass::conversion::create_vector_to_llvm());
+    pass_manager.add_pass(pass::conversion::create_open_mp_to_llvm());
+    pass_manager.add_pass(pass::conversion::create_to_llvm());
+    if pass_manager.run(&mut module).is_err() {
+        return Err(vec![
+            "MLIR-to-LLVM lowering pass failed (vector/openmp/to-llvm)".to_string(),
+        ]);
+    }
+
+    // `--convert-scf-to-cf` now finishes off the remaining nested `scf.for`
+    // loops (`memref.alloca_scope` is gone, so its single-block constraint
+    // no longer applies to them) -- and the second `--convert-to-llvm`
+    // mops up the `cf.br`/`cf.cond_br` that produces (`cf`, unlike `scf`,
+    // does have its own `ConvertToLLVMPatternInterface`, confirmed by this
+    // exact sequence leaving zero leftover ops). `omp.parallel`/`omp.
+    // wsloop`/`omp.loop_nest` themselves are still present in the module at
+    // this point -- expected, not a bug, see `register_all_llvm_
+    // translations`'s own comment.
+    let pass_manager = pass::PassManager::new(&context);
     pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
     pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
     if pass_manager.run(&mut module).is_err() {
         return Err(vec![
-            "MLIR-to-LLVM lowering pass failed (to-llvm)".to_string(),
+            "MLIR-to-LLVM lowering pass failed (scf-to-cf/to-llvm/reconcile)".to_string(),
         ]);
     }
 
@@ -599,6 +740,7 @@ fn emit_object(
     unsafe {
         register_cleave_rt_symbols(&engine);
         register_unresolved_extern_stubs(&engine, program);
+        register_openmp_stub_symbols(&engine);
     }
     let Some(object_path_str) = object_path.to_str() else {
         return Err(vec![format!(
@@ -655,6 +797,53 @@ unsafe fn register_unresolved_extern_stubs(engine: &melior::ExecutionEngine, pro
         // SAFETY: forwarded from this function's own contract.
         unsafe {
             engine.register_symbol(symbol, dummy_extern_stub as *mut ());
+        }
+    }
+}
+
+/// The exact same `ExecutionEngine::new`/`dump_to_object_file`-needs-every-
+/// symbol-resolvable-at-construction-time gap `register_cleave_rt_symbols`
+/// and `register_unresolved_extern_stubs` already document, hitting the
+/// OpenMP runtime this time — confirmed the identical way, by direct
+/// testing: the very first real `--emit-object` run through the new
+/// parallelization stage (`emit_object`'s own comment on `--convert-scf-to-
+/// openmp`) failed construction with `Symbols not found: [ __kmpc_barrier,
+/// __kmpc_for_static_fini, __kmpc_for_static_init_8u, __kmpc_fork_call,
+/// __kmpc_global_thread_num ]`. Same fix, same reasoning as `register_
+/// unresolved_extern_stubs`'s own doc comment: a dummy stub only has to
+/// satisfy this engine's own internal resolvability check — the emitted
+/// object's own undefined relocations for these symbols are unaffected
+/// (same `llvm-nm`-confirmed property), genuinely meant to be resolved by
+/// the real `libomp` at the final link step (`emit_exe`'s own `rustc`
+/// invocation needs `-l omp` added alongside `-l cleave_rt` for that to
+/// actually succeed — a real, separate follow-up, not yet done: today's
+/// `emit_exe` would produce an object file this engine happily emits, but
+/// fail to *link* into a runnable `.exe` without it).
+///
+/// The exact symbol set observed (5 names, one loop-bound index width) is
+/// widened here to cover every index-width/signedness variant `mlir-opt`'s
+/// `--convert-scf-to-openmp`/`OpenMPIRBuilder` can plausibly choose for a
+/// static-scheduled `omp.wsloop` with no reduction (this pipeline never
+/// enables `--parallel-reductions`, so the `__kmpc_reduce*` family is
+/// deliberately not included) — not something to special-case per kernel
+/// shape.
+unsafe fn register_openmp_stub_symbols(engine: &melior::ExecutionEngine) {
+    extern "C" fn dummy_openmp_stub() {}
+    const OPENMP_RUNTIME_SYMBOLS: &[&str] = &[
+        "__kmpc_fork_call",
+        "__kmpc_global_thread_num",
+        "__kmpc_for_static_init_4",
+        "__kmpc_for_static_init_4u",
+        "__kmpc_for_static_init_8",
+        "__kmpc_for_static_init_8u",
+        "__kmpc_for_static_fini",
+        "__kmpc_barrier",
+    ];
+    for symbol in OPENMP_RUNTIME_SYMBOLS {
+        // SAFETY: see this function's own doc comment -- mirrors `register_
+        // unresolved_extern_stubs`'s own, already-confirmed-sound argument.
+        unsafe {
+            engine.register_symbol(symbol, dummy_openmp_stub as *mut ());
         }
     }
 }
@@ -809,6 +998,24 @@ pub fn emit_exe(
         .map_err(|e| vec![format!("failed to write {}: {e}", shim_path.display())])?;
 
     let runtime_dir = cleave_rt_search_dir()?;
+    // `-l libomp` (not `-l omp` -- the real installed file is genuinely
+    // named `libomp.lib`, the cross-platform LLVM convention, and `rustc`
+    // on an `-msvc` target passes an `-l` name straight through to `link.
+    // exe` as `NAME.lib` with no automatic prefix-stripping the way a GNU
+    // linker would) -- needed the moment `emit_object`'s own OpenMP
+    // parallelization stage is ever exercised (`register_openmp_stub_
+    // symbols`'s own doc comment: the emitted object always carries real,
+    // unresolved `__kmpc_*` relocations once any linalg-derived kernel
+    // exists, unconditionally, not just for programs that look
+    // "parallel"). `MLIR_SYS_220_PREFIX` (`.cargo/config.toml`, the same
+    // env var `mlir-sys`'s own build script already keys off of) is reused
+    // here rather than a second, independently-maintained path -- `/lib`
+    // under it is exactly where the real toolchain install puts `libomp.
+    // lib` (confirmed directly, alongside every other real `.lib` this
+    // build already links against).
+    let mlir_prefix = std::env::var("MLIR_SYS_220_PREFIX").map_err(|_| {
+        vec!["MLIR_SYS_220_PREFIX must be set (see .cargo/config.toml) to link libomp".to_string()]
+    })?;
     let status = std::process::Command::new("rustc")
         .arg(&shim_path)
         .arg("-o")
@@ -819,6 +1026,10 @@ pub fn emit_exe(
         .arg(&runtime_dir)
         .arg("-l")
         .arg("cleave_rt")
+        .arg("-L")
+        .arg(format!("{mlir_prefix}/lib"))
+        .arg("-l")
+        .arg("libomp")
         .status();
     let _ = std::fs::remove_dir_all(&work_dir);
     match status {

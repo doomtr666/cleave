@@ -713,6 +713,10 @@ fn an_extern_fn_call_actually_executes_through_a_registered_symbol() {
         engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
         engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
         engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
+        engine.register_symbol("cleave_release_void", cleave_rt::cleave_release_void as *mut ());
+        engine.register_symbol("cleave_alloc_local", cleave_rt::cleave_alloc_local as *mut ());
+        engine.register_symbol("cleave_region_enter", cleave_rt::cleave_region_enter as *mut ());
+        engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
     }
     let mut out: i32 = -1;
     unsafe {
@@ -850,6 +854,10 @@ fn an_extern_impl_method_actually_executes_the_right_symbol_at_each_call_site() 
         engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
         engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
         engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
+        engine.register_symbol("cleave_release_void", cleave_rt::cleave_release_void as *mut ());
+        engine.register_symbol("cleave_alloc_local", cleave_rt::cleave_alloc_local as *mut ());
+        engine.register_symbol("cleave_region_enter", cleave_rt::cleave_region_enter as *mut ());
+        engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
     }
     let mut out: i32 = -1;
     unsafe {
@@ -916,6 +924,10 @@ fn an_array_argument_crosses_an_extern_call_boundary_correctly() {
         engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
         engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
         engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
+        engine.register_symbol("cleave_release_void", cleave_rt::cleave_release_void as *mut ());
+        engine.register_symbol("cleave_alloc_local", cleave_rt::cleave_alloc_local as *mut ());
+        engine.register_symbol("cleave_region_enter", cleave_rt::cleave_region_enter as *mut ());
+        engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
     }
     let mut out: i32 = -1;
     unsafe {
@@ -993,6 +1005,10 @@ fn a_unit_returning_extern_fn_can_be_called_correctly() {
         engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
         engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
         engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
+        engine.register_symbol("cleave_release_void", cleave_rt::cleave_release_void as *mut ());
+        engine.register_symbol("cleave_alloc_local", cleave_rt::cleave_alloc_local as *mut ());
+        engine.register_symbol("cleave_region_enter", cleave_rt::cleave_region_enter as *mut ());
+        engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
     }
     let mut out: i32 = -1;
     unsafe {
@@ -1066,6 +1082,10 @@ fn a_string_literal_printed_via_print_writes_the_right_bytes_to_stdout() {
         engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
         engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
         engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
+        engine.register_symbol("cleave_release_void", cleave_rt::cleave_release_void as *mut ());
+        engine.register_symbol("cleave_alloc_local", cleave_rt::cleave_alloc_local as *mut ());
+        engine.register_symbol("cleave_region_enter", cleave_rt::cleave_region_enter as *mut ());
+        engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
     }
     register_io_symbols(&engine);
     let mut out: i32 = -1;
@@ -2725,6 +2745,10 @@ fn print_of_an_unannotated_index_result_no_longer_panics() {
         engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
         engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
         engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
+        engine.register_symbol("cleave_release_void", cleave_rt::cleave_release_void as *mut ());
+        engine.register_symbol("cleave_alloc_local", cleave_rt::cleave_alloc_local as *mut ());
+        engine.register_symbol("cleave_region_enter", cleave_rt::cleave_region_enter as *mut ());
+        engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
     }
     register_io_symbols(&engine);
     let mut out: i32 = -1;
@@ -2804,6 +2828,10 @@ fn print_of_an_unannotated_matmul_index_result_no_longer_panics() {
         engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
         engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
         engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
+        engine.register_symbol("cleave_release_void", cleave_rt::cleave_release_void as *mut ());
+        engine.register_symbol("cleave_alloc_local", cleave_rt::cleave_alloc_local as *mut ());
+        engine.register_symbol("cleave_region_enter", cleave_rt::cleave_region_enter as *mut ());
+        engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
     }
     register_io_symbols(&engine);
     let mut out: i32 = -1;
@@ -4403,6 +4431,10 @@ fn run_i32_with_dynarray_symbols(
         engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
         engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
         engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
+        engine.register_symbol("cleave_release_void", cleave_rt::cleave_release_void as *mut ());
+        engine.register_symbol("cleave_alloc_local", cleave_rt::cleave_alloc_local as *mut ());
+        engine.register_symbol("cleave_region_enter", cleave_rt::cleave_region_enter as *mut ());
+        engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
     }
     register_io_symbols(&engine);
     unsafe {
@@ -5659,3 +5691,141 @@ fn region_locality_holds_with_nested_fields_and_a_nested_loop() {
 // itself isn't, so bufferization could no longer prove downstream reads
 // were copy-free the way it can for the ordinary path. The struct-boundary
 // half of the region-local mechanism (the two tests above) still stands.
+
+// Real-batching investigation (`examples/mnist-interop`'s own OpenMP
+// parallelization delivering zero real speedup -- every matmul there has
+// an outer/row dimension of exactly 1, batch=1 training, so `--affine-
+// parallelize`'s own thread distribution has nothing to actually spread
+// across cores). The fix is real batching (`Tensor<T,B,In>`, `B` a free
+// per-call const generic) -- which would need `Dense::forward` itself to
+// accept a generic *not* among `Dense<T,In,Out>`'s own (`B` varies per
+// call site, not per `Dense` value). A probe test was written, confirmed,
+// then removed (this project's own established convention -- see e.g.
+// `Sum::broadcast`'s own history, `doc/backlog.md`): an inherent-impl
+// method's own declared generics (`fn pick<X>(foo, a: X, b: X) -> X`, a
+// plain *type* generic, tried first since it's simpler than a const one)
+// are not picked up by inference at all -- `X` never becomes a fresh
+// instantiable type variable, confirmed directly ("type mismatch:
+// expected `i32`, found `X`" at the call site, `f.pick(7, 9)`, the second
+// argument rejected against the *first*'s own concrete type rather than
+// both unifying against a fresh `X`). A real, separate compiler gap, not
+// specific to const generics or to `Dense` -- not fixed here, worked
+// around via a top-level free generic function instead (`stdlib/nn/nn.
+// cleave`'s own `dense_forward<T,B,In,Out>`, not an inherent method) for
+// the batching work itself.
+
+// A second probe, same investigation: a top-level generic `fn` combining a
+// *bounded* type generic with *several* const generics at once (`dynarray_
+// new<T>`, the only pre-existing top-level generic `fn`, has neither a
+// bound nor a const generic -- genuinely untested combination before this).
+#[test]
+fn a_top_level_fn_combines_a_bounded_type_generic_with_several_const_generics() {
+    let context = context();
+    let src = "
+        fn first_of<T: Ring, const N: i32, const M: i32>(a: [T; N], b: [T; M]) -> T {
+            add(a[0], b[0])
+        }
+        fn main() -> i32 {
+            let xs: [i32; 3] = [10, 20, 30];
+            let ys: [i32; 2] = [1, 2];
+            first_of(xs, ys)
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 11);
+}
+
+/// `Broadcast0<Row,Batch>`'s own forward pair, standalone -- `broadcast0`
+/// replicates a single `1 x M` row across `B` rows, `reduce0` sums a
+/// `B x M` batch back down to `1 x M` (the exact inverse, by construction:
+/// summing `B` copies of the same row back up gives `B` times that row).
+#[test]
+fn broadcast0_replicates_a_row_and_reduce0_sums_it_back_down() {
+    let context = context();
+    let src = "
+        use nn;
+        fn main() -> i32 {
+            let r: Tensor<f32,1,3> = Tensor::<f32,1,3>(data: [[1.0, 2.0, 3.0]]);
+            let batch: Tensor<f32,4,3> = broadcast0(r);
+            let ok0 = batch[0,0] == 1.0 and batch[0,1] == 2.0 and batch[0,2] == 3.0;
+            let ok1 = batch[3,0] == 1.0 and batch[3,1] == 2.0 and batch[3,2] == 3.0;
+            let reduced: Tensor<f32,1,3> = reduce0(batch);
+            let ok2 = reduced[0,0] == 4.0 and reduced[0,1] == 8.0 and reduced[0,2] == 12.0;
+            if ok0 and ok1 and ok2 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `dense_forward`'s own gradient, at a real `B=2` batch -- checks both
+/// `w`'s gradient (`dW = x^T @ (2*err)`, `MatMul`'s own adjoint, unchanged)
+/// *and* `b`'s gradient (`dB = reduce0(2*err)`, the real new path this
+/// whole batching investigation was for) against hand-computed values, the
+/// same style `grad_through_dense_forward_computes_the_right_gradient`
+/// already established for the `B=1` case (kept, unchanged, elsewhere in
+/// this file -- `dense_forward` is a new, additive free function, not a
+/// replacement for `Dense::forward`'s own inherent method).
+///
+/// Two real bugs found and fixed getting this far, both in `egraph.rs`,
+/// both isolated with temporary probe tests (written, confirmed, removed
+/// -- documented here instead): (1) `is_pure_prim_op` didn't list `Store`
+/// -- `Broadcast0::broadcast0`/`reduce0` (`stdlib/nn/nn.cleave`) are the
+/// first algebra methods needing a loop that actually *mutates* a freshly-
+/// allocated array (`Sum::sum`'s own loop only ever accumulates a scalar,
+/// no `Store` at all), so they were never representable as an opaque
+/// node — fixed, with a documented caveat (`is_pure_prim_op`'s own doc
+/// comment has the full reasoning). (2) `is_transparent_chain`'s own `Fix`
+/// arm never had `Forward::walk`'s own top-level "opaque pure" exception —
+/// `broadcast0` alone (called directly, not nested) was already
+/// representable once (1) was fixed, but `dense_forward` (`matmul(...) +
+/// broadcast0(...)`, `broadcast0` nested *inside* a chain) still wasn't:
+/// `is_transparent_chain` tried to fully inline `broadcast0`'s own body
+/// instead, which its own `If` arm (a loop's own condition check) always
+/// rejects, purity or not. Fixed by giving `is_transparent_chain` the same
+/// exception, mirrored precisely.
+#[test]
+fn grad_through_dense_forward_at_a_real_batch_computes_the_right_gradient() {
+    let context = context();
+    let src = "
+        use nn;
+        use linalg;
+        fn loss(x: Tensor<f32, 2, 2>, y: Tensor<f32, 2, 2>, layer: Dense<f32, 2, 2>) -> f32 {
+            let pred = dense_forward(layer, x);
+            let err = pred - y;
+            sum(err * err)
+        }
+        gw = grad(loss);
+        fn main() -> i32 {
+            let x: Tensor<f32, 2, 2> = Tensor::<f32, 2, 2>(data: [[3.0, 4.0], [5.0, 6.0]]);
+            let y: Tensor<f32, 2, 2> = Tensor::<f32, 2, 2>(data: [[0.0, 0.0], [0.0, 0.0]]);
+            let layer: Dense<f32, 2, 2> = Dense(
+                w: Tensor::<f32, 2, 2>(data: [[1.0, 0.0], [0.0, 1.0]]),
+                b: Tensor::<f32, 1, 2>(data: [[0.1, 0.2]])
+            );
+            let g = gw(x, y, layer);
+            // pred = x + [[0.1,0.2],[0.1,0.2]] = [[3.1,4.2],[5.1,6.2]] (y=0, so err=pred)
+            // dW = x^T @ (2*err), dB = reduce0(2*err) -- hand-computed.
+            let expected_w00: f32 = 69.6;
+            let expected_w01: f32 = 87.2;
+            let expected_w10: f32 = 86.0;
+            let expected_w11: f32 = 108.0;
+            let expected_b0: f32 = 16.4;
+            let expected_b1: f32 = 20.8;
+            let diff_w00: f32 = g.2.w[0, 0] - expected_w00;
+            let diff_w01: f32 = g.2.w[0, 1] - expected_w01;
+            let diff_w10: f32 = g.2.w[1, 0] - expected_w10;
+            let diff_w11: f32 = g.2.w[1, 1] - expected_w11;
+            let diff_b0: f32 = g.2.b[0, 0] - expected_b0;
+            let diff_b1: f32 = g.2.b[0, 1] - expected_b1;
+            let abs_w00: f32 = if diff_w00 < 0.0 { 0.0 - diff_w00 } else { diff_w00 };
+            let abs_w01: f32 = if diff_w01 < 0.0 { 0.0 - diff_w01 } else { diff_w01 };
+            let abs_w10: f32 = if diff_w10 < 0.0 { 0.0 - diff_w10 } else { diff_w10 };
+            let abs_w11: f32 = if diff_w11 < 0.0 { 0.0 - diff_w11 } else { diff_w11 };
+            let abs_b0: f32 = if diff_b0 < 0.0 { 0.0 - diff_b0 } else { diff_b0 };
+            let abs_b1: f32 = if diff_b1 < 0.0 { 0.0 - diff_b1 } else { diff_b1 };
+            if abs_w00 < 0.001 and abs_w01 < 0.001 and abs_w10 < 0.001 and abs_w11 < 0.001
+                and abs_b0 < 0.001 and abs_b1 < 0.001
+            { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}

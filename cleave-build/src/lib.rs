@@ -159,6 +159,50 @@ impl Build {
         println!("cargo:rustc-link-arg={}", object_path.display());
         println!("cargo:rustc-link-lib=static=cleave_rt");
         println!("cargo:rustc-link-search=native={}", build_cleave_rt(&out_dir).display());
+
+        // `libomp` -- needed the moment `emit_object`'s own OpenMP
+        // parallelization stage is ever exercised (`cleave::pipeline::
+        // register_openmp_stub_symbols`'s own doc comment: the emitted
+        // object always carries real, unresolved `__kmpc_*` relocations
+        // once any linalg-derived kernel exists at all, unconditionally --
+        // confirmed directly, the first `cargo build` of a real interop
+        // example through this exact function after that stage landed
+        // failed with `LNK2019: symbole externe non résolu __kmpc_*`). The
+        // real, installed file is named `libomp.lib` (LLVM's own cross-
+        // platform convention) -- `dylib=libomp`, not `dylib=omp`, since an
+        // `-msvc` target's linker takes an `-l`-equivalent name verbatim
+        // (`NAME.lib`), no GNU-style prefix assumed. Same `MLIR_SYS_220_
+        // PREFIX` (`.cargo/config.toml`) `mlir-sys`'s own build script
+        // already keys off of, reused rather than a second, independently-
+        // maintained path -- cargo's own `[env]` mechanism hands it to
+        // every build-script process, this one included.
+        let mlir_prefix = env::var("MLIR_SYS_220_PREFIX")
+            .expect("MLIR_SYS_220_PREFIX must be set (see .cargo/config.toml) to link libomp");
+        println!("cargo:rustc-link-lib=dylib=libomp");
+        println!("cargo:rustc-link-search=native={mlir_prefix}/lib");
+
+        // `libomp.dll` itself, copied next to the *final* binary -- linking
+        // above only satisfies the linker; `libomp` is a real, dynamically-
+        // loaded runtime (Windows has no static-link story for it), so the
+        // finished executable also needs the `.dll` findable through its
+        // own DLL search order at process-start time, same as any other
+        // runtime dependency Windows resolves outside of `PATH`/`rustc`'s
+        // own knowledge. `OUT_DIR` (`target/<profile>/build/<pkg-hash>/
+        // out`) sits exactly three directories below `target/<profile>/`,
+        // where cargo actually places the finished binary -- confirmed
+        // directly against a real build, not assumed. Best-effort
+        // (`let _ =`, not `.expect(...)`): a failed copy here shouldn't
+        // fail the whole build over what's fundamentally a convenience for
+        // running the binary straight out of `target/`, and every other
+        // real deployment path (an installed/packaged binary) needs its
+        // own real answer to "where does `libomp.dll` come from" anyway,
+        // not this one.
+        if let Some(target_profile_dir) = out_dir.ancestors().nth(3) {
+            let _ = std::fs::copy(
+                format!("{mlir_prefix}/bin/libomp.dll"),
+                target_profile_dir.join("libomp.dll"),
+            );
+        }
     }
 }
 

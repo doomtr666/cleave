@@ -312,14 +312,41 @@ use std::collections::HashMap;
 /// Whether `op` has no observable side effect of its own — safe to treat a
 /// call whose own body is made only of ops like this as one opaque, freely
 /// reorderable/CSE-able node (`is_straight_line` below). An *allowlist*, not
-/// a denylist over `FieldStore`/`Store`/`Extern`: a future `PrimOp` variant
-/// this doesn't yet know about defaults to `false` (a missed optimization)
-/// rather than silently becoming unsoundly reorderable the moment someone
-/// adds one and forgets to list it here. `Array`/`ArrayRepeat`/`Load` are
-/// listed as pure even though `Forward::walk` doesn't yet translate them
-/// directly (they aren't in *its* own match) — this only gates whether a
-/// *call* to something containing them is safe to treat as one opaque node,
-/// never requires descending into that callee's own body.
+/// a denylist over `FieldStore`/`Extern`: a future `PrimOp` variant this
+/// doesn't yet know about defaults to `false` (a missed optimization) rather
+/// than silently becoming unsoundly reorderable the moment someone adds one
+/// and forgets to list it here. `Array`/`ArrayRepeat`/`Load` are listed as
+/// pure even though `Forward::walk` doesn't yet translate them directly
+/// (they aren't in *its* own match) — this only gates whether a *call* to
+/// something containing them is safe to treat as one opaque node, never
+/// requires descending into that callee's own body.
+///
+/// `Store` — real mutation-in-place at the CPS/codegen level (`cps.rs`'s
+/// own module doc comment: "an array is a stable reference, mutated in
+/// place ... `PrimOp::Store` is a real effect, not a functional update"),
+/// but sound to treat as pure *here* the same way `Load` already is: this
+/// predicate only ever gates whether a *whole call* can be folded into one
+/// e-graph node for differentiation's own value-level purposes, where a
+/// `Store` into a buffer this same call allocated fresh (`mlir::memref::
+/// alloc()`, itself already `RawMlirOp`, listed above) and never lets
+/// escape before returning is functionally pure — same input, same output
+/// value, regardless of the underlying in-place codegen strategy (`Sum::
+/// broadcast`'s own `[[u;M];N]` array-repeat construction is the pure-
+/// syntax equivalent of exactly this, just without the loop; `Broadcast0::
+/// broadcast0`/`reduce0`, `stdlib/nn/nn.cleave`, are the first algebra
+/// methods needing the loop-based, `Store`-using shape — building a batch-
+/// dimension-sized result isn't expressible as a fixed-arity array-repeat
+/// literal at all, since array-repeat has no way to make each position's
+/// own expression depend on its own index). The caveat this shares with
+/// `Load`'s own already-accepted one: this predicate has no visibility
+/// into *which* array a `Store`/`Load` actually targets — a hypothetical
+/// future algebra method that mutates a `mut` *parameter* array (instead
+/// of one it allocated itself) would be wrongly treated as pure too, since
+/// nothing here traces a `Store`'s target back to its own origin. Not
+/// currently reachable (no existing algebra method does this, verified by
+/// inspection), but a real, precise data-flow check — distinguishing a
+/// locally-allocated target from a possibly-aliased parameter — would be
+/// needed before this predicate could be trusted for one that did.
 fn is_pure_prim_op(op: &PrimOp) -> bool {
     matches!(
         op,
@@ -329,6 +356,7 @@ fn is_pure_prim_op(op: &PrimOp) -> bool {
             | PrimOp::Array
             | PrimOp::ArrayRepeat
             | PrimOp::Load { .. }
+            | PrimOp::Store { .. }
     )
 }
 
@@ -424,6 +452,28 @@ fn is_transparent_chain(
                 return false;
             };
             if is_straight_line(&callee.def.body, units) {
+                return is_transparent_chain(rest, units, visiting);
+            }
+            // An algebra-dispatched method whose own body isn't straight-
+            // line but *is* pure (`Forward::walk`'s own top-level "opaque
+            // pure" exception one level up -- `Sum::sum`'s own real `for`
+            // loop) -- treat this one call as opaque and move on to `rest`,
+            // rather than trying to inline its own interior. Inlining would
+            // wrongly reject it regardless of purity: this function's own
+            // `If` arm above always returns `false`, and a real loop's own
+            // condition check is exactly an `If` -- `is_transparent_chain`
+            // only ever means "safe to fully inline," never "safe to treat
+            // as one opaque node," and a loop-containing-but-pure callee is
+            // only ever the *latter*. Found for real, not hypothetical:
+            // `dense_forward` (`stdlib/nn/nn.cleave`, a plain top-level fn,
+            // `matmul(x,layer.w) + broadcast0(layer.b)`) failed to become
+            // transparent at all without this branch -- `broadcast0` alone,
+            // called *directly* (not nested inside a further chain), was
+            // already representable via `Forward::walk`'s own top-level
+            // check; only the *nested*, within-a-chain case was missing
+            // this exact same logic, since this function is a separate,
+            // simpler recursive helper that never consulted it.
+            if callee.origin.is_some() && is_pure(&callee.def.body) {
                 return is_transparent_chain(rest, units, visiting);
             }
             if !visiting.insert(unit_name.to_string()) {
