@@ -3460,6 +3460,47 @@ fn build_matmul_no_seed<'c>(
         .result(0)
         .unwrap()
         .into();
+    // Select the *addend* (`0.0` at `k == 0`, `cv` otherwise), not the
+    // final result -- found the hard way, not the first thing tried: an
+    // earlier version of this region computed `prod = a*b` once and
+    // selected between `prod` (k==0) and `cv + prod` (k>0) directly. That
+    // shape is mathematically identical but gives `prod` *two* real uses
+    // (the select's own true-branch, and the add) -- confirmed directly by
+    // disassembling this project's own real, compiled `examples/mnist-
+    // interop` kernel (`llvm-objdump`, not guessed from IR alone): only 14
+    // `vfmadd*ps` instructions in the whole kernel against 151 separate
+    // `vmulps`/`vaddps` pairs, meaning LLVM's own backend almost never
+    // fused the multiply-accumulate here at all -- correctly so: fusing
+    // `cv + prod` into an FMA when `prod` is *also* needed bare elsewhere
+    // would need computing the multiply a second time anyway, no actual
+    // win. Selecting the addend instead keeps the multiply's result used
+    // in exactly one place (this add), which is what actually lets `--
+    // mark_mulf_addf_contract`'s own `fastmath<contract>` stamp turn into a
+    // *real* fused multiply-add at the instruction-selection level --
+    // confirmed directly on this same probe shape (`mlir-opt`, `--convert-
+    // to-llvm`): `llvm.select` on the addend, then `llvm.fmul`/`llvm.fadd`
+    // with `fastmathFlags = #llvm.fastmath<contract>}` immediately
+    // afterward, the multiply feeding the add and nothing else.
+    let zero_elem: Value = payload
+        .append_operation(arith::constant(
+            context,
+            FloatAttribute::new(context, elem_ty, 0.0).into(),
+            location,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let addend: Value = payload
+        .append_operation(
+            OperationBuilder::new("arith.select", location)
+                .add_operands(&[is_first, zero_elem, cv])
+                .add_results(&[elem_ty])
+                .build()
+                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build arith.select: {e}")),
+        )
+        .result(0)
+        .unwrap()
+        .into();
     let prod: Value = payload
         .append_operation(
             OperationBuilder::new("arith.mulf", location)
@@ -3471,24 +3512,13 @@ fn build_matmul_no_seed<'c>(
         .result(0)
         .unwrap()
         .into();
-    let acc: Value = payload
+    let sum: Value = payload
         .append_operation(
             OperationBuilder::new("arith.addf", location)
-                .add_operands(&[cv, prod])
+                .add_operands(&[addend, prod])
                 .add_results(&[elem_ty])
                 .build()
                 .unwrap(),
-        )
-        .result(0)
-        .unwrap()
-        .into();
-    let sum: Value = payload
-        .append_operation(
-            OperationBuilder::new("arith.select", location)
-                .add_operands(&[is_first, prod, acc])
-                .add_results(&[elem_ty])
-                .build()
-                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build arith.select: {e}")),
         )
         .result(0)
         .unwrap()
