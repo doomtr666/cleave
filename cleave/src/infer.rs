@@ -2128,6 +2128,37 @@ impl<'r> Infer<'r> {
         mapping
     }
 
+    /// The combined-mapping counterpart to `fresh_generics_mapping`, for an
+    /// inherent-impl method specifically: `impl_generics` (the enclosing
+    /// `impl<T> Foo<T>` block's own) and `method_generics` (`fn pick<X>`'s
+    /// own, if any) both need fresh vars in the *same* mapping — a method
+    /// body or call site resolving a bare `X` has no separate mapping to
+    /// fall back to (`ty_from_ast_mapped`'s lookup is one flat `HashMap`),
+    /// and building two independent mappings instead of one combined pass
+    /// would also lose any const-generic cross-reference between the two
+    /// lists (a method's own `const K: T` naming the impl's own `T`, say —
+    /// `fresh_generics_mapping`'s own `Const` handling resolves a width
+    /// against the *whole* mapping it's given, not just its own list).
+    /// Deliberately just a concatenation into `fresh_generics_mapping`
+    /// itself, not a separate implementation — same bounds/const-width
+    /// handling, same span, for both lists at once.
+    fn fresh_generics_mapping_for_method(
+        &mut self,
+        impl_generics: &[GenericParam],
+        method_generics: &[GenericParam],
+        span: Span,
+    ) -> HashMap<String, Ty> {
+        if method_generics.is_empty() {
+            // The overwhelmingly common case (no method-level generics at
+            // all) — skip the allocation `to_vec`/`extend` would otherwise
+            // always pay.
+            return self.fresh_generics_mapping(impl_generics, span);
+        }
+        let mut combined = impl_generics.to_vec();
+        combined.extend_from_slice(method_generics);
+        self.fresh_generics_mapping(&combined, span)
+    }
+
     /// The pack-aware counterpart to `ExprKind::StructLit`'s own ordinary
     /// construction path, taken when `struct_generics`'s own last entry is
     /// a pack (`doc/backlog.md`'s own "Variadic generics" item —
@@ -2648,8 +2679,17 @@ impl<'r> Infer<'r> {
         // came back as a bare, still-unconstrained variable instead of the
         // concrete type `base` actually has. Mirrors
         // `infer_inherent_impl_fn_generic`'s own identical fix for the
-        // exact same reason, on the declaration side.
-        let impl_mapping = self.fresh_generics_mapping(&entry.generics, call_span);
+        // exact same reason, on the declaration side. The method's own
+        // generics (`fn pick<X>(...)`, `doc/backlog.md`'s own "An
+        // inherent-impl method's own generics aren't picked up by
+        // inference at all" item) get fresh vars in this same mapping too
+        // — see `fresh_generics_mapping_for_method`'s own doc comment;
+        // `entry.target` never references a method-level generic (only the
+        // impl block's own), so folding both lists into one mapping here
+        // doesn't change `target_ty`'s own construction at all, only what
+        // `param_tys` below can resolve.
+        let impl_mapping =
+            self.fresh_generics_mapping_for_method(&entry.generics, &entry.method.generics, call_span);
         let target_ty = self.ty_from_ast_mapped(&entry.target, &impl_mapping);
         let param_tys =
             self.inherent_method_param_tys(&entry.method.params, &impl_mapping, &target_ty);
@@ -3154,7 +3194,18 @@ impl<'r> Infer<'r> {
         f: &FnDecl,
         fallback_span: Span,
     ) -> Result<Ty, TypeError> {
-        let impl_mapping = self.fresh_generics_mapping(impl_generics, fallback_span);
+        // The method's own generics (`fn pick<X>(...)`, `doc/backlog.md`'s
+        // own "An inherent-impl method's own generics aren't picked up by
+        // inference at all" item) get fresh vars alongside the impl block's
+        // — merged into one mapping, not two separate ones, so a body
+        // reference to `X` resolves through `ty_from_ast_mapped`'s ordinary
+        // by-name lookup exactly like `T` already does, instead of falling
+        // through to a bogus literal type named `"X"`. See
+        // `fresh_generics_mapping_for_method`'s own doc comment for why a
+        // single combined mapping (not two independently-built ones) is
+        // needed here.
+        let impl_mapping =
+            self.fresh_generics_mapping_for_method(impl_generics, &f.generics, fallback_span);
         self.active_generics = impl_mapping.clone();
         let target_ty = self.ty_from_ast_mapped(target, &impl_mapping);
         let param_types = self.inherent_method_param_tys(&f.params, &impl_mapping, &target_ty);
@@ -3238,6 +3289,13 @@ impl<'r> Infer<'r> {
             env.insert(p.name.clone(), Scheme::mono(ty.clone()));
         }
         self.seed_const_generics(impl_generics, impl_mapping, &mut env);
+        // The method's own const generics (`fn pick<const K: i32>(...)`,
+        // referenced as an ordinary value in the body, not just a type)
+        // need the identical seeding — `impl_mapping` here is already the
+        // combined impl+method mapping (`fresh_generics_mapping_for_method`,
+        // both real callers of this function), so this is purely "also walk
+        // the method's own generics list," no new mapping needed.
+        self.seed_const_generics(&f.generics, impl_mapping, &mut env);
 
         let result = self.infer_block(&env, body)?;
         if let Some(ret) = &f.ret {
@@ -3318,10 +3376,29 @@ impl<'r> Infer<'r> {
 
         // Seed every member's placeholder before inferring *any* of their
         // bodies — visible to every other member (mutual recursion) and to
-        // itself (self-recursion).
+        // itself (self-recursion). Each member's own generics (`fn
+        // pick<X>(...)`, `doc/backlog.md`'s own "An inherent-impl method's
+        // own generics aren't picked up by inference at all" item) get
+        // fresh vars *of their own*, layered on top of the block's shared
+        // `impl_mapping` — deliberately not re-freshing `impl_mapping`
+        // itself per method (unlike the single-method
+        // `fresh_generics_mapping_for_method` path): every method in this
+        // block must keep referring to the *same* impl-level `T`, exactly
+        // the consistency mutual recursion (`in_progress_methods`) already
+        // depends on — only a method's own, additional generics are
+        // independent per method.
         let mut placeholders: HashMap<String, (Vec<Ty>, Ty)> = HashMap::new();
+        let mut method_mappings: HashMap<String, HashMap<String, Ty>> = HashMap::new();
         for f in fns {
-            let param_types = self.inherent_method_param_tys(&f.params, &impl_mapping, &target_ty);
+            let method_mapping = if f.generics.is_empty() {
+                impl_mapping.clone()
+            } else {
+                let mut m = impl_mapping.clone();
+                m.extend(self.fresh_generics_mapping(&f.generics, fallback_span));
+                m
+            };
+            let param_types =
+                self.inherent_method_param_tys(&f.params, &method_mapping, &target_ty);
             let ret_var = self.vars.fresh();
             if let Some(name) = &struct_name {
                 self.in_progress_methods.insert(
@@ -3330,11 +3407,13 @@ impl<'r> Infer<'r> {
                 );
             }
             placeholders.insert(f.name.clone(), (param_types, ret_var));
+            method_mappings.insert(f.name.clone(), method_mapping);
         }
 
         let mut raw_results: HashMap<String, Result<Ty, TypeError>> = HashMap::new();
         for f in fns {
             let (param_types, ret_var) = placeholders[&f.name].clone();
+            let method_mapping = &method_mappings[&f.name];
             // `check_pending_type_names` right here, per member, not folded
             // into a group-wide sweep — see `Infer::check_pending_type_
             // names`'s own doc comment for why: each entry belongs to
@@ -3343,7 +3422,7 @@ impl<'r> Infer<'r> {
                 .infer_inherent_impl_fn_raw(
                     outer,
                     impl_generics,
-                    &impl_mapping,
+                    method_mapping,
                     &target_ty,
                     param_types,
                     ret_var,
@@ -3363,6 +3442,18 @@ impl<'r> Infer<'r> {
         }
 
         self.quantify_impl_generics(&impl_mapping);
+        // Also quantify each member's own generics (`fn pick<X>`) — an `X`
+        // left unresolved after its own body is checked (e.g. an argument
+        // never actually used) must not be silently defaulted the same way
+        // an ordinary, genuinely-unconstrained expression would be; each
+        // `method_mappings` entry already contains `impl_mapping`'s own
+        // vars too (harmless to re-quantify, `HashSet::insert` is
+        // idempotent), so this alone is a strict superset of the line above
+        // — kept both for clarity, matching the single-method path's own
+        // one-call shape.
+        for mapping in method_mappings.values() {
+            self.quantify_impl_generics(mapping);
+        }
         self.apply_defaults();
         // A constraint failure here is a property of the block's mutual
         // definition as a whole, not attributable to one specific member —

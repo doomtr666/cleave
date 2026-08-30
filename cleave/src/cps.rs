@@ -575,10 +575,20 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                     }
                 }
             }
-            ItemKind::InherentImpl(d) if d.generics.is_empty() => {
+            ItemKind::InherentImpl(d)
+                if d.generics.is_empty() && d.fns.iter().all(|f| f.generics.is_empty()) =>
+            {
                 // Non-generic inherent impl — either a concrete struct with
                 // no generics of its own, or a generic struct impl'd at one
-                // specific instantiation (`impl Vec2<f64> { ... }`). Mirrors
+                // specific instantiation (`impl Vec2<f64> { ... }`), *and*
+                // none of its own methods declare a generic of their own
+                // either (`doc/backlog.md`'s own "An inherent-impl method's
+                // own generics aren't picked up by inference at all" item —
+                // a method with its own generic needs the templated branch
+                // below instead, exactly like an impl-level generic already
+                // does; `monomorphize.rs::build_inherent_templates`'s own
+                // block-selection condition mirrors this one exactly).
+                // Mirrors
                 // the non-generic-algebra-impl branch above (re-infer
                 // directly, no template needed) but through `infer_
                 // inherent_impl_block` instead of a per-method call — one
@@ -626,9 +636,11 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                 }
             }
             ItemKind::InherentImpl(d) => {
-                // Generic inherent impl — every specialization actually
-                // reached, already built by `monomorphize`'s own inherent-
-                // method worklist.
+                // Generic inherent impl — impl-level (`impl<T> Boxed<T>`),
+                // method-level (`fn pick<X>(...)` on an otherwise concrete
+                // impl), or both — every specialization actually reached,
+                // already built by `monomorphize`'s own inherent-method
+                // worklist.
                 let TypeKind::Path(p, _) = &d.target.kind else {
                     continue;
                 };

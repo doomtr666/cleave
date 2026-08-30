@@ -355,7 +355,21 @@ fn build_inherent_templates(
         let ItemKind::InherentImpl(d) = &item.kind else {
             continue;
         };
-        if d.generics.is_empty() {
+        // A method needs a template (monomorphized per real call site, the
+        // way this whole function exists to build) whenever *either* the
+        // enclosing impl block has its own generics (`impl<T> Boxed<T>`)
+        // *or* the method itself does (`fn pick<X>(...)`, `doc/backlog.md`'s
+        // own "An inherent-impl method's own generics aren't picked up by
+        // inference at all" item) — not just the impl block alone, the
+        // original (and incomplete) check here. `infer_inherent_impl_block`
+        // infers every method of the block together regardless (real mutual
+        // recursion, see its own doc comment), so this is a block-level,
+        // not a per-method, decision: an impl block skipped here entirely
+        // needs *no* method of its own templated; one that qualifies gets
+        // every one of its methods templated below, same as it already did
+        // when only checking `d.generics` — `cps.rs::collect_units`'s own
+        // `InherentImpl` branch selection mirrors this exact condition.
+        if d.generics.is_empty() && d.fns.iter().all(|f| f.generics.is_empty()) {
             continue;
         }
         let TypeKind::Path(p, _) = &d.target.kind else {
@@ -2845,14 +2859,32 @@ fn derive_inherent_instantiation(
     )
 }
 
-/// The inherent-impl counterpart to `display_impl_instantiation` — described
-/// by the concrete *receiver* type (`param_patterns[0]`, substituted; see
-/// `InherentTemplate`'s own doc comment for why that's already the target
-/// pattern, no separate field to read), the same "reader thinks in terms of
-/// the operand shapes actually involved" reasoning.
+/// The inherent-impl counterpart to `display_impl_instantiation` — every
+/// substituted parameter (receiver first) plus the substituted return type,
+/// not just the receiver (`param_patterns[0]`) alone. The receiver alone
+/// used to be a sufficient, real, unique key for every impl-level generic
+/// (`Boxed<T>::doubled` — `T` always shows up *in* the receiver's own type,
+/// `Boxed<i32>` vs `Boxed<f64>`), but a *method's* own generic
+/// (`doc/backlog.md`'s own "An inherent-impl method's own generics aren't
+/// picked up by inference at all" item, `fn pick<X>(foo, a: X, b: X) -> X`
+/// on a non-generic `Foo`) never appears in the receiver's own type at
+/// all — the receiver alone (`Foo`, always, regardless of `X`) collided
+/// two genuinely different specializations (`pick::<i32>` and
+/// `pick::<f64>`) onto the identical display string, silently reusing one
+/// call site's own specialization for the other and corrupting downstream
+/// MLIR lowering. Every parameter/return type together is exactly the
+/// domain `derive_inherent_instantiation`'s own `unify` call already treats
+/// as this template's whole pattern — using the same set here as the
+/// display key can never under-distinguish two instantiations that really
+/// are different.
 fn display_inherent_instantiation(t: &InherentTemplate, mapping: &HashMap<TyVar, Ty>) -> String {
-    let target = substitute(&t.param_patterns[0], mapping);
-    format!("{}::{}<{}>", t.struct_name, t.method_name, target)
+    let mut parts: Vec<String> = t
+        .param_patterns
+        .iter()
+        .map(|p| substitute(p, mapping).to_string())
+        .collect();
+    parts.push(substitute(&t.ret_pattern, mapping).to_string());
+    format!("{}::{}<{}>", t.struct_name, t.method_name, parts.join(", "))
 }
 
 /// Collects every sub-expression of `expr`, including `expr` itself, into

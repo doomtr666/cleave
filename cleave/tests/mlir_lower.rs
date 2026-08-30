@@ -1891,6 +1891,73 @@ fn a_generic_inherent_method_called_at_two_types_computes_the_right_value() {
     assert_eq!(run_i32(&context, src), 42);
 }
 
+/// `doc/backlog.md`'s own "An inherent-impl method's own generics aren't
+/// picked up by inference at all" item — a method declaring a generic of
+/// its *own* (`fn pick<X>`), beyond whatever the enclosing `impl` block
+/// already binds. Both call arguments must unify against the *same* fresh
+/// `X`, pinned by the first one seen — proves it's a real, shared type
+/// variable, not two independent ones that happen to agree by coincidence.
+#[test]
+fn an_inherent_methods_own_generic_is_a_real_fresh_type_variable() {
+    let context = context();
+    let src = "
+        struct Foo { n: i32 }
+        impl struct Foo {
+            fn pick<X>(foo, a: X, b: X) -> X { a }
+        }
+        fn main() -> i32 {
+            let f = Foo(n: 0);
+            f.pick(7, 9)
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 7);
+}
+
+/// The same shape as above, but on a *generic* inherent impl (`impl<T>
+/// Boxed<T>`) — the method's own generic (`X`) must stay independent from
+/// the impl block's own (`T`), not collide with or shadow it.
+#[test]
+fn an_inherent_methods_own_generic_stays_independent_of_the_impls_own() {
+    let context = context();
+    let src = "
+        struct Boxed<T> { value: T }
+        impl<T: Ring> struct Boxed<T> {
+            fn combine<X>(b, a: X, c: X) -> X { a }
+        }
+        fn main() -> i32 {
+            let b = Boxed(value: 1.5);
+            b.combine(7, 9)
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 7);
+}
+
+/// The same method, called at two different concrete types from two
+/// different call sites in the same program — each needs its own
+/// independent specialization (mirrors `a_generic_inherent_method_called_
+/// at_two_types_computes_the_right_value` above, for a method-level
+/// generic on an otherwise *non*-generic impl specifically — the exact
+/// shape `build_inherent_templates`/`cps.rs::collect_units` used to skip
+/// entirely, since neither the impl block nor (until this fix) a method's
+/// own generics were ever checked there).
+#[test]
+fn an_inherent_methods_own_generic_is_specialized_independently_at_two_call_sites() {
+    let context = context();
+    let src = "
+        struct Foo { n: i32 }
+        impl struct Foo {
+            fn pick<X>(foo, a: X, b: X) -> X { a }
+        }
+        fn main() -> i32 {
+            let f = Foo(n: 0);
+            let i = f.pick(7, 9);
+            let fl = f.pick(1.5, 2.5);
+            if fl == 1.5 { i } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 7);
+}
+
 /// A self-recursive `let`-bound lambda (`doc/backlog.md`'s own "Self-
 /// recursive `let`-bound lambda" item) — a genuinely separate gap from the
 /// type-inference-layer one already fixed: even once `infer.rs` correctly

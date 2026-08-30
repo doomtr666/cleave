@@ -3108,7 +3108,12 @@ pub fn optimize_program(
         // No explicit `with_time_limit`/`with_node_limit` used to be set here
         // at all -- `Runner::default()`'s own limits (`egg`'s own defaults),
         // unlike `synthesize_derivatives`'s own Runner just below (`with_
-        // iter_limit(1000).with_node_limit(1_000_000).with_time_limit(30s)`).
+        // iter_limit(1000).with_node_limit(1_000_000).with_time_limit(1s)`
+        // -- lowered from an original 30s, `doc/backlog.md`'s own "derive()'s
+        // own saturation" item: re-measured directly, 1s produces a bit-for-
+        // bit identical result on `xor.cleave`'s own heaviest `derive()` call,
+        // the e-graph itself long since stopped being where compile time
+        // goes).
         // Invisible for every network tried before this session's own
         // "stress the system" pass (`examples/digits-interop`): xor.cleave's
         // own tiny tensors (2x2/2x1) let this pass saturate in 2 iterations,
@@ -3130,7 +3135,7 @@ pub fn optimize_program(
             .with_egraph(egraph)
             .with_iter_limit(1000)
             .with_node_limit(1_000_000)
-            .with_time_limit(std::time::Duration::from_secs(30));
+            .with_time_limit(std::time::Duration::from_secs(1));
         if want_explanations {
             runner_builder = runner_builder.with_explanations_enabled();
         }
@@ -3507,7 +3512,7 @@ pub fn synthesize_derivatives(
         let runner = Runner::default()
             .with_iter_limit(1000)
             .with_node_limit(1_000_000)
-            .with_time_limit(std::time::Duration::from_secs(30))
+            .with_time_limit(std::time::Duration::from_secs(1))
             .with_egraph(egraph)
             .run(&pass_a_rules);
         // Pass B — ordinary axiom simplification (commutativity,
@@ -3522,7 +3527,7 @@ pub fn synthesize_derivatives(
         let runner = Runner::default()
             .with_iter_limit(1000)
             .with_node_limit(1_000_000)
-            .with_time_limit(std::time::Duration::from_secs(30))
+            .with_time_limit(std::time::Duration::from_secs(1))
             .with_egraph(runner.egraph)
             .run(&axiom_rules);
         // `IndependentZeroApplier`'s own `zero_calls_used` (`egraph.rs`'s own
