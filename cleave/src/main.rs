@@ -20,19 +20,19 @@ use cleave::cps::{
 };
 use cleave::diag::SourceMap;
 use cleave::driver::compile;
-use cleave::dps_rewrite::eliminate_redundant_field_store_copies;
 use cleave::dump::dump_program;
 use cleave::egraph::optimize_program;
 use cleave::mlir_lower::lower_program;
 use cleave::monomorphize::dump_monomorphized;
-use cleave::pipeline::{build_cps_program, check_type_errors, mark_mulf_addf_contract};
+use cleave::pipeline::{
+    Backend, CodegenOptions, build_cps_program, check_type_errors, lower_to_llvm,
+};
 use cleave::print::print_program;
 use cleave::registry::Registry;
 use melior::Context;
 use melior::dialect::DialectRegistry;
 use melior::ir::operation::OperationLike;
-use melior::pass;
-use melior::utility::{parse_pass_pipeline, register_all_dialects};
+use melior::utility::register_all_dialects;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -50,6 +50,11 @@ struct Args {
     emit_object: Option<PathBuf>,
     emit_bindings: Option<PathBuf>,
     emit_exe: Option<PathBuf>,
+    opt_level: u8,
+    openmp: Option<bool>,
+    target_cpu: Option<String>,
+    target_features: Option<String>,
+    backend: String,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -66,6 +71,11 @@ fn parse_args() -> Result<Args, String> {
     let mut emit_object = None;
     let mut emit_bindings = None;
     let mut emit_exe = None;
+    let mut opt_level: u8 = 2;
+    let mut openmp: Option<bool> = None;
+    let mut target_cpu = None;
+    let mut target_features = None;
+    let mut backend = "cpu".to_string();
 
     let mut args_iter = std::env::args().skip(1);
     while let Some(arg) = args_iter.next() {
@@ -96,6 +106,36 @@ fn parse_args() -> Result<Args, String> {
                     .next()
                     .ok_or_else(|| "--emit-exe requires a path argument".to_string())?;
                 emit_exe = Some(PathBuf::from(value));
+            }
+            "--opt-level" => {
+                let value = args_iter
+                    .next()
+                    .ok_or_else(|| "--opt-level requires a value (0-3)".to_string())?;
+                opt_level = value
+                    .parse::<u8>()
+                    .ok()
+                    .filter(|n| *n <= 3)
+                    .ok_or_else(|| format!("--opt-level must be 0-3, got {value:?}"))?;
+            }
+            "--openmp" => openmp = Some(true),
+            "--no-openmp" => openmp = Some(false),
+            "--target-cpu" => {
+                let value = args_iter
+                    .next()
+                    .ok_or_else(|| "--target-cpu requires a value".to_string())?;
+                target_cpu = Some(value);
+            }
+            "--target-features" => {
+                let value = args_iter
+                    .next()
+                    .ok_or_else(|| "--target-features requires a value".to_string())?;
+                target_features = Some(value);
+            }
+            "--backend" => {
+                let value = args_iter
+                    .next()
+                    .ok_or_else(|| "--backend requires a value".to_string())?;
+                backend = value;
             }
             other if other.starts_with("--") => return Err(format!("unknown flag {other:?}")),
             other if path.is_none() => path = Some(PathBuf::from(other)),
@@ -141,14 +181,40 @@ fn parse_args() -> Result<Args, String> {
             emit_object,
             emit_bindings,
             emit_exe,
+            opt_level,
+            openmp,
+            target_cpu,
+            target_features,
+            backend,
         }),
         None => Err(
             "usage: cleave <file.cleave> [--dump-ast] [--dump-inference-pass] [--dump-monomorphized] [--dump-cps] \
              [--dump-cps-optimized] [--dump-cps-equivalences] [--dump-mlir] [--dump-mlir-lowered] [--run] \
-             [--emit-object <path>] [--emit-bindings <path>] [--emit-exe <path>]"
+             [--emit-object <path>] [--emit-bindings <path>] [--emit-exe <path>] \
+             [--opt-level <0-3>] [--openmp | --no-openmp] [--target-cpu <name>] [--target-features <+f,-f,...>] \
+             [--backend cpu]"
                 .to_string(),
         ),
     }
+}
+
+/// Resolves `args`'s own codegen flags into a real `CodegenOptions` --
+/// `openmp_default` differs per call site (`true` for `--emit-object`/
+/// `--emit-bindings`/`--emit-exe`, `false` for `--run`/`--dump-mlir-
+/// lowered`, see `CodegenOptions::openmp`'s own doc comment for why),
+/// overridden either way by an explicit `--openmp`/`--no-openmp`.
+fn resolve_codegen_options(args: &Args, openmp_default: bool) -> Result<CodegenOptions, String> {
+    let backend = match args.backend.as_str() {
+        "cpu" => Backend::Cpu,
+        other => return Err(format!("backend {other:?} is not implemented yet -- only \"cpu\" is supported today")),
+    };
+    Ok(CodegenOptions {
+        opt_level: args.opt_level,
+        openmp: args.openmp.unwrap_or(openmp_default),
+        target_cpu: args.target_cpu.clone(),
+        target_features: args.target_features.clone(),
+        backend,
+    })
 }
 
 // CPS conversion (`cps.rs::convert_program`) recurses once per statement/
@@ -464,115 +530,33 @@ fn real_main() -> ExitCode {
                         eprintln!("error: generated MLIR module failed verification");
                         exit = ExitCode::FAILURE;
                     } else {
-                        // Mirrors `--run`'s own pass pipeline exactly, right
-                        // up to (not including) JIT invocation -- this *is*
-                        // the form that actually gets handed to the
-                        // `ExecutionEngine`, `llvm.*` dialect ops standing in
-                        // for real textual LLVM IR (melior/mlir-sys, as
-                        // vendored, don't expose `mlirTranslateModuleToLLVMIR`
-                        // at all -- real `.ll` text isn't reachable without
-                        // adding a raw FFI binding ourselves).
-                        // Staged as three *separate* `PassManager`s, each run
-                        // to completion before the next is even built — see
-                        // `--run`'s own identical pipeline below for the full
-                        // reasoning (found by direct testing to matter, not
-                        // just tidier).
-                        // Inline + fuse elementwise ops, *before*
-                        // bufferization -- see `pipeline.rs::emit_object`'s
-                        // own identical stage for the full story (found via
-                        // VTune against a real training run: an SGD update
-                        // lowers to two separate `func.func`s called via
-                        // `call`, each bufferizing its own scratch buffer;
-                        // inlining puts producer and consumer in one body so
-                        // fusion can collapse them into one).
-                        let pass_manager = pass::PassManager::new(&context);
-                        pass_manager.add_pass(pass::transform::create_inliner());
-                        pass_manager
-                            .add_pass(pass::linalg::create_convert_elementwise_to_linalg_pass());
-                        pass_manager
-                            .add_pass(pass::linalg::create_linalg_elementwise_op_fusion_pass());
-                        let ok = pass_manager.run(&mut module).is_ok();
-
-                        // Destination-passing rewrite -- see `pipeline.rs::
-                        // emit_object`'s own identical stage (and `dps_
-                        // rewrite.rs`'s own module doc comment) for the
-                        // full story.
-                        eliminate_redundant_field_store_copies(&context, &mut module);
-
-                        let pass_manager = pass::PassManager::new(&context);
-                        pass::bufferization::register_one_shot_bufferize_pass();
-                        let ok = ok
-                            && parse_pass_pipeline(
-                                pass_manager.as_operation_pass_manager(),
-                                "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})",
-                            )
-                            .is_ok()
-                            && pass_manager.run(&mut module).is_ok();
-
-                        // Tensor-payload deallocation -- see `pipeline.rs::
-                        // emit_object`'s own identical stage for the full
-                        // story (tried, reverted twice, root-caused and
-                        // fixed at the true source, `mlir_lower.rs::load_
-                        // native_shape_field`'s own doc comment).
-                        let pass_manager = pass::PassManager::new(&context);
-                        pass_manager.add_pass(
-                            pass::bufferization::create_ownership_based_buffer_deallocation_pass(),
-                        );
-                        pass_manager.add_pass(
-                            pass::bufferization::create_buffer_deallocation_simplification_pass(),
-                        );
-                        pass_manager
-                            .add_pass(pass::bufferization::create_lower_deallocations_pass());
-                        pass_manager.add_pass(pass::conversion::create_bufferization_to_mem_ref());
-                        let ok = ok && pass_manager.run(&mut module).is_ok();
-
-                        // `--symbol-dce` -- see `pipeline.rs::emit_object`'s
-                        // own identical stage for the full story.
-                        let pass_manager = pass::PassManager::new(&context);
-                        pass_manager.add_pass(pass::transform::create_symbol_dce());
-                        let ok = ok && pass_manager.run(&mut module).is_ok();
-
-                        // `--convert-linalg-to-affine-loops`, not `-to-loops`
-                        // -- see `pipeline.rs::emit_object`'s own identical
-                        // stage for the full story.
-                        let pass_manager = pass::PassManager::new(&context);
-                        pass_manager
-                            .add_pass(pass::linalg::create_convert_linalg_to_affine_loops_pass());
-                        let ok = ok && pass_manager.run(&mut module).is_ok();
-
-                        // FMA fusion -- see `pipeline.rs::emit_object`'s own
-                        // identical stage (and `mark_mulf_addf_contract`'s
-                        // own doc comment) for the full story.
-                        mark_mulf_addf_contract(&context, &mut module);
-
-                        // Structured vectorization -- see `pipeline.rs::
-                        // emit_object`'s own identical stage for the full
-                        // story.
-                        let pass_manager = pass::PassManager::new(&context);
-                        pass::affine::register_affine_vectorize();
-                        let ok = ok
-                            && parse_pass_pipeline(
-                                pass_manager.as_operation_pass_manager(),
-                                "builtin.module(func.func(affine-super-vectorize{virtual-vector-size=16}))",
-                            )
-                            .is_ok()
-                            && pass_manager.run(&mut module).is_ok();
-
-                        let pass_manager = pass::PassManager::new(&context);
-                        pass_manager.add_pass(pass::conversion::create_lower_affine());
-                        pass_manager.add_pass(pass::conversion::create_vector_to_llvm());
-                        pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
-                        pass_manager.add_pass(pass::conversion::create_to_llvm());
-                        pass_manager
-                            .add_pass(pass::conversion::create_reconcile_unrealized_casts());
-                        if !ok || pass_manager.run(&mut module).is_err() {
-                            eprintln!("error: MLIR-to-LLVM lowering pass failed");
-                            exit = ExitCode::FAILURE;
-                        } else {
-                            // See `unify_alloc.rs`'s own module doc comment
-                            // for why this runs here specifically.
-                            cleave::unify_alloc::unify_tensor_allocations(&context, &mut module);
-                            print!("{}", module.as_operation());
+                        // `lower_to_llvm` -- the shared pipeline `--run`
+                        // below also uses, right up to (not including) JIT
+                        // invocation -- this *is* the form that actually
+                        // gets handed to the `ExecutionEngine`, `llvm.*`
+                        // dialect ops standing in for real textual LLVM IR
+                        // (melior/mlir-sys, as vendored, don't expose
+                        // `mlirTranslateModuleToLLVMIR` at all -- real `.ll`
+                        // text isn't reachable without adding a raw FFI
+                        // binding ourselves). `--dump-mlir-lowered` defaults
+                        // OpenMP *off* (see `resolve_codegen_options`'s own
+                        // doc comment) -- pass `--openmp` explicitly to see
+                        // the parallelized form.
+                        let options = match resolve_codegen_options(&args, false) {
+                            Ok(options) => options,
+                            Err(e) => {
+                                eprintln!("error: {e}");
+                                std::process::exit(1);
+                            }
+                        };
+                        match lower_to_llvm(&context, &mut module, &options) {
+                            Ok(()) => print!("{}", module.as_operation()),
+                            Err(errs) => {
+                                for e in &errs {
+                                    eprintln!("error: {e}");
+                                }
+                                exit = ExitCode::FAILURE;
+                            }
                         }
                     }
                 }
@@ -641,155 +625,54 @@ fn real_main() -> ExitCode {
             return ExitCode::FAILURE;
         }
 
-        // Staged as three *separate* `PassManager`s, each run to completion
-        // before the next is even built — found by direct testing to
-        // matter, not just tidier: the identical passes combined into one
-        // single `PassManager`/one `run()` call failed partway (`op was not
-        // bufferized`) even though every individual stage, run to
-        // completion first, succeeds cleanly. Not fully root-caused beyond
-        // that (melior's own pass-manager nesting/ordering semantics across
-        // `add_pass` and a `parse_pass_pipeline`-populated nest — see stage
-        // 2 below — most likely), but empirically robust, so kept as the
-        // working shape rather than chased further.
-        //
-        // Stage 1: a bare `arith.addf` (etc.) on `tensor`-typed operands
-        // (`Ring<Tensor<T,Dims...>>`'s own elementwise impls, `stdlib/linalg/
-        // tensor.cleave`) has no `BufferizableOpInterface` implementation
-        // of its own — only a real structured/named op does — so one-shot-
-        // bufferize (stage 2) can't handle it directly without this first.
-        // Inline, then fuse elementwise tensor ops, *before* bufferization
-        // -- see `pipeline.rs::emit_object`'s own identical stage for the
-        // full story (found via VTune against a real training run,
-        // `examples/mnist-interop`: 75% of wall time inside `Optimizer::
-        // step<Sgd,Network>`, almost all in unlisted callees -- allocation/
-        // copy/free traffic, not compute. Root cause: an SGD update,
-        // `stdlib/optim/optim.cleave`'s own `Ring::sub(model, Scale::scale
-        // (grad, opt.lr))`, lowers to *two separate* `func.func`s called via
-        // ordinary `call` ops -- cleave's own CPS-level inlining never
-        // collapses a cross-algebra dispatch call, so One-Shot Bufferize
-        // materializes two scratch buffers where one would do. `--inline`
-        // puts producer and consumer back in one function body; `--linalg-
-        // fuse-elementwise-ops` (after `--convert-elementwise-to-linalg`)
-        // then fuses them into one `linalg.generic`, one buffer -- verified
-        // directly against this toolchain, and end-to-end against this
-        // exact kernel with zero verification failures at any later stage).
-        let pass_manager = pass::PassManager::new(&context);
-        pass_manager.add_pass(pass::transform::create_inliner());
-        pass_manager.add_pass(pass::linalg::create_convert_elementwise_to_linalg_pass());
-        pass_manager.add_pass(pass::linalg::create_linalg_elementwise_op_fusion_pass());
-        if pass_manager.run(&mut module).is_err() {
-            eprintln!("error: MLIR-to-LLVM lowering pass failed");
+        // `lower_to_llvm` -- shared with `--dump-mlir-lowered` above and
+        // `emit_object` (`pipeline.rs`). `--run` defaults OpenMP *off*
+        // (`resolve_codegen_options`'s own doc comment); pass `--openmp`
+        // explicitly to invoke the parallelized form for real.
+        let options = match resolve_codegen_options(&args, false) {
+            Ok(options) => options,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Err(errs) = lower_to_llvm(&context, &mut module, &options) {
+            for e in &errs {
+                eprintln!("error: {e}");
+            }
             return ExitCode::FAILURE;
         }
 
-        // Destination-passing rewrite -- see `pipeline.rs::emit_object`'s
-        // own identical stage (and `dps_rewrite.rs`'s own module doc
-        // comment) for the full story.
-        eliminate_redundant_field_store_copies(&context, &mut module);
-
-        // Stage 2: `bufferize-function-boundaries=true` — melior's own
-        // zero-argument `create_one_shot_bufferize_pass()` binding has no
-        // way to set this option, so it goes in via a real textual pass-
-        // pipeline string instead (`melior::utility::parse_pass_pipeline`)
-        // — without it, a `tensor`-typed function parameter/return (any
-        // cross-function call involving a `Vector`/`Matrix`) is left
-        // bridged by a `bufferization.to_buffer`/`to_tensor` pair at the
-        // function boundary that nothing later in this pipeline can
-        // legalize (`failed to legalize operation 'bufferization.
-        // to_buffer'`, a real pass failure, found by direct testing) —
-        // this option makes one-shot-bufferize rewrite the function's own
-        // signature directly instead, eliminating the bridge entirely. The
-        // pass must be registered by name first — textual pipeline parsing
-        // looks it up by its own registered name, unlike `add_pass`, which
-        // already has the concrete `Pass` object in hand.
-        let pass_manager = pass::PassManager::new(&context);
-        pass::bufferization::register_one_shot_bufferize_pass();
-        if parse_pass_pipeline(
-            pass_manager.as_operation_pass_manager(),
-            "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})",
-        )
-        .is_err()
-            || pass_manager.run(&mut module).is_err()
-        {
-            eprintln!("error: MLIR-to-LLVM lowering pass failed");
-            return ExitCode::FAILURE;
+        // `shared_library_paths` -- unlike `emit_object` (which only ever
+        // *dumps* an object file, never actually invokes anything through
+        // its own engine, so a dummy stub pointer is sound for `__kmpc_*`
+        // resolvability alone), `--run` really does execute the compiled
+        // code -- if `options.openmp` is on, the emitted `omp.parallel`/
+        // `__kmpc_fork_call` machinery genuinely runs, so it needs *real*
+        // `libomp` symbols, not stubs. `ExecutionEngine::new`'s own third
+        // parameter exists for exactly this: point it at the real `libomp.
+        // dll` and let the JIT resolve `__kmpc_*` from it directly, no stub
+        // registration needed at all.
+        let mut shared_libs: Vec<String> = Vec::new();
+        if options.openmp {
+            match std::env::var("MLIR_SYS_220_PREFIX") {
+                Ok(prefix) => shared_libs.push(format!("{prefix}/bin/libomp.dll")),
+                Err(_) => {
+                    eprintln!(
+                        "error: MLIR_SYS_220_PREFIX must be set (see .cargo/config.toml) to run with --openmp"
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
         }
-
-        // Tensor-payload deallocation -- see `pipeline.rs::emit_object`'s
-        // own identical stage for the full story (tried, reverted twice,
-        // root-caused and fixed at the true source, `mlir_lower.rs::load_
-        // native_shape_field`'s own doc comment).
-        let pass_manager = pass::PassManager::new(&context);
-        pass_manager.add_pass(pass::bufferization::create_ownership_based_buffer_deallocation_pass());
-        pass_manager.add_pass(pass::bufferization::create_buffer_deallocation_simplification_pass());
-        pass_manager.add_pass(pass::bufferization::create_lower_deallocations_pass());
-        pass_manager.add_pass(pass::conversion::create_bufferization_to_mem_ref());
-        if pass_manager.run(&mut module).is_err() {
-            eprintln!("error: MLIR-to-LLVM lowering pass failed");
-            return ExitCode::FAILURE;
-        }
-
-        // `--symbol-dce` -- see `pipeline.rs::emit_object`'s own identical
-        // stage for the full story.
-        let pass_manager = pass::PassManager::new(&context);
-        pass_manager.add_pass(pass::transform::create_symbol_dce());
-        if pass_manager.run(&mut module).is_err() {
-            eprintln!("error: MLIR-to-LLVM lowering pass failed");
-            return ExitCode::FAILURE;
-        }
-
-        // Stage 3: ordinary lowering to the `llvm` dialect — `scf.if` (and
-        // any other structured-control-flow op) has no direct LLVM IR
-        // translation of its own -- `-convert-scf-to-cf` lowers it to the
-        // `cf` dialect's ordinary branches first, which `-convert-to-llvm`
-        // *does* know how to translate. Skipping this produced a hard
-        // native crash (STATUS_ACCESS_VIOLATION), not a clean Rust-level
-        // error -- found by direct testing. `--convert-linalg-to-affine-
-        // loops`, not `-to-loops` -- see `pipeline.rs::emit_object`'s own
-        // identical stage for the full story.
-        let pass_manager = pass::PassManager::new(&context);
-        pass_manager.add_pass(pass::linalg::create_convert_linalg_to_affine_loops_pass());
-        if pass_manager.run(&mut module).is_err() {
-            eprintln!("error: MLIR-to-LLVM lowering pass failed");
-            return ExitCode::FAILURE;
-        }
-
-        // FMA fusion -- see `pipeline.rs::emit_object`'s own identical
-        // stage (and `mark_mulf_addf_contract`'s own doc comment) for the
-        // full story.
-        mark_mulf_addf_contract(&context, &mut module);
-
-        // Structured vectorization -- see `pipeline.rs::emit_object`'s own
-        // identical stage for the full story.
-        let pass_manager = pass::PassManager::new(&context);
-        pass::affine::register_affine_vectorize();
-        if parse_pass_pipeline(
-            pass_manager.as_operation_pass_manager(),
-            "builtin.module(func.func(affine-super-vectorize{virtual-vector-size=16}))",
-        )
-        .is_err()
-            || pass_manager.run(&mut module).is_err()
-        {
-            eprintln!("error: MLIR-to-LLVM lowering pass failed");
-            return ExitCode::FAILURE;
-        }
-
-        let pass_manager = pass::PassManager::new(&context);
-        pass_manager.add_pass(pass::conversion::create_lower_affine());
-        pass_manager.add_pass(pass::conversion::create_vector_to_llvm());
-        pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
-        pass_manager.add_pass(pass::conversion::create_to_llvm());
-        pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-        if pass_manager.run(&mut module).is_err() {
-            eprintln!("error: MLIR-to-LLVM lowering pass failed");
-            return ExitCode::FAILURE;
-        }
-
-        // See `unify_alloc.rs`'s own module doc comment for why this runs
-        // here specifically.
-        cleave::unify_alloc::unify_tensor_allocations(&context, &mut module);
-
-        let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
+        let shared_lib_refs: Vec<&str> = shared_libs.iter().map(String::as_str).collect();
+        let engine = melior::ExecutionEngine::new(
+            &module,
+            options.opt_level as usize,
+            &shared_lib_refs,
+            false,
+            false,
+        );
         // SAFETY: see `cleave::pipeline::register_cleave_rt_symbols`'s own
         // doc comment -- shared with `--emit-object`, which needs the
         // identical registration for a reason specific to it (see there).
@@ -814,12 +697,20 @@ fn real_main() -> ExitCode {
 
     if args.emit_object.is_some() || args.emit_bindings.is_some() {
         let registry = Registry::build(&program);
+        let options = match resolve_codegen_options(&args, true) {
+            Ok(options) => options,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
         if let Err(errs) = cleave::pipeline::emit_from_program(
             &program,
             &registry,
             &sources,
             args.emit_object.as_deref(),
             args.emit_bindings.as_deref(),
+            &options,
         ) {
             for e in &errs {
                 eprintln!("error: {e}");
@@ -836,7 +727,16 @@ fn real_main() -> ExitCode {
 
     if let Some(exe_path) = &args.emit_exe {
         let registry = Registry::build(&program);
-        if let Err(errs) = cleave::pipeline::emit_exe(&program, &registry, &sources, exe_path) {
+        let options = match resolve_codegen_options(&args, true) {
+            Ok(options) => options,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Err(errs) =
+            cleave::pipeline::emit_exe(&program, &registry, &sources, exe_path, &options)
+        {
             for e in &errs {
                 eprintln!("error: {e}");
             }

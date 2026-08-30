@@ -1,5 +1,5 @@
 use cleave::driver::compile;
-use cleave::pipeline::{compile_and_emit, emit_exe};
+use cleave::pipeline::{CodegenOptions, compile_and_emit, emit_exe};
 use cleave::registry::Registry;
 use std::process::Command;
 
@@ -10,7 +10,13 @@ fn build_exe(src: &str, exe_path: &std::path::Path) -> Result<(), Vec<String>> {
     let (result, sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let registry = Registry::build(&program);
-    emit_exe(&program, &registry, &sources, exe_path)
+    emit_exe(
+        &program,
+        &registry,
+        &sources,
+        exe_path,
+        &CodegenOptions::default(),
+    )
 }
 
 /// Regression test for a real, direct-testing-found crash: `emit_object`
@@ -39,6 +45,7 @@ fn emitting_an_object_for_a_program_that_calls_a_real_extern_fn_does_not_crash()
         &[],
         Some(&object_path),
         None,
+        &CodegenOptions::default(),
     );
 
     assert!(
@@ -82,6 +89,7 @@ fn emitting_an_object_for_a_program_with_a_genuinely_custom_extern_fn_does_not_c
         &[],
         Some(&object_path),
         None,
+        &CodegenOptions::default(),
     );
 
     assert!(

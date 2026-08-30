@@ -27,6 +27,92 @@ use melior::pass;
 use melior::utility::{parse_pass_pipeline, register_all_dialects};
 use std::path::{Path, PathBuf};
 
+/// The hardware target a program is being compiled for -- `doc/hld.md`'s
+/// own introduction already commits the project to two reference targets
+/// (CPU, and Vulkan Compute via the `spirv` dialect) as a stated project
+/// value, framed there as "hardware targets fit the same plugin shape as
+/// math algebras (name + cost function + MLIR lowering)". This enum is the
+/// first concrete seam for that commitment -- deliberately a single variant
+/// today (only `Cpu` is real; every pass in `lower_to_llvm` below assumes
+/// it), not a speculative attempt at Vulkan support, which would need its
+/// own real `spirv`-dialect lowering (a separate, much larger undertaking)
+/// before a second variant could mean anything. `CodegenOptions::backend`
+/// exists now specifically so the CLI/`Build` surface doesn't need a
+/// breaking change the day a second variant *does* land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    Cpu,
+}
+
+/// Real codegen configuration, threaded through every pipeline entry point
+/// that lowers to `llvm`-dialect MLIR (`lower_to_llvm` below) or constructs
+/// an `ExecutionEngine` (`emit_object`, and `main.rs`'s own `--run` block).
+/// `Default` reproduces this project's own previously-hardcoded behavior
+/// exactly (`opt_level: 2`, `openmp: true`, `target_cpu`/`target_features:
+/// None` -- i.e. don't stamp anything, leaving whatever `ExecutionEngine`
+/// already defaulted to before this struct existed, untouched) -- adding
+/// this struct is additive, not a behavior change, for any caller that
+/// doesn't ask for something different.
+#[derive(Debug, Clone)]
+pub struct CodegenOptions {
+    /// `0`-`3`, forwarded directly to `melior::ExecutionEngine::new`'s own
+    /// `optimization_level` parameter -- previously a bare hardcoded `2` at
+    /// two separate call sites (`main.rs`'s own `--run` block, and `emit_
+    /// object` below). `doc/backlog.md`'s own record of this project's
+    /// history: lowering it to `0` was tried once, as a one-off compile-
+    /// time measurement, and *explicitly rejected* as a permanent fix (the
+    /// whole point of cleave is genuinely high-performance generated code)
+    /// -- exposing it as a real, explicit, user-chosen option (defaulting
+    /// to the same `2` as before) is a different thing entirely from that
+    /// rejected silent compromise.
+    pub opt_level: u8,
+    /// Whether `lower_to_llvm` applies the OpenMP parallelization stage
+    /// (`--affine-parallelize`/`--convert-scf-to-openmp`/`--convert-openmp-
+    /// to-llvm`) at all. `main.rs`'s own JIT paths (`--run`/`--dump-mlir-
+    /// lowered`) default this `false` at their own call sites -- a
+    /// deliberate, still-standing decision from earlier this session, not
+    /// revisited here: `cleave-rt`'s own arena allocator globals (`ARENA_
+    /// BASE`/`ARENA_CURSOR`/`REGION_DEPTH`, `cleave-rt/src/lib.rs`) are
+    /// deliberately single-threaded `Ordering::Relaxed` atomics, sound only
+    /// because every OpenMP-parallelized region is provably allocator-free
+    /// (`lower_to_llvm`'s own doc comment on the parallelize stage) --
+    /// true today, but not yet stress-tested under real concurrent JIT
+    /// invocation the way the AOT path has been. AOT paths (`emit_object`/
+    /// `emit_exe`/`cleave-build::Build`) default this `true`, matching the
+    /// real, measured 6.6x speedup this mechanism already delivers there.
+    pub openmp: bool,
+    /// `llvm.func`'s own real `target_cpu` string attribute (confirmed
+    /// directly against this toolchain: `mlir-opt` parses and round-trips
+    /// `llvm.func @f() attributes { target_cpu = "..." }` cleanly) --
+    /// `None` leaves it unset, exactly matching this project's own
+    /// previous, unexamined behavior (whatever `ExecutionEngine`/`dump_to_
+    /// object_file` defaults to on their own). `"native"` is a real,
+    /// standard LLVM value, resolved by LLVM's own backend at codegen time
+    /// -- no host-CPU-detection code needed on cleave's own side for it.
+    pub target_cpu: Option<String>,
+    /// `llvm.func`'s own `target_features` attribute -- raw feature text,
+    /// e.g. `"+avx2,+fma"`, converted into the real `#llvm.target_features
+    /// <[...]>` attribute syntax by `stamp_target_cpu` below (confirmed
+    /// directly against this toolchain the same way `target_cpu` was).
+    /// `None` leaves it unset, same reasoning as `target_cpu` above.
+    pub target_features: Option<String>,
+    /// See `Backend`'s own doc comment -- `Cpu` is the only real value
+    /// today; every stage `lower_to_llvm` runs assumes it.
+    pub backend: Backend,
+}
+
+impl Default for CodegenOptions {
+    fn default() -> Self {
+        Self {
+            opt_level: 2,
+            openmp: true,
+            target_cpu: None,
+            target_features: None,
+            backend: Backend::Cpu,
+        }
+    }
+}
+
 /// `collect_units` + `convert_program` + `synthesize_derivatives`, bundled
 /// -- see the module's own doc comment for why every pipeline entry point
 /// needs all three, in this exact order.
@@ -100,6 +186,7 @@ pub fn emit_from_program(
     sources: &SourceMap,
     object_path: Option<&Path>,
     bindings_path: Option<&Path>,
+    options: &CodegenOptions,
 ) -> Result<(), Vec<String>> {
     check_type_errors(program, registry).map_err(|errs| render_all(&errs, sources))?;
     let cps_program = build_optimized_cps(program, registry)?;
@@ -111,7 +198,7 @@ pub fn emit_from_program(
     }
 
     if let Some(object_path) = object_path {
-        emit_object(program, &cps_program, object_path)?;
+        emit_object(program, &cps_program, object_path, options)?;
     }
 
     Ok(())
@@ -145,11 +232,19 @@ pub fn compile_and_emit(
     project_dirs: &[PathBuf],
     object_path: Option<&Path>,
     bindings_path: Option<&Path>,
+    options: &CodegenOptions,
 ) -> Result<(), Vec<String>> {
     let (result, sources) = crate::driver::compile(sources_in, project_dirs);
     let program = result.map_err(|errs| render_all(&errs, &sources))?;
     let registry = Registry::build(&program);
-    emit_from_program(&program, &registry, &sources, object_path, bindings_path)
+    emit_from_program(
+        &program,
+        &registry,
+        &sources,
+        object_path,
+        bindings_path,
+        options,
+    )
 }
 
 /// Shared libraries the JIT's own `ExecutionEngine` needs loaded *alongside*
@@ -323,44 +418,32 @@ fn stamp_op_and_children<'c>(mut op: OperationRefMut<'c, '_>, contract: Attribut
     }
 }
 
-/// The three-stage MLIR-to-`llvm`-dialect lowering pipeline `--run`/`--dump-
-/// mlir-lowered` also use, ending in a real `.o` written to `object_path`
-/// (`ExecutionEngine::dump_to_object_file`) rather than JIT invocation --
-/// see `main.rs`'s own original version of this block for the full
-/// reasoning behind each stage; kept identical here, just parameterized.
-fn emit_object(
-    program: &Program,
-    cps_program: &CpsProgram,
-    object_path: &Path,
+/// The MLIR-to-`llvm`-dialect lowering pipeline shared by *every* pipeline
+/// entry point that needs one -- `main.rs`'s own `--dump-mlir-lowered`/
+/// `--run` blocks, and `emit_object` below (`--emit-object`/`--emit-exe`/
+/// `cleave-build`). Extracted this way specifically to close a real,
+/// already-manifesting drift, not just to add `options`: this pipeline used
+/// to be duplicated three times (`doc/backlog.md`'s own long-standing "three
+/// copies kept manually in sync" framing), and the OpenMP parallelization
+/// stage added earlier this session landed in only *one* of the three
+/// (`emit_object`) -- `--run`/`--dump-mlir-lowered` silently had no
+/// parallelization at all, a real bug waiting to surface the next time
+/// someone touched one copy and forgot the other two. One function, called
+/// from all three sites, makes that class of drift structurally impossible
+/// going forward.
+///
+/// Takes an already-lowered, already-verified `module` (`lower_program` +
+/// `.verify()`, identical at every call site) and runs it all the way to
+/// `llvm`-dialect MLIR in place -- stops short of JIT invocation/object
+/// emission, which differ per caller (`ExecutionEngine::new`'s own
+/// `optimization_level`/`enable_object_dump` arguments are caller-specific,
+/// not part of this shared pipeline).
+pub fn lower_to_llvm<'c>(
+    context: &'c Context,
+    module: &mut Module<'c>,
+    options: &CodegenOptions,
 ) -> Result<(), Vec<String>> {
-    let dialect_registry = DialectRegistry::new();
-    register_all_dialects(&dialect_registry);
-    let context = Context::new();
-    context.append_dialect_registry(&dialect_registry);
-    context.load_all_available_dialects();
-    // Needed for the OpenMP parallelization stage below -- `omp.parallel`/
-    // `omp.wsloop`/`omp.loop_nest` deliberately survive every MLIR-level
-    // pass (confirmed directly: `--convert-openmp-to-llvm` only legalizes
-    // the *operand/region types* inside them to the `llvm` dialect, never
-    // eliminates the ops themselves) and are only ever turned into real
-    // LLVM IR (`__kmpc_fork_call`/`__kmpc_for_static_init_*`/...) at final
-    // translation time, via a *separate* registration
-    // (`mlirRegisterAllLLVMTranslations`, wrapped here) from `register_all_
-    // dialects` above -- confirmed missing before this line by direct
-    // testing: `mlir-translate --mlir-to-llvmir` on a hand-built module
-    // with these passes applied produces genuine `__kmpc_*` calls, but
-    // omitting the equivalent registration on this `Context` is exactly
-    // the kind of gap that fails silently or late, not at parse time.
-    melior::utility::register_all_llvm_translations(&context);
-
-    let mlir_types = collect_mlir_types(program);
-    let struct_schemas = collect_struct_schemas(program);
-    let mut module = lower_program(&context, cps_program, &mlir_types, struct_schemas);
-    if !module.as_operation().verify() {
-        return Err(vec![
-            "generated MLIR module failed verification".to_string(),
-        ]);
-    }
+    let Backend::Cpu = options.backend;
 
     // Inline, then fuse elementwise tensor ops, *before* bufferization --
     // found directly with VTune against a real training run
@@ -404,11 +487,11 @@ fn emit_object(
     // call-site duplication, same shape as any inliner, not the exponential
     // blowup a previous compile-time investigation hit and fixed
     // elsewhere -- `doc/backlog.md`'s own "real root cause of the 738s").
-    let pass_manager = pass::PassManager::new(&context);
+    let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::transform::create_inliner());
     pass_manager.add_pass(pass::linalg::create_convert_elementwise_to_linalg_pass());
     pass_manager.add_pass(pass::linalg::create_linalg_elementwise_op_fusion_pass());
-    if pass_manager.run(&mut module).is_err() {
+    if pass_manager.run(&mut *module).is_err() {
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (inline/elementwise-to-linalg/fuse)".to_string(),
         ]);
@@ -424,16 +507,16 @@ fn emit_object(
     // this rewrite looks for reachable at all -- and *before* One-Shot
     // Bufferize (right below), since it operates on the still-`tensor`-
     // typed, pre-bufferization form of the IR.
-    eliminate_redundant_field_store_copies(&context, &mut module);
+    eliminate_redundant_field_store_copies(context, &mut *module);
 
-    let pass_manager = pass::PassManager::new(&context);
+    let pass_manager = pass::PassManager::new(context);
     pass::bufferization::register_one_shot_bufferize_pass();
     if parse_pass_pipeline(
         pass_manager.as_operation_pass_manager(),
         "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})",
     )
     .is_err()
-        || pass_manager.run(&mut module).is_err()
+        || pass_manager.run(&mut *module).is_err()
     {
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (one-shot-bufferize)".to_string(),
@@ -463,12 +546,12 @@ fn emit_object(
     // writable`, so the promise is genuinely true and this pass — reused
     // here as-is, no longer worked around — frees the *copy*, never the
     // struct's own storage.
-    let pass_manager = pass::PassManager::new(&context);
+    let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::bufferization::create_ownership_based_buffer_deallocation_pass());
     pass_manager.add_pass(pass::bufferization::create_buffer_deallocation_simplification_pass());
     pass_manager.add_pass(pass::bufferization::create_lower_deallocations_pass());
     pass_manager.add_pass(pass::conversion::create_bufferization_to_mem_ref());
-    if pass_manager.run(&mut module).is_err() {
+    if pass_manager.run(&mut *module).is_err() {
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (buffer-deallocation)".to_string(),
         ]);
@@ -482,9 +565,9 @@ fn emit_object(
     // and private. Not just tidiness: leaving these dead, now-unreferenced
     // declarations in place is exactly what made the structured-
     // vectorization stage below hard-fail (see its own doc comment).
-    let pass_manager = pass::PassManager::new(&context);
+    let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::transform::create_symbol_dce());
-    if pass_manager.run(&mut module).is_err() {
+    if pass_manager.run(&mut *module).is_err() {
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (symbol-dce)".to_string(),
         ]);
@@ -493,9 +576,9 @@ fn emit_object(
     // `--convert-linalg-to-affine-loops`, not the ordinary `-to-loops`
     // (`scf.for`) -- see the structured-vectorization stage right below for
     // why: `--affine-super-vectorize` only operates on `affine.for`.
-    let pass_manager = pass::PassManager::new(&context);
+    let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::linalg::create_convert_linalg_to_affine_loops_pass());
-    if pass_manager.run(&mut module).is_err() {
+    if pass_manager.run(&mut *module).is_err() {
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (linalg-to-affine-loops)".to_string(),
         ]);
@@ -538,18 +621,23 @@ fn emit_object(
     // parallel-reductions` defaults `false`, correctly -- accumulation is
     // genuinely loop-carried). One thread per row of the output is coarse-
     // grained but real, sound, and doesn't disturb the SIMD lane packing.
-    let pass_manager = pass::PassManager::new(&context);
-    pass::affine::register_affine_parallelize();
-    if parse_pass_pipeline(
-        pass_manager.as_operation_pass_manager(),
-        "builtin.module(func.func(affine-parallelize{max-nested=1}))",
-    )
-    .is_err()
-        || pass_manager.run(&mut module).is_err()
-    {
-        return Err(vec![
-            "MLIR-to-LLVM lowering pass failed (affine-parallelize)".to_string(),
-        ]);
+    //
+    // Gated on `options.openmp` -- see `CodegenOptions::openmp`'s own doc
+    // comment for the default split (AOT `true`, JIT `false`) and why.
+    if options.openmp {
+        let pass_manager = pass::PassManager::new(context);
+        pass::affine::register_affine_parallelize();
+        if parse_pass_pipeline(
+            pass_manager.as_operation_pass_manager(),
+            "builtin.module(func.func(affine-parallelize{max-nested=1}))",
+        )
+        .is_err()
+            || pass_manager.run(&mut *module).is_err()
+        {
+            return Err(vec![
+                "MLIR-to-LLVM lowering pass failed (affine-parallelize)".to_string(),
+            ]);
+        }
     }
 
     // FMA fusion -- found by disassembling a real emitted object file
@@ -585,7 +673,7 @@ fn emit_object(
     // easy-to-pack `fmul`/`fadd` pair, and only the final instruction-
     // selection step -- which already knows the target has native packed
     // FMA -- decides to fuse, on the now-already-vectorized form).
-    mark_mulf_addf_contract(&context, &mut module);
+    mark_mulf_addf_contract(context, &mut *module);
 
     // Structured vectorization -- found and verified directly against this
     // toolchain, not assumed: `--affine-super-vectorize` (MLIR's own
@@ -627,128 +715,241 @@ fn emit_object(
     // did you intend to nest?") -- needs the same `outer(inner(...))`
     // nesting `mlir-opt`'s own `--pass-pipeline=` flag would, unlike `one-
     // shot-bufferize` above, which really does run at the module level.
-    let pass_manager = pass::PassManager::new(&context);
+    let pass_manager = pass::PassManager::new(context);
     pass::affine::register_affine_vectorize();
     if parse_pass_pipeline(
         pass_manager.as_operation_pass_manager(),
         "builtin.module(func.func(affine-super-vectorize{virtual-vector-size=16}))",
     )
     .is_err()
-        || pass_manager.run(&mut module).is_err()
+        || pass_manager.run(&mut *module).is_err()
     {
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (affine-super-vectorize)".to_string(),
         ]);
     }
 
-    // `--lower-affine`, on its own -- turns the `affine.parallel` the
-    // parallelize stage above produced into `scf.parallel`, and every
-    // remaining `affine.for` (`j`/`k`, still scalar/vector but *not*
-    // OS-thread-parallel) into ordinary `scf.for`. Run as its own pass,
-    // strictly before `--convert-scf-to-openmp` right below -- the next
-    // stage's own `scf.parallel` lowering needs to see it, not `affine.
-    // parallel`.
-    let pass_manager = pass::PassManager::new(&context);
-    pass_manager.add_pass(pass::conversion::create_lower_affine());
-    if pass_manager.run(&mut module).is_err() {
-        return Err(vec![
-            "MLIR-to-LLVM lowering pass failed (lower-affine)".to_string(),
-        ]);
-    }
+    if options.openmp {
+        // `--lower-affine`, on its own -- turns the `affine.parallel` the
+        // parallelize stage above produced into `scf.parallel`, and every
+        // remaining `affine.for` (`j`/`k`, still scalar/vector but *not*
+        // OS-thread-parallel) into ordinary `scf.for`. Run as its own pass,
+        // strictly before `--convert-scf-to-openmp` right below -- the next
+        // stage's own `scf.parallel` lowering needs to see it, not `affine.
+        // parallel`.
+        let pass_manager = pass::PassManager::new(context);
+        pass_manager.add_pass(pass::conversion::create_lower_affine());
+        if pass_manager.run(&mut *module).is_err() {
+            return Err(vec![
+                "MLIR-to-LLVM lowering pass failed (lower-affine)".to_string(),
+            ]);
+        }
 
-    // `--convert-scf-to-openmp` -- the one pass in this whole stage that
-    // actually turns `scf.parallel` into `omp.parallel`/`omp.wsloop`/`omp.
-    // loop_nest`, one real OS thread per outer-loop chunk (`libomp`,
-    // `cleave-rt`'s build now links, provides the actual thread pool at
-    // runtime -- see `doc/backlog.md`'s own OpenMP entry). Load-bearing
-    // that this runs on its own, in this exact spot, before anything else
-    // touches the `scf.for` loops still nested inside that `scf.parallel`
-    // (`j`/`k`, from `--lower-affine` just above) -- found by direct `mlir-
-    // opt` testing, not assumed: this pass wraps the loop body in a `memref.
-    // alloca_scope`, whose own verifier requires a *single-block* region.
-    // That's still true right here (the nested `scf.for`s are each one
-    // structured op, not yet an unrolled multi-block CFG) -- but running
-    // `--convert-scf-to-cf` *before* this point (to "get it out of the
-    // way" early) would have already broken it, and running this pass
-    // *after* `--convert-scf-to-cf` runs anywhere near these loops breaks
-    // it just the same, the moment that pass ever touches them. The actual
-    // fix, verified end-to-end via `mlir-opt`/`mlir-translate` on a real
-    // matmul kernel down to genuine `__kmpc_fork_call`/`__kmpc_for_static_
-    // init_*`/`__kmpc_barrier` calls: `--convert-to-llvm` (below) lowers
-    // `memref.alloca_scope` itself via its own dialect-interface mechanism,
-    // *while the nested loops are still structured* -- only *after* that
-    // succeeds is `--convert-scf-to-cf` safe to run on what's left (the
-    // scoping constraint is gone with `memref.alloca_scope` itself), hence
-    // the *second* `--convert-to-llvm` invocation further below to finish
-    // the job. `scf` itself has no `ConvertToLLVMPatternInterface` of its
-    // own (confirmed: a lone `--convert-to-llvm`, with no explicit `--
-    // convert-scf-to-cf` anywhere, leaves every `scf.for` completely
-    // untouched) -- the two-pass split below is the real fix, not a
-    // roundabout way of doing one pass's job.
-    let pass_manager = pass::PassManager::new(&context);
-    pass_manager.add_pass(pass::conversion::create_scf_to_open_mp());
-    if pass_manager.run(&mut module).is_err() {
-        return Err(vec![
-            "MLIR-to-LLVM lowering pass failed (scf-to-openmp)".to_string(),
-        ]);
-    }
+        // `--convert-scf-to-openmp` -- the one pass in this whole stage that
+        // actually turns `scf.parallel` into `omp.parallel`/`omp.wsloop`/`omp.
+        // loop_nest`, one real OS thread per outer-loop chunk (`libomp`,
+        // `cleave-rt`'s build now links, provides the actual thread pool at
+        // runtime -- see `doc/backlog.md`'s own OpenMP entry). Load-bearing
+        // that this runs on its own, in this exact spot, before anything else
+        // touches the `scf.for` loops still nested inside that `scf.parallel`
+        // (`j`/`k`, from `--lower-affine` just above) -- found by direct `mlir-
+        // opt` testing, not assumed: this pass wraps the loop body in a `memref.
+        // alloca_scope`, whose own verifier requires a *single-block* region.
+        // That's still true right here (the nested `scf.for`s are each one
+        // structured op, not yet an unrolled multi-block CFG) -- but running
+        // `--convert-scf-to-cf` *before* this point (to "get it out of the
+        // way" early) would have already broken it, and running this pass
+        // *after* `--convert-scf-to-cf` runs anywhere near these loops breaks
+        // it just the same, the moment that pass ever touches them. The actual
+        // fix, verified end-to-end via `mlir-opt`/`mlir-translate` on a real
+        // matmul kernel down to genuine `__kmpc_fork_call`/`__kmpc_for_static_
+        // init_*`/`__kmpc_barrier` calls: `--convert-to-llvm` (below) lowers
+        // `memref.alloca_scope` itself via its own dialect-interface mechanism,
+        // *while the nested loops are still structured* -- only *after* that
+        // succeeds is `--convert-scf-to-cf` safe to run on what's left (the
+        // scoping constraint is gone with `memref.alloca_scope` itself), hence
+        // the *second* `--convert-to-llvm` invocation further below to finish
+        // the job. `scf` itself has no `ConvertToLLVMPatternInterface` of its
+        // own (confirmed: a lone `--convert-to-llvm`, with no explicit `--
+        // convert-scf-to-cf` anywhere, leaves every `scf.for` completely
+        // untouched) -- the two-pass split below is the real fix, not a
+        // roundabout way of doing one pass's job.
+        let pass_manager = pass::PassManager::new(context);
+        pass_manager.add_pass(pass::conversion::create_scf_to_open_mp());
+        if pass_manager.run(&mut *module).is_err() {
+            return Err(vec![
+                "MLIR-to-LLVM lowering pass failed (scf-to-openmp)".to_string(),
+            ]);
+        }
 
-    // First `--convert-to-llvm`: alongside `--convert-vector-to-llvm`
-    // (unchanged from before this stage existed) and `--convert-openmp-to-
-    // llvm` (legalizes every operand/region type *inside* the `omp.*` ops
-    // to the `llvm` dialect -- the ops themselves deliberately survive,
-    // see `register_all_llvm_translations`'s own call-site comment above
-    // for why), this is specifically what needs to see `memref.alloca_
-    // scope` while it's still single-block, per the comment above.
-    let pass_manager = pass::PassManager::new(&context);
-    pass_manager.add_pass(pass::conversion::create_vector_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_open_mp_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
-    if pass_manager.run(&mut module).is_err() {
-        return Err(vec![
-            "MLIR-to-LLVM lowering pass failed (vector/openmp/to-llvm)".to_string(),
-        ]);
-    }
+        // First `--convert-to-llvm`: alongside `--convert-vector-to-llvm`
+        // (unchanged from before this stage existed) and `--convert-openmp-to-
+        // llvm` (legalizes every operand/region type *inside* the `omp.*` ops
+        // to the `llvm` dialect -- the ops themselves deliberately survive,
+        // see `register_all_llvm_translations`'s own call-site comment above
+        // for why), this is specifically what needs to see `memref.alloca_
+        // scope` while it's still single-block, per the comment above.
+        let pass_manager = pass::PassManager::new(context);
+        pass_manager.add_pass(pass::conversion::create_vector_to_llvm());
+        pass_manager.add_pass(pass::conversion::create_open_mp_to_llvm());
+        pass_manager.add_pass(pass::conversion::create_to_llvm());
+        if pass_manager.run(&mut *module).is_err() {
+            return Err(vec![
+                "MLIR-to-LLVM lowering pass failed (vector/openmp/to-llvm)".to_string(),
+            ]);
+        }
 
-    // `--convert-scf-to-cf` now finishes off the remaining nested `scf.for`
-    // loops (`memref.alloca_scope` is gone, so its single-block constraint
-    // no longer applies to them) -- and the second `--convert-to-llvm`
-    // mops up the `cf.br`/`cf.cond_br` that produces (`cf`, unlike `scf`,
-    // does have its own `ConvertToLLVMPatternInterface`, confirmed by this
-    // exact sequence leaving zero leftover ops). `omp.parallel`/`omp.
-    // wsloop`/`omp.loop_nest` themselves are still present in the module at
-    // this point -- expected, not a bug, see `register_all_llvm_
-    // translations`'s own comment.
-    let pass_manager = pass::PassManager::new(&context);
-    pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-    if pass_manager.run(&mut module).is_err() {
-        return Err(vec![
-            "MLIR-to-LLVM lowering pass failed (scf-to-cf/to-llvm/reconcile)".to_string(),
-        ]);
+        // `--convert-scf-to-cf` now finishes off the remaining nested `scf.for`
+        // loops (`memref.alloca_scope` is gone, so its single-block constraint
+        // no longer applies to them) -- and the second `--convert-to-llvm`
+        // mops up the `cf.br`/`cf.cond_br` that produces (`cf`, unlike `scf`,
+        // does have its own `ConvertToLLVMPatternInterface`, confirmed by this
+        // exact sequence leaving zero leftover ops). `omp.parallel`/`omp.
+        // wsloop`/`omp.loop_nest` themselves are still present in the module at
+        // this point -- expected, not a bug, see `register_all_llvm_
+        // translations`'s own comment.
+        let pass_manager = pass::PassManager::new(context);
+        pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
+        pass_manager.add_pass(pass::conversion::create_to_llvm());
+        pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
+        if pass_manager.run(&mut *module).is_err() {
+            return Err(vec![
+                "MLIR-to-LLVM lowering pass failed (scf-to-cf/to-llvm/reconcile)".to_string(),
+            ]);
+        }
+    } else {
+        // No OpenMP: the plain, single-group pipeline (`main.rs`'s own
+        // `--run`/`--dump-mlir-lowered` blocks used this exact shape before
+        // `lower_to_llvm` existed) -- `--lower-affine` still needed
+        // regardless (turns every remaining `affine.for` into `scf.for`),
+        // just with no `scf.parallel`/`memref.alloca_scope` complication to
+        // split around.
+        let pass_manager = pass::PassManager::new(context);
+        pass_manager.add_pass(pass::conversion::create_lower_affine());
+        pass_manager.add_pass(pass::conversion::create_vector_to_llvm());
+        pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
+        pass_manager.add_pass(pass::conversion::create_to_llvm());
+        pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
+        if pass_manager.run(&mut *module).is_err() {
+            return Err(vec![
+                "MLIR-to-LLVM lowering pass failed (to-llvm)".to_string(),
+            ]);
+        }
     }
 
     // Gives cleave sole ownership of every tensor payload's own physical
     // memory -- see `unify_alloc.rs`'s own module doc comment for why this
     // runs *here* specifically (right after `--convert-to-llvm`, not
     // before) and why a blanket rename is sound.
-    unify_tensor_allocations(&context, &mut module);
+    unify_tensor_allocations(context, &mut *module);
 
-    let engine = melior::ExecutionEngine::new(&module, 2, &[], true, false);
-    // SAFETY: see `register_cleave_rt_symbols`'s own doc comment.
-    unsafe {
-        register_cleave_rt_symbols(&engine);
-        register_unresolved_extern_stubs(&engine, program);
-        register_openmp_stub_symbols(&engine);
-    }
-    let Some(object_path_str) = object_path.to_str() else {
-        return Err(vec![format!(
-            "object path {object_path:?} is not valid UTF-8"
-        )]);
-    };
-    engine.dump_to_object_file(object_path_str);
+    stamp_target_cpu(context, module, options)?;
+
     Ok(())
+}
+
+/// Stamps `llvm.func`'s own real `target_cpu`/`target_features` attributes
+/// (confirmed directly against this toolchain -- `mlir-opt` parses and
+/// round-trips `llvm.func @f() attributes { target_cpu = "...", target_
+/// features = #llvm.target_features<[...]> }` cleanly) onto every `llvm.
+/// func` in `module`, when `options` asks for either -- a no-op, matching
+/// this project's own previous, unexamined behavior exactly, when both are
+/// `None` (the default). Mirrors `mark_mulf_addf_contract`'s own established
+/// walk-the-module-by-hand shape above, just targeting `llvm.func` instead
+/// of `arith.mulf`/`arith.addf`, and necessarily running *after* `--convert-
+/// to-llvm` (above) -- `llvm.func` doesn't exist before that point, `func.
+/// func` does the same job pre-conversion but carries no such attribute.
+///
+/// `target_features`'s own raw text (`"+avx2,+fma"`, comma-separated,
+/// exactly what a user would type after `-mattr=` in `clang`/`llc`) is
+/// turned into the real `#llvm.target_features<[...]>` attribute syntax
+/// here, each entry individually quoted -- a malformed feature list is a
+/// real, reported `CodegenOptions`-level error (`Attribute::parse` failing),
+/// not a panic, unlike `mark_mulf_addf_contract`'s own fixed, always-valid
+/// literal.
+///
+/// **Known, confirmed-by-disassembly limitation, not a cleave bug**:
+/// stamping these attributes has *no effect* on the code this project's own
+/// emission path (`melior::ExecutionEngine`, both here and in `main.rs`'s
+/// own `--run`) actually generates -- `mlir::ExecutionEngine`'s own C++
+/// implementation (`mlir/lib/ExecutionEngine/ExecutionEngine.cpp`) always
+/// builds its own `TargetMachine` via `JITTargetMachineBuilder::detectHost
+/// ()` unless a caller passes a pre-built one in, and `melior`/`mlir-sys`
+/// (vendored, `C:\dev\mlir-sys`) don't expose that constructor parameter at
+/// all. Confirmed directly, not assumed: disassembling a real emitted
+/// object built with `--target-cpu x86-64-v2` (no AVX/AVX2/AVX-512) still
+/// shows hundreds of `zmm` (AVX-512) instructions, identical to the default
+/// build. `doc/backlog.md` tracks this as a real, open item -- fixing it
+/// for real needs `mlir-sys` extended to expose a real `TargetMachine`
+/// construction path, a separate, larger undertaking, not attempted here.
+/// The warning below exists so a user relying on this flag finds out
+/// immediately, not after a confusing disassembly session of their own.
+fn stamp_target_cpu<'c>(
+    context: &'c Context,
+    module: &mut Module<'c>,
+    options: &CodegenOptions,
+) -> Result<(), Vec<String>> {
+    if options.target_cpu.is_none() && options.target_features.is_none() {
+        return Ok(());
+    }
+    eprintln!(
+        "warning: --target-cpu/--target-features are stamped in the generated MLIR but have \
+         no effect on the actual generated code yet (a real mlir-sys/melior binding \
+         limitation, not a cleave bug -- see doc/backlog.md)"
+    );
+    let target_cpu = match &options.target_cpu {
+        None => None,
+        Some(cpu) => Some(
+            Attribute::parse(context, &format!("\"{cpu}\""))
+                .ok_or_else(|| vec![format!("invalid --target-cpu {cpu:?}")])?,
+        ),
+    };
+    let target_features = match &options.target_features {
+        None => None,
+        Some(features) => {
+            let quoted: Vec<String> = features
+                .split(',')
+                .map(|f| format!("\"{}\"", f.trim()))
+                .collect();
+            Some(
+                Attribute::parse(
+                    context,
+                    &format!("#llvm.target_features<[{}]>", quoted.join(", ")),
+                )
+                .ok_or_else(|| {
+                    vec![format!("invalid --target-features {features:?}")]
+                })?,
+            )
+        }
+    };
+    stamp_llvm_func_attrs(module.as_operation_mut(), target_cpu, target_features);
+    Ok(())
+}
+
+fn stamp_llvm_func_attrs<'c>(
+    mut op: OperationRefMut<'c, '_>,
+    target_cpu: Option<Attribute<'c>>,
+    target_features: Option<Attribute<'c>>,
+) {
+    if matches!(op.name().as_string_ref().as_str(), Ok("llvm.func")) {
+        if let Some(cpu) = target_cpu {
+            op.set_attribute("target_cpu", cpu);
+        }
+        if let Some(features) = target_features {
+            op.set_attribute("target_features", features);
+        }
+    }
+    for region in op.regions() {
+        let mut next_block = region.first_block();
+        while let Some(block) = next_block {
+            let mut next_op = block.first_operation_mut();
+            while let Some(child) = next_op {
+                next_op = child.next_in_block_mut();
+                stamp_llvm_func_attrs(child, target_cpu, target_features);
+            }
+            next_block = block.next_in_region();
+        }
+    }
 }
 
 /// `register_cleave_rt_symbols`'s own doc comment establishes that `Execution
@@ -799,6 +1000,61 @@ unsafe fn register_unresolved_extern_stubs(engine: &melior::ExecutionEngine, pro
             engine.register_symbol(symbol, dummy_extern_stub as *mut ());
         }
     }
+}
+
+/// Builds the module (`lower_program` + verify), runs it through `lower_
+/// to_llvm`, and dumps a real `.o` to `object_path` via `ExecutionEngine::
+/// dump_to_object_file` -- the shared implementation behind `--emit-object`/
+/// `--emit-bindings`/`--emit-exe`/`cleave-build`.
+fn emit_object(
+    program: &Program,
+    cps_program: &CpsProgram,
+    object_path: &Path,
+    options: &CodegenOptions,
+) -> Result<(), Vec<String>> {
+    let dialect_registry = DialectRegistry::new();
+    register_all_dialects(&dialect_registry);
+    let context = Context::new();
+    context.append_dialect_registry(&dialect_registry);
+    context.load_all_available_dialects();
+    // Needed for the OpenMP parallelization stage (`lower_to_llvm`) -- `omp.
+    // parallel`/`omp.wsloop`/`omp.loop_nest` deliberately survive every
+    // MLIR-level pass and are only ever turned into real LLVM IR (`__kmpc_
+    // fork_call`/...) at final translation time, via a *separate*
+    // registration (`mlirRegisterAllLLVMTranslations`, wrapped here) from
+    // `register_all_dialects` above. Registered unconditionally, even when
+    // `options.openmp` is `false` -- cheap, and simpler than threading the
+    // option one layer further just to skip it.
+    melior::utility::register_all_llvm_translations(&context);
+
+    let mlir_types = collect_mlir_types(program);
+    let struct_schemas = collect_struct_schemas(program);
+    let mut module = lower_program(&context, cps_program, &mlir_types, struct_schemas);
+    if !module.as_operation().verify() {
+        return Err(vec![
+            "generated MLIR module failed verification".to_string(),
+        ]);
+    }
+
+    lower_to_llvm(&context, &mut module, options)?;
+
+    let engine =
+        melior::ExecutionEngine::new(&module, options.opt_level as usize, &[], true, false);
+    // SAFETY: see `register_cleave_rt_symbols`'s own doc comment.
+    unsafe {
+        register_cleave_rt_symbols(&engine);
+        register_unresolved_extern_stubs(&engine, program);
+        if options.openmp {
+            register_openmp_stub_symbols(&engine);
+        }
+    }
+    let Some(object_path_str) = object_path.to_str() else {
+        return Err(vec![format!(
+            "object path {object_path:?} is not valid UTF-8"
+        )]);
+    };
+    engine.dump_to_object_file(object_path_str);
+    Ok(())
 }
 
 /// The exact same `ExecutionEngine::new`/`dump_to_object_file`-needs-every-
@@ -953,6 +1209,7 @@ pub fn emit_exe(
     registry: &Registry,
     sources: &SourceMap,
     exe_path: &Path,
+    options: &CodegenOptions,
 ) -> Result<(), Vec<String>> {
     check_type_errors(program, registry).map_err(|errs| render_all(&errs, sources))?;
     let mut cps_program = build_optimized_cps(program, registry)?;
@@ -983,7 +1240,7 @@ pub fn emit_exe(
     let object_path = work_dir.join("program.o");
     let shim_path = work_dir.join("shim.rs");
 
-    emit_object(program, &cps_program, &object_path)?;
+    emit_object(program, &cps_program, &object_path, options)?;
 
     let shim_src = if main_returns_i32 {
         format!(
@@ -998,26 +1255,8 @@ pub fn emit_exe(
         .map_err(|e| vec![format!("failed to write {}: {e}", shim_path.display())])?;
 
     let runtime_dir = cleave_rt_search_dir()?;
-    // `-l libomp` (not `-l omp` -- the real installed file is genuinely
-    // named `libomp.lib`, the cross-platform LLVM convention, and `rustc`
-    // on an `-msvc` target passes an `-l` name straight through to `link.
-    // exe` as `NAME.lib` with no automatic prefix-stripping the way a GNU
-    // linker would) -- needed the moment `emit_object`'s own OpenMP
-    // parallelization stage is ever exercised (`register_openmp_stub_
-    // symbols`'s own doc comment: the emitted object always carries real,
-    // unresolved `__kmpc_*` relocations once any linalg-derived kernel
-    // exists, unconditionally, not just for programs that look
-    // "parallel"). `MLIR_SYS_220_PREFIX` (`.cargo/config.toml`, the same
-    // env var `mlir-sys`'s own build script already keys off of) is reused
-    // here rather than a second, independently-maintained path -- `/lib`
-    // under it is exactly where the real toolchain install puts `libomp.
-    // lib` (confirmed directly, alongside every other real `.lib` this
-    // build already links against).
-    let mlir_prefix = std::env::var("MLIR_SYS_220_PREFIX").map_err(|_| {
-        vec!["MLIR_SYS_220_PREFIX must be set (see .cargo/config.toml) to link libomp".to_string()]
-    })?;
-    let status = std::process::Command::new("rustc")
-        .arg(&shim_path)
+    let mut cmd = std::process::Command::new("rustc");
+    cmd.arg(&shim_path)
         .arg("-o")
         .arg(exe_path)
         .arg("-C")
@@ -1025,12 +1264,35 @@ pub fn emit_exe(
         .arg("-L")
         .arg(&runtime_dir)
         .arg("-l")
-        .arg("cleave_rt")
-        .arg("-L")
-        .arg(format!("{mlir_prefix}/lib"))
-        .arg("-l")
-        .arg("libomp")
-        .status();
+        .arg("cleave_rt");
+    if options.openmp {
+        // `-l libomp` (not `-l omp` -- the real installed file is genuinely
+        // named `libomp.lib`, the cross-platform LLVM convention, and `rustc`
+        // on an `-msvc` target passes an `-l` name straight through to `link.
+        // exe` as `NAME.lib` with no automatic prefix-stripping the way a GNU
+        // linker would) -- needed whenever `emit_object`'s own OpenMP
+        // parallelization stage was exercised (`register_openmp_stub_
+        // symbols`'s own doc comment: the emitted object carries real,
+        // unresolved `__kmpc_*` relocations once any linalg-derived kernel
+        // exists and `options.openmp` was on). `MLIR_SYS_220_PREFIX` (`.cargo/
+        // config.toml`, the same env var `mlir-sys`'s own build script
+        // already keys off of) is reused here rather than a second,
+        // independently-maintained path -- `/lib` under it is exactly where
+        // the real toolchain install puts `libomp.lib` (confirmed directly,
+        // alongside every other real `.lib` this build already links
+        // against).
+        let mlir_prefix = std::env::var("MLIR_SYS_220_PREFIX").map_err(|_| {
+            vec![
+                "MLIR_SYS_220_PREFIX must be set (see .cargo/config.toml) to link libomp"
+                    .to_string(),
+            ]
+        })?;
+        cmd.arg("-L")
+            .arg(format!("{mlir_prefix}/lib"))
+            .arg("-l")
+            .arg("libomp");
+    }
+    let status = cmd.status();
     let _ = std::fs::remove_dir_all(&work_dir);
     match status {
         Ok(s) if s.success() => Ok(()),

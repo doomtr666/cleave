@@ -65,6 +65,11 @@ pub fn compile_library(name: &str, files: &[&str]) {
 
 pub struct Build {
     files: Vec<PathBuf>,
+    opt_level: Option<u8>,
+    openmp: Option<bool>,
+    target_cpu: Option<String>,
+    target_features: Option<String>,
+    backend: Option<cleave::pipeline::Backend>,
 }
 
 impl Default for Build {
@@ -75,11 +80,57 @@ impl Default for Build {
 
 impl Build {
     pub fn new() -> Self {
-        Build { files: Vec::new() }
+        Build {
+            files: Vec::new(),
+            opt_level: None,
+            openmp: None,
+            target_cpu: None,
+            target_features: None,
+            backend: None,
+        }
     }
 
     pub fn file(&mut self, path: impl Into<PathBuf>) -> &mut Self {
         self.files.push(path.into());
+        self
+    }
+
+    /// `0`-`3` -- see `cleave::pipeline::CodegenOptions::opt_level`'s own
+    /// doc comment. Unset (the default) reproduces this project's own
+    /// previous, unexamined behavior (`2`) exactly.
+    pub fn opt_level(&mut self, level: u8) -> &mut Self {
+        self.opt_level = Some(level);
+        self
+    }
+
+    /// See `cleave::pipeline::CodegenOptions::openmp`'s own doc comment.
+    /// Unset defaults to `true` here -- `cleave-build` is always an AOT
+    /// path (`compile_and_emit`'s own object-file emission, never JIT
+    /// invocation), matching `--emit-object`'s own default.
+    pub fn openmp(&mut self, enabled: bool) -> &mut Self {
+        self.openmp = Some(enabled);
+        self
+    }
+
+    /// See `cleave::pipeline::CodegenOptions::target_cpu`'s own doc
+    /// comment. Unset (the default) leaves it unstamped, same as before
+    /// this method existed.
+    pub fn target_cpu(&mut self, cpu: impl Into<String>) -> &mut Self {
+        self.target_cpu = Some(cpu.into());
+        self
+    }
+
+    /// See `cleave::pipeline::CodegenOptions::target_features`'s own doc
+    /// comment.
+    pub fn target_features(&mut self, features: impl Into<String>) -> &mut Self {
+        self.target_features = Some(features.into());
+        self
+    }
+
+    /// See `cleave::pipeline::Backend`'s own doc comment -- `Cpu` is the
+    /// only real value today.
+    pub fn backend(&mut self, backend: cleave::pipeline::Backend) -> &mut Self {
+        self.backend = Some(backend);
         self
     }
 
@@ -137,6 +188,16 @@ impl Build {
         // (stable since 1.63) lets the spawned thread still borrow `sources`
         // /`project_dirs`/the two `Path`s directly, no cloning into `'static`
         // needed just to give it its own stack.
+        // `openmp` defaults `true` here (unlike `--run`'s own CLI default)
+        // -- `cleave-build` is always an AOT path, matching `--emit-object`.
+        let options = cleave::pipeline::CodegenOptions {
+            opt_level: self.opt_level.unwrap_or(2),
+            openmp: self.openmp.unwrap_or(true),
+            target_cpu: self.target_cpu.clone(),
+            target_features: self.target_features.clone(),
+            backend: self.backend.unwrap_or(cleave::pipeline::Backend::Cpu),
+        };
+
         let result = std::thread::scope(|scope| {
             std::thread::Builder::new()
                 .stack_size(1024 * 1024 * 1024)
@@ -146,6 +207,7 @@ impl Build {
                         &project_dirs,
                         Some(&object_path),
                         Some(&bindings_path),
+                        &options,
                     )
                 })
                 .expect("cleave-build: failed to spawn the compile thread")
@@ -160,48 +222,52 @@ impl Build {
         println!("cargo:rustc-link-lib=static=cleave_rt");
         println!("cargo:rustc-link-search=native={}", build_cleave_rt(&out_dir).display());
 
-        // `libomp` -- needed the moment `emit_object`'s own OpenMP
-        // parallelization stage is ever exercised (`cleave::pipeline::
-        // register_openmp_stub_symbols`'s own doc comment: the emitted
-        // object always carries real, unresolved `__kmpc_*` relocations
-        // once any linalg-derived kernel exists at all, unconditionally --
-        // confirmed directly, the first `cargo build` of a real interop
-        // example through this exact function after that stage landed
-        // failed with `LNK2019: symbole externe non résolu __kmpc_*`). The
-        // real, installed file is named `libomp.lib` (LLVM's own cross-
-        // platform convention) -- `dylib=libomp`, not `dylib=omp`, since an
-        // `-msvc` target's linker takes an `-l`-equivalent name verbatim
-        // (`NAME.lib`), no GNU-style prefix assumed. Same `MLIR_SYS_220_
-        // PREFIX` (`.cargo/config.toml`) `mlir-sys`'s own build script
-        // already keys off of, reused rather than a second, independently-
-        // maintained path -- cargo's own `[env]` mechanism hands it to
-        // every build-script process, this one included.
-        let mlir_prefix = env::var("MLIR_SYS_220_PREFIX")
-            .expect("MLIR_SYS_220_PREFIX must be set (see .cargo/config.toml) to link libomp");
-        println!("cargo:rustc-link-lib=dylib=libomp");
-        println!("cargo:rustc-link-search=native={mlir_prefix}/lib");
+        if options.openmp {
+            // `libomp` -- needed the moment `emit_object`'s own OpenMP
+            // parallelization stage was exercised (`cleave::pipeline::
+            // register_openmp_stub_symbols`'s own doc comment: the emitted
+            // object carries real, unresolved `__kmpc_*` relocations
+            // whenever a linalg-derived kernel exists and `options.openmp`
+            // was on -- confirmed directly, the first `cargo build` of a
+            // real interop example through this exact function after that
+            // stage landed failed with `LNK2019: symbole externe non
+            // résolu __kmpc_*`). The real, installed file is named `libomp.
+            // lib` (LLVM's own cross-platform convention) -- `dylib=libomp`,
+            // not `dylib=omp`, since an `-msvc` target's linker takes an
+            // `-l`-equivalent name verbatim (`NAME.lib`), no GNU-style
+            // prefix assumed. Same `MLIR_SYS_220_PREFIX` (`.cargo/config.
+            // toml`) `mlir-sys`'s own build script already keys off of,
+            // reused rather than a second, independently-maintained path --
+            // cargo's own `[env]` mechanism hands it to every build-script
+            // process, this one included.
+            let mlir_prefix = env::var("MLIR_SYS_220_PREFIX")
+                .expect("MLIR_SYS_220_PREFIX must be set (see .cargo/config.toml) to link libomp");
+            println!("cargo:rustc-link-lib=dylib=libomp");
+            println!("cargo:rustc-link-search=native={mlir_prefix}/lib");
 
-        // `libomp.dll` itself, copied next to the *final* binary -- linking
-        // above only satisfies the linker; `libomp` is a real, dynamically-
-        // loaded runtime (Windows has no static-link story for it), so the
-        // finished executable also needs the `.dll` findable through its
-        // own DLL search order at process-start time, same as any other
-        // runtime dependency Windows resolves outside of `PATH`/`rustc`'s
-        // own knowledge. `OUT_DIR` (`target/<profile>/build/<pkg-hash>/
-        // out`) sits exactly three directories below `target/<profile>/`,
-        // where cargo actually places the finished binary -- confirmed
-        // directly against a real build, not assumed. Best-effort
-        // (`let _ =`, not `.expect(...)`): a failed copy here shouldn't
-        // fail the whole build over what's fundamentally a convenience for
-        // running the binary straight out of `target/`, and every other
-        // real deployment path (an installed/packaged binary) needs its
-        // own real answer to "where does `libomp.dll` come from" anyway,
-        // not this one.
-        if let Some(target_profile_dir) = out_dir.ancestors().nth(3) {
-            let _ = std::fs::copy(
-                format!("{mlir_prefix}/bin/libomp.dll"),
-                target_profile_dir.join("libomp.dll"),
-            );
+            // `libomp.dll` itself, copied next to the *final* binary --
+            // linking above only satisfies the linker; `libomp` is a real,
+            // dynamically-loaded runtime (Windows has no static-link story
+            // for it), so the finished executable also needs the `.dll`
+            // findable through its own DLL search order at process-start
+            // time, same as any other runtime dependency Windows resolves
+            // outside of `PATH`/`rustc`'s own knowledge. `OUT_DIR` (`target/
+            // <profile>/build/<pkg-hash>/out`) sits exactly three
+            // directories below `target/<profile>/`, where cargo actually
+            // places the finished binary -- confirmed directly against a
+            // real build, not assumed. Best-effort (`let _ =`, not `.expect
+            // (...)`): a failed copy here shouldn't fail the whole build
+            // over what's fundamentally a convenience for running the
+            // binary straight out of `target/`, and every other real
+            // deployment path (an installed/packaged binary) needs its own
+            // real answer to "where does `libomp.dll` come from" anyway,
+            // not this one.
+            if let Some(target_profile_dir) = out_dir.ancestors().nth(3) {
+                let _ = std::fs::copy(
+                    format!("{mlir_prefix}/bin/libomp.dll"),
+                    target_profile_dir.join("libomp.dll"),
+                );
+            }
         }
     }
 }
