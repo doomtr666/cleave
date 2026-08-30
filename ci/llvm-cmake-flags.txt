@@ -1,0 +1,37 @@
+# The exact CMake configuration this project's own LLVM 22 / MLIR / openmp
+# toolchain needs -- verified directly against real builds this same
+# session (`doc/backlog.md`'s own OpenMP-parallelization work). Single
+# source of truth, read by `.github/workflows/ci.yml`'s own cache-key
+# computation (so the cache key changes the moment this file does) and its
+# `cmake` configure step (so the two never drift the way a copy-pasted flag
+# list would).
+#
+# One `-D<name>=<value>` per line, `#`-prefixed comments and blank lines
+# ignored by the workflow's own parsing.
+
+CMAKE_BUILD_TYPE=Release
+# `clang` included even though this project never calls it directly --
+# openmp's own in-tree build (`LLVM_ENABLE_PROJECTS=openmp`, not the newer
+# `LLVM_ENABLE_RUNTIMES=openmp`, which bootstraps through a *freshly-built*
+# clang anyway) unconditionally wires its own optional lit-test targets
+# (`check-openmp`/`check-libomp`/`check-ompt`) to a real `clang` target --
+# confirmed directly against this exact LLVM tag: `openmp/cmake/
+# OpenMPTesting.cmake`'s own `ENABLE_CHECK_TARGETS` is a plain variable,
+# unconditionally reset on every configure, not a cache variable any `-D`
+# flag could override. Building `clang` for real (rather than patching this
+# out, tried and deliberately reverted -- keeping this repo free of LLVM
+# source patches was worth the extra build time) satisfies that dependency
+# honestly instead of working around it.
+LLVM_ENABLE_PROJECTS=clang;mlir;openmp
+# Confirmed unrelated to this project's own real compile-time issues
+# (`doc/backlog.md`'s own "L'hypothèse LLVM_ENABLE_ASSERTIONS était une
+# fausse piste" item) -- kept on for real correctness value in CI
+# specifically, matching the dev toolchain exactly.
+LLVM_ENABLE_ASSERTIONS=ON
+LLVM_ENABLE_RTTI=OFF
+LLVM_TARGETS_TO_BUILD=Native
+LLVM_OPTIMIZED_TABLEGEN=OFF
+LLVM_INSTALL_UTILS=OFF
+# DIA SDK needs the ATL optional component, not installed on every MSVC
+# toolset -- irrelevant to MLIR/openmp anyway (`doc/backlog.md`).
+LLVM_ENABLE_DIA_SDK=OFF

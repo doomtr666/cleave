@@ -1,3 +1,13 @@
-[env]
-MLIR_SYS_220_PREFIX = "I:/Dev/llvm-mlir-22"
-TABLEGEN_220_PREFIX = "I:/Dev/llvm-mlir-22"
+# `MLIR_SYS_220_PREFIX`/`TABLEGEN_220_PREFIX` -- `mlir-sys`'s own build
+# script needs these pointing at a real, installed LLVM 22 + MLIR (+ openmp,
+# for this project's own OpenMP parallelization stage, `cleave/src/
+# pipeline.rs`) toolchain -- see `doc/backlog.md`/`ci/llvm-cmake-flags.txt`
+# for the exact CMake configuration this project's own toolchain needs.
+#
+# Deliberately *not* set here anymore -- this used to hardcode a machine-
+# specific absolute path (`I:/Dev/llvm-mlir-22`), which broke on every other
+# machine, CI included, the moment anyone else tried to build this repo.
+# Set both yourself, in your own shell profile (or, for CI, in the workflow
+# itself, `.github/workflows/ci.yml`) -- e.g. on Windows PowerShell:
+#   [Environment]::SetEnvironmentVariable("MLIR_SYS_220_PREFIX", "C:\llvm-mlir-22", "User")
+#   [Environment]::SetEnvironmentVariable("TABLEGEN_220_PREFIX", "C:\llvm-mlir-22", "User")

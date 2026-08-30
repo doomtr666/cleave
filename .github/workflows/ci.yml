@@ -1,0 +1,91 @@
+name: ci
+
+# Windows-only -- the whole point of this project's own toolchain
+# (`doc/hld.md`'s own CPU target, `cleave-rt`'s own MSVC-specific bits, the
+# `mlir-sys` fork this depends on, `doomtr666/mlir-sys`'s own `fix/windows-
+# msvc-static-linking` branch) is Windows/MSVC-specific work that has no
+# equivalent upstream CI coverage today (`mlir-sys`'s own CI, `ubuntu-
+# latest`/`macos-latest` only, confirmed directly -- exactly why these bugs
+# went unnoticed there).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    # A cold cache means a real, full LLVM+clang+MLIR+openmp build from
+    # source (`ci/llvm-cmake-flags.txt` -- `clang` included so openmp's own
+    # in-tree test-target wiring has a real `clang` target to depend on,
+    # avoiding any LLVM source patch -- see that file's own doc comment)
+    # -- genuinely unmeasured on a GitHub-hosted Windows runner as of
+    # writing (this project's own dev toolchain was only ever built/
+    # rebuilt incrementally, and never included `clang` at all). 350, not
+    # the hard 360-minute (6h) ceiling, to leave a little room for the job
+    # to actually report failure cleanly rather than being killed mid-step.
+    timeout-minutes: 350
+    steps:
+      - name: Checkout cleave
+        uses: actions/checkout@v4
+
+      - name: Cache LLVM/clang/MLIR/openmp toolchain
+        id: llvm-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\llvm-mlir-22
+          # `llvmorg-22.1.0` is the pinned LLVM tag itself (see the build
+          # step below) -- included directly in the key (not just via
+          # hashFiles) so bumping the tag also busts the cache, without
+          # needing the tag repeated in a third place.
+          key: llvm-mlir-22-llvmorg-22.1.0-${{ hashFiles('ci/llvm-cmake-flags.txt') }}
+
+      # Needed unconditionally, cache hit or not -- `cargo build` itself
+      # needs `link.exe` on an `-msvc` target regardless of whether LLVM was
+      # just built or restored from cache.
+      - name: Set up MSVC dev environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Set up Ninja
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        uses: seanmiddleditch/gha-setup-ninja@v4
+
+      - name: Build LLVM/clang/MLIR/openmp from source (cache miss only)
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $llvmSrc = Join-Path $env:RUNNER_TEMP "llvm-project"
+          git clone --branch llvmorg-22.1.0 --depth 1 https://github.com/llvm/llvm-project.git $llvmSrc
+
+          $flags = Get-Content "${{ github.workspace }}\ci\llvm-cmake-flags.txt" |
+            Where-Object { $_.Trim() -and -not $_.Trim().StartsWith('#') } |
+            ForEach-Object { "-D$($_.Trim())" }
+
+          cmake -S "$llvmSrc\llvm" -B "$llvmSrc\build" -G Ninja `
+            @flags `
+            -DCMAKE_INSTALL_PREFIX=C:/llvm-mlir-22
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
+
+          cmake --build "$llvmSrc\build" --target install
+          if ($LASTEXITCODE -ne 0) { throw "cmake --build (ninja install) failed" }
+
+      - name: Point mlir-sys at the toolchain
+        shell: pwsh
+        run: |
+          Add-Content $env:GITHUB_ENV "MLIR_SYS_220_PREFIX=C:\llvm-mlir-22"
+          Add-Content $env:GITHUB_ENV "TABLEGEN_220_PREFIX=C:\llvm-mlir-22"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # No `--workspace` -- deliberately respects `Cargo.toml`'s own
+      # `default-members` (`digits-interop`/`mnist-interop` need real
+      # network access and take minutes, a poor fit for an ordinary CI
+      # sweep -- `Cargo.toml`'s own doc comment already explains this).
+      - name: cargo build
+        run: cargo build --release
+
+      - name: cargo test
+        run: cargo test --release --no-fail-fast

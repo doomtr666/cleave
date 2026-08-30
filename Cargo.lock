@@ -459,6 +459,7 @@ dependencies = [
 [[package]]
 name = "mlir-sys"
 version = "220.0.2"
+source = "git+https://github.com/doomtr666/mlir-sys?branch=fix%2Fwindows-msvc-static-linking#76ed0777a5c9aef512d90d0cc02d703192a644d0"
 dependencies = [
  "bindgen",
 ]

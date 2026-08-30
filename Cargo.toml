@@ -20,11 +20,13 @@ resolver = "3"
 # https://github.com/mlir-rs/mlir-sys/pull -- three Windows/MSVC static-
 # linking bugs (enum signedness, a doubled `.lib` suffix, and static-lib
 # discovery assuming Unix `lib*.a` naming) all fixed here, none yet released
-# upstream. Vendored locally at C:/dev/mlir-sys (full git history, `origin`
-# tracking the real upstream, `fork` tracking the PR branch) rather than a
-# bare git dependency, so `cargo build` doesn't depend on network access to
-# GitHub at all once cloned.
-mlir-sys = { path = "C:/dev/mlir-sys" }
+# upstream. A real `git` dependency (not a local `path`, which this project
+# used until CI needed to build on a machine that obviously doesn't have
+# `C:/dev/mlir-sys` -- a real portability gap for any fresh clone, not just
+# CI, closed here rather than worked around) -- `doomtr666/mlir-sys`'s own
+# `fix/windows-msvc-static-linking` branch, confirmed actually pushed there
+# (`git ls-remote`), not just present in a local checkout.
+mlir-sys = { git = "https://github.com/doomtr666/mlir-sys", branch = "fix/windows-msvc-static-linking" }
 # tblgen 0.9.1 (crates.io) fails to build on MSVC -- its own bundled C++
 # wrapper needs C++20, its build.rs forces C++17. Already fixed on `main`,
 # just not released yet -- tracking `main` directly here since there's
