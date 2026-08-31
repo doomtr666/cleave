@@ -4548,25 +4548,24 @@ fn a_dynarray_grows_past_its_initial_capacity_and_reads_back_correct_values() {
 }
 
 /// The struct-element proof (`doc/backlog-done.md`'s own note on why this
-/// was scoped into v1 rather than deferred): every cleave struct value is
-/// already an opaque pointer, so `DynArray<Point>` reuses the *exact same*
-/// `_ptr`-suffixed `cleave-rt` functions the scalar-width impls use, via one
-/// small `impl RawBuffer<Point>` written here (mechanical, zero new Rust
-/// code) — direct end-to-end evidence a real heap-referenced struct
-/// round-trips correctly through the raw pointer-width buffer, not just a
-/// scalar.
+/// was scoped into v1 rather than deferred, and its own later "`DynArray<T>`
+/// needs a hand-written `impl RawBuffer<Struct>` per struct element type"
+/// entry): every cleave struct value is already an opaque pointer, so
+/// `DynArray<Point>` reuses the *exact same* `_ptr`-suffixed `cleave-rt`
+/// functions the scalar-width impls use — no `impl RawBuffer<Point>` written
+/// here at all any more, unlike this test's own original version: `Point`'s
+/// own marker impl (`impl HeapStruct<Point> {}`) is synthesized automatically
+/// by `driver::synthesize_heap_struct_marker_impls`, which `stdlib/dynarray/
+/// dynarray.cleave`'s own `impl<S: HeapStruct> RawBuffer<S>` then binds `S`
+/// to — direct end-to-end evidence a real heap-referenced struct round-trips
+/// correctly through the raw pointer-width buffer with zero per-type
+/// boilerplate, not just that the mechanism it replaced used to work.
 #[test]
 fn a_dynarray_of_structs_grows_and_reads_back_correct_field_values() {
     let context = context();
     let src = "
         use dynarray;
         struct Point { x: f64, y: f64 }
-        impl RawBuffer<Point> {
-            extern(dynarray_alloc_ptr) fn alloc(cap: i32) -> RawBuf;
-            extern(dynarray_grow_ptr) fn grow(buf: RawBuf, old_cap: i32, new_cap: i32) -> RawBuf;
-            extern(dynarray_get_ptr) fn get(buf: RawBuf, i: i32) -> Point;
-            extern(dynarray_set_ptr) fn set(buf: RawBuf, i: i32, x: Point);
-        }
         fn main() -> i32 {
             let v: DynArray<Point> = dynarray_new(4);
             v.push(Point(x: 1.0, y: 2.0));
@@ -4577,6 +4576,44 @@ fn a_dynarray_of_structs_grows_and_reads_back_correct_field_values() {
             let p0: Point = v.get(0);
             let p4: Point = v.get(4);
             if v.len() == 5 and p0.x == 1.0 and p0.y == 2.0 and p4.x == 9.0 and p4.y == 10.0 { 1 } else { 0 }
+        }
+    ";
+    let symbols: &[(&str, *mut ())] = &[
+        (
+            "dynarray_alloc_ptr",
+            cleave_rt::dynarray_alloc_ptr as *mut (),
+        ),
+        ("dynarray_grow_ptr", cleave_rt::dynarray_grow_ptr as *mut ()),
+        ("dynarray_get_ptr", cleave_rt::dynarray_get_ptr as *mut ()),
+        ("dynarray_set_ptr", cleave_rt::dynarray_set_ptr as *mut ()),
+    ];
+    assert_eq!(run_i32_with_dynarray_symbols(&context, src, symbols), 1);
+}
+
+/// `driver::synthesize_heap_struct_marker_impls`'s own real dispatch
+/// concern: *two* different, unrelated struct types, each getting its own
+/// independently-synthesized `impl HeapStruct<...> {}`, both resolving
+/// `RawBuffer<S>`'s single shared generic impl correctly — proves the
+/// synthesized marker is genuinely per-struct, not accidentally shared or
+/// order-dependent between two structs declared in the same program.
+#[test]
+fn dynarrays_of_two_different_struct_types_both_dispatch_correctly_in_one_program() {
+    let context = context();
+    let src = "
+        use dynarray;
+        struct Point { x: f64, y: f64 }
+        struct Pair { a: i32, b: i32 }
+        fn main() -> i32 {
+            let points: DynArray<Point> = dynarray_new(4);
+            points.push(Point(x: 1.0, y: 2.0));
+            points.push(Point(x: 3.0, y: 4.0));
+            let pairs: DynArray<Pair> = dynarray_new(4);
+            pairs.push(Pair(a: 10, b: 20));
+            let p1: Point = points.get(1);
+            let q0: Pair = pairs.get(0);
+            if points.len() == 2 and p1.x == 3.0 and p1.y == 4.0
+                and pairs.len() == 1 and q0.a == 10 and q0.b == 20
+            { 1 } else { 0 }
         }
     ";
     let symbols: &[(&str, *mut ())] = &[
@@ -4611,12 +4648,6 @@ fn dynarray_generalizes_correctly_across_two_different_concrete_types_in_one_pro
     let src = "
         use dynarray;
         struct Point { x: f64, y: f64 }
-        impl RawBuffer<Point> {
-            extern(dynarray_alloc_ptr) fn alloc(cap: i32) -> RawBuf;
-            extern(dynarray_grow_ptr) fn grow(buf: RawBuf, old_cap: i32, new_cap: i32) -> RawBuf;
-            extern(dynarray_get_ptr) fn get(buf: RawBuf, i: i32) -> Point;
-            extern(dynarray_set_ptr) fn set(buf: RawBuf, i: i32, x: Point);
-        }
         fn main() -> i32 {
             let ints: DynArray<i32> = dynarray_new(4);
             ints.push(1);

@@ -310,7 +310,8 @@ pub fn compile(
 
     let result = merge_programs(programs)
         .and_then(|program| synthesize_derive_signatures(program, &mut node_ids))
-        .map(|program| synthesize_tuple_structs(program, &mut node_ids));
+        .map(|program| synthesize_tuple_structs(program, &mut node_ids))
+        .map(|program| synthesize_heap_struct_marker_impls(program, &mut node_ids));
     (result, sources)
 }
 
@@ -376,6 +377,99 @@ fn synthesize_tuple_structs(mut program: Program, node_ids: &mut NodeIdGen) -> P
             kind: ItemKind::Struct(decl),
         });
     }
+    program
+}
+
+/// Injects one synthesized, empty `impl<...> HeapStruct<StructName<...>> {}`
+/// per plain, ordinary struct declaration in the merged program (`doc/
+/// backlog-done.md`'s own "`DynArray<T>` needs a hand-written `impl
+/// RawBuffer<Struct>` per struct element type" item) — the same "empty
+/// marker algebra, real content lives entirely in the *fact* an impl for
+/// this type exists" shape `stdlib/num/num.cleave`'s own `Int`/`Float` and
+/// `stdlib/linalg/tensor.cleave`'s own `NativeShape<T>` already establish,
+/// just synthesized mechanically instead of hand-declared per concrete
+/// type: `stdlib/dynarray/dynarray.cleave`'s own `impl<S: HeapStruct>
+/// RawBuffer<S> { ... }` (one impl, written once, in stdlib) can now bind
+/// `S` to *any* struct in the program, with zero per-struct-type user
+/// boilerplate ever again — the four `_ptr`-suffixed `cleave-rt` symbols
+/// really were 100% mechanical for every struct, exactly as that item's own
+/// text observed; this closes the gap by making the *bound* itself
+/// mechanical too, not by special-casing `RawBuffer` in the compiler.
+/// Mirrors `synthesize_tuple_structs`'s own "one synthesized declaration per
+/// real shape found in the program" precedent exactly, one level up
+/// (struct declarations instead of tuple arities) — run right after it in
+/// `compile`'s own chain so a synthesized tuple struct (`__Tuple2`, ...)
+/// gets marked too, same as any user-declared one.
+///
+/// **Deliberately excludes two shapes, both for real soundness reasons, not
+/// convenience:**
+/// - A struct tagged `#[mlir_type(...)]` anywhere in the program (`Tensor`,
+///   via `stdlib/linalg/tensor.cleave`'s own `NativeShape<T>` impl) — such a
+///   struct's real runtime representation is *not* the ordinary heap-
+///   allocated opaque pointer every other struct gets (`mlir_lower.rs::
+///   ty_to_mlir`'s struct fallback); `HeapStruct<T>`'s one real consumer
+///   (`RawBuffer<T>`'s pointer-based `dynarray_*_ptr` primitives) would
+///   silently miscompile if applied to one. Detected via `cps::
+///   collect_mlir_types`, the identical scan `mlir_lower.rs` itself already
+///   relies on for the same fact — reused directly, not duplicated.
+/// - A struct declaring a *pack* generic of its own (`const Dims...: i32`,
+///   `doc/backlog.md`'s own "Variadic generics" item) — referencing a pack
+///   generic *by name* in a synthesized impl target needs a different
+///   `GenericArg` shape (a pack reference, not the ordinary type-path one
+///   built below) this function doesn't build. No untagged stdlib struct
+///   declares one today (only `Tensor` does, already excluded by the tag
+///   check above), so this is a real but currently-inert scope limit, not a
+///   silent gap on anything reachable today — flagged here should that ever
+///   change, not silently mishandled.
+///
+/// Infallible, same as `synthesize_tuple_structs`: every synthesized impl is
+/// well-formed by construction, referencing only the enclosing struct's own
+/// already-valid generics, in the order it already declared them.
+fn synthesize_heap_struct_marker_impls(mut program: Program, node_ids: &mut NodeIdGen) -> Program {
+    let tagged = crate::cps::collect_mlir_types(&program);
+    let synthetic_span = Span {
+        file: FileId(0),
+        start: 0,
+        end: 0,
+    };
+    let mut synthesized = Vec::new();
+    for item in &program.items {
+        let ItemKind::Struct(d) = &item.kind else {
+            continue;
+        };
+        if tagged.contains_key(&d.name) || d.generics.iter().any(|g| g.is_variadic()) {
+            continue;
+        }
+        let args: Vec<GenericArg> = d
+            .generics
+            .iter()
+            .map(|g| {
+                GenericArg::Type(Node {
+                    id: node_ids.next(),
+                    span: synthetic_span,
+                    kind: TypeKind::Path(Path::single(g.name().to_string()), Vec::new()),
+                })
+            })
+            .collect();
+        let target = Node {
+            id: node_ids.next(),
+            span: synthetic_span,
+            kind: TypeKind::Path(Path::single(d.name.clone()), args),
+        };
+        synthesized.push(Node {
+            id: node_ids.next(),
+            span: synthetic_span,
+            kind: ItemKind::Impl(ImplDecl {
+                attrs: Vec::new(),
+                algebra: "HeapStruct".to_string(),
+                generics: d.generics.clone(),
+                target,
+                extra_targets: Vec::new(),
+                fns: Vec::new(),
+            }),
+        });
+    }
+    program.items.extend(synthesized);
     program
 }
 

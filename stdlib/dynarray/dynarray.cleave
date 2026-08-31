@@ -82,6 +82,33 @@ impl RawBuffer<f64> {
     extern(dynarray_set_f64) fn set(buf: RawBuf, i: i32, x: f64);
 }
 
+// A struct-typed element (`Point`, or any other user struct) used to need
+// its own hand-written, copy-pasted `impl RawBuffer<Point> { ... }` here —
+// `doc/backlog-done.md`'s own "`DynArray<T>` needs a hand-written `impl
+// RawBuffer<Struct>` per struct element type" item — even though the four
+// `extern(...)` symbol names are always these exact same four `_ptr`-
+// suffixed `cleave-rt` functions, verbatim, for *every* struct type, with
+// zero exceptions: every cleave struct value is already an opaque pointer
+// of identical shape (`mlir_lower.rs::ty_to_mlir`'s own struct fallback), so
+// there was never any real per-type information in that impl block at all.
+// `HeapStruct<T>` (`driver.rs::synthesize_heap_struct_marker_impls`) is a
+// compiler-synthesized, zero-method marker algebra — an empty `impl
+// HeapStruct<S> {}` is mechanically generated for *every* plain, ordinary
+// (untagged, non-pack) struct declaration in the whole program, the same
+// "empty marker impl, real content lives entirely in the fact it exists"
+// shape `Int`/`Float`/`NativeShape<T>` already use, just synthesized
+// instead of hand-declared per concrete type. One `impl` here, written
+// once, now covers every struct ever declared, present or future, with zero
+// per-struct-type boilerplate anywhere in user code.
+algebra HeapStruct<T> {}
+
+impl<S: HeapStruct> RawBuffer<S> {
+    extern(dynarray_alloc_ptr) fn alloc(cap: i32) -> RawBuf;
+    extern(dynarray_grow_ptr) fn grow(buf: RawBuf, old_cap: i32, new_cap: i32) -> RawBuf;
+    extern(dynarray_get_ptr) fn get(buf: RawBuf, i: i32) -> S;
+    extern(dynarray_set_ptr) fn set(buf: RawBuf, i: i32, x: S);
+}
+
 struct DynArray<T> { buf: RawBuf, len: i32, cap: i32 }
 
 // `dynarray_new` takes a real `initial_cap` argument, not a hardcoded

@@ -14,19 +14,15 @@ use io;
 // the most "extreme" turn available. Walking that all the way back around
 // to the start traces out the hull in order. `O(n*h)` (`h` = hull size) —
 // simple, no sorting needed, unlike Graham scan.
-struct Point { x: f64, y: f64 }
-
 // `DynArray<T>` only ships `RawBuffer<T>` impls for the primitive widths
-// (`stdlib/dynarray/dynarray.cleave`) — a struct-typed element, like this
-// one, needs its own small impl, reusing the exact same `_ptr`-suffixed
-// `cleave-rt` functions every struct element type shares (every cleave
-// struct value is already an opaque pointer under the hood).
-impl RawBuffer<Point> {
-    extern(dynarray_alloc_ptr) fn alloc(cap: i32) -> RawBuf;
-    extern(dynarray_grow_ptr) fn grow(buf: RawBuf, old_cap: i32, new_cap: i32) -> RawBuf;
-    extern(dynarray_get_ptr) fn get(buf: RawBuf, i: i32) -> Point;
-    extern(dynarray_set_ptr) fn set(buf: RawBuf, i: i32, x: Point);
-}
+// directly (`stdlib/dynarray/dynarray.cleave`) — a struct-typed element used
+// to need its own hand-written `impl RawBuffer<Point> { ... }` here too
+// (`doc/backlog-done.md`'s own "`DynArray<T>` needs a hand-written `impl
+// RawBuffer<Struct>` per struct element type" item). No longer: the compiler
+// now synthesizes an `impl HeapStruct<Point> {}` marker for every plain
+// struct automatically, and `dynarray.cleave`'s own `impl<S: HeapStruct>
+// RawBuffer<S>` picks it up from there — zero boilerplate needed here at all.
+struct Point { x: f64, y: f64 }
 
 // The sign of the cross product of `(q - p)` and `(r - p)`: negative means
 // `r` is clockwise of the edge `p -> q`.

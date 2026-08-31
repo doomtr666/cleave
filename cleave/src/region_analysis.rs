@@ -152,18 +152,56 @@ fn find_loops_and_mark(
 
 /// The real analysis, for one loop's own body: which of its own direct
 /// top-level calls are safe to mark region-local.
+///
+/// **Scoped to `then_branch` alone, not `loop_def.body` as a whole — a
+/// real, found-by-testing soundness bug, not a style choice.**
+/// `loop_def.body` (a loop's own condition-chain-then-`If` shape, see
+/// `loop_then_branch`'s own doc comment) has *three* distinct parts: the
+/// condition chain (evaluated every iteration, but not analyzed here
+/// either — see below), `then_branch` (the loop's own real, repeating
+/// body — the *only* code that genuinely runs "inside" the loop, once per
+/// iteration), and `else_branch`. `mlir_lower.rs::lower_loop`'s own doc
+/// comment is explicit about `else_branch`: "runs in the *outer* scope,
+/// ordinary flow" — it's whatever comes *after* the loop in source,
+/// running exactly once, lowered entirely outside the `scf.while` op, not
+/// per-iteration at all. Scanning the whole `loop_def.body` (the original,
+/// broken version of this function) walked into `else_branch` too — since
+/// a CPS-converted loop's own "exit" path structurally *contains* the rest
+/// of the enclosing function as part of the same term, this doesn't just
+/// miss an opportunity, it actively misclassifies real, one-shot,
+/// after-the-loop calls (`dynarray_new`, say, called once before any loop
+/// even starts but reached this way through an *earlier* loop's own exit
+/// branch) as if they ran once per iteration — marking them region-local
+/// even though their own call site is never wrapped in a `cleave_region_
+/// enter`/`cleave_region_exit` pair at all (only `lower_loop`'s own
+/// generated code ever emits one), so the very first allocation inside
+/// such a function hits `cleave-rt::cleave_alloc_local`'s own `assert_
+/// region_open` and aborts the process. Confirmed directly, not guessed:
+/// `examples/convex_hull.cleave --run` (no `#[mlir_type(...)]`-tagged type
+/// anywhere in it, so unrelated to any tensor-specific pipeline stage)
+/// crashed exactly this way, `dynarray_new<Point>` wrongly in `region_
+/// local_fns` — fixed by this restriction alone.
 fn analyze_loop_body(
     loop_def: &CFunDef,
     top_level_names: &HashSet<String>,
     call_counts: &HashMap<String, usize>,
     region_local: &mut HashSet<String>,
 ) {
+    let Some(then_branch) = loop_then_branch(loop_def) else {
+        // An unrecognized condition-chain shape -- `mlir_lower.rs::
+        // lower_loop` is where a genuinely malformed loop panics loudly at
+        // actual lowering time; this analysis just conservatively marks
+        // nothing region-local for one it can't confidently parse this
+        // way, exactly as safe as never having found the loop at all.
+        return;
+    };
+
     // The escaping set -- every `CVar` referenced in *any* tail-call back
     // to this same loop (`scf.yield`'s own operands, once lowered) --
     // these, and everything transitively derived from them, must survive
     // past this iteration.
     let mut escaping: HashSet<CVar> = HashSet::new();
-    collect_escaping(&loop_def.body, &loop_def.name, &mut escaping);
+    collect_escaping(then_branch, &loop_def.name, &mut escaping);
 
     // `children[base]` = every `CVar` bound via `PrimOp::Field` reading
     // straight out of `base` (`g.2`'s own `CVar` is a child of `g`'s) --
@@ -171,7 +209,7 @@ fn analyze_loop_body(
     // bound result CVar)` pair) found anywhere in this same loop body.
     let mut children: HashMap<CVar, Vec<CVar>> = HashMap::new();
     let mut calls: Vec<(String, CVar)> = Vec::new();
-    collect_calls_and_derivations(&loop_def.body, top_level_names, &mut children, &mut calls);
+    collect_calls_and_derivations(then_branch, top_level_names, &mut children, &mut calls);
 
     for (callee, result_var) in &calls {
         // Exactly one call site in the *whole* program -- this function's
@@ -182,6 +220,32 @@ fn analyze_loop_body(
         }
         if !reaches_escaping(*result_var, &children, &escaping) {
             region_local.insert(callee.clone());
+        }
+    }
+}
+
+/// Extracts `loop_def.body`'s own real, per-iteration body — the `then_
+/// branch` of the terminal `If` at the end of its own condition chain
+/// (zero or more sequential real calls, each a `Fix{[k], App(callee,
+/// args)}` layer, `k`'s own body continuing the chain — the exact shape
+/// `mlir_lower.rs::lower_loop`'s own identical walk parses; see that
+/// function's own doc comment for the full story of why a loop's
+/// condition can be more than one call). Returns `None` for a shape this
+/// doesn't recognize — this analysis only ever gets more conservative by
+/// bailing out, never wrong; `lower_loop` remains the sole authority that
+/// panics on a genuinely malformed loop.
+fn loop_then_branch(loop_def: &CFunDef) -> Option<&CExpr> {
+    let mut cursor: &CExpr = &loop_def.body;
+    loop {
+        match cursor {
+            CExpr::If { then_branch, .. } => return Some(then_branch),
+            CExpr::Fix { defs, .. } => {
+                let [cond_k] = &defs[..] else {
+                    return None;
+                };
+                cursor = &cond_k.body;
+            }
+            _ => return None,
         }
     }
 }

@@ -116,6 +116,48 @@ fn a_function_called_from_more_than_one_place_is_never_marked_local() {
     );
 }
 
+/// A real, found-by-testing bug (`doc/backlog-done.md`'s own "`region_
+/// analysis.rs`'s escape analysis walked a loop's own exit branch, not
+/// just its repeating body" entry, root-caused against `examples/
+/// convex_hull.cleave --run`, which crashed a real `cleave_alloc_local`
+/// call with no region open): a function called exactly *once*, structurally
+/// *after* an earlier loop finishes (never inside any loop's own repeating
+/// body at all) must never be marked region-local. `mlir_lower.rs::
+/// lower_loop`'s own doc comment is explicit that a loop's `else_branch`
+/// ("loop exit") "runs in the *outer* scope, ordinary flow" -- lowered
+/// entirely outside the `scf.while` op, with no `cleave_region_enter`/
+/// `cleave_region_exit` pair around it at all. The old, broken version of
+/// `analyze_loop_body` scanned the *whole* `loop_def.body` (condition chain
+/// + `then_branch` + `else_branch` together) for calls -- since a CPS-
+/// converted loop's own exit path structurally *contains* the rest of the
+/// enclosing function as part of the same term, `before_body`'s call here
+/// (found only in the `for` loop's own `else_branch`) was wrongly swept in
+/// as if it ran once per iteration.
+#[test]
+fn a_call_after_an_earlier_loop_finishes_is_never_marked_local() {
+    let src = r#"
+        fn before_body(x: i32) -> i32 { x + 100 }
+        fn loop_helper(x: i32) -> i32 { x + 1 }
+
+        fn main() -> i32 {
+            let mut acc: i32 = 0;
+            for _i in 0..3 {
+                acc = loop_helper(acc);
+            };
+            let b = before_body(acc);
+            b
+        }
+        "#;
+    let region_local = region_local_names(src);
+    assert!(
+        !region_local.contains("before_body"),
+        "before_body is called exactly once, only after the loop has already \
+         finished -- its own call site is never wrapped in a `cleave_region_enter`/\
+         `cleave_region_exit` pair, so marking it region-local crashes the very \
+         first allocation inside it; got: {region_local:?}"
+    );
+}
+
 /// A program with no loop at all -- the analysis must find nothing to mark,
 /// not panic or misfire on the "no `Fix` is ever self-recursive" case.
 #[test]

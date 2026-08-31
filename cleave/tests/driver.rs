@@ -480,3 +480,57 @@ fn deriving_a_generic_function_is_a_located_error() {
         errs[0].message
     );
 }
+
+// ------------------------------------------------ HeapStruct marker synthesis
+
+/// `driver::synthesize_heap_struct_marker_impls` (`doc/backlog-done.md`'s own
+/// "`DynArray<T>` needs a hand-written `impl RawBuffer<Struct>` per struct
+/// element type" item) — an ordinary, untagged, non-pack struct gets a real,
+/// synthesized `impl HeapStruct<...> {}` for free, with no `use` naming it
+/// anywhere in source. `Pair<A, B>` (generic) proves the synthesized impl's
+/// own generics list threads the struct's own declared names through
+/// correctly, not just the non-generic case.
+#[test]
+fn an_ordinary_struct_gets_a_synthesized_heap_struct_marker_impl() {
+    let src = "struct Point { x: f64, y: f64 }\nstruct Pair<A, B> { a: A, b: B }\nfn main() -> i32 { 0 }";
+    let (result, _sources) = compile(vec![("a.cleave".to_string(), src.to_string())], &[]);
+    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+    let out = print_program(&program);
+    assert!(out.contains("HeapStruct<Point>"), "got:\n{out}");
+    assert!(out.contains("HeapStruct<Pair<A, B>>"), "got:\n{out}");
+}
+
+/// A struct tagged `#[mlir_type(...)]` anywhere in the program (`Tensor`'s
+/// own real shape, via `NativeShape<T>`) must *not* also get a `HeapStruct`
+/// marker — its real runtime representation isn't the ordinary heap-
+/// allocated opaque pointer `RawBuffer<S>`'s pointer-based primitives
+/// assume; `Widget` here stands in for that shape without pulling in the
+/// real `linalg`/`Tensor` machinery at all.
+#[test]
+fn a_mlir_type_tagged_struct_does_not_get_a_heap_struct_marker_impl() {
+    let src = "\
+        struct Widget { x: i32 }\n\
+        algebra NativeShape<T> {}\n\
+        #[mlir_type(widget)] impl NativeShape<Widget> {}\n\
+        fn main() -> i32 { 0 }";
+    let (result, _sources) = compile(vec![("a.cleave".to_string(), src.to_string())], &[]);
+    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+    let out = print_program(&program);
+    assert!(!out.contains("HeapStruct<Widget>"), "got:\n{out}");
+}
+
+/// A struct declaring a pack generic of its own must not get a synthesized
+/// `HeapStruct` marker either — `synthesize_heap_struct_marker_impls`'s own
+/// doc comment explains why (a pack reference in a synthesized impl target
+/// needs a different `GenericArg` shape this function deliberately doesn't
+/// build). Real, not hypothetical: without this exclusion, building the
+/// target type for `Row<T, N...>` would need to represent `N...` as a
+/// generic argument, which this synthesis step can't do.
+#[test]
+fn a_pack_generic_struct_does_not_get_a_heap_struct_marker_impl() {
+    let src = "struct Row<T, const N...: i32> { data: [T; N...] }\nfn main() -> i32 { 0 }";
+    let (result, _sources) = compile(vec![("a.cleave".to_string(), src.to_string())], &[]);
+    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+    let out = print_program(&program);
+    assert!(!out.contains("HeapStruct<Row"), "got:\n{out}");
+}
