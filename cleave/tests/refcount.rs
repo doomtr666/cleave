@@ -12,9 +12,13 @@
 //! run at — real correctness needs `examples/digits-interop`'s own actual
 //! training run, already verified separately, not repeatable here).
 
-use cleave::cps::{collect_mlir_types, collect_struct_schemas, collect_units, convert_program};
+use cleave::cps::{
+    CExpr, CpsProgram, PrimOp, collect_mlir_types, collect_struct_schemas, collect_units,
+    convert_program,
+};
 use cleave::driver::compile;
 use cleave::egraph::optimize_program;
+use cleave::infer::Ty;
 use cleave::mlir_lower::lower_program;
 use cleave::pipeline::check_type_errors;
 use cleave::refcount::insert_refcounting;
@@ -34,12 +38,125 @@ fn context() -> Context {
     context
 }
 
+/// The shared front half of `run_i32` below — real pipeline, stopping right
+/// after `insert_refcounting` instead of going on to JIT — for a test that
+/// needs to inspect the *inserted* `Retain`/`Release` calls directly rather
+/// than only observe whether the compiled program crashes.
+fn refcounted_cps(src: &str) -> CpsProgram {
+    let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
+    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+    let registry = Registry::build(&program);
+    if let Err(diags) = check_type_errors(&program, &registry) {
+        panic!("type check failed: {diags:?}");
+    }
+    let units = collect_units(&program, &registry);
+    let cps_program = convert_program(units);
+    let cps_program = cleave::cps::eliminate_dead_code(cps_program);
+    let (cps_program, _) = optimize_program(cps_program, &registry, false);
+    let cps_program = cleave::cps::eliminate_dead_code(cps_program);
+    let struct_schemas = collect_struct_schemas(&program);
+    let mlir_types = collect_mlir_types(&program);
+    insert_refcounting(cps_program, &struct_schemas, &mlir_types)
+}
+
+/// Every struct name any `Retain`/`Release` in `program` targets — walks
+/// every top-level function's own body, recursively through every nested
+/// `Fix`/`If`, mirroring `region_analysis.rs`'s/`refcount.rs`'s own
+/// established "plain recursive `CExpr` walk" shape for this same kind of
+/// whole-program structural fact.
+fn retained_or_released_struct_names(program: &CpsProgram) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    for f in &program.funcs {
+        collect_rc_targets(&f.def.body, &mut names);
+    }
+    names
+}
+
+fn collect_rc_targets(expr: &CExpr, names: &mut std::collections::HashSet<String>) {
+    match expr {
+        CExpr::LetPrim { op, cont, .. } => {
+            if let PrimOp::Retain(ty) | PrimOp::Release(ty) = op {
+                if let Ty::Con(name) | Ty::App(name, _) = ty {
+                    names.insert(name.clone());
+                }
+            }
+            collect_rc_targets(cont, names);
+        }
+        CExpr::App { .. } => {}
+        CExpr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_rc_targets(then_branch, names);
+            collect_rc_targets(else_branch, names);
+        }
+        CExpr::Fix { defs, body } => {
+            for d in defs {
+                collect_rc_targets(&d.body, names);
+            }
+            collect_rc_targets(body, names);
+        }
+    }
+}
+
+/// How many `Retain(ty)` calls anywhere in `program` name struct
+/// `struct_name` — used to check `insert_refcounting` retained *every*
+/// element of a construction, not just recognized the struct type exists
+/// somewhere.
+fn count_retains_for(program: &CpsProgram, struct_name: &str) -> usize {
+    let mut count = 0;
+    for f in &program.funcs {
+        count_retains_in(&f.def.body, struct_name, &mut count);
+    }
+    count
+}
+
+fn count_retains_in(expr: &CExpr, struct_name: &str, count: &mut usize) {
+    match expr {
+        CExpr::LetPrim { op, cont, .. } => {
+            if let PrimOp::Retain(ty) = op {
+                if matches!(ty, Ty::Con(n) | Ty::App(n, _) if n == struct_name) {
+                    *count += 1;
+                }
+            }
+            count_retains_in(cont, struct_name, count);
+        }
+        CExpr::App { .. } => {}
+        CExpr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            count_retains_in(then_branch, struct_name, count);
+            count_retains_in(else_branch, struct_name, count);
+        }
+        CExpr::Fix { defs, body } => {
+            for d in defs {
+                count_retains_in(&d.body, struct_name, count);
+            }
+            count_retains_in(body, struct_name, count);
+        }
+    }
+}
+
 /// Compiles `src` through the *real* pipeline (`pipeline.rs::
 /// build_optimized_cps`'s own exact sequence: CPS conversion, dead-code
 /// elimination, e-graph optimization, a second dead-code sweep, then
 /// `insert_refcounting`), lowers to the `llvm` dialect, and JIT-invokes
 /// `main`, returning its own `i32` result.
 fn run_i32(src: &str) -> i32 {
+    run_i32_with_extra_symbols(src, &[])
+}
+
+/// Like `run_i32`, but registers extra runtime symbols alongside the base
+/// set — needed for a program that reaches `stdlib/dynarray/dynarray.
+/// cleave` (`use dynarray;` eagerly compiles every one of its own six
+/// non-generic `RawBuffer<T>` impls regardless of which widths the test
+/// program itself actually uses, `cps.rs`'s own "non-generic impl" branch —
+/// mirrors `tests/mlir_lower.rs::run_i32_with_dynarray_symbols`'s identical
+/// reasoning).
+fn run_i32_with_extra_symbols(src: &str, extra_symbols: &[(&str, *mut ())]) -> i32 {
     let context = context();
     let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
@@ -85,6 +202,9 @@ fn run_i32(src: &str) -> i32 {
         engine.register_symbol("cleave_alloc_local", cleave_rt::cleave_alloc_local as *mut ());
         engine.register_symbol("cleave_region_enter", cleave_rt::cleave_region_enter as *mut ());
         engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
+        for (name, ptr) in extra_symbols {
+            engine.register_symbol(name, *ptr);
+        }
     }
     let mut out: i32 = -1;
     // SAFETY: `out` is a live, correctly-aligned `i32` on the stack for the
@@ -237,4 +357,162 @@ fn a_struct_referenced_only_through_an_intervening_call_survives_two_nested_loop
         total
     }";
     assert_eq!(run_i32(src), 12);
+}
+
+/// A real, found-by-testing bug (`doc/backlog-done.md`'s own "`is_
+/// refcounted` didn't exclude an opaque-handle struct with no real
+/// construction site" entry, root-caused against `examples/convex_hull.
+/// cleave --run`'s own intermittent `cleave_release: invalid layout:
+/// LayoutError` crash): `RawBuf {}` (`stdlib/dynarray/dynarray.cleave`) is
+/// an ordinary, untagged, zero-field struct declaration, but its own real
+/// values are *never* built via `RawBuf(...)` anywhere — only ever produced
+/// by an `extern fn` (`dynarray_alloc_ptr`/`dynarray_alloc_i32`/...), a
+/// plain `realloc`-backed pointer with no `RcHeader` in front of it at all.
+/// Before this fix, `is_refcounted` was purely type-based, blind to origin,
+/// so a `RawBuf`-typed struct field (`DynArray.buf`) still got ordinary
+/// `Retain`/`Release` calls inserted around it — reading/writing an
+/// `RcHeader` that was never really there, real, non-deterministic memory
+/// corruption. Structural, not JIT-execution-based: the corruption itself
+/// only manifests probabilistically at runtime (garbage bytes vary run to
+/// run), so a single JIT invocation isn't a reliable enough signal on its
+/// own — this asserts directly on the *inserted* `Retain`/`Release` calls
+/// instead, which is deterministic.
+#[test]
+fn an_opaque_handle_struct_with_no_real_construction_site_is_never_retained_or_released() {
+    let src = r#"
+        use dynarray;
+        fn main() -> i32 {
+            let h: DynArray<i32> = dynarray_new(4);
+            h.push(1);
+            h.push(2);
+            h.get(0) + h.get(1)
+        }
+        "#;
+    let program = refcounted_cps(src);
+    let rc_targets = retained_or_released_struct_names(&program);
+    assert!(
+        !rc_targets.contains("RawBuf"),
+        "RawBuf is never constructed via `RawBuf(...)` anywhere -- its own \
+         values are always a plain, non-`cleave_alloc_rc`'d pointer from an \
+         `extern fn`, so retaining/releasing one reads/writes a header that \
+         was never really there; got: {rc_targets:?}"
+    );
+    // `DynArray` itself is a real, genuinely-constructed struct
+    // (`dynarray_new`'s own `DynArray(buf:...,len:...,cap:...)`) -- must
+    // stay refcounted normally, proving this fix didn't over-broadly
+    // exclude anything.
+    assert!(
+        rc_targets.contains("DynArray"),
+        "DynArray is a real, `cleave_alloc_rc`'d struct -- this fix must not \
+         exclude it too; got: {rc_targets:?}"
+    );
+}
+
+/// The same fix, verified end to end via a real JIT run too (not a
+/// reliable *reproduction* of the probabilistic corruption on its own —
+/// see the structural test above for that — but a real, additional
+/// correctness check: the actual computed values must still be right).
+#[test]
+fn dynarray_of_primitives_still_computes_correct_values_after_the_rawbuf_fix() {
+    let src = r#"
+        use dynarray;
+        fn main() -> i32 {
+            let h: DynArray<i32> = dynarray_new(4);
+            h.push(10);
+            h.push(20);
+            h.push(30);
+            h.get(0) + h.get(1) + h.get(2)
+        }
+        "#;
+    // `use dynarray;` eagerly compiles all six non-generic `RawBuffer<T>`
+    // impls, not just the `i32` one this program actually uses — every
+    // width's own `dynarray_*` symbol needs to be resolvable at JIT link
+    // time regardless (`run_i32_with_extra_symbols`'s own doc comment).
+    let symbols: &[(&str, *mut ())] = &[
+        ("dynarray_alloc_i8", cleave_rt::dynarray_alloc_i8 as *mut ()),
+        ("dynarray_grow_i8", cleave_rt::dynarray_grow_i8 as *mut ()),
+        ("dynarray_get_i8", cleave_rt::dynarray_get_i8 as *mut ()),
+        ("dynarray_set_i8", cleave_rt::dynarray_set_i8 as *mut ()),
+        ("dynarray_alloc_i16", cleave_rt::dynarray_alloc_i16 as *mut ()),
+        ("dynarray_grow_i16", cleave_rt::dynarray_grow_i16 as *mut ()),
+        ("dynarray_get_i16", cleave_rt::dynarray_get_i16 as *mut ()),
+        ("dynarray_set_i16", cleave_rt::dynarray_set_i16 as *mut ()),
+        ("dynarray_alloc_i32", cleave_rt::dynarray_alloc_i32 as *mut ()),
+        ("dynarray_grow_i32", cleave_rt::dynarray_grow_i32 as *mut ()),
+        ("dynarray_get_i32", cleave_rt::dynarray_get_i32 as *mut ()),
+        ("dynarray_set_i32", cleave_rt::dynarray_set_i32 as *mut ()),
+        ("dynarray_alloc_i64", cleave_rt::dynarray_alloc_i64 as *mut ()),
+        ("dynarray_grow_i64", cleave_rt::dynarray_grow_i64 as *mut ()),
+        ("dynarray_get_i64", cleave_rt::dynarray_get_i64 as *mut ()),
+        ("dynarray_set_i64", cleave_rt::dynarray_set_i64 as *mut ()),
+        ("dynarray_alloc_f32", cleave_rt::dynarray_alloc_f32 as *mut ()),
+        ("dynarray_grow_f32", cleave_rt::dynarray_grow_f32 as *mut ()),
+        ("dynarray_get_f32", cleave_rt::dynarray_get_f32 as *mut ()),
+        ("dynarray_set_f32", cleave_rt::dynarray_set_f32 as *mut ()),
+        ("dynarray_alloc_f64", cleave_rt::dynarray_alloc_f64 as *mut ()),
+        ("dynarray_grow_f64", cleave_rt::dynarray_grow_f64 as *mut ()),
+        ("dynarray_get_f64", cleave_rt::dynarray_get_f64 as *mut ()),
+        ("dynarray_set_f64", cleave_rt::dynarray_set_f64 as *mut ()),
+    ];
+    assert_eq!(run_i32_with_extra_symbols(src, symbols), 60);
+}
+
+/// A real, found-by-testing bug (`doc/backlog-done.md`'s own "an array
+/// literal of struct-typed elements got no retain at all" entry,
+/// root-caused against `examples/convex_hull.cleave --run`'s own
+/// intermittent memory corruption by dumping `--dump-cps-optimized`
+/// directly): `[p1, p2, p3]` (`PrimOp::Array`, `ExprKind::ArrayLit`) embeds
+/// each element's own pointer directly, the exact same "aliases every
+/// argument" shape `PrimOp::Struct` construction already gets a retain
+/// for — but `insert_refcounting`'s own `retain_targets` match never
+/// included `PrimOp::Array` at all, so every freshly-constructed struct fed
+/// into an array literal was released immediately after the array was
+/// built, with no retain protecting the array's own now-dangling copy.
+/// Structural, not JIT-execution-based, for the identical reason the
+/// `RawBuf` test above is: the corruption itself is probabilistic.
+#[test]
+fn every_element_of_a_struct_array_literal_is_retained() {
+    let src = r#"
+        struct Point { x: f64, y: f64 }
+        fn main() -> i32 {
+            let points: [Point; 3] = [
+                Point(x: 0.0, y: 0.0),
+                Point(x: 1.0, y: 1.0),
+                Point(x: 2.0, y: 2.0)
+            ];
+            if points[0].x == 0.0 { 1 } else { 0 }
+        }
+        "#;
+    let program = refcounted_cps(src);
+    let retains = count_retains_for(&program, "Point");
+    assert!(
+        retains >= 3,
+        "all three array elements must be retained before the array literal \
+         releases their own local bindings -- got {retains} `Retain(Point)` calls"
+    );
+}
+
+/// The same fix, verified end to end: reading every element back out of a
+/// struct array literal, well after the array's own local element bindings
+/// would otherwise have been released, must give back the real, correct
+/// field values (not garbage from an already-reused allocation).
+#[test]
+fn a_struct_array_literals_elements_read_back_correctly_after_other_work() {
+    let src = r#"
+        struct Point { x: f64, y: f64 }
+        fn scale(p: Point) -> f64 { p.x + p.y }
+        fn main() -> i32 {
+            let points: [Point; 3] = [
+                Point(x: 1.0, y: 2.0),
+                Point(x: 3.0, y: 4.0),
+                Point(x: 5.0, y: 6.0)
+            ];
+            let mut total: f64 = 0.0;
+            for i in 0..3 {
+                total = total + scale(points[i]);
+            };
+            if total == 21.0 { 1 } else { 0 }
+        }
+        "#;
+    assert_eq!(run_i32(src), 1);
 }

@@ -101,10 +101,39 @@ use std::collections::{HashMap, HashSet};
 /// all, producing a bare native SSA value with no refcount header to act
 /// on. A primitive/array/unit type is excluded structurally (neither
 /// `Ty::Con` nor `Ty::App` naming a declared struct).
+///
+/// **A third exclusion, found by direct testing against a real, intermittent
+/// memory-corruption bug, not assumed**: `name` must also have at least one
+/// real `PrimOp::Struct` construction site somewhere in the *whole compiled
+/// program* (`constructed`, below) — `stdlib/dynarray/dynarray.cleave`'s own
+/// `RawBuf {}` (an ordinary, untagged, zero-field struct declaration, so the
+/// first two checks alone don't exclude it) is the motivating case: its own
+/// doc comment is explicit that it's "never constructed via `RawBuf(...)`
+/// anywhere in this module, only ever produced/consumed by the `RawBuffer<T>`
+/// impls below" — every real value of this type comes from an `extern fn`
+/// return (`dynarray_alloc_ptr`/`dynarray_alloc_i32`/...), a plain
+/// `realloc`-backed pointer from `cleave-rt`'s own internal allocator, with
+/// *no* `RcHeader` in front of it at all. Before this exclusion, `is_
+/// refcounted` was purely type-based, blind to *origin* — a `RawBuf`-typed
+/// field (`DynArray.buf`) still got ordinary `Retain`/`Release` calls
+/// inserted around it, each one reading/writing an `RcHeader` that was never
+/// really there, off whatever bytes happened to sit just before that
+/// pointer — real, silent, non-deterministic corruption (confirmed directly:
+/// `cleave_release`'s own `Layout::from_size_align` panicking with
+/// `LayoutError` roughly a third of the time, on a minimal `let h: DynArray<
+/// i32> = dynarray_new(4);` alone, no `Point`/no `HeapStruct` involved at
+/// all — varying run to run because the garbage byte pattern in the memory
+/// immediately preceding a fresh allocation is itself unspecified). Every
+/// *genuinely* refcounted struct in this codebase (`DynArray` itself
+/// included) has a real construction site somewhere reachable — this
+/// exclusion only ever fires for the `RawBuf`-shaped "opaque FFI handle,
+/// produced solely by `extern fn`s" idiom, structurally, with no hardcoded
+/// name anywhere.
 fn is_refcounted(
     ty: &Ty,
     struct_schemas: &HashMap<String, crate::cps::StructSchema>,
     mlir_types: &HashMap<String, String>,
+    constructed: &HashSet<String>,
 ) -> bool {
     let name = match ty {
         Ty::Con(name) | Ty::App(name, _) => name,
@@ -115,6 +144,50 @@ fn is_refcounted(
             mlir_types.get(name).map(String::as_str),
             Some("tensor") | Some("vector")
         )
+        && constructed.contains(name)
+}
+
+/// Every struct name with at least one real `PrimOp::Struct` construction
+/// site anywhere in `program` — see `is_refcounted`'s own doc comment for
+/// why this matters: a struct type with *no* real construction site at all
+/// is only ever produced by an `extern fn` (the `RawBuf`-shaped "opaque FFI
+/// handle" idiom), never by `cleave_alloc_rc`, so it must never be retained/
+/// released. Walks every top-level function's own body, recursively through
+/// every nested `Fix`/`If` — mirrors `region_analysis.rs`'s own established
+/// "plain recursive `CExpr` walk, no fixpoint needed" shape for this same
+/// kind of whole-program structural fact.
+fn collect_constructed_struct_names(program: &CpsProgram) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for f in &program.funcs {
+        collect_constructed_in(&f.def.body, &mut names);
+    }
+    names
+}
+
+fn collect_constructed_in(expr: &CExpr, names: &mut HashSet<String>) {
+    match expr {
+        CExpr::LetPrim { op, cont, .. } => {
+            if let PrimOp::Struct(name, _) = op {
+                names.insert(name.clone());
+            }
+            collect_constructed_in(cont, names);
+        }
+        CExpr::App { .. } => {}
+        CExpr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_constructed_in(then_branch, names);
+            collect_constructed_in(else_branch, names);
+        }
+        CExpr::Fix { defs, body } => {
+            for d in defs {
+                collect_constructed_in(&d.body, names);
+            }
+            collect_constructed_in(body, names);
+        }
+    }
 }
 
 /// The unit `()` type, used for `Retain`/`Release`'s own bound `LetPrim`
@@ -571,6 +644,11 @@ fn walk_local_claim_vars(
 struct RefcountCtx<'a> {
     struct_schemas: &'a HashMap<String, crate::cps::StructSchema>,
     mlir_types: &'a HashMap<String, String>,
+    /// See `is_refcounted`'s own doc comment for why this exists — a struct
+    /// name absent here is only ever produced by an `extern fn` (`RawBuf`'s
+    /// own "opaque FFI handle" idiom), never by `cleave_alloc_rc`, so it
+    /// must never be retained/released.
+    constructed_structs: &'a HashSet<String>,
     var_types: &'a HashMap<CVar, Ty>,
     /// Whether releasing a given `CVar` is ever this program's own
     /// responsibility at all — see `collect_var_info`'s own doc comment
@@ -586,7 +664,12 @@ struct RefcountCtx<'a> {
 
 impl RefcountCtx<'_> {
     fn is_rc(&self, ty: &Ty) -> bool {
-        is_refcounted(ty, self.struct_schemas, self.mlir_types)
+        is_refcounted(
+            ty,
+            self.struct_schemas,
+            self.mlir_types,
+            self.constructed_structs,
+        )
     }
 }
 
@@ -607,6 +690,7 @@ pub fn insert_refcounting(
         .iter()
         .map(|f| (f.def.name.clone(), f.result.clone()))
         .collect();
+    let constructed_structs = collect_constructed_struct_names(&program);
     let funcs = program
         .funcs
         .into_iter()
@@ -621,6 +705,7 @@ pub fn insert_refcounting(
             let ctx = RefcountCtx {
                 struct_schemas,
                 mlir_types,
+                constructed_structs: &constructed_structs,
                 var_types: &var_types,
                 owned_origin: &owned_origin,
                 local_free_vars: &local_free_vars,
@@ -715,11 +800,31 @@ fn rewrite_body(
             // `dealloc` doesn't have to scribble over freed memory right
             // away, exactly the kind of bug that only manifests later,
             // once something else reuses the address).
+            //
+            // **`Array` needs the identical treatment, found by direct
+            // testing against a real, intermittent memory-corruption bug,
+            // not assumed**: `[p1, p2, p3]` (`ExprKind::ArrayLit`) embeds
+            // `p1`'s/`p2`'s/`p3`'s own pointers directly, the exact same
+            // "aliases every argument" shape `Struct` construction already
+            // gets — but was missing here entirely, so an array literal of
+            // struct-typed elements got *no* retain at all for any of them.
+            // Root-caused against `examples/convex_hull.cleave --run`'s own
+            // intermittent corruption by dumping `--dump-cps-optimized`
+            // directly (the *actual* generated code, not a guess): `let
+            // points: [Point; 3] = [Point(...), Point(...), Point(...)];`
+            // released all three freshly-constructed `Point`s **immediately
+            // after** building the array containing them — `points[i]`'s
+            // own reads, every one of them, for the rest of `main`, read
+            // back through an already-released (and potentially already-
+            // reused) pointer. `ArrayRepeat` (`[v; N]`) is a plausible,
+            // structurally similar risk — not confirmed by a real failing
+            // case the way `Array` was, and deliberately not touched here;
+            // flagged in `doc/backlog.md` instead of guessed at.
             let retain_targets: Vec<CVal> = match &op {
                 PrimOp::FieldStore { .. } | PrimOp::Store { .. } => {
                     args.last().cloned().into_iter().collect()
                 }
-                PrimOp::Struct(..) => args.clone(),
+                PrimOp::Struct(..) | PrimOp::Array => args.clone(),
                 _ => Vec::new(),
             };
             let mut retains: Vec<(CVal, Ty)> = Vec::new();

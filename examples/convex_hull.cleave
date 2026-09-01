@@ -70,12 +70,13 @@ fn main() -> i32 {
         };
     };
 
-    print(hull.len());
+    println(hull.len());
     let mut i: i32 = 0;
     while i < hull.len() {
         let p: Point = hull.get(i);
         print(p.x);
-        print(p.y);
+        print(" ");
+        println(p.y);
         i = i + 1;
     };
     0
