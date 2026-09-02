@@ -49,9 +49,11 @@ impl Print<f64> { extern(print_f64) fn print(x: f64) -> f64; }
 // contract).
 impl<const N: i32> Print<[i8; N]> { extern(print_bytes) fn print(x: [i8; N]) -> [i8; N]; }
 
-// A heterogeneous, fixed-arity `print` — `print(("x=", x, "y=", y))` — needs
-// its own impl per arity actually used. Unlike `stdlib/linalg/tensor.cleave`
-// 's own `Tensor<T, const Dims...: i32>`, real variadic generics (`doc/
+// A heterogeneous, fixed-arity `print` — `print(("x=", x, "y=", y))`,
+// `println` too (a plain `T: Print`-bound wrapper, below — a tuple
+// satisfies that bound exactly like any scalar does) — needs its own impl
+// per arity actually used. Unlike `stdlib/linalg/tensor.cleave`'s own
+// `Tensor<T, const Dims...: i32>`, real variadic generics (`doc/
 // backlog.md`'s own "Variadic generics" item) don't help *this* problem: a
 // pack there is homogeneous (every dim is the same kind of thing, an `i32`)
 // and never itself iterated per-element at the *type* level, but `("x=", x,
@@ -61,11 +63,21 @@ impl<const N: i32> Print<[i8; N]> { extern(print_bytes) fn print(x: [i8; N]) -> 
 // different mechanism, not the same one). A
 // tuple's own type/literal/field-access syntax (`(A,B)`/`(a,b)`/`x.0`) is
 // ordinary generic-struct sugar (`ast::tuple_struct_name`, `driver.rs::
-// synthesize_tuple_structs`) — these three impls are otherwise completely
+// synthesize_tuple_structs`) — these impls are otherwise completely
 // unremarkable generic algebra impls, needing no tuple-specific machinery of
 // their own at all. `A: Print`/`B: Print`/... bounds each element's own
 // recursive `print(x.N)` call to a real, concrete dispatch once monomorphized
 // (a bare, unbounded `A` would leave `print(x.0)` unresolvable).
+//
+// One impl per arity 2..=16 — matching `driver.rs::MAX_TUPLE_ARITY`, the
+// same ceiling every other tuple-consuming mechanism in this codebase
+// already shares (`derive()`'s own synthesized Jacobian, in particular) —
+// not just the original 2..=4: this is genuinely this project's own most
+// practical structured-logging idiom today (`doc/backlog.md`'s own "no
+// `format!`-style interpolated string" item stays deliberately unattempted;
+// this is what fills that gap in the meantime), so capping it well below
+// what a real, multi-value log line might need would have undercut the
+// whole point.
 impl<A: Print, B: Print> Print<(A, B)> {
     fn print(x: (A, B)) -> (A, B) {
         print(x.0);
@@ -87,6 +99,192 @@ impl<A: Print, B: Print, C: Print, D: Print> Print<(A, B, C, D)> {
         print(x.1);
         print(x.2);
         print(x.3);
+        x
+    }
+}
+impl<A: Print, B: Print, C: Print, D: Print, E: Print> Print<(A, B, C, D, E)> {
+    fn print(x: (A, B, C, D, E)) -> (A, B, C, D, E) {
+        print(x.0);
+        print(x.1);
+        print(x.2);
+        print(x.3);
+        print(x.4);
+        x
+    }
+}
+impl<A: Print, B: Print, C: Print, D: Print, E: Print, F: Print> Print<(A, B, C, D, E, F)> {
+    fn print(x: (A, B, C, D, E, F)) -> (A, B, C, D, E, F) {
+        print(x.0);
+        print(x.1);
+        print(x.2);
+        print(x.3);
+        print(x.4);
+        print(x.5);
+        x
+    }
+}
+impl<A: Print, B: Print, C: Print, D: Print, E: Print, F: Print, G: Print> Print<(A, B, C, D, E, F, G)> {
+    fn print(x: (A, B, C, D, E, F, G)) -> (A, B, C, D, E, F, G) {
+        print(x.0);
+        print(x.1);
+        print(x.2);
+        print(x.3);
+        print(x.4);
+        print(x.5);
+        print(x.6);
+        x
+    }
+}
+impl<A: Print, B: Print, C: Print, D: Print, E: Print, F: Print, G: Print, H: Print> Print<(A, B, C, D, E, F, G, H)> {
+    fn print(x: (A, B, C, D, E, F, G, H)) -> (A, B, C, D, E, F, G, H) {
+        print(x.0);
+        print(x.1);
+        print(x.2);
+        print(x.3);
+        print(x.4);
+        print(x.5);
+        print(x.6);
+        print(x.7);
+        x
+    }
+}
+impl<A: Print, B: Print, C: Print, D: Print, E: Print, F: Print, G: Print, H: Print, I: Print> Print<(A, B, C, D, E, F, G, H, I)> {
+    fn print(x: (A, B, C, D, E, F, G, H, I)) -> (A, B, C, D, E, F, G, H, I) {
+        print(x.0);
+        print(x.1);
+        print(x.2);
+        print(x.3);
+        print(x.4);
+        print(x.5);
+        print(x.6);
+        print(x.7);
+        print(x.8);
+        x
+    }
+}
+impl<A: Print, B: Print, C: Print, D: Print, E: Print, F: Print, G: Print, H: Print, I: Print, J: Print> Print<(A, B, C, D, E, F, G, H, I, J)> {
+    fn print(x: (A, B, C, D, E, F, G, H, I, J)) -> (A, B, C, D, E, F, G, H, I, J) {
+        print(x.0);
+        print(x.1);
+        print(x.2);
+        print(x.3);
+        print(x.4);
+        print(x.5);
+        print(x.6);
+        print(x.7);
+        print(x.8);
+        print(x.9);
+        x
+    }
+}
+impl<A: Print, B: Print, C: Print, D: Print, E: Print, F: Print, G: Print, H: Print, I: Print, J: Print, K: Print> Print<(A, B, C, D, E, F, G, H, I, J, K)> {
+    fn print(x: (A, B, C, D, E, F, G, H, I, J, K)) -> (A, B, C, D, E, F, G, H, I, J, K) {
+        print(x.0);
+        print(x.1);
+        print(x.2);
+        print(x.3);
+        print(x.4);
+        print(x.5);
+        print(x.6);
+        print(x.7);
+        print(x.8);
+        print(x.9);
+        print(x.10);
+        x
+    }
+}
+impl<A: Print, B: Print, C: Print, D: Print, E: Print, F: Print, G: Print, H: Print, I: Print, J: Print, K: Print, L: Print> Print<(A, B, C, D, E, F, G, H, I, J, K, L)> {
+    fn print(x: (A, B, C, D, E, F, G, H, I, J, K, L)) -> (A, B, C, D, E, F, G, H, I, J, K, L) {
+        print(x.0);
+        print(x.1);
+        print(x.2);
+        print(x.3);
+        print(x.4);
+        print(x.5);
+        print(x.6);
+        print(x.7);
+        print(x.8);
+        print(x.9);
+        print(x.10);
+        print(x.11);
+        x
+    }
+}
+impl<A: Print, B: Print, C: Print, D: Print, E: Print, F: Print, G: Print, H: Print, I: Print, J: Print, K: Print, L: Print, M: Print> Print<(A, B, C, D, E, F, G, H, I, J, K, L, M)> {
+    fn print(x: (A, B, C, D, E, F, G, H, I, J, K, L, M)) -> (A, B, C, D, E, F, G, H, I, J, K, L, M) {
+        print(x.0);
+        print(x.1);
+        print(x.2);
+        print(x.3);
+        print(x.4);
+        print(x.5);
+        print(x.6);
+        print(x.7);
+        print(x.8);
+        print(x.9);
+        print(x.10);
+        print(x.11);
+        print(x.12);
+        x
+    }
+}
+impl<A: Print, B: Print, C: Print, D: Print, E: Print, F: Print, G: Print, H: Print, I: Print, J: Print, K: Print, L: Print, M: Print, N: Print> Print<(A, B, C, D, E, F, G, H, I, J, K, L, M, N)> {
+    fn print(x: (A, B, C, D, E, F, G, H, I, J, K, L, M, N)) -> (A, B, C, D, E, F, G, H, I, J, K, L, M, N) {
+        print(x.0);
+        print(x.1);
+        print(x.2);
+        print(x.3);
+        print(x.4);
+        print(x.5);
+        print(x.6);
+        print(x.7);
+        print(x.8);
+        print(x.9);
+        print(x.10);
+        print(x.11);
+        print(x.12);
+        print(x.13);
+        x
+    }
+}
+impl<A: Print, B: Print, C: Print, D: Print, E: Print, F: Print, G: Print, H: Print, I: Print, J: Print, K: Print, L: Print, M: Print, N: Print, O: Print> Print<(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O)> {
+    fn print(x: (A, B, C, D, E, F, G, H, I, J, K, L, M, N, O)) -> (A, B, C, D, E, F, G, H, I, J, K, L, M, N, O) {
+        print(x.0);
+        print(x.1);
+        print(x.2);
+        print(x.3);
+        print(x.4);
+        print(x.5);
+        print(x.6);
+        print(x.7);
+        print(x.8);
+        print(x.9);
+        print(x.10);
+        print(x.11);
+        print(x.12);
+        print(x.13);
+        print(x.14);
+        x
+    }
+}
+impl<A: Print, B: Print, C: Print, D: Print, E: Print, F: Print, G: Print, H: Print, I: Print, J: Print, K: Print, L: Print, M: Print, N: Print, O: Print, P: Print> Print<(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P)> {
+    fn print(x: (A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P)) -> (A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P) {
+        print(x.0);
+        print(x.1);
+        print(x.2);
+        print(x.3);
+        print(x.4);
+        print(x.5);
+        print(x.6);
+        print(x.7);
+        print(x.8);
+        print(x.9);
+        print(x.10);
+        print(x.11);
+        print(x.12);
+        print(x.13);
+        print(x.14);
+        print(x.15);
         x
     }
 }

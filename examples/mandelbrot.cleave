@@ -12,7 +12,7 @@ use complex;
 // latch onto the *first* iteration that crosses the threshold and every
 // later iteration becomes a no-op past that point instead of an early exit.
 fn escape_count(c: Complex<f64>) -> i32 {
-    let mut z = Complex(real: 0.0, imag: 0.0);
+    let mut z: Complex<f64> = 0.0 + 0.0i;
     let mut count = 50;
     let mut escaped = false;
     for n in 0..50 {

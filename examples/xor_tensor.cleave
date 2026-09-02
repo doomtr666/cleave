@@ -2,14 +2,16 @@ use io;
 use nn;
 use linalg;
 
-// The tensorial reformulation of `examples/xor.cleave` -- same 2-input,
-// 2-hidden-neuron, 1-output network, same SGD training loop, same truth
-// table -- with the weights bundled into a real `Network` struct of `Dense`
-// layers (`stdlib/nn/nn.cleave`) instead of eleven loose scalar parameters
-// passed by hand. That original, flatter version is what first prompted
-// this rewrite -- raised directly, not a hypothetical: a real `forward`
-// taking 11 positional `f32`s in a row was unreadable and error-prone to
-// call correctly, and gave no way to grow the network without growing the
+// A 2-input, 2-hidden-neuron, 1-output network trained by real gradient
+// descent (`derive()`, no hand-derived math anywhere) to learn XOR -- not
+// linearly separable, so it needs the hidden layer to be a real proof the
+// network is genuinely learning a nonlinear function, not just fitting a
+// line. The weights are bundled into a real `Network` struct of `Dense`
+// layers (`stdlib/nn/nn.cleave`) -- this file's own earlier version passed
+// eleven loose scalar parameters by hand instead (since removed, `doc/
+// backlog-done.md` has the full story); a real `forward` taking 11
+// positional `f32`s in a row was unreadable and error-prone to call
+// correctly, and gave no way to grow the network without growing the
 // parameter list further.
 //
 // Three more real, separate compiler bugs were found and fixed getting
@@ -29,10 +31,10 @@ use linalg;
 // alone can't express a scalar-times-tensor broadcast, both its own
 // operands always being the same type.
 //
-// `x` is a `1x2` row (a single training example, not a batch -- SGD, same
-// reasoning `examples/xor.cleave` itself documents: batching all four
-// points into one `derive()`d function pushes e-graph saturation past its
-// own time limit) so it can be a real `matmul` left operand directly.
+// `x` is a `1x2` row (a single training example, not a batch -- SGD; batching
+// all four points into one `derive()`d function pushes e-graph saturation
+// past its own time limit) so it can be a real `matmul` left operand
+// directly.
 struct Network { l1: Dense<f32, 2, 2>, l2: Dense<f32, 2, 1> }
 
 // `doc/backlog.md`'s own "Optimizer" item -- `Network` is a user struct, not

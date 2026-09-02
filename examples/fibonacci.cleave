@@ -1,5 +1,14 @@
 use io;
 
+// `T: Int` is a deliberate constraint, not an incidental one -- `x - 1`/
+// `x - 2` type-check fine for any `Ring<T>` (so a bare, unconstrained `T`
+// monomorphizes and runs correctly too, verified directly), but a "3.5th
+// Fibonacci number" via this recursive definition doesn't converge to
+// anything meaningful (`x <= 1` never becomes exactly true by repeatedly
+// subtracting 1 from a non-integer). Bounding `T: Int` rejects that at the
+// call site, with a real, located diagnostic (`fibonacci(3.0)` ->
+// `error: no impl Int<f32>`), not a silent wrong answer or an infinite
+// recursion at runtime.
 fn fibonacci<T: Int>(x : T) -> T {
     if x <= 1 { x } else { fibonacci(x-1) + fibonacci(x-2) }
 }

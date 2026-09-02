@@ -1,20 +1,52 @@
 use io;
 
-struct vec3<T : Float> {
+// A small, custom struct with its own declared algebra impl (`Ring<vec3<T>>`
+// — same mechanism `doc/user_guide.md`'s own "Algebras: how operators
+// actually work" section introduces with `Vec2`) plus real domain-specific
+// operations `stdlib/linalg`'s generic `Tensor<T, Dims...>` genuinely can't
+// give you for free: a 3-vector-specific *cross* product and a *dot*
+// product. `Ring<Tensor<T,3>>`'s own `+`/`-` already cover the elementwise
+// part (`examples/tensor_demo.cleave`) — this file is about the case where
+// you still want your *own* struct: an operation with no generic-rank
+// equivalent, and a name (`cross`) that would make no sense as an
+// `algebra` at all (nothing else in this codebase would ever implement it).
+struct vec3<T: Float> {
     x: T,
     y: T,
     z: T,
 }
 
-impl <T: Float> Ring<vec3<T>> {
-    fn add(v1,v2) { 
+impl<T: Float> Ring<vec3<T>> {
+    fn add(v1, v2) {
         vec3(x: v1.x + v2.x, y: v1.y + v2.y, z: v1.z + v2.z)
     }
-
-    fn sub(v1,v2) { 
+    fn sub(v1, v2) {
         vec3(x: v1.x - v2.x, y: v1.y - v2.y, z: v1.z - v2.z)
     }
+}
 
+// Plain top-level `fn`s, not inherent methods on `vec3` -- a real, found-
+// by-testing compiler bug (`doc/backlog.md`'s own "An inherent-impl
+// method's own body can't construct another instance of the same struct
+// it's impl'd on" item): a generic inherent method returning a *fresh*
+// instance of the exact same struct type its own `impl` block targets
+// (`fn cross(a, b) -> vec3<T> { vec3(...) }`, inside `impl<T: Float> struct
+// vec3<T> { ... }`) fails at CPS/monomorphization time ("could not resolve
+// method call `vec3::cross`"), even though the *identical* body works fine
+// as an ordinary top-level generic `fn` -- confirmed directly, isolated
+// down to exactly this shape (constructing a genuinely different struct
+// from inside the same kind of method has no issue at all). Worked around
+// the same way this project's own "inherent-impl method's own generics"
+// item was, before it got a real fix: a plain top-level function instead.
+fn cross<T: Float>(a: vec3<T>, b: vec3<T>) -> vec3<T> {
+    vec3(
+        x: a.y * b.z - a.z * b.y,
+        y: a.z * b.x - a.x * b.z,
+        z: a.x * b.y - a.y * b.x
+    )
+}
+fn dot<T: Float>(a: vec3<T>, b: vec3<T>) -> T {
+    a.x * b.x + a.y * b.y + a.z * b.z
 }
 
 fn print_vec(v) {
@@ -23,17 +55,27 @@ fn print_vec(v) {
     print(v.z);
 }
 
+fn main() -> i32 {
+    // The standard basis vectors -- i x j = k is the textbook check.
+    let i = vec3(x: 1.0, y: 0.0, z: 0.0);
+    let j = vec3(x: 0.0, y: 1.0, z: 0.0);
+    let k = cross(i, j);
+    print_vec(k); // (0, 0, 1)
 
-fn main() {
-    
-    let v1 = vec3(x: 1.0, y: 2.0, z : 3.0);
-    let v2 = vec3(x: 1.0, y: 2.0, z : 3.0);
-    let vr = v1 + v2;
-    let va = [v1, v2, vr];
+    // `+`/`-` still dispatch through the declared `Ring<vec3<T>>` impl.
+    let sum = i + j;
+    let diff = j - i;
+    print_vec(sum);  // (1, 1, 0)
+    print_vec(diff); // (-1, 1, 0)
 
-    print_vec(va[0]);
-    print_vec(va[1]);
-    print_vec(va[2]);
+    // An array literal of struct-typed elements -- each `vec3` retained
+    // correctly for as long as `points` itself is alive (`doc/backlog-
+    // done.md`'s own "an array literal of struct-typed elements got no
+    // Retain at all" entry — the exact shape that item's own regression
+    // test uses).
+    let points: [vec3<f32>; 3] = [i, j, k];
+    print(dot(points[0], points[1])); // i . j = 0 (orthogonal)
+    print(dot(points[2], points[2])); // k . k = 1 (unit length)
 
     0
 }

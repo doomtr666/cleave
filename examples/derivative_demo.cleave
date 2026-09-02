@@ -1,30 +1,49 @@
 use io;
 
-// `doc/backlog.md`'s own auto-diff item -- `fprime = derive(f);` mechanically
-// synthesizes `fprime`'s own body via e-graph rewriting (`egraph.rs::
-// synthesize_derivatives`/`derivative_rewrites`): a `derivative(expr, wrt)`
-// node is added to the *same* e-graph `f`'s own body already translates
-// into, and progressively eliminated by chain/sum/product-rule rewrites
-// during the very same saturation pass that already runs axioms and
-// constant-folding -- ordinary equality saturation, not a separate
-// differentiation engine.
+// `doc/backlog-done.md`'s own auto-diff items -- two separate keywords,
+// two separate algorithms, both mechanically synthesized by e-graph
+// rewriting (`egraph.rs`), neither ever hand-derived:
+//
+// - `derive(f)` -- forward-mode, general-purpose: works for any return
+//   shape (`doc/backlog.md`'s own "gradient w.r.t. a struct parameter"
+//   item), but costs O(number of differentiation targets x graph size) --
+//   each parameter needs its own independent pass through the rule set.
+// - `grad(f)` -- reverse-mode (real backprop), narrower on purpose: `f`
+//   must return a scalar (`f32`/`f64`), the same contract every real ML
+//   framework's own `grad`/`backward` has -- but computes *every*
+//   parameter's own gradient in one single pass, O(graph size) regardless
+//   of parameter count. `loss` below returns a scalar, so both apply; a
+//   real training loop (`examples/xor_tensor.cleave`) uses `derive()`
+//   still, `examples/digits-interop`'s own `Network` uses `grad()` --
+//   picking the right one is a real, per-function decision, not "always
+//   prefer the newer one".
 //
 // `loss(x, y) = x^2 + y^2` -- a toy squared-error-style loss, exactly the
-// shape a real gradient-descent step would need the gradient of.
-// `grad = derive(loss);` synthesizes `grad(x, y) -> (f32, f32)`, the
+// shape a real gradient-descent step would need the gradient of. Both
+// `dloss`/`gloss` synthesize a function `(x, y) -> (f32, f32)`, the
 // Jacobian row `(d(loss)/dx, d(loss)/dy) = (2x, 2y)` -- `f`'s own arity (2
-// parameters) determines `grad`'s own return shape mechanically, never
+// parameters) determines the result's own shape mechanically, never
 // written by hand. A tuple, not an array: each entry's own type is that
 // *parameter's* own type, which lets a struct-typed parameter's own
-// gradient be struct-shaped too (`doc/backlog.md`'s own "gradient w.r.t. a
-// struct parameter" item) -- irrelevant here (both parameters are already
-// `f32`), but this is why `g.0`/`g.1`, not `g[0]`/`g[1]`.
+// gradient be struct-shaped too -- irrelevant here (both parameters are
+// already `f32`), but this is why `d.0`/`d.1`, not `d[0]`/`d[1]`.
+//
+// Deliberately *not* named `grad`/`dloss` interchangeably -- `grad` is a
+// real keyword now (this file's own earlier version bound a `derive()`
+// result to a local called `grad`, confusing on re-read once the real
+// `grad()` keyword existed).
 fn loss(x: f32, y: f32) -> f32 { x * x + y * y }
-grad = derive(loss);
+dloss = derive(loss);
+gloss = grad(loss);
 
 fn main() -> i32 {
-    let g = grad(3.0, 4.0);
-    print(g.0); // 6.0  =  2 * 3.0
-    print(g.1); // 8.0  =  2 * 4.0
+    let d = dloss(3.0, 4.0);
+    print(d.0); // 6.0  =  2 * 3.0
+    print(d.1); // 8.0  =  2 * 4.0
+
+    // Reverse-mode agrees exactly -- same math, a different algorithm.
+    let g = gloss(3.0, 4.0);
+    print(g.0); // 6.0
+    print(g.1); // 8.0
     0
 }

@@ -4990,6 +4990,28 @@ fn a_multi_argument_heterogeneous_print_call_prints_every_element_in_order() {
     assert_eq!(out, 0);
 }
 
+/// `stdlib/io/io.cleave`'s own `Print<(A,...)>` tuple impls extended from
+/// arity 2..=4 to 2..=16, matching `driver.rs::MAX_TUPLE_ARITY` — the same
+/// ceiling every other tuple-consuming mechanism in this codebase already
+/// shares. Real end-to-end proof at the *top* of that new range (16, not
+/// just one past the old ceiling of 4) — the exact heterogeneous shape
+/// `println` (a plain `T: Print`-bound wrapper, itself unchanged) needs for
+/// a genuinely multi-value structured log line in one call.
+#[test]
+fn a_sixteen_element_heterogeneous_tuple_print_reaches_the_new_arity_ceiling() {
+    let context = context();
+    let out = run_i32_with_dynarray_symbols(
+        &context,
+        "use io;\n\
+         fn main() -> i32 {\n\
+             println((\"a=\", 1, \" b=\", 2.0, \" c=\", 3, \" d=\", 4, \" e=\", 5, \" f=\", 6, \" g=\", 7, \" h=\", 8));\n\
+             0\n\
+         }",
+        &[],
+    );
+    assert_eq!(out, 0);
+}
+
 /// `doc/backlog.md`'s own "Variadic generics" item — a const-generic pack
 /// (`struct Tensor<T, const Dims...: i32> { data: [T; Dims...] }`),
 /// resolved via an explicit turbofish at a construction site, constructs

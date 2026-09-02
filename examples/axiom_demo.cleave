@@ -1,11 +1,51 @@
 use io;
 
-fn helper(x: i32) -> i32 {
-    let y = 10;
-    10 + x - y
+// A real, user-declared `algebra` with real `axiom`s of its own — unlike
+// this file's own earlier version, which relied entirely on stdlib's
+// already-declared `Ring<T>` axioms (`add_commutative`/`add_sub_assoc`/...,
+// `stdlib/num/num.cleave`) without ever showing the mechanism that makes
+// them possible in the first place. `doc/hld.md`'s own equality-saturation
+// design: a declared `axiom` is a trusted (never proven, `doc/hld.md`'s own
+// "v1 trust model") equation between two expressions, added to the same
+// e-graph every ordinary optimization pass already runs over — the *exact*
+// mechanism backing every `+`/`-`/`*` simplification in this codebase,
+// available to your own operators too.
+//
+// `pick` is real `max`, but the compiler doesn't know that from its own
+// `mlir::arith::select`-based body alone — nothing about an `if`/`select`
+// chain is inherently "idempotent" or "associative" to an optimizer that
+// only ever sees generic control flow. Declaring these two properties as
+// axioms is what lets equality saturation treat `pick` as an idempotent,
+// associative operator directly, the same way `Ring<T>`'s own declared
+// axioms are what let `10 + x - 10` simplify to `x` (this file's own former
+// example) rather than that being some special, hardcoded arithmetic
+// knowledge.
+algebra Pick<T> {
+    fn pick(a: T, b: T) -> T;
+    axiom pick_idempotent(a): pick(a, a) == a;
+    axiom pick_associative(a, b, c): pick(pick(a, b), c) == pick(a, pick(b, c));
+}
+
+impl Pick<i32> {
+    fn pick(a, b) { if a > b { a } else { b } }
+}
+
+// `pick(pick(pick(x, x), y), x)` -- true `max` semantics either way, so the
+// *result* is the same whether or not the axioms ever fire. The real,
+// visible effect of declaring them is on the *compiled form* itself, not
+// this run's own printed output -- confirmed directly, not assumed:
+// `cleave examples/axiom_demo.cleave --dump-cps-equivalences` shows the
+// actual rewrite chain `egraph.rs` found while saturating this exact
+// expression -- `pick_idempotent` collapsing the innermost `pick(x, x)` to
+// `x`, then `pick_associative` regrouping `pick(pick(x, y), x)` into
+// `pick(x, pick(y, x))` -- real equalities the compiler could only ever
+// discover because this file declared them, not generic reasoning about
+// `if`/`select` chains.
+fn helper(x: i32, y: i32) -> i32 {
+    pick(pick(pick(x, x), y), x)
 }
 
 fn main() -> i32 {
-    print(helper(21));
+    print(helper(3, 21)); // max(3, 21) = 21
     0
 }

@@ -2,15 +2,19 @@ use io;
 use complex;
 use convert;
 
-// `f64 -> Complex<f64>` isn't in `stdlib/convert/convert.cleave` itself
-// (see that file's own doc comment on why) -- an ordinary user-space
-// extension of `Convert`, same as `examples/convert.cleave`.
-impl Convert<f64, Complex<f64>> {
-    fn convert(x) { Complex(real: x, imag: 0.0) }
-}
-
-impl Convert<f32, Complex<f32>> {
-    fn convert(x) { Complex(real: x, imag: 0.0) }
+// `T -> Complex<T>` isn't in `stdlib/convert/convert.cleave` itself (see
+// that file's own doc comment on why) -- an ordinary user-space extension
+// of `Convert`, same as `examples/convert.cleave`. One generic impl, not
+// two concrete ones (`f64`/`f32` separately) -- `doc/backlog-done.md`'s own
+// "A generic impl's own generic gets silently defaulted away by a body
+// literal" entry: the real bug this used to hit (`Complex(real: x, imag:
+// 0.0)` inside `impl<T: Float> Convert<T, Complex<T>>` failed to
+// monomorphize, "expected floating point type") is long since fixed;
+// `Ring::zero()` in place of the bare `0.0` literal sidesteps it (and is
+// the more idiomatic choice regardless -- a typed zero, not a width-guessed
+// one).
+impl<T: Float> Convert<T, Complex<T>> {
+    fn convert(x) { Complex(real: x, imag: Ring::zero()) }
 }
 
 fn main() {

@@ -28,7 +28,12 @@ fn loss(w: f32, b: f32) -> f32 {
     };
     total
 }
-grad = derive(loss);
+// `derive()`, not `grad()` -- `grad()` (reverse-mode, `doc/backlog-done.md`)
+// would work fine too (`loss` returns a scalar `f32`), but this example
+// predates it; `dloss`, not `grad`, so the binding's own name doesn't
+// collide with the real `grad()` keyword that exists now (`examples/
+// derivative_demo.cleave`'s own identical fix, same reasoning).
+dloss = derive(loss);
 
 fn main() -> i32 {
     let mut w: f32 = 0.0;
@@ -38,7 +43,7 @@ fn main() -> i32 {
     print("start learning...");
 
     for step in 0..10 {
-        let g: (f32, f32) = grad(w, b);
+        let g: (f32, f32) = dloss(w, b);
         w = w - lr * g.0;
         b = b - lr * g.1;
     };

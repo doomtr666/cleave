@@ -1,18 +1,29 @@
 // `doc/backlog.md`'s "Explicit conversion between numeric types" item.
 // `stdlib/convert/convert.cleave` ships `i32 -> f64` and `f32 -> f64`
 // (dependency-free, like `stdlib/num`). A user program extends `Convert`
-// with its own impls exactly like any other algebra -- here, `f64 ->
-// Complex<f64>` (ℝ ⊂ ℂ), proving the mechanism is genuinely open, not a
-// closed set baked into the compiler.
+// with its own impls exactly like any other algebra -- here, between two
+// genuinely custom structs (`Celsius`/`Fahrenheit`, no relation to any
+// built-in numeric type at all), proving the mechanism is genuinely open,
+// not a closed set of numeric widths baked into the compiler.
+// (`examples/complex.cleave` is the other real user-space extension of
+// `Convert` in this repo -- `f64 -> Complex<f64>` -- kept separate rather
+// than duplicated here, since it already covers that specific case.)
 use convert;
-use complex;
 use io;
 
-impl Convert<f64, Complex<f64>> {
-    fn convert(x) { Complex(real: x, imag: 0.0) }
+struct Celsius { degrees: f64 }
+struct Fahrenheit { degrees: f64 }
+
+impl Convert<Celsius, Fahrenheit> {
+    fn convert(x) { Fahrenheit(degrees: x.degrees * 9.0 / 5.0 + 32.0) }
+}
+
+impl Convert<Fahrenheit, Celsius> {
+    fn convert(x) { Celsius(degrees: (x.degrees - 32.0) * 5.0 / 9.0) }
 }
 
 fn main() -> i32 {
+    // The two stdlib-shipped conversions -- ordinary numeric widening.
     let n: i32 = 3;
     let f: f64 = n.to();
     print(f);
@@ -20,9 +31,16 @@ fn main() -> i32 {
     let g: f64 = 4.to();
     print(g);
 
-    let z: Complex<f64> = f.to();
-    print(z.real);
-    print(z.imag);
+    // The two user-declared conversions above -- round-tripping through
+    // both directions. 100C is the boiling point of water at sea level.
+    let boiling: Celsius = Celsius(degrees: 100.0);
+    let boiling_f: Fahrenheit = boiling.to();
+    print(boiling_f.degrees); // 212.0
+
+    // 32F is the freezing point.
+    let freezing: Fahrenheit = Fahrenheit(degrees: 32.0);
+    let freezing_c: Celsius = freezing.to();
+    print(freezing_c.degrees); // 0.0
 
     0
 }
