@@ -253,7 +253,7 @@ impl std::fmt::Display for ConstValue {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TyVar(pub u32);
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 pub struct TyVarGen(u32);
 
 impl TyVarGen {
@@ -1891,6 +1891,25 @@ pub struct Infer<'r> {
     /// `with_inherent_patterns`.
     inherent_patterns:
         Option<&'r HashMap<(String, String), crate::callgraph::InherentMethodPattern>>,
+    /// `monomorphize.rs`'s own `resolved_target_sigs` (`doc/backlog.md`'s
+    /// own "composing algebra impl generic over `Opt`..." entry has the
+    /// full story) — `None` for every existing caller (the ordinary whole-
+    /// program pass, `build_impl_templates`, every other fallback), opted
+    /// into *only* by the `impl_worklist` drain loop's own re-inference
+    /// fallback (`infer_impl_fn_with_concrete_targets`'s own caller).
+    /// Consulted the moment `dispatch_algebra_call` below commits for real:
+    /// an output-only generic (`State`) a fresh dispatch would otherwise
+    /// leave as a bare, permanently-open variable — nothing in *this*
+    /// session's own body-inference could ever learn its concrete value on
+    /// its own, since ordinary dispatch only ever matches *structurally*
+    /// against an impl's own declaration, never against what a *separate*,
+    /// already-computed monomorphization elsewhere resolved it to — gets
+    /// unified against this table's own answer immediately, right at the
+    /// point of commit, if this exact `(algebra, concrete gating positions)`
+    /// signature is already known. Keyed and valued identically to
+    /// `monomorphize.rs`'s own table (`(String, Vec<String>) -> Vec<Ty>>`)
+    /// so no translation is needed at the call site.
+    external_state_hint: Option<&'r HashMap<(String, Vec<String>), Vec<Ty>>>,
     /// A field access (`v.foo`) whose own base was still a bare `Ty::Var`
     /// at the point it was written — e.g. `let z = 4i; z.real`, where `z`'s
     /// own type only becomes concrete once `apply_defaults` runs, at the
@@ -1968,9 +1987,29 @@ enum NumberDefault {
 
 impl<'r> Infer<'r> {
     pub fn new(registry: &'r Registry) -> Self {
+        Self::new_with_vars(registry, TyVarGen::default())
+    }
+
+    /// Like `new`, but seeded with an *existing* `TyVarGen` rather than a
+    /// fresh one starting back at `0` — see `into_vars`'s own doc comment
+    /// for why this pairing exists at all: `monomorphize.rs`'s own
+    /// `build_impl_templates` and its `impl_worklist` drain loop's own
+    /// re-inference fallback (`infer_impl_fn_with_concrete_targets`) both
+    /// mint fresh `Infer` instances, repeatedly, throughout monomorphization
+    /// — every one of `Infer::new`'s own callers *before* this pairing
+    /// existed started counting from `0` independently, which is exactly
+    /// what let two completely unrelated `TyVar`s from two different
+    /// sessions collide on the same number purely by coincidence. Safe on
+    /// its own for any *isolated* use (a single `Infer` session never
+    /// confuses its own vars with themselves), and required the moment two
+    /// sessions' own outputs are ever unified against each other directly
+    /// (`doc/backlog.md`'s own "composing algebra impl generic over
+    /// `Opt`..." entry has the full story of where this was found, the hard
+    /// way, silently producing a wrong answer before the fix).
+    pub(crate) fn new_with_vars(registry: &'r Registry, vars: TyVarGen) -> Self {
         Infer {
             subst: Subst::default(),
-            vars: TyVarGen::default(),
+            vars,
             pending_defaults: Vec::new(),
             constraints: Vec::new(),
             registry,
@@ -1985,10 +2024,38 @@ impl<'r> Infer<'r> {
             in_progress_methods: HashMap::new(),
             lambda_schemes: HashMap::new(),
             inherent_patterns: None,
+            external_state_hint: None,
             pending_field_accesses: Vec::new(),
             pending_method_calls: Vec::new(),
             pending_indices: Vec::new(),
         }
+    }
+
+    /// Opts this instance into consulting `hint` the moment an algebra
+    /// dispatch commits — see `external_state_hint`'s own doc comment for
+    /// what it does and why. Builder-style, chains onto `Infer::new_with_
+    /// vars` the same way `with_inherent_patterns` chains onto `Infer::new`.
+    pub(crate) fn with_external_state_hint(
+        mut self,
+        hint: &'r HashMap<(String, Vec<String>), Vec<Ty>>,
+    ) -> Self {
+        self.external_state_hint = Some(hint);
+        self
+    }
+
+    /// Hands back a copy of this session's own `TyVarGen` — its counter now
+    /// advanced past every `TyVar` this session itself minted so far — so a
+    /// *caller* running many short-lived `Infer` sessions back-to-back
+    /// (`monomorphize.rs`'s own `build_impl_templates`/`impl_worklist`
+    /// fallback) can feed it straight into the *next* one via `new_with_
+    /// vars`, keeping numbering unique across the whole sequence rather
+    /// than restarting at `0` every time. `&self`, not `self` — callers
+    /// still need `self` alive afterward to read `param_types`/`node_types`/
+    /// etc. back out; `TyVarGen`'s own `Copy` is what makes a non-consuming
+    /// snapshot like this meaningful at all. See `new_with_vars`'s own doc
+    /// comment for why this matters.
+    pub(crate) fn current_vars(&self) -> TyVarGen {
+        self.vars
     }
 
     /// Opts this instance into consulting `patterns` (`callgraph::infer_
@@ -2298,6 +2365,59 @@ impl<'r> Infer<'r> {
                     Ty::Con(name)
                 } else {
                     Ty::App(name, pack_tys.to_vec())
+                }
+            }
+            // A pack reference nested *inside* another generic type's own
+            // argument list (`m: Tensor<T, Dims...>`, an `AdamState<T,
+            // Dims...>` field — as opposed to `Tensor` itself's own `data:
+            // [T; Dims...]`, the bare-array-size shape the `Array` arm above
+            // already handles, or a pack used as a field's *whole* type, the
+            // bare-`PackRef` arm just above). Found by direct testing: the
+            // `_` fallback used to send this straight to plain `ty_from_ast_
+            // mapped`, which has no `pack_tys` at all and panics the moment
+            // it reaches the nested `Dims...` (`"pack reference `Dims...`
+            // has no matching declared generic in scope"`) — `mapping` here
+            // only ever holds the struct's *non-pack* generics (`T`), by
+            // this method's own caller's construction (`resolve_field_
+            // access`), never the pack itself. Mirrors `ty_from_ast_mapped`'s
+            // own `Path` arm positionally, except a `Dims...` argument
+            // splices *all* of `pack_tys` in place (one struct type-argument
+            // slot expanding into several `Ty::App` slots, exactly how
+            // `Tensor<T, Dims...>`'s own three-or-however-many concrete
+            // dimensions are laid out), rather than collapsing to a single
+            // tuple type the way the bare-`PackRef`-as-whole-type arm above
+            // does -- recursing through this same pack-aware method (not
+            // plain `ty_from_ast_mapped`) so an even-deeper nesting resolves
+            // correctly too.
+            TypeKind::Path(p, args) => {
+                let name = p.segments.join("::");
+                if let Some(mapped) = mapping.get(&name) {
+                    return mapped.clone();
+                }
+                if self.registry.has_algebra(&name) && !self.registry.has_struct(&name) {
+                    self.pending_type_name_checks.push((name.clone(), ty.span));
+                }
+                let mut type_args: Vec<Ty> = Vec::new();
+                for a in args {
+                    match a {
+                        GenericArg::Type(t) if matches!(&t.kind, TypeKind::PackRef(n) if n == pack_name) =>
+                        {
+                            type_args.extend(pack_tys.iter().cloned());
+                        }
+                        GenericArg::Type(t) => {
+                            type_args.push(self.ty_from_ast_mapped_with_pack(t, mapping, pack_name, pack_tys));
+                        }
+                        GenericArg::Const(e) => {
+                            type_args.push(
+                                self.const_value_from_expr(e, mapping).unwrap_or_else(|| self.vars.fresh()),
+                            );
+                        }
+                    }
+                }
+                if type_args.is_empty() {
+                    Ty::Con(name)
+                } else {
+                    Ty::App(name, type_args)
                 }
             }
             _ => self.ty_from_ast_mapped(ty, mapping),
@@ -3148,6 +3268,178 @@ impl<'r> Infer<'r> {
             .iter()
             .map(|t| self.subst.apply(t))
             .collect();
+        Ok(final_result)
+    }
+
+    /// Like `infer_impl_fn_generic_with_env`, but for `monomorphize.rs`'s own
+    /// duck-typed-style fallback (`doc/backlog.md`'s own "composing algebra
+    /// impl generic over `Opt`..." entry, and `monomorphize.rs`'s own
+    /// `impl_worklist` drain loop, right alongside `fn_worklist`'s existing
+    /// `infer_fn_with_concrete_params` fallback): `target_tys`/`param_types`
+    /// are a real specialization's own types — as concrete as `monomorphize.
+    /// rs`'s own caller could make them (see its own `resolved_target_sigs`
+    /// doc comment for how a sibling specialization's own resolved `State`
+    /// gets folded in *before* this is ever called), not necessarily fully
+    /// so yet. No `impl_generics`/`fresh_generics_mapping`/`active_generics`
+    /// at all — there's no longer anything generic left to *protect*
+    /// (`quantify_impl_generics` doesn't apply either, for the identical
+    /// reason).
+    ///
+    /// This is what lets a still-generic impl's own *body* — one that
+    /// dispatches a nested algebra call whose own leaf can't be resolved
+    /// while `Opt` (or any other impl-level generic) is still abstract, e.g.
+    /// `Optimizer<Opt, Wrap<T>, WrapState<StateA,StateB>>`'s own body calling
+    /// `Optimizer::init_state(opt, model.a)` — resolve for real, once `Opt`
+    /// really is concrete (`Sgd`), instead of forever carrying a leftover,
+    /// structurally disconnected free type variable that `monomorphize.rs`'s
+    /// own ordinary `substitute()` (a pure variable-*rename*, never a real
+    /// dispatch) can never repair: `infer_impl_fn_generic_with_env`'s own
+    /// one-time, wholly-generic body check is sound but *necessarily*
+    /// defers any nested dispatch that isn't provably unambiguous with
+    /// `Opt` still abstract (`unambiguous_and_preserves_openness`'s own doc
+    /// comment) — and a deferred `Constraint` inside a still-abstract
+    /// declaration is *never* resolved (`check_pending_constraints`'s own
+    /// doc comment: "not migrated into a `Scheme`... a real gap, not a
+    /// silent decision to ignore it"). Re-running inference here, with every
+    /// target/param type already as concrete as it can be, sidesteps the
+    /// gap entirely rather than trying to patch around it: ordinary dispatch
+    /// — the ready-to-commit path `infer_algebra_call` already has — just
+    /// works, the same way it does for any other fully-concrete call site.
+    ///
+    /// Any position still carrying a free variable (a `State` no sibling has
+    /// resolved *yet* — this may be the very first specialization of this
+    /// impl block anyone's ever built) gets an ordinary fresh, session-local
+    /// one — meaningless to thread the caller's own stale `TyVar` through
+    /// literally (it belongs to whichever *different*, already-abandoned
+    /// `Infer` session built the frozen template in the first place) —
+    /// structure survives (`WrapState<_,_>`, not a bare var), only the
+    /// leaves are refreshed, so field access (`state.a`) still knows what
+    /// it's looking at, and this session's own real inference gets a real
+    /// chance to pin the leaves down itself (exactly the `init_state`
+    /// case — genuinely output-only, no sibling needed at all).
+    ///
+    /// Const generics on the impl itself (`In`/`Out` on `Dense<T,In,Out>`)
+    /// are *not* separately seeded as values here, unlike `infer_impl_fn_
+    /// generic_with_env`'s own `seed_const_generics` call — `target_tys`
+    /// being concrete already bakes them into every type position that
+    /// matters; nothing this fallback exists for (a still-generic impl's own
+    /// pure composing/forwarding body) references one as a bare value
+    /// expression. A body that genuinely needs one as a value would need
+    /// this extended — not required by any real caller today.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn infer_impl_fn_with_concrete_targets(
+        &mut self,
+        algebra: &str,
+        method_name: &str,
+        target_tys: &[Ty],
+        params: &[Param],
+        body: &Block,
+        param_types: Vec<Ty>,
+        fallback_span: Span,
+    ) -> Result<Ty, TypeError> {
+        let Some(sig) = self.registry.fn_sig(algebra, method_name).cloned() else {
+            return Err(TypeError {
+                span: fallback_span,
+                kind: TypeErrorKind::NotDeclaredByAlgebra {
+                    algebra: algebra.to_string(),
+                    name: method_name.to_string(),
+                },
+            });
+        };
+        if sig.params.len() != params.len() {
+            return Err(TypeError {
+                span: fallback_span,
+                kind: TypeErrorKind::ArityMismatch {
+                    name: method_name.to_string(),
+                    expected: sig.params.len(),
+                    found: params.len(),
+                },
+            });
+        }
+
+        // Every free variable anywhere across `target_tys`/`param_types` —
+        // whatever `monomorphize.rs`'s own structural lookup couldn't fill
+        // in — belongs to a *different*, already-abandoned `Infer` session,
+        // meaningless to `self.subst` here. One shared rename, consistent
+        // across *every* position at once (so `State` showing up in both a
+        // parameter and the return type still resolves to the very same
+        // fresh var, not two independent ones) — everything *structural*
+        // survives the rename untouched, only the genuinely-still-open
+        // leaves get fresh, session-local variables.
+        let mut stale_free = HashSet::new();
+        target_tys.iter().for_each(|t| free_vars(t, &mut stale_free));
+        param_types.iter().for_each(|t| free_vars(t, &mut stale_free));
+        let rename: HashMap<TyVar, Ty> = stale_free
+            .into_iter()
+            .map(|v| (v, self.vars.fresh()))
+            .collect();
+        let target_tys: Vec<Ty> = target_tys.iter().map(|t| substitute(t, &rename)).collect();
+        let param_types: Vec<Ty> = param_types.iter().map(|t| substitute(t, &rename)).collect();
+        self.target_types = target_tys.clone();
+
+        let generics = self.registry.generics(algebra).to_vec();
+        let mut target_ty_iter = target_tys.iter();
+        let mapping: HashMap<String, Ty> = generics
+            .iter()
+            .filter_map(|g| match g {
+                GenericParam::Type { name, .. } => {
+                    target_ty_iter.next().map(|ty| (name.clone(), ty.clone()))
+                }
+                GenericParam::Const { name, .. } => Some((name.clone(), self.vars.fresh())),
+            })
+            .collect();
+
+        let mut env = Env::new();
+        for (p, ty) in params.iter().zip(&param_types) {
+            env.insert(p.name.clone(), Scheme::mono(ty.clone()));
+        }
+
+        let expected_ret = sig
+            .ret
+            .as_ref()
+            .map(|t| self.ty_from_ast_mapped(t, &mapping))
+            .unwrap_or_else(|| Ty::Con("()".to_string()));
+
+        let result = self.infer_block(&env, body)?;
+        let result_span = body
+            .tail
+            .as_deref()
+            .map(|t| t.span)
+            .unwrap_or(fallback_span);
+        self.unify_at(result_span, &expected_ret, &result)?;
+
+        // The relevant subset of `finish_fn` — no `FnDecl` exists here to
+        // hand it (`monomorphize.rs`'s own `ImplTemplate` never kept one,
+        // just the pieces this method takes directly), so its final
+        // `check_no_placeholder` call is inlined by hand instead, against
+        // `body`'s own span exactly the way `check_no_placeholder` itself
+        // would resolve one from a real `FnDecl`.
+        self.apply_defaults();
+        self.check_pending_constraints_and_indices()?;
+        self.check_pending_type_names()?;
+        self.check_pending_div_by_zero()?;
+        self.check_pending_field_accesses()?;
+        self.check_pending_method_calls()?;
+
+        self.param_types = param_types.iter().map(|t| self.subst.apply(t)).collect();
+        let resolved_nodes: Vec<(NodeId, Ty)> = self
+            .node_types
+            .iter()
+            .map(|(id, t)| (*id, self.subst.apply(t)))
+            .collect();
+        self.node_types = resolved_nodes.into_iter().collect();
+        self.resolve_lambda_schemes();
+
+        let final_result = self.subst.apply(&result);
+        let unresolved = find_placeholder_name(&final_result)
+            .or_else(|| self.param_types.iter().find_map(find_placeholder_name));
+        if let Some(placeholder) = unresolved {
+            return Err(TypeError {
+                span: result_span,
+                kind: TypeErrorKind::Unresolved(placeholder),
+            });
+        }
+
         Ok(final_result)
     }
 
@@ -6602,7 +6894,7 @@ impl<'r> Infer<'r> {
             // sound here specifically), which is what lets an output-only
             // generic like `C` end up resolved at all.
             match self.dispatch_algebra_call(algebra, &resolved_generics, call_span) {
-                Ok(true) => {}
+                Ok(true) => self.apply_external_state_hint(algebra, &resolved_generics),
                 Ok(false) => {
                     let ty = resolved_generics
                         .iter()
@@ -6673,6 +6965,52 @@ impl<'r> Infer<'r> {
         }
 
         Ok(self.subst.apply(&ret_ty))
+    }
+
+    /// `external_state_hint`'s own doc comment has the full story of why
+    /// this exists. Called right after `dispatch_algebra_call` commits for
+    /// real — `resolved_generics` reflects the just-matched candidate's own
+    /// *structural* binding at this point (an output-only `State` position
+    /// is a real, shaped `WrapState<'a,'b>` now, not a bare disconnected
+    /// var — dispatch itself already did that much), but the *leaves*
+    /// (`'a`/`'b`) are still open, since ordinary dispatch only ever proves
+    /// the shape, never the concrete contents. If `monomorphize.rs`'s own
+    /// table already has a fully-concrete answer for this exact `(algebra,
+    /// concrete gating positions)` signature — from some *separate*,
+    /// already-finished specialization elsewhere, structurally unrelated to
+    /// this call site — unify it in directly, right now, closing the gap
+    /// completely instead of leaving it for a caller that has no way to
+    /// ever learn it on its own.
+    ///
+    /// Best-effort and silent on any failure (`hint_table.get` finding
+    /// nothing, or the unify itself failing) — this is purely *additional*
+    /// information layered onto an already-sound commit, never a new way to
+    /// reject an otherwise-valid program; a mismatched hint would only ever
+    /// mean the table itself is stale or wrong, not that *this* call is.
+    fn apply_external_state_hint(&mut self, algebra: &str, resolved_generics: &[Ty]) {
+        let Some(hint_table) = self.external_state_hint else {
+            return;
+        };
+        let current: Vec<Ty> = resolved_generics.iter().map(|t| self.subst.apply(t)).collect();
+        let key = (
+            algebra.to_string(),
+            current
+                .iter()
+                .map(|t| {
+                    if is_fully_concrete(t) {
+                        t.to_string()
+                    } else {
+                        "?".to_string()
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+        let Some(known_full) = hint_table.get(&key) else {
+            return;
+        };
+        for (cur, known) in current.iter().zip(known_full) {
+            let _ = unify(&mut self.subst, cur, known);
+        }
     }
 
     /// Defaults any number-literal type variable never pinned to a concrete

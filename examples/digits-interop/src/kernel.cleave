@@ -27,15 +27,16 @@ extern fn test_label(sample: i32) -> i32;
 extern fn test_target(sample: i32, class: i32) -> f32;
 
 struct Network { l1: Dense<f32, 64, 32>, l2: Dense<f32, 32, 10> }
+struct NetworkState<StateL1, StateL2> { l1: StateL1, l2: StateL2 }
 
-impl<Opt> Optimizer<Opt, Network> {
+impl<Opt, StateL1, StateL2> Optimizer<Opt, Network, NetworkState<StateL1, StateL2>> {
     fn init_state(opt, model) {
-        Network(l1: Optimizer::init_state(opt, model.l1), l2: Optimizer::init_state(opt, model.l2))
+        NetworkState(l1: Optimizer::init_state(opt, model.l1), l2: Optimizer::init_state(opt, model.l2))
     }
     fn step(opt, model, grad, state) {
         let r1 = Optimizer::step(opt, model.l1, grad.l1, state.l1);
         let r2 = Optimizer::step(opt, model.l2, grad.l2, state.l2);
-        (Network(l1: r1.0, l2: r2.0), Network(l1: r1.1, l2: r2.1))
+        (Network(l1: r1.0, l2: r2.0), NetworkState(l1: r1.1, l2: r2.1))
     }
 }
 
@@ -125,7 +126,7 @@ export fn train_and_evaluate(epochs: i32, lr: f32, seed: i64) -> f32 {
     rand_seed(seed);
     let mut net: Network = Network(l1: Init::xavier(), l2: Init::xavier());
     let opt = Sgd(lr: lr);
-    let mut state: Network = Optimizer::init_state(opt, net);
+    let mut state = Optimizer::init_state(opt, net);
     let n: i32 = train_len();
     for epoch in 0..epochs {
         for s in 0..n {

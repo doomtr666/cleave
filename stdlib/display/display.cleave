@@ -11,6 +11,7 @@
 // out); out = Display::display(b, out);`).
 use dynarray;
 use linalg;
+use complex;
 
 algebra Display<T> {
     fn display(x: T, out: DynArray<i8>) -> DynArray<i8>;
@@ -234,6 +235,30 @@ impl<A: Display, B: Display, C: Display, D: Display> Display<(A, B, C, D)> {
         out.push(',');
         out.push(' ');
         out = Display::display(x.3, out);
+        out
+    }
+}
+
+// `Complex<T>` -- raised directly, `print`/`println` had no way to show a
+// complex value at all (`examples/complex.cleave` only ever printed `z.real`
+// / `z.imag` separately). `real+imagi`/`real-imagi` -- the conventional
+// written form, matching how a literal is spelled in cleave source itself
+// (`3.0 + 4i`) -- not `(real, imag)`, which would look like a plain tuple
+// and lose the "this is one complex number" meaning entirely. `Ring::zero()`
+// for the sign check, not a bare `0.0` literal -- the same "typed zero, not
+// a width-guessed one" reasoning `examples/complex.cleave`'s own `Convert`
+// impl already follows, doubly relevant inside a still-generic `T` body.
+impl<T: Float> Display<Complex<T>> {
+    fn display(z, mut out) {
+        out = Display::display(z.real, out);
+        if z.imag < Ring::zero() {
+            out.push('-');
+            out = Display::display(-z.imag, out);
+        } else {
+            out.push('+');
+            out = Display::display(z.imag, out);
+        };
+        out.push('i');
         out
     }
 }

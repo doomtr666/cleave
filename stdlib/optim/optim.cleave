@@ -1,32 +1,57 @@
 // `doc/backlog.md`'s own "No `Optimizer` abstraction" item: a real,
-// generic, stateful optimizer -- `Optimizer<Opt, Model>`, `Opt` a plain
-// hyperparameter-holder struct (`Sgd { lr }`, `Momentum { lr, beta }`), not
-// a value threaded through call arguments the way `Scale<Container,T>`'s
-// own scalar factor is -- SGD and Momentum need genuinely different
-// hyperparameters, so each optimizer gets its own struct field set, the
-// same "config lives in struct fields" shape `Dense`/`Init` already use,
-// rather than forcing every optimizer's `step` to share one fixed argument
-// list.
+// generic, stateful optimizer -- `Optimizer<Opt, Model, State>`, `Opt` a
+// plain hyperparameter-holder struct (`Sgd { lr }`, `Momentum { lr, beta }`,
+// `Adam { lr, beta1, beta2, eps }`), not a value threaded through call
+// arguments the way `Scale<Container,T>`'s own scalar factor is -- each
+// optimizer needs genuinely different hyperparameters, so each gets its own
+// struct field set, the same "config lives in struct fields" shape
+// `Dense`/`Init` already use, rather than forcing every optimizer's `step`
+// to share one fixed argument list.
 //
-// `State` reuses `Model` directly -- a velocity has exactly the same shape
-// as a weight, so there's no need for a separate "shadow" struct per model
-// shape the way a naive design might reach for.
+// **`State` is its own, independent target -- not `Model` reused directly.**
+// An earlier design *did* reuse `Model` directly (a velocity has exactly the
+// same shape as a weight, so no need for a separate "shadow" struct, or so
+// it seemed) -- true for `Sgd` (no state at all) and `Momentum` (one
+// velocity, same shape as the weight), but genuinely false the moment an
+// optimizer needs *more* than one accumulator of that shape: raised
+// directly ("l'API de l'optimiseur est zarbi... pas de support de
+// plusieurs simplement (adam, adamw etc.)") -- `Adam` needs *two* (first
+// and second moment estimates), which a `fn init_state(...) -> Model`
+// signature could never express at all (`Model` names exactly one shape,
+// structurally incapable of being "two tensors").
+// `Optimizer<Opt, Model, State>` is the real, general fix -- a third,
+// independent target, exactly the same heterogeneous-algebra shape
+// `MatMul<A, B, C>` (`stdlib/linalg/matrix.cleave`) already established for
+// the identical reason (operands and result needing different types/shapes
+// at once). `Sgd`/`Momentum` below simply pick `State = Model` again, now
+// as an explicit choice rather than the only option; `Adam` picks a real,
+// different `AdamState<T, Dims...>` instead.
+//
+// **A real, deep compiler limitation had to be fixed to make this design
+// usable at all** (`doc/backlog.md`'s own "composing algebra impl generic
+// over `Opt`..." entry has the full story) -- composing this algebra
+// through struct nesting (`stdlib/nn/nn.cleave`'s own `Dense`-level impl,
+// a user's own `Network`-level one, ...) used to silently break the moment
+// more than one leaf `Opt` impl existed, or leftover free type variables
+// reached MLIR lowering outright. Fixed via a real, general re-inference
+// fallback in `monomorphize.rs`, not worked around here.
 use linalg;
 
 struct Sgd { lr: f32 }
 struct Momentum { lr: f32, beta: f32 }
+struct Adam { lr: f32, beta1: f32, beta2: f32, eps: f32 }
 
-algebra Optimizer<Opt, Model> {
-    fn init_state(opt: Opt, model: Model) -> Model;
-    fn step(opt: Opt, model: Model, grad: Model, state: Model) -> (Model, Model);
+algebra Optimizer<Opt, Model, State> {
+    fn init_state(opt: Opt, model: Model) -> State;
+    fn step(opt: Opt, model: Model, grad: Model, state: State) -> (Model, State);
 }
 
 // Leaf level -- the only level that actually needs to know what an
 // optimizer *is*; every level above this one (`stdlib/nn/nn.cleave`'s own
 // `Dense`-level impl, and any user struct's own `Network`-level one) is
-// generic over `Opt` itself and never touches these bodies at all, just
-// forwards into them.
-impl<T: Float + Ring, const Dims...: i32> Optimizer<Sgd, Tensor<T, Dims...>> {
+// generic over `Opt`/`State` themselves and never touches these bodies at
+// all, just forwards into them.
+impl<T: Float + Ring, const Dims...: i32> Optimizer<Sgd, Tensor<T, Dims...>, Tensor<T, Dims...>> {
     fn init_state(opt, model) { Ring::zero() }
     fn step(opt, model, grad, state) {
         (Ring::sub(model, Scale::scale(grad, opt.lr)), state)
@@ -38,10 +63,74 @@ impl<T: Float + Ring, const Dims...: i32> Optimizer<Sgd, Tensor<T, Dims...>> {
 // `state` carries `v` between steps -- the whole reason this algebra
 // threads `state` through `step` at all, rather than `Sgd`'s simpler
 // "ignore it" shape.
-impl<T: Float + Ring, const Dims...: i32> Optimizer<Momentum, Tensor<T, Dims...>> {
+impl<T: Float + Ring, const Dims...: i32> Optimizer<Momentum, Tensor<T, Dims...>, Tensor<T, Dims...>> {
     fn init_state(opt, model) { Ring::zero() }
     fn step(opt, model, grad, state) {
         let v: Tensor<T, Dims...> = Ring::add(Scale::scale(state, opt.beta), Scale::scale(grad, 1.0 - opt.beta));
         (Ring::sub(model, Scale::scale(v, opt.lr)), v)
+    }
+}
+
+// Adam (Kingma & Ba, 2015): `m <- beta1*m + (1-beta1)*grad` (first moment,
+// an EMA of the gradient itself, exactly `Momentum`'s own `v`), `v <-
+// beta2*v + (1-beta2)*grad^2` (second moment, an EMA of the squared
+// gradient -- a per-parameter estimate of its own recent gradient
+// *magnitude*, what makes Adam adapt its own effective step size per
+// parameter instead of using one fixed learning rate everywhere). Both
+// biased toward zero early on (both start at exactly zero, so an EMA with
+// few real samples behind it is still mostly zero) -- `beta1_pow`/
+// `beta2_pow` track `beta1^t`/`beta2^t` incrementally (multiplied by their
+// own `opt.beta1`/`opt.beta2` once per step, in `state` itself) instead of
+// a real exponentiation call (no `pow` primitive exists in this stdlib at
+// all, and none is needed here): `m_hat = m/(1-beta1^t)`, `v_hat =
+// v/(1-beta2^t)` corrects exactly this early bias. `update = lr * m_hat /
+// (sqrt(v_hat) + eps)` -- `eps` (never zero) is what keeps this from
+// dividing by zero the moment `v_hat` itself is still near zero.
+struct AdamState<T: Float, const Dims...: i32> {
+    m: Tensor<T, Dims...>,
+    v: Tensor<T, Dims...>,
+    beta1_pow: f32,
+    beta2_pow: f32,
+}
+
+impl<T: Float + Ring, const Dims...: i32> Optimizer<Adam, Tensor<T, Dims...>, AdamState<T, Dims...>> {
+    fn init_state(opt, model) {
+        // Explicit turbofish, required for constructing a pack-generic
+        // struct (`doc/backlog.md`'s own "Variadic generics" item, its
+        // "constructing it needs an explicit turbofish" line) -- `m`/`v`
+        // are both `Ring::zero()`, itself still fully generic at this
+        // point (its own return type is pinned by the field it's assigned
+        // to, not the other way around), so nothing here lets the pack's
+        // own arity be inferred from the field values alone the way an
+        // ordinary struct's generics can be.
+        AdamState::<T, Dims...>(m: Ring::zero(), v: Ring::zero(), beta1_pow: 1.0, beta2_pow: 1.0)
+    }
+    fn step(opt, model, grad, state) {
+        let m: Tensor<T, Dims...> = Ring::add(Scale::scale(state.m, opt.beta1), Scale::scale(grad, 1.0 - opt.beta1));
+        let grad_sq: Tensor<T, Dims...> = grad * grad;
+        let v: Tensor<T, Dims...> = Ring::add(Scale::scale(state.v, opt.beta2), Scale::scale(grad_sq, 1.0 - opt.beta2));
+        let beta1_pow: f32 = state.beta1_pow * opt.beta1;
+        let beta2_pow: f32 = state.beta2_pow * opt.beta2;
+        let m_hat: Tensor<T, Dims...> = Scale::scale(m, 1.0 / (1.0 - beta1_pow));
+        let v_hat: Tensor<T, Dims...> = Scale::scale(v, 1.0 / (1.0 - beta2_pow));
+        // `mlir::math::sqrt`, called directly on a `Tensor`-typed value, not
+        // through any declared algebra -- `Transcendental<T>` only ever
+        // impls scalar `f32`/`f64` (`stdlib/num/num.cleave`), and `sqrt`
+        // itself was never wrapped in *any* algebra even at scalar width
+        // (`Complex<T>::magnitude`, `stdlib/complex/complex.cleave`, calls
+        // it the identical raw way). MLIR's own `math.sqrt` is elementwise-
+        // mappable, the same structural property `arith.addf`/`mulf`
+        // already lean on for `Ring<Tensor<T,Dims...>>` above -- confirmed
+        // directly, not assumed: a tensor-typed operand here lowers and
+        // runs correctly with zero new Rust code.
+        let sqrt_v_hat: Tensor<T, Dims...> = mlir::math::sqrt(v_hat);
+        // A broadcast add, not `Ring::add` (which needs *both* operands
+        // already `Tensor`-shaped) -- `mlir::tensor::splat`, the exact same
+        // primitive `Scale::scale`'s own body already uses internally to
+        // turn one scalar into a same-shaped tensor.
+        let eps_bcast: Tensor<T, Dims...> = mlir::tensor::splat(opt.eps);
+        let denom: Tensor<T, Dims...> = sqrt_v_hat + eps_bcast;
+        let update: Tensor<T, Dims...> = Scale::scale(m_hat / denom, opt.lr);
+        (model - update, AdamState::<T, Dims...>(m: m, v: v, beta1_pow: beta1_pow, beta2_pow: beta2_pow))
     }
 }

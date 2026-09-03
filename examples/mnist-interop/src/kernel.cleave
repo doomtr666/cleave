@@ -32,10 +32,18 @@ struct Network {
     l3: Dense<f32, 256, 128>,
     l4: Dense<f32, 128, 10>
 }
+struct NetworkState<StateL1, StateL2, StateL3, StateL4> {
+    l1: StateL1,
+    l2: StateL2,
+    l3: StateL3,
+    l4: StateL4
+}
 
-impl<Opt> Optimizer<Opt, Network> {
+impl<Opt, StateL1, StateL2, StateL3, StateL4>
+    Optimizer<Opt, Network, NetworkState<StateL1, StateL2, StateL3, StateL4>>
+{
     fn init_state(opt, model) {
-        Network(
+        NetworkState(
             l1: Optimizer::init_state(opt, model.l1),
             l2: Optimizer::init_state(opt, model.l2),
             l3: Optimizer::init_state(opt, model.l3),
@@ -49,7 +57,7 @@ impl<Opt> Optimizer<Opt, Network> {
         let r4 = Optimizer::step(opt, model.l4, grad.l4, state.l4);
         (
             Network(l1: r1.0, l2: r2.0, l3: r3.0, l4: r4.0),
-            Network(l1: r1.1, l2: r2.1, l3: r3.1, l4: r4.1)
+            NetworkState(l1: r1.1, l2: r2.1, l3: r3.1, l4: r4.1)
         )
     }
 }
@@ -209,7 +217,7 @@ export fn train_and_evaluate(epochs: i32, lr: f32, seed: i64) -> f32 {
     // comparable to the original per-sample regime (see `loss`'s own doc
     // comment above).
     let opt = Sgd(lr: lr / 32.0);
-    let mut state: Network = Optimizer::init_state(opt, net);
+    let mut state = Optimizer::init_state(opt, net);
     let n: i32 = train_len();
     let num_batches: i32 = n / 32;
 
@@ -224,8 +232,7 @@ export fn train_and_evaluate(epochs: i32, lr: f32, seed: i64) -> f32 {
             state = r.1;
         };
 
-        print("Epoch ");
-        println(epoch);
+        println(("Epoch=", epoch));
     };
     evaluate(net)
 }

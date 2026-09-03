@@ -127,6 +127,20 @@ pub struct ProgramInference {
     /// *non-generic* algebra impl; see `doc/backlog.md` for the fuller
     /// story.
     pub inherent_patterns: HashMap<(String, String), InherentMethodPattern>,
+    /// One past the highest `TyVar` id any SCC group's own `Infer` instance
+    /// minted during this whole pass (`next_var_id`'s own final value,
+    /// below) — exposed so a caller building further, *separate* `Infer`
+    /// sessions after this pass is already finished (`monomorphize.rs`'s
+    /// own `shared_vars`) can start past it, the identical collision this
+    /// same `next_var_id` chaining already prevents *within* this pass,
+    /// between SCC groups. Found necessary the identical way: a template
+    /// built by one of those later sessions, unified directly (`monomorphize.
+    /// rs::derive_impl_instantiation`) against a query built from this
+    /// pass's own `node_types`, could otherwise alias two completely
+    /// unrelated bindings together purely because their raw `TyVar` ids
+    /// coincided — confirmed directly, not hypothetical, before this field
+    /// existed.
+    pub next_var_id: u32,
 }
 
 /// One inherent method's own return type, inferred *early* (before
@@ -610,6 +624,7 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
         lambda_schemes,
         global_env,
         inherent_patterns,
+        next_var_id,
     }
 }
 

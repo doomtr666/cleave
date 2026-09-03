@@ -564,6 +564,44 @@ fn resolve_struct_field_ty_with_pack(
                 Ty::App(tuple_name, pack_tys.to_vec())
             }
         }
+        // A pack reference nested *inside* another generic type's own
+        // argument list (`m: Tensor<T, Dims...>`, an `AdamState<T,
+        // Dims...>` field) — mirrors `infer.rs::ty_from_ast_mapped_with_
+        // pack`'s own identical arm (same bug, same fix, found the same
+        // way: a struct whose own pack-generic field is itself another
+        // pack-generic type, as opposed to `Tensor`'s own bare-array-size
+        // `data: [T; Dims...]` or a field that's the pack's own whole
+        // type). Every element of `pack_tys` splices into this one
+        // argument-list slot (`Tensor<T, Dims...>`'s own concrete
+        // dimensions laid out flat, exactly like a direct `Tensor<f32,2,
+        // 2>` reference already has), rather than collapsing to a tuple
+        // the way the bare-`PackRef`-as-whole-type arm above does —
+        // recursing through this same pack-aware function so a deeper
+        // nesting resolves correctly too.
+        TypeKind::Path(path, args) => {
+            let name = path.segments.join("::");
+            if args.is_empty() {
+                if let Some(mapped) = mapping.get(&name) {
+                    return mapped.clone();
+                }
+                return Ty::Con(name);
+            }
+            let mut type_args = Vec::with_capacity(args.len());
+            for a in args {
+                match a {
+                    GenericArg::Type(t) if matches!(&t.kind, TypeKind::PackRef(n) if n == pack_name) => {
+                        type_args.extend(pack_tys.iter().cloned());
+                    }
+                    GenericArg::Type(t) => {
+                        type_args.push(resolve_struct_field_ty_with_pack(t, mapping, pack_name, pack_tys));
+                    }
+                    GenericArg::Const(e) => {
+                        type_args.push(resolve_struct_field_const(e, mapping));
+                    }
+                }
+            }
+            Ty::App(name, type_args)
+        }
         _ => resolve_struct_field_ty(ty, mapping),
     }
 }

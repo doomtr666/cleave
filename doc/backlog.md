@@ -6,6 +6,28 @@ Completed items live in [backlog-done.md](backlog-done.md).
 
 ---
 
+## A tensor literally constructed (not via `Init::xavier()`/an algebra call) crashes MLIR lowering when fed into `Adam`'s own `step`/`init_state`
+
+Found verifying `Adam` end to end (`doc/backlog-done.md`'s own "composing algebra impl generic over `Opt`..." entry): `Optimizer::step`/`init_state` on an `Adam`-optimized `Tensor<f32,2,2>` panics — `"error: expected floating point type"`, an MLIR verifier assertion, not a clean cleave-level diagnostic — but *only* when that tensor was built via a direct literal (`Tensor::<f32,2,2>(data: [[1.0,2.0],[3.0,4.0]])`); the identical call on an `Init::xavier()`-built tensor of the same shape runs correctly (confirmed directly: both `probe_adam_2x2.cleave`, literal, panics, and `probe_adam_xavier_direct.cleave`, otherwise byte-identical, runs and prints a sane value). `Sgd`/`Momentum` on the identical literal-built tensor are unaffected — this is specific to `Adam`'s own, more elaborate body (the only one calling `mlir::math::sqrt`/`mlir::tensor::splat` directly, and constructing `AdamState` via an explicit turbofish).
+
+Not blocking in practice — `stdlib/nn/nn.cleave`'s own `Init<Tensor<T,In,Out>>` (`xavier`/`he`) is the only real way any Dense-layer weight ever gets built, never a literal — `examples/xor.cleave` trains correctly with `Adam` (compiles and runs; convergence quality is a separate, ordinary hyperparameter question, not a compiler-correctness one). Not root-caused yet — found late, budget for this session was already spent chasing the deeper `Optimizer<Opt,Model,State>` composition fix. Worth a real, standalone investigation (dump the MLIR right before the crash, find which specific op/operand pair the verifier rejects) rather than guessing.
+
+## No `Type::<generics>::method(...)` static-call syntax — a zero-arg, output-type-driven algebra call always needs the algebra spelled out (`Init::xavier()`), never the concrete type (`Tensor::<f32,3,3>::xavier()`)
+
+Raised directly, comparing `let t: Tensor<f32,3,3> = Init::xavier();` (today's own required shape, `Init<T>`'s own module doc comment in `stdlib/nn/nn.cleave` has the fuller story of why `Init` had to become an algebra at all) against the `let t = Tensor::<f32,3,3>::xavier();` shape the user actually wanted — the target type spelled out via its own turbofish, the algebra inferred from the method name, not the other way around. This is Rust's own `Type::method()` associated-function resolution (searching every trait implemented for that type for a matching method name), not sugar over the existing qualified-call syntax.
+
+**Confirmed unparseable today, by reading `grammar.pest` directly, not guessed**:
+
+```
+path      = { ident ~ ("::" ~ ident)* }
+turbofish = { "::" ~ "<" ~ generic_arg ~ ("," ~ generic_arg)* ~ ">" }
+call_expr = { path ~ turbofish? ~ "(" ~ arg_list? ~ ")" }
+```
+
+`path` is a bare sequence of idents joined by `::`, with no generic-argument slot on any *intermediate* segment; `turbofish` is a single, path-*final* construct, consumed once, right before the argument list. `Tensor::<f32,3,3>::xavier(...)` would need a turbofish grafted onto `Tensor` in the *middle* of the path — the grammar has nowhere for that to attach at all.
+
+**Real design work beyond the grammar, not just a parser change**: today's dispatch direction is "algebra named explicitly, target type inferred from context" (`infer_algebra_call`, `doc/backlog-done.md`'s own "qualified-call syntax" item) — `Type::<...>::method()` is the reverse: target type known outright, algebra *unknown*, resolved by searching every declared algebra for a method of this exact name whose own impl target matches. Needs a real answer for the ambiguous case (two different algebras both declaring a same-named, same-arity method for the same target type) — Rust's own answer is a hard error requiring `<Type as Trait>::method()` to disambiguate, a *third* syntax this would also need to design. Not attempted — a real language-design pass, not a quick patch.
+
 ## An inherent-impl method can't construct a fresh instance of the exact same struct its own `impl` block targets
 
 Found reworking `examples/vector.cleave`: `impl<T: Float> struct vec3<T> { fn cross(a, b) -> vec3<T> { vec3(x: ..., y: ..., z: ...) } }` — a generic inherent method returning a *fresh* instance of the exact same struct type its own enclosing `impl` targets — fails at CPS/monomorphization time, `CPS: could not resolve method call \`vec3::cross\`` (a native Rust panic, not a clean diagnostic). Isolated to a minimal repro with zero stdlib usage (`use io;` alone, or nothing at all, reproduces identically): a plain `struct vec3<T: Float> { x: T, y: T, z: T }`, one inherent impl, one method constructing `vec3(...)` from its own arguments' fields.

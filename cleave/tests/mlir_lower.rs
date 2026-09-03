@@ -2210,6 +2210,31 @@ fn complex_magnitude_and_magnitude_sq_compute_correctly() {
     assert_eq!(run_i32(&context, src), 1);
 }
 
+/// Raised directly ("les complexes ne sont pas supportés par le print") --
+/// `print`/`println` had no way to show a `Complex<T>` value at all before
+/// this (`examples/complex.cleave` only ever printed `z.real`/`z.imag`
+/// separately). `Display<Complex<T>>` (`stdlib/display/display.cleave`) +
+/// `Print<Complex<T>>` (`stdlib/io/io.cleave`), the same "Display does the
+/// formatting, Print reuses it" shape every other non-scalar `Print<T>`
+/// impl already has. `use complex;` only in the source, not needed anywhere
+/// else -- `display.cleave`'s own `use complex;` makes `Complex<T>` visible
+/// transitively (real, not "one level deep", `use` resolution). Real,
+/// negative-imaginary-part sign handling checked directly, not assumed.
+#[test]
+fn println_on_a_complex_value_formats_it_as_a_single_real_plus_imaginary_string() {
+    let context = context();
+    let src = "
+        use io;
+        use complex;
+        fn main() -> i32 {
+            let z: Complex<f64> = 3.0 - 4i;
+            println(z);
+            0
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 0);
+}
+
 /// Real bug, found by direct testing while extending `examples/complex.
 /// cleave`: `apply_defaults` processed `pending_defaults` in plain source
 /// order — when a bare `Float` literal and an `Imaginary` literal end up
@@ -3532,6 +3557,17 @@ fn explicit_turbofish_on_a_zero_value_parameter_generic_function_resolves_correc
 /// ::xavier()`) sidesteps both bugs at once rather than fixing either
 /// (flagged in `doc/backlog.md`, not investigated further).
 ///
+/// **The real fill loop lives on `Init<Tensor<T,In,Out>>`, not `Init<Dense<
+/// T,In,Out>>`, since this session** — raised directly ("l'init est sur le
+/// type Init... au lieu de Tensor lui-même"): nothing about the loop below
+/// ever reads `Dense` at all, so tying it to `Dense` meant there was no way
+/// to Xavier/He-initialize a bare weight tensor without wrapping it in a
+/// `Dense` first. `Init<Dense<T,In,Out>>::xavier()` is now a two-line
+/// composition (`Dense(w: Init::xavier(), b: Ring::zero())`), both this
+/// test and `a_bare_tensor_can_be_xavier_initialized_directly_without_a_
+/// dense_wrapper` right below covering the two real entry points that
+/// composition needs to keep working.
+///
 /// `Dense<f32,2,3>` -- `limit = sqrt(6/(2+3))`, computed independently here
 /// (not a hand-copied constant), checked against every one of the six
 /// generated weights, plus non-degeneracy (not every entry identical -- the
@@ -3593,6 +3629,35 @@ fn init_he_generates_weights_with_the_right_statistics() {
             // `std = sqrt(2/4) ~= 0.7071`, `var ~= 0.5` -- a loose band
             // around that, not exact-value tolerance.
             if mean_abs < 0.1 and var > 0.2 and var < 1.0 and any_far == 1 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `Init<Tensor<T,In,Out>>::xavier()` reached directly, no `Dense` wrapper
+/// at all -- the real point of moving the fill loop off `Init<Dense<...>>`.
+/// Identical `limit`/in-range/non-degeneracy checks as `init_xavier_
+/// generates_weights_within_the_correct_glorot_bound` above, on a bare
+/// `Tensor<f32,2,3>` this time.
+#[test]
+fn a_bare_tensor_can_be_xavier_initialized_directly_without_a_dense_wrapper() {
+    let context = context();
+    let src = "
+        use nn;
+        use linalg;
+        fn main() -> i32 {
+            rand_seed(11);
+            let w: Tensor<f32, 2, 3> = Init::xavier();
+            let limit: f32 = mlir::math::sqrt(6.0 / 5.0);
+            let neg_limit: f32 = 0.0 - limit;
+            let in_range = w[0, 0] >= neg_limit and w[0, 0] < limit
+                and w[0, 1] >= neg_limit and w[0, 1] < limit
+                and w[0, 2] >= neg_limit and w[0, 2] < limit
+                and w[1, 0] >= neg_limit and w[1, 0] < limit
+                and w[1, 1] >= neg_limit and w[1, 1] < limit
+                and w[1, 2] >= neg_limit and w[1, 2] < limit;
+            let not_degenerate = w[0, 0] != w[0, 1] or w[0, 0] != w[1, 2];
+            if in_range and not_degenerate { 1 } else { 0 }
         }
     ";
     assert_eq!(run_i32(&context, src), 1);
@@ -5319,7 +5384,7 @@ fn optimizer_composes_correctly_one_level_up_through_dense() {
             let gw: Tensor<f32, 2, 2> = Tensor::<f32, 2, 2>(data: [[0.1, 0.1], [0.1, 0.1]]);
             let gb: Tensor<f32, 1, 2> = Tensor::<f32, 1, 2>(data: [[0.1, 0.1]]);
             let grad: Dense<f32, 2, 2> = Dense(w: gw, b: gb);
-            let state: Dense<f32, 2, 2> = Optimizer::init_state(opt, model);
+            let state = Optimizer::init_state(opt, model);
             let r = Optimizer::step(opt, model, grad, state);
             let m: Dense<f32, 2, 2> = r.0;
             if m.w[0, 0] > 0.899 and m.w[0, 0] < 0.901
@@ -5359,14 +5424,15 @@ fn optimizer_momentum_trains_a_real_network_to_convergence_body() {
         use nn;
         use linalg;
         struct Network { l1: Dense<f32, 2, 2>, l2: Dense<f32, 2, 1> }
-        impl<Opt> Optimizer<Opt, Network> {
+        struct NetworkState<StateL1, StateL2> { l1: StateL1, l2: StateL2 }
+        impl<Opt, StateL1, StateL2> Optimizer<Opt, Network, NetworkState<StateL1, StateL2>> {
             fn init_state(opt, model) {
-                Network(l1: Optimizer::init_state(opt, model.l1), l2: Optimizer::init_state(opt, model.l2))
+                NetworkState(l1: Optimizer::init_state(opt, model.l1), l2: Optimizer::init_state(opt, model.l2))
             }
             fn step(opt, model, grad, state) {
                 let r1 = Optimizer::step(opt, model.l1, grad.l1, state.l1);
                 let r2 = Optimizer::step(opt, model.l2, grad.l2, state.l2);
-                (Network(l1: r1.0, l2: r2.0), Network(l1: r1.1, l2: r2.1))
+                (Network(l1: r1.0, l2: r2.0), NetworkState(l1: r1.1, l2: r2.1))
             }
         }
         fn forward(x1: f32, x2: f32, net: Network) -> f32 {
@@ -5385,7 +5451,7 @@ fn optimizer_momentum_trains_a_real_network_to_convergence_body() {
             rand_seed(2);
             let mut net: Network = Network(l1: Init::xavier(), l2: Init::xavier());
             let opt = Momentum(lr: 0.5, beta: 0.9);
-            let mut state: Network = Optimizer::init_state(opt, net);
+            let mut state = Optimizer::init_state(opt, net);
             let x1s: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
             let x2s: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
             let ys: [f32; 4] = [0.0, 1.0, 1.0, 0.0];

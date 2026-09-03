@@ -326,6 +326,22 @@ impl<T: Display, const R: i32, const C: i32> Print<Tensor<T, R, C>> {
         x
     }
 }
+// `Complex<T>` -- raised directly ("les complexes ne sont pas supportés par
+// le print"): same shape as the three impls above, `Display<Complex<T>>`
+// (`stdlib/display/display.cleave`) doing the real formatting work. `use
+// complex;` isn't needed in *this* file at all -- `display.cleave`'s own
+// `use complex;` already makes `Complex<T>` visible here transitively, the
+// identical real (not "one level deep") `use` resolution `stdlib/convert/
+// convert.cleave`'s own doc comment already documents for `nn.cleave`/
+// `linalg`'s `Tensor`.
+impl<T: Float> Print<Complex<T>> {
+    fn print(x) {
+        let mut out: DynArray<i8> = dynarray_new(32);
+        out = Display::display(x, out);
+        print_dynarray_bytes(out.buf, out.len);
+        x
+    }
+}
 
 // `print`'s own trailing-newline counterpart -- a single, ordinary generic
 // `fn` bound on `Print` itself, not a parallel `Println<T>` algebra with its
@@ -337,9 +353,14 @@ impl<T: Display, const R: i32, const C: i32> Print<Tensor<T, R, C>> {
 // none of its own). `print(['\n'])` reuses the *existing* `Print<[i8;N]>`
 // impl above to write the single newline byte -- no new runtime symbol
 // needed, matching this project's own "extend through the existing algebra
-// mechanism, not a new primitive" discipline.
+// mechanism, not a new primitive" discipline. `let r = print(x)`, not a bare
+// `x` on the tail -- every `Print<T>` impl's own contract is "prints and
+// returns unchanged", so this leans on that contract explicitly (the real
+// value threaded through is whatever `print` itself produced) rather than
+// separately re-reading the original parameter, which only happens to
+// still hold the identical value because nothing here ever mutates it.
 fn println<T: Print>(x: T) -> T {
-    print(x);
+    let r: T = print(x);
     print(['\n']);
-    x
+    r
 }

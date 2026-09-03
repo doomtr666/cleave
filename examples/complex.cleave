@@ -28,19 +28,18 @@ fn main() {
     let z2: Complex<f64> = 1i;
 
     // (1 + i) * (1 - i) = 1 - i^2 = 2
+    // `println(zr)` -- `Print<Complex<T>>`/`Display<Complex<T>>` (`stdlib/
+    // io`/`stdlib/display`), not `print(zr.real); print(zr.imag);` separately.
     let zr = (z1 + z2) * (z1 - z2);
-    print(zr.real);
-    print(zr.imag);
+    println(zr);
 
     // 1 / i = -i
     let zq = z1 / z2;
-    print(zq.real);
-    print(zq.imag);
+    println(zq);
 
     // -(1 + i) = -1 - i
     let zn = -(z1 + z2);
-    print(zn.real);
-    print(zn.imag);
+    println(zn);
 
     // A real and an imaginary literal combined directly, no `.to()`/struct
     // literal needed -- 3 + 4i, the classic 3-4-5 triangle.

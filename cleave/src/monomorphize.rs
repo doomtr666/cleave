@@ -88,7 +88,7 @@ use crate::callgraph::{self, InherentMethodPattern, ProgramInference};
 use crate::cps::{StructSchema, collect_struct_schemas};
 use crate::dump::{TyVarNames, dump_block_with_call_names, fmt_ty_named};
 use crate::infer::{
-    ConstValue, Env, Infer, Scheme, Subst, Ty, TyVar, TypeError, TypeErrorKind,
+    ConstValue, Env, Infer, Scheme, Subst, Ty, TyVar, TyVarGen, TypeError, TypeErrorKind,
     find_placeholder_name, free_vars, substitute, unify,
 };
 use crate::mlir_lower::struct_field_types;
@@ -408,7 +408,7 @@ pub fn monomorphize(
     program: &Program,
     registry: &Registry,
 ) -> (MonomorphizedProgram, ProgramInference) {
-    let program_inference = callgraph::infer_program(program, registry);
+    let mut program_inference = callgraph::infer_program(program, registry);
     let functions: HashMap<&str, &FnDecl> = program
         .items
         .iter()
@@ -418,11 +418,42 @@ pub fn monomorphize(
         })
         .collect();
 
+    // Shared across every `Infer` session `build_impl_templates` and the
+    // `impl_worklist` drain loop below each mint, one after another, for the
+    // whole rest of this function — see `Infer::new_with_vars`'s own doc
+    // comment for why: two of these short-lived sessions' own outputs get
+    // unified directly against each other (the `impl_worklist` loop's own
+    // re-inference fallback, `doc/backlog.md`'s own "composing algebra impl
+    // generic over `Opt`..." entry), and `TyVar` numbers restarting at `0`
+    // independently in each one is exactly what let that happen wrong once,
+    // silently, before this existed.
+    //
+    // Seeded from `program_inference.next_var_id`, not `0` -- `derive_impl_
+    // instantiation` (called from `collect_instantiations`, all over this
+    // file) unifies a template's own pattern (built from one of *these*
+    // shared-counter sessions) directly against a query built from
+    // `program_inference.node_types` (`callgraph::infer_program`'s own,
+    // entirely separate `Infer` sessions, already finished by the time this
+    // function starts) -- the identical cross-session collision risk
+    // `shared_vars` exists to close, just one session earlier than the two
+    // this was first built for (`callgraph.rs`'s own `next_var_id`
+    // chaining already prevents the identical collision *between* SCC
+    // groups *within* that pass; `next_var_id` here is just that same
+    // chain, continued one step further). Confirmed the hard way, by
+    // direct testing: a template's own unrelated `TyVar` happening to
+    // share a raw number with `state`'s own type in `program_inference`
+    // silently aliased two completely independent struct fields together
+    // (`NetworkState<S1,S2>`'s own `S2` ending up structurally equal to
+    // `S1`) -- a genuine, non-deterministic (`HashMap`-iteration-order-
+    // dependent) correctness bug, not just a missing-resolution one,
+    // reproduced directly and root-caused precisely before this fix.
+    let mut shared_vars = TyVarGen::starting_at(program_inference.next_var_id);
     let templates = build_impl_templates(
         program,
         registry,
         &program_inference.global_env,
         &program_inference.inherent_patterns,
+        &mut shared_vars,
     );
     let inherent_templates =
         build_inherent_templates(program, registry, &program_inference.global_env);
@@ -582,6 +613,49 @@ pub fn monomorphize(
     // fixed point — `mono.specializations.contains_key` already guards every
     // loop body against redoing (or infinitely repeating) already-finished
     // work, so an extra pass over an empty worklist is always a cheap no-op.
+    //
+    // `resolved_target_sigs` — `doc/backlog.md`'s own "composing algebra
+    // impl generic over `Opt`..." entry has the full story of why this
+    // exists and what it replaces (an earlier, *wrong* attempt keyed by raw
+    // `TyVar`, defeated by `build_impl_templates` minting each method of the
+    // same `impl` block its own independent `Infer` — meaning `StateA`/
+    // `StateB` are *different*, unrelated `TyVar`s in `init_state`'s own
+    // frozen template and `step`'s own, even though they name the same
+    // declared generic). Keyed *structurally* instead — `(algebra name,
+    // every target position's own stringified type, "?" standing in for
+    // whichever one[s] are still open)` — so `step`'s own still-open `State`
+    // position, for a given concrete `(Opt, Model)`, can find whatever
+    // `init_state`'s own sibling specialization for that *same* `(Opt,
+    // Model)` already resolved it to, purely by matching on the shape both
+    // agree on, with no shared variable identity required at all. Grown
+    // every time a specialization's own `target_tys` end up fully concrete,
+    // whether that took the fallback below or not.
+    let mut resolved_target_sigs: HashMap<(String, Vec<String>), Vec<Ty>> = HashMap::new();
+    // Work items the fallback below couldn't resolve *yet* — nothing in
+    // `resolved_target_sigs` covered what they needed at the time they were
+    // popped. Held here instead of re-pushed onto `impl_worklist`
+    // immediately, which would just spin forever popping the identical,
+    // still-unresolvable item repeatedly within *this* drain pass, nothing
+    // else running in between to grow `resolved_target_sigs` at all.
+    // Drained back into `impl_worklist` for a real retry only once per
+    // *outer* pass — see the end of this same `loop` below.
+    let mut deferred_impl: Vec<(usize, HashMap<TyVar, Ty>, TypeError)> = Vec::new();
+    // A plain, generous retry-count cap, *not* a "did `resolved_target_sigs`
+    // grow since the last retry" check -- an earlier version of this used
+    // exactly that growth signal, and it's genuinely order-sensitive: which
+    // sibling specialization happens to get discovered and resolved before
+    // which other one is itself downstream of a plain `HashMap`'s own per-
+    // process-random iteration order somewhere in the seeding pass, so a
+    // real, correctly-resolvable program could report "no progress" and
+    // give up on some runs while succeeding on others, from the *same*
+    // source -- confirmed flaky (roughly 1 run in 6) by direct, repeated
+    // testing. A retry is cheap (a few `HashMap` lookups once already-
+    // resolved specializations dominate `resolved_target_sigs`), so a
+    // generous cap costs little even on the runs that never needed it, and
+    // it sidesteps the ordering-sensitivity question entirely rather than
+    // trying to detect it more cleverly.
+    const DEFERRED_IMPL_RETRY_LIMIT: u32 = 64;
+    let mut deferred_impl_retries: u32 = 0;
     loop {
         while let Some((name, concrete_tys)) = fn_worklist.pop() {
             let display = display_instantiation(&name, &concrete_tys);
@@ -714,24 +788,263 @@ pub fn monomorphize(
                 continue;
             }
 
-            let param_types: Vec<Ty> = t
-                .param_patterns
+            // Ordinary substitution first, exactly as before.
+            let raw_target_tys: Vec<Ty> = t
+                .target_patterns
                 .iter()
                 .map(|p| substitute(p, &mapping))
                 .collect();
-            let result = substitute(&t.ret_pattern, &mapping);
+
+            // `resolved_target_sigs`'s own doc comment, above this whole
+            // `loop`: a sibling specialization of this *same* `impl` block,
+            // for this *same* concrete `(Opt, Model, ...)`, may already know
+            // what a still-open target position here (`State`) concretely
+            // is. Found purely structurally (matching stringified target
+            // types, "?" for whichever ones are still open on *both* sides)
+            // — no shared `TyVar` identity assumed or required. A real
+            // per-position `unify` (not a blind rename) recovers every free
+            // variable *this* work item's own still-open target actually
+            // contains, however many, wherever nested (`WrapState<'a,'b>`
+            // against a known `WrapState<Tensor<f32,2,2>,Tensor<f32,1,2>>`
+            // binds both `'a` and `'b` in one shot).
+            let sig_key = (
+                t.algebra.clone(),
+                raw_target_tys
+                    .iter()
+                    .map(|ty| {
+                        if is_fully_concrete(ty) {
+                            ty.to_string()
+                        } else {
+                            "?".to_string()
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let mut rename: HashMap<TyVar, Ty> = HashMap::new();
+            if let Some(known_full) = resolved_target_sigs.get(&sig_key) {
+                for (raw, known) in raw_target_tys.iter().zip(known_full) {
+                    if is_fully_concrete(raw) {
+                        continue;
+                    }
+                    let mut trial = Subst::default();
+                    if unify(&mut trial, raw, known).is_ok() {
+                        let mut vars = HashSet::new();
+                        free_vars(raw, &mut vars);
+                        for v in vars {
+                            rename.entry(v).or_insert_with(|| trial.apply(&Ty::Var(v)));
+                        }
+                    }
+                }
+            }
+            let apply = |ty: &Ty| substitute(&substitute(ty, &mapping), &rename);
+
+            let mut target_tys: Vec<Ty> = t.target_patterns.iter().map(&apply).collect();
+            let mut param_types: Vec<Ty> = t.param_patterns.iter().map(&apply).collect();
+            let mut result = apply(&t.ret_pattern);
 
             let mut exprs = Vec::new();
             collect_exprs_block(&t.body, &mut exprs);
-            let node_types: HashMap<NodeId, Ty> = exprs
+            let mut node_types: HashMap<NodeId, Ty> = exprs
                 .iter()
-                .filter_map(|e| {
-                    t.node_types
-                        .get(&e.id)
-                        .map(|ty| (e.id, substitute(ty, &mapping)))
-                })
+                .filter_map(|e| t.node_types.get(&e.id).map(|ty| (e.id, apply(ty))))
                 .collect();
 
+            // `doc/backlog.md`'s own "composing algebra impl generic over
+            // `Opt`..." entry: `t.node_types`/`ret_pattern`/`param_patterns`
+            // are a *frozen* snapshot from this template's own one-time,
+            // wholly-generic body check (`build_impl_templates`) -- ordinary
+            // substitution (`mapping`, and now `rename` above) is a pure
+            // variable-*rename*, and can't repair a nested algebra dispatch
+            // that check had to permanently defer because *its own* `Opt`
+            // (or another impl-level generic) was still abstract at the
+            // time (`infer.rs::infer_algebra_call`'s own `unambiguous_and_
+            // preserves_openness` gate). The tell: after every substitution
+            // above, `param_types`/`result` (or a node inside the body)
+            // still carries a free `Ty::Var` neither `mapping` nor `rename`
+            // could have introduced on their own -- exactly `fn_worklist`'s
+            // own `duck_typed_fns` fallback (`infer_fn_with_concrete_
+            // params`), mirrored here via `infer_impl_fn_with_concrete_
+            // targets`: a fresh, real re-inference of the body, with every
+            // target/param type as concrete as this work item can make it,
+            // sees `Opt` concretely and dispatches for real, no deferral
+            // needed.
+            let still_open = !t.is_extern
+                && (!is_fully_concrete(&result)
+                    || param_types.iter().any(|p| !is_fully_concrete(p))
+                    || node_types.values().any(|v| !is_fully_concrete(v)));
+            // `None` once this specialization is genuinely done; `Some(err)`
+            // while it's still missing something -- checked *after*
+            // `collect_instantiations` below, deliberately, not here: even
+            // an incomplete `node_types` can still correctly discover a
+            // *different*, independently-resolvable nested call (`Net`-
+            // level `init_state` calling `Optimizer::init_state(opt,
+            // model.w1)` — `model.w1: Wrap<f32>` is concrete regardless of
+            // whether `Net`'s own overall `State` is), and that discovery is
+            // exactly what lets `resolved_target_sigs` ever grow enough for
+            // *this* item's own retry to eventually succeed. Bailing out
+            // before `collect_instantiations` (an earlier version of this
+            // fix did exactly that) starves it permanently: the nested
+            // template this item itself depends on would never even get
+            // queued, let alone resolved — a real, direct deadlock, found
+            // by testing a genuine two-level composition (`Net` wrapping
+            // `Wrap` wrapping `Tensor`), not guessed.
+            let mut defer_reason: Option<TypeError> = None;
+            if still_open {
+                let fallback_span = t
+                    .body
+                    .tail
+                    .as_deref()
+                    .map(|e| e.span)
+                    .or_else(|| t.body.stmts.first().map(|s| s.span))
+                    .unwrap_or(Span {
+                        file: FileId(0),
+                        start: 0,
+                        end: 0,
+                    });
+                let synthetic_err = || TypeError {
+                    span: fallback_span,
+                    kind: TypeErrorKind::MonomorphizationFailed {
+                        algebra: t.algebra.clone(),
+                        method: t.method_name.clone(),
+                        tys: target_tys
+                            .iter()
+                            .map(Ty::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    },
+                };
+                let mut infer = Infer::new_with_vars(registry, shared_vars)
+                    .with_inherent_patterns(&program_inference.inherent_patterns)
+                    .with_external_state_hint(&resolved_target_sigs);
+                match infer.infer_impl_fn_with_concrete_targets(
+                    &t.algebra,
+                    &t.method_name,
+                    &target_tys,
+                    &t.params,
+                    &t.body,
+                    param_types.clone(),
+                    fallback_span,
+                ) {
+                    Ok(re_result) => {
+                        let re_param_types = infer.param_types.clone();
+                        let re_node_types: HashMap<NodeId, Ty> = exprs
+                            .iter()
+                            .filter_map(|e| infer.node_types.get(&e.id).map(|ty| (e.id, ty.clone())))
+                            .collect();
+                        // A real re-inference can still succeed (no type
+                        // *error*) while leaving something genuinely open --
+                        // `step`'s own `state: State` parameter, popped
+                        // before `init_state`'s own sibling resolution ever
+                        // reached `resolved_target_sigs`, has nothing at all
+                        // to pin its shape down with, and `check_no_
+                        // placeholder` only rejects an explicit placeholder
+                        // marker, not an ordinary still-free `Ty::Var`.
+                        // Still used below (not discarded) — the parts that
+                        // *did* resolve (a nested, independently-concrete
+                        // call, say) are real and worth discovering via
+                        // `collect_instantiations` even though this
+                        // specialization as a whole isn't done yet.
+                        if !is_fully_concrete(&re_result)
+                            || re_param_types.iter().any(|p| !is_fully_concrete(p))
+                            || re_node_types.values().any(|v| !is_fully_concrete(v))
+                        {
+                            defer_reason = Some(synthetic_err());
+                        }
+                        param_types = re_param_types;
+                        result = re_result;
+                        node_types = re_node_types;
+                    }
+                    Err(e) => {
+                        // Not necessarily a real failure yet -- worklist
+                        // order isn't meaningful, so this could just as
+                        // easily be `step` popped before its own sibling
+                        // `init_state` ever contributed to `resolved_
+                        // target_sigs`. The *pre-fallback* `param_types`/
+                        // `result`/`node_types` (substituted above, via
+                        // `mapping`/`rename` alone) are kept as-is here,
+                        // still useful for `collect_instantiations` below.
+                        defer_reason = Some(e);
+                    }
+                }
+                // Written back either way, same reasoning as `build_impl_
+                // templates`'s own identical write-back -- this fallback's
+                // own counter must never restart at a number an *earlier*
+                // fallback (or `build_impl_templates` itself) already used,
+                // in either the success or the failure case.
+                shared_vars = infer.current_vars();
+            }
+
+            // Grows `resolved_target_sigs` for whichever sibling
+            // specialization (same `impl` block, a different method) needs
+            // exactly this binding next -- reverse-unifying the template's
+            // own *original*, still-symbolic `(param_patterns, ret_pattern)`
+            // against this specialization's own final, concrete `(param_
+            // types, result)` recovers a binding for every one of the
+            // template's own free variables in one shot, including ones
+            // that only ever appear in `target_patterns` -- the exact same
+            // technique `derive_impl_instantiation` itself already relies on
+            // for an ordinary call site's own reverse-derivation.
+            //
+            // Gated on `param_types`/`result` being *fully* concrete first
+            // -- genuinely load-bearing, not defensive: a leftover free
+            // `Ty::Var` here could belong to *this* specialization's own
+            // fallback session (`infer_impl_fn_with_concrete_targets`'s own
+            // fresh `Infer`, an entirely independent `TyVar` numbering from
+            // whichever session built `t` itself) rather than to `t`'s own
+            // template — unifying `t.param_patterns`/`ret_pattern` (the
+            // *template*'s own numbering) against a query containing one of
+            // *those* would risk `unify`'s union-find merging two `TyVar`s
+            // that only coincidentally share a number, silently aliasing
+            // completely unrelated bindings (found by direct testing: a
+            // plain, fully-concrete `Optimizer::init_state<Sgd,Tensor<f32,
+            // 2,2>,Tensor<f32,2,2>>` call started failing with a nonsense
+            // `-> Sgd` return type before this guard existed). Safe exactly
+            // when both sides are already fully concrete: nothing left to
+            // alias, every one of the pattern's own vars gets bound to a
+            // real, closed type, never another variable.
+            // Also refreshes `target_tys` itself (shadowing the `mapping`/
+            // `rename`-only version from before the fallback ran) -- the
+            // `seed_derivative_rule_references`/`seed_ring_zero`/`seed_
+            // adjoint_rule_references` calls below need it as concrete as
+            // the fallback actually made it, not just as concrete as
+            // ordinary substitution alone could.
+            if param_types.iter().all(is_fully_concrete) && is_fully_concrete(&result) {
+                let mut trial = Subst::default();
+                let pattern = Ty::Fn(t.param_patterns.clone(), Box::new(t.ret_pattern.clone()));
+                let query = Ty::Fn(param_types.clone(), Box::new(result.clone()));
+                if unify(&mut trial, &pattern, &query).is_ok() {
+                    let final_target_tys: Vec<Ty> =
+                        t.target_patterns.iter().map(|p| trial.apply(p)).collect();
+                    if final_target_tys.iter().all(is_fully_concrete) {
+                        target_tys = final_target_tys.clone();
+                        resolved_target_sigs
+                            .entry(sig_key)
+                            .or_insert(final_target_tys);
+                    }
+                }
+            }
+
+            // Run *even when* this specialization is still incomplete
+            // (`defer_reason.is_some()`) -- deliberately, found necessary by
+            // direct testing: skipping this for an incomplete item (an
+            // earlier version of this fix did exactly that) starves a
+            // genuine two-level composition (`Net` wrapping `Wrap` wrapping
+            // `Tensor`) permanently -- the inner `Wrap`-level template this
+            // item itself depends on would never even get *discovered*,
+            // let alone resolved, since the only place that ever queues it
+            // is `Net`'s own body being walked right here. Safe to run on a
+            // still-partially-open `node_types` now specifically *because*
+            // of `shared_vars` (this whole loop's own header comment):
+            // every `Ty::Var` anywhere in it, however this specialization's
+            // own attempt got built, was minted from the same globally-
+            // unique counter every template and every fallback session
+            // shares, so `derive_impl_instantiation`'s own `unify` calls,
+            // triggered from inside here, can never conflate two unrelated
+            // variables that merely happen to share a number -- confirmed
+            // directly: before `shared_vars` existed, enabling this exact
+            // line produced real, silently wrong bindings (a bogus `->
+            // Sgd`/`-> f32` return type on an unrelated, otherwise-correct
+            // call), not just missing ones.
             let mut call_names = HashMap::new();
             collect_instantiations(
                 &t.body,
@@ -750,16 +1063,16 @@ pub fn monomorphize(
                 registry,
             );
 
+            if let Some(err) = defer_reason {
+                deferred_impl.push((idx, mapping, err));
+                continue;
+            }
+
             // `seed_derivative_rule_references`'s own doc comment -- a
             // `derivative` rule declared on `t.algebra` can reference a
             // *different* algebra's own generic-impl method, at this exact
             // specialization's own resolved target type(s), that no ordinary
             // call site in the program ever reaches directly.
-            let target_tys: Vec<Ty> = t
-                .target_patterns
-                .iter()
-                .map(|p| substitute(p, &mapping))
-                .collect();
             seed_derivative_rule_references(
                 registry,
                 &t.algebra,
@@ -979,6 +1292,54 @@ pub fn monomorphize(
             && lambda_worklist.is_empty()
             && inherent_worklist.is_empty()
         {
+            if deferred_impl.is_empty() {
+                break;
+            }
+            // Every other worklist is drained, but something's still
+            // waiting on a `resolved_target_sigs` binding a sibling
+            // specialization might yet contribute -- retried up to
+            // `DEFERRED_IMPL_RETRY_LIMIT` times (`deferred_impl_retries`'s
+            // own doc comment above has why this is a plain counter, not a
+            // "did anything change" check) before giving up for real and
+            // reporting every remaining item's own original error.
+            deferred_impl_retries += 1;
+            if deferred_impl_retries > DEFERRED_IMPL_RETRY_LIMIT {
+                for (_, _, err) in deferred_impl.drain(..) {
+                    mono.errors.push(err);
+                }
+                break;
+            }
+            for (idx, mapping, _) in deferred_impl.drain(..) {
+                impl_worklist.push((idx, mapping));
+            }
+        }
+    }
+
+    // `doc/backlog.md`'s own "composing algebra impl generic over `Opt`..."
+    // entry: an *ordinary*, non-generic top-level `fn` (`main`, most
+    // directly) that calls an algebra method with an output-only generic
+    // (`State`) never gets re-inferred by anything above — its own body is
+    // assumed already fully concrete (the seeding comment near the top of
+    // this function says so explicitly), true for every ordinary program,
+    // but not for this one specific shape: `program_inference.node_types`
+    // was built once, by a *separate*, already-finished whole-program pass
+    // that has no way to know what `resolved_target_sigs` learned only
+    // afterward. Patches it in place, now that the fixed point above means
+    // `resolved_target_sigs` is as complete as this compilation will ever
+    // make it. A few rounds, not just one: `main`'s own `let r = ...step(
+    // ...); let r2 = ...step(..., r.1, ...);` — two *chained* calls to the
+    // same algebra — needs the first one patched before the second's own
+    // arg types (read from the very same `node_types` map) become concrete
+    // enough to resolve; stops itself the moment a round patches nothing.
+    for _ in 0..8 {
+        let patched = patch_ordinary_fn_node_types(
+            &functions,
+            &mut program_inference,
+            &templates,
+            registry,
+            &resolved_target_sigs,
+        );
+        if !patched {
             break;
         }
     }
@@ -1043,6 +1404,7 @@ fn build_impl_templates(
     registry: &Registry,
     global_env: &Env,
     inherent_patterns: &HashMap<(String, String), InherentMethodPattern>,
+    shared_vars: &mut TyVarGen,
 ) -> Vec<ImplTemplate> {
     let mut templates = Vec::new();
     for item in &program.items {
@@ -1068,15 +1430,26 @@ fn build_impl_templates(
             // `derive_impl_instantiation`/`call_names` exist to record, an
             // extern-backed method needs that as much as a real one does,
             // even though there's no cleave-level body to specialize.
-            let mut infer = Infer::new(registry).with_inherent_patterns(inherent_patterns);
-            let Ok(ret_pattern) = infer.infer_impl_fn_generic_with_env(
+            let mut infer =
+                Infer::new_with_vars(registry, *shared_vars).with_inherent_patterns(inherent_patterns);
+            let result = infer.infer_impl_fn_generic_with_env(
                 global_env,
                 &d.algebra,
                 &d.generics,
                 &all_targets,
                 f,
                 item.span,
-            ) else {
+            );
+            // Written back either way -- even a *failed* attempt still
+            // advanced `infer`'s own counter past whatever `TyVar`s it
+            // minted along the way, and there's no reason to throw that
+            // progress away (leaving `shared_vars` at its stale, pre-attempt
+            // value here would let the *next* attempt mint `TyVar`s that
+            // collide with this failed one's own already-abandoned-but-
+            // still-numbered ones — harmless on their own since nothing
+            // references them, but needless risk for zero benefit).
+            *shared_vars = infer.current_vars();
+            let Ok(ret_pattern) = result else {
                 continue;
             };
             // Whether *this template's own resolved patterns* still carry a
@@ -2970,6 +3343,131 @@ pub(crate) fn collect_exprs_block<'a>(block: &'a Block, out: &mut Vec<&'a Expr>)
     if let Some(tail) = &block.tail {
         collect_exprs(tail, out);
     }
+}
+
+/// `doc/backlog.md`'s own "composing algebra impl generic over `Opt`..."
+/// entry — see the one call site's own doc comment for the full story of
+/// why this exists. Walks every non-generic top-level `fn`'s own body
+/// (`functions`) for a qualified algebra call (`Optimizer::step(...)`,
+/// `derive_impl_instantiation`'s own qualified-call shape) whose own
+/// `program_inference.node_types` entry is still open, and — if `resolved_
+/// target_sigs` already has a fully-concrete answer for this exact
+/// `(algebra, concrete gating positions)` signature — unifies it in and
+/// substitutes the resulting bindings through *the whole* `node_types` map
+/// at once (not just this one node): every other node referencing the very
+/// same `TyVar` — `r`'s own `let`-binding, `r.1`'s own field access, both
+/// sharing one variable with the call itself, all from this same, single,
+/// already-finished `program_inference` session — gets fixed by the same
+/// substitution, for the identical reason `Subst`-based resolution always
+/// does.
+///
+/// Safe regardless of which `Infer` session any of these `TyVar`s
+/// originally came from (`program_inference`'s own whole-program pass, or
+/// `build_impl_templates`'s — never `shared_vars`-unified with either,
+/// unlike the `impl_worklist` loop's own fallback): `known_full` is always
+/// fully concrete by construction (`resolved_target_sigs`'s own insertion
+/// gate), and unifying anything, from any session, against an already-
+/// concrete value can never alias two unrelated variables to each other —
+/// only ever bind an open one to a real, closed type. Returns whether it
+/// patched anything at all, so the caller knows whether another round
+/// might still find more (a chained `let r = ...; let r2 = ...(r.1)...;`
+/// needs the first call patched before the second's own arg types, read
+/// from this same map, become concrete enough to resolve in turn).
+fn patch_ordinary_fn_node_types(
+    functions: &HashMap<&str, &FnDecl>,
+    program_inference: &mut ProgramInference,
+    templates: &[ImplTemplate],
+    registry: &Registry,
+    resolved_target_sigs: &HashMap<(String, Vec<String>), Vec<Ty>>,
+) -> bool {
+    let mut any_patched = false;
+    for f in functions.values() {
+        let Some(body) = &f.body else { continue };
+        let mut exprs = Vec::new();
+        collect_exprs_block(body, &mut exprs);
+        for e in exprs {
+            let ExprKind::Call(path, _, args, ..) = &e.kind else {
+                continue;
+            };
+            let [algebra, method] = path.segments.as_slice() else {
+                continue;
+            };
+            if !templates.iter().any(|t| &t.algebra == algebra) {
+                continue;
+            }
+            let is_open = program_inference
+                .node_types
+                .get(&e.id)
+                .is_some_and(|t| !is_fully_concrete(t));
+            if !is_open {
+                continue;
+            }
+            let Some(arg_tys): Option<Vec<Ty>> = args
+                .iter()
+                .map(|a| program_inference.node_types.get(&a.id).cloned())
+                .collect()
+            else {
+                continue;
+            };
+            let ImplMatch::Found(idx, mapping) = derive_impl_instantiation(
+                templates,
+                registry,
+                Some(algebra),
+                method,
+                e.id,
+                &arg_tys,
+                &program_inference.node_types,
+            ) else {
+                continue;
+            };
+            let t = &templates[idx];
+            let target_tys: Vec<Ty> = t
+                .target_patterns
+                .iter()
+                .map(|p| substitute(p, &mapping))
+                .collect();
+            let sig_key = (
+                t.algebra.clone(),
+                target_tys
+                    .iter()
+                    .map(|ty| {
+                        if is_fully_concrete(ty) {
+                            ty.to_string()
+                        } else {
+                            "?".to_string()
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let Some(known_full) = resolved_target_sigs.get(&sig_key) else {
+                continue;
+            };
+            let mut trial = Subst::default();
+            let mut bound_anything = false;
+            for (raw, known) in target_tys.iter().zip(known_full) {
+                if is_fully_concrete(raw) {
+                    continue;
+                }
+                if unify(&mut trial, raw, known).is_ok() {
+                    bound_anything = true;
+                }
+            }
+            if !bound_anything {
+                continue;
+            }
+            let mut vars = HashSet::new();
+            target_tys.iter().for_each(|t| free_vars(t, &mut vars));
+            let rename: HashMap<TyVar, Ty> = vars
+                .into_iter()
+                .map(|v| (v, trial.apply(&Ty::Var(v))))
+                .collect();
+            for v in program_inference.node_types.values_mut() {
+                *v = substitute(v, &rename);
+            }
+            any_patched = true;
+        }
+    }
+    any_patched
 }
 
 // ------------------------------------------------------------ rendering
