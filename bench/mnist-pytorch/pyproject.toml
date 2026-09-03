@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "cleave-mnist-bench"
+version = "0.1.0"
+description = "PyTorch CPU baseline for examples/mnist-interop, for a direct perf comparison against cleave"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.10"
+# CPU-only wheel explicitly, not PyPI's default CUDA-bundled build (~2.7GB on
+# Windows/Linux) -- irrelevant weight for a CPU-only comparison, and this
+# keeps the isolated poetry env small.
+torch = { version = "^2.3", source = "pytorch-cpu" }
+numpy = "^1.26"
+
+[[tool.poetry.source]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+priority = "explicit"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

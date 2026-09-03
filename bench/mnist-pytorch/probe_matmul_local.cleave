@@ -1,0 +1,10 @@
+use nn;
+use linalg;
+use io;
+
+export fn probe() -> Tensor<f32, 32, 512> {
+    rand_seed(1);
+    let a: Tensor<f32, 32, 784> = Init::xavier();
+    let b: Tensor<f32, 784, 512> = Init::xavier();
+    matmul(a, b)
+}
