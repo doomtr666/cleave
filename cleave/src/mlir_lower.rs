@@ -3600,6 +3600,21 @@ fn lower_raw_mlir_op<'c>(
     if op == "linalg.transpose" {
         return build_transpose_no_seed(ctx, block, env, args, attrs, result_ty);
     }
+    // `linalg.broadcast`/`linalg.reduce` — real, dedicated Rust code for the
+    // identical reason `linalg.matmul`/`linalg.transpose` already have it:
+    // both need a real payload region the fully generic path below never
+    // attaches, and `reduce` specifically needs a real zero-seeded `outs`
+    // (a genuine accumulation, unlike `broadcast`/`transpose`'s own trivial
+    // pass-through body). See `build_broadcast0`'s own doc comment for the
+    // full story — `stdlib/nn/nn.cleave`'s own `Broadcast0::broadcast0`/
+    // `reduce0` used to be hand-written scalar `for` loops; this is the
+    // real, structured replacement.
+    if op == "linalg.broadcast" {
+        return build_broadcast0(ctx, block, env, args, result_ty);
+    }
+    if op == "linalg.reduce" {
+        return build_reduce0(ctx, block, env, args, result_ty);
+    }
     let context = ctx.context;
     let operand_ty = args
         .iter()
@@ -3909,6 +3924,242 @@ fn build_transpose_no_seed<'c>(
         .add_results(&[result_ty])
         .build()
         .unwrap_or_else(|e| panic!("MLIR lowering: failed to build linalg.transpose: {e}"));
+    block.append_operation(built).result(0).unwrap().into()
+}
+
+/// Builds `Broadcast0::broadcast0` (`stdlib/nn/nn.cleave`) as a real
+/// `linalg.generic` — no scalar loop at all. Found tonight, not designed in
+/// up front: chasing why `--scf-parallel-loop-fusion` (a real MLIR pass —
+/// see `pipeline.rs`'s own now-reverted experiment) never fired anywhere in
+/// the real kernel turned up `Broadcast0::broadcast0`'s own hand-written
+/// `for i in 0..B { for _k in 0..M { data[i,j] = r[0,j]; ... } }` sitting
+/// between every consecutive pair of matmuls — a real, genuinely scalar,
+/// zero-vectorization runtime copy (confirmed live in the pre-fusion IR
+/// dump as a real `scf.while`/`memref.load`+`memref.store` nest), the exact
+/// same family of bug `lower_tagged_struct_construct`/`copy_nested_array`
+/// already got fixed for earlier the same night, one level up — this time
+/// at the stdlib level, not inside the compiler.
+///
+/// The real MLIR *named* ops for this (`linalg.broadcast`/`linalg.reduce`,
+/// confirmed real, current, in `LinalgStructuredOps.td`) were tried first
+/// and abandoned: `Tensor<T,1,M>` is rank-2 (a literal size-1 leading dim,
+/// not rank-1), so reaching `linalg.broadcast`'s own expected rank needs a
+/// real `tensor.collapse_shape` first — confirmed directly, on an isolated
+/// probe, that the memref this reshape bufferizes to gets a genuinely
+/// non-trivial `strided<...>` layout (even though the collapse here is
+/// always statically contiguous — MLIR's own bufferization doesn't prove
+/// that), and `--affine-super-vectorize` refuses to touch it at all ("NYI:
+/// non-trivial layout map", the *identical* diagnostic the already-
+/// documented `export fn`-Tensor-parameter case hits, but from a different
+/// real cause this time). A hand-built `linalg.generic` instead — reading
+/// `r[0,j]` via a constant-`0` affine map on the batch axis, rather than
+/// reshaping `r` down to rank 1 first — sidesteps the reshape (and its own
+/// layout problem) entirely: confirmed, on the identical probe, a clean,
+/// real, 16-wide masked-vector store loop, zero scalar code, zero
+/// unrealized casts, all the way through `mlir-translate`.
+fn build_broadcast0<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    args: &[CVal],
+    result_ty: Type<'c>,
+) -> Value<'c, 'c> {
+    let context = ctx.context;
+    let location = Location::unknown(context);
+    let [r_arg] = args else {
+        panic!(
+            "MLIR lowering: `mlir::linalg::broadcast` needs exactly one operand (`r`), got {}",
+            args.len()
+        );
+    };
+    let r = lower_cval(context, block, env, r_arg, result_ty);
+    let elem_ty = RankedTensorType::try_from(result_ty)
+        .unwrap_or_else(|e| {
+            panic!("MLIR lowering: broadcast's own result must be a ranked tensor: {e}")
+        })
+        .element();
+    let init = block
+        .append_operation(
+            OperationBuilder::new("tensor.empty", location)
+                .add_results(&[result_ty])
+                .build()
+                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build tensor.empty: {e}")),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    let in_map = Attribute::parse(context, "affine_map<(i,j) -> (0,j)>")
+        .unwrap_or_else(|| panic!("MLIR lowering: failed to parse broadcast's own input indexing map"));
+    let out_map = Attribute::parse(context, "affine_map<(i,j) -> (i,j)>")
+        .unwrap_or_else(|| panic!("MLIR lowering: failed to parse broadcast's own output indexing map"));
+    let indexing_maps = Attribute::parse(
+        context,
+        &format!("[{in_map}, {out_map}]"),
+    )
+    .unwrap_or_else(|| panic!("MLIR lowering: failed to parse broadcast's own indexing_maps"));
+    let iterator_types = Attribute::parse(
+        context,
+        "[#linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>]",
+    )
+    .unwrap_or_else(|| panic!("MLIR lowering: failed to parse broadcast's own iterator_types"));
+
+    let payload = Block::new(&[(elem_ty, location), (elem_ty, location)]);
+    let in_arg: Value = payload.argument(0).unwrap().into();
+    payload.append_operation(
+        OperationBuilder::new("linalg.yield", location)
+            .add_operands(&[in_arg])
+            .build()
+            .unwrap(),
+    );
+    let region = Region::new();
+    region.append_block(payload);
+
+    let built = OperationBuilder::new("linalg.generic", location)
+        .add_operands(&[r, init])
+        .add_attributes(&[
+            (Identifier::new(context, "indexing_maps"), indexing_maps),
+            (Identifier::new(context, "iterator_types"), iterator_types),
+            (
+                Identifier::new(context, "operandSegmentSizes"),
+                DenseI32ArrayAttribute::new(context, &[1, 1]).into(),
+            ),
+        ])
+        .add_regions_vec(vec![region])
+        .add_results(&[result_ty])
+        .build()
+        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build broadcast's own linalg.generic: {e}"));
+    block.append_operation(built).result(0).unwrap().into()
+}
+
+/// Builds `Broadcast0::reduce0` (`stdlib/nn/nn.cleave`) as a real `linalg.
+/// generic` reduction — see `build_broadcast0`'s own doc comment for the
+/// full story of why this exists and why the real named `linalg.reduce` op
+/// was tried and abandoned for the identical reason (rank mismatch needing
+/// a reshape, the reshape's own memref getting a non-trivial layout `--
+/// affine-super-vectorize` refuses). A real `linalg.fill` zero seed (not a
+/// no-seed trick): unlike `matmul`, there is no FMA-fusion concern
+/// motivating one here (a plain sum, not a multiply-accumulate), so there's
+/// no reason to pay the no-seed trick's own complexity for zero benefit.
+fn build_reduce0<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    args: &[CVal],
+    result_ty: Type<'c>,
+) -> Value<'c, 'c> {
+    let context = ctx.context;
+    let location = Location::unknown(context);
+    let [b_arg] = args else {
+        panic!(
+            "MLIR lowering: `mlir::linalg::reduce` needs exactly one operand (`b`), got {}",
+            args.len()
+        );
+    };
+    let b = lower_cval(context, block, env, b_arg, result_ty);
+    let elem_ty = RankedTensorType::try_from(result_ty)
+        .unwrap_or_else(|e| {
+            panic!("MLIR lowering: reduce's own result must be a ranked tensor: {e}")
+        })
+        .element();
+
+    let zero_elem: Value = block
+        .append_operation(arith::constant(
+            context,
+            FloatAttribute::new(context, elem_ty, 0.0).into(),
+            location,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let init_empty: Value = block
+        .append_operation(
+            OperationBuilder::new("tensor.empty", location)
+                .add_results(&[result_ty])
+                .build()
+                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build tensor.empty: {e}")),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let fill_payload = Block::new(&[(elem_ty, location), (elem_ty, location)]);
+    fill_payload.append_operation(
+        OperationBuilder::new("linalg.yield", location)
+            .add_operands(&[fill_payload.argument(0).unwrap().into()])
+            .build()
+            .unwrap(),
+    );
+    let fill_region = Region::new();
+    fill_region.append_block(fill_payload);
+    let init: Value = block
+        .append_operation(
+            OperationBuilder::new("linalg.fill", location)
+                .add_operands(&[zero_elem, init_empty])
+                .add_attributes(&[(
+                    Identifier::new(context, "operandSegmentSizes"),
+                    DenseI32ArrayAttribute::new(context, &[1, 1]).into(),
+                )])
+                .add_regions_vec(vec![fill_region])
+                .add_results(&[result_ty])
+                .build()
+                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build linalg.fill: {e}")),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    let in_map = Attribute::parse(context, "affine_map<(i,j) -> (i,j)>")
+        .unwrap_or_else(|| panic!("MLIR lowering: failed to parse reduce's own input indexing map"));
+    let out_map = Attribute::parse(context, "affine_map<(i,j) -> (0,j)>")
+        .unwrap_or_else(|| panic!("MLIR lowering: failed to parse reduce's own output indexing map"));
+    let indexing_maps = Attribute::parse(
+        context,
+        &format!("[{in_map}, {out_map}]"),
+    )
+    .unwrap_or_else(|| panic!("MLIR lowering: failed to parse reduce's own indexing_maps"));
+    let iterator_types = Attribute::parse(
+        context,
+        "[#linalg.iterator_type<reduction>, #linalg.iterator_type<parallel>]",
+    )
+    .unwrap_or_else(|| panic!("MLIR lowering: failed to parse reduce's own iterator_types"));
+
+    let payload = Block::new(&[(elem_ty, location), (elem_ty, location)]);
+    let in_arg: Value = payload.argument(0).unwrap().into();
+    let out_arg: Value = payload.argument(1).unwrap().into();
+    let sum: Value = payload
+        .append_operation(
+            OperationBuilder::new("arith.addf", location)
+                .add_operands(&[out_arg, in_arg])
+                .add_results(&[elem_ty])
+                .build()
+                .unwrap(),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    payload.append_operation(
+        OperationBuilder::new("linalg.yield", location)
+            .add_operands(&[sum])
+            .build()
+            .unwrap(),
+    );
+    let region = Region::new();
+    region.append_block(payload);
+
+    let built = OperationBuilder::new("linalg.generic", location)
+        .add_operands(&[b, init])
+        .add_attributes(&[
+            (Identifier::new(context, "indexing_maps"), indexing_maps),
+            (Identifier::new(context, "iterator_types"), iterator_types),
+            (
+                Identifier::new(context, "operandSegmentSizes"),
+                DenseI32ArrayAttribute::new(context, &[1, 1]).into(),
+            ),
+        ])
+        .add_regions_vec(vec![region])
+        .add_results(&[result_ty])
+        .build()
+        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build reduce's own linalg.generic: {e}"));
     block.append_operation(built).result(0).unwrap().into()
 }
 

@@ -564,29 +564,18 @@ impl<T: Float, const B: i32, const M: i32> Broadcast0<Tensor<T,1,M>, Tensor<T,B,
     // from a real `for`-loop-bound variable at a time, or their own value-
     // vars get silently unified together during this impl's own body
     // type-check.
+    // Both now a real `linalg.generic` (`mlir_lower.rs::build_broadcast0`/
+    // `build_reduce0`'s own doc comments have the full story) instead of a
+    // hand-written scalar `for` loop — found the hard way, chasing why a
+    // real MLIR loop-fusion pass never fired anywhere on the real kernel
+    // (`doc/backlog.md`): this scalar copy sat between every consecutive
+    // pair of matmuls, real runtime cost, zero vectorization, on every
+    // layer, every batch.
     fn broadcast0(r) {
-        let mut data: [[T; M]; B] = mlir::memref::alloc();
-        for i in 0..B {
-            let mut j: i32 = 0;
-            for _k in 0..M {
-                data[i,j] = r[0,j];
-                j = j + 1;
-            };
-        };
-        Tensor::<T,B,M>(data: data)
+        mlir::linalg::broadcast(r)
     }
     fn reduce0(b) {
-        let mut data: [[T; M]; 1] = mlir::memref::alloc();
-        for j in 0..M {
-            let mut acc: T = Ring::zero();
-            let mut i: i32 = 0;
-            for _k in 0..B {
-                acc = acc + b[i,j];
-                i = i + 1;
-            };
-            data[0,j] = acc;
-        };
-        Tensor::<T,1,M>(data: data)
+        mlir::linalg::reduce(b)
     }
 }
 
