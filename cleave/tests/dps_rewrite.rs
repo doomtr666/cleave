@@ -147,6 +147,25 @@ fn run_f32_with_rewrite(context: &Context, src: &str) -> f32 {
     let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::linalg::create_convert_linalg_to_loops_pass());
     pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
+    // `--expand-strided-metadata`/`--lower-affine`: needed once a real
+    // `memref.subview` with a genuinely non-trivial `strided<...>` layout
+    // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
+    // has the story -- `tensor_literal`'s own nested-array construction
+    // goes through it).
+    pass_manager.add_pass(pass::transform::create_canonicalizer());
+    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
+    pass_manager.add_pass(pass::conversion::create_lower_affine());
+    pass_manager.add_pass(pass::transform::create_canonicalizer());
+    // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
+    // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
+    // doc comment for the full story (isolated there, on a completely
+    // unrelated plain-array case): running `--finalize-memref-to-llvm`
+    // once, up front, leaves a genuinely unreconcilable `i64`-to-`index`-
+    // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
+    // constants; a first `--convert-to-llvm` pass gives those a chance to
+    // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
+    pass_manager.add_pass(pass::conversion::create_to_llvm());
+    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
     pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
     pass_manager
@@ -348,21 +367,41 @@ const MATMUL_SOURCE: &str = r#"
         }
         "#;
 
-/// Structural check that `matmul` gets *no* zero-fill at all any more (the
-/// whole point of `build_matmul_no_seed` -- a real, measured `memset` this
-/// rewrite used to have to re-establish explicitly, eliminated instead of
-/// preserved -- see that function's own doc comment) *and* that its own
-/// redundant struct-field-store copy still gets neutered exactly the way
-/// the plain elementwise case does -- proving both optimizations compose:
-/// no seed, and no copy.
+/// Structural check that `matmul`'s own real zero-fill seed (`build_matmul_
+/// no_seed`'s own doc comment: a real `linalg.fill`, not the old no-seed
+/// trick -- needed once `build_matmul_no_seed` moved to the real *named*
+/// `linalg.matmul` op, which `transform.structured.vectorize` needs to
+/// reach `vector.contract`/`vector.outerproduct` at all) gets redirected to
+/// seed the struct's own destination *directly*, not a separate scratch
+/// buffer later copied into it -- `Strategy::Overwrite`'s own doc comment
+/// (`dps_rewrite.rs`) has the mechanism -- *and* that the redundant struct-
+/// field-store copy still gets neutered exactly the way the plain
+/// elementwise case does, proving both optimizations still compose: a real
+/// seed, redirected, and no copy.
 #[test]
-fn matmul_gets_no_seed_and_still_neuters_its_own_copy() {
+fn matmuls_own_fill_seed_is_redirected_and_the_copy_still_neuters() {
     let context = context();
     let text = bufferized_text(&context, MATMUL_SOURCE);
+    let fill_line = text
+        .lines()
+        .find(|line| line.contains("linalg.fill"))
+        .unwrap_or_else(|| panic!("expected a real `linalg.fill` seed, got:\n{text}"));
+    let fill_dest = fill_line
+        .split("outs(")
+        .nth(1)
+        .and_then(|rest| rest.split_once(':'))
+        .map(|(dest, _)| dest.trim())
+        .unwrap_or_else(|| panic!("could not parse `linalg.fill`'s own `outs` operand from:\n{fill_line}"));
+    let dest_def_line = text
+        .lines()
+        .find(|line| line.trim_start().starts_with(&format!("{fill_dest} =")))
+        .unwrap_or_else(|| panic!("could not find {fill_dest}'s own defining line, got:\n{text}"));
     assert!(
-        !text.contains("linalg.fill"),
-        "matmul should no longer need any re-seed at all, got:\n{text}"
+        !dest_def_line.contains("tensor.empty"),
+        "expected `linalg.fill`'s own `outs` ({fill_dest}) to be redirected to the struct's real \
+         destination, not a scratch `tensor.empty()`, got:\n{dest_def_line}"
     );
+
     let memcpy_line = text
         .lines()
         .find(|line| line.contains("llvm.intr.memcpy"))

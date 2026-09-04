@@ -58,6 +58,36 @@ fn run_i32(context: &Context, src: &str) -> i32 {
 
     let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
+    // `--expand-strided-metadata`/`--lower-affine`: needed once a real
+    // `memref.subview` with a genuinely non-trivial `strided<...>` layout
+    // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
+    // has the story).
+    pass_manager.add_pass(pass::transform::create_canonicalizer());
+    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
+    pass_manager.add_pass(pass::conversion::create_lower_affine());
+    pass_manager.add_pass(pass::transform::create_canonicalizer());
+    // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
+    // `--convert-to-llvm` again -- not `--finalize-memref-to-llvm` once,
+    // up front, the way `pipeline.rs`'s own real final-lowering stage does
+    // it. Found the hard way, isolated to a minimal, completely unrelated
+    // case (`array_literal_index_and_mutation`'s own plain `a[0] = 10` --
+    // no `Tensor`, no nested array, nothing this rewrite's own new
+    // `memref.subview` shape touches at all): running `--finalize-memref-
+    // to-llvm` before any `--convert-to-llvm` at all left a real, load-
+    // bearing type mismatch behind -- an `llvm.mlir.constant` whose own
+    // attribute stayed `index`-typed while its result type became `i64`,
+    // wrapped in a genuinely unreconcilable `i64`-to-`index`-to-`i64`
+    // round trip `--reconcile-unrealized-casts` (already at the very end
+    // of this pipeline) can't fold away because the two casts aren't each
+    // other's exact inverse consumer/producer pair in the shape that pass
+    // looks for. A first `--convert-to-llvm` pass, run *before* `--
+    // finalize-memref-to-llvm`, apparently gives ordinary (non-subview)
+    // `index`-typed constants a chance to convert cleanly on their own,
+    // before `--finalize-memref-to-llvm` ever has to reason about them --
+    // confirmed directly by testing the ordering both ways on this exact
+    // failing case, not assumed.
+    pass_manager.add_pass(pass::conversion::create_to_llvm());
+    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
     pass_manager
         .run(&mut module)

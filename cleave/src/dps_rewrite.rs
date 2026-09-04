@@ -85,15 +85,36 @@ pub fn eliminate_redundant_field_store_copies<'c>(context: &'c Context, module: 
 /// strategy` more than once without fighting the borrow checker over a field
 /// of a struct that also holds non-`Copy` op/value handles.
 #[derive(Clone, Copy)]
-enum Strategy {
-    /// `linalg.generic` (`linalg.matmul`/`linalg.transpose`/plain
-    /// elementwise ops all build this shape -- `match_candidate`'s own doc
-    /// comment on this variant's match site has the full story) -- a fresh
-    /// computation, needs a real destination buffer, no re-seed: whatever
-    /// `outs` holds is already provably don't-care, either because the
-    /// region never reads it at all, or because it was seeded from `tensor.
-    /// empty()` in the first place.
-    Overwrite { outs_index: usize },
+enum Strategy<'c, 'a> {
+    /// `linalg.generic` (`linalg.transpose`/plain elementwise ops build this
+    /// shape -- `match_candidate`'s own doc comment on this variant's match
+    /// site has the full story) -- a fresh computation, needs a real
+    /// destination buffer, no re-seed: whatever `outs` holds is already
+    /// provably don't-care, either because the region never reads it at
+    /// all, or because it was seeded from `tensor.empty()` in the first
+    /// place. `redirect_op` is `producer` itself here (`rewrite_one`
+    /// redirects `outs_index` directly on it).
+    ///
+    /// `linalg.matmul` (the *named* op, `build_matmul_no_seed`'s own doc
+    /// comment: a real `linalg.fill` seed, not the old no-seed trick) needs
+    /// the *same* real destination, but can't have its own `outs` redirected
+    /// directly the way `linalg.generic` can -- a real named-op reduction
+    /// genuinely *reads* its accumulator, so redirecting `producer`'s own
+    /// `outs` to the struct's fresh, uninitialized field storage (skipping
+    /// the zero-fill it depended on) would silently corrupt the reduction
+    /// with garbage -- confirmed the hard way, in this exact rewrite's own
+    /// earlier history (see `match_candidate`'s own doc comment). Instead,
+    /// `redirect_op` here is the *`linalg.fill`* feeding `producer`'s own
+    /// `outs` -- redirecting *its* `outs` is exactly as safe as the plain
+    /// `linalg.generic` case above (`linalg.fill` unconditionally discards
+    /// whatever was there, `tensor.empty()`-seeded or not), and `producer`'s
+    /// own operand needs no change at all: it already points at `linalg.
+    /// fill`'s own result *value*, whose identity doesn't change just
+    /// because *its own* inputs did.
+    Overwrite {
+        redirect_op: OperationRef<'c, 'a>,
+        outs_index: usize,
+    },
     /// `bufferization.to_tensor`, feeding straight from `load_native_shape_
     /// field`'s own emission shape -- not a computation at all, `value` is an
     /// unmodified read of some *other* struct's own tensor field. No fresh
@@ -113,7 +134,7 @@ struct Candidate<'c, 'a> {
     /// everything new gets inserted before). Always has exactly one result,
     /// checked in `match_candidate`.
     producer: OperationRef<'c, 'a>,
-    strategy: Strategy,
+    strategy: Strategy<'c, 'a>,
     /// The pointer `memcpy` copies *from* -- for `Strategy::Passthrough`,
     /// this already points at a real, live `cleave_alloc_rc`'d payload (`load
     /// _native_shape_field`'s own read never copies -- see that function's
@@ -330,10 +351,19 @@ fn match_candidate<'c, 'a>(
         // A version of this matcher used to also accept `linalg.matmul`
         // (the *named* op) seeded by a real zero-splat constant, re-
         // establishing that same zero-fill explicitly (`linalg.fill`) on
-        // the new destination -- dead since `build_matmul_no_seed` stopped
-        // needing a seed at all (a real, measured `memset` eliminated,
-        // ~9.7% of wall time on `examples/mnist-interop`, not this
-        // rewrite's own concern to preserve).
+        // the new destination -- dead for a while, since `build_matmul_no_
+        // seed` stopped needing a seed at all (a real, measured `memset`
+        // eliminated, ~9.7% of wall time on `examples/mnist-interop`), then
+        // real again once `build_matmul_no_seed` itself moved to the real
+        // named `linalg.matmul` op (`vector.contract`/`vector.outerproduct`
+        // -- MLIR's own dedicated, FMA-friendly contraction vectorization
+        // path, confirmed directly to need a real named op, `Vectorization.
+        // cpp`'s own "Generic op is ignored" -- `pipeline.rs`'s own matmul-
+        // lowering stage has the fuller story), which pays for a real
+        // `linalg.fill` again. Re-added below, this time by redirecting the
+        // *fill's* own `outs`, not the matmul's -- see `Strategy::
+        // Overwrite`'s own doc comment for exactly why those two are not
+        // interchangeable.
         let strategy = if op_name_is(producer, "linalg.generic") {
             let outs_index = producer.operand_count().checked_sub(1)?;
             let region = producer.region(0).ok()?;
@@ -346,7 +376,26 @@ fn match_candidate<'c, 'a>(
                     return None;
                 }
             }
-            Strategy::Overwrite { outs_index }
+            Strategy::Overwrite {
+                redirect_op: producer,
+                outs_index,
+            }
+        } else if op_name_is(producer, "linalg.matmul") {
+            let outs_index = producer.operand_count().checked_sub(1)?;
+            let outs_operand = producer.operand(outs_index).ok()?;
+            let seed = defining_op(outs_operand)?;
+            if !op_name_is(seed, "linalg.fill") {
+                return None;
+            }
+            // `linalg.fill ins(%cst) outs(%old_dest)` -- its own `outs` is
+            // exactly as safe to redirect as `linalg.generic`'s above
+            // (unconditionally discarded, `tensor.empty()`-seeded or not);
+            // no need to check what feeds *it*.
+            let fill_outs_index = seed.operand_count().checked_sub(1)?;
+            Strategy::Overwrite {
+                redirect_op: seed,
+                outs_index: fill_outs_index,
+            }
         } else {
             return None;
         };
@@ -630,7 +679,10 @@ fn rewrite_one<'c>(
             );
             (candidate.src_ptr, false)
         }
-        Strategy::Overwrite { outs_index } => {
+        Strategy::Overwrite {
+            redirect_op,
+            outs_index,
+        } => {
             // Fast path: the size/alloc chain is exclusively this store's
             // own (`Candidate::private_size_chain`'s own doc comment) --
             // just relocate it, zero extra allocation, zero leak. Slow path
@@ -641,23 +693,29 @@ fn rewrite_one<'c>(
             // mnist-interop`'s own real kernel (absent from every hand-
             // written test) -- `Candidate::alloc_call`'s own doc comment has
             // the measured regression neutering exists to fix.
+            //
+            // Every insertion/move below anchors on `redirect_op`, not
+            // `candidate.producer` -- identical for the `linalg.generic`
+            // case (`redirect_op == producer`), but genuinely different for
+            // the `linalg.matmul`+`linalg.fill` case (`redirect_op` is the
+            // *fill*, which sits *before* `producer` in program order --
+            // see `Strategy::Overwrite`'s own doc comment). Anchoring on
+            // `producer` there would insert the new value's own definition
+            // *after* the fill whose operand it's about to replace, a
+            // dominance violation. Anchoring on `redirect_op` is correct in
+            // both cases: whatever is valid immediately before it is
+            // trivially also valid before anything after it.
             let relocated = candidate.private_size_chain.is_some();
             let new_dest_ptr = if let Some((size_zero, size_gep, size_ptrtoint)) =
                 candidate.private_size_chain
             {
-                as_mut(size_zero).move_before(candidate.producer);
-                as_mut(size_gep).move_before(candidate.producer);
-                as_mut(size_ptrtoint).move_before(candidate.producer);
-                as_mut(candidate.alloc_call).move_before(candidate.producer);
+                as_mut(size_zero).move_before(redirect_op);
+                as_mut(size_gep).move_before(redirect_op);
+                as_mut(size_ptrtoint).move_before(redirect_op);
+                as_mut(candidate.alloc_call).move_before(redirect_op);
                 candidate.dest_ptr
             } else {
-                build_fresh_alloc(
-                    context,
-                    block,
-                    candidate.producer,
-                    candidate.elem_type,
-                    &candidate.dims,
-                )
+                build_fresh_alloc(context, block, redirect_op, candidate.elem_type, &candidate.dims)
             };
 
             // Build a real `memref<dims x elem>` view of `new_dest_ptr` --
@@ -670,15 +728,15 @@ fn rewrite_one<'c>(
             let rank = candidate.dims.len();
             let descriptor_ty = memref_descriptor_llvm_type(context, rank);
             let zero_i64 = block.insert_operation_before(
-                candidate.producer,
+                redirect_op,
                 arith::constant(context, IntegerAttribute::new(i64_ty, 0).into(), location),
             );
-            let poison = block
-                .insert_operation_before(candidate.producer, llvm::poison(descriptor_ty, location));
+            let poison =
+                block.insert_operation_before(redirect_op, llvm::poison(descriptor_ty, location));
             let mut descriptor_val: Value = poison.result(0).unwrap().into();
             for pos in [0i64, 1] {
                 let inserted = block.insert_operation_before(
-                    candidate.producer,
+                    redirect_op,
                     llvm::insert_value(
                         context,
                         descriptor_val,
@@ -691,7 +749,7 @@ fn rewrite_one<'c>(
             }
             let zero_offset: Value = zero_i64.result(0).unwrap().into();
             let inserted = block.insert_operation_before(
-                candidate.producer,
+                redirect_op,
                 llvm::insert_value(
                     context,
                     descriptor_val,
@@ -713,7 +771,7 @@ fn rewrite_one<'c>(
             }
             for i in 0..rank {
                 let size_const = block.insert_operation_before(
-                    candidate.producer,
+                    redirect_op,
                     arith::constant(
                         context,
                         IntegerAttribute::new(i64_ty, candidate.dims[i]).into(),
@@ -721,7 +779,7 @@ fn rewrite_one<'c>(
                     ),
                 );
                 let inserted = block.insert_operation_before(
-                    candidate.producer,
+                    redirect_op,
                     llvm::insert_value(
                         context,
                         descriptor_val,
@@ -732,7 +790,7 @@ fn rewrite_one<'c>(
                 );
                 descriptor_val = inserted.result(0).unwrap().into();
                 let stride_const = block.insert_operation_before(
-                    candidate.producer,
+                    redirect_op,
                     arith::constant(
                         context,
                         IntegerAttribute::new(i64_ty, strides[i]).into(),
@@ -740,7 +798,7 @@ fn rewrite_one<'c>(
                     ),
                 );
                 let inserted = block.insert_operation_before(
-                    candidate.producer,
+                    redirect_op,
                     llvm::insert_value(
                         context,
                         descriptor_val,
@@ -755,7 +813,7 @@ fn rewrite_one<'c>(
             let memref_ty: Type =
                 MemRefType::new(candidate.elem_type, &candidate.dims, None, None).into();
             let cast = block.insert_operation_before(
-                candidate.producer,
+                redirect_op,
                 OperationBuilder::new("builtin.unrealized_conversion_cast", location)
                     .add_operands(&[descriptor_val])
                     .add_results(&[memref_ty])
@@ -766,13 +824,20 @@ fn rewrite_one<'c>(
             );
             let dest_memref: Value = cast.result(0).unwrap().into();
 
+            // `candidate.producer`'s own result type here, deliberately --
+            // not `redirect_op`'s: for the `linalg.fill` case they're the
+            // same shape either way (fill's own result feeds straight into
+            // `producer`'s `outs`), but `producer`'s is the type this whole
+            // rewrite is ultimately about (`candidate.elem_type`/`dims` were
+            // already derived from it in `match_candidate`, for the same
+            // reason).
             let tensor_ty = candidate.producer.result(0).unwrap().r#type();
             let restrict = Attribute::parse(context, "unit")
                 .unwrap_or_else(|| panic!("dps_rewrite: failed to parse `unit` attribute"));
             let writable = Attribute::parse(context, "unit")
                 .unwrap_or_else(|| panic!("dps_rewrite: failed to parse `unit` attribute"));
             let to_tensor = block.insert_operation_before(
-                candidate.producer,
+                redirect_op,
                 OperationBuilder::new("bufferization.to_tensor", location)
                     .add_operands(&[dest_memref])
                     .add_results(&[tensor_ty])
@@ -787,12 +852,16 @@ fn rewrite_one<'c>(
             );
             let dest_tensor: Value = to_tensor.result(0).unwrap().into();
 
-            // No re-seed needed for either producer shape that reaches here
-            // any more (`Strategy::Overwrite`'s own doc comment): whatever
-            // `outs` held before -- unused entirely, or `tensor.empty()`'s
-            // own genuine garbage -- redirecting it to `dest_tensor` is
-            // exactly as safe as the value it replaces.
-            as_mut(candidate.producer).set_operand(outs_index, dest_tensor);
+            // No re-seed needed for `linalg.generic` (`redirect_op ==
+            // producer` there: whatever `outs` held before -- unused
+            // entirely, or `tensor.empty()`'s own genuine garbage --
+            // redirecting it to `dest_tensor` is exactly as safe as the
+            // value it replaces). For `linalg.matmul`, `redirect_op` is the
+            // `linalg.fill` instead, and this redirects *its* `outs` --
+            // `producer` (the matmul) needs no operand change at all: it
+            // already reads `redirect_op`'s own result value, whose
+            // identity is unchanged by what now feeds *it*.
+            as_mut(redirect_op).set_operand(outs_index, dest_tensor);
             (new_dest_ptr, relocated)
         }
     };

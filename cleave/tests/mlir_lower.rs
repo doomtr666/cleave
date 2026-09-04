@@ -192,6 +192,24 @@ fn a_compiled_program_actually_runs_and_returns_the_right_value() {
     // reasoning as `run_i32`'s own doc comment below), found by direct
     // testing the moment `mod`/`rem` landed in the stdlib.
     pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
+    // `--expand-strided-metadata`/`--lower-affine`: needed once a real
+    // `memref.subview` with a genuinely non-trivial `strided<...>` layout
+    // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
+    // has the story).
+    pass_manager.add_pass(pass::transform::create_canonicalizer());
+    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
+    pass_manager.add_pass(pass::conversion::create_lower_affine());
+    pass_manager.add_pass(pass::transform::create_canonicalizer());
+    // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
+    // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
+    // doc comment for the full story (isolated there, on a completely
+    // unrelated plain-array case): running `--finalize-memref-to-llvm`
+    // once, up front, leaves a genuinely unreconcilable `i64`-to-`index`-
+    // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
+    // constants; a first `--convert-to-llvm` pass gives those a chance to
+    // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
+    pass_manager.add_pass(pass::conversion::create_to_llvm());
+    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
     // Multiple independent conversion passes can each leave `builtin.
     // unrealized_conversion_cast` bridge ops between their own intermediate
@@ -386,6 +404,24 @@ fn run_i32_from_cps(
     let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::linalg::create_convert_linalg_to_loops_pass());
     pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
+    // `--expand-strided-metadata`/`--lower-affine`: needed once a real
+    // `memref.subview` with a genuinely non-trivial `strided<...>` layout
+    // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
+    // has the story).
+    pass_manager.add_pass(pass::transform::create_canonicalizer());
+    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
+    pass_manager.add_pass(pass::conversion::create_lower_affine());
+    pass_manager.add_pass(pass::transform::create_canonicalizer());
+    // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
+    // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
+    // doc comment for the full story (isolated there, on a completely
+    // unrelated plain-array case): running `--finalize-memref-to-llvm`
+    // once, up front, leaves a genuinely unreconcilable `i64`-to-`index`-
+    // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
+    // constants; a first `--convert-to-llvm` pass gives those a chance to
+    // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
+    pass_manager.add_pass(pass::conversion::create_to_llvm());
+    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
     // Multiple independent conversion passes can each leave `builtin.
     // unrealized_conversion_cast` bridge ops between their own intermediate
@@ -691,6 +727,24 @@ fn an_extern_fn_call_actually_executes_through_a_registered_symbol() {
     // reasoning as `run_i32`'s own doc comment below), found by direct
     // testing the moment `mod`/`rem` landed in the stdlib.
     pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
+    // `--expand-strided-metadata`/`--lower-affine`: needed once a real
+    // `memref.subview` with a genuinely non-trivial `strided<...>` layout
+    // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
+    // has the story).
+    pass_manager.add_pass(pass::transform::create_canonicalizer());
+    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
+    pass_manager.add_pass(pass::conversion::create_lower_affine());
+    pass_manager.add_pass(pass::transform::create_canonicalizer());
+    // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
+    // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
+    // doc comment for the full story (isolated there, on a completely
+    // unrelated plain-array case): running `--finalize-memref-to-llvm`
+    // once, up front, leaves a genuinely unreconcilable `i64`-to-`index`-
+    // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
+    // constants; a first `--convert-to-llvm` pass gives those a chance to
+    // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
+    pass_manager.add_pass(pass::conversion::create_to_llvm());
+    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
     // Multiple independent conversion passes can each leave `builtin.
     // unrealized_conversion_cast` bridge ops between their own intermediate
@@ -831,6 +885,24 @@ fn an_extern_impl_method_actually_executes_the_right_symbol_at_each_call_site() 
     // reasoning as `run_i32`'s own doc comment below), found by direct
     // testing the moment `mod`/`rem` landed in the stdlib.
     pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
+    // `--expand-strided-metadata`/`--lower-affine`: needed once a real
+    // `memref.subview` with a genuinely non-trivial `strided<...>` layout
+    // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
+    // has the story).
+    pass_manager.add_pass(pass::transform::create_canonicalizer());
+    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
+    pass_manager.add_pass(pass::conversion::create_lower_affine());
+    pass_manager.add_pass(pass::transform::create_canonicalizer());
+    // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
+    // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
+    // doc comment for the full story (isolated there, on a completely
+    // unrelated plain-array case): running `--finalize-memref-to-llvm`
+    // once, up front, leaves a genuinely unreconcilable `i64`-to-`index`-
+    // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
+    // constants; a first `--convert-to-llvm` pass gives those a chance to
+    // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
+    pass_manager.add_pass(pass::conversion::create_to_llvm());
+    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
     // Multiple independent conversion passes can each leave `builtin.
     // unrealized_conversion_cast` bridge ops between their own intermediate
@@ -902,6 +974,24 @@ fn an_array_argument_crosses_an_extern_call_boundary_correctly() {
 
     let pass_manager = pass::PassManager::new(&context);
     pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
+    // `--expand-strided-metadata`/`--lower-affine`: needed once a real
+    // `memref.subview` with a genuinely non-trivial `strided<...>` layout
+    // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
+    // has the story).
+    pass_manager.add_pass(pass::transform::create_canonicalizer());
+    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
+    pass_manager.add_pass(pass::conversion::create_lower_affine());
+    pass_manager.add_pass(pass::transform::create_canonicalizer());
+    // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
+    // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
+    // doc comment for the full story (isolated there, on a completely
+    // unrelated plain-array case): running `--finalize-memref-to-llvm`
+    // once, up front, leaves a genuinely unreconcilable `i64`-to-`index`-
+    // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
+    // constants; a first `--convert-to-llvm` pass gives those a chance to
+    // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
+    pass_manager.add_pass(pass::conversion::create_to_llvm());
+    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
     // Multiple independent conversion passes can each leave `builtin.
     // unrealized_conversion_cast` bridge ops between their own intermediate
@@ -983,6 +1073,24 @@ fn a_unit_returning_extern_fn_can_be_called_correctly() {
 
     let pass_manager = pass::PassManager::new(&context);
     pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
+    // `--expand-strided-metadata`/`--lower-affine`: needed once a real
+    // `memref.subview` with a genuinely non-trivial `strided<...>` layout
+    // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
+    // has the story).
+    pass_manager.add_pass(pass::transform::create_canonicalizer());
+    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
+    pass_manager.add_pass(pass::conversion::create_lower_affine());
+    pass_manager.add_pass(pass::transform::create_canonicalizer());
+    // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
+    // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
+    // doc comment for the full story (isolated there, on a completely
+    // unrelated plain-array case): running `--finalize-memref-to-llvm`
+    // once, up front, leaves a genuinely unreconcilable `i64`-to-`index`-
+    // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
+    // constants; a first `--convert-to-llvm` pass gives those a chance to
+    // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
+    pass_manager.add_pass(pass::conversion::create_to_llvm());
+    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
     // Multiple independent conversion passes can each leave `builtin.
     // unrealized_conversion_cast` bridge ops between their own intermediate
@@ -1061,6 +1169,24 @@ fn a_string_literal_printed_via_print_writes_the_right_bytes_to_stdout() {
 
     let pass_manager = pass::PassManager::new(&context);
     pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
+    // `--expand-strided-metadata`/`--lower-affine`: needed once a real
+    // `memref.subview` with a genuinely non-trivial `strided<...>` layout
+    // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
+    // has the story).
+    pass_manager.add_pass(pass::transform::create_canonicalizer());
+    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
+    pass_manager.add_pass(pass::conversion::create_lower_affine());
+    pass_manager.add_pass(pass::transform::create_canonicalizer());
+    // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
+    // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
+    // doc comment for the full story (isolated there, on a completely
+    // unrelated plain-array case): running `--finalize-memref-to-llvm`
+    // once, up front, leaves a genuinely unreconcilable `i64`-to-`index`-
+    // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
+    // constants; a first `--convert-to-llvm` pass gives those a chance to
+    // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
+    pass_manager.add_pass(pass::conversion::create_to_llvm());
+    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
     // Multiple independent conversion passes can each leave `builtin.
     // unrealized_conversion_cast` bridge ops between their own intermediate
@@ -2825,6 +2951,24 @@ fn print_of_an_unannotated_index_result_no_longer_panics() {
     let pass_manager = pass::PassManager::new(&context);
     pass_manager.add_pass(pass::linalg::create_convert_linalg_to_loops_pass());
     pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
+    // `--expand-strided-metadata`/`--lower-affine`: needed once a real
+    // `memref.subview` with a genuinely non-trivial `strided<...>` layout
+    // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
+    // has the story).
+    pass_manager.add_pass(pass::transform::create_canonicalizer());
+    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
+    pass_manager.add_pass(pass::conversion::create_lower_affine());
+    pass_manager.add_pass(pass::transform::create_canonicalizer());
+    // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
+    // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
+    // doc comment for the full story (isolated there, on a completely
+    // unrelated plain-array case): running `--finalize-memref-to-llvm`
+    // once, up front, leaves a genuinely unreconcilable `i64`-to-`index`-
+    // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
+    // constants; a first `--convert-to-llvm` pass gives those a chance to
+    // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
+    pass_manager.add_pass(pass::conversion::create_to_llvm());
+    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
     pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
     pass_manager
@@ -2908,6 +3052,24 @@ fn print_of_an_unannotated_matmul_index_result_no_longer_panics() {
     let pass_manager = pass::PassManager::new(&context);
     pass_manager.add_pass(pass::linalg::create_convert_linalg_to_loops_pass());
     pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
+    // `--expand-strided-metadata`/`--lower-affine`: needed once a real
+    // `memref.subview` with a genuinely non-trivial `strided<...>` layout
+    // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
+    // has the story).
+    pass_manager.add_pass(pass::transform::create_canonicalizer());
+    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
+    pass_manager.add_pass(pass::conversion::create_lower_affine());
+    pass_manager.add_pass(pass::transform::create_canonicalizer());
+    // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
+    // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
+    // doc comment for the full story (isolated there, on a completely
+    // unrelated plain-array case): running `--finalize-memref-to-llvm`
+    // once, up front, leaves a genuinely unreconcilable `i64`-to-`index`-
+    // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
+    // constants; a first `--convert-to-llvm` pass gives those a chance to
+    // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
+    pass_manager.add_pass(pass::conversion::create_to_llvm());
+    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
     pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
     pass_manager
@@ -4551,6 +4713,24 @@ fn run_i32_with_dynarray_symbols(
 
     let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
+    // `--expand-strided-metadata`/`--lower-affine`: needed once a real
+    // `memref.subview` with a genuinely non-trivial `strided<...>` layout
+    // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
+    // has the story).
+    pass_manager.add_pass(pass::transform::create_canonicalizer());
+    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
+    pass_manager.add_pass(pass::conversion::create_lower_affine());
+    pass_manager.add_pass(pass::transform::create_canonicalizer());
+    // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
+    // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
+    // doc comment for the full story (isolated there, on a completely
+    // unrelated plain-array case): running `--finalize-memref-to-llvm`
+    // once, up front, leaves a genuinely unreconcilable `i64`-to-`index`-
+    // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
+    // constants; a first `--convert-to-llvm` pass gives those a chance to
+    // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
+    pass_manager.add_pass(pass::conversion::create_to_llvm());
+    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
     pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
     pass_manager

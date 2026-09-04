@@ -509,6 +509,67 @@ pub fn lower_to_llvm<'c>(
     // typed, pre-bufferization form of the IR.
     eliminate_redundant_field_store_copies(context, &mut *module);
 
+    // TEMP EXPERIMENT (`doc/backlog.md`, register-residency + FMA + real
+    // OpenMP parallelism, all three, on the matmul specifically): tile the
+    // still-tensor-typed `linalg.matmul` two ways -- `tile_using_forall` on
+    // the outer (`i`, genuinely parallel) dimension, `tile_using_for` on `j`
+    // (vector-lane width) and `k` (the reduction) -- then vectorize with
+    // `create_named_contraction` so the result is a real `vector.contract`,
+    // not the generic transpose/extract shape a plain `linalg.generic`
+    // (or `vectorize` without that attribute) would give -- confirmed
+    // directly, both by MLIR's own source (`Vectorization.cpp`'s
+    // `vectorizeAsLinalgContraction`: "Generic op is ignored as not every
+    // arbitrary contraction body can be expressed by a vector.contract")
+    // and by MLIR's own test suite (`contraction-interface.mlir`'s
+    // `@negative_generic`, `CHECK-NOT: vector.contract`, the *exact*
+    // indexing-map/body shape this project used to hand-build). `apply_
+    // patterns.vector.lower_contraction{outerproduct}` then turns that
+    // `vector.contract` into a `vector.outerproduct` chain -- confirmed via
+    // real disassembly on an isolated probe: `vfmadd132ps`/`vbroadcastss`,
+    // the textbook GEMM microkernel, not the `vpermt2ps`/`vinsertps`
+    // shuffle pile the generic path produces. `--loop-invariant-subset-
+    // hoisting` right after (safe here specifically because the IR is
+    // still tensor-typed, not memref -- see the backlog's own long
+    // derivation) makes the accumulator itself genuinely register-resident
+    // across the `k` reduction, rather than round-tripping through memory
+    // on every step. Schedule read from an external file (`cleave/mlir/
+    // matmul_vectorize.transform.mlir`, bundled alongside this crate's own
+    // source -- not `bench/mnist-pytorch/`, which is the PyTorch-comparison
+    // benchmark's own directory, not a natural home for a real pipeline
+    // dependency) rather than an embedded `transform.named_sequence`,
+    // sidestepping a leftover-schedule translation error that only ever
+    // affected standalone hand-written `.mlir` probes. Located via `env!(
+    // "CARGO_MANIFEST_DIR")` (this crate's own source directory, resolved
+    // by Cargo at *build* time), not a hand-typed absolute path -- the
+    // previous version of this string was hardcoded to this one machine's
+    // own checkout location (`I:/Dev/cleave/...`), silently broken on any
+    // other clone.
+    let pass_manager = pass::PassManager::new(context);
+    pass::transform_dialect::register_preload_library_pass();
+    pass::transform_dialect::register_interpreter_pass();
+    if parse_pass_pipeline(
+        pass_manager.as_operation_pass_manager(),
+        &format!(
+            "builtin.module(transform-preload-library{{transform-library-paths={}/mlir/matmul_vectorize.transform.mlir}},transform-interpreter{{entry-point=__transform_main}})",
+            env!("CARGO_MANIFEST_DIR").replace('\\', "/"),
+        ),
+    )
+    .is_err()
+        || pass_manager.run(&mut *module).is_err()
+    {
+        return Err(vec![
+            "MLIR-to-LLVM lowering pass failed (transform-dialect tile/vectorize)".to_string(),
+        ]);
+    }
+
+    let pass_manager = pass::PassManager::new(context);
+    pass_manager.add_pass(pass::transform::create_loop_invariant_subset_hoisting());
+    if pass_manager.run(&mut *module).is_err() {
+        return Err(vec![
+            "MLIR-to-LLVM lowering pass failed (loop-invariant-subset-hoisting)".to_string(),
+        ]);
+    }
+
     let pass_manager = pass::PassManager::new(context);
     pass::bufferization::register_one_shot_bufferize_pass();
     if parse_pass_pipeline(
@@ -520,6 +581,26 @@ pub fn lower_to_llvm<'c>(
     {
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (one-shot-bufferize)".to_string(),
+        ]);
+    }
+
+    // `--scf-forall-to-parallel` -- the *other* half of the real parallelism
+    // fix, alongside `tile_using_forall` above: an `scf.forall` produced
+    // pre-bufferize (still tensor-typed) carries `shared_outs`/`tensor.
+    // parallel_insert_slice`, a shape this pass can't handle at all
+    // (confirmed directly: silent exit 1, no diagnostic, on the tensor
+    // form) -- `scf.parallel` has no equivalent of a shared, combined
+    // result. Bufferized, the same `forall` has no results left at all
+    // (direct in-place memory writes only), exactly the shape this pass
+    // expects -- must run *here*, right after bufferize, not before.
+    // Produces a real `scf.parallel`, which `--convert-scf-to-openmp`
+    // (below, already the existing mechanism) picks up exactly like the
+    // *old* path's `affine.parallel`-derived one.
+    let pass_manager = pass::PassManager::new(context);
+    pass_manager.add_pass(pass::scf::create_scf_forall_to_parallel_loop());
+    if pass_manager.run(&mut *module).is_err() {
+        return Err(vec![
+            "MLIR-to-LLVM lowering pass failed (scf-forall-to-parallel)".to_string(),
         ]);
     }
 
@@ -570,6 +651,62 @@ pub fn lower_to_llvm<'c>(
     if pass_manager.run(&mut *module).is_err() {
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (symbol-dce)".to_string(),
+        ]);
+    }
+
+    // TEMP EXPERIMENT, continued: the transform-dialect-vectorized matmul
+    // body is already fully vector-typed at this point (real `vector.
+    // outerproduct` chains, from `apply_patterns.vector.lower_contraction`
+    // above) -- lower it the rest of the way here, before the *old*
+    // `linalg`-to-`affine`-to-`vector` path below ever runs (that path
+    // never touches this op at all any more; it still runs for whatever
+    // wasn't caught by the transform match, e.g. genuinely elementwise
+    // ops). `--canonicalize` first, then `--lower-vector-multi-reduction`
+    // for whatever reduction shape (if any) remains.
+    let pass_manager = pass::PassManager::new(context);
+    pass_manager.add_pass(pass::transform::create_canonicalizer());
+    pass::vector::register_lower_vector_multi_reduction();
+    if parse_pass_pipeline(
+        pass_manager.as_operation_pass_manager(),
+        "builtin.module(func.func(lower-vector-multi-reduction))",
+    )
+    .is_err()
+        || pass_manager.run(&mut *module).is_err()
+    {
+        return Err(vec![
+            "MLIR-to-LLVM lowering pass failed (canonicalize/lower-vector-multi-reduction)"
+                .to_string(),
+        ]);
+    }
+
+    // `--expand-strided-metadata` turns `memref.subview`'s own dynamic
+    // offset/stride metadata (from the tiling above) into plain arithmetic
+    // -- without it, `--finalize-memref-to-llvm` further below has nothing
+    // it can convert. It itself emits `affine.apply`, hence `--lower-
+    // affine` immediately after. A final `--canonicalize` cleans up the
+    // arithmetic both passes leave behind.
+    let pass_manager = pass::PassManager::new(context);
+    pass_manager.add_pass(pass::transform::create_canonicalizer());
+    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
+    pass_manager.add_pass(pass::conversion::create_lower_affine());
+    pass_manager.add_pass(pass::transform::create_canonicalizer());
+    if pass_manager.run(&mut *module).is_err() {
+        return Err(vec![
+            "MLIR-to-LLVM lowering pass failed (expand-strided-metadata/lower-affine)"
+                .to_string(),
+        ]);
+    }
+
+    // `--convert-vector-to-scf` -- the piece `--canonicalize` above never
+    // touched: handles the genuinely N-D `vector<1x16x16xf32>` *load*
+    // shapes (`vector.transfer_read`) directly, ahead of the ordinary
+    // `--convert-vector-to-llvm` further below in the final lowering
+    // stage.
+    let pass_manager = pass::PassManager::new(context);
+    pass_manager.add_pass(pass::conversion::create_vector_to_scf());
+    if pass_manager.run(&mut *module).is_err() {
+        return Err(vec![
+            "MLIR-to-LLVM lowering pass failed (vector-to-scf)".to_string(),
         ]);
     }
 
@@ -810,6 +947,7 @@ pub fn lower_to_llvm<'c>(
         // translations`'s own comment.
         let pass_manager = pass::PassManager::new(context);
         pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
+        pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
         pass_manager.add_pass(pass::conversion::create_to_llvm());
         pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
         if pass_manager.run(&mut *module).is_err() {
@@ -828,6 +966,7 @@ pub fn lower_to_llvm<'c>(
         pass_manager.add_pass(pass::conversion::create_lower_affine());
         pass_manager.add_pass(pass::conversion::create_vector_to_llvm());
         pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
+        pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
         pass_manager.add_pass(pass::conversion::create_to_llvm());
         pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
         if pass_manager.run(&mut *module).is_err() {

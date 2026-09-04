@@ -1746,8 +1746,7 @@ fn lower_array_construct<'c>(
     } else {
         for (i, arg) in args.iter().enumerate() {
             let src = lower_nested_array_arg(env, arg);
-            let idx = const_index(ctx, block, i as i64);
-            copy_nested_array(ctx, block, src, inner_dims, array_val, &[idx]);
+            copy_nested_array(ctx, block, src, inner_dims, array_val, &[i as i64]);
         }
     }
     array_val
@@ -1808,8 +1807,7 @@ fn lower_array_repeat<'c>(
     } else {
         let src = lower_nested_array_arg(env, value_arg);
         for i in 0..outer_dim {
-            let idx = const_index(ctx, block, i);
-            copy_nested_array(ctx, block, src, inner_dims, array_val, &[idx]);
+            copy_nested_array(ctx, block, src, inner_dims, array_val, &[i]);
         }
     }
     array_val
@@ -2027,20 +2025,54 @@ fn lower_struct_construct<'c>(
 /// type`'s own doc comment has the full design) — a genuinely different
 /// path from `lower_struct_construct`, not a variant of it: there's no
 /// `!llvm.struct` allocation at all, the result is a bare native SSA value.
-/// The struct's own sole field (already checked array-typed by `tagged_
-/// struct_native_type`) is constructed exactly like any other standalone
-/// array (`lower_array_construct`, unchanged, already ran to produce
-/// `args`' own single already-lowered `memref` value) — this function's
-/// only job is reading every one of its scalar elements back out
-/// (`flatten_memref_elements`, row-major, the read-side mirror of `copy_
-/// nested_array`'s own write-side walk) and collecting them into one
-/// `{keyword}.from_elements`. Deliberately not optimized to skip the
-/// memref round-trip even when the field's own value expression is
-/// syntactically a literal — "let MLIR have fun with the optimization"
-/// was an explicit, deliberate call: this stays one uniform path
-/// regardless of where the array value came from (a literal, a computed
-/// expression, a variable), rather than special-casing the literal shape
-/// the way `Vector`'s own now-removed reserved-call mechanism used to.
+///
+/// For `keyword == "tensor"`: a real bulk `memref.alloc`+`memref.copy`,
+/// then one `bufferization.to_tensor ... restrict` — *not* a per-element
+/// walk. Found directly, disassembling this project's own real `examples/
+/// mnist-interop` kernel (`doc/backlog.md`): the previous version of this
+/// function (`flatten_memref_elements`+`{keyword}.from_elements`, one
+/// `memref.load` per scalar element, fed as one `tensor.from_elements`
+/// operand each) compiled `load_train_batch_input`'s own `Tensor::<f32,32,
+/// 784>(data: pixels)` into **25,088 individually-unrolled scalar loads** —
+/// confirmed both in the MLIR text (one `func.func` alone, 50,249 lines)
+/// and in the real compiled object (216,040 static `vmovss` instructions
+/// kernel-wide, this one call site's own share of it) — paid *every batch
+/// load*, ~18,750 times over a real 10-epoch training run. The defensive
+/// copy first (rather than casting `src` directly) is load-bearing, not
+/// caution for its own sake: `restrict` is a promise of *exclusive*
+/// ownership, and `src` (whatever expression the caller wrote) can't be
+/// assumed to satisfy that in general — `load_native_shape_field`'s own doc
+/// comment already tells this exact story, for a different call site, in
+/// detail (a struct field's own storage, cast to a tensor without a
+/// defensive copy, let One-Shot Bufferize corrupt the struct's own memory
+/// in place). Copying into a *fresh* `memref.alloc` first makes the promise
+/// trivially true regardless of what `src` is — real, un-special-cased
+/// correctness — while still costing exactly one `memref.copy`, not N
+/// scalar loads: a real, named, structured op, not a flattened operand
+/// list, so One-Shot Bufferize's own copy-elision genuinely gets the
+/// chance to remove it later if it can independently prove `src` was
+/// already exclusively owned (the same "let MLIR have the opportunity to
+/// optimize it" every other op in this pipeline already gets — the old
+/// `{keyword}.from_elements` version threw that opportunity away up front,
+/// by flattening into scalar operands with no memref-level structure left
+/// for any later pass to recover).
+///
+/// A *different*, more aggressive bypass was tried here before and
+/// reverted (`cleave_alloc_local`, skipping any copy at all via a hand-
+/// built descriptor + `unrealized_conversion_cast`) — measured directly
+/// (VTune, `examples/mnist-interop`) to reintroduce ~63s of real `memcpy`
+/// traffic, because that hand-built memref was opaque to One-Shot
+/// Bufferize's own alias analysis, unlike an ordinary `memref.alloc`
+/// value. This fix is a different mechanism, not a retry of that one: the
+/// copy stays (so bufferization's own analysis has a real, ordinary
+/// `memref.alloc`-backed value to reason about, exactly the shape `Init::
+/// xavier`'s own construction — `stdlib/nn/nn.cleave` — already uses
+/// successfully), only the *per-element* version of it is gone.
+///
+/// `keyword == "vector"` (structurally supported, currently unused anywhere
+/// in stdlib) has no memref-backed form at all — `load_native_shape_field`'s
+/// own identical `assert_eq!` already established this — so it keeps the
+/// original per-element `{keyword}.from_elements` path unchanged.
 fn lower_tagged_struct_construct<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
@@ -2066,31 +2098,39 @@ fn lower_tagged_struct_construct<'c>(
         );
     };
     let src = lower_nested_array_arg(env, field_arg);
-    let (dims, _leaf_ty) = flatten_array_dims(field_ty);
+    let (dims, leaf_ty) = flatten_array_dims(field_ty);
+    let native_ty = ty_to_mlir(ctx, ty);
+    let location = Location::unknown(ctx.context);
+
+    if keyword == "tensor" {
+        let elem_ty = ty_to_mlir(ctx, leaf_ty);
+        let memref_ty = MemRefType::new(elem_ty, &dims, None, None);
+        let fresh: Value = block
+            .append_operation(memref::alloc(ctx.context, memref_ty, &[], &[], None, location))
+            .result(0)
+            .unwrap()
+            .into();
+        block.append_operation(
+            OperationBuilder::new("memref.copy", location)
+                .add_operands(&[src, fresh])
+                .build()
+                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build memref.copy: {e}")),
+        );
+        let restrict = Attribute::parse(ctx.context, "unit")
+            .unwrap_or_else(|| panic!("MLIR lowering: failed to parse `unit` attribute"));
+        let to_tensor = OperationBuilder::new("bufferization.to_tensor", location)
+            .add_operands(&[fresh])
+            .add_attributes(&[(Identifier::new(ctx.context, "restrict"), restrict)])
+            .add_results(&[native_ty])
+            .build()
+            .unwrap_or_else(|e| {
+                panic!("MLIR lowering: failed to build bufferization.to_tensor: {e}")
+            });
+        return block.append_operation(to_tensor).result(0).unwrap().into();
+    }
+
     let mut elems = Vec::new();
     flatten_memref_elements(ctx, block, src, &dims, &mut elems);
-
-    // A region-local variant of this construction was tried here (build the
-    // memref explicitly via `cleave_alloc_local`, skip `tensor.from_
-    // elements` entirely — closing a real gap: `load_train_input`/`load_
-    // train_target`, `region_analysis.rs`'s own tests confirm, get marked
-    // region-local correctly but their own tensor-shaped return never
-    // reached `cleave_alloc_local` through the *ordinary* path below,
-    // `tensor.from_elements`'s own physical backing deferred all the way to
-    // One-Shot Bufferize, long after `--inline` has erased which function it
-    // came from). Reverted, not kept: measured directly (VTune, `examples/
-    // mnist-interop`) to reintroduce ~63s of real `memcpy` traffic — the
-    // hand-built memref (via `unrealized_conversion_cast` on a from-scratch
-    // descriptor) is opaque to One-Shot Bufferize's own alias analysis in a
-    // way `tensor.from_elements` itself isn't, so bufferization can no
-    // longer prove downstream reads are copy-free the way it can for the
-    // ordinary path — a real, measured regression, not a hypothetical one.
-    // The struct-boundary half of the region-local mechanism (`alloc_llvm_
-    // value`'s own doc comment) still stands; only this tensor-construction
-    // extension specifically was undone.
-    let native_ty = ty_to_mlir(ctx, ty);
-
-    let location = Location::unknown(ctx.context);
     let built = OperationBuilder::new(&format!("{keyword}.from_elements"), location)
         .add_operands(&elems)
         .add_results(&[native_ty])
@@ -3338,47 +3378,114 @@ fn to_index<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, value: Value<'c, 'c>)
     op.result(0).unwrap().into()
 }
 
-/// Copies every scalar element of `src` (a flat memref of shape `dims`,
-/// itself one nested-array "row" — see `lower_array_construct`'s own doc
-/// comment) into `dst` at flat position `dst_prefix ++ idx`, one `memref.
-/// load`+`memref.store` pair per element, every index fully unrolled (every
-/// dimension here is a compile-time constant, cleave has no dynamically-
-/// sized arrays). Correctness-first, not throughput-first — a `memref.
-/// subview`+`memref.copy` bulk version is a possible later optimization, not
-/// attempted here.
+/// Copies the *entire* contents of `src` (a memref of shape `dims`, itself
+/// one nested-array "row" — see `lower_array_construct`'s own doc comment)
+/// into `dst` at the fixed outer position `dst_prefix`, via one `memref.
+/// subview` (a fully static, rank-reduced view onto `dst`'s own
+/// contiguous sub-region — `dst_prefix` is always a Rust-level, compile-
+/// time-constant index in every real call site below, `for (i, arg) in
+/// args.iter().enumerate()`/`for i in 0..outer_dim`, never a runtime CPS
+/// value, which is exactly what makes a fully static subview possible
+/// here) followed by one `memref.copy` — not a per-element walk. Found
+/// directly, disassembling this project's own real `examples/mnist-
+/// interop` kernel (`doc/backlog.md`): the previous version of this
+/// function (`memref.load`+`memref.store`, one pair per scalar element,
+/// every dimension recursively unrolled at Rust-construction time) is the
+/// other half of the exact same real cost `lower_tagged_struct_construct`'s
+/// own doc comment found for tensor construction — real compile-time IR
+/// bloat and real runtime instruction count, not merely a style preference
+/// for a loop nest over a fully unrolled one.
+///
+/// Fixing only the *outermost* dimension (`dst_prefix`, one index) and
+/// taking the *entire* extent of every remaining dimension (`dims`, in
+/// full) from an ordinary row-major `dst` is exactly what keeps this
+/// subview's own sub-region genuinely contiguous — a plain identity-layout
+/// `memref<dims...xT>` (no `strided<...>` wrapper needed at all), so its
+/// type can be identical to `src`'s own, letting `memref.copy` run between
+/// two ordinarily-typed memrefs with no cast in between.
 fn copy_nested_array<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
     src: Value<'c, 'c>,
     dims: &[i64],
     dst: Value<'c, 'c>,
-    dst_prefix: &[Value<'c, 'c>],
+    dst_prefix: &[i64],
 ) {
-    fn walk<'c>(
-        ctx: &LowerCtx<'c, '_>,
-        block: &Block<'c>,
-        src: Value<'c, 'c>,
-        remaining: &[i64],
-        idx_acc: &mut Vec<Value<'c, 'c>>,
-        dst: Value<'c, 'c>,
-        dst_prefix: &[Value<'c, 'c>],
-    ) {
-        let Some((&dim, rest)) = remaining.split_first() else {
-            let location = Location::unknown(ctx.context);
-            let load_op = block.append_operation(memref::load(src, idx_acc, location));
-            let scalar: Value = load_op.result(0).unwrap().into();
-            let mut dst_indices = dst_prefix.to_vec();
-            dst_indices.extend(idx_acc.iter().copied());
-            block.append_operation(memref::store(scalar, dst, &dst_indices, location));
-            return;
-        };
-        for i in 0..dim {
-            idx_acc.push(const_index(ctx, block, i));
-            walk(ctx, block, src, rest, idx_acc, dst, dst_prefix);
-            idx_acc.pop();
-        }
+    // Every real call site (`lower_array_construct`/`lower_array_repeat`)
+    // fixes exactly one leading index — the offset/stride arithmetic below
+    // is only derived for that shape, not the fully general N-level case.
+    assert_eq!(
+        dst_prefix.len(), 1,
+        "MLIR lowering: `copy_nested_array`'s own offset/stride math assumes a single leading fixed index"
+    );
+    let outer_index = dst_prefix[0];
+
+    let location = Location::unknown(ctx.context);
+    let elem_ty = MemRefType::try_from(src.r#type())
+        .unwrap_or_else(|e| panic!("MLIR lowering: `copy_nested_array`'s own `src` must be a memref: {e}"))
+        .element();
+
+    // `memref.subview`'s own verifier rejects a plain identity-layout
+    // result type here (confirmed directly: `cargo test`'s own real dps_
+    // rewrite suite caught it immediately — "expected result type to be
+    // '...strided<[...], offset: N>' ... but got 'memref<...xf32>'") — a
+    // rank-reduced subview's *offset* into the bigger `dst` buffer is real,
+    // physical, non-zero information a plain identity-layout memref type
+    // has no way to carry at all, so the exact `strided<[...], offset: N>`
+    // form has to be spelled out by hand, matching row-major strides for
+    // `dims` itself (fixing only the *outermost* index and taking every
+    // remaining dimension in full is exactly what keeps the result
+    // otherwise contiguous — no non-unit inner strides needed, only the
+    // one leading offset).
+    let mut strides: Vec<i64> = vec![1; dims.len()];
+    for i in (0..dims.len().saturating_sub(1)).rev() {
+        strides[i] = strides[i + 1] * dims[i + 1];
     }
-    walk(ctx, block, src, dims, &mut Vec::new(), dst, dst_prefix);
+    let elem_count: i64 = dims.iter().product();
+    let offset = outer_index * elem_count;
+    let dims_text = dims.iter().map(|d| format!("{d}x")).collect::<String>();
+    let strides_text = strides
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sub_ty = Type::parse(
+        ctx.context,
+        &format!("memref<{dims_text}{elem_ty}, strided<[{strides_text}], offset: {offset}>>"),
+    )
+    .unwrap_or_else(|| panic!("MLIR lowering: failed to parse `copy_nested_array`'s own subview result type"));
+    let sub_ty = MemRefType::try_from(sub_ty)
+        .unwrap_or_else(|e| panic!("MLIR lowering: subview result type must be a memref: {e}"));
+
+    let rank = 1 + dims.len();
+    let mut static_offsets: Vec<i64> = vec![outer_index];
+    static_offsets.extend(vec![0; dims.len()]);
+    let mut static_sizes: Vec<i64> = vec![1];
+    static_sizes.extend_from_slice(dims);
+    let static_strides: Vec<i64> = vec![1; rank];
+
+    let subview = block
+        .append_operation(memref::subview(
+            ctx.context,
+            dst,
+            &[],
+            &[],
+            &[],
+            &static_offsets,
+            &static_sizes,
+            &static_strides,
+            sub_ty,
+            location,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    block.append_operation(
+        OperationBuilder::new("memref.copy", location)
+            .add_operands(&[src, subview])
+            .build()
+            .unwrap_or_else(|e| panic!("MLIR lowering: failed to build memref.copy: {e}")),
+    );
 }
 
 /// The *entire* hardcoded-in-Rust surface for primitive operations: builds
@@ -3596,7 +3703,45 @@ fn build_matmul_no_seed<'c>(
             panic!("MLIR lowering: matmul's own result must be a ranked tensor: {e}")
         })
         .element();
-    let init = block
+
+    // Real `linalg.fill` zero seed, not the old `linalg.index`/`arith.
+    // select` no-seed trick this function's name still remembers. The
+    // no-seed trick bought a fusible `fmul`/`fadd` pair on the *old*
+    // `affine-super-vectorize` path (this function's own git history), but
+    // categorically blocks the *real* fix found later: MLIR's own
+    // `transform.structured.vectorize` only ever emits a genuine `vector.
+    // contract` — the op with its own dedicated, real-FMA-producing lowering
+    // (`vector.outerproduct`, confirmed via disassembly: `vfmadd132ps`/
+    // `vbroadcastss`, the textbook GEMM microkernel, zero shuffle overhead)
+    // — for an op implementing `ContractionOpInterface`, which MLIR restricts
+    // to *named* structured ops (confirmed directly in MLIR's own source,
+    // `Vectorization.cpp`'s `vectorizeAsLinalgContraction`: "Generic op is
+    // ignored as not every arbitrary contraction body can be expressed by a
+    // vector.contract" — and confirmed by MLIR's own test suite,
+    // `contraction-interface.mlir`'s `@negative_generic`, which checks
+    // `CHECK-NOT: vector.contract` on this exact indexing-map/body shape).
+    // A hand-built `linalg.generic`, no matter how its body is written, can
+    // never satisfy that interface — only the real named `linalg.matmul` op
+    // can. So the no-seed trick's whole reason to exist (a fusible pair
+    // without paying for a physical zero-fill) is moot: `linalg.generic`
+    // was always going to fall back to the generic, transpose-and-extract
+    // vectorization path (`vectorizeAsLinalgGeneric`) regardless of how its
+    // body was shaped, once tiling+vectorizing via the transform dialect
+    // instead of `affine-super-vectorize` (`pipeline.rs`'s own matmul-
+    // lowering stage). Paying for the real `linalg.fill` here is what
+    // finally buys a real `linalg.matmul`, which is what actually unlocks
+    // `vector.contract`/`vector.outerproduct` and the real `vfmadd` this
+    // function's whole history has been chasing.
+    let zero_elem: Value = block
+        .append_operation(arith::constant(
+            context,
+            FloatAttribute::new(context, elem_ty, 0.0).into(),
+            location,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let init_empty: Value = block
         .append_operation(
             OperationBuilder::new("tensor.empty", location)
                 .add_results(&[result_ty])
@@ -3606,91 +3751,44 @@ fn build_matmul_no_seed<'c>(
         .result(0)
         .unwrap()
         .into();
+    let fill_payload = Block::new(&[(elem_ty, location), (elem_ty, location)]);
+    fill_payload.append_operation(
+        OperationBuilder::new("linalg.yield", location)
+            .add_operands(&[fill_payload.argument(0).unwrap().into()])
+            .build()
+            .unwrap(),
+    );
+    let fill_region = Region::new();
+    fill_region.append_block(fill_payload);
+    let init: Value = block
+        .append_operation(
+            OperationBuilder::new("linalg.fill", location)
+                .add_operands(&[zero_elem, init_empty])
+                .add_attributes(&[(
+                    Identifier::new(context, "operandSegmentSizes"),
+                    DenseI32ArrayAttribute::new(context, &[1, 1]).into(),
+                )])
+                .add_regions_vec(vec![fill_region])
+                .add_results(&[result_ty])
+                .build()
+                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build linalg.fill: {e}")),
+        )
+        .result(0)
+        .unwrap()
+        .into();
 
-    let index_ty = Type::index(context);
+    // The real named `linalg.matmul` op. Its region is elided in every
+    // *textual* `linalg.matmul` this project has ever written or dumped
+    // (MLIR's own custom parser/printer for named structured ops derives
+    // the canonical `out += a*b` body automatically) — but melior's generic
+    // `OperationBuilder` goes through the plain C API (`mlirOperationCreate`
+    // via an `OperationState`), never that custom parser, so the region is
+    // built explicitly here, by hand, matching exactly the canonical body
+    // the parser would have synthesized.
     let payload = Block::new(&[(elem_ty, location), (elem_ty, location), (elem_ty, location)]);
     let av: Value = payload.argument(0).unwrap().into();
     let bv: Value = payload.argument(1).unwrap().into();
     let cv: Value = payload.argument(2).unwrap().into();
-    let k: Value = payload
-        .append_operation(
-            OperationBuilder::new("linalg.index", location)
-                .add_attributes(&[(
-                    Identifier::new(context, "dim"),
-                    IntegerAttribute::new(IntegerType::new(context, 64).into(), 2).into(),
-                )])
-                .add_results(&[index_ty])
-                .build()
-                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build linalg.index: {e}")),
-        )
-        .result(0)
-        .unwrap()
-        .into();
-    let zero_index: Value = payload
-        .append_operation(arith::constant(
-            context,
-            IntegerAttribute::new(index_ty, 0).into(),
-            location,
-        ))
-        .result(0)
-        .unwrap()
-        .into();
-    let is_first: Value = payload
-        .append_operation(
-            OperationBuilder::new("arith.cmpi", location)
-                .add_attributes(&[(
-                    Identifier::new(context, "predicate"),
-                    IntegerAttribute::new(IntegerType::new(context, 64).into(), 0).into(),
-                )])
-                .add_operands(&[k, zero_index])
-                .add_results(&[IntegerType::new(context, 1).into()])
-                .build()
-                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build arith.cmpi: {e}")),
-        )
-        .result(0)
-        .unwrap()
-        .into();
-    // Select the *addend* (`0.0` at `k == 0`, `cv` otherwise), not the
-    // final result -- found the hard way, not the first thing tried: an
-    // earlier version of this region computed `prod = a*b` once and
-    // selected between `prod` (k==0) and `cv + prod` (k>0) directly. That
-    // shape is mathematically identical but gives `prod` *two* real uses
-    // (the select's own true-branch, and the add) -- confirmed directly by
-    // disassembling this project's own real, compiled `examples/mnist-
-    // interop` kernel (`llvm-objdump`, not guessed from IR alone): only 14
-    // `vfmadd*ps` instructions in the whole kernel against 151 separate
-    // `vmulps`/`vaddps` pairs, meaning LLVM's own backend almost never
-    // fused the multiply-accumulate here at all -- correctly so: fusing
-    // `cv + prod` into an FMA when `prod` is *also* needed bare elsewhere
-    // would need computing the multiply a second time anyway, no actual
-    // win. Selecting the addend instead keeps the multiply's result used
-    // in exactly one place (this add), which is what actually lets `--
-    // mark_mulf_addf_contract`'s own `fastmath<contract>` stamp turn into a
-    // *real* fused multiply-add at the instruction-selection level --
-    // confirmed directly on this same probe shape (`mlir-opt`, `--convert-
-    // to-llvm`): `llvm.select` on the addend, then `llvm.fmul`/`llvm.fadd`
-    // with `fastmathFlags = #llvm.fastmath<contract>}` immediately
-    // afterward, the multiply feeding the add and nothing else.
-    let zero_elem: Value = payload
-        .append_operation(arith::constant(
-            context,
-            FloatAttribute::new(context, elem_ty, 0.0).into(),
-            location,
-        ))
-        .result(0)
-        .unwrap()
-        .into();
-    let addend: Value = payload
-        .append_operation(
-            OperationBuilder::new("arith.select", location)
-                .add_operands(&[is_first, zero_elem, cv])
-                .add_results(&[elem_ty])
-                .build()
-                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build arith.select: {e}")),
-        )
-        .result(0)
-        .unwrap()
-        .into();
     let prod: Value = payload
         .append_operation(
             OperationBuilder::new("arith.mulf", location)
@@ -3705,7 +3803,7 @@ fn build_matmul_no_seed<'c>(
     let sum: Value = payload
         .append_operation(
             OperationBuilder::new("arith.addf", location)
-                .add_operands(&[addend, prod])
+                .add_operands(&[cv, prod])
                 .add_results(&[elem_ty])
                 .build()
                 .unwrap(),
@@ -3722,30 +3820,16 @@ fn build_matmul_no_seed<'c>(
     let region = Region::new();
     region.append_block(payload);
 
-    let indexing_maps = Attribute::parse(
-        context,
-        "[affine_map<(i,j,k) -> (i,k)>, affine_map<(i,j,k) -> (k,j)>, affine_map<(i,j,k) -> (i,j)>]",
-    )
-    .unwrap_or_else(|| panic!("MLIR lowering: failed to parse matmul's own indexing_maps"));
-    let iterator_types = Attribute::parse(
-        context,
-        "[#linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>, #linalg.iterator_type<reduction>]",
-    )
-    .unwrap_or_else(|| panic!("MLIR lowering: failed to parse matmul's own iterator_types"));
-    let built = OperationBuilder::new("linalg.generic", location)
+    let built = OperationBuilder::new("linalg.matmul", location)
         .add_operands(&[a, b, init])
-        .add_attributes(&[
-            (Identifier::new(context, "indexing_maps"), indexing_maps),
-            (Identifier::new(context, "iterator_types"), iterator_types),
-            (
-                Identifier::new(context, "operandSegmentSizes"),
-                DenseI32ArrayAttribute::new(context, &[2, 1]).into(),
-            ),
-        ])
+        .add_attributes(&[(
+            Identifier::new(context, "operandSegmentSizes"),
+            DenseI32ArrayAttribute::new(context, &[2, 1]).into(),
+        )])
         .add_regions_vec(vec![region])
         .add_results(&[result_ty])
         .build()
-        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build matmul's own linalg.generic: {e}"));
+        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build linalg.matmul: {e}"));
     block.append_operation(built).result(0).unwrap().into()
 }
 

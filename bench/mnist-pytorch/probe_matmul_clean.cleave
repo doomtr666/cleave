@@ -1,7 +1,0 @@
-use nn;
-use linalg;
-use io;
-
-export fn probe(a: Tensor<f32, 32, 512>, b: Tensor<f32, 512, 512>) -> Tensor<f32, 32, 512> {
-    matmul(a, b)
-}
