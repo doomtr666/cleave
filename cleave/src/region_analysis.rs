@@ -51,15 +51,131 @@ use std::collections::{HashMap, HashSet};
 
 /// The whole public surface: every top-level function name safe to lower
 /// with `cleave_alloc_local` at each of its own construction sites.
+///
+/// **Extended with a transitive descent into an already-confirmed-region-
+/// local function's own body** (`doc/backlog.md`'s own "the bridge between
+/// which functions are safe and how a tensor's own bufferized storage gets
+/// allocated is missing" finding, and its own real motivating example:
+/// `net_grad` never constructs a tensor *directly* — it delegates every
+/// real computation to shared algebra functions, `MatMul::matmul`/`Ring::
+/// add`/`Scale::scale`/..., so the direct, single-level scan above (`find_
+/// loops_and_mark`, unchanged) only ever discovers `net_grad`'s own name —
+/// never any of the calls *inside* it, the only place a tensor construction
+/// actually happens).
+///
+/// **The soundness argument, not just a convenience extension**: once a
+/// callee `C`'s own call site has already been proven not to reach the
+/// enclosing loop's own carried (escaping) state, `C`'s *entire* execution —
+/// from the `cleave_region_enter` `lower_real_call` wraps its call site in,
+/// to the matching `cleave_region_exit` — is already known to complete
+/// (and every one of its results already known to be fully consumed, since
+/// nothing derived from it survives past that same boundary) before the
+/// region ever closes. Every value `C` itself computes internally, in turn,
+/// either gets discarded before `C` returns (a pure intermediate, safe by
+/// construction) or becomes part of `C`'s own already-proven-non-escaping
+/// result (safe for the identical reason `C`'s own call site was already
+/// safe) — there is no third way for a value to survive past `C`'s own
+/// return in this language (no mutable globals, no captured-by-reference
+/// closures a plain top-level `fn` body could stash one into). So a direct
+/// top-level call found *inside* `C`'s own body needs exactly the *same*
+/// single check this module already performs one level up — exactly one
+/// call site in the whole program (`call_counts`, computed once, globally,
+/// already correctly reflecting every call site regardless of which
+/// function's body it sits in) — and *no* separate escaping check at this
+/// inner level at all, since escaping was already ruled out transitively.
+///
+/// **Why the existing "exactly one call site" check alone is still what
+/// keeps this safe, not an oversight**: `MatMul::matmul<...>`'s own real
+/// backward-pass weight-gradient instantiations (`doc/backlog.md`'s own
+/// register-spill entry) are structurally *shaped differently* from any
+/// forward-pass call to the same algebra (a transposed operand order,
+/// `H^T @ dZ` rather than `H @ W`) — each monomorphized instantiation
+/// really does have exactly one call site in a real network, and `call_
+/// counts` (already computed over the *whole* program, not just `C`'s own
+/// body) correctly reflects that. A shape genuinely shared between a
+/// region-local caller and *any* other call site anywhere — the exact
+/// danger this whole mechanism exists to avoid — still fails this check
+/// and is correctly excluded, at any recursion depth.
 pub fn find_region_local_functions(program: &CpsProgram) -> HashSet<String> {
     let top_level_names: HashSet<String> = program.funcs.iter().map(|f| f.def.name.clone()).collect();
     let call_counts = count_call_sites(program, &top_level_names);
+    let by_name: HashMap<&str, &CFunDef> = program
+        .funcs
+        .iter()
+        .map(|f| (f.def.name.as_str(), &f.def))
+        .collect();
 
     let mut region_local = HashSet::new();
     for f in &program.funcs {
         find_loops_and_mark(&f.def.body, &top_level_names, &call_counts, &mut region_local);
     }
+
+    // Transitive descent -- a worklist, not a single extra pass, since a
+    // freshly-marked callee's own body might itself call a *third* function
+    // needing the identical treatment (a real, if not yet exercised, shape:
+    // one algebra function delegating to another). `region_local.insert`
+    // returning `false` for an already-marked name is what keeps a cycle
+    // (mutually recursive functions, each with a real single call site
+    // elsewhere) from looping forever -- the second time either name is
+    // reached, there is nothing left to add, so the worklist drains.
+    let mut worklist: Vec<String> = region_local.iter().cloned().collect();
+    while let Some(name) = worklist.pop() {
+        let Some(def) = by_name.get(name.as_str()) else {
+            continue;
+        };
+        let mut inner_callees = HashSet::new();
+        collect_direct_callees(&def.body, &top_level_names, &mut inner_callees);
+        for callee in inner_callees {
+            if call_counts.get(&callee).copied().unwrap_or(0) == 1 && region_local.insert(callee.clone()) {
+                worklist.push(callee);
+            }
+        }
+    }
+
     region_local
+}
+
+/// Every top-level function name called *directly* anywhere in `expr` (any
+/// nesting of `If`/`Fix`) — the same `Fix{[k], App(callee, args)}` call
+/// shape `count_calls_in`/`collect_calls_and_derivations` already recognize
+/// above, stripped down to just the callee names themselves: the transitive
+/// descent's own soundness argument (`find_region_local_functions`'s own
+/// doc comment) needs no escaping/field-derivation tracking at this inner
+/// level at all, unlike those two.
+fn collect_direct_callees(expr: &CExpr, top_level_names: &HashSet<String>, out: &mut HashSet<String>) {
+    match expr {
+        CExpr::LetPrim { cont, .. } => collect_direct_callees(cont, top_level_names, out),
+        CExpr::App { .. } => {}
+        CExpr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_direct_callees(then_branch, top_level_names, out);
+            collect_direct_callees(else_branch, top_level_names, out);
+        }
+        CExpr::Fix { defs, body } => {
+            if let [k] = defs.as_slice() {
+                if let CExpr::App {
+                    func: CVal::Label(callee),
+                    args,
+                } = &**body
+                {
+                    let targets_k = args
+                        .last()
+                        .map(|a| matches!(a, CVal::Label(n) if n == &k.name))
+                        .unwrap_or(false);
+                    if targets_k && top_level_names.contains(callee) {
+                        out.insert(callee.clone());
+                    }
+                }
+            }
+            for d in defs {
+                collect_direct_callees(&d.body, top_level_names, out);
+            }
+            collect_direct_callees(body, top_level_names, out);
+        }
+    }
 }
 
 /// How many real, top-level-call-shaped `App`s target each top-level

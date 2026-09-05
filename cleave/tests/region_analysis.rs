@@ -202,6 +202,147 @@ fn a_call_after_an_earlier_loop_finishes_is_never_marked_local() {
     );
 }
 
+/// The real motivating shape for the transitive descent (`region_analysis.
+/// rs`'s own extended doc comment on `find_region_local_functions`):
+/// `helper_local` never computes anything itself, it delegates to `inner`
+/// -- a plain, single-call-site helper reached *only* through `helper_
+/// local`'s own body, never from anywhere else in the whole program.
+/// `inner` should end up region-local too, not just `helper_local` itself.
+#[test]
+fn a_function_reached_only_through_an_already_region_local_callers_own_body_is_marked_local_too() {
+    let src = r#"
+        fn inner(x: i32) -> i32 { x * 2 }
+        fn helper_local(x: i32) -> i32 { inner(x) + 1 }
+        fn helper_escaping(x: i32) -> i32 { x + 2 }
+
+        fn main() -> i32 {
+            let mut acc: i32 = 0;
+            for _i in 0..10 {
+                let a = helper_local(acc);
+                acc = helper_escaping(a);
+            };
+            acc
+        }
+        "#;
+    let region_local = region_local_names(src);
+    assert!(
+        region_local.contains("helper_local"),
+        "helper_local's own result never reaches the carried state -- expected it region-local, got: {region_local:?}"
+    );
+    assert!(
+        region_local.contains("inner"),
+        "inner is reached only through helper_local's own body, itself already \
+         confirmed region-local, with no other call site anywhere -- expected it \
+         region-local too, got: {region_local:?}"
+    );
+}
+
+/// **The dangerous case this whole extension exists to still get right**:
+/// `shared` is called both from *inside* `helper_local` (an already-
+/// region-local function) *and* from a completely unrelated place with no
+/// region open at all (`main`'s own body, once, after the loop already
+/// finished). Marking `shared` region-local would be sound for the call
+/// *inside* `helper_local` alone, but would crash the very first allocation
+/// at its *other* call site (`cleave_alloc_local` called with no region
+/// open) -- `call_counts` is computed once, globally, specifically so this
+/// case is caught at *any* recursion depth, not just at the top level.
+#[test]
+fn a_function_shared_between_a_region_local_callers_body_and_an_unrelated_call_site_is_never_marked_local() {
+    let src = r#"
+        fn shared(x: i32) -> i32 { x * 2 }
+        fn helper_local(x: i32) -> i32 { shared(x) + 1 }
+        fn helper_escaping(x: i32) -> i32 { x + 2 }
+
+        fn main() -> i32 {
+            let mut acc: i32 = 0;
+            for _i in 0..10 {
+                let a = helper_local(acc);
+                acc = helper_escaping(a);
+            };
+            let extra = shared(acc);
+            extra
+        }
+        "#;
+    let region_local = region_local_names(src);
+    assert!(
+        !region_local.contains("shared"),
+        "shared has a second, unrelated call site outside any loop at all -- \
+         marking it region-local would crash that call site's own first \
+         allocation with no region open; got: {region_local:?}"
+    );
+}
+
+/// Multi-hop transitivity: `helper_local` (region-local) calls `mid`, which
+/// itself calls `leaf` -- both `mid` and `leaf` have exactly one call site
+/// in the whole program, two hops apart from the loop itself. The worklist
+/// must keep descending, not stop after one level.
+#[test]
+fn transitive_descent_reaches_a_function_two_hops_deep() {
+    let src = r#"
+        fn leaf(x: i32) -> i32 { x + 1 }
+        fn mid(x: i32) -> i32 { leaf(x) * 2 }
+        fn helper_local(x: i32) -> i32 { mid(x) + 1 }
+        fn helper_escaping(x: i32) -> i32 { x + 2 }
+
+        fn main() -> i32 {
+            let mut acc: i32 = 0;
+            for _i in 0..10 {
+                let a = helper_local(acc);
+                acc = helper_escaping(a);
+            };
+            acc
+        }
+        "#;
+    let region_local = region_local_names(src);
+    assert!(
+        region_local.contains("mid"),
+        "mid is reached only through helper_local's own body -- expected region-local, got: {region_local:?}"
+    );
+    assert!(
+        region_local.contains("leaf"),
+        "leaf is reached only through mid's own body, two hops from the loop -- \
+         expected the worklist to keep descending, got: {region_local:?}"
+    );
+}
+
+/// A mutually-recursive pair reached through an already-region-local
+/// caller -- `is_even`/`is_odd` each genuinely have *two* call sites in the
+/// whole program (their own recursive partner, plus `helper_local`'s own
+/// initial call into `is_even`), so `call_counts` correctly excludes both;
+/// the real point of this test is that the worklist *terminates* rather
+/// than looping forever bouncing between the two (it would, without the
+/// `region_local.insert(...)` returning `false`-on-repeat guard) --
+/// finishing at all, quickly, is the pass condition.
+#[test]
+fn a_mutually_recursive_pair_reached_through_a_region_local_caller_terminates_without_marking_either() {
+    let src = r#"
+        fn is_even(x: i32) -> bool {
+            if x == 0 { true } else { is_odd(x - 1) }
+        }
+        fn is_odd(x: i32) -> bool {
+            if x == 0 { false } else { is_even(x - 1) }
+        }
+        fn helper_local(x: i32) -> bool { is_even(x) }
+        fn helper_escaping(x: bool) -> i32 { if x { 1 } else { 0 } }
+
+        fn main() -> i32 {
+            let mut acc: i32 = 0;
+            for _i in 0..10 {
+                let a = helper_local(acc);
+                acc = helper_escaping(a);
+            };
+            acc
+        }
+        "#;
+    let region_local = region_local_names(src);
+    assert!(
+        !region_local.contains("is_even") && !region_local.contains("is_odd"),
+        "is_even/is_odd each have two call sites (their own mutual recursion, \
+         plus helper_local's own initial call) -- neither individually satisfies \
+         the single-call-site check, so neither should be region-local; got: {region_local:?}"
+    );
+}
+
 /// A program with no loop at all -- the analysis must find nothing to mark,
 /// not panic or misfire on the "no `Fix` is ever self-recursive" case.
 #[test]
