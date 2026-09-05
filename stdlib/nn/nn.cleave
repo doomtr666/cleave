@@ -194,10 +194,17 @@ impl Activation<f64> {
 // same array-repeat cost, found at real MNIST scale: `Activation::relu<
 // Tensor<f32,1,512>>` alone reached nearly 13,000 lines of MLIR).
 impl<T: Float, const Dims...: i32> Activation<Tensor<T, Dims...>> {
+    // `mlir::linalg::relu`, not a `tensor.splat` zero plus a plain
+    // `arith.maximumf` applied directly to the whole tensor operand (this
+    // impl's own previous shape) -- `mlir_lower.rs::build_relu_elemwise`'s
+    // own doc comment has the full story: a plain `arith.*` op on a
+    // `tensor<...>` never implements `TilingInterface` in this LLVM build,
+    // so it can never be pulled into a shared parallel region the way a
+    // real `linalg.generic` can. No separate zero tensor needed any more
+    // either -- the zero is a real `arith.constant` built directly inside
+    // the new op's own payload region.
     fn relu(x) {
-        let z: T = zero();
-        let zero: Tensor<T, Dims...> = mlir::tensor::splat(z);
-        mlir::arith::maximumf(x, zero)
+        mlir::linalg::relu(x)
     }
     fn sigmoid(x) {
         let o: T = one();

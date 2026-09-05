@@ -3615,6 +3615,21 @@ fn lower_raw_mlir_op<'c>(
     if op == "linalg.reduce" {
         return build_reduce0(ctx, block, env, args, result_ty);
     }
+    // `linalg.elementwise.<addf|subf|mulf|divf>`/`linalg.relu` -- same
+    // reason as `linalg.broadcast`/`linalg.reduce` just above: a real
+    // payload region the fully generic path below never attaches. See
+    // `build_elementwise_binop`'s own doc comment for why `Ring<Tensor<T,
+    // Dims...>>::add/sub/mul/div` (`stdlib/linalg/tensor.cleave`) and
+    // `Activation<Tensor<T,Dims...>>::relu` (`stdlib/nn/nn.cleave`) route
+    // through here now instead of a plain `arith.*` op applied directly to
+    // the whole tensor operand.
+    if let Some(scalar_suffix) = op.strip_prefix("linalg.elementwise.") {
+        let scalar_op = format!("arith.{scalar_suffix}");
+        return build_elementwise_binop(ctx, block, env, args, result_ty, &scalar_op);
+    }
+    if op == "linalg.relu" {
+        return build_relu_elemwise(ctx, block, env, args, result_ty);
+    }
     let context = ctx.context;
     let operand_ty = args
         .iter()
@@ -4160,6 +4175,234 @@ fn build_reduce0<'c>(
         .add_results(&[result_ty])
         .build()
         .unwrap_or_else(|e| panic!("MLIR lowering: failed to build reduce's own linalg.generic: {e}"));
+    block.append_operation(built).result(0).unwrap().into()
+}
+
+/// Builds `Ring<Tensor<T,Dims...>>::add/sub/mul/div` (`stdlib/linalg/
+/// tensor.cleave`) as a real, rank-generic `linalg.generic` -- not a plain
+/// `arith.addf`/`subf`/`mulf`/`divf` applied directly to the whole
+/// `tensor<...>` operand (this impl's own previous, and simpler, shape:
+/// MLIR's `ElementwiseMappable` trait makes that valid on its own). Found
+/// chasing the region-fusion work (`cleave/mlir/matmul_vectorize.transform.
+/// mlir`, `doc/backlog.md`'s own "continue on region fusion" item): a plain
+/// `arith.*` op applied to a tensor never implements `TilingInterface` in
+/// this LLVM build (confirmed directly -- no external model registered
+/// anywhere under `mlir/lib/Dialect/Arith/`), so neither `transform.
+/// structured.fuse` nor `fuse_into_containing_op` can ever pull a bias-add
+/// into the same `scf.forall` a tiled `linalg.matmul` already gets -- the
+/// exact mechanism a whole `matmul -> bias-add -> relu` chain needs to share
+/// one parallel region. `linalg.generic` *does* implement it. One builder
+/// for all four ops -- `scalar_op` is the real dialect-qualified scalar op
+/// to apply pointwise (`arith.addf`/`subf`/`mulf`/`divf`), dispatched from
+/// `op`'s own `linalg.elementwise.<suffix>` shape (see the dispatch site
+/// above), matching this project's "no per-op-name Rust knowledge" rule
+/// (`lower_raw_mlir_op`'s own doc comment) as closely as a real payload
+/// region allows.
+fn build_elementwise_binop<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    args: &[CVal],
+    result_ty: Type<'c>,
+    scalar_op: &str,
+) -> Value<'c, 'c> {
+    let context = ctx.context;
+    let location = Location::unknown(context);
+    let [a_arg, b_arg] = args else {
+        panic!(
+            "MLIR lowering: `mlir::linalg::elementwise::*` needs exactly two operands, got {}",
+            args.len()
+        );
+    };
+    let a = lower_cval(context, block, env, a_arg, result_ty);
+    let b = lower_cval(context, block, env, b_arg, result_ty);
+    let tensor_ty = RankedTensorType::try_from(result_ty).unwrap_or_else(|e| {
+        panic!("MLIR lowering: elementwise binop's own result must be a ranked tensor: {e}")
+    });
+    let elem_ty = tensor_ty.element();
+    let rank = tensor_ty.rank();
+
+    let init = block
+        .append_operation(
+            OperationBuilder::new("tensor.empty", location)
+                .add_results(&[result_ty])
+                .build()
+                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build tensor.empty: {e}")),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    let dims: Vec<String> = (0..rank).map(|d| format!("d{d}")).collect();
+    let identity_map = Attribute::parse(
+        context,
+        &format!("affine_map<({}) -> ({})>", dims.join(","), dims.join(",")),
+    )
+    .unwrap_or_else(|| panic!("MLIR lowering: failed to parse elementwise binop's own identity map"));
+    let indexing_maps = Attribute::parse(
+        context,
+        &format!("[{identity_map}, {identity_map}, {identity_map}]"),
+    )
+    .unwrap_or_else(|| panic!("MLIR lowering: failed to parse elementwise binop's own indexing_maps"));
+    let iterator_types = Attribute::parse(
+        context,
+        &format!(
+            "[{}]",
+            vec!["#linalg.iterator_type<parallel>"; rank].join(", ")
+        ),
+    )
+    .unwrap_or_else(|| panic!("MLIR lowering: failed to parse elementwise binop's own iterator_types"));
+
+    let payload = Block::new(&[(elem_ty, location), (elem_ty, location), (elem_ty, location)]);
+    let av: Value = payload.argument(0).unwrap().into();
+    let bv: Value = payload.argument(1).unwrap().into();
+    let r: Value = payload
+        .append_operation(
+            OperationBuilder::new(scalar_op, location)
+                .add_operands(&[av, bv])
+                .add_results(&[elem_ty])
+                .build()
+                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build `{scalar_op}`: {e}")),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    payload.append_operation(
+        OperationBuilder::new("linalg.yield", location)
+            .add_operands(&[r])
+            .build()
+            .unwrap(),
+    );
+    let region = Region::new();
+    region.append_block(payload);
+
+    let built = OperationBuilder::new("linalg.generic", location)
+        .add_operands(&[a, b, init])
+        .add_attributes(&[
+            (Identifier::new(context, "indexing_maps"), indexing_maps),
+            (Identifier::new(context, "iterator_types"), iterator_types),
+            (
+                Identifier::new(context, "operandSegmentSizes"),
+                DenseI32ArrayAttribute::new(context, &[2, 1]).into(),
+            ),
+        ])
+        .add_regions_vec(vec![region])
+        .add_results(&[result_ty])
+        .build()
+        .unwrap_or_else(|e| {
+            panic!("MLIR lowering: failed to build elementwise binop's own linalg.generic: {e}")
+        });
+    block.append_operation(built).result(0).unwrap().into()
+}
+
+/// Builds `Activation<Tensor<T,Dims...>>::relu` (`stdlib/nn/nn.cleave`) as a
+/// real, rank-generic `linalg.generic` -- see `build_elementwise_binop`'s
+/// own doc comment for why a plain `arith.maximumf` directly on a
+/// `tensor<...>` (this impl's own previous shape, built against a real
+/// `tensor.splat` zero operand) can never be fused the same way. No zero
+/// operand at all here, unlike the old `tensor.splat`-based form -- the
+/// zero comes from a real `arith.constant` built directly inside this op's
+/// own payload region, the same free-standing-constant-in-a-generic-body
+/// shape `build_reduce0`'s own zero seed already uses for its `linalg.
+/// fill`.
+fn build_relu_elemwise<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    args: &[CVal],
+    result_ty: Type<'c>,
+) -> Value<'c, 'c> {
+    let context = ctx.context;
+    let location = Location::unknown(context);
+    let [x_arg] = args else {
+        panic!(
+            "MLIR lowering: `mlir::linalg::relu` needs exactly one operand (`x`), got {}",
+            args.len()
+        );
+    };
+    let x = lower_cval(context, block, env, x_arg, result_ty);
+    let tensor_ty = RankedTensorType::try_from(result_ty)
+        .unwrap_or_else(|e| panic!("MLIR lowering: relu's own result must be a ranked tensor: {e}"));
+    let elem_ty = tensor_ty.element();
+    let rank = tensor_ty.rank();
+
+    let init = block
+        .append_operation(
+            OperationBuilder::new("tensor.empty", location)
+                .add_results(&[result_ty])
+                .build()
+                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build tensor.empty: {e}")),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    let dims: Vec<String> = (0..rank).map(|d| format!("d{d}")).collect();
+    let identity_map = Attribute::parse(
+        context,
+        &format!("affine_map<({}) -> ({})>", dims.join(","), dims.join(",")),
+    )
+    .unwrap_or_else(|| panic!("MLIR lowering: failed to parse relu's own identity map"));
+    let indexing_maps = Attribute::parse(context, &format!("[{identity_map}, {identity_map}]"))
+        .unwrap_or_else(|| panic!("MLIR lowering: failed to parse relu's own indexing_maps"));
+    let iterator_types = Attribute::parse(
+        context,
+        &format!(
+            "[{}]",
+            vec!["#linalg.iterator_type<parallel>"; rank].join(", ")
+        ),
+    )
+    .unwrap_or_else(|| panic!("MLIR lowering: failed to parse relu's own iterator_types"));
+    let zero_attr = Attribute::parse(context, &format!("0.0 : {elem_ty}"))
+        .unwrap_or_else(|| panic!("MLIR lowering: failed to parse relu's own zero constant"));
+
+    let payload = Block::new(&[(elem_ty, location), (elem_ty, location)]);
+    let in_arg: Value = payload.argument(0).unwrap().into();
+    let zero: Value = payload
+        .append_operation(
+            OperationBuilder::new("arith.constant", location)
+                .add_attributes(&[(Identifier::new(context, "value"), zero_attr)])
+                .add_results(&[elem_ty])
+                .build()
+                .unwrap(),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let r: Value = payload
+        .append_operation(
+            OperationBuilder::new("arith.maximumf", location)
+                .add_operands(&[in_arg, zero])
+                .add_results(&[elem_ty])
+                .build()
+                .unwrap(),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    payload.append_operation(
+        OperationBuilder::new("linalg.yield", location)
+            .add_operands(&[r])
+            .build()
+            .unwrap(),
+    );
+    let region = Region::new();
+    region.append_block(payload);
+
+    let built = OperationBuilder::new("linalg.generic", location)
+        .add_operands(&[x, init])
+        .add_attributes(&[
+            (Identifier::new(context, "indexing_maps"), indexing_maps),
+            (Identifier::new(context, "iterator_types"), iterator_types),
+            (
+                Identifier::new(context, "operandSegmentSizes"),
+                DenseI32ArrayAttribute::new(context, &[1, 1]).into(),
+            ),
+        ])
+        .add_regions_vec(vec![region])
+        .add_results(&[result_ty])
+        .build()
+        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build relu's own linalg.generic: {e}"));
     block.append_operation(built).result(0).unwrap().into()
 }
 

@@ -64,10 +64,19 @@ impl<T: Float, const Dims...: i32> NativeShape<Tensor<T, Dims...>> {}
 // site does (`Ty::Pack` staying symbolic through this impl's own
 // declaration-time inference is exactly what makes that possible).
 impl<T: Float, const Dims...: i32> Ring<Tensor<T, Dims...>> {
-    fn add(a: Tensor<T, Dims...>, b: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::arith::addf(a, b) }
-    fn sub(a: Tensor<T, Dims...>, b: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::arith::subf(a, b) }
-    fn mul(a: Tensor<T, Dims...>, b: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::arith::mulf(a, b) }
-    fn div(a: Tensor<T, Dims...>, b: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::arith::divf(a, b) }
+    // `mlir::linalg::elementwise::*`, not a plain `mlir::arith::*` applied
+    // directly to the whole tensor operand (this impl's own previous, and
+    // simpler, shape) -- `mlir_lower.rs::build_elementwise_binop`'s own doc
+    // comment has the full story: a plain `arith.*` op on a `tensor<...>`
+    // never implements `TilingInterface` in this LLVM build, so it can
+    // never be pulled into a shared parallel region the way a real `linalg.
+    // generic` can -- exactly what the region-fusion work (`cleave/mlir/
+    // matmul_vectorize.transform.mlir`) needs for a `matmul -> bias-add ->
+    // relu` chain to share one `scf.forall`.
+    fn add(a: Tensor<T, Dims...>, b: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::linalg::elementwise::addf(a, b) }
+    fn sub(a: Tensor<T, Dims...>, b: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::linalg::elementwise::subf(a, b) }
+    fn mul(a: Tensor<T, Dims...>, b: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::linalg::elementwise::mulf(a, b) }
+    fn div(a: Tensor<T, Dims...>, b: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::linalg::elementwise::divf(a, b) }
     fn neg(a: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::arith::negf(a) }
     // A same-shaped tensor of zeros — a real, O(1)-sized `tensor.splat`
     // call, not `[zero(); Dims...]`'s own array-repeat (`doc/backlog.md`'s
