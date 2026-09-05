@@ -106,6 +106,21 @@ struct LowerCtx<'c, 'm> {
     /// function's own body at a time, start to finish, before moving to the
     /// next), so a plain `Cell<bool>` — not a stack — is enough.
     currently_region_local: std::cell::Cell<bool>,
+    /// Every struct name with at least one real `PrimOp::Struct`
+    /// construction site anywhere in the whole program —
+    /// `refcount::collect_constructed_struct_names`'s own doc comment has
+    /// the full reasoning (the `RawBuf`-shaped "opaque FFI handle, never
+    /// constructed via `Name(...)`, produced solely by an `extern fn`"
+    /// idiom has no real `RcHeader` in front of it at all). `refcount.rs`'s
+    /// own `insert_refcounting` pass already consults this (via `is_
+    /// refcounted`) before ever emitting a top-level `PrimOp::Release` for
+    /// such a value — `lower_release_cascade`'s own doc comment has the
+    /// real reason this same set is needed *here* too: its own field-walk
+    /// used to check only "is this a declared struct type" when deciding
+    /// whether to recurse into a struct-typed field, with no awareness that
+    /// a declared-but-never-constructed struct type (`DynArray<T>`'s own
+    /// `buf: RawBuf` field, concretely) has nothing real to release at all.
+    constructed_structs: HashSet<String>,
 }
 
 /// Builds one MLIR `Module` containing every top-level function in
@@ -133,6 +148,7 @@ pub fn lower_program<'c>(
         })
         .collect();
     let region_local_fns = crate::region_analysis::find_region_local_functions(program);
+    let constructed_structs = crate::refcount::collect_constructed_struct_names(program);
     {
         // Scoped so `ctx`'s own borrow of `module` ends before `module` is
         // moved out below.
@@ -145,6 +161,7 @@ pub fn lower_program<'c>(
             struct_schemas,
             region_local_fns,
             currently_region_local: std::cell::Cell::new(false),
+            constructed_structs,
         };
         for f in &program.funcs {
             let op = lower_top_level_fn(&ctx, f);
@@ -2886,13 +2903,36 @@ fn lower_release_cascade<'c>(
                 .unwrap()
                 .into();
             pending.push(PendingChild::Tensor(base_ptr));
-        } else if matches!(field_ty, Ty::Con(_) | Ty::App(..))
-            && ctx.struct_schemas.contains_key(struct_name_and_args(field_ty).0)
-        {
+        } else if crate::refcount::is_refcounted(
+            field_ty,
+            &ctx.struct_schemas,
+            &ctx.mlir_types,
+            &ctx.constructed_structs,
+        ) {
             // An ordinary nested struct field — an opaque `!llvm.ptr`,
             // exactly like any other struct-typed value (`struct_llvm_
             // type`'s own doc comment) — read it, recurse once the
             // container's own fate is known.
+            //
+            // `refcount::is_refcounted` (the exact same check `refcount.
+            // rs::insert_refcounting` already uses before ever emitting a
+            // top-level `PrimOp::Release`), not just "is this a declared
+            // struct type" — a real, found-by-code-inspection gap, the same
+            // class of bug `is_refcounted`'s own third exclusion already
+            // fixed once at the top level: a struct type declared but never
+            // constructed anywhere (`stdlib/dynarray/dynarray.cleave`'s own
+            // `RawBuf`, `DynArray<T>`'s own `buf` field) has no real
+            // `cleave_alloc_rc`'d `RcHeader` in front of it at all —
+            // recursing into it here would call `cleave_release` on
+            // whatever raw, non-headered pointer an `extern fn` actually
+            // returned, reading/decrementing garbage bytes immediately
+            // preceding it (`is_refcounted`'s own doc comment: the
+            // identical corruption, confirmed there to be genuinely
+            // non-deterministic — roughly a third of the time a visible
+            // panic, the rest silent). The old, cruder check (`ctx.struct_
+            // schemas.contains_key(...)` alone) would have matched `RawBuf`
+            // every time a `DynArray<T>`-embedding struct's own release
+            // cascaded into it.
             let child_ty = ty_to_mlir(ctx, field_ty);
             let child_val: Value = block
                 .append_operation(llvm::load(
@@ -3663,6 +3703,222 @@ fn lower_raw_mlir_op<'c>(
     result_op.result(0).unwrap().into()
 }
 
+/// The `tensor.empty()`-shaped seed every genuinely-overwritten tensor
+/// computation below needs (matmul's own `linalg.fill`, transpose/broadcast0/
+/// reduce0/elementwise_binop/relu_elemwise's own unconditional `outs`
+/// overwrite) — plain `tensor.empty()` (MLIR's own "uninitialized, don't-
+/// care" placeholder, backed by whatever `--one-shot-bufferize` decides much
+/// later, today unconditionally a plain heap `malloc`, `unify_alloc.rs`'s own
+/// module doc comment) when the function *currently being lowered* isn't
+/// region-local — otherwise, a real, already-`cleave_alloc_local`'d buffer,
+/// built the same way *right now*, at initial construction, rather than left
+/// to bufferization to decide anonymously later.
+///
+/// **The exact same per-function decision `alloc_llvm_value` already makes
+/// for struct/array construction — `ctx.currently_region_local` — extended
+/// to cover the one case that mechanism could never reach on its own**
+/// (`doc/backlog.md`'s own "the bridge between which functions are safe and
+/// how a tensor's own bufferized storage gets allocated is missing"
+/// finding): `alloc_llvm_value` itself does the actual `cleave_alloc_rc`-vs-
+/// `cleave_alloc_local` branching (reused directly here, not reimplemented —
+/// this function only has to build the *tensor-shaped view* of whatever
+/// pointer it returns), so there is exactly one place in this whole compiler
+/// that ever decides which allocator backs a given construction, uniformly,
+/// for both structs and tensors. No new runtime primitive, no explicit
+/// region-handle data dependency threaded through the CPS/MLIR term at all
+/// (a real alternative design, considered and set aside): `cleave_alloc_
+/// local`'s own `handle` parameter is already never read at runtime
+/// (`cleave-rt::cleave_alloc_local`'s own doc comment — correctness comes
+/// entirely from `REGION_DEPTH` being genuinely nonzero at the call), and
+/// `region_analysis`'s own precondition (a region-local function has
+/// *exactly one* call site, itself inside a loop) already guarantees some
+/// region is genuinely open at runtime the moment this call executes,
+/// structurally, with no data-flow proof needed — deciding this once, per
+/// function, at *initial* lowering time (while function identity is still
+/// fully intact, unlike the much later, post-`--inline` stage `unify_alloc.
+/// rs` runs at) is exactly as sound as the already-proven-correct struct
+/// mechanism, and needs none of the machinery a later-stage recovery would.
+///
+/// Builds the identical hand-rolled descriptor `store_native_shape_field`
+/// already builds for the opposite direction (a tensor value written *into*
+/// a struct field) and `dps_rewrite.rs` builds a third time for its own
+/// destination-passing rewrite — mirrored here rather than factored into a
+/// shared helper, matching this project's own established precedent for
+/// this specific idiom (`dps_rewrite.rs`'s own doc comment on its identical
+/// descriptor-building code: "the same... trick `load_native_shape_field`
+/// already relies on, in reverse... mirrored here, not reinvented").
+/// `restrict` **and** `writable` both set (unlike `load_native_shape_field`'s
+/// own read-only `restrict`-alone use): this is a genuine, fresh write
+/// destination — exactly as safe as `dps_rewrite.rs`'s own `Strategy::
+/// Overwrite` already establishes for a `tensor.empty()`-seeded computation,
+/// unconditionally overwritten by whatever real op consumes this result next
+/// (a `linalg.fill`, or an `outs` no other op in its own region ever reads).
+fn tensor_seed<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, result_ty: Type<'c>) -> Value<'c, 'c> {
+    let context = ctx.context;
+    let location = Location::unknown(context);
+    if !ctx.currently_region_local.get() {
+        return block
+            .append_operation(
+                OperationBuilder::new("tensor.empty", location)
+                    .add_results(&[result_ty])
+                    .build()
+                    .unwrap_or_else(|e| panic!("MLIR lowering: failed to build tensor.empty: {e}")),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+    }
+
+    let tensor_ty = RankedTensorType::try_from(result_ty).unwrap_or_else(|e| {
+        panic!("MLIR lowering: tensor_seed's own result must be a ranked tensor: {e}")
+    });
+    let elem_mlir_ty = tensor_ty.element();
+    let rank = tensor_ty.rank();
+    let mut dims = Vec::with_capacity(rank);
+    for i in 0..rank {
+        // Cleave tensors are always statically, fully shaped -- see
+        // `dps_rewrite.rs`'s own identical check for the same reasoning.
+        match tensor_ty.dim_size(i).unwrap_or_else(|e| {
+            panic!("MLIR lowering: tensor_seed couldn't read dimension {i}: {e}")
+        }) {
+            DimSize::Static(size) => dims.push(size as i64),
+            DimSize::Dynamic => panic!(
+                "MLIR lowering: tensor_seed's own result has a dynamic dimension -- cleave tensors are always statically shaped"
+            ),
+        }
+    }
+
+    // Fresh destination -- sized as a flat `!llvm.array` of every element,
+    // matching `store_native_shape_field`'s own identical construction (and,
+    // through it, `alloc_llvm_value`'s own generic "any LLVM type" contract).
+    // `alloc_llvm_value` is what actually picks `cleave_alloc_rc` vs `cleave_
+    // alloc_local` here -- `ctx.currently_region_local` is already known
+    // `true` at this point (checked above), so this always draws from the
+    // arena.
+    let total_elems: u32 = dims.iter().product::<i64>() as u32;
+    let flat_array_ty = llvm::r#type::array(elem_mlir_ty, total_elems);
+    let dest_ptr = alloc_llvm_value(ctx, block, flat_array_ty);
+
+    // Hand-built descriptor -- `memref_descriptor_llvm_type`'s own confirmed
+    // `(allocated_ptr, aligned_ptr, offset, sizes[rank], strides[rank])`
+    // layout, row-major strides (cleave's own tensors are always statically,
+    // fully shaped -- no dynamic dimension to account for), byte-for-byte
+    // the same construction `store_native_shape_field` already does.
+    let i64_ty: Type = IntegerType::new(context, 64).into();
+    let descriptor_ty = memref_descriptor_llvm_type(context, dims.len());
+    let zero_i64: Value = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(i64_ty, 0).into(),
+            location,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let mut descriptor_val: Value = block
+        .append_operation(llvm::poison(descriptor_ty, location))
+        .result(0)
+        .unwrap()
+        .into();
+    for pos in [0i64, 1] {
+        descriptor_val = block
+            .append_operation(llvm::insert_value(
+                context,
+                descriptor_val,
+                DenseI64ArrayAttribute::new(context, &[pos]),
+                dest_ptr,
+                location,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+    }
+    descriptor_val = block
+        .append_operation(llvm::insert_value(
+            context,
+            descriptor_val,
+            DenseI64ArrayAttribute::new(context, &[2]),
+            zero_i64,
+            location,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let mut stride = 1i64;
+    let mut strides = vec![0i64; dims.len()];
+    for i in (0..dims.len()).rev() {
+        strides[i] = stride;
+        stride *= dims[i];
+    }
+    for (i, &dim) in dims.iter().enumerate() {
+        let dim_val: Value = block
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(i64_ty, dim).into(),
+                location,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        descriptor_val = block
+            .append_operation(llvm::insert_value(
+                context,
+                descriptor_val,
+                DenseI64ArrayAttribute::new(context, &[3, i as i64]),
+                dim_val,
+                location,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let stride_val: Value = block
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(i64_ty, strides[i]).into(),
+                location,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        descriptor_val = block
+            .append_operation(llvm::insert_value(
+                context,
+                descriptor_val,
+                DenseI64ArrayAttribute::new(context, &[4, i as i64]),
+                stride_val,
+                location,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+    }
+
+    let memref_ty: Type = MemRefType::new(elem_mlir_ty, &dims, None, None).into();
+    let cast = OperationBuilder::new("builtin.unrealized_conversion_cast", location)
+        .add_operands(&[descriptor_val])
+        .add_results(&[memref_ty])
+        .build()
+        .unwrap_or_else(|e| {
+            panic!("MLIR lowering: failed to build unrealized_conversion_cast: {e}")
+        });
+    let memref_val: Value = block.append_operation(cast).result(0).unwrap().into();
+
+    let restrict = Attribute::parse(context, "unit")
+        .unwrap_or_else(|| panic!("MLIR lowering: failed to parse `unit` attribute"));
+    let writable = Attribute::parse(context, "unit")
+        .unwrap_or_else(|| panic!("MLIR lowering: failed to parse `unit` attribute"));
+    let to_tensor = OperationBuilder::new("bufferization.to_tensor", location)
+        .add_operands(&[memref_val])
+        .add_attributes(&[
+            (Identifier::new(context, "restrict"), restrict),
+            (Identifier::new(context, "writable"), writable),
+        ])
+        .add_results(&[result_ty])
+        .build()
+        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build bufferization.to_tensor: {e}"));
+    block.append_operation(to_tensor).result(0).unwrap().into()
+}
+
 /// Builds `A @ B` (`Tensor<T,N,M> x Tensor<T,M,K> -> Tensor<T,N,K>`) as a
 /// genuinely seed-free `linalg.generic` — no `Ring::zero()`, no `linalg.
 /// fill`, no physical zero-initialization of the destination at all.
@@ -3771,16 +4027,7 @@ fn build_matmul_no_seed<'c>(
         .result(0)
         .unwrap()
         .into();
-    let init_empty: Value = block
-        .append_operation(
-            OperationBuilder::new("tensor.empty", location)
-                .add_results(&[result_ty])
-                .build()
-                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build tensor.empty: {e}")),
-        )
-        .result(0)
-        .unwrap()
-        .into();
+    let init_empty: Value = tensor_seed(ctx, block, result_ty);
     let fill_payload = Block::new(&[(elem_ty, location), (elem_ty, location)]);
     fill_payload.append_operation(
         OperationBuilder::new("linalg.yield", location)
@@ -3901,16 +4148,7 @@ fn build_transpose_no_seed<'c>(
             panic!("MLIR lowering: transpose's own result must be a ranked tensor: {e}")
         })
         .element();
-    let init = block
-        .append_operation(
-            OperationBuilder::new("tensor.empty", location)
-                .add_results(&[result_ty])
-                .build()
-                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build tensor.empty: {e}")),
-        )
-        .result(0)
-        .unwrap()
-        .into();
+    let init = tensor_seed(ctx, block, result_ty);
     let parsed_attrs: Vec<_> = attrs
         .iter()
         .map(|(name, text)| {
@@ -3993,16 +4231,7 @@ fn build_broadcast0<'c>(
             panic!("MLIR lowering: broadcast's own result must be a ranked tensor: {e}")
         })
         .element();
-    let init = block
-        .append_operation(
-            OperationBuilder::new("tensor.empty", location)
-                .add_results(&[result_ty])
-                .build()
-                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build tensor.empty: {e}")),
-        )
-        .result(0)
-        .unwrap()
-        .into();
+    let init = tensor_seed(ctx, block, result_ty);
 
     let in_map = Attribute::parse(context, "affine_map<(i,j) -> (0,j)>")
         .unwrap_or_else(|| panic!("MLIR lowering: failed to parse broadcast's own input indexing map"));
@@ -4087,16 +4316,7 @@ fn build_reduce0<'c>(
         .result(0)
         .unwrap()
         .into();
-    let init_empty: Value = block
-        .append_operation(
-            OperationBuilder::new("tensor.empty", location)
-                .add_results(&[result_ty])
-                .build()
-                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build tensor.empty: {e}")),
-        )
-        .result(0)
-        .unwrap()
-        .into();
+    let init_empty: Value = tensor_seed(ctx, block, result_ty);
     let fill_payload = Block::new(&[(elem_ty, location), (elem_ty, location)]);
     fill_payload.append_operation(
         OperationBuilder::new("linalg.yield", location)
@@ -4222,16 +4442,7 @@ fn build_elementwise_binop<'c>(
     let elem_ty = tensor_ty.element();
     let rank = tensor_ty.rank();
 
-    let init = block
-        .append_operation(
-            OperationBuilder::new("tensor.empty", location)
-                .add_results(&[result_ty])
-                .build()
-                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build tensor.empty: {e}")),
-        )
-        .result(0)
-        .unwrap()
-        .into();
+    let init = tensor_seed(ctx, block, result_ty);
 
     let dims: Vec<String> = (0..rank).map(|d| format!("d{d}")).collect();
     let identity_map = Attribute::parse(
@@ -4326,16 +4537,7 @@ fn build_relu_elemwise<'c>(
     let elem_ty = tensor_ty.element();
     let rank = tensor_ty.rank();
 
-    let init = block
-        .append_operation(
-            OperationBuilder::new("tensor.empty", location)
-                .add_results(&[result_ty])
-                .build()
-                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build tensor.empty: {e}")),
-        )
-        .result(0)
-        .unwrap()
-        .into();
+    let init = tensor_seed(ctx, block, result_ty);
 
     let dims: Vec<String> = (0..rank).map(|d| format!("d{d}")).collect();
     let identity_map = Attribute::parse(

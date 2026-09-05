@@ -235,10 +235,29 @@ fn analyze_loop_body(
 /// bailing out, never wrong; `lower_loop` remains the sole authority that
 /// panics on a genuinely malformed loop.
 fn loop_then_branch(loop_def: &CFunDef) -> Option<&CExpr> {
+    loop_then_and_else_branch(loop_def).map(|(then_branch, _)| then_branch)
+}
+
+/// `loop_then_branch`'s own condition-chain walk, generalized to hand back
+/// `else_branch` too — code that runs once *this* loop exits, `mlir_lower.
+/// rs::lower_loop`'s own doc comment: "runs in the *outer* scope, ordinary
+/// flow". Used by `collect_escaping`/`collect_calls_and_derivations` below
+/// to correctly treat a *nested* loop's own exit path as still belonging to
+/// whichever *enclosing* loop's own analysis is currently walking through
+/// it, while never re-scanning the nested loop's own repeating body (`then_
+/// branch`) — that body already gets its own, separate, dedicated `analyze_
+/// loop_body` call from `find_loops_and_mark`'s own top-level walk, which
+/// alone has the right `escaping` set (relative to *that* loop's own
+/// self-recursive tail-call) to judge it correctly.
+fn loop_then_and_else_branch(loop_def: &CFunDef) -> Option<(&CExpr, &CExpr)> {
     let mut cursor: &CExpr = &loop_def.body;
     loop {
         match cursor {
-            CExpr::If { then_branch, .. } => return Some(then_branch),
+            CExpr::If {
+                then_branch,
+                else_branch,
+                ..
+            } => return Some((then_branch, else_branch)),
             CExpr::Fix { defs, .. } => {
                 let [cond_k] = &defs[..] else {
                     return None;
@@ -278,7 +297,36 @@ fn collect_escaping(expr: &CExpr, loop_name: &str, escaping: &mut HashSet<CVar>)
         }
         CExpr::Fix { defs, body } => {
             for d in defs {
-                collect_escaping(&d.body, loop_name, escaping);
+                // A *nested* loop definition (`d.carried_types.is_some()`,
+                // `mlir_lower.rs::lower_loop`'s own precondition) — a real,
+                // found-by-testing soundness bug, not a style choice, to
+                // recurse into its own `then_branch` (its own repeating
+                // body) here: this scan is relative to *this* (some
+                // enclosing) loop's own `loop_name`, and the generic `App`
+                // arm above never recognizes the *nested* loop's own
+                // self-recursive tail-call (a *different* name) as an
+                // escape at all — so anything that genuinely escapes only
+                // as far as the *nested* loop's own carried state (`doc/
+                // backlog.md`'s own real example: `Optimizer::step`'s own
+                // result, carried into `net`/`state` by the *inner* batch
+                // loop) looks, from this *outer* loop's own perspective,
+                // like it never escapes anywhere — a false "safe" verdict
+                // that `find_region_local_functions`'s own whole-program
+                // `HashSet` (a union across every loop analyzed, never an
+                // intersection) then keeps permanently, even though the
+                // nested loop's own dedicated analysis already got it
+                // right. Only the nested loop's own *else branch* (`loop_
+                // then_and_else_branch`'s own doc comment: ordinary flow,
+                // still part of *this* enclosing scope) is genuinely this
+                // loop's own concern; an ordinary (non-loop) continuation's
+                // own body is unaffected, and still fully recursed into.
+                if d.carried_types.is_some() {
+                    if let Some((_, else_branch)) = loop_then_and_else_branch(d) {
+                        collect_escaping(else_branch, loop_name, escaping);
+                    }
+                } else {
+                    collect_escaping(&d.body, loop_name, escaping);
+                }
             }
             collect_escaping(body, loop_name, escaping);
         }
@@ -331,7 +379,23 @@ fn collect_calls_and_derivations(
                 }
             }
             for d in defs {
-                collect_calls_and_derivations(&d.body, top_level_names, children, calls);
+                // Same nested-loop restriction as `collect_escaping`'s own
+                // identical fix, and for the identical reason: a call
+                // sitting inside a *nested* loop's own repeating body has
+                // already been (or will be) collected by that loop's own
+                // separate `analyze_loop_body` call, against *its* own,
+                // correctly-scoped `escaping` set — collecting it *again*
+                // here just hands the *same* call to a check that can only
+                // ever get its own escaping status wrong (relative to the
+                // wrong loop's own tail-call). Its own else branch (still
+                // ordinary flow in this enclosing scope) is unaffected.
+                if d.carried_types.is_some() {
+                    if let Some((_, else_branch)) = loop_then_and_else_branch(d) {
+                        collect_calls_and_derivations(else_branch, top_level_names, children, calls);
+                    }
+                } else {
+                    collect_calls_and_derivations(&d.body, top_level_names, children, calls);
+                }
             }
             collect_calls_and_derivations(body, top_level_names, children, calls);
         }

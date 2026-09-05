@@ -100,6 +100,35 @@ fn collect_rc_targets(expr: &CExpr, names: &mut std::collections::HashSet<String
     }
 }
 
+/// The real, refcounted MLIR module's own printed text for `src` — one step
+/// further than `refcounted_cps` above: also runs `mlir_lower::lower_
+/// program` (real pipeline order, `pipeline.rs::build_optimized_cps`'s own
+/// sequencing) and hands back the verified module's own text, for a test
+/// that needs to inspect what `lower_release_cascade` (`mlir_lower.rs`)
+/// actually generated for a CPS-level `Release` — invisible to `refcounted_
+/// cps`'s own CPS-level structural checks above (`retained_or_released_
+/// struct_names`, `count_retains_for`), since the cascade *into* a struct's
+/// own fields is built entirely during MLIR lowering, from a single CPS-
+/// level `Release` node, never itself represented as further `Retain`/
+/// `Release` primops in the CPS term.
+fn refcounted_mlir_text(context: &Context, src: &str) -> String {
+    let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
+    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+    let registry = Registry::build(&program);
+    if let Err(diags) = check_type_errors(&program, &registry) {
+        panic!("type check failed: {diags:?}");
+    }
+    let cps_program = refcounted_cps(src);
+    let mlir_types = collect_mlir_types(&program);
+    let struct_schemas = collect_struct_schemas(&program);
+    let module = lower_program(context, &cps_program, &mlir_types, struct_schemas);
+    assert!(
+        module.as_operation().verify(),
+        "generated MLIR module failed verification"
+    );
+    module.as_operation().to_string()
+}
+
 /// How many `Retain(ty)` calls anywhere in `program` name struct
 /// `struct_name` — used to check `insert_refcounting` retained *every*
 /// element of a construction, not just recognized the struct type exists
@@ -405,6 +434,61 @@ fn an_opaque_handle_struct_with_no_real_construction_site_is_never_retained_or_r
         rc_targets.contains("DynArray"),
         "DynArray is a real, `cleave_alloc_rc`'d struct -- this fix must not \
          exclude it too; got: {rc_targets:?}"
+    );
+}
+
+/// A real, found-by-code-inspection bug, one layer beneath the CPS-level
+/// fix just above: `is_refcounted`'s own "has a real construction site"
+/// exclusion (the fix for the *original* `RawBuf` corruption) is only ever
+/// consulted by `insert_refcounting` when deciding whether to emit a *top-
+/// level* `Retain`/`Release` for a CPS-level variable — `mlir_lower.rs::
+/// lower_release_cascade` (which recurses a struct's own `Release` into its
+/// *own fields*, entirely at MLIR-lowering time, never itself represented
+/// as further CPS-level `Retain`/`Release` nodes) used to decide whether to
+/// recurse into a given field with a much cruder check: "is this a declared
+/// struct type", with no awareness that a declared-but-never-constructed
+/// one (`DynArray<T>`'s own `buf: RawBuf` field, concretely) has no real
+/// `RcHeader` to act on at all. `DynArray` embedded in a further struct
+/// (`Wrapper`, mirroring `Network` embedding `Dense`, the real shape
+/// `doc/backlog.md`'s own "cleave_release is non-cascading..." item
+/// describes) is exactly the shape that exercises this: releasing `Wrapper`
+/// cascades into its own `arr: DynArray<i32>` field, which — before this
+/// fix — cascaded *again* into `arr`'s own `buf: RawBuf` field, generating
+/// a real `cleave_release` call against a raw, non-headered pointer
+/// (confirmed directly, before landing the fix: the exact same corruption
+/// class `is_refcounted`'s own doc comment already documents as genuinely
+/// non-deterministic — roughly a third of the time a visible panic, the
+/// rest silent — which is why this is a *structural* MLIR-text check, not
+/// an execution-based one: a JIT run not crashing proves nothing here).
+#[test]
+fn releasing_a_struct_that_embeds_a_dynarray_never_cascades_into_its_own_rawbuf_field() {
+    let src = r#"
+        use dynarray;
+        struct Wrapper { arr: DynArray<i32> }
+        fn make_and_discard(cap: i32) -> i32 {
+            let d: DynArray<i32> = dynarray_new(cap);
+            let w: Wrapper = Wrapper(arr: d);
+            w.arr.len
+        }
+        fn main() -> i32 {
+            make_and_discard(4)
+        }
+        "#;
+    let text = refcounted_mlir_text(&context(), src);
+    let release_count = text.matches("call @cleave_release").count();
+    // The real, fixed count for this exact program: `d` released directly
+    // (no cascade — `buf` is correctly excluded), `w` released (cascading
+    // into its own live `arr` field, one more release), `w.arr`'s own
+    // separately-retained re-read released once more — 4 total. Before
+    // this fix, the *same* program generated a 5th `cleave_release` call,
+    // nested inside `d`'s own release cascade, targeting `buf`'s own raw
+    // `RawBuf` pointer directly (confirmed directly, by temporarily
+    // reverting just this fix and re-diffing the generated module text).
+    assert!(
+        release_count <= 4,
+        "expected at most 4 `cleave_release` calls (none of them cascading \
+         into RawBuf) -- got {release_count}, suggesting the cascade is \
+         once again recursing into a never-constructed struct field:\n{text}"
     );
 }
 

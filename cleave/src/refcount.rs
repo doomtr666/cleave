@@ -129,7 +129,7 @@ use std::collections::{HashMap, HashSet};
 /// exclusion only ever fires for the `RawBuf`-shaped "opaque FFI handle,
 /// produced solely by `extern fn`s" idiom, structurally, with no hardcoded
 /// name anywhere.
-fn is_refcounted(
+pub(crate) fn is_refcounted(
     ty: &Ty,
     struct_schemas: &HashMap<String, crate::cps::StructSchema>,
     mlir_types: &HashMap<String, String>,
@@ -156,7 +156,7 @@ fn is_refcounted(
 /// every nested `Fix`/`If` — mirrors `region_analysis.rs`'s own established
 /// "plain recursive `CExpr` walk, no fixpoint needed" shape for this same
 /// kind of whole-program structural fact.
-fn collect_constructed_struct_names(program: &CpsProgram) -> HashSet<String> {
+pub(crate) fn collect_constructed_struct_names(program: &CpsProgram) -> HashSet<String> {
     let mut names = HashSet::new();
     for f in &program.funcs {
         collect_constructed_in(&f.def.body, &mut names);

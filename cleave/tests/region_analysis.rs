@@ -89,6 +89,50 @@ fn a_result_reaching_the_carried_state_through_a_field_projection_is_not_local()
     );
 }
 
+/// The real bug found live in `examples/mnist-interop`'s own nested epoch/
+/// batch loops (`Optimizer::step<Sgd, Network, ...>`, wrongly marked region-
+/// local despite its own result becoming `net`/`state`, the *training*
+/// loop's own carried state) -- a real, found-by-testing correctness bug in
+/// `find_loops_and_mark`'s own nested-loop handling, not a hypothetical.
+///
+/// `helper_escaping`'s own call sits inside the *inner* loop, whose own
+/// self-recursive tail-call is exactly where its result escapes to (`acc`,
+/// read again next inner iteration) -- the *inner* loop's own dedicated
+/// `analyze_loop_body` call gets this right on its own. The bug: `find_
+/// loops_and_mark` also descends into the *outer* loop's own `then_branch`,
+/// which textually contains the *entire* inner loop -- and `collect_
+/// escaping`/`collect_calls_and_derivations`, run there relative to the
+/// *outer* loop's own (different) self-recursive tail-call, never recognize
+/// the *inner* loop's own tail-call as an escape at all (wrong loop name),
+/// so `helper_escaping`'s result looks, from the outer loop's own
+/// perspective, like it escapes nowhere -- a false "safe" verdict.
+/// `find_region_local_functions`'s own whole-program `HashSet` is a union
+/// across every loop's own analysis, never an intersection, so this one
+/// wrong verdict from the *outer* loop poisons the result even though the
+/// *inner* loop's own analysis already got it right.
+#[test]
+fn a_call_escaping_only_via_an_inner_loops_own_carried_state_is_never_marked_local_even_when_an_outer_loop_wraps_it()
+ {
+    let src = r#"
+        fn helper_escaping(x: i32) -> i32 { x + 2 }
+
+        fn main() -> i32 {
+            let mut acc: i32 = 0;
+            for _epoch in 0..3 {
+                for _batch in 0..10 {
+                    acc = helper_escaping(acc);
+                };
+            };
+            acc
+        }
+        "#;
+    let region_local = region_local_names(src);
+    assert!(
+        !region_local.contains("helper_escaping"),
+        "helper_escaping's own result becomes the *inner* loop's own carried state (`acc`), read again next inner iteration -- never safe to arena-allocate, regardless of the outer loop wrapping it; got: {region_local:?}"
+    );
+}
+
 /// A function called from more than one place in the whole program is
 /// never marked region-local, even if *this one* call site would otherwise
 /// qualify -- `region_analysis.rs`'s own module doc comment has the real
