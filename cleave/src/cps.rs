@@ -163,6 +163,28 @@ pub struct ConcreteUnit {
     /// callee against an `axiom`'s declared algebra/method name directly,
     /// without caring which concrete instantiation this particular unit is.
     pub origin: Option<(String, String)>,
+    /// Whether the *original* `fn` declaration this unit was built from
+    /// (an ordinary top-level `fn`, or an algebra/inherent-impl method —
+    /// `grammar.pest`'s own `fn_decl = { attribute* ~ ... }` lets any of
+    /// them carry one) declared `#[no_inline]` — threaded structurally at
+    /// construction time, the identical "read straight off `f.attrs`, right
+    /// where `f: &FnDecl` is already on hand" shape `origin` above uses for
+    /// `d.algebra`/`f.name`. `false` for a lambda unit (no `fn` syntax, no
+    /// attributes to carry) and a Stage-B higher-order specialization
+    /// (derived from an existing unit, not itself declared with `fn`).
+    /// Consumed by `mlir_lower.rs::lower_top_level_fn`, which sets the
+    /// `no_inline` unit attribute MLIR's own generic inliner already
+    /// respects (`func::FuncOp`'s own `no_inline` property, confirmed
+    /// directly in MLIR's own `FuncInlinerInterface::isLegalToInline`) — the
+    /// real, targeted fix for `doc/backlog.md`'s own "`--inline` itself,
+    /// directly confirmed as the real cause of the `l1` register spill"
+    /// entry: `stdlib/linalg/matrix.cleave`'s own `MatMul::matmul` impl
+    /// declares it, keeping the hot matmul reduction in its own separate,
+    /// register-clean function regardless of what `--inline` does to every
+    /// *other* call in the program — no compiler-side hardcoding of "matmul"
+    /// anywhere, matching this project's own "new functionality goes
+    /// through the algebra+`mlir::` stdlib mechanism, never hardcoded" rule.
+    pub no_inline: bool,
     /// Mirrors `ast::FnDecl::is_export`/`export_symbol` — `true` only for
     /// the non-generic top-level-`fn` branch of `collect_units` (MVP export
     /// scope: a fully concrete signature only), `false`/`None` everywhere
@@ -391,6 +413,7 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                         node_types: program_inference.node_types.clone(),
                         call_names: mono.seed_call_names().clone(),
                         origin: None,
+                        no_inline: f.attrs.iter().any(|a| a.name == "no_inline"),
                         is_export: f.is_export,
                         export_symbol: f.export_symbol.clone(),
                         capture_count: 0,
@@ -408,6 +431,7 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                             node_types: mono.node_types(key).clone(),
                             call_names: mono.call_names(key).clone(),
                             origin: None,
+                            no_inline: f.attrs.iter().any(|a| a.name == "no_inline"),
                             is_export: false,
                             export_symbol: None,
                             capture_count: 0,
@@ -524,6 +548,7 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                         node_types: infer.node_types.clone(),
                         call_names,
                         origin: Some((d.algebra.clone(), f.name.clone())),
+                        no_inline: f.attrs.iter().any(|a| a.name == "no_inline"),
                         is_export: false,
                         export_symbol: None,
                         capture_count: 0,
@@ -577,6 +602,7 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                             node_types: mono.node_types(key).clone(),
                             call_names: mono.call_names(key).clone(),
                             origin: Some((d.algebra.clone(), f.name.clone())),
+                            no_inline: f.attrs.iter().any(|a| a.name == "no_inline"),
                             is_export: false,
                             export_symbol: None,
                             capture_count: 0,
@@ -638,6 +664,7 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                         node_types: infer.node_types.clone(),
                         call_names: HashMap::new(),
                         origin: None,
+                        no_inline: f.attrs.iter().any(|a| a.name == "no_inline"),
                         is_export: false,
                         export_symbol: None,
                         capture_count: 0,
@@ -668,6 +695,7 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                             node_types: mono.node_types(key).clone(),
                             call_names: mono.call_names(key).clone(),
                             origin: None,
+                            no_inline: f.attrs.iter().any(|a| a.name == "no_inline"),
                             is_export: false,
                             export_symbol: None,
                             capture_count: 0,
@@ -731,6 +759,7 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                 node_types: node_types.clone(),
                 call_names: mono.call_names(key).clone(),
                 origin: None,
+                no_inline: false,
                 is_export: false,
                 export_symbol: None,
                 capture_count: capture_names.len(),
@@ -962,6 +991,7 @@ fn build_higher_order_specializations(units: &mut Vec<ConcreteUnit>) {
             node_types: callee_node_types,
             call_names: inner_call_names,
             origin: None,
+            no_inline: false,
             is_export: false,
             export_symbol: None,
             capture_count: 0,
@@ -1239,6 +1269,11 @@ pub struct CTopLevelFn {
     /// algebra/method against a real call site, say) needs it duplicated
     /// here rather than parsed back out of `def.name`.
     pub origin: Option<(String, String)>,
+    /// Threaded straight through from `ConcreteUnit::no_inline` — see its
+    /// own doc comment. Consulted by `mlir_lower.rs::lower_top_level_fn` to
+    /// set the real `no_inline` unit attribute MLIR's own generic inliner
+    /// respects.
+    pub no_inline: bool,
     /// Threaded straight through from `ConcreteUnit::is_export`/
     /// `export_symbol` — see their own doc comments. Consulted by
     /// `mlir_lower.rs` to pick this function's real exported LLVM symbol
@@ -1457,6 +1492,7 @@ pub fn convert_program(units: Vec<ConcreteUnit>) -> CpsProgram {
             result: unit.result.clone(),
             k_ret,
             origin: unit.origin.clone(),
+            no_inline: unit.no_inline,
             is_export: unit.is_export,
             export_symbol: unit.export_symbol.clone(),
         });

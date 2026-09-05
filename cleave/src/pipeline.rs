@@ -575,7 +575,7 @@ pub fn lower_to_llvm<'c>(
     pass::bufferization::register_one_shot_bufferize_pass();
     if parse_pass_pipeline(
         pass_manager.as_operation_pass_manager(),
-        "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})",
+        "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true function-boundary-type-conversion=identity-layout-map})",
     )
     .is_err()
         || pass_manager.run(&mut *module).is_err()

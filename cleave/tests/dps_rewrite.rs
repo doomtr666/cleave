@@ -377,7 +377,14 @@ const MATMUL_SOURCE: &str = r#"
 /// (`dps_rewrite.rs`) has the mechanism -- *and* that the redundant struct-
 /// field-store copy still gets neutered exactly the way the plain
 /// elementwise case does, proving both optimizations still compose: a real
-/// seed, redirected, and no copy.
+/// seed, redirected, and no copy. (`stdlib/linalg/matrix.cleave`'s own
+/// `MatMul::matmul` impl briefly declared `#[no_inline]` this session,
+/// which broke this specific composition for every matmul-sourced struct-
+/// field write -- measured a net *loss* on the real kernel once properly
+/// benchmarked, and set aside; `doc/backlog.md`'s own "`--inline` itself,
+/// directly confirmed as the real cause of the `l1` register spill" entry
+/// has the full story, including the real, differently-scoped fix still
+/// open.)
 #[test]
 fn matmuls_own_fill_seed_is_redirected_and_the_copy_still_neuters() {
     let context = context();

@@ -62,6 +62,37 @@ impl<T: Float, const N: i32, const M: i32> Transpose<Tensor<T,N,M>, Tensor<T,M,N
 
 impl<T: Float, const N: i32, const M: i32, const K: i32>
     MatMul<Tensor<T,N,M>, Tensor<T,M,K>, Tensor<T,N,K>> {
+    // `doc/backlog.md`'s own "`--inline` itself, directly confirmed as the
+    // real cause of the `l1` register spill" entry has the full story of why
+    // `#[no_inline]` is deliberately NOT applied here, despite a real,
+    // general, working `no_inline` unit-attribute mechanism existing end to
+    // end (`mlir_lower.rs`) and despite a real, confirmed, isolated win on
+    // this exact reduction (`K=784`, zero allocation calls inside the hot
+    // loop, a fully register-resident accumulator). Measured, properly, in
+    // a real low-noise terminal, both ways, same machine, same binary: the
+    // *full* kernel is ~6-8% *slower* with it than without, because the
+    // attribute is declared on the whole generic impl -- every one of this
+    // project's eight real call sites gets it, not just the one (`l1`'s own
+    // forward matmul) the register-spill problem was ever confirmed on --
+    // and `dps_rewrite.rs`'s own copy-elimination breaks for all eight,
+    // once per layer's own weight-update struct-field write
+    // (`stdlib/nn/nn.cleave`'s own `Dense`-level `Optimizer::step`).
+    //
+    // The real root cause, found by following the *allocation* angle
+    // instead (the same backlog entry): the spill isn't really about this
+    // matmul at all -- it's the x86-64 calling convention itself, forced to
+    // spill every live vector register across *any* call a callee might
+    // clobber, and `net_grad` (this reduction's own real caller, in the
+    // actual kernel) makes plenty of them -- every intermediate tensor
+    // allocation in that function still goes through a genuine heap
+    // `cleave_alloc_rc`, never the arena (`cleave_alloc_local`) `region_
+    // analysis.rs` already, correctly, proves this exact function safe to
+    // use, because that verdict only ever gates *struct* construction
+    // today, never a tensor value. `#[no_inline]` only ever treated the
+    // symptom (isolate the one reduction from whichever nearby call happens
+    // to force the spill); the real fix -- routing bufferization's own
+    // tensor allocation through the arena inside a region-local function --
+    // is scoped precisely in the backlog but not yet built.
     fn matmul(a, b) {
         // No seed needed at all any more, and deliberately so — this impl
         // used to build one here (`let init: Tensor<T,N,K> = Ring::zero();`,

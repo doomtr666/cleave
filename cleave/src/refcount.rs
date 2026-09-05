@@ -737,6 +737,7 @@ fn insert_refcounting_fn(top: CTopLevelFn, ctx: &RefcountCtx) -> CTopLevelFn {
         result: top.result,
         k_ret: top.k_ret,
         origin: top.origin,
+        no_inline: top.no_inline,
         is_export: top.is_export,
         export_symbol: top.export_symbol,
     }

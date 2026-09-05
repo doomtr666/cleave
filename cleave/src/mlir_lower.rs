@@ -807,7 +807,7 @@ fn lower_top_level_fn<'c>(ctx: &LowerCtx<'c, '_>, f: &CTopLevelFn) -> Operation<
     // so none of them ever qualified. Every internal algebra-dispatch/
     // helper function is *never* called from outside this module (only
     // `main`/exports are), so `private` costs nothing real.
-    let attrs: Vec<(melior::ir::Identifier, melior::ir::Attribute)> = if f.def.name == "main" {
+    let mut attrs: Vec<(melior::ir::Identifier, melior::ir::Attribute)> = if f.def.name == "main" {
         vec![(
             melior::ir::Identifier::new(context, "llvm.emit_c_interface"),
             melior::ir::Attribute::unit(context),
@@ -820,6 +820,24 @@ fn lower_top_level_fn<'c>(ctx: &LowerCtx<'c, '_>, f: &CTopLevelFn) -> Operation<
             StringAttribute::new(context, "private").into(),
         )]
     };
+    // A real `#[no_inline]` attribute, declarable on any `fn` (`grammar.
+    // pest`'s own `fn_decl = { attribute* ~ ... }`), threaded here unchanged
+    // since `collect_units` (`cps.rs`) first read it off the declaration --
+    // see `ConcreteUnit::no_inline`'s own doc comment for the full story.
+    // `func::FuncOp`'s own `no_inline` unit attribute is what MLIR's generic
+    // inliner (`pass::transform::create_inliner()`, `pipeline.rs`) actually
+    // consults (`FuncInlinerInterface::isLegalToInline`, confirmed directly
+    // in MLIR's own source: `mlir/lib/Dialect/Func/Extensions/
+    // InlinerExtension.cpp`) -- setting it here keeps this function a real,
+    // separate `llvm.func` no matter what `--inline` does to every other
+    // call in the program, without touching the inliner's own generic
+    // behavior at all.
+    if f.no_inline {
+        attrs.push((
+            melior::ir::Identifier::new(context, "no_inline"),
+            melior::ir::Attribute::unit(context),
+        ));
+    }
     // An exported unit's real LLVM symbol is its `export_symbol` override
     // when given, else its own cleave name unchanged. NOTE (known, scoped
     // gap, not silently wrong): overriding the symbol here does *not*

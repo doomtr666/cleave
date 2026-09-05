@@ -3648,6 +3648,7 @@ pub fn synthesize_derivatives(
             result,
             k_ret,
             origin: None,
+            no_inline: false,
             is_export: false,
             export_symbol: None,
         });
@@ -3912,6 +3913,7 @@ fn synthesize_one_gradient(
         result,
         k_ret,
         origin: None,
+        no_inline: false,
         is_export: false,
         export_symbol: None,
     })
@@ -5397,6 +5399,7 @@ mod tests {
             result: i32_ty(),
             k_ret: 12,
             origin: Some(("TestRing".to_string(), "add".to_string())),
+            no_inline: false,
             is_export: false,
             export_symbol: None,
         };
@@ -5677,6 +5680,7 @@ mod tests {
             result: i32_ty(),
             k_ret: 12,
             origin: Some(("Ring".to_string(), "add".to_string())),
+            no_inline: false,
             is_export: false,
             export_symbol: None,
         };
@@ -5744,6 +5748,7 @@ mod tests {
             result: i32_ty(),
             k_ret: 11,
             origin: None,
+            no_inline: false,
             is_export: false,
             export_symbol: None,
         };
@@ -5883,6 +5888,7 @@ mod tests {
             result: i32_ty(),
             k_ret: 12,
             origin: Some(("Ring".to_string(), "add".to_string())),
+            no_inline: false,
             is_export: false,
             export_symbol: None,
         }
@@ -6090,6 +6096,7 @@ mod tests {
             result: i32_ty(),
             k_ret: 11,
             origin: Some(("Print".to_string(), "print".to_string())),
+            no_inline: false,
             is_export: false,
             export_symbol: None,
         };
