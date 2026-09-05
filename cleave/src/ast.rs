@@ -242,30 +242,60 @@ pub struct FnDecl {
     /// (below) — any other bodyless `fn` or inherent-impl method is a real,
     /// rejected error, not silently tolerated.
     pub body: Option<Block>,
-    /// `fprime = derive(f);` (`grammar.pest`'s own `derive_decl`) lowers to
-    /// an ordinary top-level `FnDecl` (deliberately no new `ItemKind` —
-    /// see `lower.rs`'s own lowering of it) with this set to `Some("f")`,
-    /// `params`/`ret` left empty by lowering (the parser doesn't know `f`'s
-    /// own signature) and filled in by a dedicated pass afterward
-    /// (`driver.rs::compile`'s own signature-synthesis step, run once every
-    /// crate's own items are merged) — mirrors `is_extern`/`extern_symbol`'s
-    /// own "bodyless is legal, the real implementation lives elsewhere"
-    /// shape exactly, just synthesized by the compiler itself rather than
-    /// naming an external C symbol. `None` for every ordinary `fn`.
+    /// `fprime = derive(loss, w);` (`grammar.pest`'s own `derive_decl`)
+    /// lowers to an ordinary top-level `FnDecl` (deliberately no new
+    /// `ItemKind` — see `lower.rs`'s own lowering of it) with this set to
+    /// `Some("loss")`, `params`/`ret` left empty by lowering (the parser
+    /// doesn't know `loss`'s own signature) and filled in by a dedicated
+    /// pass afterward (`driver.rs::compile`'s own signature-synthesis step,
+    /// run once every crate's own items are merged) — mirrors `is_extern`/
+    /// `extern_symbol`'s own "bodyless is legal, the real implementation
+    /// lives elsewhere" shape exactly, just synthesized by the compiler
+    /// itself rather than naming an external C symbol. `None` for every
+    /// ordinary `fn`.
     pub derivative_of: Option<String>,
-    /// Distinguishes `gw = grad(f);` (`grammar.pest`'s own `grad_decl`) from
-    /// `fprime = derive(f);` — both lower to the identical `FnDecl` shape
-    /// above (`derivative_of: Some("f")`, signature synthesized the same
-    /// way, `driver.rs::synthesize_derive_signatures`), since a `grad`
-    /// request needs everything a `derive` request already needs (which
-    /// function, what its own parameter/return types are) plus exactly one
-    /// more fact: which *keyword* asked for it, since that decides which
-    /// differentiation algorithm actually runs (`derive` — general-purpose,
-    /// forward-mode; `grad` — reverse-mode, scalar-output-only, `doc/
-    /// backlog.md`'s own "reverse-mode differentiation" item). Always
-    /// `false` when `derivative_of` is `None` (an ordinary `fn` was never
-    /// asked to be differentiated at all either way).
+    /// Distinguishes `gw = grad(loss, w);` (`grammar.pest`'s own
+    /// `grad_decl`) from `fprime = derive(loss, w);` — both lower to the
+    /// identical `FnDecl` shape above (`derivative_of: Some("loss")`,
+    /// signature synthesized the same way, `driver.rs::synthesize_derive_
+    /// signatures`), since a `grad` request needs everything a `derive`
+    /// request already needs (which function, what its own parameter/
+    /// return types are, which one parameter to differentiate with respect
+    /// to) plus exactly one more fact: which *keyword* asked for it, since
+    /// that decides which differentiation algorithm actually runs (`derive`
+    /// — general-purpose, forward-mode; `grad` — reverse-mode, scalar-
+    /// output-only, `doc/backlog.md`'s own "reverse-mode differentiation"
+    /// item). Always `false` when `derivative_of` is `None` (an ordinary
+    /// `fn` was never asked to be differentiated at all either way).
     pub is_grad: bool,
+    /// `gw = grad(loss, net);` (`grammar.pest`'s own mandatory second
+    /// `ident` on both `grad_decl` and `derive_decl`) -- names exactly one
+    /// of `loss`'s own declared parameters; `gw`'s own synthesized body
+    /// then returns *that* parameter's own gradient directly (its own
+    /// type, never a tuple) and never extracts real ops for any other
+    /// parameter's own gradient at all (`egraph.rs::synthesize_one_
+    /// gradient`'s own doc comment has the full reasoning -- a real,
+    /// measured waste this closes at the root, not a dead-code pass run
+    /// after the fact: `grammar.pest`'s own `derive_decl` doc comment has
+    /// the full story of why an all-parameters/tuple form used to exist
+    /// here and was removed, not merely deprecated). `None` only for an
+    /// ordinary, non-differentiated `fn` (`derivative_of: None` too) --
+    /// every real `grad`/`derive` request always carries one, the grammar
+    /// itself no longer accepts omitting it.
+    pub grad_target_param: Option<String>,
+    /// `grad_target_param`'s own resolved *position* within `loss`'s real
+    /// parameter list (`driver.rs::synthesize_derive_signatures`'s own real,
+    /// located-error validation fills this in, exactly like it already
+    /// fills in `params`/`ret` — the parser leaves it `None`, it has no way
+    /// to know `loss`'s own signature at parse time). The only form
+    /// downstream passes (`cps.rs`, `egraph.rs`) ever actually consult —
+    /// CPS conversion renames every parameter to an anonymous `CVar`, so a
+    /// *name* is no longer resolvable by the time synthesis needs to act on
+    /// it; the index survives that renaming untouched (parameter order
+    /// itself never changes). `grad_target_param` (the name) still exists
+    /// purely for error messages and doc fidelity to the real source
+    /// syntax.
+    pub grad_target_index: Option<usize>,
 }
 
 #[derive(Debug, Clone)]

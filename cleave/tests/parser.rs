@@ -518,12 +518,12 @@ fn single_target_algebra_impl_still_parses_unchanged() {
 
 #[test]
 fn derive_decl_parses() {
-    parses(Rule::derive_decl, "fprime = derive(f);");
+    parses(Rule::derive_decl, "fprime = derive(f, x);");
 }
 
 #[test]
 fn derive_decl_is_a_valid_top_level_item() {
-    let pair = CleaveParser::parse(Rule::item, "fprime = derive(f);")
+    let pair = CleaveParser::parse(Rule::item, "fprime = derive(f, x);")
         .unwrap()
         .next()
         .unwrap();

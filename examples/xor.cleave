@@ -75,7 +75,16 @@ fn loss(x1: f32, x2: f32, y: f32, net: Network) -> f32 {
     err * err
 }
 
-grad = derive(loss);
+// `derive(loss, net)`, not the bare `derive(loss)` this file used to write
+// -- naming the one real target parameter (`grammar.pest`'s own `derive_
+// decl` doc comment has the full story). `net_grad`, not `grad` (this
+// file's own earlier name for it, before the real `grad()` keyword
+// existed, kept confusingly after) -- `net_grad`'s own result is `net`'s
+// gradient directly, never a `(dx1, dx2, dy, dnet)` tuple: the three
+// discarded partials w.r.t. the data (`x1`, `x2`, `y`) -- this file's own
+// previous comment on the call site below named them outright -- were real
+// compute, thrown away every one of the `4,000` training steps below.
+net_grad = derive(loss, net);
 
 fn main() -> i32 {
     // Real Xavier/Glorot init now (`Init<T>::xavier`, `stdlib/nn/nn.cleave`)
@@ -125,13 +134,13 @@ fn main() -> i32 {
                 + loss(x1s[3], x2s[3], ys[3], net);
             println(("step=", step, " loss=", total_loss));
         };
-        // `grad`'s own returned Jacobian has one entry per `loss` parameter,
-        // in declared order -- `g.0`/`g.1`/`g.2` are the unused partials
-        // w.r.t. the data (`x1`, `x2`, `y`), `g.3` is the real one: a whole
-        // `Network`-shaped gradient, one `Tensor` per `Dense` field, same
-        // shape as `net` itself.
-        let g = grad(x1s[i], x2s[i], ys[i], net);
-        let r = Optimizer::step(opt, net, g.3, state);
+        // `net_grad`'s own result is `net`'s gradient directly -- a whole
+        // `Network`-shaped value, one `Tensor` per `Dense` field, same shape
+        // as `net` itself. No `.3` projection anymore (`net_grad`'s own
+        // declaration above has the story of what used to sit at `.0`/`.1`/
+        // `.2`).
+        let g = net_grad(x1s[i], x2s[i], ys[i], net);
+        let r = Optimizer::step(opt, net, g, state);
         net = r.0;
         state = r.1;
     };

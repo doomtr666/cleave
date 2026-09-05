@@ -77,34 +77,67 @@ extern_kw = { "extern" ~ ("(" ~ ident ~ ")")? }
 // a genuinely different real exported symbol.
 export_kw = { "export" ~ ("(" ~ ident ~ ")")? }
 
-// `fprime = derive(f);` -- toward auto-diff (`doc/backlog.md`), a new
+// `fprime = derive(loss, w);` -- toward auto-diff (`doc/backlog.md`), a new
 // top-level item declaring `fprime` as the mechanically-derived derivative
-// of an existing, non-generic top-level `fn` named `f`. Read as an
-// assignment with `derive` applied to `f` ("fprime equals the derivative of
-// f"), not "derive fprime" (considered and rejected: reads as if `fprime`
-// itself were the thing being derived). No parameter list or return type
-// here -- `fprime`'s own signature is computed from `f`'s (see `driver.rs`'s
-// own signature-synthesis pass), never written by hand. No ambiguity with
-// `fn_decl` above: every other `item` alternative starts with a fixed
-// keyword or `#`, `derive_decl` is the only one starting with a bare
-// `ident`.
-derive_decl = { ident ~ "=" ~ "derive" ~ "(" ~ ident ~ ")" ~ ";" }
-// `gw = grad(loss);` -- `doc/backlog.md`'s own "reverse-mode differentiation"
-// item: a *separate* keyword from `derive`, deliberately, not a silent
-// swap of what `derive` itself means -- `derive` stays general-purpose
-// forward-mode symbolic differentiation (any output shape, any number of
-// differentiation targets, at a real, measured cost that scales with *how
-// many* targets there are simultaneously); `grad` is a narrower, reverse-
-// mode-specific operation with its own real contract (`f`'s own return
-// type must be a scalar `Float` -- checked structurally by `driver.rs`'s
-// own signature-synthesis pass, the identical place `derive_decl`'s own
-// checks already live), computing every parameter's own gradient in one
-// pass regardless of how many there are. Grammatically identical to
-// `derive_decl` otherwise -- same "bare `ident ~ '=' ~ keyword ~ (...)`"
-// shape, no ambiguity between the two: PEG's own ordered choice already
-// disambiguates on the literal keyword ("derive" vs "grad") the moment
-// either alternative gets past its own leading `ident ~ "="`.
-grad_decl = { ident ~ "=" ~ "grad" ~ "(" ~ ident ~ ")" ~ ";" }
+// of an existing, non-generic top-level `fn` named `loss`, with respect to
+// exactly one of `loss`'s own declared parameters (`w`, a bare selector --
+// checked against `loss`'s real parameter names by `driver.rs`'s own
+// signature-synthesis pass, a real, located error if it doesn't match one
+// -- *not* parsed as an ordinary expression, it never appears in any
+// environment the parser has to resolve, exactly why this stays its own
+// dedicated grammar production instead of overloading ordinary call-
+// argument parsing). Read as an assignment with `derive` applied to `loss`
+// ("fprime equals the derivative of loss [w.r.t. w]"), not "derive fprime"
+// (considered and rejected: reads as if `fprime` itself were the thing
+// being derived). No parameter list or return type here -- `fprime`'s own
+// signature is computed from `loss`'s (see `driver.rs`'s own signature-
+// synthesis pass), never written by hand; its own result is `w`'s own real
+// type directly, never a tuple (see this whole entry's own history below).
+// No ambiguity with `fn_decl` above: every other `item` alternative starts
+// with a fixed keyword or `#`, `derive_decl` is the only one starting with
+// a bare `ident`.
+//
+// **A whole-Jacobian, every-parameter-at-once form used to exist here too
+// (the second `ident` was optional, omitting it built an n-tuple with one
+// entry per parameter) -- removed, deliberately, not merely deprecated.**
+// Found to be a real, substantial, previously-undiscovered waste chasing
+// `doc/backlog.md`'s own real-kernel profiling entries: `net_grad = grad(
+// loss);` (`examples/mnist-interop`'s own real training loop, `18,750`
+// times over a full run) computed a genuine, full-sized, *discarded*
+// gradient w.r.t. the training batch itself alongside the one real,
+// actually-used gradient w.r.t. `net` -- `~31%` more FLOPs than the
+// backward pass strictly needs, confirmed directly tracing the generated
+// MLIR's own SSA use-chain (zero uses after definition). `examples/
+// xor.cleave`'s own `derive(loss)` had the identical shape, its own doc
+// comment naming the exact three wasted partials outright ("`g.0`/`g.1`/
+// `g.2` are the unused partials..."). The named-single-target form isn't
+// just a faster path alongside the tuple form -- once every remaining real
+// use case turned out to only ever want naming was strictly better (never
+// worse: needing a genuine multi-parameter Jacobian, `examples/
+// linear_regression.cleave`'s own real case, still works, just as two
+// separate `derive(loss, w)`/`derive(loss, b)` declarations instead of one
+// tuple-returning one -- each call exactly as cheap as the single-target
+// form, since neither extracts the *other* one's own ops at all), keeping
+// the tuple form around too would only ever be an unsafe default begging
+// to be reached for by accident (exactly how it got into three of this
+// project's own four real users in the first place).
+derive_decl = { ident ~ "=" ~ "derive" ~ "(" ~ ident ~ "," ~ ident ~ ")" ~ ";" }
+// `gw = grad(loss, net);` -- `doc/backlog.md`'s own "reverse-mode
+// differentiation" item: a *separate* keyword from `derive`, deliberately,
+// not a silent swap of what `derive` itself means -- `derive` stays
+// general-purpose forward-mode symbolic differentiation (any output shape);
+// `grad` is a narrower, reverse-mode-specific operation with its own real
+// contract (`loss`'s own return type must be a scalar `Float` -- checked
+// structurally by `driver.rs`'s own signature-synthesis pass, the identical
+// place `derive_decl`'s own checks already live). Grammatically identical
+// to `derive_decl` otherwise -- same "bare `ident ~ '=' ~ keyword ~ (ident,
+// ident)`" shape, no ambiguity between the two: PEG's own ordered choice
+// already disambiguates on the literal keyword ("derive" vs "grad") the
+// moment either alternative gets past its own leading `ident ~ "="`. See
+// `derive_decl`'s own doc comment just above for why the second `ident` is
+// mandatory here too, and for the real, measured waste requiring one was
+// built to close.
+grad_decl = { ident ~ "=" ~ "grad" ~ "(" ~ ident ~ "," ~ ident ~ ")" ~ ";" }
 
 generic_params = { "<" ~ generic_param ~ ("," ~ generic_param)* ~ ">" }
 // A trailing `...` right after the declared *name* (before any `:`-

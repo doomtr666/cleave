@@ -309,7 +309,7 @@ pub fn compile(
     }
 
     let result = merge_programs(programs)
-        .and_then(|program| synthesize_derive_signatures(program, &mut node_ids))
+        .and_then(synthesize_derive_signatures)
         .map(|program| synthesize_tuple_structs(program, &mut node_ids))
         .map(|program| synthesize_heap_struct_marker_impls(program, &mut node_ids));
     (result, sources)
@@ -317,10 +317,15 @@ pub fn compile(
 
 /// The tuple-arity ceiling this compiler understands — see `synthesize_
 /// tuple_structs`'s own doc comment. Trivially raised later; not a hard
-/// architectural limit. Raised from 4 to 16 once `derive()`'s own
-/// synthesized Jacobian (`synthesize_derive_signatures` below) started
-/// always returning a tuple, regardless of how many parameters `f` has —
-/// `examples/xor.cleave`'s own `loss` alone already has 12.
+/// architectural limit. Raised from 4 to 16 back when `derive()`'s own
+/// synthesized signature (`synthesize_derive_signatures` below) always
+/// returned a whole-Jacobian tuple, regardless of how many parameters `f`
+/// had — `examples/xor.cleave`'s own `loss` alone already had 12. That form
+/// is gone now (`grammar.pest`'s own `derive_decl` doc comment has the full
+/// "why"; `synthesize_derive_signatures` always synthesizes a single-value
+/// result today), but ordinary `(a, b, ...)` tuple literals elsewhere in the
+/// language still use this same ceiling, so it stays at 16 rather than
+/// dropping back down.
 const MAX_TUPLE_ARITY: usize = 16;
 
 /// Injects one synthesized `struct __TupleN<T0, ..., T(N-1)> { 0: T0, ...,
@@ -473,34 +478,41 @@ fn synthesize_heap_struct_marker_impls(mut program: Program, node_ids: &mut Node
     program
 }
 
-/// `fprime = derive(f);` (`grammar.pest`'s own `derive_decl`, lowered by
+/// `fprime = derive(f, x);` (`grammar.pest`'s own `derive_decl`, lowered by
 /// `lower.rs` to an ordinary bodyless `ItemKind::Fn` with `derivative_of:
-/// Some("f")`) has no `params`/`ret` of its own yet at this point —
-/// `lower.rs` has no way to know `f`'s own signature, possibly declared in
-/// a different file entirely, only merged into one `Program` by
-/// `merge_programs`, right before this runs. Mechanically derived, never
-/// written by hand: `f` itself must already be a real, non-generic
-/// function with every parameter explicitly typed (checked structurally,
-/// not full type inference, which hasn't run yet at this point in the
-/// pipeline) — `N == 1` parameter synthesizes `fn fprime(x: T) -> T` (an
-/// ordinary scalar derivative); `N > 1` synthesizes `fn fprime(x1: T1, ...,
-/// xN: TN) -> (T1, ..., TN)` (the gradient/Jacobian row, one tuple entry
-/// per parameter, in declared order).
+/// Some("f")`, `grad_target_param: Some("x")`) has no `params`/`ret` of its
+/// own yet at this point — `lower.rs` has no way to know `f`'s own
+/// signature, possibly declared in a different file entirely, only merged
+/// into one `Program` by `merge_programs`, right before this runs.
+/// Mechanically derived, never written by hand: `f` itself must already be
+/// a real, non-generic function with every parameter explicitly typed
+/// (checked structurally, not full type inference, which hasn't run yet at
+/// this point in the pipeline), and `x` must be a real parameter of `f`'s —
+/// resolved here to `grad_target_index` (`x`'s position in `f`'s own
+/// parameter list, since CPS conversion downstream renames every parameter
+/// to an anonymous `CVar` and the name stops being resolvable). Synthesizes
+/// `fn fprime(x1: T1, ..., xN: TN) -> Tx` — every one of `f`'s own
+/// parameters (needed to call `fprime` at all), but a *single* result typed
+/// as `x`'s own declared type, not a tuple: naming the target parameter is
+/// mandatory (`grammar.pest`'s own `derive_decl` doc comment has the full
+/// "why" — the whole-Jacobian tuple form was removed, not merely
+/// deprecated, after being found to cost real, measured wasted FLOPs in
+/// `examples/mnist-interop`'s own training loop). A genuine multi-parameter
+/// Jacobian is exactly as cheap either way — one `derive`/`grad` declaration
+/// per parameter actually needed, never one call computing every parameter's
+/// own share of the work regardless of whether the caller reads it.
 ///
-/// Each Jacobian entry's own type is that *parameter's* own declared type,
-/// not `f`'s return type — the gradient of a scalar loss with respect to a
+/// The result's own type is that *parameter's* own declared type, not `f`'s
+/// return type — the gradient of a scalar loss with respect to a
 /// `Tensor`-typed parameter is itself `Tensor`-shaped, not scalar-shaped;
 /// `f`'s own return type plays no role in the synthesized signature at all
-/// beyond needing to exist. Parameter types no longer need to match each
-/// other (or the return type) — heterogeneous parameters, including a
+/// beyond needing to exist. Parameter types don't need to match each other
+/// (or the return type) — heterogeneous parameters, including a
 /// struct-typed one, are exactly the point (`doc/backlog.md`'s own "gradient
-/// w.r.t. a struct parameter" item). A missing/generic/nullary `f`, or any
-/// unannotated parameter on `f`, is still a real, located `Diagnostic`,
-/// never guessed.
-fn synthesize_derive_signatures(
-    mut program: Program,
-    node_ids: &mut NodeIdGen,
-) -> Result<Program, Vec<Diagnostic>> {
+/// w.r.t. a struct parameter" item). A missing/generic/nullary `f`, any
+/// unannotated parameter on `f`, or a target name that isn't one of `f`'s
+/// own parameters, is still a real, located `Diagnostic`, never guessed.
+fn synthesize_derive_signatures(mut program: Program) -> Result<Program, Vec<Diagnostic>> {
     let fns: HashMap<String, FnDecl> = program
         .items
         .iter()
@@ -597,19 +609,43 @@ fn synthesize_derive_signatures(
             continue;
         };
 
-        fprime.params = f.params.clone();
-        fprime.ret = Some(if param_tys.len() == 1 {
-            param_tys.into_iter().next().unwrap()
-        } else {
-            let span = param_tys[0].span;
-            let name = tuple_struct_name(param_tys.len());
-            let args = param_tys.into_iter().map(GenericArg::Type).collect();
-            Node {
-                id: node_ids.next(),
-                span,
-                kind: TypeKind::Path(Path::single(name), args),
-            }
+        // `gw = grad(loss, net);` (`ast.rs`'s own `FnDecl::grad_target_param`
+        // doc comment) -- a real, located error if `net` doesn't name one of
+        // `loss`'s own real parameters, checked here (the one place that
+        // already has `f`'s own real parameter list on hand), not guessed or
+        // silently ignored. The second `ident` is mandatory in both
+        // `grad_decl` and `derive_decl` now (`grammar.pest`'s own
+        // `derive_decl` doc comment has the full "why the whole-Jacobian
+        // tuple form was removed, not merely deprecated" story) -- the
+        // parser itself guarantees `grad_target_param` is `Some` whenever
+        // `derivative_of` is, so the only real question left here is
+        // whether the *name* it holds actually resolves.
+        let target_name = fprime.grad_target_param.as_ref().unwrap_or_else(|| {
+            unreachable!(
+                "`{keyword}({of})`: grammar guarantees a target parameter name is always \
+                 present alongside `derivative_of` -- `lower_derivative_decl`'s own doc comment"
+            )
         });
+        let Some(target_index) = f.params.iter().position(|p| &p.name == target_name) else {
+            let real_names: Vec<&str> = f.params.iter().map(|p| p.name.as_str()).collect();
+            errors.push(Diagnostic::error(
+                format!(
+                    "`{keyword}({of}, {target_name})`: `{of}` has no parameter named \
+                     `{target_name}` — its real parameters are: {}",
+                    real_names.join(", ")
+                ),
+                item.span,
+            ));
+            continue;
+        };
+
+        fprime.grad_target_index = Some(target_index);
+        fprime.params = f.params.clone();
+        // Always that one parameter's own type directly, never a tuple —
+        // `egraph.rs::synthesize_one_gradient`'s own doc comment: the other
+        // parameters' gradients are never extracted into real ops at all,
+        // not merely dropped from the result.
+        fprime.ret = Some(param_tys[target_index].clone());
     }
 
     if errors.is_empty() {

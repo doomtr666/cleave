@@ -283,10 +283,11 @@ fn run_i32(context: &Context, src: &str) -> i32 {
     let requests: Vec<DerivativeRequest> = units
         .iter()
         .filter_map(|u| match &u.body {
-            UnitBody::Derivative(of, is_grad) => Some(DerivativeRequest {
+            UnitBody::Derivative(of, is_grad, grad_target_index) => Some(DerivativeRequest {
                 name: u.name.clone(),
                 of: of.clone(),
                 is_grad: *is_grad,
+                grad_target_index: *grad_target_index,
             }),
             _ => None,
         })
@@ -319,10 +320,11 @@ fn run_i32_with_optimization_pass(context: &Context, src: &str) -> i32 {
     let requests: Vec<DerivativeRequest> = units
         .iter()
         .filter_map(|u| match &u.body {
-            UnitBody::Derivative(of, is_grad) => Some(DerivativeRequest {
+            UnitBody::Derivative(of, is_grad, grad_target_index) => Some(DerivativeRequest {
                 name: u.name.clone(),
                 of: of.clone(),
                 is_grad: *is_grad,
+                grad_target_index: *grad_target_index,
             }),
             _ => None,
         })
@@ -3322,7 +3324,7 @@ fn derive_through_dense_forward_computes_the_right_gradient_body() {
             let err = pred - y;
             err * err
         }
-        grad = derive(loss);
+        dloss_layer = derive(loss, layer);
         fn main() -> i32 {
             let x1: f32 = 3.0;
             let x2: f32 = 4.0;
@@ -3342,13 +3344,13 @@ fn derive_through_dense_forward_computes_the_right_gradient_body() {
             let expected_w11: f32 = 2.0 * err * d1 * x2;
             let expected_b0: f32 = 2.0 * err * d0;
             let expected_b1: f32 = 2.0 * err * d1;
-            let g = grad(x1, x2, y, layer);
-            let diff_w00: f32 = g.3.w[0, 0] - expected_w00;
-            let diff_w01: f32 = g.3.w[0, 1] - expected_w01;
-            let diff_w10: f32 = g.3.w[1, 0] - expected_w10;
-            let diff_w11: f32 = g.3.w[1, 1] - expected_w11;
-            let diff_b0: f32 = g.3.b[0, 0] - expected_b0;
-            let diff_b1: f32 = g.3.b[0, 1] - expected_b1;
+            let g = dloss_layer(x1, x2, y, layer);
+            let diff_w00: f32 = g.w[0, 0] - expected_w00;
+            let diff_w01: f32 = g.w[0, 1] - expected_w01;
+            let diff_w10: f32 = g.w[1, 0] - expected_w10;
+            let diff_w11: f32 = g.w[1, 1] - expected_w11;
+            let diff_b0: f32 = g.b[0, 0] - expected_b0;
+            let diff_b1: f32 = g.b[0, 1] - expected_b1;
             let abs_w00: f32 = if diff_w00 < 0.0 { 0.0 - diff_w00 } else { diff_w00 };
             let abs_w01: f32 = if diff_w01 < 0.0 { 0.0 - diff_w01 } else { diff_w01 };
             let abs_w10: f32 = if diff_w10 < 0.0 { 0.0 - diff_w10 } else { diff_w10 };
@@ -3401,7 +3403,7 @@ fn grad_through_dense_forward_computes_the_right_gradient_body() {
             let err = pred - y;
             err * err
         }
-        gw = grad(loss);
+        gw = grad(loss, layer);
         fn main() -> i32 {
             let x1: f32 = 3.0;
             let x2: f32 = 4.0;
@@ -3423,12 +3425,12 @@ fn grad_through_dense_forward_computes_the_right_gradient_body() {
             let expected_b0: f32 = 2.0 * err * d0;
             let expected_b1: f32 = 2.0 * err * d1;
             let g = gw(x, y, layer);
-            let diff_w00: f32 = g.2.w[0, 0] - expected_w00;
-            let diff_w01: f32 = g.2.w[0, 1] - expected_w01;
-            let diff_w10: f32 = g.2.w[1, 0] - expected_w10;
-            let diff_w11: f32 = g.2.w[1, 1] - expected_w11;
-            let diff_b0: f32 = g.2.b[0, 0] - expected_b0;
-            let diff_b1: f32 = g.2.b[0, 1] - expected_b1;
+            let diff_w00: f32 = g.w[0, 0] - expected_w00;
+            let diff_w01: f32 = g.w[0, 1] - expected_w01;
+            let diff_w10: f32 = g.w[1, 0] - expected_w10;
+            let diff_w11: f32 = g.w[1, 1] - expected_w11;
+            let diff_b0: f32 = g.b[0, 0] - expected_b0;
+            let diff_b1: f32 = g.b[0, 1] - expected_b1;
             let abs_w00: f32 = if diff_w00 < 0.0 { 0.0 - diff_w00 } else { diff_w00 };
             let abs_w01: f32 = if diff_w01 < 0.0 { 0.0 - diff_w01 } else { diff_w01 };
             let abs_w10: f32 = if diff_w10 < 0.0 { 0.0 - diff_w10 } else { diff_w10 };
@@ -3872,7 +3874,7 @@ fn derive_of_a_single_parameter_function_computes_the_scalar_derivative() {
     let context = context();
     let src = "
         fn f(x: f32) -> f32 { x * x }
-        fprime = derive(f);
+        fprime = derive(f, x);
         fn main() -> i32 {
             let d: f32 = fprime(3.0);
             if d == 6.0 { 1 } else { 0 }
@@ -3881,22 +3883,26 @@ fn derive_of_a_single_parameter_function_computes_the_scalar_derivative() {
     assert_eq!(run_i32(&context, src), 1);
 }
 
-/// The multi-parameter, Jacobian case: `f(x,y) = x*y + x`, `df/dx = y+1`,
-/// `df/dy = x` -- at `(x,y) = (3.0, 5.0)`, `[6.0, 3.0]`, chosen so neither
-/// component is right by coincidence and neither equals the other. Proves
-/// the `N > 1` tuple-wrapping path (`__Tuple2`, ordinary struct construction
-/// -- `driver.rs::synthesize_derive_signatures`'s own doc comment) together
-/// with the "different free variable -> 0" base rule (needed for `y`'s own
-/// term to correctly vanish from `df/dx`, and `x`'s own from `df/dy`).
+/// The two-parameter case, `f(x,y) = x*y + x`, `df/dx = y+1`, `df/dy = x`
+/// -- at `(x,y) = (3.0, 5.0)`, `[6.0, 3.0]`, chosen so neither component is
+/// right by coincidence and neither equals the other. Proves the "different
+/// free variable -> 0" base rule (needed for `y`'s own term to correctly
+/// vanish from `df/dx`) *and* that naming `y` specifically returns `df/dy`
+/// directly, its own `f32`, never a tuple (`grammar.pest`'s own
+/// `derive_decl` doc comment: a whole-Jacobian tuple form used to exist
+/// here, covering both partials from one declaration -- removed,
+/// deliberately; a genuine two-target need is exactly this cheap as two
+/// separate declarations instead, `examples/linear_regression.cleave`'s own
+/// real case).
 #[test]
-fn derive_of_a_two_parameter_function_computes_the_jacobian_as_a_tuple() {
+fn derive_with_a_named_target_parameter_returns_just_that_derivative_directly() {
     let context = context();
     let src = "
         fn f(x: f32, y: f32) -> f32 { x * y + x }
-        fprime = derive(f);
+        dfdy = derive(f, y);
         fn main() -> i32 {
-            let g: (f32, f32) = fprime(3.0, 5.0);
-            if g.0 == 6.0 and g.1 == 3.0 { 1 } else { 0 }
+            let d: f32 = dfdy(3.0, 5.0);
+            if d == 3.0 { 1 } else { 0 }
         }
     ";
     assert_eq!(run_i32(&context, src), 1);
@@ -3923,7 +3929,7 @@ fn grad_of_a_single_parameter_function_computes_the_scalar_derivative() {
     let context = context();
     let src = "
         fn f(x: f32) -> f32 { x * x }
-        gw = grad(f);
+        gw = grad(f, x);
         fn main() -> i32 {
             let d: f32 = gw(3.0);
             if d == 6.0 { 1 } else { 0 }
@@ -3932,22 +3938,44 @@ fn grad_of_a_single_parameter_function_computes_the_scalar_derivative() {
     assert_eq!(run_i32(&context, src), 1);
 }
 
-/// `grad()`'s own `N > 1` case -- the identical `f(x,y) = x*y + x` `derive_
-/// of_a_two_parameter_function_computes_the_jacobian_as_a_tuple` already
-/// checks, confirming `finish_derivative_body`'s own tuple-wrapping path is
-/// shared correctly between both backends.
+/// `gw = grad(f, y);` (`ast.rs`'s own `FnDecl::grad_target_param` doc
+/// comment) -- the real fix for `doc/backlog.md`'s own "`grad()` always
+/// builds the full gradient tuple, wasting FLOPs on unread components"
+/// item: `gw`'s own result is `dy` directly, its own real type (`f32`
+/// here), never a `(f32, f32)` tuple at all -- confirmed both by this
+/// value check (a bare `f32` compare, not `.0`/`.1` projection) and,
+/// separately, by direct inspection while building this feature (`--dump-
+/// mlir` on an equivalent probe): exactly one `arith.mulf` in the whole
+/// generated module, not two -- `dx`'s own gradient is never synthesized
+/// into real ops at all, not computed-then-discarded.
 #[test]
-fn grad_of_a_two_parameter_function_computes_the_gradient_as_a_tuple() {
+fn grad_with_a_named_target_parameter_returns_just_that_gradient_directly() {
     let context = context();
     let src = "
-        fn f(x: f32, y: f32) -> f32 { x * y + x }
-        gw = grad(f);
+        fn loss(x: f32, y: f32) -> f32 { x * x + y * y }
+        gy = grad(loss, y);
         fn main() -> i32 {
-            let g: (f32, f32) = gw(3.0, 5.0);
-            if g.0 == 6.0 and g.1 == 3.0 { 1 } else { 0 }
+            let g: f32 = gy(3.0, 4.0);
+            if g == 8.0 { 1 } else { 0 }
         }
     ";
     assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `driver.rs::synthesize_derive_signatures`'s own real, located-error
+/// validation for a `grad(f, param)` request whose own `param` doesn't
+/// name any real parameter of `f` -- a real, reported diagnostic, not a
+/// silent fallback to the full-tuple form or a guess.
+#[test]
+#[should_panic(expected = "no parameter named `z`")]
+fn grad_with_an_unknown_target_parameter_name_is_a_real_located_error() {
+    let context = context();
+    let src = "
+        fn loss(x: f32, y: f32) -> f32 { x * x + y * y }
+        gy = grad(loss, z);
+        fn main() -> i32 { 0 }
+    ";
+    run_i32(&context, src);
 }
 
 /// `f(a,b) = a*b + a` -- the exact worked example from the reverse-mode
@@ -3957,16 +3985,18 @@ fn grad_of_a_two_parameter_function_computes_the_gradient_as_a_tuple() {
 /// hand-built spike e-graph: `a` has two consumers (`mul` and `add`), so
 /// this is the first real exercise of `accumulate_adjoint`'s own "second
 /// contribution" branch (`Ring::add`-summing two independently-arrived
-/// contributions to the same leaf) through the full compiler pipeline.
+/// contributions to the same leaf) through the full compiler pipeline --
+/// `a`'s own gradient specifically is the whole point, `grad(f, a)` names
+/// it directly.
 #[test]
 fn grad_accumulates_multiple_contributions_to_the_same_parameter() {
     let context = context();
     let src = "
         fn f(a: f32, b: f32) -> f32 { a * b + a }
-        gw = grad(f);
+        ga = grad(f, a);
         fn main() -> i32 {
-            let g: (f32, f32) = gw(3.0, 4.0);
-            if g.0 == 5.0 and g.1 == 3.0 { 1 } else { 0 }
+            let d: f32 = ga(3.0, 4.0);
+            if d == 5.0 { 1 } else { 0 }
         }
     ";
     assert_eq!(run_i32(&context, src), 1);
@@ -3986,7 +4016,7 @@ fn grad_through_a_composed_function_using_transcendental_and_ring_adjoint_rules(
     let src = "
         use nn;
         fn loss(x: f32) -> f32 { sigmoid(x) }
-        gw = grad(loss);
+        gw = grad(loss, x);
         fn main() -> i32 {
             let d: f32 = gw(0.0);
             // sigmoid(0) = 0.5, sigmoid'(0) = 0.5 * (1 - 0.5) = 0.25
@@ -4014,7 +4044,7 @@ fn grad_on_a_non_scalar_parameter_is_a_clean_error_not_a_panic_elsewhere() {
     let context = context();
     let src = "
         fn f(xs: [f32; 3]) -> f32 { xs[0] }
-        gw = grad(f);
+        gw = grad(f, xs);
         fn main() -> i32 { 0 }
     ";
     run_i32(&context, src);
@@ -4060,7 +4090,7 @@ fn grad_of_a_tensor_parameter_computes_the_gradient_as_one_opaque_tensor_leaf() 
     let src = "
         use nn;
         fn loss(w: Tensor<f32,2,2>) -> f32 { sum(w) }
-        gw = grad(loss);
+        gw = grad(loss, w);
         fn main() -> i32 {
             let w = Tensor::<f32,2,2>(data:[[1.0,2.0],[3.0,4.0]]);
             let g = gw(w);
@@ -4086,7 +4116,7 @@ fn grad_on_a_struct_parameter_with_only_scalar_fields_computes_the_right_gradien
     let src = "
         struct Pair { a: f32, b: f32 }
         fn f(p: Pair) -> f32 { p.a + p.b }
-        gw = grad(f);
+        gw = grad(f, p);
         fn main() -> i32 {
             let p = Pair(a: 3.0, b: 4.0);
             let g = gw(p);
@@ -4109,7 +4139,7 @@ fn grad_on_a_struct_parameter_with_an_unsupported_field_is_still_a_clean_error()
     let src = "
         struct HasArray { xs: [f32; 3] }
         fn f(p: HasArray) -> f32 { p.xs[0] }
-        gw = grad(f);
+        gw = grad(f, p);
         fn main() -> i32 { 0 }
     ";
     run_i32(&context, src);
@@ -4138,9 +4168,9 @@ fn derive_of_a_function_containing_a_statically_bounded_for_loop_computes_the_co
             };
             total
         }
-        grad = derive(loss);
+        dloss = derive(loss, w);
         fn main() -> i32 {
-            let d: f32 = grad(10.0);
+            let d: f32 = dloss(10.0);
             if d == 6.0 { 1 } else { 0 }
         }
     ";
@@ -4168,7 +4198,7 @@ fn derive_of_tanh_uses_stdlib_nns_own_declared_derivative_rule() {
     let src = "
         use nn;
         fn f(x: f32) -> f32 { Transcendental::tanh(x) }
-        fprime = derive(f);
+        fprime = derive(f, x);
         fn main() -> i32 {
             let x: f32 = 0.5;
             let t: f32 = Transcendental::tanh(x);
@@ -4200,7 +4230,7 @@ fn derive_through_a_composed_transcendental_call_whose_own_param_is_named_x() {
     let context = context();
     let src = "
         fn f(w: f32) -> f32 { exp(exp(w)) }
-        fprime = derive(f);
+        fprime = derive(f, w);
         fn main() -> i32 {
             let w: f32 = 1.0;
             let inner: f32 = exp(w);
@@ -4223,7 +4253,7 @@ fn derive_through_ring_div_uses_the_quotient_rule() {
     let context = context();
     let src = "
         fn f(w: f32) -> f32 { 1.0 / w }
-        fprime = derive(f);
+        fprime = derive(f, w);
         fn main() -> i32 {
             let w: f32 = 2.0;
             let expected: f32 = -1.0 / (w * w);
@@ -4254,7 +4284,7 @@ fn derive_through_a_named_call_to_a_multi_primitive_stdlib_function() {
             let s = sigmoid(w);
             s * s
         }
-        fprime = derive(loss);
+        fprime = derive(loss, w);
         fn main() -> i32 {
             let w: f32 = 0.5;
             let s: f32 = sigmoid(w);
@@ -4291,7 +4321,8 @@ fn derive_through_two_separate_calls_to_the_same_multi_primitive_function() {
             let s2 = sigmoid(w2);
             s1 * s2
         }
-        fprime = derive(loss);
+        fprime_w1 = derive(loss, w1);
+        fprime_w2 = derive(loss, w2);
         fn main() -> i32 {
             let w1: f32 = 0.5;
             let w2: f32 = 1.5;
@@ -4299,9 +4330,10 @@ fn derive_through_two_separate_calls_to_the_same_multi_primitive_function() {
             let s2: f32 = sigmoid(w2);
             let expected0: f32 = s1 * (1.0 - s1) * s2;
             let expected1: f32 = s1 * s2 * (1.0 - s2);
-            let got = fprime(w1, w2);
-            let diff0: f32 = got.0 - expected0;
-            let diff1: f32 = got.1 - expected1;
+            let got0: f32 = fprime_w1(w1, w2);
+            let got1: f32 = fprime_w2(w1, w2);
+            let diff0: f32 = got0 - expected0;
+            let diff1: f32 = got1 - expected1;
             let abs0: f32 = if diff0 < 0.0 { 0.0 - diff0 } else { diff0 };
             let abs1: f32 = if diff1 < 0.0 { 0.0 - diff1 } else { diff1 };
             if abs0 < 0.0001 and abs1 < 0.0001 { 1 } else { 0 }
@@ -4333,14 +4365,16 @@ fn derive_through_a_tagged_tensor_constructed_from_parameters_and_indexed_back()
             let w = Tensor::<f32,2>(data:[w1, w2]);
             w[0] + w[1] * w[1]
         }
-        fprime = derive(f);
+        fprime_w1 = derive(f, w1);
+        fprime_w2 = derive(f, w2);
         fn main() -> i32 {
             let w1: f32 = 3.0;
             let w2: f32 = 5.0;
             let expected0: f32 = 1.0;
             let expected1: f32 = 2.0 * w2;
-            let got = fprime(w1, w2);
-            if got.0 == expected0 and got.1 == expected1 { 1 } else { 0 }
+            let got0: f32 = fprime_w1(w1, w2);
+            let got1: f32 = fprime_w2(w1, w2);
+            if got0 == expected0 and got1 == expected1 { 1 } else { 0 }
         }
     ";
     assert_eq!(run_i32(&context, src), 1);
@@ -4361,14 +4395,16 @@ fn derive_through_a_plain_struct_constructed_from_parameters_and_read_back() {
             let p = Point(x: x, y: y * y);
             p.x + p.y
         }
-        fprime = derive(f);
+        fprime_x = derive(f, x);
+        fprime_y = derive(f, y);
         fn main() -> i32 {
             let x: f32 = 3.0;
             let y: f32 = 5.0;
             let expected0: f32 = 1.0;
             let expected1: f32 = 2.0 * y;
-            let got = fprime(x, y);
-            if got.0 == expected0 and got.1 == expected1 { 1 } else { 0 }
+            let got0: f32 = fprime_x(x, y);
+            let got1: f32 = fprime_y(x, y);
+            if got0 == expected0 and got1 == expected1 { 1 } else { 0 }
         }
     ";
     assert_eq!(run_i32(&context, src), 1);
@@ -4409,10 +4445,16 @@ fn derive_through_matmul_against_a_constant_identity_matrix_uses_the_product_rul
             let c = matmul(a, b);
             c[0,0] + c[1,1]
         }
-        fprime = derive(f);
+        fprime_a1 = derive(f, a1);
+        fprime_a2 = derive(f, a2);
+        fprime_a3 = derive(f, a3);
+        fprime_a4 = derive(f, a4);
         fn main() -> i32 {
-            let g = fprime(1.0, 2.0, 3.0, 4.0);
-            if g.0 == 1.0 and g.1 == 0.0 and g.2 == 0.0 and g.3 == 1.0 { 1 } else { 0 }
+            let g0: f32 = fprime_a1(1.0, 2.0, 3.0, 4.0);
+            let g1: f32 = fprime_a2(1.0, 2.0, 3.0, 4.0);
+            let g2: f32 = fprime_a3(1.0, 2.0, 3.0, 4.0);
+            let g3: f32 = fprime_a4(1.0, 2.0, 3.0, 4.0);
+            if g0 == 1.0 and g1 == 0.0 and g2 == 0.0 and g3 == 1.0 { 1 } else { 0 }
         }
     ";
     assert_eq!(run_i32_with_optimization_pass(&context, src), 1);
@@ -4434,11 +4476,11 @@ fn derive_of_a_loss_taking_an_ordinary_struct_parameter_computes_the_right_gradi
             let err = pred - y;
             err * err
         }
-        grad = derive(loss);
+        dloss_p = derive(loss, p);
         fn main() -> i32 {
             let p = Weight(w: 2.0);
-            let g = grad(3.0, 1.0, p);
-            if g.2.w == 30.0 { 1 } else { 0 }
+            let g = dloss_p(3.0, 1.0, p);
+            if g.w == 30.0 { 1 } else { 0 }
         }
     ";
     assert_eq!(run_i32(&context, src), 1);
@@ -4472,11 +4514,11 @@ fn derive_of_a_loss_taking_a_struct_parameter_with_a_tensor_field_computes_the_r
             let err = pred - y;
             err * err
         }
-        grad = derive(loss);
+        dloss_p = derive(loss, p);
         fn main() -> i32 {
             let p = Pair(w: Tensor::<f32, 1, 2>(data: [[2.0, 3.0]]));
-            let g = grad(4.0, 5.0, p);
-            if g.2.w[0, 0] == 48.0 and g.2.w[0, 1] == 12.0 { 1 } else { 0 }
+            let g = dloss_p(4.0, 5.0, p);
+            if g.w[0, 0] == 48.0 and g.w[0, 1] == 12.0 { 1 } else { 0 }
         }
     ";
     assert_eq!(run_i32(&context, src), 1);
@@ -4497,11 +4539,11 @@ fn derive_of_a_loss_ignoring_one_tensor_field_element_gives_it_a_clean_zero_grad
         fn loss(x: f32, p: Pair) -> f32 {
             p.w[0, 0] * x
         }
-        grad = derive(loss);
+        dloss_p = derive(loss, p);
         fn main() -> i32 {
             let p = Pair(w: Tensor::<f32, 1, 2>(data: [[2.0, 3.0]]));
-            let g = grad(4.0, p);
-            if g.1.w[0, 0] == 4.0 and g.1.w[0, 1] == 0.0 { 1 } else { 0 }
+            let g = dloss_p(4.0, p);
+            if g.w[0, 0] == 4.0 and g.w[0, 1] == 0.0 { 1 } else { 0 }
         }
     ";
     assert_eq!(run_i32(&context, src), 1);
@@ -5626,7 +5668,7 @@ fn optimizer_momentum_trains_a_real_network_to_convergence_body() {
             let err = pred - y;
             err * err
         }
-        grad = derive(loss);
+        net_grad = derive(loss, net);
         fn main() -> i32 {
             rand_seed(2);
             let mut net: Network = Network(l1: Init::xavier(), l2: Init::xavier());
@@ -5637,8 +5679,8 @@ fn optimizer_momentum_trains_a_real_network_to_convergence_body() {
             let ys: [f32; 4] = [0.0, 1.0, 1.0, 0.0];
             for step in 0..4000 {
                 let i: i32 = step - (step / 4) * 4;
-                let g = grad(x1s[i], x2s[i], ys[i], net);
-                let r = Optimizer::step(opt, net, g.3, state);
+                let g = net_grad(x1s[i], x2s[i], ys[i], net);
+                let r = Optimizer::step(opt, net, g, state);
                 net = r.0;
                 state = r.1;
             };
@@ -6159,7 +6201,7 @@ fn grad_through_dense_forward_at_a_real_batch_computes_the_right_gradient() {
             let err = pred - y;
             sum(err * err)
         }
-        gw = grad(loss);
+        gw = grad(loss, layer);
         fn main() -> i32 {
             let x: Tensor<f32, 2, 2> = Tensor::<f32, 2, 2>(data: [[3.0, 4.0], [5.0, 6.0]]);
             let y: Tensor<f32, 2, 2> = Tensor::<f32, 2, 2>(data: [[0.0, 0.0], [0.0, 0.0]]);
@@ -6176,12 +6218,12 @@ fn grad_through_dense_forward_at_a_real_batch_computes_the_right_gradient() {
             let expected_w11: f32 = 108.0;
             let expected_b0: f32 = 16.4;
             let expected_b1: f32 = 20.8;
-            let diff_w00: f32 = g.2.w[0, 0] - expected_w00;
-            let diff_w01: f32 = g.2.w[0, 1] - expected_w01;
-            let diff_w10: f32 = g.2.w[1, 0] - expected_w10;
-            let diff_w11: f32 = g.2.w[1, 1] - expected_w11;
-            let diff_b0: f32 = g.2.b[0, 0] - expected_b0;
-            let diff_b1: f32 = g.2.b[0, 1] - expected_b1;
+            let diff_w00: f32 = g.w[0, 0] - expected_w00;
+            let diff_w01: f32 = g.w[0, 1] - expected_w01;
+            let diff_w10: f32 = g.w[1, 0] - expected_w10;
+            let diff_w11: f32 = g.w[1, 1] - expected_w11;
+            let diff_b0: f32 = g.b[0, 0] - expected_b0;
+            let diff_b1: f32 = g.b[0, 1] - expected_b1;
             let abs_w00: f32 = if diff_w00 < 0.0 { 0.0 - diff_w00 } else { diff_w00 };
             let abs_w01: f32 = if diff_w01 < 0.0 { 0.0 - diff_w01 } else { diff_w01 };
             let abs_w10: f32 = if diff_w10 < 0.0 { 0.0 - diff_w10 } else { diff_w10 };

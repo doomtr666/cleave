@@ -188,60 +188,54 @@ impl Lowerer {
             body,
             derivative_of: None,
             is_grad: false,
+            grad_target_param: None,
+            grad_target_index: None,
         }
     }
 
-    /// `fprime = derive(f);` (`grammar.pest`'s own `derive_decl`) — lowers
-    /// straight to an ordinary `FnDecl`, deliberately reusing the same
-    /// `ItemKind::Fn` shape every other top-level `fn` uses (see `ast.rs`'s
-    /// own `FnDecl::derivative_of` doc comment for why: every existing pass
-    /// that already handles `ItemKind::Fn` uniformly — registry, print.rs,
-    /// dump.rs, driver.rs's own merge logic — needs no change at all).
-    /// `params`/`ret` are left empty here on purpose: this lowering step has
-    /// no way to know `f`'s own signature (possibly declared in a different
-    /// file entirely) — filled in by a dedicated later pass, once every
-    /// crate's own items are merged (`driver.rs::compile`).
+    /// `fprime = derive(loss, w);` (`grammar.pest`'s own `derive_decl`) —
+    /// lowers straight to an ordinary `FnDecl`, deliberately reusing the
+    /// same `ItemKind::Fn` shape every other top-level `fn` uses (see
+    /// `ast.rs`'s own `FnDecl::derivative_of` doc comment for why: every
+    /// existing pass that already handles `ItemKind::Fn` uniformly —
+    /// registry, print.rs, dump.rs, driver.rs's own merge logic — needs no
+    /// change at all). `params`/`ret` are left empty here on purpose: this
+    /// lowering step has no way to know `loss`'s own signature (possibly
+    /// declared in a different file entirely) — filled in by a dedicated
+    /// later pass, once every crate's own items are merged (`driver.rs::
+    /// compile`). Shared with `lower_grad_decl` just below — grammatically
+    /// identical past the literal keyword (`grammar.pest`'s own
+    /// `derive_decl`/`grad_decl` doc comments), `is_grad` the one
+    /// parameter distinguishing them.
+    fn lower_derivative_decl(&mut self, pair: Pair<Rule>, is_grad: bool) -> FnDecl {
+        let mut inner = pair.into_inner();
+        let name = inner.next().unwrap().as_str().to_string();
+        let of = inner.next().unwrap().as_str().to_string();
+        let grad_target_param = inner.next().map(|p| p.as_str().to_string());
+        FnDecl {
+            name,
+            attrs: Vec::new(),
+            is_extern: false,
+            extern_symbol: None,
+            is_export: false,
+            export_symbol: None,
+            generics: Vec::new(),
+            params: Vec::new(),
+            ret: None,
+            body: None,
+            derivative_of: Some(of),
+            is_grad,
+            grad_target_param,
+            grad_target_index: None,
+        }
+    }
+
     fn lower_derive_decl(&mut self, pair: Pair<Rule>) -> FnDecl {
-        let mut inner = pair.into_inner();
-        let name = inner.next().unwrap().as_str().to_string();
-        let of = inner.next().unwrap().as_str().to_string();
-        FnDecl {
-            name,
-            attrs: Vec::new(),
-            is_extern: false,
-            extern_symbol: None,
-            is_export: false,
-            export_symbol: None,
-            generics: Vec::new(),
-            params: Vec::new(),
-            ret: None,
-            body: None,
-            derivative_of: Some(of),
-            is_grad: false,
-        }
+        self.lower_derivative_decl(pair, false)
     }
 
-    /// `gw = grad(loss);` (`grammar.pest`'s own `grad_decl`) — mechanical
-    /// mirror of `lower_derive_decl` just above, `is_grad: true` the one
-    /// real difference (`ast.rs`'s own `FnDecl::is_grad` doc comment).
     fn lower_grad_decl(&mut self, pair: Pair<Rule>) -> FnDecl {
-        let mut inner = pair.into_inner();
-        let name = inner.next().unwrap().as_str().to_string();
-        let of = inner.next().unwrap().as_str().to_string();
-        FnDecl {
-            name,
-            attrs: Vec::new(),
-            is_extern: false,
-            extern_symbol: None,
-            is_export: false,
-            export_symbol: None,
-            generics: Vec::new(),
-            params: Vec::new(),
-            ret: None,
-            body: None,
-            derivative_of: Some(of),
-            is_grad: true,
-        }
+        self.lower_derivative_decl(pair, true)
     }
 
     fn lower_attribute(&mut self, pair: Pair<Rule>) -> Attribute {

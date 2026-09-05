@@ -133,7 +133,15 @@ pub enum UnitBody {
     /// synthesize_derivatives`, which needs `f`'s own body *already* CPS-
     /// converted first, hence strictly after `convert_program` returns, not
     /// during it).
-    Derivative(String, bool),
+    /// Third field: `ast.rs`'s own `FnDecl::grad_target_index` (the
+    /// resolved *position*, not `grad_target_param`'s own name — CPS
+    /// conversion has already renamed every parameter to an anonymous
+    /// `CVar` by the time anything downstream reads this, so only the
+    /// index, not the name, is still resolvable). `Some` only for a real
+    /// `gw = grad(f, param);` request, carried through so `egraph.rs::
+    /// synthesize_one_gradient` can restrict extraction to that one
+    /// parameter's own gradient instead of every one of `f`'s.
+    Derivative(String, bool, Option<usize>),
 }
 
 pub struct ConcreteUnit {
@@ -367,7 +375,11 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                             f.extern_symbol.clone().unwrap_or_else(|| f.name.clone()),
                         ),
                         None if f.derivative_of.is_some() => {
-                            UnitBody::Derivative(f.derivative_of.clone().unwrap(), f.is_grad)
+                            UnitBody::Derivative(
+                                f.derivative_of.clone().unwrap(),
+                                f.is_grad,
+                                f.grad_target_index,
+                            )
                         }
                         None => continue,
                     };
@@ -3446,7 +3458,7 @@ fn emit_call(
         // just isn't attached yet at this point in the pipeline (`UnitBody`'s
         // own doc comment) — nothing here needs to look at that body,
         // only at `unit_name` itself (resolved later, by name).
-        UnitBody::Real(_) | UnitBody::Derivative(_, _) => {
+        UnitBody::Real(_) | UnitBody::Derivative(_, _, _) => {
             let result_var = ctx.fresh.var();
             let k_label = ctx.fresh.label("k");
             let mut call_args = arg_vals;

@@ -30,10 +30,18 @@ fn loss(w: f32, b: f32) -> f32 {
 }
 // `derive()`, not `grad()` -- `grad()` (reverse-mode, `doc/backlog-done.md`)
 // would work fine too (`loss` returns a scalar `f32`), but this example
-// predates it; `dloss`, not `grad`, so the binding's own name doesn't
-// collide with the real `grad()` keyword that exists now (`examples/
-// derivative_demo.cleave`'s own identical fix, same reasoning).
-dloss = derive(loss);
+// predates it.
+//
+// Two separate declarations, one per parameter, not one call returning
+// both -- `grammar.pest`'s own `derive_decl` doc comment has the full
+// story of why the whole-Jacobian tuple form was removed, not merely
+// deprecated. Genuinely needing *both* `w`'s and `b`'s own gradient here
+// (unlike `examples/mnist-interop`'s own real training loop, which only
+// ever wanted one of three) costs exactly the same either way -- two
+// independent, single-target calls, neither computing the other's own
+// share of the work.
+dloss_w = derive(loss, w);
+dloss_b = derive(loss, b);
 
 fn main() -> i32 {
     let mut w: f32 = 0.0;
@@ -43,9 +51,10 @@ fn main() -> i32 {
     print("start learning...");
 
     for step in 0..10 {
-        let g: (f32, f32) = dloss(w, b);
-        w = w - lr * g.0;
-        b = b - lr * g.1;
+        let gw: f32 = dloss_w(w, b);
+        let gb: f32 = dloss_b(w, b);
+        w = w - lr * gw;
+        b = b - lr * gb;
     };
 
     print("done !");

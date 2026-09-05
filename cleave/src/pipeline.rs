@@ -124,10 +124,11 @@ pub fn build_cps_program(
     let requests: Vec<DerivativeRequest> = units
         .iter()
         .filter_map(|u| match &u.body {
-            UnitBody::Derivative(of, is_grad) => Some(DerivativeRequest {
+            UnitBody::Derivative(of, is_grad, grad_target_index) => Some(DerivativeRequest {
                 name: u.name.clone(),
                 of: of.clone(),
                 is_grad: *is_grad,
+                grad_target_index: *grad_target_index,
             }),
             _ => None,
         })

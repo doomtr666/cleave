@@ -171,7 +171,17 @@ fn loss(x: Tensor<f32, 32, 784>, y: Tensor<f32, 32, 10>, net: Network) -> f32 {
 // the real point of this whole mechanism, now exercised at real MNIST scale
 // (four genuinely non-square layers) instead of just the two `digits-
 // interop` already proved out.
-net_grad = grad(loss);
+//
+// `grad(loss, net)`, not the bare `grad(loss)` this file used to write --
+// naming the one real target parameter (`grammar.pest`'s own `derive_decl`
+// doc comment has the full story): `net_grad`'s own result is `net`'s
+// gradient directly, never a `(dx, dy, dnet)` tuple. Found, precisely,
+// costing this training loop a real, measured `~31%` more FLOPs than the
+// backward pass strictly needs, every single batch (`doc/backlog.md`'s own
+// profiling entries) -- the discarded `dx` (gradient w.r.t. the training
+// batch itself, never used by anything) was a whole extra `32x512 @
+// 512x784` matmul, computed for nothing, `18,750` times over a full run.
+net_grad = grad(loss, net);
 
 fn argmax10(pred: Tensor<f32, 1, 10>) -> i32 {
     let mut best: i32 = 0;
@@ -227,7 +237,7 @@ export fn train_and_evaluate(epochs: i32, lr: f32, seed: i64) -> f32 {
             let x: Tensor<f32, 32, 784> = load_train_batch_input(batch_start);
             let y: Tensor<f32, 32, 10> = load_train_batch_target(batch_start);
             let g = net_grad(x, y, net);
-            let r = Optimizer::step(opt, net, g.2, state);
+            let r = Optimizer::step(opt, net, g, state);
             net = r.0;
             state = r.1;
         };

@@ -3196,41 +3196,58 @@ pub fn optimize_program(
 
 // ---------------------------------------------------------------- derivative synthesis (Stage 7)
 
-/// `fprime = derive(f);` (`ast.rs`'s own `FnDecl::derivative_of`) — one
-/// entry per such declaration, built by the caller from `collect_units`'s
-/// own `Vec<ConcreteUnit>` (`u.body`'s own `UnitBody::Derivative(of)`)
-/// *before* `convert_program` consumes it — see `main.rs`'s own call site.
+/// `fprime = derive(f, param);` (`ast.rs`'s own `FnDecl::derivative_of`) —
+/// one entry per such declaration, built by the caller from
+/// `collect_units`'s own `Vec<ConcreteUnit>` (`u.body`'s own
+/// `UnitBody::Derivative(of, is_grad, grad_target_index)`) *before*
+/// `convert_program` consumes it — see `main.rs`'s own call site.
 pub struct DerivativeRequest {
     pub name: String,
     pub of: String,
-    /// `true` for `gw = grad(f);`, `false` for `fprime = derive(f);` —
-    /// `cps.rs`'s own `UnitBody::Derivative`'s own doc comment. Currently
-    /// read nowhere yet (`synthesize_derivatives` below is still forward-
-    /// mode-only, `doc/backlog.md`'s own "reverse-mode differentiation"
-    /// item) — carried through the request itself so a future reverse-mode
-    /// dispatch point has it on hand without needing to re-derive it from
-    /// `program`.
+    /// `true` for `gw = grad(f, param);` (reverse-mode, dispatched to
+    /// `synthesize_one_gradient` below), `false` for `fprime = derive(f,
+    /// param);` (forward-mode, `synthesize_derivatives`) — `cps.rs`'s own
+    /// `UnitBody::Derivative`'s own doc comment.
     pub is_grad: bool,
+    /// `gw = grad(f, param);` (`cps.rs`'s own `UnitBody::Derivative`'s third
+    /// field, `ast.rs`'s own `FnDecl::grad_target_index`) — `param`'s own
+    /// position in `f`'s parameter list, restricting extraction to *only*
+    /// that one parameter's own gradient (returned directly, no tuple)
+    /// instead of every one of `f`'s parameters. Always `Some` in practice:
+    /// `grammar.pest`'s own `derive_decl`/`grad_decl` make naming a target
+    /// parameter mandatory (see that file's own doc comment for why the
+    /// whole-Jacobian tuple form was removed, not merely deprecated) —
+    /// `Option` only because `driver.rs`'s own signature-synthesis pass
+    /// resolves the name to an index and a resolution failure is a located
+    /// error there, not representable as `None` here.
+    pub grad_target_index: Option<usize>,
 }
 
 /// The real body-synthesis half of `doc/backlog.md`'s own auto-diff item —
 /// runs once, right after `convert_program` (so every ordinary unit,
 /// `f` included, already has its own real, CPS-converted body to build
 /// from) and before the first `eliminate_dead_code` (so a synthesized
-/// `fprime`'s own real calls are already visible to it). For each request:
-/// walks `f`'s own already-converted body into a fresh e-graph exactly the
-/// way `optimize_program` already does for an ordinary straight-line
-/// segment, adds one `Op("derivative", [root, param])` node per one of
-/// `f`'s own real parameters (skipped — a literal zero built directly,
-/// no e-graph node needed — for a parameter `f`'s own body never actually
-/// references), saturates with `axiom_rewrites`/`struct_projection_
-/// rewrites`/`derivative_rewrites` together (the *same* saturation pass a
-/// real algebraic identity and a derivative rule can both fire within —
-/// this is the actual point of building `derivative` as ordinary e-graph
-/// rewriting rather than a separate engine), extracts each with
-/// `DerivativeFreeCost`, and rebuilds — `N == 1` becomes `fprime`'s whole
-/// body directly, `N > 1` wraps all `N` into one `[T; N]` array (`PrimOp::
-/// Array`, the same construction `[a,b,c]` already lowers to).
+/// `fprime`'s own real calls are already visible to it). Dispatches
+/// `is_grad` requests entirely to `synthesize_one_gradient` (reverse-mode)
+/// below; the rest of this function is `derive()`'s own forward-mode path.
+/// For each forward-mode request: walks `f`'s own already-converted body
+/// into a fresh e-graph exactly the way `optimize_program` already does for
+/// an ordinary straight-line segment, adds a single `Op("derivative",
+/// [root, param])` node for `grad_target_index`'s own one target parameter
+/// only (`req.grad_target_index` is resolved and filtered down to this one
+/// parameter *before* this point, well before saturation — the whole reason
+/// naming a target parameter is mandatory: saturation cost scales with how
+/// many differentiation targets are injected together, so a real multi-
+/// parameter Jacobian is one separate `derive()` declaration per parameter,
+/// never one shared saturation pass computing every parameter's own share
+/// whether the caller reads it or not), saturates with `axiom_rewrites`/
+/// `struct_projection_rewrites`/`derivative_rewrites` together (the *same*
+/// saturation pass a real algebraic identity and a derivative rule can both
+/// fire within — this is the actual point of building `derivative` as
+/// ordinary e-graph rewriting rather than a separate engine), extracts with
+/// `DerivativeFreeCost`, and rebuilds directly into `fprime`'s own single-
+/// value body — no tuple, no array, `grammar.pest`'s own `derive_decl` doc
+/// comment has the full "why" the old whole-Jacobian array form is gone.
 ///
 /// A request whose own `of` never became a real unit is silently skipped —
 /// `driver.rs`'s own signature-synthesis pass already rejects that case
@@ -3353,6 +3370,31 @@ pub fn synthesize_derivatives(
         let k_ret = fresh.var();
         new_params.push(k_ret);
 
+        // `fprime = derive(f, param);` (`ast.rs`'s own `FnDecl::grad_target_
+        // index` doc comment, shared with `grad`'s own reverse-mode path,
+        // `synthesize_one_gradient`'s own identical-in-spirit doc comment)
+        // -- restricts which parameter's own `ParamShape` gets built,
+        // wrapped, and injected into the saturation below to just this one,
+        // *before* any of that runs. Load-bearing for forward-mode
+        // specifically, more so than for `grad`'s own independent-per-leaf
+        // extraction: `derive()`'s own real, already-documented cost
+        // (`grammar.pest`'s own `derive_decl` doc comment) scales with *how
+        // many* `derivative(root, leaf)` markers exist going into the
+        // shared saturation (`derivative_rules`/`pass_a_rules` below), not
+        // just with how many results get extracted afterward -- filtering
+        // `param_shapes` down to one entry *after* the fact (mirroring
+        // `synthesize_one_gradient`'s own simpler fix) would still pay the
+        // wrong, larger cost for every parameter not asked for. `req.
+        // grad_target_index` is always `Some` by this point (the grammar
+        // requires a target for `derive` exactly like it does for `grad`)
+        // and was already checked, by `driver.rs`'s own real, located-error
+        // validation, against `f`'s real parameter count.
+        let target_index = req.grad_target_index.expect(
+            "grammar guarantees a derive/grad target index -- driver.rs::synthesize_derive_signatures",
+        );
+        let target_params = [f_params[target_index]];
+        let target_param_types = [of_unit.param_types[target_index].clone()];
+
         // One `ParamShape` per `f`'s own parameter, in declared order —
         // `None` for a parameter `f`'s own body never actually references
         // anywhere (no `Free` node was ever minted for it). A parameter is
@@ -3373,9 +3415,9 @@ pub fn synthesize_derivatives(
         // one of, per parameter, before struct-parameter support existed.
         let mut shape_referenced: HashSet<String> = HashSet::new();
         let mut shape_error: Option<String> = None;
-        let param_shapes: Vec<Option<ParamShape>> = f_params
+        let param_shapes: Vec<Option<ParamShape>> = target_params
             .iter()
-            .zip(of_unit.param_types.iter())
+            .zip(target_param_types.iter())
             .map(|(p, ty)| {
                 if shape_error.is_some() {
                     return None;
@@ -3576,10 +3618,10 @@ pub fn synthesize_derivatives(
             continue;
         }
 
-        let value_types = of_unit.param_types.clone();
+        let value_types = target_param_types.to_vec();
         let body = build_param_derivatives_from_shapes(
             &param_shapes,
-            &of_unit.param_types,
+            &target_param_types,
             &runner.egraph,
             &extractor,
             &fresh,
@@ -3588,17 +3630,12 @@ pub fn synthesize_derivatives(
             &|values| finish_derivative_body(values, &value_types, k_ret, &fresh),
         );
 
-        let n = f_params.len();
-        // Mirrors `driver.rs::synthesize_derive_signatures`'s own
-        // synthesized return type exactly -- one tuple field per
-        // parameter, that parameter's own type (not `of_unit.result`,
-        // `f`'s own return type, which plays no role here -- see that
-        // function's own doc comment).
-        let result = if n == 1 {
-            of_unit.param_types[0].clone()
-        } else {
-            Ty::App(tuple_struct_name(n), of_unit.param_types.clone())
-        };
+        // Always the one requested parameter's own type directly, never a
+        // tuple (`grammar.pest`'s own `derive_decl` doc comment: the
+        // whole-Jacobian form was removed, not merely deprecated) --
+        // mirrors `driver.rs::synthesize_derive_signatures`'s own
+        // synthesized return type exactly.
+        let result = target_param_types[0].clone();
 
         new_funcs.push(CTopLevelFn {
             def: CFunDef {
@@ -3660,7 +3697,7 @@ fn is_grad_supported_ty(ty: &Ty, struct_schemas: &HashMap<String, StructSchema>)
         .all(|(_, field_ty)| is_grad_supported_ty(field_ty, struct_schemas))
 }
 
-/// `gw = grad(f);` (`req.is_grad`) — Phase 3's own real reverse-mode
+/// `gw = grad(f, param);` (`req.is_grad`) — Phase 3's own real reverse-mode
 /// backend, generalizing the Phase 0 spike (`mod tests::spike_backward_
 /// walk`) from two hardcoded Rust match arms into real, `stdlib`-declared
 /// `adjoint` rules (`Registry::adjoint_rules`), instantiated directly into
@@ -3788,6 +3825,33 @@ fn synthesize_one_gradient(
         })
         .collect();
 
+    // `gw = grad(f, param);` (`ast.rs`'s own `FnDecl::grad_target_index`
+    // doc comment) -- restricts *everything* downstream (extraction, the
+    // synthesized function's own return type) to this one parameter's own
+    // entry, before `build_param_derivatives_from_shapes` ever runs. This
+    // is the real fix, not a dead-code pass bolted on after the fact: the
+    // other parameters' own `ParamShape`s, however real and however much
+    // real compute their own adjoint chains would need (a whole discarded
+    // matmul, say), are simply never handed to the extractor at all --
+    // `reassemble_shape` (inside `build_param_derivatives_from_shapes`)
+    // only ever runs for a shape actually present in the slice it's given,
+    // so an omitted one costs nothing, not even the ops that would have
+    // computed it. `req.grad_target_index` is always `Some` by this point
+    // (the grammar itself requires a target parameter, `grammar.pest`'s own
+    // `derive_decl` doc comment has the full "whole-Jacobian tuple form
+    // removed, not merely deprecated" story) and was already checked, by
+    // `driver.rs`'s own real, located-error validation, against `f`'s real
+    // parameter count before this code ever runs -- an out-of-range index
+    // here would be this function's own bug, not a user-facing case, hence
+    // the plain slice index rather than another `Diagnostic`.
+    let idx = req
+        .grad_target_index
+        .expect("grammar guarantees a grad target index -- driver.rs::synthesize_derive_signatures");
+    let (param_shapes, target_param_types): (Vec<Option<ParamShape>>, Vec<Ty>) = (
+        vec![param_shapes.into_iter().nth(idx).unwrap()],
+        vec![of_unit.param_types[idx].clone()],
+    );
+
     let mut call_units = fwd.call_units.clone();
     call_units.extend(referenced.into_iter().filter(|name| units.contains_key(name.as_str())));
 
@@ -3815,10 +3879,10 @@ fn synthesize_one_gradient(
     };
     let extractor = Extractor::new(&egraph, DerivativeFreeCost);
 
-    let value_types = of_unit.param_types.clone();
+    let value_types = target_param_types.clone();
     let body = build_param_derivatives_from_shapes(
         &param_shapes,
-        &of_unit.param_types,
+        &target_param_types,
         &egraph,
         &extractor,
         fresh,
@@ -3827,12 +3891,15 @@ fn synthesize_one_gradient(
         &|values| finish_derivative_body(values, &value_types, k_ret, fresh),
     );
 
-    let n = f_params.len();
-    let result = if n == 1 {
-        of_unit.param_types[0].clone()
-    } else {
-        Ty::App(tuple_struct_name(n), of_unit.param_types.clone())
-    };
+    // Always the one requested parameter's own type directly, never a
+    // tuple (`grammar.pest`'s own `derive_decl`/`grad_decl` doc comment: the
+    // whole-Jacobian form was removed, not merely deprecated) -- mirrors
+    // `synthesize_derivatives`'s own analogous result above and
+    // `driver.rs::synthesize_derive_signatures`'s own synthesized return
+    // type exactly. `target_param_types` is forced to exactly one element
+    // above (the `grad_target_index` filter), so there's no `n > 1` case
+    // left to branch on here.
+    let result = target_param_types[0].clone();
 
     Ok(CTopLevelFn {
         def: CFunDef {
@@ -7019,7 +7086,7 @@ mod tests {
             algebra Foo<T> { fn bar(x: T) -> T; }
             impl Foo<f32> { fn bar(x) { x } }
             fn f(x: f32) -> f32 { bar(x) }
-            fprime = derive(f);
+            fprime = derive(f, x);
         ";
         let (result, _sources) =
             crate::driver::compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
@@ -7029,11 +7096,14 @@ mod tests {
         let requests: Vec<DerivativeRequest> = units
             .iter()
             .filter_map(|u| match &u.body {
-                crate::cps::UnitBody::Derivative(of, is_grad) => Some(DerivativeRequest {
-                    name: u.name.clone(),
-                    of: of.clone(),
-                    is_grad: *is_grad,
-                }),
+                crate::cps::UnitBody::Derivative(of, is_grad, grad_target_index) => {
+                    Some(DerivativeRequest {
+                        name: u.name.clone(),
+                        of: of.clone(),
+                        is_grad: *is_grad,
+                        grad_target_index: *grad_target_index,
+                    })
+                }
                 _ => None,
             })
             .collect();
@@ -7071,7 +7141,7 @@ mod tests {
                 };
                 total
             }
-            fprime = derive(f);
+            fprime = derive(f, x);
         ";
         let (result, _sources) =
             crate::driver::compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
@@ -7081,11 +7151,14 @@ mod tests {
         let requests: Vec<DerivativeRequest> = units
             .iter()
             .filter_map(|u| match &u.body {
-                crate::cps::UnitBody::Derivative(of, is_grad) => Some(DerivativeRequest {
-                    name: u.name.clone(),
-                    of: of.clone(),
-                    is_grad: *is_grad,
-                }),
+                crate::cps::UnitBody::Derivative(of, is_grad, grad_target_index) => {
+                    Some(DerivativeRequest {
+                        name: u.name.clone(),
+                        of: of.clone(),
+                        is_grad: *is_grad,
+                        grad_target_index: *grad_target_index,
+                    })
+                }
                 _ => None,
             })
             .collect();

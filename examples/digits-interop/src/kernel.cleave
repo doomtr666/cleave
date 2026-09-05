@@ -94,7 +94,15 @@ fn loss(x: Tensor<f32, 1, 64>, y: Tensor<f32, 1, 10>, net: Network) -> f32 {
 // `64x32` or `l2`'s own `32x10` (both genuinely non-square -- the real
 // case `egraph.rs::build_pattern`'s own `resolve_multi_target_call_ty` fix
 // was built for).
-net_grad = grad(loss);
+//
+// `grad(loss, net)`, not the bare `grad(loss)` this file used to write --
+// naming the one real target parameter (`grammar.pest`'s own `derive_decl`
+// doc comment has the full story): `net_grad`'s own result is `net`'s
+// gradient directly, never a `(dx, dy, dnet)` tuple -- the discarded `dx`/
+// `dy` were real, wasted compute (`doc/backlog.md`'s own profiling entries
+// have the fuller, `examples/mnist-interop`-scale story of exactly how
+// much).
+net_grad = grad(loss, net);
 
 fn argmax10(pred: Tensor<f32, 1, 10>) -> i32 {
     let mut best: i32 = 0;
@@ -133,7 +141,7 @@ export fn train_and_evaluate(epochs: i32, lr: f32, seed: i64) -> f32 {
             let x = load_train_input(s);
             let y = load_train_target(s);
             let g = net_grad(x, y, net);
-            let r = Optimizer::step(opt, net, g.2, state);
+            let r = Optimizer::step(opt, net, g, state);
             net = r.0;
             state = r.1;
         };

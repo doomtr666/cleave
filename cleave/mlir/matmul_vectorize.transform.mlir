@@ -115,7 +115,32 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
       %tiled_mm, %loops2 = transform.structured.tile_using_for %inner1 tile_sizes [0, 0, 16]
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+      // See `@tile_and_vectorize`'s own doc comment for the full story --
+      // same retry-on-the-still-valid-ancestor-handle shape, needed here
+      // too: this stage handles `l4`'s own *forward* matmul in the
+      // training-loop context specifically (its output feeds `pred - y`, a
+      // real `linalg.generic` consumer, routing it through this stage
+      // rather than Stage 2), so it hits the exact same non-divisible
+      // `128 -> 10` shape, at the exact same real frequency (once per
+      // training batch, `18,750` times over a full run) that Stage 2 alone
+      // doesn't cover.
       transform.structured.vectorize %tiled_mm {create_named_contraction} : !transform.any_op
+      %still_mm_1 = transform.structured.match ops{["linalg.matmul"]} in %loops2 : (!transform.any_op) -> !transform.any_op
+      transform.sequence %still_mm_1 : !transform.any_op failures(suppress) {
+      ^bb0(%sm: !transform.any_op):
+        %padded, %pad, %copy = transform.structured.pad %sm
+          pad_to_multiple_of [1, 16, 16]
+          { padding_values = [0.0 : f32, 0.0 : f32, 0.0 : f32],
+            padding_dimensions = [0, 1, 2],
+            copy_back_op = "linalg.copy" }
+          : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+        %pinner1, %ploops1 = transform.structured.tile_using_for %padded tile_sizes [0, 16, 0]
+          : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+        %ptiled, %ploops2 = transform.structured.tile_using_for %pinner1 tile_sizes [0, 0, 16]
+          : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+        transform.structured.vectorize %ptiled {create_named_contraction} : !transform.any_op
+        transform.yield
+      }
       transform.yield
     }
     transform.yield
@@ -128,6 +153,27 @@ module attributes {transform.with_named_sequence} {
   // fusion work, see `@__transform_main`'s own comment for why a failure
   // here (a shape not evenly divisible by the tile sizes below) must not
   // abort the whole pipeline either.
+  // `structured.pad` retry, scoped to *only* whatever this stage's own
+  // direct `vectorize` below couldn't handle (a real, non-divisible shape
+  // -- this project's own `128 -> 10` output layer) -- see `@__transform_
+  // main`'s own comment on the equivalent retry inside Stage 0 for the
+  // full story of why this must be a *retry on the same already-tiled
+  // handle*, not a fresh third `foreach_match` stage: a leftover,
+  // still-unvectorized `linalg.matmul` at this point is nested inside the
+  // `scf.forall`/`scf.for`/`scf.for` this stage's own tiling just built, so
+  // its parent is `scf.for`, not `func.func`/`scf.while` -- `@match_matmul`
+  // itself would never find it again from the top. Padding *every* matmul
+  // unconditionally (the first, broader attempt at this fix) is a real,
+  // confirmed dead end in its own right: it perturbs even the *already*-
+  // divisible ones (`784 -> 512`, `l1`'s own forward matmul) enough that
+  // `vectorize` silently takes the slow, generic `--convert-vector-to-scf`
+  // masked-transfer path instead of outerproduct, allocating a real scratch
+  // buffer once per K-iteration (784 times, for that layer) *inside* the
+  // single `stacksave`/`stackrestore` pair `--convert-scf-to-openmp` wraps
+  // around the whole per-thread loop body -- a real, measured, reproduced
+  // stack overflow crashing partway through `evaluate()`. Scoping the pad
+  // to only the genuine leftover keeps every already-correct matmul's own
+  // outerproduct lowering completely undisturbed.
   transform.named_sequence @tile_and_vectorize(%m: !transform.any_op {transform.consumed}) {
     %inner0, %forall = transform.structured.tile_using_forall %m tile_sizes [1, 0, 0]
       : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
@@ -135,7 +181,29 @@ module attributes {transform.with_named_sequence} {
       : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     %tiled, %loops2 = transform.structured.tile_using_for %inner1 tile_sizes [0, 0, 16]
       : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    // `vectorize` consumes `%tiled` (invalidates it) whether it succeeds or
+    // fails -- confirmed directly, on an isolated probe, re-matching
+    // through the still-valid *ancestor* handle (`%loops2`, untouched by
+    // that consumption) instead, exactly the same "re-match from an outer
+    // handle, not the consumed one" shape `structured.pad`'s own three-
+    // result signature already forces everywhere else in this file.
     transform.structured.vectorize %tiled {create_named_contraction} : !transform.any_op
+    %still_mm = transform.structured.match ops{["linalg.matmul"]} in %loops2 : (!transform.any_op) -> !transform.any_op
+    transform.sequence %still_mm : !transform.any_op failures(suppress) {
+    ^bb0(%sm: !transform.any_op):
+      %padded, %pad, %copy = transform.structured.pad %sm
+        pad_to_multiple_of [1, 16, 16]
+        { padding_values = [0.0 : f32, 0.0 : f32, 0.0 : f32],
+          padding_dimensions = [0, 1, 2],
+          copy_back_op = "linalg.copy" }
+        : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+      %pinner1, %ploops1 = transform.structured.tile_using_for %padded tile_sizes [0, 16, 0]
+        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+      %ptiled, %ploops2 = transform.structured.tile_using_for %pinner1 tile_sizes [0, 0, 16]
+        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+      transform.structured.vectorize %ptiled {create_named_contraction} : !transform.any_op
+      transform.yield
+    }
     transform.yield
   }
 
@@ -265,6 +333,11 @@ module attributes {transform.with_named_sequence} {
       // Matmuls one at a time -- see this sequence's own doc comment,
       // point 2, for why batching them together silently vectorized none
       // of them instead of three of four.
+      // See `@tile_and_vectorize`'s own doc comment for the full retry
+      // shape -- needed here too: `%f6` (`dh3`, `l4->l3`'s own backward
+      // gradient) has a real, non-divisible `K=10` (the same shape this
+      // project's own `128 -> 10` output layer needs to tolerate
+      // elsewhere).
       transform.sequence %tiled0 : !transform.any_op failures(suppress) {
       ^bb0(%mm: !transform.any_op):
         %inner1, %k1 = transform.structured.tile_using_for %mm tile_sizes [0, 16, 0]
@@ -272,6 +345,22 @@ module attributes {transform.with_named_sequence} {
         %inner2, %k2 = transform.structured.tile_using_for %inner1 tile_sizes [0, 0, 16]
           : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
         transform.structured.vectorize %inner2 {create_named_contraction} : !transform.any_op
+        %still_mm = transform.structured.match ops{["linalg.matmul"]} in %k2 : (!transform.any_op) -> !transform.any_op
+        transform.sequence %still_mm : !transform.any_op failures(suppress) {
+        ^bb0(%sm: !transform.any_op):
+          %padded, %pad, %copy = transform.structured.pad %sm
+            pad_to_multiple_of [1, 16, 16]
+            { padding_values = [0.0 : f32, 0.0 : f32, 0.0 : f32],
+              padding_dimensions = [0, 1, 2],
+              copy_back_op = "linalg.copy" }
+            : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+          %pinner1, %ploops1 = transform.structured.tile_using_for %padded tile_sizes [0, 16, 0]
+            : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+          %ptiled, %ploops2 = transform.structured.tile_using_for %pinner1 tile_sizes [0, 0, 16]
+            : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+          transform.structured.vectorize %ptiled {create_named_contraction} : !transform.any_op
+          transform.yield
+        }
         transform.yield
       }
       transform.sequence %f2 : !transform.any_op failures(suppress) {
@@ -281,6 +370,22 @@ module attributes {transform.with_named_sequence} {
         %inner2, %k2 = transform.structured.tile_using_for %inner1 tile_sizes [0, 0, 16]
           : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
         transform.structured.vectorize %inner2 {create_named_contraction} : !transform.any_op
+        %still_mm = transform.structured.match ops{["linalg.matmul"]} in %k2 : (!transform.any_op) -> !transform.any_op
+        transform.sequence %still_mm : !transform.any_op failures(suppress) {
+        ^bb0(%sm: !transform.any_op):
+          %padded, %pad, %copy = transform.structured.pad %sm
+            pad_to_multiple_of [1, 16, 16]
+            { padding_values = [0.0 : f32, 0.0 : f32, 0.0 : f32],
+              padding_dimensions = [0, 1, 2],
+              copy_back_op = "linalg.copy" }
+            : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+          %pinner1, %ploops1 = transform.structured.tile_using_for %padded tile_sizes [0, 16, 0]
+            : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+          %ptiled, %ploops2 = transform.structured.tile_using_for %pinner1 tile_sizes [0, 0, 16]
+            : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+          transform.structured.vectorize %ptiled {create_named_contraction} : !transform.any_op
+          transform.yield
+        }
         transform.yield
       }
       transform.sequence %f4 : !transform.any_op failures(suppress) {
@@ -290,6 +395,22 @@ module attributes {transform.with_named_sequence} {
         %inner2, %k2 = transform.structured.tile_using_for %inner1 tile_sizes [0, 0, 16]
           : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
         transform.structured.vectorize %inner2 {create_named_contraction} : !transform.any_op
+        %still_mm = transform.structured.match ops{["linalg.matmul"]} in %k2 : (!transform.any_op) -> !transform.any_op
+        transform.sequence %still_mm : !transform.any_op failures(suppress) {
+        ^bb0(%sm: !transform.any_op):
+          %padded, %pad, %copy = transform.structured.pad %sm
+            pad_to_multiple_of [1, 16, 16]
+            { padding_values = [0.0 : f32, 0.0 : f32, 0.0 : f32],
+              padding_dimensions = [0, 1, 2],
+              copy_back_op = "linalg.copy" }
+            : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+          %pinner1, %ploops1 = transform.structured.tile_using_for %padded tile_sizes [0, 16, 0]
+            : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+          %ptiled, %ploops2 = transform.structured.tile_using_for %pinner1 tile_sizes [0, 0, 16]
+            : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+          transform.structured.vectorize %ptiled {create_named_contraction} : !transform.any_op
+          transform.yield
+        }
         transform.yield
       }
       transform.sequence %f6 : !transform.any_op failures(suppress) {
@@ -299,6 +420,22 @@ module attributes {transform.with_named_sequence} {
         %inner2, %k2 = transform.structured.tile_using_for %inner1 tile_sizes [0, 0, 16]
           : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
         transform.structured.vectorize %inner2 {create_named_contraction} : !transform.any_op
+        %still_mm = transform.structured.match ops{["linalg.matmul"]} in %k2 : (!transform.any_op) -> !transform.any_op
+        transform.sequence %still_mm : !transform.any_op failures(suppress) {
+        ^bb0(%sm: !transform.any_op):
+          %padded, %pad, %copy = transform.structured.pad %sm
+            pad_to_multiple_of [1, 16, 16]
+            { padding_values = [0.0 : f32, 0.0 : f32, 0.0 : f32],
+              padding_dimensions = [0, 1, 2],
+              copy_back_op = "linalg.copy" }
+            : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+          %pinner1, %ploops1 = transform.structured.tile_using_for %padded tile_sizes [0, 16, 0]
+            : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+          %ptiled, %ploops2 = transform.structured.tile_using_for %pinner1 tile_sizes [0, 0, 16]
+            : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+          transform.structured.vectorize %ptiled {create_named_contraction} : !transform.any_op
+          transform.yield
+        }
         transform.yield
       }
       transform.yield

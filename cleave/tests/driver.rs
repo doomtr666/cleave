@@ -397,18 +397,24 @@ fn duplicate_inherent_method_across_files_is_a_conflict() {
 
 // ---------------------------------------------------------------- derive (auto-diff)
 //
-// `fprime = derive(f);` synthesizes `fprime`'s own signature from `f`'s --
-// `compile()`'s own `synthesize_derive_signatures` pass, run once every
+// `fprime = derive(f, x);` synthesizes `fprime`'s own signature from `f`'s
+// -- `compile()`'s own `synthesize_derive_signatures` pass, run once every
 // crate's own items are merged. Exercised through the real `compile()`
 // entry point (not `merge_programs` alone), since that's where the pass
-// actually runs.
+// actually runs. The second `ident` (`x`) names exactly one of `f`'s own
+// parameters -- `fprime`'s own result is always *that* parameter's own
+// type directly, never a tuple (`grammar.pest`'s own `derive_decl` doc
+// comment: a whole-Jacobian, every-parameter-at-once form used to exist
+// here too, removed, deliberately, not merely deprecated, after being
+// found to cost a real, measured `~31%` more FLOPs than necessary in a
+// real training loop -- `doc/backlog.md`'s own profiling entries).
 
 #[test]
 fn a_single_param_derive_synthesizes_a_scalar_signature() {
     let (result, _sources) = compile(
         vec![(
             "a.cleave".to_string(),
-            "fn f(x: f32) -> f32 { x }\nfprime = derive(f);".to_string(),
+            "fn f(x: f32) -> f32 { x }\nfprime = derive(f, x);".to_string(),
         )],
         &[],
     );
@@ -417,42 +423,49 @@ fn a_single_param_derive_synthesizes_a_scalar_signature() {
     assert!(out.contains("fn fprime(x: f32) -> f32;"), "got:\n{out}");
 }
 
+/// A named target out of *several* real parameters still returns that
+/// one's own type directly, never a tuple -- `y`'s own gradient here, `x`
+/// never even entering the picture (this is `driver.rs`'s own signature-
+/// synthesis step, before any real differentiation runs, so this test
+/// alone can't distinguish "never computed" from "computed and dropped" --
+/// `egraph.rs`'s own `grad_with_a_named_target_parameter_returns_just_
+/// that_gradient_directly`-style tests, `cleave/tests/mlir_lower.rs`, cover
+/// that part end to end).
 #[test]
-fn a_multi_param_derive_synthesizes_a_tuple_jacobian_signature() {
+fn a_named_target_out_of_several_parameters_still_synthesizes_a_scalar_signature() {
     let (result, _sources) = compile(
         vec![(
             "a.cleave".to_string(),
-            "fn f(x: f32, y: f32) -> f32 { x }\nfprime = derive(f);".to_string(),
+            "fn f(x: f32, y: f32) -> f32 { x }\nfprime = derive(f, y);".to_string(),
         )],
         &[],
     );
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let out = print_program(&program);
     assert!(
-        out.contains("fn fprime(x: f32, y: f32) -> __Tuple2<f32, f32>;"),
+        out.contains("fn fprime(x: f32, y: f32) -> f32;"),
         "got:\n{out}"
     );
 }
 
-/// `driver.rs::synthesize_derive_signatures`'s own doc comment: each
-/// Jacobian entry's own type is that *parameter's* own type, not `f`'s
-/// return type -- heterogeneous parameters (a real motivating case, once a
-/// struct-typed parameter is involved) now synthesize a real tuple, no
-/// longer a located error. Confirms the two types land in their own
-/// declared positions, not silently coerced to one shared type.
+/// `driver.rs::synthesize_derive_signatures`'s own doc comment: the
+/// synthesized result is that *parameter's* own declared type, not `f`'s
+/// own return type -- confirmed here specifically because `y`'s own type
+/// (`f64`) differs from `f`'s own return type (`f32`), so a wrong
+/// implementation reusing `f`'s return type would be caught directly.
 #[test]
-fn a_heterogeneous_multi_param_derive_synthesizes_a_tuple_with_each_params_own_type() {
+fn a_named_target_uses_that_parameters_own_type_not_fs_return_type() {
     let (result, _sources) = compile(
         vec![(
             "a.cleave".to_string(),
-            "fn f(x: f32, y: f64) -> f32 { x }\nfprime = derive(f);".to_string(),
+            "fn f(x: f32, y: f64) -> f32 { x }\nfprime = derive(f, y);".to_string(),
         )],
         &[],
     );
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let out = print_program(&program);
     assert!(
-        out.contains("fn fprime(x: f32, y: f64) -> __Tuple2<f32, f64>;"),
+        out.contains("fn fprime(x: f32, y: f64) -> f64;"),
         "got:\n{out}"
     );
 }
@@ -460,7 +473,7 @@ fn a_heterogeneous_multi_param_derive_synthesizes_a_tuple_with_each_params_own_t
 #[test]
 fn deriving_a_nonexistent_function_is_a_located_error() {
     let (result, _sources) = compile(
-        vec![("a.cleave".to_string(), "fprime = derive(f);".to_string())],
+        vec![("a.cleave".to_string(), "fprime = derive(f, x);".to_string())],
         &[],
     );
     let errs = result.unwrap_err();
@@ -470,7 +483,7 @@ fn deriving_a_nonexistent_function_is_a_located_error() {
 
 #[test]
 fn deriving_a_generic_function_is_a_located_error() {
-    let src = "fn f<T: Float>(x: T) -> T { x }\nfprime = derive(f);";
+    let src = "fn f<T: Float>(x: T) -> T { x }\nfprime = derive(f, x);";
     let (result, _sources) = compile(vec![("a.cleave".to_string(), src.to_string())], &[]);
     let errs = result.unwrap_err();
     assert_eq!(errs.len(), 1);
