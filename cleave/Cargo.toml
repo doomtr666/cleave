@@ -9,4 +9,17 @@ ordered-float = "4"
 pest = "2"
 pest_derive = "2"
 melior = "0.27"
+# Direct dependency (previously only transitive, via melior) needed for
+# `mlirOperationCreateParse` -- melior 0.27.4 has no API for MLIR's newer
+# Properties storage mechanism (confirmed: no `parse`/`propert*`-named
+# function anywhere in its own `operation.rs`), so ops like
+# `linalg.matmul_transpose_a`/`_b` (whose `indexing_maps` is a real ODS
+# Property, not a discardable attribute -- see `doc/backlog.md`) can't be
+# built correctly via melior's own `OperationBuilder`. Workaround: build
+# the op's text form and parse it directly through MLIR's own C API,
+# then wrap the result via melior's `Operation::from_option_raw` escape
+# hatch. Version left unpinned here -- resolved transitively to the exact
+# same `[patch.crates-io]`-pinned fork/branch/commit melior already pulls
+# in (see workspace `Cargo.toml`), so there is only ever one real copy.
+mlir-sys = "220"
 cleave-rt = { path = "../cleave-rt" }

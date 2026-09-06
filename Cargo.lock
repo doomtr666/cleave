@@ -125,6 +125,7 @@ dependencies = [
  "cleave-rt",
  "egg",
  "melior",
+ "mlir-sys",
  "ordered-float",
  "pest",
  "pest_derive",

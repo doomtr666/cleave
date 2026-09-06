@@ -7433,28 +7433,34 @@ mod tests {
         let (_, da) = extractor.find_best(adjoints[&fwd.egraph.find(a_id)]);
         let (_, db) = extractor.find_best(adjoints[&fwd.egraph.find(b_id)]);
 
-        // `dA = matmul(dC, transpose(b))`, `dB = matmul(transpose(a), dC)`
+        // `dA = matmul_transpose_b(dC, b)`, `dB = matmul_transpose_a(a, dC)`
         // — the exact hand-derived formula, checked structurally (`egg`'s
         // own s-expression `Display`, mirroring the scalar spike test's own
-        // `assert_eq!` posture). Every one of the four instantiations below
-        // is dimensionally distinct (`a:2x3`, `b:3x4`, `transpose(a):3x2`,
-        // `transpose(b):4x3`, `dC:2x4`) — genuinely exercises the fix, not
-        // just its own naming: `matmul(dC, transpose(b))` is a real `2x4 ·
-        // 4x3 -> 2x3` instantiation, *different* from the forward call's
-        // own `2x3 · 3x4 -> 2x4` — reusing the forward instantiation's own
-        // unit name here (the pre-fix bug) would silently feed it operands
-        // of the wrong shape.
+        // `assert_eq!` posture). Routed through `matmul_transpose_a`/`_b`
+        // (`stdlib/linalg/matrix.cleave`'s own `adjoint matmul` rule) rather
+        // than a real `transpose(...)` feeding an ordinary `matmul` — no
+        // materialized transpose at all, MLIR's own `indexing_maps`
+        // mechanism reads the "transposed" operand directly instead
+        // (`mlir_lower.rs::build_matmul_transpose_no_seed`'s own doc
+        // comment). Every instantiation below is dimensionally distinct
+        // (`a:2x3`, `b:3x4`, `dC:2x4`) — genuinely exercises the fix, not
+        // just its own naming: `matmul_transpose_b(dC, b)` is a real
+        // `2x4 · 3x4 -> 2x3` instantiation (contracting each operand's own
+        // trailing `4`), *different* from the forward call's own
+        // `2x3 · 3x4 -> 2x4` — reusing the forward instantiation's own unit
+        // name here (the pre-fix bug this test originally guarded against)
+        // would silently feed it operands of the wrong shape.
         assert_eq!(
             da.to_string(),
-            "(\"MatMul::matmul<Tensor<f32, 2, 4>, Tensor<f32, 4, 3>, Tensor<f32, 2, 3>>\" dC \
-             (\"Transpose::transpose<Tensor<f32, 3, 4>, Tensor<f32, 4, 3>>\" fv1))",
-            "expected dA = matmul(dC, transpose(b)), got {da}"
+            "(\"MatMulTransposeB::matmul_transpose_b<Tensor<f32, 2, 4>, Tensor<f32, 3, 4>, \
+             Tensor<f32, 2, 3>>\" dC fv1)",
+            "expected dA = matmul_transpose_b(dC, b), got {da}"
         );
         assert_eq!(
             db.to_string(),
-            "(\"MatMul::matmul<Tensor<f32, 3, 2>, Tensor<f32, 2, 4>, Tensor<f32, 3, 4>>\" \
-             (\"Transpose::transpose<Tensor<f32, 2, 3>, Tensor<f32, 3, 2>>\" fv0) dC)",
-            "expected dB = matmul(transpose(a), dC), got {db}"
+            "(\"MatMulTransposeA::matmul_transpose_a<Tensor<f32, 2, 3>, Tensor<f32, 2, 4>, \
+             Tensor<f32, 3, 4>>\" fv0 dC)",
+            "expected dB = matmul_transpose_a(a, dC), got {db}"
         );
     }
 }

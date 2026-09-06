@@ -31,7 +31,46 @@ algebra MatMul<A, B, C> {
     // `d(a)`/`d(b)` and never itself needs a transpose), the reverse-mode
     // rule must physically reorient each operand to route the upstream
     // adjoint `u` back through the correct contracted dimension.
-    adjoint matmul(a, b), u: (matmul(u, transpose(b)), matmul(transpose(a), u));
+    //
+    // Routed through `matmul_transpose_a`/`_b` (just below), not a real
+    // `transpose(...)` call feeding an ordinary `matmul`: `dH = dZ*W^T`,
+    // `dW = H^T*dZ` never actually need a materialized transpose at all —
+    // MLIR's own `indexing_maps` mechanism reads the "transposed" operand
+    // with an ordinary contiguous load instead (`mlir_lower.rs::build_
+    // matmul_transpose_no_seed`'s own doc comment has the full derivation,
+    // including the real, confirmed `linalg.transpose` gather/scatter cost
+    // this specifically avoids, and the melior Properties-API gap this had
+    // to work around to build correctly — `doc/backlog.md`).
+    adjoint matmul(a, b), u: (matmul_transpose_b(u, b), matmul_transpose_a(a, u));
+}
+
+// `dH = dZ*W^T` — `Transpose<B,?>` is never involved: `u: Tensor<T,N,K>`
+// (`dZ`, the upstream adjoint) times `b: Tensor<T,M,K>` (`W`, read as if
+// transposed) gives `Tensor<T,N,M>` (`dH`'s own shape), matching `MatMul`'s
+// own `adjoint`'s first return slot exactly.
+algebra MatMulTransposeB<A, B, C> {
+    fn matmul_transpose_b(a: A, b: B) -> C;
+}
+
+impl<T: Float, const P: i32, const Q: i32, const R: i32>
+    MatMulTransposeB<Tensor<T,P,Q>, Tensor<T,R,Q>, Tensor<T,P,R>> {
+    fn matmul_transpose_b(a, b) {
+        mlir::linalg::matmul_transpose_b(a, b)
+    }
+}
+
+// `dW = H^T*dZ` — `a: Tensor<T,N,M>` (`H`, read as if transposed) times
+// `u: Tensor<T,N,K>` (`dZ`) gives `Tensor<T,M,K>` (`dW`'s own shape),
+// matching `MatMul`'s own `adjoint`'s second return slot exactly.
+algebra MatMulTransposeA<A, B, C> {
+    fn matmul_transpose_a(a: A, b: B) -> C;
+}
+
+impl<T: Float, const P: i32, const Q: i32, const R: i32>
+    MatMulTransposeA<Tensor<T,P,Q>, Tensor<T,P,R>, Tensor<T,Q,R>> {
+    fn matmul_transpose_a(a, b) {
+        mlir::linalg::matmul_transpose_a(a, b)
+    }
 }
 
 // The adjoint's own real dependency, not matmul's: `A: R^{n x m} -> A^T:

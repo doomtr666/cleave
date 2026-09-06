@@ -52,12 +52,16 @@ use melior::{
             IntegerAttribute, StringAttribute, TypeAttribute,
         },
         block::BlockLike,
-        operation::OperationBuilder,
+        operation::{OperationBuilder, OperationLike, OperationMutLike},
         r#type::{
             DimSize, FunctionType, IntegerType, MemRefType, RankedTensorType, ShapedTypeLike,
         },
     },
 };
+// Direct `mlir-sys` use (see `cleave/Cargo.toml`'s own doc comment on this
+// dependency): `build_matmul_transpose_no_seed`'s own `mlirOperationCreateParse`
+// call, the one escape hatch melior itself doesn't wrap.
+use melior::StringRef;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
@@ -3655,6 +3659,20 @@ fn lower_raw_mlir_op<'c>(
     if op == "linalg.matmul" {
         return build_matmul_no_seed(ctx, block, env, args, result_ty);
     }
+    // `linalg.matmul_transpose_a`/`_b` — cleave's own dispatch names, not
+    // real MLIR mnemonics (confirmed: `MatmulTransposeAOp`/`BOp` are plain
+    // C++ subclasses of `MatmulOp`, `Linalg.h`, never registered under their
+    // own name — there is no such op for MLIR's own parser to recognize).
+    // What they really are: an ordinary `linalg.matmul` with a non-default
+    // `indexing_maps` — see `build_matmul_transpose_no_seed`'s own doc
+    // comment for the full mechanism and why it has to go through MLIR's
+    // own textual parser rather than melior's `OperationBuilder`.
+    if op == "linalg.matmul_transpose_a" {
+        return build_matmul_transpose_no_seed(ctx, block, env, args, result_ty, true);
+    }
+    if op == "linalg.matmul_transpose_b" {
+        return build_matmul_transpose_no_seed(ctx, block, env, args, result_ty, false);
+    }
     if op == "linalg.transpose" {
         return build_transpose_no_seed(ctx, block, env, args, attrs, result_ty);
     }
@@ -4125,6 +4143,177 @@ fn build_matmul_no_seed<'c>(
         .add_results(&[result_ty])
         .build()
         .unwrap_or_else(|e| panic!("MLIR lowering: failed to build linalg.matmul: {e}"));
+    block.append_operation(built).result(0).unwrap().into()
+}
+
+/// Builds `A^T @ B` (`transpose_lhs = true`) or `A @ B^T` (`transpose_lhs =
+/// false`) as a real, *named* `linalg.matmul` whose `indexing_maps` reads
+/// the "transposed" operand with an ordinary, contiguous load — MLIR's own
+/// direct equivalent of BLAS's `transA`/`transB` GEMM flags, and a real
+/// structural alternative to ever materializing a `linalg.transpose` at all
+/// (`doc/backlog.md`'s own "`linalg.transpose`'s own real cost" entry has
+/// the full derivation: `MatmulTransposeAOp`/`MatmulTransposeBOp`, confirmed
+/// directly in MLIR's own source (`Linalg.h`), are literally the *same*
+/// `linalg.matmul` op — plain C++ subclasses of `MatmulOp`, never separately
+/// registered under their own mnemonic at all — distinguished only by a
+/// non-default `indexing_maps` value; there is no `linalg.matmul_transpose_a`
+/// for MLIR's own parser to recognize, which is why this function still has
+/// to build a plain `linalg.matmul`, just with different indexing maps, and
+/// why `lower_raw_mlir_op`'s dispatch names for this are cleave's own,
+/// not real MLIR ones).
+///
+/// `indexing_maps` is one of `MatmulOp`'s own ODS **Properties** (confirmed
+/// directly in the generated `LinalgStructuredOps.h.inc`) — a storage
+/// mechanism distinct from the ordinary discardable-attribute dictionary
+/// every other op in this file goes through via melior's `OperationBuilder::
+/// add_attributes`. melior 0.27.4 (this project's own pinned version) has
+/// *no* Properties-setting API at all (confirmed: no `parse`/`propert*`-
+/// named function anywhere in melior's own `operation.rs`) — building this
+/// op via `OperationBuilder` therefore sets `indexing_maps` as an inert,
+/// never-read discardable attribute, leaving the real property MLIR's own
+/// verifier and vectorizer actually consult at its default (untransposed)
+/// value. Confirmed, not theorized: this exact construction produced a
+/// genuine stack-overflow crash in the compiled kernel before this fix.
+///
+/// The workaround: build the *textual* MLIR form instead — a real, ordinary
+/// `linalg.matmul indexing_maps = [...] ins(...) outs(...) -> ...`, the same
+/// sugared syntax MLIR's own test suite uses for exactly this case
+/// (confirmed directly, `generalize-named-ops.mlir`'s own `@matmul_bcast_a`)
+/// — and parse it via `mlirOperationCreateParse`, MLIR's own C-API textual
+/// parser (confirmed present in this project's own generated `mlir-sys`
+/// bindings, and now a direct dependency — see `cleave/Cargo.toml`). That
+/// parser sets the real property correctly because it's the exact code path
+/// any `.mlir` file on disk goes through — no melior involvement for that
+/// part at all. The one wrinkle: a standalone parse needs *bound names* for
+/// its operands, which the real, already-lowered `a`/`b`/`init` values don't
+/// have — so this parses a tiny throwaway `func.func` wrapper (its own block
+/// arguments stand in for `a`/`b`/`init`), then reaches inside with melior's
+/// own raw-pointer escape hatches (`OperationLike::region`, `RegionLike::
+/// first_block`, `BlockLike::first_operation_mut`) to detach the one real op
+/// it cares about (`OperationMutLike::remove_from_parent`) and rewire its
+/// operands onto the real values (`OperationMutLike::set_operands`) before
+/// appending it into the real block. The wrapper itself (and its now-
+/// orphaned `func.return`, still holding a dangling *use* of the detached
+/// op's result — never a problem, per `mlirOperationRemoveFromParent`'s own
+/// doc comment: "not destroyed", only unlinked) is simply dropped once the
+/// one op inside it has been extracted.
+fn build_matmul_transpose_no_seed<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    args: &[CVal],
+    result_ty: Type<'c>,
+    transpose_lhs: bool,
+) -> Value<'c, 'c> {
+    let context = ctx.context;
+    let location = Location::unknown(context);
+    let [a_arg, b_arg] = args else {
+        panic!(
+            "MLIR lowering: `mlir::linalg::matmul_transpose_{}` needs exactly two operands (`a`, `b`), got {}",
+            if transpose_lhs { "a" } else { "b" },
+            args.len()
+        );
+    };
+    let a = lower_cval(context, block, env, a_arg, result_ty);
+    let b = lower_cval(context, block, env, b_arg, result_ty);
+    let elem_ty = RankedTensorType::try_from(result_ty)
+        .unwrap_or_else(|e| {
+            panic!("MLIR lowering: matmul_transpose's own result must be a ranked tensor: {e}")
+        })
+        .element();
+
+    // Same real `linalg.fill` zero seed `build_matmul_no_seed` uses, for the
+    // identical reason: only a real named `linalg.matmul` (never a
+    // hand-built `linalg.generic`) implements `ContractionOpInterface`, the
+    // interface `transform.structured.vectorize`'s own `create_named_
+    // contraction` mode needs to ever emit a real `vector.contract`.
+    let zero_elem: Value = block
+        .append_operation(arith::constant(
+            context,
+            FloatAttribute::new(context, elem_ty, 0.0).into(),
+            location,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let init_empty: Value = tensor_seed(ctx, block, result_ty);
+    let fill_payload = Block::new(&[(elem_ty, location), (elem_ty, location)]);
+    fill_payload.append_operation(
+        OperationBuilder::new("linalg.yield", location)
+            .add_operands(&[fill_payload.argument(0).unwrap().into()])
+            .build()
+            .unwrap(),
+    );
+    let fill_region = Region::new();
+    fill_region.append_block(fill_payload);
+    let init: Value = block
+        .append_operation(
+            OperationBuilder::new("linalg.fill", location)
+                .add_operands(&[zero_elem, init_empty])
+                .add_attributes(&[(
+                    Identifier::new(context, "operandSegmentSizes"),
+                    DenseI32ArrayAttribute::new(context, &[1, 1]).into(),
+                )])
+                .add_regions_vec(vec![fill_region])
+                .add_results(&[result_ty])
+                .build()
+                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build linalg.fill: {e}")),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    // The real default indexing maps for each variant (confirmed directly
+    // against `LinalgOps.cpp`'s own `MatmulTransposeAOp`/`BOp::
+    // getDefaultIndexingMaps`): `matmul_transpose_a` reads `a` as `(d2, d0)`
+    // (its own leading dim contracted, `K` first) and `b` as `(d2, d1)`
+    // (ordinary); `matmul_transpose_b` reads `a` as `(d0, d2)` (ordinary)
+    // and `b` as `(d1, d2)` (its own leading dim is the *output* column,
+    // `K` trailing). Both keep the ordinary `(d0, d1)` output map — the
+    // transpose lives entirely in which index a *contiguous* load lands on,
+    // never in how memory is physically walked.
+    let a_ty = a.r#type();
+    let b_ty = b.r#type();
+    let (lhs_map, rhs_map) = if transpose_lhs {
+        ("(d0, d1, d2) -> (d2, d0)", "(d0, d1, d2) -> (d2, d1)")
+    } else {
+        ("(d0, d1, d2) -> (d0, d2)", "(d0, d1, d2) -> (d1, d2)")
+    };
+    let wrapper_text = format!(
+        "func.func @cleave_matmul_transpose_tmp(%a: {a_ty}, %b: {b_ty}, %init: {result_ty}) -> {result_ty} {{\n\
+         %r = linalg.matmul indexing_maps = [\n\
+         affine_map<{lhs_map}>,\n\
+         affine_map<{rhs_map}>,\n\
+         affine_map<(d0, d1, d2) -> (d0, d1)>\n\
+         ] ins(%a, %b : {a_ty}, {b_ty}) outs(%init : {result_ty}) -> {result_ty}\n\
+         func.return %r : {result_ty}\n\
+         }}"
+    );
+    let raw = unsafe {
+        mlir_sys::mlirOperationCreateParse(
+            context.to_raw(),
+            StringRef::new(&wrapper_text).to_raw(),
+            StringRef::new("<cleave-matmul-transpose>").to_raw(),
+        )
+    };
+    let wrapper = unsafe { Operation::from_option_raw(raw) }.unwrap_or_else(|| {
+        panic!(
+            "MLIR lowering: failed to parse `matmul_transpose_{}` wrapper (see stderr diagnostics above):\n{wrapper_text}",
+            if transpose_lhs { "a" } else { "b" }
+        )
+    });
+    let region = wrapper
+        .region(0)
+        .unwrap_or_else(|e| panic!("MLIR lowering: matmul-transpose wrapper has no body region: {e}"));
+    let func_block = region
+        .first_block()
+        .unwrap_or_else(|| panic!("MLIR lowering: matmul-transpose wrapper's region has no block"));
+    let mut matmul_ref = func_block.first_operation_mut().unwrap_or_else(|| {
+        panic!("MLIR lowering: matmul-transpose wrapper's block has no operation")
+    });
+    matmul_ref.remove_from_parent();
+    matmul_ref.set_operands(&[a, b, init]);
+    let built = unsafe { Operation::from_raw(matmul_ref.to_raw()) };
     block.append_operation(built).result(0).unwrap().into()
 }
 
