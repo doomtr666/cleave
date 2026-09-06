@@ -63,7 +63,7 @@ module attributes {transform.with_named_sequence} {
       %epi_count = transform.num_associations %epi : (!transform.any_op) -> !transform.param<i64>
       transform.match.param.cmpi eq %epi_count, %one : !transform.param<i64>
       transform.match.operation_name %epi ["linalg.generic"] : !transform.any_op
-      %epi_tiled, %forall = transform.structured.tile_using_forall %epi tile_sizes [1, 0]
+      %epi_tiled, %forall = transform.structured.tile_using_forall %epi tile_sizes [4, 0]
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
       %fused_mm, %new_forall = transform.structured.fuse_into_containing_op %arg0 into %forall
         : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
