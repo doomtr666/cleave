@@ -474,8 +474,7 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                     .chain(d.extra_targets.iter().cloned())
                     .collect();
                 for f in &d.fns {
-                    let mut infer = Infer::new(registry)
-                        .with_inherent_patterns(&program_inference.inherent_patterns);
+                    let mut infer = Infer::new(registry);
                     let Ok(ret) = infer.infer_impl_fn_generic_with_env(
                         &program_inference.global_env,
                         &d.algebra,
@@ -523,10 +522,8 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                         &infer.node_types,
                         &program_inference.global_env,
                         mono.templates(),
-                        mono.inherent_templates(),
                         &program_inference.lambda_schemes,
                         HashMap::new(),
-                        &mut Vec::new(),
                         &mut Vec::new(),
                         &mut Vec::new(),
                         &mut Vec::new(),
@@ -609,99 +606,6 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                             baked_closures: Vec::new(),
                             higher_order_args: HashMap::new(),
                             body,
-                        });
-                    }
-                }
-            }
-            ItemKind::InherentImpl(d)
-                if d.generics.is_empty() && d.fns.iter().all(|f| f.generics.is_empty()) =>
-            {
-                // Non-generic inherent impl — either a concrete struct with
-                // no generics of its own, or a generic struct impl'd at one
-                // specific instantiation (`impl Vec2<f64> { ... }`), *and*
-                // none of its own methods declare a generic of their own
-                // either (`doc/backlog.md`'s own "An inherent-impl method's
-                // own generics aren't picked up by inference at all" item —
-                // a method with its own generic needs the templated branch
-                // below instead, exactly like an impl-level generic already
-                // does; `monomorphize.rs::build_inherent_templates`'s own
-                // block-selection condition mirrors this one exactly).
-                // Mirrors
-                // the non-generic-algebra-impl branch above (re-infer
-                // directly, no template needed) but through `infer_
-                // inherent_impl_block` instead of a per-method call — one
-                // shared `Infer` across every method of *this* impl block
-                // gives real mutual recursion between sibling methods for
-                // free (`w.dec().is_odd()` calling back into a sibling
-                // `is_even`), the same way `callgraph::infer_program`
-                // already does for a mutually-recursive top-level `fn`
-                // group.
-                let TypeKind::Path(p, _) = &d.target.kind else {
-                    continue;
-                };
-                let struct_name = p.segments.join("::");
-                let mut infer = Infer::new(registry);
-                let (_, results) = infer.infer_inherent_impl_block(
-                    &program_inference.global_env,
-                    &d.generics,
-                    &d.target,
-                    &d.fns,
-                    item.span,
-                );
-                for f in &d.fns {
-                    let Some(Ok((param_types, result))) = results.get(&f.name) else {
-                        continue;
-                    }; // already reported via --dump-inference-pass
-                    // A bodyless inherent method has no `#[mlir(...)]`/
-                    // `extern`-style intrinsic equivalent yet — nothing to
-                    // build a unit from.
-                    let Some(body) = &f.body else { continue };
-                    units.push(ConcreteUnit {
-                        name: format!("{struct_name}::{}", f.name),
-                        params: f.params.clone(),
-                        param_types: param_types.clone(),
-                        result: result.clone(),
-                        node_types: infer.node_types.clone(),
-                        call_names: HashMap::new(),
-                        origin: None,
-                        no_inline: f.attrs.iter().any(|a| a.name == "no_inline"),
-                        is_export: false,
-                        export_symbol: None,
-                        capture_count: 0,
-                        baked_closures: Vec::new(),
-                        higher_order_args: HashMap::new(),
-                        body: UnitBody::Real(body.clone()),
-                    });
-                }
-            }
-            ItemKind::InherentImpl(d) => {
-                // Generic inherent impl — impl-level (`impl<T> Boxed<T>`),
-                // method-level (`fn pick<X>(...)` on an otherwise concrete
-                // impl), or both — every specialization actually reached,
-                // already built by `monomorphize`'s own inherent-method
-                // worklist.
-                let TypeKind::Path(p, _) = &d.target.kind else {
-                    continue;
-                };
-                let struct_name = p.segments.join("::");
-                for f in &d.fns {
-                    let origin_key = format!("{struct_name}::{}", f.name);
-                    for key in mono.specializations_of(&origin_key) {
-                        units.push(ConcreteUnit {
-                            name: key.clone(),
-                            params: mono.params(key).to_vec(),
-                            param_types: mono.param_types(key).to_vec(),
-                            result: mono.result(key).clone(),
-                            node_types: mono.node_types(key).clone(),
-                            call_names: mono.call_names(key).clone(),
-                            origin: None,
-                            no_inline: f.attrs.iter().any(|a| a.name == "no_inline"),
-                            is_export: false,
-                            export_symbol: None,
-                            capture_count: 0,
-                            baked_closures: Vec::new(),
-                            higher_order_args: HashMap::new(),
-                            body: UnitBody::Real(mono.body(key).clone()),
                         });
                     }
                 }
@@ -2839,34 +2743,6 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                 }
             })
         }
-        // `v.method(args)` — `base` fills the method's own first parameter,
-        // an ordinary explicit positional argument, not a magic `self`
-        // (`infer.rs`'s own `ExprKind::MethodCall` handling already treats
-        // it that way at the type level) — so it converts exactly like any
-        // other real call, `[base, ...args]` evaluated left-to-right, just
-        // resolved through `resolve_method_call` (a struct's own method
-        // namespace, entirely separate from `resolve_call`'s three tiers:
-        // `Registry::inherent_method`'s own doc comment guarantees at most
-        // one method of a given name per struct, so there's no ambiguity to
-        // resolve structurally the way an algebra call needs — either a
-        // direct `call_names` override, for a specialization built from a
-        // generic inherent impl, or the bare `struct::method` name directly).
-        ExprKind::MethodCall(base, name, args) => {
-            let struct_ty = ctx.node_types[&base.id].clone();
-            let struct_name = match &struct_ty {
-                Ty::Con(n) | Ty::App(n, _) => n.clone(),
-                other => panic!(
-                    "CPS: method call on a non-struct type {other:?} -- infer.rs should have rejected this already"
-                ),
-            };
-            let result_ty = ctx.node_types[&expr.id].clone();
-            let mut all_args: Vec<&Expr> = vec![base.as_ref()];
-            all_args.extend(args.iter());
-            convert_expr_list(&all_args, env, ctx, &|arg_vals, env| {
-                let callee = resolve_method_call(&struct_name, name, expr, ctx);
-                emit_call(callee, arg_vals, result_ty.clone(), ctx, env, k)
-            })
-        }
         // A standalone block-as-expression (`{ let y = 1; y + 1 }`, reached
         // via `primary`'s own `block` alternative -- or synthesized by
         // `lower.rs`'s own direct-lambda-literal-call desugaring) — was
@@ -3045,9 +2921,6 @@ fn expr_contains_break(expr: &Expr) -> bool {
         | ExprKind::PackRef(_) => false,
         ExprKind::Call(_, _, args, ..) => args.iter().any(expr_contains_break),
         ExprKind::FieldAccess(base, _) => expr_contains_break(base),
-        ExprKind::MethodCall(base, _, args) => {
-            expr_contains_break(base) || args.iter().any(expr_contains_break)
-        }
         ExprKind::Index(base, indices) => {
             expr_contains_break(base) || indices.iter().any(expr_contains_break)
         }
@@ -3143,14 +3016,6 @@ fn mutated_free_vars_expr(
             .flat_map(|a| mutated_free_vars_expr(a, shadowed, ctx))
             .collect(),
         ExprKind::FieldAccess(base, _) => mutated_free_vars_expr(base, shadowed, ctx),
-        ExprKind::MethodCall(base, _, args) => {
-            let mut out = mutated_free_vars_expr(base, shadowed, ctx);
-            out.extend(
-                args.iter()
-                    .flat_map(|a| mutated_free_vars_expr(a, shadowed, ctx)),
-            );
-            out
-        }
         ExprKind::Index(base, indices) => {
             let mut out = mutated_free_vars_expr(base, shadowed, ctx);
             out.extend(
@@ -3324,14 +3189,6 @@ fn lambda_free_vars_expr(
             .flat_map(|a| lambda_free_vars_expr(a, shadowed, node_types))
             .collect(),
         ExprKind::FieldAccess(base, _) => lambda_free_vars_expr(base, shadowed, node_types),
-        ExprKind::MethodCall(base, _, args) => {
-            let mut out = lambda_free_vars_expr(base, shadowed, node_types);
-            out.extend(
-                args.iter()
-                    .flat_map(|a| lambda_free_vars_expr(a, shadowed, node_types)),
-            );
-            out
-        }
         ExprKind::Index(base, indices) => {
             let mut out = lambda_free_vars_expr(base, shadowed, node_types);
             out.extend(
@@ -3572,25 +3429,6 @@ fn resolve_call<'a>(name: &str, call_id: NodeId, arg_ids: &[NodeId], ctx: &Ctx<'
             .unwrap(),
         None => panic!("CPS: could not resolve call to `{name}` ({key:?})"),
     }
-}
-
-/// The `MethodCall` equivalent of `resolve_call` — a separate, simpler
-/// resolution namespace: `Registry::inherent_method`'s own doc comment
-/// guarantees at most one method of a given name exists per struct, so
-/// (unlike an algebra call) there's no structural/signature-based candidate
-/// search needed here, just a direct lookup once the struct name is known
-/// (already resolved by the caller, off `base`'s own concrete type).
-fn resolve_method_call<'a>(struct_name: &str, method: &str, call: &Expr, ctx: &Ctx<'a>) -> &'a str {
-    if let Some(mangled) = ctx.call_names.get(&call.id) {
-        return ctx.units.get_key_value(mangled.as_str()).map(|(k, _)| k.as_str()).unwrap_or_else(|| {
-            panic!("CPS: method call_names resolved `{struct_name}::{method}` to `{mangled}`, but no such unit exists")
-        });
-    }
-    let bare = format!("{struct_name}::{method}");
-    ctx.units
-        .get_key_value(bare.as_str())
-        .map(|(k, _)| k.as_str())
-        .unwrap_or_else(|| panic!("CPS: could not resolve method call `{bare}`"))
 }
 
 /// A `let`-bound literal is generalized at its own definition site (`let x =

@@ -376,18 +376,17 @@ fn algebras_how_operators_actually_work() {
 
 // ---------------------------------------------------------------- Inherent impls
 
-/// `doc/user_guide.md`'s own "Inherent impls" example, run for real via
-/// dot-call syntax (`v.magnitude_sq()`) -- previously caveated as "type-
-/// checks but can't be JIT-executed yet" (`cps.rs` had no `ExprKind::
-/// MethodCall` conversion arm at all; `doc/backlog.md`'s own item 7).
+/// Inherent impls are gone as a language concept -- `v.method(args)` is now
+/// pure sugar for `method(v, args)`, resolved through the same call-site
+/// machinery as any other top-level function. This is the direct successor
+/// of the old "Inherent impls" example: dot-call syntax on an ordinary
+/// top-level function still works exactly the same way.
 #[test]
-fn inherent_impl_method_computes_the_right_value_via_dot_syntax() {
+fn dot_call_on_a_top_level_function_computes_the_right_value() {
     let context = context();
     let src = "
         struct Vec2 { x: f64, y: f64 }
-        impl struct Vec2 {
-            fn magnitude_sq(v) -> f64 { v.x * v.x + v.y * v.y }
-        }
+        fn magnitude_sq(v: Vec2) -> f64 { v.x * v.x + v.y * v.y }
         fn main() -> i32 {
             if Vec2(x: 1.0, y: 2.0).magnitude_sq() == 5.0 { 1 } else { 0 }
         }

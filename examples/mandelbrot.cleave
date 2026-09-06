@@ -5,9 +5,9 @@ use complex;
 // standard Mandelbrot recurrence, `stdlib/complex/complex.cleave`'s own
 // `Ring<Complex<f64>>` supplying real complex arithmetic (`*`/`+`) with no
 // special-casing here at all. `magnitude_sq() > 4.0` (`|z| > 2`) is the
-// usual escape radius, checked via `Complex<T>`'s own inherent
-// `magnitude_sq` (squared, no `sqrt` — comparing a squared distance against
-// a squared threshold needs no root at all). No `break` in loops yet (`doc/
+// usual escape radius, checked via `Complex<T>`'s own `magnitude_sq`
+// (squared, no `sqrt` — comparing a squared distance against a squared
+// threshold needs no root at all). No `break` in loops yet (`doc/
 // backlog.md`'s own "break value in loops" item) — `escaped`/`count` just
 // latch onto the *first* iteration that crosses the threshold and every
 // later iteration becomes a no-op past that point instead of an early exit.

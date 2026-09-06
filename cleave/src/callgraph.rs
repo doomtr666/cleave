@@ -111,22 +111,6 @@ pub struct ProgramInference {
     /// `infer_call`'s unresolved-call placeholder (see that method's own
     /// doc comment for the bug this closes).
     pub global_env: Env,
-    /// `infer_inherent_impls_early`'s own output, computed once at the top
-    /// of this pass (needed internally, to seed every per-`fn` `Infer`
-    /// instance below via `with_inherent_patterns`) and exposed here too —
-    /// any *other* caller building its own fresh `Infer` to re-infer a
-    /// non-generic algebra impl's body (`cps.rs::collect_units`'s own
-    /// separate re-inference, not reusing this pass's own per-`fn` `Infer`
-    /// instances) needs the identical seeding, for the identical reason: a
-    /// call to an inherent method with no explicit `->` annotation
-    /// otherwise has no way to learn that method's own (possibly non-unit)
-    /// return type, and silently falls back to the unresolved-placeholder
-    /// type instead — found directly, building `Display<i32>::display`
-    /// (`stdlib/display/display.cleave`), whose own body calls `DynArray<
-    /// i8>::push` (no `->` annotation, implicitly unit) from inside a
-    /// *non-generic* algebra impl; see `doc/backlog.md` for the fuller
-    /// story.
-    pub inherent_patterns: HashMap<(String, String), InherentMethodPattern>,
     /// One past the highest `TyVar` id any SCC group's own `Infer` instance
     /// minted during this whole pass (`next_var_id`'s own final value,
     /// below) — exposed so a caller building further, *separate* `Infer`
@@ -143,93 +127,10 @@ pub struct ProgramInference {
     pub next_var_id: u32,
 }
 
-/// One inherent method's own return type, inferred *early* (before
-/// `infer_program`'s own `global_env` exists — see `infer_inherent_impls_
-/// early`'s own doc comment for why), expressed generically in terms of
-/// this impl block's own generics rather than any one concrete
-/// instantiation — the same "pattern, not a final answer" shape
-/// `monomorphize.rs`'s own `ImplTemplate`/`InherentTemplate` already use,
-/// one pipeline stage earlier.
-pub struct InherentMethodPattern {
-    /// This impl block's own generics, by name, mapped to the fresh
-    /// `Ty::Var`s `infer_inherent_impl_block` minted for them — a *different*
-    /// `Infer` instance's own vars than whatever a later caller's own call
-    /// site mints for the *same* generic parameter *names*; a caller must
-    /// cross-reference by name, not reuse these vars directly (see
-    /// `ExprKind::MethodCall`'s own dispatch in `infer.rs` for the actual
-    /// remap).
-    pub generics_mapping: HashMap<String, Ty>,
-    pub param_patterns: Vec<Ty>,
-    pub ret_pattern: Ty,
-}
-
-/// Infers every inherent impl block's own methods *once*, whole-program,
-/// *before* `infer_program`'s own per-`fn` pass runs — so an unannotated
-/// inherent method's own return type is available to a *different*
-/// function's own call site, not just to sibling methods on the same impl
-/// block (`infer_inherent_impl_block`'s own existing scope). See `doc/
-/// backlog.md`'s own "An inherent method's inferred return type reaching an
-/// external caller" entry for the real bug this closes.
-///
-/// Deliberately run with an *empty* `outer` env — `global_env` (the thing
-/// that would let an inherent method's own body call an ordinary top-level
-/// `fn`) doesn't exist yet at this point; it's what THIS pass's own results
-/// eventually help build, one step further down in `infer_program`. This is
-/// a genuine, symmetric mutual dependency between top-level `fn`s and
-/// inherent methods, not just missing plumbing — resolved the same way
-/// every other not-yet-resolvable reference already is throughout this
-/// compiler ("defer, don't guess"): an inherent method whose own return
-/// type genuinely depends on a top-level `fn` simply has no entry in the
-/// map this returns (`infer_inherent_impl_block` itself already rejects a
-/// method whose own final result still contains a placeholder — `check_no_
-/// placeholder`, called internally) — its *own* later, fully-correct type-
-/// check still happens unaffected, via `dump.rs`/`monomorphize.rs`'s own
-/// existing calls to `infer_inherent_impl_block`, which already run after
-/// `global_env` is complete and pass it through.
-pub fn infer_inherent_impls_early(
-    program: &Program,
-    registry: &Registry,
-) -> HashMap<(String, String), InherentMethodPattern> {
-    let mut out = HashMap::new();
-    let empty_env = Env::new();
-    for item in &program.items {
-        let ItemKind::InherentImpl(d) = &item.kind else {
-            continue;
-        };
-        let TypeKind::Path(p, _) = &d.target.kind else {
-            continue;
-        };
-        let struct_name = p.segments.join("::");
-        let mut infer = Infer::new(registry);
-        let (generics_mapping, results) =
-            infer.infer_inherent_impl_block(&empty_env, &d.generics, &d.target, &d.fns, item.span);
-        for f in &d.fns {
-            let Some(Ok((param_patterns, ret_pattern))) = results.get(&f.name) else {
-                continue;
-            };
-            out.insert(
-                (struct_name.clone(), f.name.clone()),
-                InherentMethodPattern {
-                    generics_mapping: generics_mapping.clone(),
-                    param_patterns: param_patterns.clone(),
-                    ret_pattern: ret_pattern.clone(),
-                },
-            );
-        }
-    }
-    out
-}
-
 /// Runs whole-program inference over every top-level `fn` in `program` (see
 /// module docs). Algebra `impl` methods are untouched — callers still infer
-/// those exactly as before (`Infer::infer_impl_fn`, one at a time). Inherent
-/// `impl` methods get one early, separate pass (`infer_inherent_impls_early`,
-/// see its own doc comment) before this function's own per-`fn` loop below,
-/// specifically so an unannotated inherent method's own return type is
-/// available to a top-level `fn` calling it — every `Infer` created below is
-/// seeded with that pass's own results via `with_inherent_patterns`.
+/// those exactly as before (`Infer::infer_impl_fn`, one at a time).
 pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference {
-    let inherent_patterns = infer_inherent_impls_early(program, registry);
     let functions: HashMap<String, &FnDecl> = program
         .items
         .iter()
@@ -279,9 +180,7 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
     let mut next_var_id: u32 = 0;
 
     for group in &sccs {
-        let mut infer = Infer::new(registry)
-            .with_inherent_patterns(&inherent_patterns)
-            .with_var_counter_starting_at(next_var_id);
+        let mut infer = Infer::new(registry).with_var_counter_starting_at(next_var_id);
 
         // Seed every member's placeholder before inferring *any* of their
         // bodies — visible to every other member (mutual recursion) and to
@@ -508,10 +407,7 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
         // the whole group" posture as `check_pending_constraints` just
         // above — see `Infer::finish_fn`'s identical pairing for the
         // single-function path.
-        if let Err(e) = infer
-            .check_pending_field_accesses()
-            .and_then(|()| infer.check_pending_method_calls())
-        {
+        if let Err(e) = infer.check_pending_field_accesses() {
             for name in group {
                 if let Some(r @ Ok(_)) = raw_results.get_mut(name) {
                     *r = Err(e.clone());
@@ -623,7 +519,6 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
         node_types,
         lambda_schemes,
         global_env,
-        inherent_patterns,
         next_var_id,
     }
 }
@@ -684,12 +579,6 @@ fn collect_calls_expr(expr: &Expr, known: &HashSet<&str>, out: &mut Vec<String>)
             }
         }
         ExprKind::FieldAccess(b, _) => collect_calls_expr(b, known, out),
-        ExprKind::MethodCall(b, _, args) => {
-            collect_calls_expr(b, known, out);
-            for a in args {
-                collect_calls_expr(a, known, out);
-            }
-        }
         ExprKind::Index(b, indices) => {
             collect_calls_expr(b, known, out);
             indices

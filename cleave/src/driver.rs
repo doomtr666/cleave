@@ -17,11 +17,14 @@
 //! candidates by return type alone). When any parameter lacks a type
 //! annotation, the signature can't be compared structurally at this stage —
 //! that becomes an inference-time concern, not a parse/merge-time one — so
-//! such items skip this check. *Inherent* impl methods (`impl struct Vec2 {
-//! ... }`) are the one exception: no overloading concept exists for them at
-//! all (`Registry::inherent_method` stores exactly one entry per method
-//! name, full stop), so conflict identity there is the bare method name —
-//! see `merge_inherent_impl_fragment`'s own doc comment.
+//! such items skip this check.
+//!
+//! Inherent impls (`impl Type { ... }`, no algebra) are not a language
+//! concept here at all — `v.method(args)` is pure sugar for `method(v,
+//! args)`, resolved as an ordinary top-level function or algebra method.
+//! There is no separate merging/conflict mechanism to speak of: a `fn`
+//! declared twice across files is caught by the same one-declaration-
+//! per-name rule as any other top-level `fn`.
 
 use crate::ast::*;
 use crate::diag::Diagnostic;
@@ -809,28 +812,6 @@ struct ImplAcc {
     seen_fns: HashMap<(String, Vec<String>), Span>,
 }
 
-struct InherentImplAcc {
-    anchor_id: NodeId,
-    anchor_span: Span,
-    decl: InherentImplDecl,
-    /// Keyed by method *name* alone, unlike `ImplAcc::seen_fns` (which keys
-    /// by `sig_key`, name **and** parameter types, to allow legitimate
-    /// operator overloading — two different `add` signatures coexisting).
-    /// Inherent methods have no such overloading concept: `Registry`'s own
-    /// `inherent_methods` lookup stores exactly one entry per (struct,
-    /// method name), full stop, so two same-named methods would silently
-    /// clobber each other there regardless of what merge-time allowed
-    /// through — this must reject on name alone to actually match what
-    /// dispatch can support. Also sidesteps a real gap `sig_key` has for
-    /// this specific case: it returns `None` (skipping the check
-    /// entirely) whenever *any* parameter lacks a type annotation — fine
-    /// for an algebra impl (an unannotated param falls back to the
-    /// algebra's own declared signature) but wrong here, where an
-    /// unannotated *first* parameter defaulting to the impl's own target
-    /// is the common case, not the exception (see
-    /// `Infer::infer_inherent_impl_fn_generic`).
-    seen_fns: HashMap<String, Span>,
-}
 
 /// Merges every parsed file's items into one logical `Program`. On any
 /// conflict, returns *all* conflicts found (not just the first) — a merge
@@ -842,7 +823,6 @@ pub fn merge_programs(programs: Vec<Program>) -> Result<Program, Vec<Diagnostic>
     let mut fn_names: Vec<String> = Vec::new();
     let mut algebras: Vec<AlgebraAcc> = Vec::new();
     let mut impls: Vec<ImplAcc> = Vec::new();
-    let mut inherent_impls: Vec<InherentImplAcc> = Vec::new();
 
     for program in programs {
         for item in program.items {
@@ -872,9 +852,6 @@ pub fn merge_programs(programs: Vec<Program>) -> Result<Program, Vec<Diagnostic>
                 }
                 ItemKind::Algebra(_) => merge_algebra_fragment(item, &mut algebras, &mut errors),
                 ItemKind::Impl(_) => merge_impl_fragment(item, &mut impls, &mut errors),
-                ItemKind::InherentImpl(_) => {
-                    merge_inherent_impl_fragment(item, &mut inherent_impls, &mut errors)
-                }
             }
         }
     }
@@ -895,13 +872,6 @@ pub fn merge_programs(programs: Vec<Program>) -> Result<Program, Vec<Diagnostic>
             id: acc.anchor_id,
             span: acc.anchor_span,
             kind: ItemKind::Impl(acc.decl),
-        });
-    }
-    for acc in inherent_impls {
-        items.push(Node {
-            id: acc.anchor_id,
-            span: acc.anchor_span,
-            kind: ItemKind::InherentImpl(acc.decl),
         });
     }
     Ok(Program { items })
@@ -1139,48 +1109,3 @@ fn merge_impl_fragment(item: Item, impls: &mut Vec<ImplAcc>, errors: &mut Vec<Di
     }
 }
 
-fn merge_inherent_impl_fragment(
-    item: Item,
-    impls: &mut Vec<InherentImplAcc>,
-    errors: &mut Vec<Diagnostic>,
-) {
-    let ItemKind::InherentImpl(d) = item.kind else {
-        unreachable!()
-    };
-    let target_key = fmt_type(&d.target);
-    // Same reasoning as `merge_impl_fragment`'s own `generics_key` — the
-    // impl's own generics are part of its identity, not just the bare
-    // target shape.
-    let generics_key = fmt_generics(&d.generics);
-
-    let Some(acc) = impls.iter_mut().find(|a| {
-        fmt_type(&a.decl.target) == target_key && fmt_generics(&a.decl.generics) == generics_key
-    }) else {
-        let mut seen_fns = HashMap::new();
-        for f in &d.fns {
-            seen_fns.insert(f.name.clone(), item.span);
-        }
-        impls.push(InherentImplAcc {
-            anchor_id: item.id,
-            anchor_span: item.span,
-            decl: d,
-            seen_fns,
-        });
-        return;
-    };
-
-    for f in d.fns {
-        if acc.seen_fns.contains_key(&f.name) {
-            errors.push(Diagnostic::error(
-                format!(
-                    "`{}` is implemented more than once in `impl {target_key}`",
-                    f.name
-                ),
-                item.span,
-            ));
-            continue;
-        }
-        acc.seen_fns.insert(f.name.clone(), item.span);
-        acc.decl.fns.push(f);
-    }
-}

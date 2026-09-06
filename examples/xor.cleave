@@ -64,8 +64,8 @@ impl<Opt, StateL1, StateL2> Optimizer<Opt, Network, NetworkState<StateL1, StateL
 
 fn forward(x1: f32, x2: f32, net: Network) -> f32 {
     let x = Tensor::<f32, 1, 2>(data: [[x1, x2]]);
-    let h = sigmoid(net.l1.forward(x));
-    let out = sigmoid(net.l2.forward(h));
+    let h = sigmoid(net.l1.dense_forward(x));
+    let out = sigmoid(net.l2.dense_forward(h));
     out[0, 0]
 }
 

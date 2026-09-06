@@ -157,7 +157,6 @@ fn check_mutability_errors(program: &Program) -> Vec<Diagnostic> {
         let fns: Vec<&crate::ast::FnDecl> = match &item.kind {
             crate::ast::ItemKind::Fn(f) => vec![f],
             crate::ast::ItemKind::Impl(d) => d.fns.iter().collect(),
-            crate::ast::ItemKind::InherentImpl(d) => d.fns.iter().collect(),
             _ => vec![],
         };
         for f in fns {

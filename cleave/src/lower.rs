@@ -88,9 +88,6 @@ impl Lowerer {
                 let variant = inner.into_inner().next().unwrap();
                 match variant.as_rule() {
                     Rule::algebra_impl => ItemKind::Impl(self.lower_algebra_impl(variant)),
-                    Rule::inherent_impl => {
-                        ItemKind::InherentImpl(self.lower_inherent_impl(variant))
-                    }
                     r => unreachable!("impl_decl: unexpected rule {r:?}"),
                 }
             }
@@ -536,27 +533,6 @@ impl Lowerer {
         }
     }
 
-    fn lower_inherent_impl(&mut self, pair: Pair<Rule>) -> InherentImplDecl {
-        let mut inner = pair.into_inner().peekable();
-
-        let generics = if matches!(
-            inner.peek().map(|p| p.as_rule()),
-            Some(Rule::generic_params)
-        ) {
-            self.lower_generic_params(inner.next().unwrap())
-        } else {
-            Vec::new()
-        };
-
-        let target = self.lower_type(inner.next().unwrap());
-        let fns = inner.map(|p| self.lower_fn_decl(p)).collect();
-        InherentImplDecl {
-            generics,
-            target,
-            fns,
-        }
-    }
-
     // ---------------------------------------------------------------- types
 
     fn lower_type(&mut self, pair: Pair<Rule>) -> Type {
@@ -860,53 +836,58 @@ impl Lowerer {
         let first = inner.next().unwrap();
         match first.as_rule() {
             // `t.0`/`t.1` — a tuple field access reuses the exact same
-            // `FieldAccess`/`MethodCall` branching an ordinary `.ident` does,
+            // `FieldAccess`/dot-call branching an ordinary `.ident` does,
             // just with the raw digit text as the field/method name (see
             // `grammar.pest`'s own `tuple_index` doc comment for why no
             // separate AST shape is needed at all).
             Rule::ident | Rule::tuple_index => {
                 let name = first.as_str().to_string();
                 // `call_args`'s mere presence (even with zero arguments, `.f()`)
-                // distinguishes a method call from plain field access (`.x`) —
+                // distinguishes a dot-call from plain field access (`.x`) —
                 // an absent vs. an empty `arg_list` are otherwise indistinguishable.
                 match inner.next() {
                     Some(call_args) => {
                         // Named (`mlir_attr`) arguments are only meaningful on
-                        // a reserved `mlir::...` *call*, never a method call —
-                        // silently dropped here, same as `MethodCall` itself
-                        // never getting a `mlir::`-recognizing path segment.
+                        // a reserved `mlir::...` *call*, never a dot-call —
+                        // silently dropped here, since a dot-call never gets a
+                        // `mlir::`-recognizing path segment.
                         let (args, _mlir_attrs) = call_args
                             .into_inner()
                             .next()
                             .map(|al| self.lower_arg_list(al))
                             .unwrap_or_default();
-                        // `.to()` — sugar for `convert(x)`, exactly the same
-                        // shape `fold_binary` already uses to desugar `a + b`
-                        // to `add(a, b)` — not a new `MethodCall`-dispatch
-                        // path. `ExprKind::MethodCall` resolves purely via
-                        // inherent-method lookup (`registry.inherent_method`,
-                        // see `infer.rs`'s own handling), a wholly separate
-                        // mechanism from algebra dispatch; `Convert<From,
-                        // To>`'s own `To` is an output-only generic that only
-                        // ever resolves through a real algebra-call dispatch,
-                        // so `.to()` has to reach `infer_call` the same way
-                        // any other operator does. Only the zero-argument
-                        // spelling counts — `convert`'s own declared
-                        // signature takes exactly one argument, the receiver
-                        // itself.
-                        if name == "to" && args.is_empty() {
-                            self.wrap(
-                                span,
-                                ExprKind::Call(
-                                    Path::single("convert"),
-                                    Vec::new(),
-                                    vec![base],
-                                    Vec::new(),
-                                ),
-                            )
+                        // `v.method(args)` is a pure syntactic rewrite to
+                        // `method(v, args)` — an ordinary bare `Call`, the
+                        // receiver spliced in as an ordinary first argument.
+                        // No separate `MethodCall`-shaped resolution exists
+                        // any more (`registry.inherent_method`/`resolve_
+                        // method_call`, `infer.rs`, removed along with
+                        // inherent impls themselves — `doc/backlog-done.md`'s
+                        // own "impls inhérents" entry has the full story):
+                        // dot-call now reaches the exact same `infer_call`
+                        // resolution a bare call already goes through
+                        // (qualified `Algebra::method`, `algebras_with_fn`,
+                        // then `env.get(name)` for any `fn` — top-level or
+                        // let-bound lambda alike). `.to()` still needs its
+                        // own name substitution, not subsumed by the general
+                        // rewrite above: it's real sugar for a *differently*
+                        // -named call (`x.to()` reaches `Convert<From,To>`'s
+                        // own `convert`, never a function literally named
+                        // `to`), the one genuine exception to "the call-site
+                        // name is the callee's own name" this rewrite
+                        // otherwise assumes everywhere else.
+                        let callee = if name == "to" && args.is_empty() {
+                            "convert".to_string()
                         } else {
-                            self.wrap(span, ExprKind::MethodCall(Box::new(base), name, args))
-                        }
+                            name
+                        };
+                        let mut call_args = Vec::with_capacity(args.len() + 1);
+                        call_args.push(base);
+                        call_args.extend(args);
+                        self.wrap(
+                            span,
+                            ExprKind::Call(Path::single(callee), Vec::new(), call_args, Vec::new()),
+                        )
                     }
                     None => self.wrap(span, ExprKind::FieldAccess(Box::new(base), name)),
                 }

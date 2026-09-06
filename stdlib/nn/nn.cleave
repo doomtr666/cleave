@@ -214,14 +214,13 @@ impl<T: Float, const Dims...: i32> Activation<Tensor<T, Dims...>> {
     fn tanh(x) { mlir::math::tanh(x) }
 }
 
-// A fully-connected layer -- ordinary stdlib struct plus inherent impl, same
-// shape as `Complex<T>::magnitude`/`magnitude_sq` (`stdlib/complex/
-// complex.cleave`), no new compiler mechanism: `forward` is just `matmul`
-// (`linalg::matrix.cleave`) followed by a bias add (`Ring<Tensor<...>>::
-// add`, via `+`), both already proven independently. This is the `Dense`
-// the session's own `Network`/`xor_tensor.cleave` rewrite bundles multiple
-// of, replacing the eleven loose scalar parameters that example used to
-// take.
+// A fully-connected layer -- ordinary stdlib struct, `dense_forward` below
+// (a plain top-level generic `fn`, dot-called as `layer.dense_forward(x)`)
+// is just `matmul` (`linalg::matrix.cleave`) followed by a bias add
+// (`Ring<Tensor<...>>::add`, via `+`), both already proven independently.
+// This is the `Dense` the session's own `Network`/`xor_tensor.cleave`
+// rewrite bundles multiple of, replacing the eleven loose scalar parameters
+// that example used to take.
 //
 // Deliberately *no* activation baked in here -- an earlier version of this
 // impl called `sigmoid` directly at the end of `forward`, inherited
@@ -238,26 +237,35 @@ impl<T: Float, const Dims...: i32> Activation<Tensor<T, Dims...>> {
 // `Dense::forward`'s own call site does.
 struct Dense<T: Float, const In: i32, const Out: i32> { w: Tensor<T, In, Out>, b: Tensor<T, 1, Out> }
 
-impl<T: Float, const In: i32, const Out: i32> struct Dense<T, In, Out> {
-    // `x` is a single `1 x In` row (one training example), matching
-    // `matmul`'s own `Tensor<T,N,M> x Tensor<T,M,K> -> Tensor<T,N,K>` shape
-    // with `N=1` -- the same single-example-at-a-time reasoning `examples/
-    // xor.cleave`/`xor_tensor.cleave` already document for their own SGD
-    // loop.
-    fn forward(layer, x: Tensor<T, 1, In>) -> Tensor<T, 1, Out> {
-        matmul(x, layer.w) + layer.b
-    }
-}
+// `Dense::forward` (single-row, `Tensor<T,1,In> -> Tensor<T,1,Out>`, an
+// inherent impl) used to live here, alongside `dense_forward` below (the
+// batched generalization) -- removed, not migrated, once impls inherents
+// stopped existing as a language concept (`doc/backlog-done.md`'s own entry
+// has the full story): `dense_forward` already handles `B=1` correctly
+// (`broadcast0`'s own `Tensor<T,1,M> -> Tensor<T,B,M>` is defined for *any*
+// `B`, `1` included -- a real, if trivial, identity-shaped broadcast, not a
+// degenerate case it special-cases away) -- the only reason both existed
+// side by side was that an inherent method's own generics weren't picked up
+// by inference at all (`dense_forward`'s own doc comment below), a gap that
+// applied *only* to inherent impls and no longer has anything left to apply
+// to. Every former `layer.forward(x)` call site keeps its dot-call syntax
+// unchanged -- only the method name moved, `layer.dense_forward(x)` --
+// dot-call is sugar for a bare call, not a reason to write one out by hand
+// (`examples/mnist-interop/src/kernel.cleave`'s own bare `dense_forward
+// (net.l1, x)` predates this migration entirely and is unrelated: `Dense::
+// forward` never existed there in the first place, only `dense_forward`
+// always did, called bare by original choice).
+
 
 // `Init<T>::xavier`/`he` -- real weight initialization, `doc/backlog.md`'s
 // own "No weight-initialization helpers" item finally closed now that `rand`
 // (`stdlib/rand/rand.cleave`) exists to build it on.
 //
-// A real, if narrow, algebra -- not `Dense`-inherent methods (an inherent
-// method call always needs a real receiver whose own type drives dispatch,
-// `registry.rs`'s own `inherent_method` doc comment: "dispatch always starts
-// from a resolved struct name" -- a constructor has no `Dense` value yet to
-// call one on) -- and, a real, found-by-testing surprise, *not* a plain top-
+// A real, if narrow, algebra -- not a `Dense`-scoped method of any kind (a
+// dot-called function always needs a real receiver value to dispatch its
+// own generics from -- `dense_forward`'s own `layer` parameter, e.g. -- and
+// a constructor has no `Dense` value yet to call one on) -- and, a real,
+// found-by-testing surprise, *not* a plain top-
 // level generic function either, even though that's the shape every other
 // helper in this file (`random_matrix`, this session's own validation probe)
 // already used successfully. `fn dense_xavier<T,In,Out>() -> Dense<T,In,Out>`
@@ -561,6 +569,18 @@ algebra Broadcast0<Row, Batch> {
     fn reduce0(b: Batch) -> Row;
     adjoint broadcast0(r), u: reduce0(u);
     adjoint reduce0(b), u: broadcast0(u);
+    // Both a real gap, found while retiring `Dense::forward` in favor of
+    // `dense_forward` (`doc/backlog-done.md`'s own "impls inhérents" entry):
+    // `Dense::forward`'s own plain `+` only ever needed `Ring::add`'s
+    // already-declared forward-mode rule, so `Broadcast0` itself never
+    // needed one before — `derive()`'s own forward-mode differentiation
+    // through `dense_forward` (which routes the bias through `broadcast0`)
+    // failed outright without it ("no derivative rule for..."). Both maps
+    // are linear, so each one's own derivative is just itself applied to
+    // the input's derivative — exactly the same shape any other linear
+    // stdlib op's `derivative` rule already takes.
+    derivative broadcast0(r): broadcast0(d(r));
+    derivative reduce0(b): reduce0(d(b));
 }
 
 impl<T: Float, const B: i32, const M: i32> Broadcast0<Tensor<T,1,M>, Tensor<T,B,M>> {
@@ -586,20 +606,18 @@ impl<T: Float, const B: i32, const M: i32> Broadcast0<Tensor<T,1,M>, Tensor<T,B,
     }
 }
 
-// A real batch-dimension generalization of `Dense::forward` above
-// (`Tensor<T,1,In> -> Tensor<T,1,Out>`, `Dense`'s own inherent method,
-// kept as-is and still the right call for a single row) — a free
-// top-level function, not a second inherent method on `Dense`, because
-// `B` needs to be a generic *owned by the call itself* (it varies per
-// call site, never per `Dense` value) and an inherent-impl method's own
-// additional generics aren't picked up by inference at all (`doc/backlog.
-// md`'s own "An inherent-impl method's own generics..." item, found and
-// worked around this exact way) — a plain top-level generic `fn`, already
-// a proven-working shape (`dynarray_new<T>`, every algebra-impl method,
-// and — combining a bound *and* several const generics at once, the
-// specific untested combination this needed — `cleave/tests/mlir_lower.
-// rs`'s own `a_top_level_fn_combines_a_bounded_type_generic_with_several_
-// const_generics`), sidesteps that gap entirely.
+// The one real `Dense`-forward function now that `Dense::forward` (above)
+// is gone — a plain top-level generic `fn`, batched over `B` (a generic
+// *owned by the call itself*, varying per call site, never per `Dense`
+// value) and correct for `B=1` too via `broadcast0`'s own identity-shaped
+// case. Originally written as a *workaround* for an inherent-impl method's
+// own generics not being picked up by inference at all (`doc/backlog.md`'s
+// own former "An inherent-impl method's own generics..." item) — now simply
+// the only `Dense`-forward function, that gap having nothing left to apply
+// to. A proven-working shape well before this, regardless (`dynarray_new<T>`,
+// every algebra-impl method, and — combining a bound *and* several const
+// generics at once — `cleave/tests/mlir_lower.rs`'s own `a_top_level_fn_
+// combines_a_bounded_type_generic_with_several_const_generics`).
 fn dense_forward<T: Float, const B: i32, const In: i32, const Out: i32>(layer: Dense<T,In,Out>, x: Tensor<T,B,In>) -> Tensor<T,B,Out> {
     matmul(x, layer.w) + broadcast0(layer.b)
 }

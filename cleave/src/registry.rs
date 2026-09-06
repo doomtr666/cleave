@@ -21,30 +21,11 @@ use std::collections::{HashMap, HashSet};
 pub struct Registry {
     algebras: HashMap<String, AlgebraEntry>,
     structs: HashMap<String, StructEntry>,
-    /// Struct name -> method name -> entry. No candidate/ambiguity handling
-    /// needed the way algebra dispatch has (`algebras_with_fn`,
-    /// `AmbiguousOperator`): `driver::merge_programs`' own duplicate-method
-    /// detection already guarantees at most one method of a given name
-    /// exists per struct, so a lookup here is either "the" method or none —
-    /// see `Infer`'s own method-call handling.
-    inherent_methods: HashMap<String, HashMap<String, InherentMethodEntry>>,
 }
 
 struct StructEntry {
     generics: Vec<GenericParam>,
     fields: Vec<Field>,
-}
-
-#[derive(Clone)]
-pub struct InherentMethodEntry {
-    /// The *impl block's* own generics (`impl<T> Vec2<T> { ... }`) — not
-    /// necessarily spelled the same as the struct's own declared generic
-    /// names; the impl's own `target` (below) is what actually establishes
-    /// the correspondence, positionally, the same way an algebra impl's
-    /// target already does for the algebra's own generics.
-    pub generics: Vec<GenericParam>,
-    pub target: Type,
-    pub method: FnDecl,
 }
 
 struct AlgebraEntry {
@@ -223,44 +204,7 @@ impl Registry {
             }
         }
 
-        let mut inherent_methods: HashMap<String, HashMap<String, InherentMethodEntry>> =
-            HashMap::new();
-        for item in &program.items {
-            if let ItemKind::InherentImpl(d) = &item.kind {
-                // Only a bare/generic *path* target names a struct at all —
-                // an inherent impl on, say, an array type has nowhere to
-                // register itself usefully (nothing could ever dispatch a
-                // method call to it, since dispatch always starts from a
-                // resolved struct name); silently unindexed rather than a
-                // hard error, matching this file's "just data, no
-                // validation" stance (a real diagnostic for this, if
-                // wanted, belongs in `infer.rs` alongside its other
-                // `pending_type_name_checks`-style checks, not here).
-                let TypeKind::Path(p, _) = &d.target.kind else {
-                    continue;
-                };
-                let struct_name = p.segments.join("::");
-                for f in &d.fns {
-                    inherent_methods
-                        .entry(struct_name.clone())
-                        .or_default()
-                        .insert(
-                            f.name.clone(),
-                            InherentMethodEntry {
-                                generics: d.generics.clone(),
-                                target: d.target.clone(),
-                                method: f.clone(),
-                            },
-                        );
-                }
-            }
-        }
-
-        Registry {
-            algebras,
-            structs,
-            inherent_methods,
-        }
+        Registry { algebras, structs }
     }
 
     /// Does `algebra` have an `impl` for this concrete target type? String
@@ -426,17 +370,6 @@ impl Registry {
             .get(name)
             .map(|e| e.generics.as_slice())
             .unwrap_or(&[])
-    }
-
-    /// The struct's own inherent method named `method_name`, if any — see
-    /// `InherentMethodEntry`'s own doc comment for why this is a plain
-    /// lookup, no ambiguity/candidate handling.
-    pub fn inherent_method(
-        &self,
-        struct_name: &str,
-        method_name: &str,
-    ) -> Option<&InherentMethodEntry> {
-        self.inherent_methods.get(struct_name)?.get(method_name)
     }
 
     /// Every *single-target* impl of `algebra` whose own target is a

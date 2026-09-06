@@ -37,17 +37,6 @@ pub enum ItemKind {
     Struct(StructDecl),
     Algebra(AlgebraDecl),
     Impl(ImplDecl),
-    /// `impl<T> Vec2<T> { fn len(v) { ... } }` — ordinary methods belonging
-    /// directly to a `struct`, no algebra/registry dispatch involved (see
-    /// `grammar.pest`'s own `inherent_impl` comment). Kept as a separate
-    /// `ItemKind` rather than folding into `ImplDecl` with an
-    /// `Option<String>` algebra field: the two have almost nothing in
-    /// common past "a generics list plus some `fn`s" once dispatch is
-    /// considered (no `Registry` algebra entry, no signature-conformance
-    /// check against a declared `fn_sig`, no target-pattern coherence
-    /// checking) — an `Option` would just move that same either/or split
-    /// into every reader of `ImplDecl` instead of into the type itself.
-    InherentImpl(InherentImplDecl),
     Fn(FnDecl),
 }
 pub type Item = Node<ItemKind>;
@@ -167,19 +156,6 @@ pub struct ImplDecl {
     /// generic parameter list starting from its second entry — empty for
     /// every single-generic algebra (i.e. almost always).
     pub extra_targets: Vec<Type>,
-    pub fns: Vec<FnDecl>,
-}
-
-#[derive(Debug, Clone)]
-pub struct InherentImplDecl {
-    /// The impl's *own* generic parameters (`impl<T> Vec2<T> { ... }`) —
-    /// distinct from the struct's own declared generics (looked up via
-    /// `Registry::struct_generics`), same relationship `ImplDecl::generics`
-    /// has to the algebra's own.
-    pub generics: Vec<GenericParam>,
-    /// Almost always a bare struct name (`Vec2`); can carry its own generic
-    /// arguments the same way a field/parameter type can (`Matrix<T, R, C>`).
-    pub target: Type,
     pub fns: Vec<FnDecl>,
 }
 
@@ -494,7 +470,6 @@ pub enum ExprKind {
     /// `is_extern`/`#[mlir(...)]` already take elsewhere in this file).
     Call(Path, Vec<GenericArg>, Vec<Expr>, Vec<(String, String)>),
     FieldAccess(Box<Expr>, String),
-    MethodCall(Box<Expr>, String, Vec<Expr>),
     /// One bracket group, `a[i]` or the Fortran-style multi-index sugar
     /// `a[i, j, ...]` — every comma-separated index collected directly into
     /// this one node, never flattened into nested `Index` nodes the way an

@@ -58,15 +58,15 @@ fn load_test_input(sample: i32) -> Tensor<f32, 1, 64> {
     Tensor::<f32, 1, 64>(data: [pixels])
 }
 
-// No final activation -- raw logits, matching `Dense::forward`'s own "no
+// No final activation -- raw logits, matching `dense_forward`'s own "no
 // activation baked in, the caller composes whichever it wants" design
 // (`stdlib/nn/nn.cleave`). `loss` below regresses these directly against a
 // one-hot target (plain sum-of-squares, not softmax/cross-entropy -- no
 // such algebra exists in this stdlib yet, and building one is a separate,
 // later step, not needed to get a real training loop running first).
 fn forward(x: Tensor<f32, 1, 64>, net: Network) -> Tensor<f32, 1, 10> {
-    let h = sigmoid(net.l1.forward(x));
-    net.l2.forward(h)
+    let h = sigmoid(net.l1.dense_forward(x));
+    net.l2.dense_forward(h)
 }
 
 // Stays tensor-native throughout, never decomposed into scalars -- `err`

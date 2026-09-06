@@ -76,20 +76,6 @@ pub fn dump_program(program: &Program, registry: &Registry) -> (String, Vec<Type
                 }
                 let _ = writeln!(out, "}}");
             }
-            ItemKind::InherentImpl(d) => {
-                let _ = writeln!(out, "impl {} {{", fmt_type(&d.target));
-                dump_inherent_impl_block(
-                    &mut out,
-                    &mut errors,
-                    &d.fns,
-                    registry,
-                    &program_inference.global_env,
-                    &d.generics,
-                    &d.target,
-                    item.span,
-                );
-                let _ = writeln!(out, "}}");
-            }
         }
     }
 
@@ -302,61 +288,6 @@ fn dump_impl_fn(
 /// two separately-declared methods on the same struct impossible in
 /// principle: each method's own body was inferred in total isolation, with
 /// no way for one to see the other's still-open placeholder.
-fn dump_inherent_impl_block(
-    out: &mut String,
-    errors: &mut Vec<TypeError>,
-    fns: &[FnDecl],
-    registry: &Registry,
-    global_env: &Env,
-    impl_generics: &[GenericParam],
-    target: &Type,
-    fallback_span: Span,
-) {
-    let mut infer = Infer::new(registry);
-    let (_, mut results) =
-        infer.infer_inherent_impl_block(global_env, impl_generics, target, fns, fallback_span);
-    for f in fns {
-        match results.remove(&f.name) {
-            Some(Ok((param_types, ret))) => {
-                let mut names = TyVarNames::default();
-                let params: Vec<String> = f
-                    .params
-                    .iter()
-                    .zip(param_types.iter())
-                    .map(|(p, t)| format!("{}: {}", p.name, fmt_ty_named(t, &mut names)))
-                    .collect();
-                let ret = fmt_ty_named(&ret, &mut names);
-                let _ = writeln!(out, "fn {}({}) -> {ret} {{", f.name, params.join(", "));
-                // A bodyless inherent method is rejected by `infer_inherent_
-                // impl_fn_raw` itself (`MissingFnBody`) before it could ever
-                // reach `Ok` here.
-                let body = f
-                    .body
-                    .as_ref()
-                    .expect("an inherent method reaching Ok always has a body");
-                dump_block(out, body, &infer.node_types, &mut names, 1);
-                let _ = writeln!(out, "}}");
-            }
-            Some(Err(e)) => {
-                let params: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
-                let _ = writeln!(
-                    out,
-                    "fn {}({}) {{ /* type error, see diagnostics */ }}",
-                    f.name,
-                    params.join(", ")
-                );
-                errors.push(e);
-            }
-            // `infer_inherent_impl_block` always inserts exactly one entry
-            // per `fns` -- unreachable outside a bug in that invariant.
-            None => unreachable!(
-                "infer_inherent_impl_block did not report a result for `{}`",
-                f.name
-            ),
-        }
-    }
-}
-
 pub(crate) fn dump_block(
     out: &mut String,
     block: &Block,
@@ -488,13 +419,6 @@ fn fmt_expr_typed(
             "{}.{name}",
             fmt_expr_typed(base, node_types, names, call_names)
         ),
-        ExprKind::MethodCall(base, name, args) => {
-            format!(
-                "{}.{name}({})",
-                fmt_expr_typed(base, node_types, names, call_names),
-                fmt_expr_list_typed(args, node_types, names, call_names)
-            )
-        }
         ExprKind::Index(base, indices) => {
             format!(
                 "{}[{}]",

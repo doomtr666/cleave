@@ -1932,19 +1932,17 @@ fn bitnot_works_across_every_non_i32_width() {
     assert_eq!(run_i32(&context, src), 3);
 }
 
-// ------------------------------------------------------------ inherent impls
+// ------------------------------------------------------------ dot-call sugar on top-level functions
 
-/// `doc/user_guide.md`'s own existing "Inherent impls" example, run for
-/// real via dot-call syntax for the first time (previously caveated as
-/// "type-checks but can't be JIT-executed yet").
+/// `doc/user_guide.md`'s own former "Inherent impls" example — now a plain
+/// top-level function, dot-called. Inherent impls are gone as a language
+/// concept; `v.method(args)` is pure sugar for `method(v, args)`.
 #[test]
-fn a_non_generic_inherent_method_called_via_dot_syntax_actually_runs() {
+fn dot_call_on_a_top_level_function_actually_runs() {
     let context = context();
     let src = "
         struct Vec2 { x: f64, y: f64 }
-        impl struct Vec2 {
-            fn magnitude_sq(v) -> f64 { v.x * v.x + v.y * v.y }
-        }
+        fn magnitude_sq(v: Vec2) -> f64 { v.x * v.x + v.y * v.y }
         fn main() -> i32 {
             let v = Vec2(x: 1.0, y: 2.0);
             if v.magnitude_sq() == 5.0 { 1 } else { 0 }
@@ -1953,21 +1951,18 @@ fn a_non_generic_inherent_method_called_via_dot_syntax_actually_runs() {
     assert_eq!(run_i32(&context, src), 1);
 }
 
-/// Mutual recursion between two sibling inherent methods on the *same*
-/// struct — `infer_inherent_impl_block`'s own stated reason for existing
-/// (both methods inferred together, sharing one `Infer`), now proven all
-/// the way through real execution: `w.dec().is_odd()` calling back into a
-/// sibling `is_even`, and vice versa.
+/// Mutual recursion between two sibling top-level functions, chained
+/// entirely through dot-call syntax: `w.dec().is_odd()` calling back into
+/// `is_even`, and vice versa -- proves the desugar chains correctly, not
+/// just a single dot-call in isolation.
 #[test]
-fn mutually_recursive_inherent_methods_on_the_same_struct_actually_run() {
+fn mutually_recursive_functions_chained_via_dot_syntax_actually_run() {
     let context = context();
     let src = "
         struct Wrapped { n: i32 }
-        impl struct Wrapped {
-            fn dec(w) -> Wrapped { Wrapped(n: w.n - 1) }
-            fn is_even(w) -> bool { if w.n == 0 { true } else { w.dec().is_odd() } }
-            fn is_odd(w) -> bool { if w.n == 0 { false } else { w.dec().is_even() } }
-        }
+        fn dec(w: Wrapped) -> Wrapped { Wrapped(n: w.n - 1) }
+        fn is_even(w: Wrapped) -> bool { if w.n == 0 { true } else { w.dec().is_odd() } }
+        fn is_odd(w: Wrapped) -> bool { if w.n == 0 { false } else { w.dec().is_even() } }
         fn main() -> i32 {
             let w = Wrapped(n: 7);
             if w.is_odd() { 1 } else { 0 }
@@ -1976,19 +1971,15 @@ fn mutually_recursive_inherent_methods_on_the_same_struct_actually_run() {
     assert_eq!(run_i32(&context, src), 1);
 }
 
-/// A *generic* inherent impl (`impl<T> Boxed<T> { ... }`) — `cps.rs::
-/// collect_units`'s own `InherentImpl` branch reads specializations back
-/// from `monomorphize.rs`'s own inherent-method worklist, mirroring the
-/// generic-algebra-impl case exactly but through `InherentTemplate`/
-/// `derive_inherent_instantiation` instead.
+/// A generic top-level function, dot-called on a generic struct value --
+/// mirrors the old generic-inherent-impl case, now through the single
+/// unified top-level-fn + algebra resolution path.
 #[test]
-fn a_generic_inherent_method_called_via_dot_syntax_actually_runs() {
+fn a_generic_top_level_function_called_via_dot_syntax_actually_runs() {
     let context = context();
     let src = "
         struct Boxed<T> { value: T }
-        impl<T: Ring> struct Boxed<T> {
-            fn doubled(b) -> T { add(b.value, b.value) }
-        }
+        fn doubled<T: Ring>(b: Boxed<T>) -> T { add(b.value, b.value) }
         fn main() -> i32 {
             let b = Boxed(value: 21);
             b.doubled()
@@ -1997,19 +1988,17 @@ fn a_generic_inherent_method_called_via_dot_syntax_actually_runs() {
     assert_eq!(run_i32(&context, src), 42);
 }
 
-/// The same generic inherent method, called at *two different* concrete
-/// types from two different call sites — each needs its own independent
+/// The same generic function, dot-called at *two different* concrete types
+/// from two different call sites — each needs its own independent
 /// specialization (mirrors `a_generic_function_called_at_two_types_
-/// converts_to_two_separate_specializations` in `cleave/tests/cps.rs`, one
-/// level up for inherent impls).
+/// converts_to_two_separate_specializations` in `cleave/tests/cps.rs`, via
+/// dot-call syntax specifically).
 #[test]
-fn a_generic_inherent_method_called_at_two_types_computes_the_right_value() {
+fn a_generic_top_level_function_called_at_two_types_via_dot_syntax() {
     let context = context();
     let src = "
         struct Boxed<T> { value: T }
-        impl<T: Ring> struct Boxed<T> {
-            fn doubled(b) -> T { add(b.value, b.value) }
-        }
+        fn doubled<T: Ring>(b: Boxed<T>) -> T { add(b.value, b.value) }
         fn main() -> i32 {
             let bi = Boxed(value: 21);
             let bf = Boxed(value: 1.5);
@@ -2019,20 +2008,16 @@ fn a_generic_inherent_method_called_at_two_types_computes_the_right_value() {
     assert_eq!(run_i32(&context, src), 42);
 }
 
-/// `doc/backlog.md`'s own "An inherent-impl method's own generics aren't
-/// picked up by inference at all" item — a method declaring a generic of
-/// its *own* (`fn pick<X>`), beyond whatever the enclosing `impl` block
-/// already binds. Both call arguments must unify against the *same* fresh
-/// `X`, pinned by the first one seen — proves it's a real, shared type
-/// variable, not two independent ones that happen to agree by coincidence.
+/// A function's own generic (`X`), called via dot-call, unifying both
+/// arguments against the *same* fresh type variable, pinned by the first
+/// one seen — proves it's a real, shared type variable, not two
+/// independent ones that happen to agree by coincidence.
 #[test]
-fn an_inherent_methods_own_generic_is_a_real_fresh_type_variable() {
+fn a_dot_called_functions_own_generic_is_a_real_fresh_type_variable() {
     let context = context();
     let src = "
         struct Foo { n: i32 }
-        impl struct Foo {
-            fn pick<X>(foo, a: X, b: X) -> X { a }
-        }
+        fn pick<X>(foo: Foo, a: X, b: X) -> X { a }
         fn main() -> i32 {
             let f = Foo(n: 0);
             f.pick(7, 9)
@@ -2041,41 +2026,15 @@ fn an_inherent_methods_own_generic_is_a_real_fresh_type_variable() {
     assert_eq!(run_i32(&context, src), 7);
 }
 
-/// The same shape as above, but on a *generic* inherent impl (`impl<T>
-/// Boxed<T>`) — the method's own generic (`X`) must stay independent from
-/// the impl block's own (`T`), not collide with or shadow it.
-#[test]
-fn an_inherent_methods_own_generic_stays_independent_of_the_impls_own() {
-    let context = context();
-    let src = "
-        struct Boxed<T> { value: T }
-        impl<T: Ring> struct Boxed<T> {
-            fn combine<X>(b, a: X, c: X) -> X { a }
-        }
-        fn main() -> i32 {
-            let b = Boxed(value: 1.5);
-            b.combine(7, 9)
-        }
-    ";
-    assert_eq!(run_i32(&context, src), 7);
-}
-
-/// The same method, called at two different concrete types from two
+/// The same function, dot-called at two different concrete types from two
 /// different call sites in the same program — each needs its own
-/// independent specialization (mirrors `a_generic_inherent_method_called_
-/// at_two_types_computes_the_right_value` above, for a method-level
-/// generic on an otherwise *non*-generic impl specifically — the exact
-/// shape `build_inherent_templates`/`cps.rs::collect_units` used to skip
-/// entirely, since neither the impl block nor (until this fix) a method's
-/// own generics were ever checked there).
+/// independent specialization.
 #[test]
-fn an_inherent_methods_own_generic_is_specialized_independently_at_two_call_sites() {
+fn a_dot_called_functions_own_generic_is_specialized_independently_at_two_call_sites() {
     let context = context();
     let src = "
         struct Foo { n: i32 }
-        impl struct Foo {
-            fn pick<X>(foo, a: X, b: X) -> X { a }
-        }
+        fn pick<X>(foo: Foo, a: X, b: X) -> X { a }
         fn main() -> i32 {
             let f = Foo(n: 0);
             let i = f.pick(7, 9);
@@ -2252,9 +2211,7 @@ fn a_const_generic_read_as_a_body_value_with_no_turbofish_actually_runs() {
     let context = context();
     let src = "
         struct Box<T, const N: i32> { data: [T; N] }
-        impl<T, const N: i32> struct Box<T, N> {
-            fn size(b) -> i32 { N }
-        }
+        fn size<T, const N: i32>(b: Box<T, N>) -> i32 { N }
         fn main() -> i32 {
             Box(data: [1, 2, 3]).size()
         }
@@ -3241,7 +3198,7 @@ fn dense_layer_forward_computes_the_right_values() {
                 b: Tensor::<f32, 1, 2>(data: [[0.0, 0.0]])
             );
             let x: Tensor<f32, 1, 2> = Tensor::<f32, 1, 2>(data: [[0.0, 1.0]]);
-            let h = layer.forward(x);
+            let h = layer.dense_forward(x);
             if h[0, 0] == 0.0 and h[0, 1] == -1.0 { 1 } else { 0 }
         }
     ";
@@ -3319,7 +3276,7 @@ fn derive_through_dense_forward_computes_the_right_gradient_body() {
         use linalg;
         fn loss(x1: f32, x2: f32, y: f32, layer: Dense<f32, 2, 2>) -> f32 {
             let x = Tensor::<f32, 1, 2>(data: [[x1, x2]]);
-            let h = sigmoid(layer.forward(x));
+            let h = sigmoid(layer.dense_forward(x));
             let pred = h[0, 0] + h[0, 1];
             let err = pred - y;
             err * err
@@ -3398,7 +3355,7 @@ fn grad_through_dense_forward_computes_the_right_gradient_body() {
         use nn;
         use linalg;
         fn loss(x: Tensor<f32, 1, 2>, y: f32, layer: Dense<f32, 2, 2>) -> f32 {
-            let h = sigmoid(layer.forward(x));
+            let h = sigmoid(layer.dense_forward(x));
             let pred = sum(h);
             let err = pred - y;
             err * err
@@ -5659,8 +5616,8 @@ fn optimizer_momentum_trains_a_real_network_to_convergence_body() {
         }
         fn forward(x1: f32, x2: f32, net: Network) -> f32 {
             let x = Tensor::<f32, 1, 2>(data: [[x1, x2]]);
-            let h = sigmoid(net.l1.forward(x));
-            let out = sigmoid(net.l2.forward(h));
+            let h = sigmoid(net.l1.dense_forward(x));
+            let out = sigmoid(net.l2.dense_forward(h));
             out[0, 0]
         }
         fn loss(x1: f32, x2: f32, y: f32, net: Network) -> f32 {

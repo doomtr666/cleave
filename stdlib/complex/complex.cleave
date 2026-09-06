@@ -40,17 +40,17 @@ impl<T: Float> Ring<Complex<T>> {
     fn neg(x) { Complex(real: -x.real, imag: -x.imag) }
 }
 
-// `magnitude_sq`/`magnitude` — inherent methods (not `Ring`, not shared with
-// any other numeric type), same shape as `real`/`imag` field access itself.
-// `magnitude_sq` avoids `sqrt` entirely (`real*real + imag*imag`, exact) --
-// the one every escape-radius/threshold check actually wants (comparing a
-// squared distance against a squared threshold needs no root at all).
-// `magnitude` is the real Euclidean norm, `mlir::math::sqrt` on top of it --
-// the same reserved, structurally-recognized `mlir::dialect::op(...)`
-// mechanism every other primitive operation in this stdlib already goes
-// through (`doc/hld.md`'s own "one generic op-emitting primitive" thesis),
-// not a new special case.
-impl<T: Float> struct Complex<T> {
-    fn magnitude_sq(z) -> T { z.real * z.real + z.imag * z.imag }
-    fn magnitude(z) -> T { mlir::math::sqrt(z.magnitude_sq()) }
-}
+// `magnitude_sq`/`magnitude` — ordinary top-level generic `fn`s, called
+// through dot-syntax's own universal sugar (`z.magnitude()` desugars to
+// `magnitude(z)`, same as any other bare call — `doc/backlog-done.md`'s own
+// "impls inhérents" entry). Not `Ring`, not shared with any other numeric
+// type — same shape as `real`/`imag` field access itself. `magnitude_sq`
+// avoids `sqrt` entirely (`real*real + imag*imag`, exact) -- the one every
+// escape-radius/threshold check actually wants (comparing a squared distance
+// against a squared threshold needs no root at all). `magnitude` is the real
+// Euclidean norm, `mlir::math::sqrt` on top of it -- the same reserved,
+// structurally-recognized `mlir::dialect::op(...)` mechanism every other
+// primitive operation in this stdlib already goes through (`doc/hld.md`'s
+// own "one generic op-emitting primitive" thesis), not a new special case.
+fn magnitude_sq<T: Float>(z: Complex<T>) -> T { z.real * z.real + z.imag * z.imag }
+fn magnitude<T: Float>(z: Complex<T>) -> T { mlir::math::sqrt(z.magnitude_sq()) }

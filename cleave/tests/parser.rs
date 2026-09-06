@@ -432,37 +432,6 @@ fn function_type_with_multiple_params_parses() {
 }
 
 #[test]
-fn inherent_impl_on_a_bare_struct_name_parses() {
-    parses(
-        Rule::impl_decl,
-        "impl struct Vec2 {\n    fn len(v) { v.x }\n}",
-    );
-}
-
-#[test]
-fn inherent_impl_on_a_generic_struct_parses() {
-    parses(
-        Rule::impl_decl,
-        "impl<T> struct Matrix<T> {\n    fn get(m) { m }\n}",
-    );
-}
-
-#[test]
-fn inherent_impl_is_distinguished_from_an_algebra_impl_by_the_struct_keyword() {
-    let pair = CleaveParser::parse(Rule::impl_decl, "impl struct Vec2 { fn len(v) { v.x } }")
-        .unwrap()
-        .next()
-        .unwrap();
-    let inner = pair.into_inner().next().unwrap();
-    assert_eq!(
-        inner.as_rule(),
-        Rule::inherent_impl,
-        "got: {:?}",
-        inner.as_rule()
-    );
-}
-
-#[test]
 fn algebra_impl_is_still_recognized_as_such() {
     let pair = CleaveParser::parse(Rule::impl_decl, "impl Ring<Vec2> { fn add(a, b) { a } }")
         .unwrap()
@@ -472,30 +441,6 @@ fn algebra_impl_is_still_recognized_as_such() {
     assert_eq!(
         inner.as_rule(),
         Rule::algebra_impl,
-        "got: {:?}",
-        inner.as_rule()
-    );
-}
-
-#[test]
-fn a_single_generic_struct_target_is_no_longer_ambiguous_with_an_algebra_impl() {
-    // The real bug the `struct` keyword fixes, found by testing:
-    // `impl<T> Boxed<T> { ... }` (no keyword) parses *identically* either
-    // way -- `algebra_impl` treats `Boxed` as an algebra name with `T` as
-    // its own single-type target, and fully matches, wrongly, since
-    // `algebra_impl` is tried first. The `struct` keyword makes the two
-    // shapes unambiguous at the very first token that differs.
-    let pair = CleaveParser::parse(
-        Rule::impl_decl,
-        "impl<T> struct Boxed<T> { fn get(b) { b } }",
-    )
-    .unwrap()
-    .next()
-    .unwrap();
-    let inner = pair.into_inner().next().unwrap();
-    assert_eq!(
-        inner.as_rule(),
-        Rule::inherent_impl,
         "got: {:?}",
         inner.as_rule()
     );

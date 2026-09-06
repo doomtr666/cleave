@@ -123,18 +123,20 @@ fn load_test_input(sample: i32) -> Tensor<f32, 1, 784> {
 }
 
 // No final activation -- raw logits, matching `examples/digits-interop`'s
-// own identical design (`Dense::forward`'s own "no activation baked in"
-// stance, `stdlib/nn/nn.cleave`). `ReLU` between every hidden layer -- the
-// standard choice for a network this deep (avoids `sigmoid`'s own vanishing-
-// gradient problem at four layers), matching `Init::he()` below.
-// `dense_forward` (`stdlib/nn/nn.cleave`), not `Dense::forward`'s own
-// inherent method -- `B` is a generic *owned by this call itself* (varies
-// per call site: `B=32` here during training, `B=1` from `evaluate` below,
-// same `net` either way), and an inherent-impl method's own additional
-// generics aren't picked up by inference at all (`doc/backlog.md`, found
-// getting this batching work off the ground) -- `dense_forward`, a plain
-// top-level generic fn, sidesteps that gap entirely. `forward` itself
-// stays generic over `B` for the identical reason.
+// own identical design ("no activation baked in" stance, `stdlib/nn/
+// nn.cleave`'s own `dense_forward` doc comment). `ReLU` between every hidden
+// layer -- the standard choice for a network this deep (avoids `sigmoid`'s
+// own vanishing-gradient problem at four layers), matching `Init::he()`
+// below.
+// `dense_forward` (`stdlib/nn/nn.cleave`), a plain top-level generic fn --
+// `B` is a generic *owned by this call itself* (varies per call site:
+// `B=32` here during training, `B=1` from `evaluate` below, same `net`
+// either way), which is exactly the shape `doc/backlog-done.md`'s own "An
+// inherent-impl method's own generics aren't picked up by inference at all"
+// entry found broken for an inherent method's *own* additional generics at
+// the time -- moot now regardless (inherent impls aren't a language concept
+// any more at all, `doc/backlog-done.md`'s own "impls inhérents" entry).
+// `forward` itself stays generic over `B` for the identical reason.
 fn forward<const B: i32>(x: Tensor<f32, B, 784>, net: Network) -> Tensor<f32, B, 10> {
     let h1 = relu(dense_forward(net.l1, x));
     let h2 = relu(dense_forward(net.l2, h1));

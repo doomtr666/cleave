@@ -1599,11 +1599,6 @@ fn check_mutability_expr(expr: &Expr, scope: &HashMap<String, bool>) -> Result<(
             .iter()
             .try_for_each(|a| check_mutability_expr(a, scope)),
         ExprKind::FieldAccess(base, _) => check_mutability_expr(base, scope),
-        ExprKind::MethodCall(base, _, args) => {
-            check_mutability_expr(base, scope)?;
-            args.iter()
-                .try_for_each(|a| check_mutability_expr(a, scope))
-        }
         ExprKind::Index(base, indices) => {
             check_mutability_expr(base, scope)?;
             indices
@@ -1842,29 +1837,6 @@ pub struct Infer<'r> {
     /// confusing message, not a real, located compile error, for something
     /// 100% certain and detectable right here.
     pending_div_by_zero_checks: Vec<(u64, Span)>,
-    /// (struct, method) -> (param types, return-type placeholder) for
-    /// whichever *inherent* method is currently having its own body
-    /// inferred (`infer_inherent_impl_fn_generic`) — the impl-method
-    /// equivalent of a top-level `fn`'s own self-reference seeded into
-    /// `env` (see `infer_fn`). Consulted by `ExprKind::MethodCall`'s own
-    /// dispatch *before* falling back to the registry's static, declared
-    /// signature: an inherent method with no `->` annotation has nothing
-    /// else to offer a recursive call site (dispatch never re-runs a
-    /// callee's own body — see that arm's own doc comment on the narrower,
-    /// still-open gap this doesn't close: a call to a *different*,
-    /// similarly-unannotated method that hasn't started inferring yet still
-    /// falls through to the placeholder).
-    ///
-    /// Only ever holds at most one entry *per nesting level* in practice
-    /// (inherent methods are inferred one at a time, `dump.rs`'s own loop,
-    /// never concurrently) — a plain `HashMap` rather than a stack because
-    /// insert/remove already brackets each method's own body inference
-    /// correctly regardless of whether an outer entry happens to still be
-    /// present (a method calling a *different* struct's method while that
-    /// other struct's own method is *also* mid-inference — not reachable
-    /// today, since nothing infers two methods' bodies inside one another,
-    /// but harmless either way: each key is its own (struct, name) pair).
-    in_progress_methods: HashMap<(String, String), (Vec<Ty>, Ty)>,
     /// Every `let`-bound lambda's own generalized `Scheme`, keyed by the
     /// `Lambda` expression's own `NodeId` (not the `let`'s) — `node_types`
     /// alone isn't enough for a lambda: `ExprKind::Lambda` is a syntactic
@@ -1881,16 +1853,6 @@ pub struct Infer<'r> {
     /// are, re-resolved through `self.subst` at the same points `node_types`
     /// is (see `finish_fn`/`infer_impl_fn_generic_with_env`).
     pub lambda_schemes: HashMap<NodeId, Scheme>,
-    /// Every inherent method's own early-inferred return-type pattern,
-    /// reached anywhere in the whole program — see `callgraph::infer_
-    /// inherent_impls_early`'s own doc comment for why this exists and what
-    /// it does/doesn't cover. `None` (the default, `Infer::new`) for every
-    /// existing caller that doesn't opt in — an ordinary `MethodCall` still
-    /// falls back to the `<not-yet-inferred>` placeholder exactly like
-    /// before, no behavior change for anything that doesn't call
-    /// `with_inherent_patterns`.
-    inherent_patterns:
-        Option<&'r HashMap<(String, String), crate::callgraph::InherentMethodPattern>>,
     /// `monomorphize.rs`'s own `resolved_target_sigs` (`doc/backlog.md`'s
     /// own "composing algebra impl generic over `Opt`..." entry has the
     /// full story) — `None` for every existing caller (the ordinary whole-
@@ -1922,13 +1884,6 @@ pub struct Infer<'r> {
     /// this waits, so it keeps returning the placeholder immediately,
     /// unchanged.
     pending_field_accesses: Vec<PendingFieldAccess>,
-    /// The `MethodCall` counterpart to `pending_field_accesses` — see its
-    /// own doc comment. `arg_tys`/`arg_spans` are captured already-resolved
-    /// (arguments never depend on the base's own resolution, so they're
-    /// still inferred immediately, same as today) — only the base-dependent
-    /// half (which method, on which struct, with what return type) is
-    /// deferred.
-    pending_method_calls: Vec<PendingMethodCall>,
     /// The `Index` (`base[i,j,...]`) counterpart to `pending_field_accesses`
     /// — same reasoning, same shape: `mc[0,0]` right after `let mc =
     /// matmul(ma, mb);` has `mc`'s own type as a bare `Ty::Var` at the point
@@ -1951,17 +1906,6 @@ struct PendingFieldAccess {
     field: String,
     result: TyVar,
     span: Span,
-}
-
-/// See `Infer::pending_method_calls`'s own doc comment.
-struct PendingMethodCall {
-    base: Ty,
-    method: String,
-    arg_tys: Vec<Ty>,
-    arg_spans: Vec<Span>,
-    base_span: Span,
-    result: TyVar,
-    call_span: Span,
 }
 
 /// See `Infer::pending_indices`'s own doc comment.
@@ -2021,12 +1965,9 @@ impl<'r> Infer<'r> {
             loop_stack: Vec::new(),
             pending_type_name_checks: Vec::new(),
             pending_div_by_zero_checks: Vec::new(),
-            in_progress_methods: HashMap::new(),
             lambda_schemes: HashMap::new(),
-            inherent_patterns: None,
             external_state_hint: None,
             pending_field_accesses: Vec::new(),
-            pending_method_calls: Vec::new(),
             pending_indices: Vec::new(),
         }
     }
@@ -2034,7 +1975,7 @@ impl<'r> Infer<'r> {
     /// Opts this instance into consulting `hint` the moment an algebra
     /// dispatch commits — see `external_state_hint`'s own doc comment for
     /// what it does and why. Builder-style, chains onto `Infer::new_with_
-    /// vars` the same way `with_inherent_patterns` chains onto `Infer::new`.
+    /// vars`.
     pub(crate) fn with_external_state_hint(
         mut self,
         hint: &'r HashMap<(String, Vec<String>), Vec<Ty>>,
@@ -2058,21 +1999,9 @@ impl<'r> Infer<'r> {
         self.vars
     }
 
-    /// Opts this instance into consulting `patterns` (`callgraph::infer_
-    /// inherent_impls_early`'s own output) when `ExprKind::MethodCall`'s own
-    /// dispatch hits an unannotated inherent method — builder-style, so
-    /// `callgraph::infer_program` can chain it directly onto `Infer::new`.
-    pub fn with_inherent_patterns(
-        mut self,
-        patterns: &'r HashMap<(String, String), crate::callgraph::InherentMethodPattern>,
-    ) -> Self {
-        self.inherent_patterns = Some(patterns);
-        self
-    }
-
     /// Starts this instance's own `TyVar` numbering at `start` instead of
-    /// `0` — builder-style, chains onto `Infer::new` exactly like `with_
-    /// inherent_patterns`. Needed whenever *several, temporally-sequential*
+    /// `0` — builder-style, chains onto `Infer::new`. Needed whenever
+    /// *several, temporally-sequential*
     /// `Infer` instances feed their own finished output into a shared,
     /// longer-lived structure that a *later* instance's own live `Subst`
     /// might still get applied against — `callgraph::infer_program`'s own
@@ -2193,37 +2122,6 @@ impl<'r> Infer<'r> {
             }
         }
         mapping
-    }
-
-    /// The combined-mapping counterpart to `fresh_generics_mapping`, for an
-    /// inherent-impl method specifically: `impl_generics` (the enclosing
-    /// `impl<T> Foo<T>` block's own) and `method_generics` (`fn pick<X>`'s
-    /// own, if any) both need fresh vars in the *same* mapping — a method
-    /// body or call site resolving a bare `X` has no separate mapping to
-    /// fall back to (`ty_from_ast_mapped`'s lookup is one flat `HashMap`),
-    /// and building two independent mappings instead of one combined pass
-    /// would also lose any const-generic cross-reference between the two
-    /// lists (a method's own `const K: T` naming the impl's own `T`, say —
-    /// `fresh_generics_mapping`'s own `Const` handling resolves a width
-    /// against the *whole* mapping it's given, not just its own list).
-    /// Deliberately just a concatenation into `fresh_generics_mapping`
-    /// itself, not a separate implementation — same bounds/const-width
-    /// handling, same span, for both lists at once.
-    fn fresh_generics_mapping_for_method(
-        &mut self,
-        impl_generics: &[GenericParam],
-        method_generics: &[GenericParam],
-        span: Span,
-    ) -> HashMap<String, Ty> {
-        if method_generics.is_empty() {
-            // The overwhelmingly common case (no method-level generics at
-            // all) — skip the allocation `to_vec`/`extend` would otherwise
-            // always pay.
-            return self.fresh_generics_mapping(impl_generics, span);
-        }
-        let mut combined = impl_generics.to_vec();
-        combined.extend_from_slice(method_generics);
-        self.fresh_generics_mapping(&combined, span)
     }
 
     /// The pack-aware counterpart to `ExprKind::StructLit`'s own ordinary
@@ -2709,161 +2607,6 @@ impl<'r> Infer<'r> {
                 },
             }),
         }
-    }
-
-    /// The `MethodCall` counterpart to `resolve_field_access` — given an
-    /// *already concrete* base type and the call's own already-inferred
-    /// argument types (arguments never depend on the base's own
-    /// resolution, so both the immediate and deferred callers infer them
-    /// up front, unchanged), finds and dispatches `name`. Deliberately
-    /// excludes the `in_progress_methods` self-recursion branch: those
-    /// entries only ever exist *during* a method body's own in-flight
-    /// inference and are always removed before that same call's
-    /// `finish_fn`/defaulting phase runs — by the time a deferred call
-    /// reaches this helper, `in_progress_methods` is structurally
-    /// guaranteed not to contain it, so the immediate call site keeps that
-    /// check inline, before ever calling this. See
-    /// `pending_method_calls`'s own doc comment for why a method call
-    /// needs deferring at all.
-    fn resolve_method_call(
-        &mut self,
-        resolved_base: &Ty,
-        name: &str,
-        arg_tys: &[Ty],
-        arg_spans: &[Span],
-        base_span: Span,
-        call_span: Span,
-    ) -> Result<Ty, TypeError> {
-        let struct_name = match resolved_base {
-            Ty::Con(n) => n.clone(),
-            Ty::App(n, _) => n.clone(),
-            // A function value, array, or const-value — none of these have
-            // methods, rejected the same way `resolve_field_access` rejects
-            // them for fields. `Ty::Var` is included only for
-            // exhaustiveness — the deferred path only ever calls this once
-            // `check_pending_method_calls` has already confirmed the base
-            // is concrete; the immediate path already returned earlier for
-            // a bare `Ty::Var`.
-            Ty::Fn(..)
-            | Ty::Array(..)
-            | Ty::Const(_)
-            | Ty::Var(_)
-            | Ty::ConstExpr(..)
-            | Ty::Pack(_)
-            | Ty::PackResolved(_)
-            | Ty::PackLen(_) => {
-                return Err(TypeError {
-                    span: call_span,
-                    kind: TypeErrorKind::NoSuchMethod {
-                        struct_name: resolved_base.to_string(),
-                        method: name.to_string(),
-                    },
-                });
-            }
-        };
-        let Some(entry) = self.registry.inherent_method(&struct_name, name).cloned() else {
-            return Err(TypeError {
-                span: call_span,
-                kind: TypeErrorKind::NoSuchMethod {
-                    struct_name,
-                    method: name.to_string(),
-                },
-            });
-        };
-        // `base` fills the method's own first parameter — an ordinary,
-        // explicit positional argument, not a magic `self` (see
-        // `grammar.pest`'s `inherent_impl` comment for why: this project
-        // doesn't have implicit-anything elsewhere, no reason to invent one
-        // here).
-        if entry.method.params.is_empty() || entry.method.params.len() != arg_tys.len() + 1 {
-            return Err(TypeError {
-                span: call_span,
-                kind: TypeErrorKind::ArityMismatch {
-                    name: name.to_string(),
-                    expected: entry.method.params.len(),
-                    found: arg_tys.len() + 1,
-                },
-            });
-        }
-        // The impl block's own generics (`impl<T: Float> Vec2<T>`) — fresh
-        // per call, bounds pushed as real `Constraint`s exactly like an
-        // algebra impl's own (`fresh_generics_mapping`). `target_ty` —
-        // built *from* `impl_mapping`, so `Boxed<T>` becomes
-        // `App("Boxed", [impl_mapping["T"]])` — is what actually pins those
-        // generics down once unified against `resolved_base` below; a bare
-        // fresh var for `param_tys[0]` would *also* end up correctly
-        // unified with `resolved_base`, but as its own, disconnected
-        // variable, never actually feeding back into `impl_mapping` at all
-        // — a real bug, found by testing: a generic inherent method's own
-        // return type (`T`, resolved through this same `impl_mapping`)
-        // came back as a bare, still-unconstrained variable instead of the
-        // concrete type `base` actually has. Mirrors
-        // `infer_inherent_impl_fn_generic`'s own identical fix for the
-        // exact same reason, on the declaration side. The method's own
-        // generics (`fn pick<X>(...)`, `doc/backlog.md`'s own "An
-        // inherent-impl method's own generics aren't picked up by
-        // inference at all" item) get fresh vars in this same mapping too
-        // — see `fresh_generics_mapping_for_method`'s own doc comment;
-        // `entry.target` never references a method-level generic (only the
-        // impl block's own), so folding both lists into one mapping here
-        // doesn't change `target_ty`'s own construction at all, only what
-        // `param_tys` below can resolve.
-        let impl_mapping =
-            self.fresh_generics_mapping_for_method(&entry.generics, &entry.method.generics, call_span);
-        let target_ty = self.ty_from_ast_mapped(&entry.target, &impl_mapping);
-        let param_tys =
-            self.inherent_method_param_tys(&entry.method.params, &impl_mapping, &target_ty);
-        self.unify_at(base_span, &param_tys[0], resolved_base)?;
-        for (pt, (at, sp)) in param_tys[1..]
-            .iter()
-            .zip(arg_tys.iter().zip(arg_spans.iter()))
-        {
-            self.unify_at(*sp, pt, at)?;
-        }
-        // Unlike an algebra call (which always has a real declared
-        // signature, return type included, to fall back on) or a
-        // top-level `fn` call (whose return type was already *inferred*,
-        // once, by the whole-program pass, then generalized into a
-        // reusable `Scheme` — see `callgraph.rs`) — dispatch here never
-        // re-runs the method's own body at the call site (except for the
-        // recursive, `in_progress_methods` case handled by the immediate
-        // caller before ever reaching here), so an inherent method with no
-        // explicit `->` annotation has no return type available *anywhere*
-        // else to report... unless `callgraph::infer_inherent_impls_early`
-        // already ran and published one (`self.inherent_patterns`, opted
-        // into via `with_inherent_patterns` — only
-        // `callgraph::infer_program` itself does today). Its own pattern's
-        // free vars are named by generic-parameter *name*
-        // (`generics_mapping`, built by a *different* `Infer` instance than
-        // this call site's own `impl_mapping`), so reusing it means
-        // cross-referencing by name and remapping through *this* call
-        // site's own fresh vars, not substituting it in directly. Falls
-        // back to the placeholder, same posture as every other
-        // genuinely-unresolved case in this file, for a method whose own
-        // return type couldn't be determined even by that early pass (e.g.
-        // it depends on a top-level `fn`, not yet visible to it — see that
-        // pass's own doc comment for why this is a deliberate, graceful
-        // deferral, not a bug).
-        Ok(entry
-            .method
-            .ret
-            .as_ref()
-            .map(|t| self.ty_from_ast_mapped(t, &impl_mapping))
-            .or_else(|| {
-                let pattern = self
-                    .inherent_patterns?
-                    .get(&(struct_name.clone(), name.to_string()))?;
-                let remap: HashMap<TyVar, Ty> = pattern
-                    .generics_mapping
-                    .iter()
-                    .filter_map(|(n, t)| match t {
-                        Ty::Var(v) => Some((*v, impl_mapping[n].clone())),
-                        _ => None,
-                    })
-                    .collect();
-                Some(substitute(&pattern.ret_pattern, &remap))
-            })
-            .unwrap_or_else(|| Ty::Con("<not-yet-inferred>".to_string())))
     }
 
     /// Fresh parameter types (annotated → concrete, else a fresh variable)
@@ -3419,7 +3162,6 @@ impl<'r> Infer<'r> {
         self.check_pending_type_names()?;
         self.check_pending_div_by_zero()?;
         self.check_pending_field_accesses()?;
-        self.check_pending_method_calls()?;
 
         self.param_types = param_types.iter().map(|t| self.subst.apply(t)).collect();
         let resolved_nodes: Vec<(NodeId, Ty)> = self
@@ -3443,406 +3185,6 @@ impl<'r> Infer<'r> {
         Ok(final_result)
     }
 
-    /// Infers one method of an *inherent* impl (`impl<T> Vec2<T> { fn
-    /// len(v) { ... } }`) — much simpler than `infer_impl_fn_generic_with_env`:
-    /// no algebra, so no declared `fn_sig` to conform to, no target-pattern
-    /// existence/coherence checking. Params are typed exactly like an
-    /// ordinary top-level `fn`'s own (annotated → resolved through
-    /// `impl_mapping`, so a `T`/`R`/`C` reference resolves to the impl's own
-    /// fresh generic instead of a bogus literal `Con("T")`; unannotated →
-    /// fresh var) — **except the first parameter**, which defaults to the
-    /// impl's own `target` type when left unannotated, exactly the same
-    /// "fall back to what the enclosing impl already declares" treatment an
-    /// *algebra* impl's own unannotated params already get from that
-    /// algebra's declared `fn_sig` (an inherent impl has no separate
-    /// signature to fall back to at all — the target itself is the closest
-    /// equivalent, and specifically *the first parameter's* role, "the
-    /// value this method belongs to", is already established by the impl
-    /// block itself: `impl Vec2 { fn len(v) { v.x } }` already says this
-    /// method is about `Vec2` values, so `v` defaulting to `Vec2` isn't new
-    /// magic, just the same "unannotated infers from context" this project
-    /// already does everywhere else). Found necessary by direct testing:
-    /// without this, `v.x` inside an unannotated `fn len(v) { v.x }` sees
-    /// `v` as a bare, totally unconstrained fresh var (nothing at
-    /// *declaration* time — as opposed to a *call site*, which does supply
-    /// a concrete `resolved_base` — ties it to `Vec2` at all), so
-    /// `FieldAccess` defers it as `<not-yet-inferred>`, which then survives
-    /// to the method's own exposed signature and fails
-    /// `check_no_placeholder` — a method that never mentions its own
-    /// receiver's type anywhere explicit could never type-check standalone
-    /// otherwise. If explicitly annotated anyway, checked against `target`
-    /// like anything else in this file that could carry two independent
-    /// truths, not trusted blindly. The body is inferred normally, the
-    /// declared return type (if any) checked against the body's own result
-    /// — then the same shared `finish_fn` tail every other inference entry
-    /// point uses. `outer` is `global_env`, same reasoning as
-    /// `infer_impl_fn_generic_with_env`'s own (an inherent method can call
-    /// an ordinary top-level `fn` too).
-    pub fn infer_inherent_impl_fn_generic(
-        &mut self,
-        outer: &Env,
-        impl_generics: &[GenericParam],
-        target: &Type,
-        f: &FnDecl,
-        fallback_span: Span,
-    ) -> Result<Ty, TypeError> {
-        // The method's own generics (`fn pick<X>(...)`, `doc/backlog.md`'s
-        // own "An inherent-impl method's own generics aren't picked up by
-        // inference at all" item) get fresh vars alongside the impl block's
-        // — merged into one mapping, not two separate ones, so a body
-        // reference to `X` resolves through `ty_from_ast_mapped`'s ordinary
-        // by-name lookup exactly like `T` already does, instead of falling
-        // through to a bogus literal type named `"X"`. See
-        // `fresh_generics_mapping_for_method`'s own doc comment for why a
-        // single combined mapping (not two independently-built ones) is
-        // needed here.
-        let impl_mapping =
-            self.fresh_generics_mapping_for_method(impl_generics, &f.generics, fallback_span);
-        self.active_generics = impl_mapping.clone();
-        let target_ty = self.ty_from_ast_mapped(target, &impl_mapping);
-        let param_types = self.inherent_method_param_tys(&f.params, &impl_mapping, &target_ty);
-
-        // Self-reference, the impl-method equivalent of `infer_fn`'s own
-        // seeded placeholder — see `in_progress_methods`'s own doc comment
-        // for why this lives there rather than in `env`: a recursive call
-        // goes through `ExprKind::MethodCall`'s own dispatch, which never
-        // consults `env` for its callee at all.
-        let self_key = if let TypeKind::Path(p, _) = &target.kind {
-            Some((p.segments.join("::"), f.name.clone()))
-        } else {
-            None
-        };
-        let ret_var = self.vars.fresh();
-        if let Some(key) = &self_key {
-            self.in_progress_methods
-                .insert(key.clone(), (param_types.clone(), ret_var.clone()));
-        }
-
-        let result = self.infer_inherent_impl_fn_raw(
-            outer,
-            impl_generics,
-            &impl_mapping,
-            &target_ty,
-            param_types.clone(),
-            ret_var,
-            f,
-            fallback_span,
-        );
-
-        if let Some(key) = &self_key {
-            self.in_progress_methods.remove(key);
-        }
-
-        let result = result?;
-        self.quantify_impl_generics(&impl_mapping);
-        self.finish_fn(f, param_types, result)
-    }
-
-    /// The body-inference core `infer_inherent_impl_fn_generic` (single
-    /// method, self-recursion only) and `infer_inherent_impl_block` (every
-    /// method of one impl block, real mutual recursion) both build on —
-    /// stops short of `finish_fn`'s defaulting/constraint-check/placeholder-
-    /// check, for the identical reason `infer_fn_raw` stops short of it for
-    /// a mutually-recursive *group* of top-level `fn`s (see `callgraph.rs`'s
-    /// own doc comment): that sequence must run once, after every method
-    /// sharing this `Infer` has had its body walked, not per-method.
-    fn infer_inherent_impl_fn_raw(
-        &mut self,
-        outer: &Env,
-        impl_generics: &[GenericParam],
-        impl_mapping: &HashMap<String, Ty>,
-        target_ty: &Ty,
-        param_types: Vec<Ty>,
-        ret_var: Ty,
-        f: &FnDecl,
-        fallback_span: Span,
-    ) -> Result<Ty, TypeError> {
-        // Only meaningful when the first parameter is annotated: a call
-        // site has no "annotation" of its own to double-check, just a
-        // concrete `resolved_base` unified against `param_tys[0]` directly
-        // (see `ExprKind::MethodCall`'s own handling) — but a declaration
-        // whose first parameter is annotated (`fn len(v: Vec2) { ... }`)
-        // must still agree with the impl's own target, not silently accept
-        // a second, independent truth.
-        let Some(body) = &f.body else {
-            return Err(TypeError {
-                span: fallback_span,
-                kind: TypeErrorKind::MissingFnBody {
-                    name: f.name.clone(),
-                },
-            });
-        };
-        if let Some(t) = f.params.first().and_then(|p| p.ty.as_ref()) {
-            self.unify_at(t.span, target_ty, &param_types[0])?;
-        }
-
-        let mut env = outer.clone();
-        for (p, ty) in f.params.iter().zip(&param_types) {
-            env.insert(p.name.clone(), Scheme::mono(ty.clone()));
-        }
-        self.seed_const_generics(impl_generics, impl_mapping, &mut env);
-        // The method's own const generics (`fn pick<const K: i32>(...)`,
-        // referenced as an ordinary value in the body, not just a type)
-        // need the identical seeding — `impl_mapping` here is already the
-        // combined impl+method mapping (`fresh_generics_mapping_for_method`,
-        // both real callers of this function), so this is purely "also walk
-        // the method's own generics list," no new mapping needed.
-        self.seed_const_generics(&f.generics, impl_mapping, &mut env);
-
-        let result = self.infer_block(&env, body)?;
-        if let Some(ret) = &f.ret {
-            let declared = self.ty_from_ast_mapped(ret, impl_mapping);
-            self.unify_at(ret.span, &declared, &result)?;
-        }
-        let result_span = body
-            .tail
-            .as_deref()
-            .map(|t| t.span)
-            .unwrap_or(fallback_span);
-        self.unify_at(result_span, &ret_var, &result)?;
-        Ok(result)
-    }
-
-    /// Like `infer_inherent_impl_fn_generic`, but for *every* method of one
-    /// inherent impl block together, sharing one `Infer`/`Subst` — real
-    /// mutual recursion between two separately-declared methods on the
-    /// *same* struct (`fn is_even(w) { ... w.dec().is_odd() ... } fn
-    /// is_odd(w) { ... w.dec().is_even() ... }`), which `in_progress_
-    /// methods`'s single self-only slot can't express (it only ever holds
-    /// an entry for whichever *one* method is currently being inferred).
-    /// The same reasoning `callgraph::infer_program` already applies to
-    /// top-level `fn`s, scoped down to one impl block instead of the whole
-    /// program.
-    ///
-    /// Doesn't build a real call graph or run Tarjan's algorithm the way
-    /// `infer_program` does — there's no *generalization* to order
-    /// correctly here: an inherent method's own generics are re-
-    /// instantiated fresh at every call site via `impl_mapping`, dispatch-
-    /// style, never through a reusable `Scheme` the way a top-level `fn`'s
-    /// own scheme is. Simply seeding every member's self/mutual-reference
-    /// placeholder before inferring *any* of their bodies, then inferring
-    /// all of them against one shared `Infer`, is already correct on its
-    /// own — there's no ordering to get right, only "everyone sees everyone
-    /// else" to arrange.
-    ///
-    /// Mirrors `callgraph.rs`'s own "defaulting/constraint-checking run once
-    /// per group, not once per member" rule, for the identical reason:
-    /// `finish_fn`'s sequence can't run per-method here, since `apply_
-    /// defaults`/`check_pending_constraints` would then drain state a
-    /// not-yet-inferred sibling still needed to contribute to.
-    ///
-    /// Returns `(impl_mapping, per-method results)`: `impl_mapping` is this
-    /// block's own generics-name-to-fresh-var mapping (already built
-    /// internally, previously discarded after use) — exposed so a caller
-    /// that stores one of these methods' own pattern for *later*, cross-
-    /// call-site reuse (`callgraph::infer_inherent_impls_early`) can remap
-    /// its free vars through a *different* call site's own fresh generics
-    /// by cross-referencing generic-parameter *name*, the same trick this
-    /// file's own template-building code already relies on elsewhere. The
-    /// second element is one entry per `fns`, each either the method's own
-    /// final `(param_types, result)` or the `TypeError` that rejected it —
-    /// the caller (`dump.rs`) reads `self.node_types` afterward for
-    /// rendering, same as any other inference entry point; unlike
-    /// `param_types` (a single, last-write-wins field on `Infer`, unsuited
-    /// to more than one method sharing an instance), `node_types` is keyed
-    /// by `NodeId` and already accumulates correctly across however many
-    /// bodies this one `Infer` instance ends up walking.
-    pub fn infer_inherent_impl_block(
-        &mut self,
-        outer: &Env,
-        impl_generics: &[GenericParam],
-        target: &Type,
-        fns: &[FnDecl],
-        fallback_span: Span,
-    ) -> (
-        HashMap<String, Ty>,
-        HashMap<String, Result<(Vec<Ty>, Ty), TypeError>>,
-    ) {
-        let impl_mapping = self.fresh_generics_mapping(impl_generics, fallback_span);
-        self.active_generics = impl_mapping.clone();
-        let target_ty = self.ty_from_ast_mapped(target, &impl_mapping);
-        let struct_name = match &target.kind {
-            TypeKind::Path(p, _) => Some(p.segments.join("::")),
-            _ => None,
-        };
-
-        // Seed every member's placeholder before inferring *any* of their
-        // bodies — visible to every other member (mutual recursion) and to
-        // itself (self-recursion). Each member's own generics (`fn
-        // pick<X>(...)`, `doc/backlog.md`'s own "An inherent-impl method's
-        // own generics aren't picked up by inference at all" item) get
-        // fresh vars *of their own*, layered on top of the block's shared
-        // `impl_mapping` — deliberately not re-freshing `impl_mapping`
-        // itself per method (unlike the single-method
-        // `fresh_generics_mapping_for_method` path): every method in this
-        // block must keep referring to the *same* impl-level `T`, exactly
-        // the consistency mutual recursion (`in_progress_methods`) already
-        // depends on — only a method's own, additional generics are
-        // independent per method.
-        let mut placeholders: HashMap<String, (Vec<Ty>, Ty)> = HashMap::new();
-        let mut method_mappings: HashMap<String, HashMap<String, Ty>> = HashMap::new();
-        for f in fns {
-            let method_mapping = if f.generics.is_empty() {
-                impl_mapping.clone()
-            } else {
-                let mut m = impl_mapping.clone();
-                m.extend(self.fresh_generics_mapping(&f.generics, fallback_span));
-                m
-            };
-            let param_types =
-                self.inherent_method_param_tys(&f.params, &method_mapping, &target_ty);
-            let ret_var = self.vars.fresh();
-            if let Some(name) = &struct_name {
-                self.in_progress_methods.insert(
-                    (name.clone(), f.name.clone()),
-                    (param_types.clone(), ret_var.clone()),
-                );
-            }
-            placeholders.insert(f.name.clone(), (param_types, ret_var));
-            method_mappings.insert(f.name.clone(), method_mapping);
-        }
-
-        let mut raw_results: HashMap<String, Result<Ty, TypeError>> = HashMap::new();
-        for f in fns {
-            let (param_types, ret_var) = placeholders[&f.name].clone();
-            let method_mapping = &method_mappings[&f.name];
-            // `check_pending_type_names` right here, per member, not folded
-            // into a group-wide sweep — see `Infer::check_pending_type_
-            // names`'s own doc comment for why: each entry belongs to
-            // whichever one member's body produced it.
-            let outcome = self
-                .infer_inherent_impl_fn_raw(
-                    outer,
-                    impl_generics,
-                    method_mapping,
-                    &target_ty,
-                    param_types,
-                    ret_var,
-                    f,
-                    fallback_span,
-                )
-                .and_then(|ty| self.check_pending_type_names().map(|()| ty))
-                .and_then(|ty| self.check_pending_div_by_zero().map(|()| ty));
-            raw_results.insert(f.name.clone(), outcome);
-        }
-
-        if let Some(name) = &struct_name {
-            for f in fns {
-                self.in_progress_methods
-                    .remove(&(name.clone(), f.name.clone()));
-            }
-        }
-
-        self.quantify_impl_generics(&impl_mapping);
-        // Also quantify each member's own generics (`fn pick<X>`) — an `X`
-        // left unresolved after its own body is checked (e.g. an argument
-        // never actually used) must not be silently defaulted the same way
-        // an ordinary, genuinely-unconstrained expression would be; each
-        // `method_mappings` entry already contains `impl_mapping`'s own
-        // vars too (harmless to re-quantify, `HashSet::insert` is
-        // idempotent), so this alone is a strict superset of the line above
-        // — kept both for clarity, matching the single-method path's own
-        // one-call shape.
-        for mapping in method_mappings.values() {
-            self.quantify_impl_generics(mapping);
-        }
-        self.apply_defaults();
-        // A constraint failure here is a property of the block's mutual
-        // definition as a whole, not attributable to one specific member —
-        // reported against every member whose own raw inference otherwise
-        // succeeded (a raw-inference failure is already more specific and
-        // is left alone), mirroring `callgraph.rs`'s identical choice.
-        if let Err(e) = self.check_pending_constraints_and_indices() {
-            for outcome in raw_results.values_mut() {
-                if outcome.is_ok() {
-                    *outcome = Err(e.clone());
-                }
-            }
-        }
-        // Same "resolve now that defaulting has run, attribute a failure to
-        // the whole block" posture as `check_pending_constraints` just
-        // above — see `finish_fn`'s identical pairing for the single-
-        // function path.
-        if let Err(e) = self
-            .check_pending_field_accesses()
-            .and_then(|()| self.check_pending_method_calls())
-        {
-            for outcome in raw_results.values_mut() {
-                if outcome.is_ok() {
-                    *outcome = Err(e.clone());
-                }
-            }
-        }
-
-        // Re-resolve `node_types` through the final substitution before any
-        // caller (`dump.rs`) reads it — mirrors `finish_fn`'s identical
-        // step. Skipping this is a real bug, found by testing: a recursive
-        // call site's own node (`w.dec().is_odd()`, inside `is_even`'s own
-        // body) is recorded *while* `is_odd`'s own `ret_var` is still a bare
-        // variable — by the time this method returns, `check_pending_
-        // constraints`/unification elsewhere may have pinned it fully
-        // concrete, but nothing had gone back to update the already-recorded
-        // node entry to match.
-        let resolved_nodes: Vec<(NodeId, Ty)> = self
-            .node_types
-            .iter()
-            .map(|(id, t)| (*id, self.subst.apply(t)))
-            .collect();
-        self.node_types = resolved_nodes.into_iter().collect();
-        self.resolve_lambda_schemes();
-
-        let mut results = HashMap::new();
-        for f in fns {
-            let (param_types, _) = &placeholders[&f.name];
-            let outcome = raw_results.remove(&f.name).unwrap();
-            let resolved = outcome.map(|result_ty| {
-                let final_params: Vec<Ty> =
-                    param_types.iter().map(|t| self.subst.apply(t)).collect();
-                let final_result = self.subst.apply(&result_ty);
-                (final_params, final_result)
-            });
-            let checked = resolved.and_then(|(final_params, final_result)| {
-                check_no_placeholder(f, &final_result, &final_params)?;
-                Ok((final_params, final_result))
-            });
-            results.insert(f.name.clone(), checked);
-        }
-        (impl_mapping, results)
-    }
-
-    /// The "first parameter defaults to the impl's own target type when left
-    /// unannotated" convention shared by an inherent method's own
-    /// declaration (`infer_inherent_impl_fn_generic`) and a method call's
-    /// own dispatch (`ExprKind::MethodCall`) — see either call site's own
-    /// doc comment for why specifically the *first* parameter gets this
-    /// treatment (there's no magic `self`, just an ordinary positional
-    /// parameter whose role — "the value this method belongs to" — the
-    /// enclosing `impl` block already establishes). An explicitly annotated
-    /// parameter (any position) is resolved through `impl_mapping` like any
-    /// other type reference; deliberately doesn't unify or check anything
-    /// here — callers do that with whatever they specifically have on hand
-    /// (a concrete `resolved_base` at a call site, only `target_ty` itself
-    /// at declaration time).
-    fn inherent_method_param_tys(
-        &mut self,
-        params: &[Param],
-        impl_mapping: &HashMap<String, Ty>,
-        target_ty: &Ty,
-    ) -> Vec<Ty> {
-        params
-            .iter()
-            .enumerate()
-            .map(|(i, p)| match &p.ty {
-                Some(t) => self.ty_from_ast_mapped(t, impl_mapping),
-                None if i == 0 => target_ty.clone(),
-                None => self.vars.fresh(),
-            })
-            .collect()
-    }
-
-    /// Shared tail of `infer_fn`/`infer_impl_fn`: defaulting, the qualified-
-    /// constraint sweep, finalizing `node_types`/`param_types` through the
-    /// last substitution, and the unresolved-placeholder safety net.
     fn finish_fn(&mut self, f: &FnDecl, param_types: Vec<Ty>, result: Ty) -> Result<Ty, TypeError> {
         self.apply_defaults();
         // After defaulting, since defaulting can turn an abstract
@@ -3856,7 +3198,6 @@ impl<'r> Infer<'r> {
         // `Ty::Var` at the point it was written now has its answer, one way
         // or the other, now that defaulting has run.
         self.check_pending_field_accesses()?;
-        self.check_pending_method_calls()?;
 
         // Fully re-resolve everything through the final substitution before
         // handing it back — `node_types`/`param_types` may have captured a
@@ -5117,32 +4458,6 @@ impl<'r> Infer<'r> {
         Ok(())
     }
 
-    /// The `MethodCall` counterpart to `check_pending_field_accesses` — see
-    /// its own doc comment, and `pending_method_calls`'s, for the shared
-    /// reasoning. `arg_tys` are passed through unresolved (as captured at
-    /// the deferred call site): `unify`/`unify_at` already resolves both
-    /// sides via `self.subst` internally, so there's no need to re-apply
-    /// here first.
-    pub(crate) fn check_pending_method_calls(&mut self) -> Result<(), TypeError> {
-        for pending in std::mem::take(&mut self.pending_method_calls) {
-            let resolved = self.subst.apply(&pending.base);
-            let ret_ty = if matches!(resolved, Ty::Var(_)) || is_placeholder(&resolved) {
-                Ty::Con("<not-yet-inferred>".to_string())
-            } else {
-                self.resolve_method_call(
-                    &resolved,
-                    &pending.method,
-                    &pending.arg_tys,
-                    &pending.arg_spans,
-                    pending.base_span,
-                    pending.call_span,
-                )?
-            };
-            self.unify_at(pending.call_span, &Ty::Var(pending.result), &ret_ty)?;
-        }
-        Ok(())
-    }
-
     /// Shared tail of `ExprKind::Index`'s own immediate path and `check_
     /// pending_indices`'s deferred one — extracted so the deferred path can
     /// reuse it without duplicating it, exactly like `resolve_field_access`'s
@@ -5566,9 +4881,18 @@ impl<'r> Infer<'r> {
             ExprKind::PackRef(name) => mapping.get(name).map(|t| self.subst.apply(t)),
             // `Dims.len()` in an array-dimension position (`[i32;
             // Dims.len()]`, `doc/backlog.md`'s own "Variadic generics" item)
-            // — see `pack_len_from_method_call`'s own doc comment.
-            ExprKind::MethodCall(base, method, args) => {
-                self.pack_len_from_method_call(mapping, base, method, args)
+            // — see `pack_len_from_method_call`'s own doc comment. Dot-call
+            // is a pure syntactic rewrite now (`lower.rs`), so `Dims.len()`
+            // itself already arrives here as an ordinary one-argument `Call`
+            // (`len(Dims)`), not a distinct `MethodCall` node — this arm
+            // recovers the same "base, method, remaining args" shape
+            // `pack_len_from_method_call` itself expects from that rewritten
+            // form (`args[0]` is `Dims` itself, `path.segments[0]` is
+            // `"len"`, and there are never any further arguments to check —
+            // `pack_len_from_method_call`'s own `!args.is_empty()` guard
+            // still runs, just always against an empty slice here).
+            ExprKind::Call(path, _, args, ..) if path.segments.len() == 1 && args.len() == 1 => {
+                self.pack_len_from_method_call(mapping, &args[0], &path.segments[0], &[])
             }
             ExprKind::Call(path, _, args, ..) if path.segments.len() == 1 && args.len() == 2 => {
                 let a = self.const_value_from_expr(&args[0], mapping)?;
@@ -6024,114 +5348,6 @@ impl<'r> Infer<'r> {
                 self.loop_stack.pop();
                 result?;
                 Ok(self.subst.apply(&accumulator))
-            }
-            ExprKind::MethodCall(base, name, args) => {
-                // `Dims.len()` — checked *before* `base` is inferred as an
-                // ordinary expression: a pack generic's own name is never
-                // inserted into `env` (it's tracked via `self.active_
-                // generics`, a type-level mapping, not a value one), so
-                // `infer_expr` on a bare `Dims` would otherwise fail with
-                // `UnknownName` before this ever gets a chance to run. See
-                // `pack_len_from_method_call`'s own doc comment for why this
-                // can't collide with a genuine method call.
-                if let Some(pack_len) =
-                    self.pack_len_from_method_call(&self.active_generics.clone(), base, name, args)
-                {
-                    return Ok(pack_len);
-                }
-                let base_ty = self.infer_expr(env, base)?;
-                let resolved_base = self.subst.apply(&base_ty);
-                match &resolved_base {
-                    // Still abstract — nothing pinned the base's type down
-                    // *yet*, but it still might (e.g. `apply_defaults`,
-                    // which hasn't run yet at this point in an ordinary
-                    // top-to-bottom pass) — deferred exactly like
-                    // `FieldAccess` defers the same "not knowable yet"
-                    // question, resolved for real once
-                    // `check_pending_method_calls` runs, after defaulting.
-                    // Arguments never depend on the base's own resolution,
-                    // so they're still inferred immediately, right here.
-                    Ty::Var(_) => {
-                        let mut arg_tys = Vec::with_capacity(args.len());
-                        let mut arg_spans = Vec::with_capacity(args.len());
-                        for a in args {
-                            arg_tys.push(self.infer_expr(env, a)?);
-                            arg_spans.push(a.span);
-                        }
-                        let Ty::Var(result) = self.vars.fresh() else {
-                            unreachable!("fresh() always returns Ty::Var")
-                        };
-                        self.pending_method_calls.push(PendingMethodCall {
-                            base: resolved_base,
-                            method: name.clone(),
-                            arg_tys,
-                            arg_spans,
-                            base_span: base.span,
-                            result,
-                            call_span: expr.span,
-                        });
-                        Ok(Ty::Var(result))
-                    }
-                    // An *already*-unresolved placeholder (a method call
-                    // chained off another not-yet-inferred expression) —
-                    // genuinely never resolves no matter how long this
-                    // waits, so it keeps returning the placeholder
-                    // immediately, unchanged.
-                    Ty::Con(name2) if is_placeholder(&resolved_base) => {
-                        let _ = name2;
-                        Ok(Ty::Con("<not-yet-inferred>".to_string()))
-                    }
-                    _ => {
-                        // A (self- or, less commonly, sibling-triggered)
-                        // recursive call back into the method *currently*
-                        // having its own body inferred — see
-                        // `in_progress_methods`'s own doc comment. Reuses
-                        // that enclosing invocation's own already-resolved
-                        // param types and return-type placeholder directly,
-                        // instead of re-deriving a fresh instantiation from
-                        // the registry: there's exactly one in-flight
-                        // instantiation to recurse into, the same one this
-                        // call is already nested inside. Handled here,
-                        // inline, rather than inside `resolve_method_call`:
-                        // `in_progress_methods` entries are always removed
-                        // before that same call's own `finish_fn`/defaulting
-                        // phase runs, so this branch is structurally
-                        // guaranteed irrelevant to the deferred path above.
-                        let struct_name = match &resolved_base {
-                            Ty::Con(n) => Some(n.clone()),
-                            Ty::App(n, _) => Some(n.clone()),
-                            _ => None,
-                        };
-                        if let Some(struct_name) = &struct_name {
-                            if let Some((param_tys, ret_ty)) = self
-                                .in_progress_methods
-                                .get(&(struct_name.clone(), name.clone()))
-                                .cloned()
-                            {
-                                self.unify_at(base.span, &param_tys[0], &resolved_base)?;
-                                for (pt, a) in param_tys[1..].iter().zip(args) {
-                                    let at = self.infer_expr(env, a)?;
-                                    self.unify_at(a.span, pt, &at)?;
-                                }
-                                return Ok(self.subst.apply(&ret_ty));
-                            }
-                        }
-                        let mut arg_tys = Vec::with_capacity(args.len());
-                        let mut arg_spans = Vec::with_capacity(args.len());
-                        for a in args {
-                            arg_tys.push(self.infer_expr(env, a)?);
-                            arg_spans.push(a.span);
-                        }
-                        self.resolve_method_call(
-                            &resolved_base,
-                            name,
-                            &arg_tys,
-                            &arg_spans,
-                            base.span,
-                            expr.span,
-                        )
-                    }
-                }
             }
             ExprKind::ArrayLit(elems) => {
                 // Every element must agree on one type — checked pairwise

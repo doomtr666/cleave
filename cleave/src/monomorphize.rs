@@ -6,12 +6,11 @@
 //! variables anywhere left (see `type_inference.md`'s own "Monomorphization"
 //! section).
 //!
-//! Scoped to top-level `fn`s and *algebra*-impl methods — generic *inherent*
-//! impl methods (`impl<T> struct Boxed<T> { ... }`) aren't attempted yet, a
-//! smaller, structurally similar follow-up left for later (no algebra-level
-//! dispatch-candidate search needed there — `Registry::inherent_method` is
-//! already a direct, unambiguous lookup — but nothing here reuses the
-//! algebra-specific matching machinery below for it yet).
+//! Scoped to top-level `fn`s and *algebra*-impl methods — the only two
+//! things that can ever need monomorphizing. Inherent impls are not a
+//! language concept here: `v.method(args)` is pure sugar for `method(v,
+//! args)`, so a generic method dot-called on a struct is monomorphized as
+//! an ordinary generic top-level `fn`, through the exact same path.
 //!
 //! ## One unified algorithm underneath two different front-ends
 //!
@@ -84,7 +83,7 @@
 //! b: B) -> C;`, exactly `MatMul`'s own shape).
 
 use crate::ast::*;
-use crate::callgraph::{self, InherentMethodPattern, ProgramInference};
+use crate::callgraph::{self, ProgramInference};
 use crate::cps::{StructSchema, collect_struct_schemas};
 use crate::dump::{TyVarNames, dump_block_with_call_names, fmt_ty_named};
 use crate::infer::{
@@ -180,7 +179,6 @@ pub struct MonomorphizedProgram {
     /// than failing a clean type check, or — for the reachable case —
     /// working at all.
     templates: Vec<ImplTemplate>,
-    inherent_templates: Vec<InherentTemplate>,
 }
 
 impl MonomorphizedProgram {
@@ -234,10 +232,6 @@ impl MonomorphizedProgram {
 
     pub(crate) fn templates(&self) -> &[ImplTemplate] {
         &self.templates
-    }
-
-    pub(crate) fn inherent_templates(&self) -> &[InherentTemplate] {
-        &self.inherent_templates
     }
 }
 
@@ -308,98 +302,6 @@ pub(crate) struct ImplTemplate {
     extern_symbol: Option<String>,
 }
 
-/// A generic inherent impl's own declaration-time "template" for one
-/// method — the inherent-impl counterpart to `ImplTemplate`, simpler in one
-/// respect: `Registry::inherent_method`'s own doc comment guarantees at
-/// most one method of a given name exists per struct, so there's no
-/// candidate *search* needed at a call site, only a direct `(struct_name,
-/// method_name)` lookup — no `is_generic`/`ImplMatch`-style "found but none
-/// matched" distinction either, a non-generic inherent impl never builds a
-/// template at all (mirrors `build_impl_templates`'s own treatment of a
-/// concrete algebra impl, one level simpler: nothing here needs to
-/// structurally *recognize* "a concrete impl already covers this," since a
-/// method name can only ever belong to the one impl block that declared
-/// it). No separate `target_patterns` field either — a method's own first
-/// parameter's pattern (`param_patterns[0]`) already *is* the impl's own
-/// target pattern: `inherent_method_param_tys` sets an unannotated first
-/// parameter to `target_ty` directly, and unifies an annotated one against
-/// it, so the two are never independently free variables to track twice.
-#[derive(Clone)]
-pub(crate) struct InherentTemplate {
-    struct_name: String,
-    method_name: String,
-    params: Vec<Param>,
-    body: Block,
-    param_patterns: Vec<Ty>,
-    ret_pattern: Ty,
-    node_types: HashMap<NodeId, Ty>,
-}
-
-/// Builds one `InherentTemplate` per method of every *generic* inherent
-/// impl in the program — mirrors `build_impl_templates`'s own doc comment,
-/// one level simpler (see `InherentTemplate`'s own doc comment for why). A
-/// whole impl block's own methods are inferred together, sharing one
-/// `Infer` (`infer_inherent_impl_block`, real mutual recursion between
-/// sibling methods) — each method's own template shares that same block's
-/// `node_types`, filtered down to its own body's nodes only, same as any
-/// other template/specialization here. A method whose own declaration-time
-/// inference failed is silently skipped, same reasoning as `build_impl_
-/// templates`.
-fn build_inherent_templates(
-    program: &Program,
-    registry: &Registry,
-    global_env: &Env,
-) -> Vec<InherentTemplate> {
-    let mut templates = Vec::new();
-    for item in &program.items {
-        let ItemKind::InherentImpl(d) = &item.kind else {
-            continue;
-        };
-        // A method needs a template (monomorphized per real call site, the
-        // way this whole function exists to build) whenever *either* the
-        // enclosing impl block has its own generics (`impl<T> Boxed<T>`)
-        // *or* the method itself does (`fn pick<X>(...)`, `doc/backlog.md`'s
-        // own "An inherent-impl method's own generics aren't picked up by
-        // inference at all" item) — not just the impl block alone, the
-        // original (and incomplete) check here. `infer_inherent_impl_block`
-        // infers every method of the block together regardless (real mutual
-        // recursion, see its own doc comment), so this is a block-level,
-        // not a per-method, decision: an impl block skipped here entirely
-        // needs *no* method of its own templated; one that qualifies gets
-        // every one of its methods templated below, same as it already did
-        // when only checking `d.generics` — `cps.rs::collect_units`'s own
-        // `InherentImpl` branch selection mirrors this exact condition.
-        if d.generics.is_empty() && d.fns.iter().all(|f| f.generics.is_empty()) {
-            continue;
-        }
-        let TypeKind::Path(p, _) = &d.target.kind else {
-            continue;
-        };
-        let struct_name = p.segments.join("::");
-        let mut infer = Infer::new(registry);
-        let (_, results) =
-            infer.infer_inherent_impl_block(global_env, &d.generics, &d.target, &d.fns, item.span);
-        for f in &d.fns {
-            let Some(Ok((param_patterns, ret_pattern))) = results.get(&f.name) else {
-                continue;
-            };
-            templates.push(InherentTemplate {
-                struct_name: struct_name.clone(),
-                method_name: f.name.clone(),
-                params: f.params.clone(),
-                body: f.body.clone().unwrap_or(Block {
-                    stmts: Vec::new(),
-                    tail: None,
-                }),
-                param_patterns: param_patterns.clone(),
-                ret_pattern: ret_pattern.clone(),
-                node_types: infer.node_types.clone(),
-            });
-        }
-    }
-    templates
-}
-
 /// Runs the whole-program inference pass (`callgraph::infer_program`) and
 /// then both monomorphization worklists over its result — mirrors
 /// `dump.rs`'s own `dump_program`, which runs the identical first step for
@@ -452,11 +354,8 @@ pub fn monomorphize(
         program,
         registry,
         &program_inference.global_env,
-        &program_inference.inherent_patterns,
         &mut shared_vars,
     );
-    let inherent_templates =
-        build_inherent_templates(program, registry, &program_inference.global_env);
     let lambda_exprs = index_lambda_exprs(program, &program_inference.lambda_schemes);
     let duck_typed_fns = detect_duck_typed_fns(&functions, &program_inference);
 
@@ -466,12 +365,10 @@ pub fn monomorphize(
         seed_call_names: HashMap::new(),
         errors: Vec::new(),
         templates: templates.clone(),
-        inherent_templates: inherent_templates.clone(),
     };
     let mut fn_worklist: Vec<(String, Vec<Ty>)> = Vec::new();
     let mut impl_worklist: Vec<(usize, HashMap<TyVar, Ty>)> = Vec::new();
     let mut lambda_worklist: Vec<(NodeId, Vec<Ty>, String)> = Vec::new();
-    let mut inherent_worklist: Vec<(usize, HashMap<TyVar, Ty>)> = Vec::new();
 
     // `seed_derive_tensor_field_indices`'s own doc comment -- every
     // `derive()`d function's own parameter types need every `Tensor`-typed
@@ -531,13 +428,11 @@ pub fn monomorphize(
             &program_inference.node_types,
             &program_inference.global_env,
             &templates,
-            &inherent_templates,
             &program_inference.lambda_schemes,
             HashMap::new(),
             &mut fn_worklist,
             &mut impl_worklist,
             &mut lambda_worklist,
-            &mut inherent_worklist,
             &mut mono.seed_call_names,
             &mut mono.errors,
             registry,
@@ -582,13 +477,11 @@ pub fn monomorphize(
             &t.node_types,
             &program_inference.global_env,
             &templates,
-            &inherent_templates,
             &program_inference.lambda_schemes,
             HashMap::new(),
             &mut fn_worklist,
             &mut impl_worklist,
             &mut lambda_worklist,
-            &mut inherent_worklist,
             &mut mono.seed_call_names,
             &mut mono.errors,
             registry,
@@ -750,13 +643,11 @@ pub fn monomorphize(
                 &node_types,
                 &program_inference.global_env,
                 &templates,
-                &inherent_templates,
                 &program_inference.lambda_schemes,
                 HashMap::new(),
                 &mut fn_worklist,
                 &mut impl_worklist,
                 &mut lambda_worklist,
-                &mut inherent_worklist,
                 &mut call_names,
                 &mut mono.errors,
                 registry,
@@ -914,7 +805,6 @@ pub fn monomorphize(
                     },
                 };
                 let mut infer = Infer::new_with_vars(registry, shared_vars)
-                    .with_inherent_patterns(&program_inference.inherent_patterns)
                     .with_external_state_hint(&resolved_target_sigs);
                 match infer.infer_impl_fn_with_concrete_targets(
                     &t.algebra,
@@ -1051,13 +941,11 @@ pub fn monomorphize(
                 &node_types,
                 &program_inference.global_env,
                 &templates,
-                &inherent_templates,
                 &program_inference.lambda_schemes,
                 HashMap::new(),
                 &mut fn_worklist,
                 &mut impl_worklist,
                 &mut lambda_worklist,
-                &mut inherent_worklist,
                 &mut call_names,
                 &mut mono.errors,
                 registry,
@@ -1185,13 +1073,11 @@ pub fn monomorphize(
                 &node_types,
                 &program_inference.global_env,
                 &templates,
-                &inherent_templates,
                 &program_inference.lambda_schemes,
                 initial_scope,
                 &mut fn_worklist,
                 &mut impl_worklist,
                 &mut lambda_worklist,
-                &mut inherent_worklist,
                 &mut call_names,
                 &mut mono.errors,
                 registry,
@@ -1217,81 +1103,7 @@ pub fn monomorphize(
             );
         }
 
-        // Inherent-method worklist -- structurally identical to the impl_
-        // worklist loop above (same `Specialization` shape, same reverse-
-        // unification via `derive_inherent_instantiation`), just reading back
-        // from `InherentTemplate` instead of `ImplTemplate` and keying `by_
-        // origin` as `"struct::method"` (matching `cps.rs::collect_units`'s own
-        // `InherentImpl` branch, which reads specializations back by that exact
-        // key).
-        while let Some((idx, mapping)) = inherent_worklist.pop() {
-            let t = &inherent_templates[idx];
-            let display = display_inherent_instantiation(t, &mapping);
-            if mono.specializations.contains_key(&display) {
-                continue;
-            }
-
-            let param_types: Vec<Ty> = t
-                .param_patterns
-                .iter()
-                .map(|p| substitute(p, &mapping))
-                .collect();
-            let result = substitute(&t.ret_pattern, &mapping);
-
-            let mut exprs = Vec::new();
-            collect_exprs_block(&t.body, &mut exprs);
-            let node_types: HashMap<NodeId, Ty> = exprs
-                .iter()
-                .filter_map(|e| {
-                    t.node_types
-                        .get(&e.id)
-                        .map(|ty| (e.id, substitute(ty, &mapping)))
-                })
-                .collect();
-
-            let mut call_names = HashMap::new();
-            collect_instantiations(
-                &t.body,
-                &node_types,
-                &program_inference.global_env,
-                &templates,
-                &inherent_templates,
-                &program_inference.lambda_schemes,
-                HashMap::new(),
-                &mut fn_worklist,
-                &mut impl_worklist,
-                &mut lambda_worklist,
-                &mut inherent_worklist,
-                &mut call_names,
-                &mut mono.errors,
-                registry,
-            );
-
-            let origin = format!("{}::{}", t.struct_name, t.method_name);
-            mono.by_origin
-                .entry(origin)
-                .or_default()
-                .push(display.clone());
-            mono.specializations.insert(
-                display,
-                Specialization {
-                    params: t.params.clone(),
-                    body: t.body.clone(),
-                    param_types,
-                    result,
-                    node_types,
-                    call_names,
-                    is_extern: false,
-                    extern_symbol: None,
-                },
-            );
-        }
-
-        if fn_worklist.is_empty()
-            && impl_worklist.is_empty()
-            && lambda_worklist.is_empty()
-            && inherent_worklist.is_empty()
-        {
+        if fn_worklist.is_empty() && impl_worklist.is_empty() && lambda_worklist.is_empty() {
             if deferred_impl.is_empty() {
                 break;
             }
@@ -1403,7 +1215,6 @@ fn build_impl_templates(
     program: &Program,
     registry: &Registry,
     global_env: &Env,
-    inherent_patterns: &HashMap<(String, String), InherentMethodPattern>,
     shared_vars: &mut TyVarGen,
 ) -> Vec<ImplTemplate> {
     let mut templates = Vec::new();
@@ -1430,8 +1241,7 @@ fn build_impl_templates(
             // `derive_impl_instantiation`/`call_names` exist to record, an
             // extern-backed method needs that as much as a real one does,
             // even though there's no cleave-level body to specialize.
-            let mut infer =
-                Infer::new_with_vars(registry, *shared_vars).with_inherent_patterns(inherent_patterns);
+            let mut infer = Infer::new_with_vars(registry, *shared_vars);
             let result = infer.infer_impl_fn_generic_with_env(
                 global_env,
                 &d.algebra,
@@ -1594,7 +1404,6 @@ pub(crate) fn collect_instantiations(
     node_types: &HashMap<NodeId, Ty>,
     global_env: &Env,
     templates: &[ImplTemplate],
-    inherent_templates: &[InherentTemplate],
     lambda_schemes: &HashMap<NodeId, Scheme>,
     // Non-empty only when re-walking a lambda specialization's own body
     // from the `lambda_worklist` drain loop -- seeded with that lambda's
@@ -1607,7 +1416,6 @@ pub(crate) fn collect_instantiations(
     fn_worklist: &mut Vec<(String, Vec<Ty>)>,
     impl_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
     lambda_worklist: &mut Vec<(NodeId, Vec<Ty>, String)>,
-    inherent_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
     call_names: &mut HashMap<NodeId, String>,
     errors: &mut Vec<TypeError>,
     registry: &Registry,
@@ -1618,13 +1426,11 @@ pub(crate) fn collect_instantiations(
         node_types,
         global_env,
         templates,
-        inherent_templates,
         lambda_schemes,
         &scope,
         fn_worklist,
         impl_worklist,
         lambda_worklist,
-        inherent_worklist,
         call_names,
         errors,
         registry,
@@ -1637,13 +1443,11 @@ fn collect_instantiations_block(
     node_types: &HashMap<NodeId, Ty>,
     global_env: &Env,
     templates: &[ImplTemplate],
-    inherent_templates: &[InherentTemplate],
     lambda_schemes: &HashMap<NodeId, Scheme>,
     scope: &HashMap<String, NodeId>,
     fn_worklist: &mut Vec<(String, Vec<Ty>)>,
     impl_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
     lambda_worklist: &mut Vec<(NodeId, Vec<Ty>, String)>,
-    inherent_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
     call_names: &mut HashMap<NodeId, String>,
     errors: &mut Vec<TypeError>,
     registry: &Registry,
@@ -1670,13 +1474,11 @@ fn collect_instantiations_block(
                     node_types,
                     global_env,
                     templates,
-                    inherent_templates,
                     lambda_schemes,
                     &scope,
                     fn_worklist,
                     impl_worklist,
                     lambda_worklist,
-                    inherent_worklist,
                     call_names,
                     errors,
                     registry,
@@ -1694,13 +1496,11 @@ fn collect_instantiations_block(
                     node_types,
                     global_env,
                     templates,
-                    inherent_templates,
                     lambda_schemes,
                     &scope,
                     fn_worklist,
                     impl_worklist,
                     lambda_worklist,
-                    inherent_worklist,
                     call_names,
                     errors,
                     registry,
@@ -1710,13 +1510,11 @@ fn collect_instantiations_block(
                     node_types,
                     global_env,
                     templates,
-                    inherent_templates,
                     lambda_schemes,
                     &scope,
                     fn_worklist,
                     impl_worklist,
                     lambda_worklist,
-                    inherent_worklist,
                     call_names,
                     errors,
                     registry,
@@ -1727,13 +1525,11 @@ fn collect_instantiations_block(
                 node_types,
                 global_env,
                 templates,
-                inherent_templates,
                 lambda_schemes,
                 &scope,
                 fn_worklist,
                 impl_worklist,
                 lambda_worklist,
-                inherent_worklist,
                 call_names,
                 errors,
                 registry,
@@ -1745,13 +1541,11 @@ fn collect_instantiations_block(
                         node_types,
                         global_env,
                         templates,
-                        inherent_templates,
                         lambda_schemes,
                         &scope,
                         fn_worklist,
                         impl_worklist,
                         lambda_worklist,
-                        inherent_worklist,
                         call_names,
                         errors,
                         registry,
@@ -1766,13 +1560,11 @@ fn collect_instantiations_block(
             node_types,
             global_env,
             templates,
-            inherent_templates,
             lambda_schemes,
             &scope,
             fn_worklist,
             impl_worklist,
             lambda_worklist,
-            inherent_worklist,
             call_names,
             errors,
             registry,
@@ -1786,13 +1578,11 @@ fn collect_instantiations_expr(
     node_types: &HashMap<NodeId, Ty>,
     global_env: &Env,
     templates: &[ImplTemplate],
-    inherent_templates: &[InherentTemplate],
     lambda_schemes: &HashMap<NodeId, Scheme>,
     scope: &HashMap<String, NodeId>,
     fn_worklist: &mut Vec<(String, Vec<Ty>)>,
     impl_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
     lambda_worklist: &mut Vec<(NodeId, Vec<Ty>, String)>,
-    inherent_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
     call_names: &mut HashMap<NodeId, String>,
     errors: &mut Vec<TypeError>,
     registry: &Registry,
@@ -1804,13 +1594,11 @@ fn collect_instantiations_expr(
                 node_types,
                 global_env,
                 templates,
-                inherent_templates,
                 lambda_schemes,
                 scope,
                 fn_worklist,
                 impl_worklist,
                 lambda_worklist,
-                inherent_worklist,
                 call_names,
                 errors,
                 registry,
@@ -1824,13 +1612,11 @@ fn collect_instantiations_expr(
                 node_types,
                 global_env,
                 templates,
-                inherent_templates,
                 lambda_schemes,
                 $scope,
                 fn_worklist,
                 impl_worklist,
                 lambda_worklist,
-                inherent_worklist,
                 call_names,
                 errors,
                 registry,
@@ -2044,38 +1830,6 @@ fn collect_instantiations_expr(
             }
         }
         ExprKind::FieldAccess(base, _) => rec!(base),
-        // `v.method(args)` -- unlike an algebra call, an inherent method's
-        // own struct is *already known* directly from `base`'s own resolved
-        // type (`node_types`), so this is a plain `(struct_name, method_
-        // name)` lookup among `inherent_templates`, not a structural
-        // candidate search (see `InherentTemplate`'s own doc comment for
-        // why there's at most one to find). A non-generic inherent method
-        // needs no entry here at all -- `cps.rs`'s own `resolve_method_call`
-        // falls back to its own bare `struct::method` unit name directly,
-        // the same "no call_names entry needed" shape a non-generic
-        // top-level `fn`/algebra impl already has.
-        ExprKind::MethodCall(base, name, args) => {
-            rec!(base);
-            args.iter().for_each(|a| rec!(a));
-            if let Some(struct_name) = node_types.get(&base.id).and_then(|t| match t {
-                Ty::Con(n) | Ty::App(n, _) => Some(n.clone()),
-                _ => None,
-            }) {
-                if let Some((idx, template)) = inherent_templates
-                    .iter()
-                    .enumerate()
-                    .find(|(_, t)| t.struct_name == struct_name && t.method_name == *name)
-                {
-                    if let Some(mapping) =
-                        derive_inherent_instantiation(template, expr, base, args, node_types)
-                    {
-                        call_names
-                            .insert(expr.id, display_inherent_instantiation(template, &mapping));
-                        inherent_worklist.push((idx, mapping));
-                    }
-                }
-            }
-        }
         ExprKind::Index(base, indices) => {
             rec!(base);
             indices.iter().for_each(|i| rec!(i));
@@ -3187,79 +2941,6 @@ fn display_impl_instantiation(t: &ImplTemplate, mapping: &HashMap<TyVar, Ty>) ->
     format!("{}::{}<{}>", t.algebra, t.method_name, targets)
 }
 
-/// The inherent-impl counterpart to `derive_instantiation`/`derive_impl_
-/// instantiation` — no candidate search needed (see `InherentTemplate`'s
-/// own doc comment), so this is called only once the caller already knows,
-/// structurally, which single template applies (matched by `struct_name`/
-/// `method_name` directly). Unifies the template's own `(param_patterns) ->
-/// ret_pattern` against the call's own concrete `(base_ty, arg_tys...) ->
-/// ret_ty` (`base` first, positionally — it fills the method's own first
-/// parameter, an ordinary explicit slot, not a magic `self`), then reads
-/// back bindings for every free variable the template mentions anywhere in
-/// either.
-fn derive_inherent_instantiation(
-    template: &InherentTemplate,
-    call: &Expr,
-    base: &Expr,
-    args: &[Expr],
-    node_types: &HashMap<NodeId, Ty>,
-) -> Option<HashMap<TyVar, Ty>> {
-    let base_ty = node_types.get(&base.id)?.clone();
-    let mut arg_tys = vec![base_ty];
-    arg_tys.extend(
-        args.iter()
-            .map(|a| node_types.get(&a.id).cloned())
-            .collect::<Option<Vec<_>>>()?,
-    );
-    let ret_ty = node_types.get(&call.id)?.clone();
-    let query = Ty::Fn(arg_tys, Box::new(ret_ty));
-    let pattern = Ty::Fn(
-        template.param_patterns.clone(),
-        Box::new(template.ret_pattern.clone()),
-    );
-    let mut trial = Subst::default();
-    unify(&mut trial, &pattern, &query).ok()?;
-    let mut vars = HashSet::new();
-    template
-        .param_patterns
-        .iter()
-        .for_each(|p| free_vars(p, &mut vars));
-    free_vars(&template.ret_pattern, &mut vars);
-    Some(
-        vars.into_iter()
-            .map(|v| (v, trial.apply(&Ty::Var(v))))
-            .collect(),
-    )
-}
-
-/// The inherent-impl counterpart to `display_impl_instantiation` — every
-/// substituted parameter (receiver first) plus the substituted return type,
-/// not just the receiver (`param_patterns[0]`) alone. The receiver alone
-/// used to be a sufficient, real, unique key for every impl-level generic
-/// (`Boxed<T>::doubled` — `T` always shows up *in* the receiver's own type,
-/// `Boxed<i32>` vs `Boxed<f64>`), but a *method's* own generic
-/// (`doc/backlog.md`'s own "An inherent-impl method's own generics aren't
-/// picked up by inference at all" item, `fn pick<X>(foo, a: X, b: X) -> X`
-/// on a non-generic `Foo`) never appears in the receiver's own type at
-/// all — the receiver alone (`Foo`, always, regardless of `X`) collided
-/// two genuinely different specializations (`pick::<i32>` and
-/// `pick::<f64>`) onto the identical display string, silently reusing one
-/// call site's own specialization for the other and corrupting downstream
-/// MLIR lowering. Every parameter/return type together is exactly the
-/// domain `derive_inherent_instantiation`'s own `unify` call already treats
-/// as this template's whole pattern — using the same set here as the
-/// display key can never under-distinguish two instantiations that really
-/// are different.
-fn display_inherent_instantiation(t: &InherentTemplate, mapping: &HashMap<TyVar, Ty>) -> String {
-    let mut parts: Vec<String> = t
-        .param_patterns
-        .iter()
-        .map(|p| substitute(p, mapping).to_string())
-        .collect();
-    parts.push(substitute(&t.ret_pattern, mapping).to_string());
-    format!("{}::{}<{}>", t.struct_name, t.method_name, parts.join(", "))
-}
-
 /// Collects every sub-expression of `expr`, including `expr` itself, into
 /// `out` — mirrors `callgraph.rs`'s own private `collect_calls_expr`
 /// traversal shape (same exhaustive per-`ExprKind` structure), but collects
@@ -3275,10 +2956,6 @@ pub(crate) fn collect_exprs<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
         | ExprKind::PackRef(_) => {}
         ExprKind::Call(_, _, args, ..) => args.iter().for_each(|a| collect_exprs(a, out)),
         ExprKind::FieldAccess(base, _) => collect_exprs(base, out),
-        ExprKind::MethodCall(base, _, args) => {
-            collect_exprs(base, out);
-            args.iter().for_each(|a| collect_exprs(a, out));
-        }
         ExprKind::Index(base, indices) => {
             collect_exprs(base, out);
             indices.iter().for_each(|i| collect_exprs(i, out));
@@ -3547,13 +3224,6 @@ pub fn dump_monomorphized(program: &Program, registry: &Registry) -> (String, Ve
                         );
                     }
                 }
-            }
-            ItemKind::InherentImpl(d) => {
-                let _ = writeln!(
-                    out,
-                    "impl {} {{ /* generic-impl monomorphization not attempted yet */ }}",
-                    crate::print::fmt_type(&d.target)
-                );
             }
             ItemKind::Fn(f) => match program_inference.results.get(&f.name) {
                 Some(Err(e)) => {

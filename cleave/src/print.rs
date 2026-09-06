@@ -54,7 +54,6 @@ impl Printer {
             ItemKind::Struct(d) => self.print_struct_decl(d),
             ItemKind::Algebra(d) => self.print_algebra_decl(d),
             ItemKind::Impl(d) => self.print_impl_decl(d),
-            ItemKind::InherentImpl(d) => self.print_inherent_impl_decl(d),
             ItemKind::Fn(d) => self.print_fn_decl(d),
         }
     }
@@ -138,20 +137,6 @@ impl Printer {
             fmt_generics(&d.generics),
             d.algebra,
             targets.join(", ")
-        ));
-        self.indented(|p| {
-            for f in &d.fns {
-                p.print_fn_decl(f);
-            }
-        });
-        self.line("}");
-    }
-
-    fn print_inherent_impl_decl(&mut self, d: &InherentImplDecl) {
-        self.line(format!(
-            "impl{} {} {{",
-            fmt_generics(&d.generics),
-            fmt_type(&d.target)
         ));
         self.indented(|p| {
             for f in &d.fns {
@@ -367,13 +352,6 @@ pub(crate) fn fmt_expr(e: &Expr) -> String {
             )
         }
         ExprKind::FieldAccess(base, name) => format!("{}.{name}", fmt_expr(base)),
-        ExprKind::MethodCall(base, name, args) => {
-            format!(
-                "{}.{name}({})",
-                fmt_expr(base),
-                args.iter().map(fmt_expr).collect::<Vec<_>>().join(", ")
-            )
-        }
         ExprKind::Index(base, indices) => {
             format!(
                 "{}[{}]",

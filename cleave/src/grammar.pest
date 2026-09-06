@@ -223,28 +223,23 @@ derivative_rule_decl = { "derivative" ~ ident ~ "(" ~ param_list? ~ ")" ~ ":" ~ 
 adjoint_rule_decl = { "adjoint" ~ ident ~ "(" ~ param_list? ~ ")" ~ "," ~ ident ~ ":" ~ expr ~ ";" }
 
 // ---------------------------------------------------------------- impl
-// Two shapes: an *algebra* impl (dispatches `add`/`gt`/... through the
-// registry, see `infer.rs`) and an *inherent* impl (ordinary methods
-// belonging directly to one `struct`, no algebra involved — `v.len()`
-// dispatches by looking `len` up among `Vec2`'s own inherent methods, not
-// through any registry-mediated interface).
-//
-// A genuinely ambiguous case forced a real disambiguator here, not just
-// alternative ordering — found by testing: `impl<T> Boxed<T> { ... }`
-// parses *identically* either way (`algebra_impl`: algebra `Boxed`, target
-// the bare type `T`; `inherent_impl`: target the single type `Boxed<T>`),
-// since a struct with exactly *one* generic parameter produces the exact
-// same character sequence as an algebra name immediately followed by its
-// own single-type target. Trying `algebra_impl` first (as an earlier
-// version of this grammar did) doesn't fail cleanly on this input the way
-// it does for a genuinely non-algebra shape — it *fully matches*, wrongly,
-// silently treating `Boxed` as an algebra name. This is exactly the
-// problem Rust's own `impl Trait for Type` vs. `impl Type` solves with a
-// `for` keyword; the leading `struct` keyword plays the identical role
-// here (reusing an existing token rather than inventing a new one) —
-// required on *every* inherent impl, not just the ambiguous generic case,
-// for one uniform rule rather than two special-cased shapes.
-impl_decl = { algebra_impl | inherent_impl }
+// One shape only: an *algebra* impl, dispatching `add`/`gt`/`matmul`/...
+// through the registry (see `infer.rs`). Inherent impls (`impl struct Type
+// { fn method(...) {...} }`, ordinary methods belonging directly to one
+// struct, no algebra involved) used to be a second, parallel shape here —
+// removed as a language concept entirely, not merely renamed or folded into
+// this one (`doc/backlog-done.md`'s own "impls inhérents" entry has the
+// full story): an inherent method typed exactly the same constraint an
+// ordinary top-level generic `fn` already types (the receiver as its own
+// first, ordinary parameter), and the one real thing it bought beyond that
+// — dot-call — is now a pure syntactic rewrite (`lower.rs`, `v.method(args)`
+// => `method(v, args)`) available to *any* function, no separate impl
+// mechanism required at all. What algebras alone still can't be replaced
+// by: genuine multi-type relational dispatch (`MatMul<A,B,C>`, dispatched on
+// the *pair* `(A,B)`, no single type to attach an inherent impl to) and
+// output-type-driven inference with no qualifier in the call at all
+// (`Init<T>::xavier()`, no receiver value exists to dispatch from).
+impl_decl = { algebra_impl }
 // `impl<T: Float> TestAlg<Complex<T>> { ... }` — an impl's own generic
 // parameters (distinct from the *algebra*'s own `<T>` in `algebra
 // TestAlg<T> { ... }`), needed once the target itself is generic
@@ -265,15 +260,6 @@ impl_decl = { algebra_impl | inherent_impl }
 // lowering doc comment). Same permissive-at-grammar-level, checked-later
 // posture every other attribute in this file already takes.
 algebra_impl  = { attribute* ~ "impl" ~ generic_params? ~ ident ~ "<" ~ type_ ~ ("," ~ type_)* ~ ">" ~ "{" ~ fn_decl* ~ "}" }
-// `impl struct Vec2 { fn len(v) { ... } }` — no algebra name, no dispatch
-// through the registry; `target` is an ordinary `type_` (usually just a
-// bare struct name, `Vec2`, but can carry its own generic arguments the
-// same way a field/parameter type can, `impl<T> struct Matrix<T, R, C>`).
-// The first parameter of a method declared here plays the role a `self`
-// parameter would in a language with one — ordinary, explicit, no special
-// syntax, same "nothing magic, just the first positional argument" stance
-// this project already takes everywhere else (see `grammar.md`).
-inherent_impl = { "impl" ~ generic_params? ~ "struct" ~ type_ ~ "{" ~ fn_decl* ~ "}" }
 
 // ---------------------------------------------------------------- types
 // arrays are the 1D primitive (see grammar.md, "Primitives + arrays") — Matrix/Tensor

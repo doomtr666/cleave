@@ -352,6 +352,11 @@ fn for_in_array_lowers_to_for_in() {
     }
 }
 
+/// `v.x` (field access) vs `v.x()` (dot-call, a pure syntactic rewrite to
+/// `x(v)` now — `doc/backlog-done.md`'s own "impls inhérents" entry: there
+/// is no separate `MethodCall` AST node any more, `v.x()` lowers straight to
+/// an ordinary `Call` with `v` spliced in as the first argument) — the
+/// presence of `()` is still what distinguishes the two at parse time.
 #[test]
 fn field_access_vs_zero_arg_method_call_are_distinguishable() {
     let f_field = lower_one_fn("fn f(v) { v.x }");
@@ -362,11 +367,11 @@ fn field_access_vs_zero_arg_method_call_are_distinguishable() {
 
     let f_call = lower_one_fn("fn f(v) { v.x() }");
     match &only_stmt_expr(&f_call.body).kind {
-        ExprKind::MethodCall(_, name, args) => {
-            assert_eq!(name, "x");
-            assert!(args.is_empty());
+        ExprKind::Call(path, _, args, _) => {
+            assert_eq!(path.segments, vec!["x".to_string()]);
+            assert_eq!(args.len(), 1, "expected `v` spliced in as the sole argument");
         }
-        other => panic!("expected zero-arg MethodCall, got {other:?}"),
+        other => panic!("expected zero-arg dot-call desugared to Call(x, [v]), got {other:?}"),
     }
 }
 
@@ -628,48 +633,6 @@ fn bool_const_generic_argument_lowers_to_a_bool_lit_generic_arg() {
             }
         }
         other => panic!("expected a path type, got {other:?}"),
-    }
-}
-
-#[test]
-fn inherent_impl_lowers_to_its_own_item_kind() {
-    let program =
-        lower_program("struct Vec2 { x: f64 }\nimpl struct Vec2 {\n    fn len(v) { v.x }\n}");
-    assert_eq!(program.items.len(), 2);
-    match &program.items[1].kind {
-        ItemKind::InherentImpl(d) => {
-            assert!(d.generics.is_empty());
-            assert_eq!(d.fns.len(), 1);
-            assert_eq!(d.fns[0].name, "len");
-            match &d.target.kind {
-                TypeKind::Path(p, args) => {
-                    assert_eq!(p.segments, vec!["Vec2".to_string()]);
-                    assert!(args.is_empty());
-                }
-                other => panic!("expected Path(Vec2), got {other:?}"),
-            }
-        }
-        other => panic!("expected InherentImpl, got {other:?}"),
-    }
-}
-
-#[test]
-fn generic_inherent_impl_carries_its_own_generics_and_target_args() {
-    let program = lower_program(
-        "struct Matrix<T> { data: T }\nimpl<T: Float> struct Matrix<T> {\n    fn get(m) { m }\n}",
-    );
-    match &program.items[1].kind {
-        ItemKind::InherentImpl(d) => {
-            assert_eq!(d.generics.len(), 1);
-            match &d.target.kind {
-                TypeKind::Path(p, args) => {
-                    assert_eq!(p.segments, vec!["Matrix".to_string()]);
-                    assert_eq!(args.len(), 1);
-                }
-                other => panic!("expected Path(Matrix<T>), got {other:?}"),
-            }
-        }
-        other => panic!("expected InherentImpl, got {other:?}"),
     }
 }
 
