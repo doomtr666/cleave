@@ -1448,24 +1448,57 @@ fn array_repeat_including_nested_computes_the_right_value() {
     assert_eq!(run_i32(&context, src), 127);
 }
 
-/// A `struct` is a stable reference (`llvm.alloca` — via a real heap-backed
+/// A struct disqualified from the "light" representation (`mlir_lower.rs::
+/// is_light_struct`'s own doc comment, `doc/backlog.md`'s own struct-
+/// allocation-strategy entry — here, a real field mutation elsewhere forces
+/// it) is a stable reference (`llvm.alloca` — via a real heap-backed
 /// `cleave_alloc` call, see `mlir_lower.rs::alloc_struct`'s own doc comment
 /// for why not literal `llvm.alloca` — plus `llvm.getelementptr`/`llvm.
 /// store`/`llvm.load`), not an `!llvm.struct` SSA value built via `undef`+
 /// `insertvalue` — found necessary by direct testing: a struct returned
 /// from one function and read by its caller came back reading garbage once
-/// its storage lived in the *constructing* function's own stack frame.
+/// its storage lived in the *constructing* function's own stack frame. A
+/// plain, never-field-mutated, all-scalar-field `Pair` (this test's own
+/// original shape) no longer takes this path at all — see the "light"
+/// counterpart test just below — so `extra.b = 2;` here exists purely to
+/// keep exercising the heavy path this test was written to protect.
 #[test]
 fn a_struct_literal_lowers_to_a_heap_alloc_plus_field_gep_and_stores() {
     let context = context();
     let text = lower(
         &context,
-        "struct Pair { a: i32, b: i32 } fn main() -> i32 { let p = Pair(a: 1, b: 2); p.a + p.b }",
+        "struct Pair { a: i32, b: i32 } \
+         fn main() -> i32 { \
+             let mut extra = Pair(a: 0, b: 0); \
+             extra.b = 2; \
+             let p = Pair(a: 1, b: 2); \
+             p.a + p.b + extra.b \
+         }",
     );
     assert!(text.contains("call @cleave_alloc"), "got:\n{text}");
     assert!(text.contains("llvm.getelementptr"), "got:\n{text}");
     assert!(text.contains("llvm.store"), "got:\n{text}");
     assert!(text.contains("llvm.load"), "got:\n{text}");
+}
+
+/// The "light" counterpart to the test just above: an ordinary struct with
+/// only scalar fields, never field-mutated anywhere in the program, lowers
+/// to a bare `!llvm.struct<(...)>` SSA value (`undef` + `insertvalue`/
+/// `extractvalue`), not a heap allocation at all — `mlir_lower.rs::is_light_
+/// struct`'s own doc comment, `doc/backlog.md`'s own struct-allocation-
+/// strategy entry has the full design and empirical motivation (closing the
+/// allocation-count gap against a hand-written equivalent).
+#[test]
+fn a_light_struct_literal_lowers_to_undef_insertvalue_extractvalue_with_no_heap_alloc() {
+    let context = context();
+    let text = lower(
+        &context,
+        "struct Pair { a: i32, b: i32 } fn main() -> i32 { let p = Pair(a: 1, b: 2); p.a + p.b }",
+    );
+    assert!(text.contains("llvm.mlir.undef"), "got:\n{text}");
+    assert!(text.contains("llvm.insertvalue"), "got:\n{text}");
+    assert!(text.contains("llvm.extractvalue"), "got:\n{text}");
+    assert!(!text.contains("call @cleave_alloc"), "got:\n{text}");
 }
 
 /// The real end-to-end proof for scalar fields: construction (`llvm.

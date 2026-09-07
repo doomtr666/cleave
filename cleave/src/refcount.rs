@@ -134,9 +134,12 @@ pub(crate) fn is_refcounted(
     struct_schemas: &HashMap<String, crate::cps::StructSchema>,
     mlir_types: &HashMap<String, String>,
     constructed: &HashSet<String>,
+    field_mutated: &HashSet<String>,
+    extern_boundary: &HashSet<String>,
 ) -> bool {
-    let name = match ty {
-        Ty::Con(name) | Ty::App(name, _) => name,
+    let (name, type_args): (&String, &[Ty]) = match ty {
+        Ty::Con(name) => (name, &[]),
+        Ty::App(name, args) => (name, args),
         _ => return false,
     };
     struct_schemas.contains_key(name)
@@ -145,6 +148,23 @@ pub(crate) fn is_refcounted(
             Some("tensor") | Some("vector")
         )
         && constructed.contains(name)
+        // A fourth exclusion (`mlir_lower.rs::is_light_struct`'s own doc
+        // comment, `doc/backlog.md`'s own struct-allocation-strategy
+        // entry): a "light" struct is a bare `!llvm.struct<(...)>` SSA
+        // value, never a `cleave_alloc_rc`-backed pointer -- no refcount
+        // header exists for any `Retain`/`Release` call to act on, same
+        // reasoning `RawBuf`'s own exclusion above already establishes for
+        // a different reason (no construction site vs. no heap identity at
+        // all).
+        && !crate::mlir_lower::is_light_struct(
+            name,
+            type_args,
+            struct_schemas,
+            mlir_types,
+            field_mutated,
+            extern_boundary,
+            constructed,
+        )
 }
 
 /// Every struct name with at least one real `PrimOp::Struct` construction
@@ -186,6 +206,122 @@ fn collect_constructed_in(expr: &CExpr, names: &mut HashSet<String>) {
                 collect_constructed_in(&d.body, names);
             }
             collect_constructed_in(body, names);
+        }
+    }
+}
+
+/// Every struct name that's ever the target of a real `PrimOp::FieldStore`
+/// (`s.field = v;`, a direct in-place field mutation) anywhere in `program`
+/// — `mlir_lower.rs::is_light_struct`'s own doc comment has the full
+/// reasoning for why this disqualifies a struct from the "light" (bare
+/// `!llvm.struct` SSA value) representation: `lower_field_store`'s own GEP-
+/// based mutation assumes a stable address to write through, which a light
+/// struct — an immutable-once-constructed aggregate value, no identity of
+/// its own — structurally doesn't have. Mirrors `collect_constructed_
+/// struct_names`'s own identical walk shape exactly, just watching for a
+/// different `PrimOp` variant. Deliberately *not* transitive the way
+/// `DynArray`'s own exclusion is (`contains_dynarray_transitively`): a
+/// struct merely *containing*, as one of its own fields, some other struct
+/// that happens to be field-mutated *elsewhere*, on its own separate
+/// binding, is completely unaffected — only the field-mutated struct's own
+/// name needs excluding, not everything that ever references it.
+pub(crate) fn collect_field_mutated_struct_names(program: &CpsProgram) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for f in &program.funcs {
+        collect_field_mutated_in(&f.def.body, &mut names);
+    }
+    names
+}
+
+fn collect_field_mutated_in(expr: &CExpr, names: &mut HashSet<String>) {
+    match expr {
+        CExpr::LetPrim { op, cont, .. } => {
+            if let PrimOp::FieldStore { struct_ty, .. } = op {
+                let name = match struct_ty {
+                    Ty::Con(name) | Ty::App(name, _) => name.clone(),
+                    _ => unreachable!("MLIR lowering: `FieldStore`'s own `struct_ty` is always a declared struct type"),
+                };
+                names.insert(name);
+            }
+            collect_field_mutated_in(cont, names);
+        }
+        CExpr::App { .. } => {}
+        CExpr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_field_mutated_in(then_branch, names);
+            collect_field_mutated_in(else_branch, names);
+        }
+        CExpr::Fix { defs, body } => {
+            for d in defs {
+                collect_field_mutated_in(&d.body, names);
+            }
+            collect_field_mutated_in(body, names);
+        }
+    }
+}
+
+/// Every struct name that ever crosses an `extern fn` boundary — named as
+/// its own `LetPrim`'s declared result type, or as one of `PrimOp::Extern`'s
+/// own `param_types`, anywhere in `program`. `mlir_lower.rs::is_light_
+/// struct`'s own doc comment has the full reasoning: a real, separately-
+/// compiled C-ABI symbol (`cleave-rt`) is written assuming cleave's fixed,
+/// uniform pointer-shaped struct representation, regardless of the struct's
+/// own field shape — flattening such a struct to a bare `!llvm.struct<
+/// (...)>` SSA value would silently change that extern call's own declared
+/// MLIR signature out from under the real native function on the other
+/// side, which still only ever takes/returns a plain pointer. A generic
+/// algebra impl backed by an extern (`RawBuffer<S: HeapStruct>`'s own
+/// `_ptr`-suffixed impl, `dynarray.cleave`) is exactly this shape once
+/// monomorphized to a concrete struct `S` — found by direct testing (a real
+/// `'func.call' op operand type mismatch` MLIR verification failure on
+/// `DynArray<Point>`, not a hypothetical concern). Not transitive, same
+/// reasoning as `collect_field_mutated_struct_names`'s own doc comment —
+/// only the struct actually named at the boundary itself is excluded, not
+/// everything that references it.
+pub(crate) fn collect_extern_boundary_struct_names(program: &CpsProgram) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for f in &program.funcs {
+        collect_extern_boundary_in(&f.def.body, &mut names);
+    }
+    names
+}
+
+fn note_struct_boundary_ty(ty: &Ty, names: &mut HashSet<String>) {
+    if let Ty::Con(name) | Ty::App(name, _) = ty {
+        names.insert(name.clone());
+    }
+}
+
+fn collect_extern_boundary_in(expr: &CExpr, names: &mut HashSet<String>) {
+    match expr {
+        CExpr::LetPrim {
+            op, ty, cont, ..
+        } => {
+            if let PrimOp::Extern { param_types, .. } = op {
+                note_struct_boundary_ty(ty, names);
+                for pt in param_types {
+                    note_struct_boundary_ty(pt, names);
+                }
+            }
+            collect_extern_boundary_in(cont, names);
+        }
+        CExpr::App { .. } => {}
+        CExpr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_extern_boundary_in(then_branch, names);
+            collect_extern_boundary_in(else_branch, names);
+        }
+        CExpr::Fix { defs, body } => {
+            for d in defs {
+                collect_extern_boundary_in(&d.body, names);
+            }
+            collect_extern_boundary_in(body, names);
         }
     }
 }
@@ -649,6 +785,13 @@ struct RefcountCtx<'a> {
     /// own "opaque FFI handle" idiom), never by `cleave_alloc_rc`, so it
     /// must never be retained/released.
     constructed_structs: &'a HashSet<String>,
+    /// See `is_refcounted`'s own doc comment — passed through to `is_light_
+    /// struct` as one of its own disqualifiers.
+    field_mutated_structs: &'a HashSet<String>,
+    /// See `is_refcounted`'s own doc comment — passed through to `is_light_
+    /// struct` as its third disqualifier alongside `constructed_structs`/
+    /// `field_mutated_structs`.
+    extern_boundary_structs: &'a HashSet<String>,
     var_types: &'a HashMap<CVar, Ty>,
     /// Whether releasing a given `CVar` is ever this program's own
     /// responsibility at all — see `collect_var_info`'s own doc comment
@@ -668,6 +811,40 @@ impl RefcountCtx<'_> {
             ty,
             self.struct_schemas,
             self.mlir_types,
+            self.constructed_structs,
+            self.field_mutated_structs,
+            self.extern_boundary_structs,
+        )
+    }
+
+    /// Every genuinely-refcounted field reachable from `ty`'s own top
+    /// level, transitively through any further light fields — empty for
+    /// anything that isn't itself a light struct (`mlir_lower::light_
+    /// struct_release_leaves` checks that first). A light struct's own
+    /// binding is never `is_rc` (correctly — it has no heap identity of
+    /// its own to release), so nothing else in this module would ever
+    /// visit its fields on its behalf; this is what lets `rewrite_body`
+    /// seed a light-but-leaf-bearing value into `owned` anyway, and
+    /// `wrap_releases` emit a real `Release` for each of its own leaves
+    /// (via a `PrimOp::Field` chain) at its own true last-use point,
+    /// instead of the single flat `Release` a heavy struct's own binding
+    /// gets — closing the exact leak `mlir_lower.rs::is_light_field_ty`'s
+    /// own doc comment describes (a struct like `Network` holding real
+    /// `Dense` pointers, retained on embedding but never released, since
+    /// nothing tracked its own light container at all).
+    fn light_release_leaves(&self, ty: &Ty) -> Vec<crate::mlir_lower::LightLeafPath> {
+        let (name, type_args): (&str, &[Ty]) = match ty {
+            Ty::Con(name) => (name.as_str(), &[]),
+            Ty::App(name, args) => (name.as_str(), args.as_slice()),
+            _ => return Vec::new(),
+        };
+        crate::mlir_lower::light_struct_release_leaves(
+            name,
+            type_args,
+            self.struct_schemas,
+            self.mlir_types,
+            self.field_mutated_structs,
+            self.extern_boundary_structs,
             self.constructed_structs,
         )
     }
@@ -691,6 +868,8 @@ pub fn insert_refcounting(
         .map(|f| (f.def.name.clone(), f.result.clone()))
         .collect();
     let constructed_structs = collect_constructed_struct_names(&program);
+    let field_mutated_structs = collect_field_mutated_struct_names(&program);
+    let extern_boundary_structs = collect_extern_boundary_struct_names(&program);
     let funcs = program
         .funcs
         .into_iter()
@@ -706,6 +885,8 @@ pub fn insert_refcounting(
                 struct_schemas,
                 mlir_types,
                 constructed_structs: &constructed_structs,
+                field_mutated_structs: &field_mutated_structs,
+                extern_boundary_structs: &extern_boundary_structs,
                 var_types: &var_types,
                 owned_origin: &owned_origin,
                 local_free_vars: &local_free_vars,
@@ -715,7 +896,16 @@ pub fn insert_refcounting(
             insert_refcounting_fn(top, &ctx)
         })
         .collect();
-    CpsProgram { funcs }
+    // Tier 1 of `doc/backlog.md`'s own struct-allocation-strategy entry —
+    // a retain/release pair-cancellation optimization, strictly additive
+    // on top of the naive, always-correct insertion above (never changes
+    // *what* is correct, only elides calls proven redundant) — see
+    // `rc_opt`'s own module doc comment for the full design. Applied here,
+    // inside the one true entry point, rather than at each of this
+    // function's own three call sites, so every one of them benefits
+    // automatically (`--dump-cps-optimized`, `--run`, and the real AOT
+    // pipeline) without needing to remember to call it separately.
+    crate::rc_opt::eliminate_redundant_retain_release(CpsProgram { funcs })
 }
 
 /// The function's own top-level `params` are deliberately never seeded
@@ -782,7 +972,17 @@ fn rewrite_body(
             // large enough to matter at real MNIST scale, ~2MB/sample).
             let field_read_owned = matches!(&op, PrimOp::Field { .. })
                 && ctx.owned_origin.get(&var).copied().unwrap_or(false);
-            if (matches!(&op, PrimOp::Struct(..)) || field_read_owned) && ctx.is_rc(&ty) {
+            // A light struct with at least one genuinely-refcounted field
+            // reachable through it (`light_release_leaves`) is seeded here
+            // too, alongside an ordinary heavy (`is_rc`) value — its own
+            // binding has no heap identity of its own to release, but its
+            // leaves do, and `wrap_releases` below is what actually knows
+            // the difference (a real `Release` on the pointer for the
+            // heavy case, a `PrimOp::Field` chain ending in `Release` for
+            // each leaf otherwise).
+            if (matches!(&op, PrimOp::Struct(..)) || field_read_owned)
+                && (ctx.is_rc(&ty) || !ctx.light_release_leaves(&ty).is_empty())
+            {
                 owned.push((var, ty.clone()));
             }
             // Retain-on-store: an *existing* struct-typed value written
@@ -828,12 +1028,30 @@ fn rewrite_body(
                 PrimOp::Struct(..) | PrimOp::Array => args.clone(),
                 _ => Vec::new(),
             };
+            // Embedding an *existing* light-with-leaves value (`Network`,
+            // once it has genuinely-refcounted fields of its own) into a
+            // fresh container is the identical hazard `retain_targets`
+            // already exists to protect against for an ordinary heavy
+            // value — except there's no single pointer of the light
+            // value's own to retain; each of *its* own leaves needs
+            // retaining individually instead. Missing this let a freshly
+            // built `(Network, NetworkState)` tuple (`Optimizer::step`'s
+            // own real return shape) embed a `Network` whose own `Dense`
+            // leaves were never protected from that same `Network`
+            // binding's own later release — a real `STATUS_HEAP_
+            // CORRUPTION`, found directly against `examples/digits-
+            // interop`'s own real training run, not hypothetical.
             let mut retains: Vec<(CVal, Ty)> = Vec::new();
+            let mut light_leaf_retains: Vec<(CVar, crate::mlir_lower::LightLeafPath)> = Vec::new();
             for target in retain_targets {
                 if let CVal::Var(cv) = &target {
                     if let Some(rty) = ctx.var_types.get(cv) {
                         if ctx.is_rc(rty) {
                             retains.push((target, rty.clone()));
+                        } else {
+                            for leaf in ctx.light_release_leaves(rty) {
+                                light_leaf_retains.push((*cv, leaf));
+                            }
                         }
                     }
                 }
@@ -855,9 +1073,35 @@ fn rewrite_body(
             // released by its caller, cascades into freeing the very
             // `Network` that same caller just extracted and is about to
             // carry into the next training iteration.
-            let field_read_retain: Option<Ty> = if let PrimOp::Field { .. } = &op {
-                if ctx.is_rc(&ty) && ctx.owned_origin.get(&var).copied().unwrap_or(false) {
-                    Some(ty.clone())
+            //
+            // A *light* `Network` (once it has genuinely-refcounted leaves
+            // of its own, `light_release_leaves`) hits the identical
+            // aliasing hazard one level down: extracting it out of a
+            // container copies its own field bytes — including its own
+            // `Dense` pointers — so the container's own eventual release
+            // (or cascade) and this read result's own eventual leaf
+            // releases would otherwise decrement the exact same `Dense`
+            // refcounts, once each, unless *this* copy's own leaves are
+            // independently retained too. There's no single pointer to
+            // retain for the light value itself (nothing to increment) —
+            // instead, retain each of its own leaves directly, mirroring
+            // exactly how `wrap_releases` below releases them.
+            enum FieldReadProtect {
+                Whole(Ty),
+                LightLeaves(Vec<crate::mlir_lower::LightLeafPath>),
+            }
+            let field_read_retain: Option<FieldReadProtect> = if let PrimOp::Field { .. } = &op {
+                if ctx.owned_origin.get(&var).copied().unwrap_or(false) {
+                    if ctx.is_rc(&ty) {
+                        Some(FieldReadProtect::Whole(ty.clone()))
+                    } else {
+                        let leaves = ctx.light_release_leaves(&ty);
+                        if leaves.is_empty() {
+                            None
+                        } else {
+                            Some(FieldReadProtect::LightLeaves(leaves))
+                        }
+                    }
                 } else {
                     None
                 }
@@ -866,17 +1110,21 @@ fn rewrite_body(
             };
 
             let new_cont = rewrite_body(*cont, owned, k_ret, ctx);
-            let new_cont = if let Some(rty) = field_read_retain {
-                let rvar = ctx.fresh.var();
-                CExpr::LetPrim {
-                    var: rvar,
-                    ty: unit_ty(),
-                    op: PrimOp::Retain(rty),
-                    args: vec![CVal::Var(var)],
-                    cont: Box::new(new_cont),
+            let new_cont = match field_read_retain {
+                Some(FieldReadProtect::Whole(rty)) => {
+                    let rvar = ctx.fresh.var();
+                    CExpr::LetPrim {
+                        var: rvar,
+                        ty: unit_ty(),
+                        op: PrimOp::Retain(rty),
+                        args: vec![CVal::Var(var)],
+                        cont: Box::new(new_cont),
+                    }
                 }
-            } else {
-                new_cont
+                Some(FieldReadProtect::LightLeaves(leaves)) => {
+                    wrap_light_leaves(ctx, var, &leaves, PrimOp::Retain, new_cont)
+                }
+                None => new_cont,
             };
             let mut result = CExpr::LetPrim {
                 var,
@@ -894,6 +1142,16 @@ fn rewrite_body(
                     args: vec![target],
                     cont: Box::new(result),
                 };
+            }
+            for (base, leaf) in light_leaf_retains {
+                result = build_leaf_chain(
+                    ctx,
+                    CVal::Var(base),
+                    &leaf.steps,
+                    &leaf.leaf_ty,
+                    PrimOp::Retain,
+                    result,
+                );
             }
             result
         }
@@ -993,10 +1251,22 @@ fn rewrite_body(
                     let mut seed: Vec<(CVar, Ty)> = Vec::new();
                     let mut seen: HashSet<CVar> = HashSet::new();
                     let is_owned = |v: &CVar| ctx.owned_origin.get(v).copied().unwrap_or(false);
+                    // A light struct with its own genuinely-refcounted
+                    // leaves needs seeding here exactly like an ordinary
+                    // heavy (`is_rc`) value does — its own binding still
+                    // has no heap identity to release directly, but a
+                    // loop's own carried `net`/`state` (this whole
+                    // mechanism's own motivating case) is *exactly* this
+                    // shape: never seeding it here would silently leak its
+                    // own leaves every single iteration, the identical
+                    // "no scope ever gets a turn" gap this function's own
+                    // doc comment already describes for a different case.
+                    let needs_seed =
+                        |ty: &Ty| ctx.is_rc(ty) || !ctx.light_release_leaves(ty).is_empty();
                     if let Some(fv) = ctx.local_claim_vars.get(&def.name) {
                         for v in fv {
                             if let Some(ty) = ctx.var_types.get(v) {
-                                if ctx.is_rc(ty) && is_owned(v) && seen.insert(*v) {
+                                if needs_seed(ty) && is_owned(v) && seen.insert(*v) {
                                     seed.push((*v, ty.clone()));
                                 }
                             }
@@ -1004,7 +1274,7 @@ fn rewrite_body(
                     }
                     for p in &def.params {
                         if let Some(ty) = ctx.var_types.get(p) {
-                            if ctx.is_rc(ty) && is_owned(p) && seen.insert(*p) {
+                            if needs_seed(ty) && is_owned(p) && seen.insert(*p) {
                                 seed.push((*p, ty.clone()));
                             }
                         }
@@ -1187,17 +1457,94 @@ fn releases_for_app(
     owned.into_iter().filter(|(v, _)| !live.contains(v)).collect()
 }
 
+/// For each `(var, ty)` no longer live: a plain `Release(ty)` for an
+/// ordinary heavy (`is_rc`) value, exactly as before — or, for a light
+/// struct with genuinely-refcounted leaves of its own (`light_release_
+/// leaves`), a `PrimOp::Field` chain down to each leaf followed by a real
+/// `Release` on it, since there's no single pointer of `var`'s own to
+/// release at all. See `mlir_lower.rs::is_light_field_ty`'s own doc
+/// comment for why this exists: without it, embedding a heavy field
+/// (`Dense`) into a light container (`Network`) retains it unconditionally
+/// (`retain_targets` above, keyed on the *field's* own type) but never
+/// released it anywhere, since a light value's own binding was never
+/// tracked at all — a real, per-construction leak, not hypothetical.
 fn wrap_releases(to_release: Vec<(CVar, Ty)>, inner: CExpr, ctx: &RefcountCtx) -> CExpr {
     let mut result = inner;
     for (var, ty) in to_release.into_iter().rev() {
-        let rvar = ctx.fresh.var();
-        result = CExpr::LetPrim {
-            var: rvar,
-            ty: unit_ty(),
-            op: PrimOp::Release(ty),
-            args: vec![CVal::Var(var)],
-            cont: Box::new(result),
-        };
+        if ctx.is_rc(&ty) {
+            let rvar = ctx.fresh.var();
+            result = CExpr::LetPrim {
+                var: rvar,
+                ty: unit_ty(),
+                op: PrimOp::Release(ty),
+                args: vec![CVal::Var(var)],
+                cont: Box::new(result),
+            };
+        } else {
+            let leaves = ctx.light_release_leaves(&ty);
+            result = wrap_light_leaves(ctx, var, &leaves, PrimOp::Release, result);
+        }
     }
     result
+}
+
+/// Builds a `PrimOp::Field` chain from `base` down to `leaf.leaf_ty`, then
+/// wraps `inner` with `terminal(leaf_ty)` (a `Retain`/`Release` `PrimOp`,
+/// passed as a bare tuple-variant constructor) applied to the leaf value —
+/// shared by both the retain-on-read and release-on-scope-exit sides of a
+/// light struct's own leaf tracking (`field_read_retain`/`wrap_releases`
+/// above). `leaves` is walked in reverse so the resulting `CExpr` reads,
+/// top to bottom, in the same order `leaves` was given.
+fn wrap_light_leaves(
+    ctx: &RefcountCtx,
+    base: CVar,
+    leaves: &[crate::mlir_lower::LightLeafPath],
+    terminal: fn(Ty) -> PrimOp,
+    inner: CExpr,
+) -> CExpr {
+    let mut result = inner;
+    for leaf in leaves.iter().rev() {
+        result = build_leaf_chain(ctx, CVal::Var(base), &leaf.steps, &leaf.leaf_ty, terminal, result);
+    }
+    result
+}
+
+fn build_leaf_chain(
+    ctx: &RefcountCtx,
+    base: CVal,
+    steps: &[(Ty, String)],
+    leaf_ty: &Ty,
+    terminal: fn(Ty) -> PrimOp,
+    inner: CExpr,
+) -> CExpr {
+    match steps {
+        [] => {
+            let rvar = ctx.fresh.var();
+            CExpr::LetPrim {
+                var: rvar,
+                ty: unit_ty(),
+                op: terminal(leaf_ty.clone()),
+                args: vec![base],
+                cont: Box::new(inner),
+            }
+        }
+        [(struct_ty, field), rest @ ..] => {
+            let next_var = ctx.fresh.var();
+            let next_ty = rest
+                .first()
+                .map(|(t, _)| t.clone())
+                .unwrap_or_else(|| leaf_ty.clone());
+            let rest_chain = build_leaf_chain(ctx, CVal::Var(next_var), rest, leaf_ty, terminal, inner);
+            CExpr::LetPrim {
+                var: next_var,
+                ty: next_ty,
+                op: PrimOp::Field {
+                    struct_ty: struct_ty.clone(),
+                    field: field.clone(),
+                },
+                args: vec![base],
+                cont: Box::new(rest_chain),
+            }
+        }
+    }
 }

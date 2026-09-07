@@ -125,6 +125,19 @@ struct LowerCtx<'c, 'm> {
     /// a declared-but-never-constructed struct type (`DynArray<T>`'s own
     /// `buf: RawBuf` field, concretely) has nothing real to release at all.
     constructed_structs: HashSet<String>,
+    /// Every struct name ever the target of a real `PrimOp::FieldStore`
+    /// anywhere in the whole program — `refcount::collect_field_mutated_
+    /// struct_names`'s own doc comment has the full reasoning; consulted by
+    /// `is_light_struct` as a disqualifier alongside `DynArray` and
+    /// embedded-array/tensor fields.
+    field_mutated_structs: HashSet<String>,
+    /// Every struct name that ever crosses an `extern fn` boundary anywhere
+    /// in the whole program — `refcount::collect_extern_boundary_struct_
+    /// names`'s own doc comment has the full reasoning (a real C-ABI symbol
+    /// assumes cleave's fixed pointer-shaped struct representation
+    /// regardless of field shape); consulted by `is_light_struct` as its
+    /// third disqualifier.
+    extern_boundary_structs: HashSet<String>,
 }
 
 /// Builds one MLIR `Module` containing every top-level function in
@@ -153,6 +166,8 @@ pub fn lower_program<'c>(
         .collect();
     let region_local_fns = crate::region_analysis::find_region_local_functions(program);
     let constructed_structs = crate::refcount::collect_constructed_struct_names(program);
+    let field_mutated_structs = crate::refcount::collect_field_mutated_struct_names(program);
+    let extern_boundary_structs = crate::refcount::collect_extern_boundary_struct_names(program);
     {
         // Scoped so `ctx`'s own borrow of `module` ends before `module` is
         // moved out below.
@@ -166,6 +181,8 @@ pub fn lower_program<'c>(
             region_local_fns,
             currently_region_local: std::cell::Cell::new(false),
             constructed_structs,
+            field_mutated_structs,
+            extern_boundary_structs,
         };
         for f in &program.funcs {
             let op = lower_top_level_fn(&ctx, f);
@@ -197,10 +214,20 @@ fn ty_to_mlir<'c>(ctx: &LowerCtx<'c, '_>, ty: &Ty) -> Type<'c> {
         // A `Ty::Con`/`Ty::App` that *isn't* a declared primitive (and isn't
         // shape-tagged, handled above) is an ordinary struct — non-generic
         // (`Ty::Con("Vec2")`) or generic-and-instantiated (`Ty::App(
-        // "Complex", [Con("f32")])`). A struct value is always an opaque
-        // `!llvm.ptr` — see `struct_llvm_type`'s own doc comment for why
-        // (reference, not value, semantics).
-        Ty::Con(_) | Ty::App(..) => llvm::r#type::pointer(ctx.context, 0),
+        // "Complex", [Con("f32")])`). Two representations now, not one --
+        // see `is_light_struct`'s own doc comment (`doc/backlog.md`'s own
+        // struct-allocation-strategy entry has the full design): a "light"
+        // struct is a real, bare `!llvm.struct<(...)>` aggregate value, no
+        // heap identity at all; every other struct is still the original
+        // opaque `!llvm.ptr` (`struct_llvm_type`'s own doc comment).
+        Ty::Con(_) | Ty::App(..) => {
+            let (name, type_args) = struct_name_and_args(ty);
+            if is_light_struct(name, type_args, &ctx.struct_schemas, &ctx.mlir_types, &ctx.field_mutated_structs, &ctx.extern_boundary_structs, &ctx.constructed_structs) {
+                struct_llvm_type(ctx, name, type_args)
+            } else {
+                llvm::r#type::pointer(ctx.context, 0)
+            }
+        }
         // Two representations, picked by the array's own *leaf* element
         // type — see `array_leaf_is_struct`'s own doc comment for why: a
         // struct-typed leaf can't be a `memref` element (`MemRefType::new`
@@ -415,6 +442,424 @@ fn is_unit_ty(ty: &Ty) -> bool {
 /// payload, or `PrimOp::Field`'s own `struct_ty`) to resolve field order/
 /// types, recovering it from an already-lowered MLIR `Value` alone isn't
 /// possible.
+/// Whether `name<type_args>` should be represented as a real `!llvm.struct
+/// <(...)>` SSA value — no heap identity at all, threaded through
+/// construction/field-access/function-parameters-and-returns/loop-carried
+/// state exactly like a scalar already is — rather than the ordinary
+/// opaque-pointer/`cleave_alloc_rc` path every other struct still uses
+/// (`doc/backlog.md`'s own struct-allocation-strategy entry has the full
+/// design and the empirical validation, both against a hand-written MLIR
+/// probe and end-to-end through this real compiler on a real test program,
+/// before this function existed at all).
+///
+/// **Purely structural, recursive, decided once per concrete instantiation
+/// — no byte-size threshold anywhere.** A struct is light *iff*, for every
+/// one of its own fields:
+/// - the field is an ordinary scalar primitive (`i32`/`f32`/`bool`/...), or
+/// - the field is a `#[mlir_type(tensor)]`/`#[mlir_type(vector)]`-tagged
+///   type (`Tensor`/`Vector`/`Matrix`) — a real memref descriptor, bounded
+///   and fixed-size per rank (`ty_to_llvm_field_type`'s own doc comment),
+///   safe at any element count since the *element data* it points to is
+///   never embedded inline, or
+/// - the field is itself another struct type, light or not — a *light*
+///   nested struct is flattened in directly (its own fields count towards
+///   this struct's own footprint, recursively); any other struct is kept
+///   as an ordinary opaque pointer (a fixed-size reference regardless of
+///   what it points to — that struct's *own* allocation strategy is a
+///   completely separate question this check never needs to answer, the
+///   same reasoning `Dense`'s own `Tensor` fields already rely on).
+///
+/// **Two structural disqualifiers, checked first, neither about size:**
+/// - `DynArray` itself, or any struct containing one anywhere, transitively
+///   — never light, full stop, regardless of how small its own envelope
+///   is. Not a size question at all: `doc/backlog.md`'s own "`mut` carries
+///   no real semantic weight..." entry has the full story of why a value-
+///   semantics `DynArray` can never be made sound without a real ownership/
+///   move-checking system cleave doesn't have (a concrete, found-by-testing
+///   aliasing hazard — two independent envelope copies silently sharing and
+///   corrupting the same backing buffer — not a hypothetical concern).
+/// - A struct with a *directly embedded* (untagged) array field — `[T;N]`
+///   declared straight on the struct, not a `Tensor`/`Vector` — is excluded
+///   too, but for a narrower, purely-implementation reason: embedding a
+///   real array value inline via `insertvalue` would need flattening an
+///   ordinary standalone array (a `memref`, `ty_to_mlir`'s own `Ty::Array`
+///   arm) into an inline `!llvm.array` first, a real, separate mechanism
+///   `lower_light_struct_construct` doesn't build yet, not attempted here.
+///   Excluded cleanly (kept heavy, correct, just not yet optimized), not a
+///   panic waiting to happen — `Dense`/`Network`/`NetworkState`/tuples, the
+///   entire real motivation for this mechanism, have no such field anyway.
+pub(crate) fn is_light_struct(
+    name: &str,
+    type_args: &[Ty],
+    struct_schemas: &HashMap<String, StructSchema>,
+    mlir_types: &HashMap<String, String>,
+    field_mutated: &HashSet<String>,
+    extern_boundary: &HashSet<String>,
+    constructed: &HashSet<String>,
+) -> bool {
+    let mut visiting = HashSet::new();
+    is_light_struct_rec(
+        name,
+        type_args,
+        struct_schemas,
+        mlir_types,
+        field_mutated,
+        extern_boundary,
+        constructed,
+        &mut visiting,
+    )
+}
+
+fn is_light_struct_rec(
+    name: &str,
+    type_args: &[Ty],
+    struct_schemas: &HashMap<String, StructSchema>,
+    mlir_types: &HashMap<String, String>,
+    field_mutated: &HashSet<String>,
+    extern_boundary: &HashSet<String>,
+    constructed: &HashSet<String>,
+    visiting: &mut HashSet<String>,
+) -> bool {
+    // `DynArray` disqualifies unconditionally, before anything else --
+    // see this function's own doc comment for why this is about its own
+    // mutate-in-place API contract, not its size.
+    if name == "DynArray" {
+        return false;
+    }
+    // A struct ever field-mutated in place (`s.field = v;`) anywhere in the
+    // whole program can't be light either -- `lower_field_store`'s own
+    // GEP-based mutation needs a real, stable address to write through,
+    // which an immutable-once-constructed aggregate value structurally
+    // doesn't have. Not transitive (`refcount::collect_field_mutated_
+    // struct_names`'s own doc comment) -- only this struct's *own* name
+    // matters here, not whatever merely references it.
+    if field_mutated.contains(name) {
+        return false;
+    }
+    // A struct ever named as an `extern fn`'s own parameter or return type
+    // anywhere in the whole program can't be light either --
+    // `refcount::collect_extern_boundary_struct_names`'s own doc comment has
+    // the full reasoning: a real C-ABI symbol on the other side (`cleave-
+    // rt`) is written assuming cleave's fixed, uniform pointer-shaped struct
+    // representation regardless of field shape. `RawBuf`'s own "opaque FFI
+    // handle" idiom hits this directly (every extern in `dynarray.cleave`'s
+    // own `RawBuffer<T>` impls takes/returns it); a generic algebra impl
+    // backed by an extern (`RawBuffer<S: HeapStruct>`) hits it too once
+    // monomorphized to a concrete struct `S` -- found by direct testing (a
+    // real `'func.call' op operand type mismatch` on `DynArray<Point>`).
+    if extern_boundary.contains(name) {
+        return false;
+    }
+    // A struct still being decided (self- or mutually-recursive reference)
+    // can't be light -- would need infinite inline storage to flatten
+    // fully. No real cleave struct does this today (a struct embedding
+    // itself, even indirectly, by value rather than through some other
+    // struct's own opaque-pointer field, isn't a pattern found anywhere in
+    // stdlib/examples) -- this is the correct, safe answer if one ever did,
+    // not an assumed non-issue.
+    if !visiting.insert(name.to_string()) {
+        return false;
+    }
+    let Some(schema) = struct_schemas.get(name) else {
+        // Not a declared struct at all (shouldn't happen for a real
+        // struct-typed field, but a safe, conservative default either way).
+        visiting.remove(name);
+        return false;
+    };
+    if schema.has_pack {
+        // A pack-generic struct's own field count isn't fixed per
+        // declaration the way an ordinary struct's is -- not attempted
+        // here, kept heavy (`Tensor<T,Dims...>` itself is exactly this
+        // shape, and is already correctly excluded below anyway via the
+        // tensor-tag check, so this arm is only ever reached for some
+        // future non-tensor pack-generic struct).
+        visiting.remove(name);
+        return false;
+    }
+    let fields = struct_field_types(struct_schemas, name, type_args);
+    // A zero-field struct is *not* light, even though `all()` on an empty
+    // iterator would vacuously say so -- this codebase's own established
+    // "opaque foreign handle" idiom (`dynarray.cleave`'s own `struct RawBuf
+    // {}`, its own doc comment spells this out explicitly) deliberately
+    // relies on a fieldless struct always lowering to a real `!llvm.ptr`
+    // (`ty_to_mlir`'s own struct fallback). Such a handle is only ever
+    // *produced* by an `extern fn` returning a real pointer from the
+    // `cleave-rt` side (never constructed via `RawBuf(...)` in cleave source
+    // itself) -- flattening it to `!llvm.struct<()>` here would silently
+    // change the extern call's own ABI out from under it (a zero-size
+    // aggregate instead of the pointer the native side actually returns),
+    // corrupting every value that ever flows through it. Found by direct
+    // testing (a `STATUS_ACCESS_VIOLATION` crash in `DynArray`'s own tests,
+    // which hold exactly this shape) -- not a hypothetical concern. A
+    // zero-field struct also has nothing to flatten anyway, so excluding it
+    // costs nothing.
+    if fields.is_empty() {
+        visiting.remove(name);
+        return false;
+    }
+    let light = fields.iter().all(|(_, field_ty)| {
+        is_light_field_ty(
+            field_ty,
+            struct_schemas,
+            mlir_types,
+            field_mutated,
+            extern_boundary,
+            constructed,
+            visiting,
+        )
+    });
+    visiting.remove(name);
+    light
+}
+
+/// Whether one field's own type qualifies for `is_light_struct_rec` above —
+/// split out since a field's own type isn't always a bare struct name (a
+/// primitive, or an array, are real possibilities too, unlike the top-level
+/// struct name `is_light_struct` itself always starts from).
+fn is_light_field_ty(
+    field_ty: &Ty,
+    struct_schemas: &HashMap<String, StructSchema>,
+    mlir_types: &HashMap<String, String>,
+    field_mutated: &HashSet<String>,
+    extern_boundary: &HashSet<String>,
+    constructed: &HashSet<String>,
+    visiting: &mut HashSet<String>,
+) -> bool {
+        match field_ty {
+        // An embedded (untagged) array field -- not yet supported by the
+        // light-construction path, see this whole mechanism's own doc
+        // comment above for why. `Ty::Array` never names a tensor/vector-
+        // tagged type (those are `Ty::Con`/`Ty::App`, matched below).
+        Ty::Array(..) => false,
+        // A `#[mlir_type(tensor)]`/`#[mlir_type(vector)]`-tagged field
+        // (`Tensor`/`Vector`/`Matrix`) -- structurally bounded and safe in
+        // principle (a real memref descriptor, this function's own doc
+        // comment already argues for it), but *not yet implemented*:
+        // `lower_light_struct_construct`/the light branch of `lower_field_
+        // access` only know how to `insertvalue`/`extractvalue` an
+        // ordinary scalar/pointer field today, not a memref-descriptor
+        // aggregate (`store_native_shape_field`/`load_native_shape_field`'s
+        // own GEP-based machinery would need a real `insertvalue`-based
+        // counterpart first). Excluded cleanly for now -- this only ever
+        // blocks a struct whose *own* field is directly `Tensor`-typed
+        // (`Dense` itself, concretely) from becoming light; a struct of
+        // *pointers to* such a struct (`Network`, `NetworkState`, the
+        // `Optimizer::step` tuple -- the actual motivating case) is
+        // completely unaffected, since a heavy nested struct is already a
+        // perfectly good pointer-shaped field regardless (see the `Ty::Con`
+        // arm below).
+        Ty::Con(name) | Ty::App(name, _) if matches!(
+            mlir_types.get(name).map(String::as_str),
+            Some("tensor") | Some("vector")
+        ) => false,
+        Ty::Con(name) if name == "bool" || mlir_types.contains_key(name) => {
+            // An ordinary primitive width -- real MLIR type text in
+            // `mlir_types`, not the tensor/vector marker just excluded
+            // above.
+            true
+        }
+        Ty::Con(name) | Ty::App(name, _) => {
+            let type_args: &[Ty] = if let Ty::App(_, args) = field_ty {
+                args
+            } else {
+                &[]
+            };
+            // A light nested field flattens in (checked recursively here) —
+            // fine unconditionally, its own fields already passed this same
+            // gate, so no release obligation of its own exists at any level.
+            if is_light_struct_rec(
+                name,
+                type_args,
+                struct_schemas,
+                mlir_types,
+                field_mutated,
+                extern_boundary,
+                constructed,
+                visiting,
+            ) {
+                true
+            } else {
+                // A *heavy* nested struct field (refcounted or not) is
+                // always fine as an ordinary opaque pointer field now —
+                // `refcount.rs::insert_refcounting_fn`'s own release-point
+                // computation seeds a light struct's own leaves (every
+                // reachable heavy, genuinely-refcounted field, transitively
+                // through further light fields) into `owned` explicitly
+                // (`RefcountCtx::light_release_leaves`, `light_struct_
+                // release_leaves` below) and emits a real `Release` for each
+                // one at the light value's own last-use point — not just a
+                // single flat `Release` on a pointer that no longer exists.
+                // This used to be a hard exclusion here (an earlier, real
+                // leak — `examples/mnist-interop`'s own `Network`/
+                // `NetworkState` holding `Dense` pointers, retained on
+                // embedding but never released, since a light container's
+                // own binding was never seeded into `owned` at all,
+                // `doc/backlog.md`'s own struct-allocation-strategy entry
+                // has the full story) — closed now that the release side
+                // exists, not worked around.
+                true
+            }
+        }
+        // A scalar/const-generic-value type never reaches this arm in
+        // practice (const generics are never struct *field* types), but a
+        // bare `Ty::Const`/anything else defaults to "fine, not array/
+        // struct-shaped, not disqualifying" rather than panicking on an
+        // unexpected shape here.
+        _ => true,
+    }
+}
+
+/// Whether `name` is ever really refcounted (heap-allocated, retain/
+/// release-managed) at all — a deliberately one-way, non-recursive-into-
+/// `is_light_struct` copy of `refcount::is_refcounted`'s own first three
+/// conditions, *not* a call to that function itself: `is_refcounted` ends
+/// with `&& !is_light_struct(...)`, so calling it from inside `is_light_
+/// struct`'s own field check would recurse back into this same mechanism —
+/// safe today only because no real cleave struct embeds another by value
+/// mutually, not a risk worth taking on purpose. `RawBuf`-shaped ("opaque
+/// FFI handle", no real construction site) and tensor/vector-tagged structs
+/// both correctly say "not refcounted" here, matching `is_refcounted`
+/// itself; a `DynArray` is *always* refcounted by this measure the moment
+/// it's constructed anywhere in the program, so this one general check
+/// already subsumes what a separate `DynArray`-only transitive check used
+/// to do by hand.
+fn field_struct_is_ever_refcounted(
+    name: &str,
+    struct_schemas: &HashMap<String, StructSchema>,
+    mlir_types: &HashMap<String, String>,
+    constructed: &HashSet<String>,
+) -> bool {
+    struct_schemas.contains_key(name)
+        && !matches!(
+            mlir_types.get(name).map(String::as_str),
+            Some("tensor") | Some("vector")
+        )
+        && constructed.contains(name)
+}
+
+/// One `PrimOp::Field` chain, from a light struct's own base value down to
+/// a single genuinely-refcounted (heavy, real construction site) field
+/// reachable through it — `steps` is `[(struct type at this hop, field
+/// name), ...]`, in order; `leaf_ty` is the final field's own type, the one
+/// that actually needs a `Release`. Nested light fields contribute more
+/// than one hop (the light field itself needs no release of its own — its
+/// own fields already flattened in — but whatever heavy fields *it* holds
+/// still do); an ordinary direct heavy field is a single-hop path.
+pub(crate) struct LightLeafPath {
+    pub steps: Vec<(Ty, String)>,
+    pub leaf_ty: Ty,
+}
+
+/// Every genuinely-refcounted field reachable from a light struct's own
+/// top level, transitively through any further light fields — see
+/// `refcount::RefcountCtx::light_release_leaves`'s own doc comment for why
+/// this exists: a light struct's own binding is never seeded into `owned`
+/// (`is_refcounted` says `false` for it, correctly — it has no heap
+/// identity of its own), so nothing else will ever visit its fields to
+/// release them; this is the whole-tree walk that makes that possible,
+/// mirroring `is_light_struct_rec`'s own recursive shape exactly. Returns
+/// an empty list for anything that isn't actually light (`is_light_struct`
+/// itself, checked first) — safe to call unconditionally, never a
+/// precondition the caller has to check first.
+pub(crate) fn light_struct_release_leaves(
+    name: &str,
+    type_args: &[Ty],
+    struct_schemas: &HashMap<String, StructSchema>,
+    mlir_types: &HashMap<String, String>,
+    field_mutated: &HashSet<String>,
+    extern_boundary: &HashSet<String>,
+    constructed: &HashSet<String>,
+) -> Vec<LightLeafPath> {
+    if !is_light_struct(
+        name,
+        type_args,
+        struct_schemas,
+        mlir_types,
+        field_mutated,
+        extern_boundary,
+        constructed,
+    ) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    collect_light_leaves(
+        name,
+        type_args,
+        struct_schemas,
+        mlir_types,
+        field_mutated,
+        extern_boundary,
+        constructed,
+        Vec::new(),
+        &mut out,
+    );
+    out
+}
+
+fn base_ty_of(name: &str, type_args: &[Ty]) -> Ty {
+    if type_args.is_empty() {
+        Ty::Con(name.to_string())
+    } else {
+        Ty::App(name.to_string(), type_args.to_vec())
+    }
+}
+
+fn collect_light_leaves(
+    name: &str,
+    type_args: &[Ty],
+    struct_schemas: &HashMap<String, StructSchema>,
+    mlir_types: &HashMap<String, String>,
+    field_mutated: &HashSet<String>,
+    extern_boundary: &HashSet<String>,
+    constructed: &HashSet<String>,
+    prefix: Vec<(Ty, String)>,
+    out: &mut Vec<LightLeafPath>,
+) {
+    let base_ty = base_ty_of(name, type_args);
+    let fields = struct_field_types(struct_schemas, name, type_args);
+    for (field_name, field_ty) in fields {
+        // A light struct's own fields are already guaranteed (`is_light_
+        // field_ty`'s own array/tensor exclusions) to never be array- or
+        // tensor-shaped directly -- only a plain primitive, a nested light
+        // struct, or a heavy struct pointer ever reaches this point.
+        let (fname, ftype_args): (&str, &[Ty]) = match &field_ty {
+            Ty::Con(n) => (n.as_str(), &[]),
+            Ty::App(n, a) => (n.as_str(), a.as_slice()),
+            _ => continue, // a plain primitive -- never refcounted
+        };
+        let mut steps = prefix.clone();
+        steps.push((base_ty.clone(), field_name));
+        if is_light_struct(
+            fname,
+            ftype_args,
+            struct_schemas,
+            mlir_types,
+            field_mutated,
+            extern_boundary,
+            constructed,
+        ) {
+            collect_light_leaves(
+                fname,
+                ftype_args,
+                struct_schemas,
+                mlir_types,
+                field_mutated,
+                extern_boundary,
+                constructed,
+                steps,
+                out,
+            );
+        } else if field_struct_is_ever_refcounted(fname, struct_schemas, mlir_types, constructed) {
+            out.push(LightLeafPath {
+                steps,
+                leaf_ty: field_ty,
+            });
+        }
+        // Else: a heavy field with no real construction site anywhere
+        // (`RawBuf`-shaped) -- nothing to release, skip.
+    }
+}
+
 fn struct_llvm_type<'c>(ctx: &LowerCtx<'c, '_>, name: &str, type_args: &[Ty]) -> Type<'c> {
     let fields = struct_field_types(&ctx.struct_schemas, name, type_args);
     let field_mlir: Vec<Type> = fields
@@ -2044,6 +2489,18 @@ fn lower_struct_construct<'c>(
     let (name, type_args) = struct_name_and_args(ty);
     let field_types = struct_field_types(&ctx.struct_schemas, name, type_args);
     let struct_llvm_ty = struct_llvm_type(ctx, name, type_args);
+    if is_light_struct(name, type_args, &ctx.struct_schemas, &ctx.mlir_types, &ctx.field_mutated_structs, &ctx.extern_boundary_structs, &ctx.constructed_structs) {
+        return lower_light_struct_construct(
+            ctx,
+            block,
+            env,
+            name,
+            struct_llvm_ty,
+            &field_types,
+            field_names,
+            args,
+        );
+    }
     let ptr = alloc_llvm_value(ctx, block, struct_llvm_ty);
     for (field_name, arg) in field_names.iter().zip(args) {
         let position = field_types
@@ -2057,6 +2514,65 @@ fn lower_struct_construct<'c>(
         store_field(ctx, block, env, field_ty, field_ptr, arg);
     }
     ptr
+}
+
+/// The "light" counterpart of `lower_struct_construct` above — builds a real
+/// `!llvm.struct<(...)>` SSA value directly (`llvm.mlir.undef` + one
+/// `llvm.insertvalue` per field), never a heap allocation, never a GEP.
+/// Deliberately narrow for this proof-of-concept: only ordinary scalar/
+/// pointer-shaped fields are handled (`lower_cval` covers exactly this case
+/// already) — an array/`#[mlir_type(...)]`-tagged field would need its own
+/// light-aggregate treatment (nested inline, or a further `insertvalue` of
+/// its own already-lowered value) not built here, since no test case needs
+/// it yet; the real classification pass (`doc/backlog.md`) will need to
+/// decide that shape for real before "light" can apply to a struct with
+/// such a field at all.
+fn lower_light_struct_construct<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    name: &str,
+    struct_llvm_ty: Type<'c>,
+    field_types: &[(String, Ty)],
+    field_names: &[String],
+    args: &[CVal],
+) -> Value<'c, 'c> {
+    let context = ctx.context;
+    let location = Location::unknown(context);
+    let mut agg: Value = block
+        .append_operation(llvm::undef(struct_llvm_ty, location))
+        .result(0)
+        .unwrap()
+        .into();
+    for (field_name, arg) in field_names.iter().zip(args) {
+        let position = field_types
+            .iter()
+            .position(|(n, _)| n == field_name)
+            .unwrap_or_else(|| {
+                panic!("MLIR lowering: struct `{name}` has no field `{field_name}`")
+            });
+        let (_, field_ty) = &field_types[position];
+        if native_shape_field_keyword(ctx, field_ty).is_some() || is_array_ty(field_ty) {
+            panic!(
+                "MLIR lowering: `{name}` is a light struct but field `{field_name}` is array/tensor-shaped -- not supported by this proof-of-concept path yet"
+            );
+        }
+        let field_mlir_ty = ty_to_mlir(ctx, field_ty);
+        let value = lower_cval(context, block, env, arg, field_mlir_ty);
+        let position_attr = DenseI64ArrayAttribute::new(context, &[position as i64]);
+        agg = block
+            .append_operation(llvm::insert_value(
+                context,
+                agg,
+                position_attr,
+                value,
+                location,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+    }
+    agg
 }
 
 /// `PrimOp::Struct` construction for a `#[mlir_type(tensor)]`/`#[mlir_type(
@@ -2725,6 +3241,25 @@ fn lower_field_access<'c>(
         .position(|(n, _)| n == field)
         .unwrap_or_else(|| panic!("MLIR lowering: struct `{name}` has no field `{field}`"));
     let (_, field_ty) = &field_types[position];
+    // A "light" struct (`is_light_struct`'s own doc comment) has no address
+    // at all -- `base_val` is already the real `!llvm.struct<(...)>` value
+    // itself, read via `llvm.extractvalue`, never a GEP.
+    if is_light_struct(name, type_args, &ctx.struct_schemas, &ctx.mlir_types, &ctx.field_mutated_structs, &ctx.extern_boundary_structs, &ctx.constructed_structs) {
+        let result_ty = ty_to_mlir(ctx, field_ty);
+        let location = Location::unknown(ctx.context);
+        let position_attr = DenseI64ArrayAttribute::new(ctx.context, &[position as i64]);
+        return block
+            .append_operation(llvm::extract_value(
+                ctx.context,
+                base_val,
+                position_attr,
+                result_ty,
+                location,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+    }
     let struct_llvm_ty = struct_llvm_type(ctx, name, type_args);
     let field_ptr = gep(ctx, block, base_val, &[0, position as i64], struct_llvm_ty);
     if native_shape_field_keyword(ctx, field_ty).is_some() {
@@ -2930,6 +3465,8 @@ fn lower_release_cascade<'c>(
             &ctx.struct_schemas,
             &ctx.mlir_types,
             &ctx.constructed_structs,
+            &ctx.field_mutated_structs,
+            &ctx.extern_boundary_structs,
         ) {
             // An ordinary nested struct field — an opaque `!llvm.ptr`,
             // exactly like any other struct-typed value (`struct_llvm_

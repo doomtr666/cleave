@@ -167,7 +167,23 @@ def main():
         default=None,
         help="truncate the training set (mirrors cleave's own MNIST_DEBUG_CAP) for a quick smoke run",
     )
+    ap.add_argument(
+        "--threads",
+        type=int,
+        default=None,
+        help=(
+            "torch.set_num_threads(...) explicitly, for a genuine mono-thread "
+            "comparison against a --no-openmp cleave build -- the OMP_NUM_THREADS "
+            "env var alone isn't reliable here: this project's own MKL fallback "
+            "runs poorly on this AMD machine (project memory), so this build may "
+            "be on the MKL backend rather than OpenMP, which doesn't always honor "
+            "that env var the same way. torch.set_num_threads() is the one knob "
+            "guaranteed to be honored regardless of backend."
+        ),
+    )
     args = ap.parse_args()
+    if args.threads is not None:
+        torch.set_num_threads(args.threads)
 
     print(f"torch {torch.__version__}, CPU threads: {torch.get_num_threads()}")
 

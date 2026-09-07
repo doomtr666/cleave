@@ -169,6 +169,42 @@ fn count_retains_in(expr: &CExpr, struct_name: &str, count: &mut usize) {
     }
 }
 
+fn count_releases_for(program: &CpsProgram, struct_name: &str) -> usize {
+    let mut count = 0;
+    for f in &program.funcs {
+        count_releases_in(&f.def.body, struct_name, &mut count);
+    }
+    count
+}
+
+fn count_releases_in(expr: &CExpr, struct_name: &str, count: &mut usize) {
+    match expr {
+        CExpr::LetPrim { op, cont, .. } => {
+            if let PrimOp::Release(ty) = op {
+                if matches!(ty, Ty::Con(n) | Ty::App(n, _) if n == struct_name) {
+                    *count += 1;
+                }
+            }
+            count_releases_in(cont, struct_name, count);
+        }
+        CExpr::App { .. } => {}
+        CExpr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            count_releases_in(then_branch, struct_name, count);
+            count_releases_in(else_branch, struct_name, count);
+        }
+        CExpr::Fix { defs, body } => {
+            for d in defs {
+                count_releases_in(&d.body, struct_name, count);
+            }
+            count_releases_in(body, struct_name, count);
+        }
+    }
+}
+
 /// Compiles `src` through the *real* pipeline (`pipeline.rs::
 /// build_optimized_cps`'s own exact sequence: CPS conversion, dead-code
 /// elimination, e-graph optimization, a second dead-code sweep, then
@@ -554,17 +590,44 @@ fn dynarray_of_primitives_still_computes_correct_values_after_the_rawbuf_fix() {
 /// built, with no retain protecting the array's own now-dangling copy.
 /// Structural, not JIT-execution-based, for the identical reason the
 /// `RawBuf` test above is: the corruption itself is probabilistic.
+///
+/// `Point` here is deliberately given a real field mutation on a *separate*
+/// binding (`extra.x = 9.0;`, never read again) purely so `mlir_lower.rs::
+/// is_light_struct` excludes it (`refcount::collect_field_mutated_struct_
+/// names`'s own doc comment — a whole-program property, not scoped to one
+/// binding): without it, a plain two-`f64`-field `Point` now correctly
+/// classifies as "light" (`doc/backlog.md`'s own struct-allocation-strategy
+/// entry) and gets no `Retain` at all, since a light struct is a bare
+/// aggregate *value*, not a heap pointer with aliasing to protect — this
+/// test's own regression (array-literal elements sharing a dangling pointer)
+/// can only happen to a *heavy* struct, so it needs one here to stay
+/// meaningful.
+///
+/// `p1`/`p2`/`p3` are also each read again *after* the array literal
+/// embeds them (`p1.x`/`p2.x`/`p3.x` in the final condition) — needed once
+/// `rc_opt`'s own retain/release pair-cancellation pass exists (`doc/
+/// backlog.md`'s own struct-allocation-strategy entry, Tier 1): without a
+/// genuine second live use, each retain this test checks for is now
+/// correctly proven redundant and eliminated (a real optimization, not a
+/// bug — the array's own copy stays the sole, valid reference either way).
+/// Reusing each binding afterward is exactly the shape the original bug
+/// report itself named (`[p1, p2, p3]`, this doc comment's own first
+/// paragraph) — a real second reference that must survive, not just an
+/// inline literal.
 #[test]
 fn every_element_of_a_struct_array_literal_is_retained() {
     let src = r#"
         struct Point { x: f64, y: f64 }
         fn main() -> i32 {
-            let points: [Point; 3] = [
-                Point(x: 0.0, y: 0.0),
-                Point(x: 1.0, y: 1.0),
-                Point(x: 2.0, y: 2.0)
-            ];
-            if points[0].x == 0.0 { 1 } else { 0 }
+            let mut extra: Point = Point(x: 9.0, y: 9.0);
+            extra.x = 1.0;
+            let p1: Point = Point(x: 0.0, y: 0.0);
+            let p2: Point = Point(x: 1.0, y: 1.0);
+            let p3: Point = Point(x: 2.0, y: 2.0);
+            let points: [Point; 3] = [p1, p2, p3];
+            if points[0].x == 0.0 and extra.x == 1.0
+                and p1.x == 0.0 and p2.x == 1.0 and p3.x == 2.0
+            { 1 } else { 0 }
         }
         "#;
     let program = refcounted_cps(src);
@@ -599,4 +662,116 @@ fn a_struct_array_literals_elements_read_back_correctly_after_other_work() {
         }
         "#;
     assert_eq!(run_i32(src), 1);
+}
+
+// ---------------------------------------------------------------------
+// `rc_opt::eliminate_redundant_retain_release` — `doc/backlog.md`'s own
+// struct-allocation-strategy entry, Tier 1: a retain/release pair-
+// cancellation pass, run strictly after the naive insertion above.
+// ---------------------------------------------------------------------
+
+/// A struct embedded into another whose own local binding is never used
+/// again — `rc_opt`'s own pass must prove the retain `insert_refcounting`'s
+/// naive baseline always inserts here is redundant, and remove it *and*
+/// its own matching release together: without a genuine second live
+/// reference, embedding `i` into `Outer` never needed a duplicated count
+/// at all — `Outer`'s own copy stays the sole, valid reference throughout.
+/// `Inner` is field-mutated elsewhere (`mutated.a = 1;`, never read again)
+/// purely to keep it off the "light struct" path (`mlir_lower.rs::is_
+/// light_struct`) — a light struct is never refcounted at all, which would
+/// make this test trivially pass for the wrong reason (no retain because
+/// nothing tracks it, not because this pass proved it redundant).
+#[test]
+fn a_provably_redundant_retain_release_pair_is_eliminated() {
+    let src = r#"
+        struct Inner { a: i32 }
+        struct Outer { x: Inner }
+        fn main() -> i32 {
+            let mut mutated: Inner = Inner(a: 0);
+            mutated.a = 1;
+            let i: Inner = Inner(a: 5);
+            let o: Outer = Outer(x: i);
+            if o.x.a == 5 { 1 } else { 0 }
+        }
+        "#;
+    let program = refcounted_cps(src);
+    assert_eq!(
+        count_retains_for(&program, "Inner"),
+        0,
+        "embedding `i` into `Outer`, never used again, must have its retain \
+         eliminated as provably redundant"
+    );
+    // `2`, not `0` or `1` — `mutated`'s own ordinary release survives (it
+    // was never paired with a retain in the first place, unrelated to this
+    // test's own point) *plus* one real, new, correct release: `Outer`
+    // itself now qualifies as light too (a heavy `Inner` field no longer
+    // disqualifies it, `doc/backlog.md`'s own struct-allocation-strategy
+    // entry, field-granularity), so `o`'s own binding is tracked with
+    // `Inner` as its own leaf (`refcount::RefcountCtx::light_release_
+    // leaves`) — since `o` is never used again after `o.x.a`, its own leaf
+    // gets an independent `Field`-then-`Release` chain here, exactly the
+    // release `o.x`'s own (separately retained-then-eliminated) copy needs
+    // *someone* to eventually issue. Only the retain/release pair for
+    // `i`/`o.x`'s own extraction is gone (confirmed by `count_retains_for`
+    // above finding zero) — this remaining release is `Inner`'s own real,
+    // final free, not a leftover.
+    assert_eq!(
+        count_releases_for(&program, "Inner"),
+        2,
+        "expected `mutated`'s own unrelated release plus `Outer`'s own new \
+         leaf-release for `Inner` (now that `Outer` itself qualifies as light)"
+    );
+}
+
+/// The other side of the same coin — a retain that must *never* be
+/// eliminated: a value read (`PrimOp::Field`) off a *borrowed* base is
+/// itself borrowed (`refcount.rs`'s own `field_read_owned` rule —
+/// "propagated from an owned base"; a borrowed base propagates no
+/// ownership at all), so it gets no `field_read_retain` of its own and,
+/// crucially, no matching `Release` anywhere in the reading function's own
+/// body either. Embedding it into a *new* container (`h.y = w.x;`) still
+/// gets an unconditional retain from `retain_targets`, same as any other
+/// embedding — but with no release to ever match it, this pass must find
+/// nothing to eliminate and leave it alone.
+///
+/// (Originally written directly against a borrowed *parameter* embedded
+/// into a container, and separately against `DynArray::push` — both
+/// reworked after finding two real, separate, pre-existing gaps in the
+/// *baseline* algorithm, neither caused by this pass, both out of this
+/// Tier 1 plan's own scope, flagged in `doc/backlog.md` instead of fixed
+/// or silently worked around here: (1) `raw_set` is a real `extern fn`
+/// call, which `retain_targets` never matches at all — pushing a struct
+/// into a `DynArray` never gets a protecting retain in the first place;
+/// (2) `refcount::collect_var_info` only walks a function's own *body*,
+/// never `top.def.params` — a top-level function parameter's own type is
+/// simply absent from `var_types`, so `retain_targets`'s own `is_rc`
+/// lookup silently no-ops for *any* bare parameter embedded directly,
+/// confirmed present with this whole pass bypassed entirely. This test
+/// instead uses a field read off a borrowed base, which *is* an ordinary
+/// `LetPrim`-bound value with a real `var_types` entry — sidestepping both
+/// gaps to exercise this pass's own actual safety property directly.)
+#[test]
+fn a_retain_protecting_a_field_read_off_a_borrowed_base_is_never_eliminated() {
+    let src = r#"
+        struct Inner { a: i32 }
+        struct Wrapper { x: Inner }
+        struct Holder { y: Inner }
+        fn store(w: Wrapper, mut h: Holder) {
+            h.y = w.x;
+        }
+        fn main() -> i32 {
+            let mut extra: Inner = Inner(a: 9);
+            extra.a = 1;
+            let w: Wrapper = Wrapper(x: Inner(a: 5));
+            let h: Holder = Holder(y: Inner(a: 0));
+            store(w, h);
+            0
+        }
+        "#;
+    let program = refcounted_cps(src);
+    assert!(
+        count_retains_for(&program, "Inner") >= 1,
+        "store's own retain on `w.x` (a field read off its borrowed `w` parameter) \
+         must survive elimination -- got 0"
+    );
 }
