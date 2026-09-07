@@ -19,10 +19,10 @@ use crate::refcount::insert_refcounting;
 use crate::registry::Registry;
 use crate::unify_alloc::unify_tensor_allocations;
 use melior::Context;
-use melior::dialect::DialectRegistry;
-use melior::ir::{BlockLike, Module, RegionLike};
+use melior::dialect::{DialectRegistry, llvm};
+use melior::ir::{BlockLike, Location, Module, RegionLike, Type, Value};
 use melior::ir::attribute::Attribute;
-use melior::ir::operation::{OperationLike, OperationMutLike, OperationRefMut};
+use melior::ir::operation::{OperationBuilder, OperationLike, OperationMutLike, OperationRefMut};
 use melior::pass;
 use melior::utility::{parse_pass_pipeline, register_all_dialects};
 use std::path::{Path, PathBuf};
@@ -412,6 +412,151 @@ fn stamp_op_and_children<'c>(mut op: OperationRefMut<'c, '_>, contract: Attribut
             while let Some(child) = next_op {
                 next_op = child.next_in_block_mut();
                 stamp_op_and_children(child, contract);
+            }
+            next_block = block.next_in_region();
+        }
+    }
+}
+
+/// Wraps every `scf.while` op's own body (the "after" region, index `1` --
+/// `mlir_lower.rs::lower_loop`'s own `scf::r#while(&init_values,
+/// &carried_types, before_region, after_region, ...)` call fixes that
+/// ordering) in a native-stack save/restore pair, one per loop iteration.
+///
+/// **The bug this closes, confirmed by direct testing, not guessed** (`doc/
+/// backlog.md`'s own "AOT binary built with `--no-openmp`... genuinely
+/// crashes with a native stack overflow" entry has the full story): a real
+/// training loop (a `for`/`while` around a nontrivial `grad()`-differentiated
+/// backward pass) built with `options.openmp == false` overflows the native
+/// stack after only 1-2 iterations, minimal-repro-confirmed, independent of
+/// MNIST. Root cause: every loop iteration's own local buffers (`llvm.
+/// alloca`, from bufferized local arrays/tensors reached through region-
+/// local calls) stayed allocated across iterations -- nothing in this
+/// pipeline ever bounded that. `--convert-scf-to-openmp` (further below,
+/// `options.openmp` only) happened to paper over this *by accident*, for
+/// whichever *one* dimension gets OpenMP-parallelized, by outlining that
+/// loop's own body into a genuinely separate function (an ordinary call/
+/// return already frees its own stack on the way out) -- never for the loop
+/// actually declared in cleave source (the training loop itself is never
+/// the parallelized dimension), and never at all with OpenMP off.
+///
+/// **The fix mirrors the arena's own existing discipline exactly, rather
+/// than inventing a second, differently-reasoned mechanism** (matching the
+/// project's own "uniformiser" direction here): `mlir_lower.rs::lower_loop`
+/// already opens one heap-arena region per iteration (`cleave_region_enter`,
+/// at the body's start) and closes it right before that iteration's own
+/// tail-yield (`cleave_region_exit`) -- see that function's own doc comment.
+/// `llvm.intr.stacksave`/`stackrestore` (real LLVM intrinsics,
+/// `LLVMIntrinsicOps.td`'s own `LLVM_StackSaveOp`/`StackRestoreOp`, no
+/// melior binding, built via `OperationBuilder` the same way every other
+/// unbound op in this codebase is) are the identical pairing for the native
+/// stack: same iteration boundary, same "opened at body start, closed right
+/// before the next iteration's own yield" shape -- just a different
+/// resource (the raw stack pointer, not the arena cursor).
+///
+/// **Applied here as a post-hoc module walk, not inside `mlir_lower.rs`'s
+/// own initial construction — found necessary by direct testing, not
+/// assumed**: building these two ops at the same point `cleave_region_enter`
+/// is built (i.e., before *any* lowering pass has run at all) puts real
+/// `llvm`-dialect ops into the module before `one-shot-bufferize`'s own
+/// `buffer-deallocation` stage (above) ever runs — that stage requires every
+/// op it encounters to answer "what are your memory effects", and an `llvm`
+/// dialect op mixed into still-tensor/memref-level IR this early doesn't
+/// implement that interface from its perspective, so it errors outright
+/// ("ops with unknown memory side effects are not supported"), before ever
+/// reaching JIT/AOT emission -- confirmed directly by trying exactly that
+/// first. Run here instead, right after buffer-deallocation (above) and
+/// before `--affine-parallelize`/`--lower-affine` (below): must see the
+/// loop while it's still a genuine, single-block-bodied `scf.while`
+/// (matching `mlir_lower.rs`'s own construction) to find the body's own
+/// first operation/terminator this simply — not, unlike `memref.
+/// alloca_scope`, because a flat stacksave/stackrestore pair actually
+/// *needs* this exact ordering to stay correct (it doesn't: no structured
+/// single-block-region constraint applies to either op, so nothing about
+/// `--convert-scf-to-cf` running later can ever silently break this the way
+/// it broke the OpenMP-specific mechanism for the same underlying problem).
+///
+/// **Extended to `scf.for` too, not just `scf.while` — a real, second crash
+/// site found the same way as the first, via the user's own suggested
+/// isolation technique (shrink the real network to a single, minimal layer,
+/// same loop/FFI/grad structure, see what still breaks)**: a from-scratch
+/// minimal repro (~40 lines, no MNIST, no OpenMP) of `grad()`/`Optimizer::
+/// step` training through a *single* `Dense<784,10>` layer overflowed the
+/// stack after the very first `scf.while`-level fix above was already
+/// landed and confirmed working on the real 4-layer network — a genuinely
+/// different loop shape than the one that fix covers. Root-caused via `--
+/// dump-mlir-lowered`: the crashing case's own IR contains real `llvm.
+/// alloca ... !llvm.array<8 x vector<10xf32>>` sites — `vector<10xf32>`,
+/// exactly this shape's own narrow (`N=10`) output width — sitting inside a
+/// loop with *no* stacksave/stackrestore pair of its own, only the far
+/// outer one `mlir_lower.rs::lower_loop`'s own `scf.while` already gets.
+/// Confirmed by direct A/B (not guessed): the *identical* repro widened to
+/// `N=512` (same `K=784`, same everything else) runs 500 iterations clean;
+/// only the narrow-`N` shape crashes. This is `doc/backlog-done.md`'s own
+/// already-named "Problem B"/pad-retry fallback (`transform.structured.pad`,
+/// the matmul schedule's own narrow-output-width retry path, `pipeline.rs`'s
+/// own transform-dialect matmul schedule, elsewhere) — a real `scf.for`
+/// loop from *that* mechanism, structurally unrelated to any `scf.while`
+/// cleave's own source ever declares, so the fix above never had a chance
+/// to see it. Same underlying disease (a loop body allocating real stack
+/// space every iteration, nothing bounding it without OpenMP's own
+/// incidental outlining), same fix, on the *other* loop shape this
+/// pipeline can produce.
+///
+/// Walks the whole module recursively (mirrors `stamp_op_and_children`'s own
+/// shape exactly, immediately above) so a loop nested inside another
+/// function, or inside another loop, still gets the identical treatment.
+fn insert_stack_scopes_in_loops<'c>(context: &'c Context, op: OperationRefMut<'c, '_>) {
+    // `scf.while`'s own loop body is region `1` (`after_region` --
+    // `mlir_lower.rs::lower_loop`'s own `scf::r#while(..., before_region,
+    // after_region, ...)` call fixes this ordering; region `0`, the
+    // condition check, is never arena-scoped either, for the identical
+    // reason `lower_loop`'s own `cleave_region_enter` call only ever runs
+    // inside `after_block` -- deliberately left untouched here too).
+    // `scf.for`/`scf.parallel` each have exactly one region, their own
+    // body, at index `0` -- `scf.parallel` matched for the identical reason
+    // `scf.for` is (this function's own doc comment above has the full
+    // audit): both `--scf-forall-to-parallel` (Stage 1's own tiling) and
+    // `--lower-affine` (the old fallback path's own `affine.parallel`) can
+    // produce one by the time this pass runs, and neither gets the
+    // `memref.alloca_scope` treatment `--convert-scf-to-openmp` would
+    // otherwise give it unless `options.openmp` happens to be on.
+    let body_region_index = match op.name().as_string_ref().as_str() {
+        Ok("scf.while") => Some(1),
+        Ok("scf.for") | Ok("scf.parallel") => Some(0),
+        _ => None,
+    };
+    if let Some(index) = body_region_index {
+        let location = Location::unknown(context);
+        let ptr_ty: Type = llvm::r#type::pointer(context, 0);
+        if let Ok(body_region) = op.region(index)
+            && let Some(body) = body_region.first_block()
+            && let Some(first_op) = body.first_operation()
+        {
+            let stacksave = OperationBuilder::new("llvm.intr.stacksave", location)
+                .add_results(&[ptr_ty])
+                .build()
+                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build llvm.intr.stacksave: {e}"));
+            let stacksave = body.insert_operation_before(first_op, stacksave);
+            let saved: Value = stacksave.result(0).unwrap().into();
+            if let Some(terminator) = body.terminator() {
+                let stackrestore = OperationBuilder::new("llvm.intr.stackrestore", location)
+                    .add_operands(&[saved])
+                    .build()
+                    .unwrap_or_else(|e| {
+                        panic!("MLIR lowering: failed to build llvm.intr.stackrestore: {e}")
+                    });
+                body.insert_operation_before(terminator, stackrestore);
+            }
+        }
+    }
+    for region in op.regions() {
+        let mut next_block = region.first_block();
+        while let Some(block) = next_block {
+            let mut next_op = block.first_operation_mut();
+            while let Some(child) = next_op {
+                next_op = child.next_in_block_mut();
+                insert_stack_scopes_in_loops(context, child);
             }
             next_block = block.next_in_region();
         }
@@ -866,22 +1011,75 @@ pub fn lower_to_llvm<'c>(
         ]);
     }
 
-    if options.openmp {
-        // `--lower-affine`, on its own -- turns the `affine.parallel` the
-        // parallelize stage above produced into `scf.parallel`, and every
-        // remaining `affine.for` (`j`/`k`, still scalar/vector but *not*
-        // OS-thread-parallel) into ordinary `scf.for`. Run as its own pass,
-        // strictly before `--convert-scf-to-openmp` right below -- the next
-        // stage's own `scf.parallel` lowering needs to see it, not `affine.
-        // parallel`.
-        let pass_manager = pass::PassManager::new(context);
-        pass_manager.add_pass(pass::conversion::create_lower_affine());
-        if pass_manager.run(&mut *module).is_err() {
-            return Err(vec![
-                "MLIR-to-LLVM lowering pass failed (lower-affine)".to_string(),
-            ]);
-        }
+    // One shared scalar lowering pipeline from here on, `options.openmp`
+    // only ever inserting the two genuinely OpenMP-specific pieces into it
+    // -- not, as an earlier version of this function had it, two entirely
+    // separate hand-maintained pipelines (one "with openmp", one "without")
+    // sharing no code past this point. That earlier split is exactly what
+    // let a real bug in here go unnoticed for as long as it did (`doc/
+    // backlog.md`'s own "An AOT binary built with `--no-openmp`... genuinely
+    // crashes with a native stack overflow" entry has the full story): the
+    // `else` branch's own doc comment asserted "no `memref.alloca_scope`
+    // complication to split around" on this path -- false, one-shot-
+    // bufferize inserts it unconditionally, nothing to do with OpenMP at
+    // all -- and nobody revisited that assumption when the `if` branch's
+    // own two-phase `--convert-to-llvm` split was later found necessary to
+    // handle exactly that construct correctly. A `false` assumption baked
+    // into one of two diverging copies of "the same" logic is a maintenance
+    // hazard by construction; one shared path with two small, clearly-
+    // labeled insertions can't drift the same way.
 
+    // `--lower-affine`, on its own -- turns any `affine.parallel` the
+    // parallelize stage above produced into `scf.parallel`, and every
+    // remaining `affine.for` (still scalar/vector but not, or not yet,
+    // OS-thread-parallel) into ordinary `scf.for`. Needed unconditionally,
+    // `options.openmp` or not -- `--affine-super-vectorize` above always
+    // leaves *some* `affine.for` behind regardless. Run strictly before
+    // `--convert-scf-to-openmp` below when that runs at all -- that pass's
+    // own `scf.parallel` lowering needs to see it, not `affine.parallel`.
+    let pass_manager = pass::PassManager::new(context);
+    pass_manager.add_pass(pass::conversion::create_lower_affine());
+    if pass_manager.run(&mut *module).is_err() {
+        return Err(vec![
+            "MLIR-to-LLVM lowering pass failed (lower-affine)".to_string(),
+        ]);
+    }
+
+    // See `insert_stack_scopes_in_loops`'s own doc comment for the full
+    // story -- the general insertion point, found after auditing every
+    // loop-producing pass in this whole function rather than reacting to
+    // individual crashes one at a time (`doc/backlog.md`'s own entry on
+    // this: two real, structurally different crashing loop shapes were
+    // already found this way, a strong sign the *reactive* approach doesn't
+    // generalize on its own). Right here, and nowhere earlier or later, is
+    // the one point where *every* structured loop shape this whole pipeline
+    // can ever produce coexists simultaneously, still fully structured (no
+    // multi-block CFG anywhere yet, `--convert-scf-to-cf` hasn't run) and
+    // not yet consumed by anything OpenMP-specific (`--convert-scf-to-
+    // openmp`, right below, only fires `if options.openmp`): `scf.while`
+    // (cleave's own `for`/`while`, `mlir_lower.rs::lower_loop`, present
+    // since initial construction), `scf.for` (from the transform-dialect
+    // matmul schedule's own tiling, present since before bufferization --
+    // `Problem B`'s own pad-retry path, `doc/backlog-done.md`, is exactly
+    // this shape), and `scf.parallel` (from *two* separate sources that
+    // both only reach this shape by this exact point: `--scf-forall-to-
+    // parallel`'s own conversion of Stage 1's `tile_using_forall`, run
+    // right after one-shot-bufferize, and `--lower-affine` right above
+    // converting whatever `affine.parallel` the *old*, non-transform-
+    // dialect fallback path -- `--convert-linalg-to-affine-loops` further
+    // above, for any matmul the schedule's own `vectorize` step declined --
+    // produced via `--affine-parallelize`). An earlier version of this call
+    // ran right after buffer-deallocation instead (before any of `--
+    // convert-linalg-to-affine-loops`/`--affine-parallelize`/this `--lower-
+    // affine` had run at all) -- correct for `scf.while` and the transform-
+    // dialect schedule's own `scf.for` (both already present that early),
+    // but structurally blind to anything the *old* fallback path or Stage
+    // 1's own parallel tiling would ever produce, neither of which exists
+    // in loop form until later passes run -- a real, found-by-audit gap
+    // this move closes, not (yet) a gap any specific crash had exposed.
+    insert_stack_scopes_in_loops(context, module.as_operation_mut());
+
+    if options.openmp {
         // `--convert-scf-to-openmp` -- the one pass in this whole stage that
         // actually turns `scf.parallel` into `omp.parallel`/`omp.wsloop`/`omp.
         // loop_nest`, one real OS thread per outer-loop chunk (`libomp`,
@@ -910,7 +1108,12 @@ pub fn lower_to_llvm<'c>(
         // own (confirmed: a lone `--convert-to-llvm`, with no explicit `--
         // convert-scf-to-cf` anywhere, leaves every `scf.for` completely
         // untouched) -- the two-pass split below is the real fix, not a
-        // roundabout way of doing one pass's job.
+        // roundabout way of doing one pass's job. **This is exactly why the
+        // split can't be collapsed away even now that it's unconditional
+        // below** -- `memref.alloca_scope` (from one-shot-bufferize, present
+        // whether or not this branch ever runs) needs the identical two-phase
+        // treatment either way; `options.openmp` only decides whether an
+        // `omp.parallel` region also happens to sit inside it.
         let pass_manager = pass::PassManager::new(context);
         pass_manager.add_pass(pass::conversion::create_scf_to_open_mp());
         if pass_manager.run(&mut *module).is_err() {
@@ -918,62 +1121,50 @@ pub fn lower_to_llvm<'c>(
                 "MLIR-to-LLVM lowering pass failed (scf-to-openmp)".to_string(),
             ]);
         }
+    }
 
-        // First `--convert-to-llvm`: alongside `--convert-vector-to-llvm`
-        // (unchanged from before this stage existed) and `--convert-openmp-to-
-        // llvm` (legalizes every operand/region type *inside* the `omp.*` ops
-        // to the `llvm` dialect -- the ops themselves deliberately survive,
-        // see `register_all_llvm_translations`'s own call-site comment above
-        // for why), this is specifically what needs to see `memref.alloca_
-        // scope` while it's still single-block, per the comment above.
-        let pass_manager = pass::PassManager::new(context);
-        pass_manager.add_pass(pass::conversion::create_vector_to_llvm());
+    // First `--convert-to-llvm`: alongside `--convert-vector-to-llvm`
+    // (unchanged from before OpenMP support existed) and, only when
+    // `options.openmp` inserted a real `omp.*` region above, `--convert-
+    // openmp-to-llvm` (legalizes every operand/region type *inside* those
+    // ops to the `llvm` dialect -- the ops themselves deliberately survive,
+    // see `register_all_llvm_translations`'s own call-site comment above
+    // for why) -- this is specifically what needs to see `memref.alloca_
+    // scope` while it's still single-block, per the comment above, and
+    // needs to run this early regardless of `options.openmp`: one-shot-
+    // bufferize inserts that construct unconditionally, not only when an
+    // `omp.parallel` region happens to sit inside it.
+    let pass_manager = pass::PassManager::new(context);
+    pass_manager.add_pass(pass::conversion::create_vector_to_llvm());
+    if options.openmp {
         pass_manager.add_pass(pass::conversion::create_open_mp_to_llvm());
-        pass_manager.add_pass(pass::conversion::create_to_llvm());
-        if pass_manager.run(&mut *module).is_err() {
-            return Err(vec![
-                "MLIR-to-LLVM lowering pass failed (vector/openmp/to-llvm)".to_string(),
-            ]);
-        }
+    }
+    pass_manager.add_pass(pass::conversion::create_to_llvm());
+    if pass_manager.run(&mut *module).is_err() {
+        return Err(vec![
+            "MLIR-to-LLVM lowering pass failed (vector/openmp/to-llvm)".to_string(),
+        ]);
+    }
 
-        // `--convert-scf-to-cf` now finishes off the remaining nested `scf.for`
-        // loops (`memref.alloca_scope` is gone, so its single-block constraint
-        // no longer applies to them) -- and the second `--convert-to-llvm`
-        // mops up the `cf.br`/`cf.cond_br` that produces (`cf`, unlike `scf`,
-        // does have its own `ConvertToLLVMPatternInterface`, confirmed by this
-        // exact sequence leaving zero leftover ops). `omp.parallel`/`omp.
-        // wsloop`/`omp.loop_nest` themselves are still present in the module at
-        // this point -- expected, not a bug, see `register_all_llvm_
-        // translations`'s own comment.
-        let pass_manager = pass::PassManager::new(context);
-        pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
-        pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
-        pass_manager.add_pass(pass::conversion::create_to_llvm());
-        pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-        if pass_manager.run(&mut *module).is_err() {
-            return Err(vec![
-                "MLIR-to-LLVM lowering pass failed (scf-to-cf/to-llvm/reconcile)".to_string(),
-            ]);
-        }
-    } else {
-        // No OpenMP: the plain, single-group pipeline (`main.rs`'s own
-        // `--run`/`--dump-mlir-lowered` blocks used this exact shape before
-        // `lower_to_llvm` existed) -- `--lower-affine` still needed
-        // regardless (turns every remaining `affine.for` into `scf.for`),
-        // just with no `scf.parallel`/`memref.alloca_scope` complication to
-        // split around.
-        let pass_manager = pass::PassManager::new(context);
-        pass_manager.add_pass(pass::conversion::create_lower_affine());
-        pass_manager.add_pass(pass::conversion::create_vector_to_llvm());
-        pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
-        pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
-        pass_manager.add_pass(pass::conversion::create_to_llvm());
-        pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-        if pass_manager.run(&mut *module).is_err() {
-            return Err(vec![
-                "MLIR-to-LLVM lowering pass failed (to-llvm)".to_string(),
-            ]);
-        }
+    // `--convert-scf-to-cf` now finishes off the remaining nested `scf.for`
+    // loops (`memref.alloca_scope` is gone, so its single-block constraint
+    // no longer applies to them) -- and the second `--convert-to-llvm`
+    // mops up the `cf.br`/`cf.cond_br` that produces (`cf`, unlike `scf`,
+    // does have its own `ConvertToLLVMPatternInterface`, confirmed by this
+    // exact sequence leaving zero leftover ops). Unconditional, identical
+    // either way -- when `options.openmp` is set, `omp.parallel`/`omp.
+    // wsloop`/`omp.loop_nest` themselves are still present in the module at
+    // this point, expected, not a bug, see `register_all_llvm_
+    // translations`'s own comment; when it isn't, there never were any.
+    let pass_manager = pass::PassManager::new(context);
+    pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
+    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
+    pass_manager.add_pass(pass::conversion::create_to_llvm());
+    pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
+    if pass_manager.run(&mut *module).is_err() {
+        return Err(vec![
+            "MLIR-to-LLVM lowering pass failed (scf-to-cf/to-llvm/reconcile)".to_string(),
+        ]);
     }
 
     // Gives cleave sole ownership of every tensor payload's own physical
