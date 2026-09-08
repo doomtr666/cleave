@@ -631,27 +631,26 @@ fn is_light_field_ty(
         // comment above for why. `Ty::Array` never names a tensor/vector-
         // tagged type (those are `Ty::Con`/`Ty::App`, matched below).
         Ty::Array(..) => false,
-        // A `#[mlir_type(tensor)]`/`#[mlir_type(vector)]`-tagged field
-        // (`Tensor`/`Vector`/`Matrix`) -- structurally bounded and safe in
-        // principle (a real memref descriptor, this function's own doc
-        // comment already argues for it), but *not yet implemented*:
-        // `lower_light_struct_construct`/the light branch of `lower_field_
-        // access` only know how to `insertvalue`/`extractvalue` an
-        // ordinary scalar/pointer field today, not a memref-descriptor
-        // aggregate (`store_native_shape_field`/`load_native_shape_field`'s
-        // own GEP-based machinery would need a real `insertvalue`-based
-        // counterpart first). Excluded cleanly for now -- this only ever
-        // blocks a struct whose *own* field is directly `Tensor`-typed
-        // (`Dense` itself, concretely) from becoming light; a struct of
-        // *pointers to* such a struct (`Network`, `NetworkState`, the
-        // `Optimizer::step` tuple -- the actual motivating case) is
-        // completely unaffected, since a heavy nested struct is already a
-        // perfectly good pointer-shaped field regardless (see the `Ty::Con`
-        // arm below).
-        Ty::Con(name) | Ty::App(name, _) if matches!(
-            mlir_types.get(name).map(String::as_str),
-            Some("tensor") | Some("vector")
-        ) => false,
+        // A `#[mlir_type(tensor)]`-tagged field (`Tensor`/`Matrix`) is fine
+        // now — a real memref descriptor, embedded as one more sub-
+        // aggregate via `insertvalue`/`extractvalue`
+        // (`lower_light_struct_construct`/`lower_field_access`'s own light
+        // branches, `build_tensor_descriptor_value`/`descriptor_value_to_
+        // tensor`), and its own release/retain handled directly on the
+        // bare tensor value (`lower_prim_op`'s own `PrimOp::Retain`/
+        // `Release` arms, `tensor_value_to_ptr`) — this is what finally
+        // lets `Dense`/`DenseState` themselves become light, not just
+        // `Network`/`NetworkState`/the `Optimizer::step` tuple (`doc/
+        // backlog.md`'s own struct-allocation-strategy entry). A `#[mlir_
+        // type(vector)]`-tagged field (`Vector`) stays excluded — it has no
+        // memref-backed form at all (`build_tensor_descriptor_value`'s own
+        // `assert_eq!(keyword, "tensor", ...)`), structurally unsupported,
+        // not merely unimplemented.
+        Ty::Con(name) | Ty::App(name, _)
+            if mlir_types.get(name).map(String::as_str) == Some("vector") =>
+        {
+            false
+        }
         Ty::Con(name) if name == "bool" || mlir_types.contains_key(name) => {
             // An ordinary primitive width -- real MLIR type text in
             // `mlir_types`, not the tensor/vector marker just excluded
@@ -819,9 +818,11 @@ fn collect_light_leaves(
     let fields = struct_field_types(struct_schemas, name, type_args);
     for (field_name, field_ty) in fields {
         // A light struct's own fields are already guaranteed (`is_light_
-        // field_ty`'s own array/tensor exclusions) to never be array- or
-        // tensor-shaped directly -- only a plain primitive, a nested light
-        // struct, or a heavy struct pointer ever reaches this point.
+        // field_ty`'s own array exclusion, and `Vector`'s own separate
+        // exclusion — no memref-backed form to release through) to never
+        // be a plain embedded array or a `Vector` directly here — only a
+        // plain primitive, a `Tensor`, a nested light struct, or a heavy
+        // struct pointer ever reaches this point.
         let (fname, ftype_args): (&str, &[Ty]) = match &field_ty {
             Ty::Con(n) => (n.as_str(), &[]),
             Ty::App(n, a) => (n.as_str(), a.as_slice()),
@@ -829,7 +830,19 @@ fn collect_light_leaves(
         };
         let mut steps = prefix.clone();
         steps.push((base_ty.clone(), field_name));
-        if is_light_struct(
+        if mlir_types.get(fname).map(String::as_str) == Some("tensor") {
+            // A `Tensor` field is always its own leaf, never recursed into
+            // (`Tensor<T,Dims...>`'s own `has_pack` already makes it fail
+            // `is_light_struct` outright, and `field_struct_is_ever_
+            // refcounted` deliberately excludes it too, matching `is_
+            // refcounted`'s own reasoning) — its own release/retain goes
+            // through `lower_prim_op`'s dedicated tensor-value handling
+            // (`tensor_value_to_ptr`), not the ordinary struct-pointer path.
+            out.push(LightLeafPath {
+                steps,
+                leaf_ty: field_ty,
+            });
+        } else if is_light_struct(
             fname,
             ftype_args,
             struct_schemas,
@@ -2143,17 +2156,45 @@ fn lower_prim_op<'c>(
             None
         }
         PrimOp::Retain(rc_ty) => {
-            lower_refcount_call(ctx, block, env, "cleave_retain", rc_ty, args);
+            // A tensor leaf (`mlir_lower.rs::LightLeafPath`, reached via a
+            // light struct's own field-chain, `refcount.rs::build_leaf_
+            // chain`) hands this a real `tensor<...>` SSA *value*, not an
+            // `!llvm.ptr` — derive the real underlying pointer first
+            // (`tensor_value_to_ptr`'s own doc comment), then retain that,
+            // exactly like any other struct pointer.
+            if native_shape_field_keyword(ctx, rc_ty).is_some() {
+                let CVal::Var(tensor_var) = &args[0] else {
+                    panic!("MLIR lowering: `cleave_retain`'s own operand must be a variable");
+                };
+                let tensor_val = *env.get(tensor_var).unwrap_or_else(|| {
+                    panic!("MLIR lowering: unbound CPS variable v{tensor_var}")
+                });
+                let ptr_val = tensor_value_to_ptr(ctx, block, tensor_val, rc_ty);
+                emit_cleave_retain(ctx, block, rc_ty, ptr_val);
+            } else {
+                lower_refcount_call(ctx, block, env, "cleave_retain", rc_ty, args);
+            }
             None
         }
         PrimOp::Release(rc_ty) => {
             let CVal::Var(ptr_var) = &args[0] else {
                 panic!("MLIR lowering: `cleave_release`'s own operand must be a variable");
             };
-            let ptr_val = *env
+            let val = *env
                 .get(ptr_var)
                 .unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{ptr_var}"));
-            lower_release_cascade(ctx, block, rc_ty, ptr_val);
+            // Same tensor-value case as `Retain` above — a tensor leaf has
+            // no further nested fields of its own to cascade into
+            // (`lower_release_cascade`'s own tensor-field branch already
+            // treats a tensor identically: one `emit_cleave_release` call,
+            // no recursion), so this calls it directly rather than going
+            // through the struct-shaped cascade at all.
+            if native_shape_field_keyword(ctx, rc_ty).is_some() {
+                let ptr_val = tensor_value_to_ptr(ctx, block, val, rc_ty);
+                emit_cleave_release(ctx, block, rc_ty, ptr_val);
+            } else {
+                lower_release_cascade(ctx, block, rc_ty, val);
+            }
             None
         }
     }
@@ -2552,14 +2593,43 @@ fn lower_light_struct_construct<'c>(
                 panic!("MLIR lowering: struct `{name}` has no field `{field_name}`")
             });
         let (_, field_ty) = &field_types[position];
-        if native_shape_field_keyword(ctx, field_ty).is_some() || is_array_ty(field_ty) {
+        let position_attr = DenseI64ArrayAttribute::new(context, &[position as i64]);
+        if let Some(keyword) = native_shape_field_keyword(ctx, field_ty) {
+            // A `Tensor` field embeds its own descriptor as one more
+            // sub-aggregate — `build_tensor_descriptor_value`'s own doc
+            // comment; `struct_llvm_type`/`ty_to_llvm_field_type` already
+            // size this position as the real descriptor type, for a light
+            // struct exactly as for a heavy one. `Vector` has no memref-
+            // backed form at all (`is_light_field_ty`'s own exclusion
+            // already keeps a `Vector` field from ever reaching a light
+            // struct in the first place — this arm is only ever hit for
+            // `tensor` in practice, the assert documents that invariant
+            // rather than silently mishandling it).
+            assert_eq!(
+                keyword, "tensor",
+                "MLIR lowering: a light struct's own `Vector` field should have been excluded by `is_light_field_ty` already"
+            );
+            let descriptor_val = build_tensor_descriptor_value(ctx, block, env, field_ty, arg);
+            agg = block
+                .append_operation(llvm::insert_value(
+                    context,
+                    agg,
+                    position_attr,
+                    descriptor_val,
+                    location,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            continue;
+        }
+        if is_array_ty(field_ty) {
             panic!(
-                "MLIR lowering: `{name}` is a light struct but field `{field_name}` is array/tensor-shaped -- not supported by this proof-of-concept path yet"
+                "MLIR lowering: `{name}` is a light struct but field `{field_name}` is an embedded array -- not supported by this path yet"
             );
         }
         let field_mlir_ty = ty_to_mlir(ctx, field_ty);
         let value = lower_cval(context, block, env, arg, field_mlir_ty);
-        let position_attr = DenseI64ArrayAttribute::new(context, &[position as i64]);
         agg = block
             .append_operation(llvm::insert_value(
                 context,
@@ -2861,14 +2931,91 @@ pub(crate) fn memref_descriptor_llvm_type<'c>(context: &'c Context, rank: usize)
 /// `memref.alloc`/`--buffer-deallocation-pipeline`-tracked exactly like any
 /// other intermediate tensor value — correctly freed once the `memcpy`
 /// reads its own last byte, never touching the struct's own field.
-fn store_native_shape_field<'c>(
+/// Derives the real, `cleave_retain`/`cleave_release`-able heap pointer
+/// underlying a bare tensor *value* — `bufferization.to_buffer` then
+/// `memref.extract_aligned_pointer_as_index` (the identical extraction
+/// `array_ptr_and_len` already uses for the unrelated "array crossing an
+/// extern fn boundary" case, and `build_tensor_descriptor_value` below uses
+/// for its own *source* data). Confirmed via direct testing (`mlir-opt
+/// --canonicalize`, this exact toolchain) that pairing this with a real
+/// `bufferization.to_tensor` immediately upstream collapses to nothing at
+/// all — `to_buffer(to_tensor(x, restrict))` folds straight back to `x`, a
+/// standard canonicalization, not a hoped-for one — so calling this on a
+/// tensor value that came straight from `descriptor_value_to_tensor` below
+/// never actually re-derives anything at runtime, it's the identical
+/// instruction either way once the pipeline's own canonicalizer runs.
+fn tensor_value_to_ptr<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    tensor_val: Value<'c, 'c>,
+    field_ty: &Ty,
+) -> Value<'c, 'c> {
+    let (name, type_args) = struct_name_and_args(field_ty);
+    let fields = struct_field_types(&ctx.struct_schemas, name, type_args);
+    let [(_, inner_ty)] = fields.as_slice() else {
+        panic!(
+            "MLIR lowering: `#[mlir_type(tensor)]` requires exactly one field, `{name}` has {}",
+            fields.len()
+        );
+    };
+    let (dims, leaf_ty) = flatten_array_dims(inner_ty);
+    let elem_mlir_ty = ty_to_mlir(ctx, leaf_ty);
+    let context = ctx.context;
+    let location = Location::unknown(context);
+    let memref_ty: Type = MemRefType::new(elem_mlir_ty, &dims, None, None).into();
+    let to_buffer = OperationBuilder::new("bufferization.to_buffer", location)
+        .add_operands(&[tensor_val])
+        .add_results(&[memref_ty])
+        .build()
+        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build bufferization.to_buffer: {e}"));
+    let memref_val: Value = block.append_operation(to_buffer).result(0).unwrap().into();
+    let index_ty = Type::index(context);
+    let extract = OperationBuilder::new("memref.extract_aligned_pointer_as_index", location)
+        .add_operands(&[memref_val])
+        .add_results(&[index_ty])
+        .build()
+        .unwrap_or_else(|e| {
+            panic!("MLIR lowering: failed to build memref.extract_aligned_pointer_as_index: {e}")
+        });
+    let idx: Value = block.append_operation(extract).result(0).unwrap().into();
+    let i64_ty: Type = IntegerType::new(context, 64).into();
+    let i64_val: Value = block
+        .append_operation(arith::index_cast(idx, i64_ty, location))
+        .result(0)
+        .unwrap()
+        .into();
+    let ptr_ty = llvm::r#type::pointer(context, 0);
+    block
+        .append_operation(
+            OperationBuilder::new("llvm.inttoptr", location)
+                .add_operands(&[i64_val])
+                .add_results(&[ptr_ty])
+                .build()
+                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build llvm.inttoptr: {e}")),
+        )
+        .result(0)
+        .unwrap()
+        .into()
+}
+
+/// Builds a `Tensor`-typed field's own descriptor as a bare SSA aggregate
+/// *value* — copies the payload into a fresh, `cleave_alloc_rc`'d buffer
+/// (see this whole mechanism's own original doc comment, preserved below,
+/// for why a defensive copy is required at all), then hand-builds the
+/// `(allocated_ptr, aligned_ptr, offset, sizes[rank], strides[rank])`
+/// descriptor (`memref_descriptor_llvm_type`) entirely via `insertvalue` —
+/// never stored anywhere itself. Shared by `store_native_shape_field`
+/// (which stores the result into a heavy struct's own field pointer) and
+/// `lower_light_struct_construct`'s own tensor-field branch (which
+/// `insertvalue`s it directly into the light struct's own aggregate,
+/// exactly like any other field).
+fn build_tensor_descriptor_value<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
     env: &HashMap<CVar, Value<'c, 'c>>,
     field_ty: &Ty,
-    field_ptr: Value<'c, 'c>,
     arg: &CVal,
-) {
+) -> Value<'c, 'c> {
     let (name, type_args) = struct_name_and_args(field_ty);
     let keyword = native_shape_keyword(ctx, name)
         .expect("caller already confirmed this is native-shape-tagged");
@@ -2891,50 +3038,8 @@ fn store_native_shape_field<'c>(
     let context = ctx.context;
     let location = Location::unknown(context);
 
-    let memref_ty: Type = MemRefType::new(elem_mlir_ty, &dims, None, None).into();
-    // `bufferization.to_buffer`, not the older `to_memref` name some MLIR
-    // docs/versions use — confirmed directly against this exact toolchain
-    // (`mlir-opt`, `I:/Dev/llvm-mlir-22`): `to_memref` verifies as an
-    // unregistered op here, `to_buffer` is this version's real name for the
-    // identical tensor -> memref direction (`bufferization.to_tensor`'s own
-    // real, unrenamed counterpart).
-    let to_buffer = OperationBuilder::new("bufferization.to_buffer", location)
-        .add_operands(&[value])
-        .add_results(&[memref_ty])
-        .build()
-        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build bufferization.to_buffer: {e}"));
-    let memref_val: Value = block.append_operation(to_buffer).result(0).unwrap().into();
-
-    // Source data pointer — the identical extraction `array_ptr_and_len`
-    // already uses for the unrelated "array crossing an extern fn boundary"
-    // case, reused here as-is.
-    let index_ty = Type::index(context);
-    let extract = OperationBuilder::new("memref.extract_aligned_pointer_as_index", location)
-        .add_operands(&[memref_val])
-        .add_results(&[index_ty])
-        .build()
-        .unwrap_or_else(|e| {
-            panic!("MLIR lowering: failed to build memref.extract_aligned_pointer_as_index: {e}")
-        });
-    let src_idx: Value = block.append_operation(extract).result(0).unwrap().into();
-    let i64_ty: Type = IntegerType::new(context, 64).into();
-    let src_i64: Value = block
-        .append_operation(arith::index_cast(src_idx, i64_ty, location))
-        .result(0)
-        .unwrap()
-        .into();
-    let ptr_ty = llvm::r#type::pointer(context, 0);
-    let src_ptr: Value = block
-        .append_operation(
-            OperationBuilder::new("llvm.inttoptr", location)
-                .add_operands(&[src_i64])
-                .add_results(&[ptr_ty])
-                .build()
-                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build llvm.inttoptr: {e}")),
-        )
-        .result(0)
-        .unwrap()
-        .into();
+    // Source data pointer — `tensor_value_to_ptr`'s own doc comment.
+    let src_ptr = tensor_value_to_ptr(ctx, block, value, field_ty);
 
     // Fresh, `cleave_alloc_rc`'d destination — sized as a flat `!llvm.array`
     // of every element, matching `alloc_llvm_value`'s own generic "any LLVM
@@ -2943,6 +3048,7 @@ fn store_native_shape_field<'c>(
     let flat_array_ty = llvm::r#type::array(elem_mlir_ty, total_elems);
     let dest_ptr = alloc_llvm_value(ctx, block, flat_array_ty);
     let size = llvm_type_size_bytes(ctx, block, flat_array_ty);
+    let i64_ty: Type = IntegerType::new(context, 64).into();
     let is_volatile = Attribute::parse(context, "false")
         .unwrap_or_else(|| panic!("MLIR lowering: failed to parse `false` attribute"));
     block.append_operation(
@@ -3044,7 +3150,20 @@ fn store_native_shape_field<'c>(
             .unwrap()
             .into();
     }
+    descriptor_val
+}
 
+fn store_native_shape_field<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    field_ty: &Ty,
+    field_ptr: Value<'c, 'c>,
+    arg: &CVal,
+) {
+    let descriptor_val = build_tensor_descriptor_value(ctx, block, env, field_ty, arg);
+    let context = ctx.context;
+    let location = Location::unknown(context);
     block.append_operation(llvm::store(
         context,
         descriptor_val,
@@ -3092,11 +3211,21 @@ fn store_native_shape_field<'c>(
 /// `ins()`, and `--buffer-deallocation-pipeline` never inserts a `memref.
 /// dealloc` for it at all — only for the *other*, genuinely-owned buffers
 /// (`tensor.empty()`-seeded intermediates) in the same function.
-fn load_native_shape_field<'c>(
+/// The read-side mirror of `build_tensor_descriptor_value`: turns an
+/// already-in-hand descriptor *value* back into a real `tensor<...>` SSA
+/// value — `builtin.unrealized_conversion_cast` to `memref<...>`, then
+/// `bufferization.to_tensor ... restrict` (`restrict` alone, no `writable`
+/// — see this function's own doc comment, preserved on `load_native_shape_
+/// field` below, for the full story on why). Shared by `load_native_shape_
+/// field` (which first `llvm.load`s the descriptor from a heavy struct's
+/// own field pointer) and `lower_field_access`'s own light-struct branch
+/// (which `extractvalue`s it directly out of the light struct's own
+/// aggregate instead).
+fn descriptor_value_to_tensor<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
     field_ty: &Ty,
-    field_ptr: Value<'c, 'c>,
+    descriptor_val: Value<'c, 'c>,
 ) -> Value<'c, 'c> {
     let (name, type_args) = struct_name_and_args(field_ty);
     let keyword = native_shape_keyword(ctx, name)
@@ -3112,19 +3241,6 @@ fn load_native_shape_field<'c>(
     let elem_mlir_ty = ty_to_mlir(ctx, leaf_ty);
     let location = Location::unknown(ctx.context);
 
-    let descriptor_ty = memref_descriptor_llvm_type(ctx.context, dims.len());
-    let descriptor_val: Value = block
-        .append_operation(llvm::load(
-            ctx.context,
-            field_ptr,
-            descriptor_ty,
-            location,
-            LoadStoreOptions::new(),
-        ))
-        .result(0)
-        .unwrap()
-        .into();
-
     let memref_ty: Type = MemRefType::new(elem_mlir_ty, &dims, None, None).into();
     let cast = OperationBuilder::new("builtin.unrealized_conversion_cast", location)
         .add_operands(&[descriptor_val])
@@ -3138,12 +3254,12 @@ fn load_native_shape_field<'c>(
     let native_ty = ty_to_mlir(ctx, field_ty);
     let restrict = Attribute::parse(ctx.context, "unit")
         .unwrap_or_else(|| panic!("MLIR lowering: failed to parse `unit` attribute"));
-    // `bufferization.to_tensor`/`to_buffer` (`store_native_shape_field`'s own
-    // doc comment) are specific to the `tensor`/`memref` pair, not a
-    // `{keyword}`-generic pair the way `{keyword}.from_elements` above used
-    // to be — `#[mlir_type(vector)]` (structurally supported, currently
-    // unused anywhere in stdlib) has no memref-backed form at all, so this
-    // whole O(1) path is real only for `keyword == "tensor"`.
+    // `bufferization.to_tensor`/`to_buffer` (`build_tensor_descriptor_
+    // value`'s own doc comment) are specific to the `tensor`/`memref` pair,
+    // not a `{keyword}`-generic pair the way `{keyword}.from_elements`
+    // above used to be — `#[mlir_type(vector)]` (structurally supported,
+    // currently unused anywhere in stdlib) has no memref-backed form at
+    // all, so this whole O(1) path is real only for `keyword == "tensor"`.
     assert_eq!(
         keyword, "tensor",
         "MLIR lowering: O(1) native-shape field access needs a real memref-backed form, which `#[mlir_type(vector)]` doesn't have"
@@ -3157,6 +3273,39 @@ fn load_native_shape_field<'c>(
         .build()
         .unwrap_or_else(|e| panic!("MLIR lowering: failed to build bufferization.to_tensor: {e}"));
     block.append_operation(to_tensor).result(0).unwrap().into()
+}
+
+fn load_native_shape_field<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    field_ty: &Ty,
+    field_ptr: Value<'c, 'c>,
+) -> Value<'c, 'c> {
+    let (name, type_args) = struct_name_and_args(field_ty);
+    let fields = struct_field_types(&ctx.struct_schemas, name, type_args);
+    let [(_, inner_ty)] = fields.as_slice() else {
+        panic!(
+            "MLIR lowering: `#[mlir_type(...)]` requires exactly one field, `{name}` has {}",
+            fields.len()
+        );
+    };
+    let (dims, _leaf_ty) = flatten_array_dims(inner_ty);
+    let location = Location::unknown(ctx.context);
+
+    let descriptor_ty = memref_descriptor_llvm_type(ctx.context, dims.len());
+    let descriptor_val: Value = block
+        .append_operation(llvm::load(
+            ctx.context,
+            field_ptr,
+            descriptor_ty,
+            location,
+            LoadStoreOptions::new(),
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+
+    descriptor_value_to_tensor(ctx, block, field_ty, descriptor_val)
 }
 
 /// `PrimOp::FieldStore { struct_ty, field }`, `args = [base, value]` — a
@@ -3245,9 +3394,44 @@ fn lower_field_access<'c>(
     // at all -- `base_val` is already the real `!llvm.struct<(...)>` value
     // itself, read via `llvm.extractvalue`, never a GEP.
     if is_light_struct(name, type_args, &ctx.struct_schemas, &ctx.mlir_types, &ctx.field_mutated_structs, &ctx.extern_boundary_structs, &ctx.constructed_structs) {
-        let result_ty = ty_to_mlir(ctx, field_ty);
         let location = Location::unknown(ctx.context);
         let position_attr = DenseI64ArrayAttribute::new(ctx.context, &[position as i64]);
+        if let Some(keyword) = native_shape_field_keyword(ctx, field_ty) {
+            // A `Tensor` field's own position holds the real descriptor
+            // aggregate (`struct_llvm_type`/`ty_to_llvm_field_type`'s own
+            // layout, unchanged for a light struct), not `ty_to_mlir(field_
+            // ty)`'s bare `tensor<...>` — extract *that* first, then
+            // rebuild the real tensor value from it (`descriptor_value_to_
+            // tensor`'s own doc comment), the exact mirror of `lower_light_
+            // struct_construct`'s own tensor-field branch.
+            assert_eq!(
+                keyword, "tensor",
+                "MLIR lowering: a light struct's own `Vector` field should have been excluded by `is_light_field_ty` already"
+            );
+            let (fname, ftype_args) = struct_name_and_args(field_ty);
+            let inner_fields = struct_field_types(&ctx.struct_schemas, fname, ftype_args);
+            let [(_, inner_ty)] = inner_fields.as_slice() else {
+                panic!(
+                    "MLIR lowering: `#[mlir_type(tensor)]` requires exactly one field, `{fname}` has {}",
+                    inner_fields.len()
+                );
+            };
+            let (dims, _leaf_ty) = flatten_array_dims(inner_ty);
+            let descriptor_ty = memref_descriptor_llvm_type(ctx.context, dims.len());
+            let descriptor_val = block
+                .append_operation(llvm::extract_value(
+                    ctx.context,
+                    base_val,
+                    position_attr,
+                    descriptor_ty,
+                    location,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            return descriptor_value_to_tensor(ctx, block, field_ty, descriptor_val);
+        }
+        let result_ty = ty_to_mlir(ctx, field_ty);
         return block
             .append_operation(llvm::extract_value(
                 ctx.context,
@@ -3310,12 +3494,23 @@ fn lower_refcount_call<'c>(
     let ptr_val = *env
         .get(ptr_var)
         .unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{ptr_var}"));
+    emit_cleave_retain(ctx, block, rc_ty, ptr_val);
+}
+
+/// A raw, already-lowered `!llvm.ptr` version of `lower_refcount_call`'s
+/// own `cleave_retain` half — no `CVal`/`env` lookup, for a pointer this
+/// module already has in hand directly (`tensor_value_to_ptr`'s own
+/// result, for a tensor leaf's own retain — `lower_prim_op`'s `PrimOp::
+/// Retain` arm). Mirrors `emit_cleave_release`'s identical shape; unlike
+/// it, `cleave_retain` returns nothing to act on.
+fn emit_cleave_retain<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, rc_ty: &Ty, ptr_val: Value<'c, 'c>) {
     let context = ctx.context;
     let location = Location::unknown(context);
-    ensure_extern_declared(ctx, symbol, std::slice::from_ref(rc_ty), &[]);
+    let declared_ty = declared_ptr_sig_ty(ctx, rc_ty);
+    ensure_extern_declared(ctx, "cleave_retain", std::slice::from_ref(&declared_ty), &[]);
     block.append_operation(func::call(
         context,
-        FlatSymbolRefAttribute::new(context, symbol),
+        FlatSymbolRefAttribute::new(context, "cleave_retain"),
         &[ptr_val],
         &[],
         location,
@@ -3341,7 +3536,8 @@ fn emit_cleave_release<'c>(
     let context = ctx.context;
     let location = Location::unknown(context);
     let bool_ty: Type = IntegerType::new(context, 1).into();
-    ensure_extern_declared(ctx, "cleave_release", std::slice::from_ref(rc_ty), &[bool_ty]);
+    let declared_ty = declared_ptr_sig_ty(ctx, rc_ty);
+    ensure_extern_declared(ctx, "cleave_release", std::slice::from_ref(&declared_ty), &[bool_ty]);
     let call_op = block.append_operation(func::call(
         context,
         FlatSymbolRefAttribute::new(context, "cleave_release"),
@@ -3350,6 +3546,31 @@ fn emit_cleave_release<'c>(
         location,
     ));
     call_op.result(0).unwrap().into()
+}
+
+/// The `Ty` `ensure_extern_declared` should use to declare `cleave_retain`/
+/// `cleave_release`'s own parameter — `rc_ty` itself for an ordinary struct
+/// (any declared struct name maps to `!llvm.ptr` via `ty_to_mlir`'s generic
+/// fallback, so which one is irrelevant to the declared C signature,
+/// `emit_cleave_release`'s own original doc comment already established
+/// this). **Not** `rc_ty` when it's tensor-tagged, though — `ty_to_mlir`
+/// intercepts a `#[mlir_type(tensor)]` name *before* that generic fallback
+/// ever runs, giving the native `tensor<...>` type instead of `!llvm.ptr` —
+/// found by direct testing, a real `'func.call' op operand type mismatch`
+/// (declared `tensor<1x10xf32>`, called with the real `!llvm.ptr`
+/// `tensor_value_to_ptr` already derived) the first time a tensor leaf's
+/// own retain/release was exercised on the real `mnist-interop` kernel. A
+/// bare, deliberately-unregistered name sidesteps this cleanly: `ty_to_mlir`
+/// only special-cases a name it actually finds tagged in `mlir_types`/
+/// declared in `struct_schemas` — anything else, `is_light_struct`'s own
+/// `struct_schemas.get(name)` miss included, falls through to the exact
+/// same generic `!llvm.ptr` fallback an ordinary struct gets.
+fn declared_ptr_sig_ty(ctx: &LowerCtx<'_, '_>, rc_ty: &Ty) -> Ty {
+    if native_shape_field_keyword(ctx, rc_ty).is_some() {
+        Ty::Con("__cleave_opaque_ptr".to_string())
+    } else {
+        rc_ty.clone()
+    }
 }
 
 /// Cascades a struct's own release into every refcounted field it holds,

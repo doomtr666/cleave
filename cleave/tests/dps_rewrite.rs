@@ -478,6 +478,17 @@ fn a_struct_field_written_from_an_unmodified_read_of_another_field_computes_the_
 /// happens to come out right (a leaked-but-still-readable buffer would also
 /// pass the numeric test, right up until it's freed out from under a second
 /// live owner).
+///
+/// `Boxed` is deliberately field-mutated on a *separate*, throwaway binding
+/// (`extra.v = a;`, never read again) purely to keep it off the "light
+/// struct" path (`mlir_lower.rs::is_light_struct` — `doc/backlog.md`'s own
+/// struct-allocation-strategy entry, the tensor-leaf axis): a light `Boxed`
+/// is built via `insertvalue`, never the `llvm.getelementptr`-based field
+/// store this rewrite's own pattern-matching requires (`dps_rewrite.rs`'s
+/// own `op_name_is(size_gep, "llvm.getelementptr")` check) — this test is
+/// specifically about that heavy-struct rewrite, so it needs a genuinely
+/// heavy `Boxed` to stay meaningful, exactly like `refcount.rs`'s own
+/// similarly-forced tests elsewhere in this session.
 #[test]
 fn the_passthrough_case_retains_the_shared_pointer_and_neuters_its_own_copy() {
     let context = context();
@@ -487,6 +498,8 @@ fn the_passthrough_case_retains_the_shared_pointer_and_neuters_its_own_copy() {
         {PASSTHROUGH_SOURCE}
         fn main() -> f32 {{
             let a: Tensor<f32, 4, 4> = {a};
+            let mut extra: Boxed = Boxed(v: a);
+            extra.v = a;
             let boxed = Boxed(v: a);
             let forwarded = passthrough(boxed);
             forwarded.v[0, 0]

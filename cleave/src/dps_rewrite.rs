@@ -188,6 +188,29 @@ struct Candidate<'c, 'a> {
     private_size_chain: Option<(OperationRef<'c, 'a>, OperationRef<'c, 'a>, OperationRef<'c, 'a>)>,
     elem_type: Type<'c>,
     dims: Vec<i64>,
+    /// `true` when `alloc_call` is `@cleave_alloc_local`, not `@cleave_
+    /// alloc_rc` -- `mlir_lower.rs::alloc_llvm_value`'s own region-local
+    /// allocator, picked whenever the struct/array construction this
+    /// candidate's `memcpy` belongs to sits inside a function `region_
+    /// analysis.rs` proved is called exactly once, inside a loop, with a
+    /// non-escaping result (`alloc_llvm_value`'s own doc comment). Same
+    /// `(size)`-vs-`(handle, size)` shape difference the rest of this
+    /// module has to thread through by hand: `cleave_alloc_local` takes an
+    /// extra leading `handle` argument (always a literal `0`, never
+    /// actually read -- `alloc_llvm_value`'s own doc comment again), so the
+    /// size operand sits at index 1, not 0, and the region allocator has no
+    /// `cleave_release`-equivalent at all (a whole region is reclaimed in
+    /// bulk when it closes, not per-object) -- `rewrite_one`'s own neuter/
+    /// release tail branches on this to skip emitting a release call that
+    /// would otherwise corrupt a bump allocator that carries no refcount
+    /// header. Found necessary the hard way, not designed in from the
+    /// start: an earlier version of this matcher accepted `@cleave_alloc_
+    /// rc` only, silently leaving every region-local struct/array
+    /// construction on the slow, un-rewritten path -- confirmed directly,
+    /// not assumed, via a temporary per-rejection counter on `examples/
+    /// mnist-interop`'s own real kernel (8 of 16 real candidates, all
+    /// rejected for this exact reason, zero for any other).
+    is_local: bool,
 }
 
 fn op_name_is<'c, 'a>(op: OperationRef<'c, 'a>, name: &str) -> bool {
@@ -251,10 +274,18 @@ fn match_candidate<'c, 'a>(
         return None;
     }
     let callee = alloc_call.attribute("callee").ok()?;
-    if callee.to_string() != "@cleave_alloc_rc" {
-        return None;
-    }
-    let size_ptrtoint = defining_op(alloc_call.operand(0).ok()?)?;
+    // Both allocators `alloc_llvm_value` can pick between -- `Candidate::
+    // is_local`'s own doc comment has the full story on why this can't just
+    // stay `@cleave_alloc_rc`-only, and on the operand-index difference
+    // (`cleave_alloc_local`'s own leading `handle` argument) handled right
+    // here.
+    let is_local = match callee.to_string().as_str() {
+        "@cleave_alloc_rc" => false,
+        "@cleave_alloc_local" => true,
+        _ => return None,
+    };
+    let size_operand_index = if is_local { 1 } else { 0 };
+    let size_ptrtoint = defining_op(alloc_call.operand(size_operand_index).ok()?)?;
     if !op_name_is(size_ptrtoint, "llvm.ptrtoint") {
         return None;
     }
@@ -369,16 +400,48 @@ fn match_candidate<'c, 'a>(
             let region = producer.region(0).ok()?;
             let body = region.first_block()?;
             let outs_arg: melior::ir::Value = body.argument(outs_index).ok()?.into();
-            if count_uses(body, outs_arg) != 0 {
+            if count_uses(body, outs_arg) == 0 {
+                Strategy::Overwrite {
+                    redirect_op: producer,
+                    outs_index,
+                }
+            } else {
                 let outs_operand = producer.operand(outs_index).ok()?;
                 let seed = defining_op(outs_operand)?;
-                if !op_name_is(seed, "tensor.empty") {
+                if op_name_is(seed, "tensor.empty") {
+                    Strategy::Overwrite {
+                        redirect_op: producer,
+                        outs_index,
+                    }
+                } else if op_name_is(seed, "linalg.fill") {
+                    // Same shape, same reasoning, as the `linalg.matmul`+
+                    // `linalg.fill` case right below -- found necessary the
+                    // hard way, not designed in from the start: a temporary
+                    // per-rejection debug print (`examples/mnist-interop`'s
+                    // own real kernel) showed every one of this rewrite's
+                    // remaining un-rewritten `linalg.generic` candidates has
+                    // *exactly* this shape (`train_and_evaluate`, a real
+                    // reduction whose own accumulator starts from a `linalg.
+                    // fill`-written constant, not `tensor.empty`) -- not a
+                    // genuine read-modify-write over some *other* struct's
+                    // own live data (which really would be unsafe to
+                    // redirect), which the original, stricter check here
+                    // couldn't tell apart from this case at all. `linalg.
+                    // fill`'s own `outs` is exactly as don't-care as `tensor.
+                    // empty` (unconditionally overwritten with a constant,
+                    // whatever was there before is irrelevant either way) --
+                    // redirect *its* destination, not the generic's; the
+                    // generic's own operand needs no change, it already
+                    // reads the fill's own result value, whose identity is
+                    // unaffected by what now feeds *it*.
+                    let fill_outs_index = seed.operand_count().checked_sub(1)?;
+                    Strategy::Overwrite {
+                        redirect_op: seed,
+                        outs_index: fill_outs_index,
+                    }
+                } else {
                     return None;
                 }
-            }
-            Strategy::Overwrite {
-                redirect_op: producer,
-                outs_index,
             }
         } else if op_name_is(producer, "linalg.matmul") {
             let outs_index = producer.operand_count().checked_sub(1)?;
@@ -482,6 +545,7 @@ fn match_candidate<'c, 'a>(
         private_size_chain,
         elem_type,
         dims,
+        is_local,
     })
 }
 
@@ -587,6 +651,7 @@ fn build_fresh_alloc<'c>(
     before: OperationRef<'c, 'c>,
     elem_type: Type<'c>,
     dims: &[i64],
+    is_local: bool,
 ) -> Value<'c, 'c> {
     let location = Location::unknown(context);
     let ptr_ty = llvm::r#type::pointer(context, 0);
@@ -611,13 +676,32 @@ fn build_fresh_alloc<'c>(
         .result(0)
         .unwrap()
         .into();
+    // `Candidate::is_local`'s own doc comment: reproduce the *same*
+    // allocator the original call used, not `cleave_alloc_rc`
+    // unconditionally -- `cleave_alloc_local` needs the same always-`0`
+    // leading `handle` argument `alloc_llvm_value` itself passes (never
+    // actually read, correctness comes from `REGION_DEPTH`), matching the
+    // exact shape `mlir_lower.rs::alloc_llvm_value` builds.
+    let (symbol, call_args): (&str, Vec<Value>) = if is_local {
+        let zero_handle: Value = block
+            .insert_operation_before(
+                before,
+                arith::constant(context, IntegerAttribute::new(i64_ty, 0).into(), location),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        ("cleave_alloc_local", vec![zero_handle, size])
+    } else {
+        ("cleave_alloc_rc", vec![size])
+    };
     block
         .insert_operation_before(
             before,
             func::call(
                 context,
-                FlatSymbolRefAttribute::new(context, "cleave_alloc_rc"),
-                &[size],
+                FlatSymbolRefAttribute::new(context, symbol),
+                &call_args,
                 &[ptr_ty],
                 location,
             ),
@@ -715,7 +799,14 @@ fn rewrite_one<'c>(
                 as_mut(candidate.alloc_call).move_before(redirect_op);
                 candidate.dest_ptr
             } else {
-                build_fresh_alloc(context, block, redirect_op, candidate.elem_type, &candidate.dims)
+                build_fresh_alloc(
+                    context,
+                    block,
+                    redirect_op,
+                    candidate.elem_type,
+                    &candidate.dims,
+                    candidate.is_local,
+                )
             };
 
             // Build a real `memref<dims x elem>` view of `new_dest_ptr` --
@@ -916,7 +1007,11 @@ fn rewrite_one<'c>(
     // sized and already wired everywhere it needs to be, so it must be
     // left completely alone.
     if !relocated {
-        as_mut(candidate.alloc_call).set_operand(0, zero_size);
+        // `cleave_alloc_local`'s own leading `handle` argument shifts the
+        // size operand to index 1 -- `Candidate::is_local`'s own doc
+        // comment.
+        let size_operand_index = if candidate.is_local { 1 } else { 0 };
+        as_mut(candidate.alloc_call).set_operand(size_operand_index, zero_size);
     }
 
     // Redirect every other pre-existing use of the *old* alloc's own
@@ -945,7 +1040,18 @@ fn rewrite_one<'c>(
     // rewrite already knows, structurally, that nothing else can hold a
     // second reference to an allocation it just proved has zero remaining
     // uses in the whole module.
-    if !relocated {
+    // No `cleave_release` for the region-local case at all: `Candidate::
+    // is_local`'s own doc comment -- a region is reclaimed in bulk when it
+    // closes, its individual allocations carry no refcount header, and
+    // `cleave_release` on one would be a real correctness bug (corrupting
+    // the bump allocator's own bookkeeping), not just a missed
+    // optimization. Zeroing the size operand above already bounds the
+    // wasted space to near-zero, same as the `cleave_alloc_rc` case relied
+    // on before the explicit release existed at all (`Candidate::alloc_
+    // call`'s own doc comment) -- just never fully closed here, because
+    // there is nothing to close: the region's own exit already does that
+    // for the whole batch, unconditionally.
+    if !relocated && !candidate.is_local {
         ensure_cleave_release_declared(context, module_body);
         let dead_code_result: Value = block
             .insert_operation_after(
