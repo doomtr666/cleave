@@ -316,38 +316,39 @@ fn match_candidate<'c, 'a>(
     if !op_name_is(inttoptr, "llvm.inttoptr") {
         return None;
     }
-    let index_cast = defining_op(inttoptr.operand(0).ok()?)?;
-    if !op_name_is(index_cast, "arith.index_cast") {
-        return None;
-    }
-    let extract_ptr = defining_op(index_cast.operand(0).ok()?)?;
-    if !op_name_is(extract_ptr, "memref.extract_aligned_pointer_as_index") {
-        return None;
-    }
-    // What `extract_ptr` operates on tells apart the two shapes.
-    // `Overwrite` goes through `bufferization.to_buffer` -- a fresh
-    // `tensor<...>`-typed computation genuinely needs bufferizing to get a
-    // pointer at all. `Strategy::Passthrough` does
-    // *not*: `store_native_shape_field` always builds `to_buffer(value)`
-    // unconditionally (`mlir_lower.rs`'s own code, checked directly, has no
-    // special case for this at all) -- but when `value` is itself `load_
-    // native_shape_field`'s own `to_tensor(cast(load(...)))` result, `--
-    // inline`'s own post-inline cleanup (confirmed directly: this project
-    // runs no separate `--canonicalize` stage at all, so this fold is
-    // coming from the inliner's own simplification pass, not from anything
-    // this rewrite or `pipeline.rs` added on purpose) folds the trivial `to
-    // _buffer(to_tensor(x)) -> x` round trip away before this rewrite ever
-    // runs -- confirmed directly, not assumed, the hard way: an earlier
-    // version of this matcher looked for `bufferization.to_tensor` as the
-    // producer feeding a `to_buffer` exactly the way `Overwrite`'s own
-    // shape works, and it silently never fired at all on this exact,
-    // structurally real case (`Sgd`'s own state passthrough, `stdlib/optim
-    // /optim.cleave`) -- `extract_ptr`'s own operand traced straight to the
-    // `unrealized_conversion_cast` underneath the vanished `to_tensor`,
-    // with no `to_buffer` anywhere in between to match against.
-    let extract_src = defining_op(extract_ptr.operand(0).ok()?)?;
+    let (strategy, producer, elem_type, dims) = {
+        let index_cast = defining_op(inttoptr.operand(0).ok()?)?;
+        if !op_name_is(index_cast, "arith.index_cast") {
+            return None;
+        }
+        let extract_ptr = defining_op(index_cast.operand(0).ok()?)?;
+        if !op_name_is(extract_ptr, "memref.extract_aligned_pointer_as_index") {
+            return None;
+        }
+        // What `extract_ptr` operates on tells apart the two shapes.
+        // `Overwrite` goes through `bufferization.to_buffer` -- a fresh
+        // `tensor<...>`-typed computation genuinely needs bufferizing to get a
+        // pointer at all. `Strategy::Passthrough` does
+        // *not*: `store_native_shape_field` always builds `to_buffer(value)`
+        // unconditionally (`mlir_lower.rs`'s own code, checked directly, has no
+        // special case for this at all) -- but when `value` is itself `load_
+        // native_shape_field`'s own `to_tensor(cast(load(...)))` result, `--
+        // inline`'s own post-inline cleanup (confirmed directly: this project
+        // runs no separate `--canonicalize` stage at all, so this fold is
+        // coming from the inliner's own simplification pass, not from anything
+        // this rewrite or `pipeline.rs` added on purpose) folds the trivial `to
+        // _buffer(to_tensor(x)) -> x` round trip away before this rewrite ever
+        // runs -- confirmed directly, not assumed, the hard way: an earlier
+        // version of this matcher looked for `bufferization.to_tensor` as the
+        // producer feeding a `to_buffer` exactly the way `Overwrite`'s own
+        // shape works, and it silently never fired at all on this exact,
+        // structurally real case (`Sgd`'s own state passthrough, `stdlib/optim
+        // /optim.cleave`) -- `extract_ptr`'s own operand traced straight to the
+        // `unrealized_conversion_cast` underneath the vanished `to_tensor`,
+        // with no `to_buffer` anywhere in between to match against.
+        let extract_src = defining_op(extract_ptr.operand(0).ok()?)?;
 
-    let (strategy, producer, elem_type, dims) = if op_name_is(extract_src, "bufferization.to_buffer")
+        if op_name_is(extract_src, "bufferization.to_buffer")
     {
         let to_buffer = extract_src;
         let value = to_buffer.operand(0).ok()?;
@@ -509,7 +510,27 @@ fn match_candidate<'c, 'a>(
         // here beyond confirming the shape and reading its type.
         let memref_val = extract_ptr.operand(0).ok()?;
         let read_descriptor = defining_op(extract_src.operand(0).ok()?)?;
-        if !op_name_is(read_descriptor, "llvm.load") {
+        // `llvm.load` -- a *heavy* struct's own field, read from real
+        // memory (`load_native_shape_field`'s own pre-Tier-3 emission) --
+        // or `llvm.extractvalue` -- a *light* struct's own field, read
+        // straight out of an already-in-hand SSA aggregate, no memory
+        // access at all (`lower_field_access`'s own light-struct branch,
+        // `mlir_lower.rs`, added once Tier 3 made this a real, reachable
+        // shape). Found necessary the hard way, not designed in from the
+        // start: this project's own real `mnist-interop` kernel has a real,
+        // dominant `memcpy` (`~88%` of the per-sample bytes copied, `doc/
+        // backlog.md`'s own entry has the full trace) whose own source is
+        // exactly this light-struct shape, structurally identical to the
+        // heavy case in every other respect -- an earlier attempt at this
+        // fix built a *second*, separate top-level branch assuming a later-
+        // pipeline-stage IR shape (`llvm.ptrtoint`/`llvm.inttoptr` around a
+        // raw pointer) that turned out not to exist yet at the point `dps_
+        // rewrite` actually runs (before bufferization) -- confirmed
+        // directly, not assumed, by dumping the real module at that exact
+        // point: the light-struct case reaches this exact `unrealized_
+        // conversion_cast`-based chain too, only the descriptor's own
+        // defining op differs from the heavy case.
+        if !op_name_is(read_descriptor, "llvm.load") && !op_name_is(read_descriptor, "llvm.extractvalue") {
             return None;
         }
         // Same "exactly one real use" safety posture as the other two
@@ -530,6 +551,7 @@ fn match_candidate<'c, 'a>(
         (Strategy::Passthrough, extract_src, elem_type, dims)
     } else {
         return None;
+    }
     };
 
     let private_size_chain =
