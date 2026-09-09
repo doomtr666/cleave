@@ -163,13 +163,139 @@ unsafe fn rc_header(ptr: *mut u8) -> *mut RcHeader {
 /// below — explicit, opt-in, only ever emitted at a site the compiler has
 /// actually proven safe) are two genuinely different entry points, not one
 /// function silently branching on ambient state.
+/// Segregated free-list cache behind `cleave_alloc_rc`/`cleave_release`'s
+/// own non-arena path — **the simpler replacement for a much more involved
+/// design that was sketched but never built** (`doc/backlog.md`'s own
+/// former "depth-bounded pool per loop-carried allocation site" entry): that
+/// version needed a brand-new CPS-level static classification (which
+/// top-level allocation sites are loop-carried, single-call-site,
+/// statically-fixed-size) before a single line of `cleave-rt` code could
+/// even be reached. The real target it was chasing — `Optimizer::step`'s
+/// own 16 tensor leaves, replaced every training-loop iteration, retired
+/// almost immediately after (`region_analysis.rs`'s own module doc comment
+/// has the full story) — never actually needed to know *which* call site
+/// produced a given allocation, only that **the same handful of sizes
+/// recur every iteration**. Bucketing by size class alone captures that
+/// directly, generalizes to every `cleave_alloc_rc` caller in the program
+/// (not just the one motivating loop), and needs no new compiler analysis
+/// at all: "pay `RtlAllocateHeap`/`RtlFreeHeap` for a given size at most
+/// once, ever, for the rest of the process's life" is what a segregated
+/// free list *is*, not something bolted onto it.
+///
+/// **Real, found-by-testing correction to this section's own original
+/// claim** ("`OMP_NUM_THREADS` parallelism lives entirely inside MLIR-
+/// generated compute loops, never reaching `cleave-rt`") — checked directly
+/// against the real `mnist-interop` kernel's own disassembled `.o`
+/// (`llvm-objdump`, this project's own established methodology): `cleave_
+/// alloc_rc`/`cleave_release` calls exist *inside* several `..omp_par.N`
+/// outlined parallel-region bodies (per-thread scratch tensors for the
+/// tiled matmul), genuinely reachable from multiple OpenMP worker threads
+/// at once whenever `OMP_NUM_THREADS > 1`. `cleave_retain`/`cleave_
+/// release`'s own plain (non-atomic) refcount increment/decrement stay
+/// sound regardless — each such scratch tensor's own header is thread-
+/// private, no two threads ever touch the *same* header — but `FREE_LISTS`
+/// itself is genuinely shared, global, mutable state every thread reaches
+/// through the *identical* allocator entry points, with nothing here ever
+/// synchronizing it: a real, reproducible race (two threads racing `cleave_
+/// alloc_rc`'s own free-list pop, both reading the same head before either
+/// writes the new one back, handing the *same* block out twice at once).
+/// `POOL_LOCK` below is the fix — a spinlock, not a full OS mutex: the
+/// critical section is a handful of pointer reads/writes, cheap enough
+/// that spinning beats a syscall-backed lock's own overhead, and the
+/// refcount increment/decrement themselves stay outside it (still
+/// per-header-private, no need to serialize those too).
+static POOL_LOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// # Safety
+/// Every `FREE_LISTS` access below happens strictly between a matching
+/// `pool_lock()`/`pool_unlock()` pair — see `POOL_LOCK`'s own doc comment.
+fn pool_lock() {
+    use std::sync::atomic::Ordering::{Acquire, Relaxed};
+    while POOL_LOCK.compare_exchange_weak(false, true, Acquire, Relaxed).is_err() {
+        std::hint::spin_loop();
+    }
+}
+fn pool_unlock() {
+    POOL_LOCK.store(false, std::sync::atomic::Ordering::Release);
+}
+
+/// Class `c` covers `(2^(c-1), 2^c]` bytes, so `class_bytes(size_class(n))`
+/// is always `>= n` — the usual power-of-two segregated-free-list rounding.
+/// Deliberately generous (64 classes: 64-bit `usize` can never overflow it)
+/// rather than sized exactly to what this program happens to allocate —
+/// the unused high classes cost nothing but one pointer-sized array slot
+/// each (a few hundred bytes total).
+const NUM_SIZE_CLASSES: usize = 64;
+
+/// One intrusive singly-linked free list per size class — `FREE_LISTS[c]`
+/// is the most-recently-released block's own base pointer (the header's own
+/// address, `cleave_release`'s own `rc_header`), or null if none is
+/// currently cached. The "next" pointer for each link is stored *in* the
+/// freed block itself, overwriting the now-dead `RcHeader` (every class's
+/// physical allocation is at least 32 bytes, `size_class`'s own `.max(32)`
+/// floor — always room for one `*mut u8`) — no separate free-list node type
+/// or allocation needed, the classic segregated-free-list trick.
+static mut FREE_LISTS: [*mut u8; NUM_SIZE_CLASSES] = [std::ptr::null_mut(); NUM_SIZE_CLASSES];
+
+/// Smallest `c` such that `2^c >= total.max(32)` — the `32` floor matches
+/// `RC_HEADER_SIZE` (16 bytes) plus a little real payload room being the
+/// smallest allocation this runtime ever actually makes, and guarantees
+/// every cached block has at least 8 bytes free for its own free-list
+/// "next" pointer even at `data_size == 0`.
+fn size_class(total: usize) -> usize {
+    let total = total.max(32);
+    (usize::BITS - (total - 1).leading_zeros()) as usize
+}
+
+/// The physical size actually allocated (and, symmetrically, freed) for
+/// every block in size class `c` — a pure function of `c` alone, so a block
+/// popped from `FREE_LISTS[c]` at alloc time and one pushed back at release
+/// time always agree on layout, even though the *requested* `data_size`
+/// generally differs from one occupant of the class to the next (the whole
+/// point of bucketing instead of tracking exact sizes: a slightly smaller
+/// same-class request still reuses the block cleanly).
+fn class_bytes(class: usize) -> usize {
+    1usize << class
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn cleave_alloc_rc(data_size: i64) -> *mut u8 {
     let total = RC_HEADER_SIZE + data_size as usize;
-    let layout = std::alloc::Layout::from_size_align(total, 16).expect("cleave_alloc_rc: invalid layout");
+    let class = size_class(total);
     unsafe {
-        let base = std::alloc::alloc(layout);
-        assert!(!base.is_null(), "cleave_alloc_rc: allocation failed");
+        // Pop under `POOL_LOCK` (`POOL_LOCK`'s own doc comment: real,
+        // concurrent OpenMP-worker traffic reaches this exact spot) --
+        // released again before the fallback `std::alloc::alloc` below,
+        // which never touches `FREE_LISTS` at all and has no reason to
+        // serialize against it.
+        let popped = if class < NUM_SIZE_CLASSES {
+            pool_lock();
+            let block = FREE_LISTS[class];
+            let popped = if !block.is_null() {
+                // The cached block's own first 8 bytes hold the next link
+                // (`FREE_LISTS`'s own doc comment) -- read it before this
+                // block's contents get overwritten by the `RcHeader` write
+                // below.
+                FREE_LISTS[class] = *(block as *mut *mut u8);
+                Some(block)
+            } else {
+                None
+            };
+            pool_unlock();
+            popped
+        } else {
+            None
+        };
+        let base = match popped {
+            Some(block) => block,
+            None => {
+                let layout = std::alloc::Layout::from_size_align(class_bytes(class), 16)
+                    .expect("cleave_alloc_rc: invalid layout");
+                let p = std::alloc::alloc(layout);
+                assert!(!p.is_null(), "cleave_alloc_rc: allocation failed");
+                p
+            }
+        };
         let header = base as *mut RcHeader;
         (*header).refcount = 1;
         (*header).data_size = data_size;
@@ -227,9 +353,28 @@ pub unsafe extern "C" fn cleave_release(ptr: *mut u8) -> bool {
             if !is_in_arena(header as *mut u8) {
                 let data_size = (*header).data_size;
                 let total = RC_HEADER_SIZE + data_size as usize;
-                let layout = std::alloc::Layout::from_size_align(total, 16)
-                    .expect("cleave_release: invalid layout");
-                std::alloc::dealloc(header as *mut u8, layout);
+                let class = size_class(total);
+                let base = header as *mut u8;
+                if class < NUM_SIZE_CLASSES {
+                    // Cache it instead of returning it to the OS heap --
+                    // `cleave_alloc_rc`'s own `FREE_LISTS` doc comment.
+                    // `class_bytes(class)` is what actually got allocated
+                    // for this block (`cleave_alloc_rc`'s own symmetric
+                    // rounding), so writing the free-list "next" pointer
+                    // into its first 8 bytes is always in-bounds.
+                    pool_lock();
+                    *(base as *mut *mut u8) = FREE_LISTS[class];
+                    FREE_LISTS[class] = base;
+                    pool_unlock();
+                } else {
+                    // Astronomically large (`class >= 64`, i.e. `total >
+                    // 2^63`) -- can't happen with a real `i64 data_size`,
+                    // but falls back to the plain, uncached path rather
+                    // than indexing out of bounds if it ever somehow did.
+                    let layout = std::alloc::Layout::from_size_align(class_bytes(class), 16)
+                        .expect("cleave_release: invalid layout");
+                    std::alloc::dealloc(base, layout);
+                }
             }
             true
         } else {
@@ -546,14 +691,64 @@ mod rc_tests {
             cleave_release(ptr as *mut u8);
 
             // A "release-to-zero actually calls dealloc, not just zeroes
-            // the count" check was tried here and removed, not left red:
-            // it asserted a fresh allocation reuses the just-freed
-            // address, found directly to be unreliable against the real
-            // system allocator (Windows' own allocator doesn't guarantee
-            // immediate reuse the way some allocators' fast paths do) — a
-            // real, non-deterministic property this test can't black-box
-            // verify without a custom `#[global_allocator]` tracking
-            // wrapper, not worth building for this one check.
+            // the count" check was tried here and removed at first, not
+            // left red: it asserted a fresh allocation reuses the
+            // just-freed address, found directly to be unreliable against
+            // the real system allocator (Windows' own allocator doesn't
+            // guarantee immediate reuse the way some allocators' fast
+            // paths do). **Now genuinely testable, the size-class free-list
+            // cache's own doc comment (`FREE_LISTS`, above) having made
+            // address reuse an actual, deterministic contract of this
+            // allocator rather than an implementation detail of whichever
+            // OS allocator happens to sit underneath it** — a released
+            // block of a given size class is *always* the next block
+            // handed back to a same-class request, LIFO, with no OS call
+            // in between at all.
+            let p1 = cleave_alloc_rc(40);
+            cleave_release(p1);
+            let p2 = cleave_alloc_rc(40);
+            assert_eq!(
+                p1, p2,
+                "a released block must be reused by the very next same-size-class allocation"
+            );
+
+            // Two *simultaneously live* same-class allocations must still
+            // never alias — the cache only ever hands out a block once
+            // it's actually been released, exactly like the plain
+            // `std::alloc::alloc` path it replaces.
+            let live_a = cleave_alloc_rc(40);
+            let live_b = cleave_alloc_rc(40);
+            assert_ne!(live_a, live_b, "two live allocations must not overlap, cache or no cache");
+            cleave_release(live_a);
+            cleave_release(live_b);
+
+            // A smaller request that still rounds up to the *same* size
+            // class reuses the identical cached block too — the free list
+            // is keyed by class, not by exact `data_size`.
+            let p3 = cleave_alloc_rc(40);
+            cleave_release(p3);
+            let p4 = cleave_alloc_rc(24);
+            assert_eq!(
+                p3, p4,
+                "a smaller same-class request must still reuse the previously released block"
+            );
+            cleave_release(p4);
+
+            // The cached block is real, writable memory each time it comes
+            // back around — not just an address that happens to satisfy
+            // the assertions above. Cycles through the class' own free
+            // list several times, writing a different pattern each time.
+            let mut prev: *mut i64 = std::ptr::null_mut();
+            for i in 0..5i64 {
+                let p = cleave_alloc_rc(40) as *mut i64;
+                if !prev.is_null() {
+                    assert_eq!(p as *mut i64, prev, "the free list should keep recycling this same block");
+                }
+                *p = 0x1000 + i;
+                assert_eq!(*p, 0x1000 + i);
+                prev = p;
+                cleave_release(p as *mut u8);
+            }
 
             let a = cleave_alloc_rc(8);
             let b = cleave_alloc_rc(8);

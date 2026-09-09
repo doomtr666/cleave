@@ -129,6 +129,28 @@ use std::collections::{HashMap, HashSet};
 /// exclusion only ever fires for the `RawBuf`-shaped "opaque FFI handle,
 /// produced solely by `extern fn`s" idiom, structurally, with no hardcoded
 /// name anywhere.
+/// Whether `ty` is itself a bare `#[mlir_type(tensor)]`-tagged type (like
+/// `Tensor<T, Dims...>`) — deliberately *not* covered by `is_refcounted`
+/// (its own doc comment excludes it on purpose, matching `mlir_lower.rs::
+/// lower_field_access`'s own "no `!llvm.struct` storage at all" native-
+/// shape handling), yet a `Tensor` value genuinely *is* heap-backed
+/// (`cleave_alloc_rc`, at bufferization) and does need a real `Retain`/
+/// `Release` when it's ever independently, directly owned — matching
+/// `mlir_lower.rs::collect_light_leaves`'s own dedicated "a Tensor field is
+/// always its own leaf" rule, the actual authority for this, reused here
+/// directly for the one case that rule doesn't itself reach: a *bare*
+/// Tensor value, never wrapped in any struct at all (`Scale::scale`'s own
+/// real return shape — see `rewrite_body`'s own `Fix` arm, the transferred-
+/// argument seeding this exists for).
+fn is_bare_tensor_ty(ty: &Ty, mlir_types: &HashMap<String, String>) -> bool {
+    let name = match ty {
+        Ty::Con(n) => n.as_str(),
+        Ty::App(n, _) => n.as_str(),
+        _ => return false,
+    };
+    mlir_types.get(name).map(String::as_str) == Some("tensor")
+}
+
 pub(crate) fn is_refcounted(
     ty: &Ty,
     struct_schemas: &HashMap<String, crate::cps::StructSchema>,
@@ -777,6 +799,223 @@ fn walk_local_claim_vars(
     }
 }
 
+/// A `CVar`'s own defining shape, tracked only for the two forms
+/// `param_leaf_key` needs to see *through* — a plain `field.F(base)` read
+/// (transparent: the result denotes exactly whatever `base`'s own `F` field
+/// already denotes, no new value), or a `struct.Name[f1,...](a1,...)`
+/// construction (also transparent, *per field* — reading `.f_i` back off
+/// this exact construction denotes exactly `a_i` again, nothing copied).
+/// Anything else (a real call's own result, an arithmetic `PrimOp`, ...) is
+/// a genuine fresh value and gets no entry at all.
+enum ValueDef {
+    Field(CVar, String),
+    StructCtor(HashMap<String, CVar>),
+}
+
+/// Every `CVar` this function's own body defines via `Field`/`Struct`,
+/// resolved to its own `ValueDef` — see `param_leaf_key`'s own doc comment
+/// for what this is *for*. A single forward walk suffices (CPS is SSA — a
+/// `CVar` is bound at most once, always *before* any later reference to it,
+/// so nothing here needs a fixpoint).
+fn collect_value_defs(top: &CTopLevelFn) -> HashMap<CVar, ValueDef> {
+    let mut defs = HashMap::new();
+    walk_value_defs(&top.def.body, &mut defs);
+    defs
+}
+
+fn walk_value_defs(expr: &CExpr, defs: &mut HashMap<CVar, ValueDef>) {
+    match expr {
+        CExpr::LetPrim {
+            var, op, args, cont, ..
+        } => {
+            match op {
+                PrimOp::Field { field, .. } => {
+                    if let [CVal::Var(base)] = args.as_slice() {
+                        defs.insert(*var, ValueDef::Field(*base, field.clone()));
+                    }
+                }
+                PrimOp::Struct(_name, field_names) => {
+                    let fields: HashMap<String, CVar> = field_names
+                        .iter()
+                        .zip(args.iter())
+                        .filter_map(|(f, a)| match a {
+                            CVal::Var(v) => Some((f.clone(), *v)),
+                            _ => None,
+                        })
+                        .collect();
+                    defs.insert(*var, ValueDef::StructCtor(fields));
+                }
+                _ => {}
+            }
+            walk_value_defs(cont, defs);
+        }
+        CExpr::App { .. } => {}
+        CExpr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            walk_value_defs(then_branch, defs);
+            walk_value_defs(else_branch, defs);
+        }
+        CExpr::Fix {
+            defs: fdefs, body, ..
+        } => {
+            for d in fdefs {
+                walk_value_defs(&d.body, defs);
+            }
+            walk_value_defs(body, defs);
+        }
+    }
+}
+
+/// What `v`'s own value, fully resolved through any number of transparent
+/// `Field`/`StructCtor` hops (`ValueDef`'s own doc comment), ultimately
+/// turns out to be: still exactly one of this function's own parameters
+/// (`Param` — propagated through *every* further `Field` hop on top of it
+/// too, since a field read off an unresolved parameter is just as much
+/// "the same value the caller already holds" as the parameter itself —
+/// there's no `StructCtor` entry for a parameter to peel a field off *of*,
+/// unlike a locally-constructed value), a locally-constructed struct whose
+/// own field->argument map is known (`Struct`, letting a *further* `Field`
+/// hop on top resolve transparently too — `param_leaf_key`'s own real
+/// need: `v2265.l1.w` must resolve exactly as far as `v2265.l1` alone
+/// (itself `Field`, resolving to `v2252`, itself a fresh `StructCtor`)
+/// already does, peeling `.w` off *that* struct's own field map, not off
+/// `v2265.l1`'s own (nonexistent) one), or genuinely `Opaque` (a real call
+/// result, arithmetic, or any other `PrimOp` — a real fresh value, full
+/// stop).
+enum Resolved<'a> {
+    /// Still exactly parameter `.0`'s own value — `.1` is the sequence of
+    /// field names taken *from that parameter itself* to reach here (empty
+    /// for the parameter's own bare `CVar`), not from wherever the walk
+    /// happened to start — the whole point: `v2431` (`v2265.l1.w`, one
+    /// re-derivation) and `v2250` (`v749.l1.w` via a completely different,
+    /// earlier chain) must resolve to the *identical* `(v749, ["l1","w"])`
+    /// key despite being different `CVar`s, different starting points, and
+    /// different numbers of hops — `wrap_releases`'s own dedup (below)
+    /// depends on that.
+    Param(CVar, Vec<String>),
+    Struct(&'a HashMap<String, CVar>),
+    Opaque,
+}
+
+fn resolve<'a>(v: CVar, params: &HashSet<CVar>, defs: &'a HashMap<CVar, ValueDef>) -> Resolved<'a> {
+    if params.contains(&v) {
+        return Resolved::Param(v, Vec::new());
+    }
+    match defs.get(&v) {
+        Some(ValueDef::StructCtor(fields)) => Resolved::Struct(fields),
+        Some(ValueDef::Field(base, field)) => match resolve(*base, params, defs) {
+            Resolved::Struct(fields) => match fields.get(field) {
+                Some(arg) => resolve(*arg, params, defs),
+                None => Resolved::Opaque,
+            },
+            Resolved::Param(p, mut path) => {
+                path.push(field.clone());
+                Resolved::Param(p, path)
+            }
+            Resolved::Opaque => Resolved::Opaque,
+        },
+        None => Resolved::Opaque,
+    }
+}
+
+/// `resolve`, continued past `var`'s own resolution through `steps` (a
+/// `LightLeafPath`'s own field-name path, `wrap_releases`'s real caller) —
+/// the shared engine behind both `wrap_releases`'s heavy-`is_rc` branch
+/// (`steps` empty, resolving `var` alone) and its light-struct-leaf branch
+/// (`steps` non-empty).
+fn resolve_leaf<'a>(
+    var: CVar,
+    steps: &[(Ty, String)],
+    params: &HashSet<CVar>,
+    defs: &'a HashMap<CVar, ValueDef>,
+) -> Resolved<'a> {
+    let mut current = resolve(var, params, defs);
+    for (_, field) in steps {
+        current = match current {
+            Resolved::Struct(fields) => match fields.get(field) {
+                Some(arg) => resolve(*arg, params, defs),
+                None => Resolved::Opaque,
+            },
+            Resolved::Param(p, mut path) => {
+                path.push(field.clone());
+                Resolved::Param(p, path)
+            }
+            Resolved::Opaque => Resolved::Opaque,
+        };
+    }
+    current
+}
+
+/// Whether `v`'s own value is *exactly* (never a copy of) something this
+/// function received as one of its own borrowed formal parameters —
+/// resolved transitively through any number of `Field`/`Struct`
+/// reconstructions in between (`ValueDef`'s own doc comment: both are
+/// transparent, denote the identical underlying value, never a new one).
+///
+/// **What this exists to fix, found by direct testing against the real
+/// `examples/mnist-interop` kernel once the pool allocator (`cleave-rt`'s
+/// own size-class free-list cache) started reusing freed blocks
+/// immediately instead of relying on the OS heap's own lazy reuse — a real
+/// `STATUS_ACCESS_VIOLATION`, root-caused precisely (not guessed) by
+/// tracing `Optimizer::step<Sgd, Network, NetworkState<...>>`'s own
+/// `--dump-cps-optimized` body variable by variable**: `Sgd`'s own `state`
+/// genuinely never changes (a stateless optimizer — `Optimizer::step` for
+/// `Sgd` just re-wraps `state`'s own existing leaves, unchanged, into a
+/// fresh `NetworkState`); this function's own true return value therefore
+/// embeds tensors that are *also* still reachable through its own `state`
+/// parameter. Before this fix, this module's own generic "release whatever
+/// this scope still owns that the return call's own *literal* arguments
+/// don't cover" step (`releases_for_app`, this function's own caller)
+/// couldn't tell that apart from the ordinary case (`net`'s own leaves,
+/// genuinely freshly computed by the very same function) — it released
+/// *every* such leaf's own locally-tracked copy unconditionally, correct
+/// for the fresh case (a completely independent object, its own count
+/// starting fresh) but one release too many for the identity-preserving
+/// case: the loop's own next iteration still reaches the exact same tensor
+/// through its own newly-returned `state`, whose count that extra release
+/// already brought to zero — a real, silent premature free, invisible
+/// until *something else* later reused the same freed block and the
+/// dangling reference read or wrote through it.
+///
+/// Deliberately narrow — only ever consulted at a function's own **true**
+/// return (`rewrite_body`'s own `CExpr::App` arm, guarded on `func ==
+/// k_ret`), never at an ordinary call/loop tail-call, where the existing
+/// `live_set`-based protection is already exactly right. A leaf that
+/// *isn't* provably param-traced (any real computation anywhere in its own
+/// derivation chain) resolves to `None` here, exactly like today —
+/// strictly additive, never loosens an existing, already-correct release.
+///
+/// **Returns the dedup key itself (`Some((param, field_path))`), not just a
+/// bool — found necessary, not a nicety, by a second real bug this fix's
+/// own first version introduced**: `owned`'s own pre-existing redundancy
+/// (a light struct nested inside another gets tracked as *two* separate
+/// `to_release` entries — its own, and again transitively through the
+/// outer one — true for `net`'s leaves too, symmetric there since *both*
+/// copies get an equally redundant retain) means a single param-traced leaf
+/// can appear here more than once in the very same `wrap_releases` call.
+/// Skipping *every* occurrence (this fix's own first version) leaves the
+/// matching retains uncompensated — a real leak (`v749.l1.w`'s own count
+/// growing by one every single training-loop iteration, unbounded).
+/// Skipping only the *first* occurrence per key (`wrap_releases`'s own
+/// `skip_once` set) restores exactly the same "one retain answered by one
+/// release" balance the ordinary (non-param-traced) case already has,
+/// letting the *other*, redundant occurrence release normally, same as
+/// before this fix existed at all.
+fn param_leaf_key(
+    var: CVar,
+    steps: &[(Ty, String)],
+    params: &HashSet<CVar>,
+    defs: &HashMap<CVar, ValueDef>,
+) -> Option<(CVar, Vec<String>)> {
+    match resolve_leaf(var, steps, params, defs) {
+        Resolved::Param(p, path) => Some((p, path)),
+        _ => None,
+    }
+}
+
 struct RefcountCtx<'a> {
     struct_schemas: &'a HashMap<String, crate::cps::StructSchema>,
     mlir_types: &'a HashMap<String, String>,
@@ -803,6 +1042,14 @@ struct RefcountCtx<'a> {
     local_free_vars: &'a HashMap<String, HashSet<CVar>>,
     local_claim_vars: &'a HashMap<String, HashSet<CVar>>,
     fresh: &'a FreshVars,
+    /// This one top-level function's own formal parameters — `param_leaf_
+    /// key`'s own base case. Per-function (not whole-program), matching
+    /// `RefcountCtx` itself being rebuilt fresh for each `top` in `insert_
+    /// refcounting`'s own loop.
+    params: &'a HashSet<CVar>,
+    /// `param_leaf_key`'s own `Field`/`StructCtor` lookup table for this
+    /// one function's own body — see that function's own doc comment.
+    value_defs: &'a HashMap<CVar, ValueDef>,
 }
 
 impl RefcountCtx<'_> {
@@ -881,6 +1128,8 @@ pub fn insert_refcounting(
             collect_local_free_vars(&top, &mut local_free_vars);
             let mut local_claim_vars = HashMap::new();
             collect_local_claim_vars(&top, &mut local_claim_vars);
+            let params: HashSet<CVar> = top.def.params.iter().copied().collect();
+            let value_defs = collect_value_defs(&top);
             let ctx = RefcountCtx {
                 struct_schemas,
                 mlir_types,
@@ -892,6 +1141,8 @@ pub fn insert_refcounting(
                 local_free_vars: &local_free_vars,
                 local_claim_vars: &local_claim_vars,
                 fresh: &fresh,
+                params: &params,
+                value_defs: &value_defs,
             };
             insert_refcounting_fn(top, &ctx)
         })
@@ -1157,7 +1408,29 @@ fn rewrite_body(
         }
         CExpr::App { func, args } => {
             let to_release = releases_for_app(&func, &args, owned, ctx);
-            wrap_releases(to_release, CExpr::App { func, args }, ctx)
+            // The function's own *true* return (as opposed to a real
+            // call's own dispatch or a loop's own back-edge, both still
+            // handled exactly as before) — `param_leaf_key`'s own doc
+            // comment has the full story: a leaf embedded in this exact
+            // return value that's provably still the identical object one
+            // of this function's own parameters already denotes was never
+            // this function's own to give away a second time here (its own
+            // *caller*, symmetrically, already assumes a real call's
+            // result is always a genuinely fresh, independently-owned
+            // reference — `collect_var_info`'s own doc comment on `PrimOp
+            // ::Field`'s ownership rule says so explicitly).
+            // At this function's own *true* return (as opposed to a real
+            // call's own dispatch or a loop's own back-edge, both still
+            // released exactly as before) — `param_leaf_key`'s own
+            // doc comment has the full story: a leaf still reachable
+            // through one of this function's own parameters was never
+            // this function's own to give away a second time here (its
+            // own *caller*, symmetrically, already assumes a real call's
+            // result is always a genuinely fresh, independently-owned
+            // reference — `collect_var_info`'s own doc comment on `PrimOp
+            // ::Field`'s ownership rule says so explicitly).
+            let at_true_return = matches!(&func, CVal::Var(v) if *v == k_ret);
+            wrap_releases(to_release, CExpr::App { func, args }, ctx, at_true_return)
         }
         CExpr::If {
             cond,
@@ -1279,6 +1552,43 @@ fn rewrite_body(
                             }
                         }
                     }
+                    // A *real* call's own resumption, `def.carried_types
+                    // .is_none()` (a loop's own entry/back-edge is excluded
+                    // below instead, `carried_types.is_some()`), consuming
+                    // an *owned* value as a literal argument that's never
+                    // referenced again anywhere leaves that value with no
+                    // scope left to release it at all: `live_set`'s own
+                    // "any literal argument is live" rule (needed so the
+                    // callee itself still sees a valid pointer while it
+                    // runs) only protects the *call's own duration*, and an
+                    // ordinary top-level function (`Ring::sub`, `Scale::
+                    // scale`, ...) never releases its own borrowed
+                    // parameters (this module's own documented convention)
+                    // — a real, confirmed, unbounded per-training-step leak
+                    // (`Optimizer::step`'s own Sgd update: `Scale::scale
+                    // (lr, grad)`'s own result, fed straight into `Ring::
+                    // sub` and never touched again). **A fix for this was
+                    // attempted and reverted** — seeding the argument into
+                    // `seed` here, gated on it not appearing in `def`'s own
+                    // `local_free_vars` (protecting a genuinely-still-
+                    // needed one), still produced a real, reproducible
+                    // `STATUS_ACCESS_VIOLATION` (`cleave-rt`'s own temporary
+                    // `CLEAVE_DEBUG_POOL`/`RtlCaptureStackBackTrace`
+                    // instrumentation traced it to `cleave_release` being
+                    // called on a header that was never a valid allocation
+                    // at all — `data_size=0`, refcount already negative on
+                    // the very first tracked event for that address) —
+                    // confirmed, by disabling the fix outright, to be the
+                    // fix's own doing, not a pre-existing issue it merely
+                    // exposed; excluding the enclosing function's own body
+                    // when it's `region_analysis::find_region_local_
+                    // functions` (arena-backed, bulk-reclaimed regardless)
+                    // did *not* resolve it either, so the real remaining
+                    // flaw in this approach is still unidentified. Left
+                    // here as a precise, validated write-up rather than a
+                    // silently-reintroduced bug — `doc/backlog.md`'s own
+                    // struct-allocation-strategy entry has the same account
+                    // for anyone picking this back up.
                     if body_is_app {
                         // A loop's own entry call passes its own initial
                         // carried values as literal arguments -- the exact
@@ -1368,7 +1678,12 @@ fn rewrite_body(
                 defs: new_defs,
                 body: Box::new(new_outer_body),
             };
-            wrap_releases(to_release, fix_node, ctx)
+            // Never the function's own true return — that's always the
+            // *bare* `CExpr::App` arm above (a `Fix` wrapping an `App` as
+            // its own trailing `body` is either a real call's own
+            // resumption or a loop's own back-edge/entry, both still
+            // released exactly as before `param_leaf_key` existed).
+            wrap_releases(to_release, fix_node, ctx, false)
         }
     }
 }
@@ -1468,10 +1783,44 @@ fn releases_for_app(
 /// (`retain_targets` above, keyed on the *field's* own type) but never
 /// released it anywhere, since a light value's own binding was never
 /// tracked at all — a real, per-construction leak, not hypothetical.
-fn wrap_releases(to_release: Vec<(CVar, Ty)>, inner: CExpr, ctx: &RefcountCtx) -> CExpr {
+/// `at_true_return`: whether `inner` is this function's own real `k_ret`
+/// dispatch (as opposed to a real call's own resumption or a loop's own
+/// back-edge/entry) — see `param_leaf_key`'s own doc comment for why
+/// that's the *only* place a light struct's own leaf can be safely skipped
+/// here: everywhere else, `owned`/`to_release` (this function's own callers,
+/// `releases_for_app`) already correctly means "this scope is genuinely
+/// done with it", true release-target aliasing or not.
+///
+/// `skip_once` (`param_leaf_key`'s own doc comment has the full story) is
+/// scoped to this one call — a fresh, empty set per `wrap_releases` call,
+/// not threaded in from outside — since it exists only to de-duplicate
+/// `to_release`'s own pre-existing redundancy *within* this exact release
+/// point, never across two different ones.
+fn wrap_releases(to_release: Vec<(CVar, Ty)>, inner: CExpr, ctx: &RefcountCtx, at_true_return: bool) -> CExpr {
     let mut result = inner;
+    let mut skip_once: HashSet<(CVar, Vec<String>)> = HashSet::new();
     for (var, ty) in to_release.into_iter().rev() {
-        if ctx.is_rc(&ty) {
+        // `is_bare_tensor_ty` alongside `is_rc` here — a bare `Tensor`
+        // (never wrapped in any struct) needs the identical plain `Release`
+        // this branch already emits, not the light-struct-leaf-chain one
+        // below (`ctx.light_release_leaves(&ty)` is *always* empty for a
+        // `Tensor` itself, `is_bare_tensor_ty`'s own doc comment) — without
+        // this, a value seeded here by the transferred-argument fix
+        // (`rewrite_body`'s own `Fix` arm) would silently route into the
+        // light branch and get *zero* releases emitted for it at all.
+        if ctx.is_rc(&ty) || is_bare_tensor_ty(&ty, ctx.mlir_types) {
+            if at_true_return {
+                if let Some(key) = param_leaf_key(var, &[], ctx.params, ctx.value_defs) {
+                    // First redundant occurrence of this exact param-
+                    // traced value: skip it, matching the one still-
+                    // outstanding compensating retain (`param_leaf_key`'s
+                    // own doc comment). Any *further* occurrence releases
+                    // normally, exactly as before this fix existed.
+                    if skip_once.insert(key) {
+                        continue;
+                    }
+                }
+            }
             let rvar = ctx.fresh.var();
             result = CExpr::LetPrim {
                 var: rvar,
@@ -1481,7 +1830,15 @@ fn wrap_releases(to_release: Vec<(CVar, Ty)>, inner: CExpr, ctx: &RefcountCtx) -
                 cont: Box::new(result),
             };
         } else {
-            let leaves = ctx.light_release_leaves(&ty);
+            let mut leaves = ctx.light_release_leaves(&ty);
+            if at_true_return {
+                leaves.retain(|leaf| {
+                    match param_leaf_key(var, &leaf.steps, ctx.params, ctx.value_defs) {
+                        Some(key) => !skip_once.insert(key),
+                        None => true,
+                    }
+                });
+            }
             result = wrap_light_leaves(ctx, var, &leaves, PrimOp::Release, result);
         }
     }
