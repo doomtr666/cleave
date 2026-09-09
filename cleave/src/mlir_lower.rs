@@ -1754,6 +1754,24 @@ fn lower_loop<'c>(
         }
     };
 
+    // Whether *this* loop's own iteration ever needs a region at all --
+    // `doc/backlog.md`'s own "every loop iteration... unconditionally opens
+    // and closes a region" finding: a real, VTune-confirmed cost (`486`
+    // million `cleave_region_enter` calls on the real `mnist-interop`
+    // kernel) paid by *every* loop in the whole program regardless of
+    // whether anything inside it ever actually calls `cleave_alloc_local` --
+    // most don't. Checked here, once per loop, by intersecting this loop's
+    // own direct top-level callees (`then_branch` alone -- a *nested* loop's
+    // own calls are its own separate concern, its own separate `lower_loop`
+    // invocation makes this identical check independently; see `region_
+    // analysis.rs::collect_direct_callees`'s own doc comment) against `ctx.
+    // region_local_fns`, the same whole-program set `lower_top_level_fn`
+    // already consults for the identical reason.
+    let top_level_names: HashSet<String> = ctx.signatures.keys().cloned().collect();
+    let mut loop_callees: HashSet<String> = HashSet::new();
+    crate::region_analysis::collect_direct_callees(then_branch, &top_level_names, &mut loop_callees);
+    let needs_region = loop_callees.iter().any(|c| ctx.region_local_fns.contains(c));
+
     // Carried-state types, from `loop_def.carried_types` (`cps.rs`'s own
     // `ExprKind::While`/`For` conversion, one `Ty` per `loop_def.params`
     // position) -- *not* derived from `init_values` themselves: a carried
@@ -1872,46 +1890,66 @@ fn lower_loop<'c>(
     // not just an individual call within it, because a region-local
     // function's own result can genuinely need to stay valid past its own
     // call returning (`net_grad`'s own `g.2`, read afterward by `Optimizer
-    // ::step`, is exactly this shape) — safe to open unconditionally, even
-    // around calls that are *not* region-local (`Optimizer::step`'s own
-    // allocation sites never call `cleave_alloc_local` at all, regardless
-    // of whether a region happens to be open around their execution — the
-    // decision was already made once, per allocation *site*, at compile
-    // time, `alloc_llvm_value`'s own doc comment).
+    // ::step`, is exactly this shape).
+    //
+    // **Only when `needs_region` — not unconditionally any more.** Used to
+    // open one regardless, reasoning that it was "safe... even around calls
+    // that are *not* region-local" (still true: `alloc_llvm_value`'s own
+    // per-site decision genuinely doesn't care whether a region happens to
+    // be open around it) — but "safe" isn't "free", and this project's own
+    // `doc/backlog.md` has the real, measured cost of paying it regardless:
+    // `486` million real `cleave_region_enter` calls on one `mnist-interop`
+    // run, the overwhelming majority for loops whose own iteration never
+    // calls anything region-local at all. `needs_region` (computed just
+    // above, once per loop) is exactly the same fact `alloc_llvm_value`'s
+    // own per-site decision already depends on transitively, just checked
+    // once per loop instead of paying the runtime call unconditionally.
+    // `region_handle` is `None` exactly when this loop's own `then_branch`
+    // (and any nested loop's own, since `collect_direct_callees` walks
+    // through those too) never calls a `region_local_fns` member — the
+    // `App`-to-`yield_targets` arm (`lower_cexpr`, `YieldTarget`'s own doc
+    // comment) already handles a `None` handle by skipping `cleave_region_
+    // exit` too, so no change needed on that side at all.
     let i64_ty: Type = IntegerType::new(context, 64).into();
-    ensure_extern_declared(
-        ctx,
-        "cleave_region_enter",
-        &[Ty::Con("i64".to_string())],
-        &[i64_ty],
-    );
-    let zero_size = after_block
-        .append_operation(arith::constant(
-            context,
-            IntegerAttribute::new(i64_ty, 0).into(),
-            location,
-        ))
-        .result(0)
-        .unwrap()
-        .into();
-    let region_handle: Value = after_block
-        .append_operation(func::call(
-            context,
-            FlatSymbolRefAttribute::new(context, "cleave_region_enter"),
-            &[zero_size],
+    let region_handle: Option<Value> = if needs_region {
+        ensure_extern_declared(
+            ctx,
+            "cleave_region_enter",
+            &[Ty::Con("i64".to_string())],
             &[i64_ty],
-            location,
-        ))
-        .result(0)
-        .unwrap()
-        .into();
+        );
+        let zero_size = after_block
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(i64_ty, 0).into(),
+                location,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        Some(
+            after_block
+                .append_operation(func::call(
+                    context,
+                    FlatSymbolRefAttribute::new(context, "cleave_region_enter"),
+                    &[zero_size],
+                    &[i64_ty],
+                    location,
+                ))
+                .result(0)
+                .unwrap()
+                .into(),
+        )
+    } else {
+        None
+    };
 
     // Pushed onto a *fresh* `Vec` for the body — the original `yield_targets`
     // (without this entry) is what the loop-exit continuation, after the
     // `scf.while` is built, uses instead (see `lower_cexpr`'s own doc
     // comment for why this needs to be a stack, not a single replaced slot).
     let mut inner_targets: Vec<YieldTarget<'c, '_>> = yield_targets.to_vec();
-    inner_targets.push((&loop_def.name, &carried_types, Some(region_handle)));
+    inner_targets.push((&loop_def.name, &carried_types, region_handle));
     lower_cexpr(
         ctx,
         &after_block,

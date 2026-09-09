@@ -15,6 +15,7 @@ use crate::diag::{Diagnostic, SourceMap};
 use crate::dps_rewrite::eliminate_redundant_field_store_copies;
 use crate::egraph::{DerivativeRequest, optimize_program, synthesize_derivatives};
 use crate::mlir_lower::lower_program;
+use crate::redundant_copy_elim::eliminate_self_copies;
 use crate::refcount::insert_refcounting;
 use crate::registry::Registry;
 use crate::unify_alloc::unify_tensor_allocations;
@@ -823,6 +824,25 @@ pub fn lower_to_llvm<'c>(
                 .to_string(),
         ]);
     }
+
+    // `--cse`, then `redundant_copy_elim::eliminate_self_copies` -- see that
+    // module's own doc comment for the full story (a real, VTune-confirmed
+    // cost: a genuine `memref.copy %x, %x` no-op, left behind by One-Shot
+    // Bufferize's own materialization of the matmul-tiling stage's own
+    // `scf.forall`/`tensor.parallel_insert_slice` write-back, above, that
+    // neither `--canonicalize` nor `--cse` alone folds away). `--cse` must
+    // run *first*, right here, specifically because two structurally
+    // identical `memref.subview`s (the real, common shape this pattern
+    // takes before CSE runs) are two *different* SSA values until CSE
+    // merges them -- confirmed directly, on an isolated probe, that the
+    // self-copy this pass targets doesn't even exist in the IR at all until
+    // CSE has already run once.
+    let pass_manager = pass::PassManager::new(context);
+    pass_manager.add_pass(pass::transform::create_cse());
+    if pass_manager.run(&mut *module).is_err() {
+        return Err(vec!["MLIR-to-LLVM lowering pass failed (cse)".to_string()]);
+    }
+    eliminate_self_copies(context, &mut *module);
 
     // `--expand-strided-metadata` turns `memref.subview`'s own dynamic
     // offset/stride metadata (from the tiling above) into plain arithmetic

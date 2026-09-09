@@ -18,5 +18,6 @@ pub mod refcount;
 pub mod region_analysis;
 pub mod registry;
 pub mod rc_opt;
+pub mod redundant_copy_elim;
 pub mod rust_bindings;
 pub mod unify_alloc;

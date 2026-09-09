@@ -142,7 +142,21 @@ pub fn find_region_local_functions(program: &CpsProgram) -> HashSet<String> {
 /// descent's own soundness argument (`find_region_local_functions`'s own
 /// doc comment) needs no escaping/field-derivation tracking at this inner
 /// level at all, unlike those two.
-fn collect_direct_callees(expr: &CExpr, top_level_names: &HashSet<String>, out: &mut HashSet<String>) {
+///
+/// **A second caller, outside this module**: `mlir_lower.rs::lower_loop`
+/// reuses this directly (`pub(crate)`) on one specific loop's own already-
+/// extracted `then_branch`, intersecting the result against `region_local_
+/// fns` to decide whether *this* loop's own iteration needs `cleave_region_
+/// enter`/`cleave_region_exit` wrapped around it at all — `doc/backlog.md`'s
+/// own "every loop iteration... unconditionally opens and closes a region"
+/// finding (a real, VTune-confirmed `486`-million-call cost on the real
+/// `mnist-interop` kernel, `cleave_region_enter` itself near-free per call
+/// but never skipped even when nothing inside a given loop ever allocates
+/// region-locally at all) is exactly what this fixes. Reused rather than
+/// reimplemented for the same reason `find_region_local_functions`'s own
+/// transitive descent reuses it: a second, independent walk of the same
+/// call shape is a real risk of the two silently drifting apart over time.
+pub(crate) fn collect_direct_callees(expr: &CExpr, top_level_names: &HashSet<String>, out: &mut HashSet<String>) {
     match expr {
         CExpr::LetPrim { cont, .. } => collect_direct_callees(cont, top_level_names, out),
         CExpr::App { .. } => {}
