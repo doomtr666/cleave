@@ -1630,8 +1630,62 @@ fn rewrite_body(
                         // — found by direct testing, the third distinct
                         // `STATUS_HEAP_CORRUPTION` in the same repro.
                         let is_loop = def.carried_types.is_some();
+                        // A real call's own resumption takes the call's
+                        // *return value* as its sole parameter, and
+                        // `collect_var_info` already seeded that param above
+                        // (`owned_origin.insert(*p, true)` for the real-call
+                        // shape). When a transferred *literal argument*
+                        // shares that parameter's type, the callee may
+                        // forward that very allocation straight back out as
+                        // its result rather than build a fresh one —
+                        // `stdlib/io`'s own `Print::print`/`println` are
+                        // literally `fn(x) -> x`. Seeding the argument *as
+                        // well as* the return-value param then releases one
+                        // allocation twice: a real double-free, found via
+                        // the size-class pool as two back-to-back `cleave_
+                        // release` calls on the same 12-byte tuple from
+                        // `println(("Epoch=", epoch))` in `mnist-interop`'s
+                        // own training loop (`FREE_LISTS` next-pointer
+                        // corrupted, misaligned-pointer crash one pop
+                        // later). The return-value param already owns that
+                        // resource, so the aliasing argument is skipped
+                        // here. A callee that instead genuinely consumes
+                        // such an argument and returns a *fresh* value of
+                        // the same type would now leak it — accepted:
+                        // strictly better than the use-after-free, and that
+                        // shape (take `T` by value, ignore it, return a new
+                        // `T`) is not one this stdlib actually has.
+                        let resumption_ret_tys: Vec<&Ty> = if is_loop {
+                            Vec::new()
+                        } else {
+                            def.params
+                                .iter()
+                                .filter_map(|p| ctx.var_types.get(p))
+                                .collect()
+                        };
                         for (v, ty) in &transferred {
-                            if (!is_loop || !entry_arg_vars.contains(v)) && seen.insert(*v) {
+                            let is_entry_arg = entry_arg_vars.contains(v);
+                            // Only an argument this call is the *last* use of
+                            // can be the one the callee hands straight back:
+                            // if the resumption still needs it (a free
+                            // variable of `def` -- e.g. `net`, passed to
+                            // `net_grad` here and then again to `Optimizer::
+                            // step` in the same resumption), the type match
+                            // is a coincidence (`net_grad: Network ->
+                            // Network` returns a *fresh* gradient), and it
+                            // must still be seeded.
+                            let arg_needed_later = ctx
+                                .local_free_vars
+                                .get(&def.name)
+                                .is_some_and(|fv| fv.contains(v));
+                            let aliases_ret_param = !is_loop
+                                && is_entry_arg
+                                && !arg_needed_later
+                                && resumption_ret_tys.iter().any(|rt| *rt == ty);
+                            if (!is_loop || !is_entry_arg)
+                                && !aliases_ret_param
+                                && seen.insert(*v)
+                            {
                                 seed.push((*v, ty.clone()));
                             }
                         }
