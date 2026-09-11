@@ -35,7 +35,9 @@
 
 use crate::ast::Type as AstType;
 use crate::ast::{Expr, ExprKind, GenericArg, TypeKind, tuple_struct_name};
-use crate::cps::{CExpr, CFunDef, CTopLevelFn, CVal, CVar, CpsProgram, PrimOp, StructSchema};
+use crate::cps::{
+    CExpr, CFunDef, CTopLevelFn, CVal, CVar, CpsProgram, PrimOp, SrcLoc, StructSchema,
+};
 use crate::infer::{ConstValue, Ty};
 use melior::{
     Context,
@@ -48,8 +50,8 @@ use melior::{
         Attribute, Block, Identifier, Location, Module, Operation, Region, RegionLike, Type,
         TypeLike, Value, ValueLike,
         attribute::{
-            DenseI32ArrayAttribute, DenseI64ArrayAttribute, FlatSymbolRefAttribute, FloatAttribute,
-            IntegerAttribute, StringAttribute, TypeAttribute,
+            AttributeLike, DenseI32ArrayAttribute, DenseI64ArrayAttribute, FlatSymbolRefAttribute,
+            FloatAttribute, IntegerAttribute, StringAttribute, TypeAttribute,
         },
         block::BlockLike,
         operation::{OperationBuilder, OperationLike, OperationMutLike},
@@ -138,6 +140,215 @@ struct LowerCtx<'c, 'm> {
     /// regardless of field shape); consulted by `is_light_struct` as its
     /// third disqualifier.
     extern_boundary_structs: HashSet<String>,
+    /// Per-`LetPrim` source line (`CpsProgram::op_lines`) -- `lower_cexpr`'s
+    /// `LetPrim` arm stamps `GEN_LINE` from it so every op emitted for that
+    /// `LetPrim` gets the right debug-info line, falling back to the
+    /// enclosing function's line for `CVar`s a pass minted without
+    /// provenance.
+    op_lines: &'m HashMap<CVar, SrcLoc>,
+}
+
+thread_local! {
+    /// The placeholder source location stamped on every generated op until
+    /// real `pest` spans are threaded parse -> AST -> CPS. A real
+    /// `FileLineColLoc` (not `Location::unknown`) is *required*, not
+    /// cosmetic: once a function carries a `DISubprogram` (`build_di_
+    /// subprograms` below), the LLVM verifier rejects any inlinable call
+    /// inside it whose own location has no `!dbg` -- and `Location::unknown`
+    /// produces none. `1:1` is a stand-in; the debug *scope* (which
+    /// function) is already correct, only the line is fake.
+    ///
+    /// The line every `gen_loc` stamps, set per top-level function in
+    /// `lower_top_level_fn` from `CTopLevelFn::line`. A `thread_local`
+    /// rather than a `LowerCtx` field only because `gen_loc` has ~50 call
+    /// sites, many in helpers that never receive `ctx` -- lowering one
+    /// module is single-threaded, so last-write-wins during the tree walk is
+    /// exactly the "line of the function/statement currently being lowered"
+    /// semantics wanted. **Was a plain process-global `static` until found,
+    /// by direct testing, to be a real race**: `cargo test`'s default
+    /// thread-per-test parallelism runs several `lower_program` calls
+    /// concurrently *in the same process*, and a bare `static` doesn't know
+    /// "single-threaded" means "one thread at a time", not "the whole
+    /// process" -- two tests' lowering interleaved, producing genuinely
+    /// corrupted `DISubprogram` attachments (LLVM verifier: "attached to
+    /// more than one function") that vanished the moment `--test-threads=1`
+    /// serialized them. `thread_local!` keeps each concurrent test's own
+    /// lowering state fully isolated while preserving the exact same
+    /// "populate before use" pattern per thread. Refined to real per-
+    /// statement lines once `pest` spans are threaded all the way to CPS.
+    static GEN_LINE: std::cell::Cell<u32> = const { std::cell::Cell::new(1) };
+}
+
+thread_local! {
+    /// Every registered source file's own absolute path, keyed by the raw
+    /// `ast::FileId.0` `SrcLoc::file` carries -- set once per thread, by
+    /// `pipeline.rs::emit_object`, from `SourceMap::path_table`. A stdlib
+    /// body (`matmul`, `relu`, ...) inlined transparently into a cleave
+    /// function has spans in a *different* file than that function's own
+    /// entry file; stamping its lines against the wrong file's path is worse
+    /// than not having a line at all -- found directly, from real VTune use:
+    /// clicking a stdlib-attributed hotspot (`Ord::lt`, `Broadcast0::
+    /// broadcast0`) opened `kernel.cleave` at that line number, since a
+    /// debug-info file field isn't validated against the line the way a real
+    /// `#include` would be. Empty (falls back to a bare `"kernel.cleave"`)
+    /// for the JIT/test paths that never call `set_gen_file_table` -- no
+    /// object anyone debugs comes out of those anyway. `thread_local` for
+    /// the same real-race reason as `GEN_LINE` above.
+    static GEN_FILE_TABLE: RefCell<Option<HashMap<u32, String>>> = const { RefCell::new(None) };
+}
+
+thread_local! {
+    /// The `FileId.0` `GEN_LINE`'s own line was resolved against -- same
+    /// "`thread_local`, ~50 call sites" reasoning as `GEN_LINE` itself.
+    static GEN_FILE_ID: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Registers every source file's own absolute path. Called once by
+/// `pipeline.rs::emit_object` with `SourceMap::path_table`.
+pub fn set_gen_file_table(table: HashMap<u32, String>) {
+    GEN_FILE_TABLE.with(|t| *t.borrow_mut() = Some(table));
+}
+
+fn gen_source_file() -> String {
+    resolve_file(GEN_FILE_ID.with(|c| c.get()))
+}
+
+/// Resolves one specific `FileId.0` to its real path, independent of
+/// whatever `GEN_FILE_ID` currently holds -- `build_di_subprograms` needs
+/// each function's *own* file, not "whichever file was current when it
+/// happened to be called", to fix the wrong-file-path bug above.
+fn resolve_file(file: u32) -> String {
+    GEN_FILE_TABLE.with(|t| {
+        t.borrow()
+            .as_ref()
+            .and_then(|t| t.get(&file))
+            .cloned()
+            .unwrap_or_else(|| "kernel.cleave".to_string())
+    })
+}
+
+thread_local! {
+    /// The current function's own `#llvm.di_subprogram` attribute, as a raw
+    /// `mlir_sys::MlirAttribute` pointer value (its `.ptr` field, cast to
+    /// `usize`) -- an `Attribute<'c>` itself can't live in a `static` (it
+    /// isn't `Send`, and its lifetime is tied to `Context`, not `'static`),
+    /// but the pointer it wraps is a plain FFI handle: sound to stash for
+    /// the duration of one `lower_program` call (the only place this is ever
+    /// read back), the same "populate before use" pattern `GEN_LINE`/
+    /// `GEN_FILE_TABLE` already use. `None` for the JIT/test paths that
+    /// never call `set_gen_subprogram`. `thread_local` for the same real-
+    /// race reason as `GEN_LINE` above -- this one matters even more: a
+    /// stale pointer read back from a *different* thread's already-dropped
+    /// `Context` is a real, if usually silent, use-after-free, not just a
+    /// wrong value.
+    static GEN_SUBPROGRAM: RefCell<Option<usize>> = const { RefCell::new(None) };
+}
+
+fn set_gen_subprogram(sp: Option<Attribute>) {
+    GEN_SUBPROGRAM.with(|s| *s.borrow_mut() = sp.map(|a| a.to_raw().ptr as usize));
+}
+
+/// Every location `gen_loc` stamps is fused with the *current* function's
+/// own `DISubprogram` (set once per function, before its body is lowered)
+/// -- not just the function's own top-level declaration location, every
+/// single op. This is what makes an *inlined* function's own compute keep
+/// real, separately-attributable debug info: `--inline` (`pipeline.rs::
+/// lower_to_llvm`) wraps a cloned op's location in `CallSiteLoc(calleeLoc,
+/// callerLoc)`, and LLVM's own translation needs the callee side of that
+/// chain to already carry a subprogram scope to emit a real "inlined at"
+/// `DILocation` -- attaching the subprogram only to the function's own
+/// wrapper op (this module's first cut) does nothing for the ops *inside*
+/// it once that wrapper op is gone post-inlining. Found by direct testing:
+/// a `count_locs`/`has_real_line` walk between every pass in `lower_to_llvm`
+/// showed `--inline` genuinely preserves every op's own line (wrapped in
+/// `CallSiteLoc`, not destroyed) -- the debug info was never lost, it just
+/// had no scope to resolve against once the callee's own `DISubprogram`
+/// stopped existing as a survivor.
+fn gen_loc(context: &Context) -> Location<'_> {
+    let line = GEN_LINE.with(|c| c.get()).max(1) as usize;
+    let base = Location::new(context, &gen_source_file(), line, 1);
+    match GEN_SUBPROGRAM.with(|s| *s.borrow()) {
+        Some(ptr) => {
+            // SAFETY: `ptr` was `Attribute::to_raw().ptr` for a real
+            // `#llvm.di_subprogram` attribute built in this exact `context`
+            // by `build_di_subprograms`, stashed by `set_gen_subprogram`
+            // immediately before this function's body starts lowering and
+            // never read past the end of that same `lower_program` call --
+            // the context, and the attribute it owns, are still alive.
+            let raw = mlir_sys::MlirAttribute {
+                ptr: ptr as *const std::ffi::c_void,
+            };
+            let sp = unsafe { Attribute::from_raw(raw) };
+            Location::fused(context, &[base], sp)
+        }
+        None => base,
+    }
+}
+
+/// One `#llvm.di_subprogram` attribute per named function, all sharing a
+/// single `#llvm.di_compile_unit`. Parsed from text in a *single*
+/// `Attribute::parse` call (as one array) so the `distinct[0]<>` compile-
+/// unit id unifies to one CU across every entry -- separate parses would
+/// each mint their own distinct CU and the LLVM verifier would reject
+/// "multiple debug compile units". `pipeline.rs::stamp_di_subprograms`
+/// attaches entry `i` to `llvm.func` `i` via a `FusedLoc`, *after* all
+/// LLVM lowering (the `func.func` -> `llvm.func` conversion drops a
+/// fused-loc-with-metadata attached earlier). This is the one thing MLIR's
+/// own `EnsureDebugInfoScopeOnLLVMFunc` pass does -- that pass segfaults
+/// from this statically-linked `mlir-sys` build, and no C-API DI-attr
+/// builder is exposed either, so it is reimplemented here from text.
+pub(crate) fn build_di_subprograms<'c>(
+    context: &'c Context,
+    funcs: &[(String, SrcLoc)],
+) -> Vec<Attribute<'c>> {
+    if funcs.is_empty() {
+        return Vec::new();
+    }
+    // `\` and `"` are the only characters an MLIR string literal needs
+    // escaped -- Windows paths are full of the former.
+    let escape = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    // The compile unit itself needs exactly one file; the user's own entry
+    // file (`FileId(0)`) is as good a choice as any -- every subprogram's
+    // own `file`/`scope` below is what actually drives per-function source
+    // correlation, not this one.
+    let cu_path = escape(&resolve_file(0));
+    let cu_file = format!(r#"#llvm.di_file<"{cu_path}" in "">"#);
+    let cu = format!(
+        r#"#llvm.di_compile_unit<id = distinct[0]<>, sourceLanguage = DW_LANG_C, file = {cu_file}, producer = "cleave", isOptimized = true, emissionKind = Full>"#
+    );
+    let srt = "#llvm.di_subroutine_type<callingConvention = DW_CC_normal>";
+    // Cache one `#llvm.di_file<...>` text per distinct file so functions
+    // sharing a file (the common case) don't re-mint distinct file
+    // attributes for no reason.
+    let mut file_cache: HashMap<u32, String> = HashMap::new();
+    let items: Vec<String> = funcs
+        .iter()
+        .map(|(name, loc)| {
+            // A name can carry generic syntax (`Ring::mul<i32>`); it goes
+            // into an MLIR string literal, so escape `\` and `"`.
+            let n = escape(name);
+            let l = loc.line.max(1);
+            let di_file = file_cache.entry(loc.file).or_insert_with(|| {
+                let p = escape(&resolve_file(loc.file));
+                format!(r#"#llvm.di_file<"{p}" in "">"#)
+            });
+            format!(
+                r#"#llvm.di_subprogram<compileUnit = {cu}, scope = {di_file}, name = "{n}", linkageName = "{n}", file = {di_file}, line = {l}, scopeLine = {l}, subprogramFlags = "Definition|Optimized", type = {srt}>"#
+            )
+        })
+        .collect();
+    let text = format!("[{}]", items.join(", "));
+    let attr = Attribute::parse(context, &text)
+        .expect("mlir_lower: failed to parse generated DI subprogram array");
+    // `ArrayAttribute::try_from` in melior 0.27.4 checks the wrong predicate
+    // (`is_dense_i64_array`), so index the array via raw `mlir-sys` instead.
+    unsafe {
+        let raw = attr.to_raw();
+        let n = mlir_sys::mlirArrayAttrGetNumElements(raw);
+        (0..n)
+            .map(|i| Attribute::from_raw(mlir_sys::mlirArrayAttrGetElement(raw, i)))
+            .collect()
+    }
 }
 
 /// Builds one MLIR `Module` containing every top-level function in
@@ -152,7 +363,7 @@ pub fn lower_program<'c>(
     mlir_types: &HashMap<String, String>,
     struct_schemas: HashMap<String, StructSchema>,
 ) -> Module<'c> {
-    let location = Location::unknown(context);
+    let location = gen_loc(context);
     let module = Module::new(location);
     let signatures = program
         .funcs
@@ -183,11 +394,23 @@ pub fn lower_program<'c>(
             constructed_structs,
             field_mutated_structs,
             extern_boundary_structs,
+            op_lines: &program.op_lines,
         };
-        for f in &program.funcs {
+        // One `DISubprogram` per function, *all* of them (not just whoever
+        // survives as a standalone `llvm.func` after `--inline` -- see
+        // `gen_loc`'s own doc comment for why that distinction matters).
+        let names: Vec<(String, SrcLoc)> = program
+            .funcs
+            .iter()
+            .map(|f| (f.def.name.clone(), f.loc))
+            .collect();
+        let subprograms = build_di_subprograms(context, &names);
+        for (f, sp) in program.funcs.iter().zip(subprograms) {
+            set_gen_subprogram(Some(sp));
             let op = lower_top_level_fn(&ctx, f);
             ctx.module.body().append_operation(op);
         }
+        set_gen_subprogram(None);
     }
     module
 }
@@ -1199,7 +1422,19 @@ fn width_ty<'c>(ctx: &LowerCtx<'c, '_>, name: &str) -> Type<'c> {
 /// and would still panic clearly in `ty_to_mlir` rather than misbehave.
 fn lower_top_level_fn<'c>(ctx: &LowerCtx<'c, '_>, f: &CTopLevelFn) -> Operation<'c> {
     let context = ctx.context;
-    let location = Location::unknown(context);
+    // Every op lowered for this function inherits its declaration position
+    // (`gen_loc`) until per-statement spans are threaded -- `loc.line == 0`
+    // means "unknown" (a synthesized unit with no `fn` of its own), fall
+    // back to line 1 / file 0 so the location stays a valid
+    // `FileLineColLoc`.
+    let (line, file) = if f.loc.line == 0 {
+        (1, 0)
+    } else {
+        (f.loc.line, f.loc.file)
+    };
+    GEN_LINE.with(|c| c.set(line));
+    GEN_FILE_ID.with(|c| c.set(file));
+    let location = gen_loc(context);
     let param_types: Vec<Type> = f.param_types.iter().map(|t| ty_to_mlir(ctx, t)).collect();
     let is_unit = is_unit_ty(&f.result);
     let result_type: Type = if is_unit {
@@ -1383,7 +1618,7 @@ fn lower_cexpr<'c>(
             func: CVal::Var(v),
             args,
         } if *v == k_ret => {
-            let location = Location::unknown(ctx.context);
+            let location = gen_loc(ctx.context);
             let values: Vec<Value> = args
                 .iter()
                 .filter(|a| !matches!(a, CVal::Unit))
@@ -1395,7 +1630,7 @@ fn lower_cexpr<'c>(
             func: CVal::Label(name),
             args,
         } if yield_targets.iter().any(|(n, _, _)| *n == name.as_str()) => {
-            let location = Location::unknown(ctx.context);
+            let location = gen_loc(ctx.context);
             let (_, types, region_handle) = yield_targets
                 .iter()
                 .find(|(n, _, _)| *n == name.as_str())
@@ -1442,6 +1677,17 @@ fn lower_cexpr<'c>(
             args,
             cont,
         } => {
+            // Stamp this `LetPrim`'s own source position so every op
+            // `lower_prim_op` emits below inherits it (`gen_loc` reads
+            // `GEN_LINE`/`GEN_FILE_ID`). No entry, or `line == 0` (a pass
+            // minted this `CVar` without provenance) -> keep whatever the
+            // enclosing function set, which is the right fallback.
+            if let Some(&loc) = ctx.op_lines.get(var) {
+                if loc.line != 0 {
+                    GEN_LINE.with(|c| c.set(loc.line));
+                    GEN_FILE_ID.with(|c| c.set(loc.file));
+                }
+            }
             if let Some(value) = lower_prim_op(ctx, block, &env, op, args, ty) {
                 env.insert(*var, value);
             }
@@ -1576,7 +1822,7 @@ fn lower_if<'c>(
         .collect();
 
     let context = ctx.context;
-    let location = Location::unknown(context);
+    let location = gen_loc(context);
     let bool_ty: Type = IntegerType::new(context, 1).into();
     let cond_value = lower_cval(context, block, &env, cond, bool_ty);
 
@@ -1689,7 +1935,7 @@ fn lower_loop<'c>(
     initial_args: &[CVal],
 ) {
     let context = ctx.context;
-    let location = Location::unknown(context);
+    let location = gen_loc(context);
 
     // A loop's own condition is *zero or more* sequential real calls, not
     // always exactly one — `i < hull.len()` needs two (`DynArray::len<...>`,
@@ -2027,7 +2273,7 @@ fn lower_real_call<'c>(
         .zip(param_types)
         .map(|(a, t)| lower_cval(context, block, &env, a, ty_to_mlir(ctx, t)))
         .collect();
-    let location = Location::unknown(context);
+    let location = gen_loc(context);
     // A `()`-returning callee is declared with *zero* MLIR results
     // (`lower_top_level_fn`'s own `is_unit`/`results` handling, applied to
     // every top-level fn, not just `main`) -- the call site must match that
@@ -2140,7 +2386,7 @@ fn lower_prim_op<'c>(
                     arg_values.push(lowered);
                 }
             }
-            let location = Location::unknown(ctx.context);
+            let location = gen_loc(ctx.context);
             let call_op = block.append_operation(func::call(
                 ctx.context,
                 FlatSymbolRefAttribute::new(ctx.context, symbol),
@@ -2279,7 +2525,7 @@ fn lower_array_construct<'c>(
         let array_llvm_ty = ty_to_llvm_field_type(ctx, ty);
         let elem_ty = ty_to_mlir(ctx, leaf_ty);
         let ptr = alloc_llvm_value(ctx, block, array_llvm_ty);
-        let location = Location::unknown(ctx.context);
+        let location = gen_loc(ctx.context);
         for (i, arg) in args.iter().enumerate() {
             let elem_val = lower_cval(ctx.context, block, env, arg, elem_ty);
             let dst_ptr = gep(ctx, block, ptr, &[0, i as i64], array_llvm_ty);
@@ -2300,7 +2546,7 @@ fn lower_array_construct<'c>(
     );
     if inner_dims.is_empty() {
         let elem_ty = ty_to_mlir(ctx, leaf_ty);
-        let location = Location::unknown(ctx.context);
+        let location = gen_loc(ctx.context);
         for (i, arg) in args.iter().enumerate() {
             let elem_val = lower_cval(ctx.context, block, env, arg, elem_ty);
             let idx = const_index(ctx, block, i as i64);
@@ -2341,7 +2587,7 @@ fn lower_array_repeat<'c>(
         let elem_ty = ty_to_mlir(ctx, leaf_ty);
         let ptr = alloc_llvm_value(ctx, block, array_llvm_ty);
         let elem_val = lower_cval(ctx.context, block, env, value_arg, elem_ty);
-        let location = Location::unknown(ctx.context);
+        let location = gen_loc(ctx.context);
         for i in 0..outer_dim {
             let dst_ptr = gep(ctx, block, ptr, &[0, i], array_llvm_ty);
             block.append_operation(llvm::store(
@@ -2362,7 +2608,7 @@ fn lower_array_repeat<'c>(
     if inner_dims.is_empty() {
         let elem_ty = ty_to_mlir(ctx, leaf_ty);
         let elem_val = lower_cval(ctx.context, block, env, value_arg, elem_ty);
-        let location = Location::unknown(ctx.context);
+        let location = gen_loc(ctx.context);
         for i in 0..outer_dim {
             let idx = const_index(ctx, block, i);
             block.append_operation(memref::store(elem_val, array_val, &[idx], location));
@@ -2419,7 +2665,7 @@ fn lower_array_load<'c>(
         .get(array_var)
         .unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{array_var}"));
     let i32_ty = width_ty(ctx, "i32");
-    let location = Location::unknown(ctx.context);
+    let location = gen_loc(ctx.context);
     if array_val.r#type().is_mem_ref() {
         let index_vals: Vec<Value> = args[1..]
             .iter()
@@ -2496,7 +2742,7 @@ fn lower_array_store<'c>(
         panic!("MLIR lowering: `store` needs at least an index and a value");
     };
     let i32_ty = width_ty(ctx, "i32");
-    let location = Location::unknown(ctx.context);
+    let location = gen_loc(ctx.context);
     if array_val.r#type().is_tensor() {
         // See `lower_array_load`'s identical check: a native `tensor<...>`
         // SSA value is purely functional (`tensor.insert` would produce a
@@ -2617,7 +2863,7 @@ fn lower_light_struct_construct<'c>(
     args: &[CVal],
 ) -> Value<'c, 'c> {
     let context = ctx.context;
-    let location = Location::unknown(context);
+    let location = gen_loc(context);
     let mut agg: Value = block
         .append_operation(llvm::undef(struct_llvm_ty, location))
         .result(0)
@@ -2763,7 +3009,7 @@ fn lower_tagged_struct_construct<'c>(
     let src = lower_nested_array_arg(env, field_arg);
     let (dims, leaf_ty) = flatten_array_dims(field_ty);
     let native_ty = ty_to_mlir(ctx, ty);
-    let location = Location::unknown(ctx.context);
+    let location = gen_loc(ctx.context);
 
     if keyword == "tensor" {
         let elem_ty = ty_to_mlir(ctx, leaf_ty);
@@ -2825,7 +3071,7 @@ fn flatten_memref_elements<'c>(
         out: &mut Vec<Value<'c, 'c>>,
     ) {
         let Some((&dim, rest)) = remaining.split_first() else {
-            let location = Location::unknown(ctx.context);
+            let location = gen_loc(ctx.context);
             let load_op = block.append_operation(memref::load(src, idx_acc, location));
             out.push(load_op.result(0).unwrap().into());
             return;
@@ -2875,7 +3121,7 @@ fn store_field<'c>(
     } else {
         let field_mlir_ty = ty_to_mlir(ctx, field_ty);
         let value = lower_cval(ctx.context, block, env, arg, field_mlir_ty);
-        let location = Location::unknown(ctx.context);
+        let location = gen_loc(ctx.context);
         block.append_operation(llvm::store(
             ctx.context,
             value,
@@ -2999,7 +3245,7 @@ fn tensor_value_to_ptr<'c>(
     let (dims, leaf_ty) = flatten_array_dims(inner_ty);
     let elem_mlir_ty = ty_to_mlir(ctx, leaf_ty);
     let context = ctx.context;
-    let location = Location::unknown(context);
+    let location = gen_loc(context);
     let memref_ty: Type = MemRefType::new(elem_mlir_ty, &dims, None, None).into();
     let to_buffer = OperationBuilder::new("bufferization.to_buffer", location)
         .add_operands(&[tensor_val])
@@ -3074,7 +3320,7 @@ fn build_tensor_descriptor_value<'c>(
     let value = lower_cval(ctx.context, block, env, arg, native_ty);
     let elem_mlir_ty = ty_to_mlir(ctx, leaf_ty);
     let context = ctx.context;
-    let location = Location::unknown(context);
+    let location = gen_loc(context);
 
     // Source data pointer — `tensor_value_to_ptr`'s own doc comment.
     let src_ptr = tensor_value_to_ptr(ctx, block, value, field_ty);
@@ -3201,7 +3447,7 @@ fn store_native_shape_field<'c>(
 ) {
     let descriptor_val = build_tensor_descriptor_value(ctx, block, env, field_ty, arg);
     let context = ctx.context;
-    let location = Location::unknown(context);
+    let location = gen_loc(context);
     block.append_operation(llvm::store(
         context,
         descriptor_val,
@@ -3277,7 +3523,7 @@ fn descriptor_value_to_tensor<'c>(
     };
     let (dims, leaf_ty) = flatten_array_dims(inner_ty);
     let elem_mlir_ty = ty_to_mlir(ctx, leaf_ty);
-    let location = Location::unknown(ctx.context);
+    let location = gen_loc(ctx.context);
 
     let memref_ty: Type = MemRefType::new(elem_mlir_ty, &dims, None, None).into();
     let cast = OperationBuilder::new("builtin.unrealized_conversion_cast", location)
@@ -3328,7 +3574,7 @@ fn load_native_shape_field<'c>(
         );
     };
     let (dims, _leaf_ty) = flatten_array_dims(inner_ty);
-    let location = Location::unknown(ctx.context);
+    let location = gen_loc(ctx.context);
 
     let descriptor_ty = memref_descriptor_llvm_type(ctx.context, dims.len());
     let descriptor_val: Value = block
@@ -3432,7 +3678,7 @@ fn lower_field_access<'c>(
     // at all -- `base_val` is already the real `!llvm.struct<(...)>` value
     // itself, read via `llvm.extractvalue`, never a GEP.
     if is_light_struct(name, type_args, &ctx.struct_schemas, &ctx.mlir_types, &ctx.field_mutated_structs, &ctx.extern_boundary_structs, &ctx.constructed_structs) {
-        let location = Location::unknown(ctx.context);
+        let location = gen_loc(ctx.context);
         let position_attr = DenseI64ArrayAttribute::new(ctx.context, &[position as i64]);
         if let Some(keyword) = native_shape_field_keyword(ctx, field_ty) {
             // A `Tensor` field's own position holds the real descriptor
@@ -3490,7 +3736,7 @@ fn lower_field_access<'c>(
         field_ptr
     } else {
         let result_ty = ty_to_mlir(ctx, field_ty);
-        let location = Location::unknown(ctx.context);
+        let location = gen_loc(ctx.context);
         block
             .append_operation(llvm::load(
                 ctx.context,
@@ -3543,7 +3789,7 @@ fn lower_refcount_call<'c>(
 /// it, `cleave_retain` returns nothing to act on.
 fn emit_cleave_retain<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, rc_ty: &Ty, ptr_val: Value<'c, 'c>) {
     let context = ctx.context;
-    let location = Location::unknown(context);
+    let location = gen_loc(context);
     let declared_ty = declared_ptr_sig_ty(ctx, rc_ty);
     ensure_extern_declared(ctx, "cleave_retain", std::slice::from_ref(&declared_ty), &[]);
     block.append_operation(func::call(
@@ -3572,7 +3818,7 @@ fn emit_cleave_release<'c>(
     ptr_val: Value<'c, 'c>,
 ) -> Value<'c, 'c> {
     let context = ctx.context;
-    let location = Location::unknown(context);
+    let location = gen_loc(context);
     let bool_ty: Type = IntegerType::new(context, 1).into();
     let declared_ty = declared_ptr_sig_ty(ctx, rc_ty);
     ensure_extern_declared(ctx, "cleave_release", std::slice::from_ref(&declared_ty), &[bool_ty]);
@@ -3664,7 +3910,7 @@ fn lower_release_cascade<'c>(
     let field_types = struct_field_types(&ctx.struct_schemas, name, type_args);
     let struct_llvm_ty = struct_llvm_type(ctx, name, type_args);
     let context = ctx.context;
-    let location = Location::unknown(context);
+    let location = gen_loc(context);
 
     enum PendingChild<'c> {
         Tensor(Value<'c, 'c>),
@@ -3860,7 +4106,7 @@ fn alloc_llvm_value<'c>(
     llvm_ty: Type<'c>,
 ) -> Value<'c, 'c> {
     let context = ctx.context;
-    let location = Location::unknown(context);
+    let location = gen_loc(context);
     let ptr_ty = llvm::r#type::pointer(context, 0);
     let size = llvm_type_size_bytes(ctx, block, llvm_ty);
     let i64_ty: Type = IntegerType::new(context, 64).into();
@@ -3908,7 +4154,7 @@ fn llvm_type_size_bytes<'c>(
     llvm_ty: Type<'c>,
 ) -> Value<'c, 'c> {
     let context = ctx.context;
-    let location = Location::unknown(context);
+    let location = gen_loc(context);
     let ptr_ty = llvm::r#type::pointer(context, 0);
     let null: Value = block
         .append_operation(llvm::zero(ptr_ty, location))
@@ -3967,7 +4213,7 @@ fn array_ptr_and_len<'c>(
     array_ty: &Ty,
 ) -> (Value<'c, 'c>, Value<'c, 'c>) {
     let context = ctx.context;
-    let location = Location::unknown(context);
+    let location = gen_loc(context);
     let i64_ty: Type = IntegerType::new(context, 64).into();
 
     let ptr: Value = if array_value.r#type().is_mem_ref() {
@@ -4028,7 +4274,7 @@ fn gep<'c>(
     pointee_ty: Type<'c>,
 ) -> Value<'c, 'c> {
     let context = ctx.context;
-    let location = Location::unknown(context);
+    let location = gen_loc(context);
     let ptr_ty = llvm::r#type::pointer(context, 0);
     let raw: Vec<i32> = indices.iter().map(|&i| i as i32).collect();
     let raw_indices = DenseI32ArrayAttribute::new(context, &raw);
@@ -4069,7 +4315,7 @@ fn gep_dynamic<'c>(
     pointee_ty: Type<'c>,
 ) -> Value<'c, 'c> {
     let context = ctx.context;
-    let location = Location::unknown(context);
+    let location = gen_loc(context);
     let ptr_ty = llvm::r#type::pointer(context, 0);
     let raw_indices = DenseI32ArrayAttribute::new(context, &vec![i32::MIN; indices.len()]);
     let built = OperationBuilder::new("llvm.getelementptr", location)
@@ -4092,7 +4338,7 @@ fn gep_dynamic<'c>(
 }
 
 fn const_i32<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, n: i64) -> Value<'c, 'c> {
-    let location = Location::unknown(ctx.context);
+    let location = gen_loc(ctx.context);
     let attribute = IntegerAttribute::new(width_ty(ctx, "i32"), n).into();
     let op = block.append_operation(arith::constant(ctx.context, attribute, location));
     op.result(0).unwrap().into()
@@ -4135,7 +4381,7 @@ fn copy_array_into_llvm_field<'c>(
         elem_mlir_ty: Type<'c>,
     ) {
         let Some((&dim, rest)) = remaining.split_first() else {
-            let location = Location::unknown(ctx.context);
+            let location = gen_loc(ctx.context);
             let scalar: Value = if src_is_mem_ref {
                 block
                     .append_operation(memref::load(src, src_idx, location))
@@ -4211,7 +4457,7 @@ fn alloc_array<'c>(
     block: &Block<'c>,
     memref_ty: MemRefType<'c>,
 ) -> Value<'c, 'c> {
-    let location = Location::unknown(ctx.context);
+    let location = gen_loc(ctx.context);
     let op = block.append_operation(memref::alloc(
         ctx.context,
         memref_ty,
@@ -4224,14 +4470,14 @@ fn alloc_array<'c>(
 }
 
 fn const_index<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, n: i64) -> Value<'c, 'c> {
-    let location = Location::unknown(ctx.context);
+    let location = gen_loc(ctx.context);
     let attribute = IntegerAttribute::new(Type::index(ctx.context), n).into();
     let op = block.append_operation(arith::constant(ctx.context, attribute, location));
     op.result(0).unwrap().into()
 }
 
 fn to_index<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, value: Value<'c, 'c>) -> Value<'c, 'c> {
-    let location = Location::unknown(ctx.context);
+    let location = gen_loc(ctx.context);
     let op = block.append_operation(arith::index_cast(value, Type::index(ctx.context), location));
     op.result(0).unwrap().into()
 }
@@ -4278,7 +4524,7 @@ fn copy_nested_array<'c>(
     );
     let outer_index = dst_prefix[0];
 
-    let location = Location::unknown(ctx.context);
+    let location = gen_loc(ctx.context);
     let elem_ty = MemRefType::try_from(src.r#type())
         .unwrap_or_else(|e| panic!("MLIR lowering: `copy_nested_array`'s own `src` must be a memref: {e}"))
         .element();
@@ -4384,7 +4630,7 @@ fn lower_tensor_extract_spread<'c>(
     result_ty: Type<'c>,
 ) -> Value<'c, 'c> {
     let context = ctx.context;
-    let location = Location::unknown(context);
+    let location = gen_loc(context);
     let memref_ty = MemRefType::try_from(idx_array_val.r#type()).unwrap_or_else(|e| {
         panic!("MLIR lowering: `tensor.extract`'s own index-array argument isn't a memref: {e}")
     });
@@ -4523,7 +4769,7 @@ fn lower_raw_mlir_op<'c>(
             (Identifier::new(context, name), attribute)
         })
         .collect();
-    let location = Location::unknown(context);
+    let location = gen_loc(context);
     let builder = OperationBuilder::new(op, location)
         .add_operands(&arg_values)
         .add_attributes(&parsed_attrs)
@@ -4587,7 +4833,7 @@ fn lower_raw_mlir_op<'c>(
 /// (a `linalg.fill`, or an `outs` no other op in its own region ever reads).
 fn tensor_seed<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, result_ty: Type<'c>) -> Value<'c, 'c> {
     let context = ctx.context;
-    let location = Location::unknown(context);
+    let location = gen_loc(context);
     if !ctx.currently_region_local.get() {
         return block
             .append_operation(
@@ -4803,7 +5049,7 @@ fn build_matmul_no_seed<'c>(
     result_ty: Type<'c>,
 ) -> Value<'c, 'c> {
     let context = ctx.context;
-    let location = Location::unknown(context);
+    let location = gen_loc(context);
     let [a_arg, b_arg] = args else {
         panic!(
             "MLIR lowering: `mlir::linalg::matmul` needs exactly two operands (`a`, `b`), got {}",
@@ -5002,7 +5248,7 @@ fn build_matmul_transpose_no_seed<'c>(
     transpose_lhs: bool,
 ) -> Value<'c, 'c> {
     let context = ctx.context;
-    let location = Location::unknown(context);
+    let location = gen_loc(context);
     let [a_arg, b_arg] = args else {
         panic!(
             "MLIR lowering: `mlir::linalg::matmul_transpose_{}` needs exactly two operands (`a`, `b`), got {}",
@@ -5138,7 +5384,7 @@ fn build_transpose_no_seed<'c>(
     result_ty: Type<'c>,
 ) -> Value<'c, 'c> {
     let context = ctx.context;
-    let location = Location::unknown(context);
+    let location = gen_loc(context);
     let [a_arg] = args else {
         panic!(
             "MLIR lowering: `mlir::linalg::transpose` needs exactly one operand (`a`), got {}",
@@ -5221,7 +5467,7 @@ fn build_broadcast0<'c>(
     result_ty: Type<'c>,
 ) -> Value<'c, 'c> {
     let context = ctx.context;
-    let location = Location::unknown(context);
+    let location = gen_loc(context);
     let [r_arg] = args else {
         panic!(
             "MLIR lowering: `mlir::linalg::broadcast` needs exactly one operand (`r`), got {}",
@@ -5296,7 +5542,7 @@ fn build_reduce0<'c>(
     result_ty: Type<'c>,
 ) -> Value<'c, 'c> {
     let context = ctx.context;
-    let location = Location::unknown(context);
+    let location = gen_loc(context);
     let [b_arg] = args else {
         panic!(
             "MLIR lowering: `mlir::linalg::reduce` needs exactly one operand (`b`), got {}",
@@ -5430,7 +5676,7 @@ fn build_elementwise_binop<'c>(
     scalar_op: &str,
 ) -> Value<'c, 'c> {
     let context = ctx.context;
-    let location = Location::unknown(context);
+    let location = gen_loc(context);
     let [a_arg, b_arg] = args else {
         panic!(
             "MLIR lowering: `mlir::linalg::elementwise::*` needs exactly two operands, got {}",
@@ -5527,7 +5773,7 @@ fn build_relu_elemwise<'c>(
     result_ty: Type<'c>,
 ) -> Value<'c, 'c> {
     let context = ctx.context;
-    let location = Location::unknown(context);
+    let location = gen_loc(context);
     let [x_arg] = args else {
         panic!(
             "MLIR lowering: `mlir::linalg::relu` needs exactly one operand (`x`), got {}",
@@ -5647,7 +5893,16 @@ fn ensure_extern_declared<'c>(
             }
         })
         .collect();
-    let location = Location::unknown(context);
+    // A bare, un-fused location, never `gen_loc()` -- this is a real
+    // *declaration* (empty region, no body), and LLVM's verifier rejects a
+    // function declaration carrying a `DISubprogram`-bearing `!dbg`
+    // ("function declaration may only have a unique !dbg attachment"),
+    // found by direct testing: `gen_loc()` fuses in whichever cleave
+    // function happens to be lowering when this extern's first call site is
+    // reached, and every `cleave-rt`/host-callback symbol here (`cleave_
+    // alloc_rc`, `print_i32`, `train_pixel`, ...) is exactly such a
+    // declaration.
+    let location = Location::new(context, &gen_source_file(), 1, 1);
     let decl = func::func(
         context,
         StringAttribute::new(context, symbol),
@@ -5680,19 +5935,19 @@ fn lower_cval<'c>(
             .get(var)
             .unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{var}")),
         CVal::Int(n) => {
-            let location = Location::unknown(context);
+            let location = gen_loc(context);
             let attribute = IntegerAttribute::new(expected_type, *n as i64).into();
             let op = block.append_operation(arith::constant(context, attribute, location));
             op.result(0).unwrap().into()
         }
         CVal::Float(n) => {
-            let location = Location::unknown(context);
+            let location = gen_loc(context);
             let attribute = FloatAttribute::new(context, expected_type, *n).into();
             let op = block.append_operation(arith::constant(context, attribute, location));
             op.result(0).unwrap().into()
         }
         CVal::Bool(b) => {
-            let location = Location::unknown(context);
+            let location = gen_loc(context);
             let attribute = IntegerAttribute::new(expected_type, *b as i64).into();
             let op = block.append_operation(arith::constant(context, attribute, location));
             op.result(0).unwrap().into()
@@ -5712,7 +5967,7 @@ fn lower_cval<'c>(
         // deliberately unspecified" primitive — exactly this case, not a
         // hack: works for any `expected_type`, builtin or dialect-specific.
         CVal::Unit => {
-            let location = Location::unknown(context);
+            let location = gen_loc(context);
             block
                 .append_operation(llvm::undef(expected_type, location))
                 .result(0)

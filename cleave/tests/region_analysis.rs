@@ -21,7 +21,7 @@ fn region_local_names(src: &str) -> std::collections::HashSet<String> {
         panic!("type check failed: {diags:?}");
     }
     let units = collect_units(&program, &registry);
-    let cps_program = convert_program(units);
+    let cps_program = convert_program(units, None);
     // Not read by this analysis at all -- collected only because `collect_
     // units`'s own signature is shared with every other test file that
     // needs it; kept here for parity, not because `find_region_local_

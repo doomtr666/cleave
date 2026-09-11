@@ -123,6 +123,15 @@ fn abstract_op_name(symbol: &str) -> Option<&str> {
 #[derive(Default, Clone)]
 pub struct ConstantFold {
     known_types: HashMap<Symbol, Ty>,
+    /// Debug-info provenance: the source line of the CPS `LetPrim` whose
+    /// node `Forward::walk` is about to `add`. Set immediately before the
+    /// `add` call and cleared right after (`Analysis::make` reads it during
+    /// that one `add`), the same "populate before the node exists" trick
+    /// `known_types` uses. `None` for every node a rewrite rule or
+    /// `backward_walk` creates -- those inherit the min line among their
+    /// inputs instead (`FoldData::line`), which anchors a synthesized or
+    /// reassociated node to the source expression it derives from.
+    pending_line: Option<u32>,
 }
 
 /// `ConstantFold`'s own `Analysis::Data` — the existing int-fold value
@@ -149,6 +158,13 @@ pub struct ConstantFold {
 /// never re-derived by walking the live, ever-growing graph.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FoldData {
+    /// Debug-info source line for this e-class (`ConstantFold::pending_line`
+    /// when the node came straight from a CPS `LetPrim`, else the smallest
+    /// line among its children -- a reassociated / synthesized / adjoint
+    /// node anchors to the earliest source expression feeding it). `merge`
+    /// keeps the smaller. Never load-bearing -- consumed only to stamp
+    /// `mlir_lower.rs`'s debug-info `FileLineColLoc`s.
+    pub line: Option<u32>,
     pub const_int: Option<u64>,
     pub free_deps: HashSet<Symbol>,
     /// This e-class's own concrete cleave `Ty`, when known (`ConstantFold::
@@ -253,7 +269,20 @@ impl Analysis<CleaveLang> for ConstantFold {
             CleaveLang::Op(sym, _) => egraph.analysis.known_types.get(sym).cloned(),
             CleaveLang::Int(_) | CleaveLang::Float(_) | CleaveLang::Bool(_) => None,
         };
+        // Provenance: a node straight from a CPS `LetPrim` carries the line
+        // `Forward::walk` just stashed; anything else (a rewrite rule's RHS,
+        // an adjoint node) takes the smallest line among its inputs.
+        let line = match enode {
+            CleaveLang::Op(_, args) => egraph.analysis.pending_line.or_else(|| {
+                args.iter()
+                    .filter_map(|id| egraph[*id].data.line)
+                    .min()
+            }),
+            CleaveLang::Free(_) => egraph.analysis.pending_line,
+            CleaveLang::Int(_) | CleaveLang::Float(_) | CleaveLang::Bool(_) => None,
+        };
         FoldData {
+            line,
             const_int,
             free_deps,
             own_ty,
@@ -261,6 +290,14 @@ impl Analysis<CleaveLang> for ConstantFold {
     }
 
     fn merge(&mut self, to: &mut Self::Data, from: Self::Data) -> DidMerge {
+        // Keep the smaller line -- provenance only, no soundness stake, so
+        // an arbitrary-but-stable choice on disagreement is fine.
+        let line_merge = egg::merge_option(&mut to.line, from.line, |a, b| {
+            let m = (*a).min(b);
+            let changed = *a != m;
+            *a = m;
+            DidMerge(changed, b != m)
+        });
         let int_merge = egg::merge_option(&mut to.const_int, from.const_int, |a, b| {
             assert_eq!(
                 *a, b,
@@ -290,7 +327,7 @@ impl Analysis<CleaveLang> for ConstantFold {
             }
             (None, None) => DidMerge(false, false),
         };
-        int_merge | DidMerge(new_len != to_len, new_len != from_len) | ty_merge
+        line_merge | int_merge | DidMerge(new_len != to_len, new_len != from_len) | ty_merge
     }
 
     fn modify(egraph: &mut egg::EGraph<CleaveLang, Self>, id: Id) {
@@ -303,7 +340,7 @@ impl Analysis<CleaveLang> for ConstantFold {
 
 // ---------------------------------------------------------------- CPS -> e-graph (forward)
 
-use crate::cps::{CExpr, CFunDef, CTopLevelFn, CVal, CVar, PrimOp, StructSchema};
+use crate::cps::{CExpr, CFunDef, CTopLevelFn, CVal, CVar, PrimOp, SrcLoc, StructSchema};
 use crate::infer::{ConstValue, Ty};
 use crate::mlir_lower::struct_field_types;
 use egg::EGraph;
@@ -530,6 +567,33 @@ fn is_pure(expr: &CExpr) -> bool {
     }
 }
 
+/// Every `CVar` bound by a `LetPrim` anywhere in `expr` (into `Fix` defs
+/// and both `If` arms too) -- used to blanket-stamp a rebuilt e-graph
+/// segment's own fresh bindings with one source line.
+fn collect_letprim_vars(expr: &CExpr, out: &mut Vec<CVar>) {
+    match expr {
+        CExpr::LetPrim { var, cont, .. } => {
+            out.push(*var);
+            collect_letprim_vars(cont, out);
+        }
+        CExpr::App { .. } => {}
+        CExpr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_letprim_vars(then_branch, out);
+            collect_letprim_vars(else_branch, out);
+        }
+        CExpr::Fix { defs, body } => {
+            for d in defs {
+                collect_letprim_vars(&d.body, out);
+            }
+            collect_letprim_vars(body, out);
+        }
+    }
+}
+
 /// Forward CPS-segment-to-e-graph translation state — one instance per
 /// segment being translated. `env` records, for every `LetPrim`-bound
 /// `CVar` successfully translated so far, which e-class it now corresponds
@@ -616,6 +680,13 @@ pub struct Forward {
     /// multi-level call transparency's own inlining (an inlined callee's
     /// own parameters are bound via `self.env`, never minted as `Free`).
     pub param_types: HashMap<CVar, Ty>,
+    /// `CpsProgram::op_lines` for the function being translated -- set by
+    /// the caller right after `Forward::default()`, like `param_types`.
+    /// `walk` stashes the entry for each `LetPrim`'s own `CVar` into
+    /// `ConstantFold::pending_line` just before `add`ing its node, so the
+    /// e-class picks up the source line; empty by default (tests, callers
+    /// that don't care), which just leaves every `FoldData::line` `None`.
+    pub op_lines: HashMap<CVar, u32>,
     next_free: u32,
     /// Remaining unroll budget, shared across *every* `try_unroll_for_loop`
     /// call this `Forward` ever makes (sibling loops *and* nested ones
@@ -657,6 +728,7 @@ impl Default for Forward {
             array_repeat_ops: HashMap::new(),
             load_ops: HashMap::new(),
             param_types: HashMap::new(),
+            op_lines: HashMap::new(),
             next_free: 0,
             unroll_budget: MAX_UNROLL_ITERATIONS,
         }
@@ -664,6 +736,18 @@ impl Default for Forward {
 }
 
 impl Forward {
+    /// `egraph.add` for a node that came straight from a specific CPS
+    /// `LetPrim` -- threads that binding's source line
+    /// (`CpsProgram::op_lines`) into the new e-class's `FoldData::line` via
+    /// the `ConstantFold::pending_line` scratch slot, cleared immediately
+    /// after so it never leaks to a node a rewrite rule adds later.
+    fn add_from_letprim(&mut self, var: CVar, node: CleaveLang) -> egg::Id {
+        self.egraph.analysis.pending_line = self.op_lines.get(&var).copied();
+        let id = self.egraph.add(node);
+        self.egraph.analysis.pending_line = None;
+        id
+    }
+
     /// Translates as much of `expr`'s own straight-line prefix as possible,
     /// returning the `CExpr` where it had to stop — the "boundary" this
     /// module's own doc comment (and the plan it was built against) both
@@ -705,7 +789,7 @@ impl Forward {
                     .known_types
                     .entry(sym)
                     .or_insert_with(|| ty.clone());
-                let id = self.egraph.add(CleaveLang::Op(sym, arg_ids));
+                let id = self.add_from_letprim(*var, CleaveLang::Op(sym, arg_ids));
                 self.env.insert(*var, id);
                 self.walk(cont, units, fresh)
             }
@@ -737,7 +821,7 @@ impl Forward {
                     .known_types
                     .entry(sym)
                     .or_insert_with(|| ty.clone());
-                let id = self.egraph.add(CleaveLang::Op(sym, arg_ids));
+                let id = self.add_from_letprim(*var, CleaveLang::Op(sym, arg_ids));
                 self.env.insert(*var, id);
                 self.walk(cont, units, fresh)
             }
@@ -761,7 +845,7 @@ impl Forward {
                     .known_types
                     .entry(sym)
                     .or_insert_with(|| ty.clone());
-                let id = self.egraph.add(CleaveLang::Op(sym, arg_ids));
+                let id = self.add_from_letprim(*var, CleaveLang::Op(sym, arg_ids));
                 self.env.insert(*var, id);
                 self.walk(cont, units, fresh)
             }
@@ -791,7 +875,7 @@ impl Forward {
                     .known_types
                     .entry(sym)
                     .or_insert_with(|| ty.clone());
-                let id = self.egraph.add(CleaveLang::Op(sym, arg_ids));
+                let id = self.add_from_letprim(*var, CleaveLang::Op(sym, arg_ids));
                 self.env.insert(*var, id);
                 self.walk(cont, units, fresh)
             }
@@ -814,7 +898,7 @@ impl Forward {
                     .known_types
                     .entry(sym)
                     .or_insert_with(|| ty.clone());
-                let id = self.egraph.add(CleaveLang::Op(sym, arg_ids));
+                let id = self.add_from_letprim(*var, CleaveLang::Op(sym, arg_ids));
                 self.env.insert(*var, id);
                 self.walk(cont, units, fresh)
             }
@@ -843,7 +927,7 @@ impl Forward {
                     .known_types
                     .entry(sym)
                     .or_insert_with(|| ty.clone());
-                let id = self.egraph.add(CleaveLang::Op(sym, arg_ids));
+                let id = self.add_from_letprim(*var, CleaveLang::Op(sym, arg_ids));
                 self.env.insert(*var, id);
                 self.walk(cont, units, fresh)
             }
@@ -3047,6 +3131,12 @@ pub fn optimize_program(
 
     let mut new_bodies: HashMap<String, CExpr> = HashMap::new();
     let mut explanations = Vec::new();
+    // Debug-info provenance for the fresh `CVar`s `rebuild_segment` mints:
+    // the whole rewritten segment computed the value originally bound to
+    // `root_var`, so anchor every op in it to that binding's source line.
+    // Coarser than per-node (the e-graph reassociates/CSEs across original
+    // statements), but enough to keep a profiler off line 0.
+    let mut extra_op_lines: HashMap<CVar, SrcLoc> = HashMap::new();
 
     for f in &program.funcs {
         let mut fwd = Forward::default();
@@ -3065,6 +3155,13 @@ pub fn optimize_program(
             .copied()
             .zip(f.param_types.iter().cloned())
             .collect();
+        // `Forward::op_lines`/`ConstantFold::pending_line` (the e-graph's
+        // own, still line-only, `FoldData::line` provenance -- not yet
+        // wired through extraction, `doc/backlog.md`'s own note on the
+        // still-open "precise" tier) predates `SrcLoc`'s own file field;
+        // project it away here rather than widen a mechanism nothing reads
+        // yet.
+        fwd.op_lines = program.op_lines.iter().map(|(v, loc)| (*v, loc.line)).collect();
         let boundary = fwd.walk(&f.def.body, &units, &fresh);
         let Some(root_var) = segment_root_var(&boundary, &fwd.env) else {
             continue;
@@ -3177,10 +3274,19 @@ pub fn optimize_program(
             &load_ops,
             &fresh,
         );
+        if let Some(seg_line) = program.op_lines.get(&root_var).copied() {
+            let mut vs = Vec::new();
+            collect_letprim_vars(&rebuilt, &mut vs);
+            for v in vs {
+                extra_op_lines.entry(v).or_insert(seg_line);
+            }
+        }
         new_bodies.insert(f.def.name.clone(), rebuilt);
     }
     drop(units);
 
+    let mut op_lines = program.op_lines;
+    op_lines.extend(extra_op_lines);
     let funcs = program
         .funcs
         .into_iter()
@@ -3191,7 +3297,7 @@ pub fn optimize_program(
             f
         })
         .collect();
-    (CpsProgram { funcs }, explanations)
+    (CpsProgram { funcs, op_lines }, explanations)
 }
 
 // ---------------------------------------------------------------- derivative synthesis (Stage 7)
@@ -3288,6 +3394,16 @@ pub fn synthesize_derivatives(
     // exists anywhere in the program — same reason `call_units` below
     // filters `referenced` the identical way.
     let unit_names: HashSet<String> = units.keys().cloned().collect();
+    // `synthesize_one_gradient`'s own `Forward` scratch state predates
+    // per-file provenance and only ever needs a line number (its `op_lines`
+    // is purely a coarse "which source line is this e-node roughly from"
+    // hint, never emitted as debug info directly) -- narrow `program`'s
+    // `SrcLoc` map down once here rather than widening that whole path.
+    let op_lines: HashMap<CVar, u32> = program
+        .op_lines
+        .iter()
+        .map(|(v, loc)| (*v, loc.line))
+        .collect();
 
     let mut new_funcs = Vec::new();
     let mut errors = Vec::new();
@@ -3313,6 +3429,7 @@ pub fn synthesize_derivatives(
                 &fresh,
                 struct_schemas,
                 &unit_names,
+                &op_lines,
             ) {
                 Ok(f) => new_funcs.push(f),
                 Err(e) => errors.push(e),
@@ -3651,6 +3768,11 @@ pub fn synthesize_derivatives(
             no_inline: false,
             is_export: false,
             export_symbol: None,
+            // No `fn` declaration of its own -- anchor the synthesized
+            // derivative to the function it differentiates so a profiler
+            // attributes its (inlined) ops to that source line rather than
+            // to nothing.
+            loc: of_unit.loc,
         });
     }
 
@@ -3658,9 +3780,10 @@ pub fn synthesize_derivatives(
         return Err(errors);
     }
 
+    let op_lines = program.op_lines;
     let mut funcs = program.funcs;
     funcs.extend(new_funcs);
-    Ok(CpsProgram { funcs })
+    Ok(CpsProgram { funcs, op_lines })
 }
 
 // ---------------------------------------------------------------- reverse-mode differentiation (grad())
@@ -3728,8 +3851,10 @@ fn synthesize_one_gradient(
     fresh: &FreshVars,
     struct_schemas: &HashMap<String, StructSchema>,
     unit_names: &HashSet<String>,
+    op_lines: &HashMap<CVar, u32>,
 ) -> Result<CTopLevelFn, String> {
     let mut fwd = Forward::default();
+    fwd.op_lines = op_lines.clone();
     let f_params = &of_unit.def.params[..of_unit.def.params.len() - 1];
     fwd.param_types = f_params
         .iter()
@@ -3916,6 +4041,11 @@ fn synthesize_one_gradient(
         no_inline: false,
         is_export: false,
         export_symbol: None,
+        // Anchor the whole synthesized backward to the forward function it
+        // differentiates -- its ops carry no finer provenance yet (that
+        // needs `FoldData::line` carried through extraction), so a profiler
+        // attributes backward time to `grad(f)`'s `f` rather than to line 0.
+        loc: of_unit.loc,
     })
 }
 
@@ -5402,6 +5532,7 @@ mod tests {
             no_inline: false,
             is_export: false,
             export_symbol: None,
+            loc: SrcLoc::default(),
         };
         let mut units: HashMap<String, &CTopLevelFn> = HashMap::new();
         units.insert("TestRing::add<i32>".to_string(), &callee);
@@ -5683,6 +5814,7 @@ mod tests {
             no_inline: false,
             is_export: false,
             export_symbol: None,
+            loc: SrcLoc::default(),
         };
         let mut units: HashMap<String, &CTopLevelFn> = HashMap::new();
         units.insert("Ring::add<i32>".to_string(), &callee);
@@ -5751,6 +5883,7 @@ mod tests {
             no_inline: false,
             is_export: false,
             export_symbol: None,
+            loc: SrcLoc::default(),
         };
         let mut units: HashMap<String, &CTopLevelFn> = HashMap::new();
         units.insert("branchy".to_string(), &callee);
@@ -5891,6 +6024,7 @@ mod tests {
             no_inline: false,
             is_export: false,
             export_symbol: None,
+            loc: SrcLoc::default(),
         }
     }
 
@@ -6099,6 +6233,7 @@ mod tests {
             no_inline: false,
             is_export: false,
             export_symbol: None,
+            loc: SrcLoc::default(),
         };
         let mut units: HashMap<String, &CTopLevelFn> = HashMap::new();
         units.insert("Print<i32>::print".to_string(), &callee);
@@ -7114,7 +7249,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        let cps_program = crate::cps::convert_program(units);
+        let cps_program = crate::cps::convert_program(units, None);
         let errs = match synthesize_derivatives(cps_program, &requests, &registry, &HashMap::new())
         {
             Err(errs) => errs,
@@ -7169,7 +7304,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        let cps_program = crate::cps::convert_program(units);
+        let cps_program = crate::cps::convert_program(units, None);
         let errs = match synthesize_derivatives(cps_program, &requests, &registry, &HashMap::new())
         {
             Err(errs) => errs,
@@ -7372,7 +7507,7 @@ mod tests {
         let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
         let registry = Registry::build(&program);
         let units = crate::cps::collect_units(&program, &registry);
-        let cps_program = crate::cps::convert_program(units);
+        let cps_program = crate::cps::convert_program(units, None);
         let f_unit = cps_program
             .funcs
             .iter()

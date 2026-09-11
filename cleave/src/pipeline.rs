@@ -21,9 +21,9 @@ use crate::registry::Registry;
 use crate::unify_alloc::unify_tensor_allocations;
 use melior::Context;
 use melior::dialect::{DialectRegistry, llvm};
-use melior::ir::{BlockLike, Location, Module, RegionLike, Type, Value};
 use melior::ir::attribute::Attribute;
 use melior::ir::operation::{OperationBuilder, OperationLike, OperationMutLike, OperationRefMut};
+use melior::ir::{BlockLike, Identifier, Location, Module, RegionLike, Type, Value};
 use melior::pass;
 use melior::utility::{parse_pass_pipeline, register_all_dialects};
 use std::path::{Path, PathBuf};
@@ -120,6 +120,7 @@ impl Default for CodegenOptions {
 pub fn build_cps_program(
     program: &Program,
     registry: &Registry,
+    sources: Option<&SourceMap>,
 ) -> Result<CpsProgram, Vec<String>> {
     let units = collect_units(program, registry);
     let requests: Vec<DerivativeRequest> = units
@@ -134,7 +135,7 @@ pub fn build_cps_program(
             _ => None,
         })
         .collect();
-    let cps_program = convert_program(units);
+    let cps_program = convert_program(units, sources);
     let struct_schemas = collect_struct_schemas(program);
     synthesize_derivatives(cps_program, &requests, registry, &struct_schemas)
 }
@@ -190,7 +191,7 @@ pub fn emit_from_program(
     options: &CodegenOptions,
 ) -> Result<(), Vec<String>> {
     check_type_errors(program, registry).map_err(|errs| render_all(&errs, sources))?;
-    let cps_program = build_optimized_cps(program, registry)?;
+    let cps_program = build_optimized_cps(program, registry, Some(sources))?;
 
     if let Some(bindings_path) = bindings_path {
         let bindings = crate::rust_bindings::generate_rust_bindings(&cps_program.funcs)?;
@@ -199,7 +200,7 @@ pub fn emit_from_program(
     }
 
     if let Some(object_path) = object_path {
-        emit_object(program, &cps_program, object_path, options)?;
+        emit_object(program, &cps_program, object_path, options, sources)?;
     }
 
     Ok(())
@@ -209,8 +210,12 @@ pub fn emit_from_program(
 /// program` / `eliminate_dead_code` sequencing every pipeline entry point
 /// needs (see `--dump-cps-optimized`'s own comment in `main.rs` for why the
 /// second sweep is needed) -- shared by `emit_from_program` and `emit_exe`.
-fn build_optimized_cps(program: &Program, registry: &Registry) -> Result<CpsProgram, Vec<String>> {
-    let cps_program = build_cps_program(program, registry)?;
+fn build_optimized_cps(
+    program: &Program,
+    registry: &Registry,
+    sources: Option<&SourceMap>,
+) -> Result<CpsProgram, Vec<String>> {
+    let cps_program = build_cps_program(program, registry, sources)?;
     let cps_program = eliminate_dead_code(cps_program);
     let (cps_program, _) = optimize_program(cps_program, registry, false);
     let cps_program = eliminate_dead_code(cps_program);
@@ -220,7 +225,11 @@ fn build_optimized_cps(program: &Program, registry: &Registry) -> Result<CpsProg
     // risks its own rewriting scrambling them).
     let struct_schemas = collect_struct_schemas(program);
     let mlir_types = collect_mlir_types(program);
-    Ok(insert_refcounting(cps_program, &struct_schemas, &mlir_types))
+    Ok(insert_refcounting(
+        cps_program,
+        &struct_schemas,
+        &mlir_types,
+    ))
 }
 
 /// Parses/merges/resolves `sources_in` from scratch (`driver::compile`'s
@@ -324,10 +333,22 @@ pub unsafe fn register_cleave_rt_symbols(engine: &melior::ExecutionEngine) {
         engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
         engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
         engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
-        engine.register_symbol("cleave_release_void", cleave_rt::cleave_release_void as *mut ());
-        engine.register_symbol("cleave_alloc_local", cleave_rt::cleave_alloc_local as *mut ());
-        engine.register_symbol("cleave_region_enter", cleave_rt::cleave_region_enter as *mut ());
-        engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
+        engine.register_symbol(
+            "cleave_release_void",
+            cleave_rt::cleave_release_void as *mut (),
+        );
+        engine.register_symbol(
+            "cleave_alloc_local",
+            cleave_rt::cleave_alloc_local as *mut (),
+        );
+        engine.register_symbol(
+            "cleave_region_enter",
+            cleave_rt::cleave_region_enter as *mut (),
+        );
+        engine.register_symbol(
+            "cleave_region_exit",
+            cleave_rt::cleave_region_exit as *mut (),
+        );
         engine.register_symbol("dynarray_alloc_i8", cleave_rt::dynarray_alloc_i8 as *mut ());
         engine.register_symbol("dynarray_grow_i8", cleave_rt::dynarray_grow_i8 as *mut ());
         engine.register_symbol("dynarray_get_i8", cleave_rt::dynarray_get_i8 as *mut ());
@@ -537,7 +558,9 @@ fn insert_stack_scopes_in_loops<'c>(context: &'c Context, op: OperationRefMut<'c
             let stacksave = OperationBuilder::new("llvm.intr.stacksave", location)
                 .add_results(&[ptr_ty])
                 .build()
-                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build llvm.intr.stacksave: {e}"));
+                .unwrap_or_else(|e| {
+                    panic!("MLIR lowering: failed to build llvm.intr.stacksave: {e}")
+                });
             let stacksave = body.insert_operation_before(first_op, stacksave);
             let saved: Value = stacksave.result(0).unwrap().into();
             if let Some(terminator) = body.terminator() {
@@ -561,6 +584,35 @@ fn insert_stack_scopes_in_loops<'c>(context: &'c Context, op: OperationRefMut<'c
             }
             next_block = block.next_in_region();
         }
+    }
+}
+
+/// Does `loc` resolve to a real `FileLineColLoc` *anywhere* inside it?
+/// `--inline` wraps a cloned op's own (perfectly good) location in a
+/// `CallSiteLoc(calleeLoc, callerLoc)` -- a shallow `is_file_line_col_
+/// range()` check on that wrapper alone reports "unknown" even though the
+/// real line is still sitting right there in `callee_loc`, one level down,
+/// and a debugger's own "inlined at" chain reads exactly this way (confirmed
+/// directly: `llvm-readobj --codeview` on a real kernel object shows real
+/// `S_INLINESITE` records once every function -- not just the ones
+/// surviving as standalone `llvm.func`s -- gets its own `DISubprogram`,
+/// `mlir_lower.rs::gen_loc`'s own doc comment has the full story). Recurses
+/// into `CallSiteLoc`/`FusedLoc`; a `NameLoc`'s own child isn't exposed by
+/// melior, so it's conservatively treated as unresolved (this pipeline only
+/// ever produces one, for the `DISubprogram` metadata attribute itself, not
+/// on ordinary ops). Used by `backfill_unknown_locs` below to tell a
+/// genuinely bare `UnknownLoc` (left by an MLIR lowering pass that
+/// synthesized new ops -- the tiled/vectorized loop nests, mostly) apart
+/// from a location that still resolves, however deep.
+fn has_real_line(loc: melior::ir::Location) -> bool {
+    if loc.is_file_line_col_range() {
+        true
+    } else if loc.is_call_site() {
+        has_real_line(loc.call_site_callee()) || has_real_line(loc.call_site_caller())
+    } else if loc.is_fused() {
+        (0..loc.fused_num_locations()).any(|i| has_real_line(loc.fused_location(i)))
+    } else {
+        false
     }
 }
 
@@ -857,8 +909,7 @@ pub fn lower_to_llvm<'c>(
     pass_manager.add_pass(pass::transform::create_canonicalizer());
     if pass_manager.run(&mut *module).is_err() {
         return Err(vec![
-            "MLIR-to-LLVM lowering pass failed (expand-strided-metadata/lower-affine)"
-                .to_string(),
+            "MLIR-to-LLVM lowering pass failed (expand-strided-metadata/lower-affine)".to_string(),
         ]);
     }
 
@@ -1187,6 +1238,21 @@ pub fn lower_to_llvm<'c>(
         ]);
     }
 
+    // `llvm.emit_c_interface` (`lower_top_level_fn`'s own comment on it, put
+    // only on `main`) makes the `--convert-to-llvm` above mint a
+    // `_mlir_ciface_main` trampoline -- and it does so by reusing `main`'s
+    // own `Location` object unmodified for the new op and its body, found
+    // directly: running the real test suite (most of which JITs and calls
+    // `main`) hard-crashed the LLVM verifier with "DISubprogram attached to
+    // more than one function" and "!dbg attachment points at wrong
+    // subprogram for function". A `DISubprogram` describes exactly one
+    // function; two `llvm.func`s both fused to the same distinct instance
+    // is invalid. The wrapper is a one-line auto-generated ABI shim, not
+    // real user code -- nobody will ever want to set a breakpoint inside
+    // `_mlir_ciface_main` -- so the fix is simply to strip all debug info
+    // from its whole subtree before it ever reaches the verifier.
+    strip_ciface_wrapper_debug_info(context, module.as_operation_mut());
+
     // Gives cleave sole ownership of every tensor payload's own physical
     // memory -- see `unify_alloc.rs`'s own module doc comment for why this
     // runs *here* specifically (right after `--convert-to-llvm`, not
@@ -1195,7 +1261,153 @@ pub fn lower_to_llvm<'c>(
 
     stamp_target_cpu(context, module, options)?;
 
+    // Emit `!llvm.module.flags` with `CodeView = 1` so the LLVM backend
+    // writes CodeView (`.debug$S`/`.debug$T`, what a Windows `.pdb` is
+    // built from) rather than DWARF for the `DISubprogram`s
+    // `mlir_lower.rs::build_di_subprograms` attached. `Debug Info Version`
+    // is set here too (the translation would add it anyway, but being
+    // explicit keeps both flags in one place). Built via `OperationBuilder`
+    // -- `llvm.module_flags` has no melior wrapper, and the `flags`
+    // inherent attribute is parsed from its textual form.
+    {
+        let flags = Attribute::parse(
+            context,
+            "[#llvm.mlir.module_flag<warning, \"CodeView\", 1 : i32>, \
+             #llvm.mlir.module_flag<max, \"Debug Info Version\", 3 : i32>]",
+        )
+        .expect("pipeline: failed to parse llvm.module_flags attribute");
+        let op = OperationBuilder::new("llvm.module_flags", Location::unknown(context))
+            .add_attributes(&[(Identifier::new(context, "flags"), flags)])
+            .build()
+            .expect("pipeline: failed to build llvm.module_flags op");
+        module.body().append_operation(op);
+    }
+
+    // Every op `mlir_lower.rs::gen_loc` ever stamped already carries its own
+    // function's `DISubprogram`, fused in from the start (`gen_loc`'s own
+    // doc comment) -- including a surviving `llvm.func`'s own top-level
+    // location, so there's nothing left to attach here. What *does* still
+    // need a floor: an op an MLIR lowering pass rebuilt from scratch (the
+    // tiled/vectorized loop nests, mostly), which comes out with a bare
+    // `UnknownLoc` no translation can resolve a debug scope from. Back-fill
+    // those, per surviving `llvm.func`, with that function's own (already
+    // good) location -- a profiler then attributes that code to the
+    // function rather than to an unnamed address range.
+    backfill_all_unknown_locs(module.as_operation_mut());
+
     Ok(())
+}
+
+/// Pre-order walk: finds every `_mlir_ciface_*` wrapper `llvm.func`
+/// anywhere under `op` and gives its own location, and every op nested
+/// inside it, a bare `Location::unknown` -- see `lower_to_llvm`'s own call-
+/// site comment for why. Stops descending once a matching function is found
+/// (its whole subtree is handled by `force_location` in one shot).
+///
+/// `pub`, not `pub(crate)`: every test file with its own bespoke, minimal
+/// JIT pass pipeline (`tests/{mlir_lower,egraph,dps_rewrite,refcount,
+/// unify_alloc,user_guide}.rs` -- found by direct testing, not assumed, when
+/// the real `cargo test -p cleave` suite hard-crashed the LLVM verifier the
+/// first time it ran after `mlir_lower.rs` started fusing a `DISubprogram`
+/// onto every function, not just ones surviving `--inline`) needs to call
+/// this too, right after its own `--convert-to-llvm` sequence -- none of
+/// them go through `lower_to_llvm` itself.
+pub fn strip_ciface_wrapper_debug_info<'c>(context: &'c Context, op: OperationRefMut<'c, '_>) {
+    if matches!(op.name().as_string_ref().as_str(), Ok("llvm.func"))
+        && op
+            .attribute("sym_name")
+            .map(|a| a.to_string().contains("_mlir_ciface_"))
+            .unwrap_or(false)
+    {
+        force_location(op, Location::unknown(context));
+        return;
+    }
+    for region in op.regions() {
+        let mut next_block = region.first_block();
+        while let Some(block) = next_block {
+            let mut next_op = block.first_operation_mut();
+            while let Some(child) = next_op {
+                next_op = child.next_in_block_mut();
+                strip_ciface_wrapper_debug_info(context, child);
+            }
+            next_block = block.next_in_region();
+        }
+    }
+}
+
+/// Unconditionally overwrites `op`'s own location, and every op nested
+/// inside it, with `loc` -- the blunt counterpart to `backfill_unknown_locs`
+/// below (which only touches ops that don't already have a real line),
+/// used only on a `_mlir_ciface_*` wrapper's whole subtree.
+fn force_location<'c>(mut op: OperationRefMut<'c, '_>, loc: Location<'c>) {
+    op.set_location(loc);
+    for region in op.regions() {
+        let mut next_block = region.first_block();
+        while let Some(block) = next_block {
+            let mut next_op = block.first_operation_mut();
+            while let Some(child) = next_op {
+                next_op = child.next_in_block_mut();
+                force_location(child, loc);
+            }
+            next_block = block.next_in_region();
+        }
+    }
+}
+
+/// Pre-order walk: inside every `llvm.func` that has a body, back-fill any
+/// op whose location doesn't resolve to a real line anywhere
+/// (`has_real_line`) with that function's own location.
+fn backfill_all_unknown_locs(op: OperationRefMut<'_, '_>) {
+    if matches!(op.name().as_string_ref().as_str(), Ok("llvm.func"))
+        && op.regions().any(|r| r.first_block().is_some())
+    {
+        let fallback = op.location();
+        for region in op.regions() {
+            let mut next_block = region.first_block();
+            while let Some(block) = next_block {
+                let mut next_op = block.first_operation_mut();
+                while let Some(child) = next_op {
+                    next_op = child.next_in_block_mut();
+                    backfill_unknown_locs(child, fallback);
+                }
+                next_block = block.next_in_region();
+            }
+        }
+        return;
+    }
+    for region in op.regions() {
+        let mut next_block = region.first_block();
+        while let Some(block) = next_block {
+            let mut next_op = block.first_operation_mut();
+            while let Some(child) = next_op {
+                next_op = child.next_in_block_mut();
+                backfill_all_unknown_locs(child);
+            }
+            next_block = block.next_in_region();
+        }
+    }
+}
+
+/// Recursively give every op with a non-`FileLineColLoc` location (an
+/// `UnknownLoc` left by a lowering pass) `fallback` -- the enclosing
+/// `llvm.func`'s declaration-line location. A coarse floor, not real
+/// provenance, but it keeps a profiler attributing that code to the
+/// function rather than to an unnamed address range.
+fn backfill_unknown_locs<'c>(mut op: OperationRefMut<'c, '_>, fallback: Location<'c>) {
+    if !has_real_line(op.location()) {
+        op.set_location(fallback);
+    }
+    for region in op.regions() {
+        let mut next_block = region.first_block();
+        while let Some(block) = next_block {
+            let mut next_op = block.first_operation_mut();
+            while let Some(child) = next_op {
+                next_op = child.next_in_block_mut();
+                backfill_unknown_locs(child, fallback);
+            }
+            next_block = block.next_in_region();
+        }
+    }
 }
 
 /// Stamps `llvm.func`'s own real `target_cpu`/`target_features` attributes
@@ -1266,9 +1478,7 @@ fn stamp_target_cpu<'c>(
                     context,
                     &format!("#llvm.target_features<[{}]>", quoted.join(", ")),
                 )
-                .ok_or_else(|| {
-                    vec![format!("invalid --target-features {features:?}")]
-                })?,
+                .ok_or_else(|| vec![format!("invalid --target-features {features:?}")])?,
             )
         }
     };
@@ -1337,7 +1547,9 @@ fn stamp_llvm_func_attrs<'c>(
 unsafe fn register_unresolved_extern_stubs(engine: &melior::ExecutionEngine, program: &Program) {
     extern "C" fn dummy_extern_stub() {}
     for item in &program.items {
-        let ItemKind::Fn(f) = &item.kind else { continue };
+        let ItemKind::Fn(f) = &item.kind else {
+            continue;
+        };
         if !f.is_extern {
             continue;
         }
@@ -1361,7 +1573,9 @@ fn emit_object(
     cps_program: &CpsProgram,
     object_path: &Path,
     options: &CodegenOptions,
+    sources: &SourceMap,
 ) -> Result<(), Vec<String>> {
+    crate::mlir_lower::set_gen_file_table(sources.path_table());
     let dialect_registry = DialectRegistry::new();
     register_all_dialects(&dialect_registry);
     let context = Context::new();
@@ -1562,7 +1776,7 @@ pub fn emit_exe(
     options: &CodegenOptions,
 ) -> Result<(), Vec<String>> {
     check_type_errors(program, registry).map_err(|errs| render_all(&errs, sources))?;
-    let mut cps_program = build_optimized_cps(program, registry)?;
+    let mut cps_program = build_optimized_cps(program, registry, Some(sources))?;
 
     let Some(main_fn) = cps_program.funcs.iter_mut().find(|f| f.def.name == "main") else {
         return Err(vec![
@@ -1590,7 +1804,7 @@ pub fn emit_exe(
     let object_path = work_dir.join("program.o");
     let shim_path = work_dir.join("shim.rs");
 
-    emit_object(program, &cps_program, &object_path, options)?;
+    emit_object(program, &cps_program, &object_path, options, sources)?;
 
     let shim_src = if main_returns_i32 {
         format!(

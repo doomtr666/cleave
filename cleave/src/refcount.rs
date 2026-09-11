@@ -1117,6 +1117,7 @@ pub fn insert_refcounting(
     let constructed_structs = collect_constructed_struct_names(&program);
     let field_mutated_structs = collect_field_mutated_struct_names(&program);
     let extern_boundary_structs = collect_extern_boundary_struct_names(&program);
+    let op_lines = program.op_lines;
     let funcs = program
         .funcs
         .into_iter()
@@ -1156,7 +1157,7 @@ pub fn insert_refcounting(
     // function's own three call sites, so every one of them benefits
     // automatically (`--dump-cps-optimized`, `--run`, and the real AOT
     // pipeline) without needing to remember to call it separately.
-    crate::rc_opt::eliminate_redundant_retain_release(CpsProgram { funcs })
+    crate::rc_opt::eliminate_redundant_retain_release(CpsProgram { funcs, op_lines })
 }
 
 /// The function's own top-level `params` are deliberately never seeded
@@ -1181,6 +1182,7 @@ fn insert_refcounting_fn(top: CTopLevelFn, ctx: &RefcountCtx) -> CTopLevelFn {
         no_inline: top.no_inline,
         is_export: top.is_export,
         export_symbol: top.export_symbol,
+        loc: top.loc,
     }
 }
 

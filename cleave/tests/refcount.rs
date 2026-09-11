@@ -20,7 +20,7 @@ use cleave::driver::compile;
 use cleave::egraph::optimize_program;
 use cleave::infer::Ty;
 use cleave::mlir_lower::lower_program;
-use cleave::pipeline::check_type_errors;
+use cleave::pipeline::{check_type_errors, strip_ciface_wrapper_debug_info};
 use cleave::refcount::insert_refcounting;
 use cleave::registry::Registry;
 use melior::Context;
@@ -50,7 +50,7 @@ fn refcounted_cps(src: &str) -> CpsProgram {
         panic!("type check failed: {diags:?}");
     }
     let units = collect_units(&program, &registry);
-    let cps_program = convert_program(units);
+    let cps_program = convert_program(units, None);
     let cps_program = cleave::cps::eliminate_dead_code(cps_program);
     let (cps_program, _) = optimize_program(cps_program, &registry, false);
     let cps_program = cleave::cps::eliminate_dead_code(cps_program);
@@ -230,7 +230,7 @@ fn run_i32_with_extra_symbols(src: &str, extra_symbols: &[(&str, *mut ())]) -> i
         panic!("type check failed: {diags:?}");
     }
     let units = collect_units(&program, &registry);
-    let cps_program = convert_program(units);
+    let cps_program = convert_program(units, None);
     let cps_program = cleave::cps::eliminate_dead_code(cps_program);
     let (cps_program, _) = optimize_program(cps_program, &registry, false);
     let cps_program = cleave::cps::eliminate_dead_code(cps_program);
@@ -253,6 +253,7 @@ fn run_i32_with_extra_symbols(src: &str, extra_symbols: &[(&str, *mut ())]) -> i
     pass_manager
         .run(&mut module)
         .expect("lowering to the llvm dialect must succeed");
+    strip_ciface_wrapper_debug_info(&context, module.as_operation_mut());
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     // SAFETY: each `cleave_rt::*` pointer is a real, valid `extern "C" fn`,

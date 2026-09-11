@@ -160,7 +160,20 @@ impl Build {
         let mut project_dirs: Vec<PathBuf> = Vec::new();
         for f in &self.files {
             let text = std::fs::read_to_string(f).unwrap_or_else(|e| panic!("cleave-build: failed to read {}: {e}", f.display()));
-            sources.push((f.display().to_string(), text));
+            // Absolute path: it becomes the debug-info source-file name a
+            // profiler/debugger resolves, so a relative `src/kernel.cleave`
+            // (what `Build::file` is normally given) would leave the user
+            // hunting for it by hand.
+            let name = f
+                .canonicalize()
+                .map(|p| {
+                    let s = p.display().to_string();
+                    // Strip Windows' `\\?\` extended-length prefix -- lldb
+                    // and VTune don't recognise it.
+                    s.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(s)
+                })
+                .unwrap_or_else(|_| f.display().to_string());
+            sources.push((name, text));
             if let Some(dir) = f.parent() {
                 if !project_dirs.contains(&dir.to_path_buf()) {
                     project_dirs.push(dir.to_path_buf());

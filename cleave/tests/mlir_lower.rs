@@ -5,7 +5,7 @@ use cleave::cps::{
 use cleave::driver::compile;
 use cleave::egraph::{DerivativeRequest, optimize_program, synthesize_derivatives};
 use cleave::mlir_lower::lower_program;
-use cleave::pipeline::check_type_errors;
+use cleave::pipeline::{check_type_errors, strip_ciface_wrapper_debug_info};
 use cleave::registry::Registry;
 use melior::Context;
 use melior::dialect::DialectRegistry;
@@ -102,7 +102,7 @@ fn lower(context: &Context, src: &str) -> String {
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let registry = Registry::build(&program);
     let units = collect_units(&program, &registry);
-    let cps_program = convert_program(units);
+    let cps_program = convert_program(units, None);
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let module = lower_program(context, &cps_program, &mlir_types, struct_schemas);
@@ -176,7 +176,7 @@ fn a_compiled_program_actually_runs_and_returns_the_right_value() {
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let registry = Registry::build(&program);
     let units = collect_units(&program, &registry);
-    let cps_program = convert_program(units);
+    let cps_program = convert_program(units, None);
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
@@ -224,6 +224,7 @@ fn a_compiled_program_actually_runs_and_returns_the_right_value() {
     pass_manager
         .run(&mut module)
         .expect("lowering to the llvm dialect must succeed");
+    strip_ciface_wrapper_debug_info(&context, module.as_operation_mut());
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     // Registered unconditionally, harmless if unused -- any struct
@@ -292,7 +293,7 @@ fn run_i32(context: &Context, src: &str) -> i32 {
             _ => None,
         })
         .collect();
-    let cps_program = convert_program(units);
+    let cps_program = convert_program(units, None);
     let struct_schemas = collect_struct_schemas(&program);
     let cps_program = synthesize_derivatives(cps_program, &requests, &registry, &struct_schemas)
         .unwrap_or_else(|e| panic!("cannot derive: {e:?}"));
@@ -329,7 +330,7 @@ fn run_i32_with_optimization_pass(context: &Context, src: &str) -> i32 {
             _ => None,
         })
         .collect();
-    let cps_program = convert_program(units);
+    let cps_program = convert_program(units, None);
     let struct_schemas = collect_struct_schemas(&program);
     let cps_program = synthesize_derivatives(cps_program, &requests, &registry, &struct_schemas)
         .unwrap_or_else(|e| panic!("cannot derive: {e:?}"));
@@ -438,6 +439,7 @@ fn run_i32_from_cps(
     pass_manager
         .run(&mut module)
         .expect("lowering to the llvm dialect must succeed");
+    strip_ciface_wrapper_debug_info(&context, module.as_operation_mut());
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     // Registered unconditionally, harmless if unused -- any struct
@@ -713,7 +715,7 @@ fn an_extern_fn_call_actually_executes_through_a_registered_symbol() {
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let registry = Registry::build(&program);
     let units = collect_units(&program, &registry);
-    let cps_program = convert_program(units);
+    let cps_program = convert_program(units, None);
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
@@ -761,6 +763,7 @@ fn an_extern_fn_call_actually_executes_through_a_registered_symbol() {
     pass_manager
         .run(&mut module)
         .expect("lowering to the llvm dialect must succeed");
+    strip_ciface_wrapper_debug_info(&context, module.as_operation_mut());
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {
@@ -871,7 +874,7 @@ fn an_extern_impl_method_actually_executes_the_right_symbol_at_each_call_site() 
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let registry = Registry::build(&program);
     let units = collect_units(&program, &registry);
-    let cps_program = convert_program(units);
+    let cps_program = convert_program(units, None);
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
@@ -919,6 +922,7 @@ fn an_extern_impl_method_actually_executes_the_right_symbol_at_each_call_site() 
     pass_manager
         .run(&mut module)
         .expect("lowering to the llvm dialect must succeed");
+    strip_ciface_wrapper_debug_info(&context, module.as_operation_mut());
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {
@@ -968,7 +972,7 @@ fn an_array_argument_crosses_an_extern_call_boundary_correctly() {
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let registry = Registry::build(&program);
     let units = collect_units(&program, &registry);
-    let cps_program = convert_program(units);
+    let cps_program = convert_program(units, None);
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
@@ -1008,6 +1012,7 @@ fn an_array_argument_crosses_an_extern_call_boundary_correctly() {
     pass_manager
         .run(&mut module)
         .expect("lowering to the llvm dialect must succeed");
+    strip_ciface_wrapper_debug_info(&context, module.as_operation_mut());
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {
@@ -1054,7 +1059,7 @@ fn a_unit_returning_extern_fn_can_be_called_correctly() {
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let registry = Registry::build(&program);
     let units = collect_units(&program, &registry);
-    let cps_program = convert_program(units);
+    let cps_program = convert_program(units, None);
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
@@ -1107,6 +1112,7 @@ fn a_unit_returning_extern_fn_can_be_called_correctly() {
     pass_manager
         .run(&mut module)
         .expect("lowering to the llvm dialect must succeed");
+    strip_ciface_wrapper_debug_info(&context, module.as_operation_mut());
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {
@@ -1154,7 +1160,7 @@ fn a_string_literal_printed_via_print_writes_the_right_bytes_to_stdout() {
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let registry = Registry::build(&program);
     let units = collect_units(&program, &registry);
-    let cps_program = convert_program(units);
+    let cps_program = convert_program(units, None);
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
@@ -1203,6 +1209,7 @@ fn a_string_literal_printed_via_print_writes_the_right_bytes_to_stdout() {
     pass_manager
         .run(&mut module)
         .expect("lowering to the llvm dialect must succeed");
+    strip_ciface_wrapper_debug_info(&context, module.as_operation_mut());
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {
@@ -2914,7 +2921,7 @@ fn print_of_an_unannotated_index_result_no_longer_panics() {
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let registry = Registry::build(&program);
     let units = collect_units(&program, &registry);
-    let cps_program = convert_program(units);
+    let cps_program = convert_program(units, None);
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
@@ -2966,6 +2973,7 @@ fn print_of_an_unannotated_index_result_no_longer_panics() {
     pass_manager
         .run(&mut module)
         .expect("lowering to the llvm dialect must succeed");
+    strip_ciface_wrapper_debug_info(&context, module.as_operation_mut());
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {
@@ -3015,7 +3023,7 @@ fn print_of_an_unannotated_matmul_index_result_no_longer_panics() {
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let registry = Registry::build(&program);
     let units = collect_units(&program, &registry);
-    let cps_program = convert_program(units);
+    let cps_program = convert_program(units, None);
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
@@ -3067,6 +3075,7 @@ fn print_of_an_unannotated_matmul_index_result_no_longer_panics() {
     pass_manager
         .run(&mut module)
         .expect("lowering to the llvm dialect must succeed");
+    strip_ciface_wrapper_debug_info(&context, module.as_operation_mut());
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {
@@ -4734,7 +4743,7 @@ fn run_i32_with_dynarray_symbols(
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let registry = Registry::build(&program);
     let units = collect_units(&program, &registry);
-    let cps_program = convert_program(units);
+    let cps_program = convert_program(units, None);
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(context, &cps_program, &mlir_types, struct_schemas);
@@ -4768,6 +4777,7 @@ fn run_i32_with_dynarray_symbols(
     pass_manager
         .run(&mut module)
         .expect("lowering to the llvm dialect must succeed");
+    strip_ciface_wrapper_debug_info(&context, module.as_operation_mut());
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {

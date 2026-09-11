@@ -72,7 +72,10 @@ pub(crate) fn eliminate_redundant_retain_release(program: CpsProgram) -> CpsProg
             top
         })
         .collect();
-    CpsProgram { funcs }
+    CpsProgram {
+        funcs,
+        op_lines: program.op_lines,
+    }
 }
 
 /// The main recursive walk — applies retain/release pair elimination

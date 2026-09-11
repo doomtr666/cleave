@@ -10,6 +10,7 @@ use cleave::cps::{
 use cleave::driver::compile;
 use cleave::egraph::optimize_program;
 use cleave::mlir_lower::lower_program;
+use cleave::pipeline::strip_ciface_wrapper_debug_info;
 use cleave::registry::Registry;
 use melior::Context;
 use melior::dialect::DialectRegistry;
@@ -70,6 +71,7 @@ fn run(
     pass_manager
         .run(&mut module)
         .expect("lowering to the llvm dialect must succeed");
+    strip_ciface_wrapper_debug_info(context, module.as_operation_mut());
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     // SAFETY: a real, valid `extern "C" fn`, live for the process's whole
@@ -124,7 +126,7 @@ fn an_axiom_folds_a_real_call_away_and_the_optimized_program_still_executes_to_t
     let registry = Registry::build(&program);
 
     let naive_units = collect_units(&program, &registry);
-    let naive_cps = convert_program(naive_units);
+    let naive_cps = convert_program(naive_units, None);
     let naive_dump = dump_cps_program(&naive_cps);
     let naive_helper = naive_dump
         .split("(fn helper")
@@ -136,7 +138,7 @@ fn an_axiom_folds_a_real_call_away_and_the_optimized_program_still_executes_to_t
     );
 
     let optimize_units = collect_units(&program, &registry);
-    let optimize_cps = convert_program(optimize_units);
+    let optimize_cps = convert_program(optimize_units, None);
     let (optimized, explanations) = optimize_program(optimize_cps, &registry, true);
     assert!(
         !explanations.is_empty(),
@@ -164,7 +166,7 @@ fn an_axiom_folds_a_real_call_away_and_the_optimized_program_still_executes_to_t
     // The real proof, not just that the CPS text changed: both forms still
     // execute to the identical runtime value.
     let naive_units_for_run = collect_units(&program, &registry);
-    let naive_cps_for_run = convert_program(naive_units_for_run);
+    let naive_cps_for_run = convert_program(naive_units_for_run, None);
     assert_eq!(
         run(&context, &program, &naive_cps_for_run),
         21,
@@ -206,7 +208,7 @@ fn a_struct_field_read_lets_add_zero_fold_a_real_call_away_and_the_optimized_pro
     let registry = Registry::build(&program);
 
     let naive_units = collect_units(&program, &registry);
-    let naive_cps = convert_program(naive_units);
+    let naive_cps = convert_program(naive_units, None);
     let naive_dump = dump_cps_program(&naive_cps);
     let naive_helper = naive_dump
         .split("(fn helper")
@@ -218,7 +220,7 @@ fn a_struct_field_read_lets_add_zero_fold_a_real_call_away_and_the_optimized_pro
     );
 
     let optimize_units = collect_units(&program, &registry);
-    let optimize_cps = convert_program(optimize_units);
+    let optimize_cps = convert_program(optimize_units, None);
     let (optimized, explanations) = optimize_program(optimize_cps, &registry, true);
     assert!(
         !explanations.is_empty(),
@@ -244,7 +246,7 @@ fn a_struct_field_read_lets_add_zero_fold_a_real_call_away_and_the_optimized_pro
     );
 
     let naive_units_for_run = collect_units(&program, &registry);
-    let naive_cps_for_run = convert_program(naive_units_for_run);
+    let naive_cps_for_run = convert_program(naive_units_for_run, None);
     assert_eq!(
         run(&context, &program, &naive_cps_for_run),
         21,

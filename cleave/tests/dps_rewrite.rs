@@ -18,7 +18,7 @@ use cleave::cps::{collect_mlir_types, collect_struct_schemas, collect_units, con
 use cleave::driver::compile;
 use cleave::dps_rewrite::eliminate_redundant_field_store_copies;
 use cleave::mlir_lower::lower_program;
-use cleave::pipeline::check_type_errors;
+use cleave::pipeline::{check_type_errors, strip_ciface_wrapper_debug_info};
 use cleave::registry::Registry;
 use melior::Context;
 use melior::dialect::DialectRegistry;
@@ -52,7 +52,7 @@ fn bufferized_text(context: &Context, src: &str) -> String {
         panic!("type check failed: {diags:?}");
     }
     let units = collect_units(&program, &registry);
-    let cps_program = convert_program(units);
+    let cps_program = convert_program(units, None);
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(context, &cps_program, &mlir_types, struct_schemas);
@@ -103,7 +103,7 @@ fn run_f32_with_rewrite(context: &Context, src: &str) -> f32 {
         panic!("type check failed: {diags:?}");
     }
     let units = collect_units(&program, &registry);
-    let cps_program = convert_program(units);
+    let cps_program = convert_program(units, None);
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(context, &cps_program, &mlir_types, struct_schemas);
@@ -171,6 +171,7 @@ fn run_f32_with_rewrite(context: &Context, src: &str) -> f32 {
     pass_manager
         .run(&mut module)
         .expect("lowering to the llvm dialect must succeed");
+    strip_ciface_wrapper_debug_info(context, module.as_operation_mut());
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {

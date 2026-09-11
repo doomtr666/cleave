@@ -7,7 +7,7 @@ fn bindings(src: &str) -> Result<String, Vec<String>> {
     let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let registry = Registry::build(&program);
-    let cps_program = convert_program(collect_units(&program, &registry));
+    let cps_program = convert_program(collect_units(&program, &registry), None);
     let cps_program = eliminate_dead_code(cps_program);
     generate_rust_bindings(&cps_program.funcs)
 }

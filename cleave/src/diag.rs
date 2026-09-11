@@ -61,7 +61,37 @@ impl SourceMap {
         self.files.insert(id, (name.into(), text.into()));
     }
 
-    fn line_col(&self, file: FileId, byte_offset: usize) -> Option<(usize, usize)> {
+    /// The name (path) of the lowest-`FileId` source -- the user's own
+    /// entry file, since stdlib files are loaded afterwards and get higher
+    /// ids. Used as the single debug-info source-file path.
+    pub fn primary_path(&self) -> Option<&str> {
+        self.files
+            .iter()
+            .min_by_key(|(id, _)| id.0)
+            .map(|(_, (name, _))| name.as_str())
+    }
+
+    /// The path for one specific file -- unlike `primary_path` (always the
+    /// user's own entry file), this is per-`FileId`: a `Span`'s own file is
+    /// generally *not* the entry file once it points into an inlined
+    /// stdlib body.
+    pub fn path(&self, file: FileId) -> Option<&str> {
+        self.files.get(&file).map(|(name, _)| name.as_str())
+    }
+
+    /// Every registered file's own path, keyed by its raw `FileId.0` -- the
+    /// table `mlir_lower.rs::set_gen_file_table` needs to resolve a
+    /// per-function/per-statement `FileId` back to a real path at debug-info
+    /// emission time, without `mlir_lower.rs` itself depending on
+    /// `SourceMap`/`FileId`.
+    pub fn path_table(&self) -> std::collections::HashMap<u32, String> {
+        self.files
+            .iter()
+            .map(|(id, (name, _))| (id.0, name.clone()))
+            .collect()
+    }
+
+    pub fn line_col(&self, file: FileId, byte_offset: usize) -> Option<(usize, usize)> {
         let (_, text) = self.files.get(&file)?;
         let offset = byte_offset.min(text.len());
         let mut line = 1;

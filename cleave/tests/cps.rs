@@ -11,7 +11,7 @@ fn cps(src: &str) -> String {
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let registry = Registry::build(&program);
     let units = collect_units(&program, &registry);
-    let cps_program = convert_program(units);
+    let cps_program = convert_program(units, None);
     dump_cps_program(&cps_program)
 }
 
@@ -761,7 +761,7 @@ fn a_top_level_fns_own_origin_survives_cps_conversion() {
     let program = result.unwrap();
     let registry = Registry::build(&program);
     let all_units = collect_units(&program, &registry);
-    let cps_program = convert_program(all_units);
+    let cps_program = convert_program(all_units, None);
     let add = cps_program
         .funcs
         .iter()
@@ -791,7 +791,7 @@ fn dead_code_elimination_drops_an_unused_top_level_fn_but_keeps_reachable_ones()
     );
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let registry = Registry::build(&program);
-    let cps_program = convert_program(collect_units(&program, &registry));
+    let cps_program = convert_program(collect_units(&program, &registry), None);
     let cps_program = eliminate_dead_code(cps_program);
     let names: Vec<&str> = cps_program
         .funcs
@@ -820,7 +820,7 @@ fn dead_code_elimination_keeps_an_export_fn_unreachable_from_main() {
     );
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let registry = Registry::build(&program);
-    let cps_program = convert_program(collect_units(&program, &registry));
+    let cps_program = convert_program(collect_units(&program, &registry), None);
     let cps_program = eliminate_dead_code(cps_program);
     let names: Vec<&str> = cps_program
         .funcs
@@ -851,7 +851,7 @@ fn dead_code_elimination_drops_unreached_stdlib_specializations() {
     );
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let registry = Registry::build(&program);
-    let cps_program = convert_program(collect_units(&program, &registry));
+    let cps_program = convert_program(collect_units(&program, &registry), None);
     let before = cps_program.funcs.len();
     let cps_program = eliminate_dead_code(cps_program);
     let after = cps_program.funcs.len();
@@ -892,7 +892,7 @@ fn dead_code_elimination_after_optimization_drops_specializations_the_axioms_fol
     );
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let registry = Registry::build(&program);
-    let cps_program = convert_program(collect_units(&program, &registry));
+    let cps_program = convert_program(collect_units(&program, &registry), None);
     let cps_program = eliminate_dead_code(cps_program);
     let names_before: Vec<&str> = cps_program
         .funcs

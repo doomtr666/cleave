@@ -352,7 +352,7 @@ fn real_main() -> ExitCode {
             report(&diags, &sources);
             exit = ExitCode::FAILURE;
         } else {
-            match build_cps_program(&program, &registry) {
+            match build_cps_program(&program, &registry, None) {
                 Ok(cps_program) => {
                     let cps_program = eliminate_dead_code(cps_program);
                     print!("{}", dump_cps_program(&cps_program));
@@ -376,7 +376,7 @@ fn real_main() -> ExitCode {
             report(&diags, &sources);
             exit = ExitCode::FAILURE;
         } else {
-            match build_cps_program(&program, &registry) {
+            match build_cps_program(&program, &registry, None) {
                 Ok(cps_program) => {
                     let cps_program = eliminate_dead_code(cps_program);
                     let (optimized, _) = optimize_program(cps_program, &registry, false);
@@ -426,7 +426,7 @@ fn real_main() -> ExitCode {
             report(&diags, &sources);
             exit = ExitCode::FAILURE;
         } else {
-            match build_cps_program(&program, &registry) {
+            match build_cps_program(&program, &registry, None) {
                 Ok(cps_program) => {
                     let cps_program = eliminate_dead_code(cps_program);
                     let (_, explanations) = optimize_program(cps_program, &registry, true);
@@ -457,7 +457,7 @@ fn real_main() -> ExitCode {
             report(&diags, &sources);
             exit = ExitCode::FAILURE;
         } else {
-            match build_cps_program(&program, &registry) {
+            match build_cps_program(&program, &registry, None) {
                 Ok(cps_program) => {
                     let cps_program = eliminate_dead_code(cps_program);
                     let (cps_program, _) = optimize_program(cps_program, &registry, false);
@@ -504,7 +504,7 @@ fn real_main() -> ExitCode {
             report(&diags, &sources);
             exit = ExitCode::FAILURE;
         } else {
-            match build_cps_program(&program, &registry) {
+            match build_cps_program(&program, &registry, None) {
                 Ok(cps_program) => {
                     let cps_program = eliminate_dead_code(cps_program);
                     let (cps_program, _) = optimize_program(cps_program, &registry, false);
@@ -585,7 +585,7 @@ fn real_main() -> ExitCode {
             report(&diags, &sources);
             return ExitCode::FAILURE;
         }
-        let cps_program = match build_cps_program(&program, &registry) {
+        let cps_program = match build_cps_program(&program, &registry, None) {
             Ok(p) => p,
             Err(errs) => {
                 for e in &errs {

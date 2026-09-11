@@ -636,7 +636,7 @@ fn gep<'c>(
     indices: &[i64],
     pointee_ty: Type<'c>,
 ) -> Value<'c, 'c> {
-    let location = Location::unknown(context);
+    let location = Location::new(context, "kernel.cleave", 1, 1);
     let ptr_ty = llvm::r#type::pointer(context, 0);
     let raw: Vec<i32> = indices.iter().map(|&i| i as i32).collect();
     let built = OperationBuilder::new("llvm.getelementptr", location)
@@ -675,7 +675,7 @@ fn build_fresh_alloc<'c>(
     dims: &[i64],
     is_local: bool,
 ) -> Value<'c, 'c> {
-    let location = Location::unknown(context);
+    let location = Location::new(context, "kernel.cleave", 1, 1);
     let ptr_ty = llvm::r#type::pointer(context, 0);
     let total_elems: u32 = dims.iter().product::<i64>() as u32;
     let flat_array_ty = llvm::r#type::array(elem_type, total_elems);
@@ -738,7 +738,7 @@ fn rewrite_one<'c>(
     module_body: melior::ir::BlockRef<'c, '_>,
     candidate: Candidate<'c, '_>,
 ) {
-    let location = Location::unknown(context);
+    let location = Location::new(context, "kernel.cleave", 1, 1);
     let block = candidate
         .producer
         .block()
@@ -1110,7 +1110,7 @@ fn ensure_cleave_retain_declared<'c>(context: &'c Context, module_body: melior::
         }
         next = op.next_in_block();
     }
-    let location = Location::unknown(context);
+    let location = Location::new(context, "kernel.cleave", 1, 1);
     let ptr_ty = llvm::r#type::pointer(context, 0);
     let decl = func::func(
         context,
@@ -1147,7 +1147,7 @@ fn ensure_cleave_release_declared<'c>(context: &'c Context, module_body: melior:
         }
         next = op.next_in_block();
     }
-    let location = Location::unknown(context);
+    let location = Location::new(context, "kernel.cleave", 1, 1);
     let ptr_ty = llvm::r#type::pointer(context, 0);
     let bool_ty: Type = IntegerType::new(context, 1).into();
     let decl = func::func(

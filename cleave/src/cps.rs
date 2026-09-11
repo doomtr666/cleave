@@ -101,6 +101,7 @@
 //! `call_index` maps exactly that to a unit's own name.
 
 use crate::ast::*;
+use crate::diag::SourceMap;
 use crate::infer::{ConstValue, Infer, Ty};
 use crate::monomorphize;
 use crate::registry::Registry;
@@ -1145,6 +1146,19 @@ pub struct CFunDef {
     pub carried_types: Option<Vec<Ty>>,
 }
 
+/// A debug-info source position: `file` is a raw `ast::FileId.0` (never
+/// `FileId` itself -- this needs to reach `mlir_lower.rs`, which has no
+/// reason to depend on `ast`/`diag`), `line` is 1-based, `0` meaning
+/// "unknown" (matching `CTopLevelFn::line`'s own existing convention) --
+/// `file` is meaningless whenever `line == 0` (`FileId(0)` is a real,
+/// common id -- the entry file itself -- so it can't double as the "no
+/// info" sentinel the way `line == 0` can).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SrcLoc {
+    pub file: u32,
+    pub line: u32,
+}
+
 /// A top-level `CFunDef` specifically — everything in `CpsProgram::funcs`,
 /// as opposed to a `Fix`-local one (an `if`/loop join, or a real call's own
 /// resumption point), which stays a bare `CFunDef` with no cleave-level
@@ -1184,10 +1198,27 @@ pub struct CTopLevelFn {
     /// name, alongside the existing `def.name == "main"` check.
     pub is_export: bool,
     pub export_symbol: Option<String>,
+    /// Source position of this function's definition (`line == 0` if
+    /// unknown -- a synthetic unit with no `fn` declaration of its own,
+    /// e.g. a derivative). Recorded once in `convert_program` and threaded
+    /// unchanged through every later pass; `mlir_lower.rs` stamps it as the
+    /// function's debug-info position and the position every op inside it
+    /// inherits until real per-statement spans are threaded too.
+    pub loc: SrcLoc,
 }
 
 pub struct CpsProgram {
     pub funcs: Vec<CTopLevelFn>,
+    /// Source position for the `LetPrim` that binds each `CVar`, recorded
+    /// in `convert_program` from the AST span and carried through every
+    /// later pass: `synthesize_derivatives` anchors each backward op to the
+    /// forward op it differentiates, the e-graph propagates it as e-class
+    /// analysis data, and `refcount`/`rc_opt`/`eliminate_dead_code` pass it
+    /// through untouched. Consumed only by `mlir_lower.rs` to stamp
+    /// debug-info locations -- never load-bearing for codegen, so a missing
+    /// entry (a `CVar` a pass minted without provenance, `SrcLoc::line ==
+    /// 0`) just falls back to the enclosing function's own position.
+    pub op_lines: HashMap<CVar, SrcLoc>,
 }
 
 // ---------------------------------------------------------------- conversion
@@ -1255,6 +1286,53 @@ struct Ctx<'a> {
     /// own, separate `loop_stack` already rejects one outside any loop
     /// before this module ever sees the program at all.
     break_targets: RefCell<Vec<BreakTarget>>,
+    /// Debug-info provenance, threaded exactly like `break_targets` (a
+    /// `RefCell`/`Cell` rather than a new parameter on every recursive
+    /// `convert_*` signature -- `Ctx` is already `&Ctx` everywhere and
+    /// conversion is single-threaded). `sources` is `None` for callers that
+    /// only need the CPS shape (`--dump-*`, tests); `current_line` tracks
+    /// the innermost AST expression currently being converted; `op_lines`
+    /// is the shared output table (one per unit's `Ctx`, all pointing at
+    /// `convert_program`'s single map).
+    sources: Option<&'a SourceMap>,
+    current_line: Cell<u32>,
+    /// The `FileId.0` `current_line` was resolved against -- a stdlib body
+    /// (`matmul`, `relu`, ...) inlined transparently into the unit being
+    /// converted has spans in a *different* file than the unit's own entry
+    /// file, and stamping its lines against the wrong file's debug info is
+    /// worse than not having a line at all (found directly: VTune resolving
+    /// `Ord::lt`'s own real stdlib line number against `kernel.cleave` just
+    /// opens `kernel.cleave` at that line, since a debug-info file field
+    /// isn't validated the way an actual `#include` path would be).
+    current_file: Cell<u32>,
+    op_lines: &'a RefCell<HashMap<CVar, SrcLoc>>,
+}
+
+impl Ctx<'_> {
+    /// Records the innermost known source position against `var` -- called
+    /// at every `LetPrim` construction. A no-op when `sources` is `None`.
+    fn line(&self, var: CVar) {
+        if self.sources.is_some() {
+            self.op_lines.borrow_mut().insert(
+                var,
+                SrcLoc {
+                    file: self.current_file.get(),
+                    line: self.current_line.get(),
+                },
+            );
+        }
+    }
+
+    /// Updates `current_line`/`current_file` from an AST span (called at the
+    /// top of `convert_expr`, so each nested subexpression refines it).
+    fn at(&self, span: Span) {
+        if let Some(src) = self.sources {
+            if let Some((l, _)) = src.line_col(span.file, span.start) {
+                self.current_line.set(l as u32);
+                self.current_file.set(span.file.0);
+            }
+        }
+    }
 }
 
 /// The currently-open, break-guarded loop's own two synthetic carried slots
@@ -1310,12 +1388,13 @@ type CEnv = HashMap<String, CVal>;
 /// Converts every `ConcreteUnit` with a real body into one `CFunDef` —
 /// `extern` units never get one at all (see `PrimOp::Extern`, produced
 /// directly at their own call sites instead).
-pub fn convert_program(units: Vec<ConcreteUnit>) -> CpsProgram {
+pub fn convert_program(units: Vec<ConcreteUnit>, sources: Option<&SourceMap>) -> CpsProgram {
     let call_index = build_call_index(&units);
     let by_name: HashMap<String, ConcreteUnit> =
         units.into_iter().map(|u| (u.name.clone(), u)).collect();
     let fresh = FreshVars::new();
     let mut funcs = Vec::new();
+    let op_lines: RefCell<HashMap<CVar, SrcLoc>> = RefCell::new(HashMap::new());
     // Sorted, not raw `by_name.values()` -- `HashMap` iteration order isn't
     // just unstable across runs (`std`'s randomized per-process hasher
     // seed), it directly drives fresh var/label *numbering* here (assigned
@@ -1330,6 +1409,22 @@ pub fn convert_program(units: Vec<ConcreteUnit>) -> CpsProgram {
         let UnitBody::Real(body) = &unit.body else {
             continue;
         };
+        // First span inside the body -- the `fn` keyword itself has no
+        // node, so the opening statement (or tail expr) is the closest
+        // anchor for "where this function is".
+        let fn_span = body
+            .stmts
+            .first()
+            .map(|s| s.span)
+            .or_else(|| body.tail.as_ref().map(|e| e.span));
+        let fn_loc = sources
+            .zip(fn_span)
+            .and_then(|(src, sp)| src.line_col(sp.file, sp.start).map(|(l, _)| (l, sp.file.0)))
+            .map(|(l, file)| SrcLoc {
+                file,
+                line: l as u32,
+            })
+            .unwrap_or_default();
         // A unit with a `Ty::Fn`-typed parameter of its own can never be
         // converted/called *as declared* — a lambda has no runtime
         // representation at all (see `CVal::Closure`'s own doc comment), so
@@ -1357,6 +1452,10 @@ pub fn convert_program(units: Vec<ConcreteUnit>) -> CpsProgram {
             higher_order_args: &unit.higher_order_args,
             fresh: &fresh,
             break_targets: RefCell::new(Vec::new()),
+            sources,
+            current_line: Cell::new(fn_loc.line.max(1)),
+            current_file: Cell::new(fn_loc.file),
+            op_lines: &op_lines,
         };
         let mut env = CEnv::new();
         let mut params = Vec::with_capacity(unit.params.len() + 1);
@@ -1399,11 +1498,15 @@ pub fn convert_program(units: Vec<ConcreteUnit>) -> CpsProgram {
             no_inline: unit.no_inline,
             is_export: unit.is_export,
             export_symbol: unit.export_symbol.clone(),
+            loc: fn_loc,
         });
     }
     // Deterministic output order — `HashMap` iteration isn't stable.
     funcs.sort_by(|a, b| a.def.name.cmp(&b.def.name));
-    CpsProgram { funcs }
+    CpsProgram {
+        funcs,
+        op_lines: op_lines.into_inner(),
+    }
 }
 
 fn convert_block(block: &Block, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> CExpr) -> CExpr {
@@ -1639,7 +1742,7 @@ fn convert_stmts(stmts: &[Stmt], env: CEnv, ctx: &Ctx, k: &dyn Fn(CEnv) -> CExpr
                             args.extend(index_vals.clone());
                             args.push(new_val);
                             CExpr::LetPrim {
-                                var,
+                                var: { ctx.line(var); var },
                                 ty: Ty::Con("()".to_string()),
                                 op: PrimOp::Store {
                                     array_ty: array_ty.clone(),
@@ -1669,7 +1772,7 @@ fn convert_stmts(stmts: &[Stmt], env: CEnv, ctx: &Ctx, k: &dyn Fn(CEnv) -> CExpr
                     convert_expr(value, env, ctx, &|new_val, env| {
                         let var = ctx.fresh.var();
                         CExpr::LetPrim {
-                            var,
+                            var: { ctx.line(var); var },
                             ty: Ty::Con("()".to_string()),
                             op: PrimOp::FieldStore {
                                 struct_ty: struct_ty.clone(),
@@ -1735,6 +1838,7 @@ fn convert_stmts(stmts: &[Stmt], env: CEnv, ctx: &Ctx, k: &dyn Fn(CEnv) -> CExpr
 }
 
 fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> CExpr) -> CExpr {
+    ctx.at(expr.span);
     match &expr.kind {
         // A plain numeric literal widened to `Complex<T>` (`4 + 2i`, `4`'s
         // own side — see `infer.rs`'s `check_pending_constraints`'s own
@@ -1795,7 +1899,7 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
             convert_expr(base, env, ctx, &|base_val, env| {
                 let var = ctx.fresh.var();
                 CExpr::LetPrim {
-                    var,
+                    var: { ctx.line(var); var },
                     ty: ctx.node_types[&expr.id].clone(),
                     op: PrimOp::Field {
                         struct_ty: struct_ty.clone(),
@@ -1813,7 +1917,7 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
             convert_expr_list(&values, env, ctx, &|arg_vals, env| {
                 let var = ctx.fresh.var();
                 CExpr::LetPrim {
-                    var,
+                    var: { ctx.line(var); var },
                     ty: ctx.node_types[&expr.id].clone(),
                     op: PrimOp::Struct(struct_name.clone(), field_names.clone()),
                     args: arg_vals,
@@ -1837,7 +1941,7 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
             convert_expr_list(&arg_refs, env, ctx, &move |arg_vals, env| {
                 let var = ctx.fresh.var();
                 CExpr::LetPrim {
-                    var,
+                    var: { ctx.line(var); var },
                     ty: result_ty.clone(),
                     op: PrimOp::RawMlirOp {
                         op: op.clone(),
@@ -2426,7 +2530,7 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                         let mut elem_env = e.clone();
                         elem_env.insert(var.clone(), CVal::Var(elem_var));
                         let then_cexpr = CExpr::LetPrim {
-                            var: elem_var,
+                            var: { ctx.line(elem_var); elem_var },
                             ty: elem_ty.clone(),
                             op: PrimOp::Load {
                                 array_ty: array_ty.clone(),
@@ -2609,7 +2713,7 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                     let mut args = vec![array_val.clone()];
                     args.extend(index_vals);
                     CExpr::LetPrim {
-                        var,
+                        var: { ctx.line(var); var },
                         ty: ctx.node_types[&expr.id].clone(),
                         op: PrimOp::Load {
                             array_ty: array_ty.clone(),
@@ -2648,7 +2752,7 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                     let idx_array_var = ctx.fresh.var();
                     let callee = resolve_call("index", expr.id, &[base.id], ctx);
                     CExpr::LetPrim {
-                        var: idx_array_var,
+                        var: { ctx.line(idx_array_var); idx_array_var },
                         ty: idx_array_ty.clone(),
                         op: PrimOp::Array,
                         args: index_vals,
@@ -2669,7 +2773,7 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
             convert_expr_list(&elem_refs, env, ctx, &|elem_vals, env| {
                 let var = ctx.fresh.var();
                 CExpr::LetPrim {
-                    var,
+                    var: { ctx.line(var); var },
                     ty: ctx.node_types[&expr.id].clone(),
                     op: PrimOp::Array,
                     args: elem_vals,
@@ -2735,7 +2839,7 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
             convert_expr_list(&copies, env, ctx, &|elem_vals, env| {
                 let var = ctx.fresh.var();
                 CExpr::LetPrim {
-                    var,
+                    var: { ctx.line(var); var },
                     ty: ctx.node_types[&expr.id].clone(),
                     op: PrimOp::Array,
                     args: elem_vals,
@@ -2817,7 +2921,7 @@ fn convert_array_repeat_over_resolved_dims(
                 if remaining == 0 {
                     let var = ctx.fresh.var();
                     return CExpr::LetPrim {
-                        var,
+                        var: { ctx.line(var); var },
                         ty: level_ty.clone(),
                         op: PrimOp::Array,
                         args: acc,
@@ -3335,7 +3439,7 @@ fn emit_call(
         UnitBody::Extern(symbol) => {
             let var = ctx.fresh.var();
             CExpr::LetPrim {
-                var,
+                var: { ctx.line(var); var },
                 ty: result_ty,
                 op: PrimOp::Extern {
                     symbol: symbol.clone(),
@@ -3470,7 +3574,7 @@ fn complex_literal(
     let imag = parse_number(imag_text, elem_ty);
     let var = ctx.fresh.var();
     CExpr::LetPrim {
-        var,
+        var: { ctx.line(var); var },
         ty,
         op: PrimOp::Struct(
             "Complex".to_string(),
@@ -3555,6 +3659,7 @@ pub fn eliminate_dead_code(program: CpsProgram) -> CpsProgram {
             .into_iter()
             .filter(|f| reachable.contains(&f.def.name))
             .collect(),
+        op_lines: program.op_lines,
     }
 }
 
