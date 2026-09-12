@@ -129,28 +129,6 @@ use std::collections::{HashMap, HashSet};
 /// exclusion only ever fires for the `RawBuf`-shaped "opaque FFI handle,
 /// produced solely by `extern fn`s" idiom, structurally, with no hardcoded
 /// name anywhere.
-/// Whether `ty` is itself a bare `#[mlir_type(tensor)]`-tagged type (like
-/// `Tensor<T, Dims...>`) — deliberately *not* covered by `is_refcounted`
-/// (its own doc comment excludes it on purpose, matching `mlir_lower.rs::
-/// lower_field_access`'s own "no `!llvm.struct` storage at all" native-
-/// shape handling), yet a `Tensor` value genuinely *is* heap-backed
-/// (`cleave_alloc_rc`, at bufferization) and does need a real `Retain`/
-/// `Release` when it's ever independently, directly owned — matching
-/// `mlir_lower.rs::collect_light_leaves`'s own dedicated "a Tensor field is
-/// always its own leaf" rule, the actual authority for this, reused here
-/// directly for the one case that rule doesn't itself reach: a *bare*
-/// Tensor value, never wrapped in any struct at all (`Scale::scale`'s own
-/// real return shape — see `rewrite_body`'s own `Fix` arm, the transferred-
-/// argument seeding this exists for).
-fn is_bare_tensor_ty(ty: &Ty, mlir_types: &HashMap<String, String>) -> bool {
-    let name = match ty {
-        Ty::Con(n) => n.as_str(),
-        Ty::App(n, _) => n.as_str(),
-        _ => return false,
-    };
-    mlir_types.get(name).map(String::as_str) == Some("tensor")
-}
-
 pub(crate) fn is_refcounted(
     ty: &Ty,
     struct_schemas: &HashMap<String, crate::cps::StructSchema>,
@@ -187,6 +165,28 @@ pub(crate) fn is_refcounted(
             extern_boundary,
             constructed,
         )
+}
+
+/// Whether `ty` is itself a bare `#[mlir_type(tensor)]`-tagged type (like
+/// `Tensor<T, Dims...>`) — deliberately *not* covered by `is_refcounted`
+/// above (excluded on purpose, matching `mlir_lower.rs::lower_field_access`'s
+/// own "no `!llvm.struct` storage at all" native-shape handling), yet a
+/// `Tensor` value genuinely *is* heap-backed (`cleave_alloc_rc`, at
+/// bufferization) and does need a real `Retain`/`Release` when it's ever
+/// independently owned with no containing struct to cascade its release
+/// from — a real, confirmed leak otherwise (`Scale::scale`'s own return
+/// value, fed straight into `Ring::sub` and never read again, `doc/
+/// backlog.md`'s own writeup has the full trace). `RefcountCtx::is_rc` is
+/// the one real caller — see its own doc comment for why folding this in
+/// there, rather than at each individual call site, is what actually
+/// makes the fix general.
+fn is_bare_tensor_ty(ty: &Ty, mlir_types: &HashMap<String, String>) -> bool {
+    let name = match ty {
+        Ty::Con(n) => n.as_str(),
+        Ty::App(n, _) => n.as_str(),
+        _ => return false,
+    };
+    mlir_types.get(name).map(String::as_str) == Some("tensor")
 }
 
 /// Every struct name with at least one real `PrimOp::Struct` construction
@@ -228,6 +228,164 @@ fn collect_constructed_in(expr: &CExpr, names: &mut HashSet<String>) {
                 collect_constructed_in(&d.body, names);
             }
             collect_constructed_in(body, names);
+        }
+    }
+}
+
+/// Every top-level function that unconditionally hands one of its own
+/// (non-`k_ret`) parameters back as its own result, completely unchanged,
+/// on *every* reachable return path — `fn(x) -> x`, any side effects along
+/// the way notwithstanding — mapped to *which* parameter, by position.
+/// `Print<(A,B)>::print`/`println` (`stdlib/io/io.cleave`) are the real
+/// instances: `println<T>(x) { let r = print(x); print(['\n']); r }` is
+/// only identity *transitively*, through its own call to `print` — hence
+/// the fixpoint below, not a single pass.
+///
+/// Built to replace `rewrite_body`'s own earlier, coarser guess at the
+/// exact same question — matching a transferred argument's *type* against
+/// the callee's own return type (the original, narrower fix for the real
+/// `println` double-release crash, `doc/backlog-done.md`'s own pool-
+/// allocator entry has the full story). Found, by direct testing, to be a
+/// real false positive whenever a *struct*-typed transferred argument
+/// happens to share its type with a genuinely different function's own
+/// return value (e.g. `combine(a, b) -> Boxed` computing a fresh `Boxed`
+/// from two others of the identical type) — the old guess wrongly treated
+/// such an argument as aliased into the call's own result and skipped
+/// seeding it, silently leaking it. This computes the real, decidable fact
+/// instead of guessing from a type coincidence.
+///
+/// **Does not, on its own, close `doc/backlog.md`'s own "Scale::scale
+/// leak" entry** — that leak's real mechanism turned out to be different
+/// (and deeper) once actually traced on the real kernel: a *bare* `Tensor`
+/// value (never wrapped in any struct, `Scale::scale`'s own real return
+/// shape) never reached `aliases_ret_param` at all, because `needs_seed`
+/// (this same `Fix` arm) didn't recognize a bare tensor as needing seeding
+/// in the first place — see `RefcountCtx::is_rc`'s own doc comment for the
+/// real, general fix (folding `is_bare_tensor_ty` into `is_rc` itself,
+/// covering every one of this module's own seeding/retain-on-embed/
+/// release sites at once, not just this one). This identity-alias fix is
+/// real and worth keeping regardless (a genuine, separate struct-typed
+/// false positive), just narrower on its own than first assumed.
+pub(crate) fn collect_identity_param_fns(program: &CpsProgram) -> HashMap<String, usize> {
+    let mut identity_fns: HashMap<String, usize> = HashMap::new();
+    // A small, monotonic fixpoint: `println`'s own identity depends on
+    // already knowing `print`'s, so one linear pass over `program.funcs`
+    // (declaration order, not call order) isn't guaranteed enough — repeat
+    // until a full pass finds nothing new. Terminates trivially: at most
+    // one new entry per function, ever.
+    loop {
+        let mut added = false;
+        for top in &program.funcs {
+            if identity_fns.contains_key(&top.def.name) {
+                continue;
+            }
+            if let Some(idx) = identity_param_index(top, &identity_fns) {
+                identity_fns.insert(top.def.name.clone(), idx);
+                added = true;
+            }
+        }
+        if !added {
+            return identity_fns;
+        }
+    }
+}
+
+/// Whether `top`'s own body, on *every* reachable terminal return, hands
+/// back the exact same one (non-`k_ret`) parameter — using `identity_fns`
+/// (the partial, being-built whole-program map above) to see *through* a
+/// call to an already-resolved identity function, so a chain like
+/// `println` -> `print` resolves correctly rather than only ever
+/// recognizing a single, direct `return x;`.
+fn identity_param_index(top: &CTopLevelFn, identity_fns: &HashMap<String, usize>) -> Option<usize> {
+    let mut aliases: HashMap<CVar, usize> = top
+        .def
+        .params
+        .iter()
+        .filter(|&&p| p != top.k_ret)
+        .enumerate()
+        .map(|(i, &p)| (p, i))
+        .collect();
+    if aliases.is_empty() {
+        return None;
+    }
+    let mut found: Option<usize> = None;
+    if walk_identity_return(&top.def.body, top.k_ret, &mut aliases, identity_fns, &mut found) {
+        found
+    } else {
+        None
+    }
+}
+
+/// `true` iff every terminal return reached so far agrees with `found`
+/// (recorded the first time one is seen) — `false` the instant any
+/// terminal disagrees, or returns something other than one bare, unchanged
+/// alias of an original parameter. `aliases` grows as the walk descends
+/// past a call to an already-known identity function (see the `Fix` arm)
+/// — CPS never rebinds a `CVar` to a different value under the same name,
+/// so once a resumption's own parameter is established as an alias, every
+/// further reference to it is sound to treat exactly like the original.
+fn walk_identity_return(
+    expr: &CExpr,
+    k_ret: CVar,
+    aliases: &mut HashMap<CVar, usize>,
+    identity_fns: &HashMap<String, usize>,
+    found: &mut Option<usize>,
+) -> bool {
+    match expr {
+        CExpr::App { func: CVal::Var(f), args } if *f == k_ret => match args.as_slice() {
+            [CVal::Var(v)] => match aliases.get(v) {
+                Some(&idx) => match *found {
+                    Some(existing) => existing == idx,
+                    None => {
+                        *found = Some(idx);
+                        true
+                    }
+                },
+                None => false,
+            },
+            _ => false,
+        },
+        // Any other `App` (a real call/jump whose target isn't `k_ret`
+        // itself) isn't a terminal return at all — not disproof of
+        // identity on its own; whatever it reaches is a `Fix`'s own
+        // `defs`, walked below (the enclosing `Fix` arm also resolves the
+        // identity-alias propagation for a call to an already-known
+        // identity callee before recursing here).
+        CExpr::App { .. } => true,
+        CExpr::LetPrim { cont, .. } => walk_identity_return(cont, k_ret, aliases, identity_fns, found),
+        CExpr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            walk_identity_return(then_branch, k_ret, aliases, identity_fns, found)
+                && walk_identity_return(else_branch, k_ret, aliases, identity_fns, found)
+        }
+        CExpr::Fix { defs, body } => {
+            // A real call/jump to an already-known identity function: its
+            // sole resumption parameter (the call's own return value)
+            // becomes a fresh alias of whichever of *our* parameters the
+            // matching argument position already resolves to, before
+            // recursing into that resumption's own body below.
+            if let CExpr::App {
+                func: CVal::Label(callee),
+                args,
+            } = body.as_ref()
+            {
+                if let (Some(&pos), [resumption]) = (identity_fns.get(callee), &defs[..]) {
+                    if let (Some(CVal::Var(arg_var)), [ret_param]) =
+                        (args.get(pos), resumption.params.as_slice())
+                    {
+                        if let Some(&idx) = aliases.get(arg_var) {
+                            aliases.insert(*ret_param, idx);
+                        }
+                    }
+                }
+            }
+            walk_identity_return(body, k_ret, aliases, identity_fns, found)
+                && defs
+                    .iter()
+                    .all(|d| walk_identity_return(&d.body, k_ret, aliases, identity_fns, found))
         }
     }
 }
@@ -800,7 +958,7 @@ fn walk_local_claim_vars(
 }
 
 /// A `CVar`'s own defining shape, tracked only for the two forms
-/// `param_leaf_key` needs to see *through* — a plain `field.F(base)` read
+/// `redundant_leaf_key` needs to see *through* — a plain `field.F(base)` read
 /// (transparent: the result denotes exactly whatever `base`'s own `F` field
 /// already denotes, no new value), or a `struct.Name[f1,...](a1,...)`
 /// construction (also transparent, *per field* — reading `.f_i` back off
@@ -810,10 +968,19 @@ fn walk_local_claim_vars(
 enum ValueDef {
     Field(CVar, String),
     StructCtor(HashMap<String, CVar>),
+    /// A real call's own resumption parameter — `App { func: Label(callee),
+    /// args }` feeding a `Fix`'s own single resumption, whose single
+    /// parameter is this `CVar`. Recorded unconditionally, for every real
+    /// call, regardless of whether `callee` is later found to alias any of
+    /// its own parameters — `resolve`'s own `advance_call` helper is what
+    /// actually consults `AliasFns` to decide whether this is transparent.
+    /// See `collect_param_alias_fns`'s own module-level doc comment for why
+    /// this hop needs to exist at all, alongside `Field`/`StructCtor`.
+    Call(String, Vec<CVal>),
 }
 
 /// Every `CVar` this function's own body defines via `Field`/`Struct`,
-/// resolved to its own `ValueDef` — see `param_leaf_key`'s own doc comment
+/// resolved to its own `ValueDef` — see `redundant_leaf_key`'s own doc comment
 /// for what this is *for*. A single forward walk suffices (CPS is SSA — a
 /// `CVar` is bound at most once, always *before* any later reference to it,
 /// so nothing here needs a fixpoint).
@@ -861,6 +1028,18 @@ fn walk_value_defs(expr: &CExpr, defs: &mut HashMap<CVar, ValueDef>) {
         CExpr::Fix {
             defs: fdefs, body, ..
         } => {
+            // A real call's own resumption: `body` itself is `App { func:
+            // Label(callee), args }`, `fdefs` its one resumption, whose own
+            // single parameter denotes exactly that call's own return value
+            // — record it as a `ValueDef::Call` before recursing, the same
+            // way `Field`/`StructCtor` are recorded on sight.
+            if let (CExpr::App { func: CVal::Label(callee), args }, [resumption]) =
+                (body.as_ref(), fdefs.as_slice())
+            {
+                if let [r] = resumption.params.as_slice() {
+                    defs.insert(*r, ValueDef::Call(callee.clone(), args.clone()));
+                }
+            }
             for d in fdefs {
                 walk_value_defs(&d.body, defs);
             }
@@ -878,7 +1057,7 @@ fn walk_value_defs(expr: &CExpr, defs: &mut HashMap<CVar, ValueDef>) {
 /// there's no `StructCtor` entry for a parameter to peel a field off *of*,
 /// unlike a locally-constructed value), a locally-constructed struct whose
 /// own field->argument map is known (`Struct`, letting a *further* `Field`
-/// hop on top resolve transparently too — `param_leaf_key`'s own real
+/// hop on top resolve transparently too — `redundant_leaf_key`'s own real
 /// need: `v2265.l1.w` must resolve exactly as far as `v2265.l1` alone
 /// (itself `Field`, resolving to `v2252`, itself a fresh `StructCtor`)
 /// already does, peeling `.w` off *that* struct's own field map, not off
@@ -896,28 +1075,215 @@ enum Resolved<'a> {
     /// different numbers of hops — `wrap_releases`'s own dedup (below)
     /// depends on that.
     Param(CVar, Vec<String>),
+    /// Resolution reached a genuine local computation, but reached it
+    /// *consistently* — `.0` the `CVar` `resolve` bottomed out at, `.1` the
+    /// leaf path taken from there to here. Mirrors `Param`'s own shape
+    /// deliberately: two chains landing on the identical `CVar` here denote
+    /// the identical runtime value, by the same SSA argument that makes
+    /// `Param`'s own dedup sound, whether or not that `CVar` happens to be
+    /// one of this function's own formal parameters.
+    ///
+    /// **Found necessary by hand-tracing a real double-release, not
+    /// designed in from the start**: `Optimizer::step<Sgd, Network,
+    /// NetworkState<...>>`'s own real body reads a just-constructed local
+    /// `Dense`'s own `.w` leaf *twice* — once directly off the sub-struct
+    /// (`v2214`), once again through the *outer* `Network` it was just
+    /// embedded into (`(field.l1 v2248).w`, `v2248.l1 == v2214` — plain
+    /// `StructCtor`/`Field` transparency) — both bottom out at the
+    /// identical `CVar` once fully unwound, but neither is this function's
+    /// own parameter, so the old `Param`-only dedup this replaces never
+    /// saw the collision: two genuinely redundant releases fired for one
+    /// retain, a real, reproducible `STATUS_ACCESS_VIOLATION` (`examples/
+    /// mnist-interop`), confirmed down to the exact instruction pair (two
+    /// `cleave_release` call sites loading the identical stack slot, a
+    /// hardware watchpoint showing zero writes to it in between) before
+    /// this fix was written.
+    Local(CVar, Vec<String>),
     Struct(&'a HashMap<String, CVar>),
+    /// A real call's own (not-yet-known-transparent) result — `.0` the
+    /// `CVar` this call's own result was bound to (kept so a lookup miss in
+    /// `finalize_call` can still fall back to `Local` on *it*, rather than
+    /// losing identity the way plain `Opaque` would), `.1` the callee's own
+    /// name, `.2` its own argument list, verbatim, `.3` the field path
+    /// accumulated *so far* on top of this call's own result (empty means
+    /// "the call's own whole result, no field yet"). Kept around (rather
+    /// than collapsing straight to `Opaque`, as `resolve` used to) so
+    /// `advance` can keep peeling fields off a call's own result *without*
+    /// consulting `AliasFns` until a real answer is actually needed
+    /// (`finalize`/`finalize_call`) — `Optimizer::step`'s own real shape
+    /// (`(Model, State)`, only `State` ever transparent) already needed
+    /// per-field lookup, not "the whole result"; a *composing* level one
+    /// layer up (`Dense`/`Network`-level `step`, generic over `Opt`) needs
+    /// this to go one step further still: its own `state` output field is
+    /// itself a **fresh struct** built from nested calls (`DenseState { w:
+    /// rw.1, b: rb.1 }`), so the fact `AliasFns` actually has to record
+    /// lives at a *multi*-field compound key (`"1.w"`, `"1.b"`, or two
+    /// levels up, `"1.l4.w"`/`"1.l4.b"`) — checking one field at a time (the
+    /// original design) can never match a compound key, which is exactly
+    /// how `Sgd`'s own `state`-passthrough (`stdlib/optim/optim.cleave`'s
+    /// leaf `step` returns `state` completely unchanged) went undetected
+    /// through `Dense`/`Network`-level composition, a real, reproducible
+    /// double-release in `examples/mnist-interop` (`doc/backlog.md`) fully
+    /// diagnosed down to this exact gap before this fix was written.
+    Call(CVar, &'a str, &'a [CVal], Vec<String>),
+    /// Genuinely no stable identity to dedup on — a `Struct`'s own field
+    /// map missing the field being looked up, an internal inconsistency
+    /// this module's own invariants should make unreachable in practice,
+    /// not a normal resolution outcome.
     Opaque,
 }
 
-fn resolve<'a>(v: CVar, params: &HashSet<CVar>, defs: &'a HashMap<CVar, ValueDef>) -> Resolved<'a> {
+/// Per function name, per output field — a **dot-joined compound path**
+/// (`""` for the return value as a whole, `"1"` for one field of it, `"1.w"`/
+/// `"1.l4.b"` for a field *nested* inside that, as deep as the return value's
+/// own struct nesting goes — never just one flat segment: `Dense`/`Network`-
+/// level `Optimizer::step` rebuild their own `state` output field as a
+/// *fresh* struct (`DenseState { w: rw.1, b: rb.1 }`), so the fact worth
+/// recording lives one or two levels below the field `identity_fns` alone
+/// could ever name) -> which of that function's own parameters (by index
+/// into `top.def.params`, excluding `k_ret`) and, recursively, which leaf
+/// field-path off of it, that output slot always resolves to — see `collect_
+/// param_alias_fns`'s own doc comment for how this gets built, and `finalize_
+/// call`'s own doc comment for why the lookup key must be the *whole*
+/// accumulated path, checked once, rather than one field at a time.
+type AliasFns = HashMap<String, HashMap<String, (usize, Vec<String>)>>;
+
+fn resolve<'a>(
+    v: CVar,
+    params: &HashSet<CVar>,
+    defs: &'a HashMap<CVar, ValueDef>,
+    alias_fns: &AliasFns,
+) -> Resolved<'a> {
     if params.contains(&v) {
         return Resolved::Param(v, Vec::new());
     }
     match defs.get(&v) {
         Some(ValueDef::StructCtor(fields)) => Resolved::Struct(fields),
-        Some(ValueDef::Field(base, field)) => match resolve(*base, params, defs) {
-            Resolved::Struct(fields) => match fields.get(field) {
-                Some(arg) => resolve(*arg, params, defs),
-                None => Resolved::Opaque,
-            },
-            Resolved::Param(p, mut path) => {
-                path.push(field.clone());
-                Resolved::Param(p, path)
-            }
-            Resolved::Opaque => Resolved::Opaque,
+        Some(ValueDef::Field(base, field)) => {
+            advance(resolve(*base, params, defs, alias_fns), field, params, defs, alias_fns)
+        }
+        // Deferred, deliberately not resolved here: whichever field (if
+        // any) gets peeled off next (`advance`, either from `resolve_leaf`'s
+        // own step loop, or its own final "no further steps" collapse) is
+        // what decides which `AliasFns` entry actually applies — resolving
+        // eagerly against the `""` ("whole value") entry here would ask the
+        // wrong question the moment there's at least one real step still to
+        // come (`Optimizer::step`'s own real shape: field `"1"`/`state` can
+        // be transparent while the call's *whole* result, field `""`,
+        // never is).
+        Some(ValueDef::Call(callee, args)) => Resolved::Call(v, callee, args, Vec::new()),
+        // `v` itself is the stopping point — a genuine local computation,
+        // reached consistently every time anything resolves back to it
+        // (`Resolved::Local`'s own doc comment has the real bug this closes).
+        None => Resolved::Local(v, Vec::new()),
+    }
+}
+
+/// Steps `current` one field further — the shared engine behind `resolve`'s
+/// own `Field` case and `resolve_leaf`'s per-step loop below. `Resolved::
+/// Call` just accumulates the field onto its own pending path instead of
+/// consulting `AliasFns` here — a *composing* level's own alias fact can
+/// live several fields deep (`finalize_call`'s own doc comment), so a single
+/// field is never enough on its own to know whether this resolves to a
+/// `Param` or not; only `finalize`/`finalize_call`, once the *whole* leaf
+/// path is known, can actually answer that.
+fn advance<'a>(
+    current: Resolved<'a>,
+    field: &str,
+    params: &HashSet<CVar>,
+    defs: &'a HashMap<CVar, ValueDef>,
+    alias_fns: &AliasFns,
+) -> Resolved<'a> {
+    match current {
+        Resolved::Struct(fields) => match fields.get(field) {
+            Some(arg) => resolve(*arg, params, defs, alias_fns),
+            None => Resolved::Opaque,
         },
-        None => Resolved::Opaque,
+        Resolved::Param(p, mut path) => {
+            path.push(field.to_string());
+            Resolved::Param(p, path)
+        }
+        Resolved::Local(origin, mut path) => {
+            path.push(field.to_string());
+            Resolved::Local(origin, path)
+        }
+        Resolved::Call(origin, callee, args, mut path) => {
+            path.push(field.to_string());
+            Resolved::Call(origin, callee, args, path)
+        }
+        Resolved::Opaque => Resolved::Opaque,
+    }
+}
+
+/// Collapses a still-pending `Resolved::Call` into a real answer — a no-op
+/// on every other variant. Every caller that needs a *definitive* answer
+/// (not just "one more field peeled off") must run its `Resolved` through
+/// this before matching on it: `advance` itself deliberately never does (see
+/// its own doc comment), so a lingering `Call` reaching a `match` anywhere
+/// else is very likely a spot that needs a `finalize` call added, not a
+/// genuine "no alias" outcome.
+fn finalize<'a>(
+    r: Resolved<'a>,
+    params: &HashSet<CVar>,
+    defs: &'a HashMap<CVar, ValueDef>,
+    alias_fns: &AliasFns,
+) -> Resolved<'a> {
+    match r {
+        Resolved::Call(origin, callee, args, path) => {
+            finalize_call(origin, callee, args, &path, params, defs, alias_fns)
+        }
+        other => other,
+    }
+}
+
+/// Looks up `alias_fns[callee][path.join(".")]` — the whole accumulated leaf
+/// path checked *at once*, not one field at a time (`Resolved::Call`'s own
+/// doc comment has the real bug this closes: `Dense`/`Network`-level
+/// `Optimizer::step` rebuild their own `state` output field as a *fresh*
+/// struct one or two levels deep, so the fact actually recorded in `AliasFns`
+/// lives at a compound key like `"1.l4.b"` — a field-at-a-time lookup could
+/// only ever match a single-segment key like `"1"`, which never exists for a
+/// composing level, so its own alias fact was silently invisible before this
+/// fix). If `callee` is whole-program-proven to hand back, at that exact
+/// path, one of its own parameters (at some index, possibly with its own
+/// further leaf path), resolves the matching *argument* `args[idx]` the same
+/// way, then walks the callee's own remaining leaf path on top of that
+/// (`advance`, once per remaining step, finalizing again after each in case
+/// that step itself lands on another not-yet-resolved call) — e.g.
+/// `Optimizer::step`'s own leaf-level impl reports `("1", (3, []))` (its own
+/// field `1`/`state` == its own parameter index `3`, no further path); a
+/// composing level one layer up, whose own `state` field is itself built
+/// from calling that leaf level per sub-field, reports the identical fact
+/// transitively for *its* own parameter at the composed key, via this exact
+/// recursion — `collect_param_alias_fns`'s own fixpoint is what makes that
+/// composition visible here, not this function itself.
+fn finalize_call<'a>(
+    origin: CVar,
+    callee: &str,
+    args: &'a [CVal],
+    path: &[String],
+    params: &HashSet<CVar>,
+    defs: &'a HashMap<CVar, ValueDef>,
+    alias_fns: &AliasFns,
+) -> Resolved<'a> {
+    let joined = path.join(".");
+    match alias_fns.get(callee).and_then(|m| m.get(&joined)) {
+        Some((idx, extra_path)) => match args.get(*idx) {
+            Some(CVal::Var(v)) => {
+                let mut r = finalize(resolve(*v, params, defs, alias_fns), params, defs, alias_fns);
+                for step in extra_path {
+                    r = finalize(advance(r, step, params, defs, alias_fns), params, defs, alias_fns);
+                }
+                r
+            }
+            // No known alias for this path -- falls back to `Local` on
+            // `origin` (the call's own result `CVar`) rather than losing
+            // identity via plain `Opaque`: two separate reads of the same
+            // untracked field, off the same call result, are still
+            // provably the same value.
+            _ => Resolved::Local(origin, path.to_vec()),
+        },
+        None => Resolved::Local(origin, path.to_vec()),
     }
 }
 
@@ -931,28 +1297,208 @@ fn resolve_leaf<'a>(
     steps: &[(Ty, String)],
     params: &HashSet<CVar>,
     defs: &'a HashMap<CVar, ValueDef>,
+    alias_fns: &AliasFns,
 ) -> Resolved<'a> {
-    let mut current = resolve(var, params, defs);
+    let mut current = resolve(var, params, defs, alias_fns);
     for (_, field) in steps {
-        current = match current {
-            Resolved::Struct(fields) => match fields.get(field) {
-                Some(arg) => resolve(*arg, params, defs),
-                None => Resolved::Opaque,
-            },
-            Resolved::Param(p, mut path) => {
-                path.push(field.clone());
-                Resolved::Param(p, path)
-            }
-            Resolved::Opaque => Resolved::Opaque,
-        };
+        current = advance(current, field, params, defs, alias_fns);
     }
-    current
+    // Every step above only ever accumulates onto a pending `Resolved::
+    // Call` (`advance`'s own doc comment) — the whole accumulated leaf path
+    // only ever gets checked against `AliasFns` here, once, now that
+    // `steps` is fully known (`finalize_call`'s own doc comment has the
+    // real bug a field-at-a-time check used to hide).
+    finalize(current, params, defs, alias_fns)
 }
 
-/// Whether `v`'s own value is *exactly* (never a copy of) something this
-/// function received as one of its own borrowed formal parameters —
-/// resolved transitively through any number of `Field`/`Struct`
-/// reconstructions in between (`ValueDef`'s own doc comment: both are
+/// Every reachable *terminal* return site (`App(k_ret, [r])`) in `expr`'s
+/// own body, `r` collected into `out` — mirrors `walk_identity_return`'s own
+/// traversal shape, but collects every site rather than checking one fact
+/// across all of them (`collect_param_alias_fns`'s own caller does the
+/// "does every site agree" reduction itself, per output field independently
+/// rather than as one whole-function bool).
+fn walk_return_sites(expr: &CExpr, k_ret: CVar, out: &mut Vec<CVar>) {
+    match expr {
+        CExpr::App {
+            func: CVal::Var(f),
+            args,
+        } if *f == k_ret => {
+            if let [CVal::Var(r)] = args.as_slice() {
+                out.push(*r);
+            }
+        }
+        CExpr::App { .. } => {}
+        CExpr::LetPrim { cont, .. } => walk_return_sites(cont, k_ret, out),
+        CExpr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            walk_return_sites(then_branch, k_ret, out);
+            walk_return_sites(else_branch, k_ret, out);
+        }
+        CExpr::Fix { defs, body, .. } => {
+            for d in defs {
+                walk_return_sites(&d.body, k_ret, out);
+            }
+            walk_return_sites(body, k_ret, out);
+        }
+    }
+}
+
+/// The output-field -> `(param index, param leaf path)` map for one
+/// terminal return value `r` — `resolve`'s own field-by-field view of it,
+/// keeping only fields (or the whole value itself, key `""`) that resolve
+/// all the way back to one of `params_ordered`'s own entries. Thin wrapper
+/// around `collect_field_aliases`, which does the actual (now recursive)
+/// walk — see its own doc comment for why one level was never enough.
+fn return_field_aliases(
+    r: CVar,
+    params_ordered: &[CVar],
+    params_set: &HashSet<CVar>,
+    defs: &HashMap<CVar, ValueDef>,
+    alias_fns: &AliasFns,
+) -> HashMap<String, (usize, Vec<String>)> {
+    let mut out = HashMap::new();
+    collect_field_aliases(r, "", params_ordered, params_set, defs, alias_fns, &mut out);
+    out
+}
+
+/// `return_field_aliases`'s own recursive engine — resolves `v` and, if it
+/// lands on `Resolved::Param`, records `prefix` (the dot-joined field path
+/// taken to reach `v` from the original return value, `""` at the top)
+/// mapped to that param's own `(index, leaf path)`. If instead `v` lands on
+/// `Resolved::Struct` (it's itself a *fresh* struct built at this return
+/// site, not a bare alias), recurses into every one of its own fields,
+/// extending `prefix` — the one level `return_field_aliases` used to stop
+/// at could see `Optimizer::step`'s own leaf-level `state` passthrough
+/// (`state` bound directly, field `"1"` resolves straight to `Resolved::
+/// Param`), but not `Dense`/`Network`-level `step`, whose own `state` output
+/// field is itself a **freshly rebuilt** `DenseState`/`NetworkState` (`{w:
+/// rw.1, b: rb.1}`) — one level of `Resolved::Struct`, not `Param`, so the
+/// old single-level check found nothing at all for it, silently missing an
+/// alias fact that genuinely holds two or three levels down (`"1.w"`,
+/// `"1.l4.b"`) — the exact gap that let `Sgd`'s own unchanged-`state`
+/// passthrough (`stdlib/optim/optim.cleave`) go undetected through
+/// composition, a real, reproducible double-release in `examples/mnist-
+/// interop` (`doc/backlog.md`) diagnosed down to this exact function before
+/// this fix.
+fn collect_field_aliases(
+    v: CVar,
+    prefix: &str,
+    params_ordered: &[CVar],
+    params_set: &HashSet<CVar>,
+    defs: &HashMap<CVar, ValueDef>,
+    alias_fns: &AliasFns,
+    out: &mut HashMap<String, (usize, Vec<String>)>,
+) {
+    let index_of = |p: CVar| params_ordered.iter().position(|&x| x == p);
+    match finalize(resolve(v, params_set, defs, alias_fns), params_set, defs, alias_fns) {
+        Resolved::Param(p, path) => {
+            if let Some(idx) = index_of(p) {
+                out.insert(prefix.to_string(), (idx, path));
+            }
+        }
+        Resolved::Struct(fields) => {
+            for (name, &fv) in fields {
+                let key = if prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{prefix}.{name}")
+                };
+                collect_field_aliases(fv, &key, params_ordered, params_set, defs, alias_fns, out);
+            }
+        }
+        Resolved::Local(..) | Resolved::Call(..) | Resolved::Opaque => {}
+    }
+}
+
+/// One function's own `AliasFns` entry — every output field that resolves
+/// identically on *every* reachable terminal return (an empty map if the
+/// function has none, or if any two return sites disagree on a given
+/// field — `HashMap::retain`'s own intersection below).
+fn function_param_aliases(top: &CTopLevelFn, alias_fns: &AliasFns) -> HashMap<String, (usize, Vec<String>)> {
+    let params_ordered: Vec<CVar> = top
+        .def
+        .params
+        .iter()
+        .copied()
+        .filter(|&p| p != top.k_ret)
+        .collect();
+    if params_ordered.is_empty() {
+        return HashMap::new();
+    }
+    let params_set: HashSet<CVar> = params_ordered.iter().copied().collect();
+    let defs = collect_value_defs(top);
+    let mut return_vars = Vec::new();
+    walk_return_sites(&top.def.body, top.k_ret, &mut return_vars);
+    let Some((&first, rest)) = return_vars.split_first() else {
+        return HashMap::new();
+    };
+    let mut acc = return_field_aliases(first, &params_ordered, &params_set, &defs, alias_fns);
+    for &r in rest {
+        let other = return_field_aliases(r, &params_ordered, &params_set, &defs, alias_fns);
+        acc.retain(|k, v| other.get(k) == Some(v));
+    }
+    acc
+}
+
+/// Whole-program: for every top-level function, which of its own output
+/// fields (`""` for the return value as a whole) always resolve back to one
+/// of its own parameters — the generalization of `collect_identity_param_
+/// fns` from "the *entire* return value is literally one parameter" to "one
+/// *field* of it is" (`Optimizer::step`'s own real shape: `state`, field
+/// `"1"` of its `(Model, State)` return, aliases its own `state` parameter;
+/// `model`, field `"0"`, does not — `identity_fns` alone could never
+/// express this, since it only ever names *one* index for the *whole*
+/// return).
+///
+/// **Why a fixpoint, exactly like `collect_identity_param_fns`'s own**: a
+/// *composing* level (`Network`-level `Optimizer::step`, built by calling
+/// `Dense`-level `Optimizer::step` once per layer and re-assembling the
+/// results into a `NetworkState`) only reveals its own alias fact once the
+/// `Dense`-level callee's own fact is already known — `resolve`'s own
+/// `advance_call` looks the callee up in whatever `alias_fns` this pass has
+/// built *so far*, so repeating until a full pass adds nothing new lets a
+/// chain of any depth (`Network` -> `Dense` -> `Sgd`) converge. Monotonic
+/// and terminating for the identical reason `collect_identity_param_fns`
+/// is: `resolve` can only find *more* things `Param`-shaped as `alias_fns`
+/// grows, entries once found are deterministic (never retracted), and
+/// there's a hard upper bound of `programs.funcs.len()` distinct facts.
+///
+/// **Consulted only by `redundant_leaf_key`, deliberately not folded into
+/// `identity_fns` itself**: the two exist for genuinely different callers
+/// (`identity_fns`'s own `identity_alias_var` use, `rewrite_body`'s `Fix`
+/// arm, needs a single `CVar`, not a field-keyed map) and merging them
+/// would only add risk to the already-tested `identity_fns` path for no
+/// real benefit — this is strictly additive alongside it.
+pub(crate) fn collect_param_alias_fns(program: &CpsProgram) -> AliasFns {
+    let mut alias_fns: AliasFns = HashMap::new();
+    loop {
+        let mut changed = false;
+        for top in &program.funcs {
+            let computed = function_param_aliases(top, &alias_fns);
+            let existing = alias_fns.entry(top.def.name.clone()).or_default();
+            for (field, value) in computed {
+                if existing.get(&field) != Some(&value) {
+                    existing.insert(field, value);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return alias_fns;
+        }
+    }
+}
+
+/// Whether `v`'s own value is *exactly* (never a copy of) something else
+/// this same scope can independently reach — either one of this function's
+/// own borrowed formal parameters (`Resolved::Param`), or a plain local
+/// computation reached the same, consistent way from more than one
+/// derivation chain (`Resolved::Local`) — resolved transitively through any
+/// number of `Field`/`Struct`/known-transparent-`Call` reconstructions in
+/// between (`ValueDef`'s/`Resolved`'s own doc comments: all three are
 /// transparent, denote the identical underlying value, never a new one).
 ///
 /// **What this exists to fix, found by direct testing against the real
@@ -980,38 +1526,61 @@ fn resolve_leaf<'a>(
 /// until *something else* later reused the same freed block and the
 /// dangling reference read or wrote through it.
 ///
+/// **`Resolved::Local` widens this to the identical bug's own *local*
+/// twin, found the same way, in the same function, once the first fix
+/// alone didn't make the crash go away**: `Optimizer::step`'s own body
+/// reads a just-constructed local `Dense`'s `.w` leaf twice — once directly
+/// off the sub-struct, once again through the *outer* `Network` it was
+/// just embedded into (plain, transparent `StructCtor`/`Field` unwrapping,
+/// `Resolved::Local`'s own doc comment has the exact chain) — neither
+/// occurrence traces back to a function *parameter* at all, so the
+/// `Param`-only version of this fix never saw it; a hardware watchpoint on
+/// the real crashing allocation confirmed both release call sites load the
+/// identical stack slot, with zero writes to it in between.
+///
 /// Deliberately narrow — only ever consulted at a function's own **true**
 /// return (`rewrite_body`'s own `CExpr::App` arm, guarded on `func ==
 /// k_ret`), never at an ordinary call/loop tail-call, where the existing
-/// `live_set`-based protection is already exactly right. A leaf that
-/// *isn't* provably param-traced (any real computation anywhere in its own
+/// `live_set`-based protection is already exactly right. A leaf that isn't
+/// provably traced back to *something* this same scope can reach another
+/// way (any real, non-transparent computation anywhere in its own
 /// derivation chain) resolves to `None` here, exactly like today —
 /// strictly additive, never loosens an existing, already-correct release.
 ///
-/// **Returns the dedup key itself (`Some((param, field_path))`), not just a
-/// bool — found necessary, not a nicety, by a second real bug this fix's
+/// **Returns the dedup key itself (`Some((origin, field_path))`), not just
+/// a bool — found necessary, not a nicety, by a second real bug this fix's
 /// own first version introduced**: `owned`'s own pre-existing redundancy
 /// (a light struct nested inside another gets tracked as *two* separate
 /// `to_release` entries — its own, and again transitively through the
 /// outer one — true for `net`'s leaves too, symmetric there since *both*
-/// copies get an equally redundant retain) means a single param-traced leaf
-/// can appear here more than once in the very same `wrap_releases` call.
+/// copies get an equally redundant retain) means a single traced leaf can
+/// appear here more than once in the very same `wrap_releases` call.
 /// Skipping *every* occurrence (this fix's own first version) leaves the
 /// matching retains uncompensated — a real leak (`v749.l1.w`'s own count
 /// growing by one every single training-loop iteration, unbounded).
-/// Skipping only the *first* occurrence per key (`wrap_releases`'s own
-/// `skip_once` set) restores exactly the same "one retain answered by one
-/// release" balance the ordinary (non-param-traced) case already has,
-/// letting the *other*, redundant occurrence release normally, same as
-/// before this fix existed at all.
-fn param_leaf_key(
+/// Skipping all but the *last* occurrence per key (`wrap_releases`'s own
+/// `skip_remaining` count, keyed on the same total-occurrence count this
+/// function's own caller precomputes) restores exactly the same "one retain
+/// answered by one release" balance the ordinary (non-traced) case already
+/// has, letting exactly one occurrence release normally, same as before
+/// this fix existed at all — **skipping only the first occurrence
+/// unconditionally (an earlier version of this fix) is a real, distinct
+/// bug of its own for a key seen 3+ times**, found by direct testing
+/// against a real crash: `Optimizer::step<Sgd,Network,NetworkState<...>>`'s
+/// own body reads one freshly-computed leaf back out through *two*
+/// different outer structs on top of its own direct binding (three
+/// occurrences of the identical key), and "skip only the first" still
+/// released two of the three — one too many.
+fn redundant_leaf_key(
     var: CVar,
     steps: &[(Ty, String)],
     params: &HashSet<CVar>,
     defs: &HashMap<CVar, ValueDef>,
+    alias_fns: &AliasFns,
 ) -> Option<(CVar, Vec<String>)> {
-    match resolve_leaf(var, steps, params, defs) {
+    match resolve_leaf(var, steps, params, defs, alias_fns) {
         Resolved::Param(p, path) => Some((p, path)),
+        Resolved::Local(origin, path) => Some((origin, path)),
         _ => None,
     }
 }
@@ -1047,12 +1616,41 @@ struct RefcountCtx<'a> {
     /// `RefcountCtx` itself being rebuilt fresh for each `top` in `insert_
     /// refcounting`'s own loop.
     params: &'a HashSet<CVar>,
-    /// `param_leaf_key`'s own `Field`/`StructCtor` lookup table for this
+    /// `redundant_leaf_key`'s own `Field`/`StructCtor` lookup table for this
     /// one function's own body — see that function's own doc comment.
     value_defs: &'a HashMap<CVar, ValueDef>,
+    /// See `collect_identity_param_fns`'s own doc comment — whole-program,
+    /// not per-function, like `struct_schemas`/`mlir_types` above.
+    identity_fns: &'a HashMap<String, usize>,
+    /// See `collect_param_alias_fns`'s own doc comment — whole-program, the
+    /// generalization of `identity_fns` above from "whole return value" to
+    /// "one output field/leaf of it", consulted by `redundant_leaf_key` (via
+    /// `resolve`/`advance_call`) to see through a composed call chain like
+    /// `Network`-level `Optimizer::step` calling down into `Dense`-level
+    /// then `Sgd`-leaf-level, not just direct `Field`/`StructCtor` hops.
+    param_alias_fns: &'a AliasFns,
+    /// TEMP, diagnosing the still-open `mnist-interop` double-release
+    /// (`doc/backlog.md`) — the top-level function `wrap_releases` is
+    /// currently processing, for a debug print showing exactly which keys
+    /// it detects as redundant. Remove alongside that print once the bug
+    /// causing `[rbx+0x128]`'s own double-release is found.
+    fn_name: &'a str,
 }
 
 impl RefcountCtx<'_> {
+    /// The one authoritative answer, throughout this whole module, to "does
+    /// a bare `CVar` of this type need independent retain/release
+    /// accounting of its own" — folds in `is_bare_tensor_ty` alongside the
+    /// free `is_refcounted` function, so every one of this method's own
+    /// callers (construction-site seeding, retain-on-embed, retain-on-
+    /// read, the `Fix` arm's own transferred-argument seeding, `wrap_
+    /// releases`'s own dispatch) gets bare-tensor coverage automatically,
+    /// in one place, rather than each needing its own separate `||
+    /// is_bare_tensor_ty(...)` bolted on piecemeal. **Not** folded into the
+    /// free `is_refcounted` function itself — that one is also consulted
+    /// by `mlir_lower.rs` for representation-*shape* decisions (pointer-vs-
+    /// native-tensor field storage), a genuinely different question this
+    /// method's own callers never ask.
     fn is_rc(&self, ty: &Ty) -> bool {
         is_refcounted(
             ty,
@@ -1061,7 +1659,7 @@ impl RefcountCtx<'_> {
             self.constructed_structs,
             self.field_mutated_structs,
             self.extern_boundary_structs,
-        )
+        ) || is_bare_tensor_ty(ty, self.mlir_types)
     }
 
     /// Every genuinely-refcounted field reachable from `ty`'s own top
@@ -1117,6 +1715,8 @@ pub fn insert_refcounting(
     let constructed_structs = collect_constructed_struct_names(&program);
     let field_mutated_structs = collect_field_mutated_struct_names(&program);
     let extern_boundary_structs = collect_extern_boundary_struct_names(&program);
+    let identity_fns = collect_identity_param_fns(&program);
+    let param_alias_fns = collect_param_alias_fns(&program);
     let op_lines = program.op_lines;
     let funcs = program
         .funcs
@@ -1131,7 +1731,9 @@ pub fn insert_refcounting(
             collect_local_claim_vars(&top, &mut local_claim_vars);
             let params: HashSet<CVar> = top.def.params.iter().copied().collect();
             let value_defs = collect_value_defs(&top);
+            let fn_name = top.def.name.clone();
             let ctx = RefcountCtx {
+                fn_name: &fn_name,
                 struct_schemas,
                 mlir_types,
                 constructed_structs: &constructed_structs,
@@ -1144,6 +1746,8 @@ pub fn insert_refcounting(
                 fresh: &fresh,
                 params: &params,
                 value_defs: &value_defs,
+                identity_fns: &identity_fns,
+                param_alias_fns: &param_alias_fns,
             };
             insert_refcounting_fn(top, &ctx)
         })
@@ -1412,7 +2016,7 @@ fn rewrite_body(
             let to_release = releases_for_app(&func, &args, owned, ctx);
             // The function's own *true* return (as opposed to a real
             // call's own dispatch or a loop's own back-edge, both still
-            // handled exactly as before) — `param_leaf_key`'s own doc
+            // handled exactly as before) — `redundant_leaf_key`'s own doc
             // comment has the full story: a leaf embedded in this exact
             // return value that's provably still the identical object one
             // of this function's own parameters already denotes was never
@@ -1423,7 +2027,7 @@ fn rewrite_body(
             // ::Field`'s ownership rule says so explicitly).
             // At this function's own *true* return (as opposed to a real
             // call's own dispatch or a loop's own back-edge, both still
-            // released exactly as before) — `param_leaf_key`'s own
+            // released exactly as before) — `redundant_leaf_key`'s own
             // doc comment has the full story: a leaf still reachable
             // through one of this function's own parameters was never
             // this function's own to give away a second time here (its
@@ -1505,19 +2109,35 @@ fn rewrite_body(
             // never claims it either (excluded from `local_claim_vars` by
             // the intermediate ancestor already claiming it) — the exact
             // same "no scope ever gets a turn" gap, one level removed.
-            let (to_release, transferred, entry_arg_vars): (
+            let (to_release, transferred, entry_arg_vars, identity_alias_var): (
                 Vec<(CVar, Ty)>,
                 Vec<(CVar, Ty)>,
                 HashSet<CVar>,
+                Option<CVar>,
             ) = match body.as_ref() {
                 CExpr::App { func, args } => {
                     let live: HashSet<CVar> = live_set(func, args, ctx);
                     let arg_vars: HashSet<CVar> = args.iter().filter_map(as_var).collect();
                     let (transferred, to_release) =
                         owned.into_iter().partition(|(v, _)| live.contains(v));
-                    (to_release, transferred, arg_vars)
+                    // If `func` names a callee `collect_identity_param_fns`
+                    // proved hands one of its own arguments straight back
+                    // as its result (`println`/`Print<T>::print` are the
+                    // real instances), resolve *which* argument variable
+                    // that is here, once — see `aliases_ret_param` below,
+                    // which replaces an earlier, coarser same-*type* guess
+                    // with this exact fact.
+                    let identity_alias_var = match func {
+                        CVal::Label(callee) => ctx
+                            .identity_fns
+                            .get(callee)
+                            .and_then(|&idx| args.get(idx))
+                            .and_then(as_var),
+                        _ => None,
+                    };
+                    (to_release, transferred, arg_vars, identity_alias_var)
                 }
-                _ => (Vec::new(), owned, HashSet::new()),
+                _ => (Vec::new(), owned, HashSet::new(), None),
             };
 
             let new_defs = defs
@@ -1536,6 +2156,17 @@ fn rewrite_body(
                     // own leaves every single iteration, the identical
                     // "no scope ever gets a turn" gap this function's own
                     // doc comment already describes for a different case.
+                    //
+                    // A *bare* `Tensor` (never wrapped in any struct) needs
+                    // seeding here too, for the identical reason, one level
+                    // simpler — `ctx.is_rc` itself now covers it (see its
+                    // own doc comment), so without this a bare tensor
+                    // returned from a real call and then consumed only as a
+                    // borrowed argument never gets tracked for release at
+                    // all — a real, confirmed leak (`doc/backlog-done.md`'s
+                    // own "Scale::scale leak" writeup). `wrap_releases`
+                    // already knows how to emit a plain `Release` for
+                    // exactly this shape.
                     let needs_seed =
                         |ty: &Ty| ctx.is_rc(ty) || !ctx.light_release_leaves(ty).is_empty();
                     if let Some(fv) = ctx.local_claim_vars.get(&def.name) {
@@ -1636,13 +2267,13 @@ fn rewrite_body(
                         // *return value* as its sole parameter, and
                         // `collect_var_info` already seeded that param above
                         // (`owned_origin.insert(*p, true)` for the real-call
-                        // shape). When a transferred *literal argument*
-                        // shares that parameter's type, the callee may
-                        // forward that very allocation straight back out as
-                        // its result rather than build a fresh one —
-                        // `stdlib/io`'s own `Print::print`/`println` are
-                        // literally `fn(x) -> x`. Seeding the argument *as
-                        // well as* the return-value param then releases one
+                        // shape). When a transferred *literal argument* is
+                        // the exact one `collect_identity_param_fns` proved
+                        // this callee hands straight back out as its own
+                        // result (`identity_alias_var`, resolved once above)
+                        // — `stdlib/io`'s own `Print::print`/`println` are
+                        // the real instances — seeding the argument *as
+                        // well as* the return-value param would release one
                         // allocation twice: a real double-free, found via
                         // the size-class pool as two back-to-back `cleave_
                         // release` calls on the same 12-byte tuple from
@@ -1651,20 +2282,26 @@ fn rewrite_body(
                         // corrupted, misaligned-pointer crash one pop
                         // later). The return-value param already owns that
                         // resource, so the aliasing argument is skipped
-                        // here. A callee that instead genuinely consumes
-                        // such an argument and returns a *fresh* value of
-                        // the same type would now leak it — accepted:
-                        // strictly better than the use-after-free, and that
-                        // shape (take `T` by value, ignore it, return a new
-                        // `T`) is not one this stdlib actually has.
-                        let resumption_ret_tys: Vec<&Ty> = if is_loop {
-                            Vec::new()
-                        } else {
-                            def.params
-                                .iter()
-                                .filter_map(|p| ctx.var_types.get(p))
-                                .collect()
-                        };
+                        // here.
+                        //
+                        // **Replaces an earlier, coarser version of this
+                        // same guard** that matched on the argument's own
+                        // *type* equalling the resumption's own parameter
+                        // type instead of resolving real identity — a real,
+                        // confirmed false positive for any ordinary
+                        // *struct*-returning function computing a genuinely
+                        // *new* value of the same struct type as one of its
+                        // own arguments (a plain `fn combine(a: Boxed, b:
+                        // Boxed) -> Boxed`, say): the type-based guess
+                        // wrongly treated such an argument as aliased into
+                        // the call's own return, silently leaking it. See
+                        // `collect_identity_param_fns`'s own doc comment for
+                        // why this specific fix, despite the family
+                        // resemblance, is *not* the same thing as `doc/
+                        // backlog-done.md`'s own "Scale::scale leak" entry
+                        // (a bare, never-struct-wrapped `Tensor` value never
+                        // reaches this code path at all — set aside there,
+                        // not fixed).
                         for (v, ty) in &transferred {
                             let is_entry_arg = entry_arg_vars.contains(v);
                             // Only an argument this call is the *last* use of
@@ -1672,10 +2309,13 @@ fn rewrite_body(
                             // if the resumption still needs it (a free
                             // variable of `def` -- e.g. `net`, passed to
                             // `net_grad` here and then again to `Optimizer::
-                            // step` in the same resumption), the type match
-                            // is a coincidence (`net_grad: Network ->
-                            // Network` returns a *fresh* gradient), and it
-                            // must still be seeded.
+                            // step` in the same resumption), it can't
+                            // possibly be the exact same allocation the call
+                            // itself already handed back once — `net_grad`
+                            // was never `identity_alias_var` in the first
+                            // place (it returns a *fresh* gradient), but a
+                            // future identity-shaped callee sharing a
+                            // free-variable argument would hit this too.
                             let arg_needed_later = ctx
                                 .local_free_vars
                                 .get(&def.name)
@@ -1683,7 +2323,7 @@ fn rewrite_body(
                             let aliases_ret_param = !is_loop
                                 && is_entry_arg
                                 && !arg_needed_later
-                                && resumption_ret_tys.iter().any(|rt| *rt == ty);
+                                && identity_alias_var == Some(*v);
                             if (!is_loop || !is_entry_arg)
                                 && !aliases_ret_param
                                 && seen.insert(*v)
@@ -1738,7 +2378,7 @@ fn rewrite_body(
             // *bare* `CExpr::App` arm above (a `Fix` wrapping an `App` as
             // its own trailing `body` is either a real call's own
             // resumption or a loop's own back-edge/entry, both still
-            // released exactly as before `param_leaf_key` existed).
+            // released exactly as before `redundant_leaf_key` existed).
             wrap_releases(to_release, fix_node, ctx, false)
         }
     }
@@ -1841,38 +2481,128 @@ fn releases_for_app(
 /// tracked at all — a real, per-construction leak, not hypothetical.
 /// `at_true_return`: whether `inner` is this function's own real `k_ret`
 /// dispatch (as opposed to a real call's own resumption or a loop's own
-/// back-edge/entry) — see `param_leaf_key`'s own doc comment for why
+/// back-edge/entry) — see `redundant_leaf_key`'s own doc comment for why
 /// that's the *only* place a light struct's own leaf can be safely skipped
 /// here: everywhere else, `owned`/`to_release` (this function's own callers,
 /// `releases_for_app`) already correctly means "this scope is genuinely
 /// done with it", true release-target aliasing or not.
 ///
-/// `skip_once` (`param_leaf_key`'s own doc comment has the full story) is
-/// scoped to this one call — a fresh, empty set per `wrap_releases` call,
-/// not threaded in from outside — since it exists only to de-duplicate
-/// `to_release`'s own pre-existing redundancy *within* this exact release
-/// point, never across two different ones.
+/// `skip_remaining` (`redundant_leaf_key`'s own doc comment has the full
+/// story) is scoped to this one call — a fresh map per `wrap_releases`
+/// call, not threaded in from outside — since it exists only to de-
+/// duplicate `to_release`'s own pre-existing redundancy *within* this
+/// exact release point, never across two different ones.
 fn wrap_releases(to_release: Vec<(CVar, Ty)>, inner: CExpr, ctx: &RefcountCtx, at_true_return: bool) -> CExpr {
     let mut result = inner;
-    let mut skip_once: HashSet<(CVar, Vec<String>)> = HashSet::new();
+    // How many times does each `redundant_leaf_key` actually appear across
+    // this *whole* `to_release` list — computed once, up front, before
+    // deciding what to skip. Needed since `Resolved::Local` widened
+    // `redundant_leaf_key`'s own resolution: unlike `Resolved::Param` (a
+    // borrowed parameter is never seeded into `owned` at all, so it can
+    // only ever reach `to_release` via the redundant-nested-light-struct
+    // path, i.e. count >= 2 always), a `Resolved::Local` leaf can appear
+    // here completely legitimately, exactly once, needing its one real
+    // release — skipping that (found the hard way, a real regression: a
+    // freshly-combined struct's own result silently never released at all)
+    // would be a leak, not a fix. Only ever skip a key genuinely seen more
+    // than once.
+    // Computed once, up front, for every scope alike — the real *skip*
+    // decision below no longer gates on `at_true_return` at all (see its
+    // own updated comment): a shared key really is the identical value
+    // regardless of which kind of tail call this cascade sits in front of.
+    let mut key_counts: HashMap<(CVar, Vec<String>), u32> = HashMap::new();
+    for (var, ty) in &to_release {
+        if ctx.is_rc(ty) {
+            if let Some(key) = redundant_leaf_key(*var, &[], ctx.params, ctx.value_defs, ctx.param_alias_fns) {
+                *key_counts.entry(key).or_insert(0) += 1;
+            }
+        } else {
+            for leaf in ctx.light_release_leaves(ty) {
+                if let Some(key) =
+                    redundant_leaf_key(*var, &leaf.steps, ctx.params, ctx.value_defs, ctx.param_alias_fns)
+                {
+                    *key_counts.entry(key).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    // TEMP, diagnosing the still-open `mnist-interop` double-release
+    // (`doc/backlog.md`) -- shows every `to_release` entry any `wrap_
+    // releases` call sees (not just a true return, now — the `[rbx+0x128]`
+    // instance turned out to be there, but a second, still-unexplained
+    // instance at a different offset survived that fix, so this now also
+    // covers non-true-return scopes, purely to see where redundancy shows
+    // up, even though the real skip logic below stays correctly gated on
+    // `at_true_return` only). Remove alongside `RefcountCtx::fn_name` once
+    // the bug causing the double-release is found.
+    if std::env::var("CLEAVE_TRACE_DEDUP").is_ok() && !to_release.is_empty() {
+        eprintln!(
+            "wrap_releases[{}]{}: {} to_release entries",
+            ctx.fn_name,
+            if at_true_return { " (true return)" } else { "" },
+            to_release.len()
+        );
+        for (var, ty) in &to_release {
+            if ctx.is_rc(ty) {
+                let key = redundant_leaf_key(*var, &[], ctx.params, ctx.value_defs, ctx.param_alias_fns);
+                let count = key.as_ref().map(|k| key_counts.get(k).copied().unwrap_or(0));
+                eprintln!("  v{var} -> key={key:?} count={count:?}");
+            } else {
+                for leaf in ctx.light_release_leaves(ty) {
+                    let field_path: Vec<&str> = leaf.steps.iter().map(|(_, f)| f.as_str()).collect();
+                    let key = redundant_leaf_key(*var, &leaf.steps, ctx.params, ctx.value_defs, ctx.param_alias_fns);
+                    let count = key.as_ref().map(|k| key_counts.get(k).copied().unwrap_or(0));
+                    eprintln!("  v{var}.{} -> key={key:?} count={count:?}", field_path.join("."));
+                }
+            }
+        }
+    }
+    // How many *more* occurrences of each key still need skipping — `count
+    // - 1` up front (exactly one occurrence must always survive to do the
+    // real release), decremented as each redundant occurrence is actually
+    // skipped below. Found necessary by direct testing, not assumed: a key
+    // genuinely seen 3+ times (not just the 2 the original "Sgd state never
+    // changes" fix was calibrated against — `Network`-level `Optimizer::
+    // step`'s own body reads a freshly-computed leaf back out through *two*
+    // different outer structs, `Dense` then `Network`, on top of its own
+    // direct binding) still released 2 of its 3 occurrences under the old
+    // "skip only the very first, release every other" policy — one too
+    // many, the exact shape of the real, reproducible `mnist-interop`
+    // double-release this fix closes.
+    let mut skip_remaining: HashMap<(CVar, Vec<String>), u32> = key_counts
+        .iter()
+        .filter(|&(_, &count)| count >= 2)
+        .map(|(key, &count)| (key.clone(), count - 1))
+        .collect();
     for (var, ty) in to_release.into_iter().rev() {
-        // `is_bare_tensor_ty` alongside `is_rc` here — a bare `Tensor`
-        // (never wrapped in any struct) needs the identical plain `Release`
-        // this branch already emits, not the light-struct-leaf-chain one
-        // below (`ctx.light_release_leaves(&ty)` is *always* empty for a
-        // `Tensor` itself, `is_bare_tensor_ty`'s own doc comment) — without
-        // this, a value seeded here by the transferred-argument fix
-        // (`rewrite_body`'s own `Fix` arm) would silently route into the
-        // light branch and get *zero* releases emitted for it at all.
-        if ctx.is_rc(&ty) || is_bare_tensor_ty(&ty, ctx.mlir_types) {
-            if at_true_return {
-                if let Some(key) = param_leaf_key(var, &[], ctx.params, ctx.value_defs) {
-                    // First redundant occurrence of this exact param-
-                    // traced value: skip it, matching the one still-
-                    // outstanding compensating retain (`param_leaf_key`'s
-                    // own doc comment). Any *further* occurrence releases
-                    // normally, exactly as before this fix existed.
-                    if skip_once.insert(key) {
+        // `ctx.is_rc` itself now covers a bare `Tensor` (never wrapped in
+        // any struct) too, so it gets the identical plain `Release` this
+        // branch already emits, not the light-struct-leaf-chain one below
+        // (`ctx.light_release_leaves(&ty)` is always empty for a `Tensor`
+        // itself) — without this, a value seeded by `needs_seed`'s own
+        // bare-tensor case (`rewrite_body`'s own `Fix` arm) would silently
+        // route into the light branch and get zero releases emitted.
+        if ctx.is_rc(&ty) {
+            if let Some(key) = redundant_leaf_key(var, &[], ctx.params, ctx.value_defs, ctx.param_alias_fns) {
+                // A redundant occurrence of this exact traced value still
+                // outstanding: skip it, matching one of its own still-
+                // uncompensated retains (`redundant_leaf_key`'s own doc
+                // comment). Once every redundant occurrence has been
+                // skipped, the *last* remaining one releases normally,
+                // exactly as before this fix existed. Applies regardless of
+                // `at_true_return` — `resolve()`'s own guarantee (two
+                // entries sharing a key really are the identical value) is
+                // scope-independent; the real, reproducible `mnist-interop`
+                // double-release this closes fires at an ordinary loop
+                // back-edge tail call (`state = r.1;`), never at a true
+                // return, so gating the skip on `at_true_return` (the
+                // original design, before `Optimizer::step`'s own alias
+                // fact could even be found through `Dense`/`Network`-level
+                // composition — `collect_field_aliases`'s own doc comment)
+                // silently left this exact case unprotected.
+                if let Some(remaining) = skip_remaining.get_mut(&key) {
+                    if *remaining > 0 {
+                        *remaining -= 1;
                         continue;
                     }
                 }
@@ -1887,14 +2617,19 @@ fn wrap_releases(to_release: Vec<(CVar, Ty)>, inner: CExpr, ctx: &RefcountCtx, a
             };
         } else {
             let mut leaves = ctx.light_release_leaves(&ty);
-            if at_true_return {
-                leaves.retain(|leaf| {
-                    match param_leaf_key(var, &leaf.steps, ctx.params, ctx.value_defs) {
-                        Some(key) => !skip_once.insert(key),
-                        None => true,
-                    }
-                });
-            }
+            // Same scope-independent skip as the `is_rc` branch above.
+            leaves.retain(|leaf| {
+                match redundant_leaf_key(var, &leaf.steps, ctx.params, ctx.value_defs, ctx.param_alias_fns) {
+                    Some(key) => match skip_remaining.get_mut(&key) {
+                        Some(remaining) if *remaining > 0 => {
+                            *remaining -= 1;
+                            false
+                        }
+                        _ => true,
+                    },
+                    None => true,
+                }
+            });
             result = wrap_light_leaves(ctx, var, &leaves, PrimOp::Release, result);
         }
     }
@@ -1917,6 +2652,30 @@ fn wrap_light_leaves(
 ) -> CExpr {
     let mut result = inner;
     for leaf in leaves.iter().rev() {
+        // TEMP, diagnosing the still-open `mnist-interop` double-release
+        // (`doc/backlog.md`) -- `build_leaf_chain`'s own terminal release/
+        // retain fires on a *freshly synthesized* CVar (the last `PrimOp::
+        // Field` projection's own result), never `base` itself once `leaf.
+        // steps` is non-empty, so `CLEAVE_TRACE_DEDUP`'s own "v{base}.
+        // {path}" labels can't be matched back to `cleave_release_tagged`'s
+        // runtime tag (that tag is exactly this projected CVar) without
+        // this print. Remove alongside `CLEAVE_TAG_RELEASES` once the bug
+        // is found.
+        if std::env::var("CLEAVE_TAG_RELEASES").is_ok() {
+            let field_path: Vec<&str> = leaf.steps.iter().map(|(_, f)| f.as_str()).collect();
+            // `build_leaf_chain` allocates one fresh `CVar` per remaining
+            // field-projection step, then one final one for the terminal
+            // release/retain itself -- that last one (`leaf.steps.len()`
+            // allocations ahead of whatever `peek_next()` reports right
+            // now) is the exact `ptr_var` `mlir_lower.rs`'s `PrimOp::
+            // Release` arm sees, i.e. the tag `cleave_release_tagged`
+            // reports at runtime.
+            eprintln!(
+                "CLEAVE_TAG_RELEASES: leaf chain for v{base}.{} ends at fresh CVar v{}",
+                field_path.join("."),
+                ctx.fresh.peek_next() + leaf.steps.len() as u32
+            );
+        }
         result = build_leaf_chain(ctx, CVal::Var(base), &leaf.steps, &leaf.leaf_ty, terminal, result);
     }
     result

@@ -15,6 +15,7 @@ use crate::diag::{Diagnostic, SourceMap};
 use crate::dps_rewrite::eliminate_redundant_field_store_copies;
 use crate::egraph::{DerivativeRequest, optimize_program, synthesize_derivatives};
 use crate::mlir_lower::lower_program;
+use crate::compensate_refcounts::{compensate_merged_refcounts, suppress_bufferization_owned_releases};
 use crate::redundant_copy_elim::eliminate_self_copies;
 use crate::refcount::insert_refcounting;
 use crate::registry::Registry;
@@ -333,6 +334,10 @@ pub unsafe fn register_cleave_rt_symbols(engine: &melior::ExecutionEngine) {
         engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
         engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
         engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
+        engine.register_symbol(
+            "cleave_release_tagged",
+            cleave_rt::cleave_release_tagged as *mut (),
+        );
         engine.register_symbol(
             "cleave_release_void",
             cleave_rt::cleave_release_void as *mut (),
@@ -768,6 +773,20 @@ pub fn lower_to_llvm<'c>(
         ]);
     }
 
+    // TEMP, diagnosing the still-open `mnist-interop` double-release
+    // (`doc/backlog.md`) -- one-shot-bufferize's own equivalence/in-place-
+    // reuse analysis is the current leading hypothesis (every CPS-level
+    // mechanism this session tried finds nothing, and the two colliding
+    // pointers show no shared SSA value anywhere in the final lowered IR
+    // either -- if bufferization decided two *tensor*-level values could
+    // share one buffer, that decision leaves no trace after the fact).
+    // Dumps the still-tensor-typed IR right before this pass runs, so it
+    // can be compared against `--dump-mlir-lowered`'s own final memref-
+    // level output for the same construction site.
+    if let Ok(path) = std::env::var("CLEAVE_DUMP_PRE_BUFFERIZE") {
+        std::fs::write(&path, module.as_operation().to_string())
+            .unwrap_or_else(|e| eprintln!("CLEAVE_DUMP_PRE_BUFFERIZE: failed to write {path}: {e}"));
+    }
     let pass_manager = pass::PassManager::new(context);
     pass::bufferization::register_one_shot_bufferize_pass();
     if parse_pass_pipeline(
@@ -825,6 +844,24 @@ pub fn lower_to_llvm<'c>(
     // writable`, so the promise is genuinely true and this pass — reused
     // here as-is, no longer worked around — frees the *copy*, never the
     // struct's own storage.
+    // **Tried and reverted, measured, not assumed** (`doc/backlog.md`'s own
+    // double-release entry): skipping `create_ownership_based_buffer_
+    // deallocation_pass` entirely, on the theory that cleave's own CPS-
+    // level `refcount.rs` could be made the *sole* authority over every
+    // heap allocation (matching how it already is for ordinary structs),
+    // needing no help from MLIR's own liveness analysis at all. Measured
+    // directly against the real kernel, under close memory monitoring:
+    // **12.7GB resident after 10 seconds**, climbing — `refcount.rs` does
+    // *not* actually track the release of most free-standing intermediate
+    // tensor arithmetic today (`unify_alloc.rs`'s own module doc comment is
+    // accurate, not just aspirational: that memory's lifetime genuinely
+    // *is* bufferization's job alone, for the large majority of cases, not
+    // just the few this pass's own `suppress_bufferization_owned_releases`
+    // sibling targets). Making cleave the sole owner of all non-stack
+    // memory, as proposed, remains the right long-term direction — it
+    // would need `refcount.rs` itself extended to explicitly track *every*
+    // tensor's lifetime first (a real, separate undertaking), not just
+    // removing MLIR's own pass ahead of that being true.
     let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::bufferization::create_ownership_based_buffer_deallocation_pass());
     pass_manager.add_pass(pass::bufferization::create_buffer_deallocation_simplification_pass());
@@ -834,6 +871,25 @@ pub fn lower_to_llvm<'c>(
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (buffer-deallocation)".to_string(),
         ]);
+    }
+
+    // A second, independent double-release mechanism from `compensate_
+    // merged_refcounts` (below, at the very end) -- see `compensate_
+    // refcounts.rs::suppress_bufferization_owned_releases`'s own doc
+    // comment for the full root-cause trace and why this one specifically
+    // must run *here*, right after buffer-deallocation and before
+    // `--convert-to-llvm`, not alongside the other one at the end.
+    suppress_bufferization_owned_releases(context, &mut *module);
+
+    // TEMP, diagnosing the still-open `mnist-interop` double-release
+    // (`doc/backlog.md`) -- dumps the module right after `--ownership-
+    // based-buffer-deallocation`/`--lower-deallocations`, memref-level, so
+    // the real conditional-ownership `scf.if`/`memref.dealloc` shape this
+    // pass generates is visible before `--convert-to-llvm` turns it into
+    // opaque `llvm.call @free`. Remove once the bug is found.
+    if let Ok(path) = std::env::var("CLEAVE_DUMP_POST_DEALLOC") {
+        std::fs::write(&path, module.as_operation().to_string())
+            .unwrap_or_else(|e| eprintln!("CLEAVE_DUMP_POST_DEALLOC: failed to write {path}: {e}"));
     }
 
     // `--symbol-dce`, right after `--inline` (above) made every inlined
@@ -1258,6 +1314,18 @@ pub fn lower_to_llvm<'c>(
     // runs *here* specifically (right after `--convert-to-llvm`, not
     // before) and why a blanket rename is sound.
     unify_tensor_allocations(context, &mut *module);
+
+    // Compensates for MLIR's own optimizations merging two independently-
+    // refcounted allocations into one shared pointer once `--inline`
+    // brought their construction sites into the same function body -- see
+    // `compensate_refcounts.rs`'s own module doc comment for the full
+    // root-cause trace, why this is purely additive on top of `refcount.
+    // rs`'s own output, and why it must run here specifically -- at the
+    // very end, alongside `unify_tensor_allocations` right above, not
+    // earlier (found by direct measurement against a real kernel: pointer
+    // identity for these calls' own operands doesn't fully settle until
+    // `--convert-to-llvm` has already run).
+    compensate_merged_refcounts(&mut *module);
 
     stamp_target_cpu(context, module, options)?;
 
@@ -1695,6 +1763,7 @@ const KNOWN_CLEAVE_RT_SYMBOLS: &[&str] = &[
     "cleave_alloc_rc",
     "cleave_retain",
     "cleave_release",
+    "cleave_release_tagged",
     "dynarray_alloc_i8",
     "dynarray_grow_i8",
     "dynarray_get_i8",

@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod callgraph;
+pub mod compensate_refcounts;
 pub mod const_eval;
 pub mod cps;
 pub mod diag;

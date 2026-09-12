@@ -2467,6 +2467,12 @@ fn lower_prim_op<'c>(
             let val = *env
                 .get(ptr_var)
                 .unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{ptr_var}"));
+            // TEMP, diagnostic-only (`cleave-rt::LAST_RELEASE_TAG`'s own doc
+            // comment): tags this release's runtime call with its own
+            // originating CVar id, only when `CLEAVE_TAG_RELEASES=1` at
+            // compile time — never affects an ordinary build or the JIT test
+            // harness (no env var set there), so this is safe to leave in
+            // place until the still-open double-release bug is found.
             // Same tensor-value case as `Retain` above — a tensor leaf has
             // no further nested fields of its own to cascade into
             // (`lower_release_cascade`'s own tensor-field branch already
@@ -2475,7 +2481,7 @@ fn lower_prim_op<'c>(
             // through the struct-shaped cascade at all.
             if native_shape_field_keyword(ctx, rc_ty).is_some() {
                 let ptr_val = tensor_value_to_ptr(ctx, block, val, rc_ty);
-                emit_cleave_release(ctx, block, rc_ty, ptr_val);
+                emit_cleave_release_tagged(ctx, block, rc_ty, ptr_val, *ptr_var);
             } else {
                 lower_release_cascade(ctx, block, rc_ty, val);
             }
@@ -3826,6 +3832,53 @@ fn emit_cleave_release<'c>(
         context,
         FlatSymbolRefAttribute::new(context, "cleave_release"),
         &[ptr_val],
+        &[bool_ty],
+        location,
+    ));
+    call_op.result(0).unwrap().into()
+}
+
+/// TEMP, diagnostic-only: identical to `emit_cleave_release`, but calls
+/// `cleave_release_tagged` (`cleave-rt::LAST_RELEASE_TAG`'s own doc comment)
+/// instead, carrying this release's own originating CVar id, when
+/// `CLEAVE_TAG_RELEASES=1` at compile time — falls back to the ordinary
+/// untagged call otherwise, so this never changes codegen for a normal
+/// build. Remove once the still-open double-release bug (`doc/backlog.md`)
+/// is found.
+fn emit_cleave_release_tagged<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    rc_ty: &Ty,
+    ptr_val: Value<'c, 'c>,
+    tag: CVar,
+) -> Value<'c, 'c> {
+    if std::env::var("CLEAVE_TAG_RELEASES").is_err() {
+        return emit_cleave_release(ctx, block, rc_ty, ptr_val);
+    }
+    let context = ctx.context;
+    let location = gen_loc(context);
+    let bool_ty: Type = IntegerType::new(context, 1).into();
+    let i64_ty: Type = IntegerType::new(context, 64).into();
+    let declared_ty = declared_ptr_sig_ty(ctx, rc_ty);
+    ensure_extern_declared(
+        ctx,
+        "cleave_release_tagged",
+        &[declared_ty, Ty::Con("i64".to_string())],
+        &[bool_ty],
+    );
+    let tag_val: Value = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(i64_ty, tag as i64).into(),
+            location,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let call_op = block.append_operation(func::call(
+        context,
+        FlatSymbolRefAttribute::new(context, "cleave_release_tagged"),
+        &[ptr_val, tag_val],
         &[bool_ty],
         location,
     ));

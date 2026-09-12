@@ -1253,6 +1253,13 @@ impl FreshVars {
         v
     }
 
+    /// TEMP, diagnostic-only (`refcount.rs::wrap_light_leaves`'s own
+    /// `CLEAVE_TAG_RELEASES` trace) -- the `CVar` the *next* `var()` call
+    /// will hand out, without allocating it. Remove alongside that trace.
+    pub(crate) fn peek_next(&self) -> CVar {
+        self.next_var.get()
+    }
+
     pub(crate) fn label(&self, hint: &str) -> String {
         let n = self.next_label.get();
         self.next_label.set(n + 1);

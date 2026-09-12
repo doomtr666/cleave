@@ -14,3 +14,8 @@ edition = "2024"
 # linker to consume).
 [lib]
 crate-type = ["rlib", "staticlib"]
+
+# TEMP debug dependency, root-causing the bare-tensor-seeding fix's own
+# double-release crash (`CLEAVE_DEBUG_POOL`, `lib.rs`) -- remove once done.
+[dependencies]
+backtrace = "0.3"

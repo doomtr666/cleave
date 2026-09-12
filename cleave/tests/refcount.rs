@@ -59,6 +59,30 @@ fn refcounted_cps(src: &str) -> CpsProgram {
     insert_refcounting(cps_program, &struct_schemas, &mlir_types)
 }
 
+/// Like `refcounted_cps` above, but skips `optimize_program`/`eliminate_
+/// dead_code` entirely — for a test that means to exercise `insert_
+/// refcounting` in isolation, without also depending on the e-graph's own
+/// separate, correctly-intentional "see straight through a construct-then-
+/// read-the-same-field call chain" transparency (`doc/backlog-done.md`'s
+/// own "Multi-level call transparency" entry) — which, found directly
+/// while writing the tests below, folds a plain, scalar `struct`-returning
+/// helper's own call away *before* `insert_refcounting` ever sees it,
+/// silently defeating a test that means to check what refcounting does
+/// with the un-inlined call itself.
+fn refcounted_cps_unoptimized(src: &str) -> CpsProgram {
+    let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
+    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+    let registry = Registry::build(&program);
+    if let Err(diags) = check_type_errors(&program, &registry) {
+        panic!("type check failed: {diags:?}");
+    }
+    let units = collect_units(&program, &registry);
+    let cps_program = convert_program(units, None);
+    let struct_schemas = collect_struct_schemas(&program);
+    let mlir_types = collect_mlir_types(&program);
+    insert_refcounting(cps_program, &struct_schemas, &mlir_types)
+}
+
 /// Every struct name any `Retain`/`Release` in `program` targets — walks
 /// every top-level function's own body, recursively through every nested
 /// `Fix`/`If`, mirroring `region_analysis.rs`'s/`refcount.rs`'s own
@@ -774,5 +798,107 @@ fn a_retain_protecting_a_field_read_off_a_borrowed_base_is_never_eliminated() {
         count_retains_for(&program, "Inner") >= 1,
         "store's own retain on `w.x` (a field read off its borrowed `w` parameter) \
          must survive elimination -- got 0"
+    );
+}
+
+/// Regression test for a real, previously-only-observed-on-the-real-kernel
+/// double-release crash (`doc/backlog-done.md`'s own pool-allocator entry:
+/// `println(("Epoch=", epoch))`, `Print::print`/`println` both `fn(x) -> x`)
+/// — a fresh struct passed straight into a genuinely identity-shaped
+/// function (returns its own argument completely unchanged) must be
+/// released *once*, not twice: `identity`'s own resumption already owns the
+/// exact same allocation under a different name (`r`), so the original
+/// binding (`p`) must not *also* be seeded for release.
+#[test]
+fn a_struct_passed_to_a_genuinely_identity_shaped_function_is_released_only_once() {
+    // `tag: [i32; 1]` is load-bearing, not decorative: an all-scalar struct
+    // qualifies as a "light" (bare aggregate value, no heap identity at
+    // all -- `doc/backlog-done.md`'s own struct-allocation-strategy entry)
+    // struct today, which never gets a `Retain`/`Release` of its own in the
+    // first place -- an embedded array field is one of the few remaining,
+    // unconditional disqualifiers (`mlir_lower.rs::is_light_field_ty`),
+    // forcing the real, heap-refcounted path this test actually means to
+    // exercise.
+    let src = "struct Boxed { v: i32, tag: [i32; 1] }
+    fn identity(x: Boxed) -> Boxed { x }
+    fn main() -> i32 {
+        let p = Boxed(v: 5, tag: [0]);
+        let r = identity(p);
+        r.v
+    }";
+    let program = refcounted_cps_unoptimized(src);
+    assert_eq!(
+        count_releases_for(&program, "Boxed"),
+        1,
+        "`p`/`r` are the exact same allocation (identity returns its argument \
+         unchanged) -- exactly one release must be inserted for it, not two \
+         (a real double-free) and not zero (a leak)"
+    );
+    assert_eq!(run_i32(src), 5);
+}
+
+/// Regression test for a real, confirmed leak: a freshly-computed struct,
+/// fed as a literal argument to a further call whose own *return type*
+/// happens to match — but which is **not** actually identity-shaped (it
+/// computes a genuinely new value) — must still be released. An earlier,
+/// coarser version of this same check matched on type alone and wrongly
+/// treated this exact shape as aliased into the call's own return value,
+/// silently dropping the seed and leaking both `make(1)`'s and `make(2)`'s
+/// own results every time. **Not** `doc/backlog-done.md`'s own "Scale::
+/// scale leak" entry — that one turned out to be a bare, never-struct-
+/// wrapped `Tensor` value, a different code path entirely, set aside
+/// rather than fixed (`refcount.rs::collect_identity_param_fns`'s own doc
+/// comment has the full story); this is a real, separate false positive
+/// found building the fix for it.
+#[test]
+fn a_transferred_call_result_matching_the_final_calls_own_return_type_is_still_released() {
+    // `tag` disqualifies `Boxed` from the "light" (no heap identity at all)
+    // representation -- see the identity-function test above for why this
+    // matters here too.
+    let src = "struct Boxed { v: i32, tag: [i32; 1] }
+    fn make(x: i32) -> Boxed { Boxed(v: x, tag: [0]) }
+    fn combine(a: Boxed, b: Boxed) -> Boxed { Boxed(v: a.v + b.v, tag: [0]) }
+    fn main() -> i32 {
+        let r = combine(make(1), make(2));
+        r.v
+    }";
+    let program = refcounted_cps_unoptimized(src);
+    assert_eq!(
+        count_releases_for(&program, "Boxed"),
+        3,
+        "`combine` computes a genuinely new `Boxed`, not one of its own \
+         arguments handed back unchanged -- both `make(1)`'s and `make(2)`'s \
+         own results, plus `combine`'s own result, must each be released \
+         once (3 total), not silently dropped as if aliased"
+    );
+    assert_eq!(run_i32(src), 3);
+}
+
+/// Regression test for the real "Scale::scale leak" (`doc/backlog-done.md`'s
+/// own full writeup): a *bare* `Tensor` (never wrapped in any struct),
+/// returned from a real call and consumed only as a borrowed argument to a
+/// further call, never read again -- the exact shape `Sgd::step`'s own
+/// `Ring::sub(model, Scale::scale(grad, lr))` has. `is_rc(Tensor<...>)` is
+/// `false` by design (a tensor's liberation was only ever wired through a
+/// *containing struct's* own release cascade) -- `needs_seed` (`rewrite_
+/// body`'s own `Fix` arm) must recognize a bare tensor as needing seeding
+/// too, or nothing ever tracks it for release at all.
+#[test]
+fn a_bare_tensor_returned_from_a_call_and_consumed_only_as_a_borrowed_argument_is_released() {
+    let src = "
+        use linalg;
+        fn scale(t: Tensor<f32,3>, k: f32) -> Tensor<f32,3> { Scale::scale(t, k) }
+        fn main() -> f32 {
+            let model = Tensor::<f32,3>(data: [1.0, 2.0, 3.0]);
+            let grad = Tensor::<f32,3>(data: [0.1, 0.2, 0.3]);
+            let r = Ring::sub(model, scale(grad, 0.5));
+            r[0]
+        }
+    ";
+    let program = refcounted_cps(src);
+    assert!(
+        count_releases_for(&program, "Tensor") >= 1,
+        "`scale(grad, 0.5)`'s own bare-tensor result, fed straight into \
+         `Ring::sub` and never read again, must be released -- got 0"
     );
 }
