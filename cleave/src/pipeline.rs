@@ -334,6 +334,10 @@ pub unsafe fn register_cleave_rt_symbols(engine: &melior::ExecutionEngine) {
         engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
         engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
         engine.register_symbol(
+            "cleave_release_tagged",
+            cleave_rt::cleave_release_tagged as *mut (),
+        );
+        engine.register_symbol(
             "cleave_release_void",
             cleave_rt::cleave_release_void as *mut (),
         );
@@ -825,6 +829,18 @@ pub fn lower_to_llvm<'c>(
     // writable`, so the promise is genuinely true and this pass — reused
     // here as-is, no longer worked around — frees the *copy*, never the
     // struct's own storage.
+    // `CLEAVE_DUMP_PRE_BUFFERIZE=<path>` -- dumps the still-tensor-typed IR
+    // right before buffer deallocation runs, so it can be compared against
+    // `--dump-mlir-lowered`'s own final memref-level output for the same
+    // construction site. The pairing matters: one-shot-bufferize's own
+    // equivalence/in-place-reuse decisions leave *no trace* after the fact,
+    // so if two tensor-level values were given one buffer, the only way to
+    // see it is to diff the two sides of this boundary.
+    if let Ok(path) = std::env::var("CLEAVE_DUMP_PRE_BUFFERIZE") {
+        std::fs::write(&path, module.as_operation().to_string())
+            .unwrap_or_else(|e| eprintln!("CLEAVE_DUMP_PRE_BUFFERIZE: failed to write {path}: {e}"));
+    }
+
     let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::bufferization::create_ownership_based_buffer_deallocation_pass());
     pass_manager.add_pass(pass::bufferization::create_buffer_deallocation_simplification_pass());
@@ -834,6 +850,19 @@ pub fn lower_to_llvm<'c>(
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (buffer-deallocation)".to_string(),
         ]);
+    }
+
+    // `CLEAVE_DUMP_POST_DEALLOC=<path>` -- the other side of the boundary
+    // `CLEAVE_DUMP_PRE_BUFFERIZE` above opens: the module right after
+    // `--ownership-based-buffer-deallocation`/`--lower-deallocations`,
+    // still memref-level, so the real conditional-ownership `scf.if`/
+    // `memref.dealloc` shape is visible before `--convert-to-llvm` turns it
+    // into opaque `llvm.call @free`. This is the dump that made the
+    // alloc-backed-with-a-dealloc population countable at all
+    // (`doc/plan-region-arena.md` §8.3).
+    if let Ok(path) = std::env::var("CLEAVE_DUMP_POST_DEALLOC") {
+        std::fs::write(&path, module.as_operation().to_string())
+            .unwrap_or_else(|e| eprintln!("CLEAVE_DUMP_POST_DEALLOC: failed to write {path}: {e}"));
     }
 
     // `--symbol-dce`, right after `--inline` (above) made every inlined

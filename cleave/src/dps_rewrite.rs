@@ -73,6 +73,15 @@ use crate::mlir_lower::memref_descriptor_llvm_type;
 /// on a module that has none (a program with no struct-field `Tensor`
 /// writes at all) -- finds nothing, changes nothing.
 pub fn eliminate_redundant_field_store_copies<'c>(context: &'c Context, module: &mut Module<'c>) {
+    // `CLEAVE_NO_DPS=1`, alongside `CLEAVE_NO_DPS_PASSTHROUGH` below: skips
+    // this whole rewrite, so every struct-field write keeps its original
+    // allocate-fresh-buffer-then-memcpy shape. A bisection lever for any
+    // ownership bug where buffer *sharing* is a suspect -- it answers
+    // "does this still happen when nothing is shared" in one run, which no
+    // amount of reading the IR does as reliably.
+    if std::env::var("CLEAVE_NO_DPS").is_ok() {
+        return;
+    }
     let candidates = find_candidates(module);
     for candidate in candidates {
         rewrite_one(context, module.body(), candidate);
@@ -547,6 +556,15 @@ fn match_candidate<'c, 'a>(
                 melior::ir::r#type::DimSize::Static(size) => dims.push(size as i64),
                 melior::ir::r#type::DimSize::Dynamic => return None,
             }
+        }
+        // `CLEAVE_NO_DPS_PASSTHROUGH=1`: declining this strategy alone (and
+        // keeping `Strategy::Overwrite`) makes the write fall back to
+        // allocate+copy, so the destination field owns a *fresh* buffer
+        // instead of sharing the source's. The finer half of `CLEAVE_NO_DPS`
+        // above -- it separates "sharing is the problem" from "this rewrite
+        // is the problem" without changing any other site.
+        if std::env::var("CLEAVE_NO_DPS_PASSTHROUGH").is_ok() {
+            return None;
         }
         (Strategy::Passthrough, extract_src, elem_type, dims)
     } else {

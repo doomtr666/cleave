@@ -14,3 +14,13 @@ edition = "2024"
 # linker to consume).
 [lib]
 crate-type = ["rlib", "staticlib"]
+
+# Used only by the ownership diagnostics in `lib.rs` (`CLEAVE_DEBUG_POOL`,
+# `CLEAVE_TRACE_RC`, `CLEAVE_TRACE_SIZE`) to resolve a release/retain call
+# site back to its own `.cleave` source line -- `first_cleave_frame`/
+# `cleave_frames`. Every one of those is env-var-gated and off by default,
+# so nothing here runs in an ordinary build; the crate is linked regardless,
+# which is the deliberate trade for having the diagnostics available on a
+# release binary without rebuilding it.
+[dependencies]
+backtrace = "0.3"

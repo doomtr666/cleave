@@ -376,6 +376,16 @@ pub fn lower_program<'c>(
         })
         .collect();
     let region_local_fns = crate::region_analysis::find_region_local_functions(program);
+    // `CLEAVE_TRACE_REGION_LOCAL=1` -- the population `region_analysis`'s
+    // own analysis settled on, sorted for a stable diff across runs. Used to
+    // confirm directly that a change to that analysis only ever *adds* names
+    // and never removes one, which is the property any relaxation of it has
+    // to preserve to stay sound.
+    if std::env::var("CLEAVE_TRACE_REGION_LOCAL").is_ok() {
+        let mut names: Vec<&String> = region_local_fns.iter().collect();
+        names.sort();
+        eprintln!("CLEAVE_TRACE_REGION_LOCAL: {} functions: {names:?}", names.len());
+    }
     let constructed_structs = crate::refcount::collect_constructed_struct_names(program);
     let field_mutated_structs = crate::refcount::collect_field_mutated_struct_names(program);
     let extern_boundary_structs = crate::refcount::collect_extern_boundary_struct_names(program);
@@ -2467,6 +2477,12 @@ fn lower_prim_op<'c>(
             let val = *env
                 .get(ptr_var)
                 .unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{ptr_var}"));
+            // TEMP, diagnostic-only (`cleave-rt::LAST_RELEASE_TAG`'s own doc
+            // comment): tags this release's runtime call with its own
+            // originating CVar id, only when `CLEAVE_TAG_RELEASES=1` at
+            // compile time — never affects an ordinary build or the JIT test
+            // harness (no env var set there), so this is safe to leave in
+            // place until the still-open double-release bug is found.
             // Same tensor-value case as `Retain` above — a tensor leaf has
             // no further nested fields of its own to cascade into
             // (`lower_release_cascade`'s own tensor-field branch already
@@ -2475,7 +2491,7 @@ fn lower_prim_op<'c>(
             // through the struct-shaped cascade at all.
             if native_shape_field_keyword(ctx, rc_ty).is_some() {
                 let ptr_val = tensor_value_to_ptr(ctx, block, val, rc_ty);
-                emit_cleave_release(ctx, block, rc_ty, ptr_val);
+                emit_cleave_release_tagged(ctx, block, rc_ty, ptr_val, *ptr_var);
             } else {
                 lower_release_cascade(ctx, block, rc_ty, val);
             }
@@ -3832,6 +3848,53 @@ fn emit_cleave_release<'c>(
     call_op.result(0).unwrap().into()
 }
 
+/// TEMP, diagnostic-only: identical to `emit_cleave_release`, but calls
+/// `cleave_release_tagged` (`cleave-rt::LAST_RELEASE_TAG`'s own doc comment)
+/// instead, carrying this release's own originating CVar id, when
+/// `CLEAVE_TAG_RELEASES=1` at compile time — falls back to the ordinary
+/// untagged call otherwise, so this never changes codegen for a normal
+/// build. Remove once the still-open double-release bug (`doc/backlog.md`)
+/// is found.
+fn emit_cleave_release_tagged<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    rc_ty: &Ty,
+    ptr_val: Value<'c, 'c>,
+    tag: CVar,
+) -> Value<'c, 'c> {
+    if std::env::var("CLEAVE_TAG_RELEASES").is_err() {
+        return emit_cleave_release(ctx, block, rc_ty, ptr_val);
+    }
+    let context = ctx.context;
+    let location = gen_loc(context);
+    let bool_ty: Type = IntegerType::new(context, 1).into();
+    let i64_ty: Type = IntegerType::new(context, 64).into();
+    let declared_ty = declared_ptr_sig_ty(ctx, rc_ty);
+    ensure_extern_declared(
+        ctx,
+        "cleave_release_tagged",
+        &[declared_ty, Ty::Con("i64".to_string())],
+        &[bool_ty],
+    );
+    let tag_val: Value = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(i64_ty, tag as i64).into(),
+            location,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let call_op = block.append_operation(func::call(
+        context,
+        FlatSymbolRefAttribute::new(context, "cleave_release_tagged"),
+        &[ptr_val, tag_val],
+        &[bool_ty],
+        location,
+    ));
+    call_op.result(0).unwrap().into()
+}
+
 /// The `Ty` `ensure_extern_declared` should use to declare `cleave_retain`/
 /// `cleave_release`'s own parameter — `rc_ty` itself for an ordinary struct
 /// (any declared struct name maps to `!llvm.ptr` via `ty_to_mlir`'s generic
@@ -4108,6 +4171,15 @@ fn alloc_llvm_value<'c>(
     let context = ctx.context;
     let location = gen_loc(context);
     let ptr_ty = llvm::r#type::pointer(context, 0);
+    // `CLEAVE_TRACE_ALLOC_TYPES=1` -- every LLVM type this allocator is
+    // asked for, at compile time. The counterpart to `cleave-rt`'s own
+    // `CLEAVE_TRACE_SIZE` (which sees only a byte count at runtime): pairing
+    // the two is what turns "something of 104 bytes is released twice" into
+    // a named type, since cleave's own allocator emits an exact `sizeof`
+    // while MLIR's aligned allocations emit `N*sizeof + 64`.
+    if std::env::var("CLEAVE_TRACE_ALLOC_TYPES").is_ok() {
+        eprintln!("ALLOC_TYPE {}", llvm_ty);
+    }
     let size = llvm_type_size_bytes(ctx, block, llvm_ty);
     let i64_ty: Type = IntegerType::new(context, 64).into();
     let (symbol, call_args): (&str, Vec<Value>) = if ctx.currently_region_local.get() {
