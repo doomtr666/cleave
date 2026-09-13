@@ -98,9 +98,27 @@ pub extern "C" fn cleave_alloc(size: i64) -> *mut u8 {
 /// alloc`'s own existing 16-byte alignment (`repr(C)` to fix the field
 /// order/no-padding layout `RC_HEADER_SIZE`'s own arithmetic below assumes —
 /// Rust's default struct layout is otherwise free to reorder fields).
+/// **`refcount` is atomic, and that is load-bearing, not defensive.** Found
+/// by direct testing, not assumed: `examples/mnist-interop` crashed
+/// non-deterministically (`CLEAVE_DEBUG_POOL`'s own "release on parked
+/// block", after anywhere from 163 to 810 training batches across runs)
+/// with OpenMP on, and ran cleanly through 5+ full epochs with
+/// `CLEAVE_NO_OPENMP=1` — the same binary, same seed, same data. A plain
+/// `i64` increment/decrement here is a read-modify-write on memory
+/// genuinely reachable from several OpenMP worker threads at once:
+/// `POOL_LOCK`'s own doc comment already establishes that every thread
+/// reaches these identical allocator entry points (that is exactly why it
+/// exists), and it deliberately covers only the free-list pop/push — it
+/// explicitly leaves the refcount itself outside the critical section. Two
+/// threads racing a decrement both read `1`, both write `0`, and both take
+/// the "I freed it" branch: the block gets parked twice, and the *next*
+/// legitimate release of whatever address the pool hands back out lands on
+/// an already-parked block. `AtomicI64` closes exactly that hole, with no
+/// layout change at all (same size, same alignment, same `repr(C)` field
+/// order `RC_HEADER_SIZE`'s own arithmetic assumes).
 #[repr(C)]
 struct RcHeader {
-    refcount: i64,
+    refcount: std::sync::atomic::AtomicI64,
     data_size: i64,
 }
 
@@ -260,6 +278,30 @@ fn record_parked_hit(base: usize) -> bool {
 static CLEAVE_TRACE_RC: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("CLEAVE_TRACE_RC").is_ok());
 
+// TEMP diagnostic (`CLEAVE_TRACE_SIZE=<bytes>`) -- a complete
+// allocate/retain/release ledger for blocks of exactly one `data_size`,
+// and nothing else. `CLEAVE_TRACE_RC`'s own whole-program ledger floods any
+// real workload (its own doc comment says so); this one is the same idea
+// narrowed to a single size class the crash message already named, which
+// makes it usable on the *real* kernel rather than only on a minimal
+// repro. Built for `doc/plan-region-arena.md`'s own §7 open item -- the
+// `data_size=104` double-release at network/optimizer-state construction
+// time. Remove once that's root-caused.
+static CLEAVE_TRACE_SIZE: std::sync::LazyLock<Option<i64>> = std::sync::LazyLock::new(|| {
+    std::env::var("CLEAVE_TRACE_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+});
+
+// `CLEAVE_STRICT_REGIONS=1` -- `assert_region_open`'s own doc comment and
+// `doc/plan-region-arena.md`'s "Step 1": restores the old, loud,
+// unconditional abort-on-misclassification behavior of `cleave_alloc_local`
+// (default, since Step 1, is a soft pool fallback instead). Not TEMP in the
+// same sense as the flags above -- meant to stay, as the escape hatch for
+// active development of `region_analysis.rs`'s region-local classification.
+static CLEAVE_STRICT_REGIONS: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("CLEAVE_STRICT_REGIONS").is_ok());
+
 // TEMP, alongside `CLEAVE_TRACE_RC` above: the pool freely reuses a freed
 // block's own address for a *later*, logically unrelated allocation, which
 // makes a raw-pointer-keyed trace genuinely ambiguous -- "released twice"
@@ -293,6 +335,37 @@ fn current_alloc_serial(base: usize) -> Option<u64> {
 /// source file -- skips every Rust-side frame (`cleave_rt::cleave_retain`
 /// itself, `backtrace`'s own capture machinery) to give a short, single-
 /// line "who called this" label instead of a full, noisy stack dump.
+/// Every `.cleave`-sourced frame on the stack, outermost-last, joined with
+/// ` < ` -- `first_cleave_frame`'s own resolution logic, but collecting the
+/// whole inline chain instead of stopping at the first hit. Answers "which
+/// cleave function actually allocated this, and through what call path",
+/// which the single-frame version can't once `--inline` has flattened
+/// everything into one enclosing function (every frame then reports that
+/// same outer function, and only the *line* distinguishes them). Used by
+/// `CLEAVE_TRACE_SIZE`'s own ledger; see that flag's own doc comment.
+fn cleave_frames() -> String {
+    let mut frames: Vec<String> = Vec::new();
+    backtrace::trace(|frame| {
+        backtrace::resolve_frame(frame, |symbol| {
+            if let Some(file) = symbol.filename() {
+                let file = file.to_string_lossy();
+                if file.ends_with(".cleave") {
+                    let name = symbol.name().map(|n| n.to_string()).unwrap_or_else(|| "?".to_string());
+                    let line = symbol.lineno().unwrap_or(0);
+                    let short = file.rsplit(['/', '\\']).next().unwrap_or(&file).to_string();
+                    frames.push(format!("{name}@{short}:{line}"));
+                }
+            }
+        });
+        frames.len() < 8
+    });
+    if frames.is_empty() {
+        "<no .cleave frames>".to_string()
+    } else {
+        frames.join(" < ")
+    }
+}
+
 fn first_cleave_frame() -> String {
     let mut cleave_label: Option<String> = None;
     // Fallback, when no frame anywhere up the stack is `.cleave`-sourced:
@@ -436,11 +509,17 @@ pub extern "C" fn cleave_alloc_rc(data_size: i64) -> *mut u8 {
             }
         };
         let header = base as *mut RcHeader;
-        (*header).refcount = 1;
+        (*header).refcount = std::sync::atomic::AtomicI64::new(1);
         (*header).data_size = data_size;
         if *CLEAVE_TRACE_RC {
             let serial = record_alloc_serial(base as usize);
             eprintln!("ALLOC   {base:p} #{serial}  {}", first_cleave_frame());
+        }
+        if *CLEAVE_TRACE_SIZE == Some(data_size) {
+            eprintln!(
+                "TRACE_SIZE alloc_rc  {base:p} size={data_size}  {}",
+                cleave_frames()
+            );
         }
         base.add(RC_HEADER_SIZE)
     }
@@ -466,16 +545,34 @@ pub unsafe extern "C" fn cleave_retain(ptr: *mut u8) {
         if *CLEAVE_COUNT_PARKED_HITS && parked_contains(header as usize) {
             return;
         }
+        // `Relaxed` is the standard ordering for a refcount *increment*: it
+        // only ever needs atomicity (no lost updates), never ordering
+        // against other memory -- the caller already holds a live reference
+        // it is adding to, so nothing is being published or observed here.
+        // The *decrement* (`cleave_release`) is where real ordering is
+        // needed; see its own comment.
+        let previous = (*header)
+            .refcount
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if *CLEAVE_TRACE_RC {
             eprintln!(
                 "RETAIN  {:p} #{}  -> {}  {}",
                 header,
                 current_alloc_serial(header as usize).map_or("?".to_string(), |s| s.to_string()),
-                (*header).refcount + 1,
+                previous + 1,
                 first_cleave_frame()
             );
         }
-        (*header).refcount += 1;
+        if *CLEAVE_TRACE_SIZE == Some((*header).data_size) {
+            eprintln!(
+                "TRACE_SIZE retain    {:p} size={} rc {} -> {}  {}",
+                header,
+                (*header).data_size,
+                previous,
+                previous + 1,
+                first_cleave_frame()
+            );
+        }
     }
 }
 
@@ -543,7 +640,7 @@ pub unsafe extern "C" fn cleave_release(ptr: *mut u8) -> bool {
                 "CLEAVE_DEBUG_POOL: cleave_release on parked (already-freed) block {:p} #{}, refcount={}, data_size={}, tag={}",
                 header,
                 current_alloc_serial(header as usize).map_or("?".to_string(), |s| s.to_string()),
-                (*header).refcount,
+                (*header).refcount.load(std::sync::atomic::Ordering::Relaxed),
                 // `data_size` (offset 8) survives being parked untouched --
                 // the free-list's own "next" link overwrites only offset 0
                 // (`refcount`'s own slot, `FREE_LISTS`'s own doc comment),
@@ -551,6 +648,16 @@ pub unsafe extern "C" fn cleave_release(ptr: *mut u8) -> bool {
                 // size, a real clue to which tensor shape this is.
                 (*header).data_size,
                 LAST_RELEASE_TAG.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            // The *offending* release's own source position -- the one
+            // thing this message was missing to be directly actionable
+            // (`CLEAVE_TRACE_SIZE`'s own ledger already gives every
+            // *earlier* allocate/retain/release site for the same block,
+            // so this closes the loop: which release is the second one).
+            eprintln!(
+                "CLEAVE_DEBUG_POOL:   offending release via {} at {}",
+                if RELEASE_VIA_VOID.with(|f| f.get()) { "void/bufferization" } else { "rc/CPS" },
+                first_cleave_frame()
             );
             // A real breakpoint exception, not `backtrace`'s own runtime
             // walk -- that crate hits a real, unavoidable limit for a call
@@ -583,18 +690,43 @@ pub unsafe extern "C" fn cleave_release(ptr: *mut u8) -> bool {
                 );
             }
             return false;
-        }
+        }        // `AcqRel` on the decrement, deliberately, not `Relaxed`: this is
+        // the one operation whose result decides whether *this* thread is
+        // the one that destroys the block. The `Release` half publishes
+        // every write this thread made through the block before giving up
+        // its reference; the `Acquire` half makes the thread that observes
+        // the final decrement (`previous == 1`) see every *other* thread's
+        // writes before it frees the memory. Exactly one thread can ever
+        // observe `previous == 1`, which is what makes the free below
+        // single-threaded by construction rather than by luck -- the whole
+        // point of `RcHeader::refcount`'s own atomicity (its doc comment
+        // has the real crash this fixed).
+        let previous = (*header)
+            .refcount
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         if *CLEAVE_TRACE_RC {
             eprintln!(
                 "RELEASE {:p} #{}  -> {}  {}",
                 header,
                 current_alloc_serial(header as usize).map_or("?".to_string(), |s| s.to_string()),
-                (*header).refcount - 1,
+                previous - 1,
                 first_cleave_frame()
             );
         }
-        (*header).refcount -= 1;
-        if (*header).refcount == 0 {
+        if *CLEAVE_TRACE_SIZE == Some((*header).data_size) {
+            eprintln!(
+                "TRACE_SIZE release[{}] tag={} {:p} size={} rc {} -> {} in_arena={}  {}",
+                if RELEASE_VIA_VOID.with(|f| f.get()) { "void/bufferization" } else { "rc/CPS" },
+                LAST_RELEASE_TAG.load(std::sync::atomic::Ordering::Relaxed),
+                header,
+                (*header).data_size,
+                previous,
+                previous - 1,
+                is_in_arena(header as *mut u8),
+                cleave_frames()
+            );
+        }
+        if previous == 1 {
             // Arena-backed (`cleave_alloc_rc`'s own doc comment): never
             // individually freed here — the matching `cleave_region_exit`
             // reclaims it in bulk, along with everything else allocated
@@ -809,21 +941,30 @@ pub extern "C" fn cleave_region_enter(_size: i64) -> i64 {
 ///
 /// `REGION_DEPTH == 0` at this call is *always* a genuine compiler bug
 /// (this function must only ever be emitted at a site already inside a
-/// matching `region_enter`/`region_exit` pair) — `assert_region_open`
-/// (right below) catches it loudly and unconditionally (not gated behind
-/// `debug_assertions` — this project's own established convention is
-/// testing under `cargo test --release`, which disables it by default; a
-/// check that only exists in debug builds would never actually run under
-/// that workflow), the same posture `cleave_alloc_rc`'s own `assert!(!
-/// base.is_null(), ...)` already takes on its own always-on allocation-
-/// failure check. A separate, plain (not `extern "C"`) function rather
-/// than an inline `assert!` here, purely so this crate's own tests can
-/// `catch_unwind` it directly: a panic *inside* an `extern "C"` function
-/// cannot unwind at all (confirmed directly — Rust aborts the whole
-/// process instead, `panic_cannot_unwind`, not something `catch_unwind`
-/// can observe), so the only way to test this check's own panic behavior
-/// is to keep it in an ordinary Rust function `cleave_alloc_local` merely
-/// calls into.
+/// matching `region_enter`/`region_exit` pair). Kept as a separate, plain
+/// (not `extern "C"`) function rather than an inline `assert!`, purely so
+/// this crate's own tests can `catch_unwind` it directly: a panic *inside*
+/// an `extern "C"` function cannot unwind at all (confirmed directly — Rust
+/// aborts the whole process instead, `panic_cannot_unwind`, not something
+/// `catch_unwind` can observe), so the only way to test this check's own
+/// panic behavior is to keep it in an ordinary Rust function.
+///
+/// **Not called unconditionally by `cleave_alloc_local` any more** (`doc/
+/// plan-region-arena.md`'s own "Step 1" — a deliberate, documented
+/// weakening, not a regression): a misclassified region-local site is a
+/// real compiler bug, but aborting the whole training process on it was
+/// disproportionate to how this bug class is actually found and fixed —
+/// every prior double-release instance in this project's own history was
+/// diagnosed from a *live, running* process (`CLEAVE_DEBUG_POOL`, memory
+/// monitoring), not from a hard crash at the point of misclassification.
+/// `cleave_alloc_local` below now falls back to `cleave_alloc_rc` instead,
+/// degrading a misclassification to "allocated on the pool instead of the
+/// arena" — a perf regression, not a crash — since `cleave_release`'s own
+/// `is_in_arena` check then frees it correctly regardless of which
+/// allocator actually served it. This function, and the loud unconditional
+/// check it performs, stays reachable behind `CLEAVE_STRICT_REGIONS=1` for
+/// exactly the case where silently degrading would hide a real bug for too
+/// long during active development of this analysis.
 fn assert_region_open() {
     use std::sync::atomic::Ordering::Relaxed;
     assert!(
@@ -834,13 +975,42 @@ fn assert_region_open() {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn cleave_alloc_local(_handle: i64, size: i64) -> *mut u8 {
-    assert_region_open();
+    use std::sync::atomic::Ordering::Relaxed;
+    if REGION_DEPTH.load(Relaxed) == 0 {
+        // `CLEAVE_STRICT_REGIONS=1` -- `assert_region_open`'s own doc
+        // comment: the loud, unconditional check this project ran with
+        // until `doc/plan-region-arena.md`'s "Step 1". Kept reachable for
+        // active development of the region-local analysis, where silently
+        // falling back could hide a real classification bug for too long.
+        if *CLEAVE_STRICT_REGIONS {
+            assert_region_open();
+        }
+        // Step 1 fallback: no region open here is a real misclassification
+        // upstream, but not fatal by default any more -- fall back to the
+        // exact allocation path `cleave_alloc_rc` uses. `cleave_release`'s
+        // own `is_in_arena` check (its own doc comment) then correctly
+        // pool-frees this block later regardless: a pool block is never
+        // inside the arena's address range, so the dynamic dispatch that
+        // already makes double-free on a genuine arena block impossible
+        // handles "turned out not to be one" symmetrically. This converts
+        // every future region-classification bug into a perf regression
+        // instead of a crash -- the property the rest of the region-arena
+        // plan (`doc/plan-region-arena.md`) depends on to stay cheap to
+        // iterate on.
+        return cleave_alloc_rc(size);
+    }
     let total = RC_HEADER_SIZE + size as usize;
     let base = arena_bump(total);
     unsafe {
         let header = base as *mut RcHeader;
-        (*header).refcount = 1;
+        (*header).refcount = std::sync::atomic::AtomicI64::new(1);
         (*header).data_size = size;
+        if *CLEAVE_TRACE_SIZE == Some(size) {
+            eprintln!(
+                "TRACE_SIZE alloc_local {base:p} size={size}  {}",
+                first_cleave_frame()
+            );
+        }
         base.add(RC_HEADER_SIZE)
     }
 }
@@ -881,9 +1051,24 @@ pub extern "C" fn cleave_region_exit(handle: i64) {
 /// alloc_rc` result.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cleave_release_void(ptr: *mut u8) {
+    // TEMP, alongside `CLEAVE_TRACE_SIZE`: marks which of the two entry
+    // points a given release came in through. `cleave_release` is only ever
+    // emitted by cleave's own CPS refcounting (`refcount.rs`); `cleave_
+    // release_void` is only ever the rename of bufferization's own `free`
+    // (`unify_alloc.rs`). A block that receives one of each is, by
+    // definition, the CPS-vs-bufferization double-ownership bug this whole
+    // plan is about -- which is exactly what this distinction is here to
+    // confirm or rule out. Remove with the rest of the `CLEAVE_TRACE_SIZE`
+    // instrumentation.
+    RELEASE_VIA_VOID.with(|f| f.set(true));
     unsafe {
         cleave_release(ptr);
     }
+    RELEASE_VIA_VOID.with(|f| f.set(false));
+}
+
+thread_local! {
+    static RELEASE_VIA_VOID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Reads `ptr`'s own current refcount without changing it — a real,
@@ -895,7 +1080,11 @@ pub unsafe extern "C" fn cleave_release_void(ptr: *mut u8) {
 /// See `rc_header`'s own safety contract.
 #[cfg(test)]
 unsafe fn rc_count(ptr: *mut u8) -> i64 {
-    unsafe { (*rc_header(ptr)).refcount }
+    unsafe {
+        (*rc_header(ptr))
+            .refcount
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]
@@ -1149,6 +1338,31 @@ mod rc_tests {
             );
             cleave_region_exit(h);
         }
+
+        // `doc/plan-region-arena.md`'s own "Step 1" -- a misclassified
+        // call site (no region open) must degrade to an ordinary pool
+        // allocation, not abort. `REGION_DEPTH` is genuinely `0` again
+        // here: every region opened above was already exited before this
+        // point.
+        unsafe {
+            let ptr = cleave_alloc_local(0, 8);
+            assert!(
+                !is_in_arena(ptr),
+                "cleave_alloc_local with no region open must fall back to the ordinary pool, \
+                 not silently claim arena space"
+            );
+            assert_eq!(rc_count(ptr), 1, "the fallback must still write a real, correct RcHeader");
+            assert!(cleave_release(ptr), "the fallback allocation must be releasable exactly like cleave_alloc_rc");
+        }
+        // `CLEAVE_STRICT_REGIONS=1` restores the old abort-instead-of-
+        // fallback behavior (`assert_region_open`'s own doc comment), but
+        // it's a `LazyLock` read once per process -- not something this
+        // in-process test can flip and re-check without restarting the
+        // process, the same reason none of `CLEAVE_DEBUG_POOL`/`CLEAVE_
+        // TRACE_RC`/etc. are unit-tested here either. The no-open-region
+        // panic path itself is already covered above (`assert_region_open`
+        // called directly, at the top of this test, before this or any
+        // other test opens a region of its own).
     }
 
 }

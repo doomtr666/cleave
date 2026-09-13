@@ -1659,7 +1659,8 @@ impl RefcountCtx<'_> {
             self.constructed_structs,
             self.field_mutated_structs,
             self.extern_boundary_structs,
-        ) || is_bare_tensor_ty(ty, self.mlir_types)
+        ) || (!std::env::var("CLEAVE_NO_BARE_TENSOR_RC").is_ok()
+            && is_bare_tensor_ty(ty, self.mlir_types))
     }
 
     /// Every genuinely-refcounted field reachable from `ty`'s own top

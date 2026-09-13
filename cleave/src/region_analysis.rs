@@ -32,116 +32,197 @@
 //! markers, with no separate tracing needed for nested allocations at all.
 //!
 //! **The real precondition this module checks, not just assumes**: marking
-//! a function's own allocation sites region-local is only sound if that
-//! function has *exactly one* call site in the whole program, and that one
-//! call's own result never reaches the enclosing loop's own carried
-//! (escaping) state — checked structurally, the same "no dataflow fixpoint
-//! needed, the structure already says so" argument `doc/hld.md`'s own
-//! "Memory management" section makes for CPS-level lifetimes generally,
-//! applied here to *which* top-level function a call targets rather than
-//! to one local value's own liveness. A function called from more than one
-//! place, or from a non-loop context, is conservatively left alone —
-//! `cleave-rt::cleave_alloc_local`'s own `assert_region_open` would catch
-//! a wrong classification loudly (a crash, not silent corruption) if this
-//! analysis were ever wrong, but this module's own job is to not be wrong
-//! in the first place, not to rely on that assertion as a safety net.
+//! a function's own allocation sites region-local is only sound if *every*
+//! call site targeting it, anywhere in the whole program, is itself proven
+//! safe — a call found strictly inside some loop's own repeating body,
+//! whose own result never reaches that loop's own carried (escaping)
+//! state, checked structurally, the same "no dataflow fixpoint needed, the
+//! structure already says so" argument `doc/hld.md`'s own "Memory
+//! management" section makes for CPS-level lifetimes generally, applied
+//! here to *which* top-level function a call targets rather than to one
+//! local value's own liveness.
+//!
+//! **`doc/plan-region-arena.md`'s own "Step 2" — a real generalization of
+//! this module, not the original shape.** The original version of this
+//! analysis required a callee to have *exactly one* call site in the whole
+//! program before marking it region-local — sufficient, but needlessly
+//! strict: it also rejected a callee with two or more call sites even when
+//! *every one* of them was individually proven just as safe (found by
+//! direct testing against this module's own test suite — see `cleave/
+//! tests/region_analysis.rs`'s own `a_function_called_from_more_than_one_
+//! place_is_never_marked_local`, whose two call sites, both inside the same
+//! loop body, both turn out to be individually non-escaping; that test was
+//! updated alongside this change, not left encoding the old, narrower
+//! rule). `analyze` below computes the sound, general condition directly:
+//! a callee is region-local iff *every* call site targeting it, anywhere in
+//! the program, is in `safe_sites` — the true special case of which the old
+//! `call_counts == 1` rule was one easy, always-safe instance (a single
+//! call site, itself already proven safe, trivially satisfies "every site
+//! safe"). This generalization also *transitively* absorbs a shared helper
+//! called from two or more *already-region-local* functions' own bodies —
+//! previously excluded outright regardless of how safe each caller was
+//! individually — using `HashSet<CVar>` membership (call-site *identity*,
+//! `CVar`s already unique across the whole program, `refcount::insert_
+//! refcounting`'s own `max_cvar_in_program` establishes this same fact)
+//! rather than a numeric tally, precisely so that discovering the same call
+//! site "safe" twice, through two different code paths, is a harmless,
+//! idempotent no-op rather than a double-count that could ever inflate a
+//! callee's own safe-occurrence count past its real, physical total.
+//!
+//! **What this generalization does *not* by itself fix — `region_
+//! specialize.rs`'s own job**: a callee genuinely shared between a
+//! safe context and an unsafe one (`doc/backlog.md`'s own real example:
+//! a shared algebra function called from both the training loop, where its
+//! result never escapes one iteration, and `evaluate()`, where it doesn't
+//! run inside a loop at all) still, correctly, fails "every site safe" and
+//! stays excluded here. `region_specialize::specialize_region_local_
+//! functions` is the *other* half of Step 2: it runs earlier in the
+//! pipeline, *before* this analysis is ever consulted, and duplicates such
+//! a genuinely-mixed callee into two names — the original, still serving
+//! its unsafe call sites, and a `{name}$region` copy, retargeted to serve
+//! only the sites this same `analyze` function already proves safe. This
+//! module needs no knowledge of that split at all: by the time `analyze`
+//! runs, `{name}$region` is just another top-level function whose *every*
+//! call site happens to be safe, by construction.
 
 use crate::cps::{CExpr, CFunDef, CVal, CVar, CpsProgram, PrimOp};
 use std::collections::{HashMap, HashSet};
 
 /// The whole public surface: every top-level function name safe to lower
-/// with `cleave_alloc_local` at each of its own construction sites.
-///
-/// **Extended with a transitive descent into an already-confirmed-region-
-/// local function's own body** (`doc/backlog.md`'s own "the bridge between
-/// which functions are safe and how a tensor's own bufferized storage gets
-/// allocated is missing" finding, and its own real motivating example:
-/// `net_grad` never constructs a tensor *directly* — it delegates every
-/// real computation to shared algebra functions, `MatMul::matmul`/`Ring::
-/// add`/`Scale::scale`/..., so the direct, single-level scan above (`find_
-/// loops_and_mark`, unchanged) only ever discovers `net_grad`'s own name —
-/// never any of the calls *inside* it, the only place a tensor construction
-/// actually happens).
-///
-/// **The soundness argument, not just a convenience extension**: once a
-/// callee `C`'s own call site has already been proven not to reach the
-/// enclosing loop's own carried (escaping) state, `C`'s *entire* execution —
-/// from the `cleave_region_enter` `lower_real_call` wraps its call site in,
-/// to the matching `cleave_region_exit` — is already known to complete
-/// (and every one of its results already known to be fully consumed, since
-/// nothing derived from it survives past that same boundary) before the
-/// region ever closes. Every value `C` itself computes internally, in turn,
-/// either gets discarded before `C` returns (a pure intermediate, safe by
-/// construction) or becomes part of `C`'s own already-proven-non-escaping
-/// result (safe for the identical reason `C`'s own call site was already
-/// safe) — there is no third way for a value to survive past `C`'s own
-/// return in this language (no mutable globals, no captured-by-reference
-/// closures a plain top-level `fn` body could stash one into). So a direct
-/// top-level call found *inside* `C`'s own body needs exactly the *same*
-/// single check this module already performs one level up — exactly one
-/// call site in the whole program (`call_counts`, computed once, globally,
-/// already correctly reflecting every call site regardless of which
-/// function's body it sits in) — and *no* separate escaping check at this
-/// inner level at all, since escaping was already ruled out transitively.
-///
-/// **Why the existing "exactly one call site" check alone is still what
-/// keeps this safe, not an oversight**: `MatMul::matmul<...>`'s own real
-/// backward-pass weight-gradient instantiations (`doc/backlog.md`'s own
-/// register-spill entry) are structurally *shaped differently* from any
-/// forward-pass call to the same algebra (a transposed operand order,
-/// `H^T @ dZ` rather than `H @ W`) — each monomorphized instantiation
-/// really does have exactly one call site in a real network, and `call_
-/// counts` (already computed over the *whole* program, not just `C`'s own
-/// body) correctly reflects that. A shape genuinely shared between a
-/// region-local caller and *any* other call site anywhere — the exact
-/// danger this whole mechanism exists to avoid — still fails this check
-/// and is correctly excluded, at any recursion depth.
+/// with `cleave_alloc_local` at each of its own construction sites. A thin
+/// wrapper over `analyze` (`pub(crate)`, see its own doc comment) — kept as
+/// a separate, stable, `pub` entry point since `mlir_lower.rs`'s own single
+/// call site (`lower_program`) only ever needs the per-function verdict,
+/// never the finer-grained `safe_sites`/`sites_by_callee` `region_
+/// specialize.rs` additionally needs.
 pub fn find_region_local_functions(program: &CpsProgram) -> HashSet<String> {
+    analyze(program).region_local
+}
+
+/// The full result of this module's own whole-program fixed point — see
+/// `analyze`'s own doc comment. `pub(crate)`, not `pub`: consumed by
+/// `region_specialize.rs` (a sibling module, same crate) alongside `find_
+/// region_local_functions`'s own narrower public contract; no external
+/// caller has a legitimate use for `safe_sites`/`sites_by_callee` on their
+/// own.
+pub(crate) struct RegionAnalysis {
+    pub(crate) region_local: HashSet<String>,
+    /// Every individual call site — identified by its own bound `result_
+    /// var`, a `CVar`, unique across the *whole* program — proven safe,
+    /// Kind-1 (found directly inside some loop's own repeating body,
+    /// individually non-escaping) or Kind-2 (found, transitively, directly
+    /// inside an already-`region_local` function's own body — no separate
+    /// escaping check needed there, `collect_direct_callees`'s own doc
+    /// comment has the soundness argument, unchanged from the original
+    /// version of this module).
+    pub(crate) safe_sites: HashSet<CVar>,
+    /// Every real top-level call site anywhere in the program, `result_
+    /// var`-identified, grouped by callee name — built once, exhaustively
+    /// (`collect_all_call_sites_in`, unconditional recursion, loops or not,
+    /// exactly `count_calls_in`'s own old shape but keeping each site's own
+    /// identity instead of only a running count). `region_specialize.rs`'s
+    /// own "does this callee need a `$region` split" test is exactly "some,
+    /// but not all, of `sites_by_callee[callee]` are in `safe_sites`".
+    pub(crate) sites_by_callee: HashMap<String, Vec<CVar>>,
+}
+
+/// The shared whole-program fixed point behind both `find_region_local_
+/// functions`'s own public, per-function verdict and `region_specialize::
+/// specialize_region_local_functions`'s own need for individual call-site
+/// identity (this module's own top doc comment has the full reasoning for
+/// why a `HashSet<CVar>` of call-site identities, not a numeric tally, is
+/// what keeps this sound under transitive propagation).
+///
+/// Bounded, like the original version's own transitive-descent worklist:
+/// each outer iteration either adds at least one name to `region_local` (at
+/// most `top_level_names.len()` times) or the loop ends, and each iteration
+/// does at most one body walk per already-`region_local` name.
+pub(crate) fn analyze(program: &CpsProgram) -> RegionAnalysis {
     let top_level_names: HashSet<String> = program.funcs.iter().map(|f| f.def.name.clone()).collect();
-    let call_counts = count_call_sites(program, &top_level_names);
     let by_name: HashMap<&str, &CFunDef> = program
         .funcs
         .iter()
         .map(|f| (f.def.name.as_str(), &f.def))
         .collect();
 
-    let mut region_local = HashSet::new();
+    // Every real call site anywhere, by identity, grouped by callee —
+    // built once, exhaustively, so neither the fixed point below nor `region_
+    // specialize.rs` ever needs to re-walk the whole program per candidate.
+    let mut sites_by_callee: HashMap<String, Vec<CVar>> = HashMap::new();
     for f in &program.funcs {
-        find_loops_and_mark(&f.def.body, &top_level_names, &call_counts, &mut region_local);
+        let mut sites = Vec::new();
+        collect_all_call_sites_in(&f.def.body, &top_level_names, &mut sites);
+        for (callee, v) in sites {
+            sites_by_callee.entry(callee).or_default().push(v);
+        }
     }
 
-    // Transitive descent -- a worklist, not a single extra pass, since a
-    // freshly-marked callee's own body might itself call a *third* function
-    // needing the identical treatment (a real, if not yet exercised, shape:
-    // one algebra function delegating to another). `region_local.insert`
-    // returning `false` for an already-marked name is what keeps a cycle
-    // (mutually recursive functions, each with a real single call site
-    // elsewhere) from looping forever -- the second time either name is
-    // reached, there is nothing left to add, so the worklist drains.
-    let mut worklist: Vec<String> = region_local.iter().cloned().collect();
-    while let Some(name) = worklist.pop() {
-        let Some(def) = by_name.get(name.as_str()) else {
-            continue;
-        };
-        let mut inner_callees = HashSet::new();
-        collect_direct_callees(&def.body, &top_level_names, &mut inner_callees);
-        for callee in inner_callees {
-            if call_counts.get(&callee).copied().unwrap_or(0) == 1 && region_local.insert(callee.clone()) {
-                worklist.push(callee);
+    // Kind-1 seed: every call site found directly inside some loop's own
+    // repeating body, individually proven non-escaping. `find_loops_and_
+    // mark`/`analyze_loop_body` below are structurally identical to the
+    // original version of this module — only *what* a proven-safe
+    // occurrence does changes (recording its own site identity in `safe_
+    // sites`, unconditionally, rather than gating on `call_counts == 1`
+    // before inserting the *callee name* into a set).
+    let mut safe_sites: HashSet<CVar> = HashSet::new();
+    for f in &program.funcs {
+        find_loops_and_mark(&f.def.body, &top_level_names, &mut safe_sites);
+    }
+
+    // Fixed point: a top-level function is wholesale region-local once
+    // *every* one of its own call sites is in `safe_sites`; once it is,
+    // every direct callee found anywhere in *its own* body is safe too (no
+    // separate escaping check needed there — `collect_direct_callees`'s own
+    // soundness argument, unchanged from the original version of this
+    // module), which can in turn make some *other* function's own call
+    // sites all-safe, and so on.
+    let mut region_local: HashSet<String> = HashSet::new();
+    loop {
+        let mut changed = false;
+        for name in &top_level_names {
+            if region_local.contains(name) {
+                continue;
+            }
+            let Some(sites) = sites_by_callee.get(name) else {
+                continue;
+            };
+            if !sites.is_empty() && sites.iter().all(|v| safe_sites.contains(v)) {
+                region_local.insert(name.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+        // Propagate Kind-2 safety from *every* currently-region-local
+        // function's own body -- re-walking already-processed names each
+        // pass is redundant work (re-inserting an already-safe `CVar` is a
+        // harmless no-op) but simpler than tracking a separate delta set,
+        // and still bounded by `top_level_names.len()` outer iterations.
+        for name in region_local.clone() {
+            let Some(def) = by_name.get(name.as_str()) else {
+                continue;
+            };
+            let mut inner_sites = Vec::new();
+            collect_all_call_sites_in(&def.body, &top_level_names, &mut inner_sites);
+            for (_, v) in inner_sites {
+                safe_sites.insert(v);
             }
         }
     }
 
-    region_local
+    RegionAnalysis {
+        region_local,
+        safe_sites,
+        sites_by_callee,
+    }
 }
 
 /// Every top-level function name called *directly* anywhere in `expr` (any
-/// nesting of `If`/`Fix`) — the same `Fix{[k], App(callee, args)}` call
-/// shape `count_calls_in`/`collect_calls_and_derivations` already recognize
-/// above, stripped down to just the callee names themselves: the transitive
-/// descent's own soundness argument (`find_region_local_functions`'s own
-/// doc comment) needs no escaping/field-derivation tracking at this inner
-/// level at all, unlike those two.
+/// nesting of `If`/`Fix`) — a thin wrapper over `collect_direct_call_sites`
+/// below (this module's own risk otherwise: re-implementing the identical
+/// `Fix{[k], App(callee, args)}` call-shape match a second time, silently
+/// drifting apart from it over time).
 ///
 /// **A second caller, outside this module**: `mlir_lower.rs::lower_loop`
 /// reuses this directly (`pub(crate)`) on one specific loop's own already-
@@ -152,93 +233,98 @@ pub fn find_region_local_functions(program: &CpsProgram) -> HashSet<String> {
 /// finding (a real, VTune-confirmed `486`-million-call cost on the real
 /// `mnist-interop` kernel, `cleave_region_enter` itself near-free per call
 /// but never skipped even when nothing inside a given loop ever allocates
-/// region-locally at all) is exactly what this fixes. Reused rather than
-/// reimplemented for the same reason `find_region_local_functions`'s own
-/// transitive descent reuses it: a second, independent walk of the same
-/// call shape is a real risk of the two silently drifting apart over time.
+/// region-locally at all) is exactly what this fixes.
 pub(crate) fn collect_direct_callees(expr: &CExpr, top_level_names: &HashSet<String>, out: &mut HashSet<String>) {
+    let mut sites = Vec::new();
+    collect_direct_call_sites(expr, top_level_names, &mut sites);
+    out.extend(sites.into_iter().map(|(name, _)| name));
+}
+
+/// `collect_direct_callees`'s own identical call-shape recognition,
+/// additionally recording each call site's own bound `result_var` — needed
+/// by `analyze`'s own fixed point (Kind-2 propagation: a specific call
+/// site's own identity, not just its callee's name, is what `safe_sites`
+/// tracks).
+fn collect_direct_call_sites(expr: &CExpr, top_level_names: &HashSet<String>, out: &mut Vec<(String, CVar)>) {
     match expr {
-        CExpr::LetPrim { cont, .. } => collect_direct_callees(cont, top_level_names, out),
+        CExpr::LetPrim { cont, .. } => collect_direct_call_sites(cont, top_level_names, out),
         CExpr::App { .. } => {}
         CExpr::If {
             then_branch,
             else_branch,
             ..
         } => {
-            collect_direct_callees(then_branch, top_level_names, out);
-            collect_direct_callees(else_branch, top_level_names, out);
+            collect_direct_call_sites(then_branch, top_level_names, out);
+            collect_direct_call_sites(else_branch, top_level_names, out);
         }
         CExpr::Fix { defs, body } => {
             if let [k] = defs.as_slice() {
-                if let CExpr::App {
-                    func: CVal::Label(callee),
-                    args,
-                } = &**body
-                {
-                    let targets_k = args
-                        .last()
-                        .map(|a| matches!(a, CVal::Label(n) if n == &k.name))
-                        .unwrap_or(false);
-                    if targets_k && top_level_names.contains(callee) {
-                        out.insert(callee.clone());
+                if let [result_var] = k.params[..] {
+                    if let CExpr::App {
+                        func: CVal::Label(callee),
+                        args,
+                    } = &**body
+                    {
+                        let targets_k = args
+                            .last()
+                            .map(|a| matches!(a, CVal::Label(n) if n == &k.name))
+                            .unwrap_or(false);
+                        if targets_k && top_level_names.contains(callee) {
+                            out.push((callee.clone(), result_var));
+                        }
                     }
                 }
             }
             for d in defs {
-                collect_direct_callees(&d.body, top_level_names, out);
+                collect_direct_call_sites(&d.body, top_level_names, out);
             }
-            collect_direct_callees(body, top_level_names, out);
+            collect_direct_call_sites(body, top_level_names, out);
         }
     }
 }
 
-/// How many real, top-level-call-shaped `App`s target each top-level
-/// function name, across the *whole* program — `find_loops_and_mark`'s own
-/// safety precondition (a region-local candidate must have exactly one).
-fn count_call_sites(program: &CpsProgram, top_level_names: &HashSet<String>) -> HashMap<String, usize> {
-    let mut counts = HashMap::new();
-    for f in &program.funcs {
-        count_calls_in(&f.def.body, top_level_names, &mut counts);
-    }
-    counts
-}
-
-fn count_calls_in(expr: &CExpr, top_level_names: &HashSet<String>, counts: &mut HashMap<String, usize>) {
+/// Every real top-level call site anywhere in `expr`, `result_var`-
+/// identified, grouped by callee name by `analyze`'s own caller —
+/// unconditional recursion through every `Fix` def's own body regardless of
+/// `carried_types` (loop or not), the same uniform shape the original
+/// version of this module's own `count_calls_in` used for a plain running
+/// count alone. Exhaustive by design: `analyze`'s own "every call site
+/// safe?" test is meaningless without first knowing the true, complete
+/// population of call sites to check that against.
+fn collect_all_call_sites_in(expr: &CExpr, top_level_names: &HashSet<String>, out: &mut Vec<(String, CVar)>) {
     match expr {
-        CExpr::LetPrim { cont, .. } => count_calls_in(cont, top_level_names, counts),
+        CExpr::LetPrim { cont, .. } => collect_all_call_sites_in(cont, top_level_names, out),
         CExpr::App { .. } => {}
         CExpr::If {
             then_branch,
             else_branch,
             ..
         } => {
-            count_calls_in(then_branch, top_level_names, counts);
-            count_calls_in(else_branch, top_level_names, counts);
+            collect_all_call_sites_in(then_branch, top_level_names, out);
+            collect_all_call_sites_in(else_branch, top_level_names, out);
         }
         CExpr::Fix { defs, body } => {
-            // `lower_real_call`'s own exact shape (`mlir_lower.rs`'s own
-            // doc comment on that function): a single-def `Fix` whose own
-            // body is a real call targeting that one def's own name as its
-            // trailing continuation argument.
             if let [k] = defs.as_slice() {
-                if let CExpr::App {
-                    func: CVal::Label(callee),
-                    args,
-                } = &**body
-                {
-                    let targets_k = args
-                        .last()
-                        .map(|a| matches!(a, CVal::Label(n) if n == &k.name))
-                        .unwrap_or(false);
-                    if targets_k && top_level_names.contains(callee) {
-                        *counts.entry(callee.clone()).or_insert(0) += 1;
+                if let [result_var] = k.params[..] {
+                    if let CExpr::App {
+                        func: CVal::Label(callee),
+                        args: call_args,
+                    } = &**body
+                    {
+                        let targets_k = call_args
+                            .last()
+                            .map(|a| matches!(a, CVal::Label(n) if n == &k.name))
+                            .unwrap_or(false);
+                        if targets_k && top_level_names.contains(callee) {
+                            out.push((callee.clone(), result_var));
+                        }
                     }
                 }
             }
             for d in defs {
-                count_calls_in(&d.body, top_level_names, counts);
+                collect_all_call_sites_in(&d.body, top_level_names, out);
             }
-            count_calls_in(body, top_level_names, counts);
+            collect_all_call_sites_in(body, top_level_names, out);
         }
     }
 }
@@ -247,41 +333,40 @@ fn count_calls_in(expr: &CExpr, top_level_names: &HashSet<String>, counts: &mut 
 /// every nested `Fix`/`If`) looking for a self-recursive `CFunDef` (a real
 /// loop — `carried_types.is_some()`, `mlir_lower.rs::lower_loop`'s own
 /// precondition) and, for each one found, analyzes it.
-fn find_loops_and_mark(
-    expr: &CExpr,
-    top_level_names: &HashSet<String>,
-    call_counts: &HashMap<String, usize>,
-    region_local: &mut HashSet<String>,
-) {
+fn find_loops_and_mark(expr: &CExpr, top_level_names: &HashSet<String>, safe_sites: &mut HashSet<CVar>) {
     match expr {
-        CExpr::LetPrim { cont, .. } => find_loops_and_mark(cont, top_level_names, call_counts, region_local),
+        CExpr::LetPrim { cont, .. } => find_loops_and_mark(cont, top_level_names, safe_sites),
         CExpr::App { .. } => {}
         CExpr::If {
             then_branch,
             else_branch,
             ..
         } => {
-            find_loops_and_mark(then_branch, top_level_names, call_counts, region_local);
-            find_loops_and_mark(else_branch, top_level_names, call_counts, region_local);
+            find_loops_and_mark(then_branch, top_level_names, safe_sites);
+            find_loops_and_mark(else_branch, top_level_names, safe_sites);
         }
         CExpr::Fix { defs, body } => {
             for d in defs {
                 if d.carried_types.is_some() {
-                    analyze_loop_body(d, top_level_names, call_counts, region_local);
+                    analyze_loop_body(d, top_level_names, safe_sites);
                 }
                 // Recurse into the def's own body too -- a nested loop (the
                 // outer `epoch` loop containing the inner `s` loop, say),
                 // or a real call's own resumption continuation, might
                 // itself contain further loops.
-                find_loops_and_mark(&d.body, top_level_names, call_counts, region_local);
+                find_loops_and_mark(&d.body, top_level_names, safe_sites);
             }
-            find_loops_and_mark(body, top_level_names, call_counts, region_local);
+            find_loops_and_mark(body, top_level_names, safe_sites);
         }
     }
 }
 
 /// The real analysis, for one loop's own body: which of its own direct
-/// top-level calls are safe to mark region-local.
+/// top-level calls are individually safe (non-escaping) — recorded by call-
+/// site identity in `safe_sites`, unconditionally; `analyze`'s own fixed
+/// point is what later decides, per callee *name*, whether *every* one of
+/// its call sites (this loop's own occurrences, plus any found elsewhere in
+/// the whole program) ended up safe.
 ///
 /// **Scoped to `then_branch` alone, not `loop_def.body` as a whole — a
 /// real, found-by-testing soundness bug, not a style choice.**
@@ -311,12 +396,7 @@ fn find_loops_and_mark(
 /// anywhere in it, so unrelated to any tensor-specific pipeline stage)
 /// crashed exactly this way, `dynarray_new<Point>` wrongly in `region_
 /// local_fns` — fixed by this restriction alone.
-fn analyze_loop_body(
-    loop_def: &CFunDef,
-    top_level_names: &HashSet<String>,
-    call_counts: &HashMap<String, usize>,
-    region_local: &mut HashSet<String>,
-) {
+fn analyze_loop_body(loop_def: &CFunDef, top_level_names: &HashSet<String>, safe_sites: &mut HashSet<CVar>) {
     let Some(then_branch) = loop_then_branch(loop_def) else {
         // An unrecognized condition-chain shape -- `mlir_lower.rs::
         // lower_loop` is where a genuinely malformed loop panics loudly at
@@ -341,15 +421,9 @@ fn analyze_loop_body(
     let mut calls: Vec<(String, CVar)> = Vec::new();
     collect_calls_and_derivations(then_branch, top_level_names, &mut children, &mut calls);
 
-    for (callee, result_var) in &calls {
-        // Exactly one call site in the *whole* program -- this function's
-        // own module doc comment has the real reasoning for why that's
-        // load-bearing, not just a nicety.
-        if call_counts.get(callee).copied().unwrap_or(0) != 1 {
-            continue;
-        }
+    for (_callee, result_var) in &calls {
         if !reaches_escaping(*result_var, &children, &escaping) {
-            region_local.insert(callee.clone());
+            safe_sites.insert(*result_var);
         }
     }
 }
@@ -379,7 +453,7 @@ fn loop_then_branch(loop_def: &CFunDef) -> Option<&CExpr> {
 /// loop_body` call from `find_loops_and_mark`'s own top-level walk, which
 /// alone has the right `escaping` set (relative to *that* loop's own
 /// self-recursive tail-call) to judge it correctly.
-fn loop_then_and_else_branch(loop_def: &CFunDef) -> Option<(&CExpr, &CExpr)> {
+pub(crate) fn loop_then_and_else_branch(loop_def: &CFunDef) -> Option<(&CExpr, &CExpr)> {
     let mut cursor: &CExpr = &loop_def.body;
     loop {
         match cursor {
@@ -403,7 +477,7 @@ fn loop_then_and_else_branch(loop_def: &CFunDef) -> Option<(&CExpr, &CExpr)> {
 /// `loop_name` (this loop's own recursive "continue" self-call) —
 /// `mlir_lower.rs::lower_loop`'s own `then_branch`'s tail recursion becomes
 /// exactly `scf.yield` on these same values.
-fn collect_escaping(expr: &CExpr, loop_name: &str, escaping: &mut HashSet<CVar>) {
+pub(crate) fn collect_escaping(expr: &CExpr, loop_name: &str, escaping: &mut HashSet<CVar>) {
     match expr {
         CExpr::LetPrim { cont, .. } => collect_escaping(cont, loop_name, escaping),
         CExpr::App {
@@ -464,9 +538,9 @@ fn collect_escaping(expr: &CExpr, loop_name: &str, escaping: &mut HashSet<CVar>)
 }
 
 /// Populates `children` (`PrimOp::Field` parent -> child edges) and `calls`
-/// (every direct top-level call found, `lower_real_call`'s own exact shape
-/// — see `count_calls_in`'s own doc comment for that same shape).
-fn collect_calls_and_derivations(
+/// (every direct top-level call found, `collect_all_call_sites_in`'s own
+/// identical shape).
+pub(crate) fn collect_calls_and_derivations(
     expr: &CExpr,
     top_level_names: &HashSet<String>,
     children: &mut HashMap<CVar, Vec<CVar>>,
@@ -537,7 +611,7 @@ fn collect_calls_and_derivations(
 /// reachability search, no fixpoint needed (the graph is a finite,
 /// acyclic set of field-projection edges over one loop body's own CPS
 /// term, never larger).
-fn reaches_escaping(start: CVar, children: &HashMap<CVar, Vec<CVar>>, escaping: &HashSet<CVar>) -> bool {
+pub(crate) fn reaches_escaping(start: CVar, children: &HashMap<CVar, Vec<CVar>>, escaping: &HashSet<CVar>) -> bool {
     let mut stack = vec![start];
     let mut seen = HashSet::new();
     while let Some(v) = stack.pop() {

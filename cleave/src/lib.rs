@@ -17,6 +17,7 @@ pub mod pipeline;
 pub mod print;
 pub mod refcount;
 pub mod region_analysis;
+pub mod region_specialize;
 pub mod registry;
 pub mod rc_opt;
 pub mod redundant_copy_elim;

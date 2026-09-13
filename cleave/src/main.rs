@@ -392,6 +392,12 @@ fn real_main() -> ExitCode {
                     // own output even though `helper`'s optimized body no
                     // longer called either.
                     let optimized = eliminate_dead_code(optimized);
+                    // `pipeline.rs::build_optimized_cps`'s own identical
+                    // step (`doc/plan-region-arena.md`'s own "Step 2") --
+                    // included here too so this flag shows the exact
+                    // population of top-level functions `--emit-object`/
+                    // `--run` actually lower, `$region` splits included.
+                    let optimized = cleave::region_specialize::specialize_region_local_functions(optimized);
                     // Last CPS-to-CPS step, strictly after the e-graph pass
                     // -- see `cleave::refcount`'s own module doc comment
                     // and `pipeline.rs::build_optimized_cps`'s own
@@ -468,6 +474,13 @@ fn real_main() -> ExitCode {
                     // first sweep — run before optimization — has no way to
                     // anticipate.
                     let cps_program = eliminate_dead_code(cps_program);
+                    // `pipeline.rs::build_optimized_cps`'s own identical
+                    // step (`doc/plan-region-arena.md`'s own "Step 2") --
+                    // `lower_program` below internally consults `region_
+                    // analysis::find_region_local_functions`, so this flag
+                    // must show the *split* population, not a stale
+                    // pre-Step-2 view of it.
+                    let cps_program = cleave::region_specialize::specialize_region_local_functions(cps_program);
 
                     let dialect_registry = DialectRegistry::new();
                     register_all_dialects(&dialect_registry);
@@ -515,6 +528,10 @@ fn real_main() -> ExitCode {
                     // first sweep — run before optimization — has no way to
                     // anticipate.
                     let cps_program = eliminate_dead_code(cps_program);
+                    // `pipeline.rs::build_optimized_cps`'s own identical
+                    // step (`doc/plan-region-arena.md`'s own "Step 2") --
+                    // see the identical comment on `--dump-mlir` above.
+                    let cps_program = cleave::region_specialize::specialize_region_local_functions(cps_program);
 
                     let dialect_registry = DialectRegistry::new();
                     register_all_dialects(&dialect_registry);
@@ -602,6 +619,11 @@ fn real_main() -> ExitCode {
         // the first sweep — run before optimization — has no way to
         // anticipate.
         let cps_program = eliminate_dead_code(cps_program);
+        // `pipeline.rs::build_optimized_cps`'s own identical step (`doc/
+        // plan-region-arena.md`'s own "Step 2") -- must run before `lower_
+        // program` below internally consults `region_analysis::find_
+        // region_local_functions`.
+        let cps_program = cleave::region_specialize::specialize_region_local_functions(cps_program);
         // Last CPS-to-CPS step, strictly after the e-graph pass -- see
         // `cleave::refcount`'s own module doc comment for why, and
         // `pipeline.rs::build_optimized_cps`'s own identical step.

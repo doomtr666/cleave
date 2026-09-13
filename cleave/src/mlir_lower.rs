@@ -376,6 +376,18 @@ pub fn lower_program<'c>(
         })
         .collect();
     let region_local_fns = crate::region_analysis::find_region_local_functions(program);
+    // `CLEAVE_TRACE_REGION_LOCAL=1` -- the final, post-`region_specialize`
+    // population `region_analysis::analyze`'s own fixed point settled on
+    // (`doc/plan-region-arena.md`'s own "Step 2"), sorted for a stable diff
+    // across runs. Used to directly confirm a relaxation only ever *adds*
+    // names (never removes one) when auditing a future change here, and to
+    // check which functions Step 3's own `unify_alloc.rs` rename will be
+    // able to see once it starts consulting this set.
+    if std::env::var("CLEAVE_TRACE_REGION_LOCAL").is_ok() {
+        let mut names: Vec<&String> = region_local_fns.iter().collect();
+        names.sort();
+        eprintln!("CLEAVE_TRACE_REGION_LOCAL: {} functions: {names:?}", names.len());
+    }
     let constructed_structs = crate::refcount::collect_constructed_struct_names(program);
     let field_mutated_structs = crate::refcount::collect_field_mutated_struct_names(program);
     let extern_boundary_structs = crate::refcount::collect_extern_boundary_struct_names(program);
@@ -4161,6 +4173,9 @@ fn alloc_llvm_value<'c>(
     let context = ctx.context;
     let location = gen_loc(context);
     let ptr_ty = llvm::r#type::pointer(context, 0);
+    if std::env::var("CLEAVE_TRACE_ALLOC_TYPES").is_ok() {
+        eprintln!("ALLOC_TYPE {}", llvm_ty);
+    }
     let size = llvm_type_size_bytes(ctx, block, llvm_ty);
     let i64_ty: Type = IntegerType::new(context, 64).into();
     let (symbol, call_args): (&str, Vec<Value>) = if ctx.currently_region_local.get() {

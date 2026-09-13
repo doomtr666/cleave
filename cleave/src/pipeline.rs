@@ -224,6 +224,19 @@ fn build_optimized_cps(
     // `refcount`'s own module doc comment for why (it has no notion of
     // `Retain`/`Release`'s own effectful ordering, inserting them earlier
     // risks its own rewriting scrambling them).
+    // `doc/plan-region-arena.md`'s own "Step 2": splits any top-level
+    // function genuinely shared between a region-local-safe call site and
+    // an unsafe one into two names (`region_specialize.rs`'s own doc
+    // comment has the full reasoning) -- must run strictly before `mlir_
+    // lower.rs::lower_program` ever calls `region_analysis::find_region_
+    // local_functions` (internally, on whatever `CpsProgram` it's handed),
+    // which is every one of this function's own callers, transitively.
+    // Placed here, not after `insert_refcounting`: a pure CPS→CPS rename
+    // with no interaction with `Retain`/`Release` insertion either way, so
+    // ordering relative to it doesn't matter for correctness, but keeping
+    // it *before* means a cloned function's own body never needs to carry
+    // refcounting ops that would otherwise need duplicating consistently.
+    let cps_program = crate::region_specialize::specialize_region_local_functions(cps_program);
     let struct_schemas = collect_struct_schemas(program);
     let mlir_types = collect_mlir_types(program);
     Ok(insert_refcounting(

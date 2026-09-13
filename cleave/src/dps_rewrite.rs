@@ -73,6 +73,14 @@ use crate::mlir_lower::memref_descriptor_llvm_type;
 /// on a module that has none (a program with no struct-field `Tensor`
 /// writes at all) -- finds nothing, changes nothing.
 pub fn eliminate_redundant_field_store_copies<'c>(context: &'c Context, module: &mut Module<'c>) {
+    // TEMP diagnostic (`CLEAVE_NO_DPS=1`), alongside `CLEAVE_NO_DPS_
+    // PASSTHROUGH` below: skips this whole rewrite, so every struct-field
+    // write keeps its original allocate-fresh-buffer-then-memcpy shape.
+    // Bisection aid for the `data_size=104` double-release investigation
+    // (`doc/plan-region-arena.md`) -- remove once that is settled.
+    if std::env::var("CLEAVE_NO_DPS").is_ok() {
+        return;
+    }
     let candidates = find_candidates(module);
     for candidate in candidates {
         rewrite_one(context, module.body(), candidate);
@@ -547,6 +555,17 @@ fn match_candidate<'c, 'a>(
                 melior::ir::r#type::DimSize::Static(size) => dims.push(size as i64),
                 melior::ir::r#type::DimSize::Dynamic => return None,
             }
+        }
+        // TEMP diagnostic (`CLEAVE_NO_DPS_PASSTHROUGH=1`): declining this
+        // strategy makes the write fall back to the ordinary allocate+copy
+        // shape, so the destination field ends up owning a *fresh* buffer
+        // instead of sharing the source's. Exists to test, by bisection
+        // rather than by argument, whether pointer sharing introduced here
+        // is what lets a bufferization-owned buffer end up inside a struct
+        // field that CPS later releases (`doc/plan-region-arena.md`'s own
+        // `data_size=104` investigation). Remove once that is settled.
+        if std::env::var("CLEAVE_NO_DPS_PASSTHROUGH").is_ok() {
+            return None;
         }
         (Strategy::Passthrough, extract_src, elem_type, dims)
     } else {
