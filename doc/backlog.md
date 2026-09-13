@@ -6,6 +6,33 @@ Completed items live in [backlog-done.md](backlog-done.md).
 
 ---
 
+## A heap struct carried through a loop is released only at the enclosing function's `return`, so a long loop holds every iteration's allocation at once — a real, measured, unbounded leak, with a reproducing program
+
+Found while testing whether `8a748f8`'s `refcount.rs` fix earned its way back in after that commit was reset out of `main` (the entry below, and [plan-region-arena.md](plan-region-arena.md) §10). It did, for this one thing — but the fix itself was welded into 2000 lines alongside the two changes that caused the regression, so there is no clean hunk to cherry-pick and nothing was re-landed.
+
+**The reproducing program**, loop-carried so neither the e-graph nor MLIR can optimise it away:
+
+```cleave
+struct Boxed { v: i32, tag: [i32; 1] }
+fn make(x: i32) -> Boxed { Boxed(v: x, tag: [x]) }
+fn combine(a: Boxed, b: Boxed) -> Boxed { Boxed(v: a.v + b.tag[0], tag: [b.tag[0]]) }
+fn main() -> i32 {
+    let mut b = make(0);
+    for i in 0..200000000 { b = combine(b, make(i)); };
+    b.v
+}
+```
+
+Compiled by `5b2b10c`: **3.7 GB at 3 s, 18 GB at 15 s, climbing linearly.** Compiled by `8a748f8`: **4 MB flat, runs to completion.** (`tag: [i32; 1]` is load-bearing — an all-scalar struct is "light" and never refcounted at all, so an embedded array field is what forces the real heap path this exercises.)
+
+**The mechanism is not a missing release.** `CLEAVE_TRACE_RC` on a five-iteration run shows ten allocations and ten releases, perfectly balanced — but every `combine` result is released *after* the loop, not in the iteration that produced it. That is `refcount.rs`'s own documented policy (release at the latest possible point, the function's `return`, deliberately, to avoid a fixed point) meeting a loop: N live allocations at once. So this is not a correctness bug in the inserted refcounting; it is the absence of a real last-use analysis, which is exactly what the struct-allocation-strategy entry below and `C:\Users\chris\.claude\plans\` Tier-1 plan describe.
+
+**Why this is parked rather than urgent**: it only bites a loop carrying a heap struct that is *not* arena-backed. `mnist-interop` never hits it — its allocations are region-local and bulk-reclaimed per iteration, which is why it runs at 233 MB flat. The gap is real and the repro is cheap to re-run, but nothing in the tree today is paying for it.
+
+**When picking this up**: re-land only the release-seeding half. The `is_rc` bare-tensor widening and `compensate_refcounts.rs` from the same commit are both rejected on their own merits (plan-region-arena.md §10.3), and gating the widening off was measured to keep this leak fixed while removing the crash — the two are genuinely independent.
+
+---
+
 ## `8a748f8` was a severe regression and has been reset out of `main` — its `refcount.rs` param-alias fix still needs a reproducing case from the clean base before any of it goes back in
 
 Bisected on the real `mnist-interop` kernel with forced rebuilds: `5b2b10c` ("add debug info generation") is **233 MB flat, 10 epochs in 31.0 s, `test accuracy: 0.9342`, 803 tests green**; its child `8a748f8` ("refcount.rs: fix param-alias composition through Sgd, and a new pass to reconcile cleave/bufferization tensor double-ownership") **segfaults within 5 s**, and with the crash suppressed grows unbounded to ~19 GB. `main` has been reset to `5b2b10c`; the full investigation, every failed fix and the methodology failures that hid the regression for a whole session are written up in [plan-region-arena.md](plan-region-arena.md) (§5, §7, §8, §9).

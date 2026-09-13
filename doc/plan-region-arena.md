@@ -472,3 +472,61 @@ Executed, in this order, rather than patching forward:
 **The one real open question left.** `8a748f8` was written against genuine double-release crashes, and its `refcount.rs` half claimed a specific bug: param-alias composition through `Sgd` (`return_field_aliases` not composing through a callee that returns one of its own parameters' fields). That fix may well be correct and necessary — but it has never been observed to be necessary *from the clean base*, only from a base that was already broken. **Step 2 of §8.7 stands, and is the next task: produce a case that reproduces at `5b2b10c` before re-applying anything.** If no such case can be produced, the fix was addressing a symptom of the rest of its own commit, and stays out.
 
 **The methodology rule this whole episode earns**, on top of §8.4's four: *a base is only known-good once it has been measured on every axis a change could plausibly damage — tests, memory, speed, accuracy — and re-measured after any reset.* Every wrong conclusion in §5, §7 and §8.6 followed from diagnosing on an unverified base.
+
+## 10. The bugfix, tested from the clean base — it is real, and it is separable
+
+§9 left one task: decide whether `8a748f8`'s `refcount.rs` fix earns its way back in, by producing a case that reproduces at `5b2b10c` **before** re-applying anything. Done. The three regression tests `8a748f8` shipped were ported verbatim onto the clean base and run there:
+
+| Test | At `5b2b10c` | Reading |
+|---|---|---|
+| A struct passed to a genuinely identity-shaped function is released only once | **passes** | the double-release it guards does not exist on this base |
+| A transferred call result matching the final call's return type is still released | fails, 1 release of 3 | un-optimized CPS only — see below |
+| A bare tensor consumed only as a borrowed argument is released | fails, 0 releases | **this is the regression's own premise, not a bug** |
+
+The third one is the important one to reject. It asserts that `refcount.rs` must release a free-standing tensor — which is exactly what `8a748f8` implemented by promoting `is_bare_tensor_ty` into `is_rc` program-wide (§9), and exactly the double-ownership §7 root-caused. `unify_alloc.rs`'s own module doc comment already states the opposite is true by design: a tensor that never touches a struct field belongs to bufferization alone. And the clean base runs ten epochs of that identical `Ring::sub(model, Scale::scale(grad, lr))` shape at 233 MB flat, which is direct evidence that something is already freeing it. **This test encodes a false premise and must not be adopted.**
+
+### 10.1 The reproducing case
+
+The second test's shape, made loop-carried so neither the e-graph nor MLIR can optimise it away:
+
+```cleave
+struct Boxed { v: i32, tag: [i32; 1] }
+fn make(x: i32) -> Boxed { Boxed(v: x, tag: [x]) }
+fn combine(a: Boxed, b: Boxed) -> Boxed { Boxed(v: a.v + b.tag[0], tag: [b.tag[0]]) }
+fn main() -> i32 {
+    let mut b = make(0);
+    for i in 0..200000000 { b = combine(b, make(i)); };
+    b.v
+}
+```
+
+| Compiled by | Resident memory |
+|---|---|
+| `5b2b10c` (clean base) | **3.7 GB at 3 s, 18 GB at 15 s, climbing linearly** |
+| `8a748f8` | **4 MB, flat, runs to completion in ~9 s** |
+
+So the fix repairs a real, unbounded leak that genuinely reproduces on the clean base. It is not addressing a symptom of its own commit.
+
+**And the mechanism is not a missing release.** `CLEAVE_TRACE_RC` on a five-iteration run of the same program shows ten allocations and ten releases — perfectly balanced — but every `combine` result is released *after* the loop, not in the iteration that produced it. That is `refcount.rs`'s own documented "release at the latest possible point (the function's return)" policy meeting a loop: N live allocations at once. `mnist-interop` does not show it because its own allocations are arena-backed and bulk-reclaimed per iteration. This is the same gap `doc/backlog.md`'s struct-allocation-strategy entry describes as needing a real last-use analysis.
+
+### 10.2 The fix and the regression are separable — measured, not argued
+
+Gating the bare-tensor widening off at `8a748f8` itself (`is_rc` restored to its `5b2b10c` shape, everything else in that commit untouched):
+
+| | Leak repro above | `mnist-interop` |
+|---|---|---|
+| `8a748f8` as shipped | 4 MB flat | **segfault within 5 s** |
+| `8a748f8`, widening gated off | **4 MB flat — fix intact** | **no crash, reaches epoch 8** |
+| `5b2b10c` | 18 GB | 233 MB flat, 31.0 s, `0.9342` |
+
+The widening is the crash. Removing it costs the leak fix nothing.
+
+**But that is not the whole regression.** With the widening off, `8a748f8` still sawtooths between 18 MB and 18 GB across epochs — no crash, but ~80× the clean base's flat 233 MB. A second, independent defect remains in that commit, and `compensate_refcounts.rs`'s `suppress_bufferization_owned_releases` (unsound per §8.1/§8.5, and shown in §8.3 to be suppressing an arbitrary 24 buffers rather than the right ones) is the first suspect.
+
+### 10.3 Conclusion
+
+Three separate things were welded into one commit, and they have different verdicts:
+
+1. **The release-seeding fix for structs transferred into a call — keep.** Real, reproduces at `5b2b10c` as an unbounded leak, fixed cleanly, and independent of the other two. This is the piece to re-land, on its own, with the loop-carried program above as its acceptance test alongside the unit test.
+2. **The `is_rc` bare-tensor widening — reject.** It is the crash, and it contradicts `unify_alloc.rs`'s own ownership model. The test asserting it should be deleted, not ported.
+3. **`compensate_refcounts.rs` — reject.** Written to reconcile a double-ownership that (2) had just created, and unsound in principle regardless (§8.1, §8.5). It also does not account for the remaining 80× memory, which is the next thing to isolate if any part of that commit is revisited.
