@@ -6,6 +6,18 @@ Completed items live in [backlog-done.md](backlog-done.md).
 
 ---
 
+## `8a748f8` was a severe regression and has been reset out of `main` — its `refcount.rs` param-alias fix still needs a reproducing case from the clean base before any of it goes back in
+
+Bisected on the real `mnist-interop` kernel with forced rebuilds: `5b2b10c` ("add debug info generation") is **233 MB flat, 10 epochs in 31.0 s, `test accuracy: 0.9342`, 803 tests green**; its child `8a748f8` ("refcount.rs: fix param-alias composition through Sgd, and a new pass to reconcile cleave/bufferization tensor double-ownership") **segfaults within 5 s**, and with the crash suppressed grows unbounded to ~19 GB. `main` has been reset to `5b2b10c`; the full investigation, every failed fix and the methodology failures that hid the regression for a whole session are written up in [plan-region-arena.md](plan-region-arena.md) (§5, §7, §8, §9).
+
+**The one open question, and it is a real one.** `8a748f8` bundled three independent changes into one 2000-line commit: the `refcount.rs` param-alias composition fix (`return_field_aliases` not composing through a callee returning one of its own parameters' fields), the new `compensate_refcounts.rs` reconciliation pass, and runtime diagnostics. The middle one is now understood to be unsound in principle (§8.1/§8.5 — no static SSA-level pass can reconcile two ownership systems whose correspondence is many-to-many and decided after CPS commits) and does not come back. The **first** one was written against genuine double-release crashes and may well be correct — but it has only ever been observed to be necessary from a base that was already broken. **Next step: produce a case that reproduces at `5b2b10c`.** If none can be produced, the fix was treating a symptom of the rest of its own commit and stays out.
+
+The size-class pool is *not* affected and does not need re-landing — it is in `5a29433`/`7f8bccf`, both before `5b2b10c`, so the "amortise the last 10% of system-allocator traffic through a pool" objective is already banked and already measured in the known-good base.
+
+Separately preserved on branch `wip/region-arena` (`5eec57a`), explicitly **not** re-validated because every measurement on it was taken on top of this regression: a whole-program fixed-point rewrite of `region_analysis.rs` carrying call-site identity (`RegionAnalysis { region_local, safe_sites, sites_by_callee }`), a new `region_specialize.rs` splitting genuinely-mixed callees into `f`/`f$region`, an arena-depth fallback in `cleave_alloc_local`, an `AtomicI64` refcount, and 16 new unit tests. Worth re-deriving from the clean base once the question above is settled — not worth trusting as-is.
+
+---
+
 ## `mut` carries no real semantic weight for *most* scalar/struct/tuple bindings — likely removable for those, but `DynArray`'s own mutate-in-place `push` turns out to be a genuine, permanent exception, not a stopgap — raised and then corrected while designing the struct-allocation-strategy entry below
 
 Surfaced directly while working out why `DynArray<T>`'s own envelope (`{buf: RawBuf, len: i32, cap: i32}`) seemed to need heap identity despite being exactly as small/pointer-shaped as `Dense` (see the entry below): the real reason wasn't the envelope's own size, it was `push`'s own API convention — mutates its `mut v: DynArray<T>` parameter in place, returns nothing, relies on the caller's binding already being a heap pointer under today's implementation for the mutation to be observed at all.
