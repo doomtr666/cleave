@@ -400,10 +400,12 @@ fn real_main() -> ExitCode {
                     // not an earlier, pre-refcounting snapshot of it.
                     let struct_schemas = collect_struct_schemas(&program);
                     let mlir_types = collect_mlir_types(&program);
+                    let escaping = cleave::escape::escaping_struct_vars(&optimized);
                     let optimized = cleave::refcount::insert_refcounting(
                         optimized,
                         &struct_schemas,
                         &mlir_types,
+                        &escaping,
                     );
                     print!("{}", dump_cps_program(&optimized));
                 }
@@ -607,10 +609,12 @@ fn real_main() -> ExitCode {
         // `pipeline.rs::build_optimized_cps`'s own identical step.
         let mlir_types = collect_mlir_types(&program);
         let struct_schemas = collect_struct_schemas(&program);
+        let escaping = cleave::escape::escaping_struct_vars(&cps_program);
         let cps_program = cleave::refcount::insert_refcounting(
             cps_program,
             &struct_schemas,
             &mlir_types,
+            &escaping,
         );
 
         let dialect_registry = DialectRegistry::new();

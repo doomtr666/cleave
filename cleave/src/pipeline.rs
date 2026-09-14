@@ -14,6 +14,7 @@ use crate::cps::{
 use crate::diag::{Diagnostic, SourceMap};
 use crate::dps_rewrite::eliminate_redundant_field_store_copies;
 use crate::egraph::{DerivativeRequest, optimize_program, synthesize_derivatives};
+use crate::escape::escaping_struct_vars;
 use crate::mlir_lower::lower_program;
 use crate::redundant_copy_elim::eliminate_self_copies;
 use crate::refcount::insert_refcounting;
@@ -225,10 +226,16 @@ fn build_optimized_cps(
     // risks its own rewriting scrambling them).
     let struct_schemas = collect_struct_schemas(program);
     let mlir_types = collect_mlir_types(program);
+    // Escape analysis: which `PrimOp::Struct`-bound vars cross a jump
+    // (slots, need header + RC) vs die before any jump (arena temps).
+    // Must run after e-graph optimisation — the optimised CPS is what
+    // `insert_refcounting` and `lower_program` both operate on.
+    let escaping = escaping_struct_vars(&cps_program);
     Ok(insert_refcounting(
         cps_program,
         &struct_schemas,
         &mlir_types,
+        &escaping,
     ))
 }
 
@@ -772,6 +779,21 @@ pub fn lower_to_llvm<'c>(
         ]);
     }
 
+    // `CLEAVE_DUMP_PRE_BUFFERIZE=<path>` -- the still-tensor-typed IR, as
+    // `mlir_lower.rs` emitted it, immediately before one-shot-bufferize
+    // runs. Pair it with `CLEAVE_DUMP_POST_DEALLOC` below: bufferization's
+    // own equivalence/in-place-reuse decisions leave *no trace* after the
+    // fact, so if two tensor-level values were given one buffer, diffing
+    // the two sides of this boundary is the only way to see it. This must
+    // stay *above* the pass manager below -- placed after it, it captures
+    // memref-typed IR with every `bufferization.to_tensor` already folded
+    // away, which silently answers a different question than the one the
+    // name promises.
+    if let Ok(path) = std::env::var("CLEAVE_DUMP_PRE_BUFFERIZE") {
+        std::fs::write(&path, module.as_operation().to_string())
+            .unwrap_or_else(|e| eprintln!("CLEAVE_DUMP_PRE_BUFFERIZE: failed to write {path}: {e}"));
+    }
+
     let pass_manager = pass::PassManager::new(context);
     pass::bufferization::register_one_shot_bufferize_pass();
     if parse_pass_pipeline(
@@ -829,18 +851,6 @@ pub fn lower_to_llvm<'c>(
     // writable`, so the promise is genuinely true and this pass — reused
     // here as-is, no longer worked around — frees the *copy*, never the
     // struct's own storage.
-    // `CLEAVE_DUMP_PRE_BUFFERIZE=<path>` -- dumps the still-tensor-typed IR
-    // right before buffer deallocation runs, so it can be compared against
-    // `--dump-mlir-lowered`'s own final memref-level output for the same
-    // construction site. The pairing matters: one-shot-bufferize's own
-    // equivalence/in-place-reuse decisions leave *no trace* after the fact,
-    // so if two tensor-level values were given one buffer, the only way to
-    // see it is to diff the two sides of this boundary.
-    if let Ok(path) = std::env::var("CLEAVE_DUMP_PRE_BUFFERIZE") {
-        std::fs::write(&path, module.as_operation().to_string())
-            .unwrap_or_else(|e| eprintln!("CLEAVE_DUMP_PRE_BUFFERIZE: failed to write {path}: {e}"));
-    }
-
     let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::bufferization::create_ownership_based_buffer_deallocation_pass());
     pass_manager.add_pass(pass::bufferization::create_buffer_deallocation_simplification_pass());

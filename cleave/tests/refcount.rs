@@ -56,7 +56,8 @@ fn refcounted_cps(src: &str) -> CpsProgram {
     let cps_program = cleave::cps::eliminate_dead_code(cps_program);
     let struct_schemas = collect_struct_schemas(&program);
     let mlir_types = collect_mlir_types(&program);
-    insert_refcounting(cps_program, &struct_schemas, &mlir_types)
+    let escaping = cleave::escape::escaping_struct_vars(&cps_program);
+    insert_refcounting(cps_program, &struct_schemas, &mlir_types, &escaping)
 }
 
 /// Every struct name any `Retain`/`Release` in `program` targets — walks
@@ -236,7 +237,8 @@ fn run_i32_with_extra_symbols(src: &str, extra_symbols: &[(&str, *mut ())]) -> i
     let cps_program = cleave::cps::eliminate_dead_code(cps_program);
     let struct_schemas = collect_struct_schemas(&program);
     let mlir_types = collect_mlir_types(&program);
-    let cps_program = insert_refcounting(cps_program, &struct_schemas, &mlir_types);
+    let escaping = cleave::escape::escaping_struct_vars(&cps_program);
+    let cps_program = insert_refcounting(cps_program, &struct_schemas, &mlir_types, &escaping);
 
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);

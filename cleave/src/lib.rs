@@ -12,6 +12,7 @@ pub mod lower;
 pub mod mlir_lower;
 pub mod monomorphize;
 pub mod parser;
+pub mod escape;
 pub mod pipeline;
 pub mod print;
 pub mod refcount;

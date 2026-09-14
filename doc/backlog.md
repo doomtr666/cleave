@@ -6,30 +6,79 @@ Completed items live in [backlog-done.md](backlog-done.md).
 
 ---
 
-## A heap struct carried through a loop is released only at the enclosing function's `return`, so a long loop holds every iteration's allocation at once — a real, measured, unbounded leak, with a reproducing program
+## Ownership is classified by *type* (`is_rc(ty: &Ty)`) where it should be classified by *role* — the model that would be correct, why the code answers a coarser question, and what that costs
+
+Worked out in discussion after the `8a748f8` reset, against the code rather than from first principles. The model below is the user's; the gaps between it and the implementation were each checked in the source.
+
+**The model — two storage classes, decided by one question: does this value cross the jump?**
+
+- **Slot** — parameters and return values, anything carried into the next continuation. Ownership transfers here. **Release rule: a value is released at the jump, if and only if it is not used in the continuation being jumped to** (not passed as an argument, and not free in its body). Local and syntactic — no fixpoint.
+- **Temp** — everything that dies before the jump. Three sub-classes: the stack (tiny only), the arena (CPS-managed, for temps that provably don't escape the region), and buffers MLIR's own lowering introduces (a reduction accumulator being the hard case).
+
+Aliasing is handled without changing the release rule: when a call hands back its own argument, a `retain` at the transfer means the count goes 2 → 1 at the jump and the object survives. That is not a special case bolted on — the existing test `a_struct_passed_to_a_genuinely_identity_shaped_function_is_released_only_once` already passes on this base, so the rule must preserve it and does.
+
+Note that "slot" and "temp" are the same predicate read in two directions — escapes the continuation, or doesn't. There is one analysis to write, not two.
+
+**Why the code has bugs even though the model holds — three measured divergences:**
+
+1. **Classification is by type, not by role.** `RefcountCtx::is_rc` takes a `&Ty`. Two values of the same type, one escaping and one not, are indistinguishable. This is the deep one, and it explains the `8a748f8` disaster exactly: that commit flipped **one boolean** in `is_rc` (adding bare tensors) and thereby moved an entire population from "MLIR owns it" to "cleave owns it" in a single edit. Under role-based classification that edit could not be expressed — each value is classified by what it does, so there is no switch that reclassifies a population wholesale.
+2. **Release fires at the function's `return`, not at the jump.** `refcount.rs`'s own module doc states this as a deliberate choice ("deliberately **not** a last-use/liveness analysis — it releases at the *latest* possible point"). The machinery to do better already exists: the pass already computes what is live at each jump (arguments passed plus free variables); it uses that to decide what to *keep*, never to decide what to release.
+3. **Ownership does not cross a call.** `walk_var_info` populates `owned_origin` only from `LetPrim` — `PrimOp::Struct` is owned, `PrimOp::Field` inherits from its base, everything else is not. The `App` arm is literally empty (`CExpr::App { .. } => {}`). So a value returned from a call is never marked owned, and rule 2 then sweeps it up at the `return`. **This is the direct cause of the unbounded loop leak in the entry above** — and it is why `b = Boxed(...)` constructed inline does *not* leak (it goes through `PrimOp::Struct`) while `b = bump(b)` does.
+
+**Explicitly ruled out — do not restart this.** A separate ANF/normalisation pass to name intermediates was considered and is **not needed**: cleave's CPS already names everything. `LetPrim { var, .. }` binds every primitive result, and a call's result arrives as the continuation's own parameter. The problem was never that values lack names; it is that ownership is not computed for them across a call. Checked in `cps.rs`/`refcount.rs` directly, not assumed.
+
+**What the model buys downstream.** Every hack in the current pipeline exists to repair a decision taken at the wrong granularity: `dps_rewrite` decides buffer sharing at MLIR level after CPS has already committed its retain/release placement (and `Strategy::Passthrough` then has to emit a compensating `cleave_retain`); `compensate_refcounts.rs` existed to patch that in turn; `unify_alloc.rs` renames allocators wholesale at the end because nothing earlier can say who owns what. Deciding ownership per value, at the jump, removes the reason each of those exists — see the destination-passing entry below for the measured half of that argument.
+
+**Order of work.** The missing `App` rule first: it is one rule in one file, it closes a measured leak, and it is the honest prerequisite for any last-use analysis. The role-based classification and the jump-time release rule after that. Destination-passing emission is a separate, larger piece.
+
+---
+
+## `--promote-buffers-to-stack` is not in the pipeline at all — the obvious lever for the MLIR-owned temporaries cleave can never own, never measured
+
+Checked directly: `pipeline.rs` runs `one-shot-bufferize`, `ownership-based-buffer-deallocation`, `buffer-deallocation-simplification` and `lower-deallocations`, and **no** buffer-hoisting or stack-promotion pass of any kind.
+
+That leaves the one storage class cleave has no lever on entirely at the mercy of the heap. Some of MLIR's own lowering-introduced buffers are short-lived and statically bounded — a reduction accumulator is the canonical example, and the one case destination-passing can never fix, since there is no pre-existing buffer of the right shape to hand it. `--promote-buffers-to-stack` would move exactly that population off the heap without cleave having to own it, which is the property that matters: the rule for this class has to stay "MLIR owns it, cleave never touches it" (violating that rule is precisely what `8a748f8` did).
+
+Caveat, and the reason this needs measuring rather than just enabling: the project has a standing, hard-won rule that bounded-but-large never reaches the real call stack (see the struct-allocation-strategy entry below, and the AOT `--no-openmp` stack-overflow bug in [backlog-done.md](backlog-done.md)). MLIR's pass takes a size threshold; it must be set conservatively, and the AOT `--no-openmp` configuration — the one that already overflowed once — is the acceptance case, not the default one.
+
+Cheap to try: add the pass, set a small threshold, measure `mnist-interop` under the usual protocol plus an explicit `--no-openmp` run.
+
+---
+
+## A heap struct rebound each loop iteration **from the result of a function call** is released only at the enclosing function's `return`, so a long loop holds every iteration's allocation at once — a real, measured, unbounded leak, narrowed to a three-line program
 
 Found while testing whether `8a748f8`'s `refcount.rs` fix earned its way back in after that commit was reset out of `main` (the entry below, and [plan-region-arena.md](plan-region-arena.md) §10). It did, for this one thing — but the fix itself was welded into 2000 lines alongside the two changes that caused the regression, so there is no clean hunk to cherry-pick and nothing was re-landed.
 
-**The reproducing program**, loop-carried so neither the e-graph nor MLIR can optimise it away:
+**The reproducing program**, minimised to the smallest shape that still leaks:
 
 ```cleave
 struct Boxed { v: i32, tag: [i32; 1] }
 fn make(x: i32) -> Boxed { Boxed(v: x, tag: [x]) }
-fn combine(a: Boxed, b: Boxed) -> Boxed { Boxed(v: a.v + b.tag[0], tag: [b.tag[0]]) }
+fn bump(a: Boxed) -> Boxed { Boxed(v: a.v + 1, tag: [a.tag[0]]) }
 fn main() -> i32 {
     let mut b = make(0);
-    for i in 0..200000000 { b = combine(b, make(i)); };
+    for i in 0..200000000 { b = bump(b); };
     b.v
 }
 ```
 
 Compiled by `5b2b10c`: **3.7 GB at 3 s, 18 GB at 15 s, climbing linearly.** Compiled by `8a748f8`: **4 MB flat, runs to completion.** (`tag: [i32; 1]` is load-bearing — an all-scalar struct is "light" and never refcounted at all, so an embedded array field is what forces the real heap path this exercises.)
 
-**The mechanism is not a missing release.** `CLEAVE_TRACE_RC` on a five-iteration run shows ten allocations and ten releases, perfectly balanced — but every `combine` result is released *after* the loop, not in the iteration that produced it. That is `refcount.rs`'s own documented policy (release at the latest possible point, the function's `return`, deliberately, to avoid a fixed point) meeting a loop: N live allocations at once. So this is not a correctness bug in the inserted refcounting; it is the absence of a real last-use analysis, which is exactly what the struct-allocation-strategy entry below and `C:\Users\chris\.claude\plans\` Tier-1 plan describe.
+**The call is the trigger, and that was established by elimination, not by reading the IR.** Three variants of the same loop body, same struct, same iteration count:
+
+| Loop body | Resident memory |
+|---|---|
+| `b = combine(b, make(i))` — a call, with a freshly-built argument | 18 GB |
+| `b = bump(b)` — a call, **no fresh argument at all** | 18 GB, identical rate |
+| `b = Boxed(v: b.v + 1, tag: [i])` — same rebinding, **constructed inline, no call** | **4 MB, flat** |
+
+Dropping the fresh argument changes nothing; dropping the call fixes it completely. So the trigger is neither the transferred argument nor the rebinding on its own — it is the **call resumption**, which loses the value the rebinding displaces.
+
+**And the mechanism is not a missing release.** `CLEAVE_TRACE_RC` on a five-iteration run shows ten allocations and ten releases, perfectly balanced — and per iteration one released immediately (the argument) and one deferred to the end (the call result the next iteration displaces). That is `refcount.rs`'s own documented policy — release at the latest possible point, the function's `return`, deliberately, to avoid a fixed point — meeting a call resumption inside a loop: N live allocations at once. So this is not a correctness bug in the inserted refcounting; it is the absence of a real last-use analysis, which is exactly what the struct-allocation-strategy entry below describes (its \"Tier 1\" half: eliminating provably-redundant retain/release pairs by computing a real last use, instead of deferring every release to the `return`).
 
 **Why this is parked rather than urgent**: it only bites a loop carrying a heap struct that is *not* arena-backed. `mnist-interop` never hits it — its allocations are region-local and bulk-reclaimed per iteration, which is why it runs at 233 MB flat. The gap is real and the repro is cheap to re-run, but nothing in the tree today is paying for it.
 
-**When picking this up**: re-land only the release-seeding half. The `is_rc` bare-tensor widening and `compensate_refcounts.rs` from the same commit are both rejected on their own merits (plan-region-arena.md §10.3), and gating the widening off was measured to keep this leak fixed while removing the crash — the two are genuinely independent.
+**When picking this up**: the site is `rewrite_body`'s own `Fix` arm — the call resumption — which is the region `8a748f8` rewrote under the name "param-alias composition"; use `b = bump(b)` above as the acceptance program, since it is the variant with nothing else in it. Re-land only the release-seeding half. The `is_rc` bare-tensor widening and `compensate_refcounts.rs` from the same commit are both rejected on their own merits (plan-region-arena.md §10.3), and gating the widening off was measured to keep this leak fixed while removing the crash — the two are genuinely independent.
 
 ---
 

@@ -59,16 +59,27 @@
 //! measurement this pass's own impact was checked against).
 
 use crate::cps::{CExpr, CVal, CVar, CpsProgram, PrimOp};
+use std::collections::HashSet;
 
 /// Runs once, after `refcount::insert_refcounting`, over every top-level
 /// function's own body — see the module's own doc comment for the full
 /// design and its own safety argument.
-pub(crate) fn eliminate_redundant_retain_release(program: CpsProgram) -> CpsProgram {
+///
+/// `escaping_structs` is the set of `CVar`s that cross at least one
+/// continuation jump. For a var NOT in this set (a pure temporary), the
+/// retain/release pair is provably redundant even across `Fix` boundaries
+/// that the conservative forward scan can't normally cross — a non-escaping
+/// var is never live at any `App`, so its `Release` is always in the `body`
+/// field of any enclosing `Fix`, never inside a def's own body.
+pub(crate) fn eliminate_redundant_retain_release(
+    program: CpsProgram,
+    escaping_structs: &HashSet<CVar>,
+) -> CpsProgram {
     let funcs = program
         .funcs
         .into_iter()
         .map(|mut top| {
-            top.def.body = optimize_body(top.def.body);
+            top.def.body = optimize_body(top.def.body, escaping_structs);
             top
         })
         .collect();
@@ -87,7 +98,7 @@ pub(crate) fn eliminate_redundant_retain_release(program: CpsProgram) -> CpsProg
 /// `owned` set into it, whether it's an `if`'s own two branches or a
 /// loop/call's own initial jump) — walked as part of the very same pass,
 /// not recursed into separately.
-fn optimize_body(expr: CExpr) -> CExpr {
+fn optimize_body(expr: CExpr, escaping: &HashSet<CVar>) -> CExpr {
     match expr {
         CExpr::LetPrim {
             var,
@@ -100,19 +111,19 @@ fn optimize_body(expr: CExpr) -> CExpr {
                 if let [CVal::Var(x)] = args.as_slice() {
                     let x = *x;
                     let result = if starts_protected_embedding(&cont) {
-                        try_eliminate_for_retain(&cont, x)
+                        try_eliminate_for_retain(&cont, x, escaping)
                     } else {
                         // The retain-on-read shape (`refcount.rs::rewrite_
                         // body`'s own `field_read_retain`) — `x` is simply
                         // an ordinarily-owned value from here on, no
                         // protected first occurrence to skip past.
-                        try_eliminate_for(&cont, x)
+                        try_eliminate_for(&cont, x, escaping)
                     };
                     if let Some(new_cont) = result {
                         // The retain itself is dropped entirely (not
                         // re-emitted) — keep optimizing what's left, more
                         // eliminable retains may follow.
-                        return optimize_body(new_cont);
+                        return optimize_body(new_cont, escaping);
                     }
                 }
             }
@@ -121,7 +132,7 @@ fn optimize_body(expr: CExpr) -> CExpr {
                 ty,
                 op,
                 args,
-                cont: Box::new(optimize_body(*cont)),
+                cont: Box::new(optimize_body(*cont, escaping)),
             }
         }
         CExpr::App { .. } => expr,
@@ -131,20 +142,20 @@ fn optimize_body(expr: CExpr) -> CExpr {
             else_branch,
         } => CExpr::If {
             cond,
-            then_branch: Box::new(optimize_body(*then_branch)),
-            else_branch: Box::new(optimize_body(*else_branch)),
+            then_branch: Box::new(optimize_body(*then_branch, escaping)),
+            else_branch: Box::new(optimize_body(*else_branch, escaping)),
         },
         CExpr::Fix { defs, body } => {
             let defs = defs
                 .into_iter()
                 .map(|mut d| {
-                    d.body = optimize_body(d.body);
+                    d.body = optimize_body(d.body, escaping);
                     d
                 })
                 .collect();
             CExpr::Fix {
                 defs,
-                body: Box::new(optimize_body(*body)),
+                body: Box::new(optimize_body(*body, escaping)),
             }
         }
     }
@@ -179,7 +190,7 @@ fn starts_protected_embedding(expr: &CExpr) -> bool {
 /// assumed (by `starts_protected_embedding`, checked at the only call
 /// site) to actually have this shape — falls back to giving up, not to
 /// guessing, if it somehow doesn't.
-fn try_eliminate_for_retain(expr: &CExpr, x: CVar) -> Option<CExpr> {
+fn try_eliminate_for_retain(expr: &CExpr, x: CVar, escaping: &HashSet<CVar>) -> Option<CExpr> {
     let CExpr::LetPrim {
         var,
         ty,
@@ -192,7 +203,7 @@ fn try_eliminate_for_retain(expr: &CExpr, x: CVar) -> Option<CExpr> {
     };
     match op {
         PrimOp::Retain(_) => {
-            let new_cont = try_eliminate_for_retain(cont, x)?;
+            let new_cont = try_eliminate_for_retain(cont, x, escaping)?;
             Some(CExpr::LetPrim {
                 var: *var,
                 ty: ty.clone(),
@@ -202,7 +213,7 @@ fn try_eliminate_for_retain(expr: &CExpr, x: CVar) -> Option<CExpr> {
             })
         }
         PrimOp::Struct(..) | PrimOp::Array | PrimOp::FieldStore { .. } | PrimOp::Store { .. } => {
-            let new_cont = try_eliminate_for(cont, x)?;
+            let new_cont = try_eliminate_for(cont, x, escaping)?;
             Some(CExpr::LetPrim {
                 var: *var,
                 ty: ty.clone(),
@@ -223,7 +234,7 @@ fn try_eliminate_for_retain(expr: &CExpr, x: CVar) -> Option<CExpr> {
 /// (a loop/call `Fix`, or a terminal `App` with `x` simply absent, meaning
 /// its own fate isn't tracked by this local mechanism at all) must also
 /// give up rather than guess.
-fn try_eliminate_for(expr: &CExpr, x: CVar) -> Option<CExpr> {
+fn try_eliminate_for(expr: &CExpr, x: CVar, escaping: &HashSet<CVar>) -> Option<CExpr> {
     match expr {
         CExpr::LetPrim {
             var,
@@ -260,7 +271,7 @@ fn try_eliminate_for(expr: &CExpr, x: CVar) -> Option<CExpr> {
             if !transparent_field_read && references(args, x) {
                 return None; // a genuine second use -- the retain stays
             }
-            let new_cont = try_eliminate_for(cont, x)?;
+            let new_cont = try_eliminate_for(cont, x, escaping)?;
             Some(CExpr::LetPrim {
                 var: *var,
                 ty: ty.clone(),
@@ -284,8 +295,8 @@ fn try_eliminate_for(expr: &CExpr, x: CVar) -> Option<CExpr> {
             else_branch,
             ..
         } => {
-            let new_then = try_eliminate_for(then_branch, x)?;
-            let new_else = try_eliminate_for(else_branch, x)?;
+            let new_then = try_eliminate_for(then_branch, x, escaping)?;
+            let new_else = try_eliminate_for(else_branch, x, escaping)?;
             let CExpr::If { cond, .. } = expr else {
                 unreachable!()
             };
@@ -299,16 +310,26 @@ fn try_eliminate_for(expr: &CExpr, x: CVar) -> Option<CExpr> {
             // Recognize exactly the `if`'s own join shape (`cps.rs::
             // ExprKind::If`'s own conversion) -- pass through into both
             // branches transparently; any other `Fix` (a loop, or a real
-            // call's own resumption) is a hard stop for this first
-            // version, per the module's own doc comment.
+            // call's own resumption) is a hard stop for escaping vars.
             if let ([_join], CExpr::If { .. }) = (defs.as_slice(), body.as_ref()) {
-                let new_body = try_eliminate_for(body, x)?;
+                let new_body = try_eliminate_for(body, x, escaping)?;
+                Some(CExpr::Fix {
+                    defs: defs.clone(),
+                    body: Box::new(new_body),
+                })
+            } else if !escaping.contains(&x) {
+                // Non-escaping var: by escape analysis, `x` is never live at
+                // any `App` — its `Release` must be in this Fix's own `body`
+                // (inserted by `releases_for_app` just before the terminal
+                // App), never inside a def's own body. Safe to scan through
+                // the Fix body without touching the defs at all.
+                let new_body = try_eliminate_for(body, x, escaping)?;
                 Some(CExpr::Fix {
                     defs: defs.clone(),
                     body: Box::new(new_body),
                 })
             } else {
-                None
+                None // escaping var: conservative stop, as before
             }
         }
     }

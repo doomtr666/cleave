@@ -480,14 +480,14 @@ Executed, in this order, rather than patching forward:
 | Test | At `5b2b10c` | Reading |
 |---|---|---|
 | A struct passed to a genuinely identity-shaped function is released only once | **passes** | the double-release it guards does not exist on this base |
-| A transferred call result matching the final call's return type is still released | fails, 1 release of 3 | un-optimized CPS only — see below |
+| A transferred call result matching the final call's return type is still released | fails, 1 release of 3 | un-optimized CPS only — the runtime path releases the transferred argument correctly, and the real leak §10.1 isolates is a different value |
 | A bare tensor consumed only as a borrowed argument is released | fails, 0 releases | **this is the regression's own premise, not a bug** |
 
 The third one is the important one to reject. It asserts that `refcount.rs` must release a free-standing tensor — which is exactly what `8a748f8` implemented by promoting `is_bare_tensor_ty` into `is_rc` program-wide (§9), and exactly the double-ownership §7 root-caused. `unify_alloc.rs`'s own module doc comment already states the opposite is true by design: a tensor that never touches a struct field belongs to bufferization alone. And the clean base runs ten epochs of that identical `Ring::sub(model, Scale::scale(grad, lr))` shape at 233 MB flat, which is direct evidence that something is already freeing it. **This test encodes a false premise and must not be adopted.**
 
-### 10.1 The reproducing case
+### 10.1 The reproducing case — and what it is actually a case *of*
 
-The second test's shape, made loop-carried so neither the e-graph nor MLIR can optimise it away:
+Starting from the second test's shape, made loop-carried so neither the e-graph nor MLIR can optimise it away:
 
 ```cleave
 struct Boxed { v: i32, tag: [i32; 1] }
@@ -507,7 +507,21 @@ fn main() -> i32 {
 
 So the fix repairs a real, unbounded leak that genuinely reproduces on the clean base. It is not addressing a symptom of its own commit.
 
-**And the mechanism is not a missing release.** `CLEAVE_TRACE_RC` on a five-iteration run of the same program shows ten allocations and ten releases — perfectly balanced — but every `combine` result is released *after* the loop, not in the iteration that produced it. That is `refcount.rs`'s own documented "release at the latest possible point (the function's return)" policy meeting a loop: N live allocations at once. `mnist-interop` does not show it because its own allocations are arena-backed and bulk-reclaimed per iteration. This is the same gap `doc/backlog.md`'s struct-allocation-strategy entry describes as needing a real last-use analysis.
+**But this program is not a case of what the second test asserts, and reading it that way sends a future implementer at the wrong thing.** `CLEAVE_TRACE_RC` on a five-iteration run shows ten allocations and ten releases — perfectly balanced — and, per iteration, *one released immediately and one deferred to the end*. The one released immediately is the one allocated first, i.e. `make(i)`: **the freshly-constructed argument transferred into the call is handled correctly.** What survives to the end of `main` is every `combine` *result* — the loop-carried `b`, which becomes garbage the instant the next iteration rebinds it.
+
+Two further variants isolate it, and the third one is what makes the diagnosis specific:
+
+| Loop body | Resident memory |
+|---|---|
+| `b = combine(b, make(i))` — a call, with a freshly-built argument | 18 GB |
+| `b = bump(b)` — a call, **no fresh argument at all** | 18 GB, at the identical rate |
+| `b = Boxed(v: b.v + 1, tag: [i])` — the same rebinding, **constructed inline, no call** | **4 MB, flat** |
+
+Dropping the fresh argument changes nothing; dropping the *call* fixes it completely. So neither the transferred argument nor the rebinding alone is the trigger:
+
+> **The leaking case is a heap-refcounted struct rebound each loop iteration from the result of a function call.** The value the rebinding displaces is released at the enclosing function's `return` rather than at the resumption that displaced it — so a loop of N iterations holds N of them live at once.
+
+That is `refcount.rs`'s own documented "release at the latest possible point" policy (deliberate, to avoid a fixed point) meeting a call resumption inside a loop — the `Fix` arm of `rewrite_body`, which is exactly the region `8a748f8` rewrote under the name "param-alias composition". `mnist-interop` never shows it because its own allocations are arena-backed and bulk-reclaimed per iteration. This is the gap `doc/backlog.md`'s struct-allocation-strategy entry describes as needing a real last-use analysis.
 
 ### 10.2 The fix and the regression are separable — measured, not argued
 
@@ -527,6 +541,6 @@ The widening is the crash. Removing it costs the leak fix nothing.
 
 Three separate things were welded into one commit, and they have different verdicts:
 
-1. **The release-seeding fix for structs transferred into a call — keep.** Real, reproduces at `5b2b10c` as an unbounded leak, fixed cleanly, and independent of the other two. This is the piece to re-land, on its own, with the loop-carried program above as its acceptance test alongside the unit test.
+1. **The release of a call result displaced by a loop rebinding — keep.** Real, reproduces at `5b2b10c` as an unbounded leak, fixed cleanly, and independent of the other two. Note the precise shape from §10.1, not the unit test's wording: the transferred *argument* is already correct on this base, and inline construction in the same loop is already correct too — it is the call resumption that loses the displaced value. Re-land this piece on its own, with `b = bump(b)` (the minimal variant, no fresh argument) as the acceptance program alongside a unit test.
 2. **The `is_rc` bare-tensor widening — reject.** It is the crash, and it contradicts `unify_alloc.rs`'s own ownership model. The test asserting it should be deleted, not ported.
 3. **`compensate_refcounts.rs` — reject.** Written to reconcile a double-ownership that (2) had just created, and unsound in principle regardless (§8.1, §8.5). It also does not account for the remaining 80× memory, which is the next thing to isolate if any part of that commit is revisited.

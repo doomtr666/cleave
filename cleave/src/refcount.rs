@@ -1107,6 +1107,7 @@ pub fn insert_refcounting(
     program: CpsProgram,
     struct_schemas: &HashMap<String, crate::cps::StructSchema>,
     mlir_types: &HashMap<String, String>,
+    escaping_structs: &HashSet<CVar>,
 ) -> CpsProgram {
     let fresh = FreshVars::starting_at(max_cvar_in_program(&program) + 1);
     let signatures: HashMap<String, Ty> = program
@@ -1157,7 +1158,7 @@ pub fn insert_refcounting(
     // function's own three call sites, so every one of them benefits
     // automatically (`--dump-cps-optimized`, `--run`, and the real AOT
     // pipeline) without needing to remember to call it separately.
-    crate::rc_opt::eliminate_redundant_retain_release(CpsProgram { funcs, op_lines })
+    crate::rc_opt::eliminate_redundant_retain_release(CpsProgram { funcs, op_lines }, escaping_structs)
 }
 
 /// The function's own top-level `params` are deliberately never seeded
