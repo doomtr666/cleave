@@ -3963,6 +3963,254 @@ fn declared_ptr_sig_ty(ctx: &LowerCtx<'_, '_>, rc_ty: &Ty) -> Ty {
 /// storage of its own to release, `lower_tagged_struct_construct`'s own
 /// doc comment) — only as a *field* of another struct, the tensor-field
 /// branch below.
+/// A value this cascade still owes a release to, once the *container*'s own
+/// refcount reaches zero — one entry per refcounted leaf reachable from a
+/// struct's own fields, however deeply that leaf sits behind array
+/// nesting (`push_cascade_leaf`'s own doc comment has the traversal).
+enum PendingChild<'c> {
+    Tensor(Value<'c, 'c>),
+    Struct(Ty, Value<'c, 'c>),
+}
+
+/// Whether `ty` is itself something this cascade would ever need to
+/// recurse into — a tensor-tagged struct, an ordinary refcounted struct,
+/// or (transitively, through `flatten_array_dims`) an array whose own
+/// leaf element is either of those. `false` for a primitive, or a plain
+/// array of primitives — the common case, and the one this check exists
+/// to bail out of cheaply, before ever computing a single element GEP.
+fn ty_needs_cascade(ctx: &LowerCtx<'_, '_>, ty: &Ty) -> bool {
+    if native_shape_field_keyword(ctx, ty).is_some() {
+        return true;
+    }
+    if crate::refcount::is_refcounted(
+        ty,
+        &ctx.struct_schemas,
+        &ctx.mlir_types,
+        &ctx.constructed_structs,
+        &ctx.field_mutated_structs,
+        &ctx.extern_boundary_structs,
+    ) {
+        return true;
+    }
+    if let Ty::Array(..) = ty {
+        let (_, leaf_ty) = flatten_array_dims(ty);
+        return ty_needs_cascade(ctx, leaf_ty);
+    }
+    false
+}
+
+/// Pushes exactly one `PendingChild` for the single value of type `leaf_ty`
+/// living at `slot_ptr` — a tensor descriptor's own base pointer extracted
+/// and queued (`PendingChild::Tensor`), or an ordinary nested struct's own
+/// opaque pointer loaded and queued (`PendingChild::Struct`, recursed into
+/// once the *container*'s own fate is known — `lower_release_cascade`'s own
+/// `pending` loop). `leaf_ty` is never itself `Ty::Array` here — array
+/// nesting is fully resolved by the caller (`push_cascade_children`) before
+/// this is ever reached; this function only ever sees the true scalar/
+/// tensor/struct leaf `flatten_array_dims` bottoms out at.
+fn push_cascade_leaf<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    leaf_ty: &Ty,
+    slot_ptr: Value<'c, 'c>,
+    pending: &mut Vec<PendingChild<'c>>,
+) {
+    let context = ctx.context;
+    let location = gen_loc(context);
+    if let Some(keyword) = native_shape_field_keyword(ctx, leaf_ty) {
+        assert_eq!(
+            keyword, "tensor",
+            "MLIR lowering: cascading release needs a real memref-backed form, which `#[mlir_type(vector)]` doesn't have"
+        );
+        // Read the slot's own descriptor and pull its `allocated_ptr`
+        // straight out (position 0, `memref_descriptor_llvm_type`'s own
+        // confirmed layout) — no need for the full `load_native_shape_
+        // field` machinery (`to_tensor`, the defensive copy) here,
+        // this pointer is only ever handed to `cleave_release`, never
+        // read as tensor data.
+        let (fname, ftype_args) = struct_name_and_args(leaf_ty);
+        let inner_fields = struct_field_types(&ctx.struct_schemas, fname, ftype_args);
+        let [(_, inner_ty)] = inner_fields.as_slice() else {
+            panic!(
+                "MLIR lowering: `#[mlir_type(tensor)]` requires exactly one field, `{fname}` has {}",
+                inner_fields.len()
+            );
+        };
+        let (dims, _leaf_ty) = flatten_array_dims(inner_ty);
+        let descriptor_ty = memref_descriptor_llvm_type(context, dims.len());
+        let descriptor_val: Value = block
+            .append_operation(llvm::load(
+                context,
+                slot_ptr,
+                descriptor_ty,
+                location,
+                LoadStoreOptions::new(),
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let ptr_ty = llvm::r#type::pointer(context, 0);
+        let base_ptr: Value = block
+            .append_operation(llvm::extract_value(
+                context,
+                descriptor_val,
+                DenseI64ArrayAttribute::new(context, &[0]),
+                ptr_ty,
+                location,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        pending.push(PendingChild::Tensor(base_ptr));
+    } else if crate::refcount::is_refcounted(
+        leaf_ty,
+        &ctx.struct_schemas,
+        &ctx.mlir_types,
+        &ctx.constructed_structs,
+        &ctx.field_mutated_structs,
+        &ctx.extern_boundary_structs,
+    ) {
+        // An ordinary nested struct — an opaque `!llvm.ptr`, exactly like
+        // any other struct-typed value (`struct_llvm_type`'s own doc
+        // comment) — read it, recurse once the container's own fate is
+        // known.
+        //
+        // `refcount::is_refcounted` (the exact same check `refcount.
+        // rs::insert_refcounting` already uses before ever emitting a
+        // top-level `PrimOp::Release`), not just "is this a declared
+        // struct type" — a real, found-by-code-inspection gap, the same
+        // class of bug `is_refcounted`'s own third exclusion already
+        // fixed once at the top level: a struct type declared but never
+        // constructed anywhere (`stdlib/dynarray/dynarray.cleave`'s own
+        // `RawBuf`, `DynArray<T>`'s own `buf` field) has no real
+        // `cleave_alloc_rc`'d `RcHeader` in front of it at all —
+        // recursing into it here would call `cleave_release` on
+        // whatever raw, non-headered pointer an `extern fn` actually
+        // returned, reading/decrementing garbage bytes immediately
+        // preceding it (`is_refcounted`'s own doc comment: the
+        // identical corruption, confirmed there to be genuinely
+        // non-deterministic — roughly a third of the time a visible
+        // panic, the rest silent). The old, cruder check (`ctx.struct_
+        // schemas.contains_key(...)` alone) would have matched `RawBuf`
+        // every time a `DynArray<T>`-embedding struct's own release
+        // cascaded into it.
+        let child_ty = ty_to_mlir(ctx, leaf_ty);
+        let child_val: Value = block
+            .append_operation(llvm::load(
+                context,
+                slot_ptr,
+                child_ty,
+                location,
+                LoadStoreOptions::new(),
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        pending.push(PendingChild::Struct(leaf_ty.clone(), child_val));
+    }
+    // Else: a primitive — nothing refcounted to release. `ty_needs_cascade`
+    // is what keeps this branch from ever being reached needlessly (the
+    // caller bails before enumerating a single array element otherwise),
+    // but this function stays correct on its own even if it weren't.
+}
+
+/// The other half of `push_cascade_leaf`: `field_ty` is a **field**'s own
+/// declared type, reached from `base_ptr` (the *container*'s own base
+/// pointer — `struct_ty`, never a field's own address) via `index_prefix`
+/// (`[0, position]`, one entry per struct-field GEP step so far).
+///
+/// **Why arrays get a real fix here, not just a TODO left for later**:
+/// found directly by reading this cascade's own prior shape — a field
+/// whose type is neither tensor-tagged nor `is_refcounted` was silently
+/// treated as "nothing to release", which is correct for a genuine
+/// primitive field but silently wrong for an *array of refcounted structs
+/// or tensors* (`struct Foo { items: [Boxed; 2] }` releasing `Foo` never
+/// released either `Boxed`, confirmed directly via `--dump-cps-optimized`
+/// on a real program: exactly one `release` fires, targeting `Foo` alone).
+/// `flatten_array_dims` already exists (built for exactly this purpose
+/// elsewhere in this file) to collapse arbitrarily-nested `[[T;M];N]` down
+/// to `(dims, leaf_ty)` — reused here, not reinvented, to enumerate every
+/// element's own flat index path and dispatch each one through `push_
+/// cascade_leaf` exactly as if it were an ordinary field. One combined GEP
+/// per element (`base_ptr`/`container_llvm_ty` throughout, `index_prefix`
+/// extended by one index per array dimension) — LLVM's own opaque-pointer
+/// GEP walks straight through a field's own inline `!llvm.array<...>`
+/// nesting (`ty_to_llvm_field_type`'s own doc comment: an ordinary array
+/// field is inline, unlike a tensor-tagged one), so no separate
+/// intermediate "pointer to the array field itself" is ever needed.
+fn push_cascade_children<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    field_ty: &Ty,
+    base_ptr: Value<'c, 'c>,
+    container_llvm_ty: Type<'c>,
+    index_prefix: &[i64],
+    pending: &mut Vec<PendingChild<'c>>,
+) {
+    if !ty_needs_cascade(ctx, field_ty) {
+        return;
+    }
+    if let Ty::Array(..) = field_ty {
+        let (dims, leaf_ty) = flatten_array_dims(field_ty);
+        if !ty_needs_cascade(ctx, leaf_ty) {
+            return;
+        }
+        let mut index_path = index_prefix.to_vec();
+        push_cascade_array_elements(
+            ctx,
+            block,
+            &dims,
+            leaf_ty,
+            base_ptr,
+            container_llvm_ty,
+            &mut index_path,
+            pending,
+        );
+    } else {
+        let slot_ptr = gep(ctx, block, base_ptr, index_prefix, container_llvm_ty);
+        push_cascade_leaf(ctx, block, field_ty, slot_ptr, pending);
+    }
+}
+
+/// The array-nesting half of `push_cascade_children`: walks `dims`
+/// (outermost-first, `flatten_array_dims`'s own doc comment) one dimension
+/// at a time, extending `index_path` by one constant index per level, and
+/// dispatches through `push_cascade_leaf` once `dims` is exhausted (the
+/// full path then names one genuine `leaf_ty`-typed element).
+fn push_cascade_array_elements<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    dims: &[i64],
+    leaf_ty: &Ty,
+    base_ptr: Value<'c, 'c>,
+    container_llvm_ty: Type<'c>,
+    index_path: &mut Vec<i64>,
+    pending: &mut Vec<PendingChild<'c>>,
+) {
+    match dims.split_first() {
+        None => {
+            let slot_ptr = gep(ctx, block, base_ptr, index_path, container_llvm_ty);
+            push_cascade_leaf(ctx, block, leaf_ty, slot_ptr, pending);
+        }
+        Some((&n, rest)) => {
+            for i in 0..n {
+                index_path.push(i);
+                push_cascade_array_elements(
+                    ctx,
+                    block,
+                    rest,
+                    leaf_ty,
+                    base_ptr,
+                    container_llvm_ty,
+                    index_path,
+                    pending,
+                );
+                index_path.pop();
+            }
+        }
+    }
+}
+
 fn lower_release_cascade<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
@@ -3972,110 +4220,20 @@ fn lower_release_cascade<'c>(
     let (name, type_args) = struct_name_and_args(struct_ty);
     let field_types = struct_field_types(&ctx.struct_schemas, name, type_args);
     let struct_llvm_ty = struct_llvm_type(ctx, name, type_args);
-    let context = ctx.context;
-    let location = gen_loc(context);
+    let location = gen_loc(ctx.context);
 
-    enum PendingChild<'c> {
-        Tensor(Value<'c, 'c>),
-        Struct(Ty, Value<'c, 'c>),
-    }
     let mut pending: Vec<PendingChild<'c>> = Vec::new();
 
     for (position, (_, field_ty)) in field_types.iter().enumerate() {
-        let field_ptr = gep(ctx, block, ptr, &[0, position as i64], struct_llvm_ty);
-        if let Some(keyword) = native_shape_field_keyword(ctx, field_ty) {
-            assert_eq!(
-                keyword, "tensor",
-                "MLIR lowering: cascading release needs a real memref-backed form, which `#[mlir_type(vector)]` doesn't have"
-            );
-            // Read the field's own descriptor and pull its `allocated_ptr`
-            // straight out (position 0, `memref_descriptor_llvm_type`'s own
-            // confirmed layout) — no need for the full `load_native_shape_
-            // field` machinery (`to_tensor`, the defensive copy) here,
-            // this pointer is only ever handed to `cleave_release`, never
-            // read as tensor data.
-            let (fname, ftype_args) = struct_name_and_args(field_ty);
-            let inner_fields = struct_field_types(&ctx.struct_schemas, fname, ftype_args);
-            let [(_, inner_ty)] = inner_fields.as_slice() else {
-                panic!(
-                    "MLIR lowering: `#[mlir_type(tensor)]` requires exactly one field, `{fname}` has {}",
-                    inner_fields.len()
-                );
-            };
-            let (dims, _leaf_ty) = flatten_array_dims(inner_ty);
-            let descriptor_ty = memref_descriptor_llvm_type(context, dims.len());
-            let descriptor_val: Value = block
-                .append_operation(llvm::load(
-                    context,
-                    field_ptr,
-                    descriptor_ty,
-                    location,
-                    LoadStoreOptions::new(),
-                ))
-                .result(0)
-                .unwrap()
-                .into();
-            let ptr_ty = llvm::r#type::pointer(context, 0);
-            let base_ptr: Value = block
-                .append_operation(llvm::extract_value(
-                    context,
-                    descriptor_val,
-                    DenseI64ArrayAttribute::new(context, &[0]),
-                    ptr_ty,
-                    location,
-                ))
-                .result(0)
-                .unwrap()
-                .into();
-            pending.push(PendingChild::Tensor(base_ptr));
-        } else if crate::refcount::is_refcounted(
+        push_cascade_children(
+            ctx,
+            block,
             field_ty,
-            &ctx.struct_schemas,
-            &ctx.mlir_types,
-            &ctx.constructed_structs,
-            &ctx.field_mutated_structs,
-            &ctx.extern_boundary_structs,
-        ) {
-            // An ordinary nested struct field — an opaque `!llvm.ptr`,
-            // exactly like any other struct-typed value (`struct_llvm_
-            // type`'s own doc comment) — read it, recurse once the
-            // container's own fate is known.
-            //
-            // `refcount::is_refcounted` (the exact same check `refcount.
-            // rs::insert_refcounting` already uses before ever emitting a
-            // top-level `PrimOp::Release`), not just "is this a declared
-            // struct type" — a real, found-by-code-inspection gap, the same
-            // class of bug `is_refcounted`'s own third exclusion already
-            // fixed once at the top level: a struct type declared but never
-            // constructed anywhere (`stdlib/dynarray/dynarray.cleave`'s own
-            // `RawBuf`, `DynArray<T>`'s own `buf` field) has no real
-            // `cleave_alloc_rc`'d `RcHeader` in front of it at all —
-            // recursing into it here would call `cleave_release` on
-            // whatever raw, non-headered pointer an `extern fn` actually
-            // returned, reading/decrementing garbage bytes immediately
-            // preceding it (`is_refcounted`'s own doc comment: the
-            // identical corruption, confirmed there to be genuinely
-            // non-deterministic — roughly a third of the time a visible
-            // panic, the rest silent). The old, cruder check (`ctx.struct_
-            // schemas.contains_key(...)` alone) would have matched `RawBuf`
-            // every time a `DynArray<T>`-embedding struct's own release
-            // cascaded into it.
-            let child_ty = ty_to_mlir(ctx, field_ty);
-            let child_val: Value = block
-                .append_operation(llvm::load(
-                    context,
-                    field_ptr,
-                    child_ty,
-                    location,
-                    LoadStoreOptions::new(),
-                ))
-                .result(0)
-                .unwrap()
-                .into();
-            pending.push(PendingChild::Struct(field_ty.clone(), child_val));
-        }
-        // Else: a primitive/array-of-primitive field — nothing refcounted
-        // to release.
+            ptr,
+            struct_llvm_ty,
+            &[0, position as i64],
+            &mut pending,
+        );
     }
 
     let freed = emit_cleave_release(ctx, block, struct_ty, ptr);

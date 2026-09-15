@@ -778,3 +778,81 @@ fn a_retain_protecting_a_field_read_off_a_borrowed_base_is_never_eliminated() {
          must survive elimination -- got 0"
     );
 }
+
+/// Regression test for the array-`Load` tracking gap found while
+/// discussing `doc/plan-affine-ownership.md`'s array/tuple section:
+/// `PrimOp::Load` (`arr[i]`) was completely invisible to `refcount.rs` —
+/// no `owned_origin` entry, no retain-on-read protection — unlike
+/// `PrimOp::Field`, which already gets both. Extracting a struct-typed
+/// element out of a struct's own array field, and using it again after
+/// that struct is released, needs the identical protection a field read
+/// already gets: retained at extraction, released at its own last use.
+///
+/// This matters more than it might look, because of what landed alongside
+/// it: `mlir_lower.rs::lower_release_cascade` was fixed, in the same pass
+/// of work, to actually recurse into an array field's own refcounted
+/// elements when the *container* is released (`doc/backlog.md`'s own
+/// "array release cascade" entry) — before *this* fix, that cascade
+/// change alone would have turned a permanent, harmless leak (the
+/// container's own release cascading into nothing, `items[0]` immortal)
+/// into a genuine use-after-free (the cascade now really frees
+/// `items[0]`, out from under `x`, which was never given its own
+/// protecting retain). Landing the cascade fix without this one would
+/// have been a correctness regression, not a fix.
+#[test]
+fn an_element_extracted_from_a_struct_field_array_is_retained_and_released_independently() {
+    let src = "
+        struct Boxed { v: i32, tag: [i32; 1] }
+        struct Foo { items: [Boxed; 2] }
+        fn make_boxed(x: i32) -> Boxed { Boxed(v: x, tag: [x]) }
+        extern fn opaque_sink(f: Foo) -> i32;
+        extern fn opaque_sink2(b: Boxed) -> i32;
+        fn main() -> i32 {
+            let a = make_boxed(1);
+            let b = make_boxed(2);
+            let f = Foo(items: [a, b]);
+            let x = f.items[0];
+            let s = opaque_sink(f);
+            s + opaque_sink2(x)
+        }
+        ";
+    let program = refcounted_cps(src);
+    assert!(
+        count_retains_for(&program, "Boxed") >= 1,
+        "`x = f.items[0]`, used again after `f` is released, must be retained \
+         at extraction to survive `f`'s own eventual cascade -- got 0"
+    );
+    assert!(
+        count_releases_for(&program, "Boxed") >= 1,
+        "`x` must be released at its own last use, independently of `f` -- got 0"
+    );
+}
+
+/// Control, mirroring `a_retain_protecting_a_field_read_off_a_borrowed_
+/// base_is_never_eliminated` above but for `Load`: extracting an array
+/// element that is *never* used again after extraction (no independent
+/// second use) must not need protecting — no retain required. This is the
+/// same "don't over-retain" discipline `Field` already gets; `Load`
+/// inherits it for free from the identical `owned_origin`-gated mechanism,
+/// not a separate rule.
+#[test]
+fn an_element_extracted_from_an_array_and_never_reused_needs_no_retain() {
+    let src = "
+        struct Boxed { v: i32, tag: [i32; 1] }
+        struct Foo { items: [Boxed; 2] }
+        fn make_boxed(x: i32) -> Boxed { Boxed(v: x, tag: [x]) }
+        fn main() -> i32 {
+            let a = make_boxed(1);
+            let b = make_boxed(2);
+            let f = Foo(items: [a, b]);
+            f.items[0].v
+        }
+        ";
+    let program = refcounted_cps(src);
+    assert_eq!(
+        count_retains_for(&program, "Boxed"),
+        0,
+        "reading `f.items[0].v` and never reusing the extracted element \
+         needs no protecting retain -- got a retain anyway"
+    );
+}

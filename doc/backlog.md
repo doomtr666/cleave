@@ -6,6 +6,24 @@ Completed items live in [backlog-done.md](backlog-done.md).
 
 ---
 
+## Two real gaps in the array-ownership model, found while discussing nesting (array-in-tuple-in-struct) for the affine-ownership plan — both fixed and tested; two adjacent construction-side limitations found along the way, not fixed
+
+Tuples need no work at all: `(a, b)` desugars to `struct __Tuple2 { 0: T0, 1: T1 }` before CPS (`ast.rs`/`driver.rs`/`lower.rs`), and `lower_release_cascade` already recurses into any struct-typed field — tuple-of-struct, struct-of-tuple-of-struct, any depth, all free.
+
+**Arrays were a real, confirmed, two-part hole — fixed.**
+
+1. **Release never cascaded into an array field's own elements.** Confirmed directly: `struct Foo { items: [Boxed; 2] }`, sent through an opaque `extern fn` sink so the e-graph couldn't fold it away, released `Foo` with exactly one `release` — zero for either embedded `Boxed`. `mlir_lower.rs::lower_release_cascade`'s own comment said it outright: *"a primitive/array-of-primitive field — nothing refcounted to release"* — true for a primitive, silently wrong for an array of refcounted structs or tensors, at any nesting depth. Fixed: the per-field dispatch is now a small set of recursive helpers (`ty_needs_cascade`, `push_cascade_leaf`, `push_cascade_children`/`push_cascade_array_elements`) that walk `flatten_array_dims`'s own flattened shape and emit one combined GEP per element, same base pointer and `elem_type` as the existing struct-field GEP — no new intermediate pointer representation needed. Tested (`cleave/tests/array_release_cascade.rs`): a `[Boxed; 2]` field cascades to 3 releases total; a `[i32; 4]` field triggers no cascade at all (the common case, unaffected).
+2. **`PrimOp::Load` (`arr[i]`) was completely invisible to `refcount.rs`** — no `owned_origin` entry, no retain-on-read protection, unlike `PrimOp::Field`, which already has both. Extracting a struct-typed element out of an array and using it again after the array's own container is released had nothing protecting it. Fixed in exact mirror of `Field`'s own existing rule (`walk_var_info`'s `is_owned` match, `field_read_owned`, `field_read_retain` in `refcount.rs`). Tested: an extracted-and-reused element gets a real retain and its own independent release; an extracted-and-discarded element gets neither (no over-retention).
+
+**Why both had to land together, not either alone.** Fixing (1) without (2) would have been a correctness *regression*, not a fix: before either fix, `f.items[0]` extracted into `x` and used after `f`'s own release was safe by accident — the cascade never actually freed `items[0]`, so `x` stayed valid (leaked, but valid). Landing the cascade fix alone would have made that cascade real, freeing `items[0]` out from under `x`, which nothing protected — a genuine use-after-free where there used to be only a leak. Confirmed the fix needs both by direct `--dump-cps-optimized` inspection before writing (2): the retain (`retain v464`) now visibly brackets the array's own eventual release.
+
+**Two adjacent, pre-existing, unrelated limitations found while writing tests for the above — not fixed, flagged precisely so they aren't rediscovered as a surprise:**
+
+- **A struct-leaf array nested inside another array (`[[Boxed; 2]; 2]`) cannot even be *constructed*.** `mlir_lower.rs`'s own array-construction lowering has an explicit `assert!`: *"a struct-leaf array nested inside another array... isn't supported yet"*. Confirmed this is unrelated to the cascade fix above (the panic fires with no release/extern-sink involved at all, purely from construction). The cascade fix's own multi-dimension traversal (`push_cascade_array_elements`) is verified by direct code review — it's a straightforward recursive index-path builder over `dims: &[i64]` — but has no integration test today, since no cleave program can build the input.
+- **An array of tensor-tagged elements (`[Tensor<f32,3>; 2]`) crashes MLIR verification at construction**: `'llvm.store' op operand #0 must be LLVM type with size, but got 'tensor<3xf32>'`. Confirmed pre-existing and unrelated to the cascade fix the same way (reproduces with zero release/extern-sink involved). `push_cascade_leaf`'s own tensor-descriptor-extraction branch is unchanged, verbatim, from the working code this refactor preserved — it's newly *reachable* from an array slot, not newly written, so it isn't under suspicion for this specific failure, but it can't be exercised end to end until array-of-tensor construction itself works.
+
+---
+
 ## Ownership is classified by *type* (`is_rc(ty: &Ty)`) where it should be classified by *role* — the model that would be correct, why the code answers a coarser question, and what that costs
 
 Worked out in discussion after the `8a748f8` reset, against the code rather than from first principles. The model below is the user's; the gaps between it and the implementation were each checked in the source.

@@ -559,7 +559,28 @@ fn walk_var_info(
             var_types.insert(*var, ty.clone());
             let is_owned = match op {
                 PrimOp::Struct(..) => true,
-                PrimOp::Field { .. } => args
+                // `Load` (`arr[i]`) needs the identical inherit-from-base
+                // rule `Field` already has, for the identical reason: an
+                // element extracted out of an array that itself traces
+                // back to an owned struct is exactly as much this scope's
+                // responsibility as a struct field read off that same
+                // struct would be — found while fixing the release-cascade
+                // gap for array fields (`mlir_lower.rs::lower_release_
+                // cascade`'s own doc comment): fixing *that* gap alone,
+                // without this, converts a permanent (harmless) leak into
+                // a genuine use-after-free — `let x = f.items[0]` now has
+                // its underlying `Boxed` really freed when `f` is released
+                // and cascades into `items`, while `x` (never itself
+                // retained) still points at it, with nothing here to have
+                // protected it. `owned_origin`'s own value for `args[0]`
+                // (the array) is already correct for this purpose without
+                // any change of its own: `Field`'s existing rule already
+                // propagates ownership through an array-*typed* field
+                // extraction (it only ever looks at the *base*'s ownership,
+                // never the field's own type) — so `let arr = owned_struct.
+                // array_field;` already sets `owned_origin[arr] = true`
+                // today, unused until this arm reads it.
+                PrimOp::Field { .. } | PrimOp::Load { .. } => args
                     .first()
                     .is_some_and(|base| is_owned_val(base, owned_origin)),
                 _ => false,
@@ -1224,7 +1245,11 @@ fn rewrite_body(
             // worth of memory *every single training sample*; invisible on
             // `digits-interop`'s own small network, ~9KB/sample, only
             // large enough to matter at real MNIST scale, ~2MB/sample).
-            let field_read_owned = matches!(&op, PrimOp::Field { .. })
+            // `Load` (`arr[i]`) is the identical shape as `Field` here —
+            // see `walk_var_info`'s own matching arm, right above, for the
+            // full reasoning (found while fixing the array release-cascade
+            // gap; without this, that fix turns a leak into a real UAF).
+            let field_read_owned = matches!(&op, PrimOp::Field { .. } | PrimOp::Load { .. })
                 && ctx.owned_origin.get(&var).copied().unwrap_or(false);
             // A light struct with at least one genuinely-refcounted field
             // reachable through it (`light_release_leaves`) is seeded here
@@ -1344,7 +1369,17 @@ fn rewrite_body(
                 Whole(Ty),
                 LightLeaves(Vec<crate::mlir_lower::LightLeafPath>),
             }
-            let field_read_retain: Option<FieldReadProtect> = if let PrimOp::Field { .. } = &op {
+            // `Load` needs this exact same protection, for the exact same
+            // reason `Field` does — see `walk_var_info`'s own matching arm
+            // for the full story. `arr[i]`'s own result, extracted out of
+            // an array reachable from an owned base, is retained here
+            // before the array's own eventual release (direct, or
+            // cascaded — `mlir_lower.rs::lower_release_cascade`) can ever
+            // reach and free the same underlying allocation out from under
+            // it.
+            let field_read_retain: Option<FieldReadProtect> = if let PrimOp::Field { .. }
+            | PrimOp::Load { .. } = &op
+            {
                 if ctx.owned_origin.get(&var).copied().unwrap_or(false) {
                     if ctx.is_rc(&ty) {
                         Some(FieldReadProtect::Whole(ty.clone()))
