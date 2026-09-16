@@ -517,6 +517,24 @@ fn real_main() -> ExitCode {
                     // first sweep — run before optimization — has no way to
                     // anticipate.
                     let cps_program = eliminate_dead_code(cps_program);
+                    // `--dump-cps-optimized`'s own identical step, missing
+                    // here until found directly (`doc/plan-affine-
+                    // ownership.md` §13's own nested-cascade work): without
+                    // this, `lower_program` never sees a single `PrimOp::
+                    // Retain`/`Release`, so its own release-side dispatch
+                    // (`ctx.affine_structs.contains`, the whole cascade)
+                    // never fires at all — this flag was silently showing a
+                    // pre-refcounting snapshot, not what `--emit-object`/
+                    // `--run` actually lower.
+                    let struct_schemas_for_rc = collect_struct_schemas(&program);
+                    let mlir_types_for_rc = collect_mlir_types(&program);
+                    let escaping = cleave::escape::escaping_struct_vars(&cps_program);
+                    let cps_program = cleave::refcount::insert_refcounting(
+                        cps_program,
+                        &struct_schemas_for_rc,
+                        &mlir_types_for_rc,
+                        &escaping,
+                    );
 
                     let dialect_registry = DialectRegistry::new();
                     register_all_dialects(&dialect_registry);

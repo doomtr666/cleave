@@ -294,6 +294,36 @@ fn region_local_result_released_by_caller_with_the_gate_off() {
     assert_eq!(run_i32_inner(src), 30000 * 30001 / 2);
 }
 
+/// `doc/plan-affine-ownership.md` §13/§14 — the real point of this whole
+/// extension: `Outer` embeds a refcounted `Inner` field, never field-
+/// mutated anywhere, so its own release now cascades *without* a header
+/// all the way down, not just at the top level. Both `Outer` and `Inner`
+/// are constructed directly in `main`'s own loop body (not behind a
+/// region-local helper function, `region_local_result_released_by_caller_
+/// with_the_gate_off`'s own doc comment has that trap) — `read_outer` is a
+/// real, separately-compiled call, a pure borrow, so both constructions
+/// survive as genuine `PrimOp::Struct` sites for this analysis to reason
+/// about, exactly like `many_short_lived_affine_constructions_run_
+/// correctly` above.
+#[test]
+fn a_nested_never_mutated_struct_cascades_through_the_pool_without_a_header() {
+    let src = "
+        struct Inner { v: i32, tag: [i32; 1] }
+        struct Outer { inner: Inner, extra: i32 }
+        fn read_outer(o: Outer) -> i32 { o.inner.v + o.extra }
+        fn main() -> i32 {
+            let mut acc = 0;
+            for i in 0..2000 {
+                let o = Outer(inner: Inner(v: i, tag: [0]), extra: i * 2);
+                acc = acc + read_outer(o);
+            };
+            acc
+        }
+        ";
+    // sum_{i=0}^{1999} (i + i*2) = 3 * sum_{i=0}^{1999} i = 3 * 1999*2000/2
+    assert_eq!(run_i32_with_affine_structs(src), 3 * 1999 * 2000 / 2);
+}
+
 /// The exact same programs, with the flag left off -- confirms the
 /// header-based path (today's default, unchanged) gives the identical
 /// result, so this test file also serves as a differential check between

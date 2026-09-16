@@ -496,19 +496,51 @@ mod affine_eligibility {
         );
     }
 
-    /// A struct embedding another refcounted struct field must be
-    /// excluded, *even when never aliased* -- this landing's own
-    /// restriction (no cascade story yet for a headerless container).
-    /// `o.inner.v` alone (construct then immediately project a field) is
-    /// *always* folded away by this e-graph regardless of loop bound --
-    /// confirmed directly, it's a per-iteration structural rewrite, not
-    /// full unrolling, so no bound is large enough to prevent it. A real
-    /// function call survives instead (mirrors the `bump` test above,
-    /// same reason): `read_outer` only ever borrows its own parameter, so
-    /// calling it doesn't alias `o` either -- isolating the cascade-field
-    /// restriction from aliasing, which is the whole point of this test.
+    /// `doc/plan-affine-ownership.md` §13/§14 — a struct embedding another
+    /// refcounted field is now affine-eligible too, *as long as it (and
+    /// that field's own struct type) is never field-mutated anywhere* — the
+    /// occupant of a never-mutated field is fixed forever from its own
+    /// single construction site, decidable statically with no flow-
+    /// sensitive points-to needed (confirmed on the real target,
+    /// `examples/mnist-interop`: zero `PrimOp::FieldStore` in the whole
+    /// compiled kernel). `o.inner.v` alone (construct then immediately
+    /// project a field) is *always* folded away by this e-graph regardless
+    /// of loop bound — a real function call survives instead (mirrors the
+    /// `bump` test above, same reason): `read_outer` only ever borrows its
+    /// own parameter, so calling it doesn't alias `o` either.
+    fn nth_named_struct_var(program: &cleave::cps::CpsProgram, f_name: &str, ty_name: &str, n: usize) -> cleave::cps::CVar {
+        fn walk(expr: &cleave::cps::CExpr, ty_name: &str, out: &mut Vec<cleave::cps::CVar>) {
+            use cleave::cps::{CExpr, PrimOp};
+            match expr {
+                CExpr::LetPrim { var, op, cont, .. } => {
+                    if let PrimOp::Struct(name, _) = op {
+                        if name == ty_name {
+                            out.push(*var);
+                        }
+                    }
+                    walk(cont, ty_name, out);
+                }
+                CExpr::App { .. } => {}
+                CExpr::If { then_branch, else_branch, .. } => {
+                    walk(then_branch, ty_name, out);
+                    walk(else_branch, ty_name, out);
+                }
+                CExpr::Fix { defs, body } => {
+                    for d in defs {
+                        walk(&d.body, ty_name, out);
+                    }
+                    walk(body, ty_name, out);
+                }
+            }
+        }
+        let f = program.funcs.iter().find(|f| f.def.name == f_name).unwrap();
+        let mut out = Vec::new();
+        walk(&f.def.body, ty_name, &mut out);
+        out[n]
+    }
+
     #[test]
-    fn a_struct_with_a_refcounted_field_is_never_affine_eligible_even_if_unaliased() {
+    fn a_never_mutated_struct_embedding_a_refcounted_field_is_affine_eligible() {
         let src = "
             struct Inner { v: i32, tag: [i32; 1] }
             struct Outer { inner: Inner }
@@ -524,49 +556,65 @@ mod affine_eligibility {
             }
             ";
         let (program, affine) = affine_vars(src);
-        // Both the `Inner` and `Outer` constructions are candidates;
-        // `Outer` specifically must be excluded for embedding a
-        // refcounted `Inner` field, regardless of its own aliasing.
-        let vars: Vec<_> = {
-            fn walk(expr: &cleave::cps::CExpr, ty_name: &str, struct_schemas_hint: &str, out: &mut Vec<cleave::cps::CVar>) {
-                use cleave::cps::{CExpr, PrimOp};
-                match expr {
-                    CExpr::LetPrim { var, op, cont, .. } => {
-                        if let PrimOp::Struct(name, _) = op {
-                            if name == struct_schemas_hint {
-                                out.push(*var);
-                            }
-                        }
-                        let _ = ty_name;
-                        walk(cont, ty_name, struct_schemas_hint, out);
-                    }
-                    CExpr::App { .. } => {}
-                    CExpr::If { then_branch, else_branch, .. } => {
-                        walk(then_branch, ty_name, struct_schemas_hint, out);
-                        walk(else_branch, ty_name, struct_schemas_hint, out);
-                    }
-                    CExpr::Fix { defs, body } => {
-                        for d in defs {
-                            walk(&d.body, ty_name, struct_schemas_hint, out);
-                        }
-                        walk(body, ty_name, struct_schemas_hint, out);
-                    }
-                }
+        let outer = nth_named_struct_var(&program, "main", "Outer", 0);
+        assert!(
+            affine.contains(&outer),
+            "`Outer` embeds `Inner`, but neither is ever field-mutated -- \
+             must now be affine-eligible (`doc/plan-affine-ownership.md` \
+             §13)"
+        );
+        let inner = nth_named_struct_var(&program, "main", "Inner", 0);
+        assert!(
+            affine.contains(&inner),
+            "`Inner`'s own construction is never aliased on its own merits \
+             either -- must be affine-eligible independently of being \
+             embedded"
+        );
+        let field_affine = cleave::alias_analysis::field_affine_positions(&program, &affine);
+        assert_eq!(
+            field_affine.get(&("Outer".to_string(), 0)),
+            Some(&true),
+            "`Outer`'s own field 0 (`inner`) is always constructed from an \
+             already-affine value at every one of `Outer`'s own \
+             construction sites -- `mlir_lower.rs::lower_release_pool_\
+             cascade` needs this to know the cascade into `inner` can also \
+             skip the header"
+        );
+    }
+
+    /// The one case that must still be excluded, precisely because it's
+    /// the one this analysis genuinely can't decide statically without the
+    /// flow-sensitive points-to `doc/plan-affine-ownership.md` §14.4 scopes
+    /// as a separate, harder phase: a field that *is* reassigned somewhere.
+    #[test]
+    fn a_struct_with_a_field_mutated_refcounted_field_is_never_affine_eligible() {
+        let src = "
+            struct Inner { v: i32, tag: [i32; 1] }
+            struct Outer { inner: Inner }
+            fn read_outer(o: Outer) -> i32 { o.inner.v }
+            extern fn opaque_sink(v: i32) -> i32;
+            fn replace_inner(mut o: Outer, new_inner: Inner) -> Outer {
+                o.inner = new_inner;
+                o
             }
-            let f = program.funcs.iter().find(|f| f.def.name == "main").unwrap();
-            let mut out = Vec::new();
-            walk(&f.def.body, "", "Outer", &mut out);
-            out
-        };
-        assert!(!vars.is_empty(), "no `Outer` construction found");
-        for v in vars {
-            assert!(
-                !affine.contains(&v),
-                "an `Outer`, embedding a refcounted `Inner` field, must never \
-                 be affine-eligible in this first landing, regardless of \
-                 its own aliasing"
-            );
-        }
+            fn main() -> i32 {
+                let mut acc = 0;
+                for i in 0..3 {
+                    let o = Outer(inner: Inner(v: i, tag: [0]));
+                    let o2 = replace_inner(o, Inner(v: i + 1, tag: [0]));
+                    acc = acc + opaque_sink(read_outer(o2));
+                };
+                acc
+            }
+            ";
+        let (program, affine) = affine_vars(src);
+        let outer = nth_named_struct_var(&program, "main", "Outer", 0);
+        assert!(
+            !affine.contains(&outer),
+            "`Outer`'s own `inner` field is reassigned by `replace_inner` -- \
+             its own occupant isn't fixed from construction, so this must \
+             stay excluded (no flow-sensitive points-to built yet)"
+        );
     }
 
     /// A struct with no cascade-worthy field, but genuinely aliased, must

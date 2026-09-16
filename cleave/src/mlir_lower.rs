@@ -151,6 +151,17 @@ struct LowerCtx<'c, 'm> {
     /// direct `HashSet::contains` is enough. Empty unless
     /// `CLEAVE_AFFINE_STRUCTS=1` (`lower_program`'s own doc comment).
     affine_structs: HashSet<CVar>,
+    /// `doc/plan-affine-ownership.md` §13/§14 — `alias_analysis::field_
+    /// affine_positions`'s own result: for every `(struct type name, field
+    /// position)` whose own type is cascade-worthy, whether *every*
+    /// construction site of that type passes an already-affine argument
+    /// there. `lower_release_pool_cascade`'s own only consumer — `Some(&
+    /// true)` keeps a nested struct field's own cascade headerless too,
+    /// anything else (including no entry at all) falls back to the
+    /// ordinary headered `lower_release_cascade` for that one field. Empty
+    /// unless `CLEAVE_AFFINE_STRUCTS=1`, exactly like `affine_structs`
+    /// above.
+    field_affine: HashMap<(String, usize), bool>,
     /// Per-`LetPrim` source line (`CpsProgram::op_lines`) -- `lower_cexpr`'s
     /// `LetPrim` arm stamps `GEN_LINE` from it so every op emitted for that
     /// `LetPrim` gets the right debug-info line, falling back to the
@@ -419,25 +430,31 @@ pub fn lower_program<'c>(
     // change with real correctness stakes (`doc/plan-affine-ownership.md`
     // §5) — an empty set here means `alloc_llvm_value`'s own new dispatch
     // branch is simply never taken, zero behavior change from today.
-    let affine_structs: HashSet<CVar> = if std::env::var("CLEAVE_AFFINE_STRUCTS").is_ok() {
-        let summary = crate::alias_analysis::analyze(program);
-        crate::alias_analysis::affine_struct_vars(
-            program,
-            &summary,
-            &struct_schemas,
-            mlir_types,
-            &constructed_structs,
-            &field_mutated_structs,
-            &extern_boundary_structs,
-            &region_local_fns,
-        )
-    } else {
-        HashSet::new()
-    };
+    let (affine_structs, field_affine): (HashSet<CVar>, HashMap<(String, usize), bool>) =
+        if std::env::var("CLEAVE_AFFINE_STRUCTS").is_ok() {
+            let summary = crate::alias_analysis::analyze(program);
+            let affine_structs = crate::alias_analysis::affine_struct_vars(
+                program,
+                &summary,
+                &struct_schemas,
+                mlir_types,
+                &constructed_structs,
+                &field_mutated_structs,
+                &extern_boundary_structs,
+                &region_local_fns,
+            );
+            let field_affine = crate::alias_analysis::field_affine_positions(program, &affine_structs);
+            (affine_structs, field_affine)
+        } else {
+            (HashSet::new(), HashMap::new())
+        };
     if std::env::var("CLEAVE_TRACE_AFFINE_STRUCTS").is_ok() {
         let mut vars: Vec<&CVar> = affine_structs.iter().collect();
         vars.sort();
         eprintln!("CLEAVE_TRACE_AFFINE_STRUCTS: {} vars: {vars:?}", vars.len());
+        let mut fields: Vec<(&(String, usize), &bool)> = field_affine.iter().collect();
+        fields.sort();
+        eprintln!("CLEAVE_TRACE_AFFINE_STRUCTS: {} fields: {fields:?}", fields.len());
     }
     {
         // Scoped so `ctx`'s own borrow of `module` ends before `module` is
@@ -454,6 +471,7 @@ pub fn lower_program<'c>(
             constructed_structs,
             field_mutated_structs,
             extern_boundary_structs,
+            field_affine,
             affine_structs,
             op_lines: &program.op_lines,
         };
@@ -607,7 +625,7 @@ fn array_memref_type<'c>(ctx: &LowerCtx<'c, '_>, ty: &Ty) -> MemRefType<'c> {
     MemRefType::new(ty_to_mlir(ctx, leaf_ty), &dims, None, None)
 }
 
-fn flatten_array_dims(ty: &Ty) -> (Vec<i64>, &Ty) {
+pub(crate) fn flatten_array_dims(ty: &Ty) -> (Vec<i64>, &Ty) {
     let mut dims = Vec::new();
     let mut cur = ty;
     while let Ty::Array(elem, size) = cur {
@@ -1446,7 +1464,7 @@ fn resolve_struct_field_const(expr: &Expr, mapping: &HashMap<String, Ty>) -> Ty 
 /// since `PrimOp::Struct`'s own `LetPrim::ty` carries exactly this, with no
 /// separate need to also thread `type_args` through `PrimOp::Struct`'s own
 /// payload.
-fn struct_name_and_args(ty: &Ty) -> (&str, &[Ty]) {
+pub(crate) fn struct_name_and_args(ty: &Ty) -> (&str, &[Ty]) {
     match ty {
         Ty::Con(name) => (name.as_str(), &[]),
         Ty::App(name, args) => (name.as_str(), args.as_slice()),
@@ -2546,18 +2564,21 @@ fn lower_prim_op<'c>(
                 let ptr_val = tensor_value_to_ptr(ctx, block, val, rc_ty);
                 emit_cleave_release_tagged(ctx, block, rc_ty, ptr_val, *ptr_var);
             } else if ctx.affine_structs.contains(ptr_var) {
-                // `doc/plan-affine-ownership.md`'s Stage 2 — nested inside
-                // the "not a tensor" branch deliberately, never checked
-                // ahead of it: `affine_struct_vars` restricts its own
-                // result to `PrimOp::Struct`-bound vars with no cascade-
-                // worthy field (`struct_has_no_cascade_fields`'s own doc
-                // comment, which also excludes a tensor-tagged `ty` itself
-                // directly) — this branch is never reachable for a tensor
-                // release regardless, this ordering just keeps it that
-                // way structurally rather than by coincidence.
-                let (name, type_args) = struct_name_and_args(rc_ty);
-                let struct_llvm_ty = struct_llvm_type(ctx, name, type_args);
-                emit_cleave_release_pool(ctx, block, rc_ty, struct_llvm_ty, val);
+                // `doc/plan-affine-ownership.md`'s Stage 2/§13 — nested
+                // inside the "not a tensor" branch deliberately, never
+                // checked ahead of it: `affine_struct_vars` excludes a
+                // tensor-tagged `ty` itself directly (`struct_cascade_is_
+                // viable`'s own doc comment), so this branch is never
+                // reachable for a tensor release regardless — this
+                // ordering just keeps it that way structurally rather than
+                // by coincidence. `lower_release_pool_cascade` (not a flat
+                // `emit_cleave_release_pool` call) — `affine_struct_vars`
+                // now also admits a struct with a cascade-worthy field, as
+                // long as it's never field-mutated (`struct_cascade_is_
+                // viable`'s own doc comment); the cascade itself decides,
+                // per field, whether to keep going headerless or fall back
+                // to the ordinary headered cascade (`ctx.field_affine`).
+                lower_release_pool_cascade(ctx, block, rc_ty, val);
             } else {
                 lower_release_cascade(ctx, block, rc_ty, val);
             }
@@ -4074,7 +4095,14 @@ fn declared_ptr_sig_ty(ctx: &LowerCtx<'_, '_>, rc_ty: &Ty) -> Ty {
 /// nesting (`push_cascade_leaf`'s own doc comment has the traversal).
 enum PendingChild<'c> {
     Tensor(Value<'c, 'c>),
-    Struct(Ty, Value<'c, 'c>),
+    /// `field_key` — `(containing struct's own type name, field position)`
+    /// — is only ever consulted by `lower_release_pool_cascade`
+    /// (`alias_analysis::field_affine_positions`'s own lookup key), never
+    /// by the ordinary headered `lower_release_cascade`; carried here
+    /// regardless, computed once alongside everything else `push_cascade_
+    /// leaf` already derives, rather than re-deriving it a second time at
+    /// the one call site that actually needs it.
+    Struct(Ty, Value<'c, 'c>, (String, usize)),
 }
 
 /// Whether `ty` is itself something this cascade would ever need to
@@ -4118,6 +4146,7 @@ fn push_cascade_leaf<'c>(
     block: &Block<'c>,
     leaf_ty: &Ty,
     slot_ptr: Value<'c, 'c>,
+    field_key: (String, usize),
     pending: &mut Vec<PendingChild<'c>>,
 ) {
     let context = ctx.context;
@@ -4211,7 +4240,7 @@ fn push_cascade_leaf<'c>(
             .result(0)
             .unwrap()
             .into();
-        pending.push(PendingChild::Struct(leaf_ty.clone(), child_val));
+        pending.push(PendingChild::Struct(leaf_ty.clone(), child_val, field_key));
     }
     // Else: a primitive — nothing refcounted to release. `ty_needs_cascade`
     // is what keeps this branch from ever being reached needlessly (the
@@ -4250,6 +4279,7 @@ fn push_cascade_children<'c>(
     base_ptr: Value<'c, 'c>,
     container_llvm_ty: Type<'c>,
     index_prefix: &[i64],
+    field_key: &(String, usize),
     pending: &mut Vec<PendingChild<'c>>,
 ) {
     if !ty_needs_cascade(ctx, field_ty) {
@@ -4269,11 +4299,12 @@ fn push_cascade_children<'c>(
             base_ptr,
             container_llvm_ty,
             &mut index_path,
+            field_key,
             pending,
         );
     } else {
         let slot_ptr = gep(ctx, block, base_ptr, index_prefix, container_llvm_ty);
-        push_cascade_leaf(ctx, block, field_ty, slot_ptr, pending);
+        push_cascade_leaf(ctx, block, field_ty, slot_ptr, field_key.clone(), pending);
     }
 }
 
@@ -4290,12 +4321,13 @@ fn push_cascade_array_elements<'c>(
     base_ptr: Value<'c, 'c>,
     container_llvm_ty: Type<'c>,
     index_path: &mut Vec<i64>,
+    field_key: &(String, usize),
     pending: &mut Vec<PendingChild<'c>>,
 ) {
     match dims.split_first() {
         None => {
             let slot_ptr = gep(ctx, block, base_ptr, index_path, container_llvm_ty);
-            push_cascade_leaf(ctx, block, leaf_ty, slot_ptr, pending);
+            push_cascade_leaf(ctx, block, leaf_ty, slot_ptr, field_key.clone(), pending);
         }
         Some((&n, rest)) => {
             for i in 0..n {
@@ -4308,6 +4340,7 @@ fn push_cascade_array_elements<'c>(
                     base_ptr,
                     container_llvm_ty,
                     index_path,
+                    field_key,
                     pending,
                 );
                 index_path.pop();
@@ -4337,6 +4370,7 @@ fn lower_release_cascade<'c>(
             ptr,
             struct_llvm_ty,
             &[0, position as i64],
+            &(name.to_string(), position),
             &mut pending,
         );
     }
@@ -4367,7 +4401,12 @@ fn lower_release_cascade<'c>(
                 // `i1` is simply unused.
                 emit_cleave_release(ctx, &then_block, struct_ty, child_ptr);
             }
-            PendingChild::Struct(child_ty, child_val) => {
+            // `field_key` is never consulted here — the ordinary, headered
+            // cascade always keeps cascading the ordinary, headered way,
+            // regardless of what `ctx.field_affine` might say about this
+            // exact field (`lower_release_pool_cascade`'s own doc comment
+            // has the one place that question actually gets asked).
+            PendingChild::Struct(child_ty, child_val, _field_key) => {
                 lower_release_cascade(ctx, &then_block, &child_ty, child_val);
             }
         }
@@ -4382,6 +4421,83 @@ fn lower_release_cascade<'c>(
     else_region.append_block(else_block);
 
     block.append_operation(scf::r#if(freed, &[], then_region, else_region, location));
+}
+
+/// `lower_release_cascade`'s headerless twin — `doc/plan-affine-ownership.
+/// md` §13/§14's own field-level cascade for a struct `alias_analysis::
+/// affine_struct_vars` already proved never aliased, with no header at all.
+///
+/// **Unconditional, never gated behind an `scf.if`** — unlike the ordinary
+/// cascade's own "was this call the one that actually freed it" check
+/// (`emit_cleave_release`'s own returned `i1`): a value this analysis
+/// proved has *exactly one* live reference, ever, can never have a second,
+/// still-live owner keeping it alive past this exact release — there is no
+/// refcount to have gotten this wrong, so "released" and "genuinely
+/// destroyed, cascade into its own fields now" are the same event here,
+/// always.
+///
+/// Reuses `push_cascade_children`/`push_cascade_leaf` verbatim — the
+/// pointer arithmetic to *find* a cascade-worthy field is identical whether
+/// the container has a header or not, only what happens to each found
+/// child differs. A `PendingChild::Tensor` always releases the ordinary,
+/// headered way (tensors are never pool-allocated at all today, `struct_
+/// cascade_is_viable`'s own doc comment — this branch is unreachable in
+/// practice, kept for the same "correct on its own, not by coincidence of
+/// caller structure" reason `lower_release_cascade`'s identical branch is).
+/// A `PendingChild::Struct` consults `ctx.field_affine` — computed once,
+/// whole-program, by `alias_analysis::field_affine_positions` — keyed by
+/// exactly the `(containing struct's own name, field position)` pair
+/// `push_cascade_leaf` already threads through: `Some(&true)` recurses
+/// through this same headerless cascade, anything else (including no
+/// entry at all — a field this analysis never proved *always* affine)
+/// falls back to the ordinary, headered `lower_release_cascade`, matching
+/// `doc/plan-affine-ownership.md` §7's own "when in doubt, header"
+/// discipline.
+fn lower_release_pool_cascade<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    struct_ty: &Ty,
+    ptr: Value<'c, 'c>,
+) {
+    let (name, type_args) = struct_name_and_args(struct_ty);
+    let field_types = struct_field_types(&ctx.struct_schemas, name, type_args);
+    let struct_llvm_ty = struct_llvm_type(ctx, name, type_args);
+
+    let mut pending: Vec<PendingChild<'c>> = Vec::new();
+    for (position, (_, field_ty)) in field_types.iter().enumerate() {
+        push_cascade_children(
+            ctx,
+            block,
+            field_ty,
+            ptr,
+            struct_llvm_ty,
+            &[0, position as i64],
+            &(name.to_string(), position),
+            &mut pending,
+        );
+    }
+
+    // Children read out and, for a nested struct, recursed into *before*
+    // this container's own block goes back to its free list — mirrors
+    // `lower_release_cascade`'s own ordering, for the identical reason: a
+    // struct field read *through* `ptr` is no longer valid to touch once
+    // `ptr`'s own storage has been handed back.
+    for child in &pending {
+        match child {
+            PendingChild::Tensor(child_ptr) => {
+                emit_cleave_release(ctx, block, struct_ty, *child_ptr);
+            }
+            PendingChild::Struct(child_ty, child_val, field_key) => {
+                if ctx.field_affine.get(field_key) == Some(&true) {
+                    lower_release_pool_cascade(ctx, block, child_ty, *child_val);
+                } else {
+                    lower_release_cascade(ctx, block, child_ty, *child_val);
+                }
+            }
+        }
+    }
+
+    emit_cleave_release_pool(ctx, block, struct_ty, struct_llvm_ty, ptr);
 }
 
 /// Allocates one **heap**-backed slot shaped `llvm_ty`, returning its own

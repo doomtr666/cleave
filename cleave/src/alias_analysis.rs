@@ -853,12 +853,94 @@ pub fn affine_struct_vars(
         for facts in &per_fn_carried_facts {
             changed |= collect_affine_carried_params(facts, &mut affine);
         }
+        // §13/§14's own extension: `refcount::insert_refcounting` sometimes
+        // releases a field *read back out* of a never-mutated struct
+        // directly (`(field.inner v466)`/`(release v477)`), rather than the
+        // containing struct's own `CVar` — the exact same physical
+        // allocation as whatever was embedded at that field's own
+        // construction site, under a third name. If that field position is
+        // already proven always-affine (`field_affine_positions`, computed
+        // fresh each iteration from the current `affine` — cheap, and
+        // needed since a field's own eligibility can itself only become
+        // known partway through this very fixed point), the field-read
+        // result needs the identical treatment or its own release
+        // disagrees with whatever allocator actually backed it — confirmed
+        // directly, a real `STATUS_ACCESS_VIOLATION` on the very first
+        // nested-struct pool test written for this extension.
+        let field_affine = field_affine_positions(program, &affine);
+        for f in &non_region_local {
+            changed |= collect_affine_field_reads(
+                &f.def.body,
+                struct_schemas,
+                field_mutated_structs,
+                &field_affine,
+                &mut affine,
+            );
+        }
         if !changed {
             break;
         }
     }
 
     affine
+}
+
+/// See [`affine_struct_vars`]'s own doc comment on the loop this is called
+/// from for why this exists. Walks the whole body once, adding to `affine`
+/// every `PrimOp::Field`-bound `CVar` reading an already-proven-affine
+/// field off a never-field-mutated struct. `PrimOp::Load` (array indexing)
+/// is deliberately not covered — `field_affine_positions` never marks an
+/// array-typed field position affine in the first place (an array's own
+/// `CVar` is never itself a member of `affine`), so this would find nothing
+/// to do for one regardless; not worth the extra code until a real case
+/// needs it.
+fn collect_affine_field_reads(
+    expr: &CExpr,
+    struct_schemas: &HashMap<String, crate::cps::StructSchema>,
+    field_mutated_structs: &HashSet<String>,
+    field_affine: &HashMap<(String, usize), bool>,
+    affine: &mut HashSet<CVar>,
+) -> bool {
+    match expr {
+        CExpr::LetPrim { var, op, cont, .. } => {
+            let mut changed = false;
+            if let PrimOp::Field { struct_ty, field } = op {
+                if !affine.contains(var) {
+                    let (name, type_args) = crate::mlir_lower::struct_name_and_args(struct_ty);
+                    if !field_mutated_structs.contains(name) {
+                        let fields = crate::mlir_lower::struct_field_types(struct_schemas, name, type_args);
+                        if let Some(pos) = fields.iter().position(|(n, _)| n == field) {
+                            if field_affine.get(&(name.to_string(), pos)) == Some(&true) {
+                                affine.insert(*var);
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            changed
+                | collect_affine_field_reads(cont, struct_schemas, field_mutated_structs, field_affine, affine)
+        }
+        CExpr::App { .. } => false,
+        CExpr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            let a = collect_affine_field_reads(then_branch, struct_schemas, field_mutated_structs, field_affine, affine);
+            let b = collect_affine_field_reads(else_branch, struct_schemas, field_mutated_structs, field_affine, affine);
+            a || b
+        }
+        CExpr::Fix { defs, body } => {
+            let mut changed = false;
+            for d in defs {
+                changed |=
+                    collect_affine_field_reads(&d.body, struct_schemas, field_mutated_structs, field_affine, affine);
+            }
+            changed |= collect_affine_field_reads(body, struct_schemas, field_mutated_structs, field_affine, affine);
+            changed
+        }
+    }
 }
 
 /// One top-level function's own body, reduced to exactly what [`collect_
@@ -1054,7 +1136,7 @@ fn collect_affine_candidates(
             var, op, ty, cont, ..
         } => {
             if matches!(op, PrimOp::Struct(..))
-                && struct_has_no_cascade_fields(
+                && struct_cascade_is_viable(
                     ty,
                     struct_schemas,
                     mlir_types,
@@ -1140,7 +1222,70 @@ fn collect_affine_candidates(
 /// `mlir_lower.rs::lower_release_cascade`-style recursion at release time
 /// — see [`affine_struct_vars`]'s own doc comment for why this is this
 /// first landing's own restriction, not a fundamental one.
-fn struct_has_no_cascade_fields(
+/// Whether `field_ty` (a field's own declared type — the true leaf, after
+/// flattening any array nesting, exactly like `mlir_lower.rs::push_cascade_
+/// children`'s own recursion) would need `lower_release_cascade`-style
+/// recursion at release time — a tensor-tagged type, or an ordinary
+/// refcounted nested struct. Shared by both directions
+/// [`struct_cascade_is_viable`] needs: "does this struct have any cascade
+/// work at all" and "is this specific cascade-worthy field's own struct
+/// type itself mutation-free".
+fn field_needs_cascade(
+    field_ty: &Ty,
+    struct_schemas: &HashMap<String, crate::cps::StructSchema>,
+    mlir_types: &HashMap<String, String>,
+    constructed_structs: &HashSet<String>,
+    field_mutated_structs: &HashSet<String>,
+    extern_boundary_structs: &HashSet<String>,
+) -> bool {
+    let (_, leaf_ty) = crate::mlir_lower::flatten_array_dims(field_ty);
+    let (field_name, _): (&str, &[Ty]) = match leaf_ty {
+        Ty::Con(n) => (n.as_str(), &[]),
+        Ty::App(n, args) => (n.as_str(), args.as_slice()),
+        // A genuine primitive leaf (after flattening): never a cascade
+        // target.
+        _ => return false,
+    };
+    if matches!(mlir_types.get(field_name).map(String::as_str), Some("tensor") | Some("vector")) {
+        return true;
+    }
+    struct_schemas.contains_key(field_name)
+        && crate::refcount::is_refcounted(
+            leaf_ty,
+            struct_schemas,
+            mlir_types,
+            constructed_structs,
+            field_mutated_structs,
+            extern_boundary_structs,
+        )
+}
+
+/// Whether `ty` (a struct type) can have its `Release` cascaded into at
+/// release time at all — either because it has zero fields that would need
+/// `mlir_lower.rs::lower_release_cascade`-style recursion
+/// ([`field_needs_cascade`]), or because *every* cascade-worthy field's own
+/// occupant is fixed forever from its own single construction site: `ty`
+/// itself, and every cascade-worthy *struct* field's own type (a tensor
+/// field is always a leaf — cleave has no way to field-mutate one of those
+/// independently of the container holding it), is never field-mutated
+/// anywhere in the whole program (`field_mutated_structs`). Decidable
+/// statically, with no flow-sensitive points-to needed at all — `doc/plan-
+/// affine-ownership.md` §14.4's own "Phase B" scoping, confirmed directly
+/// on the real target (`examples/mnist-interop`): zero `PrimOp::FieldStore`
+/// anywhere in the whole compiled kernel.
+///
+/// A struct that clears this bar is *not yet* itself affine-eligible on its
+/// own — [`affine_struct_vars`]'s own "never aliased" condition (rule 1)
+/// still has to hold too, exactly as before. What clearing it *does* mean:
+/// [`field_affine_positions`] may go on to decide, per field, whether
+/// `mlir_lower.rs::lower_release_pool_cascade` (a headerless cascade) or
+/// the ordinary headered one is the right generated code for that specific
+/// field, once and for all — the allocator choice for a *field* is a
+/// property of the *type*, not of any one instance (that generated cascade
+/// runs for every value of this struct type, not once per construction
+/// site), which is exactly why "is it ever field-mutated" (a whole-program,
+/// type-level fact) is the right question here, not a per-instance one.
+fn struct_cascade_is_viable(
     ty: &Ty,
     struct_schemas: &HashMap<String, crate::cps::StructSchema>,
     mlir_types: &HashMap<String, String>,
@@ -1167,34 +1312,86 @@ fn struct_has_no_cascade_fields(
         return false;
     }
     let fields = crate::mlir_lower::struct_field_types(struct_schemas, name, type_args);
+    let has_cascade_field = fields.iter().any(|(_, field_ty)| {
+        field_needs_cascade(
+            field_ty,
+            struct_schemas,
+            mlir_types,
+            constructed_structs,
+            field_mutated_structs,
+            extern_boundary_structs,
+        )
+    });
+    if !has_cascade_field {
+        return true;
+    }
+    if field_mutated_structs.contains(name) {
+        return false;
+    }
     fields.iter().all(|(_, field_ty)| {
-        let (field_name, _): (&str, &[Ty]) = match field_ty {
+        let (_, leaf_ty) = crate::mlir_lower::flatten_array_dims(field_ty);
+        let (field_name, _): (&str, &[Ty]) = match leaf_ty {
             Ty::Con(n) => (n.as_str(), &[]),
             Ty::App(n, args) => (n.as_str(), args.as_slice()),
-            // A primitive/array-of-primitive field: never a cascade
-            // target (`lower_release_cascade`'s own "primitive/array-of-
-            // primitive -- nothing refcounted to release" case).
             _ => return true,
         };
-        // Neither a tensor-tagged field (`#[mlir_type(tensor)]`,
-        // `native_shape_keyword`'s own check, reproduced directly here
-        // since it only ever needs `mlir_types`, not the full `LowerCtx`
-        // `mlir_lower.rs`'s own version takes) nor an ordinary refcounted
-        // nested struct.
-        let is_tensor_tagged = matches!(mlir_types.get(field_name).map(String::as_str), Some("tensor") | Some("vector"));
-        if is_tensor_tagged {
-            return false;
-        }
-        !struct_schemas.contains_key(field_name)
-            || !crate::refcount::is_refcounted(
-                field_ty,
-                struct_schemas,
-                mlir_types,
-                constructed_structs,
-                field_mutated_structs,
-                extern_boundary_structs,
-            )
+        matches!(mlir_types.get(field_name).map(String::as_str), Some("tensor") | Some("vector"))
+            || !field_mutated_structs.contains(field_name)
     })
+}
+
+/// For every `(struct type name, field position)` whose own type is
+/// [`field_needs_cascade`]-worthy, whether *every* construction site of
+/// that struct type anywhere in the program passes an already-[`affine_
+/// struct_vars`]-eligible argument at that position. A whole-program AND,
+/// not an OR: `mlir_lower.rs::lower_release_pool_cascade` is generated once
+/// per *type*, never once per instance, so the allocator choice for a
+/// given field must hold for every instance of that type — one instance
+/// backed by an ordinary header is enough to require the header-based
+/// cascade for every one of them (`doc/plan-affine-ownership.md` §7's own
+/// "when in doubt, header" discipline).
+pub fn field_affine_positions(program: &CpsProgram, affine: &HashSet<CVar>) -> HashMap<(String, usize), bool> {
+    let mut result: HashMap<(String, usize), bool> = HashMap::new();
+    for f in &program.funcs {
+        collect_field_affine_facts(&f.def.body, affine, &mut result);
+    }
+    result
+}
+
+fn collect_field_affine_facts(
+    expr: &CExpr,
+    affine: &HashSet<CVar>,
+    result: &mut HashMap<(String, usize), bool>,
+) {
+    match expr {
+        CExpr::LetPrim { op, args, cont, .. } => {
+            if let PrimOp::Struct(name, _) = op {
+                for (i, arg) in args.iter().enumerate() {
+                    let this_site_affine = matches!(arg, CVal::Var(v) if affine.contains(v));
+                    result
+                        .entry((name.clone(), i))
+                        .and_modify(|ok| *ok = *ok && this_site_affine)
+                        .or_insert(this_site_affine);
+                }
+            }
+            collect_field_affine_facts(cont, affine, result);
+        }
+        CExpr::App { .. } => {}
+        CExpr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_field_affine_facts(then_branch, affine, result);
+            collect_field_affine_facts(else_branch, affine, result);
+        }
+        CExpr::Fix { defs, body } => {
+            for d in defs {
+                collect_field_affine_facts(&d.body, affine, result);
+            }
+            collect_field_affine_facts(body, affine, result);
+        }
+    }
 }
 
 /// Standard worklist propagation over a small, already-extracted
