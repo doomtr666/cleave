@@ -340,6 +340,15 @@ pub unsafe fn register_cleave_rt_symbols(engine: &melior::ExecutionEngine) {
         engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
         engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
         engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
+        // `doc/plan-affine-ownership.md`'s Stage 2 -- only ever called when
+        // `CLEAVE_AFFINE_STRUCTS=1` (`mlir_lower.rs::lower_program`'s own
+        // doc comment), registered unconditionally here regardless, same
+        // as every other `cleave-rt` symbol on this list.
+        engine.register_symbol("cleave_alloc_pool", cleave_rt::cleave_alloc_pool as *mut ());
+        engine.register_symbol(
+            "cleave_release_pool",
+            cleave_rt::cleave_release_pool as *mut (),
+        );
         engine.register_symbol(
             "cleave_release_tagged",
             cleave_rt::cleave_release_tagged as *mut (),

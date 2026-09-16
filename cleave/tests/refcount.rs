@@ -856,3 +856,110 @@ fn an_element_extracted_from_an_array_and_never_reused_needs_no_retain() {
          needs no protecting retain -- got a retain anyway"
     );
 }
+
+/// Regression test for what `aliases_ret_param` (`refcount.rs`'s own
+/// `rewrite_body::Fix` arm) exists to prevent — found by direct testing,
+/// a real double-free via the size-class pool: `println(("Epoch=",
+/// epoch))`, `Print::print`/`println` both genuinely `fn(x) -> x`.
+/// Nothing in the test suite covered this before writing this test
+/// (checked: `grep aliases_ret_param cleave/tests/*.rs` found nothing) —
+/// only a module-doc comment recorded the original crash.
+///
+/// `id`'s own type-matching to its own resumption's return type is what
+/// the *coarse* version of this check keys on; this test's whole point is
+/// that a genuinely identity-shaped callee must still be protected no
+/// matter how that protection is computed.
+#[test]
+fn a_struct_transferred_into_a_genuinely_identity_shaped_call_and_reused_is_released_once() {
+    let src = "
+        struct Boxed { v: i32, tag: [i32; 1] }
+        fn id(x: Boxed) -> Boxed { x }
+        fn main() -> i32 {
+            let a = Boxed(v: 1, tag: [0]);
+            let r = id(a);
+            r.v + a.v
+        }
+        ";
+    let program = refcounted_cps(src);
+    assert_eq!(
+        count_releases_for(&program, "Boxed"),
+        1,
+        "`a`/`r` are the exact same allocation (`id` returns its argument \
+         unchanged) -- exactly one release must be inserted for it, not two \
+         (a real double-free) and not zero (a leak)"
+    );
+    assert_eq!(run_i32(src), 2);
+}
+
+/// The other half: a callee whose own return type happens to match one of
+/// its own parameters' types, but which is **not** identity-shaped (it
+/// genuinely builds a fresh value), must not be mistaken for one merely
+/// because the types coincide -- `bump`'s own `Boxed -> Boxed` signature
+/// is exactly this shape, and is the real, minimized case
+/// `doc/backlog.md`'s array/loop-leak entry is built from.
+#[test]
+fn a_transferred_argument_to_a_same_signature_but_non_identity_call_is_still_released() {
+    let src = "
+        struct Boxed { v: i32, tag: [i32; 1] }
+        fn bump(a: Boxed) -> Boxed { Boxed(v: a.v + 1, tag: [a.tag[0]]) }
+        extern fn opaque_sink(b: Boxed) -> i32;
+        extern fn opaque_sink2(b: Boxed) -> i32;
+        fn main() -> i32 {
+            let a = Boxed(v: 1, tag: [0]);
+            let r = bump(a);
+            opaque_sink(r) + opaque_sink2(a)
+        }
+        ";
+    let program = refcounted_cps(src);
+    assert_eq!(
+        count_releases_for(&program, "Boxed"),
+        2,
+        "`bump` builds a genuinely fresh `Boxed`, not `a` handed back unchanged \
+         -- both `a` and `bump`'s own result must be released once each (2 \
+         total), not treated as the same aliased object just because the \
+         signature happens to match"
+    );
+    // No `run_i32` here, deliberately: `opaque_sink`/`opaque_sink2` are
+    // `extern fn` with no real implementation registered in the JIT --
+    // this test checks the inserted CPS structure only, matching `cleave/
+    // tests/array_release_cascade.rs`'s own established pattern for the
+    // same reason (an opaque sink is what keeps the e-graph from fusing
+    // `bump`'s own call away entirely, `--dump-cps-optimized` confirmed
+    // directly while writing this test).
+}
+
+/// Regression test for the real `mnist-interop` crash this session found:
+/// `println` wraps `Print::print`, itself genuinely `fn(x) -> x`, and
+/// hands its own result straight back unchanged -- but `println`'s own
+/// body never *directly* returns its own parameter by name (it returns
+/// the *call's own result*, a different `CVar`). A single-pass identity
+/// check (this project's own first attempt) sees only the direct case and
+/// misses this one, wrongly seeding a second, redundant release for the
+/// original argument -- confirmed via `CLEAVE_DEBUG_POOL`: "release on
+/// parked block", on the exact 12-byte tuple `println(("Epoch=", epoch))`
+/// builds. `alias_analysis::analyze_identity`'s own whole-program fixed
+/// point is what `refcount.rs` now consults instead, specifically to
+/// resolve chains like this one.
+#[test]
+fn a_wrapper_around_a_genuinely_identity_shaped_function_is_also_identity_shaped() {
+    let src = "
+        struct Boxed { v: i32, tag: [i32; 1] }
+        fn identity(x: Boxed) -> Boxed { x }
+        fn wrapper(y: Boxed) -> Boxed { identity(y) }
+        fn main() -> i32 {
+            let a = Boxed(v: 1, tag: [0]);
+            let r = wrapper(a);
+            r.v + a.v
+        }
+        ";
+    let program = refcounted_cps(src);
+    assert_eq!(
+        count_releases_for(&program, "Boxed"),
+        1,
+        "`a`/`r` are the exact same allocation, forwarded unchanged through \
+         two levels of identity-shaped functions (`wrapper` -> `identity`) \
+         -- exactly one release must be inserted, not two (the real \
+         mnist-interop double-free this reproduces) and not zero"
+    );
+    assert_eq!(run_i32(src), 2);
+}

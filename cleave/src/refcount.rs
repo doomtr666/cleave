@@ -198,7 +198,14 @@ pub(crate) fn is_refcounted(
 /// every nested `Fix`/`If` — mirrors `region_analysis.rs`'s own established
 /// "plain recursive `CExpr` walk, no fixpoint needed" shape for this same
 /// kind of whole-program structural fact.
-pub(crate) fn collect_constructed_struct_names(program: &CpsProgram) -> HashSet<String> {
+///
+/// (The identity-return question this file used to answer itself,
+/// `collect_identity_param_positions`/`find_identity_returns`, now lives
+/// in `alias_analysis::analyze_identity` — a real fixed point, not a
+/// single pass, extirpated from here once a genuinely transitive case
+/// (`println` wrapping `Print::print`) proved the single-pass version
+/// unsound. See that function's own doc comment for the full story.)
+pub fn collect_constructed_struct_names(program: &CpsProgram) -> HashSet<String> {
     let mut names = HashSet::new();
     for f in &program.funcs {
         collect_constructed_in(&f.def.body, &mut names);
@@ -247,7 +254,7 @@ fn collect_constructed_in(expr: &CExpr, names: &mut HashSet<String>) {
 /// that happens to be field-mutated *elsewhere*, on its own separate
 /// binding, is completely unaffected — only the field-mutated struct's own
 /// name needs excluding, not everything that ever references it.
-pub(crate) fn collect_field_mutated_struct_names(program: &CpsProgram) -> HashSet<String> {
+pub fn collect_field_mutated_struct_names(program: &CpsProgram) -> HashSet<String> {
     let mut names = HashSet::new();
     for f in &program.funcs {
         collect_field_mutated_in(&f.def.body, &mut names);
@@ -303,7 +310,7 @@ fn collect_field_mutated_in(expr: &CExpr, names: &mut HashSet<String>) {
 /// reasoning as `collect_field_mutated_struct_names`'s own doc comment —
 /// only the struct actually named at the boundary itself is excluded, not
 /// everything that references it.
-pub(crate) fn collect_extern_boundary_struct_names(program: &CpsProgram) -> HashSet<String> {
+pub fn collect_extern_boundary_struct_names(program: &CpsProgram) -> HashSet<String> {
     let mut names = HashSet::new();
     for f in &program.funcs {
         collect_extern_boundary_in(&f.def.body, &mut names);
@@ -1071,6 +1078,11 @@ struct RefcountCtx<'a> {
     /// `param_leaf_key`'s own `Field`/`StructCtor` lookup table for this
     /// one function's own body — see that function's own doc comment.
     value_defs: &'a HashMap<CVar, ValueDef>,
+    /// `alias_analysis::IdentitySummary`'s own doc comment — whole-program
+    /// (not per-function, unlike `params`/`value_defs` above), since a
+    /// call site needs to look up *the callee's* own facts, not this
+    /// function's own.
+    identity_summary: &'a crate::alias_analysis::IdentitySummary,
 }
 
 impl RefcountCtx<'_> {
@@ -1139,6 +1151,7 @@ pub fn insert_refcounting(
     let constructed_structs = collect_constructed_struct_names(&program);
     let field_mutated_structs = collect_field_mutated_struct_names(&program);
     let extern_boundary_structs = collect_extern_boundary_struct_names(&program);
+    let identity_summary = crate::alias_analysis::analyze_identity(&program);
     let op_lines = program.op_lines;
     let funcs = program
         .funcs
@@ -1166,6 +1179,7 @@ pub fn insert_refcounting(
                 fresh: &fresh,
                 params: &params,
                 value_defs: &value_defs,
+                identity_summary: &identity_summary,
             };
             insert_refcounting_fn(top, &ctx)
         })
@@ -1556,6 +1570,31 @@ fn rewrite_body(
                 _ => (Vec::new(), owned, HashSet::new()),
             };
 
+            // The real callee's own name, and each literal argument's own
+            // position in its call — needed below to ask `ctx.identity_
+            // param_positions` a precise question ("does *this* callee
+            // ever return *this* specific parameter unchanged"), instead
+            // of the coarse type-coincidence `aliases_ret_param` used to
+            // rely on alone. `None` for anything that isn't a real named
+            // call (a loop's own back-edge, a join) — `aliases_ret_param`
+            // is already gated `!is_loop` below, so this is simply never
+            // consulted there.
+            let callee_and_arg_positions: Option<(&str, HashMap<CVar, usize>)> =
+                match body.as_ref() {
+                    CExpr::App {
+                        func: CVal::Label(name),
+                        args,
+                    } => {
+                        let positions: HashMap<CVar, usize> = args
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, a)| as_var(a).map(|v| (v, i)))
+                            .collect();
+                        Some((name.as_str(), positions))
+                    }
+                    _ => None,
+                };
+
             let new_defs = defs
                 .into_iter()
                 .map(|def| {
@@ -1716,10 +1755,48 @@ fn rewrite_body(
                                 .local_free_vars
                                 .get(&def.name)
                                 .is_some_and(|fv| fv.contains(v));
-                            let aliases_ret_param = !is_loop
-                                && is_entry_arg
-                                && !arg_needed_later
-                                && resumption_ret_tys.iter().any(|rt| *rt == ty);
+                            // Whether the real callee might hand `v` straight
+                            // back as its own return value -- three cases,
+                            // in order of precision (`alias_analysis::
+                            // IdentitySummary`'s own doc comment has the
+                            // full story on why the fallback exists and
+                            // must stay this conservative, and why this is
+                            // now a whole-program fixed point rather than a
+                            // single-pass check -- found necessary by a
+                            // real crash: `println` wraps `Print::print`,
+                            // itself genuinely identity-shaped, but never
+                            // *directly* returns its own parameter by name,
+                            // which the single-pass version this replaced
+                            // could not see):
+                            //   1. Callee known (`program.funcs` has its
+                            //      body), `v`'s own argument position is
+                            //      genuinely never returned unchanged on any
+                            //      path -- safe, `false`.
+                            //   2. Callee known, that position *is* (maybe)
+                            //      returned unchanged, directly or through a
+                            //      chain of other identity-shaped callees --
+                            //      protect, `true`.
+                            //   3. Callee unknown (an `extern fn` -- no body
+                            //      to check at all) -- fall back to the
+                            //      original coarse type-coincidence check,
+                            //      never more permissive than before this
+                            //      fix for a case it has no real evidence
+                            //      about.
+                            let might_return_unchanged = match callee_and_arg_positions
+                                .as_ref()
+                                .and_then(|(callee, positions)| {
+                                    positions.get(v).map(|&pos| (*callee, pos))
+                                }) {
+                                Some((callee, pos)) => ctx
+                                    .identity_summary
+                                    .returns_unchanged(callee, pos)
+                                    .unwrap_or_else(|| {
+                                        resumption_ret_tys.iter().any(|rt| *rt == ty)
+                                    }),
+                                None => resumption_ret_tys.iter().any(|rt| *rt == ty),
+                            };
+                            let aliases_ret_param =
+                                !is_loop && is_entry_arg && !arg_needed_later && might_return_unchanged;
                             if (!is_loop || !is_entry_arg)
                                 && !aliases_ret_param
                                 && seen.insert(*v)

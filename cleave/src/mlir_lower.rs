@@ -140,6 +140,17 @@ struct LowerCtx<'c, 'm> {
     /// regardless of field shape); consulted by `is_light_struct` as its
     /// third disqualifier.
     extern_boundary_structs: HashSet<String>,
+    /// `doc/plan-affine-ownership.md`'s Stage 2 -- `PrimOp::Struct`-bound
+    /// `CVar`s (`alias_analysis::affine_struct_vars`) the compiler has
+    /// *proven* can never have more than one live reference and whose own
+    /// field shape needs no release cascade -- `alloc_llvm_value`'s own
+    /// doc comment for how this gets consulted, and `PrimOp::Release`'s
+    /// own lowering arm for the matching release-side dispatch. Global
+    /// (`CVar`s are unique program-wide), unlike `region_local_fns`
+    /// above -- no per-function "currently active" `Cell` needed, a
+    /// direct `HashSet::contains` is enough. Empty unless
+    /// `CLEAVE_AFFINE_STRUCTS=1` (`lower_program`'s own doc comment).
+    affine_structs: HashSet<CVar>,
     /// Per-`LetPrim` source line (`CpsProgram::op_lines`) -- `lower_cexpr`'s
     /// `LetPrim` arm stamps `GEN_LINE` from it so every op emitted for that
     /// `LetPrim` gets the right debug-info line, falling back to the
@@ -389,6 +400,45 @@ pub fn lower_program<'c>(
     let constructed_structs = crate::refcount::collect_constructed_struct_names(program);
     let field_mutated_structs = crate::refcount::collect_field_mutated_struct_names(program);
     let extern_boundary_structs = crate::refcount::collect_extern_boundary_struct_names(program);
+    // `doc/plan-affine-ownership.md`'s Stage 2 — computed here, internally,
+    // exactly like `region_local_fns` right above, rather than threaded in
+    // as a new parameter: `lower_program` is called from 4 sites in this
+    // crate alone (`main.rs` x3, `pipeline.rs`) plus 14 test files, and
+    // `program` here is already the *one* `CpsProgram` this function
+    // actually receives — no new plumbing needed. This does mean `program`
+    // is the *post*-`insert_refcounting` CPS, not the snapshot `alias_
+    // analysis`'s own doc comment was written against — safe specifically
+    // because `alias_analysis::occurs_in` deliberately excludes `Retain`/
+    // `Release` from its own occurs-check for exactly this reason (that
+    // function's own doc comment; confirmed directly by a dedicated test,
+    // `affine_eligibility_gives_the_same_answer_before_and_after_insert_
+    // refcounting`, that the verdict doesn't change either way).
+    //
+    // Gated behind `CLEAVE_AFFINE_STRUCTS=1`, off by default, matching
+    // this whole project's own established rollout discipline for a
+    // change with real correctness stakes (`doc/plan-affine-ownership.md`
+    // §5) — an empty set here means `alloc_llvm_value`'s own new dispatch
+    // branch is simply never taken, zero behavior change from today.
+    let affine_structs: HashSet<CVar> = if std::env::var("CLEAVE_AFFINE_STRUCTS").is_ok() {
+        let summary = crate::alias_analysis::analyze(program);
+        crate::alias_analysis::affine_struct_vars(
+            program,
+            &summary,
+            &struct_schemas,
+            mlir_types,
+            &constructed_structs,
+            &field_mutated_structs,
+            &extern_boundary_structs,
+            &region_local_fns,
+        )
+    } else {
+        HashSet::new()
+    };
+    if std::env::var("CLEAVE_TRACE_AFFINE_STRUCTS").is_ok() {
+        let mut vars: Vec<&CVar> = affine_structs.iter().collect();
+        vars.sort();
+        eprintln!("CLEAVE_TRACE_AFFINE_STRUCTS: {} vars: {vars:?}", vars.len());
+    }
     {
         // Scoped so `ctx`'s own borrow of `module` ends before `module` is
         // moved out below.
@@ -404,6 +454,7 @@ pub fn lower_program<'c>(
             constructed_structs,
             field_mutated_structs,
             extern_boundary_structs,
+            affine_structs,
             op_lines: &program.op_lines,
         };
         // One `DISubprogram` per function, *all* of them (not just whoever
@@ -1698,7 +1749,7 @@ fn lower_cexpr<'c>(
                     GEN_FILE_ID.with(|c| c.set(loc.file));
                 }
             }
-            if let Some(value) = lower_prim_op(ctx, block, &env, op, args, ty) {
+            if let Some(value) = lower_prim_op(ctx, block, &env, *var, op, args, ty) {
                 env.insert(*var, value);
             }
             lower_cexpr(ctx, block, env, k_ret, result_type, yield_targets, cont);
@@ -2334,6 +2385,7 @@ fn lower_prim_op<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
     env: &HashMap<CVar, Value<'c, 'c>>,
+    var: CVar,
     op: &PrimOp,
     args: &[CVal],
     ty: &Ty,
@@ -2436,6 +2488,7 @@ fn lower_prim_op<'c>(
                     ctx,
                     block,
                     env,
+                    var,
                     ty,
                     field_names,
                     args,
@@ -2492,6 +2545,19 @@ fn lower_prim_op<'c>(
             if native_shape_field_keyword(ctx, rc_ty).is_some() {
                 let ptr_val = tensor_value_to_ptr(ctx, block, val, rc_ty);
                 emit_cleave_release_tagged(ctx, block, rc_ty, ptr_val, *ptr_var);
+            } else if ctx.affine_structs.contains(ptr_var) {
+                // `doc/plan-affine-ownership.md`'s Stage 2 — nested inside
+                // the "not a tensor" branch deliberately, never checked
+                // ahead of it: `affine_struct_vars` restricts its own
+                // result to `PrimOp::Struct`-bound vars with no cascade-
+                // worthy field (`struct_has_no_cascade_fields`'s own doc
+                // comment, which also excludes a tensor-tagged `ty` itself
+                // directly) — this branch is never reachable for a tensor
+                // release regardless, this ordering just keeps it that
+                // way structurally rather than by coincidence.
+                let (name, type_args) = struct_name_and_args(rc_ty);
+                let struct_llvm_ty = struct_llvm_type(ctx, name, type_args);
+                emit_cleave_release_pool(ctx, block, rc_ty, struct_llvm_ty, val);
             } else {
                 lower_release_cascade(ctx, block, rc_ty, val);
             }
@@ -2540,7 +2606,7 @@ fn lower_array_construct<'c>(
         );
         let array_llvm_ty = ty_to_llvm_field_type(ctx, ty);
         let elem_ty = ty_to_mlir(ctx, leaf_ty);
-        let ptr = alloc_llvm_value(ctx, block, array_llvm_ty);
+        let ptr = alloc_llvm_value(ctx, block, array_llvm_ty, None);
         let location = gen_loc(ctx.context);
         for (i, arg) in args.iter().enumerate() {
             let elem_val = lower_cval(ctx.context, block, env, arg, elem_ty);
@@ -2601,7 +2667,7 @@ fn lower_array_repeat<'c>(
         );
         let array_llvm_ty = ty_to_llvm_field_type(ctx, ty);
         let elem_ty = ty_to_mlir(ctx, leaf_ty);
-        let ptr = alloc_llvm_value(ctx, block, array_llvm_ty);
+        let ptr = alloc_llvm_value(ctx, block, array_llvm_ty, None);
         let elem_val = lower_cval(ctx.context, block, env, value_arg, elem_ty);
         let location = gen_loc(ctx.context);
         for i in 0..outer_dim {
@@ -2823,6 +2889,7 @@ fn lower_struct_construct<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
     env: &HashMap<CVar, Value<'c, 'c>>,
+    var: CVar,
     ty: &Ty,
     field_names: &[String],
     args: &[CVal],
@@ -2842,7 +2909,7 @@ fn lower_struct_construct<'c>(
             args,
         );
     }
-    let ptr = alloc_llvm_value(ctx, block, struct_llvm_ty);
+    let ptr = alloc_llvm_value(ctx, block, struct_llvm_ty, Some(var));
     for (field_name, arg) in field_names.iter().zip(args) {
         let position = field_types
             .iter()
@@ -3346,7 +3413,7 @@ fn build_tensor_descriptor_value<'c>(
     // type" contract exactly the way a struct-leaf array already uses it.
     let total_elems: u32 = dims.iter().product::<i64>() as u32;
     let flat_array_ty = llvm::r#type::array(elem_mlir_ty, total_elems);
-    let dest_ptr = alloc_llvm_value(ctx, block, flat_array_ty);
+    let dest_ptr = alloc_llvm_value(ctx, block, flat_array_ty, None);
     let size = llvm_type_size_bytes(ctx, block, flat_array_ty);
     let i64_ty: Type = IntegerType::new(context, 64).into();
     let is_volatile = Attribute::parse(context, "false")
@@ -3848,6 +3915,44 @@ fn emit_cleave_release<'c>(
     call_op.result(0).unwrap().into()
 }
 
+/// `doc/plan-affine-ownership.md`'s Stage 2 — the release half of
+/// `alloc_llvm_value`'s own `cleave_alloc_pool` branch. `cleave-rt::
+/// cleave_release_pool`'s own doc comment: no header means no `data_size`
+/// stored anywhere for the runtime to read back, so `size` (the exact
+/// same `llvm_type_size_bytes` computation `alloc_llvm_value` already used
+/// at this value's own construction) is recomputed here and passed
+/// explicitly. Returns nothing to act on (unconditional, no refcount to
+/// check) — unlike `emit_cleave_release`, there is no cascade to gate
+/// behind: `affine_struct_vars` only ever admits a struct with no
+/// cascade-worthy field of its own into `ctx.affine_structs` in the first
+/// place (that function's own doc comment), so a plain release is always
+/// the whole story here.
+fn emit_cleave_release_pool<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    rc_ty: &Ty,
+    struct_llvm_ty: Type<'c>,
+    ptr_val: Value<'c, 'c>,
+) {
+    let context = ctx.context;
+    let location = gen_loc(context);
+    let size = llvm_type_size_bytes(ctx, block, struct_llvm_ty);
+    let declared_ty = declared_ptr_sig_ty(ctx, rc_ty);
+    ensure_extern_declared(
+        ctx,
+        "cleave_release_pool",
+        &[declared_ty, Ty::Con("i64".to_string())],
+        &[],
+    );
+    block.append_operation(func::call(
+        context,
+        FlatSymbolRefAttribute::new(context, "cleave_release_pool"),
+        &[ptr_val, size],
+        &[],
+        location,
+    ));
+}
+
 /// TEMP, diagnostic-only: identical to `emit_cleave_release`, but calls
 /// `cleave_release_tagged` (`cleave-rt::LAST_RELEASE_TAG`'s own doc comment)
 /// instead, carrying this release's own originating CVar id, when
@@ -4325,6 +4430,7 @@ fn alloc_llvm_value<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
     llvm_ty: Type<'c>,
+    var: Option<CVar>,
 ) -> Value<'c, 'c> {
     let context = ctx.context;
     let location = gen_loc(context);
@@ -4340,6 +4446,19 @@ fn alloc_llvm_value<'c>(
     }
     let size = llvm_type_size_bytes(ctx, block, llvm_ty);
     let i64_ty: Type = IntegerType::new(context, 64).into();
+    // `doc/plan-affine-ownership.md`'s Stage 2 -- checked *after* the
+    // region-local arena above (unchanged, still first priority: bulk
+    // reclaim at region exit beats a per-value pool round-trip whenever
+    // it's already available) and *before* the ordinary headered
+    // fallback. `var` is only ever `Some` for a real `PrimOp::Struct`
+    // construction (`lower_struct_construct`'s own call site) -- every
+    // other caller (array/tensor scratch buffers, not yet covered by this
+    // analysis) passes `None`, which can never be in `ctx.affine_structs`
+    // (that set only ever contains `PrimOp::Struct`-bound `CVar`s,
+    // `affine_struct_vars`'s own doc comment), so this branch is
+    // correctly unreachable for them regardless of the env var.
+    let is_affine = !ctx.currently_region_local.get()
+        && var.is_some_and(|v| ctx.affine_structs.contains(&v));
     let (symbol, call_args): (&str, Vec<Value>) = if ctx.currently_region_local.get() {
         let zero_handle = block
             .append_operation(arith::constant(
@@ -4351,6 +4470,8 @@ fn alloc_llvm_value<'c>(
             .unwrap()
             .into();
         ("cleave_alloc_local", vec![zero_handle, size])
+    } else if is_affine {
+        ("cleave_alloc_pool", vec![size])
     } else {
         ("cleave_alloc_rc", vec![size])
     };
@@ -5105,7 +5226,7 @@ fn tensor_seed<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, result_ty: Type<'c
     // arena.
     let total_elems: u32 = dims.iter().product::<i64>() as u32;
     let flat_array_ty = llvm::r#type::array(elem_mlir_ty, total_elems);
-    let dest_ptr = alloc_llvm_value(ctx, block, flat_array_ty);
+    let dest_ptr = alloc_llvm_value(ctx, block, flat_array_ty, None);
 
     // Hand-built descriptor -- `memref_descriptor_llvm_type`'s own confirmed
     // `(allocated_ptr, aligned_ptr, offset, sizes[rank], strides[rank])`

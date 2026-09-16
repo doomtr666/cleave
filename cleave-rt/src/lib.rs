@@ -983,6 +983,94 @@ pub unsafe extern "C" fn cleave_release_void(ptr: *mut u8) {
     RELEASE_VIA_VOID.with(|f| f.set(false));
 }
 
+/// The other half of `doc/plan-affine-ownership.md`'s Stage 2, alongside
+/// `cleave_release_pool` below: a heap allocation with **no `RcHeader` at
+/// all** — no refcount, no retain/release machinery, just `data_size`
+/// bytes of storage. Only ever emitted by `mlir_lower.rs` for a
+/// `PrimOp::Struct` construction the compiler has *proven* — statically,
+/// via `alias_analysis::value_is_ever_aliased` — can never have more than
+/// one live reference, and whose own field shape has no refcounted/tensor
+/// field of its own to cascade into (the *first* landing of this
+/// mechanism is deliberately restricted to that simpler case; a struct
+/// embedding another refcounted value needs a real cascade story worked
+/// out before it can go through here too — not yet built).
+///
+/// **Shares `FREE_LISTS`/`size_class`/`class_bytes` with `cleave_alloc_rc`
+/// unconditionally, the exact same buckets** — deliberate, not incidental:
+/// a block a headerless release just returned to a size class is exactly
+/// as reusable by a *headered* allocation of the same class as the
+/// reverse, since each allocator writes everything it needs (a header, or
+/// nothing) fresh at allocation time and never assumes anything about a
+/// popped block's own previous occupant. Splitting into two disjoint
+/// pools would only fragment the cache for no safety benefit.
+///
+/// No header means no `data_size` stored anywhere for `cleave_release_
+/// pool` to read back later — **the caller must pass it again** at
+/// release time (`cleave_release_pool`'s own doc comment). This is not
+/// extra bookkeeping the runtime is missing: for a value this analysis
+/// has already proven affine, both its size *and* its release point are
+/// static, compile-time facts (`mlir_lower.rs` already computes the exact
+/// same `sizeof` at the allocation site via `llvm_type_size_bytes`) — the
+/// entire point of proving "never aliased" is that nothing about this
+/// value's own lifetime needs to be tracked at runtime at all.
+#[unsafe(no_mangle)]
+pub extern "C" fn cleave_alloc_pool(data_size: i64) -> *mut u8 {
+    let total = data_size.max(0) as usize;
+    let class = size_class(total);
+    unsafe {
+        let popped = if class < NUM_SIZE_CLASSES {
+            pool_lock();
+            let block = FREE_LISTS[class];
+            let popped = if !block.is_null() {
+                FREE_LISTS[class] = *(block as *mut *mut u8);
+                Some(block)
+            } else {
+                None
+            };
+            pool_unlock();
+            popped
+        } else {
+            None
+        };
+        match popped {
+            Some(block) => block,
+            None => {
+                let layout = std::alloc::Layout::from_size_align(class_bytes(class), 16)
+                    .expect("cleave_alloc_pool: invalid layout");
+                let p = std::alloc::alloc(layout);
+                assert!(!p.is_null(), "cleave_alloc_pool: allocation failed");
+                p
+            }
+        }
+    }
+}
+
+/// The release half of `cleave_alloc_pool` above — see that function's own
+/// doc comment for why `data_size` must be passed again here (no header
+/// stores it), and why sharing `FREE_LISTS` with `cleave_alloc_rc` is
+/// deliberate. Unconditional: no refcount to check, no cascade into
+/// nested fields (`cleave_alloc_pool`'s own doc comment — restricted, for
+/// now, to structs with no refcounted field of their own), just push the
+/// block back to its size class, exactly once, matching the compiler's
+/// own static proof that this is the value's one true last use.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cleave_release_pool(ptr: *mut u8, data_size: i64) {
+    let total = data_size.max(0) as usize;
+    let class = size_class(total);
+    unsafe {
+        if class < NUM_SIZE_CLASSES {
+            pool_lock();
+            *(ptr as *mut *mut u8) = FREE_LISTS[class];
+            FREE_LISTS[class] = ptr;
+            pool_unlock();
+        } else {
+            let layout = std::alloc::Layout::from_size_align(class_bytes(class), 16)
+                .expect("cleave_release_pool: invalid layout");
+            std::alloc::dealloc(ptr, layout);
+        }
+    }
+}
+
 // Which of the two entry points the release currently being serviced came
 // in through -- and therefore **which of the two ownership systems emitted
 // it**, which is the single most useful fact when diagnosing a double
@@ -1271,6 +1359,73 @@ mod rc_tests {
         }
     }
 
+    // `doc/plan-affine-ownership.md`'s Stage 2: `cleave_alloc_pool`/
+    // `cleave_release_pool` -- no header, no refcount, `data_size` passed
+    // again at release since nothing stores it.
+    #[test]
+    fn pool_alloc_writes_and_reads_back_correctly_with_no_header() {
+        unsafe {
+            let ptr = cleave_alloc_pool(8);
+            assert!(!ptr.is_null());
+            // With no header at all, the returned pointer is the true
+            // base of the allocation -- writing/reading its own first
+            // byte must never touch anything but this block's own
+            // storage (there is no header slot in front of it to
+            // accidentally corrupt, unlike `cleave_alloc_rc`).
+            *ptr = 0x42;
+            assert_eq!(*ptr, 0x42);
+            *ptr.add(7) = 0x99;
+            assert_eq!(*ptr.add(7), 0x99);
+            cleave_release_pool(ptr, 8);
+        }
+    }
+
+    #[test]
+    fn pool_release_and_alloc_reuse_the_same_block_for_the_same_size_class() {
+        unsafe {
+            let a = cleave_alloc_pool(16);
+            cleave_release_pool(a, 16);
+            let b = cleave_alloc_pool(16);
+            assert_eq!(
+                a, b,
+                "a released block must be handed back out again for the \
+                 next same-class allocation, exactly like `cleave_alloc_rc`'s \
+                 own free-list -- confirms `cleave_alloc_pool`/`cleave_release_\
+                 pool` genuinely share `FREE_LISTS`, not a separate pool"
+            );
+            cleave_release_pool(b, 16);
+        }
+    }
+
+    #[test]
+    fn pool_and_rc_allocations_freely_interchange_the_same_size_class_blocks() {
+        // The exact claim `cleave_alloc_pool`'s own doc comment makes:
+        // a block released headerless can be immediately reused by a
+        // *headered* allocation of the same class, and vice versa --
+        // proof that sharing one `FREE_LISTS` between the two allocator
+        // pairs is safe, not just convenient.
+        unsafe {
+            let headerless = cleave_alloc_pool(8);
+            cleave_release_pool(headerless, 8);
+            // `cleave_alloc_rc(8)`'s own total (header + 8 bytes) may or
+            // may not land in the identical size class as a bare 8-byte
+            // pool request -- assert the *reachable* property instead of
+            // exact pointer equality: the headered allocation must still
+            // work correctly (real header, refcount 1, releasable) even
+            // when it happens to reuse a block a headerless release just
+            // returned.
+            let headered = cleave_alloc_rc(8);
+            assert_eq!(rc_count(headered), 1);
+            assert!(cleave_release(headered));
+
+            let headered2 = cleave_alloc_rc(8);
+            assert!(cleave_release(headered2));
+            let headerless2 = cleave_alloc_pool(8);
+            *headerless2 = 7;
+            assert_eq!(*headerless2, 7);
+            cleave_release_pool(headerless2, 8);
+        }
+    }
 }
 
 /// De-risks the extern/array ABI boundary in isolation, before string
