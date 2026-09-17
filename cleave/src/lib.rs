@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod callgraph;
+pub mod chain_split;
 pub mod const_eval;
 pub mod cps;
 pub mod diag;
@@ -23,3 +24,4 @@ pub mod rc_opt;
 pub mod redundant_copy_elim;
 pub mod rust_bindings;
 pub mod unify_alloc;
+pub mod unroll_jam;

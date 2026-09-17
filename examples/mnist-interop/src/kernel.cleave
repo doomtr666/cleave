@@ -17,7 +17,6 @@ use nn;
 use linalg;
 use io;
 
-
 extern fn train_len() -> i32;
 extern fn train_pixel(sample: i32, pixel: i32) -> f32;
 extern fn train_label(sample: i32) -> i32;

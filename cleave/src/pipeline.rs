@@ -705,8 +705,27 @@ pub fn lower_to_llvm<'c>(
     // call-site duplication, same shape as any inliner, not the exponential
     // blowup a previous compile-time investigation hit and fixed
     // elsewhere -- `doc/backlog.md`'s own "real root cause of the 738s").
+    // `CLEAVE_NO_INLINE=1` -- a diagnostic-only knob, raised directly by the
+    // user to inspect the generated code with real function boundaries kept
+    // intact (`net_grad`, `matmul`, ... each stay their own `llvm.func`
+    // instead of being flattened into `train_and_evaluate`), instead of
+    // digging through `S_INLINESITE` records inside one giant disassembled
+    // blob. Skips *only* the inliner itself -- `--convert-elementwise-to-
+    // linalg`/`--linalg-fuse-elementwise-ops` still run (harmless without
+    // inlining: there is nothing cross-function left for them to fuse, per
+    // this pass's own comment above), and every later stage (`dps_rewrite`,
+    // the matmul tiling/vectorization schedule below) degrades safely --
+    // each one's own preconditions simply aren't met as often, falling back
+    // to its own always-correct, un-rewritten path (`dps_rewrite.rs`'s own
+    // module doc comment: "a single mismatch anywhere in the chain leaves
+    // that one struct-field write completely untouched"). Not meant for a
+    // real perf build -- disabling inlining reopens exactly the double-
+    // scratch-buffer cost this same pass's own comment above measured and
+    // fixed.
     let pass_manager = pass::PassManager::new(context);
-    pass_manager.add_pass(pass::transform::create_inliner());
+    if std::env::var("CLEAVE_NO_INLINE").is_err() {
+        pass_manager.add_pass(pass::transform::create_inliner());
+    }
     pass_manager.add_pass(pass::linalg::create_convert_elementwise_to_linalg_pass());
     pass_manager.add_pass(pass::linalg::create_linalg_elementwise_op_fusion_pass());
     if pass_manager.run(&mut *module).is_err() {
@@ -780,6 +799,28 @@ pub fn lower_to_llvm<'c>(
         ]);
     }
 
+    // Splits the 16-deep sequential `vector.outerproduct` chain the schedule
+    // above leaves inside every K-tile's own reduction into `factor`
+    // independent, shorter chains -- see `chain_split.rs`'s own module doc
+    // comment for the full mechanism and why it would run *here*, right
+    // after the transform-dialect schedule and before `--loop-invariant-
+    // subset-hoisting`, if enabled: unlike `unroll_jam.rs` below, this pass
+    // only ever rewires operands *within* an already-fully-vector-typed
+    // `vector.outerproduct` chain, never touching the surrounding `scf.for`
+    // 's own `iter_arg` representation -- so it doesn't need the tensor-
+    // round-trip that pass hoists away first.
+    //
+    // **Off by default** (`CLEAVE_CHAIN_SPLIT=1` opts in) -- measured on the
+    // real kernel and found to make IPC slightly *worse*, not better
+    // (`doc/backlog.md`'s own "the long-K matmul IPC gap was never a
+    // latency-chain problem, it was cache locality" entry): the real fix for
+    // this kernel's own IPC gap was a cache-locality one (the `M`-tile-size
+    // change in `matmul_vectorize.transform.mlir`, not anything in
+    // `pipeline.rs`), not a dependency-chain one. Kept wired in, off by
+    // default, as a real, working, generalizable mechanism for a future
+    // shape where the FMA chain genuinely is the bottleneck.
+    crate::chain_split::split_outerproduct_chains(context, module);
+
     let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::transform::create_loop_invariant_subset_hoisting());
     if pass_manager.run(&mut *module).is_err() {
@@ -787,6 +828,46 @@ pub fn lower_to_llvm<'c>(
             "MLIR-to-LLVM lowering pass failed (loop-invariant-subset-hoisting)".to_string(),
         ]);
     }
+
+    // Widens the narrow (3-4 register) accumulator chain the schedule above
+    // leaves inside every K-reduction `scf.for` -- `doc/backlog.md`'s own
+    // AMD-uProf-measured `~6x` per-FLOP gap between a long-K matmul (IPC
+    // 0.226) and a short-K one (IPC 1.7), same FLOPs, same schedule.
+    //
+    // **Runs here, after `--loop-invariant-subset-hoisting`, not right after
+    // `vectorize` -- found directly, not assumed, the first time this pass
+    // was wired in.** Right after `vectorize {create_named_contraction}`,
+    // the K-reduction `scf.for`'s own `iter_arg` is still a *tensor*
+    // (`tensor<8x16xf32>`, say) -- each iteration reads it back via `vector.
+    // transfer_read`, computes a real `vector.contract`, and writes the
+    // result back via `vector.transfer_write`, with *that write* (not the
+    // contract) as the value actually yielded. `--loop-invariant-subset-
+    // hoisting` is what turns this read-modify-write-through-a-tensor
+    // pattern into a genuinely register-resident `vector<...>` `iter_arg`
+    // (`vectorize`'s own doc comment, above, already said as much: "makes
+    // the accumulator itself genuinely register-resident... rather than
+    // round-tripping through memory on every step" -- this pass needs
+    // exactly that shape, a `vector.contract` result yielded directly, to
+    // recognize a loop as a reduction at all). Confirmed by tracing every
+    // real `scf.for` in the real kernel (`CLEAVE_TRACE_UNROLL_JAM=1`):
+    // every one matched *zero* candidates when this ran before hoisting,
+    // every long-K one matches correctly once moved to here.
+    //
+    // **Off by default** (`CLEAVE_UNROLL_JAM=1` opts in, `CLEAVE_AFFINE_
+    // STRUCTS`/`CLEAVE_TAG_RELEASES`'s own established convention) -- wired
+    // in and measured on the real kernel: zero IPC change (widening the
+    // *outer* K-tile loop duplicates a real, unavoidable per-copy operand-
+    // tile-load register cost, `112` registers demanded for `factor=7`
+    // against a `32`-register file -- constant spill/reload ate the gain).
+    // The real fix for this kernel's own IPC gap turned out to be a cache-
+    // locality one entirely outside this pass (`doc/backlog.md`'s own "the
+    // long-K matmul IPC gap was never a latency-chain problem, it was cache
+    // locality" entry has the full story). Kept wired in, off by default, as
+    // a real, JIT-proven-correct (`cleave/tests/unroll_jam_probe.rs`)
+    // mechanism for a future shape where the outer-loop accumulator chain
+    // genuinely is the bottleneck and the per-copy tile-load cost is small
+    // enough to afford.
+    crate::unroll_jam::unroll_and_jam_reductions(context, module);
 
     // `CLEAVE_DUMP_PRE_BUFFERIZE=<path>` -- the still-tensor-typed IR, as
     // `mlir_lower.rs` emitted it, immediately before one-shot-bufferize
@@ -1404,19 +1485,32 @@ fn force_location<'c>(mut op: OperationRefMut<'c, '_>, loc: Location<'c>) {
 
 /// Pre-order walk: inside every `llvm.func` that has a body, back-fill any
 /// op whose location doesn't resolve to a real line anywhere
-/// (`has_real_line`) with that function's own location.
+/// (`has_real_line`) with the **nearest real location already seen in
+/// program order** — a finer floor than "the whole function is one line".
+/// Raised directly by the user, inspecting a real disassembly and unable to
+/// tell an MLIR-synthesized sequence (a tiled loop's own zero-fill seed, a
+/// vectorized epilogue's constant/broadcast — an op with no cleave-level
+/// counterpart to inherit a location from at all) apart from the real
+/// compute it sits next to, because both used to collapse onto the exact
+/// same single line (the function's own declaration). Now each synthesized
+/// run inherits whichever real, cleave-emitted op it was generated closest
+/// to in the lowered code, until the next real one is seen — still a floor,
+/// not genuine provenance (an op that never existed in cleave source
+/// structurally cannot have one), but one that at least separates "this
+/// belongs near the matmul" from "this belongs near the bias-add" instead
+/// of flattening an entire function to one address range.
 fn backfill_all_unknown_locs(op: OperationRefMut<'_, '_>) {
     if matches!(op.name().as_string_ref().as_str(), Ok("llvm.func"))
         && op.regions().any(|r| r.first_block().is_some())
     {
-        let fallback = op.location();
+        let mut current = op.location();
         for region in op.regions() {
             let mut next_block = region.first_block();
             while let Some(block) = next_block {
                 let mut next_op = block.first_operation_mut();
                 while let Some(child) = next_op {
                     next_op = child.next_in_block_mut();
-                    backfill_unknown_locs(child, fallback);
+                    backfill_unknown_locs(child, &mut current);
                 }
                 next_block = block.next_in_region();
             }
@@ -1437,13 +1531,18 @@ fn backfill_all_unknown_locs(op: OperationRefMut<'_, '_>) {
 }
 
 /// Recursively give every op with a non-`FileLineColLoc` location (an
-/// `UnknownLoc` left by a lowering pass) `fallback` -- the enclosing
-/// `llvm.func`'s declaration-line location. A coarse floor, not real
-/// provenance, but it keeps a profiler attributing that code to the
-/// function rather than to an unnamed address range.
-fn backfill_unknown_locs<'c>(mut op: OperationRefMut<'c, '_>, fallback: Location<'c>) {
-    if !has_real_line(op.location()) {
-        op.set_location(fallback);
+/// `UnknownLoc` left by a lowering pass) `*current` — updated, in place, to
+/// the *most recent* real location this pre-order walk has actually seen
+/// (starting from the enclosing function's own declaration line, until the
+/// first real one is found) rather than a single fixed fallback for the
+/// whole function. See `backfill_all_unknown_locs`'s own doc comment for
+/// why: a coarse floor either way, but a per-neighborhood one now, not one
+/// shared identically by every synthesized op in the entire function body.
+fn backfill_unknown_locs<'c>(mut op: OperationRefMut<'c, '_>, current: &mut Location<'c>) {
+    if has_real_line(op.location()) {
+        *current = op.location();
+    } else {
+        op.set_location(*current);
     }
     for region in op.regions() {
         let mut next_block = region.first_block();
@@ -1451,7 +1550,7 @@ fn backfill_unknown_locs<'c>(mut op: OperationRefMut<'c, '_>, fallback: Location
             let mut next_op = block.first_operation_mut();
             while let Some(child) = next_op {
                 next_op = child.next_in_block_mut();
-                backfill_unknown_locs(child, fallback);
+                backfill_unknown_locs(child, current);
             }
             next_block = block.next_in_region();
         }

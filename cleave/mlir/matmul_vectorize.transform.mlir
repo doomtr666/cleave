@@ -175,7 +175,7 @@ module attributes {transform.with_named_sequence} {
   // to only the genuine leftover keeps every already-correct matmul's own
   // outerproduct lowering completely undisturbed.
   transform.named_sequence @tile_and_vectorize(%m: !transform.any_op {transform.consumed}) {
-    %inner0, %forall = transform.structured.tile_using_forall %m tile_sizes [1, 0, 0]
+    %inner0, %forall = transform.structured.tile_using_forall %m tile_sizes [8, 0, 0]
       : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     %inner1, %loops1 = transform.structured.tile_using_for %inner0 tile_sizes [0, 16, 0]
       : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
@@ -301,7 +301,7 @@ module attributes {transform.with_named_sequence} {
       %dh3 = transform.get_producer_of_operand %dz3[0] : (!transform.any_op) -> !transform.any_op
       %dz4 = transform.get_producer_of_operand %dh3[0] : (!transform.any_op) -> !transform.any_op
 
-      %tiled0, %forall0 = transform.structured.tile_using_forall %dx tile_sizes [1, 0, 0]
+      %tiled0, %forall0 = transform.structured.tile_using_forall %dx tile_sizes [8, 0, 0]
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
       %f1, %forall1 = transform.structured.fuse_into_containing_op %dz1 into %forall0
         : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
