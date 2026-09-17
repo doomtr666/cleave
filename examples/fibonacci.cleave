@@ -15,11 +15,9 @@ fn fibonacci<T: Int>(x : T) -> T {
 
 fn main() {
     let a = fibonacci(16:i32);
-    print("fib(16)=");
-    print(a);
+    println(("fib(16)=",a));
 
     let b = fibonacci(42:i64);
-    print("fib(42)=");
-    print(b);
+    println(("fib(42)=", b));
     0
 }

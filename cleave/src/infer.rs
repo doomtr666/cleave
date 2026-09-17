@@ -6302,12 +6302,52 @@ impl<'r> Infer<'r> {
             // the root `generalize` actually recorded as quantified;
             // checking membership on the raw, pre-resolution `var` would
             // miss exactly the cases this guard exists for.
-            let Ty::Var(root) = self.subst.apply(&Ty::Var(var)) else {
+            //
+            // A `Complex`-defaulted literal's own variable specifically can
+            // reach this point *already* unified into `Complex<T>` by
+            // ordinary argument-type unification (e.g. an imaginary literal
+            // passed straight into `Ring::add`'s own `Complex<T>`-shaped
+            // signature) — structurally "not a bare `Var` anymore", but
+            // with the *inner* `T` itself still genuinely unresolved. Found
+            // by direct testing: `examples/complex.cleave`'s own
+            // unannotated `let z7 = 5.0 + 7.5i;` — `main`'s own inference
+            // (`--dump-inference-pass`) shows `z7`'s type staying
+            // `Complex<'a>` forever, because the `else` branch below used
+            // to treat this shape as "already concrete, nothing to do" and
+            // silently skip it, exactly like a *genuinely* resolved
+            // `Complex<f32>` sibling. Left unresolved, `'a` then survives
+            // all the way to monomorphization, where `z7.magnitude()`
+            // requests a real, permanent specialization keyed on that bare
+            // variable — `derive_instantiation`'s own reverse-unification
+            // "succeeds" against it structurally (a free `Ty::Var` unifies
+            // with anything, `linalg`'s own `Ring<Tensor<T,Dims...>>`
+            // included), so the resulting body-check fails deep inside an
+            // unrelated impl (`` `Ring::add` cannot be specialized for
+            // (Tensor<'t,'t>): its generic impl body doesn't type-check at
+            // this instantiation ``) instead of ever reaching this default
+            // at all. Recursing into exactly this one known position (this
+            // default's only possible partially-resolved shape) fixes it
+            // at the source, rather than teaching monomorphization to
+            // reject a non-concrete instantiation after the fact (which
+            // would only turn this into a *different*, equally confusing
+            // "could not resolve call" error at a later stage).
+            let (root, default_ty) = match self.subst.apply(&Ty::Var(var)) {
+                Ty::Var(root) => (root, None),
+                Ty::App(name, args) if name == "Complex" && default == NumberDefault::Complex => {
+                    match args.as_slice() {
+                        [Ty::Var(inner)] => (*inner, Some(Ty::Con("f32".to_string()))),
+                        // Already fully concrete (`Complex<f32>`, a real
+                        // sibling's own default already applied) or some
+                        // other shape defaulting was never meant to reach —
+                        // either way, nothing left to default here.
+                        _ => continue,
+                    }
+                }
                 // Already concrete — via a real unification, or via a
                 // sibling literal's own default just now. Either way,
                 // nothing left to default; a genuine shape conflict is
                 // `check_pending_constraints`'s job now, not this one's.
-                continue;
+                _ => continue,
             };
             if self.quantified.contains(&root) {
                 continue;
@@ -6340,7 +6380,13 @@ impl<'r> Infer<'r> {
             if self.subst.const_width(root).is_some() {
                 continue;
             }
-            let default_ty = match default {
+            // `default_ty` is already fully decided for the nested-`Complex`
+            // shape above (`root` is the *inner* slot, defaulted to a bare
+            // `f32` directly — it's already wrapped in `Complex<..>` by the
+            // surrounding type, wrapping it again would build `Complex<
+            // Complex<f32>>`). The ordinary bare-`Var` shape still picks its
+            // target here, exactly as before this fix.
+            let default_ty = default_ty.unwrap_or_else(|| match default {
                 NumberDefault::Int => Ty::Con("i32".to_string()),
                 NumberDefault::Float => Ty::Con("f32".to_string()),
                 // Matches `Float`'s own default width — no principled reason
@@ -6350,7 +6396,7 @@ impl<'r> Infer<'r> {
                 NumberDefault::Complex => {
                     Ty::App("Complex".to_string(), vec![Ty::Con("f32".to_string())])
                 }
-            };
+            });
             unify(&mut self.subst, &Ty::Var(root), &default_ty)
                 .expect("defaulting an unbound, non-quantified variable can't fail");
         }

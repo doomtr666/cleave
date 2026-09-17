@@ -425,13 +425,23 @@ pub fn lower_program<'c>(
     // `affine_eligibility_gives_the_same_answer_before_and_after_insert_
     // refcounting`, that the verdict doesn't change either way).
     //
-    // Gated behind `CLEAVE_AFFINE_STRUCTS=1`, off by default, matching
-    // this whole project's own established rollout discipline for a
-    // change with real correctness stakes (`doc/plan-affine-ownership.md`
-    // §5) — an empty set here means `alloc_llvm_value`'s own new dispatch
-    // branch is simply never taken, zero behavior change from today.
+    // On by default as of `doc/plan-affine-ownership.md` §11-§14 landing —
+    // every confirmed crash (§11.1/§11.2's loop-carried case, §11.3's
+    // resumption/region-local interaction, §13's nested-field cascade) was
+    // root-caused and fixed this session, each with its own dedicated
+    // execution test re-verified 5× under `CLEAVE_DEBUG_POOL=1` with zero
+    // warnings, plus real, correct end-to-end runs on *both* real kernels
+    // this project has (`examples/mnist-interop`, `examples/digits-interop`
+    // — the latter via a genuine `cargo clean` rebuild, gate on, matching
+    // known-good accuracy `0.94713414`). `CLEAVE_NO_AFFINE_STRUCTS` is the
+    // escape hatch — the same "default on, named env var to opt back out"
+    // shape `CLEAVE_NO_OPENMP` already established in this project — for
+    // the day some structural shape neither real kernel nor the test suite
+    // happens to exercise turns up a case this analysis gets wrong; never
+    // remove this fallback casually, this is exactly the corruption class
+    // of bug (`8a748f8`) this whole plan exists to close carefully.
     let (affine_structs, field_affine): (HashSet<CVar>, HashMap<(String, usize), bool>) =
-        if std::env::var("CLEAVE_AFFINE_STRUCTS").is_ok() {
+        if std::env::var("CLEAVE_NO_AFFINE_STRUCTS").is_err() {
             let summary = crate::alias_analysis::analyze(program);
             let affine_structs = crate::alias_analysis::affine_struct_vars(
                 program,

@@ -1,13 +1,19 @@
 //! End-to-end execution tests for `doc/plan-affine-ownership.md`'s Stage 2
-//! — `CLEAVE_AFFINE_STRUCTS=1` routing a proven-never-aliased construction
-//! through `cleave_alloc_pool`/`cleave_release_pool` (no header, no
-//! retain/release runtime call) instead of `cleave_alloc_rc`/`cleave_
-//! release`. Registers the new symbols itself (`pipeline.rs::emit_object`'s
-//! own registration is the production path; the 17 other JIT test
-//! harnesses in this crate predate this flag and are not updated here —
-//! an opt-in flag needs the embedder to register whatever new runtime
-//! symbols it calls, exactly like `cleave_alloc_local`/`cleave_region_
-//! enter` already do).
+//! — routing a proven-never-aliased construction through `cleave_alloc_
+//! pool`/`cleave_release_pool` (no header, no retain/release runtime call)
+//! instead of `cleave_alloc_rc`/`cleave_release`. **On by default** as of
+//! §11-§14 landing (`mlir_lower.rs::lower_program`'s own doc comment) —
+//! `CLEAVE_NO_AFFINE_STRUCTS` is the opt-out, used by the handful of tests
+//! below whose own point is specifically the header-based path. Registers
+//! the new symbols itself (`pipeline.rs::emit_object`'s own registration is
+//! the production path). Every other JIT test harness in this crate that
+//! registers `cleave_alloc_rc` also now registers `cleave_alloc_pool`/
+//! `cleave_release_pool` right alongside it — found necessary the moment
+//! this mechanism became the default rather than an opt-in flag: three of
+//! them (`mlir_lower.rs`, `refcount.rs`, `user_guide.rs`) hit a real
+//! `STATUS_STACK_BUFFER_OVERRUN` from an unresolved JIT symbol the moment
+//! any of their own struct-typed test programs ran, confirming this wasn't
+//! a hypothetical gap.
 
 use cleave::cps::{collect_mlir_types, collect_struct_schemas};
 use cleave::driver::compile;
@@ -58,17 +64,30 @@ fn context() -> Context {
     context
 }
 
-/// Runs `src` to completion via the JIT, with `CLEAVE_AFFINE_STRUCTS=1`
-/// set for the duration of lowering, and the new pool-allocator symbols
-/// registered — returns `main`'s own `i32` result.
+/// `doc/plan-affine-ownership.md` §11-§14's own pool/cascade mechanism is
+/// on **by default** now (every confirmed crash root-caused and fixed this
+/// session, re-verified 5× under `CLEAVE_DEBUG_POOL=1` each, plus real
+/// correct runs on both `examples/mnist-interop` and `examples/digits-
+/// interop`) — `run_i32_inner` alone already exercises it, no env var
+/// needed. This wrapper survives only so existing call sites don't all
+/// need renaming; new tests should just call `run_i32_inner` directly.
 fn run_i32_with_affine_structs(src: &str) -> i32 {
+    run_i32_inner(src)
+}
+
+/// The explicit opt-out (`CLEAVE_NO_AFFINE_STRUCTS`, `lower_program`'s own
+/// doc comment) — for the handful of tests whose own point is specifically
+/// the *header-based* path (a differential check, or a safety net that
+/// predates and is independent of the pool mechanism entirely), now that
+/// plain `run_i32_inner` no longer means that on its own.
+fn run_i32_with_affine_structs_disabled(src: &str) -> i32 {
     let _guard = lock_env();
     unsafe {
-        std::env::set_var("CLEAVE_AFFINE_STRUCTS", "1");
+        std::env::set_var("CLEAVE_NO_AFFINE_STRUCTS", "1");
     }
     let result = std::panic::catch_unwind(|| run_i32_inner(src));
     unsafe {
-        std::env::remove_var("CLEAVE_AFFINE_STRUCTS");
+        std::env::remove_var("CLEAVE_NO_AFFINE_STRUCTS");
     }
     match result {
         Ok(v) => v,
@@ -258,25 +277,27 @@ fn many_short_lived_affine_constructions_run_correctly() {
     assert_eq!(run_i32_with_affine_structs(src), 2000 * 2001 / 2);
 }
 
-/// A real, `CLEAVE_AFFINE_STRUCTS`-independent regression guard for a
-/// scare this session ran into and ruled out, not the Stage 2 pool
-/// question at all: `bump` here has exactly one call site, entirely
-/// confined to one loop iteration, so `region_analysis::find_region_local_
-/// functions` marks it region-local *unconditionally* — no gate involved
-/// — and its own construction is arena-backed (`cleave_alloc_local`). The
-/// caller still explicitly releases the renamed result (`refcount.rs`
-/// always emits a release for a real call's own resumption parameter that
-/// isn't threaded any further), which looked, from the CPS/MLIR alone,
-/// like it would call the ordinary, header-reading `cleave_release` on a
-/// pointer that was never `cleave_alloc_rc`-backed. It doesn't: `cleave_
-/// release`'s own `is_in_arena` check (`cleave-rt/src/lib.rs`) already
-/// detects exactly this case and skips the free-list entirely — this test
-/// exists to keep that safety net honest under real, sustained reuse
-/// pressure (enough alloc/release cycles to actually exercise it, not a
-/// handful), independent of anything Stage 2 does.
+/// A real, pool-mechanism-*independent* regression guard for a scare this
+/// session ran into and ruled out, not the Stage 2 pool question at all:
+/// `bump` here has exactly one call site, entirely confined to one loop
+/// iteration, so `region_analysis::find_region_local_functions` marks it
+/// region-local *unconditionally* — no gate involved — and its own
+/// construction is arena-backed (`cleave_alloc_local`). The caller still
+/// explicitly releases the renamed result (`refcount.rs` always emits a
+/// release for a real call's own resumption parameter that isn't threaded
+/// any further), which looked, from the CPS/MLIR alone, like it would call
+/// the ordinary, header-reading `cleave_release` on a pointer that was
+/// never `cleave_alloc_rc`-backed. It doesn't: `cleave_release`'s own
+/// `is_in_arena` check (`cleave-rt/src/lib.rs`) already detects exactly
+/// this case and skips the free-list entirely — this test exists to keep
+/// that safety net honest under real, sustained reuse pressure (enough
+/// alloc/release cycles to actually exercise it, not a handful),
+/// independent of anything Stage 2 does — run with the pool mechanism
+/// explicitly disabled, since that's the specific interaction (region-
+/// local arena vs. the *ordinary* header release) this test is about, now
+/// that plain `run_i32_inner` no longer implies that on its own.
 #[test]
-fn region_local_result_released_by_caller_with_the_gate_off() {
-    let _guard = lock_env();
+fn region_local_result_released_by_caller_with_the_pool_mechanism_disabled() {
     let src = "
         struct Boxed { v: i32, tag: [i32; 1] }
         fn bump(a: Boxed) -> Boxed { Boxed(v: a.v + 1, tag: [a.tag[0]]) }
@@ -291,7 +312,7 @@ fn region_local_result_released_by_caller_with_the_gate_off() {
         }
         ";
     // sum_{i=0}^{29999} (i + 1) = sum_{i=1}^{30000} i = 30000*30001/2
-    assert_eq!(run_i32_inner(src), 30000 * 30001 / 2);
+    assert_eq!(run_i32_with_affine_structs_disabled(src), 30000 * 30001 / 2);
 }
 
 /// `doc/plan-affine-ownership.md` §13/§14 — the real point of this whole
@@ -324,13 +345,15 @@ fn a_nested_never_mutated_struct_cascades_through_the_pool_without_a_header() {
     assert_eq!(run_i32_with_affine_structs(src), 3 * 1999 * 2000 / 2);
 }
 
-/// The exact same programs, with the flag left off -- confirms the
-/// header-based path (today's default, unchanged) gives the identical
-/// result, so this test file also serves as a differential check between
-/// the two allocation strategies, not just a standalone smoke test.
+/// The exact same shape as `bump_shaped_loop_runs_correctly_through_the_
+/// pool_allocator` above, this time with the pool mechanism explicitly
+/// disabled (`CLEAVE_NO_AFFINE_STRUCTS=1`) -- confirms the ordinary,
+/// header-based path still gives the identical result now that it's no
+/// longer the default, so this test file also serves as a permanent
+/// differential/fallback check between the two allocation strategies, not
+/// just a standalone smoke test.
 #[test]
-fn the_same_programs_give_the_same_result_with_the_flag_off() {
-    let _guard = lock_env();
+fn the_same_program_gives_the_same_result_with_the_pool_mechanism_disabled() {
     let src = "
         struct Boxed { v: i32, tag: [i32; 1] }
         fn bump(a: Boxed) -> Boxed { Boxed(v: a.v + 1, tag: [a.tag[0]]) }
@@ -342,5 +365,5 @@ fn the_same_programs_give_the_same_result_with_the_flag_off() {
             b.v
         }
         ";
-    assert_eq!(run_i32_inner(src), 1000);
+    assert_eq!(run_i32_with_affine_structs_disabled(src), 1000);
 }

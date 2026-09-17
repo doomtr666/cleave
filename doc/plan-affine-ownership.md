@@ -1,5 +1,7 @@
 # Plan — "piste 1" : n'allouer un header refcompté que si la valeur est réellement aliasée
 
+> **Statut (2026-09-17) : ce plan est terminé, pas actif.** §11-§14 ont atterri, testés par exécution réelle, régression zéro (voir `doc/backlog.md`, l'entrée consolidée sur le sujet). `CLEAVE_AFFINE_STRUCTS` a depuis été **retirée** — le mécanisme est actif par défaut, l'opt-out est `CLEAVE_NO_AFFINE_STRUCTS` (`mlir_lower.rs::lower_program`). Les mentions plus bas de « désactivé par défaut »/« gate » reflètent l'état à l'écriture de chaque section, pas l'état actuel — ne pas les prendre pour une consigne encore valide. Ce fichier reste en place (pas archivé dans `backlog-done.md`, pas supprimé) parce que des dizaines de commentaires réels dans `cleave/src/alias_analysis.rs`, `mlir_lower.rs`, `pipeline.rs`, `cleave-rt/src/lib.rs` et plusieurs fichiers de test le citent nommément comme la justification de leur propre conception (`§11`, `§13`, `§14.x`) — c'est un document de référence pour le code existant, pas une proposition en attente.
+
 ## 0. Ce que ce plan doit à ce qui précède
 
 Ce document part de trois faits établis dans cette même session, sur preuve, pas par argument :

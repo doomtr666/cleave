@@ -108,6 +108,8 @@ fn run_i32(context: &Context, src: &str) -> i32 {
         engine.register_symbol("cleave_alloc_local", cleave_rt::cleave_alloc_local as *mut ());
         engine.register_symbol("cleave_region_enter", cleave_rt::cleave_region_enter as *mut ());
         engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
+        engine.register_symbol("cleave_alloc_pool", cleave_rt::cleave_alloc_pool as *mut ());
+        engine.register_symbol("cleave_release_pool", cleave_rt::cleave_release_pool as *mut ());
         engine.register_symbol("print_i8", cleave_rt::print_i8 as *mut ());
         engine.register_symbol("print_i16", cleave_rt::print_i16 as *mut ());
         engine.register_symbol("print_i32", cleave_rt::print_i32 as *mut ());

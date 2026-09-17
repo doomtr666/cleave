@@ -270,6 +270,8 @@ fn run_i32_with_extra_symbols(src: &str, extra_symbols: &[(&str, *mut ())]) -> i
         engine.register_symbol("cleave_alloc_local", cleave_rt::cleave_alloc_local as *mut ());
         engine.register_symbol("cleave_region_enter", cleave_rt::cleave_region_enter as *mut ());
         engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
+        engine.register_symbol("cleave_alloc_pool", cleave_rt::cleave_alloc_pool as *mut ());
+        engine.register_symbol("cleave_release_pool", cleave_rt::cleave_release_pool as *mut ());
         for (name, ptr) in extra_symbols {
             engine.register_symbol(name, *ptr);
         }
