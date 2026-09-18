@@ -11,6 +11,40 @@ Two things worth knowing before anything else:
 
 What's still missing, worth knowing before you go looking for it (see `doc/backlog.md` for the full, current list): no way yet to produce a standalone executable (`--run` is JIT-only); lambdas type-check but can't be JIT-executed yet (closure conversion isn't implemented); dot-method-call syntax (`v.magnitude_sq()`) on an inherent `impl` type-checks but also can't run yet — both are called out explicitly, with a working alternative, where they come up below.
 
+## Compiler flags: controlling what actually gets generated
+
+Every flag below is a real `CodegenOptions` field (`cleave::pipeline::CodegenOptions`), not a scattered environment variable — the same struct backs both the CLI (`cargo run -p cleave -- yourfile.cleave <flags>`) and the `cleave-build::Build` builder API a `build.rs` uses (`.opt_level(2)`, `.openmp(true)`, `.target_cpu("znver5")`, ... — one method per flag below, same names, same defaults). Every `--X`/`--no-X` pair can appear anywhere on the command line, in any order, any number of times — the *last* occurrence of a given flag wins (the same `-f`/`-fno-` convention gcc/clang use), so `--inline --no-inline` ends with inlining off.
+
+### `--target-cpu`/`--target-features`: real ISA control, not just a stamped attribute
+
+These two reach all the way into the actual compiled code — the `TargetMachine` LLVM's own backend uses for real code generation, both for `--run` (JIT) and `--emit-object`/`--emit-bindings`/`--emit-exe`/`cleave-build` (AOT). Left unset, both default to real host-CPU detection (`llvm::orc::JITTargetMachineBuilder::detectHost()`) — exactly what you'd get from a hand-tuned build on this exact machine, no annotation needed.
+
+- **`--target-cpu <name>`** — a real LLVM backend CPU model name: an actual microarchitecture codename (`znver5` for a Ryzen 9700X, `skylake-avx512`, ...), or one of the generic x86-64 microarchitecture levels (`x86-64-v2`/`v3`/`v4` — each a fixed, standard bundle of ISA extensions, useful for a build meant to run on a *different*, less-capable machine than the one compiling it). `x86-64-v2` specifically means no AVX/AVX2/AVX-512 at all, only SSE up to 4.2 — confirmed directly on a real compiled kernel (`doc/backlog.md`): the default build of `examples/mnist-interop/src/kernel.cleave` disassembles to `11,861` `zmm` (AVX-512) register mentions; `--target-cpu x86-64-v2` on the exact same source produces `0`, falling back to `xmm` throughout.
+- **`--target-cpu native`** — explicitly "the real maximum this exact machine supports", spelled out rather than left implicit. Not a value LLVM's own backend understands as a literal string (that's a *driver*-level convention, e.g. clang's own `-mcpu=native`) — cleave's own build resolves it the same way a real driver would (`llvm::sys::getHostCPUName()`/`getHostCPUFeatures()`) before it ever reaches the backend, so it's safe to use directly and behaves identically to leaving `--target-cpu` unset.
+- **`--target-features <+f,-f,...>`** — a comma-separated list of feature deltas layered on top of whatever CPU was selected (explicit or detected), e.g. `-avx512f` (disable one specific feature, keep everything else), `+avx2,+fma`. Real, fine-grained effects confirmed directly on an isolated probe (`cleave-mlir-shim/tests/target_override.rs`): disabling `-avx512f` alone falls back from one 512-bit (`zmm`) fused multiply-add to two independent 256-bit (`ymm`) ones; disabling `-fma` alone (leaving every AVX-512 bit on) was expected to keep `zmm` width with an unfused multiply+add pair, but actually *also* falls back to `ymm` — LLVM's own legalization of this pattern ties its preferred vector width to FMA availability, a real backend choice, not a hard ISA constraint.
+- **Passing either one clears whatever the host-detection step already populated first.** `detectHost()` doesn't just pick a CPU name, it also fills in explicit `+feature` flags for everything the host actually has — subtarget resolution applies a CPU's own default features first, then layers explicit deltas on top *in the order they're added*, so a plain `--target-cpu x86-64-v2` with no `--target-features` would otherwise still inherit the *host's* `+avx512f` (since it was added first and never removed) and silently keep using it. cleave's own build clears that inherited list the moment either flag is used, so `--target-cpu <name>` alone always means that CPU's own clean, natural defaults — never a silent host leftover.
+
+```
+cargo run -p cleave -- kernel.cleave --emit-object out.o --target-cpu x86-64-v2
+cargo run -p cleave -- kernel.cleave --run --target-features -avx512f,-fma
+```
+
+### The rest of the codegen flags
+
+| Flag | Default | What it gates |
+| --- | --- | --- |
+| `--opt-level <0-3>` | `2` | `ExecutionEngine`'s own optimization level. |
+| `--openmp` / `--no-openmp` | on for `--emit-object`/`--emit-bindings`/`--emit-exe`/`cleave-build`, off for `--run`/`--dump-mlir-lowered` | The whole OpenMP parallelization stage (`--affine-parallelize`/`--convert-scf-to-openmp`/`--convert-openmp-to-llvm`). |
+| `--backend cpu` | `cpu` | The only real value today (`doc/hld.md`'s own stated Vulkan/`spirv` target isn't implemented yet). |
+| `--inline` / `--no-inline` | on | The MLIR-level inliner. `--no-inline` is a real diagnostic knob — keeps every function (`net_grad`, `matmul`, ...) as its own separate `llvm.func` instead of flattened into its caller, useful for reading a disassembly with real function boundaries intact. Not meant for a real perf build. |
+| `--affine-structs` / `--no-affine-structs` | on | Headerless-pool allocation for structs provably never aliased. `--no-affine-structs` is the escape hatch for a structural shape this analysis gets wrong. |
+| `--dps` / `--no-dps` | on | Destination-passing-style rewriting of struct-field writes (skips an allocate-fresh-buffer-then-copy in favor of writing in place where provably safe). |
+| `--dps-passthrough` / `--no-dps-passthrough` | on | A narrower strategy within `--dps` — sharing a field write's own source storage directly rather than copying it. Independent of `--dps` itself: turning this off alone still keeps the rest of the rewrite active. |
+| `--unroll-jam` / `--no-unroll-jam` | **off** | Widens a long reduction loop's own accumulator into several independent copies, combined at the end. Real and JIT-proven correct, but measured on the real matmul kernel to have zero effect (`doc/backlog.md`) — off by default, kept for a future shape it might actually help. |
+| `--chain-split` / `--no-chain-split` | **off** | Splits a long `vector.outerproduct` dependency chain into independent shorter ones. Real and disassembly-verified to do exactly that, but measured to make the real kernel's IPC slightly *worse* — off by default for the same reason as `--unroll-jam`. |
+| `--tag-releases` / `--no-tag-releases` | off | Debugging aid: tags every `cleave_release` call with its own originating variable id, to help track down a leak/double-free's real source. Adds real IR — never worth it outside active debugging. |
+| `--debug-info` / `--no-debug-info` | on | Per-function `DISubprogram`s (fused into every op's location) plus the `CodeView`/`Debug Info Version` module flags they need. `--no-debug-info` is a real opt-out for profiling/disassembly work that doesn't want `!dbg`/`DISubprogram` noise in dumped IR or symbolized profiles — no functional effect either way. |
+
 ## Hello, cleave
 
 ```

@@ -12,6 +12,7 @@ pub mod infer;
 pub mod lower;
 pub mod mlir_lower;
 pub mod monomorphize;
+pub mod options;
 pub mod parser;
 pub mod alias_analysis;
 pub mod escape;

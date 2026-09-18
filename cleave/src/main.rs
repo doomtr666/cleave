@@ -55,6 +55,14 @@ struct Args {
     target_cpu: Option<String>,
     target_features: Option<String>,
     backend: String,
+    inline: Option<bool>,
+    unroll_jam: Option<bool>,
+    chain_split: Option<bool>,
+    affine_structs: Option<bool>,
+    dps: Option<bool>,
+    dps_passthrough: Option<bool>,
+    tag_releases: Option<bool>,
+    debug_info: Option<bool>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -76,6 +84,14 @@ fn parse_args() -> Result<Args, String> {
     let mut target_cpu = None;
     let mut target_features = None;
     let mut backend = "cpu".to_string();
+    let mut inline: Option<bool> = None;
+    let mut unroll_jam: Option<bool> = None;
+    let mut chain_split: Option<bool> = None;
+    let mut affine_structs: Option<bool> = None;
+    let mut dps: Option<bool> = None;
+    let mut dps_passthrough: Option<bool> = None;
+    let mut tag_releases: Option<bool> = None;
+    let mut debug_info: Option<bool> = None;
 
     let mut args_iter = std::env::args().skip(1);
     while let Some(arg) = args_iter.next() {
@@ -137,6 +153,29 @@ fn parse_args() -> Result<Args, String> {
                     .ok_or_else(|| "--backend requires a value".to_string())?;
                 backend = value;
             }
+            // Every `--X`/`--no-X` pair below is a plain reassignment of its
+            // own mutable local, processed by this same single forward loop
+            // over `args_iter` -- the last occurrence of a given flag always
+            // wins, matching gcc/clang's own `-f`/`-fno-` "last one wins"
+            // convention (`-inline -no-inline` ends with inlining off), with
+            // no extra bookkeeping needed for it. See `CodegenOptions`'s own
+            // doc comments (`pipeline.rs`) for what each one actually gates.
+            "--inline" => inline = Some(true),
+            "--no-inline" => inline = Some(false),
+            "--unroll-jam" => unroll_jam = Some(true),
+            "--no-unroll-jam" => unroll_jam = Some(false),
+            "--chain-split" => chain_split = Some(true),
+            "--no-chain-split" => chain_split = Some(false),
+            "--affine-structs" => affine_structs = Some(true),
+            "--no-affine-structs" => affine_structs = Some(false),
+            "--dps" => dps = Some(true),
+            "--no-dps" => dps = Some(false),
+            "--dps-passthrough" => dps_passthrough = Some(true),
+            "--no-dps-passthrough" => dps_passthrough = Some(false),
+            "--tag-releases" => tag_releases = Some(true),
+            "--no-tag-releases" => tag_releases = Some(false),
+            "--debug-info" => debug_info = Some(true),
+            "--no-debug-info" => debug_info = Some(false),
             other if other.starts_with("--") => return Err(format!("unknown flag {other:?}")),
             other if path.is_none() => path = Some(PathBuf::from(other)),
             other => {
@@ -186,13 +225,24 @@ fn parse_args() -> Result<Args, String> {
             target_cpu,
             target_features,
             backend,
+            inline,
+            unroll_jam,
+            chain_split,
+            affine_structs,
+            dps,
+            dps_passthrough,
+            tag_releases,
+            debug_info,
         }),
         None => Err(
             "usage: cleave <file.cleave> [--dump-ast] [--dump-inference-pass] [--dump-monomorphized] [--dump-cps] \
              [--dump-cps-optimized] [--dump-cps-equivalences] [--dump-mlir] [--dump-mlir-lowered] [--run] \
              [--emit-object <path>] [--emit-bindings <path>] [--emit-exe <path>] \
              [--opt-level <0-3>] [--openmp | --no-openmp] [--target-cpu <name>] [--target-features <+f,-f,...>] \
-             [--backend cpu]"
+             [--backend cpu] [--inline | --no-inline] [--unroll-jam | --no-unroll-jam] \
+             [--chain-split | --no-chain-split] [--affine-structs | --no-affine-structs] \
+             [--dps | --no-dps] [--dps-passthrough | --no-dps-passthrough] [--tag-releases | --no-tag-releases] \
+             [--debug-info | --no-debug-info]"
                 .to_string(),
         ),
     }
@@ -208,12 +258,21 @@ fn resolve_codegen_options(args: &Args, openmp_default: bool) -> Result<CodegenO
         "cpu" => Backend::Cpu,
         other => return Err(format!("backend {other:?} is not implemented yet -- only \"cpu\" is supported today")),
     };
+    let defaults = CodegenOptions::default();
     Ok(CodegenOptions {
         opt_level: args.opt_level,
         openmp: args.openmp.unwrap_or(openmp_default),
         target_cpu: args.target_cpu.clone(),
         target_features: args.target_features.clone(),
         backend,
+        inline: args.inline.unwrap_or(defaults.inline),
+        unroll_jam: args.unroll_jam.unwrap_or(defaults.unroll_jam),
+        chain_split: args.chain_split.unwrap_or(defaults.chain_split),
+        affine_structs: args.affine_structs.unwrap_or(defaults.affine_structs),
+        dps: args.dps.unwrap_or(defaults.dps),
+        dps_passthrough: args.dps_passthrough.unwrap_or(defaults.dps_passthrough),
+        tag_releases: args.tag_releases.unwrap_or(defaults.tag_releases),
+        debug_info: args.debug_info.unwrap_or(defaults.debug_info),
     })
 }
 
@@ -477,6 +536,15 @@ fn real_main() -> ExitCode {
                     context.append_dialect_registry(&dialect_registry);
                     context.load_all_available_dialects();
 
+                    // Unlike `--dump-mlir-lowered` below, no `resolve_
+                    // codegen_options`/`options::set` here -- this `cps_
+                    // program` never went through `insert_refcounting`, so
+                    // it has no `PrimOp::Retain`/`Release` at all yet;
+                    // `lower_program`'s own `affine_structs` gate (which only
+                    // ever affects release-side dispatch) has nothing to act
+                    // on regardless of what it's set to, so wiring `--no-
+                    // affine-structs` through to this specific dump would be
+                    // real code with no observable effect on its output.
                     let mlir_types = collect_mlir_types(&program);
                     let struct_schemas = collect_struct_schemas(&program);
                     let module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
@@ -542,6 +610,33 @@ fn real_main() -> ExitCode {
                     context.append_dialect_registry(&dialect_registry);
                     context.load_all_available_dialects();
 
+                    // `lower_to_llvm` -- the shared pipeline `--run` below
+                    // also uses, right up to (not including) JIT invocation
+                    // -- this *is* the form that actually gets handed to the
+                    // `ExecutionEngine`, `llvm.*` dialect ops standing in for
+                    // real textual LLVM IR (melior/mlir-sys, as vendored,
+                    // don't expose `mlirTranslateModuleToLLVMIR` at all --
+                    // real `.ll` text isn't reachable without adding a raw
+                    // FFI binding ourselves). `--dump-mlir-lowered` defaults
+                    // OpenMP *off* (see `resolve_codegen_options`'s own doc
+                    // comment) -- pass `--openmp` explicitly to see the
+                    // parallelized form.
+                    //
+                    // Resolved *before* `lower_program` below, not after --
+                    // `crate::options::current()` (`lower_program`'s own
+                    // `affine_structs` gate reads it) must already reflect
+                    // this run's real CLI flags by the time `lower_program`
+                    // itself runs, not whatever the thread-local default
+                    // happened to be beforehand.
+                    let options = match resolve_codegen_options(&args, false) {
+                        Ok(options) => options,
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+                    cleave::options::set(options.clone());
+
                     let mlir_types = collect_mlir_types(&program);
                     let struct_schemas = collect_struct_schemas(&program);
                     let mut module =
@@ -550,25 +645,6 @@ fn real_main() -> ExitCode {
                         eprintln!("error: generated MLIR module failed verification");
                         exit = ExitCode::FAILURE;
                     } else {
-                        // `lower_to_llvm` -- the shared pipeline `--run`
-                        // below also uses, right up to (not including) JIT
-                        // invocation -- this *is* the form that actually
-                        // gets handed to the `ExecutionEngine`, `llvm.*`
-                        // dialect ops standing in for real textual LLVM IR
-                        // (melior/mlir-sys, as vendored, don't expose
-                        // `mlirTranslateModuleToLLVMIR` at all -- real `.ll`
-                        // text isn't reachable without adding a raw FFI
-                        // binding ourselves). `--dump-mlir-lowered` defaults
-                        // OpenMP *off* (see `resolve_codegen_options`'s own
-                        // doc comment) -- pass `--openmp` explicitly to see
-                        // the parallelized form.
-                        let options = match resolve_codegen_options(&args, false) {
-                            Ok(options) => options,
-                            Err(e) => {
-                                eprintln!("error: {e}");
-                                std::process::exit(1);
-                            }
-                        };
                         match lower_to_llvm(&context, &mut module, &options) {
                             Ok(()) => print!("{}", module.as_operation()),
                             Err(errs) => {
@@ -641,16 +717,13 @@ fn real_main() -> ExitCode {
         context.append_dialect_registry(&dialect_registry);
         context.load_all_available_dialects();
 
-        let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
-        if !module.as_operation().verify() {
-            eprintln!("error: generated MLIR module failed verification");
-            return ExitCode::FAILURE;
-        }
-
         // `lower_to_llvm` -- shared with `--dump-mlir-lowered` above and
         // `emit_object` (`pipeline.rs`). `--run` defaults OpenMP *off*
         // (`resolve_codegen_options`'s own doc comment); pass `--openmp`
         // explicitly to invoke the parallelized form for real.
+        //
+        // Resolved *before* `lower_program` below -- same reasoning as
+        // `--dump-mlir-lowered`'s own identical reordering above.
         let options = match resolve_codegen_options(&args, false) {
             Ok(options) => options,
             Err(e) => {
@@ -658,6 +731,14 @@ fn real_main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        cleave::options::set(options.clone());
+
+        let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
+        if !module.as_operation().verify() {
+            eprintln!("error: generated MLIR module failed verification");
+            return ExitCode::FAILURE;
+        }
+
         if let Err(errs) = lower_to_llvm(&context, &mut module, &options) {
             for e in &errs {
                 eprintln!("error: {e}");
@@ -688,12 +769,14 @@ fn real_main() -> ExitCode {
             }
         }
         let shared_lib_refs: Vec<&str> = shared_libs.iter().map(String::as_str).collect();
-        let engine = melior::ExecutionEngine::new(
-            &module,
+        let engine = cleave_mlir_shim::ExecutionEngine::new(
+            module.to_raw(),
             options.opt_level as usize,
             &shared_lib_refs,
             false,
             false,
+            options.target_cpu.as_deref().unwrap_or(""),
+            options.target_features.as_deref().unwrap_or(""),
         );
         // SAFETY: see `cleave::pipeline::register_cleave_rt_symbols`'s own
         // doc comment -- shared with `--emit-object`, which needs the
@@ -726,6 +809,7 @@ fn real_main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        cleave::options::set(options.clone());
         if let Err(errs) = cleave::pipeline::emit_from_program(
             &program,
             &registry,
@@ -756,6 +840,7 @@ fn real_main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        cleave::options::set(options.clone());
         if let Err(errs) =
             cleave::pipeline::emit_exe(&program, &registry, &sources, exe_path, &options)
         {

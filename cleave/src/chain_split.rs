@@ -119,18 +119,18 @@ const MIN_CHAIN_LEN_TO_SPLIT: i64 = 8;
 /// chain this pass doesn't recognize, or can't find a factor for, is left
 /// byte-for-byte as the schedule already built it.
 ///
-/// **Off by default, opt-in via `CLEAVE_CHAIN_SPLIT=1`** — same posture and
-/// same reason as `unroll_jam.rs`'s own doc comment on `CLEAVE_UNROLL_JAM`:
-/// real, disassembly-verified to produce exactly the intended independent-
-/// chain structure, but measured on the real kernel (clean rebuild, AMD
-/// uProf) at IPC `0.197` — *worse* than the `0.226` unsplit baseline, not
-/// better (`doc/backlog.md`'s own full writeup). The bottleneck this pass
-/// targets (FMA dependency-chain latency) was never the real one for this
-/// kernel — a cache-locality fix elsewhere closed the actual gap. Kept for
-/// the same reason `unroll_jam.rs` is: a correct, working mechanism that
-/// simply wasn't the fix for this specific shape.
-pub fn split_outerproduct_chains<'c>(context: &'c Context, module: &mut Module<'c>) {
-    if std::env::var("CLEAVE_CHAIN_SPLIT").is_err() {
+/// **Off by default** (`CodegenOptions::chain_split`, `--chain-split` on the
+/// CLI) — same posture and same reason as `unroll_jam.rs`'s own doc comment
+/// on `unroll_jam`: real, disassembly-verified to produce exactly the
+/// intended independent-chain structure, but measured on the real kernel
+/// (clean rebuild, AMD uProf) at IPC `0.197` — *worse* than the `0.226`
+/// unsplit baseline, not better (`doc/backlog.md`'s own full writeup). The
+/// bottleneck this pass targets (FMA dependency-chain latency) was never the
+/// real one for this kernel — a cache-locality fix elsewhere closed the
+/// actual gap. Kept for the same reason `unroll_jam.rs` is: a correct,
+/// working mechanism that simply wasn't the fix for this specific shape.
+pub fn split_outerproduct_chains<'c>(context: &'c Context, module: &mut Module<'c>, enabled: bool) {
+    if !enabled {
         return;
     }
     let trace = std::env::var("CLEAVE_TRACE_CHAIN_SPLIT").is_ok();

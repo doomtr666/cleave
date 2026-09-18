@@ -137,22 +137,21 @@ const MIN_TRIP_COUNT_TO_UNROLL: i64 = 8;
 /// it — this pass can only ever make a long reduction *faster*, never
 /// *different*.
 ///
-/// **Off by default, opt-in via `CLEAVE_UNROLL_JAM=1`** (`CLEAVE_AFFINE_
-/// STRUCTS`/`CLEAVE_TAG_RELEASES`'s own established convention for a real,
-/// working, but not-default-on mechanism) — real, JIT-proven correct
-/// (`cleave/tests/unroll_jam_probe.rs`), but measured on the real kernel and
-/// found not to be the actual fix for the long-K matmul IPC gap it was built
-/// for (`doc/backlog.md`'s own "the long-K matmul IPC gap was never a
-/// latency-chain problem, it was cache locality" entry has the full
-/// measured story: widening the *outer* K-tile loop duplicates a real,
-/// unavoidable `16`-register operand-tile load per copy, `factor=7` demands
-/// `112` architectural registers against `32`, and the real fix turned out
-/// to be a cache-locality one, an `M`-tile-size change elsewhere). Kept in
-/// the tree rather than deleted: a correct, generalizable mechanism (real
-/// multi-`iter_arg` handling, a real `vector.outerproduct` combine-op
-/// recognition) that may be the right tool for a *different* shape later.
-pub fn unroll_and_jam_reductions<'c>(context: &'c Context, module: &mut Module<'c>) {
-    if std::env::var("CLEAVE_UNROLL_JAM").is_err() {
+/// **Off by default** (`CodegenOptions::unroll_jam`, `--unroll-jam` on the
+/// CLI) — real, JIT-proven correct (`cleave/tests/unroll_jam_probe.rs`), but
+/// measured on the real kernel and found not to be the actual fix for the
+/// long-K matmul IPC gap it was built for (`doc/backlog.md`'s own "the
+/// long-K matmul IPC gap was never a latency-chain problem, it was cache
+/// locality" entry has the full measured story: widening the *outer* K-tile
+/// loop duplicates a real, unavoidable `16`-register operand-tile load per
+/// copy, `factor=7` demands `112` architectural registers against `32`, and
+/// the real fix turned out to be a cache-locality one, an `M`-tile-size
+/// change elsewhere). Kept in the tree rather than deleted: a correct,
+/// generalizable mechanism (real multi-`iter_arg` handling, a real `vector.
+/// outerproduct` combine-op recognition) that may be the right tool for a
+/// *different* shape later.
+pub fn unroll_and_jam_reductions<'c>(context: &'c Context, module: &mut Module<'c>, enabled: bool) {
+    if !enabled {
         return;
     }
     let trace = std::env::var("CLEAVE_TRACE_UNROLL_JAM").is_ok();

@@ -129,6 +129,7 @@ fn run_i32_inner(src: &str) -> i32 {
         target_cpu: None,
         target_features: None,
         backend: Backend::Cpu,
+        ..Default::default()
     };
     lower_to_llvm(&context, &mut module, &options).expect("lower_to_llvm failed");
 

@@ -86,11 +86,18 @@ pub struct CodegenOptions {
     /// `llvm.func`'s own real `target_cpu` string attribute (confirmed
     /// directly against this toolchain: `mlir-opt` parses and round-trips
     /// `llvm.func @f() attributes { target_cpu = "..." }` cleanly) --
-    /// `None` leaves it unset, exactly matching this project's own
-    /// previous, unexamined behavior (whatever `ExecutionEngine`/`dump_to_
-    /// object_file` defaults to on their own). `"native"` is a real,
-    /// standard LLVM value, resolved by LLVM's own backend at codegen time
-    /// -- no host-CPU-detection code needed on cleave's own side for it.
+    /// `None` leaves it unset, matching real host-CPU detection (`doc/
+    /// backlog.md`'s own "first real cleave shim function" entry: the actual
+    /// `TargetMachine` construction, `cleave-mlir-shim`, starts from
+    /// `JITTargetMachineBuilder::detectHost()`). `Some("native".into())` is
+    /// also real and explicitly equivalent to `None` here -- **not** because
+    /// LLVM's own backend understands the literal string `"native"` (it
+    /// doesn't; confirmed directly, the shim used to pass it straight
+    /// through and hit a real, fatal `LLVM ERROR` abort before this was
+    /// fixed) but because the shim itself special-cases it, substituting
+    /// `llvm::sys::getHostCPUName()`/`getHostCPUFeatures()` first -- the
+    /// same substitution a real driver like `clang` does for `-mcpu=native`
+    /// before its own backend ever sees the flag.
     pub target_cpu: Option<String>,
     /// `llvm.func`'s own `target_features` attribute -- raw feature text,
     /// e.g. `"+avx2,+fma"`, converted into the real `#llvm.target_features
@@ -101,6 +108,60 @@ pub struct CodegenOptions {
     /// See `Backend`'s own doc comment -- `Cpu` is the only real value
     /// today; every stage `lower_to_llvm` runs assumes it.
     pub backend: Backend,
+    /// Gates `lower_to_llvm`'s own MLIR-level inliner pass (`pass::transform
+    /// ::create_inliner()`). Real, established default-on optimization --
+    /// `false` was previously only reachable via `CLEAVE_NO_INLINE=1`, kept
+    /// as a real, named opt-out (not removed) specifically for isolating a
+    /// single function's own disassembly during profiling, this session's
+    /// own established use for it (`doc/backlog.md`'s matmul-IPC
+    /// investigation).
+    pub inline: bool,
+    /// Gates `unroll_jam::unroll_and_jam_reductions` (`pipeline.rs`).
+    /// **Off by default** -- a real, JIT-proven-correct mechanism, measured
+    /// on the real kernel and found not to be the fix for the long-K matmul
+    /// IPC gap it was built for (`doc/backlog.md`'s own full writeup); kept
+    /// as a real, explicit opt-in for a future shape where it is.
+    pub unroll_jam: bool,
+    /// Gates `chain_split::split_outerproduct_chains` (`pipeline.rs`). **Off
+    /// by default** -- same posture and same reason as `unroll_jam` above:
+    /// real and correct, measured to make IPC slightly *worse* on the real
+    /// kernel, kept as an explicit opt-in.
+    pub chain_split: bool,
+    /// Gates `alias_analysis`'s own affine-struct pool-allocation strategy
+    /// (`mlir_lower.rs::lower_program`). **On by default** -- landed,
+    /// measured, re-verified on both real kernels (`doc/plan-affine-
+    /// ownership.md` §11-§14). `false` is the escape hatch for a structural
+    /// shape neither real kernel nor the test suite happens to exercise --
+    /// never remove this fallback casually (`lower_program`'s own doc
+    /// comment has the full reasoning).
+    pub affine_structs: bool,
+    /// Gates `dps_rewrite`'s own destination-passing-style rewrite pass.
+    /// **On by default**, real and established.
+    pub dps: bool,
+    /// Gates `dps_rewrite`'s own narrower passthrough-sharing strategy
+    /// (declining it alone, independent of `dps` above, falls back to a
+    /// safe copy instead of sharing the source's own storage). **On by
+    /// default**, real and established.
+    pub dps_passthrough: bool,
+    /// Gates `mlir_lower.rs`'s own originating-`CVar`-id tagging on emitted
+    /// `cleave_release` calls -- a real debugging aid for tracking down a
+    /// leak/double-free's own source, not a performance optimization. **Off
+    /// by default** (adds real IR, no reason to pay for it unless actually
+    /// debugging a refcounting issue).
+    pub tag_releases: bool,
+    /// Gates `mlir_lower.rs::build_di_subprograms`/`set_gen_subprogram`
+    /// (per-function `#llvm.di_subprogram` attributes, fused into every
+    /// op's location via `gen_loc`) and `lower_to_llvm`'s own `!llvm.module
+    /// .flags` emission of `CodeView`/`Debug Info Version`. **On by
+    /// default**, matching the previously-unconditional behavior (there was
+    /// no gate at all before this field existed). `false` skips both:
+    /// `gen_loc` already falls back to a bare, subprogram-less `Location`
+    /// whenever `GEN_SUBPROGRAM` is left at its default `None` (its own doc
+    /// comment), so simply never calling `set_gen_subprogram` is sufficient
+    /// -- no separate "strip DI" pass needed. A real, named opt-out for
+    /// profiling/disassembly work that doesn't want `DISubprogram`/`!dbg`
+    /// noise in dumped IR or symbolized profiles.
+    pub debug_info: bool,
 }
 
 impl Default for CodegenOptions {
@@ -111,6 +172,14 @@ impl Default for CodegenOptions {
             target_cpu: None,
             target_features: None,
             backend: Backend::Cpu,
+            inline: true,
+            unroll_jam: false,
+            chain_split: false,
+            affine_structs: true,
+            dps: true,
+            dps_passthrough: true,
+            tag_releases: false,
+            debug_info: true,
         }
     }
 }
@@ -315,7 +384,7 @@ pub fn compile_and_emit(
 /// needed because `one-shot-bufferize`'s own lowering calls it directly by
 /// name whenever a tensor value needs a real defensive copy, and this
 /// engine has no shared library loaded to satisfy that on its own.
-pub unsafe fn register_cleave_rt_symbols(engine: &melior::ExecutionEngine) {
+pub unsafe fn register_cleave_rt_symbols(engine: &cleave_mlir_shim::ExecutionEngine) {
     unsafe {
         engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
         engine.register_symbol("rand_seed", cleave_rt::rand_seed as *mut ());
@@ -705,8 +774,9 @@ pub fn lower_to_llvm<'c>(
     // call-site duplication, same shape as any inliner, not the exponential
     // blowup a previous compile-time investigation hit and fixed
     // elsewhere -- `doc/backlog.md`'s own "real root cause of the 738s").
-    // `CLEAVE_NO_INLINE=1` -- a diagnostic-only knob, raised directly by the
-    // user to inspect the generated code with real function boundaries kept
+    // `CodegenOptions::inline = false` (`--no-inline` on the CLI) -- a
+    // diagnostic-only knob, raised directly by the user to inspect the
+    // generated code with real function boundaries kept
     // intact (`net_grad`, `matmul`, ... each stay their own `llvm.func`
     // instead of being flattened into `train_and_evaluate`), instead of
     // digging through `S_INLINESITE` records inside one giant disassembled
@@ -723,7 +793,7 @@ pub fn lower_to_llvm<'c>(
     // scratch-buffer cost this same pass's own comment above measured and
     // fixed.
     let pass_manager = pass::PassManager::new(context);
-    if std::env::var("CLEAVE_NO_INLINE").is_err() {
+    if options.inline {
         pass_manager.add_pass(pass::transform::create_inliner());
     }
     pass_manager.add_pass(pass::linalg::create_convert_elementwise_to_linalg_pass());
@@ -810,8 +880,9 @@ pub fn lower_to_llvm<'c>(
     // 's own `iter_arg` representation -- so it doesn't need the tensor-
     // round-trip that pass hoists away first.
     //
-    // **Off by default** (`CLEAVE_CHAIN_SPLIT=1` opts in) -- measured on the
-    // real kernel and found to make IPC slightly *worse*, not better
+    // **Off by default** (`CodegenOptions::chain_split`, `--chain-split` on
+    // the CLI) -- measured on the real kernel and found to make IPC
+    // slightly *worse*, not better
     // (`doc/backlog.md`'s own "the long-K matmul IPC gap was never a
     // latency-chain problem, it was cache locality" entry): the real fix for
     // this kernel's own IPC gap was a cache-locality one (the `M`-tile-size
@@ -819,7 +890,7 @@ pub fn lower_to_llvm<'c>(
     // `pipeline.rs`), not a dependency-chain one. Kept wired in, off by
     // default, as a real, working, generalizable mechanism for a future
     // shape where the FMA chain genuinely is the bottleneck.
-    crate::chain_split::split_outerproduct_chains(context, module);
+    crate::chain_split::split_outerproduct_chains(context, module, options.chain_split);
 
     let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::transform::create_loop_invariant_subset_hoisting());
@@ -853,9 +924,9 @@ pub fn lower_to_llvm<'c>(
     // every one matched *zero* candidates when this ran before hoisting,
     // every long-K one matches correctly once moved to here.
     //
-    // **Off by default** (`CLEAVE_UNROLL_JAM=1` opts in, `CLEAVE_AFFINE_
-    // STRUCTS`/`CLEAVE_TAG_RELEASES`'s own established convention) -- wired
-    // in and measured on the real kernel: zero IPC change (widening the
+    // **Off by default** (`CodegenOptions::unroll_jam`, `--unroll-jam` on
+    // the CLI) -- wired in and measured on the real kernel: zero IPC change
+    // (widening the
     // *outer* K-tile loop duplicates a real, unavoidable per-copy operand-
     // tile-load register cost, `112` registers demanded for `factor=7`
     // against a `32`-register file -- constant spill/reload ate the gain).
@@ -867,7 +938,7 @@ pub fn lower_to_llvm<'c>(
     // mechanism for a future shape where the outer-loop accumulator chain
     // genuinely is the bottleneck and the per-copy tile-load cost is small
     // enough to afford.
-    crate::unroll_jam::unroll_and_jam_reductions(context, module);
+    crate::unroll_jam::unroll_and_jam_reductions(context, module, options.unroll_jam);
 
     // `CLEAVE_DUMP_PRE_BUFFERIZE=<path>` -- the still-tensor-typed IR, as
     // `mlir_lower.rs` emitted it, immediately before one-shot-bufferize
@@ -1397,8 +1468,11 @@ pub fn lower_to_llvm<'c>(
     // is set here too (the translation would add it anyway, but being
     // explicit keeps both flags in one place). Built via `OperationBuilder`
     // -- `llvm.module_flags` has no melior wrapper, and the `flags`
-    // inherent attribute is parsed from its textual form.
-    {
+    // inherent attribute is parsed from its textual form. Gated on
+    // `CodegenOptions::debug_info` -- with no `DISubprogram`s attached
+    // (`mlir_lower.rs::lower_program`'s own gate on the same option), these
+    // flags describe debug info that doesn't exist.
+    if options.debug_info {
         let flags = Attribute::parse(
             context,
             "[#llvm.mlir.module_flag<warning, \"CodeView\", 1 : i32>, \
@@ -1577,22 +1651,19 @@ fn backfill_unknown_locs<'c>(mut op: OperationRefMut<'c, '_>, current: &mut Loca
 /// not a panic, unlike `mark_mulf_addf_contract`'s own fixed, always-valid
 /// literal.
 ///
-/// **Known, confirmed-by-disassembly limitation, not a cleave bug**:
-/// stamping these attributes has *no effect* on the code this project's own
-/// emission path (`melior::ExecutionEngine`, both here and in `main.rs`'s
-/// own `--run`) actually generates -- `mlir::ExecutionEngine`'s own C++
-/// implementation (`mlir/lib/ExecutionEngine/ExecutionEngine.cpp`) always
-/// builds its own `TargetMachine` via `JITTargetMachineBuilder::detectHost
-/// ()` unless a caller passes a pre-built one in, and `melior`/`mlir-sys`
-/// (vendored, `C:\dev\mlir-sys`) don't expose that constructor parameter at
-/// all. Confirmed directly, not assumed: disassembling a real emitted
-/// object built with `--target-cpu x86-64-v2` (no AVX/AVX2/AVX-512) still
-/// shows hundreds of `zmm` (AVX-512) instructions, identical to the default
-/// build. `doc/backlog.md` tracks this as a real, open item -- fixing it
-/// for real needs `mlir-sys` extended to expose a real `TargetMachine`
-/// construction path, a separate, larger undertaking, not attempted here.
-/// The warning below exists so a user relying on this flag finds out
-/// immediately, not after a confusing disassembly session of their own.
+/// **No longer a dead flag -- both stamped here *and* genuinely honored by
+/// the actual generated code.** These attributes are still stamped for
+/// round-trip/debugging value (a real `llvm.func` reader can see what was
+/// requested), but the actual JIT/object-emission `TargetMachine` (both
+/// here and in `main.rs`'s own `--run`) is now built by `cleave-mlir-shim`
+/// 's own `ExecutionEngine::new`, which threads `options.target_cpu`/
+/// `options.target_features` straight into `JITTargetMachineBuilder`
+/// itself -- `doc/backlog.md`'s own "the first real cleave shim function"
+/// entry has the full story (including a real, found-not-assumed pitfall:
+/// `detectHost()` also populates explicit host feature flags that silently
+/// out-rank a plain `setCPU` unless cleared first -- the shim already does
+/// this correctly, confirmed via three passing disassembly-based tests,
+/// `cleave-mlir-shim/tests/target_override.rs`).
 fn stamp_target_cpu<'c>(
     context: &'c Context,
     module: &mut Module<'c>,
@@ -1601,11 +1672,6 @@ fn stamp_target_cpu<'c>(
     if options.target_cpu.is_none() && options.target_features.is_none() {
         return Ok(());
     }
-    eprintln!(
-        "warning: --target-cpu/--target-features are stamped in the generated MLIR but have \
-         no effect on the actual generated code yet (a real mlir-sys/melior binding \
-         limitation, not a cleave bug -- see doc/backlog.md)"
-    );
     let target_cpu = match &options.target_cpu {
         None => None,
         Some(cpu) => Some(
@@ -1691,7 +1757,7 @@ fn stamp_llvm_func_attrs<'c>(
 /// SAFETY: `dummy_extern_stub`'s own address is a real, valid, live-for-the-
 /// whole-process function pointer — its signature never has to match the
 /// real extern's own, since it's provably never called through this engine.
-unsafe fn register_unresolved_extern_stubs(engine: &melior::ExecutionEngine, program: &Program) {
+unsafe fn register_unresolved_extern_stubs(engine: &cleave_mlir_shim::ExecutionEngine, program: &Program) {
     extern "C" fn dummy_extern_stub() {}
     for item in &program.items {
         let ItemKind::Fn(f) = &item.kind else {
@@ -1749,8 +1815,15 @@ fn emit_object(
 
     lower_to_llvm(&context, &mut module, options)?;
 
-    let engine =
-        melior::ExecutionEngine::new(&module, options.opt_level as usize, &[], true, false);
+    let engine = cleave_mlir_shim::ExecutionEngine::new(
+        module.to_raw(),
+        options.opt_level as usize,
+        &[],
+        true,
+        false,
+        options.target_cpu.as_deref().unwrap_or(""),
+        options.target_features.as_deref().unwrap_or(""),
+    );
     // SAFETY: see `register_cleave_rt_symbols`'s own doc comment.
     unsafe {
         register_cleave_rt_symbols(&engine);
@@ -1794,7 +1867,7 @@ fn emit_object(
 /// enables `--parallel-reductions`, so the `__kmpc_reduce*` family is
 /// deliberately not included) — not something to special-case per kernel
 /// shape.
-unsafe fn register_openmp_stub_symbols(engine: &melior::ExecutionEngine) {
+unsafe fn register_openmp_stub_symbols(engine: &cleave_mlir_shim::ExecutionEngine) {
     extern "C" fn dummy_openmp_stub() {}
     const OPENMP_RUNTIME_SYMBOLS: &[&str] = &[
         "__kmpc_fork_call",

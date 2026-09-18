@@ -411,19 +411,12 @@ pub fn lower_program<'c>(
     let constructed_structs = crate::refcount::collect_constructed_struct_names(program);
     let field_mutated_structs = crate::refcount::collect_field_mutated_struct_names(program);
     let extern_boundary_structs = crate::refcount::collect_extern_boundary_struct_names(program);
-    // `doc/plan-affine-ownership.md`'s Stage 2 — computed here, internally,
-    // exactly like `region_local_fns` right above, rather than threaded in
-    // as a new parameter: `lower_program` is called from 4 sites in this
-    // crate alone (`main.rs` x3, `pipeline.rs`) plus 14 test files, and
-    // `program` here is already the *one* `CpsProgram` this function
-    // actually receives — no new plumbing needed. This does mean `program`
-    // is the *post*-`insert_refcounting` CPS, not the snapshot `alias_
-    // analysis`'s own doc comment was written against — safe specifically
-    // because `alias_analysis::occurs_in` deliberately excludes `Retain`/
-    // `Release` from its own occurs-check for exactly this reason (that
-    // function's own doc comment; confirmed directly by a dedicated test,
-    // `affine_eligibility_gives_the_same_answer_before_and_after_insert_
-    // refcounting`, that the verdict doesn't change either way).
+    // `doc/plan-affine-ownership.md`'s Stage 2 — read from `crate::options::
+    // current()` (a thread-local `CodegenOptions`, `options.rs`'s own module
+    // doc comment has the full reasoning) rather than threaded in as a new
+    // parameter: `lower_program` is called from 4 sites in this crate alone
+    // (`main.rs` x3, `pipeline.rs`) plus 14 test files, far more than
+    // changing this function's own signature was worth for one gate.
     //
     // On by default as of `doc/plan-affine-ownership.md` §11-§14 landing —
     // every confirmed crash (§11.1/§11.2's loop-carried case, §11.3's
@@ -433,15 +426,24 @@ pub fn lower_program<'c>(
     // warnings, plus real, correct end-to-end runs on *both* real kernels
     // this project has (`examples/mnist-interop`, `examples/digits-interop`
     // — the latter via a genuine `cargo clean` rebuild, gate on, matching
-    // known-good accuracy `0.94713414`). `CLEAVE_NO_AFFINE_STRUCTS` is the
-    // escape hatch — the same "default on, named env var to opt back out"
-    // shape `CLEAVE_NO_OPENMP` already established in this project — for
+    // known-good accuracy `0.94713414`). `CodegenOptions::affine_structs =
+    // false` (`--no-affine-structs` on the CLI) is the escape hatch — for
     // the day some structural shape neither real kernel nor the test suite
     // happens to exercise turns up a case this analysis gets wrong; never
     // remove this fallback casually, this is exactly the corruption class
     // of bug (`8a748f8`) this whole plan exists to close carefully.
+    //
+    // `program` here is already the *one* `CpsProgram` this function
+    // actually receives — this does mean it's the *post*-`insert_
+    // refcounting` CPS, not the snapshot `alias_analysis`'s own doc comment
+    // was written against — safe specifically because `alias_analysis::
+    // occurs_in` deliberately excludes `Retain`/`Release` from its own
+    // occurs-check for exactly this reason (that function's own doc
+    // comment; confirmed directly by a dedicated test, `affine_eligibility_
+    // gives_the_same_answer_before_and_after_insert_refcounting`, that the
+    // verdict doesn't change either way).
     let (affine_structs, field_affine): (HashSet<CVar>, HashMap<(String, usize), bool>) =
-        if std::env::var("CLEAVE_NO_AFFINE_STRUCTS").is_err() {
+        if crate::options::current().affine_structs {
             let summary = crate::alias_analysis::analyze(program);
             let affine_structs = crate::alias_analysis::affine_struct_vars(
                 program,
@@ -488,18 +490,32 @@ pub fn lower_program<'c>(
         // One `DISubprogram` per function, *all* of them (not just whoever
         // survives as a standalone `llvm.func` after `--inline` -- see
         // `gen_loc`'s own doc comment for why that distinction matters).
-        let names: Vec<(String, SrcLoc)> = program
-            .funcs
-            .iter()
-            .map(|f| (f.def.name.clone(), f.loc))
-            .collect();
-        let subprograms = build_di_subprograms(context, &names);
-        for (f, sp) in program.funcs.iter().zip(subprograms) {
-            set_gen_subprogram(Some(sp));
-            let op = lower_top_level_fn(&ctx, f);
-            ctx.module.body().append_operation(op);
+        // Gated on `CodegenOptions::debug_info` (read via the same thread-
+        // local mechanism as `affine_structs` above, for the same reason --
+        // `lower_program` has far more call sites than this one gate is
+        // worth a new parameter for). When off, simply never call `set_gen_
+        // subprogram`: `gen_loc` already falls back to a bare, subprogram-
+        // less `Location` whenever `GEN_SUBPROGRAM` is at its default
+        // `None`, so there's nothing else to skip here.
+        if crate::options::current().debug_info {
+            let names: Vec<(String, SrcLoc)> = program
+                .funcs
+                .iter()
+                .map(|f| (f.def.name.clone(), f.loc))
+                .collect();
+            let subprograms = build_di_subprograms(context, &names);
+            for (f, sp) in program.funcs.iter().zip(subprograms) {
+                set_gen_subprogram(Some(sp));
+                let op = lower_top_level_fn(&ctx, f);
+                ctx.module.body().append_operation(op);
+            }
+            set_gen_subprogram(None);
+        } else {
+            for f in program.funcs.iter() {
+                let op = lower_top_level_fn(&ctx, f);
+                ctx.module.body().append_operation(op);
+            }
         }
-        set_gen_subprogram(None);
     }
     module
 }
@@ -3987,10 +4003,10 @@ fn emit_cleave_release_pool<'c>(
 /// TEMP, diagnostic-only: identical to `emit_cleave_release`, but calls
 /// `cleave_release_tagged` (`cleave-rt::LAST_RELEASE_TAG`'s own doc comment)
 /// instead, carrying this release's own originating CVar id, when
-/// `CLEAVE_TAG_RELEASES=1` at compile time — falls back to the ordinary
-/// untagged call otherwise, so this never changes codegen for a normal
-/// build. Remove once the still-open double-release bug (`doc/backlog.md`)
-/// is found.
+/// `CodegenOptions::tag_releases` (`--tag-releases` on the CLI) is set —
+/// falls back to the ordinary untagged call otherwise, so this never changes
+/// codegen for a normal build. Remove once the still-open double-release bug
+/// (`doc/backlog.md`) is found.
 fn emit_cleave_release_tagged<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
@@ -3998,7 +4014,7 @@ fn emit_cleave_release_tagged<'c>(
     ptr_val: Value<'c, 'c>,
     tag: CVar,
 ) -> Value<'c, 'c> {
-    if std::env::var("CLEAVE_TAG_RELEASES").is_err() {
+    if !crate::options::current().tag_releases {
         return emit_cleave_release(ctx, block, rc_ty, ptr_val);
     }
     let context = ctx.context;

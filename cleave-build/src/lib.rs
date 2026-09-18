@@ -70,6 +70,14 @@ pub struct Build {
     target_cpu: Option<String>,
     target_features: Option<String>,
     backend: Option<cleave::pipeline::Backend>,
+    inline: Option<bool>,
+    unroll_jam: Option<bool>,
+    chain_split: Option<bool>,
+    affine_structs: Option<bool>,
+    dps: Option<bool>,
+    dps_passthrough: Option<bool>,
+    tag_releases: Option<bool>,
+    debug_info: Option<bool>,
 }
 
 impl Default for Build {
@@ -87,6 +95,14 @@ impl Build {
             target_cpu: None,
             target_features: None,
             backend: None,
+            inline: None,
+            unroll_jam: None,
+            chain_split: None,
+            affine_structs: None,
+            dps: None,
+            dps_passthrough: None,
+            tag_releases: None,
+            debug_info: None,
         }
     }
 
@@ -131,6 +147,57 @@ impl Build {
     /// only real value today.
     pub fn backend(&mut self, backend: cleave::pipeline::Backend) -> &mut Self {
         self.backend = Some(backend);
+        self
+    }
+
+    /// See `cleave::pipeline::CodegenOptions::inline`'s own doc comment.
+    pub fn inline(&mut self, enabled: bool) -> &mut Self {
+        self.inline = Some(enabled);
+        self
+    }
+
+    /// See `cleave::pipeline::CodegenOptions::unroll_jam`'s own doc comment.
+    pub fn unroll_jam(&mut self, enabled: bool) -> &mut Self {
+        self.unroll_jam = Some(enabled);
+        self
+    }
+
+    /// See `cleave::pipeline::CodegenOptions::chain_split`'s own doc comment.
+    pub fn chain_split(&mut self, enabled: bool) -> &mut Self {
+        self.chain_split = Some(enabled);
+        self
+    }
+
+    /// See `cleave::pipeline::CodegenOptions::affine_structs`'s own doc
+    /// comment.
+    pub fn affine_structs(&mut self, enabled: bool) -> &mut Self {
+        self.affine_structs = Some(enabled);
+        self
+    }
+
+    /// See `cleave::pipeline::CodegenOptions::dps`'s own doc comment.
+    pub fn dps(&mut self, enabled: bool) -> &mut Self {
+        self.dps = Some(enabled);
+        self
+    }
+
+    /// See `cleave::pipeline::CodegenOptions::dps_passthrough`'s own doc
+    /// comment.
+    pub fn dps_passthrough(&mut self, enabled: bool) -> &mut Self {
+        self.dps_passthrough = Some(enabled);
+        self
+    }
+
+    /// See `cleave::pipeline::CodegenOptions::tag_releases`'s own doc
+    /// comment.
+    pub fn tag_releases(&mut self, enabled: bool) -> &mut Self {
+        self.tag_releases = Some(enabled);
+        self
+    }
+
+    /// See `cleave::pipeline::CodegenOptions::debug_info`'s own doc comment.
+    pub fn debug_info(&mut self, enabled: bool) -> &mut Self {
+        self.debug_info = Some(enabled);
         self
     }
 
@@ -203,18 +270,38 @@ impl Build {
         // needed just to give it its own stack.
         // `openmp` defaults `true` here (unlike `--run`'s own CLI default)
         // -- `cleave-build` is always an AOT path, matching `--emit-object`.
+        let defaults = cleave::pipeline::CodegenOptions::default();
         let options = cleave::pipeline::CodegenOptions {
             opt_level: self.opt_level.unwrap_or(2),
             openmp: self.openmp.unwrap_or(true),
             target_cpu: self.target_cpu.clone(),
             target_features: self.target_features.clone(),
             backend: self.backend.unwrap_or(cleave::pipeline::Backend::Cpu),
+            inline: self.inline.unwrap_or(defaults.inline),
+            unroll_jam: self.unroll_jam.unwrap_or(defaults.unroll_jam),
+            chain_split: self.chain_split.unwrap_or(defaults.chain_split),
+            affine_structs: self.affine_structs.unwrap_or(defaults.affine_structs),
+            dps: self.dps.unwrap_or(defaults.dps),
+            dps_passthrough: self.dps_passthrough.unwrap_or(defaults.dps_passthrough),
+            tag_releases: self.tag_releases.unwrap_or(defaults.tag_releases),
+            debug_info: self.debug_info.unwrap_or(defaults.debug_info),
         };
 
         let result = std::thread::scope(|scope| {
             std::thread::Builder::new()
                 .stack_size(1024 * 1024 * 1024)
                 .spawn_scoped(scope, || {
+                    // `cleave::options::set` -- *inside* this closure,
+                    // deliberately: `compile_and_emit` (and everything it
+                    // calls, `lower_program`'s own `affine_structs` gate
+                    // included) reads `cleave::options::current()` off a
+                    // `thread_local!` (`options.rs`'s own module doc
+                    // comment), and this whole compile genuinely runs on
+                    // *this* spawned thread, not the build script's own
+                    // outer one -- setting it out there would leave this
+                    // thread's own copy at the default no matter what `Build`
+                    // was configured with.
+                    cleave::options::set(options.clone());
                     cleave::pipeline::compile_and_emit(
                         sources,
                         &project_dirs,
