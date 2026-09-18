@@ -76,6 +76,25 @@
 //!    dangerous case" discipline already established in `refcount.rs`
 //!    (`collect_identity_param_positions`'s own doc comment has the twin
 //!    of this exact reasoning).
+//! 4b. **Embedded into an `Array`/`ArrayRepeat` construction** is seeded
+//!    aliased directly, unconditionally too — the same "no evidence, no
+//!    assumption" reasoning as rule 4, for a different reason: a `Load`
+//!    reading back out of that array uses a genuinely runtime index (`arr
+//!    [i]`, `i` a loop variable, not a compile-time constant in general),
+//!    so *which* originally-embedded element comes back out at any later
+//!    load site is not statically knowable here — unlike a `Struct`'s own
+//!    fields, only ever reached back out via a named, fully-visible
+//!    `Field` projection this analysis already understands completely.
+//!    Confirmed a real, not hypothetical, gap: `examples/convex_hull
+//!    .cleave`'s `[Point; 8]` array literal, each `Point` embedded once and
+//!    never referenced again *by that same name* (rule 2's own occurs-check
+//!    is blind to this — the array is what survives, not the original
+//!    binding), classified every one of the 8 as pool-eligible even though
+//!    `points[current]` (a `Load` off that exact array, at a runtime index)
+//!    is later pushed into a `DynArray<Point>` — a real, non-deterministic
+//!    use-after-free once the pool block backing whichever element was
+//!    loaded got reused for something else, `doc/backlog.md`'s own entry on
+//!    this has the full failure signature and reproduction.
 //! 5. **Returned unchanged (an identity-shaped function) does NOT, on its
 //!    own, mark the parameter aliased.** A pure pass-through is not a
 //!    commitment — it creates no *new* reference by itself. The aliasing
@@ -97,7 +116,7 @@
 //! own top-level pointer identity ever duplicated", at variable
 //! granularity, not field granularity.
 
-use crate::cps::{CExpr, CVal, CVar, CpsProgram, PrimOp};
+use crate::cps::{CExpr, CFunDef, CVal, CVar, CpsProgram, PrimOp};
 use crate::infer::Ty;
 use std::collections::{HashMap, HashSet};
 
@@ -153,7 +172,7 @@ pub struct IdentitySummary {
     /// to be returned unchanged on at least one reachable path. Every
     /// function this program defines a body for gets an entry (possibly
     /// empty) — see [`AliasSummary`]'s own identical discipline and
-    /// `collect_identity_facts`'s own doc comment for why the distinction
+    /// [`analyze_identity`]'s own doc comment for why the distinction
     /// from "no entry at all" (an `extern fn`) matters to this struct's
     /// own consumer.
     identity: HashMap<String, HashSet<usize>>,
@@ -177,9 +196,27 @@ impl IdentitySummary {
 
 /// Runs the identity analysis — see [`IdentitySummary`]'s own doc comment
 /// for what it computes and why, and the module's own top-level doc
-/// comment for the two-pass design ([`collect_identity_facts`] once,
-/// [`propagate`] resolves the transitive chains) this shares verbatim
-/// with [`analyze`].
+/// comment for the two-pass design ([`tail_returns_var`] once per
+/// parameter, [`propagate`] resolves the transitive chains) this shares
+/// verbatim with [`analyze`].
+///
+/// One generalized forward trace per ordinary parameter, not two separate
+/// pattern-matched rules the way this used to be split (a *direct* return
+/// vs. a *single-hop* resumption-forwards-a-real-call shape): found, by a
+/// real, deterministic `examples/complex.cleave --run` segfault (`doc/
+/// backlog.md`'s own entry has the full story), that splitting it that way
+/// left an entire class of shape undetected — a value threaded through an
+/// `if`/`else`'s own local join continuation (`Display<Complex<T>>`'s own
+/// sign-of-imaginary-part branch, `stdlib/display/display.cleave`) before
+/// reaching either `k_ret` or a further real call never matched *either*
+/// rule, since neither the old rule 1 (only a *literal* parameter reaching
+/// `k_ret` directly) nor the old rule 2 (only a *single* real-call
+/// resumption, `tail_returns_var` explicitly refusing to recurse any
+/// deeper) ever looked *through* a plain local join point at all. A join
+/// point is not a real function — it never needs its own entry in this
+/// module's own `known_functions`/interprocedural fixed point — so tracing
+/// through one is a purely local, single-function question, resolved once
+/// here rather than deferred.
 pub fn analyze_identity(program: &CpsProgram) -> IdentitySummary {
     let known_functions: HashSet<&str> = program
         .funcs
@@ -194,15 +231,24 @@ pub fn analyze_identity(program: &CpsProgram) -> IdentitySummary {
         let Some((&k_ret, ordinary_params)) = f.def.params.split_last() else {
             continue;
         };
-        collect_identity_facts(
-            &f.def.name,
-            ordinary_params,
-            k_ret,
-            &f.def.body,
-            &known_functions,
-            &mut seed,
-            &mut edges,
-        );
+        let mut defs_by_name: HashMap<&str, &CFunDef> = HashMap::new();
+        collect_local_defs_by_name(&f.def.body, &mut defs_by_name);
+        for (i, &param) in ordinary_params.iter().enumerate() {
+            let mut visiting = HashSet::new();
+            if tail_returns_var(
+                &f.def.body,
+                &f.def.name,
+                i,
+                k_ret,
+                param,
+                &defs_by_name,
+                &known_functions,
+                &mut visiting,
+                &mut edges,
+            ) {
+                seed.insert((f.def.name.clone(), i));
+            }
+        }
     }
 
     let resolved = propagate(seed, edges);
@@ -217,121 +263,206 @@ pub fn analyze_identity(program: &CpsProgram) -> IdentitySummary {
     IdentitySummary { identity }
 }
 
-/// One real walk of `f_name`'s own body, populating `seed`/`edges` for
-/// [`propagate`] — mirrors [`collect_facts`]'s own structure exactly,
-/// with two rules instead of four:
-///
-/// 1. **Direct**: a tail call to `k_ret` whose sole argument is literally
-///    one of `f`'s own ordinary parameters (`fn(x) -> x`) — seeded
-///    straight away, unchanged from this check's own original, pre-fixed-
-///    point form.
-/// 2. **Transitive** (the fix): a `Fix` whose own body is a real call
-///    (`App{Label(callee), args}`, `callee` found in `program.funcs`) and
-///    whose sole resumption def directly forwards its own single
-///    parameter to `f`'s own `k_ret` unchanged (`tail_returns_var`) — for
-///    every one of `f`'s own ordinary parameters passed to that call at
-///    position `j`, this makes position `i` of `f` depend on position `j`
-///    of `callee`. `println`'s own wrapping of `Print::print` is exactly
-///    this shape: `println`'s resumption for the `Print::print` call
-///    forwards that call's result straight back, so `identity(println, 0)`
-///    depends on `identity(Print::print, 0)` — resolved correctly
-///    regardless of how many further links a chain like this has, by
-///    [`propagate`]'s own worklist, not by recursing deeper here.
-fn collect_identity_facts(
-    f_name: &str,
-    ordinary_params: &[CVar],
-    k_ret: CVar,
-    expr: &CExpr,
-    known_functions: &HashSet<&str>,
-    seed: &mut HashSet<(String, usize)>,
-    edges: &mut Vec<Edge>,
-) {
+/// Every local `Fix`-def anywhere in `expr` (any nesting depth), keyed by
+/// its own label — local defs share one flat name space across their
+/// whole enclosing top-level function (mutual recursion between them, a
+/// loop tail-calling itself, is ordinary), so [`tail_returns_var`] needs
+/// to look one up by name regardless of *where* under the function's body
+/// it happens to be declared relative to whichever call site is tracing
+/// through it. Mirrors [`collect_local_defs`]'s own identical walk (a
+/// different module-internal purpose, `affine_struct_vars`'s own), kept
+/// separate rather than shared since that one also seeds/edges as it
+/// walks and this one only ever collects names.
+fn collect_local_defs_by_name<'a>(expr: &'a CExpr, out: &mut HashMap<&'a str, &'a CFunDef>) {
     match expr {
-        CExpr::LetPrim { cont, .. } => {
-            collect_identity_facts(f_name, ordinary_params, k_ret, cont, known_functions, seed, edges);
-        }
-        CExpr::App { func, args } => {
-            // Rule 1: a genuine return from *this* function (`k_ret` is
-            // one fixed `CVar`, never rebound by any nested `Fix` — a
-            // literal match here is always a real return, at any nesting
-            // depth, matching this same reasoning already established
-            // elsewhere in this module and in `refcount.rs`).
-            if matches!(func, CVal::Var(v) if *v == k_ret) {
-                if let [CVal::Var(returned)] = args.as_slice() {
-                    if let Some(i) = ordinary_params.iter().position(|p| p == returned) {
-                        seed.insert((f_name.to_string(), i));
-                    }
-                }
-            }
-        }
+        CExpr::LetPrim { cont, .. } => collect_local_defs_by_name(cont, out),
+        CExpr::App { .. } => {}
         CExpr::If {
             then_branch,
             else_branch,
             ..
         } => {
-            collect_identity_facts(f_name, ordinary_params, k_ret, then_branch, known_functions, seed, edges);
-            collect_identity_facts(f_name, ordinary_params, k_ret, else_branch, known_functions, seed, edges);
+            collect_local_defs_by_name(then_branch, out);
+            collect_local_defs_by_name(else_branch, out);
         }
         CExpr::Fix { defs, body } => {
-            // Rule 2: exactly the "real call's own resumption" shape
-            // `refcount.rs::walk_var_info`'s own Fix arm already
-            // recognizes for a different purpose — a single def, and the
-            // Fix's own *body* (not the def's) is the call itself. `loop$
-            // N`/`k$N`-shaped local labels are never in `known_functions`
-            // (only real top-level functions are), so a loop's own entry/
-            // back-edge can never be mistaken for this shape.
-            if let ([def], CExpr::App { func: CVal::Label(callee), args: call_args }) =
-                (defs.as_slice(), body.as_ref())
-            {
-                if known_functions.contains(callee.as_str()) {
-                    if let [resumption_param] = def.params.as_slice() {
-                        if tail_returns_var(&def.body, k_ret, *resumption_param) {
-                            for (i, p) in ordinary_params.iter().enumerate() {
-                                if let Some(j) =
-                                    call_args.iter().position(|a| matches!(a, CVal::Var(v) if v == p))
-                                {
-                                    edges.push(((f_name.to_string(), i), (callee.clone(), j)));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
             for d in defs {
-                collect_identity_facts(f_name, ordinary_params, k_ret, &d.body, known_functions, seed, edges);
+                out.insert(d.name.as_str(), d);
+                collect_local_defs_by_name(&d.body, out);
             }
-            collect_identity_facts(f_name, ordinary_params, k_ret, body, known_functions, seed, edges);
+            collect_local_defs_by_name(body, out);
         }
     }
 }
 
-/// Whether `expr`, when it reaches a tail call to `k_ret`, ever passes
-/// `var` there completely unchanged — the same shape as rule 1 in
-/// [`collect_identity_facts`] above, generalized to check one arbitrary
-/// `CVar` instead of a whole parameter list, for checking a *resumption's*
-/// own parameter rather than the enclosing function's own top-level ones.
+/// Whether `var`, starting from `expr` (`f_name`'s own body, or a local
+/// def's body reached while tracing through one), ever flows *unchanged*
+/// all the way to `f_name`'s own `k_ret` — the module's own doc comment on
+/// [`analyze_identity`] has the full motivation for why this replaced the
+/// old two-rule split. Three real cases where the trace can end:
 ///
-/// Deliberately does **not** recurse into a further nested resumption
-/// `Fix` (returns `false` there instead) — a second level of call-
-/// forwarding within the very same resumption body is left undetected by
-/// this one call, rather than growing this walk's own scope without
-/// bound; [`collect_identity_facts`]'s own edges already resolve chains
-/// of any length through [`propagate`]'s own fixed point, one link per
-/// function, so nothing is lost by keeping each individual link's own
-/// check this simple.
-fn tail_returns_var(expr: &CExpr, k_ret: CVar, var: CVar) -> bool {
+/// 1. **Reaches `k_ret` directly, as the literal argument** — proven,
+///    return `true` right here, no further work needed.
+/// 2. **Tail-calls a local `Fix`-def** (a join point, a resumption, a
+///    loop's own self-call, found in `defs_by_name`) — trace *through* it:
+///    find which of *its own* parameter positions received `var` at this
+///    call site, then re-ask the identical question about that parameter
+///    inside that def's own body. Chains of any length and shape resolve
+///    this way, one recursive call per hop, not by growing this function's
+///    own case list.
+/// 3. **Tail-calls a real, whole-program function** (found in
+///    `known_functions`) — this is the interprocedural half, resolved by
+///    [`propagate`]'s own fixed point exactly like rule 3 elsewhere in this
+///    module: push an edge from `(f_name, param_idx)` (the parameter this
+///    *entire* trace was launched to answer, threaded through unchanged
+///    across every local hop above — not the local `var` at this specific
+///    point, which belongs only to the current def) to `(callee, pos)`,
+///    and answer `false` for *this* call directly — [`analyze_identity`]'s
+///    own `seed`/`edges` split, plus [`propagate`], resolves it from there.
+///
+/// `defs_by_name`/`known_functions` distinguish cases 2 and 3 — a name
+/// never appears in both, since a top-level function's own name and a
+/// `Fix`-local label are drawn from disjoint namespaces (confirmed by
+/// every other whole-program collector in this module already relying on
+/// the same distinction).
+///
+/// `visiting`: labels already on the current recursion path — purely to
+/// stay terminating on a genuine loop back-edge (a `loop$N` def tail-
+/// calling itself). A revisited label conservatively answers "no
+/// evidence" (`false`) for that one edge, the same posture every other
+/// "can't decide" case in this module already takes — a loop's own real
+/// exit is a separate, textually distinct tail call (its `if`'s other
+/// branch) this same walk still reaches independently, never through the
+/// revisited label itself.
+///
+/// `If`'s own two branches are combined with `||` (either proving it is
+/// enough), matching this module's own established, deliberate bias
+/// (`propagate`'s own doc comment, `is_committed_at`'s "over-classify as
+/// shared rather than risk corruption" posture): `refcount.rs`'s own
+/// consumer of this fact only ever uses `true` to *skip* an otherwise-real
+/// release (protecting against a possible double-release), never to skip
+/// a needed *retain* — the failure mode on a branch that doesn't actually
+/// preserve identity is a conservative extra reference kept alive
+/// (`refcount.rs`'s own existing release-tracking on that value's *other*
+/// name still fires normally), never a use-after-free.
+#[allow(clippy::too_many_arguments)]
+fn tail_returns_var(
+    expr: &CExpr,
+    f_name: &str,
+    param_idx: usize,
+    k_ret: CVar,
+    var: CVar,
+    defs_by_name: &HashMap<&str, &CFunDef>,
+    known_functions: &HashSet<&str>,
+    visiting: &mut HashSet<String>,
+    edges: &mut Vec<Edge>,
+) -> bool {
     match expr {
-        CExpr::LetPrim { cont, .. } => tail_returns_var(cont, k_ret, var),
-        CExpr::App { func, args } => {
-            matches!(func, CVal::Var(v) if *v == k_ret)
-                && matches!(args.as_slice(), [CVal::Var(v)] if *v == var)
-        }
+        CExpr::LetPrim { cont, .. } => tail_returns_var(
+            cont, f_name, param_idx, k_ret, var, defs_by_name, known_functions, visiting, edges,
+        ),
+        CExpr::App { func, args } => match func {
+            CVal::Var(v) if *v == k_ret => {
+                matches!(args.as_slice(), [CVal::Var(v)] if *v == var)
+            }
+            CVal::Label(callee) if known_functions.contains(callee.as_str()) => {
+                if let Some(pos) = args.iter().position(|a| matches!(a, CVal::Var(v) if *v == var)) {
+                    edges.push(((f_name.to_string(), param_idx), (callee.clone(), pos)));
+                }
+                // `var` might simply not be one of this real call's own
+                // arguments at all (an unrelated comparison/computation
+                // happening in between, e.g. `Ord::lt<i32>` inside
+                // `Display::display<f64>`'s own formatting loop, found by
+                // direct testing the first version of this fix still
+                // missed) -- if so it survives completely untouched into
+                // whatever this call's own trailing continuation is, once
+                // the call itself returns. Every real call in this CPS
+                // passes that continuation as one of its own `args`, as a
+                // `CVal::Label` naming a local `Fix`-def (never anything
+                // else `CVal::Label` is used for) -- trace on through it,
+                // `var` unchanged, exactly like the local-callee arm below
+                // already does when `var` isn't one of *its* own params
+                // either.
+                args.iter().any(|a| {
+                    if let CVal::Label(cont) = a {
+                        if let Some(def) = defs_by_name.get(cont.as_str()) {
+                            if visiting.insert(cont.clone()) {
+                                let result = tail_returns_var(
+                                    &def.body, f_name, param_idx, k_ret, var, defs_by_name,
+                                    known_functions, visiting, edges,
+                                );
+                                visiting.remove(cont.as_str());
+                                return result;
+                            }
+                        }
+                    }
+                    false
+                })
+            }
+            CVal::Label(callee) => {
+                let Some(def) = defs_by_name.get(callee.as_str()) else {
+                    return false;
+                };
+                // `var` continues into `def`'s own body either re-bound to
+                // whichever of its own parameters received it *as an
+                // argument* at this call site, or -- if it's simply never
+                // passed at all -- completely unchanged: CPS `CVar` ids are
+                // globally unique (no shadowing anywhere in this codebase's
+                // own numbering scheme), so a local `Fix`-def's body can
+                // (and very often does, `Display::display<f64>`'s own
+                // `out` parameter closed over by its own formatting loop
+                // being the exact case found here) reference an enclosing-
+                // scope variable *directly*, never threading it through its
+                // own explicit `params` at all. Requiring an explicit
+                // argument-position match unconditionally (the first
+                // version of this fix) silently broke this closure-capture
+                // case, wrongly returning `false` even for `Display::
+                // display<f64>`'s own dead-simple, genuinely direct
+                // `(k_ret out)` return -- found immediately by a dedicated
+                // debug probe once the fix's own first attempt still didn't
+                // clear `examples/complex.cleave --run`'s crash.
+                let inner_var = match args.iter().position(|a| matches!(a, CVal::Var(v) if *v == var)) {
+                    Some(pos) => match def.params.get(pos) {
+                        Some(&p) => p,
+                        None => return false,
+                    },
+                    None => var,
+                };
+                if !visiting.insert(callee.clone()) {
+                    return false;
+                }
+                let result = tail_returns_var(
+                    &def.body,
+                    f_name,
+                    param_idx,
+                    k_ret,
+                    inner_var,
+                    defs_by_name,
+                    known_functions,
+                    visiting,
+                    edges,
+                );
+                visiting.remove(callee.as_str());
+                result
+            }
+            _ => false,
+        },
         CExpr::If {
             then_branch,
             else_branch,
             ..
-        } => tail_returns_var(then_branch, k_ret, var) || tail_returns_var(else_branch, k_ret, var),
-        CExpr::Fix { .. } => false,
+        } => {
+            let then_result = tail_returns_var(
+                then_branch, f_name, param_idx, k_ret, var, defs_by_name, known_functions, visiting, edges,
+            );
+            let else_result = tail_returns_var(
+                else_branch, f_name, param_idx, k_ret, var, defs_by_name, known_functions, visiting, edges,
+            );
+            then_result || else_result
+        }
+        CExpr::Fix { body, .. } => tail_returns_var(
+            body, f_name, param_idx, k_ret, var, defs_by_name, known_functions, visiting, edges,
+        ),
     }
 }
 
@@ -365,6 +496,9 @@ pub fn value_is_ever_aliased(var: CVar, body: &CExpr, summary: &AliasSummary) ->
                 if args.iter().any(|a| matches!(a, CVal::Var(v) if *v == var)) {
                     return true;
                 }
+            }
+            if is_array_embedded(op, args, var) {
+                return true;
             }
             value_is_ever_aliased(var, cont, summary)
         }
@@ -412,6 +546,27 @@ fn is_committed_at(op: &PrimOp, args: &[CVal], var: CVar) -> usize {
         .iter()
         .filter(|a| matches!(a, CVal::Var(v) if *v == var))
         .count()
+}
+
+/// Whether `var` is one of the elements an `Array` construction embeds, or
+/// the replicated value an `ArrayRepeat` one does — rule 4b, the module's
+/// own doc comment has the full reasoning (a `Load`'s own index is runtime,
+/// so unlike a `Struct`'s named fields, this analysis can never see which
+/// originally-embedded element comes back out at a later load site, hence
+/// treating this the same as rule 4's "no evidence, assume the dangerous
+/// case" extern-fn treatment rather than [`is_committed_at`]'s own occurs-
+/// check-gated rule 1/2). `Array` commits every one of its own arguments
+/// (each becomes one element); `ArrayRepeat` only its first (`args =
+/// [value, count]` — `count` is a size, never itself a commitment).
+fn is_array_embedded(op: &PrimOp, args: &[CVal], var: CVar) -> bool {
+    let commitment_args: &[CVal] = match op {
+        PrimOp::Array => args,
+        PrimOp::ArrayRepeat => args.first().map(std::slice::from_ref).unwrap_or(&[]),
+        _ => &[],
+    };
+    commitment_args
+        .iter()
+        .any(|a| matches!(a, CVal::Var(v) if *v == var))
 }
 
 /// Runs the whole analysis — see the module's own doc comment for the
@@ -576,6 +731,18 @@ fn collect_facts(
                     }
                 }
             }
+            // Rule 4b: embedded into an `Array`/`ArrayRepeat` construction
+            // -- the module's own doc comment has the full reasoning (a
+            // later `Load`'s own runtime index makes it impossible to know
+            // here which originally-embedded element comes back out), same
+            // unconditional "no evidence, assume the dangerous case"
+            // treatment as the `Extern` case just above, not gated by
+            // `occurs_in` the way rule 1/2 below are.
+            for (i, param) in ordinary_params.iter().enumerate() {
+                if is_array_embedded(op, args, *param) {
+                    seed.insert((f_name.to_string(), i));
+                }
+            }
             for (i, param) in ordinary_params.iter().enumerate() {
                 let occurrences = is_committed_at(op, args, *param);
                 // Rule 1: committed more than once in this *same* op's own
@@ -720,6 +887,7 @@ fn occurs_in(v: CVar, expr: &CExpr) -> bool {
 pub fn affine_struct_vars(
     program: &CpsProgram,
     summary: &AliasSummary,
+    identity_summary: &IdentitySummary,
     struct_schemas: &HashMap<String, crate::cps::StructSchema>,
     mlir_types: &HashMap<String, String>,
     constructed_structs: &HashSet<String>,
@@ -784,7 +952,7 @@ pub fn affine_struct_vars(
     // narrower half: a real call's own *resumption* parameter (`Fix{defs:
     // [def with one param, carried_types: None], body: App{Label(callee),
     // ..}}` — the exact shape `alias_analysis::analyze_identity`'s own
-    // `collect_identity_facts` rule 2 already recognizes) is never itself a
+    // `tail_returns_var` already recognizes) is never itself a
     // `PrimOp::Struct` site, so `collect_affine_candidates` above never
     // considers it — yet `refcount::insert_refcounting` releases it
     // *directly*, by this exact `CVar`, whenever the call's result isn't
@@ -847,6 +1015,7 @@ pub fn affine_struct_vars(
                 &f.def.body,
                 &known_functions,
                 &fn_return_affine,
+                identity_summary,
                 &mut affine,
             );
         }
@@ -1076,33 +1245,65 @@ fn collect_affine_resumption_params(
     expr: &CExpr,
     known_functions: &HashSet<&str>,
     fn_return_affine: &HashMap<&str, bool>,
+    identity_summary: &IdentitySummary,
     affine: &mut HashSet<CVar>,
 ) -> bool {
     match expr {
-        CExpr::LetPrim { cont, .. } => {
-            collect_affine_resumption_params(cont, known_functions, fn_return_affine, affine)
-        }
+        CExpr::LetPrim { cont, .. } => collect_affine_resumption_params(
+            cont, known_functions, fn_return_affine, identity_summary, affine,
+        ),
         CExpr::App { .. } => false,
         CExpr::If {
             then_branch,
             else_branch,
             ..
         } => {
-            let a = collect_affine_resumption_params(then_branch, known_functions, fn_return_affine, affine);
-            let b = collect_affine_resumption_params(else_branch, known_functions, fn_return_affine, affine);
+            let a = collect_affine_resumption_params(
+                then_branch, known_functions, fn_return_affine, identity_summary, affine,
+            );
+            let b = collect_affine_resumption_params(
+                else_branch, known_functions, fn_return_affine, identity_summary, affine,
+            );
             a || b
         }
         CExpr::Fix { defs, body } => {
             let mut changed = false;
             if let ([def], CExpr::App {
                 func: CVal::Label(callee),
-                ..
+                args: call_args,
             }) = (defs.as_slice(), body.as_ref())
             {
                 if def.carried_types.is_none() && known_functions.contains(callee.as_str()) {
                     if let [p] = def.params.as_slice() {
+                        // Two, independent reasons this call's own
+                        // resumption parameter can denote an already-
+                        // affine allocation under a new name:
+                        let callee_constructs_and_returns_affine =
+                            fn_return_affine.get(callee.as_str()).copied().unwrap_or(false);
+                        // `Display::display<Complex<T>>`'s own shape,
+                        // `doc/backlog.md`'s "examples/complex.cleave --
+                        // run" entry has the full story: `callee` never
+                        // constructs anything of its own at all -- it just
+                        // hands back one of its *own* parameters unchanged
+                        // (proven by `analyze_identity`, generalized to
+                        // trace through however many local join points it
+                        // takes to get there). If the caller's own
+                        // argument at that exact position is *itself*
+                        // already known-affine, the resumption denotes
+                        // that same allocation, not a fresh one --
+                        // `fn_return_affine` alone can never see this,
+                        // since it only asks "is the literal returned
+                        // `CVar` a `PrimOp::Struct` site in `affine`",
+                        // never "does it trace back to a *caller-supplied*
+                        // one through an identity-shaped parameter".
+                        let callee_forwards_an_affine_argument = call_args.iter().enumerate().any(
+                            |(j, a)| {
+                                matches!(a, CVal::Var(v) if affine.contains(v))
+                                    && identity_summary.returns_unchanged(callee, j) == Some(true)
+                            },
+                        );
                         if !affine.contains(p)
-                            && fn_return_affine.get(callee.as_str()).copied().unwrap_or(false)
+                            && (callee_constructs_and_returns_affine || callee_forwards_an_affine_argument)
                         {
                             affine.insert(*p);
                             changed = true;
@@ -1111,10 +1312,13 @@ fn collect_affine_resumption_params(
                 }
             }
             for d in defs {
-                changed |=
-                    collect_affine_resumption_params(&d.body, known_functions, fn_return_affine, affine);
+                changed |= collect_affine_resumption_params(
+                    &d.body, known_functions, fn_return_affine, identity_summary, affine,
+                );
             }
-            changed |= collect_affine_resumption_params(body, known_functions, fn_return_affine, affine);
+            changed |= collect_affine_resumption_params(
+                body, known_functions, fn_return_affine, identity_summary, affine,
+            );
             changed
         }
     }

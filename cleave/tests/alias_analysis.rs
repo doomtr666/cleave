@@ -14,7 +14,7 @@
 //! refcount.rs`'s own regression tests for the sibling `identity_param_
 //! positions` fix had to route around the same way).
 
-use cleave::alias_analysis::analyze;
+use cleave::alias_analysis::{analyze, analyze_identity};
 use cleave::driver::compile;
 use cleave::egraph::optimize_program;
 use cleave::pipeline::check_type_errors;
@@ -84,6 +84,87 @@ fn a_parameter_embedded_twice_in_the_same_construction_is_aliased() {
         summary.is_aliased("duplicate", 0),
         "`duplicate` embeds `p` into two fields of the same fresh `Pair` -- \
          its own parameter must be marked aliased"
+    );
+}
+
+/// Rule 4b, the module's own doc comment has the full reasoning: a
+/// parameter embedded once into an *array* literal, and never referenced
+/// again *by that same name*, must still be marked aliased -- unlike a
+/// `Struct`'s own named fields, a later `Load` off the array can read any
+/// originally-embedded element back out at a genuinely runtime index, so
+/// rule 2's occurs-check (only ever looking for the original name) is
+/// structurally blind to this. This is the exact, real gap behind
+/// `examples/convex_hull.cleave --run`'s own non-deterministic use-after-
+/// free (`doc/backlog.md`'s own entry has the full failure signature): each
+/// of 8 fresh `Point`s was embedded once into a `[Point; 8]` array literal
+/// and never referenced again by name, so the pre-fix analysis wrongly
+/// classified every one of them as pool-eligible even though `points
+/// [current]` (a later, runtime-indexed `Load`) is pushed into a
+/// `DynArray<Point>` that clearly outlives the pool block backing it.
+#[test]
+fn a_parameter_embedded_once_into_an_array_literal_is_aliased_even_though_its_own_name_is_never_referenced_again() {
+    let src = "
+        struct Boxed { v: i32, tag: [i32; 1] }
+        fn wrap(a: Boxed) -> [Boxed; 1] { [a] }
+        extern fn opaque_array_sink(arr: [Boxed; 1]) -> i32;
+        fn main() -> i32 {
+            let a = Boxed(v: 1, tag: [0]);
+            opaque_array_sink(wrap(a))
+        }
+        ";
+    let program = optimized_cps(src);
+    let summary = analyze(&program);
+    assert!(
+        summary.is_aliased("wrap", 0),
+        "`wrap` embeds `a` into a `[Boxed; 1]` array literal and never \
+         references it again by name -- its own parameter must still be \
+         marked aliased, since a later `Load` off that array could read it \
+         back out at a runtime index this analysis can't trace"
+    );
+}
+
+/// `analyze_identity`'s own generalization -- see its doc comment for the
+/// full motivation. A parameter threaded through an `if`/`else` where
+/// *each* branch makes a real call before converging on a shared local
+/// join point, only returning the parameter unchanged *after* that join,
+/// must still be proven identity-shaped -- the exact shape `examples/
+/// complex.cleave --run`'s own real, deterministic segfault traced back to
+/// (`doc/backlog.md`'s own entry has the full story): neither the old rule
+/// 1 (only a *literal* direct return) nor the old rule 2 (only a *single*
+/// real-call resumption, never recursing further) could see through a
+/// plain local join point at all.
+#[test]
+fn a_parameter_threaded_through_an_if_else_that_converges_via_a_join_before_returning_is_identity_shaped() {
+    let src = "
+        struct Acc { v: i32 }
+        extern fn opaque_sink(x: i32) -> i32;
+        fn touch1(a: Acc) -> i32 { a.v }
+        fn touch2(a: Acc) -> i32 { a.v + 1 }
+        fn thread_through(cond: bool, acc: Acc) -> Acc {
+            if cond {
+                opaque_sink(touch1(acc));
+                acc
+            } else {
+                opaque_sink(touch2(acc));
+                acc
+            }
+        }
+        fn main() -> i32 {
+            let a = Acc(v: 1);
+            let a2 = thread_through(true, a);
+            opaque_sink(a2.v)
+        }
+        ";
+    let program = optimized_cps(src);
+    let identity = analyze_identity(&program);
+    assert_eq!(
+        identity.returns_unchanged("thread_through", 1),
+        Some(true),
+        "`thread_through`'s own `acc` parameter is threaded through an if/else \
+         where each branch makes a real call before converging on a shared \
+         join point, then returns `acc` unchanged -- this must be proven \
+         identity-shaped despite never directly returning `acc` and never \
+         being a single-hop resumption forward"
     );
 }
 
@@ -408,7 +489,7 @@ mod value_level {
 /// (never aliased, no cascade-worthy field) required together.
 mod affine_eligibility {
     use super::*;
-    use cleave::alias_analysis::{affine_struct_vars, analyze};
+    use cleave::alias_analysis::{affine_struct_vars, analyze, analyze_identity};
     use cleave::cps::collect_struct_schemas;
     use cleave::refcount::{
         collect_constructed_struct_names, collect_extern_boundary_struct_names,
@@ -418,6 +499,7 @@ mod affine_eligibility {
     fn affine_vars(src: &str) -> (cleave::cps::CpsProgram, std::collections::HashSet<cleave::cps::CVar>) {
         let program = optimized_cps(src);
         let summary = analyze(&program);
+        let identity_summary = analyze_identity(&program);
         let (compiled, _) = cleave::driver::compile(vec![("t.cleave".to_string(), src.to_string())], &[]);
         let ast_program = compiled.unwrap();
         let struct_schemas = collect_struct_schemas(&ast_program);
@@ -429,6 +511,7 @@ mod affine_eligibility {
         let affine = affine_struct_vars(
             &program,
             &summary,
+            &identity_summary,
             &struct_schemas,
             &mlir_types,
             &constructed,
@@ -642,6 +725,81 @@ mod affine_eligibility {
         );
     }
 
+    /// The resumption parameter of the first call to `callee_name` found in
+    /// `f_name`'s own body -- the `CVar` a real call's own result is bound
+    /// to (`let a2 = wrap(a);`'s own `a2`), distinct from any `PrimOp::
+    /// Struct` site `nth_struct_var` finds.
+    fn resumption_var_of_call(
+        program: &cleave::cps::CpsProgram,
+        f_name: &str,
+        callee_name: &str,
+    ) -> cleave::cps::CVar {
+        fn walk(expr: &cleave::cps::CExpr, callee_name: &str) -> Option<cleave::cps::CVar> {
+            use cleave::cps::{CExpr, CVal};
+            match expr {
+                CExpr::LetPrim { cont, .. } => walk(cont, callee_name),
+                CExpr::App { .. } => None,
+                CExpr::If { then_branch, else_branch, .. } => {
+                    walk(then_branch, callee_name).or_else(|| walk(else_branch, callee_name))
+                }
+                CExpr::Fix { defs, body } => {
+                    if let ([def], CExpr::App { func: CVal::Label(callee), .. }) =
+                        (defs.as_slice(), body.as_ref())
+                    {
+                        if callee == callee_name {
+                            if let [p] = def.params.as_slice() {
+                                return Some(*p);
+                            }
+                        }
+                    }
+                    defs.iter()
+                        .find_map(|d| walk(&d.body, callee_name))
+                        .or_else(|| walk(body, callee_name))
+                }
+            }
+        }
+        let f = program.funcs.iter().find(|f| f.def.name == f_name).unwrap();
+        walk(&f.def.body, callee_name)
+            .unwrap_or_else(|| panic!("no call to {callee_name} found in {f_name}"))
+    }
+
+    /// The identity-based propagation rule, added alongside `analyze_
+    /// identity`'s own join-point generalization (`doc/backlog.md`'s
+    /// "examples/complex.cleave --run" entry has the full story):
+    /// `Display::display<Complex<T>>`'s real shape is a function that
+    /// constructs *nothing* of its own, just hands one of its own
+    /// parameters straight back (through an if/else join, proven by
+    /// `analyze_identity`) -- if the caller's own argument at that position
+    /// is *already* affine, the call's own resumption denotes that *same*
+    /// allocation, not a fresh one, and must be affine too, or its release
+    /// disagrees with whatever allocator actually backed it (`cleave_
+    /// release` on a `cleave_alloc_pool`-only pointer -- a real, confirmed
+    /// type-confused free, not hypothetical).
+    #[test]
+    fn a_resumption_forwarding_an_already_affine_argument_through_an_identity_shaped_callee_is_affine_too() {
+        let src = "
+            struct Acc { v: i32 }
+            fn wrap(a: Acc) -> Acc { a }
+            extern fn opaque_sink(x: i32) -> i32;
+            fn main() -> i32 {
+                let a = Acc(v: 1);
+                let a2 = wrap(a);
+                opaque_sink(a2.v)
+            }
+            ";
+        let (program, affine) = affine_vars(src);
+        let a = nth_struct_var(&program, "main", 0);
+        let a2 = resumption_var_of_call(&program, "main", "wrap");
+        assert!(affine.contains(&a), "`a` is never aliased -- must be affine-eligible on its own");
+        assert!(
+            affine.contains(&a2),
+            "`wrap` is identity-shaped (hands `a` straight back) and its \
+             caller's own argument `a` is already affine -- `a2`, the \
+             resumption receiving `wrap`'s result, denotes that exact same \
+             allocation and must be affine too"
+        );
+    }
+
     /// The `i`-th parameter of the first loop/`if`-join `Fix`-def found in
     /// `f_name`'s own body (`def.carried_types.is_some()`) -- the loop-
     /// carried `CVar` `refcount::insert_refcounting` actually targets with
@@ -721,7 +879,7 @@ mod affine_eligibility {
 /// wrongly counted as "`a` occurs again", making it look aliased.
 #[test]
 fn affine_eligibility_gives_the_same_answer_before_and_after_insert_refcounting() {
-    use cleave::alias_analysis::{affine_struct_vars, analyze};
+    use cleave::alias_analysis::{affine_struct_vars, analyze, analyze_identity};
     use cleave::cps::collect_struct_schemas;
     use cleave::refcount::{
         collect_constructed_struct_names, collect_extern_boundary_struct_names,
@@ -778,9 +936,11 @@ fn affine_eligibility_gives_the_same_answer_before_and_after_insert_refcounting(
     }
     let a = first_struct_var(&pre_refcounting, "main");
 
+    let identity_summary_before = analyze_identity(&pre_refcounting);
     let affine_before = affine_struct_vars(
         &pre_refcounting,
         &summary,
+        &identity_summary_before,
         &struct_schemas,
         &mlir_types,
         &constructed,
@@ -791,9 +951,11 @@ fn affine_eligibility_gives_the_same_answer_before_and_after_insert_refcounting(
     assert!(affine_before.contains(&a), "must be affine BEFORE insert_refcounting");
 
     let post_refcounting = insert_refcounting(pre_refcounting, &struct_schemas, &mlir_types, &escaping);
+    let identity_summary_after = analyze_identity(&post_refcounting);
     let affine_after = affine_struct_vars(
         &post_refcounting,
         &summary,
+        &identity_summary_after,
         &struct_schemas,
         &mlir_types,
         &constructed,

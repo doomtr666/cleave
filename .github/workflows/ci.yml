@@ -75,5 +75,19 @@ jobs:
       - name: cargo build
         run: cargo build --release
 
+      # `RUST_MIN_STACK` -- `cargo test`'s own worker threads get an
+      # ordinary, small default stack, regardless of `--release` --
+      # confirmed directly to matter for real: `dps_rewrite.rs::matmul_
+      # reduction_is_correct_across_more_than_one_vector_width` (deep
+      # e-graph/CPS recursion, the same class of depth `cleave-build`'s own
+      # dedicated 1GB build thread and `main.rs`'s own 1GB main-thread
+      # stack already exist to give the *compiler* itself, `cleave-build/
+      # src/lib.rs`'s own doc comment) overflows the default stack under
+      # `cargo test` specifically, on both a local debug build and here in
+      # CI -- this is the same fix already documented for that case,
+      # applied where `cargo test` itself runs rather than left to each
+      # developer's own shell.
       - name: cargo test
         run: cargo test --release --no-fail-fast
+        env:
+          RUST_MIN_STACK: "67108864"

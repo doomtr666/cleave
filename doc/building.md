@@ -106,9 +106,20 @@ point this fork stops being needed at all; not there yet.
 Ordinary Cargo from here:
 
 ```sh
-cargo build --release
-cargo test --release
+RUST_MIN_STACK=67108864 cargo build --release
+RUST_MIN_STACK=67108864 cargo test --release
 ```
+
+`RUST_MIN_STACK` — not optional, confirmed directly, not a defensive
+habit: `cargo test`'s own worker threads get an ordinary, small default
+stack regardless of `--release`, and at least one real test (`dps_rewrite
+.rs::matmul_reduction_is_correct_across_more_than_one_vector_width` —
+deep e-graph/CPS recursion, the same class of depth `cleave-build`'s own
+dedicated 1GB build thread and `main.rs`'s own 1GB main-thread stack
+already exist to give the compiler itself) overflows it without this set —
+on a local debug build and in CI's own `--release` run alike. `.github/
+workflows/ci.yml` sets this on its own `cargo test` step already; nothing
+gives you the same thing automatically outside CI, set it yourself.
 
 `cargo build --workspace`/`cargo test --workspace` also walks
 `examples/digits-interop`/`examples/mnist-interop` — real network access

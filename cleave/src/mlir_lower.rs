@@ -445,9 +445,11 @@ pub fn lower_program<'c>(
     let (affine_structs, field_affine): (HashSet<CVar>, HashMap<(String, usize), bool>) =
         if crate::options::current().affine_structs {
             let summary = crate::alias_analysis::analyze(program);
+            let identity_summary = crate::alias_analysis::analyze_identity(program);
             let affine_structs = crate::alias_analysis::affine_struct_vars(
                 program,
                 &summary,
+                &identity_summary,
                 &struct_schemas,
                 mlir_types,
                 &constructed_structs,
