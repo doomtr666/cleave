@@ -16,66 +16,54 @@ on:
 jobs:
   test:
     runs-on: windows-latest
-    # A cold cache means a real, full LLVM+clang+MLIR+openmp build from
-    # source (`ci/llvm-cmake-flags.txt` -- `clang` included so openmp's own
-    # in-tree test-target wiring has a real `clang` target to depend on,
-    # avoiding any LLVM source patch -- see that file's own doc comment)
-    # -- genuinely unmeasured on a GitHub-hosted Windows runner as of
-    # writing (this project's own dev toolchain was only ever built/
-    # rebuilt incrementally, and never included `clang` at all). 350, not
-    # the hard 360-minute (6h) ceiling, to leave a little room for the job
-    # to actually report failure cleanly rather than being killed mid-step.
-    timeout-minutes: 350
+    # Used to be 350 (a from-source LLVM+clang+MLIR+openmp build's own real
+    # budget, `doc/backlog.md`'s "cleave-llvm-redist" entry) -- now just
+    # downloading a prebuilt archive plus an ordinary `cargo build`/`test`,
+    # a different order of magnitude entirely. Not yet measured on a cold
+    # cache under this new shape; generous rather than exact until a real
+    # run gives a number to tighten it against.
+    timeout-minutes: 60
     steps:
       - name: Checkout cleave
         uses: actions/checkout@v4
 
-      - name: Cache LLVM/clang/MLIR/openmp toolchain
-        id: llvm-cache
+      - name: Cache prebuilt cleave toolchain
+        id: toolchain-cache
         uses: actions/cache@v4
         with:
           path: C:\llvm-mlir-22
-          # `llvmorg-22.1.0` is the pinned LLVM tag itself (see the build
-          # step below) -- included directly in the key (not just via
-          # hashFiles) so bumping the tag also busts the cache, without
-          # needing the tag repeated in a third place.
-          key: llvm-mlir-22-llvmorg-22.1.0-${{ hashFiles('ci/llvm-cmake-flags.txt') }}
+          # The release tag itself, not just its hash -- included directly
+          # so bumping `ci/toolchain-version.txt` always busts the cache,
+          # the same reasoning the old from-source cache key used for
+          # `ci/llvm-cmake-flags.txt`.
+          key: cleave-toolchain-${{ hashFiles('ci/toolchain-version.txt') }}
 
       # Needed unconditionally, cache hit or not -- `cargo build` itself
-      # needs `link.exe` on an `-msvc` target regardless of whether LLVM was
-      # just built or restored from cache.
+      # needs `link.exe` on an `-msvc` target regardless of where the
+      # toolchain came from this run.
       - name: Set up MSVC dev environment
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Set up Ninja
-        if: steps.llvm-cache.outputs.cache-hit != 'true'
-        uses: seanmiddleditch/gha-setup-ninja@v4
-
-      - name: Build LLVM/clang/MLIR/openmp from source (cache miss only)
-        if: steps.llvm-cache.outputs.cache-hit != 'true'
+      # `doc/backlog.md`'s "cleave-llvm-redist" entry -- a prebuilt release
+      # of the exact same toolchain `ci/llvm-cmake-flags.txt`/`doc/
+      # building.md`'s from-source path builds, published by a separate
+      # repo's own CI so this one never pays that ~4-5h cost itself again.
+      # Same script a fresh dev machine runs (`scripts/setup-toolchain.ps1`
+      # `-CacheDir` -- `-ExistingPrefix` deliberately not used here, this is
+      # exactly the "nothing cached yet" case it exists for) -- one
+      # mechanism, not a CI-specific reimplementation of it.
+      - name: Download prebuilt LLVM/MLIR/openmp toolchain (cache miss only)
+        if: steps.toolchain-cache.outputs.cache-hit != 'true'
         shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $llvmSrc = Join-Path $env:RUNNER_TEMP "llvm-project"
-          git clone --branch llvmorg-22.1.0 --depth 1 https://github.com/llvm/llvm-project.git $llvmSrc
+        run: .\scripts\setup-toolchain.ps1 -CacheDir C:\llvm-mlir-22
 
-          $flags = Get-Content "${{ github.workspace }}\ci\llvm-cmake-flags.txt" |
-            Where-Object { $_.Trim() -and -not $_.Trim().StartsWith('#') } |
-            ForEach-Object { "-D$($_.Trim())" }
-
-          cmake -S "$llvmSrc\llvm" -B "$llvmSrc\build" -G Ninja `
-            @flags `
-            -DCMAKE_INSTALL_PREFIX=C:/llvm-mlir-22
-          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
-
-          cmake --build "$llvmSrc\build" --target install
-          if ($LASTEXITCODE -ne 0) { throw "cmake --build (ninja install) failed" }
-
-      - name: Point mlir-sys at the toolchain
+      # Cache hit: the archive was never re-downloaded, so `.cargo/
+      # config.toml` (gitignored, `mlir-sys`/`tblgen-rs`'s own env vars)
+      # was never (re)generated either -- still needed every run.
+      - name: Point cargo at the toolchain
+        if: steps.toolchain-cache.outputs.cache-hit == 'true'
         shell: pwsh
-        run: |
-          Add-Content $env:GITHUB_ENV "MLIR_SYS_220_PREFIX=C:\llvm-mlir-22"
-          Add-Content $env:GITHUB_ENV "TABLEGEN_220_PREFIX=C:\llvm-mlir-22"
+        run: .\scripts\setup-toolchain.ps1 -ExistingPrefix C:\llvm-mlir-22
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

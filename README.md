@@ -21,17 +21,23 @@ dialect) — deliberately not a CUDA-only path.
 
 ## Building
 
-Needs a real LLVM 22 + MLIR + openmp toolchain built from source, `cargo`
-told where it is, and `mlir-sys` resolved to this project's own fork (the
-unpatched crates.io release doesn't link on Windows/MSVC at all) — see
-**[`doc/building.md`](doc/building.md)** for the full procedure, the exact
-CMake configuration, and why the fork exists. Short version, once the
-toolchain's built and `MLIR_SYS_220_PREFIX`/`TABLEGEN_220_PREFIX` are set:
+Needs a real LLVM 22 + MLIR + openmp toolchain, `cargo` told where it is,
+and `mlir-sys` resolved to this project's own fork (the unpatched
+crates.io release doesn't link on Windows/MSVC at all) — see
+**[`doc/building.md`](doc/building.md)** for the full procedure and why the
+fork exists. Short version:
 
-```sh
+```powershell
+.\scripts\setup-toolchain.ps1
 cargo build --release
 cargo test --release
 ```
+
+The script downloads the prebuilt toolchain
+[`cleave-llvm-redist`](https://github.com/doomtr666/cleave-llvm-redist)
+publishes and points `cargo` at it automatically — no manual env vars, no
+building LLVM from source (unless you want to; `doc/building.md` covers
+that path too).
 
 `cargo build --workspace`/`cargo test --workspace` also walks
 `examples/digits-interop`/`examples/mnist-interop` — real network access

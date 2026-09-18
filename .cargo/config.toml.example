@@ -1,0 +1,27 @@
+# `MLIR_SYS_220_PREFIX`/`TABLEGEN_220_PREFIX` -- `mlir-sys`'s own build
+# script (plus `tblgen-rs`'s and `cleave-mlir-shim`'s) need these pointing
+# at a real, installed LLVM 22 + MLIR (+ openmp, for this project's own
+# OpenMP parallelization stage, `cleave/src/pipeline.rs`) toolchain.
+#
+# Run `scripts/setup-toolchain.ps1` from the repo root instead of setting
+# these by hand -- it downloads/caches the prebuilt toolchain
+# `cleave-llvm-redist` publishes (`doc/building.md`'s own "fast path") and
+# writes the *real* `.cargo/config.toml` (gitignored, machine-specific --
+# this file is only the tracked template/explanation) with the right path
+# automatically. Already have your own LLVM/MLIR build (`doc/building.md`'s
+# from-source fallback, or any other install)? `scripts/setup-toolchain.ps1
+# -ExistingPrefix C:\your\install` points at it directly, no download.
+#
+# This file itself used to hardcode a machine-specific absolute path
+# (`I:/Dev/llvm-mlir-22`), which broke on every other machine, CI included,
+# the moment anyone else tried to build this repo -- that's exactly what
+# moving the real values into a gitignored, generated file now avoids. If
+# you'd rather set these some other way (a shell profile, a CI workflow's
+# own env step) instead of running the script, that still works fine --
+# these are the two variables that matter, `220` is the fixed "LLVM major
+# version 22, no minor" naming convention `mlir-sys`/`tblgen-rs` use, not
+# configurable to a different number:
+#
+# [env]
+# MLIR_SYS_220_PREFIX = "C:/path/to/llvm-mlir-22"
+# TABLEGEN_220_PREFIX = "C:/path/to/llvm-mlir-22"
