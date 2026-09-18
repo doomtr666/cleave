@@ -23,3 +23,8 @@ melior = "0.27"
 # in (see workspace `Cargo.toml`), so there is only ever one real copy.
 mlir-sys = "220"
 cleave-rt = { path = "../cleave-rt" }
+# Real `--target-cpu`/`--target-features` control over both the JIT (`--run`)
+# and object-emission (`--emit-object`/`--emit-exe`/`cleave-build`) paths --
+# `doc/backlog.md`'s own "the first real cleave shim function" entry has the
+# full story of why `melior`/`mlir-sys` alone can't do this.
+cleave-mlir-shim = { path = "../cleave-mlir-shim" }

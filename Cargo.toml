@@ -1,5 +1,5 @@
 [workspace]
-members = ["cleave", "cleave-rt", "cleave-build", "examples/rust-interop-demo", "examples/digits-interop", "examples/mnist-interop"]
+members = ["cleave", "cleave-rt", "cleave-build", "cleave-mlir-shim", "examples/rust-interop-demo", "examples/digits-interop", "examples/mnist-interop"]
 # `digits-interop`'s own `build.rs` used to compile a real MLP kernel through
 # `derive()`, far too slow (many minutes) to sit in the ordinary `cargo
 # build/test --workspace` sweep -- `doc/backlog.md`'s own "digits-interop"

@@ -146,6 +146,7 @@ dependencies = [
 name = "cleave"
 version = "0.1.0"
 dependencies = [
+ "cleave-mlir-shim",
  "cleave-rt",
  "egg",
  "melior",
@@ -160,6 +161,15 @@ name = "cleave-build"
 version = "0.1.0"
 dependencies = [
  "cleave",
+]
+
+[[package]]
+name = "cleave-mlir-shim"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "melior",
+ "mlir-sys",
 ]
 
 [[package]]

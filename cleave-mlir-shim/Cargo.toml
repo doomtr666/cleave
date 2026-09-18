@@ -1,0 +1,28 @@
+[package]
+name = "cleave-mlir-shim"
+version = "0.1.0"
+edition = "2024"
+
+# The first real cleave shim crate -- see `doc/backlog.md`'s own melior/
+# mlir-sys decision entry for the full context. Compiles one small C++ file
+# (`cpp/shim.cpp`) via `cc`/`build.rs` against the LLVM/MLIR prefix found the
+# same way `mlir-sys` itself finds it (`MLIR_SYS_220_PREFIX`) -- temporary,
+# until `cleave-llvm-redist`'s own prebuilt release replaces the local
+# from-source build entirely. Depends on `mlir-sys` directly (not `melior`)
+# since it only needs the raw C struct types (`MlirExecutionEngine`/
+# `MlirModule`/`MlirStringRef`), and to inherit `mlir-sys`'s own build.rs
+# link directives (`cargo:rustc-link-lib`/`-search` for the real `libMLIR*`
+# static libs this shim's own object file needs symbols from at final link
+# time) -- this crate's own `build.rs` only ever compiles, never links.
+
+[dependencies]
+mlir-sys = "220"
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+# Test-only -- building the probe module by hand via `melior` is far easier
+# than raw `mlir_sys` calls; this crate's own production surface still
+# depends on `mlir-sys` alone (`Cargo.toml`'s own doc comment above).
+melior = "0.27"
