@@ -999,6 +999,18 @@ pub fn affine_struct_vars(
             facts
         })
         .collect();
+    // [`carried_param_flows_to_own_backedge`]'s own local-def lookup --
+    // one map per top-level function, the same "every local `Fix`-def
+    // anywhere in this one function, keyed by its own label" shape
+    // [`analyze_identity`] already builds for the identical reason.
+    let per_fn_defs_by_name: Vec<HashMap<&str, &CFunDef>> = non_region_local
+        .iter()
+        .map(|f| {
+            let mut defs_by_name = HashMap::new();
+            collect_local_defs_by_name(&f.def.body, &mut defs_by_name);
+            defs_by_name
+        })
+        .collect();
     loop {
         let mut fn_return_affine: HashMap<&str, bool> = HashMap::new();
         for f in &non_region_local {
@@ -1019,8 +1031,14 @@ pub fn affine_struct_vars(
                 &mut affine,
             );
         }
-        for facts in &per_fn_carried_facts {
-            changed |= collect_affine_carried_params(facts, &mut affine);
+        for (facts, defs_by_name) in per_fn_carried_facts.iter().zip(&per_fn_defs_by_name) {
+            changed |= collect_affine_carried_params(
+                facts,
+                defs_by_name,
+                &known_functions,
+                identity_summary,
+                &mut affine,
+            );
         }
         // §13/§14's own extension: `refcount::insert_refcounting` sometimes
         // releases a field *read back out* of a never-mutated struct
@@ -1167,11 +1185,50 @@ fn collect_carried_param_facts(expr: &CExpr, out: &mut CarriedParamFacts) {
 
 /// Adds a loop/if-join's own carried parameter to `affine` once *every*
 /// call this program makes to its own name — the entry, and every
-/// back-edge, wherever they textually sit — passes an already-affine
-/// `CVar` at that same position. Returns whether anything new was added,
+/// back-edge, wherever they textually sit — either (a) passes an already-
+/// affine `CVar` at that same position (the original rule), or (b) is
+/// itself provably the *same allocation* as the carried parameter, traced
+/// all the way through the loop's own body via [`carried_param_flows_to_
+/// own_backedge`] (the fix below). Returns whether anything new was added,
 /// exactly like [`collect_affine_resumption_params`]'s own identical
 /// contract.
-fn collect_affine_carried_params(facts: &CarriedParamFacts, affine: &mut HashSet<CVar>) -> bool {
+///
+/// **Why (b) is needed, not just (a) — a real, confirmed gap, not a
+/// hypothetical one**: a carried value threaded each iteration through an
+/// identity-shaped real call (`b = display_and_return(cond, b);`,
+/// `Display::display<Complex<T>>`'s own real shape, `doc/backlog.md`'s
+/// "examples/complex.cleave" entry) creates a genuine mutual dependency
+/// rule (a) alone can never resolve: the back-edge argument is that call's
+/// own *resumption* parameter, which [`collect_affine_resumption_params`]
+/// can only mark affine once the carried parameter *itself* is already
+/// affine (it's the call's own argument) — but the carried parameter can
+/// only become affine, under rule (a), once that same resumption parameter
+/// already is. Neither side has any way to seed first; the fixed point
+/// converges after exactly one iteration with nothing added, even though
+/// the true answer (both affine, anchored by the entry argument from
+/// *outside* the loop) is real and sound. Confirmed directly with a
+/// dedicated probe before writing this fix: `entry affine = true`,
+/// `carried affine = false` even though the identity fact itself
+/// (`IdentitySummary::returns_unchanged`) was already correctly `true`.
+///
+/// Rule (b) sidesteps the mutual dependency entirely: if the carried
+/// parameter is *structurally* guaranteed to reach every one of its own
+/// back-edges unchanged (no need for those *specific* arguments to be
+/// independently affine at all — they denote the exact same allocation by
+/// construction), then its own affine-ness reduces to whether *any* call
+/// site (in practice, the one real anchor: the entry argument from outside
+/// the loop, itself never traced by [`carried_param_flows_to_own_
+/// backedge`] since it's a different `CVar` the loop's own body never
+/// references) is already affine — rule (a), unconditionally, for that one
+/// site.
+#[allow(clippy::too_many_arguments)]
+fn collect_affine_carried_params(
+    facts: &CarriedParamFacts,
+    defs_by_name: &HashMap<&str, &CFunDef>,
+    known_functions: &HashSet<&str>,
+    identity_summary: &IdentitySummary,
+    affine: &mut HashSet<CVar>,
+) -> bool {
     let mut changed = false;
     for (name, params) in &facts.carried_defs {
         // A def this program never actually calls (dead code, or one this
@@ -1181,20 +1238,170 @@ fn collect_affine_carried_params(facts: &CarriedParamFacts, affine: &mut HashSet
         let Some(calls) = facts.calls.get(name).filter(|c| !c.is_empty()) else {
             continue;
         };
+        let Some(def) = defs_by_name.get(name.as_str()) else {
+            continue;
+        };
         for (i, param) in params.iter().enumerate() {
             if affine.contains(param) {
                 continue;
             }
+            // Rule (a): every recorded call site (entry + every back-edge)
+            // independently passes an already-affine value.
             let every_source_affine = calls
                 .iter()
                 .all(|call_args| matches!(call_args.get(i), Some(Some(v)) if affine.contains(v)));
-            if every_source_affine {
+            // Rule (b): the carried parameter is structurally guaranteed to
+            // reach every one of its own back-edges unchanged -- those
+            // specific back-edge arguments need no independent proof at
+            // all, so a *single* already-affine call site (in practice,
+            // the one real anchor: the entry argument from outside the
+            // loop) is enough.
+            let anchored_by_any_affine_source = || {
+                carried_param_flows_to_own_backedge(
+                    &def.body, name, i, *param, defs_by_name, known_functions, identity_summary,
+                    &mut HashSet::new(),
+                ) && calls
+                    .iter()
+                    .any(|call_args| matches!(call_args.get(i), Some(Some(v)) if affine.contains(v)))
+            };
+            if every_source_affine || anchored_by_any_affine_source() {
                 affine.insert(*param);
                 changed = true;
             }
         }
     }
     changed
+}
+
+/// Whether `var`, starting from `expr` (part of `loop_name`'s own body, or
+/// a local def's body reached while tracing through one), ever flows
+/// *unchanged* all the way back into a tail-call to `loop_name` itself,
+/// with `var` as the literal argument at `position` — the loop-carried-
+/// parameter analogue of [`tail_returns_var`] (that function's own doc
+/// comment, and [`analyze_identity`]'s, have the shared motivation: local
+/// join-point hops and identity-shaped real-call hops are traced through
+/// identically here), just targeting "reaches my own back-edge unchanged"
+/// instead of "reaches `k_ret` unchanged". [`collect_affine_carried_
+/// params`]'s own doc comment has the full story on why this exists.
+///
+/// Three real cases, mirroring [`tail_returns_var`]'s exactly:
+/// 1. **Tail-calls `loop_name` itself** with `var` at `position` — proven,
+///    `true` right here.
+/// 2. **Tail-calls a local `Fix`-def** (a join point, a nested resumption)
+///    — trace through it exactly like [`tail_returns_var`] does: re-bind
+///    to whichever of its own parameters received `var`, or leave it
+///    unchanged if it's simply captured rather than passed.
+/// 3. **Tail-calls a real, whole-program function** with `var` at position
+///    `j` — unlike [`tail_returns_var`] (which defers this case to the
+///    interprocedural fixed point via an edge), `identity_summary` is
+///    already fully resolved by the time this runs (`affine_struct_vars`'s
+///    own call site computes it first) — consult it directly: if `Some
+///    (true)`, trace on through that call's own resumption (found the same
+///    way a local join point is, via `defs_by_name`), with `var` re-bound
+///    to the resumption's own single parameter. Otherwise, dead end,
+///    `false`.
+#[allow(clippy::too_many_arguments)]
+fn carried_param_flows_to_own_backedge(
+    expr: &CExpr,
+    loop_name: &str,
+    position: usize,
+    var: CVar,
+    defs_by_name: &HashMap<&str, &CFunDef>,
+    known_functions: &HashSet<&str>,
+    identity_summary: &IdentitySummary,
+    visiting: &mut HashSet<String>,
+) -> bool {
+    match expr {
+        CExpr::LetPrim { cont, .. } => carried_param_flows_to_own_backedge(
+            cont, loop_name, position, var, defs_by_name, known_functions, identity_summary, visiting,
+        ),
+        CExpr::App { func, args } => match func {
+            CVal::Label(callee) if callee == loop_name => {
+                matches!(args.get(position), Some(CVal::Var(v)) if *v == var)
+            }
+            CVal::Label(callee) if known_functions.contains(callee.as_str()) => {
+                // `var` might not be one of *this* call's own arguments at
+                // all (an unrelated computation happening in between --
+                // exactly the loop-bound check, `Ord::lt<i32>`, every
+                // `for`/`while` loop's own condition test runs before ever
+                // reaching its real body; found directly, the first
+                // version of this function returned `false` here
+                // unconditionally and never got past a single loop
+                // iteration's own bound check as a result). If so, it
+                // survives unchanged into this call's own trailing
+                // continuation once the call returns -- trace on through
+                // that, `var` unchanged, mirroring `tail_returns_var`'s own
+                // identical fix. Only when `var` *is* one of the real
+                // arguments does the callee's own identity fact apply.
+                let resumption_var = match args.iter().position(|a| matches!(a, CVal::Var(v) if *v == var)) {
+                    Some(j) if identity_summary.returns_unchanged(callee, j) == Some(true) => None,
+                    Some(_) => return false,
+                    None => Some(var),
+                };
+                args.iter().any(|a| {
+                    if let CVal::Label(cont) = a {
+                        if let Some(def) = defs_by_name.get(cont.as_str()) {
+                            let next_var = match resumption_var {
+                                Some(v) => Some(v),
+                                None => def.params.first().copied(),
+                            };
+                            if let Some(next_var) = next_var {
+                                if visiting.insert(cont.clone()) {
+                                    let result = carried_param_flows_to_own_backedge(
+                                        &def.body, loop_name, position, next_var, defs_by_name,
+                                        known_functions, identity_summary, visiting,
+                                    );
+                                    visiting.remove(cont.as_str());
+                                    return result;
+                                }
+                            }
+                        }
+                    }
+                    false
+                })
+            }
+            CVal::Label(callee) => {
+                let Some(def) = defs_by_name.get(callee.as_str()) else {
+                    return false;
+                };
+                let inner_var = match args.iter().position(|a| matches!(a, CVal::Var(v) if *v == var)) {
+                    Some(pos) => match def.params.get(pos) {
+                        Some(&p) => p,
+                        None => return false,
+                    },
+                    None => var,
+                };
+                if !visiting.insert(callee.clone()) {
+                    return false;
+                }
+                let result = carried_param_flows_to_own_backedge(
+                    &def.body, loop_name, position, inner_var, defs_by_name, known_functions,
+                    identity_summary, visiting,
+                );
+                visiting.remove(callee.as_str());
+                result
+            }
+            _ => false,
+        },
+        CExpr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            let t = carried_param_flows_to_own_backedge(
+                then_branch, loop_name, position, var, defs_by_name, known_functions, identity_summary,
+                visiting,
+            );
+            let e = carried_param_flows_to_own_backedge(
+                else_branch, loop_name, position, var, defs_by_name, known_functions, identity_summary,
+                visiting,
+            );
+            t || e
+        }
+        CExpr::Fix { body, .. } => carried_param_flows_to_own_backedge(
+            body, loop_name, position, var, defs_by_name, known_functions, identity_summary, visiting,
+        ),
+    }
 }
 
 /// Every `CVar` a tail return (`App{Var(k_ret), [v]}`, at any nesting

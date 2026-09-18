@@ -864,6 +864,56 @@ mod affine_eligibility {
              that was never written on the iterations backed by the pool"
         );
     }
+
+    /// The genuine mutual-dependency gap `collect_affine_carried_params`'s
+    /// own doc comment has the full story on: unlike the test above (`b =
+    /// bump(b)`, a fresh `PrimOp::Struct` construction each iteration), a
+    /// carried value threaded each iteration through an *identity-shaped*
+    /// real call (`Display::display<Complex<T>>`'s own real shape,
+    /// `doc/backlog.md`'s "examples/complex.cleave" entry) creates a real
+    /// deadlock the original per-call-site rule could never resolve: the
+    /// back-edge argument is that call's own resumption parameter, only
+    /// provably affine once the carried parameter itself already is -- and
+    /// vice versa. Confirmed to fail before this fix (`entry affine =
+    /// true`, `carried affine = false`, via a dedicated debug probe) even
+    /// though the underlying identity fact was already correct.
+    #[test]
+    fn a_carried_parameter_threaded_through_an_identity_shaped_real_call_each_iteration_is_affine_too() {
+        let src = "
+            struct Boxed { v: i32, tag: [i32; 1] }
+            extern fn opaque_sink(x: i32) -> i32;
+            fn touch1(a: Boxed) -> i32 { a.v }
+            fn touch2(a: Boxed) -> i32 { a.v + 1 }
+            fn thread_through(cond: bool, a: Boxed) -> Boxed {
+                if cond {
+                    opaque_sink(touch1(a));
+                    a
+                } else {
+                    opaque_sink(touch2(a));
+                    a
+                }
+            }
+            fn main() -> i32 {
+                let mut b = Boxed(v: 0, tag: [0]);
+                for i in 0..2000 {
+                    b = thread_through(i < 1000, b);
+                };
+                b.v
+            }
+            ";
+        let (program, affine) = affine_vars(src);
+        let entry = nth_struct_var(&program, "main", 0);
+        assert!(affine.contains(&entry), "the entry construction is never aliased -- must be affine-eligible");
+        let carried = nth_loop_carried_var(&program, "main", 1);
+        assert!(
+            affine.contains(&carried),
+            "the loop's own carried parameter is threaded through `thread_through` \
+             (identity-shaped at that position) every iteration -- it denotes the \
+             exact same allocation as the entry argument throughout and must be \
+             affine-eligible too, despite the mutual dependency between it and \
+             `thread_through`'s own resumption parameter"
+        );
+    }
 }
 
 /// The whole reason `occurs_in` deliberately excludes `Retain`/`Release`
