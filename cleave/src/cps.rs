@@ -2338,17 +2338,16 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                 // then resolves that variable to `N`'s own concrete *value*
                 // (`Ty::Const`), not a width -- not usable here at all
                 // (`ConstValue::Int` never carried a width tag to recover in
-                // the first place). Falls back to the same `i32`
+                // the first place). Widened back to the same `i32`
                 // `apply_defaults` itself would have chosen had the guard not
-                // deferred it: if the counter genuinely needed a *different*
-                // width, some other real use of it (a comparison/arithmetic
-                // op against an already-concrete value elsewhere in the
-                // body) would already have pinned an ordinary `Ty::Con` here
-                // directly, never going through `Ty::Const` at all.
-                let idx_ty = match &ctx.node_types[&start.id] {
-                    Ty::Const(_) => Ty::Con("i32".to_string()),
-                    other => other.clone(),
-                };
+                // deferred it (`dispatch_ty`, shared with `resolve_call`'s
+                // own identical need): if the counter genuinely needed a
+                // *different* width, some other real use of it (a
+                // comparison/arithmetic op against an already-concrete value
+                // elsewhere in the body) would already have pinned an
+                // ordinary `Ty::Con` here directly, never going through
+                // `Ty::Const` at all.
+                let idx_ty = dispatch_ty(&ctx.node_types[&start.id]);
                 let bool_ty = Ty::Con("bool".to_string());
                 let lt_unit = resolve_synthetic_binop("lt", &idx_ty, &bool_ty, ctx).to_string();
                 let add_unit = resolve_synthetic_binop("add", &idx_ty, &idx_ty, ctx).to_string();
@@ -3503,6 +3502,32 @@ fn convert_expr_list(
     go(exprs, env, ctx, Vec::new(), k)
 }
 
+/// Widens a resolved const generic's own *value* type (`Ty::Const`) to the
+/// ordinary primitive type it stands for, for algebra/operator dispatch
+/// matching only — never for the value actually flowing through the call
+/// (that's `ExprKind::Path`'s own separate `Ty::Const -> CVal` fallback
+/// just above, untouched by this). `N`, referenced as a plain body value
+/// (`N > 100`), monomorphizes to a concrete `Ty::Const(Int(200))` exactly
+/// as intended (confirmed directly via `--dump-monomorphized`) — but
+/// `call_index` is keyed by *ordinary* argument types (`Ord<i32>::gt`
+/// registered under `["i32", "i32"]`), never by a specific literal value,
+/// so a dispatch key built straight from `Ty::Const(Int(200))` can never
+/// match anything and always panics. Mirrors `mlir_lower.rs::ty_to_mlir`'s
+/// identical widening for the type-lowering side, and replaces the
+/// narrower one-off already done for a `for` loop's own start bound below
+/// (`ExprKind::For`'s `idx_ty`) — same fix, same reasoning, now shared
+/// rather than duplicated. No declared width survives in a bare
+/// `ConstValue` (see its own doc comment) — `i32`/`bool` are the same
+/// defaults this codebase already uses for an otherwise-unconstrained
+/// literal.
+fn dispatch_ty(ty: &Ty) -> Ty {
+    match ty {
+        Ty::Const(ConstValue::Int(_)) => Ty::Con("i32".to_string()),
+        Ty::Const(ConstValue::Bool(_)) => Ty::Con("bool".to_string()),
+        other => other.clone(),
+    }
+}
+
 /// See the module's own doc comment ("Resolving a call site's own target
 /// unit") for why exactly these three tiers, in this order, are each
 /// necessary and together unambiguous.
@@ -3521,9 +3546,9 @@ fn resolve_call<'a>(name: &str, call_id: NodeId, arg_ids: &[NodeId], ctx: &Ctx<'
     }
     let arg_tys: Vec<String> = arg_ids
         .iter()
-        .map(|id| ctx.node_types[id].to_string())
+        .map(|id| dispatch_ty(&ctx.node_types[id]).to_string())
         .collect();
-    let ret_ty = ctx.node_types[&call_id].to_string();
+    let ret_ty = dispatch_ty(&ctx.node_types[&call_id]).to_string();
     let key = (name.to_string(), arg_tys, ret_ty);
     match ctx.call_index.get(&key) {
         Some(unit_name) => ctx

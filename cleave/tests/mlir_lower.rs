@@ -2273,6 +2273,35 @@ fn a_const_generic_read_as_a_body_value_with_no_turbofish_actually_runs() {
     assert_eq!(run_i32(&context, src), 3);
 }
 
+/// A const generic compared against an ordinary literal via an operator
+/// (`N > 100`) inside an `if` — a third, independent way to reach a real bug
+/// neither of the two tests above exercises: monomorphization already
+/// resolves `N` to a concrete `Ty::Const` correctly (confirmed directly via
+/// `--dump-monomorphized`), but `cps.rs::resolve_call`'s own operator-
+/// dispatch key was built straight from that `Ty::Const`'s own *value*
+/// (`"200"`) instead of the *type* the registered `Ord<i32>::gt` impl is
+/// actually keyed under (`"i32"`) — `could not resolve call to \`gt\``,
+/// always, regardless of which concrete value `N` took. Fixed by
+/// `dispatch_ty`, widening a `Ty::Const` to its own ordinary primitive type
+/// for dispatch-key purposes only (mirroring `mlir_lower.rs::ty_to_mlir`'s
+/// identical widening on the type-lowering side) — the value actually
+/// flowing through the call is untouched, still exactly `N`'s own concrete
+/// value, via the pre-existing `Ty::Const -> CVal` fallback in
+/// `ExprKind::Path`. Two distinct instantiations (`200`, `5`) straddling the
+/// threshold, to prove each specialization's own branch is taken correctly,
+/// not just that the call resolves at all.
+#[test]
+fn a_const_generic_compared_via_an_operator_inside_an_if_actually_runs() {
+    let context = context();
+    let src = "
+        fn choose<const N: i32>() -> i32 {
+            if N > 100 { 1 } else { 2 }
+        }
+        fn main() -> i32 { choose::<200>() + choose::<5>() }
+    ";
+    assert_eq!(run_i32(&context, src), 3);
+}
+
 /// `doc/backlog.md`'s own "Complex literals" item — `2i + 4` used to be
 /// unrepresentable (`ImaginaryLit` always inferred to a placeholder). Fixed
 /// via literal-shape widening, not a general numeric-conversion mechanism
