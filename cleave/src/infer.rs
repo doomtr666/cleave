@@ -295,6 +295,21 @@ pub struct Subst {
     /// `Ty::Const`/`Ty::Con` architectural tension" entry for the full
     /// story, including the exact reproduction that motivated this).
     const_widths: HashMap<TyVar, Ty>,
+    /// Which "sibling batch" a const generic's own value-var was minted in
+    /// -- every var `fresh_generics_mapping`/`instantiate_with_mapping`
+    /// mints together, in one call (one function/impl's own declared
+    /// generics, or one fresh per-call-site instantiation of a callee's),
+    /// shares one id. `bind`'s own doc comment on the new guard this
+    /// enables has the full story: merging two *different* const generics'
+    /// own value-vars is only ever safe when they come from *different*
+    /// batches (a caller's own const generic flowing into a callee's fresh
+    /// instantiation of its own same-named parameter) -- two vars from the
+    /// *same* batch (`N`/`M`, say, both `MatMul::matmul`'s own declared
+    /// generics) are logically distinct values that only happen to need a
+    /// common *type* (`Ring::mul<T>`'s own shared `T`), never a common
+    /// *identity* (`doc/backlog.md`'s own "Two distinct const generics of
+    /// the same function merging via an operator corrupts both" item).
+    const_group: HashMap<TyVar, TyVar>,
 }
 
 impl Subst {
@@ -400,7 +415,38 @@ impl Subst {
     /// silently overwritten by whichever happened to be on which side.
     fn bind(&mut self, v: TyVar, ty: Ty) {
         if let (Some(width), Ty::Var(v2)) = (self.const_widths.get(&v).cloned(), &ty) {
+            // Two *different* const generics of one declaration (`N`/`M`,
+            // both `MatMul::matmul`'s own, say), colliding here only
+            // because some operator needing a shared *type* (`Ring::mul<
+            // T>`'s own `T`) unified their value-vars together — never a
+            // real assertion that they hold the *same value* (`doc/
+            // backlog.md`'s own "Two distinct const generics of the same
+            // function merging via an operator corrupts both" item, real
+            // fix, not the `mlir::arith::*`-routing workaround that item's
+            // own text describes). Detected by `const_group`: every var
+            // `fresh_generics_mapping`/`instantiate_with_mapping` mints
+            // together, in one call, shares one id -- two const-tainted
+            // vars from the *same* id are siblings, never legitimately the
+            // same value; two from *different* ids are a caller's own
+            // const generic legitimately flowing into a callee's fresh
+            // instantiation of its own same-named parameter, which *does*
+            // need to merge (that's the whole point of instantiation).
+            //
+            // Both sides already separately known to be well-typed const
+            // values (each one's own width was checked against its own
+            // declared type, `Int`, when it was minted) -- unifying them
+            // for `T`'s sake needs nothing further here: neither var
+            // learns anything new from the other, so the safe move is to
+            // bind *neither* to the other, leaving both free to resolve to
+            // their own independent concrete value later via
+            // monomorphization's reverse-unification, exactly as if this
+            // operator had never touched them at all.
+            if self.const_group.get(&v2) == Some(&self.const_group[&v]) {
+                return;
+            }
             self.const_widths.entry(*v2).or_insert(width);
+            let group = self.const_group[&v];
+            self.const_group.entry(*v2).or_insert(group);
         }
         // A const generic's own value-var, checked against its own declared
         // *type* (an ordinary `Ty::Con`, e.g. `const N: i32` referenced as a
@@ -438,8 +484,9 @@ impl Subst {
         self.const_widths.get(&v).cloned()
     }
 
-    fn set_const_width(&mut self, v: TyVar, width: Ty) {
+    fn set_const_width(&mut self, v: TyVar, width: Ty, group: TyVar) {
         self.const_widths.insert(v, width);
+        self.const_group.insert(v, group);
     }
 
     /// Binds `v` to its own resolved pack elements — through the *ordinary*
@@ -2101,6 +2148,17 @@ impl<'r> Infer<'r> {
         span: Span,
     ) -> HashMap<String, Ty> {
         let mapping = self.fresh_vars_for_generics(generics);
+        // One shared sibling-batch id for every const generic this call
+        // mints -- `Subst::bind`'s own doc comment on `const_group` has the
+        // full story: this is what lets it tell "two of *this* function's
+        // own declared const generics, colliding only because an operator
+        // needed a shared type" apart from "a caller's const generic
+        // legitimately flowing into a fresh instantiation." A real, if
+        // unused, `TyVar` -- minted the same way any other fresh var is,
+        // just never itself bound to anything, purely as a unique tag.
+        let Ty::Var(group) = self.vars.fresh() else {
+            unreachable!("TyVarGen::fresh always returns Ty::Var")
+        };
         for g in generics {
             match g {
                 GenericParam::Type { name, bounds, .. } => {
@@ -2116,7 +2174,7 @@ impl<'r> Infer<'r> {
                 GenericParam::Const { name, ty, .. } => {
                     let width = self.ty_from_ast_mapped(ty, &mapping);
                     if let Ty::Var(v) = &mapping[name] {
-                        self.subst.set_const_width(*v, width);
+                        self.subst.set_const_width(*v, width, group);
                     }
                 }
             }
@@ -2742,10 +2800,22 @@ impl<'r> Infer<'r> {
         }
         self.seed_const_generics(&f.generics, generics, &mut env);
         let result = self.infer_block(&env, body)?;
-        if let Some(ret) = &f.ret {
+        // The declared return type, when there is one, is what callers see --
+        // not the body's own inferred type. They only differ when the body's
+        // type is a const generic's value-var (`fn probe<const N: i32>() ->
+        // i32 { N * 10 }`): `Subst::bind` deliberately never binds such a var
+        // to a plain `Ty::Con` (its identity must survive to be quantified),
+        // so `unify` above succeeds while `result` stays `N`'s own var --
+        // exposing `N` itself as the function's return type, which then
+        // instantiates to `Const(3)` at `probe::<3>()` and `Const(5)` at
+        // `probe::<5>()`, two "types" that never unify with each other.
+        let result = if let Some(ret) = &f.ret {
             let declared = self.ty_from_ast_mapped(ret, generics);
             self.unify_at(ret.span, &declared, &result)?;
-        }
+            declared
+        } else {
+            result
+        };
         // Tie the placeholder promised to (possibly recursive) callers back
         // to what the body actually computed — not automatic: if a
         // recursive call's result is simply discarded (`fn f(x) { f(x-1); 0
@@ -3646,9 +3716,20 @@ impl<'r> Infer<'r> {
         // variadic (`const Dims...: i32`, exactly the case above), so the
         // fresh replacement may be a `Ty::Pack` now, not just `Ty::Var` —
         // both carry the same underlying fresh id, extracted uniformly.
+        //
+        // One shared sibling-batch id for every const generic *this one
+        // instantiation* re-keys -- `fresh_generics_mapping`'s own doc
+        // comment on its identical `group` has the full story. A fresh id
+        // *every* time, deliberately never the scheme's own original one:
+        // each instantiation is its own independent batch (this call
+        // site's own `N`/`M`/`K`, say), unrelated to any other call site's
+        // own fresh copies of the identical declared generics.
+        let Ty::Var(group) = self.vars.fresh() else {
+            unreachable!("TyVarGen::fresh always returns Ty::Var")
+        };
         for (v, width) in &scheme.const_widths {
             if let Some(Ty::Var(fresh) | Ty::Pack(fresh)) = mapping.get(v) {
-                self.subst.set_const_width(*fresh, width.clone());
+                self.subst.set_const_width(*fresh, width.clone(), group);
             }
         }
         (substitute(&scheme.ty, &mapping), mapping)

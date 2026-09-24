@@ -3411,6 +3411,65 @@ fn derive_through_dense_forward_computes_the_right_gradient_body() {
     assert_eq!(run_i32(&context, src), 1);
 }
 
+/// Two const generics declared by the *same* function, combined through an
+/// operator (`N * M`), must each keep their own real value -- `Ring::mul<T>`
+/// needs one shared `T` for both operands, and that used to merge the two
+/// const-generic type variables (`infer.rs`'s own `Subst::bind`), corrupting
+/// both (`probe::<...> expects 1 argument(s), found 2`, or `type mismatch:
+/// expected `3`, found `7``). Fixed by tagging every batch of const-generic
+/// variables minted together with a group (`Subst::const_group`): siblings
+/// of one declaration that collide only because of an operator stay
+/// independent, while a legitimate cross-scope merge (a caller's own const
+/// generic flowing into a callee's fresh instantiation) still propagates.
+/// Each generic is also read by value outside the product, so a merge in
+/// either direction is visible.
+#[test]
+fn two_const_generics_of_one_function_keep_their_own_values_through_an_operator() {
+    let context = context();
+    for (n, m) in [(3, 7), (5, 2)] {
+        let src = format!(
+            "
+            fn probe<const N: i32, const M: i32>() -> i32 {{
+                let p: i32 = N * M;
+                p * 1000 + N * 10 + M
+            }}
+            fn main() -> i32 {{
+                probe::<{n}, {m}>()
+            }}
+            "
+        );
+        assert_eq!(run_i32(&context, &src), n * m * 1000 + n * 10 + m, "N={n}, M={m}");
+    }
+}
+
+/// A function whose body is arithmetic on its own const generic
+/// (`N * 10`) has to expose its *declared* return type (`i32`) to callers,
+/// not `N`'s own value-var: `Subst::bind` deliberately never binds such a var
+/// to a plain `Ty::Con` (its identity must survive to be quantified), so
+/// `infer_fn_raw`'s own unify against the declared type succeeded while the
+/// body's inferred type stayed `N` itself -- which instantiated to `Const(3)`
+/// at `probe::<3>()` and `Const(5)` at `probe::<5>()`, two "types" that never
+/// unify once a sum needs both to be the same `T` (`type mismatch: expected
+/// `3`, found `5``). Reproduced at the previous commit, independent of
+/// `Subst::const_group` (one const generic is enough).
+#[test]
+fn two_instantiations_of_a_const_generic_function_can_be_summed_in_one_expression() {
+    let context = context();
+    let one_generic = "
+        fn probe<const N: i32>() -> i32 { N * 10 }
+        fn main() -> i32 { probe::<3>() + probe::<5>() }
+    ";
+    assert_eq!(run_i32(&context, one_generic), 30 + 50);
+    let two_generics = "
+        fn probe<const N: i32, const M: i32>() -> i32 {
+            let p: i32 = N * M;
+            p * 1000 + N * 10 + M
+        }
+        fn main() -> i32 { probe::<3, 7>() + probe::<5, 2>() }
+    ";
+    assert_eq!(run_i32(&context, two_generics), 21037 + 10052);
+}
+
 /// The `grad()` counterpart of `derive_through_dense_forward_computes_the_
 /// right_gradient` just above -- the same hand-derived expected values and
 /// numeric tolerance, `grad()` instead of `derive()`, `x` a direct `Tensor`

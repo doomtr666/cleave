@@ -853,11 +853,13 @@ fn a_const_generic_used_as_a_for_loop_bound_is_checked_against_its_real_width_no
 /// declared return type permanently collapsed that var to `Con("i32")`,
 /// destroying its own identity before `rep`'s scheme was ever built, so
 /// `rep` was reported with *zero* declared generics -- turbofish had
-/// nothing to match `::<3>` against. `f`'s own resolved type comes out as
-/// `Ty::Const(ConstValue::Int(3))`, not a bare `Ty::Con("i32")` -- once `N`
-/// is correctly pinned to `3` by the turbofish call, that's genuinely what
-/// `rep::<3>(5)`'s own call-site type *is* (mirrors `--dump-inference-pass`
-/// on this exact source, confirmed directly during development).
+/// nothing to match `::<3>` against. `f`'s own resolved type is `Ty::Con("i32")`, `rep`'s
+/// own *declared* return type -- once `infer_fn_raw` stopped exposing the
+/// body's inferred type instead (`N`'s own value-var, which `Subst::bind`
+/// deliberately never binds to a plain `Ty::Con`), `rep::<3>(5)` no longer
+/// comes out as `Ty::Const(ConstValue::Int(3))`, a "type" that never unified
+/// with `rep::<5>(5)`'s own `Const(5)` (`two_instantiations_of_a_const_
+/// generic_function_can_be_summed_in_one_expression`, `tests/mlir_lower.rs`).
 #[test]
 fn explicit_turbofish_on_a_const_generic_resolves_the_calls_own_type() {
     let registry = Registry::default();
@@ -871,7 +873,7 @@ fn explicit_turbofish_on_a_const_generic_resolves_the_calls_own_type() {
         "{:?}",
         result.results.get("rep")
     );
-    assert_eq!(ok_result(&result, "f"), Ty::Const(ConstValue::Int(3)));
+    assert_eq!(ok_result(&result, "f"), Ty::Con("i32".to_string()));
 }
 
 /// `doc/backlog.md`'s own "Scheme satisfiability at generalization time"
