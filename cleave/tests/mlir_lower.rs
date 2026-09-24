@@ -3470,6 +3470,204 @@ fn two_instantiations_of_a_const_generic_function_can_be_summed_in_one_expressio
     assert_eq!(run_i32(&context, two_generics), 21037 + 10052);
 }
 
+/// A user-declared, multi-target algebra (`FusedDense`, the exact shape
+/// `stdlib/nn/nn.cleave`'s own `MatMulBiasAdd` needs for a fused BLAS
+/// matmul+bias-add layer) whose impl branches on a size threshold and calls
+/// a `#[pure]`-declared `extern` in one branch. Two separate, real gaps had
+/// to be fixed together to make `derive()` reach through this at all:
+///
+/// 1. **Without `PrimOp::Extern`'s own `pure` flag** (`cps.rs`/
+///    `monomorphize.rs`, consulted by `egraph.rs::is_pure_prim_op`): every
+///    extern is conservatively impure by default, so `FusedDense::
+///    fused_dense`'s own branching body -- despite having a declared
+///    `derivative` rule matching the *call* itself -- fails `is_pure`, the
+///    condition that lets `Forward::walk` treat an algebra-dispatched call
+///    as one opaque node without ever looking inside it. `derive()` then
+///    tries to actually translate the real `if`/extern-call body directly,
+///    and fails outright: "function body is not fully representable
+///    (unsupported control flow, e.g. a loop that could not be unrolled, or
+///    a branch)".
+/// 2. **Fixed only enough to reach a *second*, independent gap** (this test
+///    reproduces both at once; `grad_through_a_fused_matmul_plus_broadcast_
+///    rule_computes_the_right_gradient` just below shows the `#[pure]` fix
+///    alone still isn't enough for the reverse-mode case).
+#[test]
+fn derive_through_a_pure_extern_branching_algebra_computes_the_right_gradient() {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(derive_through_a_pure_extern_branching_algebra_body)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+const FUSED_DENSE_WITH_PURE_EXTERN_SOURCE: &str = "
+    use nn;
+    use linalg;
+
+    algebra FusedDense<A, B, Bias, C> {
+        fn fused_dense(a: A, b: B, bias: Bias) -> C;
+        derivative fused_dense(a, b, bias): add(add(matmul(d(a), b), matmul(a, d(b))), broadcast0(d(bias)));
+        adjoint fused_dense(a, b, bias), u: (matmul_transpose_b(u, b), matmul_transpose_a(a, u), reduce0(u));
+    }
+
+    // Stands in for a BLAS wrapper (`stdlib/linalg/matrix.cleave`'s own
+    // `BlasSgemmRowMajor`) -- never actually linked/run here (this test
+    // never JIT-invokes `main`, only compiles through derivative
+    // synthesis), so an unresolved symbol is fine; only its `#[pure]`
+    // declaration matters.
+    algebra WriteResult<A> {
+        fn write_result(a: A);
+    }
+    impl<T: Float, const B: i32, const Out: i32> WriteResult<Tensor<T,B,Out>> {
+        #[pure]
+        extern(noop_write) fn write_result(a);
+    }
+
+    impl<T: Float, const B: i32, const In: i32, const Out: i32>
+        FusedDense<Tensor<T,B,In>, Tensor<T,In,Out>, Tensor<T,1,Out>, Tensor<T,B,Out>> {
+        fn fused_dense(a, b, bias) {
+            // `1_000_000`, always false for these tests' own tiny shapes
+            // (`B*In*Out = 4`) -- the `write_result` branch is never taken
+            // at runtime (its own extern symbol is deliberately never
+            // registered with the JIT engine below), only *compiled*. The
+            // bug this test reproduces is entirely at derivative-synthesis
+            // time, over the function's own full declared body (both
+            // branches) -- which branch a given call site's constant
+            // arguments would actually take at runtime is irrelevant to it.
+            let binout: i32 = B * In * Out;
+            if binout > 1000000 {
+                let r = matmul(a, b) + broadcast0(bias);
+                write_result(r);
+                r
+            } else {
+                matmul(a, b) + broadcast0(bias)
+            }
+        }
+    }
+";
+
+fn derive_through_a_pure_extern_branching_algebra_body() {
+    let context = context();
+    let src = format!(
+        r#"
+        {FUSED_DENSE_WITH_PURE_EXTERN_SOURCE}
+        fn loss(x1: f32, x2: f32, y: f32, layer: Dense<f32, 2, 2>) -> f32 {{
+            let x = Tensor::<f32, 1, 2>(data: [[x1, x2]]);
+            let h = sigmoid(fused_dense(x, layer.w, layer.b));
+            let pred = h[0, 0] + h[0, 1];
+            let err = pred - y;
+            err * err
+        }}
+        dloss_layer = derive(loss, layer);
+        fn main() -> i32 {{
+            let x1: f32 = 3.0;
+            let x2: f32 = 4.0;
+            let y: f32 = 0.0;
+            let layer: Dense<f32, 2, 2> = Dense(
+                w: Tensor::<f32, 2, 2>(data: [[1.0, 0.0], [0.0, 1.0]]),
+                b: Tensor::<f32, 1, 2>(data: [[0.0, 0.0]])
+            );
+            let s0: f32 = sigmoid(x1);
+            let s1: f32 = sigmoid(x2);
+            let err: f32 = s0 + s1 - y;
+            let d0: f32 = s0 * (1.0 - s0);
+            let d1: f32 = s1 * (1.0 - s1);
+            let expected_w00: f32 = 2.0 * err * d0 * x1;
+            let expected_w11: f32 = 2.0 * err * d1 * x2;
+            let expected_b0: f32 = 2.0 * err * d0;
+            let expected_b1: f32 = 2.0 * err * d1;
+            let g = dloss_layer(x1, x2, y, layer);
+            let diff_w00: f32 = g.w[0, 0] - expected_w00;
+            let diff_w11: f32 = g.w[1, 1] - expected_w11;
+            let diff_b0: f32 = g.b[0, 0] - expected_b0;
+            let diff_b1: f32 = g.b[0, 1] - expected_b1;
+            let abs_w00: f32 = if diff_w00 < 0.0 {{ 0.0 - diff_w00 }} else {{ diff_w00 }};
+            let abs_w11: f32 = if diff_w11 < 0.0 {{ 0.0 - diff_w11 }} else {{ diff_w11 }};
+            let abs_b0: f32 = if diff_b0 < 0.0 {{ 0.0 - diff_b0 }} else {{ diff_b0 }};
+            let abs_b1: f32 = if diff_b1 < 0.0 {{ 0.0 - diff_b1 }} else {{ diff_b1 }};
+            if abs_w00 < 0.0001 and abs_w11 < 0.0001 and abs_b0 < 0.0001 and abs_b1 < 0.0001
+            {{ 1 }} else {{ 0 }}
+        }}
+        "#
+    );
+    assert_eq!(run_i32(&context, &src), 1);
+}
+
+/// `grad()` (reverse-mode) through the identical `FusedDense` shape above --
+/// found necessary as a *second*, independent test because fixing only the
+/// `#[pure]` gap (previous test) still left this one failing differently:
+/// "cannot compute grad(...): adjoint `FusedDense::fused_dense` couldn't be
+/// applied to `FusedDense::fused_dense<Tensor<f32, 1, 2>, Tensor<f32, 2, 2>,
+/// Tensor<f32, 1, 2>, Tensor<f32, 1, 2>>` — check its own declared rule
+/// body". Root cause: the adjoint rule's own `reduce0(u)` targets
+/// `Broadcast0<Tensor<T,1,M>, Tensor<T,B,M>>`, whose impl pins a *literal*
+/// `1` in its own target pattern -- `egraph.rs::match_type_pattern`/
+/// `resolve_type_pattern` used to assume every const generic in a pattern
+/// is a bare name and reject a literal outright, and separately, `reduce0`'s
+/// own `Row -> Batch` direction never determines `B` from `Row` alone (the
+/// impl is deliberately generic over `B`) without the enclosing rule's own
+/// expected return type threaded down through `build_pattern`. Same hand-
+/// derived expected gradient as the `derive()` test above (identity
+/// weights, zero bias) -- `sum(h)` in place of manual indexing, `grad()`'s
+/// own reverse-mode walk has no adjoint for indexing yet.
+#[test]
+fn grad_through_a_fused_matmul_plus_broadcast_rule_computes_the_right_gradient() {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(grad_through_a_fused_matmul_plus_broadcast_rule_body)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn grad_through_a_fused_matmul_plus_broadcast_rule_body() {
+    let context = context();
+    let src = format!(
+        r#"
+        {FUSED_DENSE_WITH_PURE_EXTERN_SOURCE}
+        fn loss(x: Tensor<f32, 1, 2>, y: f32, layer: Dense<f32, 2, 2>) -> f32 {{
+            let h = sigmoid(fused_dense(x, layer.w, layer.b));
+            let pred = sum(h);
+            let err = pred - y;
+            err * err
+        }}
+        gw = grad(loss, layer);
+        fn main() -> i32 {{
+            let x1: f32 = 3.0;
+            let x2: f32 = 4.0;
+            let x: Tensor<f32, 1, 2> = Tensor::<f32, 1, 2>(data: [[x1, x2]]);
+            let y: f32 = 0.0;
+            let layer: Dense<f32, 2, 2> = Dense(
+                w: Tensor::<f32, 2, 2>(data: [[1.0, 0.0], [0.0, 1.0]]),
+                b: Tensor::<f32, 1, 2>(data: [[0.0, 0.0]])
+            );
+            let s0: f32 = sigmoid(x1);
+            let s1: f32 = sigmoid(x2);
+            let err: f32 = s0 + s1 - y;
+            let d0: f32 = s0 * (1.0 - s0);
+            let d1: f32 = s1 * (1.0 - s1);
+            let expected_w00: f32 = 2.0 * err * d0 * x1;
+            let expected_w11: f32 = 2.0 * err * d1 * x2;
+            let expected_b0: f32 = 2.0 * err * d0;
+            let expected_b1: f32 = 2.0 * err * d1;
+            let g = gw(x, y, layer);
+            let diff_w00: f32 = g.w[0, 0] - expected_w00;
+            let diff_w11: f32 = g.w[1, 1] - expected_w11;
+            let diff_b0: f32 = g.b[0, 0] - expected_b0;
+            let diff_b1: f32 = g.b[0, 1] - expected_b1;
+            let abs_w00: f32 = if diff_w00 < 0.0 {{ 0.0 - diff_w00 }} else {{ diff_w00 }};
+            let abs_w11: f32 = if diff_w11 < 0.0 {{ 0.0 - diff_w11 }} else {{ diff_w11 }};
+            let abs_b0: f32 = if diff_b0 < 0.0 {{ 0.0 - diff_b0 }} else {{ diff_b0 }};
+            let abs_b1: f32 = if diff_b1 < 0.0 {{ 0.0 - diff_b1 }} else {{ diff_b1 }};
+            if abs_w00 < 0.0001 and abs_w11 < 0.0001 and abs_b0 < 0.0001 and abs_b1 < 0.0001
+            {{ 1 }} else {{ 0 }}
+        }}
+        "#
+    );
+    assert_eq!(run_i32(&context, &src), 1);
+}
+
 /// The `grad()` counterpart of `derive_through_dense_forward_computes_the_
 /// right_gradient` just above -- the same hand-derived expected values and
 /// numeric tolerance, `grad()` instead of `derive()`, `x` a direct `Tensor`

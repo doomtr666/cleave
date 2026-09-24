@@ -2440,6 +2440,7 @@ fn lower_prim_op<'c>(
         PrimOp::Extern {
             symbol,
             param_types,
+            pure: _,
         } => {
             // A `Ty::Array`-typed *return* is a real ABI mismatch to
             // reconcile: the cleave-level call (e.g. `Print<[i8;N]>::

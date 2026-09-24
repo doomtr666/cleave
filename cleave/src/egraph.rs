@@ -384,6 +384,12 @@ use std::collections::HashMap;
 /// inspection), but a real, precise data-flow check — distinguishing a
 /// locally-allocated target from a possibly-aliased parameter — would be
 /// needed before this predicate could be trusted for one that did.
+/// `PrimOp::Extern` -- pure *only* when the underlying `extern fn` was
+/// declared `#[pure]` (`ast.rs`'s own `Attribute`, threaded through
+/// `UnitBody::Extern`/`PrimOp::Extern`'s own `pure` field) -- an *arbitrary*
+/// extern stays conservatively impure by default, exactly as before this
+/// field existed (`Print<T>::print`'s own real, order-dependent effect is
+/// the reason this default can never flip on its own).
 fn is_pure_prim_op(op: &PrimOp) -> bool {
     matches!(
         op,
@@ -394,7 +400,7 @@ fn is_pure_prim_op(op: &PrimOp) -> bool {
             | PrimOp::ArrayRepeat
             | PrimOp::Load { .. }
             | PrimOp::Store { .. }
-    )
+    ) || matches!(op, PrimOp::Extern { pure: true, .. })
 }
 
 /// Whether `expr`'s own body contains no real control flow (`Fix`/`If`) and
@@ -1621,19 +1627,31 @@ fn match_type_pattern(pattern: &Type, concrete: &str, subst: &mut HashMap<String
     }
     gens.iter().zip(parts).all(|(garg, part)| match garg {
         GenericArg::Type(t) => match_type_pattern(t, part, subst),
-        GenericArg::Const(e) => {
-            let ExprKind::Path(path) = &e.kind else {
-                return false; // a literal int on the *pattern* side isn't expected here -- every const generic this codebase declares is a bare name
-            };
-            let cname = path.segments.join("::");
-            match subst.get(&cname) {
-                Some(existing) => existing == part,
-                None => {
-                    subst.insert(cname, part.to_string());
-                    true
+        GenericArg::Const(e) => match &e.kind {
+            ExprKind::Path(path) => {
+                let cname = path.segments.join("::");
+                match subst.get(&cname) {
+                    Some(existing) => existing == part,
+                    None => {
+                        subst.insert(cname, part.to_string());
+                        true
+                    }
                 }
             }
-        }
+            // A literal dimension pinned directly in the impl's own target
+            // pattern (`Broadcast0<Tensor<T,1,M>, Tensor<T,B,M>>`'s own
+            // `1`, not one of the impl's three declared generics `T`/`B`/
+            // `M`) -- a real, legitimate shape, not the "every const
+            // generic here is a bare name" case this function used to
+            // assume unconditionally (found directly: `resolve_multi_
+            // target_call_ty` failing to resolve `Broadcast0::reduce0`'s
+            // own `Row` target from a cross-algebra caller, the first one
+            // ever reached with a literal in a target pattern). No binding
+            // needed -- the concrete text must simply equal the literal
+            // itself.
+            ExprKind::NumberLit { text, .. } => text == part,
+            _ => false,
+        },
     })
 }
 
@@ -1654,12 +1672,16 @@ fn resolve_type_pattern(pattern: &Type, subst: &HashMap<String, String>) -> Opti
     for g in gens {
         parts.push(match g {
             GenericArg::Type(t) => resolve_type_pattern(t, subst)?,
-            GenericArg::Const(e) => {
-                let ExprKind::Path(path) = &e.kind else {
-                    return None;
-                };
-                subst.get(&path.segments.join("::")).cloned()?
-            }
+            GenericArg::Const(e) => match &e.kind {
+                ExprKind::Path(path) => subst.get(&path.segments.join("::")).cloned()?,
+                // `match_type_pattern`'s own mirror case: a literal
+                // dimension pinned directly in the pattern resolves to
+                // itself, no `subst` lookup needed (it was never bound in
+                // the first place -- `match_type_pattern` only ever checks
+                // it, never inserts it).
+                ExprKind::NumberLit { text, .. } => text.clone(),
+                _ => return None,
+            },
         });
     }
     Some(format!("{name}<{}>", parts.join(", ")))
@@ -1702,6 +1724,7 @@ fn axiom_to_rewrite(
         ty,
         &type_env,
         None,
+        None,
         &mut referenced,
         registry,
         &mut lhs_ast,
@@ -1712,6 +1735,7 @@ fn axiom_to_rewrite(
         algebra,
         ty,
         &type_env,
+        None,
         None,
         &mut referenced,
         registry,
@@ -1782,6 +1806,7 @@ fn build_pattern(
     ty: &str,
     type_env: &HashMap<&str, String>,
     d_var: Option<Var>,
+    expected_ty: Option<&str>,
     referenced: &mut HashSet<String>,
     registry: &Registry,
     ast: &mut PatternAst<CleaveLang>,
@@ -1813,8 +1838,12 @@ fn build_pattern(
             let [inner] = call_args.as_slice() else {
                 return None;
             }; // `d(...)` always takes exactly one argument
+            // No `expected_ty` forwarded here -- `inner`'s own type is
+            // always independently resolvable via `type_env` (it's always
+            // one of the rule's own declared params, or a further nested
+            // call whose own args resolve it), never needs the hint.
             let (inner_id, inner_ty) = build_pattern(
-                inner, algebra, ty, type_env, d_var, referenced, registry, ast,
+                inner, algebra, ty, type_env, d_var, None, referenced, registry, ast,
             )?;
             let x_id = ast.add(ENodeOrVar::Var(d_var.unwrap()));
             // Differentiating distributes component-wise (`construction_
@@ -1857,20 +1886,45 @@ fn build_pattern(
                     _ => return None,
                 }
             };
-            let mut ids = Vec::with_capacity(call_args.len());
-            let mut arg_types: Vec<Option<String>> = Vec::with_capacity(call_args.len());
-            for a in call_args {
-                let (id, arg_ty) =
-                    build_pattern(a, algebra, ty, type_env, d_var, referenced, registry, ast)?;
-                ids.push(id);
-                arg_types.push(arg_ty);
-            }
             let owner_generics: Vec<&str> = registry
                 .generics(&owner)
                 .iter()
                 .filter(|g| !matches!(g, crate::ast::GenericParam::Const { .. }))
                 .map(|g| g.name())
                 .collect();
+            // A single-target owner (`Ring<T>`) shares one flat type across
+            // every argument *and* its own return, so whatever expected
+            // type this call itself was given genuinely applies unchanged
+            // to each argument too (`add(matmul(...), broadcast0(...))`'s
+            // own two operands, both `C`-typed, need the enclosing rule's
+            // own `C` forwarded exactly this way for the second one -- see
+            // this call's own multi-target retry below). A multi-target
+            // owner's arguments each pin a *different* one of its own
+            // targets (`matmul(a, b)`'s `a`/`b` are `A`/`B`, never both
+            // `C`) -- this call's own `expected_ty` has no single argument
+            // it corresponds to, so `None` down into each one instead.
+            let arg_expected_ty = if owner_generics.len() <= 1 {
+                expected_ty
+            } else {
+                None
+            };
+            let mut ids = Vec::with_capacity(call_args.len());
+            let mut arg_types: Vec<Option<String>> = Vec::with_capacity(call_args.len());
+            for a in call_args {
+                let (id, arg_ty) = build_pattern(
+                    a,
+                    algebra,
+                    ty,
+                    type_env,
+                    d_var,
+                    arg_expected_ty,
+                    referenced,
+                    registry,
+                    ast,
+                )?;
+                ids.push(id);
+                arg_types.push(arg_ty);
+            }
             // Every one of `owner`'s own declared targets this call's real
             // arguments actually pin: each argument whose own declared type
             // (`sig.params[i].ty`) is a bare name matching one of `owner`'s
@@ -1889,8 +1943,8 @@ fn build_pattern(
             // call's own instantiation) but fed it arguments of the *wrong*
             // shape for it, a real, silent dimensional-mismatch bug, not
             // just a missing-unit one.
-            let known: Vec<(usize, &str)> = registry
-                .fn_sig(&owner, &method)
+            let owner_sig = registry.fn_sig(&owner, &method);
+            let known: Vec<(usize, &str)> = owner_sig
                 .into_iter()
                 .flat_map(|sig| arg_types.iter().zip(&sig.params))
                 .filter_map(|(arg_ty, sig_param)| {
@@ -1909,14 +1963,58 @@ fn build_pattern(
             let call_ty = if owner_generics.len() > 1 {
                 match resolve_multi_target_call_ty(&owner, &known, registry) {
                     Some(s) => s,
-                    // Same-algebra, nothing pinned (or the match genuinely
-                    // failed) — falling back to the enclosing instantiation
-                    // unchanged is still *safe* here (unlike the cross-
-                    // algebra case, where there's no such fallback and this
-                    // must bail): `ty` is, by construction, always a real,
-                    // valid instantiation of this exact algebra already.
-                    None if owner == algebra => ty.to_string(),
-                    None => return None,
+                    None => {
+                        // The call's own arguments alone left at least one
+                        // of `owner`'s own targets unresolved -- a real,
+                        // structural case, not just a missing impl:
+                        // `Broadcast0<Tensor<T,1,M>, Tensor<T,B,M>>`'s own
+                        // `Row -> Batch` direction (`broadcast0(r)`, called
+                        // from an *enclosing* rule's own `derivative`
+                        // body, e.g. `MatMulBiasAdd`'s own product-plus-
+                        // broadcast rule) never determines `B` from `Row`
+                        // alone -- the impl is generic over `B` for a fixed
+                        // `Row`, on purpose (`broadcast0` legitimately
+                        // works at *any* batch size). What resolves it
+                        // instead is exactly what a human reading the
+                        // surrounding `add(..., broadcast0(d(bias)))`
+                        // already knows without thinking about it: this
+                        // whole `broadcast0(...)` call's own *result* has
+                        // to be the same type as the enclosing `add`'s
+                        // other operand, `C` -- ordinary expected-type-
+                        // directed inference, one extra `known` entry at
+                        // the callee's own declared return-type position,
+                        // retried only as a fallback (never overriding an
+                        // already-successful bottom-up resolution above).
+                        let retried = expected_ty.and_then(|expected| {
+                            let ret = owner_sig?.ret.as_ref()?;
+                            let TypeKind::Path(p, gens) = &ret.kind else {
+                                return None;
+                            };
+                            if !gens.is_empty() || p.segments.len() != 1 {
+                                return None;
+                            }
+                            let idx = owner_generics.iter().position(|g| *g == p.segments[0])?;
+                            if known.iter().any(|&(i, _)| i == idx) {
+                                return None; // already pinned by an argument -- a real conflict, not this rescue's job
+                            }
+                            let mut extended = known.clone();
+                            extended.push((idx, expected));
+                            resolve_multi_target_call_ty(&owner, &extended, registry)
+                        });
+                        match retried {
+                            Some(s) => s,
+                            // Same-algebra, nothing pinned (or the match
+                            // genuinely failed) — falling back to the
+                            // enclosing instantiation unchanged is still
+                            // *safe* here (unlike the cross-algebra case,
+                            // where there's no such fallback and this must
+                            // bail): `ty` is, by construction, always a
+                            // real, valid instantiation of this exact
+                            // algebra already.
+                            None if owner == algebra => ty.to_string(),
+                            None => return None,
+                        }
+                    }
                 }
             } else if owner == algebra {
                 ty.to_string()
@@ -2552,6 +2650,18 @@ fn derivative_rule_to_rewrite(
             (rule_p.name.as_str(), resolved)
         })
         .collect();
+    // The rule body's own overall type is always `sig.ret` -- passed down
+    // as `build_pattern`'s own `expected_ty` fallback hint, needed for
+    // real once a multi-target algebra's own product rule sums a term
+    // whose own callee can't be fully resolved from its own arguments
+    // alone (`MatMulBiasAdd`'s own `broadcast0(d(bias))`: `Broadcast0<
+    // Tensor<T,1,M>, Tensor<T,B,M>>`'s `Row -> Batch` direction never
+    // determines `B` from `Row` alone -- only the enclosing `add`'s own
+    // expected result type, `C`, does).
+    let return_ty = sig
+        .ret
+        .as_ref()
+        .and_then(|ret| resolve_declared_type(ret, &subst));
     let x = Var::from(Symbol::from("?__diff_x"));
 
     let mut lhs = PatternAst::default();
@@ -2580,6 +2690,7 @@ fn derivative_rule_to_rewrite(
         ty,
         &type_env,
         Some(x),
+        return_ty.as_deref(),
         &mut referenced,
         registry,
         &mut rhs,
@@ -4540,7 +4651,8 @@ fn apply_adjoint_rule(
     let mut out = Vec::with_capacity(bodies.len());
     for ((p, body), &target) in rule.params.iter().zip(bodies).zip(children) {
         let mut ast = PatternAst::default();
-        build_pattern(body, algebra, ty, &type_env, None, referenced, registry, &mut ast)?;
+        let expected = type_env.get(p.name.as_str()).map(String::as_str);
+        build_pattern(body, algebra, ty, &type_env, None, expected, referenced, registry, &mut ast)?;
         let contribution = egraph.add_instantiation(&ast, &subst);
         out.push((target, contribution, type_env[p.name.as_str()].clone()));
     }
@@ -6129,6 +6241,7 @@ mod tests {
             op: PrimOp::Extern {
                 symbol: "print_i32".to_string(),
                 param_types: vec![i32_ty()],
+                pure: false,
             },
             args: vec![CVal::Var(10)],
             cont: Box::new(CExpr::App {
@@ -6180,6 +6293,7 @@ mod tests {
                     op: PrimOp::Extern {
                         symbol: "print_i32".to_string(),
                         param_types: vec![i32_ty()],
+                        pure: false,
                     },
                     args: vec![CVal::Var(10)],
                     cont: Box::new(CExpr::App {
@@ -6217,6 +6331,7 @@ mod tests {
                     op: PrimOp::Extern {
                         symbol: "print_i32".to_string(),
                         param_types: vec![i32_ty()],
+                        pure: false,
                     },
                     args: vec![CVal::Var(10)],
                     cont: Box::new(CExpr::App {

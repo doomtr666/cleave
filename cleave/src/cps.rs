@@ -115,10 +115,20 @@ pub enum UnitBody {
     Real(Block),
     /// A top-level `extern fn` — the C symbol name, which is just the
     /// function's own cleave name (see `ast.rs`'s own `FnDecl::is_extern`
-    /// doc comment: no separate attribute argument, nothing to rename).
-    /// Carried into `PrimOp::Extern` — see that variant's own doc comment
-    /// for why a real C call is a straight-line `LetPrim`, not a `Fix`.
-    Extern(String),
+    /// doc comment: no separate attribute argument, nothing to rename) —
+    /// plus whether it's declared `#[pure]` (a real, mathematically pure
+    /// external function with no observable side effect, e.g. `cblas_sgemm`
+    /// — the caller's own responsibility to be truthful about, same as any
+    /// other attribute; the compiler has no way to verify an extern's own
+    /// real implementation). Carried into `PrimOp::Extern` — see that
+    /// variant's own doc comment for why a real C call is a straight-line
+    /// `LetPrim`, not a `Fix`, and `is_pure_prim_op`'s own doc comment
+    /// (`egraph.rs`) for why the flag matters at all: an *arbitrary* extern
+    /// is conservatively never safe to fold/reorder or treat as one opaque,
+    /// differentiable node when reached indirectly (`Print<T>::print`'s own
+    /// order-dependent effect is the reason this defaults to `false`) — a
+    /// declared-pure one is exactly as safe as an ordinary `mlir::...` op.
+    Extern(String, bool),
     /// `fprime = derive(f);` (`ast.rs`'s own `FnDecl::derivative_of`) — the
     /// base function's own name, plus `FnDecl::is_grad` (`true` for `gw =
     /// grad(f);` instead — reverse-mode, `doc/backlog.md`'s own "reverse-
@@ -396,6 +406,7 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                         Some(b) => UnitBody::Real(b.clone()),
                         None if f.is_extern => UnitBody::Extern(
                             f.extern_symbol.clone().unwrap_or_else(|| f.name.clone()),
+                            f.attrs.iter().any(|a| a.name == "pure"),
                         ),
                         None if f.derivative_of.is_some() => {
                             UnitBody::Derivative(
@@ -495,6 +506,7 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                         Some(b) => UnitBody::Real(b.clone()),
                         None => UnitBody::Extern(
                             f.extern_symbol.clone().unwrap_or_else(|| f.name.clone()),
+                            f.attrs.iter().any(|a| a.name == "pure"),
                         ),
                     };
                     // A *qualified* call inside this method's own body
@@ -588,6 +600,7 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                                 mono.extern_symbol(key)
                                     .map(String::from)
                                     .unwrap_or_else(|| f.name.clone()),
+                                mono.is_pure(key),
                             )
                         } else {
                             UnitBody::Real(mono.body(key).clone())
@@ -1037,6 +1050,9 @@ pub enum PrimOp {
     Extern {
         symbol: String,
         param_types: Vec<Ty>,
+        /// See `UnitBody::Extern`'s own doc comment — carried straight
+        /// through from there, consulted only by `egraph.rs::is_pure_prim_op`.
+        pure: bool,
     },
     /// A reserved `mlir::dialect::op(...)` call (`ExprKind::Call` whose path
     /// starts with `"mlir"`, recognized structurally in `convert_expr` —
@@ -3435,7 +3451,7 @@ fn emit_call(
         // synchronously, same as an MLIR op -- no continuation-passing
         // needed just because the callee happens to live outside cleave
         // entirely.
-        UnitBody::Extern(symbol) => {
+        UnitBody::Extern(symbol, pure) => {
             let var = ctx.fresh.var();
             CExpr::LetPrim {
                 var: { ctx.line(var); var },
@@ -3443,6 +3459,7 @@ fn emit_call(
                 op: PrimOp::Extern {
                     symbol: symbol.clone(),
                     param_types: unit.param_types.clone(),
+                    pure: *pure,
                 },
                 args: arg_vals,
                 cont: Box::new(k(CVal::Var(var), env)),

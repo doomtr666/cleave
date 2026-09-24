@@ -139,6 +139,13 @@ struct Specialization {
     /// specialization itself, never the current outer-loop impl.
     is_extern: bool,
     extern_symbol: Option<String>,
+    /// Mirrors `is_extern`/`extern_symbol`'s own reasoning exactly, for the
+    /// identical reason (`FnDecl::attrs`, not read off whichever impl's own
+    /// `f` happens to be at hand) — `#[pure]` on a generic algebra impl's
+    /// own `extern` method (`stdlib/linalg/matrix.cleave`'s own
+    /// `BlasSgemmRowMajor::blas_sgemm_rowmajor`). Read back via
+    /// `MonomorphizedProgram::is_pure`.
+    is_pure: bool,
 }
 
 pub struct MonomorphizedProgram {
@@ -216,6 +223,10 @@ impl MonomorphizedProgram {
 
     pub fn is_extern(&self, key: &str) -> bool {
         self.specializations[key].is_extern
+    }
+
+    pub fn is_pure(&self, key: &str) -> bool {
+        self.specializations[key].is_pure
     }
 
     pub fn extern_symbol(&self, key: &str) -> Option<&str> {
@@ -300,6 +311,9 @@ pub(crate) struct ImplTemplate {
     /// iterated.
     is_extern: bool,
     extern_symbol: Option<String>,
+    /// Mirrors `Specialization`'s own identical field — see its own doc
+    /// comment.
+    is_pure: bool,
 }
 
 /// Runs the whole-program inference pass (`callgraph::infer_program`) and
@@ -668,6 +682,7 @@ pub fn monomorphize(
                     call_names,
                     is_extern: f.is_extern,
                     extern_symbol: f.extern_symbol.clone(),
+                    is_pure: f.attrs.iter().any(|a| a.name == "pure"),
                 },
             );
         }
@@ -1001,6 +1016,7 @@ pub fn monomorphize(
                     call_names,
                     is_extern: t.is_extern,
                     extern_symbol: t.extern_symbol.clone(),
+                    is_pure: t.is_pure,
                 },
             );
         }
@@ -1099,6 +1115,7 @@ pub fn monomorphize(
                     call_names,
                     is_extern: false,
                     extern_symbol: None,
+                    is_pure: false,
                 },
             );
         }
@@ -1330,6 +1347,7 @@ fn build_impl_templates(
                 is_generic,
                 is_extern: f.is_extern,
                 extern_symbol: f.extern_symbol.clone(),
+                is_pure: f.attrs.iter().any(|a| a.name == "pure"),
             });
         }
     }
