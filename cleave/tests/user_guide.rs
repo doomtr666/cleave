@@ -496,6 +496,19 @@ fn a_define_left_unoverridden_uses_its_own_default() {
     assert_eq!(run_i32(&context, src), 0);
 }
 
+#[test]
+fn cleave_openmp_is_a_usable_compiler_injected_define() {
+    let context = context();
+    let src = "fn main() -> i32 { if CLEAVE_OPENMP { 1 } else { 0 } }";
+    // This file's own `run_i32` goes through `Registry::build` (no real CLI
+    // context), which always injects `CLEAVE_OPENMP = true` -- the same
+    // universal default `resolve_codegen_options` itself resolves to absent
+    // an explicit `--openmp`/`--no-openmp` (`cleave/tests/const_decl.rs`'s
+    // own `cleave_openmp_reflects_the_resolved_openmp_option` exercises
+    // both values for real, threading a real `openmp` bool through).
+    assert_eq!(run_i32(&context, src), 1);
+}
+
 // ---------------------------------------------------------------- Turbofish
 
 #[test]

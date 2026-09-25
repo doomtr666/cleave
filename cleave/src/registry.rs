@@ -266,13 +266,23 @@ impl Registry {
             })
             .collect();
 
-        Registry {
+        let mut registry = Registry {
             algebras,
             structs,
             global_consts,
             global_const_types,
             is_define,
-        }
+        };
+        // No real CLI/`CodegenOptions` context here (`build`, unlike `build_
+        // with_defines`, never receives one) -- `true`, the same universal
+        // default `resolve_codegen_options` itself now resolves to absent an
+        // explicit `--openmp`/`--no-openmp`, so `CLEAVE_OPENMP` is available
+        // (and correct by default) even to a caller that never goes through
+        // `build_with_defines` at all (every one of this project's own
+        // library-level tests, `egraph.rs`'s own internal speculative-probe
+        // registries, ...).
+        registry.inject_compiler_define("CLEAVE_OPENMP", bool_type(), ConstValue::Bool(true));
+        registry
     }
 
     /// Like `build`, but with `--define NAME=VALUE` (CLI) / `Build::define`
@@ -286,11 +296,40 @@ impl Registry {
     /// check for a source-level problem (a `define` with neither a default
     /// nor any override at all), which *does* have a real declaration site
     /// to point at.
-    pub fn build_with_defines(program: &Program, defines: &[(String, String)]) -> (Self, Vec<String>) {
+    ///
+    /// `openmp` is the resolved `CodegenOptions::openmp` value this exact
+    /// compilation is using (`main.rs`'s own single, universal `args.openmp.
+    /// unwrap_or(true)` resolution, or `CodegenOptions::openmp` directly at
+    /// `compile_and_emit`'s own call site) -- injected as `CLEAVE_OPENMP`,
+    /// this project's first compiler-provided constant (`doc/plan-blas-
+    /// native.md`'s own §2, "Constantes injectées par le compilateur").
+    pub fn build_with_defines(
+        program: &Program,
+        defines: &[(String, String)],
+        openmp: bool,
+    ) -> (Self, Vec<String>) {
         let mut registry = Self::build(program);
         let (global_consts, errors) = Self::eval_global_consts(program, defines);
         registry.global_consts = global_consts;
+        registry.inject_compiler_define("CLEAVE_OPENMP", bool_type(), ConstValue::Bool(openmp));
         (registry, errors)
+    }
+
+    /// Writes a compiler-provided constant directly into the registry's own
+    /// tables, bypassing source-level declaration entirely -- the `CLEAVE_*`
+    /// namespace convention is just that, a convention (no enforcement, no
+    /// collision check against a same-named real `const`/`define`): the
+    /// injected value always wins, silently, if a program's own source ever
+    /// picks the same name -- deliberately simple, the reserved-namespace
+    /// discipline is entirely the program author's own responsibility to
+    /// respect, not the compiler's to police. Treated as a `define` (`is_
+    /// define` records it, so `--dump-defines` lists it and it behaves
+    /// exactly like a source-level `define` everywhere else once resolved)
+    /// even though it never went through `eval_global_consts` at all.
+    fn inject_compiler_define(&mut self, name: &str, ty: Type, value: ConstValue) {
+        self.global_const_types.insert(name.to_string(), ty);
+        self.global_consts.insert(name.to_string(), value);
+        self.is_define.insert(name.to_string());
     }
 
     /// Evaluates every top-level `const`/`define` to a concrete
@@ -458,6 +497,26 @@ impl Registry {
     /// `is_define`'s own doc comment on `Registry` has the one consumer.
     pub fn is_define(&self, name: &str) -> bool {
         self.is_define.contains(name)
+    }
+
+    /// Every currently-resolved `define` — source-declared (`grammar.pest::
+    /// define_decl`) or compiler-injected (`inject_compiler_define`, the
+    /// `CLEAVE_*` namespace convention) alike — name and value, sorted by
+    /// name for a stable, diffable listing. `main.rs`'s own `--dump-defines`
+    /// is the one real consumer. A source-declared `define` that never
+    /// resolved at all (no default, no `--define` override) is never in
+    /// `self.global_consts` in the first place (`eval_global_consts`'s own
+    /// permissive-by-omission posture) — `pipeline.rs::check_const_decl_
+    /// errors` is what catches that case, separately, as a real diagnostic;
+    /// this only ever sees defines that already resolved.
+    pub fn list_defines(&self) -> Vec<(String, ConstValue)> {
+        let mut out: Vec<(String, ConstValue)> = self
+            .is_define
+            .iter()
+            .filter_map(|name| self.global_consts.get(name).map(|v| (name.clone(), *v)))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 
     /// `SEUIL`'s own resolved *value* — unlike `global_const_type` (used for
@@ -797,5 +856,23 @@ impl Registry {
                     .collect()
             })
             .unwrap_or_default()
+    }
+}
+
+/// A synthetic `bool` type node, for `inject_compiler_define`'s own call
+/// sites -- `NodeId(u32::MAX)`/a zero-length `Span` at file 0 are safe
+/// sentinels here specifically because this node never enters `program.
+/// items` at all (it lives only in the registry's own tables, read back by
+/// `global_const_type`/`ty_from_ast`, neither of which inspects `id`), so
+/// no real parsed node's own id can ever collide with it.
+fn bool_type() -> Type {
+    Node {
+        id: NodeId(u32::MAX),
+        span: Span {
+            file: FileId(0),
+            start: 0,
+            end: 0,
+        },
+        kind: TypeKind::Path(Path::single("bool"), Vec::new()),
     }
 }

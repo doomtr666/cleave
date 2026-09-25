@@ -70,18 +70,23 @@ pub struct CodegenOptions {
     pub opt_level: u8,
     /// Whether `lower_to_llvm` applies the OpenMP parallelization stage
     /// (`--affine-parallelize`/`--convert-scf-to-openmp`/`--convert-openmp-
-    /// to-llvm`) at all. `main.rs`'s own JIT paths (`--run`/`--dump-mlir-
-    /// lowered`) default this `false` at their own call sites -- a
-    /// deliberate, still-standing decision from earlier this session, not
-    /// revisited here: `cleave-rt`'s own arena allocator globals (`ARENA_
-    /// BASE`/`ARENA_CURSOR`/`REGION_DEPTH`, `cleave-rt/src/lib.rs`) are
-    /// deliberately single-threaded `Ordering::Relaxed` atomics, sound only
-    /// because every OpenMP-parallelized region is provably allocator-free
-    /// (`lower_to_llvm`'s own doc comment on the parallelize stage) --
-    /// true today, but not yet stress-tested under real concurrent JIT
-    /// invocation the way the AOT path has been. AOT paths (`emit_object`/
-    /// `emit_exe`/`cleave-build::Build`) default this `true`, matching the
-    /// real, measured 6.6x speedup this mechanism already delivers there.
+    /// to-llvm`) at all. A single, universal default (`true`) since
+    /// `main.rs`'s own `real_main`'s "`ExecutionPath`/`openmp`/`dump-X` are
+    /// three independent, additive axes, not one flag whose default should
+    /// depend on another" design conversation: JIT (`--run`/`--dump-mlir-
+    /// lowered`) used to default this `false` at its own call sites, on the
+    /// theory that `cleave-rt`'s own arena allocator globals (`ARENA_BASE`/
+    /// `ARENA_CURSOR`/`REGION_DEPTH`, `cleave-rt/src/lib.rs` -- deliberately
+    /// single-threaded `Ordering::Relaxed` atomics, sound only because every
+    /// OpenMP-parallelized region is provably allocator-free) might behave
+    /// differently under JIT than the already-stress-tested AOT path --
+    /// found, on inspection, to have no real basis: that soundness argument
+    /// is a property of the *generated code itself*, identical either way,
+    /// never of which engine (JIT vs AOT) happens to execute it. `main.rs`'s
+    /// own `resolve_codegen_options`/`Registry::build_with_defines` calls
+    /// resolve this exact same `true` default once, universally, matching
+    /// the real, measured 6.6x speedup this mechanism delivers on the AOT
+    /// path that first proved it out.
     pub openmp: bool,
     /// `llvm.func`'s own real `target_cpu` string attribute (confirmed
     /// directly against this toolchain: `mlir-opt` parses and round-trips
@@ -393,7 +398,7 @@ pub fn compile_and_emit(
 ) -> Result<(), Vec<String>> {
     let (result, sources) = crate::driver::compile(sources_in, project_dirs);
     let program = result.map_err(|errs| render_all(&errs, &sources))?;
-    let (registry, define_errors) = Registry::build_with_defines(&program, defines);
+    let (registry, define_errors) = Registry::build_with_defines(&program, defines, options.openmp);
     if !define_errors.is_empty() {
         return Err(define_errors);
     }

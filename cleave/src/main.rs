@@ -46,6 +46,7 @@ struct Args {
     dump_cps_equivalences: bool,
     dump_mlir: bool,
     dump_mlir_lowered: bool,
+    dump_defines: bool,
     run: bool,
     emit_object: Option<PathBuf>,
     emit_bindings: Option<PathBuf>,
@@ -80,6 +81,7 @@ fn parse_args() -> Result<Args, String> {
     let mut dump_cps_equivalences = false;
     let mut dump_mlir = false;
     let mut dump_mlir_lowered = false;
+    let mut dump_defines = false;
     let mut run = false;
     let mut emit_object = None;
     let mut emit_bindings = None;
@@ -110,6 +112,7 @@ fn parse_args() -> Result<Args, String> {
             "--dump-cps-equivalences" => dump_cps_equivalences = true,
             "--dump-mlir" => dump_mlir = true,
             "--dump-mlir-lowered" => dump_mlir_lowered = true,
+            "--dump-defines" => dump_defines = true,
             "--run" => run = true,
             "--emit-object" => {
                 let value = args_iter
@@ -212,6 +215,7 @@ fn parse_args() -> Result<Args, String> {
         && !dump_cps_equivalences
         && !dump_mlir
         && !dump_mlir_lowered
+        && !dump_defines
         && !run
         && emit_object.is_none()
         && emit_bindings.is_none()
@@ -231,6 +235,7 @@ fn parse_args() -> Result<Args, String> {
             dump_cps_equivalences,
             dump_mlir,
             dump_mlir_lowered,
+            dump_defines,
             run,
             emit_object,
             emit_bindings,
@@ -252,7 +257,7 @@ fn parse_args() -> Result<Args, String> {
         }),
         None => Err(
             "usage: cleave <file.cleave> [--dump-ast] [--dump-inference-pass] [--dump-monomorphized] [--dump-cps] \
-             [--dump-cps-optimized] [--dump-cps-equivalences] [--dump-mlir] [--dump-mlir-lowered] [--run] \
+             [--dump-cps-optimized] [--dump-cps-equivalences] [--dump-mlir] [--dump-mlir-lowered] [--dump-defines] [--run] \
              [--emit-object <path>] [--emit-bindings <path>] [--emit-exe <path>] \
              [--opt-level <0-3>] [--openmp | --no-openmp] [--target-cpu <name>] [--target-features <+f,-f,...>] \
              [--backend cpu] [--inline | --no-inline] [--unroll-jam | --no-unroll-jam] \
@@ -277,8 +282,9 @@ fn parse_args() -> Result<Args, String> {
 fn build_registry(
     program: &cleave::ast::Program,
     defines: &[(String, String)],
+    openmp: bool,
 ) -> Result<Registry, ExitCode> {
-    let (registry, errors) = Registry::build_with_defines(program, defines);
+    let (registry, errors) = Registry::build_with_defines(program, defines, openmp);
     if errors.is_empty() {
         Ok(registry)
     } else {
@@ -289,12 +295,13 @@ fn build_registry(
     }
 }
 
-/// Resolves `args`'s own codegen flags into a real `CodegenOptions` --
-/// `openmp_default` differs per call site (`true` for `--emit-object`/
-/// `--emit-bindings`/`--emit-exe`, `false` for `--run`/`--dump-mlir-
-/// lowered`, see `CodegenOptions::openmp`'s own doc comment for why),
-/// overridden either way by an explicit `--openmp`/`--no-openmp`.
-fn resolve_codegen_options(args: &Args, openmp_default: bool) -> Result<CodegenOptions, String> {
+/// Resolves `args`'s own codegen flags into a real `CodegenOptions` -- a
+/// single, universal resolution, called once and reused (`real_main`'s own
+/// `cleave_openmp` doc comment has the full reasoning for why `openmp` no
+/// longer varies by call site the way it once did: `--dump-*`/`--run`/
+/// `--emit-*` are additive, orthogonal choices, not different defaults for
+/// the same underlying option).
+fn resolve_codegen_options(args: &Args) -> Result<CodegenOptions, String> {
     let backend = match args.backend.as_str() {
         "cpu" => Backend::Cpu,
         other => return Err(format!("backend {other:?} is not implemented yet -- only \"cpu\" is supported today")),
@@ -302,7 +309,7 @@ fn resolve_codegen_options(args: &Args, openmp_default: bool) -> Result<CodegenO
     let defaults = CodegenOptions::default();
     Ok(CodegenOptions {
         opt_level: args.opt_level,
-        openmp: args.openmp.unwrap_or(openmp_default),
+        openmp: args.openmp.unwrap_or(true),
         target_cpu: args.target_cpu.clone(),
         target_features: args.target_features.clone(),
         backend,
@@ -383,12 +390,26 @@ fn real_main() -> ExitCode {
         }
     };
 
+    // `openmp`'s own resolution is now a single, universal rule (`args.
+    // openmp.unwrap_or(true)`) -- no more per-mode default (`resolve_
+    // codegen_options`'s own doc comment used to vary this by call site;
+    // found, in conversation, to have no real technical justification: the
+    // `cleave-rt` arena allocator's own `Ordering::Relaxed` safety argument
+    // -- "every OpenMP-parallelized region is provably allocator-free" --
+    // is a property of the *generated code itself*, never of which engine
+    // (JIT vs AOT) ends up running it, so there was never a real reason for
+    // the two to differ). Computed once, here, reused by every mode below
+    // (registry construction *and* `resolve_codegen_options`) and also fed
+    // straight into `Registry::build_with_defines`'s own `CLEAVE_OPENMP`
+    // injection (`registry.rs`'s own doc comment on that).
+    let cleave_openmp = args.openmp.unwrap_or(true);
+
     // `args.defines`, validated exactly once, here -- every `Registry::
     // build_with_defines` call site below (one per `--dump-*`/`--run`/
     // `--emit-*` mode, `program`/`args.defines` both unchanged) re-derives
     // the identical, deterministic result, so a bad `--define` only ever
     // gets reported once, not once per requested mode.
-    if let Err(code) = build_registry(&program, &args.defines) {
+    if let Err(code) = build_registry(&program, &args.defines, cleave_openmp) {
         return code;
     }
 
@@ -404,6 +425,7 @@ fn real_main() -> ExitCode {
         args.dump_cps_equivalences,
         args.dump_mlir,
         args.dump_mlir_lowered,
+        args.dump_defines,
     ]
     .iter()
     .filter(|b| **b)
@@ -425,7 +447,7 @@ fn real_main() -> ExitCode {
         if multiple {
             println!("--- inference pass ---\n");
         }
-        let registry = Registry::build_with_defines(&program, &args.defines).0;
+        let registry = Registry::build_with_defines(&program, &args.defines, cleave_openmp).0;
         let (out, errs) = dump_program(&program, &registry);
         print!("{out}");
         if !errs.is_empty() {
@@ -438,11 +460,24 @@ fn real_main() -> ExitCode {
         }
     }
 
+    if args.dump_defines {
+        if multiple {
+            println!("--- defines ---\n");
+        }
+        let registry = Registry::build_with_defines(&program, &args.defines, cleave_openmp).0;
+        for (name, value) in registry.list_defines() {
+            println!("{name} = {value}");
+        }
+        if multiple {
+            println!();
+        }
+    }
+
     if args.dump_monomorphized {
         if multiple {
             println!("--- monomorphized ---\n");
         }
-        let registry = Registry::build_with_defines(&program, &args.defines).0;
+        let registry = Registry::build_with_defines(&program, &args.defines, cleave_openmp).0;
         let (out, errs) = dump_monomorphized(&program, &registry);
         print!("{out}");
         if !errs.is_empty() {
@@ -456,7 +491,7 @@ fn real_main() -> ExitCode {
         if multiple {
             println!("--- cps ---\n");
         }
-        let registry = Registry::build_with_defines(&program, &args.defines).0;
+        let registry = Registry::build_with_defines(&program, &args.defines, cleave_openmp).0;
         if let Err(diags) = check_type_errors(&program, &registry) {
             report(&diags, &sources);
             exit = ExitCode::FAILURE;
@@ -480,7 +515,7 @@ fn real_main() -> ExitCode {
         if multiple {
             println!("--- cps (optimized) ---\n");
         }
-        let registry = Registry::build_with_defines(&program, &args.defines).0;
+        let registry = Registry::build_with_defines(&program, &args.defines, cleave_openmp).0;
         if let Err(diags) = check_type_errors(&program, &registry) {
             report(&diags, &sources);
             exit = ExitCode::FAILURE;
@@ -532,7 +567,7 @@ fn real_main() -> ExitCode {
         if multiple {
             println!("--- cps equivalences ---\n");
         }
-        let registry = Registry::build_with_defines(&program, &args.defines).0;
+        let registry = Registry::build_with_defines(&program, &args.defines, cleave_openmp).0;
         if let Err(diags) = check_type_errors(&program, &registry) {
             report(&diags, &sources);
             exit = ExitCode::FAILURE;
@@ -563,7 +598,7 @@ fn real_main() -> ExitCode {
         if multiple {
             println!("--- mlir ---\n");
         }
-        let registry = Registry::build_with_defines(&program, &args.defines).0;
+        let registry = Registry::build_with_defines(&program, &args.defines, cleave_openmp).0;
         if let Err(diags) = check_type_errors(&program, &registry) {
             report(&diags, &sources);
             exit = ExitCode::FAILURE;
@@ -619,7 +654,7 @@ fn real_main() -> ExitCode {
         if multiple {
             println!("--- mlir (lowered) ---\n");
         }
-        let registry = Registry::build_with_defines(&program, &args.defines).0;
+        let registry = Registry::build_with_defines(&program, &args.defines, cleave_openmp).0;
         if let Err(diags) = check_type_errors(&program, &registry) {
             report(&diags, &sources);
             exit = ExitCode::FAILURE;
@@ -667,10 +702,10 @@ fn real_main() -> ExitCode {
                     // real textual LLVM IR (melior/mlir-sys, as vendored,
                     // don't expose `mlirTranslateModuleToLLVMIR` at all --
                     // real `.ll` text isn't reachable without adding a raw
-                    // FFI binding ourselves). `--dump-mlir-lowered` defaults
-                    // OpenMP *off* (see `resolve_codegen_options`'s own doc
-                    // comment) -- pass `--openmp` explicitly to see the
-                    // parallelized form.
+                    // FFI binding ourselves). OpenMP defaults *on* here too
+                    // now, same universal default every mode uses (`real_
+                    // main`'s own `cleave_openmp` doc comment) -- pass
+                    // `--no-openmp` explicitly for a serial dump.
                     //
                     // Resolved *before* `lower_program` below, not after --
                     // `crate::options::current()` (`lower_program`'s own
@@ -678,7 +713,7 @@ fn real_main() -> ExitCode {
                     // this run's real CLI flags by the time `lower_program`
                     // itself runs, not whatever the thread-local default
                     // happened to be beforehand.
-                    let options = match resolve_codegen_options(&args, false) {
+                    let options = match resolve_codegen_options(&args) {
                         Ok(options) => options,
                         Err(e) => {
                             eprintln!("error: {e}");
@@ -717,7 +752,7 @@ fn real_main() -> ExitCode {
     }
 
     if args.run {
-        let registry = Registry::build_with_defines(&program, &args.defines).0;
+        let registry = Registry::build_with_defines(&program, &args.defines, cleave_openmp).0;
         // CPS conversion (`collect_units`/`convert_program`, shared by all
         // three blocks above and below) assumes every reachable unit's own
         // types are fully concrete -- a program with a real type error
@@ -768,13 +803,16 @@ fn real_main() -> ExitCode {
         context.load_all_available_dialects();
 
         // `lower_to_llvm` -- shared with `--dump-mlir-lowered` above and
-        // `emit_object` (`pipeline.rs`). `--run` defaults OpenMP *off*
-        // (`resolve_codegen_options`'s own doc comment); pass `--openmp`
-        // explicitly to invoke the parallelized form for real.
+        // `emit_object` (`pipeline.rs`). OpenMP defaults *on* here too, same
+        // universal default as every other mode (`real_main`'s own `cleave_
+        // openmp` doc comment: the old "off for JIT" caution had no real
+        // technical basis -- `cleave-rt`'s own allocator-safety argument is
+        // a property of the generated code, not of which engine runs it) --
+        // pass `--no-openmp` explicitly for a genuine serial comparison.
         //
         // Resolved *before* `lower_program` below -- same reasoning as
         // `--dump-mlir-lowered`'s own identical reordering above.
-        let options = match resolve_codegen_options(&args, false) {
+        let options = match resolve_codegen_options(&args) {
             Ok(options) => options,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -851,8 +889,8 @@ fn real_main() -> ExitCode {
     }
 
     if args.emit_object.is_some() || args.emit_bindings.is_some() {
-        let registry = Registry::build_with_defines(&program, &args.defines).0;
-        let options = match resolve_codegen_options(&args, true) {
+        let registry = Registry::build_with_defines(&program, &args.defines, cleave_openmp).0;
+        let options = match resolve_codegen_options(&args) {
             Ok(options) => options,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -882,8 +920,8 @@ fn real_main() -> ExitCode {
     }
 
     if let Some(exe_path) = &args.emit_exe {
-        let registry = Registry::build_with_defines(&program, &args.defines).0;
-        let options = match resolve_codegen_options(&args, true) {
+        let registry = Registry::build_with_defines(&program, &args.defines, cleave_openmp).0;
+        let options = match resolve_codegen_options(&args) {
             Ok(options) => options,
             Err(e) => {
                 eprintln!("error: {e}");

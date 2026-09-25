@@ -34,7 +34,7 @@ cargo run -p cleave -- kernel.cleave --run --target-features -avx512f,-fma
 | Flag | Default | What it gates |
 | --- | --- | --- |
 | `--opt-level <0-3>` | `2` | `ExecutionEngine`'s own optimization level. |
-| `--openmp` / `--no-openmp` | on for `--emit-object`/`--emit-bindings`/`--emit-exe`/`cleave-build`, off for `--run`/`--dump-mlir-lowered` | The whole OpenMP parallelization stage (`--affine-parallelize`/`--convert-scf-to-openmp`/`--convert-openmp-to-llvm`). |
+| `--openmp` / `--no-openmp` | **on**, everywhere | The whole OpenMP parallelization stage (`--affine-parallelize`/`--convert-scf-to-openmp`/`--convert-openmp-to-llvm`). One universal default regardless of mode — `--dump-*`/`--run`/`--emit-*` are additive, orthogonal choices, not different defaults for the same option (an earlier, JIT-specific `off` default turned out to have no real technical basis: the safety argument behind it is a property of the generated code itself, not of which engine runs it). |
 | `--backend cpu` | `cpu` | The only real value today (`doc/hld.md`'s own stated Vulkan/`spirv` target isn't implemented yet). |
 | `--inline` / `--no-inline` | on | The MLIR-level inliner. `--no-inline` is a real diagnostic knob — keeps every function (`net_grad`, `matmul`, ...) as its own separate `llvm.func` instead of flattened into its caller, useful for reading a disassembly with real function boundaries intact. Not meant for a real perf build. |
 | `--affine-structs` / `--no-affine-structs` | on | Headerless-pool allocation for structs provably never aliased. `--no-affine-structs` is the escape hatch for a structural shape this analysis gets wrong. |
@@ -365,6 +365,14 @@ fn main() -> i32 { if FLAG { 1 } else { 0 } }
 Left alone, a `define` behaves exactly like a `const` with that same default value. `--define FLAG=true` on the command line (or `.define("FLAG", "true")` on `cleave-build`'s own `Build`) overrides it before compilation ever sees the file's own default — the same `-D`/`#define` role a C build's own `-D` flag plays, except the override is checked against the `define`'s declared type (`parse_define_value`: `"true"`/`"false"` for `bool`, an integer otherwise) rather than pasted in as raw text. `define NAME: T;`, with no `= expr` at all, is legal too — it must then be supplied externally, or compilation fails with a located error naming exactly which `define` was never resolved. Once resolved, by whichever path, a `define` is indistinguishable from a `const` for the rest of the compiler — the distinction is only ever about *where the value came from*, never about how it behaves afterward.
 
 Naming a real `const` in `--define`/`.define(...)` is a reported error, not a silent override — "const" keeps meaning what it says.
+
+**A small, fixed set of `define`s are provided by the compiler itself, not declared anywhere in source** — a reserved `CLEAVE_*` naming convention (nothing stops a program from declaring its own `CLEAVE_SOMETHING`; that's on you). `CLEAVE_OPENMP: bool` is the first one, reflecting whichever `--openmp`/`--no-openmp` this exact compilation resolved to — usable exactly like any other `define`, ordinary value or const-generic position alike:
+
+```
+fn main() -> i32 { if CLEAVE_OPENMP { 1 } else { 0 } }
+```
+
+`--dump-defines` lists every `define` currently in effect — source-declared and compiler-injected alike — with its resolved value, one per line, sorted by name; a plain `const` never shows up there.
 
 ## Turbofish: `::<...>`, for when inference needs a hint
 

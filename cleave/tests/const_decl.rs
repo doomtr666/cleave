@@ -59,13 +59,27 @@ fn run_i32(context: &Context, src: &str) -> i32 {
 /// thing for the real CLI `--define` flag, just with `eprintln!`/`ExitCode`
 /// instead of a panic for a config-level error.
 fn run_i32_with_defines(context: &Context, src: &str, defines: &[(&str, &str)]) -> i32 {
+    run_i32_with_defines_and_openmp(context, src, defines, true)
+}
+
+/// `run_i32_with_defines`'s own general form -- also threads a real `openmp`
+/// value through to `Registry::build_with_defines`'s own `CLEAVE_OPENMP`
+/// injection (`registry.rs`'s own doc comment), for tests that need to
+/// observe *which* value `CLEAVE_OPENMP` actually resolves to at runtime,
+/// not just that a `define`/`const` folds.
+fn run_i32_with_defines_and_openmp(
+    context: &Context,
+    src: &str,
+    defines: &[(&str, &str)],
+    openmp: bool,
+) -> i32 {
     let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let defines: Vec<(String, String)> = defines
         .iter()
         .map(|(n, v)| (n.to_string(), v.to_string()))
         .collect();
-    let (registry, errors) = Registry::build_with_defines(&program, &defines);
+    let (registry, errors) = Registry::build_with_defines(&program, &defines, openmp);
     if !errors.is_empty() {
         panic!("--define errors: {errors:?}");
     }
@@ -359,7 +373,7 @@ fn overriding_an_unknown_name_is_a_reported_error() {
     );
     let program = result.unwrap();
     let (_, errors) =
-        Registry::build_with_defines(&program, &[("NOPE".to_string(), "1".to_string())]);
+        Registry::build_with_defines(&program, &[("NOPE".to_string(), "1".to_string())], true);
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].contains("no such const/define"), "{errors:?}");
 }
@@ -380,7 +394,7 @@ fn overriding_a_real_const_is_a_reported_error() {
     );
     let program = result.unwrap();
     let (_, errors) =
-        Registry::build_with_defines(&program, &[("SEUIL".to_string(), "7".to_string())]);
+        Registry::build_with_defines(&program, &[("SEUIL".to_string(), "7".to_string())], true);
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(
         errors[0].contains("never overridable") && errors[0].contains("declare it `define`"),
@@ -405,6 +419,7 @@ fn a_badly_typed_cli_define_value_is_a_reported_error() {
     let (_, errors) = Registry::build_with_defines(
         &program,
         &[("SEUIL".to_string(), "seven".to_string())],
+        true,
     );
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].contains("not a valid"), "{errors:?}");
@@ -444,4 +459,59 @@ fn unary_negation_composes_with_binary_operators_in_generic_argument_position() 
     ";
     // -(3 * 2) + 10 = 4.
     assert_eq!(run_i32(&context, src), 4);
+}
+
+/// `CLEAVE_OPENMP` -- the first compiler-injected constant (`Registry::
+/// inject_compiler_define`'s own doc comment, `doc/plan-blas-native.md`'s
+/// own §2 "Constantes injectées par le compilateur") -- is usable as an
+/// ordinary value, and genuinely reflects whichever `openmp` value this
+/// exact compilation resolved, not a hardcoded default baked in once.
+#[test]
+fn cleave_openmp_reflects_the_resolved_openmp_option() {
+    let context = context();
+    let src = "fn main() -> i32 { if CLEAVE_OPENMP { 1 } else { 0 } }";
+    assert_eq!(
+        run_i32_with_defines_and_openmp(&context, src, &[], true),
+        1
+    );
+    assert_eq!(
+        run_i32_with_defines_and_openmp(&context, src, &[], false),
+        0
+    );
+}
+
+/// `Registry::list_defines` -- `--dump-defines`'s own one real consumer --
+/// lists every currently-resolved `define`, source-declared or compiler-
+/// injected alike, sorted by name, and excludes an ordinary `const`
+/// entirely (a `const` is never a `define`, `is_define`'s own doc comment).
+#[test]
+fn list_defines_includes_declared_and_injected_defines_but_not_consts() {
+    let (result, _sources) = compile(
+        vec![(
+            "test.cleave".to_string(),
+            "const PI_APPROX: i32 = 3;\n\
+             define SEUIL: i32 = 100;\n\
+             define FLAG: bool = false;\n\
+             fn main() -> i32 { 0 }"
+                .to_string(),
+        )],
+        &[],
+    );
+    let program = result.unwrap();
+    let (registry, errors) =
+        Registry::build_with_defines(&program, &[("SEUIL".to_string(), "42".to_string())], true);
+    assert!(errors.is_empty(), "{errors:?}");
+
+    let defines = registry.list_defines();
+    let names: Vec<&str> = defines.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, vec!["CLEAVE_OPENMP", "FLAG", "SEUIL"], "{names:?}");
+
+    let seuil = defines.iter().find(|(n, _)| n == "SEUIL").unwrap().1;
+    assert_eq!(seuil, cleave::infer::ConstValue::Int(42));
+    let openmp = defines
+        .iter()
+        .find(|(n, _)| n == "CLEAVE_OPENMP")
+        .unwrap()
+        .1;
+    assert_eq!(openmp, cleave::infer::ConstValue::Bool(true));
 }
