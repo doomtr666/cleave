@@ -5,7 +5,9 @@ use cleave::cps::{
 use cleave::driver::compile;
 use cleave::egraph::{DerivativeRequest, optimize_program, synthesize_derivatives};
 use cleave::mlir_lower::lower_program;
-use cleave::pipeline::{check_type_errors, strip_ciface_wrapper_debug_info};
+use cleave::pipeline::{
+    CodegenOptions, check_type_errors, lower_to_llvm, strip_ciface_wrapper_debug_info,
+};
 use cleave::registry::Registry;
 use melior::Context;
 use melior::dialect::DialectRegistry;
@@ -315,6 +317,45 @@ fn run_i32(context: &Context, src: &str) -> i32 {
 /// added to `run_i32` itself — tried first, reverted: it broke five other,
 /// already-passing tests elsewhere in this file, too invasive a change to
 /// a helper 125+ tests already share for a gap only this one test hits.
+/// Compiles `src` through the *full* optimized pipeline (`eliminate_dead_
+/// code`/`optimize_program`/`eliminate_dead_code`, matching `main.rs`'s own
+/// `--dump-mlir-lowered`/`--emit-object` -- unlike the bare `lower` helper
+/// above, which skips `optimize_program` entirely) and returns the printed,
+/// canonicalized `llvm`-dialect text -- for asserting a provably-dead
+/// branch's own callee never appears as a residual declaration, the same
+/// check `llvm-objdump -t`'s own symbol table gives on a real emitted
+/// object (`doc/backlog.md`'s own "constants injected by the compiler"
+/// item, §2's "no residual `extern`" criterion). No tensor/bufferization
+/// stage here on purpose -- every caller of this helper is a plain scalar
+/// program, so the shorter, tensor-free tail of `run_i32_from_cps`'s own
+/// pass sequence (canonicalize, then straight to `llvm`) is enough.
+fn lowered_llvm_text(context: &Context, src: &str) -> String {
+    let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
+    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+    let registry = Registry::build(&program);
+    if let Err(diags) = check_type_errors(&program, &registry) {
+        panic!("type check failed: {diags:?}");
+    }
+    let units = collect_units(&program, &registry);
+    let cps_program = convert_program(units, None);
+    let cps_program = eliminate_dead_code(cps_program);
+    let (cps_program, _) = optimize_program(cps_program, &registry, false);
+    let cps_program = eliminate_dead_code(cps_program);
+
+    let mlir_types = collect_mlir_types(&program);
+    let struct_schemas = collect_struct_schemas(&program);
+    let mut module = lower_program(context, &cps_program, &mlir_types, struct_schemas);
+    assert!(
+        module.as_operation().verify(),
+        "generated MLIR module failed verification"
+    );
+
+    let options = CodegenOptions::default();
+    cleave::options::set(options.clone());
+    lower_to_llvm(context, &mut module, &options).unwrap_or_else(|e| panic!("lower_to_llvm failed: {e:?}"));
+    module.as_operation().to_string()
+}
+
 fn run_i32_with_optimization_pass(context: &Context, src: &str) -> i32 {
     let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
@@ -2432,6 +2473,95 @@ fn a_const_generic_compared_via_an_operator_inside_an_if_actually_runs() {
         fn main() -> i32 { choose::<200>() + choose::<5>() }
     ";
     assert_eq!(run_i32(&context, src), 3);
+}
+
+/// `doc/plan-blas-native.md`'s own §2, last remaining criterion: an `if`
+/// whose condition folds to a compile-time-known constant must eliminate
+/// the untaken branch *before* lowering — no residual `extern` call *or*
+/// declaration for it, so a native-only build never needs an unavailable
+/// symbol (BLAS, say) resolvable just because the branch that would have
+/// called it exists in source. Found, by direct testing rather than
+/// assumed, to already hold — no new mechanism needed: the untaken branch's
+/// own `extern fn` never even reaches a declaration in the lowered `llvm`
+/// dialect text, confirmed the same way a real compiled object's own
+/// symbol table would show it (`llvm-objdump -t`, used directly against a
+/// real `--emit-object` build while investigating this).
+#[test]
+fn a_compile_time_false_if_condition_leaves_no_residual_extern_declaration_for_the_dead_branch() {
+    let context = context();
+    let src = "
+        extern fn taken_branch(x: i32) -> i32;
+        extern fn dead_branch(x: i32) -> i32;
+        define FLAG: bool = true;
+        fn main() -> i32 {
+            if FLAG { taken_branch(1) } else { dead_branch(2) }
+        }
+    ";
+    let text = lowered_llvm_text(&context, src);
+    assert!(text.contains("taken_branch"), "{text}");
+    assert!(!text.contains("dead_branch"), "{text}");
+}
+
+/// The `and`/`or` sibling of the test above — a compile-time-constant
+/// operand short-circuits the whole condition, eliminating the branch it
+/// guards the same way a plain `if FLAG` does. `USE_BLAS and N*M*K >
+/// THRESHOLD` (`doc/plan-blas-native.md`'s own §7 dispatch shape) needs
+/// exactly this: `USE_BLAS` alone being `true` must not be enough to keep
+/// the BLAS-calling branch's own declaration around once the *other* half
+/// of the `and` is also known and makes the whole condition `false`.
+#[test]
+fn and_short_circuits_a_compile_time_constant_leaving_no_residual_extern_declaration() {
+    let context = context();
+    let src = "
+        extern fn should_not_be_linked(x: i32) -> i32;
+        define USE_BLAS: bool = false;
+        fn main() -> i32 {
+            if USE_BLAS and 5 > 2 { should_not_be_linked(1) } else { 0 }
+        }
+    ";
+    let text = lowered_llvm_text(&context, src);
+    assert!(!text.contains("should_not_be_linked"), "{text}");
+}
+
+/// The real motivating shape from `doc/plan-blas-native.md`'s own §7: a
+/// size-threshold dispatch driven by *const generics*, not just a bare
+/// `define` -- `USE_BLAS and N*M*K > THRESHOLD`, `N`/`M`/`K` concrete only
+/// once a specific instantiation (`dispatch::<4,4,4>()`) exists. `4*4*4 =
+/// 64`, nowhere near the threshold, so the BLAS-shaped branch must be
+/// eliminated at *this* instantiation even though `USE_BLAS` itself is
+/// `true` -- proving the fold survives all the way through monomorphization
+/// into a concrete const-generic value, not just a source-level literal.
+#[test]
+fn a_const_generic_driven_size_threshold_dispatch_eliminates_the_unreachable_blas_shaped_branch() {
+    let context = context();
+    let src = "
+        extern fn blas_like_call(x: i32) -> i32;
+        define USE_BLAS: bool = true;
+        fn dispatch<const N: i32, const M: i32, const K: i32>() -> i32 {
+            if USE_BLAS and N * M * K > 1000000 { blas_like_call(1) } else { 2 }
+        }
+        fn main() -> i32 { dispatch::<4, 4, 4>() }
+    ";
+    let text = lowered_llvm_text(&context, src);
+    assert!(!text.contains("blas_like_call"), "{text}");
+    assert_eq!(run_i32(&context, src), 2);
+}
+
+/// The correctness half of the same criterion: folding a condition to a
+/// constant must never *skip* type-checking the branch it eliminates — a
+/// real type error inside a provably-dead branch is still a real, located
+/// error, not silently accepted just because the branch will never run.
+#[test]
+#[should_panic(expected = "type check failed")]
+fn a_type_error_inside_a_compile_time_dead_branch_is_still_a_real_error() {
+    let context = context();
+    let src = "
+        define FLAG: bool = true;
+        fn main() -> i32 {
+            if FLAG { 1 } else { \"not an i32\" }
+        }
+    ";
+    let _ = lowered_llvm_text(&context, src);
 }
 
 /// `doc/backlog.md`'s own "Complex literals" item — `2i + 4` used to be
