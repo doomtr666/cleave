@@ -46,6 +46,7 @@ fn emitting_an_object_for_a_program_that_calls_a_real_extern_fn_does_not_crash()
         Some(&object_path),
         None,
         &CodegenOptions::default(),
+        &[],
     );
 
     assert!(
@@ -90,6 +91,7 @@ fn emitting_an_object_for_a_program_with_a_genuinely_custom_extern_fn_does_not_c
         Some(&object_path),
         None,
         &CodegenOptions::default(),
+        &[],
     );
 
     assert!(

@@ -334,6 +334,38 @@ fn main() -> i32 {
 
 `N` is checked exactly like a type generic — `Vector<f64, 3>` and `Vector<f64, 4>` are genuinely different, incompatible types, the same way `Vector<f64, _>` and `Vector<i32, _>` would be.
 
+## `const`/`define`: naming a compile-time value
+
+A top-level `const NAME: T = expr;` gives a name to a value known at compile time — usable anywhere an ordinary value of type `T` would be, *and* in const-generic position (`Vector::<f64, N>`, above):
+
+```
+const SEUIL: i32 = 100;
+fn main() -> i32 { SEUIL + 1 }
+```
+
+**There's no separate "const expression" grammar category to learn.** `expr` on the right of `const NAME: T =` can be any arithmetic combination the compiler can actually fold — named consts, literals, unary/binary operators, nested arbitrarily — and the identical rule applies in const-generic position:
+
+```
+const A: i32 = 3;
+const B: i32 = 5;
+const C: i32 = 2;
+fn probe<const N: i32>() -> i32 { N }
+fn main() -> i32 { probe::<(A + B) * C - 1>() }   // (3 + 5) * 2 - 1 = 15
+```
+
+This is a deliberate choice, not an oversight: some languages grow a dedicated `constexpr`-style sublanguage for this; others spend years widening what a const generic is allowed to be. cleave draws the line at exactly one place instead — *foldable*, full stop — and grows what counts as foldable (`cleave/src/const_eval.rs`) rather than inventing a second, parallel expression grammar.
+
+`const` really does mean const: nothing, including the CLI, can ever override one. For a value that should default to something in source but stay overridable from outside — a build-time feature flag, say — declare it `define` instead:
+
+```
+define FLAG: bool = false;
+fn main() -> i32 { if FLAG { 1 } else { 0 } }
+```
+
+Left alone, a `define` behaves exactly like a `const` with that same default value. `--define FLAG=true` on the command line (or `.define("FLAG", "true")` on `cleave-build`'s own `Build`) overrides it before compilation ever sees the file's own default — the same `-D`/`#define` role a C build's own `-D` flag plays, except the override is checked against the `define`'s declared type (`parse_define_value`: `"true"`/`"false"` for `bool`, an integer otherwise) rather than pasted in as raw text. `define NAME: T;`, with no `= expr` at all, is legal too — it must then be supplied externally, or compilation fails with a located error naming exactly which `define` was never resolved. Once resolved, by whichever path, a `define` is indistinguishable from a `const` for the rest of the compiler — the distinction is only ever about *where the value came from*, never about how it behaves afterward.
+
+Naming a real `const` in `--define`/`.define(...)` is a reported error, not a silent override — "const" keeps meaning what it says.
+
 ## Turbofish: `::<...>`, for when inference needs a hint
 
 Most of the time, a generic argument is inferred from how a value is used and never needs to be written down. When there's nothing to infer it *from* — an empty array, or a bare numeric literal that would otherwise default to the wrong shape — spell it out explicitly with `::<...>`:

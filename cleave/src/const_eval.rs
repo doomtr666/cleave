@@ -50,6 +50,20 @@ pub fn eval_binop(op: &str, a: ConstValue, b: ConstValue) -> Option<ConstValue> 
     }
 }
 
+/// The unary counterpart of `eval_binop` — `-a`/`not a` (`lower.rs::lower_
+/// unary`'s own desugaring: `"-" => "neg"`, `"not" => "not"`), the only two
+/// unary operators this project's own grammar produces. Two's-complement
+/// wrapping negation, same reasoning `eval_binop`'s own `add`/`mul`/`sub`
+/// already rely on: the identical `u64` bit pattern regardless of whether
+/// the operand is "meant" to be signed.
+pub fn eval_unop(op: &str, a: ConstValue) -> Option<ConstValue> {
+    match (op, a) {
+        ("neg", ConstValue::Int(x)) => Some(ConstValue::Int(0u64.wrapping_sub(x))),
+        ("not", ConstValue::Bool(b)) => Some(ConstValue::Bool(!b)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,5 +130,21 @@ mod tests {
             eval_binop("div", ConstValue::Int(4), ConstValue::Int(0)),
             None
         );
+    }
+
+    #[test]
+    fn neg_negates_an_int_via_wrapping_subtraction_from_zero() {
+        assert_eq!(eval_unop("neg", ConstValue::Int(5)), Some(ConstValue::Int(0u64.wrapping_sub(5))));
+    }
+
+    #[test]
+    fn not_negates_a_bool() {
+        assert_eq!(eval_unop("not", ConstValue::Bool(true)), Some(ConstValue::Bool(false)));
+        assert_eq!(eval_unop("not", ConstValue::Bool(false)), Some(ConstValue::Bool(true)));
+    }
+
+    #[test]
+    fn neg_on_a_bool_is_not_evaluated() {
+        assert_eq!(eval_unop("neg", ConstValue::Bool(true)), None);
     }
 }

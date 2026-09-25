@@ -218,7 +218,69 @@ pub fn check_type_errors(program: &Program, registry: &Registry) -> Result<(), V
     let (_, errs) = crate::monomorphize::dump_monomorphized(program, registry);
     let mut diags: Vec<Diagnostic> = errs.iter().map(Diagnostic::from).collect();
     diags.extend(check_mutability_errors(program));
+    diags.extend(check_const_decl_errors(program, registry));
     if diags.is_empty() { Ok(()) } else { Err(diags) }
+}
+
+/// Every top-level `const NAME: T = expr;`'s own initializer must actually
+/// have evaluated -- `registry.rs::Registry::eval_global_consts`'s own
+/// evaluator is deliberately *permissive by omission* (an expression shape
+/// it doesn't recognize, including a reference to an undeclared name, is
+/// silently left unevaluated there, not reported -- that module's own doc
+/// comment says this diagnostic is "`infer.rs`'s own job"). Without this
+/// check, a const whose value never resolved would still type-check fine
+/// at every *use* site (`Registry::global_const_type` is populated
+/// unconditionally, straight from the AST's own declared type, regardless
+/// of whether evaluation succeeded) and only fail much later, confusingly,
+/// when `cps.rs::convert_expr` can't find a value for it either
+/// (`ConcreteUnit::global_consts`, also empty for this name) -- a real,
+/// found-by-testing gap, not a hypothetical: `const BOGUS: i32 =
+/// TOTALLY_UNDECLARED_NAME;` used to reach `panic!("CPS: unbound variable
+/// ...")` instead of a clean, located diagnostic.
+fn check_const_decl_errors(program: &Program, registry: &Registry) -> Vec<Diagnostic> {
+    program
+        .items
+        .iter()
+        .filter_map(|item| match &item.kind {
+            crate::ast::ItemKind::Const(d) if !registry.has_global_const_value(&d.name) => {
+                Some(Diagnostic::error(
+                    format!(
+                        "`const {}`'s own initializer is not a compile-time constant expression",
+                        d.name
+                    ),
+                    d.value.span,
+                ))
+            }
+            // A `define` can legitimately have nothing to evaluate at all
+            // (`grammar.pest`'s own `define_decl` doc comment: `= expr` is
+            // optional there, unlike `const_decl`'s own mandatory one) --
+            // still a real error if it stays unresolved (neither a default
+            // *nor* an external `--define` ever supplied a value), just a
+            // different, clearer message than a `const`'s own ("not a
+            // compile-time constant" would be actively misleading for a
+            // `define` with no default at all -- there's no expression here
+            // to have failed evaluating). `item.span` (the whole `define
+            // NAME: T [= expr];` item), not `d.value`'s -- that's `None`
+            // exactly in the case this message needs to cover.
+            crate::ast::ItemKind::Define(d) if !registry.has_global_const_value(&d.name) => {
+                Some(Diagnostic::error(
+                    match &d.value {
+                        Some(_) => format!(
+                            "`define {}`'s own default is not a compile-time constant expression, \
+                             and no `--define {}=...` provided a value",
+                            d.name, d.name
+                        ),
+                        None => format!(
+                            "`define {}` has no default and was not provided via `--define {}=...`",
+                            d.name, d.name
+                        ),
+                    },
+                    item.span,
+                ))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// A purely syntactic pass (`crate::infer::check_mutability`, no type
@@ -313,16 +375,28 @@ fn build_optimized_cps(
 /// through `emit_from_program` -- the simple, one-call API `cleave-build`
 /// actually wants: a build script has no pre-existing `Program` lying
 /// around the way `main.rs` does.
+///
+/// `defines` mirrors the CLI `--define NAME=VALUE` flag (`main.rs`'s own
+/// `build_registry` helper) -- `cleave-build::Build::define` is its
+/// `build.rs`-facing counterpart. A `--define`-level config error (unknown
+/// name, targets a real `const`, badly-typed value -- `Registry::build_
+/// with_defines`'s own doc comment) is reported through the same `Vec
+/// <String>` error channel every other failure here already uses, not a
+/// separate return shape.
 pub fn compile_and_emit(
     sources_in: Vec<(String, String)>,
     project_dirs: &[PathBuf],
     object_path: Option<&Path>,
     bindings_path: Option<&Path>,
     options: &CodegenOptions,
+    defines: &[(String, String)],
 ) -> Result<(), Vec<String>> {
     let (result, sources) = crate::driver::compile(sources_in, project_dirs);
     let program = result.map_err(|errs| render_all(&errs, &sources))?;
-    let registry = Registry::build(&program);
+    let (registry, define_errors) = Registry::build_with_defines(&program, defines);
+    if !define_errors.is_empty() {
+        return Err(define_errors);
+    }
     emit_from_program(
         &program,
         &registry,

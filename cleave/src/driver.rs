@@ -821,6 +821,7 @@ pub fn merge_programs(programs: Vec<Program>) -> Result<Program, Vec<Diagnostic>
     let mut items: Vec<Item> = Vec::new();
     let mut struct_names: Vec<String> = Vec::new();
     let mut fn_names: Vec<String> = Vec::new();
+    let mut const_names: Vec<String> = Vec::new();
     let mut algebras: Vec<AlgebraAcc> = Vec::new();
     let mut impls: Vec<ImplAcc> = Vec::new();
 
@@ -828,6 +829,34 @@ pub fn merge_programs(programs: Vec<Program>) -> Result<Program, Vec<Diagnostic>
         for item in program.items {
             match &item.kind {
                 ItemKind::Use(_) => items.push(item),
+                ItemKind::Const(d) => {
+                    if const_names.contains(&d.name) {
+                        errors.push(Diagnostic::error(
+                            format!("duplicate const/define `{}`", d.name),
+                            item.span,
+                        ));
+                        continue;
+                    }
+                    const_names.push(d.name.clone());
+                    items.push(item);
+                }
+                // Shares `const_names` with `Const` above, deliberately --
+                // one namespace for both (`--define NAME=...` must resolve
+                // unambiguously against either kind, `registry.rs::Registry
+                // ::global_consts`'s own doc comment has the full story), so
+                // `const X` and `define X` colliding is exactly as real a
+                // duplicate as two `const X`s.
+                ItemKind::Define(d) => {
+                    if const_names.contains(&d.name) {
+                        errors.push(Diagnostic::error(
+                            format!("duplicate const/define `{}`", d.name),
+                            item.span,
+                        ));
+                        continue;
+                    }
+                    const_names.push(d.name.clone());
+                    items.push(item);
+                }
                 ItemKind::Struct(d) => {
                     if struct_names.contains(&d.name) {
                         errors.push(Diagnostic::error(

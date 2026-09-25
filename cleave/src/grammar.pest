@@ -8,7 +8,7 @@ COMMENT = _{ "//" ~ (!NEWLINE ~ ANY)* }
 
 program = { SOI ~ item* ~ EOI }
 
-item = { use_decl | struct_decl | algebra_decl | impl_decl | fn_decl | derive_decl | grad_decl }
+item = { use_decl | const_decl | define_decl | struct_decl | algebra_decl | impl_decl | fn_decl | derive_decl | grad_decl }
 
 // ---------------------------------------------------------------- crates
 // `use linalg;` (or `use linalg::Matrix;`) is the only mechanism — no separate
@@ -24,6 +24,40 @@ item = { use_decl | struct_decl | algebra_decl | impl_decl | fn_decl | derive_de
 // a public package ecosystem, deferred, not needed at this project's current scope).
 use_decl = { "use" ~ path ~ ";" }
 path     = { ident ~ ("::" ~ ident)* }
+
+// `const SEUIL: i32 = 1_000_000;` — a whole-program, compile-time-known
+// value: not a mutable global (cleave has no such thing), a *name* for a
+// constant, evaluated once, before inference ever runs — `infer.rs`'s own
+// `const_value_from_expr`/`const_eval.rs` already do exactly this
+// evaluation for a const generic's own value; this reuses that, at
+// top-level scope, unconditionally rather than only inside a `<const N:
+// ...>` binder. `expr` here is deliberately unrestricted at the grammar
+// level (same posture `fn_decl`'s own doc comment above already
+// establishes for `const R: Int`) — "must reduce to a real constant" is a
+// semantic check (`infer.rs`), not a grammatical one.
+const_decl = { "const" ~ ident ~ ":" ~ type_ ~ "=" ~ expr ~ ";" }
+
+// `define SEUIL: i32 = 1_000_000;` — the C `-D`-equivalent: a *default*,
+// overridable from outside (`--define SEUIL=200000` on the CLI, `Build::
+// define` in `cleave-build`), resolved once, before inference ever runs,
+// exactly like `const_decl` above — the two share every later mechanism
+// (`registry.rs::Registry`'s own `global_consts`/`global_const_types`,
+// `infer.rs`'s `ExprKind::Path` fallback, `cps.rs`'s matching one). Once
+// resolved (external override if given, its own declared default
+// otherwise), a `define` is indistinguishable from a `const` for the rest
+// of the compiler's own lifetime — only the *source* of its value differs,
+// and only before that one resolution step ever runs. A real `const`
+// itself is never overridable this way (`pipeline.rs::check_define_errors`
+// rejects a `--define` naming one outright) — "const" keeps meaning what
+// it says.
+//
+// `= expr` is optional here, unlike `const_decl`'s own mandatory one — a
+// `define` with no default *requires* an external value (the same
+// "bodyless, real value lives outside" shape `fn_decl`'s own `extern fn`
+// already establishes for functions); one that's neither given a default
+// nor ever overridden is a real, located error (`check_const_decl_errors`),
+// not silently `0`/`false`.
+define_decl = { "define" ~ ident ~ ":" ~ type_ ~ ("=" ~ expr)? ~ ";" }
 
 // ---------------------------------------------------------------- fn
 
@@ -305,7 +339,40 @@ tuple_type  = { "(" ~ type_ ~ ("," ~ type_)+ ~ ","? ~ ")" }
 // parse as an ordinary (bogus) `path` — `ident` has no keyword exclusion anywhere in this
 // grammar (see `primary`'s own `literal | path` ordering for the same reason) — so `type_`
 // must lose that race, not win it.
-generic_arg = { numeric_lit | bool_lit | type_ }
+// `expr` last, as a genuine fallback, not a competing alternative: `type_`
+// already accepts a bare path (a const generic, or a whole-program `const`/
+// `define`, referenced by name — `SEUIL`, say), so it always wins that race
+// first, exactly like `array_dim`'s own identical `expr ~ pack_marker?`
+// shape already does for `[T; N]`'s own dimension. `expr` only ever gets a
+// real chance at something `type_`'s own grammar structurally *can't*
+// represent at all — a genuine arithmetic combination (`(A + B) * C - 1`,
+// `probe::<SEUIL + 1>()`) — no separate "const expression" grammar category
+// invented for it: any expression that folds to a concrete value wherever
+// one is needed is legal, the same permissive-by-omission posture `const_
+// eval.rs`'s own module doc comment already establishes; one that doesn't
+// fold is a real, located error from whichever pass actually needed the
+// value, not a grammar-level restriction.
+//
+// `type_ ~ &("," | ">")` — not plain `type_` — is the first of those two
+// alternatives, found necessary by direct testing: PEG ordered choice never
+// backtracks into a *later* alternative once an *earlier* one has matched
+// anything at all, even a strict prefix. `type_` matching just `x` out of
+// `x + 1` used to be accepted as the whole `generic_arg` on that strength
+// alone, leaving `+ 1` for the *enclosing* `turbofish`/`type_`'s own
+// `("," ~ generic_arg)* ~ ">"` to choke on — which it did, but with a
+// thoroughly misleading message (`"expected pack_marker"`, from a wholly
+// unrelated, already-abandoned parse branch pest's own error reporting
+// happened to have gotten furthest into). The lookahead (consumes nothing)
+// requires `type_`'s match to *actually* be a complete generic argument —
+// immediately followed by the real terminator, `,` or `>` — before
+// accepting it at all; failing that, ordered choice moves on to `expr`,
+// which parses `x + 1` correctly as the single arithmetic expression it
+// is. Every legitimate `type_` match (a real type, a bare const-generic
+// reference) already satisfies this trivially, since it's always
+// immediately followed by `,`/`>` in a well-formed program — this only
+// changes behavior for exactly the case that used to reach the wrong
+// alternative.
+generic_arg = { numeric_lit | bool_lit | (type_ ~ &("," | ">")) | expr }
 // Fortran-style sugar: `[f64; 3, 4]` for a fixed-size 3x4 block, desugars (at AST-building
 // time, not here) to the nested form `[[f64; 4]; 3]` — same semantics/layout either way.
 array_type  = { "[" ~ type_ ~ ";" ~ array_dim ~ ("," ~ array_dim)* ~ "]" }

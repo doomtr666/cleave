@@ -161,6 +161,16 @@ pub struct ConcreteUnit {
     pub param_types: Vec<Ty>,
     pub result: Ty,
     pub node_types: HashMap<NodeId, Ty>,
+    /// Every top-level `const NAME: T = expr;`'s own resolved value, name ->
+    /// value — the *same* whole-program snapshot (`Registry::global_
+    /// consts()`) cloned into *every* unit, deliberately: unlike `node_
+    /// types` (genuinely different per specialization), a global const's
+    /// value never varies by which unit references it, so there's nothing
+    /// to specialize -- see `registry.rs`'s own `Registry::global_consts`
+    /// doc comment for the fuller reasoning (why this is keyed by name, not
+    /// `NodeId`, and why it bypasses `Infer`/`monomorphize.rs` entirely).
+    /// `convert_expr`'s own `ExprKind::Path` handling is the one consumer.
+    pub global_consts: HashMap<String, ConstValue>,
     /// `Some((algebra, method))` for a unit built from an algebra-impl
     /// method (concrete or generic-specialized alike) — `None` for a
     /// top-level `fn`, an inherent-impl method, or a lambda unit. Threaded
@@ -339,6 +349,11 @@ pub fn collect_struct_schemas(program: &Program) -> HashMap<String, StructSchema
 pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit> {
     let (mono, program_inference) = monomorphize::monomorphize(program, registry);
     let mut units = Vec::new();
+    // One snapshot, cloned into every unit below -- `ConcreteUnit::global_
+    // consts`'s own doc comment has the full reasoning for why this is a
+    // single whole-program table, not threaded through `mono`/`program_
+    // inference` the way `node_types` is.
+    let global_consts = registry.global_consts();
 
     for item in &program.items {
         match &item.kind {
@@ -389,7 +404,32 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                         let mut vars = std::collections::HashSet::new();
                         crate::infer::free_vars(t, &mut vars);
                         !vars.is_empty()
-                    });
+                    })
+                    // `is_open`'s own free-vars check above only ever looks
+                    // at `param_types`/`result` -- blind to a *const*
+                    // generic that never appears in either (`fn value<const
+                    // N: i32>() -> i32 { N }`: no params, and `-> i32` is
+                    // already fully concrete, so `N`'s own still-open
+                    // value-var is invisible to it, even though the
+                    // function genuinely is generic and, uncalled, has no
+                    // resolved value for `N` anywhere). `f.generics` is the
+                    // AST's own declared generics list -- reading it
+                    // straight off `f` here is the identical "no inferred-
+                    // scheme quirks to worry about" reasoning this same
+                    // check already relies on for `is_extern`/`no_inline`
+                    // elsewhere in this function, and for the exact reason
+                    // this whole block's own doc comment above gives for
+                    // preferring `fn_result` over `program_inference.
+                    // global_env`'s stored scheme: never affected by the
+                    // `export fn touch(x: i32) { }` inference quirk that
+                    // comment warns about, since it never consults an
+                    // inferred scheme at all, just the source's own
+                    // declaration. Found live, by direct testing: `value`
+                    // above, declared and never called anywhere in the
+                    // program, used to build a unit anyway and panic deep
+                    // in CPS conversion ("unbound variable `N`") instead of
+                    // being skipped like any other uncalled generic.
+                    || !f.generics.is_empty();
                 if keys.is_empty() && is_open {
                     continue;
                 }
@@ -423,6 +463,7 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                         param_types: fn_result.param_types.clone(),
                         result: fn_result.result.clone(),
                         node_types: program_inference.node_types.clone(),
+                        global_consts: global_consts.clone(),
                         call_names: mono.seed_call_names().clone(),
                         origin: None,
                         no_inline: f.attrs.iter().any(|a| a.name == "no_inline"),
@@ -441,6 +482,7 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                             param_types: mono.param_types(key).to_vec(),
                             result: mono.result(key).clone(),
                             node_types: mono.node_types(key).clone(),
+                            global_consts: global_consts.clone(),
                             call_names: mono.call_names(key).clone(),
                             origin: None,
                             no_inline: f.attrs.iter().any(|a| a.name == "no_inline"),
@@ -556,6 +598,7 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                         param_types: infer.param_types.clone(),
                         result: ret,
                         node_types: infer.node_types.clone(),
+                        global_consts: global_consts.clone(),
                         call_names,
                         origin: Some((d.algebra.clone(), f.name.clone())),
                         no_inline: f.attrs.iter().any(|a| a.name == "no_inline"),
@@ -611,6 +654,7 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                             param_types: mono.param_types(key).to_vec(),
                             result: mono.result(key).clone(),
                             node_types: mono.node_types(key).clone(),
+                            global_consts: global_consts.clone(),
                             call_names: mono.call_names(key).clone(),
                             origin: Some((d.algebra.clone(), f.name.clone())),
                             no_inline: f.attrs.iter().any(|a| a.name == "no_inline"),
@@ -675,6 +719,7 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                 param_types,
                 result: mono.result(key).clone(),
                 node_types: node_types.clone(),
+                global_consts: global_consts.clone(),
                 call_names: mono.call_names(key).clone(),
                 origin: None,
                 no_inline: false,
@@ -847,6 +892,7 @@ fn build_higher_order_specializations(units: &mut Vec<ConcreteUnit>) {
         let callee_param_types = units[callee_idx].param_types.clone();
         let callee_result = units[callee_idx].result.clone();
         let callee_node_types = units[callee_idx].node_types.clone();
+        let callee_global_consts = units[callee_idx].global_consts.clone();
         let mut inner_call_names = units[callee_idx].call_names.clone();
 
         let erased_positions: HashSet<usize> = call.erased.iter().map(|(i, _)| *i).collect();
@@ -907,6 +953,7 @@ fn build_higher_order_specializations(units: &mut Vec<ConcreteUnit>) {
             param_types: new_param_types,
             result: callee_result,
             node_types: callee_node_types,
+            global_consts: callee_global_consts,
             call_names: inner_call_names,
             origin: None,
             no_inline: false,
@@ -1280,6 +1327,10 @@ struct Ctx<'a> {
     units: &'a HashMap<String, ConcreteUnit>,
     call_index: &'a CallIndex,
     node_types: &'a HashMap<NodeId, Ty>,
+    /// `ConcreteUnit::global_consts`'s own doc comment — a whole-program
+    /// const's own name -> resolved value, the one real consumer being
+    /// `ExprKind::Path`'s own conversion below.
+    global_consts: &'a HashMap<String, ConstValue>,
     call_names: &'a HashMap<NodeId, String>,
     /// Stage B only — see `ConcreteUnit::higher_order_args`'s own doc
     /// comment.
@@ -1464,6 +1515,7 @@ pub fn convert_program(units: Vec<ConcreteUnit>, sources: Option<&SourceMap>) ->
             units: &by_name,
             call_index: &call_index,
             node_types: &unit.node_types,
+            global_consts: &unit.global_consts,
             call_names: &unit.call_names,
             higher_order_args: &unit.higher_order_args,
             fresh: &fresh,
@@ -1893,19 +1945,32 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                     )
                 }
                 Some(v) => v.clone(),
-                // A const generic referenced as an ordinary value (`[v; N]`,
-                // `for i in 0..N`) is never bound as a real parameter/`let`
-                // -- by the time a `ConcreteUnit` reaches this module,
-                // monomorphization has already substituted its own
-                // `node_types` entry for this exact reference down to a
-                // resolved `Ty::Const` (see `infer.rs`'s own
-                // `seed_const_generics`/`const_widths`), so it converts the
-                // same way a literal does rather than needing to be seeded
-                // into `env` at all.
-                None => match &ctx.node_types[&expr.id] {
-                    Ty::Const(ConstValue::Int(n)) => CVal::Int(*n),
-                    Ty::Const(ConstValue::Bool(b)) => CVal::Bool(*b),
-                    _ => panic!("CPS: unbound variable `{name}`"),
+                None => match ctx.global_consts.get(&name) {
+                    // A whole-program `const` -- `infer.rs`'s own
+                    // `ExprKind::Path` fallback resolves this reference to
+                    // its *declared* type (an ordinary `Ty::Con`, not `Ty::
+                    // Const` -- `registry.rs::Registry::global_consts`'s own
+                    // doc comment explains why), so `ctx.node_types` alone
+                    // has nothing usable here; `ctx.global_consts` (cloned
+                    // straight from `Registry`, the same whole-program
+                    // value regardless of which unit this is) is where the
+                    // actual value comes from instead.
+                    Some(ConstValue::Int(n)) => CVal::Int(*n),
+                    Some(ConstValue::Bool(b)) => CVal::Bool(*b),
+                    // A const generic referenced as an ordinary value
+                    // (`[v; N]`, `for i in 0..N`) is never bound as a real
+                    // parameter/`let` -- by the time a `ConcreteUnit` reaches
+                    // this module, monomorphization has already substituted
+                    // its own `node_types` entry for this exact reference
+                    // down to a resolved `Ty::Const` (see `infer.rs`'s own
+                    // `seed_const_generics`/`const_widths`), so it converts
+                    // the same way a literal does rather than needing to be
+                    // seeded into `env` at all.
+                    None => match &ctx.node_types[&expr.id] {
+                        Ty::Const(ConstValue::Int(n)) => CVal::Int(*n),
+                        Ty::Const(ConstValue::Bool(b)) => CVal::Bool(*b),
+                        _ => panic!("CPS: unbound variable `{name}`"),
+                    },
                 },
             };
             k(v, env)

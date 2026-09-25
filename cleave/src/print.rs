@@ -51,6 +51,16 @@ impl Printer {
     fn print_item(&mut self, item: &Item) {
         match &item.kind {
             ItemKind::Use(path) => self.line(format!("use {};", fmt_path(path))),
+            ItemKind::Const(d) => self.line(format!(
+                "const {}: {} = {};",
+                d.name,
+                fmt_type(&d.ty),
+                fmt_expr(&d.value)
+            )),
+            ItemKind::Define(d) => self.line(match &d.value {
+                Some(v) => format!("define {}: {} = {};", d.name, fmt_type(&d.ty), fmt_expr(v)),
+                None => format!("define {}: {};", d.name, fmt_type(&d.ty)),
+            }),
             ItemKind::Struct(d) => self.print_struct_decl(d),
             ItemKind::Algebra(d) => self.print_algebra_decl(d),
             ItemKind::Impl(d) => self.print_impl_decl(d),

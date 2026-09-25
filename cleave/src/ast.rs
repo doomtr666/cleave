@@ -34,12 +34,40 @@ pub struct Node<T> {
 #[derive(Debug, Clone)]
 pub enum ItemKind {
     Use(Path),
+    Const(ConstDecl),
+    Define(DefineDecl),
     Struct(StructDecl),
     Algebra(AlgebraDecl),
     Impl(ImplDecl),
     Fn(FnDecl),
 }
 pub type Item = Node<ItemKind>;
+
+/// `const SEUIL: i32 = 1_000_000;` — a whole-program, compile-time-known
+/// value, evaluated once before inference runs (`infer.rs`'s own
+/// `global_consts`, built from every `ConstDecl` in the merged program).
+/// `value` is an ordinary `Expr` at the grammar level (`grammar.pest`'s own
+/// `const_decl` doc comment) — "reduces to a real constant" is checked once
+/// evaluation actually runs, not here.
+#[derive(Debug, Clone)]
+pub struct ConstDecl {
+    pub name: String,
+    pub ty: Type,
+    pub value: Expr,
+}
+
+/// `define SEUIL: i32 = 1_000_000;` — `grammar.pest`'s own `define_decl`
+/// doc comment has the full story (the C `-D`-equivalent: a default,
+/// overridable from outside, `const` in every other respect once
+/// resolved). `value` is `None` for a define with no default (`define
+/// SEUIL: i32;`) — requires an external value, mirroring `FnDecl::
+/// is_extern`'s own "bodyless, real value lives outside" shape.
+#[derive(Debug, Clone)]
+pub struct DefineDecl {
+    pub name: String,
+    pub ty: Type,
+    pub value: Option<Expr>,
+}
 
 #[derive(Debug, Clone)]
 pub struct StructDecl {
@@ -324,6 +352,10 @@ impl GenericParam {
         match self {
             GenericParam::Type { variadic, .. } | GenericParam::Const { variadic, .. } => *variadic,
         }
+    }
+
+    pub fn is_const(&self) -> bool {
+        matches!(self, GenericParam::Const { .. })
     }
 }
 

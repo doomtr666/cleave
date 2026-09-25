@@ -993,6 +993,26 @@ pub enum TypeErrorKind {
         struct_name: String,
         min_generics: usize,
     },
+    /// A turbofish/generic-argument slot whose *declared* generic parameter
+    /// is a `const` generic didn't receive a compile-time constant -- either
+    /// a bare name resolving to neither an enclosing const generic nor a
+    /// whole-program `const`/`define` (`probe::<x>()`, `x` an ordinary
+    /// runtime variable -- parses as a *type* argument, `grammar.pest::
+    /// generic_arg`'s own doc comment: a bare identifier always tries
+    /// `type_` first, so this and a genuine const-generic reference are
+    /// syntactically indistinguishable until semantic resolution actually
+    /// tries each), or a genuine arithmetic expression that doesn't fold
+    /// (`probe::<x + 1>()`) -- `generic_arg_to_ty`'s own doc comment has the
+    /// full story on why both collapse to the same check. `param` names the
+    /// declared const generic when a real declaration name is available (a
+    /// struct/algebra/top-level `fn`'s own `const N: T`); `None` for a
+    /// generalized `let`-bound lambda's own const generic, which has no
+    /// surviving source name by the time it reaches this check.
+    NotAConstGenericArg { param: Option<String> },
+    /// The reverse mismatch: a declared *type* generic parameter received a
+    /// const-generic-shaped argument (`Foo::<5>()` where `Foo<T>`'s own `T`
+    /// isn't `const`) instead of a type.
+    ExpectedTypeGenericArg { param: Option<String> },
 }
 
 impl std::fmt::Display for TypeErrorKind {
@@ -1148,6 +1168,26 @@ impl std::fmt::Display for TypeErrorKind {
                     "`{struct_name}` has a variadic generic — constructing it needs an explicit turbofish with at least {min_generics} argument(s) (e.g. `{struct_name}::<...>(...)`); inferring a pack's own arity from field values isn't supported yet"
                 )
             }
+            TypeErrorKind::NotAConstGenericArg { param } => match param {
+                Some(name) => write!(
+                    f,
+                    "`{name}` is a const generic parameter, but this argument is not a compile-time constant expression"
+                ),
+                None => write!(
+                    f,
+                    "this generic argument is not a compile-time constant expression"
+                ),
+            },
+            TypeErrorKind::ExpectedTypeGenericArg { param } => match param {
+                Some(name) => write!(
+                    f,
+                    "`{name}` is a type generic parameter, but this argument is a const-generic value, not a type"
+                ),
+                None => write!(
+                    f,
+                    "expected a type for this generic argument, found a const-generic value"
+                ),
+            },
         }
     }
 }
@@ -2231,7 +2271,7 @@ impl<'r> Infer<'r> {
         let mapping = self.fresh_generics_mapping(non_pack, span);
         for (g, explicit) in non_pack.iter().zip(explicit_generics) {
             let fresh = mapping[g.name()].clone();
-            let explicit_ty = self.generic_arg_to_ty(explicit);
+            let explicit_ty = self.generic_arg_to_ty(Some(g.name()), g.is_const(), explicit, span)?;
             self.unify_at(span, &fresh, &explicit_ty)?;
         }
         // The pack itself: every remaining turbofish argument, in order —
@@ -2240,8 +2280,8 @@ impl<'r> Infer<'r> {
         // the non-pack case above.
         let pack_tys: Vec<Ty> = explicit_generics[non_pack.len()..]
             .iter()
-            .map(|g| self.generic_arg_to_ty(g))
-            .collect();
+            .map(|g| self.generic_arg_to_ty(Some(pack_generic.name()), pack_generic.is_const(), g, span))
+            .collect::<Result<Vec<Ty>, TypeError>>()?;
 
         let mut seen: HashSet<String> = HashSet::new();
         for (name, value) in fields {
@@ -4785,6 +4825,22 @@ impl<'r> Infer<'r> {
                 if let Some(mapped) = mapping.get(&name) {
                     return mapped.clone();
                 }
+                // A bare name in generic-argument position is *always*
+                // parsed as a type at the grammar level (`grammar.pest`'s
+                // own `generic_arg = { numeric_lit | bool_lit | type_ }` --
+                // nothing short of a literal number/bool ever becomes
+                // `GenericArg::Const` there), so a whole-program `const`/
+                // `define` referenced this way (`Tensor<f32, SEUIL,
+                // SEUIL>`, `probe::<SEUIL>()`) arrives here exactly like any
+                // other bare type name would -- `const_value_from_expr`'s
+                // own identical registry fallback is *never reached* for
+                // this shape at all. Checked before the `algebra`/`struct`
+                // reasoning just below, for the same reason `mapping` is:
+                // a name can't simultaneously be a real const/define *and*
+                // a real type, so whichever resolves first is unambiguous.
+                if let Some(v) = self.registry.global_const_value(&name) {
+                    return Ty::Const(v);
+                }
                 // A bare name that resolves to a declared `algebra` (and
                 // isn't *also* a `struct` of the same name — legal, if
                 // confusing) is a real, common category error: an algebra
@@ -4950,9 +5006,23 @@ impl<'r> Infer<'r> {
                 .ok()
                 .map(|n| Ty::Const(ConstValue::Int(n))),
             ExprKind::BoolLit(b) => Some(Ty::Const(ConstValue::Bool(*b))),
-            ExprKind::Path(p) if p.segments.len() == 1 => {
-                mapping.get(&p.segments[0]).map(|t| self.subst.apply(t))
-            }
+            ExprKind::Path(p) if p.segments.len() == 1 => mapping
+                .get(&p.segments[0])
+                .map(|t| self.subst.apply(t))
+                // Not one of the *enclosing* fn/impl's own generics --
+                // a whole-program `const`/`define` referenced directly in
+                // const-generic position (`Tensor<f32, SEUIL, SEUIL>`,
+                // `probe::<SEUIL>()`) falls back to `Registry::global_
+                // const_value` the same way `mapping` itself would have
+                // resolved an ordinary const generic -- `Ty::Const`
+                // directly, correct here unlike `infer_expr_kind`'s own
+                // ordinary-value-position `Path` fallback (`registry.rs`'s
+                // own `global_consts` doc comment has the full contrast).
+                .or_else(|| {
+                    self.registry
+                        .global_const_value(&p.segments[0])
+                        .map(Ty::Const)
+                }),
             // `Dims...` in an array-dimension position (`[T; Dims...]`,
             // `doc/backlog.md`'s own "Variadic generics" item) — the exact
             // same bare-name-against-`mapping` lookup the `Path` arm just
@@ -4974,6 +5044,20 @@ impl<'r> Infer<'r> {
             // still runs, just always against an empty slice here).
             ExprKind::Call(path, _, args, ..) if path.segments.len() == 1 && args.len() == 1 => {
                 self.pack_len_from_method_call(mapping, &args[0], &path.segments[0], &[])
+                    // Not `.len()` sugar -- a real unary operator (`-N`,
+                    // `not FLAG`, `lower.rs::lower_unary`'s own desugaring)
+                    // applied to an already-concrete operand. Immediate
+                    // evaluation only, same as this arm's own binary
+                    // sibling's `Ty::Const`-vs-`Ty::Const` fast path just
+                    // below -- a still-open operand (an unresolved const
+                    // generic's own value-var) simply isn't foldable yet
+                    // here, `None`, same permissive-by-omission posture as
+                    // everywhere else in this function.
+                    .or_else(|| {
+                        let a = self.const_value_from_expr(&args[0], mapping)?;
+                        let Ty::Const(av) = a else { return None };
+                        const_eval::eval_unop(&path.segments[0], av).map(Ty::Const)
+                    })
             }
             ExprKind::Call(path, _, args, ..) if path.segments.len() == 1 && args.len() == 2 => {
                 let a = self.const_value_from_expr(&args[0], mapping)?;
@@ -5016,12 +5100,92 @@ impl<'r> Infer<'r> {
     /// too — `active_generics` is empty whenever none of this matters (a
     /// top-level, non-generic call site), so the overwhelmingly common case
     /// (a concrete type/const, `f64`/`4`/`true`) is unaffected either way.
-    fn generic_arg_to_ty(&mut self, g: &GenericArg) -> Ty {
-        match g {
-            GenericArg::Type(t) => self.ty_from_ast_mapped(t, &self.active_generics.clone()),
-            GenericArg::Const(e) => self
-                .const_value_from_expr(e, &self.active_generics.clone())
-                .unwrap_or_else(|| self.vars.fresh()),
+    /// `param`/`is_const` describe the *declared* generic parameter this
+    /// argument is being resolved against (its name, when one survives to
+    /// this call site, and whether it's a `const` generic or an ordinary
+    /// type generic) — used only to produce a comprehensible, located
+    /// diagnostic on mismatch, never to change which resolution strategy
+    /// runs for a *correctly*-shaped argument.
+    ///
+    /// **A `const` generic never silently falls back to a fresh, unresolved
+    /// var on failure the way this used to** (found by direct testing:
+    /// `probe::<x>()` for a runtime-only `x` used to crash CPS conversion
+    /// with "unbound variable", and `probe::<x + 1>()` used to fail to even
+    /// *parse*, with a misleading "expected pack_marker" message unrelated
+    /// to the real problem — neither told the caller what was actually
+    /// wrong). Both collapse to the identical check here: a bare identifier
+    /// always parses as `GenericArg::Type` first (`grammar.pest::
+    /// generic_arg`'s own doc comment — `type_` is tried before `expr`, and
+    /// a lone path always matches it), true whether it's a legitimate
+    /// reference to an enclosing const generic/whole-program `const`/
+    /// `define`, or a genuinely bogus name — so when the *declared* slot is
+    /// `const`, a bare single-segment `GenericArg::Type` is converted back
+    /// into the equivalent `Expr::Path` and routed through the exact same
+    /// `const_value_from_expr` a real `GenericArg::Const` already uses,
+    /// rather than through `ty_from_ast_mapped` (which would otherwise
+    /// silently invent an opaque `Ty::Con(name)` placeholder for anything
+    /// unrecognized — fine for an ordinary type-generic slot, since nothing
+    /// downstream ever needs more than a type-shaped tag for one of those,
+    /// but never correct for a const-generic slot, which needs a real
+    /// *value*, not a type-shaped stand-in with nothing behind it). Either
+    /// way, failure to resolve is now a real `TypeError`, not a silent
+    /// fresh var that only surfaces its absence much later, confusingly, in
+    /// CPS conversion.
+    fn generic_arg_to_ty(
+        &mut self,
+        param: Option<&str>,
+        is_const: bool,
+        g: &GenericArg,
+        span: Span,
+    ) -> Result<Ty, TypeError> {
+        if is_const {
+            // A pack forward (`Dims...`, `fn fill<T, const Dims...: i32>(v: T)
+            // -> Tensor<T, Dims...>`'s own motivating case) parses as `type_`'s
+            // own `pack_ref` alternative, not a bare `path` -- resolved
+            // exactly as `ty_from_ast_mapped`'s own `TypeKind::PackRef` arm
+            // already does (a real `Ty::Pack`/`Ty::PackResolved`, standing in
+            // for however many concrete values the pack turns out to hold),
+            // left untouched by the stricter check below: a pack forward is
+            // legitimately const *and* is never a single value expression at
+            // all, so it can never be routed through `const_value_from_expr`.
+            if let GenericArg::Type(t) = g {
+                if matches!(&t.kind, TypeKind::PackRef(_)) {
+                    return Ok(self.ty_from_ast_mapped(t, &self.active_generics.clone()));
+                }
+            }
+            let as_const_expr: Option<Expr> = match g {
+                GenericArg::Const(e) => Some(e.clone()),
+                GenericArg::Type(t) => match &t.kind {
+                    TypeKind::Path(p, generic_args)
+                        if generic_args.is_empty() && p.segments.len() == 1 =>
+                    {
+                        Some(Node {
+                            id: t.id,
+                            span: t.span,
+                            kind: ExprKind::Path(p.clone()),
+                        })
+                    }
+                    _ => None,
+                },
+            };
+            as_const_expr
+                .and_then(|e| self.const_value_from_expr(&e, &self.active_generics.clone()))
+                .ok_or_else(|| TypeError {
+                    span,
+                    kind: TypeErrorKind::NotAConstGenericArg {
+                        param: param.map(str::to_string),
+                    },
+                })
+        } else {
+            match g {
+                GenericArg::Type(t) => Ok(self.ty_from_ast_mapped(t, &self.active_generics.clone())),
+                GenericArg::Const(_) => Err(TypeError {
+                    span,
+                    kind: TypeErrorKind::ExpectedTypeGenericArg {
+                        param: param.map(str::to_string),
+                    },
+                }),
+            }
         }
     }
 
@@ -5281,11 +5445,42 @@ impl<'r> Infer<'r> {
             ExprKind::BoolLit(_) => Ok(Ty::Con("bool".to_string())),
             ExprKind::Path(p) => {
                 let name = p.segments.join("::");
-                let scheme = env.get(&name).cloned().ok_or(TypeError {
-                    span: expr.span,
-                    kind: TypeErrorKind::UnknownName(name),
-                })?;
-                Ok(self.instantiate(&scheme))
+                match env.get(&name) {
+                    Some(scheme) => Ok(self.instantiate(&scheme.clone())),
+                    // Not a local binding (parameter/`let`/const generic) --
+                    // a whole-program `const` with this name, if one exists,
+                    // is checked *after* local scope, never before: an
+                    // ordinary shadowing rule, the same one an inner `let`
+                    // already gets over an outer one.
+                    //
+                    // Resolves to the const's own *declared* type (`Ty::Con`,
+                    // via `ty_from_ast`) here -- deliberately *not*
+                    // `Ty::Const(v)` (`Registry::global_consts`'s own doc
+                    // comment has the full reasoning): two *different*
+                    // top-level consts of the same declared type, combined
+                    // through a shared generic `T` (`add(A, B)`), must unify
+                    // freely against each other the same way two ordinary
+                    // `i32` values would -- `unify`'s own `(Ty::Const(x),
+                    // Ty::Const(y)) if x == y` arm is correct for its real
+                    // purpose (two dimensions in a `Tensor<f32,N,M>` slot
+                    // genuinely must match exactly) and would wrongly reject
+                    // this if reused here. The actual *value* never needs to
+                    // reach this pass at all -- `cps.rs::collect_units`
+                    // clones `Registry::global_consts()` straight into every
+                    // `ConcreteUnit`, consulted by `convert_expr`'s own
+                    // `Path` handling directly from `Registry`, independent
+                    // of anything `node_types` carries.
+                    None => match self.registry.global_const_type(&name) {
+                        Some(decl_ty) => {
+                            let decl_ty = decl_ty.clone();
+                            Ok(self.ty_from_ast(&decl_ty))
+                        }
+                        None => Err(TypeError {
+                            span: expr.span,
+                            kind: TypeErrorKind::UnknownName(name),
+                        }),
+                    },
+                }
             }
             // A reserved raw-MLIR-op call (`mlir::arith::addi(a, b)`) --
             // skips algebra/top-level-fn resolution entirely: type-check
@@ -5659,12 +5854,10 @@ impl<'r> Infer<'r> {
                         });
                     }
                     for (g, explicit) in struct_generics.iter().zip(explicit_generics) {
-                        let name = match g {
-                            GenericParam::Type { name, .. } => name,
-                            GenericParam::Const { name, .. } => name,
-                        };
+                        let name = g.name();
                         let fresh = generics_mapping[name].clone();
-                        let explicit_ty = self.generic_arg_to_ty(explicit);
+                        let explicit_ty =
+                            self.generic_arg_to_ty(Some(name), g.is_const(), explicit, expr.span)?;
                         self.unify_at(expr.span, &fresh, &explicit_ty)?;
                     }
                 }
@@ -5916,7 +6109,8 @@ impl<'r> Infer<'r> {
                 // order for the common case.
                 for (v, g) in scheme.vars.iter().zip(explicit_generics) {
                     let fresh = mapping[v].clone();
-                    let explicit_ty = self.generic_arg_to_ty(g);
+                    let is_const = scheme.const_widths.contains_key(v);
+                    let explicit_ty = self.generic_arg_to_ty(None, is_const, g, call_span)?;
                     self.unify_at(call_span, &fresh, &explicit_ty)?;
                 }
             }
@@ -6039,12 +6233,10 @@ impl<'r> Infer<'r> {
                 });
             }
             for (param, explicit) in generics.iter().zip(explicit_generics) {
-                let param_name = match param {
-                    GenericParam::Type { name, .. } => name,
-                    GenericParam::Const { name, .. } => name,
-                };
+                let param_name = param.name();
                 let fresh = mapping[param_name].clone();
-                let explicit_ty = self.generic_arg_to_ty(explicit);
+                let explicit_ty =
+                    self.generic_arg_to_ty(Some(param_name), param.is_const(), explicit, call_span)?;
                 self.unify_at(call_span, &fresh, &explicit_ty)?;
             }
         }

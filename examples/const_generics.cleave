@@ -1,0 +1,10 @@
+use io;
+
+fn value<const N: i32>() -> i32 {
+    N
+}
+
+fn main() -> i32 {
+    println(value::<5>() + value::<3>());
+    0
+}

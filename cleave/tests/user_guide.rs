@@ -460,6 +460,42 @@ fn const_generic_array_field() {
     assert_eq!(run_i32(&context, src), 1);
 }
 
+// ---------------------------------------------------------------- const/define
+
+#[test]
+fn a_named_const_is_usable_as_an_ordinary_value() {
+    let context = context();
+    let src = "
+        const SEUIL: i32 = 100;
+        fn main() -> i32 { SEUIL + 1 }
+    ";
+    assert_eq!(run_i32(&context, src), 101);
+}
+
+#[test]
+fn arbitrary_foldable_arithmetic_on_named_consts_works_in_generic_argument_position() {
+    let context = context();
+    let src = "
+        const A: i32 = 3;
+        const B: i32 = 5;
+        const C: i32 = 2;
+        fn probe<const N: i32>() -> i32 { N }
+        fn main() -> i32 { probe::<(A + B) * C - 1>() }
+    ";
+    // (3 + 5) * 2 - 1 = 15.
+    assert_eq!(run_i32(&context, src), 15);
+}
+
+#[test]
+fn a_define_left_unoverridden_uses_its_own_default() {
+    let context = context();
+    let src = "
+        define FLAG: bool = false;
+        fn main() -> i32 { if FLAG { 1 } else { 0 } }
+    ";
+    assert_eq!(run_i32(&context, src), 0);
+}
+
 // ---------------------------------------------------------------- Turbofish
 
 #[test]

@@ -78,6 +78,7 @@ pub struct Build {
     dps_passthrough: Option<bool>,
     tag_releases: Option<bool>,
     debug_info: Option<bool>,
+    defines: Vec<(String, String)>,
 }
 
 impl Default for Build {
@@ -103,6 +104,7 @@ impl Build {
             dps_passthrough: None,
             tag_releases: None,
             debug_info: None,
+            defines: Vec::new(),
         }
     }
 
@@ -198,6 +200,21 @@ impl Build {
     /// See `cleave::pipeline::CodegenOptions::debug_info`'s own doc comment.
     pub fn debug_info(&mut self, enabled: bool) -> &mut Self {
         self.debug_info = Some(enabled);
+        self
+    }
+
+    /// Overrides a source-level `define NAME: T [= expr];` (`cleave`'s own
+    /// `--define NAME=VALUE` CLI flag, this crate's `build.rs`-facing
+    /// counterpart -- `pipeline.rs::compile_and_emit`'s own doc comment).
+    /// `value` is unparsed text, checked against the `define`'s own
+    /// declared type only once `compile` actually runs (`Registry::parse_
+    /// define_value`) -- `"true"`/`"false"` for a `bool`, a plain integer
+    /// otherwise. Naming a `const` instead of a `define`, or a name that
+    /// doesn't exist at all, is a reported error from `compile`, not a
+    /// silent no-op -- a `const` never accepts an override, "const" keeps
+    /// meaning what it says.
+    pub fn define(&mut self, name: impl Into<String>, value: impl Into<String>) -> &mut Self {
+        self.defines.push((name.into(), value.into()));
         self
     }
 
@@ -308,6 +325,7 @@ impl Build {
                         Some(&object_path),
                         Some(&bindings_path),
                         &options,
+                        &self.defines,
                     )
                 })
                 .expect("cleave-build: failed to spawn the compile thread")

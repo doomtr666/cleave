@@ -82,6 +82,8 @@ impl Lowerer {
         let inner = pair.into_inner().next().unwrap();
         let kind = match inner.as_rule() {
             Rule::use_decl => ItemKind::Use(self.lower_use_decl(inner)),
+            Rule::const_decl => ItemKind::Const(self.lower_const_decl(inner)),
+            Rule::define_decl => ItemKind::Define(self.lower_define_decl(inner)),
             Rule::struct_decl => ItemKind::Struct(self.lower_struct_decl(inner)),
             Rule::algebra_decl => ItemKind::Algebra(self.lower_algebra_decl(inner)),
             Rule::impl_decl => {
@@ -319,6 +321,22 @@ impl Lowerer {
     }
 
     // ---------------------------------------------------------------- struct
+
+    fn lower_const_decl(&mut self, pair: Pair<Rule>) -> ConstDecl {
+        let mut inner = pair.into_inner();
+        let name = inner.next().unwrap().as_str().to_string();
+        let ty = self.lower_type(inner.next().unwrap());
+        let value = self.lower_expr(inner.next().unwrap());
+        ConstDecl { name, ty, value }
+    }
+
+    fn lower_define_decl(&mut self, pair: Pair<Rule>) -> DefineDecl {
+        let mut inner = pair.into_inner();
+        let name = inner.next().unwrap().as_str().to_string();
+        let ty = self.lower_type(inner.next().unwrap());
+        let value = inner.next().map(|p| self.lower_expr(p));
+        DefineDecl { name, ty, value }
+    }
 
     fn lower_struct_decl(&mut self, pair: Pair<Rule>) -> StructDecl {
         let mut inner = pair.into_inner().peekable();
@@ -590,6 +608,11 @@ impl Lowerer {
             Rule::type_ => GenericArg::Type(self.lower_type(inner)),
             Rule::numeric_lit => GenericArg::Const(self.lower_numeric_lit(inner)),
             Rule::bool_lit => GenericArg::Const(self.lower_bool_lit(inner)),
+            // `grammar.pest`'s own `generic_arg` doc comment -- only ever
+            // reached for something `type_`'s own grammar structurally
+            // can't represent (a real arithmetic combination), since a bare
+            // path already parses as `type_` first.
+            Rule::expr => GenericArg::Const(self.lower_expr(inner)),
             r => unreachable!("generic_arg: unexpected rule {r:?}"),
         }
     }

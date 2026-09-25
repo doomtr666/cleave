@@ -1763,7 +1763,7 @@ fn collect_instantiations_expr(
             if let Some(&lambda_id) = scope.get(&name) {
                 if let Some(scheme) = lambda_schemes.get(&lambda_id) {
                     if let Some(concrete_tys) =
-                        derive_instantiation(scheme, expr, generics, args, node_types)
+                        derive_instantiation(scheme, expr, generics, args, node_types, registry)
                     {
                         // A self-recursive call site, reached while walking
                         // a still-*generic* copy of this lambda's own body
@@ -1805,7 +1805,7 @@ fn collect_instantiations_expr(
             if let Some(scheme) = global_env.get(&name) {
                 if !scheme.vars.is_empty() {
                     if let Some(concrete_tys) =
-                        derive_instantiation(scheme, expr, generics, args, node_types)
+                        derive_instantiation(scheme, expr, generics, args, node_types, registry)
                     {
                         call_names.insert(expr.id, display_instantiation(&name, &concrete_tys));
                         fn_worklist.push((name, concrete_tys));
@@ -2004,6 +2004,7 @@ fn derive_instantiation(
     explicit_generics: &[GenericArg],
     args: &[Expr],
     node_types: &HashMap<NodeId, Ty>,
+    registry: &Registry,
 ) -> Option<Vec<Ty>> {
     let mut trial = Subst::default();
     // Arity is already validated by type-checking (`infer_call`'s own
@@ -2013,7 +2014,7 @@ fn derive_instantiation(
     // falling back to plain reverse-unification exactly like before this fix.
     if explicit_generics.len() == scheme.vars.len() {
         for (v, g) in scheme.vars.iter().zip(explicit_generics) {
-            if let Some(explicit_ty) = concrete_ty_from_generic_arg(g) {
+            if let Some(explicit_ty) = concrete_ty_from_generic_arg(g, registry) {
                 unify(&mut trial, &Ty::Var(*v), &explicit_ty).ok()?;
             }
         }
@@ -2045,37 +2046,49 @@ fn derive_instantiation(
 /// handles, falls through to `None` here, same as if no turbofish were
 /// given at all — `derive_instantiation`'s own ordinary reverse-unification
 /// is the fallback, unaffected either way).
-fn concrete_ty_from_generic_arg(g: &GenericArg) -> Option<Ty> {
+fn concrete_ty_from_generic_arg(g: &GenericArg, registry: &Registry) -> Option<Ty> {
     match g {
-        GenericArg::Type(t) => concrete_ty_from_ast(t),
-        GenericArg::Const(e) => concrete_const_from_expr(e),
+        GenericArg::Type(t) => concrete_ty_from_ast(t, registry),
+        GenericArg::Const(e) => concrete_const_from_expr(e, registry),
     }
 }
 
-fn concrete_ty_from_ast(ty: &Type) -> Option<Ty> {
+fn concrete_ty_from_ast(ty: &Type, registry: &Registry) -> Option<Ty> {
     match &ty.kind {
         TypeKind::Path(p, args) => {
             let name = p.segments.join("::");
             if args.is_empty() {
+                // A bare name in this position is *always* parsed as a
+                // type at the grammar level, even when the source actually
+                // meant a whole-program `const`/`define` referenced by
+                // name (`probe::<SEUIL>()` -- `grammar.pest`'s own
+                // `generic_arg` doc comment, `infer.rs::ty_from_ast_mapped`'s
+                // identical fallback has the fuller story) -- checked
+                // *before* defaulting to `Ty::Con(name)`, for the same
+                // reason `ty_from_ast_mapped` checks it before assuming a
+                // bare name is a real type: a name can't be both.
+                if let Some(v) = registry.global_const_value(&name) {
+                    return Some(Ty::Const(v));
+                }
                 return Some(Ty::Con(name));
             }
             let type_args: Vec<Ty> = args
                 .iter()
-                .map(concrete_ty_from_generic_arg)
+                .map(|a| concrete_ty_from_generic_arg(a, registry))
                 .collect::<Option<_>>()?;
             Some(Ty::App(name, type_args))
         }
         TypeKind::Array(elem, size) => {
-            let elem = concrete_ty_from_ast(elem)?;
-            let size = concrete_const_from_expr(size)?;
+            let elem = concrete_ty_from_ast(elem, registry)?;
+            let size = concrete_const_from_expr(size, registry)?;
             Some(Ty::Array(Box::new(elem), Box::new(size)))
         }
         TypeKind::Fn(params, ret) => {
             let params = params
                 .iter()
-                .map(concrete_ty_from_ast)
+                .map(|p| concrete_ty_from_ast(p, registry))
                 .collect::<Option<_>>()?;
-            let ret = concrete_ty_from_ast(ret)?;
+            let ret = concrete_ty_from_ast(ret, registry)?;
             Some(Ty::Fn(params, Box::new(ret)))
         }
         // `doc/backlog.md`'s own "Variadic generics" item -- grammar/AST
@@ -2087,16 +2100,30 @@ fn concrete_ty_from_ast(ty: &Type) -> Option<Ty> {
     }
 }
 
-fn concrete_const_from_expr(value: &Expr) -> Option<Ty> {
+fn concrete_const_from_expr(value: &Expr, registry: &Registry) -> Option<Ty> {
     match &value.kind {
         ExprKind::NumberLit { text, .. } => text
             .parse::<u64>()
             .ok()
             .map(|n| Ty::Const(ConstValue::Int(n))),
         ExprKind::BoolLit(b) => Some(Ty::Const(ConstValue::Bool(*b))),
+        // A whole-program `const`/`define` referenced by name in a
+        // const-generic-eligible position (`[T; SEUIL]`, an arithmetic
+        // operand) -- `concrete_ty_from_ast`'s own identical fallback just
+        // above has the fuller reasoning.
+        ExprKind::Path(p) if p.segments.len() == 1 => {
+            registry.global_const_value(&p.segments[0]).map(Ty::Const)
+        }
+        // The unary counterpart of the binary arm just below (`-N`, `lower.
+        // rs::lower_unary`'s own desugaring) -- same reasoning.
+        ExprKind::Call(path, _, args, ..) if path.segments.len() == 1 && args.len() == 1 => {
+            let a = concrete_const_from_expr(&args[0], registry)?;
+            let Ty::Const(av) = a else { return None };
+            crate::const_eval::eval_unop(&path.segments[0], av).map(Ty::Const)
+        }
         ExprKind::Call(path, _, args, ..) if path.segments.len() == 1 && args.len() == 2 => {
-            let a = concrete_const_from_expr(&args[0])?;
-            let b = concrete_const_from_expr(&args[1])?;
+            let a = concrete_const_from_expr(&args[0], registry)?;
+            let b = concrete_const_from_expr(&args[1], registry)?;
             let (Ty::Const(av), Ty::Const(bv)) = (&a, &b) else {
                 return None;
             };
@@ -3191,6 +3218,12 @@ pub fn dump_monomorphized(program: &Program, registry: &Registry) -> (String, Ve
         match &item.kind {
             ItemKind::Use(path) => {
                 let _ = writeln!(out, "use {};", path.segments.join("::"));
+            }
+            ItemKind::Const(d) => {
+                let _ = writeln!(out, "const {} {{ /* not type-inferred yet */ }}", d.name);
+            }
+            ItemKind::Define(d) => {
+                let _ = writeln!(out, "define {} {{ /* not type-inferred yet */ }}", d.name);
             }
             ItemKind::Struct(d) => {
                 let _ = writeln!(out, "struct {} {{ /* not type-inferred yet */ }}", d.name);

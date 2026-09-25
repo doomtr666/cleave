@@ -1277,6 +1277,138 @@ fn an_uncalled_generic_top_level_fn_does_not_crash_compilation() {
     assert_eq!(run_i32(&context, src), 0);
 }
 
+/// The identical gap as the test just above, one layer deeper: `is_open`'s
+/// own free-vars check only ever inspects `param_types`/`result` -- blind
+/// to a *const* generic that appears in neither (`unused<const N: i32>()
+/// -> i32 { N }`: no params, and `-> i32` is already fully concrete, so
+/// `N`'s own still-open value never shows up there at all, even though the
+/// function is genuinely generic over it and, uncalled, has no resolved
+/// value for it anywhere). Found live, by direct testing (not from this
+/// test file) -- `cps.rs`'s own `is_open` computation now also checks
+/// `f.generics` directly, catching this shape the free-vars check alone
+/// never could. Used to panic deep in CPS conversion ("unbound variable
+/// `N`") instead of being skipped, exactly the class of crash the type-
+/// generic case above already guards against.
+#[test]
+fn an_uncalled_const_generic_top_level_fn_does_not_crash_compilation() {
+    let context = context();
+    let src = "
+        fn unused<const N: i32>() -> i32 {
+            N
+        }
+        fn main() -> i32 {
+            0
+        }";
+    assert_eq!(run_i32(&context, src), 0);
+}
+
+/// A bare *runtime* variable (`x`, an ordinary `let`) used in a turbofish
+/// slot whose declared generic is `const N: i32` -- found live, direct
+/// testing: a bare identifier always parses as `GenericArg::Type` first
+/// (`grammar.pest::generic_arg`'s own doc comment -- a lone `type_` always
+/// wins that race over `expr`, whether the name turns out to be legitimate
+/// or not), so this used to reach `Ty::Con("x")`, an opaque, meaningless
+/// placeholder silently accepted as `N`'s own type -- and only crash much
+/// later, confusingly, once CPS conversion went looking for `N`'s actual
+/// *value* and found nothing ("CPS: unbound variable `N`"). `Infer::
+/// generic_arg_to_ty`'s own doc comment has the fix: when the *declared*
+/// slot is const, resolve through the same value-resolution `const_value_
+/// from_expr` a real `GenericArg::Const` already uses, not through the
+/// type-resolution path -- a real, located `TypeErrorKind::
+/// NotAConstGenericArg` now, not a crash three passes later.
+#[test]
+#[should_panic(expected = "this generic argument is not a compile-time constant expression")]
+fn a_runtime_variable_in_const_generic_position_is_a_located_error_not_a_crash() {
+    let context = context();
+    let src = "
+        fn probe<const N: i32>() -> i32 { N }
+        fn main() -> i32 {
+            let x: i32 = 5;
+            probe::<x>()
+        }
+    ";
+    run_i32(&context, src);
+}
+
+/// The sibling gap, found the same way: an arithmetic combination whose
+/// operands aren't all foldable (`x + 1`, `x` a runtime variable) used to
+/// fail to even *parse* -- `type_` matched just the bare `x` prefix out of
+/// `x + 1` and PEG ordered choice never backtracks into `expr` once an
+/// earlier alternative already matched something, so the enclosing
+/// turbofish choked on the leftover `+ 1` with a wholly misleading
+/// `"expected pack_marker"` message, from an unrelated, already-abandoned
+/// parse branch. `grammar.pest::generic_arg`'s own doc comment has the
+/// grammar fix (a lookahead requiring `type_`'s match to be immediately
+/// followed by the real terminator, `,`/`>`, before accepting it, falling
+/// through to `expr` otherwise) -- once it parses correctly as `GenericArg::
+/// Const`, it reaches the exact same `NotAConstGenericArg` check the test
+/// just above does, for the same underlying reason (folding genuinely
+/// fails, `x` being a runtime value).
+#[test]
+#[should_panic(expected = "this generic argument is not a compile-time constant expression")]
+fn a_nonfoldable_arithmetic_expression_in_const_generic_position_is_a_located_error_not_a_garbled_parse_failure()
+ {
+    let context = context();
+    let src = "
+        fn probe<const N: i32>() -> i32 { N }
+        fn main() -> i32 {
+            let x: i32 = 5;
+            probe::<x + 1>()
+        }
+    ";
+    run_i32(&context, src);
+}
+
+/// The reverse mismatch, closed by the same fix: an explicit turbofish
+/// argument shaped like a const-generic value (`5`) supplied where the
+/// declared generic is an ordinary *type* (`identity<T>`'s own `T`, never
+/// `const`) -- `Infer::generic_arg_to_ty`'s own `TypeErrorKind::
+/// ExpectedTypeGenericArg` arm, the direction-symmetric check to `Not
+/// AConstGenericArg` above. A top-level `fn` call resolves its own explicit
+/// turbofish through a generalized `Scheme` (`TyVar`s, not the original
+/// declaration's own `GenericParam` names -- see `generic_arg_to_ty`'s own
+/// call site in `infer_call`), so the message here is the nameless variant.
+#[test]
+#[should_panic(
+    expected = "expected a type for this generic argument, found a const-generic value"
+)]
+fn a_const_value_supplied_where_a_type_generic_was_expected_is_a_located_error() {
+    let context = context();
+    let src = "
+        fn identity<T>(x: T) -> T { x }
+        fn main() -> i32 { identity::<5>(3) }
+    ";
+    run_i32(&context, src);
+}
+
+/// A whole-program `const` usable in **const-generic position**, not just
+/// as an ordinary value -- a real, separate gap found live: a bare name in
+/// generic-argument position is always parsed as a *type* at the grammar
+/// level (`grammar.pest`'s own `generic_arg` doc comment), so `Infer::
+/// infer_expr_kind`'s own `ExprKind::Path` fallback (`cleave/tests/const_
+/// decl.rs`'s own suite exercises that one) is never even reached here --
+/// `Infer::ty_from_ast_mapped`'s own, separate `TypeKind::Path` handling
+/// needed its own identical registry fallback. `SEUIL` here pins both
+/// dimensions of a `Tensor<f32, SEUIL, SEUIL>` return type -- needs this
+/// file's own full tensor-capable `run_i32` (bufferization included), not
+/// `const_decl.rs`'s own deliberately minimal, scalar-only harness.
+#[test]
+fn a_global_const_is_usable_as_a_tensor_dimension() {
+    let context = context();
+    let src = "
+        use linalg;
+        const SEUIL: i32 = 2;
+        fn make() -> Tensor<f32, SEUIL, SEUIL> {
+            Tensor::<f32, SEUIL, SEUIL>(data: [[1.0, 2.0], [3.0, 4.0]])
+        }
+        fn main() -> i32 {
+            let t = make();
+            if t[1, 1] > 3.5 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
 /// `'x'`/`'\n'` -- a char literal is full erasure at lowering time (`lower.
 /// rs::lower_char_lit`), sugar for a plain `i8`-suffixed `NumberLit`; end to
 /// end, it must behave *exactly* like writing the byte value out by hand.

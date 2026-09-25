@@ -63,6 +63,11 @@ struct Args {
     dps_passthrough: Option<bool>,
     tag_releases: Option<bool>,
     debug_info: Option<bool>,
+    /// `--define NAME=VALUE`, repeatable -- `grammar.pest`'s own
+    /// `define_decl` doc comment. Collected raw here; parsed/validated
+    /// against the program's own `define` declarations by `Registry::
+    /// build_with_defines`, the one real consumer.
+    defines: Vec<(String, String)>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -92,6 +97,7 @@ fn parse_args() -> Result<Args, String> {
     let mut dps_passthrough: Option<bool> = None;
     let mut tag_releases: Option<bool> = None;
     let mut debug_info: Option<bool> = None;
+    let mut defines: Vec<(String, String)> = Vec::new();
 
     let mut args_iter = std::env::args().skip(1);
     while let Some(arg) = args_iter.next() {
@@ -176,6 +182,15 @@ fn parse_args() -> Result<Args, String> {
             "--no-tag-releases" => tag_releases = Some(false),
             "--debug-info" => debug_info = Some(true),
             "--no-debug-info" => debug_info = Some(false),
+            "--define" => {
+                let value = args_iter
+                    .next()
+                    .ok_or_else(|| "--define requires a NAME=VALUE argument".to_string())?;
+                let (name, val) = value
+                    .split_once('=')
+                    .ok_or_else(|| format!("--define {value:?}: expected NAME=VALUE"))?;
+                defines.push((name.to_string(), val.to_string()));
+            }
             other if other.starts_with("--") => return Err(format!("unknown flag {other:?}")),
             other if path.is_none() => path = Some(PathBuf::from(other)),
             other => {
@@ -233,6 +248,7 @@ fn parse_args() -> Result<Args, String> {
             dps_passthrough,
             tag_releases,
             debug_info,
+            defines,
         }),
         None => Err(
             "usage: cleave <file.cleave> [--dump-ast] [--dump-inference-pass] [--dump-monomorphized] [--dump-cps] \
@@ -242,9 +258,34 @@ fn parse_args() -> Result<Args, String> {
              [--backend cpu] [--inline | --no-inline] [--unroll-jam | --no-unroll-jam] \
              [--chain-split | --no-chain-split] [--affine-structs | --no-affine-structs] \
              [--dps | --no-dps] [--dps-passthrough | --no-dps-passthrough] [--tag-releases | --no-tag-releases] \
-             [--debug-info | --no-debug-info]"
+             [--debug-info | --no-debug-info] [--define NAME=VALUE]..."
                 .to_string(),
         ),
+    }
+}
+
+/// `Registry::build_with_defines`, plus reporting -- the one real consumer
+/// of `args.defines` (`grammar.pest`'s own `define_decl` doc comment).
+/// Every call site below used to read `Registry::build(&program)` directly
+/// (no `--define` support at all, silently); this is that same call,
+/// `--define`-aware, with its own errors (an unknown name, a real `const`
+/// targeted, a value that doesn't parse) printed and turned into a real
+/// exit code -- `Err`'s own `ExitCode` is already `FAILURE`, callers just
+/// need to propagate it their own way (an early `return` for `--run`/
+/// `--emit-*`, folded into the accumulating `exit` variable for `--dump-*`,
+/// see this file's own module doc comment on why those differ).
+fn build_registry(
+    program: &cleave::ast::Program,
+    defines: &[(String, String)],
+) -> Result<Registry, ExitCode> {
+    let (registry, errors) = Registry::build_with_defines(program, defines);
+    if errors.is_empty() {
+        Ok(registry)
+    } else {
+        for e in &errors {
+            eprintln!("error: {e}");
+        }
+        Err(ExitCode::FAILURE)
     }
 }
 
@@ -342,6 +383,15 @@ fn real_main() -> ExitCode {
         }
     };
 
+    // `args.defines`, validated exactly once, here -- every `Registry::
+    // build_with_defines` call site below (one per `--dump-*`/`--run`/
+    // `--emit-*` mode, `program`/`args.defines` both unchanged) re-derives
+    // the identical, deterministic result, so a bad `--define` only ever
+    // gets reported once, not once per requested mode.
+    if let Err(code) = build_registry(&program, &args.defines) {
+        return code;
+    }
+
     // Only header-separate stages when more than one is being dumped at
     // once — no point labeling the single thing being shown in the common,
     // single-flag (or no-flag) case.
@@ -375,7 +425,7 @@ fn real_main() -> ExitCode {
         if multiple {
             println!("--- inference pass ---\n");
         }
-        let registry = Registry::build(&program);
+        let registry = Registry::build_with_defines(&program, &args.defines).0;
         let (out, errs) = dump_program(&program, &registry);
         print!("{out}");
         if !errs.is_empty() {
@@ -392,7 +442,7 @@ fn real_main() -> ExitCode {
         if multiple {
             println!("--- monomorphized ---\n");
         }
-        let registry = Registry::build(&program);
+        let registry = Registry::build_with_defines(&program, &args.defines).0;
         let (out, errs) = dump_monomorphized(&program, &registry);
         print!("{out}");
         if !errs.is_empty() {
@@ -406,7 +456,7 @@ fn real_main() -> ExitCode {
         if multiple {
             println!("--- cps ---\n");
         }
-        let registry = Registry::build(&program);
+        let registry = Registry::build_with_defines(&program, &args.defines).0;
         if let Err(diags) = check_type_errors(&program, &registry) {
             report(&diags, &sources);
             exit = ExitCode::FAILURE;
@@ -430,7 +480,7 @@ fn real_main() -> ExitCode {
         if multiple {
             println!("--- cps (optimized) ---\n");
         }
-        let registry = Registry::build(&program);
+        let registry = Registry::build_with_defines(&program, &args.defines).0;
         if let Err(diags) = check_type_errors(&program, &registry) {
             report(&diags, &sources);
             exit = ExitCode::FAILURE;
@@ -482,7 +532,7 @@ fn real_main() -> ExitCode {
         if multiple {
             println!("--- cps equivalences ---\n");
         }
-        let registry = Registry::build(&program);
+        let registry = Registry::build_with_defines(&program, &args.defines).0;
         if let Err(diags) = check_type_errors(&program, &registry) {
             report(&diags, &sources);
             exit = ExitCode::FAILURE;
@@ -513,7 +563,7 @@ fn real_main() -> ExitCode {
         if multiple {
             println!("--- mlir ---\n");
         }
-        let registry = Registry::build(&program);
+        let registry = Registry::build_with_defines(&program, &args.defines).0;
         if let Err(diags) = check_type_errors(&program, &registry) {
             report(&diags, &sources);
             exit = ExitCode::FAILURE;
@@ -569,7 +619,7 @@ fn real_main() -> ExitCode {
         if multiple {
             println!("--- mlir (lowered) ---\n");
         }
-        let registry = Registry::build(&program);
+        let registry = Registry::build_with_defines(&program, &args.defines).0;
         if let Err(diags) = check_type_errors(&program, &registry) {
             report(&diags, &sources);
             exit = ExitCode::FAILURE;
@@ -667,7 +717,7 @@ fn real_main() -> ExitCode {
     }
 
     if args.run {
-        let registry = Registry::build(&program);
+        let registry = Registry::build_with_defines(&program, &args.defines).0;
         // CPS conversion (`collect_units`/`convert_program`, shared by all
         // three blocks above and below) assumes every reachable unit's own
         // types are fully concrete -- a program with a real type error
@@ -801,7 +851,7 @@ fn real_main() -> ExitCode {
     }
 
     if args.emit_object.is_some() || args.emit_bindings.is_some() {
-        let registry = Registry::build(&program);
+        let registry = Registry::build_with_defines(&program, &args.defines).0;
         let options = match resolve_codegen_options(&args, true) {
             Ok(options) => options,
             Err(e) => {
@@ -832,7 +882,7 @@ fn real_main() -> ExitCode {
     }
 
     if let Some(exe_path) = &args.emit_exe {
-        let registry = Registry::build(&program);
+        let registry = Registry::build_with_defines(&program, &args.defines).0;
         let options = match resolve_codegen_options(&args, true) {
             Ok(options) => options,
             Err(e) => {

@@ -14,6 +14,8 @@
 //! struct literal/field access against `struct_fields`).
 
 use crate::ast::*;
+use crate::const_eval;
+use crate::infer::ConstValue;
 use crate::print::{fmt_generics, fmt_type};
 use std::collections::{HashMap, HashSet};
 
@@ -21,6 +23,43 @@ use std::collections::{HashMap, HashSet};
 pub struct Registry {
     algebras: HashMap<String, AlgebraEntry>,
     structs: HashMap<String, StructEntry>,
+    /// Every top-level `const NAME: T = expr;`, evaluated once here, eagerly
+    /// — see `Registry::eval_global_consts`'s own doc comment for the
+    /// evaluator itself.
+    ///
+    /// **Deliberately keyed by *name*, not `NodeId`** — unlike a const
+    /// generic's own per-call-site value (`Ty::Const`, resolved differently
+    /// for every instantiation), a whole-program `const`'s value never
+    /// varies by which function/specialization happens to reference it, so
+    /// it needs no per-node/per-specialization tracking at all (the
+    /// `node_types`-shaped machinery `Infer`/`monomorphize.rs`/`cps.rs`
+    /// already thread everywhere for *that* purpose would be real, avoidable
+    /// overkill here — checked directly: `node_types` alone is threaded
+    /// through two dozen-plus function signatures in `monomorphize.rs`
+    /// alone). Two separate, independently-consulted tables, not one:
+    /// `Infer::infer_expr_kind`'s own `Path` arm reads `global_const_types`
+    /// (the const's own *declared* type, e.g. `i32` — an ordinary type,
+    /// freely unifiable with anything else of that type, unlike `Ty::Const`
+    /// itself, which would make two *different* consts of the same
+    /// declared type fail to unify against each other through a shared
+    /// generic `T` — see `doc/plan-blas-native.md` §2's own "known
+    /// limitation" entry, closed by this exact split); `cps.rs::collect_
+    /// units` clones `global_consts` (the actual *value*) straight into
+    /// every `ConcreteUnit`, read back by `convert_expr`'s own `Path`
+    /// handling the same way `node_types` already is, just keyed by name
+    /// instead of `NodeId`.
+    global_consts: HashMap<String, ConstValue>,
+    /// `ConstDecl::ty`, one per entry in `global_consts` — see that field's
+    /// own doc comment for why this is a second, parallel table rather than
+    /// folded into it.
+    global_const_types: HashMap<String, Type>,
+    /// Every `define` name (never a `const` one) — `pipeline.rs::check_
+    /// const_decl_errors`'s own diagnostic wording is the one consumer,
+    /// distinguishing "this `define` has no default and was never
+    /// overridden" from a `const`'s own "initializer isn't a compile-time
+    /// constant" (a real `const` always has an `Expr` to evaluate; only a
+    /// `define` can legitimately have nothing at all to try).
+    is_define: HashSet<String>,
 }
 
 struct StructEntry {
@@ -204,7 +243,256 @@ impl Registry {
             }
         }
 
-        Registry { algebras, structs }
+        let (global_consts, define_errors) = Self::eval_global_consts(program, &[]);
+        debug_assert!(
+            define_errors.is_empty(),
+            "an empty `defines` list can never itself be invalid: {define_errors:?}"
+        );
+        let global_const_types: HashMap<String, Type> = program
+            .items
+            .iter()
+            .filter_map(|item| match &item.kind {
+                ItemKind::Const(d) => Some((d.name.clone(), d.ty.clone())),
+                ItemKind::Define(d) => Some((d.name.clone(), d.ty.clone())),
+                _ => None,
+            })
+            .collect();
+        let is_define: HashSet<String> = program
+            .items
+            .iter()
+            .filter_map(|item| match &item.kind {
+                ItemKind::Define(d) => Some(d.name.clone()),
+                _ => None,
+            })
+            .collect();
+
+        Registry {
+            algebras,
+            structs,
+            global_consts,
+            global_const_types,
+            is_define,
+        }
+    }
+
+    /// Like `build`, but with `--define NAME=VALUE` (CLI) / `Build::define`
+    /// (`cleave-build`) overrides applied — the *only* difference `define`
+    /// (`grammar.pest`'s own `define_decl` doc comment) has from a plain
+    /// `const`: its resolved value can come from here instead of its own
+    /// declared default. Returns every problem with `defines` *itself* as
+    /// plain strings, not `Diagnostic`s -- these are configuration errors
+    /// (bad CLI input), not source-code ones, no real `Span` to point at;
+    /// `pipeline.rs::check_const_decl_errors` is the separate, complementary
+    /// check for a source-level problem (a `define` with neither a default
+    /// nor any override at all), which *does* have a real declaration site
+    /// to point at.
+    pub fn build_with_defines(program: &Program, defines: &[(String, String)]) -> (Self, Vec<String>) {
+        let mut registry = Self::build(program);
+        let (global_consts, errors) = Self::eval_global_consts(program, defines);
+        registry.global_consts = global_consts;
+        (registry, errors)
+    }
+
+    /// Evaluates every top-level `const`/`define` to a concrete
+    /// `ConstValue`, once, here — a small, self-contained, *permissive*
+    /// evaluator (same posture `const_eval.rs`'s own module doc comment
+    /// takes: an expression shape it doesn't recognize, or one that
+    /// references an as-yet-unresolved const, is left unevaluated here
+    /// rather than erroring — a real "this isn't a constant expression"
+    /// diagnostic is `infer.rs`'s own job, once it actually tries to use
+    /// the const and finds nothing here).
+    ///
+    /// A fixpoint loop, not a single top-to-bottom pass: `const B: i32 = A
+    /// + 1;` declared *before* `const A: i32 = 5;` in source must still
+    /// resolve (`grammar.pest`'s own `const_decl` doesn't order-restrict
+    /// this any more than `fn`/`struct` declarations already don't) —
+    /// repeating the sweep until a full pass makes no further progress
+    /// handles any declaration order, and terminates in at most
+    /// `program.items.len()` rounds (each round resolves at least one
+    /// previously-stuck const, or the loop stops).
+    ///
+    /// `defines` is checked *before* a `define`'s own default expression is
+    /// even attempted — an external override always wins, the same `-D`
+    /// semantics `#ifndef X #define X 42 #endif` has (`X`, if already
+    /// defined from outside, is never re-evaluated from its own file-local
+    /// default at all). Every entry in `defines` is validated against the
+    /// program's own declarations: naming a real `const` (never overridable
+    /// — "const" keeps meaning what it says), naming nothing at all, or a
+    /// value that doesn't parse against its `define`'s own declared type,
+    /// are each a real, reported error here rather than silently ignored.
+    fn eval_global_consts(
+        program: &Program,
+        defines: &[(String, String)],
+    ) -> (HashMap<String, ConstValue>, Vec<String>) {
+        enum Decl<'a> {
+            Const(&'a str, &'a Expr),
+            Define(&'a str, &'a Type, Option<&'a Expr>),
+        }
+        let decls: Vec<Decl> = program
+            .items
+            .iter()
+            .filter_map(|item| match &item.kind {
+                ItemKind::Const(d) => Some(Decl::Const(&d.name, &d.value)),
+                ItemKind::Define(d) => Some(Decl::Define(&d.name, &d.ty, d.value.as_ref())),
+                _ => None,
+            })
+            .collect();
+
+        let mut errors = Vec::new();
+        for (name, _) in defines {
+            match decls.iter().find(|d| match d {
+                Decl::Const(n, _) | Decl::Define(n, _, _) => *n == name,
+            }) {
+                Some(Decl::Define(..)) => {}
+                Some(Decl::Const(..)) => errors.push(format!(
+                    "--define: `{name}` is a `const`, never overridable -- declare it `define` instead"
+                )),
+                None => errors.push(format!("--define: no such const/define `{name}`")),
+            }
+        }
+
+        let mut resolved: HashMap<String, ConstValue> = HashMap::new();
+        loop {
+            let mut progressed = false;
+            for d in &decls {
+                let (name, ty, default) = match d {
+                    Decl::Const(name, expr) => (*name, None, Some(*expr)),
+                    Decl::Define(name, ty, default) => (*name, Some(*ty), *default),
+                };
+                if resolved.contains_key(name) {
+                    continue;
+                }
+                // `ty.is_some()` iff this decl is a `Decl::Define` -- a
+                // `Decl::Const` matched by a `defines` entry is already a
+                // reported error above, but that error doesn't stop this
+                // loop from also reaching this decl; it must still fall
+                // through to evaluating the const's own initializer below,
+                // never treat `raw` as if `ty` were its declared type.
+                if let (Some(ty), Some((_, raw))) =
+                    (ty, defines.iter().find(|(n, _)| n == name))
+                {
+                    match Self::parse_define_value(raw, ty) {
+                        Some(v) => {
+                            resolved.insert(name.to_string(), v);
+                            progressed = true;
+                        }
+                        None => errors.push(format!(
+                            "--define {name}={raw:?}: not a valid `{}`",
+                            fmt_type(ty)
+                        )),
+                    }
+                    continue;
+                }
+                if let Some(expr) = default {
+                    if let Some(v) = Self::eval_const_expr(expr, &resolved) {
+                        resolved.insert(name.to_string(), v);
+                        progressed = true;
+                    }
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        (resolved, errors)
+    }
+
+    /// Parses `raw` (an external `--define` value's own text) against
+    /// `ty`'s own declared shape — the same two `ConstValue` variants
+    /// everything else in this module already works with, nothing new:
+    /// `bool` parses `"true"`/`"false"`, anything else attempts a plain
+    /// `u64` (matching `ExprKind::NumberLit`'s own identical `.parse::
+    /// <u64>()` elsewhere in this file — a literal integer in source has
+    /// never been width/signedness-checked against its own declared type
+    /// either).
+    fn parse_define_value(raw: &str, ty: &Type) -> Option<ConstValue> {
+        let TypeKind::Path(p, _) = &ty.kind else {
+            return None;
+        };
+        if p.segments.len() == 1 && p.segments[0] == "bool" {
+            match raw {
+                "true" => Some(ConstValue::Bool(true)),
+                "false" => Some(ConstValue::Bool(false)),
+                _ => None,
+            }
+        } else {
+            raw.parse::<u64>().ok().map(ConstValue::Int)
+        }
+    }
+
+    /// The expression shapes this evaluator understands — deliberately the
+    /// same subset `infer.rs::const_value_from_expr` already recognizes for
+    /// a const-generic's own value (that one walks `Ty`/`Subst`, needed
+    /// there since a const generic's value may still be an unresolved
+    /// variable at the point it's consulted; this one only ever sees
+    /// already-fully-parsed source text, so it works directly on `Expr` and
+    /// plain `ConstValue`, no `Infer` instance needed).
+    fn eval_const_expr(expr: &Expr, known: &HashMap<String, ConstValue>) -> Option<ConstValue> {
+        match &expr.kind {
+            ExprKind::NumberLit { text, .. } => text.parse::<u64>().ok().map(ConstValue::Int),
+            ExprKind::BoolLit(b) => Some(ConstValue::Bool(*b)),
+            ExprKind::Path(p) if p.segments.len() == 1 => known.get(&p.segments[0]).copied(),
+            ExprKind::Call(path, _, args, _) if path.segments.len() == 1 && args.len() == 1 => {
+                let a = Self::eval_const_expr(&args[0], known)?;
+                const_eval::eval_unop(&path.segments[0], a)
+            }
+            ExprKind::Call(path, _, args, _) if path.segments.len() == 1 && args.len() == 2 => {
+                let a = Self::eval_const_expr(&args[0], known)?;
+                let b = Self::eval_const_expr(&args[1], known)?;
+                const_eval::eval_binop(&path.segments[0], a, b)
+            }
+            _ => None,
+        }
+    }
+
+    /// `SEUIL`'s own *declared* type, for `Infer::infer_expr_kind`'s own
+    /// `ExprKind::Path` fallback — an ordinary `Ty` (via `Infer::ty_from_
+    /// ast`), not `Ty::Const`, is what that fallback actually needs (see
+    /// `global_consts`'s own doc comment for why). `None` for any name
+    /// that isn't a top-level const at all.
+    pub fn global_const_type(&self, name: &str) -> Option<&Type> {
+        self.global_const_types.get(name)
+    }
+
+    /// `true` for a `define`, `false` for a `const` (or any other name) —
+    /// `is_define`'s own doc comment on `Registry` has the one consumer.
+    pub fn is_define(&self, name: &str) -> bool {
+        self.is_define.contains(name)
+    }
+
+    /// `SEUIL`'s own resolved *value* — unlike `global_const_type` (used for
+    /// *ordinary* expression position, where the value must stay separate
+    /// from the type to unify freely, `global_consts`'s own doc comment has
+    /// the full story), this is exactly what a *const-generic* position
+    /// (`Tensor<f32, SEUIL, SEUIL>`, `probe::<SEUIL>()`) needs directly:
+    /// `Infer::const_value_from_expr`'s own `Path` fallback, the same
+    /// function an ordinary const generic's own value already resolves
+    /// through. `Ty::Const` genuinely is the right representation there —
+    /// two *different* dimensions in the same slot really must be caught as
+    /// distinct, the exact opposite of the ordinary-value-position case.
+    pub fn global_const_value(&self, name: &str) -> Option<ConstValue> {
+        self.global_consts.get(name).copied()
+    }
+
+    /// Did `name`'s own initializer actually evaluate? `pipeline.rs::check_
+    /// const_decl_errors`'s one caller -- a name can be declared (`global_
+    /// const_type` returns `Some`, straight off the AST, unconditionally)
+    /// while still failing *this* check, if `eval_global_consts` couldn't
+    /// resolve its own initializer expression.
+    pub fn has_global_const_value(&self, name: &str) -> bool {
+        self.global_consts.contains_key(name)
+    }
+
+    /// A snapshot of every top-level const's own resolved *value* —
+    /// `cps.rs::collect_units`'s one real consumer, cloned once into every
+    /// `ConcreteUnit` (see `global_consts`'s own doc comment for why a
+    /// plain, name-keyed clone is enough, no per-node/per-specialization
+    /// tracking needed). A name present here but absent (or present with a
+    /// different, stale-looking value) is never possible by construction —
+    /// this *is* the same table `global_const_type`'s own caller already
+    /// trusted enough to type-check the reference against.
+    pub fn global_consts(&self) -> HashMap<String, ConstValue> {
+        self.global_consts.clone()
     }
 
     /// Does `algebra` have an `impl` for this concrete target type? String

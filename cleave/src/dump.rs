@@ -45,6 +45,12 @@ pub fn dump_program(program: &Program, registry: &Registry) -> (String, Vec<Type
             ItemKind::Use(path) => {
                 let _ = writeln!(out, "use {};", path.segments.join("::"));
             }
+            ItemKind::Const(d) => {
+                let _ = writeln!(out, "const {}: {} = /* not type-inferred yet */;", d.name, fmt_type(&d.ty));
+            }
+            ItemKind::Define(d) => {
+                let _ = writeln!(out, "define {}: {} = /* not type-inferred yet */;", d.name, fmt_type(&d.ty));
+            }
             ItemKind::Struct(d) => {
                 let _ = writeln!(out, "struct {} {{ /* not type-inferred yet */ }}", d.name);
             }
