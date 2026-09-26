@@ -343,17 +343,21 @@ pub fn emit_from_program(
     Ok(())
 }
 
-/// `build_cps_program` + the standard `eliminate_dead_code` / `optimize_
-/// program` / `eliminate_dead_code` sequencing every pipeline entry point
-/// needs (see `--dump-cps-optimized`'s own comment in `main.rs` for why the
-/// second sweep is needed) -- shared by `emit_from_program` and `emit_exe`.
+/// `build_cps_program` + the standard `optimize_program` / `eliminate_dead_
+/// code` sequencing every pipeline entry point needs -- shared by `emit_
+/// from_program` and `emit_exe`. Deliberately *not* dead-code-eliminated
+/// before `optimize_program` runs (see `--dump-cps-optimized`'s own comment
+/// in `main.rs` for the full reasoning: an axiom/`derivative`/`adjoint`
+/// rule can reference a unit no ordinary call site reaches at all, which a
+/// pre-optimization sweep would strip before `optimize_program` ever gets a
+/// chance to need it) -- the single sweep *after* still catches the
+/// opposite case, a unit `optimize_program` itself made unreachable.
 fn build_optimized_cps(
     program: &Program,
     registry: &Registry,
     sources: Option<&SourceMap>,
 ) -> Result<CpsProgram, Vec<String>> {
     let cps_program = build_cps_program(program, registry, sources)?;
-    let cps_program = eliminate_dead_code(cps_program);
     let (cps_program, _) = optimize_program(cps_program, registry, false);
     let cps_program = eliminate_dead_code(cps_program);
     // Last CPS-to-CPS step, strictly after the e-graph pass -- see

@@ -42,6 +42,41 @@ algebra MatMul<A, B, C> {
     // this specifically avoids, and the melior Properties-API gap this had
     // to work around to build correctly — `doc/backlog.md`).
     adjoint matmul(a, b), u: (matmul_transpose_b(u, b), matmul_transpose_a(a, u));
+
+    // A user (or a later-derived expression) writing a transpose directly
+    // into a `matmul` operand, literally — not through the `adjoint` rule
+    // above, which already routes straight to `matmul_transpose_a/b`
+    // without ever going through a real `transpose(...)` node at all — gets
+    // rewritten to the identical zero-copy form: `matmul_transpose_a`/`_b`
+    // read the "transposed" operand via `indexing_maps` (an ordinary
+    // contiguous load), never materializing a real `linalg.transpose`
+    // (this file's own `MatMulTransposeA`/`MatMulTransposeB` doc comments
+    // above have the full mechanism). Equality saturation, not a rewrite
+    // committed to eagerly: both forms coexist in the same e-class, cost-
+    // based extraction picks the cheaper one — safe under today's plain
+    // node-count cost function specifically because this rule can only
+    // ever reduce or hold node count, never increase it (2 nodes either
+    // side: `matmul(transpose(a), b)` vs `matmul_transpose_a(a, b)`).
+    axiom matmul_transpose_a_rewrite(a, b): matmul(transpose(a), b) == matmul_transpose_a(a, b);
+    axiom matmul_transpose_b_rewrite(a, b): matmul(a, transpose(b)) == matmul_transpose_b(a, b);
+
+    // `transpose(A*B) = B^T*A^T` — a real, always-true linear-algebra
+    // identity, deliberately declared in *this* direction only, not as a
+    // bidirectional `==` a saturation pass would explore both ways: unlike
+    // the two rules just above, whether the *other* direction (materializing
+    // a real `transpose(matmul(a,b))` into two separate transposes) is ever
+    // a genuine win depends on real operation cost (domain-specific, per the
+    // conversation that raised this — graphics workloads hit this pattern
+    // for exactly the row/col-order reasons that motivate it there), which
+    // today's plain node-count `DerivativeFreeCost` cannot judge at all (it
+    // would even prefer the *wrong* direction, since two transposes plus a
+    // matmul is structurally more nodes than one transpose plus a matmul).
+    // *This* direction needs no such judgment call: `matmul(transpose(b),
+    // transpose(a))` (3 nodes) reducing to `transpose(matmul(a, b))` (2
+    // nodes) is a node-count win unconditionally, so it's sound to declare
+    // even under today's cost function — the reverse stays undeclared until
+    // a real, shape-aware cost model exists to arbitrate it.
+    axiom matmul_transpose_distributes(a, b): matmul(transpose(b), transpose(a)) == transpose(matmul(a, b));
 }
 
 // `dH = dZ*W^T` — `Transpose<B,?>` is never involved: `u: Tensor<T,N,K>`
@@ -81,6 +116,29 @@ impl<T: Float, const P: i32, const Q: i32, const R: i32>
 // comment above).
 algebra Transpose<A, B> {
     fn transpose(a: A) -> B;
+
+    // `(A^T)^T = A` — always true, always a strict node-count win either
+    // direction (1 node either side), unlike `matmul`'s own `transpose(a*b)`
+    // distribution above (deliberately one-directional there, needing a
+    // real cost model this project doesn't have yet for the *other*
+    // direction) — no such caution needed here.
+    axiom transpose_transpose(a): transpose(transpose(a)) == a;
+
+    // Transpose is linear: `A^T + B^T = (A+B)^T`, `A^T - B^T = (A-B)^T` —
+    // always true, and, like `matmul`'s own distribution rule above (not
+    // `transpose_transpose`'s own symmetric case), only safe to declare in
+    // the *collapsing* direction: `add(transpose(a), transpose(b))` (3
+    // nodes: `add` + two `transpose`) is more nodes than `transpose(add(a,
+    // b))` (2 nodes) unconditionally, a real node-count win regardless of
+    // today's plain `DerivativeFreeCost` — the *other* direction (pushing
+    // one `transpose` into two) would need the same real, shape-aware cost
+    // model this project doesn't have yet, exactly like `matmul`'s own
+    // undeclared reverse direction, so it stays undeclared here too.
+    // `Ring<T>`'s own `add`/`sub` — single-generic, not `Transpose`'s own
+    // multi-target concern, resolved the identical, already-working way
+    // any cross-algebra reference to a single-generic algebra always has.
+    axiom transpose_add_distributes(a, b): add(transpose(a), transpose(b)) == transpose(add(a, b));
+    axiom transpose_sub_distributes(a, b): sub(transpose(a), transpose(b)) == transpose(sub(a, b));
 }
 
 impl<T: Float, const N: i32, const M: i32> Transpose<Tensor<T,N,M>, Tensor<T,M,N>> {

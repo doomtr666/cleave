@@ -522,7 +522,18 @@ fn real_main() -> ExitCode {
         } else {
             match build_cps_program(&program, &registry, None) {
                 Ok(cps_program) => {
-                    let cps_program = eliminate_dead_code(cps_program);
+                    // Not dead-code-eliminated first, deliberately -- an
+                    // axiom (or `derivative`/`adjoint` rule) can reference a
+                    // unit no *ordinary* call site in the whole program
+                    // reaches at all (`egraph.rs::axiom_to_rewrite`'s own
+                    // doc comment: `MatMulTransposeA::matmul_transpose_a`
+                    // is the concrete case that found this), so eliminating
+                    // dead code *before* this pass ever runs can strip a
+                    // unit `optimize_program` itself is about to need,
+                    // before it gets a chance to say so. Sound either way,
+                    // strictly more so run once, after: anything genuinely
+                    // dead from the start is *still* dead once this finds
+                    // nothing to keep it alive either.
                     let (optimized, _) = optimize_program(cps_program, &registry, false);
                     // A second sweep: `optimize_program` can itself fold away
                     // every remaining call to a stdlib specialization (e.g.
@@ -574,7 +585,9 @@ fn real_main() -> ExitCode {
         } else {
             match build_cps_program(&program, &registry, None) {
                 Ok(cps_program) => {
-                    let cps_program = eliminate_dead_code(cps_program);
+                    // Not dead-code-eliminated first -- `--dump-cps-
+                    // optimized`'s own identical comment, just above, has
+                    // the full reasoning.
                     let (_, explanations) = optimize_program(cps_program, &registry, true);
                     if explanations.is_empty() {
                         println!("(no axiom rewrites fired)");
@@ -605,7 +618,9 @@ fn real_main() -> ExitCode {
         } else {
             match build_cps_program(&program, &registry, None) {
                 Ok(cps_program) => {
-                    let cps_program = eliminate_dead_code(cps_program);
+                    // Not dead-code-eliminated first -- `--dump-cps-
+                    // optimized`'s own comment above has the full
+                    // reasoning.
                     let (cps_program, _) = optimize_program(cps_program, &registry, false);
                     // See `--dump-cps-optimized`'s own comment above: a
                     // second sweep is needed to catch a unit `optimize_
@@ -661,7 +676,9 @@ fn real_main() -> ExitCode {
         } else {
             match build_cps_program(&program, &registry, None) {
                 Ok(cps_program) => {
-                    let cps_program = eliminate_dead_code(cps_program);
+                    // Not dead-code-eliminated first -- `--dump-cps-
+                    // optimized`'s own comment above has the full
+                    // reasoning.
                     let (cps_program, _) = optimize_program(cps_program, &registry, false);
                     // See `--dump-cps-optimized`'s own comment above: a
                     // second sweep is needed to catch a unit `optimize_
@@ -775,13 +792,16 @@ fn real_main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let cps_program = eliminate_dead_code(cps_program);
+        // Not dead-code-eliminated first -- `--dump-cps-optimized`'s own
+        // comment above has the full reasoning (an axiom/`derivative`/
+        // `adjoint` rule can reference a unit no ordinary call site
+        // reaches, which a pre-optimization sweep would strip before
+        // `optimize_program` ever gets a chance to need it).
         let (cps_program, _) = optimize_program(cps_program, &registry, false);
-        // See `--dump-cps-optimized`'s own comment above: a second sweep is
-        // needed to catch a unit `optimize_program` itself made unreachable
-        // (e.g. an axiom folding away every remaining call to it), which
-        // the first sweep — run before optimization — has no way to
-        // anticipate.
+        // A single sweep *after* is still needed: `optimize_program` can
+        // itself fold away every remaining call to some other unit (e.g.
+        // an axiom folding away a whole subexpression), leaving it
+        // unreachable only *now*.
         let cps_program = eliminate_dead_code(cps_program);
         // Last CPS-to-CPS step, strictly after the e-graph pass -- see
         // `cleave::refcount`'s own module doc comment for why, and

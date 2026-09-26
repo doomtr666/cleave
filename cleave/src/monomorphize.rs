@@ -999,6 +999,14 @@ pub fn monomorphize(
                 &templates,
                 &mut impl_worklist,
             );
+            // Unlike the two calls above, not keyed to `t.method_name` at
+            // all -- an `axiom`'s own params aren't tied to any one
+            // method's signature (`seed_axiom_references`'s own doc
+            // comment), so every axiom declared on `t.algebra` gets a
+            // chance here, for every reached instantiation of *any* of its
+            // methods (harmless redundancy for the common single-method
+            // case, `MatMul`'s own `matmul` included).
+            seed_axiom_references(registry, &t.algebra, &target_tys, &templates, &mut impl_worklist);
 
             let origin = format!("{}::{}", t.algebra, t.method_name);
             mono.by_origin
@@ -2689,6 +2697,282 @@ fn seed_adjoint_rule_references(
             templates,
             impl_worklist,
         );
+    }
+}
+
+/// A third sibling of `seed_derivative_rule_references`/`seed_adjoint_rule_
+/// references`, same call site, same worklist-injection mechanism — for a
+/// declared `axiom` instead. Genuinely different shape from those two,
+/// though: a `derivative`/`adjoint` rule's own params always match `rule.
+/// method`'s own signature one-to-one (`resolve_derivative_rule_expr_ty`'s
+/// own `param_tys` is built by a direct sig-zip, no recursion needed to
+/// seed it), but an `axiom`'s own params can appear *nested* inside a sub-
+/// call (`matmul(transpose(a), b)`'s own `a`, buried inside `transpose
+/// (a)`) with no method of its own to zip against directly — found live,
+/// building the matmul/transpose rewrite rules this exists for: `egraph.
+/// rs::seed_axiom_type_env` already had to solve the identical problem for
+/// *building the rewrite rule itself* (a purely textual, `egg`-facing
+/// concern); this is that same algorithm's `Ty`-based twin, needed because
+/// this module must not depend on `egg` (`resolve_derivative_rule_expr_ty`'s
+/// own doc comment already states the same constraint) and because a
+/// *rewrite rule* firing and a *unit actually existing to call* are two
+/// separate problems — `MatMulTransposeA::matmul_transpose_a<...>` appearing
+/// in an extracted expression that `collect_units` never monomorphized in
+/// the first place is exactly `seed_derivative_rule_references`'s own
+/// documented failure mode, for axioms instead of derivative rules.
+fn seed_axiom_references(
+    registry: &Registry,
+    algebra: &str,
+    target_tys: &[Ty],
+    templates: &[ImplTemplate],
+    impl_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
+) {
+    let type_env: HashMap<String, Ty> = registry
+        .generics(algebra)
+        .iter()
+        .filter(|g| !matches!(g, GenericParam::Const { .. }))
+        .map(|g| g.name().to_string())
+        .zip(target_tys.iter().cloned())
+        .collect();
+    let mut infer = Infer::new(registry);
+    for axiom in registry.axioms(algebra) {
+        let ExprKind::Call(path, _, args, _) = &axiom.body.kind else {
+            continue;
+        };
+        if path.segments.join("::") != "eq" {
+            continue;
+        }
+        let [lhs, rhs] = args.as_slice() else {
+            continue;
+        };
+        let params: HashSet<&str> = axiom.params.iter().map(|p| p.name.as_str()).collect();
+
+        // Whichever side's own *outer* call belongs to `algebra` directly
+        // (true for at least one side of every real axiom -- an axiom
+        // declared under `MatMul` is a fact *about* `matmul`) resolves its
+        // own overall type straight from `type_env`, no hint needed at
+        // all. By the axiom's own `lhs == rhs` equality, that identical
+        // type applies to the *other* side too, seeded as its own top-
+        // level `expected_ty`.
+        let mut overall_ty: Option<Ty> = None;
+        for side in [lhs, rhs] {
+            let ExprKind::Call(path, _, side_args, _) = &side.kind else {
+                continue;
+            };
+            let method = path.segments.join("::");
+            let Some(sig) = registry.fn_sig(algebra, &method) else {
+                continue;
+            };
+            if sig.params.len() != side_args.len() {
+                continue;
+            }
+            if let Some(ret) = &sig.ret {
+                overall_ty = Some(infer.ty_from_ast_mapped(ret, &type_env));
+                break;
+            }
+        }
+
+        // Shared across both sides, and across the whole walk of each:
+        // every axiom param's own real type, filled in as either side's
+        // own traversal resolves it (a bare param can appear on *both*
+        // sides -- `matmul_transpose_a_rewrite`'s own `a`/`b` do -- so
+        // resolving it once, from whichever side makes it easiest, must
+        // carry over to the other). This is the piece `overall_ty` alone
+        // can't replace: pinning only a cross-algebra callee's own
+        // *return*-type position (`MatMulTransposeA::matmul_transpose_a`'s
+        // own `C`) leaves its `P` (its first target's own row count)
+        // genuinely undetermined by `C` alone — the *same* shape `Trans
+        // pose<A,B>`'s own `B` needs `A` for, not something a single
+        // return-type pin can ever resolve on its own. `a`/`b` being
+        // already-known bare params (from the *other* side's own
+        // traversal) is what actually pins it — found live, exactly this
+        // way: without this, `find_impl_for_target` correctly refused to
+        // guess (`fully_resolved` rejecting a leftover free `P`), silently
+        // contributing nothing, no different in outcome from the earlier,
+        // even-more-wrong bug this replaced.
+        let mut param_tys: HashMap<&str, Ty> = HashMap::new();
+        for side in [lhs, rhs] {
+            seed_axiom_expr_references(
+                side,
+                overall_ty.as_ref(),
+                true,
+                algebra,
+                &type_env,
+                &params,
+                registry,
+                &mut infer,
+                templates,
+                impl_worklist,
+                &mut param_tys,
+            );
+        }
+    }
+}
+
+/// The top-down walk `seed_axiom_references` drives — the mirror image of
+/// `resolve_derivative_rule_expr_ty`'s own bottom-up one (which resolves a
+/// call's own unpinned generic *from* its already-resolved arguments; this
+/// instead resolves each argument's own type *from* the enclosing call's
+/// already-known one, exactly `egraph.rs::seed_axiom_type_env`'s own
+/// algorithm, restated with structured `Ty`/`find_impl_for_target` in place
+/// of text/`resolve_multi_target_call_ty`). `expected_ty` is `None` only
+/// ever legitimate at the very top (`seed_axiom_references`'s own two
+/// top-level calls) — a `Call` there only makes progress at all when it
+/// turns out to belong to `algebra` itself, whose own `type_env` already
+/// resolves that case with no hint needed. `algebra`/`type_env` stay fixed
+/// at the axiom's own enclosing values throughout the whole recursion, the
+/// same invariant `egraph.rs::seed_axiom_type_env`'s own doc comment states
+/// for its identical two parameters — never rebound to whichever `owner` a
+/// nested call resolves to.
+///
+/// `param_tys` is filled in by the base case (a bare `Path` naming one of
+/// `params`, recording whatever `expected_ty` this call site resolved for
+/// it) and *read back* by a `Call`'s own target-type resolution below,
+/// pinning any of `owner`'s targets whose corresponding argument is itself
+/// an already-resolved bare param — the piece a single return-type pin
+/// alone can't give (this function's own `seed_axiom_references` caller
+/// has the concrete motivating case). Shared across both sides of the
+/// axiom's own `==`, on purpose: a param resolved from one side is exactly
+/// as real on the other.
+#[allow(clippy::too_many_arguments)]
+fn seed_axiom_expr_references<'p>(
+    expr: &Expr,
+    expected_ty: Option<&Ty>,
+    is_top: bool,
+    algebra: &str,
+    type_env: &HashMap<String, Ty>,
+    params: &HashSet<&'p str>,
+    registry: &Registry,
+    infer: &mut Infer,
+    templates: &[ImplTemplate],
+    impl_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
+    param_tys: &mut HashMap<&'p str, Ty>,
+) {
+    match &expr.kind {
+        ExprKind::Path(p) if p.segments.len() == 1 => {
+            if let (Some(&name), Some(t)) = (
+                params.iter().find(|&&n| n == p.segments[0]),
+                expected_ty,
+            ) {
+                param_tys.entry(name).or_insert_with(|| t.clone());
+            }
+        }
+        ExprKind::Call(path, _, args, _) => {
+            let method = path.segments.join("::");
+            let owner = if registry
+                .fn_sig(algebra, &method)
+                .is_some_and(|s| s.params.len() == args.len())
+            {
+                algebra.to_string()
+            } else {
+                match registry.algebras_with_fn(&method, args.len()).as_slice() {
+                    [only] => only.to_string(),
+                    _ => return,
+                }
+            };
+            let Some(sig) = registry.fn_sig(&owner, &method) else {
+                return;
+            };
+            let owner_generics: Vec<&str> = registry
+                .generics(&owner)
+                .iter()
+                .filter(|g| !matches!(g, GenericParam::Const { .. }))
+                .map(|g| g.name())
+                .collect();
+
+            // `is_top && owner == algebra`: this exact instantiation's own
+            // `type_env` already resolves every one of `owner`'s targets
+            // directly, no template lookup needed at all -- but only sound
+            // for the axiom's own *outermost* call (`egraph.rs::seed_axiom_
+            // type_env`'s own identical `is_top` doc comment has the full
+            // reasoning: a *nested* same-algebra call, e.g. `transpose
+            // (transpose(a))`'s own inner `transpose`, is not guaranteed to
+            // share the enclosing instantiation at all).
+            let owner_tys: Vec<Ty> = if is_top && owner == algebra {
+                owner_generics
+                    .iter()
+                    .filter_map(|n| type_env.get(*n).cloned())
+                    .collect()
+            } else {
+                let mut target_tys: Vec<Option<Ty>> = vec![None; owner_generics.len()];
+                // Pin from already-resolved bare-param arguments first --
+                // this function's own doc comment has the motivating case
+                // (`P` in `MatMulTransposeA::matmul_transpose_a`, never
+                // determined by its own return type `C` alone).
+                for (arg, sig_param) in args.iter().zip(&sig.params) {
+                    let ExprKind::Path(p) = &arg.kind else { continue };
+                    if p.segments.len() != 1 {
+                        continue;
+                    }
+                    let Some(known) = param_tys.get(p.segments[0].as_str()) else {
+                        continue;
+                    };
+                    let Some(declared) = &sig_param.ty else { continue };
+                    let TypeKind::Path(dp, gens) = &declared.kind else {
+                        continue;
+                    };
+                    if !gens.is_empty() || dp.segments.len() != 1 {
+                        continue;
+                    }
+                    if let Some(idx) = owner_generics.iter().position(|g| *g == dp.segments[0]) {
+                        target_tys[idx] = Some(known.clone());
+                    }
+                }
+                // Then the return-type pin from context, same as before --
+                // never overriding an already-argument-pinned position.
+                let ret_idx = sig.ret.as_ref().and_then(|ret| match &ret.kind {
+                    TypeKind::Path(p, gens) if gens.is_empty() && p.segments.len() == 1 => {
+                        owner_generics.iter().position(|g| *g == p.segments[0])
+                    }
+                    _ => None,
+                });
+                if let (Some(idx), Some(t)) = (ret_idx, expected_ty) {
+                    if target_tys[idx].is_none() {
+                        target_tys[idx] = Some(t.clone());
+                    }
+                }
+                if target_tys.iter().all(Option::is_none) {
+                    return; // nothing to pin this cross-algebra callee's own targets from at all
+                }
+                let Some((idx, mapping)) =
+                    find_impl_for_target(templates, registry, &owner, &method, &target_tys)
+                else {
+                    return; // no covering impl -- a real gap elsewhere, not this function's job to guess past
+                };
+                let resolved: Vec<Ty> = templates[idx]
+                    .target_patterns
+                    .iter()
+                    .map(|p| substitute(p, &mapping))
+                    .collect();
+                impl_worklist.push((idx, mapping));
+                resolved
+            };
+            let owner_type_env: HashMap<String, Ty> = owner_generics
+                .iter()
+                .map(|s| s.to_string())
+                .zip(owner_tys)
+                .collect();
+            for (arg, sig_param) in args.iter().zip(&sig.params) {
+                let arg_expected = sig_param
+                    .ty
+                    .as_ref()
+                    .map(|d| infer.ty_from_ast_mapped(d, &owner_type_env));
+                seed_axiom_expr_references(
+                    arg,
+                    arg_expected.as_ref(),
+                    false,
+                    algebra,
+                    type_env,
+                    params,
+                    registry,
+                    infer,
+                    templates,
+                    impl_worklist,
+                    param_tys,
+                );
+            }
+        }
+        _ => {}
     }
 }
 

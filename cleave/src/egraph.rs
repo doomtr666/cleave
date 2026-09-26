@@ -1417,7 +1417,7 @@ use std::collections::HashSet;
 pub fn axiom_rewrites(
     registry: &Registry,
     reached: &HashMap<String, (String, String)>,
-) -> Vec<Rewrite<CleaveLang, ConstantFold>> {
+) -> (Vec<Rewrite<CleaveLang, ConstantFold>>, HashSet<String>) {
     let mut reached_types: HashMap<&str, HashSet<&str>> = HashMap::new();
     for (unit_name, (algebra, _method)) in reached {
         if let Some(ty) = concrete_type_of(unit_name) {
@@ -1429,16 +1429,18 @@ pub fn axiom_rewrites(
     }
 
     let mut rules = Vec::new();
+    let mut referenced = HashSet::new();
     for (algebra, types) in &reached_types {
         for axiom in registry.axioms(algebra) {
             for ty in types {
-                if let Some(rw) = axiom_to_rewrite(algebra, ty, axiom, registry) {
+                if let Some((rw, refs)) = axiom_to_rewrite(algebra, ty, axiom, registry) {
                     rules.push(rw);
+                    referenced.extend(refs);
                 }
             }
         }
     }
-    rules
+    (rules, referenced)
 }
 
 /// Extracts the bracketed type argument from a unit's own display name
@@ -1687,24 +1689,136 @@ fn resolve_type_pattern(pattern: &Type, subst: &HashMap<String, String>) -> Opti
     Some(format!("{name}<{}>", parts.join(", ")))
 }
 
+/// Bootstraps an axiom's own `type_env` for the genuinely general case
+/// `axiom_to_rewrite` itself only ever handled for a single-generic algebra
+/// before this existed: a param that appears *nested* inside a sub-call
+/// (`matmul(transpose(a), b)`'s own `a`, buried inside `transpose(a)`), not
+/// always directly as one of the enclosing algebra's own method's
+/// arguments the way every `derivative`/`adjoint` rule's params already do
+/// (those always match `rule.method`'s own signature one-to-one, so
+/// `derivative_rule_to_rewrite`'s simpler sig-zip is enough for them, and
+/// stays unchanged).
+///
+/// Works outside-in, the mirror image of `build_pattern`'s own Call arm
+/// (which resolves a call's *own* unpinned generic from its arguments,
+/// bottom-up): given `expr`'s own already-known overall type (`expr_ty`,
+/// `None` only ever legitimate at the very top, and only when this call
+/// turns out to belong to `algebra` itself, since `ty` alone already
+/// resolves that case directly), a `Call` resolves its own callee's full
+/// multi-target instantiation (`generic_substitution`-shaped) the same way
+/// `build_pattern`'s own "retried" fallback already does for a single
+/// unpinned generic (`resolve_multi_target_call_ty`, pinning the callee's
+/// own *return*-type position from `expr_ty`) — then zips that against the
+/// callee's own declared parameter types to get each argument's own
+/// expected type, and recurses into each argument with it. A bare `Path`
+/// naming one of the axiom's own `params` records `expr_ty` directly — the
+/// base case, and the only place anything actually lands in `env`.
+///
+/// `algebra`/`ty` stay fixed at the axiom's own enclosing values throughout
+/// the whole recursion (never rebound to whichever `owner` a nested call
+/// resolves to) — they only ever mean "the axiom's own declared home,"
+/// exactly matching `build_pattern`'s own identical invariant for the same
+/// two parameters. Purely additive (`entry().or_insert`) and best-effort:
+/// a param this can't resolve from either side simply stays absent from
+/// `env`, and `build_pattern` itself then correctly rejects the whole
+/// axiom for this instantiation (`ExprKind::Path`'s own unconditional
+/// lookup) — never a wrong guess, the same conservative posture as every
+/// other resolution failure in this module.
+fn seed_axiom_type_env<'p>(
+    expr: &Expr,
+    expr_ty: Option<&str>,
+    is_top: bool,
+    algebra: &str,
+    ty: &str,
+    params: &HashSet<&'p str>,
+    registry: &Registry,
+    env: &mut HashMap<&'p str, String>,
+) {
+    match &expr.kind {
+        ExprKind::Path(p) if p.segments.len() == 1 => {
+            if let (Some(&name), Some(t)) =
+                (params.iter().find(|&&n| n == p.segments[0]), expr_ty)
+            {
+                env.entry(name).or_insert_with(|| t.to_string());
+            }
+        }
+        ExprKind::Call(path, _, call_args, _) => {
+            let method = path.segments.join("::");
+            let owner = if registry
+                .fn_sig(algebra, &method)
+                .is_some_and(|sig| sig.params.len() == call_args.len())
+            {
+                algebra.to_string()
+            } else {
+                match registry.algebras_with_fn(&method, call_args.len()).as_slice() {
+                    [only] => only.to_string(),
+                    _ => return,
+                }
+            };
+            let Some(sig) = registry.fn_sig(&owner, &method) else {
+                return;
+            };
+            let owner_generics: Vec<&str> = registry
+                .generics(&owner)
+                .iter()
+                .filter(|g| !matches!(g, crate::ast::GenericParam::Const { .. }))
+                .map(|g| g.name())
+                .collect();
+            // `is_top && owner == algebra` — trusting `ty` directly — is
+            // only sound for the axiom's own *outermost* call, where `ty`
+            // is `seed_axiom_type_env`'s own caller's exact reached
+            // instantiation *for this call by construction*. A *nested*
+            // same-algebra call (`transpose(transpose(a))`'s own inner
+            // `transpose`, declared under `algebra Transpose` itself) is
+            // not guaranteed to share it — found live, exactly this shape:
+            // the inner call's own real instantiation is `Transpose`'s
+            // *swapped* target pair, not the outer one repeated (`build_
+            // pattern`'s own identical, pre-existing caution about a same-
+            // algebra recursive call already states this generally: "does
+            // *not* [reuse `ty` unchanged]... found directly, empirically").
+            // Every other case -- nested, whether same-algebra or cross- —
+            // goes through the identical `resolve_multi_target_call_ty`
+            // resolution regardless of which algebra `owner` turns out to
+            // be.
+            let owner_ty: Option<String> = if is_top && owner == algebra {
+                Some(ty.to_string())
+            } else if owner_generics.len() <= 1 {
+                expr_ty.map(str::to_string)
+            } else {
+                expr_ty.and_then(|ret_ty| {
+                    let ret_decl = sig.ret.as_ref()?;
+                    let TypeKind::Path(p, gens) = &ret_decl.kind else {
+                        return None;
+                    };
+                    if !gens.is_empty() || p.segments.len() != 1 {
+                        return None;
+                    }
+                    let idx = owner_generics.iter().position(|g| *g == p.segments[0])?;
+                    resolve_multi_target_call_ty(&owner, &[(idx, ret_ty)], registry)
+                })
+            };
+            let Some(owner_ty) = owner_ty else {
+                return;
+            };
+            let subst = generic_substitution(&owner, &owner_ty, registry);
+            for (arg, sig_param) in call_args.iter().zip(&sig.params) {
+                let arg_expected = sig_param
+                    .ty
+                    .as_ref()
+                    .and_then(|d| resolve_declared_type(d, &subst));
+                seed_axiom_type_env(arg, arg_expected.as_deref(), false, algebra, ty, params, registry, env);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn axiom_to_rewrite(
     algebra: &str,
     ty: &str,
     axiom: &AxiomDecl,
     registry: &Registry,
-) -> Option<Rewrite<CleaveLang, ConstantFold>> {
-    // Every axiom in this codebase is declared on a single-generic algebra
-    // (`Ring<T>`'s own `add_commutative`, ...) -- every param shares the
-    // one flat `ty` uniformly, the same assumption this function has always
-    // made (`build_pattern`'s own doc comment: "no cross-algebra resolution
-    // attempted" for axioms specifically). `derivative_rule_type_env`
-    // builds the *real*, per-param substitution `derivative` rules need
-    // instead (multi-target algebras, e.g. `MatMul<A,B,C>`).
-    let type_env: HashMap<&str, String> = axiom
-        .params
-        .iter()
-        .map(|p| (p.name.as_str(), ty.to_string()))
-        .collect();
+) -> Option<(Rewrite<CleaveLang, ConstantFold>, HashSet<String>)> {
     let ExprKind::Call(path, _, args, _) = &axiom.body.kind else {
         return None;
     };
@@ -1714,8 +1828,54 @@ fn axiom_to_rewrite(
     if path.segments.join("::") != "eq" {
         return None; // an axiom body that isn't `lhs == rhs` isn't representable yet
     }
-    // No `d(...)` sugar, no referenced-unit bookkeeping -- both are a
-    // `derivative`-rule-only concern (`build_pattern`'s own doc comment).
+    // Seeded *before* the flat fallback below, deliberately: `entry().or_
+    // insert()` only ever fills a gap, so whichever runs first wins for any
+    // param both would otherwise touch. A genuinely multi-target algebra
+    // (`MatMul<A,B,C>`) needs this seeding pass for real -- a param nested
+    // inside a cross-algebra sub-call (`matmul(transpose(a), b)`'s own `a`)
+    // has no single flat type the fallback alone could ever give it
+    // correctly. The flat fallback (every param -> `ty` unconditionally)
+    // still catches the overwhelmingly common single-generic case (`Ring
+    // <T>`'s own `add_commutative`), and anything the seeding pass genuinely
+    // couldn't resolve either.
+    let param_names: HashSet<&str> = axiom.params.iter().map(|p| p.name.as_str()).collect();
+    let mut type_env: HashMap<&str, String> = HashMap::new();
+    seed_axiom_type_env(lhs, None, true, algebra, ty, &param_names, registry, &mut type_env);
+    seed_axiom_type_env(rhs, None, true, algebra, ty, &param_names, registry, &mut type_env);
+    // The flat fallback (every still-unresolved param -> `ty` unconditionally)
+    // is only ever *correct* when `algebra` itself is single-generic (`ty`
+    // really is one flat type then, e.g. `Ring<T>`'s own `add_commutative`)
+    // -- for a genuine multi-target algebra, `ty` is the whole comma-joined
+    // instantiation string (`generic_substitution`'s own doc comment), and
+    // guessing it for a single param would build an outright nonsensical
+    // node name, not just an imprecise one. Left unresolved instead, for
+    // `build_pattern`'s own unconditional `type_env` lookup to correctly
+    // reject the whole axiom for this instantiation -- never a wrong guess.
+    let is_single_generic = registry
+        .generics(algebra)
+        .iter()
+        .filter(|g| !matches!(g, crate::ast::GenericParam::Const { .. }))
+        .count()
+        <= 1;
+    if is_single_generic {
+        for p in &axiom.params {
+            type_env
+                .entry(p.name.as_str())
+                .or_insert_with(|| ty.to_string());
+        }
+    }
+
+    // No `d(...)` sugar here (a `derivative`-rule-only concern, `build_
+    // pattern`'s own doc comment) -- but `referenced` genuinely matters now
+    // and must be propagated up, unlike before: an axiom whose own RHS
+    // names a cross-algebra unit no ordinary call site in the program ever
+    // reaches (`matmul_transpose_a_rewrite`'s own `matmul_transpose_a(a,
+    // b)`) needs it recorded into `call_units` downstream, or `rebuild`
+    // panics on a "real" call this rewrite itself just introduced -- found
+    // live, building exactly this axiom: `seed_axiom_references` (`mono
+    // morphize.rs`) already makes sure the unit *exists*, but this
+    // `referenced` set is the *separate* thing that tells `rebuild` it's
+    // allowed to actually call it.
     let mut referenced = HashSet::new();
     let mut lhs_ast = PatternAst::default();
     build_pattern(
@@ -1742,7 +1902,8 @@ fn axiom_to_rewrite(
         &mut rhs_ast,
     )?;
     let name = format!("{}@{algebra}<{ty}>", axiom.name);
-    Rewrite::new(name, egg::Pattern::new(lhs_ast), egg::Pattern::new(rhs_ast)).ok()
+    let rw = Rewrite::new(name, egg::Pattern::new(lhs_ast), egg::Pattern::new(rhs_ast)).ok()?;
+    Some((rw, referenced))
 }
 
 /// Walks one side of an axiom's (or a `derivative` rule's) own body,
@@ -3281,7 +3442,7 @@ pub fn optimize_program(
             continue;
         };
 
-        let mut rules = axiom_rewrites(registry, &fwd.reached);
+        let (mut rules, axiom_referenced) = axiom_rewrites(registry, &fwd.reached);
         rules.extend(struct_projection_rewrites(&fwd.struct_ops, &fwd.field_ops));
         if rules.is_empty() {
             continue; // nothing this pass knows how to apply to what this function reached
@@ -3298,7 +3459,7 @@ pub fn optimize_program(
             egraph,
             free_vars,
             raw_ops,
-            call_units,
+            mut call_units,
             struct_ops,
             field_ops,
             array_ops,
@@ -3306,6 +3467,23 @@ pub fn optimize_program(
             load_ops,
             ..
         } = fwd;
+        // An axiom's own RHS can name a cross-algebra unit no ordinary call
+        // site in this function ever reaches directly (`axiom_to_rewrite`'s
+        // own doc comment) -- `seed_axiom_references` (`monomorphize.rs`)
+        // already made sure the unit *exists*; this is the separate half
+        // that tells `rebuild`/`OpTables::call_units` it's allowed to
+        // actually call it, the same way `derivative`/`adjoint` rules'
+        // *own* referenced units already do (this file's own `referenced`
+        // variable, extended identically, elsewhere in this function).
+        // Filtered against `units` for the identical reason that other
+        // extend already is: a referenced name `seed_axiom_references`
+        // somehow didn't manage to monomorphize should stay unrecognized,
+        // not get treated as a real call by name alone.
+        call_units.extend(
+            axiom_referenced
+                .into_iter()
+                .filter(|name| units.contains_key(name.as_str())),
+        );
         // `with_egraph` *replaces* the runner's own `egraph` field wholesale
         // -- calling it before `with_explanations_enabled` (which mutates
         // the runner's current egraph in place) silently discards the flag,
@@ -3728,7 +3906,7 @@ pub fn synthesize_derivatives(
             derivative_rewrites(&ty_text, &fwd.reached, registry, &unit_names);
         referenced.extend(shape_referenced);
         pass_a_rules.extend(derivative_rules);
-        let axiom_rules = axiom_rewrites(registry, &fwd.reached);
+        let (axiom_rules, axiom_referenced) = axiom_rewrites(registry, &fwd.reached);
 
         let Forward {
             egraph,
@@ -3762,6 +3940,15 @@ pub fn synthesize_derivatives(
                 .iter()
                 .filter(|name| units.contains_key(name.as_str()))
                 .cloned(),
+        );
+        // The identical `axiom`-own-referenced-unit case as `optimize_
+        // program`'s own copy of this same extend (`axiom_to_rewrite`'s own
+        // doc comment) -- this pass builds `axiom_rules` too (`pass_a_rules`
+        // just below), so it needs the identical treatment.
+        call_units.extend(
+            axiom_referenced
+                .into_iter()
+                .filter(|name| units.contains_key(name.as_str())),
         );
         // `Runner::default()`'s own `iter_limit` (30) is tuned for `optimize_
         // program`'s ordinary axiom/constant-fold segments, not this pass:
@@ -5543,7 +5730,7 @@ mod tests {
             "TestRing::add<i32>".to_string(),
             ("TestRing".to_string(), "add".to_string()),
         );
-        let rules = axiom_rewrites(&registry, &reached);
+        let (rules, _) = axiom_rewrites(&registry, &reached);
         assert_eq!(
             rules.len(),
             1,
@@ -5586,7 +5773,7 @@ mod tests {
         );
         let program = result.unwrap();
         let registry = Registry::build(&program);
-        let rules = axiom_rewrites(&registry, &HashMap::new());
+        let (rules, _) = axiom_rewrites(&registry, &HashMap::new());
         assert!(rules.is_empty());
     }
 
@@ -5673,7 +5860,7 @@ mod tests {
         let root_var: CVar = 5;
         let root_id = fwd.env[&root_var];
 
-        let rules = axiom_rewrites(&registry, &fwd.reached);
+        let (rules, _) = axiom_rewrites(&registry, &fwd.reached);
         assert_eq!(rules.len(), 1);
 
         let Forward {

@@ -338,7 +338,11 @@ fn lowered_llvm_text(context: &Context, src: &str) -> String {
     }
     let units = collect_units(&program, &registry);
     let cps_program = convert_program(units, None);
-    let cps_program = eliminate_dead_code(cps_program);
+    // Not dead-code-eliminated before `optimize_program` runs -- an axiom/
+    // `derivative`/`adjoint` rule can reference a unit no ordinary call
+    // site reaches at all, which a pre-optimization sweep would strip
+    // before the rule ever gets a chance to need it (`pipeline.rs::build_
+    // optimized_cps`'s own identical comment has the full reasoning).
     let (cps_program, _) = optimize_program(cps_program, &registry, false);
     let cps_program = eliminate_dead_code(cps_program);
 
@@ -377,10 +381,108 @@ fn run_i32_with_optimization_pass(context: &Context, src: &str) -> i32 {
     let struct_schemas = collect_struct_schemas(&program);
     let cps_program = synthesize_derivatives(cps_program, &requests, &registry, &struct_schemas)
         .unwrap_or_else(|e| panic!("cannot derive: {e:?}"));
-    let cps_program = eliminate_dead_code(cps_program);
+    // Not dead-code-eliminated before `optimize_program` runs -- `lowered_
+    // llvm_text`'s own identical comment above has the full reasoning.
     let (cps_program, _) = optimize_program(cps_program, &registry, false);
     let cps_program = eliminate_dead_code(cps_program);
     run_i32_from_cps(context, &program, cps_program)
+}
+
+/// Like `run_i32_with_optimization_pass`, but returns the printed, fully
+/// lowered `llvm`-dialect text instead of JIT-invoking -- `lowered_llvm_
+/// text`'s own tensor-*capable* twin (that one's own doc comment explains
+/// why it deliberately skips bufferization: every one of its own callers is
+/// scalar-only). Needed for asserting *which* concrete unit an axiom
+/// rewrite actually routed through (`matmul_transpose_a`'s own zero-copy
+/// `mlir::linalg::matmul_transpose_a` intrinsic, tagged with a real,
+/// distinctive synthetic location, `<cleave-matmul-transpose>` — confirmed
+/// directly, this is genuinely how it shows up in real lowered output, not
+/// assumed) rather than only checking the numeric result, which a subtly
+/// wrong but still-plausible rewrite could satisfy by coincidence.
+fn optimized_lowered_llvm_text_for_tensors(context: &Context, src: &str) -> String {
+    let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
+    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+    let registry = Registry::build(&program);
+    if let Err(diags) = check_type_errors(&program, &registry) {
+        panic!("type check failed: {diags:?}");
+    }
+    let units = collect_units(&program, &registry);
+    let requests: Vec<DerivativeRequest> = units
+        .iter()
+        .filter_map(|u| match &u.body {
+            UnitBody::Derivative(of, is_grad, grad_target_index) => Some(DerivativeRequest {
+                name: u.name.clone(),
+                of: of.clone(),
+                is_grad: *is_grad,
+                grad_target_index: *grad_target_index,
+            }),
+            _ => None,
+        })
+        .collect();
+    let cps_program = convert_program(units, None);
+    let struct_schemas = collect_struct_schemas(&program);
+    // `build_cps_program`'s own real sequence (`pipeline.rs`) -- matching
+    // it exactly, not just `collect_units`/`convert_program` alone, found
+    // to matter live: this program has no real `derive()`/`grad()` at all
+    // (`requests` empty), yet skipping this step here specifically kept an
+    // axiom rewrite from firing that fires correctly through the real CLI
+    // (`--dump-mlir-lowered`), not yet root-caused beyond that, but
+    // reproducing the real pipeline exactly is the correct fix regardless.
+    let cps_program = synthesize_derivatives(cps_program, &requests, &registry, &struct_schemas)
+        .unwrap_or_else(|e| panic!("cannot derive: {e:?}"));
+    // Not dead-code-eliminated before `optimize_program` runs -- an axiom/
+    // `derivative`/`adjoint` rule can reference a unit no ordinary call
+    // site reaches at all, which a pre-optimization sweep would strip
+    // before the rule ever gets a chance to need it (`pipeline.rs::build_
+    // optimized_cps`'s own identical comment has the full reasoning).
+    let (cps_program, _) = optimize_program(cps_program, &registry, false);
+    let cps_program = eliminate_dead_code(cps_program);
+
+    let mlir_types = collect_mlir_types(&program);
+    let mut module = lower_program(context, &cps_program, &mlir_types, struct_schemas);
+    assert!(
+        module.as_operation().verify(),
+        "generated MLIR module failed verification"
+    );
+
+    // The identical three-stage tensor pipeline `run_i32_from_cps` already
+    // uses (that function's own doc comment has the full reasoning for
+    // each stage) -- stopping here, before JIT engine construction, instead
+    // of continuing on to invoke.
+    let pass_manager = pass::PassManager::new(context);
+    pass_manager.add_pass(pass::linalg::create_convert_elementwise_to_linalg_pass());
+    pass_manager
+        .run(&mut module)
+        .expect("convert-elementwise-to-linalg must succeed");
+
+    let pass_manager = pass::PassManager::new(context);
+    pass::bufferization::register_one_shot_bufferize_pass();
+    parse_pass_pipeline(
+        pass_manager.as_operation_pass_manager(),
+        "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})",
+    )
+    .expect("failed to parse the one-shot-bufferize pass pipeline");
+    pass_manager
+        .run(&mut module)
+        .expect("one-shot-bufferize must succeed");
+
+    let pass_manager = pass::PassManager::new(context);
+    pass_manager.add_pass(pass::linalg::create_convert_linalg_to_loops_pass());
+    pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
+    pass_manager.add_pass(pass::transform::create_canonicalizer());
+    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
+    pass_manager.add_pass(pass::conversion::create_lower_affine());
+    pass_manager.add_pass(pass::transform::create_canonicalizer());
+    pass_manager.add_pass(pass::conversion::create_to_llvm());
+    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
+    pass_manager.add_pass(pass::conversion::create_to_llvm());
+    pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
+    pass_manager
+        .run(&mut module)
+        .expect("lowering to the llvm dialect must succeed");
+    strip_ciface_wrapper_debug_info(context, module.as_operation_mut());
+
+    module.as_operation().to_string()
 }
 
 fn run_i32_from_cps(
@@ -6803,5 +6905,231 @@ fn grad_through_dense_forward_at_a_real_batch_computes_the_right_gradient() {
             { 1 } else { 0 }
         }
     ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+// ---------------------------------------------------------------- matmul/transpose axioms
+//
+// `stdlib/linalg/matrix.cleave`'s own `matmul_transpose_a_rewrite`/`_b_
+// rewrite`/`matmul_transpose_distributes`/`transpose_transpose` axioms —
+// the first `axiom` declarations anywhere in this codebase's stdlib on a
+// genuinely multi-target algebra (`MatMul<A,B,C>`) referencing a *different*
+// multi-target algebra's own method (`Transpose<A,B>`'s `transpose`,
+// `MatMulTransposeA/B<A,B,C>`'s own methods) — `axiom_to_rewrite`'s own
+// mechanism only ever supported a single flat type shared by every param
+// before this (`Ring<T>`'s own `add_commutative`, ...), found live writing
+// exactly these four rules. Closing this gap took three separate, real
+// fixes, each independently necessary: (1) `egraph.rs::seed_axiom_type_env`
+// -- resolving an axiom's own params correctly even when one appears
+// *nested* inside a cross-algebra sub-call (`matmul(transpose(a), b)`'s own
+// `a`, buried inside `transpose(a)`); (2) `monomorphize.rs::seed_axiom_
+// references` -- making sure the unit a fired rewrite introduces (`MatMul
+// TransposeA::matmul_transpose_a<...>`, never called by any ordinary source
+// expression) actually gets monomorphized, the same class of gap `seed_
+// derivative_rule_references`/`seed_adjoint_rule_references` already closed
+// for their own rule kinds; (3) `axiom_to_rewrite`'s own `referenced` set,
+// previously built but silently discarded, now propagated into `call_
+// units` the identical way `derivative`/`adjoint` rules' own referenced
+// units already are; and (4) `pipeline.rs::build_optimized_cps`/every
+// matching `main.rs` block no longer dead-code-eliminating *before*
+// `optimize_program` runs at all -- doing so used to strip exactly this
+// kind of never-directly-called unit before the rewrite that needs it ever
+// got a chance to say so (sound either way — a single sweep strictly after
+// still catches everything genuinely dead — just costs a little more of
+// `optimize_program`'s own time on segments that turn out unreachable).
+
+/// `matmul(transpose(a), b) == matmul_transpose_a(a, b)` — the rewrite
+/// actually fires, not just "the numeric answer happens to be right."
+/// `a`/`b` are routed through a real *parameter*, deliberately — found
+/// live, this matters: with `a`/`b` constructed from literal data directly
+/// inside `main`, the e-graph's own constant folding can (and, at least
+/// once, actually did — nondeterministically, depending on internal e-
+/// class ordering) fold the *whole* `matmul`/`transpose`/`index` chain
+/// straight down to a literal answer, competing with and sometimes beating
+/// the axiom rewrite on cost alone — a real, valid optimization on its own
+/// terms, just not what this test is trying to isolate. Behind an opaque
+/// function parameter, `a`/`b` are `Free` values the e-graph cannot fold
+/// through at all, so the rewrite is the only lever left — deterministic,
+/// and the actually-motivating shape besides (real code calls `matmul` on
+/// runtime tensors, never compile-time-literal ones).
+#[test]
+fn matmul_transpose_a_rewrite_fires_and_computes_the_right_value() {
+    let context = context();
+    let src = "
+        use linalg;
+        fn compute(a: Tensor<f32,2,3>, b: Tensor<f32,2,4>) -> f32 {
+            let c = matmul(transpose(a), b);
+            c[0, 0]
+        }
+        fn main() -> i32 {
+            let a = Tensor::<f32, 2, 3>(data: [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+            let b = Tensor::<f32, 2, 4>(data: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]);
+            if compute(a, b) == 1.0 { 1 } else { 0 }
+        }
+    ";
+    let text = optimized_lowered_llvm_text_for_tensors(&context, src);
+    assert!(text.contains("MatMulTransposeA::matmul_transpose_a"), "{text}");
+    assert!(!text.contains("Transpose::transpose"), "{text}");
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// The `_b` sibling — `matmul(a, transpose(b)) == matmul_transpose_b(a, b)`.
+#[test]
+fn matmul_transpose_b_rewrite_fires_and_computes_the_right_value() {
+    let context = context();
+    let src = "
+        use linalg;
+        fn compute(a: Tensor<f32,3,2>, b: Tensor<f32,4,2>) -> f32 {
+            let c = matmul(a, transpose(b));
+            c[2, 1]
+        }
+        fn main() -> i32 {
+            let a = Tensor::<f32, 3, 2>(data: [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]);
+            let b = Tensor::<f32, 4, 2>(data: [[1.0, 0.0], [0.0, 1.0], [0.0, 0.0], [0.0, 0.0]]);
+            if compute(a, b) == 6.0 { 1 } else { 0 }
+        }
+    ";
+    let text = optimized_lowered_llvm_text_for_tensors(&context, src);
+    assert!(text.contains("MatMulTransposeB::matmul_transpose_b"), "{text}");
+    assert!(!text.contains("Transpose::transpose"), "{text}");
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `transpose(transpose(a)) == a` — the strict, always-a-win identity: the
+/// rewrite must eliminate *both* transposes entirely, down to nothing at
+/// all (no `Transpose::transpose` reference left anywhere), not just fold
+/// one away. Behind an opaque parameter for the same reason as the two
+/// tests above — otherwise the e-graph's own constant folding can (and
+/// did, at least once) beat the rewrite to it, nondeterministically.
+#[test]
+fn transpose_transpose_identity_fires_and_computes_the_right_value() {
+    let context = context();
+    let src = "
+        use linalg;
+        fn compute(a: Tensor<f32,2,3>) -> f32 {
+            let b = transpose(transpose(a));
+            b[1, 2]
+        }
+        fn main() -> i32 {
+            let a = Tensor::<f32, 2, 3>(data: [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+            if compute(a) == 6.0 { 1 } else { 0 }
+        }
+    ";
+    let text = optimized_lowered_llvm_text_for_tensors(&context, src);
+    assert!(!text.contains("Transpose::transpose"), "{text}");
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `matmul(transpose(b), transpose(a)) == transpose(matmul(a, b))` — the
+/// one direction declared (deliberately one-directional, per the axiom's
+/// own doc comment in `matrix.cleave`: the *other* direction needs a real
+/// cost model this project doesn't have yet). Verified both numerically
+/// and structurally: the rewritten form (`transpose(matmul(a,b))`) has one
+/// real `Transpose::transpose` unit and an ordinary `MatMul::matmul` — the
+/// *un*rewritten form would have had two separate `Transpose::transpose`
+/// units and no plain `MatMul::matmul` at all, a real, checkable
+/// difference between the two, not just an equally-valid alternative
+/// phrasing. Behind opaque parameters for the same reason as the tests
+/// above.
+#[test]
+fn matmul_transpose_distributes_axiom_fires_and_computes_the_right_value() {
+    let context = context();
+    let src = "
+        use linalg;
+        fn compute(a: Tensor<f32,2,3>, b: Tensor<f32,3,4>) -> f32 {
+            let c = matmul(transpose(b), transpose(a));
+            c[2, 1]
+        }
+        fn main() -> i32 {
+            let a = Tensor::<f32, 2, 3>(data: [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+            let b = Tensor::<f32, 3, 4>(
+                data: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]]
+            );
+            if compute(a, b) == 6.0 { 1 } else { 0 }
+        }
+    ";
+    let text = optimized_lowered_llvm_text_for_tensors(&context, src);
+    // The *rewritten* form's own two real units, checked by their exact,
+    // fully-resolved instantiation, not just presence — a stronger check
+    // than a bare occurrence count (each real unit legitimately appears
+    // twice either way, once as its own `llvm.func` declaration and once
+    // at its call site, so counting occurrences at all was the wrong
+    // signal here, found live writing this assertion): the ordinary
+    // `matmul(a, b)` at `a`/`b`'s own real shapes, and a single trailing
+    // `transpose` of *that* 2x4 result into 4x2 — never the *unrewritten*
+    // form's own two separate, differently-shaped transposes instead.
+    assert!(
+        text.contains("MatMul::matmul<Tensor<f32, 2, 3>, Tensor<f32, 3, 4>, Tensor<f32, 2, 4>>"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Transpose::transpose<Tensor<f32, 2, 4>, Tensor<f32, 4, 2>>"),
+        "{text}"
+    );
+    assert!(!text.contains("Transpose::transpose<Tensor<f32, 3, 4>"), "{text}");
+    assert!(!text.contains("Transpose::transpose<Tensor<f32, 2, 3>"), "{text}");
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `add(transpose(a), transpose(b)) == transpose(add(a, b))` — transpose is
+/// linear. Declared under `algebra Transpose` (`stdlib/linalg/matrix.
+/// cleave`), referencing `Ring<T>`'s own `add` — single-generic, so this
+/// specific cross-algebra reference already worked before this session's
+/// own multi-target fix (only the *enclosing* side, `Transpose` itself,
+/// needed it); listed here anyway for the same "verify it fires
+/// structurally, not just the right number" discipline as the four rules
+/// above. Only the *collapsing* direction is declared (2 nodes vs. the
+/// unrewritten form's 3), the identical, unconditional node-count-win
+/// reasoning `matmul_transpose_distributes`'s own doc comment already
+/// gives — verified via `optimized_lowered_llvm_text_for_tensors`, not the
+/// real CLI: `--dump-mlir-lowered` on the identical source, tried first,
+/// folds the *whole* expression down to a bare literal once its own real
+/// MLIR inliner (this test harness's own pipeline deliberately has none)
+/// inlines `compute` into `main` and its canonicalizer sees every input as
+/// a compile-time constant — a real, *different*, equally-valid
+/// optimization, just not the one this test needs to isolate.
+#[test]
+fn transpose_add_distributes_axiom_fires_and_computes_the_right_value() {
+    let context = context();
+    let src = "
+        use linalg;
+        fn compute(a: Tensor<f32,2,3>, b: Tensor<f32,2,3>) -> f32 {
+            let c = add(transpose(a), transpose(b));
+            c[1, 0]
+        }
+        fn main() -> i32 {
+            let a = Tensor::<f32, 2, 3>(data: [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+            let b = Tensor::<f32, 2, 3>(data: [[10.0, 20.0, 30.0], [40.0, 50.0, 60.0]]);
+            if compute(a, b) == 22.0 { 1 } else { 0 }
+        }
+    ";
+    let text = optimized_lowered_llvm_text_for_tensors(&context, src);
+    assert!(text.contains("Ring::add<Tensor<f32, 2, 3>>"), "{text}");
+    assert!(text.contains("Transpose::transpose<Tensor<f32, 2, 3>, Tensor<f32, 3, 2>>"), "{text}");
+    assert!(!text.contains("Ring::add<Tensor<f32, 3, 2>>"), "{text}");
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// The `sub` sibling — `sub(transpose(a), transpose(b)) == transpose(sub(a,
+/// b))`, identical reasoning.
+#[test]
+fn transpose_sub_distributes_axiom_fires_and_computes_the_right_value() {
+    let context = context();
+    let src = "
+        use linalg;
+        fn compute(a: Tensor<f32,2,3>, b: Tensor<f32,2,3>) -> f32 {
+            let c = sub(transpose(a), transpose(b));
+            c[1, 0]
+        }
+        fn main() -> i32 {
+            let a = Tensor::<f32, 2, 3>(data: [[10.0, 20.0, 30.0], [40.0, 50.0, 60.0]]);
+            let b = Tensor::<f32, 2, 3>(data: [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+            if compute(a, b) == 18.0 { 1 } else { 0 }
+        }
+    ";
+    let text = optimized_lowered_llvm_text_for_tensors(&context, src);
+    assert!(text.contains("Ring::sub<Tensor<f32, 2, 3>>"), "{text}");
+    assert!(text.contains("Transpose::transpose<Tensor<f32, 2, 3>, Tensor<f32, 3, 2>>"), "{text}");
+    assert!(!text.contains("Ring::sub<Tensor<f32, 3, 2>>"), "{text}");
     assert_eq!(run_i32(&context, src), 1);
 }
