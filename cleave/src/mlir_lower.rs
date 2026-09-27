@@ -5241,6 +5241,26 @@ fn lower_raw_mlir_op<'c>(
     if op == "linalg.matmul_transpose_b" {
         return build_matmul_transpose_no_seed(ctx, block, env, args, result_ty, false);
     }
+    // `linalg.matmul_add`/`_transpose_a_add`/`_transpose_b_add` — `A@B + C`
+    // (or a transposed operand's own zero-copy equivalent), `C` a real,
+    // already-computed tensor value seeding `linalg.matmul`'s own `outs()`
+    // directly instead of a fresh `linalg.fill`-zeroed destination. Real
+    // accumulation, not a hypothetical: `linalg.matmul` already documents
+    // `C := A@B + C` (`build_matmul_no_seed`'s own doc comment), so this
+    // needs nothing beyond skipping the zero-fill — see `build_matmul_add`'s
+    // own doc comment. `stdlib/linalg/matrix.cleave`'s own `Fma`/
+    // `FmaTransposeA`/`FmaTransposeB` axioms are what actually introduce
+    // these from an ordinary `matmul(...) + c` (or `matmul_transpose_a/b(
+    // ...) + c`) written by a caller, or reached by differentiation.
+    if op == "linalg.matmul_add" {
+        return build_matmul_add(ctx, block, env, args, result_ty);
+    }
+    if op == "linalg.matmul_transpose_a_add" {
+        return build_matmul_transpose_add(ctx, block, env, args, result_ty, true);
+    }
+    if op == "linalg.matmul_transpose_b_add" {
+        return build_matmul_transpose_add(ctx, block, env, args, result_ty, false);
+    }
     if op == "linalg.transpose" {
         return build_transpose_no_seed(ctx, block, env, args, attrs, result_ty);
     }
@@ -5658,14 +5678,31 @@ fn build_matmul_no_seed<'c>(
         .unwrap()
         .into();
 
-    // The real named `linalg.matmul` op. Its region is elided in every
-    // *textual* `linalg.matmul` this project has ever written or dumped
-    // (MLIR's own custom parser/printer for named structured ops derives
-    // the canonical `out += a*b` body automatically) — but melior's generic
-    // `OperationBuilder` goes through the plain C API (`mlirOperationCreate`
-    // via an `OperationState`), never that custom parser, so the region is
-    // built explicitly here, by hand, matching exactly the canonical body
-    // the parser would have synthesized.
+    build_matmul_named_op(context, block, location, a, b, init, elem_ty, result_ty)
+}
+
+/// The real named `linalg.matmul` op-construction tail shared by every
+/// seeding strategy above/below (`build_matmul_no_seed`'s own zero-fill
+/// `init`, `build_matmul_add`'s own real-`c` `init`): once `init` is on
+/// hand, the op itself — the same `mulf`+`addf`+`yield` payload region,
+/// the same `operandSegmentSizes`/results — is identical either way. Its
+/// region is elided in every *textual* `linalg.matmul` this project has
+/// ever written or dumped (MLIR's own custom parser/printer for named
+/// structured ops derives the canonical `out += a*b` body automatically)
+/// — but melior's generic `OperationBuilder` goes through the plain C API
+/// (`mlirOperationCreate` via an `OperationState`), never that custom
+/// parser, so the region is built explicitly here, by hand, matching
+/// exactly the canonical body the parser would have synthesized.
+fn build_matmul_named_op<'c>(
+    context: &'c Context,
+    block: &Block<'c>,
+    location: Location<'c>,
+    a: Value<'c, 'c>,
+    b: Value<'c, 'c>,
+    init: Value<'c, 'c>,
+    elem_ty: Type<'c>,
+    result_ty: Type<'c>,
+) -> Value<'c, 'c> {
     let payload = Block::new(&[(elem_ty, location), (elem_ty, location), (elem_ty, location)]);
     let av: Value = payload.argument(0).unwrap().into();
     let bv: Value = payload.argument(1).unwrap().into();
@@ -5712,6 +5749,41 @@ fn build_matmul_no_seed<'c>(
         .build()
         .unwrap_or_else(|e| panic!("MLIR lowering: failed to build linalg.matmul: {e}"));
     block.append_operation(built).result(0).unwrap().into()
+}
+
+/// `A@B + C` — real accumulation into an explicit, already-computed tensor
+/// `c`, not a fresh zero-seeded destination. The only difference from
+/// `build_matmul_no_seed` above: `c` becomes `linalg.matmul`'s own
+/// `outs()` operand directly, no `linalg.fill` at all — `linalg.matmul`
+/// already documents `C := A@B + C` (that function's own doc comment), so
+/// real accumulation needs nothing beyond skipping the zero-fill and
+/// seeding `init` from `c` instead. `stdlib/linalg/matrix.cleave`'s own
+/// `Fma` axiom is what actually rewrites an ordinary `matmul(a,b) + c`
+/// into a call reaching this.
+fn build_matmul_add<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    args: &[CVal],
+    result_ty: Type<'c>,
+) -> Value<'c, 'c> {
+    let context = ctx.context;
+    let location = gen_loc(context);
+    let [a_arg, b_arg, c_arg] = args else {
+        panic!(
+            "MLIR lowering: `mlir::linalg::matmul_add` needs exactly three operands (`a`, `b`, `c`), got {}",
+            args.len()
+        );
+    };
+    let a = lower_cval(context, block, env, a_arg, result_ty);
+    let b = lower_cval(context, block, env, b_arg, result_ty);
+    let init = lower_cval(context, block, env, c_arg, result_ty);
+    let elem_ty = RankedTensorType::try_from(result_ty)
+        .unwrap_or_else(|e| {
+            panic!("MLIR lowering: matmul_add's own result must be a ranked tensor: {e}")
+        })
+        .element();
+    build_matmul_named_op(context, block, location, a, b, init, elem_ty, result_ty)
 }
 
 /// Builds `A^T @ B` (`transpose_lhs = true`) or `A @ B^T` (`transpose_lhs =
@@ -5840,6 +5912,26 @@ fn build_matmul_transpose_no_seed<'c>(
     // `K` trailing). Both keep the ordinary `(d0, d1)` output map — the
     // transpose lives entirely in which index a *contiguous* load lands on,
     // never in how memory is physically walked.
+    build_matmul_transpose_named_op(context, block, a, b, init, result_ty, transpose_lhs)
+}
+
+/// The textual-parse-and-splice tail shared by `build_matmul_transpose_no_
+/// seed` (zero-seeded, above) and `build_matmul_transpose_add` (seeded from
+/// a real `c`, below) — once `init` is on hand, building the actual
+/// transposed-indexing-maps `linalg.matmul` is identical either way. See
+/// `build_matmul_transpose_no_seed`'s own doc comment for why this has to
+/// go through MLIR's own textual parser (`indexing_maps` is a Properties
+/// field melior's `OperationBuilder` can't set directly) rather than
+/// melior's ordinary builder API.
+fn build_matmul_transpose_named_op<'c>(
+    context: &'c Context,
+    block: &Block<'c>,
+    a: Value<'c, 'c>,
+    b: Value<'c, 'c>,
+    init: Value<'c, 'c>,
+    result_ty: Type<'c>,
+    transpose_lhs: bool,
+) -> Value<'c, 'c> {
     let a_ty = a.r#type();
     let b_ty = b.r#type();
     let (lhs_map, rhs_map) = if transpose_lhs {
@@ -5883,6 +5975,34 @@ fn build_matmul_transpose_no_seed<'c>(
     matmul_ref.set_operands(&[a, b, init]);
     let built = unsafe { Operation::from_raw(matmul_ref.to_raw()) };
     block.append_operation(built).result(0).unwrap().into()
+}
+
+/// `A^T@B + C` (`transpose_lhs = true`) or `A@B^T + C` (`transpose_lhs =
+/// false`) — the transposed-operand analog of `build_matmul_add`: `c`
+/// seeds `init` directly, no `linalg.fill` zero-fill, same reasoning as
+/// `build_matmul_add`'s own doc comment. `stdlib/linalg/matrix.cleave`'s
+/// own `FmaTransposeA`/`FmaTransposeB` axioms are what actually rewrite an
+/// ordinary `matmul_transpose_a/b(a,b) + c` into a call reaching this.
+fn build_matmul_transpose_add<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    args: &[CVal],
+    result_ty: Type<'c>,
+    transpose_lhs: bool,
+) -> Value<'c, 'c> {
+    let context = ctx.context;
+    let [a_arg, b_arg, c_arg] = args else {
+        panic!(
+            "MLIR lowering: `mlir::linalg::matmul_transpose_{}_add` needs exactly three operands (`a`, `b`, `c`), got {}",
+            if transpose_lhs { "a" } else { "b" },
+            args.len()
+        );
+    };
+    let a = lower_cval(context, block, env, a_arg, result_ty);
+    let b = lower_cval(context, block, env, b_arg, result_ty);
+    let init = lower_cval(context, block, env, c_arg, result_ty);
+    build_matmul_transpose_named_op(context, block, a, b, init, result_ty, transpose_lhs)
 }
 
 /// Builds `A^T` as a genuinely seed-free `linalg.transpose` — no `Ring::

@@ -7133,3 +7133,96 @@ fn transpose_sub_distributes_axiom_fires_and_computes_the_right_value() {
     assert!(!text.contains("Ring::sub<Tensor<f32, 3, 2>>"), "{text}");
     assert_eq!(run_i32(&context, src), 1);
 }
+
+// ---------------------------------------------------------------- fma axioms
+//
+// `stdlib/linalg/matrix.cleave`'s own `Fma`/`FmaTransposeA`/`FmaTransposeB`
+// -- `matmul(a,b) + c` fuses into one `linalg.matmul` seeded from `c`
+// directly (`mlir_lower.rs::build_matmul_add`), the same real accumulation
+// `linalg.matmul` already documents (`C := A@B + C`), no `linalg.fill`
+// zero-fill, no separate elementwise `add` pass at all. Verified the same
+// way as `matmul_transpose_a_rewrite` above: structurally (the fused unit
+// is reached, the un-fused `Ring::add` on the *output* shape is not) and
+// numerically, behind an opaque parameter so the e-graph's own constant
+// folding can't fold the whole expression down first and mask whether the
+// axiom itself ever fired.
+#[test]
+fn fma_rewrite_fires_and_computes_the_right_value() {
+    let context = context();
+    let src = "
+        use linalg;
+        fn compute(a: Tensor<f32,2,3>, b: Tensor<f32,3,2>, c: Tensor<f32,2,2>) -> f32 {
+            let r = add(matmul(a, b), c);
+            r[0, 0]
+        }
+        fn main() -> i32 {
+            let a = Tensor::<f32, 2, 3>(data: [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+            let b = Tensor::<f32, 3, 2>(data: [[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]]);
+            let c = Tensor::<f32, 2, 2>(data: [[100.0, 200.0], [300.0, 400.0]]);
+            if compute(a, b, c) == 101.0 { 1 } else { 0 }
+        }
+    ";
+    let text = optimized_lowered_llvm_text_for_tensors(&context, src);
+    assert!(text.contains("Fma::fma<Tensor<f32, 2, 3>, Tensor<f32, 3, 2>, Tensor<f32, 2, 2>>"), "{text}");
+    assert!(!text.contains("MatMul::matmul<Tensor<f32, 2, 3>, Tensor<f32, 3, 2>, Tensor<f32, 2, 2>>"), "{text}");
+    assert!(!text.contains("Ring::add<Tensor<f32, 2, 2>>"), "{text}");
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// The `_transpose_a` sibling — `add(matmul_transpose_a(a,b), c) ==
+/// fma_transpose_a(a,b,c)`, reached transitively through `MatMul`'s own
+/// `matmul_transpose_a_rewrite` (`matmul(transpose(a),b)` unions into the
+/// same e-class as `matmul_transpose_a(a,b)` first) and `Fma`'s own
+/// `fma_transpose_a_rewrite` (layered on top, exactly like `matmul_
+/// transpose_a_rewrite` is layered on top of a plain `matmul`).
+#[test]
+fn fma_transpose_a_rewrite_fires_and_computes_the_right_value() {
+    let context = context();
+    let src = "
+        use linalg;
+        fn compute(a: Tensor<f32,3,2>, b: Tensor<f32,3,4>, c: Tensor<f32,2,4>) -> f32 {
+            let r = add(matmul(transpose(a), b), c);
+            r[0, 0]
+        }
+        fn main() -> i32 {
+            let a = Tensor::<f32, 3, 2>(data: [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]);
+            let b = Tensor::<f32, 3, 4>(
+                data: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]]
+            );
+            let c = Tensor::<f32, 2, 4>(data: [[10.0, 20.0, 30.0, 40.0], [50.0, 60.0, 70.0, 80.0]]);
+            if compute(a, b, c) == 11.0 { 1 } else { 0 }
+        }
+    ";
+    let text = optimized_lowered_llvm_text_for_tensors(&context, src);
+    assert!(text.contains("FmaTransposeA::fma_transpose_a<Tensor<f32, 3, 2>, Tensor<f32, 3, 4>, Tensor<f32, 2, 4>>"), "{text}");
+    assert!(!text.contains("Transpose::transpose<Tensor<f32, 3, 2>"), "{text}");
+    assert!(!text.contains("Ring::add<Tensor<f32, 2, 4>>"), "{text}");
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// The `_transpose_b` sibling — `add(matmul_transpose_b(a,b), c) ==
+/// fma_transpose_b(a,b,c)`.
+#[test]
+fn fma_transpose_b_rewrite_fires_and_computes_the_right_value() {
+    let context = context();
+    let src = "
+        use linalg;
+        fn compute(a: Tensor<f32,2,3>, b: Tensor<f32,4,3>, c: Tensor<f32,2,4>) -> f32 {
+            let r = add(matmul(a, transpose(b)), c);
+            r[0, 0]
+        }
+        fn main() -> i32 {
+            let a = Tensor::<f32, 2, 3>(data: [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+            let b = Tensor::<f32, 4, 3>(
+                data: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0]]
+            );
+            let c = Tensor::<f32, 2, 4>(data: [[10.0, 20.0, 30.0, 40.0], [50.0, 60.0, 70.0, 80.0]]);
+            if compute(a, b, c) == 11.0 { 1 } else { 0 }
+        }
+    ";
+    let text = optimized_lowered_llvm_text_for_tensors(&context, src);
+    assert!(text.contains("FmaTransposeB::fma_transpose_b<Tensor<f32, 2, 3>, Tensor<f32, 4, 3>, Tensor<f32, 2, 4>>"), "{text}");
+    assert!(!text.contains("Transpose::transpose<Tensor<f32, 4, 3>"), "{text}");
+    assert!(!text.contains("Ring::add<Tensor<f32, 2, 4>>"), "{text}");
+    assert_eq!(run_i32(&context, src), 1);
+}

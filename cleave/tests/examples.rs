@@ -88,6 +88,18 @@ fn axiom_demo_example_runs_cleanly() {
     assert_clean(&run_example("axiom_demo"));
 }
 
+/// `doc/plan-blas-native.md` §7.1 -- `blas::sgemm` called directly by a
+/// small real program, the same "does it still work end to end" smoke
+/// test every other example here already is (`cleave/tests/blas.rs`
+/// covers correctness in depth; this covers the real CLI path: crate
+/// resolution, JIT symbol registration via `register_cleave_rt_symbols`,
+/// and OpenBLAS's own lazy `LoadLibraryW`, none of which the in-process
+/// oracle test exercises).
+#[test]
+fn blas_demo_example_runs_cleanly() {
+    assert_clean(&run_example("blas_demo"));
+}
+
 #[test]
 fn convert_example_runs_cleanly() {
     assert_clean(&run_example("convert"));

@@ -567,6 +567,11 @@ pub unsafe fn register_cleave_rt_symbols(engine: &cleave_mlir_shim::ExecutionEng
         engine.register_symbol("dynarray_grow_ptr", cleave_rt::dynarray_grow_ptr as *mut ());
         engine.register_symbol("dynarray_get_ptr", cleave_rt::dynarray_get_ptr as *mut ());
         engine.register_symbol("dynarray_set_ptr", cleave_rt::dynarray_set_ptr as *mut ());
+        // `stdlib/blas/blas.cleave`'s own `raw_sgemm` extern -- lazily loads
+        // `openblas.dll` on first real call (`cleave_rt::blas_dynload`), so
+        // registering it here unconditionally costs nothing for a program
+        // that never calls into `blas`.
+        engine.register_symbol("cleave_blas_sgemm", cleave_rt::cleave_blas_sgemm as *mut ());
     }
 }
 

@@ -2838,7 +2838,7 @@ fn seed_axiom_references(
 fn seed_axiom_expr_references<'p>(
     expr: &Expr,
     expected_ty: Option<&Ty>,
-    is_top: bool,
+    trust_ty: bool,
     algebra: &str,
     type_env: &HashMap<String, Ty>,
     params: &HashSet<&'p str>,
@@ -2880,44 +2880,70 @@ fn seed_axiom_expr_references<'p>(
                 .map(|g| g.name())
                 .collect();
 
-            // `is_top && owner == algebra`: this exact instantiation's own
-            // `type_env` already resolves every one of `owner`'s targets
-            // directly, no template lookup needed at all -- but only sound
-            // for the axiom's own *outermost* call (`egraph.rs::seed_axiom_
-            // type_env`'s own identical `is_top` doc comment has the full
-            // reasoning: a *nested* same-algebra call, e.g. `transpose
-            // (transpose(a))`'s own inner `transpose`, is not guaranteed to
-            // share the enclosing instantiation at all).
-            let owner_tys: Vec<Ty> = if is_top && owner == algebra {
+            // Pin from already-resolved bare-param arguments first --
+            // this function's own doc comment has the motivating case (`P`
+            // in `MatMulTransposeA::matmul_transpose_a`, never determined
+            // by its own return type `C` alone) -- and, just as important,
+            // *before* ever considering `trust_ty && owner == algebra`
+            // below: a sibling pin is grounded in these specific real args'
+            // own already-confirmed identity, so it must always win over
+            // blindly trusting `type_env`/`ty` for a *nested* same-algebra
+            // call, which (unlike the truly-outermost case) is not
+            // guaranteed to share the enclosing instantiation at all --
+            // found live, in exactly this shape: `matmul_transpose_
+            // distributes`'s own RHS, `transpose(matmul(a, b))`, reaches
+            // this `matmul(a, b)` nested one level inside a *foreign*-owner
+            // `transpose` (never itself the outermost call on this side),
+            // where `a`/`b` are already known (from the *other* side's own
+            // traversal) to be the plain, untransposed shapes -- genuinely
+            // different from `ty`'s own (transposed-and-swapped) shape, so
+            // trusting `ty` there produced a real, wrong `MatMul::matmul<
+            // ...>` reference (one that skipped `find_impl_for_target`
+            // entirely, and so was never actually monomorphized) instead of
+            // the reachable rewrite it should have found.
+            let mut target_tys: Vec<Option<Ty>> = vec![None; owner_generics.len()];
+            for (arg, sig_param) in args.iter().zip(&sig.params) {
+                let ExprKind::Path(p) = &arg.kind else { continue };
+                if p.segments.len() != 1 {
+                    continue;
+                }
+                let Some(known) = param_tys.get(p.segments[0].as_str()) else {
+                    continue;
+                };
+                let Some(declared) = &sig_param.ty else { continue };
+                let TypeKind::Path(dp, gens) = &declared.kind else {
+                    continue;
+                };
+                if !gens.is_empty() || dp.segments.len() != 1 {
+                    continue;
+                }
+                if let Some(idx) = owner_generics.iter().position(|g| *g == dp.segments[0]) {
+                    target_tys[idx] = Some(known.clone());
+                }
+            }
+            let sibling_pinned = target_tys.iter().any(Option::is_some);
+
+            // `!sibling_pinned && trust_ty && owner == algebra`: this exact
+            // instantiation's own `type_env` already resolves every one of
+            // `owner`'s targets directly, no template lookup needed at all
+            // -- but only reached now as a fallback, once the sibling pin
+            // above has had first say, and only sound as long as no
+            // *ancestor* call on this same path has already matched `owner
+            // == algebra` once (`egraph.rs::seed_axiom_type_env`'s own
+            // identical `trust_ty` doc comment has the full reasoning: a
+            // *nested* same-algebra call, e.g. `transpose(transpose(a))`'s
+            // own inner `transpose`, is not guaranteed to share the
+            // enclosing instantiation at all — `trust_ty` becomes `false`
+            // the moment one does, below, and is otherwise carried through
+            // unchanged across a *foreign*-owner call, unlike this
+            // function's own former `is_top`, which forced it `false`
+            // unconditionally on every recursion).
+            let owner_tys: Vec<Ty> = if !sibling_pinned && trust_ty && owner == algebra {
                 owner_generics
                     .iter()
                     .filter_map(|n| type_env.get(*n).cloned())
                     .collect()
             } else {
-                let mut target_tys: Vec<Option<Ty>> = vec![None; owner_generics.len()];
-                // Pin from already-resolved bare-param arguments first --
-                // this function's own doc comment has the motivating case
-                // (`P` in `MatMulTransposeA::matmul_transpose_a`, never
-                // determined by its own return type `C` alone).
-                for (arg, sig_param) in args.iter().zip(&sig.params) {
-                    let ExprKind::Path(p) = &arg.kind else { continue };
-                    if p.segments.len() != 1 {
-                        continue;
-                    }
-                    let Some(known) = param_tys.get(p.segments[0].as_str()) else {
-                        continue;
-                    };
-                    let Some(declared) = &sig_param.ty else { continue };
-                    let TypeKind::Path(dp, gens) = &declared.kind else {
-                        continue;
-                    };
-                    if !gens.is_empty() || dp.segments.len() != 1 {
-                        continue;
-                    }
-                    if let Some(idx) = owner_generics.iter().position(|g| *g == dp.segments[0]) {
-                        target_tys[idx] = Some(known.clone());
-                    }
-                }
                 // Then the return-type pin from context, same as before --
                 // never overriding an already-argument-pinned position.
                 let ret_idx = sig.ret.as_ref().and_then(|ret| match &ret.kind {
@@ -2932,7 +2958,38 @@ fn seed_axiom_expr_references<'p>(
                     }
                 }
                 if target_tys.iter().all(Option::is_none) {
-                    return; // nothing to pin this cross-algebra callee's own targets from at all
+                    // Nothing pins any of `owner`'s own targets here at
+                    // all -- still worth recursing into each argument raw
+                    // (a nested same-algebra call can resolve itself
+                    // directly from `type_env`, regardless of never having
+                    // received an `expected_ty` at all) rather than giving
+                    // up on this whole call outright. See `egraph.rs::
+                    // seed_axiom_type_env`'s identical fix and its own doc
+                    // comment for the full motivating case (`Fma`'s own
+                    // fusion axioms, `stdlib/linalg/matrix.cleave`: `MatMul
+                    // ::matmul` is never itself the outermost call on
+                    // either side of `add(matmul(a,b), c) == fma(a,b,c)`,
+                    // always nested one level inside `add`/`fma`).
+                    for arg in args {
+                        seed_axiom_expr_references(
+                            arg, None, trust_ty, algebra, type_env, params, registry, infer,
+                            templates, impl_worklist, param_tys,
+                        );
+                    }
+                    // Sibling propagation, single-generic owners only
+                    // (`Ring<T>`'s own `add(a:T,b:T)->T`): every one of
+                    // `owner`'s own params sharing the *same* declared
+                    // generic name must share the identical concrete type
+                    // -- so once the raw recursion just above resolves
+                    // *any* sibling, every other still-unresolved bare
+                    // sibling declared with that same generic name gets it
+                    // too. `c` in `add(matmul(a,b), c)` is exactly this:
+                    // never itself nested, so nothing else here could ever
+                    // reach it.
+                    if owner_generics.len() == 1 {
+                        seed_sibling_param_tys(owner_generics[0], args, &sig.params, param_tys, params);
+                    }
+                    return;
                 }
                 let Some((idx, mapping)) =
                     find_impl_for_target(templates, registry, &owner, &method, &target_tys)
@@ -2952,6 +3009,11 @@ fn seed_axiom_expr_references<'p>(
                 .map(|s| s.to_string())
                 .zip(owner_tys)
                 .collect();
+            // `false` only for a same-algebra match just taken -- any
+            // *other* nested call (a foreign owner, resolved above via
+            // `find_impl_for_target`/context) keeps `trust_ty` as it
+            // already was, per this function's own doc comment above.
+            let next_trust = trust_ty && owner != algebra;
             for (arg, sig_param) in args.iter().zip(&sig.params) {
                 let arg_expected = sig_param
                     .ty
@@ -2960,7 +3022,7 @@ fn seed_axiom_expr_references<'p>(
                 seed_axiom_expr_references(
                     arg,
                     arg_expected.as_ref(),
-                    false,
+                    next_trust,
                     algebra,
                     type_env,
                     params,
@@ -2973,6 +3035,54 @@ fn seed_axiom_expr_references<'p>(
             }
         }
         _ => {}
+    }
+}
+
+/// Mirrors `egraph.rs::resolve_sibling_expr_type`'s own single-generic
+/// sibling-propagation step, in structured `Ty` form: once a bare pattern
+/// variable's own real type has been independently discovered elsewhere in
+/// this same walk (`param_tys`, filled in either by the raw recursion just
+/// above in `seed_axiom_expr_references`, or by the *other* side of the
+/// axiom's own `==` having already run), every other still-unresolved
+/// sibling argument declared with the *same* bare generic name shares it
+/// too — `Ring<T>`'s own `add(a:T,b:T)->T` is exactly this: `c` in `add(
+/// matmul(a,b), c)` is never itself nested, so it can only ever be
+/// discovered this way.
+fn seed_sibling_param_tys<'p>(
+    shared_name: &str,
+    args: &[Expr],
+    sig_params: &[Param],
+    param_tys: &mut HashMap<&'p str, Ty>,
+    params: &HashSet<&'p str>,
+) {
+    let is_shared = |p_ty: &Option<crate::ast::Type>| {
+        p_ty.as_ref().is_some_and(|d| {
+            matches!(&d.kind, TypeKind::Path(p, gens)
+                if gens.is_empty() && p.segments.len() == 1 && p.segments[0] == shared_name)
+        })
+    };
+    let known: Option<Ty> = args.iter().zip(sig_params).find_map(|(arg, sig_param)| {
+        if !is_shared(&sig_param.ty) {
+            return None;
+        }
+        let ExprKind::Path(p) = &arg.kind else { return None };
+        if p.segments.len() != 1 {
+            return None;
+        }
+        param_tys.get(p.segments[0].as_str()).cloned()
+    });
+    let Some(known) = known else { return };
+    for (arg, sig_param) in args.iter().zip(sig_params) {
+        if !is_shared(&sig_param.ty) {
+            continue;
+        }
+        if let ExprKind::Path(p) = &arg.kind {
+            if p.segments.len() == 1 {
+                if let Some(&name) = params.iter().find(|&&n| n == p.segments[0]) {
+                    param_tys.entry(name).or_insert_with(|| known.clone());
+                }
+            }
+        }
     }
 }
 

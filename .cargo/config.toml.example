@@ -25,3 +25,13 @@
 # [env]
 # MLIR_SYS_220_PREFIX = "C:/path/to/llvm-mlir-22"
 # TABLEGEN_220_PREFIX = "C:/path/to/llvm-mlir-22"
+#
+# `OPENBLAS_PREFIX` is a *different* case -- `cleave-rt` (`stdlib/blas/
+# blas.cleave`'s own `Sgemm::sgemm`, the explicit, low-level BLAS entry
+# point) loads `openblas.dll` explicitly at runtime, from a path baked in
+# at compile time (its own default install location, `scripts/setup-
+# openblas.ps1`'s own default `-CacheDir`, `target/openblas`) -- no link,
+# no `PATH`, no env var needed for a plain `scripts/setup-openblas.ps1`
+# run. Only set `OPENBLAS_PREFIX` here if you want to point at a different
+# location, and only for a process cargo itself spawns (`cargo run`/`cargo
+# test`) -- see `scripts/setup-openblas.ps1`'s own top comment.

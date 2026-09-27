@@ -77,6 +77,53 @@ algebra MatMul<A, B, C> {
     // even under today's cost function — the reverse stays undeclared until
     // a real, shape-aware cost model exists to arbitrate it.
     axiom matmul_transpose_distributes(a, b): matmul(transpose(b), transpose(a)) == transpose(matmul(a, b));
+
+    // `A@B + C` — real accumulation into an explicit, already-computed `c`
+    // (`Fma<A,B,C>`, below), fusing to one `linalg.matmul` seeded from `c`
+    // directly (`mlir_lower.rs::build_matmul_add`'s own doc comment) — no
+    // `linalg.fill` zero-fill, no separate elementwise `add` pass. `cblas_
+    // sgemm` already computes exactly this (`alpha*A@B + beta*C`) for free
+    // once a real BLAS dispatch reaches here (`doc/plan-blas-native.md`
+    // §7 — deliberately not wired to `stdlib/blas/blas.cleave`'s own
+    // `Sgemm::sgemm` yet: native lowering first, a real oracle, *then* a
+    // size threshold, the same discipline `MatMul::matmul` itself is still
+    // owed for its own BLAS dispatch).
+    //
+    // Declared *here*, inside `MatMul` (not inside `Fma` itself, despite
+    // `Fma::fma` being this rule's own RHS) — deliberately, not a style
+    // choice: `egraph.rs::axiom_rewrites` only ever considers an axiom
+    // whose *home* algebra's own method was genuinely, statically reached
+    // by a real call site somewhere in the function being optimized
+    // (`fwd.reached`, captured once, *before* any rewriting — never grown
+    // mid-saturation as new e-nodes appear). `Fma::fma` is never called
+    // directly by any real source in this codebase (only ever *introduced*
+    // by this very axiom firing) — homing the rule there would mean it can
+    // never be found at all, a real, confirmed dead end (`doc/backlog.md`'s
+    // own note has the two failed placements tried first). `MatMul::matmul`
+    // is what's genuinely reached instead (a caller writes `matmul(a,b) +
+    // c`, an ordinary call), exactly the same reasoning that already places
+    // `matmul_transpose_a_rewrite`/`_b_rewrite` above inside `MatMul` too,
+    // even though *their* own RHS names a different algebra's method.
+    //
+    // The two transpose variants just below are for the identical reason
+    // written against the fully *unfused* nested form (`matmul(transpose(
+    // a), b)`, not `matmul_transpose_a(a, b)`) — a second axiom keyed on
+    // `MatMulTransposeA`'s own reached types would hit the exact same dead
+    // end `fma_rewrite`'s original `Fma`-homed attempt did: `matmul_
+    // transpose_a` is itself never statically reached either, only ever
+    // introduced by `matmul_transpose_a_rewrite` firing in this *same*
+    // saturation pass — `axiom_rewrites` builds its whole rule set once,
+    // upfront, from the pre-saturation reached set, so a rule can never
+    // "come online" mid-saturation just because some other rule already
+    // fired. One direct, single-hop rule from the fully naive form to the
+    // fully fused target is what actually reaches it — `matmul_transpose_
+    // a_rewrite` still fires too, on the same term, since both rules share
+    // `MatMul` as their home and are therefore both in the same rule set,
+    // but the *fused* target here is reached by this rule alone, not by
+    // chaining through the other one.
+    axiom fma_rewrite(a, b, c): add(matmul(a, b), c) == fma(a, b, c);
+    axiom fma_transpose_a_rewrite(a, b, c): add(matmul(transpose(a), b), c) == fma_transpose_a(a, b, c);
+    axiom fma_transpose_b_rewrite(a, b, c): add(matmul(a, transpose(b)), c) == fma_transpose_b(a, b, c);
 }
 
 // `dH = dZ*W^T` — `Transpose<B,?>` is never involved: `u: Tensor<T,N,K>`
@@ -154,6 +201,73 @@ impl<T: Float, const N: i32, const M: i32> Transpose<Tensor<T,N,M>, Tensor<T,M,N
         // needed. `permutation: "array<i64: 1, 0>"` is the only 2D
         // permutation this impl needs — swap the two axes.
         mlir::linalg::transpose(a, permutation: "array<i64: 1, 0>")
+    }
+}
+
+// `A@B + C` — real accumulation into an explicit, already-computed `c`,
+// not a fresh zero-seeded destination. `cblas_sgemm` already computes
+// exactly this (`alpha*A@B + beta*C`) for free once a real BLAS dispatch
+// exists here (`doc/plan-blas-native.md` §7 — `stdlib/blas/blas.cleave`'s
+// own `Sgemm::sgemm`, deliberately not wired to this yet: native lowering
+// first, a real oracle, *then* a size threshold, same discipline `MatMul::
+// matmul` itself is still owed for its own BLAS dispatch). Native lowering
+// (below) needs nothing beyond `linalg.matmul`'s own already-documented
+// `C := A@B + C` semantics — see `mlir_lower.rs::build_matmul_add`'s own
+// doc comment.
+//
+// Deliberately its own algebra (not a second method on `MatMul`, same
+// reasoning as `MatMulTransposeA`/`MatMulTransposeB` above) — an impl
+// block only ever exposes its own algebra's required method to ordinary
+// call resolution.
+//
+// No `derivative`/`adjoint` rule declared here, and deliberately so: a
+// `grad`/`derive` request differentiates the CPS form *before* the axiom
+// pass below ever runs (`pipeline.rs::build_optimized_cps`'s own call
+// order — `build_cps_program`, which includes `synthesize_derivatives`,
+// strictly precedes `optimize_program`), so it only ever sees the
+// unfused `matmul(a,b) + c` a caller actually wrote, using `MatMul`'s own
+// already-declared `derivative`/`adjoint` rules — `fma` never needs to be
+// differentiable itself, only ever introduced *after* differentiation has
+// already happened. Same posture `MatMulTransposeA`/`MatMulTransposeB`
+// themselves already have (no `derivative`/`adjoint` of their own either).
+//
+// The actual fusion axioms (`fma_rewrite`/`fma_transpose_a_rewrite`/
+// `fma_transpose_b_rewrite`) live inside `MatMul`'s own algebra body
+// above, not here — see that algebra's own comment on `fma_rewrite` for
+// exactly why (in short: an axiom is only ever considered when its *home*
+// algebra's own method was genuinely, statically reached by a real call
+// site, and `fma` itself is never called directly anywhere — only ever
+// introduced by those rules firing).
+algebra Fma<A, B, C> {
+    fn fma(a: A, b: B, c: C) -> C;
+}
+
+algebra FmaTransposeA<A, B, C> {
+    fn fma_transpose_a(a: A, b: B, c: C) -> C;
+}
+
+algebra FmaTransposeB<A, B, C> {
+    fn fma_transpose_b(a: A, b: B, c: C) -> C;
+}
+
+impl<T: Float, const N: i32, const M: i32, const K: i32>
+    Fma<Tensor<T,N,M>, Tensor<T,M,K>, Tensor<T,N,K>> {
+    fn fma(a, b, c) {
+        mlir::linalg::matmul_add(a, b, c)
+    }
+}
+
+impl<T: Float, const P: i32, const Q: i32, const R: i32>
+    FmaTransposeA<Tensor<T,P,Q>, Tensor<T,P,R>, Tensor<T,Q,R>> {
+    fn fma_transpose_a(a, b, c) {
+        mlir::linalg::matmul_transpose_a_add(a, b, c)
+    }
+}
+
+impl<T: Float, const P: i32, const Q: i32, const R: i32>
+    FmaTransposeB<Tensor<T,P,Q>, Tensor<T,R,Q>, Tensor<T,P,R>> {
+    fn fma_transpose_b(a, b, c) {
+        mlir::linalg::matmul_transpose_b_add(a, b, c)
     }
 }
 

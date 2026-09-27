@@ -1727,7 +1727,7 @@ fn resolve_type_pattern(pattern: &Type, subst: &HashMap<String, String>) -> Opti
 fn seed_axiom_type_env<'p>(
     expr: &Expr,
     expr_ty: Option<&str>,
-    is_top: bool,
+    trust_ty: bool,
     algebra: &str,
     ty: &str,
     params: &HashSet<&'p str>,
@@ -1764,10 +1764,10 @@ fn seed_axiom_type_env<'p>(
                 .filter(|g| !matches!(g, crate::ast::GenericParam::Const { .. }))
                 .map(|g| g.name())
                 .collect();
-            // `is_top && owner == algebra` — trusting `ty` directly — is
-            // only sound for the axiom's own *outermost* call, where `ty`
-            // is `seed_axiom_type_env`'s own caller's exact reached
-            // instantiation *for this call by construction*. A *nested*
+            // `trust_ty && owner == algebra` — trusting `ty` directly — is
+            // only sound as long as no *ancestor* call on this same path
+            // has already matched `owner == algebra` once (`trust_ty`
+            // becomes `false` the moment one does, just below) — a nested
             // same-algebra call (`transpose(transpose(a))`'s own inner
             // `transpose`, declared under `algebra Transpose` itself) is
             // not guaranteed to share it — found live, exactly this shape:
@@ -1776,11 +1776,20 @@ fn seed_axiom_type_env<'p>(
             // pattern`'s own identical, pre-existing caution about a same-
             // algebra recursive call already states this generally: "does
             // *not* [reuse `ty` unchanged]... found directly, empirically").
-            // Every other case -- nested, whether same-algebra or cross- —
-            // goes through the identical `resolve_multi_target_call_ty`
-            // resolution regardless of which algebra `owner` turns out to
-            // be.
-            let owner_ty: Option<String> = if is_top && owner == algebra {
+            // `trust_ty` is deliberately *not* the same thing as "is this
+            // the outermost call" (this function's own earlier `is_top`
+            // parameter, which this replaces) — passing straight through a
+            // *foreign*-owner call (`add` in `add(matmul(a,b), c)`, `Ring`
+            // never `algebra` itself) must leave it unchanged for whatever
+            // is nested inside, which is exactly `matmul(a,b)`'s own
+            // situation: never itself the outermost call on either side of
+            // `fma_rewrite` (`stdlib/linalg/matrix.cleave`), always one
+            // level inside `add`/`fma` — `is_top` alone could never reach
+            // it, `trust_ty` still can. Every other case -- nested, whether
+            // same-algebra or cross- — goes through the identical `resolve_
+            // multi_target_call_ty` resolution regardless of which algebra
+            // `owner` turns out to be.
+            let owner_ty: Option<String> = if trust_ty && owner == algebra {
                 Some(ty.to_string())
             } else if owner_generics.len() <= 1 {
                 expr_ty.map(str::to_string)
@@ -1797,19 +1806,122 @@ fn seed_axiom_type_env<'p>(
                     resolve_multi_target_call_ty(&owner, &[(idx, ret_ty)], registry)
                 })
             };
-            let Some(owner_ty) = owner_ty else {
+            if let Some(owner_ty) = owner_ty {
+                let subst = generic_substitution(&owner, &owner_ty, registry);
+                for (arg, sig_param) in call_args.iter().zip(&sig.params) {
+                    let arg_expected = sig_param
+                        .ty
+                        .as_ref()
+                        .and_then(|d| resolve_declared_type(d, &subst));
+                    // `false` only for a same-algebra match just taken —
+                    // any *other* nested call (a foreign owner, resolved
+                    // via `expr_ty` above) keeps `trust_ty` as it already
+                    // was, per this function's own doc comment above.
+                    let next_trust = trust_ty && owner != algebra;
+                    seed_axiom_type_env(arg, arg_expected.as_deref(), next_trust, algebra, ty, params, registry, env);
+                }
                 return;
-            };
-            let subst = generic_substitution(&owner, &owner_ty, registry);
-            for (arg, sig_param) in call_args.iter().zip(&sig.params) {
-                let arg_expected = sig_param
-                    .ty
-                    .as_ref()
-                    .and_then(|d| resolve_declared_type(d, &subst));
-                seed_axiom_type_env(arg, arg_expected.as_deref(), false, algebra, ty, params, registry, env);
+            }
+            // `owner_ty` itself unresolvable from context alone (a
+            // foreign-owner call with no incoming `expr_ty` — e.g. `add`'s
+            // own outer call in `add(matmul(a,b), c)`, where nothing above
+            // this ever supplied one). Previously this whole call
+            // contributed nothing at all once `owner_ty` came back `None`
+            // — found live, writing `Fma`'s own fusion axioms (`stdlib/
+            // linalg/matrix.cleave`): still worth recursing into each
+            // argument raw, on the chance a *nested* call's own owner is
+            // `algebra` itself, which (per the branch above) can resolve
+            // its own type directly from `ty` regardless of never having
+            // received an `expr_ty` at all.
+            for arg in call_args {
+                seed_axiom_type_env(arg, None, trust_ty, algebra, ty, params, registry, env);
+            }
+            // Sibling propagation, single-generic owners only (`Ring<T>`'s
+            // own `add(a:T,b:T)->T`, `sub`, ...): every one of `owner`'s
+            // own params sharing the *same* declared generic name (checked
+            // structurally below, never assumed) must share the identical
+            // concrete type — so once *any* sibling resolves (via the raw
+            // recursion just above, a nested same-algebra call reached
+            // directly through `ty`), every other still-unresolved *bare*
+            // sibling declared with that same generic name gets it too.
+            // `c` in `add(matmul(a,b), c) == fma(a,b,c)` is exactly this:
+            // never itself nested, so this function's *only* other rule (a
+            // bare `Path` needs an incoming `expr_ty`, which nothing ever
+            // supplies for `add`'s own second operand) could never reach it
+            // on its own — this is what actually does.
+            if owner_generics.len() == 1 {
+                let shared_name = owner_generics[0];
+                let is_shared = |p_ty: &Option<crate::ast::Type>| {
+                    p_ty.as_ref().is_some_and(|d| {
+                        matches!(&d.kind, TypeKind::Path(p, gens)
+                            if gens.is_empty() && p.segments.len() == 1 && p.segments[0] == shared_name)
+                    })
+                };
+                let known: Option<String> =
+                    call_args.iter().zip(&sig.params).find_map(|(arg, sig_param)| {
+                        is_shared(&sig_param.ty)
+                            .then(|| resolve_sibling_expr_type(arg, algebra, ty, params, env, registry))
+                            .flatten()
+                    });
+                if let Some(known) = known {
+                    for (arg, sig_param) in call_args.iter().zip(&sig.params) {
+                        if !is_shared(&sig_param.ty) {
+                            continue;
+                        }
+                        if let ExprKind::Path(p) = &arg.kind {
+                            if p.segments.len() == 1 {
+                                if let Some(&name) = params.iter().find(|&&n| n == p.segments[0]) {
+                                    env.entry(name).or_insert_with(|| known.clone());
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         _ => {}
+    }
+}
+
+/// Best-effort read of one already-resolvable sub-expression's own type,
+/// for `seed_axiom_type_env`'s own single-generic sibling-propagation step
+/// just above — deliberately narrow, not a general inference pass: a bare
+/// pattern variable already seeded in `env` (an earlier part of the same
+/// walk having reached it independently), or a nested call whose own owner
+/// is `algebra` itself (`ty`, this axiom's own home instantiation, already
+/// gives its full answer directly — the same trusted shortcut `seed_axiom_
+/// type_env`'s own `owner == algebra` branch already relies on). Anything
+/// else: `None`, never a guess.
+fn resolve_sibling_expr_type(
+    expr: &Expr,
+    algebra: &str,
+    ty: &str,
+    params: &HashSet<&str>,
+    env: &HashMap<&str, String>,
+    registry: &Registry,
+) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Path(p) if p.segments.len() == 1 => {
+            let &name = params.iter().find(|&&n| n == p.segments[0])?;
+            env.get(name).cloned()
+        }
+        ExprKind::Call(path, _, call_args, _) => {
+            let method = path.segments.join("::");
+            let sig = registry.fn_sig(algebra, &method)?;
+            if sig.params.len() != call_args.len() {
+                return None; // not really a call to `algebra` itself
+            }
+            let ret_decl = sig.ret.as_ref()?;
+            let TypeKind::Path(p, gens) = &ret_decl.kind else {
+                return None;
+            };
+            if !gens.is_empty() || p.segments.len() != 1 {
+                return None;
+            }
+            let subst = generic_substitution(algebra, ty, registry);
+            subst.get(&p.segments[0]).cloned()
+        }
+        _ => None,
     }
 }
 

@@ -24,3 +24,18 @@ crate-type = ["rlib", "staticlib"]
 # release binary without rebuilding it.
 [dependencies]
 backtrace = "0.3"
+
+# No OpenBLAS dependency declared here at all, deliberately -- `src/lib.rs`'s
+# own `blas_dynload` module loads `openblas.dll` explicitly, at runtime, on
+# first use (`LoadLibraryW`/`GetProcAddress`), not via an ordinary implicit
+# link. Found necessary, not just preferred: an implicit `cargo:rustc-link-
+# lib=dylib=openblas` (this crate's own former `build.rs`, since removed)
+# makes *every* process that merely links `cleave-rt` -- including a
+# consuming crate's own build script (`cleave-build`'s `compile()`, which
+# only ever builds/validates a JIT `ExecutionEngine`, never executes
+# anything) -- require `openblas.dll` resolvable at process*-creation* time,
+# before any of that process's own code runs, in a directory with no single
+# predictable location to copy a DLL into (`doc/backlog.md`'s own "OpenBLAS
+# wired into cleave's own stdlib" item has the full story). Explicit, lazy
+# loading means only a process that actually *calls* into this module ever
+# needs `openblas.dll` to exist.

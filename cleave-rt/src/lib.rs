@@ -1094,6 +1094,226 @@ fn release_entry_point() -> &'static str {
     }
 }
 
+// Always linked, unconditionally (`Cargo.toml`'s own doc comment on why).
+// `stdlib/blas/blas.cleave`'s own `Sgemm::sgemm` is the one, explicit,
+// low-level entry point to real BLAS (`doc/plan-blas-native.md` §7.1) --
+// unlike the first attempt's own four wrappers (`cleave_blas_sgemm_
+// rowmajor`/`transpose_a`/`transpose_b`/`bias_rowmajor`, each hardcoding
+// its own `CBLAS_TRANSPOSE` flags), this is the *one* Rust-level symbol
+// that exposes `cblas_sgemm`'s own real, generic shape directly --
+// `trans_a`/`trans_b` are real runtime arguments here, not baked into
+// which wrapper got called. Destination `c` is explicit, passed straight
+// through -- no scratch buffer, nothing for `dps_rewrite.rs` to redirect
+// after the fact.
+//
+// **Explicit, lazy `LoadLibraryW`/`GetProcAddress` (`blas_dynload`,
+// below), not an ordinary implicit `extern "C" { ... }` link against
+// `openblas.lib` -- a real, load-bearing choice, not a stylistic one.**
+// Windows resolves every *implicit* DLL import at process-*creation*
+// time, before any of that process's own code ever runs -- found
+// directly, the hard way: any build script that merely links `cleave-rt`
+// transitively (`cleave-build`'s own `compile()`, called from every
+// "-interop" example's own `build.rs`) would need `openblas.dll`
+// discoverable the instant *its own* executable
+// (`build-script-build.exe`, in an unpredictable, per-crate, hash-named
+// `target/.../build/<pkg>-<hash>/` directory -- no single place to copy a
+// DLL that covers every consumer) starts, *even though that process never
+// actually calls a BLAS function at all* (object emission only ever
+// builds and validates a JIT `ExecutionEngine`, never executes the
+// generated code). Explicit, on-first-use loading sidesteps the whole
+// problem: a process that never calls into this module never needs
+// `openblas.dll` to exist at all, exactly the classic Windows answer to
+// "an optional/location-variable runtime dependency shouldn't be a hard,
+// process-startup import."
+mod blas_dynload {
+    use std::sync::OnceLock;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LoadLibraryW(lp_lib_file_name: *const u16) -> *mut std::ffi::c_void;
+        fn GetProcAddress(
+            h_module: *mut std::ffi::c_void,
+            lp_proc_name: *const u8,
+        ) -> *mut std::ffi::c_void;
+    }
+
+    pub type CblasSgemmFn = unsafe extern "C" fn(
+        order: i32,
+        trans_a: i32,
+        trans_b: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        a: *const f32,
+        lda: i32,
+        b: *const f32,
+        ldb: i32,
+        beta: f32,
+        c: *mut f32,
+        ldc: i32,
+    );
+    pub type OpenblasSetNumThreadsFn = unsafe extern "C" fn(num_threads: i32);
+
+    pub struct BlasFns {
+        pub cblas_sgemm: CblasSgemmFn,
+        pub openblas_set_num_threads: OpenblasSetNumThreadsFn,
+    }
+    // Both fields are plain function pointers into a DLL that, once loaded,
+    // stays mapped for the rest of the process's own lifetime -- sound to
+    // share across threads the same way any other `'static fn` pointer is.
+    unsafe impl Send for BlasFns {}
+    unsafe impl Sync for BlasFns {}
+
+    /// `OPENBLAS_PREFIX`, falling back to `<workspace root>/target/openblas`
+    /// -- mirrors `cleave-rt/build.rs`'s own identical fallback exactly
+    /// (`scripts/setup-openblas.ps1`'s own default `-CacheDir`).
+    /// `env!("CARGO_MANIFEST_DIR")` is a *compile-time* macro -- the literal
+    /// path is baked into this crate's own compiled code at the point
+    /// `cleave-rt` itself was built, unaffected by wherever the *running*
+    /// process (or its own current directory/`PATH`) happens to be later,
+    /// which is exactly why this works regardless of which consuming
+    /// process ends up loading it.
+    fn openblas_dll_path() -> String {
+        let prefix = std::env::var("OPENBLAS_PREFIX").unwrap_or_else(|_| {
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../target/openblas").to_string()
+        });
+        format!("{prefix}/bin/openblas.dll").replace('/', "\\")
+    }
+
+    fn load() -> BlasFns {
+        let path = openblas_dll_path();
+        let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        let handle = unsafe { LoadLibraryW(wide.as_ptr()) };
+        if handle.is_null() {
+            panic!(
+                "cleave-rt: failed to load openblas.dll from {path} -- run \
+                 scripts/setup-openblas.ps1, or set OPENBLAS_PREFIX"
+            );
+        }
+        let sgemm = unsafe { GetProcAddress(handle, c"cblas_sgemm".as_ptr().cast()) };
+        let set_threads =
+            unsafe { GetProcAddress(handle, c"openblas_set_num_threads".as_ptr().cast()) };
+        let (Some(sgemm), Some(set_threads)) = (
+            std::ptr::NonNull::new(sgemm),
+            std::ptr::NonNull::new(set_threads),
+        ) else {
+            panic!("cleave-rt: {path} loaded but is missing an expected symbol");
+        };
+        // SAFETY: both symbols were just resolved, by name, out of a real
+        // OpenBLAS build (`cleave-openblas-redist`) whose own C ABI for
+        // them is stable and already exercised directly (`bench_sgemm.c`).
+        unsafe {
+            BlasFns {
+                cblas_sgemm: std::mem::transmute::<*mut std::ffi::c_void, CblasSgemmFn>(
+                    sgemm.as_ptr(),
+                ),
+                openblas_set_num_threads: std::mem::transmute::<
+                    *mut std::ffi::c_void,
+                    OpenblasSetNumThreadsFn,
+                >(set_threads.as_ptr()),
+            }
+        }
+    }
+
+    static FNS: OnceLock<BlasFns> = OnceLock::new();
+    pub fn fns() -> &'static BlasFns {
+        FNS.get_or_init(load)
+    }
+}
+
+/// CBLAS's own `enum CBLAS_ORDER`/`enum CBLAS_TRANSPOSE` values (`cblas.h`)
+/// -- hardcoded rather than bound via `bindgen`/a `-sys` crate: these are
+/// the only values this thin wrapper ever needs, and they're a stable part
+/// of the CBLAS C ABI, not something OpenBLAS's own build could change
+/// between versions. `trans_a`/`trans_b` arrive here as real runtime `i32`s
+/// straight from `stdlib/blas/blas.cleave`'s own `sgemm` (itself translating
+/// a cleave-level `bool` into one of these two constants) -- this wrapper
+/// itself makes no assumption about which one it'll get.
+const CBLAS_ROW_MAJOR: i32 = 101;
+const CBLAS_NO_TRANS: i32 = 111;
+const CBLAS_TRANS: i32 = 112;
+
+/// Pins OpenBLAS to a single thread, once, the first time `cleave_blas_
+/// sgemm` is called -- a deliberate, temporary, hardcoded `1` (not yet a
+/// real, tunable setting) to directly answer a concrete question: how does
+/// a genuinely single-threaded OpenBLAS compare to cleave's own native
+/// codegen, with the thread count actually pinned and verified rather than
+/// left to whatever OpenBLAS's own default happens to be. `std::sync::
+/// Once`, not a call on every GEMM invocation -- the API call itself is
+/// presumably cheap, but there is no reason to pay it on every single call
+/// when it only ever needs to run once per process. (`blas_dynload::fns()`'s
+/// own `OnceLock` already guards the *load*; this is a separate, later step
+/// -- the *call*.)
+static PIN_BLAS_THREADS: std::sync::Once = std::sync::Once::new();
+fn ensure_thread_count_pinned() {
+    PIN_BLAS_THREADS
+        .call_once(|| unsafe { (blas_dynload::fns().openblas_set_num_threads)(1) });
+}
+
+/// `stdlib/blas/blas.cleave`'s own `Sgemm::sgemm` -- the *one* generic
+/// binding `doc/plan-blas-native.md` §7.1 calls for, replacing the first
+/// attempt's own four shape-specific wrappers. `trans_a`/`trans_b`: `0` for
+/// `CBLAS_NO_TRANS`, `1` for `CBLAS_TRANS` (`stdlib/blas/blas.cleave`'s own
+/// doc comment on why a plain `i32` crosses this boundary, not a `bool` --
+/// cleave's own `bool` has no guaranteed C-ABI representation this crate
+/// wants to depend on). `_a_len`/`_b_len`/`_c_len`: every array-typed cleave
+/// argument crosses the extern boundary as a `(pointer, i64 length)` pair
+/// (`mlir_lower.rs::array_ptr_and_len`'s own doc comment), even though the
+/// length is already compile-time-known on the cleave side -- unread here,
+/// same as the first attempt's own four wrappers. `lda`/`ldb`/`ldc`: row-
+/// major leading dimension is always the operand's own *physical* trailing
+/// extent, regardless of `trans_a`/`trans_b` -- `stdlib/blas/blas.cleave`'s
+/// own call site computes and passes these explicitly, this wrapper trusts
+/// them unconditionally, exactly like every other dimension here.
+///
+/// # Safety
+/// `a` must point to at least `lda * (if trans_a != 0 { k } else { m })`
+/// valid, initialized `f32`s; `b` similarly for `lda`/`m`/`k` replaced by
+/// `ldb`/`k`/`n`; `c` to at least `ldc * m` valid `f32`s, writable. All
+/// three non-overlapping. Entirely the caller's own contract to uphold --
+/// this is `doc/plan-blas-native.md` §7's own deliberately low-level,
+/// unchecked entry point, mirroring the real `cblas_sgemm` C ABI directly.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cleave_blas_sgemm(
+    trans_a: i32,
+    trans_b: i32,
+    m: i32,
+    n: i32,
+    k: i32,
+    alpha: f32,
+    a: *const f32,
+    _a_len: i64,
+    lda: i32,
+    b: *const f32,
+    _b_len: i64,
+    ldb: i32,
+    beta: f32,
+    c: *mut f32,
+    _c_len: i64,
+    ldc: i32,
+) {
+    ensure_thread_count_pinned();
+    unsafe {
+        (blas_dynload::fns().cblas_sgemm)(
+            CBLAS_ROW_MAJOR,
+            if trans_a != 0 { CBLAS_TRANS } else { CBLAS_NO_TRANS },
+            if trans_b != 0 { CBLAS_TRANS } else { CBLAS_NO_TRANS },
+            m,
+            n,
+            k,
+            alpha,
+            a,
+            lda,
+            b,
+            ldb,
+            beta,
+            c,
+            ldc,
+        );
+    }
+}
+
 /// Reads `ptr`'s own current refcount without changing it — a real,
 /// necessary observation point for tests (see `rc_tests` below); not part
 /// of the "real" `extern fn` surface `mlir_lower.rs`-generated code ever

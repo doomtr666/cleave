@@ -1,0 +1,57 @@
+use io;
+use linalg;
+use blas;
+
+// `doc/plan-blas-native.md` §7.1 -- `blas::sgemm` called directly, the same
+// way any other stdlib primitive is: no threshold, no auto-dispatch (§7.3
+// is explicitly out of scope until the differential oracle, `cleave/tests/
+// blas.rs`, has run clean for a while) -- this is the raw, low-level API a
+// caller reaches for on purpose, e.g. inside a hand-tuned kernel, exactly
+// as it would call `cblas_sgemm` from C. `sgemm`'s own real signature is
+// `(trans_a, trans_b, alpha, a, b, beta, c) -> C` -- `alpha*op(a)@op(b) +
+// beta*c`, `c` the explicit destination, returned as the real result
+// (never the caller's own stale `c` binding -- `blas.cleave`'s own doc
+// comment on `Sgemm::sgemm` has the full story of why that distinction is
+// load-bearing, not stylistic).
+fn main() {
+    let a = Tensor::<f32, 2, 2>(data: [
+        [1.0, 2.0],
+        [3.0, 4.0]
+    ]);
+    let b = Tensor::<f32, 2, 2>(data: [
+        [5.0, 6.0],
+        [7.0, 8.0]
+    ]);
+
+    // `beta: 0.0` -- `c`'s own initial contents are irrelevant, only its
+    // shape matters (the destination buffer BLAS writes the fresh product
+    // into). `A@B = [[19,22],[43,50]]`.
+    let zero = Tensor::<f32, 2, 2>(data: [
+        [0.0, 0.0],
+        [0.0, 0.0]
+    ]);
+    let product = sgemm(false, false, 1.0, a, b, 0.0, zero);
+    println(product[0, 0]);
+    println(product[0, 1]);
+    println(product[1, 0]);
+    println(product[1, 1]);
+
+    // `beta: 1.0` -- real accumulation, `c`'s own prior values genuinely
+    // read and added into, not just overwritten: `A@B + I = [[20,22],
+    // [43,51]]`.
+    let identity = Tensor::<f32, 2, 2>(data: [
+        [1.0, 0.0],
+        [0.0, 1.0]
+    ]);
+    let accumulated = sgemm(false, false, 1.0, a, b, 1.0, identity);
+    println(accumulated[0, 0]);
+    println(accumulated[1, 1]);
+
+    // `trans_b: true` -- `A@B^T`, `B` read transposed in place (real BLAS
+    // `transB`, no materialized copy): `A@B^T = [[17,23],[39,53]]`.
+    let transposed = sgemm(false, true, 1.0, a, b, 0.0, zero);
+    println(transposed[0, 0]);
+    println(transposed[1, 1]);
+
+    0
+}
