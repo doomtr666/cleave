@@ -999,18 +999,12 @@ pub fn affine_struct_vars(
             facts
         })
         .collect();
-    // [`carried_param_flows_to_own_backedge`]'s own local-def lookup --
-    // one map per top-level function, the same "every local `Fix`-def
-    // anywhere in this one function, keyed by its own label" shape
-    // [`analyze_identity`] already builds for the identical reason.
-    let per_fn_defs_by_name: Vec<HashMap<&str, &CFunDef>> = non_region_local
-        .iter()
-        .map(|f| {
-            let mut defs_by_name = HashMap::new();
-            collect_local_defs_by_name(&f.def.body, &mut defs_by_name);
-            defs_by_name
-        })
-        .collect();
+    // One [`LocalAliasClasses`] union-find per top-level function, built
+    // straight from the same `CarriedParamFacts` above — see its own doc
+    // comment for what it replaces (`plan-affine-ownership.md` §14.3/§14.6,
+    // Phase A).
+    let per_fn_classes: Vec<LocalAliasClasses> =
+        per_fn_carried_facts.iter().map(LocalAliasClasses::build).collect();
     loop {
         let mut fn_return_affine: HashMap<&str, bool> = HashMap::new();
         for f in &non_region_local {
@@ -1031,14 +1025,8 @@ pub fn affine_struct_vars(
                 &mut affine,
             );
         }
-        for (facts, defs_by_name) in per_fn_carried_facts.iter().zip(&per_fn_defs_by_name) {
-            changed |= collect_affine_carried_params(
-                facts,
-                defs_by_name,
-                &known_functions,
-                identity_summary,
-                &mut affine,
-            );
+        for (facts, classes) in per_fn_carried_facts.iter().zip(&per_fn_classes) {
+            changed |= collect_affine_carried_params(facts, classes, &mut affine);
         }
         // §13/§14's own extension: `refcount::insert_refcounting` sometimes
         // releases a field *read back out* of a never-mutated struct
@@ -1183,225 +1171,147 @@ fn collect_carried_param_facts(expr: &CExpr, out: &mut CarriedParamFacts) {
     }
 }
 
-/// Adds a loop/if-join's own carried parameter to `affine` once *every*
-/// call this program makes to its own name — the entry, and every
-/// back-edge, wherever they textually sit — either (a) passes an already-
-/// affine `CVar` at that same position (the original rule), or (b) is
-/// itself provably the *same allocation* as the carried parameter, traced
-/// all the way through the loop's own body via [`carried_param_flows_to_
-/// own_backedge`] (the fix below). Returns whether anything new was added,
-/// exactly like [`collect_affine_resumption_params`]'s own identical
-/// contract.
+/// A partition of `CVar`s **local to one top-level function's own body**,
+/// each class denoting the exact same underlying location under different
+/// names — a real, direct union-find, never merged across a top-level
+/// function boundary (`doc/plan-affine-ownership.md` §14.3's own corrected
+/// boundary: a top-level parameter/return is a *symbolic* name reused by
+/// every call site, not a physical identity, so unioning across that
+/// boundary directly is unsound — §14.8 has the failed first attempt and
+/// the test that caught it).
 ///
-/// **Why (b) is needed, not just (a) — a real, confirmed gap, not a
-/// hypothetical one**: a carried value threaded each iteration through an
-/// identity-shaped real call (`b = display_and_return(cond, b);`,
-/// `Display::display<Complex<T>>`'s own real shape, `doc/backlog.md`'s
-/// "examples/complex.cleave" entry) creates a genuine mutual dependency
-/// rule (a) alone can never resolve: the back-edge argument is that call's
-/// own *resumption* parameter, which [`collect_affine_resumption_params`]
-/// can only mark affine once the carried parameter *itself* is already
-/// affine (it's the call's own argument) — but the carried parameter can
-/// only become affine, under rule (a), once that same resumption parameter
-/// already is. Neither side has any way to seed first; the fixed point
-/// converges after exactly one iteration with nothing added, even though
-/// the true answer (both affine, anchored by the entry argument from
-/// *outside* the loop) is real and sound. Confirmed directly with a
-/// dedicated probe before writing this fix: `entry affine = true`,
-/// `carried affine = false` even though the identity fact itself
-/// (`IdentitySummary::returns_unchanged`) was already correctly `true`.
+/// Built once per top-level function from that function's own
+/// [`CarriedParamFacts`]: unions each loop/if-join's own carried parameter
+/// with every `CVar` textually passed as its argument at any call this
+/// same function makes to it — the entry dispatch, and every back-edge,
+/// wherever they textually sit. A literal/non-`CVar` argument at some call
+/// site simply never joins a class (there is no name to union with, the
+/// same "unresolved source" case the old AND-join treated as blocking).
 ///
-/// Rule (b) sidesteps the mutual dependency entirely: if the carried
-/// parameter is *structurally* guaranteed to reach every one of its own
-/// back-edges unchanged (no need for those *specific* arguments to be
-/// independently affine at all — they denote the exact same allocation by
-/// construction), then its own affine-ness reduces to whether *any* call
-/// site (in practice, the one real anchor: the entry argument from outside
-/// the loop, itself never traced by [`carried_param_flows_to_own_
-/// backedge`] since it's a different `CVar` the loop's own body never
-/// references) is already affine — rule (a), unconditionally, for that one
-/// site.
-#[allow(clippy::too_many_arguments)]
+/// This is what [`collect_affine_carried_params`] replaces its own former
+/// two-rule split with — see that function's own doc comment for why a
+/// class, once built, answers both of the old rules (a) and (b) as one
+/// single, strictly more precise fact: every member of one class *is* the
+/// same location, so proving any one of them affine proves all of them.
+struct LocalAliasClasses {
+    /// `CVar` -> its class's own canonical representative. Only the
+    /// `CVar`s this function's own carried-parameter union-find ever
+    /// touched have an entry; anything else is implicitly its own,
+    /// unrelated singleton class (never proven affine by this mechanism,
+    /// same as today when a carried def has no recorded call sites at
+    /// all).
+    class_of: HashMap<CVar, CVar>,
+    /// Canonical representative -> every `CVar` in that class, computed
+    /// once after every union above is settled.
+    members: HashMap<CVar, Vec<CVar>>,
+}
+
+impl LocalAliasClasses {
+    fn build(facts: &CarriedParamFacts) -> Self {
+        let mut parent: HashMap<CVar, CVar> = HashMap::new();
+        for (name, params) in &facts.carried_defs {
+            let Some(calls) = facts.calls.get(name) else {
+                continue;
+            };
+            for call_args in calls {
+                for (i, param) in params.iter().enumerate() {
+                    if let Some(Some(v)) = call_args.get(i) {
+                        Self::union(&mut parent, *param, *v);
+                    }
+                }
+            }
+        }
+        let mut class_of: HashMap<CVar, CVar> = HashMap::new();
+        let mut members: HashMap<CVar, Vec<CVar>> = HashMap::new();
+        for v in parent.keys().copied().collect::<Vec<_>>() {
+            let root = Self::find(&mut parent, v);
+            class_of.insert(v, root);
+            members.entry(root).or_default().push(v);
+        }
+        LocalAliasClasses { class_of, members }
+    }
+
+    fn find(parent: &mut HashMap<CVar, CVar>, v: CVar) -> CVar {
+        let p = *parent.entry(v).or_insert(v);
+        if p == v {
+            v
+        } else {
+            let root = Self::find(parent, p);
+            parent.insert(v, root);
+            root
+        }
+    }
+
+    fn union(parent: &mut HashMap<CVar, CVar>, a: CVar, b: CVar) {
+        let ra = Self::find(parent, a);
+        let rb = Self::find(parent, b);
+        if ra != rb {
+            parent.insert(ra, rb);
+        }
+    }
+
+    /// Every `CVar` denoting the same location as `v`, `v` itself included
+    /// — just `[v]` if `v` was never touched by any union (its own
+    /// singleton class). Returns an owned `Vec` rather than a slice — a
+    /// singleton has nowhere stable to borrow one from, and `CVar` is a
+    /// bare `u32`, cheap to copy.
+    fn class_members(&self, v: CVar) -> Vec<CVar> {
+        match self.class_of.get(&v) {
+            Some(root) => self
+                .members
+                .get(root)
+                .cloned()
+                .unwrap_or_else(|| vec![v]),
+            None => vec![v],
+        }
+    }
+}
+
+/// Adds a loop/if-join's own carried parameter to `affine` once its own
+/// [`LocalAliasClasses`] class contains any `CVar` already known affine —
+/// replacing the old two-rule split (an AND-join over every literal call
+/// argument, plus a separate recursive trace as an escape hatch when a
+/// single anchor should have been enough) with one strictly more precise
+/// fact: every member of a union-find class *is* the same underlying
+/// location by construction, so proving any single one of them affine
+/// proves every name for it, no AND and no separate trace needed at all.
+///
+/// The case that used to motivate the second rule (a carried value threaded
+/// each iteration through an identity-shaped real call, `b =
+/// display_and_return(cond, b);`, `Display::display<Complex<T>>`'s own
+/// real shape, `doc/backlog.md`'s "examples/complex.cleave" entry) still
+/// resolves correctly here, just through the ordinary fixed point instead
+/// of a dedicated trace: [`LocalAliasClasses::build`] already unions the
+/// carried parameter with that call's own resumption parameter (an
+/// ordinary local `CVar`, whatever produced it); [`collect_affine_
+/// resumption_params`] independently proves that resumption parameter
+/// affine via `IdentitySummary`, on its own; and the very next iteration of
+/// [`affine_struct_vars`]'s own fixed-point loop finds it already in
+/// `affine` when this function re-checks the class — no interprocedural
+/// tracing needs duplicating inside the union-find itself.
+///
+/// Returns whether anything new was added, exactly like [`collect_affine_
+/// resumption_params`]'s own identical contract.
 fn collect_affine_carried_params(
     facts: &CarriedParamFacts,
-    defs_by_name: &HashMap<&str, &CFunDef>,
-    known_functions: &HashSet<&str>,
-    identity_summary: &IdentitySummary,
+    classes: &LocalAliasClasses,
     affine: &mut HashSet<CVar>,
 ) -> bool {
     let mut changed = false;
-    for (name, params) in &facts.carried_defs {
-        // A def this program never actually calls (dead code, or one this
-        // walk simply hasn't found a call site for) has no sources at all
-        // — "vacuously true" would be unsound here (nothing ever proved it
-        // safe), unlike a plain boolean AND over a genuinely non-empty set.
-        let Some(calls) = facts.calls.get(name).filter(|c| !c.is_empty()) else {
-            continue;
-        };
-        let Some(def) = defs_by_name.get(name.as_str()) else {
-            continue;
-        };
-        for (i, param) in params.iter().enumerate() {
+    for (_, params) in &facts.carried_defs {
+        for param in params {
             if affine.contains(param) {
                 continue;
             }
-            // Rule (a): every recorded call site (entry + every back-edge)
-            // independently passes an already-affine value.
-            let every_source_affine = calls
-                .iter()
-                .all(|call_args| matches!(call_args.get(i), Some(Some(v)) if affine.contains(v)));
-            // Rule (b): the carried parameter is structurally guaranteed to
-            // reach every one of its own back-edges unchanged -- those
-            // specific back-edge arguments need no independent proof at
-            // all, so a *single* already-affine call site (in practice,
-            // the one real anchor: the entry argument from outside the
-            // loop) is enough.
-            let anchored_by_any_affine_source = || {
-                carried_param_flows_to_own_backedge(
-                    &def.body, name, i, *param, defs_by_name, known_functions, identity_summary,
-                    &mut HashSet::new(),
-                ) && calls
-                    .iter()
-                    .any(|call_args| matches!(call_args.get(i), Some(Some(v)) if affine.contains(v)))
-            };
-            if every_source_affine || anchored_by_any_affine_source() {
-                affine.insert(*param);
-                changed = true;
+            let members = classes.class_members(*param);
+            if members.iter().any(|v| affine.contains(v)) {
+                for v in members {
+                    changed |= affine.insert(v);
+                }
             }
         }
     }
     changed
-}
-
-/// Whether `var`, starting from `expr` (part of `loop_name`'s own body, or
-/// a local def's body reached while tracing through one), ever flows
-/// *unchanged* all the way back into a tail-call to `loop_name` itself,
-/// with `var` as the literal argument at `position` — the loop-carried-
-/// parameter analogue of [`tail_returns_var`] (that function's own doc
-/// comment, and [`analyze_identity`]'s, have the shared motivation: local
-/// join-point hops and identity-shaped real-call hops are traced through
-/// identically here), just targeting "reaches my own back-edge unchanged"
-/// instead of "reaches `k_ret` unchanged". [`collect_affine_carried_
-/// params`]'s own doc comment has the full story on why this exists.
-///
-/// Three real cases, mirroring [`tail_returns_var`]'s exactly:
-/// 1. **Tail-calls `loop_name` itself** with `var` at `position` — proven,
-///    `true` right here.
-/// 2. **Tail-calls a local `Fix`-def** (a join point, a nested resumption)
-///    — trace through it exactly like [`tail_returns_var`] does: re-bind
-///    to whichever of its own parameters received `var`, or leave it
-///    unchanged if it's simply captured rather than passed.
-/// 3. **Tail-calls a real, whole-program function** with `var` at position
-///    `j` — unlike [`tail_returns_var`] (which defers this case to the
-///    interprocedural fixed point via an edge), `identity_summary` is
-///    already fully resolved by the time this runs (`affine_struct_vars`'s
-///    own call site computes it first) — consult it directly: if `Some
-///    (true)`, trace on through that call's own resumption (found the same
-///    way a local join point is, via `defs_by_name`), with `var` re-bound
-///    to the resumption's own single parameter. Otherwise, dead end,
-///    `false`.
-#[allow(clippy::too_many_arguments)]
-fn carried_param_flows_to_own_backedge(
-    expr: &CExpr,
-    loop_name: &str,
-    position: usize,
-    var: CVar,
-    defs_by_name: &HashMap<&str, &CFunDef>,
-    known_functions: &HashSet<&str>,
-    identity_summary: &IdentitySummary,
-    visiting: &mut HashSet<String>,
-) -> bool {
-    match expr {
-        CExpr::LetPrim { cont, .. } => carried_param_flows_to_own_backedge(
-            cont, loop_name, position, var, defs_by_name, known_functions, identity_summary, visiting,
-        ),
-        CExpr::App { func, args } => match func {
-            CVal::Label(callee) if callee == loop_name => {
-                matches!(args.get(position), Some(CVal::Var(v)) if *v == var)
-            }
-            CVal::Label(callee) if known_functions.contains(callee.as_str()) => {
-                // `var` might not be one of *this* call's own arguments at
-                // all (an unrelated computation happening in between --
-                // exactly the loop-bound check, `Ord::lt<i32>`, every
-                // `for`/`while` loop's own condition test runs before ever
-                // reaching its real body; found directly, the first
-                // version of this function returned `false` here
-                // unconditionally and never got past a single loop
-                // iteration's own bound check as a result). If so, it
-                // survives unchanged into this call's own trailing
-                // continuation once the call returns -- trace on through
-                // that, `var` unchanged, mirroring `tail_returns_var`'s own
-                // identical fix. Only when `var` *is* one of the real
-                // arguments does the callee's own identity fact apply.
-                let resumption_var = match args.iter().position(|a| matches!(a, CVal::Var(v) if *v == var)) {
-                    Some(j) if identity_summary.returns_unchanged(callee, j) == Some(true) => None,
-                    Some(_) => return false,
-                    None => Some(var),
-                };
-                args.iter().any(|a| {
-                    if let CVal::Label(cont) = a {
-                        if let Some(def) = defs_by_name.get(cont.as_str()) {
-                            let next_var = match resumption_var {
-                                Some(v) => Some(v),
-                                None => def.params.first().copied(),
-                            };
-                            if let Some(next_var) = next_var {
-                                if visiting.insert(cont.clone()) {
-                                    let result = carried_param_flows_to_own_backedge(
-                                        &def.body, loop_name, position, next_var, defs_by_name,
-                                        known_functions, identity_summary, visiting,
-                                    );
-                                    visiting.remove(cont.as_str());
-                                    return result;
-                                }
-                            }
-                        }
-                    }
-                    false
-                })
-            }
-            CVal::Label(callee) => {
-                let Some(def) = defs_by_name.get(callee.as_str()) else {
-                    return false;
-                };
-                let inner_var = match args.iter().position(|a| matches!(a, CVal::Var(v) if *v == var)) {
-                    Some(pos) => match def.params.get(pos) {
-                        Some(&p) => p,
-                        None => return false,
-                    },
-                    None => var,
-                };
-                if !visiting.insert(callee.clone()) {
-                    return false;
-                }
-                let result = carried_param_flows_to_own_backedge(
-                    &def.body, loop_name, position, inner_var, defs_by_name, known_functions,
-                    identity_summary, visiting,
-                );
-                visiting.remove(callee.as_str());
-                result
-            }
-            _ => false,
-        },
-        CExpr::If {
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            let t = carried_param_flows_to_own_backedge(
-                then_branch, loop_name, position, var, defs_by_name, known_functions, identity_summary,
-                visiting,
-            );
-            let e = carried_param_flows_to_own_backedge(
-                else_branch, loop_name, position, var, defs_by_name, known_functions, identity_summary,
-                visiting,
-            );
-            t || e
-        }
-        CExpr::Fix { body, .. } => carried_param_flows_to_own_backedge(
-            body, loop_name, position, var, defs_by_name, known_functions, identity_summary, visiting,
-        ),
-    }
 }
 
 /// Every `CVar` a tail return (`App{Var(k_ret), [v]}`, at any nesting
@@ -1843,4 +1753,313 @@ fn propagate(seed: HashSet<(String, usize)>, edges: Vec<Edge>) -> HashSet<(Strin
     }
 
     aliased
+}
+
+/// Every top-level unit whose own body is *exactly* one `PrimOp::
+/// RawMlirOp` with a `"linalg.elementwise."`-prefixed op — the exact
+/// prefix `mlir_lower.rs::lower_raw_mlir_op` already dispatches on
+/// (`Ring<Tensor<T,Dims...>>::add`/`sub`/`mul`/`div`, `Scale::scale`,
+/// `stdlib/linalg/tensor.cleave`) — applied directly to (a subset of) its
+/// own parameters and returned unchanged, mapped to that `RawMlirOp`'s own
+/// `op` string (e.g. `"linalg.elementwise.subf"`, needed by `mlir_lower.rs
+/// ::build_elementwise_binop` to inline the same computation at a reuse-
+/// eligible call site) and which of its own ordinary parameter *positions*
+/// fed that call. A real call to one of these units is what
+/// [`analyze_elementwise_reuse`] looks for, and what `mlir_lower.rs::
+/// lower_real_call` inlines directly when reuse-eligible — `pub` for that
+/// second, cross-module consumer.
+pub fn collect_elementwise_units(program: &CpsProgram) -> HashMap<String, (String, Vec<usize>)> {
+    let mut out = HashMap::new();
+    for f in &program.funcs {
+        let Some((&k_ret, ordinary_params)) = f.def.params.split_last() else {
+            continue;
+        };
+        let CExpr::LetPrim {
+            var,
+            op: PrimOp::RawMlirOp { op: raw_op, .. },
+            args,
+            cont,
+            ..
+        } = &f.def.body
+        else {
+            continue;
+        };
+        if !raw_op.starts_with("linalg.elementwise.") {
+            continue;
+        }
+        let CExpr::App {
+            func: CVal::Var(k),
+            args: ret_args,
+        } = cont.as_ref()
+        else {
+            continue;
+        };
+        if *k != k_ret || !matches!(ret_args.as_slice(), [CVal::Var(v)] if v == var) {
+            continue;
+        }
+        let positions: Vec<usize> = ordinary_params
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| args.iter().any(|a| matches!(a, CVal::Var(v) if v == *p)))
+            .map(|(i, _)| i)
+            .collect();
+        if !positions.is_empty() {
+            out.insert(f.def.name.clone(), (raw_op.clone(), positions));
+        }
+    }
+    out
+}
+
+/// For each real call to a unit [`collect_elementwise_units`] identifies
+/// as elementwise, maps the call's own resumption parameter (the `CVar`
+/// that receives the result in the caller) to one of the call's own
+/// eligible-position arguments whose underlying buffer is safe to reuse as
+/// the operation's own destination, instead of always allocating a fresh
+/// one (`mlir_lower.rs::build_elementwise_binop`/`build_tensor_descriptor_
+/// value`'s own current, unconditional behavior). Sound because
+/// `linalg.elementwise.*` is always a pointwise map (reads every input at
+/// index `i` before writing the output at index `i`, never a reduction,
+/// never a shape change) — so aliasing one input's own buffer with the
+/// output is safe *exactly as long as that input is never read again*.
+/// This is the CPS-level fact `doc/plan-affine-ownership.md` §15 calls
+/// for, decided before any MLIR is emitted — unlike `dps_rewrite.rs`'s own
+/// post-`--inline` pattern matching, which can never recognize an extern
+/// BLAS call the same way (`doc/plan-blas-native.md` §7's own
+/// explicit-destination `blas::sgemm`).
+///
+/// An argument `src` at an eligible position qualifies only when:
+/// 1. **Dead after this call** — no further reference anywhere in the
+///    call's own resumption body ([`occurs_in`]), the same conservative
+///    "no evidence, no reuse" posture this whole module already uses
+///    everywhere else.
+/// 2. **If `src` was itself bound by a `PrimOp::Field` projection off some
+///    `base`** (the real motivating shape — `model.w`, read once then
+///    passed straight to `Ring::sub`) — no *other* `Field` projection of
+///    that exact `(base, field)` pair exists anywhere else in the caller's
+///    own body (two independent reads of the same field are two
+///    independent names for the same location — `src` alone being dead
+///    proves nothing about the *other* name), and `base` itself is never
+///    aliased ([`var_is_unaliased`] — the enclosing top-level function's
+///    own [`AliasSummary`] fact if `base` is one of its parameters, since
+///    that identity can be shared from *outside* this body entirely; the
+///    local [`value_is_ever_aliased`] otherwise, e.g. a fresh `Struct`
+///    construction).
+/// 3. **If `src` has no `Field` projection at all** (a bare parameter, or
+///    any other local value) — the identical [`var_is_unaliased`] check
+///    directly on `src`'s own identity.
+///
+/// Only top-level functions' own bodies are walked as the *caller* side
+/// (matching the real motivating shape, an algebra `impl fn` like
+/// `Optimizer<Sgd,..>::step`) — the walk still recurses into every nested
+/// `Fix`, with the *enclosing top-level* function's own name/params kept
+/// in scope throughout, mirroring `collect_facts`'s own established shape
+/// in this same file.
+pub fn analyze_elementwise_reuse(program: &CpsProgram, summary: &AliasSummary) -> HashMap<CVar, CVar> {
+    let elementwise_units = collect_elementwise_units(program);
+    let mut reuse: HashMap<CVar, CVar> = HashMap::new();
+    for f in &program.funcs {
+        let ordinary_params = &f.def.params[..f.def.params.len().saturating_sub(1)];
+        collect_elementwise_reuse(
+            f.def.name.as_str(),
+            ordinary_params,
+            &f.def.body,
+            &f.def.body,
+            &elementwise_units,
+            summary,
+            &mut reuse,
+        );
+    }
+    reuse
+}
+
+fn collect_elementwise_reuse(
+    f_name: &str,
+    ordinary_params: &[CVar],
+    fn_body: &CExpr,
+    expr: &CExpr,
+    elementwise_units: &HashMap<String, (String, Vec<usize>)>,
+    summary: &AliasSummary,
+    reuse: &mut HashMap<CVar, CVar>,
+) {
+    match expr {
+        CExpr::LetPrim { cont, .. } => {
+            collect_elementwise_reuse(
+                f_name, ordinary_params, fn_body, cont, elementwise_units, summary, reuse,
+            );
+        }
+        CExpr::App { .. } => {}
+        CExpr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_elementwise_reuse(
+                f_name, ordinary_params, fn_body, then_branch, elementwise_units, summary, reuse,
+            );
+            collect_elementwise_reuse(
+                f_name, ordinary_params, fn_body, else_branch, elementwise_units, summary, reuse,
+            );
+        }
+        CExpr::Fix { defs, body } => {
+            if let (
+                [def],
+                CExpr::App {
+                    func: CVal::Label(callee),
+                    args: call_args,
+                },
+            ) = (defs.as_slice(), body.as_ref())
+            {
+                if def.carried_types.is_none() {
+                    if let (Some((_, positions)), [result_var]) =
+                        (elementwise_units.get(callee.as_str()), def.params.as_slice())
+                    {
+                        elementwise_reuse_at_call(
+                            f_name,
+                            ordinary_params,
+                            fn_body,
+                            call_args,
+                            positions,
+                            &def.body,
+                            summary,
+                            *result_var,
+                            reuse,
+                        );
+                    }
+                }
+            }
+            for d in defs {
+                collect_elementwise_reuse(
+                    f_name, ordinary_params, fn_body, &d.body, elementwise_units, summary, reuse,
+                );
+            }
+            collect_elementwise_reuse(
+                f_name, ordinary_params, fn_body, body, elementwise_units, summary, reuse,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn elementwise_reuse_at_call(
+    f_name: &str,
+    ordinary_params: &[CVar],
+    fn_body: &CExpr,
+    call_args: &[CVal],
+    positions: &[usize],
+    resumption_body: &CExpr,
+    summary: &AliasSummary,
+    result_var: CVar,
+    reuse: &mut HashMap<CVar, CVar>,
+) {
+    for &pos in positions {
+        let Some(CVal::Var(src)) = call_args.get(pos) else {
+            continue;
+        };
+        if occurs_in(*src, resumption_body) {
+            continue;
+        }
+        if let Some((base, field)) = field_projection_source(*src, fn_body) {
+            if count_field_projections(base, &field, fn_body) > 1 {
+                continue;
+            }
+            if var_is_unaliased(base, f_name, ordinary_params, fn_body, summary) {
+                reuse.insert(result_var, *src);
+                return;
+            }
+            continue;
+        }
+        if var_is_unaliased(*src, f_name, ordinary_params, fn_body, summary) {
+            reuse.insert(result_var, *src);
+            return;
+        }
+    }
+}
+
+/// Whether `var` (either the enclosing top-level function's own parameter
+/// at some position, or a local value built entirely within this same
+/// function body — e.g. a fresh `Struct` construction the e-graph inlined
+/// a single-call-site callee's own body into) is provably never aliased.
+/// A parameter's own aliasing status can come from *outside* this body
+/// entirely (a different caller passing the same allocation twice), so it
+/// uses the whole-program [`AliasSummary`] built for exactly that question;
+/// anything else has no "before this function" history to worry about, so
+/// the purely local [`value_is_ever_aliased`] — already built and tested
+/// for the identical question at a pool-allocator construction site — is
+/// both necessary and sufficient.
+fn var_is_unaliased(
+    var: CVar,
+    f_name: &str,
+    ordinary_params: &[CVar],
+    fn_body: &CExpr,
+    summary: &AliasSummary,
+) -> bool {
+    match ordinary_params.iter().position(|p| *p == var) {
+        Some(pos) => !summary.is_aliased(f_name, pos),
+        None => !value_is_ever_aliased(var, fn_body, summary),
+    }
+}
+
+/// Finds the single `PrimOp::Field { .. }` binding for `var` anywhere in
+/// `expr`, if `var` was bound that way at all — `(base, field name)`.
+/// `CVar`s are unique program-wide, so there is at most one binding site
+/// regardless of where in `expr` the search starts.
+fn field_projection_source(var: CVar, expr: &CExpr) -> Option<(CVar, String)> {
+    match expr {
+        CExpr::LetPrim {
+            var: v, op, args, cont, ..
+        } => {
+            if *v == var {
+                return match op {
+                    PrimOp::Field { field, .. } => match args.as_slice() {
+                        [CVal::Var(base)] => Some((*base, field.clone())),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+            }
+            field_projection_source(var, cont)
+        }
+        CExpr::App { .. } => None,
+        CExpr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => field_projection_source(var, then_branch)
+            .or_else(|| field_projection_source(var, else_branch)),
+        CExpr::Fix { defs, body } => {
+            for d in defs {
+                if let Some(r) = field_projection_source(var, &d.body) {
+                    return Some(r);
+                }
+            }
+            field_projection_source(var, body)
+        }
+    }
+}
+
+/// How many `PrimOp::Field` projections of the exact `(base, field)` pair
+/// exist anywhere in `expr` — used to rule out reuse when a second,
+/// independent name for the same field exists elsewhere in the body (see
+/// [`analyze_elementwise_reuse`]'s own doc comment, point 2).
+fn count_field_projections(base: CVar, field: &str, expr: &CExpr) -> usize {
+    match expr {
+        CExpr::LetPrim { op, args, cont, .. } => {
+            let here = matches!(op, PrimOp::Field { field: f, .. } if f == field)
+                && matches!(args.as_slice(), [CVal::Var(b)] if *b == base);
+            usize::from(here) + count_field_projections(base, field, cont)
+        }
+        CExpr::App { .. } => 0,
+        CExpr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => count_field_projections(base, field, then_branch)
+            + count_field_projections(base, field, else_branch),
+        CExpr::Fix { defs, body } => {
+            defs.iter()
+                .map(|d| count_field_projections(base, field, &d.body))
+                .sum::<usize>()
+                + count_field_projections(base, field, body)
+        }
+    }
 }

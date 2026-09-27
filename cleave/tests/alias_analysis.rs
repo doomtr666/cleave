@@ -1020,3 +1020,163 @@ fn affine_eligibility_gives_the_same_answer_before_and_after_insert_refcounting(
          lower.rs::lower_program` runs in"
     );
 }
+
+/// The real motivating shape (`stdlib/optim/optim.cleave`'s own `Sgd::
+/// step`, `model - lr*grad`): a struct-typed parameter's own tensor field
+/// is read once (`w.t`), fed into an elementwise `Ring::sub`, and the
+/// result is embedded into a fresh struct -- the old field is never read
+/// again, and the parameter itself is never aliased. Must be recognized as
+/// reuse-eligible: the `Ring::sub` call's own result should map back to
+/// `w.t`'s own `CVar`.
+#[test]
+fn an_elementwise_op_consuming_a_dead_unaliased_struct_fields_tensor_is_reuse_eligible() {
+    use cleave::alias_analysis::{analyze, analyze_elementwise_reuse};
+
+    let src = "
+        use linalg;
+        struct Wrap { t: Tensor<f32,2,2> }
+        extern fn make_wrap() -> Wrap;
+        extern fn make_delta() -> Tensor<f32,2,2>;
+        fn compute_step(w: Wrap, delta: Tensor<f32,2,2>) -> Wrap {
+            Wrap(t: Ring::sub(w.t, delta))
+        }
+        extern fn opaque_sink(w: Wrap) -> i32;
+        fn main() -> i32 {
+            opaque_sink(compute_step(make_wrap(), make_delta()))
+        }
+        ";
+    let program = optimized_cps(src);
+    let summary = analyze(&program);
+    let reuse = analyze_elementwise_reuse(&program, &summary);
+
+    let compute_step = program
+        .funcs
+        .iter()
+        .find(|f| f.def.name == "compute_step")
+        .expect("compute_step must survive dead-code elimination");
+    let field_var = find_field_read(&compute_step.def.body, "t")
+        .expect("`w.t` must still be a real `Field` read in this function's own body");
+    let call_result = find_call_result_var(&compute_step.def.body, "Ring::sub")
+        .expect("`Ring::sub<Tensor<f32,2,2>>` must still be a real call in this function's own body");
+
+    assert_eq!(
+        reuse.get(&call_result),
+        Some(&field_var),
+        "the `Ring::sub` result must be marked reusable from `w.t`'s own dead, \
+         unaliased `CVar` -- got {reuse:?}"
+    );
+}
+
+/// The disqualifying twin of the test above: a *second* independent read
+/// of the exact same `(base, field)` pair elsewhere in the body means the
+/// first read being dead proves nothing about the field's own occupant --
+/// must NOT be marked reuse-eligible. `delta` (the call's *other* operand)
+/// is also read again afterward, so neither position has a fallback --
+/// without that, `Ring::sub` legitimately (and correctly) falls back to
+/// reusing `delta`'s own buffer instead, which is real, sound behavior,
+/// just not what this specific test means to isolate.
+#[test]
+fn a_second_independent_read_of_the_same_field_blocks_reuse() {
+    use cleave::alias_analysis::{analyze, analyze_elementwise_reuse};
+
+    let src = "
+        use linalg;
+        struct Wrap { t: Tensor<f32,2,2> }
+        extern fn make_wrap() -> Wrap;
+        extern fn make_delta() -> Tensor<f32,2,2>;
+        extern fn opaque_sink(t: Tensor<f32,2,2>) -> i32;
+        fn compute_step(w: Wrap, delta: Tensor<f32,2,2>) -> Wrap {
+            let r = Wrap(t: Ring::sub(w.t, delta));
+            opaque_sink(w.t);
+            opaque_sink(delta);
+            r
+        }
+        extern fn opaque_sink2(w: Wrap) -> i32;
+        fn main() -> i32 {
+            opaque_sink2(compute_step(make_wrap(), make_delta()))
+        }
+        ";
+    let program = optimized_cps(src);
+    let summary = analyze(&program);
+    let reuse = analyze_elementwise_reuse(&program, &summary);
+
+    let compute_step = program
+        .funcs
+        .iter()
+        .find(|f| f.def.name == "compute_step")
+        .expect("compute_step must survive dead-code elimination");
+    let call_result = find_call_result_var(&compute_step.def.body, "Ring::sub")
+        .expect("`Ring::sub<Tensor<f32,2,2>>` must still be a real call in this function's own body");
+
+    assert!(
+        !reuse.contains_key(&call_result),
+        "a second, independent read of `w.t` elsewhere in the body must block reuse -- got {reuse:?}"
+    );
+}
+
+fn find_field_read(expr: &cleave::cps::CExpr, field_name: &str) -> Option<cleave::cps::CVar> {
+    use cleave::cps::{CExpr, PrimOp};
+    match expr {
+        CExpr::LetPrim { var, op, cont, .. } => {
+            if matches!(op, PrimOp::Field { field, .. } if field == field_name) {
+                return Some(*var);
+            }
+            find_field_read(cont, field_name)
+        }
+        CExpr::App { .. } => None,
+        CExpr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => find_field_read(then_branch, field_name).or_else(|| find_field_read(else_branch, field_name)),
+        CExpr::Fix { defs, body } => {
+            for d in defs {
+                if let Some(v) = find_field_read(&d.body, field_name) {
+                    return Some(v);
+                }
+            }
+            find_field_read(body, field_name)
+        }
+    }
+}
+
+/// Finds the resumption parameter of a real call to a unit whose name
+/// starts with `callee_prefix` (a monomorphized name like `Ring::sub<..>`
+/// is never known exactly ahead of time) — the `CVar` that receives the
+/// call's own result in the caller.
+fn find_call_result_var(expr: &cleave::cps::CExpr, callee_prefix: &str) -> Option<cleave::cps::CVar> {
+    use cleave::cps::{CExpr, CVal};
+    match expr {
+        CExpr::LetPrim { cont, .. } => find_call_result_var(cont, callee_prefix),
+        CExpr::App { .. } => None,
+        CExpr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => find_call_result_var(then_branch, callee_prefix)
+            .or_else(|| find_call_result_var(else_branch, callee_prefix)),
+        CExpr::Fix { defs, body } => {
+            if let (
+                [def],
+                CExpr::App {
+                    func: CVal::Label(callee),
+                    ..
+                },
+            ) = (defs.as_slice(), body.as_ref())
+            {
+                if callee.starts_with(callee_prefix) {
+                    if let [p] = def.params.as_slice() {
+                        return Some(*p);
+                    }
+                }
+            }
+            for d in defs {
+                if let Some(v) = find_call_result_var(&d.body, callee_prefix) {
+                    return Some(v);
+                }
+            }
+            find_call_result_var(body, callee_prefix)
+        }
+    }
+}
+

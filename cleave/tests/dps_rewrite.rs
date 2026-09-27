@@ -250,6 +250,14 @@ fn a_struct_field_written_from_an_inlined_elementwise_op_computes_the_right_valu
 /// runs, proving the real byte-for-byte copy genuinely does not happen at
 /// runtime, not just that a copy of *some* kind still exists (which would
 /// also be true of the always-correct, unrewritten fallback path).
+///
+/// (`doc/plan-affine-ownership.md` §15's own compile-time buffer-reuse
+/// mechanism, `CodegenOptions::elementwise_reuse`, would also make this
+/// exact shape need no copy at all — but it's off by default, a real
+/// `STATUS_ACCESS_VIOLATION` found on `mnist-interop` traced to `build_
+/// tensor_descriptor_value`'s own skip-allocation branch wrongly assuming
+/// the computed value's buffer was already a real `cleave_alloc_rc`
+/// allocation. This test exercises the current, safe default path.)
 #[test]
 fn the_copy_is_neutered_to_zero_bytes_for_the_matching_shape() {
     let context = context();

@@ -2375,6 +2375,25 @@ fn lower_real_call<'c>(
     // `args`' own last entry is the synthesized continuation label itself
     // (`emit_call`'s own convention, see `cps.rs`), not a real argument.
     let real_args = &args[..args.len() - 1];
+    // `doc/plan-affine-ownership.md` §15 — a compile-time-decided reuse
+    // destination for a call was tried here (inlining a known `"linalg.
+    // elementwise.*"`-bodied unit's computation directly, `outs`-ing into
+    // one of its own dead/unaliased arguments) and **removed**: measured
+    // directly (`mlir-opt` dumps of the real pipeline, not assumed) to have
+    // zero effect, because this pipeline's own existing `--linalg-fuse-
+    // elementwise-ops` and One-Shot Bufferize's empty-tensor-elimination
+    // already achieve the identical or a strictly better result for every
+    // `linalg`-shaped case tested — fusing a chain away entirely, or
+    // writing straight into `build_tensor_descriptor_value`'s own final
+    // destination. Neither of those two mechanisms can ever reach an
+    // `extern` call (`PrimOp::Extern`, never a `linalg.generic` at all) —
+    // which is the actual, still-open target this analysis exists for: a
+    // future `blas::sgemm`-style call's own explicit destination argument,
+    // decided by `alias_analysis::analyze_elementwise_reuse` at the point
+    // cleave's own dispatch code (not yet built, `doc/plan-blas-native.md`
+    // §7) emits the call — no MLIR heuristic can ever do that job for an
+    // opaque extern symbol. The CPS-level fact itself stays built and
+    // tested; only this now-proven-inert consumer was removed.
     let arg_values: Vec<Value> = real_args
         .iter()
         .zip(param_types)
@@ -3458,6 +3477,7 @@ fn build_tensor_descriptor_value<'c>(
     // Source data pointer — `tensor_value_to_ptr`'s own doc comment.
     let src_ptr = tensor_value_to_ptr(ctx, block, value, field_ty);
 
+    let i64_ty: Type = IntegerType::new(context, 64).into();
     // Fresh, `cleave_alloc_rc`'d destination — sized as a flat `!llvm.array`
     // of every element, matching `alloc_llvm_value`'s own generic "any LLVM
     // type" contract exactly the way a struct-leaf array already uses it.
@@ -3465,7 +3485,6 @@ fn build_tensor_descriptor_value<'c>(
     let flat_array_ty = llvm::r#type::array(elem_mlir_ty, total_elems);
     let dest_ptr = alloc_llvm_value(ctx, block, flat_array_ty, None);
     let size = llvm_type_size_bytes(ctx, block, flat_array_ty);
-    let i64_ty: Type = IntegerType::new(context, 64).into();
     let is_volatile = Attribute::parse(context, "false")
         .unwrap_or_else(|| panic!("MLIR lowering: failed to parse `false` attribute"));
     block.append_operation(
@@ -3628,6 +3647,17 @@ fn store_native_shape_field<'c>(
 /// `ins()`, and `--buffer-deallocation-pipeline` never inserts a `memref.
 /// dealloc` for it at all — only for the *other*, genuinely-owned buffers
 /// (`tensor.empty()`-seeded intermediates) in the same function.
+///
+/// (`doc/plan-affine-ownership.md` §15 once tried making this
+/// conditionally `writable`, hoping a consuming `linalg.generic` would
+/// bufferize in place against a dying operand's own buffer — measured
+/// directly, against the real pipeline, to have zero effect: `--linalg-
+/// fuse-elementwise-ops` and One-Shot Bufferize's own empty-tensor-
+/// elimination already reach an equal-or-better result for every `linalg`
+/// -shaped case, ahead of where a `writable` hint could ever matter.
+/// Reverted — this function stays exactly what its own name says, a
+/// read.)
+///
 /// The read-side mirror of `build_tensor_descriptor_value`: turns an
 /// already-in-hand descriptor *value* back into a real `tensor<...>` SSA
 /// value — `builtin.unrealized_conversion_cast` to `memref<...>`, then

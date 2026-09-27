@@ -283,9 +283,48 @@ Une première implémentation complète a été écrite : un seul union-find glo
 
 ### 14.6 Phasage révisé
 
-1. **Phase A, restreinte (§14.3 corrigée)** : partager `seed`/`edges`/`propagate()` entre `AliasSummary` et `IdentitySummary` (aujourd'hui deux implémentations séparées mais isomorphes) et remplacer `is_loop`/`is_entry_arg` par le union-find *local* (boucle/jonction, jamais à travers une frontière de fonction top-level). Une vraie simplification, mais plus modeste que l'ambition initiale — la frontière inter-fonctions garde son mécanisme actuel, déjà correct. Pas commencé.
+1. **Phase A, restreinte (§14.3 corrigée) — FAITE.** `LocalAliasClasses` (`alias_analysis.rs`) : un vrai union-find, local à une seule fonction top-level, construit depuis `CarriedParamFacts` déjà existant (aucune nouvelle collecte de faits) — unit chaque paramètre porté d'un `Fix` local avec chaque `CVar` textuellement passé à son propre nom (entrée + tous les dos-de-boucle). `collect_affine_carried_params` réécrite dessus : au lieu de l'AND sur toutes les sources (règle a) plus un traçage récursif séparé comme échappatoire (règle b, `carried_param_flows_to_own_backedge`, ~130 lignes), une seule règle — si un membre quelconque de la classe est déjà `affine`, toute la classe l'est, puisqu'une classe dénote littéralement une seule location. Le cas qui motivait la règle (b) (`b = display_and_return(cond, b);`, identity-shaped à travers un vrai appel) continue de marcher : le union-find unit le paramètre porté avec le paramètre de résomption de cet appel (un `CVar` local ordinaire) ; `collect_affine_resumption_params`/`IdentitySummary` (mécanisme interprocédural existant, inchangé) prouve cette résomption affine séparément ; le point fixe déjà en place de `affine_struct_vars` fait remonter la preuve à la classe entière à l'itération suivante — aucun traçage interprocédural à dupliquer dans le union-find. `carried_param_flows_to_own_backedge` supprimée entièrement, code strictement plus simple. Un seul fichier touché (`alias_analysis.rs`) : `is_loop`/`is_entry_arg` de `refcount.rs` n'a délibérément **pas** été migré dans ce commit (mécanisme déjà correct et testé, `refcount.rs` étant le fichier le plus délicat de ce compilateur — un commit séparé, plus tard, s'il vaut la peine). Vérifié : suite complète (`cargo test -p cleave --release --no-fail-fast`, deux fois) verte, 903 tests, verdicts identiques ; `mnist-interop`/`digits-interop` re-vérifiés en AOT (`0.9342`/`0.94713414`, inchangés) avec `CLEAVE_DEBUG_POOL=1`, zéro corruption. Objectif de §14.7 ("suite verte, verdicts identiques à l'ancien mécanisme") atteint exactement — aucun changement de comportement observable, une simplification pure.
 2. **Phase B — les champs mutables (§14.4)** : inchangée, c'est *cette* phase qui débloquerait un gain mesurable sur `mnist-interop` (§13) — Phase A seule ne change rien à la mesure Stage 3.
 
 ### 14.7 Discipline, reprise de §7
 
 Même règle que tout ce fichier : une seule chose par commit, jamais `CLEAVE_AFFINE_STRUCTS` par défaut avant mesure complète, jamais de reproducteur non borné laissé sans supervision. Phase A avant Phase B, strictement — Phase A doit être acceptée seule (suite verte, verdicts identiques à l'ancien mécanisme) avant que Phase B ne touche au moindre fichier.
+
+## 15. Réutilisation en place d'un bloc unique — ce qui manque pour retirer le DPS rewrite (2026-09-23, non commencé)
+
+Origine : une session sur l'intégration OpenBLAS a fait remonter que `dps_rewrite.rs` (reconnaissance de pattern MLIR après `--inline`, pour supprimer la copie de `store_native_shape_field`) est un contournement, pas un mécanisme. La copie existe parce que la surface est purement fonctionnelle (`Boxed(v: a - b)` construit une nouvelle valeur) alors que le lowering fait d'un champ de struct un bloc heap refcompté qui possède son stockage : l'information « ce résultat est destiné à cet emplacement » est perdue à l'émission, et le DPS la redécouvre après coup.
+
+### 15.1 Le modèle visé : trois états, décidés à la compilation
+
+Pour une valeur consommée par une construction qui la remplace (`x_new = f(x_old)`) :
+
+- **Unique** — un seul propriétaire, et l'ancienne valeur est morte à ce point : écriture en place, sans refcount ni test.
+- **Partagée, prouvé (≥ 2)** — copie statique, sans test non plus.
+- **Multiplicité inconnue** (dépend d'une donnée d'exécution, cf. §1 : `push` dans une boucle à borne runtime) — seul cas qui garde le refcount et un test dynamique (`rc == 1` : réutiliser ; sinon : copier), à la manière du *reuse* de Perceus (Reinking et al., PLDI 2021) ou de `isUniquelyReferenced` (Swift).
+
+Deux conditions distinctes pour l'écriture en place, à ne pas confondre : l'**unicité** (§14.1 : pas deux noms de la même location aux live ranges qui se chevauchent) *et* la **vivacité** (aucun lecteur de l'ancienne valeur après ce point — l'adjoint de `grad()` lit les anciens poids avant `Optimizer::step`). En CPS la vivacité est explicite ; c'est un problème d'ordre, pas d'alias.
+
+### 15.2 Ce que le plan existant couvre, et ce qu'il laisse délibérément ouvert
+
+- **Acquis** : le verdict « jamais aliasé » par port + `propagate()` (§11-§14, `alias_analysis.rs`). C'est la moitié « unicité ».
+- **Absent** : tout consommateur qui *réutilise* un bloc. Stage 2 (§5) ne fait que supprimer le header d'une allocation neuve.
+- **§7 exclut explicitement** le destination-passing (« axe orthogonal, déjà noté dans `backlog.md` ») : le DPS rewrite vit exactement dans le trou laissé volontairement.
+- **§13 exclut les structs porteurs de tensor** (`struct_has_no_cascade_fields`) : `Network`/`Dense`/`NetworkState` — donc les poids, cible de l'écriture en place — sont hors champ ; 9 sites seulement éligibles sur le kernel réel.
+- **§14.4 (champs mutables, analyse sensible au flot) n'est pas commencé.** `Dense(w: w - lr*g, ...)` extrait `d.w` d'un struct `d` : un *move partiel*, qui exige de traiter le champ comme sa propre classe.
+
+Point qui débloque : la réutilisation n'a **pas** besoin de l'allocation sans header. On garde le bloc existant (header inclus, refcount à 1), donc le blocage du §13 (cascade de release sans header) ne s'applique pas.
+
+### 15.3 Phasage, dépendance stricte (une seule chose par commit, §7/§14.7)
+
+1. **Phase A** — §14.6, **FAITE** (`alias_analysis.rs::LocalAliasClasses`, détail dans §14.6 ci-dessus).
+2. **Phase B, reconsidérée — §14.4 (points-to par champ pour `PrimOp::FieldStore`) n'avait aucun cas d'usage réel** : `FieldStore` n'existe nulle part hors de `dynarray.cleave` lui-même, déjà exclu du monde fermé (§14.5). Remplacée par un mécanisme plus étroit et directement motivé, construit et testé : `alias_analysis::analyze_elementwise_reuse`/`collect_elementwise_units` — pour un appel réel à une unité `"linalg.elementwise.*"`-bodied (`Ring::add`/`sub`/`mul`/`div`, `Scale::scale`), détermine quel opérande mort et non-aliasé peut servir de destination. Sound, testé (`cleave/tests/alias_analysis.rs`), compose correctement à travers une chaîne sans code dédié. **Faite.**
+3. **Phase C, essayée et retirée pour le chemin natif — voir `doc/backlog.md`, l'entrée dédiée, pour le détail complet.** Un consommateur MLIR (inlining au site d'appel + `outs` réutilisé + `store_native_shape_field` recevant une destination) a été construit, a causé un vrai `STATUS_ACCESS_VIOLATION`, root-causé précisément : la bufferisation MLIR n'aliasait jamais réellement en place, et deux mécanismes déjà présents dans le pipeline (`--linalg-fuse-elementwise-ops`, l'élimination du tenseur vide de One-Shot Bufferize) atteignent déjà un résultat égal ou meilleur pour tout appel `linalg`-shaped — sans risque, sans code cleave dédié. **Retiré entièrement, pas juste désactivé.**
+
+**La vraie cible de Phase C n'est donc pas le chemin natif (déjà couvert par MLIR) — c'est le futur dispatch BLAS (§7).** Ni la fusion `linalg` ni l'élimination du tenseur vide ne peuvent jamais atteindre un appel `extern` (`blas::sgemm`) — exactement pourquoi `dps_rewrite.rs` ne pourra jamais le reconnaître non plus (son propre pattern-matching post-`--inline` cherche un `linalg.generic`, jamais un appel extern). Quand `matmul` décidera d'appeler `blas::sgemm(.., c)`, c'est le code émetteur de cleave qui devra choisir quel pointeur passer comme `c` — `analyze_elementwise_reuse` (déjà construite Phase B) est exactement le fait à consulter à ce moment-là. Cette phase attend donc la construction du module `blas` (§7, pas commencé) avant de pouvoir se brancher pour de vrai.
+
+### 15.4 Réserves à ne pas oublier
+
+- **L'AD veut du pur.** L'écriture en place est un abaissement *tardif*, après `grad()`/l'egraph, jamais une sémantique de surface qui les contamine.
+- **Le partage existe** (`Strategy::Passthrough` retient un pointeur commun) : l'unicité n'est jamais présumée, toujours prouvée, avec repli sur la copie.
+- **Un matmul en place n'est pas sûr** (la sortie ne doit pas être aliasée avec une entrée) ; un élémentaire l'est toujours.
+- **Non vérifié** : `alias_analysis.rs` lui-même n'a pas été relu pour ce paragraphe — on ne sait pas encore si la `live_set` est exploitable telle quelle par site de construction. À établir avant Phase C, pas supposé.
