@@ -186,6 +186,7 @@ fn run_f32_with_rewrite(context: &Context, src: &str) -> f32 {
         engine.register_symbol("cleave_alloc_pool", cleave_rt::cleave_alloc_pool as *mut ());
         engine.register_symbol("cleave_release_pool", cleave_rt::cleave_release_pool as *mut ());
         engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
+        engine.register_symbol("cleave_blas_sgemm", cleave_rt::cleave_blas_sgemm as *mut ());
     }
     let mut result: f32 = -1.0;
     unsafe {

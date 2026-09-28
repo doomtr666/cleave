@@ -1,4 +1,4 @@
-use cleave::cps::{
+﻿use cleave::cps::{
     UnitBody, collect_mlir_types, collect_struct_schemas, collect_units, convert_program,
     eliminate_dead_code,
 };
@@ -244,6 +244,8 @@ fn a_compiled_program_actually_runs_and_returns_the_right_value() {
         engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
         engine.register_symbol("cleave_alloc_pool", cleave_rt::cleave_alloc_pool as *mut ());
         engine.register_symbol("cleave_release_pool", cleave_rt::cleave_release_pool as *mut ());
+        engine.register_symbol("cleave_blas_sgemm", cleave_rt::cleave_blas_sgemm as *mut ());
+        engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
     }
     let mut out: i32 = -1;
     unsafe {
@@ -612,6 +614,13 @@ fn run_i32_from_cps(
         engine.register_symbol("rand_uniform_f64", cleave_rt::rand_uniform_f64 as *mut ());
         engine.register_symbol("rand_normal_f32", cleave_rt::rand_normal_f32 as *mut ());
         engine.register_symbol("rand_normal_f64", cleave_rt::rand_normal_f64 as *mut ());
+        // `stdlib/linalg/matrix.cleave`'s own `Fma`/`FmaTransposeA`/
+        // `FmaTransposeB` (`f32`-only) always build *both* branches of
+        // their own arbitrary size threshold -- unconditionally needed
+        // even when a test's own tiny shapes only ever take the native
+        // branch at runtime, the same reason `cleave/tests/blas.rs` needs
+        // this registered at all.
+        engine.register_symbol("cleave_blas_sgemm", cleave_rt::cleave_blas_sgemm as *mut ());
     }
     // `use io;` now transitively pulls in `stdlib/display/display.cleave`
     // and `stdlib/dynarray/dynarray.cleave` -- see `register_io_symbols`'s
@@ -925,6 +934,8 @@ fn an_extern_fn_call_actually_executes_through_a_registered_symbol() {
         engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
         engine.register_symbol("cleave_alloc_pool", cleave_rt::cleave_alloc_pool as *mut ());
         engine.register_symbol("cleave_release_pool", cleave_rt::cleave_release_pool as *mut ());
+        engine.register_symbol("cleave_blas_sgemm", cleave_rt::cleave_blas_sgemm as *mut ());
+        engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
     }
     let mut out: i32 = -1;
     unsafe {
@@ -1087,6 +1098,8 @@ fn an_extern_impl_method_actually_executes_the_right_symbol_at_each_call_site() 
         engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
         engine.register_symbol("cleave_alloc_pool", cleave_rt::cleave_alloc_pool as *mut ());
         engine.register_symbol("cleave_release_pool", cleave_rt::cleave_release_pool as *mut ());
+        engine.register_symbol("cleave_blas_sgemm", cleave_rt::cleave_blas_sgemm as *mut ());
+        engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
     }
     let mut out: i32 = -1;
     unsafe {
@@ -1178,6 +1191,8 @@ fn an_array_argument_crosses_an_extern_call_boundary_correctly() {
         engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
         engine.register_symbol("cleave_alloc_pool", cleave_rt::cleave_alloc_pool as *mut ());
         engine.register_symbol("cleave_release_pool", cleave_rt::cleave_release_pool as *mut ());
+        engine.register_symbol("cleave_blas_sgemm", cleave_rt::cleave_blas_sgemm as *mut ());
+        engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
     }
     let mut out: i32 = -1;
     unsafe {
@@ -1280,6 +1295,8 @@ fn a_unit_returning_extern_fn_can_be_called_correctly() {
         engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
         engine.register_symbol("cleave_alloc_pool", cleave_rt::cleave_alloc_pool as *mut ());
         engine.register_symbol("cleave_release_pool", cleave_rt::cleave_release_pool as *mut ());
+        engine.register_symbol("cleave_blas_sgemm", cleave_rt::cleave_blas_sgemm as *mut ());
+        engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
     }
     let mut out: i32 = -1;
     unsafe {
@@ -1378,6 +1395,8 @@ fn a_string_literal_printed_via_print_writes_the_right_bytes_to_stdout() {
         engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
         engine.register_symbol("cleave_alloc_pool", cleave_rt::cleave_alloc_pool as *mut ());
         engine.register_symbol("cleave_release_pool", cleave_rt::cleave_release_pool as *mut ());
+        engine.register_symbol("cleave_blas_sgemm", cleave_rt::cleave_blas_sgemm as *mut ());
+        engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
     }
     register_io_symbols(&engine);
     let mut out: i32 = -1;
@@ -3394,6 +3413,8 @@ fn print_of_an_unannotated_index_result_no_longer_panics() {
         engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
         engine.register_symbol("cleave_alloc_pool", cleave_rt::cleave_alloc_pool as *mut ());
         engine.register_symbol("cleave_release_pool", cleave_rt::cleave_release_pool as *mut ());
+        engine.register_symbol("cleave_blas_sgemm", cleave_rt::cleave_blas_sgemm as *mut ());
+        engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
     }
     register_io_symbols(&engine);
     let mut out: i32 = -1;
@@ -3498,6 +3519,8 @@ fn print_of_an_unannotated_matmul_index_result_no_longer_panics() {
         engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
         engine.register_symbol("cleave_alloc_pool", cleave_rt::cleave_alloc_pool as *mut ());
         engine.register_symbol("cleave_release_pool", cleave_rt::cleave_release_pool as *mut ());
+        engine.register_symbol("cleave_blas_sgemm", cleave_rt::cleave_blas_sgemm as *mut ());
+        engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
     }
     register_io_symbols(&engine);
     let mut out: i32 = -1;
@@ -5459,6 +5482,8 @@ fn run_i32_with_dynarray_symbols(
         engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
         engine.register_symbol("cleave_alloc_pool", cleave_rt::cleave_alloc_pool as *mut ());
         engine.register_symbol("cleave_release_pool", cleave_rt::cleave_release_pool as *mut ());
+        engine.register_symbol("cleave_blas_sgemm", cleave_rt::cleave_blas_sgemm as *mut ());
+        engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
     }
     register_io_symbols(&engine);
     unsafe {

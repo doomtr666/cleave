@@ -120,8 +120,22 @@ impl<const A0: i32, const A1: i32, const B0: i32, const B1: i32, const C0: i32, 
         let n: i32 = if trans_b { B0 } else { B1 };
         let ta: i32 = if trans_a { 1 } else { 0 };
         let tb: i32 = if trans_b { 1 } else { 0 };
-        let a_buf: [f32;A0,A1] = mlir::bufferization::to_buffer(a);
-        let b_buf: [f32;B0,B1] = mlir::bufferization::to_buffer(b);
+        // `read_only: "unit"` on `a`/`b` (never on `c`, genuinely written
+        // through) — found necessary, not decorative, by direct `mlir-opt`
+        // probing (`doc/backlog.md`'s own write-up has the full
+        // transcript): whenever `a`/`b` are read *again* elsewhere after
+        // this call (real, not hypothetical — `net_grad`'s own backward
+        // pass reads every forward activation a second time, e.g. `dW =
+        // H^T*dZ` needs the same `H` a layer's own forward pass already
+        // consumed), one-shot-bufferize conservatively copies rather than
+        // aliases *unless* `to_buffer` explicitly promises never to write
+        // through its own result — confirmed directly: the identical
+        // source, only this attribute added, is what actually made the
+        // real, measured copy disappear (matching the dynamic-strided
+        // result type `build_to_buffer_dynamic_layout` already gives —
+        // that fix alone wasn't sufficient on its own, only necessary).
+        let a_buf: [f32;A0,A1] = mlir::bufferization::to_buffer(a, read_only: "unit");
+        let b_buf: [f32;B0,B1] = mlir::bufferization::to_buffer(b, read_only: "unit");
         let mut c_buf: [f32;C0,C1] = mlir::bufferization::to_buffer(c);
         raw_sgemm(ta, tb, m, n, k, alpha, a_buf, A1, b_buf, B1, beta, c_buf, C1);
         mlir::bufferization::to_tensor(c_buf, restrict: "unit")

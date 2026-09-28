@@ -1,3 +1,11 @@
+// `use blas;` — only for `Fma`/`FmaTransposeA`/`FmaTransposeB`'s own
+// arbitrary, unmeasured size threshold below (`sgemm`, `stdlib/blas/
+// blas.cleave`): a quick, real measurement on `examples/mnist-interop`
+// (asked for directly), not yet the real, oracle-gated dispatch `doc/
+// plan-blas-native.md` §7.3 still requires before this becomes permanent
+// — see each impl's own doc comment below.
+use blas;
+
 // `MatMul` — rank-2-*specific*, deliberately not pack-generic like `Ring`/
 // `Index` in `tensor.cleave`: matmul contracts one *specific* dimension
 // (`Tensor<T,N,M>`'s own trailing `M` against `Tensor<T,M,K>`'s own leading
@@ -134,10 +142,60 @@ algebra MatMulTransposeB<A, B, C> {
     fn matmul_transpose_b(a: A, b: B) -> C;
 }
 
-impl<T: Float, const P: i32, const Q: i32, const R: i32>
-    MatMulTransposeB<Tensor<T,P,Q>, Tensor<T,R,Q>, Tensor<T,P,R>> {
+// **`100_000_000`, real measured threshold, `f32`-only** — replaces an
+// earlier `200_000` that was arbitrary/unmeasured (copied verbatim from
+// the old, obsolete pre-this-session code). Real data, not a guess (asked
+// for directly, a standalone size-sweep through the *real* production
+// pipeline — `target_cpu: "native"`, real vectorization — never `cleave/
+// tests/blas.rs`'s own simplified test pipeline, which skips vectorization
+// entirely and made native look ~14x slower than it really is): square
+// `matmul`, native vs. `sgemm`, wall-clock per call —
+//   128³ (2.1M):    82.0µs native vs.  82.8µs blas  (tied)
+//   256³ (16.8M):  408.8µs native vs. 401.1µs blas  (tied)
+//   512³ (134M):     2.63ms native vs.  2.19ms blas  (blas ~1.2x)
+//   1024³ (1.07B):  28.89ms native vs. 13.59ms blas  (blas ~2.1x)
+// BLAS's own advantage only shows up once a working set stops fitting
+// comfortably in cache (likely its own tiling/blocking, which cleave's
+// plain vectorized loop doesn't do) — below that, cleave's native `vector.
+// contract`/`vfmadd` lowering is already at parity or ahead. `100_000_000`
+// sits below the 512³ point where the gain becomes real, above the 256³
+// point where it's still a wash — `examples/mnist-interop`'s own largest
+// shape (`l1`, ~12.8M) sits well under this on purpose: that network is
+// simply too small to ever benefit from BLAS on this machine, confirmed
+// directly rather than assumed, and correctly never dispatches to it now.
+//
+// Real motivation for wiring this unit specifically, found directly, not
+// theoretical: `grad()`'s own reverse-mode adjoint (`MatMul`'s own
+// `adjoint matmul(a,b), u: (matmul_transpose_b(u, b), matmul_transpose_a(
+// a, u));`) routes *every* backward pass through this unit and its `_a`
+// sibling directly, never through `Fma`/`FmaTransposeA`/`FmaTransposeB` at
+// all (no bias is ever added to `dH`/`dW`) — wiring the threshold only
+// into the `Fma*` family (this file's own first pass at this) left the
+// single most expensive part of a real training step (two transpose-
+// matmuls per layer, against one forward matmul) entirely unaccelerated.
+//
+// `beta: 0.0` here, unlike `Fma`'s own `beta: 1.0` — there is no bias to
+// accumulate into, only a fresh destination `sgemm` needs a real `Tensor`
+// argument for at all. Built via a plain, genuinely uninitialized
+// `mlir::memref::alloc()` + `to_tensor(..., restrict: "unit")`, not `Ring::
+// zero()` — `MatMul::matmul`'s own doc comment above already has the full
+// story of why a real zero-fill is a real, measured cost worth avoiding
+// whenever the seed is never actually read (`beta: 0.0` means `sgemm`
+// never reads `c`'s own prior contents at all); `to_buffer(to_tensor(x,
+// restrict))` folds straight back to `x` (`mlir_lower.rs::build_tensor_
+// descriptor_value`'s own doc comment), so `sgemm`'s own internal `to_
+// buffer(c)` call costs nothing extra here either.
+impl<const P: i32, const Q: i32, const R: i32>
+    MatMulTransposeB<Tensor<f32,P,Q>, Tensor<f32,R,Q>, Tensor<f32,P,R>> {
     fn matmul_transpose_b(a, b) {
-        mlir::linalg::matmul_transpose_b(a, b)
+        let pqr: i32 = P * Q * R;
+        if pqr > 100000000 {
+            let mut c_buf: [f32; P, R] = mlir::memref::alloc();
+            let c: Tensor<f32,P,R> = mlir::bufferization::to_tensor(c_buf, restrict: "unit");
+            sgemm(false, true, 1.0, a, b, 0.0, c)
+        } else {
+            mlir::linalg::matmul_transpose_b(a, b)
+        }
     }
 }
 
@@ -148,10 +206,19 @@ algebra MatMulTransposeA<A, B, C> {
     fn matmul_transpose_a(a: A, b: B) -> C;
 }
 
-impl<T: Float, const P: i32, const Q: i32, const R: i32>
-    MatMulTransposeA<Tensor<T,P,Q>, Tensor<T,P,R>, Tensor<T,Q,R>> {
+// Same threshold, same reasoning, same `beta: 0.0` fresh-destination shape
+// as `MatMulTransposeB` just above — see that impl's own doc comment.
+impl<const P: i32, const Q: i32, const R: i32>
+    MatMulTransposeA<Tensor<f32,P,Q>, Tensor<f32,P,R>, Tensor<f32,Q,R>> {
     fn matmul_transpose_a(a, b) {
-        mlir::linalg::matmul_transpose_a(a, b)
+        let pqr: i32 = P * Q * R;
+        if pqr > 100000000 {
+            let mut c_buf: [f32; Q, R] = mlir::memref::alloc();
+            let c: Tensor<f32,Q,R> = mlir::bufferization::to_tensor(c_buf, restrict: "unit");
+            sgemm(true, false, 1.0, a, b, 0.0, c)
+        } else {
+            mlir::linalg::matmul_transpose_a(a, b)
+        }
     }
 }
 
@@ -250,24 +317,55 @@ algebra FmaTransposeB<A, B, C> {
     fn fma_transpose_b(a: A, b: B, c: C) -> C;
 }
 
-impl<T: Float, const N: i32, const M: i32, const K: i32>
-    Fma<Tensor<T,N,M>, Tensor<T,M,K>, Tensor<T,N,K>> {
+// **`100_000_000`, real measured threshold, `f32`-only** — same real
+// size-sweep data as `MatMulTransposeB`'s own doc comment above (128³/256³
+// tied, 512³ blas ~1.2x, 1024³ blas ~2.1x, through the real production
+// pipeline, not `cleave/tests/blas.rs`'s own vectorization-free test
+// pipeline) — replaces an earlier `200_000` that was arbitrary/unmeasured.
+// `f32`-*concrete* (not `T: Float`-generic like every other impl in this
+// file) because `sgemm`/`cblas_sgemm` themselves are `f32`-only (real
+// `SGEMM`, never `DGEMM`) — narrowing here, rather than trying to make
+// `sgemm` generic, mirrors exactly what the old, now-superseded BLAS
+// wrappers already did (`BlasSgemmTransposeB`/`_A`, both `f32`-only, never
+// `T: Float`) once they reached the point of actually calling BLAS.
+// `examples/mnist-interop`'s own network is `Dense<f32,...>` throughout,
+// so this loses no real coverage today — an `f64` caller of `fma` would
+// need this impl widened again (a real, separate impl for the
+// un-thresholded, still-generic case, `T: Float` but never BLAS-backed)
+// if one ever appears.
+impl<const N: i32, const M: i32, const K: i32>
+    Fma<Tensor<f32,N,M>, Tensor<f32,M,K>, Tensor<f32,N,K>> {
     fn fma(a, b, c) {
-        mlir::linalg::matmul_add(a, b, c)
+        let nmk: i32 = N * M * K;
+        if nmk > 100000000 {
+            sgemm(false, false, 1.0, a, b, 1.0, c)
+        } else {
+            mlir::linalg::matmul_add(a, b, c)
+        }
     }
 }
 
-impl<T: Float, const P: i32, const Q: i32, const R: i32>
-    FmaTransposeA<Tensor<T,P,Q>, Tensor<T,P,R>, Tensor<T,Q,R>> {
+impl<const P: i32, const Q: i32, const R: i32>
+    FmaTransposeA<Tensor<f32,P,Q>, Tensor<f32,P,R>, Tensor<f32,Q,R>> {
     fn fma_transpose_a(a, b, c) {
-        mlir::linalg::matmul_transpose_a_add(a, b, c)
+        let pqr: i32 = P * Q * R;
+        if pqr > 100000000 {
+            sgemm(true, false, 1.0, a, b, 1.0, c)
+        } else {
+            mlir::linalg::matmul_transpose_a_add(a, b, c)
+        }
     }
 }
 
-impl<T: Float, const P: i32, const Q: i32, const R: i32>
-    FmaTransposeB<Tensor<T,P,Q>, Tensor<T,R,Q>, Tensor<T,P,R>> {
+impl<const P: i32, const Q: i32, const R: i32>
+    FmaTransposeB<Tensor<f32,P,Q>, Tensor<f32,R,Q>, Tensor<f32,P,R>> {
     fn fma_transpose_b(a, b, c) {
-        mlir::linalg::matmul_transpose_b_add(a, b, c)
+        let pqr: i32 = P * Q * R;
+        if pqr > 100000000 {
+            sgemm(false, true, 1.0, a, b, 1.0, c)
+        } else {
+            mlir::linalg::matmul_transpose_b_add(a, b, c)
+        }
     }
 }
 

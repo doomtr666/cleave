@@ -89,7 +89,21 @@ fn run_f32(context: &Context, src: &str) -> f32 {
         .expect("lowering to the llvm dialect must succeed");
     strip_ciface_wrapper_debug_info(&context, module.as_operation_mut());
 
-    let options = CodegenOptions::default();
+    // `openmp: false`, `target_cpu: "native"` — matching `examples/mnist-
+    // interop/build.rs`'s own real config exactly, not `CodegenOptions::
+    // default()`'s own `openmp: true, target_cpu: None`. The `target_cpu`
+    // one turned out to be *the* real gap, found live: without it, native
+    // `matmul`'s own vectorized `vector.contract`/`vfmadd` lowering has no
+    // real AVX2/AVX-512 target to compile against at all (a generic
+    // baseline x86-64 target, no modern SIMD) — crippling *only* the
+    // native path, since BLAS is an externally-compiled library, already
+    // built with its own real target features, entirely unaffected by
+    // this cleave-level setting. Comparing BLAS against artificially-
+    // crippled native codegen is not comparing what the real kernel
+    // (which *does* set `target_cpu: "native"`) actually runs.
+    let mut options = CodegenOptions::default();
+    options.openmp = false;
+    options.target_cpu = Some("native".to_string());
     cleave::options::set(options.clone());
     lower_to_llvm(context, &mut module, &options).unwrap_or_else(|e| panic!("lower_to_llvm failed: {e:?}"));
 
@@ -98,6 +112,17 @@ fn run_f32(context: &Context, src: &str) -> f32 {
         engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
         engine.register_symbol("cleave_blas_sgemm", cleave_rt::cleave_blas_sgemm as *mut ());
         engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
+        engine.register_symbol("rand_seed", cleave_rt::rand_seed as *mut ());
+        engine.register_symbol("rand_uniform_f32", cleave_rt::rand_uniform_f32 as *mut ());
+        engine.register_symbol("cleave_alloc_local", cleave_rt::cleave_alloc_local as *mut ());
+        engine.register_symbol("cleave_region_enter", cleave_rt::cleave_region_enter as *mut ());
+        engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
+        engine.register_symbol("cleave_alloc_pool", cleave_rt::cleave_alloc_pool as *mut ());
+        engine.register_symbol("cleave_release_pool", cleave_rt::cleave_release_pool as *mut ());
+        engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
+        engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
+        engine.register_symbol("cleave_release_void", cleave_rt::cleave_release_void as *mut ());
+        engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
     }
     let mut out: f32 = f32::NAN;
     unsafe {
@@ -179,5 +204,125 @@ fn sgemm_agrees_with_native_matmul_on_the_same_data() {
         max_abs_diff < 1e-4,
         "blas::sgemm and matmul disagree by {max_abs_diff} on the diagonal -- the exact \
          unexplained gap doc/plan-blas-native.md §0 flagged, now with a real reproduction"
+    );
+}
+
+/// Not a correctness test — a real, isolated timing comparison, asked for
+/// directly, to answer "is `sgemm` itself slower than native `matmul` for
+/// `examples/mnist-interop`'s own real `l1` shape (32x784 @ 784x512),
+/// independent of everything else in that program's own training loop."
+/// Fresh random data built *inside* the loop on every iteration (`uniform`,
+/// a real, genuinely non-foldable extern call) -- deliberately, not `Ring::
+/// zero()`: an LLVM optimizer at `opt_level: 2` (this file's own `run_f32`)
+/// can and will hoist a loop-invariant call with no observable side effect
+/// out of the loop entirely, collapsing "200 iterations" down to one real
+/// call -- found live, this is exactly the failure mode a *first* version
+/// of this benchmark (built from `Ring::zero()`-seeded, unchanging `a`/`b`)
+/// would have silently hit. Construction cost is identical between the two
+/// variants below (same loop, same `uniform` calls), so it cancels out of
+/// the comparison -- only `matmul` vs `sgemm` (plus `sgemm`'s own `to_
+/// buffer` conversions) differs.
+fn matmul_bench_src(iters: i32) -> String {
+    format!(
+        r#"
+        use linalg;
+        use rand;
+        fn main() -> f32 {{
+            let mut acc: f32 = 0.0;
+            for _ in 0..{iters} {{
+                let mut abuf: [f32;32,784] = mlir::memref::alloc();
+                for i in 0..32 {{
+                    for j in 0..784 {{
+                        abuf[i,j] = uniform(-1.0, 1.0);
+                    }};
+                }};
+                let a: Tensor<f32,32,784> = mlir::bufferization::to_tensor(abuf, restrict: "unit");
+                let mut bbuf: [f32;784,512] = mlir::memref::alloc();
+                for i in 0..784 {{
+                    for j in 0..512 {{
+                        bbuf[i,j] = uniform(-1.0, 1.0);
+                    }};
+                }};
+                let b: Tensor<f32,784,512> = mlir::bufferization::to_tensor(bbuf, restrict: "unit");
+                let c = matmul(a, b);
+                acc = acc + c[0,0];
+            }};
+            acc
+        }}
+        "#
+    )
+}
+
+fn sgemm_bench_src(iters: i32) -> String {
+    format!(
+        r#"
+        use linalg;
+        use blas;
+        use rand;
+        fn main() -> f32 {{
+            let mut acc: f32 = 0.0;
+            for _ in 0..{iters} {{
+                let mut abuf: [f32;32,784] = mlir::memref::alloc();
+                for i in 0..32 {{
+                    for j in 0..784 {{
+                        abuf[i,j] = uniform(-1.0, 1.0);
+                    }};
+                }};
+                let a: Tensor<f32,32,784> = mlir::bufferization::to_tensor(abuf, restrict: "unit");
+                let mut bbuf: [f32;784,512] = mlir::memref::alloc();
+                for i in 0..784 {{
+                    for j in 0..512 {{
+                        bbuf[i,j] = uniform(-1.0, 1.0);
+                    }};
+                }};
+                let b: Tensor<f32,784,512> = mlir::bufferization::to_tensor(bbuf, restrict: "unit");
+                let zero: Tensor<f32,32,512> = Ring::zero();
+                let c = sgemm(false, false, 1.0, a, b, 0.0, zero);
+                acc = acc + c[0,0];
+            }};
+            acc
+        }}
+        "#
+    )
+}
+
+/// Prints both timings to stderr (`--nocapture`) rather than asserting
+/// anything — this is a real measurement to *read*, not a pass/fail gate;
+/// asserting "BLAS must be faster" would be exactly the kind of unmeasured
+/// assumption `doc/plan-blas-native.md` §7.3 already got burned by once.
+#[test]
+fn sgemm_vs_native_matmul_timing_on_mnist_interops_l1_shape() {
+    let iters = 200;
+    let native_src = matmul_bench_src(iters);
+    let blas_src = sgemm_bench_src(iters);
+
+    // A *fresh* `Context` per `run_f32` call, deliberately -- `lower_to_
+    // llvm`'s own transform-dialect matmul-vectorize script registers a
+    // named symbol into whichever `Context` it runs against; a second
+    // `lower_to_llvm` call on the *same*, already-used `Context` hits a
+    // real "doubly defined symbol @match_matmul" error (found live,
+    // writing this benchmark) -- every other test in this file only ever
+    // calls `run_f32` once per `context()`, so this never mattered before.
+    //
+    // One warm-up call each, discarded -- JIT compilation itself (not the
+    // loop body) dominates a *single* `run_f32` call otherwise, exactly
+    // the one-time cost this benchmark isn't trying to measure.
+    let _ = run_f32(&context(), &native_src);
+    let native_start = std::time::Instant::now();
+    let _ = run_f32(&context(), &native_src);
+    let native_elapsed = native_start.elapsed();
+
+    let _ = run_f32(&context(), &blas_src);
+    let blas_start = std::time::Instant::now();
+    let _ = run_f32(&context(), &blas_src);
+    let blas_elapsed = blas_start.elapsed();
+
+    eprintln!(
+        "native matmul: {native_elapsed:?} for {iters} iterations ({:?}/iter)",
+        native_elapsed / iters as u32
+    );
+    eprintln!(
+        "blas sgemm:    {blas_elapsed:?} for {iters} iterations ({:?}/iter)",
+        blas_elapsed / iters as u32
     );
 }

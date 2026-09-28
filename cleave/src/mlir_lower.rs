@@ -4754,8 +4754,80 @@ fn array_ptr_and_len<'c>(
                 )
             });
         let idx: Value = block.append_operation(built).result(0).unwrap().into();
-        let as_i64: Value = block
+        let base_i64: Value = block
             .append_operation(arith::index_cast(idx, i64_ty, location))
+            .result(0)
+            .unwrap()
+            .into();
+        // `extract_aligned_pointer_as_index` alone gives only the
+        // *base* allocation's own pointer — silently ignoring any real
+        // offset a dynamic-strided memref carries (`build_to_buffer_
+        // dynamic_layout`'s own doc comment: every real `Sgemm::sgemm`
+        // operand reaching here crossed a cleave function boundary,
+        // which bufferizes to exactly this dynamic-strided shape).
+        // Every real value reaching this function today happens to have
+        // offset zero (cleave never slices a `Tensor`), but computing it
+        // for real, rather than assuming it, is what actually makes that
+        // true instead of merely appearing to — `memref.extract_strided_
+        // metadata`'s own offset result is a compile-time-constant `0`
+        // for a plain, no-layout memref anyway, so this costs nothing
+        // extra for every *other* `Ty::Array` value already reaching
+        // here (never dynamic-strided).
+        let memref_ty = MemRefType::try_from(array_value.r#type()).unwrap_or_else(|e| {
+            panic!("MLIR lowering: array_ptr_and_len's own memref-typed value isn't a memref: {e}")
+        });
+        let rank = memref_ty.rank();
+        let elem_ty = memref_ty.element();
+        let base_memref_ty: Type = MemRefType::new(elem_ty, &[], None, None).into();
+        let mut meta_result_tys: Vec<Type> = vec![base_memref_ty, index_ty];
+        meta_result_tys.extend(std::iter::repeat_n(index_ty, 2 * rank as usize));
+        let meta_built = OperationBuilder::new("memref.extract_strided_metadata", location)
+            .add_operands(&[array_value])
+            .add_results(&meta_result_tys)
+            .build()
+            .unwrap_or_else(|e| {
+                panic!("MLIR lowering: failed to build memref.extract_strided_metadata: {e}")
+            });
+        let offset_idx: Value = block
+            .append_operation(meta_built)
+            .result(1)
+            .unwrap()
+            .into();
+        let offset_i64: Value = block
+            .append_operation(arith::index_cast(offset_idx, i64_ty, location))
+            .result(0)
+            .unwrap()
+            .into();
+        let null_ptr_ty = llvm::r#type::pointer(context, 0);
+        let null_ptr: Value = block
+            .append_operation(
+                OperationBuilder::new("llvm.mlir.zero", location)
+                    .add_results(&[null_ptr_ty])
+                    .build()
+                    .unwrap_or_else(|e| panic!("MLIR lowering: failed to build llvm.mlir.zero: {e}")),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        let elem_size_ptr = gep(ctx, block, null_ptr, &[1], elem_ty);
+        let elem_size: Value = block
+            .append_operation(
+                OperationBuilder::new("llvm.ptrtoint", location)
+                    .add_operands(&[elem_size_ptr])
+                    .add_results(&[i64_ty])
+                    .build()
+                    .unwrap_or_else(|e| panic!("MLIR lowering: failed to build llvm.ptrtoint: {e}")),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        let offset_bytes: Value = block
+            .append_operation(arith::muli(offset_i64, elem_size, location))
+            .result(0)
+            .unwrap()
+            .into();
+        let as_i64: Value = block
+            .append_operation(arith::addi(base_i64, offset_bytes, location))
             .result(0)
             .unwrap()
             .into();
@@ -5294,6 +5366,14 @@ fn lower_raw_mlir_op<'c>(
     if op == "linalg.relu" {
         return build_relu_elemwise(ctx, block, env, args, result_ty);
     }
+    // `bufferization.to_buffer` — real, dedicated Rust code so its own
+    // *result* type is dynamic-strided instead of the plain, no-layout
+    // memref the generic path below (via `result_ty`, `ty_to_mlir`'s own
+    // unconditional choice for `Ty::Array`) would otherwise force. See
+    // `build_to_buffer_dynamic_layout`'s own doc comment for why.
+    if op == "bufferization.to_buffer" {
+        return build_to_buffer_dynamic_layout(ctx, block, env, args, attrs, result_ty);
+    }
     let context = ctx.context;
     let operand_ty = args
         .iter()
@@ -5325,6 +5405,99 @@ fn lower_raw_mlir_op<'c>(
         .unwrap_or_else(|e| panic!("MLIR lowering: failed to build op `{op}`: {e}"));
     let result_op = block.append_operation(built);
     result_op.result(0).unwrap().into()
+}
+
+/// `bufferization.to_buffer %t : tensor<dims...xT> to memref<dims...xT,
+/// strided<[?, ...], offset: ?>>` — a fully *dynamic*-layout result,
+/// deliberately never the plain, no-layout memref `ty_to_mlir`/`array_
+/// memref_type` give `Ty::Array` everywhere else (`result_ty`, this
+/// function's own last argument, still carries that plain form — its
+/// *shape*/element type are reused via `MemRefType`, its *layout* is
+/// discarded).
+///
+/// Found necessary, not decorative, by direct `mlir-opt` probing (three
+/// probes, `doc/backlog.md`'s own write-up has the full transcript): a
+/// tensor value that crossed a real cleave function boundary (an ordinary
+/// call to `dense_forward`/`net_grad`/... returning a `Tensor`) bufferizes
+/// to a *dynamic-strided* memref — `one-shot-bufferize`'s own `bufferize-
+/// function-boundaries=true` option always gives a function's own
+/// tensor-typed parameters/results this shape, never a plain one. Asking
+/// `to_buffer` for a plain result type it can't just alias in that case
+/// forces a real, measured `memref.alloc` + `memref.copy` to materialize
+/// one from scratch — confirmed directly to be exactly what was
+/// happening on 7 of 9 real BLAS call sites in `examples/mnist-interop`'s
+/// own compiled kernel. Asking for the *matching* dynamic-strided type
+/// instead lets the whole `to_buffer` op fold away for free the moment
+/// the source already has (or turns out to have) that shape — probe #3:
+/// identical source, only the declared result type changed, and the op
+/// disappeared entirely, no copy, no alloc.
+///
+/// `stdlib/blas/blas.cleave`'s own `Sgemm::sgemm` is the only real caller
+/// today (`a_buf`/`b_buf`/`c_buf`) — every real call crosses exactly this
+/// kind of function-boundary round trip, so this is not a narrow-case fix.
+/// `array_ptr_and_len`'s own doc comment has the other half: extracting a
+/// correct pointer from *this* dynamic-strided shape needs its own real
+/// offset, not just the base pointer `memref.extract_aligned_pointer_as_
+/// index` alone would give for a plain memref.
+fn build_to_buffer_dynamic_layout<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    args: &[CVal],
+    attrs: &[(String, String)],
+    result_ty: Type<'c>,
+) -> Value<'c, 'c> {
+    let context = ctx.context;
+    let location = gen_loc(context);
+    let [a_arg] = args else {
+        panic!(
+            "MLIR lowering: `mlir::bufferization::to_buffer` needs exactly one operand, got {}",
+            args.len()
+        );
+    };
+    let a = lower_cval(context, block, env, a_arg, result_ty);
+    let plain = MemRefType::try_from(result_ty).unwrap_or_else(|e| {
+        panic!("MLIR lowering: `to_buffer`'s own result must be a memref: {e}")
+    });
+    let rank = plain.rank();
+    let elem_ty = plain.element();
+    let mut dims_text = String::new();
+    for i in 0..rank {
+        let DimSize::Static(d) = plain.dim_size(i).unwrap_or_else(|e| {
+            panic!("MLIR lowering: `to_buffer`'s own result has no dimension {i}: {e}")
+        }) else {
+            panic!(
+                "MLIR lowering: `to_buffer`'s own result must have every dimension statically known"
+            );
+        };
+        dims_text.push_str(&format!("{d}x"));
+    }
+    let strides_text = vec!["?"; rank as usize].join(", ");
+    let dynamic_ty = Type::parse(
+        context,
+        &format!("memref<{dims_text}{elem_ty}, strided<[{strides_text}], offset: ?>>"),
+    )
+    .unwrap_or_else(|| {
+        panic!("MLIR lowering: failed to parse `to_buffer`'s own dynamic-strided result type")
+    });
+    let parsed_attrs: Vec<_> = attrs
+        .iter()
+        .map(|(name, text)| {
+            let attribute = Attribute::parse(context, text).unwrap_or_else(|| {
+                panic!(
+                    "MLIR lowering: invalid MLIR attribute text `{text}` for `{name}` on `bufferization.to_buffer`"
+                )
+            });
+            (Identifier::new(context, name), attribute)
+        })
+        .collect();
+    let built = OperationBuilder::new("bufferization.to_buffer", location)
+        .add_operands(&[a])
+        .add_attributes(&parsed_attrs)
+        .add_results(&[dynamic_ty])
+        .build()
+        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build bufferization.to_buffer: {e}"));
+    block.append_operation(built).result(0).unwrap().into()
 }
 
 /// The `tensor.empty()`-shaped seed every genuinely-overwritten tensor
