@@ -426,9 +426,61 @@ fn class_bytes(class: usize) -> usize {
     1usize << class
 }
 
+/// Data alignment for any allocation of at least this many bytes: one
+/// AVX-512 vector, one cache line. A tensor payload aligned to only 16 bytes
+/// (what every allocator here used to give) makes every 64-byte vector load
+/// straddle two cache lines -- measured with AMD uProf on `examples/mnist-
+/// interop`: ~1 load in 3 was cache-line-crossing (`MISALIGNED_LOADS`
+/// ~224 per 1000 instructions), the weights being the worst case since
+/// they are the most-read data and live in `cleave_alloc_rc` field buffers.
+const VECTOR_ALIGN: usize = 64;
+
+/// Offset of a headered block's own data from the block's base. The
+/// `RcHeader` always sits immediately before the data (`rc_header`'s
+/// `ptr - RC_HEADER_SIZE` never changes); for a payload of at least
+/// `VECTOR_ALIGN` bytes, 48 bytes of padding go in front of it so the data
+/// itself lands on a 64-byte boundary. A smaller payload gains nothing from
+/// that (it fits in one line at 16) and keeps the compact layout. A pure
+/// function of `data_size`, which the header records, so a release can
+/// always find the block's base again.
+fn data_offset(data_size: usize) -> usize {
+    if data_size >= VECTOR_ALIGN {
+        VECTOR_ALIGN
+    } else {
+        RC_HEADER_SIZE
+    }
+}
+
+/// Alignment of every block in size class `class`. Uniform per class, not
+/// per request: `FREE_LISTS` hands a class's blocks to headered and
+/// headerless allocations alike, so every block of a class must already
+/// satisfy the strictest use either could make of it.
+fn class_align(class: usize) -> usize {
+    if class_bytes(class) >= VECTOR_ALIGN {
+        VECTOR_ALIGN
+    } else {
+        16
+    }
+}
+
+/// Base of the block `header` belongs to -- the address `FREE_LISTS`, the
+/// real `dealloc`, and every debug-bookkeeping table (`PARKED`, alloc
+/// serials) identify a block by.
+///
+/// # Safety
+/// `header` must be a live (or parked, whose `data_size` stays intact)
+/// `RcHeader` this runtime wrote.
+unsafe fn block_base(header: *mut RcHeader) -> *mut u8 {
+    unsafe {
+        let data = (header as *mut u8).add(RC_HEADER_SIZE);
+        data.sub(data_offset((*header).data_size as usize))
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn cleave_alloc_rc(data_size: i64) -> *mut u8 {
-    let total = RC_HEADER_SIZE + data_size as usize;
+    let offset = data_offset(data_size as usize);
+    let total = offset + data_size as usize;
     let class = size_class(total);
     unsafe {
         // Pop under `POOL_LOCK` (`POOL_LOCK`'s own doc comment: real,
@@ -477,14 +529,14 @@ pub extern "C" fn cleave_alloc_rc(data_size: i64) -> *mut u8 {
         let base = match popped {
             Some(block) => block,
             None => {
-                let layout = std::alloc::Layout::from_size_align(class_bytes(class), 16)
+                let layout = std::alloc::Layout::from_size_align(class_bytes(class), class_align(class))
                     .expect("cleave_alloc_rc: invalid layout");
                 let p = std::alloc::alloc(layout);
                 assert!(!p.is_null(), "cleave_alloc_rc: allocation failed");
                 p
             }
         };
-        let header = base as *mut RcHeader;
+        let header = base.add(offset - RC_HEADER_SIZE) as *mut RcHeader;
         (*header).refcount = 1;
         (*header).data_size = data_size;
         if *CLEAVE_TRACE_RC {
@@ -497,7 +549,7 @@ pub extern "C" fn cleave_alloc_rc(data_size: i64) -> *mut u8 {
                 cleave_frames()
             );
         }
-        base.add(RC_HEADER_SIZE)
+        base.add(offset)
     }
 }
 
@@ -508,8 +560,9 @@ pub extern "C" fn cleave_alloc_rc(data_size: i64) -> *mut u8 {
 pub unsafe extern "C" fn cleave_retain(ptr: *mut u8) {
     unsafe {
         let header = rc_header(ptr);
-        if *CLEAVE_DEBUG_POOL && parked_contains(header as usize) {
-            eprintln!("CLEAVE_DEBUG_POOL: cleave_retain on parked (already-freed) block {:p}", header);
+        let base = block_base(header);
+        if *CLEAVE_DEBUG_POOL && parked_contains(base as usize) {
+            eprintln!("CLEAVE_DEBUG_POOL: cleave_retain on parked (already-freed) block {:p}", base);
         }
         // `CLEAVE_COUNT_PARKED_HITS` -- same safe no-op as `cleave_
         // release`'s own, not counted separately here (the whole bug this
@@ -518,14 +571,14 @@ pub unsafe extern "C" fn cleave_retain(ptr: *mut u8) {
         // allocation traced precisely this session): only guards against
         // corrupting the free list if a retain ever *does* reach a parked
         // block under this mode.
-        if *CLEAVE_COUNT_PARKED_HITS && parked_contains(header as usize) {
+        if *CLEAVE_COUNT_PARKED_HITS && parked_contains(base as usize) {
             return;
         }
         if *CLEAVE_TRACE_RC {
             eprintln!(
                 "RETAIN  {:p} #{}  -> {}  {}",
-                header,
-                current_alloc_serial(header as usize).map_or("?".to_string(), |s| s.to_string()),
+                base,
+                current_alloc_serial(base as usize).map_or("?".to_string(), |s| s.to_string()),
                 (*header).refcount + 1,
                 first_cleave_frame()
             );
@@ -603,17 +656,18 @@ pub unsafe extern "C" fn cleave_release_tagged(ptr: *mut u8, tag: i64) -> bool {
 pub unsafe extern "C" fn cleave_release(ptr: *mut u8) -> bool {
     unsafe {
         let header = rc_header(ptr);
-        if *CLEAVE_DEBUG_POOL && parked_contains(header as usize) {
+        let base = block_base(header);
+        if *CLEAVE_DEBUG_POOL && parked_contains(base as usize) {
             eprintln!(
                 "CLEAVE_DEBUG_POOL: cleave_release on parked (already-freed) block {:p} #{}, refcount={}, data_size={}, tag={}",
-                header,
-                current_alloc_serial(header as usize).map_or("?".to_string(), |s| s.to_string()),
+                base,
+                current_alloc_serial(base as usize).map_or("?".to_string(), |s| s.to_string()),
                 (*header).refcount,
-                // `data_size` (offset 8) survives being parked untouched --
-                // the free-list's own "next" link overwrites only offset 0
-                // (`refcount`'s own slot, `FREE_LISTS`'s own doc comment),
-                // so this is still the block's real original allocation
-                // size, a real clue to which tensor shape this is.
+                // `data_size` survives being parked untouched -- the free-
+                // list's own "next" link overwrites only the block's first
+                // 8 bytes (at most `refcount`'s own slot, for a compact
+                // block), so this is still the block's real original
+                // allocation size, a real clue to which tensor shape this is.
                 (*header).data_size,
                 LAST_RELEASE_TAG.load(std::sync::atomic::Ordering::Relaxed),
             );
@@ -648,13 +702,13 @@ pub unsafe extern "C" fn cleave_release(ptr: *mut u8) -> bool {
         // hit, then safely no-ops (same reasoning as the reverted always-on
         // guard: nothing left to release, cascading into this container's
         // own fields would be wrong too, `false` correctly skips that).
-        if *CLEAVE_COUNT_PARKED_HITS && parked_contains(header as usize) {
-            if record_parked_hit(header as usize) {
+        if *CLEAVE_COUNT_PARKED_HITS && parked_contains(base as usize) {
+            if record_parked_hit(base as usize) {
                 let seen = PARKED_HITS.lock().unwrap().as_ref().map_or(0, |s| s.len());
                 eprintln!(
                     "CLEAVE_COUNT_PARKED_HITS: new distinct offender #{seen}: block {:p} #{}  {}",
-                    header,
-                    current_alloc_serial(header as usize).map_or("?".to_string(), |s| s.to_string()),
+                    base,
+                    current_alloc_serial(base as usize).map_or("?".to_string(), |s| s.to_string()),
                     first_cleave_frame()
                 );
             }
@@ -663,8 +717,8 @@ pub unsafe extern "C" fn cleave_release(ptr: *mut u8) -> bool {
         if *CLEAVE_TRACE_RC {
             eprintln!(
                 "RELEASE {:p} #{}  -> {}  {}",
-                header,
-                current_alloc_serial(header as usize).map_or("?".to_string(), |s| s.to_string()),
+                base,
+                current_alloc_serial(base as usize).map_or("?".to_string(), |s| s.to_string()),
                 (*header).refcount - 1,
                 first_cleave_frame()
             );
@@ -693,10 +747,9 @@ pub unsafe extern "C" fn cleave_release(ptr: *mut u8) -> bool {
             // once *this* container's own count genuinely reaches zero,
             // regardless of which physical allocator backs it.
             if !is_in_arena(header as *mut u8) {
-                let data_size = (*header).data_size;
-                let total = RC_HEADER_SIZE + data_size as usize;
+                let data_size = (*header).data_size as usize;
+                let total = data_offset(data_size) + data_size;
                 let class = size_class(total);
-                let base = header as *mut u8;
                 if class < NUM_SIZE_CLASSES {
                     // Cache it instead of returning it to the OS heap --
                     // `cleave_alloc_rc`'s own `FREE_LISTS` doc comment.
@@ -731,7 +784,7 @@ pub unsafe extern "C" fn cleave_release(ptr: *mut u8) -> bool {
                     // 2^63`) -- can't happen with a real `i64 data_size`,
                     // but falls back to the plain, uncached path rather
                     // than indexing out of bounds if it ever somehow did.
-                    let layout = std::alloc::Layout::from_size_align(class_bytes(class), 16)
+                    let layout = std::alloc::Layout::from_size_align(class_bytes(class), class_align(class))
                         .expect("cleave_release: invalid layout");
                     std::alloc::dealloc(base, layout);
                 }
@@ -804,23 +857,17 @@ fn arena_base() -> *mut u8 {
     base
 }
 
-/// Bumps `size` bytes off the arena's own cursor, 16-byte aligned — matches
-/// `cleave_alloc_rc`'s own `Layout::from_size_align(total, 16)` exactly
-/// (not this project's own 64-byte vectorization width: checked directly,
-/// the disassembled tensor-payload accesses reached through `cleave_
-/// alloc_rc` already use the *unaligned* masked-load/store forms, `vmovups
-/// `/`llvm.intr.masked.load`, not `vmovaps` — 64-byte alignment was never
-/// actually assumed for this allocator's own output, only for the
-/// unrelated, separately-`alignment = 64`-tagged `memref.alloc()` locals
-/// `mlir_lower.rs::alloc_llvm_value` builds) — bumps the cursor forward,
-/// returns the pre-bump address. The one real bump-allocation primitive:
-/// `cleave_alloc_local` (`doc/hld.md`'s own named entry point) is this
-/// function's only caller.
-fn arena_bump(size: usize) -> *mut u8 {
+/// Bumps `size` bytes off the arena's own cursor, aligned to `align` (a
+/// power of two: 16, or `VECTOR_ALIGN` for a block whose data needs it --
+/// `cleave_alloc_local`, the same rule `cleave_alloc_rc` follows) — bumps
+/// the cursor forward, returns the pre-bump address. The one real bump-
+/// allocation primitive: `cleave_alloc_local` (`doc/hld.md`'s own named
+/// entry point) is this function's only caller.
+fn arena_bump(size: usize, align: usize) -> *mut u8 {
     use std::sync::atomic::Ordering::Relaxed;
     let base = arena_base();
     let cursor = ARENA_CURSOR.load(Relaxed);
-    let aligned = (cursor + 15) & !15;
+    let aligned = (cursor + align - 1) & !(align - 1);
     let new_cursor = aligned + size;
     assert!(
         new_cursor <= ARENA_CAPACITY,
@@ -874,9 +921,9 @@ pub extern "C" fn cleave_region_enter(_size: i64) -> i64 {
 }
 
 /// `doc/hld.md`'s own `alloc_local(handle, size) -> ptr` — carves `size`
-/// bytes out of the arena at the current cursor (16-byte aligned — see
-/// `arena_bump`'s own doc comment for why 16, not this project's own
-/// 64-byte vectorization width), bumps the cursor forward. `handle` (the region this
+/// bytes out of the arena at the current cursor (laid out exactly like a
+/// `cleave_alloc_rc` block: `data_offset`, with the data 64-byte aligned for
+/// a payload of at least `VECTOR_ALIGN` bytes), bumps the cursor forward. `handle` (the region this
 /// allocation conceptually belongs to) isn't itself read here —
 /// correctness only needs the matching `cleave_region_exit` to eventually
 /// rewind past it, not a per-allocation check against it (nesting is a
@@ -924,10 +971,11 @@ fn assert_region_open() {
 #[unsafe(no_mangle)]
 pub extern "C" fn cleave_alloc_local(_handle: i64, size: i64) -> *mut u8 {
     assert_region_open();
-    let total = RC_HEADER_SIZE + size as usize;
-    let base = arena_bump(total);
+    let offset = data_offset(size as usize);
+    let align = if offset == VECTOR_ALIGN { VECTOR_ALIGN } else { 16 };
+    let base = arena_bump(offset + size as usize, align);
     unsafe {
-        let header = base as *mut RcHeader;
+        let header = base.add(offset - RC_HEADER_SIZE) as *mut RcHeader;
         (*header).refcount = 1;
         (*header).data_size = size;
         if *CLEAVE_TRACE_SIZE == Some(size) {
@@ -936,7 +984,7 @@ pub extern "C" fn cleave_alloc_local(_handle: i64, size: i64) -> *mut u8 {
                 first_cleave_frame()
             );
         }
-        base.add(RC_HEADER_SIZE)
+        base.add(offset)
     }
 }
 
@@ -1035,7 +1083,7 @@ pub extern "C" fn cleave_alloc_pool(data_size: i64) -> *mut u8 {
         match popped {
             Some(block) => block,
             None => {
-                let layout = std::alloc::Layout::from_size_align(class_bytes(class), 16)
+                let layout = std::alloc::Layout::from_size_align(class_bytes(class), class_align(class))
                     .expect("cleave_alloc_pool: invalid layout");
                 let p = std::alloc::alloc(layout);
                 assert!(!p.is_null(), "cleave_alloc_pool: allocation failed");
@@ -1064,7 +1112,7 @@ pub unsafe extern "C" fn cleave_release_pool(ptr: *mut u8, data_size: i64) {
             FREE_LISTS[class] = ptr;
             pool_unlock();
         } else {
-            let layout = std::alloc::Layout::from_size_align(class_bytes(class), 16)
+            let layout = std::alloc::Layout::from_size_align(class_bytes(class), class_align(class))
                 .expect("cleave_release_pool: invalid layout");
             std::alloc::dealloc(ptr, layout);
         }
@@ -1531,11 +1579,15 @@ mod rc_tests {
         }
         cleave_region_exit(outer);
 
-        // 16-byte alignment, unconditionally (`arena_bump`'s own doc
-        // comment has the real reasoning for 16, not 64).
-        let h3 = cleave_region_enter(256);
+        // A small payload stays 16-byte aligned; one of at least
+        // `VECTOR_ALIGN` bytes gets a 64-byte aligned data pointer, even
+        // right after an odd-sized allocation left the cursor unaligned.
+        let h3 = cleave_region_enter(4096);
         let p = cleave_alloc_local(h3, 17) as usize; // an odd size on purpose
         assert_eq!(p % 16, 0, "alloc_local's own result must be 16-byte aligned");
+        let q = cleave_alloc_local(h3, 256);
+        assert_eq!(q as usize % VECTOR_ALIGN, 0, "a large alloc_local payload must be 64-byte aligned");
+        assert_eq!(unsafe { rc_count(q) }, 1, "the header must still sit right before the data");
         cleave_region_exit(h3);
 
         // -- `cleave_alloc_local`, refcount-header-compatible --
@@ -1613,6 +1665,28 @@ mod rc_tests {
                  pool` genuinely share `FREE_LISTS`, not a separate pool"
             );
             cleave_release_pool(b, 16);
+        }
+    }
+
+    #[test]
+    fn large_payloads_are_64_byte_aligned_small_ones_stay_compact() {
+        unsafe {
+            for size in [64i64, 100, 4096, 401_408 * 4] {
+                let p = cleave_alloc_rc(size);
+                assert_eq!(p as usize % VECTOR_ALIGN, 0, "alloc_rc({size}) must be 64-byte aligned");
+                assert_eq!(rc_count(p), 1);
+                cleave_retain(p);
+                assert!(!cleave_release(p));
+                assert!(cleave_release(p), "alloc_rc({size}) must free cleanly from its padded base");
+                // The freed block, handed back out headerless, is aligned too.
+                let q = cleave_alloc_pool(size);
+                assert_eq!(q as usize % VECTOR_ALIGN, 0, "alloc_pool({size}) must be 64-byte aligned");
+                cleave_release_pool(q, size);
+            }
+            let small = cleave_alloc_rc(24);
+            assert_eq!(small as usize % 16, 0);
+            assert_eq!(rc_count(small), 1);
+            assert!(cleave_release(small));
         }
     }
 
