@@ -1,6 +1,6 @@
 //! Real, JIT-executed tests for `cleave::unify_alloc::unify_tensor_
-//! allocations` — mirrors `cleave/tests/dps_rewrite.rs`'s own harness style
-//! (a self-contained pipeline replicating `pipeline.rs::emit_object`'s real
+//! allocations` — a self-contained harness
+//! (a pipeline replicating `pipeline.rs::emit_object`'s real
 //! stage order, not `mlir_lower.rs`'s older, pre-`--inline` `run_i32_from_
 //! cps` helper), but carried all the way through to the `llvm` dialect —
 //! `unify_tensor_allocations` runs *after* `--convert-to-llvm`, the one
@@ -10,7 +10,6 @@
 
 use cleave::cps::{collect_mlir_types, collect_struct_schemas, collect_units, convert_program};
 use cleave::driver::compile;
-use cleave::dps_rewrite::eliminate_redundant_field_store_copies;
 use cleave::mlir_lower::lower_program;
 use cleave::pipeline::{check_type_errors, strip_ciface_wrapper_debug_info};
 use cleave::registry::Registry;
@@ -34,8 +33,8 @@ fn context() -> Context {
 /// stage order, `pipeline.rs::emit_object`, minus the vectorization-
 /// specific stages this rewrite doesn't interact with — `--convert-linalg-
 /// to-loops` in place of `-to-affine-loops`+`affine-super-vectorize`,
-/// exactly the same simplification `dps_rewrite.rs`'s own `run_f32_with_
-/// rewrite` already makes, for the same reason: this file is testing *this*
+/// the usual simplification for a test that is about
+/// allocation rather than vectorization: this file is testing *this*
 /// rewrite, not vectorization), then runs `unify_tensor_allocations`.
 fn build_unified_module<'c>(context: &'c Context, src: &str) -> melior::ir::Module<'c> {
     let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
@@ -59,13 +58,13 @@ fn build_unified_module<'c>(context: &'c Context, src: &str) -> melior::ir::Modu
         .run(&mut module)
         .expect("inline/elementwise-to-linalg/fuse must succeed");
 
-    eliminate_redundant_field_store_copies(context, &mut module);
 
     let pass_manager = pass::PassManager::new(context);
     pass::bufferization::register_one_shot_bufferize_pass();
+    pass::bufferization::register_empty_tensor_elimination_pass();
     parse_pass_pipeline(
         pass_manager.as_operation_pass_manager(),
-        "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})",
+        "builtin.module(eliminate-empty-tensors,one-shot-bufferize{bufferize-function-boundaries=true})",
     )
     .expect("failed to parse the one-shot-bufferize pass pipeline");
     pass_manager
@@ -169,7 +168,7 @@ const FREESTANDING_SOURCE: &str = r#"
         "#;
 
 /// A program with *zero* struct-field-crossing tensors -- the case
-/// `dps_rewrite.rs`'s own rewrite never touches at all (nothing to
+/// `mlir_lower.rs::build_tensor_descriptor_value` never touches (nothing to
 /// redirect a destination for: `Ring::add`/`Ring::mul` here never reach a
 /// struct field), the one this module's own doc comment says is left
 /// entirely to plain `malloc`/`free` before this rewrite exists.
@@ -210,8 +209,8 @@ fn freestanding_tensor_arithmetic_uses_cleave_alloc_rc_not_malloc() {
 /// `cleave_alloc_rc` is already declared (by the struct), so `retarget_
 /// calls`'s own "already declared" branch is exercised for real, not just
 /// the "rename the old declaration in place" branch the tests above
-/// exercise. Also proves both allocation paths (`dps_rewrite.rs`'s own
-/// struct-boundary redirect, and this module's own free-standing rename)
+/// exercise. Also proves both allocation paths (a struct field written
+/// in place, and this module's own free-standing rename)
 /// coexist correctly in the same program.
 #[test]
 fn a_program_with_both_a_struct_and_freestanding_tensor_arithmetic_computes_correctly() {

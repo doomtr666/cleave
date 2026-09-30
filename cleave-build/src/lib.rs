@@ -74,8 +74,6 @@ pub struct Build {
     unroll_jam: Option<bool>,
     chain_split: Option<bool>,
     affine_structs: Option<bool>,
-    dps: Option<bool>,
-    dps_passthrough: Option<bool>,
     tag_releases: Option<bool>,
     debug_info: Option<bool>,
     defines: Vec<(String, String)>,
@@ -100,8 +98,6 @@ impl Build {
             unroll_jam: None,
             chain_split: None,
             affine_structs: None,
-            dps: None,
-            dps_passthrough: None,
             tag_releases: None,
             debug_info: None,
             defines: Vec::new(),
@@ -174,19 +170,6 @@ impl Build {
     /// comment.
     pub fn affine_structs(&mut self, enabled: bool) -> &mut Self {
         self.affine_structs = Some(enabled);
-        self
-    }
-
-    /// See `cleave::pipeline::CodegenOptions::dps`'s own doc comment.
-    pub fn dps(&mut self, enabled: bool) -> &mut Self {
-        self.dps = Some(enabled);
-        self
-    }
-
-    /// See `cleave::pipeline::CodegenOptions::dps_passthrough`'s own doc
-    /// comment.
-    pub fn dps_passthrough(&mut self, enabled: bool) -> &mut Self {
-        self.dps_passthrough = Some(enabled);
         self
     }
 
@@ -298,8 +281,6 @@ impl Build {
             unroll_jam: self.unroll_jam.unwrap_or(defaults.unroll_jam),
             chain_split: self.chain_split.unwrap_or(defaults.chain_split),
             affine_structs: self.affine_structs.unwrap_or(defaults.affine_structs),
-            dps: self.dps.unwrap_or(defaults.dps),
-            dps_passthrough: self.dps_passthrough.unwrap_or(defaults.dps_passthrough),
             tag_releases: self.tag_releases.unwrap_or(defaults.tag_releases),
             debug_info: self.debug_info.unwrap_or(defaults.debug_info),
         };

@@ -17,8 +17,8 @@
 //! registered at all.
 //!
 //! **Unconditionally safe, no analysis needed at all -- a real, deliberate
-//! contrast with `dps_rewrite.rs`'s own considerably more involved
-//! reasoning** for a structurally different problem (redirecting a
+//! contrast with the considerably more involved reasoning** a structurally
+//! different problem needs (redirecting a
 //! *computation's own destination*, which needs real precondition checks to
 //! stay sound). A `memref.copy` from a memref to itself is a no-op by
 //! definition, in every case, for every shape -- `source == destination`
@@ -35,8 +35,7 @@ use melior::Context;
 use melior::ir::operation::{Operation, OperationLike, OperationMutLike, OperationRef};
 use melior::ir::{BlockLike, Module, RegionLike};
 
-/// Mirrors `dps_rewrite.rs`'s own identical helper and identical doc-comment
-/// reasoning -- `OperationMutLike` (needed for `remove_from_parent`) is
+/// `OperationMutLike` (needed for `remove_from_parent`) is
 /// implemented for `OperationRefMut`, not the plain `OperationRef` a walk
 /// returns; both wrap the same raw `MlirOperation` handle, this only widens
 /// which methods are callable on it.
@@ -55,8 +54,7 @@ fn as_mut<'c, 'a>(op: OperationRef<'c, 'a>) -> melior::ir::operation::OperationR
 /// `"expected that op has no uses"` -- hit later, in a subsequent pass, not
 /// at the call site itself), confirmed directly on this exact toolchain,
 /// building the real `examples/digits-interop` kernel -- not a hypothetical:
-/// exactly the same failure mode `dps_rewrite.rs`'s own doc comment already
-/// documents for `llvm.intr.memcpy`, and `unify_alloc.rs`'s own doc comment
+/// exactly the same failure mode first found on `llvm.intr.memcpy`, and `unify_alloc.rs`'s own doc comment
 /// independently reconfirms for `memref.alloc`/`memref.dealloc` ("erasure
 /// 'succeeds' at the call site itself, then crashes later, at module
 /// teardown") -- a general melior/MLIR-C-API hazard across *every* op kind

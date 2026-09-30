@@ -1,9 +1,9 @@
 //! Gives cleave sole ownership of every tensor payload's own physical
 //! memory — the "free-standing" half of unifying tensor and struct
-//! allocation onto one mechanism (`dps_rewrite.rs`'s own module doc
-//! comment already handles the other half: a tensor value that gets
-//! written into a struct field, redirected to `cleave_alloc_rc` directly,
-//! before bufferization ever runs). Tensor arithmetic that never touches a
+//! allocation onto one mechanism (`mlir_lower.rs::build_tensor_descriptor_
+//! value` handles the other half: a tensor value that gets written into a
+//! struct field is written straight into a `cleave_alloc_rc`'d field
+//! buffer, before bufferization ever runs). Tensor arithmetic that never touches a
 //! struct field is, today, left entirely to MLIR's own bufferization-
 //! inserted `memref.alloc`/`--buffer-deallocation-pipeline` — plain
 //! `malloc`/`free`, a completely different allocator from every other heap
@@ -27,8 +27,8 @@
 //!   place, with a different result type — exactly the kind of erase-and-
 //!   replace this module exists to avoid.
 //! - `melior`'s own `remove_from_parent` is confirmed unsafe to call on
-//!   real ops from this pipeline (`dps_rewrite.rs`'s own doc comment, on
-//!   `llvm.intr.memcpy`; checked again directly here, on `memref.alloc`/
+//!   real ops from this pipeline (found first on `llvm.intr.memcpy`;
+//!   checked again directly here, on `memref.alloc`/
 //!   `memref.dealloc` specifically, since one op kind erasing safely never
 //!   implies another does — same result: erasure "succeeds" at the call
 //!   site itself, then crashes later, at module teardown). A callee rename
@@ -45,11 +45,11 @@
 //! convenient**: by the time this runs, cleave's own code has never
 //! emitted a `malloc`/`free` call of its own — every struct, and every
 //! struct-crossing tensor, already goes through `cleave_alloc_rc` directly
-//! (`mlir_lower.rs::alloc_llvm_value`, `dps_rewrite.rs`) — so *every*
+//! (`mlir_lower.rs::alloc_llvm_value`) — so *every*
 //! `llvm.call @malloc`/`@free` left in the module by this point is,
 //! unconditionally, one MLIR's own bufferization pipeline inserted for a
 //! tensor payload. No pattern-matching on shape, no per-site safety proof
-//! needed the way `dps_rewrite.rs`'s own `Strategy` enum requires:
+//! needed:
 //! `--ownership-based-buffer-deallocation`'s own alias/liveness analysis
 //! has *already* decided, ahead of this rewrite, exactly which allocation
 //! belongs to which deallocation, and exactly when each one fires

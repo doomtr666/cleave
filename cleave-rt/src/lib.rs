@@ -958,8 +958,8 @@ pub extern "C" fn cleave_region_exit(handle: i64) {
 /// exactly. Exists purely so `unify_alloc.rs`'s own `llvm.call @free` ->
 /// `llvm.call @cleave_release_void` rewrite can be a **plain callee-symbol
 /// rename**, nothing else: melior's own `remove_from_parent` is confirmed
-/// unsafe to call at all on real ops from this pipeline (`dps_rewrite.rs`'s
-/// own doc comment on `memcpy`, and — checked again here, since a *
+/// unsafe to call at all on real ops from this pipeline (found first on
+/// `memcpy`, and — checked again here, since a *
 /// different* op kind isn't automatically covered by that same finding —
 /// on `memref.dealloc`/`memref.alloc` too: erasing either one succeeds at
 /// the call site itself but corrupts internal state that only crashes
@@ -1103,8 +1103,7 @@ fn release_entry_point() -> &'static str {
 // that exposes `cblas_sgemm`'s own real, generic shape directly --
 // `trans_a`/`trans_b` are real runtime arguments here, not baked into
 // which wrapper got called. Destination `c` is explicit, passed straight
-// through -- no scratch buffer, nothing for `dps_rewrite.rs` to redirect
-// after the fact.
+// through -- no scratch buffer, nothing to redirect after the fact.
 //
 // **Explicit, lazy `LoadLibraryW`/`GetProcAddress` (`blas_dynload`,
 // below), not an ordinary implicit `extern "C" { ... }` link against

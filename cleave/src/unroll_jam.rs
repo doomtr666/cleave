@@ -128,11 +128,7 @@ const MIN_TRIP_COUNT_TO_UNROLL: i64 = 8;
 /// Runs the pass over every `scf.for` reduction anywhere in `module`,
 /// unrolling-and-jamming each one whose own trip count is both large enough
 /// (`MIN_TRIP_COUNT_TO_UNROLL`) and evenly divisible by some candidate
-/// factor. Conservative by construction, matching this project's own
-/// established posture for exactly this class of transform (`dps_rewrite.rs`
-/// 's own module doc comment: "a single mismatch anywhere in the chain
-/// leaves that one... completely untouched, falling back to the always-
-/// correct path"): a loop this pass doesn't recognize, or can't find a
+/// factor. Conservative by construction: a loop this pass doesn't recognize, or can't find a
 /// factor for, is left byte-for-byte as the existing schedule already built
 /// it — this pass can only ever make a long reduction *faster*, never
 /// *different*.

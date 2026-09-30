@@ -12,7 +12,6 @@ use crate::cps::{
     convert_program, eliminate_dead_code,
 };
 use crate::diag::{Diagnostic, SourceMap};
-use crate::dps_rewrite::eliminate_redundant_field_store_copies;
 use crate::egraph::{DerivativeRequest, optimize_program, synthesize_derivatives};
 use crate::escape::escaping_struct_vars;
 use crate::mlir_lower::lower_program;
@@ -140,14 +139,6 @@ pub struct CodegenOptions {
     /// never remove this fallback casually (`lower_program`'s own doc
     /// comment has the full reasoning).
     pub affine_structs: bool,
-    /// Gates `dps_rewrite`'s own destination-passing-style rewrite pass.
-    /// **On by default**, real and established.
-    pub dps: bool,
-    /// Gates `dps_rewrite`'s own narrower passthrough-sharing strategy
-    /// (declining it alone, independent of `dps` above, falls back to a
-    /// safe copy instead of sharing the source's own storage). **On by
-    /// default**, real and established.
-    pub dps_passthrough: bool,
     /// Gates `mlir_lower.rs`'s own originating-`CVar`-id tagging on emitted
     /// `cleave_release` calls -- a real debugging aid for tracking down a
     /// leak/double-free's own source, not a performance optimization. **Off
@@ -181,8 +172,6 @@ impl Default for CodegenOptions {
             unroll_jam: false,
             chain_split: false,
             affine_structs: true,
-            dps: true,
-            dps_passthrough: true,
             tag_releases: false,
             debug_info: true,
         }
@@ -871,12 +860,11 @@ pub fn lower_to_llvm<'c>(
     // blob. Skips *only* the inliner itself -- `--convert-elementwise-to-
     // linalg`/`--linalg-fuse-elementwise-ops` still run (harmless without
     // inlining: there is nothing cross-function left for them to fuse, per
-    // this pass's own comment above), and every later stage (`dps_rewrite`,
-    // the matmul tiling/vectorization schedule below) degrades safely --
-    // each one's own preconditions simply aren't met as often, falling back
-    // to its own always-correct, un-rewritten path (`dps_rewrite.rs`'s own
-    // module doc comment: "a single mismatch anywhere in the chain leaves
-    // that one struct-field write completely untouched"). Not meant for a
+    // this pass's own comment above), and every later stage (the matmul
+    // tiling/vectorization schedule below, `--eliminate-empty-tensors`)
+    // degrades safely -- each one's own preconditions simply aren't met as
+    // often, falling back to its own always-correct path (a struct field
+    // store then costs a copy One-Shot inserts itself). Not meant for a
     // real perf build -- disabling inlining reopens exactly the double-
     // scratch-buffer cost this same pass's own comment above measured and
     // fixed.
@@ -891,18 +879,6 @@ pub fn lower_to_llvm<'c>(
             "MLIR-to-LLVM lowering pass failed (inline/elementwise-to-linalg/fuse)".to_string(),
         ]);
     }
-
-    // Destination-passing rewrite -- see `dps_rewrite.rs`'s own module doc
-    // comment for the full story (VTune, `examples/mnist-interop`: ~38% of
-    // wall time in unresolved `memcpy`-shaped frames, ~12% more in malloc/
-    // free -- `store_native_shape_field`'s own struct-field-write scratch
-    // copy). Runs *here* specifically -- after `--inline`/`--linalg-fuse-
-    // elementwise-ops` (just above) have already collapsed cross-function
-    // calls into single-function bodies, which is what makes the pattern
-    // this rewrite looks for reachable at all -- and *before* One-Shot
-    // Bufferize (right below), since it operates on the still-`tensor`-
-    // typed, pre-bufferization form of the IR.
-    eliminate_redundant_field_store_copies(context, &mut *module);
 
     // TEMP EXPERIMENT (`doc/backlog.md`, register-residency + FMA + real
     // OpenMP parallelism, all three, on the matmul specifically): tile the
@@ -1045,9 +1021,16 @@ pub fn lower_to_llvm<'c>(
 
     let pass_manager = pass::PassManager::new(context);
     pass::bufferization::register_one_shot_bufferize_pass();
+    pass::bufferization::register_empty_tensor_elimination_pass();
+    // `eliminate-empty-tensors` first: it is what lets a struct field's own
+    // `materialize_in_destination` (`mlir_lower.rs::build_tensor_descriptor_
+    // value`) turn the tensor's producer into a direct write into the field's
+    // buffer, instead of a scratch buffer plus a copy. The self-copy it
+    // leaves behind (`memref.copy %b, %b`) is folded by the later
+    // `--canonicalize` stage.
     if parse_pass_pipeline(
         pass_manager.as_operation_pass_manager(),
-        "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true function-boundary-type-conversion=identity-layout-map})",
+        "builtin.module(eliminate-empty-tensors,one-shot-bufferize{bufferize-function-boundaries=true function-boundary-type-conversion=identity-layout-map})",
     )
     .is_err()
         || pass_manager.run(&mut *module).is_err()
@@ -1596,7 +1579,7 @@ pub fn lower_to_llvm<'c>(
 /// (its whole subtree is handled by `force_location` in one shot).
 ///
 /// `pub`, not `pub(crate)`: every test file with its own bespoke, minimal
-/// JIT pass pipeline (`tests/{mlir_lower,egraph,dps_rewrite,refcount,
+/// JIT pass pipeline (`tests/{mlir_lower,egraph,refcount,
 /// unify_alloc,user_guide}.rs` -- found by direct testing, not assumed, when
 /// the real `cargo test -p cleave` suite hard-crashed the LLVM verifier the
 /// first time it ran after `mlir_lower.rs` started fusing a `DISubprogram`

@@ -1,8 +1,8 @@
 //! `doc/plan-blas-native.md` §7.2 — the differential oracle that was
 //! missing the first time (that attempt's own unexplained precision gap:
 //! §0's own "0.9341/0.9019/0.5837" numbers, never root-caused). Deliberately
-//! its own small pipeline, mirroring `cleave/tests/dps_rewrite.rs`'s own
-//! precedent for the identical reason: a real, JIT-executed check, not just
+//! its own small pipeline, like the project's other JIT-executed harnesses
+//! (`cleave/tests/unify_alloc.rs`), for the same reason: a real check, not just
 //! "the verifier didn't complain."
 //!
 //! No `insert_refcounting` here, matching `mlir_lower.rs::run_i32_from_cps`'s

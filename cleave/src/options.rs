@@ -1,7 +1,6 @@
 //! A single, real, thread-local `CodegenOptions` context, read by every
 //! deeply-nested pass that used to read a scattered `CLEAVE_*` env var
-//! instead (`unroll_jam.rs`/`chain_split.rs`/`mlir_lower.rs`/`dps_rewrite.rs`
-//! -- see `doc/backlog.md`'s own entry on this). Raised directly by the
+//! instead (`unroll_jam.rs`/`chain_split.rs`/`mlir_lower.rs` -- see `doc/backlog.md`'s own entry on this). Raised directly by the
 //! user, unhappy with env vars specifically for being invisible and easy to
 //! lose track of ("on ne sait jamais où on en est") -- the fix isn't to
 //! delete the env vars and thread a `&CodegenOptions` parameter through

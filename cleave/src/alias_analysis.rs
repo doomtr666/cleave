@@ -1822,8 +1822,9 @@ pub fn collect_elementwise_units(program: &CpsProgram) -> HashMap<String, (Strin
 /// never a shape change) — so aliasing one input's own buffer with the
 /// output is safe *exactly as long as that input is never read again*.
 /// This is the CPS-level fact `doc/plan-affine-ownership.md` §15 calls
-/// for, decided before any MLIR is emitted — unlike `dps_rewrite.rs`'s own
-/// post-`--inline` pattern matching, which can never recognize an extern
+/// for, decided before any MLIR is emitted — unlike post-`--inline`
+/// pattern matching (the since-removed `dps_rewrite.rs`), which can never
+/// recognize an extern
 /// BLAS call the same way (`doc/plan-blas-native.md` §7's own
 /// explicit-destination `blas::sgemm`).
 ///

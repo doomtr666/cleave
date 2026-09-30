@@ -112,6 +112,20 @@ struct LowerCtx<'c, 'm> {
     /// function's own body at a time, start to finish, before moving to the
     /// next), so a plain `Cell<bool>` — not a stack — is enough.
     currently_region_local: std::cell::Cell<bool>,
+    /// `(CVar, read-only view)` pairs a `Tensor` field store queued for the
+    /// enclosing `LetPrim` to rebind in its own `env` -- see
+    /// `build_tensor_descriptor_value`'s own doc comment for why every later
+    /// use of a value stored into a field must go through the field, never
+    /// the original tensor. A queue on the context rather than a `&mut env`
+    /// threaded through `store_field`'s many callers.
+    pending_rebinds: RefCell<Vec<(CVar, Value<'c, 'c>)>>,
+    /// Every read-only `tensor` view this module builds over a struct
+    /// field's own buffer (a field read, or `pending_rebinds`' own views),
+    /// keyed by the view's raw `MlirValue` pointer, mapped to that field's
+    /// descriptor. Lets storing such a view into another field *share* the
+    /// buffer (one more reference) instead of copying it -- recorded where
+    /// the view is created, never recovered by inspecting IR shapes.
+    field_views: RefCell<HashMap<usize, Value<'c, 'c>>>,
     /// Every struct name with at least one real `PrimOp::Struct`
     /// construction site anywhere in the whole program —
     /// `refcount::collect_constructed_struct_names`'s own doc comment has
@@ -482,6 +496,8 @@ pub fn lower_program<'c>(
             struct_schemas,
             region_local_fns,
             currently_region_local: std::cell::Cell::new(false),
+            pending_rebinds: RefCell::new(Vec::new()),
+            field_views: RefCell::new(HashMap::new()),
             constructed_structs,
             field_mutated_structs,
             extern_boundary_structs,
@@ -1797,6 +1813,9 @@ fn lower_cexpr<'c>(
             }
             if let Some(value) = lower_prim_op(ctx, block, &env, *var, op, args, ty) {
                 env.insert(*var, value);
+            }
+            for (rebound, view) in ctx.pending_rebinds.borrow_mut().drain(..) {
+                env.insert(rebound, view);
             }
             lower_cexpr(ctx, block, env, k_ret, result_type, yield_targets, cont);
         }
@@ -3435,16 +3454,42 @@ fn tensor_value_to_ptr<'c>(
 }
 
 /// Builds a `Tensor`-typed field's own descriptor as a bare SSA aggregate
-/// *value* — copies the payload into a fresh, `cleave_alloc_rc`'d buffer
-/// (see this whole mechanism's own original doc comment, preserved below,
-/// for why a defensive copy is required at all), then hand-builds the
-/// `(allocated_ptr, aligned_ptr, offset, sizes[rank], strides[rank])`
-/// descriptor (`memref_descriptor_llvm_type`) entirely via `insertvalue` —
-/// never stored anywhere itself. Shared by `store_native_shape_field`
-/// (which stores the result into a heavy struct's own field pointer) and
-/// `lower_light_struct_construct`'s own tensor-field branch (which
-/// `insertvalue`s it directly into the light struct's own aggregate,
-/// exactly like any other field).
+/// *value* over a fresh, cleave-owned (`alloc_llvm_value`) buffer, and has
+/// the field's tensor **written into that buffer** rather than copied into
+/// it: `bufferization.materialize_in_destination ... restrict writable`.
+/// Shared by `store_native_shape_field` (which stores the result into a
+/// heavy struct's own field pointer) and `lower_light_struct_construct`'s
+/// own tensor-field branch (which `insertvalue`s it into the light struct's
+/// own aggregate).
+///
+/// Why this shape, measured with `mlir-opt` on this exact toolchain before
+/// being built:
+/// - `pipeline.rs`'s `--eliminate-empty-tensors` (run just before One-Shot
+///   Bufferize) makes the tensor's own producer (an elementwise
+///   `linalg.generic`, a `fill`+`matmul`) write straight into the field
+///   buffer -- no scratch buffer, no copy. When no producer can (the value
+///   is a function argument, or already lives in another field), One-Shot
+///   emits the copy itself: correct, just not free. The previous version
+///   always `memcpy`'d into a fresh buffer and relied on a separate pass
+///   (`dps_rewrite.rs`, since removed) pattern-matching the result after
+///   `--inline` to remove it again.
+/// - The elimination needs the destination to *dominate* the producer, so
+///   the whole destination chain (allocation, descriptor, cast) is moved to
+///   just before the value's defining op when that op sits in this same
+///   block (before `--inline`, that op is the producer's `func.call`, which
+///   the inliner replaces in place). A value defined anywhere else (a block
+///   argument, an enclosing block) keeps the chain here -- hoisting it out
+///   of a loop body would reuse one buffer across iterations.
+/// - The field buffer comes from `cleave_alloc_rc`, not `memref.alloc`, so
+///   MLIR's ownership-based deallocation never frees it (confirmed: it only
+///   manages buffers it allocated itself); the struct's own refcount does.
+/// - Once written, the field buffer *is* the tensor's buffer, and One-Shot
+///   treats it as writable: a later op consuming the original tensor as its
+///   own destination would overwrite the struct's field in place (reproduced
+///   directly -- the field ended up holding `r*r` instead of `r`). So every
+///   later use of `arg` is rebound (`LowerCtx::pending_rebinds`) to a
+///   `to_tensor ... restrict` (read-only) view of the field: an in-place
+///   write then becomes a correct copy, and plain reads cost nothing.
 fn build_tensor_descriptor_value<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
@@ -3474,8 +3519,40 @@ fn build_tensor_descriptor_value<'c>(
     let context = ctx.context;
     let location = gen_loc(context);
 
-    // Source data pointer — `tensor_value_to_ptr`'s own doc comment.
-    let src_ptr = tensor_value_to_ptr(ctx, block, value, field_ty);
+    // Already a read-only view of some field's buffer (`LowerCtx::field_
+    // views`): share that buffer -- one more reference, no allocation, no
+    // copy. Sound because a field buffer is only ever written once, by the
+    // `materialize_in_destination` that created it; every later access goes
+    // through `restrict`-only views One-Shot will not write through.
+    let shared = ctx.field_views.borrow().get(&(value.to_raw().ptr as usize)).copied();
+    if let Some(descriptor_val) = shared {
+        let ptr_ty = llvm::r#type::pointer(context, 0);
+        let allocated_ptr: Value = block
+            .append_operation(llvm::extract_value(
+                context,
+                descriptor_val,
+                DenseI64ArrayAttribute::new(context, &[0]),
+                ptr_ty,
+                location,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        emit_cleave_retain(ctx, block, field_ty, allocated_ptr);
+        return descriptor_val;
+    }
+
+    // The value's own defining op, when it sits in this same block -- where
+    // the destination chain must go (see the doc comment above). Built into
+    // a detached staging block first, then moved there in one go.
+    let producer = melior::ir::operation::OperationResult::try_from(value)
+        .ok()
+        .map(|r| r.owner())
+        .filter(|op| op.block().is_some_and(|b| b.to_raw().ptr == block.to_raw().ptr))
+        .map(|op| op.to_raw());
+    let staging = Block::new(&[]);
+    let block_ref: &Block<'c> = block;
+    let dest_block: &Block<'c> = if producer.is_some() { &staging } else { block_ref };
 
     let i64_ty: Type = IntegerType::new(context, 64).into();
     // Fresh, `cleave_alloc_rc`'d destination — sized as a flat `!llvm.array`
@@ -3483,17 +3560,8 @@ fn build_tensor_descriptor_value<'c>(
     // type" contract exactly the way a struct-leaf array already uses it.
     let total_elems: u32 = dims.iter().product::<i64>() as u32;
     let flat_array_ty = llvm::r#type::array(elem_mlir_ty, total_elems);
-    let dest_ptr = alloc_llvm_value(ctx, block, flat_array_ty, None);
-    let size = llvm_type_size_bytes(ctx, block, flat_array_ty);
-    let is_volatile = Attribute::parse(context, "false")
-        .unwrap_or_else(|| panic!("MLIR lowering: failed to parse `false` attribute"));
-    block.append_operation(
-        OperationBuilder::new("llvm.intr.memcpy", location)
-            .add_operands(&[dest_ptr, src_ptr, size])
-            .add_attributes(&[(Identifier::new(context, "isVolatile"), is_volatile)])
-            .build()
-            .unwrap_or_else(|e| panic!("MLIR lowering: failed to build llvm.intr.memcpy: {e}")),
-    );
+    let dest_ptr = alloc_llvm_value(ctx, dest_block, flat_array_ty, None);
+    let block = dest_block;
 
     // Hand-built descriptor — `memref_descriptor_llvm_type`'s own confirmed
     // `(allocated_ptr, aligned_ptr, offset, sizes[rank], strides[rank])`
@@ -3585,6 +3653,54 @@ fn build_tensor_descriptor_value<'c>(
             .result(0)
             .unwrap()
             .into();
+    }
+
+    let memref_ty: Type = MemRefType::new(elem_mlir_ty, &dims, None, None).into();
+    let cast = OperationBuilder::new("builtin.unrealized_conversion_cast", location)
+        .add_operands(&[descriptor_val])
+        .add_results(&[memref_ty])
+        .build()
+        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build unrealized_conversion_cast: {e}"));
+    let dest_memref: Value = block.append_operation(cast).result(0).unwrap().into();
+
+    let block = block_ref;
+    if let Some(producer) = producer {
+        while let Some(op) = staging.first_operation() {
+            // `move_before` needs an `OperationRefMut`; both ref kinds wrap
+            // the identical `MlirOperation` (melior's own `walk_mut` widens
+            // the same way).
+            let mut op = unsafe { melior::ir::operation::OperationRefMut::from_raw(op.to_raw()) };
+            op.move_before(unsafe { melior::ir::operation::OperationRef::from_raw(producer) });
+        }
+    }
+
+    let unit = Attribute::parse(context, "unit")
+        .unwrap_or_else(|| panic!("MLIR lowering: failed to parse `unit` attribute"));
+    block.append_operation(
+        OperationBuilder::new("bufferization.materialize_in_destination", location)
+            .add_operands(&[value, dest_memref])
+            .add_attributes(&[
+                (Identifier::new(context, "restrict"), unit),
+                (Identifier::new(context, "writable"), unit),
+            ])
+            .build()
+            .unwrap_or_else(|e| {
+                panic!("MLIR lowering: failed to build bufferization.materialize_in_destination: {e}")
+            }),
+    );
+
+    if let CVal::Var(var) = arg {
+        let view = OperationBuilder::new("bufferization.to_tensor", location)
+            .add_operands(&[dest_memref])
+            .add_attributes(&[(Identifier::new(context, "restrict"), unit)])
+            .add_results(&[native_ty])
+            .build()
+            .unwrap_or_else(|e| panic!("MLIR lowering: failed to build bufferization.to_tensor: {e}"));
+        let view: Value = block.append_operation(view).result(0).unwrap().into();
+        ctx.field_views
+            .borrow_mut()
+            .insert(view.to_raw().ptr as usize, descriptor_val);
+        ctx.pending_rebinds.borrow_mut().push((*var, view));
     }
     descriptor_val
 }
@@ -3719,7 +3835,11 @@ fn descriptor_value_to_tensor<'c>(
         .add_results(&[native_ty])
         .build()
         .unwrap_or_else(|e| panic!("MLIR lowering: failed to build bufferization.to_tensor: {e}"));
-    block.append_operation(to_tensor).result(0).unwrap().into()
+    let view: Value = block.append_operation(to_tensor).result(0).unwrap().into();
+    ctx.field_views
+        .borrow_mut()
+        .insert(view.to_raw().ptr as usize, descriptor_val);
+    view
 }
 
 fn load_native_shape_field<'c>(
@@ -4108,12 +4228,12 @@ fn declared_ptr_sig_ty(ctx: &LowerCtx<'_, '_>, rc_ty: &Ty) -> Ty {
 /// Cascades a struct's own release into every refcounted field it holds,
 /// then releases the struct itself — the general fix `PrimOp::Release`'s
 /// own doc comment (`cps.rs`) flags as still needed: `cleave_release` on
-/// its own is flat, and a struct's own tensor-typed field, since `store_
-/// native_shape_field`'s own fix, is *always* an independently `cleave_
-/// alloc_rc`'d payload uniquely owned by that one field (tensors are
-/// copied, never aliased, on every store — no retain-on-store needed for
-/// them the way an *existing* struct value being embedded needs, `rewrite_
-/// body`'s own doc comment) — releasing the container without also
+/// its own is flat, and a struct's own tensor-typed field always holds
+/// exactly one reference to its `cleave_alloc_rc`'d payload: either a
+/// buffer freshly allocated for it (`build_tensor_descriptor_value`, the
+/// value written straight into it), or another field's buffer it shares,
+/// in which case that store took its own `cleave_retain` — releasing the
+/// container without also
 /// releasing it just leaks it, unconditionally, on every single
 /// replacement (found by direct testing: `examples/mnist-interop`'s own
 /// real training run, `Optimizer::step` replacing `net`/`state` every
@@ -5500,220 +5620,36 @@ fn build_to_buffer_dynamic_layout<'c>(
     block.append_operation(built).result(0).unwrap().into()
 }
 
-/// The `tensor.empty()`-shaped seed every genuinely-overwritten tensor
-/// computation below needs (matmul's own `linalg.fill`, transpose/broadcast0/
-/// reduce0/elementwise_binop/relu_elemwise's own unconditional `outs`
-/// overwrite) — plain `tensor.empty()` (MLIR's own "uninitialized, don't-
-/// care" placeholder, backed by whatever `--one-shot-bufferize` decides much
-/// later, today unconditionally a plain heap `malloc`, `unify_alloc.rs`'s own
-/// module doc comment) when the function *currently being lowered* isn't
-/// region-local — otherwise, a real, already-`cleave_alloc_local`'d buffer,
-/// built the same way *right now*, at initial construction, rather than left
-/// to bufferization to decide anonymously later.
+/// The `tensor.empty()` seed every genuinely-overwritten tensor computation
+/// below needs (matmul's own `linalg.fill`, transpose/broadcast0/reduce0/
+/// elementwise_binop/relu_elemwise's own unconditional `outs` overwrite):
+/// MLIR's own "uninitialized, don't-care" placeholder, given real storage by
+/// One-Shot Bufferize later.
 ///
-/// **The exact same per-function decision `alloc_llvm_value` already makes
-/// for struct/array construction — `ctx.currently_region_local` — extended
-/// to cover the one case that mechanism could never reach on its own**
-/// (`doc/backlog.md`'s own "the bridge between which functions are safe and
-/// how a tensor's own bufferized storage gets allocated is missing"
-/// finding): `alloc_llvm_value` itself does the actual `cleave_alloc_rc`-vs-
-/// `cleave_alloc_local` branching (reused directly here, not reimplemented —
-/// this function only has to build the *tensor-shaped view* of whatever
-/// pointer it returns), so there is exactly one place in this whole compiler
-/// that ever decides which allocator backs a given construction, uniformly,
-/// for both structs and tensors. No new runtime primitive, no explicit
-/// region-handle data dependency threaded through the CPS/MLIR term at all
-/// (a real alternative design, considered and set aside): `cleave_alloc_
-/// local`'s own `handle` parameter is already never read at runtime
-/// (`cleave-rt::cleave_alloc_local`'s own doc comment — correctness comes
-/// entirely from `REGION_DEPTH` being genuinely nonzero at the call), and
-/// `region_analysis`'s own precondition (a region-local function has
-/// *exactly one* call site, itself inside a loop) already guarantees some
-/// region is genuinely open at runtime the moment this call executes,
-/// structurally, with no data-flow proof needed — deciding this once, per
-/// function, at *initial* lowering time (while function identity is still
-/// fully intact, unlike the much later, post-`--inline` stage `unify_alloc.
-/// rs` runs at) is exactly as sound as the already-proven-correct struct
-/// mechanism, and needs none of the machinery a later-stage recovery would.
-///
-/// Builds the identical hand-rolled descriptor `store_native_shape_field`
-/// already builds for the opposite direction (a tensor value written *into*
-/// a struct field) and `dps_rewrite.rs` builds a third time for its own
-/// destination-passing rewrite — mirrored here rather than factored into a
-/// shared helper, matching this project's own established precedent for
-/// this specific idiom (`dps_rewrite.rs`'s own doc comment on its identical
-/// descriptor-building code: "the same... trick `load_native_shape_field`
-/// already relies on, in reverse... mirrored here, not reinvented").
-/// `restrict` **and** `writable` both set (unlike `load_native_shape_field`'s
-/// own read-only `restrict`-alone use): this is a genuine, fresh write
-/// destination — exactly as safe as `dps_rewrite.rs`'s own `Strategy::
-/// Overwrite` already establishes for a `tensor.empty()`-seeded computation,
-/// unconditionally overwritten by whatever real op consumes this result next
-/// (a `linalg.fill`, or an `outs` no other op in its own region ever reads).
+/// Always a plain `tensor.empty()`, including inside a region-local function.
+/// An earlier version allocated the seed from the arena right here
+/// (`cleave_alloc_local` + `to_tensor restrict writable`) in that case, which
+/// left `--eliminate-empty-tensors` nothing to eliminate: a result stored into
+/// a struct field then went through a full copy into the field's own buffer
+/// (measured on `examples/mnist-interop`: one 784x512 weight-gradient copy per
+/// training step, from `net_grad`). With a real `tensor.empty()`, the
+/// producer writes straight into the field (`build_tensor_descriptor_value`'s
+/// own doc comment). The field buffer itself still follows `alloc_llvm_value`'s
+/// arena-vs-heap decision; only an unstored temporary now goes through
+/// One-Shot's allocation (the pooled `cleave_alloc_rc`, `unify_alloc.rs`)
+/// instead of the arena.
 fn tensor_seed<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, result_ty: Type<'c>) -> Value<'c, 'c> {
-    let context = ctx.context;
-    let location = gen_loc(context);
-    if !ctx.currently_region_local.get() {
-        return block
-            .append_operation(
-                OperationBuilder::new("tensor.empty", location)
-                    .add_results(&[result_ty])
-                    .build()
-                    .unwrap_or_else(|e| panic!("MLIR lowering: failed to build tensor.empty: {e}")),
-            )
-            .result(0)
-            .unwrap()
-            .into();
-    }
-
-    let tensor_ty = RankedTensorType::try_from(result_ty).unwrap_or_else(|e| {
-        panic!("MLIR lowering: tensor_seed's own result must be a ranked tensor: {e}")
-    });
-    let elem_mlir_ty = tensor_ty.element();
-    let rank = tensor_ty.rank();
-    let mut dims = Vec::with_capacity(rank);
-    for i in 0..rank {
-        // Cleave tensors are always statically, fully shaped -- see
-        // `dps_rewrite.rs`'s own identical check for the same reasoning.
-        match tensor_ty.dim_size(i).unwrap_or_else(|e| {
-            panic!("MLIR lowering: tensor_seed couldn't read dimension {i}: {e}")
-        }) {
-            DimSize::Static(size) => dims.push(size as i64),
-            DimSize::Dynamic => panic!(
-                "MLIR lowering: tensor_seed's own result has a dynamic dimension -- cleave tensors are always statically shaped"
-            ),
-        }
-    }
-
-    // Fresh destination -- sized as a flat `!llvm.array` of every element,
-    // matching `store_native_shape_field`'s own identical construction (and,
-    // through it, `alloc_llvm_value`'s own generic "any LLVM type" contract).
-    // `alloc_llvm_value` is what actually picks `cleave_alloc_rc` vs `cleave_
-    // alloc_local` here -- `ctx.currently_region_local` is already known
-    // `true` at this point (checked above), so this always draws from the
-    // arena.
-    let total_elems: u32 = dims.iter().product::<i64>() as u32;
-    let flat_array_ty = llvm::r#type::array(elem_mlir_ty, total_elems);
-    let dest_ptr = alloc_llvm_value(ctx, block, flat_array_ty, None);
-
-    // Hand-built descriptor -- `memref_descriptor_llvm_type`'s own confirmed
-    // `(allocated_ptr, aligned_ptr, offset, sizes[rank], strides[rank])`
-    // layout, row-major strides (cleave's own tensors are always statically,
-    // fully shaped -- no dynamic dimension to account for), byte-for-byte
-    // the same construction `store_native_shape_field` already does.
-    let i64_ty: Type = IntegerType::new(context, 64).into();
-    let descriptor_ty = memref_descriptor_llvm_type(context, dims.len());
-    let zero_i64: Value = block
-        .append_operation(arith::constant(
-            context,
-            IntegerAttribute::new(i64_ty, 0).into(),
-            location,
-        ))
+    let location = gen_loc(ctx.context);
+    block
+        .append_operation(
+            OperationBuilder::new("tensor.empty", location)
+                .add_results(&[result_ty])
+                .build()
+                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build tensor.empty: {e}")),
+        )
         .result(0)
         .unwrap()
-        .into();
-    let mut descriptor_val: Value = block
-        .append_operation(llvm::poison(descriptor_ty, location))
-        .result(0)
-        .unwrap()
-        .into();
-    for pos in [0i64, 1] {
-        descriptor_val = block
-            .append_operation(llvm::insert_value(
-                context,
-                descriptor_val,
-                DenseI64ArrayAttribute::new(context, &[pos]),
-                dest_ptr,
-                location,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-    }
-    descriptor_val = block
-        .append_operation(llvm::insert_value(
-            context,
-            descriptor_val,
-            DenseI64ArrayAttribute::new(context, &[2]),
-            zero_i64,
-            location,
-        ))
-        .result(0)
-        .unwrap()
-        .into();
-    let mut stride = 1i64;
-    let mut strides = vec![0i64; dims.len()];
-    for i in (0..dims.len()).rev() {
-        strides[i] = stride;
-        stride *= dims[i];
-    }
-    for (i, &dim) in dims.iter().enumerate() {
-        let dim_val: Value = block
-            .append_operation(arith::constant(
-                context,
-                IntegerAttribute::new(i64_ty, dim).into(),
-                location,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        descriptor_val = block
-            .append_operation(llvm::insert_value(
-                context,
-                descriptor_val,
-                DenseI64ArrayAttribute::new(context, &[3, i as i64]),
-                dim_val,
-                location,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        let stride_val: Value = block
-            .append_operation(arith::constant(
-                context,
-                IntegerAttribute::new(i64_ty, strides[i]).into(),
-                location,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        descriptor_val = block
-            .append_operation(llvm::insert_value(
-                context,
-                descriptor_val,
-                DenseI64ArrayAttribute::new(context, &[4, i as i64]),
-                stride_val,
-                location,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-    }
-
-    let memref_ty: Type = MemRefType::new(elem_mlir_ty, &dims, None, None).into();
-    let cast = OperationBuilder::new("builtin.unrealized_conversion_cast", location)
-        .add_operands(&[descriptor_val])
-        .add_results(&[memref_ty])
-        .build()
-        .unwrap_or_else(|e| {
-            panic!("MLIR lowering: failed to build unrealized_conversion_cast: {e}")
-        });
-    let memref_val: Value = block.append_operation(cast).result(0).unwrap().into();
-
-    let restrict = Attribute::parse(context, "unit")
-        .unwrap_or_else(|| panic!("MLIR lowering: failed to parse `unit` attribute"));
-    let writable = Attribute::parse(context, "unit")
-        .unwrap_or_else(|| panic!("MLIR lowering: failed to parse `unit` attribute"));
-    let to_tensor = OperationBuilder::new("bufferization.to_tensor", location)
-        .add_operands(&[memref_val])
-        .add_attributes(&[
-            (Identifier::new(context, "restrict"), restrict),
-            (Identifier::new(context, "writable"), writable),
-        ])
-        .add_results(&[result_ty])
-        .build()
-        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build bufferization.to_tensor: {e}"));
-    block.append_operation(to_tensor).result(0).unwrap().into()
+        .into()
 }
 
 /// Builds `A @ B` (`Tensor<T,N,M> x Tensor<T,M,K> -> Tensor<T,N,K>`) as a
