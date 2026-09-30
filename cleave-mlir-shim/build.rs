@@ -13,6 +13,18 @@ fn main() {
     cc::Build::new()
         .cpp(true)
         .std("c++17")
+        // Always the release CRT/STL (`/MD`, no `_DEBUG`, `_ITERATOR_DEBUG_
+        // LEVEL=0`), whatever cargo profile is building this crate: the
+        // vendored `libMLIR*`/`LLVM*` are release builds, and this shim
+        // hands them STL objects (`ExecutionEngineOptions::transformer` is
+        // a `std::function`). Under a debug cargo profile `cc-rs` would
+        // default to `/MDd`, giving those objects a different layout than
+        // the release code calling them expects -- found as a hard
+        // `STATUS_STACK_BUFFER_OVERRUN` in every `dev`-profile build (build
+        // scripts included) the moment the shim built its own
+        // `std::function` wrapper instead of just copying upstream's.
+        .opt_level(2)
+        .debug(false)
         // Matches the exact settings the vendored LLVM/MLIR toolchain was
         // itself built with (`LLVM_ENABLE_RTTI=OFF`/`LLVM_ENABLE_EH=OFF`,
         // confirmed directly against `I:/Dev/llvm-project/build/

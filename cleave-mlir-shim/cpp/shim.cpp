@@ -28,10 +28,68 @@
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.h"
 #include "llvm/ExecutionEngine/Orc/Mangling.h"
+#include "llvm/IR/Attributes.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/Module.h"
+#include "llvm/Support/ModRef.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/TargetParser/Host.h"
 
 using namespace mlir;
+
+// Tells LLVM what the `cleave-rt` allocator entry points *are*, the way clang
+// annotates `malloc`/`free` (`allockind`/`allocsize`/`alloc-family`, `noalias`
+// return, `inaccessiblemem` effects), so its own store forwarding, memcpy
+// elision and alloc/free pairing can apply. Only facts that are true are
+// declared: `cleave_alloc_rc`/`cleave_alloc_pool` return fresh, unaliased
+// memory; `cleave_release_pool` frees its block unconditionally.
+//
+// Deliberately **not** declared: `cleave_release`/`cleave_release_void` as
+// `free`. They only decrement a refcount and free at zero, so telling LLVM
+// they free would let it drop stores to a block another holder still reads
+// (measured on `examples/mnist-interop` with the promise made anyway, as a
+// ceiling: 52 -> 31 `cleave_alloc_rc` call sites, but semantically wrong).
+// A release becomes declarable as `free` only where the block is proven
+// unique.
+//
+// Measured effect of the sound subset on the mnist kernel: 52 -> 46
+// `cleave_alloc_rc` sites, 48 -> 34 releases, 18 -> 16 `memcpy` sites.
+static void annotateAllocators(llvm::Module &m) {
+  // `using namespace mlir` above makes bare `Attribute`/`MemoryEffects`
+  // ambiguous against `llvm::` -- spelled out instead.
+  using LAttr = llvm::Attribute;
+  using LMem = llvm::MemoryEffects;
+  auto &c = m.getContext();
+  auto markAlloc = [&](llvm::StringRef name, unsigned sizeArg) {
+    llvm::Function *f = m.getFunction(name);
+    if (!f)
+      return;
+    f->addFnAttr(LAttr::get(
+        c, LAttr::AllocKind,
+        uint64_t(llvm::AllocFnKind::Alloc | llvm::AllocFnKind::Uninitialized)));
+    f->addFnAttr(LAttr::getWithAllocSizeArgs(c, sizeArg, std::nullopt));
+    f->addFnAttr(LAttr::get(c, "alloc-family", "cleave"));
+    f->addFnAttr(LAttr::NoUnwind);
+    f->addFnAttr(LAttr::WillReturn);
+    f->setMemoryEffects(LMem::inaccessibleMemOnly());
+    f->addRetAttr(LAttr::NoAlias);
+  };
+  auto markFree = [&](llvm::StringRef name) {
+    llvm::Function *f = m.getFunction(name);
+    if (!f)
+      return;
+    f->addFnAttr(
+        LAttr::get(c, LAttr::AllocKind, uint64_t(llvm::AllocFnKind::Free)));
+    f->addFnAttr(LAttr::get(c, "alloc-family", "cleave"));
+    f->addFnAttr(LAttr::NoUnwind);
+    f->addFnAttr(LAttr::WillReturn);
+    f->setMemoryEffects(LMem::argMemOnly() | LMem::inaccessibleMemOnly());
+    f->addParamAttr(0, LAttr::AllocatedPointer);
+  };
+  markAlloc("cleave_alloc_rc", 0);
+  markAlloc("cleave_alloc_pool", 0);
+  markFree("cleave_release_pool");
+}
 
 extern "C" MlirExecutionEngine cleaveExecutionEngineCreateWithTarget(
     MlirModule op, int optLevel, int numPaths,
@@ -126,7 +184,10 @@ extern "C" MlirExecutionEngine cleaveExecutionEngineCreateWithTarget(
   auto transformer = mlir::makeOptimizingTransformer(
       optLevel, /*sizeLevel=*/0, /*targetMachine=*/tmOrError->get());
   ExecutionEngineOptions jitOptions;
-  jitOptions.transformer = transformer;
+  jitOptions.transformer = [transformer](llvm::Module *m) -> llvm::Error {
+    annotateAllocators(*m);
+    return transformer(m);
+  };
   jitOptions.jitCodeGenOptLevel = static_cast<llvm::CodeGenOptLevel>(optLevel);
   jitOptions.sharedLibPaths = libPaths;
   jitOptions.enableObjectDump = enableObjectDump;

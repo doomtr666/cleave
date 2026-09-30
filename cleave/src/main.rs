@@ -16,7 +16,8 @@
 //! do (CPS conversion, ...).
 
 use cleave::cps::{
-    collect_mlir_types, collect_struct_schemas, dump_cps_program, eliminate_dead_code,
+    collect_mlir_types, collect_struct_schemas, dump_cps_program, dump_cps_program_readable,
+    eliminate_dead_code,
 };
 use cleave::diag::SourceMap;
 use cleave::driver::compile;
@@ -43,6 +44,7 @@ struct Args {
     dump_monomorphized: bool,
     dump_cps: bool,
     dump_cps_optimized: bool,
+    dump_cps_readable: bool,
     dump_cps_equivalences: bool,
     dump_mlir: bool,
     dump_mlir_lowered: bool,
@@ -78,6 +80,7 @@ fn parse_args() -> Result<Args, String> {
     let mut dump_monomorphized = false;
     let mut dump_cps = false;
     let mut dump_cps_optimized = false;
+    let mut dump_cps_readable = false;
     let mut dump_cps_equivalences = false;
     let mut dump_mlir = false;
     let mut dump_mlir_lowered = false;
@@ -109,6 +112,7 @@ fn parse_args() -> Result<Args, String> {
             "--dump-monomorphized" => dump_monomorphized = true,
             "--dump-cps" => dump_cps = true,
             "--dump-cps-optimized" => dump_cps_optimized = true,
+            "--dump-cps-readable" => dump_cps_readable = true,
             "--dump-cps-equivalences" => dump_cps_equivalences = true,
             "--dump-mlir" => dump_mlir = true,
             "--dump-mlir-lowered" => dump_mlir_lowered = true,
@@ -212,6 +216,7 @@ fn parse_args() -> Result<Args, String> {
         && !dump_monomorphized
         && !dump_cps
         && !dump_cps_optimized
+        && !dump_cps_readable
         && !dump_cps_equivalences
         && !dump_mlir
         && !dump_mlir_lowered
@@ -232,6 +237,7 @@ fn parse_args() -> Result<Args, String> {
             dump_monomorphized,
             dump_cps,
             dump_cps_optimized,
+            dump_cps_readable,
             dump_cps_equivalences,
             dump_mlir,
             dump_mlir_lowered,
@@ -257,7 +263,7 @@ fn parse_args() -> Result<Args, String> {
         }),
         None => Err(
             "usage: cleave <file.cleave> [--dump-ast] [--dump-inference-pass] [--dump-monomorphized] [--dump-cps] \
-             [--dump-cps-optimized] [--dump-cps-equivalences] [--dump-mlir] [--dump-mlir-lowered] [--dump-defines] [--run] \
+             [--dump-cps-optimized] [--dump-cps-readable] [--dump-cps-equivalences] [--dump-mlir] [--dump-mlir-lowered] [--dump-defines] [--run] \
              [--emit-object <path>] [--emit-bindings <path>] [--emit-exe <path>] \
              [--opt-level <0-3>] [--openmp | --no-openmp] [--target-cpu <name>] [--target-features <+f,-f,...>] \
              [--backend cpu] [--inline | --no-inline] [--unroll-jam | --no-unroll-jam] \
@@ -422,6 +428,7 @@ fn real_main() -> ExitCode {
         args.dump_monomorphized,
         args.dump_cps,
         args.dump_cps_optimized,
+        args.dump_cps_readable,
         args.dump_cps_equivalences,
         args.dump_mlir,
         args.dump_mlir_lowered,
@@ -563,6 +570,45 @@ fn real_main() -> ExitCode {
                         &escaping,
                     );
                     print!("{}", dump_cps_program(&optimized));
+                }
+                Err(errs) => {
+                    for e in &errs {
+                        eprintln!("error: {e}");
+                    }
+                    exit = ExitCode::FAILURE;
+                }
+            }
+        }
+    }
+
+    if args.dump_cps_readable {
+        if multiple {
+            println!("--- cps (readable) ---\n");
+        }
+        // Identical pipeline to `--dump-cps-optimized` above, right down to
+        // the two-sweep dead-code elimination and refcounting -- only the
+        // final rendering differs (`dump_cps_program_readable`'s own doc
+        // comment: a flattened, direct-style form of the exact same
+        // optimized-and-refcounted program, not a different snapshot of it).
+        let registry = Registry::build_with_defines(&program, &args.defines, cleave_openmp).0;
+        if let Err(diags) = check_type_errors(&program, &registry) {
+            report(&diags, &sources);
+            exit = ExitCode::FAILURE;
+        } else {
+            match build_cps_program(&program, &registry, None) {
+                Ok(cps_program) => {
+                    let (optimized, _) = optimize_program(cps_program, &registry, false);
+                    let optimized = eliminate_dead_code(optimized);
+                    let struct_schemas = collect_struct_schemas(&program);
+                    let mlir_types = collect_mlir_types(&program);
+                    let escaping = cleave::escape::escaping_struct_vars(&optimized);
+                    let optimized = cleave::refcount::insert_refcounting(
+                        optimized,
+                        &struct_schemas,
+                        &mlir_types,
+                        &escaping,
+                    );
+                    print!("{}", dump_cps_program_readable(&optimized));
                 }
                 Err(errs) => {
                     for e in &errs {

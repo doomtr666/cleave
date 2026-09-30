@@ -1,5 +1,6 @@
 use cleave::cps::{
-    ConcreteUnit, collect_units, convert_program, dump_cps_program, eliminate_dead_code,
+    ConcreteUnit, collect_units, convert_program, dump_cps_program, dump_cps_program_readable,
+    eliminate_dead_code,
 };
 use cleave::driver::compile;
 use cleave::registry::Registry;
@@ -13,6 +14,58 @@ fn cps(src: &str) -> String {
     let units = collect_units(&program, &registry);
     let cps_program = convert_program(units, None);
     dump_cps_program(&cps_program)
+}
+
+/// Like `cps`, but renders `--dump-cps-readable`'s flattened, direct-style
+/// form instead of the nested S-expr one.
+fn readable(src: &str) -> String {
+    let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
+    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+    let registry = Registry::build(&program);
+    let units = collect_units(&program, &registry);
+    let cps_program = convert_program(units, None);
+    dump_cps_program_readable(&cps_program)
+}
+
+/// `label`'s own analogue for `readable`'s output: that helper searches for
+/// the parenthesized `(prefix$N ` form `dump_cps_program` prints; this
+/// rendering writes `prefix$N(` instead, with no leading paren -- and,
+/// since execution order now puts a *use* of the label (a call passing it
+/// as a trailing continuation argument, immediately followed by `)`) before
+/// its own *definition* (immediately followed by `(`), this specifically
+/// finds the definition site, not just the first occurrence of `prefix$`.
+fn label_readable<'a>(block: &'a str, prefix: &str) -> &'a str {
+    let needle = format!("{prefix}$");
+    let mut search_from = 0usize;
+    loop {
+        let rel = block[search_from..].find(&needle).unwrap_or_else(|| {
+            panic!("no `{prefix}$N(...)` definition found in:\n{block}")
+        });
+        let start = search_from + rel;
+        let after_needle = start + needle.len();
+        let digits_len = block[after_needle..]
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(block.len() - after_needle);
+        let end = after_needle + digits_len;
+        if block[end..].starts_with('(') {
+            return &block[start..end];
+        }
+        search_from = end;
+    }
+}
+
+/// `fn_block`'s own analogue for `readable`'s output: a block runs from
+/// `fn {name}(` up to (but not including) the next top-level `\nfn `, or the
+/// end of the dump if `name`'s own block is the last one printed -- unlike
+/// the parenthesized form, this syntax carries no balanced delimiter of its
+/// own to search for instead.
+fn fn_block_readable<'a>(dump: &'a str, name: &str) -> &'a str {
+    let start = dump
+        .find(&format!("fn {name}("))
+        .unwrap_or_else(|| panic!("no `fn {name}(...)` block found in:\n{dump}"));
+    let rest = &dump[start..];
+    let end = rest.find("\nfn ").unwrap_or(rest.len());
+    &rest[..end]
 }
 
 /// Like `cps`, but returns the raw `ConcreteUnit`s themselves rather than
@@ -925,4 +978,142 @@ fn dead_code_elimination_after_optimization_drops_specializations_the_axioms_fol
     );
     assert!(names_after.contains(&"helper"), "got: {names_after:?}");
     assert!(names_after.contains(&"main"), "got: {names_after:?}");
+}
+
+#[test]
+fn readable_dump_keeps_fix_and_continuations_but_prints_the_call_before_its_continuation() {
+    // `dump_cps_program`'s own nested form prints `helper`'s own call
+    // *last* (innermost paren), after the `k$N (vN) ...` continuation that
+    // receives its result -- backwards from execution order. The readable
+    // form must keep the exact same real structure (a `fix`, a named
+    // continuation, the call's own trailing continuation argument) but
+    // print the call first and the continuation's own definition right
+    // below it.
+    let out = readable(
+        "fn helper(a: f64, b: f64) -> f64 { add(a, b) }
+         fn main() -> f64 { helper(1.0, 2.0) }",
+    );
+    let block = fn_block_readable(&out, "main");
+    let k = label_readable(block, "k");
+    let call_pos = block
+        .find(&format!("helper(1, 2, {k})"))
+        .unwrap_or_else(|| panic!("call must pass its own continuation as trailing arg, got:\n{block}"));
+    let cont_def_pos = block
+        .find(&format!("{k}("))
+        .filter(|&p| p != call_pos)
+        .unwrap_or_else(|| panic!("continuation's own definition must appear separately, got:\n{block}"));
+    assert!(
+        call_pos < cont_def_pos,
+        "the call must print before the continuation it leads into, got:\n{block}"
+    );
+}
+
+#[test]
+fn readable_dump_prints_execution_order_top_to_bottom() {
+    // `Optimizer::step`-style chain (`stdlib/optim/optim.cleave`'s own
+    // `Sgd` impl): two real calls in sequence, the first's result feeding
+    // the second. The nested `(fix ...)` form prints the *second* call
+    // first (`dump_cps_program`'s own doc comment) -- this rendering must
+    // not have that inversion: `scale`'s own call must appear textually
+    // before `sub`'s.
+    let out = readable(
+        "fn scale(x: f64, k: f64) -> f64 { mul(x, k) }
+         fn combine(model: f64, grad: f64, lr: f64) -> f64 {
+             sub(model, scale(grad, lr))
+         }
+         fn main() -> f64 { combine(1.0, 2.0, 0.1) }",
+    );
+    let block = fn_block_readable(&out, "combine");
+    // `scale` is a plain user-defined top-level fn (prints bare); `sub`
+    // resolves to the stdlib's `Ring::sub<f64>` specialization (prints with
+    // its own generic suffix) -- neither is a literal `"sub("` substring.
+    let scale_pos = block.find("scale(").expect(block);
+    let sub_pos = block.find("Ring::sub<f64>(").expect(block);
+    assert!(
+        scale_pos < sub_pos,
+        "execution order (scale before sub) must match printed order, got:\n{block}"
+    );
+}
+
+#[test]
+fn readable_dump_uses_indentation_instead_of_paren_nesting() {
+    let out = readable(
+        "fn helper(a: f64, b: f64) -> f64 { add(a, b) }
+         fn main() -> f64 { helper(1.0, 2.0) }",
+    );
+    let block = fn_block_readable(&out, "main");
+    // No line consists of nothing but closing parens (`dump_cps_program`'s
+    // own trailing `)`/`)\n)\n)...` lines, one per level of nesting closed)
+    // -- nesting is closed by dedenting instead.
+    assert!(
+        !block
+            .lines()
+            .any(|l| !l.trim().is_empty() && l.trim().chars().all(|c| c == ')')),
+        "got:\n{block}"
+    );
+    // A continuation's own body must be indented one level deeper than the
+    // call that invokes it.
+    let k = label_readable(block, "k");
+    let call_line = block
+        .lines()
+        .find(|l| l.contains(&format!("helper(1, 2, {k})")))
+        .unwrap();
+    let def_line = block
+        .lines()
+        .find(|l| l.trim_start().starts_with(&format!("{k}(")))
+        .unwrap();
+    let body_line = block
+        .lines()
+        .skip_while(|l| *l != def_line)
+        .nth(1)
+        .unwrap_or_else(|| panic!("continuation must have its own body line, got:\n{block}"));
+    let indent_of = |l: &str| l.len() - l.trim_start().len();
+    assert_eq!(indent_of(call_line), indent_of(def_line), "got:\n{block}");
+    assert!(
+        indent_of(body_line) > indent_of(def_line),
+        "got:\n{block}"
+    );
+}
+
+#[test]
+fn readable_dump_renders_if_else_as_an_explicit_indented_block() {
+    let out = readable("fn f(x: i32) -> i32 { if x > 0 { 1 } else { 2 } }");
+    let block = fn_block_readable(&out, "f");
+    assert!(
+        block.contains("if ") && block.contains("else:"),
+        "got:\n{block}"
+    );
+    // The join continuation (`fix`'s own `dump_cps_program` semantics --
+    // just reordered/reindented here, never removed) is still a real,
+    // separately named block, still tail-called by name from each arm.
+    let j = label_readable(block, "j");
+    assert_eq!(
+        block.matches(&format!("{j}(")).count(),
+        3,
+        "one definition plus one tail call per arm, got:\n{block}"
+    );
+}
+
+#[test]
+fn readable_dump_renders_a_for_loop_as_a_named_self_recursive_continuation() {
+    let out = readable(
+        "fn g(n: i32) -> i32 {
+            let mut acc = 0;
+            for i in 0..n {
+                acc = add(acc, i);
+            };
+            acc
+        }",
+    );
+    let block = fn_block_readable(&out, "g");
+    let l = label_readable(block, "loop");
+    assert!(
+        block.contains(&format!("{l}(")),
+        "got:\n{block}"
+    );
+    assert!(
+        block.matches(&format!("{l}(")).count() >= 2,
+        "the loop's own initial call, its own definition, and its own \
+         recursive tail call must all name the same continuation, got:\n{block}"
+    );
 }

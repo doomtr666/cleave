@@ -3835,6 +3835,116 @@ fn indent(out: &mut String, depth: usize) {
     }
 }
 
+/// `--dump-cps-readable` -- the *same* CPS structure `dump_cps_program`
+/// prints (`fix`, a continuation's own name and params, a real call's
+/// trailing continuation argument -- nothing renamed, nothing collapsed
+/// away), just reordered and reindented so it's actually legible:
+///
+/// - **Execution order, top to bottom.** `dump_cexpr`'s own `Fix` case
+///   prints its `defs` (continuation definitions) *before* `body` (the
+///   call that actually runs first and eventually invokes one of them) --
+///   correct, but backwards to read: the deepest-nested, last-printed
+///   `App` is what executes first. This prints `body` first, then each
+///   continuation's own definition right below it, so a reader's eye
+///   moves the same direction execution does.
+/// - **Indentation instead of paren-nesting.** Depth is tracked exactly
+///   the way `dump_cexpr`'s own recursion already does (one level per
+///   `Fix`/`If` nesting) -- only the delimiter changes, from matching
+///   parens (whose depth grows by one for every call in a chain, however
+///   long, and has to be counted by eye to find where a block ends) to a
+///   plain indent, closed implicitly by dedent.
+///
+/// Deliberately **not** attempted here: collapsing a call-plus-its-own-
+/// continuation into a direct-style `let` (an earlier version of this
+/// function did exactly that, hiding which value was bound by which named
+/// continuation, and under which enclosing `fix` -- reported back as
+/// working against the actual point of reading real CPS output, not
+/// helping it). Every `fix`/continuation/trailing-continuation-argument
+/// stays exactly as real, and exactly as visible, as in `dump_cps_program`.
+pub fn dump_cps_program_readable(program: &CpsProgram) -> String {
+    let mut out = String::new();
+    for (i, f) in program.funcs.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let params = f
+            .def
+            .params
+            .iter()
+            .map(|v| format!("v{v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(out, "fn {}({params}):", f.def.name);
+        render_readable(&mut out, &f.def.body, 1);
+    }
+    out
+}
+
+fn render_readable(out: &mut String, expr: &CExpr, depth: usize) {
+    match expr {
+        CExpr::LetPrim {
+            var,
+            ty,
+            op,
+            args,
+            cont,
+        } => {
+            let op_str = prim_op_str(op);
+            let args_str = args.iter().map(dump_cval).collect::<Vec<_>>().join(", ");
+            indent(out, depth);
+            match op {
+                // Each of these already returns unit, never read again (the
+                // struct-field mutation / retain-decrement / release *is*
+                // the effect) -- printing `let vN: () = ...` for one would
+                // only add noise no consumer ever looks at. Not a case
+                // `dump_cexpr` itself special-cases, but doing so here
+                // changes no information a reader could actually use.
+                PrimOp::Retain(_)
+                | PrimOp::Release(_)
+                | PrimOp::FieldStore { .. }
+                | PrimOp::Store { .. } => {
+                    let _ = writeln!(out, "{op_str}({args_str})");
+                }
+                _ => {
+                    let _ = writeln!(out, "let v{var}: {ty} = {op_str}({args_str})");
+                }
+            }
+            render_readable(out, cont, depth);
+        }
+        CExpr::App { func, args } => {
+            indent(out, depth);
+            let args_str = args.iter().map(dump_cval).collect::<Vec<_>>().join(", ");
+            let _ = writeln!(out, "{}({args_str})", dump_cval(func));
+        }
+        CExpr::Fix { defs, body } => {
+            render_readable(out, body, depth);
+            for d in defs {
+                let params = d
+                    .params
+                    .iter()
+                    .map(|v| format!("v{v}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                indent(out, depth);
+                let _ = writeln!(out, "{}({params}):", d.name);
+                render_readable(out, &d.body, depth + 1);
+            }
+        }
+        CExpr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            indent(out, depth);
+            let _ = writeln!(out, "if {}:", dump_cval(cond));
+            render_readable(out, then_branch, depth + 1);
+            indent(out, depth);
+            let _ = writeln!(out, "else:");
+            render_readable(out, else_branch, depth + 1);
+        }
+    }
+}
+
 fn dump_cval(v: &CVal) -> String {
     match v {
         CVal::Var(n) => format!("v{n}"),
@@ -3854,6 +3964,32 @@ fn dump_cval(v: &CVal) -> String {
     }
 }
 
+/// Shared by `dump_cexpr` (parenthesized S-expr form) and `linearize`
+/// (`--dump-cps-readable`'s direct-style form) — the mapping from a
+/// `PrimOp` to its printed name never differs between the two, only the
+/// surrounding syntax does.
+fn prim_op_str(op: &PrimOp) -> String {
+    match op {
+        PrimOp::Field { field, .. } => format!("field.{field}"),
+        PrimOp::FieldStore { field, .. } => format!("field-store.{field}"),
+        PrimOp::Struct(name, fields) => format!("struct.{name}[{}]", fields.join(",")),
+        PrimOp::Array => "array".to_string(),
+        PrimOp::ArrayRepeat => "array-repeat".to_string(),
+        PrimOp::Load { .. } => "load".to_string(),
+        PrimOp::Store { .. } => "store".to_string(),
+        PrimOp::Extern { symbol, .. } => format!("extern.{symbol}"),
+        PrimOp::RawMlirOp { op, attrs } => {
+            let attrs_str: String = attrs
+                .iter()
+                .map(|(name, text)| format!(" {name}={text:?}"))
+                .collect();
+            format!("mlir.{op}{attrs_str}")
+        }
+        PrimOp::Retain(_) => "retain".to_string(),
+        PrimOp::Release(_) => "release".to_string(),
+    }
+}
+
 fn dump_cexpr(out: &mut String, expr: &CExpr, depth: usize) {
     match expr {
         CExpr::LetPrim {
@@ -3864,25 +4000,7 @@ fn dump_cexpr(out: &mut String, expr: &CExpr, depth: usize) {
             cont,
         } => {
             indent(out, depth);
-            let op_str = match op {
-                PrimOp::Field { field, .. } => format!("field.{field}"),
-                PrimOp::FieldStore { field, .. } => format!("field-store.{field}"),
-                PrimOp::Struct(name, fields) => format!("struct.{name}[{}]", fields.join(",")),
-                PrimOp::Array => "array".to_string(),
-                PrimOp::ArrayRepeat => "array-repeat".to_string(),
-                PrimOp::Load { .. } => "load".to_string(),
-                PrimOp::Store { .. } => "store".to_string(),
-                PrimOp::Extern { symbol, .. } => format!("extern.{symbol}"),
-                PrimOp::RawMlirOp { op, attrs } => {
-                    let attrs_str: String = attrs
-                        .iter()
-                        .map(|(name, text)| format!(" {name}={text:?}"))
-                        .collect();
-                    format!("mlir.{op}{attrs_str}")
-                }
-                PrimOp::Retain(_) => "retain".to_string(),
-                PrimOp::Release(_) => "release".to_string(),
-            };
+            let op_str = prim_op_str(op);
             let args_str = args.iter().map(dump_cval).collect::<Vec<_>>().join(" ");
             let _ = writeln!(out, "(let-prim v{var}: {ty} = ({op_str} {args_str})");
             dump_cexpr(out, cont, depth);
