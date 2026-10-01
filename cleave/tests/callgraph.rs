@@ -370,21 +370,26 @@ fn a_generalizable_top_level_function_is_not_defaulted_before_it_can_generalize(
 }
 
 #[test]
-fn a_nullary_function_is_not_generalized_monomorphism_restriction() {
-    // Haskell's Monomorphism Restriction, applied here: a zero-parameter
-    // top-level `fn` can't accept any caller-supplied type information at
-    // its call sites the way a parameterized one can, so its own bare
-    // literal must default directly to a concrete type rather than being
-    // reported as spuriously "generic".
+fn a_nullary_function_is_generalized_and_only_a_root_takes_the_defaults() {
+    // No Monomorphism Restriction for a top-level `fn`: it's re-evaluated at
+    // every call, so `one` stays generic (its literal's type is left to each
+    // caller), while `main` — a root nothing in cleave calls, so nothing could
+    // ever pin it — takes the literal default (`callgraph.rs::is_unquantified_
+    // root`).
     let registry = registry_from(
         "algebra Ring<T> { fn add(a: T, b: T) -> T; }
         algebra Num<T> {}
         impl Ring<i32> { fn add(a: i32, b: i32) -> i32 { a } }
         impl Num<i32> {}",
     );
-    let program = lower_program("fn one() { 1 }");
+    let program = lower_program("fn one() { 1 } fn main() { one() }");
     let result = infer_program(&program, &registry);
-    assert_eq!(ok_result(&result, "one"), Ty::Con("i32".to_string()));
+    assert!(
+        matches!(ok_result(&result, "one"), Ty::Var(_)),
+        "got: {:?}",
+        ok_result(&result, "one")
+    );
+    assert_eq!(ok_result(&result, "main"), Ty::Con("i32".to_string()));
 }
 
 // ---------------------------------------------------------------------

@@ -261,31 +261,13 @@ struct Dense<T: Float, const In: i32, const Out: i32> { w: Tensor<T, In, Out>, b
 // own "No weight-initialization helpers" item finally closed now that `rand`
 // (`stdlib/rand/rand.cleave`) exists to build it on.
 //
-// A real, if narrow, algebra -- not a `Dense`-scoped method of any kind (a
-// dot-called function always needs a real receiver value to dispatch its
-// own generics from -- `dense_forward`'s own `layer` parameter, e.g. -- and
-// a constructor has no `Dense` value yet to call one on) -- and, a real,
-// found-by-testing surprise, *not* a plain top-
-// level generic function either, even though that's the shape every other
-// helper in this file (`random_matrix`, this session's own validation probe)
-// already used successfully. `fn dense_xavier<T,In,Out>() -> Dense<T,In,Out>`
-// (zero real value parameters, every one of its three generics determined
-// *purely* by the caller's own expected-type context, e.g. `let d: Dense<f32,
-// 2,2> = dense_xavier();`) hit a genuine compiler gap: unlike `Ring::zero()`
-// (also zero-arg, also purely output-type-determined, and already proven to
-// work everywhere), an ordinary top-level generic *function* call in this
-// same shape doesn't get that expected-type context propagated into its own
-// body at all -- confirmed directly: `.to()` (`Convert`) inside the body came
-// back "ambiguous dispatch ... could resolve to Convert<i32,f32> or
-// Convert<i32,f64>" even with the call site's own type fully pinned one level
-// up. Turbofish doesn't rescue it either -- a *second*, independent bug: any
-// call to a zero-*value*-parameter generic function with an explicit turbofish
-// (`dense_xavier::<f32>()`) is misdiagnosed as a real *argument* ("expects 0
-// argument(s), found 1"), the turbofish's own generic count apparently
-// counted as call arguments. Neither investigated further here (both flagged
-// in `doc/backlog.md`) -- routing through `Init<T>` instead sidesteps both at
-// once, reusing `Ring::zero()`'s own already-proven algebra-dispatch
-// resolution path rather than the broken one.
+// An algebra, not a generic `fn`, because it has several implementations
+// chosen by the result type (`Tensor` and `Dense` below), exactly like
+// `Ring::zero()`: `let d: Dense<f32, 2, 2> = he();` and a `Tensor`-typed
+// field both pick theirs from the expected type. (A nullary generic `fn`
+// returning a `Dense` works too — `cleave/tests/mlir_lower.rs`, `a_nullary_
+// generic_fn_is_instantiated_per_call_site` — but it is one implementation
+// per name.)
 algebra Init<T> {
     fn xavier() -> T;
     fn he() -> T;

@@ -5483,6 +5483,69 @@ fn reassigning_then_shadowing_a_variable_keeps_the_reassignment() {
     assert_eq!(run_i32(&context, src), 123);
 }
 
+/// A nullary generic fn whose generic appears only in its result: pinned by
+/// the expected type, by a turbofish, and at two different types in one
+/// program — each call site instantiates it afresh, like `Ring::zero()`.
+#[test]
+fn a_nullary_generic_fn_is_instantiated_per_call_site() {
+    let context = context();
+    let src = "
+        use convert;
+        fn half<T: Float>() -> T {
+            let one: i32 = 1;
+            let x: T = one.to();
+            x / 2.0
+        }
+        fn main() -> i32 {
+            let a: f32 = half();
+            let b: f64 = half();
+            let c = half::<f32>();
+            if a == 0.5 and b == 0.5 and c == 0.5 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// The same with no annotation at all: a nullary fn is generalized like any
+/// other (only `main`/`export fn` roots aren't, `callgraph.rs::is_unquantified_
+/// root`), so `nothing()` is as generic as the `Ring::zero()` it returns.
+#[test]
+fn an_unannotated_nullary_fn_is_generalized() {
+    let context = context();
+    let src = "
+        fn nothing() { Ring::zero() }
+        fn main() -> i32 {
+            let a: i32 = nothing();
+            let b: f64 = nothing();
+            if a == 0 and b == 0.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// A declared generic nothing pins is an indeterminacy, rejected — even when a
+/// literal in the body shares its type (`2.0`): only a variable born of a
+/// literal alone (`fn one() { 1 }`) takes the literal's default.
+#[test]
+fn an_unpinned_declared_generic_is_rejected_not_defaulted() {
+    let src = "
+        use convert;
+        fn half<T: Float>() -> T {
+            let one: i32 = 1;
+            let x: T = one.to();
+            x / 2.0
+        }
+        fn main() -> i32 { let h = half(); if h == h { 1 } else { 0 } }
+    ";
+    let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
+    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+    let registry = Registry::build(&program);
+    assert!(
+        check_type_errors(&program, &registry).is_err(),
+        "an unpinned declared generic must not be silently defaulted"
+    );
+}
+
 /// `let (a, mut b) = ...;` binds each element of a tuple, nesting allowed;
 /// `(x, y) = ...;` assigns each element, reading the whole value before
 /// writing any target, so `(x, y) = (y, x);` swaps.

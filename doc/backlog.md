@@ -84,6 +84,19 @@ how host data becomes a tensor.
 
 ---
 
+## Two diagnostics that point at the wrong thing
+
+- **A call to nothing in scope isn't an error of its own.** `x.to()` without `use convert;` reports
+  `type could not be fully determined (<unresolved-call:convert>)` and knock-on mismatches, instead of
+  "no `fn` or algebra method named `convert` is in scope". `infer_call`'s fallback returns a placeholder
+  type rather than an error; `resolve.rs` now knows every name in scope and could report it directly.
+- **An indeterminacy is reported inside the callee, not at the call.** `let h = half();` with
+  `fn half<T: Float>() -> T` and nothing pinning `T` is rightly rejected, but the error lands on
+  `half`'s own body (`ambiguous dispatch for Convert` at its `.to()`), where monomorphization first
+  meets the unresolved type, rather than on the `half()` call that left it open.
+
+---
+
 ## Retain/release are opaque calls, so LLVM can never fold them — emit the refcount fast path as ordinary IR
 
 `cleave_retain`/`cleave_release` are external calls into `cleave-rt`: LLVM can't see that a retain

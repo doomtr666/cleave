@@ -1304,6 +1304,13 @@ pub struct Scheme {
     /// that check needs the *real* declared width, not a guess (see
     /// `check_pending_constraints`'s own `Ty::Const` bridge).
     pub const_widths: HashMap<TyVar, Ty>,
+    /// Which of `vars` stand for a number literal's type (`fn one() { 1 }`'s
+    /// result), with the literal's default — carried to each instantiation's
+    /// fresh variable (`instantiate_with_mapping`), so a call site nothing
+    /// else pins (`main`'s `one()`) still defaults the way the literal would
+    /// have. Only literal-born variables: a declared `T: Float` with nothing
+    /// pinning it stays an indeterminacy, never silently `f64`.
+    pub literal_defaults: Vec<(TyVar, NumberDefault)>,
 }
 
 impl Scheme {
@@ -1313,6 +1320,7 @@ impl Scheme {
             constraints: Vec::new(),
             ty,
             const_widths: HashMap::new(),
+            literal_defaults: Vec::new(),
         }
     }
 }
@@ -2042,7 +2050,7 @@ struct PendingIndex {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NumberDefault {
+pub enum NumberDefault {
     Int,
     Float,
     /// A bare imaginary literal (`4i`) — see `ExprKind::ImaginaryLit`'s own
@@ -3801,11 +3809,38 @@ impl<'r> Infer<'r> {
             .map(|(v, t)| (*v, t.clone()))
             .collect();
 
+        // A declared generic (`fn half<T: Float>() -> T`) is the caller's to
+        // choose even when a literal in the body shares its type: left
+        // unpinned, it is an indeterminacy, not the literal's default.
+        let declared: HashSet<TyVar> = own_generics
+            .map(|(generics_list, mapping)| {
+                generics_list
+                    .iter()
+                    .filter_map(|g| match self.subst.apply(mapping.get(g.name())?) {
+                        Ty::Var(v) => Some(v),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut literal_defaults: Vec<(TyVar, NumberDefault)> = Vec::new();
+        for (literal_var, default) in &self.pending_defaults {
+            if let Ty::Var(root) = self.subst.apply(&Ty::Var(*literal_var)) {
+                if var_set.contains(&root)
+                    && !declared.contains(&root)
+                    && !literal_defaults.iter().any(|(v, _)| *v == root)
+                {
+                    literal_defaults.push((root, *default));
+                }
+            }
+        }
+
         Ok(Scheme {
             vars,
             constraints,
             ty,
             const_widths,
+            literal_defaults,
         })
     }
 
@@ -3951,6 +3986,11 @@ impl<'r> Infer<'r> {
                 gating_indices: c.gating_indices.clone(),
                 span: c.span,
             });
+        }
+        for (v, default) in &scheme.literal_defaults {
+            if let Some(Ty::Var(fresh)) = mapping.get(v) {
+                self.pending_defaults.push((*fresh, *default));
+            }
         }
         // Re-key `scheme.const_widths` through the same fresh mapping —
         // without this, a constraint re-queued just above (against a *fresh*

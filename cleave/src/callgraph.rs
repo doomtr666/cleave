@@ -127,6 +127,18 @@ pub struct ProgramInference {
     pub next_var_id: u32,
 }
 
+/// Whether `f` is a root of the program that is never generalized: `main` or
+/// an `export fn`, without parameters or declared generics. Nothing in cleave
+/// calls a root, so no call site could ever pin a quantified variable of its
+/// type; its free variables take their documented defaults instead (`apply_
+/// defaults`). Every other `fn` is generalized, nullary or not — a top-level
+/// `fn` is re-evaluated at each call, so the value-sharing concern behind
+/// Haskell's Monomorphism Restriction doesn't arise, and `fn zero() {
+/// Ring::zero() }` is as generic as `Ring::zero()` itself.
+fn is_unquantified_root(f: &FnDecl) -> bool {
+    (f.name == "main" || f.is_export) && f.params.is_empty() && f.generics.is_empty()
+}
+
 /// Runs whole-program inference over every top-level `fn` in `program` (see
 /// module docs). Algebra `impl` methods are untouched — callers still infer
 /// those exactly as before (`Infer::infer_impl_fn`, one at a time).
@@ -351,7 +363,7 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
                 param_types.iter().map(|t| infer.subst.apply(t)).collect(),
                 Box::new(infer.subst.apply(ret_var)),
             );
-            if f.params.is_empty() && f.generics.is_empty() {
+            if is_unquantified_root(f) {
                 // Not generalized (Monomorphism Restriction — see below) —
                 // but a pending constraint on a variable this nullary
                 // member's own returned type still exposes must still
@@ -466,7 +478,7 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
                             // this branch firing unconditionally for it too
                             // would silently overwrite that with an empty-
                             // `vars` one, undoing the fix.
-                            if f.params.is_empty() && f.generics.is_empty() {
+                            if is_unquantified_root(f) {
                                 let ty =
                                     Ty::Fn(final_params.clone(), Box::new(final_result.clone()));
                                 let constraints =
@@ -478,6 +490,7 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
                                         constraints,
                                         ty,
                                         const_widths: HashMap::new(),
+                                        literal_defaults: Vec::new(),
                                     },
                                 );
                             }
