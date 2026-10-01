@@ -40,13 +40,13 @@ impl<Opt, StateL1, StateL2, StateL3, StateL4>
         )
     }
     fn step(opt, model, grad, state) {
-        let r1 = step(opt, model.l1, grad.l1, state.l1);
-        let r2 = step(opt, model.l2, grad.l2, state.l2);
-        let r3 = step(opt, model.l3, grad.l3, state.l3);
-        let r4 = step(opt, model.l4, grad.l4, state.l4);
+        let (l1, s1) = step(opt, model.l1, grad.l1, state.l1);
+        let (l2, s2) = step(opt, model.l2, grad.l2, state.l2);
+        let (l3, s3) = step(opt, model.l3, grad.l3, state.l3);
+        let (l4, s4) = step(opt, model.l4, grad.l4, state.l4);
         (
-            Network(l1: r1.0, l2: r2.0, l3: r3.0, l4: r4.0),
-            NetworkState(l1: r1.1, l2: r2.1, l3: r3.1, l4: r4.1)
+            Network(l1: l1, l2: l2, l3: l3, l4: l4),
+            NetworkState(l1: s1, l2: s2, l3: s3, l4: s4)
         )
     }
 }
@@ -54,19 +54,19 @@ impl<Opt, StateL1, StateL2, StateL3, StateL4>
 fn load_train_batch_input(batch_start: i32) -> Tensor<f32, 32, 784> {
     let mut pixels: [[f32; 784]; 32] = mlir::memref::alloc();
     train_batch_pixels(batch_start, pixels);
-    Tensor::<f32, 32, 784>(data: pixels)
+    Tensor(data: pixels)
 }
 
 fn load_train_batch_target(batch_start: i32) -> Tensor<f32, 32, 10> {
     let mut t: [[f32; 10]; 32] = mlir::memref::alloc();
     train_batch_targets(batch_start, t);
-    Tensor::<f32, 32, 10>(data: t)
+    Tensor(data: t)
 }
 
 fn load_test_batch_input(batch_start: i32) -> Tensor<f32, 80, 784> {
     let mut pixels: [[f32; 784]; 80] = mlir::memref::alloc();
     test_batch_pixels(batch_start, pixels);
-    Tensor::<f32, 80, 784>(data: pixels)
+    Tensor(data: pixels)
 }
 
 // Raw logits, no final activation.
@@ -121,9 +121,7 @@ export fn train_and_evaluate(epochs: i32, lr: f32, seed: i64) -> f32 {
     for epoch in 0..epochs {
         for s in 0..train_len() / 32 {
             let g = net_grad(load_train_batch_input(s * 32), load_train_batch_target(s * 32), net);
-            let r = step(opt, net, g, state);
-            net = r.0;
-            state = r.1;
+            (net, state) = step(opt, net, g, state);
         };
         println(("Epoch=", epoch));
     };

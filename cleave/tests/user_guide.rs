@@ -379,6 +379,25 @@ fn algebras_how_operators_actually_work() {
 }
 
 #[test]
+fn tuples_destructured_by_let_and_assignment() {
+    let context = context();
+    let src = "
+        fn pair(n: i32) -> (i32, i32) { (n, n * 10) }
+        fn main() -> i32 {
+            let (a, mut b) = pair(2);
+            b = b + 1;
+            let ((c, d), e) = ((3, 4), 5);
+            let mut x = 0;
+            let mut y = 0;
+            (x, y) = pair(6);
+            (x, y) = (y, x);
+            if a == 2 and b == 21 and c + d + e == 12 and x == 60 and y == 6 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+#[test]
 fn how_a_call_finds_what_it_calls() {
     let context = context();
     let src = "

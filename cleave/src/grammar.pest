@@ -401,14 +401,23 @@ break_stmt  = { "break" ~ expr? ~ ";" }
 // `mut` wrapped in its own rule (rather than a bare literal) so its presence
 // is actually visible as a pair — a bare string literal leaves no trace at
 // all in pest's output, making "was `mut` there?" undetectable otherwise.
-let_stmt    = { "let" ~ mut_kw? ~ ident ~ (":" ~ type_)? ~ "=" ~ expr ~ ";" }
+let_stmt    = { "let" ~ (tuple_pattern | mut_kw? ~ ident) ~ (":" ~ type_)? ~ "=" ~ expr ~ ";" }
 mut_kw      = { "mut" }
+// `let (a, mut b) = t;` — destructures a tuple, nesting allowed (`let ((a, b),
+// c) = ...`). Desugared by `lower.rs` into ordinary `let`s reading `.0`, `.1`,
+// ... off one synthetic binding of the whole value: no pattern node in the AST.
+tuple_pattern = { "(" ~ binding_pattern ~ ("," ~ binding_pattern)+ ~ ","? ~ ")" }
+binding_pattern = { tuple_pattern | mut_kw? ~ ident }
 // reassignment of an existing `let mut` binding — bare `=`, no `let` (see grammar.md).
 // The target can be a plain name (`x = v;`) or a field/index chain into one
 // (`arr[i] = v;`, `arr[i,j] = v;`, `self.values[i] = v;`) — same shape as
 // `postfix_op` (see below) minus the call-args/method-call alternative, since
 // you can't assign through a method call.
-assign_stmt   = { assign_target ~ "=" ~ expr ~ ";" }
+// `(a, b.x) = t;` assigns every element of a tuple at once — the value is
+// evaluated once, before any target is written, so `(a, b) = (b, a);` swaps.
+// Desugared by `lower.rs` like `tuple_pattern`.
+assign_stmt   = { (tuple_target | assign_target) ~ "=" ~ expr ~ ";" }
+tuple_target  = { "(" ~ (tuple_target | assign_target) ~ ("," ~ (tuple_target | assign_target))+ ~ ","? ~ ")" }
 assign_target = { ident ~ assign_suffix* }
 assign_suffix = { "." ~ (tuple_index | ident) | "[" ~ expr ~ ("," ~ expr)* ~ "]" }
 expr_stmt   = { expr ~ ";" }

@@ -56,14 +56,14 @@ What still fails, by nature:
   into it (`train_batch_pixels(start, x.data)`) generates a module that fails verification ("operand type
   mismatch: expected `!llvm.ptr`, provided `tensor<...>`"). It should be rejected cleanly: a tensor is a
   value, and an extern writing into one breaks that.
-- **Language gap — tensor construction needs a turbofish.** `Tensor(data: pixels)` is refused ("inferring
-  a pack's own arity from field values isn't supported yet"), even though the array argument's rank and
-  the function's return type both give the dimensions.
+- ~~**Language gap — tensor construction needs a turbofish.**~~ Fixed: `Tensor(data: pixels)` infers
+  `Dims` from the value (`infer.rs::infer_struct_lit_pack_arity`: every arity tried, exactly one must fit
+  the constraints, else an error). Values with no shape information (`Ring::zero()`) still need it.
 - **Stdlib/design gap — no sanctioned way to build a tensor from host data.** User code has to write
   `mlir::memref::alloc()` and `Tensor::<f32, 32, 784>(data: ...)`. Needs a decision on how an extern hands
   data to a tensor (ties to the previous two points).
-- **Language gap — no tuple destructuring in `let`.** `let (net2, state2) = Optimizer::step(...)` is a
-  parse error, hence `let r = ...; net = r.0; state = r.1;`.
+- ~~**Language gap — no tuple destructuring in `let`.**~~ Fixed: `let (a, mut b) = ...;` and `(net, state)
+  = step(...);`, desugared by `lower.rs` (`doc/user_guide.md`, "Tuples").
 - **Autodiff limitation — `grad()` needs a non-generic function with a declared return type.** The loss
   is pinned to batch size 32 in its signature, and an unannotated loss is refused. A derivative that is
   instantiated per call site, like any generic fn, would lift both.

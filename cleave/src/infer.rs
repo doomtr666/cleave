@@ -993,6 +993,15 @@ pub enum TypeErrorKind {
         struct_name: String,
         min_generics: usize,
     },
+    /// A pack-generic struct built without its pack written
+    /// (`Tensor(data: ...)`), whose field values fit no pack arity at all
+    /// (`fitting` empty, a contradiction) or several (an indeterminacy) —
+    /// `Infer::infer_struct_lit_pack_arity`.
+    PackArityNotInferred {
+        struct_name: String,
+        pack: String,
+        fitting: Vec<usize>,
+    },
     /// A turbofish/generic-argument slot whose *declared* generic parameter
     /// is a `const` generic didn't receive a compile-time constant -- either
     /// a bare name resolving to neither an enclosing const generic nor a
@@ -1166,9 +1175,24 @@ impl std::fmt::Display for TypeErrorKind {
             } => {
                 write!(
                     f,
-                    "`{struct_name}` has a variadic generic — constructing it needs an explicit turbofish with at least {min_generics} argument(s) (e.g. `{struct_name}::<...>(...)`); inferring a pack's own arity from field values isn't supported yet"
+                    "`{struct_name}` has a variadic generic — a turbofish naming some of its generics must name at least {min_generics} (e.g. `{struct_name}::<...>(...)`), or none to infer them all from the field values"
                 )
             }
+            TypeErrorKind::PackArityNotInferred {
+                struct_name,
+                pack,
+                fitting,
+            } => match fitting.as_slice() {
+                [] => write!(
+                    f,
+                    "the field values of this `{struct_name}` fit no number of `{pack}` arguments"
+                ),
+                several => write!(
+                    f,
+                    "the field values of this `{struct_name}` fit several numbers of `{pack}` arguments ({}) — write them explicitly: `{struct_name}::<...>(...)`",
+                    several.iter().map(usize::to_string).collect::<Vec<_>>().join(", ")
+                ),
+            },
             TypeErrorKind::NotAConstGenericArg { param } => match param {
                 Some(name) => write!(
                     f,
@@ -1290,6 +1314,17 @@ impl Scheme {
             ty,
             const_widths: HashMap::new(),
         }
+    }
+}
+
+/// The number of nodes in `ty` — an upper bound on how many pack elements
+/// its structure could account for (`Infer::infer_struct_lit_pack_arity`).
+fn ty_size(ty: &Ty) -> usize {
+    match ty {
+        Ty::Array(elem, size) => 1 + ty_size(elem) + ty_size(size),
+        Ty::App(_, args) | Ty::PackResolved(args) => 1 + args.iter().map(ty_size).sum::<usize>(),
+        Ty::Fn(params, ret) => 1 + params.iter().map(ty_size).sum::<usize>() + ty_size(ret),
+        _ => 1,
     }
 }
 
@@ -2257,6 +2292,20 @@ impl<'r> Infer<'r> {
         let pack_generic = struct_generics
             .last()
             .expect("checked non-empty by the caller");
+        // No pack argument written: the pack is inferred from the field values
+        // (`infer_struct_lit_pack_arity`), with the non-pack generics either
+        // all written (`Tensor::<f32>(data: ...)`) or none.
+        if explicit_generics.len() == non_pack.len() || explicit_generics.is_empty() {
+            return self.infer_struct_lit_pack_arity(
+                env,
+                span,
+                struct_name,
+                struct_generics,
+                explicit_generics,
+                fields,
+                declared_fields,
+            );
+        }
         if explicit_generics.len() < non_pack.len() {
             return Err(TypeError {
                 span,
@@ -2326,6 +2375,160 @@ impl<'r> Infer<'r> {
         let mut type_args: Vec<Ty> = non_pack.iter().map(|g| mapping[g.name()].clone()).collect();
         type_args.extend(pack_tys);
         Ok(Ty::App(struct_name.to_string(), type_args))
+    }
+
+    /// A pack-generic struct construction whose pack arguments aren't
+    /// written (`Tensor(data: pixels)`): the pack's arity is inferred from
+    /// the field values. Every arity the values' types could account for is
+    /// tried speculatively — fresh pack elements, field types unified against
+    /// the values, then every constraint the attempt touched (the struct's
+    /// own bounds, `T: Float`; the values' own, a float literal's `Float`)
+    /// re-checked without committing. Exactly one arity fitting is the
+    /// answer; none is a contradiction and several an indeterminacy, both
+    /// `PackArityNotInferred`, never a guess: `[[f32; 784]; 32]` fits
+    /// `[T; Dims...]` as `T = f32, Dims = [32, 784]` *and* as `T = [f32;
+    /// 784], Dims = [32]`, and only a bound on `T` (`Tensor`'s `Float`) tells
+    /// them apart.
+    #[allow(clippy::too_many_arguments)]
+    fn infer_struct_lit_pack_arity(
+        &mut self,
+        env: &Env,
+        span: Span,
+        struct_name: &str,
+        struct_generics: &[GenericParam],
+        explicit_generics: &[GenericArg],
+        fields: &[(String, Expr)],
+        declared_fields: &[Field],
+    ) -> Result<Ty, TypeError> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut values: Vec<(Field, Ty, Span)> = Vec::new();
+        for (name, value) in fields {
+            let Some(decl_field) = declared_fields.iter().find(|f| &f.name == name).cloned() else {
+                return Err(TypeError {
+                    span: value.span,
+                    kind: TypeErrorKind::NoSuchField {
+                        struct_name: struct_name.to_string(),
+                        field: name.clone(),
+                    },
+                });
+            };
+            if !seen.insert(name.clone()) {
+                return Err(TypeError {
+                    span: value.span,
+                    kind: TypeErrorKind::DuplicateField {
+                        struct_name: struct_name.to_string(),
+                        field: name.clone(),
+                    },
+                });
+            }
+            let value_ty = self.infer_expr(env, value)?;
+            values.push((decl_field, value_ty, value.span));
+        }
+        if let Some(missing) = declared_fields.iter().find(|f| !seen.contains(&f.name)) {
+            return Err(TypeError {
+                span,
+                kind: TypeErrorKind::MissingField {
+                    struct_name: struct_name.to_string(),
+                    field: missing.name.clone(),
+                },
+            });
+        }
+
+        // A pack element can only come from structure the values' types
+        // already have, so their size bounds the arities worth trying.
+        let max_arity: usize = values
+            .iter()
+            .map(|(_, t, _)| ty_size(&self.subst.apply(t)))
+            .sum();
+        let mut fitting: Vec<usize> = Vec::new();
+        for arity in 0..=max_arity {
+            let before = self.subst.clone();
+            let constraints_before = self.constraints.len();
+            let fits = self
+                .unify_pack_candidate(arity, span, struct_name, struct_generics, explicit_generics, &values)
+                .is_ok()
+                && self.touched_constraints_hold(&before);
+            self.subst = before;
+            self.constraints.truncate(constraints_before);
+            if fits {
+                fitting.push(arity);
+            }
+        }
+        match fitting.as_slice() {
+            [arity] => self.unify_pack_candidate(
+                *arity,
+                span,
+                struct_name,
+                struct_generics,
+                explicit_generics,
+                &values,
+            ),
+            _ => Err(TypeError {
+                span,
+                kind: TypeErrorKind::PackArityNotInferred {
+                    struct_name: struct_name.to_string(),
+                    pack: struct_generics.last().map(|g| g.name().to_string()).unwrap_or_default(),
+                    fitting,
+                },
+            }),
+        }
+    }
+
+    /// One attempt of `infer_struct_lit_pack_arity`: the struct's generics
+    /// with a pack of exactly `arity` fresh elements, unified against the
+    /// already-inferred field value types.
+    fn unify_pack_candidate(
+        &mut self,
+        arity: usize,
+        span: Span,
+        struct_name: &str,
+        struct_generics: &[GenericParam],
+        explicit_generics: &[GenericArg],
+        values: &[(Field, Ty, Span)],
+    ) -> Result<Ty, TypeError> {
+        let non_pack = &struct_generics[..struct_generics.len() - 1];
+        let pack_generic = struct_generics
+            .last()
+            .expect("checked non-empty by the caller");
+        let mapping = self.fresh_generics_mapping(non_pack, span);
+        for (g, explicit) in non_pack.iter().zip(explicit_generics) {
+            let fresh = mapping[g.name()].clone();
+            let explicit_ty = self.generic_arg_to_ty(Some(g.name()), g.is_const(), explicit, span)?;
+            self.unify_at(span, &fresh, &explicit_ty)?;
+        }
+        let Ty::Var(group) = self.vars.fresh() else {
+            unreachable!("TyVarGen::fresh always returns Ty::Var")
+        };
+        let pack_tys: Vec<Ty> = (0..arity)
+            .map(|_| {
+                let fresh = self.vars.fresh();
+                if let (GenericParam::Const { ty, .. }, Ty::Var(v)) = (pack_generic, &fresh) {
+                    let width = self.ty_from_ast_mapped(ty, &mapping);
+                    self.subst.set_const_width(*v, width, group);
+                }
+                fresh
+            })
+            .collect();
+        for (decl_field, value_ty, value_span) in values {
+            let declared_ty =
+                self.ty_from_ast_mapped_with_pack(&decl_field.ty, &mapping, pack_generic.name(), &pack_tys);
+            self.unify_at(*value_span, &declared_ty, value_ty)?;
+        }
+        let mut type_args: Vec<Ty> = non_pack.iter().map(|g| mapping[g.name()].clone()).collect();
+        type_args.extend(pack_tys);
+        Ok(Ty::App(struct_name.to_string(), type_args))
+    }
+
+    /// Whether every pending constraint whose types changed since `before`
+    /// still has a matching impl — a non-committing check
+    /// (`has_matching_impl`), for weighing a speculative unification.
+    fn touched_constraints_hold(&mut self, before: &Subst) -> bool {
+        let constraints = self.constraints.clone();
+        constraints.iter().all(|c| {
+            let now: Vec<Ty> = c.tys.iter().map(|t| self.subst.apply(t)).collect();
+            let then: Vec<Ty> = c.tys.iter().map(|t| before.apply(t)).collect();
+            now == then || self.has_matching_impl(&c.algebra, &now)
+        })
     }
 
     /// Resolves a struct field's own declared type at a pack-generic

@@ -5483,6 +5483,46 @@ fn reassigning_then_shadowing_a_variable_keeps_the_reassignment() {
     assert_eq!(run_i32(&context, src), 123);
 }
 
+/// `let (a, mut b) = ...;` binds each element of a tuple, nesting allowed;
+/// `(x, y) = ...;` assigns each element, reading the whole value before
+/// writing any target, so `(x, y) = (y, x);` swaps.
+#[test]
+fn tuple_destructuring_in_let_and_in_assignment() {
+    let context = context();
+    let src = "
+        fn pair(n: i32) -> (i32, i32) { (n, n * 10) }
+        fn main() -> i32 {
+            let (a, mut b) = pair(2);
+            b = b + 1;
+            let ((c, d), e) = ((3, 4), 5);
+            let mut x = 0;
+            let mut y = 0;
+            (x, y) = pair(6);
+            (x, y) = (y, x);
+            if a == 2 and b == 21 and c == 3 and d == 4 and e == 5 and x == 60 and y == 6 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `Tensor(data: ...)` without a turbofish: `Dims` inferred from the nested
+/// array (`T: Float` leaves one way to split it), from a literal and from an
+/// annotated array variable alike.
+#[test]
+fn a_tensor_built_without_a_turbofish_infers_its_dimensions() {
+    let context = context();
+    let src = "
+        use linalg;
+        fn main() -> i32 {
+            let t = Tensor(data: [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+            let a: [[f32; 2]; 2] = [[7.0, 8.0], [9.0, 10.0]];
+            let u = Tensor(data: a);
+            if t[1, 0] == 4.0 and t[0, 2] == 3.0 and u[1, 1] == 10.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
 /// An operator always means the algebra method: a user `fn add` is reachable by
 /// name but never captures `+`.
 #[test]

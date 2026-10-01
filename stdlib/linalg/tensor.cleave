@@ -20,11 +20,11 @@
 // below, needed to stay *symbolic* through declaration-time inference,
 // only resolving once a real call site unifies against it) and `Ty::
 // PackLen` (`Dims.len()`, needed so `Index`'s own `idx: [i32; K]`
-// parameter isn't a fixed literal arity). Construction always needs an
-// explicit turbofish now (`Tensor::<f64,3>(...)`, never bare `Tensor(data:
-// ...)`) — inferring a pack's own arity purely from a field literal's
-// shape isn't supported (`TypeErrorKind::VariadicStructNeedsTurbofish`), a
-// deliberate, accepted trade-off, not an oversight.
+// parameter isn't a fixed literal arity). Construction infers `Dims` from
+// the `data` value (`Tensor(data: [[1.0, 2.0], [3.0, 4.0]])` is a
+// `Tensor<f64, 2, 2>`: `T: Float` leaves only one way to split the nested
+// array, `infer.rs::infer_struct_lit_pack_arity`); a value whose type says
+// nothing about its shape needs the turbofish (`Tensor::<f64, 3>(...)`).
 //
 // Even further back: an even earlier version made `Vector` a hardcoded new
 // `Ty::Vector` Rust variant — exactly the "closing the loop" anti-pattern

@@ -95,14 +95,11 @@ struct AdamState<T: Float, const Dims...: i32> {
 
 impl<T: Float + Ring, const Dims...: i32> Optimizer<Adam, Tensor<T, Dims...>, AdamState<T, Dims...>> {
     fn init_state(opt, model) {
-        // Explicit turbofish, required for constructing a pack-generic
-        // struct (`doc/backlog.md`'s own "Variadic generics" item, its
-        // "constructing it needs an explicit turbofish" line) -- `m`/`v`
-        // are both `Ring::zero()`, itself still fully generic at this
-        // point (its own return type is pinned by the field it's assigned
-        // to, not the other way around), so nothing here lets the pack's
-        // own arity be inferred from the field values alone the way an
-        // ordinary struct's generics can be.
+        // Explicit turbofish: `m`/`v` are both `Ring::zero()`, still fully
+        // generic here (its return type is pinned by the field it's assigned
+        // to, not the other way around), so the field values fit any number
+        // of `Dims` -- an indeterminacy the compiler rejects rather than
+        // guesses (`infer.rs::infer_struct_lit_pack_arity`).
         AdamState::<T, Dims...>(m: Ring::zero(), v: Ring::zero(), beta1_pow: 1.0, beta2_pow: 1.0)
     }
     fn step(opt, model, grad, state) {

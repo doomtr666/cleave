@@ -3384,8 +3384,12 @@ fn a_const_generic_pack_construction_rejects_a_shape_not_matching_the_turbofish(
     );
 }
 
+/// Without a bound on `T`, a nested array literal fits `[T; Dims...]` with
+/// zero, one or two dimensions (`T` absorbing the rest): an indeterminacy,
+/// rejected rather than guessed. Three dimensions don't fit: the innermost
+/// element is a float literal, which can't be an array.
 #[test]
-fn constructing_a_pack_generic_struct_with_no_turbofish_is_rejected() {
+fn constructing_a_pack_generic_struct_whose_values_fit_several_arities_is_rejected() {
     let err = infer_fn_named(
         "struct Tensor<T, const Dims...: i32> { data: [T; Dims...] }
          fn f() -> i32 {
@@ -3395,11 +3399,27 @@ fn constructing_a_pack_generic_struct_with_no_turbofish_is_rejected() {
         "f",
     )
     .unwrap_err();
-    assert!(
-        matches!(err.kind, TypeErrorKind::VariadicStructNeedsTurbofish { .. }),
-        "got: {:?}",
-        err.kind
-    );
+    match err.kind {
+        TypeErrorKind::PackArityNotInferred { fitting, .. } => assert_eq!(fitting, vec![0, 1, 2]),
+        other => panic!("expected PackArityNotInferred, got {other:?}"),
+    }
+}
+
+/// With `T: Float`, only one split leaves `T` a float: the pack takes every
+/// array level, inferred without a turbofish.
+#[test]
+fn a_pack_generic_struct_infers_its_pack_from_the_field_values_when_one_arity_fits() {
+    let ty = infer_fn_named(
+        "algebra Float<T> {}
+         impl Float<f64> {}
+         struct Tensor<T: Float, const Dims...: i32> { data: [T; Dims...] }
+         fn f() -> Tensor<f64, 2, 3> {
+             Tensor(data: [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+         }",
+        "f",
+    )
+    .unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(ty.to_string(), "Tensor<f64, 2, 3>");
 }
 
 #[test]

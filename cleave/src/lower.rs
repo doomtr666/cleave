@@ -665,7 +665,7 @@ impl Lowerer {
         let mut tail = None;
         for inner in pair.into_inner() {
             match inner.as_rule() {
-                Rule::stmt => stmts.push(self.lower_stmt(inner)),
+                Rule::stmt => stmts.extend(self.lower_stmt(inner)),
                 Rule::expr => tail = Some(Box::new(self.lower_expr(inner))),
                 r => unreachable!("block: unexpected rule {r:?}"),
             }
@@ -673,12 +673,14 @@ impl Lowerer {
         Block { stmts, tail }
     }
 
-    fn lower_stmt(&mut self, pair: Pair<Rule>) -> Stmt {
+    /// Several statements for one source statement only when it destructures
+    /// a tuple (`let (a, b) = ...;`, `(a, b) = ...;`).
+    fn lower_stmt(&mut self, pair: Pair<Rule>) -> Vec<Stmt> {
         let span = self.span_of(&pair);
         let inner = pair.into_inner().next().unwrap();
         let kind = match inner.as_rule() {
-            Rule::let_stmt => self.lower_let_stmt(inner),
-            Rule::assign_stmt => self.lower_assign_stmt(inner),
+            Rule::let_stmt => return self.lower_let_stmt(inner, span),
+            Rule::assign_stmt => return self.lower_assign_stmt(inner, span),
             Rule::break_stmt => {
                 let value = inner.into_inner().next().map(|p| self.lower_expr(p));
                 StmtKind::Break(value)
@@ -689,36 +691,121 @@ impl Lowerer {
             }
             r => unreachable!("stmt: unexpected rule {r:?}"),
         };
-        self.wrap(span, kind)
+        vec![self.wrap(span, kind)]
     }
 
-    fn lower_let_stmt(&mut self, pair: Pair<Rule>) -> StmtKind {
+    fn lower_let_stmt(&mut self, pair: Pair<Rule>, span: Span) -> Vec<Stmt> {
         let mut mutable = false;
         let mut name = None;
+        let mut pattern = None;
         let mut ty = None;
         let mut value = None;
         for p in pair.into_inner() {
             match p.as_rule() {
                 Rule::mut_kw => mutable = true,
                 Rule::ident if name.is_none() => name = Some(p.as_str().to_string()),
+                Rule::tuple_pattern => pattern = Some(p),
                 Rule::type_ => ty = Some(self.lower_type(p)),
                 Rule::expr => value = Some(self.lower_expr(p)),
                 _ => {}
             }
         }
-        StmtKind::Let {
-            mutable,
-            name: name.unwrap(),
+        let value = value.unwrap();
+        let Some(pattern) = pattern else {
+            let kind = StmtKind::Let {
+                mutable,
+                name: name.unwrap(),
+                ty,
+                value,
+            };
+            return vec![self.wrap(span, kind)];
+        };
+        let mut stmts = Vec::new();
+        self.destructure_let(pattern, ty, value, span, &mut stmts);
+        stmts
+    }
+
+    /// `let (p0, p1, ...) [: ty] = value;` => `let <tuple#N> [: ty] = value;`
+    /// then one `let` per element, from `<tuple#N>.0`, `<tuple#N>.1`, ...,
+    /// recursing into a nested pattern. The synthetic name can't be written in
+    /// source (`<`), so it never collides with or shadows a user binding.
+    fn destructure_let(
+        &mut self,
+        pattern: Pair<Rule>,
+        ty: Option<Type>,
+        value: Expr,
+        span: Span,
+        stmts: &mut Vec<Stmt>,
+    ) {
+        let whole = format!("<tuple#{}>", value.id.0);
+        let let_whole = StmtKind::Let {
+            mutable: false,
+            name: whole.clone(),
             ty,
-            value: value.unwrap(),
+            value,
+        };
+        stmts.push(self.wrap(span, let_whole));
+        for (index, element) in pattern.into_inner().enumerate() {
+            let element_span = self.span_of(&element);
+            let projection = self.tuple_projection(&whole, index, element_span);
+            let mut parts = element.into_inner();
+            let first = parts.next().unwrap();
+            match first.as_rule() {
+                Rule::tuple_pattern => self.destructure_let(first, None, projection, element_span, stmts),
+                Rule::mut_kw | Rule::ident => {
+                    let mutable = first.as_rule() == Rule::mut_kw;
+                    let ident = if mutable { parts.next().unwrap() } else { first };
+                    let kind = StmtKind::Let {
+                        mutable,
+                        name: ident.as_str().to_string(),
+                        ty: None,
+                        value: projection,
+                    };
+                    stmts.push(self.wrap(element_span, kind));
+                }
+                r => unreachable!("binding_pattern: unexpected rule {r:?}"),
+            }
         }
     }
 
-    fn lower_assign_stmt(&mut self, pair: Pair<Rule>) -> StmtKind {
+    /// `<name>.<index>` — the tuple field read a destructuring desugars to
+    /// (`t.0` is an ordinary `FieldAccess` named `"0"`).
+    fn tuple_projection(&mut self, name: &str, index: usize, span: Span) -> Expr {
+        let base = self.wrap(span, ExprKind::Path(Path::single(name)));
+        self.wrap(span, ExprKind::FieldAccess(Box::new(base), index.to_string()))
+    }
+
+    fn lower_assign_stmt(&mut self, pair: Pair<Rule>, span: Span) -> Vec<Stmt> {
         let mut inner = pair.into_inner();
-        let target = self.lower_assign_target(inner.next().unwrap());
+        let target = inner.next().unwrap();
         let value = self.lower_expr(inner.next().unwrap());
-        StmtKind::Assign { target, value }
+        let mut stmts = Vec::new();
+        self.lower_assign_into(target, value, span, &mut stmts);
+        stmts
+    }
+
+    /// `(t0, t1, ...) = value;` => `let <tuple#N> = value;` then `t0 =
+    /// <tuple#N>.0;`, ... — every element read from the one evaluated value
+    /// before any is written, so `(a, b) = (b, a);` swaps.
+    fn lower_assign_into(&mut self, target: Pair<Rule>, value: Expr, span: Span, stmts: &mut Vec<Stmt>) {
+        if target.as_rule() == Rule::assign_target {
+            let target = self.lower_assign_target(target);
+            stmts.push(self.wrap(span, StmtKind::Assign { target, value }));
+            return;
+        }
+        let whole = format!("<tuple#{}>", value.id.0);
+        let let_whole = StmtKind::Let {
+            mutable: false,
+            name: whole.clone(),
+            ty: None,
+            value,
+        };
+        stmts.push(self.wrap(span, let_whole));
+        for (index, element) in target.into_inner().enumerate() {
+            let element_span = self.span_of(&element);
+            let projection = self.tuple_projection(&whole, index, element_span);
+            self.lower_assign_into(element, projection, element_span, stmts);
+        }
     }
 
     /// `assign_target = { ident ~ assign_suffix* }` — same shape `postfix`

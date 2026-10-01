@@ -92,6 +92,26 @@ fn main() -> i32 { f() }
 - `let mut` bindings can be reassigned (`b = ...;`, no `let` on the reassignment) but pay a real cost: a `let mut` binding is **never generalized** (see "Generics" below) — its type is pinned once, monomorphically, at its own declaration.
 - Type annotations are optional almost everywhere (`let a: i32 = 1;` works too) — the type checker infers what it can from how a value is used.
 
+### Tuples
+
+`(a, b)` builds a tuple, `t.0`/`t.1` read its elements, and a function returns several values as one: `fn pair(n: i32) -> (i32, i32) { (n, n * 10) }`. A `let` can take a tuple apart, and an assignment can write several variables at once:
+
+```
+fn pair(n: i32) -> (i32, i32) { (n, n * 10) }
+fn main() -> i32 {
+    let (a, mut b) = pair(2);       // a = 2, b = 20; `mut` per element
+    b = b + 1;
+    let ((c, d), e) = ((3, 4), 5);  // patterns nest
+    let mut x = 0;
+    let mut y = 0;
+    (x, y) = pair(6);               // x = 6, y = 60
+    (x, y) = (y, x);                // swaps: the right side is read in full first
+    if a == 2 and b == 21 and c + d + e == 12 and x == 60 and y == 6 { 1 } else { 0 }
+}
+```
+
+An assignment target can be any assignable place, fields and indices included: `(net, state.m) = ...;`.
+
 ## Functions, and how their types get inferred
 
 ```
