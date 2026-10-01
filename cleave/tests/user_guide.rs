@@ -412,6 +412,20 @@ fn tuples_destructured_by_let_and_assignment() {
 }
 
 #[test]
+fn structs_and_tuples_indexed_by_position() {
+    let context = context();
+    let src = "
+        struct Vec3 { x: f64, y: f64, z: f64 }
+        fn first(t) { t[0] }
+        fn main() -> i32 {
+            let v = Vec3(x: 1.0, y: 2.0, z: 3.0);
+            if v[2] == 3.0 and v[0] == v.x and first((7, 2.5)) == 7 and len(v) == 3 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+#[test]
 fn how_a_call_finds_what_it_calls() {
     let context = context();
     let src = "

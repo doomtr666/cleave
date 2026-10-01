@@ -122,8 +122,9 @@ impl FileIdGen {
 /// (`and`/`or`/`xor`/`implies`/`not` on `bool`) joined for the identical
 /// reason `num` did: `if a and b { ... }` should just work, the same as
 /// `a + b` does, not require an explicit `use logic;` for something this
-/// basic.
-const PRELUDE_CRATES: &[&str] = &["num", "logic"];
+/// basic. `core` holds the collection algebras (`Len`) every program's
+/// structs and arrays get impls of.
+const PRELUDE_CRATES: &[&str] = &["num", "logic", "core"];
 
 /// Finds a directory literally named `name` among `search_paths`, in order —
 /// "project root(s), then the shipped stdlib" per `grammar.md`. First match
@@ -315,6 +316,7 @@ pub fn compile(
         .and_then(synthesize_derive_signatures)
         .map(|program| synthesize_tuple_structs(program, &mut node_ids))
         .map(|program| synthesize_heap_struct_marker_impls(program, &mut node_ids))
+        .map(|program| synthesize_len_impls(program, &mut node_ids))
         .map(crate::resolve::resolve_calls);
     (result, sources)
 }
@@ -475,6 +477,112 @@ fn synthesize_heap_struct_marker_impls(mut program: Program, node_ids: &mut Node
                 target,
                 extra_targets: Vec::new(),
                 fns: Vec::new(),
+            }),
+        });
+    }
+    program.items.extend(synthesized);
+    program
+}
+
+/// Synthesizes `impl Len<S> { fn len(x) { <number of fields> } }` for every
+/// plain struct, tuples included (`doc/plan-compile-time-sequences.md`): data
+/// read off the declaration, like `synthesize_heap_struct_marker_impls`. A
+/// struct the program writes its own `Len` impl for gets none — what the user
+/// writes replaces what the compiler provides, never overlaps it. A no-op when
+/// no `Len` algebra is loaded.
+fn synthesize_len_impls(mut program: Program, node_ids: &mut NodeIdGen) -> Program {
+    let has_len = program
+        .items
+        .iter()
+        .any(|item| matches!(&item.kind, ItemKind::Algebra(a) if a.name == "Len"));
+    if !has_len {
+        return program;
+    }
+    let written: std::collections::HashSet<String> = program
+        .items
+        .iter()
+        .filter_map(|item| match &item.kind {
+            ItemKind::Impl(d) if d.algebra == "Len" => match &d.target.kind {
+                TypeKind::Path(p, _) => Some(p.segments.join("::")),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    let tagged = crate::cps::collect_mlir_types(&program);
+    let span = Span {
+        file: FileId(0),
+        start: 0,
+        end: 0,
+    };
+    let mut synthesized = Vec::new();
+    for item in &program.items {
+        let ItemKind::Struct(d) = &item.kind else {
+            continue;
+        };
+        if tagged.contains_key(&d.name)
+            || d.generics.iter().any(|g| g.is_variadic())
+            || written.contains(&d.name)
+        {
+            continue;
+        }
+        let args: Vec<GenericArg> = d
+            .generics
+            .iter()
+            .map(|g| {
+                GenericArg::Type(Node {
+                    id: node_ids.next(),
+                    span,
+                    kind: TypeKind::Path(Path::single(g.name().to_string()), Vec::new()),
+                })
+            })
+            .collect();
+        let target = Node {
+            id: node_ids.next(),
+            span,
+            kind: TypeKind::Path(Path::single(d.name.clone()), args),
+        };
+        let count = Node {
+            id: node_ids.next(),
+            span,
+            kind: ExprKind::NumberLit {
+                text: d.fields.len().to_string(),
+                suffix: Some("i32".to_string()),
+            },
+        };
+        let len_fn = FnDecl {
+            name: "len".to_string(),
+            attrs: Vec::new(),
+            is_extern: false,
+            extern_symbol: None,
+            is_export: false,
+            export_symbol: None,
+            generics: Vec::new(),
+            params: vec![Param {
+                name: "x".to_string(),
+                ty: None,
+                mutable: false,
+            }],
+            ret: None,
+            body: Some(Block {
+                stmts: Vec::new(),
+                tail: Some(Box::new(count)),
+            }),
+            derivative_of: None,
+            is_grad: false,
+            grad_target_param: None,
+            grad_target_index: None,
+        };
+        synthesized.push(Node {
+            id: node_ids.next(),
+            span,
+            kind: ItemKind::Impl(ImplDecl {
+                attrs: Vec::new(),
+                algebra: "Len".to_string(),
+                generics: d.generics.clone(),
+                target,
+                extra_targets: Vec::new(),
+                fns: vec![len_fn],
             }),
         });
     }

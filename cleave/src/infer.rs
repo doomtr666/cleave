@@ -1328,6 +1328,18 @@ impl Scheme {
     }
 }
 
+/// The field name standing for "the `k`-th field" in a positional access
+/// (`x[k]`, `Infer::resolve_positional`) — bracketed, so it can never collide
+/// with a declared field name (tuple fields are named `0`, `1`, ...).
+pub(crate) fn positional_field_name(k: usize) -> String {
+    format!("[{k}]")
+}
+
+/// The `k` of a `positional_field_name`, `None` for an ordinary field name.
+pub(crate) fn positional_field_index(name: &str) -> Option<usize> {
+    name.strip_prefix('[')?.strip_suffix(']')?.parse().ok()
+}
+
 /// The number of nodes in `ty` — an upper bound on how many pack elements
 /// its structure could account for (`Infer::infer_struct_lit_pack_arity`).
 fn ty_size(ty: &Ty) -> usize {
@@ -2823,6 +2835,9 @@ impl<'r> Infer<'r> {
         name: &str,
         span: Span,
     ) -> Result<Ty, TypeError> {
+        if let Some(k) = positional_field_index(name) {
+            return self.resolve_positional(resolved, k, span);
+        }
         match resolved {
             // Non-generic struct (or any other bare concrete type — see the
             // `None` arm below) — field's declared type needs no further
@@ -4946,6 +4961,53 @@ impl<'r> Infer<'r> {
         Ok(())
     }
 
+    /// Whether `x[k]` on a value of type `ty` means its `k`-th field: a
+    /// struct (tuples included) with no `Index` impl. A type that has one —
+    /// an array-backed collection (`DynArray`), a `#[mlir_type]` tensor —
+    /// keeps `Index`, a run-time index into homogeneous elements.
+    pub(crate) fn is_positional_struct(&mut self, ty: &Ty) -> bool {
+        let name = match ty {
+            Ty::Con(n) | Ty::App(n, _) => n.clone(),
+            _ => return false,
+        };
+        if !self.registry.has_struct(&name) {
+            return false;
+        }
+        if !self.registry.has_algebra("Index") {
+            return true;
+        }
+        // Impls name `Index<Container, Elem>` and leave `K` implicit, or name
+        // all three: either one makes `ty` an `Index` collection.
+        let elem = self.vars.fresh();
+        let two = self.has_matching_impl("Index", &[ty.clone(), elem.clone()]);
+        let three = two
+            || self.has_matching_impl("Index", &[ty.clone(), elem, Ty::Const(ConstValue::Int(1))]);
+        !three
+    }
+
+    /// `x[k]` once `x`'s type is known: the `k`-th declared field of a
+    /// positional struct (`is_positional_struct`), otherwise an ordinary
+    /// single index (`resolve_index`) — an array, or an `Index` impl.
+    fn resolve_positional(&mut self, base: &Ty, k: usize, span: Span) -> Result<Ty, TypeError> {
+        if self.is_positional_struct(base) {
+            let (Ty::Con(struct_name) | Ty::App(struct_name, _)) = base else {
+                unreachable!("is_positional_struct only accepts Con/App")
+            };
+            let fields = self.registry.struct_fields(struct_name).unwrap_or(&[]);
+            let Some(field) = fields.get(k).map(|f| f.name.clone()) else {
+                return Err(TypeError {
+                    span,
+                    kind: TypeErrorKind::NoSuchField {
+                        struct_name: struct_name.clone(),
+                        field: positional_field_name(k),
+                    },
+                });
+            };
+            return self.resolve_field_access(base, &field, span);
+        }
+        self.resolve_index(base.clone(), &[Ty::Con("i32".to_string())], &[span], span, span)
+    }
+
     /// Resolves every pending field access whose base is concrete by now —
     /// repeatedly, since one resolution can make the next one's base concrete
     /// (`n.l1.x`). Run before `apply_defaults`, so a field's real declared
@@ -6095,6 +6157,36 @@ impl<'r> Infer<'r> {
                     ));
                     index_tys.push(idx_ty);
                     index_spans.push(idx.span);
+                }
+                // `x[k]` with an index that folds: positional access, the
+                // `k`-th field of a struct or tuple with no `Index` impl, the
+                // ordinary `Index` path otherwise (`resolve_positional`). Goes
+                // through the field-access machinery, so a still-open base is
+                // deferred, or generalized into a `FieldConstraint`, exactly
+                // like `x.name` (`fn first(t) { t[0] }`).
+                if let [idx] = indices.as_slice() {
+                    let mapping = self.active_generics.clone();
+                    if let Some(Ty::Const(ConstValue::Int(k))) = self.const_value_from_expr(idx, &mapping) {
+                        let field = positional_field_name(k as usize);
+                        match &resolved_base {
+                            Ty::Var(_) => {
+                                let Ty::Var(result) = self.vars.fresh() else {
+                                    unreachable!("fresh() always returns Ty::Var")
+                                };
+                                self.pending_field_accesses.push(PendingFieldAccess {
+                                    base: resolved_base.clone(),
+                                    field,
+                                    result,
+                                    span: expr.span,
+                                });
+                                return Ok(Ty::Var(result));
+                            }
+                            _ if self.is_positional_struct(&resolved_base) => {
+                                return self.resolve_field_access(&resolved_base, &field, expr.span);
+                            }
+                            _ => {}
+                        }
+                    }
                 }
                 match &resolved_base {
                     // Still abstract — but *not* a dead end the way an

@@ -73,7 +73,9 @@ What still fails, by nature:
   fields implement it ("parameter trees"), derived by the compiler — a real design decision (an explicit
   `derive`-like mechanism, or algebras declared as structurally recursive).
 - **Stdlib gaps** — no `argmax`, `softmax`, cross-entropy or accuracy helpers (the evaluation loop is
-  written by hand); `println(("Epoch=", epoch))` needs a tuple to print several values.
+  written by hand). Decided for `argmax`: first `argmax_rows(t: Tensor<T, R, C>) -> [i32; R]` in
+  `linalg` (a plain array, since `Tensor<T: Float, ...>` can't hold `i32`), later `Tensor`s of
+  non-float elements, which quantization will need anyway; `println(("Epoch=", epoch))` needs a tuple to print several values.
 - Already tracked separately: a matmul whose row count isn't a multiple of 8 doesn't compile (evaluation
   uses batches of 80 because of it).
 
@@ -81,6 +83,47 @@ Suggested order: the two bugs first (clear fixes, and the first one is exactly t
 inconsistency that gets harder to fix later), then the small language gaps (pack-arity inference, tuple
 destructuring), then the design questions with the user: structural derivation, generic `grad()`, and
 how host data becomes a tensor.
+
+---
+
+## Indexable collections as algebras: `x[i]` on structs and tuples, unrolled `for`, comprehensions, slices
+
+Designed in `doc/plan-compile-time-sequences.md`, not started: arrays, tensors, tuples and structs all
+indexed through stdlib algebras (`Index` for a runtime index, `Field<S, I, F>` for a constant one,
+synthesized per struct), under the same rule as const generics — legal wherever it folds at compile
+time, no hint. What makes "apply to every layer" (training a user `Network` without a hand-written
+`impl Optimizer`/`NetworkState`), the fifteen per-arity `Print` tuple impls in `stdlib/io/io.cleave`,
+and slices (`t[1:]`, `t[:25]`) expressible.
+
+## Literal suffixes, units of measure, and folding driven by the algebras (idea, 2026-10-01)
+
+Three ideas that hold together, none started:
+
+- **User-defined literal suffixes.** `2v`, `1.5ma`, `3db` desugar to an algebra call on the literal, the
+  way `+` desugars to `add`. First client: the imaginary suffix `4i`, hard-coded in the compiler today
+  (`ExprKind::ImaginaryLit`), which would move to `stdlib/complex` — one primitive fewer.
+- **Units of measure as types** (F#'s units of measure): `Quantity<T, const M, const L, const S, const A>`,
+  `mul`/`div` adding/subtracting exponents through const-generic folding, `add` requiring equal
+  exponents, zero run-time cost. A strong argument for cleave-cast (a PINN whose loss is physical
+  equations, checked dimensionally by the compiler).
+- **Folding by evaluating the algebra's own definition.** `const_eval.rs` knows integer `add`/`sub`/
+  `mul`/`div` in Rust, whatever the algebra: the one place the compiler "knows how to count", and wrong
+  for any algebra redefining `+` (decibels add logarithmically: `3dB + 3dB` ≈ 6.02 dB). Folding should
+  run the impl (`Ring<i32>::add`, `dB::add`, `Quantity::mul`) on constants instead — compile-time
+  evaluation of pure cleave functions, possibly through the existing JIT. Closes the leak and leaves the
+  compiler's core purely structural.
+- **The same compile-time evaluator would open user-defined transformations** beyond `derivative`
+  (PDF → CDF, interval arithmetic, uncertainty propagation): compositional ones are expressible today as
+  a type plus its algebras (`Dual<T>`, `Interval<T>`), or as declared per-operation rules generalizing
+  `derivative`; non-compositional ones (integration, inversion) only through rule tables and numerics.
+  Fun, not planned.
+
+## A zero-field struct built with `Name()` passes inference, then panics CPS conversion
+
+`struct Nil {}` ... `Nil()` type-checks (`infer.rs`'s `Empty()` special case) but `cps.rs::resolve_call`
+then treats it as a call: `CPS: could not resolve call to `Nil``. Found prototyping cons lists; worked
+around with a dummy field. CPS needs the same "zero-arg call to a zero-field struct is a construction"
+case inference already has.
 
 ---
 

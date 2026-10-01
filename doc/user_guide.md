@@ -94,7 +94,7 @@ fn main() -> i32 { f() }
 
 ### Tuples
 
-`(a, b)` builds a tuple, `t.0`/`t.1` read its elements, and a function returns several values as one: `fn pair(n: i32) -> (i32, i32) { (n, n * 10) }`. A `let` can take a tuple apart, and an assignment can write several variables at once:
+`(a, b)` builds a tuple, `t[0]`/`t[1]` read its elements (`t.0` works too), `t.len()` counts them, and a function returns several values as one: `fn pair(n: i32) -> (i32, i32) { (n, n * 10) }`. A `let` can take a tuple apart, and an assignment can write several variables at once:
 
 ```
 fn pair(n: i32) -> (i32, i32) { (n, n * 10) }
@@ -111,6 +111,17 @@ fn main() -> i32 {
 ```
 
 An assignment target can be any assignable place, fields and indices included: `(net, state.m) = ...;`.
+
+A tuple is an anonymous struct, and the same indexing works on any struct: `v[0]` is its first declared field, `len(v)` its number of fields. The index must be known at compile time (a literal, a constant, a const generic) since each field can have its own type; a collection whose elements share one type (an array, a `DynArray`) is indexed with any run-time value as usual.
+
+```
+struct Vec3 { x: f64, y: f64, z: f64 }
+fn first(t) { t[0] }                       // any struct or tuple
+fn main() -> i32 {
+    let v = Vec3(x: 1.0, y: 2.0, z: 3.0);
+    if v[2] == 3.0 and v[0] == v.x and first((7, 2.5)) == 7 and len(v) == 3 { 1 } else { 0 }
+}
+```
 
 ## Functions, and how their types get inferred
 

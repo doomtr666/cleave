@@ -257,6 +257,12 @@ pub struct ConcreteUnit {
     /// to — this only carries *which argument positions* were erased to get
     /// there. Empty for every call that doesn't need this.
     pub higher_order_args: HashMap<NodeId, Vec<usize>>,
+    /// `x[k]` nodes that are a positional field access (`k` folded, `x` a
+    /// struct or tuple with no `Index` impl, `Infer::is_positional_struct`),
+    /// mapped to the declared name of field `k` — converted to the same
+    /// `PrimOp::Field` projection as `x.name`. Filled at the end of
+    /// `collect_units`, which has the registry this needs.
+    pub positional_fields: HashMap<NodeId, String>,
     pub body: UnitBody,
 }
 
@@ -472,6 +478,7 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                         capture_count: 0,
                         baked_closures: Vec::new(),
                         higher_order_args: HashMap::new(),
+                        positional_fields: HashMap::new(),
                         body,
                     });
                 } else {
@@ -491,6 +498,7 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                             capture_count: 0,
                             baked_closures: Vec::new(),
                             higher_order_args: HashMap::new(),
+                            positional_fields: HashMap::new(),
                             body: UnitBody::Real(mono.body(key).clone()),
                         });
                     }
@@ -607,6 +615,7 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                         capture_count: 0,
                         baked_closures: Vec::new(),
                         higher_order_args: HashMap::new(),
+                        positional_fields: HashMap::new(),
                         body,
                     });
                 }
@@ -663,6 +672,7 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                             capture_count: 0,
                             baked_closures: Vec::new(),
                             higher_order_args: HashMap::new(),
+                            positional_fields: HashMap::new(),
                             body,
                         });
                     }
@@ -728,14 +738,58 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                 capture_count: capture_names.len(),
                 baked_closures: Vec::new(),
                 higher_order_args: HashMap::new(),
+                positional_fields: HashMap::new(),
                 body: UnitBody::Real(body.clone()),
             });
         }
     }
 
     build_higher_order_specializations(&mut units);
+    for unit in &mut units {
+        if let UnitBody::Real(body) = &unit.body {
+            unit.positional_fields = positional_fields(body, &unit.node_types, registry);
+        }
+    }
 
     units
+}
+
+/// See `ConcreteUnit::positional_fields`.
+fn positional_fields(
+    body: &Block,
+    node_types: &HashMap<NodeId, Ty>,
+    registry: &Registry,
+) -> HashMap<NodeId, String> {
+    let mut exprs = Vec::new();
+    crate::monomorphize::collect_exprs_block(body, &mut exprs);
+    let mut infer = crate::infer::Infer::new(registry);
+    let mut out = HashMap::new();
+    for e in exprs {
+        let ExprKind::Index(base, indices) = &e.kind else { continue };
+        let [idx] = indices.as_slice() else { continue };
+        let Some(base_ty) = node_types.get(&base.id) else { continue };
+        if !infer.is_positional_struct(base_ty) {
+            continue;
+        }
+        let Some(k) = folded_index(idx, node_types) else { continue };
+        let (Ty::Con(name) | Ty::App(name, _)) = base_ty else { continue };
+        if let Some(field) = registry.struct_fields(name).and_then(|fs| fs.get(k)) {
+            out.insert(e.id, field.name.clone());
+        }
+    }
+    out
+}
+
+/// A folded index's value: a literal, or anything monomorphization pinned to
+/// a constant (a const generic, an unrolled loop variable).
+fn folded_index(idx: &Expr, node_types: &HashMap<NodeId, Ty>) -> Option<usize> {
+    if let ExprKind::NumberLit { text, .. } = &idx.kind {
+        return text.parse().ok();
+    }
+    match node_types.get(&idx.id)? {
+        Ty::Const(ConstValue::Int(k)) => Some(*k as usize),
+        _ => None,
+    }
 }
 
 /// **Stage B: higher-order calls.** `apply(inc, 5)` — `apply`'s own
@@ -962,6 +1016,7 @@ fn build_higher_order_specializations(units: &mut Vec<ConcreteUnit>) {
             capture_count: 0,
             baked_closures,
             higher_order_args: HashMap::new(),
+            positional_fields: HashMap::new(),
             body: UnitBody::Real(callee_body),
         });
 
@@ -1335,6 +1390,7 @@ struct Ctx<'a> {
     /// Stage B only — see `ConcreteUnit::higher_order_args`'s own doc
     /// comment.
     higher_order_args: &'a HashMap<NodeId, Vec<usize>>,
+    positional_fields: &'a HashMap<NodeId, String>,
     fresh: &'a FreshVars,
     /// One entry per currently-open, break-guarded loop (`While`/`For`/
     /// `ForIn`/`Loop` — only ones `loop_contains_break` found to actually
@@ -1518,6 +1574,7 @@ pub fn convert_program(units: Vec<ConcreteUnit>, sources: Option<&SourceMap>) ->
             global_consts: &unit.global_consts,
             call_names: &unit.call_names,
             higher_order_args: &unit.higher_order_args,
+            positional_fields: &unit.positional_fields,
             fresh: &fresh,
             break_targets: RefCell::new(Vec::new()),
             sources,
@@ -2817,6 +2874,24 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
         // just below (an algebra-dispatched result chained through another
         // `[...]` would need its own, separate `Index` impl on `Elem` --
         // real, natural, and not attempted here).
+        // `x[k]` on a struct or tuple: the same projection as `x.name`.
+        ExprKind::Index(base, _) if ctx.positional_fields.contains_key(&expr.id) => {
+            let struct_ty = ctx.node_types[&base.id].clone();
+            let field = ctx.positional_fields[&expr.id].clone();
+            convert_expr(base, env, ctx, &|base_val, env| {
+                let var = ctx.fresh.var();
+                CExpr::LetPrim {
+                    var: { ctx.line(var); var },
+                    ty: ctx.node_types[&expr.id].clone(),
+                    op: PrimOp::Field {
+                        struct_ty: struct_ty.clone(),
+                        field: field.clone(),
+                    },
+                    args: vec![base_val],
+                    cont: Box::new(k(CVal::Var(var), env)),
+                }
+            })
+        }
         ExprKind::Index(base, _indices) if matches!(ctx.node_types[&base.id], Ty::Array(..)) => {
             let (array_expr, index_exprs) = collect_index_chain(expr);
             let array_ty = ctx.node_types[&array_expr.id].clone();

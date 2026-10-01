@@ -1916,7 +1916,11 @@ fn collect_instantiations_expr(
             // CPS-conversion time, `K` known directly from `indices.len()`,
             // no real `Expr`/`NodeId` needed for "the idx array" at all.
             if let Some(base_ty) = node_types.get(&base.id).cloned() {
-                if !matches!(base_ty, Ty::Array(..)) {
+                // A struct or tuple indexed by position (`x[0]`) is a field
+                // projection, not an `Index` dispatch (`Infer::is_positional_struct`).
+                if !matches!(base_ty, Ty::Array(..))
+                    && !Infer::new(registry).is_positional_struct(&base_ty)
+                {
                     let idx_array_ty = Ty::Array(
                         Box::new(Ty::Con("i32".to_string())),
                         Box::new(Ty::Const(ConstValue::Int(indices.len() as u64))),

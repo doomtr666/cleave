@@ -5598,6 +5598,66 @@ fn a_generic_fns_result_type_is_pinned_by_its_call_site() {
     assert_eq!(run_i32(&context, src), 1);
 }
 
+/// `x[k]` with a folding index on a struct or tuple is its `k`-th field (the
+/// same projection as `x.name`), in concrete and generic code alike; a
+/// collection with an `Index` impl (`DynArray`) keeps run-time indexing.
+#[test]
+fn positional_indexing_of_structs_and_tuples() {
+    let context = context();
+    let src = "
+        use dynarray;
+        struct Vec3 { x: f64, y: f64, z: f64 }
+        struct Mixed { n: i32, w: f64 }
+        fn first(t) { t[0] }
+        fn main() -> i32 {
+            let t = (7, 2.5, 9);
+            let v = Vec3(x: 1.0, y: 2.0, z: 3.0);
+            let m = Mixed(n: 4, w: 0.5);
+            let d: DynArray<i32> = dynarray_new(4);
+            d.push(10);
+            d.push(20);
+            let i = 1;
+            if t[0] == 7 and t[1] == 2.5 and t[2] == 9 and v[2] == 3.0 and v[0] == v.x
+                and first(m) == 4 and first(v) == 1.0 and first(t) == 7
+                and d[0] == 10 and d[i] == 20 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// A position past the last field is a compile error.
+#[test]
+fn positional_indexing_past_the_last_field_is_rejected() {
+    let errors = type_errors(
+        "
+        struct Mixed { n: i32, w: f64 }
+        fn main() -> i32 { let m = Mixed(n: 4, w: 0.5); m[2] }
+    ",
+    );
+    assert!(errors.iter().any(|e| e.contains("[2]")), "got: {errors:?}");
+}
+
+/// `Len` (`stdlib/core`): synthesized for every struct and tuple (its number
+/// of fields), an array's size, a `DynArray`'s current length.
+#[test]
+fn len_of_tuples_structs_arrays_and_dynarrays() {
+    let context = context();
+    let src = "
+        use dynarray;
+        struct Vec3 { x: f64, y: f64, z: f64 }
+        fn main() -> i32 {
+            let t = (7, 2.5, 9, 1);
+            let v = Vec3(x: 1.0, y: 2.0, z: 3.0);
+            let a = [1, 2, 3, 4, 5];
+            let d: DynArray<i32> = dynarray_new(4);
+            d.push(1);
+            d.push(2);
+            if t.len() == 4 and len(v) == 3 and a.len() == 5 and d.len() == 2 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
 fn type_errors(src: &str) -> Vec<String> {
     let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));

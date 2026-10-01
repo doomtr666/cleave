@@ -1,0 +1,13 @@
+// The prelude's collection algebras (`doc/plan-compile-time-sequences.md`).
+//
+// `Len` gives every collection its number of elements: an array's is its
+// size, a `DynArray`'s its current length, and every struct or tuple gets one
+// synthesized by the compiler (its number of fields, `driver.rs::
+// synthesize_len_impls`) unless the program writes its own.
+algebra Len<C> {
+    fn len(c: C) -> i32;
+}
+
+impl<T, const N: i32> Len<[T; N]> {
+    fn len(c) { N }
+}

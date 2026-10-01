@@ -154,7 +154,9 @@ fn push<T>(mut v: DynArray<T>, x: T) {
 }
 fn get<T>(v: DynArray<T>, i: i32) -> T { raw_get(v.buf, i) }
 fn set<T>(v: DynArray<T>, i: i32, x: T) { raw_set(v.buf, i, x); }
-fn len<T>(v: DynArray<T>) -> i32 { v.len }
+impl<T> Len<DynArray<T>> {
+    fn len(v) { v.len }
+}
 
 // `v[i]` (read) — reuses `vector`'s own `Index<Container, Elem, K>` fallback
 // dispatch, the exact mechanism `Tensor` already uses for its own non-array
