@@ -29,15 +29,17 @@ fork exists. Short version:
 
 ```powershell
 .\scripts\setup-toolchain.ps1
+.\scripts\setup-openblas.ps1
 cargo build --release
 cargo test --release
 ```
 
-The script downloads the prebuilt toolchain
+The first script downloads the prebuilt toolchain
 [`cleave-llvm-redist`](https://github.com/doomtr666/cleave-llvm-redist)
 publishes and points `cargo` at it automatically — no manual env vars, no
 building LLVM from source (unless you want to; `doc/building.md` covers
-that path too).
+that path too). The second fetches the prebuilt OpenBLAS `cleave-rt` loads
+at runtime for `blas::sgemm` (`stdlib/blas`); the tests that call it need it.
 
 `cargo build --workspace`/`cargo test --workspace` also walks
 `examples/digits-interop`/`examples/mnist-interop` — real network access

@@ -65,6 +65,22 @@ jobs:
         shell: pwsh
         run: .\scripts\setup-toolchain.ps1 -ExistingPrefix C:\llvm-mlir-22
 
+      # `cleave-rt` loads `openblas.dll` at runtime from `target\openblas`
+      # (`cleave-rt/Cargo.toml`'s own doc comment) -- without this step,
+      # every test that really calls `cleave_blas_sgemm` (`tests/blas.rs`,
+      # `examples/blas_demo.cleave`) fails to find it. The script itself
+      # skips the download when the cached copy already matches
+      # `ci/openblas-version.txt`.
+      - name: Cache prebuilt OpenBLAS
+        uses: actions/cache@v4
+        with:
+          path: target\openblas
+          key: cleave-openblas-${{ hashFiles('ci/openblas-version.txt') }}
+
+      - name: Download prebuilt OpenBLAS
+        shell: pwsh
+        run: .\scripts\setup-openblas.ps1
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -77,9 +93,8 @@ jobs:
 
       # `RUST_MIN_STACK` -- `cargo test`'s own worker threads get an
       # ordinary, small default stack, regardless of `--release` --
-      # confirmed directly to matter for real: `dps_rewrite.rs::matmul_
-      # reduction_is_correct_across_more_than_one_vector_width` (deep
-      # e-graph/CPS recursion, the same class of depth `cleave-build`'s own
+      # confirmed directly to matter for real: deep e-graph/CPS recursion
+      # in real tests (the same class of depth `cleave-build`'s own
       # dedicated 1GB build thread and `main.rs`'s own 1GB main-thread
       # stack already exist to give the *compiler* itself, `cleave-build/
       # src/lib.rs`'s own doc comment) overflows the default stack under
