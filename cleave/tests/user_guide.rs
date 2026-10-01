@@ -378,6 +378,20 @@ fn algebras_how_operators_actually_work() {
     assert_eq!(run_i32(&context, src), 1);
 }
 
+#[test]
+fn how_a_call_finds_what_it_calls() {
+    let context = context();
+    let src = "
+        algebra Doubling<T> { fn twice(x: T) -> T; }
+        impl Doubling<i32> { fn twice(x) { x * 2 } }
+        fn twice(x: i32) -> i32 { x * 10 }
+        fn main() -> i32 {
+            twice(5) + Doubling::twice(5)
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 60);
+}
+
 // ---------------------------------------------------------------- Inherent impls
 
 /// Inherent impls are gone as a language concept -- `v.method(args)` is now

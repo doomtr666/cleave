@@ -238,7 +238,31 @@ fn main() -> i32 {
 
 **An `impl` method's parameters usually don't need annotating** — they're checked against, and default to, the algebra's own declared signature. Write the annotation anyway when it makes the code more readable; the type checker treats it as a redundant check against the algebra's own truth, not a second, independent source of it.
 
-**Two algebras declaring the same operation name is an ambiguity, rejected outright, not silently guessed:** if both `Ring<T>` and some other algebra also declare `add`, calling `a + b` (with a type that has an `impl` for both) is a hard compile error — the language has no "pick whichever seems more specific" heuristic. This is deliberate: two genuinely different `add`s on the same type (wrapping vs. saturating arithmetic, say) are both legitimate, and guessing which one you meant would be worse than asking. There's no qualified-call syntax to disambiguate yet either (`doc/backlog.md`) — see "Heterogeneous algebras" below for how `MatMul<A,B,C>`'s own `matmul` routes around exactly this by not naming itself `mul`.
+### How a call finds what it calls
+
+A bare call `f(x)` (and a dot-call `x.f()`, which is the same call) is resolved by where `f` is declared, looked up in this order:
+
+1. **A local binding** in scope: a parameter, a `let`, a lambda parameter, a `for` variable.
+2. **A top-level `fn`** named `f`, including an `extern fn` or a `grad`/`derive` declaration.
+3. **The method `f` of an algebra**, taking that many arguments.
+
+The first match wins, so a local or a top-level `fn` shadows an algebra method of the same name, whatever the types involved:
+
+```
+algebra Doubling<T> { fn twice(x: T) -> T; }
+impl Doubling<i32> { fn twice(x) { x * 2 } }
+fn twice(x: i32) -> i32 { x * 10 }   // shadows Doubling::twice
+fn main() -> i32 {
+    twice(5) + Doubling::twice(5)    // 50 + 10
+}
+```
+
+Two forms skip this lookup and always reach the algebra:
+
+- **An operator.** `a + b` always calls the algebra method `add`, even when a local or a top-level `fn` named `add` exists (that `fn` stays callable as `add(a, b)`).
+- **A qualified call**, `Algebra::method(args)`: `Ring::add(a, b)` reaches `Ring`'s `add` whatever else is in scope.
+
+**Two algebras declaring the same method name and arity is an ambiguity, rejected rather than guessed:** if both `Ring<T>` and some other algebra declare a 2-argument `add`, a bare `add(a, b)` or `a + b` is a compile error naming both algebras. Two genuinely different `add`s (wrapping vs. saturating arithmetic, say) are both legitimate, and guessing which one you meant would be worse than asking. Qualify the call to choose: `Ring::add(a, b)`. `nn`'s `Activation::tanh` and `num`'s `Transcendental::tanh` are a real example: with both in scope, write the one you mean.
 
 **Recursion within your own `impl`, watch the base case:** `impl Ring<Vec2> { fn add(a, b) { a + b } }`, with `a`/`b` typed `Vec2` directly, would be `Ring::add` calling `Ring::add` for the exact same type forever — no base case. This type-checks fine (it's not a type error — nothing about the *types* is wrong), but it's an infinite loop the moment it would actually run. The correct version bottoms out at the *field* level, where `a.x + b.x` dispatches to a *different*, more primitive `impl` (`Ring<f64>`, from the prelude) — exactly what `translate` above already does.
 
@@ -430,7 +454,7 @@ fn main() -> i32 {
 
 `matmul`'s own shape checking is real: swap `b` for one whose first dimension doesn't match `a`'s own second dimension (a genuinely invalid multiplication) and the call is rejected at compile time, not silently accepted with a garbage result type.
 
-**Not named `mul`, and not wired to `*`, on purpose:** `algebras_with_fn` picks a call's candidate algebra by name and arity alone, with no shape disambiguation at that stage — a second algebra also declaring a 2-arg `mul` would make *every* `*` in the program ambiguous, including a genuinely scalar one. No qualified-call syntax exists yet to disambiguate (`doc/backlog.md`), so matrix multiplication stays an ordinary named method, called directly.
+**Not named `mul`, and not wired to `*`, on purpose:** `algebras_with_fn` picks a call's candidate algebra by name and arity alone, with no shape disambiguation at that stage — a second algebra also declaring a 2-arg `mul` would make *every* `*` in the program ambiguous, including a genuinely scalar one. A qualified call (`MatMul::mul`) would disambiguate, but writing it at every scalar `*` would be a poor trade, so matrix multiplication stays an ordinary named method, called directly.
 
 ## Higher-order functions: passing a function as a value
 

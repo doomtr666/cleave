@@ -1,18 +1,7 @@
-// The real MNIST handwritten-digit dataset (28x28 grayscale, 10 classes,
-// 60,000 training / 10,000 test images) -- loaded over HTTP and cached
-// locally via Rust (`../data.rs`'s own doc comment explains why: cleave has
-// no file I/O or network access of its own), fed in one scalar at a time
-// through `extern fn`, the same mechanism `examples/digits-interop` already
-// proved out at UCI-digits scale (8x8, 64 pixels). This is the deliberately
-// "fattest reasonable" version reachable with today's stdlib alone (`doc/
-// backlog.md`'s own "digits-interop" perf item just closed the compile-time
-// wall that used to make anything bigger than 64->32->10 impractical to even
-// try) -- a real, deep, wide `ReLU` MLP (784 -> 512 -> 256 -> 128 -> 10), not
-// a toy. No convolution/pooling/softmax+cross-entropy -- those are real,
-// separate, much bigger stdlib undertakings (new algebras of their own),
-// deliberately out of scope for this iteration; plain sum-of-squares
-// regression against a one-hot target, `Dense`/`Activation`/`Sum`/`Init`/
-// `Optimizer`, all already real and tested, is what this stresses.
+// MNIST handwritten digits (28x28 grayscale, 10 classes): a 784 -> 512 -> 256 -> 128 -> 10 ReLU MLP,
+// trained with plain SGD on a sum-of-squares loss against one-hot targets. The data is loaded by the
+// Rust host (`data.rs`) and handed over one batch per `extern` call. Line-for-line twin of
+// `bench/mnist-pytorch/mnist_bench.py`.
 use nn;
 use linalg;
 use io;
@@ -20,7 +9,6 @@ use io;
 extern fn train_len() -> i32;
 extern fn test_len() -> i32;
 extern fn test_label(sample: i32) -> i32;
-// One call per batch, writing straight into the array argument (`data.rs`).
 extern fn train_batch_pixels(sample: i32, out: [[f32; 784]; 32]);
 extern fn train_batch_targets(sample: i32, out: [[f32; 10]; 32]);
 extern fn test_batch_pixels(sample: i32, out: [[f32; 784]; 80]);
@@ -45,17 +33,17 @@ impl<Opt, StateL1, StateL2, StateL3, StateL4>
 {
     fn init_state(opt, model) {
         NetworkState(
-            l1: Optimizer::init_state(opt, model.l1),
-            l2: Optimizer::init_state(opt, model.l2),
-            l3: Optimizer::init_state(opt, model.l3),
-            l4: Optimizer::init_state(opt, model.l4)
+            l1: init_state(opt, model.l1),
+            l2: init_state(opt, model.l2),
+            l3: init_state(opt, model.l3),
+            l4: init_state(opt, model.l4)
         )
     }
     fn step(opt, model, grad, state) {
-        let r1 = Optimizer::step(opt, model.l1, grad.l1, state.l1);
-        let r2 = Optimizer::step(opt, model.l2, grad.l2, state.l2);
-        let r3 = Optimizer::step(opt, model.l3, grad.l3, state.l3);
-        let r4 = Optimizer::step(opt, model.l4, grad.l4, state.l4);
+        let r1 = step(opt, model.l1, grad.l1, state.l1);
+        let r2 = step(opt, model.l2, grad.l2, state.l2);
+        let r3 = step(opt, model.l3, grad.l3, state.l3);
+        let r4 = step(opt, model.l4, grad.l4, state.l4);
         (
             Network(l1: r1.0, l2: r2.0, l3: r3.0, l4: r4.0),
             NetworkState(l1: r1.1, l2: r2.1, l3: r3.1, l4: r4.1)
@@ -63,36 +51,6 @@ impl<Opt, StateL1, StateL2, StateL3, StateL4>
     }
 }
 
-// Real batching (`doc/backlog.md`'s own "OpenMP parallelization" item):
-// the OpenMP thread distribution added to `pipeline.rs::emit_object`
-// (`--affine-parallelize{max-nested=1}`, spreading the matmul's own
-// *outer* dimension across cores) delivered zero real speedup on this
-// exact kernel, measured directly (1062.0s vs. a 1073.4s serial baseline,
-// while the machine's cores sat at 96% -- pure synchronization overhead,
-// no useful work distributed) precisely because every matmul here used to
-// have an outer/row dimension of exactly 1 (`Tensor<f32,1,...>` -- one
-// training sample at a time). Batching `B` samples together gives that
-// same dimension real width to actually distribute -- `matmul`/`Sum::sum`/
-// `Optimizer::step` were already fully generic over it (verified directly,
-// zero stdlib changes needed there); `dense_forward`/`Broadcast0` (`stdlib/
-// nn/nn.cleave`) are the one real piece of new stdlib machinery this
-// needed (`Dense`'s own bias, stored `Tensor<T,1,Out>` regardless of `B`,
-// needs a genuine broadcast-add, not the plain same-shape `Ring::add`
-// `Dense::forward`'s own single-row form could get away with).
-//
-// `B = 32` -- `train_len()` (60,000 for real MNIST) divides evenly
-// (1,875 batches, no partial-batch remainder to handle), and is
-// comfortably wider than this machine's own core count for the
-// parallelization to actually have real width to spread across.
-// `b` a manual counter, not `for b in 0..B`'s own loop variable used
-// directly in `batch_start + b` -- a real, separate, found-by-testing
-// compiler bug (`doc/backlog.md`'s own "A `for` loop bound to a const
-// generic..." item): a `for`-loop-bound variable, when the loop's own
-// bound is a *const generic* (`B`), breaks CPS conversion the moment it's
-// used in ordinary arithmetic (fine as a plain array index, `Sum::sum`'s
-// own established pattern) -- confirmed to reproduce with a minimal,
-// `Tensor`-free probe. The loop-bound variable (`_k`, discarded) is never
-// referenced, sidestepping it entirely.
 fn load_train_batch_input(batch_start: i32) -> Tensor<f32, 32, 784> {
     let mut pixels: [[f32; 784]; 32] = mlir::memref::alloc();
     train_batch_pixels(batch_start, pixels);
@@ -111,72 +69,25 @@ fn load_test_batch_input(batch_start: i32) -> Tensor<f32, 80, 784> {
     Tensor::<f32, 80, 784>(data: pixels)
 }
 
-// No final activation -- raw logits, matching `examples/digits-interop`'s
-// own identical design ("no activation baked in" stance, `stdlib/nn/
-// nn.cleave`'s own `dense_forward` doc comment). `ReLU` between every hidden
-// layer -- the standard choice for a network this deep (avoids `sigmoid`'s
-// own vanishing-gradient problem at four layers), matching `Init::he()`
-// below.
-// `dense_forward` (`stdlib/nn/nn.cleave`), a plain top-level generic fn --
-// `B` is a generic *owned by this call itself* (varies per call site:
-// `B=32` here during training, `B=1` from `evaluate` below, same `net`
-// either way), which is exactly the shape `doc/backlog-done.md`'s own "An
-// inherent-impl method's own generics aren't picked up by inference at all"
-// entry found broken for an inherent method's *own* additional generics at
-// the time -- moot now regardless (inherent impls aren't a language concept
-// any more at all, `doc/backlog-done.md`'s own "impls inhérents" entry).
-// `forward` itself stays generic over `B` for the identical reason.
-fn forward<const B: i32>(x: Tensor<f32, B, 784>, net: Network) -> Tensor<f32, B, 10> {
-    let h1 = relu(dense_forward(net.l1, x));
-    let h2 = relu(dense_forward(net.l2, h1));
-    let h3 = relu(dense_forward(net.l3, h2));
-    dense_forward(net.l4, h3)
+// Raw logits, no final activation.
+fn forward(x, net: Network) {
+    let h1 = relu(net.l1.dense_forward(x));
+    let h2 = relu(net.l2.dense_forward(h1));
+    let h3 = relu(net.l3.dense_forward(h2));
+    net.l4.dense_forward(h3)
 }
 
-// Stays tensor-native throughout -- `examples/digits-interop`'s own identical
-// `loss` doc comment for why this exact shape (`Ring::sub`/`Ring::mul`/
-// `Sum::sum`, each with a real declared `adjoint` rule) is what `grad()`'s
-// own reverse-mode backend needs to differentiate through at all. `sum`
-// now sums over the whole 32-sample batch, not just one row -- a real,
-// necessary behavior change (a plain sum, not a mean), accounted for by
-// scaling `lr` down at the SGD call site below rather than scaling the
-// loss itself (`sum`/`Sum::sum` stay exactly as general-purpose as before,
-// no batch-aware special case needed there).
-//
-// A plain, concrete `fn` (batch size `32` fixed directly in its own
-// signature), not generic over `B` the way `forward`/`dense_forward` stay
-// -- found directly, not assumed: `grad(loss)` rejects a generic `loss`
-// outright ("`loss` is generic — only a non-generic function can be
-// derived"), a real, clean, located error, not a crash. `forward(x, net)`
-// below still calls the *generic* `forward<B>` -- this one call site pins
-// its own `B` to `32` via ordinary monomorphization, the same way any
-// other concrete call to a generic top-level `fn` already does.
+// A sum over the batch, not a mean: `lr` is divided by the batch size instead.
 fn loss(x: Tensor<f32, 32, 784>, y: Tensor<f32, 32, 10>, net: Network) -> f32 {
-    let pred = forward(x, net);
-    let err = pred - y;
+    let err = forward(x, net) - y;
     sum(err * err)
 }
 
-// `grad()`, not `derive()` -- `doc/backlog.md`'s own "Reverse-mode (`grad()`)
-// differentiation" item: cost independent of any single layer's own shape,
-// the real point of this whole mechanism, now exercised at real MNIST scale
-// (four genuinely non-square layers) instead of just the two `digits-
-// interop` already proved out.
-//
-// `grad(loss, net)`, not the bare `grad(loss)` this file used to write --
-// naming the one real target parameter (`grammar.pest`'s own `derive_decl`
-// doc comment has the full story): `net_grad`'s own result is `net`'s
-// gradient directly, never a `(dx, dy, dnet)` tuple. Found, precisely,
-// costing this training loop a real, measured `~31%` more FLOPs than the
-// backward pass strictly needs, every single batch (`doc/backlog.md`'s own
-// profiling entries) -- the discarded `dx` (gradient w.r.t. the training
-// batch itself, never used by anything) was a whole extra `32x512 @
-// 512x784` matmul, computed for nothing, `18,750` times over a full run.
 net_grad = grad(loss, net);
 
 fn argmax_row(pred: Tensor<f32, 80, 10>, r: i32) -> i32 {
-    let mut best: i32 = 0;
-    let mut best_val: f32 = pred[r, 0];
+    let mut best = 0;
+    let mut best_val = pred[r, 0];
     for c in 1..10 {
         if pred[r, c] > best_val {
             best_val = pred[r, c];
@@ -186,62 +97,34 @@ fn argmax_row(pred: Tensor<f32, 80, 10>, r: i32) -> i32 {
     best
 }
 
-// Batches of 80 (the 10,000-image test set divides evenly), not one image
-// at a time: a batch of 1 turns every layer into a matrix-vector product
-// that re-reads all ~2.3 MB of weights per image -- measured with AMD uProf
-// at ~12% of the whole run for under 1% of its arithmetic. 80, not 100: a
-// batch size that isn't a multiple of the matmul schedule's own row tile
-// (8) currently fails to compile (`linalg-to-affine-loops`: "'affine.for'
-// op operand cannot be used as a dimension id", on the remainder tile) --
-// a real compiler bug, not worked around beyond picking 80 here.
+// Batches of 80: 10,000 divides evenly, and a row count that isn't a multiple of 8 doesn't compile
+// yet (`doc/backlog.md`, "A matmul whose row count isn't a multiple of the schedule's row tile").
 fn evaluate(net: Network) -> f32 {
-    let num_batches: i32 = test_len() / 80;
-    let mut correct: i32 = 0;
+    let num_batches = test_len() / 80;
+    let mut correct = 0;
     for s in 0..num_batches {
-        let batch_start: i32 = s * 80;
-        let pred: Tensor<f32, 80, 10> = forward(load_test_batch_input(batch_start), net);
+        let pred = forward(load_test_batch_input(s * 80), net);
         for r in 0..80 {
-            if argmax_row(pred, r) == test_label(batch_start + r) { correct = correct + 1; };
+            if argmax_row(pred, r) == test_label(s * 80 + r) { correct = correct + 1; };
         };
     };
-    let correct_f: f32 = correct.to();
-    let n_f: f32 = (num_batches * 80).to();
-    correct_f / n_f
+    correct.to() / (num_batches * 80).to()
 }
 
-// `He` init on every `ReLU`-activated hidden layer (`l1`/`l2`/`l3`),
-// `Xavier` on the final, unactivated output layer -- standard convention,
-// `stdlib/nn/nn.cleave`'s own `Init<T>::xavier`/`he` doc comments.
 export fn train_and_evaluate(epochs: i32, lr: f32, seed: i64) -> f32 {
     rand_seed(seed);
-    let mut net: Network = Network(
-        l1: Init::he(),
-        l2: Init::he(),
-        l3: Init::he(),
-        l4: Init::xavier()
-    );
-    // `lr / 32.0` -- `loss`'s own `sum(err*err)` now sums over the whole
-    // 32-sample batch, not one row, so the effective gradient magnitude
-    // scales up by `B` at the same nominal `lr` -- scaled back down here,
-    // once, at the one real point of control, to keep the SGD step size
-    // comparable to the original per-sample regime (see `loss`'s own doc
-    // comment above).
+    // He init for the ReLU layers, Xavier for the output layer.
+    let mut net = Network(l1: Init::he(), l2: Init::he(), l3: Init::he(), l4: Init::xavier());
     let opt = Sgd(lr: lr / 32.0);
-    let mut state = Optimizer::init_state(opt, net);
-    let n: i32 = train_len();
-    let num_batches: i32 = n / 32;
+    let mut state = init_state(opt, net);
 
     for epoch in 0..epochs {
-        for s in 0..num_batches {
-            let batch_start: i32 = s * 32;
-            let x: Tensor<f32, 32, 784> = load_train_batch_input(batch_start);
-            let y: Tensor<f32, 32, 10> = load_train_batch_target(batch_start);
-            let g = net_grad(x, y, net);
-            let r = Optimizer::step(opt, net, g, state);
+        for s in 0..train_len() / 32 {
+            let g = net_grad(load_train_batch_input(s * 32), load_train_batch_target(s * 32), net);
+            let r = step(opt, net, g, state);
             net = r.0;
             state = r.1;
         };
-
         println(("Epoch=", epoch));
     };
     training_done();

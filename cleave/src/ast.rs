@@ -416,12 +416,26 @@ pub enum GenericArg {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Path {
     pub segments: Vec<String>,
+    /// Set on the callee path of a call desugared from operator syntax (`a + b`,
+    /// `-a`, `not a`). An operator always means the algebra method of that name,
+    /// never a local binding or a top-level `fn` that happens to share it — see
+    /// `resolve.rs` for the full name-resolution rule.
+    pub operator: bool,
 }
 
 impl Path {
     pub fn single(name: impl Into<String>) -> Self {
         Path {
             segments: vec![name.into()],
+            operator: false,
+        }
+    }
+
+    /// The callee path of an operator call (`a + b` => `add`).
+    pub fn operator(name: impl Into<String>) -> Self {
+        Path {
+            segments: vec![name.into()],
+            operator: true,
         }
     }
 }
@@ -483,8 +497,8 @@ pub enum ExprKind {
     /// Operator uses already desugar to this at construction time (`a + b` =>
     /// `Call(Path::single("add"), [], [a, b])`) — see `grammar.md`, "Operators:
     /// sugar for named algebra functions". Algebra-qualification of the call
-    /// target (`Ring::add` vs. bare `add`) is resolved later, during type
-    /// checking. The middle `Vec<GenericArg>` is an explicit turbofish
+    /// target (`Ring::add` vs. bare `add`) is resolved later, by `resolve.rs`,
+    /// which rewrites the path in place. The middle `Vec<GenericArg>` is an explicit turbofish
     /// (`fibonacci::<f64>(x)`) — almost always empty (every desugared
     /// operator call included, and any ordinary call whose type is inferred
     /// from its arguments as usual); only present when the source actually

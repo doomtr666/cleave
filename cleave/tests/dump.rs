@@ -90,16 +90,17 @@ fn nested_sub_expressions_are_each_annotated_with_their_own_type_not_just_the_ou
     // one type reported for the entire statement/tail line.
     // `add`/`sub` resolve against the real stdlib `Ring` — see the doc
     // comment above `dumps_resolved_param_and_tail_types_for_unannotated_params`
-    // for why no local algebra is declared here either.
+    // for why no local algebra is declared here either. Bare algebra calls
+    // print in their resolved, qualified form (`resolve.rs`).
     let src = "fn f(x: i32) -> i32 { add(sub(x, 1), sub(x, 2)) }";
     let (out, errs) = dump(src);
     assert_eq!(errs, 0, "got:\n{out}");
     assert!(
-        out.contains("sub(x:i32, 1:i32):i32"),
+        out.contains("Ring::sub(x:i32, 1:i32):i32"),
         "the inner `sub` calls must show their own type, got:\n{out}"
     );
     assert!(
-        out.contains("add(sub(x:i32, 1:i32):i32, sub(x:i32, 2:i32):i32):i32"),
+        out.contains("Ring::add(Ring::sub(x:i32, 1:i32):i32, Ring::sub(x:i32, 2:i32):i32):i32"),
         "got:\n{out}"
     );
 }

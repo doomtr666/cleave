@@ -86,6 +86,22 @@ A real, ordinary function body (not a special bodyless-method form) is what lets
 
 This is a genuinely structuring decision, not a minor cleanup — it's what keeps the actual compiler core small regardless of how large the numeric/domain vocabulary built on top of it grows.
 
+### Name resolution: one lexical pass decides what a call means
+
+Operators being algebra calls means a bare name like `add` can mean several things: a local binding, a top-level `fn`, or an algebra method. That decision is made once, purely lexically, by a single pass (`resolve.rs`) run on the merged program before type inference, and recorded in the AST itself rather than re-derived by each later stage:
+
+1. an operator (`a + b`, marked as such by the parser) always means the algebra method;
+2. otherwise a local binding in scope wins, then a top-level `fn`, then the method of the one algebra declaring that name and arity;
+3. a qualified `Algebra::method` always means that algebra's method.
+
+A call that resolves to an algebra is rewritten to its qualified form. After this pass a single-segment callee is always a local or a top-level `fn`, and an algebra call always carries its algebra, so inference, monomorphization and CPS conversion each follow the AST instead of running their own name lookups (which used to disagree: a top-level `fn` sharing a method's name was type-checked against the algebra, and a bare call to a generic impl method was not patched like its qualified twin). A name declared by several algebras with the same arity stays bare and is reported as an ambiguity: the language never picks one by type.
+
+The same pass gives every shadowing `let` (one whose name is already visible) a name unique within its function (`x` => `x#1`), references included. Later passes key variables by name, so without it a scope that reassigns an outer `x` and then declares its own `x` (`{ x = 1; let x = 2; }`) had CPS conversion carry the inner `x` out as the outer one. Diagnostics print the written name back (`resolve::source_name`); dumps show the renamed one.
+
+The rule is plain lexical shadowing, with no warning: a user `fn add` is a legitimate name, not a mistake. Operators are the exception because `+` names an operation, not a function in scope. Expressions evaluated as compile-time constant arithmetic (types, turbofish arguments, `[v; N]` counts, `const`/`define` values) are left untouched, so `const_eval` keeps folding their operators by name.
+
+Choosing an impl within the resolved algebra stays type-directed (`derive_impl_instantiation`), which needs the method's signature to say which impl it means. `RawBuffer<T>::alloc(cap: i32)` did not, and was silently dispatched to whichever width a name-and-type index stored last; its handle type now carries the element type (`RawBuf<T>`).
+
 ### Soundness/governance — v1 trust model: no proof kernel
 
 **Explicitly out of scope for now:** a full LCF-style proof kernel (contributed axioms verified by a checkable proof term before admission) was considered, but it amounts to building a proof-assistant kernel as a subproject — a different, much larger undertaking than the actual goal (performance + ergonomics for scientific/HPC computing). C doesn't ask a programmer to prove anything about their code beyond it being valid C; cleave's v1 trust model for axioms follows the same posture, deliberately.

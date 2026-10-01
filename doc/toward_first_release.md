@@ -35,13 +35,15 @@ showcase out on the non-ML side.
 ## Minimum content of v0.1
 
 Someone who has never seen cleave can install it, follow the guide, write a program that works, and
-use cleave from a Rust project as easily as any other crate.
+use cleave from a Rust project as easily as any other crate. An **alpha, proof-of-concept** release is
+fine: known limitations get listed in the release notes rather than fixed at all costs, and bugs are
+fixed opportunistically along the way rather than as a gate.
 
 1. **CI green** on every supported platform.
-2. **No crash or alarming output on ordinary code.** Today, two known offenders: a matmul whose row count
-   isn't a multiple of 8 fails to compile, and every build with a matmul prints `error: NYI: non-trivial
-   layout map` diagnostics (harmless, but it looks broken). Remaining known limitations are listed in
-   the release notes rather than fixed at all costs.
+2. **No crash on ordinary code.** One known offender today: a matmul whose row count isn't a multiple
+   of 8 fails to compile. The `error: NYI: non-trivial layout map` diagnostics printed by builds with a
+   matmul are noise, not a crash, and come from a lowering LLVM/MLIR doesn't implement, so anything
+   short of avoiding that lowering would be a workaround: a known limitation, not a v0.1 requirement.
 3. **Readable ML code.** The `nn` library and the MNIST example should read about as plainly as their
    PyTorch equivalent, without making the user fight generics and const generics
    (`doc/backlog.md`, "The `nn` library and the MNIST kernel are far harder to read and write...").
@@ -75,9 +77,11 @@ use cleave from a Rust project as easily as any other crate.
 
 Interleave the fun parts with the release work rather than finishing one before starting the other:
 
-1. CI green; the two visible bugs.
+1. CI green.
 2. `nn` ergonomics, by rewriting MNIST as simply as the compiler allows.
 3. Softmax + cross-entropy, then nanoLM — which doubles as the second test of the new `nn` API.
 4. Packaging and Linux (one release pipeline for both).
-5. Audit and polish; release notes with known limitations; tag v0.1.
+5. Audit and polish; release notes with known limitations; tag v0.1 (alpha).
 6. cleave-cast, before or after the tag depending on how it goes.
+
+Bugs found along the way get fixed when they're in the path, not as a separate phase.

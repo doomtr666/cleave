@@ -108,7 +108,10 @@ impl Lowerer {
 
     fn lower_path(&mut self, pair: Pair<Rule>) -> Path {
         let segments = pair.into_inner().map(|p| p.as_str().to_string()).collect();
-        Path { segments }
+        Path {
+            segments,
+            operator: false,
+        }
     }
 
     // ---------------------------------------------------------------- fn
@@ -729,9 +732,7 @@ impl Lowerer {
         let ident_span = self.span_of(&ident);
         let mut acc = self.wrap(
             ident_span,
-            ExprKind::Path(Path {
-                segments: vec![ident.as_str().to_string()],
-            }),
+            ExprKind::Path(Path::single(ident.as_str())),
         );
         for suffix in inner {
             acc = self.lower_postfix_op(acc, suffix);
@@ -793,8 +794,9 @@ impl Lowerer {
     /// Shared left-associative fold for `child ~ (op ~ child)*` — every binary
     /// precedence level has this exact shape (see `grammar.pest`). Desugars
     /// directly to `Call(op_name, [lhs, rhs])`, per `grammar.md`'s "operators
-    /// are sugar for named algebra functions" — algebra-qualifying the call
-    /// target (`Ring::add` vs. bare `add`) is a later, type-checking concern.
+    /// are sugar for named algebra functions", with an operator callee path
+    /// (`Path::operator`) — algebra-qualifying it (`Ring::add`) is `resolve.rs`'s
+    /// job.
     fn fold_binary(
         &mut self,
         pair: Pair<Rule>,
@@ -810,7 +812,7 @@ impl Lowerer {
             let span = self.join(acc.span, rhs.span);
             acc = self.wrap(
                 span,
-                ExprKind::Call(Path::single(name), Vec::new(), vec![acc, rhs], Vec::new()),
+                ExprKind::Call(Path::operator(name), Vec::new(), vec![acc, rhs], Vec::new()),
             );
         }
         acc
@@ -831,7 +833,7 @@ impl Lowerer {
                 self.wrap(
                     span,
                     ExprKind::Call(
-                        Path::single(call_name),
+                        Path::operator(call_name),
                         Vec::new(),
                         vec![operand],
                         Vec::new(),
@@ -887,11 +889,10 @@ impl Lowerer {
                         // method_call`, `infer.rs`, removed along with
                         // inherent impls themselves — `doc/backlog-done.md`'s
                         // own "impls inhérents" entry has the full story):
-                        // dot-call now reaches the exact same `infer_call`
-                        // resolution a bare call already goes through
-                        // (qualified `Algebra::method`, `algebras_with_fn`,
-                        // then `env.get(name)` for any `fn` — top-level or
-                        // let-bound lambda alike). `.to()` still needs its
+                        // dot-call now goes through the exact same name
+                        // resolution a bare call does (`resolve.rs`: local
+                        // binding, then top-level `fn`, then algebra
+                        // method). `.to()` still needs its
                         // own name substitution, not subsumed by the general
                         // rewrite above: it's real sugar for a *differently*
                         // -named call (`x.to()` reaches `Convert<From,To>`'s
@@ -1245,9 +1246,7 @@ impl Lowerer {
                         let value = Box::new(self.lower_expr(value));
                         let count = Box::new(self.wrap(
                             count_span,
-                            ExprKind::Path(Path {
-                                segments: vec![count.as_str().to_string()],
-                            }),
+                            ExprKind::Path(Path::single(count.as_str())),
                         ));
                         self.wrap(span, ExprKind::ArrayRepeat { value, count })
                     }

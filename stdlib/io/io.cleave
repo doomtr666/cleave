@@ -22,7 +22,7 @@ use display;
 // array's own ABI) rather than reusing it: `out.buf` is already a bare
 // opaque pointer (`RawBuf`, `stdlib/dynarray/dynarray.cleave`), not an
 // array value needing `mlir_lower.rs`'s own array-aware extraction.
-extern fn print_dynarray_bytes(buf: RawBuf, len: i32) -> i32;
+extern fn print_dynarray_bytes(buf: RawBuf<i8>, len: i32) -> i32;
 
 algebra Print<T> {
     fn print(x: T) -> T;

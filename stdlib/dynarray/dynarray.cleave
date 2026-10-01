@@ -26,7 +26,11 @@ use linalg; // `Index<Container, Elem, K>` — declared there, reused below.
 // would silently heap-allocate a meaningless zero-byte block) — nothing in
 // this module ever does, but a future FFI use of this same trick should
 // keep that in mind.
-struct RawBuf {}
+// `T`, the element type, is never stored: it only makes the handle's type say
+// what it holds, which is what selects the right `RawBuffer<T>` impl for
+// `alloc`/`grow` — their arguments (a count, a buffer) would not otherwise say
+// which element width to allocate for.
+struct RawBuf<T> {}
 
 // The raw, per-width storage primitive `DynArray<T>` itself is built on top
 // of, one `impl` per concrete `T` — exactly `Print<T>`'s own per-width
@@ -38,60 +42,52 @@ struct RawBuf {}
 // codebase's already-established "no runtime memory-safety enforcement"
 // posture (`stdlib/linalg/tensor.cleave`'s own `Index` impls, a dynamic
 // index into a real array, have none either).
-// `raw_get`/`raw_set`, not `get`/`set` — the names DynArray's own public
-// `.get(i)`/`.set(i,x)` (below) need for themselves, now that dot-call is a
-// pure sugar over one unified, ordinary bare-call resolution (`doc/backlog-
-// done.md`'s own "impls inhérents" entry). Before that change, `RawBuffer<T>`
-// (an algebra) and `DynArray<T>`'s own inherent impl lived in disjoint
-// resolution tables, so sharing the names `get`/`set` was harmless — now a
-// single `algebras_with_fn`/`env` search would find *both*, and the algebra
-// candidate is checked first, so `arr.get(i)` would incorrectly try to
-// unify `arr`'s own `DynArray<T>` against `RawBuffer::get`'s own `RawBuf`
-// parameter. Renaming this internal-only primitive (never called directly
-// outside this file — confirmed, `grep`) is the one-sided fix; DynArray's
-// own public API keeps its original names unchanged.
+// `raw_get`/`raw_set`, not `get`/`set`: the top-level `get`/`set` below would
+// shadow these methods for every bare call in this file (`resolve.rs`: a
+// top-level `fn` wins over an algebra method of the same name), so the
+// distinct names keep both levels callable without qualification.
 algebra RawBuffer<T> {
-    fn alloc(cap: i32) -> RawBuf;
-    fn grow(buf: RawBuf, old_cap: i32, new_cap: i32) -> RawBuf;
-    fn raw_get(buf: RawBuf, i: i32) -> T;
-    fn raw_set(buf: RawBuf, i: i32, x: T);
+    fn alloc(cap: i32) -> RawBuf<T>;
+    fn grow(buf: RawBuf<T>, old_cap: i32, new_cap: i32) -> RawBuf<T>;
+    fn raw_get(buf: RawBuf<T>, i: i32) -> T;
+    fn raw_set(buf: RawBuf<T>, i: i32, x: T);
 }
 
 impl RawBuffer<i8> {
-    extern(dynarray_alloc_i8) fn alloc(cap: i32) -> RawBuf;
-    extern(dynarray_grow_i8) fn grow(buf: RawBuf, old_cap: i32, new_cap: i32) -> RawBuf;
-    extern(dynarray_get_i8) fn raw_get(buf: RawBuf, i: i32) -> i8;
-    extern(dynarray_set_i8) fn raw_set(buf: RawBuf, i: i32, x: i8);
+    extern(dynarray_alloc_i8) fn alloc(cap: i32) -> RawBuf<i8>;
+    extern(dynarray_grow_i8) fn grow(buf: RawBuf<i8>, old_cap: i32, new_cap: i32) -> RawBuf<i8>;
+    extern(dynarray_get_i8) fn raw_get(buf: RawBuf<i8>, i: i32) -> i8;
+    extern(dynarray_set_i8) fn raw_set(buf: RawBuf<i8>, i: i32, x: i8);
 }
 impl RawBuffer<i16> {
-    extern(dynarray_alloc_i16) fn alloc(cap: i32) -> RawBuf;
-    extern(dynarray_grow_i16) fn grow(buf: RawBuf, old_cap: i32, new_cap: i32) -> RawBuf;
-    extern(dynarray_get_i16) fn raw_get(buf: RawBuf, i: i32) -> i16;
-    extern(dynarray_set_i16) fn raw_set(buf: RawBuf, i: i32, x: i16);
+    extern(dynarray_alloc_i16) fn alloc(cap: i32) -> RawBuf<i16>;
+    extern(dynarray_grow_i16) fn grow(buf: RawBuf<i16>, old_cap: i32, new_cap: i32) -> RawBuf<i16>;
+    extern(dynarray_get_i16) fn raw_get(buf: RawBuf<i16>, i: i32) -> i16;
+    extern(dynarray_set_i16) fn raw_set(buf: RawBuf<i16>, i: i32, x: i16);
 }
 impl RawBuffer<i32> {
-    extern(dynarray_alloc_i32) fn alloc(cap: i32) -> RawBuf;
-    extern(dynarray_grow_i32) fn grow(buf: RawBuf, old_cap: i32, new_cap: i32) -> RawBuf;
-    extern(dynarray_get_i32) fn raw_get(buf: RawBuf, i: i32) -> i32;
-    extern(dynarray_set_i32) fn raw_set(buf: RawBuf, i: i32, x: i32);
+    extern(dynarray_alloc_i32) fn alloc(cap: i32) -> RawBuf<i32>;
+    extern(dynarray_grow_i32) fn grow(buf: RawBuf<i32>, old_cap: i32, new_cap: i32) -> RawBuf<i32>;
+    extern(dynarray_get_i32) fn raw_get(buf: RawBuf<i32>, i: i32) -> i32;
+    extern(dynarray_set_i32) fn raw_set(buf: RawBuf<i32>, i: i32, x: i32);
 }
 impl RawBuffer<i64> {
-    extern(dynarray_alloc_i64) fn alloc(cap: i32) -> RawBuf;
-    extern(dynarray_grow_i64) fn grow(buf: RawBuf, old_cap: i32, new_cap: i32) -> RawBuf;
-    extern(dynarray_get_i64) fn raw_get(buf: RawBuf, i: i32) -> i64;
-    extern(dynarray_set_i64) fn raw_set(buf: RawBuf, i: i32, x: i64);
+    extern(dynarray_alloc_i64) fn alloc(cap: i32) -> RawBuf<i64>;
+    extern(dynarray_grow_i64) fn grow(buf: RawBuf<i64>, old_cap: i32, new_cap: i32) -> RawBuf<i64>;
+    extern(dynarray_get_i64) fn raw_get(buf: RawBuf<i64>, i: i32) -> i64;
+    extern(dynarray_set_i64) fn raw_set(buf: RawBuf<i64>, i: i32, x: i64);
 }
 impl RawBuffer<f32> {
-    extern(dynarray_alloc_f32) fn alloc(cap: i32) -> RawBuf;
-    extern(dynarray_grow_f32) fn grow(buf: RawBuf, old_cap: i32, new_cap: i32) -> RawBuf;
-    extern(dynarray_get_f32) fn raw_get(buf: RawBuf, i: i32) -> f32;
-    extern(dynarray_set_f32) fn raw_set(buf: RawBuf, i: i32, x: f32);
+    extern(dynarray_alloc_f32) fn alloc(cap: i32) -> RawBuf<f32>;
+    extern(dynarray_grow_f32) fn grow(buf: RawBuf<f32>, old_cap: i32, new_cap: i32) -> RawBuf<f32>;
+    extern(dynarray_get_f32) fn raw_get(buf: RawBuf<f32>, i: i32) -> f32;
+    extern(dynarray_set_f32) fn raw_set(buf: RawBuf<f32>, i: i32, x: f32);
 }
 impl RawBuffer<f64> {
-    extern(dynarray_alloc_f64) fn alloc(cap: i32) -> RawBuf;
-    extern(dynarray_grow_f64) fn grow(buf: RawBuf, old_cap: i32, new_cap: i32) -> RawBuf;
-    extern(dynarray_get_f64) fn raw_get(buf: RawBuf, i: i32) -> f64;
-    extern(dynarray_set_f64) fn raw_set(buf: RawBuf, i: i32, x: f64);
+    extern(dynarray_alloc_f64) fn alloc(cap: i32) -> RawBuf<f64>;
+    extern(dynarray_grow_f64) fn grow(buf: RawBuf<f64>, old_cap: i32, new_cap: i32) -> RawBuf<f64>;
+    extern(dynarray_get_f64) fn raw_get(buf: RawBuf<f64>, i: i32) -> f64;
+    extern(dynarray_set_f64) fn raw_set(buf: RawBuf<f64>, i: i32, x: f64);
 }
 
 // A struct-typed element (`Point`, or any other user struct) used to need
@@ -115,13 +111,13 @@ impl RawBuffer<f64> {
 algebra HeapStruct<T> {}
 
 impl<S: HeapStruct> RawBuffer<S> {
-    extern(dynarray_alloc_ptr) fn alloc(cap: i32) -> RawBuf;
-    extern(dynarray_grow_ptr) fn grow(buf: RawBuf, old_cap: i32, new_cap: i32) -> RawBuf;
-    extern(dynarray_get_ptr) fn raw_get(buf: RawBuf, i: i32) -> S;
-    extern(dynarray_set_ptr) fn raw_set(buf: RawBuf, i: i32, x: S);
+    extern(dynarray_alloc_ptr) fn alloc(cap: i32) -> RawBuf<S>;
+    extern(dynarray_grow_ptr) fn grow(buf: RawBuf<S>, old_cap: i32, new_cap: i32) -> RawBuf<S>;
+    extern(dynarray_get_ptr) fn raw_get(buf: RawBuf<S>, i: i32) -> S;
+    extern(dynarray_set_ptr) fn raw_set(buf: RawBuf<S>, i: i32, x: S);
 }
 
-struct DynArray<T> { buf: RawBuf, len: i32, cap: i32 }
+struct DynArray<T> { buf: RawBuf<T>, len: i32, cap: i32 }
 
 // `dynarray_new` takes a real `initial_cap` argument, not a hardcoded
 // constant — not purely an ergonomic choice, a *correctness* one, found by

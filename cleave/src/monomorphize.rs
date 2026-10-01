@@ -3257,7 +3257,14 @@ fn derive_impl_instantiation(
     let Some(ret_ty) = node_types.get(&call_id).cloned() else {
         return ImplMatch::NoCandidates;
     };
-    let query = Ty::Fn(arg_tys.to_vec(), Box::new(ret_ty));
+    // A const generic's value (`N` in `N > 100`) is typed `Ty::Const`, which
+    // unifies with every integer width: widened to its ordinary type first, the
+    // same widening `cps.rs::dispatch_ty` applies to its own dispatch keys, or
+    // the first integer impl declared (`Ord<i8>`) would be picked.
+    let query = Ty::Fn(
+        arg_tys.iter().map(crate::cps::dispatch_ty).collect(),
+        Box::new(crate::cps::dispatch_ty(&ret_ty)),
+    );
 
     for (idx, t) in templates.iter().enumerate() {
         if t.method_name != method

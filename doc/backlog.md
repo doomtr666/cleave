@@ -34,13 +34,53 @@ friction, all visible in today's kernel:
 - the loss must be a concrete, non-generic `fn` (batch size fixed in its signature) for `grad()` to accept it;
 - user code reaches for `mlir::memref::alloc()` and `Tensor::<f32, B, N>(data: ...)` to build a batch.
 
-Several of these were workarounds for inference/dispatch bugs fixed since (the e-graph typing work,
-`seed_axiom_type_env`'s generalization, the monomorphizer's re-inference fallback), so part of the
-complexity may simply no longer be needed. First step: rewrite the MNIST kernel as simply as today's
-compiler allows, record exactly which simplification still fails and why, then decide which belong in
-the language (structural derivation for parameter trees, inference of output-only generics) versus the
-stdlib (a `Sequential`-style composition, data-loading helpers). Success measure: the cleave kernel reads
-about as plainly as `mnist_bench.py`.
+Success measure: the cleave kernel reads about as plainly as `mnist_bench.py`.
+
+**Inventory, 2026-10-01** — each simplification tried alone on a copy of the kernel, compiled with the
+real CLI. What already works today was applied: the kernel went from 249 to 132 lines (mostly stale
+comments, plus annotations that were workarounds for since-fixed bugs), with identical generated code
+and accuracy (0.9341). No longer needed: scalar type annotations (`let n: i32 = ...`), the const
+generic and return type on `forward` (`fn forward(x, net: Network)` infers; `net` keeps its annotation
+because its fields are accessed — field access on an unannotated parameter is nominal by design),
+intermediate annotated variables for `.to()` conversions, method-call syntax for plain fns
+(`net.l1.dense_forward(x)`), expressions as loop bounds.
+
+Fixed since: **two resolution paths for one algebra call** (bare `init_state(opt, net)` panicked in MLIR
+lowering while `Optimizer::init_state(opt, net)` worked, and a top-level `fn relu(x: i32)` was
+type-checked against `Activation::relu`). One lexical name-resolution pass now decides every call's
+target before inference (`cleave/src/resolve.rs`, `doc/hld.md` "Name resolution"); the kernel calls
+`init_state`/`step` unqualified.
+
+What still fails, by nature:
+- **Bug — invalid MLIR instead of a type error.** Passing a tensor's `.data` to an `extern` that writes
+  into it (`train_batch_pixels(start, x.data)`) generates a module that fails verification ("operand type
+  mismatch: expected `!llvm.ptr`, provided `tensor<...>`"). It should be rejected cleanly: a tensor is a
+  value, and an extern writing into one breaks that.
+- **Language gap — tensor construction needs a turbofish.** `Tensor(data: pixels)` is refused ("inferring
+  a pack's own arity from field values isn't supported yet"), even though the array argument's rank and
+  the function's return type both give the dimensions.
+- **Stdlib/design gap — no sanctioned way to build a tensor from host data.** User code has to write
+  `mlir::memref::alloc()` and `Tensor::<f32, 32, 784>(data: ...)`. Needs a decision on how an extern hands
+  data to a tensor (ties to the previous two points).
+- **Language gap — no tuple destructuring in `let`.** `let (net2, state2) = Optimizer::step(...)` is a
+  parse error, hence `let r = ...; net = r.0; state = r.1;`.
+- **Autodiff limitation — `grad()` needs a non-generic function with a declared return type.** The loss
+  is pinned to batch size 32 in its signature, and an unannotated loss is refused. A derivative that is
+  instantiated per call site, like any generic fn, would lift both.
+- **Language gap, the biggest one — no structural derivation.** Training a user-defined `Network` needs a
+  hand-written `impl Optimizer<...>` plus a parallel `NetworkState<...>` struct, forwarding every method
+  field by field (35 lines here). What's needed is a way for an algebra to apply to any struct whose
+  fields implement it ("parameter trees"), derived by the compiler — a real design decision (an explicit
+  `derive`-like mechanism, or algebras declared as structurally recursive).
+- **Stdlib gaps** — no `argmax`, `softmax`, cross-entropy or accuracy helpers (the evaluation loop is
+  written by hand); `println(("Epoch=", epoch))` needs a tuple to print several values.
+- Already tracked separately: a matmul whose row count isn't a multiple of 8 doesn't compile (evaluation
+  uses batches of 80 because of it).
+
+Suggested order: the two bugs first (clear fixes, and the first one is exactly the kind of structural
+inconsistency that gets harder to fix later), then the small language gaps (pack-arity inference, tuple
+destructuring), then the design questions with the user: structural derivation, generic `grad()`, and
+how host data becomes a tensor.
 
 ---
 

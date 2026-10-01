@@ -1584,6 +1584,39 @@ fn convert_block(block: &Block, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -
     })
 }
 
+/// A block *expression*'s own `let`s end with it: its continuation sees the
+/// enclosing scope's bindings, updated only for the enclosing variables the
+/// block reassigns (`mutated_free_vars`, the set an `if`'s or a loop's join
+/// threads out) and for the enclosing loop's own control state, which a
+/// `break` inside the block sets. `convert_block` alone hands `k` the block's
+/// inner environment — right for an `if` branch or a loop body, whose join
+/// already carries out only what outlives them, but for a block expression it
+/// let an inner `let f = fn(...)` keep shadowing an outer `f` (or a top-level
+/// `fn f`) after the block.
+fn convert_scoped_block(
+    block: &Block,
+    env: &CEnv,
+    ctx: &Ctx,
+    k: &dyn Fn(CVal, &CEnv) -> CExpr,
+) -> CExpr {
+    let reassigned = mutated_free_vars(block, &HashSet::new(), ctx);
+    convert_block(block, env, ctx, &|v, inner| {
+        let mut out = env.clone();
+        let outliving = reassigned
+            .keys()
+            .map(String::as_str)
+            .chain(["__loop_running", "__break_value"]);
+        for name in outliving {
+            if let Some(value) = inner.get(name) {
+                if out.contains_key(name) || name.starts_with("__") {
+                    out.insert(name.to_string(), value.clone());
+                }
+            }
+        }
+        k(v, &out)
+    })
+}
+
 /// Continues converting `rest` (the remaining statements in the *current*
 /// block) — unless `might_break` (the statement just converted, via
 /// `stmt_contains_break`, might have just set `running := false`), in which
@@ -2936,7 +2969,7 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
         // nothing new: it already threads its own cloned `env` through the
         // block's own statements and hands the tail's value to `k`, exactly
         // the shape a bare expression position needs.
-        ExprKind::Block(b) => convert_block(b, env, ctx, k),
+        ExprKind::Block(b) => convert_scoped_block(b, env, ctx, k),
         other => panic!("CPS doesn't support {other:?} yet -- see doc/backlog.md"),
     }
 }
@@ -3602,7 +3635,7 @@ fn convert_expr_list(
 /// `ConstValue` (see its own doc comment) — `i32`/`bool` are the same
 /// defaults this codebase already uses for an otherwise-unconstrained
 /// literal.
-fn dispatch_ty(ty: &Ty) -> Ty {
+pub(crate) fn dispatch_ty(ty: &Ty) -> Ty {
     match ty {
         Ty::Const(ConstValue::Int(_)) => Ty::Con("i32".to_string()),
         Ty::Const(ConstValue::Bool(_)) => Ty::Con("bool".to_string()),

@@ -5407,6 +5407,139 @@ fn qualified_calls_to_two_algebras_colliding_on_the_same_method_and_type_run_the
 }
 
 // ---------------------------------------------------------------------
+// Name resolution of call sites (`resolve.rs`): local binding > top-level
+// `fn` > algebra method; `Algebra::method` always reaches the algebra;
+// operators always reach the algebra.
+// ---------------------------------------------------------------------
+
+/// A top-level `fn` shadows an algebra method of the same name, even with the
+/// very same signature; the qualified form still reaches the algebra.
+#[test]
+fn a_top_level_fn_shadows_an_algebra_method_of_the_same_name() {
+    let context = context();
+    let src = "
+        algebra Foo<T> { fn foo(x: T) -> T; }
+        impl Foo<i32> { fn foo(x) { x + 1 } }
+        fn foo(x: i32) -> i32 { x * 10 }
+        fn main() -> i32 {
+            if foo(5) == 50 and Foo::foo(5) == 6 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// A top-level `fn` whose signature no impl of the shadowed method could match
+/// still wins: the bare call is never tried against the algebra first.
+#[test]
+fn a_top_level_fn_shadows_an_algebra_method_whose_impls_do_not_match_it() {
+    let context = context();
+    let src = "
+        use nn;
+        fn relu(x: i32) -> i32 { x + 100 }
+        fn main() -> i32 { relu(5) }
+    ";
+    assert_eq!(run_i32(&context, src), 105);
+}
+
+/// A local binding (here a lambda) shadows both a top-level `fn` and an
+/// algebra method; leaving its scope restores the outer meaning.
+#[test]
+fn a_local_binding_shadows_a_top_level_fn_and_an_algebra_method() {
+    let context = context();
+    let src = "
+        algebra Foo<T> { fn foo(x: T) -> T; }
+        impl Foo<i32> { fn foo(x) { x + 1 } }
+        fn bar(x: i32) -> i32 { x * 10 }
+        fn main() -> i32 {
+            let inner = {
+                let foo = fn(x: i32) -> i32 { x * 3 };
+                let bar = fn(x: i32) -> i32 { x * 4 };
+                foo(5) + bar(5)
+            };
+            if inner == 35 and foo(5) == 6 and bar(5) == 50 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// Reassigning an outer variable, then shadowing it with a `let` in the same
+/// scope: the reassignment outlives the scope, the shadow does not — in a
+/// block, an `if` branch and a loop body alike. The shadowing `let` is renamed
+/// by `resolve.rs`, so CPS conversion can't take one `x` for the other.
+#[test]
+fn reassigning_then_shadowing_a_variable_keeps_the_reassignment() {
+    let context = context();
+    let src = "
+        fn main() -> i32 {
+            let mut a = 0;
+            { a = 1; let mut a = 100; a = a + 1; };
+            let mut b = 0;
+            if a == 1 { b = 2; let b = 200; };
+            let mut c = 0;
+            for i in 0..3 { c = c + 1; let c = 300; };
+            a * 100 + b * 10 + c
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 123);
+}
+
+/// An operator always means the algebra method: a user `fn add` is reachable by
+/// name but never captures `+`.
+#[test]
+fn an_operator_is_never_captured_by_a_top_level_fn_of_the_same_name() {
+    let context = context();
+    let src = "
+        fn add(a: i32, b: i32) -> i32 { a * b }
+        fn main() -> i32 {
+            if 2 + 3 == 5 and add(2, 3) == 6 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// A bare call to a generic impl's method from an ordinary `fn`, where the
+/// result type is fixed only by the impl (an output-only generic): resolved
+/// exactly like its qualified form. Used to panic in MLIR lowering
+/// (`MLIR lowering doesn't support type 't79`), because only the qualified
+/// form had its node types patched after monomorphization.
+#[test]
+fn a_bare_call_to_a_generic_impl_method_resolves_like_its_qualified_form() {
+    let context = context();
+    let src = "
+        use nn;
+        use linalg;
+        struct Net { l1: Dense<f32, 2, 3>, l2: Dense<f32, 3, 2> }
+        struct NetState<S1, S2> { l1: S1, l2: S2 }
+        impl<Opt, S1, S2> Optimizer<Opt, Net, NetState<S1, S2>> {
+            fn init_state(opt, model) {
+                NetState(l1: init_state(opt, model.l1), l2: init_state(opt, model.l2))
+            }
+            fn step(opt, model, grad, state) {
+                let r1 = step(opt, model.l1, grad.l1, state.l1);
+                let r2 = step(opt, model.l2, grad.l2, state.l2);
+                (Net(l1: r1.0, l2: r2.0), NetState(l1: r1.1, l2: r2.1))
+            }
+        }
+        fn main() -> i32 {
+            let net = Net(l1: Init::he(), l2: Init::he());
+            let opt = Sgd(lr: 0.5);
+            let mut n2 = net;
+            let mut state = init_state(opt, net);
+            for i in 0..3 {
+                let r = step(opt, n2, net, state);
+                n2 = r.0;
+                state = r.1;
+            };
+            // Three SGD steps with lr 0.5 and the initial weights `w` as a fixed
+            // gradient: w -> 0.5w -> 0 -> -0.5w, every step exact in f32.
+            let expected = 0.0 - net.l1.w[0, 0] * 0.5;
+            if n2.l1.w[0, 0] == expected { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+// ---------------------------------------------------------------------
 // `doc/backlog.md`'s "No dynamic-size collection" item — `DynArray<T>`
 // (`stdlib/dynarray/dynarray.cleave`), a real, growable collection built
 // entirely as an ordinary stdlib struct + algebra impls, no `Ty`/grammar

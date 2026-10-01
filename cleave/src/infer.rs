@@ -1126,7 +1126,8 @@ impl std::fmt::Display for TypeErrorKind {
             TypeErrorKind::AssignToImmutable { name } => {
                 write!(
                     f,
-                    "cannot assign to `{name}` — declared with `let`, not `let mut`"
+                    "cannot assign to `{}` — declared with `let`, not `let mut`",
+                    crate::resolve::source_name(name)
                 )
             }
             TypeErrorKind::UnsatisfiableScheme { algebras } => {
@@ -6007,11 +6008,11 @@ impl<'r> Infer<'r> {
         // own already-documented design for this. Checked *before* the
         // ordinary unqualified path: a 2-segment `path` whose first segment
         // names a real, declared algebra is unambiguously a qualified call —
-        // operator sugar (`a * b`) can never accidentally reach here, `lower.
-        // rs`'s own `fold_binary` always builds a single-segment `Path::
-        // single(name)`. Any other 2-segment path (naming something that
-        // isn't a declared algebra) falls through to the unqualified path
-        // below, unchanged.
+        // written so in the source, or rewritten so by `resolve.rs` (every
+        // bare call, operators included, that resolves to exactly one
+        // algebra). Any other 2-segment path (naming something that isn't a
+        // declared algebra) falls through to the unqualified path below,
+        // unchanged.
         if let [algebra, method] = path.segments.as_slice() {
             if self.registry.has_algebra(algebra) {
                 let arg_tys: Vec<Ty> = args
@@ -6054,7 +6055,15 @@ impl<'r> Infer<'r> {
             .map(|a| self.infer_expr(env, a))
             .collect::<Result<_, _>>()?;
 
-        let candidates = self.registry.algebras_with_fn(&name, args.len());
+        // `resolve.rs`'s rule, for a bare name it left bare (or an AST that never
+        // went through `driver::compile`): a local or top-level `fn` named `name`
+        // shadows an algebra method of the same name, except for an operator.
+        let shadowed = !path.operator && env.get(&name).is_some();
+        let candidates = if shadowed {
+            Vec::new()
+        } else {
+            self.registry.algebras_with_fn(&name, args.len())
+        };
         if candidates.len() > 1 {
             return Err(TypeError {
                 span: call_span,
