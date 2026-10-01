@@ -20,6 +20,68 @@ or in the fallback lowering, not in user code.
 
 ---
 
+## The `nn` library and the MNIST kernel are far harder to read and write than their PyTorch equivalent — a priority for adoption
+
+Raised directly by the user, comparing `examples/mnist-interop/src/kernel.cleave` with
+`bench/mnist-pytorch/mnist_bench.py` line for line: the cleave version makes its author fight the type
+system (generics, const generics, explicit turbofish) for things that are not their job. Concrete
+friction, all visible in today's kernel:
+- a user-defined `Network` needs a hand-written `impl Optimizer<Opt, Network, NetworkState<StateL1,
+  StateL2, StateL3, StateL4>>` plus a parallel `NetworkState<...>` struct, forwarding `init_state`/`step`
+  field by field — pure structural boilerplate the compiler could derive (a "parameter tree", the way
+  JAX pytrees or `nn.Module.parameters()` work);
+- `Init::he()` / `Init::xavier()` need the target type spelled out at each use;
+- the loss must be a concrete, non-generic `fn` (batch size fixed in its signature) for `grad()` to accept it;
+- user code reaches for `mlir::memref::alloc()` and `Tensor::<f32, B, N>(data: ...)` to build a batch.
+
+Several of these were workarounds for inference/dispatch bugs fixed since (the e-graph typing work,
+`seed_axiom_type_env`'s generalization, the monomorphizer's re-inference fallback), so part of the
+complexity may simply no longer be needed. First step: rewrite the MNIST kernel as simply as today's
+compiler allows, record exactly which simplification still fails and why, then decide which belong in
+the language (structural derivation for parameter trees, inference of output-only generics) versus the
+stdlib (a `Sequential`-style composition, data-loading helpers). Success measure: the cleave kernel reads
+about as plainly as `mnist_bench.py`.
+
+---
+
+## Retain/release are opaque calls, so LLVM can never fold them — emit the refcount fast path as ordinary IR
+
+`cleave_retain`/`cleave_release` are external calls into `cleave-rt`: LLVM can't see that a retain
+followed by a release of the same pointer is a no-op, can't drop the count updates of an object that
+never escapes, and can't scalarize anything around them. Since 2026-09-30, `cleave-mlir-shim` annotates
+the *allocator* entry points (`allockind`/`allocsize`/`noalias`, the subset that is sound — see
+`annotateAllocators`), which already removed a few allocations and copies, but deliberately not the
+refcounted release: it frees only at zero, so declaring it a `free` would be a miscompile.
+
+The direction, raised in conversation: lower retain to an inline `load`/`add`/`store` of the header's
+count (the header sits at `ptr - 16`, `cleave-rt`'s `rc_header`), and release to an inline decrement and
+compare, calling into the runtime only on the slow path (count reaching zero: free + cascade). LLVM then
+sees ordinary memory operations and can pair and remove them on its own. Needs care on two points before
+building it: (1) atomicity — today's counts are only ever touched outside OpenMP regions (`cleave-rt`'s
+own allocator-free-regions argument), which must stay true or the inline ops must become atomic; (2) the
+GPU direction (handle separate from data, timeline-based availability) discussed the same day, which
+argues for keeping the header's layout private to one place. Measure first: the dynamic count of
+retain/release calls per training step bounds the possible gain.
+
+---
+
+## ML roadmap after MNIST: softmax + cross-entropy, then a small character-level transformer
+
+The next ML stress test, decided 2026-10-01: a nanoGPT-style character model (2-4 layers, width ~128,
+context 64-128, trained on a small text corpus), with a line-for-line PyTorch twin like
+`bench/mnist-pytorch`, as the step toward the small-language-model goal. It exercises patterns MNIST
+never touches: embedding lookup (gather forward, scatter-add backward — new for `grad()`), batched
+matmuls on rank-3/4 tensors, transposes, a causal mask, row-wise softmax, LayerNorm (axis reductions with
+a non-trivial gradient), residual connections (one value consumed several times — buffer sharing and
+refcounting under real pressure), and Adam at scale.
+
+First step, small and shared by every later model: softmax + cross-entropy (numerically stable, max-
+shifted log-sum-exp) in the stdlib, swapped into `mnist-interop`'s loss in place of today's sum of
+squares, with the PyTorch twin updated to match. Then a written inventory of what the transformer still
+needs (likely rank-3/4 tensor support and gather/scatter first) before writing it.
+
+---
+
 ## Two real gaps in the array-ownership model, found while discussing nesting (array-in-tuple-in-struct) for the affine-ownership plan — both fixed and tested; two adjacent construction-side limitations found along the way, not fixed
 
 Tuples need no work at all: `(a, b)` desugars to `struct __Tuple2 { 0: T0, 1: T1 }` before CPS (`ast.rs`/`driver.rs`/`lower.rs`), and `lower_release_cascade` already recurses into any struct-typed field — tuple-of-struct, struct-of-tuple-of-struct, any depth, all free.
