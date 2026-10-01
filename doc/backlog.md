@@ -118,6 +118,17 @@ Three ideas that hold together, none started:
   `derivative`; non-compositional ones (integration, inversion) only through rule tables and numerics.
   Fun, not planned.
 
+## Generic bodies are checked per instantiation, not once with rigid type variables
+
+A generic impl's body (`impl<T: Float> ...`) is inferred with `T` an ordinary, permissive type variable:
+constraints on it are deferred and only really checked at each instantiation, and a generic impl whose
+body fails generic inference is silently skipped (`monomorphize.rs::build_impl_templates`) until some
+instantiation reports the error. So a body using an operation its bounds don't grant (`x + 1` under
+`T: Show`) is only caught when instantiated at a type lacking it. Checking once, generically — `T`
+rigid, satisfying exactly its declared bounds (and what they imply) — would report it at the definition
+for every user. Applies to all generic code (impls over packs of types included), so it is its own
+project, not part of the pack work.
+
 ## A zero-field struct built with `Name()` passes inference, then panics CPS conversion
 
 `struct Nil {}` ... `Nil()` type-checks (`infer.rs`'s `Empty()` special case) but `cps.rs::resolve_call`

@@ -5658,6 +5658,82 @@ fn len_of_tuples_structs_arrays_and_dynarrays() {
     assert_eq!(run_i32(&context, src), 1);
 }
 
+/// Two statements in a row that may `break`: the second `break` must still
+/// leave the loop. The join guarding the statements after the first one used
+/// to carry only the variables they reassign, losing the loop's own running
+/// flag, so the loop ran forever.
+#[test]
+fn a_break_after_an_earlier_statement_that_may_break_leaves_the_loop() {
+    let context = context();
+    let src = "
+        fn main() -> i32 {
+            let mut n = 0;
+            loop {
+                { if 0 == 2 { break; }; n = n + 1; };
+                { if 2 == 2 { break; }; n = n + 10; };
+                break;
+            };
+            n
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// A `for` indexing a tuple or struct by its variable is unrolled
+/// (`unroll.rs`): one copy per index, each with its own element type; `break`
+/// still leaves the whole loop; nested loops unroll level by level; a loop
+/// over an array stays a loop.
+#[test]
+fn for_loops_over_heterogeneous_collections_are_unrolled() {
+    let context = context();
+    let src = "
+        struct Vec3 { x: f64, y: f64, z: f64 }
+        fn main() -> i32 {
+            let t = (7, 2.5, 9);
+            let mut positive = 0;
+            for i in 0..t.len() { if t[i] == t[i] { positive = positive + 1; }; };
+            let v = Vec3(x: 1.0, y: 2.0, z: 3.0);
+            let mut s = 0.0;
+            for i in 0..len(v) { s = s + v[i]; };
+            let mut n = 0;
+            for i in 0..3 { if i == 2 { break; }; n = n + 1; };
+            let nested = ((1, 2), (3, 4, 5));
+            let mut total = 0;
+            for i in 0..nested.len() { for j in 0..nested[i].len() { total = total + nested[i][j]; }; };
+            let a = [1, 2, 3, 4];
+            let mut sa = 0;
+            for i in 0..4 { sa = sa + a[i]; };
+            if positive == 3 and s == 6.0 and n == 2 and total == 15 and sa == 10 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// An impl over a pack of types (`impl<Ts...: Show> Show<Ts...>`) covers
+/// tuples of any length whose elements all have their own `Show`; its loop
+/// unrolls per concrete tuple (`unroll.rs`: one concrete impl per tuple type
+/// used). Nested tuples instantiate it again.
+#[test]
+fn an_impl_over_a_pack_of_types_covers_every_tuple_of_showable_elements() {
+    let context = context();
+    let src = "
+        algebra Show<T> { fn show(x: T) -> i32; }
+        impl Show<i32> { fn show(x) { 1 } }
+        impl Show<f64> { fn show(x) { 10 } }
+        impl<Ts...: Show> Show<Ts...> {
+            fn show(x) {
+                let mut s = 0;
+                for i in 0..x.len() { s = s + show(x[i]); };
+                s
+            }
+        }
+        fn main() -> i32 {
+            if show((1, 2.5:f64, 3)) == 12 and show((1, (2.5:f64, 7))) == 12 and show((1, 2)) == 2 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
 fn type_errors(src: &str) -> Vec<String> {
     let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));

@@ -1723,8 +1723,24 @@ fn continue_after(
     let mutated = mutated_free_vars_stmts(rest, &HashSet::new(), ctx);
     let mut names: Vec<String> = mutated.keys().cloned().collect();
     names.sort();
-    let carried: Vec<(String, CVar)> = names.iter().map(|n| (n.clone(), ctx.fresh.var())).collect();
-    let carried_types: Vec<Ty> = names.iter().map(|n| mutated[n].clone()).collect();
+    let mut carried: Vec<(String, CVar)> =
+        names.iter().map(|n| (n.clone(), ctx.fresh.var())).collect();
+    let mut carried_types: Vec<Ty> = names.iter().map(|n| mutated[n].clone()).collect();
+    // `rest` can break too (two statements in a row that may `break`): the
+    // loop's own control state is then one more thing the join must carry
+    // out, exactly as an `if` branch containing `break` does — otherwise the
+    // later `break` is lost and the loop runs again.
+    if rest.iter().any(stmt_contains_break) {
+        let target = ctx.break_targets.borrow().last().cloned().unwrap_or_else(|| {
+            panic!("CPS: a statement contains `break` but no loop is currently open")
+        });
+        carried.push(("__loop_running".to_string(), target.running));
+        carried_types.push(Ty::Con("bool".to_string()));
+        if let Some((bv, bv_ty)) = &target.break_val {
+            carried.push(("__break_value".to_string(), *bv));
+            carried_types.push(bv_ty.clone());
+        }
+    }
 
     let join_label = ctx.fresh.label("j");
     let then_cexpr = convert_stmts(rest, env.clone(), ctx, &|env2| {

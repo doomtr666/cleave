@@ -359,7 +359,7 @@ impl Subst {
                         other => out.push(other),
                     }
                 }
-                Ty::App(name.clone(), out)
+                tuple_app(name, out)
             }
             Ty::Fn(params, ret) => Ty::Fn(
                 params.iter().map(|p| self.apply(p)).collect(),
@@ -695,6 +695,16 @@ pub fn unify(subst: &mut Subst, a: &Ty, b: &Ty) -> Result<(), UnifyError> {
         // open pack (two still-symbolic declarations meeting each other)
         // is deliberately out of scope for this pass — falls through to
         // `Mismatch`, a known, flagged gap, not silently wrong.
+        // A tuple whose elements are a pack (`Ts...` as a whole type, arity
+        // unknown) meets a concrete tuple (`__Tuple3<i32, f64, i32>`): the
+        // same tuple, so its pack absorbs the elements through the
+        // pack-aware arm just below.
+        (Ty::App(n1, a1), Ty::App(n2, _)) if n1 == TUPLE_OF_PACK && is_tuple_struct_name(n2) => {
+            unify(subst, &Ty::App(n2.clone(), a1.clone()), &b)
+        }
+        (Ty::App(n1, _), Ty::App(n2, a2)) if n2 == TUPLE_OF_PACK && is_tuple_struct_name(n1) => {
+            unify(subst, &a, &Ty::App(n1.clone(), a2.clone()))
+        }
         (Ty::App(n1, a1), Ty::App(n2, a2)) if n1 == n2 => {
             let trailing_pack = |args: &[Ty]| match args.last() {
                 Some(Ty::Pack(v)) => Some(*v),
@@ -1328,6 +1338,28 @@ impl Scheme {
     }
 }
 
+/// The type name of a tuple whose elements are a still-unresolved pack
+/// (`Ts...` as a whole type, `impl<Ts...: Print> Print<Ts...>`): no arity
+/// yet, unlike the `__TupleN` structs (`ast::tuple_struct_name`). Unifies with
+/// any `__TupleN` (the pack absorbing its elements) and takes that name back
+/// once the pack resolves (`tuple_app`).
+pub(crate) const TUPLE_OF_PACK: &str = "__Tuple";
+
+/// `__Tuple2`, `__Tuple3`, ...: a concrete tuple struct's name.
+pub(crate) fn is_tuple_struct_name(name: &str) -> bool {
+    name.strip_prefix(TUPLE_OF_PACK)
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// `Ty::App(name, args)`, except that a tuple of a pack whose elements are
+/// all known by now becomes the concrete tuple of that arity.
+fn tuple_app(name: &str, args: Vec<Ty>) -> Ty {
+    if name == TUPLE_OF_PACK && !args.iter().any(|a| matches!(a, Ty::Pack(_))) {
+        return Ty::App(tuple_struct_name(args.len()), args);
+    }
+    Ty::App(name.to_string(), args)
+}
+
 /// The field name standing for "the `k`-th field" in a positional access
 /// (`x[k]`, `Infer::resolve_positional`) — bracketed, so it can never collide
 /// with a declared field name (tuple fields are named `0`, `1`, ...).
@@ -1493,7 +1525,7 @@ pub(crate) fn substitute(ty: &Ty, mapping: &HashMap<TyVar, Ty>) -> Ty {
                     other => out.push(other),
                 }
             }
-            Ty::App(name.clone(), out)
+            tuple_app(name, out)
         }
         Ty::Fn(params, ret) => Ty::Fn(
             params.iter().map(|p| substitute(p, mapping)).collect(),
@@ -1906,6 +1938,20 @@ pub struct Infer<'r> {
     /// outside of another `fn`/impl-method's own body inference, which
     /// always resets it first.
     pub(crate) active_generics: HashMap<String, Ty>,
+    /// The `for` loops being inferred, innermost last: loop variable, the
+    /// loop's `NodeId`, its bounds when both fold.
+    unroll_scopes: Vec<(String, NodeId, Option<(u64, u64)>)>,
+    /// Loops to unroll (`NodeId`, folded bounds): a `for` whose body indexes
+    /// a struct or tuple by the loop variable (`unroll.rs`).
+    pub unroll_requests: Vec<(NodeId, u64, u64)>,
+    /// Concrete uses of an impl over a pack (`impl<Ts...: Show> Show<Ts...>`):
+    /// the algebra and the fully concrete types it was matched at
+    /// (`unroll.rs` turns each into a concrete impl).
+    pub pack_impl_uses: Vec<(String, Vec<Ty>)>,
+    /// Names of the type packs (`Ts...`, never a `const Dims...`) seen in
+    /// generics: a type pack used as a whole type is the tuple of its
+    /// elements (`ty_from_ast_mapped`), a const pack never is.
+    type_packs: HashSet<String>,
     /// Every type variable `generalize` has ever quantified into some
     /// binding's `Scheme` — `apply_defaults` must never bind one of these.
     /// Found necessary by testing, not by design up front: a self-recursive
@@ -2123,6 +2169,10 @@ impl<'r> Infer<'r> {
             param_types: Vec::new(),
             target_types: Vec::new(),
             active_generics: HashMap::new(),
+            unroll_scopes: Vec::new(),
+            unroll_requests: Vec::new(),
+            pack_impl_uses: Vec::new(),
+            type_packs: HashSet::new(),
             quantified: HashSet::new(),
             loop_stack: Vec::new(),
             pending_type_name_checks: Vec::new(),
@@ -2767,10 +2817,16 @@ impl<'r> Infer<'r> {
             };
             if variadic { Ty::Pack(id) } else { Ty::Var(id) }
         };
-        generics
+        let mut v_type_packs: Vec<String> = Vec::new();
+        let mapping: HashMap<String, Ty> = generics
             .iter()
             .map(|g| match g {
-                GenericParam::Type { name, variadic, .. } => (name.clone(), fresh(self, *variadic)),
+                GenericParam::Type { name, variadic, .. } => {
+                    if *variadic {
+                        v_type_packs.push(name.clone());
+                    }
+                    (name.clone(), fresh(self, *variadic))
+                }
                 // A const-generic (`const N: i32`) maps to a fresh var
                 // exactly like a type-generic does -- there's no separate
                 // "const" unification universe, just the same `Ty::Var`,
@@ -2792,7 +2848,9 @@ impl<'r> Infer<'r> {
                     (name.clone(), fresh(self, *variadic))
                 }
             })
-            .collect()
+            .collect();
+        self.type_packs.extend(v_type_packs);
+        mapping
     }
 
     /// The inverse of the type-argument list `StructLit` builds: given
@@ -4396,6 +4454,17 @@ impl<'r> Infer<'r> {
                 GenericParam::Const { .. } => true,
             });
             if bounds_satisfied {
+                if generics
+                    .iter()
+                    .any(|g| matches!(g, GenericParam::Type { variadic: true, .. }))
+                {
+                    let concrete: Vec<Ty> = query.iter().map(|q| trial.apply(q)).collect();
+                    if concrete.iter().all(is_fully_concrete)
+                        && !self.pack_impl_uses.iter().any(|(a, tys)| a == algebra && *tys == concrete)
+                    {
+                        self.pack_impl_uses.push((algebra.to_string(), concrete));
+                    }
+                }
                 out.push(trial);
             }
         }
@@ -4463,6 +4532,13 @@ impl<'r> Infer<'r> {
     /// itself on (or aggregates from), the way a bare existence check can
     /// borrow `Num`'s.
     pub(crate) fn has_matching_impl(&mut self, algebra: &str, tys: &[Ty]) -> bool {
+        // A bound on a pack (`Ts...: Print`) holds for each of its elements.
+        if let [Ty::PackResolved(elems)] = tys {
+            let elems = elems.clone();
+            return elems
+                .iter()
+                .all(|e| self.has_matching_impl(algebra, std::slice::from_ref(e)));
+        }
         self.has_matching_impl_inherited(algebra, tys, &mut HashSet::new())
     }
 
@@ -4961,6 +5037,39 @@ impl<'r> Infer<'r> {
         Ok(())
     }
 
+    /// A `for` bound's value when it folds: a constant expression, or the
+    /// length of a struct or tuple (`len(t)`, `t.len()`: its number of
+    /// fields, known from its type alone).
+    fn fold_loop_bound(&mut self, bound: &Expr) -> Option<u64> {
+        let mapping = self.active_generics.clone();
+        if let Some(Ty::Const(ConstValue::Int(n))) = self.const_value_from_expr(bound, &mapping) {
+            return Some(n);
+        }
+        let ExprKind::Call(path, _, args, _) = &bound.kind else {
+            return None;
+        };
+        let [arg] = args.as_slice() else { return None };
+        if path.segments.last().map(String::as_str) != Some("len") {
+            return None;
+        }
+        let arg_ty = self.subst.apply(self.node_types.get(&arg.id)?);
+        if !self.is_positional_struct(&arg_ty) {
+            return None;
+        }
+        let (Ty::Con(name) | Ty::App(name, _)) = &arg_ty else { return None };
+        self.registry.struct_fields(name).map(|fields| fields.len() as u64)
+    }
+
+    /// When `idx` is the variable of an enclosing `for` whose bounds fold:
+    /// that loop's `NodeId` and bounds (`unroll_requests`).
+    fn unrollable_loop_index(&self, idx: &Expr) -> Option<(NodeId, u64, u64)> {
+        let ExprKind::Path(p) = &idx.kind else { return None };
+        let [name] = p.segments.as_slice() else { return None };
+        let (_, for_id, bounds) = self.unroll_scopes.iter().rev().find(|(var, _, _)| var == name)?;
+        let (start, end) = (*bounds)?;
+        Some((*for_id, start, end))
+    }
+
     /// Whether `x[k]` on a value of type `ty` means its `k`-th field: a
     /// struct (tuples included) with no `Index` impl. A type that has one —
     /// an array-backed collection (`DynArray`), a `#[mlir_type]` tensor —
@@ -5320,6 +5429,15 @@ impl<'r> Infer<'r> {
                 let type_args: Vec<Ty> = args
                     .iter()
                     .map(|a| match a {
+                        // A pack in argument position (`Tensor<T, Dims...>`)
+                        // stays a pack, spliced into the arguments once it
+                        // resolves — only a pack used as a whole type is a tuple.
+                        GenericArg::Type(t) if matches!(&t.kind, TypeKind::PackRef(_)) => {
+                            let TypeKind::PackRef(name) = &t.kind else { unreachable!() };
+                            mapping.get(name).cloned().unwrap_or_else(|| {
+                                panic!("type inference: pack reference `{name}...` has no matching declared generic in scope")
+                            })
+                        }
                         GenericArg::Type(t) => self.ty_from_ast_mapped(t, mapping),
                         GenericArg::Const(e) => {
                             self.const_value_from_expr(e, mapping).unwrap_or_else(|| self.vars.fresh())
@@ -5377,10 +5495,18 @@ impl<'r> Infer<'r> {
             // (referencing a pack that was never declared, or a typo) is a
             // real bug either way -- panics with the same clarity the old,
             // unconditional version did.
-            TypeKind::PackRef(name) => mapping
-                .get(name)
-                .cloned()
-                .unwrap_or_else(|| panic!("type inference: pack reference `{name}...` has no matching declared generic in scope")),
+            TypeKind::PackRef(name) => {
+                let pack = mapping.get(name).cloned().unwrap_or_else(|| {
+                    panic!("type inference: pack reference `{name}...` has no matching declared generic in scope")
+                });
+                // A type pack used as a whole type is the tuple of its
+                // elements; a const pack stays a pack.
+                if self.type_packs.contains(name) {
+                    tuple_app(TUPLE_OF_PACK, vec![pack])
+                } else {
+                    pack
+                }
+            }
         }
     }
 
@@ -6028,12 +6154,21 @@ impl<'r> Infer<'r> {
                 ));
                 let mut inner_env = env.clone();
                 inner_env.insert(var.clone(), Scheme::mono(start_ty));
+                // Folded bounds, when they fold: what lets `x[var]` on a
+                // struct or tuple ask for this loop to be unrolled
+                // (`unroll_requests`).
+                let bounds = match (self.fold_loop_bound(start), self.fold_loop_bound(end)) {
+                    (Some(s), Some(e)) => Some((s, e)),
+                    _ => None,
+                };
+                self.unroll_scopes.push((var.clone(), expr.id, bounds));
                 // `infer_block` clones `inner_env` again internally — the
                 // same cheap-clone tradeoff `Lambda`'s own handling above
                 // already makes.
                 self.loop_stack.push(Ty::Con("()".to_string()));
                 let result = self.infer_block(&inner_env, body);
                 self.loop_stack.pop();
+                self.unroll_scopes.pop();
                 result?;
                 Ok(Ty::Con("()".to_string()))
             }
@@ -6185,6 +6320,18 @@ impl<'r> Infer<'r> {
                                 return self.resolve_field_access(&resolved_base, &field, expr.span);
                             }
                             _ => {}
+                        }
+                    } else if let Some((for_id, start, end)) = self.unrollable_loop_index(idx) {
+                        // `x[i]`, `i` the variable of an enclosing `for` with
+                        // folding bounds, `x` a struct or tuple: each value of
+                        // `i` names a field of its own type, so the loop is
+                        // unrolled (`unroll.rs`) and inferred again, one copy
+                        // per index. Typed as a fresh variable meanwhile.
+                        if self.is_positional_struct(&resolved_base) {
+                            if !self.unroll_requests.iter().any(|(id, _, _)| *id == for_id) {
+                                self.unroll_requests.push((for_id, start, end));
+                            }
+                            return Ok(self.vars.fresh());
                         }
                     }
                 }

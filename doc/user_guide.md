@@ -123,6 +123,37 @@ fn main() -> i32 {
 }
 ```
 
+A `for` loop can walk such a collection by index: the compiler unrolls it into one copy of the body per element, each copy typed with its own element's type, so nothing in the loop has to say which kind it is. `break` still leaves the whole loop.
+
+```
+fn main() -> i32 {
+    let t = (7, 2.5, 9);
+    let mut same = 0;
+    for i in 0..t.len() { if t[i] == t[i] { same = same + 1; }; };   // t[0]: i32, t[1]: f64, t[2]: i32
+    same                                                               // 3
+}
+```
+
+Every copy has to type-check on its own element, both branches of an `if` included, even when the condition only depends on `i`.
+
+An algebra can be implemented once for every tuple, whatever its length, as long as each element type implements it: a pack of types (`Ts...`) with a bound reads "every element satisfies it". This is how `print` handles tuples:
+
+```
+algebra Show<T> { fn show(x: T) -> i32; }
+impl Show<i32> { fn show(x) { 1 } }
+impl Show<f64> { fn show(x) { 10 } }
+impl<Ts...: Show> Show<Ts...> {                  // any tuple of Show-able elements
+    fn show(x) {
+        let mut s = 0;
+        for i in 0..x.len() { s = s + show(x[i]); };
+        s
+    }
+}
+fn main() -> i32 { show((1, 2.5:f64, 3)) }      // 12
+```
+
+The compiler makes one concrete impl per tuple type the program actually uses, with the loop unrolled for it. Like any generic impl, its body is checked for each of those uses, and an error points at the line in the generic impl.
+
 ## Functions, and how their types get inferred
 
 ```

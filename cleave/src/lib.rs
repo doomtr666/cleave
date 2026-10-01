@@ -25,4 +25,5 @@ pub mod rc_opt;
 pub mod redundant_copy_elim;
 pub mod rust_bindings;
 pub mod unify_alloc;
+pub mod unroll;
 pub mod unroll_jam;

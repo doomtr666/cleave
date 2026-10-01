@@ -9,7 +9,6 @@
 // hardcoded `Ty::Vector`, reverted for exactly this reason). `use dynarray;`
 // explicitly — not prelude, matching `io`/`vector`/`complex`'s own
 // precedent: a program that never constructs one sees zero change.
-use linalg; // `Index<Container, Elem, K>` — declared there, reused below.
 
 // A real, opaque, nominal handle type for the raw heap buffer backing a
 // `DynArray<T>` — zero fields, never constructed via `RawBuf(...)` anywhere

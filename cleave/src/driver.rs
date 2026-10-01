@@ -317,7 +317,8 @@ pub fn compile(
         .map(|program| synthesize_tuple_structs(program, &mut node_ids))
         .map(|program| synthesize_heap_struct_marker_impls(program, &mut node_ids))
         .map(|program| synthesize_len_impls(program, &mut node_ids))
-        .map(crate::resolve::resolve_calls);
+        .map(crate::resolve::resolve_calls)
+        .map(|program| crate::unroll::unroll_heterogeneous_loops(program, &mut node_ids));
     (result, sources)
 }
 

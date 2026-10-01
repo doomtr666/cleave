@@ -264,6 +264,25 @@ redefine positional access for a struct.
 1. ✅ `Len` synthesized for structs and tuples; `x[i]` with a folding index as positional projection;
    `t[0]` replaces `t.0`.
 2. Unrolled `for`; collapse the fifteen `Print` impls as the first real use.
+   - 2a ✅ (2026-10-02) concrete collections: `unroll.rs`, run from `driver::compile` after name
+     resolution — a trial inference records unroll requests (`Infer::unroll_requests`: a `for` with
+     folding bounds, `len(t)` included, whose body indexes a struct or tuple by its variable), the loop
+     is rewritten into one copy per index (fresh node ids, the variable replaced by its value, wrapped in
+     `loop { ...; break; }` when the body breaks), and the round repeats for nested loops. Found and
+     fixed on the way: a `break` following an earlier statement that may break was lost (CPS
+     `continue_after` didn't carry the loop's running flag), so the loop ran forever.
+   - 2b ✅ (2026-10-02) impls over a pack of types: `impl<Ts...: Print> Print<Ts...>` replaces the
+     fifteen per-arity tuple impls in `stdlib/io/io.cleave`. A type pack used as a whole type is the
+     tuple of its elements (`infer.rs::TUPLE_OF_PACK`, unifying with any `__TupleN`), a bound on a pack
+     holds element by element (`has_matching_impl`), and such an impl is a template: `unroll.rs` takes
+     it out of the program and adds one concrete impl per tuple type the trial inference finds it used
+     at, whose loop then unrolls like any other. The template's body is checked per instance, the same
+     posture every generic impl body already has in cleave (checked permissively, real errors at
+     instantiation); checking generic bodies once with rigid type variables would be new for all
+     generic code, not specific to packs (`doc/backlog.md`).
+   - Brought forward: an `if` whose condition folds should keep only its taken branch (listed under
+     step 7) — the first natural unrolled loop (`if i == 1 { a = a + t[i] } else { b = b + t[i] }`)
+     needs it, since every copy otherwise type-checks both branches.
 3. Comprehensions through `Collect` (tensors, synthesized for structs); `Optimizer` for marked structs; the MNIST kernel without its hand-written
    `impl Optimizer` and `NetworkState`.
 4. Arrays also through `Index` (and its writing counterpart) in the prelude, on top of the primitive

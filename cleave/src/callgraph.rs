@@ -125,6 +125,12 @@ pub struct ProgramInference {
     /// coincided — confirmed directly, not hypothetical, before this field
     /// existed.
     pub next_var_id: u32,
+    /// `for` loops to unroll (`Infer::unroll_requests`), gathered from every
+    /// group, failed ones included: a loop whose body indexes a struct or
+    /// tuple by its variable can't type-check before it is unrolled.
+    pub unroll_requests: Vec<(NodeId, u64, u64)>,
+    /// Concrete uses of impls over packs (`Infer::pack_impl_uses`).
+    pub pack_impl_uses: Vec<(String, Vec<Ty>)>,
 }
 
 /// Whether `f` is a root of the program that is never generalized: `main` or
@@ -190,6 +196,8 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
     // later group's brand-new generic parameter as "already free in the
     // environment" purely by numeric coincidence.
     let mut next_var_id: u32 = 0;
+    let mut unroll_requests: Vec<(NodeId, u64, u64)> = Vec::new();
+    let mut pack_impl_uses: Vec<(String, Vec<Ty>)> = Vec::new();
 
     for group in &sccs {
         let mut infer = Infer::new(registry).with_var_counter_starting_at(next_var_id);
@@ -534,6 +542,12 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
             s.ty = infer.subst.apply(&s.ty);
             (*id, s)
         }));
+        unroll_requests.extend(infer.unroll_requests.drain(..));
+        for u in infer.pack_impl_uses.drain(..) {
+            if !pack_impl_uses.contains(&u) {
+                pack_impl_uses.push(u);
+            }
+        }
         next_var_id = infer.var_counter();
     }
 
@@ -543,6 +557,8 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
         lambda_schemes,
         global_env,
         next_var_id,
+        unroll_requests,
+        pack_impl_uses,
     }
 }
 

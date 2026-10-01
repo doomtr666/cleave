@@ -195,21 +195,9 @@ impl<T: Float, const Dims...: i32> Scale<Tensor<T, Dims...>, T> {
 // exclusively for a real array (see `infer.rs`'s own `StmtKind::Assign`
 // guard) — a tensor-backed value is immutable by construction, no
 // `IndexMut`-equivalent attempted.
-algebra Index<Container, Elem, const K: i32> {
-    fn index(c: Container, idx: [i32; K]) -> Elem;
-
-    // `d/dx[c[idx]] = (dc/dx)[idx]` — reading one element out of a
-    // container and differentiating commute: the derivative of "the value
-    // at position `idx`" is "the derivative, read at that same position."
-    // `idx` itself is never wrapped in `d(...)` — an array of integer
-    // indices isn't a differentiable quantity, it's reused as-is, exactly
-    // the same shape `Ring<T>`'s own product rule already uses for an
-    // operand that stays undifferentiated on one side (`mul(a, d(b))`).
-    // Found missing directly: indexing into a `Tensor` had no path to a
-    // derivative at all before this — `doc/backlog.md`'s own "toward
-    // tensorial ML" item.
-    derivative index(c, idx): index(d(c), idx);
-}
+// `algebra Index<Container, Elem, const K: i32>` itself is declared in the
+// prelude (`stdlib/core/core.cleave`), shared with arrays, `DynArray` and
+// user collections.
 
 impl<T: Float, const Dims...: i32> Index<Tensor<T, Dims...>, T> {
     fn index(t: Tensor<T, Dims...>, idx: [i32; Dims.len()]) -> T {

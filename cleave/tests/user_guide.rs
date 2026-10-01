@@ -426,6 +426,39 @@ fn structs_and_tuples_indexed_by_position() {
 }
 
 #[test]
+fn for_over_a_tuple_is_unrolled() {
+    let context = context();
+    let src = "
+        fn main() -> i32 {
+            let t = (7, 2.5, 9);
+            let mut same = 0;
+            for i in 0..t.len() { if t[i] == t[i] { same = same + 1; }; };
+            same
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 3);
+}
+
+#[test]
+fn an_impl_over_a_pack_of_types() {
+    let context = context();
+    let src = "
+        algebra Show<T> { fn show(x: T) -> i32; }
+        impl Show<i32> { fn show(x) { 1 } }
+        impl Show<f64> { fn show(x) { 10 } }
+        impl<Ts...: Show> Show<Ts...> {
+            fn show(x) {
+                let mut s = 0;
+                for i in 0..x.len() { s = s + show(x[i]); };
+                s
+            }
+        }
+        fn main() -> i32 { show((1, 2.5:f64, 3)) }
+    ";
+    assert_eq!(run_i32(&context, src), 12);
+}
+
+#[test]
 fn how_a_call_finds_what_it_calls() {
     let context = context();
     let src = "

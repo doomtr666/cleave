@@ -11,3 +11,25 @@ algebra Len<C> {
 impl<T, const N: i32> Len<[T; N]> {
     fn len(c) { N }
 }
+
+// Indexing a homogeneous collection with run-time indices (`m[i, j]`): one
+// call per bracket group, every index gathered into one `[i32; K]` array
+// (`cps.rs`'s `ExprKind::Index`). Implemented by `Tensor` (`stdlib/linalg`),
+// `DynArray` (`stdlib/dynarray`) and any user collection; a struct or tuple
+// with no `Index` impl is indexed by position instead (`x[0]` is its first
+// field, `infer.rs::is_positional_struct`).
+algebra Index<Container, Elem, const K: i32> {
+    fn index(c: Container, idx: [i32; K]) -> Elem;
+
+    // `d/dx[c[idx]] = (dc/dx)[idx]` — reading one element out of a
+    // container and differentiating commute: the derivative of "the value
+    // at position `idx`" is "the derivative, read at that same position."
+    // `idx` itself is never wrapped in `d(...)` — an array of integer
+    // indices isn't a differentiable quantity, it's reused as-is, exactly
+    // the same shape `Ring<T>`'s own product rule already uses for an
+    // operand that stays undifferentiated on one side (`mul(a, d(b))`).
+    // Found missing directly: indexing into a `Tensor` had no path to a
+    // derivative at all before this — `doc/backlog.md`'s own "toward
+    // tensorial ML" item.
+    derivative index(c, idx): index(d(c), idx);
+}
