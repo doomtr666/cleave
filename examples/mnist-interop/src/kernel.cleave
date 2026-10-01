@@ -18,13 +18,14 @@ use linalg;
 use io;
 
 extern fn train_len() -> i32;
-extern fn train_pixel(sample: i32, pixel: i32) -> f32;
-extern fn train_label(sample: i32) -> i32;
-extern fn train_target(sample: i32, class: i32) -> f32;
 extern fn test_len() -> i32;
-extern fn test_pixel(sample: i32, pixel: i32) -> f32;
 extern fn test_label(sample: i32) -> i32;
-extern fn test_target(sample: i32, class: i32) -> f32;
+// One call per batch, writing straight into the array argument (`data.rs`).
+extern fn train_batch_pixels(sample: i32, out: [[f32; 784]; 32]);
+extern fn train_batch_targets(sample: i32, out: [[f32; 10]; 32]);
+extern fn test_batch_pixels(sample: i32, out: [[f32; 784]; 80]);
+// Marks the end of training, so the host times training alone (`main.rs`).
+extern fn training_done();
 
 struct Network {
     l1: Dense<f32, 784, 512>,
@@ -92,34 +93,22 @@ impl<Opt, StateL1, StateL2, StateL3, StateL4>
 // own established pattern) -- confirmed to reproduce with a minimal,
 // `Tensor`-free probe. The loop-bound variable (`_k`, discarded) is never
 // referenced, sidestepping it entirely.
-fn load_train_batch_input<const B: i32>(batch_start: i32) -> Tensor<f32, B, 784> {
-    let mut pixels: [[f32; 784]; B] = mlir::memref::alloc();
-    let mut b: i32 = 0;
-    for _k in 0..B {
-        for i in 0..784 {
-            pixels[b, i] = train_pixel(batch_start + b, i);
-        };
-        b = b + 1;
-    };
-    Tensor::<f32, B, 784>(data: pixels)
+fn load_train_batch_input(batch_start: i32) -> Tensor<f32, 32, 784> {
+    let mut pixels: [[f32; 784]; 32] = mlir::memref::alloc();
+    train_batch_pixels(batch_start, pixels);
+    Tensor::<f32, 32, 784>(data: pixels)
 }
 
-fn load_train_batch_target<const B: i32>(batch_start: i32) -> Tensor<f32, B, 10> {
-    let mut t: [[f32; 10]; B] = mlir::memref::alloc();
-    let mut b: i32 = 0;
-    for _k in 0..B {
-        for c in 0..10 {
-            t[b, c] = train_target(batch_start + b, c);
-        };
-        b = b + 1;
-    };
-    Tensor::<f32, B, 10>(data: t)
+fn load_train_batch_target(batch_start: i32) -> Tensor<f32, 32, 10> {
+    let mut t: [[f32; 10]; 32] = mlir::memref::alloc();
+    train_batch_targets(batch_start, t);
+    Tensor::<f32, 32, 10>(data: t)
 }
 
-fn load_test_input(sample: i32) -> Tensor<f32, 1, 784> {
-    let mut pixels: [f32; 784] = mlir::memref::alloc();
-    for i in 0..784 { pixels[i] = test_pixel(sample, i); };
-    Tensor::<f32, 1, 784>(data: [pixels])
+fn load_test_batch_input(batch_start: i32) -> Tensor<f32, 80, 784> {
+    let mut pixels: [[f32; 784]; 80] = mlir::memref::alloc();
+    test_batch_pixels(batch_start, pixels);
+    Tensor::<f32, 80, 784>(data: pixels)
 }
 
 // No final activation -- raw logits, matching `examples/digits-interop`'s
@@ -185,29 +174,38 @@ fn loss(x: Tensor<f32, 32, 784>, y: Tensor<f32, 32, 10>, net: Network) -> f32 {
 // 512x784` matmul, computed for nothing, `18,750` times over a full run.
 net_grad = grad(loss, net);
 
-fn argmax10(pred: Tensor<f32, 1, 10>) -> i32 {
+fn argmax_row(pred: Tensor<f32, 80, 10>, r: i32) -> i32 {
     let mut best: i32 = 0;
-    let mut best_val: f32 = pred[0, 0];
+    let mut best_val: f32 = pred[r, 0];
     for c in 1..10 {
-        if pred[0, c] > best_val {
-            best_val = pred[0, c];
+        if pred[r, c] > best_val {
+            best_val = pred[r, c];
             best = c;
         };
     };
     best
 }
 
+// Batches of 80 (the 10,000-image test set divides evenly), not one image
+// at a time: a batch of 1 turns every layer into a matrix-vector product
+// that re-reads all ~2.3 MB of weights per image -- measured with AMD uProf
+// at ~12% of the whole run for under 1% of its arithmetic. 80, not 100: a
+// batch size that isn't a multiple of the matmul schedule's own row tile
+// (8) currently fails to compile (`linalg-to-affine-loops`: "'affine.for'
+// op operand cannot be used as a dimension id", on the remainder tile) --
+// a real compiler bug, not worked around beyond picking 80 here.
 fn evaluate(net: Network) -> f32 {
-    let n: i32 = test_len();
+    let num_batches: i32 = test_len() / 80;
     let mut correct: i32 = 0;
-    for s in 0..n {
-        let x = load_test_input(s);
-        let predicted: i32 = argmax10(forward(x, net));
-        let label: i32 = test_label(s);
-        if predicted == label { correct = correct + 1; };
+    for s in 0..num_batches {
+        let batch_start: i32 = s * 80;
+        let pred: Tensor<f32, 80, 10> = forward(load_test_batch_input(batch_start), net);
+        for r in 0..80 {
+            if argmax_row(pred, r) == test_label(batch_start + r) { correct = correct + 1; };
+        };
     };
     let correct_f: f32 = correct.to();
-    let n_f: f32 = n.to();
+    let n_f: f32 = (num_batches * 80).to();
     correct_f / n_f
 }
 
@@ -246,5 +244,6 @@ export fn train_and_evaluate(epochs: i32, lr: f32, seed: i64) -> f32 {
 
         println(("Epoch=", epoch));
     };
+    training_done();
     evaluate(net)
 }

@@ -4,8 +4,8 @@
 //! parsing the real dataset happens entirely here, in Rust, before the
 //! compiled cleave training loop ever runs. Same crossing-the-boundary shape
 //! `examples/digits-interop/src/data.rs` already established (one scalar at
-//! a time, through `extern fn` getters -- `rust_bindings.rs`'s own doc
-//! comment: "only scalars cross this boundary today"), just scaled up (784
+//! a time, through `extern fn` getters at first -- now one `extern` call per
+//! whole batch, copied straight into a cleave array argument), scaled up (784
 //! pixels instead of 64, real IDX binary files instead of a CSV already
 //! checked into the repo).
 //!
@@ -158,26 +158,8 @@ pub extern "C" fn train_len() -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn train_pixel(sample: i32, pixel: i32) -> f32 {
-    let d = TRAIN.get().expect("data::init not called yet");
-    d.pixels[sample as usize * PIXELS_PER_IMAGE + pixel as usize]
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn train_label(sample: i32) -> i32 {
-    let d = TRAIN.get().expect("data::init not called yet");
-    d.labels[sample as usize]
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn test_len() -> i32 {
     TEST.get().expect("data::init not called yet").len() as i32
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn test_pixel(sample: i32, pixel: i32) -> f32 {
-    let d = TEST.get().expect("data::init not called yet");
-    d.pixels[sample as usize * PIXELS_PER_IMAGE + pixel as usize]
 }
 
 #[unsafe(no_mangle)]
@@ -186,17 +168,46 @@ pub extern "C" fn test_label(sample: i32) -> i32 {
     d.labels[sample as usize]
 }
 
-/// One-hot encoding, computed here rather than in cleave -- `digits-interop/
-/// src/data.rs`'s own identical `train_target`/`test_target` doc comment for
-/// why.
-#[unsafe(no_mangle)]
-pub extern "C" fn train_target(sample: i32, class: i32) -> f32 {
-    let d = TRAIN.get().expect("data::init not called yet");
-    if d.labels[sample as usize] == class { 1.0 } else { 0.0 }
+/// Copies whole consecutive samples, starting at `sample`, into a cleave
+/// array (`out`/`len`: its data pointer and total element count, the
+/// `(ptr, len)` shape `mlir_lower.rs::array_ptr_and_len` passes for every
+/// `Ty::Array` extern argument): one call per batch, rather than one
+/// `extern` call per pixel as this file used to do. Row-major, so `len /
+/// PIXELS_PER_IMAGE` samples.
+unsafe fn copy_pixels(d: &Dataset, sample: i32, out: *mut f32, len: i64) {
+    let start = sample as usize * PIXELS_PER_IMAGE;
+    let src = &d.pixels[start..start + len as usize];
+    unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), out, src.len()) }
 }
 
+/// # Safety
+/// `out` must point to `len` writable `f32`s (a cleave `[[f32; 784]; B]`).
 #[unsafe(no_mangle)]
-pub extern "C" fn test_target(sample: i32, class: i32) -> f32 {
-    let d = TEST.get().expect("data::init not called yet");
-    if d.labels[sample as usize] == class { 1.0 } else { 0.0 }
+pub unsafe extern "C" fn train_batch_pixels(sample: i32, out: *mut f32, len: i64) {
+    unsafe { copy_pixels(TRAIN.get().expect("data::init not called yet"), sample, out, len) }
+}
+
+/// # Safety
+/// `out` must point to `len` writable `f32`s (a cleave `[[f32; 784]; B]`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn test_batch_pixels(sample: i32, out: *mut f32, len: i64) {
+    unsafe { copy_pixels(TEST.get().expect("data::init not called yet"), sample, out, len) }
+}
+
+/// One-hot targets for `len / 10` consecutive training samples, computed
+/// here rather than in cleave -- `digits-interop/src/data.rs`'s own
+/// `train_target` doc comment for why.
+///
+/// # Safety
+/// `out` must point to `len` writable `f32`s (a cleave `[[f32; 10]; B]`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn train_batch_targets(sample: i32, out: *mut f32, len: i64) {
+    let d = TRAIN.get().expect("data::init not called yet");
+    let out = unsafe { std::slice::from_raw_parts_mut(out, len as usize) };
+    for (row, targets) in out.chunks_exact_mut(10).enumerate() {
+        let label = d.labels[sample as usize + row];
+        for (class, t) in targets.iter_mut().enumerate() {
+            *t = if label == class as i32 { 1.0 } else { 0.0 };
+        }
+    }
 }

@@ -6,6 +6,20 @@ Completed items live in [backlog-done.md](backlog-done.md).
 
 ---
 
+## A matmul whose row count isn't a multiple of the schedule's row tile (8) fails to compile
+
+Found moving `examples/mnist-interop`'s `evaluate` from one image at a time to batches of 100: every
+`forward<100>` layer is a `100 x K` matmul, and the transform-dialect schedule tiles rows by 8
+(`matmul_vectorize.transform.mlir`, `tile_using_forall tile_sizes [8, 0]`). The remainder tile (4 rows)
+has a dynamic size; that linalg op isn't vectorized, falls through to `--convert-linalg-to-affine-loops`,
+and the pass fails: `'affine.for' op operand cannot be used as a dimension id` (the bound is an SSA
+value defined inside the enclosing `scf` loop, not a valid affine dim/symbol). Batch 1 (the old
+`forward<1>`) and multiples of 8/16 (32, 80) compile fine. `evaluate` uses 80 for now. The fix belongs
+in the schedule (pad or peel the remainder tile, as the narrow-output `pad` path already does for N)
+or in the fallback lowering, not in user code.
+
+---
+
 ## Two real gaps in the array-ownership model, found while discussing nesting (array-in-tuple-in-struct) for the affine-ownership plan — both fixed and tested; two adjacent construction-side limitations found along the way, not fixed
 
 Tuples need no work at all: `(a, b)` desugars to `struct __Tuple2 { 0: T0, 1: T1 }` before CPS (`ast.rs`/`driver.rs`/`lower.rs`), and `lower_release_cascade` already recurses into any struct-typed field — tuple-of-struct, struct-of-tuple-of-struct, any depth, all free.
