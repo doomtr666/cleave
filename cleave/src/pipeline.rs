@@ -209,8 +209,13 @@ pub fn build_cps_program(
 /// every reachable unit's own types are already fully concrete and has no
 /// error-reporting of its own.
 pub fn check_type_errors(program: &Program, registry: &Registry) -> Result<(), Vec<Diagnostic>> {
+    // Coherence first: two impls that could both apply to one type leave
+    // dispatch with no principled way to choose, so every later choice
+    // assumes this holds.
+    let overlaps = crate::infer::Infer::new(registry).check_no_overlapping_impls();
+    let mut diags: Vec<Diagnostic> = overlaps.iter().map(Diagnostic::from).collect();
     let (_, errs) = crate::monomorphize::dump_monomorphized(program, registry);
-    let mut diags: Vec<Diagnostic> = errs.iter().map(Diagnostic::from).collect();
+    diags.extend(errs.iter().map(Diagnostic::from));
     diags.extend(check_mutability_errors(program));
     diags.extend(check_const_decl_errors(program, registry));
     if diags.is_empty() { Ok(()) } else { Err(diags) }

@@ -4162,9 +4162,20 @@ impl<'r> Infer<'r> {
                                 }
                             }
                         }
-                        let bounds_admit_a_shared_type = groups
-                            .iter()
-                            .all(|(_, bs)| self.unsatisfiable_bounds(bs.iter().copied()).is_none());
+                        // A group whose variable the shape match pinned to
+                        // something other than a bare variable (`S := f64`
+                        // in `impl<S: HeapStruct> RawBuffer<S>` against
+                        // `impl RawBuffer<f64>`) needs that type itself to
+                        // satisfy every bound, not just the bounds to share a
+                        // candidate among themselves.
+                        let bounds_admit_a_shared_type = groups.iter().all(|(root, bs)| {
+                            self.unsatisfiable_bounds(bs.iter().copied()).is_none()
+                                && (matches!(root, Ty::Var(_))
+                                    || bs.iter().all(|b| {
+                                        !self.registry.has_algebra(b)
+                                            || self.has_matching_impl(b, std::slice::from_ref(root))
+                                    }))
+                        });
                         if bounds_admit_a_shared_type {
                             let fmt_targets = |ts: &[&Type]| {
                                 ts.iter()

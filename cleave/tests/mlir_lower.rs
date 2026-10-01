@@ -5546,6 +5546,66 @@ fn an_unpinned_declared_generic_is_rejected_not_defaulted() {
     );
 }
 
+fn type_errors(src: &str) -> Vec<String> {
+    let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
+    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+    let registry = Registry::build(&program);
+    match check_type_errors(&program, &registry) {
+        Ok(()) => Vec::new(),
+        Err(diags) => diags.iter().map(|d| format!("{d:?}")).collect(),
+    }
+}
+
+/// Coherence is checked by the real compile: two impls that could both apply
+/// to one type are rejected, before any call is even made.
+#[test]
+fn overlapping_impls_are_rejected_by_the_real_compile() {
+    let errors = type_errors(
+        "
+        algebra Twice<T> { fn twice(x: T) -> T; }
+        impl<T: Ring> Twice<T> { fn twice(x) { x + x } }
+        impl Twice<i32> { fn twice(x) { x * 2 } }
+        fn main() -> i32 { 0 }
+    ",
+    );
+    assert!(errors.iter().any(|e| e.contains("overlapping")), "got: {errors:?}");
+}
+
+/// Not an overlap: the generic impl's bound can't be met by the concrete
+/// impl's type (`f64` is no `Marker`), so no type is covered by both — the
+/// shape-only false positive `impl<S: HeapStruct> RawBuffer<S>` vs. `impl
+/// RawBuffer<f64>` used to hit.
+#[test]
+fn a_bounded_generic_impl_beside_a_concrete_one_it_cannot_cover_is_not_an_overlap() {
+    let context = context();
+    let src = "
+        algebra Marker<T> {}
+        struct Point { x: f64 }
+        impl Marker<Point> {}
+        algebra Size<T> { fn size(x: T) -> i32; }
+        impl<S: Marker> Size<S> { fn size(x) { 1 } }
+        impl Size<f64> { fn size(x) { 8 } }
+        fn main() -> i32 { size(Point(x: 1.0)) * 10 + size(2.0:f64) }
+    ";
+    assert_eq!(run_i32(&context, src), 18);
+}
+
+/// A call whose types don't say which impl it means (`make`'s signature never
+/// mentions `T`) is an indeterminacy, rejected — never resolved to whichever
+/// impl comes first.
+#[test]
+fn a_call_that_does_not_determine_its_impl_is_rejected() {
+    let errors = type_errors(
+        "
+        algebra Make<T> { fn make(n: i32) -> i32; }
+        impl Make<i32> { fn make(n) { n } }
+        impl Make<f64> { fn make(n) { n + 1 } }
+        fn main() -> i32 { make(3) }
+    ",
+    );
+    assert!(!errors.is_empty(), "an undetermined impl must not be picked silently");
+}
+
 /// `let (a, mut b) = ...;` binds each element of a tuple, nesting allowed;
 /// `(x, y) = ...;` assigns each element, reading the whole value before
 /// writing any target, so `(x, y) = (y, x);` swaps.

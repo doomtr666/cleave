@@ -1094,3 +1094,22 @@ Raised directly, chasing a genuine mono-thread cleave-vs-PyTorch comparison (PyT
 **The general fix: one insertion point, not one per loop kind.** Moved the whole pass to run right after the *second* `--lower-affine` call instead — the one point in the entire pipeline where `scf.while`, every `scf.for` (both sources), and every `scf.parallel` (both sources) are *simultaneously* present, still fully structured (no multi-block CFG from `--convert-scf-to-cf` yet), and not yet consumed by anything OpenMP-specific (`--convert-scf-to-openmp`, immediately after, only runs `if options.openmp`). Extended the match to `"scf.while" | "scf.for" | "scf.parallel"` (the first two share one region index, `0`; `scf.while`'s own body is region `1`, per its own doc comment). One real risk checked directly rather than assumed safe: inserting `llvm.intr.stacksave`/`stackrestore` *inside* an `scf.parallel` body **before** `--convert-scf-to-openmp` runs (when `options.openmp` is on) could in principle confuse that pass's own region-outlining logic — tested directly on the real, unmodified 4-layer `mnist-interop` kernel with `--openmp` enabled: `test accuracy: 0.9342` (unchanged), `30.17s` (within the already-established range for this thread count) — no regression, the outlining tolerates the extra ops fine.
 
 **Verified**: the narrow-`N` repro (both the original and the exact minimal single-`Dense`-layer network that first exposed it) now runs clean under `--no-openmp`. Full `cargo test -p cleave --release` clean, all 25 binaries. Both `digits-interop` (`0.94713414`) and the real 4-layer `mnist-interop`, tested both ways — `--openmp` (`0.9342`, `30.17s`, confirming the relocation didn't regress the already-working path) and `--no-openmp` (`0.9342`, `38.78s`, matching the already-established no-openmp baseline) — all correctness-identical, zero regressions either direction.
+
+
+## No `Type::method()` static-call syntax — decided against (2026-10-01)
+
+`Tensor::<f32, 3, 3>::xavier()` would need an algebra parameter playing `Self`, which cleave's
+multi-parameter algebras don't have (`Optimizer<Opt, Model, State>`: which one would `Sgd::step` fix?);
+picking one by rule would be an implicit convention. The model already says which type is meant: the
+expected type (`let t: Tensor<f32, 3, 3> = xavier();`, a struct field) or the algebra's own turbofish
+(`Init::xavier::<Tensor<f32, 3, 3>>()`). Bare `xavier()`/`he()` resolve through `resolve.rs`.
+
+## `check_no_overlapping_impls` false positive, and coherence enforced by the real compile (2026-10-01)
+
+`impl<S: HeapStruct> RawBuffer<S>` beside `impl RawBuffer<f64>` was reported as overlapping: the bound
+check only intersected two sides' bounds, never asked whether the concrete type the shape match pinned
+(`S := f64`) meets the one bound. It now does (`has_matching_impl` on the pinned type), no overlap is
+reported anywhere in the stdlib or examples, and `pipeline.rs::check_type_errors` runs the check on
+every compile. Dispatch at monomorphization (`derive_impl_instantiation`) no longer takes the first
+matching impl: several matches on a concrete call are an ambiguity error, on a still-generic one a
+deferral.

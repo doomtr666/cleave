@@ -1751,6 +1751,12 @@ fn collect_instantiations_expr(
                             impl_worklist.push((idx, HashMap::new()));
                         }
                         ImplMatch::NoCandidates => {} // type-checking already validated this qualified call; not expected, harmless if reached
+                        ImplMatch::Ambiguous { algebra, candidates } => {
+                            errors.push(TypeError {
+                                span: expr.span,
+                                kind: TypeErrorKind::AmbiguousDispatch { algebra, candidates },
+                            });
+                        }
                         ImplMatch::NoneMatched { algebra, tys } => {
                             errors.push(TypeError {
                                 span: expr.span,
@@ -1843,6 +1849,12 @@ fn collect_instantiations_expr(
                     "derive_impl_instantiation never returns FoundConcrete when algebra is None"
                 ),
                 ImplMatch::NoCandidates => {} // not an algebra call, or a non-generic one -- nothing to do here
+                ImplMatch::Ambiguous { algebra, candidates } => {
+                    errors.push(TypeError {
+                        span: expr.span,
+                        kind: TypeErrorKind::AmbiguousDispatch { algebra, candidates },
+                    });
+                }
                 ImplMatch::NoneMatched { algebra, tys } => {
                     errors.push(TypeError {
                         span: expr.span,
@@ -1897,6 +1909,12 @@ fn collect_instantiations_expr(
                             "derive_impl_instantiation never returns FoundConcrete when algebra is None"
                         ),
                         ImplMatch::NoCandidates => {}
+                        ImplMatch::Ambiguous { algebra, candidates } => {
+                            errors.push(TypeError {
+                                span: expr.span,
+                                kind: TypeErrorKind::AmbiguousDispatch { algebra, candidates },
+                            });
+                        }
                         ImplMatch::NoneMatched { algebra, tys } => {
                             errors.push(TypeError {
                                 span: expr.span,
@@ -2168,6 +2186,12 @@ enum ImplMatch {
     NoneMatched {
         algebra: String,
         tys: String,
+    },
+    /// Several impls match this call's types: the call doesn't determine
+    /// which one it means (`derive_impl_instantiation`'s own doc comment).
+    Ambiguous {
+        algebra: String,
+        candidates: Vec<String>,
     },
 }
 
@@ -3198,18 +3222,15 @@ fn seed_derive_tensor_field_indices(
 ///
 /// The bound-check (`t.generic_bounds`, same field, same reasoning as
 /// `find_impl_for_target`'s own — see that function's doc comment for the
-/// full story) is not defensive: this function used to trust `check_no_
-/// overlapping_impls` to guarantee at most one *structural* match could
-/// ever exist, and return the first one unconditionally — a real, found-by-
-/// testing bug, since that guarantee doesn't actually hold in practice
-/// (`check_no_overlapping_impls` is never invoked by the real compile
-/// pipeline at all, `doc/backlog.md` has the fuller story) and a purely
-/// structural match can't distinguish `impl<T: Float+Ring> Optimizer<Sgd,
-/// T>` from `impl<Opt> Optimizer<Opt, Pair>` for a call site needing
-/// `Optimizer::step(Sgd_value, Pair_value, ...)` — both unify (`T:=Pair`,
-/// `Opt:=Sgd`), only the first one's own bound (`Pair` doesn't implement
-/// `Float`/`Ring`) rules it out. A rejected-on-bounds candidate now falls
-/// through to the next, same as a structurally-mismatched one already did.
+/// full story) is what coherence relies on: a purely structural match can't
+/// distinguish `impl<T: Float+Ring> Optimizer<Sgd, T>` from `impl<Opt>
+/// Optimizer<Opt, Pair>` for a call site needing `Optimizer::step(Sgd_value,
+/// Pair_value, ...)` — both unify (`T:=Pair`, `Opt:=Sgd`), only the first
+/// one's own bound (`Pair` doesn't implement `Float`/`Ring`) rules it out.
+/// Every candidate is then weighed, never the first taken: coherence
+/// (`check_no_overlapping_impls`, run by `pipeline.rs::check_type_errors`)
+/// leaves at most one for a concrete call, so several mean the call doesn't
+/// determine its impl — `ImplMatch::Ambiguous`, an error.
 ///
 /// If candidates existed but none matched (structurally, or on bounds),
 /// that's *usually* a real, surfaced failure (`ImplMatch::NoneMatched`) —
@@ -3266,6 +3287,11 @@ fn derive_impl_instantiation(
         Box::new(crate::cps::dispatch_ty(&ret_ty)),
     );
 
+    // Every matching impl, not the first: with coherence checked
+    // (`check_no_overlapping_impls`), a call whose types are concrete matches
+    // at most one, so several means the call itself doesn't determine its
+    // impl — an indeterminacy to report, never a choice to make.
+    let mut matches: Vec<(usize, Option<HashMap<TyVar, Ty>>)> = Vec::new();
     for (idx, t) in templates.iter().enumerate() {
         if t.method_name != method
             || t.param_patterns.len() != arg_tys.len()
@@ -3279,10 +3305,8 @@ fn derive_impl_instantiation(
             continue;
         }
         if !t.is_generic {
-            return match algebra {
-                None => ImplMatch::NoCandidates,
-                Some(_) => ImplMatch::FoundConcrete(idx),
-            };
+            matches.push((idx, None));
+            continue;
         }
         let bounds_satisfied = t.generic_bounds.iter().all(|(var, bounds)| {
             let resolved = trial.apply(var);
@@ -3306,11 +3330,39 @@ fn derive_impl_instantiation(
             .into_iter()
             .map(|v| (v, trial.apply(&Ty::Var(v))))
             .collect();
-        return ImplMatch::Found(idx, mapping);
+        matches.push((idx, Some(mapping)));
     }
-    ImplMatch::NoneMatched {
-        algebra: candidates[0].algebra.clone(),
-        tys: query.to_string(),
+    // A query still holding type variables (a generic lambda's body walked
+    // before any instantiation) can match several impls without being
+    // ambiguous: its concrete instantiation decides later, so nothing is
+    // chosen now.
+    if matches.len() > 1 && !is_fully_concrete(&query) {
+        return ImplMatch::NoCandidates;
+    }
+    match matches.len() {
+        0 => ImplMatch::NoneMatched {
+            algebra: candidates[0].algebra.clone(),
+            tys: query.to_string(),
+        },
+        1 => match matches.pop().expect("one match") {
+            (idx, Some(mapping)) => ImplMatch::Found(idx, mapping),
+            (idx, None) => match algebra {
+                None => ImplMatch::NoCandidates,
+                Some(_) => ImplMatch::FoundConcrete(idx),
+            },
+        },
+        _ => ImplMatch::Ambiguous {
+            algebra: templates[matches[0].0].algebra.clone(),
+            candidates: matches
+                .iter()
+                .map(|(idx, _)| {
+                    let t = &templates[*idx];
+                    let targets: Vec<String> =
+                        t.target_patterns.iter().map(ToString::to_string).collect();
+                    format!("{}<{}>", t.algebra, targets.join(", "))
+                })
+                .collect(),
+        },
     }
 }
 
