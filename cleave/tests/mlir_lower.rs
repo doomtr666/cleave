@@ -5546,6 +5546,58 @@ fn an_unpinned_declared_generic_is_rejected_not_defaulted() {
     );
 }
 
+/// Field access on an unannotated parameter: `getx` is generic over "any
+/// struct with an `x`" (a `FieldConstraint` in its scheme), used here on two
+/// unrelated structs whose `x` even has different types; `deep` reaches
+/// through a nested field whose type never appears in its signature.
+#[test]
+fn field_access_on_an_unannotated_parameter_works_on_any_struct_with_the_field() {
+    let context = context();
+    let src = "
+        struct P { x: i32, y: i32 }
+        struct Q { x: f64, z: i32 }
+        struct Outer { inner: P, w: f64 }
+        fn getx(p) { p.x }
+        fn deep(n) { n.inner.x + 1 }
+        fn main() -> i32 {
+            let a = getx(P(x: 3, y: 4));
+            let b = getx(Q(x: 2.5, z: 1));
+            let c = deep(Outer(inner: P(x: 41, y: 0), w: 0.5));
+            if a == 3 and b == 2.5 and c == 42 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// A struct without the field is a located error, never a guess.
+#[test]
+fn field_access_on_an_unannotated_parameter_rejects_a_struct_without_the_field() {
+    let errors = type_errors(
+        "
+        struct R { y: i32 }
+        fn getx(p) { p.x }
+        fn main() -> i32 { getx(R(y: 1)) }
+    ",
+    );
+    assert!(errors.iter().any(|e| e.contains("no field `x` on `R`")), "got: {errors:?}");
+}
+
+/// The result type a call site settles on pins the generic function's body
+/// too: `half_of`'s `.to()` is only determined by the `f32` its caller
+/// returns it as.
+#[test]
+fn a_generic_fns_result_type_is_pinned_by_its_call_site() {
+    let context = context();
+    let src = "
+        use convert;
+        struct Count { n: i32 }
+        fn half_of(c) { c.n.to() / 2.0 }
+        fn as_f32(c: Count) -> f32 { half_of(c) }
+        fn main() -> i32 { if as_f32(Count(n: 3)) == 1.5 { 1 } else { 0 } }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
 fn type_errors(src: &str) -> Vec<String> {
     let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));

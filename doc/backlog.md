@@ -40,8 +40,8 @@ Success measure: the cleave kernel reads about as plainly as `mnist_bench.py`.
 real CLI. What already works today was applied: the kernel went from 249 to 132 lines (mostly stale
 comments, plus annotations that were workarounds for since-fixed bugs), with identical generated code
 and accuracy (0.9341). No longer needed: scalar type annotations (`let n: i32 = ...`), the const
-generic and return type on `forward` (`fn forward(x, net: Network)` infers; `net` keeps its annotation
-because its fields are accessed — field access on an unannotated parameter is nominal by design),
+generic and return type on `forward` (now plain `fn forward(x, net)`: field access on an unannotated
+parameter is a deferred `FieldConstraint`, `doc/hld.md`),
 intermediate annotated variables for `.to()` conversions, method-call syntax for plain fns
 (`net.l1.dense_forward(x)`), expressions as loop bounds.
 

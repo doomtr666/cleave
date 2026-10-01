@@ -402,6 +402,15 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
             }
         }
 
+        // Field accesses whose base became concrete resolve before
+        // defaulting, so a field's declared type wins over a literal default.
+        if let Err(e) = infer.resolve_ready_field_accesses() {
+            for name in group {
+                if let Some(r @ Ok(_)) = raw_results.get_mut(name) {
+                    *r = Err(e.clone());
+                }
+            }
+        }
         infer.apply_defaults();
         // A constraint failure here is a property of the group's mutual
         // definition as a whole, not attributable to one specific member —
@@ -491,6 +500,7 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
                                         ty,
                                         const_widths: HashMap::new(),
                                         literal_defaults: Vec::new(),
+                                        field_constraints: Vec::new(),
                                     },
                                 );
                             }

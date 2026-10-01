@@ -334,8 +334,10 @@ fn an_unannotated_generic_params_own_field_access_resolves_via_the_duck_typed_fa
         "expected no errors, got {:?}",
         mono.errors()
     );
+    // Keyed by every quantified variable of `get_x`'s scheme, `v.x`'s own
+    // type included (a `FieldConstraint`, resolved from `Point`).
     let keys = mono.specializations_of("get_x");
-    assert_eq!(keys, &["get_x<Point>".to_string()]);
+    assert_eq!(keys, &["get_x<Point, i32>".to_string()]);
     assert_eq!(mono.result(&keys[0]), &Ty::Con("i32".to_string()));
     // The real proof: `v.x`'s own node type resolved to a genuine, fully
     // concrete type (`i32`, `Point`'s own declared field type) -- not a
@@ -351,34 +353,27 @@ fn an_unannotated_generic_params_own_field_access_resolves_via_the_duck_typed_fa
 }
 
 #[test]
-fn a_duck_typed_fallback_specialization_that_genuinely_fails_reports_the_real_inner_error() {
+fn a_field_access_the_argument_cannot_satisfy_is_rejected_at_the_callers_inference() {
+    // `get_x`'s scheme carries "`v` has a field `x`" (`FieldConstraint`);
+    // instantiating it at `i32` fails while inferring `main` itself, before
+    // monomorphization ever tries to specialize `get_x`.
     let src = "struct Point { x: i32, y: i32 }
         fn get_x(v) -> i32 { let dummy = v.x; 0 }
         fn main() -> i32 { get_x(5) }";
     let registry = registry_from(src);
     let program = lower_program(src);
-    let (mono, _) = monomorphize(&program, &registry);
+    let (mono, inference) = monomorphize(&program, &registry);
     assert!(
         mono.specializations_of("get_x").is_empty(),
         "a genuinely failing instantiation must not produce a specialization"
     );
-    assert_eq!(
-        mono.errors().len(),
-        1,
-        "expected exactly one error, got {:?}",
-        mono.errors()
-    );
-    match &mono.errors()[0].kind {
-        TypeErrorKind::GenericFnInstantiationFailed { name, tys, inner } => {
-            assert_eq!(name, "get_x");
-            assert_eq!(tys, "i32");
-            assert!(
-                matches!(inner.kind, TypeErrorKind::NoSuchField { .. }),
-                "expected the real inner NoSuchField error, got {:?}",
-                inner.kind
-            );
-        }
-        other => panic!("expected GenericFnInstantiationFailed, got {other:?}"),
+    match &inference.results["main"] {
+        Err(e) => assert!(
+            matches!(e.kind, TypeErrorKind::NoSuchField { .. }),
+            "expected NoSuchField, got {:?}",
+            e.kind
+        ),
+        Ok(_) => panic!("`main` must not type-check"),
     }
 }
 

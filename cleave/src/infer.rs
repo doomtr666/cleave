@@ -1311,6 +1311,8 @@ pub struct Scheme {
     /// have. Only literal-born variables: a declared `T: Float` with nothing
     /// pinning it stays an indeterminacy, never silently `f64`.
     pub literal_defaults: Vec<(TyVar, NumberDefault)>,
+    /// Field accesses on values of a quantified type (`FieldConstraint`).
+    pub field_constraints: Vec<FieldConstraint>,
 }
 
 impl Scheme {
@@ -1321,6 +1323,7 @@ impl Scheme {
             ty,
             const_widths: HashMap::new(),
             literal_defaults: Vec::new(),
+            field_constraints: Vec::new(),
         }
     }
 }
@@ -2032,11 +2035,27 @@ pub struct Infer<'r> {
 }
 
 /// See `Infer::pending_field_accesses`'s own doc comment.
+#[derive(Clone)]
 struct PendingFieldAccess {
     base: Ty,
     field: String,
     result: TyVar,
     span: Span,
+}
+
+/// "`base` has a field `field` of type `result`" — a field access on a value
+/// whose type a function leaves generic (`fn getx(p) { p.x }`), carried in
+/// its `Scheme` like an algebra constraint and re-checked at each
+/// instantiation, once the caller's argument pins `base` to a real struct.
+/// What lets field access work on an unannotated parameter: `getx` is
+/// polymorphic in "any struct with an `x`", and a struct without one is a
+/// located error at the call, not a guess.
+#[derive(Debug, Clone)]
+pub struct FieldConstraint {
+    pub base: Ty,
+    pub field: String,
+    pub result: Ty,
+    pub span: Span,
 }
 
 /// See `Infer::pending_indices`'s own doc comment.
@@ -2798,7 +2817,7 @@ impl<'r> Infer<'r> {
     /// logic once a deferred base finally becomes concrete, instead of
     /// duplicating it — see `pending_field_accesses`'s own doc comment for
     /// why a field access needs deferring at all.
-    fn resolve_field_access(
+    pub(crate) fn resolve_field_access(
         &mut self,
         resolved: &Ty,
         name: &str,
@@ -2997,9 +3016,19 @@ impl<'r> Infer<'r> {
         &mut self,
         f: &FnDecl,
         param_types: Vec<Ty>,
+        ret_type: Option<Ty>,
+        global_env: &Env,
     ) -> Result<Ty, TypeError> {
         let (_, ret_var, generics) = self.fresh_fn_shape(f);
-        let mut outer = Env::new();
+        // The result type the call site settled on, when it did: as much a
+        // part of this instantiation as the arguments (`fn evaluate(net) {
+        // ... .to() ... }` returning into an `f32`).
+        if let (Some(ret), Some(tail)) = (&ret_type, f.body.as_ref().and_then(|b| b.tail.as_deref())) {
+            self.unify_at(tail.span, &ret_var, ret)?;
+        }
+        // Every other top-level `fn` stays callable from the re-inferred body
+        // (`net.l1.dense_forward(x)`), exactly as in the original inference.
+        let mut outer = global_env.clone();
         outer.insert(
             f.name.clone(),
             Scheme::mono(Ty::Fn(param_types.clone(), Box::new(ret_var.clone()))),
@@ -3479,6 +3508,7 @@ impl<'r> Infer<'r> {
         // `check_no_placeholder` call is inlined by hand instead, against
         // `body`'s own span exactly the way `check_no_placeholder` itself
         // would resolve one from a real `FnDecl`.
+        self.resolve_ready_field_accesses()?;
         self.apply_defaults();
         self.check_pending_constraints_and_indices()?;
         self.check_pending_type_names()?;
@@ -3508,6 +3538,7 @@ impl<'r> Infer<'r> {
     }
 
     fn finish_fn(&mut self, f: &FnDecl, param_types: Vec<Ty>, result: Ty) -> Result<Ty, TypeError> {
+        self.resolve_ready_field_accesses()?;
         self.apply_defaults();
         // After defaulting, since defaulting can turn an abstract
         // `Num`-constrained variable concrete — check it against that
@@ -3653,6 +3684,9 @@ impl<'r> Infer<'r> {
         ty: &Ty,
         own_generics: Option<(&[GenericParam], &HashMap<String, Ty>)>,
     ) -> Result<Scheme, TypeError> {
+        // A field access whose base has become concrete has a known type: it
+        // must not be mistaken for a still-open, quantifiable one below.
+        self.resolve_ready_field_accesses()?;
         let ty = self.subst.apply(ty);
         let mut ty_fv = HashSet::new();
         free_vars(&ty, &mut ty_fv);
@@ -3710,6 +3744,52 @@ impl<'r> Infer<'r> {
                 vars
             }
         };
+        // A field access on a quantified value (`p.x`, `p` generic) makes its
+        // result quantified too — and transitively (`n.l1.x`: `n.l1`'s type
+        // never appears in the signature, but is just as determined by `n`).
+        // Those accesses travel in the scheme (`FieldConstraint`) instead of
+        // being forced to resolve now, when nothing can resolve them.
+        let mut vars = vars;
+        let mut field_constraints: Vec<FieldConstraint> = Vec::new();
+        {
+            let mut quantified_here: HashSet<TyVar> = vars.iter().copied().collect();
+            let mut captured: HashSet<usize> = HashSet::new();
+            loop {
+                let mut grew = false;
+                for (i, pending) in self.pending_field_accesses.iter().enumerate() {
+                    if captured.contains(&i) {
+                        continue;
+                    }
+                    let Ty::Var(base) = self.subst.apply(&pending.base) else {
+                        continue;
+                    };
+                    if !quantified_here.contains(&base) {
+                        continue;
+                    }
+                    captured.insert(i);
+                    grew = true;
+                    let result = self.subst.apply(&Ty::Var(pending.result));
+                    let mut fv = HashSet::new();
+                    free_vars(&result, &mut fv);
+                    let mut new_vars: Vec<TyVar> = fv
+                        .into_iter()
+                        .filter(|v| !env_fv.contains(v) && !quantified_here.contains(v))
+                        .collect();
+                    new_vars.sort();
+                    quantified_here.extend(new_vars.iter().copied());
+                    vars.extend(new_vars);
+                    field_constraints.push(FieldConstraint {
+                        base: Ty::Var(base),
+                        field: pending.field.clone(),
+                        result,
+                        span: pending.span,
+                    });
+                }
+                if !grew {
+                    break;
+                }
+            }
+        }
         // Recorded so `apply_defaults` never binds one of these afterward —
         // see `quantified`'s own doc comment.
         self.quantified.extend(vars.iter().copied());
@@ -3841,6 +3921,7 @@ impl<'r> Infer<'r> {
             ty,
             const_widths,
             literal_defaults,
+            field_constraints,
         })
     }
 
@@ -3991,6 +4072,32 @@ impl<'r> Infer<'r> {
             if let Some(Ty::Var(fresh)) = mapping.get(v) {
                 self.pending_defaults.push((*fresh, *default));
             }
+        }
+        for fc in &scheme.field_constraints {
+            let Ty::Var(result) = substitute(&fc.result, &mapping) else {
+                // Already concrete in the scheme: nothing left to learn from the
+                // field, but the access must still be valid for the base.
+                let base = substitute(&fc.base, &mapping);
+                let Ty::Var(result) = self.vars.fresh() else {
+                    unreachable!("TyVarGen::fresh always returns Ty::Var")
+                };
+                let expected = substitute(&fc.result, &mapping);
+                unify(&mut self.subst, &Ty::Var(result), &expected)
+                    .expect("a fresh variable unifies with anything");
+                self.pending_field_accesses.push(PendingFieldAccess {
+                    base,
+                    field: fc.field.clone(),
+                    result,
+                    span: fc.span,
+                });
+                continue;
+            };
+            self.pending_field_accesses.push(PendingFieldAccess {
+                base: substitute(&fc.base, &mapping),
+                field: fc.field.clone(),
+                result,
+                span: fc.span,
+            });
         }
         // Re-key `scheme.const_widths` through the same fresh mapping —
         // without this, a constraint re-queued just above (against a *fresh*
@@ -4824,6 +4931,11 @@ impl<'r> Infer<'r> {
     pub(crate) fn check_pending_field_accesses(&mut self) -> Result<(), TypeError> {
         for pending in std::mem::take(&mut self.pending_field_accesses) {
             let resolved = self.subst.apply(&pending.base);
+            // Generalized into a scheme's `FieldConstraint`: checked at each
+            // instantiation instead, never here.
+            if matches!(resolved, Ty::Var(v) if self.quantified.contains(&v)) {
+                continue;
+            }
             let field_ty = if matches!(resolved, Ty::Var(_)) || is_placeholder(&resolved) {
                 Ty::Con("<not-yet-inferred>".to_string())
             } else {
@@ -4832,6 +4944,30 @@ impl<'r> Infer<'r> {
             self.unify_at(pending.span, &Ty::Var(pending.result), &field_ty)?;
         }
         Ok(())
+    }
+
+    /// Resolves every pending field access whose base is concrete by now —
+    /// repeatedly, since one resolution can make the next one's base concrete
+    /// (`n.l1.x`). Run before `apply_defaults`, so a field's real declared
+    /// type wins over a literal's default it was unified with (`getx(q) ==
+    /// 2.5` with `q.x: f64` must not first default `2.5` to `f32`).
+    pub(crate) fn resolve_ready_field_accesses(&mut self) -> Result<(), TypeError> {
+        loop {
+            let mut progressed = false;
+            for pending in std::mem::take(&mut self.pending_field_accesses) {
+                let resolved = self.subst.apply(&pending.base);
+                if matches!(resolved, Ty::Var(_)) || is_placeholder(&resolved) {
+                    self.pending_field_accesses.push(pending);
+                    continue;
+                }
+                let field_ty = self.resolve_field_access(&resolved, &pending.field, pending.span)?;
+                self.unify_at(pending.span, &Ty::Var(pending.result), &field_ty)?;
+                progressed = true;
+            }
+            if !progressed {
+                return Ok(());
+            }
+        }
     }
 
     /// Shared tail of `ExprKind::Index`'s own immediate path and `check_

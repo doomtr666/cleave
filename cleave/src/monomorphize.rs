@@ -585,8 +585,33 @@ pub fn monomorphize(
                 // expression (field access, ...) whose own type genuinely
                 // depends on this call site's own concrete argument types,
                 // which the ordinary one-shot HM pass could never see.
+                // `concrete_tys` instantiates the scheme's *variables* (a
+                // field's result type among them), not the parameters: the
+                // parameter types come from the scheme's own signature.
+                let (concrete_params, concrete_ret): (Vec<Ty>, Option<Ty>) =
+                    match program_inference.global_env.get(&name) {
+                        Some(Scheme {
+                            vars,
+                            ty: Ty::Fn(param_pattern, ret_pattern),
+                            ..
+                        }) => {
+                            let mapping: HashMap<TyVar, Ty> =
+                                vars.iter().copied().zip(concrete_tys.iter().cloned()).collect();
+                            let ret = substitute(ret_pattern, &mapping);
+                            (
+                                param_pattern.iter().map(|p| substitute(p, &mapping)).collect(),
+                                is_fully_concrete(&ret).then_some(ret),
+                            )
+                        }
+                        _ => (concrete_tys.clone(), None),
+                    };
                 let mut infer = Infer::new(registry);
-                match infer.infer_fn_with_concrete_params(f, concrete_tys.clone()) {
+                match infer.infer_fn_with_concrete_params(
+                    f,
+                    concrete_params,
+                    concrete_ret,
+                    &program_inference.global_env,
+                ) {
                     Ok(result) => {
                         let mut exprs = Vec::new();
                         collect_exprs_block(body, &mut exprs);
@@ -1218,6 +1243,13 @@ fn detect_duck_typed_fns(
             continue;
         };
         if scheme.vars.is_empty() {
+            continue;
+        }
+        // A field accessed on a generic value (`FieldConstraint`): the body's
+        // types along that access (`n.l1` in `n.l1.x`) are only known per
+        // instantiation, so substitution alone can't specialize it.
+        if !scheme.field_constraints.is_empty() {
+            out.insert((*name).to_string());
             continue;
         }
         let Some(body) = &f.body else { continue };
@@ -2052,6 +2084,7 @@ fn derive_instantiation(
     let ret_ty = node_types.get(&call.id)?.clone();
     let query = Ty::Fn(arg_tys, Box::new(ret_ty));
     unify(&mut trial, &scheme.ty, &query).ok()?;
+    resolve_field_constraints(scheme, &mut trial, registry);
     Some(
         scheme
             .vars
@@ -2059,6 +2092,36 @@ fn derive_instantiation(
             .map(|v| trial.apply(&Ty::Var(*v)))
             .collect(),
     )
+}
+
+/// Pins the scheme variables a `FieldConstraint` alone determines (`n.l1`'s
+/// type in `fn deep(n) { n.l1.x }`, absent from the signature) once the call
+/// has made their base concrete — repeatedly, since one field's type is the
+/// next one's base. Leaves a constraint whose base stays open alone.
+fn resolve_field_constraints(scheme: &Scheme, trial: &mut Subst, registry: &Registry) {
+    let mut infer = Infer::new(registry);
+    loop {
+        let mut progressed = false;
+        for fc in &scheme.field_constraints {
+            let result = trial.apply(&fc.result);
+            if is_fully_concrete(&result) {
+                continue;
+            }
+            let base = trial.apply(&fc.base);
+            if !is_fully_concrete(&base) {
+                continue;
+            }
+            let Ok(field_ty) = infer.resolve_field_access(&base, &fc.field, fc.span) else {
+                continue;
+            };
+            if unify(trial, &result, &field_ty).is_ok() {
+                progressed = true;
+            }
+        }
+        if !progressed {
+            return;
+        }
+    }
 }
 
 /// Converts one turbofish argument (`f::<i32, 3>`'s `i32`/`3`) to a `Ty` —

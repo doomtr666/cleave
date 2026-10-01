@@ -379,6 +379,20 @@ fn algebras_how_operators_actually_work() {
 }
 
 #[test]
+fn field_access_on_an_unannotated_parameter() {
+    let context = context();
+    let src = "
+        struct Vec2 { x: f64, y: f64 }
+        struct Pixel { x: i32, y: i32, color: i32 }
+        fn first(v) { v.x }
+        fn main() -> i32 {
+            if first(Vec2(x: 3.0, y: 4.0)) == 3.0 and first(Pixel(x: 7, y: 0, color: 1)) == 7 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+#[test]
 fn tuples_destructured_by_let_and_assignment() {
     let context = context();
     let src = "

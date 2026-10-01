@@ -203,6 +203,19 @@ fn main() -> i32 {
 }
 ```
 
+The parameter's type doesn't have to be written: a function reading `v.x` without annotating `v` works on **any struct with a field `x`**, each call site checked against the struct it actually passes:
+
+```
+struct Vec2 { x: f64, y: f64 }
+struct Pixel { x: i32, y: i32, color: i32 }
+fn first(v) { v.x }
+fn main() -> i32 {
+    if first(Vec2(x: 3.0, y: 4.0)) == 3.0 and first(Pixel(x: 7, y: 0, color: 1)) == 7 { 1 } else { 0 }
+}
+```
+
+`first` returns an `f64` for a `Vec2` and an `i32` for a `Pixel`; passing a value without an `x` is a compile error naming the type and the missing field.
+
 A struct is a **stable reference** — passed and returned by identity, mutated in place, never copied field-by-field on assignment (the same design array values use, see "Arrays" below). Fields can be reassigned directly:
 
 ```

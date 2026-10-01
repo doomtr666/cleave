@@ -102,6 +102,18 @@ The rule is plain lexical shadowing, with no warning: a user `fn add` is a legit
 
 Choosing an impl within the resolved algebra stays type-directed (`derive_impl_instantiation`), which needs the method's signature to say which impl it means. `RawBuffer<T>::alloc(cap: i32)` did not, and was silently dispatched to whichever width a name-and-type index stored last; its handle type now carries the element type (`RawBuf<T>`).
 
+### Field access on a generic value: a deferred constraint, like an algebra's
+
+`fn first(v) { v.x }` leaves `v`'s type open, and a field can't be looked up on an open type. Instead of
+requiring an annotation, the access becomes part of `first`'s scheme as a constraint, "`v` has a field `x`
+of type `r`" (`infer.rs::FieldConstraint`), carried and instantiated exactly like an algebra constraint:
+each call site re-checks it once its argument pins `v` to a real struct, which gives `r`; a struct without
+the field is an error at that point. Types reached only through fields (`n.inner` in `n.inner.x`) are
+quantified along with the base, and monomorphization re-infers such a function per concrete
+instantiation, arguments *and* result (`monomorphize.rs::detect_duck_typed_fns`), since substitution
+alone can't produce types its signature never mentions. This is HM with records-as-constraints (Haskell's
+`HasField`), not C++-style unchecked templates: the function is still checked once, generically.
+
 ### Soundness/governance — v1 trust model: no proof kernel
 
 **Explicitly out of scope for now:** a full LCF-style proof kernel (contributed axioms verified by a checkable proof term before admission) was considered, but it amounts to building a proof-assistant kernel as a subproject — a different, much larger undertaking than the actual goal (performance + ergonomics for scientific/HPC computing). C doesn't ask a programmer to prove anything about their code beyond it being valid C; cleave's v1 trust model for axioms follows the same posture, deliberately.
