@@ -341,7 +341,7 @@ pub fn compile(
 const MAX_TUPLE_ARITY: usize = 16;
 
 /// Injects one synthesized `struct __TupleN<T0, ..., T(N-1)> { 0: T0, ...,
-/// (N-1): T(N-1) }` per arity 2..=`MAX_TUPLE_ARITY`, into every compiled
+/// (N-1): T(N-1) }` per arity 1..=`MAX_TUPLE_ARITY`, into every compiled
 /// program — `lower.rs`'s own `lower_tuple_type`/`lower_tuple_lit` already
 /// desugar `(T1,T2)`/`(a,b)` into ordinary generic-struct syntax naming
 /// exactly these structs (`ast::tuple_struct_name`), so this is the other
@@ -361,7 +361,7 @@ fn synthesize_tuple_structs(mut program: Program, node_ids: &mut NodeIdGen) -> P
         start: 0,
         end: 0,
     };
-    for arity in 2..=MAX_TUPLE_ARITY {
+    for arity in 1..=MAX_TUPLE_ARITY {
         let generic_names: Vec<String> = (0..arity).map(|i| format!("T{i}")).collect();
         let generics = generic_names
             .iter()
@@ -641,7 +641,11 @@ fn synthesize_collect_impls(mut program: Program, node_ids: &mut NodeIdGen) -> P
             || tagged.contains_key(&d.name)
             || d.generics.iter().any(|g| g.is_variadic())
             || written.contains(&d.name)
-            || crate::infer::is_tuple_struct_name(&d.name)
+            // A tuple collects from a tuple by being one, except `__Tuple1`,
+            // which collects from its one element like any one-field struct
+            // (the default target of a one-element comprehension, `infer.rs::
+            // apply_collect_defaults`).
+            || (crate::infer::is_tuple_struct_name(&d.name) && d.name != tuple_struct_name(1))
         {
             continue;
         }

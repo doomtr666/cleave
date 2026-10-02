@@ -655,11 +655,15 @@ pub fn unify(subst: &mut Subst, a: &Ty, b: &Ty) -> Result<(), UnifyError> {
         // arm the way `Ty::Var`'s own below is: a `Pack` conceptually stands
         // for a *list* of types, so binding it against an arbitrary
         // non-list `Ty` the way a plain type variable can would be
-        // unsound, not just unneeded. Two *different*, still-open packs
-        // meeting here falls through to the ordinary `Mismatch` below, a
-        // real, flagged gap (never reached by anything currently reachable)
-        // rather than a guess.
+        // unsound, not just unneeded. Two *different* still-open packs are
+        // the same list: one is bound to the other (first reached by a
+        // pack-generic impl calling a pack-generic function, `gelu`'s
+        // helper in `stdlib/nn`).
         (Ty::Pack(v1), Ty::Pack(v2)) if v1 == v2 => Ok(()),
+        (Ty::Pack(v1), Ty::Pack(v2)) => {
+            subst.bind(*v1, Ty::Pack(*v2));
+            Ok(())
+        }
         (Ty::Var(v), _) => {
             if subst.occurs(*v, &b) {
                 return Err(UnifyError::Occurs(*v, b));
@@ -692,9 +696,8 @@ pub fn unify(subst: &mut Subst, a: &Ty, b: &Ty) -> Result<(), UnifyError> {
         // original behavior (guarded, not just reasoned about — see the
         // `a1.len() != a2.len()` check inside the `(None, None)` arm,
         // still a real, immediate `Mismatch`). Both sides ending in an
-        // open pack (two still-symbolic declarations meeting each other)
-        // is deliberately out of scope for this pass — falls through to
-        // `Mismatch`, a known, flagged gap, not silently wrong.
+        // open pack (two still-symbolic declarations meeting each other):
+        // see the `(Some(v1), Some(v2))` arm below.
         // A tuple whose elements are a pack (`Ts...` as a whole type, arity
         // unknown) meets a concrete tuple (`__Tuple3<i32, f64, i32>`): the
         // same tuple, so its pack absorbs the elements through the
@@ -729,7 +732,23 @@ pub fn unify(subst: &mut Subst, a: &Ty, b: &Ty) -> Result<(), UnifyError> {
                     }
                     Ok(())
                 }
-                (Some(_), Some(_)) => Err(UnifyError::Mismatch(a.clone(), b.clone())),
+                // Two different open packs after prefixes of the same
+                // length (`Tensor<T, Dims...>` from a pack-generic impl
+                // calling a pack-generic function): the same list, so one
+                // pack is bound to the other and `apply` follows the chain
+                // once either resolves. Prefixes of different lengths would
+                // need one pack bound to a list *ending* in the other, left
+                // a `Mismatch` until something needs it.
+                (Some(v1), Some(v2)) => {
+                    if a1.len() != a2.len() {
+                        return Err(UnifyError::Mismatch(a.clone(), b.clone()));
+                    }
+                    for (x, y) in a1[..a1.len() - 1].iter().zip(&a2[..a2.len() - 1]) {
+                        unify(subst, x, y)?;
+                    }
+                    subst.bind(v1, Ty::Pack(v2));
+                    Ok(())
+                }
                 (Some(v), None) => {
                     let prefix_len = a1.len() - 1;
                     if a2.len() < prefix_len {
@@ -7668,7 +7687,8 @@ impl<'r> Infer<'r> {
     /// A comprehension's target when its context never fixed one
     /// (`CollectDefault`), decided once the literals inside its elements have
     /// their own defaults: an array when every element has the same scalar
-    /// (or array) type, the tuple of the elements otherwise. A target still open because it's
+    /// (or array) type, the tuple of the elements otherwise (a `__Tuple1` for
+    /// one element). A target still open because it's
     /// quantified belongs to each instance, which decides it there.
     fn apply_collect_defaults(&mut self, only_concrete: bool) {
         for d in std::mem::take(&mut self.pending_collect_defaults) {
@@ -7725,6 +7745,11 @@ impl<'r> Infer<'r> {
                     Box::new(elements[0].clone()),
                     Box::new(Ty::Const(ConstValue::Int(elements.len() as u64))),
                 )
+            } else if elements.len() == 1 {
+                // A tuple of one, not the element itself: the result is
+                // indexed like any tuple of the elements (`state[i]`, the
+                // optimizer state of a one-field model, `stdlib/optim`).
+                Ty::App(tuple_struct_name(1), elements.clone())
             } else {
                 d.source.clone()
             };

@@ -49,6 +49,15 @@ algebra Activation<T> {
     // algebra existing only to carry this one value as an adjoint rule's
     // own payload, never itself a `derive()`/`grad()` target.
     adjoint relu(x), u: mul(u, step(x));
+
+    // GELU in its `tanh` form, `0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715
+    // x^3)))` (PyTorch's `gelu(x, approximate='tanh')`, GPT-2's): a smooth
+    // ReLU, the usual activation inside a transformer's MLP. Its derivative
+    // is declared (`gelu_grad`), in closed form, rather than derived through
+    // the cube and the `tanh`.
+    fn gelu(x: T) -> T;
+    fn gelu_grad(x: T) -> T;
+    adjoint gelu(x), u: mul(u, gelu_grad(x));
 }
 
 // `relu`'s own adjoint (just above) needs this, and only this -- not a
@@ -211,6 +220,36 @@ impl<T: Float, const Dims...: i32> Activation<Tensor<T, Dims...>> {
         one / (one + exp(-x))
     }
     fn tanh(x) { mlir::math::tanh(x) }
+    fn gelu(x) {
+        let half_s: T = 0.5;
+        let half: Tensor<T, Dims...> = mlir::tensor::splat(half_s);
+        let one_s: T = 1.0;
+        let one: Tensor<T, Dims...> = mlir::tensor::splat(one_s);
+        half * x * (one + mlir::math::tanh(gelu_inner(x)))
+    }
+    // `d/dx = 0.5 (1 + t) + 0.5 x (1 - t^2) sqrt(2/pi) (1 + 3 * 0.044715 x^2)`,
+    // `t` the `tanh` above.
+    fn gelu_grad(x) {
+        let half_s: T = 0.5;
+        let half: Tensor<T, Dims...> = mlir::tensor::splat(half_s);
+        let one_s: T = 1.0;
+        let one: Tensor<T, Dims...> = mlir::tensor::splat(one_s);
+        let c_s: T = 0.7978845608;
+        let c: Tensor<T, Dims...> = mlir::tensor::splat(c_s);
+        let k3_s: T = 0.134145;
+        let k3: Tensor<T, Dims...> = mlir::tensor::splat(k3_s);
+        let t = mlir::math::tanh(gelu_inner(x));
+        half * (one + t) + half * x * (one - t * t) * c * (one + k3 * x * x)
+    }
+}
+
+// `sqrt(2/pi) (x + 0.044715 x^3)`, GELU's `tanh` argument.
+fn gelu_inner<T: Float, const Dims...: i32>(x: Tensor<T, Dims...>) -> Tensor<T, Dims...> {
+    let c_s: T = 0.7978845608;
+        let c: Tensor<T, Dims...> = mlir::tensor::splat(c_s);
+    let k_s: T = 0.044715;
+        let k: Tensor<T, Dims...> = mlir::tensor::splat(k_s);
+    c * (x + k * x * x * x)
 }
 
 // A fully-connected layer -- ordinary stdlib struct, `dense_forward` below
@@ -455,6 +494,71 @@ impl<T: Float, const B: i32, const C: i32> CrossEntropy<Tensor<T, B, C>, T> {
     }
     fn cross_entropy_grad_targets(z, y, u) {
         [for b in 0..B: { let lse = log_sum_exp_row(z, b); [for c in 0..C: (lse - z[b, c]) * u] }]
+    }
+}
+
+// Cross-entropy against integer targets: `y[b]` is the class of row `b`,
+// `-sum_b log(softmax(z)[b, y[b]])`, as PyTorch's `cross_entropy(z, y,
+// reduction='sum')` with class indices. The same loss as `cross_entropy`
+// against one-hot rows, without building them: for a language model's
+// thousands of rows of ~100 classes, the one-hot targets alone would weigh
+// more than the logits. The targets aren't differentiable (`_`).
+algebra SparseCrossEntropy<Logits, Targets, T> {
+    fn sparse_cross_entropy(z: Logits, y: Targets) -> T;
+    fn sparse_cross_entropy_grad(z: Logits, y: Targets, u: T) -> Logits;
+
+    adjoint sparse_cross_entropy(z, y), u: (sparse_cross_entropy_grad(z, y, u), _);
+}
+
+impl<T: Float, const B: i32, const C: i32> SparseCrossEntropy<Tensor<T, B, C>, [i32; B], T> {
+    fn sparse_cross_entropy(z, y) {
+        let mut total: T = zero();
+        for b in 0..B { total = total + log_sum_exp_row(z, b) - z[b, y[b]]; };
+        total
+    }
+    // `(softmax(z) - onehot(y)) * u`, row by row.
+    fn sparse_cross_entropy_grad(z, y, u) {
+        let mut g: [[T; C]; B] = mlir::memref::alloc();
+        for b in 0..B {
+            let lse = log_sum_exp_row(z, b);
+            for c in 0..C { g[b, c] = exp(z[b, c] - lse) * u; };
+            g[b, y[b]] = g[b, y[b]] - u;
+        };
+        Tensor(data: g)
+    }
+}
+
+// An embedding: row `ids[n]` of a `[V, D]` table for each of `N` ids, the
+// first layer of a language model (a character's id to its vector). Its
+// gradient is the transpose of that gather: each upstream row added back
+// into the table row it was read from, so a row read twice gets both
+// contributions and a row never read stays zero. The ids aren't
+// differentiable (`_`).
+algebra Embed<Table, Ids, Rows> {
+    fn embed(table: Table, ids: Ids) -> Rows;
+    // `table` only gives the result its shape.
+    fn embed_grad(table: Table, ids: Ids, u: Rows) -> Table;
+
+    adjoint embed(table, ids), u: (embed_grad(table, ids, u), _);
+}
+
+impl<T: Float, const V: i32, const D: i32, const N: i32> Embed<Tensor<T, V, D>, [i32; N], Tensor<T, N, D>> {
+    fn embed(table, ids) {
+        let mut rows: [[T; D]; N] = mlir::memref::alloc();
+        for n in 0..N {
+            let r = ids[n];
+            for d in 0..D { rows[n, d] = table[r, d]; };
+        };
+        Tensor(data: rows)
+    }
+    fn embed_grad(table, ids, u) {
+        let mut g: [[T; D]; V] = mlir::memref::alloc();
+        for v in 0..V { for d in 0..D { g[v, d] = zero(); }; };
+        for n in 0..N {
+            let r = ids[n];
+            for d in 0..D { g[r, d] = g[r, d] + u[n, d]; };
+        };
+        Tensor(data: g)
     }
 }
 

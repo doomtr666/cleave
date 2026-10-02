@@ -1939,3 +1939,24 @@ Ce qu'il faudra faire, par ordre de priorité :
 - **La reprise en une ligne.** Un `restore_or(path, init)` qui reprend si le fichier existe et part de `init` sinon. Rend un programme reprenable sans plomberie.
 - **Plus tard, l'écriture asynchrone.** On copie l'état, puis on l'écrit sur un autre thread pendant que le calcul continue. Utile seulement quand l'écriture pèse vraiment (grosse simu), pas pour nanoLM.
 - **Des E/S de fichier génériques dans le runtime.** Dès que cleave aura de vraies chaînes : le format et ses vérifications seraient écrits en cleave au-dessus de primitives `open`/`write bytes`/`read bytes`/`rename`/`close`, au lieu de vivre dans `cleave-rt/src/checkpoint.rs`.
+
+## Une méthode d'impl générique dont la vérification générique échoue disparaît sans message — l'erreur ressort plus tard, ailleurs, comme une panique de CPS
+
+Trouvé en écrivant `gelu` (`doc/plan-nanolm.md`, étape 2). Le symptôme est `CPS: could not resolve call to Activation::gelu`, une panique au moment de la conversion CPS, sans aucun rapport apparent avec la vraie cause. Cette cause, c'était un échec d'unification *dans le corps* de la méthode, lors de sa vérification générique (deux packs ouverts `Dims...`, corrigé depuis dans `infer.rs::unify`).
+
+Le mécanisme est dans `monomorphize.rs`, à la construction des `ImplTemplate` : `let Ok(ret_pattern) = result else { continue; };`. Une méthode dont le corps ne se type pas génériquement est simplement retirée des templates. Tout appel ensuite ne trouve plus d'instance, et l'erreur qui sort parle de l'appel, pas du corps. Il a fallu instrumenter le monomorphiseur pour remonter à l'erreur d'origine.
+
+Ce qu'il faudrait : remonter cette erreur comme un vrai diagnostic, situé dans le corps de la méthode. À vérifier d'abord : certains templates échouent-ils génériquement *exprès*, comptant sur la vérification à l'instance (des indices encore en attente sur une base ouverte, par exemple, que `infer.rs` tolère déjà dans le code générique) ? Si oui, il faut distinguer « indécidable sans l'instance » (garder le template, vérifier à l'instance) de « faux quel que soit l'instance » (diagnostic immédiat), conformément au principe « valide ou erreur, jamais un choix silencieux ».
+
+## Adam on literal tensors returns a wrong value after MLIR inlining — pre-existing, silent, absent with runtime data
+
+Found while debugging single-field models (`doc/plan-nanolm.md`, step 2). One Adam step on a tensor built from a literal (`Tensor::<f32, 8, 8>(data: [[1.0; 8]; 8])`, gradient = that same tensor, `lr` 0.25) should give 0.75 everywhere; the program sees a value in [0.999, 1.0) instead (`w2[0, 0] < 0.76` false, `< 1.0` true). Reproduced on the committed code (`90960b7`), so not a regression from that session.
+
+What is known:
+- The **optimized CPS is correct**, operation by operation (`--dump-cps-optimized`: `w - 0.25 * m_hat / (sqrt(v_hat) + eps)`).
+- The **same computation written inline in `main`**, on the same literal tensor, is correct at every stage (m, v, m_hat, v_hat, sqrt, denominator, update, result).
+- **`--no-inline` fixes it**; `--no-affine-structs`, `--no-chain-split`, `--no-unroll-jam` don't. So it comes after MLIR inlining, at the call boundaries of `Optimizer::step` / `AdamState`, once the inputs have become constants: canonicalization folding through constants, or a bufferization / post-inline pass (`unify_alloc.rs`, `redundant_copy_elim.rs`) misbehaving on a constant buffer.
+- Adding a `println` of an element of `w` before the step makes the result correct (the constant is no longer foldable as-is).
+- With **runtime data** (`Init::he()`, data from an extern), the step is correct: real training (MNIST, nanoLM) isn't affected. That's why it's not urgent, but it's a silent wrong result, so it isn't harmless.
+
+Next step: dump the MLIR after each stage (`--dump-mlir`, then the pipeline's passes one at a time) on the minimal program and find the first pass whose output computes something else.

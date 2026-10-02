@@ -38,10 +38,10 @@ softmax.
 |---|---|---|
 | dense layers, residual adds | ✅ | `Dense`, `dense_forward`, `Ring<Tensor>` add; 2D matmul with its adjoint |
 | ReLU | ✅ | `Activation`, with adjoint |
-| GELU | 🔶 | needs `tanh` (or `erf`) on tensors: `Transcendental<Tensor>` only has `exp` |
-| cross-entropy | 🔶 | `CrossEntropy` on `[B, C]` with dense one-hot targets; for 4096 rows of ~100 classes, integer targets (no one-hot of 1.6 MB per step) are better: a sparse variant |
+| GELU | ✅ | `Activation::gelu` (`tanh` form, PyTorch's `approximate='tanh'`), closed-form adjoint |
+| cross-entropy | ✅ | `SparseCrossEntropy`: `[B, C]` logits against `[i32; B]` class ids |
 | Adam | ✅ | `AdamState`, generic `Trainable` optimizer; untested at this parameter count |
-| token embedding | ❌ | gather rows of a `[V, d]` table by ids; adjoint: scatter-add into the table. Ids are integers, and `Tensor<T: Float>` can't hold them: ids as `[i32; N]` (arrays now come from the host directly, `extern fn ... -> [i32; N]`) |
+| token embedding | ✅ | `Embed`: rows of a `[V, d]` table by `[i32; N]` ids, scatter-add adjoint |
 | position embedding | ❌ (free once gather exists) | gather a `[T, d]` table with ids `0..T` repeated `B` times |
 | LayerNorm | ❌ | row-wise mean/variance, gain and bias; as an algebra with a declared adjoint (the standard backward), not derived through reductions |
 | attention | ❌ | per (batch, head): `softmax(mask + Q Kᵀ / √dh) V`. Needs slices of `[B*T, d]` (rows of one batch element, columns of one head), causal mask, row softmax, and the backward. See "Attention" below |
@@ -102,7 +102,15 @@ Each step ends with something that runs and is checked, against the PyTorch twin
    bigram baseline written in cleave (`kernel.cleave`) and in numpy (`bigram.py`) gives the same
    2.3520 nats/char (3.39 bits/char) on validation: the floor the models below must beat. (On the
    way: `Convert<f64, f32>`; one f32 accumulator over 200 k terms had cost the third decimal.)
-2. **Embeddings and a first model**: token/position gather with scatter-add adjoint, cross-entropy
+2. **Embeddings and a first model** (in progress): `Embed`, `SparseCrossEntropy`, `gelu` in `stdlib/nn`,
+   each checked by value and gradient (`cleave/tests/language_model_ops.rs`). A learned bigram (a
+   `[104, 104]` table, Adam) goes from 4.65 (ln 104) to 2.3507 nats in 1000 steps, the counted
+   bigram's 2.3520. Compiler fixes on the way: `_` in an `adjoint` rule (no contribution), reverse-mode
+   activity (no gradient through what doesn't depend on the target, so integer parameters are fine),
+   a method with a declared rule stays opaque even when its body is a transparent chain, two open
+   packs unify, one-element comprehensions default to a real `__Tuple1` (single-field models), and
+   refcounting retains a borrowed parameter stored into a new struct. Remaining: the MLP model and the
+   twin's matching loss. Original description: token/position gather with scatter-add adjoint, cross-entropy
    on integer targets, tensor `tanh` and GELU. A bigram-and-MLP model trains end to end, its loss
    matching the twin's.
 3. **LayerNorm, row softmax, 2D slices**, each gradient-checked against PyTorch on small fixed inputs.

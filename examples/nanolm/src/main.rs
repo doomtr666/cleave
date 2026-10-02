@@ -18,4 +18,7 @@ fn main() {
 
     let nats = unsafe { bigram_baseline(200, 50) };
     println!("bigram baseline: {nats:.4} nats/char ({:.4} bits/char)", nats / std::f32::consts::LN_2);
+
+    let learned = unsafe { train_bigram(10, 0.05, 1) };
+    println!("learned bigram: {learned:.4} nats/char ({:.4} bits/char)", learned / std::f32::consts::LN_2);
 }

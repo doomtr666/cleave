@@ -2924,6 +2924,27 @@ fn to_sugar_converts_an_int_to_a_float_end_to_end() {
     assert_eq!(run_i32(&context, src), 1);
 }
 
+/// A pack-generic impl method calling a pack-generic function: the two
+/// `Dims...` are different open packs when the impl is checked generically,
+/// and unify as the same list (the template used to be dropped, and the
+/// call to fail as unresolvable).
+#[test]
+fn a_pack_generic_impl_can_call_a_pack_generic_function() {
+    let context = context();
+    let src = "
+        use linalg;
+        fn twice<T: Float, const Dims...: i32>(x: Tensor<T, Dims...>) -> Tensor<T, Dims...> { x + x }
+        algebra Quad<T> { fn quad(x: T) -> T; }
+        impl<T: Float, const Dims...: i32> Quad<Tensor<T, Dims...>> { fn quad(x) { twice(twice(x)) } }
+        fn main() -> i32 {
+            let x = Tensor::<f32, 1, 4>(data: [[-2.0, -0.5, 0.3, 1.7]]);
+            let y = quad(x);
+            if y[0, 3] == 6.8 and y[0, 0] == -8.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
 /// Narrowing `f64 -> f32`, rounded to nearest, including from a function's
 /// tail where only the declared return type says the target is `f32`.
 #[test]

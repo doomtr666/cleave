@@ -253,7 +253,9 @@ derivative_rule_decl = { "derivative" ~ ident ~ "(" ~ param_list? ~ ")" ~ ":" ~ 
 // here (a `tuple_lit` and a parenthesized single `expr` are structurally
 // ambiguous without knowing `params.len()` first) -- `lower.rs`'s own
 // `lower_adjoint_rule_decl` checks it against the real declared param
-// count, a real diagnostic, not a panic.
+// count, a real diagnostic, not a panic. An entry `_` sends no contribution
+// to that parameter: one that isn't differentiable, an integer index say
+// (`egraph.rs::apply_adjoint_rule`).
 adjoint_rule_decl = { "adjoint" ~ ident ~ "(" ~ param_list? ~ ")" ~ "," ~ ident ~ ":" ~ expr ~ ";" }
 
 // ---------------------------------------------------------------- impl

@@ -636,6 +636,13 @@ pub struct Forward {
     /// possible at all). A plain top-level `fn` (`origin: None`) is never
     /// recorded here — no axiom could ever reference one.
     pub reached: HashMap<String, (String, String)>,
+    /// Units whose algebra method declares the rule being applied (an
+    /// `adjoint` for `grad`, a `derivative` for `derive`): kept one opaque
+    /// node even when their body is a transparent chain of calls, since the
+    /// rule, not the body, is what differentiates them (`gelu`, `stdlib/nn`,
+    /// whose body is a chain of tensor calls around a raw `tanh`). Set by
+    /// the caller with `ruled_units`; empty otherwise.
+    pub ruled: HashSet<String>,
     /// Every unit name used via the *real-call* path (`recognize_real_call`)
     /// — a superset of `reached`'s own keys (this includes a transparently-
     /// inlined plain top-level `fn` too, `origin: None`, which `reached`
@@ -726,6 +733,7 @@ impl Default for Forward {
             free_vars: HashMap::new(),
             external_vars: HashMap::new(),
             reached: HashMap::new(),
+            ruled: HashSet::new(),
             call_units: std::collections::HashSet::new(),
             raw_ops: HashMap::new(),
             struct_ops: HashMap::new(),
@@ -989,6 +997,8 @@ impl Forward {
                         let straight = is_straight_line(&callee.def.body, units);
                         let transparent = !straight
                             && is_transparent_chain(&callee.def.body, units, &mut HashSet::new());
+                        let ruled = self.ruled.contains(unit_name);
+                        let transparent = transparent && !ruled;
                         if straight
                             || (callee.origin.is_some()
                                 && !transparent
@@ -3842,6 +3852,7 @@ pub fn synthesize_derivatives(
         };
 
         let mut fwd = Forward::default();
+        fwd.ruled = ruled_units(&units, registry, false);
         let real_params = &of_unit.def.params[..of_unit.def.params.len() - 1];
         fwd.param_types = real_params
             .iter()
@@ -4265,6 +4276,7 @@ fn synthesize_one_gradient(
 ) -> Result<CTopLevelFn, String> {
     let mut fwd = Forward::default();
     fwd.op_lines = op_lines.clone();
+    fwd.ruled = ruled_units(units, registry, true);
     let f_params = &of_unit.def.params[..of_unit.def.params.len() - 1];
     fwd.param_types = f_params
         .iter()
@@ -4294,14 +4306,18 @@ fn synthesize_one_gradient(
     // own size. A struct-typed parameter (`Dense`/`Network`) recurses field
     // by field via `backward_walk`'s own `field_ops` routing instead —
     // every leaf field must itself be scalar/`Tensor`/struct, checked
-    // recursively here up front.
-    for ty in &of_unit.param_types {
-        if !is_grad_supported_ty(ty, struct_schemas) {
-            return Err(format!(
-                "cannot compute grad(`{}`): reverse-mode differentiation only supports scalar, `Tensor`, and struct (recursively built from either) parameters for now, got `{ty}`",
-                req.name
-            ));
-        }
+    // recursively here up front. Only for the parameter differentiated: the
+    // others pass no gradient (`backward_walk`'s activity check) and can be
+    // anything, integer ids or targets included.
+    let idx = req
+        .grad_target_index
+        .expect("grammar guarantees a grad target index -- driver.rs::synthesize_derive_signatures");
+    let target_ty = &of_unit.param_types[idx];
+    if !is_grad_supported_ty(target_ty, struct_schemas) {
+        return Err(format!(
+            "cannot compute grad(`{}`): reverse-mode differentiation only supports scalar, `Tensor`, and struct (recursively built from either) parameters for now, got `{target_ty}`",
+            req.name
+        ));
     }
 
     let mut param_substitution = HashMap::new();
@@ -4332,6 +4348,20 @@ fn synthesize_one_gradient(
         .filter_map(|(p, ty)| Some((fwd.egraph.find(*fwd.external_vars.get(p)?), ty.clone())))
         .collect();
 
+    // The parameter `grad` differentiates, as the `Free` symbol `free_deps`
+    // records; a parameter the body never reads has none, and no gradient
+    // flows at all.
+    let target_symbol = fwd
+        .external_vars
+        .get(&f_params[idx])
+        .and_then(|&id| {
+            fwd.egraph[id].nodes.iter().find_map(|n| match n {
+                CleaveLang::Free(sym) => Some(*sym),
+                _ => None,
+            })
+        })
+        .unwrap_or_else(|| Symbol::from("<unread grad target>"));
+
     let mut referenced = HashSet::new();
     let zero_calls_used: std::sync::Mutex<HashSet<String>> = std::sync::Mutex::new(HashSet::new());
     let adjoints = backward_walk(
@@ -4345,6 +4375,7 @@ fn synthesize_one_gradient(
         unit_names,
         &zero_calls_used,
         &known_types,
+        Some(target_symbol),
         registry,
         &mut referenced,
     )
@@ -4380,9 +4411,6 @@ fn synthesize_one_gradient(
     // parameter count before this code ever runs -- an out-of-range index
     // here would be this function's own bug, not a user-facing case, hence
     // the plain slice index rather than another `Diagnostic`.
-    let idx = req
-        .grad_target_index
-        .expect("grammar guarantees a grad target index -- driver.rs::synthesize_derive_signatures");
     let (param_shapes, target_param_types): (Vec<Option<ParamShape>>, Vec<Ty>) = (
         vec![param_shapes.into_iter().nth(idx).unwrap()],
         vec![of_unit.param_types[idx].clone()],
@@ -4502,6 +4530,7 @@ fn backward_walk(
     unit_names: &HashSet<String>,
     zero_calls_used: &std::sync::Mutex<HashSet<String>>,
     known_types: &HashMap<egg::Id, Ty>,
+    active: Option<Symbol>,
     registry: &Registry,
     referenced: &mut HashSet<String>,
 ) -> Result<HashMap<egg::Id, egg::Id>, String> {
@@ -4543,6 +4572,18 @@ fn backward_walk(
         let Some(&u) = adjoints.get(&id) else {
             continue; // never reached from root -- no gradient flows here
         };
+        // Activity: a value that doesn't depend on the parameter being
+        // differentiated (`active`, its `Free` symbol) passes it no gradient,
+        // whatever its own operation is -- an integer index, a conversion of
+        // one, data computed from another parameter. Its adjoint is never
+        // propagated, so it needs no rule. `free_deps` only narrows on merge
+        // (`ConstantFold::merge`): a missing symbol means the value truly
+        // doesn't depend on it.
+        if let Some(target) = active {
+            if !egraph[id].data.free_deps.contains(&target) {
+                continue;
+            }
+        }
         let Some((name, children)) = defs.get(&id).cloned() else {
             continue; // a leaf -- nothing further to propagate through
         };
@@ -4867,6 +4908,24 @@ fn accumulate_adjoint(
     }
 }
 
+/// The units (`Forward::ruled`) whose algebra method declares an `adjoint`
+/// rule (`adjoint`) or a `derivative` rule.
+fn ruled_units(units: &HashMap<String, &CTopLevelFn>, registry: &Registry, adjoint: bool) -> HashSet<String> {
+    units
+        .iter()
+        .filter(|(_, u)| {
+            u.origin.as_ref().is_some_and(|(algebra, method)| {
+                if adjoint {
+                    registry.adjoint_rules(algebra).iter().any(|r| r.method == *method)
+                } else {
+                    registry.derivative_rules(algebra).iter().any(|r| r.method == *method)
+                }
+            })
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
 /// Instantiates one declared `adjoint` rule directly into the live e-graph
 /// for one real call site (`algebra::method<ty>(...children)`, upstream
 /// adjoint `u`) — the reverse-mode counterpart of `derivative_rule_to_
@@ -4949,6 +5008,11 @@ fn apply_adjoint_rule(
 
     let mut out = Vec::with_capacity(bodies.len());
     for ((p, body), &target) in rule.params.iter().zip(bodies).zip(children) {
+        // `_`: no contribution, the parameter isn't differentiable (an
+        // integer index, say: its gradient is zero almost everywhere).
+        if matches!(&body.kind, ExprKind::Path(path) if path.segments.len() == 1 && path.segments[0] == "_") {
+            continue;
+        }
         let mut ast = PatternAst::default();
         let expected = type_env.get(p.name.as_str()).map(String::as_str);
         build_pattern(body, algebra, ty, &type_env, None, expected, referenced, registry, &mut ast)?;
@@ -7964,6 +8028,7 @@ mod tests {
             &empty_unit_names,
             &zero_calls_used,
             &empty_known_types,
+            None,
             &registry,
             &mut referenced,
         )

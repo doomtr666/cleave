@@ -3551,13 +3551,31 @@ fn unify_rejects_a_pack_side_with_fewer_query_args_than_its_own_non_pack_prefix(
 }
 
 #[test]
-fn unify_rejects_two_still_open_packs_meeting_each_other() {
-    // Deliberately out of scope for this pass (`doc/backlog.md`'s own
-    // note) — a real, flagged gap, not silently accepted.
+fn unify_makes_two_still_open_packs_the_same_list() {
+    // A pack-generic impl calling a pack-generic function: two different
+    // open packs meet and are the same list, so resolving one resolves the
+    // other.
     let mut tygen = TyVarGen::default();
     let p1 = fresh_var(&mut tygen);
     let p2 = fresh_var(&mut tygen);
     let a = Ty::App("Foo".to_string(), vec![Ty::Pack(p1)]);
+    let b = Ty::App("Foo".to_string(), vec![Ty::Pack(p2)]);
+    let mut subst = Subst::default();
+    unify(&mut subst, &a, &b).expect("two open packs unify");
+    let concrete = Ty::App("Foo".to_string(), vec![Ty::Con("i32".to_string()), Ty::Con("f64".to_string())]);
+    unify(&mut subst, &b, &concrete).expect("the second pack resolves");
+    assert_eq!(subst.apply(&a), concrete);
+}
+
+#[test]
+fn unify_rejects_two_open_packs_after_prefixes_of_different_lengths() {
+    // `Foo<T, A...>` against `Foo<B...>` would bind `B` to a list ending in
+    // `A`: not supported, a `Mismatch` rather than a guess.
+    let mut tygen = TyVarGen::default();
+    let t = fresh_var(&mut tygen);
+    let p1 = fresh_var(&mut tygen);
+    let p2 = fresh_var(&mut tygen);
+    let a = Ty::App("Foo".to_string(), vec![Ty::Var(t), Ty::Pack(p1)]);
     let b = Ty::App("Foo".to_string(), vec![Ty::Pack(p2)]);
     let mut subst = Subst::default();
     assert!(unify(&mut subst, &a, &b).is_err());

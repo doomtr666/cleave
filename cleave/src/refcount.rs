@@ -509,6 +509,14 @@ fn collect_var_info(
     var_types: &mut HashMap<CVar, Ty>,
     owned_origin: &mut HashMap<CVar, bool>,
 ) {
+    // The function's own parameters too (never owned, `owned_origin` leaves
+    // them out): a borrowed parameter stored into a fresh struct must be
+    // retained like any other existing value (`retain_targets`), which needs
+    // its type. Found with `Collect::collect<__Tuple1<X>, X>`, whose whole
+    // body wraps its parameter: the caller released the wrapped leaves twice.
+    for (p, ty) in top.def.params.iter().zip(&top.param_types) {
+        var_types.insert(*p, ty.clone());
+    }
     walk_var_info(&top.def.body, signatures, var_types, owned_origin);
 }
 

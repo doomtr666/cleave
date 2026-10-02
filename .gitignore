@@ -4,3 +4,8 @@
 # (`MLIR_SYS_220_PREFIX`/`TABLEGEN_220_PREFIX`), see
 # `.cargo/config.toml.example` for the tracked explanation.
 /.cargo/config.toml
+
+
+
+# Python bytecode (the PyTorch twins under bench/ run through poetry)
+__pycache__/
