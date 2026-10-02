@@ -454,7 +454,6 @@ impl<T: Float, const In: i32, const Out: i32> Trainable<Dense<T, In, Out>> {}
 // softmax(z) * u`, is there because a rule gives one per parameter.
 algebra CrossEntropy<Logits, T> {
     fn cross_entropy(z: Logits, y: Logits) -> T;
-    fn softmax(z: Logits) -> Logits;
     fn cross_entropy_grad_logits(z: Logits, y: Logits, u: T) -> Logits;
     fn cross_entropy_grad_targets(z: Logits, y: Logits, u: T) -> Logits;
 
@@ -474,14 +473,6 @@ impl<T: Float, const B: i32, const C: i32> CrossEntropy<Tensor<T, B, C>, T> {
     // array per row and copy it in (`doc/backlog.md`, "A nested
     // comprehension allocates and copies each row"), which on a hot path
     // (every training step) costs far more than the arithmetic.
-    fn softmax(z) {
-        let mut p: [[T; C]; B] = mlir::memref::alloc();
-        for b in 0..B {
-            let lse = log_sum_exp_row(z, b);
-            for c in 0..C { p[b, c] = exp(z[b, c] - lse); };
-        };
-        Tensor(data: p)
-    }
     fn cross_entropy_grad_logits(z, y, u) {
         let mut g: [[T; C]; B] = mlir::memref::alloc();
         for b in 0..B {
@@ -495,6 +486,264 @@ impl<T: Float, const B: i32, const C: i32> CrossEntropy<Tensor<T, B, C>, T> {
     fn cross_entropy_grad_targets(z, y, u) {
         [for b in 0..B: { let lse = log_sum_exp_row(z, b); [for c in 0..C: (lse - z[b, c]) * u] }]
     }
+}
+
+// Softmax of each row: `exp(z - logsumexp(row))`, the attention weights of a
+// transformer. Its gradient is declared in closed form, `y * (u -
+// rowsum(u * y))` with `y = softmax(z)`, rather than derived through the
+// exponentials and the division.
+algebra Softmax<X> {
+    fn softmax(z: X) -> X;
+    fn softmax_grad(z: X, u: X) -> X;
+    adjoint softmax(z), u: softmax_grad(z, u);
+}
+
+impl<T: Float, const R: i32, const C: i32> Softmax<Tensor<T, R, C>> {
+    fn softmax(z) {
+        let mut p: [[T; C]; R] = mlir::memref::alloc();
+        for r in 0..R {
+            let lse = log_sum_exp_row(z, r);
+            for c in 0..C { p[r, c] = exp(z[r, c] - lse); };
+        };
+        Tensor(data: p)
+    }
+    fn softmax_grad(z, u) {
+        let mut g: [[T; C]; R] = mlir::memref::alloc();
+        for r in 0..R {
+            let lse = log_sum_exp_row(z, r);
+            let mut dot: T = zero();
+            for c in 0..C { dot = dot + u[r, c] * exp(z[r, c] - lse); };
+            for c in 0..C { g[r, c] = exp(z[r, c] - lse) * (u[r, c] - dot); };
+        };
+        Tensor(data: g)
+    }
+}
+
+// Layer normalization (Ba, Kiros & Hinton, 2016), as in a transformer: each
+// row (one position's vector) brought to mean 0 and variance 1, then scaled
+// by a learned gain `g` and shifted by a learned bias `b`, one per column.
+// `eps` is PyTorch's default, 1e-5. With `xhat` the normalized row and
+// `rstd = 1 / sqrt(var + eps)`, the gradients are the standard ones:
+// `dx = rstd * (u g - mean(u g) - xhat * mean(u g xhat))` per row, `dg` the
+// column sums of `u * xhat`, `db` the column sums of `u`.
+algebra LayerNorm<X, P> {
+    fn layer_norm(x: X, g: P, b: P) -> X;
+    fn layer_norm_grad_x(x: X, g: P, u: X) -> X;
+    fn layer_norm_grad_g(x: X, g: P, u: X) -> P;
+    fn layer_norm_grad_b(x: X, g: P, u: X) -> P;
+    adjoint layer_norm(x, g, b), u: (layer_norm_grad_x(x, g, u), layer_norm_grad_g(x, g, u), layer_norm_grad_b(x, g, u));
+}
+
+impl<T: Float, const R: i32, const C: i32> LayerNorm<Tensor<T, R, C>, Tensor<T, 1, C>> {
+    fn layer_norm(x, g, b) {
+        let mut y: [[T; C]; R] = mlir::memref::alloc();
+        for r in 0..R {
+            let (mean, rstd) = row_moments(x, r);
+            for c in 0..C { y[r, c] = (x[r, c] - mean) * rstd * g[0, c] + b[0, c]; };
+        };
+        Tensor(data: y)
+    }
+    fn layer_norm_grad_x(x, g, u) {
+        let n: T = C.to();
+        let mut d: [[T; C]; R] = mlir::memref::alloc();
+        for r in 0..R {
+            let (mean, rstd) = row_moments(x, r);
+            let mut s1: T = zero();
+            let mut s2: T = zero();
+            for c in 0..C {
+                let ug = u[r, c] * g[0, c];
+                s1 = s1 + ug;
+                s2 = s2 + ug * (x[r, c] - mean) * rstd;
+            };
+            let m1 = s1 / n;
+            let m2 = s2 / n;
+            for c in 0..C { d[r, c] = rstd * (u[r, c] * g[0, c] - m1 - (x[r, c] - mean) * rstd * m2); };
+        };
+        Tensor(data: d)
+    }
+    fn layer_norm_grad_g(x, g, u) {
+        let mut d: [[T; C]; 1] = mlir::memref::alloc();
+        for c in 0..C { d[0, c] = zero(); };
+        for r in 0..R {
+            let (mean, rstd) = row_moments(x, r);
+            for c in 0..C { d[0, c] = d[0, c] + u[r, c] * (x[r, c] - mean) * rstd; };
+        };
+        Tensor(data: d)
+    }
+    fn layer_norm_grad_b(x, g, u) {
+        let mut d: [[T; C]; 1] = mlir::memref::alloc();
+        for c in 0..C { d[0, c] = zero(); };
+        for r in 0..R { for c in 0..C { d[0, c] = d[0, c] + u[r, c]; }; };
+        Tensor(data: d)
+    }
+}
+
+// What causal attention needs to know beyond its matrices' shapes: `L`
+// positions per sequence, heads `DH` wide. A marker, built with a turbofish
+// (`AttentionShape::<128, 32>()`), its values read as const generics.
+struct AttentionShape<const L: i32, const DH: i32> {}
+
+// Causal multi-head self-attention (Vaswani et al., 2017), the heart of a
+// transformer block. `q`, `k`, `v` are `[N, D]`: `N / L` sequences of `L`
+// positions stacked as rows, `D / DH` heads side by side as columns. For each
+// sequence and head, with `Q`, `K`, `V` its `[L, DH]` blocks:
+// `softmax(mask(Q Kᵀ / sqrt(DH))) V`, where the mask keeps position `i` from
+// seeing any position after it (`-inf` scores, zero weights). The result has
+// the layout of `q`.
+//
+// Its gradient is declared as a whole, recomputing the attention weights `P`
+// per block rather than storing them: `dV = Pᵀ dO`, `dP = dO Vᵀ`, `dS = P *
+// (dP - rowsum(dP * P)) / sqrt(DH)`, `dQ = dS K`, `dK = dSᵀ Q`. The shape
+// isn't differentiable (`_`).
+algebra CausalAttention<X, S> {
+    fn causal_attention(q: X, k: X, v: X, shape: S) -> X;
+    fn causal_attention_grad_q(q: X, k: X, v: X, shape: S, u: X) -> X;
+    fn causal_attention_grad_k(q: X, k: X, v: X, shape: S, u: X) -> X;
+    fn causal_attention_grad_v(q: X, k: X, v: X, shape: S, u: X) -> X;
+    adjoint causal_attention(q, k, v, shape), u: (
+        causal_attention_grad_q(q, k, v, shape, u),
+        causal_attention_grad_k(q, k, v, shape, u),
+        causal_attention_grad_v(q, k, v, shape, u),
+        _
+    );
+}
+
+impl<const N: i32, const D: i32, const L: i32, const DH: i32> CausalAttention<Tensor<f32, N, D>, AttentionShape<L, DH>> {
+    fn causal_attention(q, k, v, shape) {
+        let mut out: [[f32; D]; N] = mlir::memref::alloc();
+        for s in 0..N / L {
+            for h in 0..D / DH {
+                let qh: Tensor<f32, L, DH> = attention_block(q, s, h);
+                let kh: Tensor<f32, L, DH> = attention_block(k, s, h);
+                let vh: Tensor<f32, L, DH> = attention_block(v, s, h);
+                let o: Tensor<f32, L, DH> = matmul(causal_attention_weights(qh, kh), vh);
+                for i in 0..L { for j in 0..DH { out[s * L + i, h * DH + j] = o[i, j]; }; };
+            };
+        };
+        Tensor(data: out)
+    }
+    fn causal_attention_grad_q(q, k, v, shape, u) {
+        let mut out: [[f32; D]; N] = mlir::memref::alloc();
+        for s in 0..N / L {
+            for h in 0..D / DH {
+                let qh: Tensor<f32, L, DH> = attention_block(q, s, h);
+                let kh: Tensor<f32, L, DH> = attention_block(k, s, h);
+                let vh: Tensor<f32, L, DH> = attention_block(v, s, h);
+                let uh: Tensor<f32, L, DH> = attention_block(u, s, h);
+                let p = causal_attention_weights(qh, kh);
+                let ds = attention_score_grad(p, matmul_transpose_b(uh, vh), DH);
+                let g: Tensor<f32, L, DH> = matmul(ds, kh);
+                for i in 0..L { for j in 0..DH { out[s * L + i, h * DH + j] = g[i, j]; }; };
+            };
+        };
+        Tensor(data: out)
+    }
+    fn causal_attention_grad_k(q, k, v, shape, u) {
+        let mut out: [[f32; D]; N] = mlir::memref::alloc();
+        for s in 0..N / L {
+            for h in 0..D / DH {
+                let qh: Tensor<f32, L, DH> = attention_block(q, s, h);
+                let kh: Tensor<f32, L, DH> = attention_block(k, s, h);
+                let vh: Tensor<f32, L, DH> = attention_block(v, s, h);
+                let uh: Tensor<f32, L, DH> = attention_block(u, s, h);
+                let p = causal_attention_weights(qh, kh);
+                let ds = attention_score_grad(p, matmul_transpose_b(uh, vh), DH);
+                let g: Tensor<f32, L, DH> = matmul_transpose_a(ds, qh);
+                for i in 0..L { for j in 0..DH { out[s * L + i, h * DH + j] = g[i, j]; }; };
+            };
+        };
+        Tensor(data: out)
+    }
+    fn causal_attention_grad_v(q, k, v, shape, u) {
+        let mut out: [[f32; D]; N] = mlir::memref::alloc();
+        for s in 0..N / L {
+            for h in 0..D / DH {
+                let qh: Tensor<f32, L, DH> = attention_block(q, s, h);
+                let kh: Tensor<f32, L, DH> = attention_block(k, s, h);
+                let uh: Tensor<f32, L, DH> = attention_block(u, s, h);
+                let g: Tensor<f32, L, DH> = matmul_transpose_a(causal_attention_weights(qh, kh), uh);
+                for i in 0..L { for j in 0..DH { out[s * L + i, h * DH + j] = g[i, j]; }; };
+            };
+        };
+        Tensor(data: out)
+    }
+}
+
+// The `[L, DH]` block of sequence `s` and head `h` in an `[N, D]` matrix.
+fn attention_block<const N: i32, const D: i32, const L: i32, const DH: i32>(x: Tensor<f32, N, D>, s: i32, h: i32) -> Tensor<f32, L, DH> {
+    let mut b: [[f32; DH]; L] = mlir::memref::alloc();
+    for i in 0..L { for j in 0..DH { b[i, j] = x[s * L + i, h * DH + j]; }; };
+    Tensor(data: b)
+}
+
+// `softmax(mask(Q Kᵀ / sqrt(DH)))` for one block: row `i` spread over
+// positions `0..=i`, zero after.
+fn causal_attention_weights<const L: i32, const DH: i32>(qh: Tensor<f32, L, DH>, kh: Tensor<f32, L, DH>) -> Tensor<f32, L, L> {
+    let dh: f32 = DH.to();
+    let scale = 1.0 / mlir::math::sqrt(dh);
+    let scores: Tensor<f32, L, L> = matmul_transpose_b(qh, kh);
+    let mut p: [[f32; L]; L] = mlir::memref::alloc();
+    for i in 0..L {
+        let mut m = scores[i, 0];
+        for j in 1..i + 1 { if scores[i, j] > m { m = scores[i, j]; }; };
+        let mut z = 0.0;
+        for j in 0..i + 1 {
+            let e = exp((scores[i, j] - m) * scale);
+            p[i, j] = e;
+            z = z + e;
+        };
+        for j in 0..i + 1 { p[i, j] = p[i, j] / z; };
+        for j in i + 1..L { p[i, j] = 0.0; };
+    };
+    Tensor(data: p)
+}
+
+// `dS = P * (dP - rowsum(dP * P)) / sqrt(DH)`, the gradient of the scaled
+// scores from that of the weights (masked entries have `P = 0`, so `dS = 0`).
+fn attention_score_grad<const L: i32>(p: Tensor<f32, L, L>, dp: Tensor<f32, L, L>, dh: i32) -> Tensor<f32, L, L> {
+    let width: f32 = dh.to();
+    let scale = 1.0 / mlir::math::sqrt(width);
+    let mut ds: [[f32; L]; L] = mlir::memref::alloc();
+    for i in 0..L {
+        let mut dot = 0.0;
+        for j in 0..L { dot = dot + dp[i, j] * p[i, j]; };
+        for j in 0..L { ds[i, j] = p[i, j] * (dp[i, j] - dot) * scale; };
+    };
+    Tensor(data: ds)
+}
+
+// Draws a class from row `r` of a matrix of logits: class `c` with
+// probability `softmax(z[r] / temperature)[c]`. Below 1 the temperature
+// sharpens the distribution toward the likeliest classes, above 1 it
+// flattens it. Shifted by the row's maximum, so `exp` never overflows.
+fn sample_row<const R: i32, const C: i32>(z: Tensor<f32, R, C>, r: i32, temperature: f32) -> i32 {
+    let mut m = z[r, 0];
+    for c in 1..C { if z[r, c] > m { m = z[r, c]; }; };
+    let mut total = 0.0;
+    for c in 0..C { total = total + exp((z[r, c] - m) / temperature); };
+    let target = rand_uniform_f32() * total;
+    let mut acc = 0.0;
+    let mut chosen = C - 1;
+    let mut found = false;
+    for c in 0..C {
+        acc = acc + exp((z[r, c] - m) / temperature);
+        if not found and acc > target { chosen = c; found = true; };
+    };
+    chosen
+}
+
+// The mean of row `r` and `1 / sqrt(variance + 1e-5)` (the biased variance,
+// as PyTorch's `layer_norm`).
+fn row_moments<T: Float, const R: i32, const C: i32>(x: Tensor<T, R, C>, r: i32) -> (T, T) {
+    let n: T = C.to();
+    let eps: T = 0.00001;
+    let mut s: T = zero();
+    for c in 0..C { s = s + x[r, c]; };
+    let mean = s / n;
+    let mut v: T = zero();
+    for c in 0..C { v = v + (x[r, c] - mean) * (x[r, c] - mean); };
+    let one: T = one();
+    (mean, one / mlir::math::sqrt(v / n + eps))
 }
 
 // Cross-entropy against integer targets: `y[b]` is the class of row `b`,

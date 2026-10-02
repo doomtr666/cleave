@@ -1998,6 +1998,10 @@ pub struct Infer<'r> {
     /// outside of another `fn`/impl-method's own body inference, which
     /// always resets it first.
     pub(crate) active_generics: HashMap<String, Ty>,
+    /// The const generics among `active_generics`, with the type of the value
+    /// each denotes (`i32`, `bool`): what reading one as a value has, whether
+    /// or not the generic is bound yet (`ExprKind::Path`).
+    pub(crate) active_const_types: HashMap<String, Ty>,
     /// The `for` loops being inferred, innermost last: loop variable, the
     /// loop's `NodeId`, its bounds when both fold.
     unroll_scopes: Vec<(String, NodeId, Option<(u64, u64)>)>,
@@ -2290,6 +2294,7 @@ impl<'r> Infer<'r> {
             param_types: Vec::new(),
             target_types: Vec::new(),
             active_generics: HashMap::new(),
+            active_const_types: HashMap::new(),
             unroll_scopes: Vec::new(),
             unroll_requests: Vec::new(),
             undefaultable: Vec::new(),
@@ -3275,6 +3280,19 @@ impl<'r> Infer<'r> {
     /// member; `callgraph.rs` calls this once per group member first, then
     /// runs the defaulting/constraint/placeholder steps exactly once for the
     /// whole group.
+    /// Each const generic among `generics`, with its declared value type.
+    fn const_value_types(&mut self, generics: &[GenericParam]) -> HashMap<String, Ty> {
+        generics
+            .iter()
+            .filter_map(|g| match g {
+                GenericParam::Const { name, ty, variadic: false } => {
+                    Some((name.clone(), self.ty_from_ast_mapped(ty, &HashMap::new())))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     pub(crate) fn infer_fn_raw(
         &mut self,
         f: &FnDecl,
@@ -3293,6 +3311,7 @@ impl<'r> Infer<'r> {
             .as_ref()
             .expect("infer_fn_raw requires a body; caller must validate first");
         self.active_generics = generics.clone();
+        self.active_const_types = self.const_value_types(&f.generics);
         let mut env = outer.clone();
         for (p, ty) in f.params.iter().zip(&param_types) {
             env.insert(p.name.clone(), Scheme::mono(ty.clone()));
@@ -3503,6 +3522,7 @@ impl<'r> Infer<'r> {
         // bogus `App("Complex", [Con("T")])`.
         let impl_mapping = self.fresh_generics_mapping(impl_generics, fallback_span);
         self.active_generics = impl_mapping.clone();
+        self.active_const_types = self.const_value_types(impl_generics);
         let target_tys: Vec<Ty> = targets
             .iter()
             .map(|t| self.ty_from_ast_mapped(t, &impl_mapping))
@@ -6456,6 +6476,14 @@ impl<'r> Infer<'r> {
                                     .to_string(),
                                 ));
                             }
+                            // Not bound yet (a generic body): still the type
+                            // of the value, never the generic's own variable,
+                            // which arithmetic on the value would otherwise
+                            // bind (`s * L` binding `L`) or merge with another
+                            // generic's (`N / L` making `N` and `L` one).
+                            if let Some(value_ty) = self.active_const_types.get(&name) {
+                                return Ok(value_ty.clone());
+                            }
                         }
                         Ok(ty)
                     }
@@ -7270,7 +7298,8 @@ impl<'r> Infer<'r> {
             // first, so it always wins the ambiguity) — special-cased here,
             // the one remaining gap that ordering doesn't resolve on its
             // own, rather than left to fall through to the unresolved
-            // placeholder below.
+            // placeholder below. (`resolve.rs` rewrites a known one into a
+            // struct literal first; this is the case it couldn't decide.)
             Ok(Ty::Con(name))
         } else {
             // No declared algebra owns this name (checked above, via the

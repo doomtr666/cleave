@@ -1960,3 +1960,21 @@ What is known:
 - With **runtime data** (`Init::he()`, data from an extern), the step is correct: real training (MNIST, nanoLM) isn't affected. That's why it's not urgent, but it's a silent wrong result, so it isn't harmless.
 
 Next step: dump the MLIR after each stage (`--dump-mlir`, then the pipeline's passes one at a time) on the minimal program and find the first pass whose output computes something else.
+
+## "cannot be specialized… its generic impl body doesn't type-check at this instantiation" names neither the cause nor the place
+
+Hit three times in a row on the nanoLM step 4 work (attention). `TypeErrorKind::MonomorphizationFailed` (`monomorphize.rs`, `ImplMatch::NoneMatched`) only says that no impl template unified with the call. The real cause is upstream: the impl's generic check produced **wrong patterns**. In the case found, inference had merged two const generics, giving `Tensor<f32, 't1, 't2>` and `AttentionShape<'t1, 't2>` instead of `<N, D>` and `<L, DH>`, so a correct call matched nothing. The cause was a bug fixed since then (a const generic read as a value was typed with the generic's own variable). Finding it took bisecting the body line by line, and printing the patterns from inside the monomorphizer.
+
+What's needed: when `NoneMatched` hits an impl whose *declared* target (`impl<…> Algebra<Tensor<f32, N, D>, …>`) would match the call, but whose *inferred* patterns don't, say so: "the body of `Algebra::method` constrains its generics beyond its declaration: `N` and `L` were unified (here)". Comparing the declared target against the inferred patterns at template construction would catch it at the source, with the location in the body. Related to the "disappears without a message" entry above: both are the same gap, the generic check of an impl body that doesn't surface its own conclusions.
+
+## `unify` unifies two `ConstExpr`s with the same operator operand by operand — unsound
+
+`infer.rs::unify`, arm `(Ty::ConstExpr(op1, x1, y1), Ty::ConstExpr(op2, x2, y2)) if op1 == op2`: `N / L ~ M / K` forces `N = M` and `L = K`, while `8/4 = 4/2`. Not hit in practice (looked for during the attention work: the arm never fired), but it's an inference that can merge two generics wrongly, the same class as the bug found there. Fix: only accept syntactic identity (same operands, already unified), otherwise defer until the values are known, rather than deducing equal operands.
+
+## nanoLM's kernel takes ~3 minutes to compile (1.6 GB), and rust-analyzer rebuilds it on every edit
+
+Measured on `examples/nanolm/src/kernel.cleave` with the transformer (4 blocks, d = 128): up to optimized CPS, 445 MB and 5 s; down to the object file, 1.6 GB and 191 s. Almost all of it is after CPS: MLIR lowering, the matmul schedule, LLVM. Since `build.rs` compiles the kernel and rust-analyzer runs build scripts in the background, every edit of the kernel costs 3 minutes of CPU behind the editor's back. Nothing has been profiled yet. Likely leads: the size of the unrolled code (the `Trainable` comprehensions over 4 blocks of 16 leaves, Adam per leaf; the three attention gradients each recomputing the weights), and the per-function MLIR pass pipeline. To measure (phase by phase, as with the memory blowup) before guessing.
+
+## The in-process test harnesses don't run the matmul schedule: a test of a matmul there doesn't cover the real pipeline
+
+Found while fixing matmuls whose column count isn't a multiple of 16: the test written in `cleave/tests/mlir_lower.rs` passed **even without the fix**, while the CLI (`--run`) failed. The harness pipeline in those files (`run_i32` and its relatives) doesn't apply `matmul_vectorize.transform.mlir`, so its matmuls take another lowering path. The regression test now goes through the CLI binary (`language_model_ops.rs`, `CARGO_BIN_EXE_cleave`). To fix: have the harnesses go through `pipeline.rs::lower_to_llvm` with the real options, or at least list which existing tests think they cover the schedule and don't.

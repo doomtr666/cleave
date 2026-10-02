@@ -1185,6 +1185,9 @@ pub fn lower_to_llvm<'c>(
         return Err(vec!["MLIR-to-LLVM lowering pass failed (cse)".to_string()]);
     }
     eliminate_self_copies(context, &mut *module);
+    // Partial-tile write-backs, before the affine pass rejects them
+    // (`redundant_copy_elim::lower_dynamic_copies`).
+    crate::redundant_copy_elim::lower_dynamic_copies(context, &mut *module);
 
     // `--expand-strided-metadata` turns `memref.subview`'s own dynamic
     // offset/stride metadata (from the tiling above) into plain arithmetic

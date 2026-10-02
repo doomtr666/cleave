@@ -2924,6 +2924,68 @@ fn to_sugar_converts_an_int_to_a_float_end_to_end() {
     assert_eq!(run_i32(&context, src), 1);
 }
 
+/// A const generic read as a value in a generic body has the type of its
+/// value (`i32`), not the generic's own variable: arithmetic on it must not
+/// bind or merge the generics (`s * L` once `s` is known to be an `i32` used
+/// to bind `L`, and the impl then matched nothing).
+#[test]
+fn arithmetic_on_const_generic_values_leaves_the_generics_alone() {
+    let context = context();
+    let src = "
+        use linalg;
+        struct Shape<const L: i32> {}
+        fn take(x: i32) -> i32 { x }
+        algebra Count<X, S> { fn count(x: X, s: S) -> i32; }
+        impl<const N: i32, const D: i32, const L: i32> Count<Tensor<f32, N, D>, Shape<L>> {
+            fn count(x, shape) {
+                let mut c = 0;
+                for s in 0..N / L { let t = take(s); c = c + s * L + t; };
+                c
+            }
+        }
+        fn main() -> i32 {
+            let x = Tensor::<f32, 4, 2>(data: [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]);
+            count(x, Shape::<2>())
+        }
+    ";
+    // s = 0, 1: (0 * 2 + 0) + (1 * 2 + 1)
+    assert_eq!(run_i32(&context, src), 3);
+}
+
+/// `E()` constructs a struct without fields (it parses as a call; `resolve.rs`
+/// rewrites it into the struct literal), here only to select an impl.
+#[test]
+fn a_struct_without_fields_is_constructed() {
+    let context = context();
+    let src = "
+        struct E {}
+        algebra P<X> { fn p(x: X) -> i32; }
+        impl P<E> { fn p(x) { 7 } }
+        fn main() -> i32 { p(E()) }
+    ";
+    assert_eq!(run_i32(&context, src), 7);
+}
+
+/// A marker struct: no fields, only const generics, given by turbofish and
+/// read back by the impl it selects (`AttentionShape<L, H>`, `stdlib/nn`).
+#[test]
+fn a_marker_struct_carries_its_const_generics() {
+    let context = context();
+    let src = "
+        use linalg;
+        struct Shape<const L: i32, const H: i32> {}
+        algebra Probe<X, S> { fn probe(x: X, s: S) -> i32; }
+        impl<T: Float, const N: i32, const D: i32, const L: i32, const H: i32> Probe<Tensor<T, N, D>, Shape<L, H>> {
+            fn probe(x, s) { L * 100 + H * 10 + D / H }
+        }
+        fn main() -> i32 {
+            let x = Tensor::<f32, 2, 4>(data: [[1.0, 2.0, 3.0, 5.0], [-1.0, 0.0, 0.5, 4.0]]);
+            probe(x, Shape::<3, 2>())
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 322);
+}
+
 /// A pack-generic impl method calling a pack-generic function: the two
 /// `Dims...` are different open packs when the impl is checked generically,
 /// and unify as the same list (the template used to be dropped, and the

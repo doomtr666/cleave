@@ -32,8 +32,8 @@
 //! duplicate `memref.subview` computations into one shared value.
 
 use melior::Context;
-use melior::ir::operation::{Operation, OperationLike, OperationMutLike, OperationRef};
-use melior::ir::{BlockLike, Module, RegionLike};
+use melior::ir::operation::{Operation, OperationBuilder, OperationLike, OperationMutLike, OperationRef};
+use melior::ir::{BlockLike, Module, RegionLike, TypeLike, ValueLike};
 
 /// `OperationMutLike` (needed for `remove_from_parent`) is
 /// implemented for `OperationRefMut`, not the plain `OperationRef` a walk
@@ -97,6 +97,57 @@ fn collect_self_copies<'c, 'a>(block: melior::ir::BlockRef<'c, 'a>, out: &mut Ve
             let mut next_block = region.first_block();
             while let Some(b) = next_block {
                 collect_self_copies(b, out);
+                next_block = b.next_in_region();
+            }
+        }
+        next = op.next_in_block();
+    }
+}
+
+/// Turns every `linalg.copy` between memrefs of a *dynamic* size into the
+/// `memref.copy` it is, before `--convert-linalg-to-affine-loops`
+/// (`pipeline.rs`). Such a copy is the write-back of a partial tile: a
+/// matmul whose column count isn't a multiple of the schedule's 16
+/// (`matmul_vectorize.transform.mlir`, `structured.pad`'s `copy_back_op`),
+/// the GPT's `128 -> 104` output layer. Its size is an `affine.min` of an
+/// `scf.for` induction variable, which the affine pass rejects as a
+/// dimension ("operand cannot be used as a dimension id"), failing the
+/// whole compilation. `memref.copy` needs no loops of its own. Copies of a
+/// static size, every one the schedule produced before this, are left as
+/// they are.
+pub fn lower_dynamic_copies<'c>(_context: &'c Context, module: &mut Module<'c>) {
+    let mut copies = Vec::new();
+    collect_dynamic_copies(module.body(), &mut copies);
+    for op in copies {
+        let (Ok(src), Ok(dst)) = (op.operand(0), op.operand(1)) else { continue };
+        let block = op.block().expect("a linalg.copy has a parent block");
+        let copy = OperationBuilder::new("memref.copy", op.location())
+            .add_operands(&[src, dst])
+            .build()
+            .expect("failed to build memref.copy");
+        block.insert_operation_before(op, copy);
+        erase(op);
+    }
+}
+
+fn collect_dynamic_copies<'c, 'a>(block: melior::ir::BlockRef<'c, 'a>, out: &mut Vec<OperationRef<'c, 'a>>) {
+    let mut next = block.first_operation();
+    while let Some(op) = next {
+        if op.name().as_string_ref().as_str() == Ok("linalg.copy") && op.operand_count() == 2 && op.result_count() == 0 {
+            let dynamic = (0..2).any(|i| {
+                op.operand(i).is_ok_and(|v| {
+                    let ty = v.r#type();
+                    ty.is_mem_ref() && ty.to_string().contains('?')
+                })
+            });
+            if dynamic {
+                out.push(op);
+            }
+        }
+        for region in op.regions() {
+            let mut next_block = region.first_block();
+            while let Some(b) = next_block {
+                collect_dynamic_copies(b, out);
                 next_block = b.next_in_region();
             }
         }

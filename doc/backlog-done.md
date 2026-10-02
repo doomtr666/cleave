@@ -1113,3 +1113,11 @@ reported anywhere in the stdlib or examples, and `pipeline.rs::check_type_errors
 every compile. Dispatch at monomorphization (`derive_impl_instantiation`) no longer takes the first
 matching impl: several matches on a concrete call are an ambiguity error, on a still-generic one a
 deferral.
+
+## The optimizer printed every function as a tree to compare it: exponential memory on a transformer's gradient, two machine crashes
+
+Compiling the `grad` of a small GPT (`examples/nanolm`, step 4) climbed past 22 GB and took Windows down twice: `nanolm`'s `build.rs` compiles its kernel, and rust-analyzer runs build scripts in the background, so editing `kernel.cleave` was enough to trigger it. The growth was exponential in the number of blocks, independent of the sizes: 1 block 55 MB, 2 blocks 5.1 GB, 4 blocks killed past 6 GB, even at width 32.
+
+It wasn't the gradient synthesis (206 e-graph nodes, 1 ms), nor saturation (365 nodes at most), nor refcounting. After saturating each function, `optimize_program` compared the extracted expression with the original via `best.to_string() == original.to_string()`. egg's `Display` writes a `RecExpr` as an s-expression, a tree, so every shared subexpression is printed in full at each use. A transformer's gradient shares a lot: residuals, an input read by three projections, activations reused by the backward. The text doubled with each level. Located by killing the compiler mid-run under a memory watchdog and reading its last trace.
+
+Fix: `egraph.rs::same_expression`, a structural comparison of the two DAGs (same operator, same children), memoized on pairs of nodes, so linear. Test: `egraph::tests::expressions_are_compared_as_dags_not_trees` (a 64-level chain, each node using the previous one twice: 2^64 nodes as a tree, 65 as a DAG). After the fix: 4 blocks at width 32 take 28 MB, and the real model (4 blocks, d = 128, context 128, batch 32) reaches optimized CPS in 35 MB and 0.7 s.

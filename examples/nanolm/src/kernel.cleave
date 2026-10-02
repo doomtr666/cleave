@@ -9,6 +9,7 @@ use num;
 use convert;
 use nn;
 use io;
+use checkpoint;
 
 // Batches of 32 sequences of 128 characters, flattened, filled by the host.
 extern fn train_inputs(i: i32) -> [i32; 4096];
@@ -69,13 +70,192 @@ export fn train_bigram(rounds: i32, lr: f32, seed: i64) -> f32 {
     let mut m = Bigram(table: Init::xavier());
     let opt = Adam(lr: lr, beta1: 0.9, beta2: 0.999, eps: 0.00000001);
     let mut state = init_state(opt, m);
-    println(("step 0, validation:", validation_loss(m, 10)));
+    println(("step 0, validation: ", validation_loss(m, 10)));
     for r in 0..rounds {
         for k in 0..100 {
             let s = r * 100 + k;
             (m, state) = step(opt, m, model_grad(train_inputs(s), train_targets(s), m), state);
         };
-        println(("step", (r + 1) * 100, "validation:", validation_loss(m, 10)));
+        println(("step ", (r + 1) * 100, ", validation: ", validation_loss(m, 10)));
     };
     validation_loss(m, 50)
+}
+
+// The first network: each character's id to a vector (`emb`), then a two-layer MLP with GELU to the
+// logits of the next character. Still one character of context, so it can do no better than the
+// bigram; it's the whole gradient path (embedding, dense layers, GELU, loss) checked against the
+// PyTorch twin (`bench/nanolm-pytorch/mlp.py`), from the same initial weights.
+struct Lm { emb: Tensor<f32, 104, 64>, l1: Dense<f32, 64, 256>, l2: Dense<f32, 256, 104> }
+impl Trainable<Lm> {}
+
+fn logits(x: [i32; 4096], m: Lm) -> Tensor<f32, 4096, 104> {
+    m.l2.dense_forward(gelu(m.l1.dense_forward(embed(m.emb, x))))
+}
+
+fn lm_loss(x: [i32; 4096], y: [i32; 4096], m: Lm) -> f32 {
+    sparse_cross_entropy(logits(x, m), y)
+}
+
+lm_grad = grad(lm_loss, m);
+
+fn lm_validation_loss(m: Lm, batches: i32) -> f32 {
+    let mut total: f64 = 0.0;
+    for s in 0..batches { total = total + lm_loss(val_inputs(s), val_targets(s), m).to(); };
+    (total / (batches * 4096).to()).to()
+}
+
+// Writes the initial weights to `lm_init.ckpt` (in the working directory) for the twin, then
+// trains `rounds` of 100 Adam steps.
+export fn train_lm(rounds: i32, lr: f32, seed: i64) -> f32 {
+    rand_seed(seed);
+    let mut m = Lm(emb: Init::xavier(), l1: Init::he(), l2: Init::xavier());
+    save("lm_init.ckpt", m);
+    let opt = Adam(lr: lr, beta1: 0.9, beta2: 0.999, eps: 0.00000001);
+    let mut state = init_state(opt, m);
+    println(("step 0, validation: ", lm_validation_loss(m, 10)));
+    for r in 0..rounds {
+        for k in 0..100 {
+            let s = r * 100 + k;
+            (m, state) = step(opt, m, lm_grad(train_inputs(s), train_targets(s), m), state);
+        };
+        println(("step ", (r + 1) * 100, ", validation: ", lm_validation_loss(m, 10)));
+    };
+    lm_validation_loss(m, 50)
+}
+
+// ------------------------------------------------------------------ the transformer
+//
+// nanoGPT's shape at a small size: a token and a position embedding of width 128, 4 blocks, a final
+// LayerNorm and a dense head to the 104 logits. Activations are `[B*T, d]` = `[4096, 128]`
+// matrices, the 32 sequences of a batch stacked as rows. Each block is pre-LayerNorm:
+// `x + attention(layer_norm(x))`, then `x + mlp(layer_norm(x))`, the attention causal over 4 heads
+// of 32, the MLP 128 -> 512 -> 128 with GELU.
+
+struct Block {
+    ln1_g: Tensor<f32, 1, 128>, ln1_b: Tensor<f32, 1, 128>,
+    wq: Dense<f32, 128, 128>, wk: Dense<f32, 128, 128>, wv: Dense<f32, 128, 128>, wo: Dense<f32, 128, 128>,
+    ln2_g: Tensor<f32, 1, 128>, ln2_b: Tensor<f32, 1, 128>,
+    fc: Dense<f32, 128, 512>, proj: Dense<f32, 512, 128>
+}
+impl Trainable<Block> {}
+
+struct Gpt {
+    tok: Tensor<f32, 104, 128>, pos: Tensor<f32, 128, 128>,
+    b1: Block, b2: Block, b3: Block, b4: Block,
+    lnf_g: Tensor<f32, 1, 128>, lnf_b: Tensor<f32, 1, 128>,
+    head: Dense<f32, 128, 104>
+}
+impl Trainable<Gpt> {}
+
+fn ones() -> Tensor<f32, 1, 128> { [for i in 0..1: [for j in 0..128: 1.0]] }
+
+fn new_block() -> Block {
+    Block(
+        ln1_g: ones(), ln1_b: Ring::zero(),
+        wq: Init::xavier(), wk: Init::xavier(), wv: Init::xavier(), wo: Init::xavier(),
+        ln2_g: ones(), ln2_b: Ring::zero(),
+        fc: Init::he(), proj: Init::xavier()
+    )
+}
+
+fn new_gpt() -> Gpt {
+    Gpt(
+        tok: Init::xavier(), pos: Init::xavier(),
+        b1: new_block(), b2: new_block(), b3: new_block(), b4: new_block(),
+        lnf_g: ones(), lnf_b: Ring::zero(),
+        head: Init::xavier()
+    )
+}
+
+// Row `k` of a batch is position `k mod 128` of its sequence.
+fn positions() -> [i32; 4096] { [for k in 0..4096: k - (k / 128) * 128] }
+
+fn block<const N: i32>(x: Tensor<f32, N, 128>, b: Block) -> Tensor<f32, N, 128> {
+    let h = layer_norm(x, b.ln1_g, b.ln1_b);
+    let a = causal_attention(b.wq.dense_forward(h), b.wk.dense_forward(h), b.wv.dense_forward(h), AttentionShape::<128, 32>());
+    let x2 = x + b.wo.dense_forward(a);
+    x2 + b.proj.dense_forward(gelu(b.fc.dense_forward(layer_norm(x2, b.ln2_g, b.ln2_b))))
+}
+
+// Any number of rows `N`, whole sequences of 128: a training batch (4096), or the one sequence
+// generation reads (128).
+fn gpt_logits<const N: i32>(x: [i32; N], p: [i32; N], m: Gpt) -> Tensor<f32, N, 104> {
+    let h0 = embed(m.tok, x) + embed(m.pos, p);
+    let h = block(block(block(block(h0, m.b1), m.b2), m.b3), m.b4);
+    m.head.dense_forward(layer_norm(h, m.lnf_g, m.lnf_b))
+}
+
+fn gpt_loss(x: [i32; 4096], y: [i32; 4096], p: [i32; 4096], m: Gpt) -> f32 {
+    sparse_cross_entropy(gpt_logits(x, p, m), y)
+}
+
+gpt_grad = grad(gpt_loss, m);
+
+fn gpt_validation_loss(m: Gpt, p: [i32; 4096], batches: i32) -> f32 {
+    let mut total: f64 = 0.0;
+    for s in 0..batches { total = total + gpt_loss(val_inputs(s), val_targets(s), p, m).to(); };
+    (total / (batches * 4096).to()).to()
+}
+
+// Writes the initial weights to `gpt_init.ckpt` for the twin, trains `rounds` of `per_round` Adam
+// steps starting at step `first` (batches are a function of the step, so a resumed run continues
+// the same sequence), checkpointing the model, optimizer state and random generator to `gpt.ckpt`
+// after each round.
+export fn train_gpt(first: i32, rounds: i32, per_round: i32, lr: f32, seed: i64, resume: bool) -> f32 {
+    rand_seed(seed);
+    let p = positions();
+    let opt = Adam(lr: lr, beta1: 0.9, beta2: 0.999, eps: 0.00000001);
+    let fresh = new_gpt();
+    let mut m = fresh;
+    let mut state = init_state(opt, fresh);
+    if resume {
+        let (rm, rs, rseed) = restore("gpt.ckpt", (fresh, init_state(opt, fresh), 0:i64));
+        m = rm;
+        state = rs;
+        rand_seed(rseed);
+    } else {
+        save("gpt_init.ckpt", m);
+    };
+    println(("step ", first, ", validation: ", gpt_validation_loss(m, p, 4)));
+    for r in 0..rounds {
+        for k in 0..per_round {
+            let s = first + r * per_round + k;
+            (m, state) = step(opt, m, gpt_grad(train_inputs(s), train_targets(s), p, m), state);
+        };
+        save("gpt.ckpt", (m, state, rand_state()));
+        println(("step ", first + (r + 1) * per_round, ", validation: ", gpt_validation_loss(m, p, 4)));
+    };
+    gpt_validation_loss(m, p, 20)
+}
+
+// ------------------------------------------------------------------ generation
+
+// The prompt, encoded by the host (`main.rs`), left-aligned in a context of 128; its length.
+extern fn prompt_ids() -> [i32; 128];
+extern fn prompt_len() -> i32;
+// Prints one generated character.
+extern fn emit_char(c: i32);
+
+// Continues the prompt for `count` characters with the model saved in `gpt.ckpt`, each drawn from
+// the next-character distribution at `temperature`. The context slides once it holds 128.
+export fn generate(count: i32, temperature: f32, seed: i64) -> i32 {
+    let opt = Adam(lr: 0.001, beta1: 0.9, beta2: 0.999, eps: 0.00000001);
+    let fresh = new_gpt();
+    let (m, _, _) = restore("gpt.ckpt", (fresh, init_state(opt, fresh), 0:i64));
+    rand_seed(seed);
+    let p: [i32; 128] = [for k in 0..128: k];
+    let mut ctx = prompt_ids();
+    let mut len = prompt_len();
+    for g in 0..count {
+        let c = sample_row(gpt_logits(ctx, p, m), len - 1, temperature);
+        emit_char(c);
+        if len < 128 {
+            ctx[len] = c;
+            len = len + 1;
+        } else {
+            for k in 0..127 { ctx[k] = ctx[k + 1]; };
+            ctx[127] = c;
+        };
+    };
+    count
 }

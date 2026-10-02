@@ -50,11 +50,15 @@ use crate::ast::{
 /// unique names.
 pub fn resolve_calls(mut program: Program) -> Program {
     let mut top_level_fns: HashSet<String> = HashSet::new();
+    let mut fieldless_structs: HashSet<String> = HashSet::new();
     let mut algebra_methods: HashMap<(String, usize), Vec<String>> = HashMap::new();
     for item in &program.items {
         match &item.kind {
             ItemKind::Fn(f) => {
                 top_level_fns.insert(f.name.clone());
+            }
+            ItemKind::Struct(d) if d.fields.is_empty() => {
+                fieldless_structs.insert(d.name.clone());
             }
             ItemKind::Algebra(a) => {
                 for ai in &a.items {
@@ -71,6 +75,7 @@ pub fn resolve_calls(mut program: Program) -> Program {
     }
     let resolver = Resolver {
         top_level_fns,
+        fieldless_structs,
         algebra_methods,
         renamed: Cell::new(0),
     };
@@ -108,6 +113,9 @@ struct Local {
 
 struct Resolver {
     top_level_fns: HashSet<String>,
+    /// Structs without fields: `Name()` (or `Name::<...>()`) constructs one,
+    /// though it parses as a call (`grammar.pest`, `primary`).
+    fieldless_structs: HashSet<String>,
     algebra_methods: HashMap<(String, usize), Vec<String>>,
     /// Shadowing `let`s renamed so far in the current function.
     renamed: Cell<u32>,
@@ -190,6 +198,21 @@ impl Resolver {
                         *name = actual.to_string();
                     }
                 }
+            }
+            // `Name()` naming a struct without fields, and no function or
+            // local of that name: a construction, rewritten into the struct
+            // literal it is so that its generics (a marker struct has only
+            // those: `AttentionShape<L, H>`, `stdlib/nn`) and its turbofish
+            // are inferred like any struct literal's.
+            ExprKind::Call(path, generics, args, _)
+                if args.is_empty()
+                    && path.segments.len() == 1
+                    && self.fieldless_structs.contains(&path.segments[0])
+                    && !self.top_level_fns.contains(&path.segments[0])
+                    && lookup(scope, &path.segments[0]).is_none() =>
+            {
+                let (path, generics) = (path.clone(), std::mem::take(generics));
+                expr.kind = ExprKind::StructLit(path, generics, Vec::new());
             }
             ExprKind::Call(path, _, args, _) => {
                 args.iter_mut().for_each(|a| self.expr(a, scope));

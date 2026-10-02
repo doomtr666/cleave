@@ -813,7 +813,10 @@ fn a_const_generic_used_as_a_for_loop_bound_is_checked_against_its_own_declared_
 /// as a `for` loop bound demands `Int`, and this registry only declares
 /// `impl Int<i32>` (deliberately no `impl Int<i64>`), so `g::<4>(1)` must
 /// still fail on the *real* width. Were the fix instead falling back to a
-/// flat "assume i32" default, this would wrongly succeed.
+/// flat "assume i32" default, this would wrongly succeed. Reported in `g`
+/// itself: reading `M` as a value has its declared type, `i64`, whatever the
+/// instantiation, so the missing `Int<i64>` is wrong at the definition, not
+/// only at a call (it used to surface in `main`, through `g::<4>`).
 #[test]
 fn a_const_generic_used_as_a_for_loop_bound_is_checked_against_its_real_width_not_a_default() {
     let src = "algebra Num<T> {}
@@ -832,12 +835,7 @@ fn a_const_generic_used_as_a_for_loop_bound_is_checked_against_its_real_width_no
     let program = lower_program(src);
     let registry = registry_from(src);
     let result = infer_program(&program, &registry);
-    assert!(
-        result.results.get("g").unwrap().is_ok(),
-        "{:?}",
-        result.results.get("g")
-    );
-    let err = err_result(&result, "main");
+    let err = err_result(&result, "g");
     // Whichever of the merged var's own constraints (`Num` and `Int` are
     // both pushed for a bare numeric literal, see `NumberLit`'s own
     // inference arm) happens to be checked first — either is equally proof

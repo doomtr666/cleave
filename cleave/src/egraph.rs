@@ -3651,17 +3651,17 @@ pub fn optimize_program(
         let root_id = runner.egraph.find(root_id);
         let extractor = Extractor::new(&runner.egraph, AstSize);
         let (_, best) = extractor.find_best(root_id);
-        // Compared by `Display` text, not `RecExpr`'s own derived
-        // `PartialEq` -- two `RecExpr`s representing the identical tree
-        // (even printing identically) can carry a different internal id
-        // layout and compare unequal via the derived `PartialEq`, found by
-        // direct testing (a `Bitwise::bitnot` segment that never even
-        // touches `Ring::add` was showing up as "changed"). The same
-        // reasoning `egraph.rs`'s own Stage 2 tests already apply to
-        // avoiding parsing a `RecExpr` back from text -- text is this
-        // module's own reliable comparison surface, not the derived struct
-        // equality.
-        if best.to_string() == original.to_string() {
+        // Compared structurally (`same_expression`), not by `RecExpr`'s
+        // derived `PartialEq` -- two `RecExpr`s representing the identical
+        // tree can carry a different internal id layout and compare unequal
+        // (found by direct testing: a `Bitwise::bitnot` segment that never
+        // touches `Ring::add` was showing up as "changed") -- and no longer
+        // by `Display` text either: that prints the DAG as a tree, every
+        // shared subexpression in full at each use, exponential in the
+        // depth of sharing. A transformer's gradient (residuals, one input
+        // read by three projections, activations reused by the backward)
+        // made it gigabytes from two blocks on and took the machine down.
+        if same_expression(&best, &original) {
             continue; // saturation ran, but extraction picked the exact original form back -- nothing to report or rebuild
         }
         if want_explanations {
@@ -4908,6 +4908,37 @@ fn accumulate_adjoint(
     }
 }
 
+/// Whether two expressions are the same term, compared as DAGs: same
+/// operator at each node and the same children, each pair of nodes compared
+/// once (memoized), so linear in the expressions' sizes however much they
+/// share -- never by expanding them into trees.
+fn same_expression(a: &RecExpr<CleaveLang>, b: &RecExpr<CleaveLang>) -> bool {
+    fn same(
+        a: &RecExpr<CleaveLang>,
+        x: Id,
+        b: &RecExpr<CleaveLang>,
+        y: Id,
+        seen: &mut HashMap<(Id, Id), bool>,
+    ) -> bool {
+        if let Some(&known) = seen.get(&(x, y)) {
+            return known;
+        }
+        let (nx, ny) = (&a[x], &b[y]);
+        let result = nx.matches(ny)
+            && nx
+                .children()
+                .iter()
+                .zip(ny.children())
+                .all(|(&cx, &cy)| same(a, cx, b, cy, seen));
+        seen.insert((x, y), result);
+        result
+    }
+    if a.as_ref().is_empty() || b.as_ref().is_empty() {
+        return a.as_ref().is_empty() && b.as_ref().is_empty();
+    }
+    same(a, a.root(), b, b.root(), &mut HashMap::new())
+}
+
 /// The units (`Forward::ruled`) whose algebra method declares an `adjoint`
 /// rule (`adjoint`) or a `derivative` rule.
 fn ruled_units(units: &HashMap<String, &CTopLevelFn>, registry: &Registry, adjoint: bool) -> HashSet<String> {
@@ -5794,6 +5825,25 @@ fn nest_array_chunks(
 
 #[cfg(test)]
 mod tests {
+    /// A chain where each node uses the previous one twice: 64 levels are a
+    /// tree of 2^64 nodes, but a DAG of 65. The comparison must follow the
+    /// DAG (it used to print both as trees, which is what took a machine's
+    /// memory with a transformer's gradient).
+    #[test]
+    fn expressions_are_compared_as_dags_not_trees() {
+        use super::{CleaveLang, RecExpr, same_expression};
+        let chain = |leaf: &str| {
+            let mut e: RecExpr<CleaveLang> = RecExpr::default();
+            let mut prev = e.add(CleaveLang::Free(leaf.into()));
+            for _ in 0..64 {
+                prev = e.add(CleaveLang::Op("Ring::add<f32>".into(), vec![prev, prev]));
+            }
+            e
+        };
+        assert!(same_expression(&chain("x"), &chain("x")));
+        assert!(!same_expression(&chain("x"), &chain("y")));
+    }
+
     use super::*;
     use egg::{AstSize, EGraph, Extractor};
 

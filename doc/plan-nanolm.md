@@ -102,19 +102,41 @@ Each step ends with something that runs and is checked, against the PyTorch twin
    bigram baseline written in cleave (`kernel.cleave`) and in numpy (`bigram.py`) gives the same
    2.3520 nats/char (3.39 bits/char) on validation: the floor the models below must beat. (On the
    way: `Convert<f64, f32>`; one f32 accumulator over 200 k terms had cost the third decimal.)
-2. **Embeddings and a first model** (in progress): `Embed`, `SparseCrossEntropy`, `gelu` in `stdlib/nn`,
+2. **Embeddings and a first model** ✅: `Embed`, `SparseCrossEntropy`, `gelu` in `stdlib/nn`,
    each checked by value and gradient (`cleave/tests/language_model_ops.rs`). A learned bigram (a
    `[104, 104]` table, Adam) goes from 4.65 (ln 104) to 2.3507 nats in 1000 steps, the counted
    bigram's 2.3520. Compiler fixes on the way: `_` in an `adjoint` rule (no contribution), reverse-mode
    activity (no gradient through what doesn't depend on the target, so integer parameters are fine),
    a method with a declared rule stays opaque even when its body is a transparent chain, two open
    packs unify, one-element comprehensions default to a real `__Tuple1` (single-field models), and
-   refcounting retains a borrowed parameter stored into a new struct. Remaining: the MLP model and the
-   twin's matching loss. Original description: token/position gather with scatter-add adjoint, cross-entropy
+   refcounting retains a borrowed parameter stored into a new struct. Then the network `Lm`
+   (embedding 104→64, dense 64→256, GELU, dense 256→104; `train_lm`) against its twin
+   (`bench/nanolm-pytorch/mlp.py`), from the same initial weights (a checkpoint cleave writes and
+   `data.py::read_checkpoint` reads), same batches, same Adam: validation losses agree to 4-5
+   decimals at every 100 steps over 1000 (4.6388 → 2.3504), the drift of f32 rounding. Done.
+   Original description: token/position gather with scatter-add adjoint, cross-entropy
    on integer targets, tensor `tanh` and GELU. A bigram-and-MLP model trains end to end, its loss
    matching the twin's.
-3. **LayerNorm, row softmax, 2D slices**, each gradient-checked against PyTorch on small fixed inputs.
+3. **LayerNorm, row softmax** ✅: `LayerNorm` and `Softmax` in `stdlib/nn` (the forward-only `softmax`
+   moved out of `CrossEntropy`), each with its closed-form adjoint, values and gradients checked
+   against PyTorch in float64 (`cleave/tests/language_model_ops.rs`). The 2D slices moved to step 4:
+   they are only needed inside attention, whose adjoint is declared as a whole, so they need none of
+   their own.
 4. **Causal attention** as one algebra with a declared adjoint (above), gradient-checked; the full
-   model trains, with periodic checkpoints.
+   model trains, with periodic checkpoints. *In progress*: `CausalAttention` in `stdlib/nn`
+   (`causal_attention(q, k, v, AttentionShape::<L, DH>())` on `[N, D]` matrices; blocks per sequence
+   and head, the weights recomputed in the backward), value and gradients matched against PyTorch
+   on 2 sequences x 8 positions x 2 heads. On the way: field-less structs (`AttentionShape`, a marker
+   carrying const generics) construct at all (they never had: `resolve.rs` now rewrites `Name()`
+   into the struct literal), and a const generic read as a value in a generic body is typed `i32`,
+   no longer its own variable (arithmetic on it used to merge the generics). Then the full model
+   (`Gpt` in `kernel.cleave`, `train_gpt`, checkpoint every round) against its twin
+   (`bench/nanolm-pytorch/gpt.py`, from `gpt_init.ckpt`): 5.0667 -> 3.2192 after 5 steps on both
+   sides, to the 6th decimal. Two compiler fixes were needed first: an exponential memory blowup
+   comparing extracted expressions as text (`doc/backlog-done.md`; it crashed the machine twice
+   through rust-analyzer's build scripts), and matmuls whose column count isn't a multiple of 16
+   (the 104-wide head) failing in the affine pass (`redundant_copy_elim::lower_dynamic_copies`).
+   Remaining: a long run (minutes), checkpoint/resume exercised on it, and compile time (~3 min for
+   the kernel).
 5. **Generation and performance**: sampling with temperature; time per step against the twin, single
    thread then OpenMP (minimum of a few runs, per-step times in steady state).
