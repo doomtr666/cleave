@@ -29,6 +29,9 @@
 // nested `a[i][j]` read already uses), not a new mechanism; left to
 // `Dense`'s own future init helpers to use, not built here.
 extern fn rand_seed(s: i64);
+// The generator's whole state: `rand_seed(rand_state())` resumes the exact sequence, which is
+// what a checkpoint saves to resume a run bit for bit (`stdlib/checkpoint`).
+extern fn rand_state() -> i64;
 extern fn rand_uniform_f32() -> f32;
 extern fn rand_uniform_f64() -> f64;
 extern fn rand_normal_f32() -> f32;

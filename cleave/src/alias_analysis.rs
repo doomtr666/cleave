@@ -933,6 +933,14 @@ pub fn affine_struct_vars(
         .filter(|f| !region_local_fns.contains(&f.def.name))
         .collect();
 
+    let in_light = structs_inside_light_containers(
+        program,
+        struct_schemas,
+        mlir_types,
+        constructed_structs,
+        field_mutated_structs,
+        extern_boundary_structs,
+    );
     let mut affine = HashSet::new();
     for f in &non_region_local {
         collect_affine_candidates(
@@ -943,6 +951,7 @@ pub fn affine_struct_vars(
             constructed_structs,
             field_mutated_structs,
             extern_boundary_structs,
+            &in_light,
             &f.def.body,
             &mut affine,
         );
@@ -1449,6 +1458,7 @@ fn collect_affine_candidates(
     constructed_structs: &HashSet<String>,
     field_mutated_structs: &HashSet<String>,
     extern_boundary_structs: &HashSet<String>,
+    in_light: &HashSet<String>,
     fn_body: &CExpr,
     affine: &mut HashSet<CVar>,
 ) {
@@ -1457,6 +1467,7 @@ fn collect_affine_candidates(
             var, op, ty, cont, ..
         } => {
             if matches!(op, PrimOp::Struct(..))
+                && !in_light.contains(&ty.to_string())
                 && struct_cascade_is_viable(
                     ty,
                     struct_schemas,
@@ -1477,6 +1488,7 @@ fn collect_affine_candidates(
                 constructed_structs,
                 field_mutated_structs,
                 extern_boundary_structs,
+                in_light,
                 fn_body,
                 affine,
             );
@@ -1495,6 +1507,7 @@ fn collect_affine_candidates(
                 constructed_structs,
                 field_mutated_structs,
                 extern_boundary_structs,
+                in_light,
                 fn_body,
                 affine,
             );
@@ -1506,6 +1519,7 @@ fn collect_affine_candidates(
                 constructed_structs,
                 field_mutated_structs,
                 extern_boundary_structs,
+                in_light,
                 fn_body,
                 affine,
             );
@@ -1520,6 +1534,7 @@ fn collect_affine_candidates(
                     constructed_structs,
                     field_mutated_structs,
                     extern_boundary_structs,
+                    in_light,
                     fn_body,
                     affine,
                 );
@@ -1532,6 +1547,7 @@ fn collect_affine_candidates(
                 constructed_structs,
                 field_mutated_structs,
                 extern_boundary_structs,
+                in_light,
                 fn_body,
                 affine,
             );
@@ -1606,6 +1622,99 @@ fn field_needs_cascade(
 /// runs for every value of this struct type, not once per construction
 /// site), which is exactly why "is it ever field-mutated" (a whole-program,
 /// type-level fact) is the right question here, not a per-instance one.
+/// Every struct type that can end up a field of a *light* container (a
+/// tuple, a struct of light fields: no heap identity, `mlir_lower.rs::
+/// is_light_struct`), at any depth, by its displayed type: kept out of the
+/// headerless pool. Found as memory corruption with Adam on a two-layer
+/// `Trainable` model, whose state is tuples of tuples of `AdamState` structs
+/// (tensors and scalars, otherwise pool-eligible). Part of it was
+/// `field_affine_positions` keying fields by container *name*, every
+/// `__Tuple2<..>` instantiation sharing one answer (now keyed by full type);
+/// training after restoring such a state still corrupted memory without
+/// this exclusion, for a reason not identified yet (`doc/backlog.md`, "Pool
+/// allocator: heavy structs inside light containers"). Conservative: a
+/// simple light wrapper around a pool struct was fine, and loses the pool.
+fn structs_inside_light_containers(
+    program: &CpsProgram,
+    struct_schemas: &HashMap<String, crate::cps::StructSchema>,
+    mlir_types: &HashMap<String, String>,
+    constructed_structs: &HashSet<String>,
+    field_mutated_structs: &HashSet<String>,
+    extern_boundary_structs: &HashSet<String>,
+) -> HashSet<String> {
+    fn name_and_args(ty: &Ty) -> Option<(&str, &[Ty])> {
+        match ty {
+            Ty::Con(n) => Some((n.as_str(), &[])),
+            Ty::App(n, args) => Some((n.as_str(), args.as_slice())),
+            _ => None,
+        }
+    }
+    let is_light = |ty: &Ty| {
+        name_and_args(ty).is_some_and(|(name, args)| {
+            struct_schemas.contains_key(name)
+                && crate::mlir_lower::is_light_struct(
+                    name,
+                    args,
+                    struct_schemas,
+                    mlir_types,
+                    field_mutated_structs,
+                    extern_boundary_structs,
+                    constructed_structs,
+                )
+        })
+    };
+    let mut light_types: Vec<Ty> = Vec::new();
+    fn walk(e: &CExpr, out: &mut Vec<Ty>) {
+        match e {
+            CExpr::LetPrim { op, ty, cont, .. } => {
+                if matches!(op, PrimOp::Struct(..)) {
+                    out.push(ty.clone());
+                }
+                if let PrimOp::Field { struct_ty, .. } = op {
+                    out.push(struct_ty.clone());
+                }
+                walk(cont, out);
+            }
+            CExpr::App { .. } => {}
+            CExpr::If { then_branch, else_branch, .. } => {
+                walk(then_branch, out);
+                walk(else_branch, out);
+            }
+            CExpr::Fix { defs, body } => {
+                for d in defs {
+                    walk(&d.body, out);
+                }
+                walk(body, out);
+            }
+        }
+    }
+    for f in &program.funcs {
+        walk(&f.def.body, &mut light_types);
+    }
+    let mut excluded = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut stack: Vec<Ty> = light_types.into_iter().filter(|t| is_light(t)).collect();
+    while let Some(container) = stack.pop() {
+        if !seen.insert(container.to_string()) {
+            continue;
+        }
+        let Some((name, args)) = name_and_args(&container) else { continue };
+        for (_, field_ty) in crate::mlir_lower::struct_field_types(struct_schemas, name, args) {
+            let (_, leaf) = crate::mlir_lower::flatten_array_dims(&field_ty);
+            let Some((field_name, _)) = name_and_args(leaf) else { continue };
+            if !struct_schemas.contains_key(field_name) {
+                continue;
+            }
+            if is_light(leaf) {
+                stack.push(leaf.clone());
+            } else {
+                excluded.insert(leaf.to_string());
+            }
+        }
+    }
+    excluded
+}
+
 fn struct_cascade_is_viable(
     ty: &Ty,
     struct_schemas: &HashMap<String, crate::cps::StructSchema>,
@@ -1685,12 +1794,12 @@ fn collect_field_affine_facts(
     result: &mut HashMap<(String, usize), bool>,
 ) {
     match expr {
-        CExpr::LetPrim { op, args, cont, .. } => {
-            if let PrimOp::Struct(name, _) = op {
+        CExpr::LetPrim { op, args, cont, ty, .. } => {
+            if let PrimOp::Struct(..) = op {
                 for (i, arg) in args.iter().enumerate() {
                     let this_site_affine = matches!(arg, CVal::Var(v) if affine.contains(v));
                     result
-                        .entry((name.clone(), i))
+                        .entry((ty.to_string(), i))
                         .and_modify(|ok| *ok = *ok && this_site_affine)
                         .or_insert(this_site_affine);
                 }

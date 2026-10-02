@@ -646,23 +646,17 @@ mod affine_eligibility {
              must now be affine-eligible (`doc/plan-affine-ownership.md` \
              §13)"
         );
+        // `Outer` is light (a wrapper with no heap identity of its own), and a
+        // struct that can sit inside a light container is kept out of the
+        // pool (`alias_analysis.rs::structs_inside_light_containers`):
+        // `Inner` stays headered, so `Outer`'s field 0 is not a pool one.
         let inner = nth_named_struct_var(&program, "main", "Inner", 0);
         assert!(
-            affine.contains(&inner),
-            "`Inner`'s own construction is never aliased on its own merits \
-             either -- must be affine-eligible independently of being \
-             embedded"
+            !affine.contains(&inner),
+            "`Inner` lives inside a light `Outer`: deliberately not pool-allocated"
         );
         let field_affine = cleave::alias_analysis::field_affine_positions(&program, &affine);
-        assert_eq!(
-            field_affine.get(&("Outer".to_string(), 0)),
-            Some(&true),
-            "`Outer`'s own field 0 (`inner`) is always constructed from an \
-             already-affine value at every one of `Outer`'s own \
-             construction sites -- `mlir_lower.rs::lower_release_pool_\
-             cascade` needs this to know the cascade into `inner` can also \
-             skip the header"
-        );
+        assert_ne!(field_affine.get(&("Outer".to_string(), 0)), Some(&true));
     }
 
     /// The one case that must still be excluded, precisely because it's

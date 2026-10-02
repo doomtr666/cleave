@@ -1288,15 +1288,8 @@ fn rewrite_body(
             // the difference (a real `Release` on the pointer for the
             // heavy case, a `PrimOp::Field` chain ending in `Release` for
             // each leaf otherwise).
-            // A bare tensor read out of an owned struct (`n.l2.b`) is a
-            // counted reference like a heavy value, and must be tracked and
-            // protected the same way: otherwise the struct's own release
-            // frees it while the read result is still used (`Index` on it,
-            // a real use-after-free found with a gradient going through an
-            // `if`).
-            let bare_tensor = is_bare_tensor_ty(&ty, ctx.mlir_types);
             if (matches!(&op, PrimOp::Struct(..)) || field_read_owned)
-                && (ctx.is_rc(&ty) || bare_tensor || !ctx.light_release_leaves(&ty).is_empty())
+                && (ctx.is_rc(&ty) || !ctx.light_release_leaves(&ty).is_empty())
             {
                 owned.push((var, ty.clone()));
             }
@@ -1417,7 +1410,7 @@ fn rewrite_body(
             | PrimOp::Load { .. } = &op
             {
                 if ctx.owned_origin.get(&var).copied().unwrap_or(false) {
-                    if ctx.is_rc(&ty) || bare_tensor {
+                    if ctx.is_rc(&ty) {
                         Some(FieldReadProtect::Whole(ty.clone()))
                     } else {
                         let leaves = ctx.light_release_leaves(&ty);

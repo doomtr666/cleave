@@ -465,6 +465,20 @@ pub unsafe fn register_cleave_rt_symbols(engine: &cleave_mlir_shim::ExecutionEng
     unsafe {
         engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
         engine.register_symbol("rand_seed", cleave_rt::rand_seed as *mut ());
+        engine.register_symbol("rand_state", cleave_rt::rand_state as *mut ());
+        engine.register_symbol("cleave_ckpt_create", cleave_rt::checkpoint::cleave_ckpt_create as *mut ());
+        engine.register_symbol("cleave_ckpt_open", cleave_rt::checkpoint::cleave_ckpt_open as *mut ());
+        engine.register_symbol("cleave_ckpt_close", cleave_rt::checkpoint::cleave_ckpt_close as *mut ());
+        engine.register_symbol("cleave_ckpt_write_f32s", cleave_rt::checkpoint::cleave_ckpt_write_f32s as *mut ());
+        engine.register_symbol("cleave_ckpt_read_f32s", cleave_rt::checkpoint::cleave_ckpt_read_f32s as *mut ());
+        engine.register_symbol("cleave_ckpt_write_f32", cleave_rt::checkpoint::cleave_ckpt_write_f32 as *mut ());
+        engine.register_symbol("cleave_ckpt_read_f32", cleave_rt::checkpoint::cleave_ckpt_read_f32 as *mut ());
+        engine.register_symbol("cleave_ckpt_write_f64", cleave_rt::checkpoint::cleave_ckpt_write_f64 as *mut ());
+        engine.register_symbol("cleave_ckpt_read_f64", cleave_rt::checkpoint::cleave_ckpt_read_f64 as *mut ());
+        engine.register_symbol("cleave_ckpt_write_i32", cleave_rt::checkpoint::cleave_ckpt_write_i32 as *mut ());
+        engine.register_symbol("cleave_ckpt_read_i32", cleave_rt::checkpoint::cleave_ckpt_read_i32 as *mut ());
+        engine.register_symbol("cleave_ckpt_write_i64", cleave_rt::checkpoint::cleave_ckpt_write_i64 as *mut ());
+        engine.register_symbol("cleave_ckpt_read_i64", cleave_rt::checkpoint::cleave_ckpt_read_i64 as *mut ());
         engine.register_symbol("rand_uniform_f32", cleave_rt::rand_uniform_f32 as *mut ());
         engine.register_symbol("rand_uniform_f64", cleave_rt::rand_uniform_f64 as *mut ());
         engine.register_symbol("rand_normal_f32", cleave_rt::rand_normal_f32 as *mut ());
@@ -1973,6 +1987,20 @@ unsafe fn register_openmp_stub_symbols(engine: &cleave_mlir_shim::ExecutionEngin
 const KNOWN_CLEAVE_RT_SYMBOLS: &[&str] = &[
     "memrefCopy",
     "rand_seed",
+    "rand_state",
+    "cleave_ckpt_create",
+    "cleave_ckpt_open",
+    "cleave_ckpt_close",
+    "cleave_ckpt_write_f32s",
+    "cleave_ckpt_read_f32s",
+    "cleave_ckpt_write_f32",
+    "cleave_ckpt_read_f32",
+    "cleave_ckpt_write_f64",
+    "cleave_ckpt_read_f64",
+    "cleave_ckpt_write_i32",
+    "cleave_ckpt_read_i32",
+    "cleave_ckpt_write_i64",
+    "cleave_ckpt_read_i64",
     "rand_uniform_f32",
     "rand_uniform_f64",
     "rand_normal_f32",

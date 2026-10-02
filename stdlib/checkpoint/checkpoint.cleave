@@ -1,0 +1,164 @@
+// Checkpoints: saving a value to a file and restoring it, so that a run can
+// be stopped and resumed (`doc/plan-nanolm.md`, step 0).
+//
+//     save("run.ckpt", (net, state, epoch, rand_state()));
+//     let (net, state, epoch, seed) = restore("run.ckpt", (net, state, epoch, 0));
+//     rand_seed(seed);
+//
+// `restore` reads into a value of the same shape (`like`): a freshly
+// initialized model will do, and every type, an optimizer's state
+// included, stays inferred. Saving the random generator's state too resumes
+// the run bit for bit.
+//
+// Any value made of scalars, `f32` tensors, tuples, `Trainable` models and
+// optimizer states can be saved; a type of your own gets an impl of
+// `Checkpoint`, writing and reading its parts in the same order. The file
+// records each leaf's type and shape and `restore` checks them against
+// `like`: a value of another shape is a clear error, never misaligned data
+// (`cleave-rt/src/checkpoint.rs` has the format). A checkpoint is complete
+// or absent: it is written aside and renamed into place.
+use linalg;
+use optim;
+
+algebra Checkpoint<T> {
+    // Writes `x` to the open checkpoint `f`.
+    fn save_part(f: i64, x: T);
+    // Reads the next value from `f`, of the shape of `like`.
+    fn restore_part(f: i64, like: T) -> T;
+}
+
+fn save(path, x) {
+    let f = checkpoint_create(path);
+    save_part(f, x);
+    cleave_ckpt_close(f);
+}
+
+fn restore(path, like) {
+    let f = checkpoint_open(path);
+    let x = restore_part(f, like);
+    cleave_ckpt_close(f);
+    x
+}
+
+// ------------------------------------------------------------ the runtime
+
+algebra CheckpointPath<P> {
+    fn checkpoint_create(path: P) -> i64;
+    fn checkpoint_open(path: P) -> i64;
+}
+
+impl<const N: i32> CheckpointPath<[i8; N]> {
+    extern(cleave_ckpt_create) fn checkpoint_create(path: [i8; N]) -> i64;
+    extern(cleave_ckpt_open) fn checkpoint_open(path: [i8; N]) -> i64;
+}
+
+extern fn cleave_ckpt_close(f: i64);
+extern fn cleave_ckpt_write_f32(f: i64, x: f32);
+extern fn cleave_ckpt_read_f32(f: i64) -> f32;
+extern fn cleave_ckpt_write_f64(f: i64, x: f64);
+extern fn cleave_ckpt_read_f64(f: i64) -> f64;
+extern fn cleave_ckpt_write_i32(f: i64, x: i32);
+extern fn cleave_ckpt_read_i32(f: i64) -> i32;
+extern fn cleave_ckpt_write_i64(f: i64, x: i64);
+extern fn cleave_ckpt_read_i64(f: i64) -> i64;
+
+// The data of a tensor, with its shape (rank and up to three dims, the unused
+// ones 0) for the file to record and check.
+algebra CheckpointData<A> {
+    fn write_f32s(f: i64, rank: i32, d0: i32, d1: i32, d2: i32, a: A);
+    fn read_f32s(f: i64, rank: i32, d0: i32, d1: i32, d2: i32, a: A);
+}
+
+impl<const N: i32> CheckpointData<[f32; N]> {
+    extern(cleave_ckpt_write_f32s) fn write_f32s(f, rank, d0, d1, d2, a);
+    extern(cleave_ckpt_read_f32s) fn read_f32s(f, rank, d0, d1, d2, a);
+}
+
+impl<const R: i32, const C: i32> CheckpointData<[f32; R, C]> {
+    extern(cleave_ckpt_write_f32s) fn write_f32s(f, rank, d0, d1, d2, a);
+    extern(cleave_ckpt_read_f32s) fn read_f32s(f, rank, d0, d1, d2, a);
+}
+
+// ------------------------------------------------------------ the values
+
+impl Checkpoint<f32> {
+    fn save_part(f, x) { cleave_ckpt_write_f32(f, x); }
+    fn restore_part(f, like) { cleave_ckpt_read_f32(f) }
+}
+
+impl Checkpoint<f64> {
+    fn save_part(f, x) { cleave_ckpt_write_f64(f, x); }
+    fn restore_part(f, like) { cleave_ckpt_read_f64(f) }
+}
+
+impl Checkpoint<i32> {
+    fn save_part(f, x) { cleave_ckpt_write_i32(f, x); }
+    fn restore_part(f, like) { cleave_ckpt_read_i32(f) }
+}
+
+impl Checkpoint<i64> {
+    fn save_part(f, x) { cleave_ckpt_write_i64(f, x); }
+    fn restore_part(f, like) { cleave_ckpt_read_i64(f) }
+}
+
+impl<const N: i32> Checkpoint<Tensor<f32, N>> {
+    fn save_part(f, x) {
+        let data: [f32; N] = mlir::bufferization::to_buffer(x);
+        write_f32s(f, 1, N, 0, 0, data);
+    }
+    fn restore_part(f, like) {
+        let mut data: [f32; N] = mlir::memref::alloc();
+        read_f32s(f, 1, N, 0, 0, data);
+        Tensor(data: data)
+    }
+}
+
+impl<const R: i32, const C: i32> Checkpoint<Tensor<f32, R, C>> {
+    fn save_part(f, x) {
+        let data: [f32; R, C] = mlir::bufferization::to_buffer(x);
+        write_f32s(f, 2, R, C, 0, data);
+    }
+    fn restore_part(f, like) {
+        let mut data: [f32; R, C] = mlir::memref::alloc();
+        read_f32s(f, 2, R, C, 0, data);
+        Tensor(data: data)
+    }
+}
+
+// Tuples, whatever their length: each element in turn.
+impl<Ts...: Checkpoint> Checkpoint<Ts...> {
+    fn save_part(f, x) {
+        for i in 0..x.len() { save_part(f, x[i]); };
+    }
+    fn restore_part(f, like) {
+        [for i in 0..like.len(): restore_part(f, like[i])]
+    }
+}
+
+// Every model marked `Trainable`: its fields in declaration order, the model
+// rebuilt from them.
+impl<M: Trainable> Checkpoint<M> {
+    fn save_part(f, m) {
+        for i in 0..m.len() { save_part(f, m[i]); };
+    }
+    fn restore_part(f, like) {
+        [for i in 0..like.len(): restore_part(f, like[i])]
+    }
+}
+
+impl<T: Float, const Dims...: i32> Checkpoint<AdamState<T, Dims...>> {
+    fn save_part(f, s) {
+        save_part(f, s.m);
+        save_part(f, s.v);
+        save_part(f, s.beta1_pow);
+        save_part(f, s.beta2_pow);
+    }
+    fn restore_part(f, like) {
+        AdamState::<T, Dims...>(
+            m: restore_part(f, like.m),
+            v: restore_part(f, like.v),
+            beta1_pow: restore_part(f, like.beta1_pow),
+            beta2_pow: restore_part(f, like.beta2_pow)
+        )
+    }
+}

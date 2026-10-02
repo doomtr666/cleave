@@ -17,6 +17,8 @@
 //! `export fn` call site anywhere could actually resolve against the real
 //! symbol by its plain name.
 
+pub mod checkpoint;
+
 // No trailing newline -- `print`/`Print<T>` (`stdlib/io/io.cleave`) writes
 // exactly the bytes its argument's own decimal form is, nothing more, the
 // same "operate, return unchanged" contract `print_bytes`/
@@ -2079,6 +2081,13 @@ fn pcg32_next_u32() -> u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn rand_seed(s: i64) {
     PCG_STATE.store(s as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The generator's whole state: `rand_seed(rand_state())` resumes the exact
+/// sequence (what a checkpoint saves, `stdlib/checkpoint`).
+#[unsafe(no_mangle)]
+pub extern "C" fn rand_state() -> i64 {
+    PCG_STATE.load(std::sync::atomic::Ordering::Relaxed) as i64
 }
 
 /// Canonical uniform `[0,1)` -- the standard "top N mantissa bits of a raw

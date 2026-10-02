@@ -95,6 +95,18 @@ field projections inlines them (`egraph.rs`, `Forward::walk`/`is_transparent_cha
 where it arose: a comprehension collected into its own tuple emits no call (`cps.rs`). The underlying
 limitation is in the walk, and any other opaque call consuming call results will hit it.
 
+## Pool allocator: heavy structs inside light containers
+
+Adam on a two-layer `Trainable` model corrupted memory (2026-10-02): its state is tuples of tuples of
+`AdamState` (tensors and scalars), pool-allocated (`alias_analysis.rs`, affine) inside light tuples.
+Two causes found: `field_affine_positions` keyed fields by container *name*, so every `__Tuple2<..>`
+instantiation shared one answer (fixed: keyed by full type); and something still unidentified in
+training after restoring such a state (`cleave/tests/checkpoint.rs`'s resume test crashes without the
+workaround). Workaround in place: a struct that can sit inside a light container is never pool-
+allocated (`structs_inside_light_containers`). It is conservative (a plain light wrapper around a pool
+struct was fine before) and costs the pool to such structs; find the remaining cause, then narrow it.
+MNIST has no heavy struct and is unaffected.
+
 ## A gradient leaving an `if` crashes
 
 `let g = if c { net_grad(x, y, net) } else { net_grad(x, y, net) };` crashes at run time
@@ -142,7 +154,8 @@ included, and nesting builds nested collections. Missing, in the order discussed
 - Several generators flattened, `[for i in 0..3, for j in 0..4: e]`: rectangular bounds keep a known
   length (indexed, `k` split into `i = k / 4`, `j = k - i * 4`); bounds depending on an outer variable
   need appending.
-- There is no `%`: a remainder method in `Ring`/`Int` (worked around as `i - (i / 7) * 7` in a test).
+- `%` as an operator: `Rem::rem`/`Rem::mod` exist (`stdlib/num`), the grammar has no `%` for them
+  (`mul_op` is `*` and `/` only; a test wrote `i - (i / 7) * 7`).
 
 ## Arrays of tensors (and of structs, nested) as a comprehension's default target; `Generate` beyond two dimensions
 

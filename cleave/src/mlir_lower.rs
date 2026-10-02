@@ -4752,7 +4752,7 @@ fn lower_release_pool_cascade<'c>(
             ptr,
             struct_llvm_ty,
             &[0, position as i64],
-            &(name.to_string(), position),
+            &(struct_ty.to_string(), position),
             &mut pending,
         );
     }
@@ -5773,13 +5773,18 @@ fn lower_raw_mlir_op<'c>(
         return build_to_buffer_dynamic_layout(ctx, block, env, args, attrs, result_ty);
     }
     let context = ctx.context;
+    // With no variable operand to take a type from, a literal's type comes
+    // from the result: its element type when the result is shaped. A
+    // scalar broadcast to a tensor (`tensor.splat(eps)`, Adam's `eps` once
+    // the optimizer folded it to a literal) is a scalar operand, not a
+    // tensor one.
     let operand_ty = args
         .iter()
         .find_map(|a| match a {
             CVal::Var(v) => env.get(v).map(ValueLike::r#type),
             _ => None,
         })
-        .unwrap_or(result_ty);
+        .unwrap_or_else(|| shaped_element_type(result_ty).unwrap_or(result_ty));
     let arg_values: Vec<Value> = args
         .iter()
         .map(|a| lower_cval(context, block, env, a, operand_ty))
@@ -6969,6 +6974,17 @@ fn lower_extern_out_param_call<'c>(
         .build()
         .unwrap_or_else(|e| panic!("MLIR lowering: failed to build bufferization.to_tensor: {e}"));
     block.append_operation(to_tensor).result(0).unwrap().into()
+}
+
+/// The element type of a tensor, vector or memref type; `None` otherwise.
+fn shaped_element_type(ty: Type<'_>) -> Option<Type<'_>> {
+    if let Ok(t) = melior::ir::r#type::RankedTensorType::try_from(ty) {
+        return Some(t.element());
+    }
+    if let Ok(t) = MemRefType::try_from(ty) {
+        return Some(t.element());
+    }
+    None
 }
 
 fn ensure_extern_declared<'c>(

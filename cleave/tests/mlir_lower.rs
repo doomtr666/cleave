@@ -7041,6 +7041,83 @@ fn a_generic_fn_indexes_a_value_typed_by_its_instance() {
     assert_eq!(run_i32(&context, src), 1);
 }
 
+/// Adam through the generic `Trainable` impl: its state is an `AdamState`
+/// struct (tensors and scalars) carried in tuples and the layer rebuilt by
+/// `Collect`. One step from known values: every parameter moves by `lr`
+/// against its gradient's sign (Adam's first, bias-corrected step).
+#[test]
+fn adam_updates_a_trainable_layer() {
+    let context = context();
+    let src = "
+        use nn;
+        fn main() -> i32 {
+            let opt = Adam(lr: 0.1, beta1: 0.9, beta2: 0.999, eps: 0.00000001);
+            let b = Tensor::<f32, 1, 2>(data: [[1.0, 2.0]]);
+            let d = Dense(w: Tensor::<f32, 2, 2>(data: [[1.0, 2.0], [3.0, 4.0]]), b: b);
+            let gb = Tensor::<f32, 1, 2>(data: [[0.5, -0.5]]);
+            let g = Dense(w: Tensor::<f32, 2, 2>(data: [[0.5, 0.5], [-0.5, 0.5]]), b: gb);
+            let (d2, s2) = step(opt, d, g, init_state(opt, d));
+            let close = fn(a: f32, e: f32) { a - e < 0.0001 and e - a < 0.0001 };
+            if close(d2.w[0, 0], 0.9) and close(d2.w[1, 0], 3.1) and close(d2.b[0, 1], 2.1) { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// Adam over several steps in a loop, its state fed back each time. Found
+/// crashing the compiler: the optimizer's constant `eps`, folded to a literal
+/// once the steps are inlined, reached `tensor.splat` typed as the tensor it
+/// builds instead of its element (`mlir_lower.rs::lower_raw_mlir_op`).
+#[test]
+fn adam_keeps_training_over_several_steps() {
+    let context = context();
+    let src = "
+        use nn;
+        fn main() -> i32 {
+            let opt = Adam(lr: 0.1, beta1: 0.9, beta2: 0.999, eps: 0.00000001);
+            let gb = Tensor::<f32, 1, 2>(data: [[0.5, -0.5]]);
+            let g = Dense(w: Tensor::<f32, 2, 2>(data: [[0.5, 0.5], [-0.5, 0.5]]), b: gb);
+            let mut d = Dense(w: Tensor::<f32, 2, 2>(data: [[1.0, 2.0], [3.0, 4.0]]), b: Tensor::<f32, 1, 2>(data: [[1.0, 2.0]]));
+            let mut s = init_state(opt, d);
+            for i in 0..3 { (d, s) = step(opt, d, g, s); };
+            // A constant gradient: Adam moves each parameter by `lr` per step.
+            let close = fn(a: f32, e: f32) { a - e < 0.001 and e - a < 0.001 };
+            if close(d.w[0, 0], 0.7) and close(d.w[1, 0], 3.3) and close(d.b[0, 1], 2.3) { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// Adam on a two-layer `Trainable` model, in a loop. Its state is tuples of
+/// tuples of `AdamState` structs (tensors and scalars): found corrupting
+/// memory when those structs came from the headerless pool while their
+/// containers, light tuples, release them through the headered path
+/// (`alias_analysis.rs::structs_inside_light_containers`).
+#[test]
+fn adam_trains_a_two_layer_trainable_model() {
+    let context = context();
+    let src = "
+        use nn;
+        struct Net { l1: Dense<f32, 16, 32>, l2: Dense<f32, 32, 10> }
+        impl Trainable<Net> {}
+        fn forward(x, net) { net.l2.dense_forward(relu(net.l1.dense_forward(x))) }
+        fn loss(x: Tensor<f32, 32, 16>, y: Tensor<f32, 32, 10>, net: Net) -> f32 { cross_entropy(forward(x, net), y) }
+        net_grad = grad(loss, net);
+        fn main() -> i32 {
+            rand_seed(3);
+            let x: Tensor<f32, 32, 16> = Init::he();
+            let y: Tensor<f32, 32, 10> = Init::he();
+            let opt = Adam(lr: 0.01, beta1: 0.9, beta2: 0.999, eps: 0.00000001);
+            let mut net = Net(l1: Init::he(), l2: Init::xavier());
+            let mut state = init_state(opt, net);
+            let before = loss(x, y, net);
+            for i in 0..20 { (net, state) = step(opt, net, net_grad(x, y, net), state); };
+            if loss(x, y, net) < before { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
 /// A model marked `Trainable` needs no optimizer code of its own: `optim`'s
 /// one impl updates it field by field, two levels deep here (`Net` of
 /// `Dense`s), with a stateful optimizer whose state type no one declares.
