@@ -2139,6 +2139,17 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                 }
             })
         }
+        // A comprehension collected into its own tuple (`ast::
+        // comprehension_collect`, target = source): no call at all. Found
+        // necessary: the call kept the e-graph pass from inlining the
+        // calls building the tuple (`Optimizer::step` on a `Trainable`
+        // model, one call per field, left un-inlined).
+        ExprKind::Call(path, _, args, ..)
+            if is_comprehension_collect(path)
+                && ctx.node_types.get(&args[0].id) == ctx.node_types.get(&expr.id) =>
+        {
+            convert_expr(&args[0], env, ctx, k)
+        }
         ExprKind::Call(path, _, args, ..) => {
             let name = path.segments.join("::");
             let arg_refs: Vec<&Expr> = args.iter().collect();

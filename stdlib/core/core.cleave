@@ -12,6 +12,23 @@ impl<T, const N: i32> Len<[T; N]> {
     fn len(c) { N }
 }
 
+// What a comprehension (`[for i in a..b: e]`) builds: its copies of `e` form
+// a tuple, then `collect` turns that tuple into the type the context asks
+// for, like a number literal's type comes from its context. `let net:
+// Network = [for ...]` rebuilds a struct; `let v: [f32; 3] = [for ...]` an
+// array. When nothing decides, the default (`infer.rs`, `CollectDefault`):
+// an array when every element has the same scalar (or array) type, the
+// tuple itself otherwise. The struct and array impls are synthesized by the compiler
+// (`driver.rs::synthesize_collect_impls`); a program can write its own for a
+// struct (or for any type: a tensor initialized by formula).
+algebra Collect<Target, Source> {
+    fn collect(x: Source) -> Target;
+}
+
+impl<T> Collect<T, T> {
+    fn collect(x) { x }
+}
+
 // Indexing a homogeneous collection with run-time indices (`m[i, j]`): one
 // call per bracket group, every index gathered into one `[i32; K]` array
 // (`cps.rs`'s `ExprKind::Index`). Implemented by `Tensor` (`stdlib/linalg`),

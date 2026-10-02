@@ -372,6 +372,28 @@ impl GenericParam {
 /// running"`/`"__break_value"`). Shared by `lower.rs` (which needs to *name*
 /// the struct a `(T1,T2)`/`(a,b)` desugars to) and `driver.rs` (which needs
 /// to *declare* it) so the two can never drift apart.
+/// The callee name a comprehension (`[for i in a..b: e]`) lowers to:
+/// `<comprehension>(a, b, fn(i) { e })`. Not a writable identifier (`<`), so
+/// it never collides with a user name; `unroll.rs` replaces the call by the
+/// tuple of the body's copies, one per index.
+pub const COMPREHENSION: &str = "<comprehension>";
+
+/// The callee a rewritten comprehension hands its tuple to: `Collect::collect`,
+/// marked like an operator's (`Path::operator`: always the algebra's), which
+/// a user-written call never is. The mark is what lets inference give it a
+/// comprehension's default target (`infer.rs`, `CollectDefault`) without
+/// giving one to every explicit `collect(x)`.
+pub fn comprehension_collect() -> Path {
+    Path {
+        segments: vec!["Collect".to_string(), "collect".to_string()],
+        operator: true,
+    }
+}
+
+pub fn is_comprehension_collect(path: &Path) -> bool {
+    path.operator && path.segments == ["Collect", "collect"]
+}
+
 pub fn tuple_struct_name(arity: usize) -> String {
     format!("__Tuple{arity}")
 }
@@ -633,6 +655,18 @@ pub struct Program {
 pub struct NodeIdGen(u32);
 
 impl NodeIdGen {
+    /// A generator handing out ids from `start` on — for nodes created after
+    /// parsing (`monomorphize.rs`'s per-instance unrolled copies), in a range
+    /// no parsed node reaches.
+    pub fn starting_at(start: u32) -> Self {
+        NodeIdGen(start)
+    }
+
+    /// The next id this generator would hand out.
+    pub fn current(&self) -> u32 {
+        self.0
+    }
+
     pub fn next(&mut self) -> NodeId {
         let id = NodeId(self.0);
         self.0 += 1;

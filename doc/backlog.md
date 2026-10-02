@@ -86,9 +86,28 @@ how host data becomes a tensor.
 
 ---
 
+## A call taking other calls' results as a tuple stops the e-graph pass from inlining those calls
+
+Found on MNIST after `Optimizer` moved to `optim`'s generic impl for `Trainable` models (training about
+1 s slower): `Collect::collect((step(...), step(...), ...))`, the identity a comprehension is wrapped in,
+left all four `Optimizer::step<Sgd, Dense<...>>` calls un-inlined, while the same tuple consumed by
+field projections inlines them (`egraph.rs`, `Forward::walk`/`is_transparent_chain`). Worked around
+where it arose: a comprehension collected into its own tuple emits no call (`cps.rs`). The underlying
+limitation is in the walk, and any other opaque call consuming call results will hit it.
+
+## Arrays of tensors (and of structs, nested) as a comprehension's default target
+
+A comprehension over same-typed elements defaults to an array only when the elements are scalars (or
+arrays of them), a tuple otherwise (`infer.rs::apply_collect_defaults`). The fuller rule from
+`doc/plan-compile-time-sequences.md` ("an array when they unify") needs the backend to represent
+`[Tensor<f32, 1, 2>; 2]`: a memref can't hold tensors, and a struct-leaf array is single-dimension
+only (`mlir_lower.rs::lower_array_construct`). Found with `Optimizer` on a `Dense<f32, 1, 2>`, whose
+two fields share a type: the state came out as an array of tensors and failed MLIR verification.
+
 ## Indexable collections as algebras: `x[i]` on structs and tuples, unrolled `for`, comprehensions, slices
 
-Designed in `doc/plan-compile-time-sequences.md`, not started: arrays, tensors, tuples and structs all
+Steps 1-3 done (`doc/plan-compile-time-sequences.md`, "Suggested order"); slices, packs in the same
+style and structural autodiff remain. Originally: arrays, tensors, tuples and structs all
 indexed through stdlib algebras (`Index` for a runtime index, `Field<S, I, F>` for a constant one,
 synthesized per struct), under the same rule as const generics — legal wherever it folds at compile
 time, no hint. What makes "apply to every layer" (training a user `Network` without a hand-written

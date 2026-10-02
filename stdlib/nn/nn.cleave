@@ -16,9 +16,8 @@
 // none of them write `use linalg;` themselves). `mean`'s own `.to()` call
 // needs `convert` too, transitively resolved the identical way. `dense_
 // xavier`/`dense_he`'s own `uniform`/`normal` calls need `rand` the same
-// way; `Optimizer<Opt, Dense<T,In,Out>>` below needs `optim` (`Optimizer`
-// itself, plus `Sgd`/`Momentum`'s own leaf-level `Tensor` impls it forwards
-// into) for the identical reason.
+// way; `Trainable<Dense<T,In,Out>>` below needs `optim` (`Trainable`, and
+// the `Optimizer` impls a `Dense` is trained by) for the identical reason.
 use linalg;
 use convert;
 use rand;
@@ -399,39 +398,9 @@ impl<T: Float + Rand + Ring, const In: i32, const Out: i32> Init<Dense<T, In, Ou
     fn he() { Dense(w: Init::he(), b: Ring::zero()) }
 }
 
-// `doc/backlog.md`'s own "Optimizer" item -- one impl, generic over `Opt`
-// *and* `State` itself, covers *every* optimizer `optim.cleave` ever
-// declares a leaf-level impl for (`Sgd`, `Momentum`, `Adam`, and anything
-// added later) -- the body never calls a method on `opt` directly, only
-// forwards it into `Optimizer::step`/`init_state` on `.w`/`.b`, which
-// redispatch on their own to whichever concrete optimizer `opt` actually
-// is. No bound needed on `Opt` at all.
-//
-// `DenseState<StateW, StateB>`, not `Dense<StateW, StateB>` reused -- `w`/
-// `b` each need their *own* state type (`w: Tensor<T,In,Out>`'s own state
-// under `Adam` is `AdamState<T,In,Out>`, `b: Tensor<T,1,Out>`'s own is
-// `AdamState<T,1,Out>` -- two different concrete types, `Dense`'s own two
-// fields are already differently-shaped tensors for the identical reason).
-// `optim.cleave`'s own module doc comment has the full story of why `State`
-// became a real, independent target at all (`Adam` needing two accumulators
-// per tensor, impossible to express as long as `State` was forced to equal
-// `Model`) -- and `doc/backlog.md`'s own "composing algebra impl generic
-// over `Opt`..." entry has the story of the real, deep compiler limitation
-// that used to make composing this way silently break, now fixed.
-struct DenseState<StateW, StateB> { w: StateW, b: StateB }
-
-impl<Opt, StateW, StateB, T: Float + Ring, const In: i32, const Out: i32>
-    Optimizer<Opt, Dense<T, In, Out>, DenseState<StateW, StateB>>
-{
-    fn init_state(opt, model) {
-        DenseState(w: Optimizer::init_state(opt, model.w), b: Optimizer::init_state(opt, model.b))
-    }
-    fn step(opt, model, grad, state) {
-        let rw = Optimizer::step(opt, model.w, grad.w, state.w);
-        let rb = Optimizer::step(opt, model.b, grad.b, state.b);
-        (Dense(w: rw.0, b: rb.0), DenseState(w: rw.1, b: rb.1))
-    }
-}
+// A layer is trained field by field (`w`, `b`), by `optim`'s one impl for
+// every `Trainable` model.
+impl<T: Float, const In: i32, const Out: i32> Trainable<Dense<T, In, Out>> {}
 
 algebra Sum<Container, T> {
     fn sum(c: Container) -> T;

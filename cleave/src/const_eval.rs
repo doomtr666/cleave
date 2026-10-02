@@ -46,6 +46,18 @@ pub fn eval_binop(op: &str, a: ConstValue, b: ConstValue) -> Option<ConstValue> 
         // compute the *wrong* answer instead of just missing an
         // optimization. See `ConstantFold::make`'s own `div` handling.
         ("div", ConstValue::Int(x), ConstValue::Int(y)) => (y != 0).then(|| ConstValue::Int(x / y)),
+        // Comparisons, so an `if` whose condition folds can be decided at
+        // compile time (`infer.rs`, `ExprKind::If`). Compared as signed: a
+        // folded `neg` is two's complement (`eval_unop`), so `-1 < 0` must
+        // read the bits as `i64` to come out right.
+        ("eq", x, y) => Some(ConstValue::Bool(x == y)),
+        ("neq", x, y) => Some(ConstValue::Bool(x != y)),
+        ("lt", ConstValue::Int(x), ConstValue::Int(y)) => Some(ConstValue::Bool((x as i64) < (y as i64))),
+        ("le", ConstValue::Int(x), ConstValue::Int(y)) => Some(ConstValue::Bool((x as i64) <= (y as i64))),
+        ("gt", ConstValue::Int(x), ConstValue::Int(y)) => Some(ConstValue::Bool((x as i64) > (y as i64))),
+        ("ge", ConstValue::Int(x), ConstValue::Int(y)) => Some(ConstValue::Bool((x as i64) >= (y as i64))),
+        ("and", ConstValue::Bool(x), ConstValue::Bool(y)) => Some(ConstValue::Bool(x && y)),
+        ("or", ConstValue::Bool(x), ConstValue::Bool(y)) => Some(ConstValue::Bool(x || y)),
         _ => None,
     }
 }

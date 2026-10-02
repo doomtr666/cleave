@@ -317,7 +317,12 @@ pub fn compile(
         .map(|program| synthesize_tuple_structs(program, &mut node_ids))
         .map(|program| synthesize_heap_struct_marker_impls(program, &mut node_ids))
         .map(|program| synthesize_len_impls(program, &mut node_ids))
+        .map(|program| synthesize_collect_impls(program, &mut node_ids))
         .map(crate::resolve::resolve_calls)
+        .map(|mut program| {
+            crate::unroll::prune_constant_ifs(&mut program);
+            program
+        })
         .map(|program| crate::unroll::unroll_heterogeneous_loops(program, &mut node_ids));
     (result, sources)
 }
@@ -589,6 +594,186 @@ fn synthesize_len_impls(mut program: Program, node_ids: &mut NodeIdGen) -> Progr
     }
     program.items.extend(synthesized);
     program
+}
+
+/// Synthesizes the `Collect` impls a comprehension's result can take besides
+/// its default (`doc/plan-compile-time-sequences.md`): for every plain struct,
+/// `impl<..> Collect<S<..>, (F0, .., Fn-1)> { fn collect(x) { S(f0: x[0], ..) } }`
+/// (the field types as a tuple; the field type itself for a one-field
+/// struct), so `let net: Network = [for i in ...]` rebuilds a `Network`; and
+/// for every array length `impl<T> Collect<[T; N], (T, .., T)>`. Data read off
+/// the declarations, like `synthesize_len_impls`, and skipped the same way for
+/// a struct the program writes its own `Collect` impl for. A no-op when no
+/// `Collect` algebra is loaded.
+fn synthesize_collect_impls(mut program: Program, node_ids: &mut NodeIdGen) -> Program {
+    let has_collect = program
+        .items
+        .iter()
+        .any(|item| matches!(&item.kind, ItemKind::Algebra(a) if a.name == "Collect"));
+    if !has_collect {
+        return program;
+    }
+    let written: std::collections::HashSet<String> = program
+        .items
+        .iter()
+        .filter_map(|item| match &item.kind {
+            ItemKind::Impl(d) if d.algebra == "Collect" => match &d.target.kind {
+                TypeKind::Path(p, _) => Some(p.segments.join("::")),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    let tagged = crate::cps::collect_mlir_types(&program);
+    let span = Span {
+        file: FileId(0),
+        start: 0,
+        end: 0,
+    };
+    let mut b = AstBuilder { ids: node_ids, span };
+    let mut synthesized = Vec::new();
+    for item in &program.items {
+        let ItemKind::Struct(d) = &item.kind else {
+            continue;
+        };
+        if d.fields.is_empty()
+            || d.fields.len() > MAX_TUPLE_ARITY
+            || tagged.contains_key(&d.name)
+            || d.generics.iter().any(|g| g.is_variadic())
+            || written.contains(&d.name)
+            || crate::infer::is_tuple_struct_name(&d.name)
+        {
+            continue;
+        }
+        let args = d.generics.iter().map(|g| GenericArg::Type(b.named_type(g.name()))).collect();
+        let target = b.ty(TypeKind::Path(Path::single(d.name.clone()), args));
+        let field_types: Vec<Type> = d.fields.iter().map(|f| b.renumbered_type(&f.ty)).collect();
+        let fields: Vec<(String, Expr)> = d
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.name.clone(), b.element(d.fields.len(), i)))
+            .collect();
+        let body = b.expr(ExprKind::StructLit(Path::single(d.name.clone()), Vec::new(), fields));
+        let source = b_tuple_or_single(&mut b, field_types);
+        synthesized.push(b.collect_impl(d.generics.clone(), target, source, body));
+    }
+    for n in 2..=MAX_TUPLE_ARITY {
+        let generics = vec![GenericParam::Type {
+            name: "T".to_string(),
+            bounds: Vec::new(),
+            variadic: false,
+        }];
+        let len = b.expr(ExprKind::NumberLit {
+            text: n.to_string(),
+            suffix: Some("i32".to_string()),
+        });
+        let elem = b.named_type("T");
+        let target = b.ty(TypeKind::Array(Box::new(elem), Box::new(len)));
+        let elements: Vec<Type> = (0..n).map(|_| b.named_type("T")).collect();
+        let source = b_tuple_or_single(&mut b, elements);
+        let elements: Vec<Expr> = (0..n).map(|i| b.element(n, i)).collect();
+        let body = b.expr(ExprKind::ArrayLit(elements));
+        synthesized.push(b.collect_impl(generics, target, source, body));
+    }
+    program.items.extend(synthesized);
+    program
+}
+
+/// The source type of a synthesized `Collect` impl: the tuple of `types`, or
+/// the one type itself.
+fn b_tuple_or_single(b: &mut AstBuilder, mut types: Vec<Type>) -> Type {
+    if types.len() == 1 {
+        return types.pop().unwrap();
+    }
+    let name = tuple_struct_name(types.len());
+    b.ty(TypeKind::Path(Path::single(name), types.into_iter().map(GenericArg::Type).collect()))
+}
+
+/// Fresh-id AST nodes for the synthesized impls above.
+struct AstBuilder<'a> {
+    ids: &'a mut NodeIdGen,
+    span: Span,
+}
+
+impl AstBuilder<'_> {
+    fn ty(&mut self, kind: TypeKind) -> Type {
+        Node {
+            id: self.ids.next(),
+            span: self.span,
+            kind,
+        }
+    }
+
+    fn expr(&mut self, kind: ExprKind) -> Expr {
+        Node {
+            id: self.ids.next(),
+            span: self.span,
+            kind,
+        }
+    }
+
+    fn named_type(&mut self, name: &str) -> Type {
+        self.ty(TypeKind::Path(Path::single(name.to_string()), Vec::new()))
+    }
+
+    fn renumbered_type(&mut self, t: &Type) -> Type {
+        let mut t = t.clone();
+        crate::unroll::renumber_type(&mut t, self.ids);
+        t
+    }
+
+    /// `x[i]` of the source `x` of a `count`-element collect; `x` itself
+    /// when there is only one.
+    fn element(&mut self, count: usize, i: usize) -> Expr {
+        let x = self.expr(ExprKind::Path(Path::single("x")));
+        if count == 1 {
+            return x;
+        }
+        let index = self.expr(ExprKind::NumberLit {
+            text: i.to_string(),
+            suffix: None,
+        });
+        self.expr(ExprKind::Index(Box::new(x), vec![index]))
+    }
+
+    fn collect_impl(&mut self, generics: Vec<GenericParam>, target: Type, source: Type, body: Expr) -> Item {
+        let collect = FnDecl {
+            name: "collect".to_string(),
+            attrs: Vec::new(),
+            is_extern: false,
+            extern_symbol: None,
+            is_export: false,
+            export_symbol: None,
+            generics: Vec::new(),
+            params: vec![Param {
+                name: "x".to_string(),
+                ty: None,
+                mutable: false,
+            }],
+            ret: None,
+            body: Some(Block {
+                stmts: Vec::new(),
+                tail: Some(Box::new(body)),
+            }),
+            derivative_of: None,
+            is_grad: false,
+            grad_target_param: None,
+            grad_target_index: None,
+        };
+        Node {
+            id: self.ids.next(),
+            span: self.span,
+            kind: ItemKind::Impl(ImplDecl {
+                attrs: Vec::new(),
+                algebra: "Collect".to_string(),
+                generics,
+                target,
+                extra_targets: vec![source],
+                fns: vec![collect],
+            }),
+        }
+    }
 }
 
 /// `fprime = derive(f, x);` (`grammar.pest`'s own `derive_decl`, lowered by

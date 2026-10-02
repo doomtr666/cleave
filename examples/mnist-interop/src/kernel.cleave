@@ -21,35 +21,8 @@ struct Network {
     l3: Dense<f32, 256, 128>,
     l4: Dense<f32, 128, 10>
 }
-struct NetworkState<StateL1, StateL2, StateL3, StateL4> {
-    l1: StateL1,
-    l2: StateL2,
-    l3: StateL3,
-    l4: StateL4
-}
-
-impl<Opt, StateL1, StateL2, StateL3, StateL4>
-    Optimizer<Opt, Network, NetworkState<StateL1, StateL2, StateL3, StateL4>>
-{
-    fn init_state(opt, model) {
-        NetworkState(
-            l1: init_state(opt, model.l1),
-            l2: init_state(opt, model.l2),
-            l3: init_state(opt, model.l3),
-            l4: init_state(opt, model.l4)
-        )
-    }
-    fn step(opt, model, grad, state) {
-        let (l1, s1) = step(opt, model.l1, grad.l1, state.l1);
-        let (l2, s2) = step(opt, model.l2, grad.l2, state.l2);
-        let (l3, s3) = step(opt, model.l3, grad.l3, state.l3);
-        let (l4, s4) = step(opt, model.l4, grad.l4, state.l4);
-        (
-            Network(l1: l1, l2: l2, l3: l3, l4: l4),
-            NetworkState(l1: s1, l2: s2, l3: s3, l4: s4)
-        )
-    }
-}
+// Trained field by field by `nn`'s one optimizer impl for marked models.
+impl Trainable<Network> {}
 
 fn load_train_batch_input(batch_start: i32) -> Tensor<f32, 32, 784> {
     let mut pixels: [[f32; 784]; 32] = mlir::memref::alloc();

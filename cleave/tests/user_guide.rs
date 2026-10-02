@@ -459,6 +459,23 @@ fn an_impl_over_a_pack_of_types() {
 }
 
 #[test]
+fn a_comprehension_takes_its_type_from_context() {
+    let context = context();
+    let src = "
+        struct Pair { a: i32, b: f64 }
+        fn twice(x) { x + x }
+        fn main() -> i32 {
+            let squares = [for i in 0..4: i * i];
+            let p = Pair(a: 1, b: 2.5);
+            let t = [for i in 0..p.len(): twice(p[i])];
+            let q: Pair = [for i in 0..p.len(): twice(p[i])];
+            if squares[3] == 9 and t[1] == 5.0 and q.b == 5.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+#[test]
 fn how_a_call_finds_what_it_calls() {
     let context = context();
     let src = "

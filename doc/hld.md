@@ -109,9 +109,10 @@ requiring an annotation, the access becomes part of `first`'s scheme as a constr
 of type `r`" (`infer.rs::FieldConstraint`), carried and instantiated exactly like an algebra constraint:
 each call site re-checks it once its argument pins `v` to a real struct, which gives `r`; a struct without
 the field is an error at that point. Types reached only through fields (`n.inner` in `n.inner.x`) are
-quantified along with the base, and monomorphization re-infers such a function per concrete
-instantiation, arguments *and* result (`monomorphize.rs::detect_duck_typed_fns`), since substitution
-alone can't produce types its signature never mentions. This is HM with records-as-constraints (Haskell's
+quantified along with the base, and monomorphization infers every generic function per concrete
+instantiation, arguments *and* result (`monomorphize.rs::InstanceEngine`,
+`doc/plan-instance-inference.md`), since substitution alone can't produce types its signature never
+mentions. This is HM with records-as-constraints (Haskell's
 `HasField`), not C++-style unchecked templates: the function is still checked once, generically.
 
 ### Soundness/governance — v1 trust model: no proof kernel

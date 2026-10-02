@@ -129,8 +129,6 @@ pub struct ProgramInference {
     /// group, failed ones included: a loop whose body indexes a struct or
     /// tuple by its variable can't type-check before it is unrolled.
     pub unroll_requests: Vec<(NodeId, u64, u64)>,
-    /// Concrete uses of impls over packs (`Infer::pack_impl_uses`).
-    pub pack_impl_uses: Vec<(String, Vec<Ty>)>,
 }
 
 /// Whether `f` is a root of the program that is never generalized: `main` or
@@ -197,7 +195,6 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
     // environment" purely by numeric coincidence.
     let mut next_var_id: u32 = 0;
     let mut unroll_requests: Vec<(NodeId, u64, u64)> = Vec::new();
-    let mut pack_impl_uses: Vec<(String, Vec<Ty>)> = Vec::new();
 
     for group in &sccs {
         let mut infer = Infer::new(registry).with_var_counter_starting_at(next_var_id);
@@ -412,6 +409,7 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
 
         // Field accesses whose base became concrete resolve before
         // defaulting, so a field's declared type wins over a literal default.
+        infer.settle_collect_targets();
         if let Err(e) = infer.resolve_ready_field_accesses() {
             for name in group {
                 if let Some(r @ Ok(_)) = raw_results.get_mut(name) {
@@ -420,6 +418,7 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
             }
         }
         infer.apply_defaults();
+        let _ = infer.fold_late_comprehensions();
         // A constraint failure here is a property of the group's mutual
         // definition as a whole, not attributable to one specific member —
         // reported against every member whose own body-inference otherwise
@@ -543,11 +542,6 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
             (*id, s)
         }));
         unroll_requests.extend(infer.unroll_requests.drain(..));
-        for u in infer.pack_impl_uses.drain(..) {
-            if !pack_impl_uses.contains(&u) {
-                pack_impl_uses.push(u);
-            }
-        }
         next_var_id = infer.var_counter();
     }
 
@@ -558,7 +552,6 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
         global_env,
         next_var_id,
         unroll_requests,
-        pack_impl_uses,
     }
 }
 

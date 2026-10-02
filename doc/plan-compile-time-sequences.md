@@ -274,17 +274,46 @@ redefine positional access for a struct.
    - 2b ✅ (2026-10-02) impls over a pack of types: `impl<Ts...: Print> Print<Ts...>` replaces the
      fifteen per-arity tuple impls in `stdlib/io/io.cleave`. A type pack used as a whole type is the
      tuple of its elements (`infer.rs::TUPLE_OF_PACK`, unifying with any `__TupleN`), a bound on a pack
-     holds element by element (`has_matching_impl`), and such an impl is a template: `unroll.rs` takes
-     it out of the program and adds one concrete impl per tuple type the trial inference finds it used
-     at, whose loop then unrolls like any other. The template's body is checked per instance, the same
+     holds element by element (`has_matching_impl`), and each concrete tuple type it is used at is an
+     ordinary instance (`doc/plan-instance-inference.md`), whose loop unrolls on its own copy of the
+     body. The template's body is checked per instance, the same
      posture every generic impl body already has in cleave (checked permissively, real errors at
      instantiation); checking generic bodies once with rigid type variables would be new for all
      generic code, not specific to packs (`doc/backlog.md`).
-   - Brought forward: an `if` whose condition folds should keep only its taken branch (listed under
-     step 7) — the first natural unrolled loop (`if i == 1 { a = a + t[i] } else { b = b + t[i] }`)
-     needs it, since every copy otherwise type-checks both branches.
-3. Comprehensions through `Collect` (tensors, synthesized for structs); `Optimizer` for marked structs; the MNIST kernel without its hand-written
-   `impl Optimizer` and `NetworkState`.
+   - ✅ (2026-10-02) brought forward from step 7: an `if` whose condition folds from the syntax alone
+     (literals and operators, which every unrolled copy's index is) is replaced by its taken branch
+     before inference (`unroll.rs::prune_constant_ifs`, run after name resolution and after every
+     unrolling round), so a dead branch never has to type-check. A condition that only folds per
+     instantiation (`if N > 100` with `N` a const generic) still types both branches.
+3. ✅ (2026-10-02) Comprehensions through `Collect`; `Optimizer` for marked structs; the MNIST kernel
+   without its hand-written `impl Optimizer` and `NetworkState`.
+   - `[for i in a..b: e]` lowers to a call `<comprehension>(a, b, fn(i) { e })` (no new AST node).
+     Inference asks for its rewrite once the bounds fold (`Infer::unroll_requests`, like an unrolled
+     `for`), and `unroll.rs` replaces it with `Collect::collect((e0, e1, ...))`. Bounds that only fold
+     once the body is fully inferred (`0..updated.len()`, `updated` another comprehension) are tried
+     again after defaulting (`fold_late_comprehensions`). Bounds naming only concretely typed values
+     that don't fold are an error at once; in generic code they wait for the instance.
+   - The target comes from the context like a literal's: `let net: Network = [...]`, `step`'s declared
+     `-> (Model, State)`. When the context fixes it, the one `Collect` impl that fits types the elements
+     before their literals default (`let v: [f64; 3] = [for i in 0..3: 0.5]`). Otherwise the default
+     (`infer.rs::CollectDefault`): an array when every element has the same scalar (or array) type, the
+     tuple otherwise. Arrays of tensors or structs aren't a default yet: not every backend path
+     represents them (`doc/backlog.md`).
+     The call carries a mark (`ast::comprehension_collect`) so an explicit `collect(x)` gets no default.
+   - `stdlib/core`: `algebra Collect<Target, Source>` and the identity impl. Synthesized
+     (`driver.rs::synthesize_collect_impls`): one per plain struct, from the tuple of its field types
+     (the field type itself for a one-field struct), and one per array length 2..16.
+   - Not yet: `Collect` for tensors (initialization by formula), runtime-length comprehensions
+     (`DynArray`).
+   - Found on the way: an array literal whose rows are arrays read out of a struct (`[t[0], t[1]]`)
+     reached the memref copy with an inline-array pointer (fixed, `mlir_lower.rs::
+     copy_inline_array_row`); a generic impl's bound was checked against a stale type variable in
+     monomorphization, so a bounded impl matched types failing its bound (fixed, `generic_bounds` now
+     holds the representative); a comprehension collected into its own tuple emitted an identity call
+     that kept the e-graph pass from inlining `Optimizer::step` per field (MNIST about 1 s slower; now
+     no call, `cps.rs`, and `doc/backlog.md`); a comprehension's result indexed inside a generic impl
+     (`let u = [for ...]; u[0]`) broke the impl's own generic-level inference (now opaque until its
+     instance, `Infer::opaque_comprehensions`).
 4. Arrays also through `Index` (and its writing counterpart) in the prelude, on top of the primitive
    array load/store, not replacing it.
 5. Slices.

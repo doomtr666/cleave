@@ -5734,6 +5734,135 @@ fn an_impl_over_a_pack_of_types_covers_every_tuple_of_showable_elements() {
     assert_eq!(run_i32(&context, src), 1);
 }
 
+/// An `if` whose condition folds from the syntax alone keeps only its taken
+/// branch (`unroll.rs::prune_constant_ifs`), so in a loop unrolled over a
+/// tuple each copy only type-checks the branch that fits its element.
+#[test]
+fn an_if_on_a_folding_condition_keeps_only_its_taken_branch() {
+    let context = context();
+    let src = "
+        fn main() -> i32 {
+            let t = (7, 2.5, 9);
+            let mut ints = 0;
+            let mut floats = 0.0;
+            for i in 0..t.len() {
+                if i == 1 { floats = floats + t[i]; } else { ints = ints + t[i]; };
+            };
+            let dead = if 1 > 2 { true + 1 } else { 5 };
+            if ints == 16 and floats == 2.5 and dead == 5 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// `[for i in a..b: e]` is the tuple of one `e` per index (`unroll.rs`):
+/// elements may differ in type, so mapping over a tuple keeps each element's
+/// own type; one index gives the element itself; comprehensions nest; bounds
+/// can come from a collection's `len`.
+#[test]
+fn a_comprehension_is_the_tuple_of_its_copies() {
+    let context = context();
+    let src = "
+        fn twice(x) { x + x }
+        fn main() -> i32 {
+            let squares = [for i in 0..4: i * i];
+            let t = (3, 1.5);
+            let doubled = [for i in 0..t.len(): twice(t[i])];
+            let one = [for i in 2..3: i + 10];
+            let grid = [for i in 0..2: [for j in 0..3: i * 10 + j]];
+            if squares[3] == 9 and doubled[0] == 6 and doubled[1] == 3.0 and one == 12
+                and grid[1][2] == 12 and squares.len() == 4 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// A comprehension in generic code is rewritten per instance, where the
+/// collection's length is known.
+#[test]
+fn a_comprehension_in_a_generic_fn_unrolls_per_instance() {
+    let context = context();
+    let src = "
+        fn doubled(t) { [for i in 0..t.len(): t[i] + t[i]] }
+        fn main() -> i32 {
+            let a = doubled((1, 2.5));
+            let b = doubled((1, 2, 3));
+            if a[1] == 5.0 and b[2] == 6 and b.len() == 3 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// A comprehension's type comes from its context, like a literal's
+/// (`Collect`): a struct is rebuilt from its fields' values, an annotated
+/// array is an array. With no context, same-typed elements make an array
+/// (indexable at run time), differently-typed ones a tuple.
+#[test]
+fn a_comprehension_takes_its_type_from_context() {
+    let context = context();
+    let src = "
+        struct Pair { a: i32, b: f64 }
+        fn main() -> i32 {
+            let p = Pair(a: 1, b: 2.5);
+            let q: Pair = [for i in 0..p.len(): p[i] + p[i]];
+            let v: [f64; 3] = [for i in 0..3: 0.5];
+            let squares = [for i in 0..4: i * i];
+            let mut s = 0;
+            for k in 0..4 { s = s + squares[k]; };
+            let mixed = [for i in 0..p.len(): p[i]];
+            if q.a == 2 and q.b == 5.0 and v[2] == 0.5 and s == 14 and mixed[1] == 2.5 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// A comprehension in a generic impl's body unrolls per instance, like one in
+/// a generic fn.
+#[test]
+fn a_comprehension_in_a_generic_impl_unrolls_per_instance() {
+    let context = context();
+    let src = "
+        algebra Twice<T, R> { fn twice(x: T) -> R; }
+        impl<A, B> Twice<(A, B), (A, B)> {
+            fn twice(x) {
+                let u = [for i in 0..2: x[i] + x[i]];
+                (u[0], u[1])
+            }
+        }
+        fn main() -> i32 {
+            let r = twice((1, 2.5));
+            if r[0] == 2 and r[1] == 5.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// An array literal whose elements are arrays read out of a tuple.
+#[test]
+fn an_array_of_arrays_read_out_of_a_tuple() {
+    let context = context();
+    let src = "
+        fn main() -> i32 {
+            let t = ([1, 2, 3], [4, 5, 6]);
+            let g = [t[0], t[1]];
+            g[1][2]
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 6);
+}
+
+/// A comprehension whose bounds never fold is an error, not a guess.
+#[test]
+fn a_comprehension_over_runtime_bounds_is_rejected() {
+    let errors = type_errors(
+        "
+        fn f(n: i32) -> i32 { let t = [for i in 0..n: i]; 0 }
+        fn main() -> i32 { f(3) }
+    ",
+    );
+    assert!(errors.iter().any(|e| e.contains("compile time")), "got: {errors:?}");
+}
+
 fn type_errors(src: &str) -> Vec<String> {
     let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
@@ -6793,6 +6922,36 @@ fn optimizer_composes_correctly_one_level_up_through_dense() {
                 and m.b[0, 0] > 4.899 and m.b[0, 0] < 4.901
                 and m.b[0, 1] > 5.899 and m.b[0, 1] < 5.901
             { 1 } else { 0 }
+        }";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// A model marked `Trainable` needs no optimizer code of its own: `optim`'s
+/// one impl updates it field by field, two levels deep here (`Net` of
+/// `Dense`s), with a stateful optimizer whose state type no one declares.
+#[test]
+fn a_trainable_struct_is_optimized_field_by_field() {
+    let context = context();
+    let src = "
+        use nn;
+        struct Net { l1: Dense<f32, 2, 2>, l2: Dense<f32, 1, 2> }
+        impl Trainable<Net> {}
+        fn main() -> i32 {
+            let opt = Momentum(lr: 1.0, beta: 0.5);
+            let w: Tensor<f32, 2, 2> = Tensor::<f32, 2, 2>(data: [[1.0, 2.0], [3.0, 4.0]]);
+            let b: Tensor<f32, 1, 2> = Tensor::<f32, 1, 2>(data: [[5.0, 6.0]]);
+            let w2: Tensor<f32, 1, 2> = Tensor::<f32, 1, 2>(data: [[7.0, 8.0]]);
+            let net = Net(l1: Dense(w: w, b: b), l2: Dense(w: w2, b: b));
+            let gw: Tensor<f32, 2, 2> = Tensor::<f32, 2, 2>(data: [[0.2, 0.2], [0.2, 0.2]]);
+            let gb: Tensor<f32, 1, 2> = Tensor::<f32, 1, 2>(data: [[0.2, 0.2]]);
+            let grad = Net(l1: Dense(w: gw, b: gb), l2: Dense(w: gb, b: gb));
+            let state = init_state(opt, net);
+            let (net, state) = step(opt, net, grad, state);
+            let (net, state) = step(opt, net, grad, state);
+            // v1 = 0.1, v2 = 0.15: each parameter moves by 0.25 in total.
+            let a = net.l1.w[1, 1];
+            let c = net.l2.w[0, 0];
+            if a > 3.749 and a < 3.751 and c > 6.749 and c < 6.751 { 1 } else { 0 }
         }";
     assert_eq!(run_i32(&context, src), 1);
 }

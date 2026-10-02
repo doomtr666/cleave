@@ -905,6 +905,37 @@ impl Lowerer {
         acc
     }
 
+    /// `[for i in a..b: e]` => `<comprehension>(a, b, fn(i) { e })`
+    /// (`ast::COMPREHENSION`).
+    fn lower_comprehension(&mut self, pair: Pair<Rule>) -> Expr {
+        let span = self.span_of(&pair);
+        let mut inner = pair.into_inner();
+        let var = inner.next().unwrap().as_str().to_string();
+        let start = self.lower_additive(inner.next().unwrap());
+        let end = self.lower_additive(inner.next().unwrap());
+        let body = self.lower_expr(inner.next().unwrap());
+        let body_span = body.span;
+        let lambda = self.wrap(
+            body_span,
+            ExprKind::Lambda {
+                params: vec![Param {
+                    name: var,
+                    ty: None,
+                    mutable: false,
+                }],
+                ret: None,
+                body: Block {
+                    stmts: Vec::new(),
+                    tail: Some(Box::new(body)),
+                },
+            },
+        );
+        self.wrap(
+            span,
+            ExprKind::Call(Path::single(COMPREHENSION), Vec::new(), vec![start, end, lambda], Vec::new()),
+        )
+    }
+
     fn lower_unary(&mut self, pair: Pair<Rule>) -> Expr {
         let span = self.span_of(&pair);
         let mut inner = pair.into_inner();
@@ -1104,6 +1135,7 @@ impl Lowerer {
             Rule::if_expr => self.lower_if_expr(inner),
             Rule::while_expr => self.lower_while_expr(inner),
             Rule::for_expr => self.lower_for_expr(inner),
+            Rule::comprehension => self.lower_comprehension(inner),
             Rule::loop_expr => self.lower_loop_expr(inner),
             Rule::array_lit => self.lower_array_lit(inner),
             Rule::lambda_expr => self.lower_lambda_expr(inner),

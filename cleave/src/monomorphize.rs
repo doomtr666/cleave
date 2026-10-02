@@ -83,13 +83,14 @@
 //! b: B) -> C;`, exactly `MatMul`'s own shape).
 
 use crate::ast::*;
-use crate::callgraph::{self, ProgramInference};
+use crate::callgraph::{self, FnResult, ProgramInference};
 use crate::cps::{StructSchema, collect_struct_schemas};
 use crate::dump::{TyVarNames, dump_block_with_call_names, fmt_ty_named};
 use crate::infer::{
-    ConstValue, Env, Infer, Scheme, Subst, Ty, TyVar, TyVarGen, TypeError, TypeErrorKind,
-    find_placeholder_name, free_vars, substitute, unify,
+    ConstValue, Env, Infer, InstanceOracle, Scheme, Subst, Ty, TyVar, TyVarGen, TypeError,
+    TypeErrorKind, free_vars, substitute, unify,
 };
+use std::cell::{Cell, RefCell};
 use crate::mlir_lower::struct_field_types;
 use crate::registry::Registry;
 use std::collections::{HashMap, HashSet};
@@ -98,6 +99,7 @@ use std::fmt::Write as _;
 /// One concrete instantiation — of a top-level `fn` or of a generic
 /// algebra-impl method alike, the point where the two worklists below
 /// converge back into one shared shape (see the module's own doc comment).
+#[derive(Clone)]
 struct Specialization {
     params: Vec<Param>,
     body: Block,
@@ -260,6 +262,11 @@ impl MonomorphizedProgram {
 pub(crate) struct ImplTemplate {
     algebra: String,
     method_name: String,
+    /// The impl's own declaration — its generics, targets and this method —
+    /// for inferring an instance of it (`InstanceEngine::specialize_impl`).
+    impl_generics: Vec<GenericParam>,
+    impl_targets: Vec<Type>,
+    decl: FnDecl,
     params: Vec<Param>,
     body: Block,
     param_patterns: Vec<Ty>,
@@ -371,7 +378,6 @@ pub fn monomorphize(
         &mut shared_vars,
     );
     let lambda_exprs = index_lambda_exprs(program, &program_inference.lambda_schemes);
-    let duck_typed_fns = detect_duck_typed_fns(&functions, &program_inference);
 
     let mut mono = MonomorphizedProgram {
         specializations: HashMap::new(),
@@ -384,13 +390,81 @@ pub fn monomorphize(
     let mut impl_worklist: Vec<(usize, HashMap<TyVar, Ty>)> = Vec::new();
     let mut lambda_worklist: Vec<(NodeId, Vec<Ty>, String)> = Vec::new();
 
-    // `seed_derive_tensor_field_indices`'s own doc comment -- every
-    // `derive()`d function's own parameter types need every `Tensor`-typed
-    // field, at any struct-nesting depth, seeded into `impl_worklist` up
-    // front: `egraph.rs::synthesize_derivatives` (run later, once monomorph-
-    // ization is done) needs a real `Index::index<Tensor<...>,...>` unit to
-    // already exist for each one, whether or not the program's own source
-    // ever indexes it explicitly.
+    // The instance engine (`doc/plan-instance-inference.md`): every
+    // specialization below is an instance it infers, generic functions and
+    // impl methods alike. It owns copies of what it reads, so the passes
+    // below can still update `program_inference`.
+    let engine = InstanceEngine::new(
+        registry,
+        &functions,
+        &templates,
+        program_inference.global_env.clone(),
+        program_inference.lambda_schemes.clone(),
+        shared_vars,
+    );
+
+    // Non-generic functions (`main`, ...) inferred again as instances: every
+    // call into a generic callee gets the result type of that callee's own
+    // instance — what an output-only type (an optimizer's state, built by
+    // `init_state`'s body) needs to reach its caller at all.
+    for (name, f) in &functions {
+        if f.is_extern || f.derivative_of.is_some() {
+            continue;
+        }
+        let Some(body) = &f.body else { continue };
+        // A fn whose scheme-level inference failed has no scheme: inferred
+        // from its own annotations, and kept only if that comes out concrete.
+        let params: Vec<Ty> = match program_inference.global_env.get(*name) {
+            Some(scheme) if scheme.vars.is_empty() => {
+                let Ty::Fn(params, _) = &scheme.ty else { continue };
+                params.clone()
+            }
+            Some(_) => continue,
+            None if f.generics.is_empty() => {
+                let mut vars = engine.vars.get();
+                let params = f.params.iter().map(|_| vars.fresh()).collect();
+                engine.vars.set(vars);
+                params
+            }
+            None => continue,
+        };
+        let mut infer = Infer::new_with_vars(registry, engine.vars.get()).with_oracle(&engine);
+        let outcome =
+            infer.infer_fn_with_concrete_params(f, params.clone(), None, &program_inference.global_env, None);
+        engine.vars.set(infer.current_vars());
+        let Ok(result) = outcome else { continue };
+        let result = infer.subst.apply(&result);
+        let params: Vec<Ty> = params.iter().map(|p| infer.subst.apply(p)).collect();
+        if !is_fully_concrete(&result) || !params.iter().all(is_fully_concrete) {
+            continue;
+        }
+        if infer.instance_call_names.is_empty() {
+            continue;
+        }
+        // A root that only type-checks through its callees' instances (`let
+        // a = f(t); a[1]`, `f`'s result unknown from its scheme alone): this
+        // inference supersedes the scheme-level one's error.
+        if let Some(entry @ Err(_)) = program_inference.results.get_mut(*name) {
+            program_inference.global_env.insert(
+                name.to_string(),
+                Scheme::mono(Ty::Fn(params.clone(), Box::new(result.clone()))),
+            );
+            *entry = Ok(FnResult {
+                param_types: params,
+                result,
+            });
+        }
+        let mut exprs = Vec::new();
+        collect_exprs_block(body, &mut exprs);
+        program_inference.node_types.extend(
+            exprs
+                .iter()
+                .filter_map(|e| infer.node_types.get(&e.id).map(|t| (e.id, t.clone())))
+                .filter(|(_, t)| is_fully_concrete(t)),
+        );
+        mono.seed_call_names.extend(infer.instance_call_names.clone());
+    }
+
     let struct_schemas = collect_struct_schemas(program);
     for item in &program.items {
         let ItemKind::Fn(f) = &item.kind else {
@@ -502,214 +576,43 @@ pub fn monomorphize(
         );
     }
 
-    // The four worklists below aren't independent — draining one can push
-    // fresh work onto an *earlier* one (found directly, not anticipated: a
-    // generic inherent-impl method's body calling a still-generic algebra
-    // method — `Dense::forward` calling `matmul`, `stdlib/nn/nn.cleave` —
-    // discovered only while draining `inherent_worklist`, last in sequence,
-    // yet needing a new `impl_worklist` entry, third-to-last; every prior
-    // generic inherent method's own body only ever called concrete/extern
-    // ops, so this never came up before). Single-pass sequential draining
-    // (fn -> impl -> lambda -> inherent, each fully emptied before the next
-    // starts) silently drops any such "backward" push once its own loop has
-    // already finished — the callee never gets a `mono.specializations`
-    // entry at all, yet `call_names` (computed *during* that same drain)
-    // still records the mangled name as if it existed, so the failure only
-    // surfaces much later, as `cps.rs`'s own "call_names resolved ... but no
-    // such unit exists" panic. Fixed by re-running all four passes to a real
-    // fixed point — `mono.specializations.contains_key` already guards every
-    // loop body against redoing (or infinitely repeating) already-finished
-    // work, so an extra pass over an empty worklist is always a cheap no-op.
-    //
-    // `resolved_target_sigs` — `doc/backlog.md`'s own "composing algebra
-    // impl generic over `Opt`..." entry has the full story of why this
-    // exists and what it replaces (an earlier, *wrong* attempt keyed by raw
-    // `TyVar`, defeated by `build_impl_templates` minting each method of the
-    // same `impl` block its own independent `Infer` — meaning `StateA`/
-    // `StateB` are *different*, unrelated `TyVar`s in `init_state`'s own
-    // frozen template and `step`'s own, even though they name the same
-    // declared generic). Keyed *structurally* instead — `(algebra name,
-    // every target position's own stringified type, "?" standing in for
-    // whichever one[s] are still open)` — so `step`'s own still-open `State`
-    // position, for a given concrete `(Opt, Model)`, can find whatever
-    // `init_state`'s own sibling specialization for that *same* `(Opt,
-    // Model)` already resolved it to, purely by matching on the shape both
-    // agree on, with no shared variable identity required at all. Grown
-    // every time a specialization's own `target_tys` end up fully concrete,
-    // whether that took the fallback below or not.
-    let mut resolved_target_sigs: HashMap<(String, Vec<String>), Vec<Ty>> = HashMap::new();
-    // Work items the fallback below couldn't resolve *yet* — nothing in
-    // `resolved_target_sigs` covered what they needed at the time they were
-    // popped. Held here instead of re-pushed onto `impl_worklist`
-    // immediately, which would just spin forever popping the identical,
-    // still-unresolvable item repeatedly within *this* drain pass, nothing
-    // else running in between to grow `resolved_target_sigs` at all.
-    // Drained back into `impl_worklist` for a real retry only once per
-    // *outer* pass — see the end of this same `loop` below.
-    let mut deferred_impl: Vec<(usize, HashMap<TyVar, Ty>, TypeError)> = Vec::new();
-    // A plain, generous retry-count cap, *not* a "did `resolved_target_sigs`
-    // grow since the last retry" check -- an earlier version of this used
-    // exactly that growth signal, and it's genuinely order-sensitive: which
-    // sibling specialization happens to get discovered and resolved before
-    // which other one is itself downstream of a plain `HashMap`'s own per-
-    // process-random iteration order somewhere in the seeding pass, so a
-    // real, correctly-resolvable program could report "no progress" and
-    // give up on some runs while succeeding on others, from the *same*
-    // source -- confirmed flaky (roughly 1 run in 6) by direct, repeated
-    // testing. A retry is cheap (a few `HashMap` lookups once already-
-    // resolved specializations dominate `resolved_target_sigs`), so a
-    // generous cap costs little even on the runs that never needed it, and
-    // it sidesteps the ordering-sensitivity question entirely rather than
-    // trying to detect it more cleverly.
-    const DEFERRED_IMPL_RETRY_LIMIT: u32 = 64;
-    let mut deferred_impl_retries: u32 = 0;
+    // Drained to a fixed point: an instance can discover more work for any
+    // worklist (`collect_instantiations` over its body), and so can the
+    // lambdas. Every function and impl-method instance is inferred by
+    // `engine`; lambdas are still specialized by substitution.
     loop {
+        merge_produced(&mut mono, engine.drain(), &templates, registry, &mut fn_worklist, &mut impl_worklist, &mut lambda_worklist);
+
         while let Some((name, concrete_tys)) = fn_worklist.pop() {
             let display = display_instantiation(&name, &concrete_tys);
             if mono.specializations.contains_key(&display) {
                 continue;
             }
-            let Some(&f) = functions.get(name.as_str()) else {
+            let Some(Scheme { vars, ty: Ty::Fn(param_pattern, ret_pattern), .. }) = program_inference.global_env.get(&name) else {
                 continue;
             };
-            let body = f
-                .body
-                .as_ref()
-                .expect("a top-level fn with a global_env scheme always has a body");
-
-            let (param_types, result, node_types) = if duck_typed_fns.contains(&name) {
-                // Duck-typed fallback (`detect_duck_typed_fns`'s own doc
-                // comment) — a real, separate re-inference for this one
-                // concrete call site, not substitution over the shared
-                // declaration-time template: substitution can never resolve an
-                // expression (field access, ...) whose own type genuinely
-                // depends on this call site's own concrete argument types,
-                // which the ordinary one-shot HM pass could never see.
-                // `concrete_tys` instantiates the scheme's *variables* (a
-                // field's result type among them), not the parameters: the
-                // parameter types come from the scheme's own signature.
-                let (concrete_params, concrete_ret): (Vec<Ty>, Option<Ty>) =
-                    match program_inference.global_env.get(&name) {
-                        Some(Scheme {
-                            vars,
-                            ty: Ty::Fn(param_pattern, ret_pattern),
-                            ..
-                        }) => {
-                            let mapping: HashMap<TyVar, Ty> =
-                                vars.iter().copied().zip(concrete_tys.iter().cloned()).collect();
-                            let ret = substitute(ret_pattern, &mapping);
-                            (
-                                param_pattern.iter().map(|p| substitute(p, &mapping)).collect(),
-                                is_fully_concrete(&ret).then_some(ret),
-                            )
-                        }
-                        _ => (concrete_tys.clone(), None),
-                    };
-                let mut infer = Infer::new(registry);
-                match infer.infer_fn_with_concrete_params(
-                    f,
-                    concrete_params,
-                    concrete_ret,
-                    &program_inference.global_env,
-                ) {
-                    Ok(result) => {
-                        let mut exprs = Vec::new();
-                        collect_exprs_block(body, &mut exprs);
-                        let node_types: HashMap<NodeId, Ty> = exprs
-                            .iter()
-                            .filter_map(|e| infer.node_types.get(&e.id).map(|t| (e.id, t.clone())))
-                            .collect();
-                        (infer.param_types.clone(), result, node_types)
-                    }
-                    Err(e) => {
-                        let tys = concrete_tys
-                            .iter()
-                            .map(|t| t.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ");
+            let mapping: HashMap<TyVar, Ty> = vars.iter().copied().zip(concrete_tys.iter().cloned()).collect();
+            let args: Vec<Ty> = param_pattern.iter().map(|p| substitute(p, &mapping)).collect();
+            if !args.iter().all(is_fully_concrete) {
+                continue;
+            }
+            let ret = substitute(ret_pattern, &mapping);
+            let scheme_args = concrete_tys.iter().all(is_fully_concrete).then_some(concrete_tys.as_slice());
+            match engine.specialize_fn(&name, &args, is_fully_concrete(&ret).then_some(&ret), scheme_args) {
+                Some((unit, _)) => alias_specialization(&mut mono, &engine, &unit, &display),
+                None => {
+                    if let Some(e) = engine.last_error.borrow_mut().take() {
                         mono.errors.push(TypeError {
                             span: e.span,
                             kind: TypeErrorKind::GenericFnInstantiationFailed {
                                 name: name.clone(),
-                                tys,
+                                tys: concrete_tys.iter().map(Ty::to_string).collect::<Vec<_>>().join(", "),
                                 inner: Box::new(e),
                             },
                         });
-                        continue;
                     }
                 }
-            } else {
-                let Some(scheme) = program_inference.global_env.get(&name) else {
-                    continue;
-                };
-                let Ty::Fn(param_pattern, ret_pattern) = &scheme.ty else {
-                    continue; // a top-level fn's own scheme is always Ty::Fn — defensive, not expected
-                };
-                let mapping: HashMap<TyVar, Ty> = scheme
-                    .vars
-                    .iter()
-                    .copied()
-                    .zip(concrete_tys.iter().cloned())
-                    .collect();
-                let param_types: Vec<Ty> = param_pattern
-                    .iter()
-                    .map(|t| substitute(t, &mapping))
-                    .collect();
-                let result = substitute(ret_pattern, &mapping);
-                let mut exprs = Vec::new();
-                collect_exprs_block(body, &mut exprs);
-                let node_types: HashMap<NodeId, Ty> = exprs
-                    .iter()
-                    .filter_map(|e| {
-                        program_inference
-                            .node_types
-                            .get(&e.id)
-                            .map(|t| (e.id, substitute(t, &mapping)))
-                    })
-                    .collect();
-                (param_types, result, node_types)
-            };
-
-            // Scan *this specialization's own* (now fully concrete) node types
-            // for further calls into another generic callee — transitive
-            // instantiation, exactly like the seed step above. `call_names`
-            // here is local to *this one* specialization — see
-            // `Specialization::call_names`'s own doc comment for why that
-            // matters specifically for a self-recursive call site.
-            let mut call_names = HashMap::new();
-            collect_instantiations(
-                body,
-                &node_types,
-                &program_inference.global_env,
-                &templates,
-                &program_inference.lambda_schemes,
-                HashMap::new(),
-                &mut fn_worklist,
-                &mut impl_worklist,
-                &mut lambda_worklist,
-                &mut call_names,
-                &mut mono.errors,
-                registry,
-            );
-
-            mono.by_origin
-                .entry(name)
-                .or_default()
-                .push(display.clone());
-            mono.specializations.insert(
-                display,
-                Specialization {
-                    params: f.params.clone(),
-                    body: body.clone(),
-                    param_types,
-                    result,
-                    node_types,
-                    call_names,
-                    is_extern: f.is_extern,
-                    extern_symbol: f.extern_symbol.clone(),
-                    is_pure: f.attrs.iter().any(|a| a.name == "pure"),
-                },
-            );
+            }
         }
 
         while let Some((idx, mapping)) = impl_worklist.pop() {
@@ -718,355 +621,20 @@ pub fn monomorphize(
             if mono.specializations.contains_key(&display) {
                 continue;
             }
-
-            // Ordinary substitution first, exactly as before.
-            let raw_target_tys: Vec<Ty> = t
-                .target_patterns
-                .iter()
-                .map(|p| substitute(p, &mapping))
-                .collect();
-
-            // `resolved_target_sigs`'s own doc comment, above this whole
-            // `loop`: a sibling specialization of this *same* `impl` block,
-            // for this *same* concrete `(Opt, Model, ...)`, may already know
-            // what a still-open target position here (`State`) concretely
-            // is. Found purely structurally (matching stringified target
-            // types, "?" for whichever ones are still open on *both* sides)
-            // — no shared `TyVar` identity assumed or required. A real
-            // per-position `unify` (not a blind rename) recovers every free
-            // variable *this* work item's own still-open target actually
-            // contains, however many, wherever nested (`WrapState<'a,'b>`
-            // against a known `WrapState<Tensor<f32,2,2>,Tensor<f32,1,2>>`
-            // binds both `'a` and `'b` in one shot).
-            let sig_key = (
-                t.algebra.clone(),
-                raw_target_tys
-                    .iter()
-                    .map(|ty| {
-                        if is_fully_concrete(ty) {
-                            ty.to_string()
-                        } else {
-                            "?".to_string()
-                        }
-                    })
-                    .collect::<Vec<_>>(),
-            );
-            let mut rename: HashMap<TyVar, Ty> = HashMap::new();
-            if let Some(known_full) = resolved_target_sigs.get(&sig_key) {
-                for (raw, known) in raw_target_tys.iter().zip(known_full) {
-                    if is_fully_concrete(raw) {
-                        continue;
-                    }
-                    let mut trial = Subst::default();
-                    if unify(&mut trial, raw, known).is_ok() {
-                        let mut vars = HashSet::new();
-                        free_vars(raw, &mut vars);
-                        for v in vars {
-                            rename.entry(v).or_insert_with(|| trial.apply(&Ty::Var(v)));
-                        }
-                    }
-                }
-            }
-            let apply = |ty: &Ty| substitute(&substitute(ty, &mapping), &rename);
-
-            let mut target_tys: Vec<Ty> = t.target_patterns.iter().map(&apply).collect();
-            let mut param_types: Vec<Ty> = t.param_patterns.iter().map(&apply).collect();
-            let mut result = apply(&t.ret_pattern);
-
-            let mut exprs = Vec::new();
-            collect_exprs_block(&t.body, &mut exprs);
-            let mut node_types: HashMap<NodeId, Ty> = exprs
-                .iter()
-                .filter_map(|e| t.node_types.get(&e.id).map(|ty| (e.id, apply(ty))))
-                .collect();
-
-            // `doc/backlog.md`'s own "composing algebra impl generic over
-            // `Opt`..." entry: `t.node_types`/`ret_pattern`/`param_patterns`
-            // are a *frozen* snapshot from this template's own one-time,
-            // wholly-generic body check (`build_impl_templates`) -- ordinary
-            // substitution (`mapping`, and now `rename` above) is a pure
-            // variable-*rename*, and can't repair a nested algebra dispatch
-            // that check had to permanently defer because *its own* `Opt`
-            // (or another impl-level generic) was still abstract at the
-            // time (`infer.rs::infer_algebra_call`'s own `unambiguous_and_
-            // preserves_openness` gate). The tell: after every substitution
-            // above, `param_types`/`result` (or a node inside the body)
-            // still carries a free `Ty::Var` neither `mapping` nor `rename`
-            // could have introduced on their own -- exactly `fn_worklist`'s
-            // own `duck_typed_fns` fallback (`infer_fn_with_concrete_
-            // params`), mirrored here via `infer_impl_fn_with_concrete_
-            // targets`: a fresh, real re-inference of the body, with every
-            // target/param type as concrete as this work item can make it,
-            // sees `Opt` concretely and dispatches for real, no deferral
-            // needed.
-            let still_open = !t.is_extern
-                && (!is_fully_concrete(&result)
-                    || param_types.iter().any(|p| !is_fully_concrete(p))
-                    || node_types.values().any(|v| !is_fully_concrete(v)));
-            // `None` once this specialization is genuinely done; `Some(err)`
-            // while it's still missing something -- checked *after*
-            // `collect_instantiations` below, deliberately, not here: even
-            // an incomplete `node_types` can still correctly discover a
-            // *different*, independently-resolvable nested call (`Net`-
-            // level `init_state` calling `Optimizer::init_state(opt,
-            // model.w1)` — `model.w1: Wrap<f32>` is concrete regardless of
-            // whether `Net`'s own overall `State` is), and that discovery is
-            // exactly what lets `resolved_target_sigs` ever grow enough for
-            // *this* item's own retry to eventually succeed. Bailing out
-            // before `collect_instantiations` (an earlier version of this
-            // fix did exactly that) starves it permanently: the nested
-            // template this item itself depends on would never even get
-            // queued, let alone resolved — a real, direct deadlock, found
-            // by testing a genuine two-level composition (`Net` wrapping
-            // `Wrap` wrapping `Tensor`), not guessed.
-            let mut defer_reason: Option<TypeError> = None;
-            if still_open {
-                let fallback_span = t
-                    .body
-                    .tail
-                    .as_deref()
-                    .map(|e| e.span)
-                    .or_else(|| t.body.stmts.first().map(|s| s.span))
-                    .unwrap_or(Span {
-                        file: FileId(0),
-                        start: 0,
-                        end: 0,
-                    });
-                let synthetic_err = || TypeError {
-                    span: fallback_span,
-                    kind: TypeErrorKind::MonomorphizationFailed {
-                        algebra: t.algebra.clone(),
-                        method: t.method_name.clone(),
-                        tys: target_tys
-                            .iter()
-                            .map(Ty::to_string)
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                    },
-                };
-                let mut infer = Infer::new_with_vars(registry, shared_vars)
-                    .with_external_state_hint(&resolved_target_sigs);
-                match infer.infer_impl_fn_with_concrete_targets(
-                    &t.algebra,
-                    &t.method_name,
-                    &target_tys,
-                    &t.params,
-                    &t.body,
-                    param_types.clone(),
-                    fallback_span,
-                ) {
-                    Ok(re_result) => {
-                        let re_param_types = infer.param_types.clone();
-                        let re_node_types: HashMap<NodeId, Ty> = exprs
-                            .iter()
-                            .filter_map(|e| infer.node_types.get(&e.id).map(|ty| (e.id, ty.clone())))
-                            .collect();
-                        // A real re-inference can still succeed (no type
-                        // *error*) while leaving something genuinely open --
-                        // `step`'s own `state: State` parameter, popped
-                        // before `init_state`'s own sibling resolution ever
-                        // reached `resolved_target_sigs`, has nothing at all
-                        // to pin its shape down with, and `check_no_
-                        // placeholder` only rejects an explicit placeholder
-                        // marker, not an ordinary still-free `Ty::Var`.
-                        // Still used below (not discarded) — the parts that
-                        // *did* resolve (a nested, independently-concrete
-                        // call, say) are real and worth discovering via
-                        // `collect_instantiations` even though this
-                        // specialization as a whole isn't done yet.
-                        if !is_fully_concrete(&re_result)
-                            || re_param_types.iter().any(|p| !is_fully_concrete(p))
-                            || re_node_types.values().any(|v| !is_fully_concrete(v))
-                        {
-                            defer_reason = Some(synthetic_err());
-                        }
-                        param_types = re_param_types;
-                        result = re_result;
-                        node_types = re_node_types;
-                    }
-                    Err(e) => {
-                        // Not necessarily a real failure yet -- worklist
-                        // order isn't meaningful, so this could just as
-                        // easily be `step` popped before its own sibling
-                        // `init_state` ever contributed to `resolved_
-                        // target_sigs`. The *pre-fallback* `param_types`/
-                        // `result`/`node_types` (substituted above, via
-                        // `mapping`/`rename` alone) are kept as-is here,
-                        // still useful for `collect_instantiations` below.
-                        defer_reason = Some(e);
-                    }
-                }
-                // Written back either way, same reasoning as `build_impl_
-                // templates`'s own identical write-back -- this fallback's
-                // own counter must never restart at a number an *earlier*
-                // fallback (or `build_impl_templates` itself) already used,
-                // in either the success or the failure case.
-                shared_vars = infer.current_vars();
-            }
-
-            // Grows `resolved_target_sigs` for whichever sibling
-            // specialization (same `impl` block, a different method) needs
-            // exactly this binding next -- reverse-unifying the template's
-            // own *original*, still-symbolic `(param_patterns, ret_pattern)`
-            // against this specialization's own final, concrete `(param_
-            // types, result)` recovers a binding for every one of the
-            // template's own free variables in one shot, including ones
-            // that only ever appear in `target_patterns` -- the exact same
-            // technique `derive_impl_instantiation` itself already relies on
-            // for an ordinary call site's own reverse-derivation.
-            //
-            // Gated on `param_types`/`result` being *fully* concrete first
-            // -- genuinely load-bearing, not defensive: a leftover free
-            // `Ty::Var` here could belong to *this* specialization's own
-            // fallback session (`infer_impl_fn_with_concrete_targets`'s own
-            // fresh `Infer`, an entirely independent `TyVar` numbering from
-            // whichever session built `t` itself) rather than to `t`'s own
-            // template — unifying `t.param_patterns`/`ret_pattern` (the
-            // *template*'s own numbering) against a query containing one of
-            // *those* would risk `unify`'s union-find merging two `TyVar`s
-            // that only coincidentally share a number, silently aliasing
-            // completely unrelated bindings (found by direct testing: a
-            // plain, fully-concrete `Optimizer::init_state<Sgd,Tensor<f32,
-            // 2,2>,Tensor<f32,2,2>>` call started failing with a nonsense
-            // `-> Sgd` return type before this guard existed). Safe exactly
-            // when both sides are already fully concrete: nothing left to
-            // alias, every one of the pattern's own vars gets bound to a
-            // real, closed type, never another variable.
-            // Also refreshes `target_tys` itself (shadowing the `mapping`/
-            // `rename`-only version from before the fallback ran) -- the
-            // `seed_derivative_rule_references`/`seed_ring_zero`/`seed_
-            // adjoint_rule_references` calls below need it as concrete as
-            // the fallback actually made it, not just as concrete as
-            // ordinary substitution alone could.
-            if param_types.iter().all(is_fully_concrete) && is_fully_concrete(&result) {
-                let mut trial = Subst::default();
-                let pattern = Ty::Fn(t.param_patterns.clone(), Box::new(t.ret_pattern.clone()));
-                let query = Ty::Fn(param_types.clone(), Box::new(result.clone()));
-                if unify(&mut trial, &pattern, &query).is_ok() {
-                    let final_target_tys: Vec<Ty> =
-                        t.target_patterns.iter().map(|p| trial.apply(p)).collect();
-                    if final_target_tys.iter().all(is_fully_concrete) {
-                        target_tys = final_target_tys.clone();
-                        resolved_target_sigs
-                            .entry(sig_key)
-                            .or_insert(final_target_tys);
-                    }
-                }
-            }
-
-            // Run *even when* this specialization is still incomplete
-            // (`defer_reason.is_some()`) -- deliberately, found necessary by
-            // direct testing: skipping this for an incomplete item (an
-            // earlier version of this fix did exactly that) starves a
-            // genuine two-level composition (`Net` wrapping `Wrap` wrapping
-            // `Tensor`) permanently -- the inner `Wrap`-level template this
-            // item itself depends on would never even get *discovered*,
-            // let alone resolved, since the only place that ever queues it
-            // is `Net`'s own body being walked right here. Safe to run on a
-            // still-partially-open `node_types` now specifically *because*
-            // of `shared_vars` (this whole loop's own header comment):
-            // every `Ty::Var` anywhere in it, however this specialization's
-            // own attempt got built, was minted from the same globally-
-            // unique counter every template and every fallback session
-            // shares, so `derive_impl_instantiation`'s own `unify` calls,
-            // triggered from inside here, can never conflate two unrelated
-            // variables that merely happen to share a number -- confirmed
-            // directly: before `shared_vars` existed, enabling this exact
-            // line produced real, silently wrong bindings (a bogus `->
-            // Sgd`/`-> f32` return type on an unrelated, otherwise-correct
-            // call), not just missing ones.
-            let mut call_names = HashMap::new();
-            collect_instantiations(
-                &t.body,
-                &node_types,
-                &program_inference.global_env,
-                &templates,
-                &program_inference.lambda_schemes,
-                HashMap::new(),
-                &mut fn_worklist,
-                &mut impl_worklist,
-                &mut lambda_worklist,
-                &mut call_names,
-                &mut mono.errors,
-                registry,
-            );
-
-            if let Some(err) = defer_reason {
-                deferred_impl.push((idx, mapping, err));
+            let args: Vec<Ty> = t.param_patterns.iter().map(|p| substitute(p, &mapping)).collect();
+            if !args.iter().all(is_fully_concrete) {
                 continue;
             }
-
-            // `seed_derivative_rule_references`'s own doc comment -- a
-            // `derivative` rule declared on `t.algebra` can reference a
-            // *different* algebra's own generic-impl method, at this exact
-            // specialization's own resolved target type(s), that no ordinary
-            // call site in the program ever reaches directly.
-            seed_derivative_rule_references(
-                registry,
-                &t.algebra,
-                &t.method_name,
-                &target_tys,
-                &templates,
-                &mut impl_worklist,
-            );
-            seed_ring_zero(
-                &t.algebra,
-                &target_tys,
-                &templates,
-                registry,
-                &mut impl_worklist,
-            );
-            seed_adjoint_rule_references(
-                registry,
-                &t.algebra,
-                &t.method_name,
-                &target_tys,
-                &templates,
-                &mut impl_worklist,
-            );
-            // Unlike the two calls above, not keyed to `t.method_name` at
-            // all -- an `axiom`'s own params aren't tied to any one
-            // method's signature (`seed_axiom_references`'s own doc
-            // comment), so every axiom declared on `t.algebra` gets a
-            // chance here, for every reached instantiation of *any* of its
-            // methods (harmless redundancy for the common single-method
-            // case, `MatMul`'s own `matmul` included).
-            seed_axiom_references(registry, &t.algebra, &target_tys, &templates, &mut impl_worklist);
-
-            let origin = format!("{}::{}", t.algebra, t.method_name);
-            mono.by_origin
-                .entry(origin)
-                .or_default()
-                .push(display.clone());
-            mono.specializations.insert(
-                display,
-                Specialization {
-                    params: t.params.clone(),
-                    body: t.body.clone(),
-                    param_types,
-                    result,
-                    node_types,
-                    call_names,
-                    is_extern: t.is_extern,
-                    extern_symbol: t.extern_symbol.clone(),
-                    is_pure: t.is_pure,
-                },
-            );
+            match engine.specialize_impl(idx, &mapping, &args) {
+                Some((unit, _)) => alias_specialization(&mut mono, &engine, &unit, &display),
+                None => {
+                    if let Some(e) = engine.last_error.borrow_mut().take() {
+                        mono.errors.push(e);
+                    }
+                }
+            }
         }
 
-        // Lambda worklist -- structurally identical to the top-level-`fn`
-        // worklist just above (same `Specialization` shape, same reverse-
-        // unification via `derive_instantiation`), but a lambda has no top-
-        // level `FnDecl`/`global_env` entry to read `params`/`body`/`scheme`
-        // back from -- `lambda_exprs`/`program_inference.lambda_schemes`
-        // (built/aggregated once, up front) stand in for those. Unlike a top-
-        // level generic `fn`, a lambda's own body `node_types` were never given
-        // a dedicated per-declaration template (no `ImplTemplate`-style struct
-        // needed) -- they're read directly out of the *whole-program*
-        // `program_inference.node_types`, exactly the same map (and the exact
-        // same reasoning) the `fn_worklist` loop above already reads its own
-        // generic pattern from, since ordinary inference records a lambda
-        // body's node types there too, just still generic (pre-instantiation).
         while let Some((lambda_id, concrete_tys, self_name)) = lambda_worklist.pop() {
             let display = display_lambda_instantiation(lambda_id, &concrete_tys);
             if mono.specializations.contains_key(&display) {
@@ -1118,7 +686,7 @@ pub fn monomorphize(
             let mut initial_scope = HashMap::new();
             initial_scope.insert(self_name, lambda_id);
             collect_instantiations(
-                body,
+                &body,
                 &node_types,
                 &program_inference.global_env,
                 &templates,
@@ -1153,119 +721,17 @@ pub fn monomorphize(
             );
         }
 
-        if fn_worklist.is_empty() && impl_worklist.is_empty() && lambda_worklist.is_empty() {
-            if deferred_impl.is_empty() {
-                break;
-            }
-            // Every other worklist is drained, but something's still
-            // waiting on a `resolved_target_sigs` binding a sibling
-            // specialization might yet contribute -- retried up to
-            // `DEFERRED_IMPL_RETRY_LIMIT` times (`deferred_impl_retries`'s
-            // own doc comment above has why this is a plain counter, not a
-            // "did anything change" check) before giving up for real and
-            // reporting every remaining item's own original error.
-            deferred_impl_retries += 1;
-            if deferred_impl_retries > DEFERRED_IMPL_RETRY_LIMIT {
-                for (_, _, err) in deferred_impl.drain(..) {
-                    mono.errors.push(err);
-                }
-                break;
-            }
-            for (idx, mapping, _) in deferred_impl.drain(..) {
-                impl_worklist.push((idx, mapping));
-            }
-        }
-    }
-
-    // `doc/backlog.md`'s own "composing algebra impl generic over `Opt`..."
-    // entry: an *ordinary*, non-generic top-level `fn` (`main`, most
-    // directly) that calls an algebra method with an output-only generic
-    // (`State`) never gets re-inferred by anything above — its own body is
-    // assumed already fully concrete (the seeding comment near the top of
-    // this function says so explicitly), true for every ordinary program,
-    // but not for this one specific shape: `program_inference.node_types`
-    // was built once, by a *separate*, already-finished whole-program pass
-    // that has no way to know what `resolved_target_sigs` learned only
-    // afterward. Patches it in place, now that the fixed point above means
-    // `resolved_target_sigs` is as complete as this compilation will ever
-    // make it. A few rounds, not just one: `main`'s own `let r = ...step(
-    // ...); let r2 = ...step(..., r.1, ...);` — two *chained* calls to the
-    // same algebra — needs the first one patched before the second's own
-    // arg types (read from the very same `node_types` map) become concrete
-    // enough to resolve; stops itself the moment a round patches nothing.
-    for _ in 0..8 {
-        let patched = patch_ordinary_fn_node_types(
-            &functions,
-            &mut program_inference,
-            &templates,
-            registry,
-            &resolved_target_sigs,
-        );
-        if !patched {
+        let produced = engine.drain();
+        let idle = produced.is_empty();
+        merge_produced(&mut mono, produced, &templates, registry, &mut fn_worklist, &mut impl_worklist, &mut lambda_worklist);
+        if idle && fn_worklist.is_empty() && impl_worklist.is_empty() && lambda_worklist.is_empty() {
             break;
         }
     }
+    shared_vars = engine.finish().vars;
+    let _ = shared_vars;
 
     (mono, program_inference)
-}
-
-/// Builds one `ImplTemplate` per method of every *generic* algebra impl in
-/// the program (a non-generic impl, e.g. `impl Ring<i32>`, needs no
-/// template at all — it's already fully concrete, rendered unchanged by
-/// `dump.rs`'s own existing `--dump-inference-pass`-style path, untouched
-/// here). A method whose own declaration-time inference fails is silently
-/// skipped — nothing to monomorphize for a method that doesn't type-check;
-/// `--dump-inference-pass` is where that failure actually gets reported.
-/// Scans every generic top-level `fn` for placeholder residue anywhere in
-/// its own body's declaration-time `node_types` — see `infer.rs`'s own
-/// `is_placeholder` doc comment for what counts (`<not-yet-inferred>`,
-/// `<unresolved-call:...>`, ...). A fn found here can never be correctly
-/// specialized by the ordinary substitution path in the `fn_worklist` loop
-/// below — substitution only ever replaces a `Ty::Var`, and a placeholder is
-/// a `Ty::Con`, permanently baked in by the one-shot HM pass
-/// (`callgraph::infer_program`) regardless of a later call site's own
-/// concrete types. Instead, the `fn_worklist` loop routes anything found
-/// here through `Infer::infer_fn_with_concrete_params` — a real, separate
-/// re-inference per concrete call site, C++-templates-style, deliberately
-/// *not* HM's own "checked once, sound everywhere" discipline (a second,
-/// coexisting mechanism, not a replacement — see this feature's own commit/
-/// discussion for why). Scoped to top-level `fn`s only: a generic algebra-
-/// impl method's own signature is always fully, explicitly declared by its
-/// `algebra`, so it never has an unconstrained parameter to trigger this in
-/// the first place.
-fn detect_duck_typed_fns(
-    functions: &HashMap<&str, &FnDecl>,
-    program_inference: &ProgramInference,
-) -> HashSet<String> {
-    let mut out = HashSet::new();
-    for (name, f) in functions {
-        let Some(scheme) = program_inference.global_env.get(*name) else {
-            continue;
-        };
-        if scheme.vars.is_empty() {
-            continue;
-        }
-        // A field accessed on a generic value (`FieldConstraint`): the body's
-        // types along that access (`n.l1` in `n.l1.x`) are only known per
-        // instantiation, so substitution alone can't specialize it.
-        if !scheme.field_constraints.is_empty() {
-            out.insert((*name).to_string());
-            continue;
-        }
-        let Some(body) = &f.body else { continue };
-        let mut exprs = Vec::new();
-        collect_exprs_block(body, &mut exprs);
-        let has_placeholder = exprs.iter().any(|e| {
-            program_inference
-                .node_types
-                .get(&e.id)
-                .is_some_and(|t| find_placeholder_name(t).is_some())
-        });
-        if has_placeholder {
-            out.insert((*name).to_string());
-        }
-    }
-    out
 }
 
 fn build_impl_templates(
@@ -1362,7 +828,9 @@ fn build_impl_templates(
                 .iter()
                 .filter_map(|g| match g {
                     GenericParam::Type { name, bounds, .. } if !bounds.is_empty() => {
-                        Some((infer.active_generics.get(name)?.clone(), bounds.clone()))
+                        // Its representative, as the patterns name it: the
+                        // generic may have been merged into another variable.
+                        Some((infer.subst.apply(infer.active_generics.get(name)?), bounds.clone()))
                     }
                     _ => None,
                 })
@@ -1377,6 +845,9 @@ fn build_impl_templates(
             templates.push(ImplTemplate {
                 algebra: d.algebra.clone(),
                 method_name: f.name.clone(),
+                impl_generics: d.generics.clone(),
+                impl_targets: std::iter::once(d.target.clone()).chain(d.extra_targets.iter().cloned()).collect(),
+                decl: f.clone(),
                 params: f.params.clone(),
                 body,
                 param_patterns: infer.param_types.clone(),
@@ -3336,15 +2807,30 @@ fn derive_impl_instantiation(
     arg_tys: &[Ty],
     node_types: &HashMap<NodeId, Ty>,
 ) -> ImplMatch {
+    let Some(ret_ty) = node_types.get(&call_id).cloned() else {
+        return ImplMatch::NoCandidates;
+    };
+    derive_impl_instantiation_for(templates, registry, algebra, method, arg_tys, &ret_ty)
+}
+
+/// `derive_impl_instantiation` given the call's result type directly — for
+/// the instance oracle, which has no `node_types` entry for the call (its
+/// result is what it is asked for).
+fn derive_impl_instantiation_for(
+    templates: &[ImplTemplate],
+    registry: &Registry,
+    algebra: Option<&str>,
+    method: &str,
+    arg_tys: &[Ty],
+    ret_ty: &Ty,
+) -> ImplMatch {
     let owned_by =
         |t: &&ImplTemplate| t.method_name == method && algebra.map_or(true, |a| t.algebra == a);
     let candidates: Vec<&ImplTemplate> = templates.iter().filter(owned_by).collect();
     if candidates.is_empty() {
         return ImplMatch::NoCandidates;
     }
-    let Some(ret_ty) = node_types.get(&call_id).cloned() else {
-        return ImplMatch::NoCandidates;
-    };
+    let ret_ty = ret_ty.clone();
     // A const generic's value (`N` in `N > 100`) is typed `Ty::Const`, which
     // unifies with every integer width: widened to its ordinary type first, the
     // same widening `cps.rs::dispatch_ty` applies to its own dispatch keys, or
@@ -3585,131 +3071,6 @@ pub(crate) fn collect_exprs_block<'a>(block: &'a Block, out: &mut Vec<&'a Expr>)
     if let Some(tail) = &block.tail {
         collect_exprs(tail, out);
     }
-}
-
-/// `doc/backlog.md`'s own "composing algebra impl generic over `Opt`..."
-/// entry — see the one call site's own doc comment for the full story of
-/// why this exists. Walks every non-generic top-level `fn`'s own body
-/// (`functions`) for a qualified algebra call (`Optimizer::step(...)`,
-/// `derive_impl_instantiation`'s own qualified-call shape) whose own
-/// `program_inference.node_types` entry is still open, and — if `resolved_
-/// target_sigs` already has a fully-concrete answer for this exact
-/// `(algebra, concrete gating positions)` signature — unifies it in and
-/// substitutes the resulting bindings through *the whole* `node_types` map
-/// at once (not just this one node): every other node referencing the very
-/// same `TyVar` — `r`'s own `let`-binding, `r.1`'s own field access, both
-/// sharing one variable with the call itself, all from this same, single,
-/// already-finished `program_inference` session — gets fixed by the same
-/// substitution, for the identical reason `Subst`-based resolution always
-/// does.
-///
-/// Safe regardless of which `Infer` session any of these `TyVar`s
-/// originally came from (`program_inference`'s own whole-program pass, or
-/// `build_impl_templates`'s — never `shared_vars`-unified with either,
-/// unlike the `impl_worklist` loop's own fallback): `known_full` is always
-/// fully concrete by construction (`resolved_target_sigs`'s own insertion
-/// gate), and unifying anything, from any session, against an already-
-/// concrete value can never alias two unrelated variables to each other —
-/// only ever bind an open one to a real, closed type. Returns whether it
-/// patched anything at all, so the caller knows whether another round
-/// might still find more (a chained `let r = ...; let r2 = ...(r.1)...;`
-/// needs the first call patched before the second's own arg types, read
-/// from this same map, become concrete enough to resolve in turn).
-fn patch_ordinary_fn_node_types(
-    functions: &HashMap<&str, &FnDecl>,
-    program_inference: &mut ProgramInference,
-    templates: &[ImplTemplate],
-    registry: &Registry,
-    resolved_target_sigs: &HashMap<(String, Vec<String>), Vec<Ty>>,
-) -> bool {
-    let mut any_patched = false;
-    for f in functions.values() {
-        let Some(body) = &f.body else { continue };
-        let mut exprs = Vec::new();
-        collect_exprs_block(body, &mut exprs);
-        for e in exprs {
-            let ExprKind::Call(path, _, args, ..) = &e.kind else {
-                continue;
-            };
-            let [algebra, method] = path.segments.as_slice() else {
-                continue;
-            };
-            if !templates.iter().any(|t| &t.algebra == algebra) {
-                continue;
-            }
-            let is_open = program_inference
-                .node_types
-                .get(&e.id)
-                .is_some_and(|t| !is_fully_concrete(t));
-            if !is_open {
-                continue;
-            }
-            let Some(arg_tys): Option<Vec<Ty>> = args
-                .iter()
-                .map(|a| program_inference.node_types.get(&a.id).cloned())
-                .collect()
-            else {
-                continue;
-            };
-            let ImplMatch::Found(idx, mapping) = derive_impl_instantiation(
-                templates,
-                registry,
-                Some(algebra),
-                method,
-                e.id,
-                &arg_tys,
-                &program_inference.node_types,
-            ) else {
-                continue;
-            };
-            let t = &templates[idx];
-            let target_tys: Vec<Ty> = t
-                .target_patterns
-                .iter()
-                .map(|p| substitute(p, &mapping))
-                .collect();
-            let sig_key = (
-                t.algebra.clone(),
-                target_tys
-                    .iter()
-                    .map(|ty| {
-                        if is_fully_concrete(ty) {
-                            ty.to_string()
-                        } else {
-                            "?".to_string()
-                        }
-                    })
-                    .collect::<Vec<_>>(),
-            );
-            let Some(known_full) = resolved_target_sigs.get(&sig_key) else {
-                continue;
-            };
-            let mut trial = Subst::default();
-            let mut bound_anything = false;
-            for (raw, known) in target_tys.iter().zip(known_full) {
-                if is_fully_concrete(raw) {
-                    continue;
-                }
-                if unify(&mut trial, raw, known).is_ok() {
-                    bound_anything = true;
-                }
-            }
-            if !bound_anything {
-                continue;
-            }
-            let mut vars = HashSet::new();
-            target_tys.iter().for_each(|t| free_vars(t, &mut vars));
-            let rename: HashMap<TyVar, Ty> = vars
-                .into_iter()
-                .map(|v| (v, trial.apply(&Ty::Var(v))))
-                .collect();
-            for v in program_inference.node_types.values_mut() {
-                *v = substitute(v, &rename);
-            }
-            any_patched = true;
-        }
-    }
-    any_patched
 }
 
 // ------------------------------------------------------------ rendering
@@ -3986,4 +3347,529 @@ fn dump_one(
     );
     dump_block_with_call_names(out, body, node_types, &mut names, 1, call_names);
     let _ = writeln!(out, "}}");
+}
+
+/// Moves what the instance engine built into `mono` — each impl-method
+/// instance also seeding the derivative/axiom references of its algebra —
+/// and its discovered work into the worklists.
+fn merge_produced(
+    mono: &mut MonomorphizedProgram,
+    produced: Produced,
+    templates: &[ImplTemplate],
+    registry: &Registry,
+    fn_worklist: &mut Vec<(String, Vec<Ty>)>,
+    impl_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
+    lambda_worklist: &mut Vec<(NodeId, Vec<Ty>, String)>,
+) {
+    for (impl_of, origin, display, spec) in produced.specializations {
+        if mono.specializations.contains_key(&display) {
+            continue;
+        }
+        if let Some((idx, target_tys)) = impl_of {
+            let t = &templates[idx];
+            seed_derivative_rule_references(registry, &t.algebra, &t.method_name, &target_tys, templates, impl_worklist);
+            seed_ring_zero(&t.algebra, &target_tys, templates, registry, impl_worklist);
+            seed_adjoint_rule_references(registry, &t.algebra, &t.method_name, &target_tys, templates, impl_worklist);
+            seed_axiom_references(registry, &t.algebra, &target_tys, templates, impl_worklist);
+        }
+        mono.by_origin.entry(origin).or_default().push(display.clone());
+        mono.specializations.insert(display, spec);
+    }
+    fn_worklist.extend(produced.fn_worklist);
+    impl_worklist.extend(produced.impl_worklist);
+    lambda_worklist.extend(produced.lambda_worklist);
+    mono.errors.extend(produced.errors);
+}
+
+/// A worklist item names its instance from the call site's view
+/// (`requested`); the engine names it from the instance's own (`unit`). When
+/// those differ, the instance is registered under both, so every call name
+/// finds its unit.
+fn alias_specialization(mono: &mut MonomorphizedProgram, engine: &InstanceEngine, unit: &str, requested: &str) {
+    if unit == requested {
+        return;
+    }
+    let produced = engine.produced.borrow();
+    let found = produced
+        .specializations
+        .iter()
+        .find(|(_, _, d, _)| d == unit)
+        .map(|(_, origin, _, spec)| (origin.clone(), spec.clone()))
+        .or_else(|| mono.specializations.get(unit).map(|s| (String::new(), s.clone())));
+    drop(produced);
+    if let Some((origin, spec)) = found {
+        if !origin.is_empty() {
+            mono.by_origin.entry(origin).or_default().push(requested.to_string());
+        }
+        mono.specializations.insert(requested.to_string(), spec);
+    }
+}
+
+// ------------------------------------------------------------ instance oracle
+
+/// The monomorphizer as `InstanceOracle` (`doc/plan-instance-inference.md`):
+/// asked, from inside an instance's inference, for a generic callee's
+/// instance at concrete argument types, it infers that instance right away
+/// (recursively, memoized) and answers with its unit name and result type.
+/// What the instances it builds discover in turn is collected for the
+/// worklists of `monomorphize`.
+struct InstanceEngine<'a> {
+    registry: &'a Registry,
+    functions: &'a HashMap<&'a str, &'a FnDecl>,
+    templates: &'a [ImplTemplate],
+    global_env: Env,
+    lambda_schemes: HashMap<NodeId, Scheme>,
+    vars: Cell<TyVarGen>,
+    /// Why the last instance asked for failed, for the worklists to report.
+    last_error: RefCell<Option<TypeError>>,
+    /// Ids for the nodes of unrolled copies of instance bodies, in a range no
+    /// parsed node reaches.
+    next_node: Cell<u32>,
+    in_progress: RefCell<HashSet<String>>,
+    done: RefCell<HashMap<String, (String, Ty)>>,
+    produced: RefCell<Produced>,
+}
+
+/// What `InstanceEngine` hands back to `monomorphize`.
+#[derive(Default)]
+struct Produced {
+    vars: TyVarGen,
+    /// (template index and resolved targets for an impl method, `None` for a
+    /// top-level fn; origin; unit name; specialization).
+    specializations: Vec<(Option<(usize, Vec<Ty>)>, String, String, Specialization)>,
+    fn_worklist: Vec<(String, Vec<Ty>)>,
+    impl_worklist: Vec<(usize, HashMap<TyVar, Ty>)>,
+    lambda_worklist: Vec<(NodeId, Vec<Ty>, String)>,
+    errors: Vec<TypeError>,
+}
+
+impl Produced {
+    fn is_empty(&self) -> bool {
+        self.specializations.is_empty()
+            && self.fn_worklist.is_empty()
+            && self.impl_worklist.is_empty()
+            && self.lambda_worklist.is_empty()
+            && self.errors.is_empty()
+    }
+}
+
+impl<'a> InstanceEngine<'a> {
+    /// Takes what instances built so far discovered.
+    fn drain(&self) -> Produced {
+        std::mem::take(&mut *self.produced.borrow_mut())
+    }
+
+    fn new(
+        registry: &'a Registry,
+        functions: &'a HashMap<&'a str, &'a FnDecl>,
+        templates: &'a [ImplTemplate],
+        global_env: Env,
+        lambda_schemes: HashMap<NodeId, Scheme>,
+        vars: TyVarGen,
+    ) -> Self {
+        InstanceEngine {
+            registry,
+            functions,
+            templates,
+            global_env,
+            lambda_schemes,
+            vars: Cell::new(vars),
+            last_error: RefCell::new(None),
+            next_node: Cell::new(1 << 30),
+            in_progress: RefCell::new(HashSet::new()),
+            done: RefCell::new(HashMap::new()),
+            produced: RefCell::new(Produced::default()),
+        }
+    }
+
+    fn finish(self) -> Produced {
+        let mut produced = self.produced.into_inner();
+        produced.vars = self.vars.get();
+        produced
+    }
+
+    /// The instance of impl method `templates[idx]` at the concrete argument
+    /// types `args` (`mapping`: the template's bindings the call determined;
+    /// whatever it left open, an output-only target such as an optimizer's
+    /// state, the body's inference decides).
+    fn specialize_impl(&self, idx: usize, mapping: &HashMap<TyVar, Ty>, args: &[Ty]) -> Option<(String, Ty)> {
+        *self.last_error.borrow_mut() = None;
+        let t = &self.templates[idx];
+        if t.is_extern {
+            // No body to infer: the instance is the signature at these types.
+            let result = substitute(&t.ret_pattern, mapping);
+            let param_types: Vec<Ty> = t.param_patterns.iter().map(|p| substitute(p, mapping)).collect();
+            if !is_fully_concrete(&result) || !param_types.iter().all(is_fully_concrete) {
+                return None;
+            }
+            let display = display_impl_instantiation(t, mapping);
+            let target_tys: Vec<Ty> = t.target_patterns.iter().map(|p| substitute(p, mapping)).collect();
+            let mut produced = self.produced.borrow_mut();
+            if !produced.specializations.iter().any(|(_, _, d, _)| *d == display) {
+                produced.specializations.push((
+                    Some((idx, target_tys)),
+                    format!("{}::{}", t.algebra, t.method_name),
+                    display.clone(),
+                    Specialization {
+                        params: t.params.clone(),
+                        body: t.body.clone(),
+                        param_types,
+                        result: result.clone(),
+                        node_types: HashMap::new(),
+                        call_names: HashMap::new(),
+                        is_extern: true,
+                        extern_symbol: t.extern_symbol.clone(),
+                        is_pure: t.is_pure,
+                    },
+                ));
+            }
+            return Some((display, result));
+        }
+        // Keyed by the targets the call determined as well as the arguments:
+        // a method without arguments (`Init::xavier()`) has one instance per
+        // target type. A target the call left open reads `?`.
+        let targets_key: Vec<String> = t
+            .target_patterns
+            .iter()
+            .map(|p| {
+                let ty = substitute(p, mapping);
+                if is_fully_concrete(&ty) { ty.to_string() } else { "?".to_string() }
+            })
+            .collect();
+        let key = format!(
+            "{}::{}<{}>({})",
+            t.algebra,
+            t.method_name,
+            targets_key.join(", "),
+            args.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+        );
+        if let Some(found) = self.done.borrow().get(&key) {
+            return Some(found.clone());
+        }
+        if !self.in_progress.borrow_mut().insert(key.clone()) {
+            return None;
+        }
+
+        let span = t
+            .body
+            .tail
+            .as_deref()
+            .map(|e| e.span)
+            .or_else(|| t.body.stmts.first().map(|s| s.span))
+            .unwrap_or(Span {
+                file: FileId(0),
+                start: 0,
+                end: 0,
+            });
+        let mut decl = t.decl.clone();
+        let (infer, outcome) = self.infer_unrolling(&mut decl, |infer, decl| {
+            // Targets the call left open become this session's own variables.
+            let mut open: HashMap<TyVar, Ty> = HashMap::new();
+            let target_tys: Vec<Ty> = t
+                .target_patterns
+                .iter()
+                .map(|p| {
+                    let ty = substitute(p, mapping);
+                    let mut fv = HashSet::new();
+                    free_vars(&ty, &mut fv);
+                    for v in fv {
+                        open.entry(v).or_insert_with(|| infer.fresh_var());
+                    }
+                    substitute(&ty, &open)
+                })
+                .collect();
+            infer.infer_impl_fn_instance(
+                &self.global_env,
+                &t.algebra,
+                &t.impl_generics,
+                &t.impl_targets,
+                decl,
+                span,
+                &target_tys,
+                args,
+            )
+        });
+        self.in_progress.borrow_mut().remove(&key);
+        let result = match outcome {
+            Ok(r) => r,
+            Err(e) => {
+                *self.last_error.borrow_mut() = Some(e);
+                return None;
+            }
+        };
+        let body = decl.body.clone().unwrap_or(Block { stmts: Vec::new(), tail: None });
+
+        let mut exprs = Vec::new();
+        collect_exprs_block(&body, &mut exprs);
+        let node_types: HashMap<NodeId, Ty> = exprs
+            .iter()
+            .filter_map(|e| infer.node_types.get(&e.id).map(|ty| (e.id, ty.clone())))
+            .collect();
+        if !is_fully_concrete(&result)
+            || infer.param_types.iter().any(|p| !is_fully_concrete(p))
+            || node_types.values().any(|v| !is_fully_concrete(v))
+        {
+            return None;
+        }
+
+        // The template's own bindings, now that the instance is concrete.
+        let mut trial = Subst::default();
+        unify(
+            &mut trial,
+            &Ty::Fn(t.param_patterns.clone(), Box::new(t.ret_pattern.clone())),
+            &Ty::Fn(infer.param_types.clone(), Box::new(result.clone())),
+        )
+        .ok()?;
+        let mut vars = HashSet::new();
+        t.target_patterns.iter().for_each(|p| free_vars(p, &mut vars));
+        let final_mapping: HashMap<TyVar, Ty> =
+            vars.into_iter().map(|v| (v, trial.apply(&Ty::Var(v)))).collect();
+        let target_tys: Vec<Ty> = t.target_patterns.iter().map(|p| substitute(p, &final_mapping)).collect();
+        let display = display_impl_instantiation(t, &final_mapping);
+
+        let mut call_names = HashMap::new();
+        {
+            let mut produced = self.produced.borrow_mut();
+            let Produced {
+                fn_worklist,
+                impl_worklist,
+                lambda_worklist,
+                errors,
+                ..
+            } = &mut *produced;
+            collect_instantiations(
+                &body,
+                &node_types,
+                &self.global_env,
+                self.templates,
+                &self.lambda_schemes,
+                HashMap::new(),
+                fn_worklist,
+                impl_worklist,
+                lambda_worklist,
+                &mut call_names,
+                errors,
+                self.registry,
+            );
+        }
+        call_names.extend(infer.instance_call_names.clone());
+
+        self.produced.borrow_mut().specializations.push((
+            Some((idx, target_tys)),
+            format!("{}::{}", t.algebra, t.method_name),
+            display.clone(),
+            Specialization {
+                params: decl.params.clone(),
+                body,
+                param_types: infer.param_types.clone(),
+                result: result.clone(),
+                node_types,
+                call_names,
+                is_extern: t.is_extern,
+                extern_symbol: t.extern_symbol.clone(),
+                is_pure: t.is_pure,
+            },
+        ));
+        self.done.borrow_mut().insert(key, (display.clone(), result.clone()));
+        Some((display, result))
+    }
+}
+
+impl InstanceEngine<'_> {
+    /// Infers an instance with `infer_one` (a fresh session each round), and
+    /// while that inference asks for loops to be unrolled
+    /// (`Infer::unroll_requests`: a loop over a collection now known to be
+    /// heterogeneous), unrolls them in `decl` — this instance's own copy —
+    /// prunes the `if`s that now fold, and infers again.
+    fn infer_unrolling<'s>(
+        &'s self,
+        decl: &mut FnDecl,
+        infer_one: impl Fn(&mut Infer<'s>, &FnDecl) -> Result<Ty, TypeError>,
+    ) -> (Infer<'s>, Result<Ty, TypeError>) {
+        const MAX_ROUNDS: usize = 16;
+        let mut round = 0;
+        loop {
+            let mut infer = Infer::new_with_vars(self.registry, self.vars.get()).with_oracle(self);
+            let outcome = infer_one(&mut infer, decl);
+            self.vars.set(infer.current_vars());
+            if infer.unroll_requests.is_empty() || round == MAX_ROUNDS {
+                return (infer, outcome);
+            }
+            round += 1;
+            let requests: HashMap<NodeId, (u64, u64)> = infer
+                .unroll_requests
+                .iter()
+                .map(|(id, start, end)| (*id, (*start, *end)))
+                .collect();
+            let mut ids = NodeIdGen::starting_at(self.next_node.get());
+            if let Some(body) = &mut decl.body {
+                crate::unroll::unroll_block(body, &requests, &mut ids);
+                crate::unroll::prune_block(body);
+            }
+            self.next_node.set(ids.current());
+        }
+    }
+
+    /// The instance of generic top-level fn `name` at the concrete argument
+    /// types `args`: its body inferred with them, its result whatever that
+    /// body computes. Named after the scheme's own variables
+    /// (`display_instantiation`), as every other path names it.
+    fn specialize_fn(
+        &self,
+        name: &str,
+        args: &[Ty],
+        ret: Option<&Ty>,
+        scheme_args: Option<&[Ty]>,
+    ) -> Option<(String, Ty)> {
+        *self.last_error.borrow_mut() = None;
+        let f = *self.functions.get(name)?;
+        let scheme = self.global_env.get(name)?.clone();
+        if scheme.vars.is_empty() || f.is_extern || f.derivative_of.is_some() {
+            return None;
+        }
+        f.body.as_ref()?;
+        let key = format!(
+            "{name}<{}>({}) -> {}",
+            scheme_args
+                .map(|v| v.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "))
+                .unwrap_or_default(),
+            args.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+            ret.map(ToString::to_string).unwrap_or_default()
+        );
+        // Declared generics come first among the scheme's variables.
+        let declared: Option<Vec<Ty>> = scheme_args
+            .filter(|v| v.len() >= f.generics.len())
+            .map(|v| v[..f.generics.len()].to_vec());
+        if let Some(found) = self.done.borrow().get(&key) {
+            return Some(found.clone());
+        }
+        if !self.in_progress.borrow_mut().insert(key.clone()) {
+            return None;
+        }
+        let mut decl = f.clone();
+        let (infer, outcome) = self.infer_unrolling(&mut decl, |infer, decl| {
+            infer.infer_fn_with_concrete_params(decl, args.to_vec(), ret.cloned(), &self.global_env, declared.as_deref())
+        });
+        self.in_progress.borrow_mut().remove(&key);
+        let result = match outcome {
+            Ok(r) => r,
+            Err(e) => {
+                *self.last_error.borrow_mut() = Some(e);
+                return None;
+            }
+        };
+        let body = decl.body.clone()?;
+
+        let mut exprs = Vec::new();
+        collect_exprs_block(&body, &mut exprs);
+        let node_types: HashMap<NodeId, Ty> = exprs
+            .iter()
+            .filter_map(|e| infer.node_types.get(&e.id).map(|ty| (e.id, ty.clone())))
+            .collect();
+        if !is_fully_concrete(&result)
+            || infer.param_types.iter().any(|p| !is_fully_concrete(p))
+            || node_types.values().any(|v| !is_fully_concrete(v))
+        {
+            return None;
+        }
+        // The call's own instantiation names the instance when it gave one: a
+        // generic only a turbofish fixes (`N` in `fn probe<const N: i32>() ->
+        // i32`) appears nowhere in the signature to be recovered from.
+        let concrete_tys: Vec<Ty> = match scheme_args {
+            Some(given) if given.len() == scheme.vars.len() => given.to_vec(),
+            _ => {
+                let mut trial = Subst::default();
+                if unify(
+                    &mut trial,
+                    &scheme.ty,
+                    &Ty::Fn(infer.param_types.clone(), Box::new(result.clone())),
+                )
+                .is_err()
+                {
+                    return None;
+                }
+                // Variables only field accesses determine (`n.l1`'s type),
+                // absent from the signature.
+                resolve_field_constraints(&scheme, &mut trial, self.registry);
+                scheme.vars.iter().map(|v| trial.apply(&Ty::Var(*v))).collect()
+            }
+        };
+        if !concrete_tys.iter().all(is_fully_concrete) {
+            return None;
+        }
+        let display = display_instantiation(name, &concrete_tys);
+
+        let mut call_names = HashMap::new();
+        {
+            let mut produced = self.produced.borrow_mut();
+            let Produced {
+                fn_worklist,
+                impl_worklist,
+                lambda_worklist,
+                errors,
+                ..
+            } = &mut *produced;
+            collect_instantiations(
+                &body,
+                &node_types,
+                &self.global_env,
+                self.templates,
+                &self.lambda_schemes,
+                HashMap::new(),
+                fn_worklist,
+                impl_worklist,
+                lambda_worklist,
+                &mut call_names,
+                errors,
+                self.registry,
+            );
+        }
+        call_names.extend(infer.instance_call_names.clone());
+
+        self.produced.borrow_mut().specializations.push((
+            None,
+            name.to_string(),
+            display.clone(),
+            Specialization {
+                params: decl.params.clone(),
+                body,
+                param_types: infer.param_types.clone(),
+                result: result.clone(),
+                node_types,
+                call_names,
+                is_extern: false,
+                extern_symbol: None,
+                is_pure: f.attrs.iter().any(|a| a.name == "pure"),
+            },
+        ));
+        self.done.borrow_mut().insert(key, (display.clone(), result.clone()));
+        Some((display, result))
+    }
+}
+
+impl InstanceOracle for InstanceEngine<'_> {
+    fn fn_instance(
+        &self,
+        name: &str,
+        args: &[Ty],
+        ret: Option<&Ty>,
+        scheme_args: Option<&[Ty]>,
+    ) -> Option<(String, Ty)> {
+        self.specialize_fn(name, args, ret, scheme_args)
+    }
+
+    fn impl_instance(&self, algebra: &str, method: &str, args: &[Ty], ret: Option<&Ty>) -> Option<(String, Ty)> {
+        // The call's result, when the caller fixed it (an output-only target,
+        // a broadcast's shape); otherwise an unbound variable no template can
+        // share a number with.
+        let ret = ret.cloned().unwrap_or(Ty::Var(TyVar(u32::MAX - 1)));
+        match derive_impl_instantiation_for(self.templates, self.registry, Some(algebra), method, args, &ret) {
+            ImplMatch::FoundConcrete(idx) => {
+                let t = &self.templates[idx];
+                Some((display_impl_instantiation(t, &HashMap::new()), t.ret_pattern.clone()))
+            }
+            ImplMatch::Found(idx, mapping) => self.specialize_impl(idx, &mapping, args),
+            _ => None,
+        }
+    }
 }

@@ -46,6 +46,30 @@ algebra Optimizer<Opt, Model, State> {
     fn step(opt: Opt, model: Model, grad: Model, state: State) -> (Model, State);
 }
 
+// A model made of parts the optimizer already knows how to update: a struct
+// whose every field is a tensor or itself `Trainable` (`impl Trainable<Network>
+// {}`, written next to the struct). Opt-in, never every struct: a marked
+// struct is exactly what the impl below covers, so it can't overlap any
+// optimizer's own leaf impl (`doc/plan-compile-time-sequences.md`, "No blanket
+// impl over every struct").
+algebra Trainable<M> {}
+
+// Every `Trainable` model, for every optimizer: each field updated by its own
+// `Optimizer` impl, the model rebuilt from the new fields (`Collect`, pinned
+// to `M` by `step`'s own signature), the state one entry per field (a
+// tuple). Nothing here knows
+// the field names, their number, or which optimizer runs: the comprehensions
+// unroll once per concrete model (`unroll.rs`).
+impl<Opt, M: Trainable, S> Optimizer<Opt, M, S> {
+    fn init_state(opt, model) {
+        [for i in 0..model.len(): init_state(opt, model[i])]
+    }
+    fn step(opt, model, grad, state) {
+        let updated = [for i in 0..model.len(): step(opt, model[i], grad[i], state[i])];
+        ([for i in 0..updated.len(): updated[i][0]], [for i in 0..updated.len(): updated[i][1]])
+    }
+}
+
 // Leaf level -- the only level that actually needs to know what an
 // optimizer *is*; every level above this one (`stdlib/nn/nn.cleave`'s own
 // `Dense`-level impl, and any user struct's own `Network`-level one) is

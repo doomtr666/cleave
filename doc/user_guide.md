@@ -134,7 +134,7 @@ fn main() -> i32 {
 }
 ```
 
-Every copy has to type-check on its own element, both branches of an `if` included, even when the condition only depends on `i`.
+Each copy has to type-check on its own element. An `if` on `i` alone is decided per copy: when a condition folds from literals and operators (as `i == 1` does in each copy), only its taken branch is kept, so `if i == 1 { floats = floats + t[i] } else { ints = ints + t[i] }` works on a tuple mixing integers and floats.
 
 An algebra can be implemented once for every tuple, whatever its length, as long as each element type implements it: a pack of types (`Ts...`) with a bound reads "every element satisfies it". This is how `print` handles tuples:
 
@@ -153,6 +153,41 @@ fn main() -> i32 { show((1, 2.5:f64, 3)) }      // 12
 ```
 
 The compiler makes one concrete impl per tuple type the program actually uses, with the loop unrolled for it. Like any generic impl, its body is checked for each of those uses, and an error points at the line in the generic impl.
+
+A comprehension, `[for i in a..b: e]`, builds one `e` per index, each typed on its own like an unrolled loop's copies. Its type comes from the context, the way a number literal's does: an annotation or a parameter type can ask for an array, a tuple, or any struct, which is rebuilt from its fields' values in declaration order. With no context, elements that are all numbers of one type (or arrays of them) make an array, anything else a tuple. The bounds must be known at compile time.
+
+```
+struct Pair { a: i32, b: f64 }
+fn twice(x) { x + x }
+fn main() -> i32 {
+    let squares = [for i in 0..4: i * i];                 // [i32; 4]
+    let p = Pair(a: 1, b: 2.5);
+    let t = [for i in 0..p.len(): twice(p[i])];           // (i32, f64): (2, 5.0)
+    let q: Pair = [for i in 0..p.len(): twice(p[i])];     // the same values, as a Pair
+    if squares[3] == 9 and t[1] == 5.0 and q.b == 5.0 { 1 } else { 0 }
+}
+```
+
+This is how `optim` trains a model without knowing its shape. A struct marked `Trainable` is updated field by field, each field by its own `Optimizer` impl, so a network of layers needs one line besides its declaration:
+
+```
+struct Network { l1: Dense<f32, 784, 512>, l2: Dense<f32, 512, 10> }
+impl Trainable<Network> {}            // init_state and step now work on a Network
+```
+
+The impl doing it, in `stdlib/optim`, is written once for every marked struct and every optimizer:
+
+```
+impl<Opt, M: Trainable, S> Optimizer<Opt, M, S> {
+    fn init_state(opt, model) { [for i in 0..model.len(): init_state(opt, model[i])] }
+    fn step(opt, model, grad, state) {
+        let updated = [for i in 0..model.len(): step(opt, model[i], grad[i], state[i])];
+        ([for i in 0..updated.len(): updated[i][0]], [for i in 0..updated.len(): updated[i][1]])
+    }
+}
+```
+
+`step`'s declared result, `(Model, State)`, is what rebuilds the first comprehension as a `Network`. The state is whatever `init_state` builds, one entry per field, so no state struct has to be declared.
 
 ## Functions, and how their types get inferred
 

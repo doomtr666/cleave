@@ -886,11 +886,10 @@ pub enum TypeErrorKind {
         method: String,
         tys: String,
     },
-    /// A duck-typed fallback specialization (`monomorphize.rs`'s own
-    /// `detect_duck_typed_fns` -- a generic top-level fn whose body
-    /// couldn't be fully resolved by the ordinary one-shot HM pass, e.g.
-    /// field access on an unannotated parameter) genuinely failed to
-    /// type-check for one specific concrete call site. Unlike
+    /// One instance of a generic top-level fn (`monomorphize.rs`'s
+    /// `InstanceEngine`, which infers every instance's body at its concrete
+    /// argument types) genuinely failed to type-check for one specific
+    /// concrete call site. Unlike
     /// `MonomorphizationFailed` (a blind "no impl candidate unified", no
     /// inner detail available), this carries the real `TypeError` a full
     /// re-inference produced, span and all, pointing at the actual
@@ -1336,6 +1335,46 @@ impl Scheme {
             field_constraints: Vec::new(),
         }
     }
+}
+
+/// The monomorphizer, seen from inside an instance's inference
+/// (`doc/plan-instance-inference.md`): the result type of a generic callee's
+/// instance at concrete argument types, and the unit that instance compiles
+/// to. `None` when it has nothing to say (not a generic callee it knows, an
+/// instance still being inferred, a failure reported elsewhere).
+pub(crate) trait InstanceOracle {
+    /// `ret`: the call's result type when the caller already fixed it — an
+    /// instance whose body can't determine it alone (`.to()` into the caller's
+    /// `f32`) needs it.
+    /// `scheme_args`: the call's instantiation of the callee's scheme
+    /// variables, when every one is concrete — the only place a generic fixed
+    /// by a turbofish alone (`rep::<3>(5)`) is known.
+    fn fn_instance(
+        &self,
+        name: &str,
+        args: &[Ty],
+        ret: Option<&Ty>,
+        scheme_args: Option<&[Ty]>,
+    ) -> Option<(String, Ty)>;
+    fn impl_instance(&self, algebra: &str, method: &str, args: &[Ty], ret: Option<&Ty>) -> Option<(String, Ty)>;
+}
+
+enum InstanceCallee {
+    Fn(String),
+    Algebra(String, String),
+}
+
+/// A call recorded for the oracle (`Infer::instance_calls`).
+struct InstanceCall {
+    call_id: NodeId,
+    span: Span,
+    callee: InstanceCallee,
+    args: Vec<Ty>,
+    result: Ty,
+    /// The callee scheme's variables as this call instantiated them (a
+    /// top-level fn), `Infer::last_scheme_instantiation`.
+    scheme_args: Option<Vec<Ty>>,
+    resolved: bool,
 }
 
 /// The type name of a tuple whose elements are a still-unresolved pack
@@ -1875,6 +1914,8 @@ pub struct Infer<'r> {
     /// actually enforces it; this list is purely the "what would this
     /// default to if truly nothing else ever decides" fallback.
     pending_defaults: Vec<(TyVar, NumberDefault)>,
+    /// Comprehensions whose target type may still be open (`CollectDefault`).
+    pending_collect_defaults: Vec<CollectDefault>,
     /// Constraints not yet resolved one way or the other — either checked
     /// against the registry once their type becomes concrete
     /// (`check_pending_constraints`, at the end of `infer_fn`) or migrated
@@ -1944,14 +1985,32 @@ pub struct Infer<'r> {
     /// Loops to unroll (`NodeId`, folded bounds): a `for` whose body indexes
     /// a struct or tuple by the loop variable (`unroll.rs`).
     pub unroll_requests: Vec<(NodeId, u64, u64)>,
-    /// Concrete uses of an impl over a pack (`impl<Ts...: Show> Show<Ts...>`):
-    /// the algebra and the fully concrete types it was matched at
-    /// (`unroll.rs` turns each into a concrete impl).
-    pub pack_impl_uses: Vec<(String, Vec<Ty>)>,
+    /// Declared generics of the fn instance being inferred
+    /// (`infer_fn_with_concrete_params`): the caller's to pin, never a
+    /// body literal's default (`fn half<T: Float>() -> T { ... / 2.0 }`).
+    undefaultable: Vec<TyVar>,
+    /// Comprehensions whose bounds didn't fold yet: the call, its bounds, its
+    /// span (`fold_late_comprehensions`).
+    unfolded_comprehensions: Vec<(NodeId, Expr, Expr, Span)>,
+    /// Comprehension results in generic code, before any instance rewrites
+    /// them (and what is read out of them): nothing to check until then
+    /// (`check_pending_field_accesses`).
+    opaque_comprehensions: HashSet<TyVar>,
     /// Names of the type packs (`Ts...`, never a `const Dims...`) seen in
     /// generics: a type pack used as a whole type is the tuple of its
     /// elements (`ty_from_ast_mapped`), a const pack never is.
     type_packs: HashSet<String>,
+    /// The monomorphizer, when this inference is one of an instance
+    /// (`doc/plan-instance-inference.md`): asked for the result type of each
+    /// generic callee's instance once the call's argument types are concrete.
+    oracle: Option<&'r dyn InstanceOracle>,
+    /// Calls to generic functions and algebra methods, awaiting `oracle`.
+    instance_calls: Vec<InstanceCall>,
+    /// The unit each resolved instance call goes to (`InstanceOracle`).
+    pub instance_call_names: HashMap<NodeId, String>,
+    /// Set by `infer_call` when it instantiates a callee's scheme: those
+    /// variables' fresh types, read by `note_instance_call` right after.
+    last_scheme_instantiation: Option<Vec<Ty>>,
     /// Every type variable `generalize` has ever quantified into some
     /// binding's `Scheme` — `apply_defaults` must never bind one of these.
     /// Found necessary by testing, not by design up front: a self-recursive
@@ -2045,25 +2104,6 @@ pub struct Infer<'r> {
     /// are, re-resolved through `self.subst` at the same points `node_types`
     /// is (see `finish_fn`/`infer_impl_fn_generic_with_env`).
     pub lambda_schemes: HashMap<NodeId, Scheme>,
-    /// `monomorphize.rs`'s own `resolved_target_sigs` (`doc/backlog.md`'s
-    /// own "composing algebra impl generic over `Opt`..." entry has the
-    /// full story) — `None` for every existing caller (the ordinary whole-
-    /// program pass, `build_impl_templates`, every other fallback), opted
-    /// into *only* by the `impl_worklist` drain loop's own re-inference
-    /// fallback (`infer_impl_fn_with_concrete_targets`'s own caller).
-    /// Consulted the moment `dispatch_algebra_call` below commits for real:
-    /// an output-only generic (`State`) a fresh dispatch would otherwise
-    /// leave as a bare, permanently-open variable — nothing in *this*
-    /// session's own body-inference could ever learn its concrete value on
-    /// its own, since ordinary dispatch only ever matches *structurally*
-    /// against an impl's own declaration, never against what a *separate*,
-    /// already-computed monomorphization elsewhere resolved it to — gets
-    /// unified against this table's own answer immediately, right at the
-    /// point of commit, if this exact `(algebra, concrete gating positions)`
-    /// signature is already known. Keyed and valued identically to
-    /// `monomorphize.rs`'s own table (`(String, Vec<String>) -> Vec<Ty>>`)
-    /// so no translation is needed at the call site.
-    external_state_hint: Option<&'r HashMap<(String, Vec<String>), Vec<Ty>>>,
     /// A field access (`v.foo`) whose own base was still a bare `Ty::Var`
     /// at the point it was written — e.g. `let z = 4i; z.real`, where `z`'s
     /// own type only becomes concrete once `apply_defaults` runs, at the
@@ -2126,6 +2166,24 @@ struct PendingIndex {
     span: Span,
 }
 
+fn unfolded_comprehension(span: Span) -> TypeError {
+    TypeError {
+        kind: TypeErrorKind::Unresolved("a comprehension's bounds must be known at compile time".to_string()),
+        span,
+    }
+}
+
+/// A comprehension's `Collect::collect(tuple)` (`ast::comprehension_collect`):
+/// its target, the tuple it collects, and that tuple's element types — what
+/// `apply_collect_defaults` decides the target from when the context didn't.
+#[derive(Debug, Clone)]
+struct CollectDefault {
+    target: Ty,
+    source: Ty,
+    elements: Vec<Ty>,
+    span: Span,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NumberDefault {
     Int,
@@ -2145,9 +2203,9 @@ impl<'r> Infer<'r> {
     /// Like `new`, but seeded with an *existing* `TyVarGen` rather than a
     /// fresh one starting back at `0` — see `into_vars`'s own doc comment
     /// for why this pairing exists at all: `monomorphize.rs`'s own
-    /// `build_impl_templates` and its `impl_worklist` drain loop's own
-    /// re-inference fallback (`infer_impl_fn_with_concrete_targets`) both
-    /// mint fresh `Infer` instances, repeatedly, throughout monomorphization
+    /// `build_impl_templates` and its `InstanceEngine` (one inference per
+    /// instance) both mint fresh `Infer` instances, repeatedly, throughout
+    /// monomorphization
     /// — every one of `Infer::new`'s own callers *before* this pairing
     /// existed started counting from `0` independently, which is exactly
     /// what let two completely unrelated `TyVar`s from two different
@@ -2163,6 +2221,7 @@ impl<'r> Infer<'r> {
             subst: Subst::default(),
             vars,
             pending_defaults: Vec::new(),
+            pending_collect_defaults: Vec::new(),
             constraints: Vec::new(),
             registry,
             node_types: HashMap::new(),
@@ -2171,29 +2230,22 @@ impl<'r> Infer<'r> {
             active_generics: HashMap::new(),
             unroll_scopes: Vec::new(),
             unroll_requests: Vec::new(),
-            pack_impl_uses: Vec::new(),
+            undefaultable: Vec::new(),
+            unfolded_comprehensions: Vec::new(),
+            opaque_comprehensions: HashSet::new(),
             type_packs: HashSet::new(),
+            oracle: None,
+            instance_calls: Vec::new(),
+            instance_call_names: HashMap::new(),
+            last_scheme_instantiation: None,
             quantified: HashSet::new(),
             loop_stack: Vec::new(),
             pending_type_name_checks: Vec::new(),
             pending_div_by_zero_checks: Vec::new(),
             lambda_schemes: HashMap::new(),
-            external_state_hint: None,
             pending_field_accesses: Vec::new(),
             pending_indices: Vec::new(),
         }
-    }
-
-    /// Opts this instance into consulting `hint` the moment an algebra
-    /// dispatch commits — see `external_state_hint`'s own doc comment for
-    /// what it does and why. Builder-style, chains onto `Infer::new_with_
-    /// vars`.
-    pub(crate) fn with_external_state_hint(
-        mut self,
-        hint: &'r HashMap<(String, Vec<String>), Vec<Ty>>,
-    ) -> Self {
-        self.external_state_hint = Some(hint);
-        self
     }
 
     /// Hands back a copy of this session's own `TyVarGen` — its counter now
@@ -3072,10 +3124,10 @@ impl<'r> Infer<'r> {
         self.finish_fn(f, param_types, result)
     }
 
-    /// Like `infer_fn`, but for `monomorphize.rs`'s own duck-typed
-    /// fallback (`detect_duck_typed_fns`): `param_types` are a call site's
-    /// own already-concrete argument types, substituted in from the very
-    /// start, instead of `fresh_fn_shape`'s own fresh `Ty::Var`s. This is
+    /// Like `infer_fn`, but for one instance (`monomorphize.rs`'s
+    /// `InstanceEngine`, and roots re-inferred with it): `param_types` are a
+    /// call site's own already-concrete argument types, substituted in from
+    /// the very start, instead of `fresh_fn_shape`'s own fresh `Ty::Var`s. This is
     /// what lets a nominally-typed expression that depends on a parameter's
     /// own concrete shape (field access on what would otherwise be an
     /// unconstrained generic parameter) resolve for real, instead of
@@ -3091,8 +3143,32 @@ impl<'r> Infer<'r> {
         param_types: Vec<Ty>,
         ret_type: Option<Ty>,
         global_env: &Env,
+        declared_generics: Option<&[Ty]>,
     ) -> Result<Ty, TypeError> {
         let (_, ret_var, generics) = self.fresh_fn_shape(f);
+        // The declared generics' values when the call fixed them (a
+        // turbofish, `rep::<3>(5)`: nothing else says what `N` is).
+        if let Some(values) = declared_generics {
+            for (g, value) in f.generics.iter().zip(values) {
+                // A pack generic (`const Dims...`) takes its resolved list as
+                // a whole.
+                if let (Some(Ty::Pack(v)), Ty::PackResolved(elems)) = (generics.get(g.name()), value) {
+                    self.subst.bind_pack(*v, elems.clone());
+                    continue;
+                }
+                if let Some(var) = generics.get(g.name()) {
+                    let span = f.body.as_ref().and_then(|b| b.tail.as_deref()).map_or(
+                        Span {
+                            file: FileId(0),
+                            start: 0,
+                            end: 0,
+                        },
+                        |t| t.span,
+                    );
+                    self.unify_at(span, var, value)?;
+                }
+            }
+        }
         // The result type the call site settled on, when it did: as much a
         // part of this instantiation as the arguments (`fn evaluate(net) {
         // ... .to() ... }` returning into an `f32`).
@@ -3106,6 +3182,10 @@ impl<'r> Infer<'r> {
             f.name.clone(),
             Scheme::mono(Ty::Fn(param_types.clone(), Box::new(ret_var.clone()))),
         );
+        self.undefaultable.extend(generics.values().filter_map(|g| match g {
+            Ty::Var(v) => Some(*v),
+            _ => None,
+        }));
         let result = self.infer_fn_raw(f, &outer, param_types.clone(), ret_var, &generics)?;
         self.finish_fn(f, param_types, result)
     }
@@ -3287,6 +3367,49 @@ impl<'r> Infer<'r> {
         f: &FnDecl,
         fallback_span: Span,
     ) -> Result<Ty, TypeError> {
+        self.infer_impl_fn_core(outer, algebra, impl_generics, targets, f, fallback_span, None)
+    }
+
+    /// An instance of an impl method (`doc/plan-instance-inference.md`): the
+    /// impl's own targets unified with `concrete_targets` and its parameters
+    /// with `arg_types` *before* the body is inferred, so every generic of
+    /// the impl is bound — not quantified — while the body is checked. A
+    /// target the call left open stays a variable of this session, decided by
+    /// the body (an optimizer's state).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn infer_impl_fn_instance(
+        &mut self,
+        outer: &Env,
+        algebra: &str,
+        impl_generics: &[GenericParam],
+        targets: &[Type],
+        f: &FnDecl,
+        fallback_span: Span,
+        concrete_targets: &[Ty],
+        arg_types: &[Ty],
+    ) -> Result<Ty, TypeError> {
+        self.infer_impl_fn_core(
+            outer,
+            algebra,
+            impl_generics,
+            targets,
+            f,
+            fallback_span,
+            Some((concrete_targets, arg_types)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn infer_impl_fn_core(
+        &mut self,
+        outer: &Env,
+        algebra: &str,
+        impl_generics: &[GenericParam],
+        targets: &[Type],
+        f: &FnDecl,
+        fallback_span: Span,
+        instance: Option<(&[Ty], &[Ty])>,
+    ) -> Result<Ty, TypeError> {
         let Some(sig) = self.registry.fn_sig(algebra, &f.name).cloned() else {
             return Err(TypeError {
                 span: fallback_span,
@@ -3319,6 +3442,11 @@ impl<'r> Infer<'r> {
             .iter()
             .map(|t| self.ty_from_ast_mapped(t, &impl_mapping))
             .collect();
+        if let Some((concrete_targets, _)) = instance {
+            for (declared, concrete) in target_tys.iter().zip(concrete_targets) {
+                self.unify_at(fallback_span, declared, concrete)?;
+            }
+        }
         self.target_types = target_tys.clone();
 
         // The algebra's own generic parameters bind, *positionally*, to
@@ -3375,6 +3503,11 @@ impl<'r> Infer<'r> {
             param_types.push(ty.clone());
             env.insert(p.name.clone(), Scheme::mono(ty));
         }
+        if let Some((_, arg_types)) = instance {
+            for (declared, concrete) in param_types.iter().zip(arg_types) {
+                self.unify_at(fallback_span, declared, concrete)?;
+            }
+        }
         self.seed_const_generics(impl_generics, &impl_mapping, &mut env);
 
         let expected_ret = sig
@@ -3423,7 +3556,9 @@ impl<'r> Infer<'r> {
             }
         };
 
-        self.quantify_impl_generics(&impl_mapping);
+        if instance.is_none() {
+            self.quantify_impl_generics(&impl_mapping);
+        }
         let final_result = self.finish_fn(f, param_types, result)?;
         // `finish_fn` already re-resolves `self.param_types`/`node_types`
         // through the final substitution before returning — `target_types`
@@ -3438,181 +3573,8 @@ impl<'r> Infer<'r> {
         Ok(final_result)
     }
 
-    /// Like `infer_impl_fn_generic_with_env`, but for `monomorphize.rs`'s own
-    /// duck-typed-style fallback (`doc/backlog.md`'s own "composing algebra
-    /// impl generic over `Opt`..." entry, and `monomorphize.rs`'s own
-    /// `impl_worklist` drain loop, right alongside `fn_worklist`'s existing
-    /// `infer_fn_with_concrete_params` fallback): `target_tys`/`param_types`
-    /// are a real specialization's own types — as concrete as `monomorphize.
-    /// rs`'s own caller could make them (see its own `resolved_target_sigs`
-    /// doc comment for how a sibling specialization's own resolved `State`
-    /// gets folded in *before* this is ever called), not necessarily fully
-    /// so yet. No `impl_generics`/`fresh_generics_mapping`/`active_generics`
-    /// at all — there's no longer anything generic left to *protect*
-    /// (`quantify_impl_generics` doesn't apply either, for the identical
-    /// reason).
-    ///
-    /// This is what lets a still-generic impl's own *body* — one that
-    /// dispatches a nested algebra call whose own leaf can't be resolved
-    /// while `Opt` (or any other impl-level generic) is still abstract, e.g.
-    /// `Optimizer<Opt, Wrap<T>, WrapState<StateA,StateB>>`'s own body calling
-    /// `Optimizer::init_state(opt, model.a)` — resolve for real, once `Opt`
-    /// really is concrete (`Sgd`), instead of forever carrying a leftover,
-    /// structurally disconnected free type variable that `monomorphize.rs`'s
-    /// own ordinary `substitute()` (a pure variable-*rename*, never a real
-    /// dispatch) can never repair: `infer_impl_fn_generic_with_env`'s own
-    /// one-time, wholly-generic body check is sound but *necessarily*
-    /// defers any nested dispatch that isn't provably unambiguous with
-    /// `Opt` still abstract (`unambiguous_and_preserves_openness`'s own doc
-    /// comment) — and a deferred `Constraint` inside a still-abstract
-    /// declaration is *never* resolved (`check_pending_constraints`'s own
-    /// doc comment: "not migrated into a `Scheme`... a real gap, not a
-    /// silent decision to ignore it"). Re-running inference here, with every
-    /// target/param type already as concrete as it can be, sidesteps the
-    /// gap entirely rather than trying to patch around it: ordinary dispatch
-    /// — the ready-to-commit path `infer_algebra_call` already has — just
-    /// works, the same way it does for any other fully-concrete call site.
-    ///
-    /// Any position still carrying a free variable (a `State` no sibling has
-    /// resolved *yet* — this may be the very first specialization of this
-    /// impl block anyone's ever built) gets an ordinary fresh, session-local
-    /// one — meaningless to thread the caller's own stale `TyVar` through
-    /// literally (it belongs to whichever *different*, already-abandoned
-    /// `Infer` session built the frozen template in the first place) —
-    /// structure survives (`WrapState<_,_>`, not a bare var), only the
-    /// leaves are refreshed, so field access (`state.a`) still knows what
-    /// it's looking at, and this session's own real inference gets a real
-    /// chance to pin the leaves down itself (exactly the `init_state`
-    /// case — genuinely output-only, no sibling needed at all).
-    ///
-    /// Const generics on the impl itself (`In`/`Out` on `Dense<T,In,Out>`)
-    /// are *not* separately seeded as values here, unlike `infer_impl_fn_
-    /// generic_with_env`'s own `seed_const_generics` call — `target_tys`
-    /// being concrete already bakes them into every type position that
-    /// matters; nothing this fallback exists for (a still-generic impl's own
-    /// pure composing/forwarding body) references one as a bare value
-    /// expression. A body that genuinely needs one as a value would need
-    /// this extended — not required by any real caller today.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn infer_impl_fn_with_concrete_targets(
-        &mut self,
-        algebra: &str,
-        method_name: &str,
-        target_tys: &[Ty],
-        params: &[Param],
-        body: &Block,
-        param_types: Vec<Ty>,
-        fallback_span: Span,
-    ) -> Result<Ty, TypeError> {
-        let Some(sig) = self.registry.fn_sig(algebra, method_name).cloned() else {
-            return Err(TypeError {
-                span: fallback_span,
-                kind: TypeErrorKind::NotDeclaredByAlgebra {
-                    algebra: algebra.to_string(),
-                    name: method_name.to_string(),
-                },
-            });
-        };
-        if sig.params.len() != params.len() {
-            return Err(TypeError {
-                span: fallback_span,
-                kind: TypeErrorKind::ArityMismatch {
-                    name: method_name.to_string(),
-                    expected: sig.params.len(),
-                    found: params.len(),
-                },
-            });
-        }
-
-        // Every free variable anywhere across `target_tys`/`param_types` —
-        // whatever `monomorphize.rs`'s own structural lookup couldn't fill
-        // in — belongs to a *different*, already-abandoned `Infer` session,
-        // meaningless to `self.subst` here. One shared rename, consistent
-        // across *every* position at once (so `State` showing up in both a
-        // parameter and the return type still resolves to the very same
-        // fresh var, not two independent ones) — everything *structural*
-        // survives the rename untouched, only the genuinely-still-open
-        // leaves get fresh, session-local variables.
-        let mut stale_free = HashSet::new();
-        target_tys.iter().for_each(|t| free_vars(t, &mut stale_free));
-        param_types.iter().for_each(|t| free_vars(t, &mut stale_free));
-        let rename: HashMap<TyVar, Ty> = stale_free
-            .into_iter()
-            .map(|v| (v, self.vars.fresh()))
-            .collect();
-        let target_tys: Vec<Ty> = target_tys.iter().map(|t| substitute(t, &rename)).collect();
-        let param_types: Vec<Ty> = param_types.iter().map(|t| substitute(t, &rename)).collect();
-        self.target_types = target_tys.clone();
-
-        let generics = self.registry.generics(algebra).to_vec();
-        let mut target_ty_iter = target_tys.iter();
-        let mapping: HashMap<String, Ty> = generics
-            .iter()
-            .filter_map(|g| match g {
-                GenericParam::Type { name, .. } => {
-                    target_ty_iter.next().map(|ty| (name.clone(), ty.clone()))
-                }
-                GenericParam::Const { name, .. } => Some((name.clone(), self.vars.fresh())),
-            })
-            .collect();
-
-        let mut env = Env::new();
-        for (p, ty) in params.iter().zip(&param_types) {
-            env.insert(p.name.clone(), Scheme::mono(ty.clone()));
-        }
-
-        let expected_ret = sig
-            .ret
-            .as_ref()
-            .map(|t| self.ty_from_ast_mapped(t, &mapping))
-            .unwrap_or_else(|| Ty::Con("()".to_string()));
-
-        let result = self.infer_block(&env, body)?;
-        let result_span = body
-            .tail
-            .as_deref()
-            .map(|t| t.span)
-            .unwrap_or(fallback_span);
-        self.unify_at(result_span, &expected_ret, &result)?;
-
-        // The relevant subset of `finish_fn` — no `FnDecl` exists here to
-        // hand it (`monomorphize.rs`'s own `ImplTemplate` never kept one,
-        // just the pieces this method takes directly), so its final
-        // `check_no_placeholder` call is inlined by hand instead, against
-        // `body`'s own span exactly the way `check_no_placeholder` itself
-        // would resolve one from a real `FnDecl`.
-        self.resolve_ready_field_accesses()?;
-        self.apply_defaults();
-        self.check_pending_constraints_and_indices()?;
-        self.check_pending_type_names()?;
-        self.check_pending_div_by_zero()?;
-        self.check_pending_field_accesses()?;
-
-        self.param_types = param_types.iter().map(|t| self.subst.apply(t)).collect();
-        let resolved_nodes: Vec<(NodeId, Ty)> = self
-            .node_types
-            .iter()
-            .map(|(id, t)| (*id, self.subst.apply(t)))
-            .collect();
-        self.node_types = resolved_nodes.into_iter().collect();
-        self.resolve_lambda_schemes();
-
-        let final_result = self.subst.apply(&result);
-        let unresolved = find_placeholder_name(&final_result)
-            .or_else(|| self.param_types.iter().find_map(find_placeholder_name));
-        if let Some(placeholder) = unresolved {
-            return Err(TypeError {
-                span: result_span,
-                kind: TypeErrorKind::Unresolved(placeholder),
-            });
-        }
-
-        Ok(final_result)
-    }
-
     fn finish_fn(&mut self, f: &FnDecl, param_types: Vec<Ty>, result: Ty) -> Result<Ty, TypeError> {
-        self.resolve_ready_field_accesses()?;
-        self.apply_defaults();
+        self.settle_before_checks()?;
         // After defaulting, since defaulting can turn an abstract
         // `Num`-constrained variable concrete — check it against that
         // default, don't just assume defaulting made it automatically fine.
@@ -4454,17 +4416,6 @@ impl<'r> Infer<'r> {
                 GenericParam::Const { .. } => true,
             });
             if bounds_satisfied {
-                if generics
-                    .iter()
-                    .any(|g| matches!(g, GenericParam::Type { variadic: true, .. }))
-                {
-                    let concrete: Vec<Ty> = query.iter().map(|q| trial.apply(q)).collect();
-                    if concrete.iter().all(is_fully_concrete)
-                        && !self.pack_impl_uses.iter().any(|(a, tys)| a == algebra && *tys == concrete)
-                    {
-                        self.pack_impl_uses.push((algebra.to_string(), concrete));
-                    }
-                }
                 out.push(trial);
             }
         }
@@ -5027,6 +4978,17 @@ impl<'r> Infer<'r> {
             if matches!(resolved, Ty::Var(v) if self.quantified.contains(&v)) {
                 continue;
             }
+            // Through a comprehension not rewritten yet (generic code): only
+            // its instances know what it holds. Accesses chained off this one
+            // come later in the list, so they see its result as opaque too.
+            if let Ty::Var(v) = resolved {
+                if self.opaque_comprehensions.contains(&v) {
+                    if let Ty::Var(r) = self.subst.apply(&Ty::Var(pending.result)) {
+                        self.opaque_comprehensions.insert(r);
+                    }
+                    continue;
+                }
+            }
             let field_ty = if matches!(resolved, Ty::Var(_)) || is_placeholder(&resolved) {
                 Ty::Con("<not-yet-inferred>".to_string())
             } else {
@@ -5040,6 +5002,83 @@ impl<'r> Infer<'r> {
     /// A `for` bound's value when it folds: a constant expression, or the
     /// length of a struct or tuple (`len(t)`, `t.len()`: its number of
     /// fields, known from its type alone).
+    fn note_collect_default(&mut self, expr: &Expr, source: &Expr, target: &Ty) {
+        let elements = match &source.kind {
+            ExprKind::StructLit(_, _, fields) => fields
+                .iter()
+                .filter_map(|(_, v)| self.node_types.get(&v.id).cloned())
+                .collect(),
+            _ => self.node_types.get(&source.id).cloned().into_iter().collect(),
+        };
+        let Some(source) = self.node_types.get(&source.id).cloned() else { return };
+        self.pending_collect_defaults.push(CollectDefault {
+            target: target.clone(),
+            source,
+            elements,
+            span: expr.span,
+        });
+    }
+
+    /// `[for i in a..b: e]` (`<comprehension>(a, b, fn(i) { e })`): a tuple
+    /// of one `e` per index, which only exists once rewritten as such
+    /// (`unroll.rs`). With bounds that fold, this asks for that rewrite and
+    /// the copies are inferred next round; the placeholder type meanwhile
+    /// says nothing. Bounds that don't fold yet are fine in code still
+    /// generic (they may fold per instance), an error in a concrete instance.
+    fn infer_comprehension(&mut self, env: &Env, expr: &Expr, args: &[Expr]) -> Result<Ty, TypeError> {
+        let [start, end, _] = args else {
+            unreachable!("a comprehension lowers to exactly (start, end, body)")
+        };
+        let start_ty = self.infer_expr(env, start)?;
+        let end_ty = self.infer_expr(env, end)?;
+        self.unify_at(end.span, &start_ty, &end_ty)?;
+        let (s, e) = (self.fold_loop_bound(start), self.fold_loop_bound(end));
+        let never_folds = |this: &Self, folded: Option<u64>, bound: &Expr| {
+            folded.is_none() && !this.may_fold_later(bound)
+        };
+        let never = never_folds(self, s, start) || never_folds(self, e, end);
+        match (s, e) {
+            (Some(s), Some(e)) => {
+                if !self.unroll_requests.iter().any(|(id, _, _)| *id == expr.id) {
+                    self.unroll_requests.push((expr.id, s, e.max(s)));
+                }
+            }
+            _ if never => return Err(unfolded_comprehension(expr.span)),
+            // Bounds still open may fold once the body is fully inferred
+            // (`[for i in 0..updated.len(): ...]`, `updated` itself a
+            // comprehension, typed by its default at the end): tried again
+            // then (`fold_late_comprehensions`).
+            _ => self.unfolded_comprehensions.push((expr.id, start.clone(), end.clone(), expr.span)),
+        }
+        let placeholder = self.vars.fresh();
+        if self.oracle.is_none() {
+            if let Ty::Var(v) = placeholder {
+                self.opaque_comprehensions.insert(v);
+            }
+        }
+        Ok(placeholder)
+    }
+
+    /// Whether a bound that doesn't fold now might in some instance: it names
+    /// something whose type is still open (an unannotated parameter, a
+    /// declared generic). A bound naming only concretely typed values never
+    /// will.
+    fn may_fold_later(&self, bound: &Expr) -> bool {
+        fn walk(this: &Infer, e: &Expr) -> bool {
+            match &e.kind {
+                ExprKind::Path(p) => {
+                    p.segments.len() == 1 && this.active_generics.contains_key(&p.segments[0])
+                        || this.node_types.get(&e.id).is_none_or(|t| !is_fully_concrete(&this.subst.apply(t)))
+                }
+                ExprKind::Call(_, _, args, _) => args.iter().any(|a| walk(this, a)),
+                ExprKind::FieldAccess(b, _) => walk(this, b),
+                ExprKind::Index(b, idx) => walk(this, b) || idx.iter().any(|i| walk(this, i)),
+                _ => false,
+            }
+        }
+        walk(self, bound)
+    }
+
     fn fold_loop_bound(&mut self, bound: &Expr) -> Option<u64> {
         let mapping = self.active_generics.clone();
         if let Some(Ty::Const(ConstValue::Int(n))) = self.const_value_from_expr(bound, &mapping) {
@@ -5053,11 +5092,38 @@ impl<'r> Infer<'r> {
             return None;
         }
         let arg_ty = self.subst.apply(self.node_types.get(&arg.id)?);
+        // An array's length is in its type (a comprehension over
+        // same-typed elements is one).
+        if let Ty::Array(_, size) = &arg_ty {
+            return match size.as_ref() {
+                Ty::Const(ConstValue::Int(n)) => Some(*n),
+                _ => None,
+            };
+        }
         if !self.is_positional_struct(&arg_ty) {
             return None;
         }
         let (Ty::Con(name) | Ty::App(name, _)) = &arg_ty else { return None };
         self.registry.struct_fields(name).map(|fields| fields.len() as u64)
+    }
+
+    /// A collection whose element type at a loop index isn't known generically:
+    /// a declared generic of the item being inferred (`model: M`), or the
+    /// tuple of a type pack. An ordinary still-open type is not: it is
+    /// resolved later, like any deferred index.
+    fn is_generic_collection(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Var(_) => self.active_generics.values().any(|g| self.subst.apply(g) == *ty),
+            Ty::App(name, _) => name == TUPLE_OF_PACK,
+            _ => false,
+        }
+    }
+
+    /// Whether `idx` is exactly the variable of an enclosing `for`.
+    fn is_loop_variable(&self, idx: &Expr) -> bool {
+        let ExprKind::Path(p) = &idx.kind else { return false };
+        let [name] = p.segments.as_slice() else { return false };
+        self.unroll_scopes.iter().any(|(var, _, _)| var == name)
     }
 
     /// When `idx` is the variable of an enclosing `for` whose bounds fold:
@@ -5068,6 +5134,160 @@ impl<'r> Infer<'r> {
         let (_, for_id, bounds) = self.unroll_scopes.iter().rev().find(|(var, _, _)| var == name)?;
         let (start, end) = (*bounds)?;
         Some((*for_id, start, end))
+    }
+
+    /// A fresh type variable of this session.
+    pub(crate) fn fresh_var(&mut self) -> Ty {
+        self.vars.fresh()
+    }
+
+    /// Makes this inference one of an instance: generic callees' result types
+    /// come from `oracle` (`doc/plan-instance-inference.md`).
+    pub(crate) fn with_oracle(mut self, oracle: &'r dyn InstanceOracle) -> Self {
+        self.oracle = Some(oracle);
+        self
+    }
+
+    /// Records a call to a generic function or an algebra method for the
+    /// oracle — a no-op without one.
+    fn note_instance_call(&mut self, env: &Env, expr: &Expr, path: &Path, args: &[Expr], result: &Ty) {
+        if self.oracle.is_none() {
+            return;
+        }
+        let callee = match path.segments.as_slice() {
+            [algebra, method] if self.registry.has_algebra(algebra) => {
+                InstanceCallee::Algebra(algebra.clone(), method.clone())
+            }
+            [name] if env.get(name).is_some_and(|s| !s.vars.is_empty()) => InstanceCallee::Fn(name.clone()),
+            _ => return,
+        };
+        let Some(args) = args.iter().map(|a| self.node_types.get(&a.id).cloned()).collect() else {
+            return;
+        };
+        let scheme_args = match callee {
+            InstanceCallee::Fn(_) => self.last_scheme_instantiation.take(),
+            InstanceCallee::Algebra(..) => None,
+        };
+        self.instance_calls.push(InstanceCall {
+            call_id: expr.id,
+            span: expr.span,
+            callee,
+            args,
+            result: result.clone(),
+            scheme_args,
+            resolved: false,
+        });
+    }
+
+    /// Resolves every recorded call whose argument types are concrete by
+    /// now through the oracle: its result type becomes the callee
+    /// instance's. Repeated while it progresses — one result can make
+    /// another call's arguments concrete.
+    fn resolve_instance_calls(&mut self) -> Result<(), TypeError> {
+        let Some(oracle) = self.oracle else {
+            return Ok(());
+        };
+        loop {
+            let mut progressed = false;
+            for i in 0..self.instance_calls.len() {
+                if self.instance_calls[i].resolved {
+                    continue;
+                }
+                let args: Vec<Ty> = self.instance_calls[i].args.iter().map(|t| self.subst.apply(t)).collect();
+                if !args.iter().all(is_fully_concrete) {
+                    continue;
+                }
+                let ret = self.subst.apply(&self.instance_calls[i].result);
+                let ret = is_fully_concrete(&ret).then_some(&ret);
+                let answer = match &self.instance_calls[i].callee {
+                    InstanceCallee::Fn(name) => {
+                        let scheme_args: Option<Vec<Ty>> = self.instance_calls[i]
+                            .scheme_args
+                            .as_ref()
+                            .map(|v| v.iter().map(|t| self.subst.apply(t)).collect())
+                            .filter(|v: &Vec<Ty>| v.iter().all(is_fully_concrete));
+                        oracle.fn_instance(name, &args, ret, scheme_args.as_deref())
+                    }
+                    InstanceCallee::Algebra(algebra, method) => oracle.impl_instance(algebra, method, &args, ret),
+                };
+                // Unanswered (an output still open): retried once more is
+                // known, after defaulting.
+                let Some((unit, result)) = answer else { continue };
+                self.instance_calls[i].resolved = true;
+                let (call_id, span, call_result) = {
+                    let c = &self.instance_calls[i];
+                    (c.call_id, c.span, c.result.clone())
+                };
+                self.unify_at(span, &call_result, &result)?;
+                self.instance_call_names.insert(call_id, unit);
+                progressed = true;
+            }
+            self.resolve_ready_field_accesses()?;
+            if !progressed {
+                return Ok(());
+            }
+        }
+    }
+
+    /// What every inference does before defaulting and its final checks:
+    /// resolve what can be (field accesses, instance calls), default, and
+    /// resolve again what defaulting made concrete.
+    fn settle_before_checks(&mut self) -> Result<(), TypeError> {
+        self.settle_deferred()?;
+        self.settle_collect_targets();
+        self.settle_deferred()?;
+        self.apply_defaults();
+        self.settle_deferred()?;
+        self.fold_late_comprehensions()
+    }
+
+    /// Comprehensions whose bounds didn't fold while the body was inferred,
+    /// tried again once it has been: a bound that folds now asks for the
+    /// rewrite like any other. In an instance, one that still doesn't fold
+    /// is an error, unless this round rewrites something else (whose result
+    /// may be what it waits on); in generic code it waits for its instances.
+    pub(crate) fn fold_late_comprehensions(&mut self) -> Result<(), TypeError> {
+        let mut unfolded = None;
+        for (id, start, end, span) in std::mem::take(&mut self.unfolded_comprehensions) {
+            match (self.fold_loop_bound(&start), self.fold_loop_bound(&end)) {
+                (Some(s), Some(e)) => {
+                    if !self.unroll_requests.iter().any(|(r, _, _)| *r == id) {
+                        self.unroll_requests.push((id, s, e.max(s)));
+                    }
+                }
+                _ => {
+                    unfolded = unfolded.or(Some(span))
+                }
+            }
+        }
+        match unfolded {
+            Some(span) if self.oracle.is_some() && self.unroll_requests.is_empty() => {
+                Err(unfolded_comprehension(span))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Deferred field accesses and instance calls, until neither moves: an
+    /// instance's answer can fix a value's type, which an access waits on
+    /// (`let a = f(t); a[1]`, `f`'s result only known from its instance),
+    /// and the other way round.
+    fn settle_deferred(&mut self) -> Result<(), TypeError> {
+        loop {
+            let before = (
+                self.pending_field_accesses.len(),
+                self.instance_calls.iter().filter(|c| !c.resolved).count(),
+            );
+            self.resolve_ready_field_accesses()?;
+            self.resolve_instance_calls()?;
+            let after = (
+                self.pending_field_accesses.len(),
+                self.instance_calls.iter().filter(|c| !c.resolved).count(),
+            );
+            if after == before {
+                return Ok(());
+            }
+        }
     }
 
     /// Whether `x[k]` on a value of type `ty` means its `k`-th field: a
@@ -5661,6 +5881,25 @@ impl<'r> Infer<'r> {
                     Box::new(b),
                 ))
             }
+            // An operator `resolve.rs` qualified (`0 == 1` is `Ord::eq(0, 1)`
+            // by now): folded when every operand is a constant, the method
+            // name being the operator's — what lets an `if` on a folding
+            // condition be decided at compile time.
+            ExprKind::Call(path, _, args, ..) if path.operator => {
+                let op = path.segments.last()?.clone();
+                let mut operands = Vec::with_capacity(args.len());
+                for a in args {
+                    let Ty::Const(v) = self.const_value_from_expr(a, mapping)? else {
+                        return None;
+                    };
+                    operands.push(v);
+                }
+                match operands.as_slice() {
+                    [a] => const_eval::eval_unop(&op, *a).map(Ty::Const),
+                    [a, b] => const_eval::eval_binop(&op, *a, *b).map(Ty::Const),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
@@ -6085,8 +6324,17 @@ impl<'r> Infer<'r> {
                 }
                 Ok(self.vars.fresh())
             }
+            ExprKind::Call(path, _, args, _) if path.segments == [COMPREHENSION] => {
+                self.infer_comprehension(env, expr, args)
+            }
             ExprKind::Call(path, generics, args, _) => {
-                self.infer_call(env, expr.span, path, generics, args)
+                self.last_scheme_instantiation = None;
+                let ty = self.infer_call(env, expr.span, path, generics, args)?;
+                if is_comprehension_collect(path) {
+                    self.note_collect_default(expr, &args[0], &ty);
+                }
+                self.note_instance_call(env, expr, path, args, &ty);
+                Ok(ty)
             }
             ExprKind::Block(b) => self.infer_block(env, b),
             ExprKind::If {
@@ -6103,6 +6351,17 @@ impl<'r> Infer<'r> {
                             ElseBranch::If(e) => self.infer_expr(env, e)?,
                             ElseBranch::Block(b) => self.infer_block(env, b)?,
                         };
+                        // Two different const-generic values as branch results
+                        // (`if t { A1 } else { A0 }`, `A1 = 32`, `A0 = 1` in
+                        // one instance): the `if` yields an ordinary integer,
+                        // not one of the two constants.
+                        if let (Ty::Const(ConstValue::Int(a)), Ty::Const(ConstValue::Int(b))) =
+                            (self.subst.apply(&then_ty), self.subst.apply(&else_ty))
+                        {
+                            if a != b {
+                                return Ok(Ty::Con("i32".to_string()));
+                            }
+                        }
                         self.unify_at(expr.span, &then_ty, &else_ty)?;
                         Ok(then_ty)
                     }
@@ -6333,6 +6592,14 @@ impl<'r> Infer<'r> {
                             }
                             return Ok(self.vars.fresh());
                         }
+                    } else if self.is_loop_variable(idx) && self.is_generic_collection(&resolved_base) {
+                        // A generic collection (a type pack's tuple, a still
+                        // open type) indexed by a loop variable, in generic
+                        // code: each instance unrolls the loop on its own
+                        // copy, with the collection concrete
+                        // (`doc/plan-instance-inference.md`); generically,
+                        // the element is just some type.
+                        return Ok(self.vars.fresh());
                     }
                 }
                 match &resolved_base {
@@ -6731,6 +6998,7 @@ impl<'r> Infer<'r> {
             // callee is a `Path`, not an arbitrary `Expr` (see
             // `grammar.pest`'s `lambda_expr` note) — deliberately deferred.
             let (instantiated, mapping) = self.instantiate_with_mapping(&scheme);
+            self.last_scheme_instantiation = Some(scheme.vars.iter().map(|v| mapping[v].clone()).collect());
             if !explicit_generics.is_empty() {
                 if explicit_generics.len() != scheme.vars.len() {
                     return Err(TypeError {
@@ -6894,7 +7162,17 @@ impl<'r> Infer<'r> {
             .unwrap_or_else(|| Ty::Con("()".to_string()));
 
         for (pt, (at, span)) in param_tys.iter().zip(arg_tys.iter().zip(arg_spans)) {
-            self.unify_at(*span, pt, at)?;
+            // A const generic's value (`P` in `P * Q`, typed by the constant
+            // itself) is an ordinary integer to an algebra method, as
+            // `cps.rs::dispatch_ty` widens it for dispatch: otherwise two
+            // different constants (`1`, `32`) could never meet in one
+            // `Ring<T>::mul`.
+            let at = match self.subst.apply(at) {
+                Ty::Const(ConstValue::Int(_)) => Ty::Con("i32".to_string()),
+                Ty::Const(ConstValue::Bool(_)) => Ty::Con("bool".to_string()),
+                _ => at.clone(),
+            };
+            self.unify_at(*span, pt, &at)?;
         }
 
         // Checked against the *algebra's own* generics (positionally
@@ -7021,7 +7299,7 @@ impl<'r> Infer<'r> {
             // sound here specifically), which is what lets an output-only
             // generic like `C` end up resolved at all.
             match self.dispatch_algebra_call(algebra, &resolved_generics, call_span) {
-                Ok(true) => self.apply_external_state_hint(algebra, &resolved_generics),
+                Ok(true) => {}
                 Ok(false) => {
                     let ty = resolved_generics
                         .iter()
@@ -7094,52 +7372,6 @@ impl<'r> Infer<'r> {
         Ok(self.subst.apply(&ret_ty))
     }
 
-    /// `external_state_hint`'s own doc comment has the full story of why
-    /// this exists. Called right after `dispatch_algebra_call` commits for
-    /// real — `resolved_generics` reflects the just-matched candidate's own
-    /// *structural* binding at this point (an output-only `State` position
-    /// is a real, shaped `WrapState<'a,'b>` now, not a bare disconnected
-    /// var — dispatch itself already did that much), but the *leaves*
-    /// (`'a`/`'b`) are still open, since ordinary dispatch only ever proves
-    /// the shape, never the concrete contents. If `monomorphize.rs`'s own
-    /// table already has a fully-concrete answer for this exact `(algebra,
-    /// concrete gating positions)` signature — from some *separate*,
-    /// already-finished specialization elsewhere, structurally unrelated to
-    /// this call site — unify it in directly, right now, closing the gap
-    /// completely instead of leaving it for a caller that has no way to
-    /// ever learn it on its own.
-    ///
-    /// Best-effort and silent on any failure (`hint_table.get` finding
-    /// nothing, or the unify itself failing) — this is purely *additional*
-    /// information layered onto an already-sound commit, never a new way to
-    /// reject an otherwise-valid program; a mismatched hint would only ever
-    /// mean the table itself is stale or wrong, not that *this* call is.
-    fn apply_external_state_hint(&mut self, algebra: &str, resolved_generics: &[Ty]) {
-        let Some(hint_table) = self.external_state_hint else {
-            return;
-        };
-        let current: Vec<Ty> = resolved_generics.iter().map(|t| self.subst.apply(t)).collect();
-        let key = (
-            algebra.to_string(),
-            current
-                .iter()
-                .map(|t| {
-                    if is_fully_concrete(t) {
-                        t.to_string()
-                    } else {
-                        "?".to_string()
-                    }
-                })
-                .collect::<Vec<_>>(),
-        );
-        let Some(known_full) = hint_table.get(&key) else {
-            return;
-        };
-        for (cur, known) in current.iter().zip(known_full) {
-            let _ = unify(&mut self.subst, cur, known);
-        }
-    }
-
     /// Defaults any number-literal type variable never pinned to a concrete
     /// type by unification — mirrors Haskell's numeric-literal defaulting.
     ///
@@ -7189,6 +7421,86 @@ impl<'r> Infer<'r> {
     /// quantified variable) — so `Int`/`Float` get exactly the same
     /// treatment `Num` already had, with zero special-casing needed here.
     pub(crate) fn apply_defaults(&mut self) {
+        self.settle_collect_targets();
+        self.apply_number_defaults();
+        self.apply_collect_defaults(false);
+    }
+
+    /// What comprehensions can decide before any literal takes its default:
+    /// a source typed by a target the context fixed
+    /// (`refine_collect_sources`), and the default target of one whose
+    /// elements are all concrete already (`mixed[1] == 2.5` then compares
+    /// against the element's own type, not `2.5`'s default). Run before
+    /// deferred field accesses settle, so those see the result.
+    pub(crate) fn settle_collect_targets(&mut self) {
+        self.refine_collect_sources();
+        self.apply_collect_defaults(true);
+    }
+
+    /// A comprehension whose target its context fixed (`let v: [f64; 3] =
+    /// [for i in 0..3: 0.5]`): when exactly one `Collect` impl fits that
+    /// target, its source pattern types the elements, before their literals
+    /// take their own defaults (`0.5` is an `f64` here, not an `f32`).
+    fn refine_collect_sources(&mut self) {
+        for d in self.pending_collect_defaults.clone() {
+            let target = self.subst.apply(&d.target);
+            if matches!(target, Ty::Var(_)) {
+                continue;
+            }
+            let source = self.subst.apply(&d.source);
+            if let [only] = self.matching_impls("Collect", &[target, source]).as_slice() {
+                self.subst = only.clone();
+            }
+        }
+    }
+
+    /// A comprehension's target when its context never fixed one
+    /// (`CollectDefault`), decided once the literals inside its elements have
+    /// their own defaults: an array when every element has the same scalar
+    /// (or array) type, the tuple of the elements otherwise. A target still open because it's
+    /// quantified belongs to each instance, which decides it there.
+    fn apply_collect_defaults(&mut self, only_concrete: bool) {
+        for d in std::mem::take(&mut self.pending_collect_defaults) {
+            let Ty::Var(root) = self.subst.apply(&d.target) else { continue };
+            if self.quantified.contains(&root)
+                || self.undefaultable.iter().any(|v| self.subst.apply(&Ty::Var(*v)) == Ty::Var(root))
+            {
+                continue;
+            }
+            let elements: Vec<Ty> = d.elements.iter().map(|t| self.subst.apply(t)).collect();
+            if only_concrete && !elements.iter().all(is_fully_concrete) {
+                self.pending_collect_defaults.push(d);
+                continue;
+            }
+            // Arrays of scalars (or of arrays of them) only: an array of
+            // tensors or of structs isn't representable by every backend
+            // path yet (`doc/backlog.md`), and a tuple of same-typed values
+            // indexes just as well at compile time.
+            fn array_element(t: &Ty) -> bool {
+                match t {
+                    Ty::Con(_) => true,
+                    Ty::Array(e, _) => array_element(e),
+                    _ => false,
+                }
+            }
+            let homogeneous = elements.len() >= 2
+                && elements.iter().all(is_fully_concrete)
+                && array_element(&elements[0])
+                && elements.windows(2).all(|w| w[0] == w[1]);
+            let default = if homogeneous {
+                Ty::Array(
+                    Box::new(elements[0].clone()),
+                    Box::new(Ty::Const(ConstValue::Int(elements.len() as u64))),
+                )
+            } else {
+                d.source.clone()
+            };
+            // Cannot fail: `root` is an unbound variable.
+            let _ = self.unify_at(d.span, &Ty::Var(root), &default);
+        }
+    }
+
+    fn apply_number_defaults(&mut self) {
         let mut defaults = std::mem::take(&mut self.pending_defaults);
         // A `Complex` default must win over a merged `Int`/`Float` sibling
         // regardless of source order — `5.0 + 7.5i` and `7.5i + 5.0` must
@@ -7260,7 +7572,9 @@ impl<'r> Infer<'r> {
                 // `check_pending_constraints`'s job now, not this one's.
                 _ => continue,
             };
-            if self.quantified.contains(&root) {
+            if self.quantified.contains(&root)
+                || self.undefaultable.iter().any(|v| self.subst.apply(&Ty::Var(*v)) == Ty::Var(root))
+            {
                 continue;
             }
             // A const generic's own shape-slot var can end up sharing this

@@ -2725,10 +2725,64 @@ fn lower_array_construct<'c>(
     } else {
         for (i, arg) in args.iter().enumerate() {
             let src = lower_nested_array_arg(env, arg);
-            copy_nested_array(ctx, block, src, inner_dims, array_val, &[i as i64]);
+            if MemRefType::try_from(src.r#type()).is_ok() {
+                copy_nested_array(ctx, block, src, inner_dims, array_val, &[i as i64]);
+            } else {
+                // A row read out of a struct (`[t[0], t[1]]`, `t` a tuple of
+                // arrays): an array field is stored inline, so the row is a
+                // pointer into the struct (`lower_field_access`), copied
+                // element by element.
+                let Ty::Array(row_ty, _) = ty else { unreachable!("checked by flatten_array_dims") };
+                copy_inline_array_row(ctx, block, src, row_ty, leaf_ty, inner_dims, array_val, i as i64);
+            }
         }
     }
     array_val
+}
+
+/// Copies the inline array at `src` (an `!llvm.ptr` to a `row_ty`, as an array
+/// field is stored) into row `row` of the memref `dst`.
+#[allow(clippy::too_many_arguments)]
+fn copy_inline_array_row<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    src: Value<'c, 'c>,
+    row_ty: &Ty,
+    leaf_ty: &Ty,
+    dims: &[i64],
+    dst: Value<'c, 'c>,
+    row: i64,
+) {
+    let location = gen_loc(ctx.context);
+    let row_llvm_ty = ty_to_llvm_field_type(ctx, row_ty);
+    let leaf_mlir_ty = ty_to_mlir(ctx, leaf_ty);
+    let count: i64 = dims.iter().product();
+    for flat in 0..count {
+        let mut path = Vec::with_capacity(dims.len());
+        let mut rest = flat;
+        for d in dims.iter().rev() {
+            path.push(rest % d);
+            rest /= d;
+        }
+        path.reverse();
+        let mut gep_indices = vec![0];
+        gep_indices.extend(&path);
+        let elem_ptr = gep(ctx, block, src, &gep_indices, row_llvm_ty);
+        let value = block
+            .append_operation(llvm::load(
+                ctx.context,
+                elem_ptr,
+                leaf_mlir_ty,
+                location,
+                LoadStoreOptions::new(),
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let mut indices = vec![const_index(ctx, block, row)];
+        indices.extend(path.iter().map(|&p| const_index(ctx, block, p)));
+        block.append_operation(memref::store(value, dst, &indices, location));
+    }
 }
 
 /// `[value; N]` — `N` is *not* read from `args[1]` at all: `ty`'s own

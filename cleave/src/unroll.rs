@@ -19,7 +19,6 @@
 
 use crate::ast::*;
 use crate::callgraph;
-use crate::infer::Ty;
 use crate::registry::Registry;
 use std::collections::HashMap;
 
@@ -28,28 +27,16 @@ use std::collections::HashMap;
 const MAX_ROUNDS: usize = 16;
 
 pub fn unroll_heterogeneous_loops(mut program: Program, node_ids: &mut NodeIdGen) -> Program {
-    // Impls over a pack of types (`impl<Ts...: Print> Print<Ts...>`) are
-    // templates: they leave the program, and each concrete use found by the
-    // trial inference becomes a concrete impl of its own (`instantiate`),
-    // whose loops then unroll like any other. Keeping the template beside its
-    // instances would make every instance overlap it.
-    let (templates, items): (Vec<Item>, Vec<Item>) =
-        std::mem::take(&mut program.items).into_iter().partition(is_pack_template);
-    program.items = items;
-    let mut instantiated: Vec<(String, Vec<Ty>)> = Vec::new();
-
     for _ in 0..MAX_ROUNDS {
-        if templates.is_empty() && !program.items.iter().any(item_has_candidate_loop) {
+        if !program.items.iter().any(item_has_candidate_loop) {
             return program;
         }
-        let mut trial = program.clone();
-        trial.items.extend(templates.iter().cloned());
-        let registry = Registry::build(&trial);
-        let mut inference = callgraph::infer_program(&trial, &registry);
-        // `infer_program` covers top-level fns; a concrete impl's methods (an
-        // instantiated template's among them) are inferred here, for their
-        // loops and their own uses of templates.
-        for item in &trial.items {
+        let registry = Registry::build(&program);
+        let mut inference = callgraph::infer_program(&program, &registry);
+        // `infer_program` covers top-level fns; a concrete impl's methods are
+        // inferred here, for their loops. (Generic code unrolls per instance,
+        // in `monomorphize.rs`.)
+        for item in &program.items {
             let ItemKind::Impl(d) = &item.kind else { continue };
             if !d.generics.is_empty() {
                 continue;
@@ -70,26 +57,6 @@ pub fn unroll_heterogeneous_loops(mut program: Program, node_ids: &mut NodeIdGen
                     item.span,
                 );
                 inference.unroll_requests.append(&mut infer.unroll_requests);
-                for u in infer.pack_impl_uses.drain(..) {
-                    if !inference.pack_impl_uses.contains(&u) {
-                        inference.pack_impl_uses.push(u);
-                    }
-                }
-            }
-        }
-
-        let mut grew = false;
-        for (algebra, tys) in &inference.pack_impl_uses {
-            if instantiated.iter().any(|(a, t)| a == algebra && t == tys) {
-                continue;
-            }
-            let Some(template) = templates.iter().find(|t| template_algebra(t) == Some(algebra)) else {
-                continue;
-            };
-            if let Some(instance) = instantiate(template, tys, node_ids) {
-                program.items.push(instance);
-                instantiated.push((algebra.clone(), tys.clone()));
-                grew = true;
             }
         }
 
@@ -98,7 +65,7 @@ pub fn unroll_heterogeneous_loops(mut program: Program, node_ids: &mut NodeIdGen
             .iter()
             .map(|(id, start, end)| (*id, (*start, *end)))
             .collect();
-        if requests.is_empty() && !grew {
+        if requests.is_empty() {
             return program;
         }
         for item in &mut program.items {
@@ -106,12 +73,14 @@ pub fn unroll_heterogeneous_loops(mut program: Program, node_ids: &mut NodeIdGen
                 ItemKind::Fn(f) => {
                     if let Some(body) = &mut f.body {
                         unroll_block(body, &requests, node_ids);
+                        prune_block(body);
                     }
                 }
                 ItemKind::Impl(i) => {
                     for f in &mut i.fns {
                         if let Some(body) = &mut f.body {
                             unroll_block(body, &requests, node_ids);
+                            prune_block(body);
                         }
                     }
                 }
@@ -122,103 +91,147 @@ pub fn unroll_heterogeneous_loops(mut program: Program, node_ids: &mut NodeIdGen
     program
 }
 
-// ------------------------------------------------------------ pack templates
+// ------------------------------------------------------------ folding `if`s
 
-fn is_pack_template(item: &Item) -> bool {
-    matches!(&item.kind, ItemKind::Impl(d)
-        if d.generics.iter().any(|g| matches!(g, GenericParam::Type { variadic: true, .. })))
-}
-
-fn template_algebra(item: &Item) -> Option<&String> {
-    match &item.kind {
-        ItemKind::Impl(d) => Some(&d.algebra),
-        _ => None,
+/// Replaces every `if` whose condition folds without any type information —
+/// literals and operators on them, which every unrolled copy's index is —
+/// by its taken branch, before inference ever sees the other one. A branch
+/// that can never run then never has to type-check: in a loop unrolled over
+/// a tuple, `if i == 1 { a = a + t[i] } else { b = b + t[i] }` only keeps,
+/// in each copy, the branch that fits that copy's element type.
+pub fn prune_constant_ifs(program: &mut Program) {
+    for item in &mut program.items {
+        match &mut item.kind {
+            ItemKind::Fn(f) => {
+                if let Some(body) = &mut f.body {
+                    prune_block(body);
+                }
+            }
+            ItemKind::Impl(i) => {
+                for f in &mut i.fns {
+                    if let Some(body) = &mut f.body {
+                        prune_block(body);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
-/// A concrete impl of `template` at `tys`: same methods (fresh node ids), no
-/// generics, the concrete types as targets. `None` when a type has no source
-/// spelling here.
-fn instantiate(template: &Item, tys: &[Ty], ids: &mut NodeIdGen) -> Option<Item> {
-    let ItemKind::Impl(d) = &template.kind else { return None };
-    let span = template.span;
-    let mut targets = tys.iter().map(|t| type_ast(t, span, ids));
-    let target = targets.next()??;
-    let extra_targets: Vec<Type> = targets.collect::<Option<_>>()?;
-    let mut fns = d.fns.clone();
-    for f in &mut fns {
-        for p in &mut f.params {
-            if let Some(t) = &mut p.ty {
-                renumber_type(t, ids);
+pub(crate) fn prune_block(b: &mut Block) {
+    for s in &mut b.stmts {
+        match &mut s.kind {
+            StmtKind::Let { value, .. } => prune_expr(value),
+            StmtKind::Assign { target, value } => {
+                prune_expr(target);
+                prune_expr(value);
+            }
+            StmtKind::Expr(e) => prune_expr(e),
+            StmtKind::Break(v) => {
+                if let Some(v) = v {
+                    prune_expr(v);
+                }
             }
         }
-        if let Some(r) = &mut f.ret {
-            renumber_type(r, ids);
-        }
-        if let Some(body) = &mut f.body {
-            renumber_block(body, ids);
-        }
     }
-    Some(Node {
-        id: ids.next(),
-        span,
-        kind: ItemKind::Impl(ImplDecl {
-            attrs: d.attrs.clone(),
-            algebra: d.algebra.clone(),
-            generics: Vec::new(),
-            target,
-            extra_targets,
-            fns,
-        }),
-    })
+    if let Some(t) = &mut b.tail {
+        prune_expr(t);
+    }
 }
 
-/// The source spelling of a concrete type.
-fn type_ast(ty: &Ty, span: Span, ids: &mut NodeIdGen) -> Option<Type> {
-    let kind = match ty {
-        Ty::Con(name) => TypeKind::Path(Path::single(name.clone()), Vec::new()),
-        Ty::App(name, args) => {
-            let args = args
-                .iter()
-                .map(|a| match a {
-                    Ty::Const(crate::infer::ConstValue::Int(n)) => Some(GenericArg::Const(Node {
-                        id: ids.next(),
-                        span,
-                        kind: ExprKind::NumberLit {
-                            text: n.to_string(),
-                            suffix: None,
-                        },
-                    })),
-                    other => type_ast(other, span, ids).map(GenericArg::Type),
-                })
-                .collect::<Option<Vec<_>>>()?;
-            TypeKind::Path(Path::single(name.clone()), args)
-        }
-        Ty::Array(elem, size) => {
-            let Ty::Const(crate::infer::ConstValue::Int(n)) = size.as_ref() else {
-                return None;
+fn prune_expr(e: &mut Expr) {
+    if let ExprKind::If {
+        cond,
+        then_branch,
+        else_branch,
+    } = &mut e.kind
+    {
+        if let Some(crate::infer::ConstValue::Bool(taken)) = fold_syntactic(cond) {
+            let replacement = if taken {
+                ExprKind::Block(std::mem::replace(then_branch, Block { stmts: Vec::new(), tail: None }))
+            } else {
+                match else_branch.take().map(|b| *b) {
+                    Some(ElseBranch::Block(b)) => ExprKind::Block(b),
+                    Some(ElseBranch::If(inner)) => inner.kind,
+                    None => ExprKind::Block(Block {
+                        stmts: Vec::new(),
+                        tail: None,
+                    }),
+                }
             };
-            let size = Node {
-                id: ids.next(),
-                span,
-                kind: ExprKind::NumberLit {
-                    text: n.to_string(),
-                    suffix: None,
-                },
-            };
-            TypeKind::Array(Box::new(type_ast(elem, span, ids)?), Box::new(size))
+            e.kind = replacement;
+            prune_expr(e);
+            return;
         }
-        Ty::Fn(params, ret) => TypeKind::Fn(
-            params.iter().map(|p| type_ast(p, span, ids)).collect::<Option<_>>()?,
-            Box::new(type_ast(ret, span, ids)?),
-        ),
-        _ => return None,
-    };
-    Some(Node {
-        id: ids.next(),
-        span,
-        kind,
-    })
+    }
+    match &mut e.kind {
+        ExprKind::NumberLit { .. }
+        | ExprKind::ImaginaryLit { .. }
+        | ExprKind::BoolLit(_)
+        | ExprKind::Path(_)
+        | ExprKind::PackRef(_) => {}
+        ExprKind::Call(_, _, args, _) => args.iter_mut().for_each(prune_expr),
+        ExprKind::FieldAccess(b, _) => prune_expr(b),
+        ExprKind::Index(b, idx) => {
+            prune_expr(b);
+            idx.iter_mut().for_each(prune_expr);
+        }
+        ExprKind::ArrayLit(es) => es.iter_mut().for_each(prune_expr),
+        ExprKind::ArrayRepeat { value, .. } => prune_expr(value),
+        ExprKind::StructLit(_, _, fields) => fields.iter_mut().for_each(|(_, v)| prune_expr(v)),
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            prune_expr(cond);
+            prune_block(then_branch);
+            match else_branch.as_deref_mut() {
+                Some(ElseBranch::If(x)) => prune_expr(x),
+                Some(ElseBranch::Block(b)) => prune_block(b),
+                None => {}
+            }
+        }
+        ExprKind::While { cond, body } => {
+            prune_expr(cond);
+            prune_block(body);
+        }
+        ExprKind::For {
+            start, end, body, ..
+        } => {
+            prune_expr(start);
+            prune_expr(end);
+            prune_block(body);
+        }
+        ExprKind::ForIn { iter, body, .. } => {
+            prune_expr(iter);
+            prune_block(body);
+        }
+        ExprKind::Loop { body } | ExprKind::Block(body) | ExprKind::Lambda { body, .. } => {
+            prune_block(body)
+        }
+    }
+}
+
+/// A constant read off the syntax alone: integer and boolean literals, and
+/// operators (`resolve.rs` marks them, `Path::operator`) applied to them.
+fn fold_syntactic(e: &Expr) -> Option<crate::infer::ConstValue> {
+    use crate::infer::ConstValue;
+    match &e.kind {
+        ExprKind::BoolLit(b) => Some(ConstValue::Bool(*b)),
+        ExprKind::NumberLit { text, .. } => text.parse::<u64>().ok().map(ConstValue::Int),
+        ExprKind::Call(path, _, args, _) if path.operator => {
+            let op = path.segments.last()?;
+            let values: Vec<ConstValue> = args.iter().map(fold_syntactic).collect::<Option<_>>()?;
+            match values.as_slice() {
+                [a] => crate::const_eval::eval_unop(op, *a),
+                [a, b] => crate::const_eval::eval_binop(op, *a, *b),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 // ------------------------------------------------------------ candidates
@@ -232,8 +245,12 @@ fn item_has_candidate_loop(item: &Item) -> bool {
     bodies.into_iter().any(|b| any_expr_in_block(b, &mut is_candidate_loop))
 }
 
-/// A `for` whose body indexes something by the loop variable alone (`x[i]`).
+/// A `for` whose body indexes something by the loop variable alone (`x[i]`),
+/// or a comprehension (always rewritten, once its bounds fold).
 fn is_candidate_loop(e: &Expr) -> bool {
+    if comprehension_parts(e).is_some() {
+        return true;
+    }
     let ExprKind::For { var, body, .. } = &e.kind else {
         return false;
     };
@@ -296,7 +313,7 @@ fn any_expr(e: &Expr, pred: &mut dyn FnMut(&Expr) -> bool) -> bool {
 
 // ------------------------------------------------------------ rewriting
 
-fn unroll_block(block: &mut Block, requests: &HashMap<NodeId, (u64, u64)>, ids: &mut NodeIdGen) {
+pub(crate) fn unroll_block(block: &mut Block, requests: &HashMap<NodeId, (u64, u64)>, ids: &mut NodeIdGen) {
     for stmt in &mut block.stmts {
         match &mut stmt.kind {
             StmtKind::Let { value, .. } => unroll_expr(value, requests, ids),
@@ -322,6 +339,13 @@ fn unroll_expr(e: &mut Expr, requests: &HashMap<NodeId, (u64, u64)>, ids: &mut N
         if let Some(&(start, end)) = requests.get(&e.id) {
             let (var, body) = (var.clone(), body.clone());
             e.kind = unrolled(&var, &body, start, end, e.span, ids);
+            return;
+        }
+    }
+    if let Some((var, body)) = comprehension_parts(e) {
+        if let Some(&(start, end)) = requests.get(&e.id) {
+            let (var, body) = (var.to_string(), body.clone());
+            e.kind = collected(&var, &body, start, end, e.span, ids);
             return;
         }
     }
@@ -374,6 +398,56 @@ fn unroll_expr(e: &mut Expr, requests: &HashMap<NodeId, (u64, u64)>, ids: &mut N
             unroll_block(body, requests, ids)
         }
     }
+}
+
+/// A comprehension's variable and body (`ast::COMPREHENSION`).
+fn comprehension_parts(e: &Expr) -> Option<(&str, &Block)> {
+    let ExprKind::Call(path, _, args, _) = &e.kind else { return None };
+    if path.segments != [COMPREHENSION] {
+        return None;
+    }
+    let [_, _, lambda] = args.as_slice() else { return None };
+    let ExprKind::Lambda { params, body, .. } = &lambda.kind else { return None };
+    let [param] = params.as_slice() else { return None };
+    Some((param.name.as_str(), body))
+}
+
+/// The replacement of `[for var in start..end: body]`: the tuple of the body's
+/// copies, one per index (the copy itself when there is only one), handed to
+/// `Collect::collect` for whatever type the context asks of it
+/// (`ast::comprehension_collect`); `()` when there is none.
+fn collected(var: &str, body: &Block, start: u64, end: u64, span: Span, ids: &mut NodeIdGen) -> ExprKind {
+    let mut copies: Vec<Expr> = (start..end)
+        .map(|k| {
+            let mut copy = body.clone();
+            renumber_block(&mut copy, ids);
+            substitute_block(&mut copy, var, k);
+            Node {
+                id: ids.next(),
+                span,
+                kind: ExprKind::Block(copy),
+            }
+        })
+        .collect();
+    let source = match copies.len() {
+        0 => {
+            return ExprKind::Block(Block {
+                stmts: Vec::new(),
+                tail: None,
+            });
+        }
+        1 => copies.pop().unwrap(),
+        n => Node {
+            id: ids.next(),
+            span,
+            kind: ExprKind::StructLit(
+                Path::single(tuple_struct_name(n)),
+                Vec::new(),
+                copies.into_iter().enumerate().map(|(i, c)| (i.to_string(), c)).collect(),
+            ),
+        },
+    };
+    ExprKind::Call(comprehension_collect(), Vec::new(), vec![source], Vec::new())
 }
 
 /// The replacement of an unrolled `for var in start..end { body }`.
@@ -491,7 +565,7 @@ fn renumber_generic_args(args: &mut [GenericArg], ids: &mut NodeIdGen) {
     }
 }
 
-fn renumber_type(t: &mut Type, ids: &mut NodeIdGen) {
+pub(crate) fn renumber_type(t: &mut Type, ids: &mut NodeIdGen) {
     t.id = ids.next();
     match &mut t.kind {
         TypeKind::Path(_, args) => renumber_generic_args(args, ids),

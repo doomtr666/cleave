@@ -498,7 +498,7 @@ tuple_index = @{ ASCII_DIGIT+ }
 // `infer_call`'s own fallback, which special-cases exactly this one
 // remaining case (a zero-arg call naming a known, zero-field struct) rather
 // than leaving it as a silent "unresolved call".
-primary = { if_expr | while_expr | for_expr | loop_expr | array_lit | lambda_expr | call_expr | struct_lit | literal | path | tuple_lit | "(" ~ expr ~ ")" | block }
+primary = { if_expr | while_expr | for_expr | loop_expr | comprehension | array_lit | lambda_expr | call_expr | struct_lit | literal | path | tuple_lit | "(" ~ expr ~ ")" | block }
 
 // `(a, b, ...)` — arity 2+ (see `tuple_type`'s own doc comment for why),
 // tried before the bare grouping-paren alternative just after it: PEG
@@ -632,6 +632,11 @@ loop_expr  = { "loop" ~ block }
 // shapes folded into one), so lowering can tell which one actually matched
 // -- both produce a flat sequence of `expr` children on their own,
 // indistinguishable from each other without this.
+// `[for i in a..b: e]` — one `e` per index, collected into a tuple (the
+// elements may differ in type: `[for i in 0..t.len(): f(t[i])]`). Lowered to
+// an ordinary call carrying a lambda (`ast::COMPREHENSION`), replaced by the
+// tuple of its copies once its bounds are known (`unroll.rs`).
+comprehension = { "[" ~ "for" ~ ident ~ "in" ~ additive ~ ".." ~ additive ~ ":" ~ expr ~ "]" }
 array_lit    = { "[" ~ (array_repeat | array_list)? ~ "]" }
 array_repeat = { expr ~ ";" ~ (numeric_lit | pack_ref | ident) }
 array_list   = { expr ~ ("," ~ expr)* }
