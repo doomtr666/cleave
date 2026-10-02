@@ -224,3 +224,22 @@ impl<T: Float, const R: i32, const C: i32> Generate<Tensor<T, R, C>, [T; C]> {
         Tensor(data: a)
     }
 }
+
+// The column of each row's largest value, the first one on a tie: a
+// classifier's predicted class per sample (`[i32; R]`, one per row).
+algebra ArgMax<Container, Out> {
+    fn argmax_rows(c: Container) -> Out;
+}
+
+impl<T: Float, const R: i32, const C: i32> ArgMax<Tensor<T, R, C>, [i32; R]> {
+    fn argmax_rows(m) {
+        [for r in 0..R: {
+            let mut best = 0;
+            let mut best_val: T = m[r, 0];
+            for c in 1..C {
+                if m[r, c] > best_val { best_val = m[r, c]; best = c; };
+            };
+            best
+        }]
+    }
+}

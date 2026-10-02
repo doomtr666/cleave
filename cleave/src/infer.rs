@@ -5703,6 +5703,14 @@ impl<'r> Infer<'r> {
             }
             if after >= before {
                 for pending in std::mem::take(&mut self.pending_indices) {
+                    // In generic code, a collection whose type is still open
+                    // (the result of a generic callee, `let p =
+                    // argmax_rows(forward(x, net))` with `net` generic) is
+                    // indexed by each instance, where it is known: nothing to
+                    // decide here. In an instance, it is a real indeterminacy.
+                    if self.oracle.is_none() && matches!(self.subst.apply(&pending.base), Ty::Var(_)) {
+                        continue;
+                    }
                     self.unify_at(
                         pending.span,
                         &Ty::Var(pending.result),

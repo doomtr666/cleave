@@ -63,9 +63,15 @@ fn context() -> Context {
     context
 }
 
+/// One run at a time: the runtime's pool is shared by every thread, so a
+/// block one test parks could be handed to another's run, skewing both
+/// counts.
+static RUN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Compiles `src` through the real pipeline and runs `main`, returning its
 /// result and the bytes the run left allocated.
 fn run_counting(src: &str) -> (i32, i64) {
+    let _one_at_a_time = RUN.lock().unwrap_or_else(|e| e.into_inner());
     let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let registry = Registry::build(&program);

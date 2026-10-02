@@ -7009,6 +7009,38 @@ fn softmax_cross_entropy_and_its_gradient() {
     assert_eq!(run_i32(&context, src), 1);
 }
 
+/// `argmax_rows`: the column of each row's largest value, the first one on
+/// a tie (a classifier's predicted classes, one per sample).
+#[test]
+fn argmax_rows_gives_each_rows_largest_column() {
+    let context = context();
+    let src = "
+        use linalg;
+        fn main() -> i32 {
+            let m = Tensor::<f32, 3, 4>(data: [[0.1, 0.9, 0.3, 0.2], [5.0, 1.0, 2.0, 3.0], [1.0, 2.0, 2.0, -1.0]]);
+            let a = argmax_rows(m);
+            if a[0] == 1 and a[1] == 0 and a[2] == 1 and a.len() == 3 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// In a generic fn, the result of a call whose type depends on a generic
+/// parameter can be indexed at run time: each instance knows the type.
+#[test]
+fn a_generic_fn_indexes_a_value_typed_by_its_instance() {
+    let context = context();
+    let src = "
+        use linalg;
+        fn pick(m, k: i32) { let a = argmax_rows(m); a[k] }
+        fn main() -> i32 {
+            let m = Tensor::<f32, 2, 3>(data: [[0.1, 0.2, 0.9], [3.0, 1.0, 2.0]]);
+            if pick(m, 0) == 2 and pick(m, 1) == 0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
 /// A model marked `Trainable` needs no optimizer code of its own: `optim`'s
 /// one impl updates it field by field, two levels deep here (`Net` of
 /// `Dense`s), with a stateful optimizer whose state type no one declares.
