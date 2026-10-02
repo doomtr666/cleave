@@ -2519,6 +2519,17 @@ fn lower_prim_op<'c>(
             // returns (found by direct testing: a real, structural ABI
             // mismatch, though not one that happened to crash on its own —
             // nothing downstream ever read the bogus value).
+            // A returned tensor, or a returned array with no array argument
+            // to be the identity of: the host fills a fresh buffer instead,
+            // passed as a trailing out-parameter (pointer + length, the
+            // convention every array argument already crosses the boundary
+            // with), and the call's value is that buffer — a tensor viewing
+            // it without a copy, since it is fresh and nothing else holds it
+            // (`extern fn batch(i: i32) -> Tensor<f32, 32, 784>;`, the host
+            // side `fn batch(i: i32, out: *mut f32, len: i64)`).
+            if let Some(out_ty) = extern_out_param_ty(ctx, ty, param_types) {
+                return Some(lower_extern_out_param_call(ctx, block, env, symbol, param_types, args, ty, &out_ty));
+            }
             let is_array_return = matches!(ty, Ty::Array(..));
             let is_unit_return = is_unit_ty(ty);
             let results: Vec<Type> = if is_array_return {
@@ -6884,6 +6895,82 @@ fn build_relu_elemwise<'c>(
 /// than a definition; confirmed against melior's own `compile_external_
 /// function` test) the first time `symbol` is seen, and no-ops on every
 /// later call site for the same symbol.
+/// The array an extern call's host fills for its result
+/// (`lower_extern_out_param_call`): a tensor's data array, or an array
+/// returned without an array argument to be the identity of.
+fn extern_out_param_ty(ctx: &LowerCtx<'_, '_>, ty: &Ty, param_types: &[Ty]) -> Option<Ty> {
+    match ty {
+        Ty::Array(..) if !param_types.iter().any(|t| matches!(t, Ty::Array(..))) => Some(ty.clone()),
+        Ty::Con(_) | Ty::App(..) => {
+            let (name, type_args) = struct_name_and_args(ty);
+            if native_shape_keyword(ctx, name) != Some("tensor") {
+                return None;
+            }
+            let fields = struct_field_types(&ctx.struct_schemas, name, type_args);
+            match fields.as_slice() {
+                [(_, field_ty @ Ty::Array(..))] => Some(field_ty.clone()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// An extern call whose result the host writes into a fresh buffer
+/// (`extern_out_param_ty`): the buffer is allocated here, passed last, and
+/// is the result — viewed as a tensor without a copy when `ty` is one.
+#[allow(clippy::too_many_arguments)]
+fn lower_extern_out_param_call<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    symbol: &str,
+    param_types: &[Ty],
+    args: &[CVal],
+    ty: &Ty,
+    out_ty: &Ty,
+) -> Value<'c, 'c> {
+    let mut declared_params = param_types.to_vec();
+    declared_params.push(out_ty.clone());
+    ensure_extern_declared(ctx, symbol, &declared_params, &[]);
+    let (dims, leaf_ty) = flatten_array_dims(out_ty);
+    let buffer = alloc_array(ctx, block, MemRefType::new(ty_to_mlir(ctx, leaf_ty), &dims, None, None));
+    let mut arg_values: Vec<Value> = Vec::new();
+    for (a, t) in args.iter().zip(param_types) {
+        let lowered = lower_cval(ctx.context, block, env, a, ty_to_mlir(ctx, t));
+        if matches!(t, Ty::Array(..)) {
+            let (ptr, len) = array_ptr_and_len(ctx, block, lowered, t);
+            arg_values.push(ptr);
+            arg_values.push(len);
+        } else {
+            arg_values.push(lowered);
+        }
+    }
+    let (ptr, len) = array_ptr_and_len(ctx, block, buffer, out_ty);
+    arg_values.push(ptr);
+    arg_values.push(len);
+    let location = gen_loc(ctx.context);
+    block.append_operation(func::call(
+        ctx.context,
+        FlatSymbolRefAttribute::new(ctx.context, symbol),
+        &arg_values,
+        &[],
+        location,
+    ));
+    if matches!(ty, Ty::Array(..)) {
+        return buffer;
+    }
+    let restrict = Attribute::parse(ctx.context, "unit")
+        .unwrap_or_else(|| panic!("MLIR lowering: failed to parse `unit` attribute"));
+    let to_tensor = OperationBuilder::new("bufferization.to_tensor", location)
+        .add_operands(&[buffer])
+        .add_attributes(&[(Identifier::new(ctx.context, "restrict"), restrict)])
+        .add_results(&[ty_to_mlir(ctx, ty)])
+        .build()
+        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build bufferization.to_tensor: {e}"));
+    block.append_operation(to_tensor).result(0).unwrap().into()
+}
+
 fn ensure_extern_declared<'c>(
     ctx: &LowerCtx<'c, '_>,
     symbol: &str,

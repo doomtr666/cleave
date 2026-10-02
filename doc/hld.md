@@ -327,6 +327,11 @@ cleave is **standalone by default** — a cleave program compiles to a complete,
 Functions can be explicitly exposed for external consumption:
 
 - **`extern fn ...`** — declares and calls a foreign C-ABI symbol, no ABI string (`extern "C" fn ...`, this doc's own earlier draft) — implemented and shipping: C is implicitly the only ABI target, the declared signature underneath already says everything else needed, so the string was pure ceremony. Real backing implementation is typically a small Rust crate exposing `extern "C" fn` symbols, registered with the JIT/linker by real function pointer (`cleave-rt`, `main.rs`'s own `--run` path) rather than resolved by dynamic symbol name — see `stdlib/io/io.cleave`'s `Print<T>` for the working end-to-end example, including `extern(symbol)`'s own parenthesized override for the case a bare name can't cover (several algebra-impl methods sharing one cleave-level name, each needing a distinct real symbol).
+  Arrays cross the boundary as a pointer and a length. An `extern fn` that *returns* a tensor (or an
+  array, with no array argument) gets its result buffer from the compiler instead: a fresh one, passed
+  last as an out-parameter, and viewed as the result without a copy (`extern fn batch(i: i32) ->
+  Tensor<f32, 32, 784>;` on the cleave side, `fn batch(i: i32, out: *mut f32, len: i64)` on the host
+  side; `mlir_lower.rs::lower_extern_out_param_call`, `examples/mnist-interop`).
 - **The reverse direction — exposing cleave functions themselves for external consumption** (a host language calling *into* compiled cleave) is not implemented yet; the syntax sketched below is provisional, not finalized, and should be revisited to match the bare-`extern`-no-ABI-string convention above once actually built:
   - `extern fn ...` on a cleave-side definition (not just a foreign declaration) — export with the platform C ABI.
   - A `"rust"`-flavored variant, auto-generating a thin idiomatic Rust wrapper (a trait + impl whose methods just forward to the exported C symbol) so a Rust caller sees an ordinary Rust type, never raw FFI — the difference from the plain case is purely how much glue is generated, not the binary calling convention. Needs its own real design pass (how is "give me a Rust wrapper too" spelled, given there's no ABI string left to carry that marker) before it's built, not assumed here.
