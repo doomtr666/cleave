@@ -169,3 +169,14 @@ impl<T> Len<DynArray<T>> {
 impl<T> Index<DynArray<T>, T> {
     fn index(v: DynArray<T>, idx: [i32; 1]) -> T { raw_get(v.buf, idx[0]) }
 }
+
+// A `DynArray` seeded by a comprehension (`Generate`, `stdlib/core`): the
+// default target when the comprehension's length is only known at run time
+// (`[for i in 0..n: ...]`).
+impl<T> Generate<DynArray<T>, T> {
+    fn generate(start, end, f) {
+        let mut v: DynArray<T> = dynarray_new(end - start + 1);
+        for k in start..end { push(v, f(k)); };
+        v
+    }
+}

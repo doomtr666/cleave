@@ -29,6 +29,26 @@ impl<T> Collect<T, T> {
     fn collect(x) { x }
 }
 
+// What a comprehension whose elements all have one type becomes: its
+// collection filled at run time, one call of `f` per index from `start` to
+// `end`, without materializing anything first (a comprehension over a
+// struct or tuple is unrolled into `Collect` instead). Any collection can be
+// seeded this way by implementing it: `[T; N]` here, `Tensor` in `linalg`,
+// `DynArray` (whose length is only known at run time) in `dynarray`. With no
+// context, the target is an array when the bounds are known at compile
+// time, a `DynArray` otherwise (`infer.rs`, `CollectDefault`).
+algebra Generate<C, T> {
+    fn generate(start: i32, end: i32, f: (i32) -> T) -> C;
+}
+
+impl<T, const N: i32> Generate<[T; N], T> {
+    fn generate(start, end, f) {
+        let mut a: [T; N] = mlir::memref::alloc();
+        for k in 0..N { a[k] = f(start + k); };
+        a
+    }
+}
+
 // Indexing a homogeneous collection with run-time indices (`m[i, j]`): one
 // call per bracket group, every index gathered into one `[i32; K]` array
 // (`cps.rs`'s `ExprKind::Index`). Implemented by `Tensor` (`stdlib/linalg`),

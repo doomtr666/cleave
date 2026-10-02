@@ -95,10 +95,63 @@ field projections inlines them (`egraph.rs`, `Forward::walk`/`is_transparent_cha
 where it arose: a comprehension collected into its own tuple emits no call (`cps.rs`). The underlying
 limitation is in the walk, and any other opaque call consuming call results will hit it.
 
-## Arrays of tensors (and of structs, nested) as a comprehension's default target
+## A gradient leaving an `if` crashes
 
-A comprehension over same-typed elements defaults to an array only when the elements are scalars (or
-arrays of them), a tuple otherwise (`infer.rs::apply_collect_defaults`). The fuller rule from
+`let g = if c { net_grad(x, y, net) } else { net_grad(x, y, net) };` crashes at run time
+(`cleave/tests/leaks.rs`, `a_gradient_leaving_an_if_does_not_crash`, ignored until fixed). With two
+call sites, `net_grad` is no longer region-local (`region_analysis.rs`: one call site only), so its
+result goes through ordinary ownership instead of the loop's arena, which hides it in every real
+training loop. The CPS after refcounting is balanced (checked by hand); two sequential calls (no `if`)
+run fine, and so does a light struct of tensors from an ordinary function through an `if`. So the
+suspect is lowering: the `scf.if` yields the gradient as a struct of memref descriptors.
+
+Found while measuring cross-entropy against sum-of-squares on `mnist-interop` with the loss chosen
+by an `if`: there, the same path leaked (a whole gradient per batch, the run slowing from 11 s to 35-40
+s), through two `refcount.rs` gaps since fixed (2026-10-02, `values_leaving_an_if_are_released`): a
+join's own parameter came back as a free variable of every enclosing def through the transitive
+tail-call closure (`collect_local_free_vars`), so it looked live at every loop back-edge and was never
+released; and a join never owned what its branches keep alive for it, since `local_claim_vars` gives
+a value to the scope defining the join. A bare tensor read out of an owned struct was also never
+retained (`n.l2.b[0, 1]` after `n`'s release: a use-after-free), fixed alongside.
+
+## A nested comprehension allocates and copies each row
+
+`[for b in 0..B: [for c in 0..C: e]]` into a matrix runs the inner comprehension once per row: each
+row is its own freshly allocated `[T; C]` (`memref.alloc`, a real `malloc`/`free`), then copied into
+the outer buffer through a dynamic-offset subview, which lowers to MLIR's generic runtime
+`memrefCopy` (`mlir_lower.rs::copy_array_row`). Found on MNIST's cross-entropy gradient (32 rows of
+10 per step, a measurable share of a ~1 s regression); `nn`'s `CrossEntropy` now fills its result in
+place instead. The real fix is destination passing: the inner comprehension writes straight into the
+outer row's slice, with no row array at all; at least, a row copy lowered as a plain loop or `memcpy`
+rather than `memrefCopy`. Matters for nanoLM, where the loss covers every position of the batch over
+the whole vocabulary.
+
+## Comprehension expressiveness: iterating a collection, filters, several generators; `%`
+
+Comprehensions take one range (`[for i in a..b: e]`); `e` is any expression, an `if`/`else` or a block
+included, and nesting builds nested collections. Missing, in the order discussed (2026-10-02):
+- `[for x in v: f(x)]`, iterating a collection by value: sugar for `[for i in 0..v.len(): f(v[i])]`,
+  unrolled or a loop as usual. Also gives `for v in t` over a tuple.
+- Filters, `[for i in 0..n if p(i): e]`: the length is no longer known up front, which `Generate`
+  (indexed fill) can't serve. A second protocol, appending (an empty collection, one `push` per kept
+  element), for `DynArray` and any growable collection; the compiler picks indexed when there is no
+  filter and the bounds are rectangular, appending otherwise. A target that only fills by index
+  (`[T; N]`, `Tensor`) with a filter is an error ("length unknown at compile time"), never a silent
+  truncation. A filter whose condition folds on an unrolled comprehension already works through the
+  pruning of copies, giving a shorter tuple (a form of slicing).
+- Several generators flattened, `[for i in 0..3, for j in 0..4: e]`: rectangular bounds keep a known
+  length (indexed, `k` split into `i = k / 4`, `j = k - i * 4`); bounds depending on an outer variable
+  need appending.
+- There is no `%`: a remainder method in `Ring`/`Int` (worked around as `i - (i / 7) * 7` in a test).
+
+## Arrays of tensors (and of structs, nested) as a comprehension's default target; `Generate` beyond two dimensions
+
+A comprehension over same-typed elements fills an array only when the elements are scalars (or arrays
+of them); tensors or structs with bounds known at compile time are unrolled into a tuple instead
+(`infer.rs::decide_comprehensions`, `is_array_element`). `Generate` for `Tensor` covers one and two
+dimensions (`stdlib/linalg/tensor.cleave`); more needs one impl per rank, or an impl over the
+`Dims...` pack once packs can be taken apart (`doc/plan-compile-time-sequences.md`, step 6). The
+fuller rule from
 `doc/plan-compile-time-sequences.md` ("an array when they unify") needs the backend to represent
 `[Tensor<f32, 1, 2>; 2]`: a memref can't hold tensors, and a struct-leaf array is single-dimension
 only (`mlir_lower.rs::lower_array_construct`). Found with `Optimizer` on a `Dense<f32, 1, 2>`, whose
@@ -203,7 +256,10 @@ refcounting under real pressure), and Adam at scale.
 
 First step, small and shared by every later model: softmax + cross-entropy (numerically stable, max-
 shifted log-sum-exp) in the stdlib, swapped into `mnist-interop`'s loss in place of today's sum of
-squares, with the PyTorch twin updated to match. Then a written inventory of what the transformer still
+squares, with the PyTorch twin updated to match. **Done (2026-10-02)**: `nn`'s `CrossEntropy` algebra
+(`cross_entropy`, `softmax`, the gradient declared as `softmax(z) - y` rather than derived through
+`log`/`exp`), `log` added to `Transcendental`; `mnist-interop` and `bench/mnist-pytorch` both use it,
+summed over the batch, hyperparameters unchanged. Then a written inventory of what the transformer still
 needs (likely rank-3/4 tensor support and gather/scatter first) before writing it.
 
 ---
@@ -1054,6 +1110,10 @@ Found migrating a test off the old, no-longer-legal `Tensor(data: ...)` (no turb
 **Refined while building `linalg::MatMul`'s own `derivative` rule (a later session, `doc/backlog.md`'s own "Toward a matmul-based tensorial XOR" item)**: the original framing ("deterministically fails under `--workspace`, passes cleanly under plain `cargo test -p cleave --test mlir_lower`") turned out to be too narrow — a *second* test using the identical heavy pass pipeline (`derive_through_matmul_against_a_constant_identity_matrix_uses_the_product_rule_and_a_typed_zero`) showed the exact same intermittent-failure signature *even within* `cargo test -p cleave --test mlir_lower` alone (no `--workspace` needed — `cargo test`'s own default same-binary multithreading is enough to trigger it), while passing 5/5 when run in isolation (`... <exact test name>`). So the real trigger is concurrent execution of multiple tests *within one binary*, not specifically concurrent *binaries* — refines, doesn't contradict, the original resource-contention hypothesis. Not blocking, same as before: run a suspect MLIR-lowering test by name alone as the reliable signal.
 
 **A second, distinct, also-reproducible flake found re-verifying after the `Ring::zero`/`tensor.splat` fix (see the digits-interop perf item above) — a real build-ordering race, not resource contention**: `cleave/tests/pipeline.rs`'s three exe-emission tests (`emit_exe`, which shells out to `rustc -l cleave_rt -L <dir>`) look for `cleave_rt.lib` in the *unhashed* form Cargo only places directly in `target/release/` (`cleave_rt_search_dir`, same file) — but that unhashed copy is only materialized once some workspace member that depends on it as a genuine Cargo build-dependency (`examples/digits-interop`/`examples/rust-interop-demo`, via their own `build.rs`) finishes building. Under `cargo test --workspace --release` from a state where that copy doesn't exist yet, Cargo can run `pipeline.rs`'s own test binary (needing only `cleave`, already built) before those examples finish, and the exe-emission tests fail with `LINK : fatal error LNK1181: cannot open input file 'cleave_rt.lib'` — reproduced consistently, isolated by rerunning `-p cleave --test pipeline` alone right after (always passes once the unhashed copy exists). Not caused by, or specific to, any particular change — a structural gap in `cleave_rt_search_dir`'s own "look near the running exe" strategy, which has no way to *wait for* a sibling workspace member's build-dependency output. Not fixed; the reliable workaround is the same shape as the JIT-test flake above — rerun the specific failing test binary alone once the full workspace build has actually finished.
+
+**Seen again (2026-10-02)**: `cleave/tests/pipeline.rs` exited with `STATUS_HEAP_CORRUPTION` once in a
+full `cargo test --workspace` run, after three of its six tests had passed; the same binary then passed
+6/6, five times in a row, in parallel and in series. Not reproduced since.
 
 ## Multi-level call transparency in the e-graph forward translator — done
 

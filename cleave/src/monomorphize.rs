@@ -580,8 +580,21 @@ pub fn monomorphize(
     // worklist (`collect_instantiations` over its body), and so can the
     // lambdas. Every function and impl-method instance is inferred by
     // `engine`; lambdas are still specialized by substitution.
+    // Lambdas of instance bodies, absorbed as the engine reports them.
+    let mut instance_lambda_exprs: HashMap<NodeId, Expr> = HashMap::new();
+    let absorb = |produced: &mut Produced,
+                  program_inference: &mut ProgramInference,
+                  exprs: &mut HashMap<NodeId, Expr>| {
+        for (id, scheme, expr, types) in std::mem::take(&mut produced.lambdas) {
+            program_inference.lambda_schemes.insert(id, scheme);
+            program_inference.node_types.extend(types);
+            exprs.insert(id, expr);
+        }
+    };
     loop {
-        merge_produced(&mut mono, engine.drain(), &templates, registry, &mut fn_worklist, &mut impl_worklist, &mut lambda_worklist);
+        let mut produced = engine.drain();
+        absorb(&mut produced, &mut program_inference, &mut instance_lambda_exprs);
+        merge_produced(&mut mono, produced, &templates, registry, &mut fn_worklist, &mut impl_worklist, &mut lambda_worklist);
 
         while let Some((name, concrete_tys)) = fn_worklist.pop() {
             let display = display_instantiation(&name, &concrete_tys);
@@ -640,10 +653,13 @@ pub fn monomorphize(
             if mono.specializations.contains_key(&display) {
                 continue;
             }
-            let (Some(scheme), Some(&lambda_expr)) = (
-                program_inference.lambda_schemes.get(&lambda_id),
-                lambda_exprs.get(&lambda_id),
-            ) else {
+            let lambda_expr = lambda_exprs
+                .get(&lambda_id)
+                .copied()
+                .or_else(|| instance_lambda_exprs.get(&lambda_id));
+            let (Some(scheme), Some(lambda_expr)) =
+                (program_inference.lambda_schemes.get(&lambda_id), lambda_expr)
+            else {
                 continue;
             };
             let ExprKind::Lambda { params, body, .. } = &lambda_expr.kind else {
@@ -721,8 +737,9 @@ pub fn monomorphize(
             );
         }
 
-        let produced = engine.drain();
+        let mut produced = engine.drain();
         let idle = produced.is_empty();
+        absorb(&mut produced, &mut program_inference, &mut instance_lambda_exprs);
         merge_produced(&mut mono, produced, &templates, registry, &mut fn_worklist, &mut impl_worklist, &mut lambda_worklist);
         if idle && fn_worklist.is_empty() && impl_worklist.is_empty() && lambda_worklist.is_empty() {
             break;
@@ -3441,6 +3458,10 @@ struct Produced {
     impl_worklist: Vec<(usize, HashMap<TyVar, Ty>)>,
     lambda_worklist: Vec<(NodeId, Vec<Ty>, String)>,
     errors: Vec<TypeError>,
+    /// Lambdas of instance bodies (`InstanceEngine::instance_lambdas`): the
+    /// scheme, the expression and the node types the instance's inference
+    /// gave them, which the program-wide inference never saw.
+    lambdas: Vec<(NodeId, Scheme, Expr, HashMap<NodeId, Ty>)>,
 }
 
 impl Produced {
@@ -3450,6 +3471,7 @@ impl Produced {
             && self.impl_worklist.is_empty()
             && self.lambda_worklist.is_empty()
             && self.errors.is_empty()
+            && self.lambdas.is_empty()
     }
 }
 
@@ -3601,7 +3623,7 @@ impl<'a> InstanceEngine<'a> {
 
         let mut exprs = Vec::new();
         collect_exprs_block(&body, &mut exprs);
-        let node_types: HashMap<NodeId, Ty> = exprs
+        let mut node_types: HashMap<NodeId, Ty> = exprs
             .iter()
             .filter_map(|e| infer.node_types.get(&e.id).map(|ty| (e.id, ty.clone())))
             .collect();
@@ -3611,6 +3633,7 @@ impl<'a> InstanceEngine<'a> {
         {
             return None;
         }
+        let lambda_schemes = self.instance_lambdas(&infer, &exprs, &mut node_types);
 
         // The template's own bindings, now that the instance is concrete.
         let mut trial = Subst::default();
@@ -3642,7 +3665,7 @@ impl<'a> InstanceEngine<'a> {
                 &node_types,
                 &self.global_env,
                 self.templates,
-                &self.lambda_schemes,
+                &lambda_schemes,
                 HashMap::new(),
                 fn_worklist,
                 impl_worklist,
@@ -3676,6 +3699,46 @@ impl<'a> InstanceEngine<'a> {
 }
 
 impl InstanceEngine<'_> {
+    /// What an instance's body needs beyond its node types: the value of
+    /// each const generic it reads (`Infer::const_refs`, put back as
+    /// `Ty::Const` for `cps.rs`), and its lambdas, specialized from this
+    /// inference rather than the program-wide one (a comprehension's
+    /// function exists only in the instance's own copy of the body). Returns
+    /// the lambda schemes to resolve the body's calls with.
+    fn instance_lambdas(
+        &self,
+        infer: &Infer,
+        exprs: &[&Expr],
+        node_types: &mut HashMap<NodeId, Ty>,
+    ) -> HashMap<NodeId, Scheme> {
+        for (id, value) in &infer.const_refs {
+            if node_types.contains_key(id) {
+                node_types.insert(*id, Ty::Const(value.clone()));
+            }
+        }
+        let mut schemes = self.lambda_schemes.clone();
+        for e in exprs {
+            if !matches!(e.kind, ExprKind::Lambda { .. }) {
+                continue;
+            }
+            let Some(scheme) = infer.lambda_schemes.get(&e.id) else { continue };
+            let scheme = Scheme {
+                ty: infer.subst.apply(&scheme.ty),
+                ..scheme.clone()
+            };
+            let ExprKind::Lambda { body, .. } = &e.kind else { continue };
+            let mut inner = Vec::new();
+            collect_exprs_block(body, &mut inner);
+            let types: HashMap<NodeId, Ty> = inner
+                .iter()
+                .filter_map(|x| node_types.get(&x.id).map(|t| (x.id, t.clone())))
+                .collect();
+            schemes.insert(e.id, scheme.clone());
+            self.produced.borrow_mut().lambdas.push((e.id, scheme, (*e).clone(), types));
+        }
+        schemes
+    }
+
     /// Infers an instance with `infer_one` (a fresh session each round), and
     /// while that inference asks for loops to be unrolled
     /// (`Infer::unroll_requests`: a loop over a collection now known to be
@@ -3762,7 +3825,7 @@ impl InstanceEngine<'_> {
 
         let mut exprs = Vec::new();
         collect_exprs_block(&body, &mut exprs);
-        let node_types: HashMap<NodeId, Ty> = exprs
+        let mut node_types: HashMap<NodeId, Ty> = exprs
             .iter()
             .filter_map(|e| infer.node_types.get(&e.id).map(|ty| (e.id, ty.clone())))
             .collect();
@@ -3772,6 +3835,7 @@ impl InstanceEngine<'_> {
         {
             return None;
         }
+        let lambda_schemes = self.instance_lambdas(&infer, &exprs, &mut node_types);
         // The call's own instantiation names the instance when it gave one: a
         // generic only a turbofish fixes (`N` in `fn probe<const N: i32>() ->
         // i32`) appears nowhere in the signature to be recovered from.
@@ -3814,7 +3878,7 @@ impl InstanceEngine<'_> {
                 &node_types,
                 &self.global_env,
                 self.templates,
-                &self.lambda_schemes,
+                &lambda_schemes,
                 HashMap::new(),
                 fn_worklist,
                 impl_worklist,

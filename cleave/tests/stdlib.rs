@@ -96,10 +96,10 @@ fn stdlib_num_declares_adjoint_rules_alongside_derivative_rules() {
         trans_adjoints.iter().map(|r| r.method.as_str()).collect();
     assert_eq!(
         trans_methods,
-        std::collections::HashSet::from(["exp", "tanh"]),
-        "expected exactly the 2 Transcendental adjoint rules"
+        std::collections::HashSet::from(["exp", "tanh", "log"]),
+        "expected exactly the 3 Transcendental adjoint rules"
     );
-    assert_eq!(registry.derivative_rules("Transcendental").len(), 2);
+    assert_eq!(registry.derivative_rules("Transcendental").len(), 3);
 }
 
 fn load_num_registry() -> Registry {

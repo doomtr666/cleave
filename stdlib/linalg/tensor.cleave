@@ -204,3 +204,23 @@ impl<T: Float, const Dims...: i32> Index<Tensor<T, Dims...>, T> {
         mlir::tensor::extract(t, idx)
     }
 }
+
+// A tensor seeded by a comprehension (`Generate`, `stdlib/core`), filled at
+// run time: `let t: Tensor<f32, 4> = [for i in 0..4: ...]`, one nested
+// comprehension per dimension for a matrix (`[for i in 0..R: [for j in
+// 0..C: ...]]`, each row an array). One and two dimensions.
+impl<T: Float, const N: i32> Generate<Tensor<T, N>, T> {
+    fn generate(start, end, f) {
+        let mut a: [T; N] = mlir::memref::alloc();
+        for k in 0..N { a[k] = f(start + k); };
+        Tensor(data: a)
+    }
+}
+
+impl<T: Float, const R: i32, const C: i32> Generate<Tensor<T, R, C>, [T; C]> {
+    fn generate(start, end, f) {
+        let mut a: [[T; C]; R] = mlir::memref::alloc();
+        for k in 0..R { a[k] = f(start + k); };
+        Tensor(data: a)
+    }
+}

@@ -394,6 +394,31 @@ pub fn is_comprehension_collect(path: &Path) -> bool {
     path.operator && path.segments == ["Collect", "collect"]
 }
 
+/// The callee a comprehension over a homogeneous body becomes:
+/// `Generate::generate(start, end, f)`, filling its collection at run time;
+/// marked like `comprehension_collect`, for the same reason.
+pub fn comprehension_generate() -> Path {
+    Path {
+        segments: vec!["Generate".to_string(), "generate".to_string()],
+        operator: true,
+    }
+}
+
+pub fn is_comprehension_generate(path: &Path) -> bool {
+    path.operator && path.segments == ["Generate", "generate"]
+}
+
+/// The name a comprehension's function is bound to before `Generate::
+/// generate` is called with it (`unroll.rs`), `<gen#id>`: out of reach of
+/// user code.
+pub fn generated_callable_name(id: NodeId) -> String {
+    format!("<gen#{}>", id.0)
+}
+
+pub fn is_generated_callable(name: &str) -> bool {
+    name.starts_with("<gen#")
+}
+
 pub fn tuple_struct_name(arity: usize) -> String {
     format!("__Tuple{arity}")
 }

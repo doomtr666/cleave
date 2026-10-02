@@ -1989,13 +1989,19 @@ pub struct Infer<'r> {
     /// (`infer_fn_with_concrete_params`): the caller's to pin, never a
     /// body literal's default (`fn half<T: Float>() -> T { ... / 2.0 }`).
     undefaultable: Vec<TyVar>,
-    /// Comprehensions whose bounds didn't fold yet: the call, its bounds, its
-    /// span (`fold_late_comprehensions`).
-    unfolded_comprehensions: Vec<(NodeId, Expr, Expr, Span)>,
+    /// Comprehensions inferred this round, decided once the body is fully
+    /// inferred (`decide_comprehensions`).
+    pending_comprehensions: Vec<PendingComprehension>,
+    /// What each comprehension's body indexes by its variable: `(the
+    /// comprehension, the indexed value's type)`. A struct or tuple makes the
+    /// body heterogeneous; a type still open leaves it undecided.
+    comprehension_indexed: Vec<(NodeId, Ty)>,
     /// Comprehension results in generic code, before any instance rewrites
     /// them (and what is read out of them): nothing to check until then
     /// (`check_pending_field_accesses`).
     opaque_comprehensions: HashSet<TyVar>,
+    /// The comprehensions among `unroll_scopes` (`infer_comprehension`).
+    comprehension_ids: HashSet<NodeId>,
     /// Names of the type packs (`Ts...`, never a `const Dims...`) seen in
     /// generics: a type pack used as a whole type is the tuple of its
     /// elements (`ty_from_ast_mapped`), a const pack never is.
@@ -2104,6 +2110,11 @@ pub struct Infer<'r> {
     /// are, re-resolved through `self.subst` at the same points `node_types`
     /// is (see `finish_fn`/`infer_impl_fn_generic_with_env`).
     pub lambda_schemes: HashMap<NodeId, Scheme>,
+    /// The value of every const generic read as a value (`for b in 0..B`),
+    /// by the reading node, in an instance where it is known: the node's
+    /// type is the value's (`i32`), and conversion needs the value itself
+    /// (`monomorphize.rs` puts it back as `Ty::Const` for `cps.rs`).
+    pub const_refs: HashMap<NodeId, ConstValue>,
     /// A field access (`v.foo`) whose own base was still a bare `Ty::Var`
     /// at the point it was written — e.g. `let z = 4i; z.real`, where `z`'s
     /// own type only becomes concrete once `apply_defaults` runs, at the
@@ -2168,8 +2179,37 @@ struct PendingIndex {
 
 fn unfolded_comprehension(span: Span) -> TypeError {
     TypeError {
-        kind: TypeErrorKind::Unresolved("a comprehension's bounds must be known at compile time".to_string()),
+        kind: TypeErrorKind::Unresolved(
+            "a comprehension over a struct or tuple needs bounds known at compile time".to_string(),
+        ),
         span,
+    }
+}
+
+/// A comprehension seen this round (`Infer::pending_comprehensions`).
+#[derive(Debug, Clone)]
+struct PendingComprehension {
+    id: NodeId,
+    start: Expr,
+    end: Expr,
+    /// The type of one element, the body's.
+    element: Ty,
+    span: Span,
+}
+
+/// The bounds an unroll request carries when it asks for a comprehension to
+/// become a `Generate::generate` call rather than unrolled copies
+/// (`unroll.rs`): no copies, so no real bounds.
+pub const GENERATE_REQUEST: (u64, u64) = (u64::MAX, u64::MAX);
+
+/// Whether an array of this type is a default target: numbers, booleans,
+/// and arrays of them. An array of tensors or of structs isn't representable
+/// by every backend path yet (`doc/backlog.md`).
+fn is_array_element(t: &Ty) -> bool {
+    match t {
+        Ty::Con(_) => true,
+        Ty::Array(e, _) => is_array_element(e),
+        _ => false,
     }
 }
 
@@ -2182,6 +2222,9 @@ struct CollectDefault {
     source: Ty,
     elements: Vec<Ty>,
     span: Span,
+    /// `Some((start, end))` for a `Generate::generate` call (the
+    /// comprehension's bounds), `None` for `Collect::collect`.
+    generated: Option<(Expr, Expr)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2231,8 +2274,10 @@ impl<'r> Infer<'r> {
             unroll_scopes: Vec::new(),
             unroll_requests: Vec::new(),
             undefaultable: Vec::new(),
-            unfolded_comprehensions: Vec::new(),
+            pending_comprehensions: Vec::new(),
+            comprehension_indexed: Vec::new(),
             opaque_comprehensions: HashSet::new(),
+            comprehension_ids: HashSet::new(),
             type_packs: HashSet::new(),
             oracle: None,
             instance_calls: Vec::new(),
@@ -2243,6 +2288,7 @@ impl<'r> Infer<'r> {
             pending_type_name_checks: Vec::new(),
             pending_div_by_zero_checks: Vec::new(),
             lambda_schemes: HashMap::new(),
+            const_refs: HashMap::new(),
             pending_field_accesses: Vec::new(),
             pending_indices: Vec::new(),
         }
@@ -5016,40 +5062,64 @@ impl<'r> Infer<'r> {
             source,
             elements,
             span: expr.span,
+            generated: None,
         });
     }
 
-    /// `[for i in a..b: e]` (`<comprehension>(a, b, fn(i) { e })`): a tuple
-    /// of one `e` per index, which only exists once rewritten as such
-    /// (`unroll.rs`). With bounds that fold, this asks for that rewrite and
-    /// the copies are inferred next round; the placeholder type meanwhile
-    /// says nothing. Bounds that don't fold yet are fine in code still
-    /// generic (they may fold per instance), an error in a concrete instance.
+    /// `Generate::generate(start, end, f)` from a comprehension: its target,
+    /// and the type of one element (`f`'s result).
+    fn note_generate_default(&mut self, expr: &Expr, args: &[Expr], target: &Ty) {
+        let [start, end, f] = args else { return };
+        let Some(Ty::Fn(_, element)) = self.node_types.get(&f.id).map(|t| self.subst.apply(t)) else {
+            return;
+        };
+        self.pending_collect_defaults.push(CollectDefault {
+            target: target.clone(),
+            source: (*element).clone(),
+            elements: vec![*element],
+            span: expr.span,
+            generated: Some((start.clone(), end.clone())),
+        });
+    }
+
+    /// `[for i in a..b: e]` (`<comprehension>(a, b, fn(i) { e })`). Its body
+    /// is inferred once here, `i` an integer, to learn what kind of
+    /// comprehension it is (`decide_comprehensions`, once the whole body
+    /// around it is inferred): one that indexes a struct or tuple by `i`
+    /// becomes a tuple of copies, one per index (`unroll.rs`); any other, a
+    /// `Generate::generate` call filling its collection at run time. Either
+    /// way the code is rewritten and inferred again, so the placeholder type
+    /// it gets meanwhile says nothing.
     fn infer_comprehension(&mut self, env: &Env, expr: &Expr, args: &[Expr]) -> Result<Ty, TypeError> {
-        let [start, end, _] = args else {
+        let [start, end, lambda] = args else {
             unreachable!("a comprehension lowers to exactly (start, end, body)")
+        };
+        let ExprKind::Lambda { params, body, .. } = &lambda.kind else {
+            unreachable!("a comprehension's body is a lambda")
         };
         let start_ty = self.infer_expr(env, start)?;
         let end_ty = self.infer_expr(env, end)?;
         self.unify_at(end.span, &start_ty, &end_ty)?;
-        let (s, e) = (self.fold_loop_bound(start), self.fold_loop_bound(end));
-        let never_folds = |this: &Self, folded: Option<u64>, bound: &Expr| {
-            folded.is_none() && !this.may_fold_later(bound)
+        self.constraints.push(Constraint::all_gating("Int".to_string(), vec![start_ty.clone()], start.span));
+        let bounds = match (self.fold_loop_bound(start), self.fold_loop_bound(end)) {
+            (Some(s), Some(e)) => Some((s, e)),
+            _ => None,
         };
-        let never = never_folds(self, s, start) || never_folds(self, e, end);
-        match (s, e) {
-            (Some(s), Some(e)) => {
-                if !self.unroll_requests.iter().any(|(id, _, _)| *id == expr.id) {
-                    self.unroll_requests.push((expr.id, s, e.max(s)));
-                }
-            }
-            _ if never => return Err(unfolded_comprehension(expr.span)),
-            // Bounds still open may fold once the body is fully inferred
-            // (`[for i in 0..updated.len(): ...]`, `updated` itself a
-            // comprehension, typed by its default at the end): tried again
-            // then (`fold_late_comprehensions`).
-            _ => self.unfolded_comprehensions.push((expr.id, start.clone(), end.clone(), expr.span)),
-        }
+        let var = params[0].name.clone();
+        let mut inner_env = env.clone();
+        inner_env.insert(var.clone(), Scheme::mono(start_ty));
+        self.comprehension_ids.insert(expr.id);
+        self.unroll_scopes.push((var, expr.id, bounds));
+        let element = self.infer_block(&inner_env, body);
+        self.unroll_scopes.pop();
+        let element = element?;
+        self.pending_comprehensions.push(PendingComprehension {
+            id: expr.id,
+            start: start.clone(),
+            end: end.clone(),
+            element,
+            span: expr.span,
+        });
         let placeholder = self.vars.fresh();
         if self.oracle.is_none() {
             if let Ty::Var(v) = placeholder {
@@ -5057,6 +5127,34 @@ impl<'r> Infer<'r> {
             }
         }
         Ok(placeholder)
+    }
+
+    /// A comprehension's `Generate::generate(start, end, f)` (`unroll.rs`).
+    /// Its target comes from the context or, failing that, from its default
+    /// (`CollectDefault`), like a literal's type: the call is a deferred
+    /// `Generate` constraint, never dispatched while the target is open
+    /// (several impls fit an open target: an array, a `DynArray`, ...).
+    fn infer_generate(&mut self, env: &Env, expr: &Expr, path: &Path, args: &[Expr]) -> Result<Ty, TypeError> {
+        let [start, end, f] = args else {
+            unreachable!("a generated comprehension calls generate(start, end, f)")
+        };
+        let int = Ty::Con("i32".to_string());
+        let start_ty = self.infer_expr(env, start)?;
+        self.unify_at(start.span, &start_ty, &int)?;
+        let end_ty = self.infer_expr(env, end)?;
+        self.unify_at(end.span, &end_ty, &int)?;
+        let f_ty = self.infer_expr(env, f)?;
+        let element = self.vars.fresh();
+        self.unify_at(f.span, &f_ty, &Ty::Fn(vec![int], Box::new(element.clone())))?;
+        let target = self.vars.fresh();
+        self.constraints.push(Constraint::all_gating(
+            "Generate".to_string(),
+            vec![target.clone(), element],
+            expr.span,
+        ));
+        self.note_generate_default(expr, args, &target);
+        self.note_instance_call(env, expr, path, args, &target);
+        Ok(target)
     }
 
     /// Whether a bound that doesn't fold now might in some instance: it names
@@ -5128,6 +5226,15 @@ impl<'r> Infer<'r> {
 
     /// When `idx` is the variable of an enclosing `for` whose bounds fold:
     /// that loop's `NodeId` and bounds (`unroll_requests`).
+    /// The comprehension whose variable `idx` is, if any (the innermost
+    /// binding of that name).
+    fn comprehension_index(&self, idx: &Expr) -> Option<NodeId> {
+        let ExprKind::Path(p) = &idx.kind else { return None };
+        let [name] = p.segments.as_slice() else { return None };
+        let (_, id, _) = self.unroll_scopes.iter().rev().find(|(var, _, _)| var == name)?;
+        self.comprehension_ids.contains(id).then_some(*id)
+    }
+
     fn unrollable_loop_index(&self, idx: &Expr) -> Option<(NodeId, u64, u64)> {
         let ExprKind::Path(p) = &idx.kind else { return None };
         let [name] = p.segments.as_slice() else { return None };
@@ -5238,30 +5345,67 @@ impl<'r> Infer<'r> {
         self.settle_deferred()?;
         self.apply_defaults();
         self.settle_deferred()?;
-        self.fold_late_comprehensions()
+        self.decide_comprehensions()
     }
 
-    /// Comprehensions whose bounds didn't fold while the body was inferred,
-    /// tried again once it has been: a bound that folds now asks for the
-    /// rewrite like any other. In an instance, one that still doesn't fold
-    /// is an error, unless this round rewrites something else (whose result
-    /// may be what it waits on); in generic code it waits for its instances.
-    pub(crate) fn fold_late_comprehensions(&mut self) -> Result<(), TypeError> {
+    /// Every comprehension of this round, once the body around it is
+    /// inferred: what it indexes by its variable decides how it is rewritten
+    /// (`infer_comprehension`).
+    /// - A struct or tuple: a tuple of copies, which needs bounds that fold.
+    /// - Something still open (generic code): nothing yet, each instance
+    ///   decides.
+    /// - Anything else: a `Generate::generate` call, any bounds; unless its
+    ///   elements are known to be tensors or structs and its bounds fold,
+    ///   which a tuple of copies holds better than an array could
+    ///   (`is_array_element`).
+    ///
+    /// In an instance, a heterogeneous one whose bounds still don't fold is
+    /// an error, unless this round rewrites something else it may wait on.
+    pub(crate) fn decide_comprehensions(&mut self) -> Result<(), TypeError> {
         let mut unfolded = None;
-        for (id, start, end, span) in std::mem::take(&mut self.unfolded_comprehensions) {
-            match (self.fold_loop_bound(&start), self.fold_loop_bound(&end)) {
-                (Some(s), Some(e)) => {
-                    if !self.unroll_requests.iter().any(|(r, _, _)| *r == id) {
-                        self.unroll_requests.push((id, s, e.max(s)));
+        let indexed = std::mem::take(&mut self.comprehension_indexed);
+        for c in std::mem::take(&mut self.pending_comprehensions) {
+            let bases: Vec<Ty> = indexed
+                .iter()
+                .filter(|(id, _)| *id == c.id)
+                .map(|(_, t)| self.subst.apply(t))
+                .collect();
+            let heterogeneous = bases.iter().any(|b| self.is_positional_struct(b));
+            let open = bases.iter().any(|b| matches!(b, Ty::Var(_)) || self.is_generic_collection(b));
+            let bounds = match (self.fold_loop_bound(&c.start), self.fold_loop_bound(&c.end)) {
+                (Some(s), Some(e)) => Some((s, e.max(s))),
+                _ => None,
+            };
+            let element = self.subst.apply(&c.element);
+            let request = if heterogeneous {
+                match bounds {
+                    Some(b) => Some(b),
+                    None if self.oracle.is_some()
+                        || !(self.may_fold_later(&c.start) && self.may_fold_later(&c.end)) =>
+                    {
+                        unfolded = unfolded.or(Some(c.span));
+                        None
                     }
+                    None => None,
                 }
-                _ => {
-                    unfolded = unfolded.or(Some(span))
+            } else if open {
+                None
+            } else {
+                // An element type still open is left to the context (`i.to()`
+                // into a `[f32; 3]`), which the generated call carries.
+                match bounds {
+                    Some(b) if is_fully_concrete(&element) && !is_array_element(&element) => Some(b),
+                    _ => Some(GENERATE_REQUEST),
+                }
+            };
+            if let Some((s, e)) = request {
+                if !self.unroll_requests.iter().any(|(r, _, _)| *r == c.id) {
+                    self.unroll_requests.push((c.id, s, e));
                 }
             }
         }
         match unfolded {
-            Some(span) if self.oracle.is_some() && self.unroll_requests.is_empty() => {
+            Some(span) if self.unroll_requests.is_empty() || self.oracle.is_none() => {
                 Err(unfolded_comprehension(span))
             }
             _ => Ok(()),
@@ -6076,7 +6220,11 @@ impl<'r> Infer<'r> {
                     }
                     // `let mut` is never generalized — see module docs (the
                     // ref-cell-polymorphism unsoundness this avoids).
-                    let scheme = if !mutable && is_syntactic_value(value) {
+                    // Nor is a comprehension's own function (`ast::
+                    // is_generated_callable`): used once, right where it is
+                    // bound, and what its body leaves open (an inner
+                    // comprehension's length) must still take its default.
+                    let scheme = if !mutable && is_syntactic_value(value) && !is_generated_callable(name) {
                         self.generalize(&env, &value_ty, None)?
                     } else {
                         Scheme::mono(value_ty)
@@ -6264,7 +6412,26 @@ impl<'r> Infer<'r> {
             ExprKind::Path(p) => {
                 let name = p.segments.join("::");
                 match env.get(&name) {
-                    Some(scheme) => Ok(self.instantiate(&scheme.clone())),
+                    Some(scheme) => {
+                        let ty = self.instantiate(&scheme.clone());
+                        // A const generic read as a value (`for b in 0..B`):
+                        // in an instance it is bound to its value
+                        // (`Ty::Const(2)`), which is what it *is* as a type
+                        // argument, not the type of the value it denotes.
+                        if self.active_generics.contains_key(&name) {
+                            if let Ty::Const(value) = self.subst.apply(&ty) {
+                                self.const_refs.insert(expr.id, value.clone());
+                                return Ok(Ty::Con(
+                                    match value {
+                                        ConstValue::Int(_) => "i32",
+                                        ConstValue::Bool(_) => "bool",
+                                    }
+                                    .to_string(),
+                                ));
+                            }
+                        }
+                        Ok(ty)
+                    }
                     // Not a local binding (parameter/`let`/const generic) --
                     // a whole-program `const` with this name, if one exists,
                     // is checked *after* local scope, never before: an
@@ -6327,12 +6494,16 @@ impl<'r> Infer<'r> {
             ExprKind::Call(path, _, args, _) if path.segments == [COMPREHENSION] => {
                 self.infer_comprehension(env, expr, args)
             }
+            ExprKind::Call(path, _, args, _) if is_comprehension_generate(path) => {
+                self.infer_generate(env, expr, path, args)
+            }
             ExprKind::Call(path, generics, args, _) => {
                 self.last_scheme_instantiation = None;
                 let ty = self.infer_call(env, expr.span, path, generics, args)?;
                 if is_comprehension_collect(path) {
                     self.note_collect_default(expr, &args[0], &ty);
                 }
+
                 self.note_instance_call(env, expr, path, args, &ty);
                 Ok(ty)
             }
@@ -6521,6 +6692,12 @@ impl<'r> Infer<'r> {
                         .get(name)
                         .cloned()
                         .unwrap_or_else(|| self.vars.fresh())
+                } else if let Some(dim) = single_name(count).and_then(|n| self.active_generics.get(n)).cloned() {
+                    // A const generic (`[v; N]`): the array's length is the
+                    // generic itself, its value in an instance, not the type
+                    // of `N` read as a value (`i32`).
+                    self.infer_expr(env, count)?;
+                    dim
                 } else {
                     self.infer_expr(env, count)?
                 };
@@ -6579,6 +6756,18 @@ impl<'r> Infer<'r> {
                                 return self.resolve_field_access(&resolved_base, &field, expr.span);
                             }
                             _ => {}
+                        }
+                    } else if let Some(id) = self.comprehension_index(idx) {
+                        // A comprehension's body indexing by its variable:
+                        // recorded, so the comprehension knows what kind it
+                        // is (`decide_comprehensions`). A struct, a tuple or
+                        // a still-open type has no element type yet.
+                        self.comprehension_indexed.push((id, resolved_base.clone()));
+                        if self.is_positional_struct(&resolved_base)
+                            || matches!(resolved_base, Ty::Var(_))
+                            || self.is_generic_collection(&resolved_base)
+                        {
+                            return Ok(self.vars.fresh());
                         }
                     } else if let Some((for_id, start, end)) = self.unrollable_loop_index(idx) {
                         // `x[i]`, `i` the variable of an enclosing `for` with
@@ -7441,15 +7630,29 @@ impl<'r> Infer<'r> {
     /// [for i in 0..3: 0.5]`): when exactly one `Collect` impl fits that
     /// target, its source pattern types the elements, before their literals
     /// take their own defaults (`0.5` is an `f64` here, not an `f32`).
+    ///
+    /// Repeated until nothing changes: refining an outer comprehension fixes
+    /// the target of the one nested in its body (`[for i in ...: [for j in
+    /// ...: ...]]` into a matrix), which can then refine in turn.
     fn refine_collect_sources(&mut self) {
-        for d in self.pending_collect_defaults.clone() {
-            let target = self.subst.apply(&d.target);
-            if matches!(target, Ty::Var(_)) {
-                continue;
+        loop {
+            let mut changed = false;
+            for d in self.pending_collect_defaults.clone() {
+                let target = self.subst.apply(&d.target);
+                if matches!(target, Ty::Var(_)) {
+                    continue;
+                }
+                let source = self.subst.apply(&d.source);
+                let algebra = if d.generated.is_some() { "Generate" } else { "Collect" };
+                if let [only] = self.matching_impls(algebra, &[target.clone(), source.clone()]).as_slice() {
+                    if only.apply(&target) != target || only.apply(&source) != source {
+                        changed = true;
+                    }
+                    self.subst = only.clone();
+                }
             }
-            let source = self.subst.apply(&d.source);
-            if let [only] = self.matching_impls("Collect", &[target, source]).as_slice() {
-                self.subst = only.clone();
+            if !changed {
+                return;
             }
         }
     }
@@ -7461,10 +7664,20 @@ impl<'r> Infer<'r> {
     /// quantified belongs to each instance, which decides it there.
     fn apply_collect_defaults(&mut self, only_concrete: bool) {
         for d in std::mem::take(&mut self.pending_collect_defaults) {
-            let Ty::Var(root) = self.subst.apply(&d.target) else { continue };
-            if self.quantified.contains(&root)
-                || self.undefaultable.iter().any(|v| self.subst.apply(&Ty::Var(*v)) == Ty::Var(root))
-            {
+            // A target still open, wholly or in part: a `Generate` call's may
+            // already have committed to its only impl's shape (`[T; 'n]`, the
+            // length still open), so any open part counts, not just a bare
+            // variable.
+            let target = self.subst.apply(&d.target);
+            let mut open = HashSet::new();
+            free_vars(&target, &mut open);
+            if open.is_empty() || (d.generated.is_none() && !matches!(target, Ty::Var(_))) {
+                continue;
+            }
+            if open.iter().any(|v| {
+                self.quantified.contains(v)
+                    || self.undefaultable.iter().any(|u| self.subst.apply(&Ty::Var(*u)) == Ty::Var(*v))
+            }) {
                 continue;
             }
             let elements: Vec<Ty> = d.elements.iter().map(|t| self.subst.apply(t)).collect();
@@ -7472,20 +7685,32 @@ impl<'r> Infer<'r> {
                 self.pending_collect_defaults.push(d);
                 continue;
             }
-            // Arrays of scalars (or of arrays of them) only: an array of
-            // tensors or of structs isn't representable by every backend
-            // path yet (`doc/backlog.md`), and a tuple of same-typed values
-            // indexes just as well at compile time.
-            fn array_element(t: &Ty) -> bool {
-                match t {
-                    Ty::Con(_) => true,
-                    Ty::Array(e, _) => array_element(e),
-                    _ => false,
+            if let Some((start, end)) = &d.generated {
+                // A generated comprehension: an array when its length is
+                // known, a `DynArray` otherwise (when the program has one).
+                let element = elements[0].clone();
+                let default = match (self.fold_loop_bound(start), self.fold_loop_bound(end)) {
+                    (Some(s), Some(e)) if is_array_element(&element) => Some(Ty::Array(
+                        Box::new(element),
+                        Box::new(Ty::Const(ConstValue::Int(e.saturating_sub(s)))),
+                    )),
+                    _ if self.registry.has_struct("DynArray") => {
+                        Some(Ty::App("DynArray".to_string(), vec![element]))
+                    }
+                    _ => None,
+                };
+                if let Some(default) = default {
+                    let _ = self.unify_at(d.span, &target, &default);
                 }
+                continue;
             }
+            let Ty::Var(root) = target else { continue };
+            // Arrays of scalars (or of arrays of them) only (`is_array_element`):
+            // a tuple of same-typed values indexes just as well at compile
+            // time.
             let homogeneous = elements.len() >= 2
                 && elements.iter().all(is_fully_concrete)
-                && array_element(&elements[0])
+                && is_array_element(&elements[0])
                 && elements.windows(2).all(|w| w[0] == w[1]);
             let default = if homogeneous {
                 Ty::Array(
@@ -7625,5 +7850,13 @@ impl<'r> Infer<'r> {
             unify(&mut self.subst, &Ty::Var(root), &default_ty)
                 .expect("defaulting an unbound, non-quantified variable can't fail");
         }
+    }
+}
+
+/// The name an expression is, when it is a bare one (`N`).
+fn single_name(e: &Expr) -> Option<&str> {
+    match &e.kind {
+        ExprKind::Path(p) if p.segments.len() == 1 => Some(&p.segments[0]),
+        _ => None,
     }
 }

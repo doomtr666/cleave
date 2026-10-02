@@ -418,7 +418,13 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
             }
         }
         infer.apply_defaults();
-        let _ = infer.fold_late_comprehensions();
+        if let Err(e) = infer.decide_comprehensions() {
+            for name in group {
+                if let Some(r @ Ok(_)) = raw_results.get_mut(name) {
+                    *r = Err(e.clone());
+                }
+            }
+        }
         // A constraint failure here is a property of the group's mutual
         // definition as a whole, not attributable to one specific member —
         // reported against every member whose own body-inference otherwise

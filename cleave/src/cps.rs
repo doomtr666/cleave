@@ -3494,6 +3494,9 @@ fn lambda_free_vars_expr(
                 return HashMap::new();
             }
             match node_types.get(&expr.id) {
+                // A const generic's value (`C` in `0..C`), converted like a
+                // literal (`convert_expr`'s `Path` arm): nothing to capture.
+                Some(Ty::Const(_)) => HashMap::new(),
                 Some(ty) => HashMap::from([(name, ty.clone())]),
                 // A const-generic reference (`N` in `[v; N]`), or some other
                 // name this particular `node_types` map doesn't cover -- not

@@ -387,7 +387,7 @@ fn as_var(v: &CVal) -> Option<CVar> {
 /// passes it) — used by `collect_local_free_vars`'s own fixpoint, see that
 /// function's own doc comment for why a def can't just use its own direct
 /// references alone.
-fn local_free_vars(def: &CFunDef) -> (HashSet<CVar>, HashSet<String>) {
+fn local_free_vars(def: &CFunDef) -> (HashSet<CVar>, HashSet<String>, HashSet<CVar>) {
     let mut bound: HashSet<CVar> = def.params.iter().copied().collect();
     let mut referenced: HashSet<CVar> = HashSet::new();
     let mut func_labels: HashSet<String> = HashSet::new();
@@ -395,6 +395,7 @@ fn local_free_vars(def: &CFunDef) -> (HashSet<CVar>, HashSet<String>) {
     (
         referenced.difference(&bound).copied().collect(),
         func_labels,
+        bound,
     )
 }
 
@@ -707,18 +708,30 @@ fn else_branch_of(body: &CExpr) -> &CExpr {
 /// value the loop genuinely still does, releasing it one hop too early.
 /// Bounded and guaranteed to terminate: values only ever grow (a pure
 /// union each round), and there are finitely many `(def, CVar)` pairs.
+///
+/// A variable the def binds itself (a parameter, a `let`, a nested def's
+/// parameter) is never one of its free variables, even when a label it
+/// tail-calls has it free: that label is nested inside the def and gets it
+/// from there. Without this, a join's own parameter came back as free in
+/// the join (through a second join nested in it), then in every def
+/// enclosing that one, up to the loop: live at every back-edge, so never
+/// released — a whole `Dense` leaked per iteration (`let d = if ..; let e =
+/// if ..; d.w[0, 0] + e.w[0, 0]`), and `mnist-interop`'s gradient once it
+/// went through an `if`.
 fn collect_local_free_vars(top: &CTopLevelFn, out: &mut HashMap<String, HashSet<CVar>>) {
     let mut func_labels: HashMap<String, HashSet<String>> = HashMap::new();
-    walk_local_free_vars(&top.def.body, out, &mut func_labels);
+    let mut bound: HashMap<String, HashSet<CVar>> = HashMap::new();
+    walk_local_free_vars(&top.def.body, out, &mut func_labels, &mut bound);
     loop {
         let mut changed = false;
         let names: Vec<String> = out.keys().cloned().collect();
         for name in names {
             let deps = func_labels.get(&name).cloned().unwrap_or_default();
+            let own = bound.get(&name).cloned().unwrap_or_default();
             let mut additions: Vec<CVar> = Vec::new();
             for dep in &deps {
                 if let Some(dep_vars) = out.get(dep) {
-                    additions.extend(dep_vars.iter().copied());
+                    additions.extend(dep_vars.iter().copied().filter(|v| !own.contains(v)));
                 }
             }
             let entry = out.get_mut(&name).unwrap();
@@ -736,26 +749,28 @@ fn walk_local_free_vars(
     expr: &CExpr,
     out: &mut HashMap<String, HashSet<CVar>>,
     func_labels: &mut HashMap<String, HashSet<String>>,
+    bound: &mut HashMap<String, HashSet<CVar>>,
 ) {
     match expr {
-        CExpr::LetPrim { cont, .. } => walk_local_free_vars(cont, out, func_labels),
+        CExpr::LetPrim { cont, .. } => walk_local_free_vars(cont, out, func_labels, bound),
         CExpr::App { .. } => {}
         CExpr::If {
             then_branch,
             else_branch,
             ..
         } => {
-            walk_local_free_vars(then_branch, out, func_labels);
-            walk_local_free_vars(else_branch, out, func_labels);
+            walk_local_free_vars(then_branch, out, func_labels, bound);
+            walk_local_free_vars(else_branch, out, func_labels, bound);
         }
         CExpr::Fix { defs, body } => {
             for d in defs {
-                let (free_vars, deps) = local_free_vars(d);
+                let (free_vars, deps, own) = local_free_vars(d);
                 out.insert(d.name.clone(), free_vars);
                 func_labels.insert(d.name.clone(), deps);
-                walk_local_free_vars(&d.body, out, func_labels);
+                bound.insert(d.name.clone(), own);
+                walk_local_free_vars(&d.body, out, func_labels, bound);
             }
-            walk_local_free_vars(body, out, func_labels);
+            walk_local_free_vars(body, out, func_labels, bound);
         }
     }
 }
@@ -1273,8 +1288,15 @@ fn rewrite_body(
             // the difference (a real `Release` on the pointer for the
             // heavy case, a `PrimOp::Field` chain ending in `Release` for
             // each leaf otherwise).
+            // A bare tensor read out of an owned struct (`n.l2.b`) is a
+            // counted reference like a heavy value, and must be tracked and
+            // protected the same way: otherwise the struct's own release
+            // frees it while the read result is still used (`Index` on it,
+            // a real use-after-free found with a gradient going through an
+            // `if`).
+            let bare_tensor = is_bare_tensor_ty(&ty, ctx.mlir_types);
             if (matches!(&op, PrimOp::Struct(..)) || field_read_owned)
-                && (ctx.is_rc(&ty) || !ctx.light_release_leaves(&ty).is_empty())
+                && (ctx.is_rc(&ty) || bare_tensor || !ctx.light_release_leaves(&ty).is_empty())
             {
                 owned.push((var, ty.clone()));
             }
@@ -1395,7 +1417,7 @@ fn rewrite_body(
             | PrimOp::Load { .. } = &op
             {
                 if ctx.owned_origin.get(&var).copied().unwrap_or(false) {
-                    if ctx.is_rc(&ty) {
+                    if ctx.is_rc(&ty) || bare_tensor {
                         Some(FieldReadProtect::Whole(ty.clone()))
                     } else {
                         let leaves = ctx.light_release_leaves(&ty);
@@ -1595,11 +1617,29 @@ fn rewrite_body(
                     _ => None,
                 };
 
+            // A join (`Fix.body` an `If`): every value the scope defining it
+            // owns goes down both branches, and a branch jumping to the join
+            // keeps whatever the join still needs (`releases_for_app`: live
+            // at the jump). The join itself must then own those, or no scope
+            // ever releases them: `local_claim_vars` gives a value to the
+            // shallowest def it is free in — here the scope defining the
+            // join, not the join. Found as a leak of a whole `Dense` per
+            // iteration (`let d = if ..; let e = if ..; d.w[0, 0] + e.w[0,
+            // 0]`, `d` read only in the second `if`'s join), together with
+            // `collect_local_free_vars`'s own bound-variable fix.
+            let join_owned: Vec<(CVar, Ty)> = if body_is_app { Vec::new() } else { transferred.clone() };
             let new_defs = defs
                 .into_iter()
                 .map(|def| {
                     let mut seed: Vec<(CVar, Ty)> = Vec::new();
                     let mut seen: HashSet<CVar> = HashSet::new();
+                    if let Some(fv) = ctx.local_free_vars.get(&def.name) {
+                        for (v, ty) in &join_owned {
+                            if fv.contains(v) && seen.insert(*v) {
+                                seed.push((*v, ty.clone()));
+                            }
+                        }
+                    }
                     let is_owned = |v: &CVar| ctx.owned_origin.get(v).copied().unwrap_or(false);
                     // A light struct with its own genuinely-refcounted
                     // leaves needs seeding here exactly like an ordinary

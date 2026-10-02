@@ -344,8 +344,12 @@ fn unroll_expr(e: &mut Expr, requests: &HashMap<NodeId, (u64, u64)>, ids: &mut N
     }
     if let Some((var, body)) = comprehension_parts(e) {
         if let Some(&(start, end)) = requests.get(&e.id) {
-            let (var, body) = (var.to_string(), body.clone());
-            e.kind = collected(&var, &body, start, end, e.span, ids);
+            if (start, end) == crate::infer::GENERATE_REQUEST {
+                e.kind = generated(e, ids);
+            } else {
+                let (var, body) = (var.to_string(), body.clone());
+                e.kind = collected(&var, &body, start, end, e.span, ids);
+            }
             return;
         }
     }
@@ -410,6 +414,56 @@ fn comprehension_parts(e: &Expr) -> Option<(&str, &Block)> {
     let ExprKind::Lambda { params, body, .. } = &lambda.kind else { return None };
     let [param] = params.as_slice() else { return None };
     Some((param.name.as_str(), body))
+}
+
+/// The replacement of a comprehension over a homogeneous body: `{ let
+/// <gen#id> = fn(i) { body }; Generate::generate(start, end, <gen#id>) }`,
+/// filling its collection at run time. The function is bound by name since
+/// a higher-order call passes a named callable (`cps.rs`,
+/// `build_higher_order_specializations`); `<` keeps the name out of reach of
+/// user code.
+fn generated(e: &Expr, ids: &mut NodeIdGen) -> ExprKind {
+    let ExprKind::Call(_, _, args, _) = &e.kind else {
+        unreachable!("checked by comprehension_parts")
+    };
+    let [start, end, lambda] = args.as_slice() else {
+        unreachable!("a comprehension lowers to exactly (start, end, body)")
+    };
+    let name = generated_callable_name(e.id);
+    let reference = Node {
+        id: ids.next(),
+        span: e.span,
+        kind: ExprKind::Path(Path::single(name.clone())),
+    };
+    let call = Node {
+        id: ids.next(),
+        span: e.span,
+        kind: ExprKind::Call(
+            comprehension_generate(),
+            Vec::new(),
+            vec![start.clone(), end.clone(), reference],
+            Vec::new(),
+        ),
+    };
+    // Fresh ids: in an instance's own copy of a generic body, this function
+    // is that instance's alone (`monomorphize.rs` specializes it from the
+    // instance's inference), never shared with another instance's copy.
+    let mut lambda = lambda.clone();
+    renumber_expr(&mut lambda, ids);
+    let binding = Node {
+        id: ids.next(),
+        span: e.span,
+        kind: StmtKind::Let {
+            name,
+            mutable: false,
+            ty: None,
+            value: lambda,
+        },
+    };
+    ExprKind::Block(Block {
+        stmts: vec![binding],
+        tail: Some(Box::new(call)),
+    })
 }
 
 /// The replacement of `[for var in start..end: body]`: the tuple of the body's

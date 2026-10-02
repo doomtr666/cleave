@@ -303,8 +303,20 @@ redefine positional access for a struct.
    - `stdlib/core`: `algebra Collect<Target, Source>` and the identity impl. Synthesized
      (`driver.rs::synthesize_collect_impls`): one per plain struct, from the tuple of its field types
      (the field type itself for a one-field struct), and one per array length 2..16.
-   - Not yet: `Collect` for tensors (initialization by formula), runtime-length comprehensions
-     (`DynArray`).
+   - Then (2026-10-02) comprehensions over a homogeneous body: not unrolled, but a call
+     `Generate::generate(start, end, f)` filling the collection at run time (`stdlib/core`, impls for
+     `[T; N]`, `Tensor` in one and two dimensions in `linalg`, `DynArray` in `dynarray`). The body is
+     inferred once to tell the two kinds apart (`Infer::decide_comprehensions`): indexing a struct or
+     tuple by the variable unrolls; indexing a still-open type waits for the instance; anything else
+     generates, any bounds. Default target: an array when the bounds fold, a `DynArray` otherwise. The
+     `Generate` call is a deferred constraint, so an open target is never dispatched early, and the
+     context refines its element (`i.to()` into a `[f32; 3]`), nested comprehensions included
+     (`refine_collect_sources` runs to a fixpoint). The function is bound by name
+     (`<gen#id>`, never generalized) since higher-order calls take a named callable
+     (`cps.rs::build_higher_order_specializations`). Storing a whole row into an array of arrays
+     (`a[k] = row`) is a dynamic-offset copy (`mlir_lower.rs::copy_array_row`).
+   - Not yet: `Generate` for tensors of more than two dimensions, an array of structs or tensors as
+     a default target (`doc/backlog.md`).
    - Found on the way: an array literal whose rows are arrays read out of a struct (`[t[0], t[1]]`)
      reached the memref copy with an inline-array pointer (fixed, `mlir_lower.rs::
      copy_inline_array_row`); a generic impl's bound was checked against a stale type variable in

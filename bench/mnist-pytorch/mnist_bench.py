@@ -8,8 +8,9 @@ each such point below) -- the point of this script is a fair comparison,
 not "idiomatic PyTorch".
 
 Architecture (`kernel.cleave`): 784 -> 512 -> 256 -> 128 -> 10, ReLU between
-every hidden layer, no final activation (raw logits) -- plain sum-of-squares
-regression against a one-hot target, not softmax+cross-entropy.
+every hidden layer, no final activation (raw logits) -- softmax cross-entropy
+against a one-hot target, summed over the batch (`nn.cleave`'s `cross_entropy`,
+`F.cross_entropy(..., reduction="sum")` with probability targets).
 
 Run via poetry (keeps this fully out of your global Python install):
     cd bench/mnist-pytorch
@@ -202,7 +203,7 @@ def main():
 
     n = x_train.shape[0]
     num_batches = n // args.batch_size  # no partial-batch remainder, matching kernel.cleave
-    # `loss = sum(err*err)` over the whole batch (not mean) means the
+    # The loss summed over the whole batch (not a mean) means the
     # gradient magnitude scales with batch size -- `train_and_evaluate`
     # compensates by dividing `lr` by the batch size once, at the call
     # site, not by changing `sum` itself. Mirrored here identically.
@@ -215,8 +216,7 @@ def main():
             lo, hi = s * args.batch_size, (s + 1) * args.batch_size
             x, y = x_train[lo:hi], y_train[lo:hi]
             pred = net.forward(x)
-            err = pred - y
-            loss = (err * err).sum()
+            loss = torch.nn.functional.cross_entropy(pred, y, reduction="sum")
             loss.backward()
             sgd_step(net.params(), lr)
         epoch_elapsed = time.perf_counter() - epoch_start

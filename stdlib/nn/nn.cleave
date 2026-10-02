@@ -402,6 +402,71 @@ impl<T: Float + Rand + Ring, const In: i32, const Out: i32> Init<Dense<T, In, Ou
 // every `Trainable` model.
 impl<T: Float, const In: i32, const Out: i32> Trainable<Dense<T, In, Out>> {}
 
+// Softmax cross-entropy: a batch of logits (one row per sample) against
+// target distributions of the same shape (one-hot rows for classification),
+// `-sum_c y[b, c] * log(softmax(z)[b, c])` summed over the batch, as
+// PyTorch's `cross_entropy(..., reduction='sum')`. Computed through a
+// max-shifted log-sum-exp per row, so `exp` never overflows.
+//
+// Its gradient is declared rather than derived through `log`/`exp`: the
+// classic `softmax(z) - y` per row (times the upstream `u`; with targets
+// that don't sum to one, `softmax(z) * sum(y_row) - y`), the numerically
+// sound form every framework uses. The targets' own gradient, `-log_
+// softmax(z) * u`, is there because a rule gives one per parameter.
+algebra CrossEntropy<Logits, T> {
+    fn cross_entropy(z: Logits, y: Logits) -> T;
+    fn softmax(z: Logits) -> Logits;
+    fn cross_entropy_grad_logits(z: Logits, y: Logits, u: T) -> Logits;
+    fn cross_entropy_grad_targets(z: Logits, y: Logits, u: T) -> Logits;
+
+    adjoint cross_entropy(z, y), u: (cross_entropy_grad_logits(z, y, u), cross_entropy_grad_targets(z, y, u));
+}
+
+impl<T: Float, const B: i32, const C: i32> CrossEntropy<Tensor<T, B, C>, T> {
+    fn cross_entropy(z, y) {
+        let mut total: T = zero();
+        for b in 0..B {
+            let lse = log_sum_exp_row(z, b);
+            for c in 0..C { total = total + y[b, c] * (lse - z[b, c]); };
+        };
+        total
+    }
+    // Filled in place rather than by nested comprehensions: those build one
+    // array per row and copy it in (`doc/backlog.md`, "A nested
+    // comprehension allocates and copies each row"), which on a hot path
+    // (every training step) costs far more than the arithmetic.
+    fn softmax(z) {
+        let mut p: [[T; C]; B] = mlir::memref::alloc();
+        for b in 0..B {
+            let lse = log_sum_exp_row(z, b);
+            for c in 0..C { p[b, c] = exp(z[b, c] - lse); };
+        };
+        Tensor(data: p)
+    }
+    fn cross_entropy_grad_logits(z, y, u) {
+        let mut g: [[T; C]; B] = mlir::memref::alloc();
+        for b in 0..B {
+            let lse = log_sum_exp_row(z, b);
+            let mut mass: T = zero();
+            for c in 0..C { mass = mass + y[b, c]; };
+            for c in 0..C { g[b, c] = (exp(z[b, c] - lse) * mass - y[b, c]) * u; };
+        };
+        Tensor(data: g)
+    }
+    fn cross_entropy_grad_targets(z, y, u) {
+        [for b in 0..B: { let lse = log_sum_exp_row(z, b); [for c in 0..C: (lse - z[b, c]) * u] }]
+    }
+}
+
+// `log(sum_c exp(z[b, c]))` for row `b`, shifted by the row's maximum.
+fn log_sum_exp_row<T: Float, const B: i32, const C: i32>(z: Tensor<T, B, C>, b: i32) -> T {
+    let mut m: T = z[b, 0];
+    for c in 1..C { if z[b, c] > m { m = z[b, c]; }; };
+    let mut s: T = zero();
+    for c in 0..C { s = s + exp(z[b, c] - m); };
+    m + log(s)
+}
+
 algebra Sum<Container, T> {
     fn sum(c: Container) -> T;
     // `d(sum(c))/du = broadcast(u)` — the adjoint of "add every element

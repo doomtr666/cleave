@@ -5770,7 +5770,7 @@ fn a_comprehension_is_the_tuple_of_its_copies() {
             let doubled = [for i in 0..t.len(): twice(t[i])];
             let one = [for i in 2..3: i + 10];
             let grid = [for i in 0..2: [for j in 0..3: i * 10 + j]];
-            if squares[3] == 9 and doubled[0] == 6 and doubled[1] == 3.0 and one == 12
+            if squares[3] == 9 and doubled[0] == 6 and doubled[1] == 3.0 and one[0] == 12
                 and grid[1][2] == 12 and squares.len() == 4 { 1 } else { 0 }
         }
     ";
@@ -5837,6 +5837,33 @@ fn a_comprehension_in_a_generic_impl_unrolls_per_instance() {
     assert_eq!(run_i32(&context, src), 1);
 }
 
+/// An algebra method taking a function, called with a capturing lambda and
+/// applied in a loop: what a comprehension over a homogeneous body becomes
+/// (`Generate`).
+#[test]
+fn an_algebra_method_takes_a_capturing_lambda() {
+    let context = context();
+    let src = "
+        algebra Fill<C, T> { fn fill(n: i32, f: (i32) -> T) -> C; }
+        impl<T, const N: i32> Fill<[T; N], T> {
+            fn fill(n, f) {
+                let mut a: [T; N] = mlir::memref::alloc();
+                for k in 0..N { a[k] = f(k); };
+                a
+            }
+        }
+        fn main() -> i32 {
+            let base = 10;
+            let sq = fn(i) { base + i * i };
+            let a: [i32; 4] = fill(4, sq);
+            let half = fn(i) { 0.5:f64 };
+            let b: [f64; 2] = fill(2, half);
+            if a[3] == 19 and a[0] == 10 and b[1] == 0.5 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
 /// An array literal whose elements are arrays read out of a tuple.
 #[test]
 fn an_array_of_arrays_read_out_of_a_tuple() {
@@ -5851,16 +5878,47 @@ fn an_array_of_arrays_read_out_of_a_tuple() {
     assert_eq!(run_i32(&context, src), 6);
 }
 
-/// A comprehension whose bounds never fold is an error, not a guess.
+/// A comprehension over a struct or tuple whose bounds never fold is an
+/// error, not a guess: each element has its own type, so its copies must be
+/// counted at compile time.
 #[test]
-fn a_comprehension_over_runtime_bounds_is_rejected() {
+fn a_comprehension_over_a_tuple_with_runtime_bounds_is_rejected() {
     let errors = type_errors(
         "
-        fn f(n: i32) -> i32 { let t = [for i in 0..n: i]; 0 }
-        fn main() -> i32 { f(3) }
+        fn f(n: i32) -> i32 { let t = (1, 2.5); let u = [for i in 0..n: t[i]]; 0 }
+        fn main() -> i32 { f(2) }
     ",
     );
     assert!(errors.iter().any(|e| e.contains("compile time")), "got: {errors:?}");
+}
+
+/// A comprehension whose elements all have one type is not unrolled: its
+/// collection is filled at run time (`Generate`), so its length can be large
+/// or only known at run time. With no context, known bounds make an array,
+/// run-time ones a `DynArray`; a context can ask for any collection that
+/// implements `Generate`, a tensor included (one dimension per nested
+/// comprehension).
+#[test]
+fn a_homogeneous_comprehension_fills_any_collection_at_run_time() {
+    let context = context();
+    let src = "
+        use linalg;
+        use dynarray;
+        use convert;
+        fn squares_up_to(n: i32) { [for i in 0..n: i * i] }
+        fn main() -> i32 {
+            let big = [for i in 0..10000: i - (i / 7) * 7];
+            let mut s = 0;
+            for k in 0..10000 { s = s + big[k]; };
+            let v = squares_up_to(5);
+            let t: Tensor<f32, 4> = [for i in 0..4: 0.5 * i.to()];
+            let m: Tensor<f32, 2, 3> = [for i in 0..2: [for j in 0..3: (i * 10 + j).to()]];
+            let scale = 3.0;
+            let w: [f64; 3] = [for i in 0..3: 0.5 * scale];
+            if s == 29994 and v[4] == 16 and v.len() == 5 and t[3] == 1.5 and m[1, 2] == 12.0 and w[2] == 1.5 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
 }
 
 fn type_errors(src: &str) -> Vec<String> {
@@ -6923,6 +6981,31 @@ fn optimizer_composes_correctly_one_level_up_through_dense() {
                 and m.b[0, 1] > 5.899 and m.b[0, 1] < 5.901
             { 1 } else { 0 }
         }";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// Softmax cross-entropy: the value through a max-shifted log-sum-exp, the
+/// gradient through its declared rule (`softmax(z) - y`), and `softmax`
+/// itself. `z = [1, 2, 3]`, `y = [0, 0, 1]`: loss `log(e + e^2 + e^3) - 3`,
+/// gradient `softmax(z) - y`.
+#[test]
+fn softmax_cross_entropy_and_its_gradient() {
+    let context = context();
+    let src = "
+        use nn;
+        fn loss(z: Tensor<f32, 2, 3>, y: Tensor<f32, 2, 3>) -> f32 { cross_entropy(z, y) }
+        dz = grad(loss, z);
+        fn close(a: f32, b: f32) -> bool { a - b < 0.0001 and b - a < 0.0001 }
+        fn main() -> i32 {
+            let z = Tensor::<f32, 2, 3>(data: [[1.0, 2.0, 3.0], [1001.0, 1002.0, 1003.0]]);
+            let y = Tensor::<f32, 2, 3>(data: [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0]]);
+            let l = loss(z, y);
+            let g = dz(z, y);
+            let p = softmax(z);
+            if close(l, 0.40761 + 2.40761) and close(g[0, 0], 0.09003) and close(g[0, 2], 0.0 - 0.33476)
+                and close(g[1, 0], 0.09003 - 1.0) and close(p[1, 2], 0.66524) { 1 } else { 0 }
+        }
+    ";
     assert_eq!(run_i32(&context, src), 1);
 }
 

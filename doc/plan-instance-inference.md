@@ -83,6 +83,13 @@ state structs in user code.
 - Roots (non-generic fns) are inferred again through the engine. A root whose scheme-level inference
   failed only because a callee's result is unknown from its scheme alone (`let a = f(t); a[1]`) is
   repaired by that inference when it comes out concrete.
+- A const generic read as a value (`for b in 0..B`) is typed by its value's type (`i32`), not by the
+  value itself, which an instance binds it to (`Ty::Const(2)`): otherwise two loop variables over
+  different bounds had different types. The value travels separately (`Infer::const_refs`) and is put
+  back for `cps.rs`, which converts it as a literal; `[v; N]` takes its length from the generic itself.
+- Lambdas in an instance's body are specialized from the instance's own inference
+  (`InstanceEngine::instance_lambdas`): a comprehension's function only exists in that instance's
+  copy of the body, so the program-wide inference never saw it.
 - The user-facing payoff: `optim.cleave`'s `impl<Opt, M: Trainable, S> Optimizer<Opt, M, S>`, written
   once with comprehensions (`doc/plan-compile-time-sequences.md`, step 3); `nn` marks `Dense`, the
   MNIST kernel marks its `Network` and writes no optimizer code.

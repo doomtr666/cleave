@@ -165,6 +165,14 @@ struct LowerCtx<'c, 'm> {
     /// direct `HashSet::contains` is enough. Empty unless
     /// `CLEAVE_AFFINE_STRUCTS=1` (`lower_program`'s own doc comment).
     affine_structs: HashSet<CVar>,
+    /// Array values allocated on the stack rather than the heap
+    /// (`stack_index_arrays`): the index arrays `x[i, j]` builds for `Index::
+    /// index`, which only ever reads them.
+    stack_arrays: HashSet<CVar>,
+    /// The region-local functions that may allocate in the region's arena,
+    /// themselves or through a region-local callee (`region_allocating_fns`):
+    /// only a loop calling one of these needs to open a region.
+    region_allocating_fns: HashSet<String>,
     /// `doc/plan-affine-ownership.md` §13/§14 — `alias_analysis::field_
     /// affine_positions`'s own result: for every `(struct type name, field
     /// position)` whose own type is cascade-worthy, whether *every*
@@ -484,6 +492,8 @@ pub fn lower_program<'c>(
         fields.sort();
         eprintln!("CLEAVE_TRACE_AFFINE_STRUCTS: {} fields: {fields:?}", fields.len());
     }
+    let stack_arrays = stack_index_arrays(program);
+    let region_allocating_fns = region_allocating_fns(program, &region_local_fns, &stack_arrays);
     {
         // Scoped so `ctx`'s own borrow of `module` ends before `module` is
         // moved out below.
@@ -503,6 +513,8 @@ pub fn lower_program<'c>(
             extern_boundary_structs,
             field_affine,
             affine_structs,
+            stack_arrays,
+            region_allocating_fns,
             op_lines: &program.op_lines,
         };
         // One `DISubprogram` per function, *all* of them (not just whoever
@@ -2142,7 +2154,10 @@ fn lower_loop<'c>(
     let top_level_names: HashSet<String> = ctx.signatures.keys().cloned().collect();
     let mut loop_callees: HashSet<String> = HashSet::new();
     crate::region_analysis::collect_direct_callees(then_branch, &top_level_names, &mut loop_callees);
-    let needs_region = loop_callees.iter().any(|c| ctx.region_local_fns.contains(c));
+    // Only a callee that may actually allocate in the arena needs one: a
+    // region-local function computing scalars (`log_sum_exp_row`, one call
+    // per row of a cross-entropy) would otherwise pay a region per call.
+    let needs_region = loop_callees.iter().any(|c| ctx.region_allocating_fns.contains(c));
 
     // Carried-state types, from `loop_def.carried_types` (`cps.rs`'s own
     // `ExprKind::While`/`For` conversion, one `Ty` per `loop_def.params`
@@ -2558,7 +2573,7 @@ fn lower_prim_op<'c>(
             args,
             ty_to_mlir(ctx, ty),
         )),
-        PrimOp::Array => Some(lower_array_construct(ctx, block, env, ty, args)),
+        PrimOp::Array => Some(lower_array_construct(ctx, block, env, ty, args, ctx.stack_arrays.contains(&var))),
         PrimOp::ArrayRepeat => Some(lower_array_repeat(ctx, block, env, ty, args)),
         PrimOp::Load { array_ty } => Some(lower_array_load(ctx, block, env, array_ty, args)),
         PrimOp::Store { array_ty } => {
@@ -2682,6 +2697,7 @@ fn lower_array_construct<'c>(
     env: &HashMap<CVar, Value<'c, 'c>>,
     ty: &Ty,
     args: &[CVal],
+    on_stack: bool,
 ) -> Value<'c, 'c> {
     let (dims, leaf_ty) = flatten_array_dims(ty);
     let Some((_, inner_dims)) = dims.split_first() else {
@@ -2709,11 +2725,17 @@ fn lower_array_construct<'c>(
         }
         return ptr;
     }
-    let array_val = alloc_array(
-        ctx,
-        block,
-        MemRefType::new(ty_to_mlir(ctx, leaf_ty), &dims, None, None),
-    );
+    let memref_ty = MemRefType::new(ty_to_mlir(ctx, leaf_ty), &dims, None, None);
+    let array_val = if on_stack {
+        let location = gen_loc(ctx.context);
+        block
+            .append_operation(memref::alloca(ctx.context, memref_ty, &[], &[], None, location))
+            .result(0)
+            .unwrap()
+            .into()
+    } else {
+        alloc_array(ctx, block, memref_ty)
+    };
     if inner_dims.is_empty() {
         let elem_ty = ty_to_mlir(ctx, leaf_ty);
         let location = gen_loc(ctx.context);
@@ -2985,6 +3007,20 @@ fn lower_array_store<'c>(
             .iter()
             .map(|a| to_index(ctx, block, lower_cval(ctx.context, block, env, a, i32_ty)))
             .collect();
+        let rank = MemRefType::try_from(array_val.r#type()).map(|m| m.rank()).unwrap_or(0);
+        if index_vals.len() == 1 && rank > 1 {
+            // A whole row (`a[k] = row`, `a` an array of arrays): copied
+            // into its slice of the flattened memref.
+            let CVal::Var(row_var) = value_arg else {
+                panic!("MLIR lowering: a row stored into an array must be a variable");
+            };
+            let row_val = *env
+                .get(row_var)
+                .unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{row_var}"));
+            let (dims, _) = flatten_array_dims(array_ty);
+            copy_array_row(ctx, block, row_val, &dims[1..], array_val, index_vals[0]);
+            return;
+        }
         let value_val = lower_cval(ctx.context, block, env, value_arg, elem_ty);
         block.append_operation(memref::store(value_val, array_val, &index_vals, location));
     } else {
@@ -5224,6 +5260,123 @@ fn copy_array_into_llvm_field<'c>(
     );
 }
 
+/// The arrays safe on the stack: built by `PrimOp::Array` from a handful of
+/// scalars, and only ever passed to an `Index::index` instance, which reads
+/// its indices and keeps nothing (`stdlib/core`'s `Index` algebra: the
+/// index array is a temporary of `x[i, j]`, `cps.rs`'s `ExprKind::Index`).
+/// On the heap, each one was a counted allocation and release per element
+/// access, the bulk of a cross-entropy step's cost (profiled: ~60% in
+/// `cleave_alloc_rc`/`cleave_release`); on the stack, once `index` is
+/// inlined, it disappears. Every loop body already restores the stack each
+/// iteration (`pipeline.rs::insert_stack_scopes_in_loops`).
+fn stack_index_arrays(program: &CpsProgram) -> HashSet<CVar> {
+    fn small_scalar_array(ty: &Ty) -> bool {
+        matches!(ty, Ty::Array(elem, size)
+            if matches!(elem.as_ref(), Ty::Con(_))
+                && matches!(size.as_ref(), Ty::Const(crate::infer::ConstValue::Int(n)) if *n <= 16))
+    }
+    fn walk(e: &CExpr, candidates: &mut HashSet<CVar>, other_uses: &mut HashSet<CVar>) {
+        let note = |v: &CVal, ok: bool, other_uses: &mut HashSet<CVar>| {
+            if let CVal::Var(x) = v {
+                if !ok {
+                    other_uses.insert(*x);
+                }
+            }
+        };
+        match e {
+            CExpr::LetPrim { var, ty, op, args, cont } => {
+                if matches!(op, PrimOp::Array) && small_scalar_array(ty) {
+                    candidates.insert(*var);
+                }
+                for a in args {
+                    note(a, false, other_uses);
+                }
+                walk(cont, candidates, other_uses);
+            }
+            CExpr::App { func, args } => {
+                let to_index = matches!(func, CVal::Label(name) if name.starts_with("Index::index<"));
+                note(func, false, other_uses);
+                for a in args {
+                    note(a, to_index, other_uses);
+                }
+            }
+            CExpr::If { cond, then_branch, else_branch } => {
+                note(cond, false, other_uses);
+                walk(then_branch, candidates, other_uses);
+                walk(else_branch, candidates, other_uses);
+            }
+            CExpr::Fix { defs, body } => {
+                for d in defs {
+                    walk(&d.body, candidates, other_uses);
+                }
+                walk(body, candidates, other_uses);
+            }
+        }
+    }
+    let mut candidates = HashSet::new();
+    let mut other_uses = HashSet::new();
+    for f in &program.funcs {
+        walk(&f.def.body, &mut candidates, &mut other_uses);
+    }
+    candidates.difference(&other_uses).copied().collect()
+}
+
+/// The region-local functions (`region_analysis`) that may allocate through
+/// the arena: those whose body builds a struct, stores a tensor into a field,
+/// or builds an array kept off the stack (`alloc_llvm_value`'s callers: a
+/// struct's storage, a tensor field's descriptor, a struct-leaf array), or
+/// that call a region-local function which does. Deliberately coarse (any
+/// struct, light or not): a function left out here must never allocate.
+fn region_allocating_fns(
+    program: &CpsProgram,
+    region_local_fns: &HashSet<String>,
+    stack_arrays: &HashSet<CVar>,
+) -> HashSet<String> {
+    fn allocates(e: &CExpr, stack_arrays: &HashSet<CVar>) -> bool {
+        match e {
+            CExpr::LetPrim { var, op, cont, .. } => {
+                let here = match op {
+                    PrimOp::Struct(..) | PrimOp::FieldStore { .. } | PrimOp::ArrayRepeat => true,
+                    PrimOp::Array => !stack_arrays.contains(var),
+                    _ => false,
+                };
+                here || allocates(cont, stack_arrays)
+            }
+            CExpr::App { .. } => false,
+            CExpr::If { then_branch, else_branch, .. } => {
+                allocates(then_branch, stack_arrays) || allocates(else_branch, stack_arrays)
+            }
+            CExpr::Fix { defs, body } => {
+                defs.iter().any(|d| allocates(&d.body, stack_arrays)) || allocates(body, stack_arrays)
+            }
+        }
+    }
+    let top_level_names: HashSet<String> = program.funcs.iter().map(|f| f.def.name.clone()).collect();
+    let mut out: HashSet<String> = program
+        .funcs
+        .iter()
+        .filter(|f| region_local_fns.contains(&f.def.name) && allocates(&f.def.body, stack_arrays))
+        .map(|f| f.def.name.clone())
+        .collect();
+    loop {
+        let mut changed = false;
+        for f in &program.funcs {
+            if !region_local_fns.contains(&f.def.name) || out.contains(&f.def.name) {
+                continue;
+            }
+            let mut callees = HashSet::new();
+            crate::region_analysis::collect_direct_callees(&f.def.body, &top_level_names, &mut callees);
+            if callees.iter().any(|c| out.contains(c)) {
+                out.insert(f.def.name.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            return out;
+        }
+    }
+}
+
 fn alloc_array<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
@@ -5345,6 +5498,66 @@ fn copy_nested_array<'c>(
             ctx.context,
             dst,
             &[],
+            &[],
+            &[],
+            &static_offsets,
+            &static_sizes,
+            &static_strides,
+            sub_ty,
+            location,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    block.append_operation(
+        OperationBuilder::new("memref.copy", location)
+            .add_operands(&[src, subview])
+            .build()
+            .unwrap_or_else(|e| panic!("MLIR lowering: failed to build memref.copy: {e}")),
+    );
+}
+
+/// Copies the array `src` (dimensions `dims`) into row `row` of `dst`, an
+/// array with one more, outer dimension: `copy_nested_array` with the row
+/// known only at run time (`a[k] = row`), so the subview's offset is
+/// dynamic.
+fn copy_array_row<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    src: Value<'c, 'c>,
+    dims: &[i64],
+    dst: Value<'c, 'c>,
+    row: Value<'c, 'c>,
+) {
+    let location = gen_loc(ctx.context);
+    let elem_ty = MemRefType::try_from(dst.r#type())
+        .unwrap_or_else(|e| panic!("MLIR lowering: `copy_array_row`'s own `dst` must be a memref: {e}"))
+        .element();
+    let mut strides: Vec<i64> = vec![1; dims.len()];
+    for i in (0..dims.len().saturating_sub(1)).rev() {
+        strides[i] = strides[i + 1] * dims[i + 1];
+    }
+    let dims_text = dims.iter().map(|d| format!("{d}x")).collect::<String>();
+    let strides_text = strides.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",");
+    let sub_ty = Type::parse(
+        ctx.context,
+        &format!("memref<{dims_text}{elem_ty}, strided<[{strides_text}], offset: ?>>"),
+    )
+    .unwrap_or_else(|| panic!("MLIR lowering: failed to parse `copy_array_row`'s own subview result type"));
+    let sub_ty = MemRefType::try_from(sub_ty)
+        .unwrap_or_else(|e| panic!("MLIR lowering: subview result type must be a memref: {e}"));
+    let rank = 1 + dims.len();
+    // `ShapedType::kDynamic`: this offset is the `row` operand.
+    let mut static_offsets: Vec<i64> = vec![i64::MIN];
+    static_offsets.extend(vec![0; dims.len()]);
+    let mut static_sizes: Vec<i64> = vec![1];
+    static_sizes.extend_from_slice(dims);
+    let static_strides: Vec<i64> = vec![1; rank];
+    let subview = block
+        .append_operation(memref::subview(
+            ctx.context,
+            dst,
+            &[row],
             &[],
             &[],
             &static_offsets,

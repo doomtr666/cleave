@@ -1,5 +1,5 @@
 // MNIST handwritten digits (28x28 grayscale, 10 classes): a 784 -> 512 -> 256 -> 128 -> 10 ReLU MLP,
-// trained with plain SGD on a sum-of-squares loss against one-hot targets. The data is loaded by the
+// trained with plain SGD on softmax cross-entropy against one-hot targets. The data is loaded by the
 // Rust host (`data.rs`) and handed over one batch per `extern` call. Line-for-line twin of
 // `bench/mnist-pytorch/mnist_bench.py`.
 use nn;
@@ -52,8 +52,7 @@ fn forward(x, net) {
 
 // A sum over the batch, not a mean: `lr` is divided by the batch size instead.
 fn loss(x: Tensor<f32, 32, 784>, y: Tensor<f32, 32, 10>, net: Network) -> f32 {
-    let err = forward(x, net) - y;
-    sum(err * err)
+    cross_entropy(forward(x, net), y)
 }
 
 net_grad = grad(loss, net);

@@ -459,6 +459,22 @@ fn an_impl_over_a_pack_of_types() {
 }
 
 #[test]
+fn a_comprehension_seeds_any_collection() {
+    let context = context();
+    let src = "
+        use dynarray;
+        fn main() -> i32 {
+            let big = [for i in 0..10000: i * 2];
+            let n = 5;
+            let v = [for i in 0..n: i * i];
+            let grid = [for i in 0..2: [for j in 0..3: i * 10 + j]];
+            if big[9999] == 19998 and v[4] == 16 and grid[1][2] == 12 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+#[test]
 fn a_comprehension_takes_its_type_from_context() {
     let context = context();
     let src = "

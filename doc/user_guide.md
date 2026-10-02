@@ -154,13 +154,31 @@ fn main() -> i32 { show((1, 2.5:f64, 3)) }      // 12
 
 The compiler makes one concrete impl per tuple type the program actually uses, with the loop unrolled for it. Like any generic impl, its body is checked for each of those uses, and an error points at the line in the generic impl.
 
-A comprehension, `[for i in a..b: e]`, builds one `e` per index, each typed on its own like an unrolled loop's copies. Its type comes from the context, the way a number literal's does: an annotation or a parameter type can ask for an array, a tuple, or any struct, which is rebuilt from its fields' values in declaration order. With no context, elements that are all numbers of one type (or arrays of them) make an array, anything else a tuple. The bounds must be known at compile time.
+A comprehension, `[for i in a..b: e]`, builds one `e` per index and seeds whatever collection its context asks for, the way a number literal's type comes from its context: an array, a tensor, a `DynArray`, a tuple, any struct. There are two kinds, told apart by the body.
+
+- When the body indexes a struct or tuple by `i` (`f(t[i])`), each element can have its own type: the comprehension is unrolled, one copy of `e` per index, so its bounds must be known at compile time. It makes a tuple, or rebuilds a struct from its fields' values in declaration order (`let q: Pair = [...]`).
+- Otherwise every element has the same type, and nothing is unrolled: the collection is filled by a loop at run time, so it can be large, and its bounds can be run-time values. With no context, it makes an array when the bounds are known at compile time and a `DynArray` otherwise (`use dynarray;`). A matrix is one nested comprehension per dimension.
+
+```
+use dynarray;
+fn main() -> i32 {
+    let big = [for i in 0..10000: i * 2];                    // [i32; 10000], a loop
+    let n = 5;
+    let v = [for i in 0..n: i * i];                          // DynArray<i32>
+    let grid = [for i in 0..2: [for j in 0..3: i * 10 + j]]; // [[i32; 3]; 2]
+    if big[9999] == 19998 and v[4] == 16 and grid[1][2] == 12 { 1 } else { 0 }
+}
+```
+
+A tensor is seeded the same way, from its type: `let m: Tensor<f32, 2, 3> = [for i in 0..2: [for j in 0..3: 1.5]];`.
+
+Any collection can be seeded this way by implementing `Generate<C, T>` (`stdlib/core`): one function filling a `C` from `start`, `end` and `f`, called with the comprehension's body as `f`. The unrolled kind goes through `Collect<Target, Source>` instead, synthesized for every struct.
 
 ```
 struct Pair { a: i32, b: f64 }
 fn twice(x) { x + x }
 fn main() -> i32 {
-    let squares = [for i in 0..4: i * i];                 // [i32; 4]
+    let squares = [for i in 0..4: i * i];                 // [i32; 4], filled by a loop
     let p = Pair(a: 1, b: 2.5);
     let t = [for i in 0..p.len(): twice(p[i])];           // (i32, f64): (2, 5.0)
     let q: Pair = [for i in 0..p.len(): twice(p[i])];     // the same values, as a Pair
