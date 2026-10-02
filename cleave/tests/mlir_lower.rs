@@ -2924,6 +2924,22 @@ fn to_sugar_converts_an_int_to_a_float_end_to_end() {
     assert_eq!(run_i32(&context, src), 1);
 }
 
+/// Narrowing `f64 -> f32`, rounded to nearest, including from a function's
+/// tail where only the declared return type says the target is `f32`.
+#[test]
+fn to_sugar_narrows_an_f64_to_an_f32() {
+    let context = context();
+    let src = "
+        use convert;
+        fn third(x: f64) -> f32 { (x / 3.0).to() }
+        fn main() -> i32 {
+            let f = third(1.0);
+            if f == 0.33333334 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
 /// The same sugar on a bare literal, not an already-annotated value —
 /// `4.to()` is the far more natural spelling in practice, and exercises
 /// `infer_algebra_call`'s *deferred* path (the literal's own shape var

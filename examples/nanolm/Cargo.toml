@@ -1,0 +1,12 @@
+[package]
+name = "nanolm"
+version = "0.1.0"
+edition = "2024"
+
+# See `examples/rust-interop-demo/Cargo.toml` for why this lives inside the root workspace.
+[build-dependencies]
+cleave-build = { path = "../../cleave-build" }
+
+# `corpus.rs`: the books are downloaded once from Project Gutenberg (plain UTF-8 text) and cached.
+[dependencies]
+ureq = "3"

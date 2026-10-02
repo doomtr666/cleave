@@ -45,3 +45,9 @@ impl Convert<i32, f32> {
 impl Convert<f32, f64> {
     fn convert(x) { mlir::arith::extf(x) }
 }
+
+// Narrowing, rounded to nearest: explicit like every conversion here, so the precision lost is
+// never lost silently.
+impl Convert<f64, f32> {
+    fn convert(x) { mlir::arith::truncf(x) }
+}

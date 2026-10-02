@@ -1,6 +1,6 @@
 # nanoLM: what a small transformer needs, and what cleave has
 
-Status: inventory (2026-10-02), nothing built yet. Target of `doc/toward_first_release.md`'s nanoLM
+Status (2026-10-02): steps 0 (checkpoints) and 1 (corpus) done. Target of `doc/toward_first_release.md`'s nanoLM
 showcase; the ML roadmap entry in `doc/backlog.md` asked for this inventory before writing the model.
 
 ## The model
@@ -10,8 +10,8 @@ A nanoGPT-style character model, trained from scratch on CPU, with a line-for-li
 
 | | value | why |
 |---|---|---|
-| corpus | French public-domain literature, auto-downloaded and cached like MNIST | publishable; `memory`: French on purpose |
-| vocabulary | characters, ~100 (accents, « », dialogue dashes) | no tokenizer to build for v0.1 |
+| corpus | Zola: 18 *Rougon-Macquart* novels and *Thérèse Raquin*, 14.0 M training characters, *Une page d'amour* held out (0.63 M) | French, public domain, one style and one world (a mix of styles makes a small model average them) |
+| vocabulary | a fixed alphabet of 104 characters (`examples/nanolm/src/corpus.rs`) | no tokenizer to build for v0.1; independent of the corpus, so a checkpoint can be fine-tuned on another French text |
 | context `T` | 128 | |
 | width `d` | 128, `h` = 4 heads of `dh` = 32 | |
 | layers `L` | 4, pre-LayerNorm, MLP width 4`d` | |
@@ -48,7 +48,7 @@ softmax.
 | row softmax | 🔶 | exists inside `CrossEntropy` only; a standalone `Softmax` with adjoint `y ⊙ (u − rowsum(u ⊙ y))` |
 | sampling | ❌ (small) | softmax with temperature on one row, then a categorical draw (`rand`) |
 | batch loading | ✅ | `extern fn batch(i: i32) -> [i32; N]` (2026-10-02) |
-| checkpoints (save/restore) | ❌, first | resumable runs; fine-tuning later (phase 2). Step 0 below |
+| checkpoints (save/restore) | ✅ | `stdlib/checkpoint` (2026-10-02) |
 
 ## Attention
 
@@ -95,10 +95,13 @@ Each step ends with something that runs and is checked, against the PyTorch twin
    a temporary file then renamed (a run killed mid-save keeps its last good checkpoint). The random
    generator's state is saved too. Check: 10 steps straight and 5 steps, save, restore, 5 steps give
    bit-identical weights (MNIST-sized model); a shape mismatch is reported.
-1. **Corpus**: French public-domain literature (a Pleias French-PD-Books shard or a Project Gutenberg
-   selection, chosen on samples), downloaded and cached by the host like MNIST; normalization to a
-   ~100-character vocabulary; train/validation split by books; `extern fn batch(i) -> [i32; N]`; the
-   twin reads the same files.
+1. **Corpus** ✅: `examples/nanolm` (host: `corpus.rs` downloads from Project Gutenberg and cleans,
+   `data.rs` batches) and `bench/nanolm-pytorch` (`data.py`, the same batches). Pleias French-PD-Books
+   was set aside on samples: OCR noise on every page and every genre mixed in. Batch `i` is a pure
+   function of `i` (`splitmix64`), so a resumed run and the twin draw the same windows. Check: a
+   bigram baseline written in cleave (`kernel.cleave`) and in numpy (`bigram.py`) gives the same
+   2.3520 nats/char (3.39 bits/char) on validation: the floor the models below must beat. (On the
+   way: `Convert<f64, f32>`; one f32 accumulator over 200 k terms had cost the third decimal.)
 2. **Embeddings and a first model**: token/position gather with scatter-add adjoint, cross-entropy
    on integer targets, tensor `tanh` and GELU. A bigram-and-MLP model trains end to end, its loss
    matching the twin's.

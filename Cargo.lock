@@ -518,6 +518,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nanolm"
+version = "0.1.0"
+dependencies = [
+ "cleave-build",
+ "ureq",
+]
+
+[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
