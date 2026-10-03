@@ -16,7 +16,7 @@
 //! before deciding whether to extend it.
 
 use mlir_sys::{
-    MlirExecutionEngine, MlirModule, MlirStringRef, mlirExecutionEngineDestroy,
+    MlirExecutionEngine, MlirModule, MlirOperation, MlirStringRef, mlirExecutionEngineDestroy,
     mlirExecutionEngineDumpToObjectFile, mlirExecutionEngineInvokePacked,
     mlirExecutionEngineLookup, mlirExecutionEngineRegisterSymbol,
 };
@@ -33,6 +33,19 @@ unsafe extern "C" {
         target_features: MlirStringRef,
         loop_unroll: bool,
     ) -> MlirExecutionEngine;
+    fn cleaveApproximateMath(op: MlirOperation) -> bool;
+}
+
+/// Rewrites `tanh`/`exp`/`log` and their relatives under `op` into
+/// polynomial approximations (`cpp/shim.cpp`'s `cleaveApproximateMath`), so
+/// they vectorize instead of becoming one libm call per vector element.
+/// `false` if the rewrite didn't converge.
+///
+/// # Safety
+///
+/// `op` must be a valid operation, not used concurrently.
+pub unsafe fn approximate_math(op: MlirOperation) -> bool {
+    unsafe { cleaveApproximateMath(op) }
 }
 
 /// Borrows `s`'s own bytes -- the C++ side only ever reads this synchronously

@@ -1461,6 +1461,15 @@ pub fn lower_to_llvm<'c>(
         ]);
     }
 
+    // `tanh`/`exp`/`log` as polynomial approximations, now that the element-
+    // wise ops are vectors: left to `--convert-math-to-llvm`, a `math.tanh`
+    // on a `vector<1024xf32>` became 1024 calls to libm's `tanhf` (LLVM has
+    // no vector math library here), 26% of a nanoLM training step.
+    // `cleave-mlir-shim`'s `cleaveApproximateMath` has the details.
+    if !unsafe { cleave_mlir_shim::approximate_math(module.as_operation().to_raw()) } {
+        return Err(vec!["MLIR-to-LLVM lowering pass failed (math approximation)".to_string()]);
+    }
+
     // One shared scalar lowering pipeline from here on, `options.openmp`
     // only ever inserting the two genuinely OpenMP-specific pieces into it
     // -- not, as an earlier version of this function had it, two entirely

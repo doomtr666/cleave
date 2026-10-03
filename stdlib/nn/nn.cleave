@@ -613,6 +613,10 @@ algebra CausalAttention<X, S> {
     );
 }
 
+// The per-head products call `sgemm` directly (`linalg`'s `blas_*`): at 128 x 128 x 64 the
+// `linalg` matmul schedule ran at about a quarter of peak, `sgemm` twice as fast, and inside these
+// out-of-line methods there is nothing around a product to fuse it with.
+//
 // `#[no_inline]` on each method here and on `LayerNorm`'s: each lowers to thousands of lines of
 // vectorized loops, and a transformer calls them once per block forward and again per gradient.
 // Inlined, every call site got its own copy: nanoLM's training step became one function of 700k
@@ -628,7 +632,7 @@ impl<const N: i32, const D: i32, const L: i32, const DH: i32> CausalAttention<Te
                 let qh: Tensor<f32, L, DH> = attention_block(q, s, h);
                 let kh: Tensor<f32, L, DH> = attention_block(k, s, h);
                 let vh: Tensor<f32, L, DH> = attention_block(v, s, h);
-                let o: Tensor<f32, L, DH> = matmul(causal_attention_weights(qh, kh), vh);
+                let o: Tensor<f32, L, DH> = blas_matmul(causal_attention_weights(qh, kh), vh);
                 for i in 0..L { for j in 0..DH { out[s * L + i, h * DH + j] = o[i, j]; }; };
             };
         };
@@ -647,10 +651,10 @@ impl<const N: i32, const D: i32, const L: i32, const DH: i32> CausalAttention<Te
                 let vh: Tensor<f32, L, DH> = attention_block(v, s, h);
                 let uh: Tensor<f32, L, DH> = attention_block(u, s, h);
                 let p = causal_attention_weights(qh, kh);
-                let ds = attention_score_grad(p, matmul_transpose_b(uh, vh), DH);
-                let gq: Tensor<f32, L, DH> = matmul(ds, kh);
-                let gk: Tensor<f32, L, DH> = matmul_transpose_a(ds, qh);
-                let gv: Tensor<f32, L, DH> = matmul_transpose_a(p, uh);
+                let ds = attention_score_grad(p, blas_matmul_transpose_b(uh, vh), DH);
+                let gq: Tensor<f32, L, DH> = blas_matmul(ds, kh);
+                let gk: Tensor<f32, L, DH> = blas_matmul_transpose_a(ds, qh);
+                let gv: Tensor<f32, L, DH> = blas_matmul_transpose_a(p, uh);
                 for i in 0..L {
                     for j in 0..DH {
                         dq[s * L + i, h * DH + j] = gq[i, j];
@@ -676,18 +680,19 @@ fn attention_block<const N: i32, const D: i32, const L: i32, const DH: i32>(x: T
 fn causal_attention_weights<const L: i32, const DH: i32>(qh: Tensor<f32, L, DH>, kh: Tensor<f32, L, DH>) -> Tensor<f32, L, L> {
     let dh: f32 = DH.to();
     let scale = 1.0 / mlir::math::sqrt(dh);
-    let scores: Tensor<f32, L, L> = matmul_transpose_b(qh, kh);
+    let scores: Tensor<f32, L, L> = blas_matmul_transpose_b(qh, kh);
     let mut p: [[f32; L]; L] = mlir::memref::alloc();
+    // The exponentials, the sum and the normalization in separate loops: the exponential loop then
+    // has no reduction in it (a float sum can't be reordered, so it kept the whole loop scalar) and
+    // vectorizes, the softmax 2.4x faster.
     for i in 0..L {
         let mut m = scores[i, 0];
         for j in 1..i + 1 { if scores[i, j] > m { m = scores[i, j]; }; };
+        for j in 0..i + 1 { p[i, j] = exp((scores[i, j] - m) * scale); };
         let mut z = 0.0;
-        for j in 0..i + 1 {
-            let e = exp((scores[i, j] - m) * scale);
-            p[i, j] = e;
-            z = z + e;
-        };
-        for j in 0..i + 1 { p[i, j] = p[i, j] / z; };
+        for j in 0..i + 1 { z = z + p[i, j]; };
+        let rz = 1.0 / z;
+        for j in 0..i + 1 { p[i, j] = p[i, j] * rz; };
         for j in i + 1..L { p[i, j] = 0.0; };
     };
     Tensor(data: p)

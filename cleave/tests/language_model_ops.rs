@@ -619,3 +619,39 @@ fn no_inline_applies_to_the_declaring_method_only() {
     assert!(!defined("@\"Bump::bump<Tensor<f32, 4, 4>>\""), "the other impl's method was kept out of line");
     assert!(defined("@chain"), "the `#[no_inline]` plain fn was inlined");
 }
+
+/// `tanh`/`exp`/`log` on tensors become polynomial approximations, vector
+/// arithmetic, not intrinsics: LLVM has no vector math library here and
+/// scalarized each `llvm.intr.tanh` on a vector into one libm `tanhf` call
+/// per element — 26% of a nanoLM training step, the GELUs.
+/// `pipeline.rs`, `cleave_mlir_shim::approximate_math`.
+#[test]
+fn transcendentals_on_tensors_are_not_libm_calls() {
+    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("approximated_math.cleave");
+    std::fs::write(
+        &source,
+        "
+        use nn;
+        fn act(x: Tensor<f32, 64, 64>) -> Tensor<f32, 64, 64> { gelu(x) + Transcendental::exp(x) }
+        fn main() -> f32 {
+            rand_seed(1);
+            let x: Tensor<f32, 64, 64> = Init::he();
+            act(x)[3, 4]
+        }
+        ",
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--no-debug-info", "--dump-mlir-lowered"])
+        .arg(&source)
+        .output()
+        .expect("cannot run cleave");
+    let ir = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(ir.contains("llvm.func @act") || ir.contains("llvm.func @main"), "no IR dumped");
+    for intrinsic in ["llvm.intr.tanh", "llvm.intr.exp"] {
+        assert!(!ir.contains(intrinsic), "`{intrinsic}` left in the IR: it becomes one libm call per element");
+    }
+}

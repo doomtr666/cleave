@@ -431,6 +431,17 @@ impl<T: Float, const N: i32, const M: i32, const K: i32>
 // site: about 200 in nanoLM's training step, most of a minute of compile time. Out of line, the
 // glue exists once per shape. Below the threshold the `linalg` path stays inlined, where it fuses
 // with what surrounds it (MNIST measured 22% slower with every matmul out of line).
+//
+// Also called directly where a matmul has nothing around it to fuse with and is small enough that
+// the `linalg` schedule does poorly: the per-head products of `nn`'s causal attention (128 x 128 x
+// 64), where `sgemm` measured twice as fast.
+#[no_inline]
+fn blas_matmul<const N: i32, const M: i32, const K: i32>(a: Tensor<f32, N, M>, b: Tensor<f32, M, K>) -> Tensor<f32, N, K> {
+    let mut c_buf: [f32; N, K] = mlir::memref::alloc();
+    let c: Tensor<f32, N, K> = mlir::bufferization::to_tensor(c_buf, restrict: "unit");
+    sgemm(false, false, 1.0, a, b, 0.0, c)
+}
+
 #[no_inline]
 fn blas_matmul_transpose_b<const P: i32, const Q: i32, const R: i32>(a: Tensor<f32, P, Q>, b: Tensor<f32, R, Q>) -> Tensor<f32, P, R> {
     let mut c_buf: [f32; P, R] = mlir::memref::alloc();

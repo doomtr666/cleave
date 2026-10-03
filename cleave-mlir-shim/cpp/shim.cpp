@@ -24,6 +24,8 @@
 #include "mlir/CAPI/IR.h"
 #include "mlir/CAPI/Support.h"
 #include "mlir/ExecutionEngine/OptUtils.h"
+#include "mlir/Dialect/Math/Transforms/Passes.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.h"
@@ -242,4 +244,39 @@ extern "C" MlirExecutionEngine cleaveExecutionEngineCreateWithTarget(
     return MlirExecutionEngine{nullptr};
   }
   return wrap(jitOrError->release());
+}
+
+// Rewrites the transcendental `math` ops into polynomial approximations made
+// of plain `arith`/`vector` ops (MLIR's `PolynomialApproximation.cpp`), so a
+// `math.tanh` on a `vector<1024xf32>` becomes packed AVX-512 arithmetic.
+// Without it, `--convert-math-to-llvm` emits `llvm.intr.tanh` on the vector,
+// and with no vector math library attached LLVM's backend scalarizes it into
+// one libm call per element: `tanhf` was 26% of a nanoLM training step
+// (uProf, `ucrtbase.dll`), the GELU of every block. Not exposed as a pass by
+// MLIR (only a test pass is), hence the shim. Accuracy is a few ulp, not
+// libm's correctly rounded-ish results.
+extern "C" bool cleaveApproximateMath(MlirOperation op) {
+  static const llvm::StringRef approximated[] = {
+      "tanh", "exp", "expm1", "log", "log1p", "log2", "erf", "erfc"};
+  auto selected = [](StringRef name) {
+    name.consume_front("math.");
+    return llvm::is_contained(approximated, name);
+  };
+  // Only the selected `math` ops and what their rewrites create: a module-wide
+  // `applyPatternsGreedily` would also fold constants and simplify regions
+  // across the whole program, work nobody asked for on 200k lines of IR.
+  SmallVector<Operation *> ops;
+  unwrap(op)->walk([&](Operation *o) {
+    if (o->getDialect() && o->getDialect()->getNamespace() == "math" &&
+        selected(o->getName().getStringRef()))
+      ops.push_back(o);
+  });
+  if (ops.empty())
+    return true;
+  RewritePatternSet patterns(unwrap(op)->getContext());
+  populateMathPolynomialApproximationPatterns(patterns, selected);
+  GreedyRewriteConfig config;
+  config.setStrictness(GreedyRewriteStrictness::ExistingAndNewOps);
+  config.enableFolding(false);
+  return succeeded(applyOpPatternsGreedily(ops, std::move(patterns), config));
 }
