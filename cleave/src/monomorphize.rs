@@ -148,6 +148,11 @@ struct Specialization {
     /// `BlasSgemmRowMajor::blas_sgemm_rowmajor`). Read back via
     /// `MonomorphizedProgram::is_pure`.
     is_pure: bool,
+    /// `#[no_inline]`, for the same reason again: Adam's leaf `step`
+    /// (`stdlib/optim`) declares it, `Sgd`'s doesn't, and both are
+    /// specializations of `Optimizer::step`. Read back via
+    /// `MonomorphizedProgram::no_inline`.
+    no_inline: bool,
 }
 
 pub struct MonomorphizedProgram {
@@ -229,6 +234,10 @@ impl MonomorphizedProgram {
 
     pub fn is_pure(&self, key: &str) -> bool {
         self.specializations[key].is_pure
+    }
+
+    pub fn no_inline(&self, key: &str) -> bool {
+        self.specializations[key].no_inline
     }
 
     pub fn extern_symbol(&self, key: &str) -> Option<&str> {
@@ -321,6 +330,8 @@ pub(crate) struct ImplTemplate {
     /// Mirrors `Specialization`'s own identical field — see its own doc
     /// comment.
     is_pure: bool,
+    /// Mirrors `Specialization::no_inline`.
+    no_inline: bool,
 }
 
 /// Runs the whole-program inference pass (`callgraph::infer_program`) and
@@ -733,6 +744,7 @@ pub fn monomorphize(
                     is_extern: false,
                     extern_symbol: None,
                     is_pure: false,
+                    no_inline: false,
                 },
             );
         }
@@ -876,6 +888,7 @@ fn build_impl_templates(
                 is_extern: f.is_extern,
                 extern_symbol: f.extern_symbol.clone(),
                 is_pure: f.attrs.iter().any(|a| a.name == "pure"),
+                no_inline: f.attrs.iter().any(|a| a.name == "no_inline"),
             });
         }
     }
@@ -3563,6 +3576,7 @@ impl<'a> InstanceEngine<'a> {
                         is_extern: true,
                         extern_symbol: t.extern_symbol.clone(),
                         is_pure: t.is_pure,
+                        no_inline: t.no_inline,
                     },
                 ));
             }
@@ -3712,6 +3726,7 @@ impl<'a> InstanceEngine<'a> {
                 is_extern: t.is_extern,
                 extern_symbol: t.extern_symbol.clone(),
                 is_pure: t.is_pure,
+                no_inline: t.no_inline,
             },
         ));
         self.done.borrow_mut().insert(key, (display.clone(), result.clone()));
@@ -3925,6 +3940,7 @@ impl InstanceEngine<'_> {
                 is_extern: false,
                 extern_symbol: None,
                 is_pure: f.attrs.iter().any(|a| a.name == "pure"),
+                no_inline: f.attrs.iter().any(|a| a.name == "no_inline"),
             },
         ));
         self.done.borrow_mut().insert(key, (display.clone(), result.clone()));

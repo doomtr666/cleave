@@ -1,11 +1,15 @@
 """Twin of `train_gpt` in `examples/nanolm/src/kernel.cleave`: the same transformer (token and
-position embeddings of width 128, 4 pre-LayerNorm blocks with causal attention over 4 heads of 32
-and a 128 -> 512 -> 128 GELU MLP, a final LayerNorm, a dense head to 104 logits), from the same
-initial weights (`gpt_init.ckpt`, written by cleave), on the same batches, with the same Adam and
-the same summed loss. The validation losses must match cleave's.
+position embeddings of width `D`, `LAYERS` pre-LayerNorm blocks with causal attention over heads
+`DH` wide and a `D -> 4D -> D` GELU MLP, a final LayerNorm, a dense head to 104 logits), from the
+same initial weights (`gpt_init.ckpt`, written by cleave's `bench` mode in its own directory, apart
+from the real run's checkpoints), on the same
+batches, with the same Adam, learning-rate schedule and summed loss. The sizes must match the
+kernel's `define`s. The validation losses must match cleave's.
 
-    cargo run --release -p nanolm -- gpt 0 <rounds> <steps_per_round>   (writes gpt_init.ckpt)
-    poetry run python gpt.py <rounds> <steps_per_round>
+    cargo run --release -p nanolm -- bench 0 <rounds> <steps_per_round>   (writes gpt_init.ckpt)
+    poetry run python gpt.py 0 <rounds> <steps_per_round>
+
+The same arguments as cleave's `bench` mode; the first step must be 0, the twin doesn't resume.
 """
 
 import math
@@ -17,17 +21,21 @@ import torch.nn.functional as F
 
 from data import CACHE, TRAIN_SEED, VAL_SEED, Corpus, batch, read_checkpoint
 
-ROUNDS = int(sys.argv[1]) if len(sys.argv) > 1 else 10
-PER_ROUND = int(sys.argv[2]) if len(sys.argv) > 2 else 100
-LR, B, T, D, DH = 0.001, 32, 128, 128, 32
+arg = lambda i, default: int(sys.argv[i]) if len(sys.argv) > i else default
+FIRST, ROUNDS, PER_ROUND = arg(1, 0), arg(2, 10), arg(3, 100)
+if FIRST != 0:
+    sys.exit("the twin starts from gpt_init.ckpt: the first step must be 0 (it doesn't resume)")
+LR, B, T, D, DH, LAYERS = 0.001, 32, 128, 256, 64, 6
+WARMUP, DECAY_STEPS = 200, 20000
+MODEL_DIR = CACHE.parent / f"gpt-d{D}-l{LAYERS}-bench"
 H = D // DH
 
 corpus = Corpus()
-leaves = iter(torch.tensor(a, requires_grad=True) for a in read_checkpoint(CACHE.parent / "gpt_init.ckpt"))
+leaves = iter(torch.tensor(a, requires_grad=True) for a in read_checkpoint(MODEL_DIR / "gpt_init.ckpt"))
 take = lambda n: [next(leaves) for _ in range(n)]
 tok, pos = take(2)
 # Per block, in `Block`'s field order: ln1 g, b; wq, wk, wv, wo (w, b each); ln2 g, b; fc, proj (w, b).
-blocks = [take(16) for _ in range(4)]
+blocks = [take(16) for _ in range(LAYERS)]
 lnf_g, lnf_b, head_w, head_b = take(4)
 params = [tok, pos, *[p for blk in blocks for p in blk], lnf_g, lnf_b, head_w, head_b]
 positions = torch.arange(B * T) % T
@@ -58,21 +66,51 @@ def loss(x, y):
     return F.cross_entropy(layer_norm(h, lnf_g, lnf_b) @ head_w + head_b, y.reshape(-1), reduction="sum")
 
 
-def validation(batches):
+def mean_loss(tokens, seed, first, batches):
     with torch.no_grad():
-        total = sum(loss(*map(torch.from_numpy, batch(corpus.val, VAL_SEED, s))).item() for s in range(batches))
+        total = sum(loss(*map(torch.from_numpy, batch(tokens, seed, s))).item() for s in range(first, first + batches))
     return total / (batches * B * T)
 
 
+def validation(batches):
+    return mean_loss(corpus.val, VAL_SEED, 0, batches)
+
+
+def learning_rate(s):
+    if s < WARMUP:
+        return LR * (s + 1) / WARMUP
+    t = (s - WARMUP) / (DECAY_STEPS - WARMUP)
+    return LR * (1.0 - 0.9 * t) if t < 1.0 else LR * 0.1
+
+
 opt = torch.optim.Adam(params, lr=LR, betas=(0.9, 0.999), eps=1e-8)
-print(f"step 0, validation: {validation(4):.7f}")
-start = time.perf_counter()
+# The same lines as the cleave host's `round_done` (`examples/nanolm/src/main.rs`), timed the same
+# way: from one report to the next, the round's training steps plus the losses reported at its end.
+# As in cleave, the total (`elapsed`) counts from before the first report, the rounds' minutes
+# from right after it.
+begin = time.perf_counter()
+print(f"step 0: validation {validation(4):.4f}, learning rate {learning_rate(0):.6f}")
+start = last = time.perf_counter()
 for r in range(ROUNDS):
     for k in range(PER_ROUND):
-        x, y = map(torch.from_numpy, batch(corpus.train, TRAIN_SEED, r * PER_ROUND + k))
+        s = r * PER_ROUND + k
+        x, y = map(torch.from_numpy, batch(corpus.train, TRAIN_SEED, s))
+        for g in opt.param_groups:
+            g["lr"] = learning_rate(s)
         opt.zero_grad()
         loss(x, y).backward()
         opt.step()
-    print(f"step {(r + 1) * PER_ROUND}, validation: {validation(4):.7f}")
-print(f"transformer: {validation(20):.4f} nats/char")
-print(f"elapsed: {time.perf_counter() - start:.2f}s (training, with validation)")
+    step = (r + 1) * PER_ROUND
+    # The round's last four training batches, just trained on, as `gpt_train_loss` does.
+    train = mean_loss(corpus.train, TRAIN_SEED, step - 4, 4)
+    val = validation(4)
+    now = time.perf_counter()
+    print(
+        f"step {step}: train {train:.4f}, validation {val:.4f}, learning rate {learning_rate(step):.6f}, "
+        f"{(now - last) * 1000 / PER_ROUND:.0f} ms/step, {(now - start) / 60:.1f} min elapsed",
+        flush=True,
+    )
+    last = now
+nats = validation(20)
+print(f"transformer: {nats:.4f} nats/char ({nats / math.log(2):.4f} bits/char)")
+print(f"elapsed: {time.perf_counter() - begin:.2f}s")

@@ -319,6 +319,11 @@ pub struct StructSchema {
     /// everything remaining belongs to the pack.
     pub has_pack: bool,
     pub fields: Vec<(String, Type)>,
+    /// Every global `const`/`define`, resolved: a field's type may name one
+    /// as a dimension (`w: Tensor<f32, 1, D>`, `define D: i32 = 256;`), which
+    /// only inference used to resolve, leaving MLIR lowering an unresolved
+    /// `D`. Consulted after the struct's own generics, which shadow it.
+    pub consts: HashMap<String, crate::infer::Ty>,
 }
 
 /// Scans every `struct` declaration in the program — the whole-program
@@ -327,6 +332,11 @@ pub struct StructSchema {
 /// knowledge" posture `collect_mlir_types` already gives primitives.
 pub fn collect_struct_schemas(program: &Program) -> HashMap<String, StructSchema> {
     let mut schemas = HashMap::new();
+    let consts: HashMap<String, crate::infer::Ty> = crate::registry::Registry::build(program)
+        .global_consts()
+        .into_iter()
+        .map(|(name, value)| (name, crate::infer::Ty::Const(value)))
+        .collect();
     for item in &program.items {
         let ItemKind::Struct(d) = &item.kind else {
             continue;
@@ -344,6 +354,7 @@ pub fn collect_struct_schemas(program: &Program) -> HashMap<String, StructSchema
                 generics,
                 has_pack,
                 fields,
+                consts: consts.clone(),
             },
         );
     }
@@ -666,7 +677,8 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                             global_consts: global_consts.clone(),
                             call_names: mono.call_names(key).clone(),
                             origin: Some((d.algebra.clone(), f.name.clone())),
-                            no_inline: f.attrs.iter().any(|a| a.name == "no_inline"),
+                            // From the specialization, not `f`: see `is_extern` above.
+                            no_inline: mono.no_inline(key),
                             is_export: false,
                             export_symbol: None,
                             capture_count: 0,
@@ -707,7 +719,7 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
             let own_params = mono.params(key);
             let body = mono.body(key);
             let node_types = mono.node_types(key);
-            let captures = lambda_free_vars(own_params, body, node_types);
+            let captures = lambda_free_vars(own_params, body, node_types, &global_consts);
             let capture_names = sorted_capture_names(&captures);
 
             let mut params: Vec<Param> = capture_names
@@ -1855,7 +1867,7 @@ fn convert_stmts(stmts: &[Stmt], env: CEnv, ctx: &Ctx, k: &dyn Fn(CEnv) -> CExpr
             let ExprKind::Lambda { params, body, .. } = &value.kind else {
                 unreachable!()
             };
-            let free = lambda_free_vars(params, body, ctx.node_types);
+            let free = lambda_free_vars(params, body, ctx.node_types, ctx.global_consts);
             let captures: Vec<CVal> = sorted_capture_names(&free)
                 .into_iter()
                 .map(|n| {
@@ -3438,13 +3450,19 @@ fn mutated_free_vars_expr(
 /// node produce the identical *name* set every time, regardless of which
 /// `node_types` map (a specific specialization's own substituted one, or
 /// the enclosing unit's own) happens to be passed for the *type* lookup.
+/// A global `const`/`define` the lambda reads (a comprehension bounded by
+/// one, `[for j in 0..WIDTH: ...]`) is not a capture: the body resolves it as
+/// the constant it is, like a literal.
 fn lambda_free_vars(
     params: &[Param],
     body: &Block,
     node_types: &HashMap<NodeId, Ty>,
+    global_consts: &HashMap<String, ConstValue>,
 ) -> HashMap<String, Ty> {
     let shadowed: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
-    lambda_free_vars_block(body, &shadowed, node_types)
+    let mut free = lambda_free_vars_block(body, &shadowed, node_types);
+    free.retain(|name, _| !global_consts.contains_key(name));
+    free
 }
 
 fn lambda_free_vars_block(

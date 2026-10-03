@@ -126,6 +126,12 @@ impl<T: Float + Ring, const Dims...: i32> Optimizer<Adam, Tensor<T, Dims...>, Ad
         // guesses (`infer.rs::infer_struct_lit_pack_arity`).
         AdamState::<T, Dims...>(m: Ring::zero(), v: Ring::zero(), beta1_pow: 1.0, beta2_pow: 1.0)
     }
+    // Not inlined: a model has one leaf per weight tensor (102 in nanoLM's transformer) but only a
+    // handful of distinct shapes. Inlined, this step's ten tensor operations were copied for every
+    // leaf, most of the compiled code of a training step; called, it's compiled once per shape.
+    // The operations inside still inline into it and fuse, and each call works on a whole tensor:
+    // the step runs at the same speed.
+    #[no_inline]
     fn step(opt, model, grad, state) {
         let m: Tensor<T, Dims...> = Ring::add(Scale::scale(state.m, opt.beta1), Scale::scale(grad, 1.0 - opt.beta1));
         let grad_sq: Tensor<T, Dims...> = grad * grad;

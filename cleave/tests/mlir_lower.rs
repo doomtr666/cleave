@@ -2924,6 +2924,34 @@ fn to_sugar_converts_an_int_to_a_float_end_to_end() {
     assert_eq!(run_i32(&context, src), 1);
 }
 
+/// A struct field's type may name a `define` (or a `const`) as a dimension:
+/// `w: Tensor<f32, 1, D>`. Inference resolved it, but the struct schema MLIR
+/// lowering uses kept the bare name, and lowering panicked ("array size must
+/// be a resolved constant, got `D`"); and a comprehension bounded by one made
+/// its lambda capture `D` like a local. How a model's sizes are configured
+/// (`examples/nanolm`).
+#[test]
+fn a_struct_field_can_be_sized_by_a_define() {
+    let context = context();
+    let src = "
+        use nn;
+        define D: i32 = 8;
+        define F: i32 = 4 * D;
+        struct S { w: Tensor<f32, 1, D>, v: Tensor<f32, D, F> }
+        fn main() -> i32 {
+            rand_seed(1);
+            let s = S(w: Init::he(), v: Init::he());
+            let y: Tensor<f32, 1, F> = matmul(s.w, s.v);
+            // A comprehension bounded by a `define`: its lambda reads `D`
+            // as the constant it is, never as a capture (`cps.rs::lambda_
+            // free_vars`).
+            let ones: Tensor<f32, 1, D> = [for i in 0..1: [for j in 0..D: 1.0]];
+            if y[0, F - 1] != 1234.0 and ones[0, D - 1] == 1.0 { F } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 32);
+}
+
 /// A const generic read as a value in a generic body has the type of its
 /// value (`i32`), not the generic's own variable: arithmetic on it must not
 /// bind or merge the generics (`s * L` once `s` is known to be an `i32` used

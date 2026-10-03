@@ -1336,11 +1336,8 @@ pub fn struct_field_types(
             .generics
             .last()
             .expect("has_pack implies at least one generic");
-        let mapping: HashMap<String, Ty> = non_pack
-            .iter()
-            .cloned()
-            .zip(type_args.iter().cloned())
-            .collect();
+        let mut mapping: HashMap<String, Ty> = schema.consts.clone();
+        mapping.extend(non_pack.iter().cloned().zip(type_args.iter().cloned()));
         let pack_tys = &type_args[non_pack.len().min(type_args.len())..];
         schema
             .fields
@@ -1353,12 +1350,8 @@ pub fn struct_field_types(
             })
             .collect()
     } else {
-        let mapping: HashMap<String, Ty> = schema
-            .generics
-            .iter()
-            .cloned()
-            .zip(type_args.iter().cloned())
-            .collect();
+        let mut mapping: HashMap<String, Ty> = schema.consts.clone();
+        mapping.extend(schema.generics.iter().cloned().zip(type_args.iter().cloned()));
         schema
             .fields
             .iter()

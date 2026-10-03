@@ -567,3 +567,55 @@ fn tensors_destructured_from_a_returned_tuple_stay_valid() {
     ");
     assert_eq!(got, 1.0);
 }
+
+/// `#[no_inline]` is a property of the one method that declares it: Adam's
+/// leaf `step` declares it, `Sgd`'s doesn't, and both are specializations of
+/// `Optimizer::step`. It used to be read off whichever impl was being walked
+/// when the specializations were collected, so the last impl's attribute
+/// landed on every impl's specializations (MNIST's `Sgd` step went out of
+/// line, a second slower). And a plain `fn` declaring it stays a function
+/// even when its body is a chain of calls the e-graph pass would otherwise
+/// walk through (nanoLM's transformer `block`).
+#[test]
+fn no_inline_applies_to_the_declaring_method_only() {
+    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("no_inline_per_impl.cleave");
+    std::fs::write(
+        &source,
+        "
+        use nn;
+        algebra Bump<T> { fn bump(x: T) -> T; }
+        impl<const R: i32, const C: i32> Bump<Tensor<f32, R, C>> {
+            fn bump(x) { x * x }
+        }
+        impl<const N: i32> Bump<Tensor<f32, N>> {
+            #[no_inline]
+            fn bump(x) { x + x }
+        }
+        fn square(x: Tensor<f32, 4, 4>) -> Tensor<f32, 4, 4> { x * x }
+        #[no_inline]
+        fn chain(x: Tensor<f32, 4, 4>) -> Tensor<f32, 4, 4> { square(square(x)) }
+        // An axiom applies here (`matmul(transpose(a), b)`), so the e-graph
+        // pass rewrites this body, walking through what it calls.
+        fn twice(x: Tensor<f32, 4, 4>) -> Tensor<f32, 4, 4> { matmul(transpose(chain(x)), x) }
+        fn main() -> f32 {
+            let a: Tensor<f32, 4, 4> = [for i in 0..4: [for j in 0..4: 2.0]];
+            let b: Tensor<f32, 8> = [for i in 0..8: 3.0];
+            bump(a)[1, 2] + bump(b)[5] + twice(a)[0, 0]
+        }
+        ",
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--no-debug-info", "--dump-mlir-lowered"])
+        .arg(&source)
+        .output()
+        .expect("cannot run cleave");
+    let ir = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    let defined = |name: &str| ir.lines().any(|l| l.trim_start().starts_with("llvm.func") && l.contains(name));
+    assert!(defined("@\"Bump::bump<Tensor<f32, 8>>\""), "the `#[no_inline]` method was inlined");
+    assert!(!defined("@\"Bump::bump<Tensor<f32, 4, 4>>\""), "the other impl's method was kept out of line");
+    assert!(defined("@chain"), "the `#[no_inline]` plain fn was inlined");
+}

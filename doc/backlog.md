@@ -1971,7 +1971,7 @@ What's needed: when `NoneMatched` hits an impl whose *declared* target (`impl<�
 
 `infer.rs::unify`, arm `(Ty::ConstExpr(op1, x1, y1), Ty::ConstExpr(op2, x2, y2)) if op1 == op2`: `N / L ~ M / K` forces `N = M` and `L = K`, while `8/4 = 4/2`. Not hit in practice (looked for during the attention work: the arm never fired), but it's an inference that can merge two generics wrongly, the same class as the bug found there. Fix: only accept syntactic identity (same operands, already unified), otherwise defer until the values are known, rather than deducing equal operands.
 
-## nanoLM's kernel compile time: from ~3 minutes to under 2 — measured, partly fixed, the rest still large
+## nanoLM's kernel compile time: from ~3 minutes to ~30 s — measured, mostly fixed
 
 Measured on `examples/nanolm/src/kernel.cleave` with the transformer (4 blocks, d = 128). Front end down to optimized CPS: ~5 s. CPS to MLIR: 1.5 s, 22 MB of MLIR. MLIR passes: ~23 s, 69 MB of LLVM dialect. LLVM optimization and code generation: ~90 s, plus ~24 s writing the object. So the cost was LLVM digesting a huge IR.
 
@@ -1984,6 +1984,16 @@ What was done, and what each change did alone:
 - Also tried: `--no-inline` everywhere (12 s to compile, but 10× slower to run: fusion and vectorization need the small operations inlined), and rewriting Adam's leaf step as one loop (the IR grew: the ten tensor operations were already being fused well) — both reverted.
 
 Still large; the next leads: why each operation lowers to thousands of lines (vectorized loop nests and descriptor `insertvalue`/`extractvalue` chains dominate the op histogram); `no_inline` for more of the heavy, repeated operations (the gradient bodies, Adam per leaf shape); and the 24 s of writing the object (maybe a second code generation).
+
+Then the bigger model (6 blocks, d = 256), measured with `--no-openmp --no-llvm-unroll --target-cpu native --emit-object` and the phases timed separately (front end + CPS → MLIR ~3 s, MLIR passes, then the execution engine's optimization and the object's code generation, the bulk):
+- **148 s** to start with (code generation 82 s, LLVM optimization 31 s), 385k lines of LLVM dialect: `train_gpt` 132k, `generate` 114k, the Adam step's `Trainable` glue 89k.
+- `#[no_inline]` on Adam's leaf `step` (`stdlib/optim`): 112 s.
+- The BLAS tier of the matmuls out of line (`stdlib/linalg/matrix.cleave`, `blas_*`): the `sgemm` call and its glue (destination allocation, descriptors) once per shape rather than at each of ~200 call sites; the `linalg` path stays inlined. 95 s. Putting *every* matmul out of line reached 63 s but made MNIST 22% slower (lost fusion), rejected.
+- **The e-graph pass ignored `#[no_inline]`**: `optimize_program` walks a pure plain `fn` (a "transparent chain") as if inlined, so `block` disappeared into `gpt_logits` and `generate` before MLIR ever saw the attribute, and the Adam step's glue got the same treatment. It now keeps a `#[no_inline]` callee one opaque call (`Forward::honor_no_inline`), except while synthesizing a gradient, which has to see through a callee with no rule of its own. **36 s** (code generation 14.5 s, LLVM optimization 5 s), peak memory 4.2 → 2.7 GB; the Adam glue 89k → 5.7k lines, `generate` 114k → 55k.
+- `#[no_inline]` on the checkpoint leaves (`stdlib/checkpoint`: a tensor's and an Adam state's `save_part`/`restore_part`), copied for each of the 102 leaves wherever the model is saved or restored: IR 232k → 181k lines.
+- **`#[no_inline]` was read off the wrong impl**: `cps.rs::collect_units` took it from the impl being walked, while `specializations_of("Optimizer::step")` returns the specializations of *every* impl of the method (the trap `is_extern`/`is_pure` had already fallen into), so the last impl's attribute landed on all of them. Adam's spilled onto `Sgd`'s leaf step (MNIST ~1 s slower once the e-graph started honoring the attribute) and onto the generic `Trainable` glue of the optimizer and the checkpoints. Now carried by each specialization (`monomorphize.rs`, `Specialization::no_inline`); `language_model_ops.rs::no_inline_applies_to_the_declaring_method_only` covers this and the e-graph case. The glue, inlined again, puts nanoLM's IR at 207k lines (`train_gpt` 97k, `generate` 37k); **~30 s** to compile, peak memory 2.1 GB.
+
+Left: `train_gpt`'s gradient, where everything is necessarily inlined (synthesis sees through `block`; a per-function gradient, the backward of `block` as its own function, would let it be compiled once instead of six times), and the refcounting around the model's construction and restore (most of `generate`'s remaining lines are `retain`/`release`, the "retain/release are opaque calls" entry).
 
 ## The in-process test harnesses don't run the matmul schedule: a test of a matmul there doesn't cover the real pipeline
 

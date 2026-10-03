@@ -643,6 +643,14 @@ pub struct Forward {
     /// whose body is a chain of tensor calls around a raw `tanh`). Set by
     /// the caller with `ruled_units`; empty otherwise.
     pub ruled: HashSet<String>,
+    /// Whether a `#[no_inline]` callee (`CTopLevelFn::no_inline`) stays one
+    /// opaque call node instead of being walked through as a transparent
+    /// chain. Set by `optimize_program`: inlining a big plain `fn` (a
+    /// transformer `block`) at every call site multiplies the code LLVM has
+    /// to generate, and the attribute is how a program says not to. Off for
+    /// gradient synthesis, which must see through a callee that has no rule
+    /// of its own.
+    pub honor_no_inline: bool,
     /// Every unit name used via the *real-call* path (`recognize_real_call`)
     /// — a superset of `reached`'s own keys (this includes a transparently-
     /// inlined plain top-level `fn` too, `origin: None`, which `reached`
@@ -734,6 +742,7 @@ impl Default for Forward {
             external_vars: HashMap::new(),
             reached: HashMap::new(),
             ruled: HashSet::new(),
+            honor_no_inline: false,
             call_units: std::collections::HashSet::new(),
             raw_ops: HashMap::new(),
             struct_ops: HashMap::new(),
@@ -998,9 +1007,10 @@ impl Forward {
                         let transparent = !straight
                             && is_transparent_chain(&callee.def.body, units, &mut HashSet::new());
                         let ruled = self.ruled.contains(unit_name);
-                        let transparent = transparent && !ruled;
+                        let kept = self.honor_no_inline && callee.no_inline;
+                        let transparent = transparent && !ruled && !kept;
                         if straight
-                            || (callee.origin.is_some()
+                            || ((callee.origin.is_some() || kept)
                                 && !transparent
                                 && is_pure(&callee.def.body))
                         {
@@ -3559,6 +3569,7 @@ pub fn optimize_program(
         if want_explanations {
             fwd.egraph = fwd.egraph.with_explanations_enabled();
         }
+        fwd.honor_no_inline = true;
         let real_params = &f.def.params[..f.def.params.len() - 1];
         fwd.param_types = real_params
             .iter()

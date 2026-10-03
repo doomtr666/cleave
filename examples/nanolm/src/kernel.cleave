@@ -125,29 +125,47 @@ export fn train_lm(rounds: i32, lr: f32, seed: i64) -> f32 {
 
 // ------------------------------------------------------------------ the transformer
 //
-// nanoGPT's shape at a small size: a token and a position embedding of width 128, 4 blocks, a final
-// LayerNorm and a dense head to the 104 logits. Activations are `[B*T, d]` = `[4096, 128]`
-// matrices, the 32 sequences of a batch stacked as rows. Each block is pre-LayerNorm:
-// `x + attention(layer_norm(x))`, then `x + mlp(layer_norm(x))`, the attention causal over 4 heads
-// of 32, the MLP 128 -> 512 -> 128 with GELU.
+// nanoGPT's shape, at a size set by the `define`s below (overridable from `build.rs`): a token and a
+// position embedding of width `WIDTH`, six blocks, a final LayerNorm and a dense head to the
+// `VOCAB` logits. Activations are `[ROWS, WIDTH]` matrices, the 32 sequences of a batch (`data.rs`)
+// stacked as rows. Each block is pre-LayerNorm: `x + attention(layer_norm(x))`, then `x +
+// mlp(layer_norm(x))`, the attention causal over heads `HEAD` wide, the MLP `WIDTH -> MLP ->
+// WIDTH` with GELU. The block count is the struct's six fields (`b1`..`b6`, `gpt_layers`).
+
+define WIDTH: i32 = 256;
+define HEAD: i32 = 64;
+define MLP: i32 = 4 * WIDTH;
+// Characters per sequence and rows per batch: `data.rs`'s `T` and `B * T`.
+define CONTEXT: i32 = 128;
+define ROWS: i32 = 32 * CONTEXT;
+define VOCAB: i32 = 104;
+
+// Linear warmup over `WARMUP` steps, then a linear decay to a tenth of the rate at `DECAY_STEPS`,
+// flat after: a function of the step alone, so a resumed run continues the same schedule.
+define WARMUP: i32 = 200;
+define DECAY_STEPS: i32 = 20000;
 
 struct Block {
-    ln1_g: Tensor<f32, 1, 128>, ln1_b: Tensor<f32, 1, 128>,
-    wq: Dense<f32, 128, 128>, wk: Dense<f32, 128, 128>, wv: Dense<f32, 128, 128>, wo: Dense<f32, 128, 128>,
-    ln2_g: Tensor<f32, 1, 128>, ln2_b: Tensor<f32, 1, 128>,
-    fc: Dense<f32, 128, 512>, proj: Dense<f32, 512, 128>
+    ln1_g: Tensor<f32, 1, WIDTH>, ln1_b: Tensor<f32, 1, WIDTH>,
+    wq: Dense<f32, WIDTH, WIDTH>, wk: Dense<f32, WIDTH, WIDTH>, wv: Dense<f32, WIDTH, WIDTH>, wo: Dense<f32, WIDTH, WIDTH>,
+    ln2_g: Tensor<f32, 1, WIDTH>, ln2_b: Tensor<f32, 1, WIDTH>,
+    fc: Dense<f32, WIDTH, MLP>, proj: Dense<f32, MLP, WIDTH>
 }
 impl Trainable<Block> {}
 
 struct Gpt {
-    tok: Tensor<f32, 104, 128>, pos: Tensor<f32, 128, 128>,
-    b1: Block, b2: Block, b3: Block, b4: Block,
-    lnf_g: Tensor<f32, 1, 128>, lnf_b: Tensor<f32, 1, 128>,
-    head: Dense<f32, 128, 104>
+    tok: Tensor<f32, VOCAB, WIDTH>, pos: Tensor<f32, CONTEXT, WIDTH>,
+    b1: Block, b2: Block, b3: Block, b4: Block, b5: Block, b6: Block,
+    lnf_g: Tensor<f32, 1, WIDTH>, lnf_b: Tensor<f32, 1, WIDTH>,
+    head: Dense<f32, WIDTH, VOCAB>
 }
 impl Trainable<Gpt> {}
 
-fn ones() -> Tensor<f32, 1, 128> { [for i in 0..1: [for j in 0..128: 1.0]] }
+// The model's size, for the host to name its checkpoint directory (`main.rs`).
+export fn gpt_width() -> i32 { WIDTH }
+export fn gpt_layers() -> i32 { 6 }
+
+fn ones() -> Tensor<f32, 1, WIDTH> { [for i in 0..1: [for j in 0..WIDTH: 1.0]] }
 
 fn new_block() -> Block {
     Block(
@@ -161,100 +179,127 @@ fn new_block() -> Block {
 fn new_gpt() -> Gpt {
     Gpt(
         tok: Init::xavier(), pos: Init::xavier(),
-        b1: new_block(), b2: new_block(), b3: new_block(), b4: new_block(),
+        b1: new_block(), b2: new_block(), b3: new_block(), b4: new_block(), b5: new_block(), b6: new_block(),
         lnf_g: ones(), lnf_b: Ring::zero(),
         head: Init::xavier()
     )
 }
 
-// Row `k` of a batch is position `k mod 128` of its sequence.
-fn positions() -> [i32; 4096] { [for k in 0..4096: k - (k / 128) * 128] }
+// Row `k` of a batch is position `k mod CONTEXT` of its sequence.
+fn positions() -> [i32; ROWS] { [for k in 0..ROWS: k - (k / CONTEXT) * CONTEXT] }
 
-fn block<const N: i32>(x: Tensor<f32, N, 128>, b: Block) -> Tensor<f32, N, 128> {
+// Not inlined: called six times per forward pass, each call a whole block of work, compiled once
+// per row count instead of six times (the training gradient is synthesized from its body by the
+// e-graph, unaffected).
+#[no_inline]
+fn block<const N: i32>(x: Tensor<f32, N, WIDTH>, b: Block) -> Tensor<f32, N, WIDTH> {
     let h = layer_norm(x, b.ln1_g, b.ln1_b);
-    let a = causal_attention(b.wq.dense_forward(h), b.wk.dense_forward(h), b.wv.dense_forward(h), AttentionShape::<128, 32>());
+    let a = causal_attention(b.wq.dense_forward(h), b.wk.dense_forward(h), b.wv.dense_forward(h), AttentionShape::<CONTEXT, HEAD>());
     let x2 = x + b.wo.dense_forward(a);
     x2 + b.proj.dense_forward(gelu(b.fc.dense_forward(layer_norm(x2, b.ln2_g, b.ln2_b))))
 }
 
-// Any number of rows `N`, whole sequences of 128: a training batch (4096), or the one sequence
-// generation reads (128).
-fn gpt_logits<const N: i32>(x: [i32; N], p: [i32; N], m: Gpt) -> Tensor<f32, N, 104> {
+// Any number of rows `N`, whole sequences of `CONTEXT`: a training batch (`ROWS`), or the one
+// sequence generation reads (`CONTEXT`).
+fn gpt_logits<const N: i32>(x: [i32; N], p: [i32; N], m: Gpt) -> Tensor<f32, N, VOCAB> {
     let h0 = embed(m.tok, x) + embed(m.pos, p);
-    let h = block(block(block(block(h0, m.b1), m.b2), m.b3), m.b4);
+    let h = block(block(block(block(block(block(h0, m.b1), m.b2), m.b3), m.b4), m.b5), m.b6);
     m.head.dense_forward(layer_norm(h, m.lnf_g, m.lnf_b))
 }
 
-fn gpt_loss(x: [i32; 4096], y: [i32; 4096], p: [i32; 4096], m: Gpt) -> f32 {
+fn gpt_loss(x: [i32; ROWS], y: [i32; ROWS], p: [i32; ROWS], m: Gpt) -> f32 {
     sparse_cross_entropy(gpt_logits(x, p, m), y)
 }
 
 gpt_grad = grad(gpt_loss, m);
 
-fn gpt_validation_loss(m: Gpt, p: [i32; 4096], batches: i32) -> f32 {
+fn gpt_validation_loss(m: Gpt, p: [i32; ROWS], batches: i32) -> f32 {
     let mut total: f64 = 0.0;
     for s in 0..batches { total = total + gpt_loss(val_inputs(s), val_targets(s), p, m).to(); };
-    (total / (batches * 4096).to()).to()
+    (total / (batches * ROWS).to()).to()
 }
 
+// The loss on training batches `first..first + batches` (the round's last ones, just trained on):
+// next to the validation loss, whether the model under- or over-fits.
+fn gpt_train_loss(m: Gpt, p: [i32; ROWS], first: i32, batches: i32) -> f32 {
+    let mut total: f64 = 0.0;
+    for s in first..first + batches { total = total + gpt_loss(train_inputs(s), train_targets(s), p, m).to(); };
+    (total / (batches * ROWS).to()).to()
+}
+
+fn learning_rate(s: i32, base: f32) -> f32 {
+    if s < WARMUP {
+        base * (s + 1).to() / WARMUP.to()
+    } else {
+        let t: f32 = (s - WARMUP).to() / (DECAY_STEPS - WARMUP).to();
+        if t < 1.0 { base * (1.0 - 0.9 * t) } else { base * 0.1 }
+    }
+}
+
+// The end of a round, for the host to report with timings (`main.rs`).
+extern fn round_done(step: i32, train_loss: f32, validation_loss: f32, rate: f32);
+
 // Writes the initial weights to `gpt_init.ckpt` for the twin, trains `rounds` of `per_round` Adam
-// steps starting at step `first` (batches are a function of the step, so a resumed run continues
-// the same sequence), checkpointing the model, optimizer state and random generator to `gpt.ckpt`
-// after each round.
+// steps starting at step `first` (batches and learning rate are functions of the step, so a
+// resumed run continues the same sequence), checkpointing the model, optimizer state and random
+// generator to `gpt.ckpt` after each round. Checkpoints live in the working directory, one per
+// model size (`main.rs`).
 export fn train_gpt(first: i32, rounds: i32, per_round: i32, lr: f32, seed: i64, resume: bool) -> f32 {
     rand_seed(seed);
     let p = positions();
-    let opt = Adam(lr: lr, beta1: 0.9, beta2: 0.999, eps: 0.00000001);
+    let opt0 = Adam(lr: lr, beta1: 0.9, beta2: 0.999, eps: 0.00000001);
     let fresh = new_gpt();
     let mut m = fresh;
-    let mut state = init_state(opt, fresh);
+    let mut state = init_state(opt0, fresh);
     if resume {
-        let (rm, rs, rseed) = restore("gpt.ckpt", (fresh, init_state(opt, fresh), 0:i64));
+        let (rm, rs, rseed) = restore("gpt.ckpt", (fresh, init_state(opt0, fresh), 0:i64));
         m = rm;
         state = rs;
         rand_seed(rseed);
     } else {
         save("gpt_init.ckpt", m);
     };
-    println(("step ", first, ", validation: ", gpt_validation_loss(m, p, 4)));
+    round_done(first, 0.0, gpt_validation_loss(m, p, 4), learning_rate(first, lr));
     for r in 0..rounds {
         for k in 0..per_round {
             let s = first + r * per_round + k;
+            let opt = Adam(lr: learning_rate(s, lr), beta1: 0.9, beta2: 0.999, eps: 0.00000001);
             (m, state) = step(opt, m, gpt_grad(train_inputs(s), train_targets(s), p, m), state);
         };
         save("gpt.ckpt", (m, state, rand_state()));
-        println(("step ", first + (r + 1) * per_round, ", validation: ", gpt_validation_loss(m, p, 4)));
+        let next = first + (r + 1) * per_round;
+        round_done(next, gpt_train_loss(m, p, next - 4, 4), gpt_validation_loss(m, p, 4), learning_rate(next, lr));
     };
     gpt_validation_loss(m, p, 20)
 }
 
 // ------------------------------------------------------------------ generation
 
-// The prompt, encoded by the host (`main.rs`), left-aligned in a context of 128; its length.
-extern fn prompt_ids() -> [i32; 128];
+// The prompt, encoded by the host (`main.rs`), left-aligned in a context of `CONTEXT`; its length.
+extern fn prompt_ids() -> [i32; CONTEXT];
 extern fn prompt_len() -> i32;
 // Prints one generated character.
 extern fn emit_char(c: i32);
 
 // Continues the prompt for `count` characters with the model saved in `gpt.ckpt`, each drawn from
-// the next-character distribution at `temperature`. The context slides once it holds 128.
+// the next-character distribution at `temperature`. The context slides once it holds `CONTEXT`.
 export fn generate(count: i32, temperature: f32, seed: i64) -> i32 {
     let opt = Adam(lr: 0.001, beta1: 0.9, beta2: 0.999, eps: 0.00000001);
     let fresh = new_gpt();
     let (m, _, _) = restore("gpt.ckpt", (fresh, init_state(opt, fresh), 0:i64));
     rand_seed(seed);
-    let p: [i32; 128] = [for k in 0..128: k];
+    let p: [i32; CONTEXT] = [for k in 0..CONTEXT: k];
     let mut ctx = prompt_ids();
     let mut len = prompt_len();
     for g in 0..count {
         let c = sample_row(gpt_logits(ctx, p, m), len - 1, temperature);
         emit_char(c);
-        if len < 128 {
+        if len < CONTEXT {
             ctx[len] = c;
             len = len + 1;
         } else {
-            for k in 0..127 { ctx[k] = ctx[k + 1]; };
-            ctx[127] = c;
+            for k in 0..CONTEXT - 1 { ctx[k] = ctx[k + 1]; };
+            ctx[CONTEXT - 1] = c;
         };
     };
     count

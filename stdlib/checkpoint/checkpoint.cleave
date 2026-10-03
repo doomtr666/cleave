@@ -101,11 +101,16 @@ impl Checkpoint<i64> {
     fn restore_part(f, like) { cleave_ckpt_read_i64(f) }
 }
 
+// The leaves below are out of line (`#[no_inline]`): a model has a hundred of them in a handful of
+// shapes, and inlined, each copy of the glue (buffer, descriptor, shape) landed in every function
+// saving or restoring the model.
 impl<const N: i32> Checkpoint<Tensor<f32, N>> {
+    #[no_inline]
     fn save_part(f, x) {
         let data: [f32; N] = mlir::bufferization::to_buffer(x);
         write_f32s(f, 1, N, 0, 0, data);
     }
+    #[no_inline]
     fn restore_part(f, like) {
         let mut data: [f32; N] = mlir::memref::alloc();
         read_f32s(f, 1, N, 0, 0, data);
@@ -114,10 +119,12 @@ impl<const N: i32> Checkpoint<Tensor<f32, N>> {
 }
 
 impl<const R: i32, const C: i32> Checkpoint<Tensor<f32, R, C>> {
+    #[no_inline]
     fn save_part(f, x) {
         let data: [f32; R, C] = mlir::bufferization::to_buffer(x);
         write_f32s(f, 2, R, C, 0, data);
     }
+    #[no_inline]
     fn restore_part(f, like) {
         let mut data: [f32; R, C] = mlir::memref::alloc();
         read_f32s(f, 2, R, C, 0, data);
@@ -147,12 +154,14 @@ impl<M: Trainable> Checkpoint<M> {
 }
 
 impl<T: Float, const Dims...: i32> Checkpoint<AdamState<T, Dims...>> {
+    #[no_inline]
     fn save_part(f, s) {
         save_part(f, s.m);
         save_part(f, s.v);
         save_part(f, s.beta1_pow);
         save_part(f, s.beta2_pow);
     }
+    #[no_inline]
     fn restore_part(f, like) {
         AdamState::<T, Dims...>(
             m: restore_part(f, like.m),
