@@ -1787,6 +1787,7 @@ fn check_mutability_block(block: &Block, scope: &HashMap<String, bool>) -> Resul
     let mut scope = scope.clone();
     for stmt in &block.stmts {
         match &stmt.kind {
+            StmtKind::Sync => {}
             StmtKind::Let {
                 mutable,
                 name,
@@ -1826,6 +1827,7 @@ fn check_mutability_block(block: &Block, scope: &HashMap<String, bool>) -> Resul
 
 fn check_mutability_expr(expr: &Expr, scope: &HashMap<String, bool>) -> Result<(), TypeError> {
     match &expr.kind {
+        ExprKind::Spawn(call) => check_mutability_expr(call, scope),
         ExprKind::NumberLit { .. }
         | ExprKind::ImaginaryLit { .. }
         | ExprKind::BoolLit(_)
@@ -6208,6 +6210,7 @@ impl<'r> Infer<'r> {
         let mut env = env.clone();
         for stmt in &block.stmts {
             match &stmt.kind {
+                StmtKind::Sync => {}
                 StmtKind::Let {
                     mutable,
                     name,
@@ -6374,6 +6377,9 @@ impl<'r> Infer<'r> {
 
     fn infer_expr_kind(&mut self, env: &Env, expr: &Expr) -> Result<Ty, TypeError> {
         match &expr.kind {
+            // The call's own type: the future is invisible to typing
+            // (`doc/plan-spawn.md`, §1).
+            ExprKind::Spawn(call) => self.infer_expr(env, call),
             ExprKind::NumberLit { suffix, text } => match suffix {
                 Some(s) => Ok(Ty::Con(s.clone())),
                 None => {

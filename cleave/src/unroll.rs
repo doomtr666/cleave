@@ -122,6 +122,7 @@ pub fn prune_constant_ifs(program: &mut Program) {
 pub(crate) fn prune_block(b: &mut Block) {
     for s in &mut b.stmts {
         match &mut s.kind {
+            StmtKind::Sync => {}
             StmtKind::Let { value, .. } => prune_expr(value),
             StmtKind::Assign { target, value } => {
                 prune_expr(target);
@@ -166,6 +167,7 @@ fn prune_expr(e: &mut Expr) {
         }
     }
     match &mut e.kind {
+        ExprKind::Spawn(call) => prune_expr(call),
         ExprKind::NumberLit { .. }
         | ExprKind::ImaginaryLit { .. }
         | ExprKind::BoolLit(_)
@@ -269,6 +271,7 @@ fn any_expr_in_block(block: &Block, pred: &mut dyn FnMut(&Expr) -> bool) -> bool
         StmtKind::Assign { target, value } => any_expr(target, pred) || any_expr(value, pred),
         StmtKind::Expr(e) => any_expr(e, pred),
         StmtKind::Break(v) => v.as_ref().is_some_and(|v| any_expr(v, pred)),
+        StmtKind::Sync => false,
     }) || block.tail.as_deref().is_some_and(|t| any_expr(t, pred))
 }
 
@@ -282,6 +285,7 @@ fn any_expr(e: &Expr, pred: &mut dyn FnMut(&Expr) -> bool) -> bool {
         | ExprKind::BoolLit(_)
         | ExprKind::Path(_)
         | ExprKind::PackRef(_) => false,
+        ExprKind::Spawn(call) => any_expr(call, pred),
         ExprKind::Call(_, _, args, _) => args.iter().any(|a| any_expr(a, pred)),
         ExprKind::FieldAccess(b, _) => any_expr(b, pred),
         ExprKind::Index(b, idx) => any_expr(b, pred) || idx.iter().any(|i| any_expr(i, pred)),
@@ -316,6 +320,7 @@ fn any_expr(e: &Expr, pred: &mut dyn FnMut(&Expr) -> bool) -> bool {
 pub(crate) fn unroll_block(block: &mut Block, requests: &HashMap<NodeId, (u64, u64)>, ids: &mut NodeIdGen) {
     for stmt in &mut block.stmts {
         match &mut stmt.kind {
+            StmtKind::Sync => {}
             StmtKind::Let { value, .. } => unroll_expr(value, requests, ids),
             StmtKind::Assign { target, value } => {
                 unroll_expr(target, requests, ids);
@@ -354,6 +359,7 @@ fn unroll_expr(e: &mut Expr, requests: &HashMap<NodeId, (u64, u64)>, ids: &mut N
         }
     }
     match &mut e.kind {
+        ExprKind::Spawn(call) => unroll_expr(call, requests, ids),
         ExprKind::NumberLit { .. }
         | ExprKind::ImaginaryLit { .. }
         | ExprKind::BoolLit(_)
@@ -554,6 +560,7 @@ fn breaks_own_loop(body: &Block) -> bool {
     fn block(b: &Block) -> bool {
         b.stmts.iter().any(|s| match &s.kind {
             StmtKind::Break(_) => true,
+            StmtKind::Sync => false,
             StmtKind::Let { value, .. } => expr(value),
             StmtKind::Assign { value, .. } => expr(value),
             StmtKind::Expr(e) => expr(e),
@@ -587,6 +594,7 @@ fn renumber_block(b: &mut Block, ids: &mut NodeIdGen) {
     for s in &mut b.stmts {
         s.id = ids.next();
         match &mut s.kind {
+            StmtKind::Sync => {}
             StmtKind::Let { value, ty, .. } => {
                 if let Some(t) = ty {
                     renumber_type(t, ids);
@@ -638,6 +646,7 @@ pub(crate) fn renumber_type(t: &mut Type, ids: &mut NodeIdGen) {
 fn renumber_expr(e: &mut Expr, ids: &mut NodeIdGen) {
     e.id = ids.next();
     match &mut e.kind {
+        ExprKind::Spawn(call) => renumber_expr(call, ids),
         ExprKind::NumberLit { .. }
         | ExprKind::ImaginaryLit { .. }
         | ExprKind::BoolLit(_)
@@ -711,6 +720,7 @@ fn renumber_expr(e: &mut Expr, ids: &mut NodeIdGen) {
 fn substitute_block(b: &mut Block, var: &str, k: u64) {
     for s in &mut b.stmts {
         match &mut s.kind {
+            StmtKind::Sync => {}
             StmtKind::Let { name, value, .. } => {
                 substitute_expr(value, var, k);
                 if name == var {
@@ -736,6 +746,7 @@ fn substitute_block(b: &mut Block, var: &str, k: u64) {
 
 fn substitute_expr(e: &mut Expr, var: &str, k: u64) {
     match &mut e.kind {
+        ExprKind::Spawn(call) => substitute_expr(call, var, k),
         ExprKind::Path(p) if p.segments.len() == 1 && p.segments[0] == var => {
             e.kind = ExprKind::NumberLit {
                 text: k.to_string(),

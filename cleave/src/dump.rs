@@ -322,6 +322,9 @@ pub(crate) fn dump_block_with_call_names(
     let pad = "    ".repeat(indent);
     for stmt in &block.stmts {
         match &stmt.kind {
+            StmtKind::Sync => {
+                let _ = writeln!(out, "{pad}sync;");
+            }
             StmtKind::Let {
                 mutable,
                 name,
@@ -401,6 +404,7 @@ fn fmt_expr_typed(
     }
 
     let base = match &e.kind {
+        ExprKind::Spawn(call) => format!("spawn {}", fmt_expr_typed(call, node_types, names, call_names)),
         ExprKind::NumberLit { text, .. } => text.clone(),
         ExprKind::ImaginaryLit { text, .. } => format!("{text}i"),
         ExprKind::BoolLit(b) => b.to_string(),
@@ -549,6 +553,7 @@ fn fmt_block_inline_typed(
         .stmts
         .iter()
         .map(|s| match &s.kind {
+            StmtKind::Sync => "sync;".to_string(),
             StmtKind::Let {
                 mutable,
                 name,

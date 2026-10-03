@@ -389,6 +389,144 @@ fn pool_unlock() {
     POOL_LOCK.store(false, std::sync::atomic::Ordering::Release);
 }
 
+/// Bytes of freed blocks one thread keeps per size class before handing the
+/// excess back to the shared lists (`FREE_LISTS`). In bytes, not blocks: a
+/// class of 16 MiB tensors keeps two, a class of 64-byte structs half a
+/// million.
+const THREAD_CACHE_BYTES: usize = 32 << 20;
+
+fn thread_cache_cap(class: usize) -> usize {
+    (THREAD_CACHE_BYTES / class_bytes(class)).max(1)
+}
+
+/// Each thread's own free lists, in front of the shared `FREE_LISTS`
+/// (which become the depot): an allocation pops from its thread's list
+/// without any lock, a release pushes onto the releasing thread's list. The
+/// shared lock is taken once per batch — refilling an empty list, or giving
+/// back half of one past `thread_cache_cap` — instead of once per call,
+/// which on many threads (`doc/plan-spawn.md`, tasks) would serialize every
+/// allocation on one spinlock. Blocks migrate freely between threads through
+/// the depot; the cap keeps a thread that frees more than it allocates (a
+/// parent receiving its tasks' results) from hoarding. A thread's lists go
+/// back to the depot when it exits.
+struct ThreadCache {
+    head: [std::cell::Cell<*mut u8>; NUM_SIZE_CLASSES],
+    count: [std::cell::Cell<usize>; NUM_SIZE_CLASSES],
+}
+
+impl Drop for ThreadCache {
+    fn drop(&mut self) {
+        for class in 0..NUM_SIZE_CLASSES {
+            let n = self.count[class].get();
+            if n > 0 {
+                unsafe { move_to_depot(&self.head[class], &self.count[class], class, n) };
+            }
+        }
+    }
+}
+
+thread_local! {
+    static THREAD_CACHE: ThreadCache = const {
+        ThreadCache {
+            head: [const { std::cell::Cell::new(std::ptr::null_mut()) }; NUM_SIZE_CLASSES],
+            count: [const { std::cell::Cell::new(0) }; NUM_SIZE_CLASSES],
+        }
+    };
+}
+
+/// Moves `n` blocks from the front of a thread list to the depot, under one
+/// lock.
+///
+/// # Safety
+///
+/// The list holds at least `n` blocks, each at least a pointer in size.
+unsafe fn move_to_depot(head: &std::cell::Cell<*mut u8>, count: &std::cell::Cell<usize>, class: usize, n: usize) {
+    pool_lock();
+    for _ in 0..n {
+        let block = head.get();
+        unsafe {
+            head.set(*(block as *mut *mut u8));
+            *(block as *mut *mut u8) = FREE_LISTS[class];
+            FREE_LISTS[class] = block;
+        }
+    }
+    pool_unlock();
+    count.set(count.get() - n);
+}
+
+/// A cached block of `class`, if any: this thread's list first, then a batch
+/// from the depot.
+fn pool_pop(class: usize) -> Option<*mut u8> {
+    let local = THREAD_CACHE.try_with(|c| unsafe {
+        let head = &c.head[class];
+        let block = head.get();
+        if !block.is_null() {
+            head.set(*(block as *mut *mut u8));
+            c.count[class].set(c.count[class].get() - 1);
+            return Some(block);
+        }
+        // Refill: one block to return, up to half a cache's worth kept.
+        let want = (thread_cache_cap(class) / 2).max(1);
+        let mut first = None;
+        pool_lock();
+        for _ in 0..want {
+            let b = FREE_LISTS[class];
+            if b.is_null() {
+                break;
+            }
+            FREE_LISTS[class] = *(b as *mut *mut u8);
+            if first.is_none() {
+                first = Some(b);
+            } else {
+                *(b as *mut *mut u8) = head.get();
+                head.set(b);
+                c.count[class].set(c.count[class].get() + 1);
+            }
+        }
+        pool_unlock();
+        first
+    });
+    match local {
+        Ok(found) => found,
+        // This thread's cache is already gone (thread exit): the depot alone.
+        Err(_) => unsafe {
+            pool_lock();
+            let b = FREE_LISTS[class];
+            if !b.is_null() {
+                FREE_LISTS[class] = *(b as *mut *mut u8);
+            }
+            pool_unlock();
+            (!b.is_null()).then_some(b)
+        },
+    }
+}
+
+/// Caches the freed `block` of `class`.
+///
+/// # Safety
+///
+/// `block` is a freed block of `class`, owned by no one.
+unsafe fn pool_push(class: usize, block: *mut u8) {
+    let pushed = THREAD_CACHE.try_with(|c| unsafe {
+        *(block as *mut *mut u8) = c.head[class].get();
+        c.head[class].set(block);
+        let n = c.count[class].get() + 1;
+        c.count[class].set(n);
+        let cap = thread_cache_cap(class);
+        if n > cap {
+            move_to_depot(&c.head[class], &c.count[class], class, n - cap / 2);
+        }
+    });
+    if pushed.is_err() {
+        unsafe {
+            pool_lock();
+            *(block as *mut *mut u8) = FREE_LISTS[class];
+            FREE_LISTS[class] = block;
+            pool_unlock();
+        }
+    }
+}
+
 /// Class `c` covers `(2^(c-1), 2^c]` bytes, so `class_bytes(size_class(n))`
 /// is always `>= n` — the usual power-of-two segregated-free-list rounding.
 /// Deliberately generous (64 classes: 64-bit `usize` can never overflow it)
@@ -491,29 +629,11 @@ pub extern "C" fn cleave_alloc_rc(data_size: i64) -> *mut u8 {
         // which never touches `FREE_LISTS` at all and has no reason to
         // serialize against it.
         let popped = if class < NUM_SIZE_CLASSES {
-            pool_lock();
-            let block = FREE_LISTS[class];
-            let popped = if !block.is_null() {
-                // The cached block's own first 8 bytes hold the next link
-                // (`FREE_LISTS`'s own doc comment) -- read it before this
-                // block's contents get overwritten by the `RcHeader` write
-                // below.
-                FREE_LISTS[class] = *(block as *mut *mut u8);
-                Some(block)
-            } else {
-                None
-            };
-            // Debug-only `PARKED` bookkeeping done *inside* the same
-            // critical section as the real `FREE_LISTS` mutation above --
-            // found necessary the hard way (`doc/backlog-done.md`'s own
-            // pool-allocator entry): doing it outside races a concurrent
-            // OpenMP-worker pop/push of the identical block and reports
-            // spurious "not parked" false positives that have nothing to
-            // do with the real allocator. (Tried, then reverted, as an
-            // always-on production safety net -- see `cleave_release`'s
-            // own doc comment for the real cost that made it not worth it
-            // -- `CLEAVE_COUNT_PARKED_HITS` accepts that identical cost on
-            // purpose, for one bounded diagnostic run.)
+            let popped = pool_pop(class);
+            // Debug-only `PARKED` bookkeeping: the popped block now belongs
+            // to this thread alone, so no other thread can push or pop it
+            // while this runs (`pool_push` marks a block parked *before*
+            // caching it, for the same reason).
             if *CLEAVE_DEBUG_POOL || *CLEAVE_COUNT_PARKED_HITS {
                 if let Some(block) = popped {
                     if !parked_remove(block as usize) && *CLEAVE_DEBUG_POOL {
@@ -523,7 +643,6 @@ pub extern "C" fn cleave_alloc_rc(data_size: i64) -> *mut u8 {
                     }
                 }
             }
-            pool_unlock();
             popped
         } else {
             None
@@ -595,8 +714,23 @@ pub unsafe extern "C" fn cleave_retain(ptr: *mut u8) {
                 first_cleave_frame()
             );
         }
-        (*header).refcount += 1;
+        refcount_of(header).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+/// `header`'s refcount as an atomic: atomic because `spawn`'s tasks
+/// (`doc/plan-spawn.md`) share objects across threads. The field stays a
+/// plain `i64` in `RcHeader` (initialized non-atomically at allocation, before
+/// the block is visible to anyone else); every later access goes through here.
+/// The orderings are `Arc`'s: an increment needs none (whoever increments
+/// already holds a reference), a decrement publishes this thread's writes
+/// (`Release`), and the thread that frees takes them all (`Acquire`).
+///
+/// # Safety
+///
+/// `header` must be a live block's header.
+unsafe fn refcount_of<'a>(header: *mut RcHeader) -> &'a std::sync::atomic::AtomicI64 {
+    unsafe { std::sync::atomic::AtomicI64::from_ptr(std::ptr::addr_of_mut!((*header).refcount)) }
 }
 
 /// Decrements `ptr`'s own refcount; once it reaches zero, actually frees the
@@ -738,8 +872,8 @@ pub unsafe extern "C" fn cleave_release(ptr: *mut u8) -> bool {
                 cleave_frames()
             );
         }
-        (*header).refcount -= 1;
-        if (*header).refcount == 0 {
+        if refcount_of(header).fetch_sub(1, std::sync::atomic::Ordering::Release) == 1 {
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
             // Arena-backed (`cleave_alloc_rc`'s own doc comment): never
             // individually freed here — the matching `cleave_region_exit`
             // reclaims it in bulk, along with everything else allocated
@@ -759,9 +893,7 @@ pub unsafe extern "C" fn cleave_release(ptr: *mut u8) -> bool {
                     // for this block (`cleave_alloc_rc`'s own symmetric
                     // rounding), so writing the free-list "next" pointer
                     // into its first 8 bytes is always in-bounds.
-                    pool_lock();
-                    *(base as *mut *mut u8) = FREE_LISTS[class];
-                    FREE_LISTS[class] = base;
+
                     // TEMP, tried as an always-on safety net (not just `CLEAVE_
                     // DEBUG_POOL`-gated), then reverted: a global `Mutex<
                     // HashSet>` touched on *every* alloc/release, not just
@@ -780,7 +912,7 @@ pub unsafe extern "C" fn cleave_release(ptr: *mut u8) -> bool {
                     if (*CLEAVE_DEBUG_POOL || *CLEAVE_COUNT_PARKED_HITS) && !parked_insert(base as usize) && *CLEAVE_DEBUG_POOL {
                         eprintln!("CLEAVE_DEBUG_POOL: block {base:p} parked twice (double-free)");
                     }
-                    pool_unlock();
+                    pool_push(class, base);
                 } else {
                     // Astronomically large (`class >= 64`, i.e. `total >
                     // 2^63`) -- can't happen with a real `i64 data_size`,
@@ -798,15 +930,10 @@ pub unsafe extern "C" fn cleave_release(ptr: *mut u8) -> bool {
     }
 }
 
-/// Total bytes reserved for the CPU-backend arena (`doc/hld.md`'s own
-/// "Memory management" section: "one large reserved VM region... pages
-/// committed lazily, exactly like an ordinary thread's own call stack").
-/// A real OS-level `VirtualAlloc`-style lazy-commit reservation is the
-/// eventual target (matching that section's own wording exactly) — this
-/// first cut allocates the whole capacity eagerly, through the ordinary
-/// system allocator, the simplest correct thing that already gives every
-/// `cleave_region_enter`/`cleave_alloc_local`/`cleave_region_exit` call
-/// below a real, working backing store to test against. 256 MiB: bigger
+/// Bytes of one thread's arena (`doc/hld.md`'s own "Memory management"
+/// section: "one large reserved VM region... pages committed lazily").
+/// Reserved as address space once for every thread (`ARENA_SLOTS`, below),
+/// each thread's slice committed whole when it first opens a region. 256 MiB: bigger
 /// than any single training-loop iteration's own local footprint this
 /// project's own real workload (`examples/mnist-interop`, per-sample
 /// tensors well under a megabyte) plausibly needs — a real number to
@@ -816,110 +943,158 @@ pub unsafe extern "C" fn cleave_release(ptr: *mut u8) -> bool {
 /// whatever memory happens to sit past the reserved region.
 const ARENA_CAPACITY: usize = 256 * 1024 * 1024;
 
-/// The arena's own base address, lazily allocated on first use —
-/// `AtomicUsize` (an address, not a `*mut u8`) purely so this can be a
-/// `static` at all (raw pointers aren't `Sync`) — the same reasoning
-/// `PCG_STATE`'s own doc comment gives for using an atomic type here
-/// despite this runtime being single-threaded by design throughout
-/// (`doc/hld.md`'s own "Threading" paragraph, which explicitly names this
-/// exact region/pool/refcount scheme as staying non-atomic by design):
-/// `Ordering::Relaxed` everywhere below, no real concurrency, just a
-/// `Sync`-satisfying container for otherwise-plain mutable state.
-static ARENA_BASE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-/// Byte offset of the arena's own current bump cursor, relative to
-/// `ARENA_BASE` — `cleave_region_enter`/`cleave_alloc_local`/`cleave_
-/// region_exit` below are the only three operations that ever touch it.
-static ARENA_CURSOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-/// How many `cleave_region_enter` calls are currently open, without a
-/// matching `cleave_region_exit` yet. **Not** consulted by `cleave_alloc_
-/// rc` (that function's own doc comment has the real design reasoning why
-/// not) — this exists purely so `cleave_alloc_local` can debug-assert it's
-/// never emitted at a site with no region actually open, a real compiler-
-/// bug detector, not a runtime branch point. A *count*, not a bool,
-/// because regions nest (`rc_tests`'s own nesting coverage, below) — an
-/// inner `region_exit`, with an outer region still open, must leave this
-/// above zero.
-static REGION_DEPTH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The arenas: one per thread, each a `ARENA_CAPACITY` slice of one address
+/// range reserved once for all of them (`ARENA_SLOTS` slices, reserved, not
+/// committed: no memory is used until a thread opens its first region and
+/// commits its own slice). Per thread because a region is a stack discipline
+/// (`cleave_region_exit` rewinds the cursor to its `cleave_region_enter`
+/// handle): with one global arena, a `spawn` task on another thread
+/// (`doc/plan-spawn.md`) would rewind over this thread's live allocations.
+/// One reserved range, rather than one allocation per thread, keeps
+/// `is_in_arena` a single bounds check, whichever thread allocated the block
+/// and whichever releases it. A thread hands its slice back when it exits
+/// (the test harnesses start a thread per test), committed memory kept for
+/// the next one.
+const ARENA_SLOTS: usize = 256;
 
-/// Returns the arena's own base address, allocating the whole reserved
-/// region on the very first call (from whichever of the three arena
-/// functions below runs first — deliberately not tied to process startup,
-/// so a program that never uses the arena at all never pays for it).
+static ARENA_RESERVATION: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static FREE_ARENA_SLOTS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+static NEXT_ARENA_SLOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// This thread's arena: its slice's base (0 until its first region), the bump
+/// cursor (an offset into the slice) and the number of open regions.
+struct ThreadArena {
+    base: std::cell::Cell<usize>,
+    cursor: std::cell::Cell<usize>,
+    depth: std::cell::Cell<usize>,
+}
+
+impl Drop for ThreadArena {
+    fn drop(&mut self) {
+        let base = self.base.get();
+        if base != 0 {
+            let slot = (base - arena_reservation()) / ARENA_CAPACITY;
+            FREE_ARENA_SLOTS.lock().unwrap_or_else(|e| e.into_inner()).push(slot);
+        }
+    }
+}
+
+thread_local! {
+    static ARENA: ThreadArena = const {
+        ThreadArena {
+            base: std::cell::Cell::new(0),
+            cursor: std::cell::Cell::new(0),
+            depth: std::cell::Cell::new(0),
+        }
+    };
+}
+
+#[cfg(windows)]
+mod arena_memory {
+    const MEM_COMMIT: u32 = 0x1000;
+    const MEM_RESERVE: u32 = 0x2000;
+    const PAGE_NOACCESS: u32 = 0x01;
+    const PAGE_READWRITE: u32 = 0x04;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn VirtualAlloc(address: *mut std::ffi::c_void, size: usize, kind: u32, protect: u32) -> *mut std::ffi::c_void;
+    }
+    pub fn reserve(size: usize) -> usize {
+        let p = unsafe { VirtualAlloc(std::ptr::null_mut(), size, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!p.is_null(), "cleave arena: reserving {size} bytes of address space failed");
+        p as usize
+    }
+    pub fn commit(base: usize, size: usize) {
+        let p = unsafe { VirtualAlloc(base as *mut _, size, MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!p.is_null(), "cleave arena: committing {size} bytes failed");
+    }
+}
+
+#[cfg(unix)]
+mod arena_memory {
+    const PROT_READ: i32 = 1;
+    const PROT_WRITE: i32 = 2;
+    const MAP_PRIVATE: i32 = 0x02;
+    #[cfg(target_os = "macos")]
+    const MAP_ANONYMOUS: i32 = 0x1000;
+    #[cfg(not(target_os = "macos"))]
+    const MAP_ANONYMOUS: i32 = 0x20;
+    #[cfg(target_os = "linux")]
+    const MAP_NORESERVE: i32 = 0x4000;
+    #[cfg(not(target_os = "linux"))]
+    const MAP_NORESERVE: i32 = 0;
+    unsafe extern "C" {
+        fn mmap(addr: *mut std::ffi::c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut std::ffi::c_void;
+    }
+    /// Readable and writable from the start: pages are only backed when
+    /// touched, so committing is a no-op.
+    pub fn reserve(size: usize) -> usize {
+        let p = unsafe {
+            mmap(std::ptr::null_mut(), size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0)
+        };
+        assert!(p as isize != -1, "cleave arena: reserving {size} bytes of address space failed");
+        p as usize
+    }
+    pub fn commit(_base: usize, _size: usize) {}
+}
+
+fn arena_reservation() -> usize {
+    *ARENA_RESERVATION.get_or_init(|| arena_memory::reserve(ARENA_SLOTS * ARENA_CAPACITY))
+}
+
+/// This thread's arena slice, taking and committing one on first use.
 fn arena_base() -> *mut u8 {
-    use std::sync::atomic::Ordering::Relaxed;
-    let existing = ARENA_BASE.load(Relaxed);
-    if existing != 0 {
-        return existing as *mut u8;
-    }
-    let layout =
-        std::alloc::Layout::from_size_align(ARENA_CAPACITY, 64).expect("cleave_region_enter: invalid arena layout");
-    let base = unsafe { std::alloc::alloc(layout) };
-    assert!(!base.is_null(), "cleave_region_enter: arena allocation failed");
-    ARENA_BASE.store(base as usize, Relaxed);
-    base
+    ARENA.with(|a| {
+        if a.base.get() == 0 {
+            let reused = FREE_ARENA_SLOTS.lock().unwrap_or_else(|e| e.into_inner()).pop();
+            let base = match reused {
+                Some(slot) => arena_reservation() + slot * ARENA_CAPACITY,
+                None => {
+                    let slot = NEXT_ARENA_SLOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    assert!(slot < ARENA_SLOTS, "cleave arena: more than {ARENA_SLOTS} threads with an open region");
+                    let base = arena_reservation() + slot * ARENA_CAPACITY;
+                    arena_memory::commit(base, ARENA_CAPACITY);
+                    base
+                }
+            };
+            a.base.set(base);
+            a.cursor.set(0);
+        }
+        a.base.get() as *mut u8
+    })
 }
 
-/// Bumps `size` bytes off the arena's own cursor, aligned to `align` (a
-/// power of two: 16, or `VECTOR_ALIGN` for a block whose data needs it --
-/// `cleave_alloc_local`, the same rule `cleave_alloc_rc` follows) — bumps
-/// the cursor forward, returns the pre-bump address. The one real bump-
-/// allocation primitive: `cleave_alloc_local` (`doc/hld.md`'s own named
-/// entry point) is this function's only caller.
 fn arena_bump(size: usize, align: usize) -> *mut u8 {
-    use std::sync::atomic::Ordering::Relaxed;
     let base = arena_base();
-    let cursor = ARENA_CURSOR.load(Relaxed);
-    let aligned = (cursor + align - 1) & !(align - 1);
-    let new_cursor = aligned + size;
-    assert!(
-        new_cursor <= ARENA_CAPACITY,
-        "cleave arena exhausted ({new_cursor} > {ARENA_CAPACITY} bytes) -- \
-         a real overflow path (grow, or fall back to the ordinary allocator) is not built yet"
-    );
-    ARENA_CURSOR.store(new_cursor, Relaxed);
-    unsafe { base.add(aligned) }
+    ARENA.with(|a| {
+        let cursor = a.cursor.get();
+        let aligned = (cursor + align - 1) & !(align - 1);
+        let new_cursor = aligned + size;
+        assert!(
+            new_cursor <= ARENA_CAPACITY,
+            "cleave arena exhausted ({new_cursor} > {ARENA_CAPACITY} bytes) -- \
+             a real overflow path (grow, or fall back to the ordinary allocator) is not built yet"
+        );
+        a.cursor.set(new_cursor);
+        unsafe { base.add(aligned) }
+    })
 }
 
-/// Whether `ptr` falls inside the arena's own reserved address range —
-/// `cleave_release`'s own arena-vs-heap decision (its own doc comment).
-/// `ARENA_BASE == 0` (the arena has never been used at all in this
-/// process) short-circuits to `false` directly, rather than comparing
-/// against a base of `0` — a real heap pointer is never `0`, but relying
-/// on that coincidence instead of checking explicitly would be the kind
-/// of "probably fine" this codebase's own established discipline avoids.
+/// Whether `ptr` lies in any thread's arena: one bounds check on the shared
+/// reservation.
 fn is_in_arena(ptr: *mut u8) -> bool {
-    use std::sync::atomic::Ordering::Relaxed;
-    let base = ARENA_BASE.load(Relaxed);
-    if base == 0 {
-        return false;
-    }
+    let Some(&base) = ARENA_RESERVATION.get() else { return false };
     let addr = ptr as usize;
-    addr >= base && addr < base + ARENA_CAPACITY
+    addr >= base && addr < base + ARENA_SLOTS * ARENA_CAPACITY
 }
 
-/// `doc/hld.md`'s own `region_enter(size) -> handle` — the CPU backend for
-/// it ("`region_enter`/`region_exit` as pointer arithmetic... exactly like
-/// an ordinary thread's own call stack", same section). `size` is accepted
-/// (matching that interface's own signature — a future caller may want to
-/// pre-validate against it) but not consumed by one eager bump here:
-/// `cleave_alloc_local` below does the actual per-value bumping, each call
-/// already knowing its own exact size, and nothing between `region_enter`/
-/// `region_exit` needs `size` for anything else yet. The *handle* returned
-/// is simply the cursor's own value at entry — `cleave_region_exit`
-/// rewinds straight back to it, discarding everything allocated since,
-/// unconditionally, matching the region scheme's own "provably dead the
-/// instant the tail call fires" premise (`doc/hld.md`, same section):
-/// nothing is meant to call `cleave_region_enter` for a value the compiler
-/// hasn't already proven doesn't escape past the matching `region_exit`.
-/// A plain `i64` offset, not a pointer — an arena that later grows (or
-/// moves) can still honor an old handle; a raw `*mut u8` captured before a
-/// hypothetical reallocation couldn't.
 #[unsafe(no_mangle)]
 pub extern "C" fn cleave_region_enter(_size: i64) -> i64 {
-    use std::sync::atomic::Ordering::Relaxed;
     arena_base();
-    REGION_DEPTH.fetch_add(1, Relaxed);
-    ARENA_CURSOR.load(Relaxed) as i64
+    ARENA.with(|a| {
+        a.depth.set(a.depth.get() + 1);
+        a.cursor.get() as i64
+    })
 }
 
 /// `doc/hld.md`'s own `alloc_local(handle, size) -> ptr` — carves `size`
@@ -963,9 +1138,8 @@ pub extern "C" fn cleave_region_enter(_size: i64) -> i64 {
 /// is to keep it in an ordinary Rust function `cleave_alloc_local` merely
 /// calls into.
 fn assert_region_open() {
-    use std::sync::atomic::Ordering::Relaxed;
     assert!(
-        REGION_DEPTH.load(Relaxed) > 0,
+        ARENA.with(|a| a.depth.get()) > 0,
         "cleave_alloc_local called with no region open -- a real compiler bug, \
          never a legitimate runtime condition"
     );
@@ -998,9 +1172,10 @@ pub extern "C" fn cleave_alloc_local(_handle: i64, size: i64) -> *mut u8 {
 /// region.
 #[unsafe(no_mangle)]
 pub extern "C" fn cleave_region_exit(handle: i64) {
-    use std::sync::atomic::Ordering::Relaxed;
-    ARENA_CURSOR.store(handle as usize, Relaxed);
-    REGION_DEPTH.fetch_sub(1, Relaxed);
+    ARENA.with(|a| {
+        a.cursor.set(handle as usize);
+        a.depth.set(a.depth.get() - 1);
+    });
 }
 
 /// `cleave_release`'s own `bool` result ("did this call actually free the
@@ -1069,16 +1244,7 @@ pub extern "C" fn cleave_alloc_pool(data_size: i64) -> *mut u8 {
     let class = size_class(total);
     unsafe {
         let popped = if class < NUM_SIZE_CLASSES {
-            pool_lock();
-            let block = FREE_LISTS[class];
-            let popped = if !block.is_null() {
-                FREE_LISTS[class] = *(block as *mut *mut u8);
-                Some(block)
-            } else {
-                None
-            };
-            pool_unlock();
-            popped
+            pool_pop(class)
         } else {
             None
         };
@@ -1109,10 +1275,7 @@ pub unsafe extern "C" fn cleave_release_pool(ptr: *mut u8, data_size: i64) {
     let class = size_class(total);
     unsafe {
         if class < NUM_SIZE_CLASSES {
-            pool_lock();
-            *(ptr as *mut *mut u8) = FREE_LISTS[class];
-            FREE_LISTS[class] = ptr;
-            pool_unlock();
+            pool_push(class, ptr);
         } else {
             let layout = std::alloc::Layout::from_size_align(class_bytes(class), class_align(class))
                 .expect("cleave_release_pool: invalid layout");
@@ -2196,5 +2359,108 @@ mod rand_tests {
         assert!(mean.abs() < 0.2, "sample mean {mean} too far from 0");
         assert!(draws.iter().any(|&x| x < -0.5));
         assert!(draws.iter().any(|&x| x > 0.5));
+    }
+}
+
+#[cfg(test)]
+mod arena_thread_tests {
+    use super::*;
+
+    /// Regions opened and closed on several threads at once each keep their
+    /// own allocations: a thread's `cleave_region_exit` rewinds its own arena,
+    /// never another thread's (`ARENA`). With one global arena, a thread's
+    /// exit rewound the shared cursor under the others' live blocks, and
+    /// their next allocations overwrote them.
+    #[test]
+    fn regions_on_several_threads_dont_overwrite_each_other() {
+        let threads: Vec<_> = (0..8u8)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    for round in 0..200u32 {
+                        let outer = cleave_region_enter(0);
+                        let a = cleave_alloc_local(outer, 4096);
+                        unsafe { std::ptr::write_bytes(a, t, 4096) };
+                        for _ in 0..4 {
+                            let inner = cleave_region_enter(0);
+                            let b = cleave_alloc_local(inner, 1024);
+                            unsafe { std::ptr::write_bytes(b, t ^ 0xff, 1024) };
+                            std::thread::yield_now();
+                            cleave_region_exit(inner);
+                        }
+                        let intact = unsafe { std::slice::from_raw_parts(a, 4096) }.iter().all(|&x| x == t);
+                        assert!(intact, "thread {t}, round {round}: a block was overwritten");
+                        assert!(is_in_arena(a));
+                        cleave_region_exit(outer);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("a thread failed");
+        }
+    }
+}
+
+#[cfg(test)]
+mod pool_thread_tests {
+    use super::*;
+
+    /// The pool under several threads: each allocates blocks of mixed sizes,
+    /// fills each with its own pattern, and hands half of them to the next
+    /// thread to release — blocks migrate between thread caches and through
+    /// the depot. A block handed out twice while live would show up as an
+    /// overwritten pattern.
+    #[test]
+    fn the_pool_hands_out_each_block_once_across_threads() {
+        const THREADS: usize = 8;
+        let (senders, receivers): (Vec<_>, Vec<_>) =
+            (0..THREADS).map(|_| std::sync::mpsc::channel::<(usize, u8, usize)>()).unzip();
+        let handles: Vec<_> = receivers
+            .into_iter()
+            .enumerate()
+            .map(|(t, rx)| {
+                let next = senders[(t + 1) % THREADS].clone();
+                std::thread::spawn(move || {
+                    let mut live: Vec<(*mut u8, u8, usize)> = Vec::new();
+                    for i in 0..4000usize {
+                        let size = [24usize, 200, 3000, 70_000][i % 4];
+                        let tag = ((t * 31 + i) % 251) as u8;
+                        let p = cleave_alloc_rc(size as i64);
+                        unsafe { std::ptr::write_bytes(p, tag, size) };
+                        live.push((p, tag, size));
+                        // Release some of this thread's blocks, give others away.
+                        if live.len() > 64 {
+                            let (q, qtag, qsize) = live.remove(i % live.len());
+                            let ok = unsafe { std::slice::from_raw_parts(q, qsize) }.iter().all(|&x| x == qtag);
+                            assert!(ok, "thread {t}: a live block was overwritten");
+                            if i % 2 == 0 {
+                                unsafe { cleave_release(q) };
+                            } else {
+                                next.send((q as usize, qtag, qsize)).unwrap();
+                            }
+                        }
+                        // Release what the previous thread handed over.
+                        while let Ok((q, qtag, qsize)) = rx.try_recv() {
+                            let q = q as *mut u8;
+                            let ok = unsafe { std::slice::from_raw_parts(q, qsize) }.iter().all(|&x| x == qtag);
+                            assert!(ok, "thread {t}: a handed-over block was overwritten");
+                            unsafe { cleave_release(q) };
+                        }
+                    }
+                    for (q, _, _) in live {
+                        unsafe { cleave_release(q) };
+                    }
+                    drop(next);
+                    // Drain what is still in flight.
+                    while let Ok((q, _, _)) = rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                        unsafe { cleave_release(q as *mut u8) };
+                    }
+                })
+            })
+            .collect();
+        drop(senders);
+        for h in handles {
+            h.join().expect("a thread failed");
+        }
     }
 }

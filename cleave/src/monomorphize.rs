@@ -1014,6 +1014,7 @@ fn collect_instantiations_block(
     let mut scope = scope.clone();
     for stmt in &block.stmts {
         match &stmt.kind {
+            StmtKind::Sync => {}
             StmtKind::Let { name, value, .. } => {
                 // Self-recursion (`let fact = fn(n) { ... fact(n - 1) ... };`)
                 // -- seeded *before* walking `value`, not after, so a self-
@@ -1183,6 +1184,7 @@ fn collect_instantiations_expr(
         };
     }
     match &expr.kind {
+        ExprKind::Spawn(call) => rec!(call),
         ExprKind::NumberLit { .. }
         | ExprKind::ImaginaryLit { .. }
         | ExprKind::BoolLit(_)
@@ -3051,6 +3053,7 @@ fn display_impl_instantiation(t: &ImplTemplate, mapping: &HashMap<TyVar, Ty>) ->
 pub(crate) fn collect_exprs<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
     out.push(expr);
     match &expr.kind {
+        ExprKind::Spawn(call) => collect_exprs(call, out),
         ExprKind::NumberLit { .. }
         | ExprKind::ImaginaryLit { .. }
         | ExprKind::BoolLit(_)
@@ -3106,6 +3109,7 @@ pub(crate) fn collect_exprs<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
 pub(crate) fn collect_exprs_block<'a>(block: &'a Block, out: &mut Vec<&'a Expr>) {
     for stmt in &block.stmts {
         match &stmt.kind {
+            StmtKind::Sync => {}
             StmtKind::Let { value, .. } => collect_exprs(value, out),
             StmtKind::Assign { target, value } => {
                 collect_exprs(target, out);

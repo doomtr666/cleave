@@ -392,7 +392,11 @@ array_dim   = { expr ~ pack_marker? }
 
 // ---------------------------------------------------------------- statements / blocks
 block       = { "{" ~ stmt* ~ expr? ~ "}" }
-stmt        = { let_stmt | assign_stmt | break_stmt | expr_stmt }
+stmt        = { let_stmt | assign_stmt | break_stmt | sync_stmt | expr_stmt }
+// `sync;` waits for every task the current function started with `spawn`
+// (`doc/plan-spawn.md`). Every function also ends with an implicit one.
+sync_stmt   = { sync_kw ~ ";" }
+sync_kw     = @{ "sync" ~ !XID_CONTINUE }
 // A statement, not a general expression -- `break` never sensibly appears
 // as a block's own tail value or mid-expression, so keeping it out of
 // `expr`/`primary` entirely sidesteps ever having to give it its own type
@@ -500,7 +504,7 @@ tuple_index = @{ ASCII_DIGIT+ }
 // `infer_call`'s own fallback, which special-cases exactly this one
 // remaining case (a zero-arg call naming a known, zero-field struct) rather
 // than leaving it as a silent "unresolved call".
-primary = { if_expr | while_expr | for_expr | loop_expr | comprehension | array_lit | lambda_expr | call_expr | struct_lit | literal | path | tuple_lit | "(" ~ expr ~ ")" | block }
+primary = { if_expr | while_expr | for_expr | loop_expr | comprehension | array_lit | lambda_expr | spawn_expr | call_expr | struct_lit | literal | path | tuple_lit | "(" ~ expr ~ ")" | block }
 
 // `(a, b, ...)` — arity 2+ (see `tuple_type`'s own doc comment for why),
 // tried before the bare grouping-paren alternative just after it: PEG
@@ -527,6 +531,13 @@ lambda_expr = { "fn" ~ "(" ~ param_list? ~ ")" ~ ("->" ~ type_)? ~ block }
 // qualified calls (`Ring::add(a, b)`) need the same path as plain references —
 // `path`'s single-segment case still covers a bare `add(a, b)`.
 call_expr = { path ~ turbofish? ~ "(" ~ arg_list? ~ ")" }
+// `spawn f(args)`: the call may run in parallel with the rest of the
+// function; its value is waited for where it is first read
+// (`doc/plan-spawn.md`). Only a call: a task captures nothing but its
+// arguments. Tried before `call_expr`, and it needs a call after the
+// keyword, so a function named `spawn` (`spawn(x)`) still parses as a call.
+spawn_expr = { spawn_kw ~ call_expr }
+spawn_kw   = @{ "spawn" ~ !XID_CONTINUE }
 // `mlir_attr` (`predicate: "slt"`) exists for exactly one caller: a
 // reserved `mlir::dialect::op(...)` call's static attributes (see
 // `ast.rs`'s own `ExprKind::Call::mlir_attrs` doc comment) -- legal

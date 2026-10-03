@@ -571,7 +571,10 @@ Direct follow-on to the VTune investigation above (the `memcpy`/`memrefCopy`/`nt
 
 **Verified**: full `cargo test -p cleave --release --no-fail-fast` suite green; real AOT builds (`digits-interop`, `mnist-interop`) both succeed; `digits-interop` — `0.94713414`, unchanged; `mnist-interop` — `0.9342`, bit-identical, no crash, confirmed on every forced-clean rebuild during this investigation (both the buggy-crash state and the fixed state were caught this way, not glossed over).
 
-## An explicit, Cilk/Go-style `spawn`/`sync` concurrency primitive — a real, buildable alternative to auto-discovering/cost-modeling fork-join fusion, not yet designed
+## An explicit, Cilk/Go-style `spawn`/`sync` concurrency primitive — designed in `doc/plan-spawn.md` (2026-10-03), not implemented
+
+The design is `doc/plan-spawn.md`: `spawn` on a call returns an invisible future, a read waits for that task only, structured scope with an implicit `sync` at every function's end, frozen arguments, guaranteed serial elision; on a GPU the same `spawn` is async compute (streams and events). The three questions below are answered there (§1 capture, §2 safety, §3-§4 runtime and lowering). The original entry:
+
 
 Raised directly by the user, following the forward-chain-fusion revert just above: automatically discovering *and* cost-modeling where to fuse parallel regions (the thing that just failed) is a genuinely hard, general compiler problem (real auto-scheduling, à la XLA/TVM/Halide) — disproportionate effort for this project right now, and the schedule-level mechanism built so far (`@match_matmul`/`get_producer_of_operand` chains) is hardcoded to one exact network shape regardless, not a generalizable discovery mechanism at all. The alternative: stop asking the compiler to guess, and give the *programmer* an explicit, cheap primitive to state the parallelism structure directly.
 

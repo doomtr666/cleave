@@ -205,6 +205,7 @@ impl Printer {
 
     fn print_stmt(&mut self, s: &Stmt) {
         match &s.kind {
+            StmtKind::Sync => self.line("sync;".to_string()),
             StmtKind::Let {
                 mutable,
                 name,
@@ -347,6 +348,7 @@ pub(crate) fn fmt_expr(e: &Expr) -> String {
         ExprKind::BoolLit(b) => b.to_string(),
         ExprKind::Path(p) => fmt_path(p),
         ExprKind::PackRef(name) => format!("{name}..."),
+        ExprKind::Spawn(call) => format!("spawn {}", fmt_expr(call)),
         ExprKind::Call(path, generics, args, mlir_attrs) => {
             let mut parts: Vec<String> = args.iter().map(fmt_expr).collect();
             parts.extend(
@@ -447,6 +449,7 @@ fn fmt_block_inline(b: &Block) -> String {
         .stmts
         .iter()
         .map(|s| match &s.kind {
+            StmtKind::Sync => "sync;".to_string(),
             StmtKind::Let {
                 mutable,
                 name,

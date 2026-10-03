@@ -1826,6 +1826,7 @@ fn mutated_free_vars_stmts(
                     escaping.extend(mutated_free_vars_expr(v, &local_shadowed, ctx));
                 }
             }
+            StmtKind::Sync => {}
         }
     }
     escaping
@@ -1997,6 +1998,10 @@ fn convert_stmts(stmts: &[Stmt], env: CEnv, ctx: &Ctx, k: &dyn Fn(CEnv) -> CExpr
         // `value`, not held across it — `value` can itself contain a nested
         // loop with its own `break`, which would need its own `borrow_mut`
         // on the same `Ctx`.
+        // Serial elision (`doc/plan-spawn.md`, §1): with every spawned call run
+        // in place (`ExprKind::Spawn`, `convert_expr`), there is nothing to
+        // wait for. Becomes a real wait once spawned calls run as tasks.
+        StmtKind::Sync => convert_stmts(rest, env, ctx, k),
         StmtKind::Break(value) => {
             let target = ctx
                 .break_targets
@@ -2043,6 +2048,10 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
         // `0`, imag = the literal's own value.
         ExprKind::ImaginaryLit { text, .. } => complex_literal(ctx, expr, "0", text, env, k),
         ExprKind::BoolLit(b) => k(CVal::Bool(*b), env),
+        // Serial elision for now: the spawned call runs in place, which is
+        // always a valid execution of a `spawn` (`doc/plan-spawn.md`, §1).
+        // Running it as a task comes next (§ "Step 3").
+        ExprKind::Spawn(call) => convert_expr(call, env, ctx, k),
         ExprKind::Path(p) => {
             let name = p.segments.join("::");
             let v = match env.get(&name) {
@@ -3235,6 +3244,7 @@ fn loop_contains_break(block: &Block) -> bool {
 fn stmt_contains_break(stmt: &Stmt) -> bool {
     match &stmt.kind {
         StmtKind::Break(_) => true,
+        StmtKind::Sync => false,
         StmtKind::Let { value, .. } => expr_contains_break(value),
         StmtKind::Assign { target, value } => {
             expr_contains_break(target) || expr_contains_break(value)
@@ -3245,6 +3255,7 @@ fn stmt_contains_break(stmt: &Stmt) -> bool {
 
 fn expr_contains_break(expr: &Expr) -> bool {
     match &expr.kind {
+        ExprKind::Spawn(call) => expr_contains_break(call),
         ExprKind::NumberLit { .. }
         | ExprKind::ImaginaryLit { .. }
         | ExprKind::BoolLit(_)
@@ -3304,6 +3315,7 @@ fn mutated_free_vars(block: &Block, shadowed: &HashSet<String>, ctx: &Ctx) -> Ha
     let mut escaping = HashMap::new();
     for stmt in &block.stmts {
         match &stmt.kind {
+            StmtKind::Sync => {}
             StmtKind::Let { name, value, .. } => {
                 escaping.extend(mutated_free_vars_expr(value, &local_shadowed, ctx));
                 local_shadowed.insert(name.clone());
@@ -3337,6 +3349,7 @@ fn mutated_free_vars_expr(
     ctx: &Ctx,
 ) -> HashMap<String, Ty> {
     match &expr.kind {
+        ExprKind::Spawn(call) => mutated_free_vars_expr(call, shadowed, ctx),
         ExprKind::NumberLit { .. }
         | ExprKind::ImaginaryLit { .. }
         | ExprKind::BoolLit(_)
@@ -3474,6 +3487,7 @@ fn lambda_free_vars_block(
     let mut free = HashMap::new();
     for stmt in &block.stmts {
         match &stmt.kind {
+            StmtKind::Sync => {}
             StmtKind::Let { name, value, .. } => {
                 free.extend(lambda_free_vars_expr(value, &local_shadowed, node_types));
                 local_shadowed.insert(name.clone());
@@ -3502,6 +3516,7 @@ fn lambda_free_vars_expr(
     node_types: &HashMap<NodeId, Ty>,
 ) -> HashMap<String, Ty> {
     match &expr.kind {
+        ExprKind::Spawn(call) => lambda_free_vars_expr(call, shadowed, node_types),
         ExprKind::NumberLit { .. }
         | ExprKind::ImaginaryLit { .. }
         | ExprKind::BoolLit(_)

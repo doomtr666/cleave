@@ -155,6 +155,7 @@ impl Resolver {
         let depth = scope.len();
         for stmt in &mut block.stmts {
             match &mut stmt.kind {
+                StmtKind::Sync => {}
                 // The value is resolved before `name` enters scope: `let f = f(x);`
                 // calls the outer `f`.
                 StmtKind::Let { name, value, .. } => {
@@ -188,6 +189,7 @@ impl Resolver {
 
     fn expr(&self, expr: &mut Expr, scope: &mut Vec<Local>) {
         match &mut expr.kind {
+            ExprKind::Spawn(call) => self.expr(call, scope),
             ExprKind::NumberLit { .. }
             | ExprKind::ImaginaryLit { .. }
             | ExprKind::BoolLit(_)

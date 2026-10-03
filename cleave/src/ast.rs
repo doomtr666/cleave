@@ -514,6 +514,8 @@ pub enum StmtKind {
     /// so this is `None` either way at the AST level, the distinction is
     /// purely "was there an expression here or not."
     Break(Option<Expr>),
+    /// `sync;`: wait for every task this function started with `spawn`.
+    Sync,
 }
 pub type Stmt = Node<StmtKind>;
 
@@ -562,6 +564,10 @@ pub enum ExprKind {
     /// `infer.rs::infer_call`, not enforced grammatically — same posture
     /// `is_extern`/`#[mlir(...)]` already take elsewhere in this file).
     Call(Path, Vec<GenericArg>, Vec<Expr>, Vec<(String, String)>),
+    /// `spawn f(args)`: the call (always an `ExprKind::Call`, grammar-
+    /// enforced) may run in parallel with what follows; the value is the
+    /// call's, waited for where it's first read (`doc/plan-spawn.md`).
+    Spawn(Box<Expr>),
     FieldAccess(Box<Expr>, String),
     /// One bracket group, `a[i]` or the Fortran-style multi-index sugar
     /// `a[i, j, ...]` — every comma-separated index collected directly into

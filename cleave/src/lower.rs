@@ -685,6 +685,7 @@ impl Lowerer {
                 let value = inner.into_inner().next().map(|p| self.lower_expr(p));
                 StmtKind::Break(value)
             }
+            Rule::sync_stmt => StmtKind::Sync,
             Rule::expr_stmt => {
                 let e = self.lower_expr(inner.into_inner().next().unwrap());
                 StmtKind::Expr(e)
@@ -1142,6 +1143,11 @@ impl Lowerer {
             Rule::struct_lit => self.lower_struct_lit(inner),
             Rule::tuple_lit => self.lower_tuple_lit(inner),
             Rule::call_expr => self.lower_call_expr(inner),
+            Rule::spawn_expr => {
+                let call = inner.into_inner().find(|p| p.as_rule() == Rule::call_expr).unwrap();
+                let call = self.lower_call_expr(call);
+                self.wrap(span, ExprKind::Spawn(Box::new(call)))
+            }
             Rule::literal => self.lower_literal(inner),
             Rule::path => {
                 let path = self.lower_path(inner);

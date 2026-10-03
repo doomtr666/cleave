@@ -586,6 +586,7 @@ fn collect_calls_block(block: &Block, known: &HashSet<&str>, out: &mut Vec<Strin
                     collect_calls_expr(v, known, out);
                 }
             }
+            StmtKind::Sync => {}
         }
     }
     if let Some(tail) = &block.tail {
@@ -595,6 +596,7 @@ fn collect_calls_block(block: &Block, known: &HashSet<&str>, out: &mut Vec<Strin
 
 fn collect_calls_expr(expr: &Expr, known: &HashSet<&str>, out: &mut Vec<String>) {
     match &expr.kind {
+        ExprKind::Spawn(call) => collect_calls_expr(call, known, out),
         ExprKind::NumberLit { .. } | ExprKind::ImaginaryLit { .. } | ExprKind::BoolLit(_) => {}
         // A pack reference (`Dims...`, only ever an array dimension's own
         // size expression today — see `TypeKind::Array`'s own doc comment)

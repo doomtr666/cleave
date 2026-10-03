@@ -6,7 +6,6 @@ const DEBUG: bool = true;
 // LLVM's own loop unrolling, on top of cleave's: see `CodegenOptions::llvm_loop_unroll`.
 const LLVM_LOOP_UNROLL: bool = false;
 
-
 fn main() {
     cleave_build::Build::new()
         .file("src/kernel.cleave")
