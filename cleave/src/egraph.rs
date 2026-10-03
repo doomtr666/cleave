@@ -2115,6 +2115,22 @@ fn build_pattern(
             Some((ast.add(ENodeOrVar::ENode(CleaveLang::Int(n))), None))
         }
         ExprKind::BoolLit(b) => Some((ast.add(ENodeOrVar::ENode(CleaveLang::Bool(*b))), None)),
+        // `call(...)[k]`: field `k` of the tuple a call returns, so that one
+        // computation can give a rule several contributions (`adjoint f(a,
+        // b), u: (f_back(a, b, u)[0], f_back(a, b, u)[1])`: the two calls
+        // are one e-class, computed once). The node is named after the
+        // call's unit, `tuplefield:<unit>:<k>`; its types come from that
+        // unit's result once the units are at hand
+        // (`register_tuple_fields`).
+        ExprKind::Index(base, indices) => {
+            let [index] = indices.as_slice() else { return None };
+            let ExprKind::NumberLit { text, .. } = &index.kind else { return None };
+            let k: usize = text.parse().ok()?;
+            let (base_id, _) = build_pattern(base, algebra, ty, type_env, d_var, None, referenced, registry, ast)?;
+            let ENodeOrVar::ENode(CleaveLang::Op(unit, _)) = &ast[base_id] else { return None };
+            let sym = Symbol::from(format!("tuplefield:{unit}:{k}"));
+            Some((ast.add(ENodeOrVar::ENode(CleaveLang::Op(sym, vec![base_id]))), None))
+        }
         ExprKind::Call(path, _, call_args, _)
             if path.segments.join("::") == "d" && d_var.is_some() =>
         {
@@ -4381,6 +4397,7 @@ fn synthesize_one_gradient(
     )
     .map_err(|e| format!("cannot compute grad(`{}`): {e}", req.name))?;
     referenced.extend(zero_calls_used.into_inner().unwrap());
+    register_tuple_fields(&fwd.egraph, units, &mut fwd.field_ops);
 
     let param_shapes: Vec<Option<ParamShape>> = f_params
         .iter()
@@ -4937,6 +4954,32 @@ fn same_expression(a: &RecExpr<CleaveLang>, b: &RecExpr<CleaveLang>) -> bool {
         return a.as_ref().is_empty() && b.as_ref().is_empty();
     }
     same(a, a.root(), b, b.root(), &mut HashMap::new())
+}
+
+/// Registers, as field reads, the `tuplefield:<unit>:<k>` nodes an adjoint
+/// rule built (`build_pattern`'s `Index` arm): field `k` of the tuple
+/// `<unit>` returns, typed from that unit's result.
+fn register_tuple_fields(
+    egraph: &egg::EGraph<CleaveLang, ConstantFold>,
+    units: &HashMap<String, &CTopLevelFn>,
+    field_ops: &mut HashMap<Symbol, (Ty, String, Ty)>,
+) {
+    for class in egraph.classes() {
+        for node in &class.nodes {
+            let CleaveLang::Op(sym, _) = node else { continue };
+            let Some(rest) = sym.as_str().strip_prefix("tuplefield:") else { continue };
+            if field_ops.contains_key(sym) {
+                continue;
+            }
+            let Some((unit, k)) = rest.rsplit_once(':') else { continue };
+            let (Some(callee), Ok(k)) = (units.get(unit), k.parse::<usize>()) else { continue };
+            if let Ty::App(_, args) = &callee.result {
+                if let Some(field_ty) = args.get(k) {
+                    field_ops.insert(*sym, (callee.result.clone(), k.to_string(), field_ty.clone()));
+                }
+            }
+        }
+    }
 }
 
 /// The units (`Forward::ruled`) whose algebra method declares an `adjoint`

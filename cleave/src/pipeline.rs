@@ -829,6 +829,54 @@ fn has_real_line(loc: melior::ir::Location) -> bool {
 /// emission, which differ per caller (`ExecutionEngine::new`'s own
 /// `optimization_level`/`enable_object_dump` arguments are caller-specific,
 /// not part of this shared pipeline).
+/// Whether `op` holds a `vector.transfer_read`/`transfer_write` whose
+/// permutation map isn't a minor identity (`(d0, d1) -> (d1)` is one, a
+/// plain contiguous read; `(d0, d1) -> (d0)` isn't): what `--convert-vector-
+/// to-llvm` can't lower (see the second `--convert-vector-to-scf` in
+/// `lower_to_llvm`).
+fn has_permuted_transfer(op: melior::ir::operation::OperationRef) -> bool {
+    use melior::ir::operation::OperationLike;
+    let name = op.name().as_string_ref().as_str().unwrap_or("").to_string();
+    if name == "vector.transfer_read" || name == "vector.transfer_write" {
+        if let Ok(map) = op.attribute("permutation_map") {
+            if !is_minor_identity(&map.to_string()) {
+                return true;
+            }
+        }
+    }
+    for region in op.regions() {
+        let mut block = region.first_block();
+        while let Some(b) = block {
+            let mut inner = b.first_operation();
+            while let Some(o) = inner {
+                if has_permuted_transfer(o) {
+                    return true;
+                }
+                inner = o.next_in_block();
+            }
+            block = b.next_in_region();
+        }
+    }
+    false
+}
+
+/// `affine_map<(d0, ..., dn) -> (dk, ..., dn)>`: the results are the last
+/// dimensions, in order.
+fn is_minor_identity(map: &str) -> bool {
+    let Some((dims, results)) = map
+        .trim_start_matches("affine_map<")
+        .trim_end_matches('>')
+        .split_once("->")
+    else {
+        return false;
+    };
+    let names = |s: &str| -> Vec<String> {
+        s.trim().trim_start_matches('(').trim_end_matches(')').split(',').map(|d| d.trim().to_string()).filter(|d| !d.is_empty()).collect()
+    };
+    let (dims, results) = (names(dims), names(results));
+    results.len() <= dims.len() && dims[dims.len() - results.len()..] == results[..]
+}
+
 pub fn lower_to_llvm<'c>(
     context: &'c Context,
     module: &mut Module<'c>,
@@ -1385,10 +1433,15 @@ pub fn lower_to_llvm<'c>(
 
     // `--convert-vector-to-scf` again, now on what `--affine-super-
     // vectorize` just produced (the first run, before `--convert-linalg-to-
-    // affine-loops`, never saw it): its transfers can be masked and
-    // permuted (a column read, `(d0, d1) -> (d0)`), which `--convert-vector-
-    // to-llvm` can't lower; `target-rank=0` takes those down to scalar loops
-    // (a permuted read is a gather anyway). Before `--lower-affine`: the
+    // affine-loops`, never saw it), **only when it produced a permuted
+    // transfer** (a column read, `(d0, d1) -> (d0)`), which `--convert-
+    // vector-to-llvm` can't lower; `target-rank=0` takes it down to scalar
+    // loops (a permuted read is a gather anyway). Only then: the pass turns
+    // *every* 1-D transfer into a scalar loop over a stack buffer, which on
+    // nanoLM's kernel meant ~2400 more `llvm.alloca`s in loops (each a
+    // `_chkstk` call per iteration on Windows, 9% of a training step) and a
+    // fifth more IR. Inlined builds produce no permuted transfer; a
+    // non-inlined `matmul_transpose_b` does. Before `--lower-affine`: the
     // loops it builds index through `affine.apply`. Left in place, they reached the execution
     // engine still in the `vector` dialect and crashed LLVM's translation
     // outright, no diagnostic (found compiling a non-inlined
@@ -1396,12 +1449,12 @@ pub fn lower_to_llvm<'c>(
     // inlining had happened to route those loops elsewhere).
     let pass_manager = pass::PassManager::new(context);
     pass::conversion::register_vector_to_scf();
-    if parse_pass_pipeline(
+    if has_permuted_transfer(module.as_operation()) && parse_pass_pipeline(
         pass_manager.as_operation_pass_manager(),
         "builtin.module(func.func(convert-vector-to-scf{target-rank=0}))",
     )
     .is_err()
-        || pass_manager.run(&mut *module).is_err()
+        || has_permuted_transfer(module.as_operation()) && pass_manager.run(&mut *module).is_err()
     {
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (vector-to-scf after super-vectorize)".to_string(),

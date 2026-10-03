@@ -596,19 +596,19 @@ struct AttentionShape<const L: i32, const DH: i32> {}
 // seeing any position after it (`-inf` scores, zero weights). The result has
 // the layout of `q`.
 //
-// Its gradient is declared as a whole, recomputing the attention weights `P`
-// per block rather than storing them: `dV = Pᵀ dO`, `dP = dO Vᵀ`, `dS = P *
-// (dP - rowsum(dP * P)) / sqrt(DH)`, `dQ = dS K`, `dK = dSᵀ Q`. The shape
-// isn't differentiable (`_`).
+// Its gradient is declared as a whole, in one pass per block that recomputes
+// the attention weights `P` once (rather than storing them from the forward
+// pass): `dV = Pᵀ dO`, `dP = dO Vᵀ`, `dS = P * (dP - rowsum(dP * P)) /
+// sqrt(DH)`, `dQ = dS K`, `dK = dSᵀ Q`. The three gradients come back as one
+// tuple, read three times by the rule: one call (one e-class), computed once.
+// The shape isn't differentiable (`_`).
 algebra CausalAttention<X, S> {
     fn causal_attention(q: X, k: X, v: X, shape: S) -> X;
-    fn causal_attention_grad_q(q: X, k: X, v: X, shape: S, u: X) -> X;
-    fn causal_attention_grad_k(q: X, k: X, v: X, shape: S, u: X) -> X;
-    fn causal_attention_grad_v(q: X, k: X, v: X, shape: S, u: X) -> X;
+    fn causal_attention_backward(q: X, k: X, v: X, shape: S, u: X) -> (X, X, X);
     adjoint causal_attention(q, k, v, shape), u: (
-        causal_attention_grad_q(q, k, v, shape, u),
-        causal_attention_grad_k(q, k, v, shape, u),
-        causal_attention_grad_v(q, k, v, shape, u),
+        causal_attention_backward(q, k, v, shape, u)[0],
+        causal_attention_backward(q, k, v, shape, u)[1],
+        causal_attention_backward(q, k, v, shape, u)[2],
         _
     );
 }
@@ -634,9 +634,12 @@ impl<const N: i32, const D: i32, const L: i32, const DH: i32> CausalAttention<Te
         };
         Tensor(data: out)
     }
+    // `(dQ, dK, dV)`, every block's weights and score gradient computed once.
     #[no_inline]
-    fn causal_attention_grad_q(q, k, v, shape, u) {
-        let mut out: [[f32; D]; N] = mlir::memref::alloc();
+    fn causal_attention_backward(q, k, v, shape, u) {
+        let mut dq: [[f32; D]; N] = mlir::memref::alloc();
+        let mut dk: [[f32; D]; N] = mlir::memref::alloc();
+        let mut dv: [[f32; D]; N] = mlir::memref::alloc();
         for s in 0..N / L {
             for h in 0..D / DH {
                 let qh: Tensor<f32, L, DH> = attention_block(q, s, h);
@@ -645,42 +648,19 @@ impl<const N: i32, const D: i32, const L: i32, const DH: i32> CausalAttention<Te
                 let uh: Tensor<f32, L, DH> = attention_block(u, s, h);
                 let p = causal_attention_weights(qh, kh);
                 let ds = attention_score_grad(p, matmul_transpose_b(uh, vh), DH);
-                let g: Tensor<f32, L, DH> = matmul(ds, kh);
-                for i in 0..L { for j in 0..DH { out[s * L + i, h * DH + j] = g[i, j]; }; };
+                let gq: Tensor<f32, L, DH> = matmul(ds, kh);
+                let gk: Tensor<f32, L, DH> = matmul_transpose_a(ds, qh);
+                let gv: Tensor<f32, L, DH> = matmul_transpose_a(p, uh);
+                for i in 0..L {
+                    for j in 0..DH {
+                        dq[s * L + i, h * DH + j] = gq[i, j];
+                        dk[s * L + i, h * DH + j] = gk[i, j];
+                        dv[s * L + i, h * DH + j] = gv[i, j];
+                    };
+                };
             };
         };
-        Tensor(data: out)
-    }
-    #[no_inline]
-    fn causal_attention_grad_k(q, k, v, shape, u) {
-        let mut out: [[f32; D]; N] = mlir::memref::alloc();
-        for s in 0..N / L {
-            for h in 0..D / DH {
-                let qh: Tensor<f32, L, DH> = attention_block(q, s, h);
-                let kh: Tensor<f32, L, DH> = attention_block(k, s, h);
-                let vh: Tensor<f32, L, DH> = attention_block(v, s, h);
-                let uh: Tensor<f32, L, DH> = attention_block(u, s, h);
-                let p = causal_attention_weights(qh, kh);
-                let ds = attention_score_grad(p, matmul_transpose_b(uh, vh), DH);
-                let g: Tensor<f32, L, DH> = matmul_transpose_a(ds, qh);
-                for i in 0..L { for j in 0..DH { out[s * L + i, h * DH + j] = g[i, j]; }; };
-            };
-        };
-        Tensor(data: out)
-    }
-    #[no_inline]
-    fn causal_attention_grad_v(q, k, v, shape, u) {
-        let mut out: [[f32; D]; N] = mlir::memref::alloc();
-        for s in 0..N / L {
-            for h in 0..D / DH {
-                let qh: Tensor<f32, L, DH> = attention_block(q, s, h);
-                let kh: Tensor<f32, L, DH> = attention_block(k, s, h);
-                let uh: Tensor<f32, L, DH> = attention_block(u, s, h);
-                let g: Tensor<f32, L, DH> = matmul_transpose_a(causal_attention_weights(qh, kh), uh);
-                for i in 0..L { for j in 0..DH { out[s * L + i, h * DH + j] = g[i, j]; }; };
-            };
-        };
-        Tensor(data: out)
+        (Tensor(data: dq), Tensor(data: dk), Tensor(data: dv))
     }
 }
 

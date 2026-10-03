@@ -162,7 +162,7 @@ fn complex_example_runs_cleanly() {
     assert_clean(&run_example("complex"));
 }
 
-/// **Known, real bug, found 2026-09-17, not fixed here** -- both
+/// **Known, real bug, found 2026-09-17** -- both
 /// `xor.cleave` and `tensor_demo.cleave` (see the sibling test just below)
 /// print several `error: NYI: non-trivial layout map` MLIR diagnostics
 /// (from LLVM's own default diagnostic handler, straight to `stderr`)
@@ -173,9 +173,13 @@ fn complex_example_runs_cleanly() {
 /// reproducible, not spurious noise, but it is provably non-fatal here --
 /// recorded as a bug (debug-info generation hits an MLIR case it can't yet
 /// handle for this specific matmul shape) rather than a correctness
-/// regression.
+/// regression. **Gone as of 2026-10-03** (found when nanoLM's attention
+/// probes, which used to print it, stopped doing so): both examples compile
+/// with a clean `stderr` again, so these tests run once more and guard
+/// against its return. Not pinned to one change — it was already absent at
+/// `63f7a5b`; the matmul schedule and vector lowering changed several
+/// times around then.
 #[test]
-#[ignore = "known bug: MatMul::matmul debug-info lowering hits `error: NYI: non-trivial layout map`, non-fatal but pollutes stderr -- see this test's own doc comment"]
 fn xor_example_runs_cleanly() {
     assert_clean(&run_example("xor"));
 }
@@ -184,7 +188,6 @@ fn xor_example_runs_cleanly() {
 /// its own test, not folded into that one, since a fix landing for one
 /// matmul shape isn't guaranteed to cover the other.
 #[test]
-#[ignore = "known bug: MatMul::matmul debug-info lowering hits `error: NYI: non-trivial layout map`, non-fatal but pollutes stderr -- see xor_example_runs_cleanly's own doc comment"]
 fn tensor_demo_example_runs_cleanly() {
     assert_clean(&run_example("tensor_demo"));
 }

@@ -420,3 +420,150 @@ fn a_matmul_with_a_partial_column_tile_compiles_and_computes_the_product() {
     assert!(stdout.contains("main returned: 1"), "stdout: {stdout}
 stderr: {stderr}");
 }
+
+/// `matmul_transpose_b` compiled as a function of its own (`--no-inline`):
+/// the affine super-vectorizer gives it permuted vector transfers (column
+/// reads) that `--convert-vector-to-llvm` can't lower, which used to reach
+/// LLVM's translation and crash it without a word. A second
+/// `--convert-vector-to-scf` now lowers them, and only when such a transfer
+/// exists, since it would otherwise turn every vector transfer into a scalar
+/// loop (`pipeline.rs::has_permuted_transfer`).
+#[test]
+fn a_matmul_with_a_transposed_operand_compiles_without_inlining() {
+    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("transpose_no_inline.cleave");
+    std::fs::write(
+        &source,
+        "
+        use nn;
+        fn main() -> i32 {
+            rand_seed(1);
+            let q: Tensor<f32, 8, 16> = Init::he();
+            let p: Tensor<f32, 8, 8> = matmul_transpose_b(q, q);
+            let mut d = 0.0;
+            for i in 0..8 { for j in 0..8 {
+                let mut s = 0.0;
+                for k in 0..16 { s = s + q[i, k] * q[j, k]; };
+                d = d + (s - p[i, j]) * (s - p[i, j]);
+            }; };
+            if d < 0.0001 { 1 } else { 0 }
+        }
+        ",
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--no-debug-info", "--no-inline", "--run"])
+        .arg(&source)
+        .output()
+        .expect("cannot run cleave");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("main returned: 1"), "status {:?}\nstdout: {stdout}\nstderr: {stderr}", output.status);
+}
+
+/// Every matmul is vectorized, a column count that isn't a multiple of the
+/// schedule's 16 included (104): the schedule peels the loop into whole tiles
+/// plus a static remainder (`matmul_vectorize.transform.mlir`,
+/// `@tile_peel_vectorize`). A matmul the schedule leaves behind still
+/// computes the right result, through scalar loops, so only the IR can tell:
+/// a silently failed peel once left every matmul of nanoLM's kernel scalar
+/// (5x slower, every correctness test green). Checked on the IR after
+/// bufferization, with the shapes of nanoLM's head and its gradients.
+#[test]
+fn matmuls_with_a_partial_tile_are_vectorized() {
+    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("vectorized.cleave");
+    let dump = dir.join("vectorized_post_dealloc.mlir");
+    let _ = std::fs::remove_file(&dump);
+    std::fs::write(
+        &source,
+        "
+        use nn;
+        fn head(x: Tensor<f32, 64, 128>, w: Tensor<f32, 128, 104>) -> Tensor<f32, 64, 104> { matmul(x, w) }
+        fn back(u: Tensor<f32, 64, 104>, w: Tensor<f32, 128, 104>) -> Tensor<f32, 64, 128> { matmul_transpose_b(u, w) }
+        fn main() -> i32 {
+            rand_seed(1);
+            let x: Tensor<f32, 64, 128> = Init::he();
+            let w: Tensor<f32, 128, 104> = Init::he();
+            let y = head(x, w);
+            let z = back(y, w);
+            if z[0, 0] != 12345.0 { 1 } else { 0 }
+        }
+        ",
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--no-debug-info", "--run"])
+        .arg(&source)
+        .env("CLEAVE_DUMP_POST_DEALLOC", &dump)
+        .output()
+        .expect("cannot run cleave");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("main returned: 1"), "stdout: {stdout}\nstderr: {}", String::from_utf8_lossy(&output.stderr));
+    let ir = std::fs::read_to_string(&dump).expect("no IR dumped");
+    assert!(!ir.contains("linalg.matmul"), "a matmul was left unvectorized");
+    assert!(ir.contains("vector.outerproduct"), "no vectorized matmul at all");
+}
+
+/// An adjoint rule whose contributions are the parts of one call's tuple:
+/// the e-graph shares the call (one node for the three reads), so the
+/// backward is computed once — what a fused attention backward needs.
+#[test]
+fn an_adjoint_rule_can_take_its_contributions_from_one_tuple() {
+    let src = |out: &str| {
+        format!(
+            "
+            algebra Prod<T> {{
+                fn prod(a: T, b: T) -> T;
+                fn prod_back(a: T, b: T, u: T) -> (T, T);
+                adjoint prod(a, b), u: (prod_back(a, b, u)[0], prod_back(a, b, u)[1]);
+            }}
+            impl Prod<f32> {{
+                fn prod(a, b) {{ a * b }}
+                fn prod_back(a, b, u) {{ (u * b, u * a) }}
+            }}
+            fn f(a: f32, b: f32) -> f32 {{ prod(a, b) * a }}
+            da = grad(f, a);
+            db = grad(f, b);
+            fn main() -> f32 {{ {out} }}
+        "
+        )
+    };
+    // f = a^2 b: df/da = 2ab = 12 at (2, 3), df/db = a^2 = 4.
+    assert!(close(run(&src("da(2.0, 3.0)")), 12.0));
+    assert!(close(run(&src("db(2.0, 3.0)")), 4.0));
+}
+
+/// Tensors read out of a tuple a function returned are views of the
+/// tuple's buffers, not references of their own: the tuple must outlive
+/// every use of them. It used to be released right after the destructuring,
+/// so `a` and `b` below pointed into freed memory by the time they were used
+/// (found through a fused attention backward returning `(dq, dk, dv)`:
+/// wrong gradients from the second transformer block on).
+/// `refcount.rs::TensorViews`.
+#[test]
+fn tensors_destructured_from_a_returned_tuple_stay_valid() {
+    let got = run("
+        use nn;
+        #[no_inline]
+        fn two(x: Tensor<f32, 64, 64>) -> (Tensor<f32, 64, 64>, Tensor<f32, 64, 64>) { (x + x, x * x) }
+        #[no_inline]
+        fn churn(a: Tensor<f32, 64, 64>) -> Tensor<f32, 64, 64> {
+            let mut s = a;
+            for i in 0..20 { s = s + a; };
+            s
+        }
+        fn main() -> f32 {
+            rand_seed(5);
+            let x: Tensor<f32, 64, 64> = Init::he();
+            let (a, b) = two(x);
+            let c = churn(a);
+            let d1 = b[3, 4] - x[3, 4] * x[3, 4];
+            let d2 = c[3, 4] - a[3, 4] * 21.0;
+            if d1 * d1 < 0.000001 and d2 * d2 < 0.0001 { 1.0 } else { 0.0 }
+        }
+    ");
+    assert_eq!(got, 1.0);
+}

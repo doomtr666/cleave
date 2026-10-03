@@ -1898,6 +1898,27 @@ fn resolve_derivative_rule_expr_ty(
     match &expr.kind {
         ExprKind::Path(p) => param_tys.get(p.segments.join("::").as_str()).cloned(),
         ExprKind::NumberLit { .. } | ExprKind::BoolLit(_) => None,
+        // `call(...)[k]` (`egraph.rs::build_pattern`'s `Index` arm): the call
+        // is instantiated like any other, the read has its field's type.
+        ExprKind::Index(base, indices) => {
+            let base_ty = resolve_derivative_rule_expr_ty(
+                base,
+                algebra,
+                type_env,
+                param_tys,
+                registry,
+                infer,
+                templates,
+                impl_worklist,
+            )?;
+            let [index] = indices.as_slice() else { return None };
+            let ExprKind::NumberLit { text, .. } = &index.kind else { return None };
+            let k: usize = text.parse().ok()?;
+            match infer.subst.apply(&base_ty) {
+                Ty::App(_, args) => args.get(k).cloned(),
+                _ => None,
+            }
+        }
         // `d(...)` sugar (`egraph.rs::build_pattern`'s own doc comment) --
         // differentiating distributes component-wise, so `d(inner)` always
         // has the exact same type as `inner` itself.

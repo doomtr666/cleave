@@ -387,16 +387,120 @@ fn as_var(v: &CVal) -> Option<CVar> {
 /// passes it) — used by `collect_local_free_vars`'s own fixpoint, see that
 /// function's own doc comment for why a def can't just use its own direct
 /// references alone.
-fn local_free_vars(def: &CFunDef) -> (HashSet<CVar>, HashSet<String>, HashSet<CVar>) {
+fn local_free_vars(def: &CFunDef, views: &TensorViews) -> (HashSet<CVar>, HashSet<String>, HashSet<CVar>) {
     let mut bound: HashSet<CVar> = def.params.iter().copied().collect();
     let mut referenced: HashSet<CVar> = HashSet::new();
     let mut func_labels: HashSet<String> = HashSet::new();
     collect_bound_and_referenced(&def.body, &mut bound, &mut referenced, &mut func_labels);
+    // A tensor view used here keeps its container alive here too
+    // (`TensorViews`), and so does a view handed to this def by a jump.
+    let viewed: Vec<CVar> = referenced.iter().flat_map(|v| views.containers(*v)).collect();
+    referenced.extend(viewed);
+    if let Some(extra) = views.handed.get(&def.name) {
+        referenced.extend(extra.iter().copied());
+    }
     (
         referenced.difference(&bound).copied().collect(),
         func_labels,
         bound,
     )
+}
+
+/// A tensor read out of a struct or tuple field (`PrimOp::Field` of a
+/// `#[mlir_type(tensor)]` type) is a *view* of the container's buffer, not a
+/// reference of its own: nothing retains it (a `Tensor` isn't `is_rc`). The
+/// container must therefore outlive every use of the view. Without that, it
+/// was released as soon as its own variable stopped being used —
+/// `let (a, b) = two(x); let c = churn(a); ... b ...` freed `a` and `b`'s
+/// buffers right after the destructuring (found through a fused attention
+/// backward whose `(dq, dk, dv)` tuple gave wrong gradients from the second
+/// transformer block on).
+///
+/// `container`: each view's container (one level; `containers` follows the
+/// chain). `handed`: for each local def a view reaches through a jump (a
+/// real call's continuation, a join or loop the view is passed to), the
+/// containers that must stay alive into it and be released there.
+#[derive(Default)]
+struct TensorViews {
+    container: HashMap<CVar, CVar>,
+    handed: HashMap<String, HashSet<CVar>>,
+}
+
+impl TensorViews {
+    fn containers(&self, v: CVar) -> Vec<CVar> {
+        let mut out = Vec::new();
+        let mut cur = v;
+        while let Some(&c) = self.container.get(&cur) {
+            if out.contains(&c) {
+                break;
+            }
+            out.push(c);
+            cur = c;
+        }
+        out
+    }
+
+    fn build(top: &CTopLevelFn, var_types: &HashMap<CVar, Ty>, mlir_types: &HashMap<String, String>) -> Self {
+        let mut views = TensorViews::default();
+        views.collect_containers(&top.def.body, var_types, mlir_types);
+        views.collect_handed(&top.def.body);
+        views
+    }
+
+    fn collect_containers(&mut self, e: &CExpr, var_types: &HashMap<CVar, Ty>, mlir_types: &HashMap<String, String>) {
+        match e {
+            CExpr::LetPrim { var, op, args, cont, .. } => {
+                if let (PrimOp::Field { .. }, Some(CVal::Var(base))) = (op, args.first()) {
+                    if var_types.get(var).is_some_and(|t| is_bare_tensor_ty(t, mlir_types)) {
+                        self.container.insert(*var, *base);
+                    }
+                }
+                self.collect_containers(cont, var_types, mlir_types);
+            }
+            CExpr::App { .. } => {}
+            CExpr::If { then_branch, else_branch, .. } => {
+                self.collect_containers(then_branch, var_types, mlir_types);
+                self.collect_containers(else_branch, var_types, mlir_types);
+            }
+            CExpr::Fix { defs, body } => {
+                for d in defs {
+                    self.collect_containers(&d.body, var_types, mlir_types);
+                }
+                self.collect_containers(body, var_types, mlir_types);
+            }
+        }
+    }
+
+    fn collect_handed(&mut self, e: &CExpr) {
+        match e {
+            CExpr::LetPrim { cont, .. } => self.collect_handed(cont),
+            CExpr::App { func, args } => {
+                let held: Vec<CVar> = args
+                    .iter()
+                    .filter_map(|a| if let CVal::Var(v) = a { Some(*v) } else { None })
+                    .flat_map(|v| self.containers(v))
+                    .collect();
+                if held.is_empty() {
+                    return;
+                }
+                for label in std::iter::once(func).chain(args.iter()) {
+                    if let CVal::Label(name) = label {
+                        self.handed.entry(name.clone()).or_default().extend(held.iter().copied());
+                    }
+                }
+            }
+            CExpr::If { then_branch, else_branch, .. } => {
+                self.collect_handed(then_branch);
+                self.collect_handed(else_branch);
+            }
+            CExpr::Fix { defs, body } => {
+                for d in defs {
+                    self.collect_handed(&d.body);
+                }
+                self.collect_handed(body);
+            }
+        }
+    }
 }
 
 fn collect_bound_and_referenced(
@@ -726,10 +830,10 @@ fn else_branch_of(body: &CExpr) -> &CExpr {
 /// released — a whole `Dense` leaked per iteration (`let d = if ..; let e =
 /// if ..; d.w[0, 0] + e.w[0, 0]`), and `mnist-interop`'s gradient once it
 /// went through an `if`.
-fn collect_local_free_vars(top: &CTopLevelFn, out: &mut HashMap<String, HashSet<CVar>>) {
+fn collect_local_free_vars(top: &CTopLevelFn, views: &TensorViews, out: &mut HashMap<String, HashSet<CVar>>) {
     let mut func_labels: HashMap<String, HashSet<String>> = HashMap::new();
     let mut bound: HashMap<String, HashSet<CVar>> = HashMap::new();
-    walk_local_free_vars(&top.def.body, out, &mut func_labels, &mut bound);
+    walk_local_free_vars(&top.def.body, views, out, &mut func_labels, &mut bound);
     loop {
         let mut changed = false;
         let names: Vec<String> = out.keys().cloned().collect();
@@ -755,30 +859,31 @@ fn collect_local_free_vars(top: &CTopLevelFn, out: &mut HashMap<String, HashSet<
 
 fn walk_local_free_vars(
     expr: &CExpr,
+    views: &TensorViews,
     out: &mut HashMap<String, HashSet<CVar>>,
     func_labels: &mut HashMap<String, HashSet<String>>,
     bound: &mut HashMap<String, HashSet<CVar>>,
 ) {
     match expr {
-        CExpr::LetPrim { cont, .. } => walk_local_free_vars(cont, out, func_labels, bound),
+        CExpr::LetPrim { cont, .. } => walk_local_free_vars(cont, views, out, func_labels, bound),
         CExpr::App { .. } => {}
         CExpr::If {
             then_branch,
             else_branch,
             ..
         } => {
-            walk_local_free_vars(then_branch, out, func_labels, bound);
-            walk_local_free_vars(else_branch, out, func_labels, bound);
+            walk_local_free_vars(then_branch, views, out, func_labels, bound);
+            walk_local_free_vars(else_branch, views, out, func_labels, bound);
         }
         CExpr::Fix { defs, body } => {
             for d in defs {
-                let (free_vars, deps, own) = local_free_vars(d);
+                let (free_vars, deps, own) = local_free_vars(d, views);
                 out.insert(d.name.clone(), free_vars);
                 func_labels.insert(d.name.clone(), deps);
                 bound.insert(d.name.clone(), own);
-                walk_local_free_vars(&d.body, out, func_labels, bound);
+                walk_local_free_vars(&d.body, views, out, func_labels, bound);
             }
-            walk_local_free_vars(body, out, func_labels, bound);
+            walk_local_free_vars(body, views, out, func_labels, bound);
         }
     }
 }
@@ -811,29 +916,30 @@ fn walk_local_free_vars(
 /// genuinely final, not just "this particular invocation, among possibly
 /// many, is done"), computed top-down, propagating each def's own already-
 /// claimed set down into whatever's nested inside it.
-fn collect_local_claim_vars(top: &CTopLevelFn, out: &mut HashMap<String, HashSet<CVar>>) {
-    walk_local_claim_vars(&top.def.body, &HashSet::new(), out);
+fn collect_local_claim_vars(top: &CTopLevelFn, views: &TensorViews, out: &mut HashMap<String, HashSet<CVar>>) {
+    walk_local_claim_vars(&top.def.body, views, &HashSet::new(), out);
 }
 
 fn walk_local_claim_vars(
     expr: &CExpr,
+    views: &TensorViews,
     claimed_by_ancestors: &HashSet<CVar>,
     out: &mut HashMap<String, HashSet<CVar>>,
 ) {
     match expr {
-        CExpr::LetPrim { cont, .. } => walk_local_claim_vars(cont, claimed_by_ancestors, out),
+        CExpr::LetPrim { cont, .. } => walk_local_claim_vars(cont, views, claimed_by_ancestors, out),
         CExpr::App { .. } => {}
         CExpr::If {
             then_branch,
             else_branch,
             ..
         } => {
-            walk_local_claim_vars(then_branch, claimed_by_ancestors, out);
-            walk_local_claim_vars(else_branch, claimed_by_ancestors, out);
+            walk_local_claim_vars(then_branch, views, claimed_by_ancestors, out);
+            walk_local_claim_vars(else_branch, views, claimed_by_ancestors, out);
         }
         CExpr::Fix { defs, body } => {
             for d in defs {
-                let own_claim: HashSet<CVar> = local_free_vars(d)
+                let own_claim: HashSet<CVar> = local_free_vars(d, views)
                     .0
                     .difference(claimed_by_ancestors)
                     .copied()
@@ -843,9 +949,9 @@ fn walk_local_claim_vars(
                     .copied()
                     .collect();
                 out.insert(d.name.clone(), own_claim);
-                walk_local_claim_vars(&d.body, &claimed_including_this, out);
+                walk_local_claim_vars(&d.body, views, &claimed_including_this, out);
             }
-            walk_local_claim_vars(body, claimed_by_ancestors, out);
+            walk_local_claim_vars(body, views, claimed_by_ancestors, out);
         }
     }
 }
@@ -1092,6 +1198,8 @@ struct RefcountCtx<'a> {
     owned_origin: &'a HashMap<CVar, bool>,
     local_free_vars: &'a HashMap<String, HashSet<CVar>>,
     local_claim_vars: &'a HashMap<String, HashSet<CVar>>,
+    /// See `TensorViews`.
+    views: &'a TensorViews,
     fresh: &'a FreshVars,
     /// This one top-level function's own formal parameters — `param_leaf_
     /// key`'s own base case. Per-function (not whole-program), matching
@@ -1184,9 +1292,10 @@ pub fn insert_refcounting(
             let mut owned_origin = HashMap::new();
             collect_var_info(&top, &signatures, &mut var_types, &mut owned_origin);
             let mut local_free_vars = HashMap::new();
-            collect_local_free_vars(&top, &mut local_free_vars);
+            let views = TensorViews::build(&top, &var_types, mlir_types);
+            collect_local_free_vars(&top, &views, &mut local_free_vars);
             let mut local_claim_vars = HashMap::new();
-            collect_local_claim_vars(&top, &mut local_claim_vars);
+            collect_local_claim_vars(&top, &views, &mut local_claim_vars);
             let params: HashSet<CVar> = top.def.params.iter().copied().collect();
             let value_defs = collect_value_defs(&top);
             let ctx = RefcountCtx {
@@ -1199,6 +1308,7 @@ pub fn insert_refcounting(
                 owned_origin: &owned_origin,
                 local_free_vars: &local_free_vars,
                 local_claim_vars: &local_claim_vars,
+                views: &views,
                 fresh: &fresh,
                 params: &params,
                 value_defs: &value_defs,
@@ -1958,6 +2068,7 @@ fn live_set(func: &CVal, args: &[CVal], ctx: &RefcountCtx) -> HashSet<CVar> {
         match v {
             CVal::Var(cv) => {
                 live.insert(*cv);
+                live.extend(ctx.views.containers(*cv));
             }
             CVal::Label(name) => {
                 if let Some(fv) = ctx.local_free_vars.get(name) {
