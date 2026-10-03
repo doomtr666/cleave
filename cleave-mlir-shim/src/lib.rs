@@ -31,6 +31,7 @@ unsafe extern "C" {
         enable_pic: bool,
         target_cpu: MlirStringRef,
         target_features: MlirStringRef,
+        loop_unroll: bool,
     ) -> MlirExecutionEngine;
 }
 
@@ -72,6 +73,7 @@ impl ExecutionEngine {
         enable_pic: bool,
         target_cpu: &str,
         target_features: &str,
+        loop_unroll: bool,
     ) -> Self {
         let paths: Vec<MlirStringRef> = shared_library_paths.iter().map(|s| str_ref(s)).collect();
         let raw = unsafe {
@@ -84,6 +86,7 @@ impl ExecutionEngine {
                 enable_pic,
                 str_ref(target_cpu),
                 str_ref(target_features),
+                loop_unroll,
             )
         };
         Self { raw }

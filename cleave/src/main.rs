@@ -60,6 +60,7 @@ struct Args {
     backend: String,
     inline: Option<bool>,
     unroll_jam: Option<bool>,
+    llvm_loop_unroll: Option<bool>,
     chain_split: Option<bool>,
     affine_structs: Option<bool>,
     tag_releases: Option<bool>,
@@ -94,6 +95,7 @@ fn parse_args() -> Result<Args, String> {
     let mut backend = "cpu".to_string();
     let mut inline: Option<bool> = None;
     let mut unroll_jam: Option<bool> = None;
+    let mut llvm_loop_unroll: Option<bool> = None;
     let mut chain_split: Option<bool> = None;
     let mut affine_structs: Option<bool> = None;
     let mut tag_releases: Option<bool> = None;
@@ -173,6 +175,8 @@ fn parse_args() -> Result<Args, String> {
             "--no-inline" => inline = Some(false),
             "--unroll-jam" => unroll_jam = Some(true),
             "--no-unroll-jam" => unroll_jam = Some(false),
+            "--llvm-unroll" => llvm_loop_unroll = Some(true),
+            "--no-llvm-unroll" => llvm_loop_unroll = Some(false),
             "--chain-split" => chain_split = Some(true),
             "--no-chain-split" => chain_split = Some(false),
             "--affine-structs" => affine_structs = Some(true),
@@ -245,6 +249,7 @@ fn parse_args() -> Result<Args, String> {
             backend,
             inline,
             unroll_jam,
+            llvm_loop_unroll,
             chain_split,
             affine_structs,
             tag_releases,
@@ -311,6 +316,7 @@ fn resolve_codegen_options(args: &Args) -> Result<CodegenOptions, String> {
         backend,
         inline: args.inline.unwrap_or(defaults.inline),
         unroll_jam: args.unroll_jam.unwrap_or(defaults.unroll_jam),
+        llvm_loop_unroll: args.llvm_loop_unroll.unwrap_or(defaults.llvm_loop_unroll),
         chain_split: args.chain_split.unwrap_or(defaults.chain_split),
         affine_structs: args.affine_structs.unwrap_or(defaults.affine_structs),
         tag_releases: args.tag_releases.unwrap_or(defaults.tag_releases),
@@ -919,6 +925,7 @@ fn real_main() -> ExitCode {
             false,
             options.target_cpu.as_deref().unwrap_or(""),
             options.target_features.as_deref().unwrap_or(""),
+            options.llvm_loop_unroll,
         );
         // SAFETY: see `cleave::pipeline::register_cleave_rt_symbols`'s own
         // doc comment -- shared with `--emit-object`, which needs the

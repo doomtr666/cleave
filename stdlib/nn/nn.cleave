@@ -534,7 +534,9 @@ algebra LayerNorm<X, P> {
     adjoint layer_norm(x, g, b), u: (layer_norm_grad_x(x, g, u), layer_norm_grad_g(x, g, u), layer_norm_grad_b(x, g, u));
 }
 
+// `#[no_inline]` on each method: see `CausalAttention`'s impl.
 impl<T: Float, const R: i32, const C: i32> LayerNorm<Tensor<T, R, C>, Tensor<T, 1, C>> {
+    #[no_inline]
     fn layer_norm(x, g, b) {
         let mut y: [[T; C]; R] = mlir::memref::alloc();
         for r in 0..R {
@@ -543,6 +545,7 @@ impl<T: Float, const R: i32, const C: i32> LayerNorm<Tensor<T, R, C>, Tensor<T, 
         };
         Tensor(data: y)
     }
+    #[no_inline]
     fn layer_norm_grad_x(x, g, u) {
         let n: T = C.to();
         let mut d: [[T; C]; R] = mlir::memref::alloc();
@@ -561,6 +564,7 @@ impl<T: Float, const R: i32, const C: i32> LayerNorm<Tensor<T, R, C>, Tensor<T, 
         };
         Tensor(data: d)
     }
+    #[no_inline]
     fn layer_norm_grad_g(x, g, u) {
         let mut d: [[T; C]; 1] = mlir::memref::alloc();
         for c in 0..C { d[0, c] = zero(); };
@@ -570,6 +574,7 @@ impl<T: Float, const R: i32, const C: i32> LayerNorm<Tensor<T, R, C>, Tensor<T, 
         };
         Tensor(data: d)
     }
+    #[no_inline]
     fn layer_norm_grad_b(x, g, u) {
         let mut d: [[T; C]; 1] = mlir::memref::alloc();
         for c in 0..C { d[0, c] = zero(); };
@@ -608,7 +613,14 @@ algebra CausalAttention<X, S> {
     );
 }
 
+// `#[no_inline]` on each method here and on `LayerNorm`'s: each lowers to thousands of lines of
+// vectorized loops, and a transformer calls them once per block forward and again per gradient.
+// Inlined, every call site got its own copy: nanoLM's training step became one function of 700k
+// lines, which LLVM's loop passes (`IndVarSimplify` above all) handle superlinearly, most of a
+// 3-minute compile. Called instead, each instance is compiled once; the matmuls and elementwise
+// operations inside still inline into it, so a step runs at the same speed (measured).
 impl<const N: i32, const D: i32, const L: i32, const DH: i32> CausalAttention<Tensor<f32, N, D>, AttentionShape<L, DH>> {
+    #[no_inline]
     fn causal_attention(q, k, v, shape) {
         let mut out: [[f32; D]; N] = mlir::memref::alloc();
         for s in 0..N / L {
@@ -622,6 +634,7 @@ impl<const N: i32, const D: i32, const L: i32, const DH: i32> CausalAttention<Te
         };
         Tensor(data: out)
     }
+    #[no_inline]
     fn causal_attention_grad_q(q, k, v, shape, u) {
         let mut out: [[f32; D]; N] = mlir::memref::alloc();
         for s in 0..N / L {
@@ -638,6 +651,7 @@ impl<const N: i32, const D: i32, const L: i32, const DH: i32> CausalAttention<Te
         };
         Tensor(data: out)
     }
+    #[no_inline]
     fn causal_attention_grad_k(q, k, v, shape, u) {
         let mut out: [[f32; D]; N] = mlir::memref::alloc();
         for s in 0..N / L {
@@ -654,6 +668,7 @@ impl<const N: i32, const D: i32, const L: i32, const DH: i32> CausalAttention<Te
         };
         Tensor(data: out)
     }
+    #[no_inline]
     fn causal_attention_grad_v(q, k, v, shape, u) {
         let mut out: [[f32; D]; N] = mlir::memref::alloc();
         for s in 0..N / L {

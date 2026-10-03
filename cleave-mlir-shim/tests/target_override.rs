@@ -68,6 +68,7 @@ fn compile_object(context: &melior::Context, target_cpu: &str, target_features: 
         /* enable_pic = */ false,
         target_cpu,
         target_features,
+        /* loop_unroll = */ true,
     );
     engine.dump_to_object_file(dump_path.to_str().unwrap());
     assert!(dump_path.exists(), "dumped object file should exist");

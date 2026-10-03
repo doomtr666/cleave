@@ -28,6 +28,7 @@
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.h"
 #include "llvm/ExecutionEngine/Orc/Mangling.h"
+#include "llvm/Passes/PassBuilder.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Module.h"
@@ -91,10 +92,54 @@ static void annotateAllocators(llvm::Module &m) {
   markFree("cleave_release_pool");
 }
 
+// `mlir::makeOptimizingTransformer` (`mlir/lib/ExecutionEngine/OptUtils.cpp`)
+// rebuilt with LLVM's loop unrolling a choice: that function hardcodes
+// `PipelineTuningOptions::LoopUnrolling = true`. cleave's loops arrive
+// already tiled, vectorized and unrolled where it pays (the matmul schedule,
+// `unroll_jam.rs`); LLVM unrolling them again took 55% of `opt -O2` on
+// nanoLM's kernel (`LoopUnrollPass`, plus the GVN/LICM work on the unrolled
+// code), most of a 3-minute compile. Otherwise identical: the per-module
+// default pipeline at the level `optLevel` maps to.
+static std::function<llvm::Error(llvm::Module *)>
+makeTransformer(unsigned optLevel, bool loopUnroll, llvm::TargetMachine *tm) {
+  return [optLevel, loopUnroll, tm](llvm::Module *m) -> llvm::Error {
+    llvm::OptimizationLevel level;
+    switch (optLevel) {
+    case 0: level = llvm::OptimizationLevel::O0; break;
+    case 1: level = llvm::OptimizationLevel::O1; break;
+    case 2: level = llvm::OptimizationLevel::O2; break;
+    default: level = llvm::OptimizationLevel::O3; break;
+    }
+    llvm::LoopAnalysisManager lam;
+    llvm::FunctionAnalysisManager fam;
+    llvm::CGSCCAnalysisManager cgam;
+    llvm::ModuleAnalysisManager mam;
+    llvm::PipelineTuningOptions tuning;
+    tuning.LoopUnrolling = loopUnroll;
+    tuning.LoopInterleaving = true;
+    tuning.LoopVectorization = true;
+    tuning.SLPVectorization = true;
+    llvm::PassBuilder pb(tm, tuning);
+    pb.registerModuleAnalyses(mam);
+    pb.registerCGSCCAnalyses(cgam);
+    pb.registerFunctionAnalyses(fam);
+    pb.registerLoopAnalyses(lam);
+    pb.crossRegisterProxies(lam, fam, cgam, mam);
+    llvm::ModulePassManager mpm;
+    if (level == llvm::OptimizationLevel::O0)
+      mpm = pb.buildO0DefaultPipeline(level);
+    else
+      mpm = pb.buildPerModuleDefaultPipeline(level);
+    mpm.run(*m, mam);
+    return llvm::Error::success();
+  };
+}
+
 extern "C" MlirExecutionEngine cleaveExecutionEngineCreateWithTarget(
     MlirModule op, int optLevel, int numPaths,
     const MlirStringRef *sharedLibPaths, bool enableObjectDump,
-    bool enablePIC, MlirStringRef targetCpu, MlirStringRef targetFeatures) {
+    bool enablePIC, MlirStringRef targetCpu, MlirStringRef targetFeatures,
+    bool loopUnroll) {
   static bool initOnce = [] {
     llvm::InitializeNativeTarget();
     llvm::InitializeNativeTargetAsmParser();
@@ -181,8 +226,7 @@ extern "C" MlirExecutionEngine cleaveExecutionEngineCreateWithTarget(
   for (unsigned i = 0; i < static_cast<unsigned>(numPaths); ++i)
     libPaths.push_back(unwrap(sharedLibPaths[i]));
 
-  auto transformer = mlir::makeOptimizingTransformer(
-      optLevel, /*sizeLevel=*/0, /*targetMachine=*/tmOrError->get());
+  auto transformer = makeTransformer(optLevel, loopUnroll, tmOrError->get());
   ExecutionEngineOptions jitOptions;
   jitOptions.transformer = [transformer](llvm::Module *m) -> llvm::Error {
     annotateAllocators(*m);

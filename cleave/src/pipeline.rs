@@ -158,6 +158,13 @@ pub struct CodegenOptions {
     /// profiling/disassembly work that doesn't want `DISubprogram`/`!dbg`
     /// noise in dumped IR or symbolized profiles.
     pub debug_info: bool,
+    /// LLVM's own loop unrolling, in the optimization pipeline the execution
+    /// engine runs (`cleave-mlir-shim`'s `makeTransformer`). cleave's loops
+    /// reach LLVM already tiled, vectorized and unrolled where it pays (the
+    /// matmul schedule, `unroll_jam`); LLVM unrolling them again was 55% of
+    /// `opt -O2` on nanoLM's transformer kernel, most of a 3-minute compile.
+    /// `true` keeps the standard pipeline.
+    pub llvm_loop_unroll: bool,
 }
 
 impl Default for CodegenOptions {
@@ -174,6 +181,7 @@ impl Default for CodegenOptions {
             affine_structs: true,
             tag_releases: false,
             debug_info: true,
+            llvm_loop_unroll: true,
         }
     }
 }
@@ -1375,6 +1383,31 @@ pub fn lower_to_llvm<'c>(
         ]);
     }
 
+    // `--convert-vector-to-scf` again, now on what `--affine-super-
+    // vectorize` just produced (the first run, before `--convert-linalg-to-
+    // affine-loops`, never saw it): its transfers can be masked and
+    // permuted (a column read, `(d0, d1) -> (d0)`), which `--convert-vector-
+    // to-llvm` can't lower; `target-rank=0` takes those down to scalar loops
+    // (a permuted read is a gather anyway). Before `--lower-affine`: the
+    // loops it builds index through `affine.apply`. Left in place, they reached the execution
+    // engine still in the `vector` dialect and crashed LLVM's translation
+    // outright, no diagnostic (found compiling a non-inlined
+    // `matmul_transpose_b<8x16, 8x16>`, i.e. any kernel built `--no-inline`;
+    // inlining had happened to route those loops elsewhere).
+    let pass_manager = pass::PassManager::new(context);
+    pass::conversion::register_vector_to_scf();
+    if parse_pass_pipeline(
+        pass_manager.as_operation_pass_manager(),
+        "builtin.module(func.func(convert-vector-to-scf{target-rank=0}))",
+    )
+    .is_err()
+        || pass_manager.run(&mut *module).is_err()
+    {
+        return Err(vec![
+            "MLIR-to-LLVM lowering pass failed (vector-to-scf after super-vectorize)".to_string(),
+        ]);
+    }
+
     // One shared scalar lowering pipeline from here on, `options.openmp`
     // only ever inserting the two genuinely OpenMP-specific pieces into it
     // -- not, as an earlier version of this function had it, two entirely
@@ -1916,6 +1949,7 @@ fn emit_object(
         false,
         options.target_cpu.as_deref().unwrap_or(""),
         options.target_features.as_deref().unwrap_or(""),
+        options.llvm_loop_unroll,
     );
     // SAFETY: see `register_cleave_rt_symbols`'s own doc comment.
     unsafe {
