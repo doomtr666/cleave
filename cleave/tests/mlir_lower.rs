@@ -458,7 +458,7 @@ fn optimized_lowered_llvm_text_for_tensors(context: &Context, src: &str) -> Stri
         .expect("convert-elementwise-to-linalg must succeed");
 
     let pass_manager = pass::PassManager::new(context);
-    pass::bufferization::register_one_shot_bufferize_pass();
+    cleave::pipeline::register_passes();
     parse_pass_pipeline(
         pass_manager.as_operation_pass_manager(),
         "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})",
@@ -538,7 +538,7 @@ fn run_i32_from_cps(
     // pipeline parsing looks it up by its own registered name, unlike
     // `add_pass`, which already has the concrete `Pass` object in hand.
     let pass_manager = pass::PassManager::new(context);
-    pass::bufferization::register_one_shot_bufferize_pass();
+    cleave::pipeline::register_passes();
     parse_pass_pipeline(
         pass_manager.as_operation_pass_manager(),
         "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})",
@@ -3490,7 +3490,7 @@ fn print_of_an_unannotated_index_result_no_longer_panics() {
         .expect("convert-elementwise-to-linalg must succeed");
 
     let pass_manager = pass::PassManager::new(&context);
-    pass::bufferization::register_one_shot_bufferize_pass();
+    cleave::pipeline::register_passes();
     parse_pass_pipeline(
         pass_manager.as_operation_pass_manager(),
         "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})",
@@ -3596,7 +3596,7 @@ fn print_of_an_unannotated_matmul_index_result_no_longer_panics() {
         .expect("convert-elementwise-to-linalg must succeed");
 
     let pass_manager = pass::PassManager::new(&context);
-    pass::bufferization::register_one_shot_bufferize_pass();
+    cleave::pipeline::register_passes();
     parse_pass_pipeline(
         pass_manager.as_operation_pass_manager(),
         "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})",
@@ -8150,9 +8150,20 @@ fn fma_rewrite_fires_and_computes_the_right_value() {
         }
     ";
     let text = optimized_lowered_llvm_text_for_tensors(&context, src);
-    assert!(text.contains("Fma::fma<Tensor<f32, 2, 3>, Tensor<f32, 3, 2>, Tensor<f32, 2, 2>>"), "{text}");
-    assert!(!text.contains("MatMul::matmul<Tensor<f32, 2, 3>, Tensor<f32, 3, 2>, Tensor<f32, 2, 2>>"), "{text}");
-    assert!(!text.contains("Ring::add<Tensor<f32, 2, 2>>"), "{text}");
+    // The caller's own code (`compute`, inlined into `main`): `Fma::fma`'s
+    // BLAS tier adds `c` after the product, so a `Ring::add` of this shape
+    // does exist in the module, inside `Fma::fma` (a branch dead at this
+    // size).
+    let compute: String = text
+        .lines()
+        .skip_while(|l| !l.contains("llvm.func @main()"))
+        .take_while(|l| !l.starts_with("  }"))
+        .collect::<Vec<_>>()
+        .join("
+");
+    assert!(compute.contains("Fma::fma<Tensor<f32, 2, 3>, Tensor<f32, 3, 2>, Tensor<f32, 2, 2>>"), "{text}");
+    assert!(!compute.contains("MatMul::matmul<Tensor<f32, 2, 3>, Tensor<f32, 3, 2>, Tensor<f32, 2, 2>>"), "{text}");
+    assert!(!compute.contains("Ring::add<Tensor<f32, 2, 2>>"), "{text}");
     assert_eq!(run_i32(&context, src), 1);
 }
 

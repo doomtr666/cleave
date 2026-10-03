@@ -334,7 +334,13 @@ impl<const N: i32, const M: i32, const K: i32>
     fn fma(a, b, c) {
         let nmk: i32 = N * M * K;
         if nmk > 100000000 {
-            blas_fma(a, b, c)
+            // `sgemm` into a fresh output, `c` added after rather than
+            // accumulated by `sgemm` (`beta = 1`): `sgemm` writing into `c`
+            // means copying `c` first (it's a read-only input), the whole
+            // output each call; a separate add costs one pass over it and
+            // fuses with whatever built `c` (a dense layer's broadcast bias,
+            // then never materialized).
+            Ring::add(blas_matmul(a, b), c)
         } else {
             mlir::linalg::matmul_add(a, b, c)
         }

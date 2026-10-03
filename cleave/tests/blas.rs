@@ -63,7 +63,7 @@ fn run_f32(context: &Context, src: &str) -> f32 {
         .expect("convert-elementwise-to-linalg must succeed");
 
     let pass_manager = pass::PassManager::new(context);
-    pass::bufferization::register_one_shot_bufferize_pass();
+    cleave::pipeline::register_passes();
     parse_pass_pipeline(
         pass_manager.as_operation_pass_manager(),
         "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})",

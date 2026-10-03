@@ -5803,8 +5803,18 @@ fn lower_raw_mlir_op<'c>(
     result_op.result(0).unwrap().into()
 }
 
-/// `bufferization.to_buffer %t : tensor<dims...xT> to memref<dims...xT,
-/// strided<[?, ...], offset: ?>>` — a fully *dynamic*-layout result,
+/// `bufferization.to_buffer %t : tensor<dims...xT> to memref<dims...xT>`,
+/// the plain identity layout, matching what the function boundaries
+/// bufferize to (`pipeline.rs`, `function-boundary-type-conversion=
+/// identity-layout-map`): a buffer passed to an `extern` (`sgemm`'s `c`) and
+/// returned as the function's result then needs no conversion. With the
+/// dynamic layout below, One-Shot Bufferize couldn't prove the returned
+/// buffer had the identity layout the function's result type requires, and
+/// allocated a new one and copied the whole result into it: every BLAS
+/// helper (`stdlib/linalg/matrix.cleave`, `blas_*`) copied its output, a
+/// few hundred MB per nanoLM training step.
+///
+/// History: it used to be a fully *dynamic*-layout result,
 /// deliberately never the plain, no-layout memref `ty_to_mlir`/`array_
 /// memref_type` give `Ty::Array` everywhere else (`result_ty`, this
 /// function's own last argument, still carries that plain form — its
@@ -5852,30 +5862,6 @@ fn build_to_buffer_dynamic_layout<'c>(
         );
     };
     let a = lower_cval(context, block, env, a_arg, result_ty);
-    let plain = MemRefType::try_from(result_ty).unwrap_or_else(|e| {
-        panic!("MLIR lowering: `to_buffer`'s own result must be a memref: {e}")
-    });
-    let rank = plain.rank();
-    let elem_ty = plain.element();
-    let mut dims_text = String::new();
-    for i in 0..rank {
-        let DimSize::Static(d) = plain.dim_size(i).unwrap_or_else(|e| {
-            panic!("MLIR lowering: `to_buffer`'s own result has no dimension {i}: {e}")
-        }) else {
-            panic!(
-                "MLIR lowering: `to_buffer`'s own result must have every dimension statically known"
-            );
-        };
-        dims_text.push_str(&format!("{d}x"));
-    }
-    let strides_text = vec!["?"; rank as usize].join(", ");
-    let dynamic_ty = Type::parse(
-        context,
-        &format!("memref<{dims_text}{elem_ty}, strided<[{strides_text}], offset: ?>>"),
-    )
-    .unwrap_or_else(|| {
-        panic!("MLIR lowering: failed to parse `to_buffer`'s own dynamic-strided result type")
-    });
     let parsed_attrs: Vec<_> = attrs
         .iter()
         .map(|(name, text)| {
@@ -5890,7 +5876,7 @@ fn build_to_buffer_dynamic_layout<'c>(
     let built = OperationBuilder::new("bufferization.to_buffer", location)
         .add_operands(&[a])
         .add_attributes(&parsed_attrs)
-        .add_results(&[dynamic_ty])
+        .add_results(&[result_ty])
         .build()
         .unwrap_or_else(|e| panic!("MLIR lowering: failed to build bufferization.to_buffer: {e}"));
     block.append_operation(built).result(0).unwrap().into()

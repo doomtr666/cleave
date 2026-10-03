@@ -655,3 +655,117 @@ fn transcendentals_on_tensors_are_not_libm_calls() {
         assert!(!ir.contains(intrinsic), "`{intrinsic}` left in the IR: it becomes one libm call per element");
     }
 }
+
+/// A BLAS helper hands `sgemm`'s output straight back: the buffer passed as
+/// `c` is the function's result, no copy. `to_buffer` used to give the extern
+/// a dynamic-layout view, and the identity-layout result type then forced
+/// One-Shot Bufferize to allocate and copy the whole output on every call
+/// (`mlir_lower.rs::build_to_buffer_dynamic_layout`).
+#[test]
+fn a_blas_helper_returns_its_output_without_copying_it() {
+    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("blas_no_copy.cleave");
+    let dump = dir.join("blas_no_copy_post_dealloc.mlir");
+    let _ = std::fs::remove_file(&dump);
+    std::fs::write(
+        &source,
+        "
+        use nn;
+        fn main() -> i32 {
+            rand_seed(1);
+            let a: Tensor<f32, 64, 32> = Init::he();
+            let b: Tensor<f32, 48, 32> = Init::he();
+            let c = blas_matmul_transpose_b(a, b);
+            if c[1, 2] == 12345.0 { 1 } else { 0 }
+        }
+        ",
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--no-debug-info", "--run"])
+        .arg(&source)
+        .env("CLEAVE_DUMP_POST_DEALLOC", &dump)
+        .output()
+        .expect("cannot run cleave");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("main returned: 0"), "stdout: {stdout}\nstderr: {}", String::from_utf8_lossy(&output.stderr));
+    let ir = std::fs::read_to_string(&dump).expect("no IR dumped");
+    let helper: String = ir
+        .lines()
+        .skip_while(|l| !l.contains("func.func private @\"blas_matmul_transpose_b"))
+        .take_while(|l| !l.starts_with("  }"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!helper.is_empty(), "the helper isn't in the IR");
+    assert!(!helper.contains("memref.copy"), "the helper copies its output:\n{helper}");
+}
+
+/// Tensors handed over inside an aggregate are written in place, not copied
+/// into it (`redundant_copy_elim.rs`, `forward_dead_source_copies`,
+/// `forward_out_param_copies`): an array filled by loops and returned in a
+/// tuple (`Tensor(data: buf)`'s defensive copy dropped, the tuple element's
+/// storage allocated before the loops), and a function's result stored in a
+/// struct field (the call writes the field directly). Every whole-tensor copy
+/// of a nanoLM training step was one of these.
+#[test]
+fn tensors_handed_over_in_aggregates_are_not_copied() {
+    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("aggregates_no_copy.cleave");
+    let dump = dir.join("aggregates_no_copy_post_dealloc.mlir");
+    let _ = std::fs::remove_file(&dump);
+    std::fs::write(
+        &source,
+        "
+        use nn;
+        struct Pair { a: Tensor<f32, 64, 64>, b: Tensor<f32, 64, 64> }
+        #[no_inline]
+        fn filled(x: f32) -> (Tensor<f32, 64, 64>, Tensor<f32, 64, 64>) {
+            let mut p: [[f32; 64]; 64] = mlir::memref::alloc();
+            let mut q: [[f32; 64]; 64] = mlir::memref::alloc();
+            for i in 0..64 { for j in 0..64 { p[i, j] = x; q[i, j] = x + 1.0; }; };
+            (Tensor(data: p), Tensor(data: q))
+        }
+        #[no_inline]
+        fn doubled(t: Tensor<f32, 64, 64>) -> Tensor<f32, 64, 64> { t + t }
+        #[no_inline]
+        fn pair(x: f32) -> Pair {
+            let (p, q) = filled(x);
+            Pair(a: doubled(p), b: doubled(q))
+        }
+        fn main() -> i32 {
+            let r = pair(2.0);
+            if r.a[3, 4] == 4.0 and r.b[5, 6] == 6.0 { 0 } else { 1 }
+        }
+        ",
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--no-debug-info", "--run"])
+        .arg(&source)
+        .env("CLEAVE_DUMP_POST_DEALLOC", &dump)
+        .output()
+        .expect("cannot run cleave");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("main returned: 0"), "stdout: {stdout}\nstderr: {}", String::from_utf8_lossy(&output.stderr));
+    let ir = std::fs::read_to_string(&dump).expect("no IR dumped");
+    for name in ["@filled", "@pair"] {
+        let body: String = ir
+            .lines()
+            .skip_while(|l| !(l.contains("func.func") && l.contains(name)))
+            .take_while(|l| !l.starts_with("  }"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!body.is_empty(), "`{name}` isn't in the IR");
+        let copies: Vec<&str> = body
+            .lines()
+            .filter(|l| {
+                let Some(rest) = l.trim().strip_prefix("memref.copy ") else { return false };
+                let operands: Vec<&str> = rest.split(" :").next().unwrap_or("").split(", ").collect();
+                operands.len() == 2 && operands[0] != operands[1]
+            })
+            .collect();
+        assert!(copies.is_empty(), "`{name}` copies a tensor:\n{}", copies.join("\n"));
+    }
+}

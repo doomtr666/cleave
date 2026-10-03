@@ -60,8 +60,7 @@ fn build_unified_module<'c>(context: &'c Context, src: &str) -> melior::ir::Modu
 
 
     let pass_manager = pass::PassManager::new(context);
-    pass::bufferization::register_one_shot_bufferize_pass();
-    pass::bufferization::register_empty_tensor_elimination_pass();
+    cleave::pipeline::register_passes();
     parse_pass_pipeline(
         pass_manager.as_operation_pass_manager(),
         "builtin.module(eliminate-empty-tensors,one-shot-bufferize{bufferize-function-boundaries=true})",

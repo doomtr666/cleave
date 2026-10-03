@@ -877,12 +877,34 @@ fn is_minor_identity(map: &str) -> bool {
     results.len() <= dims.len() && dims[dims.len() - results.len()..] == results[..]
 }
 
+/// Registers, once per process, every pass `lower_to_llvm` names in a
+/// textual pipeline (`parse_pass_pipeline` looks them up by name). MLIR's pass
+/// registry is a global, unsynchronized table: registering at each use, as
+/// this used to, wrote to it while another thread compiling at the same time
+/// (the test harnesses run compilations in parallel) read it, an intermittent
+/// `STATUS_ACCESS_VIOLATION` in the test suite.
+pub fn register_passes() {
+    static REGISTERED: std::sync::Once = std::sync::Once::new();
+    REGISTERED.call_once(|| {
+        pass::affine::register_affine_parallelize();
+        pass::affine::register_affine_vectorize();
+        pass::bufferization::register_buffer_results_to_out_params_pass();
+        pass::bufferization::register_empty_tensor_elimination_pass();
+        pass::bufferization::register_one_shot_bufferize_pass();
+        pass::conversion::register_vector_to_scf();
+        pass::transform_dialect::register_interpreter_pass();
+        pass::transform_dialect::register_preload_library_pass();
+        pass::vector::register_lower_vector_multi_reduction();
+    });
+}
+
 pub fn lower_to_llvm<'c>(
     context: &'c Context,
     module: &mut Module<'c>,
     options: &CodegenOptions,
 ) -> Result<(), Vec<String>> {
     let Backend::Cpu = options.backend;
+    register_passes();
 
     // Inline, then fuse elementwise tensor ops, *before* bufferization --
     // found directly with VTune against a real training run
@@ -991,8 +1013,6 @@ pub fn lower_to_llvm<'c>(
     // own checkout location (`I:/Dev/cleave/...`), silently broken on any
     // other clone.
     let pass_manager = pass::PassManager::new(context);
-    pass::transform_dialect::register_preload_library_pass();
-    pass::transform_dialect::register_interpreter_pass();
     if parse_pass_pipeline(
         pass_manager.as_operation_pass_manager(),
         &format!(
@@ -1095,8 +1115,6 @@ pub fn lower_to_llvm<'c>(
     }
 
     let pass_manager = pass::PassManager::new(context);
-    pass::bufferization::register_one_shot_bufferize_pass();
-    pass::bufferization::register_empty_tensor_elimination_pass();
     // `eliminate-empty-tensors` first: it is what lets a struct field's own
     // `materialize_in_destination` (`mlir_lower.rs::build_tensor_descriptor_
     // value`) turn the tensor's producer into a direct write into the field's
@@ -1158,6 +1176,35 @@ pub fn lower_to_llvm<'c>(
     // writable`, so the promise is genuinely true and this pass — reused
     // here as-is, no longer worked around — frees the *copy*, never the
     // struct's own storage.
+    // A function's tensor results become out-parameters the caller allocates
+    // (`hoist-static-allocs`: a result that was the callee's own fresh
+    // `memref.alloc` is written straight into the caller's buffer, no copy in
+    // the callee). Before the deallocation passes, which then see plain
+    // caller-owned buffers. `redundant_copy_elim::forward_out_param_copies`
+    // then hands the call the final destination directly when the result was
+    // only copied there (a struct field, a tuple element).
+    // First, so a function returning a filled array (`Tensor(data: buf)`)
+    // returns that array's own allocation, which the out-params pass then
+    // hoists to the caller.
+    crate::redundant_copy_elim::forward_dead_source_copies(&mut *module);
+    let pass_manager = pass::PassManager::new(context);
+    if parse_pass_pipeline(
+        pass_manager.as_operation_pass_manager(),
+        "builtin.module(buffer-results-to-out-params{hoist-static-allocs=true})",
+    )
+    .is_err()
+        || pass_manager.run(&mut *module).is_err()
+    {
+        return Err(vec![
+            "MLIR-to-LLVM lowering pass failed (buffer-results-to-out-params)".to_string(),
+        ]);
+    }
+    crate::redundant_copy_elim::forward_out_param_copies(context, &mut *module);
+    if let Ok(path) = std::env::var("CLEAVE_DUMP_POST_OUT_PARAMS") {
+        std::fs::write(&path, module.as_operation().to_string())
+            .unwrap_or_else(|e| eprintln!("CLEAVE_DUMP_POST_OUT_PARAMS: failed to write {path}: {e}"));
+    }
+
     let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::bufferization::create_ownership_based_buffer_deallocation_pass());
     pass_manager.add_pass(pass::bufferization::create_buffer_deallocation_simplification_pass());
@@ -1209,7 +1256,6 @@ pub fn lower_to_llvm<'c>(
     // for whatever reduction shape (if any) remains.
     let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::transform::create_canonicalizer());
-    pass::vector::register_lower_vector_multi_reduction();
     if parse_pass_pipeline(
         pass_manager.as_operation_pass_manager(),
         "builtin.module(func.func(lower-vector-multi-reduction))",
@@ -1328,7 +1374,6 @@ pub fn lower_to_llvm<'c>(
     // comment for the default split (AOT `true`, JIT `false`) and why.
     if options.openmp {
         let pass_manager = pass::PassManager::new(context);
-        pass::affine::register_affine_parallelize();
         if parse_pass_pipeline(
             pass_manager.as_operation_pass_manager(),
             "builtin.module(func.func(affine-parallelize{max-nested=1}))",
@@ -1418,7 +1463,6 @@ pub fn lower_to_llvm<'c>(
     // nesting `mlir-opt`'s own `--pass-pipeline=` flag would, unlike `one-
     // shot-bufferize` above, which really does run at the module level.
     let pass_manager = pass::PassManager::new(context);
-    pass::affine::register_affine_vectorize();
     if parse_pass_pipeline(
         pass_manager.as_operation_pass_manager(),
         "builtin.module(func.func(affine-super-vectorize{virtual-vector-size=16}))",
@@ -1448,7 +1492,6 @@ pub fn lower_to_llvm<'c>(
     // `matmul_transpose_b<8x16, 8x16>`, i.e. any kernel built `--no-inline`;
     // inlining had happened to route those loops elsewhere).
     let pass_manager = pass::PassManager::new(context);
-    pass::conversion::register_vector_to_scf();
     if has_permuted_transfer(module.as_operation()) && parse_pass_pipeline(
         pass_manager.as_operation_pass_manager(),
         "builtin.module(func.func(convert-vector-to-scf{target-rank=0}))",
