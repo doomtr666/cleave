@@ -2483,6 +2483,11 @@ fn lower_prim_op<'c>(
     ty: &Ty,
 ) -> Option<Value<'c, 'c>> {
     match op {
+        PrimOp::Spawn { unit } => lower_spawn(ctx, block, env, unit, args),
+        PrimOp::Await | PrimOp::Sync => {
+            lower_task_wait(ctx, block, env, args);
+            None
+        }
         PrimOp::Extern {
             symbol,
             param_types,
@@ -7019,6 +7024,131 @@ fn ensure_extern_declared<'c>(
         location,
     );
     ctx.module.body().append_operation(decl);
+}
+
+/// A spawned call (`PrimOp::Spawn`, `doc/plan-spawn.md`): the same `func.call`
+/// an ordinary call to `unit` lowers to (`lower_real_call`), `no_inline` so
+/// MLIR's inliner keeps it a call, preceded by a call to the operand-less
+/// marker `cleave_spawn_next(<unit>)`: the post-bufferization task pass
+/// (`cleave-mlir-shim`'s `cleaveLowerSpawns`) wraps the next call *to `unit`*
+/// after each marker in an `omp.task` — after bufferization, since One-Shot
+/// Bufferize can't see through an `omp.task` region. A marker call rather than
+/// an attribute on the call: bufferization rebuilds calls and drops their
+/// attributes. Named after the callee because other calls can land in
+/// between: the storage of a tuple element the result goes into
+/// (`build_tensor_descriptor_value`'s `cleave_alloc_rc`) is placed right
+/// before the call producing it; "the next call" once took that allocation
+/// for the spawned call.
+fn lower_spawn<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    unit: &str,
+    args: &[CVal],
+) -> Option<Value<'c, 'c>> {
+    let Some((param_types, result_ty)) = ctx.signatures.get(unit) else {
+        panic!("MLIR lowering: spawn of unknown top-level fn `{unit}`");
+    };
+    let context = ctx.context;
+    let arg_values: Vec<Value> = args
+        .iter()
+        .zip(param_types)
+        .map(|(a, t)| lower_cval(context, block, env, a, ty_to_mlir(ctx, t)))
+        .collect();
+    let results: Vec<Type> = if is_unit_ty(result_ty) {
+        vec![]
+    } else {
+        vec![ty_to_mlir(ctx, result_ty)]
+    };
+    // Without tasks (`CodegenOptions::tasks`), an ordinary call: no marker,
+    // and inlinable like any other — `no_inline` would cost the fusion an
+    // inlined call gets, for a call that runs in place anyway.
+    if !crate::options::current().tasks {
+        let call = block.append_operation(func::call(context, FlatSymbolRefAttribute::new(context, unit), &arg_values, &results, gen_loc(context)));
+        return (!results.is_empty()).then(|| call.result(0).unwrap().into());
+    }
+    let unit_attr = Attribute::parse(context, "unit").expect("`unit` is a valid attribute");
+    let marker = format!("cleave_spawn_next({unit})");
+    if ctx.declared_externs.borrow_mut().insert(marker.clone()) {
+        let decl = func::func(
+            context,
+            StringAttribute::new(context, &marker),
+            TypeAttribute::new(FunctionType::new(context, &[], &[]).into()),
+            Region::new(),
+            &[(Identifier::new(context, "sym_visibility"), StringAttribute::new(context, "private").into())],
+            Location::new(context, &gen_source_file(), 1, 1),
+        );
+        ctx.module.body().append_operation(decl);
+    }
+    block.append_operation(func::call(context, FlatSymbolRefAttribute::new(context, &marker), &[], &[], gen_loc(context)));
+    let call = OperationBuilder::new("func.call", gen_loc(context))
+        .add_operands(&arg_values)
+        .add_results(&results)
+        .add_attributes(&[
+            (Identifier::new(context, "callee"), FlatSymbolRefAttribute::new(context, unit).into()),
+            (Identifier::new(context, "no_inline"), unit_attr),
+        ])
+        .build()
+        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build a spawned func.call: {e}"));
+    let call = block.append_operation(call);
+    (!results.is_empty()).then(|| call.result(0).unwrap().into())
+}
+
+/// `PrimOp::Await`/`PrimOp::Sync`: a call to an external marker the task pass
+/// (`pipeline.rs`) replaces with `omp.taskwait`. Its operands are the spawn's
+/// handle and arguments (the variables among them; a literal has nothing to
+/// keep alive), so bufferization and buffer deallocation see them used here,
+/// not just at the spawned call: a buffer the task reads isn't freed under
+/// it. One marker declaration per operand signature, every argument
+/// `bufferization.access = "read"` — otherwise One-Shot Bufferize assumes an
+/// external callee may write its tensor arguments and copies them.
+fn lower_task_wait<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, env: &HashMap<CVar, Value<'c, 'c>>, args: &[CVal]) {
+    // Without tasks every spawned call ran in place: nothing to wait for.
+    if !crate::options::current().tasks {
+        return;
+    }
+    let context = ctx.context;
+    let values: Vec<Value> = args
+        .iter()
+        .filter_map(|a| match a {
+            CVal::Var(v) => env.get(v).copied(),
+            _ => None,
+        })
+        .collect();
+    let types: Vec<Type> = values.iter().map(|v| v.r#type()).collect();
+    let signature = types.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ");
+    let symbol = format!("cleave_task_wait({signature})");
+    if ctx.declared_externs.borrow_mut().insert(symbol.clone()) {
+        let read = (0..types.len()).map(|_| "{bufferization.access = \"read\"}").collect::<Vec<_>>().join(", ");
+        let arg_attrs = Attribute::parse(context, &format!("[{read}]")).expect("valid arg_attrs");
+        let location = Location::new(context, &gen_source_file(), 1, 1);
+        let mut attributes = vec![(
+            Identifier::new(context, "sym_visibility"),
+            StringAttribute::new(context, "private").into(),
+        )];
+        if !types.is_empty() {
+            attributes.push((Identifier::new(context, "arg_attrs"), arg_attrs));
+        }
+        let decl = func::func(
+            context,
+            StringAttribute::new(context, &symbol),
+            TypeAttribute::new(FunctionType::new(context, &types, &[]).into()),
+            Region::new(),
+            &attributes,
+            location,
+        );
+        ctx.module.body().append_operation(decl);
+    }
+    let unit_attr = Attribute::parse(context, "unit").expect("`unit` is a valid attribute");
+    let call = OperationBuilder::new("func.call", gen_loc(context))
+        .add_operands(&values)
+        .add_attributes(&[
+            (Identifier::new(context, "callee"), FlatSymbolRefAttribute::new(context, &symbol).into()),
+            (Identifier::new(context, "cleave.task_wait"), unit_attr),
+        ])
+        .build()
+        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build a task wait: {e}"));
+    block.append_operation(call);
 }
 
 /// `expected_type` covers the cases that need it: a bare literal `CVal`

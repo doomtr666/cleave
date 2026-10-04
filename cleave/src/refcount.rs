@@ -679,6 +679,12 @@ fn walk_var_info(
             var_types.insert(*var, ty.clone());
             let is_owned = match op {
                 PrimOp::Struct(..) => true,
+                // A spawned call's result (`doc/plan-spawn.md`) is a call's
+                // fresh result, owned exactly like the single param of an
+                // ordinary call's resumption (below). Not owned, it was never
+                // released: a data-parallel training step leaked every
+                // micro-batch gradient.
+                PrimOp::Spawn { .. } => true,
                 // `Load` (`arr[i]`) needs the identical inherit-from-base
                 // rule `Field` already has, for the identical reason: an
                 // element extracted out of an array that itself traces

@@ -109,6 +109,15 @@ pub fn find_region_local_functions(program: &CpsProgram) -> HashSet<String> {
     for f in &program.funcs {
         find_loops_and_mark(&f.def.body, &top_level_names, &call_counts, &mut region_local);
     }
+    // A spawned function (`doc/plan-spawn.md`) may run on another thread than
+    // its caller, whose region it would allocate in: never region-local. Its
+    // own loops still open their regions, on the thread running the task
+    // (each thread has its own arena, `cleave-rt`).
+    let mut spawned = HashSet::new();
+    for f in &program.funcs {
+        collect_spawned_units(&f.def.body, &mut spawned);
+    }
+    region_local.retain(|name| !spawned.contains(name));
 
     // Transitive descent -- a worklist, not a single extra pass, since a
     // freshly-marked callee's own body might itself call a *third* function
@@ -552,4 +561,27 @@ fn reaches_escaping(start: CVar, children: &HashMap<CVar, Vec<CVar>>, escaping: 
         }
     }
     false
+}
+
+/// Every unit `expr` spawns (`PrimOp::Spawn`).
+fn collect_spawned_units(expr: &CExpr, out: &mut HashSet<String>) {
+    match expr {
+        CExpr::LetPrim { op, cont, .. } => {
+            if let crate::cps::PrimOp::Spawn { unit } = op {
+                out.insert(unit.clone());
+            }
+            collect_spawned_units(cont, out);
+        }
+        CExpr::App { .. } => {}
+        CExpr::Fix { defs, body } => {
+            for d in defs {
+                collect_spawned_units(&d.body, out);
+            }
+            collect_spawned_units(body, out);
+        }
+        CExpr::If { then_branch, else_branch, .. } => {
+            collect_spawned_units(then_branch, out);
+            collect_spawned_units(else_branch, out);
+        }
+    }
 }

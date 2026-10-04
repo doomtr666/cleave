@@ -73,6 +73,7 @@ pub struct Build {
     inline: Option<bool>,
     unroll_jam: Option<bool>,
     llvm_loop_unroll: Option<bool>,
+    tasks: Option<bool>,
     chain_split: Option<bool>,
     affine_structs: Option<bool>,
     tag_releases: Option<bool>,
@@ -98,6 +99,7 @@ impl Build {
             inline: None,
             unroll_jam: None,
             llvm_loop_unroll: None,
+            tasks: None,
             chain_split: None,
             affine_structs: None,
             tag_releases: None,
@@ -165,6 +167,12 @@ impl Build {
     /// See `cleave::pipeline::CodegenOptions::llvm_loop_unroll`'s own doc comment.
     pub fn llvm_loop_unroll(&mut self, enabled: bool) -> &mut Self {
         self.llvm_loop_unroll = Some(enabled);
+        self
+    }
+
+    /// See `cleave::pipeline::CodegenOptions::tasks`'s own doc comment.
+    pub fn tasks(&mut self, enabled: bool) -> &mut Self {
+        self.tasks = Some(enabled);
         self
     }
 
@@ -288,6 +296,7 @@ impl Build {
             inline: self.inline.unwrap_or(defaults.inline),
             unroll_jam: self.unroll_jam.unwrap_or(defaults.unroll_jam),
             llvm_loop_unroll: self.llvm_loop_unroll.unwrap_or(defaults.llvm_loop_unroll),
+            tasks: self.tasks.unwrap_or(defaults.tasks),
             chain_split: self.chain_split.unwrap_or(defaults.chain_split),
             affine_structs: self.affine_structs.unwrap_or(defaults.affine_structs),
             tag_releases: self.tag_releases.unwrap_or(defaults.tag_releases),
@@ -322,15 +331,18 @@ impl Build {
                 .join()
                 .unwrap_or_else(|e| std::panic::resume_unwind(e))
         });
-        if let Err(errs) = result {
-            panic!("cleave-build: failed to compile `{name}`:\n{}", errs.join("\n"));
-        }
+        let needs_openmp = match result {
+            Ok(needs_openmp) => needs_openmp,
+            Err(errs) => panic!("cleave-build: failed to compile `{name}`:\n{}", errs.join("\n")),
+        };
 
         println!("cargo:rustc-link-arg={}", object_path.display());
         println!("cargo:rustc-link-lib=static=cleave_rt");
         println!("cargo:rustc-link-search=native={}", build_cleave_rt(&out_dir).display());
 
-        if options.openmp {
+        // `--openmp`'s parallel loops, or `spawn`'s tasks (`cleave::pipeline::
+        // compile_and_emit`'s result).
+        if needs_openmp {
             // `libomp` -- needed the moment `emit_object`'s own OpenMP
             // parallelization stage was exercised (`cleave::pipeline::
             // register_openmp_stub_symbols`'s own doc comment: the emitted

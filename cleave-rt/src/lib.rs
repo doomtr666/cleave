@@ -390,13 +390,61 @@ fn pool_unlock() {
 }
 
 /// Bytes of freed blocks one thread keeps per size class before handing the
-/// excess back to the shared lists (`FREE_LISTS`). In bytes, not blocks: a
-/// class of 16 MiB tensors keeps two, a class of 64-byte structs half a
-/// million.
-const THREAD_CACHE_BYTES: usize = 32 << 20;
+/// excess back to the shared lists (`FREE_LISTS`). In bytes, not blocks.
+/// Small on purpose: with tasks (`doc/plan-spawn.md`), blocks are often
+/// allocated on one thread and freed on another (a task's result, released by
+/// its parent), so the freeing thread's cache fills while the allocating
+/// threads find theirs empty — a cache sized for one thread alone hoarded
+/// hundreds of megabytes that way.
+const THREAD_CACHE_BYTES: usize = 512 << 10;
+
+/// Blocks above this size skip the thread caches entirely: the depot's lock
+/// costs nothing next to what a block this large is used for, and it's these
+/// that are expensive to hoard (tcmalloc's large-object rule).
+const THREAD_CACHE_MAX_BLOCK: usize = 256 << 10;
+
+/// `CLEAVE_NO_THREAD_CACHE=1`: every block goes straight to the depot, so the
+/// bytes still allocated are exactly the live ones — what a leak test needs
+/// (`cleave/tests/spawn_leaks.rs`).
+static NO_THREAD_CACHE: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("CLEAVE_NO_THREAD_CACHE").is_some());
 
 fn thread_cache_cap(class: usize) -> usize {
     (THREAD_CACHE_BYTES / class_bytes(class)).max(1)
+}
+
+/// Whether blocks of `class` go through the thread caches at all.
+fn thread_cached(class: usize) -> bool {
+    class_bytes(class) <= THREAD_CACHE_MAX_BLOCK && !*NO_THREAD_CACHE
+}
+
+/// One block of `class` from the depot, if any.
+///
+/// # Safety
+///
+/// `class < NUM_SIZE_CLASSES`.
+unsafe fn depot_pop(class: usize) -> Option<*mut u8> {
+    pool_lock();
+    let b = unsafe { FREE_LISTS[class] };
+    if !b.is_null() {
+        unsafe { FREE_LISTS[class] = *(b as *mut *mut u8) };
+    }
+    pool_unlock();
+    (!b.is_null()).then_some(b)
+}
+
+/// `block` back to the depot.
+///
+/// # Safety
+///
+/// `block` is a freed block of `class`, owned by no one.
+unsafe fn depot_push(class: usize, block: *mut u8) {
+    pool_lock();
+    unsafe {
+        *(block as *mut *mut u8) = FREE_LISTS[class];
+        FREE_LISTS[class] = block;
+    }
+    pool_unlock();
 }
 
 /// Each thread's own free lists, in front of the shared `FREE_LISTS`
@@ -457,6 +505,9 @@ unsafe fn move_to_depot(head: &std::cell::Cell<*mut u8>, count: &std::cell::Cell
 /// A cached block of `class`, if any: this thread's list first, then a batch
 /// from the depot.
 fn pool_pop(class: usize) -> Option<*mut u8> {
+    if !thread_cached(class) {
+        return unsafe { depot_pop(class) };
+    }
     let local = THREAD_CACHE.try_with(|c| unsafe {
         let head = &c.head[class];
         let block = head.get();
@@ -489,15 +540,7 @@ fn pool_pop(class: usize) -> Option<*mut u8> {
     match local {
         Ok(found) => found,
         // This thread's cache is already gone (thread exit): the depot alone.
-        Err(_) => unsafe {
-            pool_lock();
-            let b = FREE_LISTS[class];
-            if !b.is_null() {
-                FREE_LISTS[class] = *(b as *mut *mut u8);
-            }
-            pool_unlock();
-            (!b.is_null()).then_some(b)
-        },
+        Err(_) => unsafe { depot_pop(class) },
     }
 }
 
@@ -507,6 +550,9 @@ fn pool_pop(class: usize) -> Option<*mut u8> {
 ///
 /// `block` is a freed block of `class`, owned by no one.
 unsafe fn pool_push(class: usize, block: *mut u8) {
+    if !thread_cached(class) {
+        return unsafe { depot_push(class, block) };
+    }
     let pushed = THREAD_CACHE.try_with(|c| unsafe {
         *(block as *mut *mut u8) = c.head[class].get();
         c.head[class].set(block);
@@ -518,12 +564,7 @@ unsafe fn pool_push(class: usize, block: *mut u8) {
         }
     });
     if pushed.is_err() {
-        unsafe {
-            pool_lock();
-            *(block as *mut *mut u8) = FREE_LISTS[class];
-            FREE_LISTS[class] = block;
-            pool_unlock();
-        }
+        unsafe { depot_push(class, block) };
     }
 }
 
@@ -1458,6 +1499,65 @@ const CBLAS_TRANS: i32 = 112;
 /// own `OnceLock` already guards the *load*; this is a separate, later step
 /// -- the *call*.)
 static PIN_BLAS_THREADS: std::sync::Once = std::sync::Once::new();
+/// How many threads a parallel region opened for `spawn`'s tasks gets
+/// (`doc/plan-spawn.md`; the region itself, `cleave-mlir-shim`'s
+/// `cleaveLowerSpawns`): `OMP_NUM_THREADS` when set, otherwise one per
+/// physical core. Not libomp's default of one per logical core: with SMT, the
+/// sibling of a core running a task spins waiting for work and takes that
+/// core's execution resources from it — nanoLM's data-parallel step, 8 threads
+/// against 16 on an 8-core, 16-thread CPU, alternating runs in one session:
+/// 275-276 against 290 ms/step, about 5% faster. Computed once.
+#[unsafe(no_mangle)]
+pub extern "C" fn cleave_parallel_threads() -> i32 {
+    static THREADS: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *THREADS.get_or_init(|| {
+        let from_env = std::env::var("OMP_NUM_THREADS")
+            .ok()
+            .and_then(|v| v.split(',').next().and_then(|n| n.trim().parse::<i32>().ok()))
+            .filter(|&n| n > 0);
+        from_env.unwrap_or_else(|| {
+            physical_cores()
+                .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
+                .unwrap_or(1) as i32
+        })
+    })
+}
+
+/// The machine's physical cores: one `RelationProcessorCore` record each.
+#[cfg(windows)]
+fn physical_cores() -> Option<usize> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetLogicalProcessorInformationEx(relationship: u32, buffer: *mut u8, length: *mut u32) -> i32;
+    }
+    const RELATION_PROCESSOR_CORE: u32 = 0;
+    let mut len = 0u32;
+    unsafe { GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, std::ptr::null_mut(), &mut len) };
+    if len == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; len as usize];
+    if unsafe { GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, buf.as_mut_ptr(), &mut len) } == 0 {
+        return None;
+    }
+    // Each record: `Relationship: u32`, `Size: u32` (the record's own size), ...
+    let (mut count, mut offset) = (0, 0usize);
+    while offset + 8 <= len as usize {
+        let size = u32::from_le_bytes(buf[offset + 4..offset + 8].try_into().ok()?) as usize;
+        if size == 0 {
+            break;
+        }
+        count += 1;
+        offset += size;
+    }
+    (count > 0).then_some(count)
+}
+
+#[cfg(not(windows))]
+fn physical_cores() -> Option<usize> {
+    None
+}
+
 fn ensure_thread_count_pinned() {
     PIN_BLAS_THREADS
         .call_once(|| unsafe { (blas_dynload::fns().openblas_set_num_threads)(1) });
@@ -2461,6 +2561,22 @@ mod pool_thread_tests {
         drop(senders);
         for h in handles {
             h.join().expect("a thread failed");
+        }
+    }
+}
+
+#[cfg(test)]
+mod parallel_threads_tests {
+    /// One thread per physical core (or `OMP_NUM_THREADS`): never more than
+    /// the logical processors, at least one. On SMT hardware, half of them.
+    #[test]
+    fn parallel_threads_are_physical_cores() {
+        let n = super::cleave_parallel_threads() as usize;
+        let logical = std::thread::available_parallelism().unwrap().get();
+        assert!(n >= 1 && n <= logical, "{n} threads for {logical} logical processors");
+        if std::env::var_os("OMP_NUM_THREADS").is_none() {
+            #[cfg(windows)]
+            assert_eq!(Some(n), super::physical_cores());
         }
     }
 }

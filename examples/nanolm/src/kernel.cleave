@@ -213,6 +213,56 @@ fn gpt_loss(x: [i32; ROWS], y: [i32; ROWS], p: [i32; ROWS], m: Gpt) -> f32 {
 
 gpt_grad = grad(gpt_loss, m);
 
+// Data parallelism (`doc/plan-spawn.md`): a batch's `ROWS` split into `SPLIT`
+// micro-batches of whole sequences, each one's gradient computed in its own
+// task, the gradients summed. The loss is a sum over rows, so the sum of the
+// parts' gradients is the batch's gradient (up to the order of the float
+// additions).
+define SPLIT: i32 = 8;
+define MICRO: i32 = ROWS / SPLIT;
+
+fn gpt_loss_micro(x: [i32; MICRO], y: [i32; MICRO], p: [i32; MICRO], m: Gpt) -> f32 {
+    sparse_cross_entropy(gpt_logits(x, p, m), y)
+}
+
+gpt_grad_micro = grad(gpt_loss_micro, m);
+
+// Micro-batch `j` of a batch: rows `j * MICRO ..`.
+fn micro(a: [i32; ROWS], j: i32) -> [i32; MICRO] { [for k in 0..MICRO: a[j * MICRO + k]] }
+
+fn parallel_grad(x: [i32; ROWS], y: [i32; ROWS], p: [i32; ROWS], m: Gpt) -> Gpt {
+    // Every micro-batch is whole sequences, so the same positions.
+    let pm = micro(p, 0);
+    let x0 = micro(x, 0);
+    let y0 = micro(y, 0);
+    let x1 = micro(x, 1);
+    let y1 = micro(y, 1);
+    let x2 = micro(x, 2);
+    let y2 = micro(y, 2);
+    let x3 = micro(x, 3);
+    let y3 = micro(y, 3);
+    let x4 = micro(x, 4);
+    let y4 = micro(y, 4);
+    let x5 = micro(x, 5);
+    let y5 = micro(y, 5);
+    let x6 = micro(x, 6);
+    let y6 = micro(y, 6);
+    let x7 = micro(x, 7);
+    let y7 = micro(y, 7);
+    let g0 = spawn gpt_grad_micro(x0, y0, pm, m);
+    let g1 = spawn gpt_grad_micro(x1, y1, pm, m);
+    let g2 = spawn gpt_grad_micro(x2, y2, pm, m);
+    let g3 = spawn gpt_grad_micro(x3, y3, pm, m);
+    let g4 = spawn gpt_grad_micro(x4, y4, pm, m);
+    let g5 = spawn gpt_grad_micro(x5, y5, pm, m);
+    let g6 = spawn gpt_grad_micro(x6, y6, pm, m);
+    let g7 = spawn gpt_grad_micro(x7, y7, pm, m);
+    sync;
+    phase_mark(1);
+    // A balanced tree, in a fixed order: the same result whatever the thread count.
+    accumulate(accumulate(accumulate(g0, g1), accumulate(g2, g3)), accumulate(accumulate(g4, g5), accumulate(g6, g7)))
+}
+
 fn gpt_validation_loss(m: Gpt, p: [i32; ROWS], batches: i32) -> f32 {
     let mut total: f64 = 0.0;
     for s in 0..batches { total = total + gpt_loss(val_inputs(s), val_targets(s), p, m).to(); };
@@ -238,6 +288,8 @@ fn learning_rate(s: i32, base: f32) -> f32 {
 
 // The end of a round, for the host to report with timings (`main.rs`).
 extern fn round_done(step: i32, train_loss: f32, validation_loss: f32, rate: f32);
+// TEMP profiling: the host times the phases of a step.
+extern fn phase_mark(id: i32);
 
 // Writes the initial weights to `gpt_init.ckpt` for the twin, trains `rounds` of `per_round` Adam
 // steps starting at step `first` (batches and learning rate are functions of the step, so a
@@ -264,7 +316,9 @@ export fn train_gpt(first: i32, rounds: i32, per_round: i32, lr: f32, seed: i64,
         for k in 0..per_round {
             let s = first + r * per_round + k;
             let opt = Adam(lr: learning_rate(s, lr), beta1: 0.9, beta2: 0.999, eps: 0.00000001);
-            (m, state) = step(opt, m, gpt_grad(train_inputs(s), train_targets(s), p, m), state);
+            phase_mark(0);
+            (m, state) = step(opt, m, parallel_grad(train_inputs(s), train_targets(s), p, m), state);
+            phase_mark(2);
         };
         save("gpt.ckpt", (m, state, rand_state()));
         let next = first + (r + 1) * per_round;

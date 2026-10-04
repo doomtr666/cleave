@@ -1,6 +1,6 @@
 # Plan: `spawn` — structured task parallelism, CPU tasks and GPU async compute
 
-Status (2026-10-03): steps 1-2 done — the libomp probe and runtime audit (§3-§4), then the runtime itself: atomic refcounts, per-thread arenas, a per-thread pool, no measurable single-threaded cost; OpenBLAS rebuilt with `USE_LOCKING` (release `cleave-openblas-0.3.33-r3`, to adopt in `ci/openblas-version.txt`). Step 3 begun: `spawn`/`sync` parse, type and run end to end under serial elision (a spawned call runs in place, `sync` is a no-op; `cleave/tests/spawn.rs`). Next: the parallel lowering (§ "Step 3, the first vertical slice", points 2-5). Agreed with the user on 2026-10-03; supersedes the open
+Status (2026-10-03): steps 1-2 done — the libomp probe and runtime audit (§3-§4), then the runtime itself: atomic refcounts, per-thread arenas, a per-thread pool, no measurable single-threaded cost; OpenBLAS rebuilt with `USE_LOCKING` (release `cleave-openblas-0.3.33-r3`, to adopt in `ci/openblas-version.txt`). Steps 3-5 and the first version of 6 done (below, "First results"). Next: the sequential parts of nanoLM's step (Adam over the model's fields, the gradient sum, the round's losses), which need arrays of futures or the `parallel for` of step 7.
 questions of the `doc/backlog.md` entry "An explicit, Cilk/Go-style `spawn`/`sync` concurrency
 primitive", which it answers. Decided: libomp's tasks as the scheduler (§4), atomic refcounts and a
 concurrent pool (§3).
@@ -204,6 +204,35 @@ so making them atomic is a change to `cleave-rt` alone.
 | OpenBLAS (`SINGLE_THREADED` build) | pinned to one thread (`Once`) | stays single-threaded (the parallelism is above the BLAS grain), but is now called from several threads at once: OpenBLAS documents concurrent calls into a single-threaded build as safe only with `USE_LOCKING=1` (its internal buffer allocator). 2400 concurrent calls (8 threads, distinct matrices) matched the serial results exactly and didn't crash — evidence, not proof | check `cleave-openblas-redist`'s build flags; add `USE_LOCKING=1` to the single-threaded build if absent (no OpenMP build: the existing one links the MSVC runtime) |
 | `memrefCopy`, MLIR's `malloc`/`free`, debug instrumentation (`Mutex`es) | stateless or locked | fine | — |
 
+### First results (2026-10-03)
+
+The language side: `spawn`/`sync` parse and type (`ExprKind::Spawn`, `StmtKind::Sync`); a misplaced
+`spawn` is a located error (`infer.rs::check_spawn_placement`); a spawned call reaching an extern that
+is neither `#[pure]` nor `#[reentrant]` is an error naming the path (`cps::check_spawn_purity`;
+`raw_sgemm` is `#[reentrant]`: it writes through a pointer, which `#[pure]` must never claim, yet
+touches no global state). CPS: `PrimOp::Spawn`/`Await`/`Sync`, awaits inserted before the first
+statement reading a spawned value. MLIR: the spawned call plus a `cleave_spawn_next` marker (an
+attribute doesn't survive bufferization, which rebuilds calls), `cleave_task_wait` markers keeping
+the arguments' buffers alive; after deallocation, `cleave_mlir_shim::lower_spawns` (C++) makes the
+tasks, the taskwaits and the parallel-region wrappers. The runtime picks one thread per physical
+core (`cleave_parallel_threads`). `cleave/tests/spawn.rs`, `cleave/tests/spawn_leaks.rs`.
+
+Traps found on the way: a function only ever spawned was dead-code-eliminated (reachability only saw
+labels); region analysis could make a spawned function region-local (it would allocate in a region
+its caller opened, on another thread); a spawned call's result wasn't owned by refcounting, so never
+released (each step leaked its gradients); the pool's thread caches hoarded blocks freed on another
+thread than their allocator's (a task's result released by its parent) — now 512 KB per class per
+thread, and blocks over 256 KB skip them.
+
+Measured: 8 spawns of a pure loop, 2.18 s serial against 0.33 s (6.6x on 8 cores). nanoLM, the
+gradient over 8 micro-batches of 512 rows (`parallel_grad`, `examples/nanolm/src/kernel.cleave`),
+the losses identical to four decimals: about 275 ms/step against about 800 single-threaded and about
+350 for PyTorch on 8 threads (runs in one session; between sessions the same binary moved 235-285).
+Profiled at that point (uProf, 16 threads): about 72% of CPU time in libomp's waits (spinning, then
+`Sleep`), the real work about 55% of the 8 physical cores — the step's sequential parts (Adam, the
+gradient sum, the round's losses) while the team waits. One thread per physical core against 16:
+about 5% (A/B, alternating).
+
 ## 5. First target and measurement
 
 nanoLM, data-parallel over micro-batches (§0), gradients summed in program order. Baselines: cleave
@@ -259,6 +288,12 @@ Bufferize can't see through an `omp.task` region. So the task is created *after*
 
 First version: an await is a `taskwait` (waits for all children) — conservative, correct by serial
 elision; per-future waits (`depend`) come after.
+
+Known gap: a spawned call's result is owned like any call's (`refcount.rs`), but an ordinary
+call's arguments are checked against the callee possibly returning one of them unchanged
+(`alias_analysis::IdentitySummary`); a spawned callee returning an argument as is would have that
+value released twice. Not the case of anything spawned so far; the check belongs with the others of
+step 4.
 
 ## 7. Open questions
 

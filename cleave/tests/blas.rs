@@ -103,6 +103,8 @@ fn run_f32(context: &Context, src: &str) -> f32 {
     // (which *does* set `target_cpu: "native"`) actually runs.
     let mut options = CodegenOptions::default();
     options.openmp = false;
+    // In-process engine without libomp: spawned calls run in place.
+    options.tasks = false;
     options.target_cpu = Some("native".to_string());
     cleave::options::set(options.clone());
     lower_to_llvm(context, &mut module, &options).unwrap_or_else(|e| panic!("lower_to_llvm failed: {e:?}"));

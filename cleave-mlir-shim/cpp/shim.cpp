@@ -25,6 +25,14 @@
 #include "mlir/CAPI/Support.h"
 #include "mlir/ExecutionEngine/OptUtils.h"
 #include "mlir/Dialect/Math/Transforms/Passes.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMTypes.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/OpenMP/OpenMPDialect.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
@@ -279,4 +287,209 @@ extern "C" bool cleaveApproximateMath(MlirOperation op) {
   config.setStrictness(GreedyRewriteStrictness::ExistingAndNewOps);
   config.enableFolding(false);
   return succeeded(applyOpPatternsGreedily(ops, std::move(patterns), config));
+}
+
+// `spawn` (cleave's `doc/plan-spawn.md`), after bufferization: One-Shot
+// Bufferize can't see through an `omp.task` region, so `mlir_lower.rs`
+// emits a spawned call as an ordinary call preceded by a call to the marker
+// `cleave_spawn_next`, and each wait (`Await`, `Sync`) as a call to a
+// `cleave_task_wait(...)` marker whose operands are the buffers to keep
+// alive until then. Here, in each function:
+//   - the call after each spawn marker moves into an `omp.task`; a scalar
+//     result goes through a slot written in the task and read back right
+//     before each use (a tensor result is already an out-parameter, written
+//     in place by the call);
+//   - each wait marker becomes `omp.taskwait`;
+//   - a function that spawns is renamed `<name>$tasks`, and `<name>` becomes
+//     a wrapper calling it directly inside a parallel region already, or
+//     inside a new one (`omp.parallel` around `omp.single`) otherwise: tasks
+//     need a team to run on, and opening one per spawning function would
+//     nest teams, which libomp serializes.
+// The markers' declarations are erased. Returns false on failure.
+namespace {
+
+bool isMarkerCall(Operation *op, StringRef prefix) {
+  auto call = dyn_cast<func::CallOp>(op);
+  return call && call.getCallee().starts_with(prefix);
+}
+
+// A slot for a value of type `t`, created at `b`'s insertion point.
+Value makeSlot(OpBuilder &b, Location loc, Type t) {
+  if (LLVM::isCompatibleType(t)) {
+    auto one = b.create<LLVM::ConstantOp>(loc, b.getI64Type(), b.getI64IntegerAttr(1));
+    return b.create<LLVM::AllocaOp>(loc, LLVM::LLVMPointerType::get(b.getContext()), t, one);
+  }
+  return b.create<memref::AllocaOp>(loc, MemRefType::get({}, t));
+}
+
+bool slotSupported(Type t) {
+  return LLVM::isCompatibleType(t) || isa<IntegerType, FloatType, IndexType>(t);
+}
+
+void storeSlot(OpBuilder &b, Location loc, Value v, Value slot) {
+  if (isa<LLVM::LLVMPointerType>(slot.getType()))
+    b.create<LLVM::StoreOp>(loc, v, slot);
+  else
+    b.create<memref::StoreOp>(loc, v, slot);
+}
+
+Value loadSlot(OpBuilder &b, Location loc, Type t, Value slot) {
+  if (isa<LLVM::LLVMPointerType>(slot.getType()))
+    return b.create<LLVM::LoadOp>(loc, t, slot);
+  return b.create<memref::LoadOp>(loc, slot);
+}
+
+// Wraps `call` in an `omp.task`; false (call left in place) if a result has
+// a type no slot handles.
+bool wrapInTask(func::CallOp call) {
+  for (Type t : call.getResultTypes())
+    if (!slotSupported(t))
+      return false;
+  OpBuilder b(call);
+  Location loc = call.getLoc();
+  SmallVector<Value> slots;
+  for (Type t : call.getResultTypes())
+    slots.push_back(makeSlot(b, loc, t));
+  // Every use of a result, outside the task, reads the slot instead. A wait
+  // marker's operands are only there to keep buffers alive until it; the
+  // marker becomes `omp.taskwait` right after, operands dropped.
+  for (auto [res, slot] : llvm::zip(call.getResults(), slots)) {
+    for (OpOperand &use : llvm::make_early_inc_range(res.getUses())) {
+      if (isMarkerCall(use.getOwner(), "cleave_task_wait"))
+        continue;
+      OpBuilder ub(use.getOwner());
+      use.set(loadSlot(ub, use.getOwner()->getLoc(), res.getType(), slot));
+    }
+  }
+  auto task = b.create<omp::TaskOp>(loc, omp::TaskOperands{});
+  Block *body = b.createBlock(&task.getRegion());
+  call->moveBefore(body, body->end());
+  OpBuilder tb = OpBuilder::atBlockEnd(body);
+  for (auto [res, slot] : llvm::zip(call.getResults(), slots))
+    storeSlot(tb, loc, res, slot);
+  tb.create<omp::TerminatorOp>(loc);
+  return true;
+}
+
+// `<name>` becomes `<name>$tasks`, plus a wrapper `<name>` running it on a team.
+void wrapInParallelRegion(ModuleOp module, func::FuncOp f) {
+  MLIRContext *ctx = module.getContext();
+  std::string name = f.getName().str();
+  std::string inner = name + "$tasks";
+  // Synthesized code, no source line: an unknown location. `f`'s own carries
+  // its debug-info subprogram, which LLVM allows on one function only.
+  Location loc = UnknownLoc::get(ctx);
+  OpBuilder mb(f);
+  auto wrapper = mb.create<func::FuncOp>(loc, name, f.getFunctionType());
+  // The wrapper takes over everything the function was known by (exported
+  // name, C interface, visibility); the body becomes a private function.
+  wrapper->setAttrs(f->getAttrs());
+  f.setName(inner);
+  wrapper.setName(name);
+  f->removeAttr("llvm.emit_c_interface");
+  SymbolTable::setSymbolVisibility(f, SymbolTable::Visibility::Private);
+
+  for (StringRef callee : {"omp_in_parallel", "cleave_parallel_threads"}) {
+    if (!module.lookupSymbol<func::FuncOp>(callee)) {
+      OpBuilder db = OpBuilder::atBlockBegin(module.getBody());
+      auto decl = db.create<func::FuncOp>(loc, callee, FunctionType::get(ctx, {}, {IntegerType::get(ctx, 32)}));
+      decl.setPrivate();
+    }
+  }
+
+  Block *entry = wrapper.addEntryBlock();
+  OpBuilder b = OpBuilder::atBlockEnd(entry);
+  SmallVector<Value> args(entry->getArguments().begin(), entry->getArguments().end());
+  SmallVector<Type> results(f.getFunctionType().getResults().begin(), f.getFunctionType().getResults().end());
+  auto inPar = b.create<func::CallOp>(loc, "omp_in_parallel", TypeRange{IntegerType::get(ctx, 32)});
+  auto zero = b.create<arith::ConstantIntOp>(loc, 0, 32);
+  auto cond = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, inPar.getResult(0), zero);
+  auto ifOp = b.create<scf::IfOp>(loc, TypeRange(results), cond, /*withElseRegion=*/true);
+  {
+    OpBuilder tb = ifOp.getThenBodyBuilder();
+    auto direct = tb.create<func::CallOp>(loc, inner, TypeRange(results), args);
+    tb.create<scf::YieldOp>(loc, direct.getResults());
+  }
+  {
+    OpBuilder eb = ifOp.getElseBodyBuilder();
+    SmallVector<Value> slots;
+    for (Type t : results)
+      slots.push_back(makeSlot(eb, loc, t));
+    // One thread per physical core unless `OMP_NUM_THREADS` says otherwise
+    // (`cleave-rt`'s `cleave_parallel_threads`).
+    omp::ParallelOperands clauses;
+    clauses.numThreads =
+        eb.create<func::CallOp>(loc, "cleave_parallel_threads", TypeRange{IntegerType::get(ctx, 32)}).getResult(0);
+    auto par = eb.create<omp::ParallelOp>(loc, clauses);
+    Block *pb = eb.createBlock(&par.getRegion());
+    OpBuilder pbb = OpBuilder::atBlockEnd(pb);
+    auto single = pbb.create<omp::SingleOp>(loc, omp::SingleOperands{});
+    Block *sb = pbb.createBlock(&single.getRegion());
+    OpBuilder sbb = OpBuilder::atBlockEnd(sb);
+    auto call = sbb.create<func::CallOp>(loc, inner, TypeRange(results), args);
+    for (auto [res, slot] : llvm::zip(call.getResults(), slots))
+      storeSlot(sbb, loc, res, slot);
+    sbb.create<omp::TerminatorOp>(loc);
+    pbb.setInsertionPointToEnd(pb);
+    pbb.create<omp::TerminatorOp>(loc);
+    eb.setInsertionPointAfter(par);
+    SmallVector<Value> loaded;
+    for (auto [t, slot] : llvm::zip(results, slots))
+      loaded.push_back(loadSlot(eb, loc, t, slot));
+    eb.create<scf::YieldOp>(loc, loaded);
+  }
+  b.setInsertionPointToEnd(entry);
+  b.create<func::ReturnOp>(loc, ifOp.getResults());
+}
+
+} // namespace
+
+extern "C" bool cleaveLowerSpawns(MlirOperation op, bool tasks) {
+  auto module = dyn_cast<ModuleOp>(unwrap(op));
+  if (!module)
+    return false;
+  module.getContext()->getOrLoadDialect<omp::OpenMPDialect>();
+  module.getContext()->getOrLoadDialect<scf::SCFDialect>();
+
+  SmallVector<func::FuncOp> spawning;
+  module.walk([&](func::FuncOp f) {
+    bool any = false;
+    SmallVector<Operation *> markers, waits;
+    f.walk([&](Operation *o) {
+      if (isMarkerCall(o, "cleave_spawn_next"))
+        markers.push_back(o);
+      else if (isMarkerCall(o, "cleave_task_wait"))
+        waits.push_back(o);
+    });
+    for (Operation *m : markers) {
+      // The spawned call: the next call to the unit the marker names
+      // (`cleave_spawn_next(<unit>)`) in its block. Other calls can sit in
+      // between (the storage the result goes into, allocated right before).
+      StringRef callee = cast<func::CallOp>(m).getCallee();
+      callee = callee.drop_front(StringRef("cleave_spawn_next(").size()).drop_back();
+      Operation *next = m->getNextNode();
+      while (next && !(isa<func::CallOp>(next) && cast<func::CallOp>(next).getCallee() == callee))
+        next = next->getNextNode();
+      m->erase();
+      // Without tasks the call stays where it is (serial elision).
+      if (tasks && next && wrapInTask(cast<func::CallOp>(next)))
+        any = true;
+    }
+    for (Operation *w : waits) {
+      if (tasks) {
+        OpBuilder b(w);
+        b.create<omp::TaskwaitOp>(w->getLoc(), omp::TaskwaitOperands{});
+      }
+      w->erase();
+    }
+    if (any)
+      spawning.push_back(f);
+  });
+  for (func::FuncOp f : spawning)
+    wrapInParallelRegion(module, f);
+  // The markers' declarations.
+  for (auto f : llvm::make_early_inc_range(module.getOps<func::FuncOp>()))
+    if (f.isDeclaration() && (f.getName().starts_with("cleave_spawn_next") || f.getName().starts_with("cleave_task_wait")))
+      f.erase();
+  return true;
 }

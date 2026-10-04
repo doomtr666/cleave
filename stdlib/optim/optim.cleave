@@ -64,9 +64,35 @@ impl<Opt, M: Trainable, S> Optimizer<Opt, M, S> {
     fn init_state(opt, model) {
         [for i in 0..model.len(): init_state(opt, model[i])]
     }
+    // Each field's update is its own task (`doc/plan-spawn.md`): fields are
+    // independent, and a model's tree of fields (a transformer's blocks, each
+    // block's layers) becomes a tree of tasks — parallel without the caller
+    // writing anything.
     fn step(opt, model, grad, state) {
-        let updated = [for i in 0..model.len(): step(opt, model[i], grad[i], state[i])];
+        let updated = [for i in 0..model.len(): spawn step(opt, model[i], grad[i], state[i])];
         ([for i in 0..updated.len(): updated[i][0]], [for i in 0..updated.len(): updated[i][1]])
+    }
+}
+
+// The sum of two gradients (or models) field by field: what combines the
+// gradients of a batch's parts computed separately — data parallelism, each
+// part's gradient in its own `spawn`ed task (`doc/plan-spawn.md`). A loss
+// summed over a batch has the sum of its parts' gradients as its gradient.
+algebra Accumulate<M> {
+    fn accumulate(a: M, b: M) -> M;
+}
+
+impl<T: Float + Ring, const Dims...: i32> Accumulate<Tensor<T, Dims...>> {
+    fn accumulate(a, b) { a + b }
+}
+
+// Every `Trainable` model: field by field, the model rebuilt from the sums
+// (`Collect`, pinned to `M` by the signature), as `Optimizer::step` does.
+impl<M: Trainable> Accumulate<M> {
+    // Field by field, each sum its own task, like `Optimizer::step`.
+    fn accumulate(a, b) {
+        let sums = [for i in 0..a.len(): spawn accumulate(a[i], b[i])];
+        sums
     }
 }
 

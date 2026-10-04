@@ -34,6 +34,21 @@ unsafe extern "C" {
         loop_unroll: bool,
     ) -> MlirExecutionEngine;
     fn cleaveApproximateMath(op: MlirOperation) -> bool;
+    fn cleaveLowerSpawns(op: MlirOperation, tasks: bool) -> bool;
+}
+
+/// Turns `spawn`'s markers into OpenMP tasks after bufferization
+/// (`cpp/shim.cpp`'s `cleaveLowerSpawns`): each spawned call in an
+/// `omp.task`, each wait an `omp.taskwait`, each spawning function wrapped to
+/// run on a parallel region's team. With `tasks` false, the markers are only
+/// removed: each spawned call runs in place, no wait, no OpenMP (serial
+/// elision). `false` if `op` isn't a module.
+///
+/// # Safety
+///
+/// `op` must be a valid module, not used concurrently.
+pub unsafe fn lower_spawns(op: MlirOperation, tasks: bool) -> bool {
+    unsafe { cleaveLowerSpawns(op, tasks) }
 }
 
 /// Rewrites `tanh`/`exp`/`log` and their relatives under `op` into

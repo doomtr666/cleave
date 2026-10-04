@@ -71,6 +71,11 @@ algebra RawSgemm<A, B, C> {
 impl<const A0: i32, const A1: i32, const B0: i32, const B1: i32, const C0: i32, const C1: i32>
     RawSgemm<[f32;A0,A1], [f32;B0,B1], [f32;C0,C1]>
 {
+    // `#[reentrant]` (not `#[pure]`, see above): it touches nothing but its
+    // arguments, so a `spawn`ed task may call it (`doc/plan-spawn.md`, §2);
+    // concurrent calls are safe in the `USE_LOCKING` build
+    // (`ci/openblas-version.txt`).
+    #[reentrant]
     extern(cleave_blas_sgemm) fn raw_sgemm(trans_a, trans_b, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
 }
 

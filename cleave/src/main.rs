@@ -61,6 +61,7 @@ struct Args {
     inline: Option<bool>,
     unroll_jam: Option<bool>,
     llvm_loop_unroll: Option<bool>,
+    tasks: Option<bool>,
     chain_split: Option<bool>,
     affine_structs: Option<bool>,
     tag_releases: Option<bool>,
@@ -96,6 +97,7 @@ fn parse_args() -> Result<Args, String> {
     let mut inline: Option<bool> = None;
     let mut unroll_jam: Option<bool> = None;
     let mut llvm_loop_unroll: Option<bool> = None;
+    let mut tasks: Option<bool> = None;
     let mut chain_split: Option<bool> = None;
     let mut affine_structs: Option<bool> = None;
     let mut tag_releases: Option<bool> = None;
@@ -177,6 +179,8 @@ fn parse_args() -> Result<Args, String> {
             "--no-unroll-jam" => unroll_jam = Some(false),
             "--llvm-unroll" => llvm_loop_unroll = Some(true),
             "--no-llvm-unroll" => llvm_loop_unroll = Some(false),
+            "--tasks" => tasks = Some(true),
+            "--no-tasks" => tasks = Some(false),
             "--chain-split" => chain_split = Some(true),
             "--no-chain-split" => chain_split = Some(false),
             "--affine-structs" => affine_structs = Some(true),
@@ -250,6 +254,7 @@ fn parse_args() -> Result<Args, String> {
             inline,
             unroll_jam,
             llvm_loop_unroll,
+            tasks,
             chain_split,
             affine_structs,
             tag_releases,
@@ -317,6 +322,7 @@ fn resolve_codegen_options(args: &Args) -> Result<CodegenOptions, String> {
         inline: args.inline.unwrap_or(defaults.inline),
         unroll_jam: args.unroll_jam.unwrap_or(defaults.unroll_jam),
         llvm_loop_unroll: args.llvm_loop_unroll.unwrap_or(defaults.llvm_loop_unroll),
+        tasks: args.tasks.unwrap_or(defaults.tasks),
         chain_split: args.chain_split.unwrap_or(defaults.chain_split),
         affine_structs: args.affine_structs.unwrap_or(defaults.affine_structs),
         tag_releases: args.tag_releases.unwrap_or(defaults.tag_releases),
@@ -905,7 +911,8 @@ fn real_main() -> ExitCode {
         // dll` and let the JIT resolve `__kmpc_*` from it directly, no stub
         // registration needed at all.
         let mut shared_libs: Vec<String> = Vec::new();
-        if options.openmp {
+        // `spawn`'s tasks run on libomp too (`doc/plan-spawn.md`).
+        if options.openmp || (options.tasks && cleave::cps::uses_spawn(&cps_program)) {
             match std::env::var("MLIR_SYS_220_PREFIX") {
                 Ok(prefix) => shared_libs.push(format!("{prefix}/bin/libomp.dll")),
                 Err(_) => {

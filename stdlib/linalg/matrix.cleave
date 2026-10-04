@@ -185,11 +185,21 @@ algebra MatMulTransposeB<A, B, C> {
 // restrict))` folds straight back to `x` (`mlir_lower.rs::build_tensor_
 // descriptor_value`'s own doc comment), so `sgemm`'s own internal `to_
 // buffer(c)` call costs nothing extra here either.
+// A matmul does this much work (`P * Q * R` multiply-adds) or more, it calls
+// `sgemm` (OpenBLAS); below, the `linalg` path, inlined, which fuses with
+// what surrounds it (MNIST's largest, 32x784x512 = 12.8M, stays there).
+// Overridable from a `build.rs` like any `define`. Was 100M, tuned on MNIST
+// alone: nanoLM's data-parallel micro-batches (512 rows) put its 512x256x256
+// projections (33.5M) under it, on the `linalg` path that runs small shapes at
+// about a quarter of a core's peak, and the gradient's own code went from
+// 2.7 s to 12 s over 30 steps.
+define BLAS_MIN_WORK: i32 = 20000000;
+
 impl<const P: i32, const Q: i32, const R: i32>
     MatMulTransposeB<Tensor<f32,P,Q>, Tensor<f32,R,Q>, Tensor<f32,P,R>> {
     fn matmul_transpose_b(a, b) {
         let pqr: i32 = P * Q * R;
-        if pqr > 100000000 {
+        if pqr > BLAS_MIN_WORK {
             blas_matmul_transpose_b(a, b)
         } else {
             mlir::linalg::matmul_transpose_b(a, b)
@@ -210,7 +220,7 @@ impl<const P: i32, const Q: i32, const R: i32>
     MatMulTransposeA<Tensor<f32,P,Q>, Tensor<f32,P,R>, Tensor<f32,Q,R>> {
     fn matmul_transpose_a(a, b) {
         let pqr: i32 = P * Q * R;
-        if pqr > 100000000 {
+        if pqr > BLAS_MIN_WORK {
             blas_matmul_transpose_a(a, b)
         } else {
             mlir::linalg::matmul_transpose_a(a, b)
@@ -333,7 +343,7 @@ impl<const N: i32, const M: i32, const K: i32>
     Fma<Tensor<f32,N,M>, Tensor<f32,M,K>, Tensor<f32,N,K>> {
     fn fma(a, b, c) {
         let nmk: i32 = N * M * K;
-        if nmk > 100000000 {
+        if nmk > BLAS_MIN_WORK {
             // `sgemm` into a fresh output, `c` added after rather than
             // accumulated by `sgemm` (`beta = 1`): `sgemm` writing into `c`
             // means copying `c` first (it's a read-only input), the whole
@@ -351,7 +361,7 @@ impl<const P: i32, const Q: i32, const R: i32>
     FmaTransposeA<Tensor<f32,P,Q>, Tensor<f32,P,R>, Tensor<f32,Q,R>> {
     fn fma_transpose_a(a, b, c) {
         let pqr: i32 = P * Q * R;
-        if pqr > 100000000 {
+        if pqr > BLAS_MIN_WORK {
             blas_fma_transpose_a(a, b, c)
         } else {
             mlir::linalg::matmul_transpose_a_add(a, b, c)
@@ -363,7 +373,7 @@ impl<const P: i32, const Q: i32, const R: i32>
     FmaTransposeB<Tensor<f32,P,Q>, Tensor<f32,R,Q>, Tensor<f32,P,R>> {
     fn fma_transpose_b(a, b, c) {
         let pqr: i32 = P * Q * R;
-        if pqr > 100000000 {
+        if pqr > BLAS_MIN_WORK {
             blas_fma_transpose_b(a, b, c)
         } else {
             mlir::linalg::matmul_transpose_b_add(a, b, c)

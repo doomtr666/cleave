@@ -129,6 +129,8 @@ fn run_i32_inner(src: &str) -> i32 {
         target_cpu: None,
         target_features: None,
         backend: Backend::Cpu,
+        // In-process engine without libomp: spawned calls run in place.
+        tasks: false,
         ..Default::default()
     };
     lower_to_llvm(&context, &mut module, &options).expect("lower_to_llvm failed");

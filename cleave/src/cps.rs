@@ -1168,6 +1168,23 @@ pub enum PrimOp {
         /// through from there, consulted only by `egraph.rs::is_pure_prim_op`.
         pure: bool,
     },
+    /// `spawn unit(args)` (`doc/plan-spawn.md`): the call `unit(args)`, which
+    /// may run as a task in parallel with what follows. The bound variable
+    /// is the call's result, readable only after an `Await` (or `Sync`)
+    /// naming it — `convert_stmts` inserts one before the first statement
+    /// reading it. `unit` is a real (non-extern) unit, resolved like an
+    /// ordinary call's.
+    Spawn { unit: String },
+    /// Waits for a spawned call: `args = [handle, the spawn's own args...]`.
+    /// The spawn's arguments are listed so they stay alive until here: the
+    /// task may still be reading them (refcounting releases a value after
+    /// its last use, and MLIR's deallocation a buffer after its last use).
+    /// The result is `()`.
+    Await,
+    /// Waits for every task the function started: `args` = every spawn's
+    /// handle and arguments, for the same reason as `Await`. At a `sync;`
+    /// statement and before a spawning function returns.
+    Sync,
     /// A reserved `mlir::dialect::op(...)` call (`ExprKind::Call` whose path
     /// starts with `"mlir"`, recognized structurally in `convert_expr` —
     /// see that match arm's own doc comment) — `op` is the real MLIR
@@ -1441,6 +1458,26 @@ struct Ctx<'a> {
     /// isn't validated the way an actual `#include` path would be).
     current_file: Cell<u32>,
     op_lines: &'a RefCell<HashMap<CVar, SrcLoc>>,
+    /// The spawns converted so far in this unit, in program order
+    /// (`doc/plan-spawn.md`): what an `Await` and the `Sync`s name.
+    spawns: RefCell<Vec<SpawnRecord>>,
+}
+
+/// One `let name = spawn unit(args)`: the handle (the call's result variable)
+/// and the converted arguments, which the `Await` and `Sync` that wait for it
+/// list to keep them alive.
+#[derive(Clone)]
+struct SpawnRecord {
+    name: String,
+    handle: CVar,
+    args: Vec<CVal>,
+}
+
+/// The `env` key marking a spawned binding already awaited on this path, so a
+/// later statement reading it again doesn't wait again. A join (an `if`'s,
+/// a loop's) doesn't carry it, which only costs a second, immediate wait.
+fn awaited_key(name: &str) -> String {
+    format!("__awaited::{name}")
 }
 
 impl Ctx<'_> {
@@ -1593,6 +1630,7 @@ pub fn convert_program(units: Vec<ConcreteUnit>, sources: Option<&SourceMap>) ->
             current_line: Cell::new(fn_loc.line.max(1)),
             current_file: Cell::new(fn_loc.file),
             op_lines: &op_lines,
+            spawns: RefCell::new(Vec::new()),
         };
         let mut env = CEnv::new();
         let mut params = Vec::with_capacity(unit.params.len() + 1);
@@ -1617,9 +1655,13 @@ pub fn convert_program(units: Vec<ConcreteUnit>, sources: Option<&SourceMap>) ->
         }
         let k_ret = fresh.var();
         params.push(k_ret);
-        let cexpr = convert_block(body, &env, &ctx, &|v, _env| CExpr::App {
-            func: CVal::Var(k_ret),
-            args: vec![v],
+        let cexpr = convert_block(body, &env, &ctx, &|v, _env| {
+            let ret = CExpr::App {
+                func: CVal::Var(k_ret),
+                args: vec![v],
+            };
+            // No task outlives the function that started it.
+            sync_all(&ctx, ret)
         });
         funcs.push(CTopLevelFn {
             def: CFunDef {
@@ -1648,8 +1690,129 @@ pub fn convert_program(units: Vec<ConcreteUnit>, sources: Option<&SourceMap>) ->
 
 fn convert_block(block: &Block, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> CExpr) -> CExpr {
     convert_stmts(&block.stmts, env.clone(), ctx, &|env| match &block.tail {
-        Some(tail) => convert_expr(tail, &env, ctx, k),
+        Some(tail) => {
+            let mut reads = Vec::new();
+            crate::monomorphize::collect_exprs(tail, &mut reads);
+            await_reads(&reads, env, ctx, &|env| convert_expr(tail, &env, ctx, k))
+        }
         None => k(CVal::Unit, &env),
+    })
+}
+
+/// Before code reading `exprs`, an `Await` for each spawned binding they
+/// name that this path hasn't awaited yet (`doc/plan-spawn.md`). Over-
+/// approximates (a name shadowed inside `exprs` still counts): an extra wait
+/// is harmless.
+fn await_reads(exprs: &[&Expr], env: CEnv, ctx: &Ctx, k: &dyn Fn(CEnv) -> CExpr) -> CExpr {
+    let names: HashSet<String> = exprs
+        .iter()
+        .filter_map(|e| match &e.kind {
+            ExprKind::Path(p) if p.segments.len() == 1 => Some(p.segments[0].clone()),
+            _ => None,
+        })
+        .collect();
+    let pending: Vec<SpawnRecord> = ctx
+        .spawns
+        .borrow()
+        .iter()
+        .filter(|r| {
+            names.contains(&r.name)
+                && matches!(env.get(&r.name), Some(CVal::Var(v)) if *v == r.handle)
+                && !env.contains_key(&awaited_key(&r.name))
+        })
+        .cloned()
+        .collect();
+    let mut env = env;
+    for r in &pending {
+        env.insert(awaited_key(&r.name), CVal::Bool(true));
+    }
+    let mut body = k(env);
+    for r in pending.iter().rev() {
+        let mut args = vec![CVal::Var(r.handle)];
+        args.extend(r.args.iter().cloned());
+        body = CExpr::LetPrim {
+            var: ctx.fresh.var(),
+            ty: Ty::Con("()".to_string()),
+            op: PrimOp::Await,
+            args,
+            cont: Box::new(body),
+        };
+    }
+    body
+}
+
+/// A `Sync` naming every spawn so far, before `cont`; `cont` unchanged when
+/// nothing was spawned.
+fn sync_all(ctx: &Ctx, cont: CExpr) -> CExpr {
+    let spawns = ctx.spawns.borrow();
+    if spawns.is_empty() {
+        return cont;
+    }
+    let args = spawns
+        .iter()
+        .flat_map(|r| std::iter::once(CVal::Var(r.handle)).chain(r.args.iter().cloned()))
+        .collect();
+    CExpr::LetPrim {
+        var: ctx.fresh.var(),
+        ty: Ty::Con("()".to_string()),
+        op: PrimOp::Sync,
+        args,
+        cont: Box::new(cont),
+    }
+}
+
+/// The unit a `spawn`'s call runs as a task, or `None` where this first
+/// version runs the call in place instead (always valid, serial elision): a
+/// call through a closure or with erased higher-order arguments, or to an
+/// `extern`. No side effect: decides, `convert_spawn_let` converts.
+fn spawn_unit<'u>(call: &Expr, env: &CEnv, ctx: &Ctx<'u>) -> Option<&'u str> {
+    let ExprKind::Call(path, _, args, _) = &call.kind else { return None };
+    let callee_name = path.segments.join("::");
+    if matches!(env.get(&callee_name), Some(CVal::Closure { .. })) || ctx.higher_order_args.contains_key(&call.id) {
+        return None;
+    }
+    let arg_ids: Vec<NodeId> = args.iter().map(|a| a.id).collect();
+    let callee = resolve_call(&callee_name, call.id, &arg_ids, ctx);
+    let (callee, unit) = ctx.units.get_key_value(callee)?;
+    if matches!(unit.body, UnitBody::Extern(..)) || unit.capture_count != 0 {
+        return None;
+    }
+    Some(callee.as_str())
+}
+
+/// `let name = spawn path(args)` as a task (`spawn_unit` said it can be): the
+/// arguments converted as for an ordinary call, then a `Spawn` binding `name`
+/// to the result.
+fn convert_spawn_let(
+    name: &str,
+    call: &Expr,
+    callee: &str,
+    rest: &[Stmt],
+    env: &CEnv,
+    ctx: &Ctx,
+    k: &dyn Fn(CEnv) -> CExpr,
+) -> CExpr {
+    let ExprKind::Call(_, _, args, _) = &call.kind else { unreachable!("spawn_unit checked it's a call") };
+    let result_ty = ctx.node_types[&call.id].clone();
+    let arg_refs: Vec<&Expr> = args.iter().collect();
+    convert_expr_list(&arg_refs, env, ctx, &|arg_vals, env| {
+        let handle = ctx.fresh.var();
+        ctx.line(handle);
+        ctx.spawns.borrow_mut().push(SpawnRecord {
+            name: name.to_string(),
+            handle,
+            args: arg_vals.clone(),
+        });
+        let mut env = env.clone();
+        env.insert(name.to_string(), CVal::Var(handle));
+        env.remove(&awaited_key(name));
+        CExpr::LetPrim {
+            var: handle,
+            ty: result_ty.clone(),
+            op: PrimOp::Spawn { unit: callee.to_string() },
+            args: arg_vals,
+            cont: Box::new(convert_stmts(rest, env, ctx, k)),
+        }
     })
 }
 
@@ -1836,6 +1999,29 @@ fn convert_stmts(stmts: &[Stmt], env: CEnv, ctx: &Ctx, k: &dyn Fn(CEnv) -> CExpr
     let Some((stmt, rest)) = stmts.split_first() else {
         return k(env);
     };
+    if !ctx.spawns.borrow().is_empty() {
+        let mut reads = Vec::new();
+        match &stmt.kind {
+            StmtKind::Let { value, .. } | StmtKind::Expr(value) => crate::monomorphize::collect_exprs(value, &mut reads),
+            StmtKind::Assign { target, value } => {
+                crate::monomorphize::collect_exprs(target, &mut reads);
+                crate::monomorphize::collect_exprs(value, &mut reads);
+            }
+            StmtKind::Break(Some(value)) => crate::monomorphize::collect_exprs(value, &mut reads),
+            StmtKind::Break(None) | StmtKind::Sync => {}
+        }
+        let pending = reads.iter().any(|e| match &e.kind {
+            ExprKind::Path(p) if p.segments.len() == 1 => ctx.spawns.borrow().iter().any(|r| {
+                r.name == p.segments[0]
+                    && matches!(env.get(&r.name), Some(CVal::Var(v)) if *v == r.handle)
+                    && !env.contains_key(&awaited_key(&r.name))
+            }),
+            _ => false,
+        });
+        if pending {
+            return await_reads(&reads, env, ctx, &|env| convert_stmts(stmts, env, ctx, k));
+        }
+    }
     // Whether *this* statement (its own value expression, or a nested `if`
     // inside it) could have set `running := false` — checked once, up
     // front, and threaded into every one of this match's own "now continue
@@ -1864,6 +2050,47 @@ fn convert_stmts(stmts: &[Stmt], env: CEnv, ctx: &Ctx, k: &dyn Fn(CEnv) -> CExpr
         // `name(...)` actually resolves to is deferred to that call site
         // itself (`ctx.call_names`, exactly like any other generic
         // instantiation), not decided here.
+        StmtKind::Let { name, value, ty, mutable }
+            if spawned_elements(value).is_some_and(|elems| elems.iter().all(|(_, call)| spawn_unit(call, &env, ctx).is_some())) =>
+        {
+            // `let xs = [for i in a..b: spawn f(..)]`, unrolled to a tuple of
+            // spawns (`unroll.rs`, a model's fields): one `let` per element
+            // spawning it, then `xs` built from their values, which the
+            // statement-level awaits wait for once every task is started.
+            let elems = spawned_elements(value).unwrap();
+            let mut stmts: Vec<Stmt> = Vec::with_capacity(elems.len() + 1 + rest.len());
+            let mut names: HashMap<NodeId, String> = HashMap::new();
+            for (k, (elem_id, call)) in elems.iter().enumerate() {
+                let synthetic = format!("__spawned{}_{k}", value.id.0);
+                names.insert(*elem_id, synthetic.clone());
+                stmts.push(Stmt {
+                    id: stmt.id,
+                    span: stmt.span,
+                    kind: StmtKind::Let {
+                        mutable: false,
+                        name: synthetic,
+                        ty: None,
+                        value: Expr { id: *elem_id, span: call.span, kind: ExprKind::Spawn(Box::new((*call).clone())) },
+                    },
+                });
+            }
+            let mut rewritten = value.clone();
+            replace_spawned_elements(&mut rewritten, &names);
+            stmts.push(Stmt {
+                id: stmt.id,
+                span: stmt.span,
+                kind: StmtKind::Let { mutable: *mutable, name: name.clone(), ty: ty.clone(), value: rewritten },
+            });
+            stmts.extend(rest.iter().cloned());
+            convert_stmts(&stmts, env, ctx, k)
+        }
+        StmtKind::Let { name, value, .. }
+            if matches!(&value.kind, ExprKind::Spawn(call) if spawn_unit(call, &env, ctx).is_some()) =>
+        {
+            let ExprKind::Spawn(call) = &value.kind else { unreachable!() };
+            let callee = spawn_unit(call, &env, ctx).unwrap();
+            convert_spawn_let(name, call, callee, rest, &env, ctx, k)
+        }
         StmtKind::Let { name, value, .. } if matches!(value.kind, ExprKind::Lambda { .. }) => {
             let ExprKind::Lambda { params, body, .. } = &value.kind else {
                 unreachable!()
@@ -2001,7 +2228,10 @@ fn convert_stmts(stmts: &[Stmt], env: CEnv, ctx: &Ctx, k: &dyn Fn(CEnv) -> CExpr
         // Serial elision (`doc/plan-spawn.md`, §1): with every spawned call run
         // in place (`ExprKind::Spawn`, `convert_expr`), there is nothing to
         // wait for. Becomes a real wait once spawned calls run as tasks.
-        StmtKind::Sync => convert_stmts(rest, env, ctx, k),
+        StmtKind::Sync => {
+            let cont = convert_stmts(rest, env, ctx, k);
+            sync_all(ctx, cont)
+        }
         StmtKind::Break(value) => {
             let target = ctx
                 .break_targets
@@ -3949,7 +4179,11 @@ fn note_label(v: &CVal, out: &mut Vec<String>) {
 
 fn collect_called_labels(expr: &CExpr, out: &mut Vec<String>) {
     match expr {
-        CExpr::LetPrim { args, cont, .. } => {
+        CExpr::LetPrim { op, args, cont, .. } => {
+            // A spawned call names its unit in the op, not as a label.
+            if let PrimOp::Spawn { unit } = op {
+                out.push(unit.clone());
+            }
             for a in args {
                 note_label(a, out);
             }
@@ -4158,6 +4392,9 @@ fn prim_op_str(op: &PrimOp) -> String {
         }
         PrimOp::Retain(_) => "retain".to_string(),
         PrimOp::Release(_) => "release".to_string(),
+        PrimOp::Spawn { unit } => format!("spawn.{unit}"),
+        PrimOp::Await => "await".to_string(),
+        PrimOp::Sync => "sync".to_string(),
     }
 }
 
@@ -4219,5 +4456,154 @@ fn dump_cexpr(out: &mut String, expr: &CExpr, depth: usize) {
             indent(out, depth);
             out.push_str(")\n");
         }
+    }
+}
+
+/// Whether any function of `program` spawns (`PrimOp::Spawn`): its spawned
+/// calls become OpenMP tasks, so it needs libomp linked and the OpenMP
+/// conversions run, `--openmp` or not (`doc/plan-spawn.md`).
+pub fn uses_spawn(program: &CpsProgram) -> bool {
+    fn walk(e: &CExpr) -> bool {
+        match e {
+            CExpr::LetPrim { op, cont, .. } => matches!(op, PrimOp::Spawn { .. }) || walk(cont),
+            CExpr::App { .. } => false,
+            CExpr::Fix { defs, body } => defs.iter().any(|d| walk(&d.body)) || walk(body),
+            CExpr::If { then_branch, else_branch, .. } => walk(then_branch) || walk(else_branch),
+        }
+    }
+    program.funcs.iter().any(|f| walk(&f.def.body))
+}
+
+/// A spawned call must not reach, through any chain of calls, an `extern`
+/// that isn't `#[pure]` (`doc/plan-spawn.md`, §2): the random generator's one
+/// global stream, printing, checkpoint files — global state a task running
+/// in parallel would race on, or make nondeterministic. One error per
+/// offending spawn, naming the path to the first impure extern found.
+pub fn check_spawn_purity(program: &CpsProgram, reentrant: &HashSet<String>) -> Result<(), Vec<String>> {
+    // Per function: the impure externs it calls itself, the units it calls.
+    let scan = |e: &CExpr, impure: &mut Vec<String>, callees: &mut Vec<String>, spawns: &mut Vec<String>| {
+        scan_for_spawn_purity(e, reentrant, impure, callees, spawns)
+    };
+    fn scan_for_spawn_purity(
+        e: &CExpr,
+        reentrant: &HashSet<String>,
+        impure: &mut Vec<String>,
+        callees: &mut Vec<String>,
+        spawns: &mut Vec<String>,
+    ) {
+        let scan = |e: &CExpr, impure: &mut Vec<String>, callees: &mut Vec<String>, spawns: &mut Vec<String>| {
+            scan_for_spawn_purity(e, reentrant, impure, callees, spawns)
+        };
+        match e {
+            CExpr::LetPrim { op, cont, .. } => {
+                match op {
+                    PrimOp::Extern { symbol, pure: false, .. } if !reentrant.contains(symbol) => impure.push(symbol.clone()),
+                    PrimOp::Spawn { unit } => {
+                        callees.push(unit.clone());
+                        spawns.push(unit.clone());
+                    }
+                    _ => {}
+                }
+                scan(cont, impure, callees, spawns);
+            }
+            CExpr::App { func, .. } => {
+                if let CVal::Label(name) = func {
+                    callees.push(name.clone());
+                }
+            }
+            CExpr::Fix { defs, body } => {
+                for d in defs {
+                    scan(&d.body, impure, callees, spawns);
+                }
+                scan(body, impure, callees, spawns);
+            }
+            CExpr::If { then_branch, else_branch, .. } => {
+                scan(then_branch, impure, callees, spawns);
+                scan(else_branch, impure, callees, spawns);
+            }
+        }
+    }
+    let mut direct: HashMap<&str, (Vec<String>, Vec<String>)> = HashMap::new();
+    let mut spawn_sites: Vec<(&str, String)> = Vec::new();
+    for f in &program.funcs {
+        let (mut impure, mut callees, mut spawns) = (Vec::new(), Vec::new(), Vec::new());
+        scan(&f.def.body, &mut impure, &mut callees, &mut spawns);
+        direct.insert(f.def.name.as_str(), (impure, callees));
+        spawn_sites.extend(spawns.into_iter().map(|u| (f.def.name.as_str(), u)));
+    }
+    // The path from `unit` to an impure extern, if any (depth-first).
+    fn path_to_impure<'a>(
+        unit: &'a str,
+        direct: &'a HashMap<&str, (Vec<String>, Vec<String>)>,
+        seen: &mut HashSet<&'a str>,
+    ) -> Option<Vec<String>> {
+        if !seen.insert(unit) {
+            return None;
+        }
+        let (impure, callees) = direct.get(unit)?;
+        if let Some(symbol) = impure.first() {
+            return Some(vec![unit.to_string(), symbol.clone()]);
+        }
+        for c in callees {
+            if let Some(mut rest) = path_to_impure(c, direct, seen) {
+                rest.insert(0, unit.to_string());
+                return Some(rest);
+            }
+        }
+        None
+    }
+    let errors: Vec<String> = spawn_sites
+        .iter()
+        .filter_map(|(caller, unit)| {
+            let path = path_to_impure(unit, &direct, &mut HashSet::new())?;
+            Some(format!(
+                "`{}` spawns `{}`, which reaches `{}`, an extern that is neither `#[pure]` nor `#[reentrant]` (path: {}): a spawned call runs in parallel and must not touch global state — random generator, printing, files",
+                crate::resolve::source_name(caller),
+                crate::resolve::source_name(unit),
+                path.last().unwrap(),
+                path.iter().map(|p| crate::resolve::source_name(p).to_string()).collect::<Vec<_>>().join(" -> ")
+            ))
+        })
+        .collect();
+    if errors.is_empty() { Ok(()) } else { Err(errors) }
+}
+
+/// The elements of an unrolled `[for i in a..b: spawn f(..)]`: the value is
+/// `Collect::collect(__TupleN(0: { spawn .. }, ..))` (`unroll.rs`), or one
+/// element alone when the range has one. Each element's expression id and its
+/// spawned call, or `None` when `value` isn't that shape.
+fn spawned_elements(value: &Expr) -> Option<Vec<(NodeId, &Expr)>> {
+    fn spawned(e: &Expr) -> Option<(NodeId, &Expr)> {
+        match &e.kind {
+            ExprKind::Spawn(call) => Some((e.id, call)),
+            ExprKind::Block(b) if b.stmts.is_empty() => match b.tail.as_deref().map(|t| &t.kind) {
+                Some(ExprKind::Spawn(call)) => Some((e.id, call)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    let ExprKind::Call(path, _, args, _) = &value.kind else { return None };
+    if !crate::ast::is_comprehension_collect(path) || args.len() != 1 {
+        return None;
+    }
+    match &args[0].kind {
+        ExprKind::StructLit(_, _, fields) => fields.iter().map(|(_, e)| spawned(e)).collect(),
+        _ => spawned(&args[0]).map(|one| vec![one]),
+    }
+}
+
+/// `spawned_elements`' elements, in place, replaced by reads of the names
+/// their spawns were bound to.
+fn replace_spawned_elements(value: &mut Expr, names: &HashMap<NodeId, String>) {
+    let read = |e: &mut Expr| {
+        if let Some(name) = names.get(&e.id) {
+            e.kind = ExprKind::Path(Path::single(name));
+        }
+    };
+    let ExprKind::Call(_, _, args, _) = &mut value.kind else { return };
+    match &mut args[0].kind {
+        ExprKind::StructLit(_, _, fields) => fields.iter_mut().for_each(|(_, e)| read(e)),
+        _ => read(&mut args[0]),
     }
 }

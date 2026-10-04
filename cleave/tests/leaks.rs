@@ -111,6 +111,8 @@ fn run_counting(src: &str) -> (i32, i64) {
         target_cpu: None,
         target_features: None,
         backend: Backend::Cpu,
+        // In-process engine without libomp: spawned calls run in place.
+        tasks: false,
         ..Default::default()
     };
     cleave::options::set(options.clone());

@@ -958,6 +958,12 @@ pub enum TypeErrorKind {
     AssignToImmutable {
         name: String,
     },
+    /// A `spawn` anywhere but as the value of a `let` directly in a
+    /// function's body (`doc/plan-spawn.md`): this first version waits for
+    /// every task at the function's end, which needs every spawned value in
+    /// scope there — not true of one bound in a branch, a loop or a nested
+    /// block, or never bound at all.
+    MisplacedSpawn,
     /// A scheme's own quantified variable carries two (or more) single-
     /// target shape constraints whose candidate concrete types (`Registry::
     /// candidates_for`) share no common type at all — e.g. `Int t` and
@@ -1167,6 +1173,10 @@ impl std::fmt::Display for TypeErrorKind {
                     crate::resolve::source_name(name)
                 )
             }
+            TypeErrorKind::MisplacedSpawn => write!(
+                f,
+                "`spawn` must be the value of a `let` directly in a function's body (`let x = spawn f(...);`, or `let xs = [for i in a..b: spawn f(...)];`), not inside a branch, a loop, a block or another expression"
+            ),
             TypeErrorKind::UnsatisfiableScheme { algebras } => {
                 write!(
                     f,
@@ -1780,7 +1790,60 @@ pub fn check_mutability(f: &FnDecl) -> Result<(), TypeError> {
         .iter()
         .map(|p| (p.name.clone(), p.mutable))
         .collect();
-    check_mutability_block(body, &scope)
+    check_mutability_block(body, &scope)?;
+    check_spawn_placement(body)
+}
+
+/// `spawn` only as the value of a `let` directly in the function's body
+/// (`TypeErrorKind::MisplacedSpawn`); its call's arguments may not spawn.
+fn check_spawn_placement(body: &Block) -> Result<(), TypeError> {
+    fn reject_any(expr: &Expr) -> Result<(), TypeError> {
+        let mut all = Vec::new();
+        crate::monomorphize::collect_exprs(expr, &mut all);
+        match all.iter().find(|e| matches!(e.kind, ExprKind::Spawn(_))) {
+            Some(e) => Err(TypeError {
+                span: e.span,
+                kind: TypeErrorKind::MisplacedSpawn,
+            }),
+            None => Ok(()),
+        }
+    }
+    for stmt in &body.stmts {
+        match &stmt.kind {
+            StmtKind::Let { value, .. } => match &value.kind {
+                ExprKind::Spawn(call) => match &call.kind {
+                    ExprKind::Call(_, _, args, _) => args.iter().try_for_each(reject_any)?,
+                    _ => reject_any(call)?,
+                },
+                // `[for i in a..b: spawn f(..)]`: one task per element, the
+                // collection built once all are done (`cps.rs`,
+                // `spawned_elements`).
+                ExprKind::Call(path, _, args, _)
+                    if path.segments == [crate::ast::COMPREHENSION]
+                        && matches!(args.get(2).map(|a| &a.kind), Some(ExprKind::Lambda { body, .. })
+                            if body.stmts.is_empty()
+                                && matches!(body.tail.as_deref().map(|t| &t.kind), Some(ExprKind::Spawn(_)))) =>
+                {
+                    reject_any(&args[0])?;
+                    reject_any(&args[1])?;
+                    let Some(ExprKind::Lambda { body, .. }) = args.get(2).map(|a| &a.kind) else { unreachable!() };
+                    let Some(ExprKind::Spawn(call)) = body.tail.as_deref().map(|t| &t.kind) else { unreachable!() };
+                    match &call.kind {
+                        ExprKind::Call(_, _, call_args, _) => call_args.iter().try_for_each(reject_any)?,
+                        _ => reject_any(call)?,
+                    }
+                }
+                _ => reject_any(value)?,
+            },
+            StmtKind::Assign { target, value } => {
+                reject_any(target)?;
+                reject_any(value)?;
+            }
+            StmtKind::Expr(e) | StmtKind::Break(Some(e)) => reject_any(e)?,
+            StmtKind::Break(None) | StmtKind::Sync => {}
+        }
+    }
+    body.tail.as_deref().map_or(Ok(()), reject_any)
 }
 
 fn check_mutability_block(block: &Block, scope: &HashMap<String, bool>) -> Result<(), TypeError> {

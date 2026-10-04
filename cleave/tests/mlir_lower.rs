@@ -182,6 +182,10 @@ fn a_compiled_program_actually_runs_and_returns_the_right_value() {
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
+    // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
+    // their engines don't load libomp: `spawn`'s markers removed, spawned
+    // calls run in place (serial elision).
+    unsafe { cleave_mlir_shim::lower_spawns(module.as_operation().to_raw(), false) };
     assert!(module.as_operation().verify());
 
     let pass_manager = pass::PassManager::new(&context);
@@ -351,12 +355,17 @@ fn lowered_llvm_text(context: &Context, src: &str) -> String {
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(context, &cps_program, &mlir_types, struct_schemas);
+    // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
+    // their engines don't load libomp: `spawn`'s markers removed, spawned
+    // calls run in place (serial elision).
+    unsafe { cleave_mlir_shim::lower_spawns(module.as_operation().to_raw(), false) };
     assert!(
         module.as_operation().verify(),
         "generated MLIR module failed verification"
     );
 
-    let options = CodegenOptions::default();
+    // In-process engine without libomp: spawned calls run in place.
+    let options = CodegenOptions { tasks: false, ..CodegenOptions::default() };
     cleave::options::set(options.clone());
     lower_to_llvm(context, &mut module, &options).unwrap_or_else(|e| panic!("lower_to_llvm failed: {e:?}"));
     module.as_operation().to_string()
@@ -442,6 +451,10 @@ fn optimized_lowered_llvm_text_for_tensors(context: &Context, src: &str) -> Stri
 
     let mlir_types = collect_mlir_types(&program);
     let mut module = lower_program(context, &cps_program, &mlir_types, struct_schemas);
+    // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
+    // their engines don't load libomp: `spawn`'s markers removed, spawned
+    // calls run in place (serial elision).
+    unsafe { cleave_mlir_shim::lower_spawns(module.as_operation().to_raw(), false) };
     assert!(
         module.as_operation().verify(),
         "generated MLIR module failed verification"
@@ -495,6 +508,10 @@ fn run_i32_from_cps(
     let mlir_types = collect_mlir_types(program);
     let struct_schemas = collect_struct_schemas(program);
     let mut module = lower_program(context, &cps_program, &mlir_types, struct_schemas);
+    // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
+    // their engines don't load libomp: `spawn`'s markers removed, spawned
+    // calls run in place (serial elision).
+    unsafe { cleave_mlir_shim::lower_spawns(module.as_operation().to_raw(), false) };
     assert!(
         module.as_operation().verify(),
         "generated MLIR module failed verification"
@@ -875,6 +892,10 @@ fn an_extern_fn_call_actually_executes_through_a_registered_symbol() {
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
+    // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
+    // their engines don't load libomp: `spawn`'s markers removed, spawned
+    // calls run in place (serial elision).
+    unsafe { cleave_mlir_shim::lower_spawns(module.as_operation().to_raw(), false) };
     assert!(module.as_operation().verify());
 
     let pass_manager = pass::PassManager::new(&context);
@@ -1038,6 +1059,10 @@ fn an_extern_impl_method_actually_executes_the_right_symbol_at_each_call_site() 
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
+    // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
+    // their engines don't load libomp: `spawn`'s markers removed, spawned
+    // calls run in place (serial elision).
+    unsafe { cleave_mlir_shim::lower_spawns(module.as_operation().to_raw(), false) };
     assert!(module.as_operation().verify());
 
     let pass_manager = pass::PassManager::new(&context);
@@ -1140,6 +1165,10 @@ fn an_array_argument_crosses_an_extern_call_boundary_correctly() {
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
+    // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
+    // their engines don't load libomp: `spawn`'s markers removed, spawned
+    // calls run in place (serial elision).
+    unsafe { cleave_mlir_shim::lower_spawns(module.as_operation().to_raw(), false) };
     assert!(module.as_operation().verify());
 
     let pass_manager = pass::PassManager::new(&context);
@@ -1231,6 +1260,10 @@ fn a_unit_returning_extern_fn_can_be_called_correctly() {
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
+    // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
+    // their engines don't load libomp: `spawn`'s markers removed, spawned
+    // calls run in place (serial elision).
+    unsafe { cleave_mlir_shim::lower_spawns(module.as_operation().to_raw(), false) };
     assert!(module.as_operation().verify());
     let text = module.as_operation().to_string();
     // The real, structural proof: the declared extern signature (and its
@@ -1336,6 +1369,10 @@ fn a_string_literal_printed_via_print_writes_the_right_bytes_to_stdout() {
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
+    // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
+    // their engines don't load libomp: `spawn`'s markers removed, spawned
+    // calls run in place (serial elision).
+    unsafe { cleave_mlir_shim::lower_spawns(module.as_operation().to_raw(), false) };
     assert!(module.as_operation().verify());
     let text = module.as_operation().to_string();
     assert!(
@@ -3478,6 +3515,10 @@ fn print_of_an_unannotated_index_result_no_longer_panics() {
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
+    // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
+    // their engines don't load libomp: `spawn`'s markers removed, spawned
+    // calls run in place (serial elision).
+    unsafe { cleave_mlir_shim::lower_spawns(module.as_operation().to_raw(), false) };
     assert!(
         module.as_operation().verify(),
         "generated MLIR module failed verification"
@@ -3584,6 +3625,10 @@ fn print_of_an_unannotated_matmul_index_result_no_longer_panics() {
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
+    // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
+    // their engines don't load libomp: `spawn`'s markers removed, spawned
+    // calls run in place (serial elision).
+    unsafe { cleave_mlir_shim::lower_spawns(module.as_operation().to_raw(), false) };
     assert!(
         module.as_operation().verify(),
         "generated MLIR module failed verification"
@@ -6236,6 +6281,10 @@ fn run_i32_with_dynarray_symbols(
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(context, &cps_program, &mlir_types, struct_schemas);
+    // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
+    // their engines don't load libomp: `spawn`'s markers removed, spawned
+    // calls run in place (serial elision).
+    unsafe { cleave_mlir_shim::lower_spawns(module.as_operation().to_raw(), false) };
     assert!(
         module.as_operation().verify(),
         "generated MLIR module failed verification"

@@ -165,6 +165,14 @@ pub struct CodegenOptions {
     /// `opt -O2` on nanoLM's transformer kernel, most of a 3-minute compile.
     /// `true` keeps the standard pipeline.
     pub llvm_loop_unroll: bool,
+    /// Whether `spawn`ed calls run as tasks (`doc/plan-spawn.md`). `false`
+    /// runs each one in place, where it's written, and drops the waits: serial
+    /// elision, always a valid execution of the same program, same results,
+    /// no OpenMP runtime involved. For the in-process test harnesses (their
+    /// engines don't load libomp, and `leaks.rs` counts allocations per
+    /// thread), and for comparing against a single-threaded run. On by
+    /// default.
+    pub tasks: bool,
 }
 
 impl Default for CodegenOptions {
@@ -182,6 +190,7 @@ impl Default for CodegenOptions {
             tag_releases: false,
             debug_info: true,
             llvm_loop_unroll: true,
+            tasks: true,
         }
     }
 }
@@ -209,13 +218,37 @@ pub fn build_cps_program(
         .collect();
     let cps_program = convert_program(units, sources);
     let struct_schemas = collect_struct_schemas(program);
-    synthesize_derivatives(cps_program, &requests, registry, &struct_schemas)
+    let cps_program = synthesize_derivatives(cps_program, &requests, registry, &struct_schemas)?;
+    crate::cps::check_spawn_purity(&cps_program, &reentrant_externs(program))?;
+    Ok(cps_program)
 }
 
 /// Runs whole-program type inference and monomorphization purely to check
 /// for errors -- a mandatory gate before CPS conversion, which assumes
 /// every reachable unit's own types are already fully concrete and has no
 /// error-reporting of its own.
+/// The C symbols of every `#[reentrant]` extern: one that touches nothing but
+/// its arguments (no global state), so a `spawn`ed task may call it even
+/// though it isn't `#[pure]` (`cps::check_spawn_purity`). `sgemm` writes its
+/// result through a pointer, which `#[pure]` must never claim, yet is
+/// perfectly safe to call from several tasks at once.
+fn reentrant_externs(program: &Program) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let mut note = |f: &crate::ast::FnDecl| {
+        if f.is_extern && f.attrs.iter().any(|a| a.name == "reentrant") {
+            out.insert(f.extern_symbol.clone().unwrap_or_else(|| f.name.clone()));
+        }
+    };
+    for item in &program.items {
+        match &item.kind {
+            crate::ast::ItemKind::Fn(f) => note(f),
+            crate::ast::ItemKind::Impl(d) => d.fns.iter().for_each(&mut note),
+            _ => {}
+        }
+    }
+    out
+}
+
 pub fn check_type_errors(program: &Program, registry: &Registry) -> Result<(), Vec<Diagnostic>> {
     // Coherence first: two impls that could both apply to one type leave
     // dispatch with no principled way to choose, so every later choice
@@ -321,6 +354,10 @@ fn render_all(diags: &[Diagnostic], sources: &SourceMap) -> Vec<String> {
 /// source text, so a caller that already has them on hand (`main.rs`, which
 /// compiles once up front and reuses the result across every `--dump-*`
 /// flag) never re-parses.
+///
+/// `Ok(true)` when the emitted code calls the OpenMP runtime — `--openmp`'s
+/// parallel loops, or `spawn`'s tasks (`doc/plan-spawn.md`) — so a caller
+/// linking the object (`cleave-build`) must link libomp too.
 pub fn emit_from_program(
     program: &Program,
     registry: &Registry,
@@ -328,9 +365,10 @@ pub fn emit_from_program(
     object_path: Option<&Path>,
     bindings_path: Option<&Path>,
     options: &CodegenOptions,
-) -> Result<(), Vec<String>> {
+) -> Result<bool, Vec<String>> {
     check_type_errors(program, registry).map_err(|errs| render_all(&errs, sources))?;
     let cps_program = build_optimized_cps(program, registry, Some(sources))?;
+    let needs_openmp = options.openmp || (options.tasks && crate::cps::uses_spawn(&cps_program));
 
     if let Some(bindings_path) = bindings_path {
         let bindings = crate::rust_bindings::generate_rust_bindings(&cps_program.funcs)?;
@@ -342,7 +380,7 @@ pub fn emit_from_program(
         emit_object(program, &cps_program, object_path, options, sources)?;
     }
 
-    Ok(())
+    Ok(needs_openmp)
 }
 
 /// `build_cps_program` + the standard `optimize_program` / `eliminate_dead_
@@ -401,7 +439,7 @@ pub fn compile_and_emit(
     bindings_path: Option<&Path>,
     options: &CodegenOptions,
     defines: &[(String, String)],
-) -> Result<(), Vec<String>> {
+) -> Result<bool, Vec<String>> {
     let (result, sources) = crate::driver::compile(sources_in, project_dirs);
     let program = result.map_err(|errs| render_all(&errs, &sources))?;
     let (registry, define_errors) = Registry::build_with_defines(&program, defines, options.openmp);
@@ -472,6 +510,7 @@ pub fn compile_and_emit(
 pub unsafe fn register_cleave_rt_symbols(engine: &cleave_mlir_shim::ExecutionEngine) {
     unsafe {
         engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
+        engine.register_symbol("cleave_parallel_threads", cleave_rt::cleave_parallel_threads as *mut ());
         engine.register_symbol("rand_seed", cleave_rt::rand_seed as *mut ());
         engine.register_symbol("rand_state", cleave_rt::rand_state as *mut ());
         engine.register_symbol("cleave_ckpt_create", cleave_rt::checkpoint::cleave_ckpt_create as *mut ());
@@ -834,6 +873,29 @@ fn has_real_line(loc: melior::ir::Location) -> bool {
 /// plain contiguous read; `(d0, d1) -> (d0)` isn't): what `--convert-vector-
 /// to-llvm` can't lower (see the second `--convert-vector-to-scf` in
 /// `lower_to_llvm`).
+/// Whether `op` holds any OpenMP-dialect operation (`omp.*`): `--openmp`'s
+/// parallel loops, or the tasks `spawn` lowers to.
+fn has_openmp_ops(op: melior::ir::operation::OperationRef) -> bool {
+    use melior::ir::operation::OperationLike;
+    if op.name().as_string_ref().as_str().unwrap_or("").starts_with("omp.") {
+        return true;
+    }
+    for region in op.regions() {
+        let mut block = region.first_block();
+        while let Some(b) = block {
+            let mut inner = b.first_operation();
+            while let Some(o) = inner {
+                if has_openmp_ops(o) {
+                    return true;
+                }
+                inner = o.next_in_block();
+            }
+            block = b.next_in_region();
+        }
+    }
+    false
+}
+
 fn has_permuted_transfer(op: melior::ir::operation::OperationRef) -> bool {
     use melior::ir::operation::OperationLike;
     let name = op.name().as_string_ref().as_str().unwrap_or("").to_string();
@@ -1224,6 +1286,12 @@ pub fn lower_to_llvm<'c>(
     // into opaque `llvm.call @free`. This is the dump that made the
     // alloc-backed-with-a-dealloc population countable at all
     // (`doc/plan-region-arena.md` §8.3).
+    // `spawn`'s markers become OpenMP tasks, now that buffers and their
+    // deallocations are placed (`cleave_mlir_shim::lower_spawns`).
+    if !unsafe { cleave_mlir_shim::lower_spawns(module.as_operation().to_raw(), options.tasks) } {
+        return Err(vec!["MLIR-to-LLVM lowering pass failed (spawn tasks)".to_string()]);
+    }
+
     if let Ok(path) = std::env::var("CLEAVE_DUMP_POST_DEALLOC") {
         std::fs::write(&path, module.as_operation().to_string())
             .unwrap_or_else(|e| eprintln!("CLEAVE_DUMP_POST_DEALLOC: failed to write {path}: {e}"));
@@ -1638,7 +1706,8 @@ pub fn lower_to_llvm<'c>(
     // `omp.parallel` region happens to sit inside it.
     let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::conversion::create_vector_to_llvm());
-    if options.openmp {
+    // `--openmp`'s parallel loops, or `spawn`'s tasks (`lower_spawns`).
+    if options.openmp || has_openmp_ops(module.as_operation()) {
         pass_manager.add_pass(pass::conversion::create_open_mp_to_llvm());
     }
     pass_manager.add_pass(pass::conversion::create_to_llvm());
@@ -2060,7 +2129,7 @@ fn emit_object(
     unsafe {
         register_cleave_rt_symbols(&engine);
         register_unresolved_extern_stubs(&engine, program);
-        if options.openmp {
+        if options.openmp || (options.tasks && crate::cps::uses_spawn(cps_program)) {
             register_openmp_stub_symbols(&engine);
         }
     }
@@ -2110,6 +2179,15 @@ unsafe fn register_openmp_stub_symbols(engine: &cleave_mlir_shim::ExecutionEngin
         "__kmpc_for_static_init_8u",
         "__kmpc_for_static_fini",
         "__kmpc_barrier",
+        // `spawn`'s tasks (`cleave_mlir_shim::lower_spawns`).
+        "__kmpc_omp_task_alloc",
+        "__kmpc_push_num_threads",
+        "__kmpc_omp_task",
+        "__kmpc_omp_task_with_deps",
+        "__kmpc_omp_taskwait",
+        "__kmpc_single",
+        "__kmpc_end_single",
+        "omp_in_parallel",
     ];
     for symbol in OPENMP_RUNTIME_SYMBOLS {
         // SAFETY: see this function's own doc comment -- mirrors `register_
@@ -2128,6 +2206,7 @@ unsafe fn register_openmp_stub_symbols(engine: &cleave_mlir_shim::ExecutionEngin
 /// on each cross-references the other).
 const KNOWN_CLEAVE_RT_SYMBOLS: &[&str] = &[
     "memrefCopy",
+    "cleave_parallel_threads",
     "rand_seed",
     "rand_state",
     "cleave_ckpt_create",
@@ -2295,7 +2374,7 @@ pub fn emit_exe(
         .arg(&runtime_dir)
         .arg("-l")
         .arg("cleave_rt");
-    if options.openmp {
+    if options.openmp || (options.tasks && crate::cps::uses_spawn(&cps_program)) {
         // `-l libomp` (not `-l omp` -- the real installed file is genuinely
         // named `libomp.lib`, the cross-platform LLVM convention, and `rustc`
         // on an `-msvc` target passes an `-l` name straight through to `link.
