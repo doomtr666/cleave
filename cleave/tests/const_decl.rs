@@ -74,11 +74,13 @@ fn run_i32_with_defines_and_openmp(
     openmp: bool,
 ) -> i32 {
     let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
-    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+    let mut program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let defines: Vec<(String, String)> = defines
         .iter()
         .map(|(n, v)| (n.to_string(), v.to_string()))
         .collect();
+    // As the real entry points do (`main.rs`, `pipeline::compile_and_emit`).
+    Registry::apply_defines(&mut program, &defines);
     let (registry, errors) = Registry::build_with_defines(&program, &defines, openmp);
     if !errors.is_empty() {
         panic!("--define errors: {errors:?}");
@@ -514,4 +516,66 @@ fn list_defines_includes_declared_and_injected_defines_but_not_consts() {
         .unwrap()
         .1;
     assert_eq!(openmp, cleave::infer::ConstValue::Bool(true));
+}
+
+/// A floating-point `define` (`define MUON_LR: f32 = 0.02;`), folded through
+/// an expression of other consts, and overridden with `--define` like an
+/// integer one. Used to be rejected: a `define` was an integer or a bool.
+#[test]
+fn a_float_define_folds_and_can_be_overridden() {
+    let context = context();
+    let src = "
+        define RATE: f32 = 0.25;
+        define SCALE: f32 = RATE * 4.0 - 0.5;
+        fn main() -> i32 {
+            let x: f32 = SCALE * 10.0;
+            if x > 4.99 { if x < 5.01 { 1 } else { 2 } } else { 3 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1, "RATE * 4.0 - 0.5 = 0.5, times 10");
+    // 0.5 * 4.0 - 0.5 = 1.5, times 10: above 5.01.
+    assert_eq!(run_i32_with_defines(&context, src, &[("RATE", "0.5")]), 2);
+}
+
+/// A `define` naming a struct field's dimension (`t: [i32; W]`, as `w:
+/// Tensor<f32, 1, W>` in nanoLM), overridden with the CLI's `--define`: the
+/// field is built and stored at the overridden size. The struct schemas used
+/// to be computed from the defaults, so the value was built at one size and
+/// stored at another, failing MLIR verification (`Registry::apply_defines`);
+/// and `[1; W]` took the *type* of `W` for its length. Through the CLI, the
+/// real entry point (this file's own harness has no runtime for structs).
+#[test]
+fn an_overridden_define_sizes_struct_fields_too() {
+    let dir = std::env::temp_dir().join("cleave-const-decl");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("define_field.cleave");
+    std::fs::write(
+        &source,
+        "
+        define W: i32 = 4;
+        struct S { t: [i32; W] }
+        fn main() -> i32 {
+            let s = S(t: [1; W]);
+            let mut n = 0;
+            for j in 0..W { n = n + s.t[j]; };
+            n
+        }
+        ",
+    )
+    .unwrap();
+    let run = |define: Option<&str>| {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"));
+        cmd.args(["--no-openmp", "--no-debug-info"]);
+        if let Some(d) = define {
+            cmd.args(["--define", d]);
+        }
+        let output = cmd.arg("--run").arg(&source).output().expect("cannot run cleave");
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        format!("{stdout}{stderr}")
+    };
+    let out = run(None);
+    assert!(out.contains("main returned: 4"), "{out}");
+    let out = run(Some("W=8"));
+    assert!(out.contains("main returned: 8"), "{out}");
 }

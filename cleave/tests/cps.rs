@@ -529,33 +529,19 @@ fn an_array_literal_an_indexed_write_and_an_indexed_read_use_the_same_stable_ref
 }
 
 #[test]
-fn an_array_repeat_whose_count_names_a_const_generic_resolves_to_three_independent_elements() {
-    // A *literal* repeat count (`[0; 3]`) desugars to an ordinary
-    // `ArrayLit` at lowering time (see `ast.rs`'s own `ExprKind::ArrayRepeat`
-    // doc comment) -- `ArrayRepeat` itself only ever survives to CPS
-    // conversion when the count names a const generic instead, and by this
-    // point monomorphization has already resolved that reference down to a
-    // concrete `Ty::Const` (found by direct testing: an earlier version of
-    // this module only ever looked a `Path` up in `env`, panicking with
-    // "unbound variable `N`" the first time this case was actually
-    // exercised).
-    //
-    // Converts to a plain `PrimOp::Array` with three (independently
-    // converted) elements now, not `PrimOp::ArrayRepeat` -- `cps.rs::
-    // convert_array_repeat_over_resolved_dims`'s own doc comment has the
-    // full story: evaluating `value` once and broadcasting it, the former
-    // behavior, is only correct for a referentially transparent `value`;
-    // `v` here (a bare parameter reference) is exactly that, so the three
-    // elements are identical (`v454 v454 v454`, all the same variable) --
-    // a real, distinct call per element (`rand.cleave`'s own `uniform`, its
-    // real motivating case) would instead produce three independent calls.
+fn an_array_repeat_whose_count_names_a_const_generic_is_filled_by_a_loop() {
+    // By this point monomorphization has resolved `N` to a concrete
+    // `Ty::Const` (an earlier version of this module looked a `Path` up in
+    // `env` and panicked with "unbound variable `N`"). An array of scalars is
+    // allocated and filled by a loop, `v` evaluated once per element
+    // (`cps.rs::fill_array_repeat`): independent evaluations, as `[uniform(..);
+    // N]` needs, in code that doesn't grow with `N`.
     let out = cps("fn make<const N: i32>(v: i32) -> [i32; N] { [v; N] }
          fn f() -> i32 { make::<3>(0); 0 }");
     let block = fn_block(&out, "make<3>");
-    assert!(
-        block.contains("(array "),
-        "the count must resolve to a real 3-element array, not stay an unbound name, got:\n{block}"
-    );
+    assert!(block.contains("memref.alloc"), "the array must be allocated, got:\n{block}");
+    assert!(block.contains("(store "), "and filled element by element, got:\n{block}");
+    assert!(block.contains("arith.cmpi"), "by a loop bounded by the resolved count, got:\n{block}");
     assert!(!out.contains("unbound variable"), "got:\n{out}");
 }
 

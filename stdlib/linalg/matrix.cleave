@@ -140,6 +140,11 @@ algebra MatMul<A, B, C> {
 // own `adjoint`'s first return slot exactly.
 algebra MatMulTransposeB<A, B, C> {
     fn matmul_transpose_b(a: A, b: B) -> C;
+    // For `Z = A B^T` (`A: P x Q`, `B: R x Q`): `dA = dZ B`, `dB = dZ^T A`,
+    // neither transpose materialized. Reached by a forward pass that calls it
+    // directly (a language model's output head tied to its input embedding,
+    // `stdlib/nn`'s `embedding_logits`), not only from `matmul`'s adjoint.
+    adjoint matmul_transpose_b(a, b), u: (matmul(u, b), matmul_transpose_a(u, a));
 }
 
 // **`100_000_000`, real measured threshold, `f32`-only** — replaces an

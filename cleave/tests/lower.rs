@@ -54,33 +54,19 @@ fn only_adjoint_rule(d: &AlgebraDecl) -> &AdjointRuleDecl {
     }
 }
 
+/// A literal-count repeat stays one node, its count a literal, however large:
+/// it used to become `N` copies of its value, which made the AST (and every
+/// pass after it) grow with the element count, an embedding table's 4096 x
+/// 384 overflowing the compiler's stack. CPS fills it with a loop.
 #[test]
-fn array_repeat_literal_desugars_to_n_copies() {
-    let f = lower_one_fn("fn f() { [0.0; 4] }");
+fn array_repeat_literal_stays_one_node_whatever_its_count() {
+    let f = lower_one_fn("fn f() { [0.0; 4096] }");
     match &only_stmt_expr(&f.body).kind {
-        ExprKind::ArrayLit(elems) => {
-            assert_eq!(elems.len(), 4);
-            for e in elems {
-                assert!(matches!(&e.kind, ExprKind::NumberLit { text, .. } if text == "0.0"));
-            }
+        ExprKind::ArrayRepeat { value, count } => {
+            assert!(matches!(&value.kind, ExprKind::NumberLit { text, .. } if text == "0.0"));
+            assert!(matches!(&count.kind, ExprKind::NumberLit { text, .. } if text == "4096"));
         }
-        other => panic!("expected ArrayLit, got {other:?}"),
-    }
-}
-
-#[test]
-fn array_repeat_literals_own_copies_each_get_a_distinct_node_id() {
-    // Every other node in the AST is unique per occurrence (see `ast.rs`'s
-    // own `NodeId` doc comment) -- a repeat literal's own desugared copies
-    // must be too, or `node_types` (keyed by `NodeId`) would silently
-    // collapse them into one entry.
-    let f = lower_one_fn("fn f() { [1; 3] }");
-    match &only_stmt_expr(&f.body).kind {
-        ExprKind::ArrayLit(elems) => {
-            let ids: std::collections::HashSet<NodeId> = elems.iter().map(|e| e.id).collect();
-            assert_eq!(ids.len(), 3, "expected 3 distinct NodeIds, got {ids:?}");
-        }
-        other => panic!("expected ArrayLit, got {other:?}"),
+        other => panic!("expected ArrayRepeat, got {other:?}"),
     }
 }
 
@@ -198,11 +184,13 @@ fn char_literal_escapes_decode_to_their_real_byte_values() {
 }
 
 #[test]
-fn array_repeat_literal_with_zero_count_is_an_empty_array() {
+fn array_repeat_literal_with_zero_count_is_a_repeat_of_zero() {
     let f = lower_one_fn("fn f() { [1; 0] }");
     match &only_stmt_expr(&f.body).kind {
-        ExprKind::ArrayLit(elems) => assert!(elems.is_empty()),
-        other => panic!("expected ArrayLit, got {other:?}"),
+        ExprKind::ArrayRepeat { count, .. } => {
+            assert!(matches!(&count.kind, ExprKind::NumberLit { text, .. } if text == "0"))
+        }
+        other => panic!("expected ArrayRepeat, got {other:?}"),
     }
 }
 

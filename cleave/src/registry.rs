@@ -303,6 +303,41 @@ impl Registry {
     /// `compile_and_emit`'s own call site) -- injected as `CLEAVE_OPENMP`,
     /// this project's first compiler-provided constant (`doc/plan-blas-
     /// native.md`'s own §2, "Constantes injectées par le compilateur").
+    /// Writes every `--define NAME=VALUE` override into `program` itself, as
+    /// the `define`'s own value, before anything reads it: every registry
+    /// built from the program afterwards (`Registry::build` alone included,
+    /// which `cps::collect_struct_schemas` and others call on their own)
+    /// sees the same values. Overrides applied to a separately built
+    /// registry only left a struct's field dimensions at their defaults
+    /// (`w: Tensor<f32, 1, W>` built at the overridden `W`, stored at the
+    /// default one, failing MLIR verification). A name that isn't a
+    /// `define`, or a value that doesn't parse, is left for
+    /// `build_with_defines` to report.
+    pub fn apply_defines(program: &mut Program, defines: &[(String, String)]) {
+        for (k, item) in program.items.iter_mut().enumerate() {
+            let ItemKind::Define(d) = &mut item.kind else { continue };
+            let Some((_, raw)) = defines.iter().find(|(n, _)| *n == d.name) else { continue };
+            if Self::parse_define_value(raw, &d.ty).is_none() {
+                continue;
+            }
+            let kind = match raw.as_str() {
+                "true" => ExprKind::BoolLit(true),
+                "false" => ExprKind::BoolLit(false),
+                _ => ExprKind::NumberLit { text: raw.clone(), suffix: None },
+            };
+            match &mut d.value {
+                Some(value) => value.kind = kind,
+                None => {
+                    d.value = Some(Expr {
+                        id: crate::ast::NodeId(u32::MAX - k as u32),
+                        span: item.span,
+                        kind,
+                    })
+                }
+            }
+        }
+    }
+
     pub fn build_with_defines(
         program: &Program,
         defines: &[(String, String)],
@@ -454,6 +489,8 @@ impl Registry {
                 "false" => Some(ConstValue::Bool(false)),
                 _ => None,
             }
+        } else if p.segments.len() == 1 && matches!(p.segments[0].as_str(), "f32" | "f64") {
+            raw.parse::<f64>().ok().map(ConstValue::float)
         } else {
             raw.parse::<u64>().ok().map(ConstValue::Int)
         }
@@ -468,7 +505,11 @@ impl Registry {
     /// plain `ConstValue`, no `Infer` instance needed).
     fn eval_const_expr(expr: &Expr, known: &HashMap<String, ConstValue>) -> Option<ConstValue> {
         match &expr.kind {
-            ExprKind::NumberLit { text, .. } => text.parse::<u64>().ok().map(ConstValue::Int),
+            ExprKind::NumberLit { text, .. } => text
+                .parse::<u64>()
+                .ok()
+                .map(ConstValue::Int)
+                .or_else(|| text.parse::<f64>().ok().map(ConstValue::float)),
             ExprKind::BoolLit(b) => Some(ConstValue::Bool(*b)),
             ExprKind::Path(p) if p.segments.len() == 1 => known.get(&p.segments[0]).copied(),
             ExprKind::Call(path, _, args, _) if path.segments.len() == 1 && args.len() == 1 => {
@@ -828,6 +869,29 @@ impl Registry {
             out.extend(self.candidates_for_inner(other, visited));
         }
         out
+    }
+
+    /// Whether `candidates_for(algebra)` is only part of the story: some
+    /// impl, of `algebra` or of an algebra bounded by it, is generic or has a
+    /// parameterized target (`impl<T> Norm<Box<T>>`), whose types can't be
+    /// listed. An empty candidate set then proves nothing.
+    pub fn has_open_impls(&self, algebra: &str) -> bool {
+        self.has_open_impls_inner(algebra, &mut HashSet::new())
+    }
+
+    fn has_open_impls_inner<'a>(&'a self, algebra: &'a str, visited: &mut HashSet<&'a str>) -> bool {
+        if !visited.insert(algebra) {
+            return false;
+        }
+        let open = self.all_impls(algebra).iter().any(|(generics, targets)| {
+            !generics.is_empty()
+                || !matches!(targets.as_slice(), [t] if matches!(&t.kind, TypeKind::Path(_, args) if args.is_empty()))
+        });
+        open || self
+            .algebras_bounded_by(algebra)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .any(|other| self.has_open_impls_inner(other, visited))
     }
 
     /// Like `all_impls`, but also hands back each impl's own declared `fn`s

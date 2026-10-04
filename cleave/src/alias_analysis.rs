@@ -840,7 +840,7 @@ fn collect_facts(
 fn occurs_in(v: CVar, expr: &CExpr) -> bool {
     match expr {
         CExpr::LetPrim { op, args, cont, .. } => {
-            let counts = !matches!(op, PrimOp::Retain(_) | PrimOp::Release(_));
+            let counts = !matches!(op, PrimOp::Retain(_) | PrimOp::Release(_) | PrimOp::LeafGlue { .. });
             (counts && args.iter().any(|a| matches!(a, CVal::Var(vv) if *vv == v)))
                 || occurs_in(v, cont)
         }

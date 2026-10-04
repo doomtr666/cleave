@@ -274,10 +274,16 @@ algebra Transcendental<T> {
     fn exp(x: T) -> T;
     fn tanh(x: T) -> T;
     fn log(x: T) -> T;
+    fn sin(x: T) -> T;
+    fn cos(x: T) -> T;
+    fn sqrt(x: T) -> T;
 
     derivative exp(x): mul(exp(x), d(x));
     derivative tanh(x): mul(sub(1, mul(tanh(x), tanh(x))), d(x));
     derivative log(x): div(d(x), x);
+    derivative sin(x): mul(cos(x), d(x));
+    derivative cos(x): mul(neg(sin(x)), d(x));
+    derivative sqrt(x): div(d(x), mul(2, sqrt(x)));
 
     // Reverse-mode counterparts — `Ring<T>`'s own `adjoint` rules just
     // above have the fuller doc comment on why these coexist with the
@@ -287,18 +293,27 @@ algebra Transcendental<T> {
     adjoint exp(x), u: mul(u, exp(x));
     adjoint tanh(x), u: mul(u, sub(1, mul(tanh(x), tanh(x))));
     adjoint log(x), u: div(u, x);
+    adjoint sin(x), u: mul(u, cos(x));
+    adjoint cos(x), u: mul(u, neg(sin(x)));
+    adjoint sqrt(x), u: div(u, mul(2, sqrt(x)));
 }
 
 impl Transcendental<f32> {
     fn exp(x: f32) -> f32 { mlir::math::exp(x) }
     fn tanh(x: f32) -> f32 { mlir::math::tanh(x) }
     fn log(x: f32) -> f32 { mlir::math::log(x) }
+    fn sin(x: f32) -> f32 { mlir::math::sin(x) }
+    fn cos(x: f32) -> f32 { mlir::math::cos(x) }
+    fn sqrt(x: f32) -> f32 { mlir::math::sqrt(x) }
 }
 
 impl Transcendental<f64> {
     fn exp(x: f64) -> f64 { mlir::math::exp(x) }
     fn tanh(x: f64) -> f64 { mlir::math::tanh(x) }
     fn log(x: f64) -> f64 { mlir::math::log(x) }
+    fn sin(x: f64) -> f64 { mlir::math::sin(x) }
+    fn cos(x: f64) -> f64 { mlir::math::cos(x) }
+    fn sqrt(x: f64) -> f64 { mlir::math::sqrt(x) }
 }
 
 // Comparison — same reasoning and shape as `Ring` above. `eq`/`neq` are

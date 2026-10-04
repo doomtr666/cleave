@@ -388,13 +388,16 @@ fn real_main() -> ExitCode {
     let file_name = args.path.display().to_string();
 
     let (result, sources) = compile(vec![(file_name, text)], &[project_dir]);
-    let program = match result {
+    let mut program = match result {
         Ok(p) => p,
         Err(errs) => {
             report(&errs, &sources);
             return ExitCode::FAILURE;
         }
     };
+    // `--define` overrides become the program's own values, for every pass
+    // that reads them (`Registry::apply_defines`).
+    Registry::apply_defines(&mut program, &args.defines);
 
     // `openmp`'s own resolution is now a single, universal rule (`args.
     // openmp.unwrap_or(true)`) -- no more per-mode default (`resolve_

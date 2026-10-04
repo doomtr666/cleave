@@ -921,3 +921,24 @@ fn compatible_shape_constraints_on_the_same_variable_still_generalize() {
         result.results.get("is_positive")
     );
 }
+
+/// Two bounds from the same algebra on one variable, an algebra whose impls
+/// are all generic (`impl<T> Norm<Box<T>>`): its candidate types can't be
+/// enumerated, which is no proof that none exists. Used to be rejected as
+/// unsatisfiable (an empty enumeration intersected with itself), which
+/// blocked `stdlib/nn`'s `clip_grad_norm` (`squared_norm` and `scaled` on
+/// one `M: GradNorm`).
+#[test]
+fn bounds_from_an_algebra_with_only_generic_impls_are_not_unsatisfiable() {
+    let src = "algebra Norm<M> {
+            fn norm(m: M) -> i32;
+            fn halve(m: M) -> M;
+        }
+        struct Box<T> { v: T }
+        impl<T> Norm<Box<T>> { fn norm(m: Box<T>) -> i32 { 1 } fn halve(m: Box<T>) -> Box<T> { m } }
+        fn f(m) { norm(m); halve(m) }";
+    let registry = registry_from(src);
+    let program = lower_program(src);
+    let result = infer_program(&program, &registry);
+    assert!(result.results.get("f").unwrap().is_ok(), "{:?}", result.results.get("f"));
+}

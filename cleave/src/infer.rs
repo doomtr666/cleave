@@ -239,12 +239,23 @@ pub enum Ty {
 pub enum ConstValue {
     Int(u64),
     Bool(bool),
+    /// A floating-point `const`/`define` (`define MUON_LR: f32 = 0.02;`),
+    /// as the bits of an `f64` so that `ConstValue` stays `Eq`: two consts
+    /// are the same value exactly when their bits are.
+    Float(u64),
+}
+
+impl ConstValue {
+    pub fn float(x: f64) -> ConstValue {
+        ConstValue::Float(x.to_bits())
+    }
 }
 
 impl std::fmt::Display for ConstValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConstValue::Int(n) => write!(f, "{n}"),
+            ConstValue::Float(bits) => write!(f, "{:?}", f64::from_bits(*bits)),
             ConstValue::Bool(b) => write!(f, "{b}"),
         }
     }
@@ -2308,7 +2319,14 @@ pub const GENERATE_REQUEST: (u64, u64) = (u64::MAX, u64::MAX);
 /// by every backend path yet (`doc/backlog.md`).
 fn is_array_element(t: &Ty) -> bool {
     match t {
-        Ty::Con(_) => true,
+        // Numbers and booleans only: a struct named without generics
+        // (`Net`, nanoLM's `Gpt`) is a `Ty::Con` too, and arrays of structs
+        // were made the default for them, never released (eight micro-batch
+        // gradients leaked per training step).
+        Ty::Con(name) => matches!(
+            name.as_str(),
+            "f32" | "f64" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "bool"
+        ),
         Ty::Array(e, _) => is_array_element(e),
         _ => false,
     }
@@ -4346,7 +4364,9 @@ impl<'r> Infer<'r> {
         let mut names: Vec<&str> = Vec::new();
         let mut candidates: Option<HashSet<String>> = None;
         for algebra in algebras {
-            if !self.registry.has_algebra(algebra) {
+            // An algebra with generic impls can't have its types listed: no
+            // conflict can be proven through it.
+            if !self.registry.has_algebra(algebra) || self.registry.has_open_impls(algebra) {
                 continue;
             }
             names.push(algebra);
@@ -5015,6 +5035,7 @@ impl<'r> Infer<'r> {
                         width.unwrap_or_else(|| match cv {
                             ConstValue::Int(_) => Ty::Con("i32".to_string()),
                             ConstValue::Bool(_) => Ty::Con("bool".to_string()),
+                            ConstValue::Float(_) => Ty::Con("f64".to_string()),
                         })
                     }
                     _ => r.clone(),
@@ -6559,6 +6580,7 @@ impl<'r> Infer<'r> {
                                     match value {
                                         ConstValue::Int(_) => "i32",
                                         ConstValue::Bool(_) => "bool",
+                                        ConstValue::Float(_) => "f64",
                                     }
                                     .to_string(),
                                 ));
@@ -6829,7 +6851,12 @@ impl<'r> Infer<'r> {
             // (below) turns it into the real nested chain.
             ExprKind::ArrayRepeat { value, count } => {
                 let elem_ty = self.infer_expr(env, value)?;
-                let count_ty = if let ExprKind::PackRef(name) = &count.kind {
+                let count_ty = if let ExprKind::NumberLit { text, .. } = &count.kind {
+                    // A literal count (`[v; 384]`): the array's length.
+                    Ty::Const(ConstValue::Int(text.parse().unwrap_or_else(|e| {
+                        panic!("array-repeat count {text:?} is not a valid array size: {e}")
+                    })))
+                } else if let ExprKind::PackRef(name) = &count.kind {
                     self.active_generics
                         .get(name)
                         .cloned()
@@ -6840,6 +6867,15 @@ impl<'r> Infer<'r> {
                     // of `N` read as a value (`i32`).
                     self.infer_expr(env, count)?;
                     dim
+                } else if let Some(value @ ConstValue::Int(_)) = single_name(count)
+                    .filter(|n| !env.contains_key(*n))
+                    .and_then(|n| self.registry.global_const_value(n))
+                {
+                    // A global `const`/`define` (`[v; W]`): its value, as for
+                    // a const generic (the type of `W`, `i32`, used to end up
+                    // as the length).
+                    self.infer_expr(env, count)?;
+                    Ty::Const(value)
                 } else {
                     self.infer_expr(env, count)?
                 };
@@ -7851,8 +7887,11 @@ impl<'r> Infer<'r> {
             let Ty::Var(root) = target else { continue };
             // Arrays of scalars (or of arrays of them) only (`is_array_element`):
             // a tuple of same-typed values indexes just as well at compile
-            // time.
-            let homogeneous = elements.len() >= 2
+            // time. One element too, as two or more: indexed by a run-time
+            // index like any array, rather than a tuple of one that needs
+            // its index folded (a loop over a one-field struct's parts used
+            // to fail with `no impl Index<__Tuple1<f32>, _>`).
+            let homogeneous = !elements.is_empty()
                 && elements.iter().all(is_fully_concrete)
                 && is_array_element(&elements[0])
                 && elements.windows(2).all(|w| w[0] == w[1]);

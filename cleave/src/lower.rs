@@ -1340,27 +1340,28 @@ impl Lowerer {
                 let value = inner.next().unwrap();
                 let count = inner.next().unwrap();
                 match count.as_rule() {
-                    // `[value; N]`, `N` a literal — re-lowers the *same*
-                    // parsed `value` pair `N` times (cheap: `Pair` is a
-                    // reference into the token stream, not an owned deep
-                    // copy) rather than lowering once and cloning the
-                    // resulting `Expr`, so each copy gets its own distinct
-                    // `NodeId` — every other node in this AST is unique per
-                    // occurrence (see `ast.rs`'s own doc comment on
-                    // `NodeId`), and `node_types` (keyed by `NodeId`) would
-                    // silently collapse all `N` copies into one entry
-                    // otherwise.
+                    // `[value; N]`, `N` a literal: one node, as for a const
+                    // generic, whatever `N` (never `N` copies of `value`: a
+                    // 4096 x 384 table made the AST, and every pass after it,
+                    // grow with the element count). CPS fills it with a loop,
+                    // `value` evaluated once per element
+                    // (`cps.rs::fill_array_repeat`).
                     Rule::numeric_lit => {
                         let count_text = count.as_str();
                         // `numeric_lit`'s own text, possibly `:suffix`-
                         // terminated — a repeat count is never suffixed in
                         // practice, but strip it defensively rather than let
                         // `.parse` reject it outright.
-                        let n: usize = count_text.split(':').next().unwrap().parse().unwrap_or_else(|e| {
+                        let n: u64 = count_text.split(':').next().unwrap().parse().unwrap_or_else(|e| {
                             panic!("array-repeat count {count_text:?} is not a valid array size: {e}")
                         });
-                        let elems = (0..n).map(|_| self.lower_expr(value.clone())).collect();
-                        self.wrap(span, ExprKind::ArrayLit(elems))
+                        let count_span = self.span_of(&count);
+                        let value = Box::new(self.lower_expr(value));
+                        let count = Box::new(self.wrap(count_span, ExprKind::NumberLit {
+                            text: n.to_string(),
+                            suffix: None,
+                        }));
+                        self.wrap(span, ExprKind::ArrayRepeat { value, count })
                     }
                     // `[value; N]`, `N` naming a const generic — its value
                     // isn't known until monomorphization, so this can't be

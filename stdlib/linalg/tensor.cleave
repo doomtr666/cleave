@@ -101,6 +101,10 @@ impl<T: Float, const Dims...: i32> Ring<Tensor<T, Dims...>> {
         let z: T = zero();
         mlir::tensor::splat(z)
     }
+    fn one() -> Tensor<T, Dims...> {
+        let o: T = one();
+        mlir::tensor::splat(o)
+    }
 }
 
 // `Transcendental<Tensor<T,Dims...>>::exp` -- needed so `Activation<Tensor<T,
@@ -121,6 +125,9 @@ impl<T: Float, const Dims...: i32> Ring<Tensor<T, Dims...>> {
 // `Tensor<T,Dims...>` once `Forward::walk`'s multi-level inlining reaches it.
 impl<T: Float, const Dims...: i32> Transcendental<Tensor<T, Dims...>> {
     fn exp(x: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::math::exp(x) }
+    fn sin(x: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::math::sin(x) }
+    fn cos(x: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::math::cos(x) }
+    fn sqrt(x: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::math::sqrt(x) }
 }
 
 // `Tensor * scalar` (`SGD`'s own `w = w - lr * grad`, needed once a weight

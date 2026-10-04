@@ -1231,6 +1231,11 @@ pub enum PrimOp {
     /// not last-use: sound without any dataflow fixpoint, by
     /// construction).
     Release(Ty),
+    /// `args = [value]`: retains or releases every tensor leaf of a light
+    /// struct through `unit`, the glue function `refcount.rs` synthesizes
+    /// once for its type (`refcount::glue_function`). Unit-valued, an
+    /// effect like `Retain`/`Release`; inserted by refcounting only.
+    LeafGlue { unit: String },
 }
 
 #[derive(Debug, Clone)]
@@ -2314,6 +2319,7 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                     // actual value comes from instead.
                     Some(ConstValue::Int(n)) => CVal::Int(*n),
                     Some(ConstValue::Bool(b)) => CVal::Bool(*b),
+                    Some(ConstValue::Float(bits)) => CVal::Float(f64::from_bits(*bits)),
                     // A const generic referenced as an ordinary value
                     // (`[v; N]`, `for i in 0..N`) is never bound as a real
                     // parameter/`let` -- by the time a `ConcreteUnit` reaches
@@ -3260,6 +3266,13 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
         // just below, `value` here is always the true leaf expression, never
         // itself another `ArrayRepeat` node one level of nesting has to
         // walk into.
+        // An array of scalars, however many dimensions and whichever spelling
+        // (`[v; Dims...]`, `[[v; M]; N]`): filled by loops, `v` evaluated once
+        // per element (`fill_array_repeat`), in code and stack depth that
+        // don't grow with the array.
+        ExprKind::ArrayRepeat { .. } if scalar_array_leaf(&ctx.node_types[&expr.id]) => {
+            fill_array_repeat(repeat_leaf(expr), &ctx.node_types[&expr.id], env, ctx, k)
+        }
         ExprKind::ArrayRepeat { value, count } if matches!(count.kind, ExprKind::PackRef(_)) => {
             convert_array_repeat_over_resolved_dims(value, &ctx.node_types[&expr.id], env, ctx, k)
         }
@@ -3324,6 +3337,118 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
         // the shape a bare expression position needs.
         ExprKind::Block(b) => convert_scoped_block(b, env, ctx, k),
         other => panic!("CPS doesn't support {other:?} yet -- see doc/backlog.md"),
+    }
+}
+
+/// Whether an array type's leaves are scalars (numbers, booleans): the
+/// arrays `fill_array_repeat` builds. An array of structs is an LLVM array of
+/// another representation, built element by element instead.
+fn scalar_array_leaf(ty: &Ty) -> bool {
+    match ty {
+        Ty::Array(elem, _) => scalar_array_leaf(elem),
+        Ty::Con(name) => matches!(
+            name.as_str(),
+            "f32" | "f64" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "bool"
+        ),
+        _ => false,
+    }
+}
+
+/// The value a (possibly hand-nested) array repeat fills its elements with:
+/// `v` in `[[v; M]; N]` as in `[v; Dims...]`.
+fn repeat_leaf(expr: &Expr) -> &Expr {
+    match &expr.kind {
+        ExprKind::ArrayRepeat { value, .. } => repeat_leaf(value),
+        _ => expr,
+    }
+}
+
+/// An array repeat of type `ty` (every dimension resolved): the array
+/// allocated, then one loop per dimension, the innermost evaluating `leaf`
+/// and storing it at the current indices. `leaf` is evaluated once per
+/// element, as the source says (`[uniform(lo, hi); Dims...]` draws every
+/// element independently), yet the code, and the compiler's own recursion,
+/// no longer grow with the element count: copying `leaf` once per element
+/// overflowed the compiler's stack on an embedding table (4096 x 384).
+fn fill_array_repeat(leaf: &Expr, ty: &Ty, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> CExpr) -> CExpr {
+    let mut dims = Vec::new();
+    let mut level = ty;
+    while let Ty::Array(elem, size) = level {
+        let Ty::Const(ConstValue::Int(n)) = size.as_ref() else {
+            panic!("CPS: array repeat with an unresolved dimension {size:?} -- monomorphization should already have resolved it");
+        };
+        dims.push(*n);
+        level = elem;
+    }
+    let array = ctx.fresh.var();
+    CExpr::LetPrim {
+        var: { ctx.line(array); array },
+        ty: ty.clone(),
+        op: PrimOp::RawMlirOp { op: "memref.alloc".to_string(), attrs: Vec::new() },
+        args: Vec::new(),
+        cont: Box::new(fill_loops(&dims, Vec::new(), array, ty, leaf, env, ctx, &|env| k(CVal::Var(array), env))),
+    }
+}
+
+/// The loops of `fill_array_repeat`, from dimension `indices.len()` inward;
+/// `after` continues once this dimension is done.
+#[allow(clippy::too_many_arguments)]
+fn fill_loops(
+    dims: &[u64],
+    indices: Vec<CVal>,
+    array: CVar,
+    array_ty: &Ty,
+    leaf: &Expr,
+    env: &CEnv,
+    ctx: &Ctx,
+    after: &dyn Fn(&CEnv) -> CExpr,
+) -> CExpr {
+    let depth = indices.len();
+    if depth == dims.len() {
+        return convert_expr(leaf, env, ctx, &|v, env| {
+            let var = ctx.fresh.var();
+            let mut args = vec![CVal::Var(array)];
+            args.extend(indices.iter().cloned());
+            args.push(v);
+            CExpr::LetPrim {
+                var: { ctx.line(var); var },
+                ty: Ty::Con("()".to_string()),
+                op: PrimOp::Store { array_ty: array_ty.clone() },
+                args,
+                cont: Box::new(after(env)),
+            }
+        });
+    }
+    let i32_ty = Ty::Con("i32".to_string());
+    let i = ctx.fresh.var();
+    let label = ctx.fresh.label("fill");
+    let cond = ctx.fresh.var();
+    let mut inner = indices.clone();
+    inner.push(CVal::Var(i));
+    let body = CExpr::LetPrim {
+        var: { ctx.line(cond); cond },
+        ty: Ty::Con("bool".to_string()),
+        // `slt`, as `Ord<i32>::lt`.
+        op: PrimOp::RawMlirOp { op: "arith.cmpi".to_string(), attrs: vec![("predicate".to_string(), "2 : i64".to_string())] },
+        args: vec![CVal::Var(i), CVal::Int(dims[depth])],
+        cont: Box::new(CExpr::If {
+            cond: CVal::Var(cond),
+            then_branch: Box::new(fill_loops(dims, inner, array, array_ty, leaf, env, ctx, &|_env| {
+                let next = ctx.fresh.var();
+                CExpr::LetPrim {
+                    var: { ctx.line(next); next },
+                    ty: i32_ty.clone(),
+                    op: PrimOp::RawMlirOp { op: "arith.addi".to_string(), attrs: Vec::new() },
+                    args: vec![CVal::Var(i), CVal::Int(1)],
+                    cont: Box::new(CExpr::App { func: CVal::Label(label.clone()), args: vec![CVal::Var(next)] }),
+                }
+            })),
+            else_branch: Box::new(after(env)),
+        }),
+    };
+    CExpr::Fix {
+        defs: vec![CFunDef { name: label.clone(), params: vec![i], body, carried_types: Some(vec![i32_ty]) }],
+        body: Box::new(CExpr::App { func: CVal::Label(label), args: vec![CVal::Int(0)] }),
     }
 }
 
@@ -4306,6 +4431,7 @@ fn render_readable(out: &mut String, expr: &CExpr, depth: usize) {
                 // changes no information a reader could actually use.
                 PrimOp::Retain(_)
                 | PrimOp::Release(_)
+                | PrimOp::LeafGlue { .. }
                 | PrimOp::FieldStore { .. }
                 | PrimOp::Store { .. } => {
                     let _ = writeln!(out, "{op_str}({args_str})");
@@ -4392,6 +4518,7 @@ fn prim_op_str(op: &PrimOp) -> String {
         }
         PrimOp::Retain(_) => "retain".to_string(),
         PrimOp::Release(_) => "release".to_string(),
+        PrimOp::LeafGlue { unit } => format!("leaf-glue.{unit}"),
         PrimOp::Spawn { unit } => format!("spawn.{unit}"),
         PrimOp::Await => "await".to_string(),
         PrimOp::Sync => "sync".to_string(),

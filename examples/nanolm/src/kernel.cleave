@@ -126,40 +126,47 @@ export fn train_lm(rounds: i32, lr: f32, seed: i64) -> f32 {
 
 // ------------------------------------------------------------------ the transformer
 //
-// nanoGPT's shape, at a size set by the `define`s below (overridable from `build.rs`): a token and a
-// position embedding of width `WIDTH`, eight blocks, a final LayerNorm and a dense head to the
-// `VOCAB` logits. Activations are `[ROWS, WIDTH]` matrices, the 32 sequences of a batch (`data.rs`)
-// stacked as rows. Each block is pre-LayerNorm: `x + attention(layer_norm(x))`, then `x +
-// mlp(layer_norm(x))`, the attention causal over heads `HEAD` wide, the MLP `WIDTH -> MLP ->
-// WIDTH` with GELU. The block count is the struct's eight fields (`b1`..`b8`, `gpt_layers`).
+// A GPT with the recipe of today's transformers (Llama, Qwen, Gemma), at a size set by the
+// `define`s below (overridable from `build.rs`): a token embedding of width `WIDTH`, eight blocks,
+// a final RMSNorm, and the output scored against the same embedding (a tied head,
+// `embedding_logits`). Activations are `[ROWS, WIDTH]` matrices, the 32 sequences of a batch
+// (`data.rs`) stacked as rows. Each block is pre-norm: `x + attention(rms_norm(x))`, then `x +
+// swiglu(rms_norm(x))`; the attention is causal over heads `HEAD` wide, its queries and keys
+// rotated by their position (RoPE, so no position table); the MLP is SwiGLU, `WIDTH -> HIDDEN ->
+// WIDTH`. Trained by Muon (hidden matrices) and AdamW (embedding, gains, biases), the gradient
+// clipped. The block count is the struct's eight fields (`b1`..`b8`, `gpt_layers`).
 
 define WIDTH: i32 = 384;
 define HEAD: i32 = 64;
-define MLP: i32 = 4 * WIDTH;
-// Characters per sequence and rows per batch: `data.rs`'s `T` and `B * T`.
+// SwiGLU's three matrices at 8/3 `WIDTH` hold what a GELU MLP's two hold at 4 `WIDTH`.
+define HIDDEN: i32 = 1024;
+// Tokens per sequence and rows per batch: `data.rs`'s `T` and `B * T`.
 define CONTEXT: i32 = 256;
 define ROWS: i32 = 32 * CONTEXT;
 // Tokens: `bpe.rs`'s vocabulary, the 104 characters and the merges learned over them.
 define VOCAB: i32 = 4096;
 
 // Linear warmup over `WARMUP` steps, then a linear decay to a tenth of the rate at `DECAY_STEPS`,
-// flat after: a function of the step alone, so a resumed run continues the same schedule.
+// flat after: a function of the step alone, so a resumed run continues the same schedule. Muon's
+// rate follows the same schedule from its own base.
 define WARMUP: i32 = 200;
 define DECAY_STEPS: i32 = 20000;
+define MUON_LR: f32 = 0.02;
+// The gradient's norm is clipped at 1 per row: the loss is summed over the batch's `ROWS`.
+define CLIP_PER_ROW: f32 = 1.0;
 
 struct Block {
-    ln1_g: Tensor<f32, 1, WIDTH>, ln1_b: Tensor<f32, 1, WIDTH>,
+    n1: Tensor<f32, 1, WIDTH>,
     wq: Dense<f32, WIDTH, WIDTH>, wk: Dense<f32, WIDTH, WIDTH>, wv: Dense<f32, WIDTH, WIDTH>, wo: Dense<f32, WIDTH, WIDTH>,
-    ln2_g: Tensor<f32, 1, WIDTH>, ln2_b: Tensor<f32, 1, WIDTH>,
-    fc: Dense<f32, WIDTH, MLP>, proj: Dense<f32, MLP, WIDTH>
+    n2: Tensor<f32, 1, WIDTH>,
+    mlp: SwiGlu<f32, WIDTH, HIDDEN>
 }
 impl Trainable<Block> {}
 
 struct Gpt {
-    tok: Tensor<f32, VOCAB, WIDTH>, pos: Tensor<f32, CONTEXT, WIDTH>,
+    tok: Embedding<f32, VOCAB, WIDTH>,
     b1: Block, b2: Block, b3: Block, b4: Block, b5: Block, b6: Block, b7: Block, b8: Block,
-    lnf_g: Tensor<f32, 1, WIDTH>, lnf_b: Tensor<f32, 1, WIDTH>,
-    head: Dense<f32, WIDTH, VOCAB>
+    nf: Tensor<f32, 1, WIDTH>
 }
 impl Trainable<Gpt> {}
 
@@ -171,43 +178,42 @@ fn ones() -> Tensor<f32, 1, WIDTH> { [for i in 0..1: [for j in 0..WIDTH: 1.0]] }
 
 fn new_block() -> Block {
     Block(
-        ln1_g: ones(), ln1_b: Ring::zero(),
+        n1: ones(),
         wq: Init::xavier(), wk: Init::xavier(), wv: Init::xavier(), wo: Init::xavier(),
-        ln2_g: ones(), ln2_b: Ring::zero(),
-        fc: Init::he(), proj: Init::xavier()
+        n2: ones(),
+        mlp: Init::xavier()
     )
 }
 
 fn new_gpt() -> Gpt {
     Gpt(
-        tok: Init::xavier(), pos: Init::xavier(),
+        tok: Init::xavier(),
         b1: new_block(), b2: new_block(), b3: new_block(), b4: new_block(), b5: new_block(), b6: new_block(),
         b7: new_block(), b8: new_block(),
-        lnf_g: ones(), lnf_b: Ring::zero(),
-        head: Init::xavier()
+        nf: ones()
     )
 }
 
-// Row `k` of a batch is position `k mod CONTEXT` of its sequence.
-fn positions() -> [i32; ROWS] { [for k in 0..ROWS: k - (k / CONTEXT) * CONTEXT] }
-
 // Not inlined: called eight times per forward pass, each call a whole block of work, compiled once
 // per row count instead of eight times (the training gradient is synthesized from its body by the
-// e-graph, unaffected).
+// e-graph, unaffected). Rows are whole sequences of `CONTEXT`: row `r` is position `r mod CONTEXT`.
 #[no_inline]
 fn block<const N: i32>(x: Tensor<f32, N, WIDTH>, b: Block) -> Tensor<f32, N, WIDTH> {
-    let h = layer_norm(x, b.ln1_g, b.ln1_b);
-    let a = causal_attention(b.wq.dense_forward(h), b.wk.dense_forward(h), b.wv.dense_forward(h), AttentionShape::<CONTEXT, HEAD>());
+    let shape = AttentionShape::<CONTEXT, HEAD>();
+    let h = rms_norm(x, b.n1);
+    let q = rope(b.wq.dense_forward(h), shape);
+    let k = rope(b.wk.dense_forward(h), shape);
+    let a = causal_attention(q, k, b.wv.dense_forward(h), shape);
     let x2 = x + b.wo.dense_forward(a);
-    x2 + b.proj.dense_forward(gelu(b.fc.dense_forward(layer_norm(x2, b.ln2_g, b.ln2_b))))
+    x2 + b.mlp.swiglu_forward(rms_norm(x2, b.n2))
 }
 
 // Any number of rows `N`, whole sequences of `CONTEXT`: a micro-batch (`MICRO`), or the one
 // sequence generation reads (`CONTEXT`).
-fn gpt_logits<const N: i32>(x: [i32; N], p: [i32; N], m: Gpt) -> Tensor<f32, N, VOCAB> {
-    let h0 = embed(m.tok, x) + embed(m.pos, p);
+fn gpt_logits<const N: i32>(x: [i32; N], m: Gpt) -> Tensor<f32, N, VOCAB> {
+    let h0 = embedding_forward(m.tok, x);
     let h = block(block(block(block(block(block(block(block(h0, m.b1), m.b2), m.b3), m.b4), m.b5), m.b6), m.b7), m.b8);
-    m.head.dense_forward(layer_norm(h, m.lnf_g, m.lnf_b))
+    embedding_logits(m.tok, rms_norm(h, m.nf))
 }
 
 // Data parallelism (`doc/plan-spawn.md`): a batch's `ROWS` split into `SPLIT`
@@ -218,8 +224,8 @@ fn gpt_logits<const N: i32>(x: [i32; N], p: [i32; N], m: Gpt) -> Tensor<f32, N, 
 define SPLIT: i32 = 8;
 define MICRO: i32 = ROWS / SPLIT;
 
-fn gpt_loss_micro(x: [i32; MICRO], y: [i32; MICRO], p: [i32; MICRO], m: Gpt) -> f32 {
-    sparse_cross_entropy(gpt_logits(x, p, m), y)
+fn gpt_loss_micro(x: [i32; MICRO], y: [i32; MICRO], m: Gpt) -> f32 {
+    sparse_cross_entropy(gpt_logits(x, m), y)
 }
 
 gpt_grad_micro = grad(gpt_loss_micro, m);
@@ -227,60 +233,32 @@ gpt_grad_micro = grad(gpt_loss_micro, m);
 // Micro-batch `j` of a batch: rows `j * MICRO ..`.
 fn micro(a: [i32; ROWS], j: i32) -> [i32; MICRO] { [for k in 0..MICRO: a[j * MICRO + k]] }
 
-fn parallel_grad(x: [i32; ROWS], y: [i32; ROWS], p: [i32; ROWS], m: Gpt) -> Gpt {
-    // Every micro-batch is whole sequences, so the same positions.
-    let pm = micro(p, 0);
-    let x0 = micro(x, 0);
-    let y0 = micro(y, 0);
-    let x1 = micro(x, 1);
-    let y1 = micro(y, 1);
-    let x2 = micro(x, 2);
-    let y2 = micro(y, 2);
-    let x3 = micro(x, 3);
-    let y3 = micro(y, 3);
-    let x4 = micro(x, 4);
-    let y4 = micro(y, 4);
-    let x5 = micro(x, 5);
-    let y5 = micro(y, 5);
-    let x6 = micro(x, 6);
-    let y6 = micro(y, 6);
-    let x7 = micro(x, 7);
-    let y7 = micro(y, 7);
-    let g0 = spawn gpt_grad_micro(x0, y0, pm, m);
-    let g1 = spawn gpt_grad_micro(x1, y1, pm, m);
-    let g2 = spawn gpt_grad_micro(x2, y2, pm, m);
-    let g3 = spawn gpt_grad_micro(x3, y3, pm, m);
-    let g4 = spawn gpt_grad_micro(x4, y4, pm, m);
-    let g5 = spawn gpt_grad_micro(x5, y5, pm, m);
-    let g6 = spawn gpt_grad_micro(x6, y6, pm, m);
-    let g7 = spawn gpt_grad_micro(x7, y7, pm, m);
-    sync;
-    phase_mark(1);
+fn parallel_grad(x: [i32; ROWS], y: [i32; ROWS], m: Gpt) -> Gpt {
+    let g = [for j in 0..SPLIT: spawn gpt_grad_micro(micro(x, j), micro(y, j), m)];
     // A balanced tree, in a fixed order: the same result whatever the thread count.
-    accumulate(accumulate(accumulate(g0, g1), accumulate(g2, g3)), accumulate(accumulate(g4, g5), accumulate(g6, g7)))
+    accumulate(accumulate(accumulate(g[0], g[1]), accumulate(g[2], g[3])), accumulate(accumulate(g[4], g[5]), accumulate(g[6], g[7])))
 }
 
 // A batch's summed loss, its micro-batches evaluated in parallel as the gradient's are, summed in
 // a fixed order.
-fn parallel_loss(x: [i32; ROWS], y: [i32; ROWS], p: [i32; ROWS], m: Gpt) -> f64 {
-    let pm = micro(p, 0);
-    let parts = [for j in 0..SPLIT: spawn gpt_loss_micro(micro(x, j), micro(y, j), pm, m)];
+fn parallel_loss(x: [i32; ROWS], y: [i32; ROWS], m: Gpt) -> f64 {
+    let parts = [for j in 0..SPLIT: spawn gpt_loss_micro(micro(x, j), micro(y, j), m)];
     let mut total: f64 = 0.0;
     for j in 0..SPLIT { total = total + parts[j].to(); };
     total
 }
 
-fn gpt_validation_loss(m: Gpt, p: [i32; ROWS], batches: i32) -> f32 {
+fn gpt_validation_loss(m: Gpt, batches: i32) -> f32 {
     let mut total: f64 = 0.0;
-    for s in 0..batches { total = total + parallel_loss(val_inputs(s), val_targets(s), p, m); };
+    for s in 0..batches { total = total + parallel_loss(val_inputs(s), val_targets(s), m); };
     (total / (batches * ROWS).to()).to()
 }
 
 // The loss on training batches `first..first + batches` (the round's last ones, just trained on):
 // next to the validation loss, whether the model under- or over-fits.
-fn gpt_train_loss(m: Gpt, p: [i32; ROWS], first: i32, batches: i32) -> f32 {
+fn gpt_train_loss(m: Gpt, first: i32, batches: i32) -> f32 {
     let mut total: f64 = 0.0;
-    for s in first..first + batches { total = total + parallel_loss(train_inputs(s), train_targets(s), p, m); };
+    for s in first..first + batches { total = total + parallel_loss(train_inputs(s), train_targets(s), m); };
     (total / (batches * ROWS).to()).to()
 }
 
@@ -293,45 +271,48 @@ fn learning_rate(s: i32, base: f32) -> f32 {
     }
 }
 
+// Step `s`'s optimizer: Muon on the hidden matrices, AdamW (base rate `lr`) on the rest.
+fn optimizer(s: i32, lr: f32) -> Muon {
+    Muon(
+        lr: learning_rate(s, MUON_LR), momentum: 0.95, weight_decay: 0.0,
+        adamw: AdamW(lr: learning_rate(s, lr), beta1: 0.9, beta2: 0.95, eps: 0.00000001, weight_decay: 0.0)
+    )
+}
+
 // The end of a round, for the host to report with timings (`main.rs`).
 extern fn round_done(step: i32, train_loss: f32, validation_loss: f32, rate: f32);
-// TEMP profiling: the host times the phases of a step.
-extern fn phase_mark(id: i32);
 
-// Writes the initial weights to `gpt_init.ckpt` for the twin, trains `rounds` of `per_round` Adam
-// steps starting at step `first` (batches and learning rate are functions of the step, so a
+// Writes the initial weights to `gpt_init.ckpt` for the twin, trains `rounds` of `per_round`
+// steps starting at step `first` (batches and learning rates are functions of the step, so a
 // resumed run continues the same sequence), checkpointing the model, optimizer state and random
 // generator to `gpt.ckpt` after each round. Checkpoints live in the working directory, one per
-// model size (`main.rs`).
+// model size (`main.rs`). `lr` is AdamW's base rate, the one reported.
 export fn train_gpt(first: i32, rounds: i32, per_round: i32, lr: f32, seed: i64, resume: bool) -> f32 {
     rand_seed(seed);
-    let p = positions();
-    let opt0 = Adam(lr: lr, beta1: 0.9, beta2: 0.999, eps: 0.00000001);
+    let clip: f32 = CLIP_PER_ROW * ROWS.to();
     let fresh = new_gpt();
     let mut m = fresh;
-    let mut state = init_state(opt0, fresh);
+    let mut state = init_state(optimizer(first, lr), fresh);
     if resume {
-        let (rm, rs, rseed) = restore("gpt.ckpt", (fresh, init_state(opt0, fresh), 0:i64));
+        let (rm, rs, rseed) = restore("gpt.ckpt", (fresh, init_state(optimizer(first, lr), fresh), 0:i64));
         m = rm;
         state = rs;
         rand_seed(rseed);
     } else {
         save("gpt_init.ckpt", m);
     };
-    round_done(first, 0.0, gpt_validation_loss(m, p, 4), learning_rate(first, lr));
+    round_done(first, 0.0, gpt_validation_loss(m, 4), learning_rate(first, lr));
     for r in 0..rounds {
         for k in 0..per_round {
             let s = first + r * per_round + k;
-            let opt = Adam(lr: learning_rate(s, lr), beta1: 0.9, beta2: 0.999, eps: 0.00000001);
-            phase_mark(0);
-            (m, state) = step(opt, m, parallel_grad(train_inputs(s), train_targets(s), p, m), state);
-            phase_mark(2);
+            let g = clip_grad_norm(parallel_grad(train_inputs(s), train_targets(s), m), clip);
+            (m, state) = step(optimizer(s, lr), m, g, state);
         };
         save("gpt.ckpt", (m, state, rand_state()));
         let next = first + (r + 1) * per_round;
-        round_done(next, gpt_train_loss(m, p, next - 4, 4), gpt_validation_loss(m, p, 4), learning_rate(next, lr));
+        round_done(next, gpt_train_loss(m, next - 4, 4), gpt_validation_loss(m, 4), learning_rate(next, lr));
     };
-    gpt_validation_loss(m, p, 20)
+    gpt_validation_loss(m, 20)
 }
 
 // ------------------------------------------------------------------ generation
@@ -343,17 +324,17 @@ extern fn prompt_len() -> i32;
 extern fn emit_token(t: i32);
 
 // Continues the prompt for `count` tokens with the model saved in `gpt.ckpt`, each drawn from the
-// next-token distribution at `temperature`. The context slides once it holds `CONTEXT`.
-export fn generate(count: i32, temperature: f32, seed: i64) -> i32 {
-    let opt = Adam(lr: 0.001, beta1: 0.9, beta2: 0.999, eps: 0.00000001);
+// next-token distribution at `temperature`, among the nucleus of the most likely tokens holding
+// `top_p` of the probability (`sample_row_top_p`; 1 keeps every token). The context slides once
+// it holds `CONTEXT`.
+export fn generate(count: i32, temperature: f32, top_p: f32, seed: i64) -> i32 {
     let fresh = new_gpt();
-    let (m, _, _) = restore("gpt.ckpt", (fresh, init_state(opt, fresh), 0:i64));
+    let (m, _, _) = restore("gpt.ckpt", (fresh, init_state(optimizer(0, 0.001), fresh), 0:i64));
     rand_seed(seed);
-    let p: [i32; CONTEXT] = [for k in 0..CONTEXT: k];
     let mut ctx = prompt_ids();
     let mut len = prompt_len();
     for g in 0..count {
-        let c = sample_row(gpt_logits(ctx, p, m), len - 1, temperature);
+        let c = sample_row_top_p(gpt_logits(ctx, m), len - 1, temperature, top_p);
         emit_token(c);
         if len < CONTEXT {
             ctx[len] = c;

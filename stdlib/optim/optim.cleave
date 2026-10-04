@@ -40,19 +40,48 @@ use linalg;
 struct Sgd { lr: f32 }
 struct Momentum { lr: f32, beta: f32 }
 struct Adam { lr: f32, beta1: f32, beta2: f32, eps: f32 }
+// AdamW (Loshchilov & Hutter, 2019): Adam with *decoupled* weight decay. The
+// weights shrink by `lr * weight_decay` of themselves at each step, apart
+// from the gradient, rather than through an L2 term in the loss that Adam's
+// per-parameter normalization would rescale. As `torch.optim.AdamW`, every
+// tensor is decayed (biases and norm gains included).
+struct AdamW { lr: f32, beta1: f32, beta2: f32, eps: f32, weight_decay: f32 }
+// Muon (Keller Jordan, 2024): for the hidden matrices of a network, the
+// momentum of the gradient orthogonalized (`newton_schulz5`) before the step,
+// so every direction of the matrix moves by a comparable amount instead of the
+// few that dominate the raw gradient. Converges in markedly fewer steps than
+// Adam on transformers. Only for matrices: rows of one (biases, norm gains)
+// and `Embedding` tables are updated by `adamw` instead.
+struct Muon { lr: f32, momentum: f32, weight_decay: f32, adamw: AdamW }
+
+// The optimizers that update every number of a model the same way, whatever
+// the tensor stands for (`Muon` doesn't: matrices and the rest differ).
+// `stdlib/nn`'s `Embedding` forwards these to its table.
+algebra ElementwiseOptimizer<Opt> {}
+impl ElementwiseOptimizer<Sgd> {}
+impl ElementwiseOptimizer<Momentum> {}
+impl ElementwiseOptimizer<Adam> {}
+impl ElementwiseOptimizer<AdamW> {}
 
 algebra Optimizer<Opt, Model, State> {
     fn init_state(opt: Opt, model: Model) -> State;
     fn step(opt: Opt, model: Model, grad: Model, state: State) -> (Model, State);
 }
 
-// A model made of parts the optimizer already knows how to update: a struct
-// whose every field is a tensor or itself `Trainable` (`impl Trainable<Network>
-// {}`, written next to the struct). Opt-in, never every struct: a marked
-// struct is exactly what the impl below covers, so it can't overlap any
-// optimizer's own leaf impl (`doc/plan-compile-time-sequences.md`, "No blanket
-// impl over every struct").
-algebra Trainable<M> {}
+// A struct made of parameters: every field a tensor or itself `Parameters`.
+// What can be handled field by field whatever the fields are: saved
+// (`Checkpoint`), summed (`Accumulate`), measured (`GradNorm`). Opt-in, never
+// every struct: a marked struct is exactly what those impls cover, so it can't
+// overlap a leaf impl (`doc/plan-compile-time-sequences.md`, "No blanket impl
+// over every struct").
+algebra Parameters<M> {}
+
+// A model made of parts the optimizer already knows how to update, field by
+// field (`impl Trainable<Network> {}`, written next to the struct); every
+// `Trainable` is `Parameters`. A `Parameters` struct that isn't `Trainable`
+// chooses its own update instead (`stdlib/nn`'s `Embedding`, kept on AdamW
+// under `Muon`).
+algebra Trainable<M> : Parameters {}
 
 // Every `Trainable` model, for every optimizer: each field updated by its own
 // `Optimizer` impl, the model rebuilt from the new fields (`Collect`, pinned
@@ -86,9 +115,9 @@ impl<T: Float + Ring, const Dims...: i32> Accumulate<Tensor<T, Dims...>> {
     fn accumulate(a, b) { a + b }
 }
 
-// Every `Trainable` model: field by field, the model rebuilt from the sums
+// Every `Parameters` struct: field by field, the struct rebuilt from the sums
 // (`Collect`, pinned to `M` by the signature), as `Optimizer::step` does.
-impl<M: Trainable> Accumulate<M> {
+impl<M: Parameters> Accumulate<M> {
     // Field by field, each sum its own task, like `Optimizer::step`.
     fn accumulate(a, b) {
         let sums = [for i in 0..a.len(): spawn accumulate(a[i], b[i])];
@@ -159,31 +188,94 @@ impl<T: Float + Ring, const Dims...: i32> Optimizer<Adam, Tensor<T, Dims...>, Ad
     // the step runs at the same speed.
     #[no_inline]
     fn step(opt, model, grad, state) {
-        let m: Tensor<T, Dims...> = Ring::add(Scale::scale(state.m, opt.beta1), Scale::scale(grad, 1.0 - opt.beta1));
-        let grad_sq: Tensor<T, Dims...> = grad * grad;
-        let v: Tensor<T, Dims...> = Ring::add(Scale::scale(state.v, opt.beta2), Scale::scale(grad_sq, 1.0 - opt.beta2));
-        let beta1_pow: f32 = state.beta1_pow * opt.beta1;
-        let beta2_pow: f32 = state.beta2_pow * opt.beta2;
-        let m_hat: Tensor<T, Dims...> = Scale::scale(m, 1.0 / (1.0 - beta1_pow));
-        let v_hat: Tensor<T, Dims...> = Scale::scale(v, 1.0 / (1.0 - beta2_pow));
-        // `mlir::math::sqrt`, called directly on a `Tensor`-typed value, not
-        // through any declared algebra -- `Transcendental<T>` only ever
-        // impls scalar `f32`/`f64` (`stdlib/num/num.cleave`), and `sqrt`
-        // itself was never wrapped in *any* algebra even at scalar width
-        // (`Complex<T>::magnitude`, `stdlib/complex/complex.cleave`, calls
-        // it the identical raw way). MLIR's own `math.sqrt` is elementwise-
-        // mappable, the same structural property `arith.addf`/`mulf`
-        // already lean on for `Ring<Tensor<T,Dims...>>` above -- confirmed
-        // directly, not assumed: a tensor-typed operand here lowers and
-        // runs correctly with zero new Rust code.
-        let sqrt_v_hat: Tensor<T, Dims...> = mlir::math::sqrt(v_hat);
-        // A broadcast add, not `Ring::add` (which needs *both* operands
-        // already `Tensor`-shaped) -- `mlir::tensor::splat`, the exact same
-        // primitive `Scale::scale`'s own body already uses internally to
-        // turn one scalar into a same-shaped tensor.
-        let eps_bcast: Tensor<T, Dims...> = mlir::tensor::splat(opt.eps);
-        let denom: Tensor<T, Dims...> = sqrt_v_hat + eps_bcast;
-        let update: Tensor<T, Dims...> = Scale::scale(m_hat / denom, opt.lr);
-        (model - update, AdamState::<T, Dims...>(m: m, v: v, beta1_pow: beta1_pow, beta2_pow: beta2_pow))
+        let (direction, next) = adam_direction(grad, state, opt.beta1, opt.beta2, opt.eps);
+        (model - Scale::scale(direction, opt.lr), next)
     }
+}
+
+impl<T: Float + Ring, const Dims...: i32> Optimizer<AdamW, Tensor<T, Dims...>, AdamState<T, Dims...>> {
+    fn init_state(opt, model) {
+        AdamState::<T, Dims...>(m: Ring::zero(), v: Ring::zero(), beta1_pow: 1.0, beta2_pow: 1.0)
+    }
+    // Not inlined, as `Adam`'s.
+    #[no_inline]
+    fn step(opt, model, grad, state) {
+        let (direction, next) = adam_direction(grad, state, opt.beta1, opt.beta2, opt.eps);
+        (Scale::scale(model, 1.0 - opt.lr * opt.weight_decay) - Scale::scale(direction, opt.lr), next)
+    }
+}
+
+// What `Adam` and `AdamW` share: the updated moments and the direction of the
+// step, `m_hat / (sqrt(v_hat) + eps)`, before the learning rate.
+fn adam_direction<T: Float + Ring, const Dims...: i32>(grad: Tensor<T, Dims...>, state: AdamState<T, Dims...>, beta1: f32, beta2: f32, eps: f32) -> (Tensor<T, Dims...>, AdamState<T, Dims...>) {
+    let m: Tensor<T, Dims...> = Ring::add(Scale::scale(state.m, beta1), Scale::scale(grad, 1.0 - beta1));
+    let grad_sq: Tensor<T, Dims...> = grad * grad;
+    let v: Tensor<T, Dims...> = Ring::add(Scale::scale(state.v, beta2), Scale::scale(grad_sq, 1.0 - beta2));
+    let beta1_pow: f32 = state.beta1_pow * beta1;
+    let beta2_pow: f32 = state.beta2_pow * beta2;
+    let m_hat: Tensor<T, Dims...> = Scale::scale(m, 1.0 / (1.0 - beta1_pow));
+    let v_hat: Tensor<T, Dims...> = Scale::scale(v, 1.0 / (1.0 - beta2_pow));
+    // `mlir::math::sqrt`, called directly on a `Tensor`-typed value, not
+    // through any declared algebra -- `Transcendental<T>` only ever
+    // impls scalar `f32`/`f64` (`stdlib/num/num.cleave`), and `sqrt`
+    // itself was never wrapped in *any* algebra even at scalar width
+    // (`Complex<T>::magnitude`, `stdlib/complex/complex.cleave`, calls
+    // it the identical raw way). MLIR's own `math.sqrt` is elementwise-
+    // mappable, the same structural property `arith.addf`/`mulf`
+    // already lean on for `Ring<Tensor<T,Dims...>>` above -- confirmed
+    // directly, not assumed: a tensor-typed operand here lowers and
+    // runs correctly with zero new Rust code.
+    let sqrt_v_hat: Tensor<T, Dims...> = mlir::math::sqrt(v_hat);
+    // A broadcast add, not `Ring::add` (which needs *both* operands
+    // already `Tensor`-shaped) -- `mlir::tensor::splat`, the exact same
+    // primitive `Scale::scale`'s own body already uses internally to
+    // turn one scalar into a same-shaped tensor.
+    let eps_bcast: Tensor<T, Dims...> = mlir::tensor::splat(eps);
+    let denom: Tensor<T, Dims...> = sqrt_v_hat + eps_bcast;
+    (m_hat / denom, AdamState::<T, Dims...>(m: m, v: v, beta1_pow: beta1_pow, beta2_pow: beta2_pow))
+}
+
+impl<const R: i32, const C: i32> Optimizer<Muon, Tensor<f32, R, C>, AdamState<f32, R, C>> {
+    fn init_state(opt, model) {
+        AdamState::<f32, R, C>(m: Ring::zero(), v: Ring::zero(), beta1_pow: 1.0, beta2_pow: 1.0)
+    }
+    // Not inlined, as `Adam`'s. A row of one (a bias, a gain) goes to AdamW;
+    // a matrix keeps its momentum in `state.m` (`v` unused), steps along the
+    // orthogonalized Nesterov momentum, scaled by `sqrt(max(1, R / C))` so
+    // that tall and wide matrices move alike, with AdamW's decoupled decay.
+    #[no_inline]
+    fn step(opt, model, grad, state) {
+        if R == 1 {
+            step(opt.adamw, model, grad, state)
+        } else {
+            let buf: Tensor<f32, R, C> = Scale::scale(state.m, opt.momentum) + Scale::scale(grad, 1.0 - opt.momentum);
+            let nesterov: Tensor<f32, R, C> = Scale::scale(grad, 1.0 - opt.momentum) + Scale::scale(buf, opt.momentum);
+            let r: f32 = R.to();
+            let c: f32 = C.to();
+            let aspect: f32 = if r > c { sqrt(r / c) } else { 1.0 };
+            let update: Tensor<f32, R, C> = Scale::scale(newton_schulz5(nesterov), opt.lr * aspect);
+            (Scale::scale(model, 1.0 - opt.lr * opt.weight_decay) - update,
+             AdamState::<f32, R, C>(m: buf, v: state.v, beta1_pow: state.beta1_pow, beta2_pow: state.beta2_pow))
+        }
+    }
+}
+
+// The orthogonal matrix nearest to `g` (its polar factor, `U Vᵀ` of its SVD),
+// approximated by five Newton-Schulz iterations of the quintic tuned for Muon
+// (coefficients 3.4445, -4.7750, 2.0315): cheap, only matrix products. Run on
+// the wide orientation (`R <= C`), so the products are `R x R`.
+fn newton_schulz5<const R: i32, const C: i32>(g: Tensor<f32, R, C>) -> Tensor<f32, R, C> {
+    if R > C { transpose(newton_schulz5_wide(transpose(g))) } else { newton_schulz5_wide(g) }
+}
+
+fn newton_schulz5_wide<const R: i32, const C: i32>(g: Tensor<f32, R, C>) -> Tensor<f32, R, C> {
+    let mut sq = 0.0;
+    for r in 0..R { for c in 0..C { sq = sq + g[r, c] * g[r, c]; }; };
+    let mut x: Tensor<f32, R, C> = Scale::scale(g, 1.0 / (sqrt(sq) + 0.0000001));
+    for i in 0..5 {
+        let a: Tensor<f32, R, R> = blas_matmul_transpose_b(x, x);
+        let b: Tensor<f32, R, R> = Scale::scale(a, -4.7750) + Scale::scale(blas_matmul(a, a), 2.0315);
+        x = Scale::scale(x, 3.4445) + blas_matmul(b, x);
+    };
+    x
 }

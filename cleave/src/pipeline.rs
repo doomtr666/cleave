@@ -441,7 +441,8 @@ pub fn compile_and_emit(
     defines: &[(String, String)],
 ) -> Result<bool, Vec<String>> {
     let (result, sources) = crate::driver::compile(sources_in, project_dirs);
-    let program = result.map_err(|errs| render_all(&errs, &sources))?;
+    let mut program = result.map_err(|errs| render_all(&errs, &sources))?;
+    Registry::apply_defines(&mut program, defines);
     let (registry, define_errors) = Registry::build_with_defines(&program, defines, options.openmp);
     if !define_errors.is_empty() {
         return Err(define_errors);
@@ -1183,9 +1184,17 @@ pub fn lower_to_llvm<'c>(
     // buffer, instead of a scratch buffer plus a copy. The self-copy it
     // leaves behind (`memref.copy %b, %b`) is folded by the later
     // `--canonicalize` stage.
+    //
+    // `allow-return-allocs-from-loops`: a loop may carry a tensor whose new
+    // value is a fresh buffer (`x = sgemm(w, x)`, any call returning a new
+    // tensor) rather than an in-place update of the one it received. Without
+    // it, One-Shot Bufferize rejects the loop outright ("Yield operand is not
+    // equivalent to the corresponding iter bbArg"); with it, the loop's buffer
+    // changes from one iteration to the next, and the ownership-based
+    // deallocation below frees the one each iteration leaves behind.
     if parse_pass_pipeline(
         pass_manager.as_operation_pass_manager(),
-        "builtin.module(eliminate-empty-tensors,one-shot-bufferize{bufferize-function-boundaries=true function-boundary-type-conversion=identity-layout-map})",
+        "builtin.module(eliminate-empty-tensors,one-shot-bufferize{bufferize-function-boundaries=true function-boundary-type-conversion=identity-layout-map allow-return-allocs-from-loops=true})",
     )
     .is_err()
         || pass_manager.run(&mut *module).is_err()
@@ -2363,17 +2372,15 @@ pub fn emit_exe(
     std::fs::write(&shim_path, shim_src)
         .map_err(|e| vec![format!("failed to write {}: {e}", shim_path.display())])?;
 
-    let runtime_dir = cleave_rt_search_dir()?;
+    let runtime_lib = cleave_rt_library()?;
     let mut cmd = std::process::Command::new("rustc");
     cmd.arg(&shim_path)
         .arg("-o")
         .arg(exe_path)
         .arg("-C")
         .arg(format!("link-arg={}", object_path.display()))
-        .arg("-L")
-        .arg(&runtime_dir)
-        .arg("-l")
-        .arg("cleave_rt");
+        .arg("-C")
+        .arg(format!("link-arg={}", runtime_lib.display()));
     if options.openmp || (options.tasks && crate::cps::uses_spawn(&cps_program)) {
         // `-l libomp` (not `-l omp` -- the real installed file is genuinely
         // named `libomp.lib`, the cross-platform LLVM convention, and `rustc`
@@ -2412,31 +2419,46 @@ pub fn emit_exe(
     }
 }
 
-/// `cleave_rt.lib`/`libcleave_rt.a` sits alongside `cleave.exe` itself in an
-/// ordinary `cargo build`/`cargo run` -- both land in the same
-/// `target/<profile>/` directory. A `cargo test`-built test binary is one
-/// level deeper (`target/<profile>/deps/`), where only a *hash-suffixed*
-/// copy exists (Cargo's own convention for a dependency built once but
-/// consumed by several test binaries) -- found directly testing this exact
-/// code path from `tests/pipeline.rs`, so both layouts are checked here,
-/// preferring the running executable's own immediate directory first.
-/// Known, deliberate limitation beyond that: a `cleave` binary copied/
-/// installed somewhere with neither layout nearby won't find one.
-fn cleave_rt_search_dir() -> Result<PathBuf, Vec<String>> {
+/// The `cleave-rt` static library to link a standalone executable with: the
+/// most recently built of `cleave_rt.lib`/`libcleave_rt.a` beside the running
+/// `cleave` (or one level up, for a test binary in `deps/`) and of Cargo's
+/// hash-suffixed copies in `deps/`. Building `cleave` rebuilds `cleave-rt` as
+/// a dependency into `deps/` only; the unsuffixed copy beside it is refreshed
+/// only by building `cleave-rt` itself, so it goes stale as the runtime gains
+/// symbols (`cleave_parallel_threads`, unresolved at link time, found with
+/// `--emit-exe`). The newest one is the one built from the current sources.
+/// A `cleave` installed with no runtime library near it finds none.
+fn cleave_rt_library() -> Result<PathBuf, Vec<String>> {
     let exe = std::env::current_exe().map_err(|e| {
         vec![format!(
             "failed to locate the running cleave executable: {e}"
         )]
     })?;
-    let candidates = exe.ancestors().skip(1).take(2);
-    for dir in candidates {
-        if dir.join("cleave_rt.lib").exists() || dir.join("libcleave_rt.a").exists() {
-            return Ok(dir.to_path_buf());
+    let is_runtime = |name: &str| {
+        name == "cleave_rt.lib"
+            || name == "libcleave_rt.a"
+            || (name.starts_with("cleave_rt-") && name.ends_with(".lib"))
+            || (name.starts_with("libcleave_rt-") && name.ends_with(".a"))
+    };
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for dir in exe.ancestors().skip(1).take(2) {
+        for dir in [dir.to_path_buf(), dir.join("deps")] {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !is_runtime(&name) {
+                    continue;
+                }
+                let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else { continue };
+                if newest.as_ref().is_none_or(|(t, _)| modified > *t) {
+                    newest = Some((modified, entry.path()));
+                }
+            }
         }
     }
-    exe.parent().map(|p| p.to_path_buf()).ok_or_else(|| {
+    newest.map(|(_, path)| path).ok_or_else(|| {
         vec![format!(
-            "cleave executable path {} has no parent directory",
+            "no cleave-rt static library (cleave_rt.lib / libcleave_rt.a) near {}",
             exe.display()
         )]
     })

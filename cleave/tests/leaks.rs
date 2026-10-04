@@ -281,3 +281,248 @@ fn training_steps_leave_no_allocation_behind() {
         .collect();
     assert!(leaks.iter().all(|(_, l)| *l < NOISE), "bytes leaked per step: {leaks:?}");
 }
+
+/// A loop carrying a tensor whose new value is a fresh buffer from `sgemm`
+/// (`x = blas_matmul(w, x)`): One-Shot Bufferize used to reject it outright
+/// (`allow-return-allocs-from-loops`); now each iteration's buffer replaces the
+/// last, and the one left behind must be freed, not accumulated.
+#[test]
+fn a_loop_carrying_a_blas_result_frees_each_iterations_buffer() {
+    let program = |steps: u32| {
+        format!(
+            "
+            use nn;
+            fn main() -> i32 {{
+                let o: f32 = 0.001;
+                let w: Tensor<f32, 384, 384> = mlir::tensor::splat(o);
+                let mut x: Tensor<f32, 384, 384> = mlir::tensor::splat(o);
+                for i in 0..{steps} {{ x = blas_matmul(w, x); }};
+                if x[0, 0] >= 0.0 {{ 1 }} else {{ 0 }}
+            }}
+            "
+        )
+    };
+    let (r8, live8) = run_counting(&program(8));
+    let (r72, live72) = run_counting(&program(72));
+    assert_eq!((r8, r72), (1, 1));
+    let per_iteration = (live72 - live8) / 64;
+    assert!(per_iteration < NOISE, "{per_iteration} bytes left behind per iteration");
+}
+
+/// One loop of `steps` iterations of `body` on `m` (a `Tensor<f32, 64, 48>`
+/// and its gradient `g`), counting what's left allocated: per iteration.
+fn leak_per_iteration(prelude: &str, body: &str) -> i64 {
+    let program = |steps: u32| {
+        format!(
+            "
+            use nn;
+            {prelude}
+            fn main() -> i32 {{
+                rand_seed(1);
+                let mut m: Tensor<f32, 64, 48> = Init::xavier();
+                let g: Tensor<f32, 64, 48> = Init::xavier();
+                {body}
+                if m[0, 0] == m[0, 0] {{ 1 }} else {{ 0 }}
+            }}
+            "
+        )
+    };
+    let (r8, live8) = run_counting(&program(8).replace("STEPS", "8"));
+    let (r72, live72) = run_counting(&program(72).replace("STEPS", "72"));
+    assert_eq!((r8, r72), (1, 1));
+    (live72 - live8) / 64
+}
+
+#[test]
+#[ignore = "leaks: doc/backlog.md, A loop carrying a bare tensor *and* a struct ... leaks every iteration"]
+fn muon_steps_leave_no_allocation_behind() {
+    let per = leak_per_iteration(
+        "",
+        "let opt = Muon(lr: 0.01, momentum: 0.95, weight_decay: 0.0,
+                       adamw: AdamW(lr: 0.001, beta1: 0.9, beta2: 0.95, eps: 0.00000001, weight_decay: 0.0));
+         let mut s = init_state(opt, m);
+         for i in 0..STEPS { (m, s) = step(opt, m, g, s); };",
+    );
+    assert!(per < NOISE, "{per} bytes per Muon step");
+}
+
+#[test]
+fn clipping_leaves_no_allocation_behind() {
+    let per = leak_per_iteration(
+        "struct Net { d: Dense<f32, 64, 48> }\n impl Trainable<Net> {}",
+        "let mut n = Net(d: Dense(w: m, b: Init::xavier()));
+         for i in 0..STEPS { n = clip_grad_norm(n, 0.5); };
+         m = n.d.w;",
+    );
+    assert!(per < NOISE, "{per} bytes per clip");
+}
+
+#[test]
+fn a_tied_embedding_gradient_leaves_no_allocation_behind() {
+    let per = leak_per_iteration(
+        "fn loss(e: Embedding<f32, 64, 48>) -> f32 {
+             let ids: [i32; 8] = [1, 5, 9, 2, 63, 0, 7, 7];
+             sum(embedding_logits(e, embedding_forward(e, ids)))
+         }
+         de = grad(loss, e);",
+        "let mut e = Embedding(table: m);
+         for i in 0..STEPS { let d = de(e); e = Embedding(table: e.table - Scale::scale(d.table, 0.0001)); };
+         m = e.table;",
+    );
+    assert!(per < NOISE, "{per} bytes per gradient");
+}
+
+#[test]
+fn transposes_leave_no_allocation_behind() {
+    let per = leak_per_iteration("", "for i in 0..STEPS { m = transpose(transpose(m)); };");
+    assert!(per < NOISE, "{per} bytes per pair of transposes");
+}
+
+#[test]
+fn newton_schulz_leaves_no_allocation_behind() {
+    let per = leak_per_iteration("", "for i in 0..STEPS { m = newton_schulz5(m); };");
+    assert!(per < NOISE, "{per} bytes per orthogonalization");
+}
+
+const CARRIED: &str = "
+    fn next_tensor<const R: i32, const C: i32>(m: Tensor<f32, R, C>, g: Tensor<f32, R, C>) -> Tensor<f32, R, C> {
+        m - Scale::scale(g, 0.001)
+    }
+    fn next_state<const R: i32, const C: i32>(g: Tensor<f32, R, C>, s: AdamState<f32, R, C>) -> AdamState<f32, R, C> {
+        AdamState::<f32, R, C>(m: Scale::scale(s.m, 0.9) + g, v: s.v, beta1_pow: s.beta1_pow, beta2_pow: s.beta2_pow)
+    }
+    fn next_both<const R: i32, const C: i32>(m: Tensor<f32, R, C>, g: Tensor<f32, R, C>, s: AdamState<f32, R, C>) -> (Tensor<f32, R, C>, AdamState<f32, R, C>) {
+        (next_tensor(m, g), next_state(g, s))
+    }
+";
+
+#[test]
+fn carried_1_a_tensor_from_a_call() {
+    let per = leak_per_iteration(CARRIED, "for i in 0..STEPS { m = next_tensor(m, g); };");
+    assert!(per < NOISE, "{per} bytes per step");
+}
+
+#[test]
+fn carried_2_a_struct_rebuilt() {
+    let per = leak_per_iteration(
+        CARRIED,
+        "let mut s = AdamState::<f32, 64, 48>(m: Ring::zero(), v: Ring::zero(), beta1_pow: 1.0, beta2_pow: 1.0);
+         for i in 0..STEPS { s = next_state(g, s); };
+         m = s.m;",
+    );
+    assert!(per < NOISE, "{per} bytes per step");
+}
+
+#[test]
+#[ignore = "leaks: doc/backlog.md, A loop carrying a bare tensor *and* a struct ... leaks every iteration"]
+fn carried_3_both_from_a_tuple() {
+    let per = leak_per_iteration(
+        CARRIED,
+        "let mut s = AdamState::<f32, 64, 48>(m: Ring::zero(), v: Ring::zero(), beta1_pow: 1.0, beta2_pow: 1.0);
+         for i in 0..STEPS { (m, s) = next_both(m, g, s); };",
+    );
+    assert!(per < NOISE, "{per} bytes per step");
+}
+
+fn model_steps_leak(opt: &str) -> i64 {
+    leak_per_iteration(
+        "struct Net { e: Embedding<f32, 64, 48>, d: Dense<f32, 48, 64> }\n impl Trainable<Net> {}",
+        &format!(
+            "let opt = {opt};
+             let mut net = Net(e: Embedding(table: m), d: Init::xavier());
+             let grad = Net(e: Embedding(table: g), d: Init::xavier());
+             let mut st = init_state(opt, net);
+             for i in 0..STEPS {{ (net, st) = step(opt, net, grad, st); }};
+             m = net.e.table;"
+        ),
+    )
+}
+
+#[test]
+fn model_steps_under_adamw_leave_nothing_behind() {
+    let per = model_steps_leak("AdamW(lr: 0.001, beta1: 0.9, beta2: 0.95, eps: 0.00000001, weight_decay: 0.0)");
+    assert!(per < NOISE, "{per} bytes per step");
+}
+
+#[test]
+fn model_steps_under_muon_leave_nothing_behind() {
+    let per = model_steps_leak(
+        "Muon(lr: 0.01, momentum: 0.95, weight_decay: 0.0,
+              adamw: AdamW(lr: 0.001, beta1: 0.9, beta2: 0.95, eps: 0.00000001, weight_decay: 0.0))",
+    );
+    assert!(per < NOISE, "{per} bytes per step");
+}
+
+#[test]
+fn accumulating_embeddings_leaves_nothing_behind() {
+    let per = leak_per_iteration(
+        "",
+        "let mut e = Embedding(table: m);
+         let d = Embedding(table: g);
+         for i in 0..STEPS { e = Embedding(table: Scale::scale(accumulate(e, d).table, 0.5)); };
+         m = e.table;",
+    );
+    assert!(per < NOISE, "{per} bytes per step");
+}
+
+#[test]
+fn a_modern_block_gradient_leaves_nothing_behind() {
+    let per = leak_per_iteration(
+        "struct B { n: Tensor<f32, 1, 48>, wq: Dense<f32, 48, 48>, mlp: SwiGlu<f32, 48, 32> }
+         impl Trainable<B> {}
+         fn ones() -> Tensor<f32, 1, 48> { [for i in 0..1: [for j in 0..48: 1.0]] }
+         fn loss(x: Tensor<f32, 64, 48>, b: B) -> f32 {
+             let shape = AttentionShape::<16, 16>();
+             let h = rms_norm(x, b.n);
+             let q = rope(b.wq.dense_forward(h), shape);
+             sum(b.mlp.swiglu_forward(q))
+         }
+         db = grad(loss, b);",
+        "let mut b = B(n: ones(), wq: Init::xavier(), mlp: Init::xavier());
+         for i in 0..STEPS { let d = db(m, b); b = B(n: b.n, wq: b.wq, mlp: SwiGlu(gate: b.mlp.gate, up: b.mlp.up, down: Dense(w: b.mlp.down.w - Scale::scale(d.mlp.down.w, 0.0001), b: b.mlp.down.b))); };",
+    );
+    assert!(per < NOISE, "{per} bytes per step");
+}
+
+/// `[for j in 0..N: spawn f(..)]` collecting structs, read by index
+/// (nanoLM's `parallel_grad`: eight micro-batch gradients, then summed).
+#[test]
+fn a_comprehension_of_spawned_structs_leaves_nothing_behind() {
+    let per = leak_per_iteration(
+        "struct Net { d: Dense<f32, 64, 48> }
+         impl Trainable<Net> {}
+         fn part(m: Tensor<f32, 64, 48>, j: i32) -> Net {
+             let s: f32 = j.to();
+             Net(d: Dense(w: Scale::scale(m, s), b: Ring::zero()))
+         }
+         fn total(m: Tensor<f32, 64, 48>) -> Net {
+             let g = [for j in 0..4: spawn part(m, j)];
+             accumulate(accumulate(g[0], g[1]), accumulate(g[2], g[3]))
+         }",
+        "for i in 0..STEPS { m = Scale::scale(total(m).d.w, 0.1); };",
+    );
+    assert!(per < NOISE, "{per} bytes per step");
+}
+
+/// The same as `a_comprehension_of_spawned_structs_leaves_nothing_behind`,
+/// sequential: a tuple built from locally owned structs, read by index.
+#[test]
+fn a_tuple_of_owned_structs_leaves_nothing_behind() {
+    let per = leak_per_iteration(
+        "struct Net { d: Dense<f32, 64, 48> }
+         impl Trainable<Net> {}
+         fn part(m: Tensor<f32, 64, 48>, j: i32) -> Net {
+             let s: f32 = j.to();
+             Net(d: Dense(w: Scale::scale(m, s), b: Ring::zero()))
+         }
+         fn total(m: Tensor<f32, 64, 48>) -> Net {
+             let a = part(m, 0);
+             let b = part(m, 1);
+             let g = (a, b);
+             accumulate(g[0], g[1])
+         }",
+        "for i in 0..STEPS { m = Scale::scale(total(m).d.w, 0.1); };",
+    );
+    assert!(per < NOISE, "{per} bytes per step");
+}
+

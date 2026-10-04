@@ -771,3 +771,453 @@ fn tensors_handed_over_in_aggregates_are_not_copied() {
         assert!(copies.is_empty(), "`{name}` copies a tensor:\n{}", copies.join("\n"));
     }
 }
+
+/// Nucleus sampling over weights 0.5, 0.3, 0.15, 0.05 (logits their logs):
+/// `top_p` 0.8 keeps the first two tokens only, drawn in proportion 5:3;
+/// `top_p` 1 keeps all four.
+#[test]
+fn nucleus_sampling_draws_only_inside_the_nucleus() {
+    let src = |top_p: &str| {
+        format!(
+            "
+            use nn;
+            fn main() -> f32 {{
+                rand_seed(3);
+                let p: [f32; 4] = [0.5, 0.3, 0.15, 0.05];
+                let z: Tensor<f32, 1, 4> = [for i in 0..1: [for j in 0..4: log(p[j])]];
+                let mut counts: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
+                for i in 0..4000 {{
+                    let c = sample_row_top_p(z, 0, 1.0, {top_p});
+                    counts[c] = counts[c] + 1.0;
+                }};
+                // Outside the first two tokens, times 1000, plus the first's share.
+                (counts[2] + counts[3]) * 1000.0 + counts[0] / 4000.0
+            }}
+            "
+        )
+    };
+    let nucleus = run(&src("0.8"));
+    assert!(nucleus < 1.0, "drew outside the nucleus: {nucleus}");
+    assert!((nucleus - 0.625).abs() < 0.03, "first token's share {nucleus}, expected 5/8");
+    let all = run(&src("1.0"));
+    assert!(all >= 1000.0, "top_p 1 must keep the tail: {all}");
+}
+
+/// RMSNorm on the same inputs as `layer_norm_and_its_gradients_match_pytorch`
+/// (no bias). Reference values from PyTorch (`F.rms_norm`, eps 1e-5, float64).
+#[test]
+fn rms_norm_and_its_gradients_match_pytorch() {
+    let src = |out: &str| {
+        format!(
+            "
+            use nn;
+            fn loss(x: Tensor<f32, 2, 4>, g: Tensor<f32, 1, 4>, w: Tensor<f32, 2, 4>) -> f32 {{
+                sum(rms_norm(x, g) * w)
+            }}
+            dx = grad(loss, x);
+            dg = grad(loss, g);
+            fn main() -> f32 {{
+                let x = Tensor::<f32, 2, 4>(data: [[1.0, 2.0, 3.0, 5.0], [-1.0, 0.0, 0.5, 4.0]]);
+                let g = Tensor::<f32, 1, 4>(data: [[1.5, -0.5, 1.0, 2.0]]);
+                let w = Tensor::<f32, 2, 4>(data: [[1.0, -2.0, 0.5, 3.0], [2.0, 1.0, -1.0, 0.5]]);
+                {out}
+            }}
+        "
+        )
+    };
+    let check = |expr: &str, expected: f32| {
+        let got = run(&src(expr));
+        assert!(close(got, expected), "{expr}: expected {expected}, got {got}");
+    };
+    check("loss(x, g, w)", 11.4497364);
+    check("rms_norm(x, g)[1, 3]", 3.8523428);
+    for (k, e) in [0.1929752f32, -0.2545620, -0.7020991, 0.4844915].into_iter().enumerate() {
+        check(&format!("dx(x, g, w)[0, {k}]"), e);
+    }
+    for (k, e) in [1.4585863f32, -0.2407714, -0.4885217, 0.4257119].into_iter().enumerate() {
+        check(&format!("dx(x, g, w)[1, {k}]"), e);
+    }
+    for (k, e) in [-0.6428296f32, -1.2810246, 0.2396128, 5.7669279].into_iter().enumerate() {
+        check(&format!("dg(x, g, w)[0, {k}]"), e);
+    }
+}
+
+/// SiLU, `x * sigmoid(x)`, and its declared derivative. Reference values from
+/// PyTorch (`F.silu`, float64).
+#[test]
+fn silu_and_its_gradient_match_pytorch() {
+    let src = |out: &str| {
+        format!(
+            "
+            use nn;
+            fn loss(x: Tensor<f32, 1, 4>) -> f32 {{ sum(silu(x)) }}
+            dx = grad(loss, x);
+            fn main() -> f32 {{
+                let x = Tensor::<f32, 1, 4>(data: [[-2.0, -0.5, 0.3, 1.7]]);
+                let g = dx(x);
+                {out}
+            }}
+        "
+        )
+    };
+    assert!(close(run(&src("loss(x)")), 1.1825656), "loss");
+    for (k, expected) in [-0.0907842f32, 0.2600388, 0.6477800, 1.0675645].into_iter().enumerate() {
+        let got = run(&src(&format!("g[0, {k}]")));
+        assert!(close(got, expected), "g[0, {k}]: expected {expected}, got {got}");
+    }
+}
+
+/// A SwiGLU MLP, `down(silu(gate(x)) * up(x))`, and the gradients of a
+/// weighted sum of its output with respect to its input and its three
+/// layers. Reference values from PyTorch (float64).
+#[test]
+fn swiglu_and_its_gradients_match_pytorch() {
+    let src = |out: &str| {
+        format!(
+            "
+            use nn;
+            fn loss(x: Tensor<f32, 2, 2>, m: SwiGlu<f32, 2, 3>, w: Tensor<f32, 2, 2>) -> f32 {{
+                sum(m.swiglu_forward(x) * w)
+            }}
+            dx = grad(loss, x);
+            dm = grad(loss, m);
+            fn main() -> f32 {{
+                let x = Tensor::<f32, 2, 2>(data: [[1.0, -0.5], [0.25, 2.0]]);
+                let m = SwiGlu(
+                    gate: Dense(w: Tensor::<f32, 2, 3>(data: [[0.5, -1.0, 0.25], [1.5, 0.75, -0.5]]), b: Tensor::<f32, 1, 3>(data: [[0.1, -0.2, 0.3]])),
+                    up: Dense(w: Tensor::<f32, 2, 3>(data: [[-0.25, 0.5, 1.0], [0.75, -1.25, 0.5]]), b: Tensor::<f32, 1, 3>(data: [[0.0, 0.2, -0.1]])),
+                    down: Dense(w: Tensor::<f32, 3, 2>(data: [[1.0, -0.5], [0.25, 0.75], [-1.0, 0.5]]), b: Tensor::<f32, 1, 2>(data: [[0.05, -0.05]]))
+                );
+                let w = Tensor::<f32, 2, 2>(data: [[1.0, -2.0], [0.5, 3.0]]);
+                {out}
+            }}
+        "
+        )
+    };
+    let check = |expr: &str, expected: f32| {
+        let got = run(&src(expr));
+        assert!(close(got, expected), "{expr}: expected {expected}, got {got}");
+    };
+    check("loss(x, m, w)", -8.8885515);
+    for (k, e) in [-1.5327024f32, -1.2508525, 5.6281748, -10.8421485].into_iter().enumerate() {
+        check(&format!("dx(x, m, w)[{}, {}]", k / 2, k % 2), e);
+    }
+    for (k, e) in [-0.9198546f32, -1.1304234, -1.0614750, -2.8402336, -9.7795097, 1.0233799].into_iter().enumerate() {
+        check(&format!("dm(x, m, w).gate.w[{}, {}]", k / 3, k % 3), e);
+    }
+    for (k, e) in [-0.9141935f32, 0.7994769, -1.1590729, -6.1339943, 3.5257898, 0.1110694].into_iter().enumerate() {
+        check(&format!("dm(x, m, w).up.w[{}, {}]", k / 3, k % 3), e);
+    }
+    for (k, e) in [2.2727056f32, 13.2893058, -1.2037814, -4.3594160, 0.2320251, -1.4781435].into_iter().enumerate() {
+        check(&format!("dm(x, m, w).down.w[{}, {}]", k / 2, k % 2), e);
+    }
+}
+
+/// `sin` and `cos` on tensors, composed, and the gradient derived from their
+/// `Transcendental` rules. Reference values from PyTorch (float64).
+#[test]
+fn sin_and_cos_and_their_gradients_match_pytorch() {
+    let src = |out: &str| {
+        format!(
+            "
+            use nn;
+            fn loss(x: Tensor<f32, 1, 4>) -> f32 {{ sum(sin(x) * cos(x + x)) }}
+            dx = grad(loss, x);
+            fn main() -> f32 {{
+                let x = Tensor::<f32, 1, 4>(data: [[-2.0, -0.5, 0.3, 1.7]]);
+                let g = dx(x);
+                {out}
+            }}
+        "
+        )
+    };
+    assert!(close(run(&src("loss(x)")), -0.3795147), "loss");
+    for (k, expected) in [1.6483288f32, -0.3326855, 0.4547467, 0.6313889].into_iter().enumerate() {
+        let got = run(&src(&format!("g[0, {k}]")));
+        assert!(close(got, expected), "g[0, {k}]: expected {expected}, got {got}");
+    }
+}
+
+/// RoPE over 2 sequences of 2 positions, 2 heads of 4 dimensions, and its
+/// gradient (the inverse rotation). Reference values from PyTorch, Llama's
+/// `rotate_half` convention (float64).
+#[test]
+fn rope_and_its_gradient_match_pytorch() {
+    let src = |out: &str| {
+        format!(
+            "
+            use nn;
+            use convert;
+            fn md(a: i32, m: i32) -> i32 {{ a - (a / m) * m }}
+            fn loss(x: Tensor<f32, 4, 8>, w: Tensor<f32, 4, 8>) -> f32 {{
+                sum(rope(x, AttentionShape::<2, 4>()) * w)
+            }}
+            dx = grad(loss, x);
+            fn main() -> f32 {{
+                let x: Tensor<f32, 4, 8> = [for r in 0..4: [for c in 0..8: 0.5 * md(r * 8 + c, 7).to() - 1.0]];
+                let w: Tensor<f32, 4, 8> = [for r in 0..4: [for c in 0..8: 0.25 * md(r * 3 + c * 5, 9).to() - 1.0]];
+                {out}
+            }}
+        "
+        )
+    };
+    let check = |expr: &str, expected: f32| {
+        let got = run(&src(expr));
+        assert!(close(got, expected), "{expr}: expected {expected}, got {got}");
+    };
+    check("loss(x, w)", 3.4633817);
+    let y = [-0.9920553f32, 0.9799503, 1.2311890, 2.0098998, -0.5403023, -0.5049749, -0.8414710, 0.4949751];
+    for (k, e) in y.into_iter().enumerate() {
+        check(&format!("rope(x, AttentionShape::<2, 4>())[3, {k}]"), e);
+    }
+    let dx = [-1.1714055f32, 0.2549874, 0.4362443, 0.4974750, -0.4805189, 0.7599623, 0.2856599, 0.9924501];
+    for (k, e) in dx.into_iter().enumerate() {
+        check(&format!("dx(x, w)[3, {k}]"), e);
+    }
+}
+
+/// Three AdamW steps on one tensor with fixed gradients, against
+/// `torch.optim.AdamW` (lr 0.1, betas 0.9 / 0.95, weight decay 0.1, float64).
+#[test]
+fn adamw_matches_pytorch() {
+    let src = |k: usize| {
+        format!(
+            "
+            use nn;
+            fn main() -> f32 {{
+                let opt = AdamW(lr: 0.1, beta1: 0.9, beta2: 0.95, eps: 0.00000001, weight_decay: 0.1);
+                let mut w = Tensor::<f32, 1, 4>(data: [[1.0, -2.0, 0.5, 3.0]]);
+                let mut s = init_state(opt, w);
+                (w, s) = step(opt, w, Tensor::<f32, 1, 4>(data: [[0.5, -1.0, 0.25, 2.0]]), s);
+                (w, s) = step(opt, w, Tensor::<f32, 1, 4>(data: [[-0.3, 0.8, 1.5, -0.5]]), s);
+                (w, s) = step(opt, w, Tensor::<f32, 1, 4>(data: [[0.1, 0.2, -0.7, 1.0]]), s);
+                w[0, {k}]
+            }}
+        "
+        )
+    };
+    for (k, e) in [0.8273726f32, -1.8423232, 0.2721164, 2.7044603].into_iter().enumerate() {
+        let got = run(&src(k));
+        assert!(close(got, e), "w[0, {k}]: expected {e}, got {got}");
+    }
+}
+
+/// Clipping a `Dense` gradient of global norm 4.62 to 2, against
+/// `torch.nn.utils.clip_grad_norm_` (float64).
+#[test]
+fn clip_grad_norm_matches_pytorch() {
+    let src = |out: &str| {
+        format!(
+            "
+            use nn;
+            fn main() -> f32 {{
+                let g = Dense(
+                    w: Tensor::<f32, 2, 3>(data: [[1.0, -2.0, 0.5], [3.0, 0.25, -1.5]]),
+                    b: Tensor::<f32, 1, 3>(data: [[0.5, -0.75, 2.0]])
+                );
+                let c = clip_grad_norm(g, 2.0);
+                {out}
+            }}
+        "
+        )
+    };
+    let check = |expr: &str, expected: f32| {
+        let got = run(&src(expr));
+        assert!(close(got, expected), "{expr}: expected {expected}, got {got}");
+    };
+    check("mlir::math::sqrt(squared_norm(g))", 4.6233105);
+    for (k, e) in [0.4325904f32, -0.8651807, 0.2162952, 1.2977711, 0.1081476, -0.6488855].into_iter().enumerate() {
+        check(&format!("c.w[{}, {}]", k / 3, k % 3), e);
+    }
+    for (k, e) in [0.2162952f32, -0.3244428, 0.8651807].into_iter().enumerate() {
+        check(&format!("c.b[0, {k}]"), e);
+    }
+    // Under the threshold, unchanged.
+    check("clip_grad_norm(g, 10.0).w[1, 0]", 3.0);
+}
+
+/// Two Muon steps on a wide (3 x 4) and on a tall (4 x 3) matrix, against
+/// Keller Jordan's algorithm written in PyTorch (Newton-Schulz quintic, Nesterov
+/// momentum, `sqrt(max(1, R / C))` scale, decoupled decay; float64).
+#[test]
+fn muon_matches_its_reference() {
+    let src = |shape: &str, w: &str, g1: &str, g2: &str, out: &str| {
+        format!(
+            "
+            use nn;
+            fn main() -> f32 {{
+                let opt = Muon(lr: 0.05, momentum: 0.95, weight_decay: 0.01,
+                               adamw: AdamW(lr: 0.001, beta1: 0.9, beta2: 0.95, eps: 0.00000001, weight_decay: 0.0));
+                let mut w = Tensor::<f32, {shape}>(data: {w});
+                let mut s = init_state(opt, w);
+                (w, s) = step(opt, w, Tensor::<f32, {shape}>(data: {g1}), s);
+                (w, s) = step(opt, w, Tensor::<f32, {shape}>(data: {g2}), s);
+                {out}
+            }}
+        "
+        )
+    };
+    let wide = "[[1.0, -2.0, 0.5, 3.0], [0.25, 1.5, -1.0, 0.5], [2.0, 0.0, -0.5, 1.0]]";
+    let g1 = "[[0.5, -1.0, 0.25, 2.0], [-0.3, 0.8, 1.5, -0.5], [0.1, 0.2, -0.7, 1.0]]";
+    let g2 = "[[1.0, 0.5, -0.25, 0.0], [0.4, -0.6, 0.2, 1.2], [-1.0, 0.3, 0.9, -0.2]]";
+    let expected_wide = [
+        0.9542974f32, -1.9868207, 0.4994867, 2.9233893, 0.2463944, 1.4934879, -1.0631486, 0.4836372, 2.0267163,
+        -0.0457288, -0.4877112, 0.9588599,
+    ];
+    for (k, e) in expected_wide.into_iter().enumerate() {
+        let got = run(&src("3, 4", wide, g1, g2, &format!("w[{}, {}]", k / 4, k % 4)));
+        assert!(close(got, e), "wide w[{}, {}]: expected {e}, got {got}", k / 4, k % 4);
+    }
+    // The transposes: Newton-Schulz on the wide orientation, the update `sqrt(4/3)` larger.
+    let tall = "[[1.0, 0.25, 2.0], [-2.0, 1.5, 0.0], [0.5, -1.0, -0.5], [3.0, 0.5, 1.0]]";
+    let t1 = "[[0.5, -0.3, 0.1], [-1.0, 0.8, 0.2], [0.25, 1.5, -0.7], [2.0, -0.5, 1.0]]";
+    let t2 = "[[1.0, 0.4, -1.0], [0.5, -0.6, 0.3], [-0.25, 0.2, 0.9], [0.0, 1.2, -0.2]]";
+    let expected_tall = [
+        0.9473819f32, 0.2458752, 2.0311586, -1.9850912, 1.4927125, -0.0528031, 0.4994846, -1.0730723, -0.4858874,
+        2.9120016, 0.4811832, 0.9526502,
+    ];
+    for (k, e) in expected_tall.into_iter().enumerate() {
+        let got = run(&src("4, 3", tall, t1, t2, &format!("w[{}, {}]", k / 3, k % 3)));
+        assert!(close(got, e), "tall w[{}, {}]: expected {e}, got {got}", k / 3, k % 3);
+    }
+}
+
+/// An `Embedding` used at both ends (its rows read for a batch of ids, then
+/// scored against every row, a tied output head): its gradient is the sum of
+/// both uses. Reference values from PyTorch (float64).
+#[test]
+fn a_tied_embedding_gets_the_gradient_of_both_uses() {
+    let src = |out: &str| {
+        format!(
+            "
+            use nn;
+            use convert;
+            fn md(a: i32, m: i32) -> i32 {{ a - (a / m) * m }}
+            fn loss(e: Embedding<f32, 5, 3>, w: Tensor<f32, 4, 5>) -> f32 {{
+                let ids: [i32; 4] = [2, 0, 4, 2];
+                sum(embedding_logits(e, embedding_forward(e, ids)) * w)
+            }}
+            de = grad(loss, e);
+            fn main() -> f32 {{
+                let e = Embedding(table: Tensor::<f32, 5, 3>(data: [[0.5, -1.0, 0.25], [1.5, 0.75, -0.5], [-0.25, 0.5, 1.0], [0.75, -1.25, 0.5], [0.1, 0.2, -0.3]]));
+                let w: Tensor<f32, 4, 5> = [for r in 0..4: [for c in 0..5: 0.25 * md(r * 3 + c * 5, 9).to() - 1.0]];
+                {out}
+            }}
+        "
+        )
+    };
+    let check = |expr: &str, expected: f32| {
+        let got = run(&src(expr));
+        assert!(close(got, expected), "{expr}: expected {expected}, got {got}");
+    };
+    check("loss(e, w)", -4.1006250);
+    let expected = [
+        1.075f32, 1.65, -3.35, 0.325, -0.85, 0.9, 1.225, -0.425, -3.175, -0.775, 1.45, 0.825, -0.3, -0.5375, -0.5375,
+    ];
+    for (k, e) in expected.into_iter().enumerate() {
+        check(&format!("de(e, w).table[{}, {}]", k / 3, k % 3), e);
+    }
+}
+
+/// A model mixing an `Embedding` and a `Dense`, stepped by `Muon` as a whole:
+/// the table goes to AdamW, the `Dense` matrix to Muon, its bias (a row of
+/// one) to AdamW — each equal to the same optimizer applied to the part alone.
+#[test]
+fn muon_routes_each_part_of_a_model_to_its_update() {
+    let src = |out: &str| {
+        format!(
+            "
+            use nn;
+            struct Net {{ e: Embedding<f32, 4, 3>, d: Dense<f32, 3, 2> }}
+            impl Trainable<Net> {{}}
+            fn main() -> f32 {{
+                rand_seed(2);
+                let adamw = AdamW(lr: 0.01, beta1: 0.9, beta2: 0.95, eps: 0.00000001, weight_decay: 0.1);
+                let opt = Muon(lr: 0.05, momentum: 0.95, weight_decay: 0.01, adamw: adamw);
+                let m = Net(e: Init::xavier(), d: Init::xavier());
+                let g = Net(e: Init::xavier(), d: Dense(w: Init::xavier(), b: Init::xavier()));
+                let (whole, _) = step(opt, m, g, init_state(opt, m));
+                let (table, _) = step(adamw, m.e.table, g.e.table, init_state(adamw, m.e.table));
+                let (w, _) = step(opt, m.d.w, g.d.w, init_state(opt, m.d.w));
+                let (b, _) = step(adamw, m.d.b, g.d.b, init_state(adamw, m.d.b));
+                {out}
+            }}
+        "
+        )
+    };
+    for (whole, part) in [("whole.e.table[3, 1]", "table[3, 1]"), ("whole.d.w[2, 0]", "w[2, 0]"), ("whole.d.b[0, 1]", "b[0, 1]")] {
+        let got = run(&src(&format!("{whole} - {part}")));
+        assert!(got.abs() < 1e-7, "{whole} differs from {part} by {got}");
+        let moved = run(&src(&format!("{whole} - m.{}", &whole[6..])));
+        assert!(moved.abs() > 1e-6, "{whole} didn't move");
+    }
+    // Muon's matrix update differs from AdamW's on the same matrix.
+    let differs = run(&src("let (aw, _) = step(adamw, m.d.w, g.d.w, init_state(adamw, m.d.w)); whole.d.w[2, 0] - aw[2, 0]"));
+    assert!(differs.abs() > 1e-6, "the Dense matrix was stepped by AdamW, not Muon");
+}
+
+/// `sum` over a large matrix, and its gradient (`Sum::broadcast`): an
+/// array-repeat literal there was converted to CPS one element at a time,
+/// recursively, and an embedding table's size (4096 x 384) overflowed the
+/// compiler's stack. A `splat` now.
+#[test]
+fn the_gradient_of_a_sum_over_a_large_matrix_compiles() {
+    let src = "
+        use nn;
+        fn loss(t: Tensor<f32, 4096, 384>) -> f32 { sum(t * t) }
+        dt = grad(loss, t);
+        fn main() -> f32 {
+            let t: Tensor<f32, 4096, 384> = Ring::one();
+            dt(t)[4095, 383] + loss(t) / 1000000.0
+        }
+    ";
+    // d(sum(t²))/dt = 2t = 2, plus 4096 * 384 / 1e6.
+    let got = run(src);
+    assert!(close(got, 2.0 + 1.572864), "got {got}");
+}
+
+/// A literal-count array repeat the size of an embedding table, nested
+/// (`[[u; 384]; 4096]`): one node, filled by a loop (`cps.rs::
+/// fill_array_repeat`); it used to become 1.5 million copies of `u` and
+/// overflow the compiler's stack.
+#[test]
+fn a_large_nested_array_repeat_is_filled_by_a_loop() {
+    let got = run("
+        use nn;
+        fn main() -> f32 {
+            let u: f32 = 2.5;
+            let a: [[f32; 384]; 4096] = [[u; 384]; 4096];
+            let mut s = 0.0;
+            for i in 0..4096 { s = s + a[i, 383]; };
+            s
+        }
+    ");
+    assert!(close(got, 10240.0), "got {got}");
+}
+
+/// A comprehension over a one-field struct's fields, summed by a loop over
+/// its parts, as over a two-field one: the one-element result used to be a
+/// tuple of one (`__Tuple1<f32>`), which only a folded index reaches, so the
+/// loop failed with `no impl Index<__Tuple1<f32>, _>`. An array of one now,
+/// like two or more (`stdlib/nn`'s `GradNorm` over an `Embedding`).
+#[test]
+fn a_comprehension_over_one_field_is_indexed_like_over_two() {
+    let got = run("
+        struct One { a: f32 }
+        struct Two { a: f32, b: f32 }
+        fn sum1(m: One) -> f32 {
+            let parts = [for i in 0..m.len(): m[i] * 2.0];
+            let mut t = 0.0;
+            for i in 0..parts.len() { t = t + parts[i]; };
+            t
+        }
+        fn sum2(m: Two) -> f32 {
+            let parts = [for i in 0..m.len(): m[i] * 2.0];
+            let mut t = 0.0;
+            for i in 0..parts.len() { t = t + parts[i]; };
+            t
+        }
+        fn main() -> f32 { sum1(One(a: 1.5)) + sum2(Two(a: 1.0, b: 2.0)) }
+    ");
+    assert!(close(got, 9.0), "got {got}");
+}

@@ -1102,6 +1102,7 @@ fn field_struct_is_ever_refcounted(
 /// than one hop (the light field itself needs no release of its own — its
 /// own fields already flattened in — but whatever heavy fields *it* holds
 /// still do); an ordinary direct heavy field is a single-hop path.
+#[derive(Clone)]
 pub(crate) struct LightLeafPath {
     pub steps: Vec<(Ty, String)>,
     pub leaf_ty: Ty,
@@ -2083,12 +2084,16 @@ fn lower_loop<'c>(
     // following), just walked by hand in a loop here since each call in the
     // chain has to land in the "before" block below, ending in `scf.
     // condition`, not an ordinary recursive `lower_cexpr` step.
-    struct CondCall<'e> {
-        callee: &'e str,
-        args: &'e [CVal],
-        result_var: CVar,
+    //
+    // A step may also be a straight-line primitive (`LetPrim`) rather than a
+    // call: a loop the CPS conversion builds itself (`cps.rs::fill_loops`,
+    // an array repeat filled in place) compares its counter with a raw
+    // `arith.cmpi`, needing no `Ord<i32>` instance in the program.
+    enum CondStep<'e> {
+        Call { callee: &'e str, args: &'e [CVal], result_var: CVar },
+        Prim { var: CVar, op: &'e PrimOp, args: &'e [CVal], ty: &'e Ty },
     }
-    let mut cond_calls: Vec<CondCall> = Vec::new();
+    let mut cond_calls: Vec<CondStep> = Vec::new();
     let mut cursor: &CExpr = &loop_def.body;
     let (cond, then_branch, else_branch) = loop {
         match cursor {
@@ -2097,6 +2102,10 @@ fn lower_loop<'c>(
                 then_branch,
                 else_branch,
             } => break (cond, then_branch, else_branch),
+            CExpr::LetPrim { var, ty, op, args, cont } => {
+                cond_calls.push(CondStep::Prim { var: *var, op, args, ty });
+                cursor = cont;
+            }
             CExpr::Fix {
                 defs: cond_defs,
                 body: cond_body,
@@ -2118,7 +2127,7 @@ fn lower_loop<'c>(
                         "MLIR lowering: a loop's own condition call must have exactly one result"
                     );
                 };
-                cond_calls.push(CondCall {
+                cond_calls.push(CondStep::Call {
                     callee: cond_callee,
                     args: cond_args,
                     result_var: cond_result_var,
@@ -2207,7 +2216,17 @@ fn lower_loop<'c>(
     // seeing the previous ones' results already bound in `before_env` (only
     // relevant for arguments referencing an earlier call's own result, e.g.
     // `Ord::lt`'s second argument here referencing `hull.len()`'s).
-    for cond_call in &cond_calls {
+    for step in &cond_calls {
+        let (callee, call_args, result_var) = match step {
+            CondStep::Call { callee, args, result_var } => (*callee, *args, *result_var),
+            CondStep::Prim { var, op, args, ty } => {
+                if let Some(value) = lower_prim_op(ctx, &before_block, &before_env, *var, op, args, ty) {
+                    before_env.insert(*var, value);
+                }
+                continue;
+            }
+        };
+        let cond_call = CondCallRef { callee, args: call_args };
         let Some((cond_param_types, cond_result_ty)) = ctx.signatures.get(cond_call.callee) else {
             panic!(
                 "MLIR lowering: call to unknown top-level fn `{}` in a loop condition",
@@ -2231,7 +2250,7 @@ fn lower_loop<'c>(
             location,
         ));
         let result: Value = cond_call_op.result(0).unwrap().into();
-        before_env.insert(cond_call.result_var, result);
+        before_env.insert(result_var, result);
     }
     // The terminal `If`'s own `cond` — when `cond_calls` is non-empty,
     // this is a bare `CVal::Var` naming the *last* call's own result,
@@ -2473,6 +2492,11 @@ fn lower_real_call<'c>(
 /// own `ty` is always the unit type `()` (see this function's own doc
 /// comment above), which `ty_to_mlir` doesn't support at all, so it must
 /// never be converted unconditionally here.
+struct CondCallRef<'e> {
+    callee: &'e str,
+    args: &'e [CVal],
+}
+
 fn lower_prim_op<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
@@ -2630,6 +2654,23 @@ fn lower_prim_op<'c>(
             } else {
                 lower_refcount_call(ctx, block, env, "cleave_retain", rc_ty, args);
             }
+            None
+        }
+        // A light struct's leaves retained or released by its type's glue
+        // function, a top-level function of the program (`refcount::
+        // glue_function`), called like any other unit-returning one.
+        PrimOp::LeafGlue { unit } => {
+            let CVal::Var(v) = &args[0] else {
+                panic!("MLIR lowering: a leaf glue call's operand must be a variable");
+            };
+            let value = *env.get(v).unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{v}"));
+            block.append_operation(func::call(
+                ctx.context,
+                FlatSymbolRefAttribute::new(ctx.context, unit),
+                &[value],
+                &[],
+                gen_loc(ctx.context),
+            ));
             None
         }
         PrimOp::Release(rc_ty) => {

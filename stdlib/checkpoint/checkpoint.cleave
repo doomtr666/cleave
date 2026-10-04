@@ -142,9 +142,9 @@ impl<Ts...: Checkpoint> Checkpoint<Ts...> {
     }
 }
 
-// Every model marked `Trainable`: its fields in declaration order, the model
-// rebuilt from them.
-impl<M: Trainable> Checkpoint<M> {
+// Every `Parameters` struct (every `Trainable` model): its fields in
+// declaration order, the struct rebuilt from them.
+impl<M: Parameters> Checkpoint<M> {
     fn save_part(f, m) {
         for i in 0..m.len() { save_part(f, m[i]); };
     }

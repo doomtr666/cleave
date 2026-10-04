@@ -89,7 +89,13 @@
 use crate::cps::{CExpr, CFunDef, CTopLevelFn, CVal, CVar, CpsProgram, FreshVars, PrimOp};
 use crate::egraph::max_cvar_in_program;
 use crate::infer::Ty;
-use std::collections::{HashMap, HashSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+/// A light struct with at least this many tensor leaves is retained or
+/// released through its type's glue function (`leaf_glue`), not with its
+/// cascade written out in place.
+const GLUE_MIN_LEAVES: usize = 4;
 
 /// Whether `ty` needs refcounting at all — an ordinary, non-generic-or-
 /// instantiated struct (`Ty::Con`/`Ty::App` naming a real `struct`
@@ -1220,6 +1226,9 @@ struct RefcountCtx<'a> {
     /// call site needs to look up *the callee's* own facts, not this
     /// function's own.
     identity_summary: &'a crate::alias_analysis::IdentitySummary,
+    /// The per-type glue functions (`leaf_glue`) requested so far, whole
+    /// program: name -> (light struct type, retain rather than release).
+    glue: &'a RefCell<BTreeMap<String, (Ty, bool)>>,
 }
 
 impl RefcountCtx<'_> {
@@ -1289,6 +1298,7 @@ pub fn insert_refcounting(
     let field_mutated_structs = collect_field_mutated_struct_names(&program);
     let extern_boundary_structs = collect_extern_boundary_struct_names(&program);
     let identity_summary = crate::alias_analysis::analyze_identity(&program);
+    let glue: RefCell<BTreeMap<String, (Ty, bool)>> = RefCell::new(BTreeMap::new());
     let op_lines = program.op_lines;
     let funcs = program
         .funcs
@@ -1319,10 +1329,37 @@ pub fn insert_refcounting(
                 params: &params,
                 value_defs: &value_defs,
                 identity_summary: &identity_summary,
+                glue: &glue,
             };
             insert_refcounting_fn(top, &ctx)
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let mut funcs = funcs;
+    let mut synthesized: HashSet<String> = HashSet::new();
+    loop {
+        let pending: Vec<(String, (Ty, bool))> = glue
+            .borrow()
+            .iter()
+            .filter(|(name, _)| !synthesized.contains(*name))
+            .map(|(name, entry)| (name.clone(), entry.clone()))
+            .collect();
+        if pending.is_empty() {
+            break;
+        }
+        for (name, (ty, retain)) in pending {
+            let leaves = crate::mlir_lower::light_struct_release_leaves(
+                ty_name(&ty),
+                ty_args(&ty),
+                struct_schemas,
+                mlir_types,
+                &field_mutated_structs,
+                &extern_boundary_structs,
+                &constructed_structs,
+            );
+            synthesized.insert(name.clone());
+            funcs.push(glue_function(name, ty, retain, &leaves, &fresh, &glue));
+        }
+    }
     // Tier 1 of `doc/backlog.md`'s own struct-allocation-strategy entry —
     // a retain/release pair-cancellation optimization, strictly additive
     // on top of the naive, always-correct insertion above (never changes
@@ -1333,6 +1370,128 @@ pub fn insert_refcounting(
     // automatically (`--dump-cps-optimized`, `--run`, and the real AOT
     // pipeline) without needing to remember to call it separately.
     crate::rc_opt::eliminate_redundant_retain_release(CpsProgram { funcs, op_lines }, escaping_structs)
+}
+
+fn ty_name(ty: &Ty) -> &str {
+    match ty {
+        Ty::Con(name) | Ty::App(name, _) => name.as_str(),
+        _ => "",
+    }
+}
+
+fn ty_args(ty: &Ty) -> &[Ty] {
+    match ty {
+        Ty::App(_, args) => args.as_slice(),
+        _ => &[],
+    }
+}
+
+fn glue_name(ty: &Ty, retain: bool) -> String {
+    format!("__{}_leaves<{ty}>", if retain { "retain" } else { "release" })
+}
+
+/// `__retain_leaves<T>` / `__release_leaves<T>`: one function per light
+/// struct type, retaining or releasing every tensor leaf of its parameter,
+/// the cascade `wrap_light_leaves` would otherwise write out at every site
+/// (Rust's "drop glue"). Field by field: a field that is itself a light
+/// struct with enough leaves goes to its own type's glue, the others are
+/// written out. Not inlined: code grows with the number of types, not with
+/// sites times leaves (nanoLM v2's training step reached 98 MB of IR written
+/// out in place).
+fn glue_function(
+    name: String,
+    ty: Ty,
+    retain: bool,
+    leaves: &[crate::mlir_lower::LightLeafPath],
+    fresh: &FreshVars,
+    glue: &RefCell<BTreeMap<String, (Ty, bool)>>,
+) -> CTopLevelFn {
+    let x = fresh.var();
+    let k = fresh.var();
+    let ret = CExpr::App { func: CVal::Var(k), args: vec![CVal::Unit] };
+    let terminal: fn(Ty) -> PrimOp = if retain { PrimOp::Retain } else { PrimOp::Release };
+    // The leaves grouped by the field they're reached through, in order.
+    let mut groups: Vec<((Ty, String), Vec<crate::mlir_lower::LightLeafPath>)> = Vec::new();
+    for leaf in leaves {
+        let (first, rest) = leaf.steps.split_first().expect("a light struct's leaf is reached through a field");
+        let stripped = crate::mlir_lower::LightLeafPath { steps: rest.to_vec(), leaf_ty: leaf.leaf_ty.clone() };
+        match groups.last_mut() {
+            Some((f, g)) if f == first => g.push(stripped),
+            _ => groups.push((first.clone(), vec![stripped])),
+        }
+    }
+    let mut body = ret;
+    for ((struct_ty, field), sub) in groups.into_iter().rev() {
+        let field_value = fresh.var();
+        // A light struct field: every one of its leaves is here.
+        let sub_ty = sub.first().and_then(|l| l.steps.first()).map(|(t, _)| t.clone());
+        body = match sub_ty {
+            Some(sub_ty) if sub.len() >= GLUE_MIN_LEAVES && sub.iter().all(|l| !l.steps.is_empty()) => {
+                let unit = glue_name(&sub_ty, retain);
+                glue.borrow_mut().entry(unit.clone()).or_insert_with(|| (sub_ty.clone(), retain));
+                CExpr::LetPrim {
+                    var: field_value,
+                    ty: sub_ty,
+                    op: PrimOp::Field { struct_ty, field },
+                    args: vec![CVal::Var(x)],
+                    cont: Box::new(CExpr::LetPrim {
+                        var: fresh.var(),
+                        ty: unit_ty(),
+                        op: PrimOp::LeafGlue { unit },
+                        args: vec![CVal::Var(field_value)],
+                        cont: Box::new(body),
+                    }),
+                }
+            }
+            _ => {
+                let mut inner = body;
+                for leaf in sub.iter().rev() {
+                    let mut steps = vec![(struct_ty.clone(), field.clone())];
+                    steps.extend(leaf.steps.iter().cloned());
+                    inner = build_leaf_chain(fresh, CVal::Var(x), &steps, &leaf.leaf_ty, terminal, inner);
+                }
+                inner
+            }
+        };
+    }
+    CTopLevelFn {
+        def: CFunDef { name, params: vec![x, k], body, carried_types: None },
+        param_types: vec![ty],
+        result: unit_ty(),
+        k_ret: k,
+        origin: None,
+        no_inline: true,
+        is_export: false,
+        export_symbol: None,
+        loc: Default::default(),
+    }
+}
+
+/// Retains or releases every tensor leaf of `var` (a light struct of type
+/// `ty`, `leaves` all of its leaves) before `inner`: a call to the type's
+/// glue function (`glue_function`) when it has enough leaves to be worth
+/// one, the cascade written out in place otherwise.
+fn leaf_glue(
+    ctx: &RefcountCtx,
+    var: CVar,
+    ty: &Ty,
+    leaves: &[crate::mlir_lower::LightLeafPath],
+    retain: bool,
+    inner: CExpr,
+) -> CExpr {
+    if leaves.len() < GLUE_MIN_LEAVES {
+        let terminal: fn(Ty) -> PrimOp = if retain { PrimOp::Retain } else { PrimOp::Release };
+        return wrap_light_leaves(ctx.fresh, var, leaves, terminal, inner);
+    }
+    let name = glue_name(ty, retain);
+    ctx.glue.borrow_mut().entry(name.clone()).or_insert_with(|| (ty.clone(), retain));
+    CExpr::LetPrim {
+        var: ctx.fresh.var(),
+        ty: unit_ty(),
+        op: PrimOp::LeafGlue { unit: name },
+        args: vec![CVal::Var(var)],
+        cont: Box::new(inner),
+    }
 }
 
 /// The function's own top-level `params` are deliberately never seeded
@@ -1474,15 +1633,16 @@ fn rewrite_body(
             // CORRUPTION`, found directly against `examples/digits-
             // interop`'s own real training run, not hypothetical.
             let mut retains: Vec<(CVal, Ty)> = Vec::new();
-            let mut light_leaf_retains: Vec<(CVar, crate::mlir_lower::LightLeafPath)> = Vec::new();
+            let mut light_leaf_retains: Vec<(CVar, Ty, Vec<crate::mlir_lower::LightLeafPath>)> = Vec::new();
             for target in retain_targets {
                 if let CVal::Var(cv) = &target {
                     if let Some(rty) = ctx.var_types.get(cv) {
                         if ctx.is_rc(rty) {
                             retains.push((target, rty.clone()));
                         } else {
-                            for leaf in ctx.light_release_leaves(rty) {
-                                light_leaf_retains.push((*cv, leaf));
+                            let leaves = ctx.light_release_leaves(rty);
+                            if !leaves.is_empty() {
+                                light_leaf_retains.push((*cv, rty.clone(), leaves));
                             }
                         }
                     }
@@ -1520,7 +1680,7 @@ fn rewrite_body(
             // exactly how `wrap_releases` below releases them.
             enum FieldReadProtect {
                 Whole(Ty),
-                LightLeaves(Vec<crate::mlir_lower::LightLeafPath>),
+                LightLeaves(Ty, Vec<crate::mlir_lower::LightLeafPath>),
             }
             // `Load` needs this exact same protection, for the exact same
             // reason `Field` does — see `walk_var_info`'s own matching arm
@@ -1541,7 +1701,7 @@ fn rewrite_body(
                         if leaves.is_empty() {
                             None
                         } else {
-                            Some(FieldReadProtect::LightLeaves(leaves))
+                            Some(FieldReadProtect::LightLeaves(ty.clone(), leaves))
                         }
                     }
                 } else {
@@ -1563,8 +1723,8 @@ fn rewrite_body(
                         cont: Box::new(new_cont),
                     }
                 }
-                Some(FieldReadProtect::LightLeaves(leaves)) => {
-                    wrap_light_leaves(ctx, var, &leaves, PrimOp::Retain, new_cont)
+                Some(FieldReadProtect::LightLeaves(leaf_ty, leaves)) => {
+                    leaf_glue(ctx, var, &leaf_ty, &leaves, true, new_cont)
                 }
                 None => new_cont,
             };
@@ -1585,15 +1745,8 @@ fn rewrite_body(
                     cont: Box::new(result),
                 };
             }
-            for (base, leaf) in light_leaf_retains {
-                result = build_leaf_chain(
-                    ctx,
-                    CVal::Var(base),
-                    &leaf.steps,
-                    &leaf.leaf_ty,
-                    PrimOp::Retain,
-                    result,
-                );
+            for (base, base_ty, leaves) in light_leaf_retains.into_iter().rev() {
+                result = leaf_glue(ctx, base, &base_ty, &leaves, true, result);
             }
             result
         }
@@ -2158,6 +2311,7 @@ fn wrap_releases(to_release: Vec<(CVar, Ty)>, inner: CExpr, ctx: &RefcountCtx, a
             };
         } else {
             let mut leaves = ctx.light_release_leaves(&ty);
+            let all = leaves.len();
             if at_true_return {
                 leaves.retain(|leaf| {
                     match param_leaf_key(var, &leaf.steps, ctx.params, ctx.value_defs) {
@@ -2166,7 +2320,11 @@ fn wrap_releases(to_release: Vec<(CVar, Ty)>, inner: CExpr, ctx: &RefcountCtx, a
                     }
                 });
             }
-            result = wrap_light_leaves(ctx, var, &leaves, PrimOp::Release, result);
+            result = if leaves.len() == all {
+                leaf_glue(ctx, var, &ty, &leaves, false, result)
+            } else {
+                wrap_light_leaves(ctx.fresh, var, &leaves, PrimOp::Release, result)
+            };
         }
     }
     result
@@ -2180,7 +2338,7 @@ fn wrap_releases(to_release: Vec<(CVar, Ty)>, inner: CExpr, ctx: &RefcountCtx, a
 /// above). `leaves` is walked in reverse so the resulting `CExpr` reads,
 /// top to bottom, in the same order `leaves` was given.
 fn wrap_light_leaves(
-    ctx: &RefcountCtx,
+    fresh: &FreshVars,
     base: CVar,
     leaves: &[crate::mlir_lower::LightLeafPath],
     terminal: fn(Ty) -> PrimOp,
@@ -2188,13 +2346,13 @@ fn wrap_light_leaves(
 ) -> CExpr {
     let mut result = inner;
     for leaf in leaves.iter().rev() {
-        result = build_leaf_chain(ctx, CVal::Var(base), &leaf.steps, &leaf.leaf_ty, terminal, result);
+        result = build_leaf_chain(fresh, CVal::Var(base), &leaf.steps, &leaf.leaf_ty, terminal, result);
     }
     result
 }
 
 fn build_leaf_chain(
-    ctx: &RefcountCtx,
+    fresh: &FreshVars,
     base: CVal,
     steps: &[(Ty, String)],
     leaf_ty: &Ty,
@@ -2203,7 +2361,7 @@ fn build_leaf_chain(
 ) -> CExpr {
     match steps {
         [] => {
-            let rvar = ctx.fresh.var();
+            let rvar = fresh.var();
             CExpr::LetPrim {
                 var: rvar,
                 ty: unit_ty(),
@@ -2213,12 +2371,12 @@ fn build_leaf_chain(
             }
         }
         [(struct_ty, field), rest @ ..] => {
-            let next_var = ctx.fresh.var();
+            let next_var = fresh.var();
             let next_ty = rest
                 .first()
                 .map(|(t, _)| t.clone())
                 .unwrap_or_else(|| leaf_ty.clone());
-            let rest_chain = build_leaf_chain(ctx, CVal::Var(next_var), rest, leaf_ty, terminal, inner);
+            let rest_chain = build_leaf_chain(fresh, CVal::Var(next_var), rest, leaf_ty, terminal, inner);
             CExpr::LetPrim {
                 var: next_var,
                 ty: next_ty,

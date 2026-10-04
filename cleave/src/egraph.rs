@@ -206,7 +206,7 @@ impl Analysis<CleaveLang> for ConstantFold {
                             a,
                         )? {
                             crate::infer::ConstValue::Int(n) => Some(n),
-                            crate::infer::ConstValue::Bool(_) => None,
+                            crate::infer::ConstValue::Bool(_) | crate::infer::ConstValue::Float(_) => None,
                         }
                     }
                     // `div` is deliberately *not* folded here, unlike every
@@ -228,7 +228,7 @@ impl Analysis<CleaveLang> for ConstantFold {
                         let b = crate::infer::ConstValue::Int(egraph[*b].data.const_int?);
                         match crate::const_eval::eval_binop(name, a, b)? {
                             crate::infer::ConstValue::Int(n) => Some(n),
-                            crate::infer::ConstValue::Bool(_) => None,
+                            crate::infer::ConstValue::Bool(_) | crate::infer::ConstValue::Float(_) => None,
                         }
                     }
                     _ => None,

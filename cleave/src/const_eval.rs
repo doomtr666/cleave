@@ -20,6 +20,18 @@ use crate::infer::ConstValue;
 /// same posture `const_value_from_expr`'s own caller already falls back on
 /// for "not evaluated yet".
 pub fn eval_binop(op: &str, a: ConstValue, b: ConstValue) -> Option<ConstValue> {
+    // Floats: the four operations, both operands floating (no implicit
+    // conversion between integers and floats, as everywhere else).
+    if let (ConstValue::Float(x), ConstValue::Float(y)) = (a, b) {
+        let (x, y) = (f64::from_bits(x), f64::from_bits(y));
+        return match op {
+            "add" => Some(ConstValue::float(x + y)),
+            "sub" => Some(ConstValue::float(x - y)),
+            "mul" => Some(ConstValue::float(x * y)),
+            "div" => Some(ConstValue::float(x / y)),
+            _ => None,
+        };
+    }
     match (op, a, b) {
         ("add", ConstValue::Int(x), ConstValue::Int(y)) => Some(ConstValue::Int(x.wrapping_add(y))),
         ("mul", ConstValue::Int(x), ConstValue::Int(y)) => Some(ConstValue::Int(x.wrapping_mul(y))),
@@ -70,6 +82,7 @@ pub fn eval_binop(op: &str, a: ConstValue, b: ConstValue) -> Option<ConstValue> 
 /// the operand is "meant" to be signed.
 pub fn eval_unop(op: &str, a: ConstValue) -> Option<ConstValue> {
     match (op, a) {
+        ("neg", ConstValue::Float(x)) => Some(ConstValue::float(-f64::from_bits(x))),
         ("neg", ConstValue::Int(x)) => Some(ConstValue::Int(0u64.wrapping_sub(x))),
         ("not", ConstValue::Bool(b)) => Some(ConstValue::Bool(!b)),
         _ => None,

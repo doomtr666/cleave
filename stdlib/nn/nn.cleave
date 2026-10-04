@@ -58,6 +58,13 @@ algebra Activation<T> {
     fn gelu(x: T) -> T;
     fn gelu_grad(x: T) -> T;
     adjoint gelu(x), u: mul(u, gelu_grad(x));
+
+    // SiLU (or swish), `x * sigmoid(x)`: the activation inside SwiGLU
+    // (`swiglu_forward`), Llama's MLP. Its derivative is declared in closed
+    // form, `s (1 + x (1 - s))` with `s = sigmoid(x)`.
+    fn silu(x: T) -> T;
+    fn silu_grad(x: T) -> T;
+    adjoint silu(x), u: mul(u, silu_grad(x));
 }
 
 // `relu`'s own adjoint (just above) needs this, and only this -- not a
@@ -240,6 +247,17 @@ impl<T: Float, const Dims...: i32> Activation<Tensor<T, Dims...>> {
         let k3: Tensor<T, Dims...> = mlir::tensor::splat(k3_s);
         let t = mlir::math::tanh(gelu_inner(x));
         half * (one + t) + half * x * (one - t * t) * c * (one + k3 * x * x)
+    }
+    fn silu(x) {
+        let one_s: T = 1.0;
+        let one: Tensor<T, Dims...> = mlir::tensor::splat(one_s);
+        x / (one + exp(-x))
+    }
+    fn silu_grad(x) {
+        let one_s: T = 1.0;
+        let one: Tensor<T, Dims...> = mlir::tensor::splat(one_s);
+        let s = one / (one + exp(-x));
+        s * (one + x * (one - s))
     }
 }
 
@@ -583,10 +601,116 @@ impl<T: Float, const R: i32, const C: i32> LayerNorm<Tensor<T, R, C>, Tensor<T, 
     }
 }
 
+// RMS normalization (Zhang & Sennrich, 2019), LayerNorm's lighter variant used
+// by Llama, Qwen, Gemma and most transformers since: each row divided by its
+// root mean square, no centering, then scaled by a learned gain `g` (no bias).
+// `eps` 1e-5, as `layer_norm`. With `rrms = 1 / sqrt(mean(x²) + eps)` and
+// `xhat = x * rrms`: `dx = rrms * (u g - xhat * mean(u g xhat))` per row, `dg`
+// the column sums of `u * xhat`.
+algebra RmsNorm<X, P> {
+    fn rms_norm(x: X, g: P) -> X;
+    fn rms_norm_grad_x(x: X, g: P, u: X) -> X;
+    fn rms_norm_grad_g(x: X, g: P, u: X) -> P;
+    adjoint rms_norm(x, g), u: (rms_norm_grad_x(x, g, u), rms_norm_grad_g(x, g, u));
+}
+
+// `1 / sqrt(mean(x[r]²) + 1e-5)`.
+fn row_rrms<T: Float, const R: i32, const C: i32>(x: Tensor<T, R, C>, r: i32) -> T {
+    let n: T = C.to();
+    let eps: T = 0.00001;
+    let mut s: T = zero();
+    for c in 0..C { s = s + x[r, c] * x[r, c]; };
+    let one: T = one();
+    one / mlir::math::sqrt(s / n + eps)
+}
+
+// `#[no_inline]` on each method: see `CausalAttention`'s impl.
+impl<T: Float, const R: i32, const C: i32> RmsNorm<Tensor<T, R, C>, Tensor<T, 1, C>> {
+    #[no_inline]
+    fn rms_norm(x, g) {
+        let mut y: [[T; C]; R] = mlir::memref::alloc();
+        for r in 0..R {
+            let rrms = row_rrms(x, r);
+            for c in 0..C { y[r, c] = x[r, c] * rrms * g[0, c]; };
+        };
+        Tensor(data: y)
+    }
+    #[no_inline]
+    fn rms_norm_grad_x(x, g, u) {
+        let n: T = C.to();
+        let mut d: [[T; C]; R] = mlir::memref::alloc();
+        for r in 0..R {
+            let rrms = row_rrms(x, r);
+            let mut s: T = zero();
+            for c in 0..C { s = s + u[r, c] * g[0, c] * x[r, c] * rrms; };
+            let m = s / n;
+            for c in 0..C { d[r, c] = rrms * (u[r, c] * g[0, c] - x[r, c] * rrms * m); };
+        };
+        Tensor(data: d)
+    }
+    #[no_inline]
+    fn rms_norm_grad_g(x, g, u) {
+        let mut d: [[T; C]; 1] = mlir::memref::alloc();
+        for c in 0..C { d[0, c] = zero(); };
+        for r in 0..R {
+            let rrms = row_rrms(x, r);
+            for c in 0..C { d[0, c] = d[0, c] + u[r, c] * x[r, c] * rrms; };
+        };
+        Tensor(data: d)
+    }
+}
+
 // What causal attention needs to know beyond its matrices' shapes: `L`
 // positions per sequence, heads `DH` wide. A marker, built with a turbofish
 // (`AttentionShape::<128, 32>()`), its values read as const generics.
 struct AttentionShape<const L: i32, const DH: i32> {}
+
+// Rotary position embedding (RoPE; Su et al., 2021), applied to the queries
+// and keys before attention instead of adding a learned position table to the
+// input. Within each head, dimension `j < DH/2` is paired with `j + DH/2` (the
+// convention of Llama and GPT-NeoX), and the pair is rotated by `pos *
+// 10000^(-2j/DH)`, `pos` the row's position in its sequence (rows as in
+// `causal_attention`: `N / L` sequences of `L` positions). A rotation of `q` at
+// `i` and `k` at `j` leaves `q·k` depending on `i - j` only: attention sees
+// relative positions, and nothing caps the context at a table's length. Linear
+// and orthogonal, so its adjoint is the inverse rotation.
+algebra Rope<X, S> {
+    fn rope(x: X, shape: S) -> X;
+    fn rope_inverse(x: X, shape: S) -> X;
+    adjoint rope(x, shape), u: (rope_inverse(u, shape), _);
+}
+
+// `x` with each head's pairs rotated by `sign` times their angle.
+fn rope_rotate<T: Float, const N: i32, const D: i32, const L: i32, const DH: i32>(x: Tensor<T, N, D>, shape: AttentionShape<L, DH>, sign: T) -> Tensor<T, N, D> {
+    let half = DH / 2;
+    let ln_base: T = 9.210340372;
+    let two: T = 2.0;
+    let dh: T = DH.to();
+    let mut y: [[T; D]; N] = mlir::memref::alloc();
+    for r in 0..N {
+        let pos: T = (r - (r / L) * L).to();
+        for h in 0..D / DH {
+            for j in 0..half {
+                let jt: T = j.to();
+                let theta = pos * exp(zero() - two * jt / dh * ln_base);
+                let c = cos(theta);
+                let s = sign * sin(theta);
+                let a = x[r, h * DH + j];
+                let b = x[r, h * DH + j + half];
+                y[r, h * DH + j] = a * c - b * s;
+                y[r, h * DH + j + half] = b * c + a * s;
+            };
+        };
+    };
+    Tensor(data: y)
+}
+
+impl<T: Float, const N: i32, const D: i32, const L: i32, const DH: i32> Rope<Tensor<T, N, D>, AttentionShape<L, DH>> {
+    #[no_inline]
+    fn rope(x, shape) { rope_rotate(x, shape, one()) }
+    #[no_inline]
+    fn rope_inverse(x, shape) { rope_rotate(x, shape, zero() - one()) }
+}
 
 // Causal multi-head self-attention (Vaswani et al., 2017), the heart of a
 // transformer block. `q`, `k`, `v` are `[N, D]`: `N / L` sequences of `L`
@@ -728,6 +852,47 @@ fn sample_row<const R: i32, const C: i32>(z: Tensor<f32, R, C>, r: i32, temperat
     for c in 0..C {
         acc = acc + exp((z[r, c] - m) / temperature);
         if not found and acc > target { chosen = c; found = true; };
+    };
+    chosen
+}
+
+// Nucleus (top-p) sampling (Holtzman et al., 2019): as `sample_row`, but drawn
+// only among the most likely tokens that together hold a fraction `top_p` of
+// the probability (the nucleus), renormalized. The long tail of individually
+// unlikely tokens, which together weigh a lot, is cut; how many tokens are
+// kept follows the model's confidence (one or two when it is sure, dozens when
+// many continuations fit). `top_p` of 1 keeps every token.
+//
+// The nucleus is every token whose weight `exp((z - max) / temperature)`, in
+// `(0, 1]`, is at least a threshold: the largest threshold still keeping
+// `top_p` of the total, found by bisection rather than by sorting the row.
+fn sample_row_top_p<const R: i32, const C: i32>(z: Tensor<f32, R, C>, r: i32, temperature: f32, top_p: f32) -> i32 {
+    let mut m = z[r, 0];
+    let mut best = 0;
+    for c in 1..C { if z[r, c] > m { m = z[r, c]; best = c; }; };
+    let mut w: [f32; C] = mlir::memref::alloc();
+    let mut total = 0.0;
+    for c in 0..C { w[c] = exp((z[r, c] - m) / temperature); total = total + w[c]; };
+    let wanted = top_p * total;
+    let mut lo = 0.0;
+    let mut hi = 1.0;
+    for i in 0..40 {
+        let mid = (lo + hi) * 0.5;
+        let mut kept = 0.0;
+        for c in 0..C { if w[c] >= mid { kept = kept + w[c]; }; };
+        if kept >= wanted { lo = mid; } else { hi = mid; };
+    };
+    let mut nucleus = 0.0;
+    for c in 0..C { if w[c] >= lo { nucleus = nucleus + w[c]; }; };
+    let target = rand_uniform_f32() * nucleus;
+    let mut acc = 0.0;
+    let mut chosen = best;
+    let mut found = false;
+    for c in 0..C {
+        if w[c] >= lo {
+            acc = acc + w[c];
+            if not found and acc > target { chosen = c; found = true; };
+        };
     };
     chosen
 }
@@ -989,6 +1154,98 @@ impl<T: Float, const B: i32, const M: i32> Broadcast0<Tensor<T,1,M>, Tensor<T,B,
 // combines_a_bounded_type_generic_with_several_const_generics`).
 fn dense_forward<T: Float, const B: i32, const In: i32, const Out: i32>(layer: Dense<T,In,Out>, x: Tensor<T,B,In>) -> Tensor<T,B,Out> {
     matmul(x, layer.w) + broadcast0(layer.b)
+}
+
+// A gated MLP, SwiGLU (Shazeer, 2020), the MLP of Llama and most transformers
+// since: `down(silu(gate(x)) * up(x))`, `D -> H -> D`. The gate decides, per
+// hidden unit, how much of `up`'s value passes. Three matrices instead of two,
+// so `H` is usually `8/3 D` rather than `4 D` for the same parameter count.
+struct SwiGlu<T: Float, const D: i32, const H: i32> { gate: Dense<T, D, H>, up: Dense<T, D, H>, down: Dense<T, H, D> }
+
+impl<T: Float + Rand + Ring, const D: i32, const H: i32> Init<SwiGlu<T, D, H>> {
+    fn xavier() { SwiGlu(gate: Init::xavier(), up: Init::xavier(), down: Init::xavier()) }
+    fn he() { SwiGlu(gate: Init::he(), up: Init::he(), down: Init::he()) }
+}
+
+impl<T: Float, const D: i32, const H: i32> Trainable<SwiGlu<T, D, H>> {}
+
+fn swiglu_forward<T: Float, const B: i32, const D: i32, const H: i32>(m: SwiGlu<T, D, H>, x: Tensor<T, B, D>) -> Tensor<T, B, D> {
+    m.down.dense_forward(silu(m.gate.dense_forward(x)) * m.up.dense_forward(x))
+}
+
+// A table of learned vectors, one row per token: `embedding_forward` reads the
+// rows of a batch of ids, `embedding_logits` scores a batch of vectors against
+// every row, the output layer of a language model whose head is tied to its
+// input embedding (one table for both, its gradient the sum of both uses).
+// `Parameters` but not `Trainable`: an elementwise optimizer updates its table
+// as any tensor, `Muon` keeps it on AdamW (a table isn't a hidden matrix).
+struct Embedding<T: Float, const V: i32, const D: i32> { table: Tensor<T, V, D> }
+
+impl<T: Float, const V: i32, const D: i32> Parameters<Embedding<T, V, D>> {}
+
+impl<T: Float + Rand + Ring, const V: i32, const D: i32> Init<Embedding<T, V, D>> {
+    fn xavier() { Embedding(table: Init::xavier()) }
+    fn he() { Embedding(table: Init::he()) }
+}
+
+fn embedding_forward<T: Float, const V: i32, const D: i32, const N: i32>(e: Embedding<T, V, D>, ids: [i32; N]) -> Tensor<T, N, D> {
+    embed(e.table, ids)
+}
+
+fn embedding_logits<const V: i32, const D: i32, const N: i32>(e: Embedding<f32, V, D>, h: Tensor<f32, N, D>) -> Tensor<f32, N, V> {
+    matmul_transpose_b(h, e.table)
+}
+
+impl<Opt: ElementwiseOptimizer, T: Float, const V: i32, const D: i32, S> Optimizer<Opt, Embedding<T, V, D>, S> {
+    fn init_state(opt, e) { init_state(opt, e.table) }
+    fn step(opt, e, grad, state) {
+        let (table, next) = step(opt, e.table, grad.table, state);
+        (Embedding(table: table), next)
+    }
+}
+
+impl<const V: i32, const D: i32> Optimizer<Muon, Embedding<f32, V, D>, AdamState<f32, V, D>> {
+    fn init_state(opt, e) { init_state(opt.adamw, e.table) }
+    fn step(opt, e, grad, state) {
+        let (table, next) = step(opt.adamw, e.table, grad.table, state);
+        (Embedding(table: table), next)
+    }
+}
+
+// Gradient clipping by global norm, as `torch.nn.utils.clip_grad_norm_`: the
+// norm of the whole gradient (every tensor of the model as one vector), and
+// when it exceeds `max_norm`, the whole gradient scaled by `max_norm / (norm +
+// 1e-6)`. A rare huge gradient (a bad batch, an unstable early step) moves the
+// weights no further than `max_norm` would.
+algebra GradNorm<M> {
+    fn squared_norm(m: M) -> f32;
+    fn scaled(m: M, s: f32) -> M;
+}
+
+impl<const N: i32> GradNorm<Tensor<f32, N>> {
+    fn squared_norm(m) { sum(m * m) }
+    fn scaled(m, s) { Scale::scale(m, s) }
+}
+
+impl<const R: i32, const C: i32> GradNorm<Tensor<f32, R, C>> {
+    fn squared_norm(m) { sum(m * m) }
+    fn scaled(m, s) { Scale::scale(m, s) }
+}
+
+// Every `Parameters` struct, field by field.
+impl<M: Parameters> GradNorm<M> {
+    fn squared_norm(m) {
+        let parts = [for i in 0..m.len(): squared_norm(m[i])];
+        let mut total = 0.0;
+        for i in 0..parts.len() { total = total + parts[i]; };
+        total
+    }
+    fn scaled(m, s) { [for i in 0..m.len(): scaled(m[i], s)] }
+}
+
+fn clip_grad_norm<M: GradNorm>(g: M, max_norm: f32) -> M {
+    let norm = sqrt(squared_norm(g));
+    if norm > max_norm { scaled(g, max_norm / (norm + 0.000001)) } else { g }
 }
 
 impl<T: Float, const N: i32> Mean<Tensor<T, N>, T> {

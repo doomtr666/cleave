@@ -170,6 +170,14 @@ fuller rule from
 only (`mlir_lower.rs::lower_array_construct`). Found with `Optimizer` on a `Dense<f32, 1, 2>`, whose
 two fields share a type: the state came out as an array of tensors and failed MLIR verification.
 
+Found again on 2026-10-04 (nanoLM v2), two ways. `is_array_element` took any `Ty::Con` for a scalar,
+so a struct named without generics (`Net`, `Gpt`) made the comprehension an array of structs: nanoLM's
+`[for j in 0..SPLIT: spawn gpt_grad_micro(..)]` collected eight micro-batch gradients into `[Gpt; 8]`,
+which nothing releases (512 MB per training step). Fixed: numbers and booleans only, a struct of any
+kind gives a tuple (`leaks.rs::a_comprehension_of_spawned_structs_leaves_nothing_behind`). Still open:
+a comprehension of structs *without* `spawn` and with a runtime-shaped body goes through `Generate`
+into `[Net; 4]`, whose `memref.alloc` fails verification ("result must be memref, got `!llvm.ptr`").
+
 ## Indexable collections as algebras: `x[i]` on structs and tuples, unrolled `for`, comprehensions, slices
 
 Steps 1-3 done (`doc/plan-compile-time-sequences.md`, "Suggested order"); slices, packs in the same
@@ -2070,3 +2078,27 @@ ML is one client of the stdlib among many; the target is computational science a
 **Converged hybrid solvers** — the showcase this leads to, stronger than a PINN for engineers: the AI accelerates a real solver and keeps its structure, rather than replacing it (a PINN) or merely being fed better features. The classical loop iterates to tolerance, so the answer keeps its guarantees (residual, conservation, stability); a bad network slows convergence, it doesn't falsify the result. Forms: a learned preconditioner inside a Krylov solver; a learned initial guess (an FNO) for Newton / Jacobian-free Newton-Krylov; learned closures (turbulence, constitutive laws) inside a finite-volume or finite-element scheme, trained solver-in-the-loop (Um et al., 2020) through the implicit gradient; multiphysics coupling (partitioned fixed point with Aitken / Anderson acceleration, or monolithic Newton); adjoint-based design and shape optimization.
 
 Progression: building blocks → `FixedPoint` / `Solve` with implicit gradients → discretizations (finite differences, finite volumes, then finite elements) → hybrids.
+
+## A loop carrying a bare tensor *and* a struct, reassigned together from a returned tuple, leaks every iteration (found 2026-10-04)
+
+`for .. { (m, s) = f(m, g, s); }` with `m` a `Tensor` and `s` a struct (an `AdamState`): about two
+tensors' worth left allocated per iteration (`leaks.rs::carried_3_both_from_a_tuple`, ignored, and
+`muon_steps_leave_no_allocation_behind`, Muon called directly on a tensor in a loop, ignored). Each
+half alone is fine (`carried_1_a_tensor_from_a_call`, `carried_2_a_struct_rebuilt`), and so is a loop
+carrying a struct model (`model_steps_under_muon_leave_nothing_behind`, nanoLM's own shape). This loop
+didn't compile at all before `allow-return-allocs-from-loops` (`pipeline.rs`, same day): One-Shot
+Bufferize rejected a loop yielding a fresh buffer. Now it compiles, and the likely cause is two owners
+meeting: the tensor read out of the returned tuple is refcounted (`refcount.rs`, a field of an owned
+struct), while as a loop iter_arg it is MLIR's (`ownership-based-buffer-deallocation`); neither frees
+the value the next iteration replaces. To fix at the source, with those two tests as the check.
+
+## Retain/release cascades are expanded inline at every site, per tensor leaf: nanoLM v2's `train_gpt` reached 98 MB of IR (found 2026-10-04)
+
+A struct's retain or release is a cascade over every tensor leaf (`refcount.rs`'s field granularity,
+`mlir_lower.rs::lower_release_cascade`), written out in full at each site, each leaf's call unpacking
+its memref descriptor (~3.5 KB of IR per call). With nanoLM v2's eight micro-batch gradients held in
+a tuple (correctly released now, see the comprehension entry above), `train_gpt` had 18,000
+`cleave_release` and 9,400 `cleave_retain` calls, 98 MB of IR before bufferization, and the MLIR/LLVM
+passes went past 10 GB. Fix in progress: one retain and one release function per struct type (Rust's
+"drop glue"), called where the cascade used to be written out, so that code grows with the number of
+types rather than sites times leaves.

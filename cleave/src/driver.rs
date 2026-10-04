@@ -601,7 +601,8 @@ fn synthesize_len_impls(mut program: Program, node_ids: &mut NodeIdGen) -> Progr
 /// `impl<..> Collect<S<..>, (F0, .., Fn-1)> { fn collect(x) { S(f0: x[0], ..) } }`
 /// (the field types as a tuple; the field type itself for a one-field
 /// struct), so `let net: Network = [for i in ...]` rebuilds a `Network`; and
-/// for every array length `impl<T> Collect<[T; N], (T, .., T)>`. Data read off
+/// for every array length `impl<T> Collect<[T; N], (T, .., T)>` (`T` itself for
+/// `N` = 1). Data read off
 /// the declarations, like `synthesize_len_impls`, and skipped the same way for
 /// a struct the program writes its own `Collect` impl for. A no-op when no
 /// `Collect` algebra is loaded.
@@ -662,7 +663,10 @@ fn synthesize_collect_impls(mut program: Program, node_ids: &mut NodeIdGen) -> P
         let source = b_tuple_or_single(&mut b, field_types);
         synthesized.push(b.collect_impl(d.generics.clone(), target, source, body));
     }
-    for n in 2..=MAX_TUPLE_ARITY {
+    // From one element too (`[T; 1]` from a `T`): the default target of a
+    // one-element comprehension of scalars, as for two or more
+    // (`infer.rs::apply_collect_defaults`).
+    for n in 1..=MAX_TUPLE_ARITY {
         let generics = vec![GenericParam::Type {
             name: "T".to_string(),
             bounds: Vec::new(),
