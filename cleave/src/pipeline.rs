@@ -961,6 +961,28 @@ pub fn register_passes() {
     });
 }
 
+/// `CLEAVE_TIME_STAGES=1`: how long each pass pipeline of `lower_to_llvm`
+/// takes (named by its line here) and the rest of `emit_object`, on stderr.
+/// What a compile spends its time on, for `doc/backlog.md`'s compile-time
+/// entry.
+fn time_stages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CLEAVE_TIME_STAGES").is_ok_and(|v| v == "1"))
+}
+
+fn report_stage(what: &str, since: std::time::Instant) {
+    if time_stages() {
+        eprintln!("cleave stage: {what}: {:.2} s", since.elapsed().as_secs_f64());
+    }
+}
+
+fn timed_run(pass_manager: &pass::PassManager, module: &mut Module, line: u32) -> Result<(), melior::Error> {
+    let start = std::time::Instant::now();
+    let result = pass_manager.run(module);
+    report_stage(&format!("pipeline.rs:{line}"), start);
+    result
+}
+
 pub fn lower_to_llvm<'c>(
     context: &'c Context,
     module: &mut Module<'c>,
@@ -1034,7 +1056,7 @@ pub fn lower_to_llvm<'c>(
     }
     pass_manager.add_pass(pass::linalg::create_convert_elementwise_to_linalg_pass());
     pass_manager.add_pass(pass::linalg::create_linalg_elementwise_op_fusion_pass());
-    if pass_manager.run(&mut *module).is_err() {
+    if timed_run(&pass_manager, &mut *module, line!()).is_err() {
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (inline/elementwise-to-linalg/fuse)".to_string(),
         ]);
@@ -1084,7 +1106,7 @@ pub fn lower_to_llvm<'c>(
         ),
     )
     .is_err()
-        || pass_manager.run(&mut *module).is_err()
+        || timed_run(&pass_manager, &mut *module, line!()).is_err()
     {
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (transform-dialect tile/vectorize)".to_string(),
@@ -1116,7 +1138,7 @@ pub fn lower_to_llvm<'c>(
 
     let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::transform::create_loop_invariant_subset_hoisting());
-    if pass_manager.run(&mut *module).is_err() {
+    if timed_run(&pass_manager, &mut *module, line!()).is_err() {
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (loop-invariant-subset-hoisting)".to_string(),
         ]);
@@ -1197,7 +1219,7 @@ pub fn lower_to_llvm<'c>(
         "builtin.module(eliminate-empty-tensors,one-shot-bufferize{bufferize-function-boundaries=true function-boundary-type-conversion=identity-layout-map allow-return-allocs-from-loops=true})",
     )
     .is_err()
-        || pass_manager.run(&mut *module).is_err()
+        || timed_run(&pass_manager, &mut *module, line!()).is_err()
     {
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (one-shot-bufferize)".to_string(),
@@ -1218,7 +1240,7 @@ pub fn lower_to_llvm<'c>(
     // *old* path's `affine.parallel`-derived one.
     let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::scf::create_scf_forall_to_parallel_loop());
-    if pass_manager.run(&mut *module).is_err() {
+    if timed_run(&pass_manager, &mut *module, line!()).is_err() {
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (scf-forall-to-parallel)".to_string(),
         ]);
@@ -1264,7 +1286,7 @@ pub fn lower_to_llvm<'c>(
         "builtin.module(buffer-results-to-out-params{hoist-static-allocs=true})",
     )
     .is_err()
-        || pass_manager.run(&mut *module).is_err()
+        || timed_run(&pass_manager, &mut *module, line!()).is_err()
     {
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (buffer-results-to-out-params)".to_string(),
@@ -1281,7 +1303,7 @@ pub fn lower_to_llvm<'c>(
     pass_manager.add_pass(pass::bufferization::create_buffer_deallocation_simplification_pass());
     pass_manager.add_pass(pass::bufferization::create_lower_deallocations_pass());
     pass_manager.add_pass(pass::conversion::create_bufferization_to_mem_ref());
-    if pass_manager.run(&mut *module).is_err() {
+    if timed_run(&pass_manager, &mut *module, line!()).is_err() {
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (buffer-deallocation)".to_string(),
         ]);
@@ -1316,7 +1338,7 @@ pub fn lower_to_llvm<'c>(
     // vectorization stage below hard-fail (see its own doc comment).
     let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::transform::create_symbol_dce());
-    if pass_manager.run(&mut *module).is_err() {
+    if timed_run(&pass_manager, &mut *module, line!()).is_err() {
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (symbol-dce)".to_string(),
         ]);
@@ -1338,7 +1360,7 @@ pub fn lower_to_llvm<'c>(
         "builtin.module(func.func(lower-vector-multi-reduction))",
     )
     .is_err()
-        || pass_manager.run(&mut *module).is_err()
+        || timed_run(&pass_manager, &mut *module, line!()).is_err()
     {
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (canonicalize/lower-vector-multi-reduction)"
@@ -1360,7 +1382,7 @@ pub fn lower_to_llvm<'c>(
     // CSE has already run once.
     let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::transform::create_cse());
-    if pass_manager.run(&mut *module).is_err() {
+    if timed_run(&pass_manager, &mut *module, line!()).is_err() {
         return Err(vec!["MLIR-to-LLVM lowering pass failed (cse)".to_string()]);
     }
     eliminate_self_copies(context, &mut *module);
@@ -1379,7 +1401,7 @@ pub fn lower_to_llvm<'c>(
     pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
     pass_manager.add_pass(pass::conversion::create_lower_affine());
     pass_manager.add_pass(pass::transform::create_canonicalizer());
-    if pass_manager.run(&mut *module).is_err() {
+    if timed_run(&pass_manager, &mut *module, line!()).is_err() {
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (expand-strided-metadata/lower-affine)".to_string(),
         ]);
@@ -1392,7 +1414,7 @@ pub fn lower_to_llvm<'c>(
     // stage.
     let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::conversion::create_vector_to_scf());
-    if pass_manager.run(&mut *module).is_err() {
+    if timed_run(&pass_manager, &mut *module, line!()).is_err() {
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (vector-to-scf)".to_string(),
         ]);
@@ -1403,7 +1425,7 @@ pub fn lower_to_llvm<'c>(
     // why: `--affine-super-vectorize` only operates on `affine.for`.
     let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::linalg::create_convert_linalg_to_affine_loops_pass());
-    if pass_manager.run(&mut *module).is_err() {
+    if timed_run(&pass_manager, &mut *module, line!()).is_err() {
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (linalg-to-affine-loops)".to_string(),
         ]);
@@ -1456,7 +1478,7 @@ pub fn lower_to_llvm<'c>(
             "builtin.module(func.func(affine-parallelize{max-nested=1}))",
         )
         .is_err()
-            || pass_manager.run(&mut *module).is_err()
+            || timed_run(&pass_manager, &mut *module, line!()).is_err()
         {
             return Err(vec![
                 "MLIR-to-LLVM lowering pass failed (affine-parallelize)".to_string(),
@@ -1545,7 +1567,7 @@ pub fn lower_to_llvm<'c>(
         "builtin.module(func.func(affine-super-vectorize{virtual-vector-size=16}))",
     )
     .is_err()
-        || pass_manager.run(&mut *module).is_err()
+        || timed_run(&pass_manager, &mut *module, line!()).is_err()
     {
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (affine-super-vectorize)".to_string(),
@@ -1574,7 +1596,7 @@ pub fn lower_to_llvm<'c>(
         "builtin.module(func.func(convert-vector-to-scf{target-rank=0}))",
     )
     .is_err()
-        || has_permuted_transfer(module.as_operation()) && pass_manager.run(&mut *module).is_err()
+        || has_permuted_transfer(module.as_operation()) && timed_run(&pass_manager, &mut *module, line!()).is_err()
     {
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (vector-to-scf after super-vectorize)".to_string(),
@@ -1618,7 +1640,7 @@ pub fn lower_to_llvm<'c>(
     // own `scf.parallel` lowering needs to see it, not `affine.parallel`.
     let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::conversion::create_lower_affine());
-    if pass_manager.run(&mut *module).is_err() {
+    if timed_run(&pass_manager, &mut *module, line!()).is_err() {
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (lower-affine)".to_string(),
         ]);
@@ -1695,7 +1717,7 @@ pub fn lower_to_llvm<'c>(
         // `omp.parallel` region also happens to sit inside it.
         let pass_manager = pass::PassManager::new(context);
         pass_manager.add_pass(pass::conversion::create_scf_to_open_mp());
-        if pass_manager.run(&mut *module).is_err() {
+        if timed_run(&pass_manager, &mut *module, line!()).is_err() {
             return Err(vec![
                 "MLIR-to-LLVM lowering pass failed (scf-to-openmp)".to_string(),
             ]);
@@ -1720,7 +1742,7 @@ pub fn lower_to_llvm<'c>(
         pass_manager.add_pass(pass::conversion::create_open_mp_to_llvm());
     }
     pass_manager.add_pass(pass::conversion::create_to_llvm());
-    if pass_manager.run(&mut *module).is_err() {
+    if timed_run(&pass_manager, &mut *module, line!()).is_err() {
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (vector/openmp/to-llvm)".to_string(),
         ]);
@@ -1741,7 +1763,7 @@ pub fn lower_to_llvm<'c>(
     pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
     pass_manager.add_pass(pass::conversion::create_to_llvm());
     pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-    if pass_manager.run(&mut *module).is_err() {
+    if timed_run(&pass_manager, &mut *module, line!()).is_err() {
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (scf-to-cf/to-llvm/reconcile)".to_string(),
         ]);
@@ -2115,14 +2137,26 @@ fn emit_object(
 
     let mlir_types = collect_mlir_types(program);
     let struct_schemas = collect_struct_schemas(program);
+    let start = std::time::Instant::now();
     let mut module = lower_program(&context, cps_program, &mlir_types, struct_schemas);
+    report_stage("MLIR lowering (mlir_lower)", start);
     if !module.as_operation().verify() {
         return Err(vec![
             "generated MLIR module failed verification".to_string(),
         ]);
     }
 
+    let start = std::time::Instant::now();
     lower_to_llvm(&context, &mut module, options)?;
+    report_stage("lower_to_llvm, in all", start);
+    // `CLEAVE_DUMP_LLVM_DIALECT=<path>`: the module as it is handed to LLVM
+    // (`mlir-translate --mlir-to-llvmir`, then `opt`/`llc -time-passes`, to
+    // see where LLVM's own share of a compile goes).
+    if let Ok(path) = std::env::var("CLEAVE_DUMP_LLVM_DIALECT") {
+        std::fs::write(&path, module.as_operation().to_string())
+            .unwrap_or_else(|e| eprintln!("CLEAVE_DUMP_LLVM_DIALECT: failed to write {path}: {e}"));
+    }
+    let start = std::time::Instant::now();
 
     let engine = cleave_mlir_shim::ExecutionEngine::new(
         module.to_raw(),
@@ -2148,6 +2182,7 @@ fn emit_object(
         )]);
     };
     engine.dump_to_object_file(object_path_str);
+    report_stage("LLVM: translation, optimization, code generation", start);
     Ok(())
 }
 

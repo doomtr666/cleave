@@ -84,6 +84,14 @@ use std::collections::{HashMap, HashSet};
 struct LowerCtx<'c, 'm> {
     context: &'c Context,
     module: &'m Module<'c>,
+    /// Functions whose signature is fixed by the outside (`main`, every
+    /// `export fn`): their parameters keep their natural types, never
+    /// passed by pointer (`by_pointer`).
+    abi_fixed: HashSet<String>,
+    /// The entry block of the function being lowered, where a by-pointer
+    /// argument's slot is allocated (`call_arguments`): once per call site,
+    /// not once per loop iteration.
+    entry_block: std::cell::Cell<Option<mlir_sys::MlirBlock>>,
     declared_externs: RefCell<HashSet<String>>,
     signatures: HashMap<String, (Vec<Ty>, Ty)>,
     /// Cleave type name -> MLIR type text, from every `#[mlir_type(...)]`-
@@ -497,9 +505,17 @@ pub fn lower_program<'c>(
     {
         // Scoped so `ctx`'s own borrow of `module` ends before `module` is
         // moved out below.
+        let abi_fixed: HashSet<String> = program
+            .funcs
+            .iter()
+            .filter(|f| f.is_export || f.def.name == "main")
+            .map(|f| f.def.name.clone())
+            .collect();
         let ctx = LowerCtx {
             context,
             module: &module,
+            abi_fixed,
+            entry_block: std::cell::Cell::new(None),
             declared_externs: RefCell::new(HashSet::new()),
             signatures,
             mlir_types: mlir_types.clone(),
@@ -1549,6 +1565,122 @@ fn width_ty<'c>(ctx: &LowerCtx<'c, '_>, name: &str) -> Type<'c> {
 /// — a unit-typed function reachable through `lower_real_call`/`PrimOp::
 /// Extern` (not just as the program's own entry point) isn't handled yet,
 /// and would still panic clearly in `ty_to_mlir` rather than misbehave.
+/// A light struct this large or more crosses a call by pointer to a copy
+/// rather than by value: the Windows x64 C ABI's rule for large aggregates,
+/// at a larger size. By value, LLVM expands the aggregate into its scalars at
+/// the call: nanoLM v2's `Optimizer::step` took 58 KB of arguments, stored
+/// below the stack pointer without a probe, past Windows' guard page (an
+/// access violation), and the copies of a spawned task's captured arguments
+/// made one basic block of 188k instructions, most of a compile's time in
+/// SelectionDAG.
+const BY_POINTER_MIN_BYTES: usize = 128;
+
+/// An estimate of an LLVM type's size in bytes, from its text: enough to
+/// compare against `BY_POINTER_MIN_BYTES` (alignment padding ignored).
+fn llvm_type_size_estimate(text: &str) -> usize {
+    fn scalar(token: &str) -> usize {
+        match token {
+            "ptr" | "i64" | "f64" | "index" => 8,
+            "i32" | "f32" => 4,
+            "i16" | "f16" | "bf16" => 2,
+            "i8" | "i1" => 1,
+            _ => 0,
+        }
+    }
+    // `array<N x T>`: N times T; everything else, the scalars it names.
+    let mut total = 0;
+    let mut rest = text;
+    while let Some(i) = rest.find("array<") {
+        total += rest[..i].split(|c: char| !c.is_alphanumeric()).map(scalar).sum::<usize>();
+        let inner = &rest[i + "array<".len()..];
+        let end = inner.find('>').unwrap_or(inner.len());
+        let mut parts = inner[..end].split(" x ");
+        let n: usize = parts.next().and_then(|n| n.trim().parse().ok()).unwrap_or(1);
+        let elem = parts.next().map(str::trim).unwrap_or("");
+        total += n * scalar(elem);
+        rest = &inner[(end + 1).min(inner.len())..];
+    }
+    total + rest.split(|c: char| !c.is_alphanumeric()).map(scalar).sum::<usize>()
+}
+
+/// Whether an argument of type `ty` to `callee` is passed by pointer to a
+/// copy (`BY_POINTER_MIN_BYTES`): a large light struct, to a function whose
+/// signature isn't fixed by the outside (`LowerCtx::abi_fixed`).
+fn by_pointer(ctx: &LowerCtx, callee: &str, ty: &Ty) -> bool {
+    if ctx.abi_fixed.contains(callee) {
+        return false;
+    }
+    let (Ty::Con(name) | Ty::App(name, _)) = ty else { return false };
+    if native_shape_keyword(ctx, name).is_some() || ctx.mlir_types.contains_key(name) || name == "bool" {
+        return false;
+    }
+    let (name, type_args) = struct_name_and_args(ty);
+    is_light_struct(
+        name,
+        type_args,
+        &ctx.struct_schemas,
+        &ctx.mlir_types,
+        &ctx.field_mutated_structs,
+        &ctx.extern_boundary_structs,
+        &ctx.constructed_structs,
+    ) && llvm_type_size_estimate(&ty_to_mlir(ctx, ty).to_string()) >= BY_POINTER_MIN_BYTES
+}
+
+/// A call's argument values for `callee` (`param_types` its parameters'
+/// types): each lowered as usual, a by-pointer one (`by_pointer`) stored to
+/// a slot allocated in the caller's entry block and passed as the slot's
+/// address. The slot lives as long as the caller's frame, so a spawned call
+/// reading it from its task (`lower_spawn`) finds it intact until the
+/// caller's `sync`.
+fn call_arguments<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    callee: &str,
+    args: &[CVal],
+    param_types: &[Ty],
+) -> Vec<Value<'c, 'c>> {
+    let context = ctx.context;
+    args.iter()
+        .zip(param_types)
+        .map(|(a, t)| {
+            let value = lower_cval(context, block, env, a, ty_to_mlir(ctx, t));
+            if !by_pointer(ctx, callee, t) {
+                return value;
+            }
+            let slot = entry_alloca(ctx, ty_to_mlir(ctx, t));
+            block.append_operation(llvm::store(context, value, slot, gen_loc(context), LoadStoreOptions::new()));
+            slot
+        })
+        .collect()
+}
+
+/// One `llvm.alloca` of `ty`, at the start of the current function's entry
+/// block (`LowerCtx::entry_block`).
+fn entry_alloca<'c>(ctx: &LowerCtx<'c, '_>, ty: Type<'c>) -> Value<'c, 'c> {
+    let context = ctx.context;
+    let raw = ctx.entry_block.get().expect("MLIR lowering: no entry block for an argument slot");
+    // SAFETY: `raw` is the entry block of the function being lowered
+    // (`lower_top_level_fn` sets it before lowering the body and clears it
+    // after), alive for the whole lowering of that function.
+    let entry = unsafe { melior::ir::BlockRef::from_raw(raw) };
+    let location = Location::unknown(context);
+    let i64_ty: Type = IntegerType::new(context, 64).into();
+    let one_op = entry.insert_operation(0, arith::constant(context, IntegerAttribute::new(i64_ty, 1).into(), location));
+    let one: Value = one_op.result(0).unwrap().into();
+    let alloca = entry.insert_operation_after(
+        one_op,
+        llvm::alloca(
+            context,
+            one,
+            llvm::r#type::pointer(context, 0),
+            location,
+            llvm::AllocaOptions::new().elem_type(Some(TypeAttribute::new(ty))),
+        ),
+    );
+    alloca.result(0).unwrap().into()
+}
+
 fn lower_top_level_fn<'c>(ctx: &LowerCtx<'c, '_>, f: &CTopLevelFn) -> Operation<'c> {
     let context = ctx.context;
     // Every op lowered for this function inherits its declaration position
@@ -1564,7 +1696,15 @@ fn lower_top_level_fn<'c>(ctx: &LowerCtx<'c, '_>, f: &CTopLevelFn) -> Operation<
     GEN_LINE.with(|c| c.set(line));
     GEN_FILE_ID.with(|c| c.set(file));
     let location = gen_loc(context);
-    let param_types: Vec<Type> = f.param_types.iter().map(|t| ty_to_mlir(ctx, t)).collect();
+    // A large light struct parameter arrives as a pointer to the caller's
+    // copy (`by_pointer`), loaded once here.
+    let pointer_params: Vec<bool> = f.param_types.iter().map(|t| by_pointer(ctx, &f.def.name, t)).collect();
+    let param_types: Vec<Type> = f
+        .param_types
+        .iter()
+        .zip(&pointer_params)
+        .map(|(t, &p)| if p { llvm::r#type::pointer(context, 0) } else { ty_to_mlir(ctx, t) })
+        .collect();
     let is_unit = is_unit_ty(&f.result);
     let result_type: Type = if is_unit {
         IntegerType::new(context, 1).into()
@@ -1585,12 +1725,30 @@ fn lower_top_level_fn<'c>(ctx: &LowerCtx<'c, '_>, f: &CTopLevelFn) -> Operation<
     // so zip against everything but the last entry.
     let mut env: HashMap<CVar, Value> = HashMap::new();
     for (i, &var) in f.def.params[..f.def.params.len() - 1].iter().enumerate() {
-        env.insert(var, block.argument(i).unwrap().into());
+        let arg: Value = block.argument(i).unwrap().into();
+        let value = if pointer_params[i] {
+            block
+                .append_operation(llvm::load(
+                    context,
+                    arg,
+                    ty_to_mlir(ctx, &f.param_types[i]),
+                    location,
+                    LoadStoreOptions::new(),
+                ))
+                .result(0)
+                .unwrap()
+                .into()
+        } else {
+            arg
+        };
+        env.insert(var, value);
     }
 
     ctx.currently_region_local
         .set(ctx.region_local_fns.contains(&f.def.name));
+    ctx.entry_block.set(Some(block.to_raw()));
     lower_cexpr(ctx, &block, env, f.k_ret, result_type, &[], &f.def.body);
+    ctx.entry_block.set(None);
 
     let region = Region::new();
     region.append_block(block);
@@ -2237,11 +2395,8 @@ fn lower_loop<'c>(
         // `args`' own last entry is the synthesized continuation label
         // itself (`emit_call`'s own convention, see `cps.rs`), not a real arg.
         let real_cond_args = &cond_call.args[..cond_call.args.len() - 1];
-        let cond_arg_values: Vec<Value> = real_cond_args
-            .iter()
-            .zip(cond_param_types)
-            .map(|(a, t)| lower_cval(context, &before_block, &before_env, a, ty_to_mlir(ctx, t)))
-            .collect();
+        let cond_arg_values: Vec<Value> =
+            call_arguments(ctx, &before_block, &before_env, cond_call.callee, real_cond_args, cond_param_types);
         let cond_call_op = before_block.append_operation(func::call(
             context,
             FlatSymbolRefAttribute::new(context, cond_call.callee),
@@ -2440,11 +2595,7 @@ fn lower_real_call<'c>(
     // §7) emits the call — no MLIR heuristic can ever do that job for an
     // opaque extern symbol. The CPS-level fact itself stays built and
     // tested; only this now-proven-inert consumer was removed.
-    let arg_values: Vec<Value> = real_args
-        .iter()
-        .zip(param_types)
-        .map(|(a, t)| lower_cval(context, block, &env, a, ty_to_mlir(ctx, t)))
-        .collect();
+    let arg_values: Vec<Value> = call_arguments(ctx, block, &env, callee, real_args, param_types);
     let location = gen_loc(context);
     // A `()`-returning callee is declared with *zero* MLIR results
     // (`lower_top_level_fn`'s own `is_unit`/`results` handling, applied to
@@ -2663,11 +2814,15 @@ fn lower_prim_op<'c>(
             let CVal::Var(v) = &args[0] else {
                 panic!("MLIR lowering: a leaf glue call's operand must be a variable");
             };
-            let value = *env.get(v).unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{v}"));
+            let _ = env.get(v).unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{v}"));
+            let Some((param_types, _)) = ctx.signatures.get(unit.as_str()) else {
+                panic!("MLIR lowering: leaf glue `{unit}` isn't a function of the program");
+            };
+            let values = call_arguments(ctx, block, env, unit, args, param_types);
             block.append_operation(func::call(
                 ctx.context,
                 FlatSymbolRefAttribute::new(ctx.context, unit),
-                &[value],
+                &values,
                 &[],
                 gen_loc(ctx.context),
             ));
@@ -7091,11 +7246,7 @@ fn lower_spawn<'c>(
         panic!("MLIR lowering: spawn of unknown top-level fn `{unit}`");
     };
     let context = ctx.context;
-    let arg_values: Vec<Value> = args
-        .iter()
-        .zip(param_types)
-        .map(|(a, t)| lower_cval(context, block, env, a, ty_to_mlir(ctx, t)))
-        .collect();
+    let arg_values: Vec<Value> = call_arguments(ctx, block, env, unit, args, param_types);
     let results: Vec<Type> = if is_unit_ty(result_ty) {
         vec![]
     } else {

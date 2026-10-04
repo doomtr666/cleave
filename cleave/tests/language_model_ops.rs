@@ -1221,3 +1221,53 @@ fn a_comprehension_over_one_field_is_indexed_like_over_two() {
     ");
     assert!(close(got, 9.0), "got {got}");
 }
+
+
+/// A light struct of ~57 KB (nested light structs of tensors) passed to a
+/// function that isn't inlined. By value, LLVM expanded it into its scalars,
+/// stored below the stack pointer with no probe: past Windows' guard page an
+/// access violation, depending on the order of the stores and on how much of
+/// the stack the thread had committed (nanoLM v2's `Optimizer::step`, 58 KB of
+/// arguments; not reproducible on demand in a small program). So what is
+/// checked is the ABI itself: the function receives pointers to copies
+/// (`mlir_lower.rs::by_pointer`), and still computes the right value.
+#[test]
+fn a_large_light_struct_crosses_a_call_by_pointer() {
+    let src = format!("
+        use nn;
+        struct L1 {{ t0: Tensor<f32, 1, 1>, t1: Tensor<f32, 1, 1>, t2: Tensor<f32, 1, 1>, t3: Tensor<f32, 1, 1>, t4: Tensor<f32, 1, 1>, t5: Tensor<f32, 1, 1>, t6: Tensor<f32, 1, 1>, t7: Tensor<f32, 1, 1>, t8: Tensor<f32, 1, 1>, t9: Tensor<f32, 1, 1>, t10: Tensor<f32, 1, 1>, t11: Tensor<f32, 1, 1>, t12: Tensor<f32, 1, 1>, t13: Tensor<f32, 1, 1>, t14: Tensor<f32, 1, 1>, t15: Tensor<f32, 1, 1> }}
+struct L2 {{ l0: L1, l1: L1, l2: L1, l3: L1, l4: L1, l5: L1, l6: L1, l7: L1, l8: L1, l9: L1, l10: L1, l11: L1, l12: L1, l13: L1, l14: L1, l15: L1 }}
+struct L3 {{ a: L2, b: L2, c: L2, d: L2 }}
+fn mk1(v: f32) -> L1 {{ L1(t0: [for r in 0..1: [for c in 0..1: v]], t1: [for r in 0..1: [for c in 0..1: v]], t2: [for r in 0..1: [for c in 0..1: v]], t3: [for r in 0..1: [for c in 0..1: v]], t4: [for r in 0..1: [for c in 0..1: v]], t5: [for r in 0..1: [for c in 0..1: v]], t6: [for r in 0..1: [for c in 0..1: v]], t7: [for r in 0..1: [for c in 0..1: v]], t8: [for r in 0..1: [for c in 0..1: v]], t9: [for r in 0..1: [for c in 0..1: v]], t10: [for r in 0..1: [for c in 0..1: v]], t11: [for r in 0..1: [for c in 0..1: v]], t12: [for r in 0..1: [for c in 0..1: v]], t13: [for r in 0..1: [for c in 0..1: v]], t14: [for r in 0..1: [for c in 0..1: v]], t15: [for r in 0..1: [for c in 0..1: v]]) }}
+fn mk2(v: f32) -> L2 {{ L2(l0: mk1(v), l1: mk1(v), l2: mk1(v), l3: mk1(v), l4: mk1(v), l5: mk1(v), l6: mk1(v), l7: mk1(v), l8: mk1(v), l9: mk1(v), l10: mk1(v), l11: mk1(v), l12: mk1(v), l13: mk1(v), l14: mk1(v), l15: mk1(v)) }}
+        #[no_inline]
+        fn read(x: L3, y: L3) -> f32 {{ x.a.l0.t0[0, 0] + y.d.l15.t15[0, 0] }}
+        fn main() -> f32 {{
+            let x = L3(a: mk2(1.5), b: mk2(0.0), c: mk2(0.0), d: mk2(0.0));
+            let y = L3(a: mk2(0.0), b: mk2(0.0), c: mk2(0.0), d: mk2(2.0));
+            read(x, y)
+        }}
+    ");
+    let got = run(&src);
+    assert!(close(got, 3.5), "got {got}");
+    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("large_light_struct.cleave");
+    std::fs::write(&source, &src).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--no-debug-info", "--dump-mlir-lowered"])
+        .arg(&source)
+        .output()
+        .expect("cannot run cleave");
+    let lowered = String::from_utf8_lossy(&output.stdout);
+    let signature = lowered
+        .lines()
+        .find(|l| l.contains("llvm.func @read("))
+        .unwrap_or_else(|| panic!("no `read` in the lowered module:
+{}", String::from_utf8_lossy(&output.stderr)));
+    assert!(
+        signature.contains("@read(%arg0: !llvm.ptr, %arg1: !llvm.ptr)"),
+        "both structs must arrive by pointer: {}...",
+        &signature[..signature.len().min(160)]
+    );
+}

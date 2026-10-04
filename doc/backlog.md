@@ -2102,3 +2102,59 @@ a tuple (correctly released now, see the comprehension entry above), `train_gpt`
 passes went past 10 GB. Fix in progress: one retain and one release function per struct type (Rust's
 "drop glue"), called where the cascade used to be written out, so that code grows with the number of
 types rather than sites times leaves.
+
+## Light structs cross calls by value, decomposed into their scalars: a 58 KB argument area crashes past the stack's guard page, and the IR swells (found 2026-10-04)
+
+nanoLM v2 segfaulted in its first training step, only with several threads and only at full size. The
+Windows event log gave the faulting instruction (`nanolm.exe+0x2411a5`, symbolized with
+`llvm-symbolizer` and the binary's PDB to `Optimizer::step` inlined in `train_gpt$tasks`): a store at
+`0x27e8(%rsp)` right after `subq $0xe360, %rsp`, the argument area of a call to `Optimizer::step<..Gpt..>`
+taking the model, its gradient and the optimizer state *by value*. A light struct (every field a
+tensor descriptor, inline) is a first-class LLVM aggregate, which LLVM expands into its scalars at a
+call: tens of thousands of bytes stored downward from the new `%rsp` with no probe, skipping Windows'
+guard page, an access violation (not a stack overflow, so no handler runs on the faulting thread).
+Latent until a call this large wasn't inlined. The same representation fills the IR with
+`extractvalue`/`insertvalue` per descriptor wherever such a value is copied, a large share of
+nanoLM v2's ~150 s of MLIR/LLVM passes. To fix at the source: pass a light struct above a size
+threshold by pointer to a copy (the Windows x64 C ABI's rule for large aggregates), parameters,
+calls and returns alike, `export fn`s and the Rust boundary included. Reproduction to write first: a
+struct of tens of KB passed to a non-inlined function.
+
+**Parameters fixed, same day.** A light struct of 128 bytes or more (`mlir_lower.rs::by_pointer`,
+`BY_POINTER_MIN_BYTES`) is passed to an internal function as a pointer to a copy in the caller's
+entry block (`call_arguments`, `entry_alloca`), loaded once in the callee; `main` and `export fn`s
+keep their signature. Calls, loop conditions, leaf glue and spawned calls alike; a spawned call's task
+captures only the pointer, the slot living until the caller's `sync`. nanoLM v2 trains (no crash), its
+LLVM time 162 s -> 98 s. The crash itself isn't reproducible on demand in a small program (it depends
+on the order of the stores and on how much stack the thread had committed), so the test checks the
+ABI: `language_model_ops.rs::a_large_light_struct_crosses_a_call_by_pointer` (fails without it).
+Still by value: **returned** light structs (LLVM demotes a large return to a hidden pointer, so no
+crash, but the aggregate is still built with `insertvalue` per scalar), and light structs inside the
+caller's own body.
+
+## Debug info attributes inlined stdlib code to the program's file
+`llvm-symbolizer` on nanoLM v2 placed `Optimizer::step` at `kernel.cleave:386`, a line the kernel
+doesn't have: the inlined function's `DISubprogram` names the right function but the program's file
+(`stdlib/optim/optim.cleave` is the right one). Line numbers are then meaningless in a crash or a
+profile. Found 2026-10-04.
+
+## Compile time: nanoLM v2's kernel takes ~170 s, almost all of it in LLVM's code generation (found 2026-10-04)
+Measured (`CLEAVE_TIME_STAGES=1` times each stage; `--dump-mlir-lowered`, then `mlir-translate
+--mlir-to-llvmir`, `opt -O2 -time-passes` and `llc -O2 -time-passes` time LLVM's passes): frontend
+(parse to refcounting) ~10 s, MLIR lowering 0.5 s, every MLIR pass 4 s, LLVM 162 s, of which `opt -O2`
+26 s and `llc` 144 s: SelectionDAG instruction selection 78 s, post-RA scheduling 26 s, register
+allocation 12 s. Of the kernel's 684k LLVM instructions, `train_gpt$tasks` holds 334k, and one of its
+basic blocks 188k: `omp.private.init`, the copies of the eight gradient tasks' captured arguments,
+the model a light struct copied scalar by scalar (165k `insertvalue`). SelectionDAG and the scheduler
+are superlinear in a block's size. Same cause as the crash above (light structs as aggregate SSA
+values); per-leaf retain/release cascades were an earlier one (fixed with per-type glue functions,
+126 MB -> 24 MB of IR before bufferization).
+
+## Two intermittent anomalies in `leaks.rs`, not reproduced (2026-10-04)
+
+Once, `clipping_leaves_no_allocation_behind` failed in a full `leaks.rs` run (bytes left per clip
+above `NOISE`); once, a run of `leaks.rs` produced no `test result` line at all (the process ended
+early). Neither came back in 12 further runs. Both happened the day the bufferization (`allow-return-
+allocs-from-loops`), refcounting (per-type glue functions) and ABI (large light structs by pointer)
+changed; worth a loop of runs (`for i in $(seq 50)`) after the next change touching those, and a
+capture of the failing output when it happens.
