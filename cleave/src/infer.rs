@@ -1833,6 +1833,15 @@ fn check_spawn_placement(body: &Block) -> Result<(), TypeError> {
                         _ => reject_any(call)?,
                     }
                 }
+                // The same, once unrolled (`unroll.rs`): `Collect::collect(__TupleN(0: { spawn .. }, ..))`.
+                _ if crate::cps::spawned_elements(value).is_some() => {
+                    for (_, call) in crate::cps::spawned_elements(value).unwrap() {
+                        match &call.kind {
+                            ExprKind::Call(_, _, call_args, _) => call_args.iter().try_for_each(reject_any)?,
+                            _ => reject_any(call)?,
+                        }
+                    }
+                }
                 _ => reject_any(value)?,
             },
             StmtKind::Assign { target, value } => {
@@ -2282,6 +2291,10 @@ struct PendingComprehension {
     end: Expr,
     /// The type of one element, the body's.
     element: Ty,
+    /// The body is a `spawn` (`[for i in a..b: spawn f(..)]`): one task per
+    /// element, which needs the elements unrolled (`cps.rs`,
+    /// `spawned_elements`) whatever their type.
+    spawns: bool,
     span: Span,
 }
 
@@ -5217,11 +5230,13 @@ impl<'r> Infer<'r> {
         let element = self.infer_block(&inner_env, body);
         self.unroll_scopes.pop();
         let element = element?;
+        let spawns = body.stmts.is_empty() && matches!(body.tail.as_deref().map(|t| &t.kind), Some(ExprKind::Spawn(_)));
         self.pending_comprehensions.push(PendingComprehension {
             id: expr.id,
             start: start.clone(),
             end: end.clone(),
             element,
+            spawns,
             span: expr.span,
         });
         let placeholder = self.vars.fresh();
@@ -5461,7 +5476,9 @@ impl<'r> Infer<'r> {
     /// - Anything else: a `Generate::generate` call, any bounds; unless its
     ///   elements are known to be tensors or structs and its bounds fold,
     ///   which a tuple of copies holds better than an array could
-    ///   (`is_array_element`).
+    ///   (`is_array_element`), or its body is a `spawn` and its bounds fold:
+    ///   one task per copy (a `spawn` in `Generate`'s run-time loop is
+    ///   `MisplacedSpawn`).
     ///
     /// In an instance, a heterogeneous one whose bounds still don't fold is
     /// an error, unless this round rewrites something else it may wait on.
@@ -5498,6 +5515,7 @@ impl<'r> Infer<'r> {
                 // An element type still open is left to the context (`i.to()`
                 // into a `[f32; 3]`), which the generated call carries.
                 match bounds {
+                    Some(b) if c.spawns => Some(b),
                     Some(b) if is_fully_concrete(&element) && !is_array_element(&element) => Some(b),
                     _ => Some(GENERATE_REQUEST),
                 }

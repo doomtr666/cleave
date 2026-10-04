@@ -171,6 +171,8 @@ fn a_spawn_outside_a_top_level_let_is_a_located_error() {
         ("in_loop", "let mut s = 0; for i in 0..3 { let a = spawn work(i); s = s + a; }; s"),
         ("in_expression", "work(1) + spawn work(2)"),
         ("in_arguments", "let a = spawn work(spawn work(1)); a"),
+        // A run-time bound: one task per element needs the elements unrolled.
+        ("in_runtime_comprehension", "let xs = [for i in 0..n: spawn work(i)]; xs[0]"),
     ] {
         let source = dir.join(format!("misplaced_{name}.cleave"));
         std::fs::write(
@@ -318,4 +320,36 @@ fn each_task_holds_its_spawned_call() {
             "a task holding something else than its spawned call: {calls:?}"
         );
     }
+}
+
+/// `[for j in 0..N: spawn f(..)]` over a numeric range with a `define`d bound,
+/// arguments computed from the index (nanoLM's parallel evaluation): one task
+/// per element, the array read like any other once built.
+#[test]
+fn a_comprehension_of_spawns_over_a_numeric_range() {
+    let out = run(
+        "range_comprehension",
+        "
+        use convert;
+        define PARTS: i32 = 4;
+        fn work(n: i32) -> f32 {
+            let mut s = 0.0;
+            for i in 0..n { s = s + 1.0; };
+            s
+        }
+        fn part(base: i32, j: i32) -> i32 { base * (j + 1) }
+        fn total(base: i32) -> f64 {
+            let parts = [for j in 0..PARTS: spawn work(part(base, j))];
+            let mut t: f64 = 0.0;
+            for j in 0..PARTS { t = t + parts[j].to(); };
+            t
+        }
+        fn main() -> i32 {
+            let t = total(10);
+            if t == 100.0 { 1 } else { 0 }
+        }
+        ",
+    );
+    // 10 + 20 + 30 + 40
+    assert!(out.contains("main returned: 1"), "{out}");
 }

@@ -1,5 +1,5 @@
-"""Twin of `train_lm` in `examples/nanolm/src/kernel.cleave`: the same model (embedding 104 -> 64,
-dense 64 -> 256, GELU (tanh form), dense 256 -> 104), from the same initial weights (the
+"""Twin of `train_lm` in `examples/nanolm/src/kernel.cleave`: the same model (embedding `VOCAB` -> 64,
+dense 64 -> 256, GELU (tanh form), dense 256 -> `VOCAB`), from the same initial weights (the
 `lm_init.ckpt` cleave writes), on the same batches, with the same Adam and the same summed loss.
 The validation losses printed every 100 steps must match cleave's.
 
@@ -43,5 +43,5 @@ for r in range(ROUNDS):
         opt.step()
     print(f"step {(r + 1) * 100}, validation: {validation(10):.7f}")
 nats = validation(50)
-print(f"embedding + MLP: {nats:.4f} nats/char")
+print(f"embedding + MLP: {corpus.per_token(nats)}")
 print(f"elapsed: {time.perf_counter() - start:.2f}s (training, with validation)")

@@ -1,0 +1,1543 @@
+# The training corpus (`corpus.rs`): every Project Gutenberg text in French classed as
+# French literature (`LoCC` PQ, so no translations), all of whose authors were born between 1790
+# and 1880 -- Zola's generation and the ones around it. Selected once from Gutenberg's catalog
+# (`https://www.gutenberg.org/cache/epub/feeds/pg_catalog.csv`, 2026-10-04) and frozen here, so
+# the corpus doesn't move with the catalog. One book per line: ebook number, first author, title
+# (tab-separated).
+799	Verne, Jules	De la terre à la lune: trajet direct en 97 heures 20 minutes
+800	Verne, Jules	Le tour du monde en quatre-vingts jours
+1256	Rostand, Edmond	Cyrano de Bergerac
+1910	Dumas, Alexandre	La Tulipe Noire
+2419	Dumas, Alexandre	La dame aux camélias
+2650	Proust, Marcel	Du côté de chez Swann
+2682	Dumas, Alexandre	Henri III et sa Cour
+2998	Proust, Marcel	A l'ombre des jeunes filles en fleurs — Première partie
+2999	Proust, Marcel	A l'ombre des jeunes filles en fleurs — Deuxième partie
+3000	Proust, Marcel	A l'ombre des jeunes filles en fleurs — Troisième partie
+3456	Verne, Jules	Le tour du monde en quatre-vingts jours
+4548	Verne, Jules	Cinq Semaines En Ballon
+4559	Renard, Jules	Poil de Carotte
+4688	Mallarmé, Stéphane	Pages
+4708	Louÿs, Pierre	Les chansons de Bilitis
+4717	Verne, Jules	Autour de la Lune
+4785	Loti, Pierre	Pêcheur d'Islande
+4791	Verne, Jules	Voyage au Centre de la Terre
+4933	Jaloux, Edmond	L'Escalier d'Or
+4968	Verne, Jules	Les Cinq Cents Millions De La Bégum
+5081	Verne, Jules	Les Indes Noires
+5082	Verne, Jules	Le chateâu des Carpathes
+5095	Verne, Jules	Vingt Mille Lieues Sous Les Mers — Part 1
+5096	Verne, Jules	Vingt Mille Lieues Sous Les Mers — Part 2
+5097	Verne, Jules	Vingt mille Lieues Sous Les Mers — Complete
+5105	Daudet, Alphonse	Tartarin sur les Alpes
+5126	Verne, Jules	Robur-le-conquérant
+5147	France, Anatole	Le Jardin d'Épicure
+5154	Zola, Émile	La Bête humaine
+5250	Zola, Émile	Nana
+5423	Hugo, Victor	L'homme Qui Rit
+5711	Zola, Émile	Germinal
+6099	Baudelaire, Charles	Les Fleurs du Mal
+6309	Tinseau, Léon de	Ma Cousine Pot-Au-Feu
+6319	Dumas, Alexandre	Bric-à-brac
+6377	France, Anatole	Thaïs
+6470	Zola, Émile	Le Ventre de Paris
+6484	Colette	Chéri
+6497	Zola, Émile	L'Assommoir
+6558	Zola, Émile	La faute de l'abbé Mouret
+6739	Gide, André	Les Caves du Vatican
+6838	Hugo, Victor	Le Dernier Jour d'un Condamné
+6994	Hugo, Victor	Han d'Islande
+7173	France, Anatole	Sur la pierre blanche
+7263	Loti, Pierre	Le Mariage de Loti
+7268	France, Anatole	Monsieur Bergeret à Paris: Histoire Contemporaine
+7442	Verne, Jules	Michel Strogoff: De Moscou a Irkoutsk
+7461	Zola, Émile	Thérèse Raquin
+7462	Zola, Émile	Contes à Ninon
+7770	Dumas, Alexandre	Les quarante-cinq — Tome 1
+7771	Dumas, Alexandre	Les quarante-cinq — Tome 2
+7772	Dumas, Alexandre	Les quarante-cinq — Tome 3
+7809	Loti, Pierre	Les Désenchantées — Roman des harems Turcs contemporains
+8174	Verne, Jules	Kéraban-Le-Têtu, Volume I
+8175	Verne, Jules	Kéraban-Le-Têtu, Volume II
+8416	Zola, Émile	Nouveaux Contes à Ninon
+8524	France, Anatole	L'Île Des Pingouins
+8541	Houssaye, Arsène	Les mains pleines de roses, pleines d'or et pleines de sang
+8560	Zola, Émile	Le Docteur Pascal
+8561	Zola, Émile	Une page d'amour
+8563	Zola, Émile	La Terre
+8650	Gaboriau, Emile	Monsieur Lecoq — Volume 1 L'enquête
+8712	Zola, Émile	La Conquête de Plassans
+8719	Gaboriau, Emile	Monsieur Lecoq — Volume2 L'honneur du nom
+8907	Zola, Émile	Pot-Bouille
+8946	Proust, Marcel	Le Côté de Guermantes - Première partie
+9261	Houssaye, Arsène	Les grandes dames
+9453	Labiche, Eugène	Le Voyage de Monsieur Perrichon: Comédie en quatre actes
+9637	Dumas, Alexandre	La dame de Monsoreau — ­Tome 1.
+9638	Dumas, Alexandre	La dame de Monsoreau — Tome 2.
+9639	Dumas, Alexandre	La dame de Monsoreau — Tome 3.
+9644	Hugo, Victor	Littérature et Philosophie mêlées
+9645	Hugo, Victor	Quatrevingt-Treize
+9655	Vigny, Alfred de	Stello
+9976	Hugo, Victor	Hernani
+10053	Féval, Paul	La vampire
+10061	Verhaeren, Emile	Les Heures Claires
+10160	France, Anatole	Pierre Nozière
+10289	Hervilly, Ernest d'	Le Chat du Neptune
+10442	Gautier, Théophile	La Comédie de la mort
+10746	Maupassant, Guy de	Boule de Suif
+10774	Achard, Amédée	Récits d'un soldat: Une armée prisonnière; Une campagne devant Paris
+10775	Maupassant, Guy de	Le Horla
+10982	Flaubert, Gustave	La tentation de Saint Antoine
+11035	Loti, Pierre	Aziyadé Extrait des notes et lettres d'un lieutenant de la marine anglaise entré au service de la Turquie le 10 mai 1876 tué dans les murs de Kars, le 27 octobre 1877.
+11036	Lavalley, Gaston	Légendes Normandes
+11037	Farrère, Claude	La veille d'armes: Pièce en cinq actes
+11040	Aleramo, Sibilla	Le passage, suivi de Transfiguration (Nouvelle)
+11042	Gide, André	Isabelle
+11049	Balzac, Honoré de	Eugénie Grandet
+11131	Maupassant, Guy de	Pierre et Jean
+11175	Maupassant, Guy de	L'inutile beauté
+11178	Maeterlinck, Maurice	La sagesse et la destinée
+11199	Maupassant, Guy de	Claire de Lune
+11300	Maquet, Auguste	La belle Gabrielle — Tome 1
+11301	Gaboriau, Emile	Les gens de bureau
+11434	Ségur, Sophie, comtesse de	Pauvre Blaise
+11450	Maupassant, Guy de	Fort comme la mort
+11484	Verne, Jules	Le pilote du Danube
+11495	Maupassant, Guy de	La Main Gauche
+11588	Gaboriau, Emile	L'argent des autres: 1. Les hommes de paille
+11589	Verne, Jules	Le Docteur Ox
+11596	Maupassant, Guy de	La Maison Tellier
+11597	Maupassant, Guy de	Mlle Fifi: Nouveaux Contes
+11621	Ségur, Sophie, comtesse de	Le Mauvais Génie
+11645	France, Anatole	La rôtisserie de la Reine Pédauque
+11650	Daudet, Alphonse	La Belle-Nivernaise: Histoire d'un vieux bateau et de son équipage
+11678	Maquet, Auguste	La belle Gabrielle — Tome 2
+11714	Maupassant, Guy de	Contes de la Becasse
+11747	Prévost, Marcel	Les Demi-Vierges
+11766	Balzac, Honoré de	Contes bruns
+11770	Daudet, Alphonse	Lettres de mon moulin
+11905	Muller, Eugène	Sous les marronniers: Contes et récits
+11927	Verne, Jules	Aventures du Capitaine Hatteras
+11928	Houssaye, Arsène	Les douze nouvelles nouvelles
+12005	Lautréamont, comte de	Les Chants de Maldoror
+12011	Maupassant, Guy de	Monsieur Parent, et autres histoires courtes
+12065	Flaubert, Gustave	Trois contes
+12072	Bonnières, Robert de	Contes des fées
+12080	Silvestre, Armand	Contes irrévérencieux
+12120	Laboulaye, Édouard	Nouveaux contes bleus
+12174	Malot, Hector	Baccara
+12271	Jacob, P. L.	Contes littéraires du bibliophile Jacob à ses petits-enfants
+12284	Malot, Hector	Anie
+12289	Hennequin, Emile	Quelques écrivains français: Flaubert, Zola, Hugo, Goncourt, Huysmans, etc.
+12331	Silvestre, Armand	Contes à la brune
+12332	Bergerat, Emile	Contes de Caliban
+12338	Sand, George	Contes d'une grand-mère
+12365	Ferland, Albert	Femmes Rêvées
+12367	Sand, George	Le péché de Monsieur Antoine, Tome 1
+12399	Laboulaye, Édouard	Contes et nouvelles
+12447	Sand, George	Pauline
+12448	Sand, George	L'Orco
+12451	Durand, Charles	De profundis! Episode Maritime
+12459	Jourdan, Prosper	Contes et poésies de Prosper Jourdan: 1854-1866
+12487	Blémont, Emile	A quoi tient l'amour? Contes de France et d'Amérique
+12488	Révoil, Bénédict-Henry	Nouveaux contes extraordinaires
+12533	Verne, Jules	Sans dessus dessous
+12534	Sand, George	Le péché de Monsieur Antoine, Tome 2
+12566	Janin, Jules Gabriel	Contes, Nouvelles et Recits
+12602	Filiatreault, Aristide	Contes, anecdotes et récits Canadiens dans le langage du terroir
+12603	Grangé, Eugène	La tête de Martin: Comédie en un acte
+12620	Mullem, Louis	Contes d'Amérique
+12646	Bordeaux, Henry	La maison
+12665	Galipaux, Félix	Galipettes
+12666	Sand, George	Consuelo, Tome 1 (1861)
+12726	Daudet, Alphonse	Le nabab, tome I
+12727	Daudet, Alphonse	Le nabab, tome II
+12749	Faguet, Émile	Études Littéraires; dix-huitième siècle
+12837	Sand, George	Cora
+12862	Sand, George	Aldo le rimeur
+12865	Sand, George	Mattea
+12869	Sand, George	Metella
+12889	Sand, George	Promenades autour d'un village
+12949	Buffum, Douglas Labaree	Contes Français
+12950	Daudet, Alphonse	L'Immortel Moeurs parisiennes
+12969	Ségur, Sophie, comtesse de	L'auberge de l'ange gardien
+12999	Proust, Marcel	Le Côté de Guermantes - Deuxième partie
+13016	Sand, George	Lavinia
+13024	Dandurand, Madame (Joséphine)	Contes de Noël par Josette
+13025	Sand, George	La Marquise
+13027	Malot, Hector	Cara
+13036	Doin, Ernest	Le Conscrit ou Le Retour de Crimée
+13038	Caro, E. (Elme-Marie)	George Sand
+13059	DeGuise, Charles	Le Cap au Diable, Légende Canadienne
+13070	Doin, Ernest	Le dîner interrompu
+13149	DeGuise, Charles	Hélika: Memoire d'un vieux maître d'école
+13189	Méténier, Oscar	Le gorille: roman parisien
+13198	Sand, George	Nouvelles lettres d'un voyageur
+13207	Zévaco, Michel	Les Pardaillan — Tome 01
+13221	Musset, Alfred de	Œuvres Complètes de Alfred de Musset — Tome 7.
+13231	Musset, Alfred de	Œuvres Complètes de Alfred de Musset — Tome 6.
+13256	Daudet, Alphonse	Le petit chose
+13258	Sand, George	Consuelo, Tome 2 (1861)
+13263	Sand, George	Valvèdre
+13303	Sand, George	Kourroglou
+13336	Malot, Hector	Clotilde Martory
+13339	Zévaco, Michel	Les Pardaillan — Tome 02 : L'épopée d'amour
+13374	Sand, George	Consuelo, Tome 3 (1861)
+13380	Sand, George	Gabriel
+13383	Zévaco, Michel	Les Pardaillan — Tome 03 : La Fausta
+13385	Malot, Hector	Comte du Pape
+13400	Malot, Hector	Conscience
+13431	Sand, George	André
+13456	Ségur, Sophie, comtesse de	Les deux nigauds
+13478	Méténier, Oscar	Zézette : moeurs foraines
+13490	Malot, Hector	Corysandre
+13523	Zévaco, Michel	Les Pardaillan — Tome 04 : Fausta Vaincue
+13524	Zévaco, Michel	Les Pardaillan — Tome 05 : Pardaillan et Fausta
+13525	Hémon, Louis	Maria Chapdelaine
+13562	Malot, Hector	Ghislaine
+13592	Sand, George	L'Uscoque
+13594	Sainte-Beuve, Charles Augustin	Portraits littéraires, Tome I
+13598	Auriac, J. Berlioz d' (Jules Berlioz)	Jim l'indien
+13622	Mariéton, Paul	Une histoire d'Amour : George Sand et A. de Musset Documents inédits, Lettres de Musset
+13629	Sand, George	Correspondance, 1812-1876 — Tome 1
+13653	Sand, George	Elle et lui
+13654	Malot, Hector	Ida et Carmelita
+13668	Sand, George	Le château des Désertes
+13671	Sand, George	Horace
+13703	Colette	La maison de Claudine
+13704	About, Edmond	L'homme à l'oreille cassée
+13727	Zévaco, Michel	Les Pardaillan — Tome 06 : Les amours du Chico
+13737	Le Roy, Albert	George Sand et ses amis
+13743	Proust, Marcel	Le Côté de Guermantes - Troisième partie
+13744	Sand, George	Isidora
+13765	Leroux, Gaston	Le mystère de la chambre jaune
+13772	Leroux, Gaston	Les etranges noces de Rouletabille
+13792	Baudelaire, Charles	Journaux intimes
+13793	Malot, Hector	En famille
+13808	Barbara, Charles	L'assassinat du pont-rouge
+13818	Sand, George	Jacques
+13819	Dumas, Alexandre	Les compagnons de Jéhu
+13825	Daudet, Alphonse	Sapho
+13834	Allais, Alphonse	À se tordre: Histoires chatnoiresques
+13837	Sand, George	Correspondance, 1812-1876 — Tome 2
+13838	Sand, George	Correspondance, 1812-1876 — Tome 3
+13839	Sand, George	Correspondance, 1812-1876 — Tome 5
+13848	Barbey d'Aurevilly, J. (Jules)	Les diaboliques
+13856	Dumas, Alexandre	La reine Margot - Tome I
+13857	Dumas, Alexandre	La reine Margot - Tome II
+13866	Zola, Émile	Le Naturalisme au théâtre, les théories et les exemples
+13875	Sand, George	Correspondance, 1812-1876 — Tome 4
+13892	Sand, George	Le meunier d'Angibault
+13917	Sand, George	La Daniella, Vol. I.
+13947	Dumas, Alexandre	Le vicomte de Bragelonne, Tome I.
+13948	Dumas, Alexandre	Le vicomte de Bragelonne, Tome II.
+13949	Dumas, Alexandre	Le vicomte de Bragelonne, Tome III.
+13950	Dumas, Alexandre	Le vicomte de Bragelonne, Tome IV.
+13951	Dumas, Alexandre	Les trois mousquetaires
+13952	Dumas, Alexandre	Vingt ans après
+13965	Sainte-Beuve, Charles Augustin	Portraits littéraires, Tome II
+14030	Dick, Vinceslas-Eugène	Un drame au Labrador
+14038	Sand, George	La Daniella, Vol. II.
+14059	Dick, Vinceslas-Eugène	Le Roi des Étudiants
+14071	Level, Maurice	Les Portes de l'Enfer
+14113	Flor O'Squarr, Ch. (Charles)	Les fantômes, étude cruelle
+14151	Caouette, J. B. (Jean Baptiste)	Le vieux muet, ou, Un héros de Châteauguay
+14155	Flaubert, Gustave	Madame Bovary
+14156	Flaubert, Gustave	Dictionnaire des idées reçues
+14157	Flaubert, Gustave	Bouvard et Pécuchet
+14159	Bordeaux, Henry	Les Roquevillard
+14162	Verne, Jules	Les tribulations d'un chinois en Chine
+14163	Verne, Jules	Les enfants du capitaine Grant
+14251	Ohnet, Georges	L'Ame de Pierre
+14259	Lévi, Éliphas	Le sorcier de Meudon
+14287	Verne, Jules	L'île mystérieuse
+14288	Gautier, Théophile	Mademoiselle de Maupin
+14372	Sand, George	Autour de la table
+14398	Féval, Paul	La fée des grèves
+14404	Lemaître, Jules	Les Rois
+14512	Berthoud, S. Henry (Samuel Henry)	Les Filleules de Rubens, Tome I
+14536	Beaugrand, Honoré	Jeanne la Fileuse: Épisode de l'Émigration Franco-Canadienne aux États-Unis
+14537	Conan, Laure	Un amour vrai
+14539	Musset, Paul de	La Chèvre Jaune
+14564	Sand, George	Césarine Dietrich
+14677	La Ville de Mirmont‏, Madame Henri de	Contes de Noël
+14692	Sainte-Beuve, Charles Augustin	Portraits littéraires, Tome III
+14702	Féval, Paul	Le loup blanc
+14704	Vallès, Jules	L'enfant
+14705	Vallès, Jules	Le bachelier
+14751	Fréchette, Louis Honoré	Le retour de l'exilé: Drame en cinq actes et huit tableaux
+14790	Maupassant, Guy de	Contes du jour et de la nuit
+14799	Goncourt, Edmond de	Journal des Goncourt (Premier Volume) Mémoires de la vie littéraire
+14803	Goncourt, Edmond de	Journal des Goncourt (Deuxième volume) Mémoires de la vie littéraire
+14805	Heredia, José-Maria de	Les trophées
+14806	Verne, Jules	La Jangada: Huit cent lieues sur l'Amazone
+14810	Verne, Jules	La maison à vapeur: Voyage à travers l'Inde septentrionale
+14820	Malot, Hector	Une femme d'argent
+14911	Rodenbach, Georges	Bruges-la-Morte
+15075	Proust, Marcel	Sodome et Gomorrhe - Deuxième partie
+15107	Gaboriau, Emile	La corde au cou
+15112	Verlaine, Paul	Œuvres complètes - Volume 1 Poèmes Saturniens, Fêtes Galantes, Bonne chanson, Romances sans paroles, Sagesse, Jadis et naguère
+15146	Ponson du Terrail	Les misères de Londres, 1. La nourrisseuse d'enfants
+15203	Verne, Jules	Un billet de loterie (Le numéro 9672)
+15208	Dumas, Alexandre	Les mille et un fantômes
+15226	Sand, George	Nanon La bibliothèque précieuse
+15235	Sand, George	Oeuvres illustrées de George Sand Les visions de la nuit dans les campagnes - La vallée noire - Une visite aux catacombes
+15239	Sand, George	Spiridion
+15287	Sand, George	Teverino
+15288	Proust, Marcel	Sodome et Gomorrhe - Première partie
+15295	Sue, Eugène	Le juif errant - Tome I
+15296	Sue, Eugène	Le juif errant - Tome II
+15297	Darien, Georges	Le voleur
+15305	Aubert de Gaspé, Philippe	L'influence d'un livre: Roman historique
+15324	Coppée, François	Promenades et intérieurs
+15361	Fréchette, Louis Honoré	Félix Poutré: Drame historique en quatre actes
+15388	Sand, George	Leone Leoni
+15397	Sand, George	Francia; Un bienfait n'est jamais perdu
+15462	Apollinaire, Guillaume	Alcools
+15554	Leroux, Gaston	Le parfum de la dame en noir
+15555	Wilde, Oscar	La chasse à l'oppossum
+15558	Eekhoud, Georges	La nouvelle Carthage
+15574	Dumas, Alexandre	Le capitaine Paul
+15579	Gaboriau, Emile	L'affaire Lerouge
+15584	Sand, George	Jean Ziska: épisode de la guerre des Hussites
+15589	Rodenbach, Georges	Les vies encloses
+15645	Daudet, Alphonse	Port-Tarascon: Dernières aventures de l'illustre Tartarin
+15646	Verne, Jules	Nord contre sud
+15686	Maquet, Auguste	La belle Gabrielle — Tome 3
+15732	Corbière, Edouard	Contes de bord
+15811	Ponson du Terrail	Le serment des hommes rouges: Aventures d'un enfant de Paris
+15815	Toulet, Paul Jean	Les tendres ménages
+15816	Féval, Paul	La fabrique de crimes
+15844	Eekhoud, Georges	Escal-Vigor
+15882	Toulet, Paul Jean	Mon amie Nane
+15885	Corbière, Edouard	Les pilotes de l'Iroise
+15943	Adam, Paul	Le conte futur
+16210	Beaugrand, Honoré	La chasse galerie: Légendes Canadiennes
+16239	Mérimée, Prosper	Colomba
+16240	Mérimée, Prosper	La Vénus d'Ille
+16286	Sand, George	Lucrezia Floriani
+16336	Tardivel, Jules Paul	Pour la patrie: Roman du XXe siècle
+16465	Loti, Pierre	Le château de La Belle-au-bois-dormant
+16492	Darien, Georges	Biribi: Discipline militaire
+16499	Coppée, François	Henriette
+16709	Coppée, François	Contes rapides
+16743	Assollant, Alfred	Aventures merveilleuses mais authentiques du capitaine Corcoran, Première Partie
+16789	Assollant, Alfred	Hyacinthe
+16795	Chavette, Eugène	La conquête d'une cuisinière I Seul contre trois belles-mères
+16796	Chavette, Eugène	La conquête d'une cuisinière II Le tombeur-des-crânes
+16812	Barrès, Maurice	Le culte du moi 1: Sous l'oeil des barbares
+16813	Barrès, Maurice	Le culte du moi 2: Un homme libre
+16814	Barrès, Maurice	Le culte du moi 3: Le jardin de Bérénice
+16817	Ponson du Terrail	Les misères de Londres, 2. L'enfant perdu
+16818	Ponson du Terrail	Les misères de Londres, 3. La cage aux oiseaux
+16819	Ponson du Terrail	Les misères de Londres, 4. Les tribulations de Shoking
+16820	Mirbeau, Octave	Le Journal d'une Femme de Chambre
+16826	Verne, Jules	Face au drapeau
+16827	Verne, Jules	Le village aérien
+16848	Daudet, Alphonse	Numa Roumestan: Moeurs Parisiennes
+16850	Retté, Adolphe	Au pays des lys noirs: Souvenirs de jeunesse et d'âge mûr
+16851	Sue, Eugène	L'alouette du casque; ou, Victoria, la mère des camps
+16852	Zola, Émile	Au bonheur des dames
+16862	Moinaux, Jules	Le monsieur au parapluie
+16874	Assollant, Alfred	Claude et Juliette
+16875	Sue, Eugène	Paula Monti, Tome I ou L'Hôtel Lambert - histoire contemporaine
+16876	Sue, Eugène	Paula Monti, Tome II ou L'Hôtel Lambert - histoire contemporaine
+16883	Corbière, Tristan	Les amours jaunes
+16884	Jarry, Alfred	Ubu Roi, ou, les Polonais
+16886	Gourmont, Remy de	Le livre des masques: Portraits symbolistes
+16901	Achard, Amédée	Madame Rose; Pierre de Villerglé
+16934	Darien, Georges	L'épaulette: Souvenirs d'un officier
+16988	Gourmont, Remy de	Le IIme livre des masques
+16989	Lautréamont, comte de	Poésies
+17010	Eekhoud, Georges	La faneuse d'amour
+17106	Assollant, Alfred	Histoire fantastique du célèbre Pierrot Écrite par le magicien Alcofribas; traduite du sogdien par Alfred Assollant
+17123	Goncourt, Edmond de	Journal des Goncourt (Troisième volume) Mémoires de la vie littéraire
+17184	Gastyne, Jules de	Le lys noir
+17225	Sand, George	La comtesse de Rudolstadt
+17238	Goncourt, Edmond de	Journal des Goncourt (Deuxième série, premier volume) Mémoires de la vie littéraire
+17251	Sand, George	Valentine
+17252	Sales, Pierre	Le sergent Renaud: Aventures parisiennes
+17264	Toudouze, Gustave	La sirène: Souvenir de Capri
+17267	Conan, Laure	Angéline de Montbrun
+17271	Lemoyne, André	Oeuvres de André Lemoyne Une Idylle normande.—Le Moulin des Prés.—Alise d'Évran.
+17281	Lermina, Jules	Les loups de Paris I. Le club des morts
+17285	Goncourt, Edmond de	Germinie Lacerteux
+17311	Demolder, Eugène	Le jardinier de la Pompadour
+17319	Lemaître, Jules	Chateaubriand
+17335	Assollant, Alfred	Aventures merveilleuses mais authentiques du capitaine Corcoran, Deuxième partie
+17344	Assollant, Alfred	Rose d'Amour
+17345	France, Anatole	Histoire comique
+17353	Corbière, Edouard	La mer et les marins Scènes maritimes
+17360	Lepelletier, Edmond	Emile Zola, Sa Vie—Son Oeuvre
+17372	Capendu, Ernest	Marcof le Malouin
+17399	Villiers de L'Isle-Adam, Auguste, comte de	Tribulat Bonhomet
+17419	Claretie, Jules	Bouddha
+17420	Goncourt, Edmond de	Journal des Goncourt (Deuxième série, deuxième volume) Mémoires de la vie littéraire
+17457	Maupassant, Guy de	Une vie
+17458	Maigron, Louis	Le Roman Historique a l'Epoque Romantique - Essai sur l'Influence de Walter Scott
+17489	Hugo, Victor	Les misérables Tome I: Fantine
+17493	Hugo, Victor	Les misérables Tome II: Cosette
+17494	Hugo, Victor	Les misérables Tome III: Marius
+17501	Banville, Théodore Faullain de	Socrate et sa femme
+17505	Goncourt, Edmond de	Journal des Goncourt (Deuxième série, troisième volume) Mémoires de la vie littéraire
+17516	Zola, Émile	L'Argent
+17517	Zola, Émile	L'Œuvre
+17518	Hugo, Victor	Les misérables Tome IV: L'idylle rue Plumet et l'épopée rue Saint-Denis
+17519	Hugo, Victor	Les misérables Tome V: Jean Valjean
+17533	Zola, Émile	Le Rêve
+17541	Gourmont, Remy de	La culture des idées
+17542	Gourmont, Remy de	Histoire tragique de la princesse Phénissa expliquée en quatre épisodes
+17550	Daudet, Alphonse	Les femmes d'artistes
+17551	Uzanne, Octave	Le calendrier de Vénus
+17553	Zola, Émile	La Curée
+17557	Zola, Émile	Son Excellence Eugène Rougon
+17573	France, Hector	L'amour au pays bleu
+17590	Gourmont, Remy de	Lettres à Sixtine
+17605	Gourmont, Remy de	Le Pèlerin du silence
+17623	Villiers de L'Isle-Adam, Auguste, comte de	Le secret de l'échafaud
+17631	Cim, Albert	Histoire d'un baiser
+17643	Ulbach, Louis	La confession d'un abbé
+17646	Gourmont, Remy de	Sixtine: roman de la vie cérébrale
+17656	Theuriet, André	Gertrude et Veronique
+17660	Verne, Jules	L'archipel en feu
+17661	Zaccone, Pierre	La Recluse
+17668	Tinseau, Léon de	Plus fort que la haine
+17673	Zaccone, Pierre	Éric le Mendiant
+17688	Dubut de Laforest, Jean-Louis	Morphine
+17692	Lermina, Jules	L'élixir de vie: Conte magique
+17693	Dumas, Alexandre	La San-Felice, Tome 01
+17696	Tissot, Victor	Simone: Histoire d'une jeune fille moderne
+17708	Bertrand, Aloysius	Gaspard de la nuit: Fantaisies à la manière de Rembrandt et de Callot
+17714	Corbière, Edouard	Le Négrier, Vol. I Aventures de mer
+17715	Corbière, Edouard	Le Négrier, Vol. II Aventures de mer
+17716	Corbière, Edouard	Le Négrier, Vol. III Aventures de mer
+17717	Corbière, Edouard	Le Négrier, Vol. IV Aventures de mer
+17738	Bouvier, Alexis	La femme du mort, Tome I (1897)
+17739	Bouvier, Alexis	La femme du mort, Tome II (1897)
+17746	Goncourt, Edmond de	Journal des Goncourt (Troisième série, premier volume) Mémoires de la vie littéraire
+17747	Du Boisgobey, Fortuné	La main froide
+17752	Lermina, Jules	La deux fois morte
+17758	Cherbuliez, Victor	Amours fragiles Le roi Apépi—Le bel Edwards—Les inconséquences de M. Drommel
+17794	Level, Maurice	L'épouvante
+17795	Sand, George	La dernière Aldini: Simon
+17796	Verne, Jules	Le pays des fourrures
+17798	Verne, Jules	L'île à hélice
+17808	Achard, Amédée	Belle-Rose
+17809	France, Hector	Sous le burnous
+17828	Larmandie, Léonce de	Excelsior: Roman parisien
+17830	Claretie, Jules	Ruines et fantômes
+17831	Zola, Émile	La Débâcle
+17832	Verne, Jules	Une ville flottante
+17911	Sand, George	Légendes rustiques
+17914	Verne, Jules	Mistress Branican
+17915	Banville, Théodore Faullain de	Les parisiennes de Paris
+17916	Sully Prudhomme	Les vaines tendresses Études et Portraits littéraires, premier série
+17947	Goncourt, Edmond de	Journal des Goncourt (Troisième série, deuxième volume) Mémoires de la vie littéraire
+17963	Chevalier, H. Emile (Henri Emile)	Le chasseur noir
+17989	Dumas, Alexandre	Le comte de Monte-Cristo, Tome I
+17990	Dumas, Alexandre	Le comte de Monte-Cristo, Tome II
+17991	Dumas, Alexandre	Le comte de Monte-Cristo, Tome III
+17992	Dumas, Alexandre	Le comte de Monte-Cristo, Tome IV
+18003	Dumas, Alexandre	La femme au collier de velours
+18006	Dumas, Alexandre	Le chevalier de Maison-Rouge
+18014	Biart, Lucien	Pile et face
+18015	Delpit, Albert	Jean-nu-pieds, Vol. 1 chronique de 1832
+18028	Dumas, Alexandre	Le chevalier d'Harmental
+18029	Chevalier, H. Emile (Henri Emile)	Les derniers Iroquois
+18034	Lermina, Jules	Les loups de Paris II. Les assises rouges
+18055	Goncourt, Edmond de	Journal des Goncourt (Troisième série, troisième volume) Mémoires de la vie littéraire
+18064	Claretie, Jules	L'américaine
+18067	Lermina, Jules	L'effrayante aventure
+18073	Ohnet, Georges	Marchand de Poison: Les Batailles de la Vie
+18074	Eekhoud, Georges	Le cycle patibulaire
+18075	Sand, George	Mademoiselle La Quintinie
+18090	Ségur, Sophie, comtesse de	Jean qui grogne et Jean qui rit
+18092	About, Edmond	Germaine
+18108	Delpit, Albert	Jean-nu-pieds, Vol. 2 chronique de 1832
+18111	Corbière, Edouard	Scènes de mer, Tome I
+18199	Dumas, Alexandre	Le Collier de la Reine, Tome I
+18200	Dumas, Alexandre	Le Collier de la Reine, Tome II
+18205	Sand, George	Simon
+18208	Chevalier, H. Emile (Henri Emile)	L'enfer et le paradis de l'autre monde
+18211	Vigny, Alfred de	Servitude et grandeur militaires
+18215	Capendu, Ernest	Le marquis de Loc-Ronan
+18262	Allais, Alphonse	Contes humoristiques - Tome I
+18263	Chevalier, H. Emile (Henri Emile)	La fille des indiens rouges
+18271	Dumas, Alexandre	Georges
+18296	Corbière, Edouard	Scènes de mer, Tome II
+18302	Gaboriau, Emile	L'argent des autres: 2. La pêche en eau trouble
+18321	Dumas, Alexandre	Acté
+18353	Maupassant, Guy de	La petite roque
+18358	Loti, Pierre	Madame Chrysanthème
+18401	Dumas, Alexandre	La San-Felice, Tome 02
+18402	Dumas, Alexandre	La San-Felice, Tome 03
+18403	Chevalier, H. Emile (Henri Emile)	La fille du pirate
+18404	Chevalier, H. Emile (Henri Emile)	Le gibet
+18415	Lermina, Jules	Histoires incroyables, Tome I
+18416	Lermina, Jules	Histoires incroyables, Tome II
+18427	Loti, Pierre	Mon frère Yves
+18446	Murger, Henri	Scènes de la vie de Bohème
+18454	Chevalier, H. Emile (Henri Emile)	L'île de sable
+18494	Féval, Paul	Le dernier vivant
+18535	Chevalier, H. Emile (Henri Emile)	La capitaine
+18537	Murger, Henri	Scènes de la vie de jeunesse: Nouvelles
+18583	Assollant, Alfred	Brancas; Les amours de Quaterquem
+18585	Chevalier, H. Emile (Henri Emile)	Les Nez-Percés
+18586	Dumas, Alexandre	La San-Felice, Tome 04
+18623	Chavette, Eugène	Le saucisson à pattes I Fil-à-beurre
+18627	Aicard, Jean	Notre-Dame-d'Amour
+18672	Chevalier, H. Emile (Henri Emile)	Poignet-d'acier, Ou, Les Chippiouais
+18692	Dombre, Roger	Une Pupille Genante
+18693	Dombre, Roger	Nounou: Histoire de la Moucheronne
+18697	Dumas, Alexandre	Le capitaine Pamphile
+18773	Dumas, Alexandre	La San-Felice, Tome 05
+18826	Dumas, Alexandre	La San-Felice, Tome 06
+18899	Boylesve, René	Mademoiselle Clocque
+18918	Darien, Georges	Bas les coeurs!
+18921	Sue, Eugène	Les mystères de Paris, Tome I
+18922	Sue, Eugène	Les mystères de Paris, Tome II
+18923	Sue, Eugène	Les mystères de Paris, Tome III
+18924	Sue, Eugène	Les mystères de Paris, Tome IV
+18925	Sue, Eugène	Les mystères de Paris, Tome V
+18944	Chevalier, H. Emile (Henri Emile)	La Tête-Plate
+18962	Boylesve, René	Le dangereux jeune homme
+18983	Boylesve, René	Sainte-Marie-des-Fleurs: Roman
+18995	Ulbach, Louis	L'île des rêves: Aventures d'un Anglais qui s'ennuie
+18996	Lemaître, Jules	Jean-Jacques Rousseau
+19021	Boylesve, René	Le bonheur à cinq sous
+19035	Leroux, Gaston	Le fauteuil hanté
+19045	Chevalier, H. Emile (Henri Emile)	Peaux-rouges et Peaux-blanches
+19149	Roussel, Raymond	Locus Solus
+19152	Dondel Du Faouëdic, Noémie	Le journal d'une pensionnaire en vacances
+19184	Boylesve, René	La carrosse aux deux lézards verts
+19186	Lemaître, Jules	Les contemporains, première série Études et portraits littéraires
+19187	Marmette, Joseph	Chevalier de Mornac: Chronique de la Nouvelle-France (1664)
+19233	France, Anatole	Les opinions de M. Jérôme Coignard Recueillies par Jacques Tournebroche
+19249	France, Anatole	La vie littéraire. Première série
+19344	France, Anatole	La vie littéraire. Deuxième série
+19345	France, Anatole	La vie littéraire. Troisième série
+19431	Chavette, Eugène	Le saucisson à pattes II Le plan de Cardeuc
+19497	Bessette, Arsène	Le débutant Ouvrage enrichi de nombreux dessins de Busnel, de deux dessins... et d'un portrait de l'auteur par St-Charles Roman de moeurs du journalisme et de la politique dans la province de Québec
+19519	Doin, Ernest	Le divorce du tailleur: Pièce archi-comique en un acte
+19536	Doin, Ernest	Le pacha trompé ou Les deux ours: Pièce comique en un acte
+19540	Sardou, Victorien	La Tosca: Drame en cinq actes
+19657	Hugo, Victor	Notre-Dame de Paris
+19689	Caouette, J. B. (Jean Baptiste)	Les voix intimes: Premières Poésies
+19738	Le Faure, Georges	Aventures extraordinaires d'un savant russe; I. La lune
+19919	Féval, Paul	Maman Léo Les Habits Noirs Tome V
+19920	Féval, Paul	L'avaleur de sabres Les Habits Noirs Tome VI
+19992	Saint-Saëns, Camille	Rimes familières
+20143	France, Anatole	La vie littéraire. Quatrième série
+20199	Renard, Jules	L'écornifleur
+20244	Comminges, Aimery de, comte de	Le Voluptueux Voyage
+20246	Musset, Alfred de	Œuvres complètes de Alfred de Musset — Tome 3
+20254	Sand, George	Les maîtres sonneurs
+20396	Marmette, Joseph	La fiancée du rebelle: Épisode de la Guerre des Bostonnais, 1775
+20414	Lemaître, Jules	Jean Racine
+20440	Caouette, J. B. (Jean Baptiste)	Une Intrigante sous le règne de Frontenac
+20568	Verlaine, Paul	Hombres (Hommes)
+20623	Sand, Maurice	Mademoiselle de Cérignan
+20700	Vinet, Alexandre Rodolphe	Études sur la Littérature française au XIXe siècle - Tome 1 Madame de Staël, Chateaubriand
+20705	Klingsor, Tristan	Humoresques
+20950	Ohnet, Georges	La Grande Marnière
+20964	Bourget, Paul	Pauvre petite!
+21017	Dumas, Alexandre	La San-Felice, Tome 08, Emma Lyonna, tome 4
+21124	Aimard, Gustave	Le fils du Soleil (1879)
+21191	Dumas, Alexandre	La San-Felice, Tome 09, Emma Lyonna, tome 5
+21215	Lemaître, Jules	Les Contemporains, 2ème Série Etudes et Portraits Littéraires
+21343	Girardin, Emile de, Mme	La canne de M. de Balzac
+21825	Prévost, Marcel	L'automne d'une femme
+21912	Lemonnier, Camille	Le possédé: étude passionnelle
+21940	Boylesve, René	Le parfum des îles Borromées
+21966	Murger, Henri	Propos de ville et propos de théâtre
+22039	Erckmann-Chatrian	Madame Thérèse Introduction and notes by Edward Manley
+22054	Noailles, Anna de	Les vivants et les morts
+22078	Le Faure, Georges	Aventures extraordinaires d'un savant russe; III. Les planètes géantes et les comètes
+22111	Allais, Alphonse	Pour cause de fin de bail OEuvres anthumes
+22262	La Landelle, G. de	Sans-peur le corsaire
+22356	Apollinaire, Guillaume	L'hérésiarque et Cie
+22383	Villey, Pierre	Montaigne et François Bacon
+22394	Musset, Alfred de	Œuvres complètes de Alfred de Musset — Tome 4
+22551	Gautier, Théophile	Ménagerie intime
+22751	Aubert, Eugène	Littérature Française (Première Année)
+22813	About, Edmond	La Mère de la Marquise
+22971	Apollinaire, Guillaume	Les trois Don Juan Don Juan Tenorio d'Espagne, Don Juan de Maraña des Flandres, Don Juan d'Angleterre
+23423	Loti, Pierre	Le roman d'un enfant
+23444	Allais, Alphonse	Deux et deux font cinq (2 + 2 = 5) oeuvres anthumes
+23463	Pharaon, Florian	La culotte du brigadier
+23508	Lemaître, Jules	Les Contemporains, 7ème Série Études et Portraits Littéraires
+23520	La Brète, Jean de	Mon oncle et mon curé; Le voeu de Nadia
+23567	Musset, Alfred de	Œuvres complètes de Alfred de Musset — Tome 5
+23582	Sand, George	La Mare au Diable
+23583	Dombre, Roger	Folla
+23589	Régnier, Henri de	La cité des eaux
+23616	Bourget, Paul	André Cornélis
+23618	Figuier, Louis	Gutenberg, pièce historique en 5 actes, 8 tableaux
+23939	Gréville, Henry	La fille de Dosia
+23940	Huysmans, J.-K. (Joris-Karl)	Un dilemme
+24081	Gréville, Henry	L'expiation de Saveli
+24123	La Blanchère, Henri de	Les derniers Peaux-Rouges: Le trésor de Montcalm
+24217	Balzac, Honoré de	La Maison du Chat-qui-pelote
+24305	Gréville, Henry	Suzanne Normis: Roman d'un père
+24369	Gréville, Henry	La Niania
+24636	Lemay, Pamphile	Picounoc le maudit
+24850	Zola, Émile	Lourdes
+24924	Le Faure, Georges	Aventures extraordinaires d'un savant russe; IV. Le désert sidéral
+24962	Le Faure, Georges	Aventures extraordinaires d'un savant russe; II. Le Soleil et les petites planètes
+25378	Lemaître, Jules	Les Contemporains, 3ème Série Études et Portraits Littéraires
+25615	Pons, A. J.	Sainte Beuve et ses inconnues
+25704	Faguet, Émile	Zola
+25981	Sand, George	Les beaux messieurs de Bois-Doré
+26418	Janin, Jules Gabriel	L'âne mort
+26476	Dumas, Alexandre	Création et rédemption, deuxième partie: La fille du marquis
+26489	Bourget, Paul	La terre promise
+26504	Dumas, Alexandre	La tulipe noire
+26571	Merrill, Stuart	Petits Poèmes d'Automne
+26614	Sand, George	Le secrétaire intime
+26648	Dujardin, Edouard	Les lauriers sont coupés
+26681	Villiers de L'Isle-Adam, Auguste, comte de	L'Ève future
+26685	Louÿs, Pierre	Aphrodite: Moeurs antiques
+26710	Baudelaire, Charles	Les épaves de Charles Baudelaire
+26780	Sébillot, Paul	Petite légende dorée de la Haute-Bretagne
+26806	Musset, Alfred de	Gamiani, ou Une nuit d'excès
+26812	Flaubert, Gustave	Un coeur simple
+26813	Des Ages, Lucie	La destinée
+26815	Feuillet, Octave	Le roman d'un jeune homme pauvre (Novel)
+26816	Feuillet, Octave	Le roman d'un jeune homme pauvre (Play)
+26817	Feuillet, Octave	Julia de Trécoeur
+26821	Feuillet, Octave	La petite comtesse
+26823	Ennery, Adolphe d'	Michel Strogoff: Pièce à grand spectacle en 5 actes et 16 tableaux
+26824	Feuillet, Octave	Histoire de Sibylle
+26826	Buxy, B. de (Berthe de)	La Demoiselle au Bois Dormant
+26827	Pressensé, E. de, Mme.	Petite Mère
+26863	Stern, Daniel	Nélida; Hervé; Julien
+26868	Louÿs, Pierre	La femme et le pantin: roman espagnol
+26891	Bourget, Paul	L'eau profonde; Les pas dans les pas
+27186	Margueritte, Paul	Jours d'épreuve: Moeurs bourgeoises
+27283	Galopin, Arnould	Mémoires d'un cambrioleur retiré des affaires
+27296	Boylesve, René	La Becquée
+27303	Rosny, J.-H., aîné	Les Corneilles
+27304	Rosny, J.-H., aîné	Scènes préhistoriques
+27379	Lemaître, Jules	Les Contemporains, 5ème Série Études et Portraits Littéraires,
+27566	Adam, Paul	La Force Le Temps et la Vie
+27644	Souvestre, Émile	Au bord du lac L'Esclave, le Serf, le Chevrier de Lorraine, l'Apprenti
+27774	Daudet, Ernest	Fils d'émigré
+27806	Féval, Paul	Le dernier chevalier
+27831	Tellier, Jules	Les deux paradis d'Abd-Er-Rhaman
+27840	Dombre, Roger	Un tuteur embarrassé
+27843	Sue, Eugène	Les mystères du peuple, tome I Histoire d'une famille de prolétaires à travers les âges
+27844	Assollant, Alfred	La chasse aux lions
+27854	Rolland, Romain	Colas Breugnon: Récit bourguignon
+28113	Chantepleure, G. (Guy)	La passagère
+28124	Boylesve, René	Le Médecin des Dames de Néans
+28210	Barine, Arvède	Alfred de Musset
+28211	Clouard, Maurice	Alfred de Musset et George Sand dessins par Alfred de Musset
+28217	Stern, Daniel	Dante et Goethe : dialogues
+28286	Lemaître, Jules	Les Contemporains, 6ème Série Études et Portraits Littéraires
+28358	Auzias-Turenne, Raymond	Le roi du Klondike
+28523	Cherbuliez, Victor	Miss Rovel
+28623	Sand, George	Le poëme de Myrza - Hamlet
+28977	Sand, George	Cadio
+29094	Sue, Eugène	Les mystères du peuple, Tome III Histoire d'une famille de prolétaires à travers les âges
+29282	Souvestre, Émile	Un philosophe sous les toits
+29302	Rimbaud, Arthur	Poésies complètes, avec préface de Paul Verlaine et notes de l'éditeur
+29549	Hugo, Victor	Le Roi s'amuse
+29651	Sandeau, Jules	Mademoiselle de la Seiglière Comédie en quatre actes, en prose
+29843	Hugo, Victor	Les contemplations: Autrefois, 1830-1843
+29844	Hugo, Victor	Les contemplations: Aujourd'hui, 1843-1856
+29857	Cherbuliez, Victor	Jacquine Vanesse
+29900	Flat, Paul	Nos femmes de lettres
+29918	Lemaître, Jules	Les Contemporains, Quatrième Série Etudes et Portraits Littéraires
+30211	Rizal, José	Au Pays des Moines (Noli me Tangere)
+30226	Renard, Jules	Coquecigrues
+30317	Goncourt, Edmond de	La fille Elisa
+30553	Louÿs, Pierre	Les aventures du roi Pausole
+30582	Sue, Eugène	Atar-Gull, Un Corsaire, Le Parisien en Mer, Voyages et Aventures sur Mer de Narcisse Gelin. romans maritimes.
+30587	Maupassant, Guy de	La Femme de Paul
+30696	Gill, André	Vingt années de Paris
+30702	Bourget, Paul	Mensonges
+30703	Loti, Pierre	Fantôme d'Orient
+30831	Sand, George	Le Piccinino
+30915	Daudet, Ernest	Mon frère et moi; souvenirs d'enfance et de jeunesse
+31032	Ardel, Henri	Le chemin qui descend
+31054	Gaboriau, Emile	La clique dorée
+31069	Kock, Paul de	Jean
+31137	Maryan, M.	La Robe brodée d'argent
+31154	Bazin, René	Le Blé qui lève
+31440	Renan, Ernest	Souvenirs d'enfance et de jeunesse
+31817	Feuillet, Octave	Monsieur de Camors — Complet
+31863	Loti, Pierre	La troisième jeunesse de Madame Prune
+31904	Mérimée, Prosper	Lettres à M. Panizzi - 3eme édition, Tome I
+31939	Féval, Paul	Le Bossu: Aventures de Cape et d'Épée. Volume 1
+31983	Sue, Eugène	Les mystères du peuple, Tome IV Histoire d'une famille de prolétaires à travers les âges
+32113	Kock, Paul de	Madeleine
+32854	Leblanc, Maurice	Arsène Lupin, gentleman-cambrioleur
+33378	Adam, Paul	Au soleil de juillet (1829-1830) Le temps et la vie
+33422	Sardou, Victorien	Les diables noirs: drame en quatre actes
+33454	Sue, Eugène	Mathilde: mémoires d'une jeune femme
+33463	Anonymous	Le chat de la mère Michel: Complainte
+33580	Fournier, Edouard	Les caquets de l'accouchée nouvelle édition revue sur les pièces originales
+33595	Lafon-Labatut, Joseph	La femme du diable
+33738	Clouard, Maurice	Documents Inédits sur Alfred de Musset
+33746	Féval, Paul	Le Bossu: Aventures de Cape et d'Épée. Volume 2
+33808	Fromentin, Eugène	Dominique
+34008	Verhaeren, Emile	Poèmes: Les bords de la route. Les Flamandes. Les Moines
+34204	Sand, George	La petite Fadette
+34285	Gautier, Théophile	Partie carrée
+34301	Féval, Paul	Le Bossu: Aventures de Cape et d'Épée. Volume 3
+34354	Féval, Paul	Le Bossu: Aventures de Cape et d'Épée. Volume 4
+34364	Le Roy, Eugène	Le moulin du Frau
+34432	Kock, Paul de	L'enfant de ma femme
+34451	Zola, Émile	Paris
+34496	La Brète, Jean de	Aimer quand même
+34528	Zola, Émile	Rome
+34559	Féval, Paul	Le Bossu: Aventures de Cape et d'Épée. Volume 5
+34560	Tillier, Claude	Mon oncle Benjamin
+34564	Lecomte du Noüy, Hermine Oudinot	Maudit soit l'Amour!
+34648	Aimard, Gustave	Les terres d'or
+34692	Sandeau, Jules	Mademoiselle de la Seiglière, Volume 1 (of 2)
+34693	Sandeau, Jules	Mademoiselle de la Seiglière, Volume 2 (of 2)
+34872	Haussonville, comte d'	Mme de La Fayette (6e édition)
+35005	Robida, Albert	Les assiègés de Compiègne, 1430
+35103	Robida, Albert	Le Vingtième Siècle: La Vie Électrique
+35223	Goncourt, Edmond de	Quelques créatures de ce temps
+35319	Méry, Joseph	Le transporté (1/4)
+35498	Verhaeren, Emile	Les Rythmes souverains: Poèmes
+35568	Bloy, Léon	Le Désespéré
+35718	Karr, Alphonse	Clotilde
+35766	Enault, Louis	Christine
+35840	Marmette, Joseph	François de Bienville: Scènes de la Vie Canadienne au XVII siècle
+35979	Féval, Paul	Le Bossu: Aventures de Cape et d'Épée. Volume 6
+36001	Méry, Joseph	Le transporté (2/4)
+36086	Mahalin, Paul	L'hôtellerie sanglante
+36437	Souvestre, Émile	Le mari de madame de Solange
+36455	Pilastre, Édouard	Petit Glossaire des lettres de Madame de Sévigné
+36460	Aimard, Gustave	Cœur de panthère
+36477	France, Anatole	Les Dieux ont soif
+36482	Toulet, Paul Jean	La jeune fille verte, roman
+36510	Gaboriau, Emile	La vie infernale 1. Pascale et Marguerite; 2. Lia d'Argelès
+36528	Rachilde	Monsieur Vénus
+36780	Daudet, Alphonse	Lettres de mon moulin
+36812	Dumas, Alexandre	Création et rédemption, première partie: Le docteur mystérieux
+36814	Loti, Pierre	Le livre de la pitié et de la mort
+36894	Gaboriau, Emile	Les esclaves de Paris
+36900	Louÿs, Pierre	Archipel
+37051	Goncourt, Edmond de	Préfaces et manifestes littéraires
+37133	Maizeroy, René	La fête
+37138	Villiers de L'Isle-Adam, Auguste, comte de	Isis: Roman
+37183	Mahalin, Paul	La filleule de Lagardère; I La saltimbanque
+37184	Mahalin, Paul	La filleule de Lagardère; II L'héritière
+37305	Michel, Francisque	Roman d'Eustache le moine, pirate fameux du XIIIe siècle publié pour la première fois d'après un manuscrit de la bibliothèque royale
+37468	Bourget, Paul	Pastels: dix portraits de femmes
+37524	Jacob, P. L.	La dette de jeu (1572)
+37569	Karr, Alphonse	La Maison de l'Ogre
+37601	Féval, Paul	La fabrique de mariages, Vol. 1
+37733	Gautier, Théophile	Émaux et Camées
+37771	Dumas, Alexandre	Le comte de Moret
+37805	Rebell, Hugues	Les Nuits chaudes du Cap français
+37836	Janin, Jules Gabriel	Contes Fantastiques et Contes Littéraires
+37896	Souvestre, Émile	Les derniers paysans - Tome 2
+37989	Sand, George	Lettres d'un voyageur
+38074	Dupuy, Ernest	Victor Hugo, son oeuvre poétique
+38122	Féval, Paul	La fabrique de mariages, Vol. 2
+38225	Gozlan, Léon	Le notaire de Chantilly
+38316	Barbey d'Aurevilly, J. (Jules)	Le Chevalier des Touches
+38362	Gaboriau, Emile	Les amours d'une empoisonneuse
+38385	Karr, Alphonse	Voyage autour de mon jardin
+38435	Sue, Eugène	Le morne au diable
+38581	Dumur, Louis	Nach Paris! Roman
+38643	Karr, Alphonse	Bourdonnements
+38674	Verne, Jules	De la terre à la lune, trajet direct en 97 heures 20 minutes
+38712	Bourget, Paul	L'Écuyère
+38756	Karr, Alphonse	Geneviève
+38849	Maeterlinck, Maurice	L'oiseau bleu: Féerie en six actes et douze tableaux
+38971	Sue, Eugène	La coucaratcha (I/III)
+38996	Potter, Henry Austin	Dix contes modernes des meilleurs auteurs du jour
+39024	Sue, Eugène	La coucaratcha (II/III)
+39031	Gaboriau, Emile	La dégringolade
+39071	Saintine, X.-B. (Xavier-Boniface)	Picciola
+39101	Sand, George	Histoire de ma Vie, Livre 1 (Vol. 1 - 4)
+39311	Sue, Eugène	Les mystères du peuple, Tome V Histoire d'une famille de prolétaires à travers les âges
+39449	Féré, Octave	Les Mystères du Louvre
+39492	Blasco Ibáñez, Vicente	Les quatre cavaliers de l'apocalypse
+39637	Maeterlinck, Maurice	Les fiançailles: Féerie en cinq actes et onze tableaux
+39679	Kock, Paul de	André le Savoyard
+39694	Gyp	Bijou
+39738	Sand, George	Lélia
+39774	Gsell, Paul	Les gosses dans les ruines: Idylle de guerre
+39825	Sue, Eugène	La coucaratcha (III/III)
+39835	Blasco Ibáñez, Vicente	Les morts commandent
+40272	Rodenbach, Georges	L'élite: écrivains, orateurs sacrés, peintres, sculpteurs
+40694	Barbey d'Aurevilly, J. (Jules)	Philosophes et Écrivains Religieux
+40707	Karr, Alphonse	Midi à quatorze heures Histoire d'un voisin—Voyage dans Paris—Une visite à l'Arsenal—Un homme et une femme
+40763	Wright, Thomas	Les Cent Nouvelles Nouvelles, tome I
+40768	Wright, Thomas	Les Cent Nouvelles Nouvelles, tome II
+41065	Claretie, Jules	Les Femmes de proie. Mademoiselle Cachemire
+41100	Loti, Pierre	L'exilée
+41113	Féval, Paul	Annette Laïs
+41211	Balzac, Honoré de	La Comédie humaine - Volume 01
+41307	Chavette, Eugène	Nous marions Virginie
+41322	Sand, George	Histoire de ma Vie, Livre 2 (Vol. 5 - 9)
+41413	Lorrain, Jean	Monsieur de Phocas, Astarté: Roman
+41578	Nicolardot, Louis	L'Impeccable Théophile Gautier et les sacrilèges romantiques
+41984	Segalen, Victor	Les Immémoriaux
+42036	Bourges, Elémir	Le Crépuscule des Dieux
+42064	Bovet, Marie-Anne de	Après le divorce
+42192	Boisjoslin, Jacques de	Notes sur Laclos et Les Liaisons Dangereuses
+42256	Bédier, Joseph	Le roman de Tristan et Iseut
+42464	Fournier, Edouard	Variétés Historiques et Littéraires (01/10) Recueil de pièces volantes rares et curieuses en prose et en vers
+42472	Lepelletier, Edmond	Madame Sans-Gêne, Tome 1 Roman tiré de la Pièce de Mm. Victorien Sardou et Émile Moreau
+42563	Delpit, Édouard	Yvonne
+42592	Delpit, Albert	Le Fils de Coralie: Comédie en quatre actes en prose
+42594	Souvestre, Émile	Les réprouvés et les élus (t.2)
+42675	Féval, Paul	La fabrique de mariages, Vol. 3
+42743	Paris, Paulin	Les Romans de la Table Ronde (1 / 5) Mis en nouveau langage et accompagnés de recherches sur l'origine et le caractère de ces grandes compositions
+42765	Sand, George	Histoire de ma Vie, Livre 3 (Vol. 10 - 13)
+42896	Mérouvel, Charles	Angèle Méraud
+42924	Souvestre, Émile	Les réprouvés et les élus (t.1)
+43047	Delpit, Albert	Mademoiselle de Bressier
+43294	Pontmartin, Armand, comte de	Les Jeudis de Madame Charbonneau
+43408	Féval, Paul	Les belles-de-nuit; ou, les anges de la famille. tome 1
+43441	Kahn, Gustave	Symbolistes et Décadents
+43554	Féval, Paul	Les belles-de-nuit; ou, les anges de la famille. tome 4
+43676	Dumur, Louis	Pauline, ou la liberté de l'amour
+43698	Boussenard, Louis	Les français au pôle Nord
+43748	Bazin, René	Le Mariage de Mademoiselle Gimel, Dactylographe
+43767	Arène, Paul	La Chèvre d'Or
+43782	Rebell, Hugues	Gringalette
+43787	Bazin, René	Madame Corentine
+43851	Balzac, Honoré de	La Comédie humaine - Volume 02
+43889	Sand, George	La Coupe; Lupo Liverani; Le Toast; Garnier; Le Contrebandier; La Rêverie à Paris
+43923	Aimard, Gustave	Le lion du désert: Scènes de la vie indienne dans les prairies
+43960	Aimard, Gustave	Les Forestiers du Michigan
+43980	Lepelletier, Edmond	Madame Sans-Gêne, Tome 3 Le Roi de Rome
+44023	Le Goffic, Charles	Les Romanciers d'Aujourd'hui
+44139	Mirbeau, Octave	Le Calvaire
+44160	Gautier, Théophile	Émaux et camées
+44161	Bourget, Paul	Un Coeur de femme
+44180	Gautier, Théophile	Poésies Complètes - Tome 1
+44198	Vigny, Alfred de	Cinq-Mars; ou, Une conjuration sous Louis XIII (Tome 1 of 2)
+44199	Vigny, Alfred de	Cinq-Mars; ou, Une conjuration sous Louis XIII (Tome 2 of 2)
+44236	Bazin, René	La Sarcelle Bleue
+44255	Renard, Jules	Histoires naturelles
+44260	Vandérem, Fernand	Les Deux Rives: Roman
+44359	Quillard, Pierre	La lyre héroïque et dolente
+44467	Gourmont, Remy de	Un cœur virginal
+44468	Vandérem, Fernand	Charlie
+44483	Nion, François de	Bellefleur: Roman d'un comédien au XVIIe siècle
+44613	Féval, Paul	Les belles-de-nuit; ou, les anges de la famille. tome 2
+44620	Gaboriau, Emile	Le crime d'Orcival
+44715	Aimard, Gustave	Le Guaranis
+44723	Gasté, Armand	Diderot et le Curé de Montchauvet Une mystification littéraire chez le baron d'Holbach, 1754
+44762	Lesueur, Daniel	Chacune son Rêve
+44807	Vandérem, Fernand	Baudelaire et Sainte-Beuve
+44874	Féval, Paul	Les belles-de-nuit; ou, les anges de la famille. tome 3
+44911	Bourget, Paul	Cruelle Énigme
+45058	Verne, Jules	Les tribulations d'un chinois en Chine
+45060	Balzac, Honoré de	La Comédie humaine - Volume 03
+45119	Maupassant, Guy de	Œuvres complètes de Guy de Maupassant - volume 01
+45207	Malot, Hector	Anie Illustrated version
+45212	Paris, Paulin	Les Romans de la Table Ronde (3 / 5) Mis en nouveau langage et accompagnés de recherches sur l'origine et le caractère de ces grandes compositions
+45213	Paris, Paulin	Les Romans de la Table Ronde (4/ 5) Mis en nouveau langage et accompagnés de recherches sur l'origine et le caractère de ces grandes compositions
+45312	Maupassant, Guy de	Œuvres complètes de Guy de Maupassant - volume 02
+45468	Verhaeren, Emile	Les Heures du Soir - Précédées de les Heures claires, Les Heures d'après-midi
+45590	Verhaeren, Emile	Les Villes tentaculaires, précédées des Campagnes hallucinées
+45633	Féval, Paul	Les belles-de-nuit; ou, les anges de la famille. tome 5
+45753	Sand, George	Tamaris
+45886	Gautier, Théophile	Poésies Complètes - Tome 2
+45969	Gréville, Henry	Ariadne
+45970	Rolland, Romain	L'âme enchantée I: Annette et Sylvie
+45979	Corday, Michel	Les casseurs de bois
+46111	Verne, Jules	Autour de la lune
+46183	Goncourt, Edmond de	La maison d'un artiste, Tome 1
+46253	Gaboriau, Emile	Mariages d'aventure
+46285	Anonymous	L'ancien Figaro
+46364	Girardin, Emile de, Mme	Essais poétiques
+46387	Maupassant, Guy de	Œuvres complètes de Guy de Maupassant - volume 03
+46470	Maupassant, Guy de	Œuvres complètes de Guy de Maupassant - volume 04
+46541	Verne, Jules	Le Tour du monde en quatre-vingts jours
+46604	Gaboriau, Emile	Le 13e Hussards, types, profils, esquisses et croquis militaires... á pied et á cheval
+46687	Gilbert de Voisins, Auguste	Les jardins, le faune et le poète
+46718	Delvau, Alfred	Au bord de la Bièvre: impressions et souvenirs
+46747	Dumas, Alexandre	Gabriel Lambert
+46837	Rod, Édouard	A Propos de l'Assommoir
+46842	Barrès, Maurice	Un jardin sur l'Oronte
+46902	Reybaud, Louis	Le dernier des commis voyageurs.
+46907	Gautier, Judith	Le Dragon Impérial
+47042	Gaboriau, Emile	Le petit vieux des Batignolles
+47062	Gautier, Judith	La fille du ciel: Drame Chinois
+47131	Gautier, Judith	Le paravent de soie et d'or
+47171	Goncourt, Edmond de	La maison d'un artiste, Tome 2
+47188	Gautier, Judith	Le collier des jours: Souvenirs de ma vie
+47207	Corday, Michel	Plaisirs d'auto
+47321	Ponson du Terrail	Les cavaliers de la nuit, 1er partie (t. 1/4)
+47324	Lesueur, Daniel	Poésies de Daniel Lesueur
+47350	Gaboriau, Emile	Le capitaine Coutanceau
+47360	Gautier, Judith	Le collier des jours: Le second rang du collier
+47468	Fournier, Edouard	Variétés Historiques et Littéraires (02/10) Recueil de pièces volantes rares et curieuses en prose et en vers
+47469	Fournier, Edouard	Variétés Historiques et Littéraires (03/10) Recueil de pièces volantes rares et curieuses en prose et en vers
+47479	Ryner, Han	Le massacre des amazones: études critiques sur deux cents bas-bleus contemporains
+47632	Méténier, Oscar	Les voyous au théâtre (Histoire de deux pièces)
+47712	Farrère, Claude	Les civilisés: Roman
+47717	Lano, Pierre de	Carnet d'une femme
+47743	Gebhart, Emile	Les origines de la Renaissance en Italie
+47802	Ponson du Terrail	Les cavaliers de la nuit, deuxième partie (t. 3/4)
+47903	Aimard, Gustave	L'éclaireur
+47982	Farrère, Claude	Les petites alliées
+47984	Reybaud, Louis	Le Capitaine Martin; ou, les Trois croisières
+47986	Reybaud, Louis	Les Aventures d'un fifre.
+47987	Reybaud, Louis	Les Idoles d'argile.
+48082	Balzac, Honoré de	La Comédie humaine - Volume 04
+48212	Barbusse, Henri	Le feu (Journal d'une Escouade)
+48279	Gobineau, Arthur, comte de	Nouvelles Asiatiques
+48282	Ponson du Terrail	Les cavaliers de la nuit, deuxième partie (t. 4/4)
+48359	Flaubert, Gustave	Œuvres complètes de Gustave Flaubert, tome 1 (of 8): Madame Bovary
+48368	Maeterlinck, Maurice	Théâtre 1 La Princesse Maleine (1890) - L'Intruse (1890) - Les Aveugles (1891)
+48401	Fournier, Edouard	Variétés Historiques et Littéraires (04/10) Recueil de pièces volantes rares et curieuses en prose et en vers
+48421	Fournier, Edouard	Variétés Historiques et Littéraires (05/10) Recueil de pièces volantes rares et curieuses en prose et en vers
+48432	Farrère, Claude	L'homme qui assassina: Roman
+48477	Fournier, Edouard	Variétés Historiques et Littéraires (06/10) Recueil de piéces volantes rares et curieuses en prose et en vers
+48518	Villiers de L'Isle-Adam, Auguste, comte de	Chez les passants: fantaisies, pamphlets et souvenirs. Suivi de pages inédites
+48519	Fournier, Edouard	Variétés Historiques et Littéraires (07/10) Recueil de pièces volantes rares et curieuses en prose et en vers
+48520	Fournier, Edouard	Variétés Historiques et Littéraires (09/10) Recueil de piéces volantes rares et curieuses en prose et en vers
+48581	Fournier, Edouard	Variétés Historiques et Littéraires (10/10) Recueil de pièces volantes rares et curieuses en prose et en vers
+48650	Ponson du Terrail	Les cavaliers de la nuit, 1er partie (t. 2/4)
+48781	Villiers de L'Isle-Adam, Auguste, comte de	Histoires insolites
+48830	Rachilde	Le Démon de l'Absurde
+48881	Flaubert, Gustave	Œuvres complètes de Gustave Flaubert, tome 2: Salammbô
+49293	Farrère, Claude	La maison des hommes vivants
+49312	Souvestre, Émile	Les derniers paysans - Tome 1
+49482	Balzac, Honoré de	La Comédie humaine - Volume 05. Scènes de la vie de Province - Tome 01
+49502	Fournier, Edouard	Variétés Historiques et Littéraires (08/10) Recueil de pièces volantes rares et curieuses en prose et en vers
+49573	Desprez, Ernest	Un enfant, t. 1/3
+49574	Desprez, Ernest	Un enfant, t. 2/3
+49575	Desprez, Ernest	Un enfant, t. 3/3
+49619	Aimard, Gustave	Les nuits mexicaines
+49712	Schwob, Marcel	Vies imaginaires
+49743	Philippe, Charles-Louis	La mère et l'enfant
+49761	Schwob, Marcel	Le Roi au Masque d'Or
+49773	Flaubert, Gustave	Œuvres complètes de Gustave Flaubert, tome 3: L'éducation sentimentale, v. 1
+49783	Rachilde	La Marquise de Sade
+49813	Hannon, Théodore	Au clair de la dune
+49887	Barney, Natalie Clifford	Pensées d'une amazone
+49943	Schwob, Marcel	Spicilège
+50007	Margueritte, V. (Victor)	La garçonne
+50144	Maupassant, Guy de	Œuvres complètes de Guy de Maupassant - volume 05
+50154	Daudet, Alphonse	Contes de lundi
+50208	Farrère, Claude	La Bataille
+50267	Pitollet, Camille	V. Blasco Ibáñez, ses romans et le roman de sa vie
+50278	Méténier, Oscar	Barbe-bleue
+50435	Boylesve, René	La jeune fille bien élevée
+50521	Lesueur, Daniel	Haine d'amour
+50580	La Jeunesse, Ernest	Sérénissime: roman contemporain
+50594	Chevassu, Francis	Visages
+50655	Rameau, Jean	Yan
+50664	France, Anatole	Clio
+50725	Lesueur, Daniel	Le mariage de Gabrielle
+50743	Borel, Pétrus	Madame Putiphar, vol 1 e 2
+50838	Cosquin, Emmanuel	Contes populaires de Lorraine, comparés avec les contes des autres provinces de France et des pays étrangers, volume 2 (of 2)
+50926	Cim, Albert	Récréations littéraires, curiosités et singularités, bévues et lapsus, etc.
+50930	Biré, Edmond	Armand de Pontmartin, sa vie et ses oeuvres, 1811-1890
+50997	Lesueur, Daniel	Le marquis de Valcor
+51012	Claudel, Paul	L'otage: Drame en trois actes
+51013	Claudel, Paul	Le pain dur: Drame en trois actes
+51014	Claudel, Paul	Le père humilié: Drame en quatre actes
+51083	Lesueur, Daniel	Le meurtre d'une âme
+51144	Aimard, Gustave	Le Montonéro
+51156	Séché, Léon	Delphine Gay, Mme de Girardin, dans ses rapports avec Lamartine, Victor Hugo, Balzac, Rachel, Jules Sandeau, Dumas, Eugène Sue et George Sand (documents inédits)
+51162	Beaunier, André	Picrate et Siméon
+51178	Dumur, Louis	Albert
+51179	Fabre, Ferdinand	Barnabé
+51225	Boylesve, René	Madeleine, jeune femme
+51227	Cim, Albert	Émancipées
+51266	Maupassant, Guy de	Œuvres complètes de Guy de Maupassant - volume 06
+51269	La Jeunesse, Ernest	L'Holocauste: Roman Contemporain
+51313	Loti, Pierre	La chanson des vieux époux
+51373	Vandérem, Fernand	La victime
+51381	Balzac, Honoré de	La Comédie humaine - Volume 06. Scènes de la vie de Province - Tome 02
+51405	Noriac, Jules	La bêtise humaine (Eusèbe Martin)
+51423	Maupassant, Guy de	Œuvres complètes de Guy de Maupassant - volume 07
+51505	Stapfer, Paul	Molière et Shakespeare
+51515	Lesueur, Daniel	Madame de Ferneuse
+51591	Lesueur, Daniel	Justice de femme
+51632	Gautier, Théophile	Romans et contes
+51659	Lesueur, Daniel	Le droit à la force
+51666	Montesquiou-Fézensac, Robert, comte de	La petite mademoiselle
+51703	Corday, Michel	Les révélées: roman
+51709	About, Edmond	Le nez d'un notaire
+51725	Louÿs, Pierre	Sanguines
+51787	Borel, Pétrus	Champavert: contes immoraux
+51826	Blanche, Jacques-Émile	Aymeris
+51876	Kolney, Fernand	Le salon de Madame Truphot: moeurs littéraires
+51977	Gautier, Théophile	Victor Hugo
+52065	Gilbert de Voisins, Auguste	Les moments perdus de John Shag
+52123	Verhaeren, Emile	Poèmes (nouvelle série): Les soirs, Les débacles, Les flambeaux noirs
+52520	Véron, Pierre	Le panthéon de poche
+52565	Gourmont, Remy de	Le chat de misère: Idées et images
+52585	Vandérem, Fernand	La Cendre: Roman
+52635	Brada	Leurs Excellences
+52753	Maupassant, Guy de	Œuvres complètes de Guy de Maupassant - volume 08
+52829	Du Genestoux, Magdeleine	Noémie Hollemechette: Journal d'une petite réfugiée belge
+52831	Balzac, Honoré de	La Comédie humaine - Volume 07. Scènes de la vie de Province - Tome 03
+52893	Flaubert, Gustave	Œuvres complètes de Gustave Flaubert, tome 4: L'éducation sentimentale, v. 2
+52919	Lorrain, Jean	Âmes d'automne
+52927	Homer	L'Odyssée
+52929	Aubenas, Joseph-Adolphe	Mémoires touchant la vie et les écrits de Marie de Rabutin-Chantal, (6/6)
+52933	Flammarion, Camille	Uranie
+53247	Maupassant, Guy de	Œuvres complètes de Guy de Maupassant - volume 09
+53331	Génin, F. (François)	Lexique comparé de la langue de Molière et des écrivains du XVIIe siècle
+53374	Schwob, Marcel	Le livre de Monelle
+53399	Gautier, Théophile	Honoré de Balzac
+53564	Lesueur, Daniel	Amour d'aujourd'hui
+53599	Farrère, Claude	L'extraordinaire aventure d'Achmet Pacha Djemaleddine, pirate, amiral, grand d'Espagne et marquis avec six autres singulières histoires
+53710	Tennyson, Alfred Tennyson, Baron	Genièvre
+54002	Bourget, Paul	La duchesse bleue
+54231	Méténier, Oscar	La casserole: drame en un acte, en prose
+54387	Villiers de L'Isle-Adam, Auguste, comte de	Histoires souveraines
+54393	Gide, André	Prétextes: Réflexions sur quelques points de littérature et de morale
+54419	Haraucourt, Edmond	La Légende des sexes: Poëmes hystériques
+54456	Baudelaire, Charles	De l'amour
+54659	Gourmont, Remy de	Les chevaux de Diomède: Roman
+54723	Balzac, Honoré de	La Comédie humaine - Volume 08. Scènes de la vie de Province - Tome 04
+54873	Verne, Jules	Vingt mille lieues sous les mers
+54952	Theuriet, André	Chanteraine
+55028	La Jeunesse, Ernest	L'Holocauste: Roman Contemporain
+55072	Bourget, Paul	La dame qui a perdu son peintre
+55111	Farrère, Claude	Dix-sept histoires de marins
+55135	Verne, Jules	P'tit-bonhomme
+55167	Maupassant, Guy de	Œuvres complètes de Guy de Maupassant - volume 10
+55259	Schwob, Marcel	La porte des rêves
+55517	Zola, Émile	Correspondance: Lettres de jeunesse
+55533	Apollinaire, Guillaume	Le flâneur des deux rives
+55554	Nerval, Gérard de	Le rêve et la vie - Les filles du feu - La bohème galante
+55855	Byvanck, W. G. C. (Willem Geertrudus Cornelis)	Un hollandais à Paris en 1891: Sensations de littérature et d'art
+55860	Balzac, Honoré de	La Comédie humaine - Volume 09. Scènes de la vie parisienne - Tome 01
+56054	Dumas, Alexandre	Les trois mousquetaires, Volume 1 (of 2)
+56149	Huysmans, J.-K. (Joris-Karl)	A rebours
+56309	Lepelletier, Edmond	Madame Sans-Gêne, Tome 2 La Maréchale
+56374	Maupassant, Guy de	Œuvres complètes de Guy de Maupassant - volume 11
+56393	Aicard, Jean	Maurin des Maures
+56473	Mérimée, Prosper	Lettres à une inconnue, Tome Premier Précédée d'une étude sur P. Mérimée par H. Taine
+56474	Mérimée, Prosper	Lettres à une inconnue, Tome Deuxième Précédée d'une étude sur P. Mérimée par H. Taine
+56515	Valois, Léonise	Fleurs sauvages: Poésies
+56523	Maupassant, Guy de	Œuvres complètes de Guy de Maupassant - volume 12
+56622	Zola, Émile	Correspondance: Les lettres et les arts
+56645	Apollinaire, Guillaume	Le poète assassiné
+56668	Rimbaud, Arthur	Une saison en enfer
+56708	Rimbaud, Arthur	Oeuvres de Arthur Rimbaud: Vers et proses Revues sur les manuscrits originaux et les premières éditions mises en ordre et annotées par Paterne Berrichon; poèmes retrouvés
+56820	Boulenger, Marcel	Couplées: Roman
+56952	Picabia, Francis	Poèmes et dessins de la fille née sans mère: 18 dessins, 51 poèmes
+57023	Péguy, Charles	Oeuvres complètes de Charles Péguy (tome 1)
+57075	Stahl, P.-J.	Vie privée et publique des animaux
+57262	Ponson du Terrail	Diane de Lancy; Les pretendus de la meunière
+57360	Lima, Oliveira	Machado de Assis, Son Oeuvre Littéraire
+57373	Flaubert, Gustave	Œuvres complètes de Gustave Flaubert, tome 5: La tentation de saint Antoine
+57420	Farrère, Claude	Bêtes et gens qui s'aimèrent
+57429	Bourget, Paul	Nouveaux Pastels (Dix portraits d'hommes)
+57430	Maupassant, Guy de	Œuvres complètes de Guy de Maupassant - volume 13
+57506	Péguy, Charles	Oeuvres complètes de Charles Péguy, Oeuvres de poésie (tome 6) Le Mystère des Saints Innocents; La tapisserie de sainte Geneviève et de Jeanne d'Arc; La tapisserie de Notre-Dame.
+57525	Flaubert, Gustave	Œuvres complètes de Gustave Flaubert, tome 6: Trois contes, suivis de mélanges inédits
+57567	Maupassant, Guy de	Œuvres complètes de Guy de Maupassant - volume 14
+57607	Féval, Paul	La fabrique de mariages, Vol. 4
+57687	Rosny, J.-H., aîné	La Mort de la Terre, roman, suivi de contes
+57712	Gourmont, Remy de	Proses moroses
+57743	Féval, Paul	La fabrique de mariages, Vol. 5
+57762	Rostand, Edmond	Les Musardises
+57775	Mirbeau, Octave	Le jardin des supplices
+57839	Rostand, Edmond	Les Romanesques: comédie en trois actes en vers
+57856	Féval, Paul	La fabrique de mariages, Vol. 6
+57866	La Jeunesse, Ernest	Le forçat honoraire: roman immoral
+57892	Cosquin, Emmanuel	Contes populaires de Lorraine, comparés avec les contes des autres provinces de France et des pays étrangers, volume 1 (of 2)
+58069	Aimard, Gustave	Les chasseurs mexicains: Scènes de la vie mexicaine
+58084	Aimard, Gustave	Cardenio: Scènes de la Vie Mexicaine
+58088	Corbière, Edouard	Les trois pirates (1/2)
+58090	Corbière, Edouard	Les trois pirates (2/2)
+58154	Apollinaire, Guillaume	La femme assise
+58211	Dumas, Alexandre	Les trois mousquetaires, Volume 2 (of 2)
+58244	Balzac, Honoré de	La Comédie humaine - Volume 10. Scènes de la vie parisienne - Tome 02
+58254	Anonymous	Histoire de Mlle Brion dite Comtesse de Launay (1754) Introduction, Essai bibliographique par Guillaume Apollinaire
+58259	Haraucourt, Edmond	Amis
+58260	Rostand, Edmond	La Samaritaine, évangile en trois tableaux, en vers
+58265	Rostand, Edmond	La dernière nuit de Don Juan: poème dramatique en deux parties et un prologue
+58299	Sand, George	Evenor et Leucippe: Les amours de l'Âge d'Or; Légende antidéluvienne
+58309	Gourmont, Remy de	Lettres d'un satyre
+58427	Dumas, Alexandre	La San-Felice, Tome 07, Emma Lyonna, tome 3
+58476	Rostand, Edmond	Un soir à Hernani, 26 février 1902
+58501	Audoux, Marguerite	L'Atelier de Marie-Claire
+58698	Proust, Marcel	Les plaisirs et les jours
+59151	Bernard, Charles de	Gerfaut
+59926	Colette	Le blé en herbe: roman
+59992	Lorrain, Jean	La mandragore
+60080	Boulenger, Marcel	Le fourbe
+60199	Apollinaire, Guillaume	Le bestiaire: ou, Cortège d'Orphée
+60354	Hugo, Victor	Ruy Blas: Drame
+60450	Verne, Jules	Les naufragés du Jonathan
+60551	Balzac, Honoré de	La Comédie humaine - Volume 11. Scènes de la vie parisienne - Tome 03
+60610	Maupassant, Guy de	Œuvres complètes de Guy de Maupassant - volume 15
+60618	Le Glay, Edward	Fragments d'épopées romanes du XIIe siècle traduits et annotés par Edward le Glay
+60666	Rolland, Romain	L'âme enchantée II: L'été
+60680	Arène, Paul	La gueuse parfumée: Récits provençaux
+60720	Proust, Marcel	La Prisonnière (Sodome et Gomorrhe III)
+60738	Lesueur, Daniel	Un mystérieux amour
+60739	Fourest, Georges	La négresse blonde Cinquième hypostase, avec soixante-quinze Tatouages de Lucien Métivet
+60746	Gautier, Théophile	Le capitaine Fracasse
+60752	Le Braz, Anatole	Pâques d'Islande
+60798	Gourmont, Remy de	La petite Ville; Paysages
+60812	Sand, George	Adriani
+60821	Huysmans, J.-K. (Joris-Karl)	En ménage
+60841	Bourges, Elémir	Les oiseaux s'envolent et les fleurs tombent
+60847	Machado de Assis	Mémoires Posthumes de Braz Cubas
+60891	Souvestre, Émile	Le monde tel qu'il sera
+60896	Liseux, Isidore	Le petit-neveu de Grécourt, ou, Étrennes gaillardes Recueil de Contes en vers, réimprimés sur l'édition de 1782
+60924	Noriac, Jules	Paris tel qu'il est
+60986	Grasset, J. (Joseph)	L'idée médicale dans les romans de Paul Bourget
+60998	Fourest, Georges	Contes pour les satyres
+61035	Ternaux-Compans, Henri	Les aventures de Don Juan de Vargas, racontées par lui-même Traduites de l'espagnol sur le manuscrit inédit par Charles Navarin
+61039	Verlaine, Paul	Poésies religieuses Préface de J. K. Huÿsmans
+61108	Barrès, Maurice	Amori et dolori sacrum: La mort de Venise
+61227	Le Roy, Eugène	Jacquou le Croquant
+61270	Lorrain, Jean	Poussières de Paris
+61274	Rosny, J.-H., aîné	La Guerre du Feu: Roman des âges farouches
+61318	Monselet, Charles	Les amours du temps passé
+61351	Boylesve, René	La leçon d'amour dans un parc
+61404	Barrès, Maurice	Trois Stations de psychothérapie
+61411	Sand, George	Le beau Laurence
+61418	Adam, Paul	La glèbe
+61460	Blasco Ibáñez, Vicente	Contes espagnols d'amour et de mort
+61472	Montesquiou-Fézensac, Robert, comte de	Autels privilégiés
+61485	Kerviler, René Pocard du Cosquer de	J. Ogier de Gombauld, 1570-1666 étude biographique et littéraire sur sa vie et ses ouvrages
+61489	Haraucourt, Edmond	Les naufragés
+61524	Haraucourt, Edmond	Dieudonat: Roman
+61527	Barrès, Maurice	La colline inspirée
+61538	Tailhade, Laurent	Le Troupeau d'Aristée
+61565	Baudelaire, Charles	L'Oeuvre Poètique de Charles Baudelaire: Les Fleurs du Mal
+61627	Boulenger, Marcel	Au pays de Sylvie
+61642	Gourmont, Remy de	Le songe d'une femme: roman familier
+61675	Lorrain, Jean	Ellen
+61718	Le Braz, Anatole	Le sang de la sirène
+61747	Loti, Pierre	Un Jeune Officier Pauvre fragments de journal intime rassemblés par son fils, Samuel Viaud.
+61768	Boylesve, René	La poudre aux yeux
+61868	Rolland, Romain	Jean-Christophe Volume 1 L'Aube, Le Matin, L'Adolescent
+61876	Rolland, Romain	Jean-Christophe, Volume 2 La Révolte, La Foire sur la Place
+61970	Rolland, Romain	Jean-Christophe Volume 3 Antoinette, Dans la maison, Les Amies
+62021	Rolland, Romain	Jean-Christophe, Volume 4 Le Buisson Ardent, La Nouvelle Journée
+62100	Proust, Marcel	Un amour de Swann
+62114	Maeterlinck, Maurice	L'intelligence des fleurs
+62179	Silvestre, Armand	Le Petit Art d'Aimer en quatorze chapitres
+62196	Houssaye, Arsène	Le roi Voltaire
+62215	Leroux, Gaston	Le Fantôme de l'Opéra
+62272	Le Braz, Anatole	Vieilles Histoires du Pays Breton
+62281	D'Annunzio, Gabriele	Le Martyre de Saint Sébastien
+62289	Dupré-Carra, Léon	Le trésor des équivoques, antistrophes, ou contrepéteries
+62393	Schwob, Marcel	Oeuvres de Marcel Schwob. Volume 1 of 2, Spicilège
+62787	Sand, George	Mauprat
+62874	Villiers de L'Isle-Adam, Auguste, comte de	Contes cruels
+62960	Sandeau, Jules	Jean de Thommeray; Le colonel Evrard
+63137	Montesquiou-Fézensac, Robert, comte de	La trépidation
+63147	Gourmont, Remy de	Histoires magiques
+63167	Moréas, Jean	Le thé chez Miranda
+63179	Goncourt, Edmond de	Manette Salomon
+63187	Maeterlinck, Maurice	Les sentiers dans la montagne
+63206	Boylesve, René	L'enfant à la balustrade
+63220	Corbière, Edouard	Le Banian, roman maritime (1/2)
+63244	Gautier, Théophile	Les Jeunes-France: romans goguenards; suivis de Contes humoristiques
+63259	Corbière, Edouard	Le Banian, roman maritime (2/2)
+63267	About, Edmond	Dernières lettres d'un bon jeune homme à sa cousine Madeleine
+63285	Villiers de L'Isle-Adam, Auguste, comte de	Nouveaux contes cruels et propos d'au delà
+63296	Schwob, Marcel	Oeuvres de Marcel Schwob. Volume 2 of 2, La lampe de Psyché; Il libro della mia memoria
+63303	Lorrain, Jean	Le crime des riches
+63470	Monselet, Charles	Les vignes du Seigneur
+63543	Monselet, Charles	Les femmes qui font des scènes
+63634	Barbey d'Aurevilly, J. (Jules)	L'Amour impossible; La bague d'Annibal
+63646	Guillaumin, Émile	La Vie d'un Simple (Mémoires d'un Métayer)
+63647	Boylesve, René	La marchande de petits pains pour les canards
+63661	Tailhade, Laurent	Au Pays du Mufle: Ballades et Quatorzains
+63674	Richepin, Jean	La Glu
+63712	Melegari, Dora	Expiation
+63734	Gyp	Le mariage de Chiffon
+63762	Boylesve, René	Nymphes dansant avec des satyres
+63768	Hugo, Victor	Post-scriptum de ma vie
+63773	Doff, Neel	Jours de famine et de détresse: roman
+63794	France, Anatole	La comédie de celui qui épousa une femme muette
+63881	Gourmont, Remy de	Couleurs. Contes nouveaux; suivis de Choses anciennes
+63905	Noailles, Anna de	La Domination
+63914	Brada	Lettres d'une amoureuse
+63937	About, Edmond	Tolla
+63951	About, Edmond	Les mariages de province La fille du chanoine, Mainfroi, L'album du régiment, Étienne.
+63979	About, Edmond	L'infâme
+64023	Haraucourt, Edmond	La peur
+64065	Gilbert de Voisins, Auguste	Le Bar de la Fourche
+64067	Véron, Pierre	Les gens de théâtre
+64084	Moréas, Jean	Les demoiselles Goubert: mœurs de Paris
+64086	Pouvillon, Emile	L'image
+64091	Gilbert de Voisins, Auguste	L'esprit impur: roman
+64116	Rochefort, Henri	La Mal'aria: Etude Sociale
+64119	Lesueur, Daniel	Lèvres closes
+64144	Margueritte, Paul	Femmes nouvelles
+64145	Proust, Marcel	Pastiches et mélanges
+64168	Mérimée, Prosper	Lettres à M. Panizzi, tome II
+64202	About, Edmond	Les mariages de Paris
+64222	Maizeroy, René	L'amour prodigue
+64290	Faure, Gabriel	Paysages Passionnés
+64305	Montfort, Eugène	Chair
+64423	Lorrain, Jean	L'école des vieilles femmes
+64427	Proust, Marcel	Albertine disparue Vol 1 (of 2) À la recherche du temps perdu, Tome 7
+64428	Proust, Marcel	Albertine disparue Vol 2 (of 2) À la recherche du temps perdu, Tome 7
+64582	Jammes, Francis	Les Robinsons basques
+64674	Barbey d'Aurevilly, J. (Jules)	L'ensorcelée
+64719	Maeterlinck, Maurice	Le trésor des humbles
+64729	Gilbert de Voisins, Auguste	Le jour naissant
+64776	Snell, Victor	Le Jardin de Marrès par Bérénice
+64787	Tailhade, Laurent	La Douleur; Le vrai mistère de la Passion
+64798	Frapié, Léon	La Maternelle
+64821	Colet, Louise	Lui: Roman contemporain
+64838	Pouvillon, Emile	Le vœu d'être chaste: roman
+64853	Brada	Madame d'Épone
+64862	Rostand, Edmond	La Princesse lointaine: Pièce en quatre actes, en vers
+64886	Frapié, Léon	La Manifestante
+64902	Boylesve, René	Élise
+64912	Boulenger, Marcel	Lettres de Chantilly
+64913	Boylesve, René	Les nouvelles leçons d'amour dans un parc
+64920	Gourmont, Remy de	D'un pays lointain: Miracles; Visages de femmes; Anecdotes
+64939	Gourmont, Remy de	Divertissements: poèmes en vers
+64983	Boylesve, René	Mon amour
+65025	Lichtenberger, André	La petite sœur de Trott
+65031	Boylesve, René	Le meilleur ami
+65052	Magre, Maurice	Conseils à un Jeune Homme pauvre qui vient faire de la littérature à Paris
+65059	Maeterlinck, Maurice	Le temple enseveli
+65096	Doff, Neel	Keetje
+65105	Doff, Neel	Keetje Trottin
+65109	Magre, Maurice	Les colombes poignardées: roman
+65111	Flaubert, Gustave	Œuvres de jeunesse inédites. II: 1839-1842. Œuvres diverses.—Novembre.
+65118	Jammes, Francis	Cloches pour deux mariages: le mariage basque; le mariage de raison
+65150	Willy	Souvenirs littéraires... et autres
+65178	Coulevain, Pierre de	Ève victorieuse
+65183	Corbière, Edouard	Les Aspirans de marine, volume 1
+65187	Hermant, Abel	Les Confidences d'une Biche, 1859-1871
+65219	Gilbert de Voisins, Auguste	Pour l'Amour du Laurier: Roman
+65224	Valéry, Paul	Variété I
+65263	Corbière, Edouard	Les Aspirans de marine, volume 2
+65349	Magre, Maurice	La conquête des femmes: Conseils à un jeune homme
+65403	Gourmont, Remy de	La fin de l'art
+65449	Gourmont, Remy de	Dissociations
+65457	Jean, d'Arras, active 14th century	Mélusine Nouvelle édition, conforme à celle de 1478, revue et corrigée
+65491	Haraucourt, Edmond	Le poison
+65494	Lemonnier, Camille	Au Coeur Frais de la Forêt: Roman
+65522	Moréas, Jean	Les Syrtes (1883-1884)
+65546	About, Edmond	Le Turco
+65578	Anet, Claude	Adolescence
+65845	Rosny, J.-H., aîné	Les Xipéhuz
+65878	Leroux, Gaston	La Poupée Sanglante
+65969	Montesquiou-Fézensac, Robert, comte de	Félicité: Étude sur la poésie de Marceline Desbordes-Valmore
+66035	Gagneur, M.-L. (Marie-Louise)	Le Calvaire des Femmes
+66505	Flaubert, Gustave	Œuvres complètes de Gustave Flaubert, tome 7: Bouvard et Pécuchet
+66645	Schultz, Jeanne	La neuvaine de Colette
+66652	Lemonnier, Camille	La petite femme de la mer
+66681	Mirbeau, Octave	Chez l'illustre Écrivain
+66695	Guilbert, Yvette	La Vedette
+66704	Schultz, Jeanne	Jean de Kerdren
+66725	Theuriet, André	Sauvageonne
+66761	Réval, Gabrielle	Les Sèvriennes
+66781	Féret, Charles-Théophile	Le Bourdeau des neuf pucelles
+66793	Rostand, Edmond	L'Aiglon: Drame en six actes, en vers
+66795	Thaly, Daniel	L'Ile et le voyage: petite odyssée d'un poète lointain
+66805	Morel, Jacques	Feuilles mortes
+66810	Anet, Claude	L'amour en Russie
+66817	Maeterlinck, Maurice	Le Double Jardin
+66827	Tailhade, Laurent	Le paillasson: Mœurs de province
+66834	Dufay, Pierre	Victor Hugo à vingt ans: Glanes romantiques
+66852	Franc-Nohain	La nouvelle cuisinière bourgeoise: Plaisirs de la table et soucis du ménage
+66927	About, Edmond	Lettres d'un bon jeune homme à sa cousine Madeleine
+66985	Maeterlinck, Maurice	Deux contes: Le massacre des Innocents; Onirologie.
+67024	Maupassant, Guy de	Œuvres complètes de Guy de Maupassant - volume 16
+67074	Maupassant, Guy de	Œuvres complètes de Guy de Maupassant - volume 17
+67099	Aicard, Jean	Arlette des Mayons: Roman de la terre et de l'école
+67102	Anet, Claude	Ariane, jeune fille russe
+67158	Maupassant, Guy de	Œuvres complètes de Guy de Maupassant - volume 18
+67243	Tinayre, Marcelle	La Rebelle
+67245	Mille, Pierre	Sur la vaste Terre
+67252	Viollet, Alphonse	Les poètes du peuple au XIXe siècle
+67264	Balzac, Honoré de	La Comédie humaine - Volume 12. Scènes de la vie parisienne et scènes de la vie politique
+67273	Ardel, Henri	Le Feu sous la Cendre
+67283	Veber, Pierre	Pensées d'un mercanti
+67327	Aicard, Jean	Au bord du Désert: L'âme arabe (à Pierre Loti); Impressions; Souvenirs; Légendes arabes; La pétition de l'Arabe
+67402	Claretie, Jules	Les Huit Jours du Petit Marquis; Carlos et Cornélius
+67427	Colette	L'Ingénue Libertine
+67620	Gourmont, Remy de	Le chemin de velours; Nouvelles dissociations d'idées
+67719	Gilbert de Voisins, Auguste	Le Mirage
+67741	Milosz, O. V. de L. (Oscar Vladislas de Lubicz)	L'Amoureuse Initiation
+67867	Aicard, Jean	Le Témoin: 1914-1916
+67884	Frapié, Léon	Les Obsédés
+67889	La Brète, Jean de	Un vaincu
+67924	Morel, Emile	Les Gueules Noires
+67927	Lesueur, Daniel	Le Cœur chemine
+67930	Colette	La Fin de Chéri
+67940	Maupassant, Guy de	Œuvres complètes de Guy de Maupassant - volume 19
+68010	Magre, Maurice	La montée aux enfers
+68036	Maupassant, Guy de	Œuvres complètes de Guy de Maupassant - volume 20
+68086	Mille, Pierre	La biche écrasée
+68271	Maupassant, Guy de	Œuvres complètes de Guy de Maupassant - volume 21
+68281	Gilbert de Voisins, Auguste	Le Démon Secret
+68298	Daguerches, Henry	Le kilomètre 83
+68303	Chantepleure, G. (Guy)	Ma conscience en robe rose
+68487	Gilbert, Marion	Le joug: roman
+68501	Boylesve, René	Le bel avenir
+68516	Gilbert de Voisins, Auguste	La conscience dans le mal: roman
+68588	Nolly, Emile	Hiên le Maboul
+68603	Pérez Galdós, Benito	Miséricorde
+68634	Rostand, Edmond	Le Cantique de l'Aile
+68701	Schultz, Jeanne	La main de Sainte Modestine
+68710	Tinayre, Marcelle	La douceur de vivre
+68719	Noailles, Anna de	Les Climats
+68818	Boylesve, René	Les deux romanciers
+68839	Franc-Nohain	Le Pays de l'Instar
+68865	Le Glay, Maurice	Récits marocains de la plaine et des monts
+68871	Gourmont, Remy de	Lettres à l'Amazone
+69007	Cahun, David-Léon	Les aventures du capitaine Magon ou une exploration phénicienne mille ans avant l'ère chrétienne
+69031	Aicard, Jean	Jésus
+69089	Pérez Galdós, Benito	Doña Perfecta
+69098	Sand, George	Les dames vertes
+69165	Aicard, Jean	Roi de Camargue
+69301	Stahl, P.-J.	Maroussia
+69540	Mille, Pierre	Nasr'Eddine et son épouse
+69568	Montesquiou-Fézensac, Robert, comte de	Brelan des dames
+69597	Anet, Claude	Quand la terre trembla
+69605	Gilbert de Voisins, Auguste	Fantasques: Petits poèmes de propos divers
+69618	Gilbert de Voisins, Auguste	Sentiments
+69770	Aicard, Jean	L'Été à l'ombre
+69794	About, Edmond	De Pontoise à Stamboul
+69936	Gilbert de Voisins, Auguste	Les miens
+70094	Hémon, Louis	Itinéraires
+70161	Brada	Isolée
+70162	Mille, Pierre	L'ange du bizarre
+70241	Tinseau, Léon de	La meilleure part
+70260	Flaubert, Gustave	Œuvres complètes de Gustave Flaubert, tome 8
+70340	Mille, Pierre	Images exotiques & françaises
+70351	Margueritte, Paul	Tante Million
+70369	Mille, Pierre	Monsieur Barbe-Bleue... et Madame
+70422	Jammes, Francis	Ma Fille Bernadette
+70504	Mille, Pierre	Barnavaux et quelques femmes
+70505	Mille, Pierre	Louise et Barnavaux
+70538	Baumann, Emile	Job le prédestiné
+70612	Bernard, Tristan	Les moyens du bord
+70891	Hugo, Victor	Notre-Dame de Paris - Tome 1
+70900	Mille, Pierre	Le monarque
+70917	Melegari, Dora	Chercheurs de sources
+70954	Mille, Pierre	Trois femmes
+70956	Rolland, Romain	Clerambault
+71022	Balzac, Honoré de	La Comédie humaine - Volume 13. Scènes de la vie militaire et Scènes de la vie de campagne
+71053	Mille, Pierre	Paraboles et diversions
+71054	Bachelin, Henri	Sous d'humbles toits
+71062	Valéry, Paul	Charmes
+71123	Bachelin, Henri	La bancale
+71143	Frapié, Léon	La Maternelle
+71172	Maupassant, Guy de	Œuvres complètes de Guy de Maupassant - volume 22
+71206	Bernard, Tristan	Souvenirs épars d'un ancien cavalier
+71208	Eberhardt, Isabelle	Trimardeur
+71227	Gide, André	Philoctète
+71251	Colette	Sido; suivi de Les vrilles de la vigne
+71293	Bernard, Tristan	L'affaire Larcier
+71299	Maupassant, Guy de	Œuvres complètes de Guy de Maupassant - volume 23
+71300	Bernard, Tristan	Les veillées du chauffeur
+71331	Maupassant, Guy de	Œuvres complètes de Guy de Maupassant - volume 24
+71341	Aicard, Jean	L'ibis bleu
+71445	Hugo, Victor	Notre-Dame de Paris - Tome 2
+71457	Mille, Pierre	Histoires exotiques et merveilleuses
+71473	Baumann, Emile	Le baptême de Pauline Ardel
+71499	Mille, Pierre	Le Diable au Sahara
+71510	Dumas, Alexandre	Pauline et Pascal Bruno
+71553	Mille, Pierre	Caillou et Tili
+71635	Bernard, Tristan	Mémoires d'un jeune homme rangé
+71658	Delarue-Mardrus, Lucie	L'apparition : roman
+71764	Galopin, Arnould	La ténébreuse affaire de Green-Park
+71773	Balzac, Honoré de	La Comédie humaine - Volume 14. Études philosophiques
+71831	Bachelin, Henri	Sous les marronniers en fleurs
+71878	Guérin, Eugénie de	Journal et fragments
+71911	Bernard, Tristan	Le roman d'un mois d'été
+72023	Bernard, Tristan	L'enfant prodigue du Vésinet : roman
+72024	Aicard, Jean	Fleur d'Abîme
+72034	Balzac, Honoré de	La Comédie humaine - Volume 15. Études philosophiques
+72091	Fournel, Victor	Du rôle des coups de bâton dans les relations sociales et, en particulier, dans l'histoire littéraire
+72160	Faure, Élie	La roue
+72205	Bernard, Tristan	La faune des plateaux
+72256	Mille, Pierre	L'Écrivain
+72260	Doff, Neel	Angelinette
+72370	Magre, Maurice	Le mystère du tigre
+72618	Arène, Paul	Au bon soleil
+72620	Chantepleure, G. (Guy)	Les ruines en fleur
+72630	Prévost, Marcel	La retraite ardente
+72702	Renard, Jules	Nos frères farouches
+72759	Baumann, Emile	Le signe sur les mains
+72773	About, Edmond	Le roi des montagnes
+72798	Retté, Adolphe	Le voyageur étonné
+72799	Milosz, O. V. de L. (Oscar Vladislas de Lubicz)	Ars magna
+72802	Boutet, Frédéric	Douze aventures sentimentales, suivies d'autres histoires d'à présent
+72804	Retté, Adolphe	Lettres à un indifférent
+72819	Baumann, Emile	Intermèdes
+72867	Le Braz, Anatole	Le gardien du feu
+72872	Robert, Louis de	Le roman du malade
+72885	Hugo, Victor	La Légende des siècles tome I
+72905	Pujo, Alice	Rose Perrin
+72912	Ardel, Henri	Cœur de sceptique
+72975	Ardel, Henri	L'été de Guillemette
+72978	Ardel, Henri	La nuit tombe...
+72984	Bachelin, Henri	L'héritage
+72992	Ardel, Henri	Rêve blanc
+73002	La Mazière, Pierre	Mireille des Trois Raisins
+73058	Gide, André	L'immoraliste
+73103	Retté, Adolphe	Le règne de la bête
+73118	Aicard, Jean	Le fameux chevalier Gaspard de Besse
+73164	Retté, Adolphe	Jusqu'à la fin du monde
+73191	Montfort, Eugène	La Turque
+73206	Veber, Pierre	L'essayeuse
+73235	Retté, Adolphe	Léon Bloy : Essai de critique équitable
+73294	Fagus	Clavecin
+73329	Montfort, Eugène	Brelan marin
+73333	Brada	Retour du flot
+73349	Cherbuliez, Victor	Meta Holdenis
+73384	Mendès, Catulle	Les oiseaux bleus
+73436	Brada	Jeunes Madames
+73454	Gilbert de Voisins, Auguste	L'absence et le retour
+73481	Tinseau, Léon de	Un nid dans les ruines
+73552	Balzac, Honoré de	La Comédie humaine - Volume 16. Études philosophiques et Études analytiques
+73562	Lemonnier, Camille	Comme va le ruisseau
+73633	Maupassant, Guy de	Œuvres complètes de Guy de Maupassant - volume 25
+73653	Hémon, Louis	La belle que voilà...
+73732	Pert, Camille	La petite Cady
+73831	Alanic, Mathilde	Derrière le voile
+73832	Arène, Paul	Nouveaux contes de Noël
+73864	Leroy-Allais, Jeanne	Marie-Rose au couvent
+73865	Boutet, Frédéric	L'homme sauvage et Julius Pingouin
+73874	Bernard, Tristan	Le voyage imprévu
+73884	Bernard, Tristan	Décadence et grandeur
+73894	Gourmont, Jean de	L'art d'aimer
+73977	Dyssord, Jacques	Les "Faisans"
+74003	Magre, Maurice	Le livre des lotus entr'ouverts
+74034	Magre, Maurice	Le poison de Goa : roman
+74035	Magre, Maurice	Le roman de Confucius
+74040	Tailhade, Laurent	Les saisons & les jours
+74081	Bloy, Léon	Lettres à sa fiancée
+74090	Proust, Marcel	Le temps retrouvé Tome 1 (de 2)
+74091	Proust, Marcel	Le temps retrouvé Tome 2 (de 2)
+74094	Aicard, Jean	Miette et Noré
+74106	Huysmans, J.-K. (Joris-Karl)	Sainte Lydwine de Schiedam
+74126	Balzac, Honoré de	La Comédie humaine - Volume 17. Études de mœurs
+74128	Gilbert de Voisins, Auguste	L'enfant qui prit peur
+74157	Huysmans, J.-K. (Joris-Karl)	En route
+74164	Rachilde	La tour d'amour
+74329	Ginisty, Paul	Lettres galantes du chevalier de Fagnes
+74398	Ardel, Henri	Seule
+74411	Margueritte, Paul	Le printemps tourmenté
+74420	Ardel, Henri	Le rêve de Suzy
+74426	Pert, Camille	Cady mariée
+74446	Jaloux, Edmond	L'âge d'or
+74448	Renard, Maurice	Le voyage immobile, suivi d'autres histoires singulières
+74459	Rachilde	Refaire l'amour
+74465	Pert, Camille	Le divorce de Cady
+74495	Varlet, Théo	La Bella Venere (La Belle Vénus)
+74506	Fagus	Pas perdus
+74580	Bainville, Jacques	Filiations
+74628	Bainville, Jacques	La tasse de saxe
+74711	Boutet, Frédéric	Par-dessus le mur
+74779	Avesnes	Contes pour lire au crépuscule
+74832	France, Hector	La pudique Albion
+74839	Estaunié, Édouard	La vie secrète
+74853	Ardel, Henri	Il faut marier Jean!
+74861	Courteline, Georges	Messieurs les ronds-de-cuir
+74995	Maindron, Maurice	La gardienne de l'idole noire
+75003	Mendès, Catulle	Le crime du vieux Blas
+75029	Ardel, Henri	Mon cousin Guy
+75043	Yver, Colette	Princesses de science
+75061	Dujardin, Edouard	L'initiation au péché et à l'amour
+75199	Rachilde	Le dessous
+75214	Lesueur, Daniel	Au tournant des jours (Gilles de Claircœur)
+75225	Bazin, René	Mémoires d'une vieille fille
+75235	Estaunié, Édouard	L'appel de la route
+75315	Neveux, Pol (Pol Louis)	Golo
+75357	Mille, Pierre	L'illustre Partonneau
+75440	Valéry, Paul	Monsieur Teste
+75447	Ardel, Henri	Le mal d'aimer
+75459	Aicard, Jean	Le Père Lebonnard
+75483	Boutet, Frédéric	Le spectre de M. Imberger
+75625	Rodenbach, Georges	Le règne du silence
+75719	Audoux, Marguerite	Marie-Claire
+75769	Maupassant, Guy de	Œuvres complètes de Guy de Maupassant - volume 26
+75776	Brulat, Paul	Eldorado
+75961	Cherbuliez, Victor	Le roman d'une honnête femme
+75972	Auriol, George	X... Roman impromptu
+76063	Aicard, Jean	Diamant noir
+76189	Aicard, Jean	Benjamine
+76203	Montfort, Eugène	Le chalet dans la montagne
+76249	Rachilde	La souris japonaise
+76252	Mendès, Catulle	Jupe courte
+76256	Fréhel, Jacques	Bretonne
+76307	Ardel, Henri	L'heure décisive
+76396	Hugo, Victor	La Légende des siècles tome II
+76638	Hugo, Victor	La Légende des siècles tome III
+76724	Verne, Jules	La chasse au météore
+76907	Hugo, Victor	La Légende des siècles tome IV
+77096	Yver, Colette	Comment s'en vont les reines
+77192	Veber, Pierre	L'aventure
+77201	Daudet, Ernest	L'espionne
+77202	Claretie, Jules	Récits héroïques
+77222	Hello, Ernest	Contes extraordinaires
+77266	Saintine, X.-B. (Xavier-Boniface)	L'esclave du pacha, suivi de Histoire de ma grand'tante
+77272	Daudet, Ernest	La Carmélite
+77273	Le Braz, Anatole	La chanson de la Bretagne
+77275	Montfort, Eugène	En flânant de Messine à Cadix
+77289	Brulat, Paul	La gangue
+77329	Régnier, Henri de	Le vrai bonheur
+77330	Anet, Claude	La rive d'Asie
+77358	Rachilde	L'heure sexuelle
+77503	Daudet, Alphonse	L'Arlésienne
+77519	Balzac, Honoré de	La Comédie humaine - Volume 18
+77617	Bourget, Paul	Le disciple
+77628	Mille, Pierre	La détresse des Harpagon
+77666	Vautel, Clément	Mon curé chez les riches
+77734	Le Bon, Gustave	Les incertitudes de l'heure présente
+77748	Theuriet, André	Contes tendres
+77790	Brada	Mylord et Mylady
+77818	Ardel, Henri	L'absence
+77876	Beauregard, Gerard de	Petit manuel de la femme supérieure
+77899	Boylesve, René	Opinions sur le roman
+77904	Balzac, Honoré de	Théâtre
+77994	Vautel, Clément	Mon curé chez les pauvres
+78036	Mille, Pierre	Quand le rideau s'est baissé
+78059	Mendès, Catulle	L'homme tout nu
+78064	Magre, Maurice	Lucifer
+78141	Bernard, Tristan	Secrets d'État
+78223	Bernard, Tristan	L'homme à la moustache verte
+78236	Gide, André	Le Prométhée mal enchaîné
+78257	Sand, George	Jeanne
+78304	Le Glay, Maurice	La mort du Rogui
+78325	Lebey, André	Ameno Kamato
+78355	Le Braz, Anatole	Ames d'Occident
+78379	Boylesve, René	Réflexions sur Stendhal
+78398	Mirbeau, Octave	Sébastien Roch
+78415	Bernard, Charles de	Les ailes d'Icare
+78417	Deledda, Grazia	Elias Portolu
+78418	Werth, Léon	La maison blanche
+78438	Bezançon, Henriette	A la recherche d'une perle
+78439	Renaud, Jean Joseph	Le clavecin hanté
+78518	Robert, Louis de	Paroles d'un solitaire
+78843	Alq, Louise d'	Anthologie féminine
+78875	Silvestre, Armand	Au pays des souvenirs
+78993	La Brète, Jean de	Badinage
+79011	Anet, Claude	Petite ville
+79046	Pravieux, Jules	Un vieux célibataire
+79100	Estaunié, Édouard	L'infirme aux mains de lumière
+79108	Adam, Juliette	Le roman de mon enfance et de ma jeunesse
+79119	Anet, Claude	Mayerling
+79170	Valéry, Paul	Variété II
+79211	Le Goffic, Charles	Morgane
+79320	Mirbeau, Octave	L'abbé Jules
+79343	Bernard, Tristan	Hirondelles de plages
+79417	Ardel, Henri	Tout arrive
+79438	Vogüé, Eugène-Melchior, vicomte de	Les morts qui parlent
+79457	Claudel, Paul	La messe là-bas
+79471	Mirbeau, Octave	Contes de la chaumière
+79484	Rachilde	Le meneur de louves
+79493	Hugo, Victor	Les travailleurs de la mer - tome 1
+79506	Binet-Valmer	Lucien
+79632	Du Boisgobey, Fortuné	Le collier d'acier
+79639	La Fouchardière, Georges de	La chienne

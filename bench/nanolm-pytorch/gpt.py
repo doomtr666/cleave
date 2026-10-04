@@ -1,6 +1,6 @@
 """Twin of `train_gpt` in `examples/nanolm/src/kernel.cleave`: the same transformer (token and
 position embeddings of width `D`, `LAYERS` pre-LayerNorm blocks with causal attention over heads
-`DH` wide and a `D -> 4D -> D` GELU MLP, a final LayerNorm, a dense head to 104 logits), from the
+`DH` wide and a `D -> 4D -> D` GELU MLP, a final LayerNorm, a dense head to `VOCAB` logits), from the
 same initial weights (`gpt_init.ckpt`, written by cleave's `bench` mode in its own directory, apart
 from the real run's checkpoints), on the same
 batches, with the same Adam, learning-rate schedule and summed loss. The sizes must match the
@@ -19,15 +19,15 @@ import time
 import torch
 import torch.nn.functional as F
 
-from data import CACHE, TRAIN_SEED, VAL_SEED, Corpus, batch, read_checkpoint
+from data import CACHE, TRAIN_SEED, VAL_SEED, VOCAB, Corpus, batch, read_checkpoint
 
 arg = lambda i, default: int(sys.argv[i]) if len(sys.argv) > i else default
 FIRST, ROUNDS, PER_ROUND = arg(1, 0), arg(2, 10), arg(3, 100)
 if FIRST != 0:
     sys.exit("the twin starts from gpt_init.ckpt: the first step must be 0 (it doesn't resume)")
-LR, B, T, D, DH, LAYERS = 0.001, 32, 128, 256, 64, 6
+LR, B, T, D, DH, LAYERS = 0.001, 32, 256, 384, 64, 8
 WARMUP, DECAY_STEPS = 200, 20000
-MODEL_DIR = CACHE.parent / f"gpt-d{D}-l{LAYERS}-bench"
+MODEL_DIR = CACHE.parent / f"gpt-d{D}-l{LAYERS}-v{VOCAB}-bench"
 H = D // DH
 
 corpus = Corpus()
@@ -89,7 +89,7 @@ opt = torch.optim.Adam(params, lr=LR, betas=(0.9, 0.999), eps=1e-8)
 # As in cleave, the total (`elapsed`) counts from before the first report, the rounds' minutes
 # from right after it.
 begin = time.perf_counter()
-print(f"step 0: validation {validation(4):.4f}, learning rate {learning_rate(0):.6f}")
+print(f"step 0: validation {corpus.per_token(validation(4))}, learning rate {learning_rate(0):.6f}")
 start = last = time.perf_counter()
 for r in range(ROUNDS):
     for k in range(PER_ROUND):
@@ -106,11 +106,11 @@ for r in range(ROUNDS):
     val = validation(4)
     now = time.perf_counter()
     print(
-        f"step {step}: train {train:.4f}, validation {val:.4f}, learning rate {learning_rate(step):.6f}, "
+        f"step {step}: train {train:.4f}, validation {corpus.per_token(val)}, learning rate {learning_rate(step):.6f}, "
         f"{(now - last) * 1000 / PER_ROUND:.0f} ms/step, {(now - start) / 60:.1f} min elapsed",
         flush=True,
     )
     last = now
 nats = validation(20)
-print(f"transformer: {nats:.4f} nats/char ({nats / math.log(2):.4f} bits/char)")
+print(f"transformer: {corpus.per_token(nats)}")
 print(f"elapsed: {time.perf_counter() - begin:.2f}s")

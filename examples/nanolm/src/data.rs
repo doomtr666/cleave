@@ -1,4 +1,4 @@
-//! Batches for the kernel: `B` windows of `T + 1` consecutive characters, drawn at random
+//! Batches for the kernel: `B` windows of `T + 1` consecutive tokens (`bpe.rs`), drawn at random
 //! offsets, the first `T` as inputs and the last `T` (shifted by one) as targets. Handed over
 //! flattened row-major, one `extern` call per batch filling the array the kernel receives (the
 //! host side takes it as a trailing `out` pointer and length).
@@ -10,33 +10,54 @@
 use std::path::Path;
 use std::sync::OnceLock;
 
-/// Sequences per batch and characters per sequence; `kernel.cleave` has the same.
+/// Sequences per batch and tokens per sequence; `kernel.cleave` has the same.
 pub const B: usize = 32;
-pub const T: usize = 128;
+pub const T: usize = 256;
 
 pub const TRAIN_SEED: u64 = 0x5a01a_7a1;
 pub const VAL_SEED: u64 = 0x5a01a_7a2;
 
+/// Tokens in the vocabulary; `kernel.cleave`'s `VOCAB`.
+pub const VOCAB: usize = 4096;
+
 struct Corpus {
-    train: Vec<u8>,
-    val: Vec<u8>,
+    bpe: crate::bpe::Bpe,
+    train: Vec<u16>,
+    val: Vec<u16>,
+    /// Characters per token over the validation text: a loss per token divided by it is a loss
+    /// per character, comparable across tokenizers.
+    chars_per_token: f64,
 }
 
 static CORPUS: OnceLock<Corpus> = OnceLock::new();
 
 pub fn init(cache_dir: &str) {
-    let (train, val) = crate::corpus::load(Path::new(cache_dir));
+    let (dir, chars, val_chars) = crate::corpus::load(Path::new(cache_dir));
+    let (bpe, train, val) = crate::bpe::load(&dir, VOCAB, &chars, &val_chars);
+    let chars_per_token = val_chars.len() as f64 / val.len() as f64;
     CORPUS
-        .set(Corpus { train, val })
+        .set(Corpus { bpe, train, val, chars_per_token })
         .unwrap_or_else(|_| panic!("data::init called twice"));
 }
 
-pub fn train() -> &'static [u8] {
-    &CORPUS.get().expect("data::init not called yet").train
+fn corpus() -> &'static Corpus {
+    CORPUS.get().expect("data::init not called yet")
 }
 
-pub fn val() -> &'static [u8] {
-    &CORPUS.get().expect("data::init not called yet").val
+pub fn train() -> &'static [u16] {
+    &corpus().train
+}
+
+pub fn val() -> &'static [u16] {
+    &corpus().val
+}
+
+pub fn bpe() -> &'static crate::bpe::Bpe {
+    &corpus().bpe
+}
+
+pub fn chars_per_token() -> f64 {
+    corpus().chars_per_token
 }
 
 pub fn splitmix64(x: u64) -> u64 {
@@ -53,7 +74,7 @@ pub fn offset(text_len: usize, seed: u64, i: i32, b: usize) -> usize {
 }
 
 /// Fills `out` (`B * T` ids) with batch `i`'s inputs (`shift` 0) or targets (`shift` 1).
-fn fill(text: &[u8], seed: u64, i: i32, shift: usize, out: &mut [i32]) {
+fn fill(text: &[u16], seed: u64, i: i32, shift: usize, out: &mut [i32]) {
     assert_eq!(out.len(), B * T, "a batch is {B} x {T} ids");
     for (b, row) in out.chunks_exact_mut(T).enumerate() {
         let start = offset(text.len(), seed, i, b) + shift;
@@ -110,7 +131,7 @@ mod tests {
 
     #[test]
     fn targets_are_inputs_shifted_by_one() {
-        let text: Vec<u8> = (0..1000).map(|k| (k % 100) as u8).collect();
+        let text: Vec<u16> = (0..1000).map(|k| (k % 100) as u16).collect();
         let mut x = vec![0; B * T];
         let mut y = vec![0; B * T];
         fill(&text, 7, 3, 0, &mut x);

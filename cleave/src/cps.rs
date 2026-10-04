@@ -4572,7 +4572,7 @@ pub fn check_spawn_purity(program: &CpsProgram, reentrant: &HashSet<String>) -> 
 /// `Collect::collect(__TupleN(0: { spawn .. }, ..))` (`unroll.rs`), or one
 /// element alone when the range has one. Each element's expression id and its
 /// spawned call, or `None` when `value` isn't that shape.
-fn spawned_elements(value: &Expr) -> Option<Vec<(NodeId, &Expr)>> {
+pub(crate) fn spawned_elements(value: &Expr) -> Option<Vec<(NodeId, &Expr)>> {
     fn spawned(e: &Expr) -> Option<(NodeId, &Expr)> {
         match &e.kind {
             ExprKind::Spawn(call) => Some((e.id, call)),

@@ -8,10 +8,10 @@ import math
 
 import numpy as np
 
-from data import TRAIN_SEED, VAL_SEED, Corpus, batch
+from data import TRAIN_SEED, VAL_SEED, VOCAB, Corpus, batch
 
 TRAIN_BATCHES, VAL_BATCHES = 200, 50
-V = 104
+V = VOCAB
 
 corpus = Corpus()
 counts = np.ones((V, V), dtype=np.float64)
@@ -26,4 +26,4 @@ for s in range(VAL_BATCHES):
 nats = total / (VAL_BATCHES * x.size)
 x, _ = batch(corpus.train, TRAIN_SEED, 0)
 print(f"first training window: {corpus.decode(x[0])!r}")
-print(f"bigram baseline: {nats:.4f} nats/char ({nats / math.log(2):.4f} bits/char)")
+print(f"bigram baseline: {corpus.per_token(nats)}")

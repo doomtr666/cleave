@@ -1,9 +1,10 @@
-// nanoLM: a character-level language model of Zola's French (`doc/plan-nanolm.md`). The corpus
-// is prepared and batched by the Rust host (`corpus.rs`, `data.rs`); line-for-line twin in
-// `bench/nanolm-pytorch`.
+// nanoLM: a language model of 19th-century French (`doc/plan-nanolm.md`), over BPE tokens. The
+// corpus is prepared, tokenized and batched by the Rust host (`corpus.rs`, `bpe.rs`, `data.rs`);
+// line-for-line twin in `bench/nanolm-pytorch`. Losses are in nats per token (the host also
+// reports them per character).
 //
-// For now, the baseline every model must beat: a bigram model, the probability of a character
-// given the one before, counted over training batches (add-one smoothing) and measured on the
+// For now, the baseline every model must beat: a bigram model, the probability of a token given
+// the one before, counted over training batches (add-one smoothing) and measured on the
 // validation book. Then the same model learned by gradient descent, which must converge to it.
 use num;
 use convert;
@@ -11,26 +12,26 @@ use nn;
 use io;
 use checkpoint;
 
-// Batches of 32 sequences of 128 characters, flattened, filled by the host.
-extern fn train_inputs(i: i32) -> [i32; 4096];
-extern fn train_targets(i: i32) -> [i32; 4096];
-extern fn val_inputs(i: i32) -> [i32; 4096];
-extern fn val_targets(i: i32) -> [i32; 4096];
+// Batches of 32 sequences of `CONTEXT` tokens (`ROWS` in all), flattened, filled by the host.
+extern fn train_inputs(i: i32) -> [i32; ROWS];
+extern fn train_targets(i: i32) -> [i32; ROWS];
+extern fn val_inputs(i: i32) -> [i32; ROWS];
+extern fn val_targets(i: i32) -> [i32; ROWS];
 
 // Mean cross-entropy, in nats per character, of the bigram model counted over `train_batches`
 // batches, on `val_batches` validation batches.
 export fn bigram_baseline(train_batches: i32, val_batches: i32) -> f32 {
-    let mut counts: [[f32; 104]; 104] = mlir::memref::alloc();
-    for a in 0..104 { for b in 0..104 { counts[a, b] = 1.0; }; };
+    let mut counts: [[f32; VOCAB]; VOCAB] = mlir::memref::alloc();
+    for a in 0..VOCAB { for b in 0..VOCAB { counts[a, b] = 1.0; }; };
     for s in 0..train_batches {
         let x = train_inputs(s);
         let y = train_targets(s);
-        for k in 0..4096 { counts[x[k], y[k]] = counts[x[k], y[k]] + 1.0; };
+        for k in 0..ROWS { counts[x[k], y[k]] = counts[x[k], y[k]] + 1.0; };
     };
-    let mut row_total: [f32; 104] = mlir::memref::alloc();
-    for a in 0..104 {
+    let mut row_total: [f32; VOCAB] = mlir::memref::alloc();
+    for a in 0..VOCAB {
         let mut t = 0.0;
-        for b in 0..104 { t = t + counts[a, b]; };
+        for b in 0..VOCAB { t = t + counts[a, b]; };
         row_total[a] = t;
     };
     // Per batch in f32, across batches in f64: 200k terms summed into one f32 lose the third
@@ -40,18 +41,18 @@ export fn bigram_baseline(train_batches: i32, val_batches: i32) -> f32 {
         let x = val_inputs(s);
         let y = val_targets(s);
         let mut batch_total = 0.0;
-        for k in 0..4096 { batch_total = batch_total + log(row_total[x[k]]) - log(counts[x[k], y[k]]); };
+        for k in 0..ROWS { batch_total = batch_total + log(row_total[x[k]]) - log(counts[x[k], y[k]]); };
         total = total + batch_total.to();
     };
-    (total / (val_batches * 4096).to()).to()
+    (total / (val_batches * ROWS).to()).to()
 }
 
 // The bigram model learned: row `a` of the table holds the logits of the character after `a`.
-struct Bigram { table: Tensor<f32, 104, 104> }
+struct Bigram { table: Tensor<f32, VOCAB, VOCAB> }
 impl Trainable<Bigram> {}
 
-// Summed over the batch's 4096 predictions (`lr` is scaled accordingly by Adam's normalization).
-fn loss(x: [i32; 4096], y: [i32; 4096], m: Bigram) -> f32 {
+// Summed over the batch's `ROWS` predictions (`lr` is scaled accordingly by Adam's normalization).
+fn loss(x: [i32; ROWS], y: [i32; ROWS], m: Bigram) -> f32 {
     sparse_cross_entropy(embed(m.table, x), y)
 }
 
@@ -61,7 +62,7 @@ model_grad = grad(loss, m);
 fn validation_loss(m: Bigram, batches: i32) -> f32 {
     let mut total: f64 = 0.0;
     for s in 0..batches { total = total + loss(val_inputs(s), val_targets(s), m).to(); };
-    (total / (batches * 4096).to()).to()
+    (total / (batches * ROWS).to()).to()
 }
 
 // `rounds` of 100 Adam steps, the validation loss printed after each.
@@ -85,14 +86,14 @@ export fn train_bigram(rounds: i32, lr: f32, seed: i64) -> f32 {
 // logits of the next character. Still one character of context, so it can do no better than the
 // bigram; it's the whole gradient path (embedding, dense layers, GELU, loss) checked against the
 // PyTorch twin (`bench/nanolm-pytorch/mlp.py`), from the same initial weights.
-struct Lm { emb: Tensor<f32, 104, 64>, l1: Dense<f32, 64, 256>, l2: Dense<f32, 256, 104> }
+struct Lm { emb: Tensor<f32, VOCAB, 64>, l1: Dense<f32, 64, 256>, l2: Dense<f32, 256, VOCAB> }
 impl Trainable<Lm> {}
 
-fn logits(x: [i32; 4096], m: Lm) -> Tensor<f32, 4096, 104> {
+fn logits(x: [i32; ROWS], m: Lm) -> Tensor<f32, ROWS, VOCAB> {
     m.l2.dense_forward(gelu(m.l1.dense_forward(embed(m.emb, x))))
 }
 
-fn lm_loss(x: [i32; 4096], y: [i32; 4096], m: Lm) -> f32 {
+fn lm_loss(x: [i32; ROWS], y: [i32; ROWS], m: Lm) -> f32 {
     sparse_cross_entropy(logits(x, m), y)
 }
 
@@ -101,7 +102,7 @@ lm_grad = grad(lm_loss, m);
 fn lm_validation_loss(m: Lm, batches: i32) -> f32 {
     let mut total: f64 = 0.0;
     for s in 0..batches { total = total + lm_loss(val_inputs(s), val_targets(s), m).to(); };
-    (total / (batches * 4096).to()).to()
+    (total / (batches * ROWS).to()).to()
 }
 
 // Writes the initial weights to `lm_init.ckpt` (in the working directory) for the twin, then
@@ -126,19 +127,20 @@ export fn train_lm(rounds: i32, lr: f32, seed: i64) -> f32 {
 // ------------------------------------------------------------------ the transformer
 //
 // nanoGPT's shape, at a size set by the `define`s below (overridable from `build.rs`): a token and a
-// position embedding of width `WIDTH`, six blocks, a final LayerNorm and a dense head to the
+// position embedding of width `WIDTH`, eight blocks, a final LayerNorm and a dense head to the
 // `VOCAB` logits. Activations are `[ROWS, WIDTH]` matrices, the 32 sequences of a batch (`data.rs`)
 // stacked as rows. Each block is pre-LayerNorm: `x + attention(layer_norm(x))`, then `x +
 // mlp(layer_norm(x))`, the attention causal over heads `HEAD` wide, the MLP `WIDTH -> MLP ->
-// WIDTH` with GELU. The block count is the struct's six fields (`b1`..`b6`, `gpt_layers`).
+// WIDTH` with GELU. The block count is the struct's eight fields (`b1`..`b8`, `gpt_layers`).
 
-define WIDTH: i32 = 256;
+define WIDTH: i32 = 384;
 define HEAD: i32 = 64;
 define MLP: i32 = 4 * WIDTH;
 // Characters per sequence and rows per batch: `data.rs`'s `T` and `B * T`.
-define CONTEXT: i32 = 128;
+define CONTEXT: i32 = 256;
 define ROWS: i32 = 32 * CONTEXT;
-define VOCAB: i32 = 104;
+// Tokens: `bpe.rs`'s vocabulary, the 104 characters and the merges learned over them.
+define VOCAB: i32 = 4096;
 
 // Linear warmup over `WARMUP` steps, then a linear decay to a tenth of the rate at `DECAY_STEPS`,
 // flat after: a function of the step alone, so a resumed run continues the same schedule.
@@ -155,7 +157,7 @@ impl Trainable<Block> {}
 
 struct Gpt {
     tok: Tensor<f32, VOCAB, WIDTH>, pos: Tensor<f32, CONTEXT, WIDTH>,
-    b1: Block, b2: Block, b3: Block, b4: Block, b5: Block, b6: Block,
+    b1: Block, b2: Block, b3: Block, b4: Block, b5: Block, b6: Block, b7: Block, b8: Block,
     lnf_g: Tensor<f32, 1, WIDTH>, lnf_b: Tensor<f32, 1, WIDTH>,
     head: Dense<f32, WIDTH, VOCAB>
 }
@@ -163,7 +165,7 @@ impl Trainable<Gpt> {}
 
 // The model's size, for the host to name its checkpoint directory (`main.rs`).
 export fn gpt_width() -> i32 { WIDTH }
-export fn gpt_layers() -> i32 { 6 }
+export fn gpt_layers() -> i32 { 8 }
 
 fn ones() -> Tensor<f32, 1, WIDTH> { [for i in 0..1: [for j in 0..WIDTH: 1.0]] }
 
@@ -180,6 +182,7 @@ fn new_gpt() -> Gpt {
     Gpt(
         tok: Init::xavier(), pos: Init::xavier(),
         b1: new_block(), b2: new_block(), b3: new_block(), b4: new_block(), b5: new_block(), b6: new_block(),
+        b7: new_block(), b8: new_block(),
         lnf_g: ones(), lnf_b: Ring::zero(),
         head: Init::xavier()
     )
@@ -188,8 +191,8 @@ fn new_gpt() -> Gpt {
 // Row `k` of a batch is position `k mod CONTEXT` of its sequence.
 fn positions() -> [i32; ROWS] { [for k in 0..ROWS: k - (k / CONTEXT) * CONTEXT] }
 
-// Not inlined: called six times per forward pass, each call a whole block of work, compiled once
-// per row count instead of six times (the training gradient is synthesized from its body by the
+// Not inlined: called eight times per forward pass, each call a whole block of work, compiled once
+// per row count instead of eight times (the training gradient is synthesized from its body by the
 // e-graph, unaffected).
 #[no_inline]
 fn block<const N: i32>(x: Tensor<f32, N, WIDTH>, b: Block) -> Tensor<f32, N, WIDTH> {
@@ -199,19 +202,13 @@ fn block<const N: i32>(x: Tensor<f32, N, WIDTH>, b: Block) -> Tensor<f32, N, WID
     x2 + b.proj.dense_forward(gelu(b.fc.dense_forward(layer_norm(x2, b.ln2_g, b.ln2_b))))
 }
 
-// Any number of rows `N`, whole sequences of `CONTEXT`: a training batch (`ROWS`), or the one
+// Any number of rows `N`, whole sequences of `CONTEXT`: a micro-batch (`MICRO`), or the one
 // sequence generation reads (`CONTEXT`).
 fn gpt_logits<const N: i32>(x: [i32; N], p: [i32; N], m: Gpt) -> Tensor<f32, N, VOCAB> {
     let h0 = embed(m.tok, x) + embed(m.pos, p);
-    let h = block(block(block(block(block(block(h0, m.b1), m.b2), m.b3), m.b4), m.b5), m.b6);
+    let h = block(block(block(block(block(block(block(block(h0, m.b1), m.b2), m.b3), m.b4), m.b5), m.b6), m.b7), m.b8);
     m.head.dense_forward(layer_norm(h, m.lnf_g, m.lnf_b))
 }
-
-fn gpt_loss(x: [i32; ROWS], y: [i32; ROWS], p: [i32; ROWS], m: Gpt) -> f32 {
-    sparse_cross_entropy(gpt_logits(x, p, m), y)
-}
-
-gpt_grad = grad(gpt_loss, m);
 
 // Data parallelism (`doc/plan-spawn.md`): a batch's `ROWS` split into `SPLIT`
 // micro-batches of whole sequences, each one's gradient computed in its own
@@ -263,9 +260,19 @@ fn parallel_grad(x: [i32; ROWS], y: [i32; ROWS], p: [i32; ROWS], m: Gpt) -> Gpt 
     accumulate(accumulate(accumulate(g0, g1), accumulate(g2, g3)), accumulate(accumulate(g4, g5), accumulate(g6, g7)))
 }
 
+// A batch's summed loss, its micro-batches evaluated in parallel as the gradient's are, summed in
+// a fixed order.
+fn parallel_loss(x: [i32; ROWS], y: [i32; ROWS], p: [i32; ROWS], m: Gpt) -> f64 {
+    let pm = micro(p, 0);
+    let parts = [for j in 0..SPLIT: spawn gpt_loss_micro(micro(x, j), micro(y, j), pm, m)];
+    let mut total: f64 = 0.0;
+    for j in 0..SPLIT { total = total + parts[j].to(); };
+    total
+}
+
 fn gpt_validation_loss(m: Gpt, p: [i32; ROWS], batches: i32) -> f32 {
     let mut total: f64 = 0.0;
-    for s in 0..batches { total = total + gpt_loss(val_inputs(s), val_targets(s), p, m).to(); };
+    for s in 0..batches { total = total + parallel_loss(val_inputs(s), val_targets(s), p, m); };
     (total / (batches * ROWS).to()).to()
 }
 
@@ -273,7 +280,7 @@ fn gpt_validation_loss(m: Gpt, p: [i32; ROWS], batches: i32) -> f32 {
 // next to the validation loss, whether the model under- or over-fits.
 fn gpt_train_loss(m: Gpt, p: [i32; ROWS], first: i32, batches: i32) -> f32 {
     let mut total: f64 = 0.0;
-    for s in first..first + batches { total = total + gpt_loss(train_inputs(s), train_targets(s), p, m).to(); };
+    for s in first..first + batches { total = total + parallel_loss(train_inputs(s), train_targets(s), p, m); };
     (total / (batches * ROWS).to()).to()
 }
 
@@ -332,11 +339,11 @@ export fn train_gpt(first: i32, rounds: i32, per_round: i32, lr: f32, seed: i64,
 // The prompt, encoded by the host (`main.rs`), left-aligned in a context of `CONTEXT`; its length.
 extern fn prompt_ids() -> [i32; CONTEXT];
 extern fn prompt_len() -> i32;
-// Prints one generated character.
-extern fn emit_char(c: i32);
+// Prints one generated token.
+extern fn emit_token(t: i32);
 
-// Continues the prompt for `count` characters with the model saved in `gpt.ckpt`, each drawn from
-// the next-character distribution at `temperature`. The context slides once it holds `CONTEXT`.
+// Continues the prompt for `count` tokens with the model saved in `gpt.ckpt`, each drawn from the
+// next-token distribution at `temperature`. The context slides once it holds `CONTEXT`.
 export fn generate(count: i32, temperature: f32, seed: i64) -> i32 {
     let opt = Adam(lr: 0.001, beta1: 0.9, beta2: 0.999, eps: 0.00000001);
     let fresh = new_gpt();
@@ -347,7 +354,7 @@ export fn generate(count: i32, temperature: f32, seed: i64) -> i32 {
     let mut len = prompt_len();
     for g in 0..count {
         let c = sample_row(gpt_logits(ctx, p, m), len - 1, temperature);
-        emit_char(c);
+        emit_token(c);
         if len < CONTEXT {
             ctx[len] = c;
             len = len + 1;

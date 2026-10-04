@@ -1,3 +1,4 @@
+mod bpe;
 mod corpus;
 mod data;
 mod generate;
@@ -25,6 +26,13 @@ pub extern "C" fn phase_mark(id: i32) {
     p.0 = Some(now);
 }
 
+/// A loss in nats per token, with its equivalent in bits per character (comparable across
+/// tokenizers, and with the character-level model's).
+fn per_token(nats: f32) -> String {
+    let bits_per_char = f64::from(nats) / std::f64::consts::LN_2 / data::chars_per_token();
+    format!("{nats:.4} nats/token ({bits_per_char:.4} bits/char)")
+}
+
 /// When the previous round ended (or training started), for `round_done`'s timings.
 static ROUND: Mutex<Option<(Instant, Instant, i32)>> = Mutex::new(None);
 
@@ -36,13 +44,14 @@ pub extern "C" fn round_done(step: i32, train_loss: f32, validation_loss: f32, r
     let mut round = ROUND.lock().unwrap();
     match *round {
         None => {
-            println!("step {step}: validation {validation_loss:.4}, learning rate {rate:.6}");
+            println!("step {step}: validation {}, learning rate {rate:.6}", per_token(validation_loss));
             *round = Some((now, now, step));
         }
         Some((start, last, last_step)) => {
             let per_step = (now - last).as_secs_f64() * 1000.0 / f64::from((step - last_step).max(1));
             println!(
-                "step {step}: train {train_loss:.4}, validation {validation_loss:.4}, learning rate {rate:.6},                  {per_step:.0} ms/step, {:.1} min elapsed",
+                "step {step}: train {train_loss:.4}, validation {}, learning rate {rate:.6}, {per_step:.0} ms/step, {:.1} min elapsed",
+                per_token(validation_loss),
                 (now - start).as_secs_f64() / 60.0
             );
             *round = Some((start, now, step));
@@ -63,36 +72,42 @@ fn main() {
     // Checkpoints are written next to the corpus.
     std::env::set_current_dir(&cache).expect("cannot enter the cache directory");
     let which = std::env::args().nth(1).unwrap_or_else(|| "lm".to_string());
-    if which == "gpt" || which == "bench" || which == "zola" {
-        // One directory per model size: its checkpoints don't fit another size. `bench` trains
+    if which == "gpt" || which == "bench" || which == "write" {
+        // One directory per model size and vocabulary: its checkpoints don't fit another. `bench` trains
         // exactly as `gpt` does, in a directory of its own, so that a comparison run against the
         // PyTorch twin never overwrites the real run's checkpoints.
         let suffix = if which == "bench" { "-bench" } else { "" };
-        let dir = format!("gpt-d{}-l{}{suffix}", unsafe { gpt_width() }, unsafe { gpt_layers() });
+        let dir = format!("gpt-d{}-l{}-v{}{suffix}", unsafe { gpt_width() }, unsafe { gpt_layers() }, data::VOCAB);
         std::fs::create_dir_all(&dir).expect("cannot create the model's checkpoint directory");
         std::env::set_current_dir(&dir).expect("cannot enter the model's checkpoint directory");
         eprintln!("checkpoints in .cache/{dir}");
     }
-    if which != "zola" {
+    if which != "write" {
         println!(
-            "corpus: {} train / {} validation characters, alphabet of {}",
+            "corpus: {} train / {} validation tokens, vocabulary of {} over an alphabet of {}, {:.2} characters per token",
             data::train().len(),
             data::val().len(),
-            corpus::alphabet().len()
+            data::bpe().vocab_size(),
+            corpus::alphabet().len(),
+            data::chars_per_token()
         );
         let o = data::offset(data::train().len(), data::TRAIN_SEED, 0, 0);
-        println!("first training window: {:?}", corpus::decode(&data::train()[o..o + data::T]));
+        println!("first training window: {:?}", data::bpe().decode(&data::train()[o..o + data::T]));
+        if which == "corpus" {
+            // Only builds the corpus (downloading what isn't cached yet) and shows it.
+            return;
+        }
 
         let nats = unsafe { bigram_baseline(200, 50) };
-        println!("bigram baseline: {nats:.4} nats/char ({:.4} bits/char)", nats / std::f32::consts::LN_2);
+        println!("bigram baseline: {}", per_token(nats));
     }
     if which == "bigram" {
         let learned = unsafe { train_bigram(10, 0.05, 1) };
-        println!("learned bigram: {learned:.4} nats/char ({:.4} bits/char)", learned / std::f32::consts::LN_2);
-    } else if which == "zola" {
-        // `zola "prompt" [characters [temperature [seed]]]`, with the model in `gpt.ckpt`.
+        println!("learned bigram: {}", per_token(learned));
+    } else if which == "write" {
+        // `write "prompt" [tokens [temperature [seed]]]`, with the model in `gpt.ckpt`.
         let prompt = std::env::args().nth(2).unwrap_or_default();
-        let count: i32 = std::env::args().nth(3).map_or(500, |a| a.parse().expect("a character count"));
+        let count: i32 = std::env::args().nth(3).map_or(200, |a| a.parse().expect("a token count"));
         let temperature: f32 = std::env::args().nth(4).map_or(0.8, |a| a.parse().expect("a temperature"));
         let seed: i64 = std::env::args().nth(5).map_or(1, |a| a.parse().expect("a seed"));
         let shown = generate::set_prompt(&prompt);
@@ -106,12 +121,12 @@ fn main() {
         let (first, rounds, per_round) = (arg(2, 0), arg(3, 10), arg(4, 100));
         let start = std::time::Instant::now();
         let nats = unsafe { train_gpt(first, rounds, per_round, 0.001, 1, first > 0) };
-        println!("transformer: {nats:.4} nats/char ({:.4} bits/char)", nats / std::f32::consts::LN_2);
+        println!("transformer: {}", per_token(nats));
         println!("elapsed: {:?}", start.elapsed());
     } else {
         let start = std::time::Instant::now();
         let nats = unsafe { train_lm(10, 0.003, 1) };
-        println!("embedding + MLP: {nats:.4} nats/char ({:.4} bits/char)", nats / std::f32::consts::LN_2);
+        println!("embedding + MLP: {}", per_token(nats));
         println!("elapsed: {:?}", start.elapsed());
     }
 }
