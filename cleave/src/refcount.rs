@@ -1226,6 +1226,8 @@ struct RefcountCtx<'a> {
     /// call site needs to look up *the callee's* own facts, not this
     /// function's own.
     identity_summary: &'a crate::alias_analysis::IdentitySummary,
+    /// `returned_join_params`, for this one function.
+    returned_join_params: &'a HashSet<(String, usize)>,
     /// The per-type glue functions (`leaf_glue`) requested so far, whole
     /// program: name -> (light struct type, retain rather than release).
     glue: &'a RefCell<BTreeMap<String, (Ty, bool)>>,
@@ -1297,7 +1299,7 @@ pub fn insert_refcounting(
     let constructed_structs = collect_constructed_struct_names(&program);
     let field_mutated_structs = collect_field_mutated_struct_names(&program);
     let extern_boundary_structs = collect_extern_boundary_struct_names(&program);
-    let identity_summary = crate::alias_analysis::analyze_identity(&program);
+    let identity_summary = crate::alias_analysis::analyze_unretained_returns(&program);
     let glue: RefCell<BTreeMap<String, (Ty, bool)>> = RefCell::new(BTreeMap::new());
     let op_lines = program.op_lines;
     let funcs = program
@@ -1314,6 +1316,7 @@ pub fn insert_refcounting(
             collect_local_claim_vars(&top, &views, &mut local_claim_vars);
             let params: HashSet<CVar> = top.def.params.iter().copied().collect();
             let value_defs = collect_value_defs(&top);
+            let returned_join_params = returned_join_params(&top);
             let ctx = RefcountCtx {
                 struct_schemas,
                 mlir_types,
@@ -1329,6 +1332,7 @@ pub fn insert_refcounting(
                 params: &params,
                 value_defs: &value_defs,
                 identity_summary: &identity_summary,
+                returned_join_params: &returned_join_params,
                 glue: &glue,
             };
             insert_refcounting_fn(top, &ctx)
@@ -1774,7 +1778,9 @@ fn rewrite_body(
             // reference — `collect_var_info`'s own doc comment on `PrimOp
             // ::Field`'s ownership rule says so explicitly).
             let at_true_return = matches!(&func, CVal::Var(v) if *v == k_ret);
-            wrap_releases(to_release, CExpr::App { func, args }, ctx, at_true_return)
+            let returned = returned_param_args(&func, &args, k_ret, ctx);
+            let released = wrap_releases(to_release, CExpr::App { func, args }, ctx, at_true_return);
+            retain_returned_params(returned, released, ctx)
         }
         CExpr::If {
             cond,
@@ -2036,12 +2042,15 @@ fn rewrite_body(
                         // corrupted, misaligned-pointer crash one pop
                         // later). The return-value param already owns that
                         // resource, so the aliasing argument is skipped
-                        // here. A callee that instead genuinely consumes
-                        // such an argument and returns a *fresh* value of
-                        // the same type would now leak it — accepted:
-                        // strictly better than the use-after-free, and that
-                        // shape (take `T` by value, ignore it, return a new
-                        // `T`) is not one this stdlib actually has.
+                        // here. That costs a leak whenever the callee
+                        // returns a fresh value instead on another path
+                        // (`clip_grad_norm`: a whole gradient per clipped
+                        // step, the nanoLM night run out of memory at step
+                        // 9100), so a known callee retains a parameter it
+                        // returns through plain joins (`returned_param_args`)
+                        // and only one returned through a loop's carried
+                        // parameter counts here (`alias_analysis::
+                        // analyze_unretained_returns`).
                         let resumption_ret_tys: Vec<&Ty> = if is_loop {
                             Vec::new()
                         } else {
@@ -2242,6 +2251,106 @@ fn live_set(func: &CVal, args: &[CVal], ctx: &RefcountCtx) -> HashSet<CVar> {
 
 /// Exactly the entries of `owned` *not* covered by `live_set` — what's safe
 /// to release right before this jump.
+/// The local joins of `top` (not loops) whose parameter at some position
+/// reaches `k_ret` unchanged, through other such joins: whatever is passed
+/// there becomes this function's result.
+fn returned_join_params(top: &CTopLevelFn) -> HashSet<(String, usize)> {
+    fn walk<'a>(expr: &'a CExpr, apps: &mut Vec<(&'a CVal, &'a [CVal])>, param_of: &mut HashMap<CVar, (String, usize)>) {
+        match expr {
+            CExpr::LetPrim { cont, .. } => walk(cont, apps, param_of),
+            CExpr::App { func, args } => apps.push((func, args)),
+            CExpr::If { then_branch, else_branch, .. } => {
+                walk(then_branch, apps, param_of);
+                walk(else_branch, apps, param_of);
+            }
+            CExpr::Fix { defs, body } => {
+                for d in defs {
+                    if !crate::alias_analysis::is_loop_def(d) {
+                        for (i, &p) in d.params.iter().enumerate() {
+                            param_of.insert(p, (d.name.clone(), i));
+                        }
+                    }
+                    walk(&d.body, apps, param_of);
+                }
+                walk(body, apps, param_of);
+            }
+        }
+    }
+    let mut apps = Vec::new();
+    let mut param_of = HashMap::new();
+    walk(&top.def.body, &mut apps, &mut param_of);
+    let mut returned = HashSet::new();
+    loop {
+        let before = returned.len();
+        for &(func, args) in &apps {
+            for pos in returned_positions(func, args.len(), top.k_ret, &returned) {
+                if let CVal::Var(x) = &args[pos]
+                    && let Some(key) = param_of.get(x)
+                {
+                    returned.insert(key.clone());
+                }
+            }
+        }
+        if returned.len() == before {
+            return returned;
+        }
+    }
+}
+
+/// The positions of a tail call `func(args)` (`n` of them) whose argument
+/// becomes the function's result: every one for `k_ret`, those of
+/// `returned` for a local join.
+fn returned_positions(func: &CVal, n: usize, k_ret: CVar, returned: &HashSet<(String, usize)>) -> Vec<usize> {
+    match func {
+        CVal::Var(v) if *v == k_ret => (0..n).collect(),
+        CVal::Label(join) => (0..n).filter(|&i| returned.contains(&(join.clone(), i))).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The arguments of a tail call that become the function's result
+/// (`returned_positions`) while being one of its parameters, or a part of
+/// one (`resolve`): borrowed from the caller, who keeps its own reference
+/// and releases it, so the result needs a reference of its own — the
+/// caller takes any call's result as owned. Without it, a function that
+/// returns a parameter on one path and a fresh value on another made its
+/// callers skip releasing the argument (`alias_analysis::
+/// analyze_unretained_returns`), and the fresh path leaked it:
+/// `clip_grad_norm`, a whole gradient per clipped training step.
+fn returned_param_args(func: &CVal, args: &[CVal], k_ret: CVar, ctx: &RefcountCtx) -> Vec<(CVar, Ty)> {
+    returned_positions(func, args.len(), k_ret, ctx.returned_join_params)
+        .into_iter()
+        .filter_map(|pos| match &args[pos] {
+            CVal::Var(x) if matches!(resolve(*x, ctx.params, ctx.value_defs), Resolved::Param(p, _) if p != k_ret) => {
+                ctx.var_types.get(x).map(|ty| (*x, ty.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A retain of each of `returned` (`returned_param_args`), before `inner`.
+fn retain_returned_params(returned: Vec<(CVar, Ty)>, inner: CExpr, ctx: &RefcountCtx) -> CExpr {
+    let mut result = inner;
+    for (var, ty) in returned.into_iter().rev() {
+        if ctx.is_rc(&ty) || is_bare_tensor_ty(&ty, ctx.mlir_types) {
+            result = CExpr::LetPrim {
+                var: ctx.fresh.var(),
+                ty: unit_ty(),
+                op: PrimOp::Retain(ty),
+                args: vec![CVal::Var(var)],
+                cont: Box::new(result),
+            };
+        } else {
+            let leaves = ctx.light_release_leaves(&ty);
+            if !leaves.is_empty() {
+                result = leaf_glue(ctx, var, &ty, &leaves, true, result);
+            }
+        }
+    }
+    result
+}
+
 fn releases_for_app(
     func: &CVal,
     args: &[CVal],

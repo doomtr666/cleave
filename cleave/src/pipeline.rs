@@ -1829,6 +1829,12 @@ pub fn lower_to_llvm<'c>(
     // function rather than to an unnamed address range.
     backfill_all_unknown_locs(module.as_operation_mut());
 
+    // Argument slots (`mlir_lower.rs::entry_alloca`): one the inliner carried
+    // into a loop goes back to its function's entry block, and an ordinary
+    // call's is bounded to its uses, so that LLVM can share storage between
+    // them. Loops are blocks by now.
+    unsafe { cleave_mlir_shim::hoist_arg_slots(module.as_operation().to_raw()) };
+
     Ok(())
 }
 

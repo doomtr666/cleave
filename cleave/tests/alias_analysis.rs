@@ -197,12 +197,12 @@ fn a_parameter_embedded_once_and_reused_afterward_is_aliased() {
 }
 
 /// A genuinely identity-shaped function (returns its own parameter
-/// unchanged, embeds it nowhere) must NOT be marked aliased on its own
-/// side, per the module's own rule 5 -- the aliasing hazard for this shape
-/// belongs entirely to the *caller*, handled separately by
-/// `refcount::collect_identity_param_positions`.
+/// unchanged, embeds it nowhere) marks that parameter aliased: it retains
+/// what it returns (`refcount.rs::returned_param_args`), so the caller's
+/// argument and the result are two references to one allocation, each
+/// released -- a headerless (affine) allocation there would be freed twice.
 #[test]
-fn a_genuinely_identity_shaped_function_does_not_mark_its_own_parameter() {
+fn a_genuinely_identity_shaped_function_marks_its_own_parameter() {
     let src = "
         struct Boxed { v: i32, tag: [i32; 1] }
         fn id(x: Boxed) -> Boxed { x }
@@ -216,9 +216,9 @@ fn a_genuinely_identity_shaped_function_does_not_mark_its_own_parameter() {
     let program = optimized_cps(src);
     let summary = analyze(&program);
     assert!(
-        !summary.is_aliased("id", 0),
-        "`id` embeds its own parameter nowhere and returns it unchanged -- \
-         it must not be marked aliased on the callee's own side"
+        summary.is_aliased("id", 0),
+        "`id` returns its own parameter, retained: two references to it, \
+         it must be marked aliased"
     );
 }
 
@@ -769,8 +769,13 @@ mod affine_eligibility {
     /// disagrees with whatever allocator actually backed it (`cleave_
     /// release` on a `cleave_alloc_pool`-only pointer -- a real, confirmed
     /// type-confused free, not hypothetical).
+    ///
+    /// Since an identity-shaped callee retains what it returns
+    /// (`refcount.rs::returned_param_args`), `a` and `a2` are two references,
+    /// each released: neither may be affine (a headerless allocation freed
+    /// twice), and both use the same, headered allocator.
     #[test]
-    fn a_resumption_forwarding_an_already_affine_argument_through_an_identity_shaped_callee_is_affine_too() {
+    fn an_argument_forwarded_through_an_identity_shaped_callee_is_not_affine() {
         let src = "
             struct Acc { v: i32 }
             fn wrap(a: Acc) -> Acc { a }
@@ -784,13 +789,10 @@ mod affine_eligibility {
         let (program, affine) = affine_vars(src);
         let a = nth_struct_var(&program, "main", 0);
         let a2 = resumption_var_of_call(&program, "main", "wrap");
-        assert!(affine.contains(&a), "`a` is never aliased -- must be affine-eligible on its own");
         assert!(
-            affine.contains(&a2),
-            "`wrap` is identity-shaped (hands `a` straight back) and its \
-             caller's own argument `a` is already affine -- `a2`, the \
-             resumption receiving `wrap`'s result, denotes that exact same \
-             allocation and must be affine too"
+            !affine.contains(&a) && !affine.contains(&a2),
+            "`wrap` hands `a` back retained: `a` and `a2` are two references to \
+             one allocation, neither may be affine"
         );
     }
 
@@ -871,8 +873,13 @@ mod affine_eligibility {
     /// vice versa. Confirmed to fail before this fix (`entry affine =
     /// true`, `carried affine = false`, via a dedicated debug probe) even
     /// though the underlying identity fact was already correct.
+    ///
+    /// Since an identity-shaped callee retains what it returns
+    /// (`refcount.rs::returned_param_args`), each iteration holds two
+    /// references to the carried value: neither it nor the entry
+    /// construction may be affine, and both agree on the headered allocator.
     #[test]
-    fn a_carried_parameter_threaded_through_an_identity_shaped_real_call_each_iteration_is_affine_too() {
+    fn a_carried_parameter_threaded_through_an_identity_shaped_real_call_is_not_affine() {
         let src = "
             struct Boxed { v: i32, tag: [i32; 1] }
             extern fn opaque_sink(x: i32) -> i32;
@@ -897,15 +904,11 @@ mod affine_eligibility {
             ";
         let (program, affine) = affine_vars(src);
         let entry = nth_struct_var(&program, "main", 0);
-        assert!(affine.contains(&entry), "the entry construction is never aliased -- must be affine-eligible");
         let carried = nth_loop_carried_var(&program, "main", 1);
         assert!(
-            affine.contains(&carried),
-            "the loop's own carried parameter is threaded through `thread_through` \
-             (identity-shaped at that position) every iteration -- it denotes the \
-             exact same allocation as the entry argument throughout and must be \
-             affine-eligible too, despite the mutual dependency between it and \
-             `thread_through`'s own resumption parameter"
+            !affine.contains(&entry) && !affine.contains(&carried),
+            "`thread_through` hands its argument back retained: the entry \
+             construction and the carried parameter are shared, neither may be affine"
         );
     }
 }

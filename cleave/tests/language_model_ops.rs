@@ -1271,3 +1271,63 @@ fn mk2(v: f32) -> L2 {{ L2(l0: mk1(v), l1: mk1(v), l2: mk1(v), l3: mk1(v), l4: m
         &signature[..signature.len().min(160)]
     );
 }
+
+/// Every call passing a large light struct by pointer has its own argument
+/// slot (`mlir_lower.rs::entry_alloca`), in its function's entry block.
+/// Without `cleave_mlir_shim::hoist_arg_slots`, an inlined call's slots land
+/// wherever the call was (inlining `relay` into `main`'s loop: a dynamic
+/// allocation per iteration), and all of a function's slots add up in its
+/// frame: nanoLM v2's `train_gpt` reached 1.4 MB, past the main thread's
+/// stack. With it, every slot is back in the entry block, and an ordinary
+/// call's is live only around the call (`lifetime.start`/`lifetime.end`), so
+/// that LLVM's stack coloring shares storage between them.
+#[test]
+fn argument_slots_sit_in_the_entry_block_with_bounded_lifetimes() {
+    let src = "
+        use nn;
+        struct P { a: Tensor<f32, 1, 1>, b: Tensor<f32, 1, 1>, c: Tensor<f32, 1, 1> }
+        fn mk(v: f32) -> P {
+            P(a: [for r in 0..1: [for c in 0..1: v]], b: [for r in 0..1: [for c in 0..1: v]], c: [for r in 0..1: [for c in 0..1: v]])
+        }
+        #[no_inline]
+        fn read(x: P, y: P, s: f32) -> f32 { s + x.a[0, 0] + x.b[0, 0] + x.c[0, 0] + y.a[0, 0] + y.b[0, 0] + y.c[0, 0] }
+        fn relay(x: P, y: P, s: f32) -> f32 { read(x, y, s) }
+        fn main() -> f32 {
+            let x = mk(0.5);
+            let y = mk(1.0);
+            let mut s = read(x, y, 0.0);
+            for i in 0..99 { s = relay(x, y, s); };
+            s
+        }
+    ";
+    let got = run(src);
+    assert!(close(got, 450.0), "got {got}");
+    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("argument_slots.cleave");
+    let object = dir.join("argument_slots.obj");
+    let dump = dir.join("argument_slots.mlir");
+    std::fs::write(&source, src).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--no-debug-info", "--emit-object"])
+        .arg(&object)
+        .arg(&source)
+        .env("CLEAVE_DUMP_LLVM_DIALECT", &dump)
+        .output()
+        .expect("cannot run cleave");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let module = std::fs::read_to_string(&dump).unwrap();
+    assert!(!module.contains("arg_slot"), "the slots' marks must be dropped");
+    let start = module.find("llvm.func @main(").expect("no `main` in the module");
+    let end = module[start + 1..].find("llvm.func ").map_or(module.len(), |e| start + 1 + e);
+    let main = &module[start..end];
+    let entry_end = main.find("^bb").unwrap_or(main.len());
+    let allocas = main.matches("llvm.alloca").count();
+    assert!(allocas >= 4, "`main` should hold its calls' slots: {allocas} allocas");
+    assert_eq!(main[entry_end..].matches("llvm.alloca").count(), 0, "every slot in `main`'s entry block");
+    // `main`'s own call to `read`, `relay`'s inlined one, and `main`'s to
+    // `relay` (inlined: stored, then loaded): two slots each.
+    let starts = main.matches("llvm.intr.lifetime.start").count();
+    assert_eq!(starts, main.matches("llvm.intr.lifetime.end").count());
+    assert!(starts >= 4, "each ordinary call's slots get a lifetime: {starts}");
+}

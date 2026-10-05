@@ -694,7 +694,13 @@ pub extern "C" fn cleave_alloc_rc(data_size: i64) -> *mut u8 {
                 let layout = std::alloc::Layout::from_size_align(class_bytes(class), class_align(class))
                     .expect("cleave_alloc_rc: invalid layout");
                 let p = std::alloc::alloc(layout);
-                assert!(!p.is_null(), "cleave_alloc_rc: allocation failed");
+                // The request's size tells an exhausted system (a plausible
+                // size) from a corrupted request (an absurd one).
+                assert!(
+                    !p.is_null(),
+                    "cleave_alloc_rc: allocation failed: {data_size} bytes requested, size class {class} ({} bytes)",
+                    class_bytes(class)
+                );
                 p
             }
         };

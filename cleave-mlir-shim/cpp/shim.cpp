@@ -254,6 +254,68 @@ extern "C" MlirExecutionEngine cleaveExecutionEngineCreateWithTarget(
   return wrap(jitOrError->release());
 }
 
+// The slots `mlir_lower.rs` allocates for arguments passed by pointer
+// (`call_arguments`, marked `cleave.arg_slot`, or `cleave.spawn_arg_slot` for
+// a spawned call's) start in their function's entry block, one per call site,
+// alive for the whole frame: nanoLM v2's `train_gpt` held 2.6k of them, 1.9 MB
+// together, past the 1 MB main thread stack. Two fixes, once loops are blocks
+// of their function's own region:
+// - every slot the inliner carried out of the entry block (into a loop, where
+//   it would be a dynamic allocation) goes back to the entry block's start,
+//   with its own size constant;
+// - an ordinary call's slot is live from its first use to its last (the store
+//   of the argument, then the call, or the loads of an inlined callee), when
+//   they share a block: `lifetime.start`/`lifetime.end` there let LLVM's stack
+//   coloring give disjoint slots the same storage. A spawned call's slot is
+//   read by its task until the caller's `sync`, so it keeps the whole frame.
+// The marks are dropped. Unmarked allocations are left alone, and so is a slot
+// inside an OpenMP region.
+extern "C" void cleaveHoistArgSlots(MlirOperation op) {
+  unwrap(op)->walk([](LLVM::LLVMFuncOp f) {
+    if (f.getBody().empty())
+      return;
+    Block &entry = f.getBody().front();
+    SmallVector<std::pair<LLVM::AllocaOp, bool>> slots;
+    f.walk([&](LLVM::AllocaOp a) {
+      bool ordinary = static_cast<bool>(a->removeAttr("cleave.arg_slot"));
+      bool spawned = static_cast<bool>(a->removeAttr("cleave.spawn_arg_slot"));
+      if ((ordinary || spawned) && a->getParentRegion() == &f.getBody())
+        slots.push_back({a, ordinary});
+    });
+    for (auto [a, ordinary] : slots) {
+      if (a->getBlock() != &entry) {
+        OpBuilder b(&entry, entry.begin());
+        Type sizeTy = a.getArraySize().getType();
+        auto one = b.create<LLVM::ConstantOp>(a.getLoc(), sizeTy, b.getIntegerAttr(sizeTy, 1));
+        a->setOperand(0, one);
+        a->moveAfter(one);
+      }
+      if (!ordinary)
+        continue;
+      Block *block = nullptr;
+      Operation *first = nullptr, *last = nullptr;
+      bool oneBlock = true;
+      for (Operation *user : a->getUsers()) {
+        if (block && user->getBlock() != block) {
+          oneBlock = false;
+          break;
+        }
+        block = user->getBlock();
+        if (!first || user->isBeforeInBlock(first))
+          first = user;
+        if (!last || last->isBeforeInBlock(user))
+          last = user;
+      }
+      if (!first || !oneBlock)
+        continue;
+      OpBuilder b(first);
+      b.create<LLVM::LifetimeStartOp>(a.getLoc(), a.getResult());
+      b.setInsertionPointAfter(last);
+      b.create<LLVM::LifetimeEndOp>(a.getLoc(), a.getResult());
+    }
+  });
+}
+
 // Rewrites the transcendental `math` ops into polynomial approximations made
 // of plain `arith`/`vector` ops (MLIR's `PolynomialApproximation.cpp`), so a
 // `math.tanh` on a `vector<1024xf32>` becomes packed AVX-512 arithmetic.

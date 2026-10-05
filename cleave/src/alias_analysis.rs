@@ -218,6 +218,35 @@ impl IdentitySummary {
 /// through one is a purely local, single-function question, resolved once
 /// here rather than deferred.
 pub fn analyze_identity(program: &CpsProgram) -> IdentitySummary {
+    identity_through(program, false)
+}
+
+/// [`analyze_identity`] narrowed to what `refcount.rs` needs: whether a
+/// function may hand one of its parameters back as its result *without a
+/// reference of its own*. A parameter reaching the return through plain
+/// joins is retained there (`refcount.rs::retains_for_return`), so the
+/// result owns it like a fresh value; only one rebound to a loop's carried
+/// parameter on the way is returned as the caller's own reference.
+pub fn analyze_unretained_returns(program: &CpsProgram) -> IdentitySummary {
+    identity_through(program, true)
+}
+
+/// Whether `def` is a loop: it calls itself. `carried_types` doesn't tell,
+/// an `if`'s join point has them too.
+pub(crate) fn is_loop_def(def: &CFunDef) -> bool {
+    fn calls(expr: &CExpr, name: &str) -> bool {
+        match expr {
+            CExpr::LetPrim { cont, .. } => calls(cont, name),
+            CExpr::App { func, .. } => matches!(func, CVal::Label(l) if l == name),
+            CExpr::If { then_branch, else_branch, .. } => calls(then_branch, name) || calls(else_branch, name),
+            CExpr::Fix { defs, body } => defs.iter().any(|d| calls(&d.body, name)) || calls(body, name),
+        }
+    }
+    calls(&def.body, &def.name)
+}
+
+/// `through_loops_only`: [`analyze_unretained_returns`]'s narrowing.
+fn identity_through(program: &CpsProgram, through_loops_only: bool) -> IdentitySummary {
     let known_functions: HashSet<&str> = program
         .funcs
         .iter()
@@ -235,12 +264,12 @@ pub fn analyze_identity(program: &CpsProgram) -> IdentitySummary {
         collect_local_defs_by_name(&f.def.body, &mut defs_by_name);
         for (i, &param) in ordinary_params.iter().enumerate() {
             let mut visiting = HashSet::new();
+            let trace = Trace { f_name: &f.def.name, param_idx: i, k_ret };
             if tail_returns_var(
                 &f.def.body,
-                &f.def.name,
-                i,
-                k_ret,
+                &trace,
                 param,
+                !through_loops_only,
                 &defs_by_name,
                 &known_functions,
                 &mut visiting,
@@ -295,6 +324,14 @@ fn collect_local_defs_by_name<'a>(expr: &'a CExpr, out: &mut HashMap<&'a str, &'
     }
 }
 
+/// What one [`tail_returns_var`] trace is answering: whether `f_name`'s
+/// parameter `param_idx` reaches its `k_ret`.
+struct Trace<'a> {
+    f_name: &'a str,
+    param_idx: usize,
+    k_ret: CVar,
+}
+
 /// Whether `var`, starting from `expr` (`f_name`'s own body, or a local
 /// def's body reached while tracing through one), ever flows *unchanged*
 /// all the way to `f_name`'s own `k_ret` — the module's own doc comment on
@@ -345,29 +382,33 @@ fn collect_local_defs_by_name<'a>(expr: &'a CExpr, out: &mut HashMap<&'a str, &'
 /// preserve identity is a conservative extra reference kept alive
 /// (`refcount.rs`'s own existing release-tracking on that value's *other*
 /// name still fires normally), never a use-after-free.
+/// `counts`: whether `var` reaching `k_ret` from here proves the trace —
+/// from the start for [`analyze_identity`]; for
+/// [`analyze_unretained_returns`], once `var` is rebound to a loop's carried
+/// parameter.
 #[allow(clippy::too_many_arguments)]
 fn tail_returns_var(
     expr: &CExpr,
-    f_name: &str,
-    param_idx: usize,
-    k_ret: CVar,
+    trace: &Trace,
     var: CVar,
+    counts: bool,
     defs_by_name: &HashMap<&str, &CFunDef>,
     known_functions: &HashSet<&str>,
     visiting: &mut HashSet<String>,
     edges: &mut Vec<Edge>,
 ) -> bool {
     match expr {
-        CExpr::LetPrim { cont, .. } => tail_returns_var(
-            cont, f_name, param_idx, k_ret, var, defs_by_name, known_functions, visiting, edges,
-        ),
+        CExpr::LetPrim { cont, .. } => {
+            tail_returns_var(cont, trace, var, counts, defs_by_name, known_functions, visiting, edges)
+        }
         CExpr::App { func, args } => match func {
-            CVal::Var(v) if *v == k_ret => {
-                matches!(args.as_slice(), [CVal::Var(v)] if *v == var)
-            }
+            CVal::Var(v) if *v == trace.k_ret => counts && matches!(args.as_slice(), [CVal::Var(v)] if *v == var),
             CVal::Label(callee) if known_functions.contains(callee.as_str()) => {
                 if let Some(pos) = args.iter().position(|a| matches!(a, CVal::Var(v) if *v == var)) {
-                    edges.push(((f_name.to_string(), param_idx), (callee.clone(), pos)));
+                    // Whatever `var` was rebound to, the callee's result is
+                    // never one of this function's parameters, so nothing
+                    // here retains it: the callee's answer carries over.
+                    edges.push(((trace.f_name.to_string(), trace.param_idx), (callee.clone(), pos)));
                 }
                 // `var` might simply not be one of this real call's own
                 // arguments at all (an unrelated comparison/computation
@@ -388,8 +429,7 @@ fn tail_returns_var(
                         if let Some(def) = defs_by_name.get(cont.as_str()) {
                             if visiting.insert(cont.clone()) {
                                 let result = tail_returns_var(
-                                    &def.body, f_name, param_idx, k_ret, var, defs_by_name,
-                                    known_functions, visiting, edges,
+                                    &def.body, trace, var, counts, defs_by_name, known_functions, visiting, edges,
                                 );
                                 visiting.remove(cont.as_str());
                                 return result;
@@ -421,26 +461,18 @@ fn tail_returns_var(
                 // `(k_ret out)` return -- found immediately by a dedicated
                 // debug probe once the fix's own first attempt still didn't
                 // clear `examples/complex.cleave --run`'s crash.
-                let inner_var = match args.iter().position(|a| matches!(a, CVal::Var(v) if *v == var)) {
+                let (inner_var, counts) = match args.iter().position(|a| matches!(a, CVal::Var(v) if *v == var)) {
                     Some(pos) => match def.params.get(pos) {
-                        Some(&p) => p,
+                        Some(&p) => (p, counts || is_loop_def(def)),
                         None => return false,
                     },
-                    None => var,
+                    None => (var, counts),
                 };
                 if !visiting.insert(callee.clone()) {
                     return false;
                 }
                 let result = tail_returns_var(
-                    &def.body,
-                    f_name,
-                    param_idx,
-                    k_ret,
-                    inner_var,
-                    defs_by_name,
-                    known_functions,
-                    visiting,
-                    edges,
+                    &def.body, trace, inner_var, counts, defs_by_name, known_functions, visiting, edges,
                 );
                 visiting.remove(callee.as_str());
                 result
@@ -452,17 +484,15 @@ fn tail_returns_var(
             else_branch,
             ..
         } => {
-            let then_result = tail_returns_var(
-                then_branch, f_name, param_idx, k_ret, var, defs_by_name, known_functions, visiting, edges,
-            );
-            let else_result = tail_returns_var(
-                else_branch, f_name, param_idx, k_ret, var, defs_by_name, known_functions, visiting, edges,
-            );
+            let then_result =
+                tail_returns_var(then_branch, trace, var, counts, defs_by_name, known_functions, visiting, edges);
+            let else_result =
+                tail_returns_var(else_branch, trace, var, counts, defs_by_name, known_functions, visiting, edges);
             then_result || else_result
         }
-        CExpr::Fix { body, .. } => tail_returns_var(
-            body, f_name, param_idx, k_ret, var, defs_by_name, known_functions, visiting, edges,
-        ),
+        CExpr::Fix { body, .. } => {
+            tail_returns_var(body, trace, var, counts, defs_by_name, known_functions, visiting, edges)
+        }
     }
 }
 
@@ -617,6 +647,14 @@ pub fn analyze(program: &CpsProgram) -> AliasSummary {
         all_names.insert(f.def.name.clone());
         collect_facts(&f.def.name, ordinary_params, &f.def.body, &mut seed, &mut edges);
         collect_local_defs(&f.def.body, &mut seed, &mut edges, &mut all_names);
+    }
+    // A parameter the function may hand back as its result is retained
+    // there (`refcount.rs::returned_param_args`): the caller's argument and
+    // the result are two references to one allocation, each released, so a
+    // headerless (affine) allocation passed there would be freed twice
+    // (`examples/fibonacci.cleave`'s `println((.., a))`).
+    for (name, positions) in analyze_identity(program).identity {
+        seed.extend(positions.into_iter().map(|i| (name.clone(), i)));
     }
 
     let aliased_pairs = propagate(seed, edges);

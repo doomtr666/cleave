@@ -870,7 +870,9 @@ fn an_element_extracted_from_an_array_and_never_reused_needs_no_retain() {
 /// `id`'s own type-matching to its own resumption's return type is what
 /// the *coarse* version of this check keys on; this test's whole point is
 /// that a genuinely identity-shaped callee must still be protected no
-/// matter how that protection is computed.
+/// matter how that protection is computed. Today `id` retains what it
+/// returns (`refcount.rs::returned_param_args`), so `a` and `r` are two
+/// references, each released once.
 #[test]
 fn a_struct_transferred_into_a_genuinely_identity_shaped_call_and_reused_is_released_once() {
     let src = "
@@ -884,11 +886,11 @@ fn a_struct_transferred_into_a_genuinely_identity_shaped_call_and_reused_is_rele
         ";
     let program = refcounted_cps(src);
     assert_eq!(
-        count_releases_for(&program, "Boxed"),
-        1,
+        (count_retains_for(&program, "Boxed"), count_releases_for(&program, "Boxed")),
+        (1, 2),
         "`a`/`r` are the exact same allocation (`id` returns its argument \
-         unchanged) -- exactly one release must be inserted for it, not two \
-         (a real double-free) and not zero (a leak)"
+         unchanged, retained): one release more than retains, not two more \
+         (a real double-free) and not none (a leak)"
     );
     assert_eq!(run_i32(src), 2);
 }
@@ -956,12 +958,12 @@ fn a_wrapper_around_a_genuinely_identity_shaped_function_is_also_identity_shaped
         ";
     let program = refcounted_cps(src);
     assert_eq!(
-        count_releases_for(&program, "Boxed"),
-        1,
+        (count_retains_for(&program, "Boxed"), count_releases_for(&program, "Boxed")),
+        (1, 2),
         "`a`/`r` are the exact same allocation, forwarded unchanged through \
-         two levels of identity-shaped functions (`wrapper` -> `identity`) \
-         -- exactly one release must be inserted, not two (the real \
-         mnist-interop double-free this reproduces) and not zero"
+         two levels of identity-shaped functions (`wrapper` -> `identity`, \
+         which retains it): one release more than retains, not two more \
+         (the real mnist-interop double-free this reproduces) and not none"
     );
     assert_eq!(run_i32(src), 2);
 }

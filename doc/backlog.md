@@ -2132,6 +2132,63 @@ Still by value: **returned** light structs (LLVM demotes a large return to a hid
 crash, but the aggregate is still built with `insertvalue` per scalar), and light structs inside the
 caller's own body.
 
+**The slots themselves then overflowed the stack (2026-10-05).** The night run (`gpt 0 200 100`)
+died with `STATUS_STACK_OVERFLOW` on the main thread. One slot per call site, alive for the whole
+frame, and MLIR's inliner carrying a callee's slots into the caller wherever the call was (inside a
+loop body, a dynamic allocation, bounded only by the loop's `stacksave`/`stackrestore`):
+`train_gpt$tasks` held 272 KB of slots in its entry block and 1.6 MB elsewhere. Fixed once loops are
+blocks (`cleave_mlir_shim::hoist_arg_slots`, end of `pipeline.rs::lower_to_llvm`): every slot goes
+back to its function's entry block, and an ordinary call's (not a spawned one's) gets
+`lifetime.start`/`lifetime.end` around its uses, so that LLVM's stack coloring shares storage
+between slots. Moving the slots without the lifetimes made it worse (a 1.37 MB static frame).
+`train_gpt$tasks`' frame is now 570 KB, static; a 100-step round trains (1429 ms/step, 10.9 GB).
+Test: `language_model_ops.rs::argument_slots_sit_in_the_entry_block_with_bounded_lifetimes` (an IR
+check; a runtime overflow in a small program depends on LLVM's argument promotion and memcpy
+forwarding, which erase the slots of a callee reading few fields or of identical arguments).
+Remaining: 570 KB is still half the main thread's stack. A slot whose uses span several blocks
+gets no lifetime and keeps the whole frame, as does a spawned call's; and the copy itself is
+redundant whenever the argument already lives in memory. Passing the caller's own storage, or
+giving the main thread a larger stack (`/STACK` at link), would remove the margin question.
+
+## A function returning its parameter on one path leaked the argument on the others — fixed (2026-10-05)
+
+The nanoLM night run died at step 9100 (`cleave_alloc_rc: allocation failed`); the System event
+log (resource exhaustion detector, event 2004) showed nanoLM alone at 75.9 GB committed, against a
+flat 18 GB over the first 300 steps. The cause: `clip_grad_norm` (`if norm > max { scaled(g, ..) }
+else { g }`). Because its parameter `g` may come back as the result (`alias_analysis::
+analyze_identity`, "on at least one path"), callers skipped releasing their argument
+(`refcount.rs`, `aliases_ret_param`, a protection against a double free through `println`'s
+identity), and when the fresh path was taken nobody released it: a whole gradient per clipped
+step, so the leak only started once training gradients crossed the threshold. The code even
+called the shape "accepted... not one this stdlib actually has".
+
+Fixed by restoring the stated convention (borrowed parameters, owned results): a parameter (or a
+part of one, through field reads) passed to `k_ret`, or to a plain join whose parameter reaches
+`k_ret`, is retained there (`refcount.rs::returned_param_args`), so the result always owns its
+references; callers then release their arguments, except where the callee may return one through
+a loop's carried parameter, the only case still unretained (`alias_analysis::
+analyze_unretained_returns`). Loops are told from `if` joins by calling themselves
+(`alias_analysis::is_loop_def`): both have `carried_types`. `analyze_identity` itself is
+unchanged for the affine-struct analysis, which asks about allocation identity, not ownership.
+Tests: `leaks.rs::returning_a_parameter_on_one_path_only_leaves_nothing_behind`,
+`clipping_a_fresh_gradient_that_is_scaled_leaves_no_allocation_behind` (16 KB per clip before),
+`..._that_is_kept_...`. Reproduced in one second instead of three hours: a long run that dies
+late is a value-dependent path, so look for the branch that changes over training first.
+
+The affine (headerless) analysis had to follow: a parameter the function may return is now a second
+reference, so `alias_analysis::analyze` marks it aliased and a value passed there is no longer
+affine (`examples/fibonacci.cleave` freed `println`'s tuple twice otherwise); three
+`alias_analysis.rs` tests and two `refcount.rs` tests that pinned the old convention were updated.
+nanoLM v2 over 100 steps: 14.3 GB committed instead of 18.05, identical losses, same speed: part of
+v2's extra memory was this.
+
+Side findings, not from this fix (both reproduced on `HEAD`'s `refcount.rs`/`alias_analysis.rs`):
+`leaks.rs::a_gradient_leaving_an_if_does_not_crash` (ignored, "A gradient leaving an `if` crashes"
+above) passes, so an earlier change fixed it, to un-ignore; and `examples/complex.cleave` under
+`CLEAVE_DEBUG_POOL=1` reports a double release of a 1-byte block through `cleave_release_void`
+(bufferization), likely `println`'s `"\n"` handed back by `extern print_bytes`, invisible without
+the debug pool.
+
 ## Debug info attributes inlined stdlib code to the program's file
 `llvm-symbolizer` on nanoLM v2 placed `Optimizer::step` at `kernel.cleave:386`, a line the kernel
 doesn't have: the inlined function's `DISubprogram` names the right function but the program's file

@@ -357,6 +357,58 @@ fn clipping_leaves_no_allocation_behind() {
     assert!(per < NOISE, "{per} bytes per clip");
 }
 
+/// nanoLM's shape: each step clips a fresh gradient, then consumes it. Early
+/// in training every gradient is scaled; later its norm falls under the
+/// threshold and the `else` branch returns it as is (the night run's leak,
+/// 18 GB at step 300, 76 GB at step 9100).
+fn clipping_a_fresh_gradient(max_norm: &str) -> i64 {
+    leak_per_iteration(
+        "struct Net { d: Dense<f32, 64, 48> }
+ impl Trainable<Net> {}",
+        &format!(
+            "let b: Tensor<f32, 1, 48> = Init::xavier();
+             for i in 0..STEPS {{
+                 let c = clip_grad_norm(Net(d: Dense(w: g, b: b)), {max_norm});
+                 m = m + c.d.w;
+             }};"
+        ),
+    )
+}
+
+/// The generic shape behind `clip_grad_norm`'s leak: a function returning
+/// its (borrowed) parameter on one path and a fresh value on the other.
+/// Its callers took the result for the argument itself and kept from
+/// releasing it, so the fresh path leaked the argument; the parameter is
+/// now retained where it's returned (`refcount.rs::returned_param_args`).
+#[test]
+fn returning_a_parameter_on_one_path_only_leaves_nothing_behind() {
+    let per = leak_per_iteration(
+        "struct Net { d: Dense<f32, 64, 48> }
+         fn rebuilt_or_kept(g: Net, t: f32) -> Net {
+             if t < 1000.0 { Net(d: Dense(w: g.d.w + g.d.w, b: g.d.b)) } else { g }
+         }",
+        "let b: Tensor<f32, 1, 48> = Init::xavier();
+         for i in 0..STEPS {
+             let rebuilt = rebuilt_or_kept(Net(d: Dense(w: g, b: b)), 0.5);
+             let kept = rebuilt_or_kept(Net(d: Dense(w: g, b: b)), 5000.0);
+             m = m + rebuilt.d.w + kept.d.w;
+         };",
+    );
+    assert!(per < NOISE, "{per} bytes per pair of calls");
+}
+
+#[test]
+fn clipping_a_fresh_gradient_that_is_scaled_leaves_no_allocation_behind() {
+    let per = clipping_a_fresh_gradient("0.001");
+    assert!(per < NOISE, "{per} bytes per clip");
+}
+
+#[test]
+fn clipping_a_fresh_gradient_that_is_kept_leaves_no_allocation_behind() {
+    let per = clipping_a_fresh_gradient("1000000.0");
+    assert!(per < NOISE, "{per} bytes per clip");
+}
+
 #[test]
 fn a_tied_embedding_gradient_leaves_no_allocation_behind() {
     let per = leak_per_iteration(

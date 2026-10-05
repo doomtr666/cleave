@@ -34,6 +34,7 @@ unsafe extern "C" {
         loop_unroll: bool,
     ) -> MlirExecutionEngine;
     fn cleaveApproximateMath(op: MlirOperation) -> bool;
+    fn cleaveHoistArgSlots(op: MlirOperation);
     fn cleaveLowerSpawns(op: MlirOperation, tasks: bool) -> bool;
 }
 
@@ -61,6 +62,19 @@ pub unsafe fn lower_spawns(op: MlirOperation, tasks: bool) -> bool {
 /// `op` must be a valid operation, not used concurrently.
 pub unsafe fn approximate_math(op: MlirOperation) -> bool {
     unsafe { cleaveApproximateMath(op) }
+}
+
+/// Moves every argument slot (`cleave.arg_slot`, `cleave.spawn_arg_slot`)
+/// an inlined call left in a non-entry block of its function back to the
+/// entry block, and bounds an ordinary call's slot's lifetime to its uses so
+/// that LLVM can share storage between slots (`cpp/shim.cpp`'s
+/// `cleaveHoistArgSlots`). Run once loops are blocks.
+///
+/// # Safety
+///
+/// `op` must be a valid operation, not used concurrently.
+pub unsafe fn hoist_arg_slots(op: MlirOperation) {
+    unsafe { cleaveHoistArgSlots(op) }
 }
 
 /// Borrows `s`'s own bytes -- the C++ side only ever reads this synchronously

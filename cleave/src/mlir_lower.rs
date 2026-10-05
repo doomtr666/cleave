@@ -1629,8 +1629,9 @@ fn by_pointer(ctx: &LowerCtx, callee: &str, ty: &Ty) -> bool {
 /// A call's argument values for `callee` (`param_types` its parameters'
 /// types): each lowered as usual, a by-pointer one (`by_pointer`) stored to
 /// a slot allocated in the caller's entry block and passed as the slot's
-/// address. The slot lives as long as the caller's frame, so a spawned call
-/// reading it from its task (`lower_spawn`) finds it intact until the
+/// address. An ordinary call's slot only lives around the call
+/// (`cleave_mlir_shim::hoist_arg_slots`); a `spawned` call's lives as long as
+/// the caller's frame, so its task (`lower_spawn`) finds it intact until the
 /// caller's `sync`.
 fn call_arguments<'c>(
     ctx: &LowerCtx<'c, '_>,
@@ -1639,6 +1640,7 @@ fn call_arguments<'c>(
     callee: &str,
     args: &[CVal],
     param_types: &[Ty],
+    spawned: bool,
 ) -> Vec<Value<'c, 'c>> {
     let context = ctx.context;
     args.iter()
@@ -1648,7 +1650,7 @@ fn call_arguments<'c>(
             if !by_pointer(ctx, callee, t) {
                 return value;
             }
-            let slot = entry_alloca(ctx, ty_to_mlir(ctx, t));
+            let slot = entry_alloca(ctx, ty_to_mlir(ctx, t), spawned);
             block.append_operation(llvm::store(context, value, slot, gen_loc(context), LoadStoreOptions::new()));
             slot
         })
@@ -1656,8 +1658,9 @@ fn call_arguments<'c>(
 }
 
 /// One `llvm.alloca` of `ty`, at the start of the current function's entry
-/// block (`LowerCtx::entry_block`).
-fn entry_alloca<'c>(ctx: &LowerCtx<'c, '_>, ty: Type<'c>) -> Value<'c, 'c> {
+/// block (`LowerCtx::entry_block`), for an argument of a call, `spawned` or
+/// not.
+fn entry_alloca<'c>(ctx: &LowerCtx<'c, '_>, ty: Type<'c>, spawned: bool) -> Value<'c, 'c> {
     let context = ctx.context;
     let raw = ctx.entry_block.get().expect("MLIR lowering: no entry block for an argument slot");
     // SAFETY: `raw` is the entry block of the function being lowered
@@ -1668,16 +1671,18 @@ fn entry_alloca<'c>(ctx: &LowerCtx<'c, '_>, ty: Type<'c>) -> Value<'c, 'c> {
     let i64_ty: Type = IntegerType::new(context, 64).into();
     let one_op = entry.insert_operation(0, arith::constant(context, IntegerAttribute::new(i64_ty, 1).into(), location));
     let one: Value = one_op.result(0).unwrap().into();
-    let alloca = entry.insert_operation_after(
-        one_op,
-        llvm::alloca(
-            context,
-            one,
-            llvm::r#type::pointer(context, 0),
-            location,
-            llvm::AllocaOptions::new().elem_type(Some(TypeAttribute::new(ty))),
-        ),
+    let mut slot = llvm::alloca(
+        context,
+        one,
+        llvm::r#type::pointer(context, 0),
+        location,
+        llvm::AllocaOptions::new().elem_type(Some(TypeAttribute::new(ty))),
     );
+    // Moved back here if inlining carries it into a loop, and given a
+    // lifetime unless spawned (`cleave_mlir_shim::hoist_arg_slots`).
+    let mark = if spawned { "cleave.spawn_arg_slot" } else { "cleave.arg_slot" };
+    slot.set_discardable_attribute(mark, Attribute::unit(context));
+    let alloca = entry.insert_operation_after(one_op, slot);
     alloca.result(0).unwrap().into()
 }
 
@@ -2396,7 +2401,7 @@ fn lower_loop<'c>(
         // itself (`emit_call`'s own convention, see `cps.rs`), not a real arg.
         let real_cond_args = &cond_call.args[..cond_call.args.len() - 1];
         let cond_arg_values: Vec<Value> =
-            call_arguments(ctx, &before_block, &before_env, cond_call.callee, real_cond_args, cond_param_types);
+            call_arguments(ctx, &before_block, &before_env, cond_call.callee, real_cond_args, cond_param_types, false);
         let cond_call_op = before_block.append_operation(func::call(
             context,
             FlatSymbolRefAttribute::new(context, cond_call.callee),
@@ -2595,7 +2600,7 @@ fn lower_real_call<'c>(
     // §7) emits the call — no MLIR heuristic can ever do that job for an
     // opaque extern symbol. The CPS-level fact itself stays built and
     // tested; only this now-proven-inert consumer was removed.
-    let arg_values: Vec<Value> = call_arguments(ctx, block, &env, callee, real_args, param_types);
+    let arg_values: Vec<Value> = call_arguments(ctx, block, &env, callee, real_args, param_types, false);
     let location = gen_loc(context);
     // A `()`-returning callee is declared with *zero* MLIR results
     // (`lower_top_level_fn`'s own `is_unit`/`results` handling, applied to
@@ -2818,7 +2823,7 @@ fn lower_prim_op<'c>(
             let Some((param_types, _)) = ctx.signatures.get(unit.as_str()) else {
                 panic!("MLIR lowering: leaf glue `{unit}` isn't a function of the program");
             };
-            let values = call_arguments(ctx, block, env, unit, args, param_types);
+            let values = call_arguments(ctx, block, env, unit, args, param_types, false);
             block.append_operation(func::call(
                 ctx.context,
                 FlatSymbolRefAttribute::new(ctx.context, unit),
@@ -7246,7 +7251,8 @@ fn lower_spawn<'c>(
         panic!("MLIR lowering: spawn of unknown top-level fn `{unit}`");
     };
     let context = ctx.context;
-    let arg_values: Vec<Value> = call_arguments(ctx, block, env, unit, args, param_types);
+    let tasks = crate::options::current().tasks;
+    let arg_values: Vec<Value> = call_arguments(ctx, block, env, unit, args, param_types, tasks);
     let results: Vec<Type> = if is_unit_ty(result_ty) {
         vec![]
     } else {
@@ -7255,7 +7261,7 @@ fn lower_spawn<'c>(
     // Without tasks (`CodegenOptions::tasks`), an ordinary call: no marker,
     // and inlinable like any other — `no_inline` would cost the fusion an
     // inlined call gets, for a call that runs in place anyway.
-    if !crate::options::current().tasks {
+    if !tasks {
         let call = block.append_operation(func::call(context, FlatSymbolRefAttribute::new(context, unit), &arg_values, &results, gen_loc(context)));
         return (!results.is_empty()).then(|| call.result(0).unwrap().into());
     }
