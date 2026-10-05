@@ -26,6 +26,7 @@
 #include "mlir/ExecutionEngine/OptUtils.h"
 #include "mlir/Dialect/Math/Transforms/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
@@ -314,6 +315,46 @@ extern "C" void cleaveHoistArgSlots(MlirOperation op) {
       b.create<LLVM::LifetimeEndOp>(a.getLoc(), a.getResult());
     }
   });
+}
+
+// A tensor that outlives the struct it was read from is adopted
+// (`PrimOp::Adopt`, `mlir_lower.rs`): a `bufferization.clone` marked
+// `cleave.adopt`, so that MLIR's ownership-based buffer deallocation, which
+// runs before this, takes it for a fresh buffer it owns and releases. Each
+// becomes a retain of the very same buffer instead of a copy: every buffer
+// is reference counted (`unify_alloc.rs`), so that release only drops the
+// reference the retain added.
+extern "C" void cleaveLowerAdoptions(MlirOperation op) {
+  auto module = cast<ModuleOp>(unwrap(op));
+  SmallVector<bufferization::CloneOp> clones;
+  module.walk([&](bufferization::CloneOp clone) {
+    if (clone->hasAttr("cleave.adopt"))
+      clones.push_back(clone);
+  });
+  if (clones.empty())
+    return;
+  MLIRContext *context = module.getContext();
+  auto ptrTy = LLVM::LLVMPointerType::get(context);
+  auto retain = module.lookupSymbol<func::FuncOp>("cleave_retain");
+  if (!retain) {
+    OpBuilder b(module.getBodyRegion());
+    retain = b.create<func::FuncOp>(module.getLoc(), "cleave_retain", FunctionType::get(context, {ptrTy}, {}));
+    retain.setPrivate();
+  }
+  for (bufferization::CloneOp clone : clones) {
+    OpBuilder b(clone);
+    Location loc = clone.getLoc();
+    Value buffer = clone.getInput();
+    Value index = b.create<memref::ExtractAlignedPointerAsIndexOp>(loc, buffer);
+    Value address = b.create<arith::IndexCastOp>(loc, b.getI64Type(), index);
+    Value ptr = b.create<LLVM::IntToPtrOp>(loc, ptrTy, address);
+    b.create<func::CallOp>(loc, retain, ValueRange{ptr});
+    Value result = clone.getOutput();
+    if (result.getType() != buffer.getType())
+      buffer = b.create<memref::CastOp>(loc, result.getType(), buffer);
+    result.replaceAllUsesWith(buffer);
+    clone.erase();
+  }
 }
 
 // Rewrites the transcendental `math` ops into polynomial approximations made

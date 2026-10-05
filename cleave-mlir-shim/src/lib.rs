@@ -35,6 +35,7 @@ unsafe extern "C" {
     ) -> MlirExecutionEngine;
     fn cleaveApproximateMath(op: MlirOperation) -> bool;
     fn cleaveHoistArgSlots(op: MlirOperation);
+    fn cleaveLowerAdoptions(op: MlirOperation);
     fn cleaveLowerSpawns(op: MlirOperation, tasks: bool) -> bool;
 }
 
@@ -75,6 +76,18 @@ pub unsafe fn approximate_math(op: MlirOperation) -> bool {
 /// `op` must be a valid operation, not used concurrently.
 pub unsafe fn hoist_arg_slots(op: MlirOperation) {
     unsafe { cleaveHoistArgSlots(op) }
+}
+
+/// Turns each adoption (a `bufferization.clone` marked `cleave.adopt`,
+/// `mlir_lower.rs`'s `PrimOp::Adopt`) into a retain of the same buffer
+/// (`cpp/shim.cpp`'s `cleaveLowerAdoptions`). Run after the buffer
+/// deallocation passes, before `bufferization-to-memref`.
+///
+/// # Safety
+///
+/// `op` must be a valid `builtin.module`, not used concurrently.
+pub unsafe fn lower_adoptions(op: MlirOperation) {
+    unsafe { cleaveLowerAdoptions(op) }
 }
 
 /// Borrows `s`'s own bytes -- the C++ side only ever reads this synchronously

@@ -1302,10 +1302,19 @@ pub fn lower_to_llvm<'c>(
     pass_manager.add_pass(pass::bufferization::create_ownership_based_buffer_deallocation_pass());
     pass_manager.add_pass(pass::bufferization::create_buffer_deallocation_simplification_pass());
     pass_manager.add_pass(pass::bufferization::create_lower_deallocations_pass());
-    pass_manager.add_pass(pass::conversion::create_bufferization_to_mem_ref());
     if timed_run(&pass_manager, &mut *module, line!()).is_err() {
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (buffer-deallocation)".to_string(),
+        ]);
+    }
+    // Adopted tensors (`PrimOp::Adopt`): the deallocation above took each for
+    // a fresh buffer; it is a retain of the same one.
+    unsafe { cleave_mlir_shim::lower_adoptions(module.as_operation().to_raw()) };
+    let pass_manager = pass::PassManager::new(context);
+    pass_manager.add_pass(pass::conversion::create_bufferization_to_mem_ref());
+    if timed_run(&pass_manager, &mut *module, line!()).is_err() {
+        return Err(vec![
+            "MLIR-to-LLVM lowering pass failed (bufferization-to-memref)".to_string(),
         ]);
     }
 

@@ -2812,6 +2812,42 @@ fn lower_prim_op<'c>(
             }
             None
         }
+        // `bufferization.clone`, marked: MLIR's buffer deallocation takes
+        // its result for a fresh, owned buffer and releases it, and
+        // `cleave_mlir_shim::lower_adoptions` then turns the clone into a
+        // retain of the same buffer, no copy (`PrimOp::Adopt`'s doc).
+        PrimOp::Adopt(tensor_ty) => {
+            let CVal::Var(tensor_var) = &args[0] else {
+                panic!("MLIR lowering: an adoption's operand must be a variable");
+            };
+            let tensor_val = *env
+                .get(tensor_var)
+                .unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{tensor_var}"));
+            let context = ctx.context;
+            let location = gen_loc(context);
+            let memref_ty = tensor_memref_type(ctx, tensor_ty);
+            let to_buffer = OperationBuilder::new("bufferization.to_buffer", location)
+                .add_operands(&[tensor_val])
+                .add_results(&[memref_ty])
+                .build()
+                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build bufferization.to_buffer: {e}"));
+            let buffer: Value = block.append_operation(to_buffer).result(0).unwrap().into();
+            let unit = Attribute::parse(context, "unit").expect("`unit` is a valid attribute");
+            let clone = OperationBuilder::new("bufferization.clone", location)
+                .add_operands(&[buffer])
+                .add_results(&[memref_ty])
+                .add_attributes(&[(Identifier::new(context, "cleave.adopt"), unit)])
+                .build()
+                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build bufferization.clone: {e}"));
+            let owned: Value = block.append_operation(clone).result(0).unwrap().into();
+            let to_tensor = OperationBuilder::new("bufferization.to_tensor", location)
+                .add_operands(&[owned])
+                .add_results(&[tensor_val.r#type()])
+                .add_attributes(&[(Identifier::new(context, "restrict"), unit)])
+                .build()
+                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build bufferization.to_tensor: {e}"));
+            Some(block.append_operation(to_tensor).result(0).unwrap().into())
+        }
         // A light struct's leaves retained or released by its type's glue
         // function, a top-level function of the program (`refcount::
         // glue_function`), called like any other unit-returning one.
@@ -3699,6 +3735,18 @@ pub(crate) fn memref_descriptor_llvm_type<'c>(context: &'c Context, rank: usize)
 /// tensor value that came straight from `descriptor_value_to_tensor` below
 /// never actually re-derives anything at runtime, it's the identical
 /// instruction either way once the pipeline's own canonicalizer runs.
+/// The identity-layout `memref` type a bare tensor of cleave type `ty`
+/// (a `#[mlir_type(tensor)]` struct) bufferizes to.
+fn tensor_memref_type<'c>(ctx: &LowerCtx<'c, '_>, ty: &Ty) -> Type<'c> {
+    let (name, type_args) = struct_name_and_args(ty);
+    let fields = struct_field_types(&ctx.struct_schemas, name, type_args);
+    let [(_, inner_ty)] = fields.as_slice() else {
+        panic!("MLIR lowering: `#[mlir_type(tensor)]` requires exactly one field, `{name}` has {}", fields.len());
+    };
+    let (dims, leaf_ty) = flatten_array_dims(inner_ty);
+    MemRefType::new(ty_to_mlir(ctx, leaf_ty), &dims, None, None).into()
+}
+
 fn tensor_value_to_ptr<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,

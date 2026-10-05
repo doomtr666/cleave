@@ -107,7 +107,10 @@ allocated (`structs_inside_light_containers`). It is conservative (a plain light
 struct was fine before) and costs the pool to such structs; find the remaining cause, then narrow it.
 MNIST has no heavy struct and is unaffected.
 
-## A gradient leaving an `if` crashes
+## A gradient leaving an `if` crashes — no longer reproduces (2026-10-05)
+
+The test passes on `HEAD`'s `refcount.rs`/`alias_analysis.rs` too, so an earlier change fixed it
+(not identified); un-ignored as a regression test. The original report:
 
 `let g = if c { net_grad(x, y, net) } else { net_grad(x, y, net) };` crashes at run time
 (`cleave/tests/leaks.rs`, `a_gradient_leaving_an_if_does_not_crash`, ignored until fixed). With two
@@ -2079,7 +2082,24 @@ ML is one client of the stdlib among many; the target is computational science a
 
 Progression: building blocks → `FixedPoint` / `Solve` with implicit gradients → discretizations (finite differences, finite volumes, then finite elements) → hybrids.
 
-## A loop carrying a bare tensor *and* a struct, reassigned together from a returned tuple, leaks every iteration (found 2026-10-04)
+## A loop carrying a bare tensor *and* a struct, reassigned together from a returned tuple, leaks every iteration (found 2026-10-04) — fixed 2026-10-05
+
+Two causes, as suspected below. (1) A tensor read out of a field is a *view* of its container
+(`refcount.rs::TensorViews`), which keeps the container alive by handing it to wherever the view
+goes; a loop's back-edge can't take it along (iteration N's tuple isn't in scope at N+1), so the
+tuple was never released. (2) A bare tensor carried by a loop is MLIR's to free
+(`ownership-based-buffer-deallocation`), which only frees the previous iteration's buffer if it
+owns it: a call's result, yes; a tensor read out of a struct, never. Fix: a tensor read out of a
+field and passed straight to a loop (`TensorViews::standalone`) is *adopted* (`PrimOp::Adopt`), a
+`bufferization.clone` marked `cleave.adopt` (`mlir_lower.rs`) that the deallocation pass takes for a
+fresh owned buffer, then turned into a retain of the same buffer, no copy
+(`cleave_mlir_shim::lower_adoptions`, between the deallocation passes and `bufferization-to-memref`);
+its container is no longer kept alive and is released as usual. `carried_3_both_from_a_tuple` and
+`muon_steps_leave_no_allocation_behind` pass and are no longer ignored; clean under
+`CLEAVE_DEBUG_POOL=1`. nanoLM unchanged (its tensors are carried inside light structs). Not covered
+yet: a view reaching a loop through an intermediate join's parameter rather than directly.
+
+The original analysis:
 
 `for .. { (m, s) = f(m, g, s); }` with `m` a `Tensor` and `s` a struct (an `AdamState`): about two
 tensors' worth left allocated per iteration (`leaks.rs::carried_3_both_from_a_tuple`, ignored, and
@@ -2184,7 +2204,7 @@ v2's extra memory was this.
 
 Side findings, not from this fix (both reproduced on `HEAD`'s `refcount.rs`/`alias_analysis.rs`):
 `leaks.rs::a_gradient_leaving_an_if_does_not_crash` (ignored, "A gradient leaving an `if` crashes"
-above) passes, so an earlier change fixed it, to un-ignore; and `examples/complex.cleave` under
+above) passes, so an earlier change fixed it (un-ignored since); and `examples/complex.cleave` under
 `CLEAVE_DEBUG_POOL=1` reports a double release of a 1-byte block through `cleave_release_void`
 (bufferization), likely `println`'s `"\n"` handed back by `extern print_bytes`, invisible without
 the debug pool.

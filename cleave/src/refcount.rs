@@ -426,10 +426,20 @@ fn local_free_vars(def: &CFunDef, views: &TensorViews) -> (HashSet<CVar>, HashSe
 /// chain). `handed`: for each local def a view reaches through a jump (a
 /// real call's continuation, a join or loop the view is passed to), the
 /// containers that must stay alive into it and be released there.
+///
+/// `standalone`: tensors read out of a field that are passed straight to a
+/// loop as carried values. A container can't be handed around a loop: the
+/// one of iteration N isn't in scope at iteration N+1, so nothing released
+/// it, nor the previous carried tensor (`(m, s) = next_both(m, g, s)`
+/// leaked a tuple and a tensor every iteration). Such a read is adopted
+/// instead (`PrimOp::Adopt`, `rewrite_body`): a buffer of its own, which
+/// MLIR's buffer deallocation releases like any carried tensor, and its
+/// container is released as usual.
 #[derive(Default)]
 struct TensorViews {
     container: HashMap<CVar, CVar>,
     handed: HashMap<String, HashSet<CVar>>,
+    standalone: HashSet<CVar>,
 }
 
 impl TensorViews {
@@ -448,31 +458,44 @@ impl TensorViews {
 
     fn build(top: &CTopLevelFn, var_types: &HashMap<CVar, Ty>, mlir_types: &HashMap<String, String>) -> Self {
         let mut views = TensorViews::default();
-        views.collect_containers(&top.def.body, var_types, mlir_types);
+        let mut loop_args = HashSet::new();
+        collect_loop_args(&top.def.body, &loop_names(&top.def.body), &mut loop_args);
+        views.collect_containers(&top.def.body, &loop_args, var_types, mlir_types);
         views.collect_handed(&top.def.body);
         views
     }
 
-    fn collect_containers(&mut self, e: &CExpr, var_types: &HashMap<CVar, Ty>, mlir_types: &HashMap<String, String>) {
+    /// `loop_args`: every variable passed straight to a loop (`standalone`).
+    fn collect_containers(
+        &mut self,
+        e: &CExpr,
+        loop_args: &HashSet<CVar>,
+        var_types: &HashMap<CVar, Ty>,
+        mlir_types: &HashMap<String, String>,
+    ) {
         match e {
             CExpr::LetPrim { var, op, args, cont, .. } => {
                 if let (PrimOp::Field { .. }, Some(CVal::Var(base))) = (op, args.first()) {
                     if var_types.get(var).is_some_and(|t| is_bare_tensor_ty(t, mlir_types)) {
-                        self.container.insert(*var, *base);
+                        if loop_args.contains(var) {
+                            self.standalone.insert(*var);
+                        } else {
+                            self.container.insert(*var, *base);
+                        }
                     }
                 }
-                self.collect_containers(cont, var_types, mlir_types);
+                self.collect_containers(cont, loop_args, var_types, mlir_types);
             }
             CExpr::App { .. } => {}
             CExpr::If { then_branch, else_branch, .. } => {
-                self.collect_containers(then_branch, var_types, mlir_types);
-                self.collect_containers(else_branch, var_types, mlir_types);
+                self.collect_containers(then_branch, loop_args, var_types, mlir_types);
+                self.collect_containers(else_branch, loop_args, var_types, mlir_types);
             }
             CExpr::Fix { defs, body } => {
                 for d in defs {
-                    self.collect_containers(&d.body, var_types, mlir_types);
+                    self.collect_containers(&d.body, loop_args, var_types, mlir_types);
                 }
-                self.collect_containers(body, var_types, mlir_types);
+                self.collect_containers(body, loop_args, var_types, mlir_types);
             }
         }
     }
@@ -505,6 +528,53 @@ impl TensorViews {
                 }
                 self.collect_handed(body);
             }
+        }
+    }
+}
+
+/// The names of the loops defined in `e` (`alias_analysis::is_loop_def`).
+fn loop_names(e: &CExpr) -> HashSet<String> {
+    fn walk(e: &CExpr, out: &mut HashSet<String>) {
+        match e {
+            CExpr::LetPrim { cont, .. } => walk(cont, out),
+            CExpr::App { .. } => {}
+            CExpr::If { then_branch, else_branch, .. } => {
+                walk(then_branch, out);
+                walk(else_branch, out);
+            }
+            CExpr::Fix { defs, body } => {
+                for d in defs {
+                    if crate::alias_analysis::is_loop_def(d) {
+                        out.insert(d.name.clone());
+                    }
+                    walk(&d.body, out);
+                }
+                walk(body, out);
+            }
+        }
+    }
+    let mut out = HashSet::new();
+    walk(e, &mut out);
+    out
+}
+
+/// Every variable passed as an argument to a jump into one of `loops`.
+fn collect_loop_args(e: &CExpr, loops: &HashSet<String>, out: &mut HashSet<CVar>) {
+    match e {
+        CExpr::LetPrim { cont, .. } => collect_loop_args(cont, loops, out),
+        CExpr::App { func: CVal::Label(name), args } if loops.contains(name) => {
+            out.extend(args.iter().filter_map(|a| if let CVal::Var(v) = a { Some(*v) } else { None }));
+        }
+        CExpr::App { .. } => {}
+        CExpr::If { then_branch, else_branch, .. } => {
+            collect_loop_args(then_branch, loops, out);
+            collect_loop_args(else_branch, loops, out);
+        }
+        CExpr::Fix { defs, body } => {
+            for d in defs {
+                collect_loop_args(&d.body, loops, out);
+            }
+            collect_loop_args(body, loops, out);
         }
     }
 }
@@ -1536,6 +1606,20 @@ fn rewrite_body(
     ctx: &RefcountCtx,
 ) -> CExpr {
     match expr {
+        // A tensor read out of a field and carried by a loop
+        // (`TensorViews::standalone`): read into a fresh variable, then
+        // adopted under the original one.
+        CExpr::LetPrim { var, ty, op: op @ PrimOp::Field { .. }, args, cont } if ctx.views.standalone.contains(&var) => {
+            let read = ctx.fresh.var();
+            let adopted = CExpr::LetPrim {
+                var,
+                ty: ty.clone(),
+                op: PrimOp::Adopt(ty.clone()),
+                args: vec![CVal::Var(read)],
+                cont,
+            };
+            rewrite_body(CExpr::LetPrim { var: read, ty, op, args, cont: Box::new(adopted) }, owned, k_ret, ctx)
+        }
         CExpr::LetPrim {
             var,
             ty,
@@ -2249,8 +2333,6 @@ fn live_set(func: &CVal, args: &[CVal], ctx: &RefcountCtx) -> HashSet<CVar> {
     live
 }
 
-/// Exactly the entries of `owned` *not* covered by `live_set` — what's safe
-/// to release right before this jump.
 /// The local joins of `top` (not loops) whose parameter at some position
 /// reaches `k_ret` unchanged, through other such joins: whatever is passed
 /// there becomes this function's result.
@@ -2351,6 +2433,8 @@ fn retain_returned_params(returned: Vec<(CVar, Ty)>, inner: CExpr, ctx: &Refcoun
     result
 }
 
+/// Exactly the entries of `owned` *not* covered by `live_set` — what's safe
+/// to release right before this jump.
 fn releases_for_app(
     func: &CVal,
     args: &[CVal],

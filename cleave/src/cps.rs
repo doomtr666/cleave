@@ -1236,6 +1236,14 @@ pub enum PrimOp {
     /// once for its type (`refcount::glue_function`). Unit-valued, an
     /// effect like `Retain`/`Release`; inserted by refcounting only.
     LeafGlue { unit: String },
+    /// `args = [tensor]`: the same tensor as a buffer of its own, owned by
+    /// whoever receives it, for a tensor read out of a field that outlives
+    /// its container (`refcount.rs::TensorViews::standalone`). Retains the
+    /// buffer rather than copying it; MLIR's buffer deallocation, which
+    /// owns a bare tensor's buffer, sees it as a fresh allocation and
+    /// releases it (`cleave_mlir_shim::lower_adoptions`). `Ty` is the
+    /// tensor's type. Inserted by refcounting only.
+    Adopt(Ty),
 }
 
 #[derive(Debug, Clone)]
@@ -4519,6 +4527,7 @@ fn prim_op_str(op: &PrimOp) -> String {
         PrimOp::Retain(_) => "retain".to_string(),
         PrimOp::Release(_) => "release".to_string(),
         PrimOp::LeafGlue { unit } => format!("leaf-glue.{unit}"),
+        PrimOp::Adopt(_) => "adopt".to_string(),
         PrimOp::Spawn { unit } => format!("spawn.{unit}"),
         PrimOp::Await => "await".to_string(),
         PrimOp::Sync => "sync".to_string(),

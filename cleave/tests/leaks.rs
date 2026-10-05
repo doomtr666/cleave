@@ -255,7 +255,6 @@ fn values_leaving_an_if_are_released() {
 /// allocated in its loop's region, and its result through the `if`'s join
 /// takes a path the region allocator otherwise always hides.
 #[test]
-#[ignore = "crashes: doc/backlog.md, A gradient leaving an `if` crashes"]
 fn a_gradient_leaving_an_if_does_not_crash() {
     let squares = "let err = forward(x, net) - y; sum(err * err)";
     let through_if = "if s >= 0 { net_grad(x, y, net) } else { net_grad(x, y, net) }";
@@ -334,7 +333,6 @@ fn leak_per_iteration(prelude: &str, body: &str) -> i64 {
 }
 
 #[test]
-#[ignore = "leaks: doc/backlog.md, A loop carrying a bare tensor *and* a struct ... leaks every iteration"]
 fn muon_steps_leave_no_allocation_behind() {
     let per = leak_per_iteration(
         "",
@@ -466,7 +464,6 @@ fn carried_2_a_struct_rebuilt() {
 }
 
 #[test]
-#[ignore = "leaks: doc/backlog.md, A loop carrying a bare tensor *and* a struct ... leaks every iteration"]
 fn carried_3_both_from_a_tuple() {
     let per = leak_per_iteration(
         CARRIED,
