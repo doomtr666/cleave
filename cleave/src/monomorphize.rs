@@ -382,7 +382,7 @@ pub fn monomorphize(
     // dependent) correctness bug, not just a missing-resolution one,
     // reproduced directly and root-caused precisely before this fix.
     let mut shared_vars = TyVarGen::starting_at(program_inference.next_var_id);
-    let templates = build_impl_templates(
+    let (templates, template_errors) = build_impl_templates(
         program,
         registry,
         &program_inference.global_env,
@@ -394,7 +394,7 @@ pub fn monomorphize(
         specializations: HashMap::new(),
         by_origin: HashMap::new(),
         seed_call_names: HashMap::new(),
-        errors: Vec::new(),
+        errors: template_errors,
         templates: templates.clone(),
     };
     let mut fn_worklist: Vec<(String, Vec<Ty>)> = Vec::new();
@@ -768,8 +768,9 @@ fn build_impl_templates(
     registry: &Registry,
     global_env: &Env,
     shared_vars: &mut TyVarGen,
-) -> Vec<ImplTemplate> {
+) -> (Vec<ImplTemplate>, Vec<TypeError>) {
     let mut templates = Vec::new();
+    let mut errors = Vec::new();
     for item in &program.items {
         let ItemKind::Impl(d) = &item.kind else {
             continue;
@@ -811,8 +812,17 @@ fn build_impl_templates(
             // still-numbered ones — harmless on their own since nothing
             // references them, but needless risk for zero benefit).
             *shared_vars = infer.current_vars();
-            let Ok(ret_pattern) = result else {
-                continue;
+            // A body that doesn't type-check generically used to drop the
+            // method silently: every call to it then failed later, elsewhere
+            // ("CPS: could not resolve call to `Activation::gelu`"), and
+            // finding the real error took instrumenting this pass. It is
+            // the error now, where it is.
+            let ret_pattern = match result {
+                Ok(ret) => ret,
+                Err(e) => {
+                    errors.push(e);
+                    continue;
+                }
             };
             // Whether *this template's own resolved patterns* still carry a
             // free variable — not just whether the *impl* itself declared
@@ -892,7 +902,7 @@ fn build_impl_templates(
             });
         }
     }
-    templates
+    (templates, errors)
 }
 
 /// Every `Lambda` expression, anywhere in any top-level `fn`'s body, that
@@ -1292,13 +1302,14 @@ fn collect_instantiations_expr(
                                 kind: TypeErrorKind::AmbiguousDispatch { algebra, candidates },
                             });
                         }
-                        ImplMatch::NoneMatched { algebra, tys } => {
+                        ImplMatch::NoneMatched { algebra, tys, candidates } => {
                             errors.push(TypeError {
                                 span: expr.span,
                                 kind: TypeErrorKind::MonomorphizationFailed {
                                     algebra,
                                     method: method.clone(),
                                     tys,
+                                    candidates,
                                 },
                             });
                         }
@@ -1391,13 +1402,14 @@ fn collect_instantiations_expr(
                         kind: TypeErrorKind::AmbiguousDispatch { algebra, candidates },
                     });
                 }
-                ImplMatch::NoneMatched { algebra, tys } => {
+                ImplMatch::NoneMatched { algebra, tys, candidates } => {
                     errors.push(TypeError {
                         span: expr.span,
                         kind: TypeErrorKind::MonomorphizationFailed {
                             algebra,
                             method: name,
                             tys,
+                            candidates,
                         },
                     });
                 }
@@ -1455,13 +1467,14 @@ fn collect_instantiations_expr(
                                 kind: TypeErrorKind::AmbiguousDispatch { algebra, candidates },
                             });
                         }
-                        ImplMatch::NoneMatched { algebra, tys } => {
+                        ImplMatch::NoneMatched { algebra, tys, candidates } => {
                             errors.push(TypeError {
                                 span: expr.span,
                                 kind: TypeErrorKind::MonomorphizationFailed {
                                     algebra,
                                     method: "index".to_string(),
                                     tys,
+                                    candidates,
                                 },
                             });
                         }
@@ -1768,6 +1781,9 @@ enum ImplMatch {
     NoneMatched {
         algebra: String,
         tys: String,
+        /// Each candidate impl, its inferred signature and why it didn't
+        /// match (`TypeErrorKind::MonomorphizationFailed::candidates`).
+        candidates: Vec<String>,
     },
     /// Several impls match this call's types: the call doesn't determine
     /// which one it means (`derive_impl_instantiation`'s own doc comment).
@@ -2910,16 +2926,22 @@ fn derive_impl_instantiation_for(
     // at most one, so several means the call itself doesn't determine its
     // impl — an indeterminacy to report, never a choice to make.
     let mut matches: Vec<(usize, Option<HashMap<TyVar, Ty>>)> = Vec::new();
+    // Why each candidate was rejected, for the error if none matches.
+    let mut rejected: Vec<String> = Vec::new();
     for (idx, t) in templates.iter().enumerate() {
-        if t.method_name != method
-            || t.param_patterns.len() != arg_tys.len()
-            || algebra.is_some_and(|a| t.algebra != a)
-        {
+        if t.method_name != method || algebra.is_some_and(|a| t.algebra != a) {
             continue;
         }
         let pattern = Ty::Fn(t.param_patterns.clone(), Box::new(t.ret_pattern.clone()));
+        let targets: Vec<String> = t.target_patterns.iter().map(ToString::to_string).collect();
+        let impl_name = format!("impl {}<{}>", t.algebra, targets.join(", "));
+        if t.param_patterns.len() != arg_tys.len() {
+            rejected.push(format!("{impl_name}: takes {} argument(s)", t.param_patterns.len()));
+            continue;
+        }
         let mut trial = Subst::default();
         if unify(&mut trial, &pattern, &query).is_err() {
+            rejected.push(format!("{impl_name}: its body's inference gives it {pattern}"));
             continue;
         }
         if !t.is_generic {
@@ -2934,6 +2956,12 @@ fn derive_impl_instantiation_for(
                 .all(|bound| infer.has_matching_impl(bound, std::slice::from_ref(&resolved)))
         });
         if !bounds_satisfied {
+            let unmet: Vec<String> = t
+                .generic_bounds
+                .iter()
+                .map(|(var, bounds)| format!("{}: {}", trial.apply(var), bounds.join(" + ")))
+                .collect();
+            rejected.push(format!("{impl_name}: matches, but not its bounds ({})", unmet.join(", ")));
             continue;
         }
         let mut vars = HashSet::new();
@@ -2961,6 +2989,7 @@ fn derive_impl_instantiation_for(
         0 => ImplMatch::NoneMatched {
             algebra: candidates[0].algebra.clone(),
             tys: query.to_string(),
+            candidates: rejected,
         },
         1 => match matches.pop().expect("one match") {
             (idx, Some(mapping)) => ImplMatch::Found(idx, mapping),

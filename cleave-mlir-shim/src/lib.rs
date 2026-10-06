@@ -35,6 +35,7 @@ unsafe extern "C" {
     ) -> MlirExecutionEngine;
     fn cleaveApproximateMath(op: MlirOperation) -> bool;
     fn cleaveHoistArgSlots(op: MlirOperation);
+    fn cleaveHostCpuName(buffer: *mut std::os::raw::c_char, size: usize) -> usize;
     fn cleaveLowerAdoptions(op: MlirOperation);
     fn cleaveLimitInlining(op: MlirOperation, threshold: i64) -> i64;
     fn cleaveApplyNoInline(op: MlirOperation);
@@ -66,6 +67,14 @@ pub unsafe fn lower_spawns(op: MlirOperation, tasks: bool) -> bool {
 /// `op` must be a valid operation, not used concurrently.
 pub unsafe fn approximate_math(op: MlirOperation) -> bool {
     unsafe { cleaveApproximateMath(op) }
+}
+
+/// The host CPU's LLVM name (`znver5`, ...): what `native` stands for.
+pub fn host_cpu_name() -> String {
+    let mut buffer = vec![0u8; 128];
+    let len = unsafe { cleaveHostCpuName(buffer.as_mut_ptr().cast(), buffer.len()) };
+    buffer.truncate(len.min(buffer.len() - 1));
+    String::from_utf8_lossy(&buffer).into_owned()
 }
 
 /// Moves every argument slot (`cleave.arg_slot`, `cleave.spawn_arg_slot`)

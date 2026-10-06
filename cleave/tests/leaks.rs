@@ -213,10 +213,6 @@ fn if_join_program(steps: u32) -> String {
     )
 }
 
-fn if_join_leak(variant: &str) -> i64 {
-    if_join_leak_in(variant, "total = total + pick(s);")
-}
-
 fn if_join_leak_in(variant: &str, in_loop: &str) -> i64 {
     let prog = |n| if_join_program(n).replace("VARIANT", variant).replace("INLOOP", in_loop);
     let (a, short) = run_counting(&prog(8));
@@ -325,9 +321,10 @@ fn leak_per_iteration(prelude: &str, body: &str) -> i64 {
             }}
             "
         )
+        .replace("STEPS", &steps.to_string())
     };
-    let (r8, live8) = run_counting(&program(8).replace("STEPS", "8"));
-    let (r72, live72) = run_counting(&program(72).replace("STEPS", "72"));
+    let (r8, live8) = run_counting(&program(8));
+    let (r72, live72) = run_counting(&program(72));
     assert_eq!((r8, r72), (1, 1));
     (live72 - live8) / 64
 }

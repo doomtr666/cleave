@@ -1206,12 +1206,14 @@ fn operator_with_zero_candidates_is_rejected_not_permissive() {
     // exposed return type must itself be an error, not a quietly "successful"
     // inference (see `infer_fn`'s check, found by running the CLI on a real
     // file where exactly this slipped through silently).
+    //
+    // Now an error at the call itself (`UnknownCallee`), no placeholder.
     let registry = registry_from("algebra Unrelated<T> { fn neg(a: T) -> T; }");
     let f = lower_one_fn("fn f(a: f64, b: f64) { a + b }");
     let mut infer = Infer::new(&registry);
     let err = infer.infer_fn(&f).unwrap_err();
     assert!(
-        matches!(err.kind, TypeErrorKind::Unresolved(ref p) if p == "<unresolved-call:add>"),
+        matches!(err.kind, TypeErrorKind::UnknownCallee(ref name) if name == "add"),
         "got: {:?}",
         err.kind
     );
@@ -1223,12 +1225,14 @@ fn unresolved_call_surviving_to_the_final_type_is_rejected() {
     // `fn` that isn't itself inferred yet (no cross-function inference, see
     // module docs) produces `(t) -> <unresolved-call:add>` as the lambda's
     // own type â€” this used to be returned as if inference had succeeded.
+    // Nothing declares `add` here at all: an error at the call now
+    // (`UnknownCallee`), before any placeholder could survive.
     let f = lower_one_fn("fn f() { let g = fn(x) { add(x, 1) }; g(1) }");
     let registry = Registry::default();
     let mut infer = Infer::new(&registry);
     let err = infer.infer_fn(&f).unwrap_err();
     assert!(
-        matches!(err.kind, TypeErrorKind::Unresolved(_)),
+        matches!(err.kind, TypeErrorKind::UnknownCallee(ref name) if name == "add"),
         "got: {:?}",
         err.kind
     );

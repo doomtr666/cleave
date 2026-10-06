@@ -1438,3 +1438,77 @@ fn an_impl_missing_a_function_of_its_algebra_is_an_error() {
         "the error should name the impl and the missing function: {stderr}"
     );
 }
+
+/// A generic impl method whose body doesn't type-check, whatever its
+/// generics: the error is reported in the body, where it is. The method used
+/// to be dropped silently instead, and every call to it then failed
+/// elsewhere ("CPS: could not resolve call to `Twice::twice`").
+#[test]
+fn a_generic_impl_body_that_fails_is_an_error_in_the_body() {
+    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("failing_generic_impl.cleave");
+    std::fs::write(
+        &source,
+        "algebra Twice<T> { fn twice(x: T) -> T; }\nimpl<T: Float> Twice<T> { fn twice(x) { x + true } }\nfn main() -> f32 { twice(1.5) }\n",
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--run"])
+        .arg(&source)
+        .output()
+        .expect("cannot run cleave");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "the program must not compile");
+    assert!(
+        stderr.contains("failing_generic_impl.cleave:2:41") && !stderr.contains("could not resolve call"),
+        "the error should be located at `x + true`, line 2, not at the call: {stderr}"
+    );
+}
+
+/// Runs `source` through the CLI, expecting it to fail; its `stderr`.
+fn cli_error(name: &str, source: &str) -> String {
+    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, source).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--run"])
+        .arg(&path)
+        .output()
+        .expect("cannot run cleave");
+    assert!(!output.status.success(), "{name} must not compile");
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// A call to a name nothing declares in scope (`x.to()` without `use
+/// convert;`) is an error at the call, naming it, rather than a placeholder
+/// type reported later as "could not be fully determined
+/// (<unresolved-call:convert>)" among knock-on mismatches.
+#[test]
+fn a_call_to_nothing_in_scope_is_an_error_at_the_call() {
+    let stderr = cli_error(
+        "unknown_callee.cleave",
+        "fn main() -> f32 {\n    let n: i32 = 3;\n    let x: f32 = n.to();\n    x\n}\n",
+    );
+    assert!(
+        stderr.contains("unknown_callee.cleave:3:18")
+            && stderr.contains("no `fn` or algebra method named `convert` is in scope")
+            && !stderr.contains("unresolved-call"),
+        "{stderr}"
+    );
+}
+
+/// A generic the call leaves undetermined is reported at the call, where it
+/// should be pinned, not in the callee's body where it is first needed.
+#[test]
+fn an_undetermined_generic_is_reported_at_the_call_that_leaves_it_open() {
+    let stderr = cli_error(
+        "undetermined_generic.cleave",
+        "use convert;\nfn half<T: Float>() -> T {\n    let one: i32 = 1;\n    one.to() / 2.0\n}\nfn main() -> i32 {\n    let h = half();\n    0\n}\n",
+    );
+    assert!(
+        stderr.contains("undetermined_generic.cleave:7:13") && stderr.contains("ambiguous dispatch"),
+        "the error should be at `half()`, line 7: {stderr}"
+    );
+}

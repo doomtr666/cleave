@@ -237,7 +237,14 @@ case inference already has.
 
 ---
 
-## Two diagnostics that point at the wrong thing
+## Two diagnostics that point at the wrong thing — fixed (2026-10-06)
+
+Both at the call now. A call to a name nothing declares is `TypeErrorKind::UnknownCallee` ("no `fn`
+or algebra method named `convert` is in scope (a missing `use`?)") instead of `infer_call`'s
+`<unresolved-call:…>` placeholder. A scheme's constraints instantiated at a call carry that call's
+span (`Infer::instantiate_with_mapping`'s `call_site`), so `let h = half();` leaving `T` open is
+reported at `half()`. Tests: `language_model_ops.rs::a_call_to_nothing_in_scope_is_an_error_at_the_
+call`, `an_undetermined_generic_is_reported_at_the_call_that_leaves_it_open`. The original report:
 
 - **A call to nothing in scope isn't an error of its own.** `x.to()` without `use convert;` reports
   `type could not be fully determined (<unresolved-call:convert>)` and knock-on mismatches, instead of
@@ -867,7 +874,14 @@ Picked back up directly on the allocation-gap entry above, this time modeling th
 
 **Real next step, well-specified, not yet attempted**: close the actual gap `net_grad` exercises — a shared, monomorphized algebra function (`MatMul::matmul<...>`, `Ring::add<...>`, etc.) called from *both* a region-local and a non-region-local context needs a *per-call-site*, not per-function, allocator decision. The user's own original design is the validated target: thread the enclosing loop's own region handle (`cleave_region_enter`'s own real return value, already computed and already threaded through `mlir_lower.rs::lower_loop`'s own `yield_targets`, per that file's own `YieldTarget` type) as a genuine extra argument into a region-local call site (`lower_real_call`), giving the shared callee's own signature an extra runtime parameter it branches on internally (`cleave_alloc_local(r, size)` vs `cleave_alloc_rc(size)`, chosen by whether `r` is a real handle or a sentinel) rather than compiled-in per function — real, cross-cutting work (touching signature generation for every algebra dispatch that might ever run in a region-local context), not a quick follow-up.
 
-## `cleave/mlir/matmul_vectorize.transform.mlir` (the matmul tile/vectorize transform-dialect schedule above) is read from a real filesystem path at runtime — breaks for a `cleave` binary shipped without its own source tree alongside it
+## `cleave/mlir/matmul_vectorize.transform.mlir` (the matmul tile/vectorize transform-dialect schedule above) is read from a real filesystem path at runtime — breaks for a `cleave` binary shipped without its own source tree alongside it — fixed (2026-10-06)
+
+The schedule is compiled into the binary (`include_str!`) and written once to the temporary
+directory under a name holding its content's hash (`pipeline.rs::matmul_schedule_path`; written
+under a temporary name then renamed, for concurrent compiles), the path `transform-preload-library`
+needs. Checked with `cleave.exe` copied out of the checkout next to a copy of `stdlib/` (which is
+found by walking up from the binary, `driver.rs::stdlib_path`): `tensor_demo.cleave` compiles and
+runs. The original report:
 
 Not urgent — flagged directly by the user, right after the file's own path got fixed from a hardcoded, machine-specific absolute path to one resolved via `env!("CARGO_MANIFEST_DIR")` (baked in at *compile* time, from wherever the crate's own source lives on the machine that built it). That fix makes the path correct on every machine that builds `cleave` from its own full source checkout — but a *compiled* `cleave` binary copied or installed somewhere else, without `cleave/mlir/` sitting next to it, will fail to find this file at first real matmul compile: `pipeline.rs`'s own `transform-preload-library{transform-library-paths=...}` pass option needs a real path on disk, there's no "load this transform library from an in-memory string" form used here.
 
@@ -1974,7 +1988,13 @@ What to do, by priority:
 - **Later, asynchronous writes.** Copy the state, then write it on another thread while the computation continues. Only worth it when writing really weighs (a big simulation), not for nanoLM.
 - **Generic file I/O in the runtime.** Once cleave has real strings: the format and its checks would be written in cleave on top of `open`/`write bytes`/`read bytes`/`rename`/`close` primitives, instead of living in `cleave-rt/src/checkpoint.rs`.
 
-## A generic impl method whose generic check fails disappears without a message — the error surfaces later, elsewhere, as a CPS panic
+## A generic impl method whose generic check fails disappears without a message — the error surfaces later, elsewhere, as a CPS panic — fixed (2026-10-06)
+
+`build_impl_templates` now returns the generic check's error with the templates, reported among the
+monomorphization errors, located in the body (`x + true` in a `T: Float` impl: "no `impl
+Additive<bool>`" at that expression). The open question below had a simple answer: nothing fails on
+purpose, neither the whole stdlib nor nanoLM's kernel reports one. Test:
+`language_model_ops.rs::a_generic_impl_body_that_fails_is_an_error_in_the_body`. The original report:
 
 Found writing `gelu` (`doc/plan-nanolm.md`, step 2). The symptom is `CPS: could not resolve call to Activation::gelu`, a panic during CPS conversion with no apparent relation to the real cause. That cause was a unification failure *inside the body* of the method, during its generic check (two open `Dims...` packs, fixed since in `infer.rs::unify`).
 
@@ -1999,7 +2019,16 @@ What is known:
 
 Next step: dump the MLIR after each stage (`--dump-mlir`, then the pipeline's passes one at a time) on the minimal program and find the first pass whose output computes something else.
 
-## "cannot be specialized… its generic impl body doesn't type-check at this instantiation" names neither the cause nor the place
+## "cannot be specialized… its generic impl body doesn't type-check at this instantiation" names neither the cause nor the place — reworded (2026-10-06)
+
+The message was also wrong: it's not that a body fails at this instantiation, but that no impl's
+inferred signature accepts the call. Now "no impl of `Algebra::method` accepts (types)", followed by
+one line per candidate impl: "its body's inference gives it (signature)" (where generics merged by
+the body show, as `'t1` twice), "matches, but not its bounds (T: Float)", or "takes N
+argument(s)" (`monomorphize.rs::derive_impl_instantiation`, `ImplMatch::NoneMatched::candidates`).
+No end-to-end test: every way found to reach it is now caught earlier (the inference rejects a bound
+at the call; an instance's re-inference reports a body constraining its generics, located in the
+body; the bugs that corrupted templates are fixed), so the path is a safety net. The original report:
 
 Hit three times in a row on the nanoLM step 4 work (attention). `TypeErrorKind::MonomorphizationFailed` (`monomorphize.rs`, `ImplMatch::NoneMatched`) only says that no impl template unified with the call. The real cause is upstream: the impl's generic check produced **wrong patterns**. In the case found, inference had merged two const generics, giving `Tensor<f32, 't1, 't2>` and `AttentionShape<'t1, 't2>` instead of `<N, D>` and `<L, DH>`, so a correct call matched nothing. The cause was a bug fixed since then (a const generic read as a value was typed with the generic's own variable). Finding it took bisecting the body line by line, and printing the patterns from inside the monomorphizer.
 
@@ -2310,8 +2339,10 @@ two things made LLVM's input huge, both fixed generically:
 
 LLVM 83 → 28.5 s; the kernel compiles in ~40 s end to end. Left in the IR: constructions
 (`insertvalue` chains) and loop-carried `phi`s of large structs; a fully memory-resident
-representation would remove those too. Also seen: LLVM warns "'native' is not a recognized
-processor" four times per compile (pre-existing, the `"target-cpu"="native"` function attribute).
+representation would remove those too. Also seen: LLVM warned "'native' is not a recognized
+processor" four times per compile: the functions' `target-cpu` attribute was the literal `native`
+(the target machine itself was already resolved). Fixed the same day: `stamp_target_cpu` resolves it
+to the host CPU's name (`cleave_mlir_shim::host_cpu_name`, `znver5` here).
 
 ## Debug info attributes inlined stdlib code to the program's file
 `llvm-symbolizer` on nanoLM v2 placed `Optimizer::step` at `kernel.cleave:386`, a line the kernel

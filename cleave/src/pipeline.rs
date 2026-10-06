@@ -1047,6 +1047,28 @@ pub fn register_passes() {
     });
 }
 
+/// The matmul tile/vectorize schedule (`cleave/mlir/matmul_vectorize.
+/// transform.mlir`), compiled into the binary and written out once to the
+/// temporary directory, the path MLIR's `transform-preload-library` reads
+/// it from; named after its content's hash, so that a binary never reads
+/// another version's.
+fn matmul_schedule_path() -> Result<String, String> {
+    use std::hash::{Hash, Hasher};
+    const SCHEDULE: &str = include_str!("../mlir/matmul_vectorize.transform.mlir");
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    SCHEDULE.hash(&mut hasher);
+    let path = std::env::temp_dir().join(format!("cleave-matmul-schedule-{:016x}.mlir", hasher.finish()));
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(SCHEDULE) {
+        // Written whole under a temporary name, then renamed: a concurrent
+        // compile never reads half a schedule.
+        let partial = path.with_extension(format!("{}.tmp", std::process::id()));
+        std::fs::write(&partial, SCHEDULE)
+            .and_then(|()| std::fs::rename(&partial, &path))
+            .map_err(|e| format!("cannot write the matmul schedule to {}: {e}", path.display()))?;
+    }
+    Ok(path.to_string_lossy().replace('\\', "/"))
+}
+
 /// `CLEAVE_TIME_STAGES=1`: how long each stage of a compile takes, on stderr:
 /// the front end's (parsing, type checking, CPS, e-graph, refcounting), each
 /// pass pipeline of `lower_to_llvm` (named by its line here) and the rest of
@@ -1189,18 +1211,16 @@ pub fn lower_to_llvm<'c>(
     // benchmark's own directory, not a natural home for a real pipeline
     // dependency) rather than an embedded `transform.named_sequence`,
     // sidestepping a leftover-schedule translation error that only ever
-    // affected standalone hand-written `.mlir` probes. Located via `env!(
-    // "CARGO_MANIFEST_DIR")` (this crate's own source directory, resolved
-    // by Cargo at *build* time), not a hand-typed absolute path -- the
-    // previous version of this string was hardcoded to this one machine's
-    // own checkout location (`I:/Dev/cleave/...`), silently broken on any
-    // other clone.
+    // affected standalone hand-written `.mlir` probes. Embedded in the
+    // binary (`matmul_schedule_path`): it was read at run time from this
+    // crate's source directory, so a `cleave` binary moved away from its
+    // checkout couldn't compile a matmul.
     let pass_manager = pass::PassManager::new(context);
+    let schedule = matmul_schedule_path().map_err(|e| vec![e])?;
     if parse_pass_pipeline(
         pass_manager.as_operation_pass_manager(),
         &format!(
-            "builtin.module(transform-preload-library{{transform-library-paths={}/mlir/matmul_vectorize.transform.mlir}},transform-interpreter{{entry-point=__transform_main}})",
-            env!("CARGO_MANIFEST_DIR").replace('\\', "/"),
+            "builtin.module(transform-preload-library{{transform-library-paths={schedule}}},transform-interpreter{{entry-point=__transform_main}})",
         ),
     )
     .is_err()
@@ -2133,10 +2153,18 @@ fn stamp_target_cpu<'c>(
     }
     let target_cpu = match &options.target_cpu {
         None => None,
-        Some(cpu) => Some(
-            Attribute::parse(context, &format!("\"{cpu}\""))
-                .ok_or_else(|| vec![format!("invalid --target-cpu {cpu:?}")])?,
-        ),
+        Some(cpu) => {
+            // A function's `target-cpu` names a real processor: LLVM builds
+            // each function's subtarget from it, and warned "'native' is not
+            // a recognized processor" (four times per nanoLM compile) before
+            // falling back on the target machine's, which the shim already
+            // resolves from `native` the same way.
+            let cpu = if cpu == "native" { cleave_mlir_shim::host_cpu_name() } else { cpu.clone() };
+            Some(
+                Attribute::parse(context, &format!("\"{cpu}\""))
+                    .ok_or_else(|| vec![format!("invalid --target-cpu {cpu:?}")])?,
+            )
+        }
     };
     let target_features = match &options.target_features {
         None => None,

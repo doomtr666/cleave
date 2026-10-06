@@ -36,6 +36,7 @@
 // reached MLIR lowering outright. Fixed via a real, general re-inference
 // fallback in `monomorphize.rs`, not worked around here.
 use linalg;
+use convert;
 
 struct Sgd { lr: f32 }
 struct Momentum { lr: f32, beta: f32 }

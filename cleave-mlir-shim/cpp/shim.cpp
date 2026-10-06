@@ -19,6 +19,7 @@
 // temporary until `cleave-llvm-redist`'s own prebuilt release replaces the
 // local build entirely).
 
+#include <cstring>
 #include <functional>
 #include <map>
 #include <set>
@@ -278,6 +279,19 @@ extern "C" MlirExecutionEngine cleaveExecutionEngineCreateWithTarget(
 //   read by its task until the caller's `sync`, so it keeps the whole frame.
 // The marks are dropped. Unmarked allocations are left alone, and so is a slot
 // inside an OpenMP region.
+// The host's CPU name (`llvm::sys::getHostCPUName`, what `native` means),
+// copied into `buffer` (`size` bytes, NUL-terminated, truncated if needed).
+// Returns its full length.
+extern "C" size_t cleaveHostCpuName(char *buffer, size_t size) {
+  std::string name = llvm::sys::getHostCPUName().str();
+  if (size > 0) {
+    size_t n = std::min(size - 1, name.size());
+    std::memcpy(buffer, name.data(), n);
+    buffer[n] = 0;
+  }
+  return name.size();
+}
+
 extern "C" void cleaveHoistArgSlots(MlirOperation op) {
   unwrap(op)->walk([](LLVM::LLVMFuncOp f) {
     if (f.getBody().empty())

@@ -835,6 +835,9 @@ pub struct TypeError {
 pub enum TypeErrorKind {
     Unify(UnifyError),
     UnknownName(String),
+    /// A call to a name that is neither a local, a top-level `fn`, nor a
+    /// method of any algebra in scope: usually a missing `use`.
+    UnknownCallee(String),
     ArityMismatch {
         name: String,
         expected: usize,
@@ -930,6 +933,12 @@ pub enum TypeErrorKind {
         algebra: String,
         method: String,
         tys: String,
+        /// Each impl of the method, with the signature its body's inference
+        /// gave it and why it was rejected (`monomorphize.rs::
+        /// derive_impl_instantiation`): a body constraining its generics
+        /// beyond the declaration shows there (two generics merged into
+        /// one).
+        candidates: Vec<String>,
     },
     /// One instance of a generic top-level fn (`monomorphize.rs`'s
     /// `InstanceEngine`, which infers every instance's body at its concrete
@@ -1089,6 +1098,10 @@ impl std::fmt::Display for TypeErrorKind {
         match self {
             TypeErrorKind::Unify(e) => write!(f, "{e}"),
             TypeErrorKind::UnknownName(name) => write!(f, "unknown identifier `{name}`"),
+            TypeErrorKind::UnknownCallee(name) => write!(
+                f,
+                "no `fn` or algebra method named `{name}` is in scope (a missing `use`?)"
+            ),
             TypeErrorKind::ArityMismatch {
                 name,
                 expected,
@@ -1155,11 +1168,14 @@ impl std::fmt::Display for TypeErrorKind {
                 algebra,
                 method,
                 tys,
+                candidates,
             } => {
-                write!(
-                    f,
-                    "`{algebra}::{method}` cannot be specialized for ({tys}): its generic impl body doesn't type-check at this instantiation"
-                )
+                write!(f, "no impl of `{algebra}::{method}` accepts {tys}")?;
+                for c in candidates {
+                    write!(f, "
+    {c}")?;
+                }
+                Ok(())
             }
             TypeErrorKind::GenericFnInstantiationFailed { name, tys, inner } => {
                 write!(
@@ -4235,7 +4251,7 @@ impl<'r> Infer<'r> {
     /// this call site — each instantiation gets its own copy of "T: Ring",
     /// checked/propagated independently, same as the type variable itself.
     fn instantiate(&mut self, scheme: &Scheme) -> Ty {
-        self.instantiate_with_mapping(scheme).0
+        self.instantiate_with_mapping(scheme, None).0
     }
 
     /// Like `instantiate`, but also hands back the fresh-variable mapping it
@@ -4255,7 +4271,13 @@ impl<'r> Infer<'r> {
     /// parameter) — a real, narrow edge case, not attempted here; a mismatch
     /// there would show up as `generic_arg_to_ty`'s unification landing on
     /// the wrong variable rather than a clean rejection.
-    fn instantiate_with_mapping(&mut self, scheme: &Scheme) -> (Ty, HashMap<TyVar, Ty>) {
+    ///
+    /// `call_site`: the call instantiating `scheme`, if any. The scheme's
+    /// constraints then carry its span rather than their own (inside the
+    /// callee): one the call leaves undetermined (`fn half<T: Float>() -> T`
+    /// whose body converts to `T`, called as `let h = half();`) is reported
+    /// where `T` should have been pinned, not in `half`'s body.
+    fn instantiate_with_mapping(&mut self, scheme: &Scheme, call_site: Option<Span>) -> (Ty, HashMap<TyVar, Ty>) {
         // Which of `scheme.vars` are actually pack-kind (`Dims...`-shaped)
         // generics, not ordinary scalar ones — recovered by scanning `scheme
         // .ty` itself for `Ty::Pack(v)` occurrences (`collect_pack_vars`,
@@ -4296,7 +4318,7 @@ impl<'r> Infer<'r> {
                 algebra: c.algebra.clone(),
                 tys: c.tys.iter().map(|t| substitute(t, &mapping)).collect(),
                 gating_indices: c.gating_indices.clone(),
-                span: c.span,
+                span: call_site.unwrap_or(c.span),
             });
         }
         for (v, default) in &scheme.literal_defaults {
@@ -7379,7 +7401,7 @@ impl<'r> Infer<'r> {
             // lambda *literal* directly isn't representable yet — `Call`'s
             // callee is a `Path`, not an arbitrary `Expr` (see
             // `grammar.pest`'s `lambda_expr` note) — deliberately deferred.
-            let (instantiated, mapping) = self.instantiate_with_mapping(&scheme);
+            let (instantiated, mapping) = self.instantiate_with_mapping(&scheme, Some(call_span));
             self.last_scheme_instantiation = Some(scheme.vars.iter().map(|v| mapping[v].clone()).collect());
             if !explicit_generics.is_empty() {
                 if explicit_generics.len() != scheme.vars.len() {
@@ -7441,12 +7463,15 @@ impl<'r> Infer<'r> {
             Ok(Ty::Con(name))
         } else {
             // No declared algebra owns this name (checked above, via the
-            // registry) and it's not a `let`-bound lambda either. Left as an
-            // explicit unknown rather than silently guessing, matching the
-            // "never silent" principle elsewhere in this project — this is
-            // still reachable for any name with zero registered candidates,
-            // which today is most operators (no stdlib declares `Ring` yet).
-            Ok(Ty::Con(format!("<unresolved-call:{name}>")))
+            // registry), it's not a `let`-bound lambda, nor a top-level
+            // `fn`: an error here, at the call. It used to be a placeholder
+            // type, reported later as "type could not be fully determined
+            // (<unresolved-call:convert>)" among knock-on mismatches, for
+            // `x.to()` without `use convert;`.
+            Err(TypeError {
+                span: call_span,
+                kind: TypeErrorKind::UnknownCallee(name),
+            })
         }
     }
 
