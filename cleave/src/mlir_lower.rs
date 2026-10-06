@@ -92,6 +92,30 @@ struct LowerCtx<'c, 'm> {
     /// argument's slot is allocated (`call_arguments`): once per call site,
     /// not once per loop iteration.
     entry_block: std::cell::Cell<Option<mlir_sys::MlirBlock>>,
+    /// The memory a large light struct value of the function being lowered
+    /// already lives in (`homes_in`): a parameter received by pointer, and
+    /// the light struct fields read out of one (a `getelementptr` into the
+    /// same memory). Immutable for the whole call (the caller's copy), so a
+    /// call passing that value by pointer passes this address instead of
+    /// copying it into a slot of its own (`call_arguments`). Without it,
+    /// every value forwarded down a chain of calls was loaded whole and
+    /// stored whole again, and LLVM splits each such copy into one load and
+    /// one store per scalar: nanoLM v2's `parallel_grad` went from 931 LLVM
+    /// instructions to 181,682 in `opt -O2`.
+    /// `true` for a home in a slot of this frame (a result returned by
+    /// pointer, `by_pointer_returns`): its lifetime is bounded by its
+    /// visible uses (`cleave_mlir_shim::hoist_arg_slots`), too soon for a
+    /// spawned task reading it until the `sync`, so a spawned call copies
+    /// such a value instead (`call_arguments`).
+    homes: RefCell<HashMap<CVar, (Value<'c, 'c>, bool)>>,
+    /// The functions returning a large light struct through a pointer to
+    /// the caller's slot, their first parameter (`returns_by_pointer`),
+    /// rather than by value: the caller then holds the result in memory, its
+    /// home (`homes`), and passes it on without copying it. Filled once
+    /// `LowerCtx` exists (`is_large_light_struct` needs it).
+    by_pointer_returns: RefCell<HashSet<String>>,
+    /// The current function's result pointer, when it returns by pointer.
+    result_out: std::cell::Cell<Option<mlir_sys::MlirValue>>,
     declared_externs: RefCell<HashSet<String>>,
     signatures: HashMap<String, (Vec<Ty>, Ty)>,
     /// Cleave type name -> MLIR type text, from every `#[mlir_type(...)]`-
@@ -516,6 +540,9 @@ pub fn lower_program<'c>(
             module: &module,
             abi_fixed,
             entry_block: std::cell::Cell::new(None),
+            homes: RefCell::new(HashMap::new()),
+            by_pointer_returns: RefCell::new(HashSet::new()),
+            result_out: std::cell::Cell::new(None),
             declared_externs: RefCell::new(HashSet::new()),
             signatures,
             mlir_types: mlir_types.clone(),
@@ -533,6 +560,19 @@ pub fn lower_program<'c>(
             region_allocating_fns,
             op_lines: &program.op_lines,
         };
+        // A spawned function keeps returning by value: the task pass stores
+        // its result in the task's own storage, read after the wait.
+        let spawned = spawned_units(program);
+        *ctx.by_pointer_returns.borrow_mut() = program
+            .funcs
+            .iter()
+            .filter(|f| {
+                !ctx.abi_fixed.contains(&f.def.name)
+                    && !spawned.contains(&f.def.name)
+                    && is_large_light_struct(&ctx, &f.result)
+            })
+            .map(|f| f.def.name.clone())
+            .collect();
         // One `DISubprogram` per function, *all* of them (not just whoever
         // survives as a standalone `llvm.func` after `--inline` -- see
         // `gen_loc`'s own doc comment for why that distinction matters).
@@ -1573,7 +1613,7 @@ fn width_ty<'c>(ctx: &LowerCtx<'c, '_>, name: &str) -> Type<'c> {
 /// access violation), and the copies of a spawned task's captured arguments
 /// made one basic block of 188k instructions, most of a compile's time in
 /// SelectionDAG.
-const BY_POINTER_MIN_BYTES: usize = 128;
+pub(crate) const BY_POINTER_MIN_BYTES: usize = 128;
 
 /// An estimate of an LLVM type's size in bytes, from its text: enough to
 /// compare against `BY_POINTER_MIN_BYTES` (alignment padding ignored).
@@ -1646,6 +1686,13 @@ fn call_arguments<'c>(
     args.iter()
         .zip(param_types)
         .map(|(a, t)| {
+            if by_pointer(ctx, callee, t)
+                && let CVal::Var(v) = a
+                && let Some(&(home, in_slot)) = ctx.homes.borrow().get(v)
+                && !(spawned && in_slot)
+            {
+                return home;
+            }
             let value = lower_cval(context, block, env, a, ty_to_mlir(ctx, t));
             if !by_pointer(ctx, callee, t) {
                 return value;
@@ -1655,6 +1702,72 @@ fn call_arguments<'c>(
             slot
         })
         .collect()
+}
+
+/// Every function some `spawn` calls.
+fn spawned_units(program: &CpsProgram) -> HashSet<String> {
+    fn walk(e: &CExpr, out: &mut HashSet<String>) {
+        match e {
+            CExpr::LetPrim { op, cont, .. } => {
+                if let PrimOp::Spawn { unit } = op {
+                    out.insert(unit.clone());
+                }
+                walk(cont, out);
+            }
+            CExpr::App { .. } => {}
+            CExpr::If { then_branch, else_branch, .. } => {
+                walk(then_branch, out);
+                walk(else_branch, out);
+            }
+            CExpr::Fix { defs, body } => {
+                for d in defs {
+                    walk(&d.body, out);
+                }
+                walk(body, out);
+            }
+        }
+    }
+    let mut out = HashSet::new();
+    for f in &program.funcs {
+        walk(&f.def.body, &mut out);
+    }
+    out
+}
+
+/// Whether `ty` is a light struct large enough to cross a call by pointer
+/// (`by_pointer`, whatever the callee).
+fn is_large_light_struct(ctx: &LowerCtx, ty: &Ty) -> bool {
+    let (Ty::Con(name) | Ty::App(name, _)) = ty else { return false };
+    if native_shape_keyword(ctx, name).is_some() || ctx.mlir_types.contains_key(name) || name == "bool" {
+        return false;
+    }
+    let (name, type_args) = struct_name_and_args(ty);
+    is_light_struct(
+        name,
+        type_args,
+        &ctx.struct_schemas,
+        &ctx.mlir_types,
+        &ctx.field_mutated_structs,
+        &ctx.extern_boundary_structs,
+        &ctx.constructed_structs,
+    ) && llvm_type_size_estimate(&ty_to_mlir(ctx, ty).to_string()) >= BY_POINTER_MIN_BYTES
+}
+
+/// A large light struct read out of a field of one with a home (`LowerCtx::
+/// homes`) lives in that same memory: its home is the field's address.
+fn home_field_read<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, var: CVar, op: &PrimOp, args: &[CVal], ty: &Ty) {
+    let (PrimOp::Field { struct_ty, field }, [CVal::Var(base)]) = (op, args) else { return };
+    let Some(&(base_home, in_slot)) = ctx.homes.borrow().get(base) else { return };
+    if !is_large_light_struct(ctx, ty) {
+        return;
+    }
+    let (name, type_args) = struct_name_and_args(struct_ty);
+    let Some(position) = struct_field_types(&ctx.struct_schemas, name, type_args).iter().position(|(n, _)| n == field)
+    else {
+        return;
+    };
+    let field_ptr = gep(ctx, block, base_home, &[0, position as i64], ty_to_mlir(ctx, struct_ty));
+    ctx.homes.borrow_mut().insert(var, (field_ptr, in_slot));
 }
 
 /// One `llvm.alloca` of `ty`, at the start of the current function's entry
@@ -1704,19 +1817,23 @@ fn lower_top_level_fn<'c>(ctx: &LowerCtx<'c, '_>, f: &CTopLevelFn) -> Operation<
     // A large light struct parameter arrives as a pointer to the caller's
     // copy (`by_pointer`), loaded once here.
     let pointer_params: Vec<bool> = f.param_types.iter().map(|t| by_pointer(ctx, &f.def.name, t)).collect();
-    let param_types: Vec<Type> = f
+    let returns_by_pointer = ctx.by_pointer_returns.borrow().contains(&f.def.name);
+    let mut param_types: Vec<Type> = f
         .param_types
         .iter()
         .zip(&pointer_params)
         .map(|(t, &p)| if p { llvm::r#type::pointer(context, 0) } else { ty_to_mlir(ctx, t) })
         .collect();
+    if returns_by_pointer {
+        param_types.insert(0, llvm::r#type::pointer(context, 0));
+    }
     let is_unit = is_unit_ty(&f.result);
     let result_type: Type = if is_unit {
         IntegerType::new(context, 1).into()
     } else {
         ty_to_mlir(ctx, &f.result)
     };
-    let results: Vec<Type> = if is_unit { vec![] } else { vec![result_type] };
+    let results: Vec<Type> = if is_unit || returns_by_pointer { vec![] } else { vec![result_type] };
 
     let block = Block::new(
         &param_types
@@ -1729,9 +1846,13 @@ fn lower_top_level_fn<'c>(ctx: &LowerCtx<'c, '_>, f: &CTopLevelFn) -> Operation<
     // covers only the ordinary ones (see `CTopLevelFn`'s own doc comment),
     // so zip against everything but the last entry.
     let mut env: HashMap<CVar, Value> = HashMap::new();
+    ctx.homes.borrow_mut().clear();
+    let first_param = usize::from(returns_by_pointer);
+    ctx.result_out.set(returns_by_pointer.then(|| block.argument(0).unwrap().to_raw()));
     for (i, &var) in f.def.params[..f.def.params.len() - 1].iter().enumerate() {
-        let arg: Value = block.argument(i).unwrap().into();
+        let arg: Value = block.argument(first_param + i).unwrap().into();
         let value = if pointer_params[i] {
+            ctx.homes.borrow_mut().insert(var, (arg, false));
             block
                 .append_operation(llvm::load(
                     context,
@@ -1916,6 +2037,16 @@ fn lower_cexpr<'c>(
                 .filter(|a| !matches!(a, CVal::Unit))
                 .map(|a| lower_cval(ctx.context, block, &env, a, result_type))
                 .collect();
+            if let Some(out) = ctx.result_out.get() {
+                // SAFETY: the current function's own first argument
+                // (`lower_top_level_fn`), alive while its body is lowered.
+                let out: Value = unsafe { Value::from_raw(out) };
+                for value in values {
+                    block.append_operation(llvm::store(ctx.context, value, out, location, LoadStoreOptions::new()));
+                }
+                block.append_operation(func::r#return(&[], location));
+                return;
+            }
             block.append_operation(func::r#return(&values, location));
         }
         CExpr::App {
@@ -1983,6 +2114,7 @@ fn lower_cexpr<'c>(
             if let Some(value) = lower_prim_op(ctx, block, &env, *var, op, args, ty) {
                 env.insert(*var, value);
             }
+            home_field_read(ctx, block, *var, op, args, ty);
             for (rebound, view) in ctx.pending_rebinds.borrow_mut().drain(..) {
                 env.insert(rebound, view);
             }
@@ -2618,6 +2750,25 @@ fn lower_real_call<'c>(
     // never materialized (nothing in the language can do anything with one
     // besides discard it, so nothing downstream ever looks it up).
     let is_unit = is_unit_ty(result_ty);
+    let mut env = env;
+    // A callee returning by pointer (`LowerCtx::by_pointer_returns`) writes
+    // its result into a slot of this frame, which stays the value's home.
+    if ctx.by_pointer_returns.borrow().contains(callee) {
+        let result_mlir_ty = ty_to_mlir(ctx, result_ty);
+        let slot = entry_alloca(ctx, result_mlir_ty, false);
+        let mut operands = vec![slot];
+        operands.extend(arg_values);
+        block.append_operation(func::call(context, FlatSymbolRefAttribute::new(context, callee), &operands, &[], location));
+        let value: Value = block
+            .append_operation(llvm::load(context, slot, result_mlir_ty, location, LoadStoreOptions::new()))
+            .result(0)
+            .unwrap()
+            .into();
+        env.insert(result_var, value);
+        ctx.homes.borrow_mut().insert(result_var, (slot, true));
+        lower_cexpr(ctx, block, env, k_ret, result_type, yield_targets, &k.body);
+        return;
+    }
     let results: Vec<Type> = if is_unit {
         vec![]
     } else {
@@ -2631,7 +2782,6 @@ fn lower_real_call<'c>(
         location,
     ));
 
-    let mut env = env;
     if !is_unit {
         env.insert(result_var, call_op.result(0).unwrap().into());
     }

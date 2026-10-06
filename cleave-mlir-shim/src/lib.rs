@@ -36,6 +36,9 @@ unsafe extern "C" {
     fn cleaveApproximateMath(op: MlirOperation) -> bool;
     fn cleaveHoistArgSlots(op: MlirOperation);
     fn cleaveLowerAdoptions(op: MlirOperation);
+    fn cleaveLimitInlining(op: MlirOperation, threshold: i64) -> i64;
+    fn cleaveApplyNoInline(op: MlirOperation);
+    fn cleaveCopyAggregatesInMemory(op: MlirOperation, min_bytes: i64) -> i64;
     fn cleaveLowerSpawns(op: MlirOperation, tasks: bool) -> bool;
 }
 
@@ -88,6 +91,41 @@ pub unsafe fn hoist_arg_slots(op: MlirOperation) {
 /// `op` must be a valid `builtin.module`, not used concurrently.
 pub unsafe fn lower_adoptions(op: MlirOperation) {
     unsafe { cleaveLowerAdoptions(op) }
+}
+
+/// Marks `no_inline` every `func.call` whose callee, inlined, would exceed
+/// `threshold` operations: its own body plus everything it would inline in
+/// turn (`cpp/shim.cpp`'s `cleaveLimitInlining`). Returns how many calls it
+/// marked. Run right before MLIR's inliner.
+///
+/// # Safety
+///
+/// `op` must be a valid `builtin.module`, not used concurrently.
+pub unsafe fn limit_inlining(op: MlirOperation, threshold: i64) -> i64 {
+    unsafe { cleaveLimitInlining(op, threshold) }
+}
+
+/// Gives LLVM's `noinline` to every `llvm.func` [`limit_inlining`] marked
+/// (`cpp/shim.cpp`'s `cleaveApplyNoInline`), so LLVM's own inliner keeps it
+/// out of line too. Run once the module is in the LLVM dialect.
+///
+/// # Safety
+///
+/// `op` must be a valid operation, not used concurrently.
+pub unsafe fn apply_no_inline(op: MlirOperation) {
+    unsafe { cleaveApplyNoInline(op) }
+}
+
+/// Turns each memory-to-memory copy of an aggregate of at least `min_bytes`
+/// written as a load, `extractvalue`s and a store into a `memcpy`
+/// (`cpp/shim.cpp`'s `cleaveCopyAggregatesInMemory`), where provably
+/// equivalent. Returns the number rewritten. Run on the LLVM dialect.
+///
+/// # Safety
+///
+/// `op` must be a valid `builtin.module`, not used concurrently.
+pub unsafe fn copy_aggregates_in_memory(op: MlirOperation, min_bytes: i64) -> i64 {
+    unsafe { cleaveCopyAggregatesInMemory(op, min_bytes) }
 }
 
 /// Borrows `s`'s own bytes -- the C++ side only ever reads this synchronously

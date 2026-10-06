@@ -73,6 +73,7 @@ pub struct Build {
     inline: Option<bool>,
     unroll_jam: Option<bool>,
     llvm_loop_unroll: Option<bool>,
+    inline_threshold: Option<usize>,
     tasks: Option<bool>,
     chain_split: Option<bool>,
     affine_structs: Option<bool>,
@@ -99,6 +100,7 @@ impl Build {
             inline: None,
             unroll_jam: None,
             llvm_loop_unroll: None,
+            inline_threshold: None,
             tasks: None,
             chain_split: None,
             affine_structs: None,
@@ -167,6 +169,12 @@ impl Build {
     /// See `cleave::pipeline::CodegenOptions::llvm_loop_unroll`'s own doc comment.
     pub fn llvm_loop_unroll(&mut self, enabled: bool) -> &mut Self {
         self.llvm_loop_unroll = Some(enabled);
+        self
+    }
+
+    /// See `cleave::pipeline::CodegenOptions::inline_threshold`'s own doc comment.
+    pub fn inline_threshold(&mut self, operations: usize) -> &mut Self {
+        self.inline_threshold = Some(operations);
         self
     }
 
@@ -296,6 +304,7 @@ impl Build {
             inline: self.inline.unwrap_or(defaults.inline),
             unroll_jam: self.unroll_jam.unwrap_or(defaults.unroll_jam),
             llvm_loop_unroll: self.llvm_loop_unroll.unwrap_or(defaults.llvm_loop_unroll),
+            inline_threshold: self.inline_threshold.unwrap_or(defaults.inline_threshold),
             tasks: self.tasks.unwrap_or(defaults.tasks),
             chain_split: self.chain_split.unwrap_or(defaults.chain_split),
             affine_structs: self.affine_structs.unwrap_or(defaults.affine_structs),

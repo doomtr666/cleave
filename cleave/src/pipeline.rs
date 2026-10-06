@@ -173,7 +173,20 @@ pub struct CodegenOptions {
     /// thread), and for comparing against a single-threaded run. On by
     /// default.
     pub tasks: bool,
+    /// The size, in MLIR operations, past which a callee isn't inlined: its
+    /// own body plus everything it would inline in turn
+    /// (`cleave_mlir_shim::limit_inlining`). Small functions, the elementwise
+    /// operations fusion needs, stay inlined; a large one gains nothing from
+    /// it (a call costs nothing next to thousands of operations) and costs a
+    /// lot: LLVM's passes are superlinear in a function's size. nanoLM v2's
+    /// `train_gpt` grew from 225 operations to ~80,000 by inlining the model's
+    /// restore, initialization, clipping and checkpointing, walked leaf by
+    /// leaf, and LICM alone then took 124 s of a 190 s compile.
+    pub inline_threshold: usize,
 }
+
+/// `CodegenOptions::inline_threshold`'s default.
+pub const DEFAULT_INLINE_THRESHOLD: usize = 1000;
 
 impl Default for CodegenOptions {
     fn default() -> Self {
@@ -191,6 +204,7 @@ impl Default for CodegenOptions {
             debug_info: true,
             llvm_loop_unroll: true,
             tasks: true,
+            inline_threshold: DEFAULT_INLINE_THRESHOLD,
         }
     }
 }
@@ -1124,6 +1138,16 @@ pub fn lower_to_llvm<'c>(
     // real perf build -- disabling inlining reopens exactly the double-
     // scratch-buffer cost this same pass's own comment above measured and
     // fixed.
+    // Always, `--no-inline` included: it also marks the functions LLVM's own
+    // inliner must leave alone (`apply_no_inline`, end of this function).
+    {
+        let kept = unsafe {
+            cleave_mlir_shim::limit_inlining(module.as_operation().to_raw(), options.inline_threshold as i64)
+        };
+        if time_stages() {
+            eprintln!("cleave stage: calls kept out of line (inline threshold {}): {kept}", options.inline_threshold);
+        }
+    }
     let pass_manager = pass::PassManager::new(context);
     if options.inline {
         pass_manager.add_pass(pass::transform::create_inliner());
@@ -1916,7 +1940,22 @@ pub fn lower_to_llvm<'c>(
     // into a loop goes back to its function's entry block, and an ordinary
     // call's is bounded to its uses, so that LLVM can share storage between
     // them. Loops are blocks by now.
+    // Large aggregates copied from memory to memory become `memcpy`s, not one
+    // load and one store per scalar (`copy_aggregates_in_memory`); before
+    // the slots get their lifetimes, which follow their uses.
+    let copies = unsafe {
+        cleave_mlir_shim::copy_aggregates_in_memory(
+            module.as_operation().to_raw(),
+            crate::mlir_lower::BY_POINTER_MIN_BYTES as i64,
+        )
+    };
+    if time_stages() {
+        eprintln!("cleave stage: aggregate copies made memcpy: {copies}");
+    }
     unsafe { cleave_mlir_shim::hoist_arg_slots(module.as_operation().to_raw()) };
+    // The functions kept out of line by the inline threshold or
+    // `#[no_inline]` stay out of line in LLVM too.
+    unsafe { cleave_mlir_shim::apply_no_inline(module.as_operation().to_raw()) };
 
     Ok(())
 }

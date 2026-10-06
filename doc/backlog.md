@@ -2271,6 +2271,48 @@ Open: the super-algebra check compares impl targets as written (`Complex<T>` in 
 impls naming their generics differently (`impl<U> Additive<Complex<U>>`) would be reported as
 missing.
 
+## nanoLM's kernel: LLVM 174.5 s → 28.5 s — done (2026-10-06)
+
+Measured with `CLEAVE_TIME_STAGES=1` (now covering the front end too: parsing, type checking, CPS,
+e-graph, refcounting): of ~190 s, 174.5 s were LLVM; `opt -O2 -time-passes` put 108 s of 138 in
+LICM, `llc` 44 s more. Before inlining the whole kernel was 17k MLIR operations (`train_gpt` 225);
+two things made LLVM's input huge, both fixed generically:
+
+- **Inlining without a size limit.** MLIR's inliner copied the model's walks (restore, init,
+  clipping, checkpointing: one block per leaf) into `train_gpt`, ~80k operations, and LLVM's
+  superlinear passes (SROA then LICM, 124 s on that one function) choked. `CodegenOptions::
+  inline_threshold` (default 1000 operations, `--inline-threshold`, `cleave-build`'s
+  `.inline_threshold`): a callee whose inlined size (own body plus what it would inline) exceeds it
+  stays a call (`cleave_mlir_shim::limit_inlining`); small functions, which fusion needs, stay
+  inlined. And `#[no_inline]` never reached LLVM, whose own inliner undid it: now the `llvm.func`'s
+  `noinline` (`apply_no_inline`). LLVM 174.5 → 83 s; nanoLM's step time unchanged (min 1231 ms).
+- **Large light structs as first-class values.** A light struct is an `!llvm.struct` SSA value;
+  `Gpt` is thousands of scalars, and LLVM splits each load, store and copy of it into one
+  operation per scalar: 84k LLVM instructions became 642k in `opt -O2`, in a few giant basic blocks
+  (instruction selection and scheduling are superlinear in a block's size). Three changes, each
+  measured on the IR after `opt`:
+  - *homes* (`mlir_lower.rs`, `LowerCtx::homes`): a value already in memory (a parameter received
+    by pointer, a field of one) is passed on by its address instead of being copied into a slot:
+    642k → 453k;
+  - aggregate copies `load P` → (`extractvalue`s) → `store Q` become a `memcpy` from P (or the
+    part's address) when nothing in between may write P (`cleave_mlir_shim::
+    copy_aggregates_in_memory`): → 316k;
+  - large light structs are returned through a pointer to a caller's slot, which becomes the
+    value's home (`LowerCtx::by_pointer_returns`; not for spawned functions, whose result goes
+    through the task's storage, nor `main`/exports): → 243k. The task pass's wrapper didn't handle
+    a spawning function with no result (it now returns by pointer): fixed (`scf.if` with no result
+    already ends its branches with a `yield`).
+  A slot's lifetime must cover the uses of addresses computed from it (a home's field passed on as
+  a `getelementptr`): the first version ended it at the `getelementptr`, stack coloring reused the
+  memory under the call reading the field, a double release, then a cycle in the pool's free list
+  that hung the whole `leaks.rs` binary (every test passed alone). `hoist_arg_slots` now follows
+  `getelementptr`s.
+
+LLVM 83 → 28.5 s; the kernel compiles in ~40 s end to end. Left in the IR: constructions
+(`insertvalue` chains) and loop-carried `phi`s of large structs; a fully memory-resident
+representation would remove those too. Also seen: LLVM warns "'native' is not a recognized
+processor" four times per compile (pre-existing, the `"target-cpu"="native"` function attribute).
+
 ## Debug info attributes inlined stdlib code to the program's file
 `llvm-symbolizer` on nanoLM v2 placed `Optimizer::step` at `kernel.cleave:386`, a line the kernel
 doesn't have: the inlined function's `DISubprogram` names the right function but the program's file

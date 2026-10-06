@@ -61,6 +61,7 @@ struct Args {
     inline: Option<bool>,
     unroll_jam: Option<bool>,
     llvm_loop_unroll: Option<bool>,
+    inline_threshold: Option<usize>,
     tasks: Option<bool>,
     chain_split: Option<bool>,
     affine_structs: Option<bool>,
@@ -97,6 +98,7 @@ fn parse_args() -> Result<Args, String> {
     let mut inline: Option<bool> = None;
     let mut unroll_jam: Option<bool> = None;
     let mut llvm_loop_unroll: Option<bool> = None;
+    let mut inline_threshold: Option<usize> = None;
     let mut tasks: Option<bool> = None;
     let mut chain_split: Option<bool> = None;
     let mut affine_structs: Option<bool> = None;
@@ -179,6 +181,16 @@ fn parse_args() -> Result<Args, String> {
             "--no-unroll-jam" => unroll_jam = Some(false),
             "--llvm-unroll" => llvm_loop_unroll = Some(true),
             "--no-llvm-unroll" => llvm_loop_unroll = Some(false),
+            "--inline-threshold" => {
+                let value = args_iter
+                    .next()
+                    .ok_or_else(|| "--inline-threshold requires a value (MLIR operations)".to_string())?;
+                inline_threshold = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| format!("--inline-threshold must be a number of operations, got {value:?}"))?,
+                );
+            }
             "--tasks" => tasks = Some(true),
             "--no-tasks" => tasks = Some(false),
             "--chain-split" => chain_split = Some(true),
@@ -254,6 +266,7 @@ fn parse_args() -> Result<Args, String> {
             inline,
             unroll_jam,
             llvm_loop_unroll,
+            inline_threshold,
             tasks,
             chain_split,
             affine_structs,
@@ -322,6 +335,7 @@ fn resolve_codegen_options(args: &Args) -> Result<CodegenOptions, String> {
         inline: args.inline.unwrap_or(defaults.inline),
         unroll_jam: args.unroll_jam.unwrap_or(defaults.unroll_jam),
         llvm_loop_unroll: args.llvm_loop_unroll.unwrap_or(defaults.llvm_loop_unroll),
+        inline_threshold: args.inline_threshold.unwrap_or(defaults.inline_threshold),
         tasks: args.tasks.unwrap_or(defaults.tasks),
         chain_split: args.chain_split.unwrap_or(defaults.chain_split),
         affine_structs: args.affine_structs.unwrap_or(defaults.affine_structs),

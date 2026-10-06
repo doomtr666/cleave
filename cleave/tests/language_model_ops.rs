@@ -1322,8 +1322,10 @@ fn argument_slots_sit_in_the_entry_block_with_bounded_lifetimes() {
         fn read(x: P, y: P, s: f32) -> f32 { s + x.a[0, 0] + x.b[0, 0] + x.c[0, 0] + y.a[0, 0] + y.b[0, 0] + y.c[0, 0] }
         fn relay(x: P, y: P, s: f32) -> f32 { read(x, y, s) }
         fn main() -> f32 {
-            let x = mk(0.5);
-            let y = mk(1.0);
+            // Built here, not returned by `mk`: a struct returned by pointer
+            // is passed on from where it lives, with no slot of its own.
+            let x = P(a: [for r in 0..1: [for c in 0..1: 0.5]], b: [for r in 0..1: [for c in 0..1: 0.5]], c: [for r in 0..1: [for c in 0..1: 0.5]]);
+            let y = P(a: [for r in 0..1: [for c in 0..1: 1.0]], b: [for r in 0..1: [for c in 0..1: 1.0]], c: [for r in 0..1: [for c in 0..1: 1.0]]);
             let mut s = read(x, y, 0.0);
             for i in 0..99 { s = relay(x, y, s); };
             s

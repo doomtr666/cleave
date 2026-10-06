@@ -19,6 +19,11 @@
 // temporary until `cleave-llvm-redist`'s own prebuilt release replaces the
 // local build entirely).
 
+#include <functional>
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
 #include "mlir-c/ExecutionEngine.h"
 #include "mlir/CAPI/ExecutionEngine.h"
 #include "mlir/CAPI/IR.h"
@@ -30,6 +35,8 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
+#include "mlir/Interfaces/DataLayoutInterfaces.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/OpenMP/OpenMPDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -296,7 +303,21 @@ extern "C" void cleaveHoistArgSlots(MlirOperation op) {
       Block *block = nullptr;
       Operation *first = nullptr, *last = nullptr;
       bool oneBlock = true;
-      for (Operation *user : a->getUsers()) {
+      // Through the addresses computed from the slot too: a field of a value
+      // living in a slot (`mlir_lower.rs`'s `homes`) is passed on as a
+      // `getelementptr` of it, and a lifetime ending at the
+      // `getelementptr` freed the slot under the call reading the field.
+      SmallVector<Operation *> users;
+      SmallVector<Value> addresses{a.getResult()};
+      while (!addresses.empty()) {
+        Value address = addresses.pop_back_val();
+        for (Operation *user : address.getUsers()) {
+          users.push_back(user);
+          if (auto gep = dyn_cast<LLVM::GEPOp>(user); gep && gep.getBase() == address)
+            addresses.push_back(gep.getResult());
+        }
+      }
+      for (Operation *user : users) {
         if (block && user->getBlock() != block) {
           oneBlock = false;
           break;
@@ -314,6 +335,167 @@ extern "C" void cleaveHoistArgSlots(MlirOperation op) {
       b.setInsertionPointAfter(last);
       b.create<LLVM::LifetimeEndOp>(a.getLoc(), a.getResult());
     }
+  });
+}
+
+// MLIR's inliner inlines every call it legally can. Past a size that gains
+// nothing (a call costs nothing next to thousands of operations) and costs a
+// lot: LLVM's passes are superlinear in a function's size, and a function
+// that inlines the walks over a whole model (initialization, restore,
+// clipping, checkpointing: one block of code per leaf) becomes one LLVM
+// can't digest. Each call whose callee would bring more than `threshold`
+// operations (its body plus, recursively, everything it inlines itself) is
+// marked `no_inline`, the attribute the inliner already honours (`spawn`'s
+// calls). Small functions, the elementwise operations fusion needs, stay
+// inlined. Returns the number of calls marked.
+extern "C" int64_t cleaveLimitInlining(MlirOperation op, int64_t threshold) {
+  auto module = cast<ModuleOp>(unwrap(op));
+  const int64_t cap = int64_t(1) << 40;
+  std::map<std::string, int64_t> own;
+  std::map<std::string, std::vector<std::string>> inlinedCallees;
+  module.walk([&](func::FuncOp f) {
+    if (f.isExternal())
+      return;
+    int64_t n = 0;
+    f.walk([&](Operation *) { ++n; });
+    std::string name = f.getName().str();
+    own[name] = n;
+    auto &callees = inlinedCallees[name];
+    f.walk([&](func::CallOp call) {
+      if (!call->hasAttr("no_inline"))
+        callees.push_back(call.getCallee().str());
+    });
+  });
+  std::map<std::string, int64_t> sizes;
+  std::set<std::string> active;
+  std::function<int64_t(const std::string &)> inlinedSize = [&](const std::string &name) -> int64_t {
+    if (auto it = sizes.find(name); it != sizes.end())
+      return it->second;
+    auto body = own.find(name);
+    if (body == own.end() || !active.insert(name).second)
+      return 0;
+    int64_t total = body->second;
+    for (const std::string &callee : inlinedCallees[name])
+      total = std::min(cap, total + inlinedSize(callee));
+    active.erase(name);
+    sizes[name] = total;
+    return total;
+  };
+  int64_t marked = 0;
+  module.walk([&](func::CallOp call) {
+    if (call->hasAttr("no_inline") || inlinedSize(call.getCallee().str()) <= threshold)
+      return;
+    call->setAttr("no_inline", UnitAttr::get(call.getContext()));
+    ++marked;
+  });
+  // The same decision must reach LLVM, whose own inliner would otherwise
+  // inline these functions back (a call's `no_inline` doesn't survive the
+  // conversion to the LLVM dialect, and neither did a `#[no_inline]`
+  // function's): marked here, turned into the `llvm.func`'s `no_inline`
+  // once converted (`cleaveApplyNoInline`).
+  module.walk([&](func::FuncOp f) {
+    if (!f.isExternal() && (f->hasAttr("no_inline") || inlinedSize(f.getName().str()) > threshold))
+      f->setAttr("cleave.noinline", UnitAttr::get(f.getContext()));
+  });
+  return marked;
+}
+
+// A large aggregate copied from memory to memory goes through a value:
+// `%v = load P`, possibly `extractvalue`s down to a part of it, then
+// `store %v, Q`. LLVM splits such a load and store into one per scalar, and a
+// light struct holding a whole model's tensor descriptors is thousands of
+// them: nanoLM v2's kernel went from 84k LLVM instructions to 642k in `opt
+// -O2`, most of it in a few basic blocks of copies. Each store of a value of
+// at least `minBytes` traced back to a load becomes a `memcpy` from the
+// loaded address (offset by `getelementptr` to the part), when nothing
+// between the load and the store may write the source: only operations
+// without memory effects, loads, lifetime markers, and stores into a stack
+// slot other than the source's. The source must be a function's argument or
+// stack slot, whose only other writers that check can see. Returns the
+// number of copies rewritten.
+static Value pointerRoot(Value p) {
+  while (auto gep = p.getDefiningOp<LLVM::GEPOp>())
+    p = gep.getBase();
+  return p;
+}
+
+extern "C" int64_t cleaveCopyAggregatesInMemory(MlirOperation op, int64_t minBytes) {
+  auto module = cast<ModuleOp>(unwrap(op));
+  DataLayout layout(module);
+  SmallVector<LLVM::StoreOp> stores;
+  module.walk([&](LLVM::StoreOp s) {
+    Type t = s.getValue().getType();
+    if (!s.getVolatile_() && isa<LLVM::LLVMStructType, LLVM::LLVMArrayType>(t) &&
+        int64_t(layout.getTypeSize(t).getFixedValue()) >= minBytes)
+      stores.push_back(s);
+  });
+  int64_t rewritten = 0;
+  for (LLVM::StoreOp s : stores) {
+    // `path`: the `extractvalue` positions from the loaded aggregate down to
+    // the stored part, outermost first.
+    SmallVector<int64_t> path;
+    SmallVector<Operation *> chain;
+    Value v = s.getValue();
+    while (auto ev = v.getDefiningOp<LLVM::ExtractValueOp>()) {
+      path.insert(path.begin(), ev.getPosition().begin(), ev.getPosition().end());
+      chain.push_back(ev);
+      v = ev.getContainer();
+    }
+    auto load = v.getDefiningOp<LLVM::LoadOp>();
+    if (!load || load.getVolatile_() || load->getBlock() != s->getBlock() || !load->isBeforeInBlock(s))
+      continue;
+    Value source = pointerRoot(load.getAddr());
+    auto sourceSlot = source.getDefiningOp<LLVM::AllocaOp>();
+    if (!sourceSlot && !isa<BlockArgument>(source))
+      continue;
+    bool clobbered = false;
+    for (Operation *between = load->getNextNode(); between != s.getOperation(); between = between->getNextNode()) {
+      if (isMemoryEffectFree(between) || isa<LLVM::LoadOp, LLVM::LifetimeStartOp, LLVM::LifetimeEndOp>(between))
+        continue;
+      if (auto other = dyn_cast<LLVM::StoreOp>(between)) {
+        auto slot = pointerRoot(other.getAddr()).getDefiningOp<LLVM::AllocaOp>();
+        if (slot && slot != sourceSlot)
+          continue;
+      }
+      clobbered = true;
+      break;
+    }
+    if (clobbered)
+      continue;
+    OpBuilder b(s);
+    Location loc = s.getLoc();
+    auto ptrTy = LLVM::LLVMPointerType::get(b.getContext());
+    Value from = load.getAddr();
+    if (!path.empty()) {
+      SmallVector<LLVM::GEPArg> indices{0};
+      for (int64_t i : path)
+        indices.push_back(int32_t(i));
+      from = b.create<LLVM::GEPOp>(loc, ptrTy, load.getType(), from, indices);
+    }
+    int64_t bytes = layout.getTypeSize(s.getValue().getType()).getFixedValue();
+    Value len = b.create<LLVM::ConstantOp>(loc, b.getI64Type(), b.getI64IntegerAttr(bytes));
+    b.create<LLVM::MemcpyOp>(loc, s.getAddr(), from, len, false);
+    s.erase();
+    for (Operation *ev : chain)
+      if (ev->use_empty())
+        ev->erase();
+    if (load->use_empty())
+      load.erase();
+    ++rewritten;
+  }
+  return rewritten;
+}
+
+// Every `llvm.func` `cleaveLimitInlining` marked `cleave.noinline` (one too
+// large to inline, or `#[no_inline]` in the source) gets LLVM's `noinline`,
+// so that LLVM's inliner keeps it out of line too: nanoLM's kernel went from
+// 84k LLVM instructions to 635k after `opt -O2` without it, and the
+// functions MLIR had kept out (the model's checkpointing, the optimizer's
+// walk) came back into `train_gpt`.
+extern "C" void cleaveApplyNoInline(MlirOperation op) {
+  unwrap(op)->walk([](LLVM::LLVMFuncOp f) {
+    if (f->removeAttr("cleave.noinline"))
+      f->setAttr(f.getNoInlineAttrName(), UnitAttr::get(f.getContext()));
   });
 }
 
@@ -508,10 +690,14 @@ void wrapInParallelRegion(ModuleOp module, func::FuncOp f) {
   auto zero = b.create<arith::ConstantIntOp>(loc, 0, 32);
   auto cond = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, inPar.getResult(0), zero);
   auto ifOp = b.create<scf::IfOp>(loc, TypeRange(results), cond, /*withElseRegion=*/true);
+  // With no result (a function returning its value through a pointer, or
+  // nothing), `scf.if` comes with an empty `scf.yield` ending each branch
+  // already, and its body builders insert before it: no yield of our own.
   {
     OpBuilder tb = ifOp.getThenBodyBuilder();
     auto direct = tb.create<func::CallOp>(loc, inner, TypeRange(results), args);
-    tb.create<scf::YieldOp>(loc, direct.getResults());
+    if (!results.empty())
+      tb.create<scf::YieldOp>(loc, direct.getResults());
   }
   {
     OpBuilder eb = ifOp.getElseBodyBuilder();
@@ -539,7 +725,8 @@ void wrapInParallelRegion(ModuleOp module, func::FuncOp f) {
     SmallVector<Value> loaded;
     for (auto [t, slot] : llvm::zip(results, slots))
       loaded.push_back(loadSlot(eb, loc, t, slot));
-    eb.create<scf::YieldOp>(loc, loaded);
+    if (!results.empty())
+      eb.create<scf::YieldOp>(loc, loaded);
   }
   b.setInsertionPointToEnd(entry);
   b.create<func::ReturnOp>(loc, ifOp.getResults());

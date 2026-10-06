@@ -29,11 +29,18 @@ param(
     [string[]]$TestArgs = @()
 )
 
+# Smoke tests `cleave` alone, but builds every default member first: a crate
+# built on the compiler's API (`cleave-build`) breaks without any test of
+# `cleave` noticing.
+$watch = [Diagnostics.Stopwatch]::StartNew()
 $scope = if ($Level -eq "workspace") { @("--workspace") } else { @("-p", "cleave") }
+if ($Level -eq "smoke") {
+    & cargo build --release
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
 $cargoArgs = @("test", "--release") + $scope + @("--no-fail-fast")
 if ($TestArgs.Count -gt 0) { $cargoArgs += @("--") + $TestArgs }
 
-$watch = [Diagnostics.Stopwatch]::StartNew()
 & cargo @cargoArgs
 $code = $LASTEXITCODE
 "{0} tests: {1:N0} s" -f $Level, $watch.Elapsed.TotalSeconds
