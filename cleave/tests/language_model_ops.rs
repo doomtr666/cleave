@@ -244,6 +244,37 @@ fn a_model_with_a_single_field_trains() {
     }
 }
 
+/// One Adam step on a tensor built from a literal, gradient the tensor
+/// itself: `1 - lr * sign(1)` everywhere. `doc/backlog.md` ("Adam on literal
+/// tensors returns a wrong value after MLIR inlining") had it at ~0.9999
+/// once the inputs were inlined constants, at this exact shape; it no longer
+/// reproduces, bare or in a model.
+#[test]
+fn adam_on_a_literal_tensor_takes_its_step() {
+    let bare = run("
+        use nn;
+        fn main() -> f32 {
+            let opt = Adam(lr: 0.25, beta1: 0.9, beta2: 0.999, eps: 0.00000001);
+            let w = Tensor::<f32, 8, 8>(data: [[1.0; 8]; 8]);
+            let (w2, s2) = step(opt, w, w, init_state(opt, w));
+            w2[3, 5]
+        }
+    ");
+    assert!(close(bare, 0.75), "bare tensor: expected 0.75, got {bare}");
+    let model = run("
+        use nn;
+        struct One { w: Tensor<f32, 8, 8> }
+        impl Trainable<One> {}
+        fn main() -> f32 {
+            let opt = Adam(lr: 0.25, beta1: 0.9, beta2: 0.999, eps: 0.00000001);
+            let m = One(w: Tensor::<f32, 8, 8>(data: [[1.0; 8]; 8]));
+            let (m2, s2) = step(opt, m, m, init_state(opt, m));
+            m2.w[3, 5]
+        }
+    ");
+    assert!(close(model, 0.75), "model: expected 0.75, got {model}");
+}
+
 /// `layer_norm(x, g, b)`: each row normalized to mean 0 and variance 1 (`eps`
 /// 1e-5, PyTorch's default), then scaled by `g` and shifted by `b`; its
 /// gradient with respect to all three. The loss weights the output by a
@@ -1223,37 +1254,35 @@ fn a_comprehension_over_one_field_is_indexed_like_over_two() {
 }
 
 
-/// A light struct of ~57 KB (nested light structs of tensors) passed to a
-/// function that isn't inlined. By value, LLVM expanded it into its scalars,
-/// stored below the stack pointer with no probe: past Windows' guard page an
-/// access violation, depending on the order of the stores and on how much of
-/// the stack the thread had committed (nanoLM v2's `Optimizer::step`, 58 KB of
-/// arguments; not reproducible on demand in a small program). So what is
-/// checked is the ABI itself: the function receives pointers to copies
-/// (`mlir_lower.rs::by_pointer`), and still computes the right value.
+/// A light struct at or above the by-pointer threshold (128 bytes,
+/// `mlir_lower.rs::BY_POINTER_MIN_BYTES`; three tensors' descriptors here)
+/// passed to a function that isn't inlined. By value, LLVM expanded it into
+/// its scalars, stored below the stack pointer with no probe: past Windows'
+/// guard page an access violation, depending on the order of the stores and
+/// on how much of the stack the thread had committed (nanoLM v2's
+/// `Optimizer::step`, 58 KB of arguments; not reproducible on demand in a
+/// small program). So what is checked is the ABI itself: the function
+/// receives pointers to copies (`mlir_lower.rs::by_pointer`), and still
+/// computes the right value. Size doesn't change the ABI past the
+/// threshold, so the struct stays small: one of ~57 KB took 80 s to compile.
 #[test]
 fn a_large_light_struct_crosses_a_call_by_pointer() {
-    let src = format!("
+    let src = "
         use nn;
-        struct L1 {{ t0: Tensor<f32, 1, 1>, t1: Tensor<f32, 1, 1>, t2: Tensor<f32, 1, 1>, t3: Tensor<f32, 1, 1>, t4: Tensor<f32, 1, 1>, t5: Tensor<f32, 1, 1>, t6: Tensor<f32, 1, 1>, t7: Tensor<f32, 1, 1>, t8: Tensor<f32, 1, 1>, t9: Tensor<f32, 1, 1>, t10: Tensor<f32, 1, 1>, t11: Tensor<f32, 1, 1>, t12: Tensor<f32, 1, 1>, t13: Tensor<f32, 1, 1>, t14: Tensor<f32, 1, 1>, t15: Tensor<f32, 1, 1> }}
-struct L2 {{ l0: L1, l1: L1, l2: L1, l3: L1, l4: L1, l5: L1, l6: L1, l7: L1, l8: L1, l9: L1, l10: L1, l11: L1, l12: L1, l13: L1, l14: L1, l15: L1 }}
-struct L3 {{ a: L2, b: L2, c: L2, d: L2 }}
-fn mk1(v: f32) -> L1 {{ L1(t0: [for r in 0..1: [for c in 0..1: v]], t1: [for r in 0..1: [for c in 0..1: v]], t2: [for r in 0..1: [for c in 0..1: v]], t3: [for r in 0..1: [for c in 0..1: v]], t4: [for r in 0..1: [for c in 0..1: v]], t5: [for r in 0..1: [for c in 0..1: v]], t6: [for r in 0..1: [for c in 0..1: v]], t7: [for r in 0..1: [for c in 0..1: v]], t8: [for r in 0..1: [for c in 0..1: v]], t9: [for r in 0..1: [for c in 0..1: v]], t10: [for r in 0..1: [for c in 0..1: v]], t11: [for r in 0..1: [for c in 0..1: v]], t12: [for r in 0..1: [for c in 0..1: v]], t13: [for r in 0..1: [for c in 0..1: v]], t14: [for r in 0..1: [for c in 0..1: v]], t15: [for r in 0..1: [for c in 0..1: v]]) }}
-fn mk2(v: f32) -> L2 {{ L2(l0: mk1(v), l1: mk1(v), l2: mk1(v), l3: mk1(v), l4: mk1(v), l5: mk1(v), l6: mk1(v), l7: mk1(v), l8: mk1(v), l9: mk1(v), l10: mk1(v), l11: mk1(v), l12: mk1(v), l13: mk1(v), l14: mk1(v), l15: mk1(v)) }}
+        struct P { a: Tensor<f32, 1, 1>, b: Tensor<f32, 1, 1>, c: Tensor<f32, 1, 1> }
+        fn mk(v: f32) -> P {
+            P(a: [for r in 0..1: [for c in 0..1: v]], b: [for r in 0..1: [for c in 0..1: v]], c: [for r in 0..1: [for c in 0..1: v]])
+        }
         #[no_inline]
-        fn read(x: L3, y: L3) -> f32 {{ x.a.l0.t0[0, 0] + y.d.l15.t15[0, 0] }}
-        fn main() -> f32 {{
-            let x = L3(a: mk2(1.5), b: mk2(0.0), c: mk2(0.0), d: mk2(0.0));
-            let y = L3(a: mk2(0.0), b: mk2(0.0), c: mk2(0.0), d: mk2(2.0));
-            read(x, y)
-        }}
-    ");
-    let got = run(&src);
+        fn read(x: P, y: P) -> f32 { x.a[0, 0] + y.c[0, 0] }
+        fn main() -> f32 { read(mk(1.5), mk(2.0)) }
+    ";
+    let got = run(src);
     assert!(close(got, 3.5), "got {got}");
     let dir = std::env::temp_dir().join("cleave-language-model-ops");
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("large_light_struct.cleave");
-    std::fs::write(&source, &src).unwrap();
+    std::fs::write(&source, src).unwrap();
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"))
         .args(["--no-openmp", "--no-debug-info", "--dump-mlir-lowered"])
         .arg(&source)
@@ -1330,4 +1359,80 @@ fn argument_slots_sit_in_the_entry_block_with_bounded_lifetimes() {
     let starts = main.matches("llvm.intr.lifetime.start").count();
     assert_eq!(starts, main.matches("llvm.intr.lifetime.end").count());
     assert!(starts >= 4, "each ordinary call's slots get a lifetime: {starts}");
+}
+
+/// Every impl defines every function its algebra declares
+/// (`pipeline.rs::check_impl_completeness`); the ones the check found
+/// missing, filled in: scalar GELU/SiLU and their derivatives, a tensor's
+/// `tanh`/`log`, `Complex`'s `zero`/`one`, and a rank-1 `Sum`'s
+/// `broadcast`, which `sum`'s adjoint calls (differentiating `sum(x * x)`
+/// on a rank-1 tensor panicked in the e-graph).
+#[test]
+fn the_functions_missing_from_their_impls_compute_what_they_should() {
+    let scalar = run("
+        use nn;
+        fn main() -> f32 {
+            let x: f32 = 1.0;
+            // 0.841192, 1.082964, 0.731059, 0.927671
+            gelu(x) * 1000.0 + gelu_grad(x) * 100.0 + silu(x) * 10.0 + silu_grad(x)
+        }
+    ");
+    let expected = 0.841192 * 1000.0 + 1.082964 * 100.0 + 0.731059 * 10.0 + 0.927671;
+    assert!((scalar - expected).abs() < 0.01, "scalar activations: expected {expected}, got {scalar}");
+    let tensor = run("
+        use nn;
+        fn main() -> f32 {
+            let t = Tensor::<f32, 2>(data: [0.5, 2.0]);
+            Transcendental::tanh(t)[0] * 10.0 + log(t)[1]
+        }
+    ");
+    let expected = 0.5f32.tanh() * 10.0 + 2.0f32.ln();
+    assert!(close(tensor, expected), "tensor tanh/log: expected {expected}, got {tensor}");
+    let complex = run("
+        use complex;
+        fn main() -> f32 {
+            let o: Complex<f32> = Ring::one();
+            let z: Complex<f32> = Ring::zero();
+            o.real * 10.0 + o.imag + z.real + z.imag
+        }
+    ");
+    assert!(close(complex, 10.0), "Complex one/zero: got {complex}");
+    let grad_of_sum = run("
+        use nn;
+        fn f(x: Tensor<f32, 3>) -> f32 { sum(x * x) }
+        df = grad(f, x);
+        fn main() -> f32 { df(Tensor::<f32, 3>(data: [1.0, 2.0, 3.0]))[2] }
+    ");
+    assert!(close(grad_of_sum, 6.0), "d sum(x^2)/dx at 3: expected 6, got {grad_of_sum}");
+}
+
+/// An impl that leaves out one of its algebra's functions is an error at
+/// the impl, naming what's missing, rather than a failure wherever the
+/// missing function happens to be called.
+#[test]
+fn an_impl_missing_a_function_of_its_algebra_is_an_error() {
+    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("incomplete_impl.cleave");
+    std::fs::write(
+        &source,
+        "
+        algebra Shape<T> { fn area(x: T) -> f32; fn perimeter(x: T) -> f32; }
+        struct Sq { side: f32 }
+        impl Shape<Sq> { fn area(x) { x.side * x.side } }
+        fn main() -> i32 { 0 }
+        ",
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--run"])
+        .arg(&source)
+        .output()
+        .expect("cannot run cleave");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "an incomplete impl must not compile");
+    assert!(
+        stderr.contains("`impl Shape<Sq>` doesn't define `perimeter`"),
+        "the error should name the impl and the missing function: {stderr}"
+    );
 }

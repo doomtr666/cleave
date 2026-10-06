@@ -3640,3 +3640,38 @@ fn a_pack_generic_structs_own_field_reads_back_the_correct_nested_element_type()
     .unwrap();
     assert_eq!(ty, Ty::Con("f64".to_string()));
 }
+
+/// Equal operators don't make equal operands: `N/L ~ M/K` must not bind
+/// `N = M` and `L = K` (`8/4 = 4/2`). Only a shared operand and an
+/// operator injective in the other one prove the other pair equal:
+/// `N+1 ~ M+1` binds `N = M`, `N/4 ~ M/4` doesn't.
+#[test]
+fn unify_only_deduces_equal_operands_when_it_follows() {
+    let mut tygen = TyVarGen::default();
+    let (n, m, l, k) = (fresh_var(&mut tygen), fresh_var(&mut tygen), fresh_var(&mut tygen), fresh_var(&mut tygen));
+    let expr = |op: &str, x: &Ty, y: &Ty| Ty::ConstExpr(op.to_string(), Box::new(x.clone()), Box::new(y.clone()));
+    let one = Ty::Const(ConstValue::Int(1));
+    let four = Ty::Const(ConstValue::Int(4));
+
+    let mut subst = Subst::default();
+    assert!(
+        unify(&mut subst, &expr("div", &Ty::Var(n), &Ty::Var(l)), &expr("div", &Ty::Var(m), &Ty::Var(k))).is_err(),
+        "`N/L ~ M/K` proves neither `N = M` nor `L = K`"
+    );
+
+    let mut subst = Subst::default();
+    unify(&mut subst, &expr("add", &Ty::Var(n), &one), &expr("add", &Ty::Var(m), &one))
+        .unwrap_or_else(|e| panic!("`N+1 ~ M+1` should unify: {e:?}"));
+    assert_eq!(subst.apply(&Ty::Var(n)), subst.apply(&Ty::Var(m)));
+
+    let mut subst = Subst::default();
+    assert!(
+        unify(&mut subst, &expr("div", &Ty::Var(n), &four), &expr("div", &Ty::Var(m), &four)).is_err(),
+        "`N/4 ~ M/4` doesn't prove `N = M`"
+    );
+
+    let mut subst = Subst::default();
+    unify(&mut subst, &expr("mul", &Ty::Var(n), &four), &expr("mul", &Ty::Var(m), &four))
+        .unwrap_or_else(|e| panic!("`N*4 ~ M*4` should unify: {e:?}"));
+    assert_eq!(subst.apply(&Ty::Var(n)), subst.apply(&Ty::Var(m)));
+}

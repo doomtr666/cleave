@@ -79,17 +79,16 @@ fn stdlib_num_splits_int_and_float_as_independent_algebras() {
 #[test]
 fn stdlib_num_declares_adjoint_rules_alongside_derivative_rules() {
     let registry = load_num_registry();
-    let ring_adjoints = registry.adjoint_rules("Ring");
-    let ring_methods: std::collections::HashSet<&str> =
-        ring_adjoints.iter().map(|r| r.method.as_str()).collect();
-    assert_eq!(
-        ring_methods,
-        std::collections::HashSet::from(["add", "sub", "mul", "div", "neg"]),
-        "expected exactly the 5 Ring adjoint rules"
-    );
+    // The additive group's three (`Additive`), the ring's own two (`Ring :
+    // Additive`).
+    let methods = |algebra: &str| -> std::collections::HashSet<String> {
+        registry.adjoint_rules(algebra).iter().map(|r| r.method.clone()).collect()
+    };
+    assert_eq!(methods("Additive"), ["add", "sub", "neg"].map(String::from).into(), "Additive's adjoint rules");
+    assert_eq!(methods("Ring"), ["mul", "div"].map(String::from).into(), "Ring's adjoint rules");
     // `derivative` rules still present too -- coexistence, not replacement,
     // during the migration.
-    assert_eq!(registry.derivative_rules("Ring").len(), 5);
+    assert_eq!(registry.derivative_rules("Additive").len() + registry.derivative_rules("Ring").len(), 5);
 
     let trans_adjoints = registry.adjoint_rules("Transcendental");
     let trans_methods: std::collections::HashSet<&str> =

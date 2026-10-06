@@ -364,8 +364,11 @@ fn algebras_how_operators_actually_work() {
     let context = context();
     let src = "
         struct Vec2 { x: f64, y: f64 }
-        impl Ring<Vec2> {
+        impl Additive<Vec2> {
             fn add(a, b) { Vec2(x: a.x + b.x, y: a.y + b.y) }
+            fn sub(a, b) { Vec2(x: a.x - b.x, y: a.y - b.y) }
+            fn neg(a) { Vec2(x: -a.x, y: -a.y) }
+            fn zero() { Vec2(x: 0.0, y: 0.0) }
         }
         fn translate(a: Vec2, b: Vec2) -> Vec2 {
             a + b
@@ -756,13 +759,16 @@ fn putting_it_together_worked_example() {
             y: f64,
         }
 
-        impl Ring<Vec2> {
+        impl Additive<Vec2> {
             fn add(a, b) { Vec2(x: a.x + b.x, y: a.y + b.y) }
+            fn sub(a, b) { Vec2(x: a.x - b.x, y: a.y - b.y) }
+            fn neg(a) { Vec2(x: -a.x, y: -a.y) }
+            fn zero() { Vec2(x: 0.0, y: 0.0) }
         }
 
         fn magnitude_sq(v: Vec2) -> f64 { v.x * v.x + v.y * v.y }
 
-        fn combine<T: Ring>(a: T, b: T) -> T {
+        fn combine<T: Additive>(a: T, b: T) -> T {
             a + b
         }
 

@@ -63,7 +63,7 @@ impl<T: Float, const Dims...: i32> NativeShape<Tensor<T, Dims...>> {}
 // impl covers every rank now — `Dims` never resolves until a real call
 // site does (`Ty::Pack` staying symbolic through this impl's own
 // declaration-time inference is exactly what makes that possible).
-impl<T: Float, const Dims...: i32> Ring<Tensor<T, Dims...>> {
+impl<T: Float, const Dims...: i32> Additive<Tensor<T, Dims...>> {
     // `mlir::linalg::elementwise::*`, not a plain `mlir::arith::*` applied
     // directly to the whole tensor operand (this impl's own previous, and
     // simpler, shape) -- `mlir_lower.rs::build_elementwise_binop`'s own doc
@@ -75,8 +75,6 @@ impl<T: Float, const Dims...: i32> Ring<Tensor<T, Dims...>> {
     // relu` chain to share one `scf.forall`.
     fn add(a: Tensor<T, Dims...>, b: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::linalg::elementwise::addf(a, b) }
     fn sub(a: Tensor<T, Dims...>, b: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::linalg::elementwise::subf(a, b) }
-    fn mul(a: Tensor<T, Dims...>, b: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::linalg::elementwise::mulf(a, b) }
-    fn div(a: Tensor<T, Dims...>, b: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::linalg::elementwise::divf(a, b) }
     fn neg(a: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::arith::negf(a) }
     // A same-shaped tensor of zeros — a real, O(1)-sized `tensor.splat`
     // call, not `[zero(); Dims...]`'s own array-repeat (`doc/backlog.md`'s
@@ -101,6 +99,11 @@ impl<T: Float, const Dims...: i32> Ring<Tensor<T, Dims...>> {
         let z: T = zero();
         mlir::tensor::splat(z)
     }
+}
+
+impl<T: Float, const Dims...: i32> Ring<Tensor<T, Dims...>> {
+    fn mul(a: Tensor<T, Dims...>, b: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::linalg::elementwise::mulf(a, b) }
+    fn div(a: Tensor<T, Dims...>, b: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::linalg::elementwise::divf(a, b) }
     fn one() -> Tensor<T, Dims...> {
         let o: T = one();
         mlir::tensor::splat(o)
@@ -128,6 +131,8 @@ impl<T: Float, const Dims...: i32> Transcendental<Tensor<T, Dims...>> {
     fn sin(x: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::math::sin(x) }
     fn cos(x: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::math::cos(x) }
     fn sqrt(x: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::math::sqrt(x) }
+    fn tanh(x: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::math::tanh(x) }
+    fn log(x: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::math::log(x) }
 }
 
 // `Tensor * scalar` (`SGD`'s own `w = w - lr * grad`, needed once a weight

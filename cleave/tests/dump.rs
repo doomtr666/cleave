@@ -96,11 +96,11 @@ fn nested_sub_expressions_are_each_annotated_with_their_own_type_not_just_the_ou
     let (out, errs) = dump(src);
     assert_eq!(errs, 0, "got:\n{out}");
     assert!(
-        out.contains("Ring::sub(x:i32, 1:i32):i32"),
+        out.contains("Additive::sub(x:i32, 1:i32):i32"),
         "the inner `sub` calls must show their own type, got:\n{out}"
     );
     assert!(
-        out.contains("Ring::add(Ring::sub(x:i32, 1:i32):i32, Ring::sub(x:i32, 2:i32):i32):i32"),
+        out.contains("Additive::add(Additive::sub(x:i32, 1:i32):i32, Additive::sub(x:i32, 2:i32):i32):i32"),
         "got:\n{out}"
     );
 }

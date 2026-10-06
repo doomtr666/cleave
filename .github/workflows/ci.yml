@@ -22,7 +22,9 @@ jobs:
     # a different order of magnitude entirely. Not yet measured on a cold
     # cache under this new shape; generous rather than exact until a real
     # run gives a number to tighten it against.
-    timeout-minutes: 60
+    # Raised from 60 when the example crates joined (their kernels, below):
+    # nanoLM's alone compiles for several minutes on a 4-vCPU runner.
+    timeout-minutes: 120
     steps:
       - name: Checkout cleave
         uses: actions/checkout@v4
@@ -85,9 +87,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       # No `--workspace` -- deliberately respects `Cargo.toml`'s own
-      # `default-members` (`digits-interop`/`mnist-interop` need real
-      # network access and take minutes, a poor fit for an ordinary CI
-      # sweep -- `Cargo.toml`'s own doc comment already explains this).
+      # `default-members` (running `digits-interop`/`mnist-interop` needs
+      # real network access and minutes of training, a poor fit for an
+      # ordinary CI sweep -- `Cargo.toml`'s own doc comment already explains
+      # this). The example crates are built (and nanoLM tested) in their own
+      # steps below, without running them.
       - name: cargo build
         run: cargo build --release
 
@@ -106,3 +110,16 @@ jobs:
         run: cargo test --release --no-fail-fast
         env:
           RUST_MIN_STACK: "67108864"
+
+      # The example crates outside `default-members`: no network and no
+      # training here, but each one's `build.rs` compiles a real kernel
+      # through the compiler, the largest code generation tests there are
+      # (nanoLM's transformer above all). nanoLM's own unit tests (BPE,
+      # corpus cleaning, data windows) need no corpus either.
+      - name: nanoLM (kernel and unit tests)
+        run: cargo test --release -p nanolm --no-fail-fast
+        env:
+          RUST_MIN_STACK: "67108864"
+
+      - name: digits-interop and mnist-interop kernels
+        run: cargo build --release -p digits-interop -p mnist-interop

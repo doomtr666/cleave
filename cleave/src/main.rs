@@ -919,9 +919,12 @@ fn real_main() -> ExitCode {
             match std::env::var("MLIR_SYS_220_PREFIX") {
                 Ok(prefix) => shared_libs.push(format!("{prefix}/bin/libomp.dll")),
                 Err(_) => {
-                    eprintln!(
-                        "error: MLIR_SYS_220_PREFIX must be set (see .cargo/config.toml) to run with --openmp"
-                    );
+                    let why = if options.openmp {
+                        "with OpenMP (--no-openmp to run without)"
+                    } else {
+                        "a program using `spawn` (its tasks run on libomp, even under --no-openmp; --no-tasks to run them in place)"
+                    };
+                    eprintln!("error: MLIR_SYS_220_PREFIX must be set (see .cargo/config.toml) to run {why}");
                     return ExitCode::FAILURE;
                 }
             }

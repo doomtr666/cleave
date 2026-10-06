@@ -800,9 +800,24 @@ pub fn unify(subst: &mut Subst, a: &Ty, b: &Ty) -> Result<(), UnifyError> {
         // "don't guess" behavior wanted for something like `N+M` against a
         // literal array length alone (`N`/`M` individually still
         // undetermined — see `Ty::ConstExpr`'s own doc comment).
+        //
+        // Equal operators don't make equal operands (`8/4 = 4/2`): only
+        // when one pair of operands is already the same, and the operator
+        // is injective in the other one (`N+1 ~ M+1` gives `N = M`; `N/4 ~
+        // M/4` doesn't), does unifying the other pair follow. Anything
+        // else is a `Mismatch` rather than a guess.
         (Ty::ConstExpr(op1, x1, y1), Ty::ConstExpr(op2, x2, y2)) if op1 == op2 => {
-            unify(subst, x1, x2)?;
-            unify(subst, y1, y2)
+            let injective = |other: &Ty| match op1.as_str() {
+                "add" | "sub" => true,
+                "mul" => matches!(other, Ty::Const(ConstValue::Int(n)) if *n != 0),
+                _ => false,
+            };
+            match (x1 == x2, y1 == y2) {
+                (true, true) => Ok(()),
+                (true, false) if injective(x1) => unify(subst, y1, y2),
+                (false, true) if injective(y1) => unify(subst, x1, x2),
+                _ => Err(UnifyError::Mismatch(a, b)),
+            }
         }
         _ => Err(UnifyError::Mismatch(a, b)),
     }

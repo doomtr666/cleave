@@ -25,7 +25,7 @@
 //! compile errors, not from the (partly stale) doc comment alone.
 //!
 //! `Op`'s own `Symbol` reuses a `ConcreteUnit`'s already-unique `name`
-//! directly for an algebra-dispatched operation (e.g. `"Ring::add<i32>"`),
+//! directly for an algebra-dispatched operation (e.g. `"Additive::add<i32>"`),
 //! or a combined `"mlir-op:type"` string for a raw `mlir::...` call with no
 //! `ConcreteUnit` of its own to borrow a name from (e.g. `"arith.addi:i32"`)
 //! — two concrete instantiations of the same abstract op are simply two
@@ -51,7 +51,7 @@ use egg::{Analysis, DidMerge, Id, Symbol};
 // `define_language!` doesn't accept a doc comment on an individual variant
 // (only the enum itself) — see the module's own doc comment above for what
 // each of these actually means: `Op` is either an algebra-dispatched
-// operation (`Symbol` = a `ConcreteUnit`'s own name, e.g. `"Ring::add<i32>"`)
+// operation (`Symbol` = a `ConcreteUnit`'s own name, e.g. `"Additive::add<i32>"`)
 // or a raw `mlir::...` call (`Symbol` = `"mlir-op:type"`); `Free` is a true
 // free variable from outside the segment being translated, a synthetic
 // per-segment symbol reverse-mapped back to its own original `CVal`
@@ -70,7 +70,7 @@ egg::define_language! {
 /// `const_eval::eval_binop`'s own expected `op` argument — from a `Op`
 /// node's own combined symbol, whichever of the two conventions produced it
 /// (see the module's own doc comment on `CleaveLang::Op`): an algebra-
-/// dispatched unit name's own method segment (`"Ring::add<i32>"` -> `"add"`
+/// dispatched unit name's own method segment (`"Additive::add<i32>"` -> `"add"`
 /// — a `ConcreteUnit`'s own method name, threaded straight through from
 /// `origin`, already *is* the exact name `eval_binop` expects, since both
 /// ultimately come from the same source-level desugaring, `ast.rs`'s own
@@ -413,7 +413,7 @@ fn is_pure_prim_op(op: &PrimOp) -> bool {
 /// direction: a unit that itself calls *another* pure unit is rejected too
 /// (its own body contains a `Fix`, from that nested call), even though it's
 /// also "really" pure — multi-level transparency is a natural follow-up,
-/// not needed for this module's own first target (`Ring::add<i32>`, a
+/// not needed for this module's own first target (`Additive::add<i32>`, a
 /// single raw `mlir::...` call, no nested calls at all).
 ///
 /// The effect check is not optional: a callee shaped `LetPrim{op: Extern
@@ -464,7 +464,7 @@ fn is_straight_line(expr: &CExpr, units: &HashMap<String, &CTopLevelFn>) -> bool
 /// Multi-level call transparency (`doc/backlog.md`'s own item, the "natural
 /// follow-up" `is_straight_line`'s own doc comment above already names) —
 /// whether `expr` is a *chain* of real calls to other units, each of which
-/// is itself either `is_straight_line` (a single primop — `Ring::add<f32>`)
+/// is itself either `is_straight_line` (a single primop — `Additive::add<f32>`)
 /// or (recursively) another such chain, with no loop/branch/effect
 /// anywhere. `Forward::walk`'s own `Fix` arm uses this to decide whether to
 /// walk *into* a callee's own body (true multi-level inlining) rather than
@@ -1055,7 +1055,7 @@ impl Forward {
                             // Multi-level transparency (`doc/backlog.md`'s
                             // own item) — `callee`'s own body isn't a single
                             // primop (so it can't become one opaque `Op`
-                            // node the way `Ring::add<f32>` does — nothing
+                            // node the way `Additive::add<f32>` does — nothing
                             // declares an axiom/derivative rule keyed by
                             // *its* own name), but it's still a pure chain
                             // of further real calls, no loop/branch/effect
@@ -1464,7 +1464,7 @@ pub fn axiom_rewrites(
 }
 
 /// Extracts the bracketed type argument from a unit's own display name
-/// (`"Ring::add<i32>"` -> `"i32"`) — a real, if narrow, parse (unlike every
+/// (`"Additive::add<i32>"` -> `"i32"`) — a real, if narrow, parse (unlike every
 /// other place in this module, which deliberately avoids parsing a unit
 /// name at all — see `ConcreteUnit::origin`'s own doc comment). Nothing
 /// structurally carries "the concrete type" on its own the way `origin`
@@ -2663,7 +2663,7 @@ pub fn derivative_rewrites(
     // ...>` impl built from ordinary cleave source (`doc/backlog.md`'s own
     // "Real pack-generic `[value; Dims...]` array-repeat" item was the
     // missing piece that unblocked writing it at all). This rule's own job
-    // shrinks to just calling it — `Ring::zero<ty>()`, resolved at
+    // shrinks to just calling it — `Additive::zero<ty>()`, resolved at
     // rewrite-*application* time since `?a`'s own `Ty` is only known then —
     // when that unit doesn't actually exist for `ty` (`unit_names`, snapshot
     // ed once, owned, since `Applier` impls must be `Send + Sync + 'static`
@@ -2727,12 +2727,12 @@ struct IndependentZeroApplier {
     /// owned, since `Applier` implementations must be `Send + Sync +
     /// 'static` (`Rewrite::new`'s own bound) and so can't hold a borrowed
     /// `&HashMap`. `build_zero`'s own existence check against this is what
-    /// keeps this rule from ever emitting a call to a `Ring::zero<ty>` that
+    /// keeps this rule from ever emitting a call to a `Additive::zero<ty>` that
     /// was never actually monomorphized (a type with no `Ring` impl at all,
     /// say) — bailing instead, the same "don't guess" posture as everywhere
     /// else in this module.
     unit_names: HashSet<String>,
-    /// Every `Ring::zero<ty>` unit name this rule actually fired for, during
+    /// Every `Additive::zero<ty>` unit name this rule actually fired for, during
     /// this whole saturation run — read back by `synthesize_derivatives`
     /// *after* `Runner::run` returns (via the `Arc` this shares), the same
     /// reason `derivative_rule_rewrites`'s own `referenced` set exists: a
@@ -2830,7 +2830,7 @@ impl Applier<CleaveLang, ConstantFold> for IndependentZeroApplier {
     }
 }
 
-/// Builds `Ring::zero<ty>()` — a real call to the real, stdlib-declared
+/// Builds `Additive::zero<ty>()` — a real call to the real, stdlib-declared
 /// `Ring<T>::zero()` (`derivative_rewrites`'s own doc comment on why this
 /// replaced an earlier, hand-built-in-Rust version) — `None`, rather than
 /// guessing, when that exact unit was never actually monomorphized
@@ -2844,7 +2844,7 @@ fn build_zero(
     unit_names: &HashSet<String>,
     zero_calls_used: &std::sync::Mutex<HashSet<String>>,
 ) -> Option<egg::Id> {
-    let unit_name = format!("Ring::zero<{ty}>");
+    let unit_name = format!("Additive::zero<{ty}>");
     if !unit_names.contains(&unit_name) {
         return None;
     }
@@ -2898,7 +2898,7 @@ fn derivative_rule_rewrites(
 
 /// `derivative` counterpart of `axiom_to_rewrite`: `derivative mul(a, b):
 /// add(mul(a, d(b)), mul(d(a), b));` becomes `derivative(Ring::mul<ty>(?a,
-/// ?b), ?x) -> Ring::add<ty>(Ring::mul<ty>(?a, derivative(?b,?x)), Ring::
+/// ?b), ?x) -> Additive::add<ty>(Ring::mul<ty>(?a, derivative(?b,?x)), Ring::
 /// mul<ty>(derivative(?a,?x), ?b))` — the LHS built by hand (the outer
 /// `derivative(method(...), ?__diff_x)` wrapper has no source-level `Expr`
 /// of its own to walk), the RHS via `build_pattern` with `d_var: Some(?
@@ -2931,7 +2931,7 @@ fn derivative_rule_rewrites(
 /// own operands are both type `C` specifically, not the whole "A,B,C"
 /// combined `ty` string the enclosing `matmul` rule was built for — found
 /// directly, not anticipated, via a minimal probe that panicked building an
-/// `Op` node literally named `Ring::add<Tensor<f32,2,2>, Tensor<f32,2,2>,
+/// `Op` node literally named `Additive::add<Tensor<f32,2,2>, Tensor<f32,2,2>,
 /// Tensor<f32,2,2>>`, a unit that could never actually exist. Falls back to
 /// the flat `ty` for any param whose own declared type isn't a bare generic
 /// name (`resolve_declared_type`'s own doc comment) — harmless: such a
@@ -3828,7 +3828,7 @@ pub fn synthesize_derivatives(
         .map(|f| (f.def.name.clone(), f))
         .collect();
     // `derivative_rewrites`'s own `IndependentZeroApplier` needs this to
-    // know whether a `Ring::zero<ty>` it might dynamically call actually
+    // know whether a `Additive::zero<ty>` it might dynamically call actually
     // exists anywhere in the program — same reason `call_units` below
     // filters `referenced` the identical way.
     let unit_names: HashSet<String> = units.keys().cloned().collect();
@@ -4072,7 +4072,7 @@ pub fn synthesize_derivatives(
         } = fwd;
         // A fired `derivative` rule's own RHS can reference a unit `f`'s
         // own body never itself called (the product rule always needs
-        // `Ring::add<ty>`, even differentiating a body that only ever
+        // `Additive::add<ty>`, even differentiating a body that only ever
         // multiplies) — `referenced` (`derivative_rewrites`'s own return
         // value, collected while building the rules actually in play)
         // names every one; `rebuild`'s own `Op` handling needs each,
@@ -4696,7 +4696,7 @@ fn backward_walk(
 }
 
 /// Accumulates one more contribution into `base`'s own running `field_name`
-/// adjoint — `accumulate_adjoint`'s own sibling, summing via `Ring::add<ty>`
+/// adjoint — `accumulate_adjoint`'s own sibling, summing via `Additive::add<ty>`
 /// exactly the same way, just keyed by `(base, field_name)` in `field_
 /// contributions` instead of directly by e-class in `adjoints` (a struct-
 /// typed `base` has no `Ring::add` of its own to sum a *whole* contribution
@@ -4715,9 +4715,9 @@ fn accumulate_field_contribution(
     let key = (base, field_name);
     match field_contributions.get(&key).copied() {
         Some(existing) => {
-            referenced.insert(format!("Ring::add<{ty}>"));
+            referenced.insert(format!("Additive::add<{ty}>"));
             let summed = egraph.add(CleaveLang::Op(
-                format!("Ring::add<{ty}>").into(),
+                format!("Additive::add<{ty}>").into(),
                 vec![existing, contribution],
             ));
             field_contributions.insert(key, summed);
@@ -4799,7 +4799,7 @@ fn synthesize_struct_adjoint(
     Ok(egraph.add(CleaveLang::Op(sym, field_ids)))
 }
 
-/// `build_zero`'s own recursive counterpart — a real `Ring::zero<ty>()`
+/// `build_zero`'s own recursive counterpart — a real `Additive::zero<ty>()`
 /// call when one exists, otherwise (a struct type with no `Ring` impl of
 /// its own — `Dense`/`Network`, exactly the shape a real gradient's own
 /// zero-filled, never-read field needs) zero-fills each of its own declared
@@ -4896,19 +4896,19 @@ fn snapshot_backward_order(
 
 /// Accumulates one more contribution into `target`'s own running adjoint —
 /// the production counterpart of the Phase 0 spike's own `spike_contribute`,
-/// generalized to a real concrete type (`Ring::add<{ty}>`, not a hardcoded
+/// generalized to a real concrete type (`Additive::add<{ty}>`, not a hardcoded
 /// `i32`) — `ty` is the contribution's own resolved type (`apply_adjoint_
 /// rule`'s own `type_env`, not re-derived from the live e-graph: an
 /// intermediate node's own `ConstantFold::own_ty` is `None` far more often
 /// than not, populated only for `Free`/`Struct`/`Array` symbols — see
 /// `ConstantFold::make`'s own doc comment).
 ///
-/// `referenced` gains `Ring::add<{ty}>` whenever this actually builds one —
+/// `referenced` gains `Additive::add<{ty}>` whenever this actually builds one —
 /// found directly needed, not anticipated: `f(x) = x * x` reaches this
 /// branch (`x` is *both* of `mul`'s own operands, so its own adjoint rule's
 /// two contributions both target the same leaf) even though `f`'s own
 /// forward body never calls `add` anywhere at all, so `fwd.call_units`
-/// alone never has it — `rebuild` then panics on a `Ring::add<f32>` node
+/// alone never has it — `rebuild` then panics on a `Additive::add<f32>` node
 /// none of its own lookup tables recognize, the identical "unrecognized
 /// symbol" class of bug `derivative_rewrites`' own `referenced` set already
 /// exists to prevent for the forward-mode path.
@@ -4923,9 +4923,9 @@ fn accumulate_adjoint(
     let target = egraph.find(target);
     match adjoints.get(&target).copied() {
         Some(existing) => {
-            referenced.insert(format!("Ring::add<{ty}>"));
+            referenced.insert(format!("Additive::add<{ty}>"));
             let summed = egraph.add(CleaveLang::Op(
-                format!("Ring::add<{ty}>").into(),
+                format!("Additive::add<{ty}>").into(),
                 vec![existing, contribution],
             ));
             adjoints.insert(target, summed);
@@ -5890,7 +5890,7 @@ mod tests {
             let mut e: RecExpr<CleaveLang> = RecExpr::default();
             let mut prev = e.add(CleaveLang::Free(leaf.into()));
             for _ in 0..64 {
-                prev = e.add(CleaveLang::Op("Ring::add<f32>".into(), vec![prev, prev]));
+                prev = e.add(CleaveLang::Op("Additive::add<f32>".into(), vec![prev, prev]));
             }
             e
         };
@@ -5903,7 +5903,7 @@ mod tests {
 
     /// Proves both the `Language` shape and the folding `Analysis` are
     /// usable in isolation, before anything CPS-shaped touches either:
-    /// `AlgebraOp("Ring::add<i32>", [Int(2), Int(3)])` folds to `Int(5)`
+    /// `AlgebraOp("Additive::add<i32>", [Int(2), Int(3)])` folds to `Int(5)`
     /// during construction (`Analysis::modify` fires the moment the e-class
     /// is created, no explicit `rebuild()` needed for a plain `add`-only
     /// graph with no rules run over it), and extraction picks the folded
@@ -5915,7 +5915,7 @@ mod tests {
         let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
         let two = egraph.add(CleaveLang::Int(2));
         let three = egraph.add(CleaveLang::Int(3));
-        let add = egraph.add(CleaveLang::Op("Ring::add<i32>".into(), vec![two, three]));
+        let add = egraph.add(CleaveLang::Op("Additive::add<i32>".into(), vec![two, three]));
 
         // Compared by `Display` text, not by parsing an expected string back
         // into a `RecExpr` for equality — `CleaveLang`'s own bare-data
@@ -5942,23 +5942,23 @@ mod tests {
         let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
         let a = egraph.add(CleaveLang::Free("a".into()));
         let two = egraph.add(CleaveLang::Int(2));
-        let add = egraph.add(CleaveLang::Op("Ring::add<i32>".into(), vec![a, two]));
+        let add = egraph.add(CleaveLang::Op("Additive::add<i32>".into(), vec![a, two]));
 
         assert_eq!(egraph[add].data.const_int, None);
         let extractor = Extractor::new(&egraph, AstSize);
         let (_, best) = extractor.find_best(add);
-        assert_eq!(best.to_string(), "(Ring::add<i32> a 2)", "got {best}");
+        assert_eq!(best.to_string(), "(Additive::add<i32> a 2)", "got {best}");
     }
 
     /// `neg` folds via `eval_binop("sub", 0, a)` (`ConstantFold::make`'s own
-    /// unary-arity arm) — `Ring::neg<i32>(5)` should constant-fold to the
+    /// unary-arity arm) — `Additive::neg<i32>(5)` should constant-fold to the
     /// same `u64` bit pattern `0u64.wrapping_sub(5)` gives, matching `Ring<T>
     /// ::neg`'s own real runtime body (`mlir::arith::subi(0, a)`).
     #[test]
     fn neg_folds_a_single_int_literal() {
         let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
         let five = egraph.add(CleaveLang::Int(5));
-        let neg = egraph.add(CleaveLang::Op("Ring::neg<i32>".into(), vec![five]));
+        let neg = egraph.add(CleaveLang::Op("Additive::neg<i32>".into(), vec![five]));
         assert_eq!(egraph[neg].data.const_int, Some(0u64.wrapping_sub(5)));
     }
 
@@ -6369,7 +6369,7 @@ mod tests {
     fn a_real_call_to_a_straight_line_unit_is_transparent() {
         let callee = CTopLevelFn {
             def: CFunDef {
-                name: "Ring::add<i32>".to_string(),
+                name: "Additive::add<i32>".to_string(),
                 params: vec![10, 11, 12],
                 body: CExpr::LetPrim {
                     var: 20,
@@ -6389,16 +6389,16 @@ mod tests {
             param_types: vec![i32_ty(), i32_ty()],
             result: i32_ty(),
             k_ret: 12,
-            origin: Some(("Ring".to_string(), "add".to_string())),
+            origin: Some(("Additive".to_string(), "add".to_string())),
             no_inline: false,
             is_export: false,
             export_symbol: None,
             loc: SrcLoc::default(),
         };
         let mut units: HashMap<String, &CTopLevelFn> = HashMap::new();
-        units.insert("Ring::add<i32>".to_string(), &callee);
+        units.insert("Additive::add<i32>".to_string(), &callee);
 
-        // The *caller's* own shape: `Fix{ k(result) { App(k_ret_of_caller, [result]) } , App(Ring::add<i32>, [a, b, k]) }`.
+        // The *caller's* own shape: `Fix{ k(result) { App(k_ret_of_caller, [result]) } , App(Additive::add<i32>, [a, b, k]) }`.
         let expr = CExpr::Fix {
             defs: vec![CFunDef {
                 name: "k$0".to_string(),
@@ -6410,7 +6410,7 @@ mod tests {
                 carried_types: None,
             }],
             body: Box::new(CExpr::App {
-                func: CVal::Label("Ring::add<i32>".to_string()),
+                func: CVal::Label("Additive::add<i32>".to_string()),
                 args: vec![CVal::Int(2), CVal::Int(3), CVal::Label("k$0".to_string())],
             }),
         };
@@ -6427,8 +6427,8 @@ mod tests {
         // 2 + 3 folds to 5 through the *callee's* own translated op.
         assert_eq!(fwd.egraph[fwd.env[&5]].data.const_int, Some(5));
         assert_eq!(
-            fwd.reached.get("Ring::add<i32>"),
-            Some(&("Ring".to_string(), "add".to_string())),
+            fwd.reached.get("Additive::add<i32>"),
+            Some(&("Additive".to_string(), "add".to_string())),
             "the inlined call's own algebra origin must be recorded for a later axiom-matching stage"
         );
     }
@@ -6501,7 +6501,7 @@ mod tests {
     /// on that exact source, not guessed — parameterized only over `end`'s
     /// own bound `CVal` so the three tests below can each plug in a
     /// literal-in-range, non-literal, or too-large bound without repeating
-    /// the whole shape. `Ring::add<i32>` is registered as a real,
+    /// the whole shape. `Additive::add<i32>` is registered as a real,
     /// straight-line callee (mirrors `a_real_call_to_a_straight_line_unit_
     /// is_transparent`'s own callee exactly) since the loop body's own two
     /// additions (`acc + i`, `i + 1`) need to resolve as real calls during
@@ -6531,14 +6531,14 @@ mod tests {
                         carried_types: None,
                     }],
                     body: Box::new(CExpr::App {
-                        func: CVal::Label("Ring::add<i32>".to_string()),
+                        func: CVal::Label("Additive::add<i32>".to_string()),
                         args: vec![CVal::Var(I), CVal::Int(1), CVal::Label("k2".to_string())],
                     }),
                 },
                 carried_types: None,
             }],
             body: Box::new(CExpr::App {
-                func: CVal::Label("Ring::add<i32>".to_string()),
+                func: CVal::Label("Additive::add<i32>".to_string()),
                 args: vec![CVal::Var(ACC), CVal::Var(I), CVal::Label("k1".to_string())],
             }),
         };
@@ -6579,7 +6579,7 @@ mod tests {
     fn ring_add_i32_callee() -> CTopLevelFn {
         CTopLevelFn {
             def: CFunDef {
-                name: "Ring::add<i32>".to_string(),
+                name: "Additive::add<i32>".to_string(),
                 params: vec![10, 11, 12],
                 body: CExpr::LetPrim {
                     var: 20,
@@ -6599,7 +6599,7 @@ mod tests {
             param_types: vec![i32_ty(), i32_ty()],
             result: i32_ty(),
             k_ret: 12,
-            origin: Some(("Ring".to_string(), "add".to_string())),
+            origin: Some(("Additive".to_string(), "add".to_string())),
             no_inline: false,
             is_export: false,
             export_symbol: None,
@@ -6618,7 +6618,7 @@ mod tests {
     fn a_literal_bounded_for_loop_unrolls_and_carries_state_correctly() {
         let callee = ring_add_i32_callee();
         let mut units: HashMap<String, &CTopLevelFn> = HashMap::new();
-        units.insert("Ring::add<i32>".to_string(), &callee);
+        units.insert("Additive::add<i32>".to_string(), &callee);
 
         let expr = for_loop_fix(CVal::Int(3));
         let mut fwd = Forward::default();
@@ -6653,7 +6653,7 @@ mod tests {
     fn a_for_loop_with_a_non_literal_bound_is_not_unrolled() {
         let callee = ring_add_i32_callee();
         let mut units: HashMap<String, &CTopLevelFn> = HashMap::new();
-        units.insert("Ring::add<i32>".to_string(), &callee);
+        units.insert("Additive::add<i32>".to_string(), &callee);
 
         let expr = for_loop_fix(CVal::Var(50));
         let mut fwd = Forward::default();
@@ -6676,7 +6676,7 @@ mod tests {
     fn a_for_loop_exceeding_the_unroll_cap_is_not_unrolled() {
         let callee = ring_add_i32_callee();
         let mut units: HashMap<String, &CTopLevelFn> = HashMap::new();
-        units.insert("Ring::add<i32>".to_string(), &callee);
+        units.insert("Additive::add<i32>".to_string(), &callee);
 
         let expr = for_loop_fix(CVal::Int(MAX_UNROLL_ITERATIONS + 1));
         let mut fwd = Forward::default();
@@ -7529,7 +7529,7 @@ mod tests {
         assert_eq!(extract_best(&runner.egraph, runner.egraph.find(d)), "1");
     }
 
-    /// `derivative(y, x) -> Ring::zero<f32>()` -- a *different* free
+    /// `derivative(y, x) -> Additive::zero<f32>()` -- a *different* free
     /// variable is a leaf that doesn't depend on `x`. The zero is a real
     /// call now, not a bare literal `0` (`derivative_rewrites`'s own doc
     /// comment on why `build_zero` calls the real, stdlib-declared `Ring::
@@ -7543,7 +7543,7 @@ mod tests {
         // A hand-built test e-graph, bypassing the real compiler pipeline
         // entirely, has to assert this unit "exists" itself, the same way
         // it already has to populate `known_types` below.
-        let unit_names: HashSet<String> = HashSet::from(["Ring::zero<f32>".to_string()]);
+        let unit_names: HashSet<String> = HashSet::from(["Additive::zero<f32>".to_string()]);
         let (rules, _, _) = derivative_rewrites("f32", &HashMap::new(), &reg, &unit_names);
         let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
         let x = egraph.add(CleaveLang::Free("x".into()));
@@ -7561,7 +7561,7 @@ mod tests {
         let runner = egg::Runner::default().with_egraph(egraph).run(&rules);
         assert_eq!(
             extract_best(&runner.egraph, runner.egraph.find(d)),
-            "Ring::zero<f32>"
+            "Additive::zero<f32>"
         );
     }
 
@@ -7731,11 +7731,11 @@ mod tests {
     fn derivative_of_x_times_y_with_respect_to_x_eliminates_the_derivative_marker() {
         let reg = ring_f32_with_derivative_rules();
         let reached = ring_f32_reached();
-        // `build_zero` now calls the real `Ring::zero<f32>` (`derivative_
+        // `build_zero` now calls the real `Additive::zero<f32>` (`derivative_
         // rewrites`'s own doc comment) -- asserted to "exist" here the same
         // way `derivative_of_a_different_free_variable_is_zero` already
         // does, for the identical reason.
-        let unit_names: HashSet<String> = HashSet::from(["Ring::zero<f32>".to_string()]);
+        let unit_names: HashSet<String> = HashSet::from(["Additive::zero<f32>".to_string()]);
         let (rules, _, _) = derivative_rewrites("f32", &reached, &reg, &unit_names);
 
         let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
@@ -7925,7 +7925,7 @@ mod tests {
         match adjoints.get(&target).copied() {
             Some(existing) => {
                 let summed = egraph.add(CleaveLang::Op(
-                    "Ring::add<i32>".into(),
+                    "Additive::add<i32>".into(),
                     vec![existing, contribution],
                 ));
                 adjoints.insert(target, summed);
@@ -8008,7 +8008,7 @@ mod tests {
                 continue; // a leaf -- nothing further to propagate through
             };
             match (name.as_str(), children.as_slice()) {
-                ("Ring::add<i32>", [a, b]) => {
+                ("Additive::add<i32>", [a, b]) => {
                     let (a, b) = (*a, *b);
                     spike_contribute(&mut adjoints, egraph, a, u);
                     spike_contribute(&mut adjoints, egraph, b, u);
@@ -8037,7 +8037,7 @@ mod tests {
         let a = egraph.add(CleaveLang::Int(3));
         let b = egraph.add(CleaveLang::Int(4));
         let c = egraph.add(CleaveLang::Op("Ring::mul<i32>".into(), vec![a, b])); // a*b = 12
-        let d = egraph.add(CleaveLang::Op("Ring::add<i32>".into(), vec![c, a])); // c+a = 15
+        let d = egraph.add(CleaveLang::Op("Additive::add<i32>".into(), vec![c, a])); // c+a = 15
 
         let adjoints = spike_backward_walk(&mut egraph, d);
 

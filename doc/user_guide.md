@@ -350,11 +350,14 @@ Returns `61`. An array, like a struct, is a stable reference — `a[i] = v` muta
 
 ```
 struct Vec2 { x: f64, y: f64 }
-impl Ring<Vec2> {
+impl Additive<Vec2> {
     fn add(a, b) { Vec2(x: a.x + b.x, y: a.y + b.y) }
+    fn sub(a, b) { Vec2(x: a.x - b.x, y: a.y - b.y) }
+    fn neg(a) { Vec2(x: -a.x, y: -a.y) }
+    fn zero() { Vec2(x: 0.0, y: 0.0) }
 }
 fn translate(a: Vec2, b: Vec2) -> Vec2 {
-    a + b   // resolves to Ring::add for Vec2
+    a + b   // resolves to Additive::add for Vec2
 }
 fn main() -> i32 {
     let r = translate(Vec2(x: 1.0, y: 2.0), Vec2(x: 3.0, y: 4.0));
@@ -362,7 +365,9 @@ fn main() -> i32 {
 }
 ```
 
-`Ring<T>` (`add`/`sub`/`mul`/`neg`) and `Ord<T>` (`lt`/`le`/`gt`/`ge`/`eq`/`neq`) are already declared by `stdlib/num/num.cleave` — you only need `impl Ring<Vec2> { ... }`, not a fresh `algebra Ring<T> { ... }` declaration, unless you're introducing a genuinely new operator family of your own.
+`Additive<T>` (`add`/`sub`/`neg`/`zero`: `+`, `-`, unary `-`), `Ring<T> : Additive` (`mul`/`div`/`one`: `*`, `/`) and `Ord<T>` (`lt`/`le`/`gt`/`ge`/`eq`/`neq`) are already declared by `stdlib/num/num.cleave` — you only need `impl Additive<Vec2> { ... }`, not a fresh algebra, unless you're introducing a genuinely new operator family of your own. A vector is an additive group, not a ring (the product of two vectors is a dot or a cross product, not `*`), so it implements `Additive` and stops there.
+
+**An `impl` defines every function its algebra declares** — an algebra is an interface, there's no partial implementation: `impl Additive<Vec2>` with only `add` is an error naming `sub`, `neg` and `zero`. And an algebra building on another one needs both: `impl Ring<T>` requires `impl Additive<T>` too.
 
 **An `impl` method's parameters usually don't need annotating** — they're checked against, and default to, the algebra's own declared signature. Write the annotation anyway when it makes the code more readable; the type checker treats it as a redundant check against the algebra's own truth, not a second, independent source of it.
 
@@ -388,11 +393,11 @@ fn main() -> i32 {
 Two forms skip this lookup and always reach the algebra:
 
 - **An operator.** `a + b` always calls the algebra method `add`, even when a local or a top-level `fn` named `add` exists (that `fn` stays callable as `add(a, b)`).
-- **A qualified call**, `Algebra::method(args)`: `Ring::add(a, b)` reaches `Ring`'s `add` whatever else is in scope.
+- **A qualified call**, `Algebra::method(args)`: `Additive::add(a, b)` reaches `Additive`'s `add` whatever else is in scope. An algebra's super-algebras' methods are reached through it too: `Ring::add(a, b)` is `Additive::add(a, b)`.
 
-**Two algebras declaring the same method name and arity is an ambiguity, rejected rather than guessed:** if both `Ring<T>` and some other algebra declare a 2-argument `add`, a bare `add(a, b)` or `a + b` is a compile error naming both algebras. Two genuinely different `add`s (wrapping vs. saturating arithmetic, say) are both legitimate, and guessing which one you meant would be worse than asking. Qualify the call to choose: `Ring::add(a, b)`. `nn`'s `Activation::tanh` and `num`'s `Transcendental::tanh` are a real example: with both in scope, write the one you mean.
+**Two algebras declaring the same method name and arity is an ambiguity, rejected rather than guessed:** if both `Additive<T>` and some other algebra declare a 2-argument `add`, a bare `add(a, b)` or `a + b` is a compile error naming both algebras. Two genuinely different `add`s (wrapping vs. saturating arithmetic, say) are both legitimate, and guessing which one you meant would be worse than asking. Qualify the call to choose: `Additive::add(a, b)`. `nn`'s `Activation::tanh` and `num`'s `Transcendental::tanh` are a real example: with both in scope, write the one you mean.
 
-**Recursion within your own `impl`, watch the base case:** `impl Ring<Vec2> { fn add(a, b) { a + b } }`, with `a`/`b` typed `Vec2` directly, would be `Ring::add` calling `Ring::add` for the exact same type forever — no base case. This type-checks fine (it's not a type error — nothing about the *types* is wrong), but it's an infinite loop the moment it would actually run. The correct version bottoms out at the *field* level, where `a.x + b.x` dispatches to a *different*, more primitive `impl` (`Ring<f64>`, from the prelude) — exactly what `translate` above already does.
+**Recursion within your own `impl`, watch the base case:** `impl Additive<Vec2> { fn add(a, b) { a + b } ... }`, with `a`/`b` typed `Vec2` directly, would be `Additive::add` calling `Additive::add` for the exact same type forever — no base case. This type-checks fine (it's not a type error — nothing about the *types* is wrong), but it's an infinite loop the moment it would actually run. The correct version bottoms out at the *field* level, where `a.x + b.x` dispatches to a *different*, more primitive `impl` (`Additive<f64>`, from the prelude) — exactly what `translate` above already does.
 
 ## Inherent impls: methods with no algebra behind them
 
@@ -405,7 +410,7 @@ impl struct Vec2 {
 }
 ```
 
-The literal `struct` keyword right after `impl` matters — it's what tells the parser this is an ordinary method block, not an algebra `impl` (`impl struct Vec2 { ... }` vs. `impl Ring<Vec2> { ... }` — dropping `struct` changes the meaning entirely, not just the style).
+The literal `struct` keyword right after `impl` matters — it's what tells the parser this is an ordinary method block, not an algebra `impl` (`impl struct Vec2 { ... }` vs. `impl Additive<Vec2> { ... }` — dropping `struct` changes the meaning entirely, not just the style).
 
 There's no implicit `self` — `v.magnitude_sq()` calls `magnitude_sq` with `v` filling its **first** parameter, an ordinary explicit one. An unannotated first parameter defaults to the enclosing struct's own type, exactly like an algebra impl's own unannotated parameters default to what the algebra declares.
 
@@ -626,22 +631,25 @@ struct Vec2 {
     y: f64,
 }
 
-impl Ring<Vec2> {
+impl Additive<Vec2> {
     fn add(a, b) { Vec2(x: a.x + b.x, y: a.y + b.y) }
+    fn sub(a, b) { Vec2(x: a.x - b.x, y: a.y - b.y) }
+    fn neg(a) { Vec2(x: -a.x, y: -a.y) }
+    fn zero() { Vec2(x: 0.0, y: 0.0) }
 }
 
 fn magnitude_sq(v: Vec2) -> f64 { v.x * v.x + v.y * v.y }
 
-fn combine<T: Ring>(a: T, b: T) -> T {
+fn combine<T: Additive>(a: T, b: T) -> T {
     a + b
 }
 
 fn main() -> i32 {
     let a = Vec2(x: 1.0, y: 2.0);
     let b = Vec2(x: 3.0, y: 4.0);
-    let c = combine(a, b);       // generic over any Ring, instantiated at Vec2 here
+    let c = combine(a, b);       // generic over any Additive, instantiated at Vec2 here
     if magnitude_sq(c) == 52.0 { 1 } else { 0 }
 }
 ```
 
-`combine` is written once, generically, and works for `Vec2` here purely because `Vec2` has a `Ring` impl — the same `combine` would work for `i32`, `f64`, or any other type with its own `Ring` impl, with zero changes to `combine` itself. That reuse — write the generic algorithm once, get it for free on every type that implements the right algebra — is the whole point of the algebra mechanism.
+`combine` is written once, generically, and works for `Vec2` here purely because `Vec2` has an `Additive` impl — the same `combine` would work for `i32`, `f64`, or any other type with its own `Additive` impl, with zero changes to `combine` itself. That reuse — write the generic algorithm once, get it for free on every type that implements the right algebra — is the whole point of the algebra mechanism.

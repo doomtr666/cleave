@@ -638,6 +638,15 @@ impl Registry {
     /// The signature an algebra declares for `fn_name`, if any — for
     /// checking argument types against the algebra's own declared
     /// parameter/return types.
+    /// The names of the functions `algebra` declares, in order; empty for an
+    /// unknown algebra.
+    pub fn fn_names(&self, algebra: &str) -> Vec<&str> {
+        self.algebras
+            .get(algebra)
+            .map(|a| a.sigs.iter().map(|s| s.name.as_str()).collect())
+            .unwrap_or_default()
+    }
+
     pub fn fn_sig(&self, algebra: &str, fn_name: &str) -> Option<&FnSig> {
         self.algebras
             .get(algebra)?

@@ -16,13 +16,17 @@ struct vec3<T: Float> {
     z: T,
 }
 
-impl<T: Float> Ring<vec3<T>> {
+// A vector is an additive group (`+`, `-`, negation, zero), not a ring:
+// the product of two vectors is `dot` or `cross` below, not `*`.
+impl<T: Float> Additive<vec3<T>> {
     fn add(v1, v2) {
         vec3(x: v1.x + v2.x, y: v1.y + v2.y, z: v1.z + v2.z)
     }
     fn sub(v1, v2) {
         vec3(x: v1.x - v2.x, y: v1.y - v2.y, z: v1.z - v2.z)
     }
+    fn neg(v) { vec3(x: -v.x, y: -v.y, z: -v.z) }
+    fn zero() { vec3(x: Additive::zero(), y: Additive::zero(), z: Additive::zero()) }
 }
 
 // Plain top-level `fn`s -- inherent impls (`impl struct vec3<T> { ... }`)

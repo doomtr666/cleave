@@ -52,6 +52,7 @@ pub fn resolve_calls(mut program: Program) -> Program {
     let mut top_level_fns: HashSet<String> = HashSet::new();
     let mut fieldless_structs: HashSet<String> = HashSet::new();
     let mut algebra_methods: HashMap<(String, usize), Vec<String>> = HashMap::new();
+    let mut algebra_bounds: HashMap<String, Vec<String>> = HashMap::new();
     for item in &program.items {
         match &item.kind {
             ItemKind::Fn(f) => {
@@ -61,6 +62,7 @@ pub fn resolve_calls(mut program: Program) -> Program {
                 fieldless_structs.insert(d.name.clone());
             }
             ItemKind::Algebra(a) => {
+                algebra_bounds.insert(a.name.clone(), a.bounds.clone());
                 for ai in &a.items {
                     if let AlgebraItemKind::FnSig(sig) = &ai.kind {
                         algebra_methods
@@ -77,6 +79,7 @@ pub fn resolve_calls(mut program: Program) -> Program {
         top_level_fns,
         fieldless_structs,
         algebra_methods,
+        algebra_bounds,
         renamed: Cell::new(0),
     };
 
@@ -117,6 +120,8 @@ struct Resolver {
     /// though it parses as a call (`grammar.pest`, `primary`).
     fieldless_structs: HashSet<String>,
     algebra_methods: HashMap<(String, usize), Vec<String>>,
+    /// Each algebra's super-algebras (`algebra Ring<T> : Additive`).
+    algebra_bounds: HashMap<String, Vec<String>>,
     /// Shadowing `let`s renamed so far in the current function.
     renamed: Cell<u32>,
 }
@@ -136,6 +141,27 @@ impl Resolver {
             [algebra] => Some(algebra),
             _ => None,
         }
+    }
+
+    /// The algebra among `algebra` and its super-algebras, nearest first,
+    /// that declares `name` with `arity` arguments: `Ring::add` is
+    /// `Additive::add` (`algebra Ring<T> : Additive`), as a trait's method
+    /// is reached through a subtrait in Rust.
+    fn declaring_algebra(&self, algebra: &str, name: &str, arity: usize) -> Option<String> {
+        let mut queue = vec![algebra.to_string()];
+        let mut seen = HashSet::new();
+        while let Some(a) = queue.pop() {
+            if !seen.insert(a.clone()) {
+                continue;
+            }
+            if self.algebra_methods.get(&(name.to_string(), arity)).is_some_and(|owners| owners.contains(&a)) {
+                return Some(a);
+            }
+            if let Some(bounds) = self.algebra_bounds.get(&a) {
+                queue.extend(bounds.iter().rev().cloned());
+            }
+        }
+        None
     }
 
     /// Binds a `let` named `name`, renaming it when it shadows a visible name.
@@ -271,6 +297,12 @@ impl Resolver {
     }
 
     fn call_target(&self, path: &mut Path, arity: usize, scope: &[Local]) {
+        if let [algebra, name] = path.segments.as_mut_slice() {
+            if let Some(owner) = self.declaring_algebra(algebra, name, arity) {
+                *algebra = owner;
+            }
+            return;
+        }
         let [name] = path.segments.as_mut_slice() else {
             return;
         };

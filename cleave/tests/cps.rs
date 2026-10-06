@@ -273,8 +273,8 @@ fn a_self_recursive_generic_function_using_if_else_converts_and_resolves_its_own
     let block = fn_block(&out, "fibonacci<i32>");
     assert!(
         block.contains("Ord::gt<i32>")
-            && block.contains("Ring::sub<i32>")
-            && block.contains("Ring::add<i32>"),
+            && block.contains("Additive::sub<i32>")
+            && block.contains("Additive::add<i32>"),
         "got:\n{block}"
     );
 }
@@ -297,7 +297,7 @@ fn a_for_loop_becomes_a_self_recursive_continuation_carrying_the_index() {
         "the implicit bound check must resolve to Ord::lt, got:\n{block}"
     );
     assert!(
-        block.contains("Ring::add<i32>"),
+        block.contains("Additive::add<i32>"),
         "both the loop body's own `add` and the implicit increment use it, got:\n{block}"
     );
     let l = label(block, "loop");
@@ -488,7 +488,7 @@ fn mutation_inside_an_if_nested_in_a_for_loop_composes_correctly() {
     // here, this just pins today's real, observed shape.
     assert_eq!(block.matches("(fix").count(), 6, "got:\n{block}");
     assert!(
-        block.contains("Ring::add<i32>")
+        block.contains("Additive::add<i32>")
             && block.contains("Ord::gt<i32>")
             && block.contains("Ord::lt<i32>"),
         "got:\n{block}"
@@ -758,21 +758,21 @@ fn a_bare_lambda_literal_passed_directly_as_an_argument_panics_cleanly() {
 
 /// A `ConcreteUnit` built from an algebra impl's own method carries its own
 /// `(algebra, method)` origin, structurally — not something a later pass
-/// has to parse back out of the unit's own display name (`"Ring::add<i32>"`,
+/// has to parse back out of the unit's own display name (`"Additive::add<i32>"`,
 /// a one-way `format!`, see `monomorphize.rs::display_impl_instantiation`).
 #[test]
 fn an_algebra_impl_units_own_origin_names_its_algebra_and_method() {
     let all = units("fn main() -> i32 { 1 + 2 }");
     let add = all
         .iter()
-        .find(|u| u.name == "Ring::add<i32>")
+        .find(|u| u.name == "Additive::add<i32>")
         .unwrap_or_else(|| {
             panic!(
-                "no `Ring::add<i32>` unit found among: {:?}",
+                "no `Additive::add<i32>` unit found among: {:?}",
                 all.iter().map(|u| &u.name).collect::<Vec<_>>()
             )
         });
-    assert_eq!(add.origin, Some(("Ring".to_string(), "add".to_string())));
+    assert_eq!(add.origin, Some(("Additive".to_string(), "add".to_string())));
 }
 
 /// An ordinary top-level `fn`'s own unit has no algebra origin at all.
@@ -804,10 +804,10 @@ fn a_top_level_fns_own_origin_survives_cps_conversion() {
     let add = cps_program
         .funcs
         .iter()
-        .find(|f| f.def.name == "Ring::add<i32>")
+        .find(|f| f.def.name == "Additive::add<i32>")
         .unwrap_or_else(|| {
             panic!(
-                "no `Ring::add<i32>` unit found among: {:?}",
+                "no `Additive::add<i32>` unit found among: {:?}",
                 cps_program
                     .funcs
                     .iter()
@@ -815,7 +815,7 @@ fn a_top_level_fns_own_origin_survives_cps_conversion() {
                     .collect::<Vec<_>>()
             )
         });
-    assert_eq!(add.origin, Some(("Ring".to_string(), "add".to_string())));
+    assert_eq!(add.origin, Some(("Additive".to_string(), "add".to_string())));
 }
 
 // -------------------------------------------------- dead-code elimination
@@ -903,9 +903,9 @@ fn dead_code_elimination_drops_unreached_stdlib_specializations() {
         .iter()
         .map(|f| f.def.name.as_str())
         .collect();
-    assert!(names.contains(&"Ring::add<i32>"), "got: {names:?}");
+    assert!(names.contains(&"Additive::add<i32>"), "got: {names:?}");
     assert!(
-        !names.contains(&"Ring::add<f64>"),
+        !names.contains(&"Additive::add<f64>"),
         "the program never touches f64, got: {names:?}"
     );
 }
@@ -916,7 +916,7 @@ fn dead_code_elimination_drops_unreached_stdlib_specializations() {
 /// remaining call to a stdlib specialization (`10 + x - 10` reducing to `x`
 /// via `add_commutative`/`add_sub_assoc`/constant-fold/`add_zero`), which
 /// the first sweep has no way to anticipate, since it runs *before*
-/// optimization ever happens. `Ring::add<i32>`/`Ring::sub<i32>` survived a
+/// optimization ever happens. `Additive::add<i32>`/`Additive::sub<i32>` survived a
 /// single DCE pass despite ending up with zero real callers — a second
 /// sweep, run *after* `optimize_program`, is needed to actually remove them.
 #[test]
@@ -939,11 +939,11 @@ fn dead_code_elimination_after_optimization_drops_specializations_the_axioms_fol
         .map(|f| f.def.name.as_str())
         .collect();
     assert!(
-        names_before.contains(&"Ring::add<i32>"),
+        names_before.contains(&"Additive::add<i32>"),
         "a single DCE pass, before optimization, can't know these are about to become dead: {names_before:?}"
     );
     assert!(
-        names_before.contains(&"Ring::sub<i32>"),
+        names_before.contains(&"Additive::sub<i32>"),
         "got: {names_before:?}"
     );
 
@@ -955,11 +955,11 @@ fn dead_code_elimination_after_optimization_drops_specializations_the_axioms_fol
         .map(|f| f.def.name.as_str())
         .collect();
     assert!(
-        !names_after.contains(&"Ring::add<i32>"),
+        !names_after.contains(&"Additive::add<i32>"),
         "the axioms folded away every real call to add<i32>, got: {names_after:?}"
     );
     assert!(
-        !names_after.contains(&"Ring::sub<i32>"),
+        !names_after.contains(&"Additive::sub<i32>"),
         "the axioms folded away every real call to sub<i32>, got: {names_after:?}"
     );
     assert!(names_after.contains(&"helper"), "got: {names_after:?}");
@@ -1011,10 +1011,10 @@ fn readable_dump_prints_execution_order_top_to_bottom() {
     );
     let block = fn_block_readable(&out, "combine");
     // `scale` is a plain user-defined top-level fn (prints bare); `sub`
-    // resolves to the stdlib's `Ring::sub<f64>` specialization (prints with
+    // resolves to the stdlib's `Additive::sub<f64>` specialization (prints with
     // its own generic suffix) -- neither is a literal `"sub("` substring.
     let scale_pos = block.find("scale(").expect(block);
-    let sub_pos = block.find("Ring::sub<f64>(").expect(block);
+    let sub_pos = block.find("Additive::sub<f64>(").expect(block);
     assert!(
         scale_pos < sub_pos,
         "execution order (scale before sub) must match printed order, got:\n{block}"

@@ -259,7 +259,73 @@ pub fn check_type_errors(program: &Program, registry: &Registry) -> Result<(), V
     diags.extend(errs.iter().map(Diagnostic::from));
     diags.extend(check_mutability_errors(program));
     diags.extend(check_const_decl_errors(program, registry));
+    diags.extend(check_impl_completeness(program, registry));
     if diags.is_empty() { Ok(()) } else { Err(diags) }
+}
+
+/// Every impl defines every function its algebra declares. A missing one
+/// went unnoticed until something called it, possibly from a rule the
+/// compiler applies itself: `Sum<Tensor<T, N>, T>` had no `broadcast`, which
+/// `sum`'s adjoint calls, and differentiating a rank-1 `sum` panicked in the
+/// e-graph ("extracted `Op` node `Sum::broadcast<..>` is in none of this
+/// module's own lookup tables").
+/// The targets of every impl of `algebra`, as written (`Tensor<T, Dims...>`).
+fn impls_for(program: &Program, algebra: &str) -> Vec<String> {
+    program
+        .items
+        .iter()
+        .filter_map(|item| match &item.kind {
+            crate::ast::ItemKind::Impl(d) if d.algebra == algebra => Some(crate::print::fmt_type(&d.target)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn check_impl_completeness(program: &Program, registry: &Registry) -> Vec<Diagnostic> {
+    program
+        .items
+        .iter()
+        .filter_map(|item| match &item.kind {
+            crate::ast::ItemKind::Impl(d) => {
+                let target = crate::print::fmt_type(&d.target);
+                let missing: Vec<&str> = registry
+                    .fn_names(&d.algebra)
+                    .into_iter()
+                    .filter(|name| !d.fns.iter().any(|f| f.name == *name))
+                    .collect();
+                if !missing.is_empty() {
+                    return Some(Diagnostic::error(
+                        format!(
+                            "`impl {}<{target}>` doesn't define {}",
+                            d.algebra,
+                            missing.iter().map(|m| format!("`{m}`")).collect::<Vec<_>>().join(", ")
+                        ),
+                        item.span,
+                    ));
+                }
+                // A super-algebra with functions of its own (`algebra Ring<T>
+                // : Additive`) needs its own impl: a bound alone would let
+                // `Additive<T>` hold with no `add` anywhere. A marker one
+                // (`Int<T> : Num`, no functions) is implied, as before.
+                let unmet: Vec<&String> = registry
+                    .algebra_bounds(&d.algebra)
+                    .iter()
+                    .filter(|b| !registry.fn_names(b).is_empty() && !impls_for(program, b).contains(&target))
+                    .collect();
+                (!unmet.is_empty()).then(|| {
+                    Diagnostic::error(
+                        format!(
+                            "`impl {}<{target}>` needs {}",
+                            d.algebra,
+                            unmet.iter().map(|b| format!("`impl {b}<{target}>`")).collect::<Vec<_>>().join(", ")
+                        ),
+                        item.span,
+                    )
+                })
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Every top-level `const NAME: T = expr;`'s own initializer must actually
@@ -366,7 +432,9 @@ pub fn emit_from_program(
     bindings_path: Option<&Path>,
     options: &CodegenOptions,
 ) -> Result<bool, Vec<String>> {
+    let start = std::time::Instant::now();
     check_type_errors(program, registry).map_err(|errs| render_all(&errs, sources))?;
+    report_stage("type checking (with a monomorphization)", start);
     let cps_program = build_optimized_cps(program, registry, Some(sources))?;
     let needs_openmp = options.openmp || (options.tasks && crate::cps::uses_spawn(&cps_program));
 
@@ -397,8 +465,13 @@ fn build_optimized_cps(
     registry: &Registry,
     sources: Option<&SourceMap>,
 ) -> Result<CpsProgram, Vec<String>> {
+    let start = std::time::Instant::now();
     let cps_program = build_cps_program(program, registry, sources)?;
+    report_stage("CPS conversion (units, derivatives)", start);
+    let start = std::time::Instant::now();
     let (cps_program, _) = optimize_program(cps_program, registry, false);
+    report_stage("e-graph optimization", start);
+    let start = std::time::Instant::now();
     let cps_program = eliminate_dead_code(cps_program);
     // Last CPS-to-CPS step, strictly after the e-graph pass -- see
     // `refcount`'s own module doc comment for why (it has no notion of
@@ -411,12 +484,9 @@ fn build_optimized_cps(
     // Must run after e-graph optimisation — the optimised CPS is what
     // `insert_refcounting` and `lower_program` both operate on.
     let escaping = escaping_struct_vars(&cps_program);
-    Ok(insert_refcounting(
-        cps_program,
-        &struct_schemas,
-        &mlir_types,
-        &escaping,
-    ))
+    let refcounted = insert_refcounting(cps_program, &struct_schemas, &mlir_types, &escaping);
+    report_stage("dead code, refcounting", start);
+    Ok(refcounted)
 }
 
 /// Parses/merges/resolves `sources_in` from scratch (`driver::compile`'s
@@ -440,8 +510,10 @@ pub fn compile_and_emit(
     options: &CodegenOptions,
     defines: &[(String, String)],
 ) -> Result<bool, Vec<String>> {
+    let start = std::time::Instant::now();
     let (result, sources) = crate::driver::compile(sources_in, project_dirs);
     let mut program = result.map_err(|errs| render_all(&errs, &sources))?;
+    report_stage("parsing, name resolution", start);
     Registry::apply_defines(&mut program, defines);
     let (registry, define_errors) = Registry::build_with_defines(&program, defines, options.openmp);
     if !define_errors.is_empty() {
@@ -961,8 +1033,10 @@ pub fn register_passes() {
     });
 }
 
-/// `CLEAVE_TIME_STAGES=1`: how long each pass pipeline of `lower_to_llvm`
-/// takes (named by its line here) and the rest of `emit_object`, on stderr.
+/// `CLEAVE_TIME_STAGES=1`: how long each stage of a compile takes, on stderr:
+/// the front end's (parsing, type checking, CPS, e-graph, refcounting), each
+/// pass pipeline of `lower_to_llvm` (named by its line here) and the rest of
+/// `emit_object`.
 /// What a compile spends its time on, for `doc/backlog.md`'s compile-time
 /// entry.
 fn time_stages() -> bool {

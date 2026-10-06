@@ -6907,12 +6907,16 @@ fn an_algebra_impl_generic_over_a_pack_computes_through_a_tagged_native_tensor_c
         #[mlir_type(tensor)]
         impl<T: Float, const Dims...: i32> NativeShape<Box3<T, Dims...>> {}
 
-        impl<T: Float, const Dims...: i32> Ring<Box3<T, Dims...>> {
+        impl<T: Float, const Dims...: i32> Additive<Box3<T, Dims...>> {
             fn add(a: Box3<T, Dims...>, b: Box3<T, Dims...>) -> Box3<T, Dims...> { mlir::arith::addf(a, b) }
             fn sub(a: Box3<T, Dims...>, b: Box3<T, Dims...>) -> Box3<T, Dims...> { mlir::arith::subf(a, b) }
+            fn neg(a: Box3<T, Dims...>) -> Box3<T, Dims...> { mlir::arith::negf(a) }
+            fn zero() -> Box3<T, Dims...> { let z: T = zero(); mlir::tensor::splat(z) }
+        }
+        impl<T: Float, const Dims...: i32> Ring<Box3<T, Dims...>> {
             fn mul(a: Box3<T, Dims...>, b: Box3<T, Dims...>) -> Box3<T, Dims...> { mlir::arith::mulf(a, b) }
             fn div(a: Box3<T, Dims...>, b: Box3<T, Dims...>) -> Box3<T, Dims...> { mlir::arith::divf(a, b) }
-            fn neg(a: Box3<T, Dims...>) -> Box3<T, Dims...> { mlir::arith::negf(a) }
+            fn one() -> Box3<T, Dims...> { let o: T = one(); mlir::tensor::splat(o) }
         }
 
         fn main() -> i32 {
@@ -8140,9 +8144,9 @@ fn transpose_add_distributes_axiom_fires_and_computes_the_right_value() {
         }
     ";
     let text = optimized_lowered_llvm_text_for_tensors(&context, src);
-    assert!(text.contains("Ring::add<Tensor<f32, 2, 3>>"), "{text}");
+    assert!(text.contains("Additive::add<Tensor<f32, 2, 3>>"), "{text}");
     assert!(text.contains("Transpose::transpose<Tensor<f32, 2, 3>, Tensor<f32, 3, 2>>"), "{text}");
-    assert!(!text.contains("Ring::add<Tensor<f32, 3, 2>>"), "{text}");
+    assert!(!text.contains("Additive::add<Tensor<f32, 3, 2>>"), "{text}");
     assert_eq!(run_i32(&context, src), 1);
 }
 
@@ -8164,9 +8168,9 @@ fn transpose_sub_distributes_axiom_fires_and_computes_the_right_value() {
         }
     ";
     let text = optimized_lowered_llvm_text_for_tensors(&context, src);
-    assert!(text.contains("Ring::sub<Tensor<f32, 2, 3>>"), "{text}");
+    assert!(text.contains("Additive::sub<Tensor<f32, 2, 3>>"), "{text}");
     assert!(text.contains("Transpose::transpose<Tensor<f32, 2, 3>, Tensor<f32, 3, 2>>"), "{text}");
-    assert!(!text.contains("Ring::sub<Tensor<f32, 3, 2>>"), "{text}");
+    assert!(!text.contains("Additive::sub<Tensor<f32, 3, 2>>"), "{text}");
     assert_eq!(run_i32(&context, src), 1);
 }
 
@@ -8271,5 +8275,113 @@ fn fma_transpose_b_rewrite_fires_and_computes_the_right_value() {
     assert!(text.contains("FmaTransposeB::fma_transpose_b<Tensor<f32, 2, 3>, Tensor<f32, 4, 3>, Tensor<f32, 2, 4>>"), "{text}");
     assert!(!text.contains("Transpose::transpose<Tensor<f32, 4, 3>"), "{text}");
     assert!(!text.contains("Ring::add<Tensor<f32, 2, 4>>"), "{text}");
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// A generic function forwarding its own const generic to another by
+/// turbofish (`probe::<M>()`): the instantiation walk took `M` for a type
+/// named `M` and built a `probe<M>` whose `N` nothing binds, a CPS panic
+/// (`doc/backlog.md`, "A const generic forwarded from an *enclosing*
+/// generic function's own turbofish crashes CPS conversion").
+#[test]
+fn a_const_generic_forwarded_by_turbofish_reaches_the_callee() {
+    let context = context();
+    let got = run_i32(
+        &context,
+        "
+        fn probe<const N: i32>() -> i32 { N }
+        fn foo<const M: i32>() -> i32 { probe::<M>() + probe::<3>() }
+        fn main() -> i32 { foo::<10>() + foo::<20>() }
+        ",
+    );
+    assert_eq!(got, 36);
+}
+
+/// `Nil()`, a zero-field struct built with an empty call, constructs it
+/// (inference already had the case; CPS once took it for a call).
+#[test]
+fn a_zero_field_struct_is_built_with_an_empty_call() {
+    let context = context();
+    let got = run_i32(
+        &context,
+        "
+        struct Nil {}
+        fn mk() -> Nil { Nil() }
+        fn main() -> i32 { let n = mk(); 7 }
+        ",
+    );
+    assert_eq!(got, 7);
+}
+
+/// A `for` loop bounded by a const generic, its variable used in
+/// arithmetic (`base + b`), and two nested ones bounded by two different
+/// const generics indexing a rectangular tensor (`c[i, j]`, `N != M`): the
+/// loop variables were once unified with the const generics themselves
+/// (`doc/backlog.md`, "A `for` loop bound to a const generic breaks if its
+/// own loop variable is used in ordinary arithmetic"), worked around in
+/// `stdlib/nn` with manual counters, since removed.
+#[test]
+fn loops_bounded_by_const_generics_use_their_variables_freely() {
+    let context = context();
+    let got = run_i32(
+        &context,
+        "
+        use nn;
+        fn sum_offsets<const B: i32>(base: i32) -> i32 {
+            let mut acc = 0;
+            for b in 0..B { acc = acc + (base + b); };
+            acc
+        }
+        algebra Total<C> { fn total(c: C) -> i32; }
+        impl<const N: i32, const M: i32> Total<[i32; N, M]> {
+            fn total(c) {
+                let mut acc = 0;
+                for i in 0..N { for j in 0..M { acc = acc + c[i, j] * (j + 1); }; };
+                acc
+            }
+        }
+        fn main() -> i32 {
+            let t: [i32; 2, 3] = [[1, 2, 3], [4, 5, 6]];
+            let u: [i32; 3, 2] = [[1, 2], [3, 4], [5, 6]];
+            sum_offsets::<3>(10) * 10000 + total(t) * 100 + total(u)
+        }
+        ",
+    );
+    // 33; 1+4+9+4+10+18 = 46; 1+4+3+8+5+12 = 33.
+    assert_eq!(got, 33 * 10000 + 46 * 100 + 33);
+}
+
+/// `Display<[T; N]>` and a rectangular `Display<Tensor<T, R, C>>`, written
+/// with the separator under `if i > 0` inside `0..N`: once avoided (the
+/// first element printed before a `1..N` loop) because a loop variable
+/// bounded by a const generic couldn't be compared, a bug since gone.
+#[test]
+fn display_of_an_array_and_a_rectangular_tensor_render_correctly() {
+    let context = context();
+    let src = r#"
+        use display;
+        use linalg;
+        fn same(out: DynArray<i8>, expected: [i8; 18]) -> i32 {
+            let mut ok: i32 = 1;
+            for i in 0..18 { if out.get(i) != expected[i] { ok = 0; }; };
+            ok
+        }
+        fn main() -> i32 {
+            let a: [i32; 3] = [7, 8, 9];
+            let mut out: DynArray<i8> = dynarray_new(16);
+            out = Display::display(a, out);
+            // "[7, 8, 9]"
+            let mut ok: i32 = 1;
+            let expected: [i8; 9] = [91, 55, 44, 32, 56, 44, 32, 57, 93];
+            if out.len() != 9 { ok = 0; };
+            for i in 0..9 { if out.get(i) != expected[i] { ok = 0; }; };
+            let t: Tensor<f32, 2, 3> = Tensor::<f32, 2, 3>(data: [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+            let mut out2: DynArray<i8> = dynarray_new(32);
+            out2 = Display::display(t, out2);
+            // "[[1, 2, 3], [4, 5, 6]]" is 22 bytes; compare the first 18.
+            let expected2: [i8; 18] = [91, 91, 49, 44, 32, 50, 44, 32, 51, 93, 44, 32, 91, 52, 44, 32, 53, 44];
+            if out2.len() != 22 { ok = 0; };
+            ok * same(out2, expected2)
+        }"#;
     assert_eq!(run_i32(&context, src), 1);
 }

@@ -1355,6 +1355,7 @@ fn collect_instantiations_expr(
                 if !scheme.vars.is_empty() {
                     if let Some(concrete_tys) =
                         derive_instantiation(scheme, expr, generics, args, node_types, registry)
+                        && concrete_tys.iter().all(is_fully_concrete)
                     {
                         call_names.insert(expr.id, display_instantiation(&name, &concrete_tys));
                         fn_worklist.push((name, concrete_tys));
@@ -1666,7 +1667,18 @@ fn concrete_ty_from_ast(ty: &Type, registry: &Registry) -> Option<Ty> {
                 if let Some(v) = registry.global_const_value(&name) {
                     return Some(Ty::Const(v));
                 }
-                return Some(Ty::Con(name));
+                // Nor is every other bare name a type: in `fn foo<const M:
+                // i32>() { probe::<M>() }`, `M` is the enclosing function's
+                // generic, which this walk has no binding for (the
+                // specialization's own inference resolves it, and names the
+                // call). Taken for a type `M`, it made a `probe<M>` whose
+                // `N` nothing binds, a CPS panic.
+                let is_type = registry.has_struct(&name)
+                    || matches!(
+                        name.as_str(),
+                        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "f32" | "f64" | "bool"
+                    );
+                return is_type.then_some(Ty::Con(name));
             }
             let type_args: Vec<Ty> = args
                 .iter()
@@ -2724,12 +2736,12 @@ fn seed_ring_zero(
     registry: &Registry,
     impl_worklist: &mut Vec<(usize, HashMap<TyVar, Ty>)>,
 ) {
-    if algebra != "Ring" {
+    if algebra != "Additive" {
         return;
     }
     let target_tys: Vec<Option<Ty>> = target_tys.iter().cloned().map(Some).collect();
     if let Some((idx, mapping)) =
-        find_impl_for_target(templates, registry, "Ring", "zero", &target_tys)
+        find_impl_for_target(templates, registry, "Additive", "zero", &target_tys)
     {
         impl_worklist.push((idx, mapping));
     }

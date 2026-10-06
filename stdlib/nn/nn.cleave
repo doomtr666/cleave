@@ -158,12 +158,32 @@ impl Activation<f32> {
     fn relu(x) { mlir::arith::maximumf(x, 0.0) }
     fn sigmoid(x) { 1.0 / (1.0 + exp(-x)) }
     fn tanh(x) { Transcendental::tanh(x) }
+    fn gelu(x) { 0.5 * x * (1.0 + Transcendental::tanh(0.7978845608 * (x + 0.044715 * x * x * x))) }
+    fn gelu_grad(x) {
+        let t = Transcendental::tanh(0.7978845608 * (x + 0.044715 * x * x * x));
+        0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * 0.7978845608 * (1.0 + 0.134145 * x * x)
+    }
+    fn silu(x) { x / (1.0 + exp(-x)) }
+    fn silu_grad(x) {
+        let s = 1.0 / (1.0 + exp(-x));
+        s * (1.0 + x * (1.0 - s))
+    }
 }
 
 impl Activation<f64> {
     fn relu(x) { mlir::arith::maximumf(x, 0.0) }
     fn sigmoid(x) { 1.0 / (1.0 + exp(-x)) }
     fn tanh(x) { Transcendental::tanh(x) }
+    fn gelu(x) { 0.5 * x * (1.0 + Transcendental::tanh(0.7978845608 * (x + 0.044715 * x * x * x))) }
+    fn gelu_grad(x) {
+        let t = Transcendental::tanh(0.7978845608 * (x + 0.044715 * x * x * x));
+        0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * 0.7978845608 * (1.0 + 0.134145 * x * x)
+    }
+    fn silu(x) { x / (1.0 + exp(-x)) }
+    fn silu_grad(x) {
+        let s = 1.0 / (1.0 + exp(-x));
+        s * (1.0 + x * (1.0 - s))
+    }
 }
 
 // The `Tensor<T,Dims...>` counterpart — pack-generic over *any* rank (was
@@ -338,10 +358,7 @@ algebra Init<T> {
 // layer. `cleave`'s own `for`/`while` loops already lower to a genuine `scf.
 // while` (confirmed directly, `mlir_lower.rs::lower_loop`) -- independent of
 // `In`*`Out`, this pays for exactly *one* `Rand::uniform`/`Rand::normal` call
-// site in the generated MLIR, the loop itself never unrolled. `j` a real,
-// manually-incremented local, not `for j in 0..Out` directly -- the same
-// two-different-loop-variables-in-one-impl-body compiler bug `Sum<Tensor<T,
-// N,M>,T>::sum`'s own doc comment above documents, sidestepped identically.
+// site in the generated MLIR, the loop itself never unrolled.
 // `rand.cleave`'s own module doc comment anticipated exactly this shape
 // ("needs a genuine loop with indexed writes... left to `Dense`'s own future
 // init helpers to use, not built here") -- built here now.
@@ -384,11 +401,6 @@ algebra Init<T> {
 // small loop-populated `Tensor` prints the expected, genuinely independent
 // per-position draws), and the real training-loop tests below stay green.
 //
-// `In`/`Out` (bare const generics) can't be handed to `.to()` directly --
-// the same `Ty::Const`-vs-`Ty::Con` gap `Mean::mean`'s own doc comment above
-// already documents and works around, identically here: `mlir::arith::addi
-// (In, 0)` forces each into a real, computed `i32` value first.
-//
 // **On `Tensor<T,In,Out>` itself, not `Dense`** -- raised directly: the
 // actual random-fill logic below has nothing `Dense`-specific about it at
 // all (it never reads `layer.w`/`layer.b`, just produces a raw `Tensor`),
@@ -405,18 +417,12 @@ impl<T: Float + Rand + Ring, const In: i32, const Out: i32> Init<Tensor<T, In, O
     // choice for a `sigmoid`/`tanh`-activated layer (`examples/xor_tensor.
     // cleave`'s own).
     fn xavier() {
-        let fan_in_i: i32 = mlir::arith::addi(In, 0);
-        let fan_out_i: i32 = mlir::arith::addi(Out, 0);
-        let fan_in: T = fan_in_i.to();
-        let fan_out: T = fan_out_i.to();
+        let fan_in: T = In.to();
+        let fan_out: T = Out.to();
         let limit: T = mlir::math::sqrt(6.0 / (fan_in + fan_out));
         let mut buf: [T; In, Out] = mlir::memref::alloc();
         for i in 0..In {
-            let mut j: i32 = 0;
-            for _k in 0..Out {
-                buf[i, j] = uniform(-limit, limit);
-                j = j + 1;
-            };
+            for j in 0..Out { buf[i, j] = uniform(-limit, limit); };
         };
         mlir::bufferization::to_tensor(buf, restrict: "unit")
     }
@@ -428,16 +434,11 @@ impl<T: Float + Rand + Ring, const In: i32, const Out: i32> Init<Tensor<T, In, O
     // and tested independently -- a network with a `relu` hidden layer needs
     // exactly this.
     fn he() {
-        let fan_in_i: i32 = mlir::arith::addi(In, 0);
-        let fan_in: T = fan_in_i.to();
+        let fan_in: T = In.to();
         let std: T = mlir::math::sqrt(2.0 / fan_in);
         let mut buf: [T; In, Out] = mlir::memref::alloc();
         for i in 0..In {
-            let mut j: i32 = 0;
-            for _k in 0..Out {
-                buf[i, j] = normal(0.0, std);
-                j = j + 1;
-            };
+            for j in 0..Out { buf[i, j] = normal(0.0, std); };
         };
         mlir::bufferization::to_tensor(buf, restrict: "unit")
     }
@@ -1025,10 +1026,11 @@ algebra Max<Container, T> {
 
 impl<T: Float, const N: i32> Sum<Tensor<T, N>, T> {
     fn sum(v) {
-        let mut acc = v[0];
-        for i in 1..N { acc = acc + v[i]; };
+        let mut acc: T = Ring::zero();
+        for i in 0..N { acc = acc + v[i]; };
         acc
     }
+    fn broadcast(u) { Tensor::<T, N>(data: [u; N]) }
 }
 
 // Rank-2-specific, like `MatMul`/`Transpose` (`stdlib/linalg/matrix.cleave`'s
@@ -1046,33 +1048,10 @@ impl<T: Float, const N: i32> Sum<Tensor<T, N>, T> {
 // declared `derivative`/`adjoint` rule — `sum`'s own forward implementation
 // detail is invisible to reverse-mode differentiation regardless of shape.
 impl<T: Float, const N: i32, const M: i32> Sum<Tensor<T,N,M>, T> {
-    // `j` is a real, manually-incremented local, *not* `for j in 0..M`'s own
-    // loop variable directly used in `c[i,j]` -- a real, found-by-testing
-    // compiler bug, not a style choice: combining *two* different nested
-    // `for`-loop variables (each bound by a *different* const generic of
-    // the same generic impl, `0..N` and `0..M`) into one array literal/
-    // index expression makes `N`'s own const-generic value-var and `M`'s
-    // own get silently unified together during this impl's own body type-
-    // check, regardless of `Tensor`/`Index` being involved at all —
-    // confirmed with a minimal, generics-only repro, and confirmed *not*
-    // to reproduce with an ordinary, non-generic function's own identical
-    // nested loop. `Ring::add<f32>` accumulation for `M != N` then silently
-    // computes the *wrong* result (or fails to type-check at all — `1` is
-    // the specific instantiation `check_no_overlapping_impls` happens to
-    // produce for the failing case, not `M`), invisible for a *square*
-    // `N == M` case, exactly why this went unnoticed until a genuinely
-    // rectangular `Tensor` (`Dense<T,64,32>`, `doc/backlog.md`'s own
-    // "digits-interop" item) was tried. A manual counter sidesteps it
-    // entirely -- not itself a `for`-loop-bound variable, so the same
-    // conflation never triggers. `doc/backlog.md` tracks the real fix.
     fn sum(c) {
         let mut acc: T = Ring::zero();
         for i in 0..N {
-            let mut j: i32 = 0;
-            for _k in 0..M {
-                acc = acc + c[i,j];
-                j = j + 1;
-            };
+            for j in 0..M { acc = acc + c[i, j]; };
         };
         acc
     }
@@ -1249,24 +1228,9 @@ fn clip_grad_norm<M: GradNorm>(g: M, max_norm: f32) -> M {
 }
 
 impl<T: Float, const N: i32> Mean<Tensor<T, N>, T> {
-    // `N.to()` (`stdlib/convert/convert.cleave`'s own `Convert<i32,T>`
-    // sugar) — used to be a `mlir::arith::sitofp` workaround instead: an
-    // output-only-generic premature-commit bug meant `N.to()` here would
-    // permanently bind *this* impl's own `T` the moment `From` (`i32`)
-    // looked ready, during mere declaration-checking, well before any real
-    // instantiation ever ran — `doc/backlog.md`'s own "Convert/output-only-
-    // generic premature-commit bug" item, fixed for real now (`infer.rs`'s
-    // `infer_algebra_call` defers instead of committing whenever a still-
-    // open generic fn/impl's own declaration is what's being checked).
-    // `N` still can't be handed to `.to()` bare, though — a bare const
-    // generic used as an ordinary value hits a separate, still-open
-    // `Ty::Const`-vs-`Ty::Con` gap (`doc/backlog.md`), unrelated to the bug
-    // above — `mlir::arith::addi(N, 0)` forces it into a genuine computed
-    // `i32` value first, the same pattern this rough edge already needs
-    // elsewhere.
     fn mean(v) {
-        let n_i: i32 = mlir::arith::addi(N, 0);
-        sum(v) / n_i.to()
+        let n: T = N.to();
+        sum(v) / n
     }
 }
 

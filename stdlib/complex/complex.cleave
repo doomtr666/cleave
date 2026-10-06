@@ -21,9 +21,14 @@ impl Complex<Complex<f32>> {}
 impl Complex<Complex<f64>> {}
 
 // `examples/complex.cleave`'s own bodies, verbatim.
-impl<T: Float> Ring<Complex<T>> {
+impl<T: Float> Additive<Complex<T>> {
     fn add(x, y) { Complex(real: x.real + y.real, imag: x.imag + y.imag) }
     fn sub(x, y) { Complex(real: x.real - y.real, imag: x.imag - y.imag) }
+    fn neg(x) { Complex(real: -x.real, imag: -x.imag) }
+    fn zero() { Complex(real: Ring::zero(), imag: Ring::zero()) }
+}
+
+impl<T: Float> Ring<Complex<T>> {
     fn mul(x, y) {
         Complex (
             real: x.real * y.real - x.imag * y.imag,
@@ -37,7 +42,7 @@ impl<T: Float> Ring<Complex<T>> {
             imag: (x.imag * y.real - x.real * y.imag) / denom
         )
     }
-    fn neg(x) { Complex(real: -x.real, imag: -x.imag) }
+    fn one() { Complex(real: Ring::one(), imag: Ring::zero()) }
 }
 
 // `magnitude_sq`/`magnitude` — ordinary top-level generic `fn`s, called

@@ -100,30 +100,11 @@ impl Display<f64> {
 // display is not attempted here (would collide with the existing string
 // impl's own target the moment `Display<i8>` existed too, which it
 // doesn't, deliberately, above).
-// The first element is printed *before* the loop, which then only ever
-// runs `1..N` -- deliberately, not `0..N` with an `if i > 0` guard around
-// the separator. Found by direct testing, a real, separate, deeper
-// compiler bug, logged in `doc/backlog.md`, not fixed here: a `for` loop's
-// own index variable, when the range's *upper bound* is itself a generic
-// const parameter (`R`/`N`/... here, not a literal or a concrete-at-this-
-// point value), is sometimes typed as that const's own *resolved value*
-// instead of `i32` the moment it's used in an arithmetic or comparison
-// expression directly (`i > 0`, `acc + i`) -- confirmed via a minimal,
-// Display-independent repro (`for i in 0..R { if i > 0 {...} }` inside a
-// plain generic top-level `fn`, nothing to do with this file). Using the
-// index *only* to index an array (`x[i]`), never in arithmetic/comparison,
-// is unaffected -- already proven safe throughout this codebase (`Dense`'s
-// own init loops, `examples/convex_hull.cleave`) -- so restructuring to
-// avoid the one unsafe use entirely sidesteps it cleanly, arguably a more
-// idiomatic join-style rendering anyway (empty-array-N=0 not handled,
-// an accepted, narrow edge case no real caller hits).
 impl<T: Display, const N: i32> Display<[T; N]> {
     fn display(x, mut out) {
         out.push('[');
-        out = Display::display(x[0], out);
-        for i in 1..N {
-            out.push(',');
-            out.push(' ');
+        for i in 0..N {
+            if i > 0 { out.push(','); out.push(' '); };
             out = Display::display(x[i], out);
         };
         out.push(']');
@@ -136,8 +117,7 @@ impl<T: Display, const N: i32> Display<[T; N]> {
 // never generalized past a concrete rank either: a per-element walk needs
 // a compile-time-known index *count*. Rank 2 specifically because `Dense.
 // w`/`Dense.b` are rank 2 -- `print(net.l1.w)`, this item's own real
-// motivating case. Same "first element before the loop, then `1..N`"
-// restructuring as `Display<[T;N]>` above, same reason.
+// motivating case.
 //
 // This used to be silently broken -- `Display::display(x[i], out)`'s own
 // recursive dispatch always resolved to `Display::display<i32>` regardless
@@ -160,10 +140,8 @@ impl<T: Display, const N: i32> Display<[T; N]> {
 impl<T: Display, const N: i32> Display<Tensor<T, N>> {
     fn display(x, mut out) {
         out.push('[');
-        out = Display::display(x[0], out);
-        for i in 1..N {
-            out.push(',');
-            out.push(' ');
+        for i in 0..N {
+            if i > 0 { out.push(','); out.push(' '); };
             out = Display::display(x[i], out);
         };
         out.push(']');
@@ -173,22 +151,11 @@ impl<T: Display, const N: i32> Display<Tensor<T, N>> {
 impl<T: Display, const R: i32, const C: i32> Display<Tensor<T, R, C>> {
     fn display(x, mut out) {
         out.push('[');
-        out.push('[');
-        out = Display::display(x[0, 0], out);
-        for j in 1..C {
-            out.push(',');
-            out.push(' ');
-            out = Display::display(x[0, j], out);
-        };
-        out.push(']');
-        for i in 1..R {
-            out.push(',');
-            out.push(' ');
+        for i in 0..R {
+            if i > 0 { out.push(','); out.push(' '); };
             out.push('[');
-            out = Display::display(x[i, 0], out);
-            for j in 1..C {
-                out.push(',');
-                out.push(' ');
+            for j in 0..C {
+                if j > 0 { out.push(','); out.push(' '); };
                 out = Display::display(x[i, j], out);
             };
             out.push(']');

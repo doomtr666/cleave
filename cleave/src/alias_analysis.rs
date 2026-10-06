@@ -994,6 +994,9 @@ pub fn affine_struct_vars(
             &mut affine,
         );
     }
+    for v in constructions_returned_to_aliasing_callers(&non_region_local, summary) {
+        affine.remove(&v);
+    }
 
     // `doc/plan-affine-ownership.md` §11's first confirmed corruption, the
     // narrower half: a real call's own *resumption* parameter (`Fix{defs:
@@ -1359,6 +1362,114 @@ fn collect_affine_carried_params(
         }
     }
     changed
+}
+
+/// The struct constructions that may become the result of a function some
+/// caller aliases. Whether a construction is affine (headerless, one
+/// owner) is decided where it is built, from its uses there
+/// ([`value_is_ever_aliased`]); a returned one is then affine under the
+/// caller's name too (`collect_affine_resumption_params`), but nothing
+/// checked what the caller does with it. `Print<Complex<T>>` hands the
+/// `DynArray` `dynarray_new` built to `Display::display`, which returns it
+/// (so the parameter is aliased, `analyze`): two names, two releases of one
+/// headerless block (`examples/complex.cleave` under `CLEAVE_DEBUG_POOL`).
+///
+/// A function's result is aliased when a call's resumption parameter is
+/// ([`value_is_ever_aliased`] on the resumption's body), or when it is
+/// returned as is by a function whose result is aliased. From each such
+/// function's returns, the trace goes back through local jumps (a join's
+/// or a loop's parameter to every argument passed there) to the
+/// constructions, and through a call's resumption parameter to that
+/// callee's own result.
+fn constructions_returned_to_aliasing_callers(
+    funcs: &[&crate::cps::CTopLevelFn],
+    summary: &AliasSummary,
+) -> HashSet<CVar> {
+    // Per function: what each local def's parameters receive, which callee
+    // each resumption parameter's value comes from, and the constructions.
+    struct Facts {
+        incoming: HashMap<CVar, Vec<CVar>>,
+        resumed_from: HashMap<CVar, String>,
+        constructed: HashSet<CVar>,
+    }
+    fn walk(e: &CExpr, defs: &HashMap<&str, &CFunDef>, facts: &mut Facts, aliased_callees: &mut HashSet<String>, summary: &AliasSummary) {
+        match e {
+            CExpr::LetPrim { var, op, cont, .. } => {
+                if matches!(op, PrimOp::Struct(..)) {
+                    facts.constructed.insert(*var);
+                }
+                walk(cont, defs, facts, aliased_callees, summary);
+            }
+            CExpr::App { func: CVal::Label(name), args } => {
+                if let Some(d) = defs.get(name.as_str()) {
+                    for (p, a) in d.params.iter().zip(args) {
+                        if let CVal::Var(v) = a {
+                            facts.incoming.entry(*p).or_default().push(*v);
+                        }
+                    }
+                }
+            }
+            CExpr::App { .. } => {}
+            CExpr::If { then_branch, else_branch, .. } => {
+                walk(then_branch, defs, facts, aliased_callees, summary);
+                walk(else_branch, defs, facts, aliased_callees, summary);
+            }
+            CExpr::Fix { defs: local, body } => {
+                if let ([d], CExpr::App { func: CVal::Label(callee), .. }) = (local.as_slice(), body.as_ref())
+                    && !defs.contains_key(callee.as_str())
+                    && let [p] = d.params.as_slice()
+                {
+                    facts.resumed_from.insert(*p, callee.clone());
+                    if value_is_ever_aliased(*p, &d.body, summary) {
+                        aliased_callees.insert(callee.clone());
+                    }
+                }
+                for d in local {
+                    walk(&d.body, defs, facts, aliased_callees, summary);
+                }
+                walk(body, defs, facts, aliased_callees, summary);
+            }
+        }
+    }
+    let mut facts: HashMap<&str, Facts> = HashMap::new();
+    let mut returns: HashMap<&str, Vec<CVar>> = HashMap::new();
+    let mut aliased: HashSet<String> = HashSet::new();
+    for f in funcs {
+        let mut defs = HashMap::new();
+        collect_local_defs_by_name(&f.def.body, &mut defs);
+        let mut fx = Facts { incoming: HashMap::new(), resumed_from: HashMap::new(), constructed: HashSet::new() };
+        walk(&f.def.body, &defs, &mut fx, &mut aliased, summary);
+        let mut out = Vec::new();
+        collect_return_vars(f.k_ret, &f.def.body, &mut out);
+        returns.insert(f.def.name.as_str(), out);
+        facts.insert(f.def.name.as_str(), fx);
+    }
+    let mut excluded = HashSet::new();
+    let mut work: Vec<String> = aliased.iter().cloned().collect();
+    while let Some(name) = work.pop() {
+        let (Some(fx), Some(rets)) = (facts.get(name.as_str()), returns.get(name.as_str())) else {
+            continue;
+        };
+        let mut seen: HashSet<CVar> = HashSet::new();
+        let mut stack = rets.clone();
+        while let Some(v) = stack.pop() {
+            if !seen.insert(v) {
+                continue;
+            }
+            if fx.constructed.contains(&v) {
+                excluded.insert(v);
+            }
+            if let Some(callee) = fx.resumed_from.get(&v)
+                && aliased.insert(callee.clone())
+            {
+                work.push(callee.clone());
+            }
+            if let Some(sources) = fx.incoming.get(&v) {
+                stack.extend(sources.iter().copied());
+            }
+        }
+    }
+    excluded
 }
 
 /// Every `CVar` a tail return (`App{Var(k_ret), [v]}`, at any nesting

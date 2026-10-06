@@ -45,9 +45,14 @@ fn run_example(name: &str) -> RunResult {
     let path = manifest_dir.join("..").join("examples").join(format!("{name}.cleave"));
     assert!(path.exists(), "no such example: {}", path.display());
 
+    // The pool's own checks (`cleave-rt`'s `CLEAVE_DEBUG_POOL`) report a
+    // double or mismatched release on `stderr`, which `assert_clean` then
+    // rejects: `complex.cleave` freed one headerless block twice, silently,
+    // until run with them.
     let output = Command::new(env!("CARGO_BIN_EXE_cleave"))
         .arg(&path)
         .arg("--run")
+        .env("CLEAVE_DEBUG_POOL", "1")
         .output()
         .unwrap_or_else(|e| panic!("failed to spawn the cleave binary: {e}"));
 

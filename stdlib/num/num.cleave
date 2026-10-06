@@ -60,13 +60,17 @@ algebra Float<T> : Num {}
 // content is a direct MLIR op call, the *entire* hardcoded-in-Rust surface
 // for primitive operations shrinking to one generic op-builder
 // (`mlir_lower.rs::lower_raw_mlir_op`) rather than a Rust match per op name.
-algebra Ring<T> {
+// An additive group: `+`, `-`, negation and zero, the part of `Ring` that
+// doesn't need a product. A vector is one (with `Scale` for a scalar
+// product, `stdlib/linalg/tensor.cleave`) but not a ring: multiplying or
+// dividing two vectors means nothing, and an impl defines every function of
+// its algebra (`pipeline.rs::check_impl_completeness`), so `+`/`-` on a
+// vector come from here, not from a partial `Ring`.
+algebra Additive<T> {
     fn add(a: T, b: T) -> T;
     fn sub(a: T, b: T) -> T;
-    fn mul(a: T, b: T) -> T;
-    fn div(a: T, b: T) -> T;
     fn neg(a: T) -> T;
-    // The additive identity — "zero", genuinely a `Ring<T>`-owned concept
+    // The additive identity — "zero", genuinely an `Additive<T>`-owned concept
     // (it only means anything relative to `add`), not a separate algebra:
     // raised directly by the project owner while looking at `egraph.rs::
     // build_zero` (`derivative-independent-zero`'s own zero-construction),
@@ -78,28 +82,6 @@ algebra Ring<T> {
     // generic" shape `MatMul`'s own `C` already needs, resolved the
     // identical way).
     fn zero() -> T;
-    // The multiplicative identity — "one", the same `Ring<T>`-owned
-    // concept `zero` already is, just relative to `mul` instead of `add`
-    // (an ordinary ring has both, mathematically). Needed the first time a
-    // *generic* impl (`T: Float`, not a concrete `f32`/`f64` one) needs a
-    // literal `1`/`0` value passed directly into a raw `mlir::...` call —
-    // `stdlib/nn/nn.cleave`'s own `Activation<Tensor<T,Dims...>>::sigmoid`/
-    // `Step<Tensor<T,Dims...>>::step`, both needing a same-shape broadcast
-    // tensor of `1.0`/`0.0` via `mlir::tensor::splat`. A bare literal
-    // written directly inside a still-generic impl is fine when it flows
-    // through an *ordinary*, type-checked call (`Ring<f32>::zero()`'s own
-    // `0.0`, inside a fully *concrete* impl, is never generic to begin
-    // with) — but handed raw to `mlir::...`, which never type-checks its
-    // own arguments against the op's real signature (this file's own
-    // module doc comment), it reaches codegen still under-resolved. Found
-    // directly, not assumed: `let z: T = 0.0;` immediately followed by
-    // `mlir::tensor::splat(z)` produced a genuinely malformed op (a `f32`-
-    // typed splat whose own constant operand lowered as a bare integer
-    // `0`, not `0.0`), a hard native MLIR assertion (`StorageUniquerSupport
-    // .h`), not a clean cleave-level error. Routing through a real call —
-    // `zero()`/`one()`, ordinarily type-checked and monomorphized before
-    // its own return value ever reaches `mlir::...` — closes the gap.
-    fn one() -> T;
 
     // Trusted as declared over every `impl Ring<T>` this algebra ever
     // gets (`hld.md`'s own v1 trust model — no per-impl soundness gate),
@@ -115,7 +97,6 @@ algebra Ring<T> {
     // in an axiom here is a real, silent miscompilation risk, not just a
     // wrong debug-flag output.
     axiom add_commutative(a, b): add(a, b) == add(b, a);
-    axiom mul_commutative(a, b): mul(a, b) == mul(b, a);
     // Only ever fires for an integer `T` in practice — a float literal has
     // no e-graph representation yet (`egraph.rs`'s own module doc comment:
     // `CVal::Float` is out of scope for now), so a segment involving `x +
@@ -144,17 +125,6 @@ algebra Ring<T> {
     // pattern`'s own doc comment.
     derivative add(a, b): add(d(a), d(b));
     derivative sub(a, b): sub(d(a), d(b));
-    derivative mul(a, b): add(mul(a, d(b)), mul(d(a), b));
-    // The quotient rule (`d(a/b) = (d(a)*b - a*d(b)) / b^2`) and negation's
-    // own trivial rule (`d(-a) = -d(a)`) — `Ring`'s own remaining two ops,
-    // completing the set alongside `add`/`sub`/`mul` above. Found missing
-    // while chasing a real, separate gap: `sigmoid` (`stdlib/nn/nn.cleave`)
-    // needs `div`'s own derivative to be differentiable at all through
-    // `1.0 / (1.0 + exp(-x))`, and previously had no path to it whatsoever
-    // (its own hand-differentiated closed form lived on `Activation<T>`
-    // instead — see `Transcendental<T>`'s own doc comment below for why
-    // that was the wrong layer).
-    derivative div(a, b): div(sub(mul(d(a), b), mul(a, d(b))), mul(b, b));
     derivative neg(a): neg(d(a));
 
     // `doc/backlog.md`'s own "reverse-mode differentiation" item — a
@@ -176,13 +146,57 @@ algebra Ring<T> {
     // algebra itself.
     adjoint add(a, b), u: (u, u);
     adjoint sub(a, b), u: (u, neg(u));
+    adjoint neg(a), u: neg(u);
+}
+
+// A ring: an additive group (`Additive`, which every `impl Ring<T>` needs
+// alongside) with a product, its quotient and its identity.
+algebra Ring<T> : Additive {
+    fn mul(a: T, b: T) -> T;
+    fn div(a: T, b: T) -> T;
+    // The multiplicative identity — "one", the same `Ring<T>`-owned
+    // concept `zero` already is, just relative to `mul` instead of `add`
+    // (an ordinary ring has both, mathematically). Needed the first time a
+    // *generic* impl (`T: Float`, not a concrete `f32`/`f64` one) needs a
+    // literal `1`/`0` value passed directly into a raw `mlir::...` call —
+    // `stdlib/nn/nn.cleave`'s own `Activation<Tensor<T,Dims...>>::sigmoid`/
+    // `Step<Tensor<T,Dims...>>::step`, both needing a same-shape broadcast
+    // tensor of `1.0`/`0.0` via `mlir::tensor::splat`. A bare literal
+    // written directly inside a still-generic impl is fine when it flows
+    // through an *ordinary*, type-checked call (`Ring<f32>::zero()`'s own
+    // `0.0`, inside a fully *concrete* impl, is never generic to begin
+    // with) — but handed raw to `mlir::...`, which never type-checks its
+    // own arguments against the op's real signature (this file's own
+    // module doc comment), it reaches codegen still under-resolved. Found
+    // directly, not assumed: `let z: T = 0.0;` immediately followed by
+    // `mlir::tensor::splat(z)` produced a genuinely malformed op (a `f32`-
+    // typed splat whose own constant operand lowered as a bare integer
+    // `0`, not `0.0`), a hard native MLIR assertion (`StorageUniquerSupport
+    // .h`), not a clean cleave-level error. Routing through a real call —
+    // `zero()`/`one()`, ordinarily type-checked and monomorphized before
+    // its own return value ever reaches `mlir::...` — closes the gap.
+    fn one() -> T;
+
+    axiom mul_commutative(a, b): mul(a, b) == mul(b, a);
+
+    derivative mul(a, b): add(mul(a, d(b)), mul(d(a), b));
+    // The quotient rule (`d(a/b) = (d(a)*b - a*d(b)) / b^2`) and negation's
+    // own trivial rule (`d(-a) = -d(a)`) — `Ring`'s own remaining two ops,
+    // completing the set alongside `add`/`sub`/`mul` above. Found missing
+    // while chasing a real, separate gap: `sigmoid` (`stdlib/nn/nn.cleave`)
+    // needs `div`'s own derivative to be differentiable at all through
+    // `1.0 / (1.0 + exp(-x))`, and previously had no path to it whatsoever
+    // (its own hand-differentiated closed form lived on `Activation<T>`
+    // instead — see `Transcendental<T>`'s own doc comment below for why
+    // that was the wrong layer).
+    derivative div(a, b): div(sub(mul(d(a), b), mul(a, d(b))), mul(b, b));
+
     adjoint mul(a, b), u: (mul(u, b), mul(u, a));
     // Same quotient-rule shape as `derivative div`'s own adjoint would be,
     // rewritten from `d(a/b) = (d(a)*b - a*d(b))/b^2` into its own reverse
     // form: `da = u/b`, `db = -u*a/(b*b)` — verified directly (product
     // rule + quotient rule, `d(1/b) = -1/b^2`), not copied blind.
     adjoint div(a, b), u: (div(u, b), neg(div(mul(u, a), mul(b, b))));
-    adjoint neg(a), u: neg(u);
 }
 
 // Integer negation has no dedicated `arith` op (unlike float — two's-
@@ -190,63 +204,81 @@ algebra Ring<T> {
 // wrap a redundant `negi`, confirmed directly against melior's own
 // `dialect::arith` module) — `mlir::arith::subi(0, a)` through the exact
 // same generic mechanism every other op here already uses, no special case.
-impl Ring<i8> {
+impl Additive<i8> {
     fn add(a: i8, b: i8) -> i8 { mlir::arith::addi(a, b) }
     fn sub(a: i8, b: i8) -> i8 { mlir::arith::subi(a, b) }
-    fn mul(a: i8, b: i8) -> i8 { mlir::arith::muli(a, b) }
-    fn div(a: i8, b: i8) -> i8 { mlir::arith::divsi(a, b) }
     fn neg(a: i8) -> i8 { mlir::arith::subi(0, a) }
     fn zero() -> i8 { 0 }
+}
+
+impl Ring<i8> {
+    fn mul(a: i8, b: i8) -> i8 { mlir::arith::muli(a, b) }
+    fn div(a: i8, b: i8) -> i8 { mlir::arith::divsi(a, b) }
     fn one() -> i8 { 1 }
 }
 
-impl Ring<i16> {
+impl Additive<i16> {
     fn add(a: i16, b: i16) -> i16 { mlir::arith::addi(a, b) }
     fn sub(a: i16, b: i16) -> i16 { mlir::arith::subi(a, b) }
-    fn mul(a: i16, b: i16) -> i16 { mlir::arith::muli(a, b) }
-    fn div(a: i16, b: i16) -> i16 { mlir::arith::divsi(a, b) }
     fn neg(a: i16) -> i16 { mlir::arith::subi(0, a) }
     fn zero() -> i16 { 0 }
+}
+
+impl Ring<i16> {
+    fn mul(a: i16, b: i16) -> i16 { mlir::arith::muli(a, b) }
+    fn div(a: i16, b: i16) -> i16 { mlir::arith::divsi(a, b) }
     fn one() -> i16 { 1 }
 }
 
-impl Ring<i32> {
+impl Additive<i32> {
     fn add(a: i32, b: i32) -> i32 { mlir::arith::addi(a, b) }
     fn sub(a: i32, b: i32) -> i32 { mlir::arith::subi(a, b) }
-    fn mul(a: i32, b: i32) -> i32 { mlir::arith::muli(a, b) }
-    fn div(a: i32, b: i32) -> i32 { mlir::arith::divsi(a, b) }
     fn neg(a: i32) -> i32 { mlir::arith::subi(0, a) }
     fn zero() -> i32 { 0 }
+}
+
+impl Ring<i32> {
+    fn mul(a: i32, b: i32) -> i32 { mlir::arith::muli(a, b) }
+    fn div(a: i32, b: i32) -> i32 { mlir::arith::divsi(a, b) }
     fn one() -> i32 { 1 }
 }
 
-impl Ring<i64> {
+impl Additive<i64> {
     fn add(a: i64, b: i64) -> i64 { mlir::arith::addi(a, b) }
     fn sub(a: i64, b: i64) -> i64 { mlir::arith::subi(a, b) }
-    fn mul(a: i64, b: i64) -> i64 { mlir::arith::muli(a, b) }
-    fn div(a: i64, b: i64) -> i64 { mlir::arith::divsi(a, b) }
     fn neg(a: i64) -> i64 { mlir::arith::subi(0, a) }
     fn zero() -> i64 { 0 }
+}
+
+impl Ring<i64> {
+    fn mul(a: i64, b: i64) -> i64 { mlir::arith::muli(a, b) }
+    fn div(a: i64, b: i64) -> i64 { mlir::arith::divsi(a, b) }
     fn one() -> i64 { 1 }
 }
 
-impl Ring<f32> {
+impl Additive<f32> {
     fn add(a: f32, b: f32) -> f32 { mlir::arith::addf(a, b) }
     fn sub(a: f32, b: f32) -> f32 { mlir::arith::subf(a, b) }
-    fn mul(a: f32, b: f32) -> f32 { mlir::arith::mulf(a, b) }
-    fn div(a: f32, b: f32) -> f32 { mlir::arith::divf(a, b) }
     fn neg(a: f32) -> f32 { mlir::arith::negf(a) }
     fn zero() -> f32 { 0.0 }
+}
+
+impl Ring<f32> {
+    fn mul(a: f32, b: f32) -> f32 { mlir::arith::mulf(a, b) }
+    fn div(a: f32, b: f32) -> f32 { mlir::arith::divf(a, b) }
     fn one() -> f32 { 1.0 }
 }
 
-impl Ring<f64> {
+impl Additive<f64> {
     fn add(a: f64, b: f64) -> f64 { mlir::arith::addf(a, b) }
     fn sub(a: f64, b: f64) -> f64 { mlir::arith::subf(a, b) }
-    fn mul(a: f64, b: f64) -> f64 { mlir::arith::mulf(a, b) }
-    fn div(a: f64, b: f64) -> f64 { mlir::arith::divf(a, b) }
     fn neg(a: f64) -> f64 { mlir::arith::negf(a) }
     fn zero() -> f64 { 0.0 }
+}
+
+impl Ring<f64> {
+    fn mul(a: f64, b: f64) -> f64 { mlir::arith::mulf(a, b) }
+    fn div(a: f64, b: f64) -> f64 { mlir::arith::divf(a, b) }
     fn one() -> f64 { 1.0 }
 }
 

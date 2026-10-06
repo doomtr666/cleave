@@ -102,7 +102,7 @@ fn run(
 /// The full proof: `helper`'s own parameter `x` is a genuine free variable
 /// at the e-graph level (never a literal, so this can't be mistaken for
 /// plain constant folding, already covered by `egraph.rs`'s own Stage 2
-/// tests) — `x + 0` compiles to a real call to `Ring::add<i32>`, which the
+/// tests) — `x + 0` compiles to a real call to `Additive::add<i32>`, which the
 /// `add_zero` axiom folds away entirely, leaving `helper` a bare `return x`.
 /// `main` itself is untouched (it calls `helper`, a unit whose own body
 /// contains a real `Fix` — not straight-line — so `Forward::walk` correctly
@@ -111,7 +111,7 @@ fn run(
 #[test]
 fn an_axiom_folds_a_real_call_away_and_the_optimized_program_still_executes_to_the_same_value() {
     let context = context();
-    // `add_zero` is a real axiom on the shipped `Ring<T>` now
+    // `add_zero` is a real axiom on the shipped `Additive<T>` now
     // (`stdlib/num/num.cleave`) -- no local `algebra Ring<T>` fragment
     // needed here (redeclaring it would collide with the real one, "same
     // parameter types", found by direct testing once the axiom actually
@@ -135,8 +135,8 @@ fn an_axiom_folds_a_real_call_away_and_the_optimized_program_still_executes_to_t
         .nth(1)
         .expect("`helper` must be in the naive dump");
     assert!(
-        naive_helper.contains("Ring::add<i32>"),
-        "the naive form must still call `Ring::add<i32>`, got:\n{naive_helper}"
+        naive_helper.contains("Additive::add<i32>"),
+        "the naive form must still call `Additive::add<i32>`, got:\n{naive_helper}"
     );
 
     let optimize_units = collect_units(&program, &registry);
@@ -157,7 +157,7 @@ fn an_axiom_folds_a_real_call_away_and_the_optimized_program_still_executes_to_t
         .nth(1)
         .expect("`helper` must be in the optimized dump");
     assert!(
-        !optimized_helper.contains("Ring::add<i32>"),
+        !optimized_helper.contains("Additive::add<i32>"),
         "the axiom should have folded the call away entirely, got:\n{optimized_helper}"
     );
     assert_ne!(
@@ -217,8 +217,8 @@ fn a_struct_field_read_lets_add_zero_fold_a_real_call_away_and_the_optimized_pro
         .nth(1)
         .expect("`helper` must be in the naive dump");
     assert!(
-        naive_helper.contains("Ring::add<i32>"),
-        "the naive form must still call `Ring::add<i32>`, got:\n{naive_helper}"
+        naive_helper.contains("Additive::add<i32>"),
+        "the naive form must still call `Additive::add<i32>`, got:\n{naive_helper}"
     );
 
     let optimize_units = collect_units(&program, &registry);
@@ -239,7 +239,7 @@ fn a_struct_field_read_lets_add_zero_fold_a_real_call_away_and_the_optimized_pro
         .nth(1)
         .expect("`helper` must be in the optimized dump");
     assert!(
-        !optimized_helper.contains("Ring::add<i32>"),
+        !optimized_helper.contains("Additive::add<i32>"),
         "the axiom should have folded the call away entirely, got:\n{optimized_helper}"
     );
     assert_ne!(

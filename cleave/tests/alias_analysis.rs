@@ -796,6 +796,34 @@ mod affine_eligibility {
         );
     }
 
+    /// A struct built in one function and returned is affine where it is
+    /// built, but the caller's use decides whether it has one owner:
+    /// handed to an identity-shaped function, it comes back under a second
+    /// name, both released. `Print<Complex<T>>` did this with
+    /// `dynarray_new`'s `DynArray` and `Display::display`, freeing a
+    /// headerless block twice (`alias_analysis::
+    /// constructions_returned_to_aliasing_callers`).
+    #[test]
+    fn a_struct_returned_to_a_caller_that_aliases_it_is_not_affine() {
+        let src = "
+            struct Acc { v: i32, tag: [i32; 1] }
+            fn make() -> Acc { Acc(v: 1, tag: [0]) }
+            fn id(a: Acc) -> Acc { a }
+            extern fn opaque_sink(x: i32) -> i32;
+            fn main() -> i32 {
+                let a = make();
+                let b = id(a);
+                opaque_sink(b.v + a.v)
+            }
+            ";
+        let (program, affine) = affine_vars(src);
+        let built = nth_struct_var(&program, "make", 0);
+        assert!(
+            !affine.contains(&built),
+            "`make`'s result is handed to `id`, which returns it: two names,              it must not be affine"
+        );
+    }
+
     /// The `i`-th parameter of the first loop/`if`-join `Fix`-def found in
     /// `f_name`'s own body (`def.carried_types.is_some()`) -- the loop-
     /// carried `CVar` `refcount::insert_refcounting` actually targets with
@@ -1020,10 +1048,10 @@ fn affine_eligibility_gives_the_same_answer_before_and_after_insert_refcounting(
 
 /// The real motivating shape (`stdlib/optim/optim.cleave`'s own `Sgd::
 /// step`, `model - lr*grad`): a struct-typed parameter's own tensor field
-/// is read once (`w.t`), fed into an elementwise `Ring::sub`, and the
+/// is read once (`w.t`), fed into an elementwise `Additive::sub`, and the
 /// result is embedded into a fresh struct -- the old field is never read
 /// again, and the parameter itself is never aliased. Must be recognized as
-/// reuse-eligible: the `Ring::sub` call's own result should map back to
+/// reuse-eligible: the `Additive::sub` call's own result should map back to
 /// `w.t`'s own `CVar`.
 #[test]
 fn an_elementwise_op_consuming_a_dead_unaliased_struct_fields_tensor_is_reuse_eligible() {
@@ -1035,7 +1063,7 @@ fn an_elementwise_op_consuming_a_dead_unaliased_struct_fields_tensor_is_reuse_el
         extern fn make_wrap() -> Wrap;
         extern fn make_delta() -> Tensor<f32,2,2>;
         fn compute_step(w: Wrap, delta: Tensor<f32,2,2>) -> Wrap {
-            Wrap(t: Ring::sub(w.t, delta))
+            Wrap(t: Additive::sub(w.t, delta))
         }
         extern fn opaque_sink(w: Wrap) -> i32;
         fn main() -> i32 {
@@ -1053,13 +1081,13 @@ fn an_elementwise_op_consuming_a_dead_unaliased_struct_fields_tensor_is_reuse_el
         .expect("compute_step must survive dead-code elimination");
     let field_var = find_field_read(&compute_step.def.body, "t")
         .expect("`w.t` must still be a real `Field` read in this function's own body");
-    let call_result = find_call_result_var(&compute_step.def.body, "Ring::sub")
-        .expect("`Ring::sub<Tensor<f32,2,2>>` must still be a real call in this function's own body");
+    let call_result = find_call_result_var(&compute_step.def.body, "Additive::sub")
+        .expect("`Additive::sub<Tensor<f32,2,2>>` must still be a real call in this function's own body");
 
     assert_eq!(
         reuse.get(&call_result),
         Some(&field_var),
-        "the `Ring::sub` result must be marked reusable from `w.t`'s own dead, \
+        "the `Additive::sub` result must be marked reusable from `w.t`'s own dead, \
          unaliased `CVar` -- got {reuse:?}"
     );
 }
@@ -1069,7 +1097,7 @@ fn an_elementwise_op_consuming_a_dead_unaliased_struct_fields_tensor_is_reuse_el
 /// first read being dead proves nothing about the field's own occupant --
 /// must NOT be marked reuse-eligible. `delta` (the call's *other* operand)
 /// is also read again afterward, so neither position has a fallback --
-/// without that, `Ring::sub` legitimately (and correctly) falls back to
+/// without that, `Additive::sub` legitimately (and correctly) falls back to
 /// reusing `delta`'s own buffer instead, which is real, sound behavior,
 /// just not what this specific test means to isolate.
 #[test]
@@ -1083,7 +1111,7 @@ fn a_second_independent_read_of_the_same_field_blocks_reuse() {
         extern fn make_delta() -> Tensor<f32,2,2>;
         extern fn opaque_sink(t: Tensor<f32,2,2>) -> i32;
         fn compute_step(w: Wrap, delta: Tensor<f32,2,2>) -> Wrap {
-            let r = Wrap(t: Ring::sub(w.t, delta));
+            let r = Wrap(t: Additive::sub(w.t, delta));
             opaque_sink(w.t);
             opaque_sink(delta);
             r
@@ -1102,8 +1130,8 @@ fn a_second_independent_read_of_the_same_field_blocks_reuse() {
         .iter()
         .find(|f| f.def.name == "compute_step")
         .expect("compute_step must survive dead-code elimination");
-    let call_result = find_call_result_var(&compute_step.def.body, "Ring::sub")
-        .expect("`Ring::sub<Tensor<f32,2,2>>` must still be a real call in this function's own body");
+    let call_result = find_call_result_var(&compute_step.def.body, "Additive::sub")
+        .expect("`Additive::sub<Tensor<f32,2,2>>` must still be a real call in this function's own body");
 
     assert!(
         !reuse.contains_key(&call_result),
@@ -1138,7 +1166,7 @@ fn find_field_read(expr: &cleave::cps::CExpr, field_name: &str) -> Option<cleave
 }
 
 /// Finds the resumption parameter of a real call to a unit whose name
-/// starts with `callee_prefix` (a monomorphized name like `Ring::sub<..>`
+/// starts with `callee_prefix` (a monomorphized name like `Additive::sub<..>`
 /// is never known exactly ahead of time) — the `CVar` that receives the
 /// call's own result in the caller.
 fn find_call_result_var(expr: &cleave::cps::CExpr, callee_prefix: &str) -> Option<cleave::cps::CVar> {

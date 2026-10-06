@@ -225,7 +225,10 @@ rigid, satisfying exactly its declared bounds (and what they imply) — would re
 for every user. Applies to all generic code (impls over packs of types included), so it is its own
 project, not part of the pack work.
 
-## A zero-field struct built with `Name()` passes inference, then panics CPS conversion
+## A zero-field struct built with `Name()` passes inference, then panics CPS conversion — no longer reproduces (2026-10-05)
+
+`Nil()` builds the struct now (fixed by an earlier change, not identified); kept as a test:
+`mlir_lower.rs::a_zero_field_struct_is_built_with_an_empty_call`. The original report:
 
 `struct Nil {}` ... `Nil()` type-checks (`infer.rs`'s `Empty()` special case) but `cps.rs::resolve_call`
 then treats it as a call: `CPS: could not resolve call to `Nil``. Found prototyping cons lists; worked
@@ -961,7 +964,15 @@ Not built — gated on the same open validation step as the rest of this explora
 
 Not "produce a real executable" — that shipped a while ago (`--emit-exe`/`cleave-build`, real and heavily used, see `doc/backlog-done.md`'s own corrected entry; this item's own title used to say otherwise and had gone stale). This is the narrower, still genuinely open question underneath it: does a "cleave library" — separately-compiled, linkable, with no source required downstream — make sense at all, given total monomorphization? A `.o` alone carries no metadata (declared signatures, generic templates, algebra impls) for a *downstream* cleave program to monomorphize *against* — unlike Rust's own `.rlib`/`.rmeta` split, which exists precisely to carry that metadata alongside compiled code. Without an equivalent, either (a) cross-crate cleave code always recompiles from source (the current `stdlib` model, extended — works, but risks "mega long" whole-program compile times, and doesn't produce a distributable library at all), or (b) a real compiled-library-plus-metadata format gets designed, a genuinely new, nontrivial piece of infrastructure. `extern fn`/`export fn` already covers the *other* interop story fine (calling into/out of compiled cleave across a language boundary to Rust, already built and working, `doc/backlog-done.md`) — this item is specifically about a *cleave-to-cleave* separately-compiled library, a different problem, needing a real design pass once the language itself is more stable. Not attempted.
 
-## A `for` loop bound to a const generic breaks if its own loop variable is used in ordinary arithmetic
+## A `for` loop bound to a const generic breaks if its own loop variable is used in ordinary arithmetic — no longer reproduces (2026-10-05)
+
+Both shapes work now (fixed by an earlier change, not identified): `for b in 0..B { .. base + b .. }`,
+and two nested loops bounded by two different const generics indexing a rectangular array, the
+`Sum::sum` variant. The workarounds are gone from `stdlib/nn` (`Init::xavier`/`he` and
+`Sum::sum`'s manual counters), and so is the related `mlir::arith::addi(N, 0)` that turned a
+const generic into a value before `.to()`: `N.to()` works in a generic impl (`Init`, `Mean`).
+Test: `mlir_lower.rs::loops_bounded_by_const_generics_use_their_variables_freely`. The original
+report:
 
 Found in the same batching investigation, building `load_train_batch_input<const B: i32>` (`examples/mnist-interop/src/kernel.cleave`): `for b in 0..B { ...; train_pixel(batch_start + b, i); }` (`b`'s own value combined with an ordinary `i32` parameter via `+`) fails CPS conversion outright — `CPS: could not resolve call to \`add\` (("add", ["i32", "3"], "i32"))` (`3` being `B`'s own *concrete value* at the failing instantiation, not a type at all) — isolated with a minimal probe (`for b in 0..B { acc = acc + (base + b); }`, `sum_offsets::<3>(10)`), confirmed to reproduce identically standalone, with no array indexing or `Tensor` involved.
 
@@ -1850,7 +1861,16 @@ fn main() -> i32 {
 
 This unblocks writing an actual size-threshold dispatch (`if M*K*N > THRESHOLD { blas_call() } else { native_matmul() }`) with `M`/`K`/`N` read directly as ordinary `const generic` values — the concrete blocker for the OpenBLAS integration work (see the `cleave-llvm-redist` entry above).
 
-## A const generic forwarded from an *enclosing* generic function's own turbofish crashes CPS conversion, even in the simplest possible case — found chasing an unrelated diagnostics fix, confirmed pre-existing via `git stash`, not caused by it, not yet root-caused
+## A const generic forwarded from an *enclosing* generic function's own turbofish crashes CPS conversion, even in the simplest possible case — found chasing an unrelated diagnostics fix, confirmed pre-existing via `git stash`, not caused by it — fixed (2026-10-05)
+
+Root cause: not a value lost in monomorphization. `foo<10>`'s specialization re-infers its body
+with `M = 10`, which creates `probe<10>` and names the call correctly; then the instantiation walk
+(`monomorphize.rs::derive_instantiation`) re-read the turbofish from the AST, where
+`concrete_ty_from_ast` took the bare name `M` for a type named `M`, and pushed a second, bogus
+`probe<M>` whose `N` nothing binds: the CPS panic. A bare turbofish name is now a type only if it
+names a struct or a primitive (otherwise the ordinary reverse unification applies), and a global
+function's instantiation is only pushed when fully concrete, as a lambda's already was. Test:
+`mlir_lower.rs::a_const_generic_forwarded_by_turbofish_reaches_the_callee`. The original report:
 
 `fn probe<const N: i32>() -> i32 { N } fn foo<const M: i32>() -> i32 { probe::<M>() } fn main() -> i32 { foo::<10>() }` panics with `` CPS: unbound variable `N` `` the moment `foo::<10>()` is actually instantiated — despite `probe::<M>()` type-checking cleanly (no diagnostic at all): `M` is a real, legitimately-declared const generic of the enclosing `foo`, correctly forwarded by name, not the "genuinely not a compile-time constant" shape the entry two above this one just closed. Confirmed pre-existing, not a regression from that fix: reproduces identically with every change from this session's diagnostics work set aside (`git stash`), against the exact commit this branch started from.
 
@@ -1962,7 +1982,11 @@ The mechanism is in `monomorphize.rs`, building the `ImplTemplate`s: `let Ok(ret
 
 What's needed: surface that error as a real diagnostic, located in the method's body. To check first: do some templates fail generically *on purpose*, relying on the check at instantiation (indices still pending on an open base, say, which `infer.rs` already tolerates in generic code)? If so, distinguish "undecidable without the instance" (keep the template, check at instantiation) from "wrong whatever the instance" (immediate diagnostic), per the "valid or error, never a silent choice" principle.
 
-## Adam on literal tensors returns a wrong value after MLIR inlining — pre-existing, silent, absent with runtime data
+## Adam on literal tensors returns a wrong value after MLIR inlining — pre-existing, silent, absent with runtime data — no longer reproduces (2026-10-05)
+
+The exact program below gives 0.75, inlined or not, bare tensor or model: fixed in passing by one of
+the refcount/bufferization changes since (not identified). Kept as a regression test:
+`language_model_ops.rs::adam_on_a_literal_tensor_takes_its_step`. The original report:
 
 Found while debugging single-field models (`doc/plan-nanolm.md`, step 2). One Adam step on a tensor built from a literal (`Tensor::<f32, 8, 8>(data: [[1.0; 8]; 8])`, gradient = that same tensor, `lr` 0.25) should give 0.75 everywhere; the program sees a value in [0.999, 1.0) instead (`w2[0, 0] < 0.76` false, `< 1.0` true). Reproduced on the committed code (`90960b7`), so not a regression from that session.
 
@@ -1981,7 +2005,12 @@ Hit three times in a row on the nanoLM step 4 work (attention). `TypeErrorKind::
 
 What's needed: when `NoneMatched` hits an impl whose *declared* target (`impl<…> Algebra<Tensor<f32, N, D>, …>`) would match the call, but whose *inferred* patterns don't, say so: "the body of `Algebra::method` constrains its generics beyond its declaration: `N` and `L` were unified (here)". Comparing the declared target against the inferred patterns at template construction would catch it at the source, with the location in the body. Related to the "disappears without a message" entry above: both are the same gap, the generic check of an impl body that doesn't surface its own conclusions.
 
-## `unify` unifies two `ConstExpr`s with the same operator operand by operand — unsound
+## `unify` unifies two `ConstExpr`s with the same operator operand by operand — unsound — fixed (2026-10-05)
+
+Now only a shared operand and an operator injective in the other one prove the other pair equal
+(`add`/`sub`, `mul` by a nonzero constant): `N+1 ~ M+1` binds `N = M`; `N/L ~ M/K` and `N/4 ~ M/4`
+are a `Mismatch` instead of a guess. Nothing in the suite or nanoLM relied on the old deduction.
+Test: `infer.rs::unify_only_deduces_equal_operands_when_it_follows`. The original report:
 
 `infer.rs::unify`, arm `(Ty::ConstExpr(op1, x1, y1), Ty::ConstExpr(op2, x2, y2)) if op1 == op2`: `N / L ~ M / K` forces `N = M` and `L = K`, while `8/4 = 4/2`. Not hit in practice (looked for during the attention work: the arm never fired), but it's an inference that can merge two generics wrongly, the same class as the bug found there. Fix: only accept syntactic identity (same operands, already unified), otherwise defer until the values are known, rather than deducing equal operands.
 
@@ -2205,9 +2234,42 @@ v2's extra memory was this.
 Side findings, not from this fix (both reproduced on `HEAD`'s `refcount.rs`/`alias_analysis.rs`):
 `leaks.rs::a_gradient_leaving_an_if_does_not_crash` (ignored, "A gradient leaving an `if` crashes"
 above) passes, so an earlier change fixed it (un-ignored since); and `examples/complex.cleave` under
-`CLEAVE_DEBUG_POOL=1` reports a double release of a 1-byte block through `cleave_release_void`
-(bufferization), likely `println`'s `"\n"` handed back by `extern print_bytes`, invisible without
-the debug pool.
+`CLEAVE_DEBUG_POOL=1` reported a double release (the `data_size=1` was a header read from a
+headerless block). Fixed 2026-10-05: not `println`'s `"\n"`, but `Print<Complex<T>>`'s `DynArray`,
+built by `dynarray_new` as an affine (headerless) struct, then handed by the caller to
+`Display::display`, which returns it: two names, released twice, plus a headered retain/release in
+between. Affinity is decided where a struct is built, and nothing checked what a caller does with a
+returned one; `alias_analysis::constructions_returned_to_aliasing_callers` now excludes every
+construction that may become the result of a function some caller aliases (traced back through
+joins, loops and forwarded call results). Test:
+`alias_analysis.rs::a_struct_returned_to_a_caller_that_aliases_it_is_not_affine` (fails without);
+`tests/examples.rs` now runs every example under `CLEAVE_DEBUG_POOL=1`, so a pool error fails it.
+
+## An impl defines every function of its algebra; `Additive` split out of `Ring` — done (2026-10-06)
+
+Differentiating `sum(x * x)` on a rank-1 tensor panicked in the e-graph ("extracted `Op` node
+`Sum::broadcast<..>` is in none of this module's own lookup tables"): the rank-1 `Sum` impl had no
+`broadcast`, which `sum`'s adjoint calls, and nothing checked that an impl defines its algebra's
+functions. Now an error at the impl (`pipeline.rs::check_impl_completeness`: "`impl Sum<Tensor<T,
+N>>` doesn't define `broadcast`"); an algebra is an interface. It found five gaps in the stdlib, all
+filled and tested (`language_model_ops.rs::the_functions_missing_from_their_impls_compute_what_they_
+should`): `Sum<Tensor<T, N>>::broadcast`, `Transcendental<Tensor>::tanh`/`log`, `Ring<Complex>::zero`/
+`one`, scalar `gelu`/`silu` and their derivatives. The stale comment calling `Sum::broadcast`
+unreachable is gone.
+
+`examples/vector.cleave` implemented `Ring<vec3>` with `add`/`sub` only, to get `+`/`-`: a vector is
+an additive group, not a ring. So `stdlib/num` has `algebra Additive<T>` (`add`, `sub`, `neg`, `zero`,
+their axioms, derivatives and adjoints) and `algebra Ring<T> : Additive` (`mul`, `div`, `one`). An
+algebra whose super-algebra declares functions needs that super-algebra's own impl too (checked
+alongside; a marker super-algebra like `Num` stays implied). A qualified call reaches a super-
+algebra's method (`Ring::add` is `Additive::add`, `resolve.rs::declaring_algebra`), so stdlib code
+and users' `Ring::zero()` keep working. Units are named after the declaring algebra
+(`Additive::add<i32>`); `egraph.rs`'s zero/sum construction and `monomorphize.rs::seed_ring_zero`
+followed. `vec3` and the user guide's `Vec2` now implement `Additive`.
+
+Open: the super-algebra check compares impl targets as written (`Complex<T>` in both impls), so two
+impls naming their generics differently (`impl<U> Additive<Complex<U>>`) would be reported as
+missing.
 
 ## Debug info attributes inlined stdlib code to the program's file
 `llvm-symbolizer` on nanoLM v2 placed `Optimizer::step` at `kernel.cleave:386`, a line the kernel
