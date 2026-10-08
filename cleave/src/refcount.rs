@@ -780,6 +780,17 @@ fn walk_var_info(
             var_types.insert(*var, ty.clone());
             let is_owned = match op {
                 PrimOp::Struct(..) => true,
+                // An array of structs built here (`is_handle_array`): a
+                // refcounted object of its own, owned like a struct built
+                // here (released, its elements with it, by the cascade), and
+                // its elements read out (`Load`, below) retained from it.
+                // Not owned, it was never released: every array built in a
+                // loop leaked its elements (`Accumulate` over a model with an
+                // array of layers: nanoLM's data-parallel step leaked its
+                // micro-batches' gradients, 3.8 GiB a step). An array of
+                // numbers is a memref, its buffer MLIR's: owning it changes
+                // nothing (`owned` keeps refcounted values only).
+                PrimOp::Array => true,
                 // A spawned call's result (`doc/plan-spawn.md`) is a call's
                 // fresh result, owned exactly like the single param of an
                 // ordinary call's resumption (below). Not owned, it was never
@@ -810,7 +821,27 @@ fn walk_var_info(
                 PrimOp::Field { .. } | PrimOp::Load { .. } => args
                     .first()
                     .is_some_and(|base| is_owned_val(base, owned_origin)),
-                _ => false,
+                // An extern's struct result is the caller's, as a call's
+                // result is (`cleave-rt`'s `dynarray_get_ptr` hands out a
+                // retained element). Not owned, a function using one without
+                // returning it never released it.
+                PrimOp::Extern { .. } => true,
+                // `[v; N]`: owned like an array literal, its value retained
+                // once per element (below). CPS conversion writes `[v; N]`
+                // of a struct as `Array(v, ..., v)`; this keeps the repeat
+                // form right if one ever reaches here.
+                PrimOp::ArrayRepeat => true,
+                // An MLIR value: a scalar, or a tensor whose buffer MLIR's
+                // deallocation owns.
+                PrimOp::RawMlirOp { .. } | PrimOp::Adopt(_) => false,
+                // Effects: their result is `()`.
+                PrimOp::Store { .. }
+                | PrimOp::FieldStore { .. }
+                | PrimOp::Retain(_)
+                | PrimOp::Release(_)
+                | PrimOp::LeafGlue { .. }
+                | PrimOp::Await
+                | PrimOp::Sync => false,
             };
             owned_origin.insert(*var, is_owned);
             walk_var_info(cont, signatures, var_types, owned_origin);
@@ -1684,7 +1715,8 @@ fn rewrite_body(
             // the difference (a real `Release` on the pointer for the
             // heavy case, a `PrimOp::Field` chain ending in `Release` for
             // each leaf otherwise).
-            if (matches!(&op, PrimOp::Struct(..)) || field_read_owned)
+            if (matches!(&op, PrimOp::Struct(..) | PrimOp::Array | PrimOp::ArrayRepeat | PrimOp::Extern { .. })
+                || field_read_owned)
                 && (ctx.is_rc(&ty) || !ctx.light_release_leaves(&ty).is_empty())
             {
                 owned.push((var, ty.clone()));
@@ -1730,7 +1762,25 @@ fn rewrite_body(
                     args.last().cloned().into_iter().collect()
                 }
                 PrimOp::Struct(..) | PrimOp::Array => args.clone(),
-                _ => Vec::new(),
+                // Its value stored N times: N references.
+                PrimOp::ArrayRepeat => match &ty {
+                    Ty::Array(_, size) => match size.as_ref() {
+                        Ty::Const(crate::infer::ConstValue::Int(n)) => {
+                            args.first().map(|v| vec![v.clone(); *n as usize]).unwrap_or_default()
+                        }
+                        _ => Vec::new(),
+                    },
+                    _ => Vec::new(),
+                },
+                // Arguments lent to the callee, as to a call.
+                PrimOp::Extern { .. } | PrimOp::Spawn { .. } | PrimOp::RawMlirOp { .. } => Vec::new(),
+                PrimOp::Field { .. } | PrimOp::Load { .. } => Vec::new(),
+                PrimOp::Retain(_)
+                | PrimOp::Release(_)
+                | PrimOp::LeafGlue { .. }
+                | PrimOp::Adopt(_)
+                | PrimOp::Await
+                | PrimOp::Sync => Vec::new(),
             };
             // Embedding an *existing* light-with-leaves value (`Network`,
             // once it has genuinely-refcounted fields of its own) into a

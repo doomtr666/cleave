@@ -1191,7 +1191,42 @@ impl Lowerer {
             .next()
             .map(|p| self.lower_arg_list(p))
             .unwrap_or_default();
-        self.wrap(span, ExprKind::Call(path, generics, args, mlir_attrs))
+        self.hoist_lambda_args(span, path, generics, args, mlir_attrs)
+    }
+
+    /// A call whose arguments include lambdas written in place (`apply(fn(x:
+    /// i32) -> i32 { x + 1 }, 3)`): each is bound by name first, `{ let
+    /// <gen#id> = fn ...; apply(<gen#id>, 3) }`, the shape a higher-order call
+    /// is specialized from (`cps.rs::build_higher_order_specializations`, as
+    /// for a comprehension's function, `unroll.rs`). Making a lambda has no
+    /// effect, so binding it before the call's other arguments changes
+    /// nothing.
+    fn hoist_lambda_args(
+        &mut self,
+        span: Span,
+        path: Path,
+        generics: Vec<GenericArg>,
+        mut args: Vec<Expr>,
+        mlir_attrs: Vec<(String, String)>,
+    ) -> Expr {
+        let mut stmts = Vec::new();
+        for arg in &mut args {
+            if !matches!(arg.kind, ExprKind::Lambda { .. }) {
+                continue;
+            }
+            let name = crate::ast::generated_callable_name(arg.id);
+            let reference = self.wrap(arg.span, ExprKind::Path(Path::single(name.clone())));
+            let lambda = std::mem::replace(arg, reference);
+            stmts.push(self.wrap(
+                lambda.span,
+                StmtKind::Let { mutable: false, name, ty: None, value: lambda },
+            ));
+        }
+        let call = self.wrap(span, ExprKind::Call(path, generics, args, mlir_attrs));
+        if stmts.is_empty() {
+            return call;
+        }
+        self.wrap(span, ExprKind::Block(Block { stmts, tail: Some(Box::new(call)) }))
     }
 
     fn lower_struct_lit(&mut self, pair: Pair<Rule>) -> Expr {

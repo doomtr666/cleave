@@ -834,6 +834,9 @@ pub struct TypeError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeErrorKind {
     Unify(UnifyError),
+    /// An integer literal whose value doesn't fit its type (`let x: i8 =
+    /// 300;`): an error, never a silent wrap.
+    LiteralOutOfRange { text: String, ty: Ty },
     UnknownName(String),
     /// A call to a name that is neither a local, a top-level `fn`, nor a
     /// method of any algebra in scope: usually a missing `use`.
@@ -1110,6 +1113,9 @@ impl std::fmt::Display for TypeErrorKind {
                 write!(f, "`{name}` expects {expected} argument(s), found {found}")
             }
             TypeErrorKind::NotCallable(ty) => write!(f, "`{ty}` is not callable"),
+            TypeErrorKind::LiteralOutOfRange { text, ty } => {
+                write!(f, "the literal `{text}` doesn't fit in `{ty}`")
+            }
             TypeErrorKind::AmbiguousOperator { name, candidates } => {
                 write!(
                     f,
@@ -2049,6 +2055,10 @@ pub struct Infer<'r> {
     /// actually enforces it; this list is purely the "what would this
     /// default to if truly nothing else ever decides" fallback.
     pending_defaults: Vec<(TyVar, NumberDefault)>,
+    /// Every integer literal, with its type and where it is, until that type
+    /// is a concrete integer its value can be checked against
+    /// (`check_literal_ranges`); in generic code, each instance checks it.
+    pending_literals: Vec<(Ty, String, Span)>,
     /// Comprehensions whose target type may still be open (`CollectDefault`).
     pending_collect_defaults: Vec<CollectDefault>,
     /// Constraints not yet resolved one way or the other — either checked
@@ -2414,6 +2424,7 @@ impl<'r> Infer<'r> {
             subst: Subst::default(),
             vars,
             pending_defaults: Vec::new(),
+            pending_literals: Vec::new(),
             pending_collect_defaults: Vec::new(),
             constraints: Vec::new(),
             registry,
@@ -5872,7 +5883,42 @@ impl<'r> Infer<'r> {
     /// `self.constraints` entries need no equivalent final step — that's
     /// already `check_pending_constraints`'s own documented "permissive by
     /// omission" posture for a bound nothing ever pins down, unchanged.
+    /// Each integer literal whose type is now a concrete integer, checked
+    /// against that type's range; the others stay pending. A literal's
+    /// magnitude may reach `2^(bits-1)`: `-128` is `-` applied to `128`,
+    /// valid in an `i8`.
+    fn check_literal_ranges(&mut self) -> Result<(), TypeError> {
+        let mut still_open = Vec::new();
+        for (ty, text, span) in std::mem::take(&mut self.pending_literals) {
+            let resolved = self.subst.apply(&ty);
+            let bits = match &resolved {
+                Ty::Con(name) => match name.as_str() {
+                    "i8" => 8,
+                    "i16" => 16,
+                    "i32" => 32,
+                    "i64" => 64,
+                    _ => continue,
+                },
+                Ty::Var(_) => {
+                    still_open.push((ty, text, span));
+                    continue;
+                }
+                _ => continue,
+            };
+            if text.contains(['.', 'e', 'E']) {
+                continue;
+            }
+            let fits = text.parse::<u128>().is_ok_and(|v| v <= 1u128 << (bits - 1));
+            if !fits {
+                return Err(TypeError { span, kind: TypeErrorKind::LiteralOutOfRange { text, ty: resolved } });
+            }
+        }
+        self.pending_literals = still_open;
+        Ok(())
+    }
+
     pub(crate) fn check_pending_constraints_and_indices(&mut self) -> Result<(), TypeError> {
+        self.check_literal_ranges()?;
         loop {
             let before = self.constraints.len() + self.pending_indices.len();
             self.check_pending_constraints()?;
@@ -6520,9 +6566,13 @@ impl<'r> Infer<'r> {
             // (`doc/plan-spawn.md`, §1).
             ExprKind::Spawn(call) => self.infer_expr(env, call),
             ExprKind::NumberLit { suffix, text } => match suffix {
-                Some(s) => Ok(Ty::Con(s.clone())),
+                Some(s) => {
+                    self.pending_literals.push((Ty::Con(s.clone()), text.clone(), expr.span));
+                    Ok(Ty::Con(s.clone()))
+                }
                 None => {
                     let v = self.vars.fresh();
+                    self.pending_literals.push((v.clone(), text.clone(), expr.span));
                     if let Ty::Var(id) = v {
                         let is_float =
                             text.contains('.') || text.contains('e') || text.contains('E');

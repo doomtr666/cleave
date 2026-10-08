@@ -580,6 +580,10 @@ fn a_tuple_of_owned_structs_leaves_nothing_behind() {
 /// 8 rows on a side: Muon's Newton-Schulz on a 10-row one hits the matmul
 /// schedule's own open bug (`doc/backlog.md`, the row tile of 8).
 fn array_model_program(opt: &str, steps: u32) -> String {
+    array_model_program_with(opt, steps, "net_grad(x, y, net)")
+}
+
+fn array_model_program_with(opt: &str, steps: u32, grad: &str) -> String {
     format!(
         "
         use nn;
@@ -598,6 +602,10 @@ fn array_model_program(opt: &str, steps: u32) -> String {
             sum(err * err)
         }}
         net_grad = grad(loss, net);
+        fn split_grad(x: Tensor<f32, 32, 16>, y: Tensor<f32, 32, 16>, net: Net) -> Net {{
+            let parts = [for j in 0..2: spawn net_grad(x, y, net)];
+            accumulate(parts[0], parts[1])
+        }}
         fn main() -> i32 {{
             rand_seed(1);
             let a = new_layer();
@@ -609,12 +617,23 @@ fn array_model_program(opt: &str, steps: u32) -> String {
             let x: Tensor<f32, 32, 16> = Init::he();
             let y: Tensor<f32, 32, 16> = Init::he();
             for s in 0..{steps} {{
-                let g = net_grad(x, y, net);
+                let g = {grad};
                 (net, state) = step(opt, net, g, state);
             }};
             1
         }}
     "
+    )
+}
+
+/// `array_model_program` with the gradient of each step computed as nanoLM's
+/// `parallel_grad` does: an array of gradients, each a model holding an
+/// array of layers, summed (`accumulate`).
+fn array_model_program_split(opt: &str, steps: u32) -> String {
+    array_model_program_with(
+        opt,
+        steps,
+        "split_grad(x, y, net)",
     )
 }
 
@@ -696,4 +715,56 @@ fn overwriting_an_array_element_releases_the_previous_one() {
         })
         .collect();
     assert!(leaks.iter().all(|(_, l)| *l < NOISE), "bytes leaked per store: {leaks:?}");
+}
+
+/// The gradients of a step summed from an array of gradients of a model
+/// holding an array of layers (nanoLM's `parallel_grad`): each released once
+/// summed, the array and its models with it.
+#[test]
+fn summing_an_array_of_gradients_of_an_array_model_leaves_no_allocation_behind() {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| {
+            let (r_short, short) = run_counting(&array_model_program_split("Sgd(lr: 0.01)", 8));
+            let (r_long, long) = run_counting(&array_model_program_split("Sgd(lr: 0.01)", 72));
+            assert_eq!((r_short, r_long), (1, 1));
+            let per_step = (long - short) / 64;
+            assert!(per_step < NOISE, "{per_step} bytes leaked per step");
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+
+/// `[v; N]` of a struct holding a tensor (`v` a variable: `[mk(); N]` calls
+/// `mk` N times, an ordinary array), built and read each iteration: the
+/// array holds N references to `v` (retained N times), and is released with
+/// them; nothing left behind, nothing freed twice.
+#[test]
+fn a_repeated_struct_array_leaves_nothing_behind() {
+    let program = |steps: u32| {
+        format!(
+            "
+            use nn;
+            struct L {{ d: Tensor<f32, 16, 16> }}
+            fn mk() -> L {{ L(d: Init::he()) }}
+            fn main() -> i32 {{
+                rand_seed(1);
+                let mut keep = mk();
+                for s in 0..{steps} {{
+                    let v = mk();
+                    let a = [v; 3];
+                    keep = a[2];
+                }};
+                if sum(keep.d) == sum(keep.d) {{ 1 }} else {{ 0 }}
+            }}
+            "
+        )
+    };
+    let (r_short, short) = run_counting(&program(8));
+    let (r_long, long) = run_counting(&program(72));
+    assert_eq!((r_short, r_long), (1, 1));
+    let per_step = (long - short) / 64;
+    assert!(per_step < NOISE, "{per_step} bytes leaked per step");
 }

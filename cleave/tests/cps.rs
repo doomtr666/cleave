@@ -739,19 +739,18 @@ fn the_original_unspecialized_higher_order_callee_is_never_itself_converted() {
     assert!(out.contains("(fn apply[f="), "got:\n{out}");
 }
 
-/// The two open risks the closure-conversion plan flagged explicitly as
-/// needing an explicit guard, not a silent misconversion — a bare lambda
-/// *literal* (no prior `let`) used directly as a call argument. Neither
-/// Stage A's own lambda-call resolution (needs a `let`-bound name) nor
-/// Stage B's own higher-order-argument detection (needs a `Path` argument)
-/// recognizes this shape at all — it falls through to `convert_expr`'s own
-/// `Lambda` catch-all, which panics clearly rather than silently producing
-/// a wrong (or missing) conversion.
+/// A bare lambda *literal* (no prior `let`) passed directly as a call
+/// argument is bound by name first (`lower.rs::hoist_lambda_args`), so the
+/// callee is specialized for it exactly as for a `let`-bound one (above). It
+/// used to fall through to `convert_expr`'s `Lambda` catch-all and panic.
 #[test]
-#[should_panic(expected = "CPS doesn't support")]
-fn a_bare_lambda_literal_passed_directly_as_an_argument_panics_cleanly() {
-    cps("fn apply(f: (i32) -> i32, x: i32) -> i32 { f(x) }
+fn a_bare_lambda_literal_passed_directly_as_an_argument_specializes_the_callee() {
+    let out = cps("fn apply(f: (i32) -> i32, x: i32) -> i32 { f(x) }
          fn main() -> i32 { apply(fn(x) { x + 1 }, 5) }");
+    assert!(!out.contains("(fn apply ("), "the un-specialized `apply` must never be emitted, got:
+{out}");
+    assert!(out.contains("(fn apply[f="), "got:
+{out}");
 }
 
 // ------------------------------------------------------------ egg integration (Stage 1)

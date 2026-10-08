@@ -57,6 +57,14 @@ pub struct SourceMap {
 }
 
 impl SourceMap {
+    /// The name of every file in the map: the path it was read from, for a
+    /// file read from disk.
+    pub fn file_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.files.values().map(|(name, _)| name.clone()).collect();
+        names.sort();
+        names
+    }
+
     pub fn add(&mut self, id: FileId, name: impl Into<String>, text: impl Into<String>) {
         self.files.insert(id, (name.into(), text.into()));
     }

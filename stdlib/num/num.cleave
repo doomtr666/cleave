@@ -96,24 +96,9 @@ algebra Additive<T> {
     // now, on both `--run` and `--dump-mlir` (see `main.rs`), so a real bug
     // in an axiom here is a real, silent miscompilation risk, not just a
     // wrong debug-flag output.
+    // Exact in floating point too: `a + b` and `b + a` round the same way.
+    // The laws that hold only for exact arithmetic are `ExactAdditive`'s.
     axiom add_commutative(a, b): add(a, b) == add(b, a);
-    // Only ever fires for an integer `T` in practice — a float literal has
-    // no e-graph representation yet (`egraph.rs`'s own module doc comment:
-    // `CVal::Float` is out of scope for now), so a segment involving `x +
-    // 0.0` simply never finishes translating far enough to match this,
-    // rather than firing unsoundly on it.
-    axiom add_zero(a): add(a, 0) == a;
-    // Associativity of `add`/`sub` — a real, generically true ring law
-    // (`a+b-c = a+(b-c)`), not a bespoke cancellation rule: this is what
-    // lets a case like `10 + x - 10` actually regroup so the two literal
-    // `10`s become siblings of the same node (`sub(10, 10)`) — only *then*
-    // is there a genuinely fully-constant subtree for `ConstantFold` to
-    // fold on its own (it can't look "through" an unrelated `x` in
-    // between), after which `add_zero` above finishes the job. Composes
-    // with `add_commutative`/`ConstantFold`/`add_zero` automatically —
-    // equality saturation's whole point — rather than needing a dedicated
-    // axiom per shape.
-    axiom add_sub_assoc(a, b, c): sub(add(a, b), c) == add(a, sub(b, c));
 
     // `doc/backlog-done.md`'s own "Auto-diff v1 -> algebra-declared rules"
     // item — a derivative rule declared right here, alongside the axioms,
@@ -204,6 +189,24 @@ algebra Ring<T> : Additive {
 // wrap a redundant `negi`, confirmed directly against melior's own
 // `dialect::arith` module) — `mlir::arith::subi(0, a)` through the exact
 // same generic mechanism every other op here already uses, no special case.
+// The laws of `+` and `-` that hold only where they are exact: integers
+// (wrapping arithmetic included), not floating point, where `(a + b) - c`
+// and `a + (b - c)` round differently (`(1e8 + 1) - 1e8` is `0` in `f32`,
+// `1e8 - 1e8 + 1` is `1`) and `-0.0 + 0` is `+0.0`. An impl says its type's
+// `+` and `-` are exact; the e-graph applies these laws to that type only
+// (`egraph.rs::axiom_rewrites`). Together they let `10 + x - 10` fold to
+// `x`: associativity regroups the two `10`s into `sub(10, 10)`, constant
+// folding makes it `0`, `add_zero` finishes.
+algebra ExactAdditive<T> {
+    axiom add_zero(a): add(a, 0) == a;
+    axiom add_sub_assoc(a, b, c): sub(add(a, b), c) == add(a, sub(b, c));
+}
+
+impl ExactAdditive<i8> {}
+impl ExactAdditive<i16> {}
+impl ExactAdditive<i32> {}
+impl ExactAdditive<i64> {}
+
 impl Additive<i8> {
     fn add(a: i8, b: i8) -> i8 { mlir::arith::addi(a, b) }
     fn sub(a: i8, b: i8) -> i8 { mlir::arith::subi(a, b) }

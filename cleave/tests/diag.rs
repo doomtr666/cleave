@@ -74,3 +74,49 @@ fn missing_file_falls_back_to_unknown_rather_than_panicking() {
     let sources = SourceMap::default();
     assert_eq!(sources.render(&diag), "<unknown>: error: oops");
 }
+
+/// Compiles `src` with the real CLI, returning what it printed to stderr.
+fn cli_stderr(name: &str, src: &str) -> String {
+    let dir = std::env::temp_dir().join("cleave-diag-tests");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, src).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--no-tasks", "--no-debug-info", "--run"])
+        .arg(&path)
+        .output()
+        .expect("cannot run cleave");
+    String::from_utf8_lossy(&output.stderr).to_string() + &String::from_utf8_lossy(&output.stdout)
+}
+
+/// An integer literal that doesn't fit its type is a located error: past
+/// `i64` (it used to panic the compiler), and past a narrower type (`300`
+/// as an `i8` used to wrap silently to `44`). The extremes still fit,
+/// `-128` included (`-` applied to `128`).
+#[test]
+fn an_integer_literal_that_does_not_fit_its_type_is_an_error() {
+    let big = cli_stderr("big_literal.cleave", "fn main() -> i32 { let x: i64 = 99999999999999999999; if x > 0 { 1 } else { 0 } }\n");
+    assert!(big.contains(":1:33: error: the literal `99999999999999999999` doesn't fit in `i64`"), "{big}");
+    let narrow = cli_stderr("narrow_literal.cleave", "fn main() -> i32 { let x: i8 = 300; if x < 100 { 1 } else { 0 } }\n");
+    assert!(narrow.contains(":1:32: error: the literal `300` doesn't fit in `i8`"), "{narrow}");
+    let extremes = cli_stderr(
+        "extreme_literals.cleave",
+        "fn main() -> i32 { let x: i8 = -128; let y: i8 = 127; let z: i32 = 2147483647; let w: i64 = 9223372036854775807; if x < y and z > 0 and w > 0 { 1 } else { 0 } }\n",
+    );
+    assert!(extremes.contains("main returned: 1"), "{extremes}");
+}
+
+/// A lambda written in place as a call's argument is bound by name first and
+/// the callee specialized for it, like a comprehension's function; a lambda
+/// used as any other value (an array element) is a located error, where both
+/// used to panic the compiler.
+#[test]
+fn a_lambda_passed_in_place_runs_and_one_stored_is_an_error() {
+    let passed = cli_stderr(
+        "lambda_argument.cleave",
+        "fn apply(f: (i32) -> i32, x: i32) -> i32 { f(x) }\nfn main() -> i32 { apply(fn(x: i32) -> i32 { x + 1 }, 3) }\n",
+    );
+    assert!(passed.contains("main returned: 4"), "{passed}");
+    let stored = cli_stderr("lambda_stored.cleave", "fn main() -> i32 { let g = fn(x: i32) -> i32 { x + 1 }; let h = [g]; 1 }\n");
+    assert!(stored.contains(":1:66: error: `g` used as a value"), "{stored}");
+}

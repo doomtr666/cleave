@@ -77,7 +77,6 @@ pub struct Build {
     tasks: Option<bool>,
     chain_split: Option<bool>,
     affine_structs: Option<bool>,
-    tag_releases: Option<bool>,
     debug_info: Option<bool>,
     defines: Vec<(String, String)>,
 }
@@ -104,7 +103,6 @@ impl Build {
             tasks: None,
             chain_split: None,
             affine_structs: None,
-            tag_releases: None,
             debug_info: None,
             defines: Vec::new(),
         }
@@ -194,13 +192,6 @@ impl Build {
     /// comment.
     pub fn affine_structs(&mut self, enabled: bool) -> &mut Self {
         self.affine_structs = Some(enabled);
-        self
-    }
-
-    /// See `cleave::pipeline::CodegenOptions::tag_releases`'s own doc
-    /// comment.
-    pub fn tag_releases(&mut self, enabled: bool) -> &mut Self {
-        self.tag_releases = Some(enabled);
         self
     }
 
@@ -308,7 +299,6 @@ impl Build {
             tasks: self.tasks.unwrap_or(defaults.tasks),
             chain_split: self.chain_split.unwrap_or(defaults.chain_split),
             affine_structs: self.affine_structs.unwrap_or(defaults.affine_structs),
-            tag_releases: self.tag_releases.unwrap_or(defaults.tag_releases),
             debug_info: self.debug_info.unwrap_or(defaults.debug_info),
         };
 
@@ -341,7 +331,17 @@ impl Build {
                 .unwrap_or_else(|e| std::panic::resume_unwind(e))
         });
         let needs_openmp = match result {
-            Ok(needs_openmp) => needs_openmp,
+            Ok(emitted) => {
+                // Every file the compile read, stdlib modules included: a
+                // change to any of them rebuilds the kernel (the stdlib is
+                // read from disk, not compiled into `cleave`).
+                for file in &emitted.loaded_files {
+                    if Path::new(file).is_file() {
+                        println!("cargo:rerun-if-changed={file}");
+                    }
+                }
+                emitted.needs_openmp
+            }
             Err(errs) => panic!("cleave-build: failed to compile `{name}`:\n{}", errs.join("\n")),
         };
 

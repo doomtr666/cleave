@@ -19,6 +19,69 @@ fn per_token(nats: f32) -> String {
 /// When the previous round ended (or training started), for `round_done`'s timings.
 static ROUND: Mutex<Option<(Instant, Instant, i32)>> = Mutex::new(None);
 
+/// The phases of a training step (`phase_done`): the gradient, its clipping, the optimizer's
+/// step, then the round's checkpoint and evaluation; the time spent in each since the last round.
+const PHASES: [&str; 4] = ["gradient", "clipping", "optimizer", "checkpoint and evaluation"];
+
+/// Per phase since the last round: wall seconds and the process's CPU seconds (all threads), from
+/// the last mark (wall, CPU).
+struct PhaseTimes {
+    last: (Instant, f64),
+    wall: [f64; 4],
+    cpu: [f64; 4],
+    kernel: [f64; 4],
+    last_kernel: f64,
+}
+static PHASE_TIMES: Mutex<Option<PhaseTimes>> = Mutex::new(None);
+
+unsafe extern "C" {
+    fn cleave_parallel_threads() -> i32;
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetCurrentProcess() -> isize;
+    fn GetProcessTimes(process: isize, creation: *mut u64, exit: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
+}
+
+/// The CPU time the process has used so far, in seconds, every thread together, and the part of
+/// it in the system's kernel (page faults, zeroing new pages).
+fn process_cpu_seconds() -> (f64, f64) {
+    #[cfg(windows)]
+    unsafe {
+        let (mut creation, mut exit, mut kernel, mut user) = (0u64, 0u64, 0u64, 0u64);
+        if GetProcessTimes(GetCurrentProcess(), &mut creation, &mut exit, &mut kernel, &mut user) != 0 {
+            return ((kernel + user) as f64 * 1e-7, kernel as f64 * 1e-7);
+        }
+    }
+    (0.0, 0.0)
+}
+
+fn fresh_phases(now: Instant) -> PhaseTimes {
+    let (cpu, kernel) = process_cpu_seconds();
+    PhaseTimes { last: (now, cpu), wall: [0.0; 4], cpu: [0.0; 4], kernel: [0.0; 4], last_kernel: kernel }
+}
+
+fn mark_phases(now: Instant) {
+    *PHASE_TIMES.lock().unwrap() = Some(fresh_phases(now));
+}
+
+/// Called by the kernel at the end of phase `phase` (`PHASES`): the time since the previous call (or
+/// the previous round's end) goes to that phase.
+#[unsafe(no_mangle)]
+pub extern "C" fn phase_done(phase: i32) {
+    let now = Instant::now();
+    let (cpu, kernel) = process_cpu_seconds();
+    let mut times = PHASE_TIMES.lock().unwrap();
+    let t = times.get_or_insert_with(|| fresh_phases(now));
+    t.wall[phase as usize] += (now - t.last.0).as_secs_f64();
+    t.cpu[phase as usize] += cpu - t.last.1;
+    t.kernel[phase as usize] += kernel - t.last_kernel;
+    t.last = (now, cpu);
+    t.last_kernel = kernel;
+}
+
 /// Where `gpt.ckpt` stands, next to it: the step its model was saved at, so that resuming
 /// continues the learning rate schedule and the batches from there. In a file of its own, the
 /// checkpoint's format unchanged.
@@ -34,6 +97,7 @@ pub extern "C" fn round_done(step: i32, train_loss: f32, validation_loss: f32, r
     match *round {
         None => {
             println!("step {step}: validation {}, learning rate {rate:.6}", per_token(validation_loss));
+            mark_phases(now);
             *round = Some((now, now, step));
         }
         Some((start, last, last_step)) => {
@@ -46,6 +110,32 @@ pub extern "C" fn round_done(step: i32, train_loss: f32, validation_loss: f32, r
                 per_token(validation_loss),
                 (now - start).as_secs_f64() / 60.0
             );
+            // The round's phases, per step; the checkpoint and evaluation ran once, in this call's
+            // arguments.
+            // Each phase's CPU use: the share of the team's threads busy (CPU time over wall time
+            // times threads).
+            let mut times = PHASE_TIMES.lock().unwrap();
+            if let Some(t) = times.as_mut() {
+                let (cpu, kernel) = process_cpu_seconds();
+                t.wall[3] += (now - t.last.0).as_secs_f64();
+                t.cpu[3] += cpu - t.last.1;
+                t.kernel[3] += kernel - t.last_kernel;
+                let steps = f64::from((step - last_step).max(1));
+                let threads = f64::from(unsafe { cleave_parallel_threads() }.max(1));
+                let parts: Vec<String> = PHASES
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| {
+                        let per = if i == 3 { t.wall[i] } else { t.wall[i] / steps };
+                        let busy = 100.0 * t.cpu[i] / (t.wall[i] * threads).max(1e-9);
+                        let system = 100.0 * t.kernel[i] / t.cpu[i].max(1e-9);
+                        format!("{name} {:.0} ms ({busy:.0}% busy, {system:.0}% of it in the system)", per * 1000.0)
+                    })
+                    .collect();
+                println!("  per step: {}; once per round: {}", parts[..3].join(", "), parts[3]);
+                drop(times);
+                mark_phases(now);
+            }
             *round = Some((start, now, step));
         }
     }
@@ -59,11 +149,17 @@ fn main() {
     std::env::set_current_dir(&cache).expect("cannot enter the cache directory");
     let which = std::env::args().nth(1).unwrap_or_else(|| "lm".to_string());
     if which == "gpt" || which == "bench" || which == "write" {
-        // One directory per model size and vocabulary: its checkpoints don't fit another. `bench` trains
+        // One directory per model size, context and vocabulary: its checkpoints don't fit another. `bench` trains
         // exactly as `gpt` does, in a directory of its own, so that a comparison run against the
         // PyTorch twin never overwrites the real run's checkpoints.
         let suffix = if which == "bench" { "-bench" } else { "" };
-        let dir = format!("nanolm2-d{}-l{}-v{}{suffix}", unsafe { gpt_width() }, unsafe { gpt_layers() }, data::VOCAB);
+        let dir = format!(
+            "nanolm2-d{}-l{}-t{}-v{}{suffix}",
+            unsafe { gpt_width() },
+            unsafe { gpt_layers() },
+            data::T,
+            data::VOCAB
+        );
         std::fs::create_dir_all(&dir).expect("cannot create the model's checkpoint directory");
         std::env::set_current_dir(&dir).expect("cannot enter the model's checkpoint directory");
         eprintln!("checkpoints in .cache/{dir}");

@@ -260,3 +260,47 @@ fn a_struct_field_read_lets_add_zero_fold_a_real_call_away_and_the_optimized_pro
         "the axiom-optimized program must produce the identical result"
     );
 }
+
+/// Runs the real CLI on `src` with `args`, returning its stdout.
+fn cli(name: &str, src: &str, args: &[&str]) -> String {
+    let dir = std::env::temp_dir().join("cleave-egraph-tests");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, src).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--no-tasks", "--no-debug-info"])
+        .args(args)
+        .arg(&path)
+        .output()
+        .expect("cannot run cleave");
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+/// The laws of `+` and `-` that hold only for exact arithmetic
+/// (`ExactAdditive`: `a + 0 == a`, `(a + b) - c == a + (b - c)`) apply to
+/// integers and not to floats. In `f32`, `(1e8 + 1) - 1e8` is `0` (`1e8 + 1`
+/// rounds to `1e8`), regrouped it would be `1`; `-0.0 + 0.0` is `+0.0`,
+/// folded it would stay `-0.0`. On integers they still fold `10 + x - 10` to
+/// `x`.
+#[test]
+fn exact_arithmetic_laws_fold_integers_and_leave_floats_as_written() {
+    let floats = "
+        fn f(x: f32, y: f32, z: f32) -> f32 { (x + y) - z }
+        fn g(x: f32) -> f32 { x + 0.0 }
+        fn main() -> i32 {
+            let a = f(1.0e8, 1.0, 1.0e8);
+            let b = g(-0.0);
+            if a == 0.0 and 1.0 / b > 0.0 { 1 } else { 0 }
+        }
+    ";
+    let out = cli("exact_floats.cleave", floats, &["--run"]);
+    assert!(out.contains("main returned: 1"), "floats regrouped or folded: {out}");
+
+    let ints = "
+        fn f(x: i32) -> i32 { 10 + x - 10 }
+        fn main() -> i32 { f(7) }
+    ";
+    let cps = cli("exact_ints.cleave", ints, &["--dump-cps-optimized"]);
+    let f: String = cps.lines().skip_while(|l| !l.starts_with("(fn f ")).take_while(|l| *l != ")").collect::<Vec<_>>().join("\n");
+    assert!(!f.contains("Additive::"), "`10 + x - 10` wasn't folded to `x`:\n{f}");
+}

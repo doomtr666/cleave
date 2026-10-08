@@ -65,7 +65,6 @@ struct Args {
     tasks: Option<bool>,
     chain_split: Option<bool>,
     affine_structs: Option<bool>,
-    tag_releases: Option<bool>,
     debug_info: Option<bool>,
     /// `--define NAME=VALUE`, repeatable -- `grammar.pest`'s own
     /// `define_decl` doc comment. Collected raw here; parsed/validated
@@ -102,7 +101,6 @@ fn parse_args() -> Result<Args, String> {
     let mut tasks: Option<bool> = None;
     let mut chain_split: Option<bool> = None;
     let mut affine_structs: Option<bool> = None;
-    let mut tag_releases: Option<bool> = None;
     let mut debug_info: Option<bool> = None;
     let mut defines: Vec<(String, String)> = Vec::new();
 
@@ -197,8 +195,6 @@ fn parse_args() -> Result<Args, String> {
             "--no-chain-split" => chain_split = Some(false),
             "--affine-structs" => affine_structs = Some(true),
             "--no-affine-structs" => affine_structs = Some(false),
-            "--tag-releases" => tag_releases = Some(true),
-            "--no-tag-releases" => tag_releases = Some(false),
             "--debug-info" => debug_info = Some(true),
             "--no-debug-info" => debug_info = Some(false),
             "--define" => {
@@ -270,7 +266,6 @@ fn parse_args() -> Result<Args, String> {
             tasks,
             chain_split,
             affine_structs,
-            tag_releases,
             debug_info,
             defines,
         }),
@@ -281,7 +276,6 @@ fn parse_args() -> Result<Args, String> {
              [--opt-level <0-3>] [--openmp | --no-openmp] [--target-cpu <name>] [--target-features <+f,-f,...>] \
              [--backend cpu] [--inline | --no-inline] [--unroll-jam | --no-unroll-jam] \
              [--chain-split | --no-chain-split] [--affine-structs | --no-affine-structs] \
-             [--tag-releases | --no-tag-releases] \
              [--debug-info | --no-debug-info] [--define NAME=VALUE]..."
                 .to_string(),
         ),
@@ -339,7 +333,6 @@ fn resolve_codegen_options(args: &Args) -> Result<CodegenOptions, String> {
         tasks: args.tasks.unwrap_or(defaults.tasks),
         chain_split: args.chain_split.unwrap_or(defaults.chain_split),
         affine_structs: args.affine_structs.unwrap_or(defaults.affine_structs),
-        tag_releases: args.tag_releases.unwrap_or(defaults.tag_releases),
         debug_info: args.debug_info.unwrap_or(defaults.debug_info),
     })
 }

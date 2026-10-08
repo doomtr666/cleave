@@ -212,12 +212,12 @@ unsafe fn rc_header(ptr: *mut u8) -> *mut RcHeader {
 /// per-header-private, no need to serialize those too).
 static POOL_LOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-// TEMP debug instrumentation (`CLEAVE_DEBUG_POOL=1`) -- reproducing the
-// bare-tensor-seeding fix's own previously-reverted, never-root-caused
-// `STATUS_ACCESS_VIOLATION` (`doc/backlog-done.md`'s own "Scale::scale
-// leak" writeup) -- mirrors the exact `PARKED`-set technique that
-// root-caused the earlier `println` double-free precisely. Remove once
-// this crash is root-caused.
+// `CLEAVE_DEBUG_POOL=1` -- the pool checks every block it hands out and takes
+// back against the set of freed ones (`PARKED`): a retain or release of a
+// freed block, or a block freed twice, stops the program at once, naming the
+// block, its allocation and the offending call's source line. Slow (a global
+// set touched on every allocation and release), for finding a refcounting
+// error; `tests/examples.rs` runs every example under it.
 static CLEAVE_DEBUG_POOL: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("CLEAVE_DEBUG_POOL").is_ok());
 static PARKED: std::sync::Mutex<Option<std::collections::HashSet<usize>>> =
@@ -232,37 +232,10 @@ fn parked_contains(base: usize) -> bool {
     PARKED.lock().unwrap().get_or_insert_with(Default::default).contains(&base)
 }
 
-// TEMP debug instrumentation (`CLEAVE_COUNT_PARKED_HITS=1`) -- a real,
-// separate mode from `CLEAVE_DEBUG_POOL`'s own crash-on-first-hit one:
-// makes `PARKED` tracking always-on (same real ~50-100x slowdown already
-// measured and documented, `doc/backlog.md`'s own still-open double-
-// release entry -- accepted here on purpose, for one bounded diagnostic
-// run, not a production setting) and, instead of crashing, counts and
-// prints only *distinct* offending addresses (never the same one twice) --
-// the total-occurrence count alone (tens of thousands per epoch, already
-// known) doesn't say whether this is a small, fixed, recurring set of
-// tensors or a constantly-growing one; this does. `cleave_release` keeps
-// running normally otherwise (silent no-op on a repeat hit of an address
-// already counted, exactly like the reverted always-on safety net did).
-static CLEAVE_COUNT_PARKED_HITS: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| std::env::var("CLEAVE_COUNT_PARKED_HITS").is_ok());
-static PARKED_HITS: std::sync::Mutex<Option<std::collections::HashSet<usize>>> =
-    std::sync::Mutex::new(None);
-/// `true` the first time `base` is seen, `false` on every repeat.
-fn record_parked_hit(base: usize) -> bool {
-    PARKED_HITS.lock().unwrap().get_or_insert_with(Default::default).insert(base)
-}
-
-// TEMP debug instrumentation (`CLEAVE_TRACE_RC=1`) -- a per-call retain/
-// release ledger (pointer, resulting refcount, real cleave source line),
-// for a *small*, deliberately minimal repro only (`Dense`+`Sgd` alone, a
-// handful of iterations) -- hand-tracing the equivalent from a `--dump-
-// cps-optimized` text dump turned out too error-prone given this project's
-// own established (and correct) redundant-retain/redundant-release
-// bookkeeping for nested light structs; this gets the same ledger
-// empirically instead. Remove once the real gap is found. Never intended
-// for a real, full-size training run -- one line per retain/release would
-// flood any real workload.
+// `CLEAVE_TRACE_RC=1` -- a ledger of every allocation, retain and release
+// (block, allocation serial, resulting count, cleave source line), for a
+// small reproduction: one line per call floods a real workload
+// (`CLEAVE_TRACE_SIZE` narrows it to one size).
 static CLEAVE_TRACE_RC: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("CLEAVE_TRACE_RC").is_ok());
 
@@ -280,6 +253,11 @@ static CLEAVE_TRACE_SIZE: std::sync::LazyLock<Option<i64>> = std::sync::LazyLock
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
 });
+
+/// Whether any of the checks and traces above is on: one test on
+/// `cleave_release`'s path instead of one per switch.
+static DIAGNOSTICS: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| *CLEAVE_DEBUG_POOL || *CLEAVE_TRACE_RC || CLEAVE_TRACE_SIZE.is_some());
 
 // `CLEAVE_ALLOC_STATS=1` -- every allocation counted, by call site, printed
 // to stderr at exit: how many, how many bytes, and how many missed the pool
@@ -574,9 +552,9 @@ mod alloc_stats {
     }
 }
 
-// TEMP, alongside `CLEAVE_TRACE_RC` above: the pool freely reuses a freed
-// block's own address for a *later*, logically unrelated allocation, which
-// makes a raw-pointer-keyed trace genuinely ambiguous -- "released twice"
+// For `CLEAVE_TRACE_RC` and `CLEAVE_DEBUG_POOL`'s messages: the pool reuses a
+// freed block's address for a later, unrelated allocation, which makes a
+// trace keyed by pointer ambiguous -- "released twice"
 // and "released once each, for two different allocations that happened to
 // share an address" print identically. A monotonic serial number, assigned
 // fresh on *every* `cleave_alloc_rc` call (pooled-reuse or genuinely new
@@ -706,8 +684,11 @@ const THREAD_CACHE_MAX_BLOCK: usize = 256 << 10;
 static NO_THREAD_CACHE: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var_os("CLEAVE_NO_THREAD_CACHE").is_some());
 
+/// Blocks of `class` a thread keeps: `THREAD_CACHE_BYTES` per doubling of
+/// size, shared by its `1 << CLASS_STEP_BITS` classes. Per class, the finer
+/// classes multiplied what a thread could hoard by as many.
 fn thread_cache_cap(class: usize) -> usize {
-    (THREAD_CACHE_BYTES / class_bytes(class)).max(1)
+    ((THREAD_CACHE_BYTES >> CLASS_STEP_BITS) / class_bytes(class)).max(1)
 }
 
 /// Whether blocks of `class` go through the thread caches at all.
@@ -985,7 +966,7 @@ pub extern "C" fn cleave_alloc_rc(data_size: i64) -> *mut u8 {
             // to this thread alone, so no other thread can push or pop it
             // while this runs (`pool_push` marks a block parked *before*
             // caching it, for the same reason).
-            if *CLEAVE_DEBUG_POOL || *CLEAVE_COUNT_PARKED_HITS {
+            if *CLEAVE_DEBUG_POOL {
                 if let Some(block) = popped {
                     if !parked_remove(block as usize) && *CLEAVE_DEBUG_POOL {
                         eprintln!(
@@ -1044,16 +1025,6 @@ pub unsafe extern "C" fn cleave_retain(ptr: *mut u8) {
         let base = block_base(header);
         if *CLEAVE_DEBUG_POOL && parked_contains(base as usize) {
             eprintln!("CLEAVE_DEBUG_POOL: cleave_retain on parked (already-freed) block {:p}", base);
-        }
-        // `CLEAVE_COUNT_PARKED_HITS` -- same safe no-op as `cleave_
-        // release`'s own, not counted separately here (the whole bug this
-        // is diagnosing has, so far, only ever been observed as a double
-        // *release* -- zero retains ever recorded on the one crashing
-        // allocation traced precisely this session): only guards against
-        // corrupting the free list if a retain ever *does* reach a parked
-        // block under this mode.
-        if *CLEAVE_COUNT_PARKED_HITS && parked_contains(base as usize) {
-            return;
         }
         if *CLEAVE_TRACE_RC {
             eprintln!(
@@ -1128,109 +1099,71 @@ unsafe fn refcount_of<'a>(header: *mut RcHeader) -> &'a std::sync::atomic::Atomi
 /// begin with, and not worth that cost for a partial one. Left `CLEAVE_
 /// DEBUG_POOL`-gated, as originally built, until the real extra release
 /// call is found and removed at the source.
-/// TEMP, diagnostic-only: the CPS `CVar` id of whichever `PrimOp::Release`
-/// site last called `cleave_release_tagged` -- lets a debugger sitting on
-/// `cleave_release`'s own `CLEAVE_DEBUG_POOL` fatal branch identify exactly
-/// *which* compile-time release site produced a given runtime `cleave_
-/// release` call, by reading this static at the crash. Only ever written to
-/// when `mlir_lower.rs` emits tagged calls (`CLEAVE_TAG_RELEASES=1` at
-/// compile time) -- remove once the still-open double-release bug (`doc/
-/// backlog.md`) is found.
-static LAST_RELEASE_TAG: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
-
-/// TEMP, diagnostic-only companion to `cleave_release` -- see `LAST_RELEASE_
-/// TAG`'s own doc comment. `mlir_lower.rs` emits calls to this instead of
-/// `cleave_release` only when `CLEAVE_TAG_RELEASES=1` at compile time, so it
-/// is never linked into an ordinary (or test) build.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn cleave_release_tagged(ptr: *mut u8, tag: i64) -> bool {
-    LAST_RELEASE_TAG.store(tag, std::sync::atomic::Ordering::Relaxed);
-    unsafe { cleave_release(ptr) }
-}
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cleave_release(ptr: *mut u8) -> bool {
     unsafe {
         let header = rc_header(ptr);
         let base = block_base(header);
-        if *CLEAVE_DEBUG_POOL && parked_contains(base as usize) {
-            eprintln!(
-                "CLEAVE_DEBUG_POOL: cleave_release on parked (already-freed) block {:p} #{}, refcount={}, data_size={}, tag={}",
-                base,
-                current_alloc_serial(base as usize).map_or("?".to_string(), |s| s.to_string()),
-                (*header).refcount,
-                // `data_size` survives being parked untouched -- the free-
-                // list's own "next" link overwrites only the block's first
-                // 8 bytes (at most `refcount`'s own slot, for a compact
-                // block), so this is still the block's real original
-                // allocation size, a real clue to which tensor shape this is.
-                (*header).data_size,
-                LAST_RELEASE_TAG.load(std::sync::atomic::Ordering::Relaxed),
-            );
-            // The *offending* release's own entry point and source position
-            // -- the one thing this message was missing to be directly
-            // actionable. `CLEAVE_TRACE_SIZE`'s own ledger already gives
-            // every *earlier* allocate/retain/release site for the same
-            // block, so this closes the loop: which release is the second
-            // one, and which of the two ownership systems emitted it.
-            eprintln!(
-                "CLEAVE_DEBUG_POOL:   offending release via {} at {}",
-                release_entry_point(),
-                first_cleave_frame()
-            );
-            // A real breakpoint exception, not `backtrace`'s own runtime
-            // walk -- that crate hits a real, unavoidable limit for a call
-            // site inside a function whose own Win64 unwind info isn't
-            // registered at this FFI boundary (deeply-inlined/vectorized
-            // functions, mostly). Now that real debug info is generated
-            // (`pipeline.rs`'s own `DISubprogram` emission), a debugger
-            // attached at this exact point (`cdb -g -G -c "g;kb;q"`, say)
-            // resolves the *real* call stack, inlined frames included, off
-            // the PDB directly -- no such limitation. Falls through to the
-            // same `exit(97)` when nothing is attached to catch it.
-            #[cfg(target_arch = "x86_64")]
-            std::arch::asm!("int3");
-            std::process::exit(97);
-        }
-        // `CLEAVE_COUNT_PARKED_HITS` -- see this static's own doc comment.
-        // A *separate* mode from `CLEAVE_DEBUG_POOL` above: never crashes,
-        // counts and prints only the first time each distinct address is
-        // hit, then safely no-ops (same reasoning as the reverted always-on
-        // guard: nothing left to release, cascading into this container's
-        // own fields would be wrong too, `false` correctly skips that).
-        if *CLEAVE_COUNT_PARKED_HITS && parked_contains(base as usize) {
-            if record_parked_hit(base as usize) {
-                let seen = PARKED_HITS.lock().unwrap().as_ref().map_or(0, |s| s.len());
+        if *DIAGNOSTICS {
+            if *CLEAVE_DEBUG_POOL && parked_contains(base as usize) {
                 eprintln!(
-                    "CLEAVE_COUNT_PARKED_HITS: new distinct offender #{seen}: block {:p} #{}  {}",
+                    "CLEAVE_DEBUG_POOL: cleave_release on parked (already-freed) block {:p} #{}, refcount={}, data_size={}",
                     base,
                     current_alloc_serial(base as usize).map_or("?".to_string(), |s| s.to_string()),
+                    (*header).refcount,
+                    // `data_size` survives being parked untouched -- the free-
+                    // list's own "next" link overwrites only the block's first
+                    // 8 bytes (at most `refcount`'s own slot, for a compact
+                    // block), so this is still the block's real original
+                    // allocation size, a real clue to which tensor shape this is.
+                    (*header).data_size,
+                );
+                // The *offending* release's own entry point and source position
+                // -- the one thing this message was missing to be directly
+                // actionable. `CLEAVE_TRACE_SIZE`'s own ledger already gives
+                // every *earlier* allocate/retain/release site for the same
+                // block, so this closes the loop: which release is the second
+                // one, and which of the two ownership systems emitted it.
+                eprintln!(
+                    "CLEAVE_DEBUG_POOL:   offending release via {} at {}",
+                    release_entry_point(),
+                    first_cleave_frame()
+                );
+                // A real breakpoint exception, not `backtrace`'s own runtime
+                // walk -- that crate hits a real, unavoidable limit for a call
+                // site inside a function whose own Win64 unwind info isn't
+                // registered at this FFI boundary (deeply-inlined/vectorized
+                // functions, mostly). Now that real debug info is generated
+                // (`pipeline.rs`'s own `DISubprogram` emission), a debugger
+                // attached at this exact point (`cdb -g -G -c "g;kb;q"`, say)
+                // resolves the *real* call stack, inlined frames included, off
+                // the PDB directly -- no such limitation. Falls through to the
+                // same `exit(97)` when nothing is attached to catch it.
+                #[cfg(target_arch = "x86_64")]
+                std::arch::asm!("int3");
+                std::process::exit(97);
+            }
+            if *CLEAVE_TRACE_RC {
+                eprintln!(
+                    "RELEASE {:p} #{}  -> {}  {}",
+                    base,
+                    current_alloc_serial(base as usize).map_or("?".to_string(), |s| s.to_string()),
+                    (*header).refcount - 1,
                     first_cleave_frame()
                 );
             }
-            return false;
-        }
-        if *CLEAVE_TRACE_RC {
-            eprintln!(
-                "RELEASE {:p} #{}  -> {}  {}",
-                base,
-                current_alloc_serial(base as usize).map_or("?".to_string(), |s| s.to_string()),
-                (*header).refcount - 1,
-                first_cleave_frame()
-            );
-        }
-        if *CLEAVE_TRACE_SIZE == Some((*header).data_size) {
-            eprintln!(
-                "TRACE_SIZE release[{}] tag={} {:p} size={} rc {} -> {} in_arena={}  {}",
-                release_entry_point(),
-                LAST_RELEASE_TAG.load(std::sync::atomic::Ordering::Relaxed),
-                header,
-                (*header).data_size,
-                (*header).refcount,
-                (*header).refcount - 1,
-                is_in_arena(header as *mut u8),
-                cleave_frames()
-            );
+            if *CLEAVE_TRACE_SIZE == Some((*header).data_size) {
+                eprintln!(
+                    "TRACE_SIZE release[{}] {:p} size={} rc {} -> {} in_arena={}  {}",
+                    release_entry_point(),
+                    header,
+                    (*header).data_size,
+                    (*header).refcount,
+                    (*header).refcount - 1,
+                    is_in_arena(header as *mut u8),
+                    cleave_frames()
+                );
+            }
         }
         if refcount_of(header).fetch_sub(1, std::sync::atomic::Ordering::Release) == 1 {
             std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
@@ -1254,22 +1187,7 @@ pub unsafe extern "C" fn cleave_release(ptr: *mut u8) -> bool {
                     // rounding), so writing the free-list "next" pointer
                     // into its first 8 bytes is always in-bounds.
 
-                    // TEMP, tried as an always-on safety net (not just `CLEAVE_
-                    // DEBUG_POOL`-gated), then reverted: a global `Mutex<
-                    // HashSet>` touched on *every* alloc/release, not just
-                    // the buggy ones, measured a real ~50-100x slowdown on
-                    // `mnist-interop` (10 epochs, ~12-19s baseline per
-                    // `doc/backlog.md`'s own OpenMP sweep, vs. minutes with
-                    // this on) — and the underlying bug turned out to also
-                    // leak memory for real (a genuine `cleave_alloc_rc:
-                    // allocation failed` a few epochs in, once the crash
-                    // itself was no longer masking it), so this was never
-                    // a full fix to begin with. Kept `CLEAVE_DEBUG_POOL`-
-                    // gated, as originally built, until the real bug is
-                    // found — see `doc/backlog.md`'s own still-open entry
-                    // (`CLEAVE_COUNT_PARKED_HITS` accepts the identical
-                    // cost on purpose, for one bounded diagnostic run).
-                    if (*CLEAVE_DEBUG_POOL || *CLEAVE_COUNT_PARKED_HITS) && !parked_insert(base as usize) && *CLEAVE_DEBUG_POOL {
+                    if *CLEAVE_DEBUG_POOL && !parked_insert(base as usize) {
                         eprintln!("CLEAVE_DEBUG_POOL: block {base:p} parked twice (double-free)");
                     }
                     if *alloc_stats::ENABLED {
@@ -2774,7 +2692,66 @@ pub unsafe extern "C" fn memrefCopy(elem_size: i64, src: *const UnrankedMemRef, 
         }
     }
 }
-dynarray_width!(*mut u8, dynarray_alloc_ptr, dynarray_grow_ptr, dynarray_get_ptr, dynarray_set_ptr);
+// `DynArray<S>` of structs (`RawBuffer<S: HeapStruct>`): its slots hold
+// references, like an array's. An extern's struct argument is lent and its
+// struct result owned by the caller (`refcount.rs`), so `set` retains what it
+// stores and releases what it overwrites, and `get` retains what it hands
+// out. Without, the buffer held no reference to its elements: a point pushed
+// from an array (`examples/convex_hull.cleave`) was freed with the array,
+// then read back and released a second time. New slots are zeroed, an empty
+// slot telling itself from an element. The elements still held when the
+// `DynArray` dies are not released (its envelope has no cascade into the
+// buffer): a leak, not a dangling reference.
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dynarray_alloc_ptr(cap: i32) -> *mut *mut u8 {
+    let bytes = cap as i64 * std::mem::size_of::<*mut u8>() as i64;
+    unsafe {
+        let p = cleave_realloc(std::ptr::null_mut(), 0, bytes);
+        std::ptr::write_bytes(p, 0, bytes as usize);
+        p as *mut *mut u8
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dynarray_grow_ptr(old: *mut *mut u8, old_cap: i32, new_cap: i32) -> *mut *mut u8 {
+    let size = std::mem::size_of::<*mut u8>() as i64;
+    unsafe {
+        let p = cleave_realloc(old as *mut u8, old_cap as i64 * size, new_cap as i64 * size);
+        if new_cap > old_cap {
+            std::ptr::write_bytes(p.add((old_cap as i64 * size) as usize), 0, ((new_cap - old_cap) as i64 * size) as usize);
+        }
+        p as *mut *mut u8
+    }
+}
+
+/// # Safety
+/// `buf` must point to a live buffer of at least `i + 1` elements, slot `i`
+/// holding an element (`dynarray_set_ptr`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dynarray_get_ptr(buf: *const *mut u8, i: i32) -> *mut u8 {
+    unsafe {
+        let v = *buf.add(i as usize);
+        cleave_retain(v);
+        v
+    }
+}
+
+/// # Safety
+/// `buf` must point to a live buffer of at least `i + 1` elements, and `v`
+/// to a live struct.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dynarray_set_ptr(buf: *mut *mut u8, i: i32, v: *mut u8) {
+    unsafe {
+        cleave_retain(v);
+        let slot = buf.add(i as usize);
+        let old = *slot;
+        *slot = v;
+        if !old.is_null() {
+            cleave_release(old);
+        }
+    }
+}
 
 /// A minimal PRNG for `stdlib/rand/rand.cleave` — PCG32 (O'Neill, public
 /// domain), the "one-sequence" variant: a single 64-bit state, advanced by a

@@ -10,15 +10,12 @@
 use std::path::Path;
 use std::sync::OnceLock;
 
-/// Sequences per batch and tokens per sequence; `kernel.cleave` has the same.
-pub const B: usize = 32;
-pub const T: usize = 256;
+// Sequences per batch (`B`), tokens per sequence (`T`) and tokens in the vocabulary (`VOCAB`): the
+// kernel's `BATCH`, `CONTEXT` and `VOCAB`, read from it by `build.rs`.
+include!(concat!(env!("OUT_DIR"), "/sizes.rs"));
 
 pub const TRAIN_SEED: u64 = 0x5a01a_7a1;
 pub const VAL_SEED: u64 = 0x5a01a_7a2;
-
-/// Tokens in the vocabulary; `kernel.cleave`'s `VOCAB`.
-pub const VOCAB: usize = 4096;
 
 struct Corpus {
     bpe: crate::bpe::Bpe,

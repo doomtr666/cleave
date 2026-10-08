@@ -33,11 +33,12 @@ if FIRST != 0:
 KERNEL = Path(__file__).resolve().parents[2] / "examples" / "nanolm" / "src" / "kernel.cleave"
 DEFINES = {m[1]: int(m[2]) for m in re.finditer(r"^define (\w+): i32 = (\d+);", KERNEL.read_text(), re.M)}
 T, D, DH, HIDDEN, LAYERS = (DEFINES[k] for k in ("CONTEXT", "WIDTH", "HEAD", "HIDDEN", "LAYERS"))
-LR, MUON_LR, B = 0.001, 0.02, 32
+B = DEFINES["BATCH"]
+LR, MUON_LR = 0.001, 0.02
 WARMUP, DECAY_STEPS = DEFINES["WARMUP"], DEFINES["DECAY_STEPS"]
 CLIP = 1.0 * B * T  # `CLIP_PER_ROW * ROWS`: the loss is summed over the rows
 EPS = 1e-5
-MODEL_DIR = CACHE.parent / f"nanolm2-d{D}-l{LAYERS}-v{VOCAB}-bench"
+MODEL_DIR = CACHE.parent / f"nanolm2-d{D}-l{LAYERS}-t{T}-v{VOCAB}-bench"
 H = D // DH
 
 corpus = Corpus()

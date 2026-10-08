@@ -139,12 +139,6 @@ pub struct CodegenOptions {
     /// never remove this fallback casually (`lower_program`'s own doc
     /// comment has the full reasoning).
     pub affine_structs: bool,
-    /// Gates `mlir_lower.rs`'s own originating-`CVar`-id tagging on emitted
-    /// `cleave_release` calls -- a real debugging aid for tracking down a
-    /// leak/double-free's own source, not a performance optimization. **Off
-    /// by default** (adds real IR, no reason to pay for it unless actually
-    /// debugging a refcounting issue).
-    pub tag_releases: bool,
     /// Gates `mlir_lower.rs::build_di_subprograms`/`set_gen_subprogram`
     /// (per-function `#llvm.di_subprogram` attributes, fused into every
     /// op's location via `gen_loc`) and `lower_to_llvm`'s own `!llvm.module
@@ -200,7 +194,6 @@ impl Default for CodegenOptions {
             unroll_jam: false,
             chain_split: false,
             affine_structs: true,
-            tag_releases: false,
             debug_info: true,
             llvm_loop_unroll: true,
             tasks: true,
@@ -274,7 +267,144 @@ pub fn check_type_errors(program: &Program, registry: &Registry) -> Result<(), V
     diags.extend(check_mutability_errors(program));
     diags.extend(check_const_decl_errors(program, registry));
     diags.extend(check_impl_completeness(program, registry));
+    diags.extend(check_lambda_positions(program));
     if diags.is_empty() { Ok(()) } else { Err(diags) }
+}
+
+/// A lambda is supported bound by a `let`, then called by that name (`let f =
+/// fn(x: i32) -> i32 { x + 1 }; f(2)`) or passed by that name to a call
+/// (`apply(f, 2)`, written in place too: `apply(fn(x: i32) -> i32 { x + 1 },
+/// 2)`); as any other value (an array element, a field, a result) it isn't
+/// yet, and used to panic the compiler's CPS conversion: a located error
+/// instead. `doc/backlog.md`: "A lambda returned from a function, or stored
+/// in a struct/array field".
+fn check_lambda_positions(program: &Program) -> Vec<Diagnostic> {
+    use crate::ast::{Block, ElseBranch, Expr, ExprKind, ItemKind, StmtKind};
+
+    fn unsupported(span: crate::ast::Span, what: &str) -> Diagnostic {
+        Diagnostic {
+            severity: crate::diag::Severity::Error,
+            message: format!(
+                "{what}: a function value can only be called or passed to a call for now"
+            ),
+            span: Some(span),
+        }
+    }
+
+    // `lambdas`: the names in scope bound to a lambda.
+    fn walk_block(block: &Block, lambdas: &mut Vec<String>, out: &mut Vec<Diagnostic>) {
+        let depth = lambdas.len();
+        for stmt in &block.stmts {
+            match &stmt.kind {
+                StmtKind::Let { name, value, .. } => {
+                    if let ExprKind::Lambda { body, .. } = &value.kind {
+                        walk_block(body, lambdas, out);
+                        lambdas.push(name.clone());
+                    } else {
+                        walk_expr(value, lambdas, out);
+                        // A later `let` of the same name shadows the lambda.
+                        if let Some(i) = lambdas.iter().rposition(|n| n == name) {
+                            lambdas.remove(i);
+                        }
+                    }
+                }
+                StmtKind::Assign { target, value } => {
+                    walk_expr(target, lambdas, out);
+                    walk_expr(value, lambdas, out);
+                }
+                StmtKind::Expr(e) => walk_expr(e, lambdas, out),
+                StmtKind::Break(e) => {
+                    if let Some(e) = e {
+                        walk_expr(e, lambdas, out);
+                    }
+                }
+                StmtKind::Sync => {}
+            }
+        }
+        if let Some(tail) = &block.tail {
+            walk_expr(tail, lambdas, out);
+        }
+        lambdas.truncate(depth);
+    }
+
+    fn walk_expr(expr: &Expr, lambdas: &mut Vec<String>, out: &mut Vec<Diagnostic>) {
+        match &expr.kind {
+            ExprKind::Lambda { .. } => out.push(unsupported(expr.span, "a lambda used as a value")),
+            ExprKind::Path(p) if p.segments.len() == 1 && lambdas.contains(&p.segments[0]) => {
+                out.push(unsupported(expr.span, &format!("`{}` used as a value", p.segments[0])));
+            }
+            ExprKind::NumberLit { .. }
+            | ExprKind::ImaginaryLit { .. }
+            | ExprKind::BoolLit(_)
+            | ExprKind::Path(_)
+            | ExprKind::PackRef(_) => {}
+            // The callee is a name, called. A lambda's name passed straight
+            // to a call is supported too: the callee is specialized for it
+            // (`cps.rs::build_higher_order_specializations`), as for a
+            // comprehension's function or a lambda written in place
+            // (`lower.rs::hoist_lambda_args`).
+            ExprKind::Call(_, _, args, _) => {
+                for a in args {
+                    match &a.kind {
+                        ExprKind::Path(p) if p.segments.len() == 1 && lambdas.contains(&p.segments[0]) => {}
+                        // In place: a comprehension's function, until
+                        // `unroll.rs` binds it (in generic code, per instance).
+                        ExprKind::Lambda { body, .. } => walk_block(body, lambdas, out),
+                        _ => walk_expr(a, lambdas, out),
+                    }
+                }
+            }
+            ExprKind::Spawn(e) | ExprKind::FieldAccess(e, _) => walk_expr(e, lambdas, out),
+            ExprKind::Index(base, indices) => {
+                walk_expr(base, lambdas, out);
+                indices.iter().for_each(|i| walk_expr(i, lambdas, out));
+            }
+            ExprKind::ArrayLit(items) => items.iter().for_each(|i| walk_expr(i, lambdas, out)),
+            ExprKind::ArrayRepeat { value, count } => {
+                walk_expr(value, lambdas, out);
+                walk_expr(count, lambdas, out);
+            }
+            ExprKind::StructLit(_, _, fields) => fields.iter().for_each(|(_, e)| walk_expr(e, lambdas, out)),
+            ExprKind::If { cond, then_branch, else_branch } => {
+                walk_expr(cond, lambdas, out);
+                walk_block(then_branch, lambdas, out);
+                match else_branch.as_deref() {
+                    Some(ElseBranch::If(e)) => walk_expr(e, lambdas, out),
+                    Some(ElseBranch::Block(b)) => walk_block(b, lambdas, out),
+                    None => {}
+                }
+            }
+            ExprKind::While { cond, body } => {
+                walk_expr(cond, lambdas, out);
+                walk_block(body, lambdas, out);
+            }
+            ExprKind::For { start, end, body, .. } => {
+                walk_expr(start, lambdas, out);
+                walk_expr(end, lambdas, out);
+                walk_block(body, lambdas, out);
+            }
+            ExprKind::ForIn { iter, body, .. } => {
+                walk_expr(iter, lambdas, out);
+                walk_block(body, lambdas, out);
+            }
+            ExprKind::Loop { body } | ExprKind::Block(body) => walk_block(body, lambdas, out),
+        }
+    }
+
+    let mut out = Vec::new();
+    for item in &program.items {
+        let fns: Vec<&crate::ast::FnDecl> = match &item.kind {
+            ItemKind::Fn(f) => vec![f],
+            ItemKind::Impl(d) => d.fns.iter().collect(),
+            _ => vec![],
+        };
+        for f in fns {
+            if let Some(body) = &f.body {
+                walk_block(body, &mut Vec::new(), &mut out);
+            }
+        }
+    }
+    out
 }
 
 /// Every impl defines every function its algebra declares. A missing one
@@ -516,6 +646,16 @@ fn build_optimized_cps(
 /// with_defines`'s own doc comment) is reported through the same `Vec
 /// <String>` error channel every other failure here already uses, not a
 /// separate return shape.
+/// What `compile_and_emit` produced besides its files: whether the object
+/// needs libomp, and every source file the compile read (the entry files and
+/// each module `use` reached, the stdlib's included): what a build script
+/// depends on.
+#[derive(Debug)]
+pub struct Emitted {
+    pub needs_openmp: bool,
+    pub loaded_files: Vec<String>,
+}
+
 pub fn compile_and_emit(
     sources_in: Vec<(String, String)>,
     project_dirs: &[PathBuf],
@@ -523,7 +663,7 @@ pub fn compile_and_emit(
     bindings_path: Option<&Path>,
     options: &CodegenOptions,
     defines: &[(String, String)],
-) -> Result<bool, Vec<String>> {
+) -> Result<Emitted, Vec<String>> {
     let start = std::time::Instant::now();
     let (result, sources) = crate::driver::compile(sources_in, project_dirs);
     let mut program = result.map_err(|errs| render_all(&errs, &sources))?;
@@ -533,14 +673,8 @@ pub fn compile_and_emit(
     if !define_errors.is_empty() {
         return Err(define_errors);
     }
-    emit_from_program(
-        &program,
-        &registry,
-        &sources,
-        object_path,
-        bindings_path,
-        options,
-    )
+    let needs_openmp = emit_from_program(&program, &registry, &sources, object_path, bindings_path, options)?;
+    Ok(Emitted { needs_openmp, loaded_files: sources.file_names() })
 }
 
 /// Shared libraries the JIT's own `ExecutionEngine` needs loaded *alongside*
@@ -643,10 +777,6 @@ pub unsafe fn register_cleave_rt_symbols(engine: &cleave_mlir_shim::ExecutionEng
         engine.register_symbol(
             "cleave_release_pool",
             cleave_rt::cleave_release_pool as *mut (),
-        );
-        engine.register_symbol(
-            "cleave_release_tagged",
-            cleave_rt::cleave_release_tagged as *mut (),
         );
         engine.register_symbol(
             "cleave_release_void",

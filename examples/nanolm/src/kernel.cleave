@@ -12,7 +12,7 @@ use nn;
 use io;
 use checkpoint;
 
-// Batches of 32 sequences of `CONTEXT` tokens (`ROWS` in all), flattened, filled by the host.
+// Batches of `BATCH` sequences of `CONTEXT` tokens (`ROWS` in all), flattened, filled by the host.
 extern fn train_inputs(i: i32) -> [i32; ROWS];
 extern fn train_targets(i: i32) -> [i32; ROWS];
 extern fn val_inputs(i: i32) -> [i32; ROWS];
@@ -136,14 +136,16 @@ export fn train_lm(rounds: i32, lr: f32, seed: i64) -> f32 {
 // WIDTH`. Trained by Muon (hidden matrices) and AdamW (embedding, gains, biases), the gradient
 // clipped. The twin (`bench/nanolm-pytorch/gpt.py`) reads its sizes from these `define`s.
 
-define WIDTH: i32 = 384;
-define LAYERS: i32 = 8;
+define WIDTH: i32 = 768;
+define LAYERS: i32 = 16;
 define HEAD: i32 = 64;
 // SwiGLU's three matrices at 8/3 `WIDTH` hold what a GELU MLP's two hold at 4 `WIDTH`.
-define HIDDEN: i32 = 1024;
-// Tokens per sequence and rows per batch: `data.rs`'s `T` and `B * T`.
-define CONTEXT: i32 = 256;
-define ROWS: i32 = 32 * CONTEXT;
+define HIDDEN: i32 = 2048;
+// Sequences per batch, tokens per sequence, and rows per batch. The host's `data.rs` (`B`, `T`)
+// and the twin read `BATCH` and `CONTEXT` from here.
+define BATCH: i32 = 8;
+define CONTEXT: i32 = 1024;
+define ROWS: i32 = BATCH * CONTEXT;
 // Tokens: `bpe.rs`'s vocabulary, the 104 characters and the merges learned over them.
 define VOCAB: i32 = 4096;
 
@@ -278,6 +280,9 @@ fn optimizer(s: i32, lr: f32) -> Muon {
 
 // The end of a round, for the host to report with timings (`main.rs`).
 extern fn round_done(step: i32, train_loss: f32, validation_loss: f32, rate: f32);
+// The end of a phase of a training step (0: the gradient, 1: its clipping, 2: the optimizer's
+// step), for the host to time.
+extern fn phase_done(phase: i32);
 
 // Writes the initial weights to `gpt_init.ckpt` for the twin, trains `rounds` of `per_round`
 // steps starting at step `first` (batches and learning rates are functions of the step, so a
@@ -302,8 +307,12 @@ export fn train_gpt(first: i32, rounds: i32, per_round: i32, lr: f32, seed: i64,
     for r in 0..rounds {
         for k in 0..per_round {
             let s = first + r * per_round + k;
-            let g = clip_grad_norm(parallel_grad(train_inputs(s), train_targets(s), m), clip);
+            let raw = parallel_grad(train_inputs(s), train_targets(s), m);
+            phase_done(0);
+            let g = clip_grad_norm(raw, clip);
+            phase_done(1);
             (m, state) = step(optimizer(s, lr), m, g, state);
+            phase_done(2);
         };
         save("gpt.ckpt", (m, state, rand_state()));
         let next = first + (r + 1) * per_round;

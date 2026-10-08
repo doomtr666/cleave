@@ -1463,11 +1463,25 @@ pub fn axiom_rewrites(
         }
     }
 
+    // An algebra's laws apply to the types it was reached at, and to every
+    // type reached elsewhere that has an impl of it: an algebra of laws alone,
+    // with no method of its own to be reached (`ExactAdditive`, the laws of
+    // `+`/`-` that hold only where they are exact), applies exactly to the
+    // types whose impls declare it.
+    let every_reached: HashSet<&str> = reached_types.values().flatten().copied().collect();
     let mut rules = Vec::new();
     let mut referenced = HashSet::new();
-    for (algebra, types) in &reached_types {
-        for axiom in registry.axioms(algebra) {
-            for ty in types {
+    for algebra in registry.algebra_names() {
+        let axioms = registry.axioms(algebra);
+        if axioms.is_empty() {
+            continue;
+        }
+        let mut types: HashSet<&str> = reached_types.get(algebra).cloned().unwrap_or_default();
+        types.extend(every_reached.iter().copied().filter(|t| registry.has_impl_named(algebra, t)));
+        let mut types: Vec<&str> = types.into_iter().collect();
+        types.sort_unstable();
+        for axiom in axioms {
+            for ty in &types {
                 if let Some((rw, refs)) = axiom_to_rewrite(algebra, ty, axiom, registry) {
                     rules.push(rw);
                     referenced.extend(refs);
@@ -6225,10 +6239,12 @@ mod tests {
             ("TestRing".to_string(), "add".to_string()),
         );
         let (rules, _) = axiom_rewrites(&registry, &reached);
+        // The shipped stdlib's laws for `i32` (`ExactAdditive`, reached here
+        // through `i32`) come too; `TestRing`'s own is the one at stake.
         assert_eq!(
-            rules.len(),
+            rules.iter().filter(|r| r.name.as_str().contains("@TestRing<")).count(),
             1,
-            "expected exactly one rewrite, for the one reached type"
+            "expected exactly one `TestRing` rewrite, for the one reached type"
         );
 
         let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
@@ -6355,7 +6371,7 @@ mod tests {
         let root_id = fwd.env[&root_var];
 
         let (rules, _) = axiom_rewrites(&registry, &fwd.reached);
-        assert_eq!(rules.len(), 1);
+        assert_eq!(rules.iter().filter(|r| r.name.as_str().contains("@TestRing<")).count(), 1);
 
         let Forward {
             egraph,

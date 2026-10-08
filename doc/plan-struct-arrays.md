@@ -126,7 +126,14 @@ heavy value.
 5. Light structs as struct of arrays (or boxed, if the decision above changes).
 6. nanoLM: `blocks: [Block; LAYERS]`, `LAYERS` a `define`, the twin reading it too. Same losses to
    the bit at eight layers; then the larger model (`d768`, twelve layers, context 512), first an
-   intermediate size under a memory watchdog.
+   intermediate size under a memory watchdog. The rewrite is done: same losses to the bit
+   at eight layers (8.4047; 7.9479 and 7.9869 at step 25), the twin reading its sizes from the
+   kernel's `define`s, the checkpoints of the named-field model still read (same leaves in the same
+   order). Before growing it, a step's memory was brought from 13.4 to 5.5 GiB of peak private
+   bytes (`CLEAVE_ALLOC_STATS`' live-at-peak report): finer size classes in the pool (powers of two
+   doubled every power-of-two tensor once its header was added), arena slices committed as used
+   rather than whole, and each buffer freed after its last use rather than at its block's end
+   (`cleaveFoldPassthroughIterArgs`, `cleaveDeallocAtLastUse`).
 7. The two inference gaps (`grad` of an unannotated parameter, positional access on a generic
    parameter), which the array version no longer needs but other programs do.
 
