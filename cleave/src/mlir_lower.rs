@@ -6049,6 +6049,194 @@ fn lower_tensor_extract_spread<'c>(
     block.append_operation(built).result(0).unwrap().into()
 }
 
+/// `stdlib/linalg/tensor.cleave`'s `Slice`: a rectangular block of a tensor
+/// at run-time offsets, its sizes the block type's own, unit strides.
+///   - `mlir::tensor::extract_slice(x, offsets...)` reads the block: a value,
+///     which One-Shot Bufferize turns into a `memref.subview` of `x`'s buffer
+///     (no copy) unless `x` is written while the block is still read.
+///   - `mlir::tensor::insert_slice(part, x, offsets...)` is `x` with the
+///     block replaced: written in place when `x` dies there, and a `part`
+///     computed into a slice of `x` (`sgemm`'s `c`) is then never copied.
+/// The offsets are `i32`s, one per dimension, made `index` here; the sizes
+/// come from the block's tensor type (`result_ty` for an extract, the
+/// `part` operand's type for an insert).
+fn build_slice_op<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    op: &str,
+    args: &[CVal],
+    result_ty: Type<'c>,
+) -> Value<'c, 'c> {
+    let context = ctx.context;
+    let location = gen_loc(context);
+    let insert = op == "tensor.insert_slice";
+    let tensors = if insert { 2 } else { 1 };
+    assert!(args.len() > tensors, "MLIR lowering: `{op}` needs its tensor operands and one offset per dimension");
+    let tensor_values: Vec<Value> = args[..tensors]
+        .iter()
+        .map(|a| lower_cval(context, block, env, a, result_ty))
+        .collect();
+    let i32_ty: Type = IntegerType::new(context, 32).into();
+    let offsets: Vec<Value> = args[tensors..]
+        .iter()
+        .map(|a| to_index(ctx, block, lower_cval(context, block, env, a, i32_ty)))
+        .collect();
+    let block_ty = RankedTensorType::try_from(tensor_values[0].r#type())
+        .ok()
+        .filter(|_| insert)
+        .or_else(|| RankedTensorType::try_from(result_ty).ok())
+        .unwrap_or_else(|| panic!("MLIR lowering: `{op}`'s block must be a ranked tensor"));
+    let rank = block_ty.rank();
+    assert_eq!(offsets.len(), rank, "MLIR lowering: `{op}` needs one offset per dimension");
+    let sizes: Vec<i64> = (0..rank)
+        .map(|i| match block_ty.dim_size(i) {
+            Ok(DimSize::Static(n)) => n as i64,
+            other => panic!("MLIR lowering: `{op}` needs a static block size, got {other:?}"),
+        })
+        .collect();
+    let mut operands = tensor_values;
+    operands.extend(offsets);
+    let segments: Vec<i32> = if insert { vec![1, 1, rank as i32, 0, 0] } else { vec![1, rank as i32, 0, 0] };
+    let attr = |name: &str, value: Attribute<'c>| (Identifier::new(context, name), value);
+    let built = OperationBuilder::new(op, location)
+        .add_operands(&operands)
+        .add_attributes(&[
+            attr("static_offsets", DenseI64ArrayAttribute::new(context, &vec![i64::MIN; rank]).into()),
+            attr("static_sizes", DenseI64ArrayAttribute::new(context, &sizes).into()),
+            attr("static_strides", DenseI64ArrayAttribute::new(context, &vec![1; rank]).into()),
+            attr("operandSegmentSizes", DenseI32ArrayAttribute::new(context, &segments).into()),
+        ])
+        .add_results(&[result_ty])
+        .build()
+        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build `{op}`: {e}"));
+    block.append_operation(built).result(0).unwrap().into()
+}
+
+/// `mlir::memref::stride(buf, dim)`: the distance, in elements, between
+/// consecutive indices of dimension `dim` (a literal) in `buf`'s memory,
+/// read from its layout at run time (`memref.extract_strided_metadata`).
+/// The row stride of a `Slice::slice` view is its source's row length, not
+/// its own: what BLAS calls the leading dimension (`Sgemm::sgemm`).
+/// `result_ty`, a memref, with the layout a `layout: "strided<...>"`
+/// argument of an `mlir::` call names, if it has one: a cleave array type
+/// says nothing of layout (`ty_to_mlir` gives the plain one), the caller
+/// states the one it needs (`bufferization.to_buffer`, `memref.cast`).
+fn with_layout<'c>(context: &'c Context, result_ty: Type<'c>, attrs: &[(String, String)]) -> Type<'c> {
+    let Some((_, layout)) = attrs.iter().find(|(name, _)| name == "layout") else {
+        return result_ty;
+    };
+    let memref_ty = MemRefType::try_from(result_ty)
+        .unwrap_or_else(|e| panic!("MLIR lowering: a `layout` is only for a memref result: {e}"));
+    let shape: String = (0..memref_ty.rank())
+        .map(|i| match memref_ty.dim_size(i) {
+            Ok(DimSize::Static(n)) => format!("{n}x"),
+            _ => "?x".to_string(),
+        })
+        .collect();
+    let text = format!("memref<{shape}{}, {layout}>", memref_ty.element());
+    Type::parse(context, &text).unwrap_or_else(|| panic!("MLIR lowering: invalid layout: `{text}`"))
+}
+
+fn build_memref_stride<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    args: &[CVal],
+    result_ty: Type<'c>,
+) -> Value<'c, 'c> {
+    let context = ctx.context;
+    let location = gen_loc(context);
+    let [CVal::Var(buf_var), dim_arg] = args else {
+        panic!("MLIR lowering: `mlir::memref::stride` takes a buffer and a dimension");
+    };
+    let dim = match dim_arg {
+        CVal::Int(n) => *n as usize,
+        other => panic!("MLIR lowering: `mlir::memref::stride`'s dimension must be a literal, got {other:?}"),
+    };
+    let buf = *env
+        .get(buf_var)
+        .unwrap_or_else(|| panic!("MLIR lowering: `mlir::memref::stride` of an unbound buffer"));
+    let memref_ty = MemRefType::try_from(buf.r#type())
+        .unwrap_or_else(|e| panic!("MLIR lowering: `mlir::memref::stride` needs a memref: {e}"));
+    let rank = memref_ty.rank() as usize;
+    assert!(dim < rank, "MLIR lowering: `mlir::memref::stride`: dimension {dim} of a rank-{rank} buffer");
+    let index_ty = Type::index(context);
+    let base_ty: Type = MemRefType::new(memref_ty.element(), &[], None, None).into();
+    let mut result_tys: Vec<Type> = vec![base_ty, index_ty];
+    result_tys.extend(std::iter::repeat_n(index_ty, 2 * rank));
+    let meta = block.append_operation(
+        OperationBuilder::new("memref.extract_strided_metadata", location)
+            .add_operands(&[buf])
+            .add_results(&result_tys)
+            .build()
+            .unwrap_or_else(|e| panic!("MLIR lowering: failed to build memref.extract_strided_metadata: {e}")),
+    );
+    // Results: base, offset, `rank` sizes, `rank` strides.
+    let stride: Value = meta.result(2 + rank + dim).unwrap().into();
+    block
+        .append_operation(arith::index_cast(stride, result_ty, location))
+        .result(0)
+        .unwrap()
+        .into()
+}
+
+/// `tensor.empty()` filled with zeros, the destination of a product that
+/// accumulates into it (`linalg.matmul`'s `C += A B`). A `fill` of zero is
+/// what `cleave_mlir_shim::lower_blas_matmuls` recognizes as `beta = 0`, and
+/// drops.
+fn zero_filled_seed<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, result_ty: Type<'c>) -> Value<'c, 'c> {
+    let context = ctx.context;
+    let location = gen_loc(context);
+    let elem_ty = shaped_element_type(result_ty)
+        .unwrap_or_else(|| panic!("MLIR lowering: a zero-filled seed must be a tensor"));
+    let zero: Value = block
+        .append_operation(arith::constant(context, FloatAttribute::new(context, elem_ty, 0.0).into(), location))
+        .result(0)
+        .unwrap()
+        .into();
+    let empty = tensor_seed(ctx, block, result_ty);
+    let payload = Block::new(&[(elem_ty, location), (elem_ty, location)]);
+    payload.append_operation(
+        OperationBuilder::new("linalg.yield", location)
+            .add_operands(&[payload.argument(0).unwrap().into()])
+            .build()
+            .unwrap(),
+    );
+    let region = Region::new();
+    region.append_block(payload);
+    block
+        .append_operation(
+            OperationBuilder::new("linalg.fill", location)
+                .add_operands(&[zero, empty])
+                .add_attributes(&[(
+                    Identifier::new(context, "operandSegmentSizes"),
+                    DenseI32ArrayAttribute::new(context, &[1, 1]).into(),
+                )])
+                .add_regions_vec(vec![region])
+                .add_results(&[result_ty])
+                .build()
+                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build linalg.fill: {e}")),
+        )
+        .result(0)
+        .unwrap()
+        .into()
+}
+
+/// Marks the op defining `product` `cleave.blas`.
+fn mark_blas<'c>(context: &'c Context, product: Value<'c, 'c>) {
+    let result = melior::ir::operation::OperationResult::try_from(product)
+        .unwrap_or_else(|_| panic!("MLIR lowering: a BLAS product must be an op's result"));
+    let owner = result.owner();
+    unsafe {
+        mlir_sys::mlirOperationSetAttributeByName(
+            owner.to_raw(),
+            StringRef::new("cleave.blas").to_raw(),
+            mlir_sys::mlirUnitAttrGet(context.to_raw()),
+        );
+    }
+}
+
 fn lower_raw_mlir_op<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
@@ -6085,12 +6273,46 @@ fn lower_raw_mlir_op<'c>(
             }
         }
     }
+    if op == "tensor.extract_slice" || op == "tensor.insert_slice" {
+        return build_slice_op(ctx, block, env, op, args, result_ty);
+    }
+    if op == "memref.stride" {
+        return build_memref_stride(ctx, block, env, args, result_ty);
+    }
     // `linalg.matmul`/`linalg.transpose` — see `build_matmul_no_seed`'s own
     // doc comment for why these two need real, dedicated Rust code (not the
     // generic `linalg.`-prefix path just below, and not the *named* ops
     // that path used to build): both now build their own seed-free
     // destination internally (`tensor.empty()`, from `result_ty` alone),
     // so neither reaches here with a third (`init`) argument any more.
+    // `blas: "unit"` (`stdlib/linalg/matrix.cleave`, above `BLAS_MIN_WORK`):
+    // the same `linalg.matmul`, marked `cleave.blas` for the BLAS tier of the
+    // pipeline (`cleave_mlir_shim::blas_tile_and_fuse`, then
+    // `lower_blas_matmuls`), which tiles it with its consumer and calls
+    // `sgemm` per tile. Unmarked, the `linalg` schedule vectorizes it.
+    if attrs.iter().any(|(name, _)| name == "blas") {
+        let product = match op {
+            "linalg.matmul" => {
+                let [a_arg, b_arg] = args else {
+                    panic!("MLIR lowering: `mlir::linalg::matmul` needs exactly two operands, got {}", args.len())
+                };
+                let a = lower_cval(ctx.context, block, env, a_arg, result_ty);
+                let b = lower_cval(ctx.context, block, env, b_arg, result_ty);
+                let elem_ty = shaped_element_type(result_ty)
+                    .unwrap_or_else(|| panic!("MLIR lowering: a matmul's result must be a tensor"));
+                let init = zero_filled_seed(ctx, block, result_ty);
+                build_matmul_named_op(ctx.context, block, gen_loc(ctx.context), a, b, init, elem_ty, result_ty)
+            }
+            "linalg.matmul_transpose_a" => build_matmul_transpose_no_seed(ctx, block, env, args, result_ty, true),
+            "linalg.matmul_transpose_b" => build_matmul_transpose_no_seed(ctx, block, env, args, result_ty, false),
+            "linalg.matmul_add" => build_matmul_add(ctx, block, env, args, result_ty),
+            "linalg.matmul_transpose_a_add" => build_matmul_transpose_add(ctx, block, env, args, result_ty, true),
+            "linalg.matmul_transpose_b_add" => build_matmul_transpose_add(ctx, block, env, args, result_ty, false),
+            other => panic!("MLIR lowering: `blas` is only for a matmul, not `{other}`"),
+        };
+        mark_blas(ctx.context, product);
+        return product;
+    }
     if op == "linalg.matmul" {
         return build_matmul_no_seed(ctx, block, env, args, result_ty);
     }
@@ -6186,8 +6408,10 @@ fn lower_raw_mlir_op<'c>(
         .iter()
         .map(|a| lower_cval(context, block, env, a, operand_ty))
         .collect();
+    let result_ty = with_layout(context, result_ty, attrs);
     let parsed_attrs: Vec<_> = attrs
         .iter()
+        .filter(|(name, _)| name != "layout")
         .map(|(name, text)| {
             let attribute = Attribute::parse(context, text).unwrap_or_else(|| {
                 panic!("MLIR lowering: invalid MLIR attribute text `{text}` for `{name}` on `{op}`")
@@ -6266,8 +6490,15 @@ fn build_to_buffer_dynamic_layout<'c>(
         );
     };
     let a = lower_cval(context, block, env, a_arg, result_ty);
+    // `layout: "strided<...>"` isn't an attribute of the op but the layout
+    // of its result: what the consumer of the buffer can read, stated by
+    // whoever calls it (`Sgemm::sgemm`: any strides and offset, which every
+    // buffer, a whole tensor's or a `Slice::slice` view's, is cast to
+    // without a copy).
+    let result_ty = with_layout(context, result_ty, attrs);
     let parsed_attrs: Vec<_> = attrs
         .iter()
+        .filter(|(name, _)| name != "layout")
         .map(|(name, text)| {
             let attribute = Attribute::parse(context, text).unwrap_or_else(|| {
                 panic!(

@@ -37,6 +37,12 @@ unsafe extern "C" {
     fn cleaveHoistArgSlots(op: MlirOperation);
     fn cleaveHostCpuName(buffer: *mut std::os::raw::c_char, size: usize) -> usize;
     fn cleaveLowerAdoptions(op: MlirOperation);
+    fn cleaveElideBlockCopies(op: MlirOperation) -> i64;
+    fn cleaveBlasTileAndFuse(op: MlirOperation, rows: i64) -> i64;
+    fn cleaveLowerBlasMatmuls(op: MlirOperation) -> i64;
+    fn cleaveReuseDyingInputs(op: MlirOperation) -> i64;
+    fn cleaveBindTeams(op: MlirOperation) -> i64;
+    fn cleaveForwardCopiesToDestinations(op: MlirOperation) -> i64;
     fn cleaveLimitInlining(op: MlirOperation, threshold: i64) -> i64;
     fn cleaveApplyNoInline(op: MlirOperation);
     fn cleaveCopyAggregatesInMemory(op: MlirOperation, min_bytes: i64) -> i64;
@@ -88,6 +94,84 @@ pub fn host_cpu_name() -> String {
 /// `op` must be a valid operation, not used concurrently.
 pub unsafe fn hoist_arg_slots(op: MlirOperation) {
     unsafe { cleaveHoistArgSlots(op) }
+}
+
+/// Removes the copy out and back in of a block of a buffer that something
+/// writing through a pointer (an `extern` such as `sgemm`) was given as its
+/// destination, the block read as a slice and put back at the same place
+/// (`cpp/shim.cpp`'s `cleaveElideBlockCopies`): it writes the block itself.
+/// Returns how many blocks it rewrote. Run after One-Shot Bufferize, before
+/// the deallocation passes.
+///
+/// # Safety
+///
+/// `op` must be a valid operation, not used concurrently.
+pub unsafe fn elide_block_copies(op: MlirOperation) -> i64 {
+    unsafe { cleaveElideBlockCopies(op) }
+}
+
+/// Writes a fresh buffer's contents straight into the destination it is
+/// then copied whole into, of the same type (a function result's
+/// out-parameter), instead of copying (`cpp/shim.cpp`'s
+/// `cleaveForwardCopiesToDestinations`). Returns how many buffers it
+/// forwarded. Run after `buffer-results-to-out-params`, before the
+/// deallocation passes.
+///
+/// # Safety
+///
+/// `op` must be a valid operation, not used concurrently.
+pub unsafe fn forward_copies_to_destinations(op: MlirOperation) -> i64 {
+    unsafe { cleaveForwardCopiesToDestinations(op) }
+}
+
+/// Tiles by `rows` rows the elementwise consumer of each product marked for
+/// BLAS (`linalg.matmul` with `cleave.blas`), the product and its
+/// initialization fused into the loop, so that each tile of the product is
+/// consumed while still in cache (`cpp/shim.cpp`'s `cleaveBlasTileAndFuse`).
+/// Returns how many products it fused. Run on tensors, before
+/// `lower_blas_matmuls`.
+///
+/// # Safety
+///
+/// `op` must be a valid operation, not used concurrently.
+pub unsafe fn blas_tile_and_fuse(op: MlirOperation, rows: i64) -> i64 {
+    unsafe { cleaveBlasTileAndFuse(op, rows) }
+}
+
+/// Turns each product marked for BLAS (`linalg.matmul` with `cleave.blas`),
+/// tiled or not, into a call to `cleave_blas_sgemm` on its operands'
+/// buffers (`cpp/shim.cpp`'s `cleaveLowerBlasMatmuls`). Returns how many it
+/// lowered. Run on tensors, before One-Shot Bufferize.
+///
+/// # Safety
+///
+/// `op` must be a valid `builtin.module`, not used concurrently.
+pub unsafe fn lower_blas_matmuls(op: MlirOperation) -> i64 {
+    unsafe { cleaveLowerBlasMatmuls(op) }
+}
+
+/// Makes each elementwise op that writes a fresh tensor write into one of
+/// its operands instead, when that operand is a local result with no other
+/// use (`cpp/shim.cpp`'s `cleaveReuseDyingInputs`). Returns how many ops it
+/// rewrote. Run before One-Shot Bufferize.
+///
+/// # Safety
+///
+/// `op` must be a valid operation, not used concurrently.
+pub unsafe fn reuse_dying_inputs(op: MlirOperation) -> i64 {
+    unsafe { cleaveReuseDyingInputs(op) }
+}
+
+/// Starts every `omp.parallel` region with each member placing itself on a
+/// physical core of its own (`cleave_bind_worker`, `cleave-rt`;
+/// `cpp/shim.cpp`'s `cleaveBindTeams`). Returns how many regions it marked.
+/// Run once the parallel regions exist, before `--convert-openmp-to-llvm`.
+///
+/// # Safety
+///
+/// `op` must be a valid `builtin.module`, not used concurrently.
+pub unsafe fn bind_teams(op: MlirOperation) -> i64 {
+    unsafe { cleaveBindTeams(op) }
 }
 
 /// Turns each adoption (a `bufferization.clone` marked `cleave.adopt`,

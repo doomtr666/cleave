@@ -85,6 +85,9 @@ pub extern "C" fn print_f64(x: f64) -> f64 {
 /// leaks unconditionally for now.
 #[unsafe(no_mangle)]
 pub extern "C" fn cleave_alloc(size: i64) -> *mut u8 {
+    if *alloc_stats::ENABLED {
+        alloc_stats::record(size as usize, true);
+    }
     let layout = std::alloc::Layout::from_size_align(size as usize, 16).expect("cleave_alloc: invalid layout");
     unsafe { std::alloc::alloc(layout) }
 }
@@ -276,6 +279,132 @@ static CLEAVE_TRACE_SIZE: std::sync::LazyLock<Option<i64>> = std::sync::LazyLock
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
 });
+
+// `CLEAVE_ALLOC_STATS=1` -- every allocation counted, by call site, printed
+// to stderr at exit: how many, how many bytes, and how many missed the pool
+// (`fresh`: new memory from the system, whose first touch page-faults). The
+// measure of what a program materializes, deterministic where a timing
+// isn't: a rewrite that fuses two loops or writes into an existing buffer
+// shows up here as fewer bytes, run after run. Per step, by difference: two
+// runs of a training loop that differ only in their number of steps.
+// A site is the stack above the allocator, captured raw (a few
+// microseconds) and symbolized only at exit.
+mod alloc_stats {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex, Once};
+
+    pub static ENABLED: LazyLock<bool> = LazyLock::new(|| std::env::var("CLEAVE_ALLOC_STATS").is_ok());
+
+    const FRAMES: usize = 8;
+
+    #[derive(Default)]
+    struct Site {
+        count: u64,
+        bytes: u64,
+        fresh: u64,
+        fresh_bytes: u64,
+    }
+
+    /// Keyed by the stack and the size: one site allocating several shapes
+    /// (a synthesized gradient, attributed to its one `grad` line) reads
+    /// as one row per shape.
+    static SITES: Mutex<Option<HashMap<([usize; FRAMES], usize), Site>>> = Mutex::new(None);
+    static REPORT_AT_EXIT: Once = Once::new();
+
+    unsafe extern "C" {
+        fn atexit(callback: extern "C" fn()) -> i32;
+    }
+
+    pub fn record(bytes: usize, fresh: bool) {
+        REPORT_AT_EXIT.call_once(|| unsafe {
+            atexit(report);
+        });
+        let mut ips = [0usize; FRAMES];
+        let mut n = 0;
+        backtrace::trace(|frame| {
+            ips[n] = frame.ip() as usize;
+            n += 1;
+            n < FRAMES
+        });
+        let mut sites = SITES.lock().unwrap();
+        let site = sites.get_or_insert_with(Default::default).entry((ips, bytes)).or_default();
+        site.count += 1;
+        site.bytes += bytes as u64;
+        if fresh {
+            site.fresh += 1;
+            site.fresh_bytes += bytes as u64;
+        }
+    }
+
+    /// The first frame above the runtime: the generated function that
+    /// allocated, with its `.cleave` line when there is debug info.
+    fn label(ips: &[usize; FRAMES]) -> String {
+        for &ip in ips.iter().filter(|&&ip| ip != 0) {
+            let mut found: Option<String> = None;
+            backtrace::resolve(ip as *mut std::ffi::c_void, |symbol| {
+                if found.is_some() {
+                    return;
+                }
+                let name = symbol.name().map(|n| n.to_string()).unwrap_or_default();
+                if name.is_empty()
+                    || name.contains("cleave_rt::")
+                    || name.contains("backtrace::")
+                    || name.starts_with("cleave_alloc")
+                {
+                    return;
+                }
+                let line = match (symbol.filename(), symbol.lineno()) {
+                    (Some(file), Some(line)) => {
+                        let file = file.to_string_lossy();
+                        format!(" @ {}:{line}", file.rsplit(['/', '\\']).next().unwrap_or(&file))
+                    }
+                    _ => String::new(),
+                };
+                found = Some(format!("{name}{line}"));
+            });
+            if let Some(found) = found {
+                return found;
+            }
+        }
+        "<unknown>".to_string()
+    }
+
+    extern "C" fn report() {
+        let Some(sites) = SITES.lock().unwrap().take() else { return };
+        let mut labels: HashMap<[usize; FRAMES], String> = HashMap::new();
+        let mut by_label: HashMap<(String, usize), Site> = HashMap::new();
+        for ((ips, bytes), site) in &sites {
+            let label = labels.entry(*ips).or_insert_with(|| label(ips)).clone();
+            let entry = by_label.entry((label, *bytes)).or_default();
+            entry.count += site.count;
+            entry.bytes += site.bytes;
+            entry.fresh += site.fresh;
+            entry.fresh_bytes += site.fresh_bytes;
+        }
+        let mut rows: Vec<_> = by_label.into_iter().collect();
+        rows.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes));
+        let total = |f: fn(&Site) -> u64| rows.iter().map(|(_, s)| f(s)).sum::<u64>();
+        let mb = |b: u64| b as f64 / (1 << 20) as f64;
+        eprintln!(
+            "CLEAVE_ALLOC_STATS: {} allocations, {:.1} MiB; {} fresh (pool misses), {:.1} MiB",
+            total(|s| s.count),
+            mb(total(|s| s.bytes)),
+            total(|s| s.fresh),
+            mb(total(|s| s.fresh_bytes)),
+        );
+        eprintln!("{:>10} {:>11} {:>10} {:>8} {:>10}  site", "count", "MiB", "bytes", "fresh", "fresh MiB");
+        for ((label, bytes), s) in rows.iter().take(60) {
+            eprintln!(
+                "{:>10} {:>11.1} {:>10} {:>8} {:>10.1}  {label}",
+                s.count,
+                mb(s.bytes),
+                bytes,
+                s.fresh,
+                mb(s.fresh_bytes)
+            );
+        }
+    }
+}
 
 // TEMP, alongside `CLEAVE_TRACE_RC` above: the pool freely reuses a freed
 // block's own address for a *later*, logically unrelated allocation, which
@@ -704,6 +833,9 @@ pub extern "C" fn cleave_alloc_rc(data_size: i64) -> *mut u8 {
                 p
             }
         };
+        if *alloc_stats::ENABLED {
+            alloc_stats::record(data_size as usize, popped.is_none());
+        }
         let header = base.add(offset - RC_HEADER_SIZE) as *mut RcHeader;
         (*header).refcount = 1;
         (*header).data_size = data_size;
@@ -1194,6 +1326,9 @@ fn assert_region_open() {
 #[unsafe(no_mangle)]
 pub extern "C" fn cleave_alloc_local(_handle: i64, size: i64) -> *mut u8 {
     assert_region_open();
+    if *alloc_stats::ENABLED {
+        alloc_stats::record(size as usize, false);
+    }
     let offset = data_offset(size as usize);
     let align = if offset == VECTOR_ALIGN { VECTOR_ALIGN } else { 16 };
     let base = arena_bump(offset + size as usize, align);
@@ -1295,6 +1430,9 @@ pub extern "C" fn cleave_alloc_pool(data_size: i64) -> *mut u8 {
         } else {
             None
         };
+        if *alloc_stats::ENABLED {
+            alloc_stats::record(total, popped.is_none());
+        }
         match popped {
             Some(block) => block,
             None => {
@@ -1529,40 +1667,116 @@ pub extern "C" fn cleave_parallel_threads() -> i32 {
     })
 }
 
-/// The machine's physical cores: one `RelationProcessorCore` record each.
+/// The machine's physical cores, each as the processor group and the mask of
+/// its logical processors (its SMT siblings): one `RelationProcessorCore`
+/// record each. Computed once.
+#[cfg(windows)]
+fn cores() -> Option<&'static [(u16, u64)]> {
+    static CORES: std::sync::OnceLock<Option<Vec<(u16, u64)>>> = std::sync::OnceLock::new();
+    CORES
+        .get_or_init(|| {
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn GetLogicalProcessorInformationEx(relationship: u32, buffer: *mut u8, length: *mut u32) -> i32;
+            }
+            const RELATION_PROCESSOR_CORE: u32 = 0;
+            let mut len = 0u32;
+            unsafe { GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, std::ptr::null_mut(), &mut len) };
+            if len == 0 {
+                return None;
+            }
+            let mut buf = vec![0u8; len as usize];
+            if unsafe { GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, buf.as_mut_ptr(), &mut len) } == 0 {
+                return None;
+            }
+            // Each record: `Relationship: u32`, `Size: u32` (the record's own
+            // size), then `PROCESSOR_RELATIONSHIP`: `Flags: u8`,
+            // `EfficiencyClass: u8`, 20 reserved bytes, `GroupCount: u16`, then
+            // `GroupCount` `GROUP_AFFINITY`s (`Mask: u64`, `Group: u16`, 6
+            // reserved bytes); a core spans one group.
+            let mut cores = Vec::new();
+            let mut offset = 0usize;
+            while offset + 8 <= len as usize {
+                let size = u32::from_le_bytes(buf[offset + 4..offset + 8].try_into().ok()?) as usize;
+                if size == 0 {
+                    break;
+                }
+                let affinity = offset + 32;
+                if affinity + 10 <= offset + size {
+                    let mask = u64::from_le_bytes(buf[affinity..affinity + 8].try_into().ok()?);
+                    let group = u16::from_le_bytes(buf[affinity + 8..affinity + 10].try_into().ok()?);
+                    cores.push((group, mask));
+                }
+                offset += size;
+            }
+            (!cores.is_empty()).then_some(cores)
+        })
+        .as_deref()
+}
+
 #[cfg(windows)]
 fn physical_cores() -> Option<usize> {
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetLogicalProcessorInformationEx(relationship: u32, buffer: *mut u8, length: *mut u32) -> i32;
-    }
-    const RELATION_PROCESSOR_CORE: u32 = 0;
-    let mut len = 0u32;
-    unsafe { GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, std::ptr::null_mut(), &mut len) };
-    if len == 0 {
-        return None;
-    }
-    let mut buf = vec![0u8; len as usize];
-    if unsafe { GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, buf.as_mut_ptr(), &mut len) } == 0 {
-        return None;
-    }
-    // Each record: `Relationship: u32`, `Size: u32` (the record's own size), ...
-    let (mut count, mut offset) = (0, 0usize);
-    while offset + 8 <= len as usize {
-        let size = u32::from_le_bytes(buf[offset + 4..offset + 8].try_into().ok()?) as usize;
-        if size == 0 {
-            break;
-        }
-        count += 1;
-        offset += size;
-    }
-    (count > 0).then_some(count)
+    cores().map(<[_]>::len)
 }
 
 #[cfg(not(windows))]
 fn physical_cores() -> Option<usize> {
     None
 }
+
+/// Called by every member of a parallel team when the region starts (the
+/// `omp.parallel` regions `cleave-mlir-shim`'s `cleaveBindTeams` marks), with
+/// its number in the team: places the calling thread on physical core
+/// `thread` (modulo their count), on all of that core's logical processors.
+/// Left to the OS, two of a team's threads (one per physical core,
+/// `cleave_parallel_threads`) can land on the two SMT siblings of one core;
+/// every barrier then waits for that core, for the whole run: nanoLM's
+/// training step drew ~1400 or ~1720 ms per process start, ~1330 for every
+/// run once placed. Once per thread (a team's threads are kept from one
+/// region to the next). Not when the placement is asked for explicitly
+/// (`OMP_PLACES`, `OMP_PROC_BIND`, `KMP_AFFINITY`): libomp does it then.
+#[unsafe(no_mangle)]
+pub extern "C" fn cleave_bind_worker(thread: i32) {
+    thread_local! {
+        static BOUND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if BOUND.with(|b| b.replace(true)) {
+        return;
+    }
+    static EXPLICIT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        ["OMP_PLACES", "OMP_PROC_BIND", "KMP_AFFINITY"].iter().any(|v| std::env::var_os(v).is_some())
+    });
+    if *EXPLICIT {
+        return;
+    }
+    bind_to_core(thread.max(0) as usize);
+}
+
+#[cfg(windows)]
+fn bind_to_core(core: usize) {
+    #[repr(C)]
+    struct GroupAffinity {
+        mask: u64,
+        group: u16,
+        reserved: [u16; 3],
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentThread() -> *mut std::ffi::c_void;
+        fn SetThreadGroupAffinity(
+            thread: *mut std::ffi::c_void,
+            affinity: *const GroupAffinity,
+            previous: *mut GroupAffinity,
+        ) -> i32;
+    }
+    let Some(cores) = cores() else { return };
+    let (group, mask) = cores[core % cores.len()];
+    let affinity = GroupAffinity { mask, group, reserved: [0; 3] };
+    unsafe { SetThreadGroupAffinity(GetCurrentThread(), &affinity, std::ptr::null_mut()) };
+}
+
+#[cfg(not(windows))]
+fn bind_to_core(_core: usize) {}
 
 fn ensure_thread_count_pinned() {
     PIN_BLAS_THREADS
@@ -2584,5 +2798,44 @@ mod parallel_threads_tests {
             #[cfg(windows)]
             assert_eq!(Some(n), super::physical_cores());
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod placement_tests {
+    /// Each team member lands on its own physical core, all of that core's
+    /// logical processors: never two on one core's SMT siblings.
+    #[test]
+    fn team_members_are_placed_on_distinct_physical_cores() {
+        #[repr(C)]
+        #[derive(Default)]
+        struct GroupAffinity {
+            mask: u64,
+            group: u16,
+            reserved: [u16; 3],
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentThread() -> *mut std::ffi::c_void;
+            fn GetThreadGroupAffinity(thread: *mut std::ffi::c_void, affinity: *mut GroupAffinity) -> i32;
+        }
+        let cores = super::cores().expect("no core information");
+        let team = cores.len().min(4);
+        let placed: Vec<(u16, u64)> = (0..team)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    super::cleave_bind_worker(i as i32);
+                    let mut affinity = GroupAffinity::default();
+                    assert_ne!(unsafe { GetThreadGroupAffinity(GetCurrentThread(), &mut affinity) }, 0);
+                    (affinity.group, affinity.mask)
+                })
+            })
+            .map(|h| h.join().unwrap())
+            .collect();
+        for (i, &core) in placed.iter().enumerate() {
+            assert_eq!(core, cores[i], "thread {i} isn't on core {i}");
+        }
+        let distinct: std::collections::HashSet<_> = placed.iter().collect();
+        assert_eq!(distinct.len(), team, "two team members share a core: {placed:?}");
     }
 }

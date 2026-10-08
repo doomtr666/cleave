@@ -20,6 +20,76 @@ or in the fallback lowering, not in user code.
 
 ---
 
+## Study: parallelism on a Rust runtime (Rayon) instead of libomp
+
+Raised by the user (2026-10-08), after the run-to-run variance turned out to be libomp's worker
+placement left to the OS (two workers on one core's SMT siblings: ~20% slower for the whole run,
+drawn at process start). Today `spawn` lowers to `omp.task` and parallel loops to OpenMP through
+MLIR's OpenMP dialect and LLVM's OpenMPIRBuilder (outlining, captures, `taskwait`), the runtime
+being libomp, configured by environment variables read once at its initialization.
+
+The idea: lower `spawn`/await and `scf.parallel` through MLIR's `async` dialect (`async.execute`,
+`async.await`, `async-parallel-for`), which outlines the bodies and calls a C runtime API
+(`mlirAsyncRuntimeExecute`, `...AwaitToken`, ...) that `cleave-rt` would implement on Rayon. Gains:
+the pool entirely ours (thread count, placement in `ThreadPoolBuilder::start_handler`), no
+libomp, no `__kmpc_*`, nested parallelism composing in one work-stealing pool, portable. Not a
+home-made scheduler (`project_spawn_parallelism`'s rule): Rayon is the scheduler.
+
+The risk to settle first: a blocking await inside a worker takes it out of the pool (lost
+parallelism, or a deadlock if every task waits). Either `async`'s coroutine lowering (an await
+suspends the task) or waits that help (run other tasks meanwhile, as `rayon::join` does).
+Prototype on a recursive `spawn` and a parallel loop: per-task overhead, nanoLM's scaling under
+the same placement, nested waits. Migrate only if it holds.
+
+---
+
+## A user `fn` named like an algebra method shadows it inside the stdlib
+
+Found 2026-10-07: a program declaring its own `fn step(a, b)` (two parameters) fails with
+`stdlib/nn/nn.cleave:1198:29: error: \`step\` expects 2 argument(s), found 4`: the stdlib's own call
+to `Optimizer::step` (four arguments) resolved to the user's function. A user's top-level name must
+not reach into another module's bodies; the stdlib's calls resolve in the stdlib's scope (and an
+unqualified call in user code that matches both should be ambiguous or prefer the local `fn`, by a
+stated rule, not by accident). Repro: any program with `use nn;` and a `fn step` of another arity.
+
+---
+
+## Views as first-class descriptors: a strided view that retains the refcounted tensor it looks into
+
+`Slice::slice`/`update` (`stdlib/linalg/tensor.cleave`) give *ephemeral* views today: a slice becomes
+a `memref.subview` inside one function, `Sgemm::sgemm` reads it with its real strides, and a block
+written by an extern and put back where it was read is written in place
+(`cleave_mlir_shim::elide_block_copies`). A view that leaves its function is copied: function
+boundaries bufferize with `identity-layout-map`, so a view passed to a `#[no_inline]` function (the
+`blas_*` helpers), returned, or stored in a struct field becomes a fresh contiguous buffer.
+
+The model to build (raised by the user: a Fortran-style descriptor): a view is a value of its own,
+`{storage, offset, sizes, strides}`, that *retains* the storage it looks into. MLIR's memref is that
+descriptor already (allocated pointer, aligned pointer, offset, sizes, strides); the allocated pointer
+is the base tensor's `cleave_alloc_rc` data, whose header `cleave_retain`/`cleave_release` find, so a
+view retains its base when made and releases it when it dies. Value semantics hold through the
+refcount: a live view keeps its base above 1, so an `update` of the base copies instead of writing in
+place (copy on write, as Swift's arrays).
+
+What makes it a language change, not a patch:
+- layout as a type-level property, inferred, not written: a contiguous tensor keeps the identity
+  layout (static strides, the fast loops, `--affine-super-vectorize`), a view carries a strided one
+  (a phantom layout parameter, or a `View` type of its own). Functions monomorphize on it like on
+  const generics: called with a contiguous tensor they compile as today, with a view as strided.
+- function boundaries take the layout of the type instead of `identity-layout-map` everywhere.
+- rank N: offsets as `[i32; Dims.len()]` (spread in lowering as `Index` does), the block's rank
+  checked against the source's at type level (`Part.len() == Dims.len()`), not left to MLIR's
+  verifier; `layout: "dynamic"` derived from the rank instead of a rank-2 literal.
+- rank-reducing views (a head of `[B, T, H, DH]`, a row): partial indexing `x[i]` as a view, the
+  natural spelling.
+- interactions to settle: affine (headerless) structs, `spawn` (atomic refcounts), views of views.
+
+The precondition `elide_block_copies` relies on (no layout fact of the copied block folded into a
+constant before bufferization, `cpp/shim.cpp`) disappears with descriptors: the layout is a run-time
+value everywhere a view goes.
+
+---
+
 ## The `nn` library and the MNIST kernel are far harder to read and write than their PyTorch equivalent — a priority for adoption
 
 Raised directly by the user, comparing `examples/mnist-interop/src/kernel.cleave` with

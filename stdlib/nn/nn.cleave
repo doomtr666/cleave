@@ -19,6 +19,7 @@
 // way; `Trainable<Dense<T,In,Out>>` below needs `optim` (`Trainable`, and
 // the `Optimizer` impls a `Dense` is trained by) for the identical reason.
 use linalg;
+use blas;
 use convert;
 use rand;
 use optim;
@@ -738,9 +739,14 @@ algebra CausalAttention<X, S> {
     );
 }
 
-// The per-head products call `sgemm` directly (`linalg`'s `blas_*`): at 128 x 128 x 64 the
-// `linalg` matmul schedule ran at about a quarter of peak, `sgemm` twice as fast, and inside these
-// out-of-line methods there is nothing around a product to fuse it with.
+// The per-head products are `sgemm`s (`stdlib/blas`): at 128 x 128 x 64 the `linalg` matmul
+// schedule ran at about a quarter of peak, `sgemm` twice as fast, and inside these out-of-line
+// methods there is nothing around a product to fuse it with. Each head's blocks of `q`, `k`, `v`
+// (and `u`) are slices, read by `sgemm` where they are, with their real row stride; each product
+// that is a block of a result is computed into that block's slice and put back by `update`, so
+// written in place (`cleave_mlir_shim::elide_block_copies`). `sgemm` is called here rather than
+// the `blas_*` helpers: a slice passed to a function is copied at its boundary (`doc/backlog.md`,
+// "Views as first-class descriptors").
 //
 // `#[no_inline]` on each method here and on `LayerNorm`'s: each lowers to thousands of lines of
 // vectorized loops, and a transformer calls them once per block forward and again per gradient.
@@ -751,61 +757,64 @@ algebra CausalAttention<X, S> {
 impl<const N: i32, const D: i32, const L: i32, const DH: i32> CausalAttention<Tensor<f32, N, D>, AttentionShape<L, DH>> {
     #[no_inline]
     fn causal_attention(q, k, v, shape) {
-        let mut out: [[f32; D]; N] = mlir::memref::alloc();
+        let mut out: Tensor<f32, N, D> = uninitialized();
         for s in 0..N / L {
             for h in 0..D / DH {
-                let qh: Tensor<f32, L, DH> = attention_block(q, s, h);
-                let kh: Tensor<f32, L, DH> = attention_block(k, s, h);
-                let vh: Tensor<f32, L, DH> = attention_block(v, s, h);
-                let o: Tensor<f32, L, DH> = blas_matmul(causal_attention_weights(qh, kh), vh);
-                for i in 0..L { for j in 0..DH { out[s * L + i, h * DH + j] = o[i, j]; }; };
+                let r0 = s * L;
+                let c0 = h * DH;
+                let qh: Tensor<f32, L, DH> = slice(q, r0, c0);
+                let kh: Tensor<f32, L, DH> = slice(k, r0, c0);
+                let vh: Tensor<f32, L, DH> = slice(v, r0, c0);
+                let scores: Tensor<f32, L, L> = sgemm(false, true, 1.0, qh, kh, 0.0, uninitialized());
+                let p = causal_softmax(scores, DH);
+                let oh: Tensor<f32, L, DH> = slice(out, r0, c0);
+                out = update(out, sgemm(false, false, 1.0, p, vh, 0.0, oh), r0, c0);
             };
         };
-        Tensor(data: out)
+        out
     }
     // `(dQ, dK, dV)`, every block's weights and score gradient computed once.
     #[no_inline]
     fn causal_attention_backward(q, k, v, shape, u) {
-        let mut dq: [[f32; D]; N] = mlir::memref::alloc();
-        let mut dk: [[f32; D]; N] = mlir::memref::alloc();
-        let mut dv: [[f32; D]; N] = mlir::memref::alloc();
+        let mut dq: Tensor<f32, N, D> = uninitialized();
+        let mut dk: Tensor<f32, N, D> = uninitialized();
+        let mut dv: Tensor<f32, N, D> = uninitialized();
         for s in 0..N / L {
             for h in 0..D / DH {
-                let qh: Tensor<f32, L, DH> = attention_block(q, s, h);
-                let kh: Tensor<f32, L, DH> = attention_block(k, s, h);
-                let vh: Tensor<f32, L, DH> = attention_block(v, s, h);
-                let uh: Tensor<f32, L, DH> = attention_block(u, s, h);
-                let p = causal_attention_weights(qh, kh);
-                let ds = attention_score_grad(p, blas_matmul_transpose_b(uh, vh), DH);
-                let gq: Tensor<f32, L, DH> = blas_matmul(ds, kh);
-                let gk: Tensor<f32, L, DH> = blas_matmul_transpose_a(ds, qh);
-                let gv: Tensor<f32, L, DH> = blas_matmul_transpose_a(p, uh);
-                for i in 0..L {
-                    for j in 0..DH {
-                        dq[s * L + i, h * DH + j] = gq[i, j];
-                        dk[s * L + i, h * DH + j] = gk[i, j];
-                        dv[s * L + i, h * DH + j] = gv[i, j];
-                    };
-                };
+                let r0 = s * L;
+                let c0 = h * DH;
+                let qh: Tensor<f32, L, DH> = slice(q, r0, c0);
+                let kh: Tensor<f32, L, DH> = slice(k, r0, c0);
+                let vh: Tensor<f32, L, DH> = slice(v, r0, c0);
+                let uh: Tensor<f32, L, DH> = slice(u, r0, c0);
+                let scores: Tensor<f32, L, L> = sgemm(false, true, 1.0, qh, kh, 0.0, uninitialized());
+                let p = causal_softmax(scores, DH);
+                let dp: Tensor<f32, L, L> = sgemm(false, true, 1.0, uh, vh, 0.0, uninitialized());
+                let ds = attention_score_grad(p, dp, DH);
+                let gq: Tensor<f32, L, DH> = slice(dq, r0, c0);
+                let gk: Tensor<f32, L, DH> = slice(dk, r0, c0);
+                let gv: Tensor<f32, L, DH> = slice(dv, r0, c0);
+                dq = update(dq, sgemm(false, false, 1.0, ds, kh, 0.0, gq), r0, c0);
+                dk = update(dk, sgemm(true, false, 1.0, ds, qh, 0.0, gk), r0, c0);
+                dv = update(dv, sgemm(true, false, 1.0, p, uh, 0.0, gv), r0, c0);
             };
         };
-        (Tensor(data: dq), Tensor(data: dk), Tensor(data: dv))
+        (dq, dk, dv)
     }
 }
 
-// The `[L, DH]` block of sequence `s` and head `h` in an `[N, D]` matrix.
-fn attention_block<const N: i32, const D: i32, const L: i32, const DH: i32>(x: Tensor<f32, N, D>, s: i32, h: i32) -> Tensor<f32, L, DH> {
-    let mut b: [[f32; DH]; L] = mlir::memref::alloc();
-    for i in 0..L { for j in 0..DH { b[i, j] = x[s * L + i, h * DH + j]; }; };
-    Tensor(data: b)
+// A tensor whose every element its producer writes (`sgemm` with `beta` 0, a block-by-block
+// result): no initialization to pay for.
+fn uninitialized<const R: i32, const C: i32>() -> Tensor<f32, R, C> {
+    let buffer: [f32; R, C] = mlir::memref::alloc();
+    mlir::bufferization::to_tensor(buffer, restrict: "unit")
 }
 
-// `softmax(mask(Q Kᵀ / sqrt(DH)))` for one block: row `i` spread over
-// positions `0..=i`, zero after.
-fn causal_attention_weights<const L: i32, const DH: i32>(qh: Tensor<f32, L, DH>, kh: Tensor<f32, L, DH>) -> Tensor<f32, L, L> {
-    let dh: f32 = DH.to();
-    let scale = 1.0 / mlir::math::sqrt(dh);
-    let scores: Tensor<f32, L, L> = blas_matmul_transpose_b(qh, kh);
+// `softmax(mask(scores / sqrt(DH)))` for one block, `scores = Q Kᵀ`: row `i` spread over positions
+// `0..=i`, zero after.
+fn causal_softmax<const L: i32>(scores: Tensor<f32, L, L>, dh: i32) -> Tensor<f32, L, L> {
+    let width: f32 = dh.to();
+    let scale = 1.0 / mlir::math::sqrt(width);
     let mut p: [[f32; L]; L] = mlir::memref::alloc();
     // The exponentials, the sum and the normalization in separate loops: the exponential loop then
     // has no reduction in it (a float sum can't be reordered, so it kept the whole loop scalar) and

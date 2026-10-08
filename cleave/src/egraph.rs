@@ -2212,28 +2212,72 @@ fn build_pattern(
             // targets (`matmul(a, b)`'s `a`/`b` are `A`/`B`, never both
             // `C`) -- this call's own `expected_ty` has no single argument
             // it corresponds to, so `None` down into each one instead.
-            let arg_expected_ty = if owner_generics.len() <= 1 {
-                expected_ty
-            } else {
-                None
+            // Except an argument declared with the very generic the call
+            // returns (`update(x: X, ...) -> X`): its type is the call's
+            // own, whatever the other targets. `update(zero(), u, r0, c0)`,
+            // `Slice::slice`'s adjoint, types its `zero()` this way.
+            let returned_generic = registry.fn_sig(&owner, &method).and_then(|sig| {
+                let TypeKind::Path(p, gens) = &sig.ret.as_ref()?.kind else { return None };
+                (gens.is_empty() && p.segments.len() == 1).then(|| p.segments[0].clone())
+            });
+            let arg_expected_ty = |i: usize| {
+                if owner_generics.len() <= 1 {
+                    return expected_ty;
+                }
+                let declared = registry.fn_sig(&owner, &method)?.params.get(i)?.ty.as_ref()?;
+                let TypeKind::Path(p, gens) = &declared.kind else { return None };
+                let same = gens.is_empty() && p.segments.len() == 1 && Some(&p.segments[0]) == returned_generic.as_ref();
+                if same { expected_ty } else { None }
             };
-            let mut ids = Vec::with_capacity(call_args.len());
-            let mut arg_types: Vec<Option<String>> = Vec::with_capacity(call_args.len());
-            for a in call_args {
-                let (id, arg_ty) = build_pattern(
-                    a,
-                    algebra,
-                    ty,
-                    type_env,
-                    d_var,
-                    arg_expected_ty,
-                    referenced,
-                    registry,
-                    ast,
-                )?;
-                ids.push(id);
-                arg_types.push(arg_ty);
+            let mut built: Vec<Option<(egg::Id, Option<String>)>> = call_args
+                .iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    build_pattern(a, algebra, ty, type_env, d_var, arg_expected_ty(i), referenced, registry, ast)
+                })
+                .collect();
+            // An argument typed by nothing it contains and nothing the call
+            // returns (`update(u, zero(), r0, c0)`'s `zero()`, a `Y` where
+            // the call returns `X`), in a call to the enclosing algebra
+            // itself: the enclosing instantiation's binding for its
+            // generic, provided every argument that did type itself agrees
+            // with that same instantiation (otherwise the call is another
+            // instantiation -- `matmul(u, transpose(b))` in `MatMul`'s
+            // adjoint -- and its bindings aren't the enclosing ones).
+            if built.iter().any(Option::is_none) {
+                if owner != algebra {
+                    return None;
+                }
+                let sig = registry.fn_sig(&owner, &method)?;
+                let enclosing = generic_substitution(algebra, ty, registry);
+                let agrees = built.iter().zip(&sig.params).all(|(arg, param)| match (arg, param.ty.as_ref()) {
+                    (Some((_, Some(concrete))), Some(declared)) => {
+                        resolve_declared_type(declared, &enclosing).is_none_or(|b| &b == concrete)
+                    }
+                    _ => true,
+                });
+                if !agrees {
+                    return None;
+                }
+                for (i, slot) in built.iter_mut().enumerate() {
+                    if slot.is_none() {
+                        let declared = sig.params.get(i)?.ty.as_ref()?;
+                        let binding = resolve_declared_type(declared, &enclosing)?;
+                        *slot = Some(build_pattern(
+                            &call_args[i],
+                            algebra,
+                            ty,
+                            type_env,
+                            d_var,
+                            Some(&binding),
+                            referenced,
+                            registry,
+                            ast,
+                        )?);
+                    }
+                }
             }
+            let (ids, arg_types): (Vec<egg::Id>, Vec<Option<String>>) = built.into_iter().map(Option::unwrap).unzip();
             // Every one of `owner`'s own declared targets this call's real
             // arguments actually pin: each argument whose own declared type
             // (`sig.params[i].ty`) is a bare name matching one of `owner`'s
@@ -2331,6 +2375,8 @@ fn build_pattern(
                 // Single-target cross-algebra (`Ring<T>`, `Transcendental
                 // <T>`) — every argument's own type must agree, `owner`'s
                 // one generic has no other position it could be.
+                // No typed argument at all (`zero()`): the type the call
+                // is expected to have.
                 let mut agreed: Option<&str> = None;
                 for t in arg_types.iter().flatten() {
                     match agreed {
@@ -2339,7 +2385,7 @@ fn build_pattern(
                         Some(_) => return None,
                     }
                 }
-                agreed?.to_string()
+                agreed.or(expected_ty)?.to_string()
             };
             let unit_name = format!("{owner}::{method}<{call_ty}>");
             referenced.insert(unit_name.clone());

@@ -19,8 +19,14 @@ fn per_token(nats: f32) -> String {
 /// When the previous round ended (or training started), for `round_done`'s timings.
 static ROUND: Mutex<Option<(Instant, Instant, i32)>> = Mutex::new(None);
 
+/// Where `gpt.ckpt` stands, next to it: the step its model was saved at, so that resuming
+/// continues the learning rate schedule and the batches from there. In a file of its own, the
+/// checkpoint's format unchanged.
+const STEP_FILE: &str = "gpt.step";
+
 /// Called by the kernel at the end of each training round (and once before the first): the step
 /// reached, the losses, the learning rate; printed with the time per step since the last round.
+/// A round's end follows its checkpoint (`train_gpt`): the step is recorded as the checkpoint's.
 #[unsafe(no_mangle)]
 pub extern "C" fn round_done(step: i32, train_loss: f32, validation_loss: f32, rate: f32) {
     let now = Instant::now();
@@ -31,6 +37,9 @@ pub extern "C" fn round_done(step: i32, train_loss: f32, validation_loss: f32, r
             *round = Some((now, now, step));
         }
         Some((start, last, last_step)) => {
+            if let Err(e) = std::fs::write(STEP_FILE, step.to_string()) {
+                eprintln!("cannot record the checkpoint's step in {STEP_FILE}: {e}");
+            }
             let per_step = (now - last).as_secs_f64() * 1000.0 / f64::from((step - last_step).max(1));
             println!(
                 "step {step}: train {train_loss:.4}, validation {}, learning rate {rate:.6}, {per_step:.0} ms/step, {:.1} min elapsed",
@@ -93,10 +102,24 @@ fn main() {
         unsafe { generate(count, temperature, top_p, seed) };
         println!();
     } else if which == "gpt" || which == "bench" {
-        // `gpt [first_step [rounds [steps_per_round]]]`; a first step above 0 resumes from
-        // `gpt.ckpt`.
+        // `gpt [first_step|resume [rounds [steps_per_round]]]`; a first step above 0 resumes from
+        // `gpt.ckpt`, `resume` at the step it was saved at (`gpt.step`). A first step that isn't
+        // the checkpoint's would replay batches the model has seen, at the schedule's learning
+        // rate for another step: refused.
         let arg = |i: usize, default: i32| std::env::args().nth(i).map_or(default, |a| a.parse().expect("an integer"));
-        let (first, rounds, per_round) = (arg(2, 0), arg(3, 10), arg(4, 100));
+        let saved: Option<i32> = std::fs::read_to_string(STEP_FILE).ok().and_then(|s| s.trim().parse().ok());
+        let first = match std::env::args().nth(2).as_deref() {
+            Some("resume") => saved.unwrap_or_else(|| {
+                eprintln!("no {STEP_FILE}: give the step `gpt.ckpt` was saved at instead of `resume`");
+                std::process::exit(2)
+            }),
+            _ => arg(2, 0),
+        };
+        if let Some(saved) = saved.filter(|&saved| first > 0 && saved != first) {
+            eprintln!("`gpt.ckpt` was saved at step {saved}, not {first}: resume with `gpt resume` or `gpt {saved}`");
+            std::process::exit(2);
+        }
+        let (rounds, per_round) = (arg(3, 10), arg(4, 100));
         let start = std::time::Instant::now();
         let nats = unsafe { train_gpt(first, rounds, per_round, 0.001, 1, first > 0) };
         println!("transformer: {}", per_token(nats));

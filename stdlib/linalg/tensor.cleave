@@ -217,6 +217,29 @@ impl<T: Float, const Dims...: i32> Index<Tensor<T, Dims...>, T> {
     }
 }
 
+// A rectangular block of a matrix, `Y`'s size, at rows `r0..` and columns
+// `c0..`: `slice` reads it, `update` returns `x` with it replaced. Values, as
+// every tensor: where they live is bufferization's choice, and it makes a
+// slice a view of `x`'s memory (no copy) and an update a write in place when
+// `x` isn't used afterwards (`mlir_lower.rs::build_slice_op`). A block
+// computed straight into `slice(out, ...)` (`sgemm`'s destination) and put
+// back by `update` is then written where it belongs, once.
+//
+// Each the other's adjoint, up to zeros: the gradient of a block read is
+// that block placed in a zero matrix, and an update's gradient splits into
+// the part it overwrote (zero for `x`) and the block (for `part`).
+algebra Slice<X, Y> {
+    fn slice(x: X, r0: i32, c0: i32) -> Y;
+    fn update(x: X, part: Y, r0: i32, c0: i32) -> X;
+    adjoint slice(x, r0, c0), u: (update(zero(), u, r0, c0), _, _);
+    adjoint update(x, part, r0, c0), u: (update(u, zero(), r0, c0), slice(u, r0, c0), _, _);
+}
+
+impl<T: Float, const N: i32, const M: i32, const R: i32, const C: i32> Slice<Tensor<T, N, M>, Tensor<T, R, C>> {
+    fn slice(x, r0, c0) { mlir::tensor::extract_slice(x, r0, c0) }
+    fn update(x, part, r0, c0) { mlir::tensor::insert_slice(part, x, r0, c0) }
+}
+
 // A tensor seeded by a comprehension (`Generate`, `stdlib/core`), filled at
 // run time: `let t: Tensor<f32, 4> = [for i in 0..4: ...]`, one nested
 // comprehension per dimension for a matrix (`[for i in 0..R: [for j in

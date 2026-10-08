@@ -139,10 +139,33 @@ impl<const A0: i32, const A1: i32, const B0: i32, const B1: i32, const C0: i32, 
         // real, measured copy disappear (matching the dynamic-strided
         // result type `build_to_buffer_dynamic_layout` already gives —
         // that fix alone wasn't sufficient on its own, only necessary).
-        let a_buf: [f32;A0,A1] = mlir::bufferization::to_buffer(a, read_only: "unit");
-        let b_buf: [f32;B0,B1] = mlir::bufferization::to_buffer(b, read_only: "unit");
-        let mut c_buf: [f32;C0,C1] = mlir::bufferization::to_buffer(c);
-        raw_sgemm(ta, tb, m, n, k, alpha, a_buf, A1, b_buf, B1, beta, c_buf, C1);
+        //
+        // `layout` on `a`/`b`: any strides, any offset, so that every buffer
+        // reaches `raw_sgemm` as is, a whole tensor's as a `Slice::slice`
+        // view's (One-Shot Bufferize can only cast a buffer to a layout at
+        // least as dynamic as its own; a static unit column stride made it
+        // allocate and copy, or fail). Each leading dimension is the
+        // buffer's real row stride, a view's being its source's row length,
+        // not its own `A1`. The column stride is 1, as BLAS's row-major
+        // layout needs, for every tensor buffer: they are allocated
+        // row-major, and a slice keeps unit strides.
+        //
+        // On `c` too, and from the `to_buffer` itself: a slice of a larger
+        // tensor as `c` gets copied out and back in by One-Shot Bufferize,
+        // a copy then removed (`cleave_mlir_shim::elide_block_copies`) by
+        // writing the block in place, and only a layout never known at
+        // compile time keeps `ldc` and the pointer's offset right once the
+        // block replaces the copy (a static one is folded into constants
+        // before bufferization). A function returning `c`'s buffer copies
+        // it into its plain-layout result, a copy removed in turn
+        // (`cleave_mlir_shim::forward_copies_to_destinations`).
+        let a_buf: [f32;A0,A1] = mlir::bufferization::to_buffer(a, read_only: "unit", layout: "strided<[?, ?], offset: ?>");
+        let b_buf: [f32;B0,B1] = mlir::bufferization::to_buffer(b, read_only: "unit", layout: "strided<[?, ?], offset: ?>");
+        let mut c_buf: [f32;C0,C1] = mlir::bufferization::to_buffer(c, layout: "strided<[?, ?], offset: ?>");
+        let lda: i32 = mlir::memref::stride(a_buf, 0);
+        let ldb: i32 = mlir::memref::stride(b_buf, 0);
+        let ldc: i32 = mlir::memref::stride(c_buf, 0);
+        raw_sgemm(ta, tb, m, n, k, alpha, a_buf, lda, b_buf, ldb, beta, c_buf, ldc);
         mlir::bufferization::to_tensor(c_buf, restrict: "unit")
     }
 }

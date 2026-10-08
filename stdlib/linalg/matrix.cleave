@@ -193,6 +193,14 @@ algebra MatMulTransposeB<A, B, C> {
 // A matmul does this much work (`P * Q * R` multiply-adds) or more, it calls
 // `sgemm` (OpenBLAS); below, the `linalg` path, inlined, which fuses with
 // what surrounds it (MNIST's largest, 32x784x512 = 12.8M, stays there).
+//
+// Either way a `linalg.matmul`: `blas: "unit"` marks the BLAS tier's
+// (`mlir_lower.rs::mark_blas`), which stays structured until just before
+// bufferization. Its elementwise consumer, if it has a single one (a bias, an
+// activation, a residual), is then tiled by rows with the product fused in,
+// each tile computed by `sgemm` and consumed while in cache
+// (`cleave_mlir_shim::blas_tile_and_fuse`), and every marked product becomes
+// a `sgemm` call (`lower_blas_matmuls`).
 // Overridable from a `build.rs` like any `define`. Was 100M, tuned on MNIST
 // alone: nanoLM's data-parallel micro-batches (512 rows) put its 512x256x256
 // projections (33.5M) under it, on the `linalg` path that runs small shapes at
@@ -205,7 +213,7 @@ impl<const P: i32, const Q: i32, const R: i32>
     fn matmul_transpose_b(a, b) {
         let pqr: i32 = P * Q * R;
         if pqr > BLAS_MIN_WORK {
-            blas_matmul_transpose_b(a, b)
+            mlir::linalg::matmul_transpose_b(a, b, blas: "unit")
         } else {
             mlir::linalg::matmul_transpose_b(a, b)
         }
@@ -226,7 +234,7 @@ impl<const P: i32, const Q: i32, const R: i32>
     fn matmul_transpose_a(a, b) {
         let pqr: i32 = P * Q * R;
         if pqr > BLAS_MIN_WORK {
-            blas_matmul_transpose_a(a, b)
+            mlir::linalg::matmul_transpose_a(a, b, blas: "unit")
         } else {
             mlir::linalg::matmul_transpose_a(a, b)
         }
@@ -349,13 +357,10 @@ impl<const N: i32, const M: i32, const K: i32>
     fn fma(a, b, c) {
         let nmk: i32 = N * M * K;
         if nmk > BLAS_MIN_WORK {
-            // `sgemm` into a fresh output, `c` added after rather than
-            // accumulated by `sgemm` (`beta = 1`): `sgemm` writing into `c`
-            // means copying `c` first (it's a read-only input), the whole
-            // output each call; a separate add costs one pass over it and
-            // fuses with whatever built `c` (a dense layer's broadcast bias,
-            // then never materialized).
-            Ring::add(blas_matmul(a, b), c)
+            // Accumulated into `c` by `sgemm` (`beta = 1`), in place where
+            // `c` dies there (a dense layer's broadcast bias, fused into the
+            // same tiles when the product has an elementwise consumer).
+            mlir::linalg::matmul_add(a, b, c, blas: "unit")
         } else {
             mlir::linalg::matmul_add(a, b, c)
         }
@@ -367,7 +372,7 @@ impl<const P: i32, const Q: i32, const R: i32>
     fn fma_transpose_a(a, b, c) {
         let pqr: i32 = P * Q * R;
         if pqr > BLAS_MIN_WORK {
-            blas_fma_transpose_a(a, b, c)
+            mlir::linalg::matmul_transpose_a_add(a, b, c, blas: "unit")
         } else {
             mlir::linalg::matmul_transpose_a_add(a, b, c)
         }
@@ -379,7 +384,7 @@ impl<const P: i32, const Q: i32, const R: i32>
     fn fma_transpose_b(a, b, c) {
         let pqr: i32 = P * Q * R;
         if pqr > BLAS_MIN_WORK {
-            blas_fma_transpose_b(a, b, c)
+            mlir::linalg::matmul_transpose_b_add(a, b, c, blas: "unit")
         } else {
             mlir::linalg::matmul_transpose_b_add(a, b, c)
         }

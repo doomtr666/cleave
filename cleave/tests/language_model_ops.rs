@@ -1512,3 +1512,453 @@ fn an_undetermined_generic_is_reported_at_the_call_that_leaves_it_open() {
         "the error should be at `half()`, line 7: {stderr}"
     );
 }
+
+/// `CLEAVE_ALLOC_STATS=1` counts every allocation and prints the totals at
+/// exit: the measure of what a program materializes. Two tensor temporaries
+/// per iteration here, ten iterations: at least twenty allocations of 4 KiB.
+#[test]
+fn alloc_stats_count_what_a_program_materializes() {
+    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("alloc_stats.cleave");
+    std::fs::write(
+        &source,
+        "
+        use nn;
+        fn main() -> f32 {
+            rand_seed(1);
+            let mut x: Tensor<f32, 32, 32> = Init::he();
+            for i in 0..10 {
+                x = (x + x) * x;
+            };
+            x[1, 2]
+        }
+        ",
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--no-debug-info", "--run"])
+        .arg(&source)
+        .env("CLEAVE_ALLOC_STATS", "1")
+        .output()
+        .expect("cannot run cleave");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    let summary = stderr
+        .lines()
+        .find_map(|l| l.strip_prefix("CLEAVE_ALLOC_STATS: "))
+        .unwrap_or_else(|| panic!("no allocation report: {stderr}"));
+    let count: u64 = summary.split(' ').next().unwrap().parse().unwrap();
+    assert!(count >= 20, "{summary}");
+}
+
+/// `slice(x, r0, c0)` reads the block of `x` at rows `r0..` and columns
+/// `c0..`, its size the result type's; `update(x, part, r0, c0)` is `x`
+/// with that block replaced, everything else untouched.
+#[test]
+fn a_slice_reads_a_block_and_an_update_replaces_it() {
+    let src = |out: &str| {
+        format!(
+            "
+            use nn;
+            fn main() -> f32 {{
+                let x = Tensor::<f32, 3, 4>(data: [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], [9.0, 10.0, 11.0, 12.0]]);
+                let s: Tensor<f32, 2, 2> = slice(x, 1, 2);
+                let y = update(x, s + s, 0, 1);
+                {out}
+            }}
+        "
+        )
+    };
+    // `s` is [[7, 8], [11, 12]].
+    assert_eq!(run(&src("s[0, 0] * 1000.0 + s[0, 1] * 100.0 + s[1, 0] * 10.0 + s[1, 1]")), 7000.0 + 800.0 + 110.0 + 12.0);
+    // `y` is `x` with [[14, 16], [22, 24]] at rows 0..2, columns 1..3.
+    assert_eq!(run(&src("y[0, 0] + y[0, 1] * 10.0 + y[1, 2] * 100.0 + y[2, 3] * 1000.0")), 1.0 + 140.0 + 2400.0 + 12000.0);
+}
+
+/// The adjoints: the gradient of a block read is that block's upstream
+/// gradient placed in zeros; through an update, the overwritten block of
+/// `x` gets nothing and `part` gets the block of the upstream gradient.
+#[test]
+fn slices_and_updates_have_gradients() {
+    let src = |out: &str| {
+        format!(
+            "
+            use nn;
+            fn read(x: Tensor<f32, 3, 4>) -> f32 {{
+                let s: Tensor<f32, 2, 2> = slice(x, 1, 2);
+                sum(s * s)
+            }}
+            dread = grad(read, x);
+            fn write(x: Tensor<f32, 3, 4>, p: Tensor<f32, 2, 2>) -> f32 {{
+                let y = update(x, p * p, 0, 1);
+                sum(y * x)
+            }}
+            dwrite_x = grad(write, x);
+            dwrite_p = grad(write, p);
+            fn main() -> f32 {{
+                let x = Tensor::<f32, 3, 4>(data: [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], [9.0, 10.0, 11.0, 12.0]]);
+                let p = Tensor::<f32, 2, 2>(data: [[1.0, 2.0], [3.0, 4.0]]);
+                let gr = dread(x);
+                let gx = dwrite_x(x, p);
+                let gp = dwrite_p(x, p);
+                {out}
+            }}
+        "
+        )
+    };
+    // d/dx sum(s²) = 2x on the block, 0 elsewhere.
+    assert_eq!(run(&src("gr[1, 2] + gr[2, 3] * 10.0 + gr[0, 0] * 100.0 + gr[1, 1] * 1000.0")), 14.0 + 240.0);
+    // `sum(y * x)`: d/dx = y + (dy/dx)ᵀ x, and `y` doesn't depend on `x` on
+    // the block: there, `y` = p², elsewhere 2x.
+    assert_eq!(run(&src("gx[0, 1] + gx[0, 0] * 10.0 + gx[2, 3] * 100.0")), 1.0 + 20.0 + 2400.0);
+    // d/dp sum(p² ⊙ x[block]) = 2 p ⊙ x[block], the block at rows 0..2, columns 1..3.
+    assert_eq!(run(&src("gp[0, 0] + gp[1, 1] * 10.0")), 2.0 * 1.0 * 2.0 + 10.0 * 2.0 * 4.0 * 7.0);
+}
+
+/// Elementwise arithmetic straight on a slice (a strided view after
+/// bufferization) compiles without diagnostics: `--affine-super-vectorize`
+/// can't vectorize a loop over a non-identity layout and said so as an
+/// `error:` on a compilation that succeeded.
+#[test]
+fn arithmetic_on_a_slice_compiles_silently() {
+    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("slice_arithmetic.cleave");
+    std::fs::write(
+        &source,
+        "
+        use nn;
+        fn main() -> f32 {
+            let x = Tensor::<f32, 3, 4>(data: [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], [9.0, 10.0, 11.0, 12.0]]);
+            let s: Tensor<f32, 2, 2> = slice(x, 1, 2);
+            let y = update(x, s + s, 0, 1);
+            y[0, 1]
+        }
+        ",
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--no-debug-info", "--run"])
+        .arg(&source)
+        .output()
+        .expect("cannot run cleave");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(stdout.contains(&format!("main returned: {}", 14.0f32.to_bits() as i32)), "stdout: {stdout}");
+    assert!(!stderr.contains("error"), "diagnostics on a successful compilation: {stderr}");
+}
+
+/// Per-head products as attention computes them: each block of `q` and `k`
+/// read as a slice, multiplied by `sgemm` straight into a slice of `out`,
+/// put back by `update`. Right values, and no block is materialized: BLAS
+/// reads the views with their real leading dimension and writes the
+/// product where it belongs (`Sgemm::sgemm`, `stdlib/blas`).
+#[test]
+fn sgemm_reads_and_writes_slices_in_place() {
+    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("sgemm_slices.cleave");
+    let dump = dir.join("sgemm_slices_post_dealloc.mlir");
+    let _ = std::fs::remove_file(&dump);
+    std::fs::write(
+        &source,
+        "
+        use nn;
+        #[no_inline]
+        fn heads(q: Tensor<f32, 8, 6>, k: Tensor<f32, 8, 6>) -> Tensor<f32, 8, 16> {
+            let mut out: Tensor<f32, 8, 16> = zero();
+            for h in 0..2 {
+                let qh: Tensor<f32, 8, 3> = slice(q, 0, h * 3);
+                let kh: Tensor<f32, 8, 3> = slice(k, 0, h * 3);
+                let dest: Tensor<f32, 8, 8> = slice(out, 0, h * 8);
+                out = update(out, sgemm(false, true, 1.0, qh, kh, 0.0, dest), 0, h * 8);
+            };
+            out
+        }
+        fn main() -> i32 {
+            rand_seed(1);
+            let q: Tensor<f32, 8, 6> = Init::he();
+            let k: Tensor<f32, 8, 6> = Init::he();
+            let out = heads(q, k);
+            let mut wrong = 0;
+            for h in 0..2 {
+                for i in 0..8 {
+                    for j in 0..8 {
+                        let mut s: f32 = 0.0;
+                        for c in 0..3 { s = s + q[i, h * 3 + c] * k[j, h * 3 + c]; };
+                        let d = out[i, h * 8 + j] - s;
+                        if d * d > 0.000001 { wrong = wrong + 1; };
+                    };
+                };
+            };
+            wrong
+        }
+        ",
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--no-debug-info", "--run"])
+        .arg(&source)
+        .env("CLEAVE_DUMP_POST_DEALLOC", &dump)
+        .output()
+        .expect("cannot run cleave");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("main returned: 0"), "stdout: {stdout}\nstderr: {stderr}");
+    let ir = std::fs::read_to_string(&dump).expect("no IR dumped");
+    let heads: String = ir
+        .lines()
+        .skip_while(|l| !l.contains("func.func private @heads"))
+        .take_while(|l| !l.starts_with("  }"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!heads.is_empty(), "`heads` isn't in the IR");
+    for block in ["memref<8x3xf32", "memref<8x8xf32"] {
+        assert!(
+            !heads.lines().any(|l| (l.contains("memref.alloc") || l.contains("memref.copy")) && l.contains(block)),
+            "a block is copied:\n{heads}"
+        );
+    }
+    // The loop builds `out` in the caller's buffer
+    // (`cleave_mlir_shim::forward_copies_to_destinations`): the one copy left
+    // is `zero()`'s, its initialization.
+    assert_eq!(heads.matches("memref.copy").count(), 1, "`out` is copied:\n{heads}");
+}
+
+/// A block written by `sgemm` while `sgemm` also reads it (`a` and the
+/// destination are the same slice of `out`): the write can't go in place,
+/// BLAS would overwrite what it is still reading. The copy stays, the
+/// values are right.
+#[test]
+fn a_block_read_by_its_own_write_is_still_copied() {
+    let src = "
+        use nn;
+        fn main() -> f32 {
+            let x = Tensor::<f32, 2, 4>(data: [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]);
+            let b = Tensor::<f32, 2, 2>(data: [[1.0, 1.0], [1.0, 2.0]]);
+            let blk: Tensor<f32, 2, 2> = slice(x, 0, 2);
+            let y = update(x, sgemm(false, false, 1.0, blk, b, 0.0, blk), 0, 2);
+            // [[3, 4], [7, 8]] @ [[1, 1], [1, 2]] = [[7, 11], [15, 23]]
+            y[0, 2] + y[0, 3] * 10.0 + y[1, 2] * 100.0 + y[1, 3] * 1000.0 + y[0, 0] * 10000.0
+        }
+    ";
+    assert_eq!(run(src), 7.0 + 110.0 + 1500.0 + 23000.0 + 10000.0);
+}
+
+/// A dense layer and its activation on the BLAS tier (`BLAS_MIN_WORK`
+/// lowered to 0): the activation is tiled by rows with the product fused in,
+/// each tile's bias broadcast and `sgemm` (accumulating into it, `beta = 1`)
+/// done in a scratch tile the activation then reads while it is in cache
+/// (`cleave_mlir_shim::blas_tile_and_fuse`, `lower_blas_matmuls`). The values
+/// are the `linalg` tier's, up to the order of the sums; the only buffer the
+/// product's size is the result.
+#[test]
+fn a_blas_product_is_computed_tile_by_tile_with_its_consumer() {
+    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("blas_tiles.cleave");
+    let dump = dir.join("blas_tiles_post_dealloc.mlir");
+    std::fs::write(
+        &source,
+        "
+        use nn;
+        fn layer(x: Tensor<f32, 512, 32>, w: Tensor<f32, 32, 48>, b: Tensor<f32, 1, 48>) -> Tensor<f32, 512, 48> {
+            silu(matmul(x, w) + broadcast0(b))
+        }
+        fn main() -> f32 {
+            rand_seed(1);
+            let x: Tensor<f32, 512, 32> = Init::he();
+            let w: Tensor<f32, 32, 48> = Init::he();
+            let b: Tensor<f32, 1, 48> = Init::he();
+            sum(layer(x, w, b))
+        }
+        ",
+    )
+    .unwrap();
+    let run = |blas: bool| {
+        let _ = std::fs::remove_file(&dump);
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"));
+        command.args(["--no-openmp", "--no-debug-info", "--run"]);
+        if blas {
+            command.args(["--define", "BLAS_MIN_WORK=0"]).env("CLEAVE_DUMP_POST_DEALLOC", &dump);
+        }
+        let output = command.arg(&source).output().expect("cannot run cleave");
+        // `--run` exits with what `main` returns: the bits, not a status.
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let bits: i32 = stdout
+            .trim()
+            .strip_prefix("main returned: ")
+            .and_then(|b| b.parse().ok())
+            .unwrap_or_else(|| panic!("stdout: {stdout}\nstderr: {}", String::from_utf8_lossy(&output.stderr)));
+        f32::from_bits(bits as u32)
+    };
+    let (native, blas) = (run(false), run(true));
+    assert!((native - blas).abs() <= 1e-4 * native.abs().max(1.0), "linalg {native}, BLAS {blas}");
+    let ir = std::fs::read_to_string(&dump).expect("no IR dumped");
+    let main: String = ir
+        .lines()
+        .skip_while(|l| !l.contains("func.func @main"))
+        .take_while(|l| !l.starts_with("  }"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let calls: Vec<usize> = main.lines().enumerate().filter(|(_, l)| l.contains("call @cleave_blas_sgemm")).map(|(i, _)| i).collect();
+    let tile_loop = main.lines().position(|l| l.contains("scf.for")).expect("no tile loop");
+    assert_eq!(calls.len(), 1, "one `sgemm`, per tile:\n{main}");
+    assert!(calls[0] > tile_loop, "the `sgemm` isn't in the tile loop:\n{main}");
+    assert!(main.contains("memref<128x48xf32>"), "no scratch tile:\n{main}");
+    let whole = main.lines().filter(|l| l.contains("memref.alloc") && l.contains("memref<512x48xf32>")).count();
+    assert_eq!(whole, 1, "a product-sized buffer besides the result:\n{main}");
+}
+
+/// An elementwise op consuming two BLAS products (SwiGLU's `silu(x Wg) *
+/// x Wu`): both fused into the one tile loop (it used to be tiled once per
+/// product, the second time after the first had replaced it, and crash).
+/// The values are the `linalg` tier's, up to the order of the sums.
+#[test]
+fn an_elementwise_op_of_two_blas_products_fuses_both() {
+    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("blas_two_products.cleave");
+    std::fs::write(
+        &source,
+        "
+        use nn;
+        fn main() -> f32 {
+            rand_seed(1);
+            let x: Tensor<f32, 256, 32> = Init::he();
+            let g: Tensor<f32, 32, 48> = Init::he();
+            let u: Tensor<f32, 32, 48> = Init::he();
+            sum(silu(matmul(x, g)) * matmul(x, u))
+        }
+        ",
+    )
+    .unwrap();
+    let run = |blas: bool| {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"));
+        command.args(["--no-openmp", "--no-debug-info", "--run"]);
+        if blas {
+            command.args(["--define", "BLAS_MIN_WORK=0"]);
+        }
+        let output = command.arg(&source).output().expect("cannot run cleave");
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let bits: i32 = stdout
+            .trim()
+            .strip_prefix("main returned: ")
+            .and_then(|b| b.parse().ok())
+            .unwrap_or_else(|| panic!("stdout: {stdout}\nstderr: {}", String::from_utf8_lossy(&output.stderr)));
+        f32::from_bits(bits as u32)
+    };
+    let (native, blas) = (run(false), run(true));
+    assert!((native - blas).abs() <= 1e-4 * native.abs().max(1.0), "linalg {native}, BLAS {blas}");
+}
+
+/// An elementwise op whose operand is a tensor computed just for it (a
+/// call's result, not fused into the op) writes its result into that
+/// operand's buffer instead of a new one (`cleave_mlir_shim::
+/// reuse_dying_inputs`); an operand read again afterwards is left alone.
+#[test]
+fn an_elementwise_op_writes_into_an_operand_that_dies_there() {
+    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("reuse_dying.cleave");
+    let dump = dir.join("reuse_dying_post_dealloc.mlir");
+    let _ = std::fs::remove_file(&dump);
+    std::fs::write(
+        &source,
+        "
+        use nn;
+        #[no_inline]
+        fn twice(a: Tensor<f32, 64, 64>) -> Tensor<f32, 64, 64> { a + a }
+        #[no_inline]
+        fn dies(a: Tensor<f32, 64, 64>, b: Tensor<f32, 64, 64>) -> f32 {
+            let t = twice(a);
+            sum(t * b)
+        }
+        #[no_inline]
+        fn lives(a: Tensor<f32, 64, 64>, b: Tensor<f32, 64, 64>) -> f32 {
+            let t = twice(a);
+            sum(t * b) + sum(t)
+        }
+        fn main() -> f32 {
+            rand_seed(1);
+            let a: Tensor<f32, 64, 64> = Init::he();
+            let b: Tensor<f32, 64, 64> = Init::he();
+            dies(a, b) + lives(a, b)
+        }
+        ",
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--no-debug-info", "--run"])
+        .arg(&source)
+        .env("CLEAVE_DUMP_POST_DEALLOC", &dump)
+        .output()
+        .expect("cannot run cleave");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("main returned"), "stdout: {stdout}\nstderr: {}", String::from_utf8_lossy(&output.stderr));
+    let ir = std::fs::read_to_string(&dump).expect("no IR dumped");
+    let body = |name: &str| -> String {
+        ir.lines()
+            .skip_while(|l| !l.contains(&format!("func.func private @{name}(")))
+            .take_while(|l| !l.starts_with("  }"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let allocs = |b: &str| b.lines().filter(|l| l.contains("memref.alloc") && l.contains("memref<64x64xf32>")).count();
+    // `twice`'s result, plus the product's own buffer only where `t` lives on.
+    assert_eq!(allocs(&body("dies")), 1, "`t * b` isn't written into `t`:\n{}", body("dies"));
+    assert_eq!(allocs(&body("lives")), 2, "`t`, still read, was overwritten:\n{}", body("lives"));
+}
+
+/// A BLAS product (its buffer laid out dynamically for `sgemm`) passed to a
+/// function, whose parameter has the plain layout: One-Shot Bufferize copies
+/// it into a fresh buffer of the plain layout; the copy's destination becomes
+/// the product's own buffer, of that same type
+/// (`cleave_mlir_shim::forward_copies_to_destinations`): no copy.
+#[test]
+fn a_blas_product_passed_to_a_function_is_not_copied() {
+    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("blas_to_call.cleave");
+    let dump = dir.join("blas_to_call_post_dealloc.mlir");
+    let _ = std::fs::remove_file(&dump);
+    std::fs::write(
+        &source,
+        "
+        use nn;
+        #[no_inline]
+        fn consume(t: Tensor<f32, 64, 48>) -> f32 { sum(t * t) }
+        #[no_inline]
+        fn produce(x: Tensor<f32, 64, 32>, w: Tensor<f32, 32, 48>, b: Tensor<f32, 1, 48>) -> f32 {
+            consume(matmul(x, w) + broadcast0(b))
+        }
+        fn main() -> f32 {
+            rand_seed(1);
+            let x: Tensor<f32, 64, 32> = Init::he();
+            let w: Tensor<f32, 32, 48> = Init::he();
+            let b: Tensor<f32, 1, 48> = Init::he();
+            produce(x, w, b)
+        }
+        ",
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--no-debug-info", "--define", "BLAS_MIN_WORK=0", "--run"])
+        .arg(&source)
+        .env("CLEAVE_DUMP_POST_DEALLOC", &dump)
+        .output()
+        .expect("cannot run cleave");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("main returned"), "stdout: {stdout}\nstderr: {}", String::from_utf8_lossy(&output.stderr));
+    let ir = std::fs::read_to_string(&dump).expect("no IR dumped");
+    let produce: String = ir
+        .lines()
+        .skip_while(|l| !l.contains("func.func private @produce("))
+        .take_while(|l| !l.starts_with("  }"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(produce.contains("cleave_blas_sgemm"), "not on the BLAS tier:\n{produce}");
+    assert!(!produce.contains("memref.copy"), "the product is copied:\n{produce}");
+}

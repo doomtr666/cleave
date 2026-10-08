@@ -598,6 +598,7 @@ pub unsafe fn register_cleave_rt_symbols(engine: &cleave_mlir_shim::ExecutionEng
     unsafe {
         engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
         engine.register_symbol("cleave_parallel_threads", cleave_rt::cleave_parallel_threads as *mut ());
+        engine.register_symbol("cleave_bind_worker", cleave_rt::cleave_bind_worker as *mut ());
         engine.register_symbol("rand_seed", cleave_rt::rand_seed as *mut ());
         engine.register_symbol("rand_state", cleave_rt::rand_state as *mut ());
         engine.register_symbol("cleave_ckpt_create", cleave_rt::checkpoint::cleave_ckpt_create as *mut ());
@@ -1052,6 +1053,13 @@ pub fn register_passes() {
 /// temporary directory, the path MLIR's `transform-preload-library` reads
 /// it from; named after its content's hash, so that a binary never reads
 /// another version's.
+/// Rows of a BLAS product computed per tile when it is fused with its
+/// elementwise consumer (`cleave_mlir_shim::blas_tile_and_fuse`): a tile of a
+/// product 1024 wide is 512 KB, within a core's 1 MB L2 alongside its slice
+/// of `A`; fewer rows would call `sgemm` more often, each call packing `B`
+/// again.
+const BLAS_TILE_ROWS: i64 = 128;
+
 fn matmul_schedule_path() -> Result<String, String> {
     use std::hash::{Hash, Hasher};
     const SCHEDULE: &str = include_str!("../mlir/matmul_vectorize.transform.mlir");
@@ -1216,6 +1224,18 @@ pub fn lower_to_llvm<'c>(
     // crate's source directory, so a `cleave` binary moved away from its
     // checkout couldn't compile a matmul.
     let pass_manager = pass::PassManager::new(context);
+    // The BLAS tier (`stdlib/linalg/matrix.cleave`, above `BLAS_MIN_WORK`):
+    // each product's elementwise consumer tiled by rows with the product
+    // fused in, then every marked product a `sgemm` call, before the
+    // schedule below vectorizes the `linalg` tier's.
+    {
+        let raw = module.as_operation().to_raw();
+        let fused = unsafe { cleave_mlir_shim::blas_tile_and_fuse(raw, BLAS_TILE_ROWS) };
+        let lowered = unsafe { cleave_mlir_shim::lower_blas_matmuls(raw) };
+        if time_stages() {
+            eprintln!("cleave stage: BLAS products: {lowered}, fused with their consumer: {fused}");
+        }
+    }
     let schedule = matmul_schedule_path().map_err(|e| vec![e])?;
     if parse_pass_pipeline(
         pass_manager.as_operation_pass_manager(),
@@ -1302,6 +1322,14 @@ pub fn lower_to_llvm<'c>(
     // enough to afford.
     crate::unroll_jam::unroll_and_jam_reductions(context, module, options.unroll_jam);
 
+    // An elementwise op writing a fresh tensor while one of its operands, a
+    // local result, dies there: it writes into that operand
+    // (`cleave_mlir_shim::reuse_dying_inputs`), one buffer fewer alive.
+    let reused = unsafe { cleave_mlir_shim::reuse_dying_inputs(module.as_operation().to_raw()) };
+    if time_stages() {
+        eprintln!("cleave stage: elementwise results written into a dying operand: {reused}");
+    }
+
     // `CLEAVE_DUMP_PRE_BUFFERIZE=<path>` -- the still-tensor-typed IR, as
     // `mlir_lower.rs` emitted it, immediately before one-shot-bufferize
     // runs. Pair it with `CLEAVE_DUMP_POST_DEALLOC` below: bufferization's
@@ -1342,6 +1370,15 @@ pub fn lower_to_llvm<'c>(
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (one-shot-bufferize)".to_string(),
         ]);
+    }
+
+    // A block of a buffer given to an extern as its destination (`sgemm`
+    // into `Slice::slice(out, ...)`, put back by `Slice::update`): written
+    // in place instead of copied out and back in
+    // (`cleave_mlir_shim::elide_block_copies`).
+    let elided = unsafe { cleave_mlir_shim::elide_block_copies(module.as_operation().to_raw()) };
+    if time_stages() {
+        eprintln!("cleave stage: blocks written in place: {elided}");
     }
 
     // `--scf-forall-to-parallel` -- the *other* half of the real parallelism
@@ -1411,6 +1448,14 @@ pub fn lower_to_llvm<'c>(
         ]);
     }
     crate::redundant_copy_elim::forward_out_param_copies(context, &mut *module);
+    // A result written into a fresh buffer of the out-parameter's type and
+    // then copied into it: written into the out-parameter directly
+    // (`cleave_mlir_shim::forward_copies_to_destinations`).
+    let forwarded =
+        unsafe { cleave_mlir_shim::forward_copies_to_destinations(module.as_operation().to_raw()) };
+    if time_stages() {
+        eprintln!("cleave stage: results written in their destination: {forwarded}");
+    }
     if let Ok(path) = std::env::var("CLEAVE_DUMP_POST_OUT_PARAMS") {
         std::fs::write(&path, module.as_operation().to_string())
             .unwrap_or_else(|e| eprintln!("CLEAVE_DUMP_POST_OUT_PARAMS: failed to write {path}: {e}"));
@@ -1550,12 +1595,24 @@ pub fn lower_to_llvm<'c>(
     // `--convert-linalg-to-affine-loops`, not the ordinary `-to-loops`
     // (`scf.for`) -- see the structured-vectorization stage right below for
     // why: `--affine-super-vectorize` only operates on `affine.for`.
+    //
+    // `--affine-fold-memref-alias-ops` then: a loop over a subview (a tile of a
+    // larger buffer, `cleave_mlir_shim::blas_tile_and_fuse`'s consumer
+    // writing its rows of the result; a `Slice::slice`) reads and writes the
+    // buffer it is a view of instead, at offset indices, so that its memrefs
+    // have the plain layout `--affine-super-vectorize` needs (it leaves a
+    // loop over any other scalar).
     let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::linalg::create_convert_linalg_to_affine_loops_pass());
     if timed_run(&pass_manager, &mut *module, line!()).is_err() {
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (linalg-to-affine-loops)".to_string(),
         ]);
+    }
+    let pass_manager = pass::PassManager::new(context);
+    pass_manager.nested_under("func.func").add_pass(pass::affine::create_affine_fold_mem_ref_alias_ops());
+    if timed_run(&pass_manager, &mut *module, line!()).is_err() {
+        return Err(vec!["MLIR-to-LLVM lowering pass failed (affine-fold-memref-alias-ops)".to_string()]);
     }
 
     // OpenMP parallelization -- marks every linalg-derived loop nest's own
@@ -1688,14 +1745,24 @@ pub fn lower_to_llvm<'c>(
     // did you intend to nest?") -- needs the same `outer(inner(...))`
     // nesting `mlir-opt`'s own `--pass-pipeline=` flag would, unlike `one-
     // shot-bufferize` above, which really does run at the module level.
+    //
+    // A loop over a strided memref that isn't a function's parameter (a
+    // `Slice::slice` view of a local tensor) remains: the pass leaves it
+    // scalar, for LLVM's loop vectorizer (its strides are static), and
+    // reports it as an `error:` diagnostic while succeeding. Not an error
+    // here: that one diagnostic is dropped while the pass runs.
     let pass_manager = pass::PassManager::new(context);
-    if parse_pass_pipeline(
+    let skipped_strided_loop = context.attach_diagnostic_handler(|diagnostic| {
+        diagnostic.to_string().contains("NYI: non-trivial layout map")
+    });
+    let vectorized = parse_pass_pipeline(
         pass_manager.as_operation_pass_manager(),
         "builtin.module(func.func(affine-super-vectorize{virtual-vector-size=16}))",
     )
-    .is_err()
-        || timed_run(&pass_manager, &mut *module, line!()).is_err()
-    {
+    .is_ok()
+        && timed_run(&pass_manager, &mut *module, line!()).is_ok();
+    context.detach_diagnostic_handler(skipped_strided_loop);
+    if !vectorized {
         return Err(vec![
             "MLIR-to-LLVM lowering pass failed (affine-super-vectorize)".to_string(),
         ]);
@@ -1849,6 +1916,13 @@ pub fn lower_to_llvm<'c>(
                 "MLIR-to-LLVM lowering pass failed (scf-to-openmp)".to_string(),
             ]);
         }
+    }
+
+    // Every parallel region's members place themselves one per physical core
+    // (`cleave_mlir_shim::bind_teams`, `cleave-rt`'s `cleave_bind_worker`).
+    let teams = unsafe { cleave_mlir_shim::bind_teams(module.as_operation().to_raw()) };
+    if time_stages() {
+        eprintln!("cleave stage: parallel regions placing their threads: {teams}");
     }
 
     // First `--convert-to-llvm`: alongside `--convert-vector-to-llvm`
@@ -2388,6 +2462,9 @@ unsafe fn register_openmp_stub_symbols(engine: &cleave_mlir_shim::ExecutionEngin
         "__kmpc_single",
         "__kmpc_end_single",
         "omp_in_parallel",
+        // Each team member's number, for its placement
+        // (`cleave_mlir_shim::bind_teams`).
+        "omp_get_thread_num",
     ];
     for symbol in OPENMP_RUNTIME_SYMBOLS {
         // SAFETY: see this function's own doc comment -- mirrors `register_
@@ -2407,6 +2484,7 @@ unsafe fn register_openmp_stub_symbols(engine: &cleave_mlir_shim::ExecutionEngin
 const KNOWN_CLEAVE_RT_SYMBOLS: &[&str] = &[
     "memrefCopy",
     "cleave_parallel_threads",
+    "cleave_bind_worker",
     "rand_seed",
     "rand_state",
     "cleave_ckpt_create",

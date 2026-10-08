@@ -135,6 +135,7 @@ fn run_counting(src: &str) -> (i32, i64) {
         engine.register_symbol("cleave_release_pool", cleave_rt::cleave_release_pool as *mut ());
         engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
         engine.register_symbol("cleave_parallel_threads", cleave_rt::cleave_parallel_threads as *mut ());
+        engine.register_symbol("cleave_bind_worker", cleave_rt::cleave_bind_worker as *mut ());
         engine.register_symbol("rand_seed", cleave_rt::rand_seed as *mut ());
         engine.register_symbol("rand_uniform_f32", cleave_rt::rand_uniform_f32 as *mut ());
         engine.register_symbol("rand_normal_f32", cleave_rt::rand_normal_f32 as *mut ());

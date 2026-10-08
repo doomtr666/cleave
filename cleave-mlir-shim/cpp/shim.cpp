@@ -41,7 +41,17 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/OpenMP/OpenMPDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
+#include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/TilingInterface.h"
+#include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Tensor/Transforms/Transforms.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
@@ -511,6 +521,670 @@ extern "C" void cleaveApplyNoInline(MlirOperation op) {
     if (f->removeAttr("cleave.noinline"))
       f->setAttr(f.getNoInlineAttrName(), UnitAttr::get(f.getContext()));
   });
+}
+
+// Two values computed the same way from the same operands: the same SSA
+// value, or results of the same side-effect-free operation (same name,
+// attributes, result types) on pairwise-same operands. What tells the two
+// `h * 8` of a slice's extract and insert apart before CSE has run.
+static bool sameValue(Value a, Value b, int depth = 8) {
+  if (a == b)
+    return true;
+  if (depth == 0)
+    return false;
+  auto ra = dyn_cast<OpResult>(a), rb = dyn_cast<OpResult>(b);
+  if (!ra || !rb || ra.getResultNumber() != rb.getResultNumber())
+    return false;
+  Operation *x = ra.getOwner(), *y = rb.getOwner();
+  if (x->getName() != y->getName() || x->getAttrDictionary() != y->getAttrDictionary() ||
+      x->getResultTypes() != y->getResultTypes() || x->getNumOperands() != y->getNumOperands() ||
+      x->getNumRegions() != 0 || y->getNumRegions() != 0 || !isMemoryEffectFree(x))
+    return false;
+  for (auto [p, q] : llvm::zip(x->getOperands(), y->getOperands()))
+    if (!sameValue(p, q, depth - 1))
+      return false;
+  return true;
+}
+
+// The base a memref is a view of: through subviews, casts and reinterpret
+// casts, down to its allocation or block argument.
+static Value viewRoot(Value v) {
+  while (Operation *def = v.getDefiningOp()) {
+    if (auto sv = dyn_cast<memref::SubViewOp>(def))
+      v = sv.getSource();
+    else if (auto c = dyn_cast<memref::CastOp>(def))
+      v = c.getSource();
+    else if (auto rc = dyn_cast<memref::ReinterpretCastOp>(def))
+      v = rc.getSource();
+    else if (auto meta = dyn_cast<memref::ExtractStridedMetadataOp>(def))
+      v = meta.getSource();
+    else
+      break;
+  }
+  return v;
+}
+
+// The same region of the same buffer: one value, or subviews of one source
+// at offsets, sizes and strides computed the same way.
+static bool sameRegion(Value a, Value b) {
+  if (a == b)
+    return true;
+  auto x = a.getDefiningOp<memref::SubViewOp>(), y = b.getDefiningOp<memref::SubViewOp>();
+  if (!x || !y || x.getSource() != y.getSource() || x.getType() != y.getType())
+    return false;
+  auto same = [](ArrayRef<OpFoldResult> l, ArrayRef<OpFoldResult> r) {
+    if (l.size() != r.size())
+      return false;
+    for (auto [p, q] : llvm::zip(l, r)) {
+      if (isEqualConstantIntOrValue(p, q))
+        continue;
+      auto vp = dyn_cast<Value>(p), vq = dyn_cast<Value>(q);
+      if (!vp || !vq || !sameValue(vp, vq))
+        return false;
+    }
+    return true;
+  };
+  return same(x.getMixedOffsets(), y.getMixedOffsets()) && same(x.getMixedSizes(), y.getMixedSizes()) &&
+         same(x.getMixedStrides(), y.getMixedStrides());
+}
+
+// A block of a buffer handed to something that writes through a pointer (an
+// `extern` such as `cleave_blas_sgemm`, `stdlib/blas`'s `Sgemm::sgemm`, given
+// `Slice::slice(out, ...)` as destination) and put back where it came from
+// (`Slice::update(out, ..., same offsets)`). One-Shot Bufferize can't see
+// the write, so it works on a copy:
+//
+//   %tmp = memref.alloc()
+//   memref.copy %S, %tmp          %S: the block, a subview of %B
+//   ... the write, through a pointer to %tmp
+//   memref.copy %tmp, %T          %T: the same block of %B
+//
+// When nothing between the two copies touches %B any other way, the copy
+// is the block itself: %tmp becomes %S, and both copies and %tmp go. %tmp
+// may only be viewed (cast, its pointer or layout read) besides the copies
+// and its deallocation; nothing in that block may take a pointer into %B
+// other than through %tmp before the copy back (it could alias the write).
+// After One-Shot Bufferize, before the deallocation passes. Returns how many
+// blocks it rewrote.
+extern "C" int64_t cleaveElideBlockCopies(MlirOperation op) {
+  SmallVector<memref::AllocOp> allocs;
+  unwrap(op)->walk([&](memref::AllocOp alloc) { allocs.push_back(alloc); });
+  int64_t elided = 0;
+  for (memref::AllocOp alloc : allocs) {
+    Value tmp = alloc.getResult();
+    // `%tmp` and its casts to a fully dynamic layout. Its layout may only be
+    // read through those: they read it at run time, from whatever buffer
+    // they are a cast of, so they give the block's real strides and offset
+    // once it replaces `%tmp`. A layout read of `%tmp` itself is a
+    // compile-time constant, `%tmp`'s own (an 8-wide block's row stride of 8
+    // where the block's is 16, a zero offset), and would be wrong for the
+    // block.
+    //
+    // Assumed, not checkable here: that no such constant was folded before
+    // bufferization either, through a cast of a statically laid out buffer
+    // (`to_buffer` to the plain layout, then a cast to a dynamic one: the
+    // stride read through the cast folds to the plain layout's). True of
+    // the buffer One-Shot Bufferize makes for a `to_buffer` whose own result
+    // has a dynamic layout, which is how `Sgemm::sgemm` gets `c`'s.
+    auto fullyDynamic = [](Type t) {
+      auto layout = dyn_cast<StridedLayoutAttr>(cast<MemRefType>(t).getLayout());
+      return layout && ShapedType::isDynamic(layout.getOffset()) &&
+             llvm::all_of(layout.getStrides(), ShapedType::isDynamic);
+    };
+    SmallVector<Value> fromTmpList{tmp};
+    SmallVector<Operation *> casts;
+    bool ok = true;
+    for (Operation *user : tmp.getUsers())
+      if (auto castOp = dyn_cast<memref::CastOp>(user)) {
+        ok &= fullyDynamic(castOp.getType());
+        casts.push_back(castOp);
+        fromTmpList.push_back(castOp.getResult());
+      }
+    llvm::SmallPtrSet<Value, 8> fromTmp(fromTmpList.begin(), fromTmpList.end());
+    memref::CopyOp copyIn, copyOut;
+    SmallVector<Operation *> deallocs;
+    for (Value v : fromTmpList)
+      for (Operation *user : v.getUsers()) {
+        bool direct = v == tmp;
+        if (auto copy = dyn_cast<memref::CopyOp>(user)) {
+          auto &slot = fromTmp.contains(copy.getTarget()) ? copyIn : copyOut;
+          ok &= !slot;
+          slot = copy;
+        } else if (direct && isa<memref::DeallocOp>(user)) {
+          deallocs.push_back(user);
+        } else if (direct && isa<memref::CastOp>(user)) {
+          // Checked above.
+        } else if (direct || !isa<memref::ExtractStridedMetadataOp, memref::ExtractAlignedPointerAsIndexOp>(user)) {
+          ok = false;
+        }
+      }
+    if (!ok || !copyIn || !copyOut || copyIn->getBlock() != copyOut->getBlock() ||
+        alloc->getBlock() != copyIn->getBlock() || !copyIn->isBeforeInBlock(copyOut))
+      continue;
+    Value block = copyIn.getSource();
+    if (!sameRegion(block, copyOut.getTarget()))
+      continue;
+    // `%S` must be usable wherever `%tmp` is.
+    Operation *blockDef = block.getDefiningOp();
+    if (blockDef && (blockDef->getBlock() != alloc->getBlock() || !blockDef->isBeforeInBlock(alloc)))
+      continue;
+    // A cast of `%tmp` must still be a valid cast of `%S`.
+    for (Operation *cast : casts)
+      ok &= memref::CastOp::areCastCompatible(block.getType(), cast->getResult(0).getType());
+    if (!ok)
+      continue;
+    Value root = viewRoot(block);
+    auto reachesRoot = [&](Operation *o) {
+      for (Value operand : o->getOperands())
+        if (isa<BaseMemRefType>(operand.getType()) && !fromTmp.contains(operand) && viewRoot(operand) == root)
+          return true;
+      return false;
+    };
+    // Only what may touch memory counts: making a view (the copy back's own
+    // subview) doesn't, taking a pointer out of one might.
+    auto mayAccess = [](Operation *o) {
+      return isa<memref::ExtractAlignedPointerAsIndexOp>(o) || o->getNumRegions() != 0 || !isMemoryEffectFree(o);
+    };
+    for (Operation *o = copyIn->getNextNode(); ok && o != copyOut.getOperation(); o = o->getNextNode())
+      o->walk([&](Operation *inner) { ok &= !(mayAccess(inner) && reachesRoot(inner)); });
+    for (Operation &o : *alloc->getBlock()) {
+      if (&o == copyOut.getOperation())
+        break;
+      if (isa<memref::ExtractAlignedPointerAsIndexOp>(o) && reachesRoot(&o))
+        ok = false;
+    }
+    if (!ok)
+      continue;
+    copyIn.erase();
+    copyOut.erase();
+    for (Operation *d : deallocs)
+      d->erase();
+    tmp.replaceAllUsesWith(block);
+    alloc.erase();
+    ++elided;
+  }
+  return elided;
+}
+
+// The buffer a value is, through casts and through loops that carry a
+// buffer and hand it back unchanged (every iteration writes it in place):
+// an `scf.while` result whose `scf.condition` forwards a "before" argument
+// that the "after" region yields back as it received it, traced to the
+// loop's initial operand. What a loop accumulating into a tensor
+// (`Slice::update` in a loop) leaves as its result.
+static Value carriedBuffer(Value v, int depth = 16) {
+  while (depth-- > 0) {
+    if (auto castOp = v.getDefiningOp<memref::CastOp>()) {
+      v = castOp.getSource();
+      continue;
+    }
+    auto result = dyn_cast<OpResult>(v);
+    auto loop = result ? dyn_cast<scf::WhileOp>(result.getOwner()) : scf::WhileOp();
+    if (!loop)
+      return v;
+    unsigned i = result.getResultNumber();
+    auto before = dyn_cast<BlockArgument>(loop.getConditionOp().getArgs()[i]);
+    if (!before || before.getOwner() != loop.getBeforeBody())
+      return v;
+    unsigned j = before.getArgNumber();
+    Value yielded = loop.getYieldOp().getResults()[j];
+    Value back = carriedBuffer(yielded, depth);
+    auto after = dyn_cast<BlockArgument>(back);
+    if (!after || after.getOwner() != loop.getAfterBody() || after.getArgNumber() != i)
+      return v;
+    v = loop.getInits()[j];
+  }
+  return v;
+}
+
+// A fresh buffer written and then copied whole into a destination of the
+// same type (the caller's out-parameter for a function's result, once
+// `buffer-results-to-out-params` has run, or a field of a returned tuple):
+//
+//   %tmp = memref.alloc()
+//   ... the writes, through %tmp, casts of it, loops carrying it
+//   memref.copy %tmp', %D           (%tmp' is %tmp, through those)
+//
+// When %D is available wherever %tmp is used, nothing else touches %D before
+// the copy and the copied value has no other use, the writes may go to %D
+// directly: %tmp becomes %D, the copy and %tmp go. The same type, layout
+// included, is what keeps this sound: whatever was derived from %tmp's
+// layout at compile time (a row stride, a zero offset) holds for %D too.
+// Returns how many buffers it forwarded.
+extern "C" int64_t cleaveForwardCopiesToDestinations(MlirOperation op) {
+  SmallVector<memref::CopyOp> copies;
+  unwrap(op)->walk([&](memref::CopyOp copy) { copies.push_back(copy); });
+  int64_t forwarded = 0;
+  for (memref::CopyOp copy : copies) {
+    Value source = copy.getSource(), dest = copy.getTarget();
+    auto alloc = carriedBuffer(source).getDefiningOp<memref::AllocOp>();
+    if (!alloc || alloc.getType() != dest.getType() || alloc->getBlock() != copy->getBlock() ||
+        !alloc->isBeforeInBlock(copy))
+      continue;
+    Value tmp = alloc.getResult();
+    // The copied value: not read after the copy (only freed).
+    bool ok = llvm::all_of(source.getUsers(), [&](Operation *user) {
+      if (user == copy.getOperation() || isa<memref::DeallocOp>(user))
+        return true;
+      Operation *ancestor = copy->getBlock()->findAncestorOpInBlock(*user);
+      return ancestor && ancestor->isBeforeInBlock(copy);
+    });
+    // `%D` usable wherever `%tmp` is, and `%tmp` used only before the copy.
+    auto func = alloc->getParentOfType<FunctionOpInterface>();
+    if (!ok || !func)
+      continue;
+    DominanceInfo dominance(func);
+    SmallVector<Operation *> deallocs;
+    for (Operation *user : tmp.getUsers()) {
+      if (isa<memref::DeallocOp>(user)) {
+        deallocs.push_back(user);
+        continue;
+      }
+      Operation *ancestor = alloc->getBlock()->findAncestorOpInBlock(*user);
+      ok &= dominance.properlyDominates(dest, user) && ancestor && ancestor->isBeforeInBlock(copy);
+    }
+    // Nothing touches `%D` between `%tmp`'s allocation and the copy.
+    Value root = viewRoot(dest);
+    for (Operation *o = alloc->getNextNode(); ok && o != copy.getOperation(); o = o->getNextNode())
+      o->walk([&](Operation *inner) {
+        for (Value operand : inner->getOperands())
+          if (isa<BaseMemRefType>(operand.getType()) && viewRoot(operand) == root)
+            ok = false;
+      });
+    if (!ok)
+      continue;
+    for (Operation *user : llvm::make_early_inc_range(source.getUsers()))
+      if (isa<memref::DeallocOp>(user))
+        user->erase();
+    copy.erase();
+    for (Operation *d : deallocs)
+      d->erase();
+    tmp.replaceAllUsesWith(dest);
+    alloc.erase();
+    ++forwarded;
+  }
+  // The other direction: a fresh buffer whose first write is a whole copy
+  // of a buffer of the same type that isn't used afterwards (a BLAS product,
+  // its buffer laid out dynamically for `sgemm`, passed to a function whose
+  // parameter has the plain layout: One-Shot Bufferize copies it into a
+  // fresh plain buffer). The destination becomes that buffer, sound for the
+  // same reason: the same type.
+  copies.clear();
+  unwrap(op)->walk([&](memref::CopyOp copy) { copies.push_back(copy); });
+  for (memref::CopyOp copy : copies) {
+    Value source = copy.getSource(), dest = copy.getTarget();
+    auto alloc = carriedBuffer(source).getDefiningOp<memref::AllocOp>();
+    auto fresh = dest.getDefiningOp<memref::AllocOp>();
+    if (!alloc || !fresh || alloc.getType() != fresh.getType() || alloc->getBlock() != copy->getBlock() ||
+        fresh->getBlock() != copy->getBlock() || !alloc->isBeforeInBlock(copy))
+      continue;
+    Block *block = copy->getBlock();
+    auto after = [&](Operation *user) {
+      Operation *ancestor = block->findAncestorOpInBlock(*user);
+      return ancestor && copy->isBeforeInBlock(ancestor);
+    };
+    auto before = [&](Operation *user) {
+      Operation *ancestor = block->findAncestorOpInBlock(*user);
+      return ancestor && ancestor->isBeforeInBlock(copy);
+    };
+    // The destination only used after the copy; the source buffer, and the
+    // value copied, only before it (or freed).
+    bool ok = llvm::all_of(dest.getUsers(), [&](Operation *u) { return u == copy.getOperation() || after(u); });
+    for (Value v : SmallVector<Value, 2>{alloc.getResult(), source})
+      ok &= llvm::all_of(v.getUsers(), [&](Operation *u) {
+        return u == copy.getOperation() || isa<memref::DeallocOp>(u) || before(u);
+      });
+    if (!ok)
+      continue;
+    for (Operation *user : llvm::make_early_inc_range(alloc.getResult().getUsers()))
+      if (isa<memref::DeallocOp>(user))
+        user->erase();
+    copy.erase();
+    dest.replaceAllUsesWith(alloc.getResult());
+    fresh.erase();
+    ++forwarded;
+  }
+  return forwarded;
+}
+
+// A product BLAS computes (`linalg.matmul` marked `cleave.blas`,
+// `stdlib/linalg/matrix.cleave` above `BLAS_MIN_WORK`) whose only consumer
+// is an elementwise op (a bias, an activation, a residual, a gradient's
+// pointwise factor): the consumer is tiled by `rows` rows and the product,
+// with what initializes it (its zero fill, a broadcast bias), fused into the
+// same loop. Each tile of the product is then consumed while it is still in
+// L2 instead of written to memory whole and read back: with every core busy,
+// memory gives a core ~6 GB/s where its L2 gives ~220. Before
+// `cleaveLowerBlasMatmuls`, on tensors. Returns how many products it fused.
+extern "C" int64_t cleaveBlasTileAndFuse(MlirOperation op, int64_t rows) {
+  // A consumer of several products (SwiGLU's `silu(gate) * up`) once: all
+  // of them are fused into its loop.
+  llvm::SetVector<linalg::GenericOp> consumers;
+  unwrap(op)->walk([&](linalg::MatmulOp product) {
+    if (!product->hasAttr("cleave.blas") || !product.hasPureTensorSemantics())
+      return;
+    Value result = product->getResult(0);
+    if (!result.hasOneUse())
+      return;
+    auto consumer = dyn_cast<linalg::GenericOp>(*result.getUsers().begin());
+    if (!consumer || !consumer.hasPureTensorSemantics() || consumer.getNumLoops() != 2 ||
+        consumer.getNumParallelLoops() != 2 || consumer.getNumDpsInits() != 1)
+      return;
+    // Pointwise over the product's rows: every operand read through a
+    // projected permutation, the result written through the identity, the
+    // product read through the identity.
+    if (!llvm::all_of(consumer.getIndexingMapsArray(), [](AffineMap m) { return m.isProjectedPermutation(); }) ||
+        !consumer.getMatchingIndexingMap(consumer.getDpsInitOperand(0)).isIdentity())
+      return;
+    for (OpOperand &input : consumer->getOpOperands())
+      if (input.get() == result && !consumer.getMatchingIndexingMap(&input).isIdentity())
+        return;
+    consumers.insert(consumer);
+  });
+  if (consumers.empty())
+    return 0;
+  MLIRContext *context = unwrap(op)->getContext();
+  IRRewriter rewriter(context);
+  int64_t fused = 0;
+  for (linalg::GenericOp consumer : consumers) {
+    scf::SCFTilingOptions tiling;
+    tiling.setTileSizes(getAsIndexOpFoldResult(context, ArrayRef<int64_t>{rows, 0}));
+    tiling.setLoopType(scf::SCFTilingOptions::LoopType::ForOp);
+    scf::SCFTileAndFuseOptions options;
+    options.setTilingOptions(tiling);
+    // What is fused: the products and what initializes them (a fill, a
+    // broadcast bias: any `linalg` op with only parallel loops, cheap to
+    // compute per tile), each only if every use of it is the consumer or
+    // another op fused with it. A producer with any other use would be
+    // computed twice, per tile here and whole for the others (a product the
+    // backward pass reads again: a `sgemm` too many).
+    llvm::SmallPtrSet<Operation *, 8> chain;
+    {
+      auto fusable = [](Operation *o) {
+        auto linalgOp = dyn_cast<linalg::LinalgOp>(o);
+        if (auto product = dyn_cast<linalg::MatmulOp>(o))
+          return product->hasAttr("cleave.blas") && product.hasPureTensorSemantics();
+        return linalgOp && linalgOp.hasPureTensorSemantics() && linalgOp.getNumLoops() == linalgOp.getNumParallelLoops();
+      };
+      SmallVector<Operation *> worklist{consumer.getOperation()};
+      llvm::SmallPtrSet<Operation *, 8> seen{consumer.getOperation()};
+      while (!worklist.empty()) {
+        Operation *user = worklist.pop_back_val();
+        for (Value operand : user->getOperands()) {
+          Operation *producer = operand.getDefiningOp();
+          if (!producer || !fusable(producer) || !seen.insert(producer).second)
+            continue;
+          bool onlyInChain = llvm::all_of(producer->getUsers(), [&](Operation *u) {
+            return u == consumer.getOperation() || chain.contains(u) || u == user;
+          });
+          if (!onlyInChain)
+            continue;
+          chain.insert(producer);
+          worklist.push_back(producer);
+        }
+      }
+    }
+    options.setFusionControlFn(
+        [&chain](tensor::ExtractSliceOp, OpResult producer,
+                 bool) -> std::optional<scf::SCFTileAndFuseOptions::ControlFnResult> {
+          if (chain.contains(producer.getOwner()))
+            return scf::SCFTileAndFuseOptions::ControlFnResult{};
+          return std::nullopt;
+        });
+    rewriter.setInsertionPoint(consumer);
+    FailureOr<scf::SCFTileAndFuseResult> tiled =
+        scf::tileConsumerAndFuseProducersUsingSCF(rewriter, cast<TilingInterface>(consumer.getOperation()), options);
+    if (failed(tiled))
+      continue;
+    for (auto [original, replacement] : tiled->replacements)
+      rewriter.replaceAllUsesWith(original, replacement);
+    // The tiled consumer, vectorized here in rows of 16 columns, as the
+    // `linalg` schedule does its epilogues: it writes rows of a larger
+    // result (a subview, after bufferization), which `--affine-super-
+    // vectorize` would leave scalar, and its tile loop's induction variable
+    // isn't an affine symbol `--affine-fold-memref-alias-ops` could fold the
+    // subview's offset into. A vector transfer reads and writes a strided
+    // view as well as a whole buffer.
+    for (Operation *tiledOp : tiled->tiledAndFusedOps) {
+      auto generic = dyn_cast<linalg::GenericOp>(tiledOp);
+      if (!generic || generic->getNumResults() != 1 ||
+          !llvm::any_of(generic->getUsers(), [](Operation *u) { return isa<tensor::InsertSliceOp>(u); }))
+        continue;
+      scf::SCFTilingOptions rowsOf16;
+      rowsOf16.setTileSizes(getAsIndexOpFoldResult(context, ArrayRef<int64_t>{1, 16}));
+      rewriter.setInsertionPoint(generic);
+      FailureOr<scf::SCFTilingResult> inner =
+          scf::tileUsingSCF(rewriter, cast<TilingInterface>(generic.getOperation()), rowsOf16);
+      if (failed(inner) || inner->tiledOps.size() != 1)
+        continue;
+      rewriter.replaceOp(generic, inner->replacements);
+      Operation *row = inner->tiledOps.front();
+      rewriter.setInsertionPoint(row);
+      FailureOr<linalg::VectorizationResult> vectorized = linalg::vectorize(rewriter, row, {1, 16}, {false, false});
+      if (succeeded(vectorized))
+        rewriter.replaceOp(row, vectorized->replacements);
+    }
+    // The untiled originals, now unused: erased here, the product before it
+    // becomes a `sgemm` call no dead-code elimination would remove. Tiling
+    // leaves dead slices of them in the loop first.
+    for (LoopLikeOpInterface loop : tiled->loops) {
+      SmallVector<Operation *> trivially;
+      loop->walk([&](Operation *o) {
+        if (isOpTriviallyDead(o))
+          trivially.push_back(o);
+      });
+      for (Operation *o : trivially)
+        rewriter.eraseOp(o);
+    }
+    // A tile of the product initialized from a slice of a whole-size empty
+    // tensor gets an empty tensor of the tile's size instead: a scratch tile
+    // reused from one iteration to the next, not a slice of a whole-size
+    // buffer written back to memory in the end.
+    SmallVector<Operation *> emptySlices;
+    for (LoopLikeOpInterface loop : tiled->loops)
+      loop->walk([&](tensor::ExtractSliceOp slice) {
+        if (slice.getSource().getDefiningOp<tensor::EmptyOp>())
+          emptySlices.push_back(slice);
+      });
+    if (!emptySlices.empty()) {
+      RewritePatternSet patterns(context);
+      tensor::populateFoldTensorEmptyPatterns(patterns);
+      GreedyRewriteConfig config;
+      config.setStrictness(GreedyRewriteStrictness::ExistingAndNewOps);
+      config.enableFolding(false);
+      (void)applyOpPatternsGreedily(emptySlices, std::move(patterns), config);
+    }
+    SmallVector<Operation *> dead{consumer.getOperation()};
+    while (!dead.empty()) {
+      Operation *o = dead.pop_back_val();
+      if (!o->use_empty() || !isa<linalg::LinalgOp>(o))
+        continue;
+      SmallVector<Operation *> producers;
+      for (Value operand : o->getOperands())
+        if (Operation *def = operand.getDefiningOp())
+          producers.push_back(def);
+      rewriter.eraseOp(o);
+      dead.append(producers.begin(), producers.end());
+    }
+    ++fused;
+  }
+  return fused;
+}
+
+// Every `linalg.matmul` marked `cleave.blas`, tiled or not: a call to
+// `cleave_blas_sgemm` (`cleave-rt`, `cblas_sgemm`) on its operands' buffers,
+// on tensors, before One-Shot Bufferize. Which operand is transposed comes
+// from the indexing maps (`(d2, d0)` for `A`, `(d1, d2)` for `B`); each
+// leading dimension is the buffer's real row stride, read at run time (a
+// tile is a view of a larger matrix). The destination's layout is dynamic
+// from the `to_buffer` on: `cleaveElideBlockCopies` relies on no layout fact
+// of it being known at compile time. A zero `linalg.fill` initializing the
+// product is dropped for `beta = 0`; anything else (a broadcast bias, `fma`'s
+// `c`) is accumulated into, `beta = 1`. Returns how many it lowered.
+extern "C" int64_t cleaveLowerBlasMatmuls(MlirOperation op) {
+  auto module = dyn_cast<ModuleOp>(unwrap(op));
+  if (!module)
+    return 0;
+  SmallVector<linalg::MatmulOp> products;
+  module.walk([&](linalg::MatmulOp product) {
+    if (product->hasAttr("cleave.blas") && product.hasPureTensorSemantics())
+      products.push_back(product);
+  });
+  if (products.empty())
+    return 0;
+  MLIRContext *context = module.getContext();
+  Type i32 = IntegerType::get(context, 32), i64 = IntegerType::get(context, 64);
+  FloatType f32 = Float32Type::get(context);
+  auto ptrTy = LLVM::LLVMPointerType::get(context);
+  auto sgemm = module.lookupSymbol<func::FuncOp>("cleave_blas_sgemm");
+  if (!sgemm) {
+    OpBuilder b(module.getBodyRegion());
+    sgemm = b.create<func::FuncOp>(
+        module.getLoc(), "cleave_blas_sgemm",
+        FunctionType::get(context, {i32, i32, i32, i32, i32, f32, ptrTy, i64, i32, ptrTy, i64, i32, f32, ptrTy, i64, i32},
+                          {}));
+    sgemm.setPrivate();
+  }
+  int64_t lowered = 0;
+  for (linalg::MatmulOp product : products) {
+    SmallVector<AffineMap> maps = product.getIndexingMapsArray();
+    MLIRContext *c = context;
+    auto d = [&](unsigned i) { return getAffineDimExpr(i, c); };
+    auto map2 = [&](AffineExpr x, AffineExpr y) { return AffineMap::get(3, 0, {x, y}, c); };
+    bool transA = maps[0] == map2(d(2), d(0)), transB = maps[1] == map2(d(1), d(2));
+    if ((!transA && maps[0] != map2(d(0), d(2))) || (!transB && maps[1] != map2(d(2), d(1))) ||
+        maps[2] != map2(d(0), d(1)))
+      continue;
+    Value a = product.getDpsInputOperand(0)->get(), bMat = product.getDpsInputOperand(1)->get();
+    Value init = product.getDpsInitOperand(0)->get();
+    auto aTy = cast<RankedTensorType>(a.getType()), bTy = cast<RankedTensorType>(bMat.getType());
+    auto cTy = cast<RankedTensorType>(init.getType());
+    if (!aTy.hasStaticShape() || !bTy.hasStaticShape() || !cTy.hasStaticShape() || !aTy.getElementType().isF32())
+      continue;
+    float beta = 1.0f;
+    Value dest = init;
+    if (auto fill = init.getDefiningOp<linalg::FillOp>()) {
+      auto zero = fill.getInputs()[0].getDefiningOp<arith::ConstantOp>();
+      auto value = zero ? dyn_cast<FloatAttr>(zero.getValue()) : FloatAttr();
+      if (value && value.getValue().isZero()) {
+        beta = 0.0f;
+        dest = fill.getOutputs()[0];
+      }
+    }
+    OpBuilder b(product);
+    Location loc = product.getLoc();
+    auto dynamicLayout = StridedLayoutAttr::get(c, ShapedType::kDynamic, {ShapedType::kDynamic, ShapedType::kDynamic});
+    auto bufferOf = [&](Value tensor, bool readOnly) -> Value {
+      auto ty = cast<RankedTensorType>(tensor.getType());
+      auto memTy = MemRefType::get(ty.getShape(), ty.getElementType(), dynamicLayout);
+      auto toBuffer = b.create<bufferization::ToBufferOp>(loc, memTy, tensor);
+      if (readOnly)
+        toBuffer.setReadOnly(true);
+      return toBuffer;
+    };
+    // The address of a buffer's first element and its row stride.
+    auto pointerAndStride = [&](Value buffer) -> std::pair<Value, Value> {
+      auto meta = b.create<memref::ExtractStridedMetadataOp>(loc, buffer);
+      Value base = b.create<memref::ExtractAlignedPointerAsIndexOp>(loc, buffer);
+      Value baseI64 = b.create<arith::IndexCastOp>(loc, i64, base);
+      Value offset = b.create<arith::IndexCastOp>(loc, i64, meta.getOffset());
+      Value four = b.create<arith::ConstantIntOp>(loc, i64, 4);
+      Value address = b.create<arith::AddIOp>(loc, baseI64, b.create<arith::MulIOp>(loc, offset, four));
+      Value ptr = b.create<LLVM::IntToPtrOp>(loc, ptrTy, address);
+      Value stride = b.create<arith::IndexCastOp>(loc, i32, meta.getStrides()[0]);
+      return {ptr, stride};
+    };
+    Value aBuf = bufferOf(a, true), bBuf = bufferOf(bMat, true), cBuf = bufferOf(dest, false);
+    auto [aPtr, lda] = pointerAndStride(aBuf);
+    auto [bPtr, ldb] = pointerAndStride(bBuf);
+    auto [cPtr, ldc] = pointerAndStride(cBuf);
+    int64_t m = cTy.getDimSize(0), n = cTy.getDimSize(1), k = transA ? aTy.getDimSize(0) : aTy.getDimSize(1);
+    auto i32c = [&](int64_t v) -> Value { return b.create<arith::ConstantIntOp>(loc, i32, v); };
+    auto i64c = [&](int64_t v) -> Value { return b.create<arith::ConstantIntOp>(loc, i64, v); };
+    auto f32c = [&](float v) -> Value { return b.create<arith::ConstantFloatOp>(loc, f32, APFloat(v)); };
+    b.create<func::CallOp>(loc, sgemm,
+                           ValueRange{i32c(transA), i32c(transB), i32c(m), i32c(n), i32c(k), f32c(1.0f), aPtr,
+                                      i64c(aTy.getNumElements()), lda, bPtr, i64c(bTy.getNumElements()), ldb,
+                                      f32c(beta), cPtr, i64c(cTy.getNumElements()), ldc});
+    Value result = b.create<bufferization::ToTensorOp>(loc, cTy, cBuf, /*restrict=*/true, /*writable=*/true);
+    product->getResult(0).replaceAllUsesWith(result);
+    Operation *fill = init.getDefiningOp<linalg::FillOp>();
+    product.erase();
+    if (beta == 0.0f && fill && fill->use_empty())
+      fill->erase();
+    ++lowered;
+  }
+  return lowered;
+}
+
+// An elementwise op (`linalg.generic`, every loop parallel) writing a fresh
+// tensor (`tensor.empty`) while one of its operands, of the same type and
+// read through the same identity map, has no other use: the op writes into
+// that operand instead. Each element is read before it is written at the
+// same index, so writing in place is sound, and One-Shot Bufferize still
+// checks it. One buffer fewer alive at once: a smaller working set, more of
+// it in cache. Only an operand computed in this function by an op that
+// gives a fresh, writable result (a `linalg` op, a call): a parameter is
+// borrowed, and a constant or a buffer made a tensor isn't ours to write.
+// Before One-Shot Bufferize. Returns how many ops it rewrote.
+extern "C" int64_t cleaveReuseDyingInputs(MlirOperation op) {
+  int64_t reused = 0;
+  unwrap(op)->walk([&](linalg::GenericOp generic) {
+    if (!generic.hasPureTensorSemantics() || generic.getNumDpsInits() != 1 ||
+        generic.getNumLoops() != generic.getNumParallelLoops())
+      return;
+    OpOperand *init = generic.getDpsInitOperand(0);
+    if (!init->get().getDefiningOp<tensor::EmptyOp>() || !generic.getMatchingIndexingMap(init).isIdentity())
+      return;
+    for (OpOperand *input : generic.getDpsInputOperands()) {
+      Value value = input->get();
+      Operation *producer = value.getDefiningOp();
+      if (!producer || !isa<linalg::LinalgOp, func::CallOp>(producer) || value.getType() != init->get().getType() ||
+          !generic.getMatchingIndexingMap(input).isIdentity() || !value.hasOneUse())
+        continue;
+      init->set(value);
+      ++reused;
+      return;
+    }
+  });
+  return reused;
+}
+
+// Every parallel region (`spawn`'s team, `cleaveLowerSpawns`; a parallel
+// loop's, `--convert-scf-to-openmp`) starts with each member placing itself:
+// `cleave_bind_worker(omp_get_thread_num())` (`cleave-rt`), one member per
+// physical core. Left to the OS, two members can share one core's SMT
+// siblings, and every barrier waits for that core for the whole run. Once per
+// thread at run time (the call returns at once afterwards), so harmless in a
+// region entered often. Returns how many regions it marked.
+extern "C" int64_t cleaveBindTeams(MlirOperation op) {
+  auto module = dyn_cast<ModuleOp>(unwrap(op));
+  if (!module)
+    return 0;
+  SmallVector<omp::ParallelOp> regions;
+  module.walk([&](omp::ParallelOp region) { regions.push_back(region); });
+  if (regions.empty())
+    return 0;
+  MLIRContext *context = module.getContext();
+  Type i32 = IntegerType::get(context, 32);
+  auto declare = [&](StringRef name, TypeRange inputs, TypeRange results) {
+    auto f = module.lookupSymbol<func::FuncOp>(name);
+    if (!f) {
+      OpBuilder b(module.getBodyRegion());
+      f = b.create<func::FuncOp>(module.getLoc(), name, FunctionType::get(context, inputs, results));
+      f.setPrivate();
+    }
+    return f;
+  };
+  auto threadNum = declare("omp_get_thread_num", {}, {i32});
+  auto bind = declare("cleave_bind_worker", {i32}, {});
+  for (omp::ParallelOp region : regions) {
+    Block &entry = region.getRegion().front();
+    OpBuilder b = OpBuilder::atBlockBegin(&entry);
+    Value thread = b.create<func::CallOp>(region.getLoc(), threadNum, ValueRange{}).getResult(0);
+    b.create<func::CallOp>(region.getLoc(), bind, ValueRange{thread});
+  }
+  return regions.size();
 }
 
 // A tensor that outlives the struct it was read from is adopted

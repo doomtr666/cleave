@@ -353,3 +353,28 @@ fn a_comprehension_of_spawns_over_a_numeric_range() {
     // 10 + 20 + 30 + 40
     assert!(out.contains("main returned: 1"), "{out}");
 }
+
+/// A team starts with each member placing itself on a physical core of its
+/// own (`cleave_mlir_shim::bind_teams`, `cleave_rt::cleave_bind_worker`): the
+/// call is in the lowered parallel region, and the program runs with it.
+#[test]
+fn a_team_places_its_members_one_per_core() {
+    let src = "
+        fn work(n: i32) -> i32 { n * 3 }
+        fn main() -> i32 {
+            let a = spawn work(10);
+            let b = spawn work(4);
+            a + b
+        }
+    ";
+    assert!(run("team_placement", src).contains("main returned: 42"));
+    let source = std::env::temp_dir().join("cleave-spawn").join("team_placement.cleave");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--no-debug-info", "--dump-mlir-lowered"])
+        .arg(&source)
+        .output()
+        .expect("cannot run cleave");
+    let ir = String::from_utf8_lossy(&output.stdout);
+    assert!(ir.contains("omp.parallel"), "no parallel region: {ir}");
+    assert!(ir.contains("@cleave_bind_worker") && ir.contains("@omp_get_thread_num"), "members not placed: {ir}");
+}
