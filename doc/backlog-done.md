@@ -2778,3 +2778,73 @@ bug", which no open entry describes any more: remove them. The switches left rea
 flags word.
 
 Fixed 2026-10-08: tagged releases removed end to end (`cleave_release_tagged`, `LAST_RELEASE_TAG`, `CodegenOptions::tag_releases`, `--tag-releases`, `cleave-build`'s option), `CLEAVE_COUNT_PARKED_HITS` removed; `CLEAVE_DEBUG_POOL`, `CLEAVE_TRACE_RC`, `CLEAVE_TRACE_SIZE` and the allocation serials described as the tools they are; `cleave_release` tests one `DIAGNOSTICS` flag instead of one per switch.
+
+## Debt: the test harnesses each carry their own copy of the pipeline
+
+`cleave/tests/` has at least ten private copies of the compile sequence (CPS conversion, derivative
+synthesis, e-graph, dead code, escape analysis, `insert_refcounting`, `lower_program`,
+`lower_to_llvm`, JIT symbol table): `leaks.rs`, `checkpoint.rs`, `language_model_ops.rs`,
+`affine_pool_alloc.rs`, `array_release_cascade.rs`, `extern_buffers.rs`, `refcount.rs`,
+`spawn_leaks.rs`, ... Each drifts from `pipeline.rs::build_optimized_cps` on its own, and most run with
+`tasks: false`: the leak of every array built by a function (2026-10-08, 3.8 GiB a nanoLM step) went
+unseen by the leak suite, which never runs nanoLM's shape with tasks. `main.rs` has the same problem
+inside the compiler (four copies of the optimize-and-refcount sequence, one per dump flag). One
+harness in the crate (`cleave::testing`), built on the real pipeline function and taking
+`CodegenOptions` (tasks on by default), with the allocation counter and the JIT symbol table; the
+dump flags as taps on the one pipeline.
+
+Done 2026-10-08. `cleave::run` (`cleave/src/run.rs`): `check_sources` (parse, defines, type check, diagnostics
+rendered), `run_main`/`run_main_with` (`pipeline::build_optimized_cps`, lowering, `lower_to_llvm`, the JIT with
+libomp when the code needs it, `cleave-rt`'s symbols plus a caller's own), `run_source`/`run_source_with`. The
+CLI's `--run` uses it; so do the harnesses that ran a program (`leaks`, `spawn_leaks`, `checkpoint`,
+`language_model_ops`, `extern_buffers`, `refcount`, `affine_pool_alloc`, `user_guide`, `const_decl`, `blas`)
+and `array_release_cascade` (through `build_optimized_cps`); the dump flags go through `build_optimized_cps`
+too (`--dump-mlir` now shows the releases `--run` lowers). Several harnesses had drifted far: `user_guide`
+and `const_decl` skipped the e-graph, refcounting and `lower_to_llvm` (`user_guide` even the type check),
+`refcount` ran three hand-picked passes, and `affine_pool_alloc`'s "pool disabled" tests set an environment
+variable `lower_program` had stopped reading, so ran with the pool on. Kept apart on purpose: the stage tests
+of `mlir_lower.rs`, `egraph.rs`, `unify_alloc.rs`. Tasks: on in `spawn_leaks` (its own binary, a
+process-wide counter), now with nanoLM's shape too (an array model's gradient as an array of spawned parts,
+which fails without the 2026-10-08 array ownership fix); off elsewhere, since several programs spawning at
+once in one process crash (entry above) and `leaks.rs` counts per thread.
+
+## Debt: code nothing uses: experimental passes, stdlib helpers
+
+`unroll_jam.rs` (629 lines) and `chain_split.rs` (364) run only behind `CodegenOptions::unroll_jam`/
+`chain_split`, both `false` by default; no example, build script or test turns them on, except
+`cleave/tests/unroll_jam_probe.rs` exercising the transformation alone. Their history
+(`backlog-done.md`: the native matmul's IPC investigation, "two dead ends and one real fix") says they
+didn't pay, and the products that mattered moved to BLAS since. Removed with their options and probe,
+or kept with a sentence saying what would make them worth turning on. `CodegenOptions::tag_releases`
+belongs to the runtime-diagnostics entry below. The stdlib has the same kind of dead weight:
+`blas_matmul_transpose_a`, `blas_fma`, `blas_fma_transpose_a` and `blas_fma_transpose_b`
+(`stdlib/linalg/matrix.cleave`) are called and tested nowhere, left from before the BLAS dispatch moved
+to the `blas` attribute; a test each, or gone.
+
+Done 2026-10-08: `unroll_jam.rs` and `chain_split.rs` removed with `CodegenOptions::unroll_jam`/`chain_split`,
+their CLI flags (`--unroll-jam`, `--chain-split`), `cleave-build`'s setters, their trace variables, the user
+guide's rows and `cleave/tests/unroll_jam_probe.rs` (about 1,600 lines); the four BLAS helpers removed from
+`stdlib/linalg/matrix.cleave`. Their history stays in `backlog-done.md`.
+
+## Debt: compiler panics reachable from user programs
+
+`mlir_lower.rs` has 191 `panic!`s and `cps.rs` 27; most are internal invariants, some are unsupported
+programs (index-assignment into a `#[mlir_type]` value, a function-typed struct field, constructing
+`[Tensor<...>; N]`, a struct array nested in an array, a multi-def loop condition, "CPS doesn't
+support ... yet"). A user gets a compiler crash, not a located error. A corpus of small programs, one
+per unsupported construct, run by a test that expects a diagnostic with a span; each panic it reaches
+becomes a check before lowering (inference or a pre-lowering validation pass). Found and fixed
+by the 2026-10-08 audit's probes: an integer literal that doesn't fit its type (past `i64` it panicked,
+`let x: i8 = 300;` wrapped silently to `44`) is now a located error (`infer.rs::check_literal_ranges`);
+a lambda literal passed straight to a call now works (`lower.rs::hoist_lambda_args`), one used as any
+other value is a located error (`pipeline.rs::check_lambda_positions`). Left: the five unsupported
+constructs above.
+
+Done 2026-10-08 for the constructs found: assigning to a tensor's element ("assigning to an element of a
+`Tensor<f32, 2, 2>` isn't supported yet", it was a mismatch against an array of unknowns), an array of a
+natively represented struct and an array of arrays of structs (`monomorphize.rs::check_unsupported_arrays`,
+over every concrete body with its types, through the new `ast::for_each_expr`), a struct field holding a
+lambda (`check_lambda_positions`). Test: `tests/diag.rs`, `unsupported_constructs_are_located_errors`. The
+multi-def loop condition panic (`mlir_lower.rs`) wasn't reproduced from source; the other panics are
+internal invariants.
+

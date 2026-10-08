@@ -9,17 +9,7 @@
 //! 72 steps, and anything under `NOISE` bytes per step is that, not a leak
 //! (a leaked gradient is thousands of bytes per step).
 
-use cleave::cps::{collect_mlir_types, collect_struct_schemas};
-use cleave::driver::compile;
-use cleave::egraph::{DerivativeRequest, optimize_program, synthesize_derivatives};
-use cleave::mlir_lower::lower_program;
-use cleave::pipeline::{Backend, CodegenOptions, check_type_errors, lower_to_llvm};
-use cleave::refcount::insert_refcounting;
-use cleave::registry::Registry;
-use melior::Context;
-use melior::dialect::DialectRegistry;
-use melior::ir::operation::OperationLike;
-use melior::utility::register_all_dialects;
+use cleave::pipeline::CodegenOptions;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
@@ -54,96 +44,29 @@ fn live() -> i64 {
     LIVE.with(|l| l.get())
 }
 
-fn context() -> Context {
-    let dialect_registry = DialectRegistry::new();
-    register_all_dialects(&dialect_registry);
-    let context = Context::new();
-    context.append_dialect_registry(&dialect_registry);
-    context.load_all_available_dialects();
-    context
-}
-
 /// One run at a time: the runtime's pool is shared by every thread, so a
 /// block one test parks could be handed to another's run, skewing both
 /// counts.
 static RUN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Compiles `src` through the real pipeline and runs `main`, returning its
-/// result and the bytes the run left allocated.
+/// Compiles `src` through the real pipeline (`cleave::run`, what `--run`
+/// uses) and runs `main`, returning its result and the bytes the run left
+/// allocated. Tasks off: spawned calls run in place, on this thread, the one
+/// whose allocations are counted (`spawn_leaks.rs` covers tasks).
 fn run_counting(src: &str) -> (i32, i64) {
     let _one_at_a_time = RUN.lock().unwrap_or_else(|e| e.into_inner());
-    let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
-    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
-    let registry = Registry::build(&program);
-    if let Err(diags) = check_type_errors(&program, &registry) {
-        panic!("type check failed: {diags:?}");
-    }
-    let units = cleave::cps::collect_units(&program, &registry);
-    let requests: Vec<DerivativeRequest> = units
-        .iter()
-        .filter_map(|u| match &u.body {
-            cleave::cps::UnitBody::Derivative(of, is_grad, grad_target_index) => Some(DerivativeRequest {
-                name: u.name.clone(),
-                of: of.clone(),
-                is_grad: *is_grad,
-                grad_target_index: *grad_target_index,
-            }),
-            _ => None,
-        })
-        .collect();
-    let cps_program = cleave::cps::convert_program(units, None);
-    let struct_schemas = collect_struct_schemas(&program);
-    let cps_program = synthesize_derivatives(cps_program, &requests, &registry, &struct_schemas)
-        .unwrap_or_else(|e| panic!("cannot derive: {e:?}"));
-    let (cps_program, _) = optimize_program(cps_program, &registry, false);
-    let cps_program = cleave::cps::eliminate_dead_code(cps_program);
-    let mlir_types = collect_mlir_types(&program);
-    let escaping = cleave::escape::escaping_struct_vars(&cps_program);
-    let cps_program = insert_refcounting(cps_program, &struct_schemas, &mlir_types, &escaping);
-
-    let context = context();
-    melior::utility::register_all_llvm_translations(&context);
-    let mut module = lower_program(&context, &cps_program, &mlir_types, collect_struct_schemas(&program));
-    assert!(module.as_operation().verify(), "module failed verification");
-    let options = CodegenOptions {
-        opt_level: 2,
-        openmp: false,
-        target_cpu: None,
-        target_features: None,
-        backend: Backend::Cpu,
-        // In-process engine without libomp: spawned calls run in place.
-        tasks: false,
-        ..Default::default()
-    };
-    cleave::options::set(options.clone());
-    lower_to_llvm(&context, &mut module, &options).expect("lower_to_llvm failed");
-
-    let engine = melior::ExecutionEngine::new(&module, options.opt_level as usize, &[], true, false);
-    unsafe {
-        engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
-        engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
-        engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
-        engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
-        engine.register_symbol("cleave_release_void", cleave_rt::cleave_release_void as *mut ());
-        engine.register_symbol("cleave_alloc_local", cleave_rt::cleave_alloc_local as *mut ());
-        engine.register_symbol("cleave_region_enter", cleave_rt::cleave_region_enter as *mut ());
-        engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
-        engine.register_symbol("cleave_alloc_pool", cleave_rt::cleave_alloc_pool as *mut ());
-        engine.register_symbol("cleave_release_pool", cleave_rt::cleave_release_pool as *mut ());
-        engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
-        engine.register_symbol("rand_seed", cleave_rt::rand_seed as *mut ());
-        engine.register_symbol("rand_uniform_f32", cleave_rt::rand_uniform_f32 as *mut ());
-        engine.register_symbol("rand_normal_f32", cleave_rt::rand_normal_f32 as *mut ());
-        engine.register_symbol("cleave_blas_sgemm", cleave_rt::cleave_blas_sgemm as *mut ());
-    }
-    let before = live();
-    let mut result: i32 = 0;
-    unsafe {
-        engine
-            .invoke_packed("main", &mut [&mut result as *mut i32 as *mut ()])
-            .expect("JIT invocation failed");
-    }
-    (result, live() - before)
+    let options = CodegenOptions { openmp: false, tasks: false, ..Default::default() };
+    let (program, registry, sources) = cleave::run::check_sources(vec![("test.cleave".to_string(), src.to_string())], &[], false)
+        .unwrap_or_else(|e| panic!("{}", e.join("
+")));
+    cleave::run::run_main_with(&program, &registry, Some(&sources), &options, &[], |invoke| {
+        let before = live();
+        let result = invoke().unwrap_or_else(|e| panic!("{}", e.join("
+")));
+        (result, live() - before)
+    })
+    .unwrap_or_else(|e| panic!("{}", e.join("
+")))
 }
 
 /// A small `mnist-interop`: two `Dense` layers in a `Trainable` struct,
@@ -758,6 +681,70 @@ fn a_repeated_struct_array_leaves_nothing_behind() {
                     keep = a[2];
                 }};
                 if sum(keep.d) == sum(keep.d) {{ 1 }} else {{ 0 }}
+            }}
+            "
+        )
+    };
+    let (r_short, short) = run_counting(&program(8));
+    let (r_long, long) = run_counting(&program(72));
+    assert_eq!((r_short, r_long), (1, 1));
+    let per_step = (long - short) / 64;
+    assert!(per_step < NOISE, "{per_step} bytes leaked per step");
+}
+
+/// An array of arrays of structs (`[[L; 2]; 2]`, each inner array an array
+/// object of its own) built, written and read each iteration: released with
+/// its inner arrays and their elements, nothing left behind.
+#[test]
+fn a_nested_struct_array_leaves_nothing_behind() {
+    let program = |steps: u32| {
+        format!(
+            "
+            use nn;
+            struct L {{ d: Tensor<f32, 16, 16> }}
+            fn mk() -> L {{ L(d: Init::he()) }}
+            fn main() -> i32 {{
+                rand_seed(1);
+                let mut keep = mk();
+                for s in 0..{steps} {{
+                    let mut g = [[mk(), mk()], [mk(), mk()]];
+                    g[1][0] = mk();
+                    keep = g[1][0];
+                    let row = g[0];
+                    keep = row[1];
+                }};
+                if sum(keep.d) == sum(keep.d) {{ 1 }} else {{ 0 }}
+            }}
+            "
+        )
+    };
+    let (r_short, short) = run_counting(&program(8));
+    let (r_long, long) = run_counting(&program(72));
+    assert_eq!((r_short, r_long), (1, 1));
+    let per_step = (long - short) / 64;
+    assert!(per_step < NOISE, "{per_step} bytes leaked per step");
+}
+
+/// An array of tensors (`[Tensor<f32, 16, 16>; 3]`, each slot a tensor's
+/// descriptor) built, read, overwritten and summed each iteration, one read
+/// carried out of the loop: its buffers released with the array, the
+/// overwritten one when replaced, nothing left behind.
+#[test]
+fn an_array_of_tensors_leaves_nothing_behind() {
+    let program = |steps: u32| {
+        format!(
+            "
+            use nn;
+            fn mk() -> Tensor<f32, 16, 16> {{ Init::he() }}
+            fn main() -> i32 {{
+                rand_seed(1);
+                let mut keep = mk();
+                for s in 0..{steps} {{
+                    let mut ts: [Tensor<f32, 16, 16>; 3] = [mk(), mk(), mk()];
+                    ts[1] = ts[0] + ts[2];
+                    keep = ts[1];
+                }};
+                if sum(keep) == sum(keep) {{ 1 }} else {{ 0 }}
             }}
             "
         )

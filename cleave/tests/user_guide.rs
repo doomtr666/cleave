@@ -13,15 +13,9 @@
 //! value — matching this whole project's own "verified by running it, not
 //! just by type-checking" discipline.
 
-use cleave::cps::{collect_mlir_types, collect_struct_schemas, collect_units, convert_program};
-use cleave::driver::compile;
-use cleave::mlir_lower::lower_program;
-use cleave::pipeline::strip_ciface_wrapper_debug_info;
-use cleave::registry::Registry;
+use cleave::pipeline::CodegenOptions;
 use melior::Context;
 use melior::dialect::DialectRegistry;
-use melior::ir::operation::OperationLike;
-use melior::pass;
 use melior::utility::register_all_dialects;
 
 fn context() -> Context {
@@ -33,148 +27,13 @@ fn context() -> Context {
     context
 }
 
-fn build_module<'c>(context: &'c Context, src: &str) -> melior::ir::Module<'c> {
-    let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
-    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
-    let registry = Registry::build(&program);
-    let units = collect_units(&program, &registry);
-    let cps_program = convert_program(units, None);
-    let mlir_types = collect_mlir_types(&program);
-    let struct_schemas = collect_struct_schemas(&program);
-    let module = lower_program(context, &cps_program, &mlir_types, struct_schemas);
-    assert!(
-        module.as_operation().verify(),
-        "generated MLIR module failed verification"
-    );
-    module
-}
-
-/// Lowers `src` to the `llvm` dialect and JIT-invokes its `main`, returning
-/// the result. `scf.if` (and any other structured-control-flow op) has no
-/// direct LLVM IR translation of its own -- `create_scf_to_control_flow`
-/// lowers it to the `cf` dialect's ordinary branches first, which `create_
-/// to_llvm` *does* know how to translate.
-fn run_i32(context: &Context, src: &str) -> i32 {
-    let mut module = build_module(context, src);
-
-    let pass_manager = pass::PassManager::new(context);
-    pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
-    // `--expand-strided-metadata`/`--lower-affine`: needed once a real
-    // `memref.subview` with a genuinely non-trivial `strided<...>` layout
-    // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
-    // has the story).
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
-    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
-    pass_manager.add_pass(pass::conversion::create_lower_affine());
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
-    // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
-    // `--convert-to-llvm` again -- not `--finalize-memref-to-llvm` once,
-    // up front, the way `pipeline.rs`'s own real final-lowering stage does
-    // it. Found the hard way, isolated to a minimal, completely unrelated
-    // case (`array_literal_index_and_mutation`'s own plain `a[0] = 10` --
-    // no `Tensor`, no nested array, nothing this rewrite's own new
-    // `memref.subview` shape touches at all): running `--finalize-memref-
-    // to-llvm` before any `--convert-to-llvm` at all left a real, load-
-    // bearing type mismatch behind -- an `llvm.mlir.constant` whose own
-    // attribute stayed `index`-typed while its result type became `i64`,
-    // wrapped in a genuinely unreconcilable `i64`-to-`index`-to-`i64`
-    // round trip `--reconcile-unrealized-casts` (already at the very end
-    // of this pipeline) can't fold away because the two casts aren't each
-    // other's exact inverse consumer/producer pair in the shape that pass
-    // looks for. A first `--convert-to-llvm` pass, run *before* `--
-    // finalize-memref-to-llvm`, apparently gives ordinary (non-subview)
-    // `index`-typed constants a chance to convert cleanly on their own,
-    // before `--finalize-memref-to-llvm` ever has to reason about them --
-    // confirmed directly by testing the ordering both ways on this exact
-    // failing case, not assumed.
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
-    pass_manager
-        .run(&mut module)
-        .expect("lowering to the llvm dialect must succeed");
-    strip_ciface_wrapper_debug_info(context, module.as_operation_mut());
-
-    let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
-    // Registered unconditionally, harmless if unused -- any struct
-    // construction anywhere in the program needs `cleave_alloc` (see
-    // `mlir_lower.rs::alloc_struct`'s own doc comment).
-    unsafe {
-        engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
-        engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
-        engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
-        engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
-        engine.register_symbol("cleave_release_void", cleave_rt::cleave_release_void as *mut ());
-        engine.register_symbol("cleave_alloc_local", cleave_rt::cleave_alloc_local as *mut ());
-        engine.register_symbol("cleave_region_enter", cleave_rt::cleave_region_enter as *mut ());
-        engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
-        engine.register_symbol("cleave_alloc_pool", cleave_rt::cleave_alloc_pool as *mut ());
-        engine.register_symbol("cleave_release_pool", cleave_rt::cleave_release_pool as *mut ());
-        engine.register_symbol("print_i8", cleave_rt::print_i8 as *mut ());
-        engine.register_symbol("print_i16", cleave_rt::print_i16 as *mut ());
-        engine.register_symbol("print_i32", cleave_rt::print_i32 as *mut ());
-        engine.register_symbol("print_i64", cleave_rt::print_i64 as *mut ());
-        engine.register_symbol("print_f32", cleave_rt::print_f32 as *mut ());
-        engine.register_symbol("print_f64", cleave_rt::print_f64 as *mut ());
-        engine.register_symbol("print_bytes", cleave_rt::print_bytes as *mut ());
-        // `use io;` now transitively pulls in `stdlib/display/display.cleave`
-        // (non-generic `Display<i32>`/`Display<f32>`/`Display<f64>`, eagerly
-        // compiled) and `stdlib/dynarray/dynarray.cleave` (every `RawBuffer
-        // <T>` width, same reason) -- registered unconditionally, harmless
-        // if unused, same reasoning as the `print_*` symbols above.
-        engine.register_symbol(
-            "print_dynarray_bytes",
-            cleave_rt::print_dynarray_bytes as *mut (),
-        );
-        engine.register_symbol("format_f32", cleave_rt::format_f32 as *mut ());
-        engine.register_symbol("format_f64", cleave_rt::format_f64 as *mut ());
-        engine.register_symbol("dynarray_alloc_i8", cleave_rt::dynarray_alloc_i8 as *mut ());
-        engine.register_symbol("dynarray_grow_i8", cleave_rt::dynarray_grow_i8 as *mut ());
-        engine.register_symbol("dynarray_get_i8", cleave_rt::dynarray_get_i8 as *mut ());
-        engine.register_symbol("dynarray_set_i8", cleave_rt::dynarray_set_i8 as *mut ());
-        engine.register_symbol(
-            "dynarray_alloc_i16",
-            cleave_rt::dynarray_alloc_i16 as *mut (),
-        );
-        engine.register_symbol("dynarray_grow_i16", cleave_rt::dynarray_grow_i16 as *mut ());
-        engine.register_symbol("dynarray_get_i16", cleave_rt::dynarray_get_i16 as *mut ());
-        engine.register_symbol("dynarray_set_i16", cleave_rt::dynarray_set_i16 as *mut ());
-        engine.register_symbol(
-            "dynarray_alloc_i32",
-            cleave_rt::dynarray_alloc_i32 as *mut (),
-        );
-        engine.register_symbol("dynarray_grow_i32", cleave_rt::dynarray_grow_i32 as *mut ());
-        engine.register_symbol("dynarray_get_i32", cleave_rt::dynarray_get_i32 as *mut ());
-        engine.register_symbol("dynarray_set_i32", cleave_rt::dynarray_set_i32 as *mut ());
-        engine.register_symbol(
-            "dynarray_alloc_i64",
-            cleave_rt::dynarray_alloc_i64 as *mut (),
-        );
-        engine.register_symbol("dynarray_grow_i64", cleave_rt::dynarray_grow_i64 as *mut ());
-        engine.register_symbol("dynarray_get_i64", cleave_rt::dynarray_get_i64 as *mut ());
-        engine.register_symbol("dynarray_set_i64", cleave_rt::dynarray_set_i64 as *mut ());
-        engine.register_symbol(
-            "dynarray_alloc_f32",
-            cleave_rt::dynarray_alloc_f32 as *mut (),
-        );
-        engine.register_symbol("dynarray_grow_f32", cleave_rt::dynarray_grow_f32 as *mut ());
-        engine.register_symbol("dynarray_get_f32", cleave_rt::dynarray_get_f32 as *mut ());
-        engine.register_symbol("dynarray_set_f32", cleave_rt::dynarray_set_f32 as *mut ());
-        engine.register_symbol(
-            "dynarray_alloc_f64",
-            cleave_rt::dynarray_alloc_f64 as *mut (),
-        );
-        engine.register_symbol("dynarray_grow_f64", cleave_rt::dynarray_grow_f64 as *mut ());
-        engine.register_symbol("dynarray_get_f64", cleave_rt::dynarray_get_f64 as *mut ());
-        engine.register_symbol("dynarray_set_f64", cleave_rt::dynarray_set_f64 as *mut ());
-    }
-    let mut out: i32 = -1;
-    unsafe {
-        engine
-            .invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()])
-            .expect("JIT invocation must succeed");
-    }
-    out
+/// Compiles and runs `src`'s `main` through the real pipeline
+/// (`cleave::run`, what `--run` uses): the guide's examples as a user runs
+/// them. `_context` is unused, kept for the call sites.
+fn run_i32(_context: &Context, src: &str) -> i32 {
+    let options = CodegenOptions { openmp: false, tasks: false, ..Default::default() };
+    cleave::run::run_source("test.cleave", src, &options).unwrap_or_else(|e| panic!("{}", e.join("
+")))
 }
 
 // ---------------------------------------------------------------- Hello, cleave
@@ -630,13 +489,10 @@ fn a_define_left_unoverridden_uses_its_own_default() {
 fn cleave_openmp_is_a_usable_compiler_injected_define() {
     let context = context();
     let src = "fn main() -> i32 { if CLEAVE_OPENMP { 1 } else { 0 } }";
-    // This file's own `run_i32` goes through `Registry::build` (no real CLI
-    // context), which always injects `CLEAVE_OPENMP = true` -- the same
-    // universal default `resolve_codegen_options` itself resolves to absent
-    // an explicit `--openmp`/`--no-openmp` (`cleave/tests/const_decl.rs`'s
-    // own `cleave_openmp_reflects_the_resolved_openmp_option` exercises
-    // both values for real, threading a real `openmp` bool through).
-    assert_eq!(run_i32(&context, src), 1);
+    // It says what the run's options say: this file's `run_i32` runs without
+    // OpenMP (`cleave/tests/const_decl.rs`'s
+    // `cleave_openmp_reflects_the_resolved_openmp_option` checks both values).
+    assert_eq!(run_i32(&context, src), 0);
 }
 
 // ---------------------------------------------------------------- Turbofish

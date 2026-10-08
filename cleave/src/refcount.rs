@@ -215,9 +215,16 @@ pub(crate) fn is_handle_array(
     let name = match elem.as_ref() {
         Ty::Con(name) => name,
         Ty::App(name, _) => name,
+        // An array of arrays of structs: its elements are array objects too,
+        // each held by pointer (`[[P; 2]; 3]`).
+        Ty::Array(..) => return is_handle_array(elem, struct_schemas, mlir_types),
         _ => return false,
     };
-    struct_schemas.contains_key(name) && !mlir_types.contains_key(name)
+    // A `Tensor` too: its slots hold the tensors' descriptors, as a struct's
+    // tensor fields do. Not a `Vector` (`#[mlir_type(vector)]`), which has
+    // no buffer to hold.
+    struct_schemas.contains_key(name)
+        && mlir_types.get(name).is_none_or(|keyword| keyword == "tensor")
 }
 
 /// Every struct name with at least one real `PrimOp::Struct` construction
@@ -500,7 +507,8 @@ impl TensorViews {
     ) {
         match e {
             CExpr::LetPrim { var, op, args, cont, .. } => {
-                if let (PrimOp::Field { .. }, Some(CVal::Var(base))) = (op, args.first()) {
+                // A tensor read out of a struct's field or an array's slot.
+                if let (PrimOp::Field { .. } | PrimOp::Load { .. }, Some(CVal::Var(base))) = (op, args.first()) {
                     if var_types.get(var).is_some_and(|t| is_bare_tensor_ty(t, mlir_types)) {
                         if loop_args.contains(var) {
                             self.standalone.insert(*var);
@@ -1665,7 +1673,9 @@ fn rewrite_body(
         // A tensor read out of a field and carried by a loop
         // (`TensorViews::standalone`): read into a fresh variable, then
         // adopted under the original one.
-        CExpr::LetPrim { var, ty, op: op @ PrimOp::Field { .. }, args, cont } if ctx.views.standalone.contains(&var) => {
+        CExpr::LetPrim { var, ty, op: op @ (PrimOp::Field { .. } | PrimOp::Load { .. }), args, cont }
+            if ctx.views.standalone.contains(&var) =>
+        {
             let read = ctx.fresh.var();
             let adopted = CExpr::LetPrim {
                 var,

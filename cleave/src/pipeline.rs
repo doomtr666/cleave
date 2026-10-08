@@ -120,17 +120,6 @@ pub struct CodegenOptions {
     /// own established use for it (`doc/backlog.md`'s matmul-IPC
     /// investigation).
     pub inline: bool,
-    /// Gates `unroll_jam::unroll_and_jam_reductions` (`pipeline.rs`).
-    /// **Off by default** -- a real, JIT-proven-correct mechanism, measured
-    /// on the real kernel and found not to be the fix for the long-K matmul
-    /// IPC gap it was built for (`doc/backlog.md`'s own full writeup); kept
-    /// as a real, explicit opt-in for a future shape where it is.
-    pub unroll_jam: bool,
-    /// Gates `chain_split::split_outerproduct_chains` (`pipeline.rs`). **Off
-    /// by default** -- same posture and same reason as `unroll_jam` above:
-    /// real and correct, measured to make IPC slightly *worse* on the real
-    /// kernel, kept as an explicit opt-in.
-    pub chain_split: bool,
     /// Gates `alias_analysis`'s own affine-struct pool-allocation strategy
     /// (`mlir_lower.rs::lower_program`). **On by default** -- landed,
     /// measured, re-verified on both real kernels (`doc/plan-affine-
@@ -155,7 +144,7 @@ pub struct CodegenOptions {
     /// LLVM's own loop unrolling, in the optimization pipeline the execution
     /// engine runs (`cleave-mlir-shim`'s `makeTransformer`). cleave's loops
     /// reach LLVM already tiled, vectorized and unrolled where it pays (the
-    /// matmul schedule, `unroll_jam`); LLVM unrolling them again was 55% of
+    /// matmul schedule); LLVM unrolling them again was 55% of
     /// `opt -O2` on nanoLM's transformer kernel, most of a 3-minute compile.
     /// `true` keeps the standard pipeline.
     pub llvm_loop_unroll: bool,
@@ -191,8 +180,6 @@ impl Default for CodegenOptions {
             target_features: None,
             backend: Backend::Cpu,
             inline: true,
-            unroll_jam: false,
-            chain_split: false,
             affine_structs: true,
             debug_info: true,
             llvm_loop_unroll: true,
@@ -604,7 +591,7 @@ pub fn emit_from_program(
 /// pre-optimization sweep would strip before `optimize_program` ever gets a
 /// chance to need it) -- the single sweep *after* still catches the
 /// opposite case, a unit `optimize_program` itself made unreachable.
-fn build_optimized_cps(
+pub fn build_optimized_cps(
     program: &Program,
     registry: &Registry,
     sources: Option<&SourceMap>,
@@ -1381,29 +1368,6 @@ pub fn lower_to_llvm<'c>(
         ]);
     }
 
-    // Splits the 16-deep sequential `vector.outerproduct` chain the schedule
-    // above leaves inside every K-tile's own reduction into `factor`
-    // independent, shorter chains -- see `chain_split.rs`'s own module doc
-    // comment for the full mechanism and why it would run *here*, right
-    // after the transform-dialect schedule and before `--loop-invariant-
-    // subset-hoisting`, if enabled: unlike `unroll_jam.rs` below, this pass
-    // only ever rewires operands *within* an already-fully-vector-typed
-    // `vector.outerproduct` chain, never touching the surrounding `scf.for`
-    // 's own `iter_arg` representation -- so it doesn't need the tensor-
-    // round-trip that pass hoists away first.
-    //
-    // **Off by default** (`CodegenOptions::chain_split`, `--chain-split` on
-    // the CLI) -- measured on the real kernel and found to make IPC
-    // slightly *worse*, not better
-    // (`doc/backlog.md`'s own "the long-K matmul IPC gap was never a
-    // latency-chain problem, it was cache locality" entry): the real fix for
-    // this kernel's own IPC gap was a cache-locality one (the `M`-tile-size
-    // change in `matmul_vectorize.transform.mlir`, not anything in
-    // `pipeline.rs`), not a dependency-chain one. Kept wired in, off by
-    // default, as a real, working, generalizable mechanism for a future
-    // shape where the FMA chain genuinely is the bottleneck.
-    crate::chain_split::split_outerproduct_chains(context, module, options.chain_split);
-
     let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::transform::create_loop_invariant_subset_hoisting());
     if timed_run(&pass_manager, &mut *module, line!()).is_err() {
@@ -1411,46 +1375,6 @@ pub fn lower_to_llvm<'c>(
             "MLIR-to-LLVM lowering pass failed (loop-invariant-subset-hoisting)".to_string(),
         ]);
     }
-
-    // Widens the narrow (3-4 register) accumulator chain the schedule above
-    // leaves inside every K-reduction `scf.for` -- `doc/backlog.md`'s own
-    // AMD-uProf-measured `~6x` per-FLOP gap between a long-K matmul (IPC
-    // 0.226) and a short-K one (IPC 1.7), same FLOPs, same schedule.
-    //
-    // **Runs here, after `--loop-invariant-subset-hoisting`, not right after
-    // `vectorize` -- found directly, not assumed, the first time this pass
-    // was wired in.** Right after `vectorize {create_named_contraction}`,
-    // the K-reduction `scf.for`'s own `iter_arg` is still a *tensor*
-    // (`tensor<8x16xf32>`, say) -- each iteration reads it back via `vector.
-    // transfer_read`, computes a real `vector.contract`, and writes the
-    // result back via `vector.transfer_write`, with *that write* (not the
-    // contract) as the value actually yielded. `--loop-invariant-subset-
-    // hoisting` is what turns this read-modify-write-through-a-tensor
-    // pattern into a genuinely register-resident `vector<...>` `iter_arg`
-    // (`vectorize`'s own doc comment, above, already said as much: "makes
-    // the accumulator itself genuinely register-resident... rather than
-    // round-tripping through memory on every step" -- this pass needs
-    // exactly that shape, a `vector.contract` result yielded directly, to
-    // recognize a loop as a reduction at all). Confirmed by tracing every
-    // real `scf.for` in the real kernel (`CLEAVE_TRACE_UNROLL_JAM=1`):
-    // every one matched *zero* candidates when this ran before hoisting,
-    // every long-K one matches correctly once moved to here.
-    //
-    // **Off by default** (`CodegenOptions::unroll_jam`, `--unroll-jam` on
-    // the CLI) -- wired in and measured on the real kernel: zero IPC change
-    // (widening the
-    // *outer* K-tile loop duplicates a real, unavoidable per-copy operand-
-    // tile-load register cost, `112` registers demanded for `factor=7`
-    // against a `32`-register file -- constant spill/reload ate the gain).
-    // The real fix for this kernel's own IPC gap turned out to be a cache-
-    // locality one entirely outside this pass (`doc/backlog.md`'s own "the
-    // long-K matmul IPC gap was never a latency-chain problem, it was cache
-    // locality" entry has the full story). Kept wired in, off by default, as
-    // a real, JIT-proven-correct (`cleave/tests/unroll_jam_probe.rs`)
-    // mechanism for a future shape where the outer-loop accumulator chain
-    // genuinely is the bottleneck and the per-copy tile-load cost is small
-    // enough to afford.
-    crate::unroll_jam::unroll_and_jam_reductions(context, module, options.unroll_jam);
 
     // An elementwise op writing a fresh tensor while one of its operands, a
     // local result, dies there: it writes into that operand

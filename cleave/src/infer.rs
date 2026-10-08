@@ -837,6 +837,9 @@ pub enum TypeErrorKind {
     /// An integer literal whose value doesn't fit its type (`let x: i8 =
     /// 300;`): an error, never a silent wrap.
     LiteralOutOfRange { text: String, ty: Ty },
+    /// A construct the language accepts but the compiler can't build yet
+    /// (`monomorphize.rs::check_unsupported_arrays`): what, in words.
+    Unsupported(String),
     UnknownName(String),
     /// A call to a name that is neither a local, a top-level `fn`, nor a
     /// method of any algebra in scope: usually a missing `use`.
@@ -1116,6 +1119,7 @@ impl std::fmt::Display for TypeErrorKind {
             TypeErrorKind::LiteralOutOfRange { text, ty } => {
                 write!(f, "the literal `{text}` doesn't fit in `{ty}`")
             }
+            TypeErrorKind::Unsupported(what) => write!(f, "{what} isn't supported yet"),
             TypeErrorKind::AmbiguousOperator { name, candidates } => {
                 write!(
                     f,
@@ -6494,19 +6498,44 @@ impl<'r> Infer<'r> {
                     // tagged-struct target silently reach it. `base`'s own
                     // type is already resolved (`infer_expr(target)` just
                     // above walked into it) — re-read rather than re-infer.
-                    if let ExprKind::Index(base, _) = &target.kind {
+                    if let ExprKind::Index(base, indices) = &target.kind {
                         let base_ty = self.subst.apply(&self.node_types[&base.id].clone());
+                        // A value collection (`Tensor`), written through its
+                        // variable: `c = IndexSet::set(c, [i, ...], v)`
+                        // (`cps.rs`), typed as that call.
+                        let candidates = self.registry.algebras_with_fn("set", 3);
+                        if !matches!(base_ty, Ty::Array(..) | Ty::Var(_))
+                            && !is_placeholder(&base_ty)
+                            && matches!(base.kind, ExprKind::Path(_))
+                            && let [algebra] = candidates.as_slice()
+                        {
+                            let algebra = algebra.to_string();
+                            let idx_array_ty = Ty::Array(
+                                Box::new(Ty::Con("i32".to_string())),
+                                Box::new(Ty::Const(ConstValue::Int(indices.len() as u64))),
+                            );
+                            let value_ty = self.infer_expr(&env, value)?;
+                            let result = self.infer_algebra_call(
+                                target.span,
+                                &algebra,
+                                "set",
+                                &[base_ty.clone(), idx_array_ty, value_ty],
+                                &[base.span, target.span, value.span],
+                                &[],
+                            )?;
+                            self.unify_at(target.span, &base_ty, &result)?;
+                            continue;
+                        }
                         if !matches!(base_ty, Ty::Array(..) | Ty::Var(_))
                             && !is_placeholder(&base_ty)
                         {
+                            // Said as what it is: an element of a value
+                            // that isn't an array (it was a type mismatch
+                            // against an array of unknowns).
                             return Err(TypeError {
                                 span: target.span,
-                                kind: TypeErrorKind::Unify(UnifyError::Mismatch(
-                                    Ty::Array(
-                                        Box::new(self.vars.fresh()),
-                                        Box::new(self.vars.fresh()),
-                                    ),
-                                    base_ty,
+                                kind: TypeErrorKind::Unsupported(format!(
+                                    "assigning to an element of a `{base_ty}`"
                                 )),
                             });
                         }

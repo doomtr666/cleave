@@ -15,31 +15,7 @@
 //! any of their own struct-typed test programs ran, confirming this wasn't
 //! a hypothetical gap.
 
-use cleave::cps::{collect_mlir_types, collect_struct_schemas};
-use cleave::driver::compile;
-use cleave::egraph::optimize_program;
-use cleave::mlir_lower::lower_program;
-use cleave::pipeline::{Backend, CodegenOptions, check_type_errors, lower_to_llvm};
-use cleave::refcount::insert_refcounting;
-use cleave::registry::Registry;
-use melior::Context;
-use melior::dialect::DialectRegistry;
-use melior::ir::operation::OperationLike;
-use melior::utility::register_all_dialects;
-use std::sync::{Mutex, OnceLock};
-
-// `CLEAVE_AFFINE_STRUCTS`/`CLEAVE_TRACE_ALLOC_TYPES` etc. are read via
-// `std::env::var` at compile time (inside `lower_program`), and `cargo
-// test` runs every test in this binary as threads of one process sharing
-// one environment -- `env::set_var` in one test racing another test's own
-// `env::var` read is a real, direct hazard, not a hypothetical one. A
-// single mutex serializes every test in this file that touches the flag,
-// matching the discipline this whole plan has used for other env-gated
-// compiler flags all session.
-static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-    ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
-}
+use cleave::pipeline::CodegenOptions;
 
 /// Backs `extern fn opaque_sink(b: Boxed) -> i32` in
 /// `many_short_lived_affine_constructions_run_correctly` below — a struct
@@ -55,120 +31,27 @@ unsafe extern "C" fn opaque_sink(ptr: *mut u8) -> i32 {
     unsafe { *(ptr as *mut i32) }
 }
 
-fn context() -> Context {
-    let dialect_registry = DialectRegistry::new();
-    register_all_dialects(&dialect_registry);
-    let context = Context::new();
-    context.append_dialect_registry(&dialect_registry);
-    context.load_all_available_dialects();
-    context
-}
-
-/// `doc/plan-affine-ownership.md` §11-§14's own pool/cascade mechanism is
-/// on **by default** now (every confirmed crash root-caused and fixed this
-/// session, re-verified 5× under `CLEAVE_DEBUG_POOL=1` each, plus real
-/// correct runs on both `examples/mnist-interop` and `examples/digits-
-/// interop`) — `run_i32_inner` alone already exercises it, no env var
-/// needed. This wrapper survives only so existing call sites don't all
-/// need renaming; new tests should just call `run_i32_inner` directly.
+/// The pool mechanism is on by default (`CodegenOptions::affine_structs`):
+/// `run_i32_inner` exercises it.
 fn run_i32_with_affine_structs(src: &str) -> i32 {
-    run_i32_inner(src)
+    run_i32_inner(src, true)
 }
 
-/// The explicit opt-out (`CLEAVE_NO_AFFINE_STRUCTS`, `lower_program`'s own
-/// doc comment) — for the handful of tests whose own point is specifically
-/// the *header-based* path (a differential check, or a safety net that
-/// predates and is independent of the pool mechanism entirely), now that
-/// plain `run_i32_inner` no longer means that on its own.
+/// The opt-out, for the tests whose point is the header-based path (a
+/// differential check, a safety net independent of the pool). It used to
+/// set `CLEAVE_NO_AFFINE_STRUCTS`, which `lower_program` stopped reading when
+/// the switch moved to `CodegenOptions`: those tests ran with the pool on.
 fn run_i32_with_affine_structs_disabled(src: &str) -> i32 {
-    let _guard = lock_env();
-    unsafe {
-        std::env::set_var("CLEAVE_NO_AFFINE_STRUCTS", "1");
-    }
-    let result = std::panic::catch_unwind(|| run_i32_inner(src));
-    unsafe {
-        std::env::remove_var("CLEAVE_NO_AFFINE_STRUCTS");
-    }
-    match result {
-        Ok(v) => v,
-        Err(e) => std::panic::resume_unwind(e),
-    }
+    run_i32_inner(src, false)
 }
 
-fn run_i32_inner(src: &str) -> i32 {
-    let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
-    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
-    let registry = Registry::build(&program);
-    if let Err(diags) = check_type_errors(&program, &registry) {
-        panic!("type check failed: {diags:?}");
-    }
-    let units = cleave::cps::collect_units(&program, &registry);
-    let cps_program = cleave::cps::convert_program(units, None);
-    let cps_program = cleave::cps::eliminate_dead_code(cps_program);
-    let (cps_program, _) = optimize_program(cps_program, &registry, false);
-    let cps_program = cleave::cps::eliminate_dead_code(cps_program);
-    let mlir_types = collect_mlir_types(&program);
-    let struct_schemas = collect_struct_schemas(&program);
-    let escaping = cleave::escape::escaping_struct_vars(&cps_program);
-    let cps_program = insert_refcounting(cps_program, &struct_schemas, &mlir_types, &escaping);
-
-    let context = context();
-    melior::utility::register_all_llvm_translations(&context);
-    let mlir_types2 = collect_mlir_types(&program);
-    let struct_schemas2 = collect_struct_schemas(&program);
-    let mut module = lower_program(&context, &cps_program, &mlir_types2, struct_schemas2);
-    assert!(module.as_operation().verify(), "module failed verification");
-
-    // Reuses the real, already-battle-tested pipeline stage
-    // (`pipeline.rs::lower_to_llvm`) instead of hand-reconstructing its own
-    // multi-stage pass sequence here -- deliberately, so this test can
-    // never silently drift from what `--emit-exe`/`--run` actually do.
-    let options = CodegenOptions {
-        opt_level: 2,
-        openmp: false,
-        target_cpu: None,
-        target_features: None,
-        backend: Backend::Cpu,
-        // In-process engine without libomp: spawned calls run in place.
-        tasks: false,
-        ..Default::default()
-    };
-    lower_to_llvm(&context, &mut module, &options).expect("lower_to_llvm failed");
-
-    let engine = melior::ExecutionEngine::new(&module, options.opt_level as usize, &[], true, false);
-    unsafe {
-        engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
-        engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
-        engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
-        engine.register_symbol(
-            "cleave_release_void",
-            cleave_rt::cleave_release_void as *mut (),
-        );
-        engine.register_symbol(
-            "cleave_alloc_local",
-            cleave_rt::cleave_alloc_local as *mut (),
-        );
-        engine.register_symbol(
-            "cleave_region_enter",
-            cleave_rt::cleave_region_enter as *mut (),
-        );
-        engine.register_symbol(
-            "cleave_region_exit",
-            cleave_rt::cleave_region_exit as *mut (),
-        );
-        engine.register_symbol("cleave_alloc_pool", cleave_rt::cleave_alloc_pool as *mut ());
-        engine.register_symbol(
-            "cleave_release_pool",
-            cleave_rt::cleave_release_pool as *mut (),
-        );
-        engine.register_symbol("opaque_sink", opaque_sink as *mut ());
-
-        let mut result: i32 = 0;
-        engine
-            .invoke_packed("main", &mut [&mut result as *mut i32 as *mut ()])
-            .expect("JIT invocation failed");
-        result
-    }
+/// Compiles and runs `src`'s `main` through the real pipeline
+/// (`cleave::run`, what `--run` uses).
+fn run_i32_inner(src: &str, affine_structs: bool) -> i32 {
+    let options = CodegenOptions { openmp: false, tasks: false, affine_structs, ..Default::default() };
+    let host: &[(&str, *mut ())] = &[("opaque_sink", opaque_sink as *mut ())];
+    cleave::run::run_source_with("test.cleave", src, &options, host).unwrap_or_else(|e| panic!("{}", e.join("
+")))
 }
 
 /// The real `b = bump(b)` shape (`doc/backlog.md`'s array/loop-leak

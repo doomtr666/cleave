@@ -17,6 +17,35 @@ A cap on the parked bytes (a fixed budget, or a fraction of the live bytes), bey
 block goes back to the system, would keep the pool's speed on the sizes every step reuses; to measure
 in memory and in time (a block taken back from the system costs page faults).
 
+## Two cleave programs running at once crawl: their workers are pinned to the same cores
+
+`cleave_bind_worker` (`cleave-rt`) gives team member `i` a hard affinity to physical core `i` (both its
+SMT siblings), which made one-member-per-core certain and run times stable. With two programs running,
+both pin their members to the same cores: measured 2026-10-08, `examples/xor.cleave --run` (OpenMP)
+beside a nanoLM training didn't finish in 60 s, and finished in 11 s with the binding off
+(`OMP_PROC_BIND=false`), 29 s with `KMP_BLOCKTIME=0`, 8 s on two threads. A soft placement instead, the
+ideal processor (`SetThreadIdealProcessorEx`), steers each member to its core when the machine is free
+and lets the scheduler move it under contention; to measure on nanoLM's step time and spread
+(`scripts/ab.ps1`, what the binding was for) and with two programs side by side.
+
+## Several programs spawning tasks at once in one process crash
+
+Found 2026-10-08 moving `tests/checkpoint.rs` onto `cleave::run` with tasks on: each test passes alone,
+the four together (parallel test threads, each JIT-compiling and running a program whose optimizer
+spawns tasks on the one libomp the process loads) end in `STATUS_ACCESS_VIOLATION`. The in-process
+harnesses ran with tasks off, and still do. A host embedding two kernels that both spawn (the Rust
+interop) could meet it: to reproduce with two threads each running a small spawning program, then look
+at what the programs share (libomp's team and task queues, the runtime's pool and per-thread arenas,
+`cleave_bind_worker`'s once-per-thread binding).
+
+## A test binary fails now and then under load, without a captured message
+
+2026-10-08: `scripts/test.ps1 smoke` failed once in `cleave --test language_model_ops` (no test named, the
+binary's exit only) while a nanoLM training took every core; rerun alone, then the whole suite again, it
+passed. The same symptom as an entry closed as not reproduced (`backlog-done.md`: "`cargo test
+--workspace` intermittently fails one heavy JIT test under concurrent load"). Next time: keep the binary's
+whole output (`cargo test ... 2>&1 | tee`), the test name and the exit code.
+
 ## A `DynArray` of structs doesn't release its elements when it dies
 
 Its slots hold references (`dynarray_set_ptr` retains, `dynarray_get_ptr` hands out a retained one,
@@ -25,20 +54,6 @@ buffer: the elements it still holds when it dies leak. And an element released t
 `dynarray_set_ptr` (overwritten) is released flat (`cleave_release`), without the cascade into its
 own refcounted fields that the compiler generates per type.
 
-## Debt: the test harnesses each carry their own copy of the pipeline
-
-`cleave/tests/` has at least ten private copies of the compile sequence (CPS conversion, derivative
-synthesis, e-graph, dead code, escape analysis, `insert_refcounting`, `lower_program`,
-`lower_to_llvm`, JIT symbol table): `leaks.rs`, `checkpoint.rs`, `language_model_ops.rs`,
-`affine_pool_alloc.rs`, `array_release_cascade.rs`, `extern_buffers.rs`, `refcount.rs`,
-`spawn_leaks.rs`, ... Each drifts from `pipeline.rs::build_optimized_cps` on its own, and most run with
-`tasks: false`: the leak of every array built by a function (2026-10-08, 3.8 GiB a nanoLM step) went
-unseen by the leak suite, which never runs nanoLM's shape with tasks. `main.rs` has the same problem
-inside the compiler (four copies of the optimize-and-refcount sequence, one per dump flag). One
-harness in the crate (`cleave::testing`), built on the real pipeline function and taking
-`CodegenOptions` (tasks on by default), with the allocation counter and the JIT symbol table; the
-dump flags as taps on the one pipeline.
-
 ## Debt: a constraint on a never-generalized abstract variable is checked nowhere
 
 `infer.rs`'s module comment, in its own words: a constraint on a variable still abstract and never
@@ -46,20 +61,6 @@ generalized (a `let mut`'s, say) "has nowhere further to travel once its enclosi
 silently unchecked". Not in the backlog until the 2026-10-08 audit. The failure, if it comes, comes
 later (an impl not found at monomorphization) without the `let`'s location. The same comment still
 lists mutability checking as not done, which `check_mutability` has done for a while.
-
-## Debt: compiler panics reachable from user programs
-
-`mlir_lower.rs` has 191 `panic!`s and `cps.rs` 27; most are internal invariants, some are unsupported
-programs (index-assignment into a `#[mlir_type]` value, a function-typed struct field, constructing
-`[Tensor<...>; N]`, a struct array nested in an array, a multi-def loop condition, "CPS doesn't
-support ... yet"). A user gets a compiler crash, not a located error. A corpus of small programs, one
-per unsupported construct, run by a test that expects a diagnostic with a span; each panic it reaches
-becomes a check before lowering (inference or a pre-lowering validation pass). Found and fixed
-by the 2026-10-08 audit's probes: an integer literal that doesn't fit its type (past `i64` it panicked,
-`let x: i8 = 300;` wrapped silently to `44`) is now a located error (`infer.rs::check_literal_ranges`);
-a lambda literal passed straight to a call now works (`lower.rs::hoist_lambda_args`), one used as any
-other value is a located error (`pipeline.rs::check_lambda_positions`). Left: the five unsupported
-constructs above.
 
 ## Debt: `cleaveElideBlockCopies` relies on an assumption it can't check
 
@@ -88,19 +89,6 @@ the pattern; the caller skips it (`if let Some(...)`). A derivative rule missing
 as a clean "no rule reaches" error; an axiom just never fires, and the stdlib author who declared it
 never learns. A warning (or an error) when the stdlib is loaded, naming the axiom and what in its body
 isn't representable.
-
-## Debt: code nothing uses: experimental passes, stdlib helpers
-
-`unroll_jam.rs` (629 lines) and `chain_split.rs` (364) run only behind `CodegenOptions::unroll_jam`/
-`chain_split`, both `false` by default; no example, build script or test turns them on, except
-`cleave/tests/unroll_jam_probe.rs` exercising the transformation alone. Their history
-(`backlog-done.md`: the native matmul's IPC investigation, "two dead ends and one real fix") says they
-didn't pay, and the products that mattered moved to BLAS since. Removed with their options and probe,
-or kept with a sentence saying what would make them worth turning on. `CodegenOptions::tag_releases`
-belongs to the runtime-diagnostics entry below. The stdlib has the same kind of dead weight:
-`blas_matmul_transpose_a`, `blas_fma`, `blas_fma_transpose_a` and `blas_fma_transpose_b`
-(`stdlib/linalg/matrix.cleave`) are called and tested nowhere, left from before the BLAS dispatch moved
-to the `blas` attribute; a test each, or gone.
 
 ## Debt: comments that tell the code's history instead of the code
 

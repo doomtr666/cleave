@@ -120,3 +120,69 @@ fn a_lambda_passed_in_place_runs_and_one_stored_is_an_error() {
     let stored = cli_stderr("lambda_stored.cleave", "fn main() -> i32 { let g = fn(x: i32) -> i32 { x + 1 }; let h = [g]; 1 }\n");
     assert!(stored.contains(":1:66: error: `g` used as a value"), "{stored}");
 }
+
+/// Constructs the language accepts but the compiler can't build yet are
+/// located errors saying so: a struct field holding a lambda (a panic
+/// before; a function value has no run-time form).
+#[test]
+fn unsupported_constructs_are_located_errors() {
+    let cases: [(&str, &str, &str); 1] = [(
+        "function_field.cleave",
+        "struct Act { f: (f32) -> f32 }
+fn main() -> i32 {
+    let a = Act(f: fn(x: f32) -> f32 { x * 2.0 });
+    1
+}
+",
+        ":3:20: error: a lambda used as a value",
+    )];
+    for (name, src, expected) in cases {
+        let out = cli_stderr(name, src);
+        assert!(out.contains(expected), "{name}: {out}");
+        assert!(!out.contains("panicked"), "{name}: {out}");
+    }
+}
+
+/// An element of a tensor written through its variable (`t[i, j] = v`, the
+/// `IndexSet` algebra): `t` rebound to the tensor with that element
+/// replaced, carried through a loop like any reassigned variable.
+#[test]
+fn a_tensor_element_is_written_through_its_variable() {
+    let src = "use linalg;\nuse convert;\nfn main() -> i32 {\n    let mut t: Tensor<f32, 3, 3> = Tensor(data: [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]);\n    for i in 0..3 { t[i, i] = 1.0 + i.to(); };\n    t[0, 2] = 7.0;\n    let s = t[0, 0] + t[1, 1] + t[2, 2] + t[0, 2] + t[2, 0];\n    if s == 13.0 { 1 } else { 0 }\n}\n";
+    let out = cli_stderr("tensor_write.cleave", src);
+    assert!(out.contains("main returned: 1"), "{out}");
+}
+
+/// An array of arrays of structs: each inner array an array object, the outer
+/// one holding pointers to them. Read through two indices (`g[1][0]`, a
+/// `Load` per level), written (`g[0][1] = ...`), an inner array read whole
+/// (`g[1]`). It used to panic the compiler.
+#[test]
+fn an_array_of_arrays_of_structs_is_read_and_written() {
+    let src = "struct P { x: i32, y: [i32; 1] }\nfn mk(v: i32) -> P { P(x: v, y: [v]) }\nfn main() -> i32 {\n    let mut g = [[mk(1), mk(2)], [mk(3), mk(4)]];\n    g[0][1] = mk(20);\n    let mut s = 0;\n    for i in 0..2 { for j in 0..2 { s = s + g[i][j].x; }; };\n    let row = g[1];\n    s * 100 + row[0].x\n}\n";
+    let out = cli_stderr("nested_struct_array.cleave", src);
+    assert!(out.contains("main returned: 2803"), "{out}");
+}
+
+/// An array of tensors: each slot holds a tensor's descriptor, as a struct's
+/// tensor field does, a read a view of its buffer. Built, read into an
+/// expression, a slot overwritten, summed in a loop, an element of a read
+/// tensor read; the tensor a slot was built from is left as it was. It used
+/// to fail MLIR verification.
+#[test]
+fn an_array_of_tensors_is_read_and_written() {
+    let src = "use nn;
+fn main() -> i32 {
+    let a: Tensor<f32, 3> = Tensor(data: [1.0, 2.0, 3.0]);
+    let b: Tensor<f32, 3> = Tensor(data: [4.0, 5.0, 6.0]);
+    let mut ts: [Tensor<f32, 3>; 2] = [a, b];
+    let c = ts[0] + ts[1];
+    ts[0] = c;
+    let mut s = 0.0;
+    for i in 0..2 { s = s + sum(ts[i]); };
+    if s == 36.0 and ts[0][2] == 9.0 and a[0] == 1.0 { 1 } else { 0 }
+}
+";
+    let out = cli_stderr("tensor_array.cleave", src);
+    assert!(out.contains("main returned: 1"), "{out}");
+}

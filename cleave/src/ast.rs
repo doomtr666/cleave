@@ -704,3 +704,77 @@ impl NodeIdGen {
         id
     }
 }
+
+/// Calls `f` on every expression of `block`, its statements' and nested
+/// blocks' included (lambda bodies too), outer before inner: what a check
+/// over a function body walks.
+pub fn for_each_expr_in_block(block: &Block, f: &mut impl FnMut(&Expr)) {
+    for stmt in &block.stmts {
+        match &stmt.kind {
+            StmtKind::Let { value, .. } => for_each_expr(value, f),
+            StmtKind::Assign { target, value } => {
+                for_each_expr(target, f);
+                for_each_expr(value, f);
+            }
+            StmtKind::Expr(e) => for_each_expr(e, f),
+            StmtKind::Break(e) => {
+                if let Some(e) = e {
+                    for_each_expr(e, f);
+                }
+            }
+            StmtKind::Sync => {}
+        }
+    }
+    if let Some(tail) = &block.tail {
+        for_each_expr(tail, f);
+    }
+}
+
+/// Calls `f` on `expr` and every expression inside it (`for_each_expr_in_block`).
+pub fn for_each_expr(expr: &Expr, f: &mut impl FnMut(&Expr)) {
+    f(expr);
+    match &expr.kind {
+        ExprKind::NumberLit { .. }
+        | ExprKind::ImaginaryLit { .. }
+        | ExprKind::BoolLit(_)
+        | ExprKind::Path(_)
+        | ExprKind::PackRef(_) => {}
+        ExprKind::Call(_, _, args, _) => args.iter().for_each(|a| for_each_expr(a, f)),
+        ExprKind::Spawn(e) | ExprKind::FieldAccess(e, _) => for_each_expr(e, f),
+        ExprKind::Index(base, indices) => {
+            for_each_expr(base, f);
+            indices.iter().for_each(|i| for_each_expr(i, f));
+        }
+        ExprKind::ArrayLit(items) => items.iter().for_each(|i| for_each_expr(i, f)),
+        ExprKind::ArrayRepeat { value, count } => {
+            for_each_expr(value, f);
+            for_each_expr(count, f);
+        }
+        ExprKind::StructLit(_, _, fields) => fields.iter().for_each(|(_, e)| for_each_expr(e, f)),
+        ExprKind::If { cond, then_branch, else_branch } => {
+            for_each_expr(cond, f);
+            for_each_expr_in_block(then_branch, f);
+            match else_branch.as_deref() {
+                Some(ElseBranch::If(e)) => for_each_expr(e, f),
+                Some(ElseBranch::Block(b)) => for_each_expr_in_block(b, f),
+                None => {}
+            }
+        }
+        ExprKind::While { cond, body } => {
+            for_each_expr(cond, f);
+            for_each_expr_in_block(body, f);
+        }
+        ExprKind::For { start, end, body, .. } => {
+            for_each_expr(start, f);
+            for_each_expr(end, f);
+            for_each_expr_in_block(body, f);
+        }
+        ExprKind::ForIn { iter, body, .. } => {
+            for_each_expr(iter, f);
+            for_each_expr_in_block(body, f);
+        }
+        ExprKind::Loop { body } | ExprKind::Block(body) | ExprKind::Lambda { body, .. } => {
+            for_each_expr_in_block(body, f)
+        }
+    }
+}

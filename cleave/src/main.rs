@@ -59,11 +59,9 @@ struct Args {
     target_features: Option<String>,
     backend: String,
     inline: Option<bool>,
-    unroll_jam: Option<bool>,
     llvm_loop_unroll: Option<bool>,
     inline_threshold: Option<usize>,
     tasks: Option<bool>,
-    chain_split: Option<bool>,
     affine_structs: Option<bool>,
     debug_info: Option<bool>,
     /// `--define NAME=VALUE`, repeatable -- `grammar.pest`'s own
@@ -95,11 +93,9 @@ fn parse_args() -> Result<Args, String> {
     let mut target_features = None;
     let mut backend = "cpu".to_string();
     let mut inline: Option<bool> = None;
-    let mut unroll_jam: Option<bool> = None;
     let mut llvm_loop_unroll: Option<bool> = None;
     let mut inline_threshold: Option<usize> = None;
     let mut tasks: Option<bool> = None;
-    let mut chain_split: Option<bool> = None;
     let mut affine_structs: Option<bool> = None;
     let mut debug_info: Option<bool> = None;
     let mut defines: Vec<(String, String)> = Vec::new();
@@ -175,8 +171,6 @@ fn parse_args() -> Result<Args, String> {
             // doc comments (`pipeline.rs`) for what each one actually gates.
             "--inline" => inline = Some(true),
             "--no-inline" => inline = Some(false),
-            "--unroll-jam" => unroll_jam = Some(true),
-            "--no-unroll-jam" => unroll_jam = Some(false),
             "--llvm-unroll" => llvm_loop_unroll = Some(true),
             "--no-llvm-unroll" => llvm_loop_unroll = Some(false),
             "--inline-threshold" => {
@@ -191,8 +185,6 @@ fn parse_args() -> Result<Args, String> {
             }
             "--tasks" => tasks = Some(true),
             "--no-tasks" => tasks = Some(false),
-            "--chain-split" => chain_split = Some(true),
-            "--no-chain-split" => chain_split = Some(false),
             "--affine-structs" => affine_structs = Some(true),
             "--no-affine-structs" => affine_structs = Some(false),
             "--debug-info" => debug_info = Some(true),
@@ -260,11 +252,9 @@ fn parse_args() -> Result<Args, String> {
             target_features,
             backend,
             inline,
-            unroll_jam,
             llvm_loop_unroll,
             inline_threshold,
             tasks,
-            chain_split,
             affine_structs,
             debug_info,
             defines,
@@ -274,8 +264,7 @@ fn parse_args() -> Result<Args, String> {
              [--dump-cps-optimized] [--dump-cps-readable] [--dump-cps-equivalences] [--dump-mlir] [--dump-mlir-lowered] [--dump-defines] [--run] \
              [--emit-object <path>] [--emit-bindings <path>] [--emit-exe <path>] \
              [--opt-level <0-3>] [--openmp | --no-openmp] [--target-cpu <name>] [--target-features <+f,-f,...>] \
-             [--backend cpu] [--inline | --no-inline] [--unroll-jam | --no-unroll-jam] \
-             [--chain-split | --no-chain-split] [--affine-structs | --no-affine-structs] \
+             [--backend cpu] [--inline | --no-inline] [--affine-structs | --no-affine-structs] \
              [--debug-info | --no-debug-info] [--define NAME=VALUE]..."
                 .to_string(),
         ),
@@ -327,11 +316,9 @@ fn resolve_codegen_options(args: &Args) -> Result<CodegenOptions, String> {
         target_features: args.target_features.clone(),
         backend,
         inline: args.inline.unwrap_or(defaults.inline),
-        unroll_jam: args.unroll_jam.unwrap_or(defaults.unroll_jam),
         llvm_loop_unroll: args.llvm_loop_unroll.unwrap_or(defaults.llvm_loop_unroll),
         inline_threshold: args.inline_threshold.unwrap_or(defaults.inline_threshold),
         tasks: args.tasks.unwrap_or(defaults.tasks),
-        chain_split: args.chain_split.unwrap_or(defaults.chain_split),
         affine_structs: args.affine_structs.unwrap_or(defaults.affine_structs),
         debug_info: args.debug_info.unwrap_or(defaults.debug_info),
     })
@@ -537,48 +524,8 @@ fn real_main() -> ExitCode {
             report(&diags, &sources);
             exit = ExitCode::FAILURE;
         } else {
-            match build_cps_program(&program, &registry, None) {
-                Ok(cps_program) => {
-                    // Not dead-code-eliminated first, deliberately -- an
-                    // axiom (or `derivative`/`adjoint` rule) can reference a
-                    // unit no *ordinary* call site in the whole program
-                    // reaches at all (`egraph.rs::axiom_to_rewrite`'s own
-                    // doc comment: `MatMulTransposeA::matmul_transpose_a`
-                    // is the concrete case that found this), so eliminating
-                    // dead code *before* this pass ever runs can strip a
-                    // unit `optimize_program` itself is about to need,
-                    // before it gets a chance to say so. Sound either way,
-                    // strictly more so run once, after: anything genuinely
-                    // dead from the start is *still* dead once this finds
-                    // nothing to keep it alive either.
-                    let (optimized, _) = optimize_program(cps_program, &registry, false);
-                    // A second sweep: `optimize_program` can itself fold away
-                    // every remaining call to a stdlib specialization (e.g.
-                    // `10 + x - 10` reducing to `x` via axioms) — the first
-                    // sweep, run *before* optimization, has no way to know
-                    // that in advance, so a unit only unreachable *after*
-                    // axiom rewriting would otherwise survive despite having
-                    // zero real callers left. Found by direct testing
-                    // (`examples/axiom_demo.cleave`): `Ring::add<i32>`/
-                    // `Ring::sub<i32>` remained in `--dump-cps-optimized`'s
-                    // own output even though `helper`'s optimized body no
-                    // longer called either.
-                    let optimized = eliminate_dead_code(optimized);
-                    // Last CPS-to-CPS step, strictly after the e-graph pass
-                    // -- see `cleave::refcount`'s own module doc comment
-                    // and `pipeline.rs::build_optimized_cps`'s own
-                    // identical step. Included here too so this flag
-                    // actually shows the CPS `--emit-object`/`--run` lower,
-                    // not an earlier, pre-refcounting snapshot of it.
-                    let struct_schemas = collect_struct_schemas(&program);
-                    let mlir_types = collect_mlir_types(&program);
-                    let escaping = cleave::escape::escaping_struct_vars(&optimized);
-                    let optimized = cleave::refcount::insert_refcounting(
-                        optimized,
-                        &struct_schemas,
-                        &mlir_types,
-                        &escaping,
-                    );
+            match cleave::pipeline::build_optimized_cps(&program, &registry, None) {
+                Ok(optimized) => {
                     print!("{}", dump_cps_program(&optimized));
                 }
                 Err(errs) => {
@@ -605,19 +552,8 @@ fn real_main() -> ExitCode {
             report(&diags, &sources);
             exit = ExitCode::FAILURE;
         } else {
-            match build_cps_program(&program, &registry, None) {
-                Ok(cps_program) => {
-                    let (optimized, _) = optimize_program(cps_program, &registry, false);
-                    let optimized = eliminate_dead_code(optimized);
-                    let struct_schemas = collect_struct_schemas(&program);
-                    let mlir_types = collect_mlir_types(&program);
-                    let escaping = cleave::escape::escaping_struct_vars(&optimized);
-                    let optimized = cleave::refcount::insert_refcounting(
-                        optimized,
-                        &struct_schemas,
-                        &mlir_types,
-                        &escaping,
-                    );
+            match cleave::pipeline::build_optimized_cps(&program, &registry, None) {
+                Ok(optimized) => {
                     print!("{}", dump_cps_program_readable(&optimized));
                 }
                 Err(errs) => {
@@ -672,35 +608,24 @@ fn real_main() -> ExitCode {
             report(&diags, &sources);
             exit = ExitCode::FAILURE;
         } else {
-            match build_cps_program(&program, &registry, None) {
+            match cleave::pipeline::build_optimized_cps(&program, &registry, None) {
                 Ok(cps_program) => {
-                    // Not dead-code-eliminated first -- `--dump-cps-
-                    // optimized`'s own comment above has the full
-                    // reasoning.
-                    let (cps_program, _) = optimize_program(cps_program, &registry, false);
-                    // See `--dump-cps-optimized`'s own comment above: a
-                    // second sweep is needed to catch a unit `optimize_
-                    // program` itself made unreachable (e.g. an axiom
-                    // folding away every remaining call to it), which the
-                    // first sweep — run before optimization — has no way to
-                    // anticipate.
-                    let cps_program = eliminate_dead_code(cps_program);
-
                     let dialect_registry = DialectRegistry::new();
                     register_all_dialects(&dialect_registry);
                     let context = Context::new();
                     context.append_dialect_registry(&dialect_registry);
                     context.load_all_available_dialects();
 
-                    // Unlike `--dump-mlir-lowered` below, no `resolve_
-                    // codegen_options`/`options::set` here -- this `cps_
-                    // program` never went through `insert_refcounting`, so
-                    // it has no `PrimOp::Retain`/`Release` at all yet;
-                    // `lower_program`'s own `affine_structs` gate (which only
-                    // ever affects release-side dispatch) has nothing to act
-                    // on regardless of what it's set to, so wiring `--no-
-                    // affine-structs` through to this specific dump would be
-                    // real code with no observable effect on its output.
+                    // The program `--run` lowers, releases included: its
+                    // options set first (`lower_program` reads
+                    // `affine_structs` from them).
+                    match resolve_codegen_options(&args) {
+                        Ok(options) => cleave::options::set(options),
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
                     let mlir_types = collect_mlir_types(&program);
                     let struct_schemas = collect_struct_schemas(&program);
                     let module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
@@ -730,38 +655,8 @@ fn real_main() -> ExitCode {
             report(&diags, &sources);
             exit = ExitCode::FAILURE;
         } else {
-            match build_cps_program(&program, &registry, None) {
+            match cleave::pipeline::build_optimized_cps(&program, &registry, None) {
                 Ok(cps_program) => {
-                    // Not dead-code-eliminated first -- `--dump-cps-
-                    // optimized`'s own comment above has the full
-                    // reasoning.
-                    let (cps_program, _) = optimize_program(cps_program, &registry, false);
-                    // See `--dump-cps-optimized`'s own comment above: a
-                    // second sweep is needed to catch a unit `optimize_
-                    // program` itself made unreachable (e.g. an axiom
-                    // folding away every remaining call to it), which the
-                    // first sweep — run before optimization — has no way to
-                    // anticipate.
-                    let cps_program = eliminate_dead_code(cps_program);
-                    // `--dump-cps-optimized`'s own identical step, missing
-                    // here until found directly (`doc/plan-affine-
-                    // ownership.md` §13's own nested-cascade work): without
-                    // this, `lower_program` never sees a single `PrimOp::
-                    // Retain`/`Release`, so its own release-side dispatch
-                    // (`ctx.affine_structs.contains`, the whole cascade)
-                    // never fires at all — this flag was silently showing a
-                    // pre-refcounting snapshot, not what `--emit-object`/
-                    // `--run` actually lower.
-                    let struct_schemas_for_rc = collect_struct_schemas(&program);
-                    let mlir_types_for_rc = collect_mlir_types(&program);
-                    let escaping = cleave::escape::escaping_struct_vars(&cps_program);
-                    let cps_program = cleave::refcount::insert_refcounting(
-                        cps_program,
-                        &struct_schemas_for_rc,
-                        &mlir_types_for_rc,
-                        &escaping,
-                    );
-
                     let dialect_registry = DialectRegistry::new();
                     register_all_dialects(&dialect_registry);
                     let context = Context::new();
@@ -839,55 +734,6 @@ fn real_main() -> ExitCode {
             report(&diags, &sources);
             return ExitCode::FAILURE;
         }
-        let cps_program = match build_cps_program(&program, &registry, None) {
-            Ok(p) => p,
-            Err(errs) => {
-                for e in &errs {
-                    eprintln!("error: {e}");
-                }
-                return ExitCode::FAILURE;
-            }
-        };
-        // Not dead-code-eliminated first -- `--dump-cps-optimized`'s own
-        // comment above has the full reasoning (an axiom/`derivative`/
-        // `adjoint` rule can reference a unit no ordinary call site
-        // reaches, which a pre-optimization sweep would strip before
-        // `optimize_program` ever gets a chance to need it).
-        let (cps_program, _) = optimize_program(cps_program, &registry, false);
-        // A single sweep *after* is still needed: `optimize_program` can
-        // itself fold away every remaining call to some other unit (e.g.
-        // an axiom folding away a whole subexpression), leaving it
-        // unreachable only *now*.
-        let cps_program = eliminate_dead_code(cps_program);
-        // Last CPS-to-CPS step, strictly after the e-graph pass -- see
-        // `cleave::refcount`'s own module doc comment for why, and
-        // `pipeline.rs::build_optimized_cps`'s own identical step.
-        let mlir_types = collect_mlir_types(&program);
-        let struct_schemas = collect_struct_schemas(&program);
-        let escaping = cleave::escape::escaping_struct_vars(&cps_program);
-        let cps_program = cleave::refcount::insert_refcounting(
-            cps_program,
-            &struct_schemas,
-            &mlir_types,
-            &escaping,
-        );
-
-        let dialect_registry = DialectRegistry::new();
-        register_all_dialects(&dialect_registry);
-        let context = Context::new();
-        context.append_dialect_registry(&dialect_registry);
-        context.load_all_available_dialects();
-
-        // `lower_to_llvm` -- shared with `--dump-mlir-lowered` above and
-        // `emit_object` (`pipeline.rs`). OpenMP defaults *on* here too, same
-        // universal default as every other mode (`real_main`'s own `cleave_
-        // openmp` doc comment: the old "off for JIT" caution had no real
-        // technical basis -- `cleave-rt`'s own allocator-safety argument is
-        // a property of the generated code, not of which engine runs it) --
-        // pass `--no-openmp` explicitly for a genuine serial comparison.
-        //
-        // Resolved *before* `lower_program` below -- same reasoning as
-        // `--dump-mlir-lowered`'s own identical reordering above.
         let options = match resolve_codegen_options(&args) {
             Ok(options) => options,
             Err(e) => {
@@ -895,75 +741,16 @@ fn real_main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        cleave::options::set(options.clone());
-
-        let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
-        if !module.as_operation().verify() {
-            eprintln!("error: generated MLIR module failed verification");
-            return ExitCode::FAILURE;
-        }
-
-        if let Err(errs) = lower_to_llvm(&context, &mut module, &options) {
-            for e in &errs {
-                eprintln!("error: {e}");
-            }
-            return ExitCode::FAILURE;
-        }
-
-        // `shared_library_paths` -- unlike `emit_object` (which only ever
-        // *dumps* an object file, never actually invokes anything through
-        // its own engine, so a dummy stub pointer is sound for `__kmpc_*`
-        // resolvability alone), `--run` really does execute the compiled
-        // code -- if `options.openmp` is on, the emitted `omp.parallel`/
-        // `__kmpc_fork_call` machinery genuinely runs, so it needs *real*
-        // `libomp` symbols, not stubs. `ExecutionEngine::new`'s own third
-        // parameter exists for exactly this: point it at the real `libomp.
-        // dll` and let the JIT resolve `__kmpc_*` from it directly, no stub
-        // registration needed at all.
-        let mut shared_libs: Vec<String> = Vec::new();
-        // `spawn`'s tasks run on libomp too (`doc/plan-spawn.md`).
-        if options.openmp || (options.tasks && cleave::cps::uses_spawn(&cps_program)) {
-            match std::env::var("MLIR_SYS_220_PREFIX") {
-                Ok(prefix) => shared_libs.push(format!("{prefix}/bin/libomp.dll")),
-                Err(_) => {
-                    let why = if options.openmp {
-                        "with OpenMP (--no-openmp to run without)"
-                    } else {
-                        "a program using `spawn` (its tasks run on libomp, even under --no-openmp; --no-tasks to run them in place)"
-                    };
-                    eprintln!("error: MLIR_SYS_220_PREFIX must be set (see .cargo/config.toml) to run {why}");
-                    return ExitCode::FAILURE;
-                }
-            }
-        }
-        let shared_lib_refs: Vec<&str> = shared_libs.iter().map(String::as_str).collect();
-        let engine = cleave_mlir_shim::ExecutionEngine::new(
-            module.to_raw(),
-            options.opt_level as usize,
-            &shared_lib_refs,
-            false,
-            false,
-            options.target_cpu.as_deref().unwrap_or(""),
-            options.target_features.as_deref().unwrap_or(""),
-            options.llvm_loop_unroll,
-        );
-        // SAFETY: see `cleave::pipeline::register_cleave_rt_symbols`'s own
-        // doc comment -- shared with `--emit-object`, which needs the
-        // identical registration for a reason specific to it (see there).
-        unsafe {
-            cleave::pipeline::register_cleave_rt_symbols(&engine);
-        }
-        let mut result: i32 = -1;
-        // SAFETY: `result` is a live, correctly-aligned `i32` on the stack
-        // for the duration of this call, matching exactly what `main`'s own
-        // (verified, i32-returning) MLIR signature writes into.
-        match unsafe { engine.invoke_packed("main", &mut [&mut result as *mut i32 as *mut ()]) } {
-            Ok(()) => {
+        // The pipeline every test running a program uses too (`cleave::run`).
+        match cleave::run::run_main(&program, &registry, None, &options, &[]) {
+            Ok(result) => {
                 println!("main returned: {result}");
                 return ExitCode::from(result as u8);
             }
-            Err(error) => {
-                eprintln!("error: failed to invoke `main`: {error}");
+            Err(errs) => {
+                for e in &errs {
+                    eprintln!("error: {e}");
+                }
                 return ExitCode::FAILURE;
             }
         }

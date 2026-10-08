@@ -29,15 +29,11 @@
 //! extraction mechanism between them) rather than shared, matching this
 //! project's own established posture for small, focused test files.
 
-use cleave::cps::{collect_mlir_types, collect_struct_schemas, collect_units, convert_program};
 use cleave::driver::compile;
-use cleave::mlir_lower::lower_program;
-use cleave::pipeline::{check_type_errors, strip_ciface_wrapper_debug_info};
+use cleave::pipeline::CodegenOptions;
 use cleave::registry::Registry;
 use melior::Context;
 use melior::dialect::DialectRegistry;
-use melior::ir::operation::OperationLike;
-use melior::pass;
 use melior::utility::register_all_dialects;
 
 fn context() -> Context {
@@ -68,58 +64,21 @@ fn run_i32_with_defines(context: &Context, src: &str, defines: &[(&str, &str)]) 
 /// observe *which* value `CLEAVE_OPENMP` actually resolves to at runtime,
 /// not just that a `define`/`const` folds.
 fn run_i32_with_defines_and_openmp(
-    context: &Context,
+    _context: &Context,
     src: &str,
     defines: &[(&str, &str)],
     openmp: bool,
 ) -> i32 {
-    let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
-    let mut program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
-    let defines: Vec<(String, String)> = defines
-        .iter()
-        .map(|(n, v)| (n.to_string(), v.to_string()))
-        .collect();
-    // As the real entry points do (`main.rs`, `pipeline::compile_and_emit`).
-    Registry::apply_defines(&mut program, &defines);
-    let (registry, errors) = Registry::build_with_defines(&program, &defines, openmp);
-    if !errors.is_empty() {
-        panic!("--define errors: {errors:?}");
-    }
-    if let Err(diags) = check_type_errors(&program, &registry) {
-        panic!("type check failed: {diags:?}");
-    }
-    let units = collect_units(&program, &registry);
-    let cps_program = convert_program(units, None);
-    let mlir_types = collect_mlir_types(&program);
-    let struct_schemas = collect_struct_schemas(&program);
-    let mut module = lower_program(context, &cps_program, &mlir_types, struct_schemas);
-    assert!(
-        module.as_operation().verify(),
-        "generated MLIR module failed verification"
-    );
-
-    let pass_manager = pass::PassManager::new(context);
-    pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
-    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
-    pass_manager.add_pass(pass::conversion::create_lower_affine());
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
-    pass_manager
-        .run(&mut module)
-        .expect("lowering to the llvm dialect must succeed");
-    strip_ciface_wrapper_debug_info(context, module.as_operation_mut());
-
-    let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
-    let mut result: i32 = -1;
-    unsafe {
-        engine
-            .invoke_packed("main", &mut [&mut result as *mut i32 as *mut ()])
-            .unwrap_or_else(|e| panic!("JIT invocation failed: {e:?}"));
-    }
-    result
+    let defines: Vec<(String, String)> = defines.iter().map(|(n, v)| (n.to_string(), v.to_string())).collect();
+    // `openmp` is what the registry's `CLEAVE_OPENMP` says; the code runs
+    // without OpenMP either way.
+    let (program, registry, sources) =
+        cleave::run::check_sources(vec![("test.cleave".to_string(), src.to_string())], &defines, openmp)
+            .unwrap_or_else(|e| panic!("{}", e.join("
+")));
+    let options = CodegenOptions { openmp: false, tasks: false, ..Default::default() };
+    cleave::run::run_main(&program, &registry, Some(&sources), &options, &[]).unwrap_or_else(|e| panic!("{}", e.join("
+")))
 }
 
 /// The baseline case: a const referenced as an ordinary value, combined
@@ -238,7 +197,7 @@ fn a_const_can_reference_another_const_declared_later_in_the_file() {
 /// named helper) is what actually catches it, the same path any other
 /// unknown-name error already goes through.
 #[test]
-#[should_panic(expected = "type check failed")]
+#[should_panic(expected = "error: `const BOGUS`'s own initializer is not a compile-time constant expression")]
 fn an_unresolvable_const_initializer_is_a_located_error_not_a_silent_failure() {
     let context = context();
     let src = "
@@ -349,7 +308,7 @@ fn a_bool_define_is_overridden_by_a_cli_define() {
 /// not a panic deep inside codegen once `cps.rs::convert_expr` fails to
 /// find it in `ConcreteUnit::global_consts`.
 #[test]
-#[should_panic(expected = "type check failed")]
+#[should_panic(expected = "error: `define SEUIL` has no default")]
 fn a_define_with_no_default_and_no_override_is_a_located_error() {
     let context = context();
     let src = "

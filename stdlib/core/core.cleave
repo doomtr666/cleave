@@ -70,3 +70,11 @@ algebra Index<Container, Elem, const K: i32> {
     // tensorial ML" item.
     derivative index(c, idx): index(d(c), idx);
 }
+
+// Writing one element of a collection that is a value rather than storage (a
+// `Tensor`): `c[i, j] = v` on a variable `c` of such a type is `c = set(c, [i,
+// j], v)` (`cps.rs`), the collection with that element replaced, rebound to
+// the variable. An array is written in place instead (`PrimOp::Store`).
+algebra IndexSet<Container, Elem, const K: i32> {
+    fn set(c: Container, idx: [i32; K], v: Elem) -> Container;
+}

@@ -199,14 +199,12 @@ impl<T: Float, const Dims...: i32> Scale<Tensor<T, Dims...>, T> {
 // Passing `idx` straight through, not unpacked into individual `index`-
 // typed operands (`idx[0]`, `idx[1]`, ...) the way this used to read: `mlir
 // ::tensor::extract`'s own variadic-index-array form (`lower_tensor_
-// extract_spread`, `mlir_lower.rs`) does that unpacking (plus the `i32 ->
+// index_spread`, `mlir_lower.rs`) does that unpacking (plus the `i32 ->
 // index` conversion every real operand needs) internally now, since the
 // real number of indices isn't known until `Dims`/`K` resolve — no longer
 // expressible as a fixed number of separate `let i0: index = ...;`
-// statements written out here. Read-only, deliberately: mutation stays
-// exclusively for a real array (see `infer.rs`'s own `StmtKind::Assign`
-// guard) — a tensor-backed value is immutable by construction, no
-// `IndexMut`-equivalent attempted.
+// statements written out here. A tensor is a value: writing an element
+// (`t[i, j] = v`) is `IndexSet`, below, `t` rebound to the updated tensor.
 // `algebra Index<Container, Elem, const K: i32>` itself is declared in the
 // prelude (`stdlib/core/core.cleave`), shared with arrays, `DynArray` and
 // user collections.
@@ -214,6 +212,14 @@ impl<T: Float, const Dims...: i32> Scale<Tensor<T, Dims...>, T> {
 impl<T: Float, const Dims...: i32> Index<Tensor<T, Dims...>, T> {
     fn index(t: Tensor<T, Dims...>, idx: [i32; Dims.len()]) -> T {
         mlir::tensor::extract(t, idx)
+    }
+}
+
+// `t[i, j] = v` (`IndexSet`, `stdlib/core`): `t` with one element replaced,
+// in place when `t` isn't used afterwards (bufferization's choice).
+impl<T: Float, const Dims...: i32> IndexSet<Tensor<T, Dims...>, T> {
+    fn set(t: Tensor<T, Dims...>, idx: [i32; Dims.len()], v: T) -> Tensor<T, Dims...> {
+        mlir::tensor::insert(v, t, idx)
     }
 }
 

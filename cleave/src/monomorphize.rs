@@ -1061,6 +1061,54 @@ fn collect_instantiations_block(
                 }
             }
             StmtKind::Assign { target, value } => {
+                // A value collection's element written (`IndexSet`, `cps.rs`):
+                // its `set` is instantiated for the statement, the target's
+                // base and indices walked as reads; the target itself isn't
+                // an `Index` read.
+                if let Some((base, indices)) = index_set_target(target, node_types, registry) {
+                    for e in std::iter::once(base).chain(indices.iter()).chain(std::iter::once(value)) {
+                        collect_instantiations_expr(
+                            e,
+                            node_types,
+                            global_env,
+                            templates,
+                            lambda_schemes,
+                            &scope,
+                            fn_worklist,
+                            impl_worklist,
+                            lambda_worklist,
+                            call_names,
+                            errors,
+                            registry,
+                        );
+                    }
+                    let base_ty = node_types[&base.id].clone();
+                    let idx_array_ty = Ty::Array(
+                        Box::new(Ty::Con("i32".to_string())),
+                        Box::new(Ty::Const(ConstValue::Int(indices.len() as u64))),
+                    );
+                    let value_ty = node_types[&value.id].clone();
+                    match derive_impl_instantiation_for(
+                        templates,
+                        registry,
+                        None,
+                        "set",
+                        &[base_ty.clone(), idx_array_ty, value_ty],
+                        &base_ty,
+                    ) {
+                        ImplMatch::Found(tmpl_idx, mapping) => {
+                            call_names.insert(stmt.id, display_impl_instantiation(&templates[tmpl_idx], &mapping));
+                            impl_worklist.push((tmpl_idx, mapping));
+                        }
+                        _ => errors.push(TypeError {
+                            span: target.span,
+                            kind: TypeErrorKind::Unsupported(format!(
+                                "assigning to an element of a `{base_ty}` (no `IndexSet` impl matches)"
+                            )),
+                        }),
+                    }
+                    continue;
+                }
                 collect_instantiations_expr(
                     target,
                     node_types,
@@ -3187,6 +3235,10 @@ pub fn dump_monomorphized(program: &Program, registry: &Registry) -> (String, Ve
     let (mono, program_inference) = monomorphize(program, registry);
     let mut out = String::new();
     let mut errors = Vec::new();
+    // Types with a native MLIR representation (`#[mlir_type(...)]`): the
+    // primitives, and the structs `Tensor` and `Vector`, which
+    // `check_unsupported_arrays` looks for.
+    let native: HashMap<String, String> = crate::cps::collect_mlir_types(program);
 
     for (i, item) in program.items.iter().enumerate() {
         if i > 0 {
@@ -3223,6 +3275,7 @@ pub fn dump_monomorphized(program: &Program, registry: &Registry) -> (String, Ve
                     dump_concrete_impl(
                         &mut out,
                         &mut errors,
+                        &native,
                         d,
                         item.span,
                         registry,
@@ -3240,6 +3293,7 @@ pub fn dump_monomorphized(program: &Program, registry: &Registry) -> (String, Ve
                         );
                     }
                     for k in keys {
+                        check_unsupported_arrays(mono.body(k), mono.node_types(k), &native, registry, &mut errors);
                         dump_one(
                             &mut out,
                             k,
@@ -3267,6 +3321,7 @@ pub fn dump_monomorphized(program: &Program, registry: &Registry) -> (String, Ve
                 Some(Ok(fn_result)) => match program_inference.global_env.get(&f.name) {
                     Some(scheme) if scheme.vars.is_empty() => match &f.body {
                         Some(body) => {
+                            check_unsupported_arrays(body, &program_inference.node_types, &native, registry, &mut errors);
                             dump_one(
                                 &mut out,
                                 &f.name,
@@ -3303,6 +3358,7 @@ pub fn dump_monomorphized(program: &Program, registry: &Registry) -> (String, Ve
                             );
                         }
                         for key in keys {
+                            check_unsupported_arrays(mono.body(key), mono.node_types(key), &native, registry, &mut errors);
                             dump_one(
                                 &mut out,
                                 key,
@@ -3345,6 +3401,7 @@ pub fn dump_monomorphized(program: &Program, registry: &Registry) -> (String, Ve
 fn dump_concrete_impl(
     out: &mut String,
     errors: &mut Vec<TypeError>,
+    native: &HashMap<String, String>,
     d: &ImplDecl,
     span: Span,
     registry: &Registry,
@@ -3369,16 +3426,19 @@ fn dump_concrete_impl(
             span,
         ) {
             Ok(ret) => match &f.body {
-                Some(body) => dump_one(
-                    out,
-                    &f.name,
-                    &f.params,
-                    body,
-                    &infer.param_types,
-                    &ret,
-                    &infer.node_types,
-                    &HashMap::new(),
-                ),
+                Some(body) => {
+                    check_unsupported_arrays(body, &infer.node_types, native, registry, errors);
+                    dump_one(
+                        out,
+                        &f.name,
+                        &f.params,
+                        body,
+                        &infer.param_types,
+                        &ret,
+                        &infer.node_types,
+                        &HashMap::new(),
+                    )
+                }
                 // A bodyless method (`#[mlir(...)]`-tagged) that type-checked
                 // successfully — rendered as a bare signature, same as
                 // `dump.rs`'s own `dump_impl_fn`.
@@ -3418,6 +3478,59 @@ fn dump_concrete_impl(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `c[i, ...] = v` writing an element of a value collection (`IndexSet`): `c`
+/// a variable whose type isn't an array nor a struct indexed by position.
+/// Its base and indices.
+pub(crate) fn index_set_target<'e>(
+    target: &'e Expr,
+    node_types: &HashMap<NodeId, Ty>,
+    registry: &Registry,
+) -> Option<(&'e Expr, &'e [Expr])> {
+    let ExprKind::Index(base, indices) = &target.kind else { return None };
+    if !matches!(base.kind, ExprKind::Path(_)) {
+        return None;
+    }
+    let base_ty = node_types.get(&base.id)?;
+    if matches!(base_ty, Ty::Array(..) | Ty::Var(_)) || Infer::new(registry).is_positional_struct(base_ty) {
+        return None;
+    }
+    Some((base, indices))
+}
+
+/// Array shapes the lowering can't build yet, as located errors (they failed
+/// in MLIR lowering: a module failing verification): an array of a natively
+/// represented struct (`[Tensor<f32, 3>; 2]`). Each array built in `body`,
+/// with its type.
+fn check_unsupported_arrays(
+    body: &Block,
+    node_types: &HashMap<NodeId, Ty>,
+    native: &HashMap<String, String>,
+    registry: &Registry,
+    errors: &mut Vec<TypeError>,
+) {
+    let struct_name = |t: &Ty| match t {
+        Ty::Con(n) | Ty::App(n, _) => Some(n.clone()),
+        _ => None,
+    };
+    for_each_expr_in_block(body, &mut |expr| {
+        if !matches!(expr.kind, ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat { .. }) {
+            return;
+        }
+        let Some(Ty::Array(elem, _)) = node_types.get(&expr.id) else { return };
+        let what = match elem.as_ref() {
+            // A `Tensor` is held by its descriptor (`refcount::is_handle_array`);
+            // a `Vector` has no buffer to hold.
+            t if struct_name(t).is_some_and(|n| registry.has_struct(&n) && native.get(&n).is_some_and(|k| k != "tensor")) => {
+                format!("an array of `{t}`")
+            }
+            _ => return,
+        };
+        if !errors.iter().any(|e| e.span == expr.span) {
+            errors.push(TypeError { span: expr.span, kind: TypeErrorKind::Unsupported(what) });
+        }
+    });
+}
+
 fn dump_one(
     out: &mut String,
     mangled_name: &str,

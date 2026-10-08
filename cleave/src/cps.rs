@@ -1989,6 +1989,11 @@ fn mutated_free_vars_stmts(
             }
             StmtKind::Assign { target, value } => {
                 escaping.extend(mutated_free_vars_expr(value, &local_shadowed, ctx));
+                // A value collection's element written rebinds its variable.
+                let target = match index_set_parts(stmt, ctx) {
+                    Some((base, _)) => base,
+                    None => target,
+                };
                 if let ExprKind::Path(p) = &target.kind {
                     let name = p.segments.join("::");
                     if !local_shadowed.contains(&name) {
@@ -2006,6 +2011,16 @@ fn mutated_free_vars_stmts(
         }
     }
     escaping
+}
+
+/// `c[i, ...] = v` writing an element of a value collection (`IndexSet`):
+/// monomorphization resolved a `set` for this statement
+/// (`monomorphize::index_set_target`). Its base (the variable `c`) and
+/// indices.
+fn index_set_parts<'s>(stmt: &'s Stmt, ctx: &Ctx) -> Option<(&'s Expr, &'s [Expr])> {
+    let StmtKind::Assign { target, .. } = &stmt.kind else { return None };
+    let ExprKind::Index(base, indices) = &target.kind else { return None };
+    (matches!(base.kind, ExprKind::Path(_)) && ctx.call_names.contains_key(&stmt.id)).then_some((&**base, indices.as_slice()))
 }
 
 fn convert_stmts(stmts: &[Stmt], env: CEnv, ctx: &Ctx, k: &dyn Fn(CEnv) -> CExpr) -> CExpr {
@@ -2132,6 +2147,46 @@ fn convert_stmts(stmts: &[Stmt], env: CEnv, ctx: &Ctx, k: &dyn Fn(CEnv) -> CExpr
         StmtKind::Expr(e) => convert_expr(e, &env, ctx, &|_v, env| {
             continue_after(rest, env.clone(), ctx, might_break, k)
         }),
+        // A value collection's element (`IndexSet`): `c = set(c, [i, ...], v)`,
+        // the result rebound to `c` (`mutated_free_vars` sees `c` assigned).
+        StmtKind::Assign { value, .. } if index_set_parts(stmt, ctx).is_some() => {
+            let (base, indices) = index_set_parts(stmt, ctx).unwrap();
+            let ExprKind::Path(p) = &base.kind else { unreachable!("index_set_target's base is a path") };
+            let name = p.segments.join("::");
+            let base_ty = ctx.node_types[&base.id].clone();
+            let idx_array_ty = Ty::Array(
+                Box::new(Ty::Con("i32".to_string())),
+                Box::new(Ty::Const(ConstValue::Int(indices.len() as u64))),
+            );
+            let index_exprs: Vec<&Expr> = indices.iter().collect();
+            convert_expr(base, &env, ctx, &|base_val, env| {
+                convert_expr_list(&index_exprs, env, ctx, &|index_vals, env| {
+                    convert_expr(value, env, ctx, &|new_val, env| {
+                        let idx_array_var = ctx.fresh.var();
+                        let callee = resolve_call("set", stmt.id, &[base.id, value.id], ctx);
+                        let name = name.clone();
+                        CExpr::LetPrim {
+                            var: { ctx.line(idx_array_var); idx_array_var },
+                            ty: idx_array_ty.clone(),
+                            op: PrimOp::Array,
+                            args: index_vals.clone(),
+                            cont: Box::new(emit_call(
+                                callee,
+                                vec![base_val.clone(), CVal::Var(idx_array_var), new_val],
+                                base_ty.clone(),
+                                ctx,
+                                env,
+                                &move |updated, env| {
+                                    let mut env2 = env.clone();
+                                    env2.insert(name.clone(), updated);
+                                    continue_after(rest, env2, ctx, might_break, k)
+                                },
+                            )),
+                        }
+                    })
+                })
+            })
+        }
         StmtKind::Assign { target, value } => match &target.kind {
             ExprKind::Path(p) => {
                 let name = p.segments.join("::");
@@ -2164,25 +2219,26 @@ fn convert_stmts(stmts: &[Stmt], env: CEnv, ctx: &Ctx, k: &dyn Fn(CEnv) -> CExpr
                 convert_expr(array_expr, &env, ctx, &|array_val, env| {
                     convert_expr_list(&index_exprs, env, ctx, &|index_vals, env| {
                         convert_expr(value, env, ctx, &|new_val, env| {
-                            let var = ctx.fresh.var();
-                            let mut args = vec![array_val.clone()];
-                            args.extend(index_vals.clone());
-                            args.push(new_val);
-                            CExpr::LetPrim {
-                                var: { ctx.line(var); var },
-                                ty: Ty::Con("()".to_string()),
-                                op: PrimOp::Store {
-                                    array_ty: array_ty.clone(),
-                                },
-                                args,
-                                cont: Box::new(continue_after(
-                                    rest,
-                                    env.clone(),
-                                    ctx,
-                                    might_break,
-                                    k,
-                                )),
-                            }
+                            // Into the array object the leading indices reach
+                            // (`index_segments`), then a store there.
+                            let segments = index_segments(&array_ty, index_vals.len());
+                            let (last_ty, last_len) = segments.last().cloned().expect("an index");
+                            let lead = index_vals.len() - last_len;
+                            let new_val = new_val.clone();
+                            let index_vals = index_vals.clone();
+                            emit_loads(array_val.clone(), &array_ty, &index_vals[..lead], ctx, &|object| {
+                                let var = ctx.fresh.var();
+                                let mut args = vec![object];
+                                args.extend(index_vals[lead..].iter().cloned());
+                                args.push(new_val.clone());
+                                CExpr::LetPrim {
+                                    var: { ctx.line(var); var },
+                                    ty: Ty::Con("()".to_string()),
+                                    op: PrimOp::Store { array_ty: last_ty.clone() },
+                                    args,
+                                    cont: Box::new(continue_after(rest, env.clone(), ctx, might_break, k)),
+                                }
+                            })
                         })
                     })
                 })
@@ -3189,18 +3245,7 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
             let array_ty = ctx.node_types[&array_expr.id].clone();
             convert_expr(array_expr, env, ctx, &|array_val, env| {
                 convert_expr_list(&index_exprs, env, ctx, &|index_vals, env| {
-                    let var = ctx.fresh.var();
-                    let mut args = vec![array_val.clone()];
-                    args.extend(index_vals);
-                    CExpr::LetPrim {
-                        var: { ctx.line(var); var },
-                        ty: ctx.node_types[&expr.id].clone(),
-                        op: PrimOp::Load {
-                            array_ty: array_ty.clone(),
-                        },
-                        args,
-                        cont: Box::new(k(CVal::Var(var), env)),
-                    }
+                    emit_loads(array_val.clone(), &array_ty, &index_vals, ctx, &|v| k(v, env))
                 })
             })
         }
@@ -3550,6 +3595,76 @@ fn convert_array_repeat_over_resolved_dims(
 /// groups outside-in, so the *group* order is reversed before flattening,
 /// while each group's own internal (already-source-order) index order stays
 /// untouched).
+/// Whether a type is a scalar: an array of them is laid out flat, one array
+/// value whatever its rank.
+fn is_scalar_ty(ty: &Ty) -> bool {
+    matches!(ty, Ty::Con(n) if matches!(n.as_str(), "i8" | "i16" | "i32" | "i64" | "f32" | "f64" | "bool" | "index"))
+}
+
+/// Whether `ty` is an array whose elements are arrays of structs: each
+/// element an array object of its own (`refcount::is_handle_array`), reached
+/// through a pointer, not laid out inline. An index into it can't share a
+/// `Load` with the indices applied to the element it reaches.
+fn elements_are_array_objects(ty: &Ty) -> bool {
+    let Ty::Array(elem, _) = ty else { return false };
+    if !matches!(elem.as_ref(), Ty::Array(..)) {
+        return false;
+    }
+    let mut leaf = elem.as_ref();
+    while let Ty::Array(e, _) = leaf {
+        leaf = e;
+    }
+    !is_scalar_ty(leaf)
+}
+
+/// `count` indices into `array_ty`, split at its array objects: the array
+/// type each `Load`/`Store` applies to and how many of the indices it takes.
+/// One `Load`/`Store` for an array laid out flat (`a[i, j]`, `a[i][j]` on
+/// `[[f32; M]; N]`); one per level for arrays of arrays of structs.
+fn index_segments(array_ty: &Ty, count: usize) -> Vec<(Ty, usize)> {
+    let mut segments = Vec::new();
+    let mut current = array_ty.clone();
+    let mut left = count;
+    while left > 0 {
+        if elements_are_array_objects(&current) && left > 1 {
+            let Ty::Array(elem, _) = &current else { unreachable!() };
+            segments.push((current.clone(), 1));
+            current = elem.as_ref().clone();
+            left -= 1;
+        } else {
+            segments.push((current.clone(), left));
+            left = 0;
+        }
+    }
+    segments
+}
+
+/// The element `indices` reach in `array_val` (of `array_ty`), one `Load` per
+/// segment (`index_segments`), handed to `k`; `array_val` itself for no
+/// index.
+fn emit_loads(array_val: CVal, array_ty: &Ty, indices: &[CVal], ctx: &Ctx, k: &dyn Fn(CVal) -> CExpr) -> CExpr {
+    if indices.is_empty() {
+        return k(array_val);
+    }
+    let segments = index_segments(array_ty, indices.len());
+    let (segment_ty, taken) = segments[0].clone();
+    let mut result_ty = segment_ty.clone();
+    for _ in 0..taken {
+        let Ty::Array(elem, _) = result_ty else { panic!("CPS: indexing past an array's dimensions") };
+        result_ty = *elem;
+    }
+    let var = ctx.fresh.var();
+    let mut args = vec![array_val];
+    args.extend(indices[..taken].iter().cloned());
+    CExpr::LetPrim {
+        var: { ctx.line(var); var },
+        ty: result_ty.clone(),
+        op: PrimOp::Load { array_ty: segment_ty },
+        args,
+        cont: Box::new(emit_loads(CVal::Var(var), &result_ty, &indices[taken..], ctx, k)),
+    }
+}
+
 fn collect_index_chain(expr: &Expr) -> (&Expr, Vec<&Expr>) {
     let mut groups: Vec<&Vec<Expr>> = Vec::new();
     let mut current = expr;
@@ -3685,6 +3800,11 @@ fn mutated_free_vars(block: &Block, shadowed: &HashSet<String>, ctx: &Ctx) -> Ha
             }
             StmtKind::Assign { target, value } => {
                 escaping.extend(mutated_free_vars_expr(value, &local_shadowed, ctx));
+                // A value collection's element written rebinds its variable.
+                let target = match index_set_parts(stmt, ctx) {
+                    Some((base, _)) => base,
+                    None => target,
+                };
                 if let ExprKind::Path(p) = &target.kind {
                     let name = p.segments.join("::");
                     if !local_shadowed.contains(&name) {

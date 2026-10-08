@@ -71,11 +71,9 @@ pub struct Build {
     target_features: Option<String>,
     backend: Option<cleave::pipeline::Backend>,
     inline: Option<bool>,
-    unroll_jam: Option<bool>,
     llvm_loop_unroll: Option<bool>,
     inline_threshold: Option<usize>,
     tasks: Option<bool>,
-    chain_split: Option<bool>,
     affine_structs: Option<bool>,
     debug_info: Option<bool>,
     defines: Vec<(String, String)>,
@@ -97,11 +95,9 @@ impl Build {
             target_features: None,
             backend: None,
             inline: None,
-            unroll_jam: None,
             llvm_loop_unroll: None,
             inline_threshold: None,
             tasks: None,
-            chain_split: None,
             affine_structs: None,
             debug_info: None,
             defines: Vec::new(),
@@ -158,12 +154,6 @@ impl Build {
         self
     }
 
-    /// See `cleave::pipeline::CodegenOptions::unroll_jam`'s own doc comment.
-    pub fn unroll_jam(&mut self, enabled: bool) -> &mut Self {
-        self.unroll_jam = Some(enabled);
-        self
-    }
-
     /// See `cleave::pipeline::CodegenOptions::llvm_loop_unroll`'s own doc comment.
     pub fn llvm_loop_unroll(&mut self, enabled: bool) -> &mut Self {
         self.llvm_loop_unroll = Some(enabled);
@@ -179,12 +169,6 @@ impl Build {
     /// See `cleave::pipeline::CodegenOptions::tasks`'s own doc comment.
     pub fn tasks(&mut self, enabled: bool) -> &mut Self {
         self.tasks = Some(enabled);
-        self
-    }
-
-    /// See `cleave::pipeline::CodegenOptions::chain_split`'s own doc comment.
-    pub fn chain_split(&mut self, enabled: bool) -> &mut Self {
-        self.chain_split = Some(enabled);
         self
     }
 
@@ -293,11 +277,9 @@ impl Build {
             target_features: self.target_features.clone(),
             backend: self.backend.unwrap_or(cleave::pipeline::Backend::Cpu),
             inline: self.inline.unwrap_or(defaults.inline),
-            unroll_jam: self.unroll_jam.unwrap_or(defaults.unroll_jam),
             llvm_loop_unroll: self.llvm_loop_unroll.unwrap_or(defaults.llvm_loop_unroll),
             inline_threshold: self.inline_threshold.unwrap_or(defaults.inline_threshold),
             tasks: self.tasks.unwrap_or(defaults.tasks),
-            chain_split: self.chain_split.unwrap_or(defaults.chain_split),
             affine_structs: self.affine_structs.unwrap_or(defaults.affine_structs),
             debug_info: self.debug_info.unwrap_or(defaults.debug_info),
         };

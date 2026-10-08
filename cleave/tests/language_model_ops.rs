@@ -3,116 +3,20 @@
 //! gradient: an `adjoint` rule with a non-differentiable (integer) parameter,
 //! embeddings, cross-entropy on integer targets, GELU.
 
-use cleave::cps::{collect_mlir_types, collect_struct_schemas};
-use cleave::driver::compile;
-use cleave::egraph::{DerivativeRequest, optimize_program, synthesize_derivatives};
-use cleave::mlir_lower::lower_program;
-use cleave::pipeline::{Backend, CodegenOptions, check_type_errors, lower_to_llvm};
-use cleave::refcount::insert_refcounting;
-use cleave::registry::Registry;
-use melior::Context;
-use melior::dialect::DialectRegistry;
-use melior::ir::operation::OperationLike;
-use melior::utility::register_all_dialects;
+use cleave::pipeline::CodegenOptions;
 
 /// Compiles `src` through the real pipeline and returns what its `main`
 /// returns.
+/// Compiles and runs `src`'s `main` (`fn main() -> f32`) through the real
+/// pipeline (`cleave::run`, what `--run` uses): `main`'s four bytes read as
+/// an `f32`. Tasks off: this binary's tests run in parallel (`doc/backlog.md`,
+/// several programs spawning tasks at once in one process).
 fn run(src: &str) -> f32 {
-    let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
-    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
-    let registry = Registry::build(&program);
-    if let Err(diags) = check_type_errors(&program, &registry) {
-        panic!("type check failed: {diags:?}");
-    }
-    let units = cleave::cps::collect_units(&program, &registry);
-    let requests: Vec<DerivativeRequest> = units
-        .iter()
-        .filter_map(|u| match &u.body {
-            cleave::cps::UnitBody::Derivative(of, is_grad, grad_target_index) => Some(DerivativeRequest {
-                name: u.name.clone(),
-                of: of.clone(),
-                is_grad: *is_grad,
-                grad_target_index: *grad_target_index,
-            }),
-            _ => None,
-        })
-        .collect();
-    let cps_program = cleave::cps::convert_program(units, None);
-    let struct_schemas = collect_struct_schemas(&program);
-    let cps_program = synthesize_derivatives(cps_program, &requests, &registry, &struct_schemas)
-        .unwrap_or_else(|e| panic!("cannot derive: {e:?}"));
-    let (cps_program, _) = optimize_program(cps_program, &registry, false);
-    let cps_program = cleave::cps::eliminate_dead_code(cps_program);
-    let mlir_types = collect_mlir_types(&program);
-    let escaping = cleave::escape::escaping_struct_vars(&cps_program);
-    let cps_program = insert_refcounting(cps_program, &struct_schemas, &mlir_types, &escaping);
-
-    let dialect_registry = DialectRegistry::new();
-    register_all_dialects(&dialect_registry);
-    let context = Context::new();
-    context.append_dialect_registry(&dialect_registry);
-    context.load_all_available_dialects();
-    melior::utility::register_all_llvm_translations(&context);
-    let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
-    assert!(module.as_operation().verify(), "module failed verification");
-    let options = CodegenOptions {
-        opt_level: 2,
-        openmp: false,
-        target_cpu: None,
-        target_features: None,
-        backend: Backend::Cpu,
-        // In-process engine without libomp: spawned calls run in place.
-        tasks: false,
-        ..Default::default()
-    };
-    cleave::options::set(options.clone());
-    lower_to_llvm(&context, &mut module, &options).expect("lower_to_llvm failed");
-
-    let engine = melior::ExecutionEngine::new(&module, options.opt_level as usize, &[], true, false);
-    unsafe {
-        use cleave_rt::checkpoint as ck;
-        let symbols: &[(&str, *mut ())] = &[
-            ("cleave_alloc", cleave_rt::cleave_alloc as *mut ()),
-            ("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ()),
-            ("cleave_retain", cleave_rt::cleave_retain as *mut ()),
-            ("cleave_release", cleave_rt::cleave_release as *mut ()),
-            ("cleave_release_void", cleave_rt::cleave_release_void as *mut ()),
-            ("cleave_alloc_local", cleave_rt::cleave_alloc_local as *mut ()),
-            ("cleave_region_enter", cleave_rt::cleave_region_enter as *mut ()),
-            ("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ()),
-            ("cleave_alloc_pool", cleave_rt::cleave_alloc_pool as *mut ()),
-            ("cleave_release_pool", cleave_rt::cleave_release_pool as *mut ()),
-            ("memrefCopy", cleave_rt::memrefCopy as *mut ()),
-            ("cleave_blas_sgemm", cleave_rt::cleave_blas_sgemm as *mut ()),
-            ("rand_seed", cleave_rt::rand_seed as *mut ()),
-            ("rand_state", cleave_rt::rand_state as *mut ()),
-            ("rand_uniform_f32", cleave_rt::rand_uniform_f32 as *mut ()),
-            ("rand_normal_f32", cleave_rt::rand_normal_f32 as *mut ()),
-            ("cleave_ckpt_create", ck::cleave_ckpt_create as *mut ()),
-            ("cleave_ckpt_open", ck::cleave_ckpt_open as *mut ()),
-            ("cleave_ckpt_close", ck::cleave_ckpt_close as *mut ()),
-            ("cleave_ckpt_write_f32s", ck::cleave_ckpt_write_f32s as *mut ()),
-            ("cleave_ckpt_read_f32s", ck::cleave_ckpt_read_f32s as *mut ()),
-            ("cleave_ckpt_write_f32", ck::cleave_ckpt_write_f32 as *mut ()),
-            ("cleave_ckpt_read_f32", ck::cleave_ckpt_read_f32 as *mut ()),
-            ("cleave_ckpt_write_f64", ck::cleave_ckpt_write_f64 as *mut ()),
-            ("cleave_ckpt_read_f64", ck::cleave_ckpt_read_f64 as *mut ()),
-            ("cleave_ckpt_write_i32", ck::cleave_ckpt_write_i32 as *mut ()),
-            ("cleave_ckpt_read_i32", ck::cleave_ckpt_read_i32 as *mut ()),
-            ("cleave_ckpt_write_i64", ck::cleave_ckpt_write_i64 as *mut ()),
-            ("cleave_ckpt_read_i64", ck::cleave_ckpt_read_i64 as *mut ()),
-        ];
-        for (name, f) in symbols {
-            engine.register_symbol(name, *f);
-        }
-        let mut result: f32 = 0.0;
-        engine
-            .invoke_packed("main", &mut [&mut result as *mut f32 as *mut ()])
-            .expect("JIT invocation failed");
-        result
-    }
+    let options = CodegenOptions { openmp: false, tasks: false, ..Default::default() };
+    let bits = cleave::run::run_source("test.cleave", src, &options).unwrap_or_else(|e| panic!("{}", e.join("
+")));
+    f32::from_bits(bits as u32)
 }
-
 
 fn close(a: f32, b: f32) -> bool {
     (a - b).abs() <= 1e-4 * (1.0 + b.abs())

@@ -20,13 +20,12 @@ use cleave::driver::compile;
 use cleave::egraph::optimize_program;
 use cleave::infer::Ty;
 use cleave::mlir_lower::lower_program;
-use cleave::pipeline::{check_type_errors, strip_ciface_wrapper_debug_info};
+use cleave::pipeline::check_type_errors;
 use cleave::refcount::insert_refcounting;
 use cleave::registry::Registry;
 use melior::Context;
 use melior::dialect::DialectRegistry;
 use melior::ir::operation::OperationLike;
-use melior::pass;
 use melior::utility::register_all_dialects;
 
 fn context() -> Context {
@@ -206,85 +205,19 @@ fn count_releases_in(expr: &CExpr, struct_name: &str, count: &mut usize) {
     }
 }
 
-/// Compiles `src` through the *real* pipeline (`pipeline.rs::
-/// build_optimized_cps`'s own exact sequence: CPS conversion, dead-code
-/// elimination, e-graph optimization, a second dead-code sweep, then
-/// `insert_refcounting`), lowers to the `llvm` dialect, and JIT-invokes
-/// `main`, returning its own `i32` result.
+/// Compiles `src` through the real pipeline (`cleave::run`, what `--run`
+/// uses) and runs `main`, returning its `i32` result.
 fn run_i32(src: &str) -> i32 {
     run_i32_with_extra_symbols(src, &[])
 }
 
-/// Like `run_i32`, but registers extra runtime symbols alongside the base
-/// set — needed for a program that reaches `stdlib/dynarray/dynarray.
-/// cleave` (`use dynarray;` eagerly compiles every one of its own six
-/// non-generic `RawBuffer<T>` impls regardless of which widths the test
-/// program itself actually uses, `cps.rs`'s own "non-generic impl" branch —
-/// mirrors `tests/mlir_lower.rs::run_i32_with_dynarray_symbols`'s identical
-/// reasoning).
+/// Like `run_i32`, with host functions for the program's own externs.
 fn run_i32_with_extra_symbols(src: &str, extra_symbols: &[(&str, *mut ())]) -> i32 {
-    let context = context();
-    let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
-    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
-    let registry = Registry::build(&program);
-    if let Err(diags) = check_type_errors(&program, &registry) {
-        panic!("type check failed: {diags:?}");
-    }
-    let units = collect_units(&program, &registry);
-    let cps_program = convert_program(units, None);
-    let cps_program = cleave::cps::eliminate_dead_code(cps_program);
-    let (cps_program, _) = optimize_program(cps_program, &registry, false);
-    let cps_program = cleave::cps::eliminate_dead_code(cps_program);
-    let struct_schemas = collect_struct_schemas(&program);
-    let mlir_types = collect_mlir_types(&program);
-    let escaping = cleave::escape::escaping_struct_vars(&cps_program);
-    let cps_program = insert_refcounting(cps_program, &struct_schemas, &mlir_types, &escaping);
-
-    let mlir_types = collect_mlir_types(&program);
-    let struct_schemas = collect_struct_schemas(&program);
-    let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
-    assert!(
-        module.as_operation().verify(),
-        "generated MLIR module failed verification"
-    );
-
-    let pass_manager = pass::PassManager::new(&context);
-    pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-    pass_manager
-        .run(&mut module)
-        .expect("lowering to the llvm dialect must succeed");
-    strip_ciface_wrapper_debug_info(&context, module.as_operation_mut());
-
-    let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
-    // SAFETY: each `cleave_rt::*` pointer is a real, valid `extern "C" fn`,
-    // live for the process's whole lifetime — mirrors `pipeline.rs::
-    // register_cleave_rt_symbols`'s own registration.
-    unsafe {
-        engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
-        engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
-        engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
-        engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
-        engine.register_symbol("cleave_release_void", cleave_rt::cleave_release_void as *mut ());
-        engine.register_symbol("cleave_alloc_local", cleave_rt::cleave_alloc_local as *mut ());
-        engine.register_symbol("cleave_region_enter", cleave_rt::cleave_region_enter as *mut ());
-        engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
-        engine.register_symbol("cleave_alloc_pool", cleave_rt::cleave_alloc_pool as *mut ());
-        engine.register_symbol("cleave_release_pool", cleave_rt::cleave_release_pool as *mut ());
-        for (name, ptr) in extra_symbols {
-            engine.register_symbol(name, *ptr);
-        }
-    }
-    let mut out: i32 = -1;
-    // SAFETY: `out` is a live, correctly-aligned `i32` on the stack for the
-    // duration of this call.
-    unsafe {
-        engine
-            .invoke_packed("main", &mut [&mut out as *mut i32 as *mut ()])
-            .expect("JIT invocation must succeed — a real crash here (STATUS_HEAP_CORRUPTION/STATUS_ACCESS_VIOLATION) is exactly the failure mode a wrong retain/release insertion produces");
-    }
-    out
+    let options = cleave::pipeline::CodegenOptions { openmp: false, tasks: false, ..Default::default() };
+    cleave::run::run_source_with("test.cleave", src, &options, extra_symbols).unwrap_or_else(|e| {
+        panic!("{} -- a crash here (STATUS_HEAP_CORRUPTION/STATUS_ACCESS_VIOLATION) is the failure a wrong retain/release produces", e.join("
+"))
+    })
 }
 
 /// The simplest case: a struct constructed and never used again must be
@@ -549,36 +482,9 @@ fn dynarray_of_primitives_still_computes_correct_values_after_the_rawbuf_fix() {
             h.get(0) + h.get(1) + h.get(2)
         }
         "#;
-    // `use dynarray;` eagerly compiles all six non-generic `RawBuffer<T>`
-    // impls, not just the `i32` one this program actually uses — every
-    // width's own `dynarray_*` symbol needs to be resolvable at JIT link
-    // time regardless (`run_i32_with_extra_symbols`'s own doc comment).
-    let symbols: &[(&str, *mut ())] = &[
-        ("dynarray_alloc_i8", cleave_rt::dynarray_alloc_i8 as *mut ()),
-        ("dynarray_grow_i8", cleave_rt::dynarray_grow_i8 as *mut ()),
-        ("dynarray_get_i8", cleave_rt::dynarray_get_i8 as *mut ()),
-        ("dynarray_set_i8", cleave_rt::dynarray_set_i8 as *mut ()),
-        ("dynarray_alloc_i16", cleave_rt::dynarray_alloc_i16 as *mut ()),
-        ("dynarray_grow_i16", cleave_rt::dynarray_grow_i16 as *mut ()),
-        ("dynarray_get_i16", cleave_rt::dynarray_get_i16 as *mut ()),
-        ("dynarray_set_i16", cleave_rt::dynarray_set_i16 as *mut ()),
-        ("dynarray_alloc_i32", cleave_rt::dynarray_alloc_i32 as *mut ()),
-        ("dynarray_grow_i32", cleave_rt::dynarray_grow_i32 as *mut ()),
-        ("dynarray_get_i32", cleave_rt::dynarray_get_i32 as *mut ()),
-        ("dynarray_set_i32", cleave_rt::dynarray_set_i32 as *mut ()),
-        ("dynarray_alloc_i64", cleave_rt::dynarray_alloc_i64 as *mut ()),
-        ("dynarray_grow_i64", cleave_rt::dynarray_grow_i64 as *mut ()),
-        ("dynarray_get_i64", cleave_rt::dynarray_get_i64 as *mut ()),
-        ("dynarray_set_i64", cleave_rt::dynarray_set_i64 as *mut ()),
-        ("dynarray_alloc_f32", cleave_rt::dynarray_alloc_f32 as *mut ()),
-        ("dynarray_grow_f32", cleave_rt::dynarray_grow_f32 as *mut ()),
-        ("dynarray_get_f32", cleave_rt::dynarray_get_f32 as *mut ()),
-        ("dynarray_set_f32", cleave_rt::dynarray_set_f32 as *mut ()),
-        ("dynarray_alloc_f64", cleave_rt::dynarray_alloc_f64 as *mut ()),
-        ("dynarray_grow_f64", cleave_rt::dynarray_grow_f64 as *mut ()),
-        ("dynarray_get_f64", cleave_rt::dynarray_get_f64 as *mut ()),
-        ("dynarray_set_f64", cleave_rt::dynarray_set_f64 as *mut ()),
-    ];
+    // `cleave-rt`'s `dynarray_*` functions are the runtime's own, registered
+    // with it (`pipeline::register_cleave_rt_symbols`).
+    let symbols: &[(&str, *mut ())] = &[];
     assert_eq!(run_i32_with_extra_symbols(src, symbols), 60);
 }
 

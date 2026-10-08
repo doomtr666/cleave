@@ -484,24 +484,3 @@ fn blas_matmul_transpose_b<const P: i32, const Q: i32, const R: i32>(a: Tensor<f
     sgemm(false, true, 1.0, a, b, 0.0, c)
 }
 
-#[no_inline]
-fn blas_matmul_transpose_a<const P: i32, const Q: i32, const R: i32>(a: Tensor<f32, P, Q>, b: Tensor<f32, P, R>) -> Tensor<f32, Q, R> {
-    let mut c_buf: [f32; Q, R] = mlir::memref::alloc();
-    let c: Tensor<f32, Q, R> = mlir::bufferization::to_tensor(c_buf, restrict: "unit");
-    sgemm(true, false, 1.0, a, b, 0.0, c)
-}
-
-#[no_inline]
-fn blas_fma<const N: i32, const M: i32, const K: i32>(a: Tensor<f32, N, M>, b: Tensor<f32, M, K>, c: Tensor<f32, N, K>) -> Tensor<f32, N, K> {
-    sgemm(false, false, 1.0, a, b, 1.0, c)
-}
-
-#[no_inline]
-fn blas_fma_transpose_a<const P: i32, const Q: i32, const R: i32>(a: Tensor<f32, P, Q>, b: Tensor<f32, P, R>, c: Tensor<f32, Q, R>) -> Tensor<f32, Q, R> {
-    sgemm(true, false, 1.0, a, b, 1.0, c)
-}
-
-#[no_inline]
-fn blas_fma_transpose_b<const P: i32, const Q: i32, const R: i32>(a: Tensor<f32, P, Q>, b: Tensor<f32, R, Q>, c: Tensor<f32, P, R>) -> Tensor<f32, P, R> {
-    sgemm(false, true, 1.0, a, b, 1.0, c)
-}

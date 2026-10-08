@@ -9,16 +9,10 @@
 //! own established precedent for a short-lived, single-invocation test —
 //! harmless to leak a handful of small tensors once, at process exit.
 
-use cleave::cps::{collect_mlir_types, collect_struct_schemas, collect_units, convert_program};
-use cleave::driver::compile;
-use cleave::mlir_lower::lower_program;
-use cleave::pipeline::{CodegenOptions, check_type_errors, lower_to_llvm, strip_ciface_wrapper_debug_info};
-use cleave::registry::Registry;
+use cleave::pipeline::CodegenOptions;
 use melior::Context;
 use melior::dialect::DialectRegistry;
-use melior::ir::operation::OperationLike;
-use melior::pass;
-use melior::utility::{parse_pass_pipeline, register_all_dialects};
+use melior::utility::register_all_dialects;
 
 fn context() -> Context {
     let dialect_registry = DialectRegistry::new();
@@ -29,110 +23,22 @@ fn context() -> Context {
     context
 }
 
-/// Compiles `src` all the way to a real JIT invocation of `main() -> f32`,
-/// mirroring `mlir_lower.rs::run_i32_from_cps`'s own three-stage tensor
-/// pipeline (elementwise-to-linalg, one-shot-bufferize with function-
-/// boundary rewriting, then the ordinary llvm-dialect tail) exactly — see
-/// that function's own doc comments for why each stage is a *separate*
-/// `PassManager`, and why the `--convert-to-llvm`/`--finalize-memref-to-
-/// llvm`/`--convert-to-llvm` sequence is repeated. Only `cleave_alloc_rc`
-/// (real `Tensor` construction) and `cleave_blas_sgemm` (`stdlib/blas/
-/// blas.cleave`'s own real extern) are registered — this file's own
-/// sources never reach `io`/`dynarray`/refcounting at all.
-fn run_f32(context: &Context, src: &str) -> f32 {
-    let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
-    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
-    let registry = Registry::build(&program);
-    if let Err(diags) = check_type_errors(&program, &registry) {
-        panic!("type check failed: {diags:?}");
-    }
-    let units = collect_units(&program, &registry);
-    let cps_program = convert_program(units, None);
-    let mlir_types = collect_mlir_types(&program);
-    let struct_schemas = collect_struct_schemas(&program);
-    let mut module = lower_program(context, &cps_program, &mlir_types, struct_schemas);
-    assert!(
-        module.as_operation().verify(),
-        "generated MLIR module failed verification"
-    );
-
-    let pass_manager = pass::PassManager::new(context);
-    pass_manager.add_pass(pass::linalg::create_convert_elementwise_to_linalg_pass());
-    pass_manager
-        .run(&mut module)
-        .expect("convert-elementwise-to-linalg must succeed");
-
-    let pass_manager = pass::PassManager::new(context);
-    cleave::pipeline::register_passes();
-    parse_pass_pipeline(
-        pass_manager.as_operation_pass_manager(),
-        "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})",
-    )
-    .expect("failed to parse the one-shot-bufferize pass pipeline");
-    pass_manager
-        .run(&mut module)
-        .expect("one-shot-bufferize must succeed");
-
-    let pass_manager = pass::PassManager::new(context);
-    pass_manager.add_pass(pass::linalg::create_convert_linalg_to_loops_pass());
-    pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
-    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
-    pass_manager.add_pass(pass::conversion::create_lower_affine());
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-    pass_manager
-        .run(&mut module)
-        .expect("lowering to the llvm dialect must succeed");
-    strip_ciface_wrapper_debug_info(&context, module.as_operation_mut());
-
-    // `openmp: false`, `target_cpu: "native"` — matching `examples/mnist-
-    // interop/build.rs`'s own real config exactly, not `CodegenOptions::
-    // default()`'s own `openmp: true, target_cpu: None`. The `target_cpu`
-    // one turned out to be *the* real gap, found live: without it, native
-    // `matmul`'s own vectorized `vector.contract`/`vfmadd` lowering has no
-    // real AVX2/AVX-512 target to compile against at all (a generic
-    // baseline x86-64 target, no modern SIMD) — crippling *only* the
-    // native path, since BLAS is an externally-compiled library, already
-    // built with its own real target features, entirely unaffected by
-    // this cleave-level setting. Comparing BLAS against artificially-
-    // crippled native codegen is not comparing what the real kernel
-    // (which *does* set `target_cpu: "native"`) actually runs.
-    let mut options = CodegenOptions::default();
-    options.openmp = false;
-    // In-process engine without libomp: spawned calls run in place.
-    options.tasks = false;
-    options.target_cpu = Some("native".to_string());
-    cleave::options::set(options.clone());
-    lower_to_llvm(context, &mut module, &options).unwrap_or_else(|e| panic!("lower_to_llvm failed: {e:?}"));
-
-    let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
-    unsafe {
-        engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
-        engine.register_symbol("cleave_blas_sgemm", cleave_rt::cleave_blas_sgemm as *mut ());
-        engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
-        engine.register_symbol("rand_seed", cleave_rt::rand_seed as *mut ());
-        engine.register_symbol("rand_uniform_f32", cleave_rt::rand_uniform_f32 as *mut ());
-        engine.register_symbol("cleave_alloc_local", cleave_rt::cleave_alloc_local as *mut ());
-        engine.register_symbol("cleave_region_enter", cleave_rt::cleave_region_enter as *mut ());
-        engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
-        engine.register_symbol("cleave_alloc_pool", cleave_rt::cleave_alloc_pool as *mut ());
-        engine.register_symbol("cleave_release_pool", cleave_rt::cleave_release_pool as *mut ());
-        engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
-        engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
-        engine.register_symbol("cleave_release_void", cleave_rt::cleave_release_void as *mut ());
-        engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
-    }
-    let mut out: f32 = f32::NAN;
-    unsafe {
-        engine
-            .invoke_packed("main", &mut [&mut out as *mut f32 as *mut ()])
-            .expect("JIT invocation must succeed");
-    }
-    out
+/// Compiles and runs `src`'s `main` (`fn main() -> f32`) through the real
+/// pipeline (`cleave::run`, what `--run` uses), `target_cpu: "native"` as
+/// `examples/mnist-interop/build.rs` compiles: without it, the native
+/// `matmul` has no AVX target and the comparison with BLAS (built for its
+/// own target) is against crippled code. `main`'s four bytes read as an
+/// `f32`; `_context` unused, kept for the call sites.
+fn run_f32(_context: &Context, src: &str) -> f32 {
+    let options = CodegenOptions {
+        openmp: false,
+        tasks: false,
+        target_cpu: Some("native".to_string()),
+        ..Default::default()
+    };
+    let bits = cleave::run::run_source("test.cleave", src, &options).unwrap_or_else(|e| panic!("{}", e.join("
+")));
+    f32::from_bits(bits as u32)
 }
 
 /// Absolute correctness, against a hand-computed expected value, no

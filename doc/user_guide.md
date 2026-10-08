@@ -38,8 +38,6 @@ cargo run -p cleave -- kernel.cleave --run --target-features -avx512f,-fma
 | `--backend cpu` | `cpu` | The only real value today (`doc/hld.md`'s own stated Vulkan/`spirv` target isn't implemented yet). |
 | `--inline` / `--no-inline` | on | The MLIR-level inliner. `--no-inline` is a real diagnostic knob — keeps every function (`net_grad`, `matmul`, ...) as its own separate `llvm.func` instead of flattened into its caller, useful for reading a disassembly with real function boundaries intact. Not meant for a real perf build. |
 | `--affine-structs` / `--no-affine-structs` | on | Headerless-pool allocation for structs provably never aliased. `--no-affine-structs` is the escape hatch for a structural shape this analysis gets wrong. |
-| `--unroll-jam` / `--no-unroll-jam` | **off** | Widens a long reduction loop's own accumulator into several independent copies, combined at the end. Real and JIT-proven correct, but measured on the real matmul kernel to have zero effect (`doc/backlog.md`) — off by default, kept for a future shape it might actually help. |
-| `--chain-split` / `--no-chain-split` | **off** | Splits a long `vector.outerproduct` dependency chain into independent shorter ones. Real and disassembly-verified to do exactly that, but measured to make the real kernel's IPC slightly *worse* — off by default for the same reason as `--unroll-jam`. |
 | `--debug-info` / `--no-debug-info` | on | Per-function `DISubprogram`s (fused into every op's location) plus the `CodeView`/`Debug Info Version` module flags they need. `--no-debug-info` is a real opt-out for profiling/disassembly work that doesn't want `!dbg`/`DISubprogram` noise in dumped IR or symbolized profiles — no functional effect either way. |
 
 ## Hello, cleave

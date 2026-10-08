@@ -16,14 +16,8 @@
 //! `cleave/tests/mlir_lower.rs::lower`'s own doc comment already commits
 //! to for its own (refcounting-free) purpose.
 
-use cleave::cps::{collect_mlir_types, collect_struct_schemas, collect_units, convert_program};
-use cleave::driver::compile;
-use cleave::egraph::optimize_program;
-use cleave::escape::escaping_struct_vars;
+use cleave::cps::{collect_mlir_types, collect_struct_schemas};
 use cleave::mlir_lower::lower_program;
-use cleave::pipeline::check_type_errors;
-use cleave::refcount::insert_refcounting;
-use cleave::registry::Registry;
 use melior::Context;
 use melior::dialect::DialectRegistry;
 use melior::ir::operation::OperationLike;
@@ -38,35 +32,19 @@ fn context() -> Context {
     context
 }
 
-/// Compiles `src` through the exact same CPS-to-CPS chain `pipeline.rs::
-/// build_optimized_cps` uses (dead-code elimination, e-graph optimization,
-/// a second dead-code sweep, escape analysis, `insert_refcounting`), then
-/// lowers to MLIR — the real AOT shape, not `cleave/tests/mlir_lower.rs`'s
-/// own refcounting-free `lower`, which would never show a `Release` at all.
+/// Compiles `src` through the real CPS pipeline (`pipeline::build_optimized_cps`:
+/// derivatives, e-graph, dead code, escape analysis, `insert_refcounting`),
+/// then lowers to MLIR: the IR `--emit-exe`/`--run` lower, releases
+/// included.
 fn lower_with_refcounting(context: &Context, src: &str) -> String {
-    let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
-    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
-    let registry = Registry::build(&program);
-    if let Err(diags) = check_type_errors(&program, &registry) {
-        panic!("type check failed: {diags:?}");
-    }
-    let units = collect_units(&program, &registry);
-    let cps_program = convert_program(units, None);
-    let cps_program = cleave::cps::eliminate_dead_code(cps_program);
-    let (cps_program, _) = optimize_program(cps_program, &registry, false);
-    let cps_program = cleave::cps::eliminate_dead_code(cps_program);
-    let struct_schemas = collect_struct_schemas(&program);
-    let mlir_types = collect_mlir_types(&program);
-    let escaping = escaping_struct_vars(&cps_program);
-    let cps_program = insert_refcounting(cps_program, &struct_schemas, &mlir_types, &escaping);
-
-    let mlir_types = collect_mlir_types(&program);
-    let struct_schemas = collect_struct_schemas(&program);
-    let module = lower_program(context, &cps_program, &mlir_types, struct_schemas);
-    assert!(
-        module.as_operation().verify(),
-        "generated MLIR module failed verification"
-    );
+    let (program, registry, sources) = cleave::run::check_sources(vec![("test.cleave".to_string(), src.to_string())], &[], false)
+        .unwrap_or_else(|e| panic!("{}", e.join("
+")));
+    let cps_program = cleave::pipeline::build_optimized_cps(&program, &registry, Some(&sources))
+        .unwrap_or_else(|e| panic!("{}", e.join("
+")));
+    let module = lower_program(context, &cps_program, &collect_mlir_types(&program), collect_struct_schemas(&program));
+    assert!(module.as_operation().verify(), "generated MLIR module failed verification");
     module.as_operation().to_string()
 }
 

@@ -750,6 +750,23 @@ pub(crate) fn flatten_array_dims(ty: &Ty) -> (Vec<i64>, &Ty) {
     (dims, cur)
 }
 
+/// An array type's dimensions laid out in one block, and its element there:
+/// every dimension (`flatten_array_dims`), except for an array of array
+/// objects (`[[P; 2]; 3]`, `refcount::is_handle_array`), whose block holds
+/// one dimension of pointers to its elements, each an array object.
+fn array_dims<'t>(ctx: &LowerCtx, ty: &'t Ty) -> (Vec<i64>, &'t Ty) {
+    if let Ty::Array(elem, size) = ty
+        && matches!(elem.as_ref(), Ty::Array(..))
+        && is_handle_array(ctx, elem)
+    {
+        let Ty::Const(ConstValue::Int(n)) = size.as_ref() else {
+            panic!("MLIR lowering: array size must be a resolved constant, got `{size}`");
+        };
+        return (vec![*n as i64], elem);
+    }
+    flatten_array_dims(ty)
+}
+
 fn is_array_ty(ty: &Ty) -> bool {
     matches!(ty, Ty::Array(..))
 }
@@ -1334,7 +1351,7 @@ fn struct_llvm_type<'c>(ctx: &LowerCtx<'c, '_>, name: &str, type_args: &[Ty]) ->
 /// structs is (`refcount::is_handle_array`) — where `ty_to_llvm_field_type`
 /// gives the field holding a pointer to that block instead.
 fn array_inline_llvm_type<'c>(ctx: &LowerCtx<'c, '_>, ty: &Ty) -> Type<'c> {
-    let (dims, leaf_ty) = flatten_array_dims(ty);
+    let (dims, leaf_ty) = array_dims(ctx, ty);
     let mut t = ty_to_llvm_field_type(ctx, leaf_ty);
     for &d in dims.iter().rev() {
         t = llvm::r#type::array(t, d as u32);
@@ -3110,22 +3127,28 @@ fn lower_array_construct<'c>(
     args: &[CVal],
     on_stack: bool,
 ) -> Value<'c, 'c> {
-    let (dims, leaf_ty) = flatten_array_dims(ty);
+    let (dims, leaf_ty) = array_dims(ctx, ty);
     let Some((_, inner_dims)) = dims.split_first() else {
         panic!("MLIR lowering: `array` prim on a non-array type `{ty}`");
     };
     if array_leaf_is_struct(ctx, ty) {
+        // Its elements, each a struct or an array object (`array_dims`).
         assert!(
             inner_dims.is_empty(),
-            "MLIR lowering: a struct-leaf array nested inside another array (`{ty}`) isn't supported yet -- only a single-dimension struct-leaf array (`[Struct; N]`) is"
+            "MLIR lowering: an array of structs laid out over several dimensions (`{ty}`)"
         );
         let array_llvm_ty = array_inline_llvm_type(ctx, ty);
         let elem_ty = ty_to_mlir(ctx, leaf_ty);
         let ptr = alloc_llvm_value(ctx, block, array_llvm_ty, None);
         let location = gen_loc(ctx.context);
         for (i, arg) in args.iter().enumerate() {
-            let elem_val = lower_cval(ctx.context, block, env, arg, elem_ty);
             let dst_ptr = gep(ctx, block, ptr, &[0, i as i64], array_llvm_ty);
+            // A tensor: its descriptor in the slot, as in a struct's field.
+            if native_shape_field_keyword(ctx, leaf_ty).is_some() {
+                store_native_shape_field(ctx, block, env, leaf_ty, dst_ptr, arg);
+                continue;
+            }
+            let elem_val = lower_cval(ctx.context, block, env, arg, elem_ty);
             block.append_operation(llvm::store(
                 ctx.context,
                 elem_val,
@@ -3230,7 +3253,7 @@ fn lower_array_repeat<'c>(
     ty: &Ty,
     args: &[CVal],
 ) -> Value<'c, 'c> {
-    let (dims, leaf_ty) = flatten_array_dims(ty);
+    let (dims, leaf_ty) = array_dims(ctx, ty);
     let Some((&outer_dim, inner_dims)) = dims.split_first() else {
         panic!("MLIR lowering: `array-repeat` prim on a non-array type `{ty}`");
     };
@@ -3350,7 +3373,7 @@ fn lower_array_load<'c>(
             .unwrap_or_else(|e| panic!("MLIR lowering: failed to build tensor.extract: {e}"));
         block.append_operation(built).result(0).unwrap().into()
     } else {
-        let (_, leaf_ty) = flatten_array_dims(array_ty);
+        let (_, leaf_ty) = array_dims(ctx, array_ty);
         let array_llvm_ty = array_inline_llvm_type(ctx, array_ty);
         let mut gep_indices = vec![const_i32(ctx, block, 0)];
         gep_indices.extend(
@@ -3359,6 +3382,11 @@ fn lower_array_load<'c>(
                 .map(|a| lower_cval(ctx.context, block, env, a, i32_ty)),
         );
         let leaf_ptr = gep_dynamic(ctx, block, array_val, &gep_indices, array_llvm_ty);
+        // A tensor: a view of the buffer its slot's descriptor holds, as a
+        // struct's tensor field is read.
+        if native_shape_field_keyword(ctx, leaf_ty).is_some() {
+            return load_native_shape_field(ctx, block, leaf_ty, leaf_ptr);
+        }
         let result_ty = ty_to_mlir(ctx, leaf_ty);
         block
             .append_operation(llvm::load(
@@ -3435,7 +3463,7 @@ fn lower_array_store<'c>(
         let value_val = lower_cval(ctx.context, block, env, value_arg, elem_ty);
         block.append_operation(memref::store(value_val, array_val, &index_vals, location));
     } else {
-        let (_, leaf_ty) = flatten_array_dims(array_ty);
+        let (_, leaf_ty) = array_dims(ctx, array_ty);
         let array_llvm_ty = array_inline_llvm_type(ctx, array_ty);
         let elem_mlir_ty = ty_to_mlir(ctx, leaf_ty);
         let mut gep_indices = vec![const_i32(ctx, block, 0)];
@@ -3453,14 +3481,18 @@ fn lower_array_store<'c>(
         if ty_needs_cascade(ctx, leaf_ty) {
             push_cascade_leaf(ctx, block, leaf_ty, leaf_ptr, (String::new(), 0), &mut previous);
         }
-        let value_val = lower_cval(ctx.context, block, env, value_arg, elem_mlir_ty);
-        block.append_operation(llvm::store(
-            ctx.context,
-            value_val,
-            leaf_ptr,
-            location,
-            LoadStoreOptions::new(),
-        ));
+        if native_shape_field_keyword(ctx, leaf_ty).is_some() {
+            store_native_shape_field(ctx, block, env, leaf_ty, leaf_ptr, value_arg);
+        } else {
+            let value_val = lower_cval(ctx.context, block, env, value_arg, elem_mlir_ty);
+            block.append_operation(llvm::store(
+                ctx.context,
+                value_val,
+                leaf_ptr,
+                location,
+                LoadStoreOptions::new(),
+            ));
+        }
         for child in previous {
             match child {
                 PendingChild::Tensor(child_ptr) => {
@@ -5151,7 +5183,7 @@ fn lower_array_release_cascade<'c>(
     ptr: Value<'c, 'c>,
 ) {
     let location = gen_loc(ctx.context);
-    let (dims, leaf_ty) = flatten_array_dims(array_ty);
+    let (dims, leaf_ty) = array_dims(ctx, array_ty);
     let array_llvm_ty = array_inline_llvm_type(ctx, array_ty);
     let mut pending: Vec<PendingChild<'c>> = Vec::new();
     if ty_needs_cascade(ctx, leaf_ty) {
@@ -6099,7 +6131,8 @@ fn copy_array_row<'c>(
 /// (`CVal::Var`) sibling operand's own MLIR type (`Value::r#type`, always
 /// available once lowered), falling back to the op's own declared result
 /// type for the (rarer) all-literal case.
-/// `tensor.extract`'s own variadic-index-array form — see `lower_raw_mlir_
+/// `tensor.extract`'s and `tensor.insert`'s variadic-index-array form (the
+/// operands before the index array passed through) — see `lower_raw_mlir_
 /// op`'s own doc comment for why this exists. `idx_val`'s own static length
 /// (`ShapedTypeLike::dim_size`, always static — cleave has no dynamically-
 /// sized arrays) is read directly off its already-lowered `memref` type,
@@ -6108,10 +6141,11 @@ fn copy_array_row<'c>(
 /// cast to `index` (`to_index`, the type every real `tensor.extract`/
 /// `tensor.insert` index operand needs, `i32`'s own array element type
 /// otherwise mismatching it).
-fn lower_tensor_extract_spread<'c>(
+fn lower_tensor_index_spread<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
-    tensor_val: Value<'c, 'c>,
+    op: &str,
+    leading: &[Value<'c, 'c>],
     idx_array_val: Value<'c, 'c>,
     result_ty: Type<'c>,
 ) -> Value<'c, 'c> {
@@ -6127,18 +6161,18 @@ fn lower_tensor_extract_spread<'c>(
             "MLIR lowering: `tensor.extract`'s own index-array argument must have a static length"
         );
     };
-    let mut operands = vec![tensor_val];
+    let mut operands = leading.to_vec();
     for i in 0..k as i64 {
         let idx = const_index(ctx, block, i);
         let load_op = block.append_operation(memref::load(idx_array_val, &[idx], location));
         let scalar: Value = load_op.result(0).unwrap().into();
         operands.push(to_index(ctx, block, scalar));
     }
-    let built = OperationBuilder::new("tensor.extract", location)
+    let built = OperationBuilder::new(op, location)
         .add_operands(&operands)
         .add_results(&[result_ty])
         .build()
-        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build tensor.extract: {e}"));
+        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build {op}: {e}"));
     block.append_operation(built).result(0).unwrap().into()
 }
 
@@ -6357,13 +6391,16 @@ fn lower_raw_mlir_op<'c>(
     // call's own second argument is genuinely array-typed (`i0: i32` isn't
     // a memref, so `Index<Vector<T,N>,T>`'s own existing call shape falls
     // straight through to the generic path below, unchanged).
-    if op == "tensor.extract" {
-        if let [CVal::Var(base_var), CVal::Var(idx_var)] = args {
-            if let (Some(&base_val), Some(&idx_val)) = (env.get(base_var), env.get(idx_var)) {
-                if idx_val.r#type().is_mem_ref() {
-                    return lower_tensor_extract_spread(ctx, block, base_val, idx_val, result_ty);
-                }
-            }
+    // `tensor.insert` (`IndexSet<Tensor<..>>`, `stdlib/linalg`) the same way:
+    // its value and tensor first, then the spread indices.
+    if op == "tensor.extract" || op == "tensor.insert" {
+        if let Some((CVal::Var(idx_var), leading)) = args.split_last()
+            && let Some(&idx_val) = env.get(idx_var)
+            && idx_val.r#type().is_mem_ref()
+            && let Some(leading_vals) =
+                leading.iter().map(|a| match a { CVal::Var(v) => env.get(v).copied(), _ => None }).collect::<Option<Vec<_>>>()
+        {
+            return lower_tensor_index_spread(ctx, block, op, &leading_vals, idx_val, result_ty);
         }
     }
     if op == "tensor.extract_slice" || op == "tensor.insert_slice" {
