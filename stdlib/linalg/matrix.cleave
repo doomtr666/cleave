@@ -447,7 +447,16 @@ impl<T: Float, const N: i32, const M: i32, const K: i32>
         // branch it never selects — see that function's own doc comment
         // for the full mechanism and why it's mathematically identical to
         // the zero-seeded version, at a fraction of the cost.
-        mlir::linalg::matmul(a, b)
+        // Above `BLAS_MIN_WORK`, the BLAS tier (`blas: "unit"`), as `Fma` and
+        // the transposed products: for `f32`, where `sgemm` applies; any
+        // other element type stays on the `linalg` schedule
+        // (`cleave_mlir_shim::lower_blas_matmuls` leaves it alone).
+        let nmk: i32 = N * M * K;
+        if nmk > BLAS_MIN_WORK {
+            mlir::linalg::matmul(a, b, blas: "unit")
+        } else {
+            mlir::linalg::matmul(a, b)
+        }
     }
 }
 

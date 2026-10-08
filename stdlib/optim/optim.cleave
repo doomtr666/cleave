@@ -84,6 +84,15 @@ algebra Parameters<M> {}
 // under `Muon`).
 algebra Trainable<M> : Parameters {}
 
+// An array of parameters is parameters, an array of trainable parts is
+// trainable (`doc/plan-struct-arrays.md`): a model's layers can be one field,
+// `layers: [Layer; LAYERS]`, its depth a constant, and every algebra that
+// walks a model part by part (`Optimizer`, `Accumulate`, `GradNorm`,
+// checkpoints) walks the array element by element, `len` and `[i]` being
+// the same on an array as on a struct.
+impl<T: Parameters, const N: i32> Parameters<[T; N]> {}
+impl<T: Trainable, const N: i32> Trainable<[T; N]> {}
+
 // Every `Trainable` model, for every optimizer: each field updated by its own
 // `Optimizer` impl, the model rebuilt from the new fields (`Collect`, pinned
 // to `M` by `step`'s own signature), the state one entry per field (a
@@ -274,9 +283,9 @@ fn newton_schulz5_wide<const R: i32, const C: i32>(g: Tensor<f32, R, C>) -> Tens
     for r in 0..R { for c in 0..C { sq = sq + g[r, c] * g[r, c]; }; };
     let mut x: Tensor<f32, R, C> = Scale::scale(g, 1.0 / (sqrt(sq) + 0.0000001));
     for i in 0..5 {
-        let a: Tensor<f32, R, R> = blas_matmul_transpose_b(x, x);
-        let b: Tensor<f32, R, R> = Scale::scale(a, -4.7750) + Scale::scale(blas_matmul(a, a), 2.0315);
-        x = Scale::scale(x, 3.4445) + blas_matmul(b, x);
+        let a: Tensor<f32, R, R> = matmul_transpose_b(x, x);
+        let b: Tensor<f32, R, R> = Scale::scale(a, -4.7750) + Scale::scale(matmul(a, a), 2.0315);
+        x = Scale::scale(x, 3.4445) + matmul(b, x);
     };
     x
 }

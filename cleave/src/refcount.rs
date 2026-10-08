@@ -165,6 +165,9 @@ pub(crate) fn is_refcounted(
     field_mutated: &HashSet<String>,
     extern_boundary: &HashSet<String>,
 ) -> bool {
+    if is_handle_array(ty, struct_schemas, mlir_types) {
+        return true;
+    }
     let (name, type_args): (&String, &[Ty]) = match ty {
         Ty::Con(name) => (name, &[]),
         Ty::App(name, args) => (name, args),
@@ -193,6 +196,28 @@ pub(crate) fn is_refcounted(
             extern_boundary,
             constructed,
         )
+}
+
+/// An array of structs, `[S; N]` (`doc/plan-struct-arrays.md`): a heap
+/// object of its own, behind a refcount header (`cleave_alloc_rc`), holding
+/// its elements (a heavy struct's pointer, a light one's value) and
+/// releasing them when it is freed (`mlir_lower.rs::lower_release_cascade`).
+/// A struct's field of this type holds a pointer to one, like a heavy
+/// struct field: every array of structs, standalone or a field, is the same
+/// refcounted value. One dimension; `S` a declared struct, not a tagged
+/// native one (`Tensor`, `Vector`).
+pub(crate) fn is_handle_array(
+    ty: &Ty,
+    struct_schemas: &HashMap<String, crate::cps::StructSchema>,
+    mlir_types: &HashMap<String, String>,
+) -> bool {
+    let Ty::Array(elem, _) = ty else { return false };
+    let name = match elem.as_ref() {
+        Ty::Con(name) => name,
+        Ty::App(name, _) => name,
+        _ => return false,
+    };
+    struct_schemas.contains_key(name) && !mlir_types.contains_key(name)
 }
 
 /// Every struct name with at least one real `PrimOp::Struct` construction

@@ -127,16 +127,17 @@ export fn train_lm(rounds: i32, lr: f32, seed: i64) -> f32 {
 // ------------------------------------------------------------------ the transformer
 //
 // A GPT with the recipe of today's transformers (Llama, Qwen, Gemma), at a size set by the
-// `define`s below (overridable from `build.rs`): a token embedding of width `WIDTH`, eight blocks,
+// `define`s below (overridable from `build.rs`): a token embedding of width `WIDTH`, `LAYERS` blocks,
 // a final RMSNorm, and the output scored against the same embedding (a tied head,
 // `embedding_logits`). Activations are `[ROWS, WIDTH]` matrices, the 32 sequences of a batch
 // (`data.rs`) stacked as rows. Each block is pre-norm: `x + attention(rms_norm(x))`, then `x +
 // swiglu(rms_norm(x))`; the attention is causal over heads `HEAD` wide, its queries and keys
 // rotated by their position (RoPE, so no position table); the MLP is SwiGLU, `WIDTH -> HIDDEN ->
 // WIDTH`. Trained by Muon (hidden matrices) and AdamW (embedding, gains, biases), the gradient
-// clipped. The block count is the struct's eight fields (`b1`..`b8`, `gpt_layers`).
+// clipped. The twin (`bench/nanolm-pytorch/gpt.py`) reads its sizes from these `define`s.
 
 define WIDTH: i32 = 384;
+define LAYERS: i32 = 8;
 define HEAD: i32 = 64;
 // SwiGLU's three matrices at 8/3 `WIDTH` hold what a GELU MLP's two hold at 4 `WIDTH`.
 define HIDDEN: i32 = 1024;
@@ -165,14 +166,14 @@ impl Trainable<Block> {}
 
 struct Gpt {
     tok: Embedding<f32, VOCAB, WIDTH>,
-    b1: Block, b2: Block, b3: Block, b4: Block, b5: Block, b6: Block, b7: Block, b8: Block,
+    blocks: [Block; LAYERS],
     nf: Tensor<f32, 1, WIDTH>
 }
 impl Trainable<Gpt> {}
 
 // The model's size, for the host to name its checkpoint directory (`main.rs`).
 export fn gpt_width() -> i32 { WIDTH }
-export fn gpt_layers() -> i32 { 8 }
+export fn gpt_layers() -> i32 { LAYERS }
 
 fn ones() -> Tensor<f32, 1, WIDTH> { [for i in 0..1: [for j in 0..WIDTH: 1.0]] }
 
@@ -186,16 +187,11 @@ fn new_block() -> Block {
 }
 
 fn new_gpt() -> Gpt {
-    Gpt(
-        tok: Init::xavier(),
-        b1: new_block(), b2: new_block(), b3: new_block(), b4: new_block(), b5: new_block(), b6: new_block(),
-        b7: new_block(), b8: new_block(),
-        nf: ones()
-    )
+    Gpt(tok: Init::xavier(), blocks: [for i in 0..LAYERS: new_block()], nf: ones())
 }
 
-// Not inlined: called eight times per forward pass, each call a whole block of work, compiled once
-// per row count instead of eight times (the training gradient is synthesized from its body by the
+// Not inlined: called `LAYERS` times per forward pass, each call a whole block of work, compiled
+// once per row count instead of once per layer (the training gradient is synthesized from its body by the
 // e-graph, unaffected). Rows are whole sequences of `CONTEXT`: row `r` is position `r mod CONTEXT`.
 #[no_inline]
 fn block<const N: i32>(x: Tensor<f32, N, WIDTH>, b: Block) -> Tensor<f32, N, WIDTH> {
@@ -212,7 +208,8 @@ fn block<const N: i32>(x: Tensor<f32, N, WIDTH>, b: Block) -> Tensor<f32, N, WID
 // sequence generation reads (`CONTEXT`).
 fn gpt_logits<const N: i32>(x: [i32; N], m: Gpt) -> Tensor<f32, N, VOCAB> {
     let h0 = embedding_forward(m.tok, x);
-    let h = block(block(block(block(block(block(block(block(h0, m.b1), m.b2), m.b3), m.b4), m.b5), m.b6), m.b7), m.b8);
+    let mut h = h0;
+    for i in 0..LAYERS { h = block(h, m.blocks[i]); };
     embedding_logits(m.tok, rms_norm(h, m.nf))
 }
 

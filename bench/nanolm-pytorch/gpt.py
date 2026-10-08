@@ -15,8 +15,10 @@ doesn't.
 """
 
 import math
+import re
 import sys
 import time
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -27,8 +29,12 @@ arg = lambda i, default: int(sys.argv[i]) if len(sys.argv) > i else default
 FIRST, ROUNDS, PER_ROUND = arg(1, 0), arg(2, 10), arg(3, 100)
 if FIRST != 0:
     sys.exit("the twin starts from gpt_init.ckpt: the first step must be 0 (it doesn't resume)")
-LR, MUON_LR, B, T, D, DH, HIDDEN, LAYERS = 0.001, 0.02, 32, 256, 384, 64, 1024, 8
-WARMUP, DECAY_STEPS = 200, 20000
+# The sizes are the kernel's `define`s, read from its source.
+KERNEL = Path(__file__).resolve().parents[2] / "examples" / "nanolm" / "src" / "kernel.cleave"
+DEFINES = {m[1]: int(m[2]) for m in re.finditer(r"^define (\w+): i32 = (\d+);", KERNEL.read_text(), re.M)}
+T, D, DH, HIDDEN, LAYERS = (DEFINES[k] for k in ("CONTEXT", "WIDTH", "HEAD", "HIDDEN", "LAYERS"))
+LR, MUON_LR, B = 0.001, 0.02, 32
+WARMUP, DECAY_STEPS = DEFINES["WARMUP"], DEFINES["DECAY_STEPS"]
 CLIP = 1.0 * B * T  # `CLIP_PER_ROW * ROWS`: the loss is summed over the rows
 EPS = 1e-5
 MODEL_DIR = CACHE.parent / f"nanolm2-d{D}-l{LAYERS}-v{VOCAB}-bench"

@@ -82,8 +82,9 @@ fn count_release_calls(text: &str) -> usize {
 /// The exact bug: `Foo`'s own array field embeds two freshly-built `Boxed`
 /// values, never reused after construction (no protected-embedding retain
 /// needed), sent through an opaque `extern fn` so the e-graph can't inline
-/// `Foo` away. Releasing `Foo` must also release both `Boxed`s — three
-/// `cleave_release` calls total, not one.
+/// `Foo` away. Releasing `Foo` must also release its `items` array, a
+/// refcounted object of its own (`refcount::is_handle_array`), and through
+/// it both `Boxed`s — four `cleave_release` calls total, not one.
 #[test]
 fn releasing_a_struct_cascades_into_a_refcounted_array_fields_own_elements() {
     let context = context();
@@ -100,9 +101,9 @@ fn releasing_a_struct_cascades_into_a_refcounted_array_fields_own_elements() {
     let text = lower_with_refcounting(&context, src);
     assert_eq!(
         count_release_calls(&text),
-        3,
+        4,
         "releasing `Foo` must cascade into both embedded `Boxed` elements \
-         (3 releases total: Foo, items[0], items[1]) -- got:\n{text}"
+         (4 releases total: Foo, the `items` array, items[0], items[1]) -- got:\n{text}"
     );
 }
 

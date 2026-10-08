@@ -4890,26 +4890,23 @@ fn grad_through_a_composed_function_using_transcendental_and_ring_adjoint_rules(
     assert_eq!(run_i32(&context, src), 1);
 }
 
-/// `synthesize_one_gradient`'s own parameter scope check (`is_grad_
-/// supported_ty`: scalar, `Tensor`, or a struct recursively built from
-/// either -- a bare array is none of those) -- a real, located error
-/// rather than a panic deeper in the pipeline or a silently wrong
-/// gradient. `xs: [f32; 3]` (not a `Tensor`) passes `driver.rs::
-/// synthesize_derive_signatures`'s own checks unchanged (identical to what
-/// `derive()` already accepts for the same parameter shape) -- this is
-/// `grad()`'s own, additional, narrower restriction.
+/// `grad` with respect to an array (`doc/plan-struct-arrays.md`): each element
+/// read at a constant index is a projection like a field read, the gradient
+/// an array of the elements' gradients, zero where an element isn't read.
+/// `f(xs) = 2 xs[0] + xs[2]`: `[2, 0, 1]`. (An array parameter used to be
+/// refused here.)
 #[test]
-#[should_panic(
-    expected = "reverse-mode differentiation only supports scalar, `Tensor`, and struct"
-)]
-fn grad_on_a_non_scalar_parameter_is_a_clean_error_not_a_panic_elsewhere() {
+fn grad_with_respect_to_an_array_is_the_array_of_its_elements_gradients() {
     let context = context();
     let src = "
-        fn f(xs: [f32; 3]) -> f32 { xs[0] }
+        fn f(xs: [f32; 3]) -> f32 { xs[0] * 2.0 + xs[2] }
         gw = grad(f, xs);
-        fn main() -> i32 { 0 }
+        fn main() -> i32 {
+            let g = gw([1.0, 2.0, 3.0]);
+            if g[0] == 2.0 and g[1] == 0.0 and g[2] == 1.0 { 1 } else { 0 }
+        }
     ";
-    run_i32(&context, src);
+    assert_eq!(run_i32(&context, src), 1);
 }
 
 /// The real point of reverse-mode over `derive()`'s own `ParamShape::
@@ -4988,23 +4985,22 @@ fn grad_on_a_struct_parameter_with_only_scalar_fields_computes_the_right_gradien
     assert_eq!(run_i32(&context, src), 1);
 }
 
-/// `is_grad_supported_ty`'s own recursion still rejects a struct with a
-/// genuinely unsupported field (`xs: [f32; 3]`, a bare array, not a
-/// `Tensor`) -- a real, located error at the *outer* struct parameter,
-/// not a guess or a panic three stages downstream.
+/// A struct with an array field differentiates through it: the field's
+/// gradient is the array of its elements' (`HasArray { xs: [f32; 3] }`,
+/// `f(p) = p.xs[0] * p.xs[1]`: `xs`'s gradient `[x1, x0, 0]`).
 #[test]
-#[should_panic(
-    expected = "reverse-mode differentiation only supports scalar, `Tensor`, and struct"
-)]
-fn grad_on_a_struct_parameter_with_an_unsupported_field_is_still_a_clean_error() {
+fn grad_through_a_struct_s_array_field() {
     let context = context();
     let src = "
         struct HasArray { xs: [f32; 3] }
-        fn f(p: HasArray) -> f32 { p.xs[0] }
+        fn f(p: HasArray) -> f32 { p.xs[0] * p.xs[1] }
         gw = grad(f, p);
-        fn main() -> i32 { 0 }
+        fn main() -> i32 {
+            let g = gw(HasArray(xs: [3.0, 5.0, 7.0]));
+            if g.xs[0] == 5.0 and g.xs[1] == 3.0 and g.xs[2] == 0.0 { 1 } else { 0 }
+        }
     ";
-    run_i32(&context, src);
+    assert_eq!(run_i32(&context, src), 1);
 }
 
 /// `Forward::try_unroll_for_loop` (`egraph.rs`) -- a literal-bounded `for`

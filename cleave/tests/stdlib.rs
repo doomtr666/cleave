@@ -132,3 +132,37 @@ fn satisfies_bound(registry: &Registry, bound: &str, ty: &str) -> bool {
     let mut infer = cleave::infer::Infer::new(registry);
     infer.infer_fn(&f).is_ok()
 }
+
+/// A `Trainable` struct with a field no optimizer knows how to update (an
+/// `i32`): the generic `Optimizer` impl's instance can't type its state, and
+/// that is a located error, not a panic later in CPS conversion (which used
+/// to find the instance's name recorded but the instance never built).
+#[test]
+fn an_untrainable_field_is_a_located_error_not_a_panic() {
+    let dir = std::env::temp_dir().join("cleave-stdlib");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("untrainable_field.cleave");
+    std::fs::write(
+        &source,
+        "use nn;
+struct Net { d: Dense<f32, 4, 4>, count: i32 }
+impl Trainable<Net> {}
+fn main() -> f32 {
+    rand_seed(1);
+    let net = Net(d: Init::xavier(), count: 3);
+    let state = init_state(Sgd(lr: 0.1), net);
+    1.0
+}
+",
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--no-debug-info", "--run"])
+        .arg(&source)
+        .output()
+        .expect("cannot run cleave");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("panicked"), "a panic instead of an error:\n{stderr}");
+    assert!(stderr.contains("error"), "no error:\n{stderr}");
+    assert!(stderr.contains("i32"), "the error doesn't name the field's type:\n{stderr}");
+}

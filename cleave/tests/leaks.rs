@@ -572,3 +572,128 @@ fn a_tuple_of_owned_structs_leaves_nothing_behind() {
     assert!(per < NOISE, "{per} bytes per step");
 }
 
+
+/// A model whose layers are an array (`layers: [Layer; 3]`,
+/// `doc/plan-struct-arrays.md`), `steps` steps of `opt`: the array holds a
+/// reference to each layer, the gradient and the optimizer's state are
+/// arrays too, every one of them rebuilt each step. Every matrix a multiple of
+/// 8 rows on a side: Muon's Newton-Schulz on a 10-row one hits the matmul
+/// schedule's own open bug (`doc/backlog.md`, the row tile of 8).
+fn array_model_program(opt: &str, steps: u32) -> String {
+    format!(
+        "
+        use nn;
+        struct Layer {{ d: Dense<f32, 16, 16> }}
+        impl Trainable<Layer> {{}}
+        struct Net {{ layers: [Layer; 3], out: Dense<f32, 16, 16> }}
+        impl Trainable<Net> {{}}
+        fn new_layer() -> Layer {{ Layer(d: Init::xavier()) }}
+        fn forward(x: Tensor<f32, 32, 16>, net: Net) -> Tensor<f32, 32, 16> {{
+            let mut h = x;
+            for i in 0..3 {{ h = relu(net.layers[i].d.dense_forward(h)); }};
+            net.out.dense_forward(h)
+        }}
+        fn loss(x: Tensor<f32, 32, 16>, y: Tensor<f32, 32, 16>, net: Net) -> f32 {{
+            let err = forward(x, net) - y;
+            sum(err * err)
+        }}
+        net_grad = grad(loss, net);
+        fn main() -> i32 {{
+            rand_seed(1);
+            let a = new_layer();
+            let b = new_layer();
+            let c = new_layer();
+            let mut net = Net(layers: [a, b, c], out: Init::xavier());
+            let opt = {opt};
+            let mut state = init_state(opt, net);
+            let x: Tensor<f32, 32, 16> = Init::he();
+            let y: Tensor<f32, 32, 16> = Init::he();
+            for s in 0..{steps} {{
+                let g = net_grad(x, y, net);
+                (net, state) = step(opt, net, g, state);
+            }};
+            1
+        }}
+    "
+    )
+}
+
+/// Training a model whose layers are an array leaves nothing behind: the
+/// layers each array holds, and the arrays themselves (model, gradient,
+/// optimizer state), are released as their struct counterparts are.
+#[test]
+fn training_a_model_with_an_array_of_layers_leaves_no_allocation_behind() {
+    // Compiled on a larger stack, as the CLI does (`main.rs`): the compiler
+    // recurses on the program's continuation-passing form.
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(array_model_leaks)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn array_model_leaks() {
+    let _ = run_counting(&array_model_program("Sgd(lr: 0.01)", 1));
+    let leaks: Vec<(&str, i64)> = [
+        ("Sgd", "Sgd(lr: 0.01)"),
+        ("AdamW", "AdamW(lr: 0.001, beta1: 0.9, beta2: 0.95, eps: 0.00000001, weight_decay: 0.0)"),
+        (
+            "Muon",
+            "Muon(lr: 0.01, momentum: 0.95, weight_decay: 0.0, adamw: AdamW(lr: 0.001, beta1: 0.9, beta2: 0.95, eps: 0.00000001, weight_decay: 0.0))",
+        ),
+    ]
+    .iter()
+    .map(|(name, opt)| {
+        let (r_short, short) = run_counting(&array_model_program(opt, 8));
+        let (r_long, long) = run_counting(&array_model_program(opt, 72));
+        assert_eq!((r_short, r_long), (1, 1), "{name}");
+        (*name, (long - short) / 64)
+    })
+    .collect();
+    assert!(leaks.iter().all(|(_, l)| *l < NOISE), "bytes leaked per step: {leaks:?}");
+}
+
+/// `a[i] = v` on an array of structs, `steps` times: arrays have reference
+/// semantics, the write is in place (an alias `b` of `a` sees it), the
+/// overwritten element is released, `v` retained. `elem` is the element
+/// type: a light struct (`Layer`, its `Dense` held by value) or a heavy one.
+fn array_store_program(elem: &str, steps: u32) -> String {
+    format!(
+        "
+        use nn;
+        struct Layer {{ d: Dense<f32, 16, 16> }}
+        struct Heavy {{ d: Dense<f32, 16, 16>, tag: [i32; 1] }}
+        fn new_layer() -> Layer {{ Layer(d: Init::xavier()) }}
+        fn new_heavy() -> Heavy {{ Heavy(d: Init::xavier(), tag: [1]) }}
+        fn main() -> i32 {{
+            rand_seed(1);
+            let mut a = [new_{elem}(), new_{elem}(), new_{elem}()];
+            let b = a;
+            let mut last = new_{elem}();
+            for s in 0..{steps} {{
+                last = new_{elem}();
+                a[rem(s, 3)] = last;
+            }};
+            let k = rem({steps} - 1, 3);
+            if b[k].d.w[0, 0] == last.d.w[0, 0] {{ 1 }} else {{ 0 }}
+        }}
+    "
+    )
+}
+
+/// Overwriting an element of an array of structs releases the element it
+/// held; the write is seen through an alias of the array.
+#[test]
+fn overwriting_an_array_element_releases_the_previous_one() {
+    let leaks: Vec<(&str, i64)> = ["layer", "heavy"]
+        .iter()
+        .map(|elem| {
+            let (r_short, short) = run_counting(&array_store_program(elem, 8));
+            let (r_long, long) = run_counting(&array_store_program(elem, 72));
+            assert_eq!((r_short, r_long), (1, 1), "{elem}");
+            (*elem, (long - short) / 64)
+        })
+        .collect();
+    assert!(leaks.iter().all(|(_, l)| *l < NOISE), "bytes leaked per store: {leaks:?}");
+}

@@ -861,7 +861,9 @@ extern "C" int64_t cleaveBlasTileAndFuse(MlirOperation op, int64_t rows) {
   // of them are fused into its loop.
   llvm::SetVector<linalg::GenericOp> consumers;
   unwrap(op)->walk([&](linalg::MatmulOp product) {
-    if (!product->hasAttr("cleave.blas") || !product.hasPureTensorSemantics())
+    // Only what `cleaveLowerBlasMatmuls` will make a `sgemm` (`f32`).
+    if (!product->hasAttr("cleave.blas") || !product.hasPureTensorSemantics() ||
+        !getElementTypeOrSelf(product->getResult(0).getType()).isF32())
       return;
     Value result = product->getResult(0);
     if (!result.hasOneUse())
@@ -1148,6 +1150,138 @@ extern "C" int64_t cleaveReuseDyingInputs(MlirOperation op) {
     }
   });
   return reused;
+}
+
+// Removes the loop-carried values a loop yields back unchanged (`scf.for`'s
+// own canonicalization, its loops alone): the loop's result is then the
+// value it was given. Before `--ownership-based-buffer-deallocation`. A tile
+// loop writing its tiles into a carried output buffer (`cleaveBlasTileAndFuse`)
+// yields that buffer back; carried, its result is a value of unknown origin
+// to the deallocation's alias analysis, which then cannot tell any buffer of
+// the function from it, and frees them all together at the end of the
+// function, after a run-time check of which alias which (measured on nanoLM's
+// gradient: 273 buffers in one deallocation). Returns how many loop-carried
+// values went.
+extern "C" int64_t cleaveFoldPassthroughIterArgs(MlirOperation op) {
+  SmallVector<Operation *> loops;
+  int64_t before = 0;
+  unwrap(op)->walk([&](scf::ForOp loop) {
+    loops.push_back(loop);
+    before += loop.getNumRegionIterArgs();
+  });
+  if (loops.empty())
+    return 0;
+  MLIRContext *context = unwrap(op)->getContext();
+  RewritePatternSet patterns(context);
+  scf::ForOp::getCanonicalizationPatterns(patterns, context);
+  GreedyRewriteConfig config;
+  config.setStrictness(GreedyRewriteStrictness::ExistingAndNewOps);
+  config.enableFolding(false);
+  (void)applyOpPatternsGreedily(loops, std::move(patterns), config);
+  int64_t after = 0;
+  unwrap(op)->walk([&](scf::ForOp loop) { after += loop.getNumRegionIterArgs(); });
+  return before - after;
+}
+
+// Frees each buffer right after its last use. `--ownership-based-buffer-
+// deallocation` frees a buffer at the end of the block its ownership ends in,
+// and a function whose calls are inlined is mostly one block: every temporary
+// of a synthesized gradient's forward pass stayed allocated until its return,
+// those its backward pass reads and all the others (measured on nanoLM's
+// gradient, `CLEAVE_ALLOC_STATS`: 9 hidden-layer-sized tensors alive per
+// SwiGLU at the peak, where its backward reads 3).
+//
+// A deallocation is a `memref.dealloc`, alone or alone in an `scf.if` on its
+// ownership flag (`--lower-deallocations`' shape). Its buffer's uses are the
+// uses of everything derived from its root (`viewRoot`): views and casts,
+// any memref, pointer or tensor result of an op using one (a call returning
+// it, a region op yielding it), its address as an integer and integers
+// computed from that. The deallocation moves to just after the last op of its
+// block holding one of them, unless the buffer escapes: stored to memory, or
+// used outside the block's ops. A `cleave_task_wait` marker (`spawn`, before
+// `cleaveLowerSpawns`) lists the buffers its tasks use: it is a use, so a
+// buffer a task reads is freed after the wait. Returns how many moved.
+namespace {
+
+bool followsAddress(Operation *op) {
+  return isa<memref::ExtractAlignedPointerAsIndexOp, LLVM::PtrToIntOp, arith::IndexCastOp, arith::IndexCastUIOp,
+             arith::ExtUIOp, arith::ExtSIOp, arith::TruncIOp, arith::AddIOp, arith::SubIOp, LLVM::IntToPtrOp>(op);
+}
+
+bool carriesBuffer(Type t) {
+  return isa<BaseMemRefType, LLVM::LLVMPointerType, TensorType>(t);
+}
+
+// The last op of `block` using the buffer `root` (before `dealloc`), in
+// `last`; false if the buffer escapes.
+bool lastUseInBlock(Value root, Operation *dealloc, Operation *moved, Block *block, Operation *&last) {
+  SmallVector<Value> work{root};
+  llvm::SmallPtrSet<Value, 16> seen{root};
+  auto follow = [&](Value v) {
+    if (seen.insert(v).second)
+      work.push_back(v);
+  };
+  while (!work.empty()) {
+    Value v = work.pop_back_val();
+    for (OpOperand &use : v.getUses()) {
+      Operation *user = use.getOwner();
+      if (user == dealloc || moved->isAncestor(user))
+        continue;
+      Operation *anchor = block->findAncestorOpInBlock(*user);
+      if (!anchor)
+        return false;
+      if (auto store = dyn_cast<LLVM::StoreOp>(user); store && store.getValue() == v)
+        return false;
+      if (auto store = dyn_cast<memref::StoreOp>(user); store && store.getValue() == v)
+        return false;
+      if (!last || last->isBeforeInBlock(anchor))
+        last = anchor;
+      // What the use produces, and what each region op around it produces.
+      for (Operation *op = user; op; op = op == anchor ? nullptr : op->getParentOp())
+        for (Value r : op->getResults())
+          if (carriesBuffer(r.getType()) || (r.getType().isIntOrIndex() && followsAddress(op)))
+            follow(r);
+    }
+  }
+  return true;
+}
+
+} // namespace
+
+extern "C" int64_t cleaveDeallocAtLastUse(MlirOperation op) {
+  SmallVector<memref::DeallocOp> deallocs;
+  unwrap(op)->walk([&](memref::DeallocOp d) { deallocs.push_back(d); });
+  int64_t moved = 0;
+  for (memref::DeallocOp d : deallocs) {
+    // The op to move: the dealloc, or the `scf.if` it is alone in.
+    Operation *mover = d;
+    Value condition;
+    if (auto guard = dyn_cast<scf::IfOp>(d->getParentOp())) {
+      Block *then = guard.thenBlock();
+      if (guard.getNumResults() != 0 || !guard.getElseRegion().empty() || then->getOperations().size() != 2)
+        continue;
+      mover = guard;
+      condition = guard.getCondition();
+    }
+    Block *block = mover->getBlock();
+    Value root = viewRoot(d.getMemref());
+    Operation *last = nullptr;
+    if (!lastUseInBlock(root, d, mover, block, last))
+      continue;
+    // Where the buffer and the condition are defined, if in this block.
+    for (Value v : {root, Value(d.getMemref()), condition}) {
+      if (!v)
+        continue;
+      if (Operation *def = v.getDefiningOp())
+        if (Operation *anchor = block->findAncestorOpInBlock(*def); anchor && (!last || last->isBeforeInBlock(anchor)))
+          last = anchor;
+    }
+    if (!last || last == mover || !last->isBeforeInBlock(mover) || last->getNextNode() == mover)
+      continue;
+    mover->moveAfter(last);
+    ++moved;
+  }
+  return moved;
 }
 
 // Every parallel region (`spawn`'s team, `cleaveLowerSpawns`; a parallel

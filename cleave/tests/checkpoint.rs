@@ -199,6 +199,84 @@ fn a_run_resumed_from_a_checkpoint_is_the_same_run() {
     assert_eq!(run(&src), 1);
 }
 
+/// The same resumed run with a model whose layers are an array
+/// (`layers: [Layer; 2]`, `doc/plan-struct-arrays.md`): the array of layers
+/// and the optimizer's array of states saved element by element, restored
+/// into fresh ones, the run carried on to the same weights to the bit.
+#[test]
+fn a_run_of_a_model_with_an_array_of_layers_resumes_from_a_checkpoint() {
+    let path = scratch("resume_array.ckpt");
+    let prelude = "
+        use nn;
+        use checkpoint;
+        struct Layer { d: Dense<f32, 16, 16> }
+        impl Trainable<Layer> {}
+        struct Net { layers: [Layer; 2], out: Dense<f32, 16, 10> }
+        impl Trainable<Net> {}
+        fn new_net() -> Net {
+            let a = Layer(d: Init::he());
+            let b = Layer(d: Init::he());
+            Net(layers: [a, b], out: Init::xavier())
+        }
+        fn forward(x: Tensor<f32, 32, 16>, net: Net) -> Tensor<f32, 32, 10> {
+            let mut h = x;
+            for i in 0..2 { h = relu(net.layers[i].d.dense_forward(h)); };
+            net.out.dense_forward(h)
+        }
+        fn loss(x: Tensor<f32, 32, 16>, y: Tensor<f32, 32, 10>, net: Net) -> f32 { cross_entropy(forward(x, net), y) }
+        net_grad = grad(loss, net);
+        fn train(x, y, opt, net, state, steps: i32) {
+            let mut n = net;
+            let mut s = state;
+            for i in 0..steps { (n, s) = step(opt, n, net_grad(x, y, n), s); };
+            (n, s)
+        }
+        fn fingerprint(net: Net) -> f32 {
+            sum(net.layers[0].d.w) + sum(net.layers[1].d.w) + sum(net.layers[1].d.b) + sum(net.out.w)
+        }
+    ";
+    let src = format!(
+        "{prelude}
+        fn main() -> i32 {{
+            rand_seed(7);
+            let x: Tensor<f32, 32, 16> = Init::he();
+            let y: Tensor<f32, 32, 10> = Init::he();
+            let opt = Adam(lr: 0.01, beta1: 0.9, beta2: 0.999, eps: 0.00000001);
+            let fresh = new_net();
+
+            let (straight, _) = train(x, y, opt, fresh, init_state(opt, fresh), 10);
+
+            rand_seed(7);
+            let x2: Tensor<f32, 32, 16> = Init::he();
+            let y2: Tensor<f32, 32, 10> = Init::he();
+            let first = new_net();
+            let (half, half_state) = train(x2, y2, opt, first, init_state(opt, first), 5);
+            save(\"{path}\", (half, half_state));
+
+            rand_seed(12345);
+            let other = new_net();
+            let (net, state) = restore(\"{path}\", (other, init_state(opt, other)));
+            let (resumed, _) = train(x2, y2, opt, net, state, 5);
+
+            if fingerprint(resumed) == fingerprint(straight)
+                and fingerprint(resumed) != fingerprint(fresh) {{ 1 }} else {{ 0 }}
+        }}
+    "
+    );
+    assert_eq!(run_on_a_large_stack(src), 1);
+}
+
+/// `run` on a 64 MB stack, as the CLI compiles (`main.rs`): the compiler
+/// recurses on the program's continuation-passing form.
+fn run_on_a_large_stack(src: String) -> i32 {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || run(&src))
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
 /// Restoring into a value of another shape stops the program with a message
 /// naming the shape found and the shape expected (run through the real CLI:
 /// the error ends the process).

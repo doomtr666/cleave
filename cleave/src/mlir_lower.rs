@@ -754,6 +754,13 @@ fn is_array_ty(ty: &Ty) -> bool {
     matches!(ty, Ty::Array(..))
 }
 
+/// An array of structs, a refcounted heap object of its own
+/// (`refcount::is_handle_array`): a field of this type holds a pointer to
+/// it, not the elements inline.
+fn is_handle_array(ctx: &LowerCtx, ty: &Ty) -> bool {
+    crate::refcount::is_handle_array(ty, &ctx.struct_schemas, &ctx.mlir_types)
+}
+
 /// Whether `ty` is a `#[mlir_type(tensor)]`/`#[mlir_type(vector)]`-tagged
 /// struct (`native_shape_keyword`'s own doc comment) — `None` for anything
 /// else, including a plain scalar. Checks the shape first (`struct_name_
@@ -1322,6 +1329,19 @@ fn struct_llvm_type<'c>(ctx: &LowerCtx<'c, '_>, name: &str, type_args: &[Ty]) ->
 /// descriptor instead (`memref_descriptor_llvm_type`'s own doc comment) —
 /// `store_native_shape_field`/`load_native_shape_field` are this
 /// representation's own O(1) write/read halves.
+/// An array's elements laid out in place, `!llvm.array<N x elem>` (nested
+/// per dimension): a struct's inline array field, or the block an array of
+/// structs is (`refcount::is_handle_array`) — where `ty_to_llvm_field_type`
+/// gives the field holding a pointer to that block instead.
+fn array_inline_llvm_type<'c>(ctx: &LowerCtx<'c, '_>, ty: &Ty) -> Type<'c> {
+    let (dims, leaf_ty) = flatten_array_dims(ty);
+    let mut t = ty_to_llvm_field_type(ctx, leaf_ty);
+    for &d in dims.iter().rev() {
+        t = llvm::r#type::array(t, d as u32);
+    }
+    t
+}
+
 fn ty_to_llvm_field_type<'c>(ctx: &LowerCtx<'c, '_>, ty: &Ty) -> Type<'c> {
     if let Some(keyword) = native_shape_field_keyword(ctx, ty) {
         let (name, type_args) = struct_name_and_args(ty);
@@ -1345,6 +1365,7 @@ fn ty_to_llvm_field_type<'c>(ctx: &LowerCtx<'c, '_>, ty: &Ty) -> Type<'c> {
         return memref_descriptor_llvm_type(ctx.context, dims.len());
     }
     match ty {
+        Ty::Array(..) if is_handle_array(ctx, ty) => llvm::r#type::pointer(ctx.context, 0),
         Ty::Array(..) => {
             let (dims, leaf_ty) = flatten_array_dims(ty);
             let mut t = ty_to_llvm_field_type(ctx, leaf_ty);
@@ -3104,7 +3125,7 @@ fn lower_array_construct<'c>(
             inner_dims.is_empty(),
             "MLIR lowering: a struct-leaf array nested inside another array (`{ty}`) isn't supported yet -- only a single-dimension struct-leaf array (`[Struct; N]`) is"
         );
-        let array_llvm_ty = ty_to_llvm_field_type(ctx, ty);
+        let array_llvm_ty = array_inline_llvm_type(ctx, ty);
         let elem_ty = ty_to_mlir(ctx, leaf_ty);
         let ptr = alloc_llvm_value(ctx, block, array_llvm_ty, None);
         let location = gen_loc(ctx.context);
@@ -3225,7 +3246,7 @@ fn lower_array_repeat<'c>(
             inner_dims.is_empty(),
             "MLIR lowering: a struct-leaf array nested inside another array (`{ty}`) isn't supported yet -- only a single-dimension struct-leaf array (`[Struct; N]`) is"
         );
-        let array_llvm_ty = ty_to_llvm_field_type(ctx, ty);
+        let array_llvm_ty = array_inline_llvm_type(ctx, ty);
         let elem_ty = ty_to_mlir(ctx, leaf_ty);
         let ptr = alloc_llvm_value(ctx, block, array_llvm_ty, None);
         let elem_val = lower_cval(ctx.context, block, env, value_arg, elem_ty);
@@ -3336,7 +3357,7 @@ fn lower_array_load<'c>(
         block.append_operation(built).result(0).unwrap().into()
     } else {
         let (_, leaf_ty) = flatten_array_dims(array_ty);
-        let array_llvm_ty = ty_to_llvm_field_type(ctx, array_ty);
+        let array_llvm_ty = array_inline_llvm_type(ctx, array_ty);
         let mut gep_indices = vec![const_i32(ctx, block, 0)];
         gep_indices.extend(
             args[1..]
@@ -3421,7 +3442,7 @@ fn lower_array_store<'c>(
         block.append_operation(memref::store(value_val, array_val, &index_vals, location));
     } else {
         let (_, leaf_ty) = flatten_array_dims(array_ty);
-        let array_llvm_ty = ty_to_llvm_field_type(ctx, array_ty);
+        let array_llvm_ty = array_inline_llvm_type(ctx, array_ty);
         let elem_mlir_ty = ty_to_mlir(ctx, leaf_ty);
         let mut gep_indices = vec![const_i32(ctx, block, 0)];
         gep_indices.extend(
@@ -3430,6 +3451,14 @@ fn lower_array_store<'c>(
                 .map(|a| lower_cval(ctx.context, block, env, a, i32_ty)),
         );
         let leaf_ptr = gep_dynamic(ctx, block, array_val, &gep_indices, array_llvm_ty);
+        // The slot holds one reference to its element (`refcount.rs`
+        // retains the value before a `Store`): the element it held before
+        // is read out first, then released once overwritten. Arrays have
+        // reference semantics, the write is in place.
+        let mut previous: Vec<PendingChild<'c>> = Vec::new();
+        if ty_needs_cascade(ctx, leaf_ty) {
+            push_cascade_leaf(ctx, block, leaf_ty, leaf_ptr, (String::new(), 0), &mut previous);
+        }
         let value_val = lower_cval(ctx.context, block, env, value_arg, elem_mlir_ty);
         block.append_operation(llvm::store(
             ctx.context,
@@ -3438,6 +3467,16 @@ fn lower_array_store<'c>(
             location,
             LoadStoreOptions::new(),
         ));
+        for child in previous {
+            match child {
+                PendingChild::Tensor(child_ptr) => {
+                    emit_cleave_release(ctx, block, &Ty::Con("__cleave_opaque_ptr".to_string()), child_ptr);
+                }
+                PendingChild::Struct(child_ty, child_val, _) => {
+                    lower_release_cascade(ctx, block, &child_ty, child_val);
+                }
+            }
+        }
     }
 }
 
@@ -3761,7 +3800,7 @@ fn store_field<'c>(
 ) {
     if native_shape_field_keyword(ctx, field_ty).is_some() {
         store_native_shape_field(ctx, block, env, field_ty, field_ptr, arg);
-    } else if is_array_ty(field_ty) {
+    } else if is_array_ty(field_ty) && !is_handle_array(ctx, field_ty) {
         let src = lower_nested_array_arg(env, arg);
         let (dims, leaf_ty) = flatten_array_dims(field_ty);
         let field_llvm_ty = ty_to_llvm_field_type(ctx, field_ty);
@@ -4513,7 +4552,7 @@ fn lower_field_access<'c>(
     let field_ptr = gep(ctx, block, base_val, &[0, position as i64], struct_llvm_ty);
     if native_shape_field_keyword(ctx, field_ty).is_some() {
         load_native_shape_field(ctx, block, field_ty, field_ptr)
-    } else if is_array_ty(field_ty) {
+    } else if is_array_ty(field_ty) && !is_handle_array(ctx, field_ty) {
         field_ptr
     } else {
         let result_ty = ty_to_mlir(ctx, field_ty);
@@ -4716,7 +4755,9 @@ fn emit_cleave_release_tagged<'c>(
 /// `struct_schemas.get(name)` miss included, falls through to the exact
 /// same generic `!llvm.ptr` fallback an ordinary struct gets.
 fn declared_ptr_sig_ty(ctx: &LowerCtx<'_, '_>, rc_ty: &Ty) -> Ty {
-    if native_shape_field_keyword(ctx, rc_ty).is_some() {
+    // An array of structs (`refcount::is_handle_array`) is held as a plain
+    // `!llvm.ptr` too, but `ty_to_mlir` maps an array type to a memref.
+    if native_shape_field_keyword(ctx, rc_ty).is_some() || is_handle_array(ctx, rc_ty) {
         Ty::Con("__cleave_opaque_ptr".to_string())
     } else {
         rc_ty.clone()
@@ -4788,6 +4829,26 @@ enum PendingChild<'c> {
 /// leaf element is either of those. `false` for a primitive, or a plain
 /// array of primitives — the common case, and the one this check exists
 /// to bail out of cheaply, before ever computing a single element GEP.
+/// `ty`'s name and type arguments when it is a light struct (by value, no
+/// header).
+fn light_struct_name<'t>(ctx: &LowerCtx<'_, '_>, ty: &'t Ty) -> Option<(&'t str, &'t [Ty])> {
+    let (name, type_args): (&str, &[Ty]) = match ty {
+        Ty::Con(name) => (name, &[]),
+        Ty::App(name, args) => (name, args),
+        _ => return None,
+    };
+    is_light_struct(
+        name,
+        type_args,
+        &ctx.struct_schemas,
+        &ctx.mlir_types,
+        &ctx.field_mutated_structs,
+        &ctx.extern_boundary_structs,
+        &ctx.constructed_structs,
+    )
+    .then_some((name, type_args))
+}
+
 fn ty_needs_cascade(ctx: &LowerCtx<'_, '_>, ty: &Ty) -> bool {
     if native_shape_field_keyword(ctx, ty).is_some() {
         return true;
@@ -4805,6 +4866,12 @@ fn ty_needs_cascade(ctx: &LowerCtx<'_, '_>, ty: &Ty) -> bool {
     if let Ty::Array(..) = ty {
         let (_, leaf_ty) = flatten_array_dims(ty);
         return ty_needs_cascade(ctx, leaf_ty);
+    }
+    // A light struct needs one when any of its fields does.
+    if let Some((name, type_args)) = light_struct_name(ctx, ty) {
+        return struct_field_types(&ctx.struct_schemas, name, type_args)
+            .iter()
+            .any(|(_, inner)| ty_needs_cascade(ctx, inner));
     }
     false
 }
@@ -4918,6 +4985,25 @@ fn push_cascade_leaf<'c>(
             .unwrap()
             .into();
         pending.push(PendingChild::Struct(leaf_ty.clone(), child_val, field_key));
+    } else if let Some((name, type_args)) = light_struct_name(ctx, leaf_ty) {
+        // A light struct stored by value (an element of an array of layers,
+        // `Layer { d: Dense }`): no header of its own, but its fields may
+        // hold refcounted values (its `Dense`'s tensors), released through
+        // it, field by field, as a heavy container's own fields are.
+        let fields = struct_field_types(&ctx.struct_schemas, name, type_args);
+        let light_llvm_ty = struct_llvm_type(ctx, name, type_args);
+        for (position, (_, inner_ty)) in fields.iter().enumerate() {
+            push_cascade_children(
+                ctx,
+                block,
+                inner_ty,
+                slot_ptr,
+                light_llvm_ty,
+                &[0, position as i64],
+                &field_key,
+                pending,
+            );
+        }
     }
     // Else: a primitive — nothing refcounted to release. `ty_needs_cascade`
     // is what keeps this branch from ever being reached needlessly (the
@@ -4962,7 +5048,9 @@ fn push_cascade_children<'c>(
     if !ty_needs_cascade(ctx, field_ty) {
         return;
     }
-    if let Ty::Array(..) = field_ty {
+    if let Ty::Array(..) = field_ty
+        && !is_handle_array(ctx, field_ty)
+    {
         let (dims, leaf_ty) = flatten_array_dims(field_ty);
         if !ty_needs_cascade(ctx, leaf_ty) {
             return;
@@ -5032,6 +5120,10 @@ fn lower_release_cascade<'c>(
     struct_ty: &Ty,
     ptr: Value<'c, 'c>,
 ) {
+    if is_handle_array(ctx, struct_ty) {
+        lower_array_release_cascade(ctx, block, struct_ty, ptr);
+        return;
+    }
     let (name, type_args) = struct_name_and_args(struct_ty);
     let field_types = struct_field_types(&ctx.struct_schemas, name, type_args);
     let struct_llvm_ty = struct_llvm_type(ctx, name, type_args);
@@ -5097,6 +5189,60 @@ fn lower_release_cascade<'c>(
     let else_region = Region::new();
     else_region.append_block(else_block);
 
+    block.append_operation(scf::r#if(freed, &[], then_region, else_region, location));
+}
+
+/// An array of structs released (`refcount::is_handle_array`): its count
+/// dropped, and if this release freed it, each element's own references
+/// released (a heavy element's object, a light one's refcounted fields),
+/// the array object being the container `push_cascade_array_elements`
+/// walks.
+fn lower_array_release_cascade<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    array_ty: &Ty,
+    ptr: Value<'c, 'c>,
+) {
+    let location = gen_loc(ctx.context);
+    let (dims, leaf_ty) = flatten_array_dims(array_ty);
+    let array_llvm_ty = array_inline_llvm_type(ctx, array_ty);
+    let mut pending: Vec<PendingChild<'c>> = Vec::new();
+    if ty_needs_cascade(ctx, leaf_ty) {
+        let mut index_path = vec![0];
+        push_cascade_array_elements(
+            ctx,
+            block,
+            &dims,
+            leaf_ty,
+            ptr,
+            array_llvm_ty,
+            &mut index_path,
+            &(String::new(), 0),
+            &mut pending,
+        );
+    }
+    let freed = emit_cleave_release(ctx, block, array_ty, ptr);
+    if pending.is_empty() {
+        return;
+    }
+    let then_block = Block::new(&[]);
+    for child in pending {
+        match child {
+            PendingChild::Tensor(child_ptr) => {
+                emit_cleave_release(ctx, &then_block, array_ty, child_ptr);
+            }
+            PendingChild::Struct(child_ty, child_val, _) => {
+                lower_release_cascade(ctx, &then_block, &child_ty, child_val);
+            }
+        }
+    }
+    then_block.append_operation(scf::r#yield(&[], location));
+    let then_region = Region::new();
+    then_region.append_block(then_block);
+    let else_block = Block::new(&[]);
+    else_block.append_operation(scf::r#yield(&[], location));
+    let else_region = Region::new();
+    else_region.append_block(else_block);
     block.append_operation(scf::r#if(freed, &[], then_region, else_region, location));
 }
 

@@ -85,11 +85,12 @@ pub extern "C" fn print_f64(x: f64) -> f64 {
 /// leaks unconditionally for now.
 #[unsafe(no_mangle)]
 pub extern "C" fn cleave_alloc(size: i64) -> *mut u8 {
-    if *alloc_stats::ENABLED {
-        alloc_stats::record(size as usize, true);
-    }
     let layout = std::alloc::Layout::from_size_align(size as usize, 16).expect("cleave_alloc: invalid layout");
-    unsafe { std::alloc::alloc(layout) }
+    let p = unsafe { std::alloc::alloc(layout) };
+    if *alloc_stats::ENABLED {
+        alloc_stats::record(size as usize, true, Some((p as usize, size as usize)));
+    }
+    p
 }
 
 /// The header `cleave_alloc_rc` prepends to every allocation it makes —
@@ -289,6 +290,13 @@ static CLEAVE_TRACE_SIZE: std::sync::LazyLock<Option<i64>> = std::sync::LazyLock
 // runs of a training loop that differ only in their number of steps.
 // A site is the stack above the allocator, captured raw (a few
 // microseconds) and symbolized only at exit.
+//
+// It also follows what is alive: each block from its allocation to its
+// free, the bytes asked for and the bytes its size class takes, and the
+// freed blocks parked in the pool (`pool_push`), never given back to the
+// system. At the peak of the live bytes, the live bytes by site are
+// recorded, and printed at exit with the process's own peak working set:
+// what a step holds at its high point, and where it was allocated.
 mod alloc_stats {
     use std::collections::HashMap;
     use std::sync::{LazyLock, Mutex, Once};
@@ -311,11 +319,37 @@ mod alloc_stats {
     static SITES: Mutex<Option<HashMap<([usize; FRAMES], usize), Site>>> = Mutex::new(None);
     static REPORT_AT_EXIT: Once = Once::new();
 
+    type SiteKey = ([usize; FRAMES], usize);
+
+    /// What is alive, under one lock: each live block's site and sizes, by
+    /// address, and the totals.
+    #[derive(Default)]
+    struct Live {
+        blocks: HashMap<usize, (SiteKey, u64, u64)>,
+        by_site: HashMap<SiteKey, (u64, u64)>,
+        bytes: u64,
+        class_bytes: u64,
+        parked: u64,
+        peak_bytes: u64,
+        peak_class_bytes: u64,
+        peak_parked: u64,
+        peak_held: u64,
+        at_peak: Vec<(SiteKey, (u64, u64))>,
+        at_peak_parked: u64,
+        at_peak_class_bytes: u64,
+        at_peak_bytes: u64,
+    }
+
+    static LIVE: Mutex<Option<Live>> = Mutex::new(None);
+
     unsafe extern "C" {
         fn atexit(callback: extern "C" fn()) -> i32;
     }
 
-    pub fn record(bytes: usize, fresh: bool) {
+    /// An allocation of `bytes`; `block` (its base) and the bytes its size
+    /// class takes when it is freed individually later (`forget`), `None`
+    /// for an arena or pool allocation, not followed.
+    pub fn record(bytes: usize, fresh: bool, block: Option<(usize, usize)>) {
         REPORT_AT_EXIT.call_once(|| unsafe {
             atexit(report);
         });
@@ -326,14 +360,145 @@ mod alloc_stats {
             n += 1;
             n < FRAMES
         });
-        let mut sites = SITES.lock().unwrap();
-        let site = sites.get_or_insert_with(Default::default).entry((ips, bytes)).or_default();
-        site.count += 1;
-        site.bytes += bytes as u64;
-        if fresh {
-            site.fresh += 1;
-            site.fresh_bytes += bytes as u64;
+        {
+            let mut sites = SITES.lock().unwrap();
+            let site = sites.get_or_insert_with(Default::default).entry((ips, bytes)).or_default();
+            site.count += 1;
+            site.bytes += bytes as u64;
+            if fresh {
+                site.fresh += 1;
+                site.fresh_bytes += bytes as u64;
+            }
         }
+        let Some((base, class_bytes)) = block else { return };
+        let key = (ips, bytes);
+        let (bytes, class_bytes) = (bytes as u64, class_bytes as u64);
+        let mut live = LIVE.lock().unwrap();
+        let live = live.get_or_insert_with(Default::default);
+        live.blocks.insert(base, (key, bytes, class_bytes));
+        let site = live.by_site.entry(key).or_default();
+        site.0 += bytes;
+        site.1 += class_bytes;
+        live.bytes += bytes;
+        live.class_bytes += class_bytes;
+        if !fresh {
+            live.parked = live.parked.saturating_sub(class_bytes);
+        }
+        live.peak_class_bytes = live.peak_class_bytes.max(live.class_bytes);
+        live.peak_held = live.peak_held.max(live.class_bytes + live.parked);
+        if live.bytes > live.peak_bytes {
+            // Recorded again only 1% above the last record: a snapshot copies
+            // every site, not to be taken on each allocation of a ramp.
+            if live.at_peak.is_empty() || live.bytes > live.at_peak_bytes + live.at_peak_bytes / 100 {
+                live.at_peak = live.by_site.iter().filter(|(_, v)| v.0 > 0).map(|(k, v)| (*k, *v)).collect();
+                live.at_peak_parked = live.parked;
+                live.at_peak_class_bytes = live.class_bytes;
+                live.at_peak_bytes = live.bytes;
+            }
+            live.peak_bytes = live.bytes;
+        }
+    }
+
+    /// The block at `base` freed; `parked` when it goes to the pool rather
+    /// than back to the system.
+    pub fn forget(base: usize, parked: bool) {
+        let mut live = LIVE.lock().unwrap();
+        let Some(live) = live.as_mut() else { return };
+        let Some((key, bytes, class_bytes)) = live.blocks.remove(&base) else { return };
+        if let Some(site) = live.by_site.get_mut(&key) {
+            site.0 -= bytes;
+            site.1 -= class_bytes;
+        }
+        live.bytes -= bytes;
+        live.class_bytes -= class_bytes;
+        if parked {
+            live.parked += class_bytes;
+            live.peak_parked = live.peak_parked.max(live.parked);
+            live.peak_held = live.peak_held.max(live.class_bytes + live.parked);
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct ProcessMemoryCounters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
+
+    #[cfg(windows)]
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn K32GetProcessMemoryInfo(process: isize, counters: *mut ProcessMemoryCounters, cb: u32) -> i32;
+    }
+
+    /// The process's peak working set and peak private bytes, when the
+    /// system tells them.
+    fn process_peaks() -> Option<(u64, u64)> {
+        #[cfg(windows)]
+        unsafe {
+            let mut c = ProcessMemoryCounters {
+                cb: std::mem::size_of::<ProcessMemoryCounters>() as u32,
+                ..Default::default()
+            };
+            if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) != 0 {
+                return Some((c.peak_working_set_size as u64, c.peak_pagefile_usage as u64));
+            }
+        }
+        None
+    }
+
+    fn report_peak(live: &Live, labels: &mut HashMap<[usize; FRAMES], String>) {
+        let mb = |b: u64| b as f64 / (1 << 20) as f64;
+        eprintln!(
+            "CLEAVE_ALLOC_STATS peak: live {:.1} MiB asked, {:.1} MiB in size classes; \
+             parked in the pool {:.1} MiB at most; held (live in classes + parked) {:.1} MiB at most",
+            mb(live.peak_bytes),
+            mb(live.peak_class_bytes),
+            mb(live.peak_parked),
+            mb(live.peak_held),
+        );
+        if let Some((working_set, private)) = process_peaks() {
+            eprintln!(
+                "CLEAVE_ALLOC_STATS process: peak working set {:.1} MiB, peak private {:.1} MiB",
+                mb(working_set),
+                mb(private)
+            );
+        }
+        let (slices, committed) = super::arena_commitment();
+        eprintln!(
+            "CLEAVE_ALLOC_STATS arenas: {slices} threads' slices, {:.1} MiB committed",
+            mb(committed as u64)
+        );
+        let mut by_label: HashMap<(String, usize), (u64, u64, u64)> = HashMap::new();
+        for ((ips, bytes), (asked, class)) in &live.at_peak {
+            let label = labels.entry(*ips).or_insert_with(|| label(ips)).clone();
+            let e = by_label.entry((label, *bytes)).or_default();
+            e.0 += asked / (*bytes).max(1) as u64;
+            e.1 += asked;
+            e.2 += class;
+        }
+        let mut rows: Vec<_> = by_label.into_iter().collect();
+        rows.sort_by(|a, b| b.1.1.cmp(&a.1.1));
+        eprintln!(
+            "live at the peak, by site ({:.1} MiB asked, {:.1} MiB in size classes, {:.1} MiB parked then):",
+            mb(live.at_peak_bytes),
+            mb(live.at_peak_class_bytes),
+            mb(live.at_peak_parked)
+        );
+        eprintln!("{:>8} {:>11} {:>11} {:>12}  site", "blocks", "MiB", "class MiB", "bytes each");
+        for ((label, bytes), (count, asked, class)) in rows.iter().take(40) {
+            eprintln!("{count:>8} {:>11.1} {:>11.1} {bytes:>12}  {label}", mb(*asked), mb(*class));
+        }
+        eprintln!();
     }
 
     /// The first frame above the runtime: the generated function that
@@ -372,6 +537,9 @@ mod alloc_stats {
     extern "C" fn report() {
         let Some(sites) = SITES.lock().unwrap().take() else { return };
         let mut labels: HashMap<[usize; FRAMES], String> = HashMap::new();
+        if let Some(live) = LIVE.lock().unwrap().take() {
+            report_peak(&live, &mut labels);
+        }
         let mut by_label: HashMap<(String, usize), Site> = HashMap::new();
         for ((ips, bytes), site) in &sites {
             let label = labels.entry(*ips).or_insert_with(|| label(ips)).clone();
@@ -697,13 +865,18 @@ unsafe fn pool_push(class: usize, block: *mut u8) {
     }
 }
 
-/// Class `c` covers `(2^(c-1), 2^c]` bytes, so `class_bytes(size_class(n))`
-/// is always `>= n` — the usual power-of-two segregated-free-list rounding.
-/// Deliberately generous (64 classes: 64-bit `usize` can never overflow it)
-/// rather than sized exactly to what this program happens to allocate —
-/// the unused high classes cost nothing but one pointer-sized array slot
-/// each (a few hundred bytes total).
-const NUM_SIZE_CLASSES: usize = 64;
+/// Size classes per doubling, as `2^CLASS_STEP_BITS`: a block is at most
+/// `1 / 2^CLASS_STEP_BITS` larger than the request (12.5%), where powers of
+/// two lost up to half of it. Measured on nanoLM (`CLEAVE_ALLOC_STATS`): the
+/// tensors of a model come in a few shapes, and its powers of two plus the
+/// 64-byte header (a 4 MiB tensor, a 16 MiB one) each took a block of twice
+/// their size; the live bytes at a step's peak, 5.8 GiB, held 9.6 GiB.
+const CLASS_STEP_BITS: u32 = 3;
+
+/// Every class a 64-bit size can fall in (`size_class`): 64 doublings of
+/// `2^CLASS_STEP_BITS` classes. The unused ones cost a pointer-sized slot
+/// each.
+const NUM_SIZE_CLASSES: usize = 64 << CLASS_STEP_BITS;
 
 /// One intrusive singly-linked free list per size class — `FREE_LISTS[c]`
 /// is the most-recently-released block's own base pointer (the header's own
@@ -715,14 +888,20 @@ const NUM_SIZE_CLASSES: usize = 64;
 /// or allocation needed, the classic segregated-free-list trick.
 static mut FREE_LISTS: [*mut u8; NUM_SIZE_CLASSES] = [std::ptr::null_mut(); NUM_SIZE_CLASSES];
 
-/// Smallest `c` such that `2^c >= total.max(32)` — the `32` floor matches
+/// The class of a block of `total.max(32)` bytes: the smallest class whose
+/// blocks (`class_bytes`) hold it. A class is a doubling (the exponent of
+/// the highest bit of `total - 1`) and a step within it (the
+/// `CLASS_STEP_BITS` bits below that one): a block is `2^e` plus `step + 1`
+/// steps of `2^e / 2^CLASS_STEP_BITS`. The `32` floor matches
 /// `RC_HEADER_SIZE` (16 bytes) plus a little real payload room being the
 /// smallest allocation this runtime ever actually makes, and guarantees
 /// every cached block has at least 8 bytes free for its own free-list
 /// "next" pointer even at `data_size == 0`.
 fn size_class(total: usize) -> usize {
-    let total = total.max(32);
-    (usize::BITS - (total - 1).leading_zeros()) as usize
+    let x = total.max(32) - 1;
+    let e = usize::BITS - 1 - x.leading_zeros();
+    let step = (x >> (e - CLASS_STEP_BITS)) & ((1 << CLASS_STEP_BITS) - 1);
+    ((e as usize) << CLASS_STEP_BITS) | step
 }
 
 /// The physical size actually allocated (and, symmetrically, freed) for
@@ -733,7 +912,9 @@ fn size_class(total: usize) -> usize {
 /// point of bucketing instead of tracking exact sizes: a slightly smaller
 /// same-class request still reuses the block cleanly).
 fn class_bytes(class: usize) -> usize {
-    1usize << class
+    let e = (class >> CLASS_STEP_BITS) as u32;
+    let step = class & ((1 << CLASS_STEP_BITS) - 1);
+    ((1 << CLASS_STEP_BITS) + step + 1) << (e - CLASS_STEP_BITS)
 }
 
 /// Data alignment for any allocation of at least this many bytes: one
@@ -834,7 +1015,7 @@ pub extern "C" fn cleave_alloc_rc(data_size: i64) -> *mut u8 {
             }
         };
         if *alloc_stats::ENABLED {
-            alloc_stats::record(data_size as usize, popped.is_none());
+            alloc_stats::record(data_size as usize, popped.is_none(), Some((base as usize, class_bytes(class))));
         }
         let header = base.add(offset - RC_HEADER_SIZE) as *mut RcHeader;
         (*header).refcount = 1;
@@ -1091,8 +1272,14 @@ pub unsafe extern "C" fn cleave_release(ptr: *mut u8) -> bool {
                     if (*CLEAVE_DEBUG_POOL || *CLEAVE_COUNT_PARKED_HITS) && !parked_insert(base as usize) && *CLEAVE_DEBUG_POOL {
                         eprintln!("CLEAVE_DEBUG_POOL: block {base:p} parked twice (double-free)");
                     }
+                    if *alloc_stats::ENABLED {
+                        alloc_stats::forget(base as usize, true);
+                    }
                     pool_push(class, base);
                 } else {
+                    if *alloc_stats::ENABLED {
+                        alloc_stats::forget(base as usize, false);
+                    }
                     // Astronomically large (`class >= 64`, i.e. `total >
                     // 2^63`) -- can't happen with a real `i64 data_size`,
                     // but falls back to the plain, uncached path rather
@@ -1112,7 +1299,8 @@ pub unsafe extern "C" fn cleave_release(ptr: *mut u8) -> bool {
 /// Bytes of one thread's arena (`doc/hld.md`'s own "Memory management"
 /// section: "one large reserved VM region... pages committed lazily").
 /// Reserved as address space once for every thread (`ARENA_SLOTS`, below),
-/// each thread's slice committed whole when it first opens a region. 256 MiB: bigger
+/// each thread's slice committed as its cursor first reaches it, by
+/// `ARENA_COMMIT_STEP`. 256 MiB: bigger
 /// than any single training-loop iteration's own local footprint this
 /// project's own real workload (`examples/mnist-interop`, per-sample
 /// tensors well under a megabyte) plausibly needs — a real number to
@@ -1136,6 +1324,24 @@ const ARENA_CAPACITY: usize = 256 * 1024 * 1024;
 /// the next one.
 const ARENA_SLOTS: usize = 256;
 
+/// An arena slice is committed by this many bytes at a time, as its cursor
+/// first reaches them. Committed whole when a thread first opened a region,
+/// nanoLM's threads held 2 GiB of committed memory, almost none of it ever
+/// touched: most open a region and never allocate in it; the one that does
+/// uses under 1 MiB (`CLEAVE_ALLOC_STATS`: peak private bytes 10.1 -> 8.0
+/// GiB).
+const ARENA_COMMIT_STEP: usize = 1024 * 1024;
+
+/// Bytes committed in each slice, by slot: a slice handed back by an exiting
+/// thread keeps its pages for the next one.
+static ARENA_COMMITTED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// The slices taken so far and the bytes committed in them.
+fn arena_commitment() -> (usize, usize) {
+    let committed = ARENA_COMMITTED.lock().unwrap_or_else(|e| e.into_inner());
+    (committed.iter().filter(|&&c| c > 0).count(), committed.iter().sum())
+}
+
 static ARENA_RESERVATION: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static FREE_ARENA_SLOTS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 static NEXT_ARENA_SLOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1146,6 +1352,8 @@ struct ThreadArena {
     base: std::cell::Cell<usize>,
     cursor: std::cell::Cell<usize>,
     depth: std::cell::Cell<usize>,
+    /// Bytes of the slice committed (`ARENA_COMMIT_STEP` by step).
+    committed: std::cell::Cell<usize>,
 }
 
 impl Drop for ThreadArena {
@@ -1164,6 +1372,7 @@ thread_local! {
             base: std::cell::Cell::new(0),
             cursor: std::cell::Cell::new(0),
             depth: std::cell::Cell::new(0),
+            committed: std::cell::Cell::new(0),
         }
     };
 }
@@ -1226,18 +1435,24 @@ fn arena_base() -> *mut u8 {
     ARENA.with(|a| {
         if a.base.get() == 0 {
             let reused = FREE_ARENA_SLOTS.lock().unwrap_or_else(|e| e.into_inner()).pop();
-            let base = match reused {
-                Some(slot) => arena_reservation() + slot * ARENA_CAPACITY,
+            let slot = match reused {
+                Some(slot) => slot,
                 None => {
                     let slot = NEXT_ARENA_SLOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     assert!(slot < ARENA_SLOTS, "cleave arena: more than {ARENA_SLOTS} threads with an open region");
-                    let base = arena_reservation() + slot * ARENA_CAPACITY;
-                    arena_memory::commit(base, ARENA_CAPACITY);
-                    base
+                    slot
                 }
             };
-            a.base.set(base);
+            let committed = {
+                let mut all = ARENA_COMMITTED.lock().unwrap_or_else(|e| e.into_inner());
+                if all.len() <= slot {
+                    all.resize(slot + 1, 0);
+                }
+                all[slot]
+            };
+            a.base.set(arena_reservation() + slot * ARENA_CAPACITY);
             a.cursor.set(0);
+            a.committed.set(committed);
         }
         a.base.get() as *mut u8
     })
@@ -1254,6 +1469,14 @@ fn arena_bump(size: usize, align: usize) -> *mut u8 {
             "cleave arena exhausted ({new_cursor} > {ARENA_CAPACITY} bytes) -- \
              a real overflow path (grow, or fall back to the ordinary allocator) is not built yet"
         );
+        if new_cursor > a.committed.get() {
+            let committed = a.committed.get();
+            let target = new_cursor.div_ceil(ARENA_COMMIT_STEP) * ARENA_COMMIT_STEP;
+            arena_memory::commit(base as usize + committed, target - committed);
+            a.committed.set(target);
+            let slot = (base as usize - arena_reservation()) / ARENA_CAPACITY;
+            ARENA_COMMITTED.lock().unwrap_or_else(|e| e.into_inner())[slot] = target;
+        }
         a.cursor.set(new_cursor);
         unsafe { base.add(aligned) }
     })
@@ -1327,7 +1550,7 @@ fn assert_region_open() {
 pub extern "C" fn cleave_alloc_local(_handle: i64, size: i64) -> *mut u8 {
     assert_region_open();
     if *alloc_stats::ENABLED {
-        alloc_stats::record(size as usize, false);
+        alloc_stats::record(size as usize, false, None);
     }
     let offset = data_offset(size as usize);
     let align = if offset == VECTOR_ALIGN { VECTOR_ALIGN } else { 16 };
@@ -1431,7 +1654,7 @@ pub extern "C" fn cleave_alloc_pool(data_size: i64) -> *mut u8 {
             None
         };
         if *alloc_stats::ENABLED {
-            alloc_stats::record(total, popped.is_none());
+            alloc_stats::record(total, popped.is_none(), None);
         }
         match popped {
             Some(block) => block,
@@ -1955,10 +2178,11 @@ mod rc_tests {
 
             // A smaller request that still rounds up to the *same* size
             // class reuses the identical cached block too — the free list
-            // is keyed by class, not by exact `data_size`.
+            // is keyed by class, not by exact `data_size` (40 and 38 bytes
+            // of data, 56 and 54 with the header, are one class of 56).
             let p3 = cleave_alloc_rc(40);
             cleave_release(p3);
-            let p4 = cleave_alloc_rc(24);
+            let p4 = cleave_alloc_rc(38);
             assert_eq!(
                 p3, p4,
                 "a smaller same-class request must still reuse the previously released block"
@@ -2134,6 +2358,25 @@ mod rc_tests {
             assert_eq!(*ptr.add(7), 0x99);
             cleave_release_pool(ptr, 8);
         }
+    }
+
+    #[test]
+    fn a_size_class_holds_its_request_and_wastes_at_most_an_eighth() {
+        let mut previous = 0;
+        for n in (32..1 << 16).chain([1572928, 4194304, 4194368, 16777280, 1 << 40]) {
+            let class = super::size_class(n);
+            let bytes = super::class_bytes(class);
+            assert!(class < super::NUM_SIZE_CLASSES);
+            assert!(bytes >= n, "{n} bytes in a class of {bytes}");
+            assert!(bytes - n <= n / 8, "{n} bytes in a class of {bytes}");
+            assert_eq!(super::size_class(bytes), class, "{bytes}: a class's own size is in it");
+            if n < 1 << 16 {
+                assert!(class >= previous, "classes grow with the size");
+                previous = class;
+            }
+        }
+        assert_eq!(super::class_bytes(super::size_class(4194304)), 4194304);
+        assert_eq!(super::class_bytes(super::size_class(4194368)), 4718592);
     }
 
     #[test]

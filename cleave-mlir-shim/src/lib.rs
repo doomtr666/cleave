@@ -41,6 +41,8 @@ unsafe extern "C" {
     fn cleaveBlasTileAndFuse(op: MlirOperation, rows: i64) -> i64;
     fn cleaveLowerBlasMatmuls(op: MlirOperation) -> i64;
     fn cleaveReuseDyingInputs(op: MlirOperation) -> i64;
+    fn cleaveDeallocAtLastUse(op: MlirOperation) -> i64;
+    fn cleaveFoldPassthroughIterArgs(op: MlirOperation) -> i64;
     fn cleaveBindTeams(op: MlirOperation) -> i64;
     fn cleaveForwardCopiesToDestinations(op: MlirOperation) -> i64;
     fn cleaveLimitInlining(op: MlirOperation, threshold: i64) -> i64;
@@ -160,6 +162,27 @@ pub unsafe fn lower_blas_matmuls(op: MlirOperation) -> i64 {
 /// `op` must be a valid operation, not used concurrently.
 pub unsafe fn reuse_dying_inputs(op: MlirOperation) -> i64 {
     unsafe { cleaveReuseDyingInputs(op) }
+}
+
+/// Moves each buffer's deallocation to just after its last use in its block
+/// (`cpp/shim.cpp`'s `cleaveDeallocAtLastUse`), where the ownership-based
+/// deallocation put it at the block's end. Returns how many moved.
+///
+/// # Safety
+/// `op` must be a valid module operation.
+pub unsafe fn dealloc_at_last_use(op: MlirOperation) -> i64 {
+    unsafe { cleaveDeallocAtLastUse(op) }
+}
+
+/// Removes the values loops carry and yield back unchanged
+/// (`cpp/shim.cpp`'s `cleaveFoldPassthroughIterArgs`), so that the
+/// deallocation's alias analysis sees where a loop's result comes from.
+/// Returns how many went.
+///
+/// # Safety
+/// `op` must be a valid module operation.
+pub unsafe fn fold_passthrough_iter_args(op: MlirOperation) -> i64 {
+    unsafe { cleaveFoldPassthroughIterArgs(op) }
 }
 
 /// Starts every `omp.parallel` region with each member placing itself on a

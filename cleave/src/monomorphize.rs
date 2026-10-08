@@ -3711,6 +3711,8 @@ impl<'a> InstanceEngine<'a> {
             || infer.param_types.iter().any(|p| !is_fully_concrete(p))
             || node_types.values().any(|v| !is_fully_concrete(v))
         {
+            *self.last_error.borrow_mut() =
+                self.undetermined_instance_error(&display_impl_instantiation(t, mapping), args, &exprs, &node_types);
             return None;
         }
         let lambda_schemes = self.instance_lambdas(&infer, &exprs, &mut node_types);
@@ -3852,6 +3854,91 @@ impl InstanceEngine<'_> {
             }
             self.next_node.set(ids.current());
         }
+    }
+
+    /// Why an instance's body left a type undetermined, for its error: the
+    /// first call in it whose arguments are all known but whose result isn't,
+    /// an algebra method with no impl at those types (`init_state(opt,
+    /// model[i])` on an `i32` field of a `Trainable` struct: no `Optimizer`
+    /// for it). The impl's targets the arguments don't fix show as `_`.
+    /// Otherwise, the first expression whose type stays unknown. Without it,
+    /// the instance was silently not built while its name was already the
+    /// call's target, and CPS conversion found the name with no unit behind
+    /// it.
+    fn undetermined_instance_error(
+        &self,
+        instance: &str,
+        args: &[Ty],
+        exprs: &[&Expr],
+        node_types: &HashMap<NodeId, Ty>,
+    ) -> Option<TypeError> {
+        let tys = args.iter().map(Ty::to_string).collect::<Vec<_>>().join(", ");
+        // The instance's undetermined targets are inference variables
+        // (`'t774`): `_` for the reader.
+        let mut name = String::new();
+        let mut chars = instance.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\'' && chars.peek() == Some(&'t') {
+                chars.next();
+                while chars.peek().is_some_and(char::is_ascii_digit) {
+                    chars.next();
+                }
+                name.push('_');
+            } else {
+                name.push(c);
+            }
+        }
+        let wrap = |inner: TypeError| TypeError {
+            span: inner.span,
+            kind: TypeErrorKind::GenericFnInstantiationFailed {
+                name: name.clone(),
+                tys: tys.clone(),
+                inner: Box::new(inner),
+            },
+        };
+        for e in exprs {
+            let ExprKind::Call(path, _, call_args, _) = &e.kind else { continue };
+            if node_types.get(&e.id).is_none_or(is_fully_concrete) {
+                continue;
+            }
+            let Some(arg_tys) = call_args
+                .iter()
+                .map(|a| node_types.get(&a.id).filter(|t| is_fully_concrete(t)).cloned())
+                .collect::<Option<Vec<Ty>>>()
+            else {
+                continue;
+            };
+            let Some(method) = path.segments.last() else { continue };
+            let algebras = self.registry.algebras_with_fn(method, call_args.len());
+            let [algebra] = algebras.as_slice() else { continue };
+            let Some(sig) = self.registry.fn_sig(algebra, method) else { continue };
+            // Each of the algebra's type targets: the argument declared with
+            // it, if any.
+            let targets: Vec<String> = self
+                .registry
+                .generics(algebra)
+                .iter()
+                .filter(|g| !matches!(g, crate::ast::GenericParam::Const { .. }))
+                .map(|g| {
+                    sig.params
+                        .iter()
+                        .zip(&arg_tys)
+                        .find(|(p, _)| {
+                            p.ty.as_ref().is_some_and(|t| crate::print::fmt_type(t) == g.name())
+                        })
+                        .map_or_else(|| "_".to_string(), |(_, ty)| ty.to_string())
+                })
+                .collect();
+            return Some(wrap(TypeError {
+                span: e.span,
+                kind: TypeErrorKind::MissingImpl { algebra: algebra.to_string(), ty: targets.join(", ") },
+            }));
+        }
+        let e = exprs.iter().find(|e| node_types.get(&e.id).is_some_and(|t| !is_fully_concrete(t)))?;
+        Some(wrap(TypeError {
+            span: e.span,
+            kind: TypeErrorKind::Unresolved(format!("the type of this expression ({})", node_types[&e.id])),
+        }))
     }
 
     /// The instance of generic top-level fn `name` at the concrete argument

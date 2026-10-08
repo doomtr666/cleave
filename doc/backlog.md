@@ -1,4 +1,4 @@
-# Backlog
+g# Backlog
 
 *Ordered — top to bottom is the order we work through it. Not a wishlist: each entry is a real, confirmed gap (found by testing or by direct inspection), not a guess about what might be missing.*
 
@@ -17,6 +17,22 @@ value defined inside the enclosing `scf` loop, not a valid affine dim/symbol). B
 `forward<1>`) and multiples of 8/16 (32, 80) compile fine. `evaluate` uses 80 for now. The fix belongs
 in the schedule (pad or peel the remainder tile, as the narrow-output `pad` path already does for N)
 or in the fallback lowering, not in user code.
+
+---
+
+## A BLAS result passed to a function and read again later is copied at the call
+
+Eight per nanoLM micro-batch (one per layer, 1.5 MB each, ~1% of the step's traffic, 2026-10-08):
+the value projection, computed by `sgemm` into a buffer of dynamic layout (`cleaveLowerBlasMatmuls`:
+the layout `cleaveElideBlockCopies`' soundness needs), passed to `causal_attention`, whose
+parameter has the plain layout (`function-boundary-type-conversion=identity-layout-map`). One-Shot
+Bufferize can't cast a dynamic layout to the plain one without a check, so it copies. The reverse
+copy forwarding (`cleaveForwardCopiesToDestinations`) removes the copy when the source isn't used
+afterwards; here the backward pass reads it again (`causal_attention_backward`). Removing it needs
+to know the callee never writes that parameter: a read-only-parameter analysis over the call graph
+(an argument only read by `linalg` inputs, loads, transfer reads, or passed to read-only parameters
+of other functions), then the destination becomes the source when neither is written while the copy
+lives. Or layouts at function boundaries taken from the type ("Views as first-class descriptors").
 
 ---
 
@@ -55,6 +71,9 @@ stated rule, not by accident). Repro: any program with `use nn;` and a `fn step`
 ---
 
 ## Views as first-class descriptors: a strided view that retains the refcounted tensor it looks into
+
+Planned as Part 2 of `doc/plan-struct-arrays.md` (heap references: arrays of structs first, views on
+the same base: retained references, copy on write).
 
 `Slice::slice`/`update` (`stdlib/linalg/tensor.cleave`) give *ephemeral* views today: a slice becomes
 a `memref.subview` inside one function, `Sgemm::sgemm` reads it with its real strides, and a block

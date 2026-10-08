@@ -1461,6 +1461,13 @@ pub fn lower_to_llvm<'c>(
             .unwrap_or_else(|e| eprintln!("CLEAVE_DUMP_POST_OUT_PARAMS: failed to write {path}: {e}"));
     }
 
+    // A loop yielding back the buffer it carries returns the buffer it was
+    // given: said before the deallocation, whose alias analysis can't see
+    // through a loop (`cleave_mlir_shim::fold_passthrough_iter_args`).
+    let folded = unsafe { cleave_mlir_shim::fold_passthrough_iter_args(module.as_operation().to_raw()) };
+    if time_stages() {
+        eprintln!("cleave stage: loop-carried values yielded back unchanged, removed: {folded}");
+    }
     let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::bufferization::create_ownership_based_buffer_deallocation_pass());
     pass_manager.add_pass(pass::bufferization::create_buffer_deallocation_simplification_pass());
@@ -1473,6 +1480,13 @@ pub fn lower_to_llvm<'c>(
     // Adopted tensors (`PrimOp::Adopt`): the deallocation above took each for
     // a fresh buffer; it is a retain of the same one.
     unsafe { cleave_mlir_shim::lower_adoptions(module.as_operation().to_raw()) };
+    // Each buffer freed right after its last use, not at the end of its block
+    // (`cleave_mlir_shim::dealloc_at_last_use`). Before the spawns are
+    // lowered: a task's wait marker is a use of the buffers the task reads.
+    let moved = unsafe { cleave_mlir_shim::dealloc_at_last_use(module.as_operation().to_raw()) };
+    if time_stages() {
+        eprintln!("cleave stage: deallocations moved to the last use: {moved}");
+    }
     let pass_manager = pass::PassManager::new(context);
     pass_manager.add_pass(pass::conversion::create_bufferization_to_mem_ref());
     if timed_run(&pass_manager, &mut *module, line!()).is_err() {

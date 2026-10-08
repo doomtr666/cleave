@@ -1812,6 +1812,78 @@ fn a_blas_product_is_computed_tile_by_tile_with_its_consumer() {
     assert_eq!(whole, 1, "a product-sized buffer besides the result:\n{main}");
 }
 
+/// Three dense layers on the BLAS tier in one function: each product is
+/// computed by a tile loop carrying its output buffer, and each layer's
+/// result is freed once the next has read it, not at the function's end
+/// (`cleave_mlir_shim::fold_passthrough_iter_args`: the loop's result is
+/// the buffer it was given, so the deallocation's alias analysis frees each
+/// buffer on its own instead of all together after a run-time alias check;
+/// `dealloc_at_last_use` then frees each right after its last use).
+#[test]
+fn buffers_are_freed_after_their_last_use_through_tile_loops() {
+    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("last_use.cleave");
+    let dump = dir.join("last_use_post_dealloc.mlir");
+    std::fs::write(
+        &source,
+        "
+        use nn;
+        fn layer(x: Tensor<f32, 512, 32>, w: Tensor<f32, 32, 32>, b: Tensor<f32, 1, 32>) -> Tensor<f32, 512, 32> {
+            silu(matmul(x, w) + broadcast0(b))
+        }
+        fn main() -> f32 {
+            rand_seed(1);
+            let x: Tensor<f32, 512, 32> = Init::he();
+            let w: Tensor<f32, 32, 32> = Init::he();
+            let b: Tensor<f32, 1, 32> = Init::he();
+            sum(layer(layer(layer(x, w, b), w, b), w, b))
+        }
+        ",
+    )
+    .unwrap();
+    let run = |blas: bool| {
+        let _ = std::fs::remove_file(&dump);
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"));
+        command.args(["--no-openmp", "--no-debug-info", "--run"]);
+        if blas {
+            command.args(["--define", "BLAS_MIN_WORK=0"]).env("CLEAVE_DUMP_POST_DEALLOC", &dump);
+        }
+        let output = command.arg(&source).output().expect("cannot run cleave");
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let bits: i32 = stdout
+            .trim()
+            .strip_prefix("main returned: ")
+            .and_then(|b| b.parse().ok())
+            .unwrap_or_else(|| panic!("stdout: {stdout}
+stderr: {}", String::from_utf8_lossy(&output.stderr)));
+        f32::from_bits(bits as u32)
+    };
+    let (native, blas) = (run(false), run(true));
+    assert!((native - blas).abs() <= 1e-4 * native.abs().max(1.0), "linalg {native}, BLAS {blas}");
+    let ir = std::fs::read_to_string(&dump).expect("no IR dumped");
+    let main: Vec<&str> = ir
+        .lines()
+        .skip_while(|l| !l.contains("func.func @main"))
+        .take_while(|l| !l.starts_with("  }"))
+        .collect();
+    let text = main.join("
+");
+    assert!(!text.contains("dealloc_helper"), "a run-time alias check before freeing:
+{text}");
+    let whole = |op: &str| -> Vec<usize> {
+        main.iter().enumerate().filter(|(_, l)| l.contains(op) && l.contains("memref<512x32xf32>")).map(|(i, _)| i).collect()
+    };
+    let (allocs, deallocs) = (whole("memref.alloc"), whole("memref.dealloc"));
+    assert!(allocs.len() >= 3 && !deallocs.is_empty(), "allocs {allocs:?}, deallocs {deallocs:?}:
+{text}");
+    assert!(
+        deallocs[0] < *allocs.last().unwrap(),
+        "every layer-sized buffer is freed after the last is allocated:
+{text}"
+    );
+}
+
 /// An elementwise op consuming two BLAS products (SwiGLU's `silu(x Wg) *
 /// x Wu`): both fused into the one tile loop (it used to be tiled once per
 /// product, the second time after the first had replaced it, and crash).
@@ -1961,4 +2033,123 @@ fn a_blas_product_passed_to_a_function_is_not_copied() {
         .join("\n");
     assert!(produce.contains("cleave_blas_sgemm"), "not on the BLAS tier:\n{produce}");
     assert!(!produce.contains("memref.copy"), "the product is copied:\n{produce}");
+}
+
+/// A model whose layers are an array (`layers: [Layer; 3]`, the depth a
+/// constant) differentiates like the same model with three named fields:
+/// the loop over the layers unrolls, each element read is a projection like
+/// a field read, and the gradient has the model's shape, an array of layer
+/// gradients. Same initialization, same values to the bit
+/// (`doc/plan-struct-arrays.md`).
+#[test]
+fn a_model_whose_layers_are_an_array_has_the_gradient_of_named_layers() {
+    let common = "
+        use nn;
+        define LAYERS: i32 = 3;
+        struct Layer { d: Dense<f32, 16, 16> }
+        impl Trainable<Layer> {}
+        fn new_layer() -> Layer { Layer(d: Init::xavier()) }
+    ";
+    let array = |out: &str| {
+        format!(
+            "{common}
+            struct Net {{ layers: [Layer; LAYERS], out: Dense<f32, 16, 4> }}
+            impl Trainable<Net> {{}}
+            // The loop in a function `loss` calls, as a model's forward is
+            // written: its body unrolls inside `loss`'s gradient.
+            fn forward(x: Tensor<f32, 8, 16>, net: Net) -> Tensor<f32, 8, 16> {{
+                let mut h = x;
+                for i in 0..LAYERS {{ h = relu(net.layers[i].d.dense_forward(h)); }};
+                h
+            }}
+            fn loss(x: Tensor<f32, 8, 16>, net: Net) -> f32 {{
+                sum(net.out.dense_forward(forward(x, net)))
+            }}
+            net_grad = grad(loss, net);
+            fn main() -> f32 {{
+                rand_seed(1);
+                let a = new_layer();
+                let b = new_layer();
+                let c = new_layer();
+                let net = Net(layers: [a, b, c], out: Init::xavier());
+                let x: Tensor<f32, 8, 16> = Init::he();
+                let g = net_grad(x, net);
+                {out}
+            }}"
+        )
+    };
+    let named = |out: &str| {
+        format!(
+            "{common}
+            struct Net {{ l1: Layer, l2: Layer, l3: Layer, out: Dense<f32, 16, 4> }}
+            impl Trainable<Net> {{}}
+            fn loss(x: Tensor<f32, 8, 16>, net: Net) -> f32 {{
+                let h1 = relu(net.l1.d.dense_forward(x));
+                let h2 = relu(net.l2.d.dense_forward(h1));
+                let h3 = relu(net.l3.d.dense_forward(h2));
+                sum(net.out.dense_forward(h3))
+            }}
+            net_grad = grad(loss, net);
+            fn main() -> f32 {{
+                rand_seed(1);
+                let a = new_layer();
+                let b = new_layer();
+                let c = new_layer();
+                let net = Net(l1: a, l2: b, l3: c, out: Init::xavier());
+                let x: Tensor<f32, 8, 16> = Init::he();
+                let g = net_grad(x, net);
+                {out}
+            }}"
+        )
+    };
+    for (by_index, by_name) in [
+        ("sum(g.layers[0].d.w)", "sum(g.l1.d.w)"),
+        ("sum(g.layers[1].d.b)", "sum(g.l2.d.b)"),
+        ("g.layers[2].d.w[3, 5]", "g.l3.d.w[3, 5]"),
+        ("sum(g.out.w)", "sum(g.out.w)"),
+    ] {
+        let (a, n) = (run(&array(by_index)), run(&named(by_name)));
+        assert_eq!(a.to_bits(), n.to_bits(), "{by_index}: {a} against {n}");
+    }
+}
+
+/// A call `grad` can't see through (a branch on a run-time value in the
+/// callee) is a located error naming it, not a gradient silently built from
+/// what came before the call (it used to take a variable read at the call
+/// for the function's result: `out`'s gradient came out the integer `1`, and
+/// MLIR lowering crashed on it).
+#[test]
+fn grad_through_an_opaque_call_is_an_error_naming_it() {
+    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("grad_opaque_call.cleave");
+    std::fs::write(
+        &source,
+        "
+        use nn;
+        struct Net { d: Dense<f32, 16, 16>, out: Dense<f32, 16, 4> }
+        fn forward(x: Tensor<f32, 8, 16>, net: Net, k: i32) -> Tensor<f32, 8, 16> {
+            if k > 2 { relu(net.d.dense_forward(x)) } else { net.d.dense_forward(x) }
+        }
+        fn loss(x: Tensor<f32, 8, 16>, net: Net, k: i32) -> f32 {
+            sum(net.out.dense_forward(forward(x, net, k)))
+        }
+        net_grad = grad(loss, net);
+        fn main() -> f32 {
+            rand_seed(1);
+            let net = Net(d: Init::xavier(), out: Init::xavier());
+            let x: Tensor<f32, 8, 16> = Init::he();
+            sum(net_grad(x, net, 3).d.w)
+        }
+        ",
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--no-debug-info", "--run"])
+        .arg(&source)
+        .output()
+        .expect("cannot run cleave");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("Assertion failed") && !stderr.contains("panicked"), "a crash, not an error:\n{stderr}");
+    assert!(stderr.contains("net_grad") && stderr.contains("forward"), "the error doesn't name the call:\n{stderr}");
 }

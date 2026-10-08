@@ -488,6 +488,14 @@ fn is_transparent_chain(
         CExpr::App { .. } => true,
         CExpr::If { .. } => false,
         CExpr::Fix { defs, body } => {
+            // A loop with constant bounds (`for i in 0..LAYERS`, a model's
+            // forward over its layers): `Forward::walk` unrolls it while
+            // inlining the callee, so it is as transparent as its body and
+            // what follows it.
+            if let Some(l) = recognize_unrollable_loop(defs, body) {
+                return is_transparent_chain(l.then_branch, units, visiting)
+                    && is_transparent_chain(l.else_branch, units, visiting);
+            }
             let Some((_, unit_name, _, rest)) = recognize_real_call(defs, body) else {
                 return false;
             };
@@ -1279,45 +1287,11 @@ impl Forward {
         units: &HashMap<String, &CTopLevelFn>,
         fresh: &FreshVars,
     ) -> Option<CExpr> {
-        let [loop_def] = defs else { return None };
-        loop_def.carried_types.as_ref()?;
-        let CExpr::App {
-            func: CVal::Label(call_label),
-            args: init_args,
-        } = body
-        else {
-            return None;
-        };
-        if call_label != &loop_def.name {
-            return None;
-        }
+        let UnrollableLoop { loop_def, init_args, start, end, then_branch, else_branch } =
+            recognize_unrollable_loop(defs, body)?;
         let (&i_var, carried_params) = loop_def.params.split_first()?;
-        let (start_val, carried_init) = init_args.split_first()?;
-        let &CVal::Int(start) = start_val else {
-            return None;
-        };
-
-        let CExpr::Fix {
-            defs: cond_defs,
-            body: cond_body,
-        } = &loop_def.body
-        else {
-            return None;
-        };
-        let (_, _, cmp_args, if_expr) = recognize_real_call(cond_defs, cond_body)?;
-        let [_, CVal::Int(end)] = cmp_args else {
-            return None;
-        };
-        let end = *end;
-        let CExpr::If {
-            then_branch,
-            else_branch,
-            ..
-        } = if_expr
-        else {
-            return None;
-        };
-        let iterations = end.saturating_sub(start).max(0) as u64;
+        let (_, carried_init) = init_args.split_first()?;
+        let iterations = end.saturating_sub(start);
         if iterations > self.unroll_budget {
             return None;
         }
@@ -1363,6 +1337,47 @@ impl Forward {
 /// saturation's own memory/time cost grows with node count), which is worse
 /// than just not unrolling.
 const MAX_UNROLL_ITERATIONS: u64 = 256;
+
+/// A `for` loop with constant bounds, as `cps.rs` desugars it: `Fix { defs:
+/// [loop], body: App(loop, [start, carried...]) }`, the loop's body testing
+/// its counter against a constant `end` (`If { then: one iteration, then
+/// the loop again; else: what follows the loop }`). What
+/// `Forward::try_unroll_for_loop` unrolls, and what `is_transparent_chain`
+/// accepts inside a callee: one recognizer for both, so that a loop judged
+/// transparent is always one the walk then unrolls.
+struct UnrollableLoop<'a> {
+    loop_def: &'a CFunDef,
+    init_args: &'a [CVal],
+    start: u64,
+    end: u64,
+    then_branch: &'a CExpr,
+    else_branch: &'a CExpr,
+}
+
+fn recognize_unrollable_loop<'a>(defs: &'a [CFunDef], body: &'a CExpr) -> Option<UnrollableLoop<'a>> {
+    let [loop_def] = defs else { return None };
+    loop_def.carried_types.as_ref()?;
+    let CExpr::App { func: CVal::Label(call_label), args: init_args } = body else {
+        return None;
+    };
+    if call_label != &loop_def.name {
+        return None;
+    }
+    let &CVal::Int(start) = init_args.first()? else {
+        return None;
+    };
+    let CExpr::Fix { defs: cond_defs, body: cond_body } = &loop_def.body else {
+        return None;
+    };
+    let (_, _, cmp_args, if_expr) = recognize_real_call(cond_defs, cond_body)?;
+    let [_, CVal::Int(end)] = cmp_args else {
+        return None;
+    };
+    let CExpr::If { then_branch, else_branch, .. } = if_expr else {
+        return None;
+    };
+    Some(UnrollableLoop { loop_def, init_args, start, end: *end, then_branch, else_branch })
+}
 
 /// Recognizes `cps.rs::emit_call`'s own exact `UnitBody::Real` shape --
 /// `Fix{defs: [k], body: App{func: Label(unit_name), args}}` where `k`'s
@@ -4298,6 +4313,12 @@ fn is_grad_supported_ty(ty: &Ty, struct_schemas: &HashMap<String, StructSchema>)
                 .is_some_and(|(elem, _)| matches!(&elem, Ty::Con(n) if is_scalar_width(n)));
         }
     }
+    // An array of supported elements, one dimension, its length a constant
+    // (`layers: [Layer; LAYERS]`): its elements read at constant indices,
+    // once loops unroll, are projections like fields (`backward_walk`).
+    if let Some((elem, _)) = array_elem_and_len(ty) {
+        return !matches!(elem, Ty::Array(..)) && is_grad_supported_ty(elem, struct_schemas);
+    }
     let struct_name = match ty {
         Ty::Con(name) => name.as_str(),
         Ty::App(name, _) => name.as_str(),
@@ -4313,6 +4334,15 @@ fn is_grad_supported_ty(ty: &Ty, struct_schemas: &HashMap<String, StructSchema>)
     struct_field_types(struct_schemas, struct_name, &type_args)
         .iter()
         .all(|(_, field_ty)| is_grad_supported_ty(field_ty, struct_schemas))
+}
+
+/// An array type's element type and constant length (`[T; N]`, `N` folded).
+fn array_elem_and_len(ty: &Ty) -> Option<(&Ty, u64)> {
+    let Ty::Array(elem, len) = ty else { return None };
+    match len.as_ref() {
+        Ty::Const(crate::infer::ConstValue::Int(n)) => Some((elem.as_ref(), *n as u64)),
+        _ => None,
+    }
 }
 
 /// `gw = grad(f, param);` (`req.is_grad`) — Phase 3's own real reverse-mode
@@ -4357,12 +4387,32 @@ fn synthesize_one_gradient(
         .zip(of_unit.param_types.iter().cloned())
         .collect();
     let boundary = fwd.walk(&of_unit.def.body, units, fresh);
+    // Where the walk stopped, for the error: a call it couldn't see through,
+    // named, or the function's own control flow.
+    let stopped_at = match &boundary {
+        CExpr::Fix { defs, body } => recognize_real_call(defs, body)
+            .map(|(_, unit, _, _)| format!("the call to `{unit}` can't be seen through (a branch, or a loop that doesn't unroll, in its body)")),
+        _ => None,
+    }
+    .unwrap_or_else(|| {
+        "unsupported control flow, e.g. a loop that could not be unrolled, or a branch".to_string()
+    });
     let unrepresentable = || {
         format!(
-            "cannot compute grad(`{}`): function body is not fully representable (unsupported control flow, e.g. a loop that could not be unrolled, or a branch)",
+            "cannot compute grad(`{}`): function body is not fully representable ({stopped_at})",
             req.name
         )
     };
+    // The walk must have reached the function's return (`k_ret(result)`):
+    // stopped earlier, at a call it couldn't see through, the one variable
+    // the stopping point reads isn't the function's result, and taking it
+    // for the result built a gradient from what came before the call (an
+    // integer where a struct was due, crashing MLIR lowering).
+    let k_ret = of_unit.def.params.last().copied();
+    let returns = matches!(&boundary, CExpr::App { func: CVal::Var(f), args } if Some(*f) == k_ret && args.len() == 1);
+    if !returns {
+        return Err(unrepresentable());
+    }
     let Some(root_var) = segment_root_var(&boundary, &fwd.env) else {
         return Err(unrepresentable());
     };
@@ -4443,8 +4493,10 @@ fn synthesize_one_gradient(
         seed,
         &fwd.reached,
         &fwd.field_ops,
+        &fwd.load_ops,
         struct_schemas,
         &mut fwd.struct_ops,
+        &mut fwd.array_ops,
         unit_names,
         &zero_calls_used,
         &known_types,
@@ -4599,8 +4651,10 @@ fn backward_walk(
     seed: egg::Id,
     reached: &HashMap<String, (String, String)>,
     field_ops: &HashMap<Symbol, (Ty, String, Ty)>,
+    load_ops: &HashMap<Symbol, (Ty, Ty)>,
     struct_schemas: &HashMap<String, StructSchema>,
     struct_ops: &mut HashMap<Symbol, (String, Vec<String>, Ty)>,
+    array_ops: &mut HashMap<Symbol, Ty>,
     unit_names: &HashSet<String>,
     zero_calls_used: &std::sync::Mutex<HashSet<String>>,
     known_types: &HashMap<egg::Id, Ty>,
@@ -4620,26 +4674,46 @@ fn backward_walk(
             .map(|(_, f)| f.clone())
             .collect();
         if !own_fields.is_empty() {
+            // A parameter's declared type, or what the op reading it says:
+            // a field's type, or an array element's.
             let ty = known_types.get(&id).cloned().or_else(|| {
-                defs.get(&id)
-                    .and_then(|(name, _)| field_ops.get(name))
+                let (name, _) = defs.get(&id)?;
+                field_ops
+                    .get(name)
                     .map(|(_, _, field_ty)| field_ty.clone())
+                    .or_else(|| load_ops.get(name).map(|(_, elem_ty)| elem_ty.clone()))
             });
             let Some(ty) = ty else {
                 return Err(format!(
-                    "internal error: a struct-typed value (e-class {id:?}) has field contributions but its own type is unknown"
+                    "internal error: a struct-typed value (e-class {id:?}, defined by {:?}) has field contributions but its own type is unknown",
+                    defs.get(&id).map(|(name, _)| name.to_string())
                 ));
             };
-            let synthesized = synthesize_struct_adjoint(
-                egraph,
-                id,
-                &ty,
-                &field_contributions,
-                unit_names,
-                zero_calls_used,
-                struct_ops,
-                struct_schemas,
-            )?;
+            let synthesized = if array_elem_and_len(&ty).is_some() {
+                synthesize_array_adjoint(
+                    egraph,
+                    id,
+                    &ty,
+                    &field_contributions,
+                    unit_names,
+                    zero_calls_used,
+                    struct_ops,
+                    array_ops,
+                    struct_schemas,
+                )?
+            } else {
+                synthesize_struct_adjoint(
+                    egraph,
+                    id,
+                    &ty,
+                    &field_contributions,
+                    unit_names,
+                    zero_calls_used,
+                    struct_ops,
+                    array_ops,
+                    struct_schemas,
+                )?
+            };
             adjoints.insert(id, synthesized);
         }
 
@@ -4679,6 +4753,34 @@ fn backward_walk(
                 referenced,
             );
             continue;
+        }
+
+        // An element read of an array (`layers[i]`, a loop over the layers
+        // unrolled): at a constant index, a projection like a field read,
+        // its adjoint accumulated as the array's `[k]` part, the array's own
+        // adjoint built from its parts (`synthesize_array_adjoint`). A
+        // dynamic index has no such part to accumulate into.
+        if let Some((array_ty, elem_ty)) = load_ops.get(&name) {
+            if array_elem_and_len(array_ty).is_some() {
+                let [base, index] = children.as_slice() else {
+                    return Err(format!("internal error: array read `{name_str}` isn't `[array, index]`"));
+                };
+                let Some(k) = egraph[*index].data.const_int else {
+                    return Err(format!(
+                        "differentiating through a read of `{array_ty}` at an index known only at run time isn't supported yet (a loop over the array whose bounds are constants unrolls, and its reads have constant indices)"
+                    ));
+                };
+                accumulate_field_contribution(
+                    &mut field_contributions,
+                    egraph,
+                    *base,
+                    format!("[{k}]"),
+                    u,
+                    &elem_ty.to_string(),
+                    referenced,
+                );
+                continue;
+            }
         }
 
         let Some((algebra, method)) = reached.get(name_str) else {
@@ -4797,6 +4899,7 @@ fn synthesize_struct_adjoint(
     unit_names: &HashSet<String>,
     zero_calls_used: &std::sync::Mutex<HashSet<String>>,
     struct_ops: &mut HashMap<Symbol, (String, Vec<String>, Ty)>,
+    array_ops: &mut HashMap<Symbol, Ty>,
     struct_schemas: &HashMap<String, StructSchema>,
 ) -> Result<egg::Id, String> {
     let struct_name = match ty {
@@ -4822,6 +4925,7 @@ fn synthesize_struct_adjoint(
                 unit_names,
                 zero_calls_used,
                 struct_ops,
+                array_ops,
                 struct_schemas,
             )
             .ok_or_else(|| {
@@ -4845,6 +4949,52 @@ fn synthesize_struct_adjoint(
     Ok(egraph.add(CleaveLang::Op(sym, field_ids)))
 }
 
+/// An array-typed value's adjoint, built from its elements' (`[k]`, keyed in
+/// `field_contributions` by the element reads at constant indices,
+/// `backward_walk`): `synthesize_struct_adjoint`'s counterpart, an element
+/// never read getting a zero of its type, the array rebuilt the way a
+/// literal is (`array:{ty}:{N}`, `Forward::walk`'s `PrimOp::Array`).
+#[allow(clippy::too_many_arguments)]
+fn synthesize_array_adjoint(
+    egraph: &mut egg::EGraph<CleaveLang, ConstantFold>,
+    id: egg::Id,
+    ty: &Ty,
+    field_contributions: &HashMap<(egg::Id, String), egg::Id>,
+    unit_names: &HashSet<String>,
+    zero_calls_used: &std::sync::Mutex<HashSet<String>>,
+    struct_ops: &mut HashMap<Symbol, (String, Vec<String>, Ty)>,
+    array_ops: &mut HashMap<Symbol, Ty>,
+    struct_schemas: &HashMap<String, StructSchema>,
+) -> Result<egg::Id, String> {
+    let Some((elem, len)) = array_elem_and_len(ty) else {
+        return Err(format!("cannot compute grad(...): `{ty}` isn't an array of constant length"));
+    };
+    let mut elems = Vec::with_capacity(len as usize);
+    for k in 0..len {
+        let elem_id = match field_contributions.get(&(id, format!("[{k}]"))) {
+            Some(&existing) => existing,
+            None => build_zero_recursive(egraph, elem, unit_names, zero_calls_used, struct_ops, array_ops, struct_schemas)
+                .ok_or_else(|| format!("cannot compute grad(...): no zero value for an element of `{ty}`"))?,
+        };
+        elems.push(elem_id);
+    }
+    Ok(add_array_construction(egraph, ty, elems, array_ops))
+}
+
+/// `array:{ty}:{N}` over `elems`, registered for `rebuild` as `Forward::walk`
+/// registers a literal's.
+fn add_array_construction(
+    egraph: &mut egg::EGraph<CleaveLang, ConstantFold>,
+    ty: &Ty,
+    elems: Vec<egg::Id>,
+    array_ops: &mut HashMap<Symbol, Ty>,
+) -> egg::Id {
+    let sym = Symbol::from(format!("array:{ty}:{}", elems.len()));
+    array_ops.entry(sym).or_insert_with(|| ty.clone());
+    egraph.analysis.known_types.entry(sym).or_insert_with(|| ty.clone());
+    egraph.add(CleaveLang::Op(sym, elems))
+}
+
 /// `build_zero`'s own recursive counterpart — a real `Additive::zero<ty>()`
 /// call when one exists, otherwise (a struct type with no `Ring` impl of
 /// its own — `Dense`/`Network`, exactly the shape a real gradient's own
@@ -4856,10 +5006,27 @@ fn build_zero_recursive(
     unit_names: &HashSet<String>,
     zero_calls_used: &std::sync::Mutex<HashSet<String>>,
     struct_ops: &mut HashMap<Symbol, (String, Vec<String>, Ty)>,
+    array_ops: &mut HashMap<Symbol, Ty>,
     struct_schemas: &HashMap<String, StructSchema>,
 ) -> Option<egg::Id> {
     if let Some(id) = build_zero(egraph, ty, unit_names, zero_calls_used) {
         return Some(id);
+    }
+    // An array of zeros, element by element.
+    if let Some((elem, len)) = array_elem_and_len(ty) {
+        let mut elems = Vec::with_capacity(len as usize);
+        for _ in 0..len {
+            elems.push(build_zero_recursive(
+                egraph,
+                elem,
+                unit_names,
+                zero_calls_used,
+                struct_ops,
+                array_ops,
+                struct_schemas,
+            )?);
+        }
+        return Some(add_array_construction(egraph, ty, elems, array_ops));
     }
     let struct_name = match ty {
         Ty::Con(name) => name.clone(),
@@ -4882,6 +5049,7 @@ fn build_zero_recursive(
             unit_names,
             zero_calls_used,
             struct_ops,
+            array_ops,
             struct_schemas,
         )?);
     }
@@ -8173,8 +8341,10 @@ mod tests {
             seed,
             &fwd.reached,
             &fwd.field_ops,
+            &fwd.load_ops,
             &empty_struct_schemas,
             &mut fwd.struct_ops,
+            &mut fwd.array_ops,
             &empty_unit_names,
             &zero_calls_used,
             &empty_known_types,
