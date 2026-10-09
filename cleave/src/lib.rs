@@ -1,4 +1,5 @@
 pub mod collections;
+pub mod toolchain;
 pub mod ast;
 pub mod callgraph;
 pub mod const_eval;

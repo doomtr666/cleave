@@ -32,9 +32,9 @@
 use cleave::driver::compile;
 use cleave::pipeline::CodegenOptions;
 use cleave::registry::Registry;
-use cleave_mlir_shim::mlir::Context;
-use cleave_mlir_shim::mlir::dialect::DialectRegistry;
-use cleave_mlir_shim::mlir::utility::register_all_dialects;
+use cleave_mlir::Context;
+use cleave_mlir::dialect::DialectRegistry;
+use cleave_mlir::utility::register_all_dialects;
 
 fn context() -> Context {
     let dialect_registry = DialectRegistry::new();

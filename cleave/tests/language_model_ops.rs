@@ -364,7 +364,7 @@ stderr: {stderr}");
 /// LLVM's translation and crash it without a word. A second
 /// `--convert-vector-to-scf` now lowers them, and only when such a transfer
 /// exists, since it would otherwise turn every vector transfer into a scalar
-/// loop (`cleave-lower-permuted-transfers`, `cleave-mlir-shim`).
+/// loop (`cleave-lower-permuted-transfers`, `cleave-mlir`).
 #[test]
 fn a_matmul_with_a_transposed_operand_compiles_without_inlining() {
     let dir = std::env::temp_dir().join("cleave-language-model-ops");
@@ -561,7 +561,7 @@ fn no_inline_applies_to_the_declaring_method_only() {
 /// arithmetic, not intrinsics: LLVM has no vector math library here and
 /// scalarized each `llvm.intr.tanh` on a vector into one libm `tanhf` call
 /// per element — 26% of a nanoLM training step, the GELUs.
-/// `pipeline.rs`, `cleave_mlir_shim::approximate_math`.
+/// `pipeline.rs`, `cleave_mlir::approximate_math`.
 #[test]
 fn transcendentals_on_tensors_are_not_libm_calls() {
     let dir = std::env::temp_dir().join("cleave-language-model-ops");
@@ -1207,7 +1207,7 @@ fn a_large_light_struct_crosses_a_call_by_pointer() {
 
 /// Every call passing a large light struct by pointer has its own argument
 /// slot (`mlir_lower.rs::entry_alloca`), in its function's entry block.
-/// Without `cleave_mlir_shim::hoist_arg_slots`, an inlined call's slots land
+/// Without `cleave_mlir::hoist_arg_slots`, an inlined call's slots land
 /// wherever the call was (inlining `relay` into `main`'s loop: a dynamic
 /// allocation per iteration), and all of a function's slots add up in its
 /// frame: nanoLM v2's `train_gpt` reached 1.4 MB, past the main thread's
@@ -1626,7 +1626,7 @@ fn sgemm_reads_and_writes_slices_in_place() {
         );
     }
     // The loop builds `out` in the caller's buffer
-    // (`cleave_mlir_shim::forward_copies_to_destinations`): the one copy left
+    // (`cleave_mlir::forward_copies_to_destinations`): the one copy left
     // is `zero()`'s, its initialization.
     assert_eq!(heads.matches("memref.copy").count(), 1, "`out` is copied:\n{heads}");
 }
@@ -1655,7 +1655,7 @@ fn a_block_read_by_its_own_write_is_still_copied() {
 /// lowered to 0): the activation is tiled by rows with the product fused in,
 /// each tile's bias broadcast and `sgemm` (accumulating into it, `beta = 1`)
 /// done in a scratch tile the activation then reads while it is in cache
-/// (`cleave_mlir_shim::blas_tile_and_fuse`, `lower_blas_matmuls`). The values
+/// (`cleave_mlir::blas_tile_and_fuse`, `lower_blas_matmuls`). The values
 /// are the `linalg` tier's, up to the order of the sums; the only buffer the
 /// product's size is the result.
 #[test]
@@ -1719,7 +1719,7 @@ fn a_blas_product_is_computed_tile_by_tile_with_its_consumer() {
 /// Three dense layers on the BLAS tier in one function: each product is
 /// computed by a tile loop carrying its output buffer, and each layer's
 /// result is freed once the next has read it, not at the function's end
-/// (`cleave_mlir_shim::fold_passthrough_iter_args`: the loop's result is
+/// (`cleave_mlir::fold_passthrough_iter_args`: the loop's result is
 /// the buffer it was given, so the deallocation's alias analysis frees each
 /// buffer on its own instead of all together after a run-time alias check;
 /// `dealloc_at_last_use` then frees each right after its last use).
@@ -1832,7 +1832,7 @@ fn an_elementwise_op_of_two_blas_products_fuses_both() {
 
 /// An elementwise op whose operand is a tensor computed just for it (a
 /// call's result, not fused into the op) writes its result into that
-/// operand's buffer instead of a new one (`cleave_mlir_shim::
+/// operand's buffer instead of a new one (`cleave_mlir::
 /// reuse_dying_inputs`); an operand read again afterwards is left alone.
 #[test]
 fn an_elementwise_op_writes_into_an_operand_that_dies_there() {
@@ -1892,7 +1892,7 @@ fn an_elementwise_op_writes_into_an_operand_that_dies_there() {
 /// function, whose parameter has the plain layout: One-Shot Bufferize copies
 /// it into a fresh buffer of the plain layout; the copy's destination becomes
 /// the product's own buffer, of that same type
-/// (`cleave_mlir_shim::forward_copies_to_destinations`): no copy.
+/// (`cleave_mlir::forward_copies_to_destinations`): no copy.
 #[test]
 fn a_blas_product_passed_to_a_function_is_not_copied() {
     let dir = std::env::temp_dir().join("cleave-language-model-ops");

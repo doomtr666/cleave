@@ -9,9 +9,9 @@ use cleave::pipeline::{
     CodegenOptions, check_type_errors, lower_to_llvm, strip_ciface_wrapper_debug_info,
 };
 use cleave::registry::Registry;
-use cleave_mlir_shim::mlir::Context;
-use cleave_mlir_shim::mlir::dialect::DialectRegistry;
-use cleave_mlir_shim::mlir::utility::register_all_dialects;
+use cleave_mlir::Context;
+use cleave_mlir::dialect::DialectRegistry;
+use cleave_mlir::utility::register_all_dialects;
 
 fn context() -> Context {
     let dialect_registry = DialectRegistry::new();
@@ -38,7 +38,7 @@ fn context() -> Context {
 /// itself actually uses. A single shared helper here, instead of hand-
 /// listing the same ~30 symbols at each of this file's own several
 /// `ExecutionEngine::new` call sites, keeps them from drifting out of sync.
-fn register_io_symbols(engine: &cleave_mlir_shim::ExecutionEngine) {
+fn register_io_symbols(engine: &cleave_mlir::ExecutionEngine) {
     unsafe {
         engine.register_symbol("print_i8", cleave_rt::print_i8 as *mut ());
         engine.register_symbol("print_i16", cleave_rt::print_i16 as *mut ());
@@ -183,7 +183,7 @@ fn a_compiled_program_actually_runs_and_returns_the_right_value() {
     // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
     // their engines don't load libomp: `spawn`'s markers removed, spawned
     // calls run in place (serial elision).
-    unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
+    unsafe { cleave_mlir::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
         .expect("cleave-lower-spawns");
     assert!(module.as_operation().verify());
 
@@ -346,7 +346,7 @@ fn lowered_llvm_text(context: &Context, src: &str) -> String {
     // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
     // their engines don't load libomp: `spawn`'s markers removed, spawned
     // calls run in place (serial elision).
-    unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
+    unsafe { cleave_mlir::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
         .expect("cleave-lower-spawns");
     assert!(
         module.as_operation().verify(),
@@ -443,7 +443,7 @@ fn optimized_lowered_llvm_text_for_tensors(context: &Context, src: &str) -> Stri
     // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
     // their engines don't load libomp: `spawn`'s markers removed, spawned
     // calls run in place (serial elision).
-    unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
+    unsafe { cleave_mlir::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
         .expect("cleave-lower-spawns");
     assert!(
         module.as_operation().verify(),
@@ -479,23 +479,16 @@ fn run_i32_from_cps(
     // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
     // their engines don't load libomp: `spawn`'s markers removed, spawned
     // calls run in place (serial elision).
-    unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
+    unsafe { cleave_mlir::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
         .expect("cleave-lower-spawns");
     assert!(
         module.as_operation().verify(),
         "generated MLIR module failed verification"
     );
 
-    // Staged as three *separate* `PassManager`s, each run to completion
-    // before the next is even built — found by direct testing to matter,
-    // not just tidier: the identical passes combined into one single
-    // `PassManager`/one `run()` call failed partway (`op was not
-    // bufferized`) even though every individual stage, run to completion
-    // first, succeeds cleanly. Not fully root-caused beyond that (melior's
-    // own pass-manager nesting/ordering semantics across `add_pass` and a
-    // `parse_pass_pipeline`-populated nested nest — see the bufferize stage
-    // below — most likely), but empirically robust, so kept as the working
-    // shape rather than chased further.
+    // Three separate pipelines, each run to completion before the next:
+    // combined into one, the same passes once failed partway (`op was not
+    // bufferized`). Not root-caused; kept as the shape that works.
     //
     // Stage 1: a bare `arith.addf` (etc.) on `tensor`-typed operands
     // (`Ring<Tensor<T,Dims...>>`'s own elementwise impls, `stdlib/linalg/
@@ -505,11 +498,7 @@ fn run_i32_from_cps(
     cleave::pipeline::run_passes(&mut module, "builtin.module(convert-elementwise-to-linalg)")
         .expect("convert-elementwise-to-linalg must succeed");
 
-    // Stage 2: `bufferize-function-boundaries=true` — melior's own
-    // generated `create_one_shot_bufferize_pass()` binding takes no
-    // options at all (the underlying C API constructor is zero-argument),
-    // so the option has to go in via a real textual pass-pipeline string
-    // instead (`cleave_mlir_shim::mlir::utility::parse_pass_pipeline`) — without it, a
+    // Stage 2: `bufferize-function-boundaries=true` — without it, a
     // `tensor`-typed function parameter/return (any cross-function call
     // involving a `Vector`/`Matrix`) is left bridged by a `bufferization.
     // to_buffer`/`to_tensor` pair at the function boundary that nothing
@@ -517,9 +506,7 @@ fn run_i32_from_cps(
     // 'bufferization.to_buffer'`, a real pass failure, found by direct
     // testing) — this option makes one-shot-bufferize rewrite the
     // function's own signature directly instead, eliminating the bridge
-    // entirely. The pass must be registered by name first — textual
-    // pipeline parsing looks it up by its own registered name, unlike
-    // `add_pass`, which already has the concrete `Pass` object in hand.
+    // entirely.
     cleave::pipeline::register_passes();
     cleave::pipeline::run_passes(&mut module, "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})")
         .expect("one-shot-bufferize must succeed");
@@ -712,7 +699,7 @@ fn a_direct_mlir_call_actually_computes_the_right_value() {
 
 /// The predicate attribute is the one genuinely non-uniform case (`arith.
 /// cmpi`/`cmpf` need a static attribute beyond bare operands) -- confirmed
-/// directly against real melior/MLIR behavior before committing `stdlib/
+/// directly against MLIR's behavior before committing `stdlib/
 /// num`'s own 36 bodies to it (see `stdlib/num/num.cleave`'s own comment on
 /// this): the predicate is the *raw integer* ordinal (`"2 : i64"` for
 /// `slt`), not the symbolic name (`Attribute::parse` rejects a bare `"slt"`
@@ -842,7 +829,7 @@ fn an_extern_fn_call_actually_executes_through_a_registered_symbol() {
     // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
     // their engines don't load libomp: `spawn`'s markers removed, spawned
     // calls run in place (serial elision).
-    unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
+    unsafe { cleave_mlir::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
         .expect("cleave-lower-spawns");
     assert!(module.as_operation().verify());
 
@@ -999,7 +986,7 @@ fn an_extern_impl_method_actually_executes_the_right_symbol_at_each_call_site() 
     // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
     // their engines don't load libomp: `spawn`'s markers removed, spawned
     // calls run in place (serial elision).
-    unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
+    unsafe { cleave_mlir::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
         .expect("cleave-lower-spawns");
     assert!(module.as_operation().verify());
 
@@ -1095,7 +1082,7 @@ fn an_array_argument_crosses_an_extern_call_boundary_correctly() {
     // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
     // their engines don't load libomp: `spawn`'s markers removed, spawned
     // calls run in place (serial elision).
-    unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
+    unsafe { cleave_mlir::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
         .expect("cleave-lower-spawns");
     assert!(module.as_operation().verify());
 
@@ -1180,7 +1167,7 @@ fn a_unit_returning_extern_fn_can_be_called_correctly() {
     // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
     // their engines don't load libomp: `spawn`'s markers removed, spawned
     // calls run in place (serial elision).
-    unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
+    unsafe { cleave_mlir::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
         .expect("cleave-lower-spawns");
     assert!(module.as_operation().verify());
     let text = module.as_operation().to_string();
@@ -1279,7 +1266,7 @@ fn a_string_literal_printed_via_print_writes_the_right_bytes_to_stdout() {
     // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
     // their engines don't load libomp: `spawn`'s markers removed, spawned
     // calls run in place (serial elision).
-    unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
+    unsafe { cleave_mlir::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
         .expect("cleave-lower-spawns");
     assert!(module.as_operation().verify());
     let text = module.as_operation().to_string();
@@ -3415,7 +3402,7 @@ fn print_of_an_unannotated_index_result_no_longer_panics() {
     // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
     // their engines don't load libomp: `spawn`'s markers removed, spawned
     // calls run in place (serial elision).
-    unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
+    unsafe { cleave_mlir::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
         .expect("cleave-lower-spawns");
     assert!(
         module.as_operation().verify(),
@@ -3504,7 +3491,7 @@ fn print_of_an_unannotated_matmul_index_result_no_longer_panics() {
     // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
     // their engines don't load libomp: `spawn`'s markers removed, spawned
     // calls run in place (serial elision).
-    unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
+    unsafe { cleave_mlir::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
         .expect("cleave-lower-spawns");
     assert!(
         module.as_operation().verify(),
@@ -6135,7 +6122,7 @@ fn run_i32_with_dynarray_symbols(
     // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
     // their engines don't load libomp: `spawn`'s markers removed, spawned
     // calls run in place (serial elision).
-    unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
+    unsafe { cleave_mlir::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
         .expect("cleave-lower-spawns");
     assert!(
         module.as_operation().verify(),

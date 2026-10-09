@@ -51,9 +51,9 @@ fixed opportunistically along the way rather than as a gate.
    experiments; move finished entries out of `doc/backlog.md`; keep the user guide in sync with the
    language.
 5. **A standalone, easy-to-use package.**
-   - cleave talks to MLIR only through its own C API, implemented by its C++ shim, built with cleave
-     against the prebuilt LLVM/MLIR: no `melior`, `mlir-sys`, `tblgen`, libclang or forks to build
-     cleave ([`plan-mlir-shim.md`](plan-mlir-shim.md)). The two points below rest on it.
+   - Done: cleave talks to MLIR only through its own C API (`cleave-mlir`, its C++ shim built with
+     cleave against the prebuilt LLVM/MLIR; [`plan-mlir-shim.md`](plan-mlir-shim.md)). The two
+     points below rest on it.
    - The `cleave` compiler ships as a prebuilt binary per platform (GitHub releases): the standalone
      tool, usable on its own.
    - Using cleave from Rust feels like using any crate (the experience `pest` gives): add `cleave-build`
@@ -61,11 +61,14 @@ fixed opportunistically along the way rather than as a gate.
      the matching prebuilt compiler instead of compiling LLVM/MLIR-linked code inside every user
      project, with an override for working on cleave itself. The executable it produces finds its
      runtime libraries (OpenMP, OpenBLAS) without manual setup.
-6. **Linux support**, alongside Windows. Mostly CI: prebuilt LLVM/MLIR and OpenBLAS for Linux (the
-   OpenBLAS one may already exist), then the few Windows-specific spots (OpenBLAS loading in
-   `cleave-rt`, MSVC flags in `cleave-mlir-shim/build.rs`, linking in `cleave-build`, the PowerShell
-   setup scripts). Local testing through WSL2, which runs on the same CPU, so performance numbers stay
-   comparable.
+6. **Linux support**, alongside Windows. The code is ready for it: the shim's build uses each
+   compiler's spelling of its flags and links LLVM/MLIR by `llvm-config`, the OpenMP runtime's
+   name and place come from one module (`cleave::toolchain`), OpenBLAS is loaded with `dlopen` off
+   Windows, debug info is DWARF there (CodeView on Windows only), and executables find `libomp`
+   through an rpath. Left: a prebuilt LLVM/MLIR and OpenBLAS for Linux (a CI leg of
+   `cleave-llvm-redist`), the setup scripts (PowerShell today; `pwsh` runs on Linux, or a shell
+   twin), a Linux CI job, and running the test suite there. Local testing through WSL2, which runs
+   on the same CPU, so performance numbers stay comparable.
 7. **The showcase**: nanoLM at least; cleave-cast if it's ready.
 
 ## Not required for v0.1

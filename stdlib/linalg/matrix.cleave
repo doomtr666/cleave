@@ -47,8 +47,8 @@ algebra MatMul<A, B, C> {
     // with an ordinary contiguous load instead (`mlir_lower.rs::build_
     // matmul_transpose_no_seed`'s own doc comment has the full derivation,
     // including the real, confirmed `linalg.transpose` gather/scatter cost
-    // this specifically avoids, and the melior Properties-API gap this had
-    // to work around to build correctly — `doc/backlog.md`).
+    // this specifically avoids, and why the op is built from its textual
+    // form: `indexing_maps` is a property MLIR's C API can't set).
     adjoint matmul(a, b), u: (matmul_transpose_b(u, b), matmul_transpose_a(a, u));
 
     // A user (or a later-derived expression) writing a transpose directly
@@ -199,7 +199,7 @@ algebra MatMulTransposeB<A, B, C> {
 // bufferization. Its elementwise consumer, if it has a single one (a bias, an
 // activation, a residual), is then tiled by rows with the product fused in,
 // each tile computed by `sgemm` and consumed while in cache
-// (`cleave_mlir_shim::blas_tile_and_fuse`), and every marked product becomes
+// (`cleave_mlir::blas_tile_and_fuse`), and every marked product becomes
 // a `sgemm` call (`lower_blas_matmuls`).
 // Overridable from a `build.rs` like any `define`. Was 100M, tuned on MNIST
 // alone: nanoLM's data-parallel micro-batches (512 rows) put its 512x256x256
@@ -450,7 +450,7 @@ impl<T: Float, const N: i32, const M: i32, const K: i32>
         // Above `BLAS_MIN_WORK`, the BLAS tier (`blas: "unit"`), as `Fma` and
         // the transposed products: for `f32`, where `sgemm` applies; any
         // other element type stays on the `linalg` schedule
-        // (`cleave_mlir_shim::lower_blas_matmuls` leaves it alone).
+        // (`cleave_mlir::lower_blas_matmuls` leaves it alone).
         let nmk: i32 = N * M * K;
         if nmk > BLAS_MIN_WORK {
             mlir::linalg::matmul(a, b, blas: "unit")

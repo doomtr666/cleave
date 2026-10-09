@@ -1,5 +1,5 @@
 //! Lowers a CPS-form program (`cps::CpsProgram`) into MLIR, through cleave's
-//! MLIR API (`cleave_mlir_shim::mlir`).
+//! MLIR API (`cleave_mlir::mlir`).
 //!
 //! Handles, so far: a top-level function's `return`, straight-line `LetPrim`
 //! chains (`extern` calls, reserved `mlir::dialect::op(...)` calls — see
@@ -22,7 +22,7 @@
 //! from operations: `ty_to_mlir` looks a cleave type name up in a map built
 //! from every `#[mlir_type("...")]`-tagged algebra `impl`
 //! (`cps::collect_mlir_types`), parsing the declared MLIR type text via
-//! `cleave_mlir_shim::mlir::ir::Type::parse` — no per-type-name Rust match left, beyond
+//! `cleave_mlir::ir::Type::parse` — no per-type-name Rust match left, beyond
 //! `bool`, which stays a genuine special case (matching `infer.rs`'s own
 //! hardcoded `Ty::Con("bool")` for `if`/`while` conditions — the *only*
 //! other structurally-special type name left anywhere in this compiler).
@@ -40,7 +40,7 @@ use crate::cps::{
     CExpr, CFunDef, CTopLevelFn, CVal, CVar, CpsProgram, PrimOp, SrcLoc, StructSchema,
 };
 use crate::infer::{ConstValue, Ty};
-use cleave_mlir_shim::mlir::{
+use cleave_mlir::{
     Context,
     dialect::{
         arith, func,
@@ -57,7 +57,7 @@ use cleave_mlir_shim::mlir::{
         r#type::{DimSize, FunctionType, IntegerType, MemRefType, RankedTensorType},
     },
 };
-use cleave_mlir_shim::mlir::StringRef;
+use cleave_mlir::StringRef;
 use std::cell::RefCell;
 use crate::collections::{HashMap, HashSet};
 
@@ -85,7 +85,7 @@ struct LowerCtx<'c, 'm> {
     /// The entry block of the function being lowered, where a by-pointer
     /// argument's slot is allocated (`call_arguments`): once per call site,
     /// not once per loop iteration.
-    entry_block: std::cell::Cell<Option<cleave_mlir_shim::mlir::sys::MlirBlock>>,
+    entry_block: std::cell::Cell<Option<cleave_mlir::sys::MlirBlock>>,
     /// The memory a large light struct value of the function being lowered
     /// already lives in (`homes_in`): a parameter received by pointer, and
     /// the light struct fields read out of one (a `getelementptr` into the
@@ -98,7 +98,7 @@ struct LowerCtx<'c, 'm> {
     /// instructions to 181,682 in `opt -O2`.
     /// `true` for a home in a slot of this frame (a result returned by
     /// pointer, `by_pointer_returns`): its lifetime is bounded by its
-    /// visible uses (`cleave_mlir_shim::hoist_arg_slots`), too soon for a
+    /// visible uses (`cleave_mlir::hoist_arg_slots`), too soon for a
     /// spawned task reading it until the `sync`, so a spawned call copies
     /// such a value instead (`call_arguments`).
     homes: RefCell<HashMap<CVar, (Value<'c, 'c>, bool)>>,
@@ -109,7 +109,7 @@ struct LowerCtx<'c, 'm> {
     /// `LowerCtx` exists (`is_large_light_struct` needs it).
     by_pointer_returns: RefCell<HashSet<String>>,
     /// The current function's result pointer, when it returns by pointer.
-    result_out: std::cell::Cell<Option<cleave_mlir_shim::mlir::sys::MlirValue>>,
+    result_out: std::cell::Cell<Option<cleave_mlir::sys::MlirValue>>,
     declared_externs: RefCell<HashSet<String>>,
     signatures: HashMap<String, (Vec<Ty>, Ty)>,
     /// Cleave type name -> MLIR type text, from every `#[mlir_type(...)]`-
@@ -299,7 +299,7 @@ fn resolve_file(file: u32) -> String {
 
 thread_local! {
     /// The current function's own `#llvm.di_subprogram` attribute, as a raw
-    /// `cleave_mlir_shim::mlir::sys::MlirAttribute` pointer value (its `.ptr` field, cast to
+    /// `cleave_mlir::sys::MlirAttribute` pointer value (its `.ptr` field, cast to
     /// `usize`) -- an `Attribute<'c>` itself can't live in a `static` (it
     /// isn't `Send`, and its lifetime is tied to `Context`, not `'static`),
     /// but the pointer it wraps is a plain FFI handle: sound to stash for
@@ -345,7 +345,7 @@ fn gen_loc(context: &Context) -> Location<'_> {
             // immediately before this function's body starts lowering and
             // never read past the end of that same `lower_program` call --
             // the context, and the attribute it owns, are still alive.
-            let raw = cleave_mlir_shim::mlir::sys::MlirAttribute {
+            let raw = cleave_mlir::sys::MlirAttribute {
                 ptr: ptr as *const std::ffi::c_void,
             };
             let sp = unsafe { Attribute::from_raw(raw) };
@@ -364,9 +364,10 @@ fn gen_loc(context: &Context) -> Location<'_> {
 /// attaches entry `i` to `llvm.func` `i` via a `FusedLoc`, *after* all
 /// LLVM lowering (the `func.func` -> `llvm.func` conversion drops a
 /// fused-loc-with-metadata attached earlier). This is the one thing MLIR's
-/// own `EnsureDebugInfoScopeOnLLVMFunc` pass does -- that pass segfaults
-/// from this statically-linked `mlir-sys` build, and no C-API DI-attr
-/// builder is exposed either, so it is reimplemented here from text.
+/// own `EnsureDebugInfoScopeOnLLVMFunc` pass does -- that pass segfaulted
+/// when tried (not retried since cleave runs passes through its shim), and
+/// MLIR's C API has no debug-info attribute builder, so it is built here
+/// from text.
 pub(crate) fn build_di_subprograms<'c>(
     context: &'c Context,
     funcs: &[(String, SrcLoc)],
@@ -413,9 +414,9 @@ pub(crate) fn build_di_subprograms<'c>(
     // Its elements through the C API (`sys`).
     unsafe {
         let raw = attr.to_raw();
-        let n = cleave_mlir_shim::mlir::sys::mlirArrayAttrGetNumElements(raw);
+        let n = cleave_mlir::sys::mlirArrayAttrGetNumElements(raw);
         (0..n)
-            .map(|i| Attribute::from_raw(cleave_mlir_shim::mlir::sys::mlirArrayAttrGetElement(raw, i)))
+            .map(|i| Attribute::from_raw(cleave_mlir::sys::mlirArrayAttrGetElement(raw, i)))
             .collect()
     }
 }
@@ -1703,7 +1704,7 @@ fn by_pointer(ctx: &LowerCtx, callee: &str, ty: &Ty) -> bool {
 /// types): each lowered as usual, a by-pointer one (`by_pointer`) stored to
 /// a slot allocated in the caller's entry block and passed as the slot's
 /// address. An ordinary call's slot only lives around the call
-/// (`cleave_mlir_shim::hoist_arg_slots`); a `spawned` call's lives as long as
+/// (`cleave_mlir::hoist_arg_slots`); a `spawned` call's lives as long as
 /// the caller's frame, so its task (`lower_spawn`) finds it intact until the
 /// caller's `sync`.
 fn call_arguments<'c>(
@@ -1812,7 +1813,7 @@ fn entry_alloca<'c>(ctx: &LowerCtx<'c, '_>, ty: Type<'c>, spawned: bool) -> Valu
     // SAFETY: `raw` is the entry block of the function being lowered
     // (`lower_top_level_fn` sets it before lowering the body and clears it
     // after), alive for the whole lowering of that function.
-    let entry = unsafe { cleave_mlir_shim::mlir::ir::BlockRef::from_raw(raw) };
+    let entry = unsafe { cleave_mlir::ir::BlockRef::from_raw(raw) };
     let location = Location::unknown(context);
     let i64_ty: Type = IntegerType::new(context, 64).into();
     let one_op = entry.insert_operation(0, arith::constant(context, IntegerAttribute::new(i64_ty, 1).into(), location));
@@ -1825,7 +1826,7 @@ fn entry_alloca<'c>(ctx: &LowerCtx<'c, '_>, ty: Type<'c>, spawned: bool) -> Valu
         llvm::AllocaOptions::new().elem_type(Some(TypeAttribute::new(ty))),
     );
     // Moved back here if inlining carries it into a loop, and given a
-    // lifetime unless spawned (`cleave_mlir_shim::hoist_arg_slots`).
+    // lifetime unless spawned (`cleave_mlir::hoist_arg_slots`).
     let mark = if spawned { "cleave.spawn_arg_slot" } else { "cleave.arg_slot" };
     slot.set_discardable_attribute(mark, Attribute::unit(context));
     let alloca = entry.insert_operation_after(one_op, slot);
@@ -1950,16 +1951,16 @@ fn lower_top_level_fn<'c>(ctx: &LowerCtx<'c, '_>, f: &CTopLevelFn) -> Operation<
     // so none of them ever qualified. Every internal algebra-dispatch/
     // helper function is *never* called from outside this module (only
     // `main`/exports are), so `private` costs nothing real.
-    let mut attrs: Vec<(cleave_mlir_shim::mlir::ir::Identifier, cleave_mlir_shim::mlir::ir::Attribute)> = if f.def.name == "main" {
+    let mut attrs: Vec<(cleave_mlir::ir::Identifier, cleave_mlir::ir::Attribute)> = if f.def.name == "main" {
         vec![(
-            cleave_mlir_shim::mlir::ir::Identifier::new(context, "llvm.emit_c_interface"),
-            cleave_mlir_shim::mlir::ir::Attribute::unit(context),
+            cleave_mlir::ir::Identifier::new(context, "llvm.emit_c_interface"),
+            cleave_mlir::ir::Attribute::unit(context),
         )]
     } else if f.is_export {
         vec![]
     } else {
         vec![(
-            cleave_mlir_shim::mlir::ir::Identifier::new(context, "sym_visibility"),
+            cleave_mlir::ir::Identifier::new(context, "sym_visibility"),
             StringAttribute::new(context, "private").into(),
         )]
     };
@@ -1977,8 +1978,8 @@ fn lower_top_level_fn<'c>(ctx: &LowerCtx<'c, '_>, f: &CTopLevelFn) -> Operation<
     // behavior at all.
     if f.no_inline {
         attrs.push((
-            cleave_mlir_shim::mlir::ir::Identifier::new(context, "no_inline"),
-            cleave_mlir_shim::mlir::ir::Attribute::unit(context),
+            cleave_mlir::ir::Identifier::new(context, "no_inline"),
+            cleave_mlir::ir::Attribute::unit(context),
         ));
     }
     // An exported unit's real LLVM symbol is its `export_symbol` override
@@ -3002,7 +3003,7 @@ fn lower_prim_op<'c>(
         }
         // `bufferization.clone`, marked: MLIR's buffer deallocation takes
         // its result for a fresh, owned buffer and releases it, and
-        // `cleave_mlir_shim::lower_adoptions` then turns the clone into a
+        // `cleave_mlir::lower_adoptions` then turns the clone into a
         // retain of the same buffer, no copy (`PrimOp::Adopt`'s doc).
         PrimOp::Adopt(tensor_ty) => {
             let CVal::Var(tensor_var) = &args[0] else {
@@ -4140,7 +4141,7 @@ fn build_tensor_descriptor_value<'c>(
     // The value's own defining op, when it sits in this same block -- where
     // the destination chain must go (see the doc comment above). Built into
     // a detached staging block first, then moved there in one go.
-    let producer = cleave_mlir_shim::mlir::ir::operation::OperationResult::try_from(value)
+    let producer = cleave_mlir::ir::operation::OperationResult::try_from(value)
         .ok()
         .map(|r| r.owner())
         .filter(|op| op.block().is_some_and(|b| b.to_raw().ptr == block.to_raw().ptr))
@@ -4260,12 +4261,10 @@ fn build_tensor_descriptor_value<'c>(
 
     let block = block_ref;
     if let Some(producer) = producer {
+        // SAFETY: `producer` is the value's defining operation, in `block`.
+        let producer = unsafe { cleave_mlir::ir::OperationRef::from_raw(producer) };
         while let Some(op) = staging.first_operation() {
-            // `move_before` needs an `OperationRefMut`; both ref kinds wrap
-            // the identical `MlirOperation` (melior's own `walk_mut` widens
-            // the same way).
-            let op = unsafe { cleave_mlir_shim::mlir::ir::operation::OperationRefMut::from_raw(op.to_raw()) };
-            op.move_before(unsafe { cleave_mlir_shim::mlir::ir::operation::OperationRef::from_raw(producer) });
+            op.move_before(producer);
         }
     }
 
@@ -5489,17 +5488,15 @@ fn llvm_type_size_bytes<'c>(
 /// extraction needed for it at all, it already *is* the value this
 /// function exists to produce.
 ///
-/// The `memref` branch: MLIR's default `convert-to-llvm` conversion (the
-/// only pass this pipeline runs — melior's own binding exposes no options
-/// on it, no bare-pointer-calling-convention toggle available) turns a
+/// The `memref` branch: MLIR's `convert-to-llvm` conversion, run with its
+/// defaults (no bare-pointer calling convention), turns a
 /// `memref` crossing any `func.call`/`llvm.call` boundary into a
 /// descriptor *struct* (`{allocatedPtr, alignedPtr, offset, sizes[],
 /// strides[]}`), passed by value — not a bare pointer. No hand-written
 /// `cleave-rt` extern fn could plausibly match that layout, found by direct
 /// testing (a hard `STATUS_ACCESS_VIOLATION` crash, not a clean panic,
 /// before this fix). `memref.extract_aligned_pointer_as_index`/`llvm.
-/// inttoptr` have no melior binding — built directly via `OperationBuilder`,
-/// the identical pattern `llvm_type_size_bytes`'s own `llvm.ptrtoint`
+/// inttoptr` are built with the generic `OperationBuilder`, the pattern `llvm_type_size_bytes`'s own `llvm.ptrtoint`
 /// already uses just above.
 ///
 /// `len` is the array's own *total* element count (every dimension's own
@@ -5671,12 +5668,10 @@ fn gep<'c>(
 
 /// Like `gep`, but for indices that are already runtime `Value`s (a loop
 /// variable used as an array index) rather than compile-time constants —
-/// built directly via `OperationBuilder` rather than melior's own `llvm::
-/// get_element_ptr_dynamic` (which requires a compile-time-known index
-/// *count*, via a const generic — this file's own callers need a genuinely
-/// runtime-length index list, one per array dimension). `rawConstantIndices`
-/// filled with `i32::MIN` sentinels throughout — melior's own convention
-/// (confirmed in its `get_element_ptr_dynamic`) for "every index here is a
+/// built with the generic `OperationBuilder`, since the number of indices
+/// (one per array dimension) varies. `rawConstantIndices` filled with
+/// `i32::MIN` sentinels throughout — `LLVM::GEPOp::kDynamicIndex`, MLIR's
+/// marker for "every index here is a
 /// real operand, not a constant" — mixing compile-time-constant and dynamic
 /// indices in one GEP is possible in principle but not needed by any caller
 /// here, so not attempted.
@@ -6347,7 +6342,7 @@ fn build_memref_stride<'c>(
 
 /// `tensor.empty()` filled with zeros, the destination of a product that
 /// accumulates into it (`linalg.matmul`'s `C += A B`). A `fill` of zero is
-/// what `cleave_mlir_shim::lower_blas_matmuls` recognizes as `beta = 0`, and
+/// what `cleave_mlir::lower_blas_matmuls` recognizes as `beta = 0`, and
 /// drops.
 fn zero_filled_seed<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, result_ty: Type<'c>) -> Value<'c, 'c> {
     let context = ctx.context;
@@ -6389,14 +6384,14 @@ fn zero_filled_seed<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, result_ty: Ty
 
 /// Marks the op defining `product` `cleave.blas`.
 fn mark_blas<'c>(context: &'c Context, product: Value<'c, 'c>) {
-    let result = cleave_mlir_shim::mlir::ir::operation::OperationResult::try_from(product)
+    let result = cleave_mlir::ir::operation::OperationResult::try_from(product)
         .unwrap_or_else(|_| panic!("MLIR lowering: a BLAS product must be an op's result"));
     let owner = result.owner();
     unsafe {
-        cleave_mlir_shim::mlir::sys::mlirOperationSetAttributeByName(
+        cleave_mlir::sys::mlirOperationSetAttributeByName(
             owner.to_raw(),
             StringRef::new("cleave.blas").to_raw(),
-            cleave_mlir_shim::mlir::sys::mlirUnitAttrGet(context.to_raw()),
+            cleave_mlir::sys::mlirUnitAttrGet(context.to_raw()),
         );
     }
 }
@@ -6454,7 +6449,7 @@ fn lower_raw_mlir_op<'c>(
     // so neither reaches here with a third (`init`) argument any more.
     // `blas: "unit"` (`stdlib/linalg/matrix.cleave`, above `BLAS_MIN_WORK`):
     // the same `linalg.matmul`, marked `cleave.blas` for the BLAS tier of the
-    // pipeline (`cleave_mlir_shim::blas_tile_and_fuse`, then
+    // pipeline (`cleave_mlir::blas_tile_and_fuse`, then
     // `lower_blas_matmuls`), which tiles it with its consumer and calls
     // `sgemm` per tile. Unmarked, the `linalg` schedule vectorizes it.
     if attrs.iter().any(|(name, _)| name == "blas") {
@@ -6490,7 +6485,7 @@ fn lower_raw_mlir_op<'c>(
     // What they really are: an ordinary `linalg.matmul` with a non-default
     // `indexing_maps` — see `build_matmul_transpose_no_seed`'s own doc
     // comment for the full mechanism and why it has to go through MLIR's
-    // own textual parser rather than melior's `OperationBuilder`.
+    // own textual parser rather than the generic `OperationBuilder`.
     if op == "linalg.matmul_transpose_a" {
         return build_matmul_transpose_no_seed(ctx, block, env, args, result_ty, true);
     }
@@ -6862,7 +6857,7 @@ fn build_matmul_no_seed<'c>(
 /// region is elided in every *textual* `linalg.matmul` this project has
 /// ever written or dumped (MLIR's own custom parser/printer for named
 /// structured ops derives the canonical `out += a*b` body automatically)
-/// — but melior's generic `OperationBuilder` goes through the plain C API
+/// — but the generic `OperationBuilder` goes through the plain C API
 /// (`mlirOperationCreate` via an `OperationState`), never that custom
 /// parser, so the region is built explicitly here, by hand, matching
 /// exactly the canonical body the parser would have synthesized.
@@ -6975,41 +6970,23 @@ fn build_matmul_add<'c>(
 /// why `lower_raw_mlir_op`'s dispatch names for this are cleave's own,
 /// not real MLIR ones).
 ///
-/// `indexing_maps` is one of `MatmulOp`'s own ODS **Properties** (confirmed
-/// directly in the generated `LinalgStructuredOps.h.inc`) — a storage
-/// mechanism distinct from the ordinary discardable-attribute dictionary
-/// every other op in this file goes through via melior's `OperationBuilder::
-/// add_attributes`. melior 0.27.4 (this project's own pinned version) has
-/// *no* Properties-setting API at all (confirmed: no `parse`/`propert*`-
-/// named function anywhere in melior's own `operation.rs`) — building this
-/// op via `OperationBuilder` therefore sets `indexing_maps` as an inert,
-/// never-read discardable attribute, leaving the real property MLIR's own
-/// verifier and vectorizer actually consult at its default (untransposed)
-/// value. Confirmed, not theorized: this exact construction produced a
-/// genuine stack-overflow crash in the compiled kernel before this fix.
+/// `indexing_maps` is one of `MatmulOp`'s ODS **properties**, a storage
+/// distinct from the discardable-attribute dictionary `OperationBuilder::
+/// add_attributes` fills: MLIR's C API has no way to set a property, so an
+/// op built through it keeps `indexing_maps` at its default (untransposed)
+/// value, the given one an inert attribute nothing reads (it produced a
+/// stack-overflow crash in a compiled kernel).
 ///
-/// The workaround: build the *textual* MLIR form instead — a real, ordinary
-/// `linalg.matmul indexing_maps = [...] ins(...) outs(...) -> ...`, the same
-/// sugared syntax MLIR's own test suite uses for exactly this case
-/// (confirmed directly, `generalize-named-ops.mlir`'s own `@matmul_bcast_a`)
-/// — and parse it via `mlirOperationCreateParse`, MLIR's own C-API textual
-/// parser (confirmed present in this project's own generated `mlir-sys`
-/// bindings, and now a direct dependency — see `cleave/Cargo.toml`). That
-/// parser sets the real property correctly because it's the exact code path
-/// any `.mlir` file on disk goes through — no melior involvement for that
-/// part at all. The one wrinkle: a standalone parse needs *bound names* for
-/// its operands, which the real, already-lowered `a`/`b`/`init` values don't
-/// have — so this parses a tiny throwaway `func.func` wrapper (its own block
-/// arguments stand in for `a`/`b`/`init`), then reaches inside with melior's
-/// own raw-pointer escape hatches (`OperationLike::region`, `RegionLike::
-/// first_block`, `BlockLike::first_operation_mut`) to detach the one real op
-/// it cares about (`OperationMutLike::remove_from_parent`) and rewire its
-/// operands onto the real values (`OperationMutLike::set_operands`) before
-/// appending it into the real block. The wrapper itself (and its now-
-/// orphaned `func.return`, still holding a dangling *use* of the detached
-/// op's result — never a problem, per `mlirOperationRemoveFromParent`'s own
-/// doc comment: "not destroyed", only unlinked) is simply dropped once the
-/// one op inside it has been extracted.
+/// So the op is parsed from its textual form, `linalg.matmul indexing_maps
+/// = [...] ins(...) outs(...)` (the syntax of MLIR's own
+/// `generalize-named-ops.mlir`), through `mlirOperationCreateParse`, the
+/// parser any `.mlir` file goes through, which sets the property. A
+/// standalone parse needs named operands, which the already-lowered `a`,
+/// `b`, `init` don't have: the text is a throwaway `func.func` whose block
+/// arguments stand in for them; the one op inside is detached
+/// (`remove_from_parent`), its operands set to the real values
+/// (`set_operands`), and appended to the real block. The wrapper, its
+/// `func.return` still using the detached op's result, is dropped after.
 fn build_matmul_transpose_no_seed<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
@@ -7093,9 +7070,8 @@ fn build_matmul_transpose_no_seed<'c>(
 /// a real `c`, below) — once `init` is on hand, building the actual
 /// transposed-indexing-maps `linalg.matmul` is identical either way. See
 /// `build_matmul_transpose_no_seed`'s own doc comment for why this has to
-/// go through MLIR's own textual parser (`indexing_maps` is a Properties
-/// field melior's `OperationBuilder` can't set directly) rather than
-/// melior's ordinary builder API.
+/// go through MLIR's own textual parser (`indexing_maps` is a property, which
+/// the generic `OperationBuilder` can't set).
 fn build_matmul_transpose_named_op<'c>(
     context: &'c Context,
     block: &Block<'c>,
@@ -7123,7 +7099,7 @@ fn build_matmul_transpose_named_op<'c>(
          }}"
     );
     let raw = unsafe {
-        cleave_mlir_shim::mlir::sys::mlirOperationCreateParse(
+        cleave_mlir::sys::mlirOperationCreateParse(
             context.to_raw(),
             StringRef::new(&wrapper_text).to_raw(),
             StringRef::new("<cleave-matmul-transpose>").to_raw(),
@@ -7678,8 +7654,7 @@ fn build_relu_elemwise<'c>(
 
 /// Emits a `func.func private @symbol(param_types) -> result_ty` declaration
 /// (an *empty* region — zero blocks — is what makes it a declaration rather
-/// than a definition; confirmed against melior's own `compile_external_
-/// function` test) the first time `symbol` is seen, and no-ops on every
+/// than a definition) the first time `symbol` is seen, and no-ops on every
 /// later call site for the same symbol.
 /// The array an extern call's host fills for its result
 /// (`lower_extern_out_param_call`): a tensor's data array, or an array
@@ -7759,7 +7734,7 @@ fn lower_extern_out_param_call<'c>(
 
 /// The element type of a tensor, vector or memref type; `None` otherwise.
 fn shaped_element_type(ty: Type<'_>) -> Option<Type<'_>> {
-    if let Ok(t) = cleave_mlir_shim::mlir::ir::r#type::RankedTensorType::try_from(ty) {
+    if let Ok(t) = cleave_mlir::ir::r#type::RankedTensorType::try_from(ty) {
         return Some(t.element());
     }
     if let Ok(t) = MemRefType::try_from(ty) {
@@ -7815,7 +7790,7 @@ fn ensure_extern_declared<'c>(
         TypeAttribute::new(FunctionType::new(context, &param_mlir, results).into()),
         Region::new(),
         &[(
-            cleave_mlir_shim::mlir::ir::Identifier::new(context, "sym_visibility"),
+            cleave_mlir::ir::Identifier::new(context, "sym_visibility"),
             StringAttribute::new(context, "private").into(),
         )],
         location,
@@ -7827,7 +7802,7 @@ fn ensure_extern_declared<'c>(
 /// an ordinary call to `unit` lowers to (`lower_real_call`), `no_inline` so
 /// MLIR's inliner keeps it a call, preceded by a call to the operand-less
 /// marker `cleave_spawn_next(<unit>)`: the post-bufferization task pass
-/// (`cleave-mlir-shim`'s `cleaveLowerSpawns`) wraps the next call *to `unit`*
+/// (`cleave-mlir`'s `cleaveLowerSpawns`) wraps the next call *to `unit`*
 /// after each marker in an `omp.task` — after bufferization, since One-Shot
 /// Bufferize can't see through an `omp.task` region. A marker call rather than
 /// an attribute on the call: bufferization rebuilds calls and drops their

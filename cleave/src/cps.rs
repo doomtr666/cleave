@@ -1241,7 +1241,7 @@ pub enum PrimOp {
     /// its container (`refcount.rs::TensorViews::standalone`). Retains the
     /// buffer rather than copying it; MLIR's buffer deallocation, which
     /// owns a bare tensor's buffer, sees it as a fresh allocation and
-    /// releases it (`cleave_mlir_shim::lower_adoptions`). `Ty` is the
+    /// releases it (`cleave_mlir::lower_adoptions`). `Ty` is the
     /// tensor's type. Inserted by refcounting only.
     Adopt(Ty),
 }

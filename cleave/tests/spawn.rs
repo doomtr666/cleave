@@ -72,7 +72,7 @@ fn a_function_named_spawn_is_still_an_ordinary_call() {
 }
 
 /// Spawned calls become OpenMP tasks after bufferization
-/// (`cleave_mlir_shim::lower_spawns`): each in an `omp.task`, each wait an
+/// (`cleave_mlir::lower_spawns`): each in an `omp.task`, each wait an
 /// `omp.taskwait`, and the spawning function wrapped to open a parallel region
 /// when not already in one.
 #[test]
@@ -355,7 +355,7 @@ fn a_comprehension_of_spawns_over_a_numeric_range() {
 }
 
 /// A team starts with each member placing itself on a physical core of its
-/// own (`cleave_mlir_shim::bind_teams`, `cleave_rt::cleave_bind_worker`): the
+/// own (`cleave_mlir::bind_teams`, `cleave_rt::cleave_bind_worker`): the
 /// call is in the lowered parallel region, and the program runs with it.
 #[test]
 fn a_team_places_its_members_one_per_core() {

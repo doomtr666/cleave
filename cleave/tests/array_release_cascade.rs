@@ -18,9 +18,9 @@
 
 use cleave::cps::{collect_mlir_types, collect_struct_schemas};
 use cleave::mlir_lower::lower_program;
-use cleave_mlir_shim::mlir::Context;
-use cleave_mlir_shim::mlir::dialect::DialectRegistry;
-use cleave_mlir_shim::mlir::utility::register_all_dialects;
+use cleave_mlir::Context;
+use cleave_mlir::dialect::DialectRegistry;
+use cleave_mlir::utility::register_all_dialects;
 
 fn context() -> Context {
     let dialect_registry = DialectRegistry::new();

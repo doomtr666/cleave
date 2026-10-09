@@ -1,5 +1,5 @@
 # `CLEAVE_LLVM_PREFIX` -- the LLVM 22 + MLIR + openmp install
-# `cleave-mlir-shim`'s build script compiles its C++ against and links, and
+# `cleave-mlir`'s build script compiles its C++ against and links, and
 # where `--run` and `cleave-build` find `libomp`.
 #
 # Run `scripts/setup-toolchain.ps1` from the repo root instead of setting it

@@ -557,7 +557,7 @@ pub enum ExprKind {
     /// `mlir_attrs`: named arguments to a reserved `mlir::dialect::op(...)`
     /// call (`mlir::arith::cmpi(a, b, predicate: "slt")`) — attribute name
     /// to raw literal text (quotes already stripped), passed verbatim to
-    /// `cleave_mlir_shim::mlir::ir::attribute::Attribute::parse` at MLIR-lowering time.
+    /// `cleave_mlir::ir::attribute::Attribute::parse` at MLIR-lowering time.
     /// Empty for every ordinary call. Kept as raw text, not `Expr`, since
     /// these never need general-expression evaluation — only `mlir::`-
     /// prefixed calls are semantically allowed to have any (checked in

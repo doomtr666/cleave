@@ -753,7 +753,7 @@ algebra CausalAttention<X, S> {
 // methods there is nothing around a product to fuse it with. Each head's blocks of `q`, `k`, `v`
 // (and `u`) are slices, read by `sgemm` where they are, with their real row stride; each product
 // that is a block of a result is computed into that block's slice and put back by `update`, so
-// written in place (`cleave_mlir_shim::elide_block_copies`). `sgemm` is called here rather than
+// written in place (`cleave_mlir::elide_block_copies`). `sgemm` is called here rather than
 // the `blas_*` helpers: a slice passed to a function is copied at its boundary (`doc/backlog.md`,
 // "Views as first-class descriptors").
 //

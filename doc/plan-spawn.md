@@ -213,7 +213,7 @@ is neither `#[pure]` nor `#[reentrant]` is an error naming the path (`cps::check
 touches no global state). CPS: `PrimOp::Spawn`/`Await`/`Sync`, awaits inserted before the first
 statement reading a spawned value. MLIR: the spawned call plus a `cleave_spawn_next` marker (an
 attribute doesn't survive bufferization, which rebuilds calls), `cleave_task_wait` markers keeping
-the arguments' buffers alive; after deallocation, `cleave_mlir_shim::lower_spawns` (C++) makes the
+the arguments' buffers alive; after deallocation, `cleave_mlir::lower_spawns` (C++) makes the
 tasks, the taskwaits and the parallel-region wrappers. The runtime picks one thread per physical
 core (`cleave_parallel_threads`). `cleave/tests/spawn.rs`, `cleave/tests/spawn_leaks.rs`.
 

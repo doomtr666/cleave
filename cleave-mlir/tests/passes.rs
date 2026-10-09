@@ -1,9 +1,9 @@
 //! cleave's passes, run through `run_pipeline` on hand-written modules.
 
-use cleave_mlir_shim::mlir::Context;
-use cleave_mlir_shim::mlir::dialect::DialectRegistry;
-use cleave_mlir_shim::mlir::ir::Module;
-use cleave_mlir_shim::mlir::utility::register_all_dialects;
+use cleave_mlir::Context;
+use cleave_mlir::dialect::DialectRegistry;
+use cleave_mlir::ir::Module;
+use cleave_mlir::utility::register_all_dialects;
 
 fn context() -> Context {
     let registry = DialectRegistry::new();
@@ -19,7 +19,7 @@ fn run(source: &str, pipeline: &str) -> String {
     let context = context();
     let module = Module::parse(&context, source).expect("failed to parse the module");
     // SAFETY: `module` is a valid module, owned here.
-    unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), pipeline, false) }.expect("pipeline failed");
+    unsafe { cleave_mlir::run_pipeline(module.to_raw(), pipeline, false) }.expect("pipeline failed");
     module.as_operation().to_string()
 }
 

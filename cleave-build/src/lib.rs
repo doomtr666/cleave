@@ -334,43 +334,28 @@ impl Build {
         // `--openmp`'s parallel loops, or `spawn`'s tasks (`cleave::pipeline::
         // compile_and_emit`'s result).
         if needs_openmp {
-            // `libomp` -- needed the moment `emit_object`'s own OpenMP
-            // parallelization stage or `spawn`'s tasks were used: the object
-            // then carries unresolved `__kmpc_*` relocations. The real, installed file is named `libomp.
-            // lib` (LLVM's own cross-platform convention) -- `dylib=libomp`,
-            // not `dylib=omp`, since an `-msvc` target's linker takes an
-            // `-l`-equivalent name verbatim (`NAME.lib`), no GNU-style
-            // prefix assumed. Same `CLEAVE_LLVM_PREFIX` (`.cargo/config.
-            // toml`) the shim builds against, reused rather than a second, independently-maintained path --
-            // cargo's own `[env]` mechanism hands it to every build-script
-            // process, this one included.
-            let mlir_prefix = env::var("CLEAVE_LLVM_PREFIX")
-                .expect("CLEAVE_LLVM_PREFIX must be set (see .cargo/config.toml) to link libomp");
-            println!("cargo:rustc-link-lib=dylib=libomp");
-            println!("cargo:rustc-link-search=native={mlir_prefix}/lib");
-
-            // `libomp.dll` itself, copied next to the *final* binary --
-            // linking above only satisfies the linker; `libomp` is a real,
-            // dynamically-loaded runtime (Windows has no static-link story
-            // for it), so the finished executable also needs the `.dll`
-            // findable through its own DLL search order at process-start
-            // time, same as any other runtime dependency Windows resolves
-            // outside of `PATH`/`rustc`'s own knowledge. `OUT_DIR` (`target/
-            // <profile>/build/<pkg-hash>/out`) sits exactly three
-            // directories below `target/<profile>/`, where cargo actually
-            // places the finished binary -- confirmed directly against a
-            // real build, not assumed. Best-effort (`let _ =`, not `.expect
-            // (...)`): a failed copy here shouldn't fail the whole build
-            // over what's fundamentally a convenience for running the
-            // binary straight out of `target/`, and every other real
-            // deployment path (an installed/packaged binary) needs its own
-            // real answer to "where does `libomp.dll` come from" anyway,
-            // not this one.
-            if let Some(target_profile_dir) = out_dir.ancestors().nth(3) {
-                let _ = std::fs::copy(
-                    format!("{mlir_prefix}/bin/libomp.dll"),
-                    target_profile_dir.join("libomp.dll"),
-                );
+            // `__kmpc_*` references resolved against the toolchain's `libomp`
+            // (`CLEAVE_LLVM_PREFIX`, which cargo's `[env]` hands to build
+            // scripts too).
+            let prefix = cleave::toolchain::llvm_prefix().unwrap_or_else(|e| panic!("cleave-build: {e} to link libomp"));
+            let lib_dir = cleave::toolchain::libomp_link_dir(&prefix);
+            println!("cargo:rustc-link-lib=dylib={}", cleave::toolchain::LIBOMP_LINK_NAME);
+            println!("cargo:rustc-link-search=native={lib_dir}");
+            if cfg!(windows) {
+                // The DLL next to the binary, where Windows looks for it at
+                // start: `OUT_DIR` (`target/<profile>/build/<pkg>/out`) is
+                // three levels below `target/<profile>/`. Best-effort, a
+                // convenience for running from `target/`; a packaged binary
+                // ships its own.
+                if let Some(target_profile_dir) = out_dir.ancestors().nth(3) {
+                    let _ = std::fs::copy(
+                        cleave::toolchain::libomp_shared_library(&prefix),
+                        target_profile_dir.join("libomp.dll"),
+                    );
+                }
+            } else {
+                // Found at run time where it was linked from.
+                println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_dir}");
             }
         }
     }

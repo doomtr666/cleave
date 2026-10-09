@@ -11,4 +11,4 @@ pest_derive = "2"
 cleave-rt = { path = "../cleave-rt" }
 # cleave's MLIR API and C++ shim: IR construction, passes, target, code
 # generation (`doc/plan-mlir-shim.md`).
-cleave-mlir-shim = { path = "../cleave-mlir-shim" }
+cleave-mlir = { path = "../cleave-mlir" }

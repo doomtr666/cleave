@@ -152,5 +152,5 @@ on (contiguous code stays as fast as today), function boundaries taking the layo
 instead of `identity-layout-map` everywhere, offsets as `[i32; Dims.len()]` for rank N, and
 rank-reducing views by partial indexing. What Part 1 leaves for it: retaining and releasing a
 referenced buffer, and copy on write, built and tested on arrays first. The precondition
-`cleave_mlir_shim::elide_block_copies` relies on disappears with descriptors (the layout is a run
+`cleave_mlir::elide_block_copies` relies on disappears with descriptors (the layout is a run
 time value wherever a view goes).

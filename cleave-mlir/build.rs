@@ -8,37 +8,26 @@ fn main() {
     // prebuilt one (`cleave-llvm-redist`) and writes this variable into
     // `.cargo/config.toml`.
     let prefix = env::var("CLEAVE_LLVM_PREFIX")
-        .expect("CLEAVE_LLVM_PREFIX must be set (see .cargo/config.toml) to build cleave-mlir-shim");
+        .expect("CLEAVE_LLVM_PREFIX must be set (see .cargo/config.toml) to build cleave-mlir");
 
     cc::Build::new()
         .cpp(true)
         .std("c++17")
-        // Always the release CRT/STL (`/MD`, no `_DEBUG`, `_ITERATOR_DEBUG_
-        // LEVEL=0`), whatever cargo profile is building this crate: the
-        // vendored `libMLIR*`/`LLVM*` are release builds, and this shim
-        // hands them STL objects (`ExecutionEngineOptions::transformer` is
-        // a `std::function`). Under a debug cargo profile `cc-rs` would
-        // default to `/MDd`, giving those objects a different layout than
-        // the release code calling them expects -- found as a hard
-        // `STATUS_STACK_BUFFER_OVERRUN` in every `dev`-profile build (build
-        // scripts included) the moment the shim built its own
-        // `std::function` wrapper instead of just copying upstream's.
+        // Built the way the toolchain was, whatever the cargo profile, since
+        // the shim hands the toolchain's libraries STL objects (a
+        // `std::function` among them): the release runtime (under a debug
+        // profile `cc` would pick MSVC's debug CRT, a different layout, a
+        // crash), no RTTI, no exceptions (`LLVM_ENABLE_RTTI=OFF`,
+        // `LLVM_ENABLE_EH=OFF`). Each flag in its MSVC and GCC/Clang spelling.
         .opt_level(2)
         .debug(false)
-        // Matches the exact settings the vendored LLVM/MLIR toolchain was
-        // itself built with (`LLVM_ENABLE_RTTI=OFF`/`LLVM_ENABLE_EH=OFF`,
-        // confirmed directly against `I:/Dev/llvm-project/build/
-        // CMakeCache.txt`, not assumed) -- mismatching either here risks a
-        // real ABI mismatch across the boundary between this shim's own
-        // object file and the prebuilt `libMLIR*`/`LLVM*` static libs it
-        // links against.
-        .flag_if_supported("/GR-") // MSVC: disable RTTI
-        .flag_if_supported("-fno-rtti") // clang-cl: disable RTTI
-        .flag_if_supported("/EHs-c-") // MSVC: disable exceptions
-        .flag_if_supported("-fno-exceptions") // clang-cl: disable exceptions
+        .flag_if_supported("/GR-")
+        .flag_if_supported("-fno-rtti")
+        .flag_if_supported("/EHs-c-")
+        .flag_if_supported("-fno-exceptions")
         .include(format!("{prefix}/include"))
         .file("cpp/shim.cpp")
-        .compile("cleave_mlir_shim");
+        .compile("cleave_mlir");
 
     link_llvm_and_mlir(&prefix);
 }

@@ -30,9 +30,9 @@ use cleave::pipeline::{
 };
 use cleave::print::print_program;
 use cleave::registry::Registry;
-use cleave_mlir_shim::mlir::Context;
-use cleave_mlir_shim::mlir::dialect::DialectRegistry;
-use cleave_mlir_shim::mlir::utility::register_all_dialects;
+use cleave_mlir::Context;
+use cleave_mlir::dialect::DialectRegistry;
+use cleave_mlir::utility::register_all_dialects;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -665,11 +665,8 @@ fn real_main() -> ExitCode {
                     // `lower_to_llvm` -- the shared pipeline `--run` below
                     // also uses, right up to (not including) JIT invocation
                     // -- this *is* the form that actually gets handed to the
-                    // `ExecutionEngine`, `llvm.*` dialect ops standing in for
-                    // real textual LLVM IR (melior/mlir-sys, as vendored,
-                    // don't expose `mlirTranslateModuleToLLVMIR` at all --
-                    // real `.ll` text isn't reachable without adding a raw
-                    // FFI binding ourselves). OpenMP defaults *on* here too
+                    // code generator, in the `llvm` dialect (the translated
+                    // LLVM IR itself isn't dumped). OpenMP defaults *on* here too
                     // now, same universal default every mode uses (`real_
                     // main`'s own `cleave_openmp` doc comment) -- pass
                     // `--no-openmp` explicitly for a serial dump.

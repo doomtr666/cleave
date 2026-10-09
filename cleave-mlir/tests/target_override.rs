@@ -9,9 +9,8 @@
 //! AVX-512 can hold that in one `zmm` register and emit one `vfmadd*ps`;
 //! without it, LLVM's own instruction legalizer must split the 512-bit
 //! operation into narrower ($<=$256-bit) pieces. Confirmed by real
-//! disassembly (`llvm-objdump`, part of the same `CLEAVE_LLVM_PREFIX`
-//! toolchain `mlir-sys` itself already requires -- no extra tool
-//! dependency), grepping for a real `zmm` register mention -- a raw byte
+//! disassembly (`llvm-objdump`, part of the `CLEAVE_LLVM_PREFIX` toolchain
+//! the shim builds against -- no extra tool dependency), grepping for a real `zmm` register mention -- a raw byte
 //! scan for the `0x62` EVEX prefix byte was tried first and rejected: an
 //! object file's own symbol/string tables contain enough incidental `0x62`
 //! bytes to false-positive even on code with no AVX-512 in it at all,
@@ -31,21 +30,21 @@ module {
 "#;
 
 /// Lowers `FMA16_MLIR` to the LLVM dialect and writes it as an object file
-/// (`cleave_mlir_shim::emit_object`) for a target built with the given
+/// (`cleave_mlir::emit_object`) for a target built with the given
 /// `target_cpu`/`target_features` override (`""` for either means "use
 /// `detectHost`'s own default unchanged"). Returns the dumped file's own
 /// path (kept on disk -- `disassemble` below re-reads it via `llvm-objdump`).
 fn compile_object(
-    context: &cleave_mlir_shim::mlir::Context,
+    context: &cleave_mlir::Context,
     target_cpu: &str,
     target_features: &str,
 ) -> std::path::PathBuf {
-    use cleave_mlir_shim::mlir::ir::Module;
+    use cleave_mlir::ir::Module;
 
     let module = Module::parse(context, FMA16_MLIR).expect("failed to parse probe module");
     // SAFETY: `module` is a valid module, owned here.
     unsafe {
-        cleave_mlir_shim::run_pipeline(
+        cleave_mlir::run_pipeline(
             module.to_raw(),
             "builtin.module(convert-vector-to-llvm,convert-func-to-llvm,reconcile-unrealized-casts)",
             false,
@@ -54,21 +53,20 @@ fn compile_object(
     .expect("failed to run the lowering pipeline");
 
     let dump_path = std::env::temp_dir().join(format!(
-        "cleave-mlir-shim-probe-{target_cpu}-{target_features}.o"
+        "cleave-mlir-probe-{target_cpu}-{target_features}.o"
     ));
     let opt = |v: &str| (!v.is_empty()).then(|| v.to_string());
-    let target = cleave_mlir_shim::Target::new(opt(target_cpu).as_deref(), opt(target_features).as_deref(), 2, false, true)
+    let target = cleave_mlir::Target::new(opt(target_cpu).as_deref(), opt(target_features).as_deref(), 2, false, true)
         .expect("failed to build the target");
     // SAFETY: `module` is a valid module, owned here.
-    unsafe { cleave_mlir_shim::emit_object(module.to_raw(), &target, dump_path.to_str().unwrap()) }
+    unsafe { cleave_mlir::emit_object(module.to_raw(), &target, dump_path.to_str().unwrap()) }
         .expect("failed to emit the object");
     assert!(dump_path.exists(), "dumped object file should exist");
     dump_path
 }
 
-/// Disassembles `object_path` via `llvm-objdump` (the same `MLIR_SYS_220_
-/// PREFIX/bin` toolchain `mlir-sys` itself already needs -- no separate
-/// tool dependency), returning the real disassembly text.
+/// Disassembles `object_path` via `llvm-objdump` (`CLEAVE_LLVM_PREFIX/bin`),
+/// returning the disassembly text.
 fn disassemble(object_path: &std::path::Path) -> String {
     let prefix = std::env::var("CLEAVE_LLVM_PREFIX")
         .expect("CLEAVE_LLVM_PREFIX must be set to disassemble the probe object");
@@ -91,10 +89,10 @@ fn disassembly_uses_zmm(object_path: &std::path::Path) -> bool {
     disassemble(object_path).contains("zmm")
 }
 
-fn probe_context() -> cleave_mlir_shim::mlir::Context {
-    use cleave_mlir_shim::mlir::Context;
-    use cleave_mlir_shim::mlir::dialect::DialectRegistry;
-    use cleave_mlir_shim::mlir::utility::register_all_dialects;
+fn probe_context() -> cleave_mlir::Context {
+    use cleave_mlir::Context;
+    use cleave_mlir::dialect::DialectRegistry;
+    use cleave_mlir::utility::register_all_dialects;
 
     let registry = DialectRegistry::new();
     register_all_dialects(&registry);
@@ -257,6 +255,6 @@ fn explicit_negative_avx512_feature_drops_avx512() {
 /// on a generic processor.
 #[test]
 fn an_unknown_target_cpu_is_an_error() {
-    let error = cleave_mlir_shim::Target::new(Some("not-a-cpu"), None, 2, false, true).err();
+    let error = cleave_mlir::Target::new(Some("not-a-cpu"), None, 2, false, true).err();
     assert!(error.is_some_and(|e| e.contains("not-a-cpu")), "an unknown CPU was accepted");
 }

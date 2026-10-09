@@ -27,7 +27,7 @@ algebra Float<T> : Num {}
 // calls on the operation side below (`doc/hld.md`'s "one generic 'emit this
 // named MLIR op' primitive" thesis, one level up: `mlir_lower.rs::ty_to_mlir`
 // looks the name up here and parses the declared text via
-// `melior::ir::Type::parse`, no per-type-name Rust match left at all).
+// `Type::parse`, no per-type-name Rust match left at all).
 #[mlir_type(i8)] impl Int<i8> {}
 #[mlir_type(i16)] impl Int<i16> {}
 #[mlir_type(i32)] impl Int<i32> {}
@@ -186,8 +186,7 @@ algebra Ring<T> : Additive {
 
 // Integer negation has no dedicated `arith` op (unlike float — two's-
 // complement negation is just `0 - a`, MLIR's own `arith` dialect doesn't
-// wrap a redundant `negi`, confirmed directly against melior's own
-// `dialect::arith` module) — `mlir::arith::subi(0, a)` through the exact
+// wrap a redundant `negi`) — `mlir::arith::subi(0, a)` through the exact
 // same generic mechanism every other op here already uses, no special case.
 // The laws of `+` and `-` that hold only where they are exact: integers
 // (wrapping arithmetic included), not floating point, where `(a + b) - c`
@@ -363,8 +362,8 @@ impl Transcendental<f64> {
 // *pretty-printer* syntax for specific ops, not something the generic
 // attribute parser understands on its own; confirmed directly by testing
 // both forms against a real `arith.cmpi` and checking `module.verify()`).
-// Ordinals below match melior's own `arith::CmpiPredicate`/`CmpfPredicate`
-// enum declaration order exactly (`melior-0.27.4/src/dialect/arith.rs`):
+// Ordinals below are MLIR's `arith::CmpIPredicate`/`CmpFPredicate` values
+// (`ArithBase.td`):
 // `CmpiPredicate`: Eq=0, Ne=1, Slt=2, Sle=3, Sgt=4, Sge=5 (Ult/Ule/Ugt/Uge
 // unused here — cleave's integers are signed).
 // `CmpfPredicate`: Oeq=1, Ogt=2, Oge=3, Olt=4, Ole=5, One=6 (ordered

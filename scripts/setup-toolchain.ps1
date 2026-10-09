@@ -2,7 +2,7 @@
 Downloads (or reuses) the prebuilt LLVM 22 + MLIR + openmp toolchain
 `cleave-llvm-redist` publishes, and writes `.cargo/config.toml` (gitignored,
 machine-specific -- see `.cargo/config.toml.example`) with `CLEAVE_LLVM_PREFIX`,
-which `cleave-mlir-shim`'s build script compiles and links against. One
+which `cleave-mlir`'s build script compiles and links against. One
 idempotent command, run identically by a fresh dev machine, CI
 (`.github/workflows/ci.yml`), and anyone re-pointing at a version bump.
 

@@ -18,7 +18,7 @@ The rule this sets: **IR construction in Rust, everything that transforms or com
 - **Redistribution.** Building cleave today goes through three build scripts that each consume the
   LLVM/MLIR toolchain their own way: `mlir-sys` (bindgen, so libclang; `MLIR_SYS_220_PREFIX`; a fork
   for Windows MSVC static linking), `tblgen` (which `melior` runs at build time to generate its
-  dialect bindings, a git fork too, `TABLEGEN_220_PREFIX`) and `cleave-mlir-shim` (`cc` against the
+  dialect bindings, a git fork too, `TABLEGEN_220_PREFIX`) and `cleave-mlir` (`cc` against the
   MLIR headers). After this plan there is one: the shim's `build.rs`, compiling the C++ with `cc`
   against the prebuilt LLVM/MLIR and linking it. No bindgen, no libclang, no tblgen, no forks, one
   prefix variable.
@@ -52,12 +52,12 @@ Measured on the current tree.
   requires every external symbol to resolve at JIT construction, hence `register_unresolved_extern_stubs`
   registering a dummy pointer for each user `extern fn`. The target CPU is both stamped on every
   `llvm.func` (`stamp_target_cpu`) and passed to the engine.
-- **The shim** (`cleave-mlir-shim`): 1.6k lines of C++, 16 IR rewrites plus the engine with a target;
+- **The shim** (`cleave-mlir`): 1.6k lines of C++, 16 IR rewrites plus the engine with a target;
   its Rust side declares the externs by hand already, over `mlir-sys`'s handle types.
 
 ## Target architecture
 
-One crate, `cleave-mlir` (the current `cleave-mlir-shim`, renamed):
+One crate, `cleave-mlir` (the current `cleave-mlir`, renamed):
 
 - **C++ side** (`cpp/`): the C API (`cleave_mlir.h`), its implementation, and the passes.
 - **Rust side** (`src/`): `extern "C"` declarations written by hand from that header, and a small

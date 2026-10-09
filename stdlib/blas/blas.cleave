@@ -152,13 +152,13 @@ impl<const A0: i32, const A1: i32, const B0: i32, const B1: i32, const C0: i32, 
         //
         // On `c` too, and from the `to_buffer` itself: a slice of a larger
         // tensor as `c` gets copied out and back in by One-Shot Bufferize,
-        // a copy then removed (`cleave_mlir_shim::elide_block_copies`) by
+        // a copy then removed (`cleave_mlir::elide_block_copies`) by
         // writing the block in place, and only a layout never known at
         // compile time keeps `ldc` and the pointer's offset right once the
         // block replaces the copy (a static one is folded into constants
         // before bufferization). A function returning `c`'s buffer copies
         // it into its plain-layout result, a copy removed in turn
-        // (`cleave_mlir_shim::forward_copies_to_destinations`).
+        // (`cleave_mlir::forward_copies_to_destinations`).
         let a_buf: [f32;A0,A1] = mlir::bufferization::to_buffer(a, read_only: "unit", layout: "strided<[?, ?], offset: ?>");
         let b_buf: [f32;B0,B1] = mlir::bufferization::to_buffer(b, read_only: "unit", layout: "strided<[?, ?], offset: ?>");
         let mut c_buf: [f32;C0,C1] = mlir::bufferization::to_buffer(c, layout: "strided<[?, ?], offset: ?>");

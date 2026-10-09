@@ -1511,17 +1511,9 @@ pub extern "C" fn cleave_region_exit(handle: i64) {
 /// `cleave_release`'s own `bool` result ("did this call actually free the
 /// block"), discarded — matches `free`'s own `(ptr) -> ()` C signature
 /// exactly. Exists purely so `cleave-unify-tensor-allocations`'s `llvm.call @free` ->
-/// `llvm.call @cleave_release_void` rewrite can be a **plain callee-symbol
-/// rename**, nothing else: melior's own `remove_from_parent` is confirmed
-/// unsafe to call at all on real ops from this pipeline (found first on
-/// `memcpy`, and — checked again here, since a *
-/// different* op kind isn't automatically covered by that same finding —
-/// on `memref.dealloc`/`memref.alloc` too: erasing either one succeeds at
-/// the call site itself but corrupts internal state that only crashes
-/// later, at module teardown), so *rebuilding* a call op with a different
-/// result arity (`free`'s `()` vs `cleave_release`'s own `i1`) is exactly
-/// the kind of erase-and-replace this project's own established discipline
-/// avoids wherever a same-shape alternative exists instead. `llvm.call
+/// `llvm.call @cleave_release_void` rewrite can be a plain callee rename,
+/// rather than a call rebuilt with another result arity (`free`'s `()`
+/// against `cleave_release`'s `i1`). `llvm.call
 /// @malloc(size) -> ptr` already matches `cleave_alloc_rc`'s own real
 /// signature byte-for-byte, needing no such wrapper at all — this one
 /// exists only because `free`'s own C signature returns nothing.
@@ -1651,35 +1643,49 @@ fn release_entry_point() -> &'static str {
 // which wrapper got called. Destination `c` is explicit, passed straight
 // through -- no scratch buffer, nothing to redirect after the fact.
 //
-// **Explicit, lazy `LoadLibraryW`/`GetProcAddress` (`blas_dynload`,
-// below), not an ordinary implicit `extern "C" { ... }` link against
-// `openblas.lib` -- a real, load-bearing choice, not a stylistic one.**
-// Windows resolves every *implicit* DLL import at process-*creation*
-// time, before any of that process's own code ever runs -- found
-// directly, the hard way: any build script that merely links `cleave-rt`
-// transitively (`cleave-build`'s own `compile()`, called from every
-// "-interop" example's own `build.rs`) would need `openblas.dll`
-// discoverable the instant *its own* executable
-// (`build-script-build.exe`, in an unpredictable, per-crate, hash-named
-// `target/.../build/<pkg>-<hash>/` directory -- no single place to copy a
-// DLL that covers every consumer) starts, *even though that process never
-// actually calls a BLAS function at all* (object emission only ever
-// builds and validates a JIT `ExecutionEngine`, never executes the
-// generated code). Explicit, on-first-use loading sidesteps the whole
-// problem: a process that never calls into this module never needs
-// `openblas.dll` to exist at all, exactly the classic Windows answer to
-// "an optional/location-variable runtime dependency shouldn't be a hard,
-// process-startup import."
+// OpenBLAS is loaded explicitly, on first use (`blas_dynload`), not linked:
+// an implicit import is resolved when a process starts, so every process
+// linking `cleave-rt` (each example's build script, through `cleave-build`)
+// would need the library findable even if it never calls BLAS.
 mod blas_dynload {
     use std::sync::OnceLock;
 
+    use std::ffi::{CStr, c_void};
+
+    #[cfg(windows)]
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn LoadLibraryW(lp_lib_file_name: *const u16) -> *mut std::ffi::c_void;
-        fn GetProcAddress(
-            h_module: *mut std::ffi::c_void,
-            lp_proc_name: *const u8,
-        ) -> *mut std::ffi::c_void;
+        fn LoadLibraryW(lp_lib_file_name: *const u16) -> *mut c_void;
+        fn GetProcAddress(h_module: *mut c_void, lp_proc_name: *const u8) -> *mut c_void;
+    }
+
+    #[cfg(unix)]
+    #[cfg_attr(target_os = "linux", link(name = "dl"))]
+    unsafe extern "C" {
+        fn dlopen(filename: *const std::os::raw::c_char, flags: i32) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, symbol: *const std::os::raw::c_char) -> *mut c_void;
+    }
+
+    /// The library at `path`, loaded; null if it can't be.
+    #[cfg(windows)]
+    fn open(path: &str) -> *mut c_void {
+        let wide: Vec<u16> = path.replace('/', "\\").encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe { LoadLibraryW(wide.as_ptr()) }
+    }
+
+    #[cfg(unix)]
+    fn open(path: &str) -> *mut c_void {
+        const RTLD_NOW: i32 = 2;
+        let Ok(path) = std::ffi::CString::new(path) else { return std::ptr::null_mut() };
+        unsafe { dlopen(path.as_ptr(), RTLD_NOW) }
+    }
+
+    /// `name`'s address in the loaded library `handle`; null if absent.
+    fn symbol(handle: *mut c_void, name: &CStr) -> *mut c_void {
+        #[cfg(windows)]
+        return unsafe { GetProcAddress(handle, name.as_ptr().cast()) };
+        #[cfg(unix)]
+        return unsafe { dlsym(handle, name.as_ptr()) };
     }
 
     pub type CblasSgemmFn = unsafe extern "C" fn(
@@ -1710,53 +1716,48 @@ mod blas_dynload {
     unsafe impl Send for BlasFns {}
     unsafe impl Sync for BlasFns {}
 
-    /// `OPENBLAS_PREFIX`, falling back to `<workspace root>/target/openblas`
-    /// -- mirrors `cleave-rt/build.rs`'s own identical fallback exactly
-    /// (`scripts/setup-openblas.ps1`'s own default `-CacheDir`).
-    /// `env!("CARGO_MANIFEST_DIR")` is a *compile-time* macro -- the literal
-    /// path is baked into this crate's own compiled code at the point
-    /// `cleave-rt` itself was built, unaffected by wherever the *running*
-    /// process (or its own current directory/`PATH`) happens to be later,
-    /// which is exactly why this works regardless of which consuming
-    /// process ends up loading it.
-    fn openblas_dll_path() -> String {
+    /// OpenBLAS's shared library under `OPENBLAS_PREFIX`, or under
+    /// `<workspace>/target/openblas` (`scripts/setup-openblas.ps1`'s default),
+    /// that path fixed when `cleave-rt` is compiled: a DLL in `bin` on
+    /// Windows, a shared object in `lib` elsewhere.
+    fn openblas_path() -> String {
         let prefix = std::env::var("OPENBLAS_PREFIX").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), "/../target/openblas").to_string()
         });
-        format!("{prefix}/bin/openblas.dll").replace('/', "\\")
+        if cfg!(windows) {
+            format!("{prefix}/bin/openblas.dll")
+        } else if cfg!(target_os = "macos") {
+            format!("{prefix}/lib/libopenblas.dylib")
+        } else {
+            format!("{prefix}/lib/libopenblas.so")
+        }
     }
 
     fn load() -> BlasFns {
-        let path = openblas_dll_path();
-        let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
-        let handle = unsafe { LoadLibraryW(wide.as_ptr()) };
+        let path = openblas_path();
+        let handle = open(&path);
         if handle.is_null() {
             panic!(
-                "cleave-rt: failed to load openblas.dll from {path} -- run \
+                "cleave-rt: failed to load OpenBLAS from {path} -- run \
                  scripts/setup-openblas.ps1, or set OPENBLAS_PREFIX"
             );
         }
-        let sgemm = unsafe { GetProcAddress(handle, c"cblas_sgemm".as_ptr().cast()) };
-        let set_threads =
-            unsafe { GetProcAddress(handle, c"openblas_set_num_threads".as_ptr().cast()) };
+        let sgemm = symbol(handle, c"cblas_sgemm");
+        let set_threads = symbol(handle, c"openblas_set_num_threads");
         let (Some(sgemm), Some(set_threads)) = (
             std::ptr::NonNull::new(sgemm),
             std::ptr::NonNull::new(set_threads),
         ) else {
             panic!("cleave-rt: {path} loaded but is missing an expected symbol");
         };
-        // SAFETY: both symbols were just resolved, by name, out of a real
-        // OpenBLAS build (`cleave-openblas-redist`) whose own C ABI for
-        // them is stable and already exercised directly (`bench_sgemm.c`).
+        // SAFETY: both symbols resolved by name out of OpenBLAS, whose C ABI
+        // for them is stable.
         unsafe {
             BlasFns {
-                cblas_sgemm: std::mem::transmute::<*mut std::ffi::c_void, CblasSgemmFn>(
-                    sgemm.as_ptr(),
+                cblas_sgemm: std::mem::transmute::<*mut c_void, CblasSgemmFn>(sgemm.as_ptr()),
+                openblas_set_num_threads: std::mem::transmute::<*mut c_void, OpenblasSetNumThreadsFn>(
+                    set_threads.as_ptr(),
                 ),
-                openblas_set_num_threads: std::mem::transmute::<
-                    *mut std::ffi::c_void,
-                    OpenblasSetNumThreadsFn,
-                >(set_threads.as_ptr()),
             }
         }
     }
@@ -1792,7 +1793,7 @@ const CBLAS_TRANS: i32 = 112;
 /// -- the *call*.)
 static PIN_BLAS_THREADS: std::sync::Once = std::sync::Once::new();
 /// How many threads a parallel region opened for `spawn`'s tasks gets
-/// (`doc/plan-spawn.md`; the region itself, `cleave-mlir-shim`'s
+/// (`doc/plan-spawn.md`; the region itself, `cleave-mlir`'s
 /// `cleaveLowerSpawns`): `OMP_NUM_THREADS` when set, otherwise one per
 /// physical core. Not libomp's default of one per logical core: with SMT, the
 /// sibling of a core running a task spins waiting for work and takes that
@@ -1873,7 +1874,7 @@ fn physical_cores() -> Option<usize> {
 }
 
 /// Called by every member of a parallel team when the region starts (the
-/// `omp.parallel` regions `cleave-mlir-shim`'s `cleaveBindTeams` marks), with
+/// `omp.parallel` regions `cleave-mlir`'s `cleaveBindTeams` marks), with
 /// its number in the team: places the calling thread on physical core
 /// `thread` (modulo their count), on all of that core's logical processors.
 /// Left to the OS, two of a team's threads (one per physical core,
@@ -2594,19 +2595,11 @@ dynarray_width!(f64, dynarray_alloc_f64, dynarray_grow_f64, dynarray_get_f64, dy
 /// enough to need a real defensive copy before a write (`Dense`/`Network`,
 /// `examples/xor_tensor.cleave`, is the first cleave program ever to trigger
 /// one — every prior example's own lowered IR has zero `memref.copy` calls
-/// at all, confirmed directly via `--dump-mlir-lowered`), and this project's
-/// own JIT (`melior::ExecutionEngine::new`) never had any shared library
-/// loaded alongside the lowered module to satisfy it. Loading the real DLL
-/// was tried first and abandoned: passing more than one path in `melior`'s
-/// own `shared_library_paths` array (needed since `mlir_c_runner_utils.dll`
-/// itself depends on the sibling `mlir_float16_utils.dll`, confirmed via
-/// `dumpbin /dependents`, and `I:/Dev/llvm-mlir-22/bin` was never on this
-/// process's own DLL search path) corrupted the *first* path into the
-/// second with no separator between them (`Failed to create MemoryBuffer
-/// for: ...dllI:/Dev/...`) -- a real bug somewhere in `melior`'s/MLIR's own
-/// C API glue around a non-null-terminated `MlirStringRef`, not this
-/// project's own code, and not worth chasing further versus just owning a
-/// small, correct reimplementation here instead — matches this crate's own
+/// at all, confirmed directly via `--dump-mlir-lowered`), and cleave's JIT
+/// loads no shared library to satisfy it. Loading the real DLL was tried and
+/// abandoned: it needs a second one (`mlir_float16_utils.dll`), and two
+/// paths reached the engine as one (`...dllI:/Dev/...`), the C API reading a
+/// string ref past its end. A small reimplementation here instead — matches this crate's own
 /// existing posture (`dynarray_*` above already reimplements, rather than
 /// links against, the array-growth runtime a real language would often
 /// pull from an external allocator library).

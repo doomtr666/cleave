@@ -3,7 +3,9 @@
 //! (`emit_object`), a JIT (`ExecutionEngine`), and the IR rewrites cleave's
 //! pipeline runs.
 
-pub mod mlir;
+mod mlir;
+
+pub use mlir::{Context, Diagnostic, DiagnosticHandlerId, Error, StringRef, dialect, ir, sys, utility};
 
 use mlir::sys::{
     MlirContext, MlirExecutionEngine, MlirModule, MlirStringRef, mlirExecutionEngineDestroy,

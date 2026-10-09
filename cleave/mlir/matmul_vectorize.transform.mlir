@@ -169,7 +169,7 @@ module attributes {transform.with_named_sequence} {
       // `vgatherqps`/`vscatterqps` each) -- a real, if non-fatal,
       // performance regression, not a correctness bug (`--affine-super-
       // vectorize`'s own failure here doesn't propagate as fatal either,
-      // confirmed directly against melior's own `PassManager::run`).
+      // the pass manager reports success).
       // Vectorizing the epilogue *first* means a later matmul-vectorize
       // failure only ever strands the *matmul* half tiled-but-unvectorized
       // -- the exact shape Stage 2's own standalone `@tile_and_vectorize`

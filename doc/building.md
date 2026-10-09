@@ -2,9 +2,9 @@
 
 Two things have to be true before `cargo build` works: an LLVM 22 + MLIR +
 openmp toolchain, and `cargo` told where it is (`CLEAVE_LLVM_PREFIX`).
-cleave talks to MLIR through its own C API (`cleave-mlir-shim`, compiled
+cleave talks to MLIR through its own C API (`cleave-mlir`, compiled
 with `cc` against that toolchain and linking it; `doc/plan-mlir-shim.md`):
-no `melior`, `mlir-sys`, `tblgen`, bindgen or libclang.
+no third-party MLIR bindings, bindgen or libclang.
 
 ## 1. Prerequisites
 
@@ -36,7 +36,7 @@ lives on; `cargo clean` deletes it along with everything else under
 trade-off), and writes `.cargo/config.toml`
 (gitignored, machine-specific — see `.cargo/config.toml.example` for the
 tracked explanation of what it contains) with `CLEAVE_LLVM_PREFIX`, which
-`cleave-mlir-shim`'s build script picks up. Idempotent:
+`cleave-mlir`'s build script picks up. Idempotent:
 re-running it is a no-op once the pinned version (`ci/toolchain-version.txt`)
 is already cached — re-run it after that file changes, or pass `-Force` to
 redownload regardless.
@@ -56,7 +56,7 @@ command to remember).
 
 ## 3. How cleave reaches MLIR
 
-`cleave-mlir-shim` holds everything that touches MLIR and LLVM: its C++
+`cleave-mlir` holds everything that touches MLIR and LLVM: its C++
 (`cpp/shim.cpp`: the target and code generation, cleave's passes, the
 pipeline runner) and the Rust side (`src/mlir`: MLIR's C API declared by
 hand, and the IR API `mlir_lower.rs` builds with). Its `build.rs` compiles
@@ -115,7 +115,7 @@ directly). Its flags, and why each one is there:
 | `CMAKE_BUILD_TYPE=Release` | Optimized codegen — this project cares about the generated code's own runtime performance, not just compiling the toolchain fast. |
 | `LLVM_ENABLE_PROJECTS=clang;mlir;openmp` | `mlir` is the real target; `openmp` backs `cleave`'s own OpenMP parallelization (`cleave/src/pipeline.rs`, `--openmp`/`CodegenOptions::openmp`). `clang` is included even though this project never calls it directly — openmp's own in-tree build unconditionally wires its optional lit-test targets (`check-openmp`/etc.) to a real `clang` target (confirmed directly against this exact LLVM tag — no `-D` flag can skip this, `openmp/cmake/OpenMPTesting.cmake`'s own `ENABLE_CHECK_TARGETS` is a plain variable, unconditionally reset on every configure, not a cache variable). Building `clang` for real satisfies that dependency honestly instead of patching LLVM's own source to work around it. |
 | `LLVM_ENABLE_ASSERTIONS=ON` | Real correctness value, confirmed unrelated to this project's own compile-time issues (`doc/backlog.md`'s own "L'hypothèse LLVM_ENABLE_ASSERTIONS était une fausse piste" item — root-caused and fixed elsewhere, not by disabling this). |
-| `LLVM_ENABLE_RTTI=OFF` | LLVM/MLIR's own default; `cleave-mlir-shim` is compiled the same way (`/GR-`). |
+| `LLVM_ENABLE_RTTI=OFF` | LLVM/MLIR's own default; `cleave-mlir` is compiled the same way (`/GR-`). |
 | `LLVM_TARGETS_TO_BUILD=Native` | Only the host's own architecture — cleave's own reference backend is CPU (`doc/hld.md`), no cross-compilation target needed today. |
 | `LLVM_OPTIMIZED_TABLEGEN=OFF` | Matches this project's own dev toolchain; `ON` is a real, untried lever if a from-scratch build ever needs to be faster (`ci/llvm-cmake-flags.txt`'s own build ballooned once `clang` was added). |
 | `LLVM_INSTALL_UTILS=OFF` | Not needed — this project only ever links against the installed libraries/headers, never runs LLVM's own dev utilities. |

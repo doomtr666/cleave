@@ -1,5 +1,5 @@
 [package]
-name = "cleave-mlir-shim"
+name = "cleave-mlir"
 version = "0.1.0"
 edition = "2024"
 

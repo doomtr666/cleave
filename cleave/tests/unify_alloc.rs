@@ -9,9 +9,9 @@ use cleave::driver::compile;
 use cleave::mlir_lower::lower_program;
 use cleave::pipeline::{check_type_errors, strip_ciface_wrapper_debug_info};
 use cleave::registry::Registry;
-use cleave_mlir_shim::mlir::Context;
-use cleave_mlir_shim::mlir::dialect::DialectRegistry;
-use cleave_mlir_shim::mlir::utility::register_all_dialects;
+use cleave_mlir::Context;
+use cleave_mlir::dialect::DialectRegistry;
+use cleave_mlir::utility::register_all_dialects;
 
 fn context() -> Context {
     let dialect_registry = DialectRegistry::new();
@@ -29,7 +29,7 @@ fn context() -> Context {
 /// the usual simplification for a test that is about
 /// allocation rather than vectorization: this file is testing *this*
 /// rewrite, not vectorization), then runs `cleave-unify-tensor-allocations`.
-fn build_unified_module<'c>(context: &'c Context, src: &str) -> cleave_mlir_shim::mlir::ir::Module<'c> {
+fn build_unified_module<'c>(context: &'c Context, src: &str) -> cleave_mlir::ir::Module<'c> {
     let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let registry = Registry::build(&program);
@@ -69,7 +69,7 @@ fn build_unified_module<'c>(context: &'c Context, src: &str) -> cleave_mlir_shim
     cleave::pipeline::run_passes(&mut module, "builtin.module(convert-linalg-to-loops,convert-scf-to-cf,canonicalize,expand-strided-metadata,lower-affine,canonicalize,convert-to-llvm,finalize-memref-to-llvm,convert-to-llvm,reconcile-unrealized-casts)")
         .expect("lowering to the llvm dialect must succeed");
 
-    unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), "builtin.module(cleave-unify-tensor-allocations)", false) }
+    unsafe { cleave_mlir::run_pipeline(module.to_raw(), "builtin.module(cleave-unify-tensor-allocations)", false) }
         .expect("cleave-unify-tensor-allocations");
     assert!(
         module.as_operation().verify(),

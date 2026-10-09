@@ -11,9 +11,9 @@ use crate::diag::{Diagnostic, SourceMap};
 use crate::mlir_lower::lower_program;
 use crate::pipeline::{CodegenOptions, build_optimized_cps, check_type_errors, lower_to_llvm};
 use crate::registry::Registry;
-use cleave_mlir_shim::mlir::Context;
-use cleave_mlir_shim::mlir::dialect::DialectRegistry;
-use cleave_mlir_shim::mlir::utility::register_all_dialects;
+use cleave_mlir::Context;
+use cleave_mlir::dialect::DialectRegistry;
+use cleave_mlir::utility::register_all_dialects;
 
 /// Parses `sources` (`(file name, text)` pairs, `use` resolved against the
 /// shipped stdlib) and type-checks them: the program and its registry, or
@@ -87,14 +87,13 @@ pub fn run_main_with<T>(
         } else {
             "a program using `spawn` (its tasks run on libomp, even under --no-openmp; --no-tasks to run them in place)"
         };
-        let prefix = std::env::var("CLEAVE_LLVM_PREFIX")
-            .map_err(|_| vec![format!("CLEAVE_LLVM_PREFIX must be set (see .cargo/config.toml) to run {why}")])?;
-        shared_libs.push(format!("{prefix}/bin/libomp.dll"));
+        let prefix = crate::toolchain::llvm_prefix().map_err(|e| vec![format!("{e} to run {why}")])?;
+        shared_libs.push(crate::toolchain::libomp_shared_library(&prefix));
     }
     let shared_lib_refs: Vec<&str> = shared_libs.iter().map(String::as_str).collect();
     let target = crate::pipeline::target(options)?;
     // SAFETY: `module` is a valid module, owned here.
-    let engine = unsafe { cleave_mlir_shim::ExecutionEngine::new(module.to_raw(), &target, &shared_lib_refs) }
+    let engine = unsafe { cleave_mlir::ExecutionEngine::new(module.to_raw(), &target, &shared_lib_refs) }
         .map_err(|e| vec![format!("failed to compile the program: {e}")])?;
     // SAFETY: every symbol registered is a real `extern "C"` function live for
     // the whole process (`register_cleave_rt_symbols`'s doc comment); the

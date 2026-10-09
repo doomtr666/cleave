@@ -126,7 +126,7 @@ Structural payoff, beyond cycles: **a block with no refcount cannot be double-re
 
 ### Alignment — the larger win, and the reason to do this at all
 
-**AVX-512 is genuinely in play here, confirmed, not assumed.** `pipeline.rs`'s `stamp_target_cpu` doc comment records a direct disassembly finding: the emitted object contains *hundreds* of `zmm` instructions even when built with `--target-cpu x86-64-v2`, because `melior::ExecutionEngine` always builds its own `TargetMachine` from `JITTargetMachineBuilder::detectHost()`. So the kernel is already being vectorised at 512 bits on this Zen host, regardless of the (currently inert) flag.
+**AVX-512 is genuinely in play here, confirmed, not assumed.** The kernel is vectorised at 512 bits on this Zen host: the default target is the host's (`cleave-mlir`'s `Target`, AVX-512 included), as the shim's disassembly tests check (`target_override.rs`).
 
 Now the arithmetic. `RC_HEADER_SIZE` is 16. `arena_base()` is 64-aligned (`Layout::from_size_align(ARENA_CAPACITY, 64)`), `arena_bump` rounds the cursor to 16, and the payload sits at `base + 16`. `cleave_alloc_rc` is the same shape with `from_size_align(total, 16)`. So **every tensor payload in the system is 16-aligned and, relative to the 64-byte vector width, misaligned by construction.** A full-width 64-byte access at payload offset 0 straddles a cache line. That is not a rounding detail — it is a guaranteed line-split on a large fraction of accesses in a matmul-heavy kernel.
 
@@ -262,7 +262,7 @@ Healthy: flat or slowly-oscillating working set. Any monotonic climb past ~1 GB 
 
 Also required each step:
 - `cargo test -p cleave --release --no-fail-fast` fully green. Note: the `pipeline` and `mlir_lower` targets are **intermittently flaky under parallel load** (link/JIT contention). Re-run the failing target in isolation before treating it as a real failure.
-- Build env: `MLIR_SYS_220_PREFIX=/i/Dev/llvm-mlir-22 TABLEGEN_220_PREFIX=/i/Dev/llvm-mlir-22` must be set inline on every cargo/cleave.exe invocation; they are not in the ambient environment.
+- Build env: `CLEAVE_LLVM_PREFIX` (`.cargo/config.toml`, written by `scripts/setup-toolchain.ps1`).
 - Accuracy unchanged where a run completes: `digits-interop` `0.94713414`, `mnist-interop` `0.9342`.
 
 ### Debugging tools available
