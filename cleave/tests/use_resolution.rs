@@ -314,3 +314,27 @@ fn a_circular_crate_dependency_is_rejected_cleanly() {
         "expected a diagnostic naming the actual cycle, got: {errs:?}"
     );
 }
+
+/// An impl the program declares again over the stdlib's (`impl Additive<i32>`,
+/// `stdlib/num`) is an error located at both: the program's line, not only
+/// the stdlib's.
+#[test]
+fn an_impl_declared_again_names_both_declarations() {
+    let src = "impl Additive<i32> {
+        fn add(a: i32, b: i32) -> i32 { a }
+        fn sub(a: i32, b: i32) -> i32 { a }
+        fn neg(a: i32) -> i32 { a }
+        fn zero() -> i32 { 0 }
+    }
+    fn f() -> i32 { 0 }"
+        .to_string();
+    let (result, sources) = compile(vec![("main.cleave".to_string(), src)], &[]);
+    let errs = result.unwrap_err();
+    let rendered: Vec<String> = errs.iter().map(|e| sources.render(e)).collect();
+    let duplicate = rendered
+        .iter()
+        .find(|r| r.contains("`add` is implemented more than once"))
+        .unwrap_or_else(|| panic!("got: {rendered:?}"));
+    assert!(duplicate.contains("main.cleave:1:"), "the program's impl isn't named: {duplicate}");
+    assert!(duplicate.contains("num.cleave:"), "the stdlib's impl isn't named: {duplicate}");
+}

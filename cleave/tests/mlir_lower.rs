@@ -5451,6 +5451,22 @@ fn a_top_level_fn_shadows_an_algebra_method_whose_impls_do_not_match_it() {
     assert_eq!(run_i32(&context, src), 105);
 }
 
+/// A program's `fn` shadows an algebra method in the program only: the
+/// stdlib's own calls to the method (`optim`'s and `nn`'s `step(opt, model,
+/// grad, state)`, `Optimizer::step`) don't see it, as no crate sees the
+/// functions of a crate that uses it. They used to resolve to the program's
+/// `step` and fail (`` `step` expects 2 argument(s), found 4 ``).
+#[test]
+fn a_programs_fn_does_not_shadow_an_algebra_method_inside_the_stdlib() {
+    let context = context();
+    let src = "
+        use nn;
+        fn step(a: i32, b: i32) -> i32 { a + b }
+        fn main() -> i32 { step(1, 2) }
+    ";
+    assert_eq!(run_i32(&context, src), 3);
+}
+
 /// A local binding (here a lambda) shadows both a top-level `fn` and an
 /// algebra method; leaving its scope restores the outer meaning.
 #[test]

@@ -10,7 +10,10 @@
 //! 2. a local binding in scope (a parameter, a `let`, a lambda parameter, a `for`
 //!    variable) named `f`;
 //! 3. a top-level `fn` named `f` (including `extern fn` and `grad`/`derive`
-//!    declarations);
+//!    declarations) that the body's crate sees: one of its own, or of a crate
+//!    it uses, directly or not (`CrateScopes`). A program's functions never
+//!    reach into the stdlib's bodies: a program's `fn step` doesn't capture
+//!    `optim`'s calls to `Optimizer::step`;
 //! 4. the method `f` of the one algebra declaring it with that arity.
 //!
 //! A qualified call (`Algebra::method`) always means that algebra's method, and
@@ -41,15 +44,36 @@ use std::cell::Cell;
 use crate::collections::{HashMap, HashSet};
 
 use crate::ast::{
-    AlgebraItemKind, Block, ElseBranch, Expr, ExprKind, FnDecl, ItemKind, Path, Program,
+    AlgebraItemKind, Block, ElseBranch, Expr, ExprKind, FileId, FnDecl, ItemKind, Path, Program,
     StmtKind,
 };
+
+/// Which crate each source file belongs to, and which crates each crate sees:
+/// itself and the crates it uses, directly or not (the prelude's included).
+/// A file it doesn't know (a synthesized item's) sees every crate, and is
+/// seen by every crate.
+#[derive(Default)]
+pub struct CrateScopes {
+    pub crate_of_file: HashMap<FileId, usize>,
+    pub sees: Vec<HashSet<usize>>,
+}
+
+impl CrateScopes {
+    fn sees(&self, from: Option<usize>, of: Option<usize>) -> bool {
+        match (from, of) {
+            (Some(from), Some(of)) => from == of || self.sees.get(from).is_some_and(|s| s.contains(&of)),
+            _ => true,
+        }
+    }
+}
 
 /// Rewrites every function and impl body in `program` per the module doc
 /// comment: algebra-targeted calls to `Algebra::method`, shadowing `let`s to
 /// unique names.
-pub fn resolve_calls(mut program: Program) -> Program {
+pub fn resolve_calls(mut program: Program, scopes: &CrateScopes) -> Program {
+    let crate_of = |file: FileId| scopes.crate_of_file.get(&file).copied();
     let mut top_level_fns: HashSet<String> = HashSet::default();
+    let mut fn_crates: HashMap<String, Vec<Option<usize>>> = HashMap::default();
     let mut fieldless_structs: HashSet<String> = HashSet::default();
     let mut algebra_methods: HashMap<(String, usize), Vec<String>> = HashMap::default();
     let mut algebra_bounds: HashMap<String, Vec<String>> = HashMap::default();
@@ -57,6 +81,7 @@ pub fn resolve_calls(mut program: Program) -> Program {
         match &item.kind {
             ItemKind::Fn(f) => {
                 top_level_fns.insert(f.name.clone());
+                fn_crates.entry(f.name.clone()).or_default().push(crate_of(item.span.file));
             }
             ItemKind::Struct(d) if d.fields.is_empty() => {
                 fieldless_structs.insert(d.name.clone());
@@ -77,6 +102,9 @@ pub fn resolve_calls(mut program: Program) -> Program {
     }
     let resolver = Resolver {
         top_level_fns,
+        fn_crates,
+        scopes,
+        current_crate: Cell::new(None),
         fieldless_structs,
         algebra_methods,
         algebra_bounds,
@@ -84,6 +112,7 @@ pub fn resolve_calls(mut program: Program) -> Program {
     };
 
     for item in &mut program.items {
+        resolver.current_crate.set(crate_of(item.span.file));
         match &mut item.kind {
             ItemKind::Fn(f) => resolver.resolve_fn(f),
             ItemKind::Impl(i) => i.fns.iter_mut().for_each(|f| resolver.resolve_fn(f)),
@@ -114,8 +143,13 @@ struct Local {
     actual: String,
 }
 
-struct Resolver {
+struct Resolver<'s> {
     top_level_fns: HashSet<String>,
+    /// The crate of each top-level `fn` of that name.
+    fn_crates: HashMap<String, Vec<Option<usize>>>,
+    scopes: &'s CrateScopes,
+    /// The crate of the item whose body is being resolved.
+    current_crate: Cell<Option<usize>>,
     /// Structs without fields: `Name()` (or `Name::<...>()`) constructs one,
     /// though it parses as a call (`grammar.pest`, `primary`).
     fieldless_structs: HashSet<String>,
@@ -126,7 +160,7 @@ struct Resolver {
     renamed: Cell<u32>,
 }
 
-impl Resolver {
+impl Resolver<'_> {
     fn resolve_fn(&self, f: &mut FnDecl) {
         let Some(body) = &mut f.body else { return };
         self.renamed.set(0);
@@ -316,7 +350,12 @@ impl Resolver {
             *name = actual.to_string();
             return;
         }
-        if self.top_level_fns.contains(name.as_str()) {
+        let from = self.current_crate.get();
+        if self
+            .fn_crates
+            .get(name.as_str())
+            .is_some_and(|crates| crates.iter().any(|&of| self.scopes.sees(from, of)))
+        {
             return;
         }
         if let Some(algebra) = self.unique_algebra(name, arity) {

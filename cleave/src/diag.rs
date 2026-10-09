@@ -17,6 +17,9 @@ pub struct Diagnostic {
     pub severity: Severity,
     pub message: String,
     pub span: Option<Span>,
+    /// Other places the error involves (the earlier of two conflicting
+    /// declarations), each rendered on its own line after the error.
+    pub notes: Vec<(Span, String)>,
 }
 
 impl Diagnostic {
@@ -25,7 +28,14 @@ impl Diagnostic {
             severity: Severity::Error,
             message: message.into(),
             span: Some(span),
+            notes: Vec::new(),
         }
+    }
+
+    /// The same error, with `message` noted at `span`.
+    pub fn with_note(mut self, span: Span, message: impl Into<String>) -> Self {
+        self.notes.push((span, message.into()));
+        self
     }
 
     /// Converts a pest parse error, whose own byte offset (`err.location`)
@@ -119,14 +129,22 @@ impl SourceMap {
         let severity = match diag.severity {
             Severity::Error => "error",
         };
-        let located = diag.span.and_then(|s| {
-            let name = self.files.get(&s.file).map(|(name, _)| name.clone())?;
-            let (line, col) = self.line_col(s.file, s.start)?;
-            Some((name, line, col))
-        });
-        match located {
-            Some((name, line, col)) => format!("{name}:{line}:{col}: {severity}: {}", diag.message),
-            None => format!("<unknown>: {severity}: {}", diag.message),
+        let line = |span: Option<Span>, severity: &str, message: &str| {
+            let located = span.and_then(|s| {
+                let name = self.files.get(&s.file).map(|(name, _)| name.clone())?;
+                let (line, col) = self.line_col(s.file, s.start)?;
+                Some((name, line, col))
+            });
+            match located {
+                Some((name, line, col)) => format!("{name}:{line}:{col}: {severity}: {message}"),
+                None => format!("<unknown>: {severity}: {message}"),
+            }
+        };
+        let mut rendered = line(diag.span, severity, &diag.message);
+        for (span, note) in &diag.notes {
+            rendered.push('\n');
+            rendered.push_str(&line(Some(*span), "note", note));
         }
+        rendered
     }
 }

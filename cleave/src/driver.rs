@@ -263,6 +263,9 @@ pub fn compile(
 
     let mut loaded = crate::collections::HashSet::default();
     let mut stack = Vec::new();
+    // Each program's crate, in `programs`' order: the entry files are the
+    // program's own crate, named here by the empty string.
+    let mut crate_names: Vec<String> = vec![String::new(); programs.len()];
     for (name, span) in wanted {
         visit_crate(
             &name,
@@ -276,6 +279,7 @@ pub fn compile(
             &mut errors,
             &mut loaded,
             &mut stack,
+            &mut crate_names,
         );
     }
 
@@ -304,6 +308,7 @@ pub fn compile(
                 &mut errors,
                 &mut loaded,
                 &mut stack,
+                &mut crate_names,
             );
         }
     }
@@ -312,13 +317,14 @@ pub fn compile(
         return (Err(errors), sources);
     }
 
+    let scopes = crate_scopes(&programs, &crate_names);
     let result = merge_programs(programs)
         .and_then(synthesize_derive_signatures)
         .map(|program| synthesize_tuple_structs(program, &mut node_ids))
         .map(|program| synthesize_heap_struct_marker_impls(program, &mut node_ids))
         .map(|program| synthesize_len_impls(program, &mut node_ids))
         .map(|program| synthesize_collect_impls(program, &mut node_ids))
-        .map(crate::resolve::resolve_calls)
+        .map(|program| crate::resolve::resolve_calls(program, &scopes))
         .map(|mut program| {
             crate::unroll::prune_constant_ifs(&mut program);
             program
@@ -970,6 +976,50 @@ fn synthesize_derive_signatures(mut program: Program) -> Result<Program, Vec<Dia
 /// always `required: true`, including a prelude crate's own further
 /// dependencies once the prelude crate itself is found.
 #[allow(clippy::too_many_arguments)]
+/// Each file's crate, and the crates each crate sees: itself, the crates it
+/// `use`s and the prelude's, transitively (`resolve.rs`, `CrateScopes`).
+fn crate_scopes(programs: &[Program], crate_names: &[String]) -> crate::resolve::CrateScopes {
+    let mut index: crate::collections::HashMap<&str, usize> = crate::collections::HashMap::default();
+    for name in crate_names {
+        let next = index.len();
+        index.entry(name.as_str()).or_insert(next);
+    }
+    let mut scopes = crate::resolve::CrateScopes {
+        sees: vec![crate::collections::HashSet::default(); index.len()],
+        ..Default::default()
+    };
+    let prelude: Vec<usize> = PRELUDE_CRATES.iter().filter_map(|name| index.get(name).copied()).collect();
+    for (program, name) in programs.iter().zip(crate_names) {
+        let this = index[name.as_str()];
+        scopes.sees[this].extend(prelude.iter().copied().filter(|&c| c != this));
+        for item in &program.items {
+            scopes.crate_of_file.insert(item.span.file, this);
+            if let ItemKind::Use(path) = &item.kind {
+                if let Some(&used) = index.get(path.segments[0].as_str()) {
+                    scopes.sees[this].insert(used);
+                }
+            }
+        }
+    }
+    // Transitively: what a crate sees, it sees what that one sees.
+    loop {
+        let mut grew = false;
+        for this in 0..scopes.sees.len() {
+            let reached: Vec<usize> = scopes.sees[this]
+                .iter()
+                .flat_map(|&c| scopes.sees[c].iter().copied())
+                .filter(|&c| c != this)
+                .collect();
+            for c in reached {
+                grew |= scopes.sees[this].insert(c);
+            }
+        }
+        if !grew {
+            return scopes;
+        }
+    }
+}
+
 fn visit_crate(
     name: &str,
     span: Span,
@@ -982,6 +1032,7 @@ fn visit_crate(
     errors: &mut Vec<Diagnostic>,
     loaded: &mut crate::collections::HashSet<String>,
     stack: &mut Vec<String>,
+    crate_names: &mut Vec<String>,
 ) {
     if loaded.contains(name) {
         return;
@@ -1038,12 +1089,14 @@ fn visit_crate(
                     errors,
                     loaded,
                     stack,
+                    crate_names,
                 );
             }
             // Post-order: this crate's own `Program` is only pushed *after*
             // every one of its own dependencies has been — see this
             // function's own doc comment for why (a real topological order).
             programs.push(program);
+            crate_names.push(name.to_string());
         }
         Err(mut e) => errors.append(&mut e),
     }
@@ -1416,14 +1469,14 @@ fn merge_impl_fragment(item: Item, impls: &mut Vec<ImplAcc>, errors: &mut Vec<Di
     }
 
     for f in d.fns {
-        let conflict = sig_key(&f.name, &f.params).is_some_and(|key| {
-            let dup = acc.seen_fns.contains_key(&key);
-            if !dup {
+        let earlier = sig_key(&f.name, &f.params).and_then(|key| match acc.seen_fns.get(&key) {
+            Some(&span) => Some(span),
+            None => {
                 acc.seen_fns.insert(key, item.span);
+                None
             }
-            dup
         });
-        if conflict {
+        if let Some(earlier) = earlier {
             // `FnDecl` itself carries no span (only the enclosing `Item`
             // does — see `ast.rs`), so this necessarily points at the whole
             // `impl` fragment currently being merged in, not the specific
@@ -1434,7 +1487,7 @@ fn merge_impl_fragment(item: Item, impls: &mut Vec<ImplAcc>, errors: &mut Vec<Di
                     f.name, d.algebra
                 ),
                 item.span,
-            ));
+            ).with_note(earlier, format!("`{}` is first implemented here", f.name)));
             continue;
         }
         acc.decl.fns.push(f);

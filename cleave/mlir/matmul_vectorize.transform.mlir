@@ -30,8 +30,15 @@ module attributes {transform.with_named_sequence} {
       %main, %rem = transform.loop.peel %l : (!transform.op<"scf.for">) -> (!transform.any_op, !transform.any_op)
       transform.yield
     }
-    // Folds the remainder (one iteration) down to static sizes.
-    transform.apply_patterns to %scope { transform.apply_patterns.canonicalization } : !transform.any_op
+    // Folds the remainder (one iteration) down to static sizes; the loop
+    // bounds fold the rows of a `scf.forall` of one tile over fewer rows than
+    // the tile (`min(8, 4 - 8 * i)`, `i` = 0: 4 rows, not a dynamic count
+    // nothing vectorizes). More rows than a tile are a multiple of it
+    // (`cleave-split-row-remainders`).
+    transform.apply_patterns to %scope {
+      transform.apply_patterns.scf.for_loop_canonicalization
+      transform.apply_patterns.canonicalization
+    } : !transform.any_op
     %ntiles = transform.structured.match ops{["linalg.matmul"]} attributes{cleave_tile} in %scope : (!transform.any_op) -> !transform.any_op
     %inner2, %kloops = transform.structured.tile_using_for %ntiles tile_sizes [0, 0, 16]
       : (!transform.any_op) -> (!transform.any_op, !transform.any_op)

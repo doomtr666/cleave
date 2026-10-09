@@ -917,6 +917,27 @@ static int64_t cleaveForwardCopiesToDestinations(MlirOperation op) {
   return forwarded;
 }
 
+// The only consumer of `product`'s result when it is pointwise over the
+// product's rows (two parallel loops, one result written through the
+// identity, every operand read through a projected permutation, the product
+// through the identity); null otherwise.
+static linalg::GenericOp pointwiseConsumer(linalg::MatmulOp product) {
+  Value result = product->getResult(0);
+  if (!result.hasOneUse())
+    return nullptr;
+  auto consumer = dyn_cast<linalg::GenericOp>(*result.getUsers().begin());
+  if (!consumer || !consumer.hasPureTensorSemantics() || consumer.getNumLoops() != 2 ||
+      consumer.getNumParallelLoops() != 2 || consumer.getNumDpsInits() != 1)
+    return nullptr;
+  if (!llvm::all_of(consumer.getIndexingMapsArray(), [](AffineMap m) { return m.isProjectedPermutation(); }) ||
+      !consumer.getMatchingIndexingMap(consumer.getDpsInitOperand(0)).isIdentity())
+    return nullptr;
+  for (OpOperand &input : consumer->getOpOperands())
+    if (input.get() == result && !consumer.getMatchingIndexingMap(&input).isIdentity())
+      return nullptr;
+  return consumer;
+}
+
 // A product BLAS computes (`linalg.matmul` marked `cleave.blas`,
 // `stdlib/linalg/matrix.cleave` above `BLAS_MIN_WORK`) whose only consumer
 // is an elementwise op (a bias, an activation, a residual, a gradient's
@@ -935,23 +956,8 @@ static int64_t cleaveBlasTileAndFuse(MlirOperation op, int64_t rows) {
     if (!product->hasAttr("cleave.blas") || !product.hasPureTensorSemantics() ||
         !getElementTypeOrSelf(product->getResult(0).getType()).isF32())
       return;
-    Value result = product->getResult(0);
-    if (!result.hasOneUse())
-      return;
-    auto consumer = dyn_cast<linalg::GenericOp>(*result.getUsers().begin());
-    if (!consumer || !consumer.hasPureTensorSemantics() || consumer.getNumLoops() != 2 ||
-        consumer.getNumParallelLoops() != 2 || consumer.getNumDpsInits() != 1)
-      return;
-    // Pointwise over the product's rows: every operand read through a
-    // projected permutation, the result written through the identity, the
-    // product read through the identity.
-    if (!llvm::all_of(consumer.getIndexingMapsArray(), [](AffineMap m) { return m.isProjectedPermutation(); }) ||
-        !consumer.getMatchingIndexingMap(consumer.getDpsInitOperand(0)).isIdentity())
-      return;
-    for (OpOperand &input : consumer->getOpOperands())
-      if (input.get() == result && !consumer.getMatchingIndexingMap(&input).isIdentity())
-        return;
-    consumers.insert(consumer);
+    if (linalg::GenericOp consumer = pointwiseConsumer(product))
+      consumers.insert(consumer);
   });
   if (consumers.empty())
     return 0;
@@ -1081,6 +1087,142 @@ static int64_t cleaveBlasTileAndFuse(MlirOperation op, int64_t rows) {
     ++fused;
   }
   return fused;
+}
+
+// A product whose row count (static) isn't a multiple of `rows`, the matmul
+// schedule's row tile (`matmul_vectorize.transform.mlir`, `tile_using_forall`):
+// split in two, the whole tiles and the remainder, each of static size. The
+// schedule peels its inner loops (columns, `K`), but a `scf.forall` can't be
+// peeled: its last tile had a dynamic size, the same operation for every
+// tile, so nothing in the loop vectorized and the affine lowering rejected
+// its bounds. What is split is what the schedule tiles by rows: the
+// product's pointwise consumer when it is its only one (the schedule fuses
+// the product into that consumer's loop, so each part here computes its own
+// rows of the product), the product itself otherwise. Before the schedule, on
+// tensors. Returns how many operations it split.
+static int64_t cleaveSplitRowRemainders(MlirOperation op, int64_t rows) {
+  llvm::SetVector<Operation *> roots;
+  llvm::SmallPtrSet<Operation *, 8> fusedProducts;
+  unwrap(op)->walk([&](linalg::MatmulOp product) {
+    auto type = dyn_cast<RankedTensorType>(product->getResult(0).getType());
+    if (!product.hasPureTensorSemantics() || !type || type.getRank() != 2 || type.isDynamicDim(0) ||
+        type.getDimSize(0) <= rows || type.getDimSize(0) % rows == 0)
+      return;
+    if (linalg::GenericOp consumer = pointwiseConsumer(product)) {
+      roots.insert(consumer.getOperation());
+      fusedProducts.insert(product.getOperation());
+    } else {
+      roots.insert(product.getOperation());
+    }
+  });
+  IRRewriter rewriter(unwrap(op)->getContext());
+  int64_t split = 0;
+  for (Operation *rootOp : roots) {
+    auto root = cast<TilingInterface>(rootOp);
+    if (rootOp->getNumResults() != 1)
+      continue;
+    rewriter.setInsertionPoint(rootOp);
+    SmallVector<Range> domain = root.getIterationDomain(rewriter);
+    std::optional<int64_t> m = getConstantIntValue(domain[0].size);
+    if (!m)
+      continue;
+    SmallVector<OpFoldResult> offsets, sizes;
+    for (Range range : domain) {
+      offsets.push_back(range.offset);
+      sizes.push_back(range.size);
+    }
+    // Each part's result written into its rows of the root's destination.
+    Value result = cast<DestinationStyleOpInterface>(rootOp).getDpsInits()[0];
+    int64_t whole = *m - *m % rows;
+    for (auto [offset, size] : {std::pair{int64_t(0), whole}, std::pair{whole, *m - whole}}) {
+      offsets[0] = rewriter.getIndexAttr(offset);
+      sizes[0] = rewriter.getIndexAttr(size);
+      rewriter.setInsertionPoint(rootOp);
+      FailureOr<TilingResult> part = root.getTiledImplementation(rewriter, offsets, sizes);
+      if (failed(part) || part->tiledValues.size() != 1)
+        return split;
+      // The consumer's rows of a product it reads: those rows of the product.
+      for (Operation *slice : part->generatedSlices) {
+        auto rowsOf = dyn_cast<tensor::ExtractSliceOp>(slice);
+        if (!rowsOf || !fusedProducts.contains(rowsOf.getSource().getDefiningOp()))
+          continue;
+        rewriter.setInsertionPoint(rowsOf);
+        FailureOr<TilingResult> product =
+            tensor::replaceExtractSliceWithTiledProducer(rewriter, rowsOf, cast<OpResult>(rowsOf.getSource()));
+        if (succeeded(product))
+          rewriter.replaceOp(rowsOf, product->tiledValues);
+      }
+      SmallVector<OpFoldResult> resultOffsets, resultSizes;
+      rewriter.setInsertionPoint(rootOp);
+      if (failed(root.getResultTilePosition(rewriter, 0, offsets, sizes, resultOffsets, resultSizes)))
+        return split;
+      SmallVector<OpFoldResult> strides(resultOffsets.size(), rewriter.getIndexAttr(1));
+      result = rewriter.create<tensor::InsertSliceOp>(rootOp->getLoc(), part->tiledValues[0], result,
+                                                      resultOffsets, resultSizes, strides);
+    }
+    // The whole product the consumer read, now unused.
+    llvm::SetVector<Operation *> products;
+    for (Value operand : rootOp->getOperands())
+      if (Operation *producer = operand.getDefiningOp(); producer && fusedProducts.contains(producer))
+        products.insert(producer);
+    rewriter.replaceOp(rootOp, result);
+    for (Operation *product : products)
+      if (product->use_empty())
+        rewriter.eraseOp(product);
+    ++split;
+  }
+  return split;
+}
+
+// A `linalg` op on buffers whose bounds aren't affine dimensions or symbols
+// (a tile's size computed inside a `scf` loop, a tile the schedule left of
+// dynamic size): `scf.for` loops, slower than the affine loops the affine
+// passes vectorize, but compiled where `convert-linalg-to-affine-loops` would
+// build loops the verifier rejects and fail the compilation. Whether they
+// would be valid is found by building them and verifying them, diagnostics
+// silenced, then erasing them: the ops they're valid for are left to
+// `convert-linalg-to-affine-loops`, unchanged. Returns how many ops it lowered.
+static int64_t cleaveLowerNonAffineLinalg(MlirOperation op) {
+  SmallVector<linalg::LinalgOp> ops;
+  unwrap(op)->walk([&](linalg::LinalgOp linalgOp) {
+    if (linalgOp.hasPureBufferSemantics())
+      ops.push_back(linalgOp);
+  });
+  MLIRContext *context = unwrap(op)->getContext();
+  IRRewriter rewriter(context);
+  int64_t lowered = 0;
+  for (linalg::LinalgOp linalgOp : ops) {
+    // What the trial inserts, the loops and their bounds' constants, sits
+    // between the op's previous neighbour and the op.
+    Operation *previous = linalgOp->getPrevNode();
+    auto eraseTrial = [&] {
+      while (Operation *inserted = linalgOp->getPrevNode()) {
+        if (inserted == previous)
+          break;
+        rewriter.eraseOp(inserted);
+      }
+    };
+    rewriter.setInsertionPoint(linalgOp);
+    FailureOr<linalg::LinalgLoops> affine = linalg::linalgOpToAffineLoops(rewriter, linalgOp);
+    if (failed(affine) || affine->empty()) {
+      eraseTrial();
+      continue;
+    }
+    bool valid;
+    {
+      ScopedDiagnosticHandler silenced(context, [](Diagnostic &) { return success(); });
+      valid = succeeded(verify(affine->front()));
+    }
+    eraseTrial();
+    if (valid)
+      continue;
+    rewriter.setInsertionPoint(linalgOp);
+    if (succeeded(linalg::linalgOpToLoops(rewriter, linalgOp))) {
+      rewriter.eraseOp(linalgOp);
+      ++lowered;
+    }
+  }
+  return lowered;
 }
 
 // Every `linalg.matmul` marked `cleave.blas`, tiled or not: a call to
@@ -1731,6 +1873,9 @@ CLEAVE_COUNTING_PASS(FoldPassthroughIterArgsPass,
 CLEAVE_COUNTING_PASS(DeallocAtLastUsePass, "cleave-dealloc-at-last-use",
                      "deallocations moved to the last use",
                      cleaveDeallocAtLastUse)
+CLEAVE_COUNTING_PASS(LowerNonAffineLinalgPass, "cleave-lower-non-affine-linalg",
+                     "linalg ops with non-affine bounds lowered to scf loops",
+                     cleaveLowerNonAffineLinalg)
 CLEAVE_COUNTING_PASS(BindTeamsPass, "cleave-bind-teams",
                      "parallel regions placing their threads", cleaveBindTeams)
 CLEAVE_PLAIN_PASS(LowerAdoptionsPass, "cleave-lower-adoptions",
@@ -1794,6 +1939,24 @@ struct BlasTileAndFusePass
   Statistic fused{this, "fused", "products fused with their consumer"};
   void runOnOperation() final {
     fused += cleaveBlasTileAndFuse(wrap(getOperation().getOperation()), rows);
+  }
+};
+
+struct SplitRowRemaindersPass
+    : PassWrapper<SplitRowRemaindersPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SplitRowRemaindersPass)
+  SplitRowRemaindersPass() = default;
+  SplitRowRemaindersPass(const SplitRowRemaindersPass &other) : PassWrapper(other) {}
+  StringRef getArgument() const final { return "cleave-split-row-remainders"; }
+  StringRef getName() const final { return "cleave-split-row-remainders"; }
+  StringRef getDescription() const final {
+    return "products split into whole row tiles and a remainder of static size";
+  }
+  Option<int64_t> rows{*this, "rows", llvm::cl::desc("rows per tile"),
+                       llvm::cl::init(8)};
+  Statistic split{this, "split", "operations split"};
+  void runOnOperation() final {
+    split += cleaveSplitRowRemainders(wrap(getOperation().getOperation()), rows);
   }
 };
 
@@ -2547,6 +2710,8 @@ extern "C" void cleaveRegisterPasses() {
     registerAllPasses();
     PassRegistration<LimitInliningPass>();
     PassRegistration<BlasTileAndFusePass>();
+    PassRegistration<SplitRowRemaindersPass>();
+    PassRegistration<LowerNonAffineLinalgPass>();
     PassRegistration<LowerBlasMatmulsPass>();
     PassRegistration<ReuseDyingInputsPass>();
     PassRegistration<ElideBlockCopiesPass>();

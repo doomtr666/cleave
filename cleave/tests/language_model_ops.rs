@@ -358,6 +358,62 @@ fn a_matmul_with_a_partial_column_tile_compiles_and_computes_the_product() {
 stderr: {stderr}");
 }
 
+/// Matmuls whose row count isn't a multiple of the schedule's row tile of 8
+/// (a batch of 100), alone and followed by an elementwise epilogue (the two
+/// shapes the schedule tiles differently), compile through the real CLI and
+/// compute the product, checked against a plain triple loop. The rows' last
+/// tile used to have a dynamic size, which nothing vectorized and the affine
+/// lowering rejected (`'affine.for' op operand cannot be used as a dimension
+/// id`).
+#[test]
+fn matmuls_with_a_partial_row_tile_compile_and_compute_the_product() {
+    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("partial_row_tile.cleave");
+    let check = |m: usize| {
+        format!(
+            "
+            let x{m}: Tensor<f32, {m}, 64> = Init::he();
+            let c{m}: Tensor<f32, {m}, 32> = Init::he();
+            let y{m} = plain(x{m}, w);
+            let z{m} = epilogue(x{m}, w, c{m});
+            for i in 0..{m} {{ for j in 0..32 {{
+                let mut s = 0.0;
+                for k in 0..64 {{ s = s + x{m}[i, k] * w[k, j]; }};
+                d = d + (s - y{m}[i, j]) * (s - y{m}[i, j]) + (s + c{m}[i, j] - z{m}[i, j]) * (s + c{m}[i, j] - z{m}[i, j]);
+            }}; }};"
+        )
+    };
+    let checks: String = [4, 7, 9, 100].into_iter().map(check).collect();
+    std::fs::write(
+        &source,
+        format!(
+            "
+            use nn;
+            fn plain<const M: i32>(x: Tensor<f32, M, 64>, w: Tensor<f32, 64, 32>) -> Tensor<f32, M, 32> {{ matmul(x, w) }}
+            fn epilogue<const M: i32>(x: Tensor<f32, M, 64>, w: Tensor<f32, 64, 32>, c: Tensor<f32, M, 32>) -> Tensor<f32, M, 32> {{ matmul(x, w) + c }}
+            fn main() -> i32 {{
+                rand_seed(1);
+                let w: Tensor<f32, 64, 32> = Init::he();
+                let mut d = 0.0;
+                {checks}
+                if d < 0.001 {{ 1 }} else {{ 0 }}
+            }}
+            "
+        ),
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--no-debug-info", "--run"])
+        .arg(&source)
+        .output()
+        .expect("cannot run cleave");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("main returned: 1"), "stdout: {stdout}
+stderr: {stderr}");
+}
+
 /// `matmul_transpose_b` compiled as a function of its own (`--no-inline`):
 /// the affine super-vectorizer gives it permuted vector transfers (column
 /// reads) that `--convert-vector-to-llvm` can't lower, which used to reach

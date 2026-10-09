@@ -2900,3 +2900,340 @@ Along the way, comparisons of known integers fold in the e-graph (`ConstantFold:
 The dependencies and the workspace's `[patch.crates-io]` forks are gone; `Cargo.lock` has none of them, nor bindgen. The toolchain's prefix is one variable, `CLEAVE_LLVM_PREFIX` (replacing `MLIR_SYS_220_PREFIX` and `TABLEGEN_220_PREFIX`), written by `scripts/setup-toolchain.ps1` and read by the shim's `build.rs`, `--run` and `cleave-build` (libomp). `doc/building.md`, the README, `.cargo/config.toml.example` and the CI comments updated. Code comments that still tell melior's history are left to the comment-hygiene entry in `backlog.md`.
 
 Checked: `cargo build --release --workspace` (every example's kernel through `cleave-build`), the smoke suite, the shim's tests. The plan's five steps are done; its sixth (a prebuilt shim artifact) was dropped, the shim staying in this repository.
+
+### A size-class free-list pool for `cleave_alloc_rc`, and the three `refcount.rs` bugs it surfaced
+
+Started from the user's own "pool for the CPS-continuation-carried slots" idea (a *former* version of this entry — see git history — sketched a bespoke, per-allocation-site, depth-bounded pool requiring a new static "is this loop-carried" classification). That design was **replaced before being built** by a simpler, general one, once re-examining the goal ("on veut juste payer le malloc qu'une fois") showed the per-site classification was solving the wrong problem: the real requirement is just "the same handful of sizes recur every iteration, so cache by size class" — which needs no new CPS-level analysis at all, and benefits every `cleave_alloc_rc` caller in the program, not just the one motivating loop.
+
+**What actually landed, in `cleave-rt/src/lib.rs`**: `cleave_alloc_rc`/`cleave_release`'s own non-arena path now goes through a segregated free-list cache, one intrusive singly-linked list per power-of-two size class (`size_class`/`class_bytes`), guarded by a spinlock (`POOL_LOCK`) — a real, found-by-testing requirement, not caution for its own sake: `cleave_alloc_rc`/`cleave_release` calls exist *inside* several `..omp_par.N` OpenMP-outlined parallel regions (per-thread scratch tensors), genuinely reachable from multiple worker threads at once whenever `OMP_NUM_THREADS > 1` — confirmed directly against the real kernel's own disassembled `.o`, not assumed.
+
+**Three real, confirmed-independently bugs in `cleave/src/refcount.rs` surfaced by the pool** (all pre-existing, unrelated to each other, all invisible under the *old* allocator because none manifests without the pool's own immediate, deterministic block reuse — the stray writes they caused landed in memory the old allocator had already handed back to the OS). Item 3 is the crash; item 1 was fixed en route; item 2 (a leak) had its fix attempt reverted and is still open:
+1. **A genuine over-release for identity-preserving loop-carried values.** `Optimizer::step<Sgd, ...>` returns `state` unchanged (`Sgd` is a stateless optimizer — it re-wraps `state`'s own existing leaves, never computes a new value for them) — the training loop's own back-edge unconditionally releases the *old* carried state's own leaves every iteration, correct for `net` (genuinely recomputed each step) but one release too many for `state` specifically, since old-and-new are the exact same object. Root-caused precisely (not guessed) by tracing `--dump-cps-optimized` variable by variable. Fixed via a new `param_leaf_key` analysis (`refcount.rs`) that recognizes, at a function's own true return, when a returned leaf still traces back — through any number of transparent `Field`/`StructCtor` hops — to one of that function's own parameters, and skips exactly the first of the (pre-existing, harmless-until-now) redundant release occurrences for it, restoring the same balance a genuinely fresh value already had. Verified by direct count on the real kernel's own dump (`retains=2, releases=1` for `state`'s own leaves inside `Optimizer::step`, matching the `-1` its own caller already contributes).
+2. **A real, unbounded leak** (confirmed, not just a corruption theory): a freshly-computed value passed as a literal argument to an ordinary function call (`Scale::scale(lr, grad)`'s own result, fed straight into `Ring::sub`, never read again) is never released by anyone — the caller's own bookkeeping "transfers" it to the call and stops tracking it, and the callee (an ordinary top-level function) never releases its own borrowed parameters, by this project's own established convention. **A fix was attempted and reverted** — see the comment left in place at `refcount.rs`'s own `rewrite_body::Fix` arm, right where the attempt lived: seeding the argument for release at the callee's own resumption, guarded on it not being one of the resumption's own free variables (protecting a genuinely-still-needed one) and on the enclosing function not being `region_analysis::find_region_local_functions`-local (arena-backed values are bulk-reclaimed regardless, so this fix's own motivating leak never applies there), still produced a real, reproducible `STATUS_ACCESS_VIOLATION` — confirmed, by disabling the fix outright, to be the fix's own doing. The real remaining flaw in that approach was not identified before the fix was reverted; the leak itself is real and still open.
+
+3. **The crash — a compiler-emitted double `cleave_release` on the same allocation, in `cleave/src/refcount.rs`, now fixed.** The pool's free-list would acquire a garbage "next" link (a valid pointer ±1, so *misaligned* — ends in an odd nibble — not the `0xFFFF...` first guessed), crashing the *next* pop of that size class with `STATUS_ACCESS_VIOLATION`. Root-caused precisely this time, with real tooling: `lldb` now works (`winget install Python.Python.3.10` supplies the `python310.dll` `liblldb.dll` needs), and `CARGO_PROFILE_RELEASE_DEBUG=true` gives source-level symbols for `cleave-rt`. Temporary instrumentation in the pool (an alignment assert on every pop/push, a `!(base)` canary in bytes `[8..16]` of every parked block, and a `PARKED` set of currently-free block bases that `cleave_retain`/`cleave_release` consult) pinned it to *"`cleave_release` called on a block already freed and pooled"* — the canary intact but the next-pointer off by one, the signature of a stray `cleave_release` doing `refcount -= 1` on what is now the free-list link. `lldb` + disassembly of the faulting `train_and_evaluate` offset showed **two `call cleave_release` back-to-back on the same register**, once per epoch, right after the `Epoch=` print. Source: `println(("Epoch=", epoch))`. `stdlib/io`'s `Print::print<(A,B)>` and `println` are both `fn(x) -> x` — they return their argument unchanged — so the caller's `--dump-cps-optimized` showed `(release <println result>)` *and* `(release <the tuple it constructed>)`, two releases of one allocation. `refcount.rs`'s `rewrite_body::Fix` arm seeds every *transferred* literal call-argument into the call's own resumption for release; when that argument shares the resumption's return-value parameter's type, the callee may be handing that very allocation back (`Print::print`/`println` do), so the return-value parameter — already seeded, already released — covers it and the argument must not be seeded again. Guarded to only skip an argument the call is genuinely the *last* use of (not a free variable of the resumption): `net_grad: Network -> Network` also type-matches but returns a *fresh* gradient and its `net` argument is still needed by the following `Optimizer::step` in the same resumption, so it stays seeded. Verified by exact release-count diff on the real kernel's own dump (exactly one release removed, `v1791`, everything else identical), full `cargo test -p cleave` green, and real forced-clean AOT runs of both examples (`digits-interop` `0.94713414`; `mnist-interop` 10 epochs `0.9342`, no crash, OpenMP on). All the temporary pool instrumentation was removed afterward — `git diff` clean of everything but the `refcount.rs` fix. **A false lead worth recording**: the first cut of the `PARKED` set updated it *outside* `POOL_LOCK`, which raced concurrent OpenMP-worker pops/pushes and reported spurious "stale release"s in `digits-interop`; maintaining it inside the spinlock section, atomically with the `FREE_LISTS` mutation, made those vanish.
+
+Item 2 above (the `Scale::scale` transferred-argument leak) is **unrelated to item 3 and still open** — item 3's fix *removes* a seed in the same arm, item 2's reverted attempt *added* one; they don't interact, and the leak is real.
+
+**Net effect on the real kernel**: `RtlAllocateHeap`/`RtlFreeHeap` traffic for any repeated size is now paid at most once per process lifetime rather than every allocation.
+
+### Reference profile — 2026-09-10, `mnist-interop`, post-pool + post-double-free-fix
+
+Recorded as the baseline the next round of work (see below) is measured against. VTune 2025.8, **software** (user-mode) sampling — this machine is AMD, hardware event-based sampling is unavailable ("cannot recognize the processor"); sw-sampling inflates absolute CPU-seconds ~3–4× over a bare run, so read the **proportions**, not the wall-clock. Built `CARGO_PROFILE_RELEASE_DEBUG=true` (gives `cleave-rt` source symbols; `kernel.o` still has none, so the whole MLIR kernel shows as one flat `train_and_evaluate` symbol).
+
+**Bare wall-clock** (`cargo run --release -p mnist-interop`, 10 epochs, accuracy `0.9342` in every configuration), a `OMP_NUM_THREADS` sweep on this 16-logical-CPU box:
+
+| threads | elapsed | speedup vs 1T |
+|--------:|--------:|--------------:|
+| 1 (`CLEAVE_NO_OPENMP=1`) | ~18.8 s | 1.00× |
+| 2 | 13.3 s | 1.43× |
+| 4 | **12.1 s** | 1.56× |
+| 8 | 18.0 s | 1.05× |
+| 16 | 28.4 s | 0.66× |
+
+Scaling peaks at ~1.6× on 4 threads and goes **negative** past that.
+
+**VTune hotspots, 1 thread** (`train_and_evaluate` = the MLIR compute kernel; no spin time at all):
+
+| symbol | self | share |
+|---|--:|--:|
+| `train_and_evaluate` | 17.06 s | 86.1 % |
+| `memcpy`/`memmove` (`VCRUNTIME140`) + `cleave_rt::memrefCopy` | 1.19 s | 6.0 % |
+| `RtlAllocateHeap` + `RtlFreeHeap` | 0.37 s | **1.9 %** (was ~12 % pre-pool) |
+| `POOL_LOCK` (`AtomicBool::compare_exchange_weak`) | 0.21 s | ~1.0 % |
+| host-side MNIST unpack (`data::train_pixel`) + driver-loop scaffolding | ~0.55 s | ~2.8 % |
+
+The pool did its job: system-allocator cost fell from ~12 % to ~2 %, and the mono-thread kernel is now genuinely **compute-bound** (86 % in the kernel itself). `memcpy` (~6 %) is the remaining non-compute cost, consistent with the `dps_rewrite` `Strategy::Passthrough` fix already having landed.
+
+**VTune hotspots, 4 threads** (267.9 s CPU / 67.5 s elapsed *under the profiler*; Effective Time 29.8 s = **11.1 %**, Spin 190.3 s = **71 %**, Overhead 47.8 s = **17.8 %**):
+
+| symbol | CPU time | share |
+|---|--:|--:|
+| `libomp` spin-wait (`func@0x18001d04f`) | 121.0 s | 45.2 % |
+| `_kmpc_barrier` | 98.4 s | 36.7 % |
+| **`train_and_evaluate`** (real compute) | 16.5 s | **6.2 %** |
+| `libomp` (`func@0x18001cb40`) | 9.4 s | 3.5 % |
+| `_kmp_fork_call` (parallel-region creation) | 9.1 s | 3.4 % |
+
+~85 % of CPU is pure OpenMP barrier + spin + fork/join; only ~6 % is compute. VTune's own diagnostic: *"CPU time spent on parallel work arrangement can be a result of too fine-grain parallelism. Try parallelizing outer loops rather than inner loops."* The pool spinlock is **not** the cause — `RtlAllocateHeap`/`compare_exchange_weak`/`cleave_alloc_rc` are all buried in `[Others]` at < 5 % combined; the earlier "`POOL_LOCK` contention is the parallel-scaling killer" hypothesis is **disproven** by this profile.
+
+**The real finding, and the next work item**: cleave's `--convert-scf-to-openmp` parallelizes at far too fine a grain — the generated kernel forks a parallel region and hits a barrier around individual small ops inside the per-batch inner loop (1875 batches × 10 epochs × many parallelized ops = on the order of millions of fork/join + barrier round-trips), each doing microseconds of work on the tiny MLP layers at batch 32. This — not allocation, not `memcpy` — is the OpenMP-efficiency gap vs PyTorch (whose persistent threadpool dispatches coarse tasks). Fixing it means parallelizing an *outer* loop (the batch loop, or a tile band spanning many rows) once per region instead of the innermost linalg op, and/or keeping a worker pool alive across regions. Re-measure this exact sweep + both VTune profiles after any such change.
+
+### Reference profile — 2026-09-17, `mnist-interop`, post-§11/§13/§14 (pool-cascade for never-mutated nested structs, `CLEAVE_AFFINE_STRUCTS` flipped on by default)
+
+Mono-thread only (`CLEAVE_NO_OPENMP=1`, forced-clean rebuild) — the OpenMP sweep above is untouched by this round of work by design (memory-management and parallel scheduling are orthogonal axes; see `doc/plan-affine-ownership.md`). `vtune -collect hotspots`, same machine, same methodology as the 2026-09-10 reference above.
+
+| symbol | CPU time | share |
+|---|--:|--:|
+| `train_and_evaluate` | 14.397 s | 78.1 % |
+| `func@...` (`VCRUNTIME140.dll`, unresolved — `memcpy`-shaped, per this project's own established reading) | 1.276 s | 6.9 % |
+| `memrefCopy` | 1.100 s | 6.0 % |
+| `train_pixel` (host-side MNIST unpack) | 0.496 s | 2.7 % |
+| `cleave_release` | 0.331 s | 1.8 % |
+| `[Others]` | 0.842 s | 4.6 % |
+
+Elapsed 18.58 s (CPU 18.44 s, 1 thread — no spin, matches elapsed almost exactly, unlike the inflated multi-thread CPU-seconds this file's own methodology note warns about).
+
+**Real, absolute win inside `train_and_evaluate` itself**: `17.06 s -> 14.397 s`, **-15.6 %**, consistent with tonight's pool-cascade work removing header allocations and shortening release chains for the struct values this giant inlined function constructs and tears down every batch. But the *share* dropped (`86.1 % -> 78.1 %`) rather than held or grown, because the non-compute pieces did **not** shrink proportionally — `memrefCopy` is flat (`1.19 s -> ~1.10-1.28 s` combined with the VCRUNTIME frame), so as the compute numerator shrinks, this roughly-fixed copy cost eats a growing slice of a shrinking pie — the identical "shrinking base" dynamic this file's own OpenMP entries already named from the other side (`speedup ratio shrinks as the per-region cost shrinks`). Still, `78.1 % + 2.7 %` (`train_pixel`, also real work, not overhead) `= 80.8 %` in genuinely useful work — matching this round's own stated target ("le maximum de temps dans le code de calcul... on a déjà 80%+") almost exactly.
+
+**Net reading**: the pool-cascade work is a real, measured, absolute single-thread win, not just a correctness/memory fix — but the next lever for *mono-thread* time is now unambiguously the `memcpy`/`memrefCopy` pair (`~12.9%` combined), not allocation (`cleave_release` alone is `1.8%`, already small). The OpenMP-scaling gap above remains completely untouched and is still the dominant, order-of-magnitude-larger opportunity once threads are involved.
+
+**Closed 2026-10-09.** Item 2 (the `Scale::scale` argument leak) no longer reproduces: `Sgd`'s step is exactly `Ring::sub(model, Scale::scale(grad, opt.lr))`, and `leaks.rs::training_steps_leave_no_allocation_behind` (Sgd, Momentum) passes.
+
+### The kernel object carries CodeView debug info, inline sites included
+
+Motivated directly by the profile above: every VTune/AMDuProf run so far attributed 100% of compute to one flat `train_and_evaluate` symbol with no line information, because `mlir_lower.rs` built every op with `Location::unknown` and the object went out with no `.debug$*` sections at all. Root-causing the `println` double-free earlier this session took ~30 tool calls of `llvm-objdump` + hand-correlation for want of exactly this.
+
+**What landed, all in-process — no `mlir-opt` subprocess, no C-API DI-attr builder (MLIR's C API has none):**
+- Every `Location::unknown` in `mlir_lower.rs`/`dps_rewrite.rs` replaced with a real `FileLineColLoc`. This is a hard prerequisite, not cosmetic: once a function carries a `DISubprogram`, the LLVM verifier rejects any inlinable call inside it whose location has no `!dbg`.
+- `build_di_subprograms` (`mlir_lower.rs`) constructs one `#llvm.di_subprogram` per defined `llvm.func` from **text**, parsed as a single array attribute in one `Attribute::parse` call so the `distinct[0]<>` compile-unit id unifies to one shared `DICompileUnit` (separate parses would each mint their own — the LLVM verifier then rejects "multiple debug compile units"). `pipeline.rs::stamp_di_subprograms` attaches each via a `FusedLoc` on the `llvm.func`, run **last**, after every hand-walk (`unify_tensor_allocations`, `stamp_target_cpu`), so nothing inserts an un-located op into an already-`DISubprogram`'d function. This reimplements the one thing MLIR's `EnsureDebugInfoScopeOnLLVMFunc` pass does — that pass **segfaulted** (`STATUS_ACCESS_VIOLATION`) when run in-process through the earlier Rust bindings, while running fine in `mlir-opt`: most likely a pass registration the static link dropped. Retried 2026-10-09: it runs in-process now (`cleave-mlir/tests/passes.rs`), but it isn't a replacement: it gives a `DISubprogram` to each final `llvm.func` only, and turns inlined code into lexical blocks of the caller. cleave's own subprograms, one per source function before inlining, keep inlined functions named as inlined frames: what lets a profile of a fully inlined kernel show `net_grad` and `Optimizer::step` rather than one `train_and_evaluate`. The text-built subprograms stay.
+- An `llvm.module_flags` op with `CodeView = 1` + `Debug Info Version = 3`, built via `OperationBuilder`. Without the `CodeView` flag the backend emits DWARF `.debug_line`, which `lld-link` ignores for PDB purposes; with it, `.debug$S`/`.debug$T`, which `lld-link` folds straight into `mnist_interop.pdb` alongside the Rust `.debug$S` that `CARGO_PROFILE_RELEASE_DEBUG=true` already produces — zero extra linker config.
+- `mlirExecutionEngineDumpToObjectFile` **does** emit the CodeView sections once the DI metadata + module flag are present (an earlier "it strips debug info" conclusion was a stale-object artifact).
+
+**Source lines, two tiers:**
+- **Per-function (robust, survives everything):** `CTopLevelFn::line`, set once in `convert_program` from the first AST span inside the body (the `fn` keyword has no node), threaded unchanged through `synthesize_derivatives`/`optimize_program`/`eliminate_dead_code`/`rc_opt`/`insert_refcounting` (all rebuild bodies but keep the struct). `train_and_evaluate` now resolves in `lldb` as `at kernel.cleave:218` — its first real statement.
+- **Per-statement (best-effort):** `CpsProgram::op_lines: HashMap<CVar, u32>`, populated at the 13 `LetPrim` construction sites in `convert_program` (`convert_expr` tracks the innermost expression span in a `Cell`), carried through every pass, consumed by a process-global `GEN_LINE` that `mlir_lower.rs::lower_cexpr`'s `LetPrim` arm stamps before lowering each op. `train_and_evaluate`'s CodeView line table now spans `218, 223, 231, 233, 243, 244, 247` — its actual statements, not one flat line.
+
+**The real root cause, found by direct measurement, and the fix — inlined functions now keep real, separately-attributable debug info:**
+
+A `count_locs`/`has_real_line` walk inserted between every pass in `lower_to_llvm` (removed after use) first looked like it confirmed the obvious guess: `located` count crashes right after the very first pass (`--inline`). It didn't. A *shallow* `is_file_line_col_range()` check reports "unknown" for a `CallSiteLoc` even when the real line is sitting one level down in its own `callee` field — `--inline` wraps a cloned op's already-good location in `CallSiteLoc(calleeLoc, callerLoc)`, it never destroys it. `has_real_line` (recursing into `CallSiteLoc`/`FusedLoc`) showed the true picture: ~97% of ops resolve to a real line all the way through the pipeline. **The debug info was never lost. It had nowhere to attach a scope.** LLVM's translator needs the *callee* side of an inlined `CallSiteLoc` chain to already carry a `DISubprogram` to emit a real "inlined at" `DILocation` — and the previous design (`stamp_di_subprograms`, run once at the very end, on whichever `llvm.func`s survived) only ever gave a subprogram to `train_and_evaluate` + `dealloc_helper`. `matmul`/`net_grad`/`relu`/... never got one (they'd already been inlined away by then), so their otherwise-perfectly-good `CallSiteLoc` chains had no scope to resolve against, and the translator fell back to the one available scope: the enclosing (post-inline) function.
+
+**The fix**: give *every* function its own `DISubprogram` **before** `--inline` runs, fused onto **every op** `gen_loc` stamps for it (not just the function's own top-level declaration op — that wrapper disappears once the function is inlined away, but each individual op's own location survives, wrapped in `CallSiteLoc`, and now carries its own scope from the start).
+- `mlir_lower.rs::lower_program` now calls `build_di_subprograms` up front, once, for *all* of `program.funcs` (previously: only for the survivors, at the very end).
+- `Attribute<'c>` can't live in a `static` (not `Send`, lifetime tied to `Context`) the way `GEN_LINE`/`GEN_FILE` already do, so `set_gen_subprogram`/`GEN_SUBPROGRAM` stash the attribute's own raw `MlirAttribute.ptr` as a `usize` instead — sound for the span of one `lower_program` call, the only place it's read back (`gen_loc`'s own doc comment has the full safety argument). `lower_program`'s per-function loop sets it before lowering each function's body; `gen_loc` fuses it onto the `FileLineColLoc` it would have returned anyway.
+- This made the old post-hoc `stamp_di_subprograms`/`collect_defined_llvm_func_names` (attach a subprogram to whichever `llvm.func` survived) **entirely redundant** — deleted. What's left, `backfill_all_unknown_locs`, only does the one thing still needed: give a genuinely bare `UnknownLoc` op (one an MLIR lowering pass synthesized from scratch — the tiled/vectorized loop nests, mostly) the enclosing (already well-scoped) function's location as a floor.
+
+**A real crash found and fixed along the way**: turning this on unconditionally first produced a reproducible `STATUS_ACCESS_VIOLATION` inside the `cleave-build` build script — not a graceful `Err`. The actual LLVM verifier complaint, buried in the raw stderr: `"function declaration may only have a unique !dbg attachment"`, once per `cleave-rt` extern (`cleave_alloc_rc`, `print_i32`, `train_pixel`, ...). `ensure_extern_declared` (`mlir_lower.rs`) builds these as real declarations (empty region, no body) but was calling the same `gen_loc()` as everything else — so the first cleave function to reference a given extern symbol fused *its own* `DISubprogram` onto that extern's declaration, which LLVM disallows (a declaration has no body to scope debug info to in the first place). Fixed by giving `ensure_extern_declared` a bare, un-fused `Location::new(...)` instead of `gen_loc()`.
+
+**Verified, on the real, cleanly-rebuilt `mnist-interop` kernel.o** (not a synthetic probe):
+- `llvm-readobj --codeview kernel.o` → **193 real `S_INLINESITE` records** (an isolated `emissionKind = Full` experiment on the same IR via `llc` directly showed 585 — `mlirExecutionEngineDumpToObjectFile`'s own codegen is a bit more conservative but demonstrably emits the same kind of record, not zero).
+- `lldb`: `b kernel.cleave:158` (`MatMul::matmul`'s own real source line — a function with no standalone symbol left anywhere in the binary) → **`Breakpoint 1: 5 locations`** — 5 real, distinct addresses, one per generic instantiation actually inlined into the kernel. A breakpoint on an inlined-away function's own source line genuinely works.
+- `image dump line-table kernel.cleave` (the *flat* PC→line view, not an inline-site query) still only shows `train_and_evaluate`'s own ~8 driver-loop lines — expected and not a regression: a flat line table is defined to report the outermost attribution; the per-inlined-function detail lives in the `S_INLINESITE` records instead, exactly what `b kernel.cleave:158` above reads. Checking for it via the wrong query (`image lookup -v -a <addr>`'s "Blocks:" listing, which lldb's own PDB/Windows inline-frame support doesn't populate) is what made this look broken longer than it needed to; VTune, a far more mature CodeView consumer, is expected to show real per-inlined-function source attribution now that the records genuinely exist in the object.
+- Debugging the printer-vs-diagnostic distinction along the way: `Operation::to_string()` (the default printer) **never prints locations at all** (matches `mlir-opt`'s own default) — `count_locs`'s first, wildly-wrong readings on a *dumped* module were this, not real data loss. `OperationPrintingFlags::new().enable_debug_info(true, false)` + `to_string_with_flags` is required to see them.
+- Full `cargo test -p cleave --release --no-fail-fast` green; `mnist-interop` 10 epochs `0.9342`, `digits-interop` `0.94713414`, both unchanged.
+
+**Per-statement lines (`CpsProgram::op_lines`, `convert_program`'s 13 `LetPrim` sites) and the e-graph/derivative provenance foundation (`FoldData::line` on `ConstantFold`, `Forward::add_from_letprim`) from earlier in this same session are unaffected by the above and still exactly as good/limited as before**: real per-statement lines for anything that stays as CPS-emitted straight-line code (`train_and_evaluate`'s own driver loop: `218, 223, 231, 233, 243, 244, 247`), a coarse "whole rewritten segment / whole synthesized derivative → one line" floor for anything that goes through the e-graph or `synthesize_derivatives`, and `FoldData::line`'s own precise per-e-class line **still not wired through `rebuild`/`rebuild_segment`'s extraction** — the one piece of the per-*statement* (not per-*function*) story still open. This is now a smaller gap than it looked: even the coarse floor is a real, correctly-scoped `DISubprogram`'d location (net_grad's backward now genuinely attributes to `net_grad`'s own line via a real inline site, not just "somewhere in train_and_evaluate").
+
+DI emission is unconditional (adds real weight to every `kernel.o` now — every function gets a subprogram, not just the survivors) — fine while profiling, worth a `--debug-symbols` gate later. The `--emit-object` CLI path still prints the pre-existing, unrelated `NYI: non-trivial layout map` diagnostic (confirmed non-fatal there both before and after everything above; the DISubprogram text now embedded in that diagnostic's own location dump is what made it readable enough to spot the "inlined at" chain in the first place).
+
+**Closed.** Moved out of the backlog 2026-10-09.
+
+### A finer location backfill for MLIR-synthesized ops, and a switch keeping function boundaries
+
+**1. `backfill_unknown_locs`/`backfill_all_unknown_locs` (`pipeline.rs`) now propagate the *nearest real location seen so far in program order*, not a single fixed fallback (the enclosing function's own declaration line) for every synthesized op in the whole body.** Found while the user was reading a real `mnist-interop` disassembly and unable to attribute large, unlabeled `mov mem, zmmN` sequences (plausibly a tiled matmul accumulator's own `linalg.fill` zero-seed) to anything — every MLIR-lowering-synthesized op (tiled loop scaffolding, vectorized epilogues — anything with no cleave-source counterpart to inherit a location from at all) used to collapse onto the *exact same* single line as literally everything else in the function, since the old backfill just stamped the function's own root location everywhere. Now each synthesized run inherits whichever real, cleave-emitted op it was generated closest to, until the next real one is seen — still a floor, not genuine provenance (structurally impossible for an op that never existed in cleave source), but one that separates "this sits near the matmul" from "this sits near the bias-add" instead of flattening a whole function to one address range.
+
+**2. `CLEAVE_NO_INLINE=1`** (`pipeline.rs::lower_to_llvm`, same opt-out convention as `CLEAVE_NO_OPENMP`/`CLEAVE_NO_DPS`/`CLEAVE_NO_AFFINE_STRUCTS`) skips only `--inline` itself — `--convert-elementwise-to-linalg`/`--linalg-fuse-elementwise-ops` still run (harmless without cross-function inlining, nothing left for them to fuse), and every later stage degrades safely to its own always-correct, un-rewritten path. Diagnostic only, explicitly not for a perf build — it reopens exactly the double-scratch-buffer cost the inline+fuse comment above it measured and fixed. **Verified directly**: `CLEAVE_NO_INLINE=1`, forced-clean rebuild of `mnist-interop` — `llvm-nm` on the real `kernel.o` now shows `MatMul::matmul<...>` (every shape) as real, standalone, globally-defined symbols with their own `..omp_par.N` regions, instead of inlined away entirely; `mnist-interop` still runs correctly end to end, `0.9342`, no crash (predictably much slower — no fusion, no `dps_rewrite` candidates, exactly as expected for a diagnostic-only build).
+
+**Verified**: full `cargo test -p cleave --release --no-fail-fast` green (one `fibonacci_example_runs_cleanly` failure on the first full-workspace run was a transient parallel-test-runner flake — passed cleanly both in isolation and on a clean re-run of the whole `examples` binary, not a real regression). Both examples re-run end to end with the default (inlining on) build after: `digits-interop` `0.94713414`, `mnist-interop` `0.9342`, unchanged.
+
+**Closed.** `CLEAVE_NO_INLINE=1` has since become the `--no-inline` option (`CodegenOptions::inline`).
+
+### `collect_affine_carried_params`: a value threaded through an identity-shaped call each iteration
+
+Picked up directly on the user's own request ("vas y pour carried params") rather than waiting for a real crash to surface it, following the exact same discipline as Bugs 1-3: reproduce the suspected gap in isolation first, via a dedicated debug probe, before writing any fix.
+
+**Confirmed real, by direct construction, not assumed**: a minimal program mirroring `Display::display<Complex<T>>`'s own shape but inside a loop --
+
+```
+fn thread_through(cond: bool, a: Boxed) -> Boxed {
+    if cond { opaque_sink(touch1(a)); a } else { opaque_sink(touch2(a)); a }
+}
+fn main() -> i32 {
+    let mut b = Boxed(v: 0, tag: [0]);
+    for i in 0..2000 { b = thread_through(i < 1000, b); };
+    b.v
+}
+```
+
+-- a debug probe on `affine_struct_vars`'s own output showed `entry affine = true`, `carried affine = false`, even though `identity_summary.returns_unchanged("thread_through", 1)` was already correctly `Some(true)`.
+
+**Root cause: a genuine mutual dependency the existing single-pass-per-iteration fixed point can never seed on its own.** The loop's own back-edge argument (`b2`, `thread_through`'s own resumption parameter) can only be marked affine by `collect_affine_resumption_params` once the carried parameter itself (`thread_through`'s own argument at that call site) is *already* affine. The carried parameter, under the original rule, can only be marked affine once *every* one of its own sources -- including that same back-edge argument -- is *already* affine. Neither side has anywhere to seed from independently within the loop body itself; the true anchor (the entry argument, constructed *outside* the loop) is only ever checked by `collect_affine_carried_params`, which requires *every* source affine, back-edge included -- so the fixed point converges after one iteration having made no progress on this cycle at all, despite the real answer being sound.
+
+**Fixed, in `alias_analysis.rs`, with a new mechanism structurally mirroring `tail_returns_var`/`IdentitySummary` exactly, retargeted**: `carried_param_flows_to_own_backedge` -- "does the carried parameter, traced forward through the loop's own body (through local join-point hops the same way, and through an identity-shaped real call's own resumption via `identity_summary`, chasing an unrelated intervening call's own trailing continuation exactly like `tail_returns_var` already had to), ever reach a tail-call back to the loop itself with the *same* value at the *same* position?" If so, the carried parameter is *structurally* guaranteed to denote the same allocation every iteration -- its own back-edge arguments need no independent proof of their own at all, and its affine-ness reduces to whether *any* recorded call site (in practice, the one real anchor: the entry argument) is already affine. `collect_affine_carried_params` now checks this as an additional, alternative path alongside the original "every source independently affine" rule (kept, since it's still what the *fresh-construction-per-iteration* shape, `b = bump(b)`, needs).
+
+**One real bug found while building this, caught immediately by the same debug probe rather than assumed correct on the first attempt**: the first version, mirroring `tail_returns_var`'s *original* (single-hop) shape, didn't chase an unrelated intervening real call's own continuation -- every `for`/`while` loop's own bound check (`Ord::lt<i32>`) runs *before* the loop's real body on every iteration, and the carried value isn't one of *that* call's own arguments at all. Fixed identically to how `tail_returns_var` itself needed fixing for the same reason (this module's own established pattern, applied a second time to a new function rather than re-discovered from scratch).
+
+**Verified**: a new test, `a_carried_parameter_threaded_through_an_identity_shaped_real_call_each_iteration_is_affine_too` (`cleave/tests/alias_analysis.rs`), the exact minimized repro from the debug probe, both facts asserted directly. `examples/complex.cleave --run`/`examples/convex_hull.cleave --run`: 0/100 each, re-confirmed unaffected. Full `cargo test --release --no-fail-fast` (`RUST_MIN_STACK=67108864` set, per the entry above) green -- 35 test binaries, run cleanly with no concurrent interference.
+
+**Closed.** Moved out of the backlog 2026-10-09.
+
+### Float `const`/`define`
+
+Found in conversation, not by testing a failure directly, but confirmed by reading: `ConstValue` (`infer.rs`) is exactly `Int(u64) | Bool(bool)` — no third variant. `const PI: f64 = 3.14159;` cannot fold today: `registry.rs::eval_const_expr` and `infer.rs::const_value_from_expr`'s own `ExprKind::NumberLit` arms both parse the literal's text via `.parse::<u64>()` only, so a float-shaped literal (anything with a `.`) never even reaches a `ConstValue` at all, let alone one of the right kind — it fails the same permissive-by-omission way any other unrecognized shape does (silently unresolved, `pipeline.rs::check_const_decl_errors` reports it at the point of use, not with a message pointing at "float unsupported" specifically).
+
+**Squarely the right next investment in this exact area, not scope creep**: this whole `const`/`define` feature (this session's own work, `doc/hld.md`'s own "`const`/`define`: no `constexpr` sublanguage" section) is explicitly aimed at a scientist/HPC author, for whom a named float constant (a physical constant, a tolerance, a learning rate) is the single most obvious use case — arguably more obviously wanted than any integer/bool one already supported. Widening `const_eval.rs`'s own `ConstValue`/`eval_binop`/`eval_unop` to a `Float(f64)` variant (parsing `NumberLit`'s own text as a float when it contains a `.`, mirroring how ordinary literal defaulting already distinguishes `i32` vs `f32` shapes elsewhere in this codebase) is the natural, narrow, additive next step — same "grow what's foldable, don't invent a second mechanism" posture the whole feature was designed around, not a new design question.
+
+**Deliberately not conflated with general constant folding for ordinary `let` bindings** — that's a separate, already-existing mechanism (`egraph.rs::Analysis::make`'s own `const_int` computation, `doc/hld.md`'s "Constant and copy propagation" section), running later in the pipeline (post-CPS, on already-typed code) for a different reason (an e-graph congruence-closure consequence, not a value `const`/`define` needs resolved before type inference can even run). Widening `const_eval.rs` doesn't touch that mechanism at all, and vice versa — the two stay independent on purpose.
+
+**Closed.** Checked 2026-10-09: `define SCALE: f64 = 2.5;` and a float `const` fold and run.
+
+### nanoLM's kernel compile time: from ~3 minutes to ~30 s
+
+Measured on `examples/nanolm/src/kernel.cleave` with the transformer (4 blocks, d = 128). Front end down to optimized CPS: ~5 s. CPS to MLIR: 1.5 s, 22 MB of MLIR. MLIR passes: ~23 s, 69 MB of LLVM dialect. LLVM optimization and code generation: ~90 s, plus ~24 s writing the object. So the cost was LLVM digesting a huge IR.
+
+Why the IR was huge: everything inlined into the exported functions — `train_gpt` was one function of 704k lines out of 865k. Each heavy operation lowers to thousands of lines (attention forward ~5.7k, LayerNorm ~4.8k, a matmul ~1.7k: the matmul schedule's tiling, unrolled vector contractions, masks, memref descriptor plumbing), and full inlining copied them at every call site (LayerNorm 8 times forward plus its gradients, attention 4 + 12, …). `opt -O2 -time-passes` on that IR: `IndVarSimplify` 47%, then full unrolling, `LoopRotate`, `LICM`, all superlinear in function size; `llc` another 24 s, half of it register allocation.
+
+What was done, and what each change did alone:
+- `#[no_inline]` on `CausalAttention`'s and `LayerNorm`'s methods (`stdlib/nn`): each instance compiled once; IR down to 537k lines. **Alone it made things worse** (638 s): smaller functions let LLVM's `LoopUnrollPass` unroll far more (96 s of 174 in `opt`).
+- `CodegenOptions::llvm_loop_unroll` (CLI `--no-llvm-unroll`, `cleave-build` `.llvm_loop_unroll(false)`), turning off LLVM's own loop unrolling in the execution engine's pipeline (`cleave-mlir`'s `makeTransformer`; cleave's loops arrive already tiled and unrolled where it pays). **Alone, no gain** on the fully inlined kernel (168 s): there `IndVarSimplify` on the giant function dominates, not unrolling.
+- **Both together: 80 s** through the CLI, `cargo build -p nanolm` 1 min 50; a training step's speed unchanged (50 steps: 42.7 s against 41.0 s for the old configuration, within noise; identical validation loss). `nanolm/build.rs` uses `LLVM_LOOP_UNROLL = false`; the default stays `true` until measured on MNIST and the rest.
+- Also tried: `--no-inline` everywhere (12 s to compile, but 10× slower to run: fusion and vectorization need the small operations inlined), and rewriting Adam's leaf step as one loop (the IR grew: the ten tensor operations were already being fused well) — both reverted.
+
+Still large; the next leads: why each operation lowers to thousands of lines (vectorized loop nests and descriptor `insertvalue`/`extractvalue` chains dominate the op histogram); `no_inline` for more of the heavy, repeated operations (the gradient bodies, Adam per leaf shape); and the 24 s of writing the object (maybe a second code generation).
+
+Then the bigger model (6 blocks, d = 256), measured with `--no-openmp --no-llvm-unroll --target-cpu native --emit-object` and the phases timed separately (front end + CPS → MLIR ~3 s, MLIR passes, then the execution engine's optimization and the object's code generation, the bulk):
+- **148 s** to start with (code generation 82 s, LLVM optimization 31 s), 385k lines of LLVM dialect: `train_gpt` 132k, `generate` 114k, the Adam step's `Trainable` glue 89k.
+- `#[no_inline]` on Adam's leaf `step` (`stdlib/optim`): 112 s.
+- The BLAS tier of the matmuls out of line (`stdlib/linalg/matrix.cleave`, `blas_*`): the `sgemm` call and its glue (destination allocation, descriptors) once per shape rather than at each of ~200 call sites; the `linalg` path stays inlined. 95 s. Putting *every* matmul out of line reached 63 s but made MNIST 22% slower (lost fusion), rejected.
+- **The e-graph pass ignored `#[no_inline]`**: `optimize_program` walks a pure plain `fn` (a "transparent chain") as if inlined, so `block` disappeared into `gpt_logits` and `generate` before MLIR ever saw the attribute, and the Adam step's glue got the same treatment. It now keeps a `#[no_inline]` callee one opaque call (`Forward::honor_no_inline`), except while synthesizing a gradient, which has to see through a callee with no rule of its own. **36 s** (code generation 14.5 s, LLVM optimization 5 s), peak memory 4.2 → 2.7 GB; the Adam glue 89k → 5.7k lines, `generate` 114k → 55k.
+- `#[no_inline]` on the checkpoint leaves (`stdlib/checkpoint`: a tensor's and an Adam state's `save_part`/`restore_part`), copied for each of the 102 leaves wherever the model is saved or restored: IR 232k → 181k lines.
+- **`#[no_inline]` was read off the wrong impl**: `cps.rs::collect_units` took it from the impl being walked, while `specializations_of("Optimizer::step")` returns the specializations of *every* impl of the method (the trap `is_extern`/`is_pure` had already fallen into), so the last impl's attribute landed on all of them. Adam's spilled onto `Sgd`'s leaf step (MNIST ~1 s slower once the e-graph started honoring the attribute) and onto the generic `Trainable` glue of the optimizer and the checkpoints. Now carried by each specialization (`monomorphize.rs`, `Specialization::no_inline`); `language_model_ops.rs::no_inline_applies_to_the_declaring_method_only` covers this and the e-graph case. The glue, inlined again, puts nanoLM's IR at 207k lines (`train_gpt` 97k, `generate` 37k); **~30 s** to compile, peak memory 2.1 GB.
+
+Left: `train_gpt`'s gradient, where everything is necessarily inlined (synthesis sees through `block`; a per-function gradient, the backward of `block` as its own function, would let it be compiled once instead of six times), and the refcounting around the model's construction and restore (most of `generate`'s remaining lines are `retain`/`release`, the "retain/release are opaque calls" entry).
+
+**Closed 2026-10-09.** The lead left is its own entry ("A gradient compiled once per function, not once per inlined call"); the refcounting share became per-type glue ("Retain/release cascades", below).
+
+### Retain/release cascades expanded inline at every site: per-type glue functions
+
+A struct's retain or release is a cascade over every tensor leaf (`refcount.rs`'s field granularity,
+`mlir_lower.rs::lower_release_cascade`), written out in full at each site, each leaf's call unpacking
+its memref descriptor (~3.5 KB of IR per call). With nanoLM v2's eight micro-batch gradients held in
+a tuple (correctly released now, see the comprehension entry above), `train_gpt` had 18,000
+`cleave_release` and 9,400 `cleave_retain` calls, 98 MB of IR before bufferization, and the MLIR/LLVM
+passes went past 10 GB. Fix in progress: one retain and one release function per struct type (Rust's
+"drop glue"), called where the cascade used to be written out, so that code grows with the number of
+types rather than sites times leaves.
+
+**Closed.** One retain and one release function per struct type (`__retain_leaves<..>`/`__release_leaves<..>`), called where the cascade was written out.
+
+### Debug info attributes inlined stdlib code to the program's file
+`llvm-symbolizer` on nanoLM v2 placed `Optimizer::step` at `kernel.cleave:386`, a line the kernel
+doesn't have: the inlined function's `DISubprogram` names the right function but the program's file
+(`stdlib/optim/optim.cleave` is the right one). Line numbers are then meaningless in a crash or a
+profile. Found 2026-10-04.
+
+**Closed.** Checked 2026-10-09: nanoLM's CodeView names `stdlib\nn\nn.cleave`, `stdlib\optim\optim.cleave`... for inlined stdlib functions.
+
+### Destination-passing detection in CPS rather than an MLIR peephole
+
+Raised directly by the user: `dps_rewrite.rs` is a post-hoc MLIR peephole; could the "does this computation's result flow straight into a struct-field store, in place" pattern be recognized earlier, at CPS/e-graph level, where the project's own extensibility discipline (algebra + `mlir::` stdlib mechanism) more naturally lives?
+
+**The real constraint, checked directly, not assumed**: `egraph.rs::Forward::walk` treats `PrimOp::FieldStore` (alongside `Store`/`Extern`) as a hard stop — a real mutation effect, never looked at, the walk returns the remaining expression unchanged from that point on. This is by design (`hld.md`'s own v1 trust model: the e-graph only ever sees the pure world). So today, literally nothing in the e-graph ever observes a field-store site at all, let alone rewrites it.
+
+**Why the MLIR-level placement isn't just historical accident, either**: `dps_rewrite` runs *after* `--inline`/`--linalg-fuse-elementwise-ops` have already fused what were several separate CPS-level calls (e.g. `matmul` then a bias `add`) into *one* `linalg.generic`. That fused shape — not the individual CPS-level calls — is what it redirects. Moving detection to CPS, before fusion, faces a real fork:
+1. Handle only the simple case (one algebra call, single-use, stored directly) — decidable locally in CPS via the same "single consumer, no other use" analysis `rc_opt.rs` already does for retain/release pairs. Real, but misses exactly the case that measured `~8.4×` in this file's own `dps_rewrite` entry (a *fused* multi-op chain), since CPS-level single-call detection can't see what MLIR's own fusion pass will later combine.
+2. Duplicate `--linalg-fuse-elementwise-ops`'s own fusion-eligibility reasoning at the CPS level to predict the fused shape ahead of time — real duplication of logic between two pipeline stages, a maintenance risk each time MLIR's own fusion rules change.
+
+**A real precedent exists for encoding a genuine precondition into an e-graph rewrite here**: `IndependentZeroApplier` (`egraph.rs`) is already a custom `Applier` with an embedded side-condition (disjointness), not a pure unconditional rewrite — so "conditional rewrite, checked before firing" is an established, working pattern in this codebase's `egg` integration, not something to invent from scratch if this is pursued.
+
+**Not started. The most promising direction, not yet validated**: rather than detecting fusion ahead of time, teach `Forward::walk` to cross a `FieldStore` when (and only when) the stored value has no other use — representing it in the e-graph language as a pure node parameterized by its own destination, rather than as an opaque effect. This reframes the problem as "when is a store observationally a pure construction" rather than "predict what MLIR will later fuse," and would need real design work (how a destination-parameterized node composes with the rest of `CleaveLang`, whether it still lets the fused-chain case fall out for free once downstream MLIR fusion runs on the resulting shape) before any code — a genuine next design session, not a quick follow-on.
+
+**Obsolete 2026-10-09.** `dps_rewrite.rs` is gone: destinations are decided before MLIR (`alias_analysis.rs`, `mlir_lower.rs`), the question this entry asked.
+
+### `matmul_transpose_b` and the generic vectorizer (hypothesis)
+
+Raised in conversation: in row-major layout, `C[i,j] = Σ_k A[i,k]·B[j,k]` (exactly `matmul_transpose_b`'s own shape) is the one of the three matmul forms where *both* operands are read as a contiguous row along the reduction axis `k` — a plain vectorizable dot-product reduction, zero stride on either side. Contrast the other two: plain `matmul` (`NN`) has `B[k,j]` strided by `N` along the reduction axis (the classic reason BLAS packs `B` before its own hot loop); `matmul_transpose_a` (`TN`) has both operands contiguous per fixed `k`, but that's an outer-product/rank-1-update accumulation into `C`, a genuinely different loop structure, not the same loop merely relabeled.
+
+**Why this might matter specifically for cleave, not BLAS in general**: cleave's native MLIR lowering has no packing/blocking microkernel of its own (unlike a real BLAS) — it leans on MLIR's own `linalg` vectorizer operating fairly directly on the `indexing_maps` the lowering emits. `matmul_transpose_b`'s zero-copy `indexing_maps` trick for the transposed operand is plausibly the one case among the three where that map stays affine and contiguous along the vectorized axis, i.e. the one case a generic vectorizer has a real shot at recognizing and turning into a proper vector reduction without any hand-written lowering. This also directly recoups the "NYI: non-trivial layout map" diagnostic already tracked elsewhere in this backlog (the struct-allocation-strategy entry's own native-lowering point of vigilance, and §4/§9 of `doc/plan-blas-native.md`) — same non-trivial-layout-map mechanism, this time asked from the angle of "does it actually vectorize well" rather than "does it crash."
+
+**Not measured, not designed, nothing built** — purely a hypothesis worth checking empirically before doing anything: dump `--dump-mlir-lowered` for all three variants on the same shapes and read whether the vectorizer actually emits a vectorized reduction for `matmul_transpose_b` specifically (vs. a scalar loop for the other two, or for all three alike). If MLIR already handles it well, there's nothing to build. If not, this is a real candidate for a dedicated native lowering path for `MatMulTransposeB` specifically, distinct from `NN`/`TN` — but that's a follow-up decision, not this entry's own conclusion.
+
+**Deliberately not touched**: four other test-harness files (`affine_pool_alloc.rs`, `alias_analysis.rs`, `array_release_cascade.rs`, `refcount.rs`) still run their own local copy of the old eliminate-before-optimize sequence — harmless for what they each test today (none of them exercise a never-directly-called cross-algebra reference), but now genuinely inconsistent with the real, fixed pipeline. Low-priority cleanup, not blocking anything.
+
+**Obsolete 2026-10-09.** Every matmul form now goes through the matmul schedule (`matmul_vectorize.transform.mlir`); the harness copies its last paragraph mentions are tracked by "The in-process test harnesses don't run the matmul schedule".
+
+### Light structs crossing calls by value: by pointer above 128 bytes, slots hoisted with lifetimes
+
+nanoLM v2 segfaulted in its first training step, only with several threads and only at full size. The
+Windows event log gave the faulting instruction (`nanolm.exe+0x2411a5`, symbolized with
+`llvm-symbolizer` and the binary's PDB to `Optimizer::step` inlined in `train_gpt$tasks`): a store at
+`0x27e8(%rsp)` right after `subq $0xe360, %rsp`, the argument area of a call to `Optimizer::step<..Gpt..>`
+taking the model, its gradient and the optimizer state *by value*. A light struct (every field a
+tensor descriptor, inline) is a first-class LLVM aggregate, which LLVM expands into its scalars at a
+call: tens of thousands of bytes stored downward from the new `%rsp` with no probe, skipping Windows'
+guard page, an access violation (not a stack overflow, so no handler runs on the faulting thread).
+Latent until a call this large wasn't inlined. The same representation fills the IR with
+`extractvalue`/`insertvalue` per descriptor wherever such a value is copied, a large share of
+nanoLM v2's ~150 s of MLIR/LLVM passes. To fix at the source: pass a light struct above a size
+threshold by pointer to a copy (the Windows x64 C ABI's rule for large aggregates), parameters,
+calls and returns alike, `export fn`s and the Rust boundary included. Reproduction to write first: a
+struct of tens of KB passed to a non-inlined function.
+
+**Parameters fixed, same day.** A light struct of 128 bytes or more (`mlir_lower.rs::by_pointer`,
+`BY_POINTER_MIN_BYTES`) is passed to an internal function as a pointer to a copy in the caller's
+entry block (`call_arguments`, `entry_alloca`), loaded once in the callee; `main` and `export fn`s
+keep their signature. Calls, loop conditions, leaf glue and spawned calls alike; a spawned call's task
+captures only the pointer, the slot living until the caller's `sync`. nanoLM v2 trains (no crash), its
+LLVM time 162 s -> 98 s. The crash itself isn't reproducible on demand in a small program (it depends
+on the order of the stores and on how much stack the thread had committed), so the test checks the
+ABI: `language_model_ops.rs::a_large_light_struct_crosses_a_call_by_pointer` (fails without it).
+Still by value: **returned** light structs (LLVM demotes a large return to a hidden pointer, so no
+crash, but the aggregate is still built with `insertvalue` per scalar), and light structs inside the
+caller's own body.
+
+**The slots themselves then overflowed the stack (2026-10-05).** The night run (`gpt 0 200 100`)
+died with `STATUS_STACK_OVERFLOW` on the main thread. One slot per call site, alive for the whole
+frame, and MLIR's inliner carrying a callee's slots into the caller wherever the call was (inside a
+loop body, a dynamic allocation, bounded only by the loop's `stacksave`/`stackrestore`):
+`train_gpt$tasks` held 272 KB of slots in its entry block and 1.6 MB elsewhere. Fixed once loops are
+blocks (`cleave_mlir::hoist_arg_slots`, end of `pipeline.rs::lower_to_llvm`): every slot goes
+back to its function's entry block, and an ordinary call's (not a spawned one's) gets
+`lifetime.start`/`lifetime.end` around its uses, so that LLVM's stack coloring shares storage
+between slots. Moving the slots without the lifetimes made it worse (a 1.37 MB static frame).
+`train_gpt$tasks`' frame is now 570 KB, static; a 100-step round trains (1429 ms/step, 10.9 GB).
+Test: `language_model_ops.rs::argument_slots_sit_in_the_entry_block_with_bounded_lifetimes` (an IR
+check; a runtime overflow in a small program depends on LLVM's argument promotion and memcpy
+forwarding, which erase the slots of a callee reading few fields or of identical arguments).
+Remaining: 570 KB is still half the main thread's stack. A slot whose uses span several blocks
+gets no lifetime and keeps the whole frame, as does a spawned call's; and the copy itself is
+redundant whenever the argument already lives in memory. Passing the caller's own storage, or
+giving the main thread a larger stack (`/STACK` at link), would remove the margin question.
+
+**Closed for the crash and the IR size.** What remains is its own entry ("The main thread's frame...").
+
+### Matmuls of any row count, vectorized
+
+Found moving `examples/mnist-interop`'s `evaluate` from one image at a time to batches of 100: every
+`forward<100>` layer is a `100 x K` matmul, and the transform-dialect schedule tiles rows by 8
+(`matmul_vectorize.transform.mlir`, `tile_using_forall tile_sizes [8, 0]`). The remainder tile (4 rows)
+has a dynamic size; that linalg op isn't vectorized, falls through to `--convert-linalg-to-affine-loops`,
+and the pass fails: `'affine.for' op operand cannot be used as a dimension id` (the bound is an SSA
+value defined inside the enclosing `scf` loop, not a valid affine dim/symbol). Batch 1 (the old
+`forward<1>`) and multiples of 8/16 (32, 80) compile fine. `evaluate` uses 80 for now. The fix belongs
+in the schedule (pad or peel the remainder tile, as the narrow-output `pad` path already does for N)
+or in the fallback lowering, not in user code.
+
+**Fixed 2026-10-09**, three generic pieces:
+- `cleave-split-row-remainders{rows=8}` (shim, before the schedule): a product whose static row count
+  is above the row tile and not a multiple of it is split into the whole tiles and a remainder, each
+  of static size; when the product's only consumer is pointwise (the schedule's epilogue fusion), the
+  consumer is split instead, each part computing its own rows of the product, so the fusion survives.
+- `@tile_peel_vectorize` folds a `scf.forall` tile's rows with the loop's bounds
+  (`apply_patterns.scf.for_loop_canonicalization`): one tile over fewer rows than the tile
+  (`min(8, 4 - 8 * i)`, `i` = 0) is 4 static rows, not a dynamic count. Every product of 8 rows or
+  fewer was never vectorized before: xor's and tensor_demo's matmuls, digits', nanoLM's
+  `decode_block` (generation, one row: 0 -> 64 vector FMAs).
+- `cleave-lower-non-affine-linalg` (before `convert-linalg-to-affine-loops`): a `linalg` op whose
+  bounds aren't affine becomes `scf.for` loops instead of failing the compilation; the others are left
+  to the affine lowering, unchanged.
+
+`mnist-interop`'s `evaluate` back to batches of 100. Tests:
+`language_model_ops.rs::matmuls_with_a_partial_row_tile_compile_and_compute_the_product` (M = 4, 7, 9,
+100, alone and with an epilogue), `cleave-mlir/tests/passes.rs::a_linalg_op_with_non_affine_bounds_becomes_scf_loops`.
+The 18 examples' LLVM-dialect dumps differ only in those small products, now vectorized.
+
+### A program's `fn` no longer shadows an algebra method inside the stdlib
+
+Found 2026-10-07: a program declaring its own `fn step(a, b)` (two parameters) fails with
+`stdlib/nn/nn.cleave:1198:29: error: \`step\` expects 2 argument(s), found 4`: the stdlib's own call
+to `Optimizer::step` (four arguments) resolved to the user's function. A user's top-level name must
+not reach into another module's bodies; the stdlib's calls resolve in the stdlib's scope (and an
+unqualified call in user code that matches both should be ambiguous or prefer the local `fn`, by a
+stated rule, not by accident). Repro: any program with `use nn;` and a `fn step` of another arity.
+
+**Fixed 2026-10-09.** `resolve.rs`'s rule 3 (a top-level `fn` shadows an algebra method of its name)
+now applies only where the `fn`'s crate is seen: from the body's own crate, or from a crate that uses
+it, directly or not (`CrateScopes`, built by `driver::crate_scopes` from each crate's `use`s and the
+prelude). No crate uses the program's, so its functions never reach the stdlib's bodies; within the
+program the rule is unchanged (the local `fn` wins, the qualified form reaches the algebra). Test:
+`mlir_lower.rs::a_programs_fn_does_not_shadow_an_algebra_method_inside_the_stdlib`.

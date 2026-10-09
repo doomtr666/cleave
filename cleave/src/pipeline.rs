@@ -195,6 +195,7 @@ fn check_lambda_positions(program: &Program) -> Vec<Diagnostic> {
                 "{what}: a function value can only be called or passed to a call for now"
             ),
             span: Some(span),
+            notes: Vec::new(),
         }
     }
 
@@ -732,6 +733,12 @@ pub fn register_passes() {
 /// fewer rows would call `sgemm` more often, each call packing `B` again.
 const BLAS_TILE_ROWS: i64 = 128;
 
+/// The matmul schedule's row tile (`tile_using_forall tile_sizes [8, ..]` in
+/// `matmul_vectorize.transform.mlir`): a product whose rows aren't a multiple
+/// of it is split first into whole tiles and a static remainder
+/// (`cleave-split-row-remainders`).
+const MATMUL_ROW_TILE: i64 = 8;
+
 /// The matmul tile/vectorize schedule, compiled into the binary and loaded
 /// into the context's transform library from memory
 /// (`cleave_mlir::load_transform_library`).
@@ -785,7 +792,8 @@ fn run_stage(module: &mut Module, what: &str, pipeline: &str) -> Result<(), Vec<
 ///    chain through intermediates. BLAS-marked products are tiled with their
 ///    elementwise consumer and lowered to `sgemm` calls; the other matmuls go
 ///    through the tile-and-vectorize schedule (`matmul_vectorize.transform.
-///    mlir`, loaded into the context first). `loop-invariant-subset-hoisting`
+///    mlir`, loaded into the context first), split first when their rows
+///    aren't a multiple of its row tile. `loop-invariant-subset-hoisting`
 ///    then keeps a tile's accumulator in registers across the reduction,
 ///    which it can only do while the IR is still tensors.
 /// 2. **Bufferization.** Empty tensors eliminated so producers write into
@@ -802,7 +810,8 @@ fn run_stage(module: &mut Module, what: &str, pipeline: &str) -> Result<(), Vec<
 /// 4. **Loops and vectors.** Dead symbols removed (the callees inlining left
 ///    behind, whose strided signatures the vectorizer would reject), then
 ///    `cse` (which the self-copy elimination after it needs: two identical
-///    subviews must be one value). `linalg` becomes affine loops;
+///    subviews must be one value). `linalg` becomes affine loops (`scf`
+///    loops for an op whose bounds aren't affine);
 ///    with OpenMP, the outer loops are parallelized; `mulf`/`addf` may
 ///    contract into FMAs; the affine super-vectorizer vectorizes the loops
 ///    the schedule didn't (it reports, without failing, the strided loops it
@@ -848,7 +857,7 @@ pub fn lower_to_llvm<'c>(
             "builtin.module(cleave-limit-inlining{{threshold={threshold}}},{inline}\
              convert-elementwise-to-linalg,linalg-fuse-elementwise-ops,\
              cleave-blas-tile-and-fuse{{rows={BLAS_TILE_ROWS}}},cleave-lower-blas-matmuls,\
-             transform-interpreter{{entry-point=__transform_main}},\
+             cleave-split-row-remainders{{rows={MATMUL_ROW_TILE}}},transform-interpreter{{entry-point=__transform_main}},\
              loop-invariant-subset-hoisting,cleave-reuse-dying-inputs)",
             threshold = options.inline_threshold,
             inline = if options.inline { "inline," } else { "" },
@@ -890,7 +899,7 @@ pub fn lower_to_llvm<'c>(
             "builtin.module(symbol-dce,func.func(lower-vector-multi-reduction),cse,\
              cleave-eliminate-self-copies,cleave-lower-dynamic-copies,\
              canonicalize,expand-strided-metadata,lower-affine,canonicalize,\
-             convert-vector-to-scf,convert-linalg-to-affine-loops,\
+             convert-vector-to-scf,cleave-lower-non-affine-linalg,convert-linalg-to-affine-loops,\
              func.func(affine-fold-memref-alias-ops),{parallelize}\
              cleave-mark-contract,func.func(affine-super-vectorize{{virtual-vector-size=16}}),\
              cleave-lower-permuted-transfers,cleave-approximate-math,lower-affine,\
