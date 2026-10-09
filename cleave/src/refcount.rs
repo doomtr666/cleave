@@ -839,6 +839,10 @@ fn walk_var_info(
                 // of a struct as `Array(v, ..., v)`; this keeps the repeat
                 // form right if one ever reaches here.
                 PrimOp::ArrayRepeat => true,
+                // An array allocated empty (`mlir::memref::alloc()`, what
+                // `Generate` fills): owned like an array literal; an array of
+                // structs or tensors is an array object (`is_handle_array`).
+                PrimOp::RawMlirOp { op, .. } if op == "memref.alloc" => matches!(ty, Ty::Array(..)),
                 // An MLIR value: a scalar, or a tensor whose buffer MLIR's
                 // deallocation owns.
                 PrimOp::RawMlirOp { .. } | PrimOp::Adopt(_) => false,
@@ -1725,7 +1729,9 @@ fn rewrite_body(
             // the difference (a real `Release` on the pointer for the
             // heavy case, a `PrimOp::Field` chain ending in `Release` for
             // each leaf otherwise).
+            let empty_array = matches!(&op, PrimOp::RawMlirOp { op, .. } if op == "memref.alloc");
             if (matches!(&op, PrimOp::Struct(..) | PrimOp::Array | PrimOp::ArrayRepeat | PrimOp::Extern { .. })
+                || empty_array
                 || field_read_owned)
                 && (ctx.is_rc(&ty) || !ctx.light_release_leaves(&ty).is_empty())
             {

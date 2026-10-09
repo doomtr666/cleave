@@ -525,7 +525,9 @@ pub fn lower_program<'c>(
         eprintln!("CLEAVE_TRACE_AFFINE_STRUCTS: {} fields: {fields:?}", fields.len());
     }
     let stack_arrays = stack_index_arrays(program);
-    let region_allocating_fns = region_allocating_fns(program, &region_local_fns, &stack_arrays);
+    let region_allocating_fns = region_allocating_fns(program, &region_local_fns, &stack_arrays, &|ty| {
+        crate::refcount::is_handle_array(ty, &struct_schemas, mlir_types)
+    });
     {
         // Scoped so `ctx`'s own borrow of `module` ends before `module` is
         // moved out below.
@@ -2941,6 +2943,11 @@ fn lower_prim_op<'c>(
                 Some(call_op.result(0).unwrap().into())
             }
         }
+        // An array object allocated empty (`mlir::memref::alloc()` of an
+        // array of structs or tensors, `Generate`'s): not a memref.
+        PrimOp::RawMlirOp { op, .. } if op == "memref.alloc" && is_handle_array(ctx, ty) => {
+            Some(lower_empty_array_object(ctx, block, ty))
+        }
         PrimOp::RawMlirOp { op, attrs } => Some(lower_raw_mlir_op(
             ctx,
             block,
@@ -3300,6 +3307,38 @@ fn lower_array_repeat<'c>(
         }
     }
     array_val
+}
+
+/// An array object (`is_handle_array`) with every slot empty: zeroed, a null
+/// pointer (a struct, an inner array object) or a null descriptor (a tensor)
+/// in each, which a store into the slot releases as it would the element it
+/// replaces (`cleave_release` ignores null), as does the array's own release
+/// cascade for a slot never filled.
+fn lower_empty_array_object<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, ty: &Ty) -> Value<'c, 'c> {
+    let array_llvm_ty = array_inline_llvm_type(ctx, ty);
+    let ptr = alloc_llvm_value(ctx, block, array_llvm_ty, None);
+    let size = llvm_type_size_bytes(ctx, block, array_llvm_ty);
+    let location = gen_loc(ctx.context);
+    let zero_byte = block
+        .append_operation(arith::constant(
+            ctx.context,
+            IntegerAttribute::new(IntegerType::new(ctx.context, 8).into(), 0).into(),
+            location,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    block.append_operation(
+        OperationBuilder::new("llvm.intr.memset", location)
+            .add_operands(&[ptr, zero_byte, size])
+            .add_attributes(&[(
+                Identifier::new(ctx.context, "isVolatile"),
+                IntegerAttribute::new(IntegerType::new(ctx.context, 1).into(), 0).into(),
+            )])
+            .build()
+            .unwrap_or_else(|e| panic!("MLIR lowering: failed to build llvm.intr.memset: {e}")),
+    );
+    ptr
 }
 
 /// A nested array literal/repeat's own element is always an already-built
@@ -5857,30 +5896,35 @@ fn stack_index_arrays(program: &CpsProgram) -> HashSet<CVar> {
 /// The region-local functions (`region_analysis`) that may allocate through
 /// the arena: those whose body builds a struct, stores a tensor into a field,
 /// or builds an array kept off the stack (`alloc_llvm_value`'s callers: a
-/// struct's storage, a tensor field's descriptor, a struct-leaf array), or
-/// that call a region-local function which does. Deliberately coarse (any
-/// struct, light or not): a function left out here must never allocate.
+/// struct's storage, a tensor field's descriptor, a struct-leaf array, an
+/// array object allocated empty), or that call a region-local function which
+/// does. Deliberately coarse (any struct, light or not): a function left out
+/// here must never allocate. `is_handle_array` tells an array object.
 fn region_allocating_fns(
     program: &CpsProgram,
     region_local_fns: &HashSet<String>,
     stack_arrays: &HashSet<CVar>,
+    is_handle_array: &dyn Fn(&Ty) -> bool,
 ) -> HashSet<String> {
-    fn allocates(e: &CExpr, stack_arrays: &HashSet<CVar>) -> bool {
+    fn allocates(e: &CExpr, stack_arrays: &HashSet<CVar>, is_handle_array: &dyn Fn(&Ty) -> bool) -> bool {
         match e {
-            CExpr::LetPrim { var, op, cont, .. } => {
+            CExpr::LetPrim { var, ty, op, cont, .. } => {
                 let here = match op {
                     PrimOp::Struct(..) | PrimOp::FieldStore { .. } | PrimOp::ArrayRepeat => true,
                     PrimOp::Array => !stack_arrays.contains(var),
+                    PrimOp::RawMlirOp { op, .. } => op == "memref.alloc" && is_handle_array(ty),
                     _ => false,
                 };
-                here || allocates(cont, stack_arrays)
+                here || allocates(cont, stack_arrays, is_handle_array)
             }
             CExpr::App { .. } => false,
             CExpr::If { then_branch, else_branch, .. } => {
-                allocates(then_branch, stack_arrays) || allocates(else_branch, stack_arrays)
+                allocates(then_branch, stack_arrays, is_handle_array)
+                    || allocates(else_branch, stack_arrays, is_handle_array)
             }
             CExpr::Fix { defs, body } => {
-                defs.iter().any(|d| allocates(&d.body, stack_arrays)) || allocates(body, stack_arrays)
+                defs.iter().any(|d| allocates(&d.body, stack_arrays, is_handle_array))
+                    || allocates(body, stack_arrays, is_handle_array)
             }
         }
     }
@@ -5888,7 +5932,7 @@ fn region_allocating_fns(
     let mut out: HashSet<String> = program
         .funcs
         .iter()
-        .filter(|f| region_local_fns.contains(&f.def.name) && allocates(&f.def.body, stack_arrays))
+        .filter(|f| region_local_fns.contains(&f.def.name) && allocates(&f.def.body, stack_arrays, is_handle_array))
         .map(|f| f.def.name.clone())
         .collect();
     loop {

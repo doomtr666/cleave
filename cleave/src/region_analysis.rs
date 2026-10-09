@@ -341,6 +341,7 @@ fn analyze_loop_body(
     // past this iteration.
     let mut escaping: HashSet<CVar> = HashSet::new();
     collect_escaping(then_branch, &loop_def.name, &mut escaping);
+    collect_stored(then_branch, &mut escaping);
 
     // `children[base]` = every `CVar` bound via `PrimOp::Field` reading
     // straight out of `base` (`g.2`'s own `CVar` is a child of `g`'s) --
@@ -472,6 +473,39 @@ fn collect_escaping(expr: &CExpr, loop_name: &str, escaping: &mut HashSet<CVar>)
     }
 }
 
+/// Every `CVar` written into storage anywhere in `expr`, nested loops'
+/// bodies included: the value of a `Store` (`a[i] = v`) or `FieldStore`
+/// (`s.f = v`). The array or struct written to may outlive the iteration (a
+/// model's layers, a decoder's caches, carried in place rather than through
+/// the loop's tail call), so what it holds escapes the region as surely as a
+/// carried value does. Missed, a call's result stored into an array built
+/// before the loop was allocated in the iteration's arena, which the next
+/// iteration reused under it (a decoder's per-layer caches, all layers but
+/// the last overwritten).
+fn collect_stored(expr: &CExpr, escaping: &mut HashSet<CVar>) {
+    match expr {
+        CExpr::LetPrim { op, args, cont, .. } => {
+            if matches!(op, PrimOp::Store { .. } | PrimOp::FieldStore { .. })
+                && let Some(CVal::Var(v)) = args.last()
+            {
+                escaping.insert(*v);
+            }
+            collect_stored(cont, escaping);
+        }
+        CExpr::App { .. } => {}
+        CExpr::If { then_branch, else_branch, .. } => {
+            collect_stored(then_branch, escaping);
+            collect_stored(else_branch, escaping);
+        }
+        CExpr::Fix { defs, body } => {
+            for d in defs {
+                collect_stored(&d.body, escaping);
+            }
+            collect_stored(body, escaping);
+        }
+    }
+}
+
 /// Populates `children` (`PrimOp::Field` parent -> child edges) and `calls`
 /// (every direct top-level call found, `lower_real_call`'s own exact shape
 /// — see `count_calls_in`'s own doc comment for that same shape).
@@ -487,6 +521,13 @@ fn collect_calls_and_derivations(
                 if let [CVal::Var(base)] = args.as_slice() {
                     children.entry(*base).or_default().push(*var);
                 }
+            }
+            // An element read out of an array (`r[i]`) derives from it as a
+            // field does.
+            if matches!(op, PrimOp::Load { .. })
+                && let Some(CVal::Var(base)) = args.first()
+            {
+                children.entry(*base).or_default().push(*var);
             }
             collect_calls_and_derivations(cont, top_level_names, children, calls);
         }

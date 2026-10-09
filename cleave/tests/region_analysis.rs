@@ -357,3 +357,35 @@ fn a_program_with_no_loop_marks_nothing_region_local() {
         "no loop exists in this program -- nothing should be marked region-local, got: {region_local:?}"
     );
 }
+
+/// A result stored into storage that outlives the iteration (an array built
+/// before the loop, written in place) escapes as a carried value does, here
+/// through a field of the returned tuple: `put` must not allocate in the
+/// iteration's arena, which the next iteration reuses under the stored
+/// value. A decoder's per-layer caches had every layer but the last
+/// overwritten this way.
+#[test]
+fn a_result_stored_into_an_array_built_before_the_loop_is_not_local() {
+    let src = r#"
+        use nn;
+        #[no_inline]
+        fn put(kc: Tensor<f32, 2, 2>, p: Tensor<f32, 1, 2>) -> (Tensor<f32, 1, 2>, Tensor<f32, 2, 2>) {
+            (p + p, update(kc, p, 0, 0))
+        }
+        fn main() -> i32 {
+            let mut ts: [Tensor<f32, 2, 2>; 2] = [for i in 0..2: uninitialized()];
+            let mut h: Tensor<f32, 1, 2> = [for r in 0..1: [for c in 0..2: 1.0]];
+            for i in 0..2 {
+                let (y, k) = put(ts[i], h);
+                h = y;
+                ts[i] = k;
+            };
+            if ts[0][0, 0] == 1.0 and ts[1][0, 0] == 2.0 { 1 } else { 0 }
+        }
+        "#;
+    let region_local = region_local_names(src);
+    assert!(
+        !region_local.contains("put"),
+        "put's result is stored into `ts`, which outlives the iteration -- must not be region-local, got: {region_local:?}"
+    );
+}

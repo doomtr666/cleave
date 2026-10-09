@@ -1099,8 +1099,15 @@ unsafe fn refcount_of<'a>(header: *mut RcHeader) -> &'a std::sync::atomic::Atomi
 /// begin with, and not worth that cost for a partial one. Left `CLEAVE_
 /// DEBUG_POOL`-gated, as originally built, until the real extra release
 /// call is found and removed at the source.
+///
+/// A null `ptr` is no reference, nothing to release: an empty slot of an
+/// array object allocated empty (`mlir_lower.rs::lower_empty_array_object`),
+/// overwritten or released with its array before it was filled.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cleave_release(ptr: *mut u8) -> bool {
+    if ptr.is_null() {
+        return false;
+    }
     unsafe {
         let header = rc_header(ptr);
         let base = block_base(header);

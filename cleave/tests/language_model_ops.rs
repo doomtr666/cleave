@@ -2057,3 +2057,149 @@ fn grad_through_an_opaque_call_is_an_error_naming_it() {
     assert!(!stderr.contains("Assertion failed") && !stderr.contains("panicked"), "a crash, not an error:\n{stderr}");
     assert!(stderr.contains("net_grad") && stderr.contains("forward"), "the error doesn't name the call:\n{stderr}");
 }
+
+/// Decoding with a key/value cache (`rope_at`, `cached_attention`) computes
+/// what `causal_attention` does over the whole sequence: tokens fed one at a
+/// time, each one's rotated key and value written to its slot, its query
+/// attending to the slots filled so far. With a cache of 4 slots on a
+/// sequence of 8, the cache slides as a ring (the newest token in the oldest
+/// slot, rotated by its absolute position): token 6 sees tokens 3..=6, as
+/// `causal_attention` over those four alone, rotated from position 0, does.
+#[test]
+fn cached_attention_decodes_as_causal_attention_does() {
+    let src = |out: &str| {
+        format!(
+            "
+            use nn;
+            use convert;
+            fn f(a: f32, b: f32, c: f32) -> Tensor<f32, 8, 16> {{
+                [for i in 0..8: [for j in 0..16: 1.5 * Transcendental::tanh(a * i.to() + b * j.to() + c)]]
+            }}
+            fn row(x: Tensor<f32, 8, 16>, t: i32) -> Tensor<f32, 1, 16> {{ slice(x, t, 0) }}
+            // Token `t`'s output, the cache `L` slots long.
+            fn decode<const L: i32>(q: Tensor<f32, 8, 16>, k: Tensor<f32, 8, 16>, v: Tensor<f32, 8, 16>, t: i32) -> Tensor<f32, 1, 16> {{
+                let shape = AttentionShape::<L, 8>();
+                let mut kc: Tensor<f32, L, 16> = uninitialized();
+                let mut vc: Tensor<f32, L, 16> = uninitialized();
+                let mut out: Tensor<f32, 1, 16> = uninitialized();
+                for s in 0..t + 1 {{
+                    let slot = s - (s / L) * L;
+                    kc = update(kc, rope_at(row(k, s), s, shape), slot, 0);
+                    vc = update(vc, row(v, s), slot, 0);
+                    let n = if s + 1 < L {{ s + 1 }} else {{ L }};
+                    out = cached_attention(rope_at(row(q, s), s, shape), kc, vc, n, shape);
+                }};
+                out
+            }}
+            fn full(q: Tensor<f32, 8, 16>, k: Tensor<f32, 8, 16>, v: Tensor<f32, 8, 16>) -> Tensor<f32, 8, 16> {{
+                let shape = AttentionShape::<8, 8>();
+                causal_attention(rope(q, shape), rope(k, shape), v, shape)
+            }}
+            // Rows 3..=6 alone, as one sequence of 4.
+            fn w(x: Tensor<f32, 8, 16>) -> Tensor<f32, 4, 16> {{ slice(x, 3, 0) }}
+            fn window(q: Tensor<f32, 8, 16>, k: Tensor<f32, 8, 16>, v: Tensor<f32, 8, 16>) -> Tensor<f32, 4, 16> {{
+                let shape = AttentionShape::<4, 8>();
+                causal_attention(rope(w(q), shape), rope(w(k), shape), w(v), shape)
+            }}
+            fn gap(a: Tensor<f32, 1, 16>, b: Tensor<f32, 1, 16>) -> f32 {{
+                let mut m = 0.0;
+                for c in 0..16 {{ let d = a[0, c] - b[0, c]; if d > m {{ m = d; }}; if 0.0 - d > m {{ m = 0.0 - d; }}; }};
+                m
+            }}
+            fn main() -> f32 {{
+                let q = f(0.35, -0.6, 1.0);
+                let k = f(-0.3, 0.45, 1.0);
+                let v = f(0.25, -0.9, 0.5);
+                {out}
+            }}
+        "
+        )
+    };
+    let check = |expr: &str| {
+        let got = run(&src(expr));
+        assert!(got < 1e-5, "{expr}: off by {got}");
+    };
+    for t in [0, 1, 5, 7] {
+        check(&format!("gap(decode::<8>(q, k, v, {t}), row(full(q, k, v), {t}))"));
+    }
+    check("gap(decode::<4>(q, k, v, 6), slice(window(q, k, v), 3, 0))");
+    check("gap(decode::<4>(q, k, v, 3), row(full(q, k, v), 3))");
+}
+
+/// A small GPT decoding with key/value caches (an array of tensors per
+/// layer, `rope_at`, `cached_attention`) gives the logits its whole-sequence
+/// forward pass gives, token by token: nanoLM's `generate` in miniature.
+#[test]
+fn a_gpt_decoding_with_caches_gives_its_forward_logits() {
+    let src = |out: &str| {
+        format!(
+            "
+            use nn;
+            use convert;
+            struct Blk {{
+                n1: Tensor<f32, 1, 16>,
+                wq: Dense<f32, 16, 16>, wk: Dense<f32, 16, 16>, wv: Dense<f32, 16, 16>, wo: Dense<f32, 16, 16>,
+                n2: Tensor<f32, 1, 16>,
+                mlp: SwiGlu<f32, 16, 32>
+            }}
+            struct G {{ tok: Embedding<f32, 12, 16>, blocks: [Blk; 2], nf: Tensor<f32, 1, 16> }}
+            fn ones() -> Tensor<f32, 1, 16> {{ [for i in 0..1: [for j in 0..16: 1.0]] }}
+            fn mk() -> Blk {{ Blk(n1: ones(), wq: Init::xavier(), wk: Init::xavier(), wv: Init::xavier(), wo: Init::xavier(), n2: ones(), mlp: Init::xavier()) }}
+            #[no_inline]
+            fn block<const N: i32>(x: Tensor<f32, N, 16>, b: Blk) -> Tensor<f32, N, 16> {{
+                let shape = AttentionShape::<8, 8>();
+                let h = rms_norm(x, b.n1);
+                let a = causal_attention(rope(b.wq.dense_forward(h), shape), rope(b.wk.dense_forward(h), shape), b.wv.dense_forward(h), shape);
+                let x2 = x + b.wo.dense_forward(a);
+                x2 + b.mlp.swiglu_forward(rms_norm(x2, b.n2))
+            }}
+            fn full(x: [i32; 8], m: G) -> Tensor<f32, 8, 12> {{
+                let mut h = embedding_forward(m.tok, x);
+                for i in 0..2 {{ h = block(h, m.blocks[i]); }};
+                embedding_logits(m.tok, rms_norm(h, m.nf))
+            }}
+            #[no_inline]
+            fn decode_block(x: Tensor<f32, 1, 16>, b: Blk, kc: Tensor<f32, 8, 16>, vc: Tensor<f32, 8, 16>, pos: i32) -> (Tensor<f32, 1, 16>, Tensor<f32, 8, 16>, Tensor<f32, 8, 16>) {{
+                let shape = AttentionShape::<8, 8>();
+                let h = rms_norm(x, b.n1);
+                let k = update(kc, rope_at(b.wk.dense_forward(h), pos, shape), pos, 0);
+                let v = update(vc, b.wv.dense_forward(h), pos, 0);
+                let a = cached_attention(rope_at(b.wq.dense_forward(h), pos, shape), k, v, pos + 1, shape);
+                let x2 = x + b.wo.dense_forward(a);
+                (x2 + b.mlp.swiglu_forward(rms_norm(x2, b.n2)), k, v)
+            }}
+            // The largest gap between the two logits, over the 8 positions.
+            fn gap(x: [i32; 8], m: G) -> f32 {{
+                let reference = full(x, m);
+                let mut keys: [Tensor<f32, 8, 16>; 2] = [for i in 0..2: uninitialized()];
+                let mut values: [Tensor<f32, 8, 16>; 2] = [for i in 0..2: uninitialized()];
+                let mut worst = 0.0;
+                for pos in 0..8 {{
+                    let mut h = embedding_forward(m.tok, [x[pos]]);
+                    for i in 0..2 {{
+                        let (y, k, v) = decode_block(h, m.blocks[i], keys[i], values[i], pos);
+                        h = y;
+                        keys[i] = k;
+                        values[i] = v;
+                    }};
+                    let z = embedding_logits(m.tok, rms_norm(h, m.nf));
+                    for c in 0..12 {{
+                        let d = z[0, c] - reference[pos, c];
+                        if d > worst {{ worst = d; }};
+                        if 0.0 - d > worst {{ worst = 0.0 - d; }};
+                    }};
+                }};
+                worst
+            }}
+            fn main() -> f32 {{
+                rand_seed(3);
+                let m = G(tok: Init::xavier(), blocks: [mk(), mk()], nf: ones());
+                let x = [3, 1, 4, 1, 5, 9, 2, 6];
+                {out}
+            }}
+        "
+        )
+    };
+    let got = run(&src("gap(x, m)"));
+    assert!(got < 1e-4, "decoded logits off by {got}");
+}

@@ -682,15 +682,16 @@ algebra Rope<X, S> {
     adjoint rope(x, shape), u: (rope_inverse(u, shape), _);
 }
 
-// `x` with each head's pairs rotated by `sign` times their angle.
-fn rope_rotate<T: Float, const N: i32, const D: i32, const L: i32, const DH: i32>(x: Tensor<T, N, D>, shape: AttentionShape<L, DH>, sign: T) -> Tensor<T, N, D> {
+// `x` with each head's pairs rotated by `sign` times their angle, row `r` at position `first + r
+// mod L`.
+fn rope_rotate<T: Float, const N: i32, const D: i32, const L: i32, const DH: i32>(x: Tensor<T, N, D>, shape: AttentionShape<L, DH>, sign: T, first: i32) -> Tensor<T, N, D> {
     let half = DH / 2;
     let ln_base: T = 9.210340372;
     let two: T = 2.0;
     let dh: T = DH.to();
     let mut y: [[T; D]; N] = mlir::memref::alloc();
     for r in 0..N {
-        let pos: T = (r - (r / L) * L).to();
+        let pos: T = (first + r - (r / L) * L).to();
         for h in 0..D / DH {
             for j in 0..half {
                 let jt: T = j.to();
@@ -709,9 +710,17 @@ fn rope_rotate<T: Float, const N: i32, const D: i32, const L: i32, const DH: i32
 
 impl<T: Float, const N: i32, const D: i32, const L: i32, const DH: i32> Rope<Tensor<T, N, D>, AttentionShape<L, DH>> {
     #[no_inline]
-    fn rope(x, shape) { rope_rotate(x, shape, one()) }
+    fn rope(x, shape) { rope_rotate(x, shape, one(), 0) }
     #[no_inline]
-    fn rope_inverse(x, shape) { rope_rotate(x, shape, zero() - one()) }
+    fn rope_inverse(x, shape) { rope_rotate(x, shape, zero() - one(), 0) }
+}
+
+// `rope` for rows of one sequence starting at position `first` rather than 0: the queries and keys
+// of the tokens a decoder adds one at a time (`cached_attention`). The position isn't wrapped at
+// `L`: a key cache that slides keeps its keys rotated by their absolute positions, and the scores
+// depend on differences only.
+fn rope_at<T: Float, const N: i32, const D: i32, const L: i32, const DH: i32>(x: Tensor<T, N, D>, first: i32, shape: AttentionShape<L, DH>) -> Tensor<T, N, D> {
+    rope_rotate(x, shape, one(), first)
 }
 
 // Causal multi-head self-attention (Vaswani et al., 2017), the heart of a
@@ -801,6 +810,41 @@ impl<const N: i32, const D: i32, const L: i32, const DH: i32> CausalAttention<Te
         };
         (dq, dk, dv)
     }
+}
+
+// Attention over a key/value cache, the decoding side of `causal_attention`: each of the `N`
+// query rows attends to the first `count` rows of `k` and `v`, `[L, D]` with heads `DH` wide, the
+// keys and values of the tokens seen so far (the newest included). Rows are slots, not positions:
+// the order doesn't matter (a softmax over a set), so a cache full at `L` slides as a ring, the
+// newest key overwriting the oldest's slot, its rotation (`rope_at`) carrying its position.
+// Matrix-vector work, for which a loop is as good as a product.
+#[no_inline]
+fn cached_attention<const N: i32, const D: i32, const L: i32, const DH: i32>(q: Tensor<f32, N, D>, k: Tensor<f32, L, D>, v: Tensor<f32, L, D>, count: i32, shape: AttentionShape<L, DH>) -> Tensor<f32, N, D> {
+    let width: f32 = DH.to();
+    let scale = 1.0 / mlir::math::sqrt(width);
+    let mut out: [[f32; D]; N] = mlir::memref::alloc();
+    let mut p: [f32; L] = mlir::memref::alloc();
+    for r in 0..N {
+        for h in 0..D / DH {
+            let c0 = h * DH;
+            for j in 0..count {
+                let mut s = 0.0;
+                for c in 0..DH { s = s + q[r, c0 + c] * k[j, c0 + c]; };
+                p[j] = s * scale;
+            };
+            let mut m = p[0];
+            for j in 1..count { if p[j] > m { m = p[j]; }; };
+            let mut z = 0.0;
+            for j in 0..count { p[j] = exp(p[j] - m); z = z + p[j]; };
+            let rz = 1.0 / z;
+            for c in 0..DH { out[r, c0 + c] = 0.0; };
+            for j in 0..count {
+                let w = p[j] * rz;
+                for c in 0..DH { out[r, c0 + c] = out[r, c0 + c] + w * v[j, c0 + c]; };
+            };
+        };
+    };
+    Tensor(data: out)
 }
 
 // A tensor whose every element its producer writes (`sgemm` with `beta` 0, a block-by-block

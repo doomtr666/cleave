@@ -206,8 +206,7 @@ fn block<const N: i32>(x: Tensor<f32, N, WIDTH>, b: Block) -> Tensor<f32, N, WID
     x2 + b.mlp.swiglu_forward(rms_norm(x2, b.n2))
 }
 
-// Any number of rows `N`, whole sequences of `CONTEXT`: a micro-batch (`MICRO`), or the one
-// sequence generation reads (`CONTEXT`).
+// Any number of rows `N`, whole sequences of `CONTEXT`: a micro-batch (`MICRO`).
 fn gpt_logits<const N: i32>(x: [i32; N], m: Gpt) -> Tensor<f32, N, VOCAB> {
     let h0 = embedding_forward(m.tok, x);
     let mut h = h0;
@@ -329,25 +328,50 @@ extern fn prompt_len() -> i32;
 // Prints one generated token.
 extern fn emit_token(t: i32);
 
+// `block` for the one token at position `pos` of the sequence being generated, its key and value
+// written to slot `pos mod CONTEXT` of the layer's caches (`kc`, `vc`), its query attending to every
+// slot filled: the last `CONTEXT` tokens, the window the model was trained on (`cached_attention`).
+// The block's output and the caches.
+#[no_inline]
+fn decode_block(x: Tensor<f32, 1, WIDTH>, b: Block, kc: Tensor<f32, CONTEXT, WIDTH>, vc: Tensor<f32, CONTEXT, WIDTH>, pos: i32) -> (Tensor<f32, 1, WIDTH>, Tensor<f32, CONTEXT, WIDTH>, Tensor<f32, CONTEXT, WIDTH>) {
+    let shape = AttentionShape::<CONTEXT, HEAD>();
+    let h = rms_norm(x, b.n1);
+    let slot = pos - (pos / CONTEXT) * CONTEXT;
+    let k = update(kc, rope_at(b.wk.dense_forward(h), pos, shape), slot, 0);
+    let v = update(vc, b.wv.dense_forward(h), slot, 0);
+    let filled = if pos < CONTEXT { pos + 1 } else { CONTEXT };
+    let a = cached_attention(rope_at(b.wq.dense_forward(h), pos, shape), k, v, filled, shape);
+    let x2 = x + b.wo.dense_forward(a);
+    (x2 + b.mlp.swiglu_forward(rms_norm(x2, b.n2)), k, v)
+}
+
 // Continues the prompt for `count` tokens with the model saved in `gpt.ckpt`, each drawn from the
 // next-token distribution at `temperature`, among the nucleus of the most likely tokens holding
-// `top_p` of the probability (`sample_row_top_p`; 1 keeps every token). The context slides once
-// it holds `CONTEXT`.
+// `top_p` of the probability (`sample_row_top_p`; 1 keeps every token). One token through the
+// model at a time, each layer's keys and values kept in its caches (`decode_block`): the prompt's
+// tokens fed in, then each drawn one.
 export fn generate(count: i32, temperature: f32, top_p: f32, seed: i64) -> i32 {
     let fresh = new_gpt();
     let (m, _, _) = restore("gpt.ckpt", (fresh, init_state(optimizer(0, 0.001), fresh), 0:i64));
     rand_seed(seed);
-    let mut ctx = prompt_ids();
-    let mut len = prompt_len();
-    for g in 0..count {
-        let c = sample_row_top_p(gpt_logits(ctx, m), len - 1, temperature, top_p);
-        emit_token(c);
-        if len < CONTEXT {
-            ctx[len] = c;
-            len = len + 1;
+    let prompt = prompt_ids();
+    let len = prompt_len();
+    let mut keys: [Tensor<f32, CONTEXT, WIDTH>; LAYERS] = [for i in 0..LAYERS: uninitialized()];
+    let mut values: [Tensor<f32, CONTEXT, WIDTH>; LAYERS] = [for i in 0..LAYERS: uninitialized()];
+    let mut next = prompt[0];
+    for pos in 0..len + count - 1 {
+        let mut h = embedding_forward(m.tok, [next]);
+        for i in 0..LAYERS {
+            let (y, k, v) = decode_block(h, m.blocks[i], keys[i], values[i], pos);
+            h = y;
+            keys[i] = k;
+            values[i] = v;
+        };
+        if pos + 1 < len {
+            next = prompt[pos + 1];
         } else {
-            for k in 0..CONTEXT - 1 { ctx[k] = ctx[k + 1]; };
-            ctx[CONTEXT - 1] = c;
+            next = sample_row_top_p(embedding_logits(m.tok, rms_norm(h, m.nf)), 0, temperature, top_p);
+            emit_token(next);
         };
     };
     count

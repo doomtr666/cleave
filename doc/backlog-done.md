@@ -2848,3 +2848,11 @@ lambda (`check_lambda_positions`). Test: `tests/diag.rs`, `unsupported_construct
 multi-def loop condition panic (`mlir_lower.rs`) wasn't reproduced from source; the other panics are
 internal invariants.
 
+
+### Decoding with a key/value cache (`stdlib/nn`, nanoLM's `generate`)
+
+Generation used to run the whole `CONTEXT`-row forward pass for every token. It now feeds one token at a time through `decode_block`, each layer's keys and values kept in an array of tensors (`[Tensor<f32, CONTEXT, WIDTH>; LAYERS]`). Two generic pieces in `nn`: `rope_at` (RoPE from a given position) and `cached_attention` (queries against the first `count` rows of a key/value cache). The cache is a ring once full: the newest token overwrites the oldest slot, rotated by its absolute position, and since RoPE scores depend only on position differences, the window is the last `CONTEXT` tokens, as the old sliding context was. Tests: `cached_attention_decodes_as_causal_attention_does` (exact positions and the ring window against `causal_attention`) and `a_gpt_decoding_with_caches_gives_its_forward_logits` (a two-layer GPT, decoded logits against its forward pass).
+
+Two compiler bugs it surfaced, fixed generically:
+- An array of structs or tensors allocated empty (`mlir::memref::alloc()`, what `Generate` fills, so any comprehension whose element type only its context fixes) was lowered as a `memref.alloc` of a pointer type and failed verification. It is now an array object with zeroed slots (`lower_empty_array_object`), owned like an array literal, and `cleave_release` ignores null, so an empty slot releases nothing when overwritten or when its array dies.
+- `region_analysis` only treated values passed to the loop's tail call as escaping. A call's result stored into an array or struct that outlives the iteration (`ts[i] = k`) was allocated in the iteration's arena, which the next iteration reused under it: every layer's cache but the last was overwritten. Values written by `Store`/`FieldStore` now escape (`collect_stored`), and an element `Load`ed from a call's result derives from it as a field does. Test: `a_result_stored_into_an_array_built_before_the_loop_is_not_local`.

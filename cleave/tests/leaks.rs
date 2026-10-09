@@ -755,3 +755,37 @@ fn an_array_of_tensors_leaves_nothing_behind() {
     let per_step = (long - short) / 64;
     assert!(per_step < NOISE, "{per_step} bytes leaked per step");
 }
+
+/// An array of tensors filled at run time (`Generate`: a comprehension whose
+/// element type only the context fixes), so allocated empty first, and one
+/// allocated empty and only partly filled: every slot's buffer released with
+/// its array or when overwritten, the empty ones releasing nothing.
+#[test]
+fn an_array_of_tensors_allocated_empty_leaves_nothing_behind() {
+    let program = |steps: u32| {
+        format!(
+            "
+            use nn;
+            fn mk() -> Tensor<f32, 16, 16> {{ Init::he() }}
+            fn main() -> i32 {{
+                rand_seed(1);
+                let mut keep = mk();
+                for s in 0..{steps} {{
+                    let mut ts: [Tensor<f32, 16, 16>; 3] = [for i in 0..3: uninitialized()];
+                    ts[0] = mk();
+                    ts[1] = ts[0] + mk();
+                    let mut part: [Tensor<f32, 16, 16>; 4] = mlir::memref::alloc();
+                    part[2] = ts[1];
+                    keep = part[2];
+                }};
+                if sum(keep) == sum(keep) {{ 1 }} else {{ 0 }}
+            }}
+            "
+        )
+    };
+    let (r_short, short) = run_counting(&program(8));
+    let (r_long, long) = run_counting(&program(72));
+    assert_eq!((r_short, r_long), (1, 1));
+    let per_step = (long - short) / 64;
+    assert!(per_step < NOISE, "{per_step} bytes leaked per step");
+}

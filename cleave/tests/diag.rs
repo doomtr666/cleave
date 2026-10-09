@@ -186,3 +186,22 @@ fn main() -> i32 {
     let out = cli_stderr("tensor_array.cleave", src);
     assert!(out.contains("main returned: 1"), "{out}");
 }
+
+/// An array of tensors filled by a comprehension whose element type only the
+/// annotation fixes (`uninitialized()`): a run-time `Generate` loop into an
+/// array object allocated empty, rather than a literal. It used to fail MLIR
+/// verification (a `memref.alloc` of an array of tensors).
+#[test]
+fn an_array_of_tensors_is_filled_by_a_comprehension() {
+    let src = "use nn;
+fn main() -> i32 {
+    let mut ts: [Tensor<f32, 2, 2>; 3] = [for i in 0..3: uninitialized()];
+    let a: Tensor<f32, 2, 2> = [for r in 0..2: [for c in 0..2: 1.0 + r.to()]];
+    ts[1] = a;
+    ts[2] = a + a;
+    if ts[1][0, 1] == 1.0 and ts[2][1, 0] == 4.0 { 1 } else { 0 }
+}
+";
+    let out = cli_stderr("tensor_array_generate.cleave", src);
+    assert!(out.contains("main returned: 1"), "{out}");
+}
