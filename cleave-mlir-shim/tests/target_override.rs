@@ -9,7 +9,7 @@
 //! AVX-512 can hold that in one `zmm` register and emit one `vfmadd*ps`;
 //! without it, LLVM's own instruction legalizer must split the 512-bit
 //! operation into narrower ($<=$256-bit) pieces. Confirmed by real
-//! disassembly (`llvm-objdump`, part of the same `MLIR_SYS_220_PREFIX`
+//! disassembly (`llvm-objdump`, part of the same `CLEAVE_LLVM_PREFIX`
 //! toolchain `mlir-sys` itself already requires -- no extra tool
 //! dependency), grepping for a real `zmm` register mention -- a raw byte
 //! scan for the `0x62` EVEX prefix byte was tried first and rejected: an
@@ -36,30 +36,22 @@ module {
 /// `detectHost`'s own default unchanged"). Returns the dumped file's own
 /// path (kept on disk -- `disassemble` below re-reads it via `llvm-objdump`).
 fn compile_object(
-    context: &melior::Context,
+    context: &cleave_mlir_shim::mlir::Context,
     target_cpu: &str,
     target_features: &str,
 ) -> std::path::PathBuf {
-    use melior::ir::Module;
-    use melior::pass::{self, PassManager};
+    use cleave_mlir_shim::mlir::ir::Module;
 
-    let mut module = Module::parse(context, FMA16_MLIR).expect("failed to parse probe module");
-
-    // Melior's own strongly-typed pass constructors, not a textual pipeline
-    // string -- `parse_pass_pipeline` needs each named pass registered in
-    // this process first (the way `mlir-opt`'s own `main()` does for every
-    // pass it ships; a bare library-embedding context does not get that for
-    // free), confirmed directly (`'convert-vector-to-llvm' does not refer to
-    // a registered pass`) rather than assumed. `pipeline.rs`'s own real
-    // pipeline already uses exactly this constructor shape for the same
-    // reason.
-    let pass_manager = PassManager::new(context);
-    pass_manager.add_pass(pass::conversion::create_vector_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_func_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-    pass_manager
-        .run(&mut module)
-        .expect("failed to run the lowering pipeline");
+    let module = Module::parse(context, FMA16_MLIR).expect("failed to parse probe module");
+    // SAFETY: `module` is a valid module, owned here.
+    unsafe {
+        cleave_mlir_shim::run_pipeline(
+            module.to_raw(),
+            "builtin.module(convert-vector-to-llvm,convert-func-to-llvm,reconcile-unrealized-casts)",
+            false,
+        )
+    }
+    .expect("failed to run the lowering pipeline");
 
     let dump_path = std::env::temp_dir().join(format!(
         "cleave-mlir-shim-probe-{target_cpu}-{target_features}.o"
@@ -78,8 +70,8 @@ fn compile_object(
 /// PREFIX/bin` toolchain `mlir-sys` itself already needs -- no separate
 /// tool dependency), returning the real disassembly text.
 fn disassemble(object_path: &std::path::Path) -> String {
-    let prefix = std::env::var("MLIR_SYS_220_PREFIX")
-        .expect("MLIR_SYS_220_PREFIX must be set to disassemble the probe object");
+    let prefix = std::env::var("CLEAVE_LLVM_PREFIX")
+        .expect("CLEAVE_LLVM_PREFIX must be set to disassemble the probe object");
     let objdump = std::path::Path::new(&prefix).join("bin/llvm-objdump.exe");
     let output = Command::new(&objdump)
         .arg("-d")
@@ -99,10 +91,10 @@ fn disassembly_uses_zmm(object_path: &std::path::Path) -> bool {
     disassemble(object_path).contains("zmm")
 }
 
-fn probe_context() -> melior::Context {
-    use melior::Context;
-    use melior::dialect::DialectRegistry;
-    use melior::utility::register_all_dialects;
+fn probe_context() -> cleave_mlir_shim::mlir::Context {
+    use cleave_mlir_shim::mlir::Context;
+    use cleave_mlir_shim::mlir::dialect::DialectRegistry;
+    use cleave_mlir_shim::mlir::utility::register_all_dialects;
 
     let registry = DialectRegistry::new();
     register_all_dialects(&registry);

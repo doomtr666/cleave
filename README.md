@@ -21,11 +21,9 @@ dialect) — deliberately not a CUDA-only path.
 
 ## Building
 
-Needs a real LLVM 22 + MLIR + openmp toolchain, `cargo` told where it is,
-and `mlir-sys` resolved to this project's own fork (the unpatched
-crates.io release doesn't link on Windows/MSVC at all) — see
-**[`doc/building.md`](doc/building.md)** for the full procedure and why the
-fork exists. Short version:
+Needs an LLVM 22 + MLIR + openmp toolchain and `cargo` told where it is —
+see **[`doc/building.md`](doc/building.md)** for the full procedure. Short
+version:
 
 ```powershell
 .\scripts\setup-toolchain.ps1
@@ -49,6 +47,6 @@ purpose, not by habit.
 
 ## Platform
 
-Windows/MSVC only today — the toolchain, `cleave-rt`, and the `mlir-sys`
-fork this depends on are all Windows-specific work with no equivalent
-upstream CI coverage (`mlir-sys`'s own CI is Linux/macOS only).
+Windows/MSVC only today: the prebuilt toolchain, `cleave-rt`'s
+platform-specific parts and the shim's build flags are Windows/MSVC work so
+far.

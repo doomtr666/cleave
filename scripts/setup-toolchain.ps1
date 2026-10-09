@@ -1,16 +1,10 @@
 <#
 Downloads (or reuses) the prebuilt LLVM 22 + MLIR + openmp toolchain
 `cleave-llvm-redist` publishes, and writes `.cargo/config.toml` (gitignored,
-machine-specific -- see `.cargo/config.toml.example`) so `mlir-sys`/
-`tblgen-rs`/`cleave-mlir-shim`'s own build scripts pick it up automatically.
-
-Replaces the previous "set MLIR_SYS_220_PREFIX/TABLEGEN_220_PREFIX by hand
-in your shell profile, restart your shell, hope you remembered on the next
-machine" step (`doc/building.md`'s own real bug history: a machine-specific
-path hardcoded into a *tracked* `.cargo/config.toml` once broke every other
-machine, CI included) with one idempotent command -- run identically by a
-fresh dev machine, CI (`.github/workflows/ci.yml`), and anyone re-pointing
-at a version bump.
+machine-specific -- see `.cargo/config.toml.example`) with `CLEAVE_LLVM_PREFIX`,
+which `cleave-mlir-shim`'s build script compiles and links against. One
+idempotent command, run identically by a fresh dev machine, CI
+(`.github/workflows/ci.yml`), and anyone re-pointing at a version bump.
 
 Usage:
   scripts/setup-toolchain.ps1                                    # download/cache the pinned release (ci/toolchain-version.txt)
@@ -50,8 +44,7 @@ function Write-CleaveCargoConfig([string]$Prefix) {
 # this is). Re-run the script after a toolchain version bump
 # (ci/toolchain-version.txt) to refresh it.
 [env]
-MLIR_SYS_220_PREFIX = "$forward"
-TABLEGEN_220_PREFIX = "$forward"
+CLEAVE_LLVM_PREFIX = "$forward"
 "@
     Set-Content -Path $cargoConfigPath -Value $content -Encoding utf8
     Write-Host "Wrote $cargoConfigPath -> $Prefix"

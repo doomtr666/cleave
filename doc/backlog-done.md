@@ -2878,3 +2878,25 @@ Checked: the LLVM-dialect module of every example and kernel (18, nanoLM's 34 MB
 Every rewrite of the IR is a shim pass now: the copy rewrites (`cleave-forward-dead-source-copies`, `cleave-forward-out-param-copies`, `cleave-eliminate-self-copies`, `cleave-lower-dynamic-copies`, formerly `redundant_copy_elim.rs`), the allocator swap (`cleave-unify-tensor-allocations`, formerly `unify_alloc.rs`), and the walks `pipeline.rs` did by hand: `cleave-mark-contract`, `cleave-insert-stack-scopes`, `cleave-strip-ciface-debug-info`, `cleave-backfill-locations`. The two IR probes that decided whether a pass ran became passes running it when needed (`cleave-lower-permuted-transfers`, `cleave-convert-openmp-if-used{always=..}`). Gone with them: the C API's erasure traps (an op removed from its block isn't destroyed) and operations compared by raw pointer. What Rust still does to the module between stages: the `llvm.module_flags` it builds for CodeView (construction, step 4).
 
 Checked: the 18 modules identical to the baseline, each ported pass firing on nanoLM or mnist (dead-source copies 46, out-param calls 63, self copies 286, contractions 984, loop stack scopes 3527, allocator calls 2178 on nanoLM), the dynamic copies and permuted transfers by their tests (`a_matmul_with_a_partial_column_tile_compiles_and_computes_the_product`, `a_matmul_with_a_transposed_operand_compiles_without_inlining`).
+
+### cleave builds its IR without melior (`doc/plan-mlir-shim.md`, step 4)
+
+`cleave-mlir-shim/src/mlir` is cleave's MLIR API: MLIR's C API declared by hand (`sys`, no bindgen), and over it the objects cleave builds IR with, under the paths and names its lowering was written against (`ir::Block`, `ir::operation::OperationBuilder`, `dialect::llvm::load`, ...), so `mlir_lower.rs` changed its imports, not its logic. The dialect builders are melior's, operation for operation (the same operands, attributes and results, in the same order). The shim's `build.rs` links LLVM and MLIR itself (every `MLIR*` library, `llvm-config --libnames`, the system libraries), which `mlir-sys`'s build script did. The test harnesses run their passes through `cleave::pipeline::run_passes` (a textual pipeline) and JIT through `cleave::pipeline::jit`.
+
+No code in the workspace uses `melior` or `mlir-sys` any more; the dependencies themselves go in step 5.
+
+Checked: `--dump-mlir` of every example and kernel identical to the baseline compiler's, and the LLVM-dialect modules identical (18); the smoke suite and the shim's target tests pass.
+
+### mnist 3.5x slower since 2026-10-08: permuted-transfer lowering applied to the whole module
+
+Found 2026-10-09 by bisecting 43 commits (mnist-interop, single-thread build: 10.1 s on 2026-09-30, 35 s since `b822660`), then the commit's own changes one by one. `Fma::fma`'s BLAS branch, dead for mnist's training shapes, became an inline `linalg.matmul_add {blas}` instead of a call; the smaller body put `net_grad` under the inline threshold, so it was inlined into `train_and_evaluate`'s training loop. That brought a column read (a permuted `vector.transfer_read`) into the same function as the training loop, and `cleave-lower-permuted-transfers` ran `convert-vector-to-scf{target-rank=0}` on every function as soon as one permuted transfer existed: every vectorized transfer of the training loop became a scalar loop over a stack buffer (169 `__chkstk` probes in the object instead of 12, `net_grad` 2.4x slower in a uProf profile).
+
+Fixed: the pass lowers the permuted transfers only, and what lowering them creates (permutation maps, then scalar loops, tracked by a rewriter listener); every other transfer stays a vector one. mnist back to 10.8 s, same accuracy. Test: `cleave-mlir-shim/tests/passes.rs`, `only_permuted_transfers_are_lowered_to_scalar_loops`.
+
+Along the way, comparisons of known integers fold in the e-graph (`ConstantFold::const_bool`, signed, plus `and`/`or` of known booleans): `if P * Q * R > BLAS_MIN_WORK` is `if false` in CPS. The dead branch itself still reaches MLIR, where canonicalization removes it after inlining. Test: `comparisons_of_known_integers_fold_to_booleans`.
+
+### No more `melior`, `mlir-sys` or `tblgen` (`doc/plan-mlir-shim.md`, step 5)
+
+The dependencies and the workspace's `[patch.crates-io]` forks are gone; `Cargo.lock` has none of them, nor bindgen. The toolchain's prefix is one variable, `CLEAVE_LLVM_PREFIX` (replacing `MLIR_SYS_220_PREFIX` and `TABLEGEN_220_PREFIX`), written by `scripts/setup-toolchain.ps1` and read by the shim's `build.rs`, `--run` and `cleave-build` (libomp). `doc/building.md`, the README, `.cargo/config.toml.example` and the CI comments updated. Code comments that still tell melior's history are left to the comment-hygiene entry in `backlog.md`.
+
+Checked: `cargo build --release --workspace` (every example's kernel through `cleave-build`), the smoke suite, the shim's tests. The plan's five steps are done; its sixth (a prebuilt shim artifact) was dropped, the shim staying in this repository.

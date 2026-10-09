@@ -3,7 +3,9 @@
 //! (`emit_object`), a JIT (`ExecutionEngine`), and the IR rewrites cleave's
 //! pipeline runs.
 
-use mlir_sys::{
+pub mod mlir;
+
+use mlir::sys::{
     MlirContext, MlirExecutionEngine, MlirModule, MlirStringRef, mlirExecutionEngineDestroy,
     mlirExecutionEngineInvokePacked, mlirExecutionEngineLookup, mlirExecutionEngineRegisterSymbol,
 };
@@ -218,8 +220,7 @@ impl ExecutionEngine {
 
     /// # Safety
     ///
-    /// Same contract as `melior::ExecutionEngine::invoke_packed`: `arguments`
-    /// must be valid, aligned pointers to the real argument/result storage
+    /// `arguments` must be valid, aligned pointers to the real argument/result storage
     /// the named function expects.
     pub unsafe fn invoke_packed(
         &self,
@@ -251,9 +252,7 @@ impl Drop for ExecutionEngine {
     }
 }
 
-/// Mirrors `melior::Error::InvokeFunction`'s own role -- a plain marker,
-/// carrying no extra detail beyond "the JIT'd call itself reported failure",
-/// matching what `mlirExecutionEngineInvokePacked`'s own `MlirLogicalResult`
+/// A JIT'd call that reported failure: no detail beyond that, matching what `mlirExecutionEngineInvokePacked`'s own `MlirLogicalResult`
 /// return value carries.
 #[derive(Debug)]
 pub struct InvokeError;

@@ -12,11 +12,9 @@ use cleave::egraph::optimize_program;
 use cleave::mlir_lower::lower_program;
 use cleave::pipeline::strip_ciface_wrapper_debug_info;
 use cleave::registry::Registry;
-use melior::Context;
-use melior::dialect::DialectRegistry;
-use melior::ir::operation::OperationLike;
-use melior::pass;
-use melior::utility::register_all_dialects;
+use cleave_mlir_shim::mlir::Context;
+use cleave_mlir_shim::mlir::dialect::DialectRegistry;
+use cleave_mlir_shim::mlir::utility::register_all_dialects;
 
 fn context() -> Context {
     let dialect_registry = DialectRegistry::new();
@@ -47,16 +45,10 @@ fn run(
         "generated MLIR module failed verification"
     );
 
-    let pass_manager = pass::PassManager::new(context);
-    pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
     // `--expand-strided-metadata`/`--lower-affine`: needed once a real
     // `memref.subview` with a genuinely non-trivial `strided<...>` layout
     // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
     // has the story).
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
-    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
-    pass_manager.add_pass(pass::conversion::create_lower_affine());
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
     // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
     // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
     // doc comment for the full story (isolated there, on a completely
@@ -65,15 +57,11 @@ fn run(
     // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
     // constants; a first `--convert-to-llvm` pass gives those a chance to
     // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
-    pass_manager
-        .run(&mut module)
+    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-scf-to-cf,canonicalize,expand-strided-metadata,lower-affine,canonicalize,convert-to-llvm,finalize-memref-to-llvm,convert-to-llvm)")
         .expect("lowering to the llvm dialect must succeed");
     strip_ciface_wrapper_debug_info(&mut module);
 
-    let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
+    let engine = cleave::pipeline::jit(&module, 2);
     // SAFETY: a real, valid `extern "C" fn`, live for the process's whole
     // lifetime — mirrors `main.rs`'s own registration exactly.
     unsafe {

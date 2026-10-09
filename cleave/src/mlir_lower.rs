@@ -1,4 +1,5 @@
-//! Lowers a CPS-form program (`cps::CpsProgram`) into MLIR, via `melior`.
+//! Lowers a CPS-form program (`cps::CpsProgram`) into MLIR, through cleave's
+//! MLIR API (`cleave_mlir_shim::mlir`).
 //!
 //! Handles, so far: a top-level function's `return`, straight-line `LetPrim`
 //! chains (`extern` calls, reserved `mlir::dialect::op(...)` calls — see
@@ -21,7 +22,7 @@
 //! from operations: `ty_to_mlir` looks a cleave type name up in a map built
 //! from every `#[mlir_type("...")]`-tagged algebra `impl`
 //! (`cps::collect_mlir_types`), parsing the declared MLIR type text via
-//! `melior::ir::Type::parse` — no per-type-name Rust match left, beyond
+//! `cleave_mlir_shim::mlir::ir::Type::parse` — no per-type-name Rust match left, beyond
 //! `bool`, which stays a genuine special case (matching `infer.rs`'s own
 //! hardcoded `Ty::Con("bool")` for `if`/`while` conditions — the *only*
 //! other structurally-special type name left anywhere in this compiler).
@@ -39,7 +40,7 @@ use crate::cps::{
     CExpr, CFunDef, CTopLevelFn, CVal, CVar, CpsProgram, PrimOp, SrcLoc, StructSchema,
 };
 use crate::infer::{ConstValue, Ty};
-use melior::{
+use cleave_mlir_shim::mlir::{
     Context,
     dialect::{
         arith, func,
@@ -47,23 +48,16 @@ use melior::{
         memref, scf,
     },
     ir::{
-        Attribute, Block, Identifier, Location, Module, Operation, Region, RegionLike, Type,
-        TypeLike, Value, ValueLike,
-        attribute::{
-            AttributeLike, DenseI32ArrayAttribute, DenseI64ArrayAttribute, FlatSymbolRefAttribute,
+        Attribute, Block, Identifier, Location, Module, Operation, Region, Type,
+        Value, attribute::{
+            DenseI32ArrayAttribute, DenseI64ArrayAttribute, FlatSymbolRefAttribute,
             FloatAttribute, IntegerAttribute, StringAttribute, TypeAttribute,
         },
-        block::BlockLike,
-        operation::{OperationBuilder, OperationLike, OperationMutLike},
-        r#type::{
-            DimSize, FunctionType, IntegerType, MemRefType, RankedTensorType, ShapedTypeLike,
-        },
+        operation::OperationBuilder,
+        r#type::{DimSize, FunctionType, IntegerType, MemRefType, RankedTensorType},
     },
 };
-// Direct `mlir-sys` use (see `cleave/Cargo.toml`'s own doc comment on this
-// dependency): `build_matmul_transpose_no_seed`'s own `mlirOperationCreateParse`
-// call, the one escape hatch melior itself doesn't wrap.
-use melior::StringRef;
+use cleave_mlir_shim::mlir::StringRef;
 use std::cell::RefCell;
 use crate::collections::{HashMap, HashSet};
 
@@ -91,7 +85,7 @@ struct LowerCtx<'c, 'm> {
     /// The entry block of the function being lowered, where a by-pointer
     /// argument's slot is allocated (`call_arguments`): once per call site,
     /// not once per loop iteration.
-    entry_block: std::cell::Cell<Option<mlir_sys::MlirBlock>>,
+    entry_block: std::cell::Cell<Option<cleave_mlir_shim::mlir::sys::MlirBlock>>,
     /// The memory a large light struct value of the function being lowered
     /// already lives in (`homes_in`): a parameter received by pointer, and
     /// the light struct fields read out of one (a `getelementptr` into the
@@ -115,7 +109,7 @@ struct LowerCtx<'c, 'm> {
     /// `LowerCtx` exists (`is_large_light_struct` needs it).
     by_pointer_returns: RefCell<HashSet<String>>,
     /// The current function's result pointer, when it returns by pointer.
-    result_out: std::cell::Cell<Option<mlir_sys::MlirValue>>,
+    result_out: std::cell::Cell<Option<cleave_mlir_shim::mlir::sys::MlirValue>>,
     declared_externs: RefCell<HashSet<String>>,
     signatures: HashMap<String, (Vec<Ty>, Ty)>,
     /// Cleave type name -> MLIR type text, from every `#[mlir_type(...)]`-
@@ -305,7 +299,7 @@ fn resolve_file(file: u32) -> String {
 
 thread_local! {
     /// The current function's own `#llvm.di_subprogram` attribute, as a raw
-    /// `mlir_sys::MlirAttribute` pointer value (its `.ptr` field, cast to
+    /// `cleave_mlir_shim::mlir::sys::MlirAttribute` pointer value (its `.ptr` field, cast to
     /// `usize`) -- an `Attribute<'c>` itself can't live in a `static` (it
     /// isn't `Send`, and its lifetime is tied to `Context`, not `'static`),
     /// but the pointer it wraps is a plain FFI handle: sound to stash for
@@ -351,7 +345,7 @@ fn gen_loc(context: &Context) -> Location<'_> {
             // immediately before this function's body starts lowering and
             // never read past the end of that same `lower_program` call --
             // the context, and the attribute it owns, are still alive.
-            let raw = mlir_sys::MlirAttribute {
+            let raw = cleave_mlir_shim::mlir::sys::MlirAttribute {
                 ptr: ptr as *const std::ffi::c_void,
             };
             let sp = unsafe { Attribute::from_raw(raw) };
@@ -416,13 +410,12 @@ pub(crate) fn build_di_subprograms<'c>(
     let text = format!("[{}]", items.join(", "));
     let attr = Attribute::parse(context, &text)
         .expect("mlir_lower: failed to parse generated DI subprogram array");
-    // `ArrayAttribute::try_from` in melior 0.27.4 checks the wrong predicate
-    // (`is_dense_i64_array`), so index the array via raw `mlir-sys` instead.
+    // Its elements through the C API (`sys`).
     unsafe {
         let raw = attr.to_raw();
-        let n = mlir_sys::mlirArrayAttrGetNumElements(raw);
+        let n = cleave_mlir_shim::mlir::sys::mlirArrayAttrGetNumElements(raw);
         (0..n)
-            .map(|i| Attribute::from_raw(mlir_sys::mlirArrayAttrGetElement(raw, i)))
+            .map(|i| Attribute::from_raw(cleave_mlir_shim::mlir::sys::mlirArrayAttrGetElement(raw, i)))
             .collect()
     }
 }
@@ -1819,12 +1812,12 @@ fn entry_alloca<'c>(ctx: &LowerCtx<'c, '_>, ty: Type<'c>, spawned: bool) -> Valu
     // SAFETY: `raw` is the entry block of the function being lowered
     // (`lower_top_level_fn` sets it before lowering the body and clears it
     // after), alive for the whole lowering of that function.
-    let entry = unsafe { melior::ir::BlockRef::from_raw(raw) };
+    let entry = unsafe { cleave_mlir_shim::mlir::ir::BlockRef::from_raw(raw) };
     let location = Location::unknown(context);
     let i64_ty: Type = IntegerType::new(context, 64).into();
     let one_op = entry.insert_operation(0, arith::constant(context, IntegerAttribute::new(i64_ty, 1).into(), location));
     let one: Value = one_op.result(0).unwrap().into();
-    let mut slot = llvm::alloca(
+    let slot = llvm::alloca(
         context,
         one,
         llvm::r#type::pointer(context, 0),
@@ -1957,16 +1950,16 @@ fn lower_top_level_fn<'c>(ctx: &LowerCtx<'c, '_>, f: &CTopLevelFn) -> Operation<
     // so none of them ever qualified. Every internal algebra-dispatch/
     // helper function is *never* called from outside this module (only
     // `main`/exports are), so `private` costs nothing real.
-    let mut attrs: Vec<(melior::ir::Identifier, melior::ir::Attribute)> = if f.def.name == "main" {
+    let mut attrs: Vec<(cleave_mlir_shim::mlir::ir::Identifier, cleave_mlir_shim::mlir::ir::Attribute)> = if f.def.name == "main" {
         vec![(
-            melior::ir::Identifier::new(context, "llvm.emit_c_interface"),
-            melior::ir::Attribute::unit(context),
+            cleave_mlir_shim::mlir::ir::Identifier::new(context, "llvm.emit_c_interface"),
+            cleave_mlir_shim::mlir::ir::Attribute::unit(context),
         )]
     } else if f.is_export {
         vec![]
     } else {
         vec![(
-            melior::ir::Identifier::new(context, "sym_visibility"),
+            cleave_mlir_shim::mlir::ir::Identifier::new(context, "sym_visibility"),
             StringAttribute::new(context, "private").into(),
         )]
     };
@@ -1984,8 +1977,8 @@ fn lower_top_level_fn<'c>(ctx: &LowerCtx<'c, '_>, f: &CTopLevelFn) -> Operation<
     // behavior at all.
     if f.no_inline {
         attrs.push((
-            melior::ir::Identifier::new(context, "no_inline"),
-            melior::ir::Attribute::unit(context),
+            cleave_mlir_shim::mlir::ir::Identifier::new(context, "no_inline"),
+            cleave_mlir_shim::mlir::ir::Attribute::unit(context),
         ));
     }
     // An exported unit's real LLVM symbol is its `export_symbol` override
@@ -4147,7 +4140,7 @@ fn build_tensor_descriptor_value<'c>(
     // The value's own defining op, when it sits in this same block -- where
     // the destination chain must go (see the doc comment above). Built into
     // a detached staging block first, then moved there in one go.
-    let producer = melior::ir::operation::OperationResult::try_from(value)
+    let producer = cleave_mlir_shim::mlir::ir::operation::OperationResult::try_from(value)
         .ok()
         .map(|r| r.owner())
         .filter(|op| op.block().is_some_and(|b| b.to_raw().ptr == block.to_raw().ptr))
@@ -4271,8 +4264,8 @@ fn build_tensor_descriptor_value<'c>(
             // `move_before` needs an `OperationRefMut`; both ref kinds wrap
             // the identical `MlirOperation` (melior's own `walk_mut` widens
             // the same way).
-            let mut op = unsafe { melior::ir::operation::OperationRefMut::from_raw(op.to_raw()) };
-            op.move_before(unsafe { melior::ir::operation::OperationRef::from_raw(producer) });
+            let op = unsafe { cleave_mlir_shim::mlir::ir::operation::OperationRefMut::from_raw(op.to_raw()) };
+            op.move_before(unsafe { cleave_mlir_shim::mlir::ir::operation::OperationRef::from_raw(producer) });
         }
     }
 
@@ -6396,14 +6389,14 @@ fn zero_filled_seed<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, result_ty: Ty
 
 /// Marks the op defining `product` `cleave.blas`.
 fn mark_blas<'c>(context: &'c Context, product: Value<'c, 'c>) {
-    let result = melior::ir::operation::OperationResult::try_from(product)
+    let result = cleave_mlir_shim::mlir::ir::operation::OperationResult::try_from(product)
         .unwrap_or_else(|_| panic!("MLIR lowering: a BLAS product must be an op's result"));
     let owner = result.owner();
     unsafe {
-        mlir_sys::mlirOperationSetAttributeByName(
+        cleave_mlir_shim::mlir::sys::mlirOperationSetAttributeByName(
             owner.to_raw(),
             StringRef::new("cleave.blas").to_raw(),
-            mlir_sys::mlirUnitAttrGet(context.to_raw()),
+            cleave_mlir_shim::mlir::sys::mlirUnitAttrGet(context.to_raw()),
         );
     }
 }
@@ -6574,7 +6567,7 @@ fn lower_raw_mlir_op<'c>(
     let operand_ty = args
         .iter()
         .find_map(|a| match a {
-            CVal::Var(v) => env.get(v).map(ValueLike::r#type),
+            CVal::Var(v) => env.get(v).map(|v| v.r#type()),
             _ => None,
         })
         .unwrap_or_else(|| shaped_element_type(result_ty).unwrap_or(result_ty));
@@ -7130,7 +7123,7 @@ fn build_matmul_transpose_named_op<'c>(
          }}"
     );
     let raw = unsafe {
-        mlir_sys::mlirOperationCreateParse(
+        cleave_mlir_shim::mlir::sys::mlirOperationCreateParse(
             context.to_raw(),
             StringRef::new(&wrapper_text).to_raw(),
             StringRef::new("<cleave-matmul-transpose>").to_raw(),
@@ -7148,7 +7141,7 @@ fn build_matmul_transpose_named_op<'c>(
     let func_block = region
         .first_block()
         .unwrap_or_else(|| panic!("MLIR lowering: matmul-transpose wrapper's region has no block"));
-    let mut matmul_ref = func_block.first_operation_mut().unwrap_or_else(|| {
+    let matmul_ref = func_block.first_operation_mut().unwrap_or_else(|| {
         panic!("MLIR lowering: matmul-transpose wrapper's block has no operation")
     });
     matmul_ref.remove_from_parent();
@@ -7766,7 +7759,7 @@ fn lower_extern_out_param_call<'c>(
 
 /// The element type of a tensor, vector or memref type; `None` otherwise.
 fn shaped_element_type(ty: Type<'_>) -> Option<Type<'_>> {
-    if let Ok(t) = melior::ir::r#type::RankedTensorType::try_from(ty) {
+    if let Ok(t) = cleave_mlir_shim::mlir::ir::r#type::RankedTensorType::try_from(ty) {
         return Some(t.element());
     }
     if let Ok(t) = MemRefType::try_from(ty) {
@@ -7822,7 +7815,7 @@ fn ensure_extern_declared<'c>(
         TypeAttribute::new(FunctionType::new(context, &param_mlir, results).into()),
         Region::new(),
         &[(
-            melior::ir::Identifier::new(context, "sym_visibility"),
+            cleave_mlir_shim::mlir::ir::Identifier::new(context, "sym_visibility"),
             StringAttribute::new(context, "private").into(),
         )],
         location,

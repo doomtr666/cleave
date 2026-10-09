@@ -9,11 +9,9 @@ use cleave::driver::compile;
 use cleave::mlir_lower::lower_program;
 use cleave::pipeline::{check_type_errors, strip_ciface_wrapper_debug_info};
 use cleave::registry::Registry;
-use melior::Context;
-use melior::dialect::DialectRegistry;
-use melior::ir::operation::OperationLike;
-use melior::pass;
-use melior::utility::{parse_pass_pipeline, register_all_dialects};
+use cleave_mlir_shim::mlir::Context;
+use cleave_mlir_shim::mlir::dialect::DialectRegistry;
+use cleave_mlir_shim::mlir::utility::register_all_dialects;
 
 fn context() -> Context {
     let dialect_registry = DialectRegistry::new();
@@ -31,7 +29,7 @@ fn context() -> Context {
 /// the usual simplification for a test that is about
 /// allocation rather than vectorization: this file is testing *this*
 /// rewrite, not vectorization), then runs `cleave-unify-tensor-allocations`.
-fn build_unified_module<'c>(context: &'c Context, src: &str) -> melior::ir::Module<'c> {
+fn build_unified_module<'c>(context: &'c Context, src: &str) -> cleave_mlir_shim::mlir::ir::Module<'c> {
     let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let registry = Registry::build(&program);
@@ -45,46 +43,21 @@ fn build_unified_module<'c>(context: &'c Context, src: &str) -> melior::ir::Modu
     let mut module = lower_program(context, &cps_program, &mlir_types, struct_schemas);
     assert!(module.as_operation().verify());
 
-    let pass_manager = pass::PassManager::new(context);
-    pass_manager.add_pass(pass::transform::create_inliner());
-    pass_manager.add_pass(pass::linalg::create_convert_elementwise_to_linalg_pass());
-    pass_manager.add_pass(pass::linalg::create_linalg_elementwise_op_fusion_pass());
-    pass_manager
-        .run(&mut module)
+    cleave::pipeline::run_passes(&mut module, "builtin.module(inline,convert-elementwise-to-linalg,linalg-fuse-elementwise-ops)")
         .expect("inline/elementwise-to-linalg/fuse must succeed");
 
 
-    let pass_manager = pass::PassManager::new(context);
     cleave::pipeline::register_passes();
-    parse_pass_pipeline(
-        pass_manager.as_operation_pass_manager(),
-        "builtin.module(eliminate-empty-tensors,one-shot-bufferize{bufferize-function-boundaries=true})",
-    )
-    .expect("failed to parse the one-shot-bufferize pass pipeline");
-    pass_manager
-        .run(&mut module)
+    cleave::pipeline::run_passes(&mut module, "builtin.module(eliminate-empty-tensors,one-shot-bufferize{bufferize-function-boundaries=true})")
         .expect("one-shot-bufferize must succeed");
 
-    let pass_manager = pass::PassManager::new(context);
-    pass_manager.add_pass(pass::bufferization::create_ownership_based_buffer_deallocation_pass());
-    pass_manager.add_pass(pass::bufferization::create_buffer_deallocation_simplification_pass());
-    pass_manager.add_pass(pass::bufferization::create_lower_deallocations_pass());
-    pass_manager.add_pass(pass::conversion::create_bufferization_to_mem_ref());
-    pass_manager
-        .run(&mut module)
+    cleave::pipeline::run_passes(&mut module, "builtin.module(ownership-based-buffer-deallocation,buffer-deallocation-simplification,bufferization-lower-deallocations,convert-bufferization-to-memref)")
         .expect("buffer-deallocation must succeed");
 
-    let pass_manager = pass::PassManager::new(context);
-    pass_manager.add_pass(pass::linalg::create_convert_linalg_to_loops_pass());
-    pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
     // `--expand-strided-metadata`/`--lower-affine`: needed once a real
     // `memref.subview` with a genuinely non-trivial `strided<...>` layout
     // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
     // has the story).
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
-    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
-    pass_manager.add_pass(pass::conversion::create_lower_affine());
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
     // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
     // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
     // doc comment for the full story (isolated there, on a completely
@@ -93,12 +66,7 @@ fn build_unified_module<'c>(context: &'c Context, src: &str) -> melior::ir::Modu
     // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
     // constants; a first `--convert-to-llvm` pass gives those a chance to
     // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-    pass_manager
-        .run(&mut module)
+    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-linalg-to-loops,convert-scf-to-cf,canonicalize,expand-strided-metadata,lower-affine,canonicalize,convert-to-llvm,finalize-memref-to-llvm,convert-to-llvm,reconcile-unrealized-casts)")
         .expect("lowering to the llvm dialect must succeed");
 
     unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), "builtin.module(cleave-unify-tensor-allocations)", false) }
@@ -122,7 +90,7 @@ fn unified_text(context: &Context, src: &str) -> String {
 /// value, not just verifiable text.
 fn run_f32_unified(context: &Context, src: &str) -> f32 {
     let module = build_unified_module(context, src);
-    let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
+    let engine = cleave::pipeline::jit(&module, 2);
     unsafe {
         engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
         engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());

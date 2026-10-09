@@ -166,6 +166,11 @@ pub struct FoldData {
     /// `mlir_lower.rs`'s debug-info `FileLineColLoc`s.
     pub line: Option<u32>,
     pub const_int: Option<u64>,
+    /// A known boolean: a literal, or a comparison (`Ord::gt`, ...) or a
+    /// logical operation (`Logic::and`, ...) of known operands, folded as
+    /// `const_int` folds arithmetic. An `if` on it is decided here, its dead
+    /// branch never reaching the rest of the pipeline.
+    pub const_bool: Option<bool>,
     pub free_deps: HashSet<Symbol>,
     /// This e-class's own concrete cleave `Ty`, when known (`ConstantFold::
     /// known_types`'s own doc comment) -- used by `derivative-independent-
@@ -240,6 +245,31 @@ impl Analysis<CleaveLang> for ConstantFold {
             // comment).
             CleaveLang::Float(_) | CleaveLang::Bool(_) | CleaveLang::Free(_) => None,
         })();
+        // Comparisons of known integers (signed, `eval_binop`), logic over
+        // known booleans.
+        let const_bool = (|| match enode {
+            CleaveLang::Bool(b) => Some(*b),
+            CleaveLang::Op(op, args) => {
+                let name = abstract_op_name(op.as_str())?;
+                let [a, b] = args.as_slice() else { return None };
+                let (a, b) = match name {
+                    "eq" | "neq" | "lt" | "le" | "gt" | "ge" => (
+                        crate::infer::ConstValue::Int(egraph[*a].data.const_int?),
+                        crate::infer::ConstValue::Int(egraph[*b].data.const_int?),
+                    ),
+                    "and" | "or" => (
+                        crate::infer::ConstValue::Bool(egraph[*a].data.const_bool?),
+                        crate::infer::ConstValue::Bool(egraph[*b].data.const_bool?),
+                    ),
+                    _ => return None,
+                };
+                match crate::const_eval::eval_binop(name, a, b)? {
+                    crate::infer::ConstValue::Bool(b) => Some(b),
+                    _ => None,
+                }
+            }
+            CleaveLang::Int(_) | CleaveLang::Float(_) | CleaveLang::Free(_) => None,
+        })();
         let free_deps = match enode {
             CleaveLang::Free(sym) => std::iter::once(*sym).collect(),
             // `derivative(inner, x)` gets no special case here — `x` (a
@@ -284,6 +314,7 @@ impl Analysis<CleaveLang> for ConstantFold {
         FoldData {
             line,
             const_int,
+            const_bool,
             free_deps,
             own_ty,
         }
@@ -303,6 +334,10 @@ impl Analysis<CleaveLang> for ConstantFold {
                 *a, b,
                 "constant-fold analysis disagreed with itself on the same e-class's own value"
             );
+            DidMerge(false, false)
+        });
+        let bool_merge = egg::merge_option(&mut to.const_bool, from.const_bool, |a, b| {
+            assert_eq!(*a, b, "constant-fold analysis disagreed with itself on the same e-class's own value");
             DidMerge(false, false)
         });
         let to_len = to.free_deps.len();
@@ -327,12 +362,16 @@ impl Analysis<CleaveLang> for ConstantFold {
             }
             (None, None) => DidMerge(false, false),
         };
-        line_merge | int_merge | DidMerge(new_len != to_len, new_len != from_len) | ty_merge
+        line_merge | int_merge | bool_merge | DidMerge(new_len != to_len, new_len != from_len) | ty_merge
     }
 
     fn modify(egraph: &mut egg::EGraph<CleaveLang, Self>, id: Id) {
         if let Some(n) = egraph[id].data.const_int {
             let added = egraph.add(CleaveLang::Int(n));
+            egraph.union(id, added);
+        }
+        if let Some(b) = egraph[id].data.const_bool {
+            let added = egraph.add(CleaveLang::Bool(b));
             egraph.union(id, added);
         }
     }
@@ -6160,6 +6199,31 @@ mod tests {
             "5",
             "expected the folded literal, got {best}"
         );
+    }
+
+    /// A comparison of known integers folds to its boolean, signed (`-1 <
+    /// 0`), and logic over known booleans folds too: an `if` on a constant
+    /// condition (`P * Q * R > BLAS_MIN_WORK`, all const generics) is
+    /// decided at compile time, its dead branch never reaching MLIR.
+    #[test]
+    fn comparisons_of_known_integers_fold_to_booleans() {
+        let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
+        let small = egraph.add(CleaveLang::Int(40960));
+        let threshold = egraph.add(CleaveLang::Int(20_000_000));
+        let gt = egraph.add(CleaveLang::Op("Ord::gt<i32>".into(), vec![small, threshold]));
+        assert_eq!(egraph[gt].data.const_bool, Some(false));
+        let five = egraph.add(CleaveLang::Int(5));
+        let minus_one = egraph.add(CleaveLang::Op("Ring::neg<i32>".into(), vec![five]));
+        let zero = egraph.add(CleaveLang::Int(0));
+        let lt = egraph.add(CleaveLang::Op("Ord::lt<i32>".into(), vec![minus_one, zero]));
+        assert_eq!(egraph[lt].data.const_bool, Some(true));
+        let and = egraph.add(CleaveLang::Op("Logic::and<bool>".into(), vec![gt, lt]));
+        assert_eq!(egraph[and].data.const_bool, Some(false));
+        let x = egraph.add(CleaveLang::Free("x".into()));
+        let unknown = egraph.add(CleaveLang::Op("Ord::gt<i32>".into(), vec![x, zero]));
+        assert_eq!(egraph[unknown].data.const_bool, None);
+        let extractor = Extractor::new(&egraph, AstSize);
+        assert_eq!(extractor.find_best(gt).1.to_string(), "false");
     }
 
     /// A node whose own children aren't both known constants doesn't fold

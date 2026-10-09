@@ -30,10 +30,9 @@ use cleave::pipeline::{
 };
 use cleave::print::print_program;
 use cleave::registry::Registry;
-use melior::Context;
-use melior::dialect::DialectRegistry;
-use melior::ir::operation::OperationLike;
-use melior::utility::register_all_dialects;
+use cleave_mlir_shim::mlir::Context;
+use cleave_mlir_shim::mlir::dialect::DialectRegistry;
+use cleave_mlir_shim::mlir::utility::register_all_dialects;
 use std::path::PathBuf;
 use std::process::ExitCode;
 

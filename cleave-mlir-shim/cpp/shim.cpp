@@ -57,6 +57,8 @@
 #include "mlir/Target/LLVMIR/Export.h"
 #include "mlir/Dialect/Transform/IR/TransformDialect.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/Conversion/VectorToSCF/VectorToSCF.h"
+#include "mlir/Dialect/Vector/Transforms/LoweringPatterns.h"
 #include "mlir/Dialect/Transform/IR/Utils.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/InitAllPasses.h"
@@ -2361,18 +2363,83 @@ static LogicalResult runIf(ModuleOp module, bool condition,
   return runPipeline(pm, module);
 }
 
-// Whether `module` has a `vector.transfer_read`/`transfer_write` whose
-// permutation map isn't a minor identity (`(d0, d1) -> (d1)` is one; `(d0, d1)
-// -> (d0)` isn't): what `convert-vector-to-llvm` can't lower.
-static bool hasPermutedTransfer(ModuleOp module) {
-  bool found = false;
+// Whether `op` is a `vector.transfer_read`/`transfer_write` whose permutation
+// map isn't a minor identity (`(d0, d1) -> (d1)` is one; `(d0, d1) -> (d0)`, a
+// column, isn't): what `convert-vector-to-llvm` can't lower.
+static bool isPermutedTransfer(Operation *op) {
+  if (auto read = dyn_cast<vector::TransferReadOp>(op))
+    return !read.getPermutationMap().isMinorIdentity();
+  if (auto write = dyn_cast<vector::TransferWriteOp>(op))
+    return !write.getPermutationMap().isMinorIdentity();
+  return false;
+}
+
+// The operations a rewrite inserts, minus those it erases again.
+struct TrackInserted : RewriterBase::Listener {
+  llvm::SetVector<Operation *> ops;
+  void notifyOperationInserted(Operation *op,
+                               OpBuilder::InsertPoint) override {
+    ops.insert(op);
+  }
+  void notifyOperationErased(Operation *op) override { ops.remove(op); }
+};
+
+// The permuted transfers of `module` lowered as `convert-vector-to-scf
+// {target-rank=0}` lowers transfers (their permutation maps first, then
+// scalar loops over a stack buffer), and only them and what lowering them
+// creates: the pass itself would scalarize every transfer of the module, the
+// vectorized loops around included, once a single permuted one exists (a
+// training loop's matmuls went 3x slower when inlining put a column read in
+// their function). Returns how many there were.
+static int64_t lowerPermutedTransfers(ModuleOp module) {
+  SmallVector<Operation *> permuted;
   module.walk([&](Operation *op) {
-    if (auto read = dyn_cast<vector::TransferReadOp>(op))
-      found |= !read.getPermutationMap().isMinorIdentity();
-    else if (auto write = dyn_cast<vector::TransferWriteOp>(op))
-      found |= !write.getPermutationMap().isMinorIdentity();
+    if (isPermutedTransfer(op))
+      permuted.push_back(op);
   });
-  return found;
+  if (permuted.empty())
+    return 0;
+  MLIRContext *ctx = module.getContext();
+  TrackInserted track;
+  llvm::SetVector<Operation *> alive(permuted.begin(), permuted.end());
+  struct Forget : RewriterBase::Listener {
+    llvm::SetVector<Operation *> &alive;
+    TrackInserted &track;
+    Forget(llvm::SetVector<Operation *> &alive, TrackInserted &track)
+        : alive(alive), track(track) {}
+    void notifyOperationInserted(Operation *op,
+                                 OpBuilder::InsertPoint ip) override {
+      track.notifyOperationInserted(op, ip);
+    }
+    void notifyOperationErased(Operation *op) override {
+      alive.remove(op);
+      track.notifyOperationErased(op);
+    }
+  } listener(alive, track);
+
+  RewritePatternSet mapPatterns(ctx);
+  vector::populateVectorTransferPermutationMapLoweringPatterns(mapPatterns);
+  (void)applyOpPatternsGreedily(
+      alive.getArrayRef(), std::move(mapPatterns),
+      GreedyRewriteConfig()
+          .setStrictness(GreedyRewriteStrictness::ExistingAndNewOps)
+          .setListener(&listener));
+
+  SmallVector<Operation *> transfers;
+  for (Operation *op : alive)
+    transfers.push_back(op);
+  for (Operation *op : track.ops)
+    if (isa<vector::TransferReadOp, vector::TransferWriteOp>(op))
+      transfers.push_back(op);
+  RewritePatternSet scfPatterns(ctx);
+  VectorTransferToSCFOptions options;
+  options.targetRank = 0;
+  populateVectorToSCFConversionPatterns(scfPatterns, options);
+  (void)applyOpPatternsGreedily(
+      transfers, std::move(scfPatterns),
+      GreedyRewriteConfig().setStrictness(
+          GreedyRewriteStrictness::ExistingAndNewOps));
+  return permuted.size();
 }
 
 #define CLEAVE_MODULE_PASS(Class, argument, description, body)                 \
@@ -2416,14 +2483,10 @@ CLEAVE_MODULE_PASS(StripCifaceDebugInfoPass, "cleave-strip-ciface-debug-info",
 CLEAVE_MODULE_PASS(BackfillLocationsPass, "cleave-backfill-locations",
                    "synthesized operations given their nearest source line",
                    backfillUnknownLocations(getOperation());)
-CLEAVE_MODULE_PASS(
-    LowerPermutedTransfersPass, "cleave-lower-permuted-transfers",
-    "permuted vector transfers lowered to scalar loops (if any)",
-    if (failed(runIf(getOperation(), hasPermutedTransfer(getOperation()),
-                     "func.func(convert-vector-to-scf{target-rank=0})",
-                     [&](OpPassManager &pm, Operation *op) {
-                       return runPipeline(pm, op);
-                     }))) signalPassFailure();)
+CLEAVE_MODULE_PASS(LowerPermutedTransfersPass,
+                   "cleave-lower-permuted-transfers",
+                   "permuted vector transfers lowered to scalar loops",
+                   rewritten += lowerPermutedTransfers(getOperation());)
 
 #undef CLEAVE_MODULE_PASS
 

@@ -1,5 +1,7 @@
 # Plan: cleave talks to MLIR through its own C API only — no `melior`, no `mlir-sys`
 
+**Status: done, 2026-10-09** (`doc/backlog-done.md`, steps 1 to 5).
+
 ## Goal
 
 Drop `melior`, `mlir-sys` and `tblgen` from cleave's dependencies. Rust keeps building the IR (the CPS
@@ -118,10 +120,10 @@ the end-to-end coverage of code generation). One step per commit.
 3. **The Rust IR rewrites into C++** Done (2026-10-09).: `unify_alloc` first (smallest), then `redundant_copy_elim`,
    then the `pipeline.rs` walks (contract flags, stack scopes, location backfill, debug-info stripping,
    the `has_*` probes). Same identical-output check, plus their existing tests.
-4. **The Rust layer.** `cleave-mlir`'s `src/` gets the construction API over group 1 of the C API;
+4. **The Rust layer.** Done (2026-10-09). `cleave-mlir`'s `src/` gets the construction API over group 1 of the C API;
    the shim's Rust side stops depending on `mlir-sys`. `mlir_lower.rs` and the tests switch imports
    module by module. Check: identical `--dump-mlir` output on the examples and nanoLM.
-5. **Remove** `melior`, `mlir-sys`, `tblgen` and the patches; the shim's `build.rs` emits the LLVM/MLIR
+5. **Remove** (done, 2026-10-09) `melior`, `mlir-sys`, `tblgen` and the patches; the shim's `build.rs` emits the LLVM/MLIR
    link directives itself; `setup-toolchain.ps1` writes `CLEAVE_LLVM_PREFIX` only; `building.md`
    rewritten. Linux then needs only the prebuilt LLVM/MLIR for it and the shim's `build.rs` flags.
 

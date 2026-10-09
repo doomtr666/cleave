@@ -9,11 +9,9 @@ use cleave::pipeline::{
     CodegenOptions, check_type_errors, lower_to_llvm, strip_ciface_wrapper_debug_info,
 };
 use cleave::registry::Registry;
-use melior::Context;
-use melior::dialect::DialectRegistry;
-use melior::ir::operation::OperationLike;
-use melior::pass;
-use melior::utility::{parse_pass_pipeline, register_all_dialects};
+use cleave_mlir_shim::mlir::Context;
+use cleave_mlir_shim::mlir::dialect::DialectRegistry;
+use cleave_mlir_shim::mlir::utility::register_all_dialects;
 
 fn context() -> Context {
     let dialect_registry = DialectRegistry::new();
@@ -40,7 +38,7 @@ fn context() -> Context {
 /// itself actually uses. A single shared helper here, instead of hand-
 /// listing the same ~30 symbols at each of this file's own several
 /// `ExecutionEngine::new` call sites, keeps them from drifting out of sync.
-fn register_io_symbols(engine: &melior::ExecutionEngine) {
+fn register_io_symbols(engine: &cleave_mlir_shim::ExecutionEngine) {
     unsafe {
         engine.register_symbol("print_i8", cleave_rt::print_i8 as *mut ());
         engine.register_symbol("print_i16", cleave_rt::print_i16 as *mut ());
@@ -189,7 +187,6 @@ fn a_compiled_program_actually_runs_and_returns_the_right_value() {
         .expect("cleave-lower-spawns");
     assert!(module.as_operation().verify());
 
-    let pass_manager = pass::PassManager::new(&context);
     // `num`'s own `Rem::mod` (prelude, unconditionally compiled into every
     // module regardless of whether the program actually calls it — see
     // `doc/backlog.md`'s own "dead-code elimination" item) has a real `if`/
@@ -198,15 +195,10 @@ fn a_compiled_program_actually_runs_and_returns_the_right_value() {
     // can't translate it (needs `create_scf_to_control_flow` first, same
     // reasoning as `run_i32`'s own doc comment below), found by direct
     // testing the moment `mod`/`rem` landed in the stdlib.
-    pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
     // `--expand-strided-metadata`/`--lower-affine`: needed once a real
     // `memref.subview` with a genuinely non-trivial `strided<...>` layout
     // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
     // has the story).
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
-    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
-    pass_manager.add_pass(pass::conversion::create_lower_affine());
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
     // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
     // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
     // doc comment for the full story (isolated there, on a completely
@@ -215,9 +207,6 @@ fn a_compiled_program_actually_runs_and_returns_the_right_value() {
     // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
     // constants; a first `--convert-to-llvm` pass gives those a chance to
     // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
     // Multiple independent conversion passes can each leave `builtin.
     // unrealized_conversion_cast` bridge ops between their own intermediate
     // representations behind -- found by direct testing, kept defensively:
@@ -227,13 +216,11 @@ fn a_compiled_program_actually_runs_and_returns_the_right_value() {
     // standard MLIR cleanup for exactly that situation: folds/cancels
     // chains of these casts away (`cast(cast(x, A->B), B->A) == x`), not a
     // real lowering step of its own.
-    pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-    pass_manager
-        .run(&mut module)
+    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-scf-to-cf,canonicalize,expand-strided-metadata,lower-affine,canonicalize,convert-to-llvm,finalize-memref-to-llvm,convert-to-llvm,reconcile-unrealized-casts)")
         .expect("lowering to the llvm dialect must succeed");
     strip_ciface_wrapper_debug_info(&mut module);
 
-    let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
+    let engine = cleave::pipeline::jit(&module, 2);
     // Registered unconditionally, harmless if unused -- any struct
     // construction anywhere in the program (not just a top-level return)
     // needs `cleave_alloc` (see `mlir_lower.rs::alloc_struct`'s own doc
@@ -467,36 +454,14 @@ fn optimized_lowered_llvm_text_for_tensors(context: &Context, src: &str) -> Stri
     // uses (that function's own doc comment has the full reasoning for
     // each stage) -- stopping here, before JIT engine construction, instead
     // of continuing on to invoke.
-    let pass_manager = pass::PassManager::new(context);
-    pass_manager.add_pass(pass::linalg::create_convert_elementwise_to_linalg_pass());
-    pass_manager
-        .run(&mut module)
+    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-elementwise-to-linalg)")
         .expect("convert-elementwise-to-linalg must succeed");
 
-    let pass_manager = pass::PassManager::new(context);
     cleave::pipeline::register_passes();
-    parse_pass_pipeline(
-        pass_manager.as_operation_pass_manager(),
-        "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})",
-    )
-    .expect("failed to parse the one-shot-bufferize pass pipeline");
-    pass_manager
-        .run(&mut module)
+    cleave::pipeline::run_passes(&mut module, "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})")
         .expect("one-shot-bufferize must succeed");
 
-    let pass_manager = pass::PassManager::new(context);
-    pass_manager.add_pass(pass::linalg::create_convert_linalg_to_loops_pass());
-    pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
-    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
-    pass_manager.add_pass(pass::conversion::create_lower_affine());
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-    pass_manager
-        .run(&mut module)
+    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-linalg-to-loops,convert-scf-to-cf,canonicalize,expand-strided-metadata,lower-affine,canonicalize,convert-to-llvm,finalize-memref-to-llvm,convert-to-llvm,reconcile-unrealized-casts)")
         .expect("lowering to the llvm dialect must succeed");
     strip_ciface_wrapper_debug_info(&mut module);
 
@@ -537,17 +502,14 @@ fn run_i32_from_cps(
     // tensor.cleave`) has no `BufferizableOpInterface` implementation of
     // its own — only a real structured/named op does — so one-shot-
     // bufferize (stage 2) can't handle it directly without this first.
-    let pass_manager = pass::PassManager::new(context);
-    pass_manager.add_pass(pass::linalg::create_convert_elementwise_to_linalg_pass());
-    pass_manager
-        .run(&mut module)
+    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-elementwise-to-linalg)")
         .expect("convert-elementwise-to-linalg must succeed");
 
     // Stage 2: `bufferize-function-boundaries=true` — melior's own
     // generated `create_one_shot_bufferize_pass()` binding takes no
     // options at all (the underlying C API constructor is zero-argument),
     // so the option has to go in via a real textual pass-pipeline string
-    // instead (`melior::utility::parse_pass_pipeline`) — without it, a
+    // instead (`cleave_mlir_shim::mlir::utility::parse_pass_pipeline`) — without it, a
     // `tensor`-typed function parameter/return (any cross-function call
     // involving a `Vector`/`Matrix`) is left bridged by a `bufferization.
     // to_buffer`/`to_tensor` pair at the function boundary that nothing
@@ -558,31 +520,17 @@ fn run_i32_from_cps(
     // entirely. The pass must be registered by name first — textual
     // pipeline parsing looks it up by its own registered name, unlike
     // `add_pass`, which already has the concrete `Pass` object in hand.
-    let pass_manager = pass::PassManager::new(context);
     cleave::pipeline::register_passes();
-    parse_pass_pipeline(
-        pass_manager.as_operation_pass_manager(),
-        "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})",
-    )
-    .expect("failed to parse the one-shot-bufferize pass pipeline");
-    pass_manager
-        .run(&mut module)
+    cleave::pipeline::run_passes(&mut module, "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})")
         .expect("one-shot-bufferize must succeed");
 
     // Stage 3: ordinary lowering to the `llvm` dialect — everything past
     // this point is plain `memref`/`arith`/`scf`, already fully handled by
     // this project's own pre-existing pipeline, unchanged.
-    let pass_manager = pass::PassManager::new(context);
-    pass_manager.add_pass(pass::linalg::create_convert_linalg_to_loops_pass());
-    pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
     // `--expand-strided-metadata`/`--lower-affine`: needed once a real
     // `memref.subview` with a genuinely non-trivial `strided<...>` layout
     // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
     // has the story).
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
-    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
-    pass_manager.add_pass(pass::conversion::create_lower_affine());
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
     // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
     // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
     // doc comment for the full story (isolated there, on a completely
@@ -591,9 +539,6 @@ fn run_i32_from_cps(
     // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
     // constants; a first `--convert-to-llvm` pass gives those a chance to
     // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
     // Multiple independent conversion passes can each leave `builtin.
     // unrealized_conversion_cast` bridge ops between their own intermediate
     // representations behind -- found by direct testing, kept defensively:
@@ -603,13 +548,11 @@ fn run_i32_from_cps(
     // standard MLIR cleanup for exactly that situation: folds/cancels
     // chains of these casts away (`cast(cast(x, A->B), B->A) == x`), not a
     // real lowering step of its own.
-    pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-    pass_manager
-        .run(&mut module)
+    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-linalg-to-loops,convert-scf-to-cf,canonicalize,expand-strided-metadata,lower-affine,canonicalize,convert-to-llvm,finalize-memref-to-llvm,convert-to-llvm,reconcile-unrealized-casts)")
         .expect("lowering to the llvm dialect must succeed");
     strip_ciface_wrapper_debug_info(&mut module);
 
-    let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
+    let engine = cleave::pipeline::jit(&module, 2);
     // Registered unconditionally, harmless if unused -- any struct
     // construction anywhere in the program (not just a top-level return)
     // needs `cleave_alloc` (see `mlir_lower.rs::alloc_struct`'s own doc
@@ -903,7 +846,6 @@ fn an_extern_fn_call_actually_executes_through_a_registered_symbol() {
         .expect("cleave-lower-spawns");
     assert!(module.as_operation().verify());
 
-    let pass_manager = pass::PassManager::new(&context);
     // `num`'s own `Rem::mod` (prelude, unconditionally compiled into every
     // module regardless of whether the program actually calls it — see
     // `doc/backlog.md`'s own "dead-code elimination" item) has a real `if`/
@@ -912,15 +854,10 @@ fn an_extern_fn_call_actually_executes_through_a_registered_symbol() {
     // can't translate it (needs `create_scf_to_control_flow` first, same
     // reasoning as `run_i32`'s own doc comment below), found by direct
     // testing the moment `mod`/`rem` landed in the stdlib.
-    pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
     // `--expand-strided-metadata`/`--lower-affine`: needed once a real
     // `memref.subview` with a genuinely non-trivial `strided<...>` layout
     // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
     // has the story).
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
-    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
-    pass_manager.add_pass(pass::conversion::create_lower_affine());
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
     // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
     // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
     // doc comment for the full story (isolated there, on a completely
@@ -929,9 +866,6 @@ fn an_extern_fn_call_actually_executes_through_a_registered_symbol() {
     // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
     // constants; a first `--convert-to-llvm` pass gives those a chance to
     // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
     // Multiple independent conversion passes can each leave `builtin.
     // unrealized_conversion_cast` bridge ops between their own intermediate
     // representations behind -- found by direct testing, kept defensively:
@@ -941,13 +875,11 @@ fn an_extern_fn_call_actually_executes_through_a_registered_symbol() {
     // standard MLIR cleanup for exactly that situation: folds/cancels
     // chains of these casts away (`cast(cast(x, A->B), B->A) == x`), not a
     // real lowering step of its own.
-    pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-    pass_manager
-        .run(&mut module)
+    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-scf-to-cf,canonicalize,expand-strided-metadata,lower-affine,canonicalize,convert-to-llvm,finalize-memref-to-llvm,convert-to-llvm,reconcile-unrealized-casts)")
         .expect("lowering to the llvm dialect must succeed");
     strip_ciface_wrapper_debug_info(&mut module);
 
-    let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
+    let engine = cleave::pipeline::jit(&module, 2);
     unsafe {
         engine.register_symbol("print_i32", cleave_rt::print_i32 as *mut ());
         engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
@@ -1071,7 +1003,6 @@ fn an_extern_impl_method_actually_executes_the_right_symbol_at_each_call_site() 
         .expect("cleave-lower-spawns");
     assert!(module.as_operation().verify());
 
-    let pass_manager = pass::PassManager::new(&context);
     // `num`'s own `Rem::mod` (prelude, unconditionally compiled into every
     // module regardless of whether the program actually calls it — see
     // `doc/backlog.md`'s own "dead-code elimination" item) has a real `if`/
@@ -1080,15 +1011,10 @@ fn an_extern_impl_method_actually_executes_the_right_symbol_at_each_call_site() 
     // can't translate it (needs `create_scf_to_control_flow` first, same
     // reasoning as `run_i32`'s own doc comment below), found by direct
     // testing the moment `mod`/`rem` landed in the stdlib.
-    pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
     // `--expand-strided-metadata`/`--lower-affine`: needed once a real
     // `memref.subview` with a genuinely non-trivial `strided<...>` layout
     // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
     // has the story).
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
-    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
-    pass_manager.add_pass(pass::conversion::create_lower_affine());
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
     // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
     // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
     // doc comment for the full story (isolated there, on a completely
@@ -1097,9 +1023,6 @@ fn an_extern_impl_method_actually_executes_the_right_symbol_at_each_call_site() 
     // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
     // constants; a first `--convert-to-llvm` pass gives those a chance to
     // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
     // Multiple independent conversion passes can each leave `builtin.
     // unrealized_conversion_cast` bridge ops between their own intermediate
     // representations behind -- found by direct testing, kept defensively:
@@ -1109,13 +1032,11 @@ fn an_extern_impl_method_actually_executes_the_right_symbol_at_each_call_site() 
     // standard MLIR cleanup for exactly that situation: folds/cancels
     // chains of these casts away (`cast(cast(x, A->B), B->A) == x`), not a
     // real lowering step of its own.
-    pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-    pass_manager
-        .run(&mut module)
+    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-scf-to-cf,canonicalize,expand-strided-metadata,lower-affine,canonicalize,convert-to-llvm,finalize-memref-to-llvm,convert-to-llvm,reconcile-unrealized-casts)")
         .expect("lowering to the llvm dialect must succeed");
     strip_ciface_wrapper_debug_info(&mut module);
 
-    let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
+    let engine = cleave::pipeline::jit(&module, 2);
     unsafe {
         engine.register_symbol("print_i32", cleave_rt::print_i32 as *mut ());
         engine.register_symbol("print_i64", cleave_rt::print_i64 as *mut ());
@@ -1178,16 +1099,10 @@ fn an_array_argument_crosses_an_extern_call_boundary_correctly() {
         .expect("cleave-lower-spawns");
     assert!(module.as_operation().verify());
 
-    let pass_manager = pass::PassManager::new(&context);
-    pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
     // `--expand-strided-metadata`/`--lower-affine`: needed once a real
     // `memref.subview` with a genuinely non-trivial `strided<...>` layout
     // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
     // has the story).
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
-    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
-    pass_manager.add_pass(pass::conversion::create_lower_affine());
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
     // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
     // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
     // doc comment for the full story (isolated there, on a completely
@@ -1196,9 +1111,6 @@ fn an_array_argument_crosses_an_extern_call_boundary_correctly() {
     // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
     // constants; a first `--convert-to-llvm` pass gives those a chance to
     // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
     // Multiple independent conversion passes can each leave `builtin.
     // unrealized_conversion_cast` bridge ops between their own intermediate
     // representations behind -- found by direct testing, kept defensively:
@@ -1208,13 +1120,11 @@ fn an_array_argument_crosses_an_extern_call_boundary_correctly() {
     // standard MLIR cleanup for exactly that situation: folds/cancels
     // chains of these casts away (`cast(cast(x, A->B), B->A) == x`), not a
     // real lowering step of its own.
-    pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-    pass_manager
-        .run(&mut module)
+    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-scf-to-cf,canonicalize,expand-strided-metadata,lower-affine,canonicalize,convert-to-llvm,finalize-memref-to-llvm,convert-to-llvm,reconcile-unrealized-casts)")
         .expect("lowering to the llvm dialect must succeed");
     strip_ciface_wrapper_debug_info(&mut module);
 
-    let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
+    let engine = cleave::pipeline::jit(&module, 2);
     unsafe {
         engine.register_symbol("sum_bytes", cleave_rt::sum_bytes as *mut ());
         engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
@@ -1287,16 +1197,10 @@ fn a_unit_returning_extern_fn_can_be_called_correctly() {
         "got:\n{text}"
     );
 
-    let pass_manager = pass::PassManager::new(&context);
-    pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
     // `--expand-strided-metadata`/`--lower-affine`: needed once a real
     // `memref.subview` with a genuinely non-trivial `strided<...>` layout
     // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
     // has the story).
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
-    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
-    pass_manager.add_pass(pass::conversion::create_lower_affine());
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
     // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
     // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
     // doc comment for the full story (isolated there, on a completely
@@ -1305,9 +1209,6 @@ fn a_unit_returning_extern_fn_can_be_called_correctly() {
     // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
     // constants; a first `--convert-to-llvm` pass gives those a chance to
     // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
     // Multiple independent conversion passes can each leave `builtin.
     // unrealized_conversion_cast` bridge ops between their own intermediate
     // representations behind -- found by direct testing, kept defensively:
@@ -1317,13 +1218,11 @@ fn a_unit_returning_extern_fn_can_be_called_correctly() {
     // standard MLIR cleanup for exactly that situation: folds/cancels
     // chains of these casts away (`cast(cast(x, A->B), B->A) == x`), not a
     // real lowering step of its own.
-    pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-    pass_manager
-        .run(&mut module)
+    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-scf-to-cf,canonicalize,expand-strided-metadata,lower-affine,canonicalize,convert-to-llvm,finalize-memref-to-llvm,convert-to-llvm,reconcile-unrealized-casts)")
         .expect("lowering to the llvm dialect must succeed");
     strip_ciface_wrapper_debug_info(&mut module);
 
-    let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
+    let engine = cleave::pipeline::jit(&module, 2);
     unsafe {
         engine.register_symbol("touch_i32", cleave_rt::touch_i32 as *mut ());
         engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
@@ -1393,16 +1292,10 @@ fn a_string_literal_printed_via_print_writes_the_right_bytes_to_stdout() {
         "expected the array-aware pointer extraction, got:\n{text}"
     );
 
-    let pass_manager = pass::PassManager::new(&context);
-    pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
     // `--expand-strided-metadata`/`--lower-affine`: needed once a real
     // `memref.subview` with a genuinely non-trivial `strided<...>` layout
     // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
     // has the story).
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
-    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
-    pass_manager.add_pass(pass::conversion::create_lower_affine());
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
     // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
     // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
     // doc comment for the full story (isolated there, on a completely
@@ -1411,9 +1304,6 @@ fn a_string_literal_printed_via_print_writes_the_right_bytes_to_stdout() {
     // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
     // constants; a first `--convert-to-llvm` pass gives those a chance to
     // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
     // Multiple independent conversion passes can each leave `builtin.
     // unrealized_conversion_cast` bridge ops between their own intermediate
     // representations behind -- found by direct testing, kept defensively:
@@ -1423,13 +1313,11 @@ fn a_string_literal_printed_via_print_writes_the_right_bytes_to_stdout() {
     // standard MLIR cleanup for exactly that situation: folds/cancels
     // chains of these casts away (`cast(cast(x, A->B), B->A) == x`), not a
     // real lowering step of its own.
-    pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-    pass_manager
-        .run(&mut module)
+    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-scf-to-cf,canonicalize,expand-strided-metadata,lower-affine,canonicalize,convert-to-llvm,finalize-memref-to-llvm,convert-to-llvm,reconcile-unrealized-casts)")
         .expect("lowering to the llvm dialect must succeed");
     strip_ciface_wrapper_debug_info(&mut module);
 
-    let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
+    let engine = cleave::pipeline::jit(&module, 2);
     unsafe {
         engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
         engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
@@ -3534,34 +3422,17 @@ fn print_of_an_unannotated_index_result_no_longer_panics() {
         "generated MLIR module failed verification"
     );
 
-    let pass_manager = pass::PassManager::new(&context);
-    pass_manager.add_pass(pass::linalg::create_convert_elementwise_to_linalg_pass());
-    pass_manager
-        .run(&mut module)
+    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-elementwise-to-linalg)")
         .expect("convert-elementwise-to-linalg must succeed");
 
-    let pass_manager = pass::PassManager::new(&context);
     cleave::pipeline::register_passes();
-    parse_pass_pipeline(
-        pass_manager.as_operation_pass_manager(),
-        "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})",
-    )
-    .expect("failed to parse the one-shot-bufferize pass pipeline");
-    pass_manager
-        .run(&mut module)
+    cleave::pipeline::run_passes(&mut module, "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})")
         .expect("one-shot-bufferize must succeed");
 
-    let pass_manager = pass::PassManager::new(&context);
-    pass_manager.add_pass(pass::linalg::create_convert_linalg_to_loops_pass());
-    pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
     // `--expand-strided-metadata`/`--lower-affine`: needed once a real
     // `memref.subview` with a genuinely non-trivial `strided<...>` layout
     // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
     // has the story).
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
-    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
-    pass_manager.add_pass(pass::conversion::create_lower_affine());
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
     // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
     // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
     // doc comment for the full story (isolated there, on a completely
@@ -3570,16 +3441,11 @@ fn print_of_an_unannotated_index_result_no_longer_panics() {
     // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
     // constants; a first `--convert-to-llvm` pass gives those a chance to
     // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-    pass_manager
-        .run(&mut module)
+    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-linalg-to-loops,convert-scf-to-cf,canonicalize,expand-strided-metadata,lower-affine,canonicalize,convert-to-llvm,finalize-memref-to-llvm,convert-to-llvm,reconcile-unrealized-casts)")
         .expect("lowering to the llvm dialect must succeed");
     strip_ciface_wrapper_debug_info(&mut module);
 
-    let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
+    let engine = cleave::pipeline::jit(&module, 2);
     unsafe {
         engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
         engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
@@ -3645,34 +3511,17 @@ fn print_of_an_unannotated_matmul_index_result_no_longer_panics() {
         "generated MLIR module failed verification"
     );
 
-    let pass_manager = pass::PassManager::new(&context);
-    pass_manager.add_pass(pass::linalg::create_convert_elementwise_to_linalg_pass());
-    pass_manager
-        .run(&mut module)
+    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-elementwise-to-linalg)")
         .expect("convert-elementwise-to-linalg must succeed");
 
-    let pass_manager = pass::PassManager::new(&context);
     cleave::pipeline::register_passes();
-    parse_pass_pipeline(
-        pass_manager.as_operation_pass_manager(),
-        "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})",
-    )
-    .expect("failed to parse the one-shot-bufferize pass pipeline");
-    pass_manager
-        .run(&mut module)
+    cleave::pipeline::run_passes(&mut module, "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})")
         .expect("one-shot-bufferize must succeed");
 
-    let pass_manager = pass::PassManager::new(&context);
-    pass_manager.add_pass(pass::linalg::create_convert_linalg_to_loops_pass());
-    pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
     // `--expand-strided-metadata`/`--lower-affine`: needed once a real
     // `memref.subview` with a genuinely non-trivial `strided<...>` layout
     // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
     // has the story).
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
-    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
-    pass_manager.add_pass(pass::conversion::create_lower_affine());
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
     // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
     // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
     // doc comment for the full story (isolated there, on a completely
@@ -3681,16 +3530,11 @@ fn print_of_an_unannotated_matmul_index_result_no_longer_panics() {
     // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
     // constants; a first `--convert-to-llvm` pass gives those a chance to
     // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-    pass_manager
-        .run(&mut module)
+    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-linalg-to-loops,convert-scf-to-cf,canonicalize,expand-strided-metadata,lower-affine,canonicalize,convert-to-llvm,finalize-memref-to-llvm,convert-to-llvm,reconcile-unrealized-casts)")
         .expect("lowering to the llvm dialect must succeed");
     strip_ciface_wrapper_debug_info(&mut module);
 
-    let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
+    let engine = cleave::pipeline::jit(&module, 2);
     unsafe {
         engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
         engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
@@ -6298,16 +6142,10 @@ fn run_i32_with_dynarray_symbols(
         "generated MLIR module failed verification"
     );
 
-    let pass_manager = pass::PassManager::new(context);
-    pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
     // `--expand-strided-metadata`/`--lower-affine`: needed once a real
     // `memref.subview` with a genuinely non-trivial `strided<...>` layout
     // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
     // has the story).
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
-    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
-    pass_manager.add_pass(pass::conversion::create_lower_affine());
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
     // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
     // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
     // doc comment for the full story (isolated there, on a completely
@@ -6316,16 +6154,11 @@ fn run_i32_with_dynarray_symbols(
     // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
     // constants; a first `--convert-to-llvm` pass gives those a chance to
     // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-    pass_manager
-        .run(&mut module)
+    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-scf-to-cf,canonicalize,expand-strided-metadata,lower-affine,canonicalize,convert-to-llvm,finalize-memref-to-llvm,convert-to-llvm,reconcile-unrealized-casts)")
         .expect("lowering to the llvm dialect must succeed");
     strip_ciface_wrapper_debug_info(&mut module);
 
-    let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
+    let engine = cleave::pipeline::jit(&module, 2);
     unsafe {
         engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
         engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());

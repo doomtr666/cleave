@@ -17,12 +17,12 @@ use crate::escape::escaping_struct_vars;
 use crate::mlir_lower::lower_program;
 use crate::refcount::insert_refcounting;
 use crate::registry::Registry;
-use melior::Context;
-use melior::dialect::DialectRegistry;
-use melior::ir::attribute::Attribute;
-use melior::ir::operation::{OperationBuilder, OperationLike};
-use melior::ir::{BlockLike, Identifier, Location, Module};
-use melior::utility::register_all_dialects;
+use cleave_mlir_shim::mlir::Context;
+use cleave_mlir_shim::mlir::dialect::DialectRegistry;
+use cleave_mlir_shim::mlir::ir::attribute::Attribute;
+use cleave_mlir_shim::mlir::ir::operation::{OperationBuilder};
+use cleave_mlir_shim::mlir::ir::{Identifier, Location, Module};
+use cleave_mlir_shim::mlir::utility::register_all_dialects;
 use std::path::{Path, PathBuf};
 
 /// The hardware target a program is being compiled for -- `doc/hld.md`'s
@@ -1578,6 +1578,23 @@ pub fn strip_ciface_wrapper_debug_info(module: &mut Module) {
         .expect("cleave-strip-ciface-debug-info");
 }
 
+/// Runs the textual pipeline `pipeline` (`builtin.module(...)`) on `module`:
+/// for harnesses running their own passes rather than `lower_to_llvm`.
+pub fn run_passes(module: &mut Module, pipeline: &str) -> Result<(), String> {
+    register_passes();
+    // SAFETY: `module` is a valid module, borrowed mutably here.
+    unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), pipeline, false) }
+}
+
+/// A JIT for `module`, in the LLVM dialect, compiled for the host at
+/// optimization level `opt_level`: for harnesses running their own passes.
+pub fn jit(module: &Module, opt_level: usize) -> cleave_mlir_shim::ExecutionEngine {
+    let target = cleave_mlir_shim::Target::new(None, None, opt_level, false, true).expect("the host target");
+    // SAFETY: `module` is a valid module, borrowed for the call.
+    unsafe { cleave_mlir_shim::ExecutionEngine::new(module.to_raw(), &target, &[]) }
+        .unwrap_or_else(|e| panic!("failed to compile the module: {e}"))
+}
+
 /// The target `options` ask for (`cleave_mlir_shim::Target`): for objects
 /// and JITs alike.
 pub fn target(options: &CodegenOptions) -> Result<cleave_mlir_shim::Target, Vec<String>> {
@@ -1616,7 +1633,7 @@ fn emit_object(
     // `register_all_dialects` above. Registered unconditionally, even when
     // `options.openmp` is `false` -- cheap, and simpler than threading the
     // option one layer further just to skip it.
-    melior::utility::register_all_llvm_translations(&context);
+    cleave_mlir_shim::mlir::utility::register_all_llvm_translations(&context);
 
     let mlir_types = collect_mlir_types(program);
     let struct_schemas = collect_struct_schemas(program);
@@ -1763,16 +1780,15 @@ pub fn emit_exe(
         // exe` as `NAME.lib` with no automatic prefix-stripping the way a GNU
         // linker would) -- needed whenever `emit_object`'s own OpenMP
         // parallelization stage or `spawn`'s tasks were used: the object then
-        // carries unresolved `__kmpc_*` relocations. `MLIR_SYS_220_PREFIX` (`.cargo/
-        // config.toml`, the same env var `mlir-sys`'s own build script
-        // already keys off of) is reused here rather than a second,
-        // independently-maintained path -- `/lib` under it is exactly where
+        // carries unresolved `__kmpc_*` relocations. `CLEAVE_LLVM_PREFIX` (`.cargo/
+        // config.toml`, the toolchain the shim builds against) is reused
+        // here rather than a second, independently-maintained path -- `/lib` under it is exactly where
         // the real toolchain install puts `libomp.lib` (confirmed directly,
         // alongside every other real `.lib` this build already links
         // against).
-        let mlir_prefix = std::env::var("MLIR_SYS_220_PREFIX").map_err(|_| {
+        let mlir_prefix = std::env::var("CLEAVE_LLVM_PREFIX").map_err(|_| {
             vec![
-                "MLIR_SYS_220_PREFIX must be set (see .cargo/config.toml) to link libomp"
+                "CLEAVE_LLVM_PREFIX must be set (see .cargo/config.toml) to link libomp"
                     .to_string(),
             ]
         })?;

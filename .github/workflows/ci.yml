@@ -1,12 +1,8 @@
 name: ci
 
-# Windows-only -- the whole point of this project's own toolchain
-# (`doc/hld.md`'s own CPU target, `cleave-rt`'s own MSVC-specific bits, the
-# `mlir-sys` fork this depends on, `doomtr666/mlir-sys`'s own `fix/windows-
-# msvc-static-linking` branch) is Windows/MSVC-specific work that has no
-# equivalent upstream CI coverage today (`mlir-sys`'s own CI, `ubuntu-
-# latest`/`macos-latest` only, confirmed directly -- exactly why these bugs
-# went unnoticed there).
+# Windows-only -- the toolchain cleave builds against (the prebuilt
+# LLVM/MLIR of `cleave-llvm-redist`), `cleave-rt`'s MSVC-specific parts and
+# the shim's MSVC build flags are Windows/MSVC work so far.
 
 on:
   push:
@@ -60,7 +56,7 @@ jobs:
         run: .\scripts\setup-toolchain.ps1 -CacheDir C:\llvm-mlir-22
 
       # Cache hit: the archive was never re-downloaded, so `.cargo/
-      # config.toml` (gitignored, `mlir-sys`/`tblgen-rs`'s own env vars)
+      # config.toml` (gitignored, `CLEAVE_LLVM_PREFIX`)
       # was never (re)generated either -- still needed every run.
       - name: Point cargo at the toolchain
         if: steps.toolchain-cache.outputs.cache-hit == 'true'

@@ -1,10 +1,10 @@
 # Building cleave
 
-Three real, separate things have to be true before `cargo build` works at
-all: a real LLVM 22 + MLIR + openmp toolchain, `cargo` told where it is, and
-`mlir-sys` resolved to this project's own fork (not the unpatched
-crates.io release, which doesn't link on Windows/MSVC at all). This doc
-covers all three.
+Two things have to be true before `cargo build` works: an LLVM 22 + MLIR +
+openmp toolchain, and `cargo` told where it is (`CLEAVE_LLVM_PREFIX`).
+cleave talks to MLIR through its own C API (`cleave-mlir-shim`, compiled
+with `cc` against that toolchain and linking it; `doc/plan-mlir-shim.md`):
+no `melior`, `mlir-sys`, `tblgen`, bindgen or libclang.
 
 ## 1. Prerequisites
 
@@ -35,8 +35,8 @@ lives on; `cargo clean` deletes it along with everything else under
 `target`, so it re-downloads on the next build after that, an accepted
 trade-off), and writes `.cargo/config.toml`
 (gitignored, machine-specific — see `.cargo/config.toml.example` for the
-tracked explanation of what it contains) so `mlir-sys`/`tblgen-rs`/
-`cleave-mlir-shim`'s own build scripts pick it up automatically. Idempotent:
+tracked explanation of what it contains) with `CLEAVE_LLVM_PREFIX`, which
+`cleave-mlir-shim`'s build script picks up. Idempotent:
 re-running it is a no-op once the pinned version (`ci/toolchain-version.txt`)
 is already cached — re-run it after that file changes, or pass `-Force` to
 redownload regardless.
@@ -54,52 +54,15 @@ Windows-only so far (a Linux build is planned; once it exists, the script
 picks the right asset for the host platform automatically, no separate
 command to remember).
 
-## 3. Why cleave needs a forked `mlir-sys`
+## 3. How cleave reaches MLIR
 
-`cleave/Cargo.toml`'s own `[patch.crates-io]` points `mlir-sys` at
-[`doomtr666/mlir-sys`](https://github.com/doomtr666/mlir-sys)'s own
-`fix/windows-msvc-static-linking` branch, not the crates.io release —
-three real, independent Windows/MSVC bugs in the unpatched crate, each
-found by direct testing (a real `func.func` with `arith.addi`, built and
-verified against a from-source LLVM/MLIR 22.1.0 install), none yet released
-upstream:
-
-1. **Enum signedness.** `bindgen` reflects Clang's own per-target enum
-   underlying-type inference faithfully — the MLIR C API's enums come out
-   `c_int` on `-pc-windows-msvc`, but `melior`'s own hand-written Rust
-   source (developed/tested on Linux/macOS, where the same enums infer
-   `c_uint`) hardcodes `u32` unconditionally — a real compile failure on
-   Windows, not a runtime bug. Fixed by post-processing the generated
-   bindings, normalizing the affected enum type aliases from `c_int` to
-   `c_uint` (same 4-byte C ABI representation either way — only Rust's own
-   signedness declaration changes) — scoped to `CARGO_CFG_TARGET_ENV ==
-   "msvc"` specifically, so it's provably a no-op on Linux/macOS rather
-   than just probably one.
-2. **A doubled `.lib` suffix.** `llvm-config --system-libs` reports names
-   already carrying their own `.lib` suffix on Windows (unlike Unix's bare
-   `-lfoo` form) — passed through unchanged, `cargo:rustc-link-lib` appends
-   the platform suffix a second time, producing a nonexistent
-   `psapi.lib.lib` at link time.
-3. **Static-library discovery assumed Unix naming.** The `MLIRCAPI*`
-   libraries are never reported by `llvm-config --libnames` at all (a real,
-   verified gap — zero CAPI entries) — only a disk-scan fallback finds
-   them, but its own `starts_with("libMLIR")` check and its own static-lib
-   name parser both assumed a `lib` prefix. Windows static libraries have
-   no such prefix (`MLIRCAPIIR.lib`, never `libMLIRCAPIIR.lib` — confirmed
-   directly: 0 of 389 real `MLIR*.lib` files in an actual install start
-   with `lib`). Every `MLIR*` static library was silently unlinked on
-   Windows; only whichever symbols a given program actually referenced
-   surfaced as `LNK2019` errors, which is why this showed up as a handful
-   of `MLIRCAPIIR`-specific unresolved symbols rather than a wall of them.
-
-Referencing the fork's own branch via a real `git` dependency (not a local
-`path`, which this project used until it broke on any machine other than
-the one it was first developed on) means `cargo build` needs network access
-to GitHub the first time it resolves dependencies, same as any other `git`
-dependency. Two upstream PRs fixing this in `mlir-sys` proper have been open
-since June/July with no response — `cleave-mlir-shim`'s own longer-term
-plan (`doc/backlog.md`) is to drop `melior`/`mlir-sys` entirely, at which
-point this fork stops being needed at all; not there yet.
+`cleave-mlir-shim` holds everything that touches MLIR and LLVM: its C++
+(`cpp/shim.cpp`: the target and code generation, cleave's passes, the
+pipeline runner) and the Rust side (`src/mlir`: MLIR's C API declared by
+hand, and the IR API `mlir_lower.rs` builds with). Its `build.rs` compiles
+the C++ with the same settings the toolchain was built with (release CRT,
+no RTTI, no exceptions) and links every `MLIR*` library of the prefix, the
+LLVM components `llvm-config --libnames` lists, and the system libraries.
 
 ## 4. Building and testing cleave itself
 
@@ -152,7 +115,7 @@ directly). Its flags, and why each one is there:
 | `CMAKE_BUILD_TYPE=Release` | Optimized codegen — this project cares about the generated code's own runtime performance, not just compiling the toolchain fast. |
 | `LLVM_ENABLE_PROJECTS=clang;mlir;openmp` | `mlir` is the real target; `openmp` backs `cleave`'s own OpenMP parallelization (`cleave/src/pipeline.rs`, `--openmp`/`CodegenOptions::openmp`). `clang` is included even though this project never calls it directly — openmp's own in-tree build unconditionally wires its optional lit-test targets (`check-openmp`/etc.) to a real `clang` target (confirmed directly against this exact LLVM tag — no `-D` flag can skip this, `openmp/cmake/OpenMPTesting.cmake`'s own `ENABLE_CHECK_TARGETS` is a plain variable, unconditionally reset on every configure, not a cache variable). Building `clang` for real satisfies that dependency honestly instead of patching LLVM's own source to work around it. |
 | `LLVM_ENABLE_ASSERTIONS=ON` | Real correctness value, confirmed unrelated to this project's own compile-time issues (`doc/backlog.md`'s own "L'hypothèse LLVM_ENABLE_ASSERTIONS était une fausse piste" item — root-caused and fixed elsewhere, not by disabling this). |
-| `LLVM_ENABLE_RTTI=OFF` | LLVM/MLIR's own default; `melior`/`mlir-sys` expect it. |
+| `LLVM_ENABLE_RTTI=OFF` | LLVM/MLIR's own default; `cleave-mlir-shim` is compiled the same way (`/GR-`). |
 | `LLVM_TARGETS_TO_BUILD=Native` | Only the host's own architecture — cleave's own reference backend is CPU (`doc/hld.md`), no cross-compilation target needed today. |
 | `LLVM_OPTIMIZED_TABLEGEN=OFF` | Matches this project's own dev toolchain; `ON` is a real, untried lever if a from-scratch build ever needs to be faster (`ci/llvm-cmake-flags.txt`'s own build ballooned once `clang` was added). |
 | `LLVM_INSTALL_UTILS=OFF` | Not needed — this project only ever links against the installed libraries/headers, never runs LLVM's own dev utilities. |
@@ -179,4 +142,4 @@ development from paying repeatedly.
 
 Once installed, point cleave at it with `scripts/setup-toolchain.ps1
 -ExistingPrefix C:\llvm-mlir-22` (§2 above) rather than setting
-`MLIR_SYS_220_PREFIX`/`TABLEGEN_220_PREFIX` by hand.
+`CLEAVE_LLVM_PREFIX` by hand.

@@ -18,8 +18,7 @@ ordinary process environment variable, not a system-wide one. A standalone
 real `OPENBLAS_PREFIX` set some other way (a shell profile, a launch script).
 
 Merges into the existing `[env]` block rather than overwriting it outright --
-`setup-toolchain.ps1` may already have written `MLIR_SYS_220_PREFIX`/
-`TABLEGEN_220_PREFIX` into the very same file, and both scripts need to
+`setup-toolchain.ps1` may already have written `CLEAVE_LLVM_PREFIX` into the very same file, and both scripts need to
 coexist there.
 
 Usage:

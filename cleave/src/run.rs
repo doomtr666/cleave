@@ -11,10 +11,9 @@ use crate::diag::{Diagnostic, SourceMap};
 use crate::mlir_lower::lower_program;
 use crate::pipeline::{CodegenOptions, build_optimized_cps, check_type_errors, lower_to_llvm};
 use crate::registry::Registry;
-use melior::Context;
-use melior::dialect::DialectRegistry;
-use melior::ir::operation::OperationLike;
-use melior::utility::register_all_dialects;
+use cleave_mlir_shim::mlir::Context;
+use cleave_mlir_shim::mlir::dialect::DialectRegistry;
+use cleave_mlir_shim::mlir::utility::register_all_dialects;
 
 /// Parses `sources` (`(file name, text)` pairs, `use` resolved against the
 /// shipped stdlib) and type-checks them: the program and its registry, or
@@ -42,7 +41,7 @@ pub fn check_sources(
 /// (`pipeline::register_cleave_rt_symbols`): a test's own host functions,
 /// never one of the runtime's (the JIT aborts on a symbol defined twice).
 /// `libomp` is loaded when the code needs it (OpenMP, or tasks a program
-/// spawns), from `MLIR_SYS_220_PREFIX`.
+/// spawns), from `CLEAVE_LLVM_PREFIX`.
 pub fn run_main(
     program: &Program,
     registry: &Registry,
@@ -88,8 +87,8 @@ pub fn run_main_with<T>(
         } else {
             "a program using `spawn` (its tasks run on libomp, even under --no-openmp; --no-tasks to run them in place)"
         };
-        let prefix = std::env::var("MLIR_SYS_220_PREFIX")
-            .map_err(|_| vec![format!("MLIR_SYS_220_PREFIX must be set (see .cargo/config.toml) to run {why}")])?;
+        let prefix = std::env::var("CLEAVE_LLVM_PREFIX")
+            .map_err(|_| vec![format!("CLEAVE_LLVM_PREFIX must be set (see .cargo/config.toml) to run {why}")])?;
         shared_libs.push(format!("{prefix}/bin/libomp.dll"));
     }
     let shared_lib_refs: Vec<&str> = shared_libs.iter().map(String::as_str).collect();

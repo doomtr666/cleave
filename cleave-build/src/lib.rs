@@ -340,13 +340,12 @@ impl Build {
             // lib` (LLVM's own cross-platform convention) -- `dylib=libomp`,
             // not `dylib=omp`, since an `-msvc` target's linker takes an
             // `-l`-equivalent name verbatim (`NAME.lib`), no GNU-style
-            // prefix assumed. Same `MLIR_SYS_220_PREFIX` (`.cargo/config.
-            // toml`) `mlir-sys`'s own build script already keys off of,
-            // reused rather than a second, independently-maintained path --
+            // prefix assumed. Same `CLEAVE_LLVM_PREFIX` (`.cargo/config.
+            // toml`) the shim builds against, reused rather than a second, independently-maintained path --
             // cargo's own `[env]` mechanism hands it to every build-script
             // process, this one included.
-            let mlir_prefix = env::var("MLIR_SYS_220_PREFIX")
-                .expect("MLIR_SYS_220_PREFIX must be set (see .cargo/config.toml) to link libomp");
+            let mlir_prefix = env::var("CLEAVE_LLVM_PREFIX")
+                .expect("CLEAVE_LLVM_PREFIX must be set (see .cargo/config.toml) to link libomp");
             println!("cargo:rustc-link-lib=dylib=libomp");
             println!("cargo:rustc-link-search=native={mlir_prefix}/lib");
 
