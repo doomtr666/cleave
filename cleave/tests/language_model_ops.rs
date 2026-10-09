@@ -319,7 +319,7 @@ fn causal_attention_and_its_gradients_match_pytorch() {
 /// and computes the product, checked against a plain triple loop. The
 /// partial last tile is padded; its write-back, a copy of dynamic size, used
 /// to reach the affine pass and fail the whole compilation
-/// (`redundant_copy_elim::lower_dynamic_copies`). Through the CLI because
+/// (`cleave-lower-dynamic-copies`). Through the CLI because
 /// this file's in-process pipeline doesn't run the matmul schedule.
 #[test]
 fn a_matmul_with_a_partial_column_tile_compiles_and_computes_the_product() {
@@ -364,7 +364,7 @@ stderr: {stderr}");
 /// LLVM's translation and crash it without a word. A second
 /// `--convert-vector-to-scf` now lowers them, and only when such a transfer
 /// exists, since it would otherwise turn every vector transfer into a scalar
-/// loop (`pipeline.rs::has_permuted_transfer`).
+/// loop (`cleave-lower-permuted-transfers`, `cleave-mlir-shim`).
 #[test]
 fn a_matmul_with_a_transposed_operand_compiles_without_inlining() {
     let dir = std::env::temp_dir().join("cleave-language-model-ops");
@@ -639,7 +639,7 @@ fn a_blas_helper_returns_its_output_without_copying_it() {
 }
 
 /// Tensors handed over inside an aggregate are written in place, not copied
-/// into it (`redundant_copy_elim.rs`, `forward_dead_source_copies`,
+/// into it (`cleave-forward-dead-source-copies`,
 /// `forward_out_param_copies`): an array filled by loops and returned in a
 /// tuple (`Tensor(data: buf)`'s defensive copy dropped, the tuple element's
 /// storage allocated before the loops), and a function's result stored in a

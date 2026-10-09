@@ -59,7 +59,7 @@
 //! measurement this pass's own impact was checked against).
 
 use crate::cps::{CExpr, CVal, CVar, CpsProgram, PrimOp};
-use std::collections::HashSet;
+use crate::collections::HashSet;
 
 /// Runs once, after `refcount::insert_refcounting`, over every top-level
 /// function's own body — see the module's own doc comment for the full

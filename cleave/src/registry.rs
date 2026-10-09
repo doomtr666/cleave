@@ -17,7 +17,7 @@ use crate::ast::*;
 use crate::const_eval;
 use crate::infer::ConstValue;
 use crate::print::{fmt_generics, fmt_type};
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 #[derive(Default)]
 pub struct Registry {
@@ -123,7 +123,7 @@ struct ImplEntry {
 
 impl Registry {
     pub fn build(program: &Program) -> Self {
-        let mut algebras: HashMap<String, AlgebraEntry> = HashMap::new();
+        let mut algebras: HashMap<String, AlgebraEntry> = HashMap::default();
 
         for item in &program.items {
             if let ItemKind::Algebra(d) = &item.kind {
@@ -176,7 +176,7 @@ impl Registry {
                         axioms,
                         derivative_rules,
                         adjoint_rules,
-                        impls: HashMap::new(),
+                        impls: HashMap::default(),
                     });
             }
         }
@@ -192,7 +192,7 @@ impl Registry {
                         axioms: Vec::new(),
                         derivative_rules: Vec::new(),
                         adjoint_rules: Vec::new(),
-                        impls: HashMap::new(),
+                        impls: HashMap::default(),
                     });
                 // `fmt_type(target)` alone would collide two *different*
                 // generic impls sharing the same bare target shape but
@@ -230,7 +230,7 @@ impl Registry {
         // are (`driver::merge_programs` rejects a duplicate struct name
         // outright) — nothing to merge here, just index the already-unique
         // declarations.
-        let mut structs: HashMap<String, StructEntry> = HashMap::new();
+        let mut structs: HashMap<String, StructEntry> = HashMap::default();
         for item in &program.items {
             if let ItemKind::Struct(d) = &item.kind {
                 structs.insert(
@@ -425,7 +425,7 @@ impl Registry {
             }
         }
 
-        let mut resolved: HashMap<String, ConstValue> = HashMap::new();
+        let mut resolved: HashMap<String, ConstValue> = HashMap::default();
         loop {
             let mut progressed = false;
             for d in &decls {
@@ -846,7 +846,7 @@ impl Registry {
     /// "forward aggregate" case) isn't attempted here either — not needed
     /// for `Int`/`Float`/`Num`, the only shapes that exist today.
     pub fn candidates_for(&self, algebra: &str) -> HashSet<String> {
-        self.candidates_for_inner(algebra, &mut HashSet::new())
+        self.candidates_for_inner(algebra, &mut HashSet::default())
     }
 
     /// `visited` guards against a cyclic bound declaration (`algebra A : B`,
@@ -857,7 +857,7 @@ impl Registry {
         algebra: &'a str,
         visited: &mut HashSet<&'a str>,
     ) -> HashSet<String> {
-        let mut out = HashSet::new();
+        let mut out = HashSet::default();
         if !visited.insert(algebra) {
             return out;
         }
@@ -885,7 +885,7 @@ impl Registry {
     /// parameterized target (`impl<T> Norm<Box<T>>`), whose types can't be
     /// listed. An empty candidate set then proves nothing.
     pub fn has_open_impls(&self, algebra: &str) -> bool {
-        self.has_open_impls_inner(algebra, &mut HashSet::new())
+        self.has_open_impls_inner(algebra, &mut HashSet::default())
     }
 
     fn has_open_impls_inner<'a>(&'a self, algebra: &'a str, visited: &mut HashSet<&'a str>) -> bool {

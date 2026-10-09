@@ -38,7 +38,7 @@
 //! `const_eval` folds directly.
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use crate::ast::{
     AlgebraItemKind, Block, ElseBranch, Expr, ExprKind, FnDecl, ItemKind, Path, Program,
@@ -49,10 +49,10 @@ use crate::ast::{
 /// comment: algebra-targeted calls to `Algebra::method`, shadowing `let`s to
 /// unique names.
 pub fn resolve_calls(mut program: Program) -> Program {
-    let mut top_level_fns: HashSet<String> = HashSet::new();
-    let mut fieldless_structs: HashSet<String> = HashSet::new();
-    let mut algebra_methods: HashMap<(String, usize), Vec<String>> = HashMap::new();
-    let mut algebra_bounds: HashMap<String, Vec<String>> = HashMap::new();
+    let mut top_level_fns: HashSet<String> = HashSet::default();
+    let mut fieldless_structs: HashSet<String> = HashSet::default();
+    let mut algebra_methods: HashMap<(String, usize), Vec<String>> = HashMap::default();
+    let mut algebra_bounds: HashMap<String, Vec<String>> = HashMap::default();
     for item in &program.items {
         match &item.kind {
             ItemKind::Fn(f) => {
@@ -149,7 +149,7 @@ impl Resolver {
     /// is reached through a subtrait in Rust.
     fn declaring_algebra(&self, algebra: &str, name: &str, arity: usize) -> Option<String> {
         let mut queue = vec![algebra.to_string()];
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         while let Some(a) = queue.pop() {
             if !seen.insert(a.clone()) {
                 continue;

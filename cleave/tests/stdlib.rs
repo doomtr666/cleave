@@ -81,21 +81,21 @@ fn stdlib_num_declares_adjoint_rules_alongside_derivative_rules() {
     let registry = load_num_registry();
     // The additive group's three (`Additive`), the ring's own two (`Ring :
     // Additive`).
-    let methods = |algebra: &str| -> std::collections::HashSet<String> {
+    let methods = |algebra: &str| -> cleave::collections::HashSet<String> {
         registry.adjoint_rules(algebra).iter().map(|r| r.method.clone()).collect()
     };
-    assert_eq!(methods("Additive"), ["add", "sub", "neg"].map(String::from).into(), "Additive's adjoint rules");
-    assert_eq!(methods("Ring"), ["mul", "div"].map(String::from).into(), "Ring's adjoint rules");
+    assert_eq!(methods("Additive"), ["add", "sub", "neg"].map(String::from).into_iter().collect(), "Additive's adjoint rules");
+    assert_eq!(methods("Ring"), ["mul", "div"].map(String::from).into_iter().collect(), "Ring's adjoint rules");
     // `derivative` rules still present too -- coexistence, not replacement,
     // during the migration.
     assert_eq!(registry.derivative_rules("Additive").len() + registry.derivative_rules("Ring").len(), 5);
 
     let trans_adjoints = registry.adjoint_rules("Transcendental");
-    let trans_methods: std::collections::HashSet<&str> =
+    let trans_methods: cleave::collections::HashSet<&str> =
         trans_adjoints.iter().map(|r| r.method.as_str()).collect();
     assert_eq!(
         trans_methods,
-        std::collections::HashSet::from(["exp", "tanh", "log", "sin", "cos", "sqrt"]),
+        cleave::collections::HashSet::from_iter(["exp", "tanh", "log", "sin", "cos", "sqrt"]),
         "expected exactly the 6 Transcendental adjoint rules"
     );
     assert_eq!(registry.derivative_rules("Transcendental").len(), 6);

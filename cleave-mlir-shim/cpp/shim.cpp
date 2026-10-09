@@ -1,23 +1,7 @@
-// The first real cleave shim function -- see `doc/backlog.md`'s own
-// "`--target-cpu`/`--target-features` are wired end to end but have no real
-// effect" entry for the full story: `mlirExecutionEngineCreate`'s own C API
-// (`mlir-c/ExecutionEngine.h`) always builds its `TargetMachine` via
-// `JITTargetMachineBuilder::detectHost()`, with no way for a caller to
-// override the CPU/features -- confirmed directly by reading this project's
-// own vendored `mlir/lib/CAPI/ExecutionEngine/ExecutionEngine.cpp`, not
-// assumed. This file is that exact same function, copied and extended with
-// two extra parameters (`targetCpu`/`targetFeatures`) applied to the
-// `JITTargetMachineBuilder` before it builds the real `TargetMachine` --
-// everything else (dialect translation registration, the optimizing
-// transformer, `ExecutionEngineOptions`) is unchanged from upstream.
-//
-// Proves the shim's own build/link/FFI shape on the narrowest possible real
-// surface (`doc/backlog.md`'s own recommended sequencing) -- one function,
-// no new types, callable from Rust exactly like any other `mlir-sys`
-// function, built via `cc`/`build.rs` against the same local LLVM/MLIR
-// prefix `mlir-sys` itself already builds against (`MLIR_SYS_220_PREFIX`,
-// temporary until `cleave-llvm-redist`'s own prebuilt release replaces the
-// local build entirely).
+// cleave's C API over MLIR and LLVM (`doc/plan-mlir-shim.md`): the target and
+// code generation (`cleaveTarget*`, `cleaveEmitObject`, `cleaveJitCreate`),
+// and the IR rewrites cleave's pipeline runs (`pipeline.rs`). Only handles,
+// integers and strings cross it.
 
 #include <cstring>
 #include <functional>
@@ -64,6 +48,22 @@
 #include "llvm/Support/ModRef.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/TargetParser/Host.h"
+#include "llvm/IR/LegacyPassManager.h"
+#include "llvm/MC/MCSubtargetInfo.h"
+#include "llvm/MC/TargetRegistry.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Target/TargetMachine.h"
+#include "mlir/Target/LLVMIR/Export.h"
+#include "mlir/Dialect/Transform/IR/TransformDialect.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/Dialect/Transform/IR/Utils.h"
+#include "mlir/IR/Verifier.h"
+#include "mlir/InitAllPasses.h"
+#include "mlir/Parser/Parser.h"
+#include "mlir/Pass/PassManager.h"
+#include "mlir/Pass/PassRegistry.h"
+#include "llvm/Support/SourceMgr.h"
 
 using namespace mlir;
 
@@ -164,113 +164,194 @@ makeTransformer(unsigned optLevel, bool loopUnroll, llvm::TargetMachine *tm) {
   };
 }
 
-extern "C" MlirExecutionEngine cleaveExecutionEngineCreateWithTarget(
-    MlirModule op, int optLevel, int numPaths,
-    const MlirStringRef *sharedLibPaths, bool enableObjectDump,
-    bool enablePIC, MlirStringRef targetCpu, MlirStringRef targetFeatures,
-    bool loopUnroll) {
-  static bool initOnce = [] {
+// A target: the machine code generation is for, and how it optimizes. Built
+// once from cleave's options (`CodegenOptions`), used for both the object
+// (`cleaveEmitObject`) and the JIT (`cleaveJitCreate`); each builds its own
+// `TargetMachine` from it, since the JIT takes ownership of one.
+struct CleaveTarget {
+  llvm::orc::JITTargetMachineBuilder builder;
+  unsigned optLevel;
+  bool loopUnroll;
+};
+
+// Reports an error message to the caller, which keeps a copy.
+using CleaveErrorCallback = void (*)(const char *, size_t, void *);
+static void report(CleaveErrorCallback onError, void *userData,
+                   const std::string &message) {
+  if (onError)
+    onError(message.data(), message.size(), userData);
+}
+
+static void initNativeTarget() {
+  static bool once = [] {
     llvm::InitializeNativeTarget();
     llvm::InitializeNativeTargetAsmParser();
     llvm::InitializeNativeTargetAsmPrinter();
     return true;
   }();
-  (void)initOnce;
+  (void)once;
+}
 
-  auto &ctx = *unwrap(op)->getContext();
-  mlir::registerBuiltinDialectTranslation(ctx);
-  mlir::registerLLVMDialectTranslation(ctx);
-  mlir::registerOpenMPDialectTranslation(ctx);
-
-  auto tmBuilderOrError = llvm::orc::JITTargetMachineBuilder::detectHost();
-  if (!tmBuilderOrError) {
-    consumeError(tmBuilderOrError.takeError());
-    return MlirExecutionEngine{nullptr};
+// The host's machine, unless `cpu`/`features` say otherwise. `cpu` empty keeps
+// the host's; `native` is the host's CPU with every feature it has (a driver
+// convention LLVM's backend doesn't know, resolved here as clang does).
+// `features` is a comma-separated `+f`/`-f` list. Either one set starts from a
+// clean feature list: the host's detected `+feature`s would otherwise outrank
+// the chosen CPU's defaults (an `x86-64-v2` object still used AVX-512).
+// `optLevel` 0 to 3; `loopUnroll` lets LLVM unroll loops (`makeTransformer`).
+// Null on error, reported through `onError`.
+extern "C" CleaveTarget *cleaveTargetCreate(MlirStringRef cpuRef,
+                                            MlirStringRef featuresRef,
+                                            int optLevel, bool pic,
+                                            bool loopUnroll,
+                                            CleaveErrorCallback onError,
+                                            void *userData) {
+  initNativeTarget();
+  auto builder = llvm::orc::JITTargetMachineBuilder::detectHost();
+  if (!builder) {
+    report(onError, userData, llvm::toString(builder.takeError()));
+    return nullptr;
   }
-  if (enablePIC)
-    tmBuilderOrError->setRelocationModel(llvm::Reloc::PIC_);
-
-  // The lines `mlirExecutionEngineCreate` itself has no way to reach --
-  // everything else in this function is an unmodified copy.
-  //
-  // **`detectHost()` doesn't just pick a CPU name -- it also populates real,
-  // explicit `+feature` flags for everything the host actually has**
-  // (confirmed directly, not assumed: an isolated probe requesting `setCPU
-  // ("x86-64-v2")` alone, with no feature string, still produced `zmm`
-  // (AVX-512) instructions in the disassembled object -- `cleave-mlir-shim/
-  // tests/target_override.rs`'s own `x86_64_v2_target_cpu_has_a_real_
-  // effect_and_drops_avx512` records this exact finding). Subtarget feature
-  // resolution applies the CPU's own default feature set first, then layers
-  // explicit `+`/`-` feature deltas on top in order -- `detectHost()`'s own
-  // already-populated `+avx512f` (etc.) deltas out-rank whatever a *new*
-  // CPU's own defaults would otherwise imply, since they were added first
-  // and never removed. Any real override (CPU or features) therefore clears
-  // that inherited list first, giving the caller a clean slate: the
-  // requested CPU's own natural defaults, plus only the feature deltas this
-  // call explicitly asks for -- never a silent host-detected leftover.
-  llvm::StringRef cpu = unwrap(targetCpu);
-  llvm::StringRef features = unwrap(targetFeatures);
-
-  // `"native"` is a *driver*-level convention (clang substitutes the real
-  // detected name/features itself, before its own backend ever sees `-mcpu=
-  // `), not something the backend's own subtarget lookup understands as a
-  // literal string -- confirmed directly, not assumed: passing it straight
-  // through to `setCPU` produces a real LLVM diagnostic ("'native' is not a
-  // recognized processor for this target (ignoring processor)") followed by
-  // a *fatal*, non-catchable `LLVM ERROR` abort building a subtarget that
-  // can't even do 64-bit codegen (`cleave-mlir-shim/tests/target_override
-  // .rs`'s own `target_cpu_native_means_the_max_this_host_actually_has`
-  // found this the hard way). Resolved here instead, the same way a real
-  // driver would: substitute the real detected name/feature set before
-  // `setCPU`/`setFeatures` below ever see it.
+  llvm::StringRef cpu = unwrap(cpuRef);
+  llvm::StringRef features = unwrap(featuresRef);
   std::string nativeCpu;
   bool isNative = cpu == "native";
   if (isNative) {
     nativeCpu = llvm::sys::getHostCPUName().str();
     cpu = nativeCpu;
   }
-
-  if (!cpu.empty() || !features.empty())
-    tmBuilderOrError->setFeatures("");
-  if (!cpu.empty())
-    tmBuilderOrError->setCPU(cpu.str());
-  if (isNative && features.empty()) {
-    // No explicit `targetFeatures` alongside `"native"` -- use the real,
-    // full CPUID-detected feature set (not just whatever the resolved CPU
-    // *model name*'s own generic defaults imply, which can be a strict
-    // subset of what this exact stepping/microcode actually supports).
-    for (const auto &entry : llvm::sys::getHostCPUFeatures())
-      tmBuilderOrError->getFeatures().AddFeature(entry.getKey(), entry.getValue());
-  } else if (!features.empty()) {
-    tmBuilderOrError->setFeatures(features);
+  // A CPU LLVM doesn't know is the caller's error to report (LLVM itself
+  // only warns, then falls back on a generic processor).
+  if (!cpu.empty() && !isNative) {
+    std::string lookupError;
+    const llvm::Target *t = llvm::TargetRegistry::lookupTarget(
+        builder->getTargetTriple(), lookupError);
+    if (!t) {
+      report(onError, userData, lookupError);
+      return nullptr;
+    }
+    std::unique_ptr<llvm::MCSubtargetInfo> sti(t->createMCSubtargetInfo(
+        builder->getTargetTriple(), "generic", ""));
+    if (!sti || !sti->isCPUStringValid(cpu)) {
+      report(onError, userData, "unknown target CPU `" + cpu.str() + "`");
+      return nullptr;
+    }
   }
+  if (!cpu.empty() || !features.empty())
+    builder->setFeatures("");
+  if (!cpu.empty())
+    builder->setCPU(cpu.str());
+  if (isNative && features.empty()) {
+    for (const auto &entry : llvm::sys::getHostCPUFeatures())
+      builder->getFeatures().AddFeature(entry.getKey(), entry.getValue());
+  } else if (!features.empty()) {
+    builder->setFeatures(features);
+  }
+  if (pic)
+    builder->setRelocationModel(llvm::Reloc::PIC_);
+  builder->setCodeGenOptLevel(static_cast<llvm::CodeGenOptLevel>(optLevel));
+  // Checked now rather than at first use: a bad feature list is the
+  // caller's error too.
+  auto probe = builder->createTargetMachine();
+  if (!probe) {
+    report(onError, userData, llvm::toString(probe.takeError()));
+    return nullptr;
+  }
+  return new CleaveTarget{std::move(*builder), static_cast<unsigned>(optLevel),
+                          loopUnroll};
+}
 
-  auto tmOrError = tmBuilderOrError->createTargetMachine();
-  if (!tmOrError) {
-    consumeError(tmOrError.takeError());
+extern "C" void cleaveTargetDestroy(CleaveTarget *target) { delete target; }
+
+// Every dialect translation to LLVM IR cleave's modules use.
+static void registerTranslations(MLIRContext &ctx) {
+  mlir::registerBuiltinDialectTranslation(ctx);
+  mlir::registerLLVMDialectTranslation(ctx);
+  mlir::registerOpenMPDialectTranslation(ctx);
+}
+
+// Writes `module` (in the LLVM dialect) as an object file at `path`: translated
+// to LLVM IR, optimized at the target's level (`makeTransformer`, with the
+// allocator annotations), compiled by the target's `TargetMachine`. No JIT:
+// the object's external symbols are left for the linker. `false` on error,
+// reported through `onError`.
+extern "C" bool cleaveEmitObject(MlirModule module, CleaveTarget *target,
+                                 MlirStringRef pathRef,
+                                 CleaveErrorCallback onError, void *userData) {
+  initNativeTarget();
+  auto tm = target->builder.createTargetMachine();
+  if (!tm) {
+    report(onError, userData, llvm::toString(tm.takeError()));
+    return false;
+  }
+  Operation *op = unwrap(module).getOperation();
+  registerTranslations(*op->getContext());
+  llvm::LLVMContext llvmContext;
+  std::unique_ptr<llvm::Module> llvmModule =
+      mlir::translateModuleToLLVMIR(op, llvmContext);
+  if (!llvmModule) {
+    report(onError, userData, "failed to translate the module to LLVM IR");
+    return false;
+  }
+  llvmModule->setDataLayout((*tm)->createDataLayout());
+  llvmModule->setTargetTriple((*tm)->getTargetTriple());
+  annotateAllocators(*llvmModule);
+  if (llvm::Error e = makeTransformer(target->optLevel, target->loopUnroll,
+                                      tm->get())(llvmModule.get())) {
+    report(onError, userData, llvm::toString(std::move(e)));
+    return false;
+  }
+  std::error_code ec;
+  llvm::raw_fd_ostream out(unwrap(pathRef), ec, llvm::sys::fs::OF_None);
+  if (ec) {
+    report(onError, userData,
+           "cannot write `" + unwrap(pathRef).str() + "`: " + ec.message());
+    return false;
+  }
+  llvm::legacy::PassManager codegen;
+  if ((*tm)->addPassesToEmitFile(codegen, out, nullptr,
+                                 llvm::CodeGenFileType::ObjectFile)) {
+    report(onError, userData, "the target can't emit an object file");
+    return false;
+  }
+  codegen.run(*llvmModule);
+  out.flush();
+  return true;
+}
+
+// A JIT for `module` (in the LLVM dialect), compiled for `target`, loading the
+// `numPaths` shared libraries at `sharedLibPaths` for the symbols they define.
+// Null on error, reported through `onError`.
+extern "C" MlirExecutionEngine
+cleaveJitCreate(MlirModule module, CleaveTarget *target, int numPaths,
+                const MlirStringRef *sharedLibPaths,
+                CleaveErrorCallback onError, void *userData) {
+  initNativeTarget();
+  auto tm = target->builder.createTargetMachine();
+  if (!tm) {
+    report(onError, userData, llvm::toString(tm.takeError()));
     return MlirExecutionEngine{nullptr};
   }
-
+  registerTranslations(*unwrap(module)->getContext());
   SmallVector<StringRef> libPaths;
-  for (unsigned i = 0; i < static_cast<unsigned>(numPaths); ++i)
+  for (int i = 0; i < numPaths; ++i)
     libPaths.push_back(unwrap(sharedLibPaths[i]));
-
-  auto transformer = makeTransformer(optLevel, loopUnroll, tmOrError->get());
+  auto transformer =
+      makeTransformer(target->optLevel, target->loopUnroll, tm->get());
   ExecutionEngineOptions jitOptions;
   jitOptions.transformer = [transformer](llvm::Module *m) -> llvm::Error {
     annotateAllocators(*m);
     return transformer(m);
   };
-  jitOptions.jitCodeGenOptLevel = static_cast<llvm::CodeGenOptLevel>(optLevel);
+  jitOptions.jitCodeGenOptLevel =
+      static_cast<llvm::CodeGenOptLevel>(target->optLevel);
   jitOptions.sharedLibPaths = libPaths;
-  jitOptions.enableObjectDump = enableObjectDump;
-  auto jitOrError = ExecutionEngine::create(unwrap(op), jitOptions,
-                                             std::move(tmOrError.get()));
-  if (!jitOrError) {
-    consumeError(jitOrError.takeError());
+  auto jit = ExecutionEngine::create(unwrap(module), jitOptions, std::move(*tm));
+  if (!jit) {
+    report(onError, userData, llvm::toString(jit.takeError()));
     return MlirExecutionEngine{nullptr};
   }
-  return wrap(jitOrError->release());
+  return wrap(jit->release());
 }
 
 // The slots `mlir_lower.rs` allocates for arguments passed by pointer
@@ -289,20 +370,7 @@ extern "C" MlirExecutionEngine cleaveExecutionEngineCreateWithTarget(
 //   read by its task until the caller's `sync`, so it keeps the whole frame.
 // The marks are dropped. Unmarked allocations are left alone, and so is a slot
 // inside an OpenMP region.
-// The host's CPU name (`llvm::sys::getHostCPUName`, what `native` means),
-// copied into `buffer` (`size` bytes, NUL-terminated, truncated if needed).
-// Returns its full length.
-extern "C" size_t cleaveHostCpuName(char *buffer, size_t size) {
-  std::string name = llvm::sys::getHostCPUName().str();
-  if (size > 0) {
-    size_t n = std::min(size - 1, name.size());
-    std::memcpy(buffer, name.data(), n);
-    buffer[n] = 0;
-  }
-  return name.size();
-}
-
-extern "C" void cleaveHoistArgSlots(MlirOperation op) {
+static void cleaveHoistArgSlots(MlirOperation op) {
   unwrap(op)->walk([](LLVM::LLVMFuncOp f) {
     if (f.getBody().empty())
       return;
@@ -372,7 +440,7 @@ extern "C" void cleaveHoistArgSlots(MlirOperation op) {
 // marked `no_inline`, the attribute the inliner already honours (`spawn`'s
 // calls). Small functions, the elementwise operations fusion needs, stay
 // inlined. Returns the number of calls marked.
-extern "C" int64_t cleaveLimitInlining(MlirOperation op, int64_t threshold) {
+static int64_t cleaveLimitInlining(MlirOperation op, int64_t threshold) {
   auto module = cast<ModuleOp>(unwrap(op));
   const int64_t cap = int64_t(1) << 40;
   std::map<std::string, int64_t> own;
@@ -443,7 +511,7 @@ static Value pointerRoot(Value p) {
   return p;
 }
 
-extern "C" int64_t cleaveCopyAggregatesInMemory(MlirOperation op, int64_t minBytes) {
+static int64_t cleaveCopyAggregatesInMemory(MlirOperation op, int64_t minBytes) {
   auto module = cast<ModuleOp>(unwrap(op));
   DataLayout layout(module);
   SmallVector<LLVM::StoreOp> stores;
@@ -516,7 +584,7 @@ extern "C" int64_t cleaveCopyAggregatesInMemory(MlirOperation op, int64_t minByt
 // 84k LLVM instructions to 635k after `opt -O2` without it, and the
 // functions MLIR had kept out (the model's checkpointing, the optimizer's
 // walk) came back into `train_gpt`.
-extern "C" void cleaveApplyNoInline(MlirOperation op) {
+static void cleaveApplyNoInline(MlirOperation op) {
   unwrap(op)->walk([](LLVM::LLVMFuncOp f) {
     if (f->removeAttr("cleave.noinline"))
       f->setAttr(f.getNoInlineAttrName(), UnitAttr::get(f.getContext()));
@@ -606,7 +674,7 @@ static bool sameRegion(Value a, Value b) {
 // other than through %tmp before the copy back (it could alias the write).
 // After One-Shot Bufferize, before the deallocation passes. Returns how many
 // blocks it rewrote.
-extern "C" int64_t cleaveElideBlockCopies(MlirOperation op) {
+static int64_t cleaveElideBlockCopies(MlirOperation op) {
   SmallVector<memref::AllocOp> allocs;
   unwrap(op)->walk([&](memref::AllocOp alloc) { allocs.push_back(alloc); });
   int64_t elided = 0;
@@ -751,7 +819,7 @@ static Value carriedBuffer(Value v, int depth = 16) {
 // included, is what keeps this sound: whatever was derived from %tmp's
 // layout at compile time (a row stride, a zero offset) holds for %D too.
 // Returns how many buffers it forwarded.
-extern "C" int64_t cleaveForwardCopiesToDestinations(MlirOperation op) {
+static int64_t cleaveForwardCopiesToDestinations(MlirOperation op) {
   SmallVector<memref::CopyOp> copies;
   unwrap(op)->walk([&](memref::CopyOp copy) { copies.push_back(copy); });
   int64_t forwarded = 0;
@@ -856,7 +924,7 @@ extern "C" int64_t cleaveForwardCopiesToDestinations(MlirOperation op) {
 // L2 instead of written to memory whole and read back: with every core busy,
 // memory gives a core ~6 GB/s where its L2 gives ~220. Before
 // `cleaveLowerBlasMatmuls`, on tensors. Returns how many products it fused.
-extern "C" int64_t cleaveBlasTileAndFuse(MlirOperation op, int64_t rows) {
+static int64_t cleaveBlasTileAndFuse(MlirOperation op, int64_t rows) {
   // A consumer of several products (SwiGLU's `silu(gate) * up`) once: all
   // of them are fused into its loop.
   llvm::SetVector<linalg::GenericOp> consumers;
@@ -1023,7 +1091,7 @@ extern "C" int64_t cleaveBlasTileAndFuse(MlirOperation op, int64_t rows) {
 // of it being known at compile time. A zero `linalg.fill` initializing the
 // product is dropped for `beta = 0`; anything else (a broadcast bias, `fma`'s
 // `c`) is accumulated into, `beta = 1`. Returns how many it lowered.
-extern "C" int64_t cleaveLowerBlasMatmuls(MlirOperation op) {
+static int64_t cleaveLowerBlasMatmuls(MlirOperation op) {
   auto module = dyn_cast<ModuleOp>(unwrap(op));
   if (!module)
     return 0;
@@ -1129,7 +1197,7 @@ extern "C" int64_t cleaveLowerBlasMatmuls(MlirOperation op) {
 // gives a fresh, writable result (a `linalg` op, a call): a parameter is
 // borrowed, and a constant or a buffer made a tensor isn't ours to write.
 // Before One-Shot Bufferize. Returns how many ops it rewrote.
-extern "C" int64_t cleaveReuseDyingInputs(MlirOperation op) {
+static int64_t cleaveReuseDyingInputs(MlirOperation op) {
   int64_t reused = 0;
   unwrap(op)->walk([&](linalg::GenericOp generic) {
     if (!generic.hasPureTensorSemantics() || generic.getNumDpsInits() != 1 ||
@@ -1162,7 +1230,7 @@ extern "C" int64_t cleaveReuseDyingInputs(MlirOperation op) {
 // function, after a run-time check of which alias which (measured on nanoLM's
 // gradient: 273 buffers in one deallocation). Returns how many loop-carried
 // values went.
-extern "C" int64_t cleaveFoldPassthroughIterArgs(MlirOperation op) {
+static int64_t cleaveFoldPassthroughIterArgs(MlirOperation op) {
   SmallVector<Operation *> loops;
   int64_t before = 0;
   unwrap(op)->walk([&](scf::ForOp loop) {
@@ -1248,7 +1316,7 @@ bool lastUseInBlock(Value root, Operation *dealloc, Operation *moved, Block *blo
 
 } // namespace
 
-extern "C" int64_t cleaveDeallocAtLastUse(MlirOperation op) {
+static int64_t cleaveDeallocAtLastUse(MlirOperation op) {
   SmallVector<memref::DeallocOp> deallocs;
   unwrap(op)->walk([&](memref::DeallocOp d) { deallocs.push_back(d); });
   int64_t moved = 0;
@@ -1291,7 +1359,7 @@ extern "C" int64_t cleaveDeallocAtLastUse(MlirOperation op) {
 // siblings, and every barrier waits for that core for the whole run. Once per
 // thread at run time (the call returns at once afterwards), so harmless in a
 // region entered often. Returns how many regions it marked.
-extern "C" int64_t cleaveBindTeams(MlirOperation op) {
+static int64_t cleaveBindTeams(MlirOperation op) {
   auto module = dyn_cast<ModuleOp>(unwrap(op));
   if (!module)
     return 0;
@@ -1326,9 +1394,9 @@ extern "C" int64_t cleaveBindTeams(MlirOperation op) {
 // `cleave.adopt`, so that MLIR's ownership-based buffer deallocation, which
 // runs before this, takes it for a fresh buffer it owns and releases. Each
 // becomes a retain of the very same buffer instead of a copy: every buffer
-// is reference counted (`unify_alloc.rs`), so that release only drops the
+// is reference counted (`cleave-unify-tensor-allocations`), so that release only drops the
 // reference the retain added.
-extern "C" void cleaveLowerAdoptions(MlirOperation op) {
+static void cleaveLowerAdoptions(MlirOperation op) {
   auto module = cast<ModuleOp>(unwrap(op));
   SmallVector<bufferization::CloneOp> clones;
   module.walk([&](bufferization::CloneOp clone) {
@@ -1370,7 +1438,7 @@ extern "C" void cleaveLowerAdoptions(MlirOperation op) {
 // (uProf, `ucrtbase.dll`), the GELU of every block. Not exposed as a pass by
 // MLIR (only a test pass is), hence the shim. Accuracy is a few ulp, not
 // libm's correctly rounded-ish results.
-extern "C" bool cleaveApproximateMath(MlirOperation op) {
+static bool cleaveApproximateMath(MlirOperation op) {
   static const llvm::StringRef approximated[] = {
       "tanh", "exp", "expm1", "log", "log1p", "log2", "erf", "erfc"};
   auto selected = [](StringRef name) {
@@ -1556,7 +1624,7 @@ void wrapInParallelRegion(ModuleOp module, func::FuncOp f) {
 
 } // namespace
 
-extern "C" bool cleaveLowerSpawns(MlirOperation op, bool tasks) {
+static bool cleaveLowerSpawns(MlirOperation op, bool tasks) {
   auto module = dyn_cast<ModuleOp>(unwrap(op));
   if (!module)
     return false;
@@ -1604,4 +1672,882 @@ extern "C" bool cleaveLowerSpawns(MlirOperation op, bool tasks) {
     if (f.isDeclaration() && (f.getName().starts_with("cleave_spawn_next") || f.getName().starts_with("cleave_task_wait")))
       f.erase();
   return true;
+}
+
+// ------------------------------------------------------------------ passes
+//
+// Each rewrite above as a registered MLIR pass on the module, so a stage of
+// cleave's pipeline is one textual pipeline (`cleaveRunPipeline`). What a
+// rewrite counts is a pass statistic, printed when the pipeline runs with
+// statistics on.
+
+namespace {
+
+// A pass running `rewrite` on the module, counting what it returns.
+#define CLEAVE_COUNTING_PASS(Class, argument, description, rewrite)            \
+  struct Class : PassWrapper<Class, OperationPass<ModuleOp>> {                 \
+    MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(Class)                        \
+    Class() = default;                                                         \
+    Class(const Class &other) : PassWrapper(other) {}                          \
+    StringRef getArgument() const final { return argument; }                   \
+    StringRef getName() const final { return argument; }                       \
+    StringRef getDescription() const final { return description; }           \
+    Statistic rewritten{this, "rewritten", description};                       \
+    void runOnOperation() final {                                              \
+      rewritten += rewrite(wrap(getOperation().getOperation()));               \
+    }                                                                          \
+  };
+
+// A pass running `rewrite` on the module, which reports nothing.
+#define CLEAVE_PLAIN_PASS(Class, argument, description, rewrite)               \
+  struct Class : PassWrapper<Class, OperationPass<ModuleOp>> {                 \
+    MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(Class)                        \
+    StringRef getArgument() const final { return argument; }                   \
+    StringRef getName() const final { return argument; }                       \
+    StringRef getDescription() const final { return description; }           \
+    void runOnOperation() final {                                              \
+      rewrite(wrap(getOperation().getOperation()));                            \
+    }                                                                          \
+  };
+
+CLEAVE_COUNTING_PASS(LowerBlasMatmulsPass, "cleave-lower-blas-matmuls",
+                     "BLAS-marked products lowered to sgemm calls",
+                     cleaveLowerBlasMatmuls)
+CLEAVE_COUNTING_PASS(ReuseDyingInputsPass, "cleave-reuse-dying-inputs",
+                     "elementwise results written into a dying operand",
+                     cleaveReuseDyingInputs)
+CLEAVE_COUNTING_PASS(ElideBlockCopiesPass, "cleave-elide-block-copies",
+                     "blocks written in place", cleaveElideBlockCopies)
+CLEAVE_COUNTING_PASS(ForwardCopiesToDestinationsPass,
+                     "cleave-forward-copies-to-destinations",
+                     "results written in their destination",
+                     cleaveForwardCopiesToDestinations)
+CLEAVE_COUNTING_PASS(FoldPassthroughIterArgsPass,
+                     "cleave-fold-passthrough-iter-args",
+                     "loop-carried values yielded back unchanged, removed",
+                     cleaveFoldPassthroughIterArgs)
+CLEAVE_COUNTING_PASS(DeallocAtLastUsePass, "cleave-dealloc-at-last-use",
+                     "deallocations moved to the last use",
+                     cleaveDeallocAtLastUse)
+CLEAVE_COUNTING_PASS(BindTeamsPass, "cleave-bind-teams",
+                     "parallel regions placing their threads", cleaveBindTeams)
+CLEAVE_PLAIN_PASS(LowerAdoptionsPass, "cleave-lower-adoptions",
+                  "adoption markers lowered", cleaveLowerAdoptions)
+CLEAVE_PLAIN_PASS(HoistArgSlotsPass, "cleave-hoist-arg-slots",
+                  "argument slots hoisted to the entry block, their lifetimes "
+                  "bounded",
+                  cleaveHoistArgSlots)
+CLEAVE_PLAIN_PASS(ApplyNoInlinePass, "cleave-apply-no-inline",
+                  "functions kept out of line stay out of line in LLVM",
+                  cleaveApplyNoInline)
+
+#undef CLEAVE_COUNTING_PASS
+#undef CLEAVE_PLAIN_PASS
+
+struct ApproximateMathPass
+    : PassWrapper<ApproximateMathPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ApproximateMathPass)
+  StringRef getArgument() const final { return "cleave-approximate-math"; }
+  StringRef getName() const final { return "cleave-approximate-math"; }
+  StringRef getDescription() const final {
+    return "transcendentals rewritten as vectorizable polynomials";
+  }
+  void runOnOperation() final {
+    if (!cleaveApproximateMath(wrap(getOperation().getOperation())))
+      signalPassFailure();
+  }
+};
+
+struct LimitInliningPass
+    : PassWrapper<LimitInliningPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LimitInliningPass)
+  LimitInliningPass() = default;
+  LimitInliningPass(const LimitInliningPass &other) : PassWrapper(other) {}
+  StringRef getArgument() const final { return "cleave-limit-inlining"; }
+  StringRef getName() const final { return "cleave-limit-inlining"; }
+  StringRef getDescription() const final {
+    return "calls kept out of line by the inline threshold";
+  }
+  Option<int64_t> threshold{*this, "threshold",
+                            llvm::cl::desc("the inline threshold"),
+                            llvm::cl::init(0)};
+  Statistic kept{this, "kept", "calls kept out of line"};
+  void runOnOperation() final {
+    kept += cleaveLimitInlining(wrap(getOperation().getOperation()), threshold);
+  }
+};
+
+struct BlasTileAndFusePass
+    : PassWrapper<BlasTileAndFusePass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(BlasTileAndFusePass)
+  BlasTileAndFusePass() = default;
+  BlasTileAndFusePass(const BlasTileAndFusePass &other) : PassWrapper(other) {}
+  StringRef getArgument() const final { return "cleave-blas-tile-and-fuse"; }
+  StringRef getName() const final { return "cleave-blas-tile-and-fuse"; }
+  StringRef getDescription() const final {
+    return "BLAS products fused with their consumer, tiled by rows";
+  }
+  Option<int64_t> rows{*this, "rows", llvm::cl::desc("rows per tile"),
+                       llvm::cl::init(128)};
+  Statistic fused{this, "fused", "products fused with their consumer"};
+  void runOnOperation() final {
+    fused += cleaveBlasTileAndFuse(wrap(getOperation().getOperation()), rows);
+  }
+};
+
+struct CopyAggregatesInMemoryPass
+    : PassWrapper<CopyAggregatesInMemoryPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(CopyAggregatesInMemoryPass)
+  CopyAggregatesInMemoryPass() = default;
+  CopyAggregatesInMemoryPass(const CopyAggregatesInMemoryPass &other)
+      : PassWrapper(other) {}
+  StringRef getArgument() const final {
+    return "cleave-copy-aggregates-in-memory";
+  }
+  StringRef getName() const final { return "cleave-copy-aggregates-in-memory"; }
+  StringRef getDescription() const final {
+    return "large aggregates copied from memory to memory become memcpys";
+  }
+  Option<int64_t> minBytes{*this, "min-bytes",
+                           llvm::cl::desc("the smallest aggregate copied so"),
+                           llvm::cl::init(0)};
+  Statistic copies{this, "copies", "aggregate copies made memcpy"};
+  void runOnOperation() final {
+    copies += cleaveCopyAggregatesInMemory(
+        wrap(getOperation().getOperation()), minBytes);
+  }
+};
+
+struct LowerSpawnsPass : PassWrapper<LowerSpawnsPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LowerSpawnsPass)
+  LowerSpawnsPass() = default;
+  LowerSpawnsPass(const LowerSpawnsPass &other) : PassWrapper(other) {}
+  StringRef getArgument() const final { return "cleave-lower-spawns"; }
+  StringRef getName() const final { return "cleave-lower-spawns"; }
+  StringRef getDescription() const final {
+    return "spawn markers lowered to OpenMP tasks, or removed";
+  }
+  Option<bool> tasks{*this, "tasks",
+                     llvm::cl::desc("OpenMP tasks; false runs each spawned "
+                                    "call in place"),
+                     llvm::cl::init(true)};
+  void runOnOperation() final {
+    if (!cleaveLowerSpawns(wrap(getOperation().getOperation()), tasks))
+      signalPassFailure();
+  }
+};
+
+} // namespace
+
+
+// ------------------------------------------------------------------ rewrites
+// of the bufferized and lowered module: copies, allocations, loop stack
+// scopes, locations
+
+namespace {
+
+// Every operation's block and position in it, every value's uses (the using
+// operation and the operand's index) and every `memref.copy`, in a pre-order
+// walk of the module: what the copy rewrites below match against.
+struct OpIndex {
+  llvm::DenseMap<Operation *, std::pair<Block *, unsigned>> position;
+  llvm::DenseMap<Value, SmallVector<std::pair<Operation *, unsigned>>> uses;
+  SmallVector<Operation *> copies;
+};
+
+static void indexBlock(Block &block, OpIndex &index) {
+  unsigned pos = 0;
+  for (Operation &op : block) {
+    index.position[&op] = {&block, pos};
+    for (OpOperand &operand : op.getOpOperands())
+      index.uses[operand.get()].push_back({&op, operand.getOperandNumber()});
+    if (isa<memref::CopyOp>(op))
+      index.copies.push_back(&op);
+    for (Region &region : op.getRegions())
+      for (Block &b : region)
+        indexBlock(b, index);
+    ++pos;
+  }
+}
+
+static OpIndex indexModule(ModuleOp module) {
+  OpIndex index;
+  indexBlock(*module.getBody(), index);
+  return index;
+}
+
+// The position in `block` of `user`'s ancestor there (itself included).
+static std::optional<unsigned> positionIn(const OpIndex &index, Block *block,
+                                          Operation *user) {
+  Operation *ancestor = block->findAncestorOpInBlock(*user);
+  if (!ancestor)
+    return std::nullopt;
+  auto it = index.position.find(ancestor);
+  if (it == index.position.end())
+    return std::nullopt;
+  return it->second.second;
+}
+
+static ArrayRef<std::pair<Operation *, unsigned>> usesOf(const OpIndex &index,
+                                                         Value v) {
+  auto it = index.uses.find(v);
+  if (it == index.uses.end())
+    return {};
+  return it->second;
+}
+
+// `memref.copy %a, %b`, `%a` and `%b` both operand-less `memref.alloc`s of the
+// same type in the copy's block, `%a` with no use after the copy (nested uses
+// counted at their enclosing operation in that block), `%b` with none before
+// it: `%a`, `%b` and `%b`'s allocation. `Tensor(data: buf)` copies `buf`
+// before marking the tensor `restrict` (`mlir_lower.rs::lower_tagged_struct_
+// construct`), since `buf` could in general still be written afterwards;
+// when it isn't, the copy is pure cost.
+struct DeadSourceCopy {
+  Value a, b;
+  Operation *bAlloc;
+};
+static std::optional<DeadSourceCopy> matchDeadSourceCopy(const OpIndex &index,
+                                                         Operation *copy) {
+  Value a = copy->getOperand(0), b = copy->getOperand(1);
+  if (a == b || a.getType() != b.getType())
+    return std::nullopt;
+  auto [block, copyPos] = index.position.lookup(copy);
+  auto allocOf = [&](Value v) -> Operation * {
+    Operation *op = v.getDefiningOp();
+    if (!op || !isa<memref::AllocOp>(op) || op->getNumOperands() != 0)
+      return nullptr;
+    auto it = index.position.find(op);
+    if (it == index.position.end() || it->second.first != block)
+      return nullptr;
+    return op;
+  };
+  if (!allocOf(a))
+    return std::nullopt;
+  Operation *bAlloc = allocOf(b);
+  if (!bAlloc || !index.uses.count(a) || !index.uses.count(b))
+    return std::nullopt;
+  for (auto [user, operand] : usesOf(index, a)) {
+    if (user == copy)
+      continue;
+    auto pos = positionIn(index, block, user);
+    if (!pos || *pos >= copyPos)
+      return std::nullopt;
+  }
+  for (auto [user, operand] : usesOf(index, b)) {
+    if (user == copy)
+      continue;
+    auto pos = positionIn(index, block, user);
+    if (!pos || *pos <= copyPos)
+      return std::nullopt;
+  }
+  return DeadSourceCopy{a, b, bAlloc};
+}
+
+// What `matchHoistableDestination` may move earlier: no side effect but
+// allocating, no region.
+static bool isMovable(Operation *op) {
+  if (op->getNumRegions() != 0)
+    return false;
+  StringRef name = op->getName().getStringRef();
+  if (name == "llvm.getelementptr" || name == "llvm.ptrtoint" ||
+      name == "llvm.insertvalue" || name == "llvm.extractvalue" ||
+      name == "llvm.mlir.poison" || name == "llvm.mlir.undef" ||
+      name == "llvm.mlir.zero" || name == "llvm.mlir.constant" ||
+      name == "arith.constant" || name == "builtin.unrealized_conversion_cast")
+    return true;
+  if (auto call = dyn_cast<func::CallOp>(op))
+    return call.getCallee() == "cleave_alloc_rc";
+  return false;
+}
+
+// The other direction: `memref.copy %a, %b` where `%a` is a fresh
+// `memref.alloc` filled earlier and dead after the copy, and `%b` a
+// destination defined later (a tuple element's or struct field's storage,
+// `mlir_lower.rs::build_tensor_descriptor_value`). When `%b`'s definition is
+// a chain of movable operations depending only on values available before
+// `%a`'s allocation, the chain moves up next to it and `%a`'s writers write
+// `%b` directly. `%a`'s allocation, `%a`, `%b` and the chain, in block order.
+struct HoistableDestination {
+  Operation *aAlloc;
+  Value a, b;
+  SmallVector<Operation *> slice;
+};
+static std::optional<HoistableDestination>
+matchHoistableDestination(const OpIndex &index, Operation *copy) {
+  Value a = copy->getOperand(0), b = copy->getOperand(1);
+  if (a == b || a.getType() != b.getType())
+    return std::nullopt;
+  auto [block, copyPos] = index.position.lookup(copy);
+  Operation *aAlloc = a.getDefiningOp();
+  if (!aAlloc || !isa<memref::AllocOp>(aAlloc) || aAlloc->getNumOperands() != 0)
+    return std::nullopt;
+  auto aIt = index.position.find(aAlloc);
+  if (aIt == index.position.end() || aIt->second.first != block)
+    return std::nullopt;
+  unsigned aPos = aIt->second.second;
+  if (!index.uses.count(a))
+    return std::nullopt;
+  for (auto [user, operand] : usesOf(index, a)) {
+    if (user == copy)
+      continue;
+    auto pos = positionIn(index, block, user);
+    if (!pos || *pos >= copyPos)
+      return std::nullopt;
+  }
+  Operation *bDef = b.getDefiningOp();
+  if (!bDef)
+    return std::nullopt;
+  auto bIt = index.position.find(bDef);
+  if (bIt == index.position.end() || bIt->second.first != block)
+    return std::nullopt;
+  unsigned bPos = bIt->second.second;
+  if (bPos <= aPos || bPos >= copyPos)
+    return std::nullopt;
+  for (auto [user, operand] : usesOf(index, b)) {
+    if (user == copy)
+      continue;
+    auto pos = positionIn(index, block, user);
+    if (!pos || *pos <= copyPos)
+      return std::nullopt;
+  }
+  // The backward slice of `%b` after `%a`'s allocation, every op movable;
+  // operands defined before `%a`'s allocation, or block arguments, are
+  // available at the new position already.
+  SmallVector<std::pair<unsigned, Operation *>> slice;
+  llvm::DenseSet<Operation *> seen;
+  SmallVector<Operation *> work{bDef};
+  while (!work.empty()) {
+    Operation *op = work.pop_back_val();
+    if (!seen.insert(op).second)
+      continue;
+    auto it = index.position.find(op);
+    if (it == index.position.end())
+      return std::nullopt;
+    if (it->second.first != block || it->second.second <= aPos)
+      continue;
+    if (!isMovable(op))
+      return std::nullopt;
+    slice.push_back({it->second.second, op});
+    for (Value operand : op->getOperands())
+      if (Operation *def = operand.getDefiningOp())
+        work.push_back(def);
+  }
+  // Nothing outside the slice may use its results before the copy.
+  llvm::DenseSet<Operation *> inSlice;
+  for (auto [pos, op] : slice)
+    inSlice.insert(op);
+  for (auto [pos, op] : slice)
+    for (Value result : op->getResults())
+      for (auto [user, operand] : usesOf(index, result)) {
+        if (inSlice.contains(user) || user == copy)
+          continue;
+        auto userPos = positionIn(index, block, user);
+        if (!userPos || *userPos <= copyPos)
+          return std::nullopt;
+      }
+  llvm::stable_sort(slice, [](auto &x, auto &y) { return x.first < y.first; });
+  HoistableDestination match{aAlloc, a, b, {}};
+  for (auto [pos, op] : slice)
+    match.slice.push_back(op);
+  return match;
+}
+
+// Drops the copies `matchDeadSourceCopy` and `matchHoistableDestination` find,
+// until none is left. Each round rewrites a buffer at most once: a later
+// rewrite could involve a value an earlier one replaces.
+static int64_t forwardDeadSourceCopies(ModuleOp module) {
+  int64_t total = 0;
+  while (true) {
+    OpIndex index = indexModule(module);
+    llvm::DenseSet<Value> done;
+    SmallVector<std::pair<Operation *, DeadSourceCopy>> rewrites;
+    SmallVector<std::pair<Operation *, HoistableDestination>> hoists;
+    for (Operation *copy : index.copies) {
+      if (auto m = matchDeadSourceCopy(index, copy)) {
+        if (done.insert(m->a).second && done.insert(m->b).second)
+          rewrites.push_back({copy, *m});
+      } else if (auto h = matchHoistableDestination(index, copy)) {
+        if (done.insert(h->a).second && done.insert(h->b).second)
+          hoists.push_back({copy, *h});
+      }
+    }
+    if (rewrites.empty() && hoists.empty())
+      return total;
+    for (auto &[copy, m] : rewrites) {
+      for (auto [user, operand] : usesOf(index, m.b))
+        if (user != copy)
+          user->setOperand(operand, m.a);
+      copy->erase();
+      m.bAlloc->erase();
+      ++total;
+    }
+    for (auto &[copy, h] : hoists) {
+      Operation *anchor = h.aAlloc->getNextNode();
+      for (Operation *op : h.slice)
+        op->moveBefore(anchor);
+      for (auto [user, operand] : usesOf(index, h.a))
+        if (user != copy)
+          user->setOperand(operand, h.b);
+      copy->erase();
+      h.aAlloc->erase();
+      ++total;
+    }
+  }
+}
+
+// After `buffer-results-to-out-params`, a call whose result goes into a struct
+// field or a tuple element allocates `%out`, passes it to the call, then
+// copies it into the field: `call @f(%a, %out) ... memref.copy %out, %field`.
+// Rewritten to `call @f(%a, %field)`, the copy and the allocation gone.
+// Conservative, every condition local: `%out` is a `memref.alloc` used exactly
+// twice, by one `func.call` and as the copy's source, all three in one block
+// in that order; `%field` has the same type, is defined earlier in that block
+// (so it dominates the call), and has no use before the copy, the call's own
+// operands included. Runs `forwardDeadSourceCopies` first.
+static int64_t forwardOutParamCopies(ModuleOp module) {
+  int64_t total = forwardDeadSourceCopies(module);
+  OpIndex index = indexModule(module);
+  struct Rewrite {
+    Operation *call;
+    unsigned operand;
+    Value dst;
+    Operation *copy, *alloc;
+  };
+  SmallVector<Rewrite> rewrites;
+  for (Operation *copy : index.copies) {
+    Value src = copy->getOperand(0), dst = copy->getOperand(1);
+    if (src == dst || src.getType() != dst.getType())
+      continue;
+    auto [block, copyPos] = index.position.lookup(copy);
+    Operation *alloc = src.getDefiningOp();
+    if (!alloc || !isa<memref::AllocOp>(alloc))
+      continue;
+    auto allocIt = index.position.find(alloc);
+    if (allocIt == index.position.end() || !index.uses.count(src))
+      continue;
+    auto srcUses = usesOf(index, src);
+    if (allocIt->second.first != block || srcUses.size() != 2)
+      continue;
+    auto other = llvm::find_if(srcUses, [&](auto &u) { return u.first != copy; });
+    if (other == srcUses.end())
+      continue;
+    auto [call, operand] = *other;
+    if (!isa<func::CallOp>(call))
+      continue;
+    auto callIt = index.position.find(call);
+    if (callIt == index.position.end() || callIt->second.first != block)
+      continue;
+    unsigned allocPos = allocIt->second.second, callPos = callIt->second.second;
+    if (!(allocPos < callPos && callPos < copyPos))
+      continue;
+    Operation *def = dst.getDefiningOp();
+    if (!def)
+      continue;
+    auto defIt = index.position.find(def);
+    if (defIt == index.position.end() || defIt->second.first != block ||
+        defIt->second.second >= callPos)
+      continue;
+    bool usedBefore = false;
+    for (auto [user, i] : usesOf(index, dst)) {
+      if (user == copy)
+        continue;
+      auto pos = positionIn(index, block, user);
+      if (!pos || *pos <= copyPos) {
+        usedBefore = true;
+        break;
+      }
+    }
+    if (!usedBefore)
+      rewrites.push_back({call, operand, dst, copy, alloc});
+  }
+  for (Rewrite &r : rewrites) {
+    r.call->setOperand(r.operand, r.dst);
+    r.copy->erase();
+    r.alloc->erase();
+    ++total;
+  }
+  return total;
+}
+
+// A `memref.copy %x, %x`, left by One-Shot Bufferize's write-back of a tiled
+// `scf.forall` (`tensor.parallel_insert_slice`): a no-op, erased. Neither
+// `canonicalize` nor `cse` folds it. Runs after `cse`, which merges the two
+// identical subviews such a copy is made of.
+static int64_t eliminateSelfCopies(ModuleOp module) {
+  SmallVector<memref::CopyOp> dead;
+  module.walk([&](memref::CopyOp copy) {
+    if (copy.getSource() == copy.getTarget())
+      dead.push_back(copy);
+  });
+  for (memref::CopyOp copy : dead)
+    copy->erase();
+  return dead.size();
+}
+
+// Every `linalg.copy` between memrefs of a dynamic size (or layout) made the
+// `memref.copy` it is, before `convert-linalg-to-affine-loops`: the
+// write-back of a partial tile (a matmul whose column count isn't a multiple
+// of the schedule's 16), whose size is an `affine.min` of an `scf.for`
+// induction variable, which the affine pass rejects as a dimension.
+static int64_t lowerDynamicCopies(ModuleOp module) {
+  SmallVector<Operation *> copies;
+  module.walk([&](Operation *op) {
+    if (op->getName().getStringRef() != "linalg.copy" ||
+        op->getNumOperands() != 2 || op->getNumResults() != 0)
+      return;
+    for (Value v : op->getOperands()) {
+      if (!isa<MemRefType>(v.getType()))
+        continue;
+      std::string text;
+      llvm::raw_string_ostream os(text);
+      v.getType().print(os);
+      if (StringRef(text).contains('?')) {
+        copies.push_back(op);
+        return;
+      }
+    }
+  });
+  for (Operation *op : copies) {
+    OpBuilder builder(op);
+    memref::CopyOp::create(builder, op->getLoc(), op->getOperand(0),
+                           op->getOperand(1));
+    op->erase();
+  }
+  return copies.size();
+}
+
+// Every `llvm.call @old` renamed `@new`; `@old`'s declaration renamed too
+// when nothing declares `@new` yet (same signature by construction).
+static int64_t retargetCalls(ModuleOp module, StringRef oldName,
+                             StringRef newName) {
+  auto findDecl = [&](StringRef name) -> LLVM::LLVMFuncOp {
+    for (Operation &op : *module.getBody())
+      if (auto f = dyn_cast<LLVM::LLVMFuncOp>(op))
+        if (f.getSymName() == name)
+          return f;
+    return nullptr;
+  };
+  bool newDeclared = static_cast<bool>(findDecl(newName));
+  int64_t renamed = 0;
+  auto callee = FlatSymbolRefAttr::get(module.getContext(), newName);
+  module.walk([&](LLVM::CallOp call) {
+    if (call.getCallee() == oldName) {
+      call.setCalleeAttr(callee);
+      ++renamed;
+    }
+  });
+  if (renamed && !newDeclared)
+    if (LLVM::LLVMFuncOp decl = findDecl(oldName))
+      decl->setAttr("sym_name", StringAttr::get(module.getContext(), newName));
+  return renamed;
+}
+
+// Every allocation MLIR's bufferization left as `malloc`/`free` (by now, every
+// one is a tensor payload's: cleave's own code allocates through
+// `cleave_alloc_rc`) goes through cleave's allocator instead:
+// `@cleave_alloc_rc`/`@cleave_release_void`, same signatures. Runs once
+// everything is in the LLVM dialect, where the swap is a rename.
+static int64_t unifyTensorAllocations(ModuleOp module) {
+  return retargetCalls(module, "malloc", "cleave_alloc_rc") +
+         retargetCalls(module, "free", "cleave_release_void");
+}
+
+// `fastmath<contract>` on every `arith.mulf`/`arith.addf`: the permission
+// LLVM needs to fuse a multiply and an add into one FMA.
+static int64_t markMulfAddfContract(ModuleOp module) {
+  auto contract = arith::FastMathFlagsAttr::get(module.getContext(),
+                                                arith::FastMathFlags::contract);
+  int64_t marked = 0;
+  module.walk([&](Operation *op) {
+    if (isa<arith::MulFOp, arith::AddFOp>(op)) {
+      op->setAttr("fastmath", contract);
+      ++marked;
+    }
+  });
+  return marked;
+}
+
+// Every loop body (`scf.while`'s after region, `scf.for`'s and
+// `scf.parallel`'s body) between `llvm.intr.stacksave` and
+// `llvm.intr.stackrestore`: what a body allocates on the stack is freed at
+// each iteration, as the arena region `mlir_lower.rs::lower_loop` opens per
+// iteration frees what it allocates on the heap. Without it a training loop
+// built without OpenMP (whose outlined bodies return, freeing their frames)
+// overflowed the stack within a few iterations.
+static int64_t insertStackScopesInLoops(ModuleOp module) {
+  SmallVector<std::pair<Operation *, unsigned>> loops;
+  module.walk<WalkOrder::PreOrder>([&](Operation *op) {
+    if (isa<scf::WhileOp>(op))
+      loops.push_back({op, 1});
+    else if (isa<scf::ForOp, scf::ParallelOp>(op))
+      loops.push_back({op, 0});
+  });
+  MLIRContext *ctx = module.getContext();
+  auto ptrTy = LLVM::LLVMPointerType::get(ctx);
+  auto loc = UnknownLoc::get(ctx);
+  int64_t scoped = 0;
+  for (auto [loop, index] : loops) {
+    Region &region = loop->getRegion(index);
+    if (region.empty() || region.front().empty())
+      continue;
+    Block &body = region.front();
+    OpBuilder builder(&body.front());
+    Value saved = LLVM::StackSaveOp::create(builder, loc, ptrTy);
+    Operation *last = &body.back();
+    if (last->hasTrait<OpTrait::IsTerminator>()) {
+      builder.setInsertionPoint(last);
+      LLVM::StackRestoreOp::create(builder, loc, saved);
+    }
+    ++scoped;
+  }
+  return scoped;
+}
+
+// The `_mlir_ciface_*` wrappers `llvm.emit_c_interface` makes reuse their
+// function's location, `DISubprogram` included, which LLVM's verifier
+// rejects ("DISubprogram attached to more than one function"): their whole
+// body gets an unknown location.
+static void stripCifaceDebugInfo(ModuleOp module) {
+  auto unknown = UnknownLoc::get(module.getContext());
+  module.walk([&](LLVM::LLVMFuncOp f) {
+    if (f.getSymName().contains("_mlir_ciface_"))
+      f->walk([&](Operation *op) { op->setLoc(unknown); });
+  });
+}
+
+// Whether `loc` resolves to a source line anywhere inside it (`--inline`
+// wraps a cloned op's location in a `CallSiteLoc`, the line one level down).
+static bool hasRealLine(Location loc) {
+  if (isa<FileLineColRange>(loc))
+    return true;
+  if (auto callSite = dyn_cast<CallSiteLoc>(loc))
+    return hasRealLine(callSite.getCallee()) || hasRealLine(callSite.getCaller());
+  if (auto fused = dyn_cast<FusedLoc>(loc))
+    return llvm::any_of(fused.getLocations(),
+                        [](Location l) { return hasRealLine(l); });
+  return false;
+}
+
+// In every `llvm.func` with a body, each operation without a source line (one
+// an MLIR lowering synthesized: a tile's seed, a vector epilogue) takes the
+// nearest real location before it in program order, the function's own to
+// start with: a profiler or debugger then places it next to the code it was
+// generated for, not on the function's declaration.
+static void backfillUnknownLocations(ModuleOp module) {
+  module.walk([&](LLVM::LLVMFuncOp f) {
+    if (f.getBody().empty())
+      return;
+    Location current = f.getLoc();
+    f.getBody().walk<WalkOrder::PreOrder>([&](Operation *op) {
+      if (hasRealLine(op->getLoc()))
+        current = op->getLoc();
+      else
+        op->setLoc(current);
+    });
+  });
+}
+
+// Runs `pipeline` (nested in a module) on `module` if `condition` holds.
+static LogicalResult runIf(ModuleOp module, bool condition,
+                           StringRef pipeline,
+                           function_ref<LogicalResult(OpPassManager &, Operation *)>
+                               runPipeline) {
+  if (!condition)
+    return success();
+  OpPassManager pm("builtin.module");
+  if (failed(parsePassPipeline(pipeline, pm)))
+    return failure();
+  return runPipeline(pm, module);
+}
+
+// Whether `module` has a `vector.transfer_read`/`transfer_write` whose
+// permutation map isn't a minor identity (`(d0, d1) -> (d1)` is one; `(d0, d1)
+// -> (d0)` isn't): what `convert-vector-to-llvm` can't lower.
+static bool hasPermutedTransfer(ModuleOp module) {
+  bool found = false;
+  module.walk([&](Operation *op) {
+    if (auto read = dyn_cast<vector::TransferReadOp>(op))
+      found |= !read.getPermutationMap().isMinorIdentity();
+    else if (auto write = dyn_cast<vector::TransferWriteOp>(op))
+      found |= !write.getPermutationMap().isMinorIdentity();
+  });
+  return found;
+}
+
+#define CLEAVE_MODULE_PASS(Class, argument, description, body)                 \
+  struct Class : PassWrapper<Class, OperationPass<ModuleOp>> {                 \
+    MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(Class)                        \
+    Class() = default;                                                         \
+    Class(const Class &other) : PassWrapper(other) {}                          \
+    StringRef getArgument() const final { return argument; }                   \
+    StringRef getName() const final { return argument; }                       \
+    StringRef getDescription() const final { return description; }           \
+    Statistic rewritten{this, "rewritten", description};                       \
+    void runOnOperation() final { body }                                       \
+  };
+
+CLEAVE_MODULE_PASS(ForwardDeadSourceCopiesPass,
+                   "cleave-forward-dead-source-copies",
+                   "copies of a buffer dead after them into a fresh one, dropped",
+                   rewritten += forwardDeadSourceCopies(getOperation());)
+CLEAVE_MODULE_PASS(ForwardOutParamCopiesPass, "cleave-forward-out-param-copies",
+                   "calls writing their result directly where it was copied",
+                   rewritten += forwardOutParamCopies(getOperation());)
+CLEAVE_MODULE_PASS(EliminateSelfCopiesPass, "cleave-eliminate-self-copies",
+                   "copies of a buffer to itself, erased",
+                   rewritten += eliminateSelfCopies(getOperation());)
+CLEAVE_MODULE_PASS(LowerDynamicCopiesPass, "cleave-lower-dynamic-copies",
+                   "linalg.copy of a dynamic size made memref.copy",
+                   rewritten += lowerDynamicCopies(getOperation());)
+CLEAVE_MODULE_PASS(UnifyTensorAllocationsPass,
+                   "cleave-unify-tensor-allocations",
+                   "malloc/free calls made cleave allocator calls",
+                   rewritten += unifyTensorAllocations(getOperation());)
+CLEAVE_MODULE_PASS(MarkContractPass, "cleave-mark-contract",
+                   "mulf/addf allowed to contract into an FMA",
+                   rewritten += markMulfAddfContract(getOperation());)
+CLEAVE_MODULE_PASS(InsertStackScopesPass, "cleave-insert-stack-scopes",
+                   "loop bodies freeing their stack at each iteration",
+                   rewritten += insertStackScopesInLoops(getOperation());)
+CLEAVE_MODULE_PASS(StripCifaceDebugInfoPass, "cleave-strip-ciface-debug-info",
+                   "C-interface wrappers given no debug location",
+                   stripCifaceDebugInfo(getOperation());)
+CLEAVE_MODULE_PASS(BackfillLocationsPass, "cleave-backfill-locations",
+                   "synthesized operations given their nearest source line",
+                   backfillUnknownLocations(getOperation());)
+CLEAVE_MODULE_PASS(
+    LowerPermutedTransfersPass, "cleave-lower-permuted-transfers",
+    "permuted vector transfers lowered to scalar loops (if any)",
+    if (failed(runIf(getOperation(), hasPermutedTransfer(getOperation()),
+                     "func.func(convert-vector-to-scf{target-rank=0})",
+                     [&](OpPassManager &pm, Operation *op) {
+                       return runPipeline(pm, op);
+                     }))) signalPassFailure();)
+
+#undef CLEAVE_MODULE_PASS
+
+// `convert-openmp-to-llvm`, when the module has OpenMP operations or `always`
+// (`--openmp`'s parallel loops, or the tasks `spawn` lowers to).
+struct ConvertOpenMPIfUsedPass
+    : PassWrapper<ConvertOpenMPIfUsedPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ConvertOpenMPIfUsedPass)
+  ConvertOpenMPIfUsedPass() = default;
+  ConvertOpenMPIfUsedPass(const ConvertOpenMPIfUsedPass &other)
+      : PassWrapper(other) {}
+  StringRef getArgument() const final { return "cleave-convert-openmp-if-used"; }
+  StringRef getName() const final { return "cleave-convert-openmp-if-used"; }
+  StringRef getDescription() const final {
+    return "convert-openmp-to-llvm, when OpenMP operations are present";
+  }
+  Option<bool> always{*this, "always",
+                      llvm::cl::desc("convert even with no OpenMP operation"),
+                      llvm::cl::init(false)};
+  void runOnOperation() final {
+    bool used = always;
+    getOperation().walk([&](Operation *op) {
+      if (op->getName().getDialectNamespace() == "omp") {
+        used = true;
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+    if (failed(runIf(getOperation(), used, "convert-openmp-to-llvm",
+                     [&](OpPassManager &pm, Operation *op) {
+                       return runPipeline(pm, op);
+                     })))
+      signalPassFailure();
+  }
+};
+
+} // namespace
+
+// Registers the passes above; called by `cleaveRegisterPasses`.
+static void registerRewritePasses() {
+  PassRegistration<ForwardDeadSourceCopiesPass>();
+  PassRegistration<ForwardOutParamCopiesPass>();
+  PassRegistration<EliminateSelfCopiesPass>();
+  PassRegistration<LowerDynamicCopiesPass>();
+  PassRegistration<UnifyTensorAllocationsPass>();
+  PassRegistration<MarkContractPass>();
+  PassRegistration<InsertStackScopesPass>();
+  PassRegistration<StripCifaceDebugInfoPass>();
+  PassRegistration<BackfillLocationsPass>();
+  PassRegistration<LowerPermutedTransfersPass>();
+  PassRegistration<ConvertOpenMPIfUsedPass>();
+}
+
+// Registers cleave's passes (above) and every MLIR pass, for pipelines to
+// name them. Idempotent.
+extern "C" void cleaveRegisterPasses() {
+  static bool once = [] {
+    registerAllPasses();
+    PassRegistration<LimitInliningPass>();
+    PassRegistration<BlasTileAndFusePass>();
+    PassRegistration<LowerBlasMatmulsPass>();
+    PassRegistration<ReuseDyingInputsPass>();
+    PassRegistration<ElideBlockCopiesPass>();
+    PassRegistration<ForwardCopiesToDestinationsPass>();
+    PassRegistration<FoldPassthroughIterArgsPass>();
+    PassRegistration<LowerAdoptionsPass>();
+    PassRegistration<DeallocAtLastUsePass>();
+    PassRegistration<LowerSpawnsPass>();
+    PassRegistration<ApproximateMathPass>();
+    PassRegistration<BindTeamsPass>();
+    PassRegistration<CopyAggregatesInMemoryPass>();
+    PassRegistration<HoistArgSlotsPass>();
+    PassRegistration<ApplyNoInlinePass>();
+    registerRewritePasses();
+    return true;
+  }();
+  (void)once;
+}
+
+// Runs the textual pipeline `pipeline` (`builtin.module(...)`) on `module`,
+// with the pass statistics printed on stderr if `statistics`. `false` if the
+// pipeline doesn't parse (reported through `onError`) or a pass fails (its
+// diagnostics already reported by the context's handlers).
+extern "C" bool cleaveRunPipeline(MlirModule module, MlirStringRef pipeline,
+                                  bool statistics, CleaveErrorCallback onError,
+                                  void *userData) {
+  cleaveRegisterPasses();
+  ModuleOp op = unwrap(module);
+  std::string parseErrors;
+  llvm::raw_string_ostream errorStream(parseErrors);
+  FailureOr<OpPassManager> parsed = parsePassPipeline(unwrap(pipeline), errorStream);
+  if (failed(parsed)) {
+    report(onError, userData, parseErrors);
+    return false;
+  }
+  PassManager pm(op->getContext(), parsed->getOpAnchorName());
+  static_cast<OpPassManager &>(pm) = std::move(*parsed);
+  if (statistics)
+    pm.enableStatistics();
+  return succeeded(pm.run(op));
+}
+
+// Loads the transform module `text` (named `name` in diagnostics) into the
+// transform dialect's library for `context`, where `transform-interpreter`
+// finds the sequences it names: what `transform-preload-library` does with a
+// file, from memory. `false` on error, reported through the context's
+// diagnostic handlers.
+extern "C" bool cleaveLoadTransformLibrary(MlirContext context,
+                                           MlirStringRef text,
+                                           MlirStringRef name) {
+  MLIRContext *ctx = unwrap(context);
+  llvm::SourceMgr sourceMgr;
+  sourceMgr.AddNewSourceBuffer(
+      llvm::MemoryBuffer::getMemBufferCopy(unwrap(text), unwrap(name)),
+      llvm::SMLoc());
+  OwningOpRef<ModuleOp> library = parseSourceFile<ModuleOp>(sourceMgr, ctx);
+  if (!library || failed(mlir::verify(*library)))
+    return false;
+  auto loc = FileLineColLoc::get(ctx, "<shared-library-module>", 0, 0);
+  OwningOpRef<ModuleOp> merged = ModuleOp::create(loc, "__transform");
+  merged.get()->setAttr("transform.with_named_sequence", UnitAttr::get(ctx));
+  if (failed(transform::detail::mergeSymbolsInto(merged.get(),
+                                                 std::move(library))))
+    return false;
+  return succeeded(ctx->getOrLoadDialect<transform::TransformDialect>()
+                       ->loadIntoLibraryModule(std::move(merged)));
 }

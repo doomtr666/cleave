@@ -47,7 +47,7 @@
 //! in the first place, not to rely on that assertion as a safety net.
 
 use crate::cps::{CExpr, CFunDef, CVal, CVar, CpsProgram, PrimOp};
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 /// The whole public surface: every top-level function name safe to lower
 /// with `cleave_alloc_local` at each of its own construction sites.
@@ -105,7 +105,7 @@ pub fn find_region_local_functions(program: &CpsProgram) -> HashSet<String> {
         .map(|f| (f.def.name.as_str(), &f.def))
         .collect();
 
-    let mut region_local = HashSet::new();
+    let mut region_local = HashSet::default();
     for f in &program.funcs {
         find_loops_and_mark(&f.def.body, &top_level_names, &call_counts, &mut region_local);
     }
@@ -113,7 +113,7 @@ pub fn find_region_local_functions(program: &CpsProgram) -> HashSet<String> {
     // its caller, whose region it would allocate in: never region-local. Its
     // own loops still open their regions, on the thread running the task
     // (each thread has its own arena, `cleave-rt`).
-    let mut spawned = HashSet::new();
+    let mut spawned = HashSet::default();
     for f in &program.funcs {
         collect_spawned_units(&f.def.body, &mut spawned);
     }
@@ -132,7 +132,7 @@ pub fn find_region_local_functions(program: &CpsProgram) -> HashSet<String> {
         let Some(def) = by_name.get(name.as_str()) else {
             continue;
         };
-        let mut inner_callees = HashSet::new();
+        let mut inner_callees = HashSet::default();
         collect_direct_callees(&def.body, &top_level_names, &mut inner_callees);
         for callee in inner_callees {
             if call_counts.get(&callee).copied().unwrap_or(0) == 1 && region_local.insert(callee.clone()) {
@@ -205,7 +205,7 @@ pub(crate) fn collect_direct_callees(expr: &CExpr, top_level_names: &HashSet<Str
 /// function name, across the *whole* program — `find_loops_and_mark`'s own
 /// safety precondition (a region-local candidate must have exactly one).
 fn count_call_sites(program: &CpsProgram, top_level_names: &HashSet<String>) -> HashMap<String, usize> {
-    let mut counts = HashMap::new();
+    let mut counts = HashMap::default();
     for f in &program.funcs {
         count_calls_in(&f.def.body, top_level_names, &mut counts);
     }
@@ -339,7 +339,7 @@ fn analyze_loop_body(
     // to this same loop (`scf.yield`'s own operands, once lowered) --
     // these, and everything transitively derived from them, must survive
     // past this iteration.
-    let mut escaping: HashSet<CVar> = HashSet::new();
+    let mut escaping: HashSet<CVar> = HashSet::default();
     collect_escaping(then_branch, &loop_def.name, &mut escaping);
     collect_stored(then_branch, &mut escaping);
 
@@ -347,7 +347,7 @@ fn analyze_loop_body(
     // straight out of `base` (`g.2`'s own `CVar` is a child of `g`'s) --
     // together with `calls` (every direct top-level call's own `(callee,
     // bound result CVar)` pair) found anywhere in this same loop body.
-    let mut children: HashMap<CVar, Vec<CVar>> = HashMap::new();
+    let mut children: HashMap<CVar, Vec<CVar>> = HashMap::default();
     let mut calls: Vec<(String, CVar)> = Vec::new();
     collect_calls_and_derivations(then_branch, top_level_names, &mut children, &mut calls);
 
@@ -589,7 +589,7 @@ fn collect_calls_and_derivations(
 /// term, never larger).
 fn reaches_escaping(start: CVar, children: &HashMap<CVar, Vec<CVar>>, escaping: &HashSet<CVar>) -> bool {
     let mut stack = vec![start];
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     while let Some(v) = stack.pop() {
         if !seen.insert(v) {
             continue;

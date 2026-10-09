@@ -5,7 +5,7 @@
 //! terminals (VS Code's included) recognize and turn into a clickable link.
 
 use crate::ast::{FileId, Span};
-use std::collections::HashMap;
+use crate::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
@@ -92,7 +92,7 @@ impl SourceMap {
     /// per-function/per-statement `FileId` back to a real path at debug-info
     /// emission time, without `mlir_lower.rs` itself depending on
     /// `SourceMap`/`FileId`.
-    pub fn path_table(&self) -> std::collections::HashMap<u32, String> {
+    pub fn path_table(&self) -> crate::collections::HashMap<u32, String> {
         self.files
             .iter()
             .map(|(id, (name, _))| (id.0, name.clone()))

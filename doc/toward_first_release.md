@@ -51,6 +51,9 @@ fixed opportunistically along the way rather than as a gate.
    experiments; move finished entries out of `doc/backlog.md`; keep the user guide in sync with the
    language.
 5. **A standalone, easy-to-use package.**
+   - cleave talks to MLIR only through its own C API, implemented by its C++ shim, built with cleave
+     against the prebuilt LLVM/MLIR: no `melior`, `mlir-sys`, `tblgen`, libclang or forks to build
+     cleave ([`plan-mlir-shim.md`](plan-mlir-shim.md)). The two points below rest on it.
    - The `cleave` compiler ships as a prebuilt binary per platform (GitHub releases): the standalone
      tool, usable on its own.
    - Using cleave from Rust feels like using any crate (the experience `pest` gives): add `cleave-build`
@@ -69,8 +72,6 @@ fixed opportunistically along the way rather than as a gate.
 
 - Good multi-thread scaling (cleave already beats PyTorch on MNIST: 1.7x single-threaded, and 6.1 s on
   4 threads versus 7.8 s for PyTorch's best configuration on 8).
-- Replacing `mlir-sys`/`melior` with the C++ shim: a background effort (`doc/backlog.md`, "`mlir-sys`/
-  `melior`'s own ceiling").
 - The GPU (Vulkan) backend, macOS, ARM.
 
 ## Suggested order

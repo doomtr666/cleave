@@ -1,19 +1,14 @@
-//! Real, JIT-executed tests for `cleave::unify_alloc::unify_tensor_
-//! allocations` — a self-contained harness
-//! (a pipeline replicating `pipeline.rs::emit_object`'s real
-//! stage order, not `mlir_lower.rs`'s older, pre-`--inline` `run_i32_from_
-//! cps` helper), but carried all the way through to the `llvm` dialect —
-//! `unify_tensor_allocations` runs *after* `--convert-to-llvm`, the one
-//! stage every other rewrite in this project runs before (`unify_alloc.rs`'s
-//! own module doc comment explains why: `llvm.call @malloc`/`@free` don't
-//! exist as such any earlier).
+//! JIT-executed tests for `cleave-unify-tensor-allocations` (`cleave-mlir-
+//! shim`): the `malloc`/`free` calls bufferization leaves made calls to
+//! cleave's allocator. A self-contained harness replicating `pipeline.rs`'s
+//! stage order through to the `llvm` dialect, since the pass runs after
+//! `--convert-to-llvm`, where those calls first exist as such.
 
 use cleave::cps::{collect_mlir_types, collect_struct_schemas, collect_units, convert_program};
 use cleave::driver::compile;
 use cleave::mlir_lower::lower_program;
 use cleave::pipeline::{check_type_errors, strip_ciface_wrapper_debug_info};
 use cleave::registry::Registry;
-use cleave::unify_alloc::unify_tensor_allocations;
 use melior::Context;
 use melior::dialect::DialectRegistry;
 use melior::ir::operation::OperationLike;
@@ -35,7 +30,7 @@ fn context() -> Context {
 /// to-loops` in place of `-to-affine-loops`+`affine-super-vectorize`,
 /// the usual simplification for a test that is about
 /// allocation rather than vectorization: this file is testing *this*
-/// rewrite, not vectorization), then runs `unify_tensor_allocations`.
+/// rewrite, not vectorization), then runs `cleave-unify-tensor-allocations`.
 fn build_unified_module<'c>(context: &'c Context, src: &str) -> melior::ir::Module<'c> {
     let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
@@ -106,13 +101,14 @@ fn build_unified_module<'c>(context: &'c Context, src: &str) -> melior::ir::Modu
         .run(&mut module)
         .expect("lowering to the llvm dialect must succeed");
 
-    unify_tensor_allocations(context, &mut module);
+    unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), "builtin.module(cleave-unify-tensor-allocations)", false) }
+        .expect("cleave-unify-tensor-allocations");
     assert!(
         module.as_operation().verify(),
-        "module failed verification after unify_tensor_allocations\n{}",
+        "module failed verification after cleave-unify-tensor-allocations\n{}",
         module.as_operation()
     );
-    strip_ciface_wrapper_debug_info(context, module.as_operation_mut());
+    strip_ciface_wrapper_debug_info(&mut module);
 
     module
 }

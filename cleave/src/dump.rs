@@ -15,7 +15,7 @@ use crate::callgraph::{self, ProgramInference};
 use crate::infer::{Env, Infer, Ty, TyVar, TypeError};
 use crate::print::{fmt_params, fmt_turbofish, fmt_type};
 use crate::registry::Registry;
-use std::collections::HashMap;
+use crate::collections::HashMap;
 use std::fmt::Write as _;
 
 type NodeTypes = HashMap<NodeId, Ty>;
@@ -301,7 +301,7 @@ pub(crate) fn dump_block(
     names: &mut TyVarNames,
     indent: usize,
 ) {
-    dump_block_with_call_names(out, block, node_types, names, indent, &HashMap::new());
+    dump_block_with_call_names(out, block, node_types, names, indent, &HashMap::default());
 }
 
 /// Like `dump_block`, but a `Call` node present in `call_names` renders

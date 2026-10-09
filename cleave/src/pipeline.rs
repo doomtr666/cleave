@@ -6,7 +6,7 @@
 //! thing whether it's invoked from the command line or from someone else's
 //! `build.rs`.
 
-use crate::ast::{ItemKind, Program};
+use crate::ast::Program;
 use crate::cps::{
     CpsProgram, UnitBody, collect_mlir_types, collect_struct_schemas, collect_units,
     convert_program, eliminate_dead_code,
@@ -15,17 +15,14 @@ use crate::diag::{Diagnostic, SourceMap};
 use crate::egraph::{DerivativeRequest, optimize_program, synthesize_derivatives};
 use crate::escape::escaping_struct_vars;
 use crate::mlir_lower::lower_program;
-use crate::redundant_copy_elim::eliminate_self_copies;
 use crate::refcount::insert_refcounting;
 use crate::registry::Registry;
-use crate::unify_alloc::unify_tensor_allocations;
 use melior::Context;
-use melior::dialect::{DialectRegistry, llvm};
+use melior::dialect::DialectRegistry;
 use melior::ir::attribute::Attribute;
-use melior::ir::operation::{OperationBuilder, OperationLike, OperationMutLike, OperationRefMut};
-use melior::ir::{BlockLike, Identifier, Location, Module, RegionLike, Type, Value};
-use melior::pass;
-use melior::utility::{parse_pass_pipeline, register_all_dialects};
+use melior::ir::operation::{OperationBuilder, OperationLike};
+use melior::ir::{BlockLike, Identifier, Location, Module};
+use melior::utility::register_all_dialects;
 use std::path::{Path, PathBuf};
 
 /// The hardware target a program is being compiled for -- `doc/hld.md`'s
@@ -56,16 +53,7 @@ pub enum Backend {
 /// doesn't ask for something different.
 #[derive(Debug, Clone)]
 pub struct CodegenOptions {
-    /// `0`-`3`, forwarded directly to `melior::ExecutionEngine::new`'s own
-    /// `optimization_level` parameter -- previously a bare hardcoded `2` at
-    /// two separate call sites (`main.rs`'s own `--run` block, and `emit_
-    /// object` below). `doc/backlog.md`'s own record of this project's
-    /// history: lowering it to `0` was tried once, as a one-off compile-
-    /// time measurement, and *explicitly rejected* as a permanent fix (the
-    /// whole point of cleave is genuinely high-performance generated code)
-    /// -- exposing it as a real, explicit, user-chosen option (defaulting
-    /// to the same `2` as before) is a different thing entirely from that
-    /// rejected silent compromise.
+    /// LLVM's optimization level, `0`-`3` (`target`).
     pub opt_level: u8,
     /// Whether `lower_to_llvm` applies the OpenMP parallelization stage
     /// (`--affine-parallelize`/`--convert-scf-to-openmp`/`--convert-openmp-
@@ -87,27 +75,10 @@ pub struct CodegenOptions {
     /// the real, measured 6.6x speedup this mechanism delivers on the AOT
     /// path that first proved it out.
     pub openmp: bool,
-    /// `llvm.func`'s own real `target_cpu` string attribute (confirmed
-    /// directly against this toolchain: `mlir-opt` parses and round-trips
-    /// `llvm.func @f() attributes { target_cpu = "..." }` cleanly) --
-    /// `None` leaves it unset, matching real host-CPU detection (`doc/
-    /// backlog.md`'s own "first real cleave shim function" entry: the actual
-    /// `TargetMachine` construction, `cleave-mlir-shim`, starts from
-    /// `JITTargetMachineBuilder::detectHost()`). `Some("native".into())` is
-    /// also real and explicitly equivalent to `None` here -- **not** because
-    /// LLVM's own backend understands the literal string `"native"` (it
-    /// doesn't; confirmed directly, the shim used to pass it straight
-    /// through and hit a real, fatal `LLVM ERROR` abort before this was
-    /// fixed) but because the shim itself special-cases it, substituting
-    /// `llvm::sys::getHostCPUName()`/`getHostCPUFeatures()` first -- the
-    /// same substitution a real driver like `clang` does for `-mcpu=native`
-    /// before its own backend ever sees the flag.
+    /// The CPU code is generated for (`target`): an LLVM processor name, or
+    /// `native` for the host's with every feature it has. `None`: the host's.
     pub target_cpu: Option<String>,
-    /// `llvm.func`'s own `target_features` attribute -- raw feature text,
-    /// e.g. `"+avx2,+fma"`, converted into the real `#llvm.target_features
-    /// <[...]>` attribute syntax by `stamp_target_cpu` below (confirmed
-    /// directly against this toolchain the same way `target_cpu` was).
-    /// `None` leaves it unset, same reasoning as `target_cpu` above.
+    /// Features added to or removed from the CPU's (`+avx2,-avx512f`).
     pub target_features: Option<String>,
     /// See `Backend`'s own doc comment -- `Cpu` is the only real value
     /// today; every stage `lower_to_llvm` runs assumes it.
@@ -226,8 +197,8 @@ pub fn build_cps_program(
 /// though it isn't `#[pure]` (`cps::check_spawn_purity`). `sgemm` writes its
 /// result through a pointer, which `#[pure]` must never claim, yet is
 /// perfectly safe to call from several tasks at once.
-fn reentrant_externs(program: &Program) -> std::collections::HashSet<String> {
-    let mut out = std::collections::HashSet::new();
+fn reentrant_externs(program: &Program) -> crate::collections::HashSet<String> {
+    let mut out = crate::collections::HashSet::default();
     let mut note = |f: &crate::ast::FnDecl| {
         if f.is_extern && f.attrs.iter().any(|a| a.name == "reentrant") {
             out.insert(f.extern_symbol.clone().unwrap_or_else(|| f.name.clone()));
@@ -664,57 +635,16 @@ pub fn compile_and_emit(
     Ok(Emitted { needs_openmp, loaded_files: sources.file_names() })
 }
 
-/// Shared libraries the JIT's own `ExecutionEngine` needs loaded *alongside*
-/// the lowered module, for symbols the lowered `llvm` dialect calls but never
-/// defines itself -- `memrefCopy` (`mlir::ExecutionEngine::CRunnerUtils`),
-/// the runtime helper `one-shot-bufferize` inserts a real call to once a
-/// tensor value needs a defensive copy before a write it can't otherwise
-/// prove safe. Every program up to and including this session's own `Dense`/
-/// `Network` work happened to need no such copy at all (confirmed directly:
-/// `--dump-mlir-lowered` on every prior example has zero `memrefCopy` calls),
-/// so this was never missing *for those* -- but the gap was always there:
-/// `ExecutionEngine::new`'s own `shared_library_paths` parameter was `&[]`
-/// unconditionally, on both call sites, so a program needing it would always
-/// have crashed exactly the way this one did (`JIT session error: Symbols
-/// not found: [ memrefCopy ]`) the moment a big enough derivative expression
-/// finally triggered a real defensive copy. `mlir_c_runner_utils.dll` (not
-/// `mlir_runner_utils.dll`, its sibling — the latter is the *print*/timing
-/// helper library, a separate concern) really does export it (confirmed
-/// directly: `dumpbin /exports` on the actual `.dll`), built alongside this
-/// project's own real, non-"compiler-only" MLIR 22 install (`.cargo/config.
-/// Registers every real `cleave-rt` function by pointer against `engine` --
-/// shared by `--run` (`main.rs`) and `emit_object` below. A short, explicit,
-/// hardcoded list, growing one line per `extern fn` `cleave-rt` provides;
-/// registering by real function pointer, not dynamic symbol lookup by name,
-/// sidesteps the Windows/MSVC CRT-symbol-visibility questions a raw libc
-/// binding would run into.
-///
-/// Needed for *object emission* too, not just real JIT invocation, found by
-/// direct testing: `ExecutionEngine::new`/`dump_to_object_file` apparently
-/// still needs every externally-called symbol resolvable at construction
-/// time even though nothing is ever actually invoked through this engine
-/// instance -- omitting registration crashed hard (`STATUS_STACK_BUFFER_
-/// OVERRUN`) the moment a compiled program called a real `extern fn`
-/// (`print_i32`, say), where every earlier `--emit-object` test happened to
-/// only exercise `export fn`s with no `extern fn` calls in their own
-/// bodies, so this went unnoticed until a program mixing both was tried.
-/// The registered pointer only satisfies the engine's own internal
-/// requirement, though -- confirmed directly (`llvm-nm` on the emitted
-/// `.o`) that the real external symbol still comes out as an ordinary
-/// undefined (`U`) relocation, not a baked-in address: the actual object
-/// file is unaffected, still meant to be resolved later by a real linker
-/// against `cleave-rt`'s own staticlib.
+/// Registers every `cleave-rt` function a program may call, by pointer,
+/// with the JIT `engine` (`--run` and the in-process tests; an object file
+/// leaves them for the linker). One line per `extern fn` `cleave-rt`
+/// provides; by pointer rather than by name lookup, which sidesteps the
+/// Windows/MSVC questions of which CRT exports what. `memrefCopy` is
+/// `cleave-rt`'s own version of MLIR's runtime helper, which
+/// `one-shot-bufferize` calls by name for a defensive copy.
 ///
 /// SAFETY: each `cleave_rt::*` pointer is a real, valid `extern "C" fn`,
 /// live for the process's whole lifetime.
-///
-/// `memrefCopy` belongs here too, even though it isn't a cleave `extern fn`
-/// any cleave source ever calls directly -- `cleave_rt::memrefCopy`'s own
-/// doc comment has the full story: it's this project's own reimplementation
-/// of an MLIR runtime helper (`mlir::ExecutionEngine::CRunnerUtils.h`),
-/// needed because `one-shot-bufferize`'s own lowering calls it directly by
-/// name whenever a tensor value needs a real defensive copy, and this
-/// engine has no shared library loaded to satisfy that on its own.
 pub unsafe fn register_cleave_rt_symbols(engine: &cleave_mlir_shim::ExecutionEngine) {
     unsafe {
         engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
@@ -835,364 +765,28 @@ pub unsafe fn register_cleave_rt_symbols(engine: &cleave_mlir_shim::ExecutionEng
     }
 }
 
-/// Stamps every `arith.mulf`/`arith.addf` op in `module` with a
-/// `fastmath<contract>` attribute -- see the pipeline stage that calls this
-/// (`emit_object`, and its two identical copies in `main.rs`) for why: it's
-/// the permission `--math-uplift-to-fma` needs before it will fuse a
-/// `mulf`+`addf` pair into one `math.fma`, found to be required (not
-/// optional) by direct testing against this toolchain. No typed MLIR pass
-/// does this -- there's no generic "permit contraction everywhere" pass in
-/// this toolchain (`mlir-opt --help` checked directly) -- so this walks the
-/// module by hand, the same nested region/block/operation traversal a real
-/// MLIR C++ pass would do internally. Not built on melior's own
-/// `OperationMutLike::walk_mut`: that closure is `for<'x, 'y> FnMut(...)`
-/// (a real MLIR C++ walk visits operations at many different nested
-/// lifetimes), which can't accept a single `Attribute<'c>` captured from
-/// outside at one fixed lifetime -- found directly (`E0521`, "argument
-/// requires that `'c` must outlive `'static`") rather than assumed; a
-/// plain recursive walk sidesteps it by staying at one lifetime throughout.
-pub fn mark_mulf_addf_contract<'c>(context: &'c Context, module: &mut Module<'c>) {
-    let contract = Attribute::parse(context, "#arith.fastmath<contract>")
-        .expect("`#arith.fastmath<contract>` is a fixed, always-valid attribute literal");
-    stamp_op_and_children(module.as_operation_mut(), contract);
-}
-
-fn stamp_op_and_children<'c>(mut op: OperationRefMut<'c, '_>, contract: Attribute<'c>) {
-    if matches!(
-        op.name().as_string_ref().as_str(),
-        Ok("arith.mulf" | "arith.addf")
-    ) {
-        op.set_attribute("fastmath", contract);
-    }
-    for region in op.regions() {
-        let mut next_block = region.first_block();
-        while let Some(block) = next_block {
-            let mut next_op = block.first_operation_mut();
-            while let Some(child) = next_op {
-                next_op = child.next_in_block_mut();
-                stamp_op_and_children(child, contract);
-            }
-            next_block = block.next_in_region();
-        }
-    }
-}
-
-/// Wraps every `scf.while` op's own body (the "after" region, index `1` --
-/// `mlir_lower.rs::lower_loop`'s own `scf::r#while(&init_values,
-/// &carried_types, before_region, after_region, ...)` call fixes that
-/// ordering) in a native-stack save/restore pair, one per loop iteration.
-///
-/// **The bug this closes, confirmed by direct testing, not guessed** (`doc/
-/// backlog.md`'s own "AOT binary built with `--no-openmp`... genuinely
-/// crashes with a native stack overflow" entry has the full story): a real
-/// training loop (a `for`/`while` around a nontrivial `grad()`-differentiated
-/// backward pass) built with `options.openmp == false` overflows the native
-/// stack after only 1-2 iterations, minimal-repro-confirmed, independent of
-/// MNIST. Root cause: every loop iteration's own local buffers (`llvm.
-/// alloca`, from bufferized local arrays/tensors reached through region-
-/// local calls) stayed allocated across iterations -- nothing in this
-/// pipeline ever bounded that. `--convert-scf-to-openmp` (further below,
-/// `options.openmp` only) happened to paper over this *by accident*, for
-/// whichever *one* dimension gets OpenMP-parallelized, by outlining that
-/// loop's own body into a genuinely separate function (an ordinary call/
-/// return already frees its own stack on the way out) -- never for the loop
-/// actually declared in cleave source (the training loop itself is never
-/// the parallelized dimension), and never at all with OpenMP off.
-///
-/// **The fix mirrors the arena's own existing discipline exactly, rather
-/// than inventing a second, differently-reasoned mechanism** (matching the
-/// project's own "uniformiser" direction here): `mlir_lower.rs::lower_loop`
-/// already opens one heap-arena region per iteration (`cleave_region_enter`,
-/// at the body's start) and closes it right before that iteration's own
-/// tail-yield (`cleave_region_exit`) -- see that function's own doc comment.
-/// `llvm.intr.stacksave`/`stackrestore` (real LLVM intrinsics,
-/// `LLVMIntrinsicOps.td`'s own `LLVM_StackSaveOp`/`StackRestoreOp`, no
-/// melior binding, built via `OperationBuilder` the same way every other
-/// unbound op in this codebase is) are the identical pairing for the native
-/// stack: same iteration boundary, same "opened at body start, closed right
-/// before the next iteration's own yield" shape -- just a different
-/// resource (the raw stack pointer, not the arena cursor).
-///
-/// **Applied here as a post-hoc module walk, not inside `mlir_lower.rs`'s
-/// own initial construction — found necessary by direct testing, not
-/// assumed**: building these two ops at the same point `cleave_region_enter`
-/// is built (i.e., before *any* lowering pass has run at all) puts real
-/// `llvm`-dialect ops into the module before `one-shot-bufferize`'s own
-/// `buffer-deallocation` stage (above) ever runs — that stage requires every
-/// op it encounters to answer "what are your memory effects", and an `llvm`
-/// dialect op mixed into still-tensor/memref-level IR this early doesn't
-/// implement that interface from its perspective, so it errors outright
-/// ("ops with unknown memory side effects are not supported"), before ever
-/// reaching JIT/AOT emission -- confirmed directly by trying exactly that
-/// first. Run here instead, right after buffer-deallocation (above) and
-/// before `--affine-parallelize`/`--lower-affine` (below): must see the
-/// loop while it's still a genuine, single-block-bodied `scf.while`
-/// (matching `mlir_lower.rs`'s own construction) to find the body's own
-/// first operation/terminator this simply — not, unlike `memref.
-/// alloca_scope`, because a flat stacksave/stackrestore pair actually
-/// *needs* this exact ordering to stay correct (it doesn't: no structured
-/// single-block-region constraint applies to either op, so nothing about
-/// `--convert-scf-to-cf` running later can ever silently break this the way
-/// it broke the OpenMP-specific mechanism for the same underlying problem).
-///
-/// **Extended to `scf.for` too, not just `scf.while` — a real, second crash
-/// site found the same way as the first, via the user's own suggested
-/// isolation technique (shrink the real network to a single, minimal layer,
-/// same loop/FFI/grad structure, see what still breaks)**: a from-scratch
-/// minimal repro (~40 lines, no MNIST, no OpenMP) of `grad()`/`Optimizer::
-/// step` training through a *single* `Dense<784,10>` layer overflowed the
-/// stack after the very first `scf.while`-level fix above was already
-/// landed and confirmed working on the real 4-layer network — a genuinely
-/// different loop shape than the one that fix covers. Root-caused via `--
-/// dump-mlir-lowered`: the crashing case's own IR contains real `llvm.
-/// alloca ... !llvm.array<8 x vector<10xf32>>` sites — `vector<10xf32>`,
-/// exactly this shape's own narrow (`N=10`) output width — sitting inside a
-/// loop with *no* stacksave/stackrestore pair of its own, only the far
-/// outer one `mlir_lower.rs::lower_loop`'s own `scf.while` already gets.
-/// Confirmed by direct A/B (not guessed): the *identical* repro widened to
-/// `N=512` (same `K=784`, same everything else) runs 500 iterations clean;
-/// only the narrow-`N` shape crashes. This is `doc/backlog-done.md`'s own
-/// already-named "Problem B"/pad-retry fallback (`transform.structured.pad`,
-/// the matmul schedule's own narrow-output-width retry path, `pipeline.rs`'s
-/// own transform-dialect matmul schedule, elsewhere) — a real `scf.for`
-/// loop from *that* mechanism, structurally unrelated to any `scf.while`
-/// cleave's own source ever declares, so the fix above never had a chance
-/// to see it. Same underlying disease (a loop body allocating real stack
-/// space every iteration, nothing bounding it without OpenMP's own
-/// incidental outlining), same fix, on the *other* loop shape this
-/// pipeline can produce.
-///
-/// Walks the whole module recursively (mirrors `stamp_op_and_children`'s own
-/// shape exactly, immediately above) so a loop nested inside another
-/// function, or inside another loop, still gets the identical treatment.
-fn insert_stack_scopes_in_loops<'c>(context: &'c Context, op: OperationRefMut<'c, '_>) {
-    // `scf.while`'s own loop body is region `1` (`after_region` --
-    // `mlir_lower.rs::lower_loop`'s own `scf::r#while(..., before_region,
-    // after_region, ...)` call fixes this ordering; region `0`, the
-    // condition check, is never arena-scoped either, for the identical
-    // reason `lower_loop`'s own `cleave_region_enter` call only ever runs
-    // inside `after_block` -- deliberately left untouched here too).
-    // `scf.for`/`scf.parallel` each have exactly one region, their own
-    // body, at index `0` -- `scf.parallel` matched for the identical reason
-    // `scf.for` is (this function's own doc comment above has the full
-    // audit): both `--scf-forall-to-parallel` (Stage 1's own tiling) and
-    // `--lower-affine` (the old fallback path's own `affine.parallel`) can
-    // produce one by the time this pass runs, and neither gets the
-    // `memref.alloca_scope` treatment `--convert-scf-to-openmp` would
-    // otherwise give it unless `options.openmp` happens to be on.
-    let body_region_index = match op.name().as_string_ref().as_str() {
-        Ok("scf.while") => Some(1),
-        Ok("scf.for") | Ok("scf.parallel") => Some(0),
-        _ => None,
-    };
-    if let Some(index) = body_region_index {
-        let location = Location::unknown(context);
-        let ptr_ty: Type = llvm::r#type::pointer(context, 0);
-        if let Ok(body_region) = op.region(index)
-            && let Some(body) = body_region.first_block()
-            && let Some(first_op) = body.first_operation()
-        {
-            let stacksave = OperationBuilder::new("llvm.intr.stacksave", location)
-                .add_results(&[ptr_ty])
-                .build()
-                .unwrap_or_else(|e| {
-                    panic!("MLIR lowering: failed to build llvm.intr.stacksave: {e}")
-                });
-            let stacksave = body.insert_operation_before(first_op, stacksave);
-            let saved: Value = stacksave.result(0).unwrap().into();
-            if let Some(terminator) = body.terminator() {
-                let stackrestore = OperationBuilder::new("llvm.intr.stackrestore", location)
-                    .add_operands(&[saved])
-                    .build()
-                    .unwrap_or_else(|e| {
-                        panic!("MLIR lowering: failed to build llvm.intr.stackrestore: {e}")
-                    });
-                body.insert_operation_before(terminator, stackrestore);
-            }
-        }
-    }
-    for region in op.regions() {
-        let mut next_block = region.first_block();
-        while let Some(block) = next_block {
-            let mut next_op = block.first_operation_mut();
-            while let Some(child) = next_op {
-                next_op = child.next_in_block_mut();
-                insert_stack_scopes_in_loops(context, child);
-            }
-            next_block = block.next_in_region();
-        }
-    }
-}
-
-/// Does `loc` resolve to a real `FileLineColLoc` *anywhere* inside it?
-/// `--inline` wraps a cloned op's own (perfectly good) location in a
-/// `CallSiteLoc(calleeLoc, callerLoc)` -- a shallow `is_file_line_col_
-/// range()` check on that wrapper alone reports "unknown" even though the
-/// real line is still sitting right there in `callee_loc`, one level down,
-/// and a debugger's own "inlined at" chain reads exactly this way (confirmed
-/// directly: `llvm-readobj --codeview` on a real kernel object shows real
-/// `S_INLINESITE` records once every function -- not just the ones
-/// surviving as standalone `llvm.func`s -- gets its own `DISubprogram`,
-/// `mlir_lower.rs::gen_loc`'s own doc comment has the full story). Recurses
-/// into `CallSiteLoc`/`FusedLoc`; a `NameLoc`'s own child isn't exposed by
-/// melior, so it's conservatively treated as unresolved (this pipeline only
-/// ever produces one, for the `DISubprogram` metadata attribute itself, not
-/// on ordinary ops). Used by `backfill_unknown_locs` below to tell a
-/// genuinely bare `UnknownLoc` (left by an MLIR lowering pass that
-/// synthesized new ops -- the tiled/vectorized loop nests, mostly) apart
-/// from a location that still resolves, however deep.
-fn has_real_line(loc: melior::ir::Location) -> bool {
-    if loc.is_file_line_col_range() {
-        true
-    } else if loc.is_call_site() {
-        has_real_line(loc.call_site_callee()) || has_real_line(loc.call_site_caller())
-    } else if loc.is_fused() {
-        (0..loc.fused_num_locations()).any(|i| has_real_line(loc.fused_location(i)))
-    } else {
-        false
-    }
-}
-
-/// The MLIR-to-`llvm`-dialect lowering pipeline shared by *every* pipeline
-/// entry point that needs one -- `main.rs`'s own `--dump-mlir-lowered`/
-/// `--run` blocks, and `emit_object` below (`--emit-object`/`--emit-exe`/
-/// `cleave-build`). Extracted this way specifically to close a real,
-/// already-manifesting drift, not just to add `options`: this pipeline used
-/// to be duplicated three times (`doc/backlog.md`'s own long-standing "three
-/// copies kept manually in sync" framing), and the OpenMP parallelization
-/// stage added earlier this session landed in only *one* of the three
-/// (`emit_object`) -- `--run`/`--dump-mlir-lowered` silently had no
-/// parallelization at all, a real bug waiting to surface the next time
-/// someone touched one copy and forgot the other two. One function, called
-/// from all three sites, makes that class of drift structurally impossible
-/// going forward.
-///
-/// Takes an already-lowered, already-verified `module` (`lower_program` +
-/// `.verify()`, identical at every call site) and runs it all the way to
-/// `llvm`-dialect MLIR in place -- stops short of JIT invocation/object
-/// emission, which differ per caller (`ExecutionEngine::new`'s own
-/// `optimization_level`/`enable_object_dump` arguments are caller-specific,
-/// not part of this shared pipeline).
-/// Whether `op` holds a `vector.transfer_read`/`transfer_write` whose
-/// permutation map isn't a minor identity (`(d0, d1) -> (d1)` is one, a
-/// plain contiguous read; `(d0, d1) -> (d0)` isn't): what `--convert-vector-
-/// to-llvm` can't lower (see the second `--convert-vector-to-scf` in
-/// `lower_to_llvm`).
-/// Whether `op` holds any OpenMP-dialect operation (`omp.*`): `--openmp`'s
-/// parallel loops, or the tasks `spawn` lowers to.
-fn has_openmp_ops(op: melior::ir::operation::OperationRef) -> bool {
-    use melior::ir::operation::OperationLike;
-    if op.name().as_string_ref().as_str().unwrap_or("").starts_with("omp.") {
-        return true;
-    }
-    for region in op.regions() {
-        let mut block = region.first_block();
-        while let Some(b) = block {
-            let mut inner = b.first_operation();
-            while let Some(o) = inner {
-                if has_openmp_ops(o) {
-                    return true;
-                }
-                inner = o.next_in_block();
-            }
-            block = b.next_in_region();
-        }
-    }
-    false
-}
-
-fn has_permuted_transfer(op: melior::ir::operation::OperationRef) -> bool {
-    use melior::ir::operation::OperationLike;
-    let name = op.name().as_string_ref().as_str().unwrap_or("").to_string();
-    if name == "vector.transfer_read" || name == "vector.transfer_write" {
-        if let Ok(map) = op.attribute("permutation_map") {
-            if !is_minor_identity(&map.to_string()) {
-                return true;
-            }
-        }
-    }
-    for region in op.regions() {
-        let mut block = region.first_block();
-        while let Some(b) = block {
-            let mut inner = b.first_operation();
-            while let Some(o) = inner {
-                if has_permuted_transfer(o) {
-                    return true;
-                }
-                inner = o.next_in_block();
-            }
-            block = b.next_in_region();
-        }
-    }
-    false
-}
-
-/// `affine_map<(d0, ..., dn) -> (dk, ..., dn)>`: the results are the last
-/// dimensions, in order.
-fn is_minor_identity(map: &str) -> bool {
-    let Some((dims, results)) = map
-        .trim_start_matches("affine_map<")
-        .trim_end_matches('>')
-        .split_once("->")
-    else {
-        return false;
-    };
-    let names = |s: &str| -> Vec<String> {
-        s.trim().trim_start_matches('(').trim_end_matches(')').split(',').map(|d| d.trim().to_string()).filter(|d| !d.is_empty()).collect()
-    };
-    let (dims, results) = (names(dims), names(results));
-    results.len() <= dims.len() && dims[dims.len() - results.len()..] == results[..]
-}
-
-/// Registers, once per process, every pass `lower_to_llvm` names in a
-/// textual pipeline (`parse_pass_pipeline` looks them up by name). MLIR's pass
-/// registry is a global, unsynchronized table: registering at each use, as
-/// this used to, wrote to it while another thread compiling at the same time
-/// (the test harnesses run compilations in parallel) read it, an intermittent
-/// `STATUS_ACCESS_VIOLATION` in the test suite.
+/// Registers, once per process, every pass a textual pipeline may name:
+/// MLIR's and cleave's (`cleave_mlir_shim::register_passes`). MLIR's pass
+/// registry is a global, unsynchronized table: registering at each use wrote
+/// to it while another thread compiling at the same time (the test harnesses
+/// run compilations in parallel) read it, an intermittent
+/// `STATUS_ACCESS_VIOLATION`. The shim registers inside a function-local
+/// static's initialization, which other threads wait for, and runs it before
+/// parsing any pipeline.
 pub fn register_passes() {
-    static REGISTERED: std::sync::Once = std::sync::Once::new();
-    REGISTERED.call_once(|| {
-        pass::affine::register_affine_parallelize();
-        pass::affine::register_affine_vectorize();
-        pass::bufferization::register_buffer_results_to_out_params_pass();
-        pass::bufferization::register_empty_tensor_elimination_pass();
-        pass::bufferization::register_one_shot_bufferize_pass();
-        pass::conversion::register_vector_to_scf();
-        pass::transform_dialect::register_interpreter_pass();
-        pass::transform_dialect::register_preload_library_pass();
-        pass::vector::register_lower_vector_multi_reduction();
-    });
+    cleave_mlir_shim::register_passes();
 }
 
-/// The matmul tile/vectorize schedule (`cleave/mlir/matmul_vectorize.
-/// transform.mlir`), compiled into the binary and written out once to the
-/// temporary directory, the path MLIR's `transform-preload-library` reads
-/// it from; named after its content's hash, so that a binary never reads
-/// another version's.
 /// Rows of a BLAS product computed per tile when it is fused with its
-/// elementwise consumer (`cleave_mlir_shim::blas_tile_and_fuse`): a tile of a
-/// product 1024 wide is 512 KB, within a core's 1 MB L2 alongside its slice
-/// of `A`; fewer rows would call `sgemm` more often, each call packing `B`
-/// again.
+/// elementwise consumer (`cleave-blas-tile-and-fuse`): a tile of a product
+/// 1024 wide is 512 KB, within a core's 1 MB L2 alongside its slice of `A`;
+/// fewer rows would call `sgemm` more often, each call packing `B` again.
 const BLAS_TILE_ROWS: i64 = 128;
 
-fn matmul_schedule_path() -> Result<String, String> {
-    use std::hash::{Hash, Hasher};
-    const SCHEDULE: &str = include_str!("../mlir/matmul_vectorize.transform.mlir");
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    SCHEDULE.hash(&mut hasher);
-    let path = std::env::temp_dir().join(format!("cleave-matmul-schedule-{:016x}.mlir", hasher.finish()));
-    if std::fs::read_to_string(&path).ok().as_deref() != Some(SCHEDULE) {
-        // Written whole under a temporary name, then renamed: a concurrent
-        // compile never reads half a schedule.
-        let partial = path.with_extension(format!("{}.tmp", std::process::id()));
-        std::fs::write(&partial, SCHEDULE)
-            .and_then(|()| std::fs::rename(&partial, &path))
-            .map_err(|e| format!("cannot write the matmul schedule to {}: {e}", path.display()))?;
-    }
-    Ok(path.to_string_lossy().replace('\\', "/"))
-}
+/// The matmul tile/vectorize schedule, compiled into the binary and loaded
+/// into the context's transform library from memory
+/// (`cleave_mlir_shim::load_transform_library`).
+const MATMUL_SCHEDULE: &str = include_str!("../mlir/matmul_vectorize.transform.mlir");
 
 /// `CLEAVE_TIME_STAGES=1`: how long each stage of a compile takes, on stderr:
 /// the front end's (parsing, type checking, CPS, e-graph, refcounting), each
@@ -1211,11 +805,22 @@ fn report_stage(what: &str, since: std::time::Instant) {
     }
 }
 
-fn timed_run(pass_manager: &pass::PassManager, module: &mut Module, line: u32) -> Result<(), melior::Error> {
+/// Runs one stage of `lower_to_llvm`: the textual pipeline `pipeline`
+/// (`builtin.module(...)`), through the shim, timed and with cleave's pass
+/// statistics printed under `CLEAVE_TIME_STAGES=1`. `what` names the stage in
+/// an error.
+fn run_stage(module: &mut Module, what: &str, pipeline: &str) -> Result<(), Vec<String>> {
     let start = std::time::Instant::now();
-    let result = pass_manager.run(module);
-    report_stage(&format!("pipeline.rs:{line}"), start);
-    result
+    // SAFETY: `module` is a valid module, borrowed mutably here.
+    let result = unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), pipeline, time_stages()) };
+    report_stage(what, start);
+    result.map_err(|e| {
+        vec![if e.is_empty() {
+            format!("MLIR-to-LLVM lowering pass failed ({what})")
+        } else {
+            format!("MLIR-to-LLVM lowering: invalid pipeline for {what}: {e}")
+        }]
+    })
 }
 
 pub fn lower_to_llvm<'c>(
@@ -1287,25 +892,15 @@ pub fn lower_to_llvm<'c>(
     // fixed.
     // Always, `--no-inline` included: it also marks the functions LLVM's own
     // inliner must leave alone (`apply_no_inline`, end of this function).
-    {
-        let kept = unsafe {
-            cleave_mlir_shim::limit_inlining(module.as_operation().to_raw(), options.inline_threshold as i64)
-        };
-        if time_stages() {
-            eprintln!("cleave stage: calls kept out of line (inline threshold {}): {kept}", options.inline_threshold);
-        }
-    }
-    let pass_manager = pass::PassManager::new(context);
-    if options.inline {
-        pass_manager.add_pass(pass::transform::create_inliner());
-    }
-    pass_manager.add_pass(pass::linalg::create_convert_elementwise_to_linalg_pass());
-    pass_manager.add_pass(pass::linalg::create_linalg_elementwise_op_fusion_pass());
-    if timed_run(&pass_manager, &mut *module, line!()).is_err() {
-        return Err(vec![
-            "MLIR-to-LLVM lowering pass failed (inline/elementwise-to-linalg/fuse)".to_string(),
-        ]);
-    }
+    run_stage(
+        module,
+        "inline/elementwise-to-linalg/fuse",
+        &format!(
+            "builtin.module(cleave-limit-inlining{{threshold={}}},{}convert-elementwise-to-linalg,linalg-fuse-elementwise-ops)",
+            options.inline_threshold,
+            if options.inline { "inline," } else { "" },
+        ),
+    )?;
 
     // TEMP EXPERIMENT (`doc/backlog.md`, register-residency + FMA + real
     // OpenMP parallelism, all three, on the matmul specifically): tile the
@@ -1340,49 +935,30 @@ pub fn lower_to_llvm<'c>(
     // binary (`matmul_schedule_path`): it was read at run time from this
     // crate's source directory, so a `cleave` binary moved away from its
     // checkout couldn't compile a matmul.
-    let pass_manager = pass::PassManager::new(context);
     // The BLAS tier (`stdlib/linalg/matrix.cleave`, above `BLAS_MIN_WORK`):
     // each product's elementwise consumer tiled by rows with the product
     // fused in, then every marked product a `sgemm` call, before the
-    // schedule below vectorizes the `linalg` tier's.
-    {
-        let raw = module.as_operation().to_raw();
-        let fused = unsafe { cleave_mlir_shim::blas_tile_and_fuse(raw, BLAS_TILE_ROWS) };
-        let lowered = unsafe { cleave_mlir_shim::lower_blas_matmuls(raw) };
-        if time_stages() {
-            eprintln!("cleave stage: BLAS products: {lowered}, fused with their consumer: {fused}");
-        }
+    // schedule vectorizes the `linalg` tier's.
+    // SAFETY: `context` is the module's, used by this thread only.
+    if !unsafe {
+        cleave_mlir_shim::load_transform_library(context.to_raw(), MATMUL_SCHEDULE, "matmul_vectorize.transform.mlir")
+    } {
+        return Err(vec!["failed to load the matmul schedule".to_string()]);
     }
-    let schedule = matmul_schedule_path().map_err(|e| vec![e])?;
-    if parse_pass_pipeline(
-        pass_manager.as_operation_pass_manager(),
+    run_stage(
+        module,
+        "BLAS tier, transform-dialect tile/vectorize",
         &format!(
-            "builtin.module(transform-preload-library{{transform-library-paths={schedule}}},transform-interpreter{{entry-point=__transform_main}})",
+            "builtin.module(cleave-blas-tile-and-fuse{{rows={BLAS_TILE_ROWS}}},cleave-lower-blas-matmuls,transform-interpreter{{entry-point=__transform_main}})"
         ),
-    )
-    .is_err()
-        || timed_run(&pass_manager, &mut *module, line!()).is_err()
-    {
-        return Err(vec![
-            "MLIR-to-LLVM lowering pass failed (transform-dialect tile/vectorize)".to_string(),
-        ]);
-    }
+    )?;
 
-    let pass_manager = pass::PassManager::new(context);
-    pass_manager.add_pass(pass::transform::create_loop_invariant_subset_hoisting());
-    if timed_run(&pass_manager, &mut *module, line!()).is_err() {
-        return Err(vec![
-            "MLIR-to-LLVM lowering pass failed (loop-invariant-subset-hoisting)".to_string(),
-        ]);
-    }
+    run_stage(module, "loop-invariant-subset-hoisting", "builtin.module(loop-invariant-subset-hoisting)")?;
 
     // An elementwise op writing a fresh tensor while one of its operands, a
     // local result, dies there: it writes into that operand
     // (`cleave_mlir_shim::reuse_dying_inputs`), one buffer fewer alive.
-    let reused = unsafe { cleave_mlir_shim::reuse_dying_inputs(module.as_operation().to_raw()) };
-    if time_stages() {
-        eprintln!("cleave stage: elementwise results written into a dying operand: {reused}");
-    }
+    run_stage(module, "reuse dying inputs", "builtin.module(cleave-reuse-dying-inputs)")?;
 
     // `CLEAVE_DUMP_PRE_BUFFERIZE=<path>` -- the still-tensor-typed IR, as
     // `mlir_lower.rs` emitted it, immediately before one-shot-bufferize
@@ -1399,7 +975,6 @@ pub fn lower_to_llvm<'c>(
             .unwrap_or_else(|e| eprintln!("CLEAVE_DUMP_PRE_BUFFERIZE: failed to write {path}: {e}"));
     }
 
-    let pass_manager = pass::PassManager::new(context);
     // `eliminate-empty-tensors` first: it is what lets a struct field's own
     // `materialize_in_destination` (`mlir_lower.rs::build_tensor_descriptor_
     // value`) turn the tensor's producer into a direct write into the field's
@@ -1414,26 +989,17 @@ pub fn lower_to_llvm<'c>(
     // equivalent to the corresponding iter bbArg"); with it, the loop's buffer
     // changes from one iteration to the next, and the ownership-based
     // deallocation below frees the one each iteration leaves behind.
-    if parse_pass_pipeline(
-        pass_manager.as_operation_pass_manager(),
+    run_stage(
+        module,
+        "one-shot-bufferize",
         "builtin.module(eliminate-empty-tensors,one-shot-bufferize{bufferize-function-boundaries=true function-boundary-type-conversion=identity-layout-map allow-return-allocs-from-loops=true})",
-    )
-    .is_err()
-        || timed_run(&pass_manager, &mut *module, line!()).is_err()
-    {
-        return Err(vec![
-            "MLIR-to-LLVM lowering pass failed (one-shot-bufferize)".to_string(),
-        ]);
-    }
+    )?;
 
     // A block of a buffer given to an extern as its destination (`sgemm`
     // into `Slice::slice(out, ...)`, put back by `Slice::update`): written
     // in place instead of copied out and back in
     // (`cleave_mlir_shim::elide_block_copies`).
-    let elided = unsafe { cleave_mlir_shim::elide_block_copies(module.as_operation().to_raw()) };
-    if time_stages() {
-        eprintln!("cleave stage: blocks written in place: {elided}");
-    }
+    run_stage(module, "elide block copies", "builtin.module(cleave-elide-block-copies)")?;
 
     // `--scf-forall-to-parallel` -- the *other* half of the real parallelism
     // fix, alongside `tile_using_forall` above: an `scf.forall` produced
@@ -1447,13 +1013,7 @@ pub fn lower_to_llvm<'c>(
     // Produces a real `scf.parallel`, which `--convert-scf-to-openmp`
     // (below, already the existing mechanism) picks up exactly like the
     // *old* path's `affine.parallel`-derived one.
-    let pass_manager = pass::PassManager::new(context);
-    pass_manager.add_pass(pass::scf::create_scf_forall_to_parallel_loop());
-    if timed_run(&pass_manager, &mut *module, line!()).is_err() {
-        return Err(vec![
-            "MLIR-to-LLVM lowering pass failed (scf-forall-to-parallel)".to_string(),
-        ]);
-    }
+    run_stage(module, "scf-forall-to-parallel", "builtin.module(scf-forall-to-parallel)")?;
 
     // Tensor *payload* deallocation — tried here twice before and
     // reverted both times (`doc/backlog.md`, "MLIR's own buffer-
@@ -1482,34 +1042,23 @@ pub fn lower_to_llvm<'c>(
     // (`hoist-static-allocs`: a result that was the callee's own fresh
     // `memref.alloc` is written straight into the caller's buffer, no copy in
     // the callee). Before the deallocation passes, which then see plain
-    // caller-owned buffers. `redundant_copy_elim::forward_out_param_copies`
+    // caller-owned buffers. `cleave-forward-out-param-copies`
     // then hands the call the final destination directly when the result was
     // only copied there (a struct field, a tuple element).
     // First, so a function returning a filled array (`Tensor(data: buf)`)
     // returns that array's own allocation, which the out-params pass then
     // hoists to the caller.
-    crate::redundant_copy_elim::forward_dead_source_copies(&mut *module);
-    let pass_manager = pass::PassManager::new(context);
-    if parse_pass_pipeline(
-        pass_manager.as_operation_pass_manager(),
+    run_stage(module, "forward dead source copies", "builtin.module(cleave-forward-dead-source-copies)")?;
+    run_stage(
+        module,
+        "buffer-results-to-out-params",
         "builtin.module(buffer-results-to-out-params{hoist-static-allocs=true})",
-    )
-    .is_err()
-        || timed_run(&pass_manager, &mut *module, line!()).is_err()
-    {
-        return Err(vec![
-            "MLIR-to-LLVM lowering pass failed (buffer-results-to-out-params)".to_string(),
-        ]);
-    }
-    crate::redundant_copy_elim::forward_out_param_copies(context, &mut *module);
+    )?;
+    run_stage(module, "forward out-param copies", "builtin.module(cleave-forward-out-param-copies)")?;
     // A result written into a fresh buffer of the out-parameter's type and
     // then copied into it: written into the out-parameter directly
     // (`cleave_mlir_shim::forward_copies_to_destinations`).
-    let forwarded =
-        unsafe { cleave_mlir_shim::forward_copies_to_destinations(module.as_operation().to_raw()) };
-    if time_stages() {
-        eprintln!("cleave stage: results written in their destination: {forwarded}");
-    }
+    run_stage(module, "forward copies to destinations", "builtin.module(cleave-forward-copies-to-destinations)")?;
     if let Ok(path) = std::env::var("CLEAVE_DUMP_POST_OUT_PARAMS") {
         std::fs::write(&path, module.as_operation().to_string())
             .unwrap_or_else(|e| eprintln!("CLEAVE_DUMP_POST_OUT_PARAMS: failed to write {path}: {e}"));
@@ -1518,36 +1067,20 @@ pub fn lower_to_llvm<'c>(
     // A loop yielding back the buffer it carries returns the buffer it was
     // given: said before the deallocation, whose alias analysis can't see
     // through a loop (`cleave_mlir_shim::fold_passthrough_iter_args`).
-    let folded = unsafe { cleave_mlir_shim::fold_passthrough_iter_args(module.as_operation().to_raw()) };
-    if time_stages() {
-        eprintln!("cleave stage: loop-carried values yielded back unchanged, removed: {folded}");
-    }
-    let pass_manager = pass::PassManager::new(context);
-    pass_manager.add_pass(pass::bufferization::create_ownership_based_buffer_deallocation_pass());
-    pass_manager.add_pass(pass::bufferization::create_buffer_deallocation_simplification_pass());
-    pass_manager.add_pass(pass::bufferization::create_lower_deallocations_pass());
-    if timed_run(&pass_manager, &mut *module, line!()).is_err() {
-        return Err(vec![
-            "MLIR-to-LLVM lowering pass failed (buffer-deallocation)".to_string(),
-        ]);
-    }
+    run_stage(module, "fold passthrough iter args", "builtin.module(cleave-fold-passthrough-iter-args)")?;
+    run_stage(
+        module,
+        "buffer-deallocation",
+        "builtin.module(ownership-based-buffer-deallocation,buffer-deallocation-simplification,bufferization-lower-deallocations)",
+    )?;
     // Adopted tensors (`PrimOp::Adopt`): the deallocation above took each for
     // a fresh buffer; it is a retain of the same one.
-    unsafe { cleave_mlir_shim::lower_adoptions(module.as_operation().to_raw()) };
+    run_stage(module, "lower adoptions", "builtin.module(cleave-lower-adoptions)")?;
     // Each buffer freed right after its last use, not at the end of its block
     // (`cleave_mlir_shim::dealloc_at_last_use`). Before the spawns are
     // lowered: a task's wait marker is a use of the buffers the task reads.
-    let moved = unsafe { cleave_mlir_shim::dealloc_at_last_use(module.as_operation().to_raw()) };
-    if time_stages() {
-        eprintln!("cleave stage: deallocations moved to the last use: {moved}");
-    }
-    let pass_manager = pass::PassManager::new(context);
-    pass_manager.add_pass(pass::conversion::create_bufferization_to_mem_ref());
-    if timed_run(&pass_manager, &mut *module, line!()).is_err() {
-        return Err(vec![
-            "MLIR-to-LLVM lowering pass failed (bufferization-to-memref)".to_string(),
-        ]);
-    }
+    run_stage(module, "dealloc at last use", "builtin.module(cleave-dealloc-at-last-use)")?;
+    run_stage(module, "bufferization-to-memref", "builtin.module(convert-bufferization-to-memref)")?;
 
     // `CLEAVE_DUMP_POST_DEALLOC=<path>` -- the other side of the boundary
     // `CLEAVE_DUMP_PRE_BUFFERIZE` above opens: the module right after
@@ -1559,9 +1092,7 @@ pub fn lower_to_llvm<'c>(
     // (`doc/plan-region-arena.md` §8.3).
     // `spawn`'s markers become OpenMP tasks, now that buffers and their
     // deallocations are placed (`cleave_mlir_shim::lower_spawns`).
-    if !unsafe { cleave_mlir_shim::lower_spawns(module.as_operation().to_raw(), options.tasks) } {
-        return Err(vec!["MLIR-to-LLVM lowering pass failed (spawn tasks)".to_string()]);
-    }
+    run_stage(module, "spawn tasks", &format!("builtin.module(cleave-lower-spawns{{tasks={}}})", options.tasks))?;
 
     if let Ok(path) = std::env::var("CLEAVE_DUMP_POST_DEALLOC") {
         std::fs::write(&path, module.as_operation().to_string())
@@ -1576,13 +1107,7 @@ pub fn lower_to_llvm<'c>(
     // and private. Not just tidiness: leaving these dead, now-unreferenced
     // declarations in place is exactly what made the structured-
     // vectorization stage below hard-fail (see its own doc comment).
-    let pass_manager = pass::PassManager::new(context);
-    pass_manager.add_pass(pass::transform::create_symbol_dce());
-    if timed_run(&pass_manager, &mut *module, line!()).is_err() {
-        return Err(vec![
-            "MLIR-to-LLVM lowering pass failed (symbol-dce)".to_string(),
-        ]);
-    }
+    run_stage(module, "symbol-dce", "builtin.module(symbol-dce)")?;
 
     // TEMP EXPERIMENT, continued: the transform-dialect-vectorized matmul
     // body is already fully vector-typed at this point (real `vector.
@@ -1593,22 +1118,16 @@ pub fn lower_to_llvm<'c>(
     // wasn't caught by the transform match, e.g. genuinely elementwise
     // ops). `--canonicalize` first, then `--lower-vector-multi-reduction`
     // for whatever reduction shape (if any) remains.
-    let pass_manager = pass::PassManager::new(context);
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
-    if parse_pass_pipeline(
-        pass_manager.as_operation_pass_manager(),
+    // `lower-vector-multi-reduction` alone: a `canonicalize` was added to this
+    // stage's pass manager before the pipeline was parsed into it, which
+    // replaced it, so it never ran. Kept as it ran, the output unchanged.
+    run_stage(
+        module,
+        "lower-vector-multi-reduction",
         "builtin.module(func.func(lower-vector-multi-reduction))",
-    )
-    .is_err()
-        || timed_run(&pass_manager, &mut *module, line!()).is_err()
-    {
-        return Err(vec![
-            "MLIR-to-LLVM lowering pass failed (canonicalize/lower-vector-multi-reduction)"
-                .to_string(),
-        ]);
-    }
+    )?;
 
-    // `--cse`, then `redundant_copy_elim::eliminate_self_copies` -- see that
+    // `--cse`, then `cleave-eliminate-self-copies` -- see that
     // module's own doc comment for the full story (a real, VTune-confirmed
     // cost: a genuine `memref.copy %x, %x` no-op, left behind by One-Shot
     // Bufferize's own materialization of the matmul-tiling stage's own
@@ -1620,15 +1139,11 @@ pub fn lower_to_llvm<'c>(
     // merges them -- confirmed directly, on an isolated probe, that the
     // self-copy this pass targets doesn't even exist in the IR at all until
     // CSE has already run once.
-    let pass_manager = pass::PassManager::new(context);
-    pass_manager.add_pass(pass::transform::create_cse());
-    if timed_run(&pass_manager, &mut *module, line!()).is_err() {
-        return Err(vec!["MLIR-to-LLVM lowering pass failed (cse)".to_string()]);
-    }
-    eliminate_self_copies(context, &mut *module);
+    run_stage(module, "cse", "builtin.module(cse)")?;
+    run_stage(module, "eliminate self copies", "builtin.module(cleave-eliminate-self-copies)")?;
     // Partial-tile write-backs, before the affine pass rejects them
-    // (`redundant_copy_elim::lower_dynamic_copies`).
-    crate::redundant_copy_elim::lower_dynamic_copies(context, &mut *module);
+    // (`cleave-lower-dynamic-copies`).
+    run_stage(module, "lower dynamic copies", "builtin.module(cleave-lower-dynamic-copies)")?;
 
     // `--expand-strided-metadata` turns `memref.subview`'s own dynamic
     // offset/stride metadata (from the tiling above) into plain arithmetic
@@ -1636,29 +1151,18 @@ pub fn lower_to_llvm<'c>(
     // it can convert. It itself emits `affine.apply`, hence `--lower-
     // affine` immediately after. A final `--canonicalize` cleans up the
     // arithmetic both passes leave behind.
-    let pass_manager = pass::PassManager::new(context);
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
-    pass_manager.add_pass(pass::memref::create_expand_strided_metadata_pass());
-    pass_manager.add_pass(pass::conversion::create_lower_affine());
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
-    if timed_run(&pass_manager, &mut *module, line!()).is_err() {
-        return Err(vec![
-            "MLIR-to-LLVM lowering pass failed (expand-strided-metadata/lower-affine)".to_string(),
-        ]);
-    }
+    run_stage(
+        module,
+        "expand-strided-metadata/lower-affine",
+        "builtin.module(canonicalize,expand-strided-metadata,lower-affine,canonicalize)",
+    )?;
 
     // `--convert-vector-to-scf` -- the piece `--canonicalize` above never
     // touched: handles the genuinely N-D `vector<1x16x16xf32>` *load*
     // shapes (`vector.transfer_read`) directly, ahead of the ordinary
     // `--convert-vector-to-llvm` further below in the final lowering
     // stage.
-    let pass_manager = pass::PassManager::new(context);
-    pass_manager.add_pass(pass::conversion::create_vector_to_scf());
-    if timed_run(&pass_manager, &mut *module, line!()).is_err() {
-        return Err(vec![
-            "MLIR-to-LLVM lowering pass failed (vector-to-scf)".to_string(),
-        ]);
-    }
+    run_stage(module, "vector-to-scf", "builtin.module(convert-vector-to-scf)")?;
 
     // `--convert-linalg-to-affine-loops`, not the ordinary `-to-loops`
     // (`scf.for`) -- see the structured-vectorization stage right below for
@@ -1670,18 +1174,8 @@ pub fn lower_to_llvm<'c>(
     // buffer it is a view of instead, at offset indices, so that its memrefs
     // have the plain layout `--affine-super-vectorize` needs (it leaves a
     // loop over any other scalar).
-    let pass_manager = pass::PassManager::new(context);
-    pass_manager.add_pass(pass::linalg::create_convert_linalg_to_affine_loops_pass());
-    if timed_run(&pass_manager, &mut *module, line!()).is_err() {
-        return Err(vec![
-            "MLIR-to-LLVM lowering pass failed (linalg-to-affine-loops)".to_string(),
-        ]);
-    }
-    let pass_manager = pass::PassManager::new(context);
-    pass_manager.nested_under("func.func").add_pass(pass::affine::create_affine_fold_mem_ref_alias_ops());
-    if timed_run(&pass_manager, &mut *module, line!()).is_err() {
-        return Err(vec!["MLIR-to-LLVM lowering pass failed (affine-fold-memref-alias-ops)".to_string()]);
-    }
+    run_stage(module, "linalg-to-affine-loops", "builtin.module(convert-linalg-to-affine-loops)")?;
+    run_stage(module, "affine-fold-memref-alias-ops", "builtin.module(func.func(affine-fold-memref-alias-ops))")?;
 
     // OpenMP parallelization -- marks every linalg-derived loop nest's own
     // *outermost* dimension `affine.parallel` when it's genuinely safe (no
@@ -1724,18 +1218,7 @@ pub fn lower_to_llvm<'c>(
     // Gated on `options.openmp` -- see `CodegenOptions::openmp`'s own doc
     // comment for the default split (AOT `true`, JIT `false`) and why.
     if options.openmp {
-        let pass_manager = pass::PassManager::new(context);
-        if parse_pass_pipeline(
-            pass_manager.as_operation_pass_manager(),
-            "builtin.module(func.func(affine-parallelize{max-nested=1}))",
-        )
-        .is_err()
-            || timed_run(&pass_manager, &mut *module, line!()).is_err()
-        {
-            return Err(vec![
-                "MLIR-to-LLVM lowering pass failed (affine-parallelize)".to_string(),
-            ]);
-        }
+        run_stage(module, "affine-parallelize", "builtin.module(func.func(affine-parallelize{max-nested=1}))")?;
     }
 
     // FMA fusion -- found by disassembling a real emitted object file
@@ -1771,7 +1254,7 @@ pub fn lower_to_llvm<'c>(
     // easy-to-pack `fmul`/`fadd` pair, and only the final instruction-
     // selection step -- which already knows the target has native packed
     // FMA -- decides to fuse, on the now-already-vectorized form).
-    mark_mulf_addf_contract(context, &mut *module);
+    run_stage(module, "mark contract", "builtin.module(cleave-mark-contract)")?;
 
     // Structured vectorization -- found and verified directly against this
     // toolchain, not assumed: `--affine-super-vectorize` (MLIR's own
@@ -1819,22 +1302,16 @@ pub fn lower_to_llvm<'c>(
     // scalar, for LLVM's loop vectorizer (its strides are static), and
     // reports it as an `error:` diagnostic while succeeding. Not an error
     // here: that one diagnostic is dropped while the pass runs.
-    let pass_manager = pass::PassManager::new(context);
     let skipped_strided_loop = context.attach_diagnostic_handler(|diagnostic| {
         diagnostic.to_string().contains("NYI: non-trivial layout map")
     });
-    let vectorized = parse_pass_pipeline(
-        pass_manager.as_operation_pass_manager(),
+    let vectorized = run_stage(
+        module,
+        "affine-super-vectorize",
         "builtin.module(func.func(affine-super-vectorize{virtual-vector-size=16}))",
-    )
-    .is_ok()
-        && timed_run(&pass_manager, &mut *module, line!()).is_ok();
+    );
     context.detach_diagnostic_handler(skipped_strided_loop);
-    if !vectorized {
-        return Err(vec![
-            "MLIR-to-LLVM lowering pass failed (affine-super-vectorize)".to_string(),
-        ]);
-    }
+    vectorized?;
 
     // `--convert-vector-to-scf` again, now on what `--affine-super-
     // vectorize` just produced (the first run, before `--convert-linalg-to-
@@ -1852,27 +1329,14 @@ pub fn lower_to_llvm<'c>(
     // outright, no diagnostic (found compiling a non-inlined
     // `matmul_transpose_b<8x16, 8x16>`, i.e. any kernel built `--no-inline`;
     // inlining had happened to route those loops elsewhere).
-    let pass_manager = pass::PassManager::new(context);
-    if has_permuted_transfer(module.as_operation()) && parse_pass_pipeline(
-        pass_manager.as_operation_pass_manager(),
-        "builtin.module(func.func(convert-vector-to-scf{target-rank=0}))",
-    )
-    .is_err()
-        || has_permuted_transfer(module.as_operation()) && timed_run(&pass_manager, &mut *module, line!()).is_err()
-    {
-        return Err(vec![
-            "MLIR-to-LLVM lowering pass failed (vector-to-scf after super-vectorize)".to_string(),
-        ]);
-    }
+    run_stage(module, "vector-to-scf after super-vectorize", "builtin.module(cleave-lower-permuted-transfers)")?;
 
     // `tanh`/`exp`/`log` as polynomial approximations, now that the element-
     // wise ops are vectors: left to `--convert-math-to-llvm`, a `math.tanh`
     // on a `vector<1024xf32>` became 1024 calls to libm's `tanhf` (LLVM has
     // no vector math library here), 26% of a nanoLM training step.
     // `cleave-mlir-shim`'s `cleaveApproximateMath` has the details.
-    if !unsafe { cleave_mlir_shim::approximate_math(module.as_operation().to_raw()) } {
-        return Err(vec!["MLIR-to-LLVM lowering pass failed (math approximation)".to_string()]);
-    }
+    run_stage(module, "math approximation", "builtin.module(cleave-approximate-math)")?;
 
     // One shared scalar lowering pipeline from here on, `options.openmp`
     // only ever inserting the two genuinely OpenMP-specific pieces into it
@@ -1900,15 +1364,9 @@ pub fn lower_to_llvm<'c>(
     // leaves *some* `affine.for` behind regardless. Run strictly before
     // `--convert-scf-to-openmp` below when that runs at all -- that pass's
     // own `scf.parallel` lowering needs to see it, not `affine.parallel`.
-    let pass_manager = pass::PassManager::new(context);
-    pass_manager.add_pass(pass::conversion::create_lower_affine());
-    if timed_run(&pass_manager, &mut *module, line!()).is_err() {
-        return Err(vec![
-            "MLIR-to-LLVM lowering pass failed (lower-affine)".to_string(),
-        ]);
-    }
+    run_stage(module, "lower-affine", "builtin.module(lower-affine)")?;
 
-    // See `insert_stack_scopes_in_loops`'s own doc comment for the full
+    // See `cleave-insert-stack-scopes` (`cleave-mlir-shim`) for the full
     // story -- the general insertion point, found after auditing every
     // loop-producing pass in this whole function rather than reacting to
     // individual crashes one at a time (`doc/backlog.md`'s own entry on
@@ -1940,7 +1398,7 @@ pub fn lower_to_llvm<'c>(
     // 1's own parallel tiling would ever produce, neither of which exists
     // in loop form until later passes run -- a real, found-by-audit gap
     // this move closes, not (yet) a gap any specific crash had exposed.
-    insert_stack_scopes_in_loops(context, module.as_operation_mut());
+    run_stage(module, "stack scopes in loops", "builtin.module(cleave-insert-stack-scopes)")?;
 
     if options.openmp {
         // `--convert-scf-to-openmp` -- the one pass in this whole stage that
@@ -1977,21 +1435,12 @@ pub fn lower_to_llvm<'c>(
         // whether or not this branch ever runs) needs the identical two-phase
         // treatment either way; `options.openmp` only decides whether an
         // `omp.parallel` region also happens to sit inside it.
-        let pass_manager = pass::PassManager::new(context);
-        pass_manager.add_pass(pass::conversion::create_scf_to_open_mp());
-        if timed_run(&pass_manager, &mut *module, line!()).is_err() {
-            return Err(vec![
-                "MLIR-to-LLVM lowering pass failed (scf-to-openmp)".to_string(),
-            ]);
-        }
+        run_stage(module, "scf-to-openmp", "builtin.module(convert-scf-to-openmp)")?;
     }
 
     // Every parallel region's members place themselves one per physical core
     // (`cleave_mlir_shim::bind_teams`, `cleave-rt`'s `cleave_bind_worker`).
-    let teams = unsafe { cleave_mlir_shim::bind_teams(module.as_operation().to_raw()) };
-    if time_stages() {
-        eprintln!("cleave stage: parallel regions placing their threads: {teams}");
-    }
+    run_stage(module, "bind teams", "builtin.module(cleave-bind-teams)")?;
 
     // First `--convert-to-llvm`: alongside `--convert-vector-to-llvm`
     // (unchanged from before OpenMP support existed) and, only when
@@ -2004,18 +1453,15 @@ pub fn lower_to_llvm<'c>(
     // needs to run this early regardless of `options.openmp`: one-shot-
     // bufferize inserts that construct unconditionally, not only when an
     // `omp.parallel` region happens to sit inside it.
-    let pass_manager = pass::PassManager::new(context);
-    pass_manager.add_pass(pass::conversion::create_vector_to_llvm());
     // `--openmp`'s parallel loops, or `spawn`'s tasks (`lower_spawns`).
-    if options.openmp || has_openmp_ops(module.as_operation()) {
-        pass_manager.add_pass(pass::conversion::create_open_mp_to_llvm());
-    }
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
-    if timed_run(&pass_manager, &mut *module, line!()).is_err() {
-        return Err(vec![
-            "MLIR-to-LLVM lowering pass failed (vector/openmp/to-llvm)".to_string(),
-        ]);
-    }
+    run_stage(
+        module,
+        "vector/openmp/to-llvm",
+        &format!(
+            "builtin.module(convert-vector-to-llvm,cleave-convert-openmp-if-used{{always={}}},convert-to-llvm)",
+            options.openmp
+        ),
+    )?;
 
     // `--convert-scf-to-cf` now finishes off the remaining nested `scf.for`
     // loops (`memref.alloca_scope` is gone, so its single-block constraint
@@ -2027,16 +1473,11 @@ pub fn lower_to_llvm<'c>(
     // wsloop`/`omp.loop_nest` themselves are still present in the module at
     // this point, expected, not a bug, see `register_all_llvm_
     // translations`'s own comment; when it isn't, there never were any.
-    let pass_manager = pass::PassManager::new(context);
-    pass_manager.add_pass(pass::conversion::create_scf_to_control_flow());
-    pass_manager.add_pass(pass::conversion::create_finalize_mem_ref_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_to_llvm());
-    pass_manager.add_pass(pass::conversion::create_reconcile_unrealized_casts());
-    if timed_run(&pass_manager, &mut *module, line!()).is_err() {
-        return Err(vec![
-            "MLIR-to-LLVM lowering pass failed (scf-to-cf/to-llvm/reconcile)".to_string(),
-        ]);
-    }
+    run_stage(
+        module,
+        "scf-to-cf/to-llvm/reconcile",
+        "builtin.module(convert-scf-to-cf,finalize-memref-to-llvm,convert-to-llvm,reconcile-unrealized-casts)",
+    )?;
 
     // `llvm.emit_c_interface` (`lower_top_level_fn`'s own comment on it, put
     // only on `main`) makes the `--convert-to-llvm` above mint a
@@ -2051,15 +1492,13 @@ pub fn lower_to_llvm<'c>(
     // real user code -- nobody will ever want to set a breakpoint inside
     // `_mlir_ciface_main` -- so the fix is simply to strip all debug info
     // from its whole subtree before it ever reaches the verifier.
-    strip_ciface_wrapper_debug_info(context, module.as_operation_mut());
+    strip_ciface_wrapper_debug_info(module);
 
     // Gives cleave sole ownership of every tensor payload's own physical
-    // memory -- see `unify_alloc.rs`'s own module doc comment for why this
+    // memory -- see `cleave-unify-tensor-allocations` (`cleave-mlir-shim`) for why this
     // runs *here* specifically (right after `--convert-to-llvm`, not
     // before) and why a blanket rename is sound.
-    unify_tensor_allocations(context, &mut *module);
-
-    stamp_target_cpu(context, module, options)?;
+    run_stage(module, "unify tensor allocations", "builtin.module(cleave-unify-tensor-allocations)")?;
 
     // Emit `!llvm.module.flags` with `CodeView = 1` so the LLVM backend
     // writes CodeView (`.debug$S`/`.debug$T`, what a Windows `.pdb` is
@@ -2096,7 +1535,7 @@ pub fn lower_to_llvm<'c>(
     // those, per surviving `llvm.func`, with that function's own (already
     // good) location -- a profiler then attributes that code to the
     // function rather than to an unnamed address range.
-    backfill_all_unknown_locs(module.as_operation_mut());
+    run_stage(module, "backfill locations", "builtin.module(cleave-backfill-locations)")?;
 
     // Argument slots (`mlir_lower.rs::entry_alloca`): one the inliner carried
     // into a loop goes back to its function's entry block, and an ordinary
@@ -2105,19 +1544,16 @@ pub fn lower_to_llvm<'c>(
     // Large aggregates copied from memory to memory become `memcpy`s, not one
     // load and one store per scalar (`copy_aggregates_in_memory`); before
     // the slots get their lifetimes, which follow their uses.
-    let copies = unsafe {
-        cleave_mlir_shim::copy_aggregates_in_memory(
-            module.as_operation().to_raw(),
-            crate::mlir_lower::BY_POINTER_MIN_BYTES as i64,
-        )
-    };
-    if time_stages() {
-        eprintln!("cleave stage: aggregate copies made memcpy: {copies}");
-    }
-    unsafe { cleave_mlir_shim::hoist_arg_slots(module.as_operation().to_raw()) };
-    // The functions kept out of line by the inline threshold or
+    // Then the functions kept out of line by the inline threshold or
     // `#[no_inline]` stay out of line in LLVM too.
-    unsafe { cleave_mlir_shim::apply_no_inline(module.as_operation().to_raw()) };
+    run_stage(
+        module,
+        "aggregate copies, argument slots, no-inline",
+        &format!(
+            "builtin.module(cleave-copy-aggregates-in-memory{{min-bytes={}}},cleave-hoist-arg-slots,cleave-apply-no-inline)",
+            crate::mlir_lower::BY_POINTER_MIN_BYTES
+        ),
+    )?;
 
     Ok(())
 }
@@ -2136,280 +1572,29 @@ pub fn lower_to_llvm<'c>(
 /// onto every function, not just ones surviving `--inline`) needs to call
 /// this too, right after its own `--convert-to-llvm` sequence -- none of
 /// them go through `lower_to_llvm` itself.
-pub fn strip_ciface_wrapper_debug_info<'c>(context: &'c Context, op: OperationRefMut<'c, '_>) {
-    if matches!(op.name().as_string_ref().as_str(), Ok("llvm.func"))
-        && op
-            .attribute("sym_name")
-            .map(|a| a.to_string().contains("_mlir_ciface_"))
-            .unwrap_or(false)
-    {
-        force_location(op, Location::unknown(context));
-        return;
-    }
-    for region in op.regions() {
-        let mut next_block = region.first_block();
-        while let Some(block) = next_block {
-            let mut next_op = block.first_operation_mut();
-            while let Some(child) = next_op {
-                next_op = child.next_in_block_mut();
-                strip_ciface_wrapper_debug_info(context, child);
-            }
-            next_block = block.next_in_region();
-        }
-    }
+pub fn strip_ciface_wrapper_debug_info(module: &mut Module) {
+    // SAFETY: `module` is a valid module, borrowed mutably here.
+    unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), "builtin.module(cleave-strip-ciface-debug-info)", false) }
+        .expect("cleave-strip-ciface-debug-info");
 }
 
-/// Unconditionally overwrites `op`'s own location, and every op nested
-/// inside it, with `loc` -- the blunt counterpart to `backfill_unknown_locs`
-/// below (which only touches ops that don't already have a real line),
-/// used only on a `_mlir_ciface_*` wrapper's whole subtree.
-fn force_location<'c>(mut op: OperationRefMut<'c, '_>, loc: Location<'c>) {
-    op.set_location(loc);
-    for region in op.regions() {
-        let mut next_block = region.first_block();
-        while let Some(block) = next_block {
-            let mut next_op = block.first_operation_mut();
-            while let Some(child) = next_op {
-                next_op = child.next_in_block_mut();
-                force_location(child, loc);
-            }
-            next_block = block.next_in_region();
-        }
-    }
-}
-
-/// Pre-order walk: inside every `llvm.func` that has a body, back-fill any
-/// op whose location doesn't resolve to a real line anywhere
-/// (`has_real_line`) with the **nearest real location already seen in
-/// program order** — a finer floor than "the whole function is one line".
-/// Raised directly by the user, inspecting a real disassembly and unable to
-/// tell an MLIR-synthesized sequence (a tiled loop's own zero-fill seed, a
-/// vectorized epilogue's constant/broadcast — an op with no cleave-level
-/// counterpart to inherit a location from at all) apart from the real
-/// compute it sits next to, because both used to collapse onto the exact
-/// same single line (the function's own declaration). Now each synthesized
-/// run inherits whichever real, cleave-emitted op it was generated closest
-/// to in the lowered code, until the next real one is seen — still a floor,
-/// not genuine provenance (an op that never existed in cleave source
-/// structurally cannot have one), but one that at least separates "this
-/// belongs near the matmul" from "this belongs near the bias-add" instead
-/// of flattening an entire function to one address range.
-fn backfill_all_unknown_locs(op: OperationRefMut<'_, '_>) {
-    if matches!(op.name().as_string_ref().as_str(), Ok("llvm.func"))
-        && op.regions().any(|r| r.first_block().is_some())
-    {
-        let mut current = op.location();
-        for region in op.regions() {
-            let mut next_block = region.first_block();
-            while let Some(block) = next_block {
-                let mut next_op = block.first_operation_mut();
-                while let Some(child) = next_op {
-                    next_op = child.next_in_block_mut();
-                    backfill_unknown_locs(child, &mut current);
-                }
-                next_block = block.next_in_region();
-            }
-        }
-        return;
-    }
-    for region in op.regions() {
-        let mut next_block = region.first_block();
-        while let Some(block) = next_block {
-            let mut next_op = block.first_operation_mut();
-            while let Some(child) = next_op {
-                next_op = child.next_in_block_mut();
-                backfill_all_unknown_locs(child);
-            }
-            next_block = block.next_in_region();
-        }
-    }
-}
-
-/// Recursively give every op with a non-`FileLineColLoc` location (an
-/// `UnknownLoc` left by a lowering pass) `*current` — updated, in place, to
-/// the *most recent* real location this pre-order walk has actually seen
-/// (starting from the enclosing function's own declaration line, until the
-/// first real one is found) rather than a single fixed fallback for the
-/// whole function. See `backfill_all_unknown_locs`'s own doc comment for
-/// why: a coarse floor either way, but a per-neighborhood one now, not one
-/// shared identically by every synthesized op in the entire function body.
-fn backfill_unknown_locs<'c>(mut op: OperationRefMut<'c, '_>, current: &mut Location<'c>) {
-    if has_real_line(op.location()) {
-        *current = op.location();
-    } else {
-        op.set_location(*current);
-    }
-    for region in op.regions() {
-        let mut next_block = region.first_block();
-        while let Some(block) = next_block {
-            let mut next_op = block.first_operation_mut();
-            while let Some(child) = next_op {
-                next_op = child.next_in_block_mut();
-                backfill_unknown_locs(child, current);
-            }
-            next_block = block.next_in_region();
-        }
-    }
-}
-
-/// Stamps `llvm.func`'s own real `target_cpu`/`target_features` attributes
-/// (confirmed directly against this toolchain -- `mlir-opt` parses and
-/// round-trips `llvm.func @f() attributes { target_cpu = "...", target_
-/// features = #llvm.target_features<[...]> }` cleanly) onto every `llvm.
-/// func` in `module`, when `options` asks for either -- a no-op, matching
-/// this project's own previous, unexamined behavior exactly, when both are
-/// `None` (the default). Mirrors `mark_mulf_addf_contract`'s own established
-/// walk-the-module-by-hand shape above, just targeting `llvm.func` instead
-/// of `arith.mulf`/`arith.addf`, and necessarily running *after* `--convert-
-/// to-llvm` (above) -- `llvm.func` doesn't exist before that point, `func.
-/// func` does the same job pre-conversion but carries no such attribute.
-///
-/// `target_features`'s own raw text (`"+avx2,+fma"`, comma-separated,
-/// exactly what a user would type after `-mattr=` in `clang`/`llc`) is
-/// turned into the real `#llvm.target_features<[...]>` attribute syntax
-/// here, each entry individually quoted -- a malformed feature list is a
-/// real, reported `CodegenOptions`-level error (`Attribute::parse` failing),
-/// not a panic, unlike `mark_mulf_addf_contract`'s own fixed, always-valid
-/// literal.
-///
-/// **No longer a dead flag -- both stamped here *and* genuinely honored by
-/// the actual generated code.** These attributes are still stamped for
-/// round-trip/debugging value (a real `llvm.func` reader can see what was
-/// requested), but the actual JIT/object-emission `TargetMachine` (both
-/// here and in `main.rs`'s own `--run`) is now built by `cleave-mlir-shim`
-/// 's own `ExecutionEngine::new`, which threads `options.target_cpu`/
-/// `options.target_features` straight into `JITTargetMachineBuilder`
-/// itself -- `doc/backlog.md`'s own "the first real cleave shim function"
-/// entry has the full story (including a real, found-not-assumed pitfall:
-/// `detectHost()` also populates explicit host feature flags that silently
-/// out-rank a plain `setCPU` unless cleared first -- the shim already does
-/// this correctly, confirmed via three passing disassembly-based tests,
-/// `cleave-mlir-shim/tests/target_override.rs`).
-fn stamp_target_cpu<'c>(
-    context: &'c Context,
-    module: &mut Module<'c>,
-    options: &CodegenOptions,
-) -> Result<(), Vec<String>> {
-    if options.target_cpu.is_none() && options.target_features.is_none() {
-        return Ok(());
-    }
-    let target_cpu = match &options.target_cpu {
-        None => None,
-        Some(cpu) => {
-            // A function's `target-cpu` names a real processor: LLVM builds
-            // each function's subtarget from it, and warned "'native' is not
-            // a recognized processor" (four times per nanoLM compile) before
-            // falling back on the target machine's, which the shim already
-            // resolves from `native` the same way.
-            let cpu = if cpu == "native" { cleave_mlir_shim::host_cpu_name() } else { cpu.clone() };
-            Some(
-                Attribute::parse(context, &format!("\"{cpu}\""))
-                    .ok_or_else(|| vec![format!("invalid --target-cpu {cpu:?}")])?,
-            )
-        }
-    };
-    let target_features = match &options.target_features {
-        None => None,
-        Some(features) => {
-            let quoted: Vec<String> = features
-                .split(',')
-                .map(|f| format!("\"{}\"", f.trim()))
-                .collect();
-            Some(
-                Attribute::parse(
-                    context,
-                    &format!("#llvm.target_features<[{}]>", quoted.join(", ")),
-                )
-                .ok_or_else(|| vec![format!("invalid --target-features {features:?}")])?,
-            )
-        }
-    };
-    stamp_llvm_func_attrs(module.as_operation_mut(), target_cpu, target_features);
-    Ok(())
-}
-
-fn stamp_llvm_func_attrs<'c>(
-    mut op: OperationRefMut<'c, '_>,
-    target_cpu: Option<Attribute<'c>>,
-    target_features: Option<Attribute<'c>>,
-) {
-    if matches!(op.name().as_string_ref().as_str(), Ok("llvm.func")) {
-        if let Some(cpu) = target_cpu {
-            op.set_attribute("target_cpu", cpu);
-        }
-        if let Some(features) = target_features {
-            op.set_attribute("target_features", features);
-        }
-    }
-    for region in op.regions() {
-        let mut next_block = region.first_block();
-        while let Some(block) = next_block {
-            let mut next_op = block.first_operation_mut();
-            while let Some(child) = next_op {
-                next_op = child.next_in_block_mut();
-                stamp_llvm_func_attrs(child, target_cpu, target_features);
-            }
-            next_block = block.next_in_region();
-        }
-    }
-}
-
-/// `register_cleave_rt_symbols`'s own doc comment establishes that `Execution
-/// Engine::new`/`dump_to_object_file` needs *every* externally-called symbol
-/// resolvable at construction time, even for object-only emission where
-/// nothing is ever actually invoked through this engine instance — but that
-/// registration only ever covers `cleave-rt`'s own fixed, known set. A
-/// program declaring its *own* `extern fn` (real Rust interop, `examples/
-/// digits-interop/src/kernel.cleave` — the whole point of `export fn`/`--
-/// emit-object` existing at all: a consuming Rust crate provides its own
-/// externs, compiled into the *same final binary* by an ordinary linker
-/// afterward, not by this engine) has no way to satisfy that requirement at
-/// this point in the pipeline — the real implementation lives in the
-/// consuming crate, which hasn't even been compiled yet when this object is
-/// being emitted. Found for real, not hypothetical: the very first program
-/// with a genuinely custom `extern fn` (not one of `cleave-rt`'s own) hit
-/// exactly the `STATUS_STACK_BUFFER_OVERRUN` crash `register_cleave_rt_
-/// symbols`'s own doc comment already describes for the *known*-symbol case,
-/// just for an *unknown* one instead.
-///
-/// The fix mirrors that same doc comment's own confirmed finding — "the
-/// registered pointer only satisfies the engine's own internal requirement
-/// ... the actual object file is unaffected, still meant to be resolved
-/// later by a real linker" — so *what* gets registered here doesn't matter
-/// at all, only *that* something does: every `extern fn` in `program` not
-/// already in `KNOWN_CLEAVE_RT_SYMBOLS` gets the same inert stub pointer.
-/// The emitted object's own undefined relocation for that symbol is
-/// unaffected either way (confirmed the identical way that doc comment
-/// already did, via `llvm-nm`), so this is sound regardless of the stub's
-/// own signature mismatch against the real one.
-///
-/// SAFETY: `dummy_extern_stub`'s own address is a real, valid, live-for-the-
-/// whole-process function pointer — its signature never has to match the
-/// real extern's own, since it's provably never called through this engine.
-unsafe fn register_unresolved_extern_stubs(engine: &cleave_mlir_shim::ExecutionEngine, program: &Program) {
-    extern "C" fn dummy_extern_stub() {}
-    for item in &program.items {
-        let ItemKind::Fn(f) = &item.kind else {
-            continue;
-        };
-        if !f.is_extern {
-            continue;
-        }
-        let symbol = f.extern_symbol.as_deref().unwrap_or(&f.name);
-        if KNOWN_CLEAVE_RT_SYMBOLS.contains(&symbol) {
-            continue;
-        }
-        // SAFETY: forwarded from this function's own contract.
-        unsafe {
-            engine.register_symbol(symbol, dummy_extern_stub as *mut ());
-        }
-    }
+/// The target `options` ask for (`cleave_mlir_shim::Target`): for objects
+/// and JITs alike.
+pub fn target(options: &CodegenOptions) -> Result<cleave_mlir_shim::Target, Vec<String>> {
+    cleave_mlir_shim::Target::new(
+        options.target_cpu.as_deref(),
+        options.target_features.as_deref(),
+        options.opt_level as usize,
+        false,
+        options.llvm_loop_unroll,
+    )
+    .map_err(|e| vec![format!("invalid target: {e}")])
 }
 
 /// Builds the module (`lower_program` + verify), runs it through `lower_
-/// to_llvm`, and dumps a real `.o` to `object_path` via `ExecutionEngine::
-/// dump_to_object_file` -- the shared implementation behind `--emit-object`/
-/// `--emit-bindings`/`--emit-exe`/`cleave-build`.
+/// to_llvm`, and writes it as an object file at `object_path`, compiled for
+/// the target `options` ask for -- the shared implementation behind
+/// `--emit-object`/`--emit-bindings`/`--emit-exe`/`cleave-build`.
 fn emit_object(
     program: &Program,
     cps_program: &CpsProgram,
@@ -2456,165 +1641,18 @@ fn emit_object(
     }
     let start = std::time::Instant::now();
 
-    let engine = cleave_mlir_shim::ExecutionEngine::new(
-        module.to_raw(),
-        options.opt_level as usize,
-        &[],
-        true,
-        false,
-        options.target_cpu.as_deref().unwrap_or(""),
-        options.target_features.as_deref().unwrap_or(""),
-        options.llvm_loop_unroll,
-    );
-    // SAFETY: see `register_cleave_rt_symbols`'s own doc comment.
-    unsafe {
-        register_cleave_rt_symbols(&engine);
-        register_unresolved_extern_stubs(&engine, program);
-        if options.openmp || (options.tasks && crate::cps::uses_spawn(cps_program)) {
-            register_openmp_stub_symbols(&engine);
-        }
-    }
     let Some(object_path_str) = object_path.to_str() else {
         return Err(vec![format!(
             "object path {object_path:?} is not valid UTF-8"
         )]);
     };
-    engine.dump_to_object_file(object_path_str);
+    let target = target(options)?;
+    // SAFETY: `module` is a valid module, owned here.
+    unsafe { cleave_mlir_shim::emit_object(module.to_raw(), &target, object_path_str) }
+        .map_err(|e| vec![format!("failed to emit {object_path_str}: {e}")])?;
     report_stage("LLVM: translation, optimization, code generation", start);
     Ok(())
 }
-
-/// The exact same `ExecutionEngine::new`/`dump_to_object_file`-needs-every-
-/// symbol-resolvable-at-construction-time gap `register_cleave_rt_symbols`
-/// and `register_unresolved_extern_stubs` already document, hitting the
-/// OpenMP runtime this time — confirmed the identical way, by direct
-/// testing: the very first real `--emit-object` run through the new
-/// parallelization stage (`emit_object`'s own comment on `--convert-scf-to-
-/// openmp`) failed construction with `Symbols not found: [ __kmpc_barrier,
-/// __kmpc_for_static_fini, __kmpc_for_static_init_8u, __kmpc_fork_call,
-/// __kmpc_global_thread_num ]`. Same fix, same reasoning as `register_
-/// unresolved_extern_stubs`'s own doc comment: a dummy stub only has to
-/// satisfy this engine's own internal resolvability check — the emitted
-/// object's own undefined relocations for these symbols are unaffected
-/// (same `llvm-nm`-confirmed property), genuinely meant to be resolved by
-/// the real `libomp` at the final link step (`emit_exe`'s own `rustc`
-/// invocation needs `-l omp` added alongside `-l cleave_rt` for that to
-/// actually succeed — a real, separate follow-up, not yet done: today's
-/// `emit_exe` would produce an object file this engine happily emits, but
-/// fail to *link* into a runnable `.exe` without it).
-///
-/// The exact symbol set observed (5 names, one loop-bound index width) is
-/// widened here to cover every index-width/signedness variant `mlir-opt`'s
-/// `--convert-scf-to-openmp`/`OpenMPIRBuilder` can plausibly choose for a
-/// static-scheduled `omp.wsloop` with no reduction (this pipeline never
-/// enables `--parallel-reductions`, so the `__kmpc_reduce*` family is
-/// deliberately not included) — not something to special-case per kernel
-/// shape.
-unsafe fn register_openmp_stub_symbols(engine: &cleave_mlir_shim::ExecutionEngine) {
-    extern "C" fn dummy_openmp_stub() {}
-    const OPENMP_RUNTIME_SYMBOLS: &[&str] = &[
-        "__kmpc_fork_call",
-        "__kmpc_global_thread_num",
-        "__kmpc_for_static_init_4",
-        "__kmpc_for_static_init_4u",
-        "__kmpc_for_static_init_8",
-        "__kmpc_for_static_init_8u",
-        "__kmpc_for_static_fini",
-        "__kmpc_barrier",
-        // `spawn`'s tasks (`cleave_mlir_shim::lower_spawns`).
-        "__kmpc_omp_task_alloc",
-        "__kmpc_push_num_threads",
-        "__kmpc_omp_task",
-        "__kmpc_omp_task_with_deps",
-        "__kmpc_omp_taskwait",
-        "__kmpc_single",
-        "__kmpc_end_single",
-        "omp_in_parallel",
-        // Each team member's number, for its placement
-        // (`cleave_mlir_shim::bind_teams`).
-        "omp_get_thread_num",
-    ];
-    for symbol in OPENMP_RUNTIME_SYMBOLS {
-        // SAFETY: see this function's own doc comment -- mirrors `register_
-        // unresolved_extern_stubs`'s own, already-confirmed-sound argument.
-        unsafe {
-            engine.register_symbol(symbol, dummy_openmp_stub as *mut ());
-        }
-    }
-}
-
-/// Every symbol `register_cleave_rt_symbols` registers, by name — kept as an
-/// explicit, separate list (not derived from that function's own body)
-/// purely because the real registration there is one hardcoded `register_
-/// symbol` call per real function pointer, not a loop over data; a new
-/// `cleave-rt` extern needs a line added in *both* places (the doc comment
-/// on each cross-references the other).
-const KNOWN_CLEAVE_RT_SYMBOLS: &[&str] = &[
-    "memrefCopy",
-    "cleave_parallel_threads",
-    "cleave_bind_worker",
-    "rand_seed",
-    "rand_state",
-    "cleave_ckpt_create",
-    "cleave_ckpt_open",
-    "cleave_ckpt_close",
-    "cleave_ckpt_write_f32s",
-    "cleave_ckpt_read_f32s",
-    "cleave_ckpt_write_f32",
-    "cleave_ckpt_read_f32",
-    "cleave_ckpt_write_f64",
-    "cleave_ckpt_read_f64",
-    "cleave_ckpt_write_i32",
-    "cleave_ckpt_read_i32",
-    "cleave_ckpt_write_i64",
-    "cleave_ckpt_read_i64",
-    "rand_uniform_f32",
-    "rand_uniform_f64",
-    "rand_normal_f32",
-    "rand_normal_f64",
-    "print_i8",
-    "print_i16",
-    "print_i32",
-    "print_i64",
-    "print_f32",
-    "print_f64",
-    "print_bytes",
-    "print_dynarray_bytes",
-    "format_f32",
-    "format_f64",
-    "cleave_alloc",
-    "cleave_alloc_rc",
-    "cleave_retain",
-    "cleave_release",
-    "dynarray_alloc_i8",
-    "dynarray_grow_i8",
-    "dynarray_get_i8",
-    "dynarray_set_i8",
-    "dynarray_alloc_i16",
-    "dynarray_grow_i16",
-    "dynarray_get_i16",
-    "dynarray_set_i16",
-    "dynarray_alloc_i32",
-    "dynarray_grow_i32",
-    "dynarray_get_i32",
-    "dynarray_set_i32",
-    "dynarray_alloc_i64",
-    "dynarray_grow_i64",
-    "dynarray_get_i64",
-    "dynarray_set_i64",
-    "dynarray_alloc_f32",
-    "dynarray_grow_f32",
-    "dynarray_get_f32",
-    "dynarray_set_f32",
-    "dynarray_alloc_f64",
-    "dynarray_grow_f64",
-    "dynarray_get_f64",
-    "dynarray_set_f64",
-    "dynarray_alloc_ptr",
-    "dynarray_grow_ptr",
-    "dynarray_get_ptr",
-    "dynarray_set_ptr",
-];
 
 /// The fixed internal symbol cleave's own `fn main()` gets renamed to when
 /// compiling a standalone executable (`emit_exe` below) -- never seen by a
@@ -2724,10 +1762,8 @@ pub fn emit_exe(
         // on an `-msvc` target passes an `-l` name straight through to `link.
         // exe` as `NAME.lib` with no automatic prefix-stripping the way a GNU
         // linker would) -- needed whenever `emit_object`'s own OpenMP
-        // parallelization stage was exercised (`register_openmp_stub_
-        // symbols`'s own doc comment: the emitted object carries real,
-        // unresolved `__kmpc_*` relocations once any linalg-derived kernel
-        // exists and `options.openmp` was on). `MLIR_SYS_220_PREFIX` (`.cargo/
+        // parallelization stage or `spawn`'s tasks were used: the object then
+        // carries unresolved `__kmpc_*` relocations. `MLIR_SYS_220_PREFIX` (`.cargo/
         // config.toml`, the same env var `mlir-sys`'s own build script
         // already keys off of) is reused here rather than a second,
         // independently-maintained path -- `/lib` under it is exactly where

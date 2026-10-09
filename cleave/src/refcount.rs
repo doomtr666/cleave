@@ -90,7 +90,8 @@ use crate::cps::{CExpr, CFunDef, CTopLevelFn, CVal, CVar, CpsProgram, FreshVars,
 use crate::egraph::max_cvar_in_program;
 use crate::infer::Ty;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
+use crate::collections::{HashMap, HashSet};
 
 /// A light struct with at least this many tensor leaves is retained or
 /// released through its type's glue function (`leaf_glue`), not with its
@@ -244,7 +245,7 @@ pub(crate) fn is_handle_array(
 /// (`println` wrapping `Print::print`) proved the single-pass version
 /// unsound. See that function's own doc comment for the full story.)
 pub fn collect_constructed_struct_names(program: &CpsProgram) -> HashSet<String> {
-    let mut names = HashSet::new();
+    let mut names = HashSet::default();
     for f in &program.funcs {
         collect_constructed_in(&f.def.body, &mut names);
     }
@@ -293,7 +294,7 @@ fn collect_constructed_in(expr: &CExpr, names: &mut HashSet<String>) {
 /// binding, is completely unaffected — only the field-mutated struct's own
 /// name needs excluding, not everything that ever references it.
 pub fn collect_field_mutated_struct_names(program: &CpsProgram) -> HashSet<String> {
-    let mut names = HashSet::new();
+    let mut names = HashSet::default();
     for f in &program.funcs {
         collect_field_mutated_in(&f.def.body, &mut names);
     }
@@ -349,7 +350,7 @@ fn collect_field_mutated_in(expr: &CExpr, names: &mut HashSet<String>) {
 /// only the struct actually named at the boundary itself is excluded, not
 /// everything that references it.
 pub fn collect_extern_boundary_struct_names(program: &CpsProgram) -> HashSet<String> {
-    let mut names = HashSet::new();
+    let mut names = HashSet::default();
     for f in &program.funcs {
         collect_extern_boundary_in(&f.def.body, &mut names);
     }
@@ -427,8 +428,8 @@ fn as_var(v: &CVal) -> Option<CVar> {
 /// references alone.
 fn local_free_vars(def: &CFunDef, views: &TensorViews) -> (HashSet<CVar>, HashSet<String>, HashSet<CVar>) {
     let mut bound: HashSet<CVar> = def.params.iter().copied().collect();
-    let mut referenced: HashSet<CVar> = HashSet::new();
-    let mut func_labels: HashSet<String> = HashSet::new();
+    let mut referenced: HashSet<CVar> = HashSet::default();
+    let mut func_labels: HashSet<String> = HashSet::default();
     collect_bound_and_referenced(&def.body, &mut bound, &mut referenced, &mut func_labels);
     // A tensor view used here keeps its container alive here too
     // (`TensorViews`), and so does a view handed to this def by a jump.
@@ -490,7 +491,7 @@ impl TensorViews {
 
     fn build(top: &CTopLevelFn, var_types: &HashMap<CVar, Ty>, mlir_types: &HashMap<String, String>) -> Self {
         let mut views = TensorViews::default();
-        let mut loop_args = HashSet::new();
+        let mut loop_args = HashSet::default();
         collect_loop_args(&top.def.body, &loop_names(&top.def.body), &mut loop_args);
         views.collect_containers(&top.def.body, &loop_args, var_types, mlir_types);
         views.collect_handed(&top.def.body);
@@ -586,7 +587,7 @@ fn loop_names(e: &CExpr) -> HashSet<String> {
             }
         }
     }
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     walk(e, &mut out);
     out
 }
@@ -981,8 +982,8 @@ fn else_branch_of(body: &CExpr) -> &CExpr {
 /// if ..; d.w[0, 0] + e.w[0, 0]`), and `mnist-interop`'s gradient once it
 /// went through an `if`.
 fn collect_local_free_vars(top: &CTopLevelFn, views: &TensorViews, out: &mut HashMap<String, HashSet<CVar>>) {
-    let mut func_labels: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut bound: HashMap<String, HashSet<CVar>> = HashMap::new();
+    let mut func_labels: HashMap<String, HashSet<String>> = HashMap::default();
+    let mut bound: HashMap<String, HashSet<CVar>> = HashMap::default();
     walk_local_free_vars(&top.def.body, views, out, &mut func_labels, &mut bound);
     loop {
         let mut changed = false;
@@ -1067,7 +1068,7 @@ fn walk_local_free_vars(
 /// many, is done"), computed top-down, propagating each def's own already-
 /// claimed set down into whatever's nested inside it.
 fn collect_local_claim_vars(top: &CTopLevelFn, views: &TensorViews, out: &mut HashMap<String, HashSet<CVar>>) {
-    walk_local_claim_vars(&top.def.body, views, &HashSet::new(), out);
+    walk_local_claim_vars(&top.def.body, views, &HashSet::default(), out);
 }
 
 fn walk_local_claim_vars(
@@ -1125,7 +1126,7 @@ enum ValueDef {
 /// `CVar` is bound at most once, always *before* any later reference to it,
 /// so nothing here needs a fixpoint).
 fn collect_value_defs(top: &CTopLevelFn) -> HashMap<CVar, ValueDef> {
-    let mut defs = HashMap::new();
+    let mut defs = HashMap::default();
     walk_value_defs(&top.def.body, &mut defs);
     defs
 }
@@ -1444,13 +1445,13 @@ pub fn insert_refcounting(
         .funcs
         .into_iter()
         .map(|top| {
-            let mut var_types = HashMap::new();
-            let mut owned_origin = HashMap::new();
+            let mut var_types = HashMap::default();
+            let mut owned_origin = HashMap::default();
             collect_var_info(&top, &signatures, &mut var_types, &mut owned_origin);
-            let mut local_free_vars = HashMap::new();
+            let mut local_free_vars = HashMap::default();
             let views = TensorViews::build(&top, &var_types, mlir_types);
             collect_local_free_vars(&top, &views, &mut local_free_vars);
-            let mut local_claim_vars = HashMap::new();
+            let mut local_claim_vars = HashMap::default();
             collect_local_claim_vars(&top, &views, &mut local_claim_vars);
             let params: HashSet<CVar> = top.def.params.iter().copied().collect();
             let value_defs = collect_value_defs(&top);
@@ -1477,7 +1478,7 @@ pub fn insert_refcounting(
         })
         .collect::<Vec<_>>();
     let mut funcs = funcs;
-    let mut synthesized: HashSet<String> = HashSet::new();
+    let mut synthesized: HashSet<String> = HashSet::default();
     loop {
         let pending: Vec<(String, (Ty, bool))> = glue
             .borrow()
@@ -2040,7 +2041,7 @@ fn rewrite_body(
                         owned.into_iter().partition(|(v, _)| live.contains(v));
                     (to_release, transferred, arg_vars)
                 }
-                _ => (Vec::new(), owned, HashSet::new()),
+                _ => (Vec::new(), owned, HashSet::default()),
             };
 
             // The real callee's own name, and each literal argument's own
@@ -2083,7 +2084,7 @@ fn rewrite_body(
                 .into_iter()
                 .map(|def| {
                     let mut seed: Vec<(CVar, Ty)> = Vec::new();
-                    let mut seen: HashSet<CVar> = HashSet::new();
+                    let mut seen: HashSet<CVar> = HashSet::default();
                     if let Some(fv) = ctx.local_free_vars.get(&def.name) {
                         for (v, ty) in &join_owned {
                             if fv.contains(v) && seen.insert(*v) {
@@ -2105,6 +2106,11 @@ fn rewrite_body(
                     let needs_seed =
                         |ty: &Ty| ctx.is_rc(ty) || !ctx.light_release_leaves(ty).is_empty();
                     if let Some(fv) = ctx.local_claim_vars.get(&def.name) {
+                        // In variable order, not the set's: the order of the
+                        // releases emitted, so the compiler's output, must
+                        // not change from one run to the next.
+                        let mut fv: Vec<&CVar> = fv.iter().collect();
+                        fv.sort();
                         for v in fv {
                             if let Some(ty) = ctx.var_types.get(v) {
                                 if needs_seed(ty) && is_owned(v) && seen.insert(*v) {
@@ -2406,7 +2412,7 @@ fn rewrite_loop_condition_chain(
 /// own free variables — see the module's own doc comment for why both are
 /// needed.
 fn live_set(func: &CVal, args: &[CVal], ctx: &RefcountCtx) -> HashSet<CVar> {
-    let mut live: HashSet<CVar> = HashSet::new();
+    let mut live: HashSet<CVar> = HashSet::default();
     for v in std::iter::once(func).chain(args.iter()) {
         match v {
             CVal::Var(cv) => {
@@ -2450,9 +2456,9 @@ fn returned_join_params(top: &CTopLevelFn) -> HashSet<(String, usize)> {
         }
     }
     let mut apps = Vec::new();
-    let mut param_of = HashMap::new();
+    let mut param_of = HashMap::default();
     walk(&top.def.body, &mut apps, &mut param_of);
-    let mut returned = HashSet::new();
+    let mut returned = HashSet::default();
     loop {
         let before = returned.len();
         for &(func, args) in &apps {
@@ -2562,7 +2568,7 @@ fn releases_for_app(
 /// point, never across two different ones.
 fn wrap_releases(to_release: Vec<(CVar, Ty)>, inner: CExpr, ctx: &RefcountCtx, at_true_return: bool) -> CExpr {
     let mut result = inner;
-    let mut skip_once: HashSet<(CVar, Vec<String>)> = HashSet::new();
+    let mut skip_once: HashSet<(CVar, Vec<String>)> = HashSet::default();
     for (var, ty) in to_release.into_iter().rev() {
         // `is_bare_tensor_ty` alongside `is_rc` here — a bare `Tensor`
         // (never wrapped in any struct) needs the identical plain `Release`

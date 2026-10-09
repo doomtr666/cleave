@@ -1510,7 +1510,7 @@ pub extern "C" fn cleave_region_exit(handle: i64) {
 
 /// `cleave_release`'s own `bool` result ("did this call actually free the
 /// block"), discarded — matches `free`'s own `(ptr) -> ()` C signature
-/// exactly. Exists purely so `unify_alloc.rs`'s own `llvm.call @free` ->
+/// exactly. Exists purely so `cleave-unify-tensor-allocations`'s `llvm.call @free` ->
 /// `llvm.call @cleave_release_void` rewrite can be a **plain callee-symbol
 /// rename**, nothing else: melior's own `remove_from_parent` is confirmed
 /// unsafe to call at all on real ops from this pipeline (found first on
@@ -1622,7 +1622,7 @@ pub unsafe extern "C" fn cleave_release_pool(ptr: *mut u8, data_size: i64) {
 // it**, which is the single most useful fact when diagnosing a double
 // release. `cleave_release` is only ever emitted by cleave's own CPS
 // refcounting (`refcount.rs`); `cleave_release_void` is only ever the
-// rename of bufferization's own `free` (`unify_alloc.rs`). A block that
+// rename of bufferization's own `free` (`cleave-unify-tensor-allocations`). A block that
 // receives one of each is, by definition, a CPS-vs-bufferization double-
 // ownership bug. Read by `CLEAVE_TRACE_SIZE`'s ledger and by `CLEAVE_
 // DEBUG_POOL`'s fatal message; thread-local because both entry points are

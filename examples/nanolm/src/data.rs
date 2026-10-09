@@ -128,7 +128,8 @@ mod tests {
 
     #[test]
     fn targets_are_inputs_shifted_by_one() {
-        let text: Vec<u16> = (0..1000).map(|k| (k % 100) as u16).collect();
+        // Longer than a sequence, whatever the kernel's `CONTEXT` (`T`).
+        let text: Vec<u16> = (0..4 * T).map(|k| (k % 100) as u16).collect();
         let mut x = vec![0; B * T];
         let mut y = vec![0; B * T];
         fill(&text, 7, 3, 0, &mut x);

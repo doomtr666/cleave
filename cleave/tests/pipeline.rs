@@ -19,20 +19,10 @@ fn build_exe(src: &str, exe_path: &std::path::Path) -> Result<(), Vec<String>> {
     )
 }
 
-/// Regression test for a real, direct-testing-found crash: `emit_object`
-/// (`pipeline.rs`) used to call `ExecutionEngine::new`/`dump_to_object_file`
-/// *without* registering `cleave-rt`'s own symbols by pointer -- fine for
-/// every earlier `--emit-object` test, which happened to only compile
-/// `export fn`s with no `extern fn` call in their own body, but a real,
-/// direct crash (`STATUS_STACK_BUFFER_OVERRUN`) the moment a compiled
-/// program's body actually called a real `extern fn` (`print_i32`, here):
-/// the JIT engine apparently still needs every externally-called symbol
-/// resolvable at construction time, even for object-only emission with no
-/// intent to ever invoke anything. A regression here would very likely
-/// crash the whole test process, not just fail an assertion -- an
-/// acceptable, visible way for this particular class of bug to surface in
-/// `cargo test`, matching how `tests/mlir_lower.rs`'s own end-to-end
-/// `extern fn` tests are already structured.
+/// An object for a program calling a `cleave-rt` `extern fn` (`print_i32`):
+/// the symbol is left for the linker. Object emission once went through a
+/// JIT, which needed every external symbol resolvable and crashed
+/// (`STATUS_STACK_BUFFER_OVERRUN`) on this program.
 #[test]
 fn emitting_an_object_for_a_program_that_calls_a_real_extern_fn_does_not_crash() {
     let dir = std::env::temp_dir().join(format!("cleave_pipeline_test_{}", std::process::id()));
@@ -61,18 +51,9 @@ fn emitting_an_object_for_a_program_that_calls_a_real_extern_fn_does_not_crash()
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Same shape as the test just above, but for a genuinely *custom* `extern
-/// fn` -- one not in `cleave-rt`'s own fixed set at all, the real-Rust-
-/// interop case (`examples/digits-interop`, a consuming crate providing its
-/// own externs, linked in by an ordinary linker only *after* this object is
-/// emitted). `register_cleave_rt_symbols` alone can't satisfy `melior::
-/// ExecutionEngine::new`'s own "every external symbol resolvable at
-/// construction time" requirement for a name it's never heard of -- found
-/// for real building `digits-interop`'s own data-loading kernel, the exact
-/// `STATUS_STACK_BUFFER_OVERRUN` crash `register_cleave_rt_symbols`'s own
-/// doc comment already describes for the *known*-symbol case, this time for
-/// an unknown one. Fixed by `register_unresolved_extern_stubs` (`pipeline.
-/// rs`), registering an inert stub for anything not already known.
+/// The same for an `extern fn` only the consuming program defines (Rust
+/// interop, `examples/digits-interop`): nothing to resolve it against at
+/// emission, the linker does it later.
 #[test]
 fn emitting_an_object_for_a_program_with_a_genuinely_custom_extern_fn_does_not_crash() {
     let dir = std::env::temp_dir().join(format!(
@@ -235,4 +216,24 @@ fn emit_exe_without_a_main_fn_is_a_clean_error() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A compilation is reproducible: the same program, compiled in three
+/// processes, gives the same MLIR. The compiler's hash maps used to iterate
+/// in a per-process order (`std`'s `RandomState`), and passes emitting code
+/// while iterating one (the releases of the values dying at a point, the
+/// terms of a derivative) emitted it in that order (`cleave::collections`).
+#[test]
+fn a_compilation_is_reproducible() {
+    let program = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/xor.cleave");
+    let dump = || {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"))
+            .args(["--dump-mlir", program])
+            .output()
+            .expect("cannot run cleave");
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        output.stdout
+    };
+    let first = dump();
+    assert!(dump() == first && dump() == first, "two compilations of the same program differ");
 }

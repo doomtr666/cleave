@@ -93,7 +93,7 @@ use crate::infer::{
 use std::cell::{Cell, RefCell};
 use crate::mlir_lower::struct_field_types;
 use crate::registry::Registry;
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 /// One concrete instantiation — of a top-level `fn` or of a generic
@@ -184,7 +184,7 @@ pub struct MonomorphizedProgram {
     /// reusing a `Specialization` — see its own doc comment for why) can
     /// still run the identical qualified-call discovery `collect_
     /// instantiations_expr` already does for every *reachability-driven*
-    /// specialization, instead of hardcoding `call_names: HashMap::new()`
+    /// specialization, instead of hardcoding `call_names: HashMap::default()`
     /// — a real, found-by-testing gap: a qualified call (`Transcendental::
     /// tanh(x)`) inside a fully-concrete impl's own body (`Activation<f64>
     /// ::tanh`, `stdlib/nn/nn.cleave`) was never discoverable at all
@@ -391,9 +391,9 @@ pub fn monomorphize(
     let lambda_exprs = index_lambda_exprs(program, &program_inference.lambda_schemes);
 
     let mut mono = MonomorphizedProgram {
-        specializations: HashMap::new(),
-        by_origin: HashMap::new(),
-        seed_call_names: HashMap::new(),
+        specializations: HashMap::default(),
+        by_origin: HashMap::default(),
+        seed_call_names: HashMap::default(),
         errors: template_errors,
         templates: templates.clone(),
     };
@@ -528,7 +528,7 @@ pub fn monomorphize(
             &program_inference.global_env,
             &templates,
             &program_inference.lambda_schemes,
-            HashMap::new(),
+            HashMap::default(),
             &mut fn_worklist,
             &mut impl_worklist,
             &mut lambda_worklist,
@@ -577,7 +577,7 @@ pub fn monomorphize(
             &program_inference.global_env,
             &templates,
             &program_inference.lambda_schemes,
-            HashMap::new(),
+            HashMap::default(),
             &mut fn_worklist,
             &mut impl_worklist,
             &mut lambda_worklist,
@@ -592,7 +592,7 @@ pub fn monomorphize(
     // lambdas. Every function and impl-method instance is inferred by
     // `engine`; lambdas are still specialized by substitution.
     // Lambdas of instance bodies, absorbed as the engine reports them.
-    let mut instance_lambda_exprs: HashMap<NodeId, Expr> = HashMap::new();
+    let mut instance_lambda_exprs: HashMap<NodeId, Expr> = HashMap::default();
     let absorb = |produced: &mut Produced,
                   program_inference: &mut ProgramInference,
                   exprs: &mut HashMap<NodeId, Expr>| {
@@ -704,13 +704,13 @@ pub fn monomorphize(
                 })
                 .collect();
 
-            let mut call_names = HashMap::new();
+            let mut call_names = HashMap::default();
             // Seeded with this lambda's own canonical self-name (recovered
             // above from `scope`, at whichever call site originally discovered
             // this specialization -- see `collect_instantiations_expr`'s own
             // `ExprKind::Call` arm) -- otherwise this re-walk, starting fresh,
             // could never resolve a self-recursive call inside `body` at all.
-            let mut initial_scope = HashMap::new();
+            let mut initial_scope = HashMap::default();
             initial_scope.insert(self_name, lambda_id);
             collect_instantiations(
                 &body,
@@ -841,7 +841,7 @@ fn build_impl_templates(
             // it. `derive_impl_instantiation` already gathers free vars from
             // exactly these three patterns unconditionally once `is_generic`
             // is true (see its own doc comment) — no other change needed.
-            let mut free = HashSet::new();
+            let mut free = HashSet::default();
             infer
                 .param_types
                 .iter()
@@ -919,7 +919,7 @@ fn index_lambda_exprs<'a>(
     program: &'a Program,
     lambda_schemes: &HashMap<NodeId, Scheme>,
 ) -> HashMap<NodeId, &'a Expr> {
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     for item in &program.items {
         let ItemKind::Fn(f) = &item.kind else {
             continue;
@@ -1339,9 +1339,9 @@ fn collect_instantiations_expr(
                         ImplMatch::FoundConcrete(idx) => {
                             call_names.insert(
                                 expr.id,
-                                display_impl_instantiation(&templates[idx], &HashMap::new()),
+                                display_impl_instantiation(&templates[idx], &HashMap::default()),
                             );
-                            impl_worklist.push((idx, HashMap::new()));
+                            impl_worklist.push((idx, HashMap::default()));
                         }
                         ImplMatch::NoCandidates => {} // type-checking already validated this qualified call; not expected, harmless if reached
                         ImplMatch::Ambiguous { algebra, candidates } => {
@@ -1594,7 +1594,7 @@ fn collect_instantiations_expr(
 /// instantiation` alone can't tell "genuinely concrete" from "still open"
 /// apart on its own.
 fn is_fully_concrete(ty: &Ty) -> bool {
-    let mut vars = HashSet::new();
+    let mut vars = HashSet::default();
     free_vars(ty, &mut vars);
     vars.is_empty()
 }
@@ -1924,7 +1924,7 @@ fn find_impl_for_target(
         if !bounds_satisfied {
             continue;
         }
-        let mut vars = HashSet::new();
+        let mut vars = HashSet::default();
         t.param_patterns
             .iter()
             .for_each(|p| free_vars(p, &mut vars));
@@ -1954,7 +1954,7 @@ fn find_impl_for_target(
         // not guessed, the same posture this whole function already takes
         // for a bounds mismatch just above.
         let fully_resolved = mapping.values().all(|resolved| {
-            let mut free = HashSet::new();
+            let mut free = HashSet::default();
             free_vars(resolved, &mut free);
             free.is_empty()
         });
@@ -2481,7 +2481,7 @@ fn seed_axiom_references(
         // guess (`fully_resolved` rejecting a leftover free `P`), silently
         // contributing nothing, no different in outcome from the earlier,
         // even-more-wrong bug this replaced.
-        let mut param_tys: HashMap<&str, Ty> = HashMap::new();
+        let mut param_tys: HashMap<&str, Ty> = HashMap::default();
         for side in [lhs, rhs] {
             seed_axiom_expr_references(
                 side,
@@ -3012,7 +3012,7 @@ fn derive_impl_instantiation_for(
             rejected.push(format!("{impl_name}: matches, but not its bounds ({})", unmet.join(", ")));
             continue;
         }
-        let mut vars = HashSet::new();
+        let mut vars = HashSet::default();
         t.param_patterns
             .iter()
             .for_each(|p| free_vars(p, &mut vars));
@@ -3436,7 +3436,7 @@ fn dump_concrete_impl(
                         &infer.param_types,
                         &ret,
                         &infer.node_types,
-                        &HashMap::new(),
+                        &HashMap::default(),
                     )
                 }
                 // A bodyless method (`#[mlir(...)]`-tagged) that type-checked
@@ -3690,8 +3690,8 @@ impl<'a> InstanceEngine<'a> {
             vars: Cell::new(vars),
             last_error: RefCell::new(None),
             next_node: Cell::new(1 << 30),
-            in_progress: RefCell::new(HashSet::new()),
-            done: RefCell::new(HashMap::new()),
+            in_progress: RefCell::new(HashSet::default()),
+            done: RefCell::new(HashMap::default()),
             produced: RefCell::new(Produced::default()),
         }
     }
@@ -3729,8 +3729,8 @@ impl<'a> InstanceEngine<'a> {
                         body: t.body.clone(),
                         param_types,
                         result: result.clone(),
-                        node_types: HashMap::new(),
-                        call_names: HashMap::new(),
+                        node_types: HashMap::default(),
+                        call_names: HashMap::default(),
                         is_extern: true,
                         extern_symbol: t.extern_symbol.clone(),
                         is_pure: t.is_pure,
@@ -3779,13 +3779,13 @@ impl<'a> InstanceEngine<'a> {
         let mut decl = t.decl.clone();
         let (infer, outcome) = self.infer_unrolling(&mut decl, |infer, decl| {
             // Targets the call left open become this session's own variables.
-            let mut open: HashMap<TyVar, Ty> = HashMap::new();
+            let mut open: HashMap<TyVar, Ty> = HashMap::default();
             let target_tys: Vec<Ty> = t
                 .target_patterns
                 .iter()
                 .map(|p| {
                     let ty = substitute(p, mapping);
-                    let mut fv = HashSet::new();
+                    let mut fv = HashSet::default();
                     free_vars(&ty, &mut fv);
                     for v in fv {
                         open.entry(v).or_insert_with(|| infer.fresh_var());
@@ -3838,14 +3838,14 @@ impl<'a> InstanceEngine<'a> {
             &Ty::Fn(infer.param_types.clone(), Box::new(result.clone())),
         )
         .ok()?;
-        let mut vars = HashSet::new();
+        let mut vars = HashSet::default();
         t.target_patterns.iter().for_each(|p| free_vars(p, &mut vars));
         let final_mapping: HashMap<TyVar, Ty> =
             vars.into_iter().map(|v| (v, trial.apply(&Ty::Var(v)))).collect();
         let target_tys: Vec<Ty> = t.target_patterns.iter().map(|p| substitute(p, &final_mapping)).collect();
         let display = display_impl_instantiation(t, &final_mapping);
 
-        let mut call_names = HashMap::new();
+        let mut call_names = HashMap::default();
         {
             let mut produced = self.produced.borrow_mut();
             let Produced {
@@ -3861,7 +3861,7 @@ impl<'a> InstanceEngine<'a> {
                 &self.global_env,
                 self.templates,
                 &lambda_schemes,
-                HashMap::new(),
+                HashMap::default(),
                 fn_worklist,
                 impl_worklist,
                 lambda_worklist,
@@ -4144,7 +4144,7 @@ impl InstanceEngine<'_> {
         }
         let display = display_instantiation(name, &concrete_tys);
 
-        let mut call_names = HashMap::new();
+        let mut call_names = HashMap::default();
         {
             let mut produced = self.produced.borrow_mut();
             let Produced {
@@ -4160,7 +4160,7 @@ impl InstanceEngine<'_> {
                 &self.global_env,
                 self.templates,
                 &lambda_schemes,
-                HashMap::new(),
+                HashMap::default(),
                 fn_worklist,
                 impl_worklist,
                 lambda_worklist,
@@ -4212,7 +4212,7 @@ impl InstanceOracle for InstanceEngine<'_> {
         match derive_impl_instantiation_for(self.templates, self.registry, Some(algebra), method, args, &ret) {
             ImplMatch::FoundConcrete(idx) => {
                 let t = &self.templates[idx];
-                Some((display_impl_instantiation(t, &HashMap::new()), t.ret_pattern.clone()))
+                Some((display_impl_instantiation(t, &HashMap::default()), t.ret_pattern.clone()))
             }
             ImplMatch::Found(idx, mapping) => self.specialize_impl(idx, &mapping, args),
             _ => None,

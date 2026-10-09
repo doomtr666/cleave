@@ -107,7 +107,7 @@ fn string_literal_bytes_each_get_a_distinct_node_id() {
     let f = lower_one_fn("fn f() { \"abc\" }");
     match &only_stmt_expr(&f.body).kind {
         ExprKind::ArrayLit(elems) => {
-            let ids: std::collections::HashSet<NodeId> = elems.iter().map(|e| e.id).collect();
+            let ids: cleave::collections::HashSet<NodeId> = elems.iter().map(|e| e.id).collect();
             assert_eq!(ids.len(), 3, "expected 3 distinct NodeIds, got {ids:?}");
         }
         other => panic!("expected ArrayLit, got {other:?}"),

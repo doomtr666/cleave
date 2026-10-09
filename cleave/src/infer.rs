@@ -77,7 +77,7 @@ use crate::ast::*;
 use crate::const_eval;
 use crate::print::fmt_type;
 use crate::registry::Registry;
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 // ---------------------------------------------------------------- types
 
@@ -1411,7 +1411,7 @@ impl Scheme {
             vars: Vec::new(),
             constraints: Vec::new(),
             ty,
-            const_widths: HashMap::new(),
+            const_widths: HashMap::default(),
             literal_defaults: Vec::new(),
             field_constraints: Vec::new(),
         }
@@ -2432,29 +2432,29 @@ impl<'r> Infer<'r> {
             pending_collect_defaults: Vec::new(),
             constraints: Vec::new(),
             registry,
-            node_types: HashMap::new(),
+            node_types: HashMap::default(),
             param_types: Vec::new(),
             target_types: Vec::new(),
-            active_generics: HashMap::new(),
-            active_const_types: HashMap::new(),
+            active_generics: HashMap::default(),
+            active_const_types: HashMap::default(),
             unroll_scopes: Vec::new(),
             unroll_requests: Vec::new(),
             undefaultable: Vec::new(),
             pending_comprehensions: Vec::new(),
             comprehension_indexed: Vec::new(),
-            opaque_comprehensions: HashSet::new(),
-            comprehension_ids: HashSet::new(),
-            type_packs: HashSet::new(),
+            opaque_comprehensions: HashSet::default(),
+            comprehension_ids: HashSet::default(),
+            type_packs: HashSet::default(),
             oracle: None,
             instance_calls: Vec::new(),
-            instance_call_names: HashMap::new(),
+            instance_call_names: HashMap::default(),
             last_scheme_instantiation: None,
-            quantified: HashSet::new(),
+            quantified: HashSet::default(),
             loop_stack: Vec::new(),
             pending_type_name_checks: Vec::new(),
             pending_div_by_zero_checks: Vec::new(),
-            lambda_schemes: HashMap::new(),
-            const_refs: HashMap::new(),
+            lambda_schemes: HashMap::default(),
+            const_refs: HashMap::default(),
             pending_field_accesses: Vec::new(),
             pending_indices: Vec::new(),
         }
@@ -2686,7 +2686,7 @@ impl<'r> Infer<'r> {
             .map(|g| self.generic_arg_to_ty(Some(pack_generic.name()), pack_generic.is_const(), g, span))
             .collect::<Result<Vec<Ty>, TypeError>>()?;
 
-        let mut seen: HashSet<String> = HashSet::new();
+        let mut seen: HashSet<String> = HashSet::default();
         for (name, value) in fields {
             let Some(decl_field) = declared_fields.iter().find(|f| &f.name == name).cloned() else {
                 return Err(TypeError {
@@ -2753,7 +2753,7 @@ impl<'r> Infer<'r> {
         fields: &[(String, Expr)],
         declared_fields: &[Field],
     ) -> Result<Ty, TypeError> {
-        let mut seen: HashSet<String> = HashSet::new();
+        let mut seen: HashSet<String> = HashSet::default();
         let mut values: Vec<(Field, Ty, Span)> = Vec::new();
         for (name, value) in fields {
             let Some(decl_field) = declared_fields.iter().find(|f| &f.name == name).cloned() else {
@@ -3327,7 +3327,7 @@ impl<'r> Infer<'r> {
     /// method alone only ever sees itself, never a sibling).
     pub fn infer_fn(&mut self, f: &FnDecl) -> Result<Ty, TypeError> {
         let (param_types, ret_var, generics) = self.fresh_fn_shape(f);
-        let mut outer = Env::new();
+        let mut outer = Env::default();
         outer.insert(
             f.name.clone(),
             Scheme::mono(Ty::Fn(param_types.clone(), Box::new(ret_var.clone()))),
@@ -3428,7 +3428,7 @@ impl<'r> Infer<'r> {
             .iter()
             .filter_map(|g| match g {
                 GenericParam::Const { name, ty, variadic: false } => {
-                    Some((name.clone(), self.ty_from_ast_mapped(ty, &HashMap::new())))
+                    Some((name.clone(), self.ty_from_ast_mapped(ty, &HashMap::default())))
                 }
                 _ => None,
             })
@@ -3550,7 +3550,7 @@ impl<'r> Infer<'r> {
         fallback_span: Span,
     ) -> Result<Ty, TypeError> {
         self.infer_impl_fn_generic_with_env(
-            &Env::new(),
+            &Env::default(),
             algebra,
             impl_generics,
             std::slice::from_ref(target),
@@ -3564,7 +3564,7 @@ impl<'r> Infer<'r> {
     /// `Scheme` (`callgraph::infer_program`'s own `global_env`), so an impl
     /// method's body can call an ordinary top-level function by name, not
     /// just dispatch other algebra operators through the registry. Without
-    /// this, `env` was always empty (`Env::new()`), and *any* call to a
+    /// this, `env` was always empty (`Env::default()`), and *any* call to a
     /// top-level `fn` from inside an impl method — even a wholly ordinary,
     /// non-generic one — silently fell through to `infer_call`'s
     /// `<unresolved-call:...>` placeholder, found by direct testing:
@@ -3950,20 +3950,20 @@ impl<'r> Infer<'r> {
         // must not be mistaken for a still-open, quantifiable one below.
         self.resolve_ready_field_accesses()?;
         let ty = self.subst.apply(ty);
-        let mut ty_fv = HashSet::new();
+        let mut ty_fv = HashSet::default();
         free_vars(&ty, &mut ty_fv);
 
-        let mut env_fv = HashSet::new();
+        let mut env_fv = HashSet::default();
         for scheme in env.values() {
             let resolved = self.subst.apply(&scheme.ty);
-            let mut fv = HashSet::new();
+            let mut fv = HashSet::default();
             free_vars(&resolved, &mut fv);
             env_fv.extend(fv.into_iter().filter(|v| !scheme.vars.contains(v)));
         }
 
         let vars: Vec<TyVar> = match own_generics {
             Some((generics_list, mapping)) => {
-                let mut seen = HashSet::new();
+                let mut seen = HashSet::default();
                 let mut ordered: Vec<TyVar> = generics_list
                     .iter()
                     .filter_map(|g| {
@@ -4015,7 +4015,7 @@ impl<'r> Infer<'r> {
         let mut field_constraints: Vec<FieldConstraint> = Vec::new();
         {
             let mut quantified_here: HashSet<TyVar> = vars.iter().copied().collect();
-            let mut captured: HashSet<usize> = HashSet::new();
+            let mut captured: HashSet<usize> = HashSet::default();
             loop {
                 let mut grew = false;
                 for (i, pending) in self.pending_field_accesses.iter().enumerate() {
@@ -4031,7 +4031,7 @@ impl<'r> Infer<'r> {
                     captured.insert(i);
                     grew = true;
                     let result = self.subst.apply(&Ty::Var(pending.result));
-                    let mut fv = HashSet::new();
+                    let mut fv = HashSet::default();
                     free_vars(&result, &mut fv);
                     let mut new_vars: Vec<TyVar> = fv
                         .into_iter()
@@ -4089,7 +4089,7 @@ impl<'r> Infer<'r> {
         let mut constraints = Vec::new();
         for c in &self.constraints {
             let resolved_tys: Vec<Ty> = c.tys.iter().map(|t| self.subst.apply(t)).collect();
-            let mut fv = HashSet::new();
+            let mut fv = HashSet::default();
             for t in &resolved_tys {
                 free_vars(t, &mut fv);
             }
@@ -4117,7 +4117,7 @@ impl<'r> Infer<'r> {
         // a complete no-op for a registry that never declares `Int`/`Float`/
         // `Num` in the first place, exactly like every other consumer of
         // those shape constraints already is.
-        let mut by_var: HashMap<TyVar, Vec<&Constraint>> = HashMap::new();
+        let mut by_var: HashMap<TyVar, Vec<&Constraint>> = HashMap::default();
         for c in &constraints {
             if let [Ty::Var(v)] = c.tys.as_slice() {
                 if self.registry.has_algebra(&c.algebra) {
@@ -4238,13 +4238,13 @@ impl<'r> Infer<'r> {
     /// `Scheme::mono` — the only thing crossing that group boundary for a
     /// nullary binding — carries zero constraints by construction.
     pub(crate) fn constraints_touching(&self, ty: &Ty) -> Vec<Constraint> {
-        let mut ty_fv = HashSet::new();
+        let mut ty_fv = HashSet::default();
         free_vars(&self.subst.apply(ty), &mut ty_fv);
         self.constraints
             .iter()
             .filter_map(|c| {
                 let resolved_tys: Vec<Ty> = c.tys.iter().map(|t| self.subst.apply(t)).collect();
-                let mut fv = HashSet::new();
+                let mut fv = HashSet::default();
                 for t in &resolved_tys {
                     free_vars(t, &mut fv);
                 }
@@ -4311,7 +4311,7 @@ impl<'r> Infer<'r> {
         // found for real via a top-level `fn random_fill<T,const Dims...:
         // i32>(...) -> Tensor<T,Dims...>` called at two different ranks
         // (`doc/backlog.md`).
-        let mut pack_vars = HashSet::new();
+        let mut pack_vars = HashSet::default();
         collect_pack_vars(&scheme.ty, &mut pack_vars);
         let mapping: HashMap<TyVar, Ty> = scheme
             .vars
@@ -4725,7 +4725,7 @@ impl<'r> Infer<'r> {
                 .iter()
                 .all(|e| self.has_matching_impl(algebra, std::slice::from_ref(e)));
         }
-        self.has_matching_impl_inherited(algebra, tys, &mut HashSet::new())
+        self.has_matching_impl_inherited(algebra, tys, &mut HashSet::default())
     }
 
     fn has_matching_impl_inherited(
@@ -4920,7 +4920,7 @@ impl<'r> Infer<'r> {
         // around). Comparing against the older, still-unmerged `self.subst`
         // here compared two different names for the same equivalence
         // class and never matched.
-        let mut active_vars: HashSet<TyVar> = HashSet::new();
+        let mut active_vars: HashSet<TyVar> = HashSet::default();
         for ty in self.active_generics.clone().values() {
             free_vars(&trial.apply(ty), &mut active_vars);
         }
@@ -4934,7 +4934,7 @@ impl<'r> Infer<'r> {
         // genuinely new.
         query.iter().all(|q| {
             let resolved = trial.apply(q);
-            let mut resolved_vars = HashSet::new();
+            let mut resolved_vars = HashSet::default();
             free_vars(&resolved, &mut resolved_vars);
             resolved_vars.iter().all(|v| active_vars.contains(v))
         })
@@ -5959,7 +5959,7 @@ impl<'r> Infer<'r> {
     /// fn` (rejected outright, see `TypeErrorKind::ExternFnCannotBeGeneric`),
     /// so the unmapped form is exactly what's needed there.
     pub(crate) fn ty_from_ast(&mut self, ty: &Type) -> Ty {
-        self.ty_from_ast_mapped(ty, &HashMap::new())
+        self.ty_from_ast_mapped(ty, &HashMap::default())
     }
 
     /// Like `ty_from_ast`, but a bare path matching a key in `mapping`
@@ -7242,7 +7242,7 @@ impl<'r> Infer<'r> {
                     }
                 }
 
-                let mut seen: HashSet<String> = HashSet::new();
+                let mut seen: HashSet<String> = HashSet::default();
                 for (name, value) in fields {
                     let Some(decl_field) =
                         declared_fields.iter().find(|f| &f.name == name).cloned()
@@ -7694,7 +7694,7 @@ impl<'r> Infer<'r> {
         // each generic's own fresh var occurs free in `param_tys` — gate
         // readiness; a return-type-only generic rides along into the match
         // itself and gets bound *by* it.
-        let mut param_free_vars: HashSet<TyVar> = HashSet::new();
+        let mut param_free_vars: HashSet<TyVar> = HashSet::default();
         for pt in &param_tys {
             free_vars(pt, &mut param_free_vars);
         }
@@ -7968,7 +7968,7 @@ impl<'r> Infer<'r> {
             // length still open), so any open part counts, not just a bare
             // variable.
             let target = self.subst.apply(&d.target);
-            let mut open = HashSet::new();
+            let mut open = HashSet::default();
             free_vars(&target, &mut open);
             if open.is_empty() || (d.generated.is_none() && !matches!(target, Ty::Var(_))) {
                 continue;

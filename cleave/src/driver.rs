@@ -32,7 +32,7 @@ use crate::lower::Lowerer;
 use crate::parser::{CleaveParser, Rule};
 use crate::print::{fmt_generics, fmt_type};
 use pest::Parser;
-use std::collections::HashMap;
+use crate::collections::HashMap;
 use std::path::PathBuf;
 
 /// Locates the shipped standard library directory relative to the running
@@ -244,7 +244,7 @@ pub fn compile(
     }
 
     let mut wanted: Vec<(String, Span)> = Vec::new();
-    let mut wanted_names = std::collections::HashSet::new();
+    let mut wanted_names = crate::collections::HashSet::default();
     for program in &programs {
         for item in &program.items {
             if let ItemKind::Use(path) = &item.kind {
@@ -261,7 +261,7 @@ pub fn compile(
         search_paths.push(std);
     }
 
-    let mut loaded = std::collections::HashSet::new();
+    let mut loaded = crate::collections::HashSet::default();
     let mut stack = Vec::new();
     for (name, span) in wanted {
         visit_crate(
@@ -504,7 +504,7 @@ fn synthesize_len_impls(mut program: Program, node_ids: &mut NodeIdGen) -> Progr
     if !has_len {
         return program;
     }
-    let written: std::collections::HashSet<String> = program
+    let written: crate::collections::HashSet<String> = program
         .items
         .iter()
         .filter_map(|item| match &item.kind {
@@ -614,7 +614,7 @@ fn synthesize_collect_impls(mut program: Program, node_ids: &mut NodeIdGen) -> P
     if !has_collect {
         return program;
     }
-    let written: std::collections::HashSet<String> = program
+    let written: crate::collections::HashSet<String> = program
         .items
         .iter()
         .filter_map(|item| match &item.kind {
@@ -980,7 +980,7 @@ fn visit_crate(
     sources: &mut crate::diag::SourceMap,
     programs: &mut Vec<Program>,
     errors: &mut Vec<Diagnostic>,
-    loaded: &mut std::collections::HashSet<String>,
+    loaded: &mut crate::collections::HashSet<String>,
     stack: &mut Vec<String>,
 ) {
     if loaded.contains(name) {
@@ -1016,7 +1016,7 @@ fn visit_crate(
     match load_crate_dir(dir.as_path(), ids, node_ids, sources) {
         Ok(program) => {
             let mut deps: Vec<(String, Span)> = Vec::new();
-            let mut dep_names = std::collections::HashSet::new();
+            let mut dep_names = crate::collections::HashSet::default();
             for item in &program.items {
                 if let ItemKind::Use(path) = &item.kind {
                     let dep_name = path.segments[0].clone();
@@ -1219,10 +1219,10 @@ fn merge_algebra_fragment(
     };
 
     let Some(acc) = algebras.iter_mut().find(|a| a.decl.name == d.name) else {
-        let mut seen_fn_sigs = HashMap::new();
-        let mut seen_axioms = HashMap::new();
-        let mut seen_derivative_rules = HashMap::new();
-        let mut seen_adjoint_rules = HashMap::new();
+        let mut seen_fn_sigs = HashMap::default();
+        let mut seen_axioms = HashMap::default();
+        let mut seen_derivative_rules = HashMap::default();
+        let mut seen_adjoint_rules = HashMap::default();
         for it in &d.items {
             match &it.kind {
                 AlgebraItemKind::FnSig(sig) => {
@@ -1362,7 +1362,7 @@ fn merge_impl_fragment(item: Item, impls: &mut Vec<ImplAcc>, errors: &mut Vec<Di
             && target_key_of(&a.decl) == target_key
             && fmt_generics(&a.decl.generics) == generics_key
     }) else {
-        let mut seen_fns = HashMap::new();
+        let mut seen_fns = HashMap::default();
         for f in &d.fns {
             if let Some(key) = sig_key(&f.name, &f.params) {
                 seen_fns.insert(key, item.span);

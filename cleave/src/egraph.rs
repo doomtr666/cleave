@@ -253,7 +253,7 @@ impl Analysis<CleaveLang> for ConstantFold {
                 .iter()
                 .flat_map(|id| egraph[*id].data.free_deps.iter().copied())
                 .collect(),
-            CleaveLang::Int(_) | CleaveLang::Float(_) | CleaveLang::Bool(_) => HashSet::new(),
+            CleaveLang::Int(_) | CleaveLang::Float(_) | CleaveLang::Bool(_) => HashSet::default(),
         };
         // `Free`'s own declared type (`Forward`'s own `param_types`, a
         // top-level function's own parameter types) and a construction's
@@ -344,7 +344,7 @@ use crate::cps::{CExpr, CFunDef, CTopLevelFn, CVal, CVar, PrimOp, SrcLoc, Struct
 use crate::infer::{ConstValue, Ty};
 use crate::mlir_lower::struct_field_types;
 use egg::EGraph;
-use std::collections::HashMap;
+use crate::collections::HashMap;
 
 /// Whether `op` has no observable side effect of its own — safe to treat a
 /// call whose own body is made only of ops like this as one opaque, freely
@@ -453,7 +453,7 @@ fn is_straight_line(expr: &CExpr, units: &HashMap<String, &CTopLevelFn>) -> bool
         CExpr::Fix { defs, body } => match recognize_real_call(defs, body) {
             Some((_, unit_name, real_args, rest)) if real_args.is_empty() => {
                 units.get(unit_name).is_some_and(|callee| {
-                    is_transparent_chain(&callee.def.body, units, &mut HashSet::new())
+                    is_transparent_chain(&callee.def.body, units, &mut HashSet::default())
                 }) && is_straight_line(rest, units)
             }
             _ => false,
@@ -669,7 +669,7 @@ pub struct Forward {
     /// without it, telling the two apart would mean guessing from the
     /// symbol's own text shape, exactly the kind of parsing this module has
     /// deliberately avoided everywhere else.
-    pub call_units: std::collections::HashSet<String>,
+    pub call_units: crate::collections::HashSet<String>,
     /// A raw `mlir::...` op's own combined symbol -> its original `(mlir op
     /// name, concrete type, attrs)` — mirrors `free_vars`'s own reasoning
     /// exactly (a later reconstruction stage needs the *original* pieces
@@ -745,21 +745,21 @@ impl Default for Forward {
     fn default() -> Self {
         Self {
             egraph: EGraph::default(),
-            env: HashMap::new(),
-            free_vars: HashMap::new(),
-            external_vars: HashMap::new(),
-            reached: HashMap::new(),
-            ruled: HashSet::new(),
+            env: HashMap::default(),
+            free_vars: HashMap::default(),
+            external_vars: HashMap::default(),
+            reached: HashMap::default(),
+            ruled: HashSet::default(),
             honor_no_inline: false,
-            call_units: std::collections::HashSet::new(),
-            raw_ops: HashMap::new(),
-            struct_ops: HashMap::new(),
-            field_ops: HashMap::new(),
-            array_ops: HashMap::new(),
-            array_repeat_ops: HashMap::new(),
-            load_ops: HashMap::new(),
-            param_types: HashMap::new(),
-            op_lines: HashMap::new(),
+            call_units: crate::collections::HashSet::default(),
+            raw_ops: HashMap::default(),
+            struct_ops: HashMap::default(),
+            field_ops: HashMap::default(),
+            array_ops: HashMap::default(),
+            array_repeat_ops: HashMap::default(),
+            load_ops: HashMap::default(),
+            param_types: HashMap::default(),
+            op_lines: HashMap::default(),
             next_free: 0,
             unroll_budget: MAX_UNROLL_ITERATIONS,
         }
@@ -1013,7 +1013,7 @@ impl Forward {
                         // check exists to prevent.
                         let straight = is_straight_line(&callee.def.body, units);
                         let transparent = !straight
-                            && is_transparent_chain(&callee.def.body, units, &mut HashSet::new());
+                            && is_transparent_chain(&callee.def.body, units, &mut HashSet::default());
                         let ruled = self.ruled.contains(unit_name);
                         let kept = self.honor_no_inline && callee.no_inline;
                         let transparent = transparent && !ruled && !kept;
@@ -1083,7 +1083,7 @@ impl Forward {
                             if let Some(arg_ids) = self.cvals_to_ids(real_args) {
                                 let ordinary_params =
                                     &callee.def.params[..callee.def.params.len().saturating_sub(1)];
-                                let mut map: HashMap<CVar, CVar> = HashMap::new();
+                                let mut map: HashMap<CVar, CVar> = HashMap::default();
                                 let renamed_params: Vec<CVar> =
                                     ordinary_params.iter().map(|_| fresh.var()).collect();
                                 for (&orig, &renamed) in ordinary_params.iter().zip(&renamed_params)
@@ -1310,7 +1310,7 @@ impl Forward {
             for (&p, &id) in carried_params.iter().zip(&carried_ids) {
                 self.env.insert(p, id);
             }
-            let renamed = Self::alpha_rename(then_branch, &mut HashMap::new(), fresh);
+            let renamed = Self::alpha_rename(then_branch, &mut HashMap::default(), fresh);
             let CExpr::App {
                 func: CVal::Label(l),
                 args,
@@ -1427,7 +1427,7 @@ use crate::ast::{
 };
 use crate::registry::Registry;
 use egg::{ENodeOrVar, PatternAst, Rewrite, Var};
-use std::collections::HashSet;
+use crate::collections::HashSet;
 
 /// Builds one concrete `Rewrite` per `(axiom, reached concrete type)` pair,
 /// for every axiom declared on whichever algebra each `reached` unit
@@ -1453,7 +1453,7 @@ pub fn axiom_rewrites(
     registry: &Registry,
     reached: &HashMap<String, (String, String)>,
 ) -> (Vec<Rewrite<CleaveLang, ConstantFold>>, HashSet<String>) {
-    let mut reached_types: HashMap<&str, HashSet<&str>> = HashMap::new();
+    let mut reached_types: HashMap<&str, HashSet<&str>> = HashMap::default();
     for (unit_name, (algebra, _method)) in reached {
         if let Some(ty) = concrete_type_of(unit_name) {
             reached_types
@@ -1470,7 +1470,7 @@ pub fn axiom_rewrites(
     // types whose impls declare it.
     let every_reached: HashSet<&str> = reached_types.values().flatten().copied().collect();
     let mut rules = Vec::new();
-    let mut referenced = HashSet::new();
+    let mut referenced = HashSet::default();
     for algebra in registry.algebra_names() {
         let axioms = registry.axioms(algebra);
         if axioms.is_empty() {
@@ -1612,7 +1612,7 @@ fn resolve_multi_target_call_ty(
         if known.iter().any(|&(idx, _)| idx >= targets.len()) {
             continue;
         }
-        let mut subst: HashMap<String, String> = HashMap::new();
+        let mut subst: HashMap<String, String> = HashMap::default();
         for &(idx, concrete) in known {
             if !match_type_pattern(targets[idx], concrete, &mut subst) {
                 continue 'templates;
@@ -2000,7 +2000,7 @@ fn axiom_to_rewrite(
     // <T>`'s own `add_commutative`), and anything the seeding pass genuinely
     // couldn't resolve either.
     let param_names: HashSet<&str> = axiom.params.iter().map(|p| p.name.as_str()).collect();
-    let mut type_env: HashMap<&str, String> = HashMap::new();
+    let mut type_env: HashMap<&str, String> = HashMap::default();
     seed_axiom_type_env(lhs, None, true, algebra, ty, &param_names, registry, &mut type_env);
     seed_axiom_type_env(rhs, None, true, algebra, ty, &param_names, registry, &mut type_env);
     // The flat fallback (every still-unresolved param -> `ty` unconditionally)
@@ -2037,7 +2037,7 @@ fn axiom_to_rewrite(
     // morphize.rs`) already makes sure the unit *exists*, but this
     // `referenced` set is the *separate* thing that tells `rebuild` it's
     // allowed to actually call it.
-    let mut referenced = HashSet::new();
+    let mut referenced = HashSet::default();
     let mut lhs_ast = PatternAst::default();
     build_pattern(
         lhs,
@@ -2747,7 +2747,7 @@ pub fn derivative_rewrites(
     // expansion, already present in the same e-class regardless, supplies
     // the correct answer there instead, this rule staying a pure
     // optimization shortcut, never the sole source of truth.
-    let zero_calls_used = std::sync::Arc::new(std::sync::Mutex::new(HashSet::new()));
+    let zero_calls_used = std::sync::Arc::new(std::sync::Mutex::new(HashSet::default()));
     {
         let a = Var::from(Symbol::from("?a"));
         let x = Var::from(Symbol::from("?x"));
@@ -2946,7 +2946,7 @@ fn derivative_rule_rewrites(
     registry: &Registry,
     reached: &HashMap<String, (String, String)>,
 ) -> (Vec<Rewrite<CleaveLang, ConstantFold>>, HashSet<String>) {
-    let mut reached_types: HashMap<&str, HashSet<&str>> = HashMap::new();
+    let mut reached_types: HashMap<&str, HashSet<&str>> = HashMap::default();
     for (unit_name, (algebra, _method)) in reached {
         if let Some(ty) = concrete_type_of(unit_name) {
             reached_types
@@ -2957,7 +2957,7 @@ fn derivative_rule_rewrites(
     }
 
     let mut rules = Vec::new();
-    let mut referenced = HashSet::new();
+    let mut referenced = HashSet::default();
     for (algebra, types) in &reached_types {
         for rule in registry.derivative_rules(algebra) {
             for ty in types {
@@ -3066,7 +3066,7 @@ fn derivative_rule_to_rewrite(
         vec![method_id, x_id_lhs],
     )));
 
-    let mut referenced = HashSet::new();
+    let mut referenced = HashSet::default();
     let mut rhs = PatternAst::default();
     build_pattern(
         &rule.body,
@@ -3377,7 +3377,7 @@ pub(crate) fn rebuild_segment(
     load_ops: &HashMap<Symbol, (Ty, Ty)>,
     fresh: &FreshVars,
 ) -> CExpr {
-    let no_substitution = HashMap::new();
+    let no_substitution = HashMap::default();
     let tables = OpTables {
         free_vars,
         raw_ops,
@@ -3389,7 +3389,7 @@ pub(crate) fn rebuild_segment(
         load_ops,
         param_substitution: &no_substitution,
     };
-    let memo = RefCell::new(HashMap::new());
+    let memo = RefCell::new(HashMap::default());
     rebuild(recexpr, root, fresh, &tables, &memo, &|final_val| {
         substitute_var(boundary, old_root_var, &final_val)
     })
@@ -3518,7 +3518,7 @@ fn collect_var_refs(expr: &CExpr, out: &mut HashSet<CVar>) {
 /// final return) as one instance of this: that shape always references
 /// exactly one var too, so every previously-optimizable function still is.
 fn segment_root_var(boundary: &CExpr, env: &HashMap<CVar, egg::Id>) -> Option<CVar> {
-    let mut refs = HashSet::new();
+    let mut refs = HashSet::default();
     collect_var_refs(boundary, &mut refs);
     let mut in_segment = refs.into_iter().filter(|v| env.contains_key(v));
     let root = in_segment.next()?;
@@ -3624,14 +3624,14 @@ pub fn optimize_program(
         .map(|f| (f.def.name.clone(), f))
         .collect();
 
-    let mut new_bodies: HashMap<String, CExpr> = HashMap::new();
+    let mut new_bodies: HashMap<String, CExpr> = HashMap::default();
     let mut explanations = Vec::new();
     // Debug-info provenance for the fresh `CVar`s `rebuild_segment` mints:
     // the whole rewritten segment computed the value originally bound to
     // `root_var`, so anchor every op in it to that binding's source line.
     // Coarser than per-node (the e-graph reassociates/CSEs across original
     // statements), but enough to keep a profiler off line 0.
-    let mut extra_op_lines: HashMap<CVar, SrcLoc> = HashMap::new();
+    let mut extra_op_lines: HashMap<CVar, SrcLoc> = HashMap::default();
 
     for f in &program.funcs {
         let mut fwd = Forward::default();
@@ -3991,7 +3991,7 @@ pub fn synthesize_derivatives(
 
         // Fresh params for `fprime` itself — never `f`'s own reused (see
         // `OpTables::param_substitution`'s own doc comment for why).
-        let mut param_substitution = HashMap::new();
+        let mut param_substitution = HashMap::default();
         let mut new_params = Vec::with_capacity(f_params.len() + 1);
         for &p in f_params {
             let np = fresh.var();
@@ -4044,7 +4044,7 @@ pub fn synthesize_derivatives(
         // `Tensor` parameter's own many) into the real `Op("derivative",
         // [root,leaf])` node the rest of this function already expected
         // one of, per parameter, before struct-parameter support existed.
-        let mut shape_referenced: HashSet<String> = HashSet::new();
+        let mut shape_referenced: HashSet<String> = HashSet::default();
         let mut shape_error: Option<String> = None;
         let param_shapes: Vec<Option<ParamShape>> = target_params
             .iter()
@@ -4457,7 +4457,7 @@ fn synthesize_one_gradient(
         ));
     }
 
-    let mut param_substitution = HashMap::new();
+    let mut param_substitution = HashMap::default();
     let mut new_params = Vec::with_capacity(f_params.len() + 1);
     for &p in f_params {
         let np = fresh.var();
@@ -4499,8 +4499,8 @@ fn synthesize_one_gradient(
         })
         .unwrap_or_else(|| Symbol::from("<unread grad target>"));
 
-    let mut referenced = HashSet::new();
-    let zero_calls_used: std::sync::Mutex<HashSet<String>> = std::sync::Mutex::new(HashSet::new());
+    let mut referenced = HashSet::default();
+    let zero_calls_used: std::sync::Mutex<HashSet<String>> = std::sync::Mutex::new(HashSet::default());
     let adjoints = backward_walk(
         &mut fwd.egraph,
         root_id,
@@ -4677,8 +4677,8 @@ fn backward_walk(
     referenced: &mut HashSet<String>,
 ) -> Result<HashMap<egg::Id, egg::Id>, String> {
     let (order, defs) = snapshot_backward_order(egraph, root);
-    let mut adjoints: HashMap<egg::Id, egg::Id> = HashMap::new();
-    let mut field_contributions: HashMap<(egg::Id, String), egg::Id> = HashMap::new();
+    let mut adjoints: HashMap<egg::Id, egg::Id> = HashMap::default();
+    let mut field_contributions: HashMap<(egg::Id, String), egg::Id> = HashMap::default();
     adjoints.insert(egraph.find(root), seed);
 
     for &id in order.iter().rev() {
@@ -5093,12 +5093,12 @@ fn snapshot_backward_order(
     root: egg::Id,
 ) -> (Vec<egg::Id>, HashMap<egg::Id, (Symbol, Vec<egg::Id>)>) {
     let mut order = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    let mut defs: HashMap<egg::Id, (Symbol, Vec<egg::Id>)> = HashMap::new();
+    let mut seen = crate::collections::HashSet::default();
+    let mut defs: HashMap<egg::Id, (Symbol, Vec<egg::Id>)> = HashMap::default();
     fn visit(
         egraph: &egg::EGraph<CleaveLang, ConstantFold>,
         id: egg::Id,
-        seen: &mut std::collections::HashSet<egg::Id>,
+        seen: &mut crate::collections::HashSet<egg::Id>,
         order: &mut Vec<egg::Id>,
         defs: &mut HashMap<egg::Id, (Symbol, Vec<egg::Id>)>,
     ) {
@@ -5192,7 +5192,7 @@ fn same_expression(a: &RecExpr<CleaveLang>, b: &RecExpr<CleaveLang>) -> bool {
     if a.as_ref().is_empty() || b.as_ref().is_empty() {
         return a.as_ref().is_empty() && b.as_ref().is_empty();
     }
-    same(a, a.root(), b, b.root(), &mut HashMap::new())
+    same(a, a.root(), b, b.root(), &mut HashMap::default())
 }
 
 /// Registers, as field reads, the `tuplefield:<unit>:<k>` nodes an adjoint
@@ -5955,7 +5955,7 @@ fn reassemble_shape(
     match shape {
         ParamShape::Leaf(id, _ty) => {
             let (_, best) = extractor.find_best(egraph.find(*id));
-            let memo = RefCell::new(HashMap::new());
+            let memo = RefCell::new(HashMap::default());
             rebuild(&best, best.root(), fresh, tables, &memo, k)
         }
         ParamShape::Tensor {
@@ -6233,7 +6233,7 @@ mod tests {
         let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
         let registry = Registry::build(&program);
 
-        let mut reached = HashMap::new();
+        let mut reached = HashMap::default();
         reached.insert(
             "TestRing::add<i32>".to_string(),
             ("TestRing".to_string(), "add".to_string()),
@@ -6283,7 +6283,7 @@ mod tests {
         );
         let program = result.unwrap();
         let registry = Registry::build(&program);
-        let (rules, _) = axiom_rewrites(&registry, &HashMap::new());
+        let (rules, _) = axiom_rewrites(&registry, &HashMap::default());
         assert!(rules.is_empty());
     }
 
@@ -6343,7 +6343,7 @@ mod tests {
             export_symbol: None,
             loc: SrcLoc::default(),
         };
-        let mut units: HashMap<String, &CTopLevelFn> = HashMap::new();
+        let mut units: HashMap<String, &CTopLevelFn> = HashMap::default();
         units.insert("TestRing::add<i32>".to_string(), &callee);
 
         // `let v = TestRing::add<i32>(x, 0); <boundary referencing v>` --
@@ -6463,7 +6463,7 @@ mod tests {
             }),
         };
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
+        let boundary = fwd.walk(&expr, &HashMap::default(), &FreshVars::new());
         assert!(
             matches!(boundary, CExpr::App { .. }),
             "expected the bare tail App as the boundary, got {boundary:?}"
@@ -6502,7 +6502,7 @@ mod tests {
             cont: Box::new(tail.clone()),
         };
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
+        let boundary = fwd.walk(&expr, &HashMap::default(), &FreshVars::new());
         assert!(
             matches!(boundary, CExpr::App { .. }),
             "expected the bare tail App as the boundary, got {boundary:?}"
@@ -6541,7 +6541,7 @@ mod tests {
             cont: Box::new(tail.clone()),
         };
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
+        let boundary = fwd.walk(&expr, &HashMap::default(), &FreshVars::new());
         let root_var: CVar = 0;
         let root_id = fwd.env[&root_var];
 
@@ -6625,7 +6625,7 @@ mod tests {
             export_symbol: None,
             loc: SrcLoc::default(),
         };
-        let mut units: HashMap<String, &CTopLevelFn> = HashMap::new();
+        let mut units: HashMap<String, &CTopLevelFn> = HashMap::default();
         units.insert("Additive::add<i32>".to_string(), &callee);
 
         // The *caller's* own shape: `Fix{ k(result) { App(k_ret_of_caller, [result]) } , App(Additive::add<i32>, [a, b, k]) }`.
@@ -6694,7 +6694,7 @@ mod tests {
             export_symbol: None,
             loc: SrcLoc::default(),
         };
-        let mut units: HashMap<String, &CTopLevelFn> = HashMap::new();
+        let mut units: HashMap<String, &CTopLevelFn> = HashMap::default();
         units.insert("branchy".to_string(), &callee);
 
         let expr = CExpr::Fix {
@@ -6847,7 +6847,7 @@ mod tests {
     #[test]
     fn a_literal_bounded_for_loop_unrolls_and_carries_state_correctly() {
         let callee = ring_add_i32_callee();
-        let mut units: HashMap<String, &CTopLevelFn> = HashMap::new();
+        let mut units: HashMap<String, &CTopLevelFn> = HashMap::default();
         units.insert("Additive::add<i32>".to_string(), &callee);
 
         let expr = for_loop_fix(CVal::Int(3));
@@ -6882,7 +6882,7 @@ mod tests {
     #[test]
     fn a_for_loop_with_a_non_literal_bound_is_not_unrolled() {
         let callee = ring_add_i32_callee();
-        let mut units: HashMap<String, &CTopLevelFn> = HashMap::new();
+        let mut units: HashMap<String, &CTopLevelFn> = HashMap::default();
         units.insert("Additive::add<i32>".to_string(), &callee);
 
         let expr = for_loop_fix(CVal::Var(50));
@@ -6905,7 +6905,7 @@ mod tests {
     #[test]
     fn a_for_loop_exceeding_the_unroll_cap_is_not_unrolled() {
         let callee = ring_add_i32_callee();
-        let mut units: HashMap<String, &CTopLevelFn> = HashMap::new();
+        let mut units: HashMap<String, &CTopLevelFn> = HashMap::default();
         units.insert("Additive::add<i32>".to_string(), &callee);
 
         let expr = for_loop_fix(CVal::Int(MAX_UNROLL_ITERATIONS + 1));
@@ -6947,7 +6947,7 @@ mod tests {
             }),
         };
         assert!(
-            !is_straight_line(&body, &HashMap::new()),
+            !is_straight_line(&body, &HashMap::default()),
             "an Extern effect must not be judged straight-line, no Fix/If needed to reject it"
         );
     }
@@ -7047,7 +7047,7 @@ mod tests {
             export_symbol: None,
             loc: SrcLoc::default(),
         };
-        let mut units: HashMap<String, &CTopLevelFn> = HashMap::new();
+        let mut units: HashMap<String, &CTopLevelFn> = HashMap::default();
         units.insert("Print<i32>::print".to_string(), &callee);
 
         let expr = CExpr::Fix {
@@ -7094,7 +7094,7 @@ mod tests {
             }),
         };
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
+        let boundary = fwd.walk(&expr, &HashMap::default(), &FreshVars::new());
         assert!(matches!(boundary, CExpr::If { .. }));
         assert!(fwd.env.is_empty());
         assert!(
@@ -7125,7 +7125,7 @@ mod tests {
             }),
         };
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
+        let boundary = fwd.walk(&expr, &HashMap::default(), &FreshVars::new());
         assert!(
             matches!(boundary, CExpr::App { .. }),
             "expected the bare tail App as the boundary, got {boundary:?}"
@@ -7164,7 +7164,7 @@ mod tests {
             }),
         };
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
+        let boundary = fwd.walk(&expr, &HashMap::default(), &FreshVars::new());
         assert!(
             matches!(boundary, CExpr::App { .. }),
             "expected the bare tail App as the boundary, got {boundary:?}"
@@ -7206,7 +7206,7 @@ mod tests {
             cont: Box::new(build()),
         };
         let mut fwd = Forward::default();
-        let _boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
+        let _boundary = fwd.walk(&expr, &HashMap::default(), &FreshVars::new());
         assert_eq!(
             fwd.env[&0], fwd.env[&1],
             "two structurally identical constructions must hashcons to the same e-class"
@@ -7237,7 +7237,7 @@ mod tests {
             }),
         };
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
+        let boundary = fwd.walk(&expr, &HashMap::default(), &FreshVars::new());
         assert!(
             matches!(boundary, CExpr::App { .. }),
             "expected the bare tail App as the boundary, got {boundary:?}"
@@ -7262,7 +7262,7 @@ mod tests {
             }),
         };
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
+        let boundary = fwd.walk(&expr, &HashMap::default(), &FreshVars::new());
         assert!(
             matches!(boundary, CExpr::App { .. }),
             "expected the bare tail App as the boundary, got {boundary:?}"
@@ -7297,7 +7297,7 @@ mod tests {
             }),
         };
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
+        let boundary = fwd.walk(&expr, &HashMap::default(), &FreshVars::new());
         assert!(
             matches!(boundary, CExpr::App { .. }),
             "expected the bare tail App as the boundary, got {boundary:?}"
@@ -7337,7 +7337,7 @@ mod tests {
             }),
         };
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
+        let boundary = fwd.walk(&expr, &HashMap::default(), &FreshVars::new());
         let root_var: CVar = 1;
         let root_id = fwd.env[&root_var];
 
@@ -7417,7 +7417,7 @@ mod tests {
             }),
         };
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
+        let boundary = fwd.walk(&expr, &HashMap::default(), &FreshVars::new());
         let root_var: CVar = 1;
         let root_id = fwd.env[&root_var];
 
@@ -7516,7 +7516,7 @@ mod tests {
             }),
         };
         let mut fwd = Forward::default();
-        let boundary = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
+        let boundary = fwd.walk(&expr, &HashMap::default(), &FreshVars::new());
         let root_var: CVar = 2;
         let root_id = fwd.env[&root_var];
 
@@ -7602,7 +7602,7 @@ mod tests {
             }),
         };
         let mut fwd = Forward::default();
-        let _boundary_ignored = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
+        let _boundary_ignored = fwd.walk(&expr, &HashMap::default(), &FreshVars::new());
 
         let boundary = CExpr::Fix {
             defs: vec![CFunDef {
@@ -7653,7 +7653,7 @@ mod tests {
             }),
         };
         let mut fwd = Forward::default();
-        let _boundary_ignored = fwd.walk(&expr, &HashMap::new(), &FreshVars::new());
+        let _boundary_ignored = fwd.walk(&expr, &HashMap::default(), &FreshVars::new());
 
         let boundary = CExpr::App {
             func: CVal::Var(99),
@@ -7671,7 +7671,7 @@ mod tests {
     /// — not just that a `Rewrite` value got constructed without error.
     #[test]
     fn struct_projection_rewrites_unions_a_field_read_with_its_own_constructor_arg() {
-        let mut struct_ops = HashMap::new();
+        let mut struct_ops = HashMap::default();
         let struct_sym = Symbol::from("struct:Pair:x,y");
         struct_ops.insert(
             struct_sym,
@@ -7682,7 +7682,7 @@ mod tests {
             ),
         );
 
-        let mut field_ops = HashMap::new();
+        let mut field_ops = HashMap::default();
         let field_sym = Symbol::from("field:Pair:y");
         field_ops.insert(field_sym, (pair_ty(), "y".to_string(), i32_ty()));
 
@@ -7717,7 +7717,7 @@ mod tests {
     /// `axiom_rewrites`'s own `no_rewrites_are_built_for_an_unreached_algebra`.
     #[test]
     fn no_projection_rewrite_is_built_for_a_field_never_read() {
-        let mut struct_ops = HashMap::new();
+        let mut struct_ops = HashMap::default();
         struct_ops.insert(
             Symbol::from("struct:Pair:x,y"),
             (
@@ -7726,7 +7726,7 @@ mod tests {
                 pair_ty(),
             ),
         );
-        let rules = struct_projection_rewrites(&struct_ops, &HashMap::new());
+        let rules = struct_projection_rewrites(&struct_ops, &HashMap::default());
         assert!(rules.is_empty());
     }
 
@@ -7750,7 +7750,7 @@ mod tests {
     #[test]
     fn derivative_of_a_variable_with_respect_to_itself_is_one() {
         let reg = empty_registry();
-        let (rules, _, _) = derivative_rewrites("f32", &HashMap::new(), &reg, &HashSet::new());
+        let (rules, _, _) = derivative_rewrites("f32", &HashMap::default(), &reg, &HashSet::default());
         let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
         let x = egraph.add(CleaveLang::Free("x".into()));
         let d = egraph.add(CleaveLang::Op("derivative".into(), vec![x, x]));
@@ -7773,8 +7773,8 @@ mod tests {
         // A hand-built test e-graph, bypassing the real compiler pipeline
         // entirely, has to assert this unit "exists" itself, the same way
         // it already has to populate `known_types` below.
-        let unit_names: HashSet<String> = HashSet::from(["Additive::zero<f32>".to_string()]);
-        let (rules, _, _) = derivative_rewrites("f32", &HashMap::new(), &reg, &unit_names);
+        let unit_names: HashSet<String> = HashSet::from_iter(["Additive::zero<f32>".to_string()]);
+        let (rules, _, _) = derivative_rewrites("f32", &HashMap::default(), &reg, &unit_names);
         let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
         let x = egraph.add(CleaveLang::Free("x".into()));
         // `own_ty` (`ConstantFold::known_types`'s own doc comment) — real
@@ -7800,7 +7800,7 @@ mod tests {
     #[test]
     fn derivative_of_a_float_literal_is_zero() {
         let reg = empty_registry();
-        let (rules, _, _) = derivative_rewrites("f32", &HashMap::new(), &reg, &HashSet::new());
+        let (rules, _, _) = derivative_rewrites("f32", &HashMap::default(), &reg, &HashSet::default());
         let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
         let x = egraph.add(CleaveLang::Free("x".into()));
         let three = egraph.add(CleaveLang::Float(3.0.into()));
@@ -7865,7 +7865,7 @@ mod tests {
         let w_times_zero = egraph.add(CleaveLang::Op("Ring::mul<f32>".into(), vec![w, zero]));
         assert_eq!(
             egraph[w_times_zero].data.free_deps,
-            HashSet::from([Symbol::from("w")]),
+            HashSet::from_iter([Symbol::from("w")]),
             "w*0.0's own naive bound must mention w before it's unioned with anything"
         );
         egraph.union(zero, w_times_zero);
@@ -7907,7 +7907,7 @@ mod tests {
     }
 
     fn ring_f32_reached() -> HashMap<String, (String, String)> {
-        let mut reached = HashMap::new();
+        let mut reached = HashMap::default();
         reached.insert(
             "TestRing::mul<f32>".to_string(),
             ("TestRing".to_string(), "mul".to_string()),
@@ -7931,7 +7931,7 @@ mod tests {
     fn derivative_of_a_product_involving_x_does_not_wrongly_collapse_to_zero() {
         let reg = ring_f32_with_derivative_rules();
         let reached = ring_f32_reached();
-        let (rules, _, _) = derivative_rewrites("f32", &reached, &reg, &HashSet::new());
+        let (rules, _, _) = derivative_rewrites("f32", &reached, &reg, &HashSet::default());
 
         let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
         let x = egraph.add(CleaveLang::Free("x".into()));
@@ -7965,7 +7965,7 @@ mod tests {
         // rewrites`'s own doc comment) -- asserted to "exist" here the same
         // way `derivative_of_a_different_free_variable_is_zero` already
         // does, for the identical reason.
-        let unit_names: HashSet<String> = HashSet::from(["Additive::zero<f32>".to_string()]);
+        let unit_names: HashSet<String> = HashSet::from_iter(["Additive::zero<f32>".to_string()]);
         let (rules, _, _) = derivative_rewrites("f32", &reached, &reg, &unit_names);
 
         let mut egraph: EGraph<CleaveLang, ConstantFold> = EGraph::default();
@@ -8000,12 +8000,12 @@ mod tests {
     fn derivative_rewrites_reports_units_the_declared_rules_reference_but_reached_does_not_include()
     {
         let reg = ring_f32_with_derivative_rules();
-        let mut reached = HashMap::new();
+        let mut reached = HashMap::default();
         reached.insert(
             "TestRing::mul<f32>".to_string(),
             ("TestRing".to_string(), "mul".to_string()),
         );
-        let (_, referenced, _) = derivative_rewrites("f32", &reached, &reg, &HashSet::new());
+        let (_, referenced, _) = derivative_rewrites("f32", &reached, &reg, &HashSet::default());
         assert!(
             referenced.contains("TestRing::add<f32>"),
             "expected the product rule's own referenced-unit set to name add, got {referenced:?}"
@@ -8017,7 +8017,7 @@ mod tests {
     #[test]
     fn only_base_rules_are_built_when_nothing_is_declared() {
         let reg = empty_registry();
-        let (rules, _, _) = derivative_rewrites("f32", &HashMap::new(), &reg, &HashSet::new());
+        let (rules, _, _) = derivative_rewrites("f32", &HashMap::default(), &reg, &HashSet::default());
         assert_eq!(
             rules.len(),
             2,
@@ -8062,7 +8062,7 @@ mod tests {
             })
             .collect();
         let cps_program = crate::cps::convert_program(units, None);
-        let errs = match synthesize_derivatives(cps_program, &requests, &registry, &HashMap::new())
+        let errs = match synthesize_derivatives(cps_program, &requests, &registry, &HashMap::default())
         {
             Err(errs) => errs,
             Ok(_) => panic!("expected a real error, not a successfully synthesized fprime"),
@@ -8117,7 +8117,7 @@ mod tests {
             })
             .collect();
         let cps_program = crate::cps::convert_program(units, None);
-        let errs = match synthesize_derivatives(cps_program, &requests, &registry, &HashMap::new())
+        let errs = match synthesize_derivatives(cps_program, &requests, &registry, &HashMap::default())
         {
             Err(errs) => errs,
             Ok(_) => panic!("expected a real error, not a successfully synthesized fprime"),
@@ -8186,7 +8186,7 @@ mod tests {
     /// order.
     fn spike_backward_walk(egraph: &mut EGraph<CleaveLang, ConstantFold>, root: Id) -> HashMap<Id, Id> {
         let mut order = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = crate::collections::HashSet::default();
         // Snapshotted *once*, per id, during this initial walk -- consulted
         // later instead of re-querying `egraph[id].nodes` live. Found
         // necessary directly, not anticipated: building a contribution
@@ -8202,11 +8202,11 @@ mod tests {
         // -- the defining structure of the *original* forward computation
         // can never change after this point, regardless of what gets added
         // to the shared e-graph later.
-        let mut defs: HashMap<Id, (Symbol, Vec<Id>)> = HashMap::new();
+        let mut defs: HashMap<Id, (Symbol, Vec<Id>)> = HashMap::default();
         fn visit(
             egraph: &EGraph<CleaveLang, ConstantFold>,
             id: Id,
-            seen: &mut std::collections::HashSet<Id>,
+            seen: &mut crate::collections::HashSet<Id>,
             order: &mut Vec<Id>,
             defs: &mut HashMap<Id, (Symbol, Vec<Id>)>,
         ) {
@@ -8226,7 +8226,7 @@ mod tests {
         }
         visit(egraph, root, &mut seen, &mut order, &mut defs);
 
-        let mut adjoints: HashMap<Id, Id> = HashMap::new();
+        let mut adjoints: HashMap<Id, Id> = HashMap::default();
         let one = egraph.add(CleaveLang::Int(1));
         adjoints.insert(egraph.find(root), one);
 
@@ -8346,11 +8346,11 @@ mod tests {
         let root_id = *fwd.env.get(&root_var).expect("root var not in `fwd.env`");
 
         let seed = fwd.egraph.add(CleaveLang::Free(Symbol::from("dC")));
-        let mut referenced = HashSet::new();
-        let empty_struct_schemas = HashMap::new();
-        let empty_unit_names = HashSet::new();
-        let zero_calls_used = std::sync::Mutex::new(HashSet::new());
-        let empty_known_types = HashMap::new();
+        let mut referenced = HashSet::default();
+        let empty_struct_schemas = HashMap::default();
+        let empty_unit_names = HashSet::default();
+        let zero_calls_used = std::sync::Mutex::new(HashSet::default());
+        let empty_known_types = HashMap::default();
         let adjoints = backward_walk(
             &mut fwd.egraph,
             root_id,

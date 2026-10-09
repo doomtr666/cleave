@@ -185,7 +185,8 @@ fn a_compiled_program_actually_runs_and_returns_the_right_value() {
     // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
     // their engines don't load libomp: `spawn`'s markers removed, spawned
     // calls run in place (serial elision).
-    unsafe { cleave_mlir_shim::lower_spawns(module.as_operation().to_raw(), false) };
+    unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
+        .expect("cleave-lower-spawns");
     assert!(module.as_operation().verify());
 
     let pass_manager = pass::PassManager::new(&context);
@@ -230,7 +231,7 @@ fn a_compiled_program_actually_runs_and_returns_the_right_value() {
     pass_manager
         .run(&mut module)
         .expect("lowering to the llvm dialect must succeed");
-    strip_ciface_wrapper_debug_info(&context, module.as_operation_mut());
+    strip_ciface_wrapper_debug_info(&mut module);
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     // Registered unconditionally, harmless if unused -- any struct
@@ -358,7 +359,8 @@ fn lowered_llvm_text(context: &Context, src: &str) -> String {
     // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
     // their engines don't load libomp: `spawn`'s markers removed, spawned
     // calls run in place (serial elision).
-    unsafe { cleave_mlir_shim::lower_spawns(module.as_operation().to_raw(), false) };
+    unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
+        .expect("cleave-lower-spawns");
     assert!(
         module.as_operation().verify(),
         "generated MLIR module failed verification"
@@ -454,7 +456,8 @@ fn optimized_lowered_llvm_text_for_tensors(context: &Context, src: &str) -> Stri
     // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
     // their engines don't load libomp: `spawn`'s markers removed, spawned
     // calls run in place (serial elision).
-    unsafe { cleave_mlir_shim::lower_spawns(module.as_operation().to_raw(), false) };
+    unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
+        .expect("cleave-lower-spawns");
     assert!(
         module.as_operation().verify(),
         "generated MLIR module failed verification"
@@ -495,7 +498,7 @@ fn optimized_lowered_llvm_text_for_tensors(context: &Context, src: &str) -> Stri
     pass_manager
         .run(&mut module)
         .expect("lowering to the llvm dialect must succeed");
-    strip_ciface_wrapper_debug_info(context, module.as_operation_mut());
+    strip_ciface_wrapper_debug_info(&mut module);
 
     module.as_operation().to_string()
 }
@@ -511,7 +514,8 @@ fn run_i32_from_cps(
     // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
     // their engines don't load libomp: `spawn`'s markers removed, spawned
     // calls run in place (serial elision).
-    unsafe { cleave_mlir_shim::lower_spawns(module.as_operation().to_raw(), false) };
+    unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
+        .expect("cleave-lower-spawns");
     assert!(
         module.as_operation().verify(),
         "generated MLIR module failed verification"
@@ -603,7 +607,7 @@ fn run_i32_from_cps(
     pass_manager
         .run(&mut module)
         .expect("lowering to the llvm dialect must succeed");
-    strip_ciface_wrapper_debug_info(&context, module.as_operation_mut());
+    strip_ciface_wrapper_debug_info(&mut module);
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     // Registered unconditionally, harmless if unused -- any struct
@@ -895,7 +899,8 @@ fn an_extern_fn_call_actually_executes_through_a_registered_symbol() {
     // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
     // their engines don't load libomp: `spawn`'s markers removed, spawned
     // calls run in place (serial elision).
-    unsafe { cleave_mlir_shim::lower_spawns(module.as_operation().to_raw(), false) };
+    unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
+        .expect("cleave-lower-spawns");
     assert!(module.as_operation().verify());
 
     let pass_manager = pass::PassManager::new(&context);
@@ -940,7 +945,7 @@ fn an_extern_fn_call_actually_executes_through_a_registered_symbol() {
     pass_manager
         .run(&mut module)
         .expect("lowering to the llvm dialect must succeed");
-    strip_ciface_wrapper_debug_info(&context, module.as_operation_mut());
+    strip_ciface_wrapper_debug_info(&mut module);
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {
@@ -1062,7 +1067,8 @@ fn an_extern_impl_method_actually_executes_the_right_symbol_at_each_call_site() 
     // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
     // their engines don't load libomp: `spawn`'s markers removed, spawned
     // calls run in place (serial elision).
-    unsafe { cleave_mlir_shim::lower_spawns(module.as_operation().to_raw(), false) };
+    unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
+        .expect("cleave-lower-spawns");
     assert!(module.as_operation().verify());
 
     let pass_manager = pass::PassManager::new(&context);
@@ -1107,7 +1113,7 @@ fn an_extern_impl_method_actually_executes_the_right_symbol_at_each_call_site() 
     pass_manager
         .run(&mut module)
         .expect("lowering to the llvm dialect must succeed");
-    strip_ciface_wrapper_debug_info(&context, module.as_operation_mut());
+    strip_ciface_wrapper_debug_info(&mut module);
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {
@@ -1168,7 +1174,8 @@ fn an_array_argument_crosses_an_extern_call_boundary_correctly() {
     // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
     // their engines don't load libomp: `spawn`'s markers removed, spawned
     // calls run in place (serial elision).
-    unsafe { cleave_mlir_shim::lower_spawns(module.as_operation().to_raw(), false) };
+    unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
+        .expect("cleave-lower-spawns");
     assert!(module.as_operation().verify());
 
     let pass_manager = pass::PassManager::new(&context);
@@ -1205,7 +1212,7 @@ fn an_array_argument_crosses_an_extern_call_boundary_correctly() {
     pass_manager
         .run(&mut module)
         .expect("lowering to the llvm dialect must succeed");
-    strip_ciface_wrapper_debug_info(&context, module.as_operation_mut());
+    strip_ciface_wrapper_debug_info(&mut module);
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {
@@ -1263,7 +1270,8 @@ fn a_unit_returning_extern_fn_can_be_called_correctly() {
     // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
     // their engines don't load libomp: `spawn`'s markers removed, spawned
     // calls run in place (serial elision).
-    unsafe { cleave_mlir_shim::lower_spawns(module.as_operation().to_raw(), false) };
+    unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
+        .expect("cleave-lower-spawns");
     assert!(module.as_operation().verify());
     let text = module.as_operation().to_string();
     // The real, structural proof: the declared extern signature (and its
@@ -1313,7 +1321,7 @@ fn a_unit_returning_extern_fn_can_be_called_correctly() {
     pass_manager
         .run(&mut module)
         .expect("lowering to the llvm dialect must succeed");
-    strip_ciface_wrapper_debug_info(&context, module.as_operation_mut());
+    strip_ciface_wrapper_debug_info(&mut module);
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {
@@ -1372,7 +1380,8 @@ fn a_string_literal_printed_via_print_writes_the_right_bytes_to_stdout() {
     // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
     // their engines don't load libomp: `spawn`'s markers removed, spawned
     // calls run in place (serial elision).
-    unsafe { cleave_mlir_shim::lower_spawns(module.as_operation().to_raw(), false) };
+    unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
+        .expect("cleave-lower-spawns");
     assert!(module.as_operation().verify());
     let text = module.as_operation().to_string();
     assert!(
@@ -1418,7 +1427,7 @@ fn a_string_literal_printed_via_print_writes_the_right_bytes_to_stdout() {
     pass_manager
         .run(&mut module)
         .expect("lowering to the llvm dialect must succeed");
-    strip_ciface_wrapper_debug_info(&context, module.as_operation_mut());
+    strip_ciface_wrapper_debug_info(&mut module);
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {
@@ -3518,7 +3527,8 @@ fn print_of_an_unannotated_index_result_no_longer_panics() {
     // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
     // their engines don't load libomp: `spawn`'s markers removed, spawned
     // calls run in place (serial elision).
-    unsafe { cleave_mlir_shim::lower_spawns(module.as_operation().to_raw(), false) };
+    unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
+        .expect("cleave-lower-spawns");
     assert!(
         module.as_operation().verify(),
         "generated MLIR module failed verification"
@@ -3567,7 +3577,7 @@ fn print_of_an_unannotated_index_result_no_longer_panics() {
     pass_manager
         .run(&mut module)
         .expect("lowering to the llvm dialect must succeed");
-    strip_ciface_wrapper_debug_info(&context, module.as_operation_mut());
+    strip_ciface_wrapper_debug_info(&mut module);
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {
@@ -3628,7 +3638,8 @@ fn print_of_an_unannotated_matmul_index_result_no_longer_panics() {
     // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
     // their engines don't load libomp: `spawn`'s markers removed, spawned
     // calls run in place (serial elision).
-    unsafe { cleave_mlir_shim::lower_spawns(module.as_operation().to_raw(), false) };
+    unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
+        .expect("cleave-lower-spawns");
     assert!(
         module.as_operation().verify(),
         "generated MLIR module failed verification"
@@ -3677,7 +3688,7 @@ fn print_of_an_unannotated_matmul_index_result_no_longer_panics() {
     pass_manager
         .run(&mut module)
         .expect("lowering to the llvm dialect must succeed");
-    strip_ciface_wrapper_debug_info(&context, module.as_operation_mut());
+    strip_ciface_wrapper_debug_info(&mut module);
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {
@@ -5521,7 +5532,7 @@ fn sum_of_a_non_square_rank_2_tensor_computes_the_right_total() {
 /// for the nested qualified call; separately, `cps.rs::collect_units`'s
 /// own non-generic-impl branch (which compiles *every* concrete impl
 /// unconditionally, regardless of reachability) hardcoded `call_names:
-/// HashMap::new()`, needing the identical discovery run directly against
+/// HashMap::default()`, needing the identical discovery run directly against
 /// its own re-inferred body. Both fixed together — this test specifically
 /// exercises the second path (`Activation<f64>::tanh`, never reached from
 /// `main` at all, only present because `use nn;` merges the whole crate),
@@ -6280,7 +6291,8 @@ fn run_i32_with_dynarray_symbols(
     // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
     // their engines don't load libomp: `spawn`'s markers removed, spawned
     // calls run in place (serial elision).
-    unsafe { cleave_mlir_shim::lower_spawns(module.as_operation().to_raw(), false) };
+    unsafe { cleave_mlir_shim::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
+        .expect("cleave-lower-spawns");
     assert!(
         module.as_operation().verify(),
         "generated MLIR module failed verification"
@@ -6311,7 +6323,7 @@ fn run_i32_with_dynarray_symbols(
     pass_manager
         .run(&mut module)
         .expect("lowering to the llvm dialect must succeed");
-    strip_ciface_wrapper_debug_info(&context, module.as_operation_mut());
+    strip_ciface_wrapper_debug_info(&mut module);
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     unsafe {

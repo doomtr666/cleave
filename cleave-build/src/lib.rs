@@ -335,14 +335,8 @@ impl Build {
         // compile_and_emit`'s result).
         if needs_openmp {
             // `libomp` -- needed the moment `emit_object`'s own OpenMP
-            // parallelization stage was exercised (`cleave::pipeline::
-            // register_openmp_stub_symbols`'s own doc comment: the emitted
-            // object carries real, unresolved `__kmpc_*` relocations
-            // whenever a linalg-derived kernel exists and `options.openmp`
-            // was on -- confirmed directly, the first `cargo build` of a
-            // real interop example through this exact function after that
-            // stage landed failed with `LNK2019: symbole externe non
-            // résolu __kmpc_*`). The real, installed file is named `libomp.
+            // parallelization stage or `spawn`'s tasks were used: the object
+            // then carries unresolved `__kmpc_*` relocations. The real, installed file is named `libomp.
             // lib` (LLVM's own cross-platform convention) -- `dylib=libomp`,
             // not `dylib=omp`, since an `-msvc` target's linker takes an
             // `-l`-equivalent name verbatim (`NAME.lib`), no GNU-style

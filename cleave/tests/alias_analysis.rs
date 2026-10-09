@@ -496,7 +496,7 @@ mod affine_eligibility {
         collect_field_mutated_struct_names,
     };
 
-    fn affine_vars(src: &str) -> (cleave::cps::CpsProgram, std::collections::HashSet<cleave::cps::CVar>) {
+    fn affine_vars(src: &str) -> (cleave::cps::CpsProgram, cleave::collections::HashSet<cleave::cps::CVar>) {
         let program = optimized_cps(src);
         let summary = analyze(&program);
         let identity_summary = analyze_identity(&program);

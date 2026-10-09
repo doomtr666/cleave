@@ -34,7 +34,7 @@
 //! `live_set` definition here mirrors `refcount.rs::live_set` exactly.
 
 use crate::cps::{CExpr, CFunDef, CVal, CVar, CpsProgram, PrimOp};
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 /// For every top-level function in `program`, returns the set of `CVar`s
 /// bound by `PrimOp::Struct` within its body (at any nesting depth) that
@@ -46,7 +46,7 @@ use std::collections::{HashMap, HashSet};
 /// `CVar`s are globally unique so the result is a single flat `HashSet`
 /// over the whole program with no collision risk across functions.
 pub fn escaping_struct_vars(program: &CpsProgram) -> HashSet<CVar> {
-    let mut escaping = HashSet::new();
+    let mut escaping = HashSet::default();
     for f in &program.funcs {
         let local_free_vars = collect_local_free_vars_for(&f.def);
         find_escaping_in(&f.def.body, &local_free_vars, &mut escaping);
@@ -58,8 +58,8 @@ pub fn escaping_struct_vars(program: &CpsProgram) -> HashSet<CVar> {
 /// `refcount::collect_local_free_vars` — any change to the live-set rule
 /// must be applied to both.
 fn collect_local_free_vars_for(top: &CFunDef) -> HashMap<String, HashSet<CVar>> {
-    let mut out: HashMap<String, HashSet<CVar>> = HashMap::new();
-    let mut func_labels: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut out: HashMap<String, HashSet<CVar>> = HashMap::default();
+    let mut func_labels: HashMap<String, HashSet<String>> = HashMap::default();
     walk_local_free_vars_in(&top.body, &mut out, &mut func_labels);
     // Fixpoint: propagate transitively through bare tail-calls.
     loop {
@@ -100,8 +100,8 @@ fn walk_local_free_vars_in(
         CExpr::Fix { defs, body } => {
             for d in defs {
                 let mut bound: HashSet<CVar> = d.params.iter().copied().collect();
-                let mut referenced: HashSet<CVar> = HashSet::new();
-                let mut inner_func_labels: HashSet<String> = HashSet::new();
+                let mut referenced: HashSet<CVar> = HashSet::default();
+                let mut inner_func_labels: HashSet<String> = HashSet::default();
                 collect_bound_and_referenced_in(&d.body, &mut bound, &mut referenced, &mut inner_func_labels);
                 let free: HashSet<CVar> = referenced.difference(&bound).copied().collect();
                 out.insert(d.name.clone(), free);
@@ -153,7 +153,7 @@ fn live_set_at(
     args: &[CVal],
     local_free_vars: &HashMap<String, HashSet<CVar>>,
 ) -> HashSet<CVar> {
-    let mut live: HashSet<CVar> = HashSet::new();
+    let mut live: HashSet<CVar> = HashSet::default();
     for v in std::iter::once(func).chain(args.iter()) {
         match v {
             CVal::Var(cv) => { live.insert(*cv); }

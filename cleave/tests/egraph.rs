@@ -71,7 +71,7 @@ fn run(
     pass_manager
         .run(&mut module)
         .expect("lowering to the llvm dialect must succeed");
-    strip_ciface_wrapper_debug_info(context, module.as_operation_mut());
+    strip_ciface_wrapper_debug_info(&mut module);
 
     let engine = melior::ExecutionEngine::new(&module, 2, &[], false, false);
     // SAFETY: a real, valid `extern "C" fn`, live for the process's whole

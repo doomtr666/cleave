@@ -118,7 +118,7 @@
 
 use crate::cps::{CExpr, CFunDef, CVal, CVar, CpsProgram, PrimOp};
 use crate::infer::Ty;
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 /// The result of [`analyze`] — a flat, precomputed table. Every query is
 /// O(1); nothing here ever re-walks a CPS tree.
@@ -253,17 +253,17 @@ fn identity_through(program: &CpsProgram, through_loops_only: bool) -> IdentityS
         .map(|f| f.def.name.as_str())
         .collect();
 
-    let mut seed: HashSet<(String, usize)> = HashSet::new();
+    let mut seed: HashSet<(String, usize)> = HashSet::default();
     let mut edges: Vec<Edge> = Vec::new();
 
     for f in &program.funcs {
         let Some((&k_ret, ordinary_params)) = f.def.params.split_last() else {
             continue;
         };
-        let mut defs_by_name: HashMap<&str, &CFunDef> = HashMap::new();
+        let mut defs_by_name: HashMap<&str, &CFunDef> = HashMap::default();
         collect_local_defs_by_name(&f.def.body, &mut defs_by_name);
         for (i, &param) in ordinary_params.iter().enumerate() {
-            let mut visiting = HashSet::new();
+            let mut visiting = HashSet::default();
             let trace = Trace { f_name: &f.def.name, param_idx: i, k_ret };
             if tail_returns_var(
                 &f.def.body,
@@ -282,7 +282,7 @@ fn identity_through(program: &CpsProgram, through_loops_only: bool) -> IdentityS
 
     let resolved = propagate(seed, edges);
 
-    let mut identity: HashMap<String, HashSet<usize>> = HashMap::new();
+    let mut identity: HashMap<String, HashSet<usize>> = HashMap::default();
     for f in &program.funcs {
         identity.entry(f.def.name.clone()).or_default();
     }
@@ -632,9 +632,9 @@ fn is_array_embedded(op: &PrimOp, args: &[CVal], var: CVar) -> bool {
 /// propagation, further down this file) that most needed a real answer
 /// instead of a reflexive "yes".
 pub fn analyze(program: &CpsProgram) -> AliasSummary {
-    let mut seed: HashSet<(String, usize)> = HashSet::new();
+    let mut seed: HashSet<(String, usize)> = HashSet::default();
     let mut edges: Vec<Edge> = Vec::new();
-    let mut all_names: HashSet<String> = HashSet::new();
+    let mut all_names: HashSet<String> = HashSet::default();
 
     for f in &program.funcs {
         // The trailing continuation parameter is never itself a candidate
@@ -673,7 +673,7 @@ pub fn analyze(program: &CpsProgram) -> AliasSummary {
     // parameter anywhere) both came back aliased before this fix, for
     // exactly this reason — and the identical hazard applies to a local
     // loop/if-join/resumption def now that each gets its own entry too.
-    let mut aliased: HashMap<String, HashSet<usize>> = HashMap::new();
+    let mut aliased: HashMap<String, HashSet<usize>> = HashMap::default();
     for name in &all_names {
         aliased.entry(name.clone()).or_default();
     }
@@ -979,7 +979,7 @@ pub fn affine_struct_vars(
         field_mutated_structs,
         extern_boundary_structs,
     );
-    let mut affine = HashSet::new();
+    let mut affine = HashSet::default();
     for f in &non_region_local {
         collect_affine_candidates(
             &f.def.body,
@@ -1042,7 +1042,7 @@ pub fn affine_struct_vars(
         .iter()
         .map(|f| {
             let mut facts = CarriedParamFacts {
-                calls: HashMap::new(),
+                calls: HashMap::default(),
                 carried_defs: Vec::new(),
             };
             collect_carried_param_facts(&f.def.body, &mut facts);
@@ -1056,7 +1056,7 @@ pub fn affine_struct_vars(
     let per_fn_classes: Vec<LocalAliasClasses> =
         per_fn_carried_facts.iter().map(LocalAliasClasses::build).collect();
     loop {
-        let mut fn_return_affine: HashMap<&str, bool> = HashMap::new();
+        let mut fn_return_affine: HashMap<&str, bool> = HashMap::default();
         for f in &non_region_local {
             let mut return_vars = Vec::new();
             let clean = collect_return_vars(f.k_ret, &f.def.body, &mut return_vars);
@@ -1258,7 +1258,7 @@ struct LocalAliasClasses {
 
 impl LocalAliasClasses {
     fn build(facts: &CarriedParamFacts) -> Self {
-        let mut parent: HashMap<CVar, CVar> = HashMap::new();
+        let mut parent: HashMap<CVar, CVar> = HashMap::default();
         for (name, params) in &facts.carried_defs {
             let Some(calls) = facts.calls.get(name) else {
                 continue;
@@ -1271,8 +1271,8 @@ impl LocalAliasClasses {
                 }
             }
         }
-        let mut class_of: HashMap<CVar, CVar> = HashMap::new();
-        let mut members: HashMap<CVar, Vec<CVar>> = HashMap::new();
+        let mut class_of: HashMap<CVar, CVar> = HashMap::default();
+        let mut members: HashMap<CVar, Vec<CVar>> = HashMap::default();
         for v in parent.keys().copied().collect::<Vec<_>>() {
             let root = Self::find(&mut parent, v);
             class_of.insert(v, root);
@@ -1431,26 +1431,26 @@ fn constructions_returned_to_aliasing_callers(
             }
         }
     }
-    let mut facts: HashMap<&str, Facts> = HashMap::new();
-    let mut returns: HashMap<&str, Vec<CVar>> = HashMap::new();
-    let mut aliased: HashSet<String> = HashSet::new();
+    let mut facts: HashMap<&str, Facts> = HashMap::default();
+    let mut returns: HashMap<&str, Vec<CVar>> = HashMap::default();
+    let mut aliased: HashSet<String> = HashSet::default();
     for f in funcs {
-        let mut defs = HashMap::new();
+        let mut defs = HashMap::default();
         collect_local_defs_by_name(&f.def.body, &mut defs);
-        let mut fx = Facts { incoming: HashMap::new(), resumed_from: HashMap::new(), constructed: HashSet::new() };
+        let mut fx = Facts { incoming: HashMap::default(), resumed_from: HashMap::default(), constructed: HashSet::default() };
         walk(&f.def.body, &defs, &mut fx, &mut aliased, summary);
         let mut out = Vec::new();
         collect_return_vars(f.k_ret, &f.def.body, &mut out);
         returns.insert(f.def.name.as_str(), out);
         facts.insert(f.def.name.as_str(), fx);
     }
-    let mut excluded = HashSet::new();
+    let mut excluded = HashSet::default();
     let mut work: Vec<String> = aliased.iter().cloned().collect();
     while let Some(name) = work.pop() {
         let (Some(fx), Some(rets)) = (facts.get(name.as_str()), returns.get(name.as_str())) else {
             continue;
         };
-        let mut seen: HashSet<CVar> = HashSet::new();
+        let mut seen: HashSet<CVar> = HashSet::default();
         let mut stack = rets.clone();
         while let Some(v) = stack.pop() {
             if !seen.insert(v) {
@@ -1840,8 +1840,8 @@ fn structs_inside_light_containers(
     for f in &program.funcs {
         walk(&f.def.body, &mut light_types);
     }
-    let mut excluded = HashSet::new();
-    let mut seen = HashSet::new();
+    let mut excluded = HashSet::default();
+    let mut seen = HashSet::default();
     let mut stack: Vec<Ty> = light_types.into_iter().filter(|t| is_light(t)).collect();
     while let Some(container) = stack.pop() {
         if !seen.insert(container.to_string()) {
@@ -1930,7 +1930,7 @@ fn struct_cascade_is_viable(
 /// cascade for every one of them (`doc/plan-affine-ownership.md` §7's own
 /// "when in doubt, header" discipline).
 pub fn field_affine_positions(program: &CpsProgram, affine: &HashSet<CVar>) -> HashMap<(String, usize), bool> {
-    let mut result: HashMap<(String, usize), bool> = HashMap::new();
+    let mut result: HashMap<(String, usize), bool> = HashMap::default();
     for f in &program.funcs {
         collect_field_affine_facts(&f.def.body, affine, &mut result);
     }
@@ -1987,12 +1987,12 @@ fn propagate(seed: HashSet<(String, usize)>, edges: Vec<Edge>) -> HashSet<(Strin
     // Index edges by their own dependency (the RHS) so a newly-discovered
     // aliased pair can cheaply find everything waiting on it, instead of
     // re-scanning the whole edge list on every step.
-    let mut waiting_on: HashMap<(String, usize), Vec<(String, usize)>> = HashMap::new();
+    let mut waiting_on: HashMap<(String, usize), Vec<(String, usize)>> = HashMap::default();
     for (dependent, depends_on) in edges {
         waiting_on.entry(depends_on).or_default().push(dependent);
     }
 
-    let mut aliased: HashSet<(String, usize)> = HashSet::new();
+    let mut aliased: HashSet<(String, usize)> = HashSet::default();
     let mut worklist: Vec<(String, usize)> = Vec::new();
     for pair in seed {
         if aliased.insert(pair.clone()) {
@@ -2027,7 +2027,7 @@ fn propagate(seed: HashSet<(String, usize)>, edges: Vec<Edge>) -> HashSet<(Strin
 /// lower_real_call` inlines directly when reuse-eligible — `pub` for that
 /// second, cross-module consumer.
 pub fn collect_elementwise_units(program: &CpsProgram) -> HashMap<String, (String, Vec<usize>)> {
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     for f in &program.funcs {
         let Some((&k_ret, ordinary_params)) = f.def.params.split_last() else {
             continue;
@@ -2115,7 +2115,7 @@ pub fn collect_elementwise_units(program: &CpsProgram) -> HashMap<String, (Strin
 /// in this same file.
 pub fn analyze_elementwise_reuse(program: &CpsProgram, summary: &AliasSummary) -> HashMap<CVar, CVar> {
     let elementwise_units = collect_elementwise_units(program);
-    let mut reuse: HashMap<CVar, CVar> = HashMap::new();
+    let mut reuse: HashMap<CVar, CVar> = HashMap::default();
     for f in &program.funcs {
         let ordinary_params = &f.def.params[..f.def.params.len().saturating_sub(1)];
         collect_elementwise_reuse(

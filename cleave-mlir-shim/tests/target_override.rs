@@ -1,5 +1,5 @@
-//! Proves `cleaveExecutionEngineCreateWithTarget`'s own `target_cpu`/
-//! `target_features` parameters have a *real* effect on the compiled code
+//! Proves `Target`'s CPU and feature list have a *real* effect on the
+//! compiled code
 //! -- not just that the shim compiles and links (`doc/backlog.md`'s own
 //! entry on why `--target-cpu`/`--target-features` were "wired end to end
 //! but have no real effect" before this shim existed).
@@ -30,12 +30,16 @@ module {
 }
 "#;
 
-/// Lowers `FMA16_MLIR` to the LLVM dialect and dumps a real object file
-/// through `cleave_mlir_shim::ExecutionEngine`, built with the given
+/// Lowers `FMA16_MLIR` to the LLVM dialect and writes it as an object file
+/// (`cleave_mlir_shim::emit_object`) for a target built with the given
 /// `target_cpu`/`target_features` override (`""` for either means "use
 /// `detectHost`'s own default unchanged"). Returns the dumped file's own
 /// path (kept on disk -- `disassemble` below re-reads it via `llvm-objdump`).
-fn compile_object(context: &melior::Context, target_cpu: &str, target_features: &str) -> std::path::PathBuf {
+fn compile_object(
+    context: &melior::Context,
+    target_cpu: &str,
+    target_features: &str,
+) -> std::path::PathBuf {
     use melior::ir::Module;
     use melior::pass::{self, PassManager};
 
@@ -60,17 +64,12 @@ fn compile_object(context: &melior::Context, target_cpu: &str, target_features: 
     let dump_path = std::env::temp_dir().join(format!(
         "cleave-mlir-shim-probe-{target_cpu}-{target_features}.o"
     ));
-    let engine = cleave_mlir_shim::ExecutionEngine::new(
-        module.to_raw(),
-        /* optimization_level = */ 2,
-        &[],
-        /* enable_object_dump = */ true,
-        /* enable_pic = */ false,
-        target_cpu,
-        target_features,
-        /* loop_unroll = */ true,
-    );
-    engine.dump_to_object_file(dump_path.to_str().unwrap());
+    let opt = |v: &str| (!v.is_empty()).then(|| v.to_string());
+    let target = cleave_mlir_shim::Target::new(opt(target_cpu).as_deref(), opt(target_features).as_deref(), 2, false, true)
+        .expect("failed to build the target");
+    // SAFETY: `module` is a valid module, owned here.
+    unsafe { cleave_mlir_shim::emit_object(module.to_raw(), &target, dump_path.to_str().unwrap()) }
+        .expect("failed to emit the object");
     assert!(dump_path.exists(), "dumped object file should exist");
     dump_path
 }
@@ -185,10 +184,17 @@ fn disabling_avx512_falls_back_to_two_ymm_wide_fma_halves() {
     // independent 256-bit (`ymm`) `vfmadd*ps` halves instead of one `zmm`
     // one.
     let context = probe_context();
-    let path = compile_object(&context, "", "-avx512f,-avx512vl,-avx512bw,-avx512dq,-avx512cd");
+    let path = compile_object(
+        &context,
+        "",
+        "-avx512f,-avx512vl,-avx512bw,-avx512dq,-avx512cd",
+    );
     let text = disassemble(&path);
     let _ = fs::remove_file(&path);
-    assert!(!text.contains("zmm"), "AVX-512 disabled but zmm still appeared:\n{text}");
+    assert!(
+        !text.contains("zmm"),
+        "AVX-512 disabled but zmm still appeared:\n{text}"
+    );
     assert!(
         text.contains("ymm"),
         "expected a 256-bit (ymm) fallback with AVX-512 disabled, found none:\n{text}"
@@ -224,7 +230,10 @@ fn disabling_fma_alone_also_falls_back_to_ymm_not_just_dropping_the_fusion() {
         !text.contains("vfmadd"),
         "-fma was disabled but a fused vfmadd instruction still appeared:\n{text}"
     );
-    assert!(!text.contains("zmm"), "expected no zmm usage with -fma disabled:\n{text}");
+    assert!(
+        !text.contains("zmm"),
+        "expected no zmm usage with -fma disabled:\n{text}"
+    );
     assert!(
         text.contains("ymm") && text.contains("vmulps") && text.contains("vaddps"),
         "expected an unfused vmulps + vaddps pair, split to 256-bit (ymm):\n{text}"
@@ -250,4 +259,12 @@ fn explicit_negative_avx512_feature_drops_avx512() {
         "an explicit -avx512f feature override still produced zmm-register instructions -- \
          the target-features override had no real effect"
     );
+}
+
+/// A CPU LLVM doesn't know is an error, not a warning and a silent fallback
+/// on a generic processor.
+#[test]
+fn an_unknown_target_cpu_is_an_error() {
+    let error = cleave_mlir_shim::Target::new(Some("not-a-cpu"), None, 2, false, true).err();
+    assert!(error.is_some_and(|e| e.contains("not-a-cpu")), "an unknown CPU was accepted");
 }

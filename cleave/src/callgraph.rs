@@ -84,7 +84,7 @@ use crate::infer::{
     Constraint, Env, Infer, Scheme, Ty, TypeError, TypeErrorKind, check_no_placeholder,
 };
 use crate::registry::Registry;
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 /// One top-level `fn`'s outcome from a whole-program inference run.
 #[derive(Debug)]
@@ -169,7 +169,7 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
         .collect();
 
     let known: HashSet<&str> = functions.keys().map(String::as_str).collect();
-    let mut graph: HashMap<String, Vec<String>> = HashMap::new();
+    let mut graph: HashMap<String, Vec<String>> = HashMap::default();
     for (name, f) in &functions {
         let mut calls = Vec::new();
         if let Some(body) = &f.body {
@@ -180,10 +180,10 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
 
     let sccs = Tarjan::run(&graph);
 
-    let mut global_env: Env = Env::new();
-    let mut results: HashMap<String, Result<FnResult, TypeError>> = HashMap::new();
-    let mut node_types: HashMap<NodeId, Ty> = HashMap::new();
-    let mut lambda_schemes: HashMap<NodeId, Scheme> = HashMap::new();
+    let mut global_env: Env = Env::default();
+    let mut results: HashMap<String, Result<FnResult, TypeError>> = HashMap::default();
+    let mut node_types: HashMap<NodeId, Ty> = HashMap::default();
+    let mut lambda_schemes: HashMap<NodeId, Scheme> = HashMap::default();
     // Carried from each group's own finished `Infer` into the next group's
     // fresh one — see `Infer::with_var_counter_starting_at`'s own doc
     // comment for the real, found-by-testing collision this prevents:
@@ -202,7 +202,7 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
         // Seed every member's placeholder before inferring *any* of their
         // bodies — visible to every other member (mutual recursion) and to
         // itself (self-recursion).
-        let mut placeholders: HashMap<String, (Vec<Ty>, Ty, HashMap<String, Ty>)> = HashMap::new();
+        let mut placeholders: HashMap<String, (Vec<Ty>, Ty, HashMap<String, Ty>)> = HashMap::default();
         let mut group_env = global_env.clone();
         for name in group {
             let f = functions[name.as_str()];
@@ -214,7 +214,7 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
             placeholders.insert(name.clone(), (param_types, ret_var, generics));
         }
 
-        let mut raw_results: HashMap<String, Result<Ty, TypeError>> = HashMap::new();
+        let mut raw_results: HashMap<String, Result<Ty, TypeError>> = HashMap::default();
         for name in group {
             let f = functions[name.as_str()];
             if f.body.is_none() {
@@ -359,7 +359,7 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
         // Vec2 {...}`) is completely unaffected — `f.generics.is_empty()`
         // was already true for every one of them, so this is a pure
         // narrowing, not a behavior change for anything already working.
-        let mut nullary_constraints: HashMap<String, Vec<Constraint>> = HashMap::new();
+        let mut nullary_constraints: HashMap<String, Vec<Constraint>> = HashMap::default();
         for name in group {
             let Ok(_) = &raw_results[name] else { continue };
             let f = functions[name.as_str()];
@@ -511,7 +511,7 @@ pub fn infer_program(program: &Program, registry: &Registry) -> ProgramInference
                                         vars: Vec::new(),
                                         constraints,
                                         ty,
-                                        const_widths: HashMap::new(),
+                                        const_widths: HashMap::default(),
                                         literal_defaults: Vec::new(),
                                         field_constraints: Vec::new(),
                                     },
@@ -703,9 +703,9 @@ impl<'a> Tarjan<'a> {
 
         let mut t = Tarjan {
             graph,
-            index_of: HashMap::new(),
-            low_link: HashMap::new(),
-            on_stack: HashSet::new(),
+            index_of: HashMap::default(),
+            low_link: HashMap::default(),
+            on_stack: HashSet::default(),
             stack: Vec::new(),
             next_index: 0,
             sccs: Vec::new(),

@@ -13,7 +13,7 @@ use cleave::pipeline::check_type_errors;
 use cleave::region_analysis::find_region_local_functions;
 use cleave::registry::Registry;
 
-fn region_local_names(src: &str) -> std::collections::HashSet<String> {
+fn region_local_names(src: &str) -> cleave::collections::HashSet<String> {
     let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let registry = Registry::build(&program);

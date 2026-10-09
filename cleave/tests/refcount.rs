@@ -64,15 +64,15 @@ fn refcounted_cps(src: &str) -> CpsProgram {
 /// `Fix`/`If`, mirroring `region_analysis.rs`'s/`refcount.rs`'s own
 /// established "plain recursive `CExpr` walk" shape for this same kind of
 /// whole-program structural fact.
-fn retained_or_released_struct_names(program: &CpsProgram) -> std::collections::HashSet<String> {
-    let mut names = std::collections::HashSet::new();
+fn retained_or_released_struct_names(program: &CpsProgram) -> cleave::collections::HashSet<String> {
+    let mut names = cleave::collections::HashSet::default();
     for f in &program.funcs {
         collect_rc_targets(&f.def.body, &mut names);
     }
     names
 }
 
-fn collect_rc_targets(expr: &CExpr, names: &mut std::collections::HashSet<String>) {
+fn collect_rc_targets(expr: &CExpr, names: &mut cleave::collections::HashSet<String>) {
     match expr {
         CExpr::LetPrim { op, cont, .. } => {
             if let PrimOp::Retain(ty) | PrimOp::Release(ty) = op {

@@ -20,7 +20,7 @@
 use crate::ast::*;
 use crate::callgraph;
 use crate::registry::Registry;
-use std::collections::HashMap;
+use crate::collections::HashMap;
 
 /// More rounds than any real nesting of unrolled loops needs; a guard against
 /// a request that would somehow reappear forever.

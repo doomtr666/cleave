@@ -1894,7 +1894,7 @@ fn a_generic_impls_own_generic_is_not_defaulted_away_by_a_body_literal() {
     let mut infer = Infer::new(&registry);
     infer
         .infer_impl_fn_generic_with_env(
-            &cleave::infer::Env::new(),
+            &cleave::infer::Env::default(),
             &algebra,
             &generics,
             &all_targets,

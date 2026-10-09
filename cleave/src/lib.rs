@@ -1,3 +1,4 @@
+pub mod collections;
 pub mod ast;
 pub mod callgraph;
 pub mod const_eval;
@@ -21,8 +22,6 @@ pub mod region_analysis;
 pub mod registry;
 pub mod resolve;
 pub mod rc_opt;
-pub mod redundant_copy_elim;
 pub mod run;
 pub mod rust_bindings;
-pub mod unify_alloc;
 pub mod unroll;

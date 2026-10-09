@@ -93,16 +93,10 @@ pub fn run_main_with<T>(
         shared_libs.push(format!("{prefix}/bin/libomp.dll"));
     }
     let shared_lib_refs: Vec<&str> = shared_libs.iter().map(String::as_str).collect();
-    let engine = cleave_mlir_shim::ExecutionEngine::new(
-        module.to_raw(),
-        options.opt_level as usize,
-        &shared_lib_refs,
-        false,
-        false,
-        options.target_cpu.as_deref().unwrap_or(""),
-        options.target_features.as_deref().unwrap_or(""),
-        options.llvm_loop_unroll,
-    );
+    let target = crate::pipeline::target(options)?;
+    // SAFETY: `module` is a valid module, owned here.
+    let engine = unsafe { cleave_mlir_shim::ExecutionEngine::new(module.to_raw(), &target, &shared_lib_refs) }
+        .map_err(|e| vec![format!("failed to compile the program: {e}")])?;
     // SAFETY: every symbol registered is a real `extern "C"` function live for
     // the whole process (`register_cleave_rt_symbols`'s doc comment); the
     // caller vouches for `extra_symbols` the same way.

@@ -106,7 +106,7 @@ use crate::infer::{ConstValue, Infer, Ty};
 use crate::monomorphize;
 use crate::registry::Registry;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 // ---------------------------------------------------------------- flattening
@@ -277,7 +277,7 @@ pub struct ConcreteUnit {
 /// `mlir_lower.rs`'s own lookup panics clearly if a type it actually needs
 /// was never declared this way.
 pub fn collect_mlir_types(program: &Program) -> HashMap<String, String> {
-    let mut types = HashMap::new();
+    let mut types = HashMap::default();
     for item in &program.items {
         let ItemKind::Impl(d) = &item.kind else {
             continue;
@@ -331,7 +331,7 @@ pub struct StructSchema {
 /// value/access a field generically, the same "no per-struct Rust
 /// knowledge" posture `collect_mlir_types` already gives primitives.
 pub fn collect_struct_schemas(program: &Program) -> HashMap<String, StructSchema> {
-    let mut schemas = HashMap::new();
+    let mut schemas = HashMap::default();
     let consts: HashMap<String, crate::infer::Ty> = crate::registry::Registry::build(program)
         .global_consts()
         .into_iter()
@@ -418,7 +418,7 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                     .iter()
                     .chain(std::iter::once(&fn_result.result))
                     .any(|t| {
-                        let mut vars = std::collections::HashSet::new();
+                        let mut vars = crate::collections::HashSet::default();
                         crate::infer::free_vars(t, &mut vars);
                         !vars.is_empty()
                     })
@@ -488,8 +488,8 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                         export_symbol: f.export_symbol.clone(),
                         capture_count: 0,
                         baked_closures: Vec::new(),
-                        higher_order_args: HashMap::new(),
-                        positional_fields: HashMap::new(),
+                        higher_order_args: HashMap::default(),
+                        positional_fields: HashMap::default(),
                         body,
                     });
                 } else {
@@ -508,8 +508,8 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                             export_symbol: None,
                             capture_count: 0,
                             baked_closures: Vec::new(),
-                            higher_order_args: HashMap::new(),
-                            positional_fields: HashMap::new(),
+                            higher_order_args: HashMap::default(),
+                            positional_fields: HashMap::default(),
                             body: UnitBody::Real(mono.body(key).clone()),
                         });
                     }
@@ -587,7 +587,7 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                     // into a still-*generic* fn/impl needing its own further
                     // specialization isn't discovered this way (a real,
                     // narrower, separate gap — no known case needs it yet).
-                    let mut call_names = HashMap::new();
+                    let mut call_names = HashMap::default();
                     monomorphize::collect_instantiations(
                         &f.body.clone().unwrap_or(Block {
                             stmts: Vec::new(),
@@ -597,7 +597,7 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                         &program_inference.global_env,
                         mono.templates(),
                         &program_inference.lambda_schemes,
-                        HashMap::new(),
+                        HashMap::default(),
                         &mut Vec::new(),
                         &mut Vec::new(),
                         &mut Vec::new(),
@@ -625,8 +625,8 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                         export_symbol: None,
                         capture_count: 0,
                         baked_closures: Vec::new(),
-                        higher_order_args: HashMap::new(),
-                        positional_fields: HashMap::new(),
+                        higher_order_args: HashMap::default(),
+                        positional_fields: HashMap::default(),
                         body,
                     });
                 }
@@ -683,8 +683,8 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                             export_symbol: None,
                             capture_count: 0,
                             baked_closures: Vec::new(),
-                            higher_order_args: HashMap::new(),
-                            positional_fields: HashMap::new(),
+                            higher_order_args: HashMap::default(),
+                            positional_fields: HashMap::default(),
                             body,
                         });
                     }
@@ -749,8 +749,8 @@ pub fn collect_units(program: &Program, registry: &Registry) -> Vec<ConcreteUnit
                 export_symbol: None,
                 capture_count: capture_names.len(),
                 baked_closures: Vec::new(),
-                higher_order_args: HashMap::new(),
-                positional_fields: HashMap::new(),
+                higher_order_args: HashMap::default(),
+                positional_fields: HashMap::default(),
                 body: UnitBody::Real(body.clone()),
             });
         }
@@ -775,7 +775,7 @@ fn positional_fields(
     let mut exprs = Vec::new();
     crate::monomorphize::collect_exprs_block(body, &mut exprs);
     let mut infer = crate::infer::Infer::new(registry);
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     for e in exprs {
         let ExprKind::Index(base, indices) = &e.kind else { continue };
         let [idx] = indices.as_slice() else { continue };
@@ -939,7 +939,7 @@ fn build_higher_order_specializations(units: &mut Vec<ConcreteUnit>) {
         return;
     }
 
-    let mut specialized: HashMap<(String, Vec<(usize, String)>), String> = HashMap::new();
+    let mut specialized: HashMap<(String, Vec<(usize, String)>), String> = HashMap::default();
     let mut new_units: Vec<ConcreteUnit> = Vec::new();
 
     for call in &found {
@@ -1027,8 +1027,8 @@ fn build_higher_order_specializations(units: &mut Vec<ConcreteUnit>) {
             export_symbol: None,
             capture_count: 0,
             baked_closures,
-            higher_order_args: HashMap::new(),
-            positional_fields: HashMap::new(),
+            higher_order_args: HashMap::default(),
+            positional_fields: HashMap::default(),
             body: UnitBody::Real(callee_body),
         });
 
@@ -1058,7 +1058,7 @@ fn build_higher_order_specializations(units: &mut Vec<ConcreteUnit>) {
 type CallIndex = HashMap<(String, Vec<String>, String), String>;
 
 fn build_call_index(units: &[ConcreteUnit]) -> CallIndex {
-    let mut index = CallIndex::new();
+    let mut index = CallIndex::default();
     for u in units {
         // The bare method/fn name is whatever follows the last `::` in a
         // unit's own name — `"Ring::add<i32>"` -> `"add"`, `"fibonacci<i32>"`
@@ -1579,7 +1579,7 @@ pub fn convert_program(units: Vec<ConcreteUnit>, sources: Option<&SourceMap>) ->
         units.into_iter().map(|u| (u.name.clone(), u)).collect();
     let fresh = FreshVars::new();
     let mut funcs = Vec::new();
-    let op_lines: RefCell<HashMap<CVar, SrcLoc>> = RefCell::new(HashMap::new());
+    let op_lines: RefCell<HashMap<CVar, SrcLoc>> = RefCell::new(HashMap::default());
     // Sorted, not raw `by_name.values()` -- `HashMap` iteration order isn't
     // just unstable across runs (`std`'s randomized per-process hasher
     // seed), it directly drives fresh var/label *numbering* here (assigned
@@ -1645,7 +1645,7 @@ pub fn convert_program(units: Vec<ConcreteUnit>, sources: Option<&SourceMap>) ->
             op_lines: &op_lines,
             spawns: RefCell::new(Vec::new()),
         };
-        let mut env = CEnv::new();
+        let mut env = CEnv::default();
         let mut params = Vec::with_capacity(unit.params.len() + 1);
         for p in &unit.params {
             let v = fresh.var();
@@ -1844,7 +1844,7 @@ fn convert_scoped_block(
     ctx: &Ctx,
     k: &dyn Fn(CVal, &CEnv) -> CExpr,
 ) -> CExpr {
-    let reassigned = mutated_free_vars(block, &HashSet::new(), ctx);
+    let reassigned = mutated_free_vars(block, &HashSet::default(), ctx);
     convert_block(block, env, ctx, &|v, inner| {
         let mut out = env.clone();
         let outliving = reassigned
@@ -1908,7 +1908,7 @@ fn continue_after(
     // Whatever `rest` itself mutates in an *enclosing* scope — needed so
     // the "skip" path still hands `k` the correct, unmodified values for
     // anything `rest` would otherwise have gone on to reassign.
-    let mutated = mutated_free_vars_stmts(rest, &HashSet::new(), ctx);
+    let mutated = mutated_free_vars_stmts(rest, &HashSet::default(), ctx);
     let mut names: Vec<String> = mutated.keys().cloned().collect();
     names.sort();
     let mut carried: Vec<(String, CVar)> =
@@ -1980,7 +1980,7 @@ fn mutated_free_vars_stmts(
     ctx: &Ctx,
 ) -> HashMap<String, Ty> {
     let mut local_shadowed = shadowed.clone();
-    let mut escaping = HashMap::new();
+    let mut escaping = HashMap::default();
     for stmt in stmts {
         match &stmt.kind {
             StmtKind::Let { name, value, .. } => {
@@ -2087,7 +2087,7 @@ fn convert_stmts(stmts: &[Stmt], env: CEnv, ctx: &Ctx, k: &dyn Fn(CEnv) -> CExpr
             // statement-level awaits wait for once every task is started.
             let elems = spawned_elements(value).unwrap();
             let mut stmts: Vec<Stmt> = Vec::with_capacity(elems.len() + 1 + rest.len());
-            let mut names: HashMap<NodeId, String> = HashMap::new();
+            let mut names: HashMap<NodeId, String> = HashMap::default();
             for (k, (elem_id, call)) in elems.iter().enumerate() {
                 let synthetic = format!("__spawned{}_{k}", value.id.0);
                 names.insert(*elem_id, synthetic.clone());
@@ -2597,14 +2597,14 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
             // computed once, statically, from the source AST, not from
             // `env` itself.
             let mut mutated: HashMap<String, Ty> =
-                mutated_free_vars(then_branch, &HashSet::new(), ctx);
+                mutated_free_vars(then_branch, &HashSet::default(), ctx);
             match else_branch {
                 Some(eb) => match &**eb {
                     ElseBranch::If(e) => {
-                        mutated.extend(mutated_free_vars_expr(e, &HashSet::new(), ctx))
+                        mutated.extend(mutated_free_vars_expr(e, &HashSet::default(), ctx))
                     }
                     ElseBranch::Block(b) => {
-                        mutated.extend(mutated_free_vars(b, &HashSet::new(), ctx))
+                        mutated.extend(mutated_free_vars(b, &HashSet::default(), ctx))
                     }
                 },
                 None => {}
@@ -2721,8 +2721,8 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
             // each arm already terminates on its own, `k` is only ever
             // reached via the exit path.
             let mut mutated: HashMap<String, Ty> =
-                mutated_free_vars_expr(cond, &HashSet::new(), ctx);
-            mutated.extend(mutated_free_vars(body, &HashSet::new(), ctx));
+                mutated_free_vars_expr(cond, &HashSet::default(), ctx);
+            mutated.extend(mutated_free_vars(body, &HashSet::default(), ctx));
             let mut names: Vec<String> = mutated.keys().cloned().collect();
             names.sort();
             names.dedup();
@@ -2828,7 +2828,7 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                 // do. `var` itself seeds the shadow set: it's never a
                 // `let mut`, so an (illegal) assignment to it wouldn't have
                 // anywhere outer to escape to regardless.
-                let mut shadowed = HashSet::new();
+                let mut shadowed = HashSet::default();
                 shadowed.insert(var.clone());
                 let mutated: HashMap<String, Ty> = mutated_free_vars(body, &shadowed, ctx);
                 let mut names: Vec<String> = mutated.keys().cloned().collect();
@@ -2996,7 +2996,7 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                 ),
             };
 
-            let mut shadowed = HashSet::new();
+            let mut shadowed = HashSet::default();
             shadowed.insert(var.clone());
             let mutated: HashMap<String, Ty> = mutated_free_vars(body, &shadowed, ctx);
             let mut names: Vec<String> = mutated.keys().cloned().collect();
@@ -3136,7 +3136,7 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
         // on, so `running`/the break-value slot (if the loop's own
         // resolved type isn't `()`) are always present.
         ExprKind::Loop { body } => {
-            let mutated: HashMap<String, Ty> = mutated_free_vars(body, &HashSet::new(), ctx);
+            let mutated: HashMap<String, Ty> = mutated_free_vars(body, &HashSet::default(), ctx);
             let mut names: Vec<String> = mutated.keys().cloned().collect();
             names.sort();
             let mut carried: Vec<(String, CVar)> =
@@ -3790,7 +3790,7 @@ fn expr_contains_break(expr: &Expr) -> bool {
 /// (Stage 5, not handled here).
 fn mutated_free_vars(block: &Block, shadowed: &HashSet<String>, ctx: &Ctx) -> HashMap<String, Ty> {
     let mut local_shadowed = shadowed.clone();
-    let mut escaping = HashMap::new();
+    let mut escaping = HashMap::default();
     for stmt in &block.stmts {
         match &stmt.kind {
             StmtKind::Sync => {}
@@ -3837,7 +3837,7 @@ fn mutated_free_vars_expr(
         | ExprKind::ImaginaryLit { .. }
         | ExprKind::BoolLit(_)
         | ExprKind::Path(_)
-        | ExprKind::PackRef(_) => HashMap::new(),
+        | ExprKind::PackRef(_) => HashMap::default(),
         ExprKind::Call(_, _, args, ..) => args
             .iter()
             .flat_map(|a| mutated_free_vars_expr(a, shadowed, ctx))
@@ -3911,7 +3911,7 @@ fn mutated_free_vars_expr(
         // at all yet (closure conversion is a separate, later pass this
         // module doesn't implement, see its own doc comment), so nothing
         // downstream would ever read a mutation found inside one anyway.
-        ExprKind::Lambda { .. } => HashMap::new(),
+        ExprKind::Lambda { .. } => HashMap::default(),
     }
 }
 
@@ -3967,7 +3967,7 @@ fn lambda_free_vars_block(
     node_types: &HashMap<NodeId, Ty>,
 ) -> HashMap<String, Ty> {
     let mut local_shadowed = shadowed.clone();
-    let mut free = HashMap::new();
+    let mut free = HashMap::default();
     for stmt in &block.stmts {
         match &stmt.kind {
             StmtKind::Sync => {}
@@ -4003,23 +4003,23 @@ fn lambda_free_vars_expr(
         ExprKind::NumberLit { .. }
         | ExprKind::ImaginaryLit { .. }
         | ExprKind::BoolLit(_)
-        | ExprKind::PackRef(_) => HashMap::new(),
+        | ExprKind::PackRef(_) => HashMap::default(),
         ExprKind::Path(p) => {
             let name = p.segments.join("::");
             if shadowed.contains(&name) {
-                return HashMap::new();
+                return HashMap::default();
             }
             match node_types.get(&expr.id) {
                 // A const generic's value (`C` in `0..C`), converted like a
                 // literal (`convert_expr`'s `Path` arm): nothing to capture.
-                Some(Ty::Const(_)) => HashMap::new(),
-                Some(ty) => HashMap::from([(name, ty.clone())]),
+                Some(Ty::Const(_)) => HashMap::default(),
+                Some(ty) => HashMap::from_iter([(name, ty.clone())]),
                 // A const-generic reference (`N` in `[v; N]`), or some other
                 // name this particular `node_types` map doesn't cover -- not
                 // a real captured *value* either way (mirrors `convert_
                 // expr`'s own `ExprKind::Path` arm's identical const-generic
                 // case), nothing to capture.
-                None => HashMap::new(),
+                None => HashMap::default(),
             }
         }
         ExprKind::Call(_, _, args, ..) => args
@@ -4389,7 +4389,7 @@ pub fn eliminate_dead_code(program: CpsProgram) -> CpsProgram {
         .iter()
         .map(|f| (f.def.name.as_str(), f))
         .collect();
-    let mut reachable: HashSet<String> = HashSet::new();
+    let mut reachable: HashSet<String> = HashSet::default();
     // `main` is one root among possibly several: an `export fn` is, by its
     // own definition, an entry point an external host calls directly --
     // cleave's own `main` may never call it at all (that's the entire
@@ -4779,7 +4779,7 @@ pub fn check_spawn_purity(program: &CpsProgram, reentrant: &HashSet<String>) -> 
             }
         }
     }
-    let mut direct: HashMap<&str, (Vec<String>, Vec<String>)> = HashMap::new();
+    let mut direct: HashMap<&str, (Vec<String>, Vec<String>)> = HashMap::default();
     let mut spawn_sites: Vec<(&str, String)> = Vec::new();
     for f in &program.funcs {
         let (mut impure, mut callees, mut spawns) = (Vec::new(), Vec::new(), Vec::new());
@@ -4811,7 +4811,7 @@ pub fn check_spawn_purity(program: &CpsProgram, reentrant: &HashSet<String>) -> 
     let errors: Vec<String> = spawn_sites
         .iter()
         .filter_map(|(caller, unit)| {
-            let path = path_to_impure(unit, &direct, &mut HashSet::new())?;
+            let path = path_to_impure(unit, &direct, &mut HashSet::default())?;
             Some(format!(
                 "`{}` spawns `{}`, which reaches `{}`, an extern that is neither `#[pure]` nor `#[reentrant]` (path: {}): a spawned call runs in parallel and must not touch global state — random generator, printing, files",
                 crate::resolve::source_name(caller),

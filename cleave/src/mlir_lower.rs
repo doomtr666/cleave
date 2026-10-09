@@ -65,7 +65,7 @@ use melior::{
 // call, the one escape hatch melior itself doesn't wrap.
 use melior::StringRef;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 /// What a growing lowering pass needs threaded everywhere. `declared_externs`
 /// is a `RefCell` (rather than a `&mut` threaded alongside everything else)
@@ -396,7 +396,7 @@ pub(crate) fn build_di_subprograms<'c>(
     // Cache one `#llvm.di_file<...>` text per distinct file so functions
     // sharing a file (the common case) don't re-mint distinct file
     // attributes for no reason.
-    let mut file_cache: HashMap<u32, String> = HashMap::new();
+    let mut file_cache: HashMap<u32, String> = HashMap::default();
     let items: Vec<String> = funcs
         .iter()
         .map(|(name, loc)| {
@@ -514,7 +514,7 @@ pub fn lower_program<'c>(
             let field_affine = crate::alias_analysis::field_affine_positions(program, &affine_structs);
             (affine_structs, field_affine)
         } else {
-            (HashSet::new(), HashMap::new())
+            (HashSet::default(), HashMap::default())
         };
     if std::env::var("CLEAVE_TRACE_AFFINE_STRUCTS").is_ok() {
         let mut vars: Vec<&CVar> = affine_structs.iter().collect();
@@ -542,17 +542,17 @@ pub fn lower_program<'c>(
             module: &module,
             abi_fixed,
             entry_block: std::cell::Cell::new(None),
-            homes: RefCell::new(HashMap::new()),
-            by_pointer_returns: RefCell::new(HashSet::new()),
+            homes: RefCell::new(HashMap::default()),
+            by_pointer_returns: RefCell::new(HashSet::default()),
             result_out: std::cell::Cell::new(None),
-            declared_externs: RefCell::new(HashSet::new()),
+            declared_externs: RefCell::new(HashSet::default()),
             signatures,
             mlir_types: mlir_types.clone(),
             struct_schemas,
             region_local_fns,
             currently_region_local: std::cell::Cell::new(false),
             pending_rebinds: RefCell::new(Vec::new()),
-            field_views: RefCell::new(HashMap::new()),
+            field_views: RefCell::new(HashMap::default()),
             constructed_structs,
             field_mutated_structs,
             extern_boundary_structs,
@@ -937,7 +937,7 @@ pub(crate) fn is_light_struct(
     extern_boundary: &HashSet<String>,
     constructed: &HashSet<String>,
 ) -> bool {
-    let mut visiting = HashSet::new();
+    let mut visiting = HashSet::default();
     is_light_struct_rec(
         name,
         type_args,
@@ -1767,7 +1767,7 @@ fn spawned_units(program: &CpsProgram) -> HashSet<String> {
             }
         }
     }
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     for f in &program.funcs {
         walk(&f.def.body, &mut out);
     }
@@ -1885,7 +1885,7 @@ fn lower_top_level_fn<'c>(ctx: &LowerCtx<'c, '_>, f: &CTopLevelFn) -> Operation<
     // `f.def.params` is `[ordinary params..., k_ret]` -- `f.param_types`
     // covers only the ordinary ones (see `CTopLevelFn`'s own doc comment),
     // so zip against everything but the last entry.
-    let mut env: HashMap<CVar, Value> = HashMap::new();
+    let mut env: HashMap<CVar, Value> = HashMap::default();
     ctx.homes.borrow_mut().clear();
     let first_param = usize::from(returns_by_pointer);
     ctx.result_out.set(returns_by_pointer.then(|| block.argument(0).unwrap().to_raw()));
@@ -2489,7 +2489,7 @@ fn lower_loop<'c>(
     // region_local_fns`, the same whole-program set `lower_top_level_fn`
     // already consults for the identical reason.
     let top_level_names: HashSet<String> = ctx.signatures.keys().cloned().collect();
-    let mut loop_callees: HashSet<String> = HashSet::new();
+    let mut loop_callees: HashSet<String> = HashSet::default();
     crate::region_analysis::collect_direct_callees(then_branch, &top_level_names, &mut loop_callees);
     // Only a callee that may actually allocate in the arena needs one: a
     // region-local function computing scalars (`log_sum_exp_row`, one call
@@ -5840,7 +5840,7 @@ fn copy_array_into_llvm_field<'c>(
 /// access, the bulk of a cross-entropy step's cost (profiled: ~60% in
 /// `cleave_alloc_rc`/`cleave_release`); on the stack, once `index` is
 /// inlined, it disappears. Every loop body already restores the stack each
-/// iteration (`pipeline.rs::insert_stack_scopes_in_loops`).
+/// iteration (`cleave-insert-stack-scopes`).
 fn stack_index_arrays(program: &CpsProgram) -> HashSet<CVar> {
     fn small_scalar_array(ty: &Ty) -> bool {
         matches!(ty, Ty::Array(elem, size)
@@ -5885,8 +5885,8 @@ fn stack_index_arrays(program: &CpsProgram) -> HashSet<CVar> {
             }
         }
     }
-    let mut candidates = HashSet::new();
-    let mut other_uses = HashSet::new();
+    let mut candidates = HashSet::default();
+    let mut other_uses = HashSet::default();
     for f in &program.funcs {
         walk(&f.def.body, &mut candidates, &mut other_uses);
     }
@@ -5941,7 +5941,7 @@ fn region_allocating_fns(
             if !region_local_fns.contains(&f.def.name) || out.contains(&f.def.name) {
                 continue;
             }
-            let mut callees = HashSet::new();
+            let mut callees = HashSet::default();
             crate::region_analysis::collect_direct_callees(&f.def.body, &top_level_names, &mut callees);
             if callees.iter().any(|c| out.contains(c)) {
                 out.insert(f.def.name.clone());
@@ -6707,7 +6707,7 @@ fn build_to_buffer_dynamic_layout<'c>(
 /// producer writes straight into the field (`build_tensor_descriptor_value`'s
 /// own doc comment). The field buffer itself still follows `alloc_llvm_value`'s
 /// arena-vs-heap decision; only an unstored temporary now goes through
-/// One-Shot's allocation (the pooled `cleave_alloc_rc`, `unify_alloc.rs`)
+/// One-Shot's allocation (the pooled `cleave_alloc_rc`, `cleave-unify-tensor-allocations`)
 /// instead of the arena.
 fn tensor_seed<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, result_ty: Type<'c>) -> Value<'c, 'c> {
     let location = gen_loc(ctx.context);

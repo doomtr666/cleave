@@ -1,254 +1,119 @@
-//! The first real cleave shim: one function, `cleaveExecutionEngineCreate
-//! WithTarget` (`cpp/shim.cpp`), giving real `--target-cpu`/`--target-
-//! features` control over the `TargetMachine` `mlir::ExecutionEngine`
-//! actually JIT-compiles with -- a real gap `melior`/`mlir-sys` can't close
-//! themselves (`doc/backlog.md`'s own entry has the full story: `mlirExecu
-//! tionEngineCreate`'s C API always calls `JITTargetMachineBuilder::detect
-//! Host()` with no override hook at all).
-//!
-//! Deliberately minimal, matching this project's own recommended sequencing
-//! for the shim as a whole (`doc/backlog.md`'s melior/mlir-sys decision
-//! entry): one function, no new types beyond a thin wrapper mirroring
-//! `melior::ExecutionEngine`'s own shape, depends on `mlir-sys` directly
-//! (not `melior`, whose own `ExecutionEngine` has a private `raw` field
-//! this crate has no way to construct from an externally-built handle) --
-//! proves the build/link/FFI shape on the narrowest possible real surface
-//! before deciding whether to extend it.
+//! cleave's C API over MLIR and LLVM (`cpp/shim.cpp`, `doc/plan-mlir-shim.md`):
+//! the target code is generated for (`Target`), an object file
+//! (`emit_object`), a JIT (`ExecutionEngine`), and the IR rewrites cleave's
+//! pipeline runs.
 
 use mlir_sys::{
-    MlirExecutionEngine, MlirModule, MlirOperation, MlirStringRef, mlirExecutionEngineDestroy,
-    mlirExecutionEngineDumpToObjectFile, mlirExecutionEngineInvokePacked,
-    mlirExecutionEngineLookup, mlirExecutionEngineRegisterSymbol,
+    MlirContext, MlirExecutionEngine, MlirModule, MlirStringRef, mlirExecutionEngineDestroy,
+    mlirExecutionEngineInvokePacked, mlirExecutionEngineLookup, mlirExecutionEngineRegisterSymbol,
 };
 
+/// `cpp/shim.cpp`'s `CleaveTarget`, opaque here.
+#[repr(C)]
+struct RawTarget {
+    _private: [u8; 0],
+}
+
+/// Receives an error message from the shim: `user_data` is a `&mut String`.
+type ErrorCallback =
+    unsafe extern "C" fn(*const std::os::raw::c_char, usize, *mut std::ffi::c_void);
+
+unsafe extern "C" fn keep_error(
+    message: *const std::os::raw::c_char,
+    len: usize,
+    user_data: *mut std::ffi::c_void,
+) {
+    // SAFETY: the shim passes `len` bytes at `message`, and `user_data` is the
+    // `&mut String` its caller handed over (`with_error`).
+    unsafe {
+        let bytes = std::slice::from_raw_parts(message as *const u8, len);
+        *(user_data as *mut String) = String::from_utf8_lossy(bytes).into_owned();
+    }
+}
+
+/// Calls `f` with the shim's error callback and its user data, returning
+/// what `f` returns and the message the shim reported, if any.
+fn with_error<T>(f: impl FnOnce(ErrorCallback, *mut std::ffi::c_void) -> T) -> (T, String) {
+    let mut message = String::new();
+    let result = f(
+        keep_error,
+        &mut message as *mut String as *mut std::ffi::c_void,
+    );
+    (result, message)
+}
+
 unsafe extern "C" {
-    fn cleaveExecutionEngineCreateWithTarget(
-        op: MlirModule,
+    fn cleaveTargetCreate(
+        cpu: MlirStringRef,
+        features: MlirStringRef,
         opt_level: i32,
+        pic: bool,
+        loop_unroll: bool,
+        on_error: ErrorCallback,
+        user_data: *mut std::ffi::c_void,
+    ) -> *mut RawTarget;
+    fn cleaveTargetDestroy(target: *mut RawTarget);
+    fn cleaveEmitObject(
+        module: MlirModule,
+        target: *mut RawTarget,
+        path: MlirStringRef,
+        on_error: ErrorCallback,
+        user_data: *mut std::ffi::c_void,
+    ) -> bool;
+    fn cleaveJitCreate(
+        module: MlirModule,
+        target: *mut RawTarget,
         num_paths: i32,
         shared_lib_paths: *const MlirStringRef,
-        enable_object_dump: bool,
-        enable_pic: bool,
-        target_cpu: MlirStringRef,
-        target_features: MlirStringRef,
-        loop_unroll: bool,
+        on_error: ErrorCallback,
+        user_data: *mut std::ffi::c_void,
     ) -> MlirExecutionEngine;
-    fn cleaveApproximateMath(op: MlirOperation) -> bool;
-    fn cleaveHoistArgSlots(op: MlirOperation);
-    fn cleaveHostCpuName(buffer: *mut std::os::raw::c_char, size: usize) -> usize;
-    fn cleaveLowerAdoptions(op: MlirOperation);
-    fn cleaveElideBlockCopies(op: MlirOperation) -> i64;
-    fn cleaveBlasTileAndFuse(op: MlirOperation, rows: i64) -> i64;
-    fn cleaveLowerBlasMatmuls(op: MlirOperation) -> i64;
-    fn cleaveReuseDyingInputs(op: MlirOperation) -> i64;
-    fn cleaveDeallocAtLastUse(op: MlirOperation) -> i64;
-    fn cleaveFoldPassthroughIterArgs(op: MlirOperation) -> i64;
-    fn cleaveBindTeams(op: MlirOperation) -> i64;
-    fn cleaveForwardCopiesToDestinations(op: MlirOperation) -> i64;
-    fn cleaveLimitInlining(op: MlirOperation, threshold: i64) -> i64;
-    fn cleaveApplyNoInline(op: MlirOperation);
-    fn cleaveCopyAggregatesInMemory(op: MlirOperation, min_bytes: i64) -> i64;
-    fn cleaveLowerSpawns(op: MlirOperation, tasks: bool) -> bool;
+    fn cleaveRegisterPasses();
+    fn cleaveRunPipeline(
+        module: MlirModule,
+        pipeline: MlirStringRef,
+        statistics: bool,
+        on_error: ErrorCallback,
+        user_data: *mut std::ffi::c_void,
+    ) -> bool;
+    fn cleaveLoadTransformLibrary(context: MlirContext, text: MlirStringRef, name: MlirStringRef) -> bool;
 }
 
-/// Turns `spawn`'s markers into OpenMP tasks after bufferization
-/// (`cpp/shim.cpp`'s `cleaveLowerSpawns`): each spawned call in an
-/// `omp.task`, each wait an `omp.taskwait`, each spawning function wrapped to
-/// run on a parallel region's team. With `tasks` false, the markers are only
-/// removed: each spawned call runs in place, no wait, no OpenMP (serial
-/// elision). `false` if `op` isn't a module.
+/// Registers cleave's passes and MLIR's, for pipelines to name them
+/// (`cpp/shim.cpp`: `cleave-elide-block-copies`, `cleave-lower-spawns{tasks=..}`,
+/// ...). Idempotent; `run_pipeline` calls it.
+pub fn register_passes() {
+    unsafe { cleaveRegisterPasses() }
+}
+
+/// Runs the textual pipeline `pipeline` (`builtin.module(...)`) on `module`,
+/// printing the pass statistics on stderr if `statistics` (what cleave's own
+/// passes rewrote). An error for a pipeline that doesn't parse; a failing
+/// pass reports through the context's diagnostic handlers and returns
+/// `Err` with an empty message.
 ///
 /// # Safety
 ///
-/// `op` must be a valid module, not used concurrently.
-pub unsafe fn lower_spawns(op: MlirOperation, tasks: bool) -> bool {
-    unsafe { cleaveLowerSpawns(op, tasks) }
+/// `module` must be a valid module, not used concurrently.
+pub unsafe fn run_pipeline(module: MlirModule, pipeline: &str, statistics: bool) -> Result<(), String> {
+    let (ok, message) = with_error(|on_error, user_data| unsafe {
+        cleaveRunPipeline(module, str_ref(pipeline), statistics, on_error, user_data)
+    });
+    if ok { Ok(()) } else { Err(message) }
 }
 
-/// Rewrites `tanh`/`exp`/`log` and their relatives under `op` into
-/// polynomial approximations (`cpp/shim.cpp`'s `cleaveApproximateMath`), so
-/// they vectorize instead of becoming one libm call per vector element.
-/// `false` if the rewrite didn't converge.
+/// Loads the transform module `text` into the transform dialect's library for
+/// `context`, for `transform-interpreter` to find the sequences it names:
+/// `transform-preload-library`, from memory. `name` names it in diagnostics.
+/// `false` on error, reported through the context's diagnostic handlers.
 ///
 /// # Safety
 ///
-/// `op` must be a valid operation, not used concurrently.
-pub unsafe fn approximate_math(op: MlirOperation) -> bool {
-    unsafe { cleaveApproximateMath(op) }
+/// `context` must be a valid context, not used concurrently.
+pub unsafe fn load_transform_library(context: MlirContext, text: &str, name: &str) -> bool {
+    unsafe { cleaveLoadTransformLibrary(context, str_ref(text), str_ref(name)) }
 }
 
-/// The host CPU's LLVM name (`znver5`, ...): what `native` stands for.
-pub fn host_cpu_name() -> String {
-    let mut buffer = vec![0u8; 128];
-    let len = unsafe { cleaveHostCpuName(buffer.as_mut_ptr().cast(), buffer.len()) };
-    buffer.truncate(len.min(buffer.len() - 1));
-    String::from_utf8_lossy(&buffer).into_owned()
-}
-
-/// Moves every argument slot (`cleave.arg_slot`, `cleave.spawn_arg_slot`)
-/// an inlined call left in a non-entry block of its function back to the
-/// entry block, and bounds an ordinary call's slot's lifetime to its uses so
-/// that LLVM can share storage between slots (`cpp/shim.cpp`'s
-/// `cleaveHoistArgSlots`). Run once loops are blocks.
-///
-/// # Safety
-///
-/// `op` must be a valid operation, not used concurrently.
-pub unsafe fn hoist_arg_slots(op: MlirOperation) {
-    unsafe { cleaveHoistArgSlots(op) }
-}
-
-/// Removes the copy out and back in of a block of a buffer that something
-/// writing through a pointer (an `extern` such as `sgemm`) was given as its
-/// destination, the block read as a slice and put back at the same place
-/// (`cpp/shim.cpp`'s `cleaveElideBlockCopies`): it writes the block itself.
-/// Returns how many blocks it rewrote. Run after One-Shot Bufferize, before
-/// the deallocation passes.
-///
-/// # Safety
-///
-/// `op` must be a valid operation, not used concurrently.
-pub unsafe fn elide_block_copies(op: MlirOperation) -> i64 {
-    unsafe { cleaveElideBlockCopies(op) }
-}
-
-/// Writes a fresh buffer's contents straight into the destination it is
-/// then copied whole into, of the same type (a function result's
-/// out-parameter), instead of copying (`cpp/shim.cpp`'s
-/// `cleaveForwardCopiesToDestinations`). Returns how many buffers it
-/// forwarded. Run after `buffer-results-to-out-params`, before the
-/// deallocation passes.
-///
-/// # Safety
-///
-/// `op` must be a valid operation, not used concurrently.
-pub unsafe fn forward_copies_to_destinations(op: MlirOperation) -> i64 {
-    unsafe { cleaveForwardCopiesToDestinations(op) }
-}
-
-/// Tiles by `rows` rows the elementwise consumer of each product marked for
-/// BLAS (`linalg.matmul` with `cleave.blas`), the product and its
-/// initialization fused into the loop, so that each tile of the product is
-/// consumed while still in cache (`cpp/shim.cpp`'s `cleaveBlasTileAndFuse`).
-/// Returns how many products it fused. Run on tensors, before
-/// `lower_blas_matmuls`.
-///
-/// # Safety
-///
-/// `op` must be a valid operation, not used concurrently.
-pub unsafe fn blas_tile_and_fuse(op: MlirOperation, rows: i64) -> i64 {
-    unsafe { cleaveBlasTileAndFuse(op, rows) }
-}
-
-/// Turns each product marked for BLAS (`linalg.matmul` with `cleave.blas`),
-/// tiled or not, into a call to `cleave_blas_sgemm` on its operands'
-/// buffers (`cpp/shim.cpp`'s `cleaveLowerBlasMatmuls`). Returns how many it
-/// lowered. Run on tensors, before One-Shot Bufferize.
-///
-/// # Safety
-///
-/// `op` must be a valid `builtin.module`, not used concurrently.
-pub unsafe fn lower_blas_matmuls(op: MlirOperation) -> i64 {
-    unsafe { cleaveLowerBlasMatmuls(op) }
-}
-
-/// Makes each elementwise op that writes a fresh tensor write into one of
-/// its operands instead, when that operand is a local result with no other
-/// use (`cpp/shim.cpp`'s `cleaveReuseDyingInputs`). Returns how many ops it
-/// rewrote. Run before One-Shot Bufferize.
-///
-/// # Safety
-///
-/// `op` must be a valid operation, not used concurrently.
-pub unsafe fn reuse_dying_inputs(op: MlirOperation) -> i64 {
-    unsafe { cleaveReuseDyingInputs(op) }
-}
-
-/// Moves each buffer's deallocation to just after its last use in its block
-/// (`cpp/shim.cpp`'s `cleaveDeallocAtLastUse`), where the ownership-based
-/// deallocation put it at the block's end. Returns how many moved.
-///
-/// # Safety
-/// `op` must be a valid module operation.
-pub unsafe fn dealloc_at_last_use(op: MlirOperation) -> i64 {
-    unsafe { cleaveDeallocAtLastUse(op) }
-}
-
-/// Removes the values loops carry and yield back unchanged
-/// (`cpp/shim.cpp`'s `cleaveFoldPassthroughIterArgs`), so that the
-/// deallocation's alias analysis sees where a loop's result comes from.
-/// Returns how many went.
-///
-/// # Safety
-/// `op` must be a valid module operation.
-pub unsafe fn fold_passthrough_iter_args(op: MlirOperation) -> i64 {
-    unsafe { cleaveFoldPassthroughIterArgs(op) }
-}
-
-/// Starts every `omp.parallel` region with each member placing itself on a
-/// physical core of its own (`cleave_bind_worker`, `cleave-rt`;
-/// `cpp/shim.cpp`'s `cleaveBindTeams`). Returns how many regions it marked.
-/// Run once the parallel regions exist, before `--convert-openmp-to-llvm`.
-///
-/// # Safety
-///
-/// `op` must be a valid `builtin.module`, not used concurrently.
-pub unsafe fn bind_teams(op: MlirOperation) -> i64 {
-    unsafe { cleaveBindTeams(op) }
-}
-
-/// Turns each adoption (a `bufferization.clone` marked `cleave.adopt`,
-/// `mlir_lower.rs`'s `PrimOp::Adopt`) into a retain of the same buffer
-/// (`cpp/shim.cpp`'s `cleaveLowerAdoptions`). Run after the buffer
-/// deallocation passes, before `bufferization-to-memref`.
-///
-/// # Safety
-///
-/// `op` must be a valid `builtin.module`, not used concurrently.
-pub unsafe fn lower_adoptions(op: MlirOperation) {
-    unsafe { cleaveLowerAdoptions(op) }
-}
-
-/// Marks `no_inline` every `func.call` whose callee, inlined, would exceed
-/// `threshold` operations: its own body plus everything it would inline in
-/// turn (`cpp/shim.cpp`'s `cleaveLimitInlining`). Returns how many calls it
-/// marked. Run right before MLIR's inliner.
-///
-/// # Safety
-///
-/// `op` must be a valid `builtin.module`, not used concurrently.
-pub unsafe fn limit_inlining(op: MlirOperation, threshold: i64) -> i64 {
-    unsafe { cleaveLimitInlining(op, threshold) }
-}
-
-/// Gives LLVM's `noinline` to every `llvm.func` [`limit_inlining`] marked
-/// (`cpp/shim.cpp`'s `cleaveApplyNoInline`), so LLVM's own inliner keeps it
-/// out of line too. Run once the module is in the LLVM dialect.
-///
-/// # Safety
-///
-/// `op` must be a valid operation, not used concurrently.
-pub unsafe fn apply_no_inline(op: MlirOperation) {
-    unsafe { cleaveApplyNoInline(op) }
-}
-
-/// Turns each memory-to-memory copy of an aggregate of at least `min_bytes`
-/// written as a load, `extractvalue`s and a store into a `memcpy`
-/// (`cpp/shim.cpp`'s `cleaveCopyAggregatesInMemory`), where provably
-/// equivalent. Returns the number rewritten. Run on the LLVM dialect.
-///
-/// # Safety
-///
-/// `op` must be a valid `builtin.module`, not used concurrently.
-pub unsafe fn copy_aggregates_in_memory(op: MlirOperation, min_bytes: i64) -> i64 {
-    unsafe { cleaveCopyAggregatesInMemory(op, min_bytes) }
-}
-
-/// Borrows `s`'s own bytes -- the C++ side only ever reads this synchronously
-/// during the call it's passed to, so no ownership/lifetime story beyond the
-/// call itself is needed (matches `melior::string_ref::StringRef::new`'s own
-/// same-shaped contract, reimplemented here rather than pulling in `melior`
-/// as a whole for one helper).
 fn str_ref(s: &str) -> MlirStringRef {
     MlirStringRef {
         data: s.as_ptr() as *const _,
@@ -256,49 +121,95 @@ fn str_ref(s: &str) -> MlirStringRef {
     }
 }
 
-/// An `mlir::ExecutionEngine`, built with a real, explicit CPU/feature-set
-/// `TargetMachine` instead of whatever `JITTargetMachineBuilder::detectHost`
-/// finds. Mirrors `melior::ExecutionEngine`'s own public surface (`lookup`/
-/// `invoke_packed`/`register_symbol`/`dump_to_object_file`) so a caller
-/// already using that type has nothing new to learn -- just a different
-/// constructor.
+/// The machine code is generated for and how it is optimized: the host's,
+/// unless a CPU (`native`: the host's, with every feature it has) or a
+/// comma-separated `+f`/`-f` feature list says otherwise. Built once, used
+/// for objects (`emit_object`) and JITs (`ExecutionEngine`).
+pub struct Target {
+    raw: *mut RawTarget,
+}
+
+impl Target {
+    /// `opt_level` 0 to 3; `loop_unroll` lets LLVM unroll loops. An unknown
+    /// CPU or feature list is an error.
+    pub fn new(
+        cpu: Option<&str>,
+        features: Option<&str>,
+        opt_level: usize,
+        pic: bool,
+        loop_unroll: bool,
+    ) -> Result<Self, String> {
+        let (raw, message) = with_error(|on_error, user_data| unsafe {
+            cleaveTargetCreate(
+                str_ref(cpu.unwrap_or("")),
+                str_ref(features.unwrap_or("")),
+                opt_level as i32,
+                pic,
+                loop_unroll,
+                on_error,
+                user_data,
+            )
+        });
+        if raw.is_null() {
+            Err(message)
+        } else {
+            Ok(Self { raw })
+        }
+    }
+}
+
+impl Drop for Target {
+    fn drop(&mut self) {
+        unsafe { cleaveTargetDestroy(self.raw) }
+    }
+}
+
+/// Writes `module`, in the LLVM dialect, as an object file at `path`,
+/// compiled for `target`. Its external symbols are left for the linker.
+///
+/// # Safety
+///
+/// `module` must be a valid module, not used concurrently.
+pub unsafe fn emit_object(module: MlirModule, target: &Target, path: &str) -> Result<(), String> {
+    let (ok, message) = with_error(|on_error, user_data| unsafe {
+        cleaveEmitObject(module, target.raw, str_ref(path), on_error, user_data)
+    });
+    if ok { Ok(()) } else { Err(message) }
+}
+
+/// A JIT (`mlir::ExecutionEngine`) for a module in the LLVM dialect.
 pub struct ExecutionEngine {
     raw: MlirExecutionEngine,
 }
 
 impl ExecutionEngine {
-    /// `target_cpu`/`target_features` -- pass `""` for either to keep
-    /// `detectHost`'s own untouched behaviour for that one axis. The two
-    /// non-empty cases match exactly how `stamp_target_cpu` (`cleave/src/
-    /// pipeline.rs`) already formats these two values as real `llvm.func`
-    /// attributes today (a plain CPU name; a comma-separated `+feature`/
-    /// `-feature` list) -- this is the same string, just finally reaching
-    /// somewhere that has a real effect on the compiled code.
-    pub fn new(
+    /// Compiles `module` for `target`, loading `shared_library_paths` for
+    /// the symbols they define.
+    ///
+    /// # Safety
+    ///
+    /// `module` must be a valid module, not used concurrently.
+    pub unsafe fn new(
         module: MlirModule,
-        optimization_level: usize,
+        target: &Target,
         shared_library_paths: &[&str],
-        enable_object_dump: bool,
-        enable_pic: bool,
-        target_cpu: &str,
-        target_features: &str,
-        loop_unroll: bool,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let paths: Vec<MlirStringRef> = shared_library_paths.iter().map(|s| str_ref(s)).collect();
-        let raw = unsafe {
-            cleaveExecutionEngineCreateWithTarget(
+        let (raw, message) = with_error(|on_error, user_data| unsafe {
+            cleaveJitCreate(
                 module,
-                optimization_level as i32,
+                target.raw,
                 paths.len() as i32,
                 paths.as_ptr(),
-                enable_object_dump,
-                enable_pic,
-                str_ref(target_cpu),
-                str_ref(target_features),
-                loop_unroll,
+                on_error,
+                user_data,
             )
-        };
-        Self { raw }
+        });
+        if raw.ptr.is_null() {
+            Err(message)
+        } else {
+            Ok(Self { raw })
+        }
     }
 
     pub fn lookup(&self, name: &str) -> *mut () {
@@ -331,10 +242,6 @@ impl ExecutionEngine {
     /// may call through it at any point until this engine is dropped.
     pub unsafe fn register_symbol(&self, name: &str, ptr: *mut ()) {
         unsafe { mlirExecutionEngineRegisterSymbol(self.raw, str_ref(name), ptr as _) }
-    }
-
-    pub fn dump_to_object_file(&self, path: &str) {
-        unsafe { mlirExecutionEngineDumpToObjectFile(self.raw, str_ref(path)) }
     }
 }
 

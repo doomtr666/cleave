@@ -146,7 +146,7 @@ fn a_generalized_self_recursive_function_does_not_show_a_contradictory_default_i
 #[test]
 fn an_impl_method_can_call_an_ordinary_top_level_function() {
     // A real bug, found by direct testing: an `impl` method's own `env` was
-    // always empty (`Env::new()`, never connected to `callgraph.rs`'s
+    // always empty (`Env::default()`, never connected to `callgraph.rs`'s
     // `global_env`) -- calling *any* top-level `fn`, even a wholly ordinary
     // non-generic one, silently fell through to `infer_call`'s
     // `<unresolved-call:...>` placeholder, with no error at all (the
