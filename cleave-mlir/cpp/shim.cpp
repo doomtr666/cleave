@@ -917,6 +917,145 @@ static int64_t cleaveForwardCopiesToDestinations(MlirOperation op) {
   return forwarded;
 }
 
+// Whether a function's argument is only read: by itself and through every
+// view of it, in the function and in whatever it passes it to. Keyed by
+// function and argument number; a function being analyzed counts as
+// read-only for the recursion through it (any write found still makes the
+// whole answer false).
+using ReadOnlyArguments = llvm::DenseMap<std::pair<Operation *, unsigned>, bool>;
+
+static bool valueOnlyRead(Value v, ModuleOp module, ReadOnlyArguments &memo);
+
+static bool argumentOnlyRead(func::FuncOp callee, unsigned index, ModuleOp module, ReadOnlyArguments &memo) {
+  if (callee.isExternal() || index >= callee.getNumArguments())
+    return false;
+  auto key = std::make_pair(callee.getOperation(), index);
+  if (auto known = memo.find(key); known != memo.end())
+    return known->second;
+  memo[key] = true;
+  bool onlyRead = valueOnlyRead(callee.getArgument(index), module, memo);
+  memo[key] = onlyRead;
+  return onlyRead;
+}
+
+// Whether the use `use` of a memref only reads it.
+static bool useOnlyReads(OpOperand &use, ModuleOp module, ReadOnlyArguments &memo) {
+  Operation *user = use.getOwner();
+  Value v = use.get();
+  if (auto call = dyn_cast<func::CallOp>(user)) {
+    auto callee = module.lookupSymbol<func::FuncOp>(call.getCallee());
+    return callee && argumentOnlyRead(callee, use.getOperandNumber(), module, memo);
+  }
+  // A view of it: read only if every use of the view is.
+  if (isa<memref::CastOp, memref::SubViewOp, memref::ReinterpretCastOp, memref::CollapseShapeOp,
+          memref::ExpandShapeOp, memref::TransposeOp, memref::ExtractStridedMetadataOp>(user))
+    return llvm::all_of(user->getResults(), [&](Value result) {
+      return !isa<BaseMemRefType>(result.getType()) || valueOnlyRead(result, module, memo);
+    });
+  if (isa<memref::DimOp>(user))
+    return true;
+  // What the operation declares it does to this operand: only reads.
+  auto effects = dyn_cast<MemoryEffectOpInterface>(user);
+  if (!effects)
+    return false;
+  SmallVector<MemoryEffects::EffectInstance> instances;
+  effects.getEffects(instances);
+  for (const MemoryEffects::EffectInstance &effect : instances) {
+    if (isa<MemoryEffects::Read>(effect.getEffect()))
+      continue;
+    // A write, an allocation or a free: on this operand, or on what isn't
+    // said (any memory).
+    if (!effect.getValue() || effect.getValue() == v)
+      return false;
+  }
+  return true;
+}
+
+static bool valueOnlyRead(Value v, ModuleOp module, ReadOnlyArguments &memo) {
+  return llvm::all_of(v.getUses(), [&](OpOperand &use) { return useOnlyReads(use, module, memo); });
+}
+
+// A buffer copied whole into a fresh one only to change its layout, the
+// copy then passed to functions that only read it (a BLAS product, laid
+// out dynamically for `sgemm` by `cleaveLowerBlasMatmuls`, passed to a
+// function whose parameter has the plain layout: One-Shot Bufferize copies
+// it, and the source is read again afterwards, so
+// `cleaveForwardCopiesToDestinations` keeps the copy):
+//
+//   %src = memref.cast %buf          (%buf of the plain layout)
+//   %d = memref.alloc()              (the plain layout too)
+//   memref.copy %src, %d
+//   call @f(%d)                      (`f` only reads that argument)
+//
+// The calls get %buf itself, the copy and %d go: the same memory, read the
+// same way, when nothing writes %buf between the copy and the last call.
+// Returns how many copies it removed.
+static int64_t cleaveForwardReadOnlyArguments(MlirOperation op) {
+  auto module = dyn_cast<ModuleOp>(unwrap(op));
+  if (!module)
+    return 0;
+  ReadOnlyArguments memo;
+  SmallVector<memref::CopyOp> copies;
+  module->walk([&](memref::CopyOp copy) { copies.push_back(copy); });
+  int64_t forwarded = 0;
+  for (memref::CopyOp copy : copies) {
+    auto cast = copy.getSource().getDefiningOp<memref::CastOp>();
+    auto alloc = copy.getTarget().getDefiningOp<memref::AllocOp>();
+    if (!cast || !alloc || cast.getSource().getType() != alloc.getType() || alloc->getBlock() != copy->getBlock() ||
+        !alloc->isBeforeInBlock(copy))
+      continue;
+    Value buffer = cast.getSource();
+    Block *block = copy->getBlock();
+    // The copy's only uses: the copy, calls after it in this block reading
+    // it, and its frees.
+    SmallVector<OpOperand *> calls;
+    SmallVector<Operation *> frees;
+    Operation *last = copy.getOperation();
+    bool ok = true;
+    for (OpOperand &use : alloc.getResult().getUses()) {
+      Operation *user = use.getOwner();
+      if (user == copy.getOperation())
+        continue;
+      if (isa<memref::DeallocOp>(user)) {
+        frees.push_back(user);
+        continue;
+      }
+      if (!isa<func::CallOp>(user) || user->getBlock() != block || !copy->isBeforeInBlock(user) ||
+          !useOnlyReads(use, module, memo)) {
+        ok = false;
+        break;
+      }
+      calls.push_back(&use);
+      if (last->isBeforeInBlock(user))
+        last = user;
+    }
+    if (!ok || calls.empty())
+      continue;
+    // Nothing writes `buffer` (or a view of it) between the copy and the
+    // last call.
+    Value root = viewRoot(buffer);
+    for (Operation *o = copy->getNextNode(); ok && o && o != last->getNextNode(); o = o->getNextNode())
+      o->walk([&](Operation *inner) {
+        for (OpOperand &operand : inner->getOpOperands())
+          if (isa<BaseMemRefType>(operand.get().getType()) && viewRoot(operand.get()) == root &&
+              !useOnlyReads(operand, module, memo))
+            ok = false;
+      });
+    if (!ok)
+      continue;
+    for (OpOperand *use : calls)
+      use->set(buffer);
+    copy.erase();
+    for (Operation *free : frees)
+      free->erase();
+    alloc.erase();
+    if (cast->use_empty())
+      cast.erase();
+    ++forwarded;
+  }
+  return forwarded;
+}
+
 // The only consumer of `product`'s result when it is pointwise over the
 // product's rows (two parallel loops, one result written through the
 // identity, every operand read through a projected permutation, the product
@@ -1866,6 +2005,10 @@ CLEAVE_COUNTING_PASS(ForwardCopiesToDestinationsPass,
                      "cleave-forward-copies-to-destinations",
                      "results written in their destination",
                      cleaveForwardCopiesToDestinations)
+CLEAVE_COUNTING_PASS(ForwardReadOnlyArgumentsPass,
+                     "cleave-forward-read-only-arguments",
+                     "layout-only copies passed to read-only parameters, removed",
+                     cleaveForwardReadOnlyArguments)
 CLEAVE_COUNTING_PASS(FoldPassthroughIterArgsPass,
                      "cleave-fold-passthrough-iter-args",
                      "loop-carried values yielded back unchanged, removed",
@@ -2716,6 +2859,7 @@ extern "C" void cleaveRegisterPasses() {
     PassRegistration<ReuseDyingInputsPass>();
     PassRegistration<ElideBlockCopiesPass>();
     PassRegistration<ForwardCopiesToDestinationsPass>();
+    PassRegistration<ForwardReadOnlyArgumentsPass>();
     PassRegistration<FoldPassthroughIterArgsPass>();
     PassRegistration<LowerAdoptionsPass>();
     PassRegistration<DeallocAtLastUsePass>();

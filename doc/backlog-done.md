@@ -3392,3 +3392,37 @@ doc corrected). Under `--no-inline` the matmul is vectorized (16 vector FMAs, no
 18 examples' LLVM dialect is unchanged (MLIR folded it there). Test:
 `language_model_ops.rs::a_branch_decided_by_a_specialized_functions_sizes_is_pruned`.
 
+### A BLAS result passed to a function and read again later was copied at the call
+
+Eight per nanoLM micro-batch (one per layer, 1.5 MB each, ~1% of the step's traffic, 2026-10-08):
+the value projection, computed by `sgemm` into a buffer of dynamic layout (`cleaveLowerBlasMatmuls`:
+the layout `cleaveElideBlockCopies`' soundness needs), passed to `causal_attention`, whose
+parameter has the plain layout (`function-boundary-type-conversion=identity-layout-map`). One-Shot
+Bufferize can't cast a dynamic layout to the plain one without a check, so it copies. The reverse
+copy forwarding (`cleaveForwardCopiesToDestinations`) removes the copy when the source isn't used
+afterwards; here the backward pass reads it again (`causal_attention_backward`). Removing it needs
+to know the callee never writes that parameter: a read-only-parameter analysis over the call graph
+(an argument only read by `linalg` inputs, loads, transfer reads, or passed to read-only parameters
+of other functions), then the destination becomes the source when neither is written while the copy
+lives. Or layouts at function boundaries taken from the type ("Views as first-class descriptors").
+
+**Fixed 2026-10-10.** The copy's source was a `memref.cast` of a buffer of the plain layout itself (the
+product's buffer, cast to the dynamic layout for `sgemm`): the callee can take that buffer as it is.
+`cleave-forward-read-only-arguments` (shim, after `cleave-forward-copies-to-destinations`): a layout-only
+copy (`memref.cast` of a buffer of the destination's type, into a fresh buffer passed only to calls) whose
+callees only read that argument goes, the calls getting the buffer, when nothing writes it between the copy
+and the last call. Read-only: through every view and every call (memoized, recursion included), from the
+operations' declared memory effects; anything else, a pointer escaping to an extern included, counts as a
+write. nanoLM: one copy site removed (the per-layer value projection), losses identical to the bit, the
+step time within noise (the ~1% it was). Test: `cleave-mlir/tests/passes.rs::a_layout_only_copy_passed_to_a_reader_is_removed`
+(a reader through two calls; a callee writing its parameter and a write before the call keep the copy).
+
+### The main thread's frame: 570 KB of argument slots in nanoLM's `train_gpt$tasks` (obsolete, 2026-10-10)
+
+The 570 KB frame came from the model as one huge light struct per layer, copied into argument slots.
+With the model as `[Block; 16]` (heap arrays crossing calls by pointer), the slots are gone: measured
+on `--emit-object` of `examples/nanolm/src/kernel.cleave` (prologues read from `llvm-objdump -d`), the
+largest frame of the whole kernel is 3.4 KiB (`decode_block`), then 3.2 KiB
+(`Accumulate::accumulate<Block>$tasks`) and ~3.1 KiB per `Optimizer::step` instance — far below the
+1 MB main-thread stack. The general points (multi-block slots without lifetimes, redundant copies of
+arguments already in memory) stay valid but have no measured cost anymore.

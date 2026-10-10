@@ -97,3 +97,52 @@ fn a_linalg_op_with_non_affine_bounds_becomes_scf_loops() {
     assert!(out.contains("scf.for"), "the tile should be scf loops:\n{out}");
     assert!(out.contains("affine.for"), "the whole buffer should be affine loops:\n{out}");
 }
+
+/// A buffer copied only to change its layout, the copy passed to a function
+/// (`f`, then `f` passes it on to `g`) that only reads it: the call gets the
+/// buffer itself (`cleave-forward-read-only-arguments`). One where the callee
+/// writes its parameter (`w`), and one where the buffer is written between
+/// the copy and the call, keep their copies.
+#[test]
+fn a_layout_only_copy_passed_to_a_reader_is_removed() {
+    let module = |callee: &str, between: &str| {
+        format!(
+            r#"
+            func.func private @g(%x: memref<4x4xf32>) -> f32 {{
+              %c0 = arith.constant 0 : index
+              %v = memref.load %x[%c0, %c0] : memref<4x4xf32>
+              return %v : f32
+            }}
+            func.func private @f(%x: memref<4x4xf32>) -> f32 {{
+              %v = call @g(%x) : (memref<4x4xf32>) -> f32
+              return %v : f32
+            }}
+            func.func private @w(%x: memref<4x4xf32>) -> f32 {{
+              %one = arith.constant 1.0 : f32
+              linalg.fill ins(%one : f32) outs(%x : memref<4x4xf32>)
+              return %one : f32
+            }}
+            func.func @main(%b: memref<4x4xf32>) -> f32 {{
+              %s = memref.cast %b : memref<4x4xf32> to memref<4x4xf32, strided<[?, ?], offset: ?>>
+              %d = memref.alloc() : memref<4x4xf32>
+              memref.copy %s, %d : memref<4x4xf32, strided<[?, ?], offset: ?>> to memref<4x4xf32>
+              {between}
+              %v = call @{callee}(%d) : (memref<4x4xf32>) -> f32
+              memref.dealloc %d : memref<4x4xf32>
+              return %v : f32
+            }}
+            "#
+        )
+    };
+    let pipeline = "builtin.module(cleave-forward-read-only-arguments)";
+    let out = run(&module("f", ""), pipeline);
+    assert!(!out.contains("memref.copy"), "the copy should go:\n{out}");
+    assert!(out.contains("call @f(%arg0)"), "`f` should read the buffer itself:\n{out}");
+
+    let out = run(&module("w", ""), pipeline);
+    assert!(out.contains("memref.copy"), "`w` writes its parameter: the copy stays:\n{out}");
+
+    let write = "%z = arith.constant 0.0 : f32\n linalg.fill ins(%z : f32) outs(%b : memref<4x4xf32>)";
+    let out = run(&module("f", write), pipeline);
+    assert!(out.contains("memref.copy"), "the buffer is written before the call: the copy stays:\n{out}");
+}
