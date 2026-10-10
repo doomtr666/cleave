@@ -323,7 +323,7 @@ fn causal_attention_and_its_gradients_match_pytorch() {
 /// this file's in-process pipeline doesn't run the matmul schedule.
 #[test]
 fn a_matmul_with_a_partial_column_tile_compiles_and_computes_the_product() {
-    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    let dir = std::env::temp_dir().join(format!("cleave-language-model-ops-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("partial_tile.cleave");
     std::fs::write(
@@ -367,7 +367,7 @@ stderr: {stderr}");
 /// id`).
 #[test]
 fn matmuls_with_a_partial_row_tile_compile_and_compute_the_product() {
-    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    let dir = std::env::temp_dir().join(format!("cleave-language-model-ops-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("partial_row_tile.cleave");
     let check = |m: usize| {
@@ -423,7 +423,7 @@ stderr: {stderr}");
 /// loop (`cleave-lower-permuted-transfers`, `cleave-mlir`).
 #[test]
 fn a_matmul_with_a_transposed_operand_compiles_without_inlining() {
-    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    let dir = std::env::temp_dir().join(format!("cleave-language-model-ops-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("transpose_no_inline.cleave");
     std::fs::write(
@@ -465,7 +465,7 @@ fn a_matmul_with_a_transposed_operand_compiles_without_inlining() {
 /// bufferization, with the shapes of nanoLM's head and its gradients.
 #[test]
 fn matmuls_with_a_partial_tile_are_vectorized() {
-    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    let dir = std::env::temp_dir().join(format!("cleave-language-model-ops-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("vectorized.cleave");
     let dump = dir.join("vectorized_post_dealloc.mlir");
@@ -571,7 +571,7 @@ fn tensors_destructured_from_a_returned_tuple_stay_valid() {
 /// walk through (nanoLM's transformer `block`).
 #[test]
 fn no_inline_applies_to_the_declaring_method_only() {
-    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    let dir = std::env::temp_dir().join(format!("cleave-language-model-ops-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("no_inline_per_impl.cleave");
     std::fs::write(
@@ -620,7 +620,7 @@ fn no_inline_applies_to_the_declaring_method_only() {
 /// `pipeline.rs`, `cleave_mlir::approximate_math`.
 #[test]
 fn transcendentals_on_tensors_are_not_libm_calls() {
-    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    let dir = std::env::temp_dir().join(format!("cleave-language-model-ops-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("approximated_math.cleave");
     std::fs::write(
@@ -656,7 +656,7 @@ fn transcendentals_on_tensors_are_not_libm_calls() {
 /// (`mlir_lower.rs::build_to_buffer_dynamic_layout`).
 #[test]
 fn a_blas_helper_returns_its_output_without_copying_it() {
-    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    let dir = std::env::temp_dir().join(format!("cleave-language-model-ops-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("blas_no_copy.cleave");
     let dump = dir.join("blas_no_copy_post_dealloc.mlir");
@@ -703,7 +703,7 @@ fn a_blas_helper_returns_its_output_without_copying_it() {
 /// of a nanoLM training step was one of these.
 #[test]
 fn tensors_handed_over_in_aggregates_are_not_copied() {
-    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    let dir = std::env::temp_dir().join(format!("cleave-language-model-ops-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("aggregates_no_copy.cleave");
     let dump = dir.join("aggregates_no_copy_post_dealloc.mlir");
@@ -1239,7 +1239,7 @@ fn a_large_light_struct_crosses_a_call_by_pointer() {
     ";
     let got = run(src);
     assert!(close(got, 3.5), "got {got}");
-    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    let dir = std::env::temp_dir().join(format!("cleave-language-model-ops-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("large_light_struct.cleave");
     std::fs::write(&source, src).unwrap();
@@ -1293,7 +1293,7 @@ fn argument_slots_sit_in_the_entry_block_with_bounded_lifetimes() {
     ";
     let got = run(src);
     assert!(close(got, 450.0), "got {got}");
-    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    let dir = std::env::temp_dir().join(format!("cleave-language-model-ops-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("argument_slots.cleave");
     let object = dir.join("argument_slots.obj");
@@ -1373,7 +1373,7 @@ fn the_functions_missing_from_their_impls_compute_what_they_should() {
 /// missing function happens to be called.
 #[test]
 fn an_impl_missing_a_function_of_its_algebra_is_an_error() {
-    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    let dir = std::env::temp_dir().join(format!("cleave-language-model-ops-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("incomplete_impl.cleave");
     std::fs::write(
@@ -1405,7 +1405,7 @@ fn an_impl_missing_a_function_of_its_algebra_is_an_error() {
 /// elsewhere ("CPS: could not resolve call to `Twice::twice`").
 #[test]
 fn a_generic_impl_body_that_fails_is_an_error_in_the_body() {
-    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    let dir = std::env::temp_dir().join(format!("cleave-language-model-ops-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("failing_generic_impl.cleave");
     std::fs::write(
@@ -1428,7 +1428,7 @@ fn a_generic_impl_body_that_fails_is_an_error_in_the_body() {
 
 /// Runs `source` through the CLI, expecting it to fail; its `stderr`.
 fn cli_error(name: &str, source: &str) -> String {
-    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    let dir = std::env::temp_dir().join(format!("cleave-language-model-ops-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(name);
     std::fs::write(&path, source).unwrap();
@@ -1478,7 +1478,7 @@ fn an_undetermined_generic_is_reported_at_the_call_that_leaves_it_open() {
 /// per iteration here, ten iterations: at least twenty allocations of 4 KiB.
 #[test]
 fn alloc_stats_count_what_a_program_materializes() {
-    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    let dir = std::env::temp_dir().join(format!("cleave-language-model-ops-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("alloc_stats.cleave");
     std::fs::write(
@@ -1582,7 +1582,7 @@ fn slices_and_updates_have_gradients() {
 /// `error:` on a compilation that succeeded.
 #[test]
 fn arithmetic_on_a_slice_compiles_silently() {
-    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    let dir = std::env::temp_dir().join(format!("cleave-language-model-ops-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("slice_arithmetic.cleave");
     std::fs::write(
@@ -1617,7 +1617,7 @@ fn arithmetic_on_a_slice_compiles_silently() {
 /// product where it belongs (`Sgemm::sgemm`, `stdlib/blas`).
 #[test]
 fn sgemm_reads_and_writes_slices_in_place() {
-    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    let dir = std::env::temp_dir().join(format!("cleave-language-model-ops-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("sgemm_slices.cleave");
     let dump = dir.join("sgemm_slices_post_dealloc.mlir");
@@ -1716,7 +1716,7 @@ fn a_block_read_by_its_own_write_is_still_copied() {
 /// product's size is the result.
 #[test]
 fn a_blas_product_is_computed_tile_by_tile_with_its_consumer() {
-    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    let dir = std::env::temp_dir().join(format!("cleave-language-model-ops-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("blas_tiles.cleave");
     let dump = dir.join("blas_tiles_post_dealloc.mlir");
@@ -1781,7 +1781,7 @@ fn a_blas_product_is_computed_tile_by_tile_with_its_consumer() {
 /// `dealloc_at_last_use` then frees each right after its last use).
 #[test]
 fn buffers_are_freed_after_their_last_use_through_tile_loops() {
-    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    let dir = std::env::temp_dir().join(format!("cleave-language-model-ops-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("last_use.cleave");
     let dump = dir.join("last_use_post_dealloc.mlir");
@@ -1850,7 +1850,7 @@ stderr: {}", String::from_utf8_lossy(&output.stderr)));
 /// The values are the `linalg` tier's, up to the order of the sums.
 #[test]
 fn an_elementwise_op_of_two_blas_products_fuses_both() {
-    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    let dir = std::env::temp_dir().join(format!("cleave-language-model-ops-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("blas_two_products.cleave");
     std::fs::write(
@@ -1892,7 +1892,7 @@ fn an_elementwise_op_of_two_blas_products_fuses_both() {
 /// reuse_dying_inputs`); an operand read again afterwards is left alone.
 #[test]
 fn an_elementwise_op_writes_into_an_operand_that_dies_there() {
-    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    let dir = std::env::temp_dir().join(format!("cleave-language-model-ops-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("reuse_dying.cleave");
     let dump = dir.join("reuse_dying_post_dealloc.mlir");
@@ -1951,7 +1951,7 @@ fn an_elementwise_op_writes_into_an_operand_that_dies_there() {
 /// (`cleave_mlir::forward_copies_to_destinations`): no copy.
 #[test]
 fn a_blas_product_passed_to_a_function_is_not_copied() {
-    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    let dir = std::env::temp_dir().join(format!("cleave-language-model-ops-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("blas_to_call.cleave");
     let dump = dir.join("blas_to_call_post_dealloc.mlir");
@@ -2080,7 +2080,7 @@ fn a_model_whose_layers_are_an_array_has_the_gradient_of_named_layers() {
 /// MLIR lowering crashed on it).
 #[test]
 fn grad_through_an_opaque_call_is_an_error_naming_it() {
-    let dir = std::env::temp_dir().join("cleave-language-model-ops");
+    let dir = std::env::temp_dir().join(format!("cleave-language-model-ops-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("grad_opaque_call.cleave");
     std::fs::write(

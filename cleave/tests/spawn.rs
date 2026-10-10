@@ -3,7 +3,7 @@
 //! serial program (serial elision), whatever runs in parallel.
 
 fn run(name: &str, src: &str) -> String {
-    let dir = std::env::temp_dir().join("cleave-spawn");
+    let dir = std::env::temp_dir().join(format!("cleave-spawn-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join(format!("{name}.cleave"));
     std::fs::write(&source, src).unwrap();
@@ -77,7 +77,7 @@ fn a_function_named_spawn_is_still_an_ordinary_call() {
 /// when not already in one.
 #[test]
 fn spawned_calls_become_openmp_tasks() {
-    let dir = std::env::temp_dir().join("cleave-spawn");
+    let dir = std::env::temp_dir().join(format!("cleave-spawn-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("tasks_ir.cleave");
     let dump = dir.join("tasks_ir_post_dealloc.mlir");
@@ -164,7 +164,7 @@ fn spawned_functions_can_spawn() {
 /// loop, a block or another expression is a located error, not a crash.
 #[test]
 fn a_spawn_outside_a_top_level_let_is_a_located_error() {
-    let dir = std::env::temp_dir().join("cleave-spawn");
+    let dir = std::env::temp_dir().join(format!("cleave-spawn-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     for (name, body) in [
         ("in_branch", "if n > 0 { let a = spawn work(n); a } else { 0 }"),
@@ -198,7 +198,7 @@ fn a_spawn_outside_a_top_level_let_is_a_located_error() {
 /// task runs in parallel and must not touch global state.
 #[test]
 fn a_spawned_call_reaching_global_state_is_an_error() {
-    let dir = std::env::temp_dir().join("cleave-spawn");
+    let dir = std::env::temp_dir().join(format!("cleave-spawn-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("impure_spawn.cleave");
     std::fs::write(
@@ -261,7 +261,7 @@ fn a_comprehension_of_spawns_runs_one_task_per_field() {
 /// the allocation ran as a task, read back before it had run.
 #[test]
 fn each_task_holds_its_spawned_call() {
-    let dir = std::env::temp_dir().join("cleave-spawn");
+    let dir = std::env::temp_dir().join(format!("cleave-spawn-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("field_spawns_ir.cleave");
     let dump = dir.join("field_spawns_ir_post_dealloc.mlir");
@@ -368,7 +368,7 @@ fn a_team_places_its_members_one_per_core() {
         }
     ";
     assert!(run("team_placement", src).contains("main returned: 42"));
-    let source = std::env::temp_dir().join("cleave-spawn").join("team_placement.cleave");
+    let source = std::env::temp_dir().join(format!("cleave-spawn-{}", std::process::id())).join("team_placement.cleave");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"))
         .args(["--no-openmp", "--no-debug-info", "--dump-mlir-lowered"])
         .arg(&source)

@@ -657,6 +657,25 @@ impl Registry {
             .find(|s| s.name == fn_name)
     }
 
+    /// The algebra and method a call in one of `enclosing`'s rule bodies
+    /// (axiom, `derivative`, `adjoint`) targets, with `arity` arguments:
+    /// `Owner::method` as written (`resolve.rs` qualifies a call to another
+    /// algebra by the rule's crate), a bare name the enclosing algebra's
+    /// own, or else the one algebra declaring it. `None` when nothing, or
+    /// several algebras, match.
+    pub fn rule_callee(&self, enclosing: &str, path: &crate::ast::Path, arity: usize) -> Option<(String, String)> {
+        let declares = |algebra: &str, method: &str| self.fn_sig(algebra, method).is_some_and(|s| s.params.len() == arity);
+        match path.segments.as_slice() {
+            [owner, method] => declares(owner, method).then(|| (owner.clone(), method.clone())),
+            [method] if declares(enclosing, method) => Some((enclosing.to_string(), method.clone())),
+            [method] => match self.algebras_with_fn(method, arity).as_slice() {
+                [only] => Some((only.to_string(), method.clone())),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// The algebra's own generic parameters (`<T>` in `algebra Ring<T>`) —
     /// needed to instantiate a declared signature's `T`-typed parameters
     /// with fresh inference type variables, rather than treating `T` as a

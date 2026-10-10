@@ -325,6 +325,7 @@ pub fn compile(
         .map(|program| synthesize_len_impls(program, &mut node_ids))
         .map(|program| synthesize_collect_impls(program, &mut node_ids))
         .map(|program| crate::resolve::resolve_calls(program, &scopes))
+        .and_then(crate::egraph::check_rule_bodies)
         .map(|mut program| {
             crate::unroll::prune_constant_ifs(&mut program);
             program

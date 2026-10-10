@@ -3426,3 +3426,55 @@ largest frame of the whole kernel is 3.4 KiB (`decode_block`), then 3.2 KiB
 (`Accumulate::accumulate<Block>$tasks`) and ~3.1 KiB per `Optimizer::step` instance — far below the
 1 MB main-thread stack. The general points (multi-block slots without lifetimes, redundant copies of
 arguments already in memory) stay valid but have no measured cost anymore.
+
+### A statically-zero-trip-count loop's body was lowered anyway (2026-10-10)
+
+`for i in 0..0 { never_called(i) }` kept its `scf.while` and the call until LLVM's backend DCE, so
+`--opt-level 0` needed `never_called` to link. `cleave-drop-zero-trip-whiles` (shim, right after the
+inliner): a `scf.while` whose condition folds to false on its constant initial values is its "before"
+region inlined once, results the condition's forwarded values. Folding only touches ops whose operands
+are all known (a fold on unknown operands rewrites in place, `arith.cmpi` swapping its operands). Gone
+at every opt level; with `--no-inline` the condition stays an opaque `Ord::lt` call and the loop stays.
+Test: `cleave-mlir/tests/passes.rs::a_loop_whose_condition_is_false_on_entry_is_dropped`.
+
+### Declared axioms that couldn't be built were dropped without a word (2026-10-10)
+
+`egraph::check_rule_bodies` (run by the driver after name resolution): an axiom that isn't `lhs ==
+rhs`, or an axiom/`derivative` body naming something the e-graph can't represent (a field access, a
+struct literal, a name that isn't a parameter, a method no algebra or several declare), is an error at
+load time, naming the rule. Running it on the stdlib found a real silent drop: a program's own algebra
+declaring `add` made `Ring`'s derivative rule for `mul` and two `ExactAdditive` axioms ambiguous, and
+the stdlib's own `+` in function bodies too ("`add` is ambiguous between: Additive, Shapes"). Fixed by
+scoping resolution to crates: `resolve.rs` rule 4 (the one algebra declaring a method) counts only the
+algebras the body's crate sees, and rule bodies are resolved too (the enclosing algebra, its
+super-algebras, then the one visible algebra), qualifying a call to another algebra
+(`Additive::add`); `Registry::rule_callee` replaces four copies of the owner lookup in `egraph.rs` and
+`monomorphize.rs`. Tests: `use_resolution.rs::an_axiom_the_egraph_cant_represent_is_an_error`,
+`mlir_lower.rs::a_programs_own_algebra_method_does_not_hide_a_stdlib_rules_callee`.
+
+### A segment feeding several values to the rest of its function wasn't optimized (2026-10-10)
+
+The entry was "a call taking other calls' results as a tuple stops the e-graph pass from inlining
+them"; the reproduction showed the opposite shape: `consume(sq(a), sq(b), n)` skipped the whole
+function, the tuple version didn't. `optimize_program` only rebuilt a segment whose boundary referenced
+exactly one of its values. Now every referenced value is a root: `extract_shared` extracts them into one
+`RecExpr` (shared subterms one node), `rebuild_segment_roots` rebuilds them together and substitutes
+each in the boundary; a struct/array construction reached from two roots keeps the function as it was
+(merged constructions would alias). Enabling it exposed two latent bugs the one-root rule had hidden: a
+boundary's own bound variables (a loop's parameters) counted as segment roots (`free_var_refs` now), and
+a constant loop whose unrolling ran out of budget partway left its parameters bound to the abandoned
+iterations' values (`try_unroll_for_loop` restores `env` and the budget) -- together, a loop index
+replaced by a constant, an infinite loop at run time. The 18 examples' LLVM is unchanged. Tests:
+`egraph.rs::a_segment_feeding_several_values_to_a_call_is_optimized`,
+`egraph.rs::a_loop_unrolled_only_partway_is_left_as_it_was`.
+
+### The in-process test harnesses didn't run the matmul schedule (2026-10-10)
+
+`mlir_lower.rs` (`run_i32` and relatives, ten inline copies in individual tests) and `egraph.rs::run`
+ran their own pass lists; they now go through `pipeline::lower_to_llvm` with the CLI's options
+(`--no-openmp`, spawned calls in place): `lower_like_the_cli`. The axiom-rewrite tests now check the
+optimized CPS (`optimized_cps_text`) since the MLIR inliner erases unit names. Found on the way:
+`lower_to_llvm` twice in one MLIR context failed ("doubly defined symbol @match_matmul"),
+`cleaveLoadTransformLibrary` now skips a library already loaded. `unify_alloc.rs` keeps its own
+pipeline on purpose (one pass under test, no vectorization).
+

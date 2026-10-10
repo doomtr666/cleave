@@ -10,7 +10,7 @@ use cleave::cps::{
 use cleave::driver::compile;
 use cleave::egraph::optimize_program;
 use cleave::mlir_lower::lower_program;
-use cleave::pipeline::strip_ciface_wrapper_debug_info;
+use cleave::pipeline::{CodegenOptions, lower_to_llvm};
 use cleave::registry::Registry;
 use cleave_mlir::Context;
 use cleave_mlir::dialect::DialectRegistry;
@@ -44,22 +44,11 @@ fn run(
         module.as_operation().verify(),
         "generated MLIR module failed verification"
     );
-
-    // `--expand-strided-metadata`/`--lower-affine`: needed once a real
-    // `memref.subview` with a genuinely non-trivial `strided<...>` layout
-    // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
-    // has the story).
-    // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
-    // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
-    // doc comment for the full story (isolated there, on a completely
-    // unrelated plain-array case): running `--finalize-memref-to-llvm`
-    // once, up front, leaves a genuinely unreconcilable `i64`-to-`index`-
-    // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
-    // constants; a first `--convert-to-llvm` pass gives those a chance to
-    // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
-    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-scf-to-cf,canonicalize,expand-strided-metadata,lower-affine,canonicalize,convert-to-llvm,finalize-memref-to-llvm,convert-to-llvm)")
-        .expect("lowering to the llvm dialect must succeed");
-    strip_ciface_wrapper_debug_info(&mut module);
+    // The CLI's own pipeline, so these tests cover what `--run --no-openmp`
+    // compiles; no libomp in this engine: spawned calls run in place.
+    let options = CodegenOptions { openmp: false, tasks: false, ..CodegenOptions::default() };
+    cleave::options::set(options.clone());
+    lower_to_llvm(context, &mut module, &options).unwrap_or_else(|e| panic!("lower_to_llvm failed: {e:?}"));
 
     let engine = cleave::pipeline::jit(&module, 2);
     // SAFETY: a real, valid `extern "C" fn`, live for the process's whole
@@ -169,6 +158,74 @@ fn an_axiom_folds_a_real_call_away_and_the_optimized_program_still_executes_to_t
     );
 }
 
+/// A segment whose values reach the rest of the function through several
+/// variables (`pair`'s two arguments, `pair` an opaque call: a loop) is
+/// still optimized, both values rebuilt together: `add_zero` folds both
+/// `+ 0` away, and the program computes the same value.
+#[test]
+fn a_segment_feeding_several_values_to_a_call_is_optimized() {
+    let context = context();
+    let src = "fn pair(a: i32, b: i32, n: i32) -> i32 {
+        let mut acc: i32 = 0;
+        for i in 0..n {
+            acc = acc + a * b;
+        };
+        acc
+    }
+
+    fn helper(x: i32) -> i32 {
+        pair(x + 0, x * 2 + 0, 2)
+    }
+
+    fn main() -> i32 {
+        helper(21)
+    }";
+    let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
+    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+    let registry = Registry::build(&program);
+
+    let (optimized, _) = optimize_program(convert_program(collect_units(&program, &registry), None), &registry, false);
+    let optimized_dump = dump_cps_program(&optimized);
+    let helper = optimized_dump
+        .split("(fn helper")
+        .nth(1)
+        .and_then(|rest| rest.split("(fn ").next())
+        .expect("`helper` must be in the optimized dump");
+    assert!(
+        !helper.contains("Additive::add<i32>"),
+        "both `+ 0` should be folded away, got:
+{helper}"
+    );
+    assert_eq!(run(&context, &program, &optimized), 21 * 42 * 2);
+}
+
+/// Nested constant loops whose iterations exceed the unroll budget partway
+/// (64 x 64): the unrolling stops and the loop stays, its own variables not
+/// bound to what the abandoned iterations computed, so the function still
+/// computes the loop's value (`try_unroll_for_loop`, `free_var_refs`).
+#[test]
+fn a_loop_unrolled_only_partway_is_left_as_it_was() {
+    let context = context();
+    let src = "fn helper(x: i32) -> i32 {
+        let mut acc: i32 = 0;
+        for i in 0..64 {
+            for j in 0..64 {
+                acc = acc + i * j + x + 0;
+            };
+        };
+        acc
+    }
+
+    fn main() -> i32 {
+        helper(1)
+    }";
+    let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
+    let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+    let registry = Registry::build(&program);
+    let (optimized, _) = optimize_program(convert_program(collect_units(&program, &registry), None), &registry, false);
+    assert_eq!(run(&context, &program, &optimized), 2016 * 2016 + 64 * 64);
+}
+
 /// The Struct/Field extension's own end-to-end proof — deliberately *not*
 /// `examples/complex.cleave` (its own float literals and multi-level call
 /// nesting put it out of reach of this increment entirely, see the plan
@@ -251,7 +308,7 @@ fn a_struct_field_read_lets_add_zero_fold_a_real_call_away_and_the_optimized_pro
 
 /// Runs the real CLI on `src` with `args`, returning its stdout.
 fn cli(name: &str, src: &str, args: &[&str]) -> String {
-    let dir = std::env::temp_dir().join("cleave-egraph-tests");
+    let dir = std::env::temp_dir().join(format!("cleave-egraph-tests-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(name);
     std::fs::write(&path, src).unwrap();

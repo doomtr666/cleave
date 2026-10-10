@@ -44,6 +44,14 @@ measure the same way (held at most, ms/step), and the waste a block serving a sm
 - Earlier, closed as not reproduced (`backlog-done.md`: "`cargo test --workspace` intermittently fails
   one heavy JIT test under concurrent load").
 
+- 2026-10-10, captured: `language_model_ops` run twice at once failed 4 runs in 16 ("no IR dumped",
+  file not found, five different tests): every test wrote its source and IR dump to one fixed
+  `%TEMP%/cleave-language-model-ops`, so one process removed a dump the other was about to read. Fixed
+  for every test file using a fixed temp dir (a directory per process, `std::process::id()`); 24 runs
+  of three concurrent instances then all passed, and `leaks` passed 16 in 16 under the same load. This
+  explains a failure whenever two test runs overlap (a second `cargo test`, an IDE's test runner); not
+  necessarily the 2026-10-08 one, a single run beside training.
+
 Next time: keep the binary's whole output (`cargo test ... 2>&1 | tee`), the test name and the exit
 code; after a change touching those areas, a loop of runs (`for i in $(seq 50)`).
 
@@ -73,15 +81,6 @@ imaginary literals and their default type), `Tensor` (`egraph.rs`: the AD rebuil
 zeros), `DynArray` (`infer.rs`, `mlir_lower.rs`). Each wants either an algebra the stdlib impls carry
 (a literal algebra for imaginary literals; the AD's accumulation through whatever algebra declares
 it) or, where the dependency is the language's own, a documented one in one place.
-
-## Debt: declared axioms that can't be built are dropped without a word
-
-`egraph.rs::axiom_to_rewrite` (and `derivative_rule_to_rewrite`) return `None` when a rule's body isn't
-representable in the e-graph (`build_pattern`: a field access, a struct literal, ...) or `egg` refuses
-the pattern; the caller skips it (`if let Some(...)`). A derivative rule missing that way surfaces later
-as a clean "no rule reaches" error; an axiom just never fires, and the stdlib author who declared it
-never learns. A warning (or an error) when the stdlib is loaded, naming the axiom and what in its body
-isn't representable.
 
 ## Debt: comments that tell the code's history instead of the code
 
@@ -212,15 +211,6 @@ destructuring), then the design questions with the user: structural derivation, 
 how host data becomes a tensor.
 
 ---
-
-## A call taking other calls' results as a tuple stops the e-graph pass from inlining those calls
-
-Found on MNIST after `Optimizer` moved to `optim`'s generic impl for `Trainable` models (training about
-1 s slower): `Collect::collect((step(...), step(...), ...))`, the identity a comprehension is wrapped in,
-left all four `Optimizer::step<Sgd, Dense<...>>` calls un-inlined, while the same tuple consumed by
-field projections inlines them (`egraph.rs`, `Forward::walk`/`is_transparent_chain`). Worked around
-where it arose: a comprehension collected into its own tuple emits no call (`cps.rs`). The underlying
-limitation is in the walk, and any other opaque call consuming call results will hit it.
 
 ## Pool allocator: heavy structs inside light containers
 
@@ -522,16 +512,6 @@ The idea, as raised: track each variable's own possible value *range* (an interv
 
 **A strict generalization of exact-value folding, not a separate, parallel mechanism sitting next to it** — the closing insight from the conversation that raised this: a proven interval `[x, x]` (lower bound equals upper bound) *is* a proven constant, exactly the degenerate, single-point case of the same lattice. `const_eval.rs`/`Analysis::make`'s exact folding only ever answers "is this value exactly known;" a real interval lattice answers the strictly more general "what range could this value fall in," with exact-known-constant as one specific, already-converged point in that range — so a full interval-analysis pass, if ever built, would properly *subsume* today's exact folding rather than duplicate it, the same way any abstract-interpretation lattice's most-precise element degenerates to exact evaluation. A real interval lattice needs its own join/widen operators and its own fixpoint loop over the CPS graph's own loop-carried arguments (`doc/hld.md`'s own "Memory management: a region/stack discipline derived from CPS" section already establishes that a loop's own carried state is syntactically explicit in this pipeline's CPS form, `carried_types`/`params` on `CFunDef` — the same structural fact that made copy-propagation's def-use question local rather than needing classical dominance-frontier computation likely applies here too, worth checking directly before assuming a full classical dataflow pass is needed). Not designed, not scoped, no repro/motivating failure yet — purely a direction flagged for later evaluation once the more concrete gaps above are closed.
 
-## A statically-zero-trip-count loop's body is *not* eliminated the way a compile-time-constant `if`/`and`/`or` branch already is — "works" at `--opt-level 2` only by incidental LLVM backend DCE, not by anything cleave's own pipeline proves, and silently stops "working" at `--opt-level 0`
-
-Raised in conversation, directly after the `if`/`and`/`or` dead-branch-elimination work above closed: does the identical guarantee hold for `for i in 0..0 { extern_call(i); }`, a loop whose own trip count is staticaly zero? Tested directly, not assumed — it does not, and the difference is real, not cosmetic.
-
-**`if`/`and`/`or` eliminates the dead branch structurally, before LLVM's own backend ever runs** — confirmed by the entry above: `--dump-mlir-lowered` (printed straight after cleave's own CPS-optimize/MLIR-canonicalize stages, before any LLVM backend codegen) already shows zero trace of the untaken branch. **A zero-trip-count loop does not get this treatment at all** — `--dump-mlir-lowered` on `for i in 0..0 { acc = never_called(i); }` still shows `never_called` both declared and called, inside a real loop construct, completely unchanged from a loop whose bound is a genuine runtime value. The loop is never recognized as trivially dead at the CPS/MLIR level cleave itself controls.
-
-**What actually removes it from the final object is a different, unrelated mechanism, and a much weaker guarantee**: at the default `--opt-level 2`, `never_called` is genuinely absent from the emitted object's own symbol table (confirmed via `llvm-objdump -t`) — but this is LLVM's own backend dead-code elimination, running during real machine-code generation, well after cleave's own IR has already committed to emitting the call. Proof this is incidental, not structural: **the identical program built with `--opt-level 0` has `never_called` right back in the symbol table**, unresolved. Anyone building for debugging (`--opt-level 0`, `--no-inline`, the exact combination this project's own `--no-inline` doc comment recommends for reading a clean disassembly) would need a symbol the source-level logic proves is never actually called — and a genuinely side-effecting `extern fn` (not provably pure) might not even be safe for LLVM's own backend to drop at any opt level, meaning this "works" only for the specific, effect-free probe tested here, not as a general guarantee at all.
-
-**Not fixed, not scoped in depth** — the natural extension of the already-closed `if`/`and`/`or` work above (same underlying idea: a provably-unreachable branch/body should never require a symbol to exist), but genuinely more work: `if`'s condition is a single boolean value already reaching the const-fold machinery for free; a loop's own trip count first needs deriving from its bounds (`end - start` provably `<= 0` for the simplest case, `0..0` here) before the identical "this is unreachable, don't even lower it" treatment could apply. Plausibly connects to the interval/value-range analysis entry immediately above (a trip count is exactly the kind of fact that lattice would derive), but a narrower, `<=0`-specific special case might be enough for the immediate BLAS-adjacent motivation without waiting on the full lattice. No design attempted here.
-
 ## Checkpoints: make them a general building block for long computations, not an ML tool — to revisit once the language core is stable
 
 The `stdlib/checkpoint` module (step 0 of `doc/plan-nanolm.md`) serves any long-running simulation: fault tolerance, resuming a run, splitting a computation into segments. Yet today it does `use linalg; use optim;` and holds the `AdamState` and `Trainable` impls itself, so a fluid simulation using it drags the optimizer in for nothing. Deliberately postponed: cleaning up the stdlib is easier once the language has settled.
@@ -543,10 +523,6 @@ What to do, by priority:
 - **One-line resume.** A `restore_or(path, init)` that resumes if the file exists and starts from `init` otherwise. Makes a program resumable without plumbing.
 - **Later, asynchronous writes.** Copy the state, then write it on another thread while the computation continues. Only worth it when writing really weighs (a big simulation), not for nanoLM.
 - **Generic file I/O in the runtime.** Once cleave has real strings: the format and its checks would be written in cleave on top of `open`/`write bytes`/`read bytes`/`rename`/`close` primitives, instead of living in `cleave-rt/src/checkpoint.rs`.
-
-## The in-process test harnesses don't run the matmul schedule: a test of a matmul there doesn't cover the real pipeline
-
-Found while fixing matmuls whose column count isn't a multiple of 16: the test written in `cleave/tests/mlir_lower.rs` passed **even without the fix**, while the CLI (`--run`) failed. The harness pipeline in those files (`run_i32` and its relatives) doesn't apply `matmul_vectorize.transform.mlir`, so its matmuls take another lowering path. The regression test now goes through the CLI binary (`language_model_ops.rs`, `CARGO_BIN_EXE_cleave`). To fix: have the harnesses go through `pipeline.rs::lower_to_llvm` with the real options, or at least list which existing tests think they cover the schedule and don't.
 
 ## Fewer bits per weight: `bf16` training, codebook quantization for inference (idea, 2026-10-04)
 

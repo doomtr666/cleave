@@ -26,6 +26,7 @@
 #include "mlir/Dialect/OpenMP/OpenMPDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/TilingInterface.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
@@ -1056,6 +1057,62 @@ static int64_t cleaveForwardReadOnlyArguments(MlirOperation op) {
   return forwarded;
 }
 
+// A `scf.while` whose condition is false on entry: its "before" region runs
+// once and the loop ends, so the loop is that region inlined, its results
+// the condition's forwarded values. The condition is decided by folding the
+// region's operations on the loop's constant initial values (a `for i in
+// 0..0`), so a body that never runs isn't lowered at all, whatever the
+// optimization level, and nothing it calls has to exist. Returns how many
+// loops it removed.
+static int64_t cleaveDropZeroTripWhiles(MlirOperation op) {
+  SmallVector<scf::WhileOp> loops;
+  unwrap(op)->walk([&](scf::WhileOp loop) { loops.push_back(loop); });
+  int64_t dropped = 0;
+  for (scf::WhileOp loop : loops) {
+    Block &before = loop.getBefore().front();
+    llvm::DenseMap<Value, Attribute> known;
+    auto constant = [&](Value v) -> Attribute {
+      if (auto found = known.find(v); found != known.end())
+        return found->second;
+      Attribute attr;
+      return matchPattern(v, m_Constant(&attr)) ? attr : Attribute();
+    };
+    for (auto [arg, init] : llvm::zip(before.getArguments(), loop.getInits()))
+      if (Attribute attr = constant(init))
+        known[arg] = attr;
+    for (Operation &inner : before.without_terminator()) {
+      if (inner.getNumRegions() != 0 || !isMemoryEffectFree(&inner))
+        continue;
+      // Only on known operands: a fold may otherwise rewrite the operation
+      // in place (`arith.cmpi` moving a constant to the right).
+      SmallVector<Attribute> operands;
+      for (Value operand : inner.getOperands())
+        operands.push_back(constant(operand));
+      if (llvm::is_contained(operands, Attribute()))
+        continue;
+      SmallVector<OpFoldResult> results;
+      if (failed(inner.fold(operands, results)) || results.size() != inner.getNumResults())
+        continue;
+      for (auto [result, folded] : llvm::zip(inner.getResults(), results)) {
+        Attribute attr = isa<Attribute>(folded) ? cast<Attribute>(folded) : constant(cast<Value>(folded));
+        if (attr)
+          known[result] = attr;
+      }
+    }
+    auto condition = cast<scf::ConditionOp>(before.getTerminator());
+    auto decided = dyn_cast_or_null<IntegerAttr>(constant(condition.getCondition()));
+    if (!decided || !decided.getValue().isZero())
+      continue;
+    IRRewriter rewriter(loop.getContext());
+    SmallVector<Value> inits(loop.getInits());
+    rewriter.inlineBlockBefore(&before, loop, inits);
+    rewriter.replaceOp(loop, condition.getArgs());
+    rewriter.eraseOp(condition);
+    ++dropped;
+  }
+  return dropped;
+}
+
 // The only consumer of `product`'s result when it is pointwise over the
 // product's rows (two parallel loops, one result written through the
 // identity, every operand read through a projected permutation, the product
@@ -2005,6 +2062,9 @@ CLEAVE_COUNTING_PASS(ForwardCopiesToDestinationsPass,
                      "cleave-forward-copies-to-destinations",
                      "results written in their destination",
                      cleaveForwardCopiesToDestinations)
+CLEAVE_COUNTING_PASS(DropZeroTripWhilesPass, "cleave-drop-zero-trip-whiles",
+                     "loops whose condition is false on entry, replaced by one run of it",
+                     cleaveDropZeroTripWhiles)
 CLEAVE_COUNTING_PASS(ForwardReadOnlyArgumentsPass,
                      "cleave-forward-read-only-arguments",
                      "layout-only copies passed to read-only parameters, removed",
@@ -2860,6 +2920,7 @@ extern "C" void cleaveRegisterPasses() {
     PassRegistration<ElideBlockCopiesPass>();
     PassRegistration<ForwardCopiesToDestinationsPass>();
     PassRegistration<ForwardReadOnlyArgumentsPass>();
+    PassRegistration<DropZeroTripWhilesPass>();
     PassRegistration<FoldPassthroughIterArgsPass>();
     PassRegistration<LowerAdoptionsPass>();
     PassRegistration<DeallocAtLastUsePass>();
@@ -2914,6 +2975,16 @@ extern "C" bool cleaveLoadTransformLibrary(MlirContext context,
   OwningOpRef<ModuleOp> library = parseSourceFile<ModuleOp>(sourceMgr, ctx);
   if (!library || failed(mlir::verify(*library)))
     return false;
+  // Loaded already (a second compile in the same context): its sequences are
+  // in the library; merging them again would define each one twice.
+  auto *dialect = ctx->getOrLoadDialect<transform::TransformDialect>();
+  if (ModuleOp existing = dialect->getLibraryModule()) {
+    bool loaded = llvm::all_of(library->getBody()->getOps<SymbolOpInterface>(), [&](SymbolOpInterface symbol) {
+      return SymbolTable::lookupSymbolIn(existing, symbol.getNameAttr()) != nullptr;
+    });
+    if (loaded)
+      return true;
+  }
   auto loc = FileLineColLoc::get(ctx, "<shared-library-module>", 0, 0);
   OwningOpRef<ModuleOp> merged = ModuleOp::create(loc, "__transform");
   merged.get()->setAttr("transform.with_named_sequence", UnitAttr::get(ctx));

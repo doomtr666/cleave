@@ -1337,36 +1337,44 @@ impl Forward {
         if iterations > self.unroll_budget {
             return None;
         }
-        // Decremented *before* unrolling, not after — see `unroll_budget`'s
-        // own doc comment: an enclosing loop must charge its own iterations
-        // against the shared budget before any nested loop inside its own
-        // body gets a chance to check what's left, so the real *product*
-        // across nested levels is what respects the cap, not each level
-        // checked in isolation.
-        self.unroll_budget -= iterations;
-
-        let mut carried_ids = self.cvals_to_ids(carried_init)?;
-        for idx in start..end {
-            let i_id = self.egraph.add(CleaveLang::Int(idx));
-            self.env.insert(i_var, i_id);
+        // An iteration that doesn't translate leaves the loop as it was: the
+        // bindings the iterations before it made (the loop's own parameters
+        // bound to an unrolled iteration's values) must not outlive it, or
+        // the loop left in place would read them as segment values.
+        let (env_before, budget_before) = (self.env.clone(), self.unroll_budget);
+        let mut unroll = || -> Option<()> {
+            // Decremented *before* unrolling, not after — see `unroll_budget`'s
+            // own doc comment: an enclosing loop must charge its own iterations
+            // against the shared budget before any nested loop inside its own
+            // body gets a chance to check what's left, so the real *product*
+            // across nested levels is what respects the cap, not each level
+            // checked in isolation.
+            self.unroll_budget -= iterations;
+            let mut carried_ids = self.cvals_to_ids(carried_init)?;
+            for idx in start..end {
+                let i_id = self.egraph.add(CleaveLang::Int(idx));
+                self.env.insert(i_var, i_id);
+                for (&p, &id) in carried_params.iter().zip(&carried_ids) {
+                    self.env.insert(p, id);
+                }
+                let renamed = Self::alpha_rename(then_branch, &mut HashMap::default(), fresh);
+                let CExpr::App { func: CVal::Label(l), args } = self.walk(&renamed, units, fresh) else {
+                    return None;
+                };
+                if l != loop_def.name {
+                    return None;
+                }
+                carried_ids = self.cvals_to_ids(&args[1..])?;
+            }
             for (&p, &id) in carried_params.iter().zip(&carried_ids) {
                 self.env.insert(p, id);
             }
-            let renamed = Self::alpha_rename(then_branch, &mut HashMap::default(), fresh);
-            let CExpr::App {
-                func: CVal::Label(l),
-                args,
-            } = self.walk(&renamed, units, fresh)
-            else {
-                return None;
-            };
-            if l != loop_def.name {
-                return None;
-            }
-            carried_ids = self.cvals_to_ids(&args[1..])?;
-        }
-        for (&p, &id) in carried_params.iter().zip(&carried_ids) {
-            self.env.insert(p, id);
+            Some(())
+        };
+        if unroll().is_none() {
+            self.env = env_before;
+            self.unroll_budget = budget_before;
+            return None;
         }
         Some(self.walk(else_branch, units, fresh))
     }
@@ -1834,17 +1842,8 @@ fn seed_axiom_type_env<'p>(
             }
         }
         ExprKind::Call(path, _, call_args, _) => {
-            let method = path.segments.join("::");
-            let owner = if registry
-                .fn_sig(algebra, &method)
-                .is_some_and(|sig| sig.params.len() == call_args.len())
-            {
-                algebra.to_string()
-            } else {
-                match registry.algebras_with_fn(&method, call_args.len()).as_slice() {
-                    [only] => only.to_string(),
-                    _ => return,
-                }
+            let Some((owner, method)) = registry.rule_callee(algebra, path, call_args.len()) else {
+                return;
             };
             let Some(sig) = registry.fn_sig(&owner, &method) else {
                 return;
@@ -2109,6 +2108,98 @@ fn axiom_to_rewrite(
     Some((rw, referenced))
 }
 
+/// Every algebra's axioms and `derivative` rules whose body the e-graph can't
+/// represent, whatever the type they're instantiated at: an axiom that isn't
+/// `lhs == rhs`, or a body naming something `build_pattern` rejects (a field
+/// access, a struct literal, a name that isn't a parameter, a method no
+/// algebra or several declare). `axiom_rewrites` would drop such a rule
+/// without a word, so it never fires and its author never learns; an error
+/// here instead, when the program and its crates are loaded. A rule rejected
+/// only for one instantiation (a multi-target algebra whose types it can't
+/// resolve) is a type question, not this one.
+pub fn check_rule_bodies(program: crate::ast::Program) -> Result<crate::ast::Program, Vec<crate::diag::Diagnostic>> {
+    use crate::ast::{AlgebraItemKind, ItemKind};
+    let registry = Registry::build(&program);
+    let mut errors = Vec::new();
+    for item in &program.items {
+        let ItemKind::Algebra(decl) = &item.kind else { continue };
+        for rule in &decl.items {
+            let (what, params, body, derivative) = match &rule.kind {
+                AlgebraItemKind::Axiom(axiom) => (format!("axiom `{}`", axiom.name), &axiom.params, &axiom.body, false),
+                AlgebraItemKind::DerivativeRule(d) => (format!("derivative rule for `{}`", d.method), &d.params, &d.body, true),
+                _ => continue,
+            };
+            let params: HashSet<&str> = params.iter().map(|p| p.name.as_str()).collect();
+            let problem = if derivative {
+                unrepresentable(body, &decl.name, &params, true, &registry)
+            } else {
+                match &body.kind {
+                    ExprKind::Call(path, _, args, _) if path.segments.join("::") == "eq" && args.len() == 2 => args
+                        .iter()
+                        .find_map(|side| unrepresentable(side, &decl.name, &params, false, &registry)),
+                    _ => Some((body.span, "it isn't an equality `lhs == rhs`".to_string())),
+                }
+            };
+            if let Some((span, reason)) = problem {
+                errors.push(
+                    crate::diag::Diagnostic::error(
+                        format!("{what} of algebra `{}` can't be used as a rewrite: {reason}", decl.name),
+                        span,
+                    )
+                    .with_note(rule.span, "declared here"),
+                );
+            }
+        }
+    }
+    if errors.is_empty() { Ok(program) } else { Err(errors) }
+}
+
+/// The first part of a rule body `build_pattern` can never represent, with
+/// why; `None` when every part is representable (`check_rule_bodies`).
+fn unrepresentable(
+    expr: &Expr,
+    algebra: &str,
+    params: &HashSet<&str>,
+    derivative: bool,
+    registry: &Registry,
+) -> Option<(crate::ast::Span, String)> {
+    let at = |reason: String| Some((expr.span, reason));
+    match &expr.kind {
+        ExprKind::Path(p) => {
+            let name = p.segments.join("::");
+            if params.contains(name.as_str()) {
+                return None;
+            }
+            at(format!("`{name}` isn't one of its parameters"))
+        }
+        ExprKind::NumberLit { .. } | ExprKind::BoolLit(_) => None,
+        ExprKind::Index(base, indices) => match (&base.kind, indices.as_slice()) {
+            (ExprKind::Call(..), [index]) if matches!(index.kind, ExprKind::NumberLit { .. }) => {
+                unrepresentable(base, algebra, params, derivative, registry)
+            }
+            _ => at("only a call's result can be indexed, by a literal (`f(a, b)[0]`)".to_string()),
+        },
+        ExprKind::Call(path, _, args, _) => {
+            let method = path.segments.join("::");
+            if derivative && method == "d" {
+                if args.len() != 1 {
+                    return at("`d` takes one argument".to_string());
+                }
+            } else if registry.rule_callee(algebra, path, args.len()).is_none() {
+                let n = args.len();
+                return match path.segments.as_slice() {
+                    [_] if registry.algebras_with_fn(&method, n).len() > 1 => {
+                        at(format!("several algebras its crate sees declare `{method}` with {n} arguments"))
+                    }
+                    _ => at(format!("no algebra declares `{method}` with {n} arguments")),
+                };
+            }
+            args.iter().find_map(|a| unrepresentable(a, algebra, params, derivative, registry))
+        }
+        _ => at("only parameters, literals and method calls can be rewritten".to_string()),
+    }
+}
+
 /// Walks one side of an axiom's (or a `derivative` rule's) own body,
 /// building it up as a `PatternAst` node by node (never through string
 /// parsing — this module has already hit real ambiguities doing that twice
@@ -2238,34 +2329,13 @@ fn build_pattern(
             ))
         }
         ExprKind::Call(path, _, call_args, _) => {
-            let method = path.segments.join("::");
-            // Which algebra actually owns `method` — almost always the
-            // *enclosing* one (`Ring<T>`'s own axioms/derivative rules
-            // calling `add`/`mul`/..., all declared right there), checked
-            // first so every existing single-algebra rule keeps resolving
-            // exactly as before. Falls back to a real registry search
-            // (`Registry::algebras_with_fn`) only when the enclosing
-            // algebra doesn't declare it — needed for real:
-            // `Activation::tanh`'s own derivative rule (`1 - tanh(u)²`)
-            // needs `Ring`'s own `sub`/`mul`, not `Activation`'s (which
-            // doesn't have either). Ambiguous (more than one algebra
-            // declares it) or simply unknown — rejected, not guessed,
-            // same posture as everywhere else `build_pattern` returns
-            // `None`.
-            let owner = if registry
-                .fn_sig(algebra, &method)
-                .is_some_and(|sig| sig.params.len() == call_args.len())
-            {
-                algebra.to_string()
-            } else {
-                match registry
-                    .algebras_with_fn(&method, call_args.len())
-                    .as_slice()
-                {
-                    [only] => only.to_string(),
-                    _ => return None,
-                }
-            };
+            // Which algebra actually owns the method: almost always the
+            // enclosing one (`Ring<T>`'s own axioms and derivative rules
+            // calling `add`/`mul`/...). Another one's is qualified by
+            // `resolve.rs` (`Activation::tanh`'s derivative rule, `1 -
+            // tanh(u)²`, needs `Ring`'s `sub`/`mul`); unknown or ambiguous,
+            // the rule is rejected, not guessed (`Registry::rule_callee`).
+            let (owner, method) = registry.rule_callee(algebra, path, call_args.len())?;
             let owner_generics: Vec<&str> = registry
                 .generics(&owner)
                 .iter()
@@ -3403,11 +3473,47 @@ fn rebuild_args(
 /// after moving its own `egraph` field into a `Runner`. Owns the
 /// reconstruction's own `memo` (one per segment, never shared across calls
 /// — see `rebuild`'s own doc comment).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn rebuild_segment(
+fn rebuild_segment(
     recexpr: &RecExpr<CleaveLang>,
     root: egg::Id,
     old_root_var: CVar,
+    boundary: &CExpr,
+    free_vars: &HashMap<Symbol, CVal>,
+    raw_ops: &HashMap<Symbol, (String, Ty, Vec<(String, String)>)>,
+    call_units: &HashSet<String>,
+    struct_ops: &HashMap<Symbol, (String, Vec<String>, Ty)>,
+    field_ops: &HashMap<Symbol, (Ty, String, Ty)>,
+    array_ops: &HashMap<Symbol, Ty>,
+    array_repeat_ops: &HashMap<Symbol, Ty>,
+    load_ops: &HashMap<Symbol, (Ty, Ty)>,
+    fresh: &FreshVars,
+) -> CExpr {
+    rebuild_segment_roots(
+        recexpr,
+        &[(root, old_root_var)],
+        boundary,
+        free_vars,
+        raw_ops,
+        call_units,
+        struct_ops,
+        field_ops,
+        array_ops,
+        array_repeat_ops,
+        load_ops,
+        fresh,
+    )
+}
+
+/// `rebuild_segment` for a boundary that needs several of the segment's
+/// values (`consume(a, b)`): every root rebuilt in one reconstruction, so
+/// what they share is computed once, and each original `CVar` replaced in
+/// `boundary` by its root's value.
+#[allow(clippy::too_many_arguments)]
+fn rebuild_segment_roots(
+    recexpr: &RecExpr<CleaveLang>,
+    roots: &[(egg::Id, CVar)],
     boundary: &CExpr,
     free_vars: &HashMap<Symbol, CVal>,
     raw_ops: &HashMap<Symbol, (String, Ty, Vec<(String, String)>)>,
@@ -3432,8 +3538,12 @@ pub(crate) fn rebuild_segment(
         param_substitution: &no_substitution,
     };
     let memo = RefCell::new(HashMap::default());
-    rebuild(recexpr, root, fresh, &tables, &memo, &|final_val| {
-        substitute_var(boundary, old_root_var, &final_val)
+    let ids: Vec<egg::Id> = roots.iter().map(|&(id, _)| id).collect();
+    rebuild_args(recexpr, &ids, fresh, &tables, &memo, &|values| {
+        roots
+            .iter()
+            .zip(&values)
+            .fold(boundary.clone(), |expr, (&(_, var), value)| substitute_var(&expr, var, value))
     })
 }
 
@@ -3536,6 +3646,39 @@ fn collect_var_refs(expr: &CExpr, out: &mut HashSet<CVar>) {
     }
 }
 
+/// The variables `expr` reads that it doesn't bind itself (a `LetPrim`'s
+/// `var`, a `Fix` definition's parameter): what it needs from before it.
+/// `CVar`s are unique in a function, so a binder anywhere in `expr` covers
+/// every reference to it.
+fn free_var_refs(expr: &CExpr) -> HashSet<CVar> {
+    fn bound(expr: &CExpr, out: &mut HashSet<CVar>) {
+        match expr {
+            CExpr::LetPrim { var, cont, .. } => {
+                out.insert(*var);
+                bound(cont, out);
+            }
+            CExpr::App { .. } => {}
+            CExpr::Fix { defs, body } => {
+                for d in defs {
+                    out.extend(d.params.iter().copied());
+                    bound(&d.body, out);
+                }
+                bound(body, out);
+            }
+            CExpr::If { then_branch, else_branch, .. } => {
+                bound(then_branch, out);
+                bound(else_branch, out);
+            }
+        }
+    }
+    let mut refs = HashSet::default();
+    collect_var_refs(expr, &mut refs);
+    let mut binders = HashSet::default();
+    bound(expr, &mut binders);
+    refs.retain(|v| !binders.contains(v));
+    refs
+}
+
 /// The one segment-bound `CVar` `boundary` needs reconstructed, or `None`
 /// if there isn't exactly one — either `boundary` doesn't reference the
 /// segment at all (nothing worth optimizing), or it references *more than
@@ -3560,11 +3703,78 @@ fn collect_var_refs(expr: &CExpr, out: &mut HashSet<CVar>) {
 /// final return) as one instance of this: that shape always references
 /// exactly one var too, so every previously-optimizable function still is.
 fn segment_root_var(boundary: &CExpr, env: &HashMap<CVar, egg::Id>) -> Option<CVar> {
-    let mut refs = HashSet::default();
-    collect_var_refs(boundary, &mut refs);
-    let mut in_segment = refs.into_iter().filter(|v| env.contains_key(v));
+    let mut in_segment = free_var_refs(boundary).into_iter().filter(|v| env.contains_key(v));
     let root = in_segment.next()?;
     in_segment.next().is_none().then_some(root)
+}
+
+/// Every segment-bound `CVar` `boundary` references, in a stable order: the
+/// values `optimize_program` rebuilds together (`rebuild_segment_roots`).
+fn segment_root_vars(boundary: &CExpr, env: &HashMap<CVar, egg::Id>) -> Vec<CVar> {
+    let mut roots: Vec<CVar> = free_var_refs(boundary).into_iter().filter(|v| env.contains_key(v)).collect();
+    roots.sort_unstable();
+    roots
+}
+
+/// The cheapest form of each of `roots`, extracted into one `RecExpr` so
+/// that what they share is one node: the expression, and each root's id in
+/// it.
+fn extract_shared(
+    egraph: &EGraph<CleaveLang, ConstantFold>,
+    extractor: &Extractor<AstSize, CleaveLang, ConstantFold>,
+    roots: &[Id],
+) -> (RecExpr<CleaveLang>, Vec<Id>) {
+    let mut expr = RecExpr::default();
+    let mut memo: HashMap<Id, Id> = HashMap::default();
+    for &root in roots {
+        let mut stack = vec![egraph.find(root)];
+        while let Some(&class) = stack.last() {
+            if memo.contains_key(&class) {
+                stack.pop();
+                continue;
+            }
+            let node = extractor.find_best_node(class);
+            let pending: Vec<Id> = node
+                .children()
+                .iter()
+                .map(|&c| egraph.find(c))
+                .filter(|c| !memo.contains_key(c))
+                .collect();
+            if pending.is_empty() {
+                let built = node.clone().map_children(|c| memo[&egraph.find(c)]);
+                memo.insert(class, expr.add(built));
+                stack.pop();
+            } else {
+                stack.extend(pending);
+            }
+        }
+    }
+    let ids = roots.iter().map(|&r| memo[&egraph.find(r)]).collect();
+    (expr, ids)
+}
+
+/// Whether a struct or array construction (a value with an identity on the
+/// heap) is reached from more than one of `roots`: two constructions the
+/// e-graph merged would reach the boundary as one object, and a write
+/// through one would show through the other.
+fn shares_construction(recexpr: &RecExpr<CleaveLang>, roots: &[Id], is_construction: impl Fn(&Symbol) -> bool) -> bool {
+    let mut reached_from: HashMap<Id, usize> = HashMap::default();
+    for (i, &root) in roots.iter().enumerate() {
+        let mut seen: HashSet<Id> = HashSet::default();
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if let CleaveLang::Op(sym, _) = &recexpr[id] {
+                if is_construction(sym) && *reached_from.entry(id).or_insert(i) != i {
+                    return true;
+                }
+            }
+            stack.extend(recexpr[id].children().iter().copied());
+        }
+    }
+    false
 }
 
 fn max_cvar_in_cexpr(expr: &CExpr, max: &mut CVar) {
@@ -3701,12 +3911,12 @@ pub fn optimize_program(
         // yet.
         fwd.op_lines = program.op_lines.iter().map(|(v, loc)| (*v, loc.line)).collect();
         let boundary = fwd.walk(&f.def.body, &units, &fresh);
-        let Some(root_var) = segment_root_var(&boundary, &fwd.env) else {
+        // Every segment value the boundary needs, rebuilt together.
+        let root_vars = segment_root_vars(&boundary, &fwd.env);
+        if root_vars.is_empty() {
             continue;
-        };
-        let Some(&root_id) = fwd.env.get(&root_var) else {
-            continue;
-        };
+        }
+        let root_ids: Vec<Id> = root_vars.iter().map(|v| fwd.env[v]).collect();
 
         let (mut rules, axiom_referenced) = axiom_rewrites(registry, &fwd.reached);
         rules.extend(struct_projection_rewrites(&fwd.struct_ops, &fwd.field_ops));
@@ -3720,7 +3930,7 @@ pub fn optimize_program(
         // back an arbitrary member of the now-merged equivalence class, not
         // the original pre-rewrite tree, silently defeating the "did
         // anything actually change" comparison below.
-        let original = fwd.egraph.id_to_expr(root_id);
+        let originals: Vec<RecExpr<CleaveLang>> = root_ids.iter().map(|&id| fwd.egraph.id_to_expr(id)).collect();
         let Forward {
             egraph,
             free_vars,
@@ -3792,9 +4002,8 @@ pub fn optimize_program(
             runner_builder = runner_builder.with_explanations_enabled();
         }
         let mut runner = runner_builder.run(&rules);
-        let root_id = runner.egraph.find(root_id);
         let extractor = Extractor::new(&runner.egraph, AstSize);
-        let (_, best) = extractor.find_best(root_id);
+        let (best, best_roots) = extract_shared(&runner.egraph, &extractor, &root_ids);
         // Compared structurally (`same_expression`), not by `RecExpr`'s
         // derived `PartialEq` -- two `RecExpr`s representing the identical
         // tree can carry a different internal id layout and compare unequal
@@ -3805,19 +4014,29 @@ pub fn optimize_program(
         // depth of sharing. A transformer's gradient (residuals, one input
         // read by three projections, activations reused by the backward)
         // made it gigabytes from two blocks on and took the machine down.
-        if same_expression(&best, &original) {
+        if originals
+            .iter()
+            .zip(&best_roots)
+            .all(|(original, &root)| same_expression_at(&best, root, original, original.root()))
+        {
             continue; // saturation ran, but extraction picked the exact original form back -- nothing to report or rebuild
         }
-        if want_explanations {
-            let explanation = runner
-                .explain_equivalence(&original, &best)
-                .get_flat_string();
-            explanations.push(format!("{}: {}", f.def.name, explanation));
+        let is_construction =
+            |sym: &Symbol| struct_ops.contains_key(sym) || array_ops.contains_key(sym) || array_repeat_ops.contains_key(sym);
+        if shares_construction(&best, &best_roots, is_construction) {
+            continue;
         }
-        let rebuilt = rebuild_segment(
+        if want_explanations {
+            let singles: Vec<RecExpr<CleaveLang>> = root_ids.iter().map(|&id| extractor.find_best(id).1).collect();
+            for (original, single) in originals.iter().zip(&singles) {
+                let explanation = runner.explain_equivalence(original, single).get_flat_string();
+                explanations.push(format!("{}: {}", f.def.name, explanation));
+            }
+        }
+        let roots: Vec<(Id, CVar)> = best_roots.iter().copied().zip(root_vars.iter().copied()).collect();
+        let rebuilt = rebuild_segment_roots(
             &best,
-            best.root(),
-            root_var,
+            &roots,
             &boundary,
             &free_vars,
             &raw_ops,
@@ -3829,7 +4048,7 @@ pub fn optimize_program(
             &load_ops,
             &fresh,
         );
-        if let Some(seg_line) = program.op_lines.get(&root_var).copied() {
+        if let Some(seg_line) = root_vars.iter().find_map(|v| program.op_lines.get(v).copied()) {
             let mut vs = Vec::new();
             collect_letprim_vars(&rebuilt, &mut vs);
             for v in vs {
@@ -5210,7 +5429,16 @@ fn accumulate_adjoint(
 /// operator at each node and the same children, each pair of nodes compared
 /// once (memoized), so linear in the expressions' sizes however much they
 /// share -- never by expanding them into trees.
+#[cfg(test)]
 fn same_expression(a: &RecExpr<CleaveLang>, b: &RecExpr<CleaveLang>) -> bool {
+    if a.as_ref().is_empty() || b.as_ref().is_empty() {
+        return a.as_ref().is_empty() && b.as_ref().is_empty();
+    }
+    same_expression_at(a, a.root(), b, b.root())
+}
+
+/// `same_expression` for the subexpressions at `x` in `a` and `y` in `b`.
+fn same_expression_at(a: &RecExpr<CleaveLang>, x: Id, b: &RecExpr<CleaveLang>, y: Id) -> bool {
     fn same(
         a: &RecExpr<CleaveLang>,
         x: Id,
@@ -5231,10 +5459,7 @@ fn same_expression(a: &RecExpr<CleaveLang>, b: &RecExpr<CleaveLang>) -> bool {
         seen.insert((x, y), result);
         result
     }
-    if a.as_ref().is_empty() || b.as_ref().is_empty() {
-        return a.as_ref().is_empty() && b.as_ref().is_empty();
-    }
-    same(a, a.root(), b, b.root(), &mut HashMap::default())
+    same(a, x, b, y, &mut HashMap::default())
 }
 
 /// Registers, as field reads, the `tuplefield:<unit>:<k>` nodes an adjoint

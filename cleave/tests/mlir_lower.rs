@@ -6,7 +6,7 @@ use cleave::driver::compile;
 use cleave::egraph::{DerivativeRequest, optimize_program, synthesize_derivatives};
 use cleave::mlir_lower::lower_program;
 use cleave::pipeline::{
-    CodegenOptions, check_type_errors, lower_to_llvm, strip_ciface_wrapper_debug_info,
+    CodegenOptions, check_type_errors, lower_to_llvm,
 };
 use cleave::registry::Registry;
 use cleave_mlir::Context;
@@ -115,45 +115,8 @@ fn a_compiled_program_actually_runs_and_returns_the_right_value() {
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
-    // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
-    // their engines don't load libomp: `spawn`'s markers removed, spawned
-    // calls run in place (serial elision).
-    unsafe { cleave_mlir::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
-        .expect("cleave-lower-spawns");
     assert!(module.as_operation().verify());
-
-    // `num`'s own `Rem::mod` (prelude, unconditionally compiled into every
-    // module regardless of whether the program actually calls it — see
-    // `doc/backlog.md`'s own "dead-code elimination" item) has a real `if`/
-    // `else` body, so `scf.if` is now present in *every* compiled module,
-    // not just ones whose own source uses `if` — `create_to_llvm` alone
-    // can't translate it (needs `create_scf_to_control_flow` first, same
-    // reasoning as `run_i32`'s own doc comment below), found by direct
-    // testing the moment `mod`/`rem` landed in the stdlib.
-    // `--expand-strided-metadata`/`--lower-affine`: needed once a real
-    // `memref.subview` with a genuinely non-trivial `strided<...>` layout
-    // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
-    // has the story).
-    // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
-    // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
-    // doc comment for the full story (isolated there, on a completely
-    // unrelated plain-array case): running `--finalize-memref-to-llvm`
-    // once, up front, leaves a genuinely unreconcilable `i64`-to-`index`-
-    // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
-    // constants; a first `--convert-to-llvm` pass gives those a chance to
-    // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
-    // Multiple independent conversion passes can each leave `builtin.
-    // unrealized_conversion_cast` bridge ops between their own intermediate
-    // representations behind -- found by direct testing, kept defensively:
-    // real LLVM-IR translation can't handle a bare `unrealized_conversion_
-    // cast` at all (`LLVM Translation failed for operation: builtin.
-    // unrealized_conversion_cast`, a hard native crash). This is the
-    // standard MLIR cleanup for exactly that situation: folds/cancels
-    // chains of these casts away (`cast(cast(x, A->B), B->A) == x`), not a
-    // real lowering step of its own.
-    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-scf-to-cf,canonicalize,expand-strided-metadata,lower-affine,canonicalize,convert-to-llvm,finalize-memref-to-llvm,convert-to-llvm,reconcile-unrealized-casts)")
-        .expect("lowering to the llvm dialect must succeed");
-    strip_ciface_wrapper_debug_info(&mut module);
+    lower_like_the_cli(&context, &mut module);
 
     let engine = cleave::pipeline::jit(&module, 2);
     // Registered unconditionally, harmless if unused -- any struct
@@ -183,13 +146,8 @@ fn a_compiled_program_actually_runs_and_returns_the_right_value() {
     assert_eq!(out, 17);
 }
 
-/// Lowers `src` to the `llvm` dialect and JIT-invokes its `main`, returning
-/// the result. `scf.if` (and any other structured-control-flow op) has no
-/// direct LLVM IR translation of its own -- `create_scf_to_control_flow`
-/// lowers it to the `cf` dialect's ordinary branches first, which `create_
-/// to_llvm` *does* know how to translate. Skipping this produced a hard
-/// native crash (`STATUS_ACCESS_VIOLATION`), not a clean Rust-level error --
-/// found by direct testing, same fix applied in `main.rs`'s own `--run`.
+/// Lowers `src` to the `llvm` dialect through the CLI's own pipeline
+/// (`lower_like_the_cli`) and JIT-invokes its `main`, returning the result.
 ///
 /// `check_type_errors` runs first, exactly like every one of `main.rs`'s own
 /// `--run`/`--emit-*` call sites already do -- `doc/backlog.md`'s own former
@@ -278,20 +236,11 @@ fn lowered_llvm_text(context: &Context, src: &str) -> String {
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(context, &cps_program, &mlir_types, struct_schemas);
-    // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
-    // their engines don't load libomp: `spawn`'s markers removed, spawned
-    // calls run in place (serial elision).
-    unsafe { cleave_mlir::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
-        .expect("cleave-lower-spawns");
     assert!(
         module.as_operation().verify(),
         "generated MLIR module failed verification"
     );
-
-    // In-process engine without libomp: spawned calls run in place.
-    let options = CodegenOptions { tasks: false, ..CodegenOptions::default() };
-    cleave::options::set(options.clone());
-    lower_to_llvm(context, &mut module, &options).unwrap_or_else(|e| panic!("lower_to_llvm failed: {e:?}"));
+    lower_like_the_cli(context, &mut module);
     module.as_operation().to_string()
 }
 
@@ -323,18 +272,14 @@ fn run_i32_with_optimization_pass(context: &Context, src: &str) -> i32 {
     run_i32_from_cps(context, &program, cps_program)
 }
 
-/// Like `run_i32_with_optimization_pass`, but returns the printed, fully
-/// lowered `llvm`-dialect text instead of JIT-invoking -- `lowered_llvm_
-/// text`'s own tensor-*capable* twin (that one's own doc comment explains
-/// why it deliberately skips bufferization: every one of its own callers is
-/// scalar-only). Needed for asserting *which* concrete unit an axiom
-/// rewrite actually routed through (`matmul_transpose_a`'s own zero-copy
-/// `mlir::linalg::matmul_transpose_a` intrinsic, tagged with a real,
-/// distinctive synthetic location, `<cleave-matmul-transpose>` — confirmed
-/// directly, this is genuinely how it shows up in real lowered output, not
-/// assumed) rather than only checking the numeric result, which a subtly
-/// wrong but still-plausible rewrite could satisfy by coincidence.
-fn optimized_lowered_llvm_text_for_tensors(context: &Context, src: &str) -> String {
+/// `run_i32_with_optimization_pass`'s CPS, printed after `optimize_program`
+/// and dead-code elimination: for asserting *which* concrete unit an axiom
+/// rewrite routed through (`MatMulTransposeA::matmul_transpose_a`, and no
+/// `Transpose::transpose` left) rather than only checking the numeric
+/// result, which a subtly wrong but still-plausible rewrite could satisfy
+/// by coincidence. The rewrite is a CPS one; after the MLIR inliner the
+/// lowered module no longer names the units.
+fn optimized_cps_text(src: &str) -> String {
     let (result, _sources) = compile(vec![("test.cleave".to_string(), src.to_string())], &[]);
     let program = result.unwrap_or_else(|e| panic!("compile failed: {e:?}"));
     let registry = Registry::build(&program);
@@ -356,51 +301,23 @@ fn optimized_lowered_llvm_text_for_tensors(context: &Context, src: &str) -> Stri
         .collect();
     let cps_program = convert_program(units, None);
     let struct_schemas = collect_struct_schemas(&program);
-    // `build_cps_program`'s own real sequence (`pipeline.rs`) -- matching
-    // it exactly, not just `collect_units`/`convert_program` alone, found
-    // to matter live: this program has no real `derive()`/`grad()` at all
-    // (`requests` empty), yet skipping this step here specifically kept an
-    // axiom rewrite from firing that fires correctly through the real CLI
-    // (`--dump-mlir-lowered`), not yet root-caused beyond that, but
-    // reproducing the real pipeline exactly is the correct fix regardless.
     let cps_program = synthesize_derivatives(cps_program, &requests, &registry, &struct_schemas)
         .unwrap_or_else(|e| panic!("cannot derive: {e:?}"));
     // Not dead-code-eliminated before `optimize_program` runs -- an axiom/
     // `derivative`/`adjoint` rule can reference a unit no ordinary call
-    // site reaches at all, which a pre-optimization sweep would strip
-    // before the rule ever gets a chance to need it (`pipeline.rs::build_
-    // optimized_cps`'s own identical comment has the full reasoning).
+    // site reaches at all (`pipeline.rs::build_optimized_cps`).
     let (cps_program, _) = optimize_program(cps_program, &registry, false);
-    let cps_program = eliminate_dead_code(cps_program);
+    cleave::cps::dump_cps_program(&eliminate_dead_code(cps_program))
+}
 
-    let mlir_types = collect_mlir_types(&program);
-    let mut module = lower_program(context, &cps_program, &mlir_types, struct_schemas);
-    // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
-    // their engines don't load libomp: `spawn`'s markers removed, spawned
-    // calls run in place (serial elision).
-    unsafe { cleave_mlir::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
-        .expect("cleave-lower-spawns");
-    assert!(
-        module.as_operation().verify(),
-        "generated MLIR module failed verification"
-    );
-
-    // The identical three-stage tensor pipeline `run_i32_from_cps` already
-    // uses (that function's own doc comment has the full reasoning for
-    // each stage) -- stopping here, before JIT engine construction, instead
-    // of continuing on to invoke.
-    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-elementwise-to-linalg)")
-        .expect("convert-elementwise-to-linalg must succeed");
-
-    cleave::pipeline::register_passes();
-    cleave::pipeline::run_passes(&mut module, "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})")
-        .expect("one-shot-bufferize must succeed");
-
-    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-linalg-to-loops,convert-scf-to-cf,canonicalize,expand-strided-metadata,lower-affine,canonicalize,convert-to-llvm,finalize-memref-to-llvm,convert-to-llvm,reconcile-unrealized-casts)")
-        .expect("lowering to the llvm dialect must succeed");
-    strip_ciface_wrapper_debug_info(&mut module);
-
-    module.as_operation().to_string()
+/// The CLI's own MLIR-to-LLVM pipeline (`pipeline::lower_to_llvm`, the
+/// matmul schedule and every `cleave-*` pass included), so a test here
+/// covers what `--run --no-openmp` compiles. The in-process engine has no
+/// libomp: no parallel loops, spawned calls run in place (`tasks: false`).
+fn lower_like_the_cli<'c>(context: &'c Context, module: &mut cleave_mlir::ir::Module<'c>) {
+    let options = CodegenOptions { openmp: false, tasks: false, ..CodegenOptions::default() };
+    cleave::options::set(options.clone());
+    lower_to_llvm(context, module, &options).unwrap_or_else(|e| panic!("lower_to_llvm failed: {e:?}"));
 }
 
 fn run_i32_from_cps(
@@ -411,68 +328,11 @@ fn run_i32_from_cps(
     let mlir_types = collect_mlir_types(program);
     let struct_schemas = collect_struct_schemas(program);
     let mut module = lower_program(context, &cps_program, &mlir_types, struct_schemas);
-    // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
-    // their engines don't load libomp: `spawn`'s markers removed, spawned
-    // calls run in place (serial elision).
-    unsafe { cleave_mlir::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
-        .expect("cleave-lower-spawns");
     assert!(
         module.as_operation().verify(),
         "generated MLIR module failed verification"
     );
-
-    // Three separate pipelines, each run to completion before the next:
-    // combined into one, the same passes once failed partway (`op was not
-    // bufferized`). Not root-caused; kept as the shape that works.
-    //
-    // Stage 1: a bare `arith.addf` (etc.) on `tensor`-typed operands
-    // (`Ring<Tensor<T,Dims...>>`'s own elementwise impls, `stdlib/linalg/
-    // tensor.cleave`) has no `BufferizableOpInterface` implementation of
-    // its own — only a real structured/named op does — so one-shot-
-    // bufferize (stage 2) can't handle it directly without this first.
-    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-elementwise-to-linalg)")
-        .expect("convert-elementwise-to-linalg must succeed");
-
-    // Stage 2: `bufferize-function-boundaries=true` — without it, a
-    // `tensor`-typed function parameter/return (any cross-function call
-    // involving a `Vector`/`Matrix`) is left bridged by a `bufferization.
-    // to_buffer`/`to_tensor` pair at the function boundary that nothing
-    // later in this pipeline can legalize (`failed to legalize operation
-    // 'bufferization.to_buffer'`, a real pass failure, found by direct
-    // testing) — this option makes one-shot-bufferize rewrite the
-    // function's own signature directly instead, eliminating the bridge
-    // entirely.
-    cleave::pipeline::register_passes();
-    cleave::pipeline::run_passes(&mut module, "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})")
-        .expect("one-shot-bufferize must succeed");
-
-    // Stage 3: ordinary lowering to the `llvm` dialect — everything past
-    // this point is plain `memref`/`arith`/`scf`, already fully handled by
-    // this project's own pre-existing pipeline, unchanged.
-    // `--expand-strided-metadata`/`--lower-affine`: needed once a real
-    // `memref.subview` with a genuinely non-trivial `strided<...>` layout
-    // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
-    // has the story).
-    // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
-    // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
-    // doc comment for the full story (isolated there, on a completely
-    // unrelated plain-array case): running `--finalize-memref-to-llvm`
-    // once, up front, leaves a genuinely unreconcilable `i64`-to-`index`-
-    // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
-    // constants; a first `--convert-to-llvm` pass gives those a chance to
-    // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
-    // Multiple independent conversion passes can each leave `builtin.
-    // unrealized_conversion_cast` bridge ops between their own intermediate
-    // representations behind -- found by direct testing, kept defensively:
-    // real LLVM-IR translation can't handle a bare `unrealized_conversion_
-    // cast` at all (`LLVM Translation failed for operation: builtin.
-    // unrealized_conversion_cast`, a hard native crash). This is the
-    // standard MLIR cleanup for exactly that situation: folds/cancels
-    // chains of these casts away (`cast(cast(x, A->B), B->A) == x`), not a
-    // real lowering step of its own.
-    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-linalg-to-loops,convert-scf-to-cf,canonicalize,expand-strided-metadata,lower-affine,canonicalize,convert-to-llvm,finalize-memref-to-llvm,convert-to-llvm,reconcile-unrealized-casts)")
-        .expect("lowering to the llvm dialect must succeed");
-    strip_ciface_wrapper_debug_info(&mut module);
+    lower_like_the_cli(context, &mut module);
 
     let engine = cleave::pipeline::jit(&module, 2);
     // Registered unconditionally, harmless if unused -- any struct
@@ -483,14 +343,6 @@ fn run_i32_from_cps(
     // `memref.copy` calls need it once a tensor value is big enough to need
     // a real defensive copy, first hit by `derive_through_dense_forward_
     // computes_the_right_gradient`, just below).
-    unsafe {
-        // `stdlib/linalg/matrix.cleave`'s own `Fma`/`FmaTransposeA`/
-        // `FmaTransposeB` (`f32`-only) always build *both* branches of
-        // their own arbitrary size threshold -- unconditionally needed
-        // even when a test's own tiny shapes only ever take the native
-        // branch at runtime, the same reason `cleave/tests/blas.rs` needs
-        // this registered at all.
-    }
     // `use io;` now transitively pulls in `stdlib/display/display.cleave`
     // and `stdlib/dynarray/dynarray.cleave` -- see `register_io_symbols`'s
     // own doc comment.
@@ -744,45 +596,8 @@ fn an_extern_fn_call_actually_executes_through_a_registered_symbol() {
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
-    // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
-    // their engines don't load libomp: `spawn`'s markers removed, spawned
-    // calls run in place (serial elision).
-    unsafe { cleave_mlir::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
-        .expect("cleave-lower-spawns");
     assert!(module.as_operation().verify());
-
-    // `num`'s own `Rem::mod` (prelude, unconditionally compiled into every
-    // module regardless of whether the program actually calls it — see
-    // `doc/backlog.md`'s own "dead-code elimination" item) has a real `if`/
-    // `else` body, so `scf.if` is now present in *every* compiled module,
-    // not just ones whose own source uses `if` — `create_to_llvm` alone
-    // can't translate it (needs `create_scf_to_control_flow` first, same
-    // reasoning as `run_i32`'s own doc comment below), found by direct
-    // testing the moment `mod`/`rem` landed in the stdlib.
-    // `--expand-strided-metadata`/`--lower-affine`: needed once a real
-    // `memref.subview` with a genuinely non-trivial `strided<...>` layout
-    // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
-    // has the story).
-    // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
-    // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
-    // doc comment for the full story (isolated there, on a completely
-    // unrelated plain-array case): running `--finalize-memref-to-llvm`
-    // once, up front, leaves a genuinely unreconcilable `i64`-to-`index`-
-    // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
-    // constants; a first `--convert-to-llvm` pass gives those a chance to
-    // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
-    // Multiple independent conversion passes can each leave `builtin.
-    // unrealized_conversion_cast` bridge ops between their own intermediate
-    // representations behind -- found by direct testing, kept defensively:
-    // real LLVM-IR translation can't handle a bare `unrealized_conversion_
-    // cast` at all (`LLVM Translation failed for operation: builtin.
-    // unrealized_conversion_cast`, a hard native crash). This is the
-    // standard MLIR cleanup for exactly that situation: folds/cancels
-    // chains of these casts away (`cast(cast(x, A->B), B->A) == x`), not a
-    // real lowering step of its own.
-    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-scf-to-cf,canonicalize,expand-strided-metadata,lower-affine,canonicalize,convert-to-llvm,finalize-memref-to-llvm,convert-to-llvm,reconcile-unrealized-casts)")
-        .expect("lowering to the llvm dialect must succeed");
-    strip_ciface_wrapper_debug_info(&mut module);
+    lower_like_the_cli(&context, &mut module);
 
     let engine = cleave::pipeline::jit(&module, 2);
     unsafe {
@@ -901,45 +716,8 @@ fn an_extern_impl_method_actually_executes_the_right_symbol_at_each_call_site() 
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
-    // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
-    // their engines don't load libomp: `spawn`'s markers removed, spawned
-    // calls run in place (serial elision).
-    unsafe { cleave_mlir::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
-        .expect("cleave-lower-spawns");
     assert!(module.as_operation().verify());
-
-    // `num`'s own `Rem::mod` (prelude, unconditionally compiled into every
-    // module regardless of whether the program actually calls it — see
-    // `doc/backlog.md`'s own "dead-code elimination" item) has a real `if`/
-    // `else` body, so `scf.if` is now present in *every* compiled module,
-    // not just ones whose own source uses `if` — `create_to_llvm` alone
-    // can't translate it (needs `create_scf_to_control_flow` first, same
-    // reasoning as `run_i32`'s own doc comment below), found by direct
-    // testing the moment `mod`/`rem` landed in the stdlib.
-    // `--expand-strided-metadata`/`--lower-affine`: needed once a real
-    // `memref.subview` with a genuinely non-trivial `strided<...>` layout
-    // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
-    // has the story).
-    // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
-    // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
-    // doc comment for the full story (isolated there, on a completely
-    // unrelated plain-array case): running `--finalize-memref-to-llvm`
-    // once, up front, leaves a genuinely unreconcilable `i64`-to-`index`-
-    // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
-    // constants; a first `--convert-to-llvm` pass gives those a chance to
-    // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
-    // Multiple independent conversion passes can each leave `builtin.
-    // unrealized_conversion_cast` bridge ops between their own intermediate
-    // representations behind -- found by direct testing, kept defensively:
-    // real LLVM-IR translation can't handle a bare `unrealized_conversion_
-    // cast` at all (`LLVM Translation failed for operation: builtin.
-    // unrealized_conversion_cast`, a hard native crash). This is the
-    // standard MLIR cleanup for exactly that situation: folds/cancels
-    // chains of these casts away (`cast(cast(x, A->B), B->A) == x`), not a
-    // real lowering step of its own.
-    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-scf-to-cf,canonicalize,expand-strided-metadata,lower-affine,canonicalize,convert-to-llvm,finalize-memref-to-llvm,convert-to-llvm,reconcile-unrealized-casts)")
-        .expect("lowering to the llvm dialect must succeed");
-    strip_ciface_wrapper_debug_info(&mut module);
+    lower_like_the_cli(&context, &mut module);
 
     let engine = cleave::pipeline::jit(&module, 2);
     unsafe {
@@ -997,37 +775,8 @@ fn an_array_argument_crosses_an_extern_call_boundary_correctly() {
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
-    // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
-    // their engines don't load libomp: `spawn`'s markers removed, spawned
-    // calls run in place (serial elision).
-    unsafe { cleave_mlir::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
-        .expect("cleave-lower-spawns");
     assert!(module.as_operation().verify());
-
-    // `--expand-strided-metadata`/`--lower-affine`: needed once a real
-    // `memref.subview` with a genuinely non-trivial `strided<...>` layout
-    // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
-    // has the story).
-    // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
-    // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
-    // doc comment for the full story (isolated there, on a completely
-    // unrelated plain-array case): running `--finalize-memref-to-llvm`
-    // once, up front, leaves a genuinely unreconcilable `i64`-to-`index`-
-    // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
-    // constants; a first `--convert-to-llvm` pass gives those a chance to
-    // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
-    // Multiple independent conversion passes can each leave `builtin.
-    // unrealized_conversion_cast` bridge ops between their own intermediate
-    // representations behind -- found by direct testing, kept defensively:
-    // real LLVM-IR translation can't handle a bare `unrealized_conversion_
-    // cast` at all (`LLVM Translation failed for operation: builtin.
-    // unrealized_conversion_cast`, a hard native crash). This is the
-    // standard MLIR cleanup for exactly that situation: folds/cancels
-    // chains of these casts away (`cast(cast(x, A->B), B->A) == x`), not a
-    // real lowering step of its own.
-    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-scf-to-cf,canonicalize,expand-strided-metadata,lower-affine,canonicalize,convert-to-llvm,finalize-memref-to-llvm,convert-to-llvm,reconcile-unrealized-casts)")
-        .expect("lowering to the llvm dialect must succeed");
-    strip_ciface_wrapper_debug_info(&mut module);
+    lower_like_the_cli(&context, &mut module);
 
     let engine = cleave::pipeline::jit(&module, 2);
     unsafe {
@@ -1082,11 +831,6 @@ fn a_unit_returning_extern_fn_can_be_called_correctly() {
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
-    // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
-    // their engines don't load libomp: `spawn`'s markers removed, spawned
-    // calls run in place (serial elision).
-    unsafe { cleave_mlir::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
-        .expect("cleave-lower-spawns");
     assert!(module.as_operation().verify());
     let text = module.as_operation().to_string();
     // The real, structural proof: the declared extern signature (and its
@@ -1102,30 +846,7 @@ fn a_unit_returning_extern_fn_can_be_called_correctly() {
         "got:\n{text}"
     );
 
-    // `--expand-strided-metadata`/`--lower-affine`: needed once a real
-    // `memref.subview` with a genuinely non-trivial `strided<...>` layout
-    // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
-    // has the story).
-    // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
-    // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
-    // doc comment for the full story (isolated there, on a completely
-    // unrelated plain-array case): running `--finalize-memref-to-llvm`
-    // once, up front, leaves a genuinely unreconcilable `i64`-to-`index`-
-    // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
-    // constants; a first `--convert-to-llvm` pass gives those a chance to
-    // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
-    // Multiple independent conversion passes can each leave `builtin.
-    // unrealized_conversion_cast` bridge ops between their own intermediate
-    // representations behind -- found by direct testing, kept defensively:
-    // real LLVM-IR translation can't handle a bare `unrealized_conversion_
-    // cast` at all (`LLVM Translation failed for operation: builtin.
-    // unrealized_conversion_cast`, a hard native crash). This is the
-    // standard MLIR cleanup for exactly that situation: folds/cancels
-    // chains of these casts away (`cast(cast(x, A->B), B->A) == x`), not a
-    // real lowering step of its own.
-    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-scf-to-cf,canonicalize,expand-strided-metadata,lower-affine,canonicalize,convert-to-llvm,finalize-memref-to-llvm,convert-to-llvm,reconcile-unrealized-casts)")
-        .expect("lowering to the llvm dialect must succeed");
-    strip_ciface_wrapper_debug_info(&mut module);
+    lower_like_the_cli(&context, &mut module);
 
     let engine = cleave::pipeline::jit(&module, 2);
     unsafe {
@@ -1181,11 +902,6 @@ fn a_string_literal_printed_via_print_writes_the_right_bytes_to_stdout() {
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
-    // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
-    // their engines don't load libomp: `spawn`'s markers removed, spawned
-    // calls run in place (serial elision).
-    unsafe { cleave_mlir::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
-        .expect("cleave-lower-spawns");
     assert!(module.as_operation().verify());
     let text = module.as_operation().to_string();
     assert!(
@@ -1197,30 +913,7 @@ fn a_string_literal_printed_via_print_writes_the_right_bytes_to_stdout() {
         "expected the array-aware pointer extraction, got:\n{text}"
     );
 
-    // `--expand-strided-metadata`/`--lower-affine`: needed once a real
-    // `memref.subview` with a genuinely non-trivial `strided<...>` layout
-    // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
-    // has the story).
-    // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
-    // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
-    // doc comment for the full story (isolated there, on a completely
-    // unrelated plain-array case): running `--finalize-memref-to-llvm`
-    // once, up front, leaves a genuinely unreconcilable `i64`-to-`index`-
-    // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
-    // constants; a first `--convert-to-llvm` pass gives those a chance to
-    // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
-    // Multiple independent conversion passes can each leave `builtin.
-    // unrealized_conversion_cast` bridge ops between their own intermediate
-    // representations behind -- found by direct testing, kept defensively:
-    // real LLVM-IR translation can't handle a bare `unrealized_conversion_
-    // cast` at all (`LLVM Translation failed for operation: builtin.
-    // unrealized_conversion_cast`, a hard native crash). This is the
-    // standard MLIR cleanup for exactly that situation: folds/cancels
-    // chains of these casts away (`cast(cast(x, A->B), B->A) == x`), not a
-    // real lowering step of its own.
-    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-scf-to-cf,canonicalize,expand-strided-metadata,lower-affine,canonicalize,convert-to-llvm,finalize-memref-to-llvm,convert-to-llvm,reconcile-unrealized-casts)")
-        .expect("lowering to the llvm dialect must succeed");
-    strip_ciface_wrapper_debug_info(&mut module);
+    lower_like_the_cli(&context, &mut module);
 
     let engine = cleave::pipeline::jit(&module, 2);
     register_io_symbols(&engine);
@@ -3303,38 +2996,12 @@ fn print_of_an_unannotated_index_result_no_longer_panics() {
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
-    // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
-    // their engines don't load libomp: `spawn`'s markers removed, spawned
-    // calls run in place (serial elision).
-    unsafe { cleave_mlir::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
-        .expect("cleave-lower-spawns");
     assert!(
         module.as_operation().verify(),
         "generated MLIR module failed verification"
     );
 
-    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-elementwise-to-linalg)")
-        .expect("convert-elementwise-to-linalg must succeed");
-
-    cleave::pipeline::register_passes();
-    cleave::pipeline::run_passes(&mut module, "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})")
-        .expect("one-shot-bufferize must succeed");
-
-    // `--expand-strided-metadata`/`--lower-affine`: needed once a real
-    // `memref.subview` with a genuinely non-trivial `strided<...>` layout
-    // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
-    // has the story).
-    // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
-    // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
-    // doc comment for the full story (isolated there, on a completely
-    // unrelated plain-array case): running `--finalize-memref-to-llvm`
-    // once, up front, leaves a genuinely unreconcilable `i64`-to-`index`-
-    // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
-    // constants; a first `--convert-to-llvm` pass gives those a chance to
-    // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
-    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-linalg-to-loops,convert-scf-to-cf,canonicalize,expand-strided-metadata,lower-affine,canonicalize,convert-to-llvm,finalize-memref-to-llvm,convert-to-llvm,reconcile-unrealized-casts)")
-        .expect("lowering to the llvm dialect must succeed");
-    strip_ciface_wrapper_debug_info(&mut module);
+    lower_like_the_cli(&context, &mut module);
 
     let engine = cleave::pipeline::jit(&module, 2);
     register_io_symbols(&engine);
@@ -3378,38 +3045,12 @@ fn print_of_an_unannotated_matmul_index_result_no_longer_panics() {
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(&context, &cps_program, &mlir_types, struct_schemas);
-    // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
-    // their engines don't load libomp: `spawn`'s markers removed, spawned
-    // calls run in place (serial elision).
-    unsafe { cleave_mlir::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
-        .expect("cleave-lower-spawns");
     assert!(
         module.as_operation().verify(),
         "generated MLIR module failed verification"
     );
 
-    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-elementwise-to-linalg)")
-        .expect("convert-elementwise-to-linalg must succeed");
-
-    cleave::pipeline::register_passes();
-    cleave::pipeline::run_passes(&mut module, "builtin.module(one-shot-bufferize{bufferize-function-boundaries=true})")
-        .expect("one-shot-bufferize must succeed");
-
-    // `--expand-strided-metadata`/`--lower-affine`: needed once a real
-    // `memref.subview` with a genuinely non-trivial `strided<...>` layout
-    // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
-    // has the story).
-    // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
-    // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
-    // doc comment for the full story (isolated there, on a completely
-    // unrelated plain-array case): running `--finalize-memref-to-llvm`
-    // once, up front, leaves a genuinely unreconcilable `i64`-to-`index`-
-    // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
-    // constants; a first `--convert-to-llvm` pass gives those a chance to
-    // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
-    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-linalg-to-loops,convert-scf-to-cf,canonicalize,expand-strided-metadata,lower-affine,canonicalize,convert-to-llvm,finalize-memref-to-llvm,convert-to-llvm,reconcile-unrealized-casts)")
-        .expect("lowering to the llvm dialect must succeed");
-    strip_ciface_wrapper_debug_info(&mut module);
+    lower_like_the_cli(&context, &mut module);
 
     let engine = cleave::pipeline::jit(&module, 2);
     register_io_symbols(&engine);
@@ -4453,6 +4094,24 @@ fn a_float_literal_inside_a_straight_line_segment_still_computes_correctly_throu
 fn derive_of_a_single_parameter_function_computes_the_scalar_derivative() {
     let context = context();
     let src = "
+        fn f(x: f32) -> f32 { x * x }
+        fprime = derive(f, x);
+        fn main() -> i32 {
+            let d: f32 = fprime(3.0);
+            if d == 6.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// The program declaring its own `add` doesn't hide the stdlib's: `Ring`'s
+/// derivative rule for `mul` (a sum of `Additive::add`) still differentiates
+/// `x * x`, its `add` resolved from the stdlib's crate.
+#[test]
+fn a_programs_own_algebra_method_does_not_hide_a_stdlib_rules_callee() {
+    let context = context();
+    let src = "
+        algebra Shapes<T> { fn add(a: T, b: T) -> T; }
         fn f(x: f32) -> f32 { x * x }
         fprime = derive(f, x);
         fn main() -> i32 {
@@ -6000,31 +5659,12 @@ fn run_i32_with_dynarray_symbols(
     let mlir_types = collect_mlir_types(&program);
     let struct_schemas = collect_struct_schemas(&program);
     let mut module = lower_program(context, &cps_program, &mlir_types, struct_schemas);
-    // These harnesses run their own pass pipelines, not `lower_to_llvm`, and
-    // their engines don't load libomp: `spawn`'s markers removed, spawned
-    // calls run in place (serial elision).
-    unsafe { cleave_mlir::run_pipeline(module.to_raw(), "builtin.module(cleave-lower-spawns{tasks=false})", false) }
-        .expect("cleave-lower-spawns");
     assert!(
         module.as_operation().verify(),
         "generated MLIR module failed verification"
     );
 
-    // `--expand-strided-metadata`/`--lower-affine`: needed once a real
-    // `memref.subview` with a genuinely non-trivial `strided<...>` layout
-    // can appear here (`mlir_lower.rs::copy_nested_array`'s own doc comment
-    // has the story).
-    // `--convert-to-llvm`, *then* `--finalize-memref-to-llvm`, *then*
-    // `--convert-to-llvm` again -- see `tests/user_guide.rs::run_i32`'s own
-    // doc comment for the full story (isolated there, on a completely
-    // unrelated plain-array case): running `--finalize-memref-to-llvm`
-    // once, up front, leaves a genuinely unreconcilable `i64`-to-`index`-
-    // to-`i64` round trip behind on ordinary (non-subview) `index`-typed
-    // constants; a first `--convert-to-llvm` pass gives those a chance to
-    // convert cleanly before `--finalize-memref-to-llvm` ever sees them.
-    cleave::pipeline::run_passes(&mut module, "builtin.module(convert-scf-to-cf,canonicalize,expand-strided-metadata,lower-affine,canonicalize,convert-to-llvm,finalize-memref-to-llvm,convert-to-llvm,reconcile-unrealized-casts)")
-        .expect("lowering to the llvm dialect must succeed");
-    strip_ciface_wrapper_debug_info(&mut module);
+    lower_like_the_cli(&context, &mut module);
 
     let engine = cleave::pipeline::jit(&module, 2);
     register_io_symbols(&engine);
@@ -7663,7 +7303,7 @@ fn matmul_transpose_a_rewrite_fires_and_computes_the_right_value() {
             if compute(a, b) == 1.0 { 1 } else { 0 }
         }
     ";
-    let text = optimized_lowered_llvm_text_for_tensors(&context, src);
+    let text = optimized_cps_text(src);
     assert!(text.contains("MatMulTransposeA::matmul_transpose_a"), "{text}");
     assert!(!text.contains("Transpose::transpose"), "{text}");
     assert_eq!(run_i32(&context, src), 1);
@@ -7685,7 +7325,7 @@ fn matmul_transpose_b_rewrite_fires_and_computes_the_right_value() {
             if compute(a, b) == 6.0 { 1 } else { 0 }
         }
     ";
-    let text = optimized_lowered_llvm_text_for_tensors(&context, src);
+    let text = optimized_cps_text(src);
     assert!(text.contains("MatMulTransposeB::matmul_transpose_b"), "{text}");
     assert!(!text.contains("Transpose::transpose"), "{text}");
     assert_eq!(run_i32(&context, src), 1);
@@ -7711,7 +7351,7 @@ fn transpose_transpose_identity_fires_and_computes_the_right_value() {
             if compute(a) == 6.0 { 1 } else { 0 }
         }
     ";
-    let text = optimized_lowered_llvm_text_for_tensors(&context, src);
+    let text = optimized_cps_text(src);
     assert!(!text.contains("Transpose::transpose"), "{text}");
     assert_eq!(run_i32(&context, src), 1);
 }
@@ -7744,7 +7384,7 @@ fn matmul_transpose_distributes_axiom_fires_and_computes_the_right_value() {
             if compute(a, b) == 6.0 { 1 } else { 0 }
         }
     ";
-    let text = optimized_lowered_llvm_text_for_tensors(&context, src);
+    let text = optimized_cps_text(src);
     // The *rewritten* form's own two real units, checked by their exact,
     // fully-resolved instantiation, not just presence — a stronger check
     // than a bare occurrence count (each real unit legitimately appears
@@ -7777,7 +7417,7 @@ fn matmul_transpose_distributes_axiom_fires_and_computes_the_right_value() {
 /// above. Only the *collapsing* direction is declared (2 nodes vs. the
 /// unrewritten form's 3), the identical, unconditional node-count-win
 /// reasoning `matmul_transpose_distributes`'s own doc comment already
-/// gives — verified via `optimized_lowered_llvm_text_for_tensors`, not the
+/// gives — verified via `optimized_cps_text`, not the
 /// real CLI: `--dump-mlir-lowered` on the identical source, tried first,
 /// folds the *whole* expression down to a bare literal once its own real
 /// MLIR inliner (this test harness's own pipeline deliberately has none)
@@ -7799,7 +7439,7 @@ fn transpose_add_distributes_axiom_fires_and_computes_the_right_value() {
             if compute(a, b) == 22.0 { 1 } else { 0 }
         }
     ";
-    let text = optimized_lowered_llvm_text_for_tensors(&context, src);
+    let text = optimized_cps_text(src);
     assert!(text.contains("Additive::add<Tensor<f32, 2, 3>>"), "{text}");
     assert!(text.contains("Transpose::transpose<Tensor<f32, 2, 3>, Tensor<f32, 3, 2>>"), "{text}");
     assert!(!text.contains("Additive::add<Tensor<f32, 3, 2>>"), "{text}");
@@ -7823,7 +7463,7 @@ fn transpose_sub_distributes_axiom_fires_and_computes_the_right_value() {
             if compute(a, b) == 18.0 { 1 } else { 0 }
         }
     ";
-    let text = optimized_lowered_llvm_text_for_tensors(&context, src);
+    let text = optimized_cps_text(src);
     assert!(text.contains("Additive::sub<Tensor<f32, 2, 3>>"), "{text}");
     assert!(text.contains("Transpose::transpose<Tensor<f32, 2, 3>, Tensor<f32, 3, 2>>"), "{text}");
     assert!(!text.contains("Additive::sub<Tensor<f32, 3, 2>>"), "{text}");
@@ -7858,18 +7498,17 @@ fn fma_rewrite_fires_and_computes_the_right_value() {
             if compute(a, b, c) == 101.0 { 1 } else { 0 }
         }
     ";
-    let text = optimized_lowered_llvm_text_for_tensors(&context, src);
+    let text = optimized_cps_text(src);
     // The caller's own code (`compute`, inlined into `main`): `Fma::fma`'s
     // BLAS tier adds `c` after the product, so a `Ring::add` of this shape
-    // does exist in the module, inside `Fma::fma` (a branch dead at this
+    // does exist in the program, inside `Fma::fma` (a branch dead at this
     // size).
-    let compute: String = text
-        .lines()
-        .skip_while(|l| !l.contains("llvm.func @main()"))
-        .take_while(|l| !l.starts_with("  }"))
-        .collect::<Vec<_>>()
-        .join("
-");
+    let compute = text
+        .split("(fn main")
+        .nth(1)
+        .and_then(|rest| rest.split("
+(fn ").next())
+        .expect("`main` must be in the optimized CPS");
     assert!(compute.contains("Fma::fma<Tensor<f32, 2, 3>, Tensor<f32, 3, 2>, Tensor<f32, 2, 2>>"), "{text}");
     assert!(!compute.contains("MatMul::matmul<Tensor<f32, 2, 3>, Tensor<f32, 3, 2>, Tensor<f32, 2, 2>>"), "{text}");
     assert!(!compute.contains("Ring::add<Tensor<f32, 2, 2>>"), "{text}");
@@ -7900,7 +7539,7 @@ fn fma_transpose_a_rewrite_fires_and_computes_the_right_value() {
             if compute(a, b, c) == 11.0 { 1 } else { 0 }
         }
     ";
-    let text = optimized_lowered_llvm_text_for_tensors(&context, src);
+    let text = optimized_cps_text(src);
     assert!(text.contains("FmaTransposeA::fma_transpose_a<Tensor<f32, 3, 2>, Tensor<f32, 3, 4>, Tensor<f32, 2, 4>>"), "{text}");
     assert!(!text.contains("Transpose::transpose<Tensor<f32, 3, 2>"), "{text}");
     assert!(!text.contains("Ring::add<Tensor<f32, 2, 4>>"), "{text}");
@@ -7927,7 +7566,7 @@ fn fma_transpose_b_rewrite_fires_and_computes_the_right_value() {
             if compute(a, b, c) == 11.0 { 1 } else { 0 }
         }
     ";
-    let text = optimized_lowered_llvm_text_for_tensors(&context, src);
+    let text = optimized_cps_text(src);
     assert!(text.contains("FmaTransposeB::fma_transpose_b<Tensor<f32, 2, 3>, Tensor<f32, 4, 3>, Tensor<f32, 2, 4>>"), "{text}");
     assert!(!text.contains("Transpose::transpose<Tensor<f32, 4, 3>"), "{text}");
     assert!(!text.contains("Ring::add<Tensor<f32, 2, 4>>"), "{text}");

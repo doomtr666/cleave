@@ -505,7 +505,7 @@ fn a_float_define_folds_and_can_be_overridden() {
 /// real entry point (this file's own harness has no runtime for structs).
 #[test]
 fn an_overridden_define_sizes_struct_fields_too() {
-    let dir = std::env::temp_dir().join("cleave-const-decl");
+    let dir = std::env::temp_dir().join(format!("cleave-const-decl-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("define_field.cleave");
     std::fs::write(

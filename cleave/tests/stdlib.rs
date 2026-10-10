@@ -139,7 +139,7 @@ fn satisfies_bound(registry: &Registry, bound: &str, ty: &str) -> bool {
 /// to find the instance's name recorded but the instance never built).
 #[test]
 fn an_untrainable_field_is_a_located_error_not_a_panic() {
-    let dir = std::env::temp_dir().join("cleave-stdlib");
+    let dir = std::env::temp_dir().join(format!("cleave-stdlib-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("untrainable_field.cleave");
     std::fs::write(

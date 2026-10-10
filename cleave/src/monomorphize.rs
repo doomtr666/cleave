@@ -2030,7 +2030,6 @@ fn resolve_derivative_rule_expr_ty(
             )
         }
         ExprKind::Call(path, _, args, _) => {
-            let method = path.segments.join("::");
             let arg_tys: Vec<Ty> = args
                 .iter()
                 .filter_map(|a| {
@@ -2046,17 +2045,7 @@ fn resolve_derivative_rule_expr_ty(
                     )
                 })
                 .collect();
-            let owner = if registry
-                .fn_sig(algebra, &method)
-                .is_some_and(|s| s.params.len() == args.len())
-            {
-                algebra.to_string()
-            } else {
-                match registry.algebras_with_fn(&method, args.len()).as_slice() {
-                    [only] => only.to_string(),
-                    _ => return None,
-                }
-            };
+            let (owner, method) = registry.rule_callee(algebra, path, args.len())?;
             // The one concrete type this call's own arguments agree on --
             // every algebra ever called this way across the whole stdlib
             // today is single-generic (`Ring<T>`, `Transcendental<T>`), so
@@ -2550,17 +2539,8 @@ fn seed_axiom_expr_references<'p>(
             }
         }
         ExprKind::Call(path, _, args, _) => {
-            let method = path.segments.join("::");
-            let owner = if registry
-                .fn_sig(algebra, &method)
-                .is_some_and(|s| s.params.len() == args.len())
-            {
-                algebra.to_string()
-            } else {
-                match registry.algebras_with_fn(&method, args.len()).as_slice() {
-                    [only] => only.to_string(),
-                    _ => return,
-                }
+            let Some((owner, method)) = registry.rule_callee(algebra, path, args.len()) else {
+                return;
             };
             let Some(sig) = registry.fn_sig(&owner, &method) else {
                 return;

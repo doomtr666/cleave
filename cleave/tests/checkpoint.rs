@@ -9,7 +9,7 @@ use std::path::PathBuf;
 /// A path for this test's checkpoint, with forward slashes (a cleave string
 /// literal has no escapes for backslashes; Windows takes either).
 fn scratch(name: &str) -> String {
-    let dir = std::env::temp_dir().join("cleave-checkpoint-tests");
+    let dir = std::env::temp_dir().join(format!("cleave-checkpoint-tests-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir.join(name).to_string_lossy().replace('\\', "/")
 }
@@ -185,7 +185,7 @@ fn run_on_a_large_stack(src: String) -> i32 {
 #[test]
 fn restoring_into_another_shape_is_a_clear_error() {
     let path = scratch("mismatch.ckpt");
-    let dir = std::env::temp_dir().join("cleave-checkpoint-tests");
+    let dir = std::env::temp_dir().join(format!("cleave-checkpoint-tests-{}", std::process::id()));
     let source: PathBuf = dir.join("mismatch.cleave");
     std::fs::write(
         &source,

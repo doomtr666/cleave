@@ -77,7 +77,7 @@ fn missing_file_falls_back_to_unknown_rather_than_panicking() {
 
 /// Compiles `src` with the real CLI, returning what it printed to stderr.
 fn cli_stderr(name: &str, src: &str) -> String {
-    let dir = std::env::temp_dir().join("cleave-diag-tests");
+    let dir = std::env::temp_dir().join(format!("cleave-diag-tests-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(name);
     std::fs::write(&path, src).unwrap();

@@ -815,7 +815,7 @@ pub fn lower_to_llvm<'c>(
         "tensors",
         &format!(
             "builtin.module(cleave-limit-inlining{{threshold={threshold}}},{inline}\
-             convert-elementwise-to-linalg,linalg-fuse-elementwise-ops,\
+             cleave-drop-zero-trip-whiles,convert-elementwise-to-linalg,linalg-fuse-elementwise-ops,\
              cleave-blas-tile-and-fuse{{rows={BLAS_TILE_ROWS}}},cleave-lower-blas-matmuls,\
              cleave-split-row-remainders{{rows={MATMUL_ROW_TILE}}},transform-interpreter{{entry-point=__transform_main}},\
              loop-invariant-subset-hoisting,cleave-reuse-dying-inputs)",

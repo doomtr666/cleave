@@ -14,7 +14,8 @@
 //!    it uses, directly or not (`CrateScopes`). A program's functions never
 //!    reach into the stdlib's bodies: a program's `fn step` doesn't capture
 //!    `optim`'s calls to `Optimizer::step`;
-//! 4. the method `f` of the one algebra declaring it with that arity.
+//! 4. the method `f` of the one algebra declaring it with that arity among
+//!    those the body's crate sees.
 //!
 //! A qualified call (`Algebra::method`) always means that algebra's method, and
 //! `mlir::...` calls are raw operations; both are left as they are.
@@ -35,6 +36,13 @@
 //! }` made CPS conversion carry the inner `x` out of the block as the outer one.
 //! `source_name` recovers the written name for diagnostics.
 //!
+//! **Rule bodies.** A call in an algebra's axiom, `derivative` or `adjoint`
+//! rule means, in that order: the enclosing algebra's method; the nearest
+//! super-algebra's (`algebra Ring<T> : Additive`); the method of the one
+//! algebra declaring it among those the rule's crate sees. The last two are
+//! qualified (`Additive::add`), so that a program's own algebra declaring an
+//! `add` doesn't make the stdlib's rules ambiguous (`Registry::rule_callee`).
+//!
 //! Expressions that are evaluated at compile time as constant arithmetic rather
 //! than dispatched (types, turbofish arguments, `[v; N]` repeat counts, `const`
 //! and `define` values) are not rewritten: their operators stay bare names that
@@ -44,7 +52,7 @@ use std::cell::Cell;
 use crate::collections::{HashMap, HashSet};
 
 use crate::ast::{
-    AlgebraItemKind, Block, ElseBranch, Expr, ExprKind, FileId, FnDecl, ItemKind, Path, Program,
+    AlgebraDecl, AlgebraItemKind, Block, ElseBranch, Expr, ExprKind, FileId, FnDecl, ItemKind, Path, Program,
     StmtKind,
 };
 
@@ -77,6 +85,7 @@ pub fn resolve_calls(mut program: Program, scopes: &CrateScopes) -> Program {
     let mut fieldless_structs: HashSet<String> = HashSet::default();
     let mut algebra_methods: HashMap<(String, usize), Vec<String>> = HashMap::default();
     let mut algebra_bounds: HashMap<String, Vec<String>> = HashMap::default();
+    let mut algebra_crates: HashMap<String, Option<usize>> = HashMap::default();
     for item in &program.items {
         match &item.kind {
             ItemKind::Fn(f) => {
@@ -88,6 +97,7 @@ pub fn resolve_calls(mut program: Program, scopes: &CrateScopes) -> Program {
             }
             ItemKind::Algebra(a) => {
                 algebra_bounds.insert(a.name.clone(), a.bounds.clone());
+                algebra_crates.insert(a.name.clone(), crate_of(item.span.file));
                 for ai in &a.items {
                     if let AlgebraItemKind::FnSig(sig) = &ai.kind {
                         algebra_methods
@@ -108,6 +118,7 @@ pub fn resolve_calls(mut program: Program, scopes: &CrateScopes) -> Program {
         fieldless_structs,
         algebra_methods,
         algebra_bounds,
+        algebra_crates,
         renamed: Cell::new(0),
     };
 
@@ -116,6 +127,7 @@ pub fn resolve_calls(mut program: Program, scopes: &CrateScopes) -> Program {
         match &mut item.kind {
             ItemKind::Fn(f) => resolver.resolve_fn(f),
             ItemKind::Impl(i) => i.fns.iter_mut().for_each(|f| resolver.resolve_fn(f)),
+            ItemKind::Algebra(a) => resolver.resolve_rules(a),
             _ => {}
         }
     }
@@ -156,6 +168,8 @@ struct Resolver<'s> {
     algebra_methods: HashMap<(String, usize), Vec<String>>,
     /// Each algebra's super-algebras (`algebra Ring<T> : Additive`).
     algebra_bounds: HashMap<String, Vec<String>>,
+    /// The crate each algebra is declared in.
+    algebra_crates: HashMap<String, Option<usize>>,
     /// Shadowing `let`s renamed so far in the current function.
     renamed: Cell<u32>,
 }
@@ -169,10 +183,17 @@ impl Resolver<'_> {
     }
 
     /// The algebra a call to `name` with `arity` arguments targets, when exactly
-    /// one algebra declares it.
+    /// one algebra the current crate sees declares it: a program's own
+    /// algebra declaring an `add` doesn't make the stdlib's `+` ambiguous.
     fn unique_algebra(&self, name: &str, arity: usize) -> Option<&str> {
-        match self.algebra_methods.get(&(name.to_string(), arity))?.as_slice() {
-            [algebra] => Some(algebra),
+        let from = self.current_crate.get();
+        let mut visible = self
+            .algebra_methods
+            .get(&(name.to_string(), arity))?
+            .iter()
+            .filter(|a| self.scopes.sees(from, self.algebra_crates.get(*a).copied().flatten()));
+        match (visible.next(), visible.next()) {
+            (Some(algebra), None) => Some(algebra),
             _ => None,
         }
     }
@@ -196,6 +217,47 @@ impl Resolver<'_> {
             }
         }
         None
+    }
+
+    /// Qualifies the calls of `algebra`'s rule bodies that target another
+    /// algebra's method (module doc comment, "Rule bodies"). An axiom's
+    /// `lhs == rhs` itself and a `derivative` rule's `d(x)` are the rules'
+    /// own syntax, not calls.
+    fn resolve_rules(&self, algebra: &mut AlgebraDecl) {
+        let name = algebra.name.clone();
+        for item in &mut algebra.items {
+            match &mut item.kind {
+                AlgebraItemKind::Axiom(axiom) => match &mut axiom.body.kind {
+                    ExprKind::Call(path, _, sides, _) if path.segments == ["eq"] => {
+                        sides.iter_mut().for_each(|side| self.resolve_rule_body(&name, side, false));
+                    }
+                    _ => self.resolve_rule_body(&name, &mut axiom.body, false),
+                },
+                AlgebraItemKind::DerivativeRule(rule) => self.resolve_rule_body(&name, &mut rule.body, true),
+                AlgebraItemKind::AdjointRule(rule) => self.resolve_rule_body(&name, &mut rule.body, false),
+                AlgebraItemKind::FnSig(_) => {}
+            }
+        }
+    }
+
+    fn resolve_rule_body(&self, algebra: &str, body: &mut Expr, derivative: bool) {
+        crate::ast::for_each_expr_mut(body, &mut |e| {
+            let ExprKind::Call(path, _, args, _) = &mut e.kind else { return };
+            let [method] = path.segments.as_slice() else { return };
+            let arity = args.len();
+            if derivative && method == "d" && arity == 1 {
+                return;
+            }
+            if self.algebra_methods.get(&(method.clone(), arity)).is_some_and(|o| o.iter().any(|a| a == algebra)) {
+                return;
+            }
+            let owner = self
+                .declaring_algebra(algebra, method, arity)
+                .or_else(|| self.unique_algebra(method, arity).map(str::to_string));
+            if let Some(owner) = owner {
+                path.segments = vec![owner, method.clone()];
+            }
+        });
     }
 
     /// Binds a `let` named `name`, renaming it when it shadows a visible name.

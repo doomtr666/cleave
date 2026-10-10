@@ -146,3 +146,38 @@ fn a_layout_only_copy_passed_to_a_reader_is_removed() {
     let out = run(&module("f", write), pipeline);
     assert!(out.contains("memref.copy"), "the buffer is written before the call: the copy stays:\n{out}");
 }
+
+/// A loop whose condition is false on its constant initial values (`for i in
+/// 0..0`) is its condition region run once: the body, and the call in it,
+/// go. The same loop entered with a bound only known at run time stays.
+#[test]
+fn a_loop_whose_condition_is_false_on_entry_is_dropped() {
+    let module = |bound: &str| {
+        format!(
+            r#"
+            func.func private @never_called(i32) -> i32
+            func.func @main(%n: i32) -> i32 {{
+              %zero = arith.constant 0 : i32
+              %one = arith.constant 1 : i32
+              %r:2 = scf.while (%i = %zero, %acc = %zero) : (i32, i32) -> (i32, i32) {{
+                %more = arith.cmpi slt, %i, {bound} : i32
+                scf.condition(%more) %i, %acc : i32, i32
+              }} do {{
+              ^bb0(%i: i32, %acc: i32):
+                %v = func.call @never_called(%i) : (i32) -> i32
+                %next = arith.addi %i, %one : i32
+                scf.yield %next, %v : i32, i32
+              }}
+              return %r#1 : i32
+            }}
+            "#
+        )
+    };
+    let pipeline = "builtin.module(cleave-drop-zero-trip-whiles)";
+    let out = run(&module("%zero"), pipeline);
+    assert!(!out.contains("scf.while"), "the loop never runs: it should go:\n{out}");
+    assert!(!out.contains("call @never_called"), "nothing in the body should be called:\n{out}");
+
+    let out = run(&module("%n"), pipeline);
+    assert!(out.contains("scf.while"), "a bound known at run time keeps the loop:\n{out}");
+}

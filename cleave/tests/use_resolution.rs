@@ -338,3 +338,25 @@ fn an_impl_declared_again_names_both_declarations() {
     assert!(duplicate.contains("main.cleave:1:"), "the program's impl isn't named: {duplicate}");
     assert!(duplicate.contains("num.cleave:"), "the stdlib's impl isn't named: {duplicate}");
 }
+
+/// An axiom the e-graph can't represent (here, a field access) would never
+/// fire: rejected when the program is loaded, naming it, rather than dropped
+/// without a word.
+#[test]
+fn an_axiom_the_egraph_cant_represent_is_an_error() {
+    let src = "struct P { x: i32 }
+    algebra Proj<T> {
+        fn proj(a: T) -> T;
+        axiom proj_field(a): proj(a) == a.x;
+    }
+    fn f() -> i32 { 0 }"
+        .to_string();
+    let (result, sources) = compile(vec![("main.cleave".to_string(), src)], &[]);
+    let errs = result.unwrap_err();
+    let rendered: Vec<String> = errs.iter().map(|e| sources.render(e)).collect();
+    let error = rendered
+        .iter()
+        .find(|r| r.contains("axiom `proj_field` of algebra `Proj` can't be used as a rewrite"))
+        .unwrap_or_else(|| panic!("got: {rendered:?}"));
+    assert!(error.contains("main.cleave:4:"), "the axiom isn't located: {error}");
+}
