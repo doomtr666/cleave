@@ -15,11 +15,9 @@ fn scratch(name: &str) -> String {
 }
 
 /// Compiles and runs `src`'s `main` through the real pipeline
-/// (`cleave::run`, what `--run` uses). Tasks off, spawned calls in place:
-/// several programs spawning tasks at once in one process (this binary's
-/// tests run in parallel) crash (`doc/backlog.md`).
+/// (`cleave::run`, what `--run` uses), tasks on: the optimizers spawn.
 fn run(src: &str) -> i32 {
-    let options = CodegenOptions { openmp: false, tasks: false, ..Default::default() };
+    let options = CodegenOptions { openmp: false, tasks: true, ..Default::default() };
     cleave::run::run_source("test.cleave", src, &options).unwrap_or_else(|e| panic!("{}", e.join("
 ")))
 }

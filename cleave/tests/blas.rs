@@ -115,77 +115,30 @@ fn sgemm_agrees_with_native_matmul_on_the_same_data() {
     );
 }
 
-/// Not a correctness test — a real, isolated timing comparison, asked for
-/// directly, to answer "is `sgemm` itself slower than native `matmul` for
-/// `examples/mnist-interop`'s own real `l1` shape (32x784 @ 784x512),
-/// independent of everything else in that program's own training loop."
-/// Fresh random data built *inside* the loop on every iteration (`uniform`,
-/// a real, genuinely non-foldable extern call) -- deliberately, not `Ring::
-/// zero()`: an LLVM optimizer at `opt_level: 2` (this file's own `run_f32`)
-/// can and will hoist a loop-invariant call with no observable side effect
-/// out of the loop entirely, collapsing "200 iterations" down to one real
-/// call -- found live, this is exactly the failure mode a *first* version
-/// of this benchmark (built from `Ring::zero()`-seeded, unchanging `a`/`b`)
-/// would have silently hit. Construction cost is identical between the two
-/// variants below (same loop, same `uniform` calls), so it cancels out of
-/// the comparison -- only `matmul` vs `sgemm` (plus `sgemm`'s own `to_
-/// buffer` conversions) differs.
-fn matmul_bench_src(iters: i32) -> String {
-    format!(
-        r#"
-        use linalg;
-        use rand;
-        fn main() -> f32 {{
-            let mut acc: f32 = 0.0;
-            for _ in 0..{iters} {{
-                let mut abuf: [f32;32,784] = mlir::memref::alloc();
-                for i in 0..32 {{
-                    for j in 0..784 {{
-                        abuf[i,j] = uniform(-1.0, 1.0);
-                    }};
-                }};
-                let a: Tensor<f32,32,784> = mlir::bufferization::to_tensor(abuf, restrict: "unit");
-                let mut bbuf: [f32;784,512] = mlir::memref::alloc();
-                for i in 0..784 {{
-                    for j in 0..512 {{
-                        bbuf[i,j] = uniform(-1.0, 1.0);
-                    }};
-                }};
-                let b: Tensor<f32,784,512> = mlir::bufferization::to_tensor(bbuf, restrict: "unit");
-                let c = matmul(a, b);
-                acc = acc + c[0,0];
-            }};
-            acc
-        }}
-        "#
-    )
-}
-
-fn sgemm_bench_src(iters: i32) -> String {
+/// A product of `a` (`m x k`, or `k x m` for `matmul_transpose_a`) and `b`
+/// (`k x n`), `iters` times, as `call` writes it (`matmul(a2, b)`,
+/// `matmul_transpose_a(a2, b)`, a `sgemm`). The operands are built once;
+/// `a` is scaled a little every iteration, so the product can't be hoisted
+/// out of the loop (it has no effect an optimizer must keep), for `m x k`
+/// multiplications against the product's `m x k x n` FMAs.
+fn product_bench_src(a_shape: (usize, usize), m: usize, n: usize, k: usize, call: &str, iters: i32) -> String {
+    let (ar, ac) = a_shape;
     format!(
         r#"
         use linalg;
         use blas;
         use rand;
         fn main() -> f32 {{
+            let mut abuf: [f32;{ar},{ac}] = mlir::memref::alloc();
+            for i in 0..{ar} {{ for j in 0..{ac} {{ abuf[i,j] = uniform(-1.0, 1.0); }}; }};
+            let mut a: Tensor<f32,{ar},{ac}> = mlir::bufferization::to_tensor(abuf, restrict: "unit");
+            let mut bbuf: [f32;{k},{n}] = mlir::memref::alloc();
+            for i in 0..{k} {{ for j in 0..{n} {{ bbuf[i,j] = uniform(-1.0, 1.0); }}; }};
+            let b: Tensor<f32,{k},{n}> = mlir::bufferization::to_tensor(bbuf, restrict: "unit");
             let mut acc: f32 = 0.0;
             for _ in 0..{iters} {{
-                let mut abuf: [f32;32,784] = mlir::memref::alloc();
-                for i in 0..32 {{
-                    for j in 0..784 {{
-                        abuf[i,j] = uniform(-1.0, 1.0);
-                    }};
-                }};
-                let a: Tensor<f32,32,784> = mlir::bufferization::to_tensor(abuf, restrict: "unit");
-                let mut bbuf: [f32;784,512] = mlir::memref::alloc();
-                for i in 0..784 {{
-                    for j in 0..512 {{
-                        bbuf[i,j] = uniform(-1.0, 1.0);
-                    }};
-                }};
-                let b: Tensor<f32,784,512> = mlir::bufferization::to_tensor(bbuf, restrict: "unit");
-                let zero: Tensor<f32,32,512> = Ring::zero();
-                let c = sgemm(false, false, 1.0, a, b, 0.0, zero);
+                a = Scale::scale(a, 0.999);
+                let c: Tensor<f32,{m},{n}> = {call};
                 acc = acc + c[0,0];
             }};
             acc
@@ -194,43 +147,46 @@ fn sgemm_bench_src(iters: i32) -> String {
     )
 }
 
-/// Prints both timings to stderr (`--nocapture`) rather than asserting
-/// anything — this is a real measurement to *read*, not a pass/fail gate;
-/// asserting "BLAS must be faster" would be exactly the kind of unmeasured
-/// assumption `doc/plan-blas-native.md` §7.3 already got burned by once.
+/// Single-thread GFLOP/s of the native `matmul` (the `linalg` schedule) at
+/// one count of FMAs, `M x K x N` = 32 x 784 x 512 (mnist-interop's `l1`),
+/// for reductions from `K` = 32 to 3136, and of `matmul_transpose_a` on
+/// `dW1`'s shape, `sgemm` for reference. A short reduction ran ~6x faster
+/// per FMA than a long one (`doc/backlog.md`, "The `~6x` per-FLOP gap"): a
+/// reduction chained through too few accumulators is latency-bound.
+/// Compilation is excluded (two runs of different lengths, their
+/// difference). A measurement to read, not a gate:
+///
+///   cargo test --release -p cleave --test blas -- --ignored --nocapture matmul_throughput
 #[test]
-fn sgemm_vs_native_matmul_timing_on_mnist_interops_l1_shape() {
-    let iters = 200;
-    let native_src = matmul_bench_src(iters);
-    let blas_src = sgemm_bench_src(iters);
-
-    // A *fresh* `Context` per `run_f32` call, deliberately -- `lower_to_
-    // llvm`'s own transform-dialect matmul-vectorize script registers a
-    // named symbol into whichever `Context` it runs against; a second
-    // `lower_to_llvm` call on the *same*, already-used `Context` hits a
-    // real "doubly defined symbol @match_matmul" error (found live,
-    // writing this benchmark) -- every other test in this file only ever
-    // calls `run_f32` once per `context()`, so this never mattered before.
-    //
-    // One warm-up call each, discarded -- JIT compilation itself (not the
-    // loop body) dominates a *single* `run_f32` call otherwise, exactly
-    // the one-time cost this benchmark isn't trying to measure.
-    let _ = run_f32(&context(), &native_src);
-    let native_start = std::time::Instant::now();
-    let _ = run_f32(&context(), &native_src);
-    let native_elapsed = native_start.elapsed();
-
-    let _ = run_f32(&context(), &blas_src);
-    let blas_start = std::time::Instant::now();
-    let _ = run_f32(&context(), &blas_src);
-    let blas_elapsed = blas_start.elapsed();
-
-    eprintln!(
-        "native matmul: {native_elapsed:?} for {iters} iterations ({:?}/iter)",
-        native_elapsed / iters as u32
-    );
-    eprintln!(
-        "blas sgemm:    {blas_elapsed:?} for {iters} iterations ({:?}/iter)",
-        blas_elapsed / iters as u32
-    );
+#[ignore]
+fn matmul_throughput_by_reduction_length() {
+    // (label, A's shape, M, N, K, call)
+    let cases: [(&str, (usize, usize), usize, usize, usize, &str); 6] = [
+        ("matmul             M 784  K 32   N 512", (784, 32), 784, 512, 32, "matmul(a, b)"),
+        ("matmul             M 196  K 128  N 512", (196, 128), 196, 512, 128, "matmul(a, b)"),
+        ("matmul             M 32   K 784  N 512", (32, 784), 32, 512, 784, "matmul(a, b)"),
+        ("matmul             M 8    K 3136 N 512", (8, 3136), 8, 512, 3136, "matmul(a, b)"),
+        ("matmul_transpose_a M 784  K 32   N 512", (32, 784), 784, 512, 32, "matmul_transpose_a(a, b)"),
+        (
+            "sgemm              M 32   K 784  N 512",
+            (32, 784),
+            32,
+            512,
+            784,
+            "sgemm(false, false, 1.0, a, b, 0.0, Ring::zero())",
+        ),
+    ];
+    let (short, long) = (20, 220);
+    for (label, a_shape, m, n, k, call) in cases {
+        let fmas = (m * k * n) as f64;
+        let time = |iters: i32| {
+            let src = product_bench_src(a_shape, m, n, k, call, iters);
+            let start = std::time::Instant::now();
+            let _ = run_f32(&context(), &src);
+            start.elapsed().as_secs_f64()
+        };
+        let _warm = time(short);
+        let per_call = (time(long) - time(short)) / (long - short) as f64;
+        eprintln!("{label}: {:7.1} us/call {:7.1} GFLOP/s", per_call * 1e6, 2.0 * fmas / per_call / 1e9);
+    }
 }

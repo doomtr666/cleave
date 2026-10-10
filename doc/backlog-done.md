@@ -3311,3 +3311,84 @@ Tests: `cleave/tests/enums.rs` (values, generic `Option`, structs and tensors as
 `leaks.rs` (`enums_holding_*`, `a_field_of_a_struct_bound_in_a_branch_leaves_the_if`, the `HashMap` tests
 on `lookup`'s `Option`). The 18 examples' LLVM dialect is unchanged but for null checks in cascades.
 
+### The ~6x per-FLOP gap between long-K and short-K matmuls
+
+Direct follow-on to the roofline entry above. Disassembled a matched pair, both real, separately-named symbols today thanks to `CLEAVE_NO_INLINE=1`: `MatMulTransposeA::matmul_transpose_a<Tensor<f32,32,784>,Tensor<f32,32,512>,Tensor<f32,784,512>>` (`dW1`, K=32 reduction, ~89-113 GFlop/s) against `MatMul::matmul<Tensor<f32,32,784>,Tensor<f32,784,512>,Tensor<f32,32,512>>` (L1's own forward matmul, K=784 reduction, ~14.7 GFlop/s) — identical total FLOPs (25.7M each), ~6x apart in wall time.
+
+**Both loops use the identical narrow accumulator shape**: a serial chain rotating through only 3-4 independent `zmm` registers (`zmm1 = zmm1*mem+zmm0`, `zmm0 = zmm0*mem+zmm1`, `zmm2 = zmm2*mem+zmm1`, ... — each FMA's own output feeds the next FMA's own input, so the CPU cannot start FMA N+1 until FMA N's own latency has fully retired). This is exactly the pre-existing, already-documented `36.7%` accumulator-latency-chain finding (`vfmadd132ps` rotating through `zmm0-zmm3`).
+
+**The mechanical difference, found by reading the actual loop structure, not assumed**: `dW1`'s own K=32 reduction fits *entirely* inside one unrolled, straight-line block — the latency stall is paid exactly **once**. L1-forward's own K=784 reduction wraps the *identical*-shaped 3-4-register chain inside a **real loop with a back-edge** (`jmp 0xc5e0`, `cmp r13, 0x2ff` — iterating roughly 24 times to cover 784 in chunks), paying the same per-chunk latency stall **~24 times**, because the accumulator set never widens with `K` — more reduction depth only ever means more trips through the same narrow, latency-bound chain, never more independent work to overlap it with.
+
+**The fix direction is not new — it was already named, precisely, and never implemented**: this file's own `llvm-mca` entry (a real, separate analysis session, already in this backlog) concluded exactly this mechanism (`Data Dependencies 75.57%`, only 4 independent registers rotating) and named the fix: *"widen the reduction's own independent-accumulator count in `cleave/mlir/matmul_vectorize.transform.mlir`'s own schedule (more parallel partial sums per `k`-tile, combined only at the end) — 'unroll and jam' the reduction — to give the CPU more independent work to overlap while any one FMA's own latency is still in flight"*. The wider-`M`-tile fix that *did* land (`doc/backlog-done.md`, ~36% single-thread win) widened the *output* tile, which helps register/cache reuse across `M`/`N` — it never widened the `K`-reduction's own accumulator set, which is the specific, still-open gap this entry re-confirms mechanically, on the real kernel, with a real, GFlop/s-quantified before/after pair (`dW1` vs `L1-forward`) rather than a profiler percentage alone.
+
+**Not attempted here** — real, scoped, but the transform-dialect schedule has a documented history of subtle regressions when touched (`doc/backlog-done.md`'s own pad-retry/stack-overflow story) — needs the same discipline: one isolated probe first, then the real kernel, full test suite, accuracy unchanged, before trusting any wall-clock win.
+
+**Closed 2026-10-10, measured** (`cleave/tests/blas.rs::matmul_throughput_by_reduction_length`, ignored,
+single thread, the same 12.8 M FMAs at every `K`, best of three runs on an idle machine): `K` = 32 218-230
+GFLOP/s (plain and `matmul_transpose_a`), `K` = 128 170, `K` = 784 191, `K` = 3136 153; OpenBLAS `sgemm`
+on the `K` = 784 shape 182. The row tile of 8 (8 independent accumulators per step of `K`) closed it, no
+unroll-and-jam of `K` needed; the native schedule matches or beats single-thread OpenBLAS. What's left at
+`K` = 3136 (1.5x) has `M` = 8, a single row tile streaming all of `B` (6.4 MB, past the L2) for 8 rows:
+bandwidth, not latency, and a rare shape.
+
+### Programs on libomp run one after another in one process crashed
+
+Found 2026-10-08 moving `tests/checkpoint.rs` onto `cleave::run` with tasks on: each test passes alone,
+the four together (parallel test threads, each JIT-compiling and running a program whose optimizer
+spawns tasks on the one libomp the process loads) end in `STATUS_ACCESS_VIOLATION`. The in-process
+harnesses ran with tasks off, and still do. A host embedding two kernels that both spawn (the Rust
+interop) could meet it: to reproduce with two threads each running a small spawning program, then look
+at what the programs share (libomp's team and task queues, the runtime's pool and per-thread arenas,
+`cleave_bind_worker`'s once-per-thread binding).
+
+**Fixed 2026-10-10. Not concurrency**: it crashed with the tests run one at a time too, as soon as a
+program that ran on libomp had run before in the same process (alone, each passed). Caught with a new
+diagnostic, `CLEAVE_CRASH_TRACE=1` (`cleave_rt::install_crash_trace`, installed by `cleave::run`: on the
+first access violation, the faulting instruction's module and offset, the address read, the stack, the
+OpenMP runtimes loaded), where an external debugger wouldn't attach: a libomp worker thread, in a team's
+barrier, reading freed memory. One libomp only. libomp keeps a team alive for the next parallel region,
+holding pointers into the program that ran on it (the source locations each `__kmpc_*` call passes, in
+the JIT module's data); `cleave::run` then freed that program's code, and the next program reusing the
+team read them. Now `cleave::run` pauses libomp once a program on it is done, before freeing its code
+(`cleave_rt::pause_openmp`, `omp_pause_resource_all(omp_pause_hard)`; the next region starts it again),
+and runs such programs one at a time (pausing it under another thread's parallel region isn't defined).
+A program linked ahead of time (a host running several kernels) never frees its code: unaffected.
+Tests: `tests/checkpoint.rs` runs with tasks on again; `spawn.rs::programs_spawning_tasks_at_once_in_one_process`.
+
+### Two cleave programs running at once: `CLEAVE_BIND=soft`
+
+`cleave_bind_worker` (`cleave-rt`) gives team member `i` a hard affinity to physical core `i` (both its
+SMT siblings), which made one-member-per-core certain and run times stable. With two programs running,
+both pin their members to the same cores: measured 2026-10-08, `examples/xor.cleave --run` (OpenMP)
+beside a nanoLM training didn't finish in 60 s, and finished in 11 s with the binding off
+(`OMP_PROC_BIND=false`), 29 s with `KMP_BLOCKTIME=0`, 8 s on two threads. A soft placement instead, the
+ideal processor (`SetThreadIdealProcessorEx`), steers each member to its core when the machine is free
+and lets the scheduler move it under contention; to measure on nanoLM's step time and spread
+(`scripts/ab.ps1`, what the binding was for) and with two programs side by side.
+
+**Settled 2026-10-10, measured** (nanoLM `bench 0 1 10`, `examples/xor.cleave --run`):
+
+| binding | nanoLM alone, ms/step (3 runs) | `xor` alone | `xor` beside nanoLM | nanoLM beside `xor` |
+|---|---|---|---|---|
+| hard (default) | 10966 / 11443 / 11081 | 2.7 s | 169 s | 13074 ms/step |
+| soft | 13961 / 12212 / 11424 | 2.6 s | 7.8 s | 13938 ms/step |
+
+Hard binding stays the default: alone, ~4% faster and far steadier. `CLEAVE_BIND=soft` (the ideal
+processor, `cleave-rt::bind_to_core`) for running two programs at once. Deciding per core (a core taken by
+another program left soft, by a named object per core) was written and dropped: machinery for a rare case
+the variable already covers.
+
+### Under `--no-inline`, a matmul inside the BLAS-threshold `if` wasn't vectorized
+
+`matmul_transpose_b`'s body is `if P*Q*R > 100000000 { sgemm(...) } else { linalg matmul }`. Inlined, the `if` folds away (the product is a compile-time constant) and the matmul is vectorized like any other. Compiled as its own function (`--no-inline`), the `if` stays, the `linalg.matmul` sits inside an `scf.if`, and the schedule's matcher (`@match_matmul`) only accepts a matmul directly under a `func.func` or an `scf.while`: the matmul is left to scalar loops. Correct, just slow. Found writing `matmuls_with_a_partial_tile_are_vectorized`, which therefore runs inlined. To fix: fold a branch whose condition is a compile-time constant in the specialized function too (`doc/backlog.md` already has the zero-trip-count loop case of the same gap), or let the matcher accept an `scf.if` parent.
+
+**Fixed 2026-10-10.** The e-graph already folded the condition (the specialized function's `P * Q * R`)
+to `false`; nothing pruned the `if` after it. `egraph::prune_constant_ifs`, right after the e-graph pass
+(`pipeline::build_optimized_cps`): an `if` on a constant keeps its taken branch; its join, then jumped
+to once, is inlined at that jump (wherever it is in the branch), dropped when nothing refers to it, kept
+when the branch passes it to a call as its continuation (a call and its continuation, a shape lowering
+knows). A loop is told from a join by jumping to itself: `carried_types` is `Some` for a join too (its
+doc corrected). Under `--no-inline` the matmul is vectorized (16 vector FMAs, none before); inlined, the
+18 examples' LLVM dialect is unchanged (MLIR folded it there). Test:
+`language_model_ops.rs::a_branch_decided_by_a_specialized_functions_sizes_is_pruned`.
+

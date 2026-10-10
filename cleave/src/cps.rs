@@ -1296,14 +1296,13 @@ pub struct CFunDef {
     /// it already *is* a continuation, nothing further to return to.
     pub params: Vec<CVar>,
     pub body: CExpr,
-    /// `Some(one Ty per `params` entry, same order)` for a **loop's** own
-    /// self-recursive `CFunDef` specifically — `None` everywhere else (a
-    /// join, a real call's own resumption, or a top-level function, none of
-    /// which need it: mlir_lower.rs already gets a join's own single value
-    /// type from the enclosing function's `result_type`, and a real call's
-    /// own resumption from the callee's signature — see `ExprKind::While`/
-    /// `For`'s own doc comment for why a loop's own carried state needs
-    /// this explicitly instead). A carried variable's own initial value
+    /// `Some(one Ty per `params` entry, same order)` for a loop's
+    /// self-recursive `CFunDef` and for an `if`'s join (the values it
+    /// receives); `None` for a real call's own resumption and a top-level
+    /// function (whose types come from the callee's signature). A loop is
+    /// told from a join by jumping to itself, not by this field. See
+    /// `ExprKind::While`/`For`'s own doc comment for why a loop's carried
+    /// state needs this explicitly. A carried variable's own initial value
     /// (`gather_carried`) can be a bare, width-less literal CVal (`total =
     /// 0.0`, never wrapped in a `LetPrim`) — with nothing else in the CPS
     /// IR recording its real type, `mlir_lower.rs::lower_loop` used to guess

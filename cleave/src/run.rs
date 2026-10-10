@@ -64,6 +64,7 @@ pub fn run_main_with<T>(
     around: impl FnOnce(&dyn Fn() -> Result<i32, Vec<String>>) -> T,
 ) -> Result<T, Vec<String>> {
     crate::options::set(options.clone());
+    cleave_rt::install_crash_trace();
     let cps_program = build_optimized_cps(program, registry, sources)?;
 
     let dialect_registry = DialectRegistry::new();
@@ -112,7 +113,19 @@ pub fn run_main_with<T>(
             .map_err(|e| vec![format!("failed to invoke `main`: {e}")])?;
         Ok(result)
     };
-    Ok(around(&invoke))
+    if shared_libs.is_empty() {
+        return Ok(around(&invoke));
+    }
+    // A program on libomp: paused once it's done, before `engine` frees its
+    // code, which libomp's kept teams point into (`cleave_rt::pause_openmp`).
+    // One such program at a time: pausing libomp while another thread's
+    // parallel region runs isn't defined. (Linked ahead of time, a program's
+    // code is never freed: a host running several needs none of this.)
+    static ON_LIBOMP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one_at_a_time = ON_LIBOMP.lock().unwrap_or_else(|e| e.into_inner());
+    let result = around(&invoke);
+    cleave_rt::pause_openmp();
+    Ok(result)
 }
 
 /// `check_sources` then `run_main`, for one source file named `name`.

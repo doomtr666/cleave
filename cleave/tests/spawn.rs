@@ -378,3 +378,49 @@ fn a_team_places_its_members_one_per_core() {
     assert!(ir.contains("omp.parallel"), "no parallel region: {ir}");
     assert!(ir.contains("@cleave_bind_worker") && ir.contains("@omp_get_thread_num"), "members not placed: {ir}");
 }
+
+/// Several programs spawning tasks at once in one process (a host running
+/// two kernels, the Rust interop), each compiled and run from its own
+/// thread, their tasks on the one libomp the process loads (`doc/
+/// backlog.md`, "Several programs spawning tasks at once in one process
+/// crash": `STATUS_ACCESS_VIOLATION`).
+#[test]
+fn programs_spawning_tasks_at_once_in_one_process() {
+    let src = "
+        use nn;
+        fn part(m: Tensor<f32, 32, 32>, s: f32) -> Tensor<f32, 32, 32> { Scale::scale(m, s) }
+        fn both(m: Tensor<f32, 32, 32>) -> Tensor<f32, 32, 32> {
+            let a = spawn part(m, 1.0);
+            let b = spawn part(m, 2.0);
+            a + b - Scale::scale(m, 3.0)
+        }
+        fn main() -> i32 {
+            rand_seed(1);
+            let m: Tensor<f32, 32, 32> = Init::xavier();
+            let mut ok = 1;
+            for i in 0..200 {
+                let d = both(m);
+                if d[3, 4] * d[3, 4] > 0.0001 { ok = 0; };
+            };
+            ok
+        }
+    ";
+    let runs: Vec<std::thread::JoinHandle<i32>> = (0..4)
+        .map(|_| {
+            std::thread::Builder::new()
+                .stack_size(64 * 1024 * 1024)
+                .spawn(move || {
+                    let (program, registry, sources) =
+                        cleave::run::check_sources(vec![("test.cleave".to_string(), src.to_string())], &[], false)
+                            .unwrap_or_else(|e| panic!("{}", e.join("\n")));
+                    let options = cleave::pipeline::CodegenOptions { openmp: false, tasks: true, ..Default::default() };
+                    cleave::run::run_main(&program, &registry, Some(&sources), &options, &[])
+                        .unwrap_or_else(|e| panic!("{}", e.join("\n")))
+                })
+                .unwrap()
+        })
+        .collect();
+    for run in runs {
+        assert_eq!(run.join().unwrap(), 1);
+    }
+}

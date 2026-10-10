@@ -2259,3 +2259,42 @@ fn a_gpt_decoding_with_caches_gives_its_forward_logits() {
     let got = run(&src("gap(x, m)"));
     assert!(got < 1e-4, "decoded logits off by {got}");
 }
+
+/// A matmul whose BLAS threshold is decided by its sizes
+/// (`P * Q * R > BLAS_MIN_WORK`, `stdlib/linalg/matrix.cleave`): once the
+/// function is specialized, the e-graph folds the condition to a constant,
+/// and the dead branch is pruned with its join (`egraph::prune_constant_ifs`).
+/// Compiled on its own (`--no-inline`, `#[no_inline]`), the matmul used to
+/// stay inside an `if`, where the schedule's matcher didn't find it: scalar
+/// loops instead of vectorized ones.
+#[test]
+fn a_branch_decided_by_a_specialized_functions_sizes_is_pruned() {
+    let src = "
+        use nn;
+        fn main() -> i32 {
+            rand_seed(1);
+            let a: Tensor<f32, 64, 32> = Init::xavier();
+            let b: Tensor<f32, 48, 32> = Init::xavier();
+            let c = matmul_transpose_b(a, b);
+            if c[0, 0] == c[0, 0] { 1 } else { 0 }
+        }
+    ";
+    let (program, registry, _) = cleave::run::check_sources(vec![("test.cleave".to_string(), src.to_string())], &[], false)
+        .unwrap_or_else(|e| panic!("{}", e.join("\n")));
+    let cps = cleave::pipeline::build_optimized_cps(&program, &registry, None).unwrap_or_else(|e| panic!("{}", e.join("\n")));
+    let matmul = cps
+        .funcs
+        .iter()
+        .find(|f| f.def.name.starts_with("MatMulTransposeB::matmul_transpose_b"))
+        .expect("the specialized matmul");
+    fn has_if(e: &cleave::cps::CExpr) -> bool {
+        use cleave::cps::CExpr;
+        match e {
+            CExpr::LetPrim { cont, .. } => has_if(cont),
+            CExpr::App { .. } => false,
+            CExpr::If { .. } => true,
+            CExpr::Fix { defs, body } => defs.iter().any(|d| has_if(&d.body)) || has_if(body),
+        }
+    }
+    assert!(!has_if(&matmul.def.body), "{:?}", matmul.def.body);
+}

@@ -538,6 +538,14 @@ mod alloc_stats {
             total(|s| s.fresh),
             mb(total(|s| s.fresh_bytes)),
         );
+        let (held, parked) = super::pool_large_bytes();
+        eprintln!(
+            "CLEAVE_ALLOC_STATS: blocks over the thread caches: {:.1} MiB held at most, {:.1} MiB live at most; at exit {:.1} MiB held, {:.1} MiB of them parked",
+            mb(super::LARGE_PEAK_HELD.load(std::sync::atomic::Ordering::Relaxed) as u64),
+            mb(super::LARGE_PEAK_LIVE.load(std::sync::atomic::Ordering::Relaxed) as u64),
+            mb(held as u64),
+            mb(parked as u64),
+        );
         eprintln!("{:>10} {:>11} {:>10} {:>8} {:>10}  site", "count", "MiB", "bytes", "fresh", "fresh MiB");
         for ((label, bytes), s) in rows.iter().take(60) {
             eprintln!(
@@ -696,6 +704,45 @@ fn thread_cached(class: usize) -> bool {
     class_bytes(class) <= THREAD_CACHE_MAX_BLOCK && !*NO_THREAD_CACHE
 }
 
+/// Bytes of the blocks too large for the thread caches (`thread_cached`)
+/// taken from the system, of those parked in the depot (the live ones are
+/// the difference), and the most ever live: what `CLEAVE_POOL_PARK` bounds.
+static LARGE_HELD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static LARGE_PARKED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static LARGE_PEAK_LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static LARGE_PEAK_HELD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `CLEAVE_POOL_PARK=<fraction>`: a freed block too large for the thread
+/// caches is parked only while the parked ones stay under that fraction of
+/// the most ever live, else given back to the system: what the program holds
+/// stays under `1 + fraction` times its peak. Unset: always parked. A program
+/// whose phases use different sizes (a training step's activations, then its
+/// optimizer's weight-sized buffers) otherwise holds the peak of every size
+/// at once; a block given back costs page faults when its size is needed
+/// again (`doc/backlog.md`, "The pool keeps every freed block"). Against the
+/// peak, not the current live bytes: those drop at the end of every step,
+/// which would give everything back and fault it all in again.
+static POOL_PARK: std::sync::LazyLock<Option<f64>> = std::sync::LazyLock::new(|| {
+    let value = std::env::var("CLEAVE_POOL_PARK").ok().filter(|v| !v.is_empty())?;
+    Some(value.parse().expect("CLEAVE_POOL_PARK: a fraction, e.g. 0.25"))
+});
+
+/// The blocks too large for the thread caches: bytes taken from the system
+/// and not given back, and bytes of them parked in the depot.
+pub fn pool_large_bytes() -> (usize, usize) {
+    (LARGE_HELD.load(std::sync::atomic::Ordering::Relaxed), LARGE_PARKED.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// A block of `class` taken from the system.
+fn note_system_alloc(class: usize) {
+    if !thread_cached(class) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let held = LARGE_HELD.fetch_add(class_bytes(class), Relaxed) + class_bytes(class);
+        LARGE_PEAK_HELD.fetch_max(held, Relaxed);
+        LARGE_PEAK_LIVE.fetch_max(held.saturating_sub(LARGE_PARKED.load(Relaxed)), Relaxed);
+    }
+}
+
 /// One block of `class` from the depot, if any.
 ///
 /// # Safety
@@ -706,6 +753,9 @@ unsafe fn depot_pop(class: usize) -> Option<*mut u8> {
     let b = unsafe { FREE_LISTS[class] };
     if !b.is_null() {
         unsafe { FREE_LISTS[class] = *(b as *mut *mut u8) };
+        if !thread_cached(class) {
+            LARGE_PARKED.fetch_sub(class_bytes(class), std::sync::atomic::Ordering::Relaxed);
+        }
     }
     pool_unlock();
     (!b.is_null()).then_some(b)
@@ -717,10 +767,30 @@ unsafe fn depot_pop(class: usize) -> Option<*mut u8> {
 ///
 /// `block` is a freed block of `class`, owned by no one.
 unsafe fn depot_push(class: usize, block: *mut u8) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let bytes = class_bytes(class);
+    if !thread_cached(class)
+        && let Some(fraction) = *POOL_PARK
+    {
+        // A block reused from the depot leaves the peak unchanged: it was
+        // live before, within it.
+        if (LARGE_PARKED.load(Relaxed) + bytes) as f64 > fraction * LARGE_PEAK_LIVE.load(Relaxed) as f64 {
+            if *CLEAVE_DEBUG_POOL {
+                parked_remove(block as usize);
+            }
+            LARGE_HELD.fetch_sub(bytes, Relaxed);
+            let layout = std::alloc::Layout::from_size_align(bytes, class_align(class)).expect("depot_push: invalid layout");
+            unsafe { std::alloc::dealloc(block, layout) };
+            return;
+        }
+    }
     pool_lock();
     unsafe {
         *(block as *mut *mut u8) = FREE_LISTS[class];
         FREE_LISTS[class] = block;
+    }
+    if !thread_cached(class) {
+        LARGE_PARKED.fetch_add(bytes, Relaxed);
     }
     pool_unlock();
 }
@@ -985,6 +1055,7 @@ pub extern "C" fn cleave_alloc_rc(data_size: i64) -> *mut u8 {
                 let layout = std::alloc::Layout::from_size_align(class_bytes(class), class_align(class))
                     .expect("cleave_alloc_rc: invalid layout");
                 let p = std::alloc::alloc(layout);
+                note_system_alloc(class);
                 // The request's size tells an exhausted system (a plausible
                 // size) from a corrupted request (an absurd one).
                 assert!(
@@ -1584,6 +1655,7 @@ pub extern "C" fn cleave_alloc_pool(data_size: i64) -> *mut u8 {
                 let layout = std::alloc::Layout::from_size_align(class_bytes(class), class_align(class))
                     .expect("cleave_alloc_pool: invalid layout");
                 let p = std::alloc::alloc(layout);
+                note_system_alloc(class);
                 assert!(!p.is_null(), "cleave_alloc_pool: allocation failed");
                 p
             }
@@ -1906,6 +1978,17 @@ pub extern "C" fn cleave_bind_worker(thread: i32) {
     bind_to_core(thread.max(0) as usize);
 }
 
+/// `CLEAVE_BIND=soft`: a team member gets its core as its *ideal* processor
+/// (`SetThreadIdealProcessorEx`) rather than a hard affinity: the scheduler
+/// runs it there when it can and moves it when something else wants that
+/// core. For two programs running at once: hard-bound, both put their
+/// members on the same cores. Measured on nanoLM (2026-10-10): alone, hard
+/// affinity runs ~4% faster and steadier than soft (10966-11443 ms/step
+/// against 11424-13961); beside it, a second program hard-bound crawled
+/// (`xor`: 169 s instead of 2.7), soft-bound it shared the cores (7.8 s).
+static SOFT_BINDING: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("CLEAVE_BIND").is_ok_and(|v| v == "soft"));
+
 #[cfg(windows)]
 fn bind_to_core(core: usize) {
     #[repr(C)]
@@ -1913,6 +1996,12 @@ fn bind_to_core(core: usize) {
         mask: u64,
         group: u16,
         reserved: [u16; 3],
+    }
+    #[repr(C)]
+    struct ProcessorNumber {
+        group: u16,
+        number: u8,
+        reserved: u8,
     }
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -1922,9 +2011,20 @@ fn bind_to_core(core: usize) {
             affinity: *const GroupAffinity,
             previous: *mut GroupAffinity,
         ) -> i32;
+        fn SetThreadIdealProcessorEx(
+            thread: *mut std::ffi::c_void,
+            ideal: *const ProcessorNumber,
+            previous: *mut ProcessorNumber,
+        ) -> i32;
     }
     let Some(cores) = cores() else { return };
     let (group, mask) = cores[core % cores.len()];
+    if *SOFT_BINDING {
+        // The core's first logical processor.
+        let ideal = ProcessorNumber { group, number: mask.trailing_zeros() as u8, reserved: 0 };
+        unsafe { SetThreadIdealProcessorEx(GetCurrentThread(), &ideal, std::ptr::null_mut()) };
+        return;
+    }
     let affinity = GroupAffinity { mask, group, reserved: [0; 3] };
     unsafe { SetThreadGroupAffinity(GetCurrentThread(), &affinity, std::ptr::null_mut()) };
 }
@@ -2969,5 +3069,181 @@ mod placement_tests {
         }
         let distinct: std::collections::HashSet<_> = placed.iter().collect();
         assert_eq!(distinct.len(), team, "two team members share a core: {placed:?}");
+    }
+}
+
+/// `CLEAVE_CRASH_TRACE`: on the first access violation, prints what it hit
+/// and where, before the process dies, since a debugger can't always be
+/// attached: the faulting instruction's address and module (none: JIT-
+/// compiled code), the address accessed, and the stack. Installed by
+/// `cleave::run` before running a program; a no-op without the variable.
+pub fn install_crash_trace() {
+    #[cfg(windows)]
+    {
+        static INSTALLED: std::sync::Once = std::sync::Once::new();
+        if std::env::var_os("CLEAVE_CRASH_TRACE").is_none() {
+            return;
+        }
+        INSTALLED.call_once(|| unsafe {
+            crash_trace::AddVectoredExceptionHandler(1, crash_trace::handler);
+        });
+    }
+}
+
+#[cfg(windows)]
+mod crash_trace {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    pub struct ExceptionRecord {
+        code: u32,
+        flags: u32,
+        record: *mut ExceptionRecord,
+        address: *mut c_void,
+        parameter_count: u32,
+        information: [usize; 15],
+    }
+
+    #[repr(C)]
+    pub struct ExceptionPointers {
+        record: *mut ExceptionRecord,
+        context: *mut c_void,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        pub fn AddVectoredExceptionHandler(first: u32, handler: unsafe extern "system" fn(*mut ExceptionPointers) -> i32) -> *mut c_void;
+        fn GetModuleHandleExW(flags: u32, address: *const c_void, module: *mut *mut c_void) -> i32;
+        fn GetModuleFileNameW(module: *mut c_void, name: *mut u16, size: u32) -> u32;
+        fn GetCurrentProcess() -> isize;
+        fn K32EnumProcessModules(process: *mut c_void, modules: *mut *mut c_void, size: u32, needed: *mut u32) -> i32;
+    }
+
+    /// Every loaded module whose file name mentions `omp`, with its path:
+    /// two OpenMP runtimes in one process would share no state.
+    fn openmp_modules() -> Vec<String> {
+        let mut modules = vec![std::ptr::null_mut::<c_void>(); 1024];
+        let mut needed = 0u32;
+        let size = (modules.len() * std::mem::size_of::<*mut c_void>()) as u32;
+        if unsafe { K32EnumProcessModules(GetCurrentProcess() as *mut c_void, modules.as_mut_ptr(), size, &mut needed) } == 0 {
+            return Vec::new();
+        }
+        let count = needed as usize / std::mem::size_of::<*mut c_void>();
+        modules[..count.min(modules.len())]
+            .iter()
+            .filter_map(|&module| {
+                let mut name = [0u16; 512];
+                let len = unsafe { GetModuleFileNameW(module, name.as_mut_ptr(), name.len() as u32) } as usize;
+                let path = String::from_utf16_lossy(&name[..len]);
+                path.to_lowercase().contains("omp").then(|| format!("{path} @ {module:p}"))
+            })
+            .collect()
+    }
+
+    const ACCESS_VIOLATION: u32 = 0xC000_0005;
+    const CONTINUE_SEARCH: i32 = 0;
+
+    /// The module holding `address` and the offset into it; `None` for
+    /// memory no module maps (JIT-compiled code, the heap).
+    fn module_of(address: usize) -> Option<(String, usize)> {
+        const FROM_ADDRESS: u32 = 0x4;
+        const UNCHANGED_REFCOUNT: u32 = 0x2;
+        let mut module: *mut c_void = std::ptr::null_mut();
+        if unsafe { GetModuleHandleExW(FROM_ADDRESS | UNCHANGED_REFCOUNT, address as *const c_void, &mut module) } == 0 {
+            return None;
+        }
+        let mut name = [0u16; 512];
+        let len = unsafe { GetModuleFileNameW(module, name.as_mut_ptr(), name.len() as u32) } as usize;
+        let path = String::from_utf16_lossy(&name[..len]);
+        let short = path.rsplit(['\\', '/']).next().unwrap_or(&path).to_string();
+        Some((short, address - module as usize))
+    }
+
+    fn describe(address: usize) -> String {
+        match module_of(address) {
+            Some((module, offset)) => format!("{address:#x} ({module}+{offset:#x})"),
+            None => format!("{address:#x} (no module: JIT-compiled code or data)"),
+        }
+    }
+
+    pub unsafe extern "system" fn handler(pointers: *mut ExceptionPointers) -> i32 {
+        static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let record = unsafe { &*(*pointers).record };
+        if record.code != ACCESS_VIOLATION || REPORTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return CONTINUE_SEARCH;
+        }
+        let kind = match record.information[0] {
+            0 => "reading",
+            1 => "writing",
+            _ => "executing",
+        };
+        eprintln!(
+            "CLEAVE_CRASH_TRACE: access violation {kind} {:#x}, at {}, thread {:?}",
+            record.information[1],
+            describe(record.address as usize),
+            std::thread::current().id()
+        );
+        for module in openmp_modules() {
+            eprintln!("  OpenMP runtime loaded: {module}");
+        }
+        let mut depth = 0;
+        backtrace::trace(|frame| {
+            let ip = frame.ip() as usize;
+            let mut name = None;
+            backtrace::resolve_frame(frame, |symbol| {
+                if name.is_none() {
+                    name = symbol.name().map(|n| n.to_string());
+                }
+            });
+            eprintln!("  #{depth:<2} {} {}", describe(ip), name.unwrap_or_default());
+            depth += 1;
+            depth < 40
+        });
+        CONTINUE_SEARCH
+    }
+}
+
+/// Shuts libomp's teams and threads down (`omp_pause_resource_all(omp_pause_hard)`,
+/// OpenMP 5.0), if the process loaded it: before the JIT-compiled code of a
+/// program that ran on it is freed (`cleave::run`). A team libomp keeps for
+/// the next parallel region holds pointers into that program's code and data
+/// (the source locations each `__kmpc_*` call passes): the next program
+/// reusing the team read them freed, an access violation in libomp's own
+/// barrier. The next region starts the runtime again. Nothing when libomp
+/// isn't loaded.
+pub fn pause_openmp() {
+    #[cfg(windows)]
+    unsafe {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetModuleHandleW(name: *const u16) -> *mut std::ffi::c_void;
+            fn GetProcAddress(module: *mut std::ffi::c_void, name: *const u8) -> *mut std::ffi::c_void;
+        }
+        let name: Vec<u16> = "libomp.dll".encode_utf16().chain(std::iter::once(0)).collect();
+        let module = GetModuleHandleW(name.as_ptr());
+        if module.is_null() {
+            return;
+        }
+        let pause = GetProcAddress(module, c"omp_pause_resource_all".as_ptr().cast());
+        if pause.is_null() {
+            return;
+        }
+        const OMP_PAUSE_HARD: i32 = 2;
+        let pause: extern "C" fn(i32) -> i32 = std::mem::transmute(pause);
+        pause(OMP_PAUSE_HARD);
+    }
+    #[cfg(unix)]
+    unsafe {
+        unsafe extern "C" {
+            fn dlsym(handle: *mut std::ffi::c_void, symbol: *const std::os::raw::c_char) -> *mut std::ffi::c_void;
+        }
+        // `RTLD_DEFAULT`: every library loaded globally.
+        let pause = dlsym(std::ptr::null_mut(), c"omp_pause_resource_all".as_ptr());
+        if pause.is_null() {
+            return;
+        }
+        const OMP_PAUSE_HARD: i32 = 2;
+        let pause: extern "C" fn(i32) -> i32 = std::mem::transmute(pause);
+        pause(OMP_PAUSE_HARD);
     }
 }

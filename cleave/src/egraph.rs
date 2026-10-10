@@ -8481,3 +8481,125 @@ mod tests {
         );
     }
 }
+
+/// An `if` whose condition the e-graph folded to a constant (`if false:` --
+/// a specialized function's `P * Q * R > BLAS_MIN_WORK`, its sizes now
+/// known): its taken branch alone. Its join then has one jump left (if any),
+/// wherever it is in that branch: the jump becomes the join's body, its
+/// parameters given the jump's values. Without it, compiled on its own
+/// (`--no-inline`, a `#[no_inline]` function) the dead branch stayed, an `scf.if` around the
+/// live one, where the matmul schedule's matcher, which takes a matmul
+/// directly in a function or a loop, didn't find it: left to scalar loops.
+pub fn prune_constant_ifs(program: CpsProgram) -> CpsProgram {
+    let funcs = program
+        .funcs
+        .into_iter()
+        .map(|mut f| {
+            f.def.body = prune_constant_if(&f.def.body);
+            f
+        })
+        .collect();
+    CpsProgram { funcs, ..program }
+}
+
+fn prune_constant_if(expr: &CExpr) -> CExpr {
+    match expr {
+        CExpr::LetPrim { var, ty, op, args, cont } => CExpr::LetPrim {
+            var: *var,
+            ty: ty.clone(),
+            op: op.clone(),
+            args: args.clone(),
+            cont: Box::new(prune_constant_if(cont)),
+        },
+        CExpr::App { .. } => expr.clone(),
+        CExpr::If { cond: CVal::Bool(taken), then_branch, else_branch } => {
+            prune_constant_if(if *taken { then_branch } else { else_branch })
+        }
+        CExpr::If { cond, then_branch, else_branch } => CExpr::If {
+            cond: cond.clone(),
+            then_branch: Box::new(prune_constant_if(then_branch)),
+            else_branch: Box::new(prune_constant_if(else_branch)),
+        },
+        CExpr::Fix { defs, body } => {
+            let defs: Vec<CFunDef> = defs
+                .iter()
+                .map(|d| CFunDef { body: prune_constant_if(&d.body), ..d.clone() })
+                .collect();
+            let body = prune_constant_if(body);
+            // A join (not a loop: a loop's def jumps to itself) whose `if`
+            // is gone: one jump to it left, inlined there; nothing referring
+            // to it, dropped. Passed to a call as its continuation (`if c {
+            // f(x) } else { .. }`), it stays: a call and its continuation.
+            if let [join] = defs.as_slice()
+                && !jumps_to(&join.body, &join.name)
+            {
+                let (jumps, passed) = references(&body, &join.name);
+                match (jumps, passed) {
+                    (0, 0) => return body,
+                    (1, 0) => return inline_jump(&body, join),
+                    _ => {}
+                }
+            }
+            CExpr::Fix { defs, body: Box::new(body) }
+        }
+    }
+}
+
+/// Whether `expr` jumps to (or passes along) the local def `name`.
+fn jumps_to(expr: &CExpr, name: &str) -> bool {
+    let is = |v: &CVal| matches!(v, CVal::Label(l) if l == name);
+    match expr {
+        CExpr::LetPrim { cont, .. } => jumps_to(cont, name),
+        CExpr::App { func, args } => is(func) || args.iter().any(is),
+        CExpr::If { then_branch, else_branch, .. } => jumps_to(then_branch, name) || jumps_to(else_branch, name),
+        CExpr::Fix { defs, body } => defs.iter().any(|d| jumps_to(&d.body, name)) || jumps_to(body, name),
+    }
+}
+
+/// How many times `expr` jumps to the local def `name` (as the callee), and
+/// passes it along (as an argument: a call's continuation).
+fn references(expr: &CExpr, name: &str) -> (usize, usize) {
+    let add = |(a, b): (usize, usize), (c, d): (usize, usize)| (a + c, b + d);
+    match expr {
+        CExpr::LetPrim { cont, .. } => references(cont, name),
+        CExpr::App { func, args } => (
+            usize::from(matches!(func, CVal::Label(l) if l == name)),
+            args.iter().filter(|a| matches!(a, CVal::Label(l) if l == name)).count(),
+        ),
+        CExpr::If { then_branch, else_branch, .. } => add(references(then_branch, name), references(else_branch, name)),
+        CExpr::Fix { defs, body } => {
+            defs.iter().map(|d| references(&d.body, name)).fold(references(body, name), add)
+        }
+    }
+}
+
+/// `expr` with its jump to `join` replaced by `join`'s body, the jump's
+/// values given to its parameters.
+fn inline_jump(expr: &CExpr, join: &CFunDef) -> CExpr {
+    match expr {
+        CExpr::LetPrim { var, ty, op, args, cont } => CExpr::LetPrim {
+            var: *var,
+            ty: ty.clone(),
+            op: op.clone(),
+            args: args.clone(),
+            cont: Box::new(inline_jump(cont, join)),
+        },
+        CExpr::App { func: CVal::Label(name), args } if *name == join.name => {
+            let mut inlined = join.body.clone();
+            for (param, arg) in join.params.iter().zip(args) {
+                inlined = substitute_var(&inlined, *param, arg);
+            }
+            inlined
+        }
+        CExpr::App { .. } => expr.clone(),
+        CExpr::If { cond, then_branch, else_branch } => CExpr::If {
+            cond: cond.clone(),
+            then_branch: Box::new(inline_jump(then_branch, join)),
+            else_branch: Box::new(inline_jump(else_branch, join)),
+        },
+        CExpr::Fix { defs, body } => CExpr::Fix {
+            defs: defs.iter().map(|d| CFunDef { body: inline_jump(&d.body, join), ..d.clone() }).collect(),
+            body: Box::new(inline_jump(body, join)),
+        },
+    }
+}

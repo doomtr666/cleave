@@ -523,6 +523,7 @@ pub fn build_optimized_cps(
     report_stage("CPS conversion (units, derivatives)", start);
     let start = std::time::Instant::now();
     let (cps_program, _) = optimize_program(cps_program, registry, false);
+    let cps_program = crate::egraph::prune_constant_ifs(cps_program);
     report_stage("e-graph optimization", start);
     let start = std::time::Instant::now();
     let cps_program = eliminate_dead_code(cps_program);

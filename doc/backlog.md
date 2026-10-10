@@ -6,37 +6,31 @@ Completed items live in [backlog-done.md](backlog-done.md).
 
 ---
 
-## The pool keeps every freed block, whatever its size class: freed memory is never given back
+## The pool keeps every freed block, whatever its size class: memory held well above the live peak
 
 `cleave_release` parks every freed block in its size class's free list (`pool_push`), for the next
 allocation of that class. A program whose phases use different sizes (a training step: activations in
 the forward and backward passes, weight-sized buffers in the optimizer) holds the peak of each class
-at once. Measured on nanoLM at 116M parameters (d768, 16 layers, context 1024, `CLEAVE_ALLOC_STATS`):
-live 14.9 GiB at most in size classes, 22.1 GiB held (live plus parked), up to 14.5 GiB parked.
-A cap on the parked bytes (a fixed budget, or a fraction of the live bytes), beyond which a large
-block goes back to the system, would keep the pool's speed on the sizes every step reuses; to measure
-in memory and in time (a block taken back from the system costs page faults).
+at once.
 
-## Two cleave programs running at once crawl: their workers are pinned to the same cores
+**A cap exists, off by default** (2026-10-10): `CLEAVE_POOL_PARK=<fraction>` parks a block too large for
+the thread caches only while the parked ones stay under that fraction of the peak of live bytes, else
+gives it back to the system (`cleave-rt::depot_push`; `CLEAVE_ALLOC_STATS` reports the large blocks'
+peak held and live bytes; `cleave-rt/tests/pool_park.rs`). Measured on nanoLM 116M (`bench 0 1 10`, one
+run each), live peak 11.1 GiB in every case:
 
-`cleave_bind_worker` (`cleave-rt`) gives team member `i` a hard affinity to physical core `i` (both its
-SMT siblings), which made one-member-per-core certain and run times stable. With two programs running,
-both pin their members to the same cores: measured 2026-10-08, `examples/xor.cleave --run` (OpenMP)
-beside a nanoLM training didn't finish in 60 s, and finished in 11 s with the binding off
-(`OMP_PROC_BIND=false`), 29 s with `KMP_BLOCKTIME=0`, 8 s on two threads. A soft placement instead, the
-ideal processor (`SetThreadIdealProcessorEx`), steers each member to its core when the machine is free
-and lets the scheduler move it under contention; to measure on nanoLM's step time and spread
-(`scripts/ab.ps1`, what the binding was for) and with two programs side by side.
+| `CLEAVE_POOL_PARK` | held at most | ms/step |
+|---|---|---|
+| unset | 18.3 GiB | 11200 |
+| 0.5 | 14.1 GiB | 11939 (+6.6%) |
+| 0.25 | 13.0 GiB | 12071 (+7.8%) |
+| 0.1 | 12.2 GiB | 12317 (+10%) |
 
-## Several programs spawning tasks at once in one process crash
-
-Found 2026-10-08 moving `tests/checkpoint.rs` onto `cleave::run` with tasks on: each test passes alone,
-the four together (parallel test threads, each JIT-compiling and running a program whose optimizer
-spawns tasks on the one libomp the process loads) end in `STATUS_ACCESS_VIOLATION`. The in-process
-harnesses ran with tasks off, and still do. A host embedding two kernels that both spawn (the Rust
-interop) could meet it: to reproduce with two threads each running a small spawning program, then look
-at what the programs share (libomp's team and task queues, the runtime's pool and per-thread arenas,
-`cleave_bind_worker`'s once-per-thread binding).
+A block given back is faulted in again when its size is needed: every step pays it. Kept off; for a run
+that must fit in less memory. **The lead left**: let a parked block serve a request of a nearby smaller
+class (up to 2x smaller, say), so the blocks parked in one class during a phase serve the next phase's
+sizes instead of new ones being taken from the system: less held without giving anything back. To
+measure the same way (held at most, ms/step), and the waste a block serving a smaller request carries.
 
 ## Intermittent test failures under load, never captured
 
@@ -127,29 +121,6 @@ to know the callee never writes that parameter: a read-only-parameter analysis o
 (an argument only read by `linalg` inputs, loads, transfer reads, or passed to read-only parameters
 of other functions), then the destination becomes the source when neither is written while the copy
 lives. Or layouts at function boundaries taken from the type ("Views as first-class descriptors").
-
----
-
-## Study: parallelism on a Rust runtime (Rayon) instead of libomp
-
-Raised by the user (2026-10-08), after the run-to-run variance turned out to be libomp's worker
-placement left to the OS (two workers on one core's SMT siblings: ~20% slower for the whole run,
-drawn at process start). Today `spawn` lowers to `omp.task` and parallel loops to OpenMP through
-MLIR's OpenMP dialect and LLVM's OpenMPIRBuilder (outlining, captures, `taskwait`), the runtime
-being libomp, configured by environment variables read once at its initialization.
-
-The idea: lower `spawn`/await and `scf.parallel` through MLIR's `async` dialect (`async.execute`,
-`async.await`, `async-parallel-for`), which outlines the bodies and calls a C runtime API
-(`mlirAsyncRuntimeExecute`, `...AwaitToken`, ...) that `cleave-rt` would implement on Rayon. Gains:
-the pool entirely ours (thread count, placement in `ThreadPoolBuilder::start_handler`), no
-libomp, no `__kmpc_*`, nested parallelism composing in one work-stealing pool, portable. Not a
-home-made scheduler (`project_spawn_parallelism`'s rule): Rayon is the scheduler.
-
-The risk to settle first: a blocking await inside a worker takes it out of the pool (lost
-parallelism, or a deadlock if every task waits). Either `async`'s coroutine lowering (an await
-suspends the task) or waits that help (run other tasks meanwhile, as `rayon::join` does).
-Prototype on a recursive `spawn` and a parallel loop: per-task overhead, nanoLM's scaling under
-the same placement, nested waits. Migrate only if it holds.
 
 ---
 
@@ -561,18 +532,6 @@ The other two shapes originally bundled with "Calling a lambda literal directly"
 
 A keyword (`let`, `if`, `and`, `not`, ...) is only special at its own specific grammar position — nothing stops it from *also* being used as an ordinary identifier elsewhere (`let and = 5;` presumably parses). Distinct from the word-boundary bug already fixed (see "Done" above, boolean logic): that was about a keyword wrongly matching as a *prefix* of a longer identifier; this is about a keyword being usable as a *complete* identifier at all. Not urgent, noted so it isn't lost.
 
-## The `~6x` per-FLOP gap between long-K and short-K matmuls, mechanically confirmed by side-by-side disassembly — the fix direction was already identified (`llvm-mca` entry, above) but never implemented
-
-Direct follow-on to the roofline entry above. Disassembled a matched pair, both real, separately-named symbols today thanks to `CLEAVE_NO_INLINE=1`: `MatMulTransposeA::matmul_transpose_a<Tensor<f32,32,784>,Tensor<f32,32,512>,Tensor<f32,784,512>>` (`dW1`, K=32 reduction, ~89-113 GFlop/s) against `MatMul::matmul<Tensor<f32,32,784>,Tensor<f32,784,512>,Tensor<f32,32,512>>` (L1's own forward matmul, K=784 reduction, ~14.7 GFlop/s) — identical total FLOPs (25.7M each), ~6x apart in wall time.
-
-**Both loops use the identical narrow accumulator shape**: a serial chain rotating through only 3-4 independent `zmm` registers (`zmm1 = zmm1*mem+zmm0`, `zmm0 = zmm0*mem+zmm1`, `zmm2 = zmm2*mem+zmm1`, ... — each FMA's own output feeds the next FMA's own input, so the CPU cannot start FMA N+1 until FMA N's own latency has fully retired). This is exactly the pre-existing, already-documented `36.7%` accumulator-latency-chain finding (`vfmadd132ps` rotating through `zmm0-zmm3`).
-
-**The mechanical difference, found by reading the actual loop structure, not assumed**: `dW1`'s own K=32 reduction fits *entirely* inside one unrolled, straight-line block — the latency stall is paid exactly **once**. L1-forward's own K=784 reduction wraps the *identical*-shaped 3-4-register chain inside a **real loop with a back-edge** (`jmp 0xc5e0`, `cmp r13, 0x2ff` — iterating roughly 24 times to cover 784 in chunks), paying the same per-chunk latency stall **~24 times**, because the accumulator set never widens with `K` — more reduction depth only ever means more trips through the same narrow, latency-bound chain, never more independent work to overlap it with.
-
-**The fix direction is not new — it was already named, precisely, and never implemented**: this file's own `llvm-mca` entry (a real, separate analysis session, already in this backlog) concluded exactly this mechanism (`Data Dependencies 75.57%`, only 4 independent registers rotating) and named the fix: *"widen the reduction's own independent-accumulator count in `cleave/mlir/matmul_vectorize.transform.mlir`'s own schedule (more parallel partial sums per `k`-tile, combined only at the end) — 'unroll and jam' the reduction — to give the CPU more independent work to overlap while any one FMA's own latency is still in flight"*. The wider-`M`-tile fix that *did* land (`doc/backlog-done.md`, ~36% single-thread win) widened the *output* tile, which helps register/cache reuse across `M`/`N` — it never widened the `K`-reduction's own accumulator set, which is the specific, still-open gap this entry re-confirms mechanically, on the real kernel, with a real, GFlop/s-quantified before/after pair (`dW1` vs `L1-forward`) rather than a profiler percentage alone.
-
-**Not attempted here** — real, scoped, but the transform-dialect schedule has a documented history of subtle regressions when touched (`doc/backlog-done.md`'s own pad-retry/stack-overflow story) — needs the same discipline: one isolated probe first, then the real kernel, full test suite, accuracy unchanged, before trusting any wall-clock win.
-
 ## Interval/value-range analysis (a fixpoint-iterated abstract-interpretation lattice, not literal fixed-point *arithmetic*) — raised in conversation as a plausible future direction, not designed or scoped yet
 
 The idea, as raised: track each variable's own possible value *range* (an interval, not just "known constant or not"), converged via the standard fixpoint-iteration abstract-interpretation technique (widening/narrowing across a loop's own back-edge, Cousot-style) rather than exact constant folding alone. The concrete motivating use case named directly: a `for` loop's own **trip count** becoming staticaly derivable when its bounds are provably within a known range — unlocking unroll/unroll-jam decisions, bounds-check elimination, and potentially const-generic-shaped dispatch (`doc/backlog.md`'s own already-closed "const generic compared via an operator" entry, and the still-open OpenBLAS-motivated size-threshold dispatch it unblocked) for cases that are range-bounded but not literally constant.
@@ -604,10 +563,6 @@ What to do, by priority:
 ## The in-process test harnesses don't run the matmul schedule: a test of a matmul there doesn't cover the real pipeline
 
 Found while fixing matmuls whose column count isn't a multiple of 16: the test written in `cleave/tests/mlir_lower.rs` passed **even without the fix**, while the CLI (`--run`) failed. The harness pipeline in those files (`run_i32` and its relatives) doesn't apply `matmul_vectorize.transform.mlir`, so its matmuls take another lowering path. The regression test now goes through the CLI binary (`language_model_ops.rs`, `CARGO_BIN_EXE_cleave`). To fix: have the harnesses go through `pipeline.rs::lower_to_llvm` with the real options, or at least list which existing tests think they cover the schedule and don't.
-
-## Under `--no-inline`, a matmul inside the BLAS-threshold `if` isn't vectorized
-
-`matmul_transpose_b`'s body is `if P*Q*R > 100000000 { sgemm(...) } else { linalg matmul }`. Inlined, the `if` folds away (the product is a compile-time constant) and the matmul is vectorized like any other. Compiled as its own function (`--no-inline`), the `if` stays, the `linalg.matmul` sits inside an `scf.if`, and the schedule's matcher (`@match_matmul`) only accepts a matmul directly under a `func.func` or an `scf.while`: the matmul is left to scalar loops. Correct, just slow. Found writing `matmuls_with_a_partial_tile_are_vectorized`, which therefore runs inlined. To fix: fold a branch whose condition is a compile-time constant in the specialized function too (`doc/backlog.md` already has the zero-trip-count loop case of the same gap), or let the matcher accept an `scf.if` parent.
 
 ## Fewer bits per weight: `bf16` training, codebook quantization for inference (idea, 2026-10-04)
 
