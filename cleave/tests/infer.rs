@@ -60,6 +60,7 @@ fn inject_tuple_struct(mut program: Program, arity: usize) -> Program {
         name: tuple_struct_name(arity),
         generics,
         fields,
+        zero_fill: false,
     };
     program.items.push(Item {
         id: NodeId(900_000 + 100 + arity as u32),

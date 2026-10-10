@@ -578,8 +578,9 @@ fn is_committed_at(op: &PrimOp, args: &[CVal], var: CVar) -> usize {
         .count()
 }
 
-/// Whether `var` is one of the elements an `Array` construction embeds, or
-/// the replicated value an `ArrayRepeat` one does — rule 4b, the module's
+/// Whether `var` is one of the elements an `Array` construction embeds, the
+/// replicated value an `ArrayRepeat` one does, or the value a `Store` writes
+/// into a slot — rule 4b, the module's
 /// own doc comment has the full reasoning (a `Load`'s own index is runtime,
 /// so unlike a `Struct`'s named fields, this analysis can never see which
 /// originally-embedded element comes back out at a later load site, hence
@@ -592,6 +593,12 @@ fn is_array_embedded(op: &PrimOp, args: &[CVal], var: CVar) -> bool {
     let commitment_args: &[CVal] = match op {
         PrimOp::Array => args,
         PrimOp::ArrayRepeat => args.first().map(std::slice::from_ref).unwrap_or(&[]),
+        // A value stored into a slot (`a[i] = p`, a buffer's slot): read
+        // back by a runtime index too. Without it, a struct stored into a
+        // buffer by a callee (`buffer_set`), never used again there, was
+        // pool-allocated without a header, freed at its last use while the
+        // buffer held it.
+        PrimOp::Store { .. } => args.last().map(std::slice::from_ref).unwrap_or(&[]),
         _ => &[],
     };
     commitment_args

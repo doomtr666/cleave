@@ -1242,6 +1242,7 @@ fn collect_instantiations_expr(
         };
     }
     match &expr.kind {
+        ExprKind::Match { .. } => unreachable!("a `match` is lowered by `driver::desugar_enums`"),
         ExprKind::Spawn(call) => rec!(call),
         ExprKind::NumberLit { .. }
         | ExprKind::ImaginaryLit { .. }
@@ -3142,6 +3143,7 @@ fn display_impl_instantiation(t: &ImplTemplate, mapping: &HashMap<TyVar, Ty>) ->
 pub(crate) fn collect_exprs<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
     out.push(expr);
     match &expr.kind {
+        ExprKind::Match { .. } => unreachable!("a `match` is lowered by `driver::desugar_enums`"),
         ExprKind::Spawn(call) => collect_exprs(call, out),
         ExprKind::NumberLit { .. }
         | ExprKind::ImaginaryLit { .. }
@@ -3245,6 +3247,7 @@ pub fn dump_monomorphized(program: &Program, registry: &Registry) -> (String, Ve
             out.push('\n');
         }
         match &item.kind {
+            ItemKind::Enum(_) => unreachable!("an `enum` is lowered by `driver::desugar_enums`"),
             ItemKind::Use(path) => {
                 let _ = writeln!(out, "use {};", path.segments.join("::"));
             }

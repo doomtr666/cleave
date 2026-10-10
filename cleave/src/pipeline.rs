@@ -237,6 +237,7 @@ fn check_lambda_positions(program: &Program) -> Vec<Diagnostic> {
 
     fn walk_expr(expr: &Expr, lambdas: &mut Vec<String>, out: &mut Vec<Diagnostic>) {
         match &expr.kind {
+            ExprKind::Match { .. } => unreachable!("a `match` is lowered by `driver::desugar_enums`"),
             ExprKind::Lambda { .. } => out.push(unsupported(expr.span, "a lambda used as a value")),
             ExprKind::Path(p) if p.segments.len() == 1 && lambdas.contains(&p.segments[0]) => {
                 out.push(unsupported(expr.span, &format!("`{}` used as a value", p.segments[0])));
@@ -627,8 +628,8 @@ pub unsafe fn register_cleave_rt_symbols(engine: &cleave_mlir::ExecutionEngine) 
         engine.register_symbol("print_f64", cleave_rt::print_f64 as *mut ());
         engine.register_symbol("print_bytes", cleave_rt::print_bytes as *mut ());
         engine.register_symbol(
-            "print_dynarray_bytes",
-            cleave_rt::print_dynarray_bytes as *mut (),
+            "print_buffer_bytes",
+            cleave_rt::print_buffer_bytes as *mut (),
         );
         engine.register_symbol("format_f32", cleave_rt::format_f32 as *mut ());
         engine.register_symbol("format_f64", cleave_rt::format_f64 as *mut ());
@@ -661,52 +662,10 @@ pub unsafe fn register_cleave_rt_symbols(engine: &cleave_mlir::ExecutionEngine) 
             "cleave_region_exit",
             cleave_rt::cleave_region_exit as *mut (),
         );
-        engine.register_symbol("dynarray_alloc_i8", cleave_rt::dynarray_alloc_i8 as *mut ());
-        engine.register_symbol("dynarray_grow_i8", cleave_rt::dynarray_grow_i8 as *mut ());
-        engine.register_symbol("dynarray_get_i8", cleave_rt::dynarray_get_i8 as *mut ());
-        engine.register_symbol("dynarray_set_i8", cleave_rt::dynarray_set_i8 as *mut ());
-        engine.register_symbol(
-            "dynarray_alloc_i16",
-            cleave_rt::dynarray_alloc_i16 as *mut (),
-        );
-        engine.register_symbol("dynarray_grow_i16", cleave_rt::dynarray_grow_i16 as *mut ());
-        engine.register_symbol("dynarray_get_i16", cleave_rt::dynarray_get_i16 as *mut ());
-        engine.register_symbol("dynarray_set_i16", cleave_rt::dynarray_set_i16 as *mut ());
-        engine.register_symbol(
-            "dynarray_alloc_i32",
-            cleave_rt::dynarray_alloc_i32 as *mut (),
-        );
-        engine.register_symbol("dynarray_grow_i32", cleave_rt::dynarray_grow_i32 as *mut ());
-        engine.register_symbol("dynarray_get_i32", cleave_rt::dynarray_get_i32 as *mut ());
-        engine.register_symbol("dynarray_set_i32", cleave_rt::dynarray_set_i32 as *mut ());
-        engine.register_symbol(
-            "dynarray_alloc_i64",
-            cleave_rt::dynarray_alloc_i64 as *mut (),
-        );
-        engine.register_symbol("dynarray_grow_i64", cleave_rt::dynarray_grow_i64 as *mut ());
-        engine.register_symbol("dynarray_get_i64", cleave_rt::dynarray_get_i64 as *mut ());
-        engine.register_symbol("dynarray_set_i64", cleave_rt::dynarray_set_i64 as *mut ());
-        engine.register_symbol(
-            "dynarray_alloc_f32",
-            cleave_rt::dynarray_alloc_f32 as *mut (),
-        );
-        engine.register_symbol("dynarray_grow_f32", cleave_rt::dynarray_grow_f32 as *mut ());
-        engine.register_symbol("dynarray_get_f32", cleave_rt::dynarray_get_f32 as *mut ());
-        engine.register_symbol("dynarray_set_f32", cleave_rt::dynarray_set_f32 as *mut ());
-        engine.register_symbol(
-            "dynarray_alloc_f64",
-            cleave_rt::dynarray_alloc_f64 as *mut (),
-        );
-        engine.register_symbol("dynarray_grow_f64", cleave_rt::dynarray_grow_f64 as *mut ());
-        engine.register_symbol("dynarray_get_f64", cleave_rt::dynarray_get_f64 as *mut ());
-        engine.register_symbol("dynarray_set_f64", cleave_rt::dynarray_set_f64 as *mut ());
-        engine.register_symbol(
-            "dynarray_alloc_ptr",
-            cleave_rt::dynarray_alloc_ptr as *mut (),
-        );
-        engine.register_symbol("dynarray_grow_ptr", cleave_rt::dynarray_grow_ptr as *mut ());
-        engine.register_symbol("dynarray_get_ptr", cleave_rt::dynarray_get_ptr as *mut ());
-        engine.register_symbol("dynarray_set_ptr", cleave_rt::dynarray_set_ptr as *mut ());
+        engine.register_symbol("cleave_buffer_alloc", cleave_rt::cleave_buffer_alloc as *mut ());
+        engine.register_symbol("cleave_buffer_grow", cleave_rt::cleave_buffer_grow as *mut ());
+        engine.register_symbol("cleave_buffer_capacity", cleave_rt::cleave_buffer_capacity as *mut ());
+        engine.register_symbol("cleave_buffer_free_data", cleave_rt::cleave_buffer_free_data as *mut ());
         // `stdlib/blas/blas.cleave`'s own `raw_sgemm` extern -- lazily loads
         // `openblas.dll` on first real call (`cleave_rt::blas_dynload`), so
         // registering it here unconditionally costs nothing for a program

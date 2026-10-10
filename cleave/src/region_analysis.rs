@@ -99,6 +99,8 @@ use crate::collections::{HashMap, HashSet};
 pub fn find_region_local_functions(program: &CpsProgram) -> HashSet<String> {
     let top_level_names: HashSet<String> = program.funcs.iter().map(|f| f.def.name.clone()).collect();
     let call_counts = count_call_sites(program, &top_level_names);
+    // Which parameters a callee may store somewhere (`collect_stored`).
+    let summary = crate::alias_analysis::analyze(program);
     let by_name: HashMap<&str, &CFunDef> = program
         .funcs
         .iter()
@@ -107,7 +109,7 @@ pub fn find_region_local_functions(program: &CpsProgram) -> HashSet<String> {
 
     let mut region_local = HashSet::default();
     for f in &program.funcs {
-        find_loops_and_mark(&f.def.body, &top_level_names, &call_counts, &mut region_local);
+        find_loops_and_mark(&f.def.body, &top_level_names, &call_counts, &summary, &mut region_local);
     }
     // A spawned function (`doc/plan-spawn.md`) may run on another thread than
     // its caller, whose region it would allocate in: never region-local. Its
@@ -118,6 +120,13 @@ pub fn find_region_local_functions(program: &CpsProgram) -> HashSet<String> {
         collect_spawned_units(&f.def.body, &mut spawned);
     }
     region_local.retain(|name| !spawned.contains(name));
+    // A function writing into storage one of its parameters reaches (a
+    // buffer's slot, an array's, a struct's field) keeps what it stores, or
+    // allocates to store, past its return: never region-local (the module's
+    // soundness argument assumes nothing survives a call but its result).
+    let writes_through_params: HashSet<String> =
+        program.funcs.iter().filter(|f| writes_through_params(&f.def)).map(|f| f.def.name.clone()).collect();
+    region_local.retain(|name| !writes_through_params.contains(name));
 
     // Transitive descent -- a worklist, not a single extra pass, since a
     // freshly-marked callee's own body might itself call a *third* function
@@ -135,13 +144,49 @@ pub fn find_region_local_functions(program: &CpsProgram) -> HashSet<String> {
         let mut inner_callees = HashSet::default();
         collect_direct_callees(&def.body, &top_level_names, &mut inner_callees);
         for callee in inner_callees {
-            if call_counts.get(&callee).copied().unwrap_or(0) == 1 && region_local.insert(callee.clone()) {
+            if call_counts.get(&callee).copied().unwrap_or(0) == 1
+                && !writes_through_params.contains(&callee)
+                && region_local.insert(callee.clone())
+            {
                 worklist.push(callee);
             }
         }
     }
 
     region_local
+}
+
+/// Whether `def`'s body stores into storage reachable from its parameters: a
+/// `Store`/`FieldStore` whose target is a parameter, or a field or element
+/// read out of one, transitively.
+fn writes_through_params(def: &CFunDef) -> bool {
+    fn walk(expr: &CExpr, reached: &mut HashSet<CVar>) -> bool {
+        match expr {
+            CExpr::LetPrim { var, op, args, cont, .. } => {
+                let base = match args.first() {
+                    Some(CVal::Var(v)) => reached.contains(v),
+                    _ => false,
+                };
+                match op {
+                    PrimOp::Store { .. } | PrimOp::FieldStore { .. } if base => return true,
+                    PrimOp::Field { .. } | PrimOp::Load { .. } if base => {
+                        reached.insert(*var);
+                    }
+                    _ => {}
+                }
+                walk(cont, reached)
+            }
+            CExpr::App { .. } => false,
+            CExpr::If { then_branch, else_branch, .. } => walk(then_branch, reached) || walk(else_branch, reached),
+            CExpr::Fix { defs, body } => {
+                // A loop or join's parameters carry what reaches them
+                // conservatively: whatever reached the enclosing scope.
+                defs.iter().any(|d| walk(&d.body, reached)) || walk(body, reached)
+            }
+        }
+    }
+    let mut reached: HashSet<CVar> = def.params.iter().copied().collect();
+    walk(&def.body, &mut reached)
 }
 
 /// Every top-level function name called *directly* anywhere in `expr` (any
@@ -260,31 +305,32 @@ fn find_loops_and_mark(
     expr: &CExpr,
     top_level_names: &HashSet<String>,
     call_counts: &HashMap<String, usize>,
+    summary: &crate::alias_analysis::AliasSummary,
     region_local: &mut HashSet<String>,
 ) {
     match expr {
-        CExpr::LetPrim { cont, .. } => find_loops_and_mark(cont, top_level_names, call_counts, region_local),
+        CExpr::LetPrim { cont, .. } => find_loops_and_mark(cont, top_level_names, call_counts, summary, region_local),
         CExpr::App { .. } => {}
         CExpr::If {
             then_branch,
             else_branch,
             ..
         } => {
-            find_loops_and_mark(then_branch, top_level_names, call_counts, region_local);
-            find_loops_and_mark(else_branch, top_level_names, call_counts, region_local);
+            find_loops_and_mark(then_branch, top_level_names, call_counts, summary, region_local);
+            find_loops_and_mark(else_branch, top_level_names, call_counts, summary, region_local);
         }
         CExpr::Fix { defs, body } => {
             for d in defs {
                 if d.carried_types.is_some() {
-                    analyze_loop_body(d, top_level_names, call_counts, region_local);
+                    analyze_loop_body(d, top_level_names, call_counts, summary, region_local);
                 }
                 // Recurse into the def's own body too -- a nested loop (the
                 // outer `epoch` loop containing the inner `s` loop, say),
                 // or a real call's own resumption continuation, might
                 // itself contain further loops.
-                find_loops_and_mark(&d.body, top_level_names, call_counts, region_local);
+                find_loops_and_mark(&d.body, top_level_names, call_counts, summary, region_local);
             }
-            find_loops_and_mark(body, top_level_names, call_counts, region_local);
+            find_loops_and_mark(body, top_level_names, call_counts, summary, region_local);
         }
     }
 }
@@ -324,6 +370,7 @@ fn analyze_loop_body(
     loop_def: &CFunDef,
     top_level_names: &HashSet<String>,
     call_counts: &HashMap<String, usize>,
+    summary: &crate::alias_analysis::AliasSummary,
     region_local: &mut HashSet<String>,
 ) {
     let Some(then_branch) = loop_then_branch(loop_def) else {
@@ -341,7 +388,7 @@ fn analyze_loop_body(
     // past this iteration.
     let mut escaping: HashSet<CVar> = HashSet::default();
     collect_escaping(then_branch, &loop_def.name, &mut escaping);
-    collect_stored(then_branch, &mut escaping);
+    collect_stored(then_branch, top_level_names, summary, &mut escaping);
 
     // `children[base]` = every `CVar` bound via `PrimOp::Field` reading
     // straight out of `base` (`g.2`'s own `CVar` is a child of `g`'s) --
@@ -482,7 +529,18 @@ fn collect_escaping(expr: &CExpr, loop_name: &str, escaping: &mut HashSet<CVar>)
 /// before the loop was allocated in the iteration's arena, which the next
 /// iteration reused under it (a decoder's per-layer caches, all layers but
 /// the last overwritten).
-fn collect_stored(expr: &CExpr, escaping: &mut HashSet<CVar>) {
+///
+/// A value passed to a call that may store it (`summary`'s aliased
+/// positions: `alias_analysis`, a `Store` or a construction in the callee or
+/// further down) escapes the same way: `buffer_set(b, i, make(i))` keeps
+/// `make`'s result in `b`. Only direct calls to top-level functions: a
+/// jump to a continuation or a join stores nothing.
+fn collect_stored(
+    expr: &CExpr,
+    top_level_names: &HashSet<String>,
+    summary: &crate::alias_analysis::AliasSummary,
+    escaping: &mut HashSet<CVar>,
+) {
     match expr {
         CExpr::LetPrim { op, args, cont, .. } => {
             if matches!(op, PrimOp::Store { .. } | PrimOp::FieldStore { .. })
@@ -490,18 +548,27 @@ fn collect_stored(expr: &CExpr, escaping: &mut HashSet<CVar>) {
             {
                 escaping.insert(*v);
             }
-            collect_stored(cont, escaping);
+            collect_stored(cont, top_level_names, summary, escaping);
+        }
+        CExpr::App { func: CVal::Label(callee), args } if top_level_names.contains(callee) => {
+            for (i, arg) in args.iter().enumerate() {
+                if let CVal::Var(v) = arg
+                    && summary.is_aliased(callee, i)
+                {
+                    escaping.insert(*v);
+                }
+            }
         }
         CExpr::App { .. } => {}
         CExpr::If { then_branch, else_branch, .. } => {
-            collect_stored(then_branch, escaping);
-            collect_stored(else_branch, escaping);
+            collect_stored(then_branch, top_level_names, summary, escaping);
+            collect_stored(else_branch, top_level_names, summary, escaping);
         }
         CExpr::Fix { defs, body } => {
             for d in defs {
-                collect_stored(&d.body, escaping);
+                collect_stored(&d.body, top_level_names, summary, escaping);
             }
-            collect_stored(body, escaping);
+            collect_stored(body, top_level_names, summary, escaping);
         }
     }
 }

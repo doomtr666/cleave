@@ -78,3 +78,6 @@ algebra Index<Container, Elem, const K: i32> {
 algebra IndexSet<Container, Elem, const K: i32> {
     fn set(c: Container, idx: [i32; K], v: Elem) -> Container;
 }
+
+// A value, or none (`doc/plan-sum-types.md`): `match o { Some(x) => .., None => .. }`.
+enum Option<T> { None, Some(T) }

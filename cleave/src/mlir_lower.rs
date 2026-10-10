@@ -155,17 +155,17 @@ struct LowerCtx<'c, 'm> {
     /// Every struct name with at least one real `PrimOp::Struct`
     /// construction site anywhere in the whole program —
     /// `refcount::collect_constructed_struct_names`'s own doc comment has
-    /// the full reasoning (the `RawBuf`-shaped "opaque FFI handle, never
-    /// constructed via `Name(...)`, produced solely by an `extern fn`"
-    /// idiom has no real `RcHeader` in front of it at all). `refcount.rs`'s
+    /// the full reasoning (an opaque foreign handle, never constructed via
+    /// `Name(...)` and produced solely by an `extern fn`, has no real
+    /// `RcHeader` in front of it at all). `refcount.rs`'s
     /// own `insert_refcounting` pass already consults this (via `is_
     /// refcounted`) before ever emitting a top-level `PrimOp::Release` for
     /// such a value — `lower_release_cascade`'s own doc comment has the
     /// real reason this same set is needed *here* too: its own field-walk
     /// used to check only "is this a declared struct type" when deciding
     /// whether to recurse into a struct-typed field, with no awareness that
-    /// a declared-but-never-constructed struct type (`DynArray<T>`'s own
-    /// `buf: RawBuf` field, concretely) has nothing real to release at all.
+    /// a declared-but-never-constructed struct type (a foreign handle field)
+    /// has nothing real to release at all.
     constructed_structs: HashSet<String>,
     /// Every struct name ever the target of a real `PrimOp::FieldStore`
     /// anywhere in the whole program — `refcount::collect_field_mutated_
@@ -903,15 +903,7 @@ fn is_unit_ty(ty: &Ty) -> bool {
 ///   completely separate question this check never needs to answer, the
 ///   same reasoning `Dense`'s own `Tensor` fields already rely on).
 ///
-/// **Two structural disqualifiers, checked first, neither about size:**
-/// - `DynArray` itself, or any struct containing one anywhere, transitively
-///   — never light, full stop, regardless of how small its own envelope
-///   is. Not a size question at all: `doc/backlog.md`'s own "`mut` carries
-///   no real semantic weight..." entry has the full story of why a value-
-///   semantics `DynArray` can never be made sound without a real ownership/
-///   move-checking system cleave doesn't have (a concrete, found-by-testing
-///   aliasing hazard — two independent envelope copies silently sharing and
-///   corrupting the same backing buffer — not a hypothetical concern).
+/// **A structural disqualifier, checked first, not about size:**
 /// - A struct with a *directly embedded* (untagged) array field — `[T;N]`
 ///   declared straight on the struct, not a `Tensor`/`Vector` — is excluded
 ///   too, but for a narrower, purely-implementation reason: embedding a
@@ -954,10 +946,8 @@ fn is_light_struct_rec(
     constructed: &HashSet<String>,
     visiting: &mut HashSet<String>,
 ) -> bool {
-    // `DynArray` disqualifies unconditionally, before anything else --
-    // see this function's own doc comment for why this is about its own
-    // mutate-in-place API contract, not its size.
-    if name == "DynArray" {
+    // A buffer is a refcounted object, a reference: never a value.
+    if mlir_types.get(name).map(String::as_str) == Some("buffer") {
         return false;
     }
     // A struct ever field-mutated in place (`s.field = v;`) anywhere in the
@@ -975,12 +965,10 @@ fn is_light_struct_rec(
     // `refcount::collect_extern_boundary_struct_names`'s own doc comment has
     // the full reasoning: a real C-ABI symbol on the other side (`cleave-
     // rt`) is written assuming cleave's fixed, uniform pointer-shaped struct
-    // representation regardless of field shape. `RawBuf`'s own "opaque FFI
-    // handle" idiom hits this directly (every extern in `dynarray.cleave`'s
-    // own `RawBuffer<T>` impls takes/returns it); a generic algebra impl
-    // backed by an extern (`RawBuffer<S: HeapStruct>`) hits it too once
-    // monomorphized to a concrete struct `S` -- found by direct testing (a
-    // real `'func.call' op operand type mismatch` on `DynArray<Point>`).
+    // representation regardless of field shape: a struct crossing it as an
+    // aggregate would change the call's ABI (a `'func.call' op operand type
+    // mismatch`, found with a generic extern-backed impl monomorphized to a
+    // concrete struct).
     if extern_boundary.contains(name) {
         return false;
     }
@@ -1012,21 +1000,14 @@ fn is_light_struct_rec(
     }
     let fields = struct_field_types(struct_schemas, name, type_args);
     // A zero-field struct is *not* light, even though `all()` on an empty
-    // iterator would vacuously say so -- this codebase's own established
-    // "opaque foreign handle" idiom (`dynarray.cleave`'s own `struct RawBuf
-    // {}`, its own doc comment spells this out explicitly) deliberately
-    // relies on a fieldless struct always lowering to a real `!llvm.ptr`
-    // (`ty_to_mlir`'s own struct fallback). Such a handle is only ever
-    // *produced* by an `extern fn` returning a real pointer from the
-    // `cleave-rt` side (never constructed via `RawBuf(...)` in cleave source
-    // itself) -- flattening it to `!llvm.struct<()>` here would silently
-    // change the extern call's own ABI out from under it (a zero-size
-    // aggregate instead of the pointer the native side actually returns),
-    // corrupting every value that ever flows through it. Found by direct
-    // testing (a `STATUS_ACCESS_VIOLATION` crash in `DynArray`'s own tests,
-    // which hold exactly this shape) -- not a hypothetical concern. A
-    // zero-field struct also has nothing to flatten anyway, so excluding it
-    // costs nothing.
+    // iterator would vacuously say so -- an opaque foreign handle (a
+    // fieldless struct only an `extern fn` produces, never constructed in
+    // cleave source) relies on a fieldless struct always lowering to a real
+    // `!llvm.ptr` (`ty_to_mlir`'s own struct fallback): flattening it to
+    // `!llvm.struct<()>` would change the extern call's ABI out from under it
+    // (a zero-size aggregate instead of the pointer the native side returns;
+    // found as a `STATUS_ACCESS_VIOLATION`). A zero-field struct has nothing
+    // to flatten anyway, so excluding it costs nothing.
     if fields.is_empty() {
         visiting.remove(name);
         return false;
@@ -1149,13 +1130,9 @@ fn is_light_field_ty(
 /// with `&& !is_light_struct(...)`, so calling it from inside `is_light_
 /// struct`'s own field check would recurse back into this same mechanism —
 /// safe today only because no real cleave struct embeds another by value
-/// mutually, not a risk worth taking on purpose. `RawBuf`-shaped ("opaque
-/// FFI handle", no real construction site) and tensor/vector-tagged structs
-/// both correctly say "not refcounted" here, matching `is_refcounted`
-/// itself; a `DynArray` is *always* refcounted by this measure the moment
-/// it's constructed anywhere in the program, so this one general check
-/// already subsumes what a separate `DynArray`-only transitive check used
-/// to do by hand.
+/// mutually, not a risk worth taking on purpose. A foreign handle (no real
+/// construction site) and tensor/vector-tagged structs both say "not
+/// refcounted" here, matching `is_refcounted` itself.
 fn field_struct_is_ever_refcounted(
     name: &str,
     struct_schemas: &HashMap<String, StructSchema>,
@@ -1303,8 +1280,8 @@ fn collect_light_leaves(
                 leaf_ty: field_ty,
             });
         }
-        // Else: a heavy field with no real construction site anywhere
-        // (`RawBuf`-shaped) -- nothing to release, skip.
+        // Else: a heavy field with no real construction site anywhere (a
+        // foreign handle) -- nothing to release, skip.
     }
 }
 
@@ -2848,6 +2825,8 @@ fn lower_prim_op<'c>(
 ) -> Option<Value<'c, 'c>> {
     match op {
         PrimOp::Spawn { unit } => lower_spawn(ctx, block, env, unit, args),
+        PrimOp::BufferAlloc => Some(lower_buffer_alloc(ctx, block, env, ty, args)),
+        PrimOp::BufferTake => Some(lower_buffer_take(ctx, block, env, ty, args)),
         PrimOp::Await | PrimOp::Sync => {
             lower_task_wait(ctx, block, env, args);
             None
@@ -3377,6 +3356,10 @@ fn lower_array_load<'c>(
     let array_val = *env
         .get(array_var)
         .unwrap_or_else(|| panic!("MLIR lowering: unbound CPS variable v{array_var}"));
+    if let Some(elem_ty) = crate::refcount::buffer_element(array_ty, &ctx.mlir_types) {
+        let slot_ptr = buffer_slot_ptr(ctx, block, env, array_val, elem_ty, &args[1]);
+        return load_slot(ctx, block, elem_ty, slot_ptr);
+    }
     let i32_ty = width_ty(ctx, "i32");
     let location = gen_loc(ctx.context);
     if array_val.r#type().is_mem_ref() {
@@ -3415,24 +3398,67 @@ fn lower_array_load<'c>(
                 .map(|a| lower_cval(ctx.context, block, env, a, i32_ty)),
         );
         let leaf_ptr = gep_dynamic(ctx, block, array_val, &gep_indices, array_llvm_ty);
-        // A tensor: a view of the buffer its slot's descriptor holds, as a
-        // struct's tensor field is read.
-        if native_shape_field_keyword(ctx, leaf_ty).is_some() {
-            return load_native_shape_field(ctx, block, leaf_ty, leaf_ptr);
-        }
-        let result_ty = ty_to_mlir(ctx, leaf_ty);
-        block
-            .append_operation(llvm::load(
-                ctx.context,
-                leaf_ptr,
-                result_ty,
-                location,
-                LoadStoreOptions::new(),
-            ))
-            .result(0)
-            .unwrap()
-            .into()
+        load_slot(ctx, block, leaf_ty, leaf_ptr)
     }
+}
+
+/// The element of type `leaf_ty` in the slot at `slot_ptr`: an array
+/// object's (`is_handle_array`) or a buffer's.
+fn load_slot<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, leaf_ty: &Ty, slot_ptr: Value<'c, 'c>) -> Value<'c, 'c> {
+    // A tensor: a view of the buffer its slot's descriptor holds, as a
+    // struct's tensor field is read.
+    if native_shape_field_keyword(ctx, leaf_ty).is_some() {
+        return load_native_shape_field(ctx, block, leaf_ty, slot_ptr);
+    }
+    let result_ty = ty_to_mlir(ctx, leaf_ty);
+    block
+        .append_operation(llvm::load(
+            ctx.context,
+            slot_ptr,
+            result_ty,
+            gen_loc(ctx.context),
+            LoadStoreOptions::new(),
+        ))
+        .result(0)
+        .unwrap()
+        .into()
+}
+
+/// `Buffer<T>`'s object (`cleave-rt::BufferObject`): its slots' address,
+/// their count, their size.
+fn buffer_object_llvm_type<'c>(ctx: &LowerCtx<'c, '_>) -> Type<'c> {
+    let i32_ty: Type = IntegerType::new(ctx.context, 32).into();
+    llvm::r#type::r#struct(ctx.context, &[llvm::r#type::pointer(ctx.context, 0), i32_ty, i32_ty], false)
+}
+
+/// Field `position` of the buffer object `buffer` points to.
+fn load_buffer_field<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    buffer: Value<'c, 'c>,
+    position: i64,
+    field_ty: Type<'c>,
+) -> Value<'c, 'c> {
+    let field_ptr = gep(ctx, block, buffer, &[0, position], buffer_object_llvm_type(ctx));
+    block
+        .append_operation(llvm::load(ctx.context, field_ptr, field_ty, gen_loc(ctx.context), LoadStoreOptions::new()))
+        .result(0)
+        .unwrap()
+        .into()
+}
+
+/// The address of slot `index` of `buffer`, a `Buffer<elem_ty>`.
+fn buffer_slot_ptr<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    buffer: Value<'c, 'c>,
+    elem_ty: &Ty,
+    index: &CVal,
+) -> Value<'c, 'c> {
+    let data = load_buffer_field(ctx, block, buffer, 0, llvm::r#type::pointer(ctx.context, 0));
+    let index = lower_cval(ctx.context, block, env, index, width_ty(ctx, "i32"));
+    gep_dynamic(ctx, block, data, &[index], ty_to_llvm_field_type(ctx, elem_ty))
 }
 
 /// `args = [array, index..., value]` (value last — `cps.rs`'s own
@@ -3459,6 +3485,11 @@ fn lower_array_store<'c>(
     let Some((value_arg, index_args)) = args[1..].split_last() else {
         panic!("MLIR lowering: `store` needs at least an index and a value");
     };
+    if let Some(elem_ty) = crate::refcount::buffer_element(array_ty, &ctx.mlir_types) {
+        let slot_ptr = buffer_slot_ptr(ctx, block, env, array_val, elem_ty, &index_args[0]);
+        store_slot(ctx, block, env, elem_ty, slot_ptr, value_arg);
+        return;
+    }
     let i32_ty = width_ty(ctx, "i32");
     let location = gen_loc(ctx.context);
     if array_val.r#type().is_tensor() {
@@ -3498,7 +3529,6 @@ fn lower_array_store<'c>(
     } else {
         let (_, leaf_ty) = array_dims(ctx, array_ty);
         let array_llvm_ty = array_inline_llvm_type(ctx, array_ty);
-        let elem_mlir_ty = ty_to_mlir(ctx, leaf_ty);
         let mut gep_indices = vec![const_i32(ctx, block, 0)];
         gep_indices.extend(
             index_args
@@ -3506,34 +3536,53 @@ fn lower_array_store<'c>(
                 .map(|a| lower_cval(ctx.context, block, env, a, i32_ty)),
         );
         let leaf_ptr = gep_dynamic(ctx, block, array_val, &gep_indices, array_llvm_ty);
-        // The slot holds one reference to its element (`refcount.rs`
-        // retains the value before a `Store`): the element it held before
-        // is read out first, then released once overwritten. Arrays have
-        // reference semantics, the write is in place.
-        let mut previous: Vec<PendingChild<'c>> = Vec::new();
-        if ty_needs_cascade(ctx, leaf_ty) {
-            push_cascade_leaf(ctx, block, leaf_ty, leaf_ptr, (String::new(), 0), &mut previous);
-        }
-        if native_shape_field_keyword(ctx, leaf_ty).is_some() {
-            store_native_shape_field(ctx, block, env, leaf_ty, leaf_ptr, value_arg);
-        } else {
-            let value_val = lower_cval(ctx.context, block, env, value_arg, elem_mlir_ty);
-            block.append_operation(llvm::store(
-                ctx.context,
-                value_val,
-                leaf_ptr,
-                location,
-                LoadStoreOptions::new(),
-            ));
-        }
-        for child in previous {
-            match child {
-                PendingChild::Tensor(child_ptr) => {
-                    emit_cleave_release(ctx, block, &Ty::Con("__cleave_opaque_ptr".to_string()), child_ptr);
-                }
-                PendingChild::Struct(child_ty, child_val, _) => {
-                    lower_release_cascade(ctx, block, &child_ty, child_val);
-                }
+        store_slot(ctx, block, env, leaf_ty, leaf_ptr, value_arg);
+    }
+}
+
+/// Stores `value_arg` into the slot at `slot_ptr` of an array object
+/// (`is_handle_array`) or a buffer. The slot holds one reference to its
+/// element (`refcount.rs` retains the value before a `Store`): the element
+/// it held before is read out first, then released once overwritten (an
+/// empty slot is all zero, releasing nothing). The write is in place.
+fn store_slot<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    leaf_ty: &Ty,
+    slot_ptr: Value<'c, 'c>,
+    value_arg: &CVal,
+) {
+    let mut previous: Vec<PendingChild<'c>> = Vec::new();
+    if ty_needs_cascade(ctx, leaf_ty) {
+        push_cascade_leaf(ctx, block, leaf_ty, slot_ptr, (String::new(), 0), &mut previous);
+    }
+    if native_shape_field_keyword(ctx, leaf_ty).is_some() {
+        store_native_shape_field(ctx, block, env, leaf_ty, slot_ptr, value_arg);
+    } else {
+        let value_val = lower_cval(ctx.context, block, env, value_arg, ty_to_mlir(ctx, leaf_ty));
+        block.append_operation(llvm::store(
+            ctx.context,
+            value_val,
+            slot_ptr,
+            gen_loc(ctx.context),
+            LoadStoreOptions::new(),
+        ));
+    }
+    release_pending(ctx, block, previous);
+}
+
+/// Releases what `push_cascade_leaf` queued out of a slot: a tensor's
+/// buffer, or a struct with its own cascade. The slot may be empty (all
+/// zero), which both tolerate.
+fn release_pending<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, pending: Vec<PendingChild<'c>>) {
+    for child in pending {
+        match child {
+            PendingChild::Tensor(child_ptr) => {
+                emit_cleave_release(ctx, block, &Ty::Con("__cleave_opaque_ptr".to_string()), child_ptr);
+            }
+            PendingChild::Struct(child_ty, child_val, _) => {
+                lower_release_cascade(ctx, block, &child_ty, child_val);
             }
         }
     }
@@ -3582,6 +3631,31 @@ fn lower_struct_construct<'c>(
         );
     }
     let ptr = alloc_llvm_value(ctx, block, struct_llvm_ty, Some(var));
+    // A literal omitting fields (an enum's inactive variants, `enums.rs`):
+    // they're all zero.
+    if field_names.len() < field_types.len() {
+        let location = gen_loc(ctx.context);
+        let size = llvm_type_size_bytes(ctx, block, struct_llvm_ty);
+        let zero_byte = block
+            .append_operation(arith::constant(
+                ctx.context,
+                IntegerAttribute::new(IntegerType::new(ctx.context, 8).into(), 0).into(),
+                location,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        block.append_operation(
+            OperationBuilder::new("llvm.intr.memset", location)
+                .add_operands(&[ptr, zero_byte, size])
+                .add_attributes(&[(
+                    Identifier::new(ctx.context, "isVolatile"),
+                    IntegerAttribute::new(IntegerType::new(ctx.context, 1).into(), 0).into(),
+                )])
+                .build()
+                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build llvm.intr.memset: {e}")),
+        );
+    }
     for (field_name, arg) in field_names.iter().zip(args) {
         let position = field_types
             .iter()
@@ -3619,11 +3693,14 @@ fn lower_light_struct_construct<'c>(
 ) -> Value<'c, 'c> {
     let context = ctx.context;
     let location = gen_loc(context);
-    let mut agg: Value = block
-        .append_operation(llvm::undef(struct_llvm_ty, location))
-        .result(0)
-        .unwrap()
-        .into();
+    // A literal omitting fields (an enum's inactive variants, `enums.rs`)
+    // starts from all zero.
+    let initial = if field_names.len() < field_types.len() {
+        llvm::zero(struct_llvm_ty, location)
+    } else {
+        llvm::undef(struct_llvm_ty, location)
+    };
+    let mut agg: Value = block.append_operation(initial).result(0).unwrap().into();
     for (field_name, arg) in field_names.iter().zip(args) {
         let position = field_types
             .iter()
@@ -4969,9 +5046,8 @@ fn push_cascade_leaf<'c>(
         // struct type" — a real, found-by-code-inspection gap, the same
         // class of bug `is_refcounted`'s own third exclusion already
         // fixed once at the top level: a struct type declared but never
-        // constructed anywhere (`stdlib/dynarray/dynarray.cleave`'s own
-        // `RawBuf`, `DynArray<T>`'s own `buf` field) has no real
-        // `cleave_alloc_rc`'d `RcHeader` in front of it at all —
+        // constructed anywhere (a foreign handle an `extern fn` returns) has
+        // no real `cleave_alloc_rc`'d `RcHeader` in front of it at all —
         // recursing into it here would call `cleave_release` on
         // whatever raw, non-headered pointer an `extern fn` actually
         // returned, reading/decrementing garbage bytes immediately
@@ -4979,9 +5055,8 @@ fn push_cascade_leaf<'c>(
         // identical corruption, confirmed there to be genuinely
         // non-deterministic — roughly a third of the time a visible
         // panic, the rest silent). The old, cruder check (`ctx.struct_
-        // schemas.contains_key(...)` alone) would have matched `RawBuf`
-        // every time a `DynArray<T>`-embedding struct's own release
-        // cascaded into it.
+        // schemas.contains_key(...)` alone) matched such a handle field
+        // every time its container's release cascaded into it.
         let child_ty = ty_to_mlir(ctx, leaf_ty);
         let child_val: Value = block
             .append_operation(llvm::load(
@@ -5124,7 +5199,72 @@ fn push_cascade_array_elements<'c>(
     }
 }
 
+/// Releases `ptr`, a refcounted value of type `struct_ty`, cascading into
+/// what it holds once freed. A cascade reads the object before releasing it
+/// (what it holds, which the release may free), so a null `ptr` (an empty
+/// slot, an enum's inactive variant: `enums.rs`) skips it; a plain release
+/// tolerates null by itself (`cleave_release`).
 fn lower_release_cascade<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    struct_ty: &Ty,
+    ptr: Value<'c, 'c>,
+) {
+    let reads_first = is_handle_array(ctx, struct_ty)
+        || crate::refcount::buffer_element(struct_ty, &ctx.mlir_types).is_some()
+        || {
+            let (name, type_args) = struct_name_and_args(struct_ty);
+            struct_field_types(&ctx.struct_schemas, name, type_args)
+                .iter()
+                .any(|(_, field_ty)| ty_needs_cascade(ctx, field_ty))
+        };
+    if !reads_first {
+        lower_release_cascade_non_null(ctx, block, struct_ty, ptr);
+        return;
+    }
+    let context = ctx.context;
+    let location = gen_loc(context);
+    let not_null = emit_not_null(ctx, block, ptr);
+    let then_block = Block::new(&[]);
+    lower_release_cascade_non_null(ctx, &then_block, struct_ty, ptr);
+    then_block.append_operation(scf::r#yield(&[], location));
+    let then_region = Region::new();
+    then_region.append_block(then_block);
+    let else_block = Block::new(&[]);
+    else_block.append_operation(scf::r#yield(&[], location));
+    let else_region = Region::new();
+    else_region.append_block(else_block);
+    block.append_operation(scf::r#if(not_null, &[], then_region, else_region, location));
+}
+
+/// `ptr != null`.
+fn emit_not_null<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, ptr: Value<'c, 'c>) -> Value<'c, 'c> {
+    let context = ctx.context;
+    let location = gen_loc(context);
+    let null: Value = block
+        .append_operation(llvm::zero(llvm::r#type::pointer(context, 0), location))
+        .result(0)
+        .unwrap()
+        .into();
+    block
+        .append_operation(
+            OperationBuilder::new("llvm.icmp", location)
+                .add_operands(&[ptr, null])
+                .add_attributes(&[(
+                    Identifier::new(context, "predicate"),
+                    // `ne` (`LLVM::ICmpPredicate`).
+                    IntegerAttribute::new(IntegerType::new(context, 64).into(), 1).into(),
+                )])
+                .add_results(&[IntegerType::new(context, 1).into()])
+                .build()
+                .unwrap_or_else(|e| panic!("MLIR lowering: failed to build llvm.icmp: {e}")),
+        )
+        .result(0)
+        .unwrap()
+        .into()
+}
+
+fn lower_release_cascade_non_null<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
     struct_ty: &Ty,
@@ -5132,6 +5272,10 @@ fn lower_release_cascade<'c>(
 ) {
     if is_handle_array(ctx, struct_ty) {
         lower_array_release_cascade(ctx, block, struct_ty, ptr);
+        return;
+    }
+    if let Some(elem_ty) = crate::refcount::buffer_element(struct_ty, &ctx.mlir_types) {
+        lower_buffer_release(ctx, block, struct_ty, elem_ty, ptr);
         return;
     }
     let (name, type_args) = struct_name_and_args(struct_ty);
@@ -5199,6 +5343,153 @@ fn lower_release_cascade<'c>(
     let else_region = Region::new();
     else_region.append_block(else_block);
 
+    block.append_operation(scf::r#if(freed, &[], then_region, else_region, location));
+}
+
+/// `args = [cap]`: a `Buffer<T>` (`ty`) of `cap` empty slots
+/// (`cleave_buffer_alloc`), each laid out as an array object's slot is.
+fn lower_buffer_alloc<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    ty: &Ty,
+    args: &[CVal],
+) -> Value<'c, 'c> {
+    let elem_ty = crate::refcount::buffer_element(ty, &ctx.mlir_types)
+        .unwrap_or_else(|| panic!("MLIR lowering: a buffer allocation of a non-buffer type `{ty}`"));
+    let cap = lower_cval(ctx.context, block, env, &args[0], width_ty(ctx, "i32"));
+    let slot_bytes = llvm_type_size_bytes(ctx, block, ty_to_llvm_field_type(ctx, elem_ty));
+    let ptr_ty = llvm::r#type::pointer(ctx.context, 0);
+    ensure_extern_declared(
+        ctx,
+        "cleave_buffer_alloc",
+        &[Ty::Con("i32".to_string()), Ty::Con("i64".to_string())],
+        &[ptr_ty],
+    );
+    block
+        .append_operation(func::call(
+            ctx.context,
+            FlatSymbolRefAttribute::new(ctx.context, "cleave_buffer_alloc"),
+            &[cap, slot_bytes],
+            &[ptr_ty],
+            gen_loc(ctx.context),
+        ))
+        .result(0)
+        .unwrap()
+        .into()
+}
+
+/// `args = [buffer, index]`: the slot's element (of type `elem_ty`), read as `load_slot` does,
+/// then the slot zeroed (empty): its reference moves to the result.
+fn lower_buffer_take<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    env: &HashMap<CVar, Value<'c, 'c>>,
+    elem_ty: &Ty,
+    args: &[CVal],
+) -> Value<'c, 'c> {
+    let CVal::Var(buffer_var) = &args[0] else {
+        panic!("MLIR lowering: `buffer_take`'s buffer must be a variable");
+    };
+    let buffer = env[buffer_var];
+    let slot_ptr = buffer_slot_ptr(ctx, block, env, buffer, elem_ty, &args[1]);
+    let element = load_slot(ctx, block, elem_ty, slot_ptr);
+    let location = gen_loc(ctx.context);
+    let size = llvm_type_size_bytes(ctx, block, ty_to_llvm_field_type(ctx, elem_ty));
+    let zero_byte = block
+        .append_operation(arith::constant(
+            ctx.context,
+            IntegerAttribute::new(IntegerType::new(ctx.context, 8).into(), 0).into(),
+            location,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    block.append_operation(
+        OperationBuilder::new("llvm.intr.memset", location)
+            .add_operands(&[slot_ptr, zero_byte, size])
+            .add_attributes(&[(
+                Identifier::new(ctx.context, "isVolatile"),
+                IntegerAttribute::new(IntegerType::new(ctx.context, 1).into(), 0).into(),
+            )])
+            .build()
+            .unwrap_or_else(|e| panic!("MLIR lowering: failed to build llvm.intr.memset: {e}")),
+    );
+    element
+}
+
+/// A buffer released: its count dropped, and if this release freed it, the
+/// element of every non-empty slot released (`push_cascade_leaf`, as an
+/// array object's, in a loop over the capacity: an empty slot is all zero,
+/// which releases nothing), then the slots freed. The slots' address and
+/// count are read before the release frees the object holding them.
+fn lower_buffer_release<'c>(
+    ctx: &LowerCtx<'c, '_>,
+    block: &Block<'c>,
+    buffer_ty: &Ty,
+    elem_ty: &Ty,
+    ptr: Value<'c, 'c>,
+) {
+    let context = ctx.context;
+    let location = gen_loc(context);
+    let ptr_ty = llvm::r#type::pointer(context, 0);
+    let i32_ty: Type = IntegerType::new(context, 32).into();
+    let data = load_buffer_field(ctx, block, ptr, 0, ptr_ty);
+    let cap = load_buffer_field(ctx, block, ptr, 1, i32_ty);
+    let freed = emit_cleave_release(ctx, block, buffer_ty, ptr);
+
+    let then_block = Block::new(&[]);
+    let slot_ty = ty_to_llvm_field_type(ctx, elem_ty);
+    if ty_needs_cascade(ctx, elem_ty) {
+        let index_ty = Type::index(context);
+        let body = Block::new(&[(index_ty, location)]);
+        let i: Value = body.argument(0).unwrap().into();
+        let i32_index: Value = body
+            .append_operation(arith::index_cast(i, i32_ty, location))
+            .result(0)
+            .unwrap()
+            .into();
+        let slot_ptr = gep_dynamic(ctx, &body, data, &[i32_index], slot_ty);
+        let mut pending: Vec<PendingChild<'c>> = Vec::new();
+        push_cascade_leaf(ctx, &body, elem_ty, slot_ptr, (String::new(), 0), &mut pending);
+        release_pending(ctx, &body, pending);
+        body.append_operation(scf::r#yield(&[], location));
+        let body_region = Region::new();
+        body_region.append_block(body);
+        let zero = then_block
+            .append_operation(arith::constant(context, IntegerAttribute::new(index_ty, 0).into(), location))
+            .result(0)
+            .unwrap()
+            .into();
+        let one = then_block
+            .append_operation(arith::constant(context, IntegerAttribute::new(index_ty, 1).into(), location))
+            .result(0)
+            .unwrap()
+            .into();
+        let upper = to_index(ctx, &then_block, cap);
+        then_block.append_operation(scf::r#for(zero, upper, one, body_region, location));
+    }
+    let slot_bytes = llvm_type_size_bytes(ctx, &then_block, slot_ty);
+    ensure_extern_declared(
+        ctx,
+        "cleave_buffer_free_data",
+        &[Ty::Con("__cleave_opaque_ptr".to_string()), Ty::Con("i32".to_string()), Ty::Con("i64".to_string())],
+        &[],
+    );
+    then_block.append_operation(func::call(
+        context,
+        FlatSymbolRefAttribute::new(context, "cleave_buffer_free_data"),
+        &[data, cap, slot_bytes],
+        &[],
+        location,
+    ));
+    then_block.append_operation(scf::r#yield(&[], location));
+    let then_region = Region::new();
+    then_region.append_block(then_block);
+    let else_block = Block::new(&[]);
+    else_block.append_operation(scf::r#yield(&[], location));
+    let else_region = Region::new();
+    else_region.append_block(else_block);
     block.append_operation(scf::r#if(freed, &[], then_region, else_region, location));
 }
 

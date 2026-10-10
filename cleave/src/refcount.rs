@@ -109,33 +109,18 @@ const GLUE_MIN_LEAVES: usize = 4;
 /// on. A primitive/array/unit type is excluded structurally (neither
 /// `Ty::Con` nor `Ty::App` naming a declared struct).
 ///
-/// **A third exclusion, found by direct testing against a real, intermittent
-/// memory-corruption bug, not assumed**: `name` must also have at least one
-/// real `PrimOp::Struct` construction site somewhere in the *whole compiled
-/// program* (`constructed`, below) — `stdlib/dynarray/dynarray.cleave`'s own
-/// `RawBuf {}` (an ordinary, untagged, zero-field struct declaration, so the
-/// first two checks alone don't exclude it) is the motivating case: its own
-/// doc comment is explicit that it's "never constructed via `RawBuf(...)`
-/// anywhere in this module, only ever produced/consumed by the `RawBuffer<T>`
-/// impls below" — every real value of this type comes from an `extern fn`
-/// return (`dynarray_alloc_ptr`/`dynarray_alloc_i32`/...), a plain
-/// `realloc`-backed pointer from `cleave-rt`'s own internal allocator, with
-/// *no* `RcHeader` in front of it at all. Before this exclusion, `is_
-/// refcounted` was purely type-based, blind to *origin* — a `RawBuf`-typed
-/// field (`DynArray.buf`) still got ordinary `Retain`/`Release` calls
-/// inserted around it, each one reading/writing an `RcHeader` that was never
-/// really there, off whatever bytes happened to sit just before that
-/// pointer — real, silent, non-deterministic corruption (confirmed directly:
-/// `cleave_release`'s own `Layout::from_size_align` panicking with
-/// `LayoutError` roughly a third of the time, on a minimal `let h: DynArray<
-/// i32> = dynarray_new(4);` alone, no `Point`/no `HeapStruct` involved at
-/// all — varying run to run because the garbage byte pattern in the memory
-/// immediately preceding a fresh allocation is itself unspecified). Every
-/// *genuinely* refcounted struct in this codebase (`DynArray` itself
-/// included) has a real construction site somewhere reachable — this
-/// exclusion only ever fires for the `RawBuf`-shaped "opaque FFI handle,
-/// produced solely by `extern fn`s" idiom, structurally, with no hardcoded
-/// name anywhere.
+/// **A third exclusion**: `name` must also have at least one real
+/// `PrimOp::Struct` construction site somewhere in the *whole compiled
+/// program* (`constructed`, below). A struct declared but never constructed,
+/// whose values only an `extern fn` returns (an opaque foreign handle: a
+/// pointer from the native side, with no `RcHeader` in front of it), is
+/// never retained or released: doing so read and wrote a header that wasn't
+/// there, off whatever bytes sat before the pointer (`cleave_release`
+/// panicking with `LayoutError` a third of the time, `DynArray`'s former
+/// `realloc`-backed buffer handle). A `Buffer<T>` is the one refcounted
+/// object built without a construction (`PrimOp::BufferAlloc`), recognized
+/// by its tag first.
+///
 /// Whether `ty` is itself a bare `#[mlir_type(tensor)]`-tagged type (like
 /// `Tensor<T, Dims...>`) — deliberately *not* covered by `is_refcounted`
 /// (its own doc comment excludes it on purpose, matching `mlir_lower.rs::
@@ -166,7 +151,7 @@ pub(crate) fn is_refcounted(
     field_mutated: &HashSet<String>,
     extern_boundary: &HashSet<String>,
 ) -> bool {
-    if is_handle_array(ty, struct_schemas, mlir_types) {
+    if is_handle_array(ty, struct_schemas, mlir_types) || buffer_element(ty, mlir_types).is_some() {
         return true;
     }
     let (name, type_args): (&String, &[Ty]) = match ty {
@@ -185,7 +170,7 @@ pub(crate) fn is_refcounted(
         // entry): a "light" struct is a bare `!llvm.struct<(...)>` SSA
         // value, never a `cleave_alloc_rc`-backed pointer -- no refcount
         // header exists for any `Retain`/`Release` call to act on, same
-        // reasoning `RawBuf`'s own exclusion above already establishes for
+        // reasoning the foreign-handle exclusion above already establishes for
         // a different reason (no construction site vs. no heap identity at
         // all).
         && !crate::mlir_lower::is_light_struct(
@@ -197,6 +182,17 @@ pub(crate) fn is_refcounted(
             extern_boundary,
             constructed,
         )
+}
+
+/// `T` for a `Buffer<T>` (`stdlib/buffer`, tagged `#[mlir_type(buffer)]`):
+/// a refcounted object of its own, built by `PrimOp::BufferAlloc` rather than
+/// a construction, releasing its slots' elements when it is freed
+/// (`mlir_lower.rs::lower_buffer_release`).
+pub(crate) fn buffer_element<'t>(ty: &'t Ty, mlir_types: &HashMap<String, String>) -> Option<&'t Ty> {
+    match ty {
+        Ty::App(name, args) if mlir_types.get(name).map(String::as_str) == Some("buffer") => args.first(),
+        _ => None,
+    }
 }
 
 /// An array of structs, `[S; N]` (`doc/plan-struct-arrays.md`): a heap
@@ -231,7 +227,7 @@ pub(crate) fn is_handle_array(
 /// Every struct name with at least one real `PrimOp::Struct` construction
 /// site anywhere in `program` — see `is_refcounted`'s own doc comment for
 /// why this matters: a struct type with *no* real construction site at all
-/// is only ever produced by an `extern fn` (the `RawBuf`-shaped "opaque FFI
+/// is only ever produced by an `extern fn` (an opaque foreign handle, the "opaque FFI
 /// handle" idiom), never by `cleave_alloc_rc`, so it must never be retained/
 /// released. Walks every top-level function's own body, recursively through
 /// every nested `Fix`/`If` — mirrors `region_analysis.rs`'s own established
@@ -341,11 +337,10 @@ fn collect_field_mutated_in(expr: &CExpr, names: &mut HashSet<String>) {
 /// (...)>` SSA value would silently change that extern call's own declared
 /// MLIR signature out from under the real native function on the other
 /// side, which still only ever takes/returns a plain pointer. A generic
-/// algebra impl backed by an extern (`RawBuffer<S: HeapStruct>`'s own
-/// `_ptr`-suffixed impl, `dynarray.cleave`) is exactly this shape once
+/// algebra impl backed by an extern is exactly this shape once
 /// monomorphized to a concrete struct `S` — found by direct testing (a real
-/// `'func.call' op operand type mismatch` MLIR verification failure on
-/// `DynArray<Point>`, not a hypothetical concern). Not transitive, same
+/// `'func.call' op operand type mismatch` MLIR verification failure). Not
+/// transitive, same
 /// reasoning as `collect_field_mutated_struct_names`'s own doc comment —
 /// only the struct actually named at the boundary itself is excluded, not
 /// everything that references it.
@@ -494,8 +489,59 @@ impl TensorViews {
         let mut loop_args = HashSet::default();
         collect_loop_args(&top.def.body, &loop_names(&top.def.body), &mut loop_args);
         views.collect_containers(&top.def.body, &loop_args, var_types, mlir_types);
+        let mut scope: HashSet<CVar> = top.def.params.iter().copied().collect();
+        let mut def_scopes: HashMap<String, HashSet<CVar>> = HashMap::default();
+        views.adopt_out_of_scope(&top.def.body, &mut scope, &mut def_scopes);
         views.collect_handed(&top.def.body);
         views
+    }
+
+    /// A view passed to a local def (a join) whose container isn't in scope
+    /// where the def is defined can't hand it its container: `if c { let x
+    /// = make(); x.t } else { m }` (an enum's `Some(x) => x.t`) bound `x`
+    /// in a branch, out of the join's reach, which then released it anyway.
+    /// Such a view is adopted instead (`standalone`), as one passed to a
+    /// loop is. `def_scopes`: the variables in scope where each local def
+    /// is defined.
+    fn adopt_out_of_scope(
+        &mut self,
+        e: &CExpr,
+        scope: &mut HashSet<CVar>,
+        def_scopes: &mut HashMap<String, HashSet<CVar>>,
+    ) {
+        match e {
+            CExpr::LetPrim { var, cont, .. } => {
+                scope.insert(*var);
+                self.adopt_out_of_scope(cont, scope, def_scopes);
+            }
+            CExpr::App { func: CVal::Label(name), args } => {
+                let Some(visible) = def_scopes.get(name) else { return };
+                for arg in args {
+                    if let CVal::Var(v) = arg
+                        && self.containers(*v).iter().any(|c| !visible.contains(c))
+                    {
+                        self.container.remove(v);
+                        self.standalone.insert(*v);
+                    }
+                }
+            }
+            CExpr::App { .. } => {}
+            CExpr::If { then_branch, else_branch, .. } => {
+                self.adopt_out_of_scope(then_branch, &mut scope.clone(), def_scopes);
+                self.adopt_out_of_scope(else_branch, &mut scope.clone(), def_scopes);
+            }
+            CExpr::Fix { defs, body } => {
+                for d in defs {
+                    def_scopes.insert(d.name.clone(), scope.clone());
+                }
+                for d in defs {
+                    let mut inner = scope.clone();
+                    inner.extend(d.params.iter().copied());
+                    self.adopt_out_of_scope(&d.body, &mut inner, def_scopes);
+                }
+                self.adopt_out_of_scope(body, scope, def_scopes);
+            }
+        }
     }
 
     /// `loop_args`: every variable passed straight to a loop (`standalone`).
@@ -788,7 +834,8 @@ fn walk_var_info(
         } => {
             var_types.insert(*var, ty.clone());
             let is_owned = match op {
-                PrimOp::Struct(..) => true,
+                // A buffer built here, as a struct is.
+                PrimOp::Struct(..) | PrimOp::BufferAlloc | PrimOp::BufferTake => true,
                 // An array of structs built here (`is_handle_array`): a
                 // refcounted object of its own, owned like a struct built
                 // here (released, its elements with it, by the cascade), and
@@ -1118,6 +1165,11 @@ fn walk_local_claim_vars(
 enum ValueDef {
     Field(CVar, String),
     StructCtor(HashMap<String, CVar>),
+    /// An element read out of a container (`Load`: an array's slot, a
+    /// buffer's): part of the container, as a field is of its struct. The
+    /// string names the slot (its indices), so two reads of the same slot
+    /// resolve alike and reads of different ones don't.
+    Element(CVar, String),
 }
 
 /// Every `CVar` this function's own body defines via `Field`/`Struct`,
@@ -1140,6 +1192,11 @@ fn walk_value_defs(expr: &CExpr, defs: &mut HashMap<CVar, ValueDef>) {
                 PrimOp::Field { field, .. } => {
                     if let [CVal::Var(base)] = args.as_slice() {
                         defs.insert(*var, ValueDef::Field(*base, field.clone()));
+                    }
+                }
+                PrimOp::Load { .. } => {
+                    if let [CVal::Var(base), indices @ ..] = args.as_slice() {
+                        defs.insert(*var, ValueDef::Element(*base, format!("{indices:?}")));
                     }
                 }
                 PrimOp::Struct(_name, field_names) => {
@@ -1224,6 +1281,15 @@ fn resolve<'a>(v: CVar, params: &HashSet<CVar>, defs: &'a HashMap<CVar, ValueDef
                 Resolved::Param(p, path)
             }
             Resolved::Opaque => Resolved::Opaque,
+        },
+        // An element of a parameter's container is that parameter's, as its
+        // field is; one of a local container is a value of its own.
+        Some(ValueDef::Element(base, slot)) => match resolve(*base, params, defs) {
+            Resolved::Param(p, mut path) => {
+                path.push(slot.clone());
+                Resolved::Param(p, path)
+            }
+            Resolved::Struct(_) | Resolved::Opaque => Resolved::Opaque,
         },
         None => Resolved::Opaque,
     }
@@ -1324,12 +1390,24 @@ fn param_leaf_key(
     }
 }
 
+/// `param_leaf_key`, except for a bare tensor parameter itself (an empty
+/// path): written into a struct's field, a tensor parameter is copied
+/// (`mlir_lower.rs::build_tensor_descriptor_value` materializes a value with
+/// no producer in the function into fresh storage), so the leaf is that
+/// copy, this function's own to release, not the caller's tensor. A field
+/// read out of a parameter (`state.w`) is a view of it, never copied.
+fn skippable_param_leaf(ctx: &RefcountCtx, var: CVar, steps: &[(Ty, String)]) -> Option<(CVar, Vec<String>)> {
+    let (param, path) = param_leaf_key(var, steps, ctx.params, ctx.value_defs)?;
+    let copied = path.is_empty() && ctx.var_types.get(&param).is_some_and(|ty| is_bare_tensor_ty(ty, ctx.mlir_types));
+    (!copied).then_some((param, path))
+}
+
 struct RefcountCtx<'a> {
     struct_schemas: &'a HashMap<String, crate::cps::StructSchema>,
     mlir_types: &'a HashMap<String, String>,
     /// See `is_refcounted`'s own doc comment for why this exists — a struct
-    /// name absent here is only ever produced by an `extern fn` (`RawBuf`'s
-    /// own "opaque FFI handle" idiom), never by `cleave_alloc_rc`, so it
+    /// name absent here is only ever produced by an `extern fn` (an opaque
+    /// foreign handle), never by `cleave_alloc_rc`, so it
     /// must never be retained/released.
     constructed_structs: &'a HashSet<String>,
     /// See `is_refcounted`'s own doc comment — passed through to `is_light_
@@ -1731,10 +1809,16 @@ fn rewrite_body(
             // heavy case, a `PrimOp::Field` chain ending in `Release` for
             // each leaf otherwise).
             let empty_array = matches!(&op, PrimOp::RawMlirOp { op, .. } if op == "memref.alloc");
-            if (matches!(&op, PrimOp::Struct(..) | PrimOp::Array | PrimOp::ArrayRepeat | PrimOp::Extern { .. })
+            // A tensor taken out of a buffer's slot: no slot holds it any
+            // more, so this scope releases it.
+            let taken_tensor = matches!(&op, PrimOp::BufferTake) && is_bare_tensor_ty(&ty, ctx.mlir_types);
+            if (matches!(
+                &op,
+                PrimOp::Struct(..) | PrimOp::Array | PrimOp::ArrayRepeat | PrimOp::Extern { .. } | PrimOp::BufferAlloc | PrimOp::BufferTake
+            )
                 || empty_array
                 || field_read_owned)
-                && (ctx.is_rc(&ty) || !ctx.light_release_leaves(&ty).is_empty())
+                && (ctx.is_rc(&ty) || taken_tensor || !ctx.light_release_leaves(&ty).is_empty())
             {
                 owned.push((var, ty.clone()));
             }
@@ -1791,7 +1875,7 @@ fn rewrite_body(
                 },
                 // Arguments lent to the callee, as to a call.
                 PrimOp::Extern { .. } | PrimOp::Spawn { .. } | PrimOp::RawMlirOp { .. } => Vec::new(),
-                PrimOp::Field { .. } | PrimOp::Load { .. } => Vec::new(),
+                PrimOp::Field { .. } | PrimOp::Load { .. } | PrimOp::BufferAlloc | PrimOp::BufferTake => Vec::new(),
                 PrimOp::Retain(_)
                 | PrimOp::Release(_)
                 | PrimOp::LeafGlue { .. }
@@ -2500,9 +2584,20 @@ fn returned_param_args(func: &CVal, args: &[CVal], k_ret: CVar, ctx: &RefcountCt
     returned_positions(func, args.len(), k_ret, ctx.returned_join_params)
         .into_iter()
         .filter_map(|pos| match &args[pos] {
-            CVal::Var(x) if matches!(resolve(*x, ctx.params, ctx.value_defs), Resolved::Param(p, _) if p != k_ret) => {
-                ctx.var_types.get(x).map(|ty| (*x, ty.clone()))
-            }
+            CVal::Var(x) => match resolve(*x, ctx.params, ctx.value_defs) {
+                Resolved::Param(p, path) if p != k_ret => {
+                    let ty = ctx.var_types.get(x)?;
+                    // A bare tensor read out of a parameter (a field, a
+                    // slot: `Full(t) => t`) is returned without a reference
+                    // of its own: its caller receives a returned tensor
+                    // through an out-parameter, a copy
+                    // (`buffer-results-to-out-params`), so a reference taken
+                    // here was never released (one tensor per call).
+                    let part_of_param = !path.is_empty();
+                    (!(part_of_param && is_bare_tensor_ty(ty, ctx.mlir_types))).then(|| (*x, ty.clone()))
+                }
+                _ => None,
+            },
             _ => None,
         })
         .collect()
@@ -2580,7 +2675,7 @@ fn wrap_releases(to_release: Vec<(CVar, Ty)>, inner: CExpr, ctx: &RefcountCtx, a
         // light branch and get *zero* releases emitted for it at all.
         if ctx.is_rc(&ty) || is_bare_tensor_ty(&ty, ctx.mlir_types) {
             if at_true_return {
-                if let Some(key) = param_leaf_key(var, &[], ctx.params, ctx.value_defs) {
+                if let Some(key) = skippable_param_leaf(ctx, var, &[]) {
                     // First redundant occurrence of this exact param-
                     // traced value: skip it, matching the one still-
                     // outstanding compensating retain (`param_leaf_key`'s
@@ -2604,7 +2699,7 @@ fn wrap_releases(to_release: Vec<(CVar, Ty)>, inner: CExpr, ctx: &RefcountCtx, a
             let all = leaves.len();
             if at_true_return {
                 leaves.retain(|leaf| {
-                    match param_leaf_key(var, &leaf.steps, ctx.params, ctx.value_defs) {
+                    match skippable_param_leaf(ctx, var, &leaf.steps) {
                         Some(key) => !skip_once.insert(key),
                         None => true,
                     }

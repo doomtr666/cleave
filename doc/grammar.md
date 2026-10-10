@@ -44,6 +44,24 @@ No special syntax — `main` is an ordinary function, recognized by name convent
 
 **Returns `i32` directly as an explicit exit code** (C-style), not `Result<(), E>` + a `Termination` trait (Rust's approach). This sidesteps needing sum types (`Result`/`Option`, enums-with-data) to be designed at all for `main` to work — deliberately deferred, not decided here. Command-line arguments, if needed, come from a standard-library function (`env::args()` or equivalent), not a `main` parameter — keeps the entry-point signature minimal.
 
+## Enums and `match`
+
+```
+enum Option<T> { None, Some(T) }      // in the prelude (`stdlib/core`)
+enum Hit { Miss, Point(f64, f64) }
+
+let h = Point(1.0, 2.0);               // a variant is a generic constructor; `Hit::Point` too
+match h {
+    Point(x, _) => x,                  // data bound positionally, `_` ignores one
+    Miss => 0.0,                       // or `_ => ..` for every other variant
+}
+```
+
+A `match` is an expression; it must cover every variant (or have a `_` arm), else an error names the
+missing ones. Variant names are unique across a program. No nested patterns or guards yet. Lowered to a
+struct (a tag, then every variant's data, inactive ones zero) and `if`s on the tag right after the crates
+merge (`cleave/src/enums.rs`, `doc/plan-sum-types.md`).
+
 ## The grammar is a funnel: parses more than the pipeline processes yet
 
 `cleave/src/grammar.pest` can be wider than what the rest of the compiler (AST lowering, type inference, the e-graph) actually handles at any given point — a construct parsing successfully doesn't mean it's wired into semantic processing yet. `while`/`for` are a good example of how this actually plays out over time: they parsed (`while_expr`, `for_expr`) long before they had any real type inference behind them, and now they do (see `type_inference.md`, "Control flow gets real inference") — but they still aren't connected to CPS conversion/the e-graph, which is a separate, later stage (see `hld.md`). Parsing, type-checking, and lowering are three genuinely different milestones for any one construct, and this file tracks the first one; don't assume the other two follow automatically just because a construct is documented here.

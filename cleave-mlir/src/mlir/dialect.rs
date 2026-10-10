@@ -156,6 +156,22 @@ pub mod scf {
     pub fn r#yield<'c>(values: &[Value<'c, '_>], location: Location<'c>) -> Operation<'c> {
         OperationBuilder::new("scf.yield", location).add_operands(values).build().expect("valid operation")
     }
+
+    /// `scf.for` without loop-carried values: `region`'s block takes the
+    /// induction variable and ends with `scf.yield`.
+    pub fn r#for<'c>(
+        lower_bound: Value<'c, '_>,
+        upper_bound: Value<'c, '_>,
+        step: Value<'c, '_>,
+        region: Region<'c>,
+        location: Location<'c>,
+    ) -> Operation<'c> {
+        OperationBuilder::new("scf.for", location)
+            .add_operands(&[lower_bound, upper_bound, step])
+            .add_regions([region])
+            .build()
+            .expect("valid operation")
+    }
 }
 
 pub mod memref {

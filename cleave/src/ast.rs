@@ -37,6 +37,9 @@ pub enum ItemKind {
     Const(ConstDecl),
     Define(DefineDecl),
     Struct(StructDecl),
+    /// Lowered to a `Struct` and constructor `Fn`s once the crates are merged
+    /// (`driver::desugar_enums`): no pass after that sees one.
+    Enum(EnumDecl),
     Algebra(AlgebraDecl),
     Impl(ImplDecl),
     Fn(FnDecl),
@@ -74,6 +77,41 @@ pub struct StructDecl {
     pub name: String,
     pub generics: Vec<GenericParam>,
     pub fields: Vec<Field>,
+    /// A literal may omit fields, left all zero: an enum's struct
+    /// (`driver::desugar_enums`), whose inactive variants' fields are zero.
+    pub zero_fill: bool,
+}
+
+/// `enum Name<..> { V, W(T, U) }` (`doc/plan-sum-types.md`).
+#[derive(Debug, Clone)]
+pub struct EnumDecl {
+    pub name: String,
+    pub generics: Vec<GenericParam>,
+    pub variants: Vec<Variant>,
+}
+
+/// One variant of an `EnumDecl`, its data positional.
+#[derive(Debug, Clone)]
+pub struct Variant {
+    pub name: String,
+    pub fields: Vec<Type>,
+}
+
+/// One arm of a `match`.
+#[derive(Debug, Clone)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub body: Expr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum Pattern {
+    /// `_`: any value.
+    Wildcard,
+    /// `Some(x, _)`, `Option::None`: the variant `path` names, its data bound
+    /// to `bindings` in order (`_` binds nothing).
+    Variant { path: Path, bindings: Vec<String> },
 }
 
 #[derive(Debug, Clone)]
@@ -609,6 +647,13 @@ pub enum ExprKind {
         then_branch: Block,
         else_branch: Option<Box<ElseBranch>>,
     },
+    /// `match scrutinee { arms }`, lowered to `if`s on the enum's tag once the
+    /// crates are merged (`driver::desugar_enums`): no pass after that sees
+    /// one.
+    Match {
+        scrutinee: Box<Expr>,
+        arms: Vec<MatchArm>,
+    },
     /// Parses (the grammar is a funnel — see `grammar.pest`) but not yet wired
     /// into CPS conversion/the e-graph; kept here so the AST can represent what
     /// the parser accepts, without implying semantic support exists yet.
@@ -751,6 +796,10 @@ pub fn for_each_expr(expr: &Expr, f: &mut impl FnMut(&Expr)) {
             for_each_expr(count, f);
         }
         ExprKind::StructLit(_, _, fields) => fields.iter().for_each(|(_, e)| for_each_expr(e, f)),
+        ExprKind::Match { scrutinee, arms } => {
+            for_each_expr(scrutinee, f);
+            arms.iter().for_each(|arm| for_each_expr(&arm.body, f));
+        }
         ExprKind::If { cond, then_branch, else_branch } => {
             for_each_expr(cond, f);
             for_each_expr_in_block(then_branch, f);
@@ -775,6 +824,83 @@ pub fn for_each_expr(expr: &Expr, f: &mut impl FnMut(&Expr)) {
         }
         ExprKind::Loop { body } | ExprKind::Block(body) | ExprKind::Lambda { body, .. } => {
             for_each_expr_in_block(body, f)
+        }
+    }
+}
+
+/// `for_each_expr_in_block`, mutating: `f` may rewrite an expression, whose
+/// children (the rewritten ones) are visited after it.
+pub fn for_each_expr_in_block_mut(block: &mut Block, f: &mut impl FnMut(&mut Expr)) {
+    for stmt in &mut block.stmts {
+        match &mut stmt.kind {
+            StmtKind::Let { value, .. } => for_each_expr_mut(value, f),
+            StmtKind::Assign { target, value } => {
+                for_each_expr_mut(target, f);
+                for_each_expr_mut(value, f);
+            }
+            StmtKind::Expr(e) => for_each_expr_mut(e, f),
+            StmtKind::Break(e) => {
+                if let Some(e) = e {
+                    for_each_expr_mut(e, f);
+                }
+            }
+            StmtKind::Sync => {}
+        }
+    }
+    if let Some(tail) = &mut block.tail {
+        for_each_expr_mut(tail, f);
+    }
+}
+
+/// `for_each_expr`, mutating (`for_each_expr_in_block_mut`).
+pub fn for_each_expr_mut(expr: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
+    f(expr);
+    match &mut expr.kind {
+        ExprKind::NumberLit { .. }
+        | ExprKind::ImaginaryLit { .. }
+        | ExprKind::BoolLit(_)
+        | ExprKind::Path(_)
+        | ExprKind::PackRef(_) => {}
+        ExprKind::Call(_, _, args, _) => args.iter_mut().for_each(|a| for_each_expr_mut(a, f)),
+        ExprKind::Spawn(e) | ExprKind::FieldAccess(e, _) => for_each_expr_mut(e, f),
+        ExprKind::Index(base, indices) => {
+            for_each_expr_mut(base, f);
+            indices.iter_mut().for_each(|i| for_each_expr_mut(i, f));
+        }
+        ExprKind::ArrayLit(items) => items.iter_mut().for_each(|i| for_each_expr_mut(i, f)),
+        ExprKind::ArrayRepeat { value, count } => {
+            for_each_expr_mut(value, f);
+            for_each_expr_mut(count, f);
+        }
+        ExprKind::StructLit(_, _, fields) => fields.iter_mut().for_each(|(_, e)| for_each_expr_mut(e, f)),
+        ExprKind::Match { scrutinee, arms } => {
+            for_each_expr_mut(scrutinee, f);
+            arms.iter_mut().for_each(|arm| for_each_expr_mut(&mut arm.body, f));
+        }
+        ExprKind::If { cond, then_branch, else_branch } => {
+            for_each_expr_mut(cond, f);
+            for_each_expr_in_block_mut(then_branch, f);
+            match else_branch.as_deref_mut() {
+                Some(ElseBranch::If(e)) => for_each_expr_mut(e, f),
+                Some(ElseBranch::Block(b)) => for_each_expr_in_block_mut(b, f),
+                None => {}
+            }
+        }
+        ExprKind::While { cond, body } => {
+            for_each_expr_mut(cond, f);
+            for_each_expr_in_block_mut(body, f);
+        }
+        ExprKind::For { start, end, body, .. } => {
+            for_each_expr_mut(start, f);
+            for_each_expr_mut(end, f);
+            for_each_expr_in_block_mut(body, f);
+        }
+        ExprKind::ForIn { iter, body, .. } => {
+            for_each_expr_mut(iter, f);
+            for_each_expr_in_block_mut(body, f);
+        }
+        ExprKind::Loop { body } | ExprKind::Block(body) | ExprKind::Lambda { body, .. } => {
+            for_each_expr_in_block_mut(body, f)
         }
     }
 }

@@ -53,14 +53,6 @@ at what the programs share (libomp's team and task queues, the runtime's pool an
 Next time: keep the binary's whole output (`cargo test ... 2>&1 | tee`), the test name and the exit
 code; after a change touching those areas, a loop of runs (`for i in $(seq 50)`).
 
-## A `DynArray` of structs doesn't release its elements when it dies
-
-Its slots hold references (`dynarray_set_ptr` retains, `dynarray_get_ptr` hands out a retained one,
-an overwritten element is released), but the `DynArray` envelope has no release cascade into its
-buffer: the elements it still holds when it dies leak. And an element released through
-`dynarray_set_ptr` (overwritten) is released flat (`cleave_release`), without the cascade into its
-own refcounted fields that the compiler generates per type.
-
 ## Debt: a constraint on a never-generalized abstract variable is checked nowhere
 
 `infer.rs`'s module comment, in its own words: a constraint on a variable still abstract and never
@@ -660,3 +652,13 @@ remove the margin question.
 nanoLM's `train_gpt` gradient is necessarily fully inlined: synthesis sees through `block`, so its
 backward is emitted six times (once per layer) where a per-function gradient (the backward of `block`
 as its own function) would compile it once. The largest remaining share of nanoLM's compile time.
+
+## Consumed parameters (`own`): a move instead of a borrow
+
+Every parameter is borrowed today: the caller keeps its reference and releases it. A consumed parameter
+would hand the callee the caller's reference: retain/release pairs gone on every transfer, and `Buffer<T>`
+able to reallocate its object itself (one allocation, no indirection to its slots) since `v.buf =
+grow(v.buf, n)` would then give `grow` the only reference (`doc/plan-buffer.md`). Needs use-after-move
+checking in inference and the transfer in `refcount.rs`.
+
+ 

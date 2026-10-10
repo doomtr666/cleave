@@ -65,6 +65,7 @@ pub struct Registry {
 struct StructEntry {
     generics: Vec<GenericParam>,
     fields: Vec<Field>,
+    zero_fill: bool,
 }
 
 struct AlgebraEntry {
@@ -238,6 +239,7 @@ impl Registry {
                     StructEntry {
                         generics: d.generics.clone(),
                         fields: d.fields.clone(),
+                        zero_fill: d.zero_fill,
                     },
                 );
             }
@@ -762,6 +764,12 @@ impl Registry {
     /// one of these names) to a real type, either fresh (construction) or
     /// the concrete argument a particular value was built with (field
     /// access) — see `infer.rs`'s `StructLit`/`FieldAccess` handling.
+    /// Whether a literal of struct `name` may omit fields, left all zero (an
+    /// enum's struct, `enums.rs`).
+    pub fn struct_zero_fill(&self, name: &str) -> bool {
+        self.structs.get(name).is_some_and(|s| s.zero_fill)
+    }
+
     pub fn struct_generics(&self, name: &str) -> &[GenericParam] {
         self.structs
             .get(name)

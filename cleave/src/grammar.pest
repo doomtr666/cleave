@@ -8,7 +8,7 @@ COMMENT = _{ "//" ~ (!NEWLINE ~ ANY)* }
 
 program = { SOI ~ item* ~ EOI }
 
-item = { use_decl | const_decl | define_decl | struct_decl | algebra_decl | impl_decl | fn_decl | derive_decl | grad_decl }
+item = { use_decl | const_decl | define_decl | struct_decl | enum_decl | algebra_decl | impl_decl | fn_decl | derive_decl | grad_decl }
 
 // ---------------------------------------------------------------- crates
 // `use linalg;` (or `use linalg::Matrix;`) is the only mechanism — no separate
@@ -218,6 +218,14 @@ param      = { mut_kw? ~ ident ~ (":" ~ type_)? }
 struct_decl = { "struct" ~ ident ~ generic_params? ~ "{" ~ field_list? ~ "}" }
 field_list  = { field ~ ("," ~ field)* ~ ","? }
 field       = { ident ~ ":" ~ type_ }
+
+// ---------------------------------------------------------------- enum
+// `enum Option<T> { None, Some(T) }` (`doc/plan-sum-types.md`): each variant
+// with or without data, its data positional.
+enum_decl    = { enum_kw ~ ident ~ generic_params? ~ "{" ~ variant_list? ~ "}" }
+enum_kw      = @{ "enum" ~ !XID_CONTINUE }
+variant_list = { variant ~ ("," ~ variant)* ~ ","? }
+variant      = { ident ~ ("(" ~ type_ ~ ("," ~ type_)* ~ ")")? }
 
 // ---------------------------------------------------------------- algebra
 // "algebra" is the working keyword from hld.md's closing section; naming
@@ -504,7 +512,7 @@ tuple_index = @{ ASCII_DIGIT+ }
 // `infer_call`'s own fallback, which special-cases exactly this one
 // remaining case (a zero-arg call naming a known, zero-field struct) rather
 // than leaving it as a silent "unresolved call".
-primary = { if_expr | while_expr | for_expr | loop_expr | comprehension | array_lit | lambda_expr | spawn_expr | call_expr | struct_lit | literal | path | tuple_lit | "(" ~ expr ~ ")" | block }
+primary = { match_expr | if_expr | while_expr | for_expr | loop_expr | comprehension | array_lit | lambda_expr | spawn_expr | call_expr | struct_lit | literal | path | tuple_lit | "(" ~ expr ~ ")" | block }
 
 // `(a, b, ...)` — arity 2+ (see `tuple_type`'s own doc comment for why),
 // tried before the bare grouping-paren alternative just after it: PEG
@@ -613,6 +621,16 @@ field_init_list = { field_init ~ ("," ~ field_init)* }
 field_init      = { ident ~ ":" ~ expr }
 
 if_expr = { "if" ~ expr ~ block ~ ("else" ~ (if_expr | block))? }
+
+// `match e { Some(x) => .., None => .. }` (`doc/plan-sum-types.md`): an arm
+// is a variant pattern, its data bound to names (`_` ignores one), or `_`.
+// Commas between arms optional, as after a block body in Rust.
+match_expr  = { match_kw ~ expr ~ "{" ~ match_arm ~ (","? ~ match_arm)* ~ ","? ~ "}" }
+match_kw    = @{ "match" ~ !XID_CONTINUE }
+match_arm   = { pattern ~ "=>" ~ expr }
+pattern     = { wildcard_pattern | variant_pattern }
+wildcard_pattern = @{ "_" ~ !XID_CONTINUE }
+variant_pattern  = { path ~ ("(" ~ ident ~ ("," ~ ident)* ~ ")")? }
 
 // parses (funnel grammar), not yet wired into CPS conversion/the e-graph — see top-of-file note.
 while_expr = { "while" ~ expr ~ block }

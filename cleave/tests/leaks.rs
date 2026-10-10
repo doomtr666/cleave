@@ -49,12 +49,33 @@ fn live() -> i64 {
 /// counts.
 static RUN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+thread_local! {
+    static HOLDS_RUN: Cell<bool> = const { Cell::new(false) };
+}
+
+/// `RUN`, held by a test for its whole duration: a leak is measured as the
+/// difference between two runs, which another test's run between them would
+/// skew (the blocks it leaves in the pool, or takes from it).
+struct Serial(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+fn serial() -> Serial {
+    let guard = RUN.lock().unwrap_or_else(|e| e.into_inner());
+    HOLDS_RUN.with(|h| h.set(true));
+    Serial(guard)
+}
+
+impl Drop for Serial {
+    fn drop(&mut self) {
+        HOLDS_RUN.with(|h| h.set(false));
+    }
+}
+
 /// Compiles `src` through the real pipeline (`cleave::run`, what `--run`
 /// uses) and runs `main`, returning its result and the bytes the run left
 /// allocated. Tasks off: spawned calls run in place, on this thread, the one
 /// whose allocations are counted (`spawn_leaks.rs` covers tasks).
 fn run_counting(src: &str) -> (i32, i64) {
-    let _one_at_a_time = RUN.lock().unwrap_or_else(|e| e.into_inner());
+    let _one_at_a_time = (!HOLDS_RUN.with(Cell::get)).then(serial);
     let options = CodegenOptions { openmp: false, tasks: false, ..Default::default() };
     let (program, registry, sources) = cleave::run::check_sources(vec![("test.cleave".to_string(), src.to_string())], &[], false)
         .unwrap_or_else(|e| panic!("{}", e.join("
@@ -152,6 +173,7 @@ fn if_join_leak_in(variant: &str, in_loop: &str) -> i64 {
 /// the second's join.
 #[test]
 fn values_leaving_an_if_are_released() {
+    let _serial = serial();
     let _ = run_counting(&if_join_program(1).replace("VARIANT", "1.0").replace("INLOOP", "total = total + pick(s);"));
     let cases = [
         ("a struct of structs, from a fn", "total = total + pick(s);"),
@@ -175,6 +197,7 @@ fn values_leaving_an_if_are_released() {
 /// takes a path the region allocator otherwise always hides.
 #[test]
 fn a_gradient_leaving_an_if_does_not_crash() {
+    let _serial = serial();
     let squares = "let err = forward(x, net) - y; sum(err * err)";
     let through_if = "if s >= 0 { net_grad(x, y, net) } else { net_grad(x, y, net) }";
     let (r, _) = run_counting(&training_program_with(squares, "Sgd(lr: 0.01)", 4, through_if));
@@ -183,6 +206,7 @@ fn a_gradient_leaving_an_if_does_not_crash() {
 
 #[test]
 fn training_steps_leave_no_allocation_behind() {
+    let _serial = serial();
     let squares = "let err = forward(x, net) - y; sum(err * err)";
     let entropy = "cross_entropy(forward(x, net), y)";
     let direct = "net_grad(x, y, net)";
@@ -206,6 +230,7 @@ fn training_steps_leave_no_allocation_behind() {
 /// last, and the one left behind must be freed, not accumulated.
 #[test]
 fn a_loop_carrying_a_blas_result_frees_each_iterations_buffer() {
+    let _serial = serial();
     let program = |steps: u32| {
         format!(
             "
@@ -254,6 +279,7 @@ fn leak_per_iteration(prelude: &str, body: &str) -> i64 {
 
 #[test]
 fn muon_steps_leave_no_allocation_behind() {
+    let _serial = serial();
     let per = leak_per_iteration(
         "",
         "let opt = Muon(lr: 0.01, momentum: 0.95, weight_decay: 0.0,
@@ -266,6 +292,7 @@ fn muon_steps_leave_no_allocation_behind() {
 
 #[test]
 fn clipping_leaves_no_allocation_behind() {
+    let _serial = serial();
     let per = leak_per_iteration(
         "struct Net { d: Dense<f32, 64, 48> }\n impl Trainable<Net> {}",
         "let mut n = Net(d: Dense(w: m, b: Init::xavier()));
@@ -300,6 +327,7 @@ fn clipping_a_fresh_gradient(max_norm: &str) -> i64 {
 /// now retained where it's returned (`refcount.rs::returned_param_args`).
 #[test]
 fn returning_a_parameter_on_one_path_only_leaves_nothing_behind() {
+    let _serial = serial();
     let per = leak_per_iteration(
         "struct Net { d: Dense<f32, 64, 48> }
          fn rebuilt_or_kept(g: Net, t: f32) -> Net {
@@ -317,18 +345,21 @@ fn returning_a_parameter_on_one_path_only_leaves_nothing_behind() {
 
 #[test]
 fn clipping_a_fresh_gradient_that_is_scaled_leaves_no_allocation_behind() {
+    let _serial = serial();
     let per = clipping_a_fresh_gradient("0.001");
     assert!(per < NOISE, "{per} bytes per clip");
 }
 
 #[test]
 fn clipping_a_fresh_gradient_that_is_kept_leaves_no_allocation_behind() {
+    let _serial = serial();
     let per = clipping_a_fresh_gradient("1000000.0");
     assert!(per < NOISE, "{per} bytes per clip");
 }
 
 #[test]
 fn a_tied_embedding_gradient_leaves_no_allocation_behind() {
+    let _serial = serial();
     let per = leak_per_iteration(
         "fn loss(e: Embedding<f32, 64, 48>) -> f32 {
              let ids: [i32; 8] = [1, 5, 9, 2, 63, 0, 7, 7];
@@ -344,12 +375,14 @@ fn a_tied_embedding_gradient_leaves_no_allocation_behind() {
 
 #[test]
 fn transposes_leave_no_allocation_behind() {
+    let _serial = serial();
     let per = leak_per_iteration("", "for i in 0..STEPS { m = transpose(transpose(m)); };");
     assert!(per < NOISE, "{per} bytes per pair of transposes");
 }
 
 #[test]
 fn newton_schulz_leaves_no_allocation_behind() {
+    let _serial = serial();
     let per = leak_per_iteration("", "for i in 0..STEPS { m = newton_schulz5(m); };");
     assert!(per < NOISE, "{per} bytes per orthogonalization");
 }
@@ -368,12 +401,14 @@ const CARRIED: &str = "
 
 #[test]
 fn carried_1_a_tensor_from_a_call() {
+    let _serial = serial();
     let per = leak_per_iteration(CARRIED, "for i in 0..STEPS { m = next_tensor(m, g); };");
     assert!(per < NOISE, "{per} bytes per step");
 }
 
 #[test]
 fn carried_2_a_struct_rebuilt() {
+    let _serial = serial();
     let per = leak_per_iteration(
         CARRIED,
         "let mut s = AdamState::<f32, 64, 48>(m: Ring::zero(), v: Ring::zero(), beta1_pow: 1.0, beta2_pow: 1.0);
@@ -385,6 +420,7 @@ fn carried_2_a_struct_rebuilt() {
 
 #[test]
 fn carried_3_both_from_a_tuple() {
+    let _serial = serial();
     let per = leak_per_iteration(
         CARRIED,
         "let mut s = AdamState::<f32, 64, 48>(m: Ring::zero(), v: Ring::zero(), beta1_pow: 1.0, beta2_pow: 1.0);
@@ -409,12 +445,14 @@ fn model_steps_leak(opt: &str) -> i64 {
 
 #[test]
 fn model_steps_under_adamw_leave_nothing_behind() {
+    let _serial = serial();
     let per = model_steps_leak("AdamW(lr: 0.001, beta1: 0.9, beta2: 0.95, eps: 0.00000001, weight_decay: 0.0)");
     assert!(per < NOISE, "{per} bytes per step");
 }
 
 #[test]
 fn model_steps_under_muon_leave_nothing_behind() {
+    let _serial = serial();
     let per = model_steps_leak(
         "Muon(lr: 0.01, momentum: 0.95, weight_decay: 0.0,
               adamw: AdamW(lr: 0.001, beta1: 0.9, beta2: 0.95, eps: 0.00000001, weight_decay: 0.0))",
@@ -424,6 +462,7 @@ fn model_steps_under_muon_leave_nothing_behind() {
 
 #[test]
 fn accumulating_embeddings_leaves_nothing_behind() {
+    let _serial = serial();
     let per = leak_per_iteration(
         "",
         "let mut e = Embedding(table: m);
@@ -436,6 +475,7 @@ fn accumulating_embeddings_leaves_nothing_behind() {
 
 #[test]
 fn a_modern_block_gradient_leaves_nothing_behind() {
+    let _serial = serial();
     let per = leak_per_iteration(
         "struct B { n: Tensor<f32, 1, 48>, wq: Dense<f32, 48, 48>, mlp: SwiGlu<f32, 48, 32> }
          impl Trainable<B> {}
@@ -457,6 +497,7 @@ fn a_modern_block_gradient_leaves_nothing_behind() {
 /// (nanoLM's `parallel_grad`: eight micro-batch gradients, then summed).
 #[test]
 fn a_comprehension_of_spawned_structs_leaves_nothing_behind() {
+    let _serial = serial();
     let per = leak_per_iteration(
         "struct Net { d: Dense<f32, 64, 48> }
          impl Trainable<Net> {}
@@ -477,6 +518,7 @@ fn a_comprehension_of_spawned_structs_leaves_nothing_behind() {
 /// sequential: a tuple built from locally owned structs, read by index.
 #[test]
 fn a_tuple_of_owned_structs_leaves_nothing_behind() {
+    let _serial = serial();
     let per = leak_per_iteration(
         "struct Net { d: Dense<f32, 64, 48> }
          impl Trainable<Net> {}
@@ -566,10 +608,14 @@ fn array_model_program_split(opt: &str, steps: u32) -> String {
 #[test]
 fn training_a_model_with_an_array_of_layers_leaves_no_allocation_behind() {
     // Compiled on a larger stack, as the CLI does (`main.rs`): the compiler
-    // recurses on the program's continuation-passing form.
+    // recurses on the program's continuation-passing form. `RUN` is held by
+    // the thread measuring.
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
-        .spawn(array_model_leaks)
+        .spawn(|| {
+            let _serial = serial();
+            array_model_leaks()
+        })
         .unwrap()
         .join()
         .unwrap();
@@ -628,6 +674,7 @@ fn array_store_program(elem: &str, steps: u32) -> String {
 /// held; the write is seen through an alias of the array.
 #[test]
 fn overwriting_an_array_element_releases_the_previous_one() {
+    let _serial = serial();
     let leaks: Vec<(&str, i64)> = ["layer", "heavy"]
         .iter()
         .map(|elem| {
@@ -648,6 +695,7 @@ fn summing_an_array_of_gradients_of_an_array_model_leaves_no_allocation_behind()
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
         .spawn(|| {
+            let _serial = serial();
             let (r_short, short) = run_counting(&array_model_program_split("Sgd(lr: 0.01)", 8));
             let (r_long, long) = run_counting(&array_model_program_split("Sgd(lr: 0.01)", 72));
             assert_eq!((r_short, r_long), (1, 1));
@@ -666,6 +714,7 @@ fn summing_an_array_of_gradients_of_an_array_model_leaves_no_allocation_behind()
 /// them; nothing left behind, nothing freed twice.
 #[test]
 fn a_repeated_struct_array_leaves_nothing_behind() {
+    let _serial = serial();
     let program = |steps: u32| {
         format!(
             "
@@ -697,6 +746,7 @@ fn a_repeated_struct_array_leaves_nothing_behind() {
 /// its inner arrays and their elements, nothing left behind.
 #[test]
 fn a_nested_struct_array_leaves_nothing_behind() {
+    let _serial = serial();
     let program = |steps: u32| {
         format!(
             "
@@ -731,6 +781,7 @@ fn a_nested_struct_array_leaves_nothing_behind() {
 /// overwritten one when replaced, nothing left behind.
 #[test]
 fn an_array_of_tensors_leaves_nothing_behind() {
+    let _serial = serial();
     let program = |steps: u32| {
         format!(
             "
@@ -762,6 +813,7 @@ fn an_array_of_tensors_leaves_nothing_behind() {
 /// its array or when overwritten, the empty ones releasing nothing.
 #[test]
 fn an_array_of_tensors_allocated_empty_leaves_nothing_behind() {
+    let _serial = serial();
     let program = |steps: u32| {
         format!(
             "
@@ -788,4 +840,282 @@ fn an_array_of_tensors_allocated_empty_leaves_nothing_behind() {
     assert_eq!((r_short, r_long), (1, 1));
     let per_step = (long - short) / 64;
     assert!(per_step < NOISE, "{per_step} bytes leaked per step");
+}
+
+/// `Buffer<T>` (`stdlib/buffer`) of numbers: slots read back what was
+/// stored, growth keeps them and adds empty ones.
+#[test]
+fn a_buffer_of_numbers_keeps_its_elements_as_it_grows() {
+    let _serial = serial();
+    let (result, _) = run_counting(
+        "
+        use buffer;
+        use convert;
+        fn main() -> i32 {
+            let b: Buffer<f64> = buffer_alloc(2);
+            for i in 0..10 {
+                if i == buffer_capacity(b) { buffer_grow(b, 2 * buffer_capacity(b)); };
+                let v: f64 = (i * 3).to();
+                buffer_set(b, i, v);
+            };
+            buffer_set(b, 4, 100.0);
+            let mut s = 0.0;
+            for i in 0..10 { s = s + buffer_get(b, i); };
+            if s == 223.0 and buffer_capacity(b) == 16 { 1 } else { 0 }
+        }
+        ",
+    );
+    assert_eq!(result, 1);
+}
+
+/// A buffer of structs holding a tensor: each slot owns a reference to its
+/// element, an overwritten element is released through its type's cascade,
+/// and a dying buffer releases what its slots still hold, then its slots.
+const STRUCT_BUFFER: &str = "
+    use buffer;
+    struct Holder { t: Tensor<f32, 64, 48>, k: i32 }
+    fn fill(m: Tensor<f32, 64, 48>, n: i32) -> Buffer<Holder> {
+        let b: Buffer<Holder> = buffer_alloc(2);
+        for i in 0..n {
+            if i == buffer_capacity(b) { buffer_grow(b, 2 * buffer_capacity(b)); };
+            buffer_set(b, i, Holder(t: Scale::scale(m, 0.5), k: i));
+        };
+        buffer_set(b, 0, Holder(t: m, k: 100));
+        b
+    }";
+
+#[test]
+fn a_buffer_of_structs_reads_back_what_was_stored() {
+    let _serial = serial();
+    let (result, _) = run_counting(&format!(
+        "{STRUCT_BUFFER}
+        use nn;
+        fn main() -> i32 {{
+            rand_seed(1);
+            let m: Tensor<f32, 64, 48> = Init::xavier();
+            let b = fill(m, 5);
+            let first = buffer_get(b, 0);
+            let fourth = buffer_get(b, 4);
+            if first.k == 100 and fourth.k == 4 and first.t[3, 2] == m[3, 2] and fourth.t[3, 2] == 0.5 * m[3, 2] {{ 1 }} else {{ 0 }}
+        }}
+        "
+    ));
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn a_buffer_of_structs_leaves_nothing_behind() {
+    let _serial = serial();
+    let per = leak_per_iteration(
+        STRUCT_BUFFER,
+        // Two call sites: `fill` isn't region-local (`region_analysis`),
+        // whose arena would free its allocations whatever the buffer does.
+        "for i in 0..STEPS { let b = fill(m, 5); let c = fill(m, 3); m = Scale::scale(buffer_get(b, 1).t, 2.0) - Scale::scale(buffer_get(c, 2).t, 1.0); };",
+    );
+    assert!(per < NOISE, "{per} bytes per step");
+}
+
+/// A buffer built before a loop and filled in it by a function called once
+/// (`make`, kept a call): what `make` returns is kept by the buffer past the iteration,
+/// so `make` must not allocate in the iteration's region
+/// (`region_analysis::collect_stored`, a call that may store its argument).
+/// It did: the next iteration's region reused every element but the last.
+#[test]
+fn a_buffer_filled_across_iterations_keeps_every_element() {
+    let _serial = serial();
+    let (result, _) = run_counting(
+        "
+        use buffer;
+        use nn;
+        use convert;
+        struct Holder { t: Tensor<f32, 4, 4>, k: i32 }
+        #[no_inline]
+        fn make(m: Tensor<f32, 4, 4>, i: i32) -> Holder {
+            let s: f32 = i.to();
+            Holder(t: Scale::scale(m, s), k: i)
+        }
+        fn main() -> i32 {
+            rand_seed(1);
+            let m: Tensor<f32, 4, 4> = Init::xavier();
+            let b: Buffer<Holder> = buffer_alloc(10);
+            for i in 0..10 { buffer_set(b, i, make(m, i)); };
+            let mut ok = 1;
+            for i in 0..10 {
+                let h = buffer_get(b, i);
+                let s: f32 = i.to();
+                if h.k != i or h.t[2, 3] != s * m[2, 3] { ok = 0; };
+            };
+            ok
+        }
+        ",
+    );
+    assert_eq!(result, 1);
+}
+
+/// `buffer_take` hands out a slot's element and leaves the slot empty;
+/// `DynArray::pop` is built on it. Numbers and structs holding a tensor.
+#[test]
+fn taking_from_a_buffer_and_popping_a_dynarray_return_the_elements() {
+    let _serial = serial();
+    let (result, _) = run_counting(
+        "
+        use buffer;
+        use dynarray;
+        use nn;
+        struct Holder { t: Tensor<f32, 4, 4>, k: i32 }
+        fn main() -> i32 {
+            rand_seed(1);
+            let m: Tensor<f32, 4, 4> = Init::xavier();
+            let b: Buffer<Holder> = buffer_alloc(2);
+            buffer_set(b, 1, Holder(t: Scale::scale(m, 2.0), k: 7));
+            let h = buffer_take(b, 1);
+            buffer_set(b, 1, Holder(t: m, k: 8));
+            let v: DynArray<i32> = dynarray_new(1);
+            v.push(4);
+            v.push(5);
+            let top = v.pop();
+            let w: DynArray<Holder> = dynarray_new(1);
+            w.push(Holder(t: m, k: 9));
+            w.push(Holder(t: Scale::scale(m, 3.0), k: 10));
+            let last = w.pop();
+            if h.k == 7 and h.t[1, 2] == 2.0 * m[1, 2] and buffer_get(b, 1).k == 8
+                and top == 5 and v.len() == 1 and last.k == 10 and last.t[1, 2] == 3.0 * m[1, 2] and w.len() == 1
+            { 1 } else { 0 }
+        }
+        ",
+    );
+    assert_eq!(result, 1);
+}
+
+/// Elements pushed then popped, every iteration: what `pop` hands out is
+/// released by its taker, what the `DynArray` still holds by the buffer.
+#[test]
+fn popping_a_dynarray_leaves_nothing_behind() {
+    let _serial = serial();
+    let per = leak_per_iteration(
+        "
+        use dynarray;
+        struct Holder { t: Tensor<f32, 64, 48>, k: i32 }
+        fn churn(m: Tensor<f32, 64, 48>, n: i32) -> Tensor<f32, 64, 48> {
+            let v: DynArray<Holder> = dynarray_new(2);
+            for i in 0..n { v.push(Holder(t: Scale::scale(m, 0.5), k: i)); };
+            let a = v.pop();
+            let b = v.pop();
+            a.t - b.t
+        }",
+        // Two call sites: `churn` isn't region-local.
+        "for i in 0..STEPS { m = churn(m, 5) + churn(m, 3); };",
+    );
+    assert!(per < NOISE, "{per} bytes per step");
+}
+
+/// `HashMap` (`stdlib/hashmap`): growth past several rehashes, replacing a
+/// value, removing a key, probing past a removed slot; `i64` keys and struct
+/// values holding a tensor.
+#[test]
+fn a_hashmap_maps_keys_to_values_through_growth_and_removal() {
+    let _serial = serial();
+    let (result, _) = run_counting(
+        "
+        use hashmap;
+        use nn;
+        use convert;
+        struct Holder { t: Tensor<f32, 4, 4>, k: i32 }
+        fn main() -> i32 {
+            let m: HashMap<i32, i32> = hashmap_new(4);
+            for i in 0..1000 { m.insert(i * 7, i); };
+            m.insert(14, 500);
+            m.remove(21);
+            let mut ok = 1;
+            if m.len() != 999 or m.contains(21) or not m.contains(28) or match m.lookup(14) { Some(v) => v != 500, None => true } { ok = 0; };
+            for i in 0..1000 {
+                if i != 3 and i != 2 and match m.lookup(i * 7) { Some(v) => v != i, None => true } { ok = 0; };
+            };
+            if match m.lookup(21) { Some(_) => true, None => false } { ok = 0; };
+            if m.contains(5) { ok = 0; };
+
+            rand_seed(1);
+            let t: Tensor<f32, 4, 4> = Init::xavier();
+            let h: HashMap<i64, Holder> = hashmap_new(2);
+            for i in 0..40 {
+                let s: f32 = i.to();
+                let key: i64 = 4000000000;
+                h.insert(key, Holder(t: t, k: -1));
+                h.insert(1000000007, Holder(t: Scale::scale(t, s), k: i));
+            };
+            let big: i64 = 1000000007;
+            match h.lookup(big) {
+                Some(last) => { if h.len() != 2 or last.k != 39 or last.t[1, 2] != 39.0 * t[1, 2] { ok = 0; }; },
+                None => { ok = 0; },
+            };
+            ok
+        }
+        ",
+    );
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn a_hashmap_of_structs_leaves_nothing_behind() {
+    let _serial = serial();
+    let per = leak_per_iteration(
+        "
+        use hashmap;
+        struct Holder { t: Tensor<f32, 64, 48>, k: i32 }
+        fn build(m: Tensor<f32, 64, 48>, n: i32) -> Tensor<f32, 64, 48> {
+            let h: HashMap<i32, Holder> = hashmap_new(2);
+            for i in 0..n { h.insert(i, Holder(t: Scale::scale(m, 0.5), k: i)); };
+            h.insert(1, Holder(t: m, k: 100));
+            h.remove(2);
+            let a = match h.lookup(1) { Some(x) => x.t, None => m };
+            let b = match h.lookup(0) { Some(x) => x.t, None => m };
+            a - b
+        }",
+        // Two call sites: `build` isn't region-local.
+        "for i in 0..STEPS { m = build(m, 6) + build(m, 4); };",
+    );
+    assert!(per < NOISE, "{per} bytes per step");
+}
+
+/// Enums holding refcounted data (`enums.rs`), built and matched every
+/// iteration: the active variant's data released with the value, the
+/// inactive variants' zero fields releasing nothing.
+#[test]
+fn enums_holding_structs_and_tensors_leave_nothing_behind() {
+    let _serial = serial();
+    let per = leak_per_iteration(
+        "
+        enum Slot { Empty, Full(Tensor<f32, 64, 48>), Pair(Tensor<f32, 64, 48>, Tensor<f32, 64, 48>) }
+        fn make(m: Tensor<f32, 64, 48>, i: i32) -> Slot {
+            if mod(i, 3) == 0 { Empty } else { if mod(i, 3) == 1 { Full(Scale::scale(m, 0.5)) } else { Pair(Scale::scale(m, 0.5), Scale::scale(m, 2.0)) } }
+        }
+        fn weight(s: Slot) -> Tensor<f32, 64, 48> {
+            match s { Empty => Ring::zero(), Full(t) => t, Pair(a, b) => a - b }
+        }",
+        // Two call sites each: neither `make` nor `weight` is region-local.
+        "for i in 0..STEPS { m = weight(make(m, i)) + weight(make(m, i + 1)) + Scale::scale(m, 0.25); };",
+    );
+    assert!(per < NOISE, "{per} bytes per step");
+}
+
+/// The value of an `if` a tensor field of a struct bound in a branch (an
+/// enum's `Some(x) => x.t` is this): the join after the `if` can't reach the
+/// struct to keep it alive, so the tensor is adopted, a buffer of its own
+/// (`refcount.rs`, `TensorViews::adopt_out_of_scope`). It panicked the
+/// compiler (`unbound CPS variable`): the join released the struct.
+#[test]
+fn a_field_of_a_struct_bound_in_a_branch_leaves_the_if() {
+    let _serial = serial();
+    let per = leak_per_iteration(
+        "
+        struct Holder { t: Tensor<f32, 64, 48>, k: i32 }
+        #[no_inline]
+        fn mk(m: Tensor<f32, 64, 48>, i: i32) -> Holder { Holder(t: Scale::scale(m, 2.0), k: i) }
+        fn pick(m: Tensor<f32, 64, 48>, i: i32) -> Tensor<f32, 64, 48> {
+            let a = if mod(i, 2) == 0 { let x = mk(m, i); x.t } else { m };
+            Scale::scale(a, 0.5)
+        }",
+        "for i in 0..STEPS { m = pick(m, i) + pick(m, i + 1) - m; };",
+    );
+    assert!(per < NOISE, "{per} bytes per step");
 }

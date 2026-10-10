@@ -1951,6 +1951,7 @@ fn check_mutability_block(block: &Block, scope: &HashMap<String, bool>) -> Resul
 
 fn check_mutability_expr(expr: &Expr, scope: &HashMap<String, bool>) -> Result<(), TypeError> {
     match &expr.kind {
+        ExprKind::Match { .. } => unreachable!("a `match` is lowered by `driver::desugar_enums`"),
         ExprKind::Spawn(call) => check_mutability_expr(call, scope),
         ExprKind::NumberLit { .. }
         | ExprKind::ImaginaryLit { .. }
@@ -4541,8 +4542,8 @@ impl<'r> Infer<'r> {
                         }
                         // A group whose variable the shape match pinned to
                         // something other than a bare variable (`S := f64`
-                        // in `impl<S: HeapStruct> RawBuffer<S>` against
-                        // `impl RawBuffer<f64>`) needs that type itself to
+                        // in `impl<S: Marker> Size<S>` against
+                        // `impl Size<f64>`) needs that type itself to
                         // satisfy every bound, not just the bounds to share a
                         // candidate among themselves.
                         let bounds_admit_a_shared_type = groups.iter().all(|(root, bs)| {
@@ -6593,6 +6594,7 @@ impl<'r> Infer<'r> {
         match &expr.kind {
             // The call's own type: the future is invisible to typing
             // (`doc/plan-spawn.md`, §1).
+            ExprKind::Match { .. } => unreachable!("a `match` is lowered by `driver::desugar_enums`"),
             ExprKind::Spawn(call) => self.infer_expr(env, call),
             ExprKind::NumberLit { suffix, text } => match suffix {
                 Some(s) => {
@@ -6769,7 +6771,14 @@ impl<'r> Infer<'r> {
                 for arg in args {
                     self.infer_expr(env, arg)?;
                 }
-                Ok(self.vars.fresh())
+                // The buffer intrinsics `cps.rs` lowers itself
+                // (`stdlib/buffer`): those whose result their arguments
+                // don't determine.
+                match path.segments[1..].join(".").as_str() {
+                    "cleave.buffer_set" | "cleave.buffer_grow" => Ok(Ty::Con("()".to_string())),
+                    "cleave.buffer_capacity" => Ok(Ty::Con("i32".to_string())),
+                    _ => Ok(self.vars.fresh()),
+                }
             }
             ExprKind::Call(path, _, args, _) if path.segments == [COMPREHENSION] => {
                 self.infer_comprehension(env, expr, args)
@@ -7268,7 +7277,11 @@ impl<'r> Infer<'r> {
                     let declared_ty = self.ty_from_ast_mapped(&decl_field.ty, &generics_mapping);
                     self.unify_at(value.span, &declared_ty, &value_ty)?;
                 }
-                if let Some(missing) = declared_fields.iter().find(|f| !seen.contains(&f.name)) {
+                if let Some(missing) = declared_fields
+                    .iter()
+                    .find(|f| !seen.contains(&f.name))
+                    .filter(|_| !self.registry.struct_zero_fill(&struct_name))
+                {
                     return Err(TypeError {
                         span: expr.span,
                         kind: TypeErrorKind::MissingField {

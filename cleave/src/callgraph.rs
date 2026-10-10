@@ -596,6 +596,7 @@ fn collect_calls_block(block: &Block, known: &HashSet<&str>, out: &mut Vec<Strin
 
 fn collect_calls_expr(expr: &Expr, known: &HashSet<&str>, out: &mut Vec<String>) {
     match &expr.kind {
+        ExprKind::Match { .. } => unreachable!("a `match` is lowered by `driver::desugar_enums`"),
         ExprKind::Spawn(call) => collect_calls_expr(call, known, out),
         ExprKind::NumberLit { .. } | ExprKind::ImaginaryLit { .. } | ExprKind::BoolLit(_) => {}
         // A pack reference (`Dims...`, only ever an array dimension's own

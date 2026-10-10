@@ -361,116 +361,60 @@ fn a_struct_referenced_only_through_an_intervening_call_survives_two_nested_loop
     assert_eq!(run_i32(src), 12);
 }
 
-/// A real, found-by-testing bug (`doc/backlog-done.md`'s own "`is_
-/// refcounted` didn't exclude an opaque-handle struct with no real
-/// construction site" entry, root-caused against `examples/convex_hull.
-/// cleave --run`'s own intermittent `cleave_release: invalid layout:
-/// LayoutError` crash): `RawBuf {}` (`stdlib/dynarray/dynarray.cleave`) is
-/// an ordinary, untagged, zero-field struct declaration, but its own real
-/// values are *never* built via `RawBuf(...)` anywhere — only ever produced
-/// by an `extern fn` (`dynarray_alloc_ptr`/`dynarray_alloc_i32`/...), a
-/// plain `realloc`-backed pointer with no `RcHeader` in front of it at all.
-/// Before this fix, `is_refcounted` was purely type-based, blind to origin,
-/// so a `RawBuf`-typed struct field (`DynArray.buf`) still got ordinary
-/// `Retain`/`Release` calls inserted around it — reading/writing an
-/// `RcHeader` that was never really there, real, non-deterministic memory
-/// corruption. Structural, not JIT-execution-based: the corruption itself
-/// only manifests probabilistically at runtime (garbage bytes vary run to
-/// run), so a single JIT invocation isn't a reliable enough signal on its
-/// own — this asserts directly on the *inserted* `Retain`/`Release` calls
-/// instead, which is deterministic.
+/// A struct with no construction site anywhere, whose values only an
+/// `extern fn` produces (an opaque foreign handle): no refcount header in
+/// front of them, so never retained or released (`refcount::is_refcounted`).
+/// Retaining one read and wrote a header that wasn't there, corrupting memory
+/// non-deterministically (`DynArray`'s former `realloc`-backed buffer
+/// handle): checked on the inserted calls, which is deterministic.
 #[test]
 fn an_opaque_handle_struct_with_no_real_construction_site_is_never_retained_or_released() {
     let src = r#"
-        use dynarray;
+        struct Handle {}
+        extern fn open_handle(n: i32) -> Handle;
+        struct Owner { h: Handle, n: i32 }
         fn main() -> i32 {
-            let h: DynArray<i32> = dynarray_new(4);
-            h.push(1);
-            h.push(2);
-            h.get(0) + h.get(1)
+            let mut o = Owner(h: open_handle(1), n: 2);
+            o.n = 3;
+            o.n
         }
         "#;
     let program = refcounted_cps(src);
     let rc_targets = retained_or_released_struct_names(&program);
-    assert!(
-        !rc_targets.contains("RawBuf"),
-        "RawBuf is never constructed via `RawBuf(...)` anywhere -- its own \
-         values are always a plain, non-`cleave_alloc_rc`'d pointer from an \
-         `extern fn`, so retaining/releasing one reads/writes a header that \
-         was never really there; got: {rc_targets:?}"
-    );
-    // `DynArray` itself is a real, genuinely-constructed struct
-    // (`dynarray_new`'s own `DynArray(buf:...,len:...,cap:...)`) -- must
-    // stay refcounted normally, proving this fix didn't over-broadly
-    // exclude anything.
-    assert!(
-        rc_targets.contains("DynArray"),
-        "DynArray is a real, `cleave_alloc_rc`'d struct -- this fix must not \
-         exclude it too; got: {rc_targets:?}"
-    );
+    assert!(!rc_targets.contains("Handle"), "a foreign handle is refcounted: {rc_targets:?}");
+    assert!(rc_targets.contains("Owner"), "`Owner` is a constructed struct, still refcounted: {rc_targets:?}");
 }
 
-/// A real, found-by-code-inspection bug, one layer beneath the CPS-level
-/// fix just above: `is_refcounted`'s own "has a real construction site"
-/// exclusion (the fix for the *original* `RawBuf` corruption) is only ever
-/// consulted by `insert_refcounting` when deciding whether to emit a *top-
-/// level* `Retain`/`Release` for a CPS-level variable — `mlir_lower.rs::
-/// lower_release_cascade` (which recurses a struct's own `Release` into its
-/// *own fields*, entirely at MLIR-lowering time, never itself represented
-/// as further CPS-level `Retain`/`Release` nodes) used to decide whether to
-/// recurse into a given field with a much cruder check: "is this a declared
-/// struct type", with no awareness that a declared-but-never-constructed
-/// one (`DynArray<T>`'s own `buf: RawBuf` field, concretely) has no real
-/// `RcHeader` to act on at all. `DynArray` embedded in a further struct
-/// (`Wrapper`, mirroring `Network` embedding `Dense`, the real shape
-/// `doc/backlog.md`'s own "cleave_release is non-cascading..." item
-/// describes) is exactly the shape that exercises this: releasing `Wrapper`
-/// cascades into its own `arr: DynArray<i32>` field, which — before this
-/// fix — cascaded *again* into `arr`'s own `buf: RawBuf` field, generating
-/// a real `cleave_release` call against a raw, non-headered pointer
-/// (confirmed directly, before landing the fix: the exact same corruption
-/// class `is_refcounted`'s own doc comment already documents as genuinely
-/// non-deterministic — roughly a third of the time a visible panic, the
-/// rest silent — which is why this is a *structural* MLIR-text check, not
-/// an execution-based one: a JIT run not crashing proves nothing here).
+/// The same exclusion in a release cascade (`mlir_lower.rs::
+/// lower_release_cascade`, which recurses into fields at lowering time):
+/// releasing a struct holding a foreign handle releases as many objects as
+/// the same struct without the handle field. It used to cascade into the
+/// handle, a `cleave_release` on a pointer with no header.
 #[test]
-fn releasing_a_struct_that_embeds_a_dynarray_never_cascades_into_its_own_rawbuf_field() {
-    let src = r#"
-        use dynarray;
-        struct Wrapper { arr: DynArray<i32> }
-        fn make_and_discard(cap: i32) -> i32 {
-            let d: DynArray<i32> = dynarray_new(cap);
-            let w: Wrapper = Wrapper(arr: d);
-            w.arr.len
-        }
-        fn main() -> i32 {
-            make_and_discard(4)
-        }
-        "#;
-    let text = refcounted_mlir_text(&context(), src);
-    let release_count = text.matches("call @cleave_release").count();
-    // The real, fixed count for this exact program: `d` released directly
-    // (no cascade — `buf` is correctly excluded), `w` released (cascading
-    // into its own live `arr` field, one more release), `w.arr`'s own
-    // separately-retained re-read released once more — 4 total. Before
-    // this fix, the *same* program generated a 5th `cleave_release` call,
-    // nested inside `d`'s own release cascade, targeting `buf`'s own raw
-    // `RawBuf` pointer directly (confirmed directly, by temporarily
-    // reverting just this fix and re-diffing the generated module text).
-    assert!(
-        release_count <= 4,
-        "expected at most 4 `cleave_release` calls (none of them cascading \
-         into RawBuf) -- got {release_count}, suggesting the cascade is \
-         once again recursing into a never-constructed struct field:\n{text}"
-    );
+fn releasing_a_struct_never_cascades_into_a_foreign_handle_field() {
+    let program = |field: &str, value: &str| {
+        format!(
+            r#"
+            struct Handle {{}}
+            extern fn open_handle(n: i32) -> Handle;
+            struct Owner {{ {field} n: i32 }}
+            fn make_and_discard(k: i32) -> i32 {{
+                let mut o = Owner({value} n: k);
+                o.n = k + 1;
+                o.n
+            }}
+            fn main() -> i32 {{ make_and_discard(4) }}
+            "#
+        )
+    };
+    let releases = |src: &str| refcounted_mlir_text(&context(), src).matches("call @cleave_release").count();
+    let with_handle = releases(&program("h: Handle,", "h: open_handle(1),"));
+    let without = releases(&program("", ""));
+    assert_eq!(with_handle, without, "releasing `Owner` cascades into its handle");
 }
 
-/// The same fix, verified end to end via a real JIT run too (not a
-/// reliable *reproduction* of the probabilistic corruption on its own —
-/// see the structural test above for that — but a real, additional
-/// correctness check: the actual computed values must still be right).
 #[test]
-fn dynarray_of_primitives_still_computes_correct_values_after_the_rawbuf_fix() {
+fn a_dynarray_of_primitives_reads_back_its_values() {
     let src = r#"
         use dynarray;
         fn main() -> i32 {
@@ -481,10 +425,7 @@ fn dynarray_of_primitives_still_computes_correct_values_after_the_rawbuf_fix() {
             h.get(0) + h.get(1) + h.get(2)
         }
         "#;
-    // `cleave-rt`'s `dynarray_*` functions are the runtime's own, registered
-    // with it (`pipeline::register_cleave_rt_symbols`).
-    let symbols: &[(&str, *mut ())] = &[];
-    assert_eq!(run_i32_with_extra_symbols(src, symbols), 60);
+    assert_eq!(run_i32_with_extra_symbols(src, &[]), 60);
 }
 
 /// A real, found-by-testing bug (`doc/backlog-done.md`'s own "an array
@@ -498,8 +439,8 @@ fn dynarray_of_primitives_still_computes_correct_values_after_the_rawbuf_fix() {
 /// included `PrimOp::Array` at all, so every freshly-constructed struct fed
 /// into an array literal was released immediately after the array was
 /// built, with no retain protecting the array's own now-dangling copy.
-/// Structural, not JIT-execution-based, for the identical reason the
-/// `RawBuf` test above is: the corruption itself is probabilistic.
+/// Structural, not JIT-execution-based: the corruption itself is
+/// probabilistic.
 ///
 /// `Point` here is deliberately given a real field mutation on a *separate*
 /// binding (`extra.x = 9.0;`, never read again) purely so `mlir_lower.rs::
@@ -871,4 +812,45 @@ fn a_wrapper_around_a_genuinely_identity_shaped_function_is_also_identity_shaped
          (the real mnist-interop double-free this reproduces) and not none"
     );
     assert_eq!(run_i32(src), 2);
+}
+
+/// Whether `expr` retains anything: a `Retain`, or a light struct's leaves
+/// retained through its glue (`LeafGlue`).
+fn retains_anything(expr: &CExpr) -> bool {
+    match expr {
+        CExpr::LetPrim { op, cont, .. } => {
+            matches!(op, PrimOp::Retain(_) | PrimOp::LeafGlue { .. }) || retains_anything(cont)
+        }
+        CExpr::App { .. } => false,
+        CExpr::If { then_branch, else_branch, .. } => retains_anything(then_branch) || retains_anything(else_branch),
+        CExpr::Fix { defs, body } => defs.iter().any(|d| retains_anything(&d.body)) || retains_anything(body),
+    }
+}
+
+/// An element read out of an array the function borrowed, then returned:
+/// the caller takes any call's result as owned and releases it, while the
+/// array's owner releases it too when the array dies, so the function
+/// returns a reference of its own. It used to return the borrowed one: the
+/// element was released twice (`CLEAVE_DEBUG_POOL`: a release of an
+/// already-freed block). `Buffer<T>`'s `buffer_get` is the same read.
+#[test]
+fn an_element_read_from_a_borrowed_array_and_returned_is_retained() {
+    let program = refcounted_cps(
+        "
+        use nn;
+        struct Holder { t: Tensor<f32, 4, 4>, k: i32 }
+        fn pick(a: [Holder; 2], i: i32) -> Holder { a[i] }
+        fn main() -> i32 {
+            let m: Tensor<f32, 4, 4> = Init::xavier();
+            let a = [Holder(t: m, k: 1), Holder(t: Scale::scale(m, 2.0), k: 2)];
+            pick(a, 1).k
+        }
+        ",
+    );
+    let pick = program
+        .funcs
+        .iter()
+        .find(|f| f.def.name == "pick")
+        .expect("`pick` is a function of the program");
+    assert!(retains_anything(&pick.def.body), "`pick` returns its element unretained:\n{:?}", pick.def.body);
 }

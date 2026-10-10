@@ -3237,3 +3237,77 @@ it, directly or not (`CrateScopes`, built by `driver::crate_scopes` from each cr
 prelude). No crate uses the program's, so its functions never reach the stdlib's bodies; within the
 program the rule is unchanged (the local `fn` wins, the qualified form reaches the algebra). Test:
 `mlir_lower.rs::a_programs_fn_does_not_shadow_an_algebra_method_inside_the_stdlib`.
+
+### `Buffer<T>`, and `DynArray` built on it
+
+Its slots hold references (`dynarray_set_ptr` retains, `dynarray_get_ptr` hands out a retained one,
+an overwritten element is released), but the `DynArray` envelope has no release cascade into its
+buffer: the elements it still holds when it dies leak. And an element released through
+`dynarray_set_ptr` (overwritten) is released flat (`cleave_release`), without the cascade into its
+own refcounted fields that the compiler generates per type.
+
+**Fixed 2026-10-10** (`doc/plan-buffer.md`, steps 1-2). `Buffer<T>` (`stdlib/buffer`): a refcounted object
+holding a separate, zeroed allocation of slots laid out as an array's, an all-zero slot empty; reading
+and writing a slot are `Load`/`Store` on it, its release a loop releasing each non-empty slot's element
+through its type's cascade, then its slots. `DynArray<T>` is `{buf: Buffer<T>, len: i32}` in plain
+stdlib; `RawBuf`, `RawBuffer`, `HeapStruct` (and its synthesis in the driver) and the 26 `dynarray_*`
+runtime symbols are gone. Any element: a number, a light or heavy struct, a tensor.
+
+Building it surfaced six generic bugs, each fixed where it lived:
+- `refcount.rs`: an element read out of a borrowed container (`a[i]`) and returned wasn't retained,
+  while the caller released it and the container's owner did too: released twice (`ValueDef::Element`).
+- `refcount.rs`: a light struct built from a bare tensor parameter and stored never released its leaf
+  (`skippable_param_leaf`): the leaf is lowering's copy of the parameter, not the parameter.
+- `alias_analysis.rs` rule 4b: a value stored into a slot (`Store`) is read back by a runtime index, as
+  an array literal's element is: aliased. A struct stored by a callee was pool-allocated without a
+  header and freed at its last use while the container held it.
+- `region_analysis.rs`: a value passed to a call that may store it escapes the iteration
+  (`collect_stored`, from `alias_analysis`'s summary), and a function writing into storage its
+  parameters reach is never region-local (`writes_through_params`): both kept what they stored in an
+  arena freed at the end of the iteration.
+- `mlir_lower.rs`: releasing an empty slot's heavy struct read its fields from a null pointer
+  (`release_pending` checks it).
+- The leak tests measured nothing when the function under test was region-local (its arena freed
+  everything): `a_buffer_of_structs_leaves_nothing_behind` calls it from two sites; checked to fail
+  without the release loop (105 KB per step).
+
+Tests: `leaks.rs` (`a_buffer_*`), `refcount.rs::an_element_read_from_a_borrowed_array_and_returned_is_retained`,
+the foreign-handle tests (rewritten without `RawBuf`), the existing `DynArray` tests,
+`examples/convex_hull`. mnist, digits and nanoLM's LLVM dialect is unchanged.
+
+### `take`, `pop` and `HashMap` (`doc/plan-buffer.md`, steps 3-4)
+
+`buffer_take(b, i)` (`PrimOp::BufferTake`): a slot's element, the slot left empty, its reference moving
+to the result, no retain/release pair. `DynArray::pop` on it. `HashMap<K, V>` (`stdlib/hashmap`), plain
+stdlib over three `Buffer`s: open addressing, linear probing, a power-of-two capacity rehashed at three
+quarters full, removed slots kept as tombstones; `insert`, `contains`, `lookup`, `remove`, `len`; keys
+hashed through a `Hash<T>` algebra (`i32`, `i64`: MurmurHash3's `fmix32`). Tests: `leaks.rs`
+(`taking_from_a_buffer_*`, `popping_a_dynarray_*`, `a_hashmap_*`), each leak test checked to fail without
+the buffer's release loop, and the programs checked free of double releases under `CLEAVE_DEBUG_POOL`
+(which does catch a `take` that doesn't empty its slot).
+
+### Enums with data and `match` (`doc/plan-sum-types.md`, steps 1-3)
+
+`enum E<G> { V(T0, T1), W }` and `match e { V(a, _) => .., W => .. }`, Rust-style and limited: positional
+data, variant patterns and `_`, exhaustiveness checked (the missing variants named), variant names unique
+across a program. `cleave/src/enums.rs` lowers them right after the crates merge: an enum is a struct (a
+tag, then every variant's data, a sum of fields) flagged `zero_fill`, each variant a generic constructor
+leaving the other variants' fields all zero, a `match` a block binding the scrutinee then `if`s on the tag.
+Nothing downstream changed but lowering: a `zero_fill` literal zeroes what it omits, a release cascade
+skips a null object (it reads the object before releasing it), `cleave_retain` ignores null. `Option<T>`
+is in the prelude (`stdlib/core`); `HashMap::lookup` returns it.
+
+Two pre-existing `refcount.rs` bugs, both made common by `Some(x) => x.t`, fixed generically:
+- A tensor field of a struct bound in an `if`'s branch, the `if`'s value: the join after it released the
+  struct it couldn't reach, a compiler panic (`unbound CPS variable`). Such a view is now adopted
+  (`TensorViews::adopt_out_of_scope`), as one carried by a loop is.
+- A tensor field (or slot) of a parameter, returned: retained, then copied to the caller's out-parameter,
+  so the reference leaked, one tensor per call. No longer retained (`returned_param_args`).
+
+The leak tests now hold the runtime lock for a whole test (`leaks.rs::serial`): another test's run
+between the two compared runs skewed them by a pool block, an intermittent failure (208 bytes per step).
+
+Tests: `cleave/tests/enums.rs` (values, generic `Option`, structs and tensors as data, every error),
+`leaks.rs` (`enums_holding_*`, `a_field_of_a_struct_bound_in_a_branch_leaves_the_if`, the `HashMap` tests
+on `lookup`'s `Option`). The 18 examples' LLVM dialect is unchanged but for null checks in cascades.
+

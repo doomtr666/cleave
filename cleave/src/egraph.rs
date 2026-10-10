@@ -430,6 +430,9 @@ use crate::collections::HashMap;
 /// field existed (`Print<T>::print`'s own real, order-dependent effect is
 /// the reason this default can never flip on its own).
 fn is_pure_prim_op(op: &PrimOp) -> bool {
+    // A `Store` into a buffer (`stdlib/buffer`, `array_ty` a `Buffer<T>`,
+    // not an array) is an effect: a buffer's slots are state other holders
+    // read.
     matches!(
         op,
         PrimOp::RawMlirOp { .. }
@@ -438,8 +441,8 @@ fn is_pure_prim_op(op: &PrimOp) -> bool {
             | PrimOp::Array
             | PrimOp::ArrayRepeat
             | PrimOp::Load { .. }
-            | PrimOp::Store { .. }
-    ) || matches!(op, PrimOp::Extern { pure: true, .. })
+    ) || matches!(op, PrimOp::Store { array_ty: Ty::Array(..) })
+        || matches!(op, PrimOp::Extern { pure: true, .. })
 }
 
 /// Whether `expr`'s own body contains no real control flow (`Fix`/`If`) and

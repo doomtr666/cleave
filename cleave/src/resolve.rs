@@ -249,6 +249,7 @@ impl Resolver<'_> {
 
     fn expr(&self, expr: &mut Expr, scope: &mut Vec<Local>) {
         match &mut expr.kind {
+            ExprKind::Match { .. } => unreachable!("a `match` is lowered by `driver::desugar_enums`"),
             ExprKind::Spawn(call) => self.expr(call, scope),
             ExprKind::NumberLit { .. }
             | ExprKind::ImaginaryLit { .. }

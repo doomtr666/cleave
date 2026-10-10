@@ -1,178 +1,49 @@
-// `DynArray<T>` — a real, growable collection (`doc/backlog.md`'s own
-// former "No dynamic-size collection" item, the confirmed blocker for
-// output-size-unknown-at-compile-time workloads like convex hull/
-// triangulation). Built entirely as an ordinary generic struct + algebra
-// impls + a handful of `cleave-rt` extern fns (`cleave-rt/src/lib.rs`'s own
-// `dynarray_*` functions) — the identical "no new `Ty::Vector`-style
-// compiler variant" discipline `stdlib/linalg/tensor.cleave`'s own top
-// comment already documents (that file's own earlier version *was* a
-// hardcoded `Ty::Vector`, reverted for exactly this reason). `use dynarray;`
-// explicitly — not prelude, matching `io`/`vector`/`complex`'s own
-// precedent: a program that never constructs one sees zero change.
+// `DynArray<T>` — a growable sequence, the default target of a comprehension
+// whose length is only known at run time (`[for i in 0..n: ...]`). Plain
+// stdlib over `Buffer<T>` (`stdlib/buffer`), which holds its elements and
+// releases them when the last reference to it goes: a `DynArray` is a
+// struct, hence a reference, mutated in place by `push`/`set` (`mut v`), and
+// its buffer is its own, never handed out, so growing it in place is seen by
+// every holder of the `DynArray`. `use dynarray;` explicitly: a program that
+// never builds one sees no change.
+use buffer;
 
-// A real, opaque, nominal handle type for the raw heap buffer backing a
-// `DynArray<T>` — zero fields, never constructed via `RawBuf(...)` anywhere
-// in this module, only ever produced/consumed by the `RawBuffer<T>` impls
-// below. This also serves as this project's own opaque-pointer story
-// (`doc/backlog.md`'s own separate, now-also-closed "No opaque/foreign-
-// pointer type for FFI-style resources" item): a real, declared, nominal
-// type, distinguishable from a bare `i64`/another opaque handle at the type
-// level, exactly what that item asked for — `mlir_lower.rs::ty_to_mlir`'s
-// own existing struct fallback (any non-primitive `Ty::Con`/`Ty::App` is an
-// opaque `!llvm.ptr`) is all it ever needs, no compiler change at all. One
-// honest residual gap versus a "real" `extern type Handle;`: nothing stops
-// accidentally writing `RawBuf()` (an empty struct literal, legal today,
-// would silently heap-allocate a meaningless zero-byte block) — nothing in
-// this module ever does, but a future FFI use of this same trick should
-// keep that in mind.
-// `T`, the element type, is never stored: it only makes the handle's type say
-// what it holds, which is what selects the right `RawBuffer<T>` impl for
-// `alloc`/`grow` — their arguments (a count, a buffer) would not otherwise say
-// which element width to allocate for.
-struct RawBuf<T> {}
+struct DynArray<T> { buf: Buffer<T>, len: i32 }
 
-// The raw, per-width storage primitive `DynArray<T>` itself is built on top
-// of, one `impl` per concrete `T` — exactly `Print<T>`'s own per-width
-// `impl` shape (`stdlib/io/io.cleave`). `alloc`/`grow` are element-*count*
-// based (not bytes) — each impl below hardcodes its own element's byte
-// width when it calls into `cleave-rt`, so cleave source itself never needs
-// a generic `sizeof<T>()` mechanism (none exists). `get`/`set` are a plain,
-// unchecked pointer-offset read/write — no bounds checking, matching this
-// codebase's already-established "no runtime memory-safety enforcement"
-// posture (`stdlib/linalg/tensor.cleave`'s own `Index` impls, a dynamic
-// index into a real array, have none either).
-// `raw_get`/`raw_set`, not `get`/`set`: the top-level `get`/`set` below would
-// shadow these methods for every bare call in this file (`resolve.rs`: a
-// top-level `fn` wins over an algebra method of the same name), so the
-// distinct names keep both levels callable without qualification.
-algebra RawBuffer<T> {
-    fn alloc(cap: i32) -> RawBuf<T>;
-    fn grow(buf: RawBuf<T>, old_cap: i32, new_cap: i32) -> RawBuf<T>;
-    fn raw_get(buf: RawBuf<T>, i: i32) -> T;
-    fn raw_set(buf: RawBuf<T>, i: i32, x: T);
-}
-
-impl RawBuffer<i8> {
-    extern(dynarray_alloc_i8) fn alloc(cap: i32) -> RawBuf<i8>;
-    extern(dynarray_grow_i8) fn grow(buf: RawBuf<i8>, old_cap: i32, new_cap: i32) -> RawBuf<i8>;
-    extern(dynarray_get_i8) fn raw_get(buf: RawBuf<i8>, i: i32) -> i8;
-    extern(dynarray_set_i8) fn raw_set(buf: RawBuf<i8>, i: i32, x: i8);
-}
-impl RawBuffer<i16> {
-    extern(dynarray_alloc_i16) fn alloc(cap: i32) -> RawBuf<i16>;
-    extern(dynarray_grow_i16) fn grow(buf: RawBuf<i16>, old_cap: i32, new_cap: i32) -> RawBuf<i16>;
-    extern(dynarray_get_i16) fn raw_get(buf: RawBuf<i16>, i: i32) -> i16;
-    extern(dynarray_set_i16) fn raw_set(buf: RawBuf<i16>, i: i32, x: i16);
-}
-impl RawBuffer<i32> {
-    extern(dynarray_alloc_i32) fn alloc(cap: i32) -> RawBuf<i32>;
-    extern(dynarray_grow_i32) fn grow(buf: RawBuf<i32>, old_cap: i32, new_cap: i32) -> RawBuf<i32>;
-    extern(dynarray_get_i32) fn raw_get(buf: RawBuf<i32>, i: i32) -> i32;
-    extern(dynarray_set_i32) fn raw_set(buf: RawBuf<i32>, i: i32, x: i32);
-}
-impl RawBuffer<i64> {
-    extern(dynarray_alloc_i64) fn alloc(cap: i32) -> RawBuf<i64>;
-    extern(dynarray_grow_i64) fn grow(buf: RawBuf<i64>, old_cap: i32, new_cap: i32) -> RawBuf<i64>;
-    extern(dynarray_get_i64) fn raw_get(buf: RawBuf<i64>, i: i32) -> i64;
-    extern(dynarray_set_i64) fn raw_set(buf: RawBuf<i64>, i: i32, x: i64);
-}
-impl RawBuffer<f32> {
-    extern(dynarray_alloc_f32) fn alloc(cap: i32) -> RawBuf<f32>;
-    extern(dynarray_grow_f32) fn grow(buf: RawBuf<f32>, old_cap: i32, new_cap: i32) -> RawBuf<f32>;
-    extern(dynarray_get_f32) fn raw_get(buf: RawBuf<f32>, i: i32) -> f32;
-    extern(dynarray_set_f32) fn raw_set(buf: RawBuf<f32>, i: i32, x: f32);
-}
-impl RawBuffer<f64> {
-    extern(dynarray_alloc_f64) fn alloc(cap: i32) -> RawBuf<f64>;
-    extern(dynarray_grow_f64) fn grow(buf: RawBuf<f64>, old_cap: i32, new_cap: i32) -> RawBuf<f64>;
-    extern(dynarray_get_f64) fn raw_get(buf: RawBuf<f64>, i: i32) -> f64;
-    extern(dynarray_set_f64) fn raw_set(buf: RawBuf<f64>, i: i32, x: f64);
-}
-
-// A struct-typed element (`Point`, or any other user struct) used to need
-// its own hand-written, copy-pasted `impl RawBuffer<Point> { ... }` here —
-// `doc/backlog-done.md`'s own "`DynArray<T>` needs a hand-written `impl
-// RawBuffer<Struct>` per struct element type" item — even though the four
-// `extern(...)` symbol names are always these exact same four `_ptr`-
-// suffixed `cleave-rt` functions, verbatim, for *every* struct type, with
-// zero exceptions: every cleave struct value is already an opaque pointer
-// of identical shape (`mlir_lower.rs::ty_to_mlir`'s own struct fallback), so
-// there was never any real per-type information in that impl block at all.
-// `HeapStruct<T>` (`driver.rs::synthesize_heap_struct_marker_impls`) is a
-// compiler-synthesized, zero-method marker algebra — an empty `impl
-// HeapStruct<S> {}` is mechanically generated for *every* plain, ordinary
-// (untagged, non-pack) struct declaration in the whole program, the same
-// "empty marker impl, real content lives entirely in the fact it exists"
-// shape `Int`/`Float`/`NativeShape<T>` already use, just synthesized
-// instead of hand-declared per concrete type. One `impl` here, written
-// once, now covers every struct ever declared, present or future, with zero
-// per-struct-type boilerplate anywhere in user code.
-algebra HeapStruct<T> {}
-
-impl<S: HeapStruct> RawBuffer<S> {
-    extern(dynarray_alloc_ptr) fn alloc(cap: i32) -> RawBuf<S>;
-    extern(dynarray_grow_ptr) fn grow(buf: RawBuf<S>, old_cap: i32, new_cap: i32) -> RawBuf<S>;
-    extern(dynarray_get_ptr) fn raw_get(buf: RawBuf<S>, i: i32) -> S;
-    extern(dynarray_set_ptr) fn raw_set(buf: RawBuf<S>, i: i32, x: S);
-}
-
-struct DynArray<T> { buf: RawBuf<T>, len: i32, cap: i32 }
-
-// `dynarray_new` takes the caller's starting capacity. (It once had to take
-// a parameter to be generalized at all — nullary top-level fns weren't —
-// which `callgraph.rs::is_unquantified_root` has since lifted.)
+// An empty `DynArray` with room for `initial_cap` elements before it grows.
 fn dynarray_new<T>(initial_cap: i32) -> DynArray<T> {
-    DynArray(buf: alloc(initial_cap), len: 0, cap: initial_cap)
+    DynArray(buf: buffer_alloc(initial_cap), len: 0)
 }
 
-// `v.push(x)`/`v.get(i)`/`v.set(i,x)`/`v.len()` — ordinary top-level generic
-// `fn`s, called through dot-syntax's own universal sugar (`v.push(x)` desugars
-// to `push(v, x)`, resolved the same way any other bare call is — `doc/
-// backlog-done.md`'s own "impls inhérents" entry). These used to be an
-// inherent impl (`impl<T> DynArray<T> { ... }`), a wholly separate dispatch
-// mechanism from the `RawBuffer<T>` algebra above — that mechanism no longer
-// exists at all, so these are indistinguishable, at the language level, from
-// any other top-level `fn`; only the (now-renamed) `raw_get`/`raw_set` naming
-// above keeps this file's own two "levels" (the raw per-width primitive vs.
-// this public wrapper) from colliding in the one shared resolution `get`/
-// `set` now go through. A `DynArray` is a struct, hence already a heap
-// reference (mutated in place, never copied) — `push`'s own `mut v`
-// parameter (`doc/backlog-done.md`'s own note on why a plain, non-`mut`
-// parameter couldn't reassign any of its own fields either, found directly
-// while writing this exact method) is what lets `v.buf`/`v.len`/`v.cap`
-// mutate the struct the *caller's* own variable already points at, not a
-// separate copy.
+// `v.push(x)`/`v.pop()`/`v.get(i)`/`v.set(i, x)`/`v.len()`: plain top-level `fn`s,
+// reached through dot syntax (`v.push(x)` is `push(v, x)`). Indices aren't
+// checked.
 fn push<T>(mut v: DynArray<T>, x: T) {
-    if v.len == v.cap {
-        let new_cap: i32 = v.cap * 2;
-        v.buf = grow(v.buf, v.cap, new_cap);
-        v.cap = new_cap;
+    let cap = buffer_capacity(v.buf);
+    if v.len == cap {
+        buffer_grow(v.buf, if cap == 0 { 4 } else { 2 * cap });
     };
-    raw_set(v.buf, v.len, x);
+    buffer_set(v.buf, v.len, x);
     v.len = v.len + 1;
 }
-fn get<T>(v: DynArray<T>, i: i32) -> T { raw_get(v.buf, i) }
-fn set<T>(v: DynArray<T>, i: i32, x: T) { raw_set(v.buf, i, x); }
+// The last element, removed. The `DynArray` must not be empty.
+fn pop<T>(mut v: DynArray<T>) -> T {
+    v.len = v.len - 1;
+    buffer_take(v.buf, v.len)
+}
+fn get<T>(v: DynArray<T>, i: i32) -> T { buffer_get(v.buf, i) }
+fn set<T>(v: DynArray<T>, i: i32, x: T) { buffer_set(v.buf, i, x); }
 impl<T> Len<DynArray<T>> {
     fn len(v) { v.len }
 }
 
-// `v[i]` (read) — reuses `vector`'s own `Index<Container, Elem, K>` fallback
-// dispatch, the exact mechanism `Tensor` already uses for its own non-array
-// element access. Deliberately read-only: `v[i] = x`
-// write syntax is not attempted here — `infer.rs`'s own `StmtKind::Assign`
-// guard rejects a non-array `Index` assignment target outright today (added
-// so a tensor-backed value, immutable by construction, can't be silently
-// "mutated" through `[i]=`) — `DynArray` mutation goes through `.set(i, x)`
-// instead, a real if minor ergonomic gap, not worth reopening that guard
-// for this pass.
+// `v[i]` (read), through `Index` as a tensor's element. Writing goes through
+// `v.set(i, x)`: `infer.rs` rejects a non-array `Index` assignment target.
 impl<T> Index<DynArray<T>, T> {
-    fn index(v: DynArray<T>, idx: [i32; 1]) -> T { raw_get(v.buf, idx[0]) }
+    fn index(v: DynArray<T>, idx: [i32; 1]) -> T { buffer_get(v.buf, idx[0]) }
 }
 
-// A `DynArray` seeded by a comprehension (`Generate`, `stdlib/core`): the
-// default target when the comprehension's length is only known at run time
-// (`[for i in 0..n: ...]`).
+// A `DynArray` seeded by a comprehension (`Generate`, `stdlib/core`).
 impl<T> Generate<DynArray<T>, T> {
     fn generate(start, end, f) {
         let mut v: DynArray<T> = dynarray_new(end - start + 1);

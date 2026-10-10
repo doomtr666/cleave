@@ -85,6 +85,7 @@ impl Lowerer {
             Rule::const_decl => ItemKind::Const(self.lower_const_decl(inner)),
             Rule::define_decl => ItemKind::Define(self.lower_define_decl(inner)),
             Rule::struct_decl => ItemKind::Struct(self.lower_struct_decl(inner)),
+            Rule::enum_decl => ItemKind::Enum(self.lower_enum_decl(inner)),
             Rule::algebra_decl => ItemKind::Algebra(self.lower_algebra_decl(inner)),
             Rule::impl_decl => {
                 let variant = inner.into_inner().next().unwrap();
@@ -360,7 +361,31 @@ impl Lowerer {
             name,
             generics,
             fields,
+            zero_fill: false,
         }
+    }
+
+    fn lower_enum_decl(&mut self, pair: Pair<Rule>) -> EnumDecl {
+        let mut inner = pair.into_inner().filter(|p| p.as_rule() != Rule::enum_kw).peekable();
+        let name = inner.next().unwrap().as_str().to_string();
+        let generics = if matches!(inner.peek().map(|p| p.as_rule()), Some(Rule::generic_params)) {
+            self.lower_generic_params(inner.next().unwrap())
+        } else {
+            Vec::new()
+        };
+        let variants = match inner.next() {
+            Some(list) => list
+                .into_inner()
+                .map(|variant| {
+                    let mut parts = variant.into_inner();
+                    let name = parts.next().unwrap().as_str().to_string();
+                    let fields = parts.map(|t| self.lower_type(t)).collect();
+                    Variant { name, fields }
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        EnumDecl { name, generics, variants }
     }
 
     fn lower_field_list(&mut self, pair: Pair<Rule>) -> Vec<Field> {
@@ -1134,6 +1159,7 @@ impl Lowerer {
         let inner = pair.into_inner().next().unwrap();
         match inner.as_rule() {
             Rule::if_expr => self.lower_if_expr(inner),
+            Rule::match_expr => self.lower_match_expr(inner),
             Rule::while_expr => self.lower_while_expr(inner),
             Rule::for_expr => self.lower_for_expr(inner),
             Rule::comprehension => self.lower_comprehension(inner),
@@ -1311,6 +1337,32 @@ impl Lowerer {
                 else_branch,
             },
         )
+    }
+
+    fn lower_match_expr(&mut self, pair: Pair<Rule>) -> Expr {
+        let span = self.span_of(&pair);
+        let mut inner = pair.into_inner().filter(|p| p.as_rule() != Rule::match_kw);
+        let scrutinee = Box::new(self.lower_expr(inner.next().unwrap()));
+        let arms = inner
+            .map(|arm| {
+                let arm_span = self.span_of(&arm);
+                let mut parts = arm.into_inner();
+                let pattern_pair = parts.next().unwrap().into_inner().next().unwrap();
+                let pattern = match pattern_pair.as_rule() {
+                    Rule::wildcard_pattern => Pattern::Wildcard,
+                    Rule::variant_pattern => {
+                        let mut pieces = pattern_pair.into_inner();
+                        let path = self.lower_path(pieces.next().unwrap());
+                        let bindings = pieces.map(|b| b.as_str().to_string()).collect();
+                        Pattern::Variant { path, bindings }
+                    }
+                    r => unreachable!("pattern: unexpected rule {r:?}"),
+                };
+                let body = self.lower_expr(parts.next().unwrap());
+                MatchArm { pattern, body, span: arm_span }
+            })
+            .collect();
+        self.wrap(span, ExprKind::Match { scrutinee, arms })
     }
 
     fn lower_while_expr(&mut self, pair: Pair<Rule>) -> Expr {

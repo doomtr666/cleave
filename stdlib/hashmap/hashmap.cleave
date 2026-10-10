@@ -1,0 +1,135 @@
+// `HashMap<K, V>` — keys mapped to values, plain stdlib over three
+// `Buffer`s (`stdlib/buffer`): open addressing with linear probing, a
+// capacity that is a power of two, grown (rehashed into twice the slots)
+// before three quarters of them are in use. A slot's state is empty (0),
+// full (1) or removed (2); a removed slot keeps probes going past it and is
+// reused by an insertion. A `HashMap` is a struct, hence a reference,
+// mutated in place by `insert`/`remove`. `K` needs `Hash` and `==`.
+use buffer;
+
+// A key's hash: spread over all 32 bits, since the slot is its low bits.
+algebra Hash<T> {
+    fn hash(x: T) -> i32;
+}
+
+// MurmurHash3's 32-bit finalizer: every input bit flips each output bit
+// with probability close to one half.
+fn hashmap_fmix32(x: i32) -> i32 {
+    let c16: i32 = 16;
+    let c13: i32 = 13;
+    let m1: i32 = -2048144789;
+    let m2: i32 = -1028477387;
+    let s1: i32 = mlir::arith::shrui(x, c16);
+    let h1: i32 = mlir::arith::xori(x, s1);
+    let h2: i32 = mlir::arith::muli(h1, m1);
+    let s2: i32 = mlir::arith::shrui(h2, c13);
+    let h3: i32 = mlir::arith::xori(h2, s2);
+    let h4: i32 = mlir::arith::muli(h3, m2);
+    let s3: i32 = mlir::arith::shrui(h4, c16);
+    mlir::arith::xori(h4, s3)
+}
+
+impl Hash<i32> {
+    fn hash(x: i32) -> i32 { hashmap_fmix32(x) }
+}
+impl Hash<i64> {
+    fn hash(x: i64) -> i32 {
+        let c32: i64 = 32;
+        let high: i64 = mlir::arith::shrui(x, c32);
+        let lo: i32 = mlir::arith::trunci(x);
+        let hi: i32 = mlir::arith::trunci(high);
+        let folded: i32 = mlir::arith::xori(lo, hi);
+        hashmap_fmix32(folded)
+    }
+}
+
+struct HashMap<K, V> { keys: Buffer<K>, values: Buffer<V>, state: Buffer<i8>, len: i32, used: i32 }
+
+// An empty `HashMap` with room for `min_cap` entries before it grows.
+fn hashmap_new<K, V>(min_cap: i32) -> HashMap<K, V> {
+    let mut cap = 8;
+    while 3 * cap < 4 * min_cap { cap = 2 * cap; };
+    HashMap(keys: buffer_alloc(cap), values: buffer_alloc(cap), state: buffer_alloc(cap), len: 0, used: 0)
+}
+
+// The slot holding `k`, or -1.
+fn hashmap_find<K, V>(m: HashMap<K, V>, k: K) -> i32 {
+    let mask = buffer_capacity(m.state) - 1;
+    let mut i = Bitwise::bitand(hash(k), mask);
+    let mut found = -1;
+    let mut probing = true;
+    while probing {
+        let s = buffer_get(m.state, i);
+        if s == 0 {
+            probing = false;
+        } else {
+            if s == 1 and buffer_get(m.keys, i) == k {
+                found = i;
+                probing = false;
+            } else {
+                i = Bitwise::bitand(i + 1, mask);
+            };
+        };
+    };
+    found
+}
+
+// Moves every entry into `cap` fresh slots.
+fn hashmap_rehash<K, V>(mut m: HashMap<K, V>, cap: i32) {
+    let old_keys = m.keys;
+    let old_values = m.values;
+    let old_state = m.state;
+    m.keys = buffer_alloc(cap);
+    m.values = buffer_alloc(cap);
+    m.state = buffer_alloc(cap);
+    m.len = 0;
+    m.used = 0;
+    for i in 0..buffer_capacity(old_state) {
+        if buffer_get(old_state, i) == 1 {
+            insert(m, buffer_take(old_keys, i), buffer_take(old_values, i));
+        };
+    };
+}
+
+// Maps `k` to `v`, replacing what `k` mapped to.
+fn insert<K, V>(mut m: HashMap<K, V>, k: K, v: V) {
+    let at = hashmap_find(m, k);
+    if at >= 0 {
+        buffer_set(m.values, at, v);
+    } else {
+        if 4 * (m.used + 1) > 3 * buffer_capacity(m.state) {
+            hashmap_rehash(m, 2 * buffer_capacity(m.state));
+        };
+        let mask = buffer_capacity(m.state) - 1;
+        let mut i = Bitwise::bitand(hash(k), mask);
+        while buffer_get(m.state, i) == 1 { i = Bitwise::bitand(i + 1, mask); };
+        if buffer_get(m.state, i) == 0 { m.used = m.used + 1; };
+        buffer_set(m.keys, i, k);
+        buffer_set(m.values, i, v);
+        buffer_set(m.state, i, 1);
+        m.len = m.len + 1;
+    };
+}
+
+fn contains<K, V>(m: HashMap<K, V>, k: K) -> bool { hashmap_find(m, k) >= 0 }
+
+// What `k` maps to, if it is in the map.
+fn lookup<K, V>(m: HashMap<K, V>, k: K) -> Option<V> {
+    let at = hashmap_find(m, k);
+    if at >= 0 { Some(buffer_get(m.values, at)) } else { None }
+}
+
+// Removes `k` and what it maps to, if it is in the map.
+fn remove<K, V>(mut m: HashMap<K, V>, k: K) {
+    let at = hashmap_find(m, k);
+    if at >= 0 {
+        let key = buffer_take(m.keys, at);
+        let value = buffer_take(m.values, at);
+        buffer_set(m.state, at, 2);
+        m.len = m.len - 1;
+    };
+}
+
+impl<K, V> Len<HashMap<K, V>> {
+    fn len(m) { m.len }
+}

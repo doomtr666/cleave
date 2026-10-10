@@ -1,0 +1,32 @@
+// `Buffer<T>` — a growable run of slots of `T`, refcounted, the one primitive
+// dynamic containers (`DynArray`, a hash map...) are built on
+// (`doc/plan-buffer.md`). A buffer is a reference, like any heavy struct:
+// every holder sees what is stored into it and its growth. A slot holds its
+// element as an array's slot does (a scalar, a struct, a tensor), owning one
+// reference to it. An all-zero slot is empty: a new buffer's slots and the
+// slots growth adds are empty, and a dying buffer releases the elements of
+// its non-empty slots. Indices aren't checked.
+struct Buffer<T> {}
+
+algebra BufferShape<T> {}
+
+#[mlir_type(buffer)]
+impl<T> BufferShape<Buffer<T>> {}
+
+// A buffer of `cap` empty slots.
+fn buffer_alloc<T>(cap: i32) -> Buffer<T> { mlir::cleave::buffer_alloc(cap) }
+
+// Slot `i`'s element. The slot must not be empty.
+fn buffer_get<T>(b: Buffer<T>, i: i32) -> T { mlir::cleave::buffer_get(b, i) }
+
+// Stores `x` into slot `i`, releasing the element it held.
+fn buffer_set<T>(b: Buffer<T>, i: i32, x: T) { mlir::cleave::buffer_set(b, i, x); }
+
+fn buffer_capacity<T>(b: Buffer<T>) -> i32 { mlir::cleave::buffer_capacity(b) }
+
+// Grows `b` to `cap` slots (no change below its capacity), the new ones
+// empty, every element kept in its slot.
+fn buffer_grow<T>(b: Buffer<T>, cap: i32) { mlir::cleave::buffer_grow(b, cap); }
+
+// Slot `i`'s element, leaving the slot empty. The slot must not be empty.
+fn buffer_take<T>(b: Buffer<T>, i: i32) -> T { mlir::cleave::buffer_take(b, i) }

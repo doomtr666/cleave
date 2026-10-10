@@ -54,6 +54,7 @@ pub fn dump_program(program: &Program, registry: &Registry) -> (String, Vec<Type
             ItemKind::Struct(d) => {
                 let _ = writeln!(out, "struct {} {{ /* not type-inferred yet */ }}", d.name);
             }
+            ItemKind::Enum(_) => unreachable!("an `enum` is lowered by `driver::desugar_enums`"),
             ItemKind::Algebra(d) => {
                 let _ = writeln!(out, "algebra {} {{ /* not type-inferred yet */ }}", d.name);
             }
@@ -404,6 +405,7 @@ fn fmt_expr_typed(
     }
 
     let base = match &e.kind {
+        ExprKind::Match { .. } => unreachable!("a `match` is lowered by `driver::desugar_enums`"),
         ExprKind::Spawn(call) => format!("spawn {}", fmt_expr_typed(call, node_types, names, call_names)),
         ExprKind::NumberLit { text, .. } => text.clone(),
         ExprKind::ImaginaryLit { text, .. } => format!("{text}i"),

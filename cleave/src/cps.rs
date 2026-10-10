@@ -1153,6 +1153,16 @@ pub enum PrimOp {
     Store {
         array_ty: Ty,
     },
+    /// `args = [cap]`: a new `Buffer<T>` (the bound type) of `cap` empty
+    /// slots (`stdlib/buffer`, `doc/plan-buffer.md`), owned by this scope as
+    /// a construction is. Its own op rather than a runtime call: the slot's
+    /// size is known only once `T` is laid out (`mlir_lower.rs`).
+    BufferAlloc,
+    /// `args = [buffer, index]`: the element of a `Buffer<T>`'s slot, which
+    /// is left empty (all zero): the slot's reference becomes the result's,
+    /// owned by this scope as a construction is (`stdlib/buffer`'s
+    /// `buffer_take`).
+    BufferTake,
     /// A call to a real, separately-compiled C-ABI symbol (`UnitBody::
     /// Extern`) — `param_types` is threaded through explicitly (from the
     /// callee's own `ConcreteUnit::param_types`, already on hand at
@@ -2446,15 +2456,14 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
             let arg_refs: Vec<&Expr> = args.iter().collect();
             let result_ty = ctx.node_types[&expr.id].clone();
             let attrs = mlir_attrs.clone();
+            let arg_types: Vec<Ty> = args.iter().map(|a| ctx.node_types[&a.id].clone()).collect();
+            let prim = buffer_intrinsic(&op, &arg_types).unwrap_or(PrimOp::RawMlirOp { op, attrs });
             convert_expr_list(&arg_refs, env, ctx, &move |arg_vals, env| {
                 let var = ctx.fresh.var();
                 CExpr::LetPrim {
                     var: { ctx.line(var); var },
                     ty: result_ty.clone(),
-                    op: PrimOp::RawMlirOp {
-                        op: op.clone(),
-                        attrs: attrs.clone(),
-                    },
+                    op: prim.clone(),
                     args: arg_vals,
                     cont: Box::new(k(CVal::Var(var), env)),
                 }
@@ -3621,6 +3630,29 @@ fn elements_are_array_objects(ty: &Ty) -> bool {
 /// type each `Load`/`Store` applies to and how many of the indices it takes.
 /// One `Load`/`Store` for an array laid out flat (`a[i, j]`, `a[i][j]` on
 /// `[[f32; M]; N]`); one per level for arrays of arrays of structs.
+/// The operation a `Buffer<T>` intrinsic (`stdlib/buffer`, `mlir::cleave::
+/// buffer_*`) is: reading and writing a slot are an array's `Load`/`Store`
+/// on the buffer, which every pass already treats as a read of a container
+/// and a store into one; growth and capacity are runtime calls. `None` for
+/// any other op.
+fn buffer_intrinsic(op: &str, arg_types: &[Ty]) -> Option<PrimOp> {
+    let runtime = |symbol: &str| PrimOp::Extern {
+        symbol: symbol.to_string(),
+        param_types: arg_types.to_vec(),
+        pure: false,
+    };
+    let buffer_ty = || arg_types.first().cloned().expect("a buffer intrinsic takes the buffer first");
+    Some(match op {
+        "cleave.buffer_alloc" => PrimOp::BufferAlloc,
+        "cleave.buffer_take" => PrimOp::BufferTake,
+        "cleave.buffer_get" => PrimOp::Load { array_ty: buffer_ty() },
+        "cleave.buffer_set" => PrimOp::Store { array_ty: buffer_ty() },
+        "cleave.buffer_grow" => runtime("cleave_buffer_grow"),
+        "cleave.buffer_capacity" => runtime("cleave_buffer_capacity"),
+        _ => return None,
+    })
+}
+
 fn index_segments(array_ty: &Ty, count: usize) -> Vec<(Ty, usize)> {
     let mut segments = Vec::new();
     let mut current = array_ty.clone();
@@ -3733,6 +3765,7 @@ fn stmt_contains_break(stmt: &Stmt) -> bool {
 
 fn expr_contains_break(expr: &Expr) -> bool {
     match &expr.kind {
+        ExprKind::Match { .. } => unreachable!("a `match` is lowered by `driver::desugar_enums`"),
         ExprKind::Spawn(call) => expr_contains_break(call),
         ExprKind::NumberLit { .. }
         | ExprKind::ImaginaryLit { .. }
@@ -3832,6 +3865,7 @@ fn mutated_free_vars_expr(
     ctx: &Ctx,
 ) -> HashMap<String, Ty> {
     match &expr.kind {
+        ExprKind::Match { .. } => unreachable!("a `match` is lowered by `driver::desugar_enums`"),
         ExprKind::Spawn(call) => mutated_free_vars_expr(call, shadowed, ctx),
         ExprKind::NumberLit { .. }
         | ExprKind::ImaginaryLit { .. }
@@ -3999,6 +4033,7 @@ fn lambda_free_vars_expr(
     node_types: &HashMap<NodeId, Ty>,
 ) -> HashMap<String, Ty> {
     match &expr.kind {
+        ExprKind::Match { .. } => unreachable!("a `match` is lowered by `driver::desugar_enums`"),
         ExprKind::Spawn(call) => lambda_free_vars_expr(call, shadowed, node_types),
         ExprKind::NumberLit { .. }
         | ExprKind::ImaginaryLit { .. }
@@ -4636,6 +4671,8 @@ fn prim_op_str(op: &PrimOp) -> String {
         PrimOp::ArrayRepeat => "array-repeat".to_string(),
         PrimOp::Load { .. } => "load".to_string(),
         PrimOp::Store { .. } => "store".to_string(),
+        PrimOp::BufferAlloc => "buffer-alloc".to_string(),
+        PrimOp::BufferTake => "buffer-take".to_string(),
         PrimOp::Extern { symbol, .. } => format!("extern.{symbol}"),
         PrimOp::RawMlirOp { op, attrs } => {
             let attrs_str: String = attrs

@@ -167,6 +167,7 @@ fn prune_expr(e: &mut Expr) {
         }
     }
     match &mut e.kind {
+        ExprKind::Match { .. } => unreachable!("a `match` is lowered by `driver::desugar_enums`"),
         ExprKind::Spawn(call) => prune_expr(call),
         ExprKind::NumberLit { .. }
         | ExprKind::ImaginaryLit { .. }
@@ -280,6 +281,7 @@ fn any_expr(e: &Expr, pred: &mut dyn FnMut(&Expr) -> bool) -> bool {
         return true;
     }
     match &e.kind {
+        ExprKind::Match { .. } => unreachable!("a `match` is lowered by `driver::desugar_enums`"),
         ExprKind::NumberLit { .. }
         | ExprKind::ImaginaryLit { .. }
         | ExprKind::BoolLit(_)
@@ -359,6 +361,7 @@ fn unroll_expr(e: &mut Expr, requests: &HashMap<NodeId, (u64, u64)>, ids: &mut N
         }
     }
     match &mut e.kind {
+        ExprKind::Match { .. } => unreachable!("a `match` is lowered by `driver::desugar_enums`"),
         ExprKind::Spawn(call) => unroll_expr(call, requests, ids),
         ExprKind::NumberLit { .. }
         | ExprKind::ImaginaryLit { .. }
@@ -646,6 +649,7 @@ pub(crate) fn renumber_type(t: &mut Type, ids: &mut NodeIdGen) {
 fn renumber_expr(e: &mut Expr, ids: &mut NodeIdGen) {
     e.id = ids.next();
     match &mut e.kind {
+        ExprKind::Match { .. } => unreachable!("a `match` is lowered by `driver::desugar_enums`"),
         ExprKind::Spawn(call) => renumber_expr(call, ids),
         ExprKind::NumberLit { .. }
         | ExprKind::ImaginaryLit { .. }
@@ -746,6 +750,7 @@ fn substitute_block(b: &mut Block, var: &str, k: u64) {
 
 fn substitute_expr(e: &mut Expr, var: &str, k: u64) {
     match &mut e.kind {
+        ExprKind::Match { .. } => unreachable!("a `match` is lowered by `driver::desugar_enums`"),
         ExprKind::Spawn(call) => substitute_expr(call, var, k),
         ExprKind::Path(p) if p.segments.len() == 1 && p.segments[0] == var => {
             e.kind = ExprKind::NumberLit {

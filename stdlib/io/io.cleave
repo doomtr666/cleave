@@ -13,16 +13,15 @@
 // `Print<T>` impls further down (arrays/tensors of a `Display`-able
 // element type), not by the scalar/string/tuple impls above them, which
 // predate `Display<T>` entirely and stay untouched.
+use buffer;
 use dynarray;
 use display;
 
-// Flushes a `DynArray<i8>`'s own already-built buffer straight to stdout --
-// `stdlib/display/display.cleave`'s own doc comment (`Display<T>`) explains
-// why this is a separate primitive from `print_bytes` (an ordinary `[i8;N]`
-// array's own ABI) rather than reusing it: `out.buf` is already a bare
-// opaque pointer (`RawBuf`, `stdlib/dynarray/dynarray.cleave`), not an
-// array value needing `mlir_lower.rs`'s own array-aware extraction.
-extern fn print_dynarray_bytes(buf: RawBuf<i8>, len: i32) -> i32;
+// Writes the first `len` bytes of a `DynArray<i8>`'s buffer to stdout: what
+// the `Display<T>`-backed impls below build their text into. Its own
+// primitive, not `print_bytes` (an `[i8; N]`'s pointer and length): a buffer
+// is passed as the object holding its slots (`stdlib/buffer`).
+extern fn print_buffer_bytes(buf: Buffer<i8>, len: i32) -> i32;
 
 algebra Print<T> {
     fn print(x: T) -> T;
@@ -80,7 +79,7 @@ impl<T: Display, const N: i32> Print<[T; N]> {
     fn print(x) {
         let mut out: DynArray<i8> = dynarray_new(32);
         out = Display::display(x, out);
-        print_dynarray_bytes(out.buf, out.len);
+        print_buffer_bytes(out.buf, out.len);
         x
     }
 }
@@ -88,7 +87,7 @@ impl<T: Display, const N: i32> Print<Tensor<T, N>> {
     fn print(x) {
         let mut out: DynArray<i8> = dynarray_new(32);
         out = Display::display(x, out);
-        print_dynarray_bytes(out.buf, out.len);
+        print_buffer_bytes(out.buf, out.len);
         x
     }
 }
@@ -96,7 +95,7 @@ impl<T: Display, const R: i32, const C: i32> Print<Tensor<T, R, C>> {
     fn print(x) {
         let mut out: DynArray<i8> = dynarray_new(32);
         out = Display::display(x, out);
-        print_dynarray_bytes(out.buf, out.len);
+        print_buffer_bytes(out.buf, out.len);
         x
     }
 }
@@ -112,7 +111,7 @@ impl<T: Float> Print<Complex<T>> {
     fn print(x) {
         let mut out: DynArray<i8> = dynarray_new(32);
         out = Display::display(x, out);
-        print_dynarray_bytes(out.buf, out.len);
+        print_buffer_bytes(out.buf, out.len);
         x
     }
 }

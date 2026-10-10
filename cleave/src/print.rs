@@ -62,6 +62,20 @@ impl Printer {
                 None => format!("define {}: {};", d.name, fmt_type(&d.ty)),
             }),
             ItemKind::Struct(d) => self.print_struct_decl(d),
+            ItemKind::Enum(d) => {
+                self.line(format!("enum {}{} {{", d.name, fmt_generics(&d.generics)));
+                self.indented(|p| {
+                    for v in &d.variants {
+                        if v.fields.is_empty() {
+                            p.line(format!("{},", v.name));
+                        } else {
+                            let fields: Vec<String> = v.fields.iter().map(fmt_type).collect();
+                            p.line(format!("{}({}),", v.name, fields.join(", ")));
+                        }
+                    }
+                });
+                self.line("}".to_string());
+            }
             ItemKind::Algebra(d) => self.print_algebra_decl(d),
             ItemKind::Impl(d) => self.print_impl_decl(d),
             ItemKind::Fn(d) => self.print_fn_decl(d),
@@ -388,6 +402,20 @@ pub(crate) fn fmt_expr(e: &Expr) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        ExprKind::Match { scrutinee, arms } => {
+            let arms: Vec<String> = arms
+                .iter()
+                .map(|arm| {
+                    let pattern = match &arm.pattern {
+                        Pattern::Wildcard => "_".to_string(),
+                        Pattern::Variant { path, bindings } if bindings.is_empty() => fmt_path(path),
+                        Pattern::Variant { path, bindings } => format!("{}({})", fmt_path(path), bindings.join(", ")),
+                    };
+                    format!("{pattern} => {}", fmt_expr(&arm.body))
+                })
+                .collect();
+            format!("match {} {{ {} }}", fmt_expr(scrutinee), arms.join(", "))
+        }
         ExprKind::If {
             cond,
             then_branch,

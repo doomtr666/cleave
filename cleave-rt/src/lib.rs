@@ -22,13 +22,13 @@ pub mod checkpoint;
 // No trailing newline -- `print`/`Print<T>` (`stdlib/io/io.cleave`) writes
 // exactly the bytes its argument's own decimal form is, nothing more, the
 // same "operate, return unchanged" contract `print_bytes`/
-// `print_dynarray_bytes` (below) already honor for a string/`Display`-built
+// `print_buffer_bytes` (below) already honor for a string/`Display`-built
 // buffer. A caller wanting a trailing newline uses `println` (`stdlib/io/
 // io.cleave`, a plain `T: Print`-bound wrapper -- `print(x); print(['\n']);`
 // -- no separate runtime symbol needed for it at all). Found for real, not
 // hypothetical: these used to hardcode `println!`, silently appending `\n`
 // for *every* scalar while every string/array/tensor/tuple `Print<T>` impl
-// (routed through `print_bytes`/`print_dynarray_bytes`, plain `write_all`,
+// (routed through `print_bytes`/`print_buffer_bytes`, plain `write_all`,
 // never `println!`) added none -- a genuine inconsistency, reported
 // directly (`print("step "); print(step);` produced an invisible newline
 // between them that wasn't written anywhere in the calling code).
@@ -1020,6 +1020,11 @@ pub extern "C" fn cleave_alloc_rc(data_size: i64) -> *mut u8 {
 /// alloc_rc` result.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cleave_retain(ptr: *mut u8) {
+    // No reference, nothing to count: an empty slot, an enum's inactive
+    // variant (as `cleave_release` below).
+    if ptr.is_null() {
+        return;
+    }
     unsafe {
         let header = rc_header(ptr);
         let base = block_base(header);
@@ -2426,30 +2431,19 @@ pub unsafe extern "C" fn print_bytes(ptr: *const u8, len: i64) -> i64 {
     len
 }
 
-/// Writes `len` bytes starting at `buf` to stdout as raw text -- `Print<T>`'s
-/// own scalar/string impls (`stdlib/io/io.cleave`) each hardcode their own
-/// backing extern (`print_i32`, `print_bytes`, ...); the new `Display<T>`-
-/// backed impls (arrays/tensors/tuples of a `Display`-able element type,
-/// `stdlib/display/display.cleave`) all build one `DynArray<i8>` buffer the
-/// identical way regardless of the underlying type, so they share this one
-/// flush primitive instead of each declaring their own. Structurally
-/// identical to `print_bytes` above -- the only real difference is the
-/// argument shape: a `DynArray<i8>`'s own `buf` field is already a bare,
-/// opaque pointer by construction (`RawBuf`'s own doc comment,
-/// `stdlib/dynarray/dynarray.cleave`), not an array-typed value needing
-/// `mlir_lower.rs`'s own array-aware `(ptr,len)` extraction the way
-/// `print_bytes`'s own `[i8;N]` argument does -- passed straight through as
-/// an ordinary opaque-pointer argument instead.
+/// Writes the first `len` bytes of `buffer`, a `Buffer<i8>`, to stdout:
+/// the text `stdlib/io`'s `Display<T>`-backed `Print<T>` impls build into a
+/// `DynArray<i8>`.
 ///
 /// # Safety
-/// `buf` must point to at least `len` readable bytes.
+/// `buffer` must be a live buffer of at least `len` one-byte slots.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn print_dynarray_bytes(buf: *const u8, len: i32) -> i32 {
-    let bytes = unsafe { std::slice::from_raw_parts(buf, len as usize) };
+pub unsafe extern "C" fn print_buffer_bytes(buffer: *const u8, len: i32) -> i32 {
+    let bytes = unsafe { std::slice::from_raw_parts((*(buffer as *const BufferObject)).data, len as usize) };
     use std::io::Write;
     std::io::stdout()
         .write_all(bytes)
-        .expect("print_dynarray_bytes: stdout write failed");
+        .expect("print_buffer_bytes: stdout write failed");
     len
 }
 
@@ -2496,96 +2490,6 @@ macro_rules! format_float {
 format_float!(format_f32, f32);
 format_float!(format_f64, f64);
 
-/// Backs `stdlib/dynarray/dynarray.cleave`'s `DynArray<T>` -- a real,
-/// growable collection (`doc/backlog.md`'s own former "No dynamic-size
-/// collection" item), built entirely as an ordinary stdlib struct + algebra
-/// impls, the same "no new `Ty::Vector`-style compiler variant" discipline
-/// `stdlib/linalg/tensor.cleave`'s own top comment already documents.
-///
-/// The one shared, byte-count-based growth primitive -- every per-width
-/// `dynarray_grow_*`/`dynarray_alloc_*` below (see `dynarray_width!` further
-/// down) just converts its own element count to bytes and delegates here,
-/// exactly the way `cleave_alloc` above is the one shared allocation
-/// primitive every struct construction delegates to. `old_size == 0` means
-/// "no real old block yet" (a fresh `DynArray`'s very first grow) --
-/// `std::alloc::realloc` requires a pointer actually allocated with the
-/// exact layout it's told, which doesn't exist yet in that case, so this
-/// allocates fresh instead. Unlike `cleave_alloc` (deliberately leaked, no
-/// free -- see its own doc comment above), a *real* grow (`old_size > 0`)
-/// does not leak: `std::alloc::realloc` either extends the existing block in
-/// place or moves the data and frees the old block itself. What's still
-/// true, unchanged from every other struct in this codebase: a `DynArray`'s
-/// own *final* buffer is never freed once the `DynArray` value itself is
-/// discarded -- cleave has no `drop`/ownership story anywhere yet, not a new
-/// gap this introduces.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn cleave_realloc(ptr: *mut u8, old_size: i64, new_size: i64) -> *mut u8 {
-    let new_layout = std::alloc::Layout::from_size_align(new_size as usize, 16).expect("cleave_realloc: invalid layout");
-    if old_size == 0 {
-        unsafe { std::alloc::alloc(new_layout) }
-    } else {
-        let old_layout = std::alloc::Layout::from_size_align(old_size as usize, 16).expect("cleave_realloc: invalid layout");
-        unsafe { std::alloc::realloc(ptr, old_layout, new_layout.size()) }
-    }
-}
-
-/// Generates the four per-width raw-buffer primitives `RawBuffer<T>`'s own
-/// per-width `impl` (`stdlib/dynarray/dynarray.cleave`) binds via
-/// `extern(...)`: `alloc`/`grow` (element-count-based, converted to bytes
-/// here, hardcoded per width -- exactly how `print_i32`/`print_f64`/...
-/// above already hardcode their own width, no generic `sizeof` mechanism
-/// needed anywhere) and `get`/`set` (plain pointer-offset read/write).
-/// Invoked once per width below, including `*mut u8` -- the "any struct
-/// element" case, since every cleave struct value is already an opaque
-/// pointer of exactly this shape (`mlir_lower.rs::ty_to_mlir`'s own struct
-/// fallback), so this one width's functions are reusable as-is by *any*
-/// future struct-element `DynArray<Struct>`, no new Rust code needed per
-/// struct type -- only a new `impl RawBuffer<Struct>` on the cleave side.
-macro_rules! dynarray_width {
-    ($elem:ty, $alloc:ident, $grow:ident, $get:ident, $set:ident) => {
-        #[unsafe(no_mangle)]
-        pub extern "C" fn $alloc(cap: i32) -> *mut $elem {
-            unsafe { cleave_realloc(std::ptr::null_mut(), 0, cap as i64 * std::mem::size_of::<$elem>() as i64) as *mut $elem }
-        }
-        #[unsafe(no_mangle)]
-        pub extern "C" fn $grow(old: *mut $elem, old_cap: i32, new_cap: i32) -> *mut $elem {
-            unsafe {
-                cleave_realloc(
-                    old as *mut u8,
-                    old_cap as i64 * std::mem::size_of::<$elem>() as i64,
-                    new_cap as i64 * std::mem::size_of::<$elem>() as i64,
-                ) as *mut $elem
-            }
-        }
-        /// # Safety
-        /// `buf` must point to a live buffer of at least `i + 1` `$elem`s --
-        /// guaranteed by construction: only `DynArray<T>`'s own generated
-        /// calls (`stdlib/dynarray/dynarray.cleave`) ever call this, always
-        /// with its own real, currently-allocated buffer and an in-bounds
-        /// index (no bounds checking, matching this codebase's existing
-        /// "no runtime memory-safety enforcement" posture elsewhere).
-        #[unsafe(no_mangle)]
-        pub unsafe extern "C" fn $get(buf: *const $elem, i: i32) -> $elem {
-            unsafe { *buf.add(i as usize) }
-        }
-        /// # Safety
-        /// Same as `$get` above.
-        #[unsafe(no_mangle)]
-        pub unsafe extern "C" fn $set(buf: *mut $elem, i: i32, v: $elem) {
-            unsafe {
-                *buf.add(i as usize) = v;
-            }
-        }
-    };
-}
-
-dynarray_width!(i8, dynarray_alloc_i8, dynarray_grow_i8, dynarray_get_i8, dynarray_set_i8);
-dynarray_width!(i16, dynarray_alloc_i16, dynarray_grow_i16, dynarray_get_i16, dynarray_set_i16);
-dynarray_width!(i32, dynarray_alloc_i32, dynarray_grow_i32, dynarray_get_i32, dynarray_set_i32);
-dynarray_width!(i64, dynarray_alloc_i64, dynarray_grow_i64, dynarray_get_i64, dynarray_set_i64);
-dynarray_width!(f32, dynarray_alloc_f32, dynarray_grow_f32, dynarray_get_f32, dynarray_set_f32);
-dynarray_width!(f64, dynarray_alloc_f64, dynarray_grow_f64, dynarray_get_f64, dynarray_set_f64);
-
 /// MLIR's own `memref.copy` runtime helper (`mlir::ExecutionEngine::
 /// CRunnerUtils.h`'s own `memrefCopy`), reimplemented here rather than
 /// loaded from the real `mlir_c_runner_utils.dll` (`I:/Dev/llvm-mlir-22`'s
@@ -2599,10 +2503,7 @@ dynarray_width!(f64, dynarray_alloc_f64, dynarray_grow_f64, dynarray_get_f64, dy
 /// loads no shared library to satisfy it. Loading the real DLL was tried and
 /// abandoned: it needs a second one (`mlir_float16_utils.dll`), and two
 /// paths reached the engine as one (`...dllI:/Dev/...`), the C API reading a
-/// string ref past its end. A small reimplementation here instead — matches this crate's own
-/// existing posture (`dynarray_*` above already reimplements, rather than
-/// links against, the array-growth runtime a real language would often
-/// pull from an external allocator library).
+/// string ref past its end. A small reimplementation here instead.
 ///
 /// ABI, read directly from the real header (no `.cpp` shipped alongside it,
 /// only headers -- this project's own MLIR 22 install is headers + prebuilt
@@ -2692,65 +2593,76 @@ pub unsafe extern "C" fn memrefCopy(elem_size: i64, src: *const UnrankedMemRef, 
         }
     }
 }
-// `DynArray<S>` of structs (`RawBuffer<S: HeapStruct>`): its slots hold
-// references, like an array's. An extern's struct argument is lent and its
-// struct result owned by the caller (`refcount.rs`), so `set` retains what it
-// stores and releases what it overwrites, and `get` retains what it hands
-// out. Without, the buffer held no reference to its elements: a point pushed
-// from an array (`examples/convex_hull.cleave`) was freed with the array,
-// then read back and released a second time. New slots are zeroed, an empty
-// slot telling itself from an element. The elements still held when the
-// `DynArray` dies are not released (its envelope has no cascade into the
-// buffer): a leak, not a dangling reference.
+/// A `Buffer<T>` (`stdlib/buffer`, `doc/plan-buffer.md`): the refcounted
+/// object (`cleave_alloc_rc`) a buffer value points to. `data` is a separate
+/// allocation of `cap` slots of `slot_bytes` each, so growing it leaves the
+/// object, which every holder points to, where it is. An all-zero slot is
+/// empty. The compiler reads `data` (field 0) to address a slot and, when the
+/// object is freed, releases the slots' elements, then frees `data`
+/// (`cleave_buffer_free_data`).
+#[repr(C)]
+pub struct BufferObject {
+    data: *mut u8,
+    cap: i32,
+    slot_bytes: i32,
+}
 
+fn buffer_data_layout(bytes: usize) -> std::alloc::Layout {
+    std::alloc::Layout::from_size_align(bytes.max(1), 16).expect("cleave_buffer: invalid layout")
+}
+
+/// A buffer of `cap` empty slots of `slot_bytes` each.
 #[unsafe(no_mangle)]
-pub extern "C" fn dynarray_alloc_ptr(cap: i32) -> *mut *mut u8 {
-    let bytes = cap as i64 * std::mem::size_of::<*mut u8>() as i64;
+pub extern "C" fn cleave_buffer_alloc(cap: i32, slot_bytes: i64) -> *mut u8 {
+    let cap = cap.max(0);
+    let slot_bytes = slot_bytes as i32;
     unsafe {
-        let p = cleave_realloc(std::ptr::null_mut(), 0, bytes);
-        std::ptr::write_bytes(p, 0, bytes as usize);
-        p as *mut *mut u8
+        let data = std::alloc::alloc_zeroed(buffer_data_layout(cap as usize * slot_bytes as usize));
+        assert!(!data.is_null(), "cleave_buffer_alloc: allocation of {cap} slots of {slot_bytes} bytes failed");
+        let object = cleave_alloc_rc(std::mem::size_of::<BufferObject>() as i64) as *mut BufferObject;
+        object.write(BufferObject { data, cap, slot_bytes });
+        object as *mut u8
     }
 }
 
+/// Grows `buffer` to `new_cap` slots, the new ones empty; the elements move
+/// with their slots, keeping their references. Nothing below the current
+/// capacity: a buffer never shrinks here.
+///
+/// # Safety
+/// `buffer` must be a live buffer (`cleave_buffer_alloc`).
 #[unsafe(no_mangle)]
-pub extern "C" fn dynarray_grow_ptr(old: *mut *mut u8, old_cap: i32, new_cap: i32) -> *mut *mut u8 {
-    let size = std::mem::size_of::<*mut u8>() as i64;
+pub unsafe extern "C" fn cleave_buffer_grow(buffer: *mut u8, new_cap: i32) {
     unsafe {
-        let p = cleave_realloc(old as *mut u8, old_cap as i64 * size, new_cap as i64 * size);
-        if new_cap > old_cap {
-            std::ptr::write_bytes(p.add((old_cap as i64 * size) as usize), 0, ((new_cap - old_cap) as i64 * size) as usize);
+        let object = &mut *(buffer as *mut BufferObject);
+        if new_cap <= object.cap {
+            return;
         }
-        p as *mut *mut u8
+        let slot = object.slot_bytes as usize;
+        let (old_bytes, new_bytes) = (object.cap as usize * slot, new_cap as usize * slot);
+        let data = std::alloc::realloc(object.data, buffer_data_layout(old_bytes), new_bytes.max(1));
+        assert!(!data.is_null(), "cleave_buffer_grow: reallocation to {new_cap} slots of {slot} bytes failed");
+        std::ptr::write_bytes(data.add(old_bytes), 0, new_bytes - old_bytes);
+        object.data = data;
+        object.cap = new_cap;
     }
 }
 
 /// # Safety
-/// `buf` must point to a live buffer of at least `i + 1` elements, slot `i`
-/// holding an element (`dynarray_set_ptr`).
+/// `buffer` must be a live buffer (`cleave_buffer_alloc`).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn dynarray_get_ptr(buf: *const *mut u8, i: i32) -> *mut u8 {
-    unsafe {
-        let v = *buf.add(i as usize);
-        cleave_retain(v);
-        v
-    }
+pub unsafe extern "C" fn cleave_buffer_capacity(buffer: *const u8) -> i32 {
+    unsafe { (*(buffer as *const BufferObject)).cap }
 }
 
+/// Frees a freed buffer's slots, once their elements are released. Takes the
+/// fields read before the object itself was freed.
+///
 /// # Safety
-/// `buf` must point to a live buffer of at least `i + 1` elements, and `v`
-/// to a live struct.
+/// `data` must be a freed buffer's `data`, of `cap` slots of `slot_bytes`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn dynarray_set_ptr(buf: *mut *mut u8, i: i32, v: *mut u8) {
-    unsafe {
-        cleave_retain(v);
-        let slot = buf.add(i as usize);
-        let old = *slot;
-        *slot = v;
-        if !old.is_null() {
-            cleave_release(old);
-        }
-    }
+pub unsafe extern "C" fn cleave_buffer_free_data(data: *mut u8, cap: i32, slot_bytes: i64) {
+    unsafe { std::alloc::dealloc(data, buffer_data_layout(cap.max(0) as usize * slot_bytes as usize)) }
 }
 
 /// A minimal PRNG for `stdlib/rand/rand.cleave` — PCG32 (O'Neill, public

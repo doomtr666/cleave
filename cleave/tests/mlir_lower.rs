@@ -22,77 +22,12 @@ fn context() -> Context {
     context
 }
 
-/// Registers every `stdlib/dynarray/dynarray.cleave` + `stdlib/display/
-/// display.cleave` + `stdlib/io/io.cleave` runtime symbol this test file's
-/// own several independent, hand-built `ExecutionEngine` harnesses might
-/// need, unconditionally, harmless if unused. Once `stdlib/io/io.cleave`
-/// started `use dynarray;`/`use display;` for its own new `Display<T>`-
-/// backed `Print<T>` impls, `use io;` alone (already used by the
-/// overwhelming majority of tests in this file) started transitively
-/// pulling in *every* `RawBuffer<T>` impl for *every* scalar width
-/// (`stdlib/dynarray/dynarray.cleave`'s own six `impl RawBuffer<...>`
-/// blocks, all non-generic, hence eagerly compiled into any program
-/// reaching them at all — `cps.rs::collect_units`'s own "non-generic impl"
-/// branch, unconditional, regardless of whether `DynArray<i16>` etc. is
-/// ever actually *constructed*) — not just the `i8`-width one `Display<T>`
-/// itself actually uses. A single shared helper here, instead of hand-
-/// listing the same ~30 symbols at each of this file's own several
-/// `ExecutionEngine::new` call sites, keeps them from drifting out of sync.
+/// Every `cleave-rt` symbol a program may call (`use io;` alone reaches the
+/// buffer and formatting runtime through `display`), for this file's
+/// hand-built `ExecutionEngine`s.
 fn register_io_symbols(engine: &cleave_mlir::ExecutionEngine) {
-    unsafe {
-        engine.register_symbol("print_i8", cleave_rt::print_i8 as *mut ());
-        engine.register_symbol("print_i16", cleave_rt::print_i16 as *mut ());
-        engine.register_symbol("print_i32", cleave_rt::print_i32 as *mut ());
-        engine.register_symbol("print_i64", cleave_rt::print_i64 as *mut ());
-        engine.register_symbol("print_f32", cleave_rt::print_f32 as *mut ());
-        engine.register_symbol("print_f64", cleave_rt::print_f64 as *mut ());
-        engine.register_symbol("print_bytes", cleave_rt::print_bytes as *mut ());
-        engine.register_symbol(
-            "print_dynarray_bytes",
-            cleave_rt::print_dynarray_bytes as *mut (),
-        );
-        engine.register_symbol("format_f32", cleave_rt::format_f32 as *mut ());
-        engine.register_symbol("format_f64", cleave_rt::format_f64 as *mut ());
-        engine.register_symbol("dynarray_alloc_i8", cleave_rt::dynarray_alloc_i8 as *mut ());
-        engine.register_symbol("dynarray_grow_i8", cleave_rt::dynarray_grow_i8 as *mut ());
-        engine.register_symbol("dynarray_get_i8", cleave_rt::dynarray_get_i8 as *mut ());
-        engine.register_symbol("dynarray_set_i8", cleave_rt::dynarray_set_i8 as *mut ());
-        engine.register_symbol(
-            "dynarray_alloc_i16",
-            cleave_rt::dynarray_alloc_i16 as *mut (),
-        );
-        engine.register_symbol("dynarray_grow_i16", cleave_rt::dynarray_grow_i16 as *mut ());
-        engine.register_symbol("dynarray_get_i16", cleave_rt::dynarray_get_i16 as *mut ());
-        engine.register_symbol("dynarray_set_i16", cleave_rt::dynarray_set_i16 as *mut ());
-        engine.register_symbol(
-            "dynarray_alloc_i32",
-            cleave_rt::dynarray_alloc_i32 as *mut (),
-        );
-        engine.register_symbol("dynarray_grow_i32", cleave_rt::dynarray_grow_i32 as *mut ());
-        engine.register_symbol("dynarray_get_i32", cleave_rt::dynarray_get_i32 as *mut ());
-        engine.register_symbol("dynarray_set_i32", cleave_rt::dynarray_set_i32 as *mut ());
-        engine.register_symbol(
-            "dynarray_alloc_i64",
-            cleave_rt::dynarray_alloc_i64 as *mut (),
-        );
-        engine.register_symbol("dynarray_grow_i64", cleave_rt::dynarray_grow_i64 as *mut ());
-        engine.register_symbol("dynarray_get_i64", cleave_rt::dynarray_get_i64 as *mut ());
-        engine.register_symbol("dynarray_set_i64", cleave_rt::dynarray_set_i64 as *mut ());
-        engine.register_symbol(
-            "dynarray_alloc_f32",
-            cleave_rt::dynarray_alloc_f32 as *mut (),
-        );
-        engine.register_symbol("dynarray_grow_f32", cleave_rt::dynarray_grow_f32 as *mut ());
-        engine.register_symbol("dynarray_get_f32", cleave_rt::dynarray_get_f32 as *mut ());
-        engine.register_symbol("dynarray_set_f32", cleave_rt::dynarray_set_f32 as *mut ());
-        engine.register_symbol(
-            "dynarray_alloc_f64",
-            cleave_rt::dynarray_alloc_f64 as *mut (),
-        );
-        engine.register_symbol("dynarray_grow_f64", cleave_rt::dynarray_grow_f64 as *mut ());
-        engine.register_symbol("dynarray_get_f64", cleave_rt::dynarray_get_f64 as *mut ());
-        engine.register_symbol("dynarray_set_f64", cleave_rt::dynarray_set_f64 as *mut ());
-    }
+    // SAFETY: the engine is live; every symbol is a `cleave-rt` function.
+    unsafe { cleave::pipeline::register_cleave_rt_symbols(engine) }
 }
 
 /// Compiles `src` all the way through CPS conversion and MLIR lowering,
@@ -549,29 +484,12 @@ fn run_i32_from_cps(
     // a real defensive copy, first hit by `derive_through_dense_forward_
     // computes_the_right_gradient`, just below).
     unsafe {
-        engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
-        engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
-        engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
-        engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
-        engine.register_symbol("cleave_release_void", cleave_rt::cleave_release_void as *mut ());
-        engine.register_symbol("cleave_alloc_local", cleave_rt::cleave_alloc_local as *mut ());
-        engine.register_symbol("cleave_region_enter", cleave_rt::cleave_region_enter as *mut ());
-        engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
-        engine.register_symbol("cleave_alloc_pool", cleave_rt::cleave_alloc_pool as *mut ());
-        engine.register_symbol("cleave_release_pool", cleave_rt::cleave_release_pool as *mut ());
-        engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
-        engine.register_symbol("rand_seed", cleave_rt::rand_seed as *mut ());
-        engine.register_symbol("rand_uniform_f32", cleave_rt::rand_uniform_f32 as *mut ());
-        engine.register_symbol("rand_uniform_f64", cleave_rt::rand_uniform_f64 as *mut ());
-        engine.register_symbol("rand_normal_f32", cleave_rt::rand_normal_f32 as *mut ());
-        engine.register_symbol("rand_normal_f64", cleave_rt::rand_normal_f64 as *mut ());
         // `stdlib/linalg/matrix.cleave`'s own `Fma`/`FmaTransposeA`/
         // `FmaTransposeB` (`f32`-only) always build *both* branches of
         // their own arbitrary size threshold -- unconditionally needed
         // even when a test's own tiny shapes only ever take the native
         // branch at runtime, the same reason `cleave/tests/blas.rs` needs
         // this registered at all.
-        engine.register_symbol("cleave_blas_sgemm", cleave_rt::cleave_blas_sgemm as *mut ());
     }
     // `use io;` now transitively pulls in `stdlib/display/display.cleave`
     // and `stdlib/dynarray/dynarray.cleave` -- see `register_io_symbols`'s
@@ -1305,20 +1223,6 @@ fn a_string_literal_printed_via_print_writes_the_right_bytes_to_stdout() {
     strip_ciface_wrapper_debug_info(&mut module);
 
     let engine = cleave::pipeline::jit(&module, 2);
-    unsafe {
-        engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
-        engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
-        engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
-        engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
-        engine.register_symbol("cleave_release_void", cleave_rt::cleave_release_void as *mut ());
-        engine.register_symbol("cleave_alloc_local", cleave_rt::cleave_alloc_local as *mut ());
-        engine.register_symbol("cleave_region_enter", cleave_rt::cleave_region_enter as *mut ());
-        engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
-        engine.register_symbol("cleave_alloc_pool", cleave_rt::cleave_alloc_pool as *mut ());
-        engine.register_symbol("cleave_release_pool", cleave_rt::cleave_release_pool as *mut ());
-        engine.register_symbol("cleave_blas_sgemm", cleave_rt::cleave_blas_sgemm as *mut ());
-        engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
-    }
     register_io_symbols(&engine);
     let mut out: i32 = -1;
     unsafe {
@@ -3433,20 +3337,6 @@ fn print_of_an_unannotated_index_result_no_longer_panics() {
     strip_ciface_wrapper_debug_info(&mut module);
 
     let engine = cleave::pipeline::jit(&module, 2);
-    unsafe {
-        engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
-        engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
-        engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
-        engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
-        engine.register_symbol("cleave_release_void", cleave_rt::cleave_release_void as *mut ());
-        engine.register_symbol("cleave_alloc_local", cleave_rt::cleave_alloc_local as *mut ());
-        engine.register_symbol("cleave_region_enter", cleave_rt::cleave_region_enter as *mut ());
-        engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
-        engine.register_symbol("cleave_alloc_pool", cleave_rt::cleave_alloc_pool as *mut ());
-        engine.register_symbol("cleave_release_pool", cleave_rt::cleave_release_pool as *mut ());
-        engine.register_symbol("cleave_blas_sgemm", cleave_rt::cleave_blas_sgemm as *mut ());
-        engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
-    }
     register_io_symbols(&engine);
     let mut out: i32 = -1;
     unsafe {
@@ -3522,20 +3412,6 @@ fn print_of_an_unannotated_matmul_index_result_no_longer_panics() {
     strip_ciface_wrapper_debug_info(&mut module);
 
     let engine = cleave::pipeline::jit(&module, 2);
-    unsafe {
-        engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
-        engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
-        engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
-        engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
-        engine.register_symbol("cleave_release_void", cleave_rt::cleave_release_void as *mut ());
-        engine.register_symbol("cleave_alloc_local", cleave_rt::cleave_alloc_local as *mut ());
-        engine.register_symbol("cleave_region_enter", cleave_rt::cleave_region_enter as *mut ());
-        engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
-        engine.register_symbol("cleave_alloc_pool", cleave_rt::cleave_alloc_pool as *mut ());
-        engine.register_symbol("cleave_release_pool", cleave_rt::cleave_release_pool as *mut ());
-        engine.register_symbol("cleave_blas_sgemm", cleave_rt::cleave_blas_sgemm as *mut ());
-        engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
-    }
     register_io_symbols(&engine);
     let mut out: i32 = -1;
     unsafe {
@@ -5973,9 +5849,8 @@ fn overlapping_impls_are_rejected_by_the_real_compile() {
 }
 
 /// Not an overlap: the generic impl's bound can't be met by the concrete
-/// impl's type (`f64` is no `Marker`), so no type is covered by both — the
-/// shape-only false positive `impl<S: HeapStruct> RawBuffer<S>` vs. `impl
-/// RawBuffer<f64>` used to hit.
+/// impl's type (`f64` is no `Marker`), so no type is covered by both — a
+/// shape-only check reported a false overlap.
 #[test]
 fn a_bounded_generic_impl_beside_a_concrete_one_it_cannot_cover_is_not_an_overlap() {
     let context = context();
@@ -6110,18 +5985,8 @@ fn a_bare_call_to_a_generic_impl_method_resolves_like_its_qualified_form() {
 // changes.
 // ---------------------------------------------------------------------
 
-/// Runs `src` the same way `an_extern_fn_call_actually_executes_through_a_
-/// registered_symbol` does (the simple scf/llvm pipeline — no tensor types
-/// involved here, so `run_i32`'s own fuller bufferize pipeline isn't
-/// needed). Registers every scalar-width `dynarray_*` symbol unconditionally
-/// (`doc/backlog.md`'s own "no dead-code elimination" item — `use dynarray;`
-/// compiles all six `RawBuffer<T>` impls in `stdlib/dynarray/dynarray.cleave`
-/// regardless of which width the test's own program actually calls, exactly
-/// the same reason `num`'s own `Rem::mod` is always present too), plus
-/// `cleave_alloc` (every struct construction needs it) and whichever extra
-/// symbols the caller passes in (the `_ptr` width, only ever declared
-/// locally by a specific test's own `impl RawBuffer<SomeStruct>`, never
-/// unconditionally compiled).
+/// Runs `src` through the simple scf/llvm pipeline (no tensors involved),
+/// with every `cleave-rt` symbol registered, plus `extra_symbols`.
 fn run_i32_with_dynarray_symbols(
     context: &Context,
     src: &str,
@@ -6162,20 +6027,6 @@ fn run_i32_with_dynarray_symbols(
     strip_ciface_wrapper_debug_info(&mut module);
 
     let engine = cleave::pipeline::jit(&module, 2);
-    unsafe {
-        engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
-        engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
-        engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
-        engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
-        engine.register_symbol("cleave_release_void", cleave_rt::cleave_release_void as *mut ());
-        engine.register_symbol("cleave_alloc_local", cleave_rt::cleave_alloc_local as *mut ());
-        engine.register_symbol("cleave_region_enter", cleave_rt::cleave_region_enter as *mut ());
-        engine.register_symbol("cleave_region_exit", cleave_rt::cleave_region_exit as *mut ());
-        engine.register_symbol("cleave_alloc_pool", cleave_rt::cleave_alloc_pool as *mut ());
-        engine.register_symbol("cleave_release_pool", cleave_rt::cleave_release_pool as *mut ());
-        engine.register_symbol("cleave_blas_sgemm", cleave_rt::cleave_blas_sgemm as *mut ());
-        engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
-    }
     register_io_symbols(&engine);
     unsafe {
         for (name, ptr) in extra_symbols {
@@ -6192,7 +6043,7 @@ fn run_i32_with_dynarray_symbols(
 }
 
 /// Pushes past the initial capacity (4), forcing at least one real
-/// `RawBuffer<i32>::grow`, then reads every element back both via `.get(i)`
+/// growth of its buffer, then reads every element back both via `.get(i)`
 /// and via `v[i]` (the `Index<DynArray<T>,T>` fallback) — proving growth
 /// preserves the earlier elements correctly, not just that the *last* push
 /// landed right. `.len()` folded in here too rather than its own separate
@@ -6220,19 +6071,8 @@ fn a_dynarray_grows_past_its_initial_capacity_and_reads_back_correct_values() {
     assert_eq!(run_i32_with_dynarray_symbols(&context, src, &[]), 1);
 }
 
-/// The struct-element proof (`doc/backlog-done.md`'s own note on why this
-/// was scoped into v1 rather than deferred, and its own later "`DynArray<T>`
-/// needs a hand-written `impl RawBuffer<Struct>` per struct element type"
-/// entry): every cleave struct value is already an opaque pointer, so
-/// `DynArray<Point>` reuses the *exact same* `_ptr`-suffixed `cleave-rt`
-/// functions the scalar-width impls use — no `impl RawBuffer<Point>` written
-/// here at all any more, unlike this test's own original version: `Point`'s
-/// own marker impl (`impl HeapStruct<Point> {}`) is synthesized automatically
-/// by `driver::synthesize_heap_struct_marker_impls`, which `stdlib/dynarray/
-/// dynarray.cleave`'s own `impl<S: HeapStruct> RawBuffer<S>` then binds `S`
-/// to — direct end-to-end evidence a real heap-referenced struct round-trips
-/// correctly through the raw pointer-width buffer with zero per-type
-/// boilerplate, not just that the mechanism it replaced used to work.
+/// A `DynArray` of structs grows past its initial capacity and reads every
+/// element back: its buffer's slots hold the structs' references.
 #[test]
 fn a_dynarray_of_structs_grows_and_reads_back_correct_field_values() {
     let context = context();
@@ -6251,24 +6091,12 @@ fn a_dynarray_of_structs_grows_and_reads_back_correct_field_values() {
             if v.len() == 5 and p0.x == 1.0 and p0.y == 2.0 and p4.x == 9.0 and p4.y == 10.0 { 1 } else { 0 }
         }
     ";
-    let symbols: &[(&str, *mut ())] = &[
-        (
-            "dynarray_alloc_ptr",
-            cleave_rt::dynarray_alloc_ptr as *mut (),
-        ),
-        ("dynarray_grow_ptr", cleave_rt::dynarray_grow_ptr as *mut ()),
-        ("dynarray_get_ptr", cleave_rt::dynarray_get_ptr as *mut ()),
-        ("dynarray_set_ptr", cleave_rt::dynarray_set_ptr as *mut ()),
-    ];
+    let symbols: &[(&str, *mut ())] = &[];
     assert_eq!(run_i32_with_dynarray_symbols(&context, src, symbols), 1);
 }
 
-/// `driver::synthesize_heap_struct_marker_impls`'s own real dispatch
-/// concern: *two* different, unrelated struct types, each getting its own
-/// independently-synthesized `impl HeapStruct<...> {}`, both resolving
-/// `RawBuffer<S>`'s single shared generic impl correctly — proves the
-/// synthesized marker is genuinely per-struct, not accidentally shared or
-/// order-dependent between two structs declared in the same program.
+/// `DynArray`s of two different struct types in one program, each over its
+/// own `Buffer<T>`.
 #[test]
 fn dynarrays_of_two_different_struct_types_both_dispatch_correctly_in_one_program() {
     let context = context();
@@ -6289,15 +6117,7 @@ fn dynarrays_of_two_different_struct_types_both_dispatch_correctly_in_one_progra
             { 1 } else { 0 }
         }
     ";
-    let symbols: &[(&str, *mut ())] = &[
-        (
-            "dynarray_alloc_ptr",
-            cleave_rt::dynarray_alloc_ptr as *mut (),
-        ),
-        ("dynarray_grow_ptr", cleave_rt::dynarray_grow_ptr as *mut ()),
-        ("dynarray_get_ptr", cleave_rt::dynarray_get_ptr as *mut ()),
-        ("dynarray_set_ptr", cleave_rt::dynarray_set_ptr as *mut ()),
-    ];
+    let symbols: &[(&str, *mut ())] = &[];
     assert_eq!(run_i32_with_dynarray_symbols(&context, src, symbols), 1);
 }
 
@@ -6333,15 +6153,7 @@ fn dynarray_generalizes_correctly_across_two_different_concrete_types_in_one_pro
             { 1 } else { 0 }
         }
     ";
-    let symbols: &[(&str, *mut ())] = &[
-        (
-            "dynarray_alloc_ptr",
-            cleave_rt::dynarray_alloc_ptr as *mut (),
-        ),
-        ("dynarray_grow_ptr", cleave_rt::dynarray_grow_ptr as *mut ()),
-        ("dynarray_get_ptr", cleave_rt::dynarray_get_ptr as *mut ()),
-        ("dynarray_set_ptr", cleave_rt::dynarray_set_ptr as *mut ()),
-    ];
+    let symbols: &[(&str, *mut ())] = &[];
     assert_eq!(run_i32_with_dynarray_symbols(&context, src, symbols), 1);
 }
 
