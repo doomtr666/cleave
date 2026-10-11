@@ -1,0 +1,24 @@
+[package]
+name = "cleave-vk"
+version = "0.1.0"
+edition = "2024"
+
+# The Vulkan runtime of cleave's GPU backend (`doc/plan-vulkan.md`): device,
+# memory, kernels, dispatch. A crate of its own so that a CPU-only program,
+# which links `cleave-rt` alone, pulls in no Vulkan dependency. `ash` loads
+# the Vulkan loader at run time (its `loaded` feature, the default), so
+# building needs no Vulkan SDK; `vk-mem` compiles AMD's VMA from its C++.
+# `staticlib` alongside the `rlib` (as `cleave-rt`'s): what `cleave-build`
+# links an executable built for `Backend::Vulkan` against, in place of
+# `cleave-rt`'s, which it holds.
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+ash = "0.38"
+# Its free hook (`set_free_hook`): a freed payload's device mirror must go.
+cleave-rt = { path = "../cleave-rt" }
+vk-mem = "0.5"
+
+[dev-dependencies]
+cleave-mlir = { path = "../cleave-mlir" }

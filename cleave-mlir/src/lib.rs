@@ -81,6 +81,13 @@ unsafe extern "C" {
         user_data: *mut std::ffi::c_void,
     ) -> bool;
     fn cleaveLoadTransformLibrary(context: MlirContext, text: MlirStringRef, name: MlirStringRef) -> bool;
+    fn cleaveSerializeSpirv(
+        module: MlirModule,
+        name: MlirStringRef,
+        on_words: unsafe extern "C" fn(*const u32, usize, *mut std::ffi::c_void),
+        on_error: ErrorCallback,
+        user_data: *mut std::ffi::c_void,
+    ) -> bool;
 }
 
 /// Registers cleave's passes and MLIR's, for pipelines to name them
@@ -116,6 +123,34 @@ pub unsafe fn run_pipeline(module: MlirModule, pipeline: &str, statistics: bool)
 /// `context` must be a valid context, not used concurrently.
 pub unsafe fn load_transform_library(context: MlirContext, text: &str, name: &str) -> bool {
     unsafe { cleaveLoadTransformLibrary(context, str_ref(text), str_ref(name)) }
+}
+
+/// The SPIR-V binary, as 32-bit words, of the `spirv.module` in `module`
+/// named `name` (the only one when `name` is empty): what a Vulkan driver
+/// takes (`vkCreateShaderModule`).
+///
+/// # Safety
+///
+/// `module` must be a valid module, not used concurrently.
+pub unsafe fn serialize_spirv(module: MlirModule, name: &str) -> Result<Vec<u32>, String> {
+    struct Out {
+        words: Vec<u32>,
+        error: String,
+    }
+    unsafe extern "C" fn on_words(words: *const u32, len: usize, user_data: *mut std::ffi::c_void) {
+        let out = unsafe { &mut *(user_data as *mut Out) };
+        out.words = unsafe { std::slice::from_raw_parts(words, len) }.to_vec();
+    }
+    unsafe extern "C" fn on_error(message: *const std::ffi::c_char, len: usize, user_data: *mut std::ffi::c_void) {
+        let out = unsafe { &mut *(user_data as *mut Out) };
+        let bytes = unsafe { std::slice::from_raw_parts(message as *const u8, len) };
+        out.error = String::from_utf8_lossy(bytes).into_owned();
+    }
+    let mut out = Out { words: Vec::new(), error: String::new() };
+    let ok = unsafe {
+        cleaveSerializeSpirv(module, str_ref(name), on_words, on_error, &mut out as *mut Out as *mut std::ffi::c_void)
+    };
+    if ok { Ok(out.words) } else { Err(out.error) }
 }
 
 fn str_ref(s: &str) -> MlirStringRef {

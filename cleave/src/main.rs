@@ -20,7 +20,7 @@ use cleave::cps::{
     eliminate_dead_code,
 };
 use cleave::diag::SourceMap;
-use cleave::driver::compile;
+use cleave::driver::compile_with_defines;
 use cleave::dump::dump_program;
 use cleave::egraph::optimize_program;
 use cleave::mlir_lower::lower_program;
@@ -263,7 +263,7 @@ fn parse_args() -> Result<Args, String> {
              [--dump-cps-optimized] [--dump-cps-readable] [--dump-cps-equivalences] [--dump-mlir] [--dump-mlir-lowered] [--dump-defines] [--run] \
              [--emit-object <path>] [--emit-bindings <path>] [--emit-exe <path>] \
              [--opt-level <0-3>] [--openmp | --no-openmp] [--target-cpu <name>] [--target-features <+f,-f,...>] \
-             [--backend cpu] [--inline | --no-inline] [--affine-structs | --no-affine-structs] \
+             [--backend cpu|vulkan] [--inline | --no-inline] [--affine-structs | --no-affine-structs] \
              [--debug-info | --no-debug-info] [--define NAME=VALUE]..."
                 .to_string(),
         ),
@@ -305,7 +305,8 @@ fn build_registry(
 fn resolve_codegen_options(args: &Args) -> Result<CodegenOptions, String> {
     let backend = match args.backend.as_str() {
         "cpu" => Backend::Cpu,
-        other => return Err(format!("backend {other:?} is not implemented yet -- only \"cpu\" is supported today")),
+        "vulkan" => Backend::Vulkan,
+        other => return Err(format!("unknown backend {other:?}: \"cpu\" or \"vulkan\"")),
     };
     let defaults = CodegenOptions::default();
     Ok(CodegenOptions {
@@ -380,18 +381,16 @@ fn real_main() -> ExitCode {
         .unwrap_or_else(|| PathBuf::from("."));
     let file_name = args.path.display().to_string();
 
-    let (result, sources) = compile(vec![(file_name, text)], &[project_dir]);
-    let mut program = match result {
+    // `--define` overrides become the program's own values before any pass
+    // reads them (`driver::compile_with_defines`).
+    let (result, sources) = compile_with_defines(vec![(file_name, text)], &[project_dir], &args.defines);
+    let program = match result {
         Ok(p) => p,
         Err(errs) => {
             report(&errs, &sources);
             return ExitCode::FAILURE;
         }
     };
-    // `--define` overrides become the program's own values, for every pass
-    // that reads them (`Registry::apply_defines`).
-    Registry::apply_defines(&mut program, &args.defines);
-
     // `openmp`'s own resolution is now a single, universal rule (`args.
     // openmp.unwrap_or(true)`) -- no more per-mode default (`resolve_
     // codegen_options`'s own doc comment used to vary this by call site;
@@ -741,6 +740,14 @@ fn real_main() -> ExitCode {
         match cleave::run::run_main(&program, &registry, None, &options, &[]) {
             Ok(result) => {
                 println!("main returned: {result}");
+                // What the Vulkan runtime moved (`--backend vulkan`).
+                if std::env::var("CLEAVE_VK_STATS").is_ok_and(|v| v == "1") {
+                    let stats = cleave_vk::stats();
+                    eprintln!(
+                        "cleave Vulkan stats: {} dispatches, {} bytes uploaded, {} bytes downloaded, {} submits",
+                        stats.dispatches, stats.uploaded_bytes, stats.downloaded_bytes, stats.submits
+                    );
+                }
                 return ExitCode::from(result as u8);
             }
             Err(errs) => {

@@ -276,6 +276,24 @@ fn a_define_is_overridden_by_a_matching_cli_define() {
     assert_eq!(run_i32_with_defines(&context, src, &[("SEUIL", "7")]), 8);
 }
 
+/// An overridden `define` is the one a comprehension over it unrolls:
+/// `[for i in 0..N: ...]` with `N` overridden to 4 builds 4 elements, typed
+/// `[i32; N]` with the same `N`. Overrides used to be applied after the
+/// driver had unrolled comprehensions with the source's value (nanoLM's
+/// `LAYERS` overridden: "no impl Collect<[Block; 4], __Tuple16<...>>").
+#[test]
+fn an_overridden_define_is_the_one_a_comprehension_unrolls() {
+    let context = context();
+    let src = "
+        define N: i32 = 16;
+        fn main() -> i32 {
+            let a: [i32; N] = [for i in 0..N: i * 2];
+            a[N - 1]
+        }
+    ";
+    assert_eq!(run_i32_with_defines(&context, src, &[("N", "4")]), 6);
+}
+
 /// `define NAME: T;`, no default at all (mirrors `extern fn`'s bodyless
 /// pattern -- `grammar.pest::define_decl`'s own doc comment) -- resolves
 /// purely from an external `--define`, with nothing in source to fold.

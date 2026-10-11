@@ -23,10 +23,9 @@ pub fn check_sources(
     defines: &[(String, String)],
     openmp: bool,
 ) -> Result<(Program, Registry, SourceMap), Vec<String>> {
-    let (result, map) = crate::driver::compile(sources, &[]);
+    let (result, map) = crate::driver::compile_with_defines(sources, &[], defines);
     let render = |diags: &[Diagnostic], map: &SourceMap| diags.iter().map(|d| map.render(d)).collect::<Vec<_>>();
-    let mut program = result.map_err(|diags| render(&diags, &map))?;
-    Registry::apply_defines(&mut program, defines);
+    let program = result.map_err(|diags| render(&diags, &map))?;
     let (registry, define_errors) = Registry::build_with_defines(&program, defines, openmp);
     if !define_errors.is_empty() {
         return Err(define_errors);
@@ -82,7 +81,7 @@ pub fn run_main_with<T>(
     lower_to_llvm(&context, &mut module, options)?;
 
     let mut shared_libs: Vec<String> = Vec::new();
-    if options.openmp || (options.tasks && crate::cps::uses_spawn(&cps_program)) {
+    if options.openmp || (options.host_tasks() && crate::cps::uses_spawn(&cps_program)) {
         let why = if options.openmp {
             "with OpenMP (--no-openmp to run without)"
         } else {

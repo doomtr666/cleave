@@ -152,7 +152,10 @@ fn main() {
         // One directory per model size, context and vocabulary: its checkpoints don't fit another. `bench` trains
         // exactly as `gpt` does, in a directory of its own, so that a comparison run against the
         // PyTorch twin never overwrites the real run's checkpoints.
-        let suffix = if which == "bench" { "-bench" } else { "" };
+        // A build for the GPU (`--features vulkan`) never resumes or overwrites a CPU run's
+        // checkpoints either.
+        let backend = if cfg!(feature = "vulkan") { "-vulkan" } else { "" };
+        let suffix = format!("{}{backend}", if which == "bench" { "-bench" } else { "" });
         let dir = format!(
             "nanolm2-d{}-l{}-t{}-v{}{suffix}",
             unsafe { gpt_width() },

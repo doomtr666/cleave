@@ -221,6 +221,18 @@ pub fn compile(
     entry_sources: Vec<(String, String)>,
     extra_search_paths: &[PathBuf],
 ) -> (Result<Program, Vec<Diagnostic>>, crate::diag::SourceMap) {
+    compile_with_defines(entry_sources, extra_search_paths, &[])
+}
+
+/// `compile`, with `--define` overrides (`Registry::apply_defines`) applied
+/// as soon as the program is merged: before anything evaluates a `define`
+/// (a comprehension over `0..LAYERS` unrolled, a constant `if` pruned), not
+/// after, when those had already used the source's value.
+pub fn compile_with_defines(
+    entry_sources: Vec<(String, String)>,
+    extra_search_paths: &[PathBuf],
+    defines: &[(String, String)],
+) -> (Result<Program, Vec<Diagnostic>>, crate::diag::SourceMap) {
     let mut ids = FileIdGen::default();
     let mut node_ids = NodeIdGen::default();
     let mut sources = crate::diag::SourceMap::default();
@@ -319,6 +331,10 @@ pub fn compile(
 
     let scopes = crate_scopes(&programs, &crate_names);
     let result = merge_programs(programs)
+        .map(|mut program| {
+            crate::registry::Registry::apply_defines(&mut program, defines);
+            program
+        })
         .and_then(|program| crate::enums::desugar_enums(program, &mut node_ids))
         .and_then(synthesize_derive_signatures)
         .map(|program| synthesize_tuple_structs(program, &mut node_ids))

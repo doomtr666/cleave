@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 # See `examples/rust-interop-demo/Cargo.toml` for why this lives inside the root workspace.
+# `--features vulkan`: the kernel compiled for the Vulkan backend
+# (`doc/plan-vulkan.md`), its checkpoints in a directory of their own
+# (`-vulkan`). `--features small`: a small model (`build.rs`, `SMALL`), to
+# try a backend or a change at a scale that builds and runs in minutes.
+[features]
+vulkan = []
+small = []
+
 [build-dependencies]
 cleave-build = { path = "../../cleave-build" }
 

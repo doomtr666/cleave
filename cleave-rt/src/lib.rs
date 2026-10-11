@@ -1250,6 +1250,7 @@ pub unsafe extern "C" fn cleave_release(ptr: *mut u8) -> bool {
         }
         if refcount_of(header).fetch_sub(1, std::sync::atomic::Ordering::Release) == 1 {
             std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+            notify_freed(ptr, (*header).data_size as usize);
             // Arena-backed (`cleave_alloc_rc`'s own doc comment): never
             // individually freed here — the matching `cleave_region_exit`
             // reclaims it in bulk, along with everything else allocated
@@ -1579,9 +1580,36 @@ pub extern "C" fn cleave_alloc_local(_handle: i64, size: i64) -> *mut u8 {
 #[unsafe(no_mangle)]
 pub extern "C" fn cleave_region_exit(handle: i64) {
     ARENA.with(|a| {
+        let top = a.cursor.get();
         a.cursor.set(handle as usize);
         a.depth.set(a.depth.get() - 1);
+        if top > handle as usize {
+            notify_freed(handle as usize as *mut u8, top - handle as usize);
+        }
     });
+}
+
+/// The function told when memory that held payloads stops being live
+/// ([`set_free_hook`]); 0 when none is set.
+static FREE_HOOK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Sets the function told, with the range's start and length in bytes, when
+/// memory that held payloads stops being live: a `cleave_alloc_rc` payload
+/// whose refcount reaches zero, an arena range a region exit rewinds over.
+/// For a runtime keeping state about payload addresses (`cleave-vk`'s device
+/// mirrors), which must forget it before the address is reused. Called on
+/// the freeing thread; costs one relaxed load per free when unset.
+pub fn set_free_hook(hook: extern "C" fn(*mut u8, usize)) {
+    FREE_HOOK.store(hook as usize, std::sync::atomic::Ordering::Release);
+}
+
+fn notify_freed(start: *mut u8, len: usize) {
+    let hook = FREE_HOOK.load(std::sync::atomic::Ordering::Relaxed);
+    if hook != 0 {
+        // SAFETY: only `set_free_hook` stores here, a valid fn pointer.
+        let hook: extern "C" fn(*mut u8, usize) = unsafe { std::mem::transmute(hook) };
+        hook(start, len);
+    }
 }
 
 /// `cleave_release`'s own `bool` result ("did this call actually free the

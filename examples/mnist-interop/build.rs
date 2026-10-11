@@ -39,5 +39,12 @@ fn main() {
         .inline(INLINE)
         .debug_info(DEBUG)
         .target_cpu("native")
+        // `--features vulkan` (`Cargo.toml`), which Cargo hands to build
+        // scripts as `CARGO_FEATURE_VULKAN`.
+        .backend(if std::env::var_os("CARGO_FEATURE_VULKAN").is_some() {
+            cleave_build::Backend::Vulkan
+        } else {
+            cleave_build::Backend::Cpu
+        })
         .compile("kernel");
 }

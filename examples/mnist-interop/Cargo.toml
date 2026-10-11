@@ -5,6 +5,11 @@ edition = "2024"
 
 # See `examples/rust-interop-demo/Cargo.toml`'s own identical comment for why
 # this lives inside the root workspace rather than standing alone.
+# `cargo run --release --features vulkan`: the kernel compiled for the
+# Vulkan backend (`doc/plan-vulkan.md`), its tensor operations GPU kernels.
+[features]
+vulkan = []
+
 [build-dependencies]
 cleave-build = { path = "../../cleave-build" }
 

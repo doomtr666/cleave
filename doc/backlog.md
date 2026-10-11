@@ -52,6 +52,19 @@ measure the same way (held at most, ms/step), and the waste a block serving a sm
   explains a failure whenever two test runs overlap (a second `cargo test`, an IDE's test runner); not
   necessarily the 2026-10-08 one, a single run beside training.
 
+- 2026-10-11, captured once: `vulkan.rs::examples_print_the_same_on_the_gpu`, `tensor_demo` on the iGPU,
+  died in the JIT's link with `LLVM ERROR: IMAGE_REL_AMD64_ADDR32NB relocation requires an ordered
+  section layout`. That relocation (COFF unwind info, `.pdata`/`.xdata`, 32-bit offsets from an image
+  base) assumes a section layout JITLink doesn't always produce: it depends on where the memory lands,
+  so on everything else running. Not reproduced in 3 runs of the test and 6 of the program; nothing to
+  do with the GPU (host code, linked before any kernel runs). If it comes back: the JIT's memory manager
+  and the order it lays out sections in; `--emit-exe` doesn't go through it.
+- 2026-10-11, once: `vulkan.rs::an_elementwise_sum_runs_as_a_kernel_on_every_device` returned a wrong
+  sum (`main returned` not 0, no validation message), in a full run of the Vulkan tests during the
+  Vulkan transfer work (fresh-buffer discards, zero-trip guard, barrier before a batch's first
+  command). Not reproduced in 9 runs of the suite, 6 of the test, nor 30 concurrent runs of the
+  program on both devices.
+
 Next time: keep the binary's whole output (`cargo test ... 2>&1 | tee`), the test name and the exit
 code; after a change touching those areas, a loop of runs (`for i in $(seq 50)`).
 
@@ -568,3 +581,19 @@ grow(v.buf, n)` would then give `grow` the only reference (`doc/plan-buffer.md`)
 checking in inference and the transfer in `refcount.rs`.
 
  
+## Polyhedral scheduling at the MLIR level: fusion across reductions (idea, 2026-10-11)
+
+Not Polly: it runs on LLVM IR, after we've lowered away what it would have to rediscover (affine nests
+become `cf` + GEPs, multi-dimensional memrefs flattened, no aliasing facts), it isn't in our LLVM build
+(`ci/llvm-cmake-flags.txt`), and our hot kernels are scheduled by hand already (the matmul transform
+schedule). The polyhedral model belongs where the information is exact: cleave knows every shape
+statically, so nearly every nest is affine with constant bounds, and MLIR has the pieces (`affine`
+dependence analysis, the Presburger library `IntegerRelation`/`FlatAffineValueConstraints`,
+`affine-loop-fusion`/`-tile`/interchange), though no Pluto-like global scheduler.
+
+Where it would pay, most likely first: fusing the non-matmul chains elementwise -> reduction ->
+broadcast (nanoLM's norms, softmax, the optimizer step), which `linalg-fuse-elementwise-ops` stops at;
+then tiling non-matmul nests, choosing which loop to parallelize and how many threads per shape
+(the per-shape OpenMP entry), and emptiness/interval facts in general (the zero-trip-loop pass is the
+trivial case). First step: measure, on one nanoLM block, which whole-memory passes remain between two
+matmuls and what a fusion across reductions would remove, before building anything.

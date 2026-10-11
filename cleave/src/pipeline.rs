@@ -25,12 +25,15 @@ use cleave_mlir::ir::{Identifier, Location, Module};
 use cleave_mlir::utility::register_all_dialects;
 use std::path::{Path, PathBuf};
 
-/// The hardware a program is compiled for. The CPU only, today: a GPU backend
-/// (Vulkan, through MLIR's `spirv` dialect) is planned, and every stage of
-/// `lower_to_llvm` assumes this one.
+/// The hardware a program is compiled for. `Vulkan` (`doc/plan-vulkan.md`,
+/// Phase 0): its tensor operations run as GPU kernels through the Vulkan
+/// runtime (`cleave-vk`), the rest on the CPU as with `Cpu`, whose stages it
+/// shares; `lower_to_llvm` adds the kernel stage and leaves out the CPU's
+/// matmul schedule and BLAS lowering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     Cpu,
+    Vulkan,
 }
 
 /// How a program is compiled: by `lower_to_llvm` and code generation, for
@@ -90,6 +93,17 @@ pub struct CodegenOptions {
 
 /// `CodegenOptions::inline_threshold`'s default.
 pub const DEFAULT_INLINE_THRESHOLD: usize = 1000;
+
+impl CodegenOptions {
+    /// Whether `spawn`ed calls become tasks (`tasks`), which the CPU backend
+    /// alone does: on the Vulkan backend the device does the parallel work
+    /// and host tasks only contend to record it into one queue (measured on
+    /// MNIST: libomp's waiting took most of the host's time), so spawned
+    /// calls run in place.
+    pub fn host_tasks(&self) -> bool {
+        self.tasks && self.backend == Backend::Cpu
+    }
+}
 
 impl Default for CodegenOptions {
     fn default() -> Self {
@@ -489,7 +503,7 @@ pub fn emit_from_program(
     check_type_errors(program, registry).map_err(|errs| render_all(&errs, sources))?;
     report_stage("type checking (with a monomorphization)", start);
     let cps_program = build_optimized_cps(program, registry, Some(sources))?;
-    let needs_openmp = options.openmp || (options.tasks && crate::cps::uses_spawn(&cps_program));
+    let needs_openmp = options.openmp || (options.host_tasks() && crate::cps::uses_spawn(&cps_program));
 
     if let Some(bindings_path) = bindings_path {
         let bindings = crate::rust_bindings::generate_rust_bindings(&cps_program.funcs)?;
@@ -575,10 +589,9 @@ pub fn compile_and_emit(
     defines: &[(String, String)],
 ) -> Result<Emitted, Vec<String>> {
     let start = std::time::Instant::now();
-    let (result, sources) = crate::driver::compile(sources_in, project_dirs);
-    let mut program = result.map_err(|errs| render_all(&errs, &sources))?;
+    let (result, sources) = crate::driver::compile_with_defines(sources_in, project_dirs, defines);
+    let program = result.map_err(|errs| render_all(&errs, &sources))?;
     report_stage("parsing, name resolution", start);
-    Registry::apply_defines(&mut program, defines);
     let (registry, define_errors) = Registry::build_with_defines(&program, defines, options.openmp);
     if !define_errors.is_empty() {
         return Err(define_errors);
@@ -600,6 +613,10 @@ pub fn compile_and_emit(
 pub unsafe fn register_cleave_rt_symbols(engine: &cleave_mlir::ExecutionEngine) {
     unsafe {
         engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
+        engine.register_symbol("cleave_vk_dispatch", cleave_vk::cleave_vk_dispatch as *mut ());
+        engine.register_symbol("cleave_vk_sync_host", cleave_vk::cleave_vk_sync_host as *mut ());
+        engine.register_symbol("cleave_vk_host_wrote", cleave_vk::cleave_vk_host_wrote as *mut ());
+        engine.register_symbol("cleave_vk_discard", cleave_vk::cleave_vk_discard as *mut ());
         engine.register_symbol("cleave_parallel_threads", cleave_rt::cleave_parallel_threads as *mut ());
         engine.register_symbol("cleave_bind_worker", cleave_rt::cleave_bind_worker as *mut ());
         engine.register_symbol("rand_seed", cleave_rt::rand_seed as *mut ());
@@ -797,7 +814,7 @@ pub fn lower_to_llvm<'c>(
     module: &mut Module<'c>,
     options: &CodegenOptions,
 ) -> Result<(), Vec<String>> {
-    let Backend::Cpu = options.backend;
+    let vulkan = options.backend == Backend::Vulkan;
     register_passes();
     let dump = |module: &Module, variable: &str| {
         if let Ok(path) = std::env::var(variable) {
@@ -810,15 +827,24 @@ pub fn lower_to_llvm<'c>(
     if !unsafe { cleave_mlir::load_transform_library(context.to_raw(), MATMUL_SCHEDULE, "matmul_vectorize.transform.mlir") } {
         return Err(vec!["failed to load the matmul schedule".to_string()]);
     }
+    // The CPU's matmul schedule and BLAS lowering, which the Vulkan backend's
+    // kernels replace.
+    let cpu_matmuls = if vulkan {
+        ""
+    } else {
+        "cleave-blas-tile-and-fuse{rows=BLAS_ROWS},cleave-lower-blas-matmuls,\
+         cleave-split-row-remainders{rows=ROW_TILE},transform-interpreter{entry-point=__transform_main},\
+         loop-invariant-subset-hoisting,"
+    }
+    .replace("BLAS_ROWS", &BLAS_TILE_ROWS.to_string())
+    .replace("ROW_TILE", &MATMUL_ROW_TILE.to_string());
     run_stage(
         module,
         "tensors",
         &format!(
             "builtin.module(cleave-limit-inlining{{threshold={threshold}}},{inline}\
              cleave-drop-zero-trip-whiles,convert-elementwise-to-linalg,linalg-fuse-elementwise-ops,\
-             cleave-blas-tile-and-fuse{{rows={BLAS_TILE_ROWS}}},cleave-lower-blas-matmuls,\
-             cleave-split-row-remainders{{rows={MATMUL_ROW_TILE}}},transform-interpreter{{entry-point=__transform_main}},\
-             loop-invariant-subset-hoisting,cleave-reuse-dying-inputs)",
+             {cpu_matmuls}cleave-reuse-dying-inputs)",
             threshold = options.inline_threshold,
             inline = if options.inline { "inline," } else { "" },
         ),
@@ -845,10 +871,47 @@ pub fn lower_to_llvm<'c>(
              buffer-deallocation-simplification,bufferization-lower-deallocations,\
              cleave-lower-adoptions,cleave-dealloc-at-last-use,convert-bufferization-to-memref,\
              cleave-lower-spawns{{tasks={}}})",
-            options.tasks
+            options.host_tasks()
         ),
     )?;
     dump(module, "CLEAVE_DUMP_POST_DEALLOC");
+
+    if vulkan {
+        // Every remaining `linalg` op becomes a GPU kernel: parallel loops,
+        // split into workgroups of 64 along their widest dimension
+        // (`cleave-tile-parallel-loops-for-gpu`, which folds the steps and
+        // bounds it computes: `convert-parallel-loops-to-gpu` leaves a loop
+        // whose workgroup size it can't read on the host), mapped to blocks and
+        // threads, outlined, converted to SPIR-V; each launch then a call to
+        // the runtime with the kernel's binary embedded
+        // (`cleave-lower-gpu-launches`). Every kernel on the GPU (the
+        // degenerate placement); a heap payload stays mirrored on the device
+        // between launches, the host's accesses reported to the runtime so
+        // that each side sees the other's writes (`cleave-sync-host-accesses`).
+        run_stage(
+            module,
+            "GPU kernels",
+            "builtin.module(cleave-blas-to-linalg,cleave-parallelize-loops,cleave-gpu-copies,cleave-parallel-iterators-first,cleave-mark-full-overwrites,\
+             func.func(convert-linalg-to-parallel-loops),\
+             cleave-tile-parallel-loops-for-gpu{threads=64},func.func(gpu-map-parallel-loops,\
+             convert-parallel-loops-to-gpu,canonicalize),cleave-sink-views-into-launches,\
+             func.func(fold-memref-alias-ops),gpu-launch-sink-index-computations,\
+             gpu-kernel-outlining)",
+        )?;
+        // The kernels outlined, before SPIR-V: what to read when one computes
+        // something else on the device than on the host.
+        dump(module, "CLEAVE_DUMP_GPU_OUTLINED");
+        run_stage(
+            module,
+            "SPIR-V kernels",
+            "builtin.module(cleave-set-spirv-entry-abi,gpu.module(lower-affine),cleave-guard-zero-trip-loops,\
+             spirv-attach-target{ver=v1.3 caps=Shader exts=SPV_KHR_storage_buffer_storage_class},\
+             cleave-accurate-kernel-math,gpu.module(convert-math-to-spirv),convert-gpu-to-spirv,\
+             spirv.module(spirv-lower-abi-attrs,spirv-update-vce),\
+             cleave-lower-gpu-launches,cleave-sync-host-accesses)",
+        )?;
+        dump(module, "CLEAVE_DUMP_POST_GPU");
+    }
 
     let strided_loops_skipped = context.attach_diagnostic_handler(|diagnostic| {
         diagnostic.to_string().contains("NYI: non-trivial layout map")
@@ -1096,7 +1159,7 @@ pub fn emit_exe(
         .arg(format!("link-arg={}", object_path.display()))
         .arg("-C")
         .arg(format!("link-arg={}", runtime_lib.display()));
-    if options.openmp || (options.tasks && crate::cps::uses_spawn(&cps_program)) {
+    if options.openmp || (options.host_tasks() && crate::cps::uses_spawn(&cps_program)) {
         // `__kmpc_*` references, from `--openmp`'s parallel loops or `spawn`'s
         // tasks, resolved against the toolchain's `libomp`.
         let prefix = crate::toolchain::llvm_prefix().map_err(|e| vec![format!("{e} to link libomp")])?;

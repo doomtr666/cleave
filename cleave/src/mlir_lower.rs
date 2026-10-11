@@ -8113,7 +8113,7 @@ fn lower_spawn<'c>(
         panic!("MLIR lowering: spawn of unknown top-level fn `{unit}`");
     };
     let context = ctx.context;
-    let tasks = crate::options::current().tasks;
+    let tasks = crate::options::current().host_tasks();
     let arg_values: Vec<Value> = call_arguments(ctx, block, env, unit, args, param_types, tasks);
     let results: Vec<Type> = if is_unit_ty(result_ty) {
         vec![]
@@ -8164,7 +8164,7 @@ fn lower_spawn<'c>(
 /// external callee may write its tensor arguments and copies them.
 fn lower_task_wait<'c>(ctx: &LowerCtx<'c, '_>, block: &Block<'c>, env: &HashMap<CVar, Value<'c, 'c>>, args: &[CVal]) {
     // Without tasks every spawned call ran in place: nothing to wait for.
-    if !crate::options::current().tasks {
+    if !crate::options::current().host_tasks() {
         return;
     }
     let context = ctx.context;

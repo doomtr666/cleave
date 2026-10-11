@@ -9,6 +9,9 @@ ordered-float = "4"
 pest = "2"
 pest_derive = "2"
 cleave-rt = { path = "../cleave-rt" }
+# The Vulkan runtime, for `--backend vulkan` programs the JIT runs
+# (`doc/plan-vulkan.md`); a CPU program never calls it.
+cleave-vk = { path = "../cleave-vk" }
 # cleave's MLIR API and C++ shim: IR construction, passes, target, code
 # generation (`doc/plan-mlir-shim.md`).
 cleave-mlir = { path = "../cleave-mlir" }

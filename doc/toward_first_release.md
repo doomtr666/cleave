@@ -70,12 +70,13 @@ fixed opportunistically along the way rather than as a gate.
    twin), a Linux CI job, and running the test suite there. Local testing through WSL2, which runs
    on the same CPU, so performance numbers stay comparable.
 7. **The showcase**: nanoLM at least; cleave-cast if it's ready.
+8. **A GPU version**: the Vulkan backend ([`plan-vulkan.md`](plan-vulkan.md)), nanoLM training on it.
 
 ## Not required for v0.1
 
 - Good multi-thread scaling (cleave already beats PyTorch on MNIST: 1.7x single-threaded, and 6.1 s on
   4 threads versus 7.8 s for PyTorch's best configuration on 8).
-- The GPU (Vulkan) backend, macOS, ARM.
+- macOS, ARM.
 
 ## Suggested order
 

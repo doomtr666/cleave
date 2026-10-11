@@ -53,6 +53,8 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+pub use cleave::pipeline::Backend;
+
 /// Convenience wrapper matching `ispc::compile_library`'s own shape:
 /// `cleave_build::compile_library("kernel", &["src/kernel.cleave"])`.
 pub fn compile_library(name: &str, files: &[&str]) {
@@ -141,9 +143,10 @@ impl Build {
         self
     }
 
-    /// See `cleave::pipeline::Backend`'s own doc comment -- `Cpu` is the
-    /// only real value today.
-    pub fn backend(&mut self, backend: cleave::pipeline::Backend) -> &mut Self {
+    /// The hardware the kernel is compiled for ([`Backend`]): `Vulkan`
+    /// links the executable against `cleave-vk`'s runtime instead of
+    /// `cleave-rt`'s.
+    pub fn backend(&mut self, backend: Backend) -> &mut Self {
         self.backend = Some(backend);
         self
     }
@@ -328,8 +331,13 @@ impl Build {
         };
 
         println!("cargo:rustc-link-arg={}", object_path.display());
-        println!("cargo:rustc-link-lib=static=cleave_rt");
-        println!("cargo:rustc-link-search=native={}", build_cleave_rt(&out_dir).display());
+        // The runtime: `cleave-rt`, or, for `Backend::Vulkan`, `cleave-vk`,
+        // whose staticlib holds `cleave-rt` too. Never both: two copies of
+        // `cleave-rt` would each have their own allocator state, and the
+        // Vulkan runtime's free hook would hear only the one it was set in.
+        let runtime = if options.backend == cleave::pipeline::Backend::Vulkan { "cleave-vk" } else { "cleave-rt" };
+        println!("cargo:rustc-link-lib=static={}", runtime.replace('-', "_"));
+        println!("cargo:rustc-link-search=native={}", build_runtime(&out_dir, runtime).display());
 
         // `--openmp`'s parallel loops, or `spawn`'s tasks (`cleave::pipeline::
         // compile_and_emit`'s result).
@@ -361,11 +369,12 @@ impl Build {
     }
 }
 
-/// Builds `cleave-rt`'s own staticlib into `<out_dir>/cleave-rt-target/
-/// <profile>/` (a dedicated target directory, not the outer build's shared
-/// one -- see the module's own doc comment for why) and returns that
-/// directory, ready for `cargo:rustc-link-search=native=...`.
-fn build_cleave_rt(out_dir: &Path) -> PathBuf {
+/// Builds the staticlib of the runtime crate `runtime` (`cleave-rt`, or
+/// `cleave-vk`, which holds it) into `<out_dir>/<runtime>-target/<profile>/`
+/// (a dedicated target directory, not the outer build's shared one -- see
+/// the module's own doc comment for why) and returns that directory, ready
+/// for `cargo:rustc-link-search=native=...`.
+fn build_runtime(out_dir: &Path, runtime: &str) -> PathBuf {
     // `env!` (compile-time), not `env::var` (runtime): this code runs
     // *inside* the consuming crate's own build script process, where a
     // runtime `CARGO_MANIFEST_DIR` lookup would give *that* crate's own
@@ -376,7 +385,7 @@ fn build_cleave_rt(out_dir: &Path) -> PathBuf {
     // compiled, which is what "a fixed sibling in this workspace's own
     // layout" actually needs to be relative to.
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let cleave_rt_manifest = manifest_dir.join("../cleave-rt/Cargo.toml");
+    let runtime_manifest = manifest_dir.join(format!("../{runtime}/Cargo.toml"));
 
     // `PROFILE` (a build-script env var Cargo always sets) is exactly
     // "debug" or "release" -- conveniently, the same two strings Cargo's
@@ -384,18 +393,18 @@ fn build_cleave_rt(out_dir: &Path) -> PathBuf {
     // between "which profile is the outer build using" and "which
     // subdirectory will the nested build's own output land in".
     let profile = env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
-    let target_dir = out_dir.join("cleave-rt-target");
+    let target_dir = out_dir.join(format!("{runtime}-target"));
 
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let mut cmd = std::process::Command::new(cargo);
-    cmd.arg("build").arg("--manifest-path").arg(&cleave_rt_manifest).arg("--target-dir").arg(&target_dir).arg("--quiet");
+    cmd.arg("build").arg("--manifest-path").arg(&runtime_manifest).arg("--target-dir").arg(&target_dir).arg("--quiet");
     if profile == "release" {
         cmd.arg("--release");
     }
     let status = cmd
         .status()
-        .unwrap_or_else(|e| panic!("cleave-build: failed to run `cargo build` for cleave-rt's own staticlib: {e}"));
-    assert!(status.success(), "cleave-build: `cargo build` for cleave-rt's own staticlib failed (exit status: {status})");
+        .unwrap_or_else(|e| panic!("cleave-build: failed to run `cargo build` for {runtime}'s own staticlib: {e}"));
+    assert!(status.success(), "cleave-build: `cargo build` for {runtime}'s own staticlib failed (exit status: {status})");
 
     target_dir.join(profile)
 }

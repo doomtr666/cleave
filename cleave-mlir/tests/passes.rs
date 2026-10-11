@@ -181,3 +181,34 @@ fn a_loop_whose_condition_is_false_on_entry_is_dropped() {
     let out = run(&module("%n"), pipeline);
     assert!(out.contains("scf.while"), "a bound known at run time keeps the loop:\n{out}");
 }
+
+/// The Vulkan backend's kernel pipeline on an elementwise `linalg.generic`
+/// over memrefs: outlined to a GPU kernel, converted to SPIR-V, the launch
+/// replaced by a call to the runtime with the binary embedded as a global,
+/// the kernel modules gone.
+#[test]
+fn an_elementwise_op_becomes_a_vulkan_dispatch() {
+    let source = r#"
+      #map = affine_map<(d0) -> (d0)>
+      func.func @add(%a: memref<1024xf32>, %b: memref<1024xf32>, %c: memref<1024xf32>) {
+        linalg.generic {indexing_maps = [#map, #map, #map], iterator_types = ["parallel"]}
+          ins(%a, %b : memref<1024xf32>, memref<1024xf32>) outs(%c : memref<1024xf32>) {
+        ^bb0(%x: f32, %y: f32, %o: f32):
+          %s = arith.addf %x, %y : f32
+          linalg.yield %s : f32
+        }
+        return
+      }
+    "#;
+    let out = run(
+        source,
+        "builtin.module(func.func(convert-linalg-to-parallel-loops),cleave-tile-parallel-loops-for-gpu{threads=64},\
+         func.func(gpu-map-parallel-loops,convert-parallel-loops-to-gpu,canonicalize),gpu-launch-sink-index-computations,\
+         gpu-kernel-outlining,cleave-set-spirv-entry-abi,gpu.module(lower-affine),\
+         spirv-attach-target{ver=v1.3 caps=Shader exts=SPV_KHR_storage_buffer_storage_class},convert-gpu-to-spirv,\
+         spirv.module(spirv-lower-abi-attrs,spirv-update-vce),cleave-lower-gpu-launches)",
+    );
+    assert!(out.contains("call @cleave_vk_dispatch("), "no runtime call:\n{out}");
+    assert!(out.contains("memref.global \"private\" constant @__cleave_spirv_add_kernel"), "no embedded binary:\n{out}");
+    assert!(!out.contains("gpu.module") && !out.contains("spirv.module") && !out.contains("gpu.launch_func"), "kernel modules left:\n{out}");
+}
