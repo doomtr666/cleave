@@ -14,3 +14,23 @@ members = ["cleave", "cleave-rt", "cleave-vk", "cleave-build", "cleave-mlir", "e
 # of this list, so build/test either deliberately, not by habit.
 default-members = ["cleave", "cleave-rt", "cleave-build", "examples/rust-interop-demo"]
 resolver = "3"
+
+# The compiler itself and its MLIR bindings (not `cleave-rt`, which the
+# programs it builds link) build incrementally in release too: a change to
+# `cleave-mlir`'s C++ rebuilds the whole `cleave` crate otherwise, 19 s of
+# the edit-build-test loop, against 6 s incrementally. The code it
+# generates doesn't depend on it, nor, measured on nanoLM's kernel, its own
+# speed (the front end's stages within run-to-run variance).
+[profile.release.package.cleave]
+incremental = true
+
+[profile.release.package.cleave-mlir]
+incremental = true
+
+# What build scripts run is compiled optimized, like the rest of a release
+# build: cargo's default for it is `opt-level = 0`, and the example kernels'
+# `build.rs` run the whole compiler (`cleave-build`). nanoLM's front end
+# (type checking, CPS, refcounting) took about 100 s that way, 50 to 60 s
+# optimized.
+[profile.release.build-override]
+opt-level = 3

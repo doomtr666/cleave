@@ -1,0 +1,68 @@
+// nanoLM's products at its real size (d768, 16 layers, context 1024, SwiGLU
+// hidden 2048, vocabulary 4096; a micro-batch of R = 1024 rows), each in a
+// function of its own so that its kernels carry its name in the Vulkan
+// profile, called `REPS` times. Run by `bench/gpu_matmul/gpu_matmul.rs`,
+// which reads the device time of each from `CLEAVE_VK_PROFILE`.
+use nn;
+use io;
+
+define REPS: i32 = 20;
+
+#[no_inline]
+fn qkvo_fwd(a: Tensor<f32, 1024, 768>, b: Tensor<f32, 768, 768>) -> Tensor<f32, 1024, 768> { matmul(a, b) }
+#[no_inline]
+fn gate_up(a: Tensor<f32, 1024, 768>, b: Tensor<f32, 768, 2048>) -> Tensor<f32, 1024, 2048> { matmul(a, b) }
+#[no_inline]
+fn down(a: Tensor<f32, 1024, 2048>, b: Tensor<f32, 2048, 768>) -> Tensor<f32, 1024, 768> { matmul(a, b) }
+#[no_inline]
+fn head(a: Tensor<f32, 1024, 768>, b: Tensor<f32, 4096, 768>) -> Tensor<f32, 1024, 4096> { matmul_transpose_b(a, b) }
+#[no_inline]
+fn head_dx(a: Tensor<f32, 1024, 4096>, b: Tensor<f32, 4096, 768>) -> Tensor<f32, 1024, 768> { matmul(a, b) }
+#[no_inline]
+fn head_dw(a: Tensor<f32, 1024, 4096>, b: Tensor<f32, 1024, 768>) -> Tensor<f32, 4096, 768> { matmul_transpose_a(a, b) }
+#[no_inline]
+fn dw_qkvo(a: Tensor<f32, 1024, 768>, b: Tensor<f32, 1024, 768>) -> Tensor<f32, 768, 768> { matmul_transpose_a(a, b) }
+#[no_inline]
+fn dw_up(a: Tensor<f32, 1024, 768>, b: Tensor<f32, 1024, 2048>) -> Tensor<f32, 768, 2048> { matmul_transpose_a(a, b) }
+#[no_inline]
+fn dx_up(a: Tensor<f32, 1024, 2048>, b: Tensor<f32, 768, 2048>) -> Tensor<f32, 1024, 768> { matmul_transpose_b(a, b) }
+#[no_inline]
+fn attn_qk(a: Tensor<f32, 1024, 64>, b: Tensor<f32, 1024, 64>) -> Tensor<f32, 1024, 1024> { matmul_transpose_b(a, b) }
+#[no_inline]
+fn attn_pv(a: Tensor<f32, 1024, 1024>, b: Tensor<f32, 1024, 64>) -> Tensor<f32, 1024, 64> { matmul(a, b) }
+#[no_inline]
+fn muon_xxt(a: Tensor<f32, 768, 768>, b: Tensor<f32, 768, 768>) -> Tensor<f32, 768, 768> { matmul_transpose_b(a, b) }
+#[no_inline]
+fn muon_wide(a: Tensor<f32, 768, 2048>, b: Tensor<f32, 768, 2048>) -> Tensor<f32, 768, 768> { matmul_transpose_b(a, b) }
+
+fn main() -> i32 {
+    rand_seed(1);
+    let x: Tensor<f32, 1024, 768> = Init::he();
+    let h: Tensor<f32, 1024, 2048> = Init::he();
+    let z: Tensor<f32, 1024, 4096> = Init::he();
+    let w: Tensor<f32, 768, 768> = Init::he();
+    let w_up: Tensor<f32, 768, 2048> = Init::he();
+    let w_down: Tensor<f32, 2048, 768> = Init::he();
+    let table: Tensor<f32, 4096, 768> = Init::he();
+    let q: Tensor<f32, 1024, 64> = Init::he();
+    let p: Tensor<f32, 1024, 1024> = Init::he();
+    // One element of every result, so that no call is dead.
+    let mut check: f32 = 0.0;
+    for r in 0..REPS {
+        check = check + qkvo_fwd(x, w)[0, 0];
+        check = check + gate_up(x, w_up)[0, 0];
+        check = check + down(h, w_down)[0, 0];
+        check = check + head(x, table)[0, 0];
+        check = check + head_dx(z, table)[0, 0];
+        check = check + head_dw(z, x)[0, 0];
+        check = check + dw_qkvo(x, x)[0, 0];
+        check = check + dw_up(x, h)[0, 0];
+        check = check + dx_up(h, w_up)[0, 0];
+        check = check + attn_qk(q, q)[0, 0];
+        check = check + attn_pv(p, q)[0, 0];
+        check = check + muon_xxt(w, w)[0, 0];
+        check = check + muon_wide(w_up, w_up)[0, 0];
+    };
+    println(check);
+    0
+}

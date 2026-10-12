@@ -59,6 +59,13 @@ measure the same way (held at most, ms/step), and the waste a block serving a sm
   so on everything else running. Not reproduced in 3 runs of the test and 6 of the program; nothing to
   do with the GPU (host code, linked before any kernel runs). If it comes back: the JIT's memory manager
   and the order it lays out sections in; `--emit-exe` doesn't go through it.
+  2026-10-12, again: `vulkan.rs::struct_field_tensors_stay_on_the_device` on the RTX 4070 SUPER, the
+  same message, empty stdout; the suite passed on the next run. Then about one run of the Vulkan suite
+  in two. **Fixed** the same day: RuntimeDyld's `ADDR32NB` (unwind info) is a 32-bit offset from the
+  lowest section it has seen, and the default mapper puts sections wherever `VirtualAlloc` finds room,
+  sometimes below. `cleaveJitCreate` now gives MLIR's engine a mapper that reserves one range per JIT
+  and commits sections upwards in it (`OrderedMemoryMapper`, `shim.cpp`): 4 runs of the Vulkan suite
+  and a smoke run clean since.
 - 2026-10-11, once: `vulkan.rs::an_elementwise_sum_runs_as_a_kernel_on_every_device` returned a wrong
   sum (`main returned` not 0, no validation message), in a full run of the Vulkan tests during the
   Vulkan transfer work (fresh-buffer discards, zero-trip guard, barrier before a batch's first

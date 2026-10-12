@@ -476,7 +476,27 @@ pub struct Stats {
     pub runtime_ns: u64,
     pub uploaded_bytes: u64,
     pub downloaded_bytes: u64,
+    /// `CLEAVE_VK_PROFILE`: the time dispatches spent in each phase, waits
+    /// for the device left out ([`DISPATCH_PHASES`]).
+    pub dispatch_phase_ns: [u64; 6],
+    /// `CLEAVE_VK_PROFILE`, waits left out: the host's synchronizations
+    /// (`cleave_vk_sync_host`, `cleave_vk_host_wrote`, `cleave_vk_discard`
+    /// that do something), uploads (a staging buffer made and filled) and the
+    /// copies of downloads into the host's memory.
+    pub sync_ns: u64,
+    pub upload_ns: u64,
+    pub download_copy_ns: u64,
 }
+
+/// The phases of a dispatch [`Stats::dispatch_phase_ns`] times.
+pub const DISPATCH_PHASES: [&str; 6] = [
+    "entry, kernel lookup",
+    "mirrors (uploads, retirements)",
+    "copied arguments (scalars)",
+    "descriptors",
+    "recording",
+    "copies back, submit",
+];
 
 /// The device copy of one host payload range (`doc/plan-vulkan.md`, Phase
 /// 1): the host's copy stays the one refcounted and freed; this one, in the
@@ -690,12 +710,36 @@ extern "C" fn report() {
         s.uploaded_bytes as f64 / 1048576.0,
         s.downloaded_bytes as f64 / 1048576.0
     );
+    let phases: Vec<String> = DISPATCH_PHASES
+        .iter()
+        .zip(s.dispatch_phase_ns)
+        .map(|(name, ns)| format!("{name} {:.1} ms", ns as f64 / 1e6))
+        .collect();
+    let _ = writeln!(
+        out,
+        "  dispatches, waits left out: {:.1} us each ({})",
+        s.dispatch_phase_ns.iter().sum::<u64>() as f64 / 1e3 / s.dispatches.max(1) as f64,
+        phases.join(", ")
+    );
+    let _ = writeln!(
+        out,
+        "  waits left out: {:.1} ms in host synchronizations, {:.1} ms making uploads, {:.1} ms copying downloads",
+        s.sync_ns as f64 / 1e6,
+        s.upload_ns as f64 / 1e6,
+        s.download_copy_ns as f64 / 1e6
+    );
     let _ = writeln!(
         out,
         "  host synchronizations: {} sync_host, {} host_wrote calls",
         SYNC_CALLS.load(std::sync::atomic::Ordering::Relaxed),
         WROTE_CALLS.load(std::sync::atomic::Ordering::Relaxed)
     );
+    let mut samples: Vec<(String, u64)> =
+        SYNC_SAMPLES.lock().unwrap_or_else(|p| p.into_inner()).iter().map(|(k, v)| (k.clone(), *v)).collect();
+    samples.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    for (caller, calls) in samples.iter().take(10) {
+        let _ = writeln!(out, "    ~{calls:>9} {caller}");
+    }
     let total: f64 = runtime.profile.iter().map(|k| k.gpu_ns).sum();
     let _ = writeln!(out, "  device time in kernels: {:.1} ms", total / 1e6);
     let mut kernels: Vec<&KernelProfile> = runtime.profile.iter().collect();
@@ -957,7 +1001,9 @@ impl Runtime {
             // SAFETY: the mirror's host range is a live payload (a freed one's
             // mirror is gone, `on_freed`).
             let host = unsafe { std::slice::from_raw_parts_mut(key as *mut u8, mirror.len) };
+            let copying = std::time::Instant::now();
             staging.read(host);
+            self.stats.download_copy_ns += copying.elapsed().as_nanos() as u64;
             mirror.device_newer = false;
             self.stats.downloaded_bytes += mirror.len as u64;
             if tracing() {
@@ -970,6 +1016,7 @@ impl Runtime {
     /// the bytes copied now into a fresh staging buffer, which nothing in
     /// flight uses, and copied on the device in order with what's recorded.
     fn upload(&mut self, start: usize, len: usize, target: vk::Buffer) {
+        let entered = std::time::Instant::now();
         let gpu = self.gpu;
         let mut staging = gpu.buffer(len).unwrap_or_else(|e| abort_with(format!("staging {len} bytes: {e}")));
         // SAFETY: the caller's range is live host memory.
@@ -979,6 +1026,7 @@ impl Runtime {
         unsafe { gpu.device.cmd_copy_buffer(command, staging.buffer, target, &region) };
         self.defer(Garbage::Buffer(staging));
         self.stats.uploaded_bytes += len as u64;
+        self.stats.upload_ns += entered.elapsed().as_nanos() as u64;
         if tracing() {
             eprintln!("cleave Vulkan upload {start:#x}+{len}");
         }
@@ -1102,6 +1150,17 @@ pub unsafe extern "C" fn cleave_vk_dispatch(
     let mut guard = lock();
     let runtime = runtime(&mut guard);
     let gpu = runtime.gpu;
+    // Ends phase `$i` (`Stats::dispatch_phase_ns`), the waits in it left out.
+    let (mut phase_start, mut phase_waited) = (entered, runtime.stats.wait_ns);
+    macro_rules! phase {
+        ($i:expr) => {{
+            let now = std::time::Instant::now();
+            let waited = runtime.stats.wait_ns - phase_waited;
+            runtime.stats.dispatch_phase_ns[$i] += ((now - phase_start).as_nanos() as u64).saturating_sub(waited);
+            phase_start = now;
+            phase_waited = runtime.stats.wait_ns;
+        }};
+    }
     // SAFETY: as documented, every pointer is valid for what it describes.
     let entry = unsafe { CStr::from_ptr(entry as usize as *const std::ffi::c_char) }.to_string_lossy().into_owned();
     let count = count as usize;
@@ -1128,6 +1187,7 @@ pub unsafe extern "C" fn cleave_vk_dispatch(
     }
     let kernel_id = runtime.kernel_ids[&key];
     runtime.profile[kernel_id].dispatches += 1;
+    phase!(0);
     let (uploaded_before, downloaded_before) = (runtime.stats.uploaded_bytes, runtime.stats.downloaded_bytes);
 
     if paranoid().0 {
@@ -1156,6 +1216,7 @@ pub unsafe extern "C" fn cleave_vk_dispatch(
         profile.uploaded += runtime.stats.uploaded_bytes - uploaded_before;
         profile.downloaded += runtime.stats.downloaded_bytes - downloaded_before;
     }
+    phase!(1);
     let mut copies: Vec<Option<Buffer<'static>>> = Vec::with_capacity(count);
     for i in 0..count {
         if flags[i] & ARG_MIRROR != 0 {
@@ -1172,6 +1233,7 @@ pub unsafe extern "C" fn cleave_vk_dispatch(
         runtime.profile[kernel_id].copied_in += bytes[i] as u64;
         copies.push(Some(buffer));
     }
+    phase!(2);
     let buffers: Vec<vk::Buffer> = (0..count)
         .map(|i| match &copies[i] {
             Some(buffer) => buffer.buffer,
@@ -1208,6 +1270,7 @@ pub unsafe extern "C" fn cleave_vk_dispatch(
         })
         .collect();
     unsafe { device.update_descriptor_sets(&writes, &[]) };
+    phase!(3);
     let command = runtime.record();
     let batch = runtime.recording.as_mut().expect("a batch");
     let query = match batch.queries {
@@ -1230,6 +1293,7 @@ pub unsafe extern "C" fn cleave_vk_dispatch(
     }
     runtime.defer(Garbage::DescriptorPool(pool));
     runtime.stats.dispatches += 1;
+    phase!(4);
 
     for i in 0..count {
         if flags[i] & ARG_WRITTEN != 0 && copies[i].is_none() {
@@ -1302,6 +1366,8 @@ pub unsafe extern "C" fn cleave_vk_dispatch(
     if runtime.recording.as_ref().is_some_and(|b| b.commands >= BATCH_COMMANDS) {
         runtime.submit();
     }
+    phase!(5);
+    let _ = (phase_start, phase_waited); // the last phase's marks go unread
     runtime.stats.runtime_ns += entered.elapsed().as_nanos() as u64;
 }
 
@@ -1314,9 +1380,12 @@ pub extern "C" fn cleave_vk_discard(ptr: i64, bytes: i64) {
     if tracing() {
         eprintln!("cleave Vulkan discard {ptr:#x}+{bytes}");
     }
+    let entered = std::time::Instant::now();
     let mut guard = lock();
     let runtime = runtime(&mut guard);
+    let waited = runtime.stats.wait_ns;
     runtime.mirror(ptr as usize, bytes as usize, true);
+    runtime.stats.sync_ns += (entered.elapsed().as_nanos() as u64).saturating_sub(runtime.stats.wait_ns - waited);
 }
 
 /// Before the host reads (or partly writes) `[ptr, ptr + bytes)`: what a
@@ -1325,7 +1394,8 @@ pub extern "C" fn cleave_vk_discard(ptr: i64, bytes: i64) {
 /// covers it or none was written by the device.
 #[unsafe(no_mangle)]
 pub extern "C" fn cleave_vk_sync_host(ptr: i64, bytes: i64) {
-    SYNC_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let call = SYNC_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    sample_caller(call, "cleave_vk_sync_host");
     if !MIRRORS_LIVE.load(std::sync::atomic::Ordering::Acquire) {
         return;
     }
@@ -1339,6 +1409,7 @@ pub extern "C" fn cleave_vk_sync_host(ptr: i64, bytes: i64) {
     let entered = std::time::Instant::now();
     let mut guard = lock();
     if let Some(runtime) = guard.as_mut() {
+        let waited = runtime.stats.wait_ns;
         let keys = runtime.overlapping(ptr as usize, bytes as usize);
         let before = runtime.stats.downloaded_bytes;
         runtime.download(&keys);
@@ -1349,14 +1420,39 @@ pub extern "C" fn cleave_vk_sync_host(ptr: i64, bytes: i64) {
             entry.1 += downloaded;
         }
         runtime.stats.runtime_ns += entered.elapsed().as_nanos() as u64;
+        runtime.stats.sync_ns += (entered.elapsed().as_nanos() as u64).saturating_sub(runtime.stats.wait_ns - waited);
         // Read under the lock: every bump happens under it.
         remember(&SYNCED, ptr, bytes, DEVICE_GENERATION.load(std::sync::atomic::Ordering::Acquire));
     }
 }
 
+/// Profiling: one host synchronization call in 4096 (the `call`-th) counted
+/// against the function making it, from a backtrace: who makes millions.
+fn sample_caller(call: u64, entry: &str) {
+    const EVERY: u64 = 4096;
+    if call % EVERY != 0 || !profiling_enabled() {
+        return;
+    }
+    let caller = caller_of(entry);
+    let mut samples = SYNC_SAMPLES.lock().unwrap_or_else(|p| p.into_inner());
+    *samples.entry(format!("{entry} from {caller}")).or_default() += EVERY;
+}
+
+static SYNC_SAMPLES: Mutex<std::collections::BTreeMap<String, u64>> = Mutex::new(std::collections::BTreeMap::new());
+
+fn profiling_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CLEAVE_VK_PROFILE").is_ok_and(|v| v == "1"))
+}
+
 /// Profiling: the function that called [`cleave_vk_sync_host`], from a
 /// backtrace (symbols permitting).
 fn reader() -> String {
+    caller_of("cleave_vk_sync_host")
+}
+
+/// The function that called `entry`, from a backtrace (symbols permitting).
+fn caller_of(entry: &str) -> String {
     let trace = std::backtrace::Backtrace::force_capture().to_string();
     let frames: Vec<&str> = trace
         .lines()
@@ -1367,7 +1463,7 @@ fn reader() -> String {
         .collect();
     frames
         .iter()
-        .position(|name| name.contains("cleave_vk_sync_host"))
+        .position(|name| name.contains(entry))
         .and_then(|at| frames.get(at + 1))
         .map_or_else(|| "<unknown>".to_string(), |name| name.to_string())
 }
@@ -1377,7 +1473,8 @@ fn reader() -> String {
 /// compiler (`cleave-sync-host-accesses`).
 #[unsafe(no_mangle)]
 pub extern "C" fn cleave_vk_host_wrote(ptr: i64, bytes: i64) {
-    WROTE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let call = WROTE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    sample_caller(call, "cleave_vk_host_wrote");
     if !MIRRORS_LIVE.load(std::sync::atomic::Ordering::Acquire) {
         return;
     }
@@ -1388,11 +1485,13 @@ pub extern "C" fn cleave_vk_host_wrote(ptr: i64, bytes: i64) {
     if tracing() {
         eprintln!("cleave Vulkan host_wrote {ptr:#x}+{bytes}");
     }
+    let entered = std::time::Instant::now();
     let mut guard = lock();
     if let Some(runtime) = guard.as_mut() {
         for key in runtime.overlapping(ptr as usize, bytes as usize) {
             runtime.mirrors.get_mut(&key).expect("a mirror").host_dirty = true;
         }
+        runtime.stats.sync_ns += entered.elapsed().as_nanos() as u64;
         // Read under the lock: every bump happens under it.
         remember(&MARKED, ptr, bytes, HOST_GENERATION.load(std::sync::atomic::Ordering::Acquire));
     }

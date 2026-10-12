@@ -187,12 +187,12 @@ stderr: {stderr}", device.name);
     }
 }
 
-/// Causal attention moves only what it must: its three inputs and its
-/// out-parameter go up once (the out-parameter because the per-head blocks
-/// are views of it), every head's scores and weights stay on the device, a
+/// Causal attention moves only what it must: its three inputs go up once
+/// (its out-parameter, fresh, is discarded though the head loop carries
+/// it), every head's scores and weights stay on the device, a
 /// fresh allocation's undefined contents never uploaded (`causal_softmax`'s
 /// weights, which its kernel reads back), and the host reads one element
-/// back. Up: four 256 KiB tensors and 80 bytes of scalar kernel arguments. Found as 512 KiB moved per head in nanoLM's step: the softmax loop
+/// back. Up: three 256 KiB tensors and 80 bytes of scalar kernel arguments. Found as 512 KiB moved per head in nanoLM's step: the softmax loop
 /// stayed on the host while `sgemm` still took raw pointers, and each fresh
 /// buffer was uploaded.
 #[test]
@@ -214,7 +214,7 @@ fn attention_moves_only_its_inputs() {
         assert!(stdout.contains("main returned: 0"), "{}: stdout: {stdout}
 stderr: {stderr}", device.name);
         assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
-        assert!(stderr.contains("1048656 bytes uploaded") && stderr.contains(", 1 submits"), "{}: {stderr}", device.name);
+        assert!(stderr.contains("786512 bytes uploaded") && stderr.contains(", 1 submits"), "{}: {stderr}", device.name);
     }
 }
 
@@ -298,6 +298,174 @@ fn a_loss_reads_back_its_rows_values_not_its_logits() {
 stderr: {stderr}", device.name);
         assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
         assert!(stderr.contains(" 512 bytes downloaded"), "{}: {stderr}", device.name);
+    }
+}
+
+/// Products the device runs tiled (`cleave-tile-matmuls-for-gpu`: blocks of
+/// the result per workgroup, slices of the operands through workgroup
+/// memory) give the CPU's results to the bit, in each layout: `matmul`,
+/// `matmul_transpose_b`, `matmul_transpose_a`, and a shape only the smaller
+/// tiling divides. Each element sums over `k` in the same order.
+#[test]
+fn tiled_products_match_the_cpu_to_the_bit() {
+    let src = "
+        use nn;
+        use io;
+        #[no_inline]
+        fn p1(a: Tensor<f32, 256, 64>, b: Tensor<f32, 64, 128>) -> Tensor<f32, 256, 128> { matmul(a, b) }
+        #[no_inline]
+        fn p2(a: Tensor<f32, 256, 64>, b: Tensor<f32, 128, 64>) -> Tensor<f32, 256, 128> { matmul_transpose_b(a, b) }
+        #[no_inline]
+        fn p3(a: Tensor<f32, 64, 256>, b: Tensor<f32, 64, 128>) -> Tensor<f32, 256, 128> { matmul_transpose_a(a, b) }
+        #[no_inline]
+        fn p4(a: Tensor<f32, 128, 64>, b: Tensor<f32, 64, 64>) -> Tensor<f32, 128, 64> { matmul(a, b) }
+        fn checksum(c: Tensor<f32, 256, 128>) -> f32 {
+            let mut s: f32 = 0.0;
+            for i in 0..256 { for j in 0..128 { s = s + c[i, j] * (i * 7 - j * 3).to(); }; };
+            s
+        }
+        fn main() -> i32 {
+            rand_seed(3);
+            let a: Tensor<f32, 256, 64> = Init::he();
+            let at: Tensor<f32, 64, 256> = Init::he();
+            let b: Tensor<f32, 64, 128> = Init::he();
+            let bt: Tensor<f32, 128, 64> = Init::he();
+            let x: Tensor<f32, 128, 64> = Init::he();
+            let w: Tensor<f32, 64, 64> = Init::he();
+            println(checksum(p1(a, b)));
+            println(checksum(p2(a, bt)));
+            println(checksum(p3(at, b)));
+            let y = p4(x, w);
+            let mut s: f32 = 0.0;
+            for i in 0..128 { for j in 0..64 { s = s + y[i, j] * (i - j).to(); }; };
+            println(s);
+            0
+        }
+    ";
+    let devices = devices();
+    if devices.is_empty() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("cleave-vulkan-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("tiled_products.cleave");
+    std::fs::write(&source, src).unwrap();
+    let cpu = Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--no-debug-info", "--run"])
+        .arg(&source)
+        .output()
+        .expect("cannot run cleave");
+    let cpu = String::from_utf8_lossy(&cpu.stdout).into_owned();
+    assert!(cpu.contains("main returned: 0"), "cpu: {cpu}");
+    for (index, device) in devices.iter().enumerate() {
+        let (stdout, stderr) = stats_on(index, "tiled_products", src);
+        assert_eq!(stdout, cpu, "{}: stderr: {stderr}", device.name);
+        assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
+    }
+}
+
+/// Causal attention's gradient keeps its three results on the device across
+/// heads: bufferization's deallocation takes their addresses each iteration
+/// only to compare them (`dealloc_helper`), which isn't an access
+/// (`addressOnlyCompared`); reported as one, each head re-uploaded them,
+/// 14 GiB a step in nanoLM. Each head's scores, a fresh allocation reached
+/// through a cast, are discarded rather than uploaded. Up: the four inputs
+/// and the three out-parameters, 256 KiB each, and scalar kernel
+/// arguments; one submit per result read.
+#[test]
+fn attention_gradients_stay_on_the_device_across_heads() {
+    let src = "
+        use nn;
+        use io;
+        fn main() -> i32 {
+            rand_seed(1);
+            let q: Tensor<f32, 256, 256> = Init::he();
+            let k: Tensor<f32, 256, 256> = Init::he();
+            let v: Tensor<f32, 256, 256> = Init::he();
+            let u: Tensor<f32, 256, 256> = Init::he();
+            let (a, b, c) = CausalAttention::causal_attention_backward(q, k, v, AttentionShape::<256, 64>(), u);
+            println(a[3, 5] + b[7, 9] + c[1, 2]);
+            0
+        }
+    ";
+    for (index, device) in devices().iter().enumerate() {
+        let (stdout, stderr) = stats_on(index, "attention_backward", src);
+        assert!(stdout.contains("main returned: 0"), "{}: stdout: {stdout}
+stderr: {stderr}", device.name);
+        assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
+        assert!(
+            stderr.contains("1835424 bytes uploaded, 786432 bytes downloaded, 3 submits"),
+            "{}: {stderr}",
+            device.name
+        );
+    }
+}
+
+/// A loop over rows whose body reduces each row runs a workgroup per row,
+/// the row's elements shared among its threads and their partial maximum
+/// and sum combined by a tree (`cleave-cooperative-rows`): 256 workgroups,
+/// where a thread per row made 4. The sum is taken in another order than the
+/// CPU's: equal within rounding.
+#[test]
+fn row_reductions_run_a_workgroup_per_row() {
+    let src = "
+        use nn;
+        use io;
+        #[no_inline]
+        fn row_stats(x: Tensor<f32, 256, 1000>) -> Tensor<f32, 256, 2> {
+            let mut y: [[f32; 2]; 256] = mlir::memref::alloc();
+            for i in 0..256 {
+                let mut m = x[i, 0];
+                for j in 1..1000 { if x[i, j] > m { m = x[i, j]; }; };
+                let mut s: f32 = 0.0;
+                for j in 0..1000 { s = s + exp(x[i, j] - m); };
+                y[i, 0] = m;
+                y[i, 1] = s;
+            };
+            Tensor(data: y)
+        }
+        fn main() -> i32 {
+            rand_seed(5);
+            let x: Tensor<f32, 256, 1000> = Init::he();
+            let y = row_stats(x);
+            let mut t: f32 = 0.0;
+            for i in 0..256 { t = t + y[i, 0] * 3.0 + y[i, 1]; };
+            println(t);
+            0
+        }
+    ";
+    let devices = devices();
+    if devices.is_empty() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("cleave-vulkan-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("row_stats.cleave");
+    std::fs::write(&source, src).unwrap();
+    let number = |out: &str| -> f64 { out.lines().next().and_then(|l| l.trim().parse().ok()).unwrap_or(f64::NAN) };
+    let cpu = Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--no-debug-info", "--run"])
+        .arg(&source)
+        .output()
+        .expect("cannot run cleave");
+    let expected = number(&String::from_utf8_lossy(&cpu.stdout));
+    assert!(expected.is_finite());
+    for (index, _) in devices.iter().enumerate() {
+        let output = Command::new(env!("CARGO_BIN_EXE_cleave"))
+            .args(["--backend", "vulkan", "--no-openmp", "--no-debug-info", "--run"])
+            .arg(&source)
+            .env("CLEAVE_VK_DEVICE", index.to_string())
+            .env("CLEAVE_VK_VALIDATION", "1")
+            .env("CLEAVE_VK_PROFILE", "1")
+            .output()
+            .expect("cannot run cleave");
+        let (stdout, stderr) =
+            (String::from_utf8_lossy(&output.stdout).into_owned(), String::from_utf8_lossy(&output.stderr).into_owned());
+        let got = number(&stdout);
+        assert!((got - expected).abs() <= 1e-5 * expected.abs(), "{got} on the GPU, {expected} on the CPU
+{stderr}");
+        assert!(!stderr.contains("cleave Vulkan validation"), "{stderr}");
+        assert!(stderr.contains("row_stats_kernel #0 [256, 1, 1]"), "{stderr}");
     }
 }
 

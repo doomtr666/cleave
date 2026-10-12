@@ -1,0 +1,48 @@
+// The device's FMA ceiling as cleave compiles for it: a kernel of `N`
+// threads, each running `STEPS` rounds of `a = a * x + y` on 8 independent
+// accumulators (no thread waits on one chain). 2 * 8 * STEPS * N flops.
+// Run by `bench/gpu_matmul/gpu_matmul.rs`.
+use nn;
+use io;
+
+define N: i32 = 1048576;
+define STEPS: i32 = 4096;
+define REPS: i32 = 50;
+
+#[no_inline]
+fn fma_peak(seed: Tensor<f32, 1, N>) -> Tensor<f32, 1, N> {
+    let mut out: [[f32; N]; 1] = mlir::memref::alloc();
+    for i in 0..N {
+        let x = seed[0, i];
+        let y: f32 = 0.0001;
+        let mut a0 = x;
+        let mut a1 = x + 1.0;
+        let mut a2 = x + 2.0;
+        let mut a3 = x + 3.0;
+        let mut a4 = x + 4.0;
+        let mut a5 = x + 5.0;
+        let mut a6 = x + 6.0;
+        let mut a7 = x + 7.0;
+        for k in 0..STEPS {
+            a0 = a0 * x + y;
+            a1 = a1 * x + y;
+            a2 = a2 * x + y;
+            a3 = a3 * x + y;
+            a4 = a4 * x + y;
+            a5 = a5 * x + y;
+            a6 = a6 * x + y;
+            a7 = a7 * x + y;
+        };
+        out[0, i] = a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7;
+    };
+    Tensor(data: out)
+}
+
+fn main() -> i32 {
+    rand_seed(1);
+    let seed: Tensor<f32, 1, N> = Init::he();
+    let mut check: f32 = 0.0;
+    for r in 0..REPS { check = check + fma_peak(seed)[0, 0]; };
+    println(check);
+    0
+}

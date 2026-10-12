@@ -891,8 +891,8 @@ pub fn lower_to_llvm<'c>(
         run_stage(
             module,
             "GPU kernels",
-            "builtin.module(cleave-blas-to-linalg,cleave-parallelize-loops,cleave-gpu-copies,cleave-parallel-iterators-first,cleave-mark-full-overwrites,\
-             func.func(convert-linalg-to-parallel-loops),\
+            "builtin.module(cleave-blas-to-linalg,cleave-parallelize-loops,cleave-gpu-copies,cleave-parallel-iterators-first,cleave-mark-full-overwrites,cleave-tile-matmuls-for-gpu,\
+             func.func(convert-linalg-to-parallel-loops),cleave-cooperative-rows,\
              cleave-tile-parallel-loops-for-gpu{threads=64},func.func(gpu-map-parallel-loops,\
              convert-parallel-loops-to-gpu,canonicalize),cleave-sink-views-into-launches,\
              func.func(fold-memref-alias-ops),gpu-launch-sink-index-computations,\
