@@ -97,6 +97,12 @@ pub struct Gpu {
     device: ash::Device,
     queue: vk::Queue,
     command_pool: vk::CommandPool,
+    /// `VK_KHR_push_descriptor`, when the device has it: a dispatch's buffers
+    /// recorded into its command buffer, without a descriptor pool and set
+    /// per dispatch (10 us of each of nanoLM's 400k at the full size). Up to
+    /// `max_push_descriptors` bindings; a kernel with more takes a set.
+    push_descriptor: Option<ash::khr::push_descriptor::Device>,
+    max_push_descriptors: u32,
     /// Nanoseconds per timestamp tick (`CLEAVE_VK_PROFILE`).
     timestamp_period: f32,
     debug: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
@@ -172,8 +178,41 @@ impl Gpu {
             .ok_or_else(|| Error(format!("{} has no compute queue", infos[chosen].name)))? as u32;
         let priorities = [1.0];
         let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(family).queue_priorities(&priorities)];
-        let device = unsafe { instance.create_device(physical, &vk::DeviceCreateInfo::default().queue_create_infos(&queues), None) }
-            .map_err(fail("creating the device"))?;
+        let available = unsafe { instance.enumerate_device_extension_properties(physical) }
+            .map_err(fail("listing the device's extensions"))?;
+        let has_push = available
+            .iter()
+            .any(|e| e.extension_name_as_c_str().is_ok_and(|name| name == ash::khr::push_descriptor::NAME));
+        let has = |wanted: &std::ffi::CStr| {
+            available.iter().any(|e| e.extension_name_as_c_str().is_ok_and(|name| name == wanted))
+        };
+        // `VK_EXT_memory_budget`: how much of each heap the system lets this
+        // process have, for VMA's `WITHIN_BUDGET` (`create_buffer`).
+        let has_budget = has(ash::ext::memory_budget::NAME);
+        let mut extensions: Vec<*const std::ffi::c_char> = Vec::new();
+        if has_push {
+            extensions.push(ash::khr::push_descriptor::NAME.as_ptr());
+        }
+        if has_budget {
+            extensions.push(ash::ext::memory_budget::NAME.as_ptr());
+        }
+        let device = unsafe {
+            instance.create_device(
+                physical,
+                &vk::DeviceCreateInfo::default().queue_create_infos(&queues).enabled_extension_names(&extensions),
+                None,
+            )
+        }
+        .map_err(fail("creating the device"))?;
+        let push_descriptor = has_push.then(|| ash::khr::push_descriptor::Device::new(&instance, &device));
+        let max_push_descriptors = if has_push {
+            let mut push = vk::PhysicalDevicePushDescriptorPropertiesKHR::default();
+            let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut push);
+            unsafe { instance.get_physical_device_properties2(physical, &mut properties) };
+            push.max_push_descriptors
+        } else {
+            0
+        };
         let queue = unsafe { device.get_device_queue(family, 0) };
         let command_pool = unsafe {
             device.create_command_pool(
@@ -184,8 +223,16 @@ impl Gpu {
             )
         }
         .map_err(fail("creating the command pool"))?;
-        let allocator = unsafe { vk_mem::Allocator::new(vk_mem::AllocatorCreateInfo::new(&instance, &device, physical)) }
-            .map_err(fail("creating the memory allocator"))?;
+        let mut allocator_info = vk_mem::AllocatorCreateInfo::new(&instance, &device, physical);
+        // The device's own version, at most the 1.3 the instance asks for and
+        // VMA knows: the budget extension needs 1.1's queries.
+        let device_version = unsafe { instance.get_physical_device_properties(physical) }.api_version;
+        allocator_info.vulkan_api_version = device_version.min(vk::API_VERSION_1_3);
+        if has_budget && device_version >= vk::API_VERSION_1_1 {
+            allocator_info.flags |= vk_mem::AllocatorCreateFlags::EXT_MEMORY_BUDGET;
+        }
+        let allocator =
+            unsafe { vk_mem::Allocator::new(allocator_info) }.map_err(fail("creating the memory allocator"))?;
 
         let timestamp_period = unsafe { instance.get_physical_device_properties(physical) }.limits.timestamp_period;
         Ok(Gpu {
@@ -194,6 +241,8 @@ impl Gpu {
             device,
             queue,
             command_pool,
+            push_descriptor,
+            max_push_descriptors,
             timestamp_period,
             debug,
             instance,
@@ -242,7 +291,24 @@ impl Gpu {
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let mapped_flag =
             if access.is_empty() { vk_mem::AllocationCreateFlags::empty() } else { vk_mem::AllocationCreateFlags::MAPPED };
-        let allocation_info = vk_mem::AllocationCreateInfo { usage, flags: access | mapped_flag, ..Default::default() };
+        // Device-only buffers in the device's memory, never VMA's fallback to
+        // the host's when it's full: the runtime evicts mirrors instead
+        // (`Runtime::take_buffer`), where the fallback put them in memory
+        // Windows then pages, a 42 s step and 21 GB of the host's for nanoLM.
+        // Within the budget the system gives the process, too: past it, Windows
+        // doesn't fail an allocation but pages device memory to the host's
+        // behind the device's back (a 33 s step, waits for the paging).
+        let (required_flags, budget) = if access.is_empty() {
+            (vk::MemoryPropertyFlags::DEVICE_LOCAL, vk_mem::AllocationCreateFlags::WITHIN_BUDGET)
+        } else {
+            (vk::MemoryPropertyFlags::empty(), vk_mem::AllocationCreateFlags::empty())
+        };
+        let allocation_info = vk_mem::AllocationCreateInfo {
+            usage,
+            flags: access | mapped_flag | budget,
+            required_flags,
+            ..Default::default()
+        };
         let (buffer, allocation) =
             unsafe { self.allocator.create_buffer(&info, &allocation_info) }.map_err(fail("allocating a buffer"))?;
         let mapped = self.allocator.get_allocation_info(&allocation).mapped_data as *mut u8;
@@ -265,8 +331,17 @@ impl Gpu {
                     .stage_flags(vk::ShaderStageFlags::COMPUTE)
             })
             .collect();
+        let pushed = self.push_descriptor.is_some() && bindings <= self.max_push_descriptors;
+        let flags = if pushed {
+            vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR
+        } else {
+            vk::DescriptorSetLayoutCreateFlags::empty()
+        };
         let set_layout = unsafe {
-            device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&layout_bindings), None)
+            device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().flags(flags).bindings(&layout_bindings),
+                None,
+            )
         }
         .map_err(fail("creating the descriptor set layout"))?;
         let set_layouts = [set_layout];
@@ -287,7 +362,7 @@ impl Gpu {
         }
         .map_err(|(_, result)| fail("creating the compute pipeline")(result))?[0];
         unsafe { device.destroy_shader_module(module, None) };
-        Ok(Kernel { gpu: self, bindings, set_layout, pipeline_layout, pipeline })
+        Ok(Kernel { gpu: self, bindings, pushed, set_layout, pipeline_layout, pipeline })
     }
 
     /// Runs `kernel` over `groups` workgroups with `buffers` bound in order,
@@ -301,27 +376,37 @@ impl Gpu {
         let pool = unsafe { device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None) }
             .map_err(fail("creating a descriptor pool"))?;
         let result = (|| {
-            let set_layouts = [kernel.set_layout];
-            let set = unsafe {
-                device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&set_layouts))
-            }
-            .map_err(fail("allocating a descriptor set"))?[0];
             let infos: Vec<[vk::DescriptorBufferInfo; 1]> = buffers
                 .iter()
                 .map(|b| [vk::DescriptorBufferInfo::default().buffer(b.buffer).offset(0).range(vk::WHOLE_SIZE)])
                 .collect();
-            let writes: Vec<vk::WriteDescriptorSet> = infos
+            let mut writes: Vec<vk::WriteDescriptorSet> = infos
                 .iter()
                 .enumerate()
                 .map(|(i, info)| {
                     vk::WriteDescriptorSet::default()
-                        .dst_set(set)
                         .dst_binding(i as u32)
                         .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                         .buffer_info(info)
                 })
                 .collect();
-            unsafe { device.update_descriptor_sets(&writes, &[]) };
+            // A set, unless the kernel's buffers are pushed (`Kernel::pushed`).
+            let set = if kernel.pushed {
+                None
+            } else {
+                let set_layouts = [kernel.set_layout];
+                let set = unsafe {
+                    device.allocate_descriptor_sets(
+                        &vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&set_layouts),
+                    )
+                }
+                .map_err(fail("allocating a descriptor set"))?[0];
+                for write in &mut writes {
+                    write.dst_set = set;
+                }
+                unsafe { device.update_descriptor_sets(&writes, &[]) };
+                Some(set)
+            };
 
             let command = unsafe {
                 device.allocate_command_buffers(
@@ -338,7 +423,24 @@ impl Gpu {
                     .begin_command_buffer(command, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))
                     .map_err(fail("beginning the command buffer"))?;
                 device.cmd_bind_pipeline(command, vk::PipelineBindPoint::COMPUTE, kernel.pipeline);
-                device.cmd_bind_descriptor_sets(command, vk::PipelineBindPoint::COMPUTE, kernel.pipeline_layout, 0, &[set], &[]);
+                match (set, &self.push_descriptor) {
+                    (Some(set), _) => device.cmd_bind_descriptor_sets(
+                        command,
+                        vk::PipelineBindPoint::COMPUTE,
+                        kernel.pipeline_layout,
+                        0,
+                        &[set],
+                        &[],
+                    ),
+                    (None, Some(push)) => push.cmd_push_descriptor_set(
+                        command,
+                        vk::PipelineBindPoint::COMPUTE,
+                        kernel.pipeline_layout,
+                        0,
+                        &writes,
+                    ),
+                    (None, None) => unreachable!("a kernel pushes its buffers only with VK_KHR_push_descriptor"),
+                }
                 device.cmd_dispatch(command, groups[0], groups[1], groups[2]);
                 // The kernel's writes made visible to the host's reads of the
                 // mapped buffers once the fence signals.
@@ -446,6 +548,9 @@ impl Drop for Buffer<'_> {
 pub struct Kernel<'g> {
     gpu: &'g Gpu,
     bindings: u32,
+    /// Its buffers pushed into the command buffer (`Gpu::push_descriptor`)
+    /// rather than bound as a set.
+    pushed: bool,
     set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
@@ -486,7 +591,23 @@ pub struct Stats {
     pub sync_ns: u64,
     pub upload_ns: u64,
     pub download_copy_ns: u64,
+    /// Buffers made, not taken from the spare ones.
+    pub buffers_made: u64,
+    /// Mirrors freed to make room in the device's memory.
+    pub evictions: u64,
+    /// `CLEAVE_VK_PROFILE`: what dispatches uploaded, by cause (`upload_causes`):
+    /// a new mirror the kernel only writes (its contents undefined, nothing to
+    /// upload: a discard the compiler missed), a new mirror it reads (the
+    /// host's data), a mirror the host wrote since.
+    pub upload_causes: [u64; 3],
 }
+
+/// The causes [`Stats::upload_causes`] counts.
+pub const UPLOAD_CAUSES: [&str; 3] = [
+    "new mirrors the kernel only writes (missed discards)",
+    "new mirrors the kernel reads",
+    "mirrors the host wrote since",
+];
 
 /// The phases of a dispatch [`Stats::dispatch_phase_ns`] times.
 pub const DISPATCH_PHASES: [&str; 6] = [
@@ -508,13 +629,19 @@ struct Mirror {
     buffer: Buffer<'static>,
     host_dirty: bool,
     device_newer: bool,
+    /// When a dispatch last used it (`Runtime::uses`): the least recent go
+    /// first when the device's memory runs out.
+    last_use: u64,
 }
 
 /// What a batch keeps alive until the device has finished it: what its
 /// commands use and nothing else holds any more.
 enum Garbage {
+    /// Kept spare once the device is done with it (`Runtime::spare`).
     Buffer(Buffer<'static>),
     DescriptorPool(vk::DescriptorPool),
+    /// Freed once the device is done with it: a spare buffer pushed out.
+    Free(Buffer<'static>),
 }
 
 /// Commands recorded into one command buffer and submitted together
@@ -549,6 +676,8 @@ struct KernelProfile {
     /// Bytes its mirrors were uploaded again, and downloaded to make room.
     uploaded: u64,
     downloaded: u64,
+    /// Of `uploaded`, by cause (`Stats::upload_causes`).
+    upload_causes: [u64; 3],
 }
 
 /// A batch is submitted, without waiting for it, once it holds this many
@@ -574,7 +703,29 @@ struct Runtime {
     /// Profiling: the downloads host reads caused, by the function reading
     /// (count, bytes).
     host_reads: std::collections::HashMap<String, (u64, u64)>,
+    /// Buffers whose last use the device has finished, kept for the next
+    /// one of the same size and kind (mapped for the host or not) instead of
+    /// freed: a step makes and frees the same sizes thousands of times (each
+    /// fresh tensor's mirror, each transfer's staging), each a VMA
+    /// allocation. `spare_bytes` of them, device and host memory apart,
+    /// up to `SPARE_DEVICE_BYTES` and `SPARE_HOST_BYTES`.
+    spare: std::collections::HashMap<(usize, bool), Vec<Buffer<'static>>>,
+    spare_bytes: [usize; 2],
+    /// The sizes of the spare buffers in the order they were kept, device
+    /// and host apart: the oldest go when one more doesn't fit (a full
+    /// spare refusing new buffers kept sizes no one asked for again, while
+    /// split products' partials, 8 MiB each, were made and freed 50k times).
+    /// An entry whose buffer was taken since is skipped.
+    spare_order: [std::collections::VecDeque<usize>; 2],
+    /// A clock of mirror uses (`Mirror::last_use`).
+    uses: u64,
 }
+
+/// How much memory `Runtime::spare` keeps: the device's freed first when
+/// its memory runs out (`take_buffer`), so what's kept never pushes
+/// mirrors out; the host's for staging only.
+const SPARE_DEVICE_BYTES: usize = 1 << 30;
+const SPARE_HOST_BYTES: usize = 256 << 20;
 
 static RUNTIME: Mutex<Option<Runtime>> = Mutex::new(None);
 
@@ -654,6 +805,13 @@ fn checking_nans() -> bool {
     *CHECK.get_or_init(|| std::env::var("CLEAVE_VK_CHECK_NAN").is_ok_and(|v| v == "1"))
 }
 
+/// `CLEAVE_VK_DEVICE_BUDGET=<bytes>`: the device memory mirrors may hold
+/// together (`Runtime::take_buffer`); unbounded by default.
+fn device_budget() -> Option<usize> {
+    static BUDGET: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| std::env::var("CLEAVE_VK_DEVICE_BUDGET").ok().and_then(|v| v.parse().ok()))
+}
+
 fn tracing() -> bool {
     static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *TRACE.get_or_init(|| std::env::var("CLEAVE_VK_TRACE").is_ok_and(|v| v == "1"))
@@ -673,6 +831,10 @@ fn runtime(guard: &mut Option<Runtime>) -> &mut Runtime {
             kernel_ids: Default::default(),
             profile: Vec::new(),
             host_reads: Default::default(),
+            spare: Default::default(),
+            spare_bytes: [0, 0],
+            spare_order: Default::default(),
+            uses: 0,
             profiling: {
                 let profiling = std::env::var("CLEAVE_VK_PROFILE").is_ok_and(|v| v == "1");
                 if profiling {
@@ -723,10 +885,12 @@ extern "C" fn report() {
     );
     let _ = writeln!(
         out,
-        "  waits left out: {:.1} ms in host synchronizations, {:.1} ms making uploads, {:.1} ms copying downloads",
+        "  waits left out: {:.1} ms in host synchronizations, {:.1} ms making uploads, {:.1} ms copying downloads; {} buffers made, {} mirrors evicted",
         s.sync_ns as f64 / 1e6,
         s.upload_ns as f64 / 1e6,
-        s.download_copy_ns as f64 / 1e6
+        s.download_copy_ns as f64 / 1e6,
+        s.buffers_made,
+        s.evictions
     );
     let _ = writeln!(
         out,
@@ -761,6 +925,19 @@ extern "C" fn report() {
     readers.sort_by_key(|(_, (_, bytes))| std::cmp::Reverse(*bytes));
     for (name, (reads, bytes)) in readers.iter().take(10) {
         let _ = writeln!(out, "  {:>10.1} MiB down in {:>8} host reads  {}", mib(*bytes), reads, name);
+    }
+    let causes: Vec<String> = UPLOAD_CAUSES
+        .iter()
+        .zip(s.upload_causes)
+        .map(|(cause, bytes)| format!("{:.1} MiB {cause}", mib(bytes)))
+        .collect();
+    let _ = writeln!(out, "  uploads at dispatches: {}", causes.join(", "));
+    for (cause, name) in UPLOAD_CAUSES.iter().enumerate() {
+        let mut by: Vec<&KernelProfile> = runtime.profile.iter().filter(|k| k.upload_causes[cause] > 0).collect();
+        by.sort_by_key(|k| std::cmp::Reverse(k.upload_causes[cause]));
+        for k in by.iter().take(5) {
+            let _ = writeln!(out, "    {:>9.1} MiB {name}: {} x {}", mib(k.upload_causes[cause]), k.dispatches, k.name);
+        }
     }
     let mut movers: Vec<&KernelProfile> = runtime.profile.iter().collect();
     movers.sort_by_key(|k| std::cmp::Reverse(k.copied_in + k.copied_out + k.uploaded + k.downloaded));
@@ -875,6 +1052,17 @@ impl Runtime {
     /// may use it: the batch being recorded, else the last one in flight;
     /// dropped at once when nothing is pending.
     fn defer(&mut self, garbage: Garbage) {
+        // A buffer only the device uses is spare at once: what's recorded
+        // with it next runs after what used it (one queue, a full barrier
+        // between commands). Waiting for the fence left the spare empty
+        // between waits, every new mirror a new buffer (320k a nanoLM step).
+        // One the host maps waits: the host writes it when it's taken.
+        if let Garbage::Buffer(buffer) = &garbage
+            && buffer.mapped.is_null()
+        {
+            self.dispose(garbage);
+            return;
+        }
         if let Some(batch) = self.recording.as_mut().or(self.in_flight.last_mut()) {
             batch.garbage.push(garbage);
         } else {
@@ -882,10 +1070,122 @@ impl Runtime {
         }
     }
 
-    fn dispose(&self, garbage: Garbage) {
+    /// A buffer of `len` bytes, mapped for the host (`host`) or in the
+    /// device's own memory: a spare one if there is (`spare`), else a new one.
+    fn take_buffer(&mut self, len: usize, host: bool, pinned: &[usize]) -> Buffer<'static> {
+        if let Some(buffer) = self.spare.get_mut(&(len, host)).and_then(Vec::pop) {
+            self.spare_bytes[host as usize] -= len;
+            return buffer;
+        }
+        // `CLEAVE_VK_DEVICE_BUDGET`, bytes: the mirrors kept within it, the
+        // least recently used evicted past it, as when the device's memory
+        // runs out (what tests it, on a small program).
+        if let (false, Some(budget)) = (host, device_budget()) {
+            loop {
+                let used: usize = self.mirrors.values().map(|m| m.len).sum();
+                if used + len <= budget {
+                    break;
+                }
+                self.finish();
+                let victim = self
+                    .mirrors
+                    .iter()
+                    .filter(|(key, _)| !pinned.contains(key))
+                    .min_by_key(|(_, mirror)| mirror.last_use)
+                    .map(|(&key, _)| key);
+                match victim {
+                    Some(key) => self.evict(key),
+                    None => break,
+                }
+            }
+        }
+        self.stats.buffers_made += 1;
+        let make = |gpu: &'static Gpu| if host { gpu.buffer(len) } else { gpu.device_buffer(len) };
+        match make(self.gpu) {
+            Ok(buffer) => buffer,
+            // Out of memory, perhaps for the spare buffers held (nanoLM at its
+            // full size, 12 GiB of device memory): the device's work finished
+            // (what it holds freed or made spare), every spare freed, then once
+            // more.
+            Err(_) => {
+                self.finish();
+                self.spare.clear();
+                self.spare_bytes = [0, 0];
+                self.spare_order = Default::default();
+                loop {
+                    match make(self.gpu) {
+                        Ok(buffer) => return buffer,
+                        Err(e) if host => abort_with(format!("a buffer of {len} bytes: {e}")),
+                        Err(e) => {
+                            // The least recently used mirror the dispatch being
+                            // prepared doesn't bind, its device copy brought home
+                            // first if newer.
+                            let victim = self
+                                .mirrors
+                                .iter()
+                                .filter(|(key, _)| !pinned.contains(key))
+                                .min_by_key(|(_, mirror)| mirror.last_use)
+                                .map(|(&key, _)| key);
+                            let Some(key) = victim else {
+                                abort_with(format!("a buffer of {len} bytes, every mirror evicted: {e}"))
+                            };
+                            self.evict(key);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Frees the mirror at `key`, the device being idle (`finish`): its
+    /// contents brought home if the device wrote them since; the next
+    /// dispatch that binds the payload uploads it again.
+    fn evict(&mut self, key: usize) {
+        self.download(&[key]);
+        if let Some(mirror) = self.mirrors.remove(&key) {
+            drop(mirror.buffer);
+            self.stats.evictions += 1;
+            bump(&DEVICE_GENERATION);
+            bump(&HOST_GENERATION);
+        }
+    }
+
+    fn dispose(&mut self, garbage: Garbage) {
         match garbage {
-            Garbage::Buffer(buffer) => drop(buffer),
+            Garbage::Buffer(buffer) => {
+                let (len, host) = (buffer.len(), !buffer.mapped.is_null());
+                let kind = host as usize;
+                let limit = if host { SPARE_HOST_BYTES } else { SPARE_DEVICE_BYTES };
+                if len > limit {
+                    return;
+                }
+                // The oldest kept go until this one fits.
+                while self.spare_bytes[kind] + len > limit {
+                    let Some(oldest) = self.spare_order[kind].pop_front() else { break };
+                    if let Some(kept) = self.spare.get_mut(&(oldest, host)).filter(|kept| !kept.is_empty()) {
+                        // Perhaps still bound by a command in flight.
+                        let pushed_out = kept.remove(0);
+                        self.spare_bytes[kind] -= oldest;
+                        self.defer(Garbage::Free(pushed_out));
+                    }
+                }
+                self.spare_bytes[kind] += len;
+                self.spare.entry((len, host)).or_default().push(buffer);
+                self.spare_order[kind].push_back(len);
+                // Entries of buffers taken since pile up: rebuilt from what's
+                // kept once they far outnumber it (the order within a size
+                // and across sizes then approximate).
+                if self.spare_order[kind].len() > 65536 {
+                    self.spare_order[kind] = self
+                        .spare
+                        .iter()
+                        .filter(|((_, h), _)| *h == host)
+                        .flat_map(|((size, _), kept)| std::iter::repeat_n(*size, kept.len()))
+                        .collect();
+                }
+            }
             Garbage::DescriptorPool(pool) => unsafe { self.gpu.device.destroy_descriptor_pool(pool, None) },
+            Garbage::Free(buffer) => drop(buffer),
         }
     }
 
@@ -989,7 +1289,7 @@ impl Runtime {
         let mut staged = Vec::with_capacity(stale.len());
         for &key in &stale {
             let len = self.mirrors[&key].len;
-            let staging = gpu.buffer(len).unwrap_or_else(|e| abort_with(format!("staging {len} bytes: {e}")));
+            let staging = self.take_buffer(len, true, &[]);
             let command = self.record();
             let region = [vk::BufferCopy::default().size(len as u64)];
             unsafe { gpu.device.cmd_copy_buffer(command, self.mirrors[&key].buffer.buffer, staging.buffer, &region) };
@@ -1003,11 +1303,13 @@ impl Runtime {
             let host = unsafe { std::slice::from_raw_parts_mut(key as *mut u8, mirror.len) };
             let copying = std::time::Instant::now();
             staging.read(host);
-            self.stats.download_copy_ns += copying.elapsed().as_nanos() as u64;
             mirror.device_newer = false;
-            self.stats.downloaded_bytes += mirror.len as u64;
+            let len = mirror.len;
+            self.stats.download_copy_ns += copying.elapsed().as_nanos() as u64;
+            self.stats.downloaded_bytes += len as u64;
+            self.dispose(Garbage::Buffer(staging)); // the device is done with it
             if tracing() {
-                eprintln!("cleave Vulkan download {key:#x}+{}", mirror.len);
+                eprintln!("cleave Vulkan download {key:#x}+{len}");
             }
         }
     }
@@ -1018,7 +1320,7 @@ impl Runtime {
     fn upload(&mut self, start: usize, len: usize, target: vk::Buffer) {
         let entered = std::time::Instant::now();
         let gpu = self.gpu;
-        let mut staging = gpu.buffer(len).unwrap_or_else(|e| abort_with(format!("staging {len} bytes: {e}")));
+        let mut staging = self.take_buffer(len, true, &[]);
         // SAFETY: the caller's range is live host memory.
         staging.write(unsafe { std::slice::from_raw_parts(start as *const u8, len) });
         let command = self.record();
@@ -1038,7 +1340,7 @@ impl Runtime {
     /// brought home first. `discard`: what's there is about to be overwritten
     /// whole ([`cleave_vk_discard`]), so nothing is uploaded, nor brought home
     /// from a mirror inside the range.
-    fn mirror(&mut self, start: usize, len: usize, discard: bool) {
+    fn mirror(&mut self, start: usize, len: usize, discard: bool, pinned: &[usize]) {
         let retired: Vec<usize> = self
             .overlapping(start, len)
             .into_iter()
@@ -1056,15 +1358,16 @@ impl Runtime {
             bump(&DEVICE_GENERATION);
             bump(&HOST_GENERATION);
         }
-        let gpu = self.gpu;
+        self.uses += 1;
         if !self.mirrors.contains_key(&start) {
-            let buffer = gpu.device_buffer(len).unwrap_or_else(|e| abort_with(format!("mirror of {len} bytes: {e}")));
-            self.mirrors.insert(start, Mirror { len, buffer, host_dirty: true, device_newer: false });
+            let buffer = self.take_buffer(len, false, pinned);
+            self.mirrors.insert(start, Mirror { len, buffer, host_dirty: true, device_newer: false, last_use: self.uses });
             MIRRORS_LIVE.store(true, std::sync::atomic::Ordering::Release);
             bump(&DEVICE_GENERATION);
             bump(&HOST_GENERATION);
         }
         let mirror = self.mirrors.get_mut(&start).expect("a mirror");
+        mirror.last_use = self.uses;
         if discard {
             mirror.host_dirty = false;
             mirror.device_newer = false;
@@ -1196,10 +1499,26 @@ pub unsafe extern "C" fn cleave_vk_dispatch(
             mirror.host_dirty = true;
         }
     }
-    // The mirrors first (each may retire another), then the copies.
+    // The mirrors first (each may retire another), then the copies. None of
+    // this dispatch's is evicted to make room for another (`pinned`).
+    let pinned: Vec<usize> =
+        (0..count).filter(|&i| flags[i] & ARG_MIRROR != 0).map(|i| pointers[i] as usize).collect();
     for i in 0..count {
         if flags[i] & ARG_MIRROR != 0 {
-            runtime.mirror(pointers[i] as usize, bytes[i] as usize, false);
+            let (start, len) = (pointers[i] as usize, bytes[i] as usize);
+            let new = !runtime.mirrors.get(&start).is_some_and(|m| m.len == len);
+            let before = runtime.stats.uploaded_bytes;
+            runtime.mirror(start, len, false, &pinned);
+            let uploaded = runtime.stats.uploaded_bytes - before;
+            if uploaded > 0 {
+                let cause = match (new, flags[i] & ARG_READ != 0) {
+                    (true, false) => 0,
+                    (true, true) => 1,
+                    (false, _) => 2,
+                };
+                runtime.stats.upload_causes[cause] += uploaded;
+                runtime.profile[kernel_id].upload_causes[cause] += uploaded;
+            }
         }
     }
     // A copied argument may still be memory a mirror covers (a payload the
@@ -1224,7 +1543,7 @@ pub unsafe extern "C" fn cleave_vk_dispatch(
             continue;
         }
         let mut buffer =
-            gpu.buffer(bytes[i] as usize).unwrap_or_else(|e| abort_with(format!("kernel `{entry}`: {e}")));
+            runtime.take_buffer(bytes[i] as usize, true, &[]);
         // Copied in whether the kernel reads it or not: one that writes only
         // part of it would bring the rest back as garbage otherwise.
         let host = unsafe { std::slice::from_raw_parts(pointers[i] as usize as *const u8, bytes[i] as usize) };
@@ -1241,35 +1560,48 @@ pub unsafe extern "C" fn cleave_vk_dispatch(
         })
         .collect();
 
-    // The descriptor set, from a pool of its own, kept until the batch is done.
+    // The buffers pushed with the dispatch, or a descriptor set from a pool
+    // of its own, kept until the batch is done.
     let kernel = &runtime.kernels[&key];
-    let (pipeline, pipeline_layout, set_layout) = (kernel.pipeline, kernel.pipeline_layout, kernel.set_layout);
+    let (pipeline, pipeline_layout, set_layout, pushed) =
+        (kernel.pipeline, kernel.pipeline_layout, kernel.set_layout, kernel.pushed);
     let device = &gpu.device;
-    let sizes = [vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(count as u32)];
-    let pool =
-        unsafe { device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None) }
-            .unwrap_or_else(|e| abort_with(format!("creating a descriptor pool: {e}")));
-    let set_layouts = [set_layout];
-    let set = unsafe {
-        device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&set_layouts))
-    }
-    .unwrap_or_else(|e| abort_with(format!("allocating a descriptor set: {e}")))[0];
     let infos: Vec<[vk::DescriptorBufferInfo; 1]> = buffers
         .iter()
         .map(|&b| [vk::DescriptorBufferInfo::default().buffer(b).offset(0).range(vk::WHOLE_SIZE)])
         .collect();
-    let writes: Vec<vk::WriteDescriptorSet> = infos
+    let mut writes: Vec<vk::WriteDescriptorSet> = infos
         .iter()
         .enumerate()
         .map(|(i, info)| {
             vk::WriteDescriptorSet::default()
-                .dst_set(set)
                 .dst_binding(i as u32)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(info)
         })
         .collect();
-    unsafe { device.update_descriptor_sets(&writes, &[]) };
+    let set = if pushed {
+        None
+    } else {
+        let sizes =
+            [vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(count as u32)];
+        let pool = unsafe {
+            device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None)
+        }
+        .unwrap_or_else(|e| abort_with(format!("creating a descriptor pool: {e}")));
+        let set_layouts = [set_layout];
+        let set = unsafe {
+            device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&set_layouts),
+            )
+        }
+        .unwrap_or_else(|e| abort_with(format!("allocating a descriptor set: {e}")))[0];
+        for write in &mut writes {
+            write.dst_set = set;
+        }
+        unsafe { device.update_descriptor_sets(&writes, &[]) };
+        Some((pool, set))
+    };
     phase!(3);
     let command = runtime.record();
     let batch = runtime.recording.as_mut().expect("a batch");
@@ -1285,13 +1617,23 @@ pub unsafe extern "C" fn cleave_vk_dispatch(
             device.cmd_write_timestamp(command, vk::PipelineStageFlags::TOP_OF_PIPE, pool, first);
         }
         device.cmd_bind_pipeline(command, vk::PipelineBindPoint::COMPUTE, pipeline);
-        device.cmd_bind_descriptor_sets(command, vk::PipelineBindPoint::COMPUTE, pipeline_layout, 0, &[set], &[]);
+        match (set, &gpu.push_descriptor) {
+            (Some((_, set)), _) => {
+                device.cmd_bind_descriptor_sets(command, vk::PipelineBindPoint::COMPUTE, pipeline_layout, 0, &[set], &[])
+            }
+            (None, Some(push)) => {
+                push.cmd_push_descriptor_set(command, vk::PipelineBindPoint::COMPUTE, pipeline_layout, 0, &writes)
+            }
+            (None, None) => unreachable!("a kernel pushes its buffers only with VK_KHR_push_descriptor"),
+        }
         device.cmd_dispatch(command, groups_x as u32, groups_y as u32, groups_z as u32);
         if let Some((pool, first)) = query {
             device.cmd_write_timestamp(command, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, first + 1);
         }
     }
-    runtime.defer(Garbage::DescriptorPool(pool));
+    if let Some((pool, _)) = set {
+        runtime.defer(Garbage::DescriptorPool(pool));
+    }
     runtime.stats.dispatches += 1;
     phase!(4);
 
@@ -1384,7 +1726,7 @@ pub extern "C" fn cleave_vk_discard(ptr: i64, bytes: i64) {
     let mut guard = lock();
     let runtime = runtime(&mut guard);
     let waited = runtime.stats.wait_ns;
-    runtime.mirror(ptr as usize, bytes as usize, true);
+    runtime.mirror(ptr as usize, bytes as usize, true, &[ptr as usize]);
     runtime.stats.sync_ns += (entered.elapsed().as_nanos() as u64).saturating_sub(runtime.stats.wait_ns - waited);
 }
 

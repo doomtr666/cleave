@@ -303,11 +303,14 @@ stderr: {stderr}", device.name);
 
 /// Products the device runs tiled (`cleave-tile-matmuls-for-gpu`: blocks of
 /// the result per workgroup, slices of the operands through workgroup
-/// memory) give the CPU's results to the bit, in each layout: `matmul`,
+/// memory) give the CPU's results in each layout: `matmul`,
 /// `matmul_transpose_b`, `matmul_transpose_a`, and a shape only the smaller
-/// tiling divides. Each element sums over `k` in the same order.
+/// tiling divides. One large enough to fill the device sums each element
+/// over `k` in order, the CPU's result to the bit; the small ones make too
+/// few workgroups and split `k` (two slices added after), equal within
+/// rounding.
 #[test]
-fn tiled_products_match_the_cpu_to_the_bit() {
+fn tiled_products_match_the_cpu() {
     let src = "
         use nn;
         use io;
@@ -319,6 +322,8 @@ fn tiled_products_match_the_cpu_to_the_bit() {
         fn p3(a: Tensor<f32, 64, 256>, b: Tensor<f32, 64, 128>) -> Tensor<f32, 256, 128> { matmul_transpose_a(a, b) }
         #[no_inline]
         fn p4(a: Tensor<f32, 128, 64>, b: Tensor<f32, 64, 64>) -> Tensor<f32, 128, 64> { matmul(a, b) }
+        #[no_inline]
+        fn p5(a: Tensor<f32, 1024, 64>, b: Tensor<f32, 64, 2048>) -> Tensor<f32, 1024, 2048> { matmul(a, b) }
         fn checksum(c: Tensor<f32, 256, 128>) -> f32 {
             let mut s: f32 = 0.0;
             for i in 0..256 { for j in 0..128 { s = s + c[i, j] * (i * 7 - j * 3).to(); }; };
@@ -339,6 +344,12 @@ fn tiled_products_match_the_cpu_to_the_bit() {
             let mut s: f32 = 0.0;
             for i in 0..128 { for j in 0..64 { s = s + y[i, j] * (i - j).to(); }; };
             println(s);
+            let big_a: Tensor<f32, 1024, 64> = Init::he();
+            let big_b: Tensor<f32, 64, 2048> = Init::he();
+            let z = p5(big_a, big_b);
+            let mut t: f32 = 0.0;
+            for i in 0..1024 { for j in 0..2048 { t = t + z[i, j] * (i - j).to(); }; };
+            println(t);
             0
         }
     ";
@@ -357,9 +368,18 @@ fn tiled_products_match_the_cpu_to_the_bit() {
         .expect("cannot run cleave");
     let cpu = String::from_utf8_lossy(&cpu.stdout).into_owned();
     assert!(cpu.contains("main returned: 0"), "cpu: {cpu}");
+    let lines = |out: &str| -> Vec<String> { out.lines().map(str::to_string).collect() };
+    let expected = lines(&cpu);
     for (index, device) in devices.iter().enumerate() {
         let (stdout, stderr) = stats_on(index, "tiled_products", src);
-        assert_eq!(stdout, cpu, "{}: stderr: {stderr}", device.name);
+        let got = lines(&stdout);
+        assert_eq!(got.len(), expected.len(), "{}: {stdout}
+{stderr}", device.name);
+        for (i, (g, e)) in got.iter().zip(&expected).take(4).enumerate() {
+            let (g, e): (f64, f64) = (g.parse().unwrap(), e.parse().unwrap());
+            assert!((g - e).abs() <= 1e-5 * e.abs(), "{}: product {}: {g} on the GPU, {e} on the CPU", device.name, i + 1);
+        }
+        assert_eq!(got[4..], expected[4..], "{}: the large product: stderr: {stderr}", device.name);
         assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
     }
 }
@@ -369,9 +389,10 @@ fn tiled_products_match_the_cpu_to_the_bit() {
 /// only to compare them (`dealloc_helper`), which isn't an access
 /// (`addressOnlyCompared`); reported as one, each head re-uploaded them,
 /// 14 GiB a step in nanoLM. Each head's scores, a fresh allocation reached
-/// through a cast, are discarded rather than uploaded. Up: the four inputs
-/// and the three out-parameters, 256 KiB each, and scalar kernel
-/// arguments; one submit per result read.
+/// through a cast, are discarded rather than uploaded, and so are the three
+/// results, fresh heap allocations made memrefs in the function
+/// (`isFreshDescriptor`). Up: the four inputs, 256 KiB each, and scalar
+/// kernel arguments; one submit per result read.
 #[test]
 fn attention_gradients_stay_on_the_device_across_heads() {
     let src = "
@@ -394,7 +415,7 @@ fn attention_gradients_stay_on_the_device_across_heads() {
 stderr: {stderr}", device.name);
         assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
         assert!(
-            stderr.contains("1835424 bytes uploaded, 786432 bytes downloaded, 3 submits"),
+            stderr.contains("1048992 bytes uploaded, 786432 bytes downloaded, 3 submits"),
             "{}: {stderr}",
             device.name
         );
@@ -466,6 +487,54 @@ fn row_reductions_run_a_workgroup_per_row() {
 {stderr}");
         assert!(!stderr.contains("cleave Vulkan validation"), "{stderr}");
         assert!(stderr.contains("row_stats_kernel #0 [256, 1, 1]"), "{stderr}");
+    }
+}
+
+/// A gradient summed over rows into one value per column (`rms_norm_grad_g`:
+/// each row's scale computed, then `d[c] += u[r, c] * x[r, c] * scale`) runs
+/// as three kernels (`interchangeAccumulation`): the zeros, each row's scale,
+/// then each column summing the rows in their order. It ran a kernel per row
+/// with the scales on the host, 1.5 GiB read back per nanoLM step. The sum
+/// is the CPU's up to the device's square root.
+#[test]
+fn a_sum_over_rows_into_columns_runs_by_column() {
+    let src = "
+        use nn;
+        use io;
+        fn main() -> i32 {
+            rand_seed(1);
+            let x: Tensor<f32, 256, 256> = Init::he();
+            let g: Tensor<f32, 1, 256> = Init::he();
+            let u: Tensor<f32, 256, 256> = Init::he();
+            let d = RmsNorm::rms_norm_grad_g(x, g, u);
+            let mut s: f32 = 0.0;
+            for c in 0..256 { s = s + d[0, c] * (c + 1).to(); };
+            println(s);
+            0
+        }
+    ";
+    let devices = devices();
+    if devices.is_empty() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("cleave-vulkan-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("column_sums.cleave");
+    std::fs::write(&source, src).unwrap();
+    let number = |out: &str| -> f64 { out.lines().next().and_then(|l| l.trim().parse().ok()).unwrap_or(f64::NAN) };
+    let cpu = Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--no-debug-info", "--run"])
+        .arg(&source)
+        .output()
+        .expect("cannot run cleave");
+    let expected = number(&String::from_utf8_lossy(&cpu.stdout));
+    assert!(expected.is_finite());
+    for (index, device) in devices.iter().enumerate() {
+        let (stdout, stderr) = stats_on(index, "column_sums", src);
+        let got = number(&stdout);
+        assert!((got - expected).abs() <= 1e-5 * expected.abs(), "{}: {got} on the GPU, {expected} on the CPU", device.name);
+        assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
+        assert!(stderr.contains(" 3 dispatches"), "{}: {stderr}", device.name);
     }
 }
 
@@ -598,7 +667,11 @@ stderr: {stderr}", device.name);
 /// Phase 3, an in-place elementwise op (`o * w` writing into `o`) declared
 /// a full overwrite of a buffer one of its inputs reads: the host's values
 /// were dropped (`cleave_vk_discard` now only for fresh allocations no input
-/// reads). nanoLM's attention gradients were 3 to 15 times off.
+/// reads). nanoLM's attention gradients were 3 to 15 times off. Again with
+/// 40 KB of device memory for mirrors (`CLEAVE_VK_DEVICE_BUDGET`): the
+/// least recently used evicted, brought home first, uploaded again when
+/// bound, the same gradients (nanoLM at its full size outgrows the 4070
+/// SUPER's 12 GiB).
 #[test]
 fn a_miniature_transformer_has_the_cpus_gradients() {
     let src = "
@@ -691,21 +764,36 @@ fn a_miniature_transformer_has_the_cpus_gradients() {
     let source = dir.join("tiny_gpt.cleave");
     std::fs::write(&source, src).unwrap();
     let numbers = |stdout: &str| -> Vec<f64> { stdout.lines().filter_map(|l| l.trim().parse().ok()).collect() };
-    let run = |backend: &str, device: usize| {
-        let output = Command::new(env!("CARGO_BIN_EXE_cleave"))
+    // `budget`: a device memory budget (`CLEAVE_VK_DEVICE_BUDGET`) small
+    // enough that mirrors are evicted and uploaded again.
+    let run = |backend: &str, device: usize, budget: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cleave"));
+        command
             .args(["--backend", backend, "--no-openmp", "--no-debug-info", "--run"])
             .arg(&source)
             .env("CLEAVE_VK_DEVICE", device.to_string())
-            .env("CLEAVE_VK_VALIDATION", "1")
-            .output()
-            .expect("cannot run cleave");
+            .env("CLEAVE_VK_VALIDATION", "1");
+        if let Some(budget) = budget {
+            command.env("CLEAVE_VK_DEVICE_BUDGET", budget).env("CLEAVE_VK_PROFILE", "1");
+        }
+        let output = command.output().expect("cannot run cleave");
         (String::from_utf8_lossy(&output.stdout).into_owned(), String::from_utf8_lossy(&output.stderr).into_owned())
     };
-    let (cpu, _) = run("cpu", 0);
+    let (cpu, _) = run("cpu", 0, None);
     let expected = numbers(&cpu);
     assert_eq!(expected.len(), 12, "cpu: {cpu}");
-    for (index, device) in devices.iter().enumerate() {
-        let (gpu, stderr) = run("vulkan", index);
+    for ((index, device), budget) in
+        devices.iter().enumerate().flat_map(|d| [(d, None), (d, Some("40000"))])
+    {
+        let (gpu, stderr) = run("vulkan", index, budget);
+        if budget.is_some() {
+            let evicted = stderr
+                .split(" mirrors evicted")
+                .next()
+                .and_then(|before| before.rsplit(' ').next())
+                .and_then(|n| n.parse::<u64>().ok());
+            assert!(evicted.is_some_and(|n| n > 0), "{}: no mirror evicted under the budget: {stderr}", device.name);
+        }
         let got = numbers(&gpu);
         assert_eq!(got.len(), expected.len(), "{}: {gpu}
 {stderr}", device.name);
