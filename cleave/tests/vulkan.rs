@@ -398,7 +398,10 @@ fn tiled_products_match_the_cpu() {
 /// through a cast, are discarded rather than uploaded, and so are the three
 /// results, fresh heap allocations made memrefs in the function
 /// (`isFreshDescriptor`). Up: the four inputs, 256 KiB each, and scalar
-/// kernel arguments; one submit per result read.
+/// kernel arguments; one submit per result read. Its loop over heads, a
+/// `scf.while` for the deallocation's bookkeeping, is folded into its
+/// kernels (`cleave-fold-loops-into-grids`), the bookkeeping left in a host
+/// loop: 10 dispatches.
 #[test]
 fn attention_gradients_stay_on_the_device_across_heads() {
     let src = "
@@ -421,7 +424,7 @@ fn attention_gradients_stay_on_the_device_across_heads() {
 stderr: {stderr}", device.name);
         assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
         assert!(
-            stderr.contains("1048896 bytes uploaded, 786432 bytes downloaded, 3 submits"),
+            stderr.contains(": 10 dispatches, 1048672 bytes uploaded, 786432 bytes downloaded, 3 submits"),
             "{}: {stderr}",
             device.name
         );
@@ -499,9 +502,11 @@ fn row_reductions_run_a_workgroup_per_row() {
 /// A gradient summed over rows into one value per column (`rms_norm_grad_g`:
 /// each row's scale computed, then `d[c] += u[r, c] * x[r, c] * scale`) runs
 /// as three kernels (`interchangeAccumulation`): the zeros, each row's scale,
-/// then each column summing the rows in their order. It ran a kernel per row
-/// with the scales on the host, 1.5 GiB read back per nanoLM step. The sum
-/// is the CPU's up to the device's square root.
+/// then each column summing its rows, a workgroup per column
+/// (`promoteAccumulation`: a thread per column made 12 workgroups of nanoLM's
+/// 768 columns, its costliest kernel). It ran a kernel per row with the
+/// scales on the host, 1.5 GiB read back per nanoLM step. The sum is the
+/// CPU's up to the device's square root and the rows' summing order.
 #[test]
 fn a_sum_over_rows_into_columns_runs_by_column() {
     let src = "
@@ -536,7 +541,17 @@ fn a_sum_over_rows_into_columns_runs_by_column() {
     let expected = number(&String::from_utf8_lossy(&cpu.stdout));
     assert!(expected.is_finite());
     for (index, device) in devices.iter().enumerate() {
-        let (stdout, stderr) = stats_on(index, "column_sums", src);
+        let output = Command::new(env!("CARGO_BIN_EXE_cleave"))
+            .args(["--backend", "vulkan", "--no-openmp", "--no-debug-info", "--run"])
+            .arg(&source)
+            .env("CLEAVE_VK_DEVICE", index.to_string())
+            .env("CLEAVE_VK_VALIDATION", "1")
+            .env("CLEAVE_VK_PROFILE", "1")
+            .output()
+            .expect("cannot run cleave");
+        let (stdout, stderr) =
+            (String::from_utf8_lossy(&output.stdout).into_owned(), String::from_utf8_lossy(&output.stderr).into_owned());
+        assert!(stderr.contains("Tensor<f32, 1, 256>>_kernel #2 [256, 1, 1]"), "{}: {stderr}", device.name);
         let got = number(&stdout);
         assert!((got - expected).abs() <= 1e-5 * expected.abs(), "{}: {got} on the GPU, {expected} on the CPU", device.name);
         assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
@@ -606,6 +621,137 @@ fn a_nest_of_independent_loops_runs_a_thread_per_innermost_iteration() {
         assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
         assert!(stderr.contains("AttentionShape<64, 32>>_kernel #0 [256, 1, 1]"), "{}: {stderr}", device.name);
         assert!(stderr.contains("running_sums_kernel #2 [4, 1, 1]"), "{}: {stderr}", device.name);
+    }
+}
+
+/// Causal attention skips the work the mask makes useless, found at compile
+/// time (`cleave-tile-matmuls-for-gpu`): the tiles of `Q K^T` above the
+/// diagonal, which the softmax never reads (120 of 256), and in the products
+/// by the weights or the score gradient (`P V`, `dQ`, `dK`, `dV`), the
+/// slices of the reduction where those are zero (stored as 0, or as a
+/// product with the zero weights). The same values as the CPU, forward and
+/// backward.
+#[test]
+fn causal_attention_skips_the_masked_half() {
+    let src = "
+        use nn;
+        use io;
+        fn main() -> i32 {
+            rand_seed(3);
+            let q: Tensor<f32, 1024, 128> = Init::he();
+            let k: Tensor<f32, 1024, 128> = Init::he();
+            let v: Tensor<f32, 1024, 128> = Init::he();
+            let u: Tensor<f32, 1024, 128> = Init::he();
+            let o = causal_attention(q, k, v, AttentionShape::<1024, 64>());
+            let (a, b, c) = CausalAttention::causal_attention_backward(q, k, v, AttentionShape::<1024, 64>(), u);
+            for r in [0, 5, 63, 64, 517, 1000, 1023] {
+                for col in [0, 33, 64, 127] {
+                    println(o[r, col]);
+                    println(a[r, col]);
+                    println(b[r, col]);
+                    println(c[r, col]);
+                };
+            };
+            0
+        }
+    ";
+    let devices = devices();
+    if devices.is_empty() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("cleave-vulkan-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("masked_attention.cleave");
+    std::fs::write(&source, src).unwrap();
+    let numbers = |out: &str| -> Vec<f64> { out.lines().filter_map(|l| l.trim().parse().ok()).collect() };
+    let cpu = Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--no-debug-info", "--run"])
+        .arg(&source)
+        .output()
+        .expect("cannot run cleave");
+    let expected = numbers(&String::from_utf8_lossy(&cpu.stdout));
+    assert_eq!(expected.len(), 7 * 4 * 4);
+    let scale = expected.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+    for (index, device) in devices.iter().enumerate() {
+        let output = Command::new(env!("CARGO_BIN_EXE_cleave"))
+            .args(["--backend", "vulkan", "--no-openmp", "--no-debug-info", "--run"])
+            .arg(&source)
+            .env("CLEAVE_VK_DEVICE", index.to_string())
+            .env("CLEAVE_VK_VALIDATION", "1")
+            .env("CLEAVE_DEBUG_PARALLELIZE", "1")
+            .output()
+            .expect("cannot run cleave");
+        let (stdout, stderr) =
+            (String::from_utf8_lossy(&output.stdout).into_owned(), String::from_utf8_lossy(&output.stderr).into_owned());
+        let got = numbers(&stdout);
+        assert_eq!(got.len(), expected.len(), "{}: {stdout}", device.name);
+        for (i, (g, e)) in got.iter().zip(&expected).enumerate() {
+            assert!((g - e).abs() <= 1e-4 * scale, "{}: value {i}: {g} on the GPU, {e} on the CPU", device.name);
+        }
+        assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
+        assert_eq!(stderr.matches("1024x1024x64, 120 dead tiles of 256").count(), 2, "{}: {stderr}", device.name);
+        assert_eq!(stderr.matches("some zero slices").count(), 4, "{}: {stderr}", device.name);
+    }
+}
+
+/// A host loop whose iterations' allocations don't all fit the device's
+/// cache together is folded into its kernels by groups
+/// (`cleave-fold-loops-into-grids`, `CLEAVE_GPU_FOLD_BYTES`), a host loop over
+/// the groups left: 4 heads holding 8 MiB each at most, by 2 under 24 MiB. The CPU's
+/// values.
+#[test]
+fn a_host_loop_folds_into_its_kernels_by_groups() {
+    let src = "
+        use nn;
+        use io;
+        fn main() -> i32 {
+            rand_seed(4);
+            let q: Tensor<f32, 1024, 256> = Init::he();
+            let k: Tensor<f32, 1024, 256> = Init::he();
+            let v: Tensor<f32, 1024, 256> = Init::he();
+            let o = causal_attention(q, k, v, AttentionShape::<1024, 64>());
+            for r in [0, 9, 511, 1023] {
+                for c in [0, 70, 130, 255] { println(o[r, c]); };
+            };
+            0
+        }
+    ";
+    let devices = devices();
+    if devices.is_empty() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("cleave-vulkan-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("grouped_heads.cleave");
+    std::fs::write(&source, src).unwrap();
+    let numbers = |out: &str| -> Vec<f64> { out.lines().filter_map(|l| l.trim().parse().ok()).collect() };
+    let cpu = Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--no-debug-info", "--run"])
+        .arg(&source)
+        .output()
+        .expect("cannot run cleave");
+    let expected = numbers(&String::from_utf8_lossy(&cpu.stdout));
+    assert_eq!(expected.len(), 16);
+    let scale = expected.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+    for (index, device) in devices.iter().enumerate() {
+        let output = Command::new(env!("CARGO_BIN_EXE_cleave"))
+            .args(["--backend", "vulkan", "--no-openmp", "--no-debug-info", "--run"])
+            .arg(&source)
+            .env("CLEAVE_VK_DEVICE", index.to_string())
+            .env("CLEAVE_VK_VALIDATION", "1")
+            .env("CLEAVE_DEBUG_PARALLELIZE", "1")
+            .env("CLEAVE_GPU_FOLD_BYTES", (24 << 20).to_string())
+            .output()
+            .expect("cannot run cleave");
+        let (stdout, stderr) =
+            (String::from_utf8_lossy(&output.stdout).into_owned(), String::from_utf8_lossy(&output.stderr).into_owned());
+        let got = numbers(&stdout);
+        assert_eq!(got.len(), expected.len(), "{}: {stdout}", device.name);
+        for (i, (g, e)) in got.iter().zip(&expected).enumerate() {
+            assert!((g - e).abs() <= 1e-4 * scale, "{}: value {i}: {g} on the GPU, {e} on the CPU", device.name);
+        }
+        assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
+        assert!(stderr.contains("folded 4 iterations by 2"), "{}: {stderr}", device.name);
     }
 }
 
