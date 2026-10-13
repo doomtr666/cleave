@@ -105,6 +105,8 @@ pub struct Gpu {
     max_push_descriptors: u32,
     /// Nanoseconds per timestamp tick (`CLEAVE_VK_PROFILE`).
     timestamp_period: f32,
+    /// Whether VMA reads the system's budget (`VK_EXT_memory_budget`).
+    has_budget: bool,
     debug: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
     instance: ash::Instance,
     _entry: ash::Entry,
@@ -228,7 +230,8 @@ impl Gpu {
         // VMA knows: the budget extension needs 1.1's queries.
         let device_version = unsafe { instance.get_physical_device_properties(physical) }.api_version;
         allocator_info.vulkan_api_version = device_version.min(vk::API_VERSION_1_3);
-        if has_budget && device_version >= vk::API_VERSION_1_1 {
+        let has_budget = has_budget && device_version >= vk::API_VERSION_1_1;
+        if has_budget {
             allocator_info.flags |= vk_mem::AllocatorCreateFlags::EXT_MEMORY_BUDGET;
         }
         let allocator =
@@ -244,6 +247,7 @@ impl Gpu {
             push_descriptor,
             max_push_descriptors,
             timestamp_period,
+            has_budget,
             debug,
             instance,
             _entry: entry,
@@ -259,6 +263,43 @@ impl Gpu {
     /// without `CLEAVE_VK_VALIDATION=1`).
     pub fn validation_messages(&self) -> Vec<String> {
         VALIDATION_MESSAGES.lock().map(|mut m| std::mem::take(&mut *m)).unwrap_or_default()
+    }
+
+    /// The device's own memory this process uses and the most the system lets
+    /// it use (`VK_EXT_memory_budget`, through VMA): its device-local heaps'
+    /// usage and budget, as of the last refresh (`refresh_budget`). None
+    /// without the extension.
+    pub fn device_memory(&self) -> Option<(u64, u64)> {
+        self.device_memory_detail().map(|d| (d[0], d[1]))
+    }
+
+    /// `device_memory`, then VMA's own: the bytes of its blocks (device
+    /// memory it took from the system) and of the allocations in them.
+    fn device_memory_detail(&self) -> Option<[u64; 4]> {
+        if !self.has_budget {
+            return None;
+        }
+        // SAFETY: the allocator is alive as long as `self`.
+        let properties = unsafe { self.allocator.get_memory_properties() };
+        let budgets = self.allocator.get_heap_budgets().ok()?;
+        let mut total = [0; 4];
+        for (heap, budget) in properties.memory_heaps[..properties.memory_heap_count as usize].iter().zip(&budgets) {
+            if heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL) {
+                total[0] += budget.usage;
+                total[1] += budget.budget;
+                total[2] += budget.statistics.blockBytes;
+                total[3] += budget.statistics.allocationBytes;
+            }
+        }
+        Some(total)
+    }
+
+    /// Fetches the system's budget again (VMA otherwise keeps the one it
+    /// read at start, plus its own allocations since: another program taking
+    /// device memory goes unseen, and Windows then moves ours to the host's).
+    fn refresh_budget(&self, frame: u32) {
+        // SAFETY: the allocator is alive as long as `self`.
+        unsafe { self.allocator.set_current_frame_index(frame) };
     }
 
     /// A storage buffer of `bytes` bytes the host can also read and write
@@ -600,6 +641,18 @@ pub struct Stats {
     /// upload: a discard the compiler missed), a new mirror it reads (the
     /// host's data), a mirror the host wrote since.
     pub upload_causes: [u64; 3],
+    /// Commands recorded without a barrier before them, and with one
+    /// (`Runtime::record`).
+    pub barriers: [u64; 2],
+    /// `CLEAVE_VK_PROFILE`: the batches' spans on the device, from a batch's
+    /// first kernel's start to its last one's end, and how much of them some
+    /// kernel ran (the union of their intervals).
+    pub batch_span_ns: u64,
+    pub batch_busy_ns: u64,
+    /// The most device memory the process used (`Gpu::device_memory`), as
+    /// a new buffer was made, and then: the budget, the mirrors', the spare
+    /// buffers', VMA's blocks' and allocations'.
+    pub device_peak: [u64; 6],
 }
 
 /// The causes [`Stats::upload_causes`] counts.
@@ -656,6 +709,10 @@ struct Batch {
     /// kernel each pair times.
     queries: Option<vk::QueryPool>,
     timed: Vec<usize>,
+    /// The buffers commands read and wrote since the batch's last barrier
+    /// (`Runtime::record`).
+    read_since: std::collections::HashSet<vk::Buffer>,
+    written_since: std::collections::HashSet<vk::Buffer>,
 }
 
 /// Dispatches a batch times at most (`CLEAVE_VK_PROFILE`); later ones in the
@@ -684,6 +741,11 @@ struct KernelProfile {
 /// commands: the device starts on long sequences before the host needs
 /// anything back, and what a batch keeps alive stays bounded.
 const BATCH_COMMANDS: usize = 256;
+
+/// Batches submitted and not finished at most (`Runtime::submit`): enough
+/// for the device never to wait for the host, few enough that what they keep
+/// alive stays small.
+const MOST_IN_FLIGHT: usize = 4;
 
 /// The runtime generated code calls: the device, opened on first use
 /// ([`Gpu::new`]), the kernels built so far (by the address of their SPIR-V
@@ -812,6 +874,13 @@ fn device_budget() -> Option<usize> {
     *BUDGET.get_or_init(|| std::env::var("CLEAVE_VK_DEVICE_BUDGET").ok().and_then(|v| v.parse().ok()))
 }
 
+/// `CLEAVE_VK_FULL_BARRIERS=1`: a barrier before every command
+/// (`Runtime::record`), a diagnostic for a result the skipped ones change.
+fn full_barriers() -> bool {
+    static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FULL.get_or_init(|| std::env::var("CLEAVE_VK_FULL_BARRIERS").is_ok_and(|v| v == "1"))
+}
+
 fn tracing() -> bool {
     static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *TRACE.get_or_init(|| std::env::var("CLEAVE_VK_TRACE").is_ok_and(|v| v == "1"))
@@ -906,6 +975,31 @@ extern "C" fn report() {
     }
     let total: f64 = runtime.profile.iter().map(|k| k.gpu_ns).sum();
     let _ = writeln!(out, "  device time in kernels: {:.1} ms", total / 1e6);
+    let _ = writeln!(
+        out,
+        "  barriers: {} commands after one, {} without ({:.0}%: no buffer hazard)",
+        s.barriers[1],
+        s.barriers[0],
+        100.0 * s.barriers[0] as f64 / (s.barriers[0] + s.barriers[1]).max(1) as f64
+    );
+    let idle = s.batch_span_ns.saturating_sub(s.batch_busy_ns);
+    let _ = writeln!(
+        out,
+        "  device time across batches: {:.1} ms, {:.1} ms of it running a kernel, {:.1} ms ({:.0}%) between kernels",
+        s.batch_span_ns as f64 / 1e6,
+        s.batch_busy_ns as f64 / 1e6,
+        idle as f64 / 1e6,
+        100.0 * idle as f64 / s.batch_span_ns.max(1) as f64
+    );
+    let [used, budget, mirrors, spare, blocks, allocations] = s.device_peak.map(|b| b as f64 / 1048576.0);
+    let _ = writeln!(
+        out,
+        "  device memory at its peak: {used:.0} MiB of a {budget:.0} MiB budget: {mirrors:.0} MiB of mirrors, \
+         {spare:.0} MiB of spare buffers, {:.0} MiB else (allocations in VMA's blocks {allocations:.0} MiB of \
+         {blocks:.0} MiB); {} mirrors evicted",
+        used - mirrors - spare,
+        s.evictions
+    );
     let mut kernels: Vec<&KernelProfile> = runtime.profile.iter().collect();
     kernels.sort_by(|a, b| b.gpu_ns.total_cmp(&a.gpu_ns));
     let mib = |b: u64| b as f64 / 1048576.0;
@@ -987,10 +1081,15 @@ pub fn finish() {
 }
 
 impl Runtime {
-    /// The command buffer being recorded, begun if none is, with a full
-    /// memory barrier recorded after what it already holds: every command
-    /// sees every earlier one's writes, transfers and dispatches alike.
-    fn record(&mut self) -> vk::CommandBuffer {
+    /// The command buffer being recorded, begun if none is, ready for a
+    /// command reading `reads` and writing `writes`: a memory barrier first
+    /// when it needs one, a buffer it touches written by a command since the
+    /// last barrier, or one it writes read by one (or the batch's first
+    /// command: an earlier batch may still run). Commands on unrelated
+    /// buffers then run without draining the device between them (30% of
+    /// nanoLM's barriers needed nothing). `CLEAVE_VK_FULL_BARRIERS=1`: one
+    /// before every command, a diagnostic.
+    fn record(&mut self, reads: &[vk::Buffer], writes: &[vk::Buffer]) -> vk::CommandBuffer {
         let device = &self.gpu.device;
         if self.recording.is_none() {
             let command = unsafe {
@@ -1024,13 +1123,28 @@ impl Runtime {
                 unsafe { device.cmd_reset_query_pool(command, pool, 0, 2 * TIMED_PER_BATCH as u32) };
                 pool
             });
-            self.recording = Some(Batch { command, fence, commands: 0, garbage: Vec::new(), queries, timed: Vec::new() });
+            self.recording = Some(Batch {
+                command,
+                fence,
+                commands: 0,
+                garbage: Vec::new(),
+                queries,
+                timed: Vec::new(),
+                read_since: Default::default(),
+                written_since: Default::default(),
+            });
         }
         let batch = self.recording.as_mut().expect("a batch");
-        // Before every command, the first of a batch too: a barrier's first
-        // scope is everything submitted to the queue before it, and an earlier
-        // batch may still be running (submitted without waiting).
-        {
+        let needed = full_barriers()
+            || batch.commands == 0
+            || reads.iter().chain(writes).any(|b| batch.written_since.contains(b))
+            || writes.iter().any(|b| batch.read_since.contains(b));
+        self.stats.barriers[needed as usize] += 1;
+        if needed {
+            batch.read_since.clear();
+            batch.written_since.clear();
+            // A barrier's first scope is everything submitted to the queue
+            // before it: the commands of this batch and of earlier ones.
             let stages = vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER;
             let barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
@@ -1044,6 +1158,8 @@ impl Runtime {
                 device.cmd_pipeline_barrier(batch.command, stages, stages, vk::DependencyFlags::empty(), &[barrier], &[], &[])
             };
         }
+        batch.read_since.extend(reads);
+        batch.written_since.extend(writes);
         batch.commands += 1;
         batch.command
     }
@@ -1053,8 +1169,8 @@ impl Runtime {
     /// dropped at once when nothing is pending.
     fn defer(&mut self, garbage: Garbage) {
         // A buffer only the device uses is spare at once: what's recorded
-        // with it next runs after what used it (one queue, a full barrier
-        // between commands). Waiting for the fence left the spare empty
+        // with it next runs after what used it (one queue, a barrier before
+        // any command touching a buffer an unfinished one touched). Waiting for the fence left the spare empty
         // between waits, every new mirror a new buffer (320k a nanoLM step).
         // One the host maps waits: the host writes it when it's taken.
         if let Garbage::Buffer(buffer) = &garbage
@@ -1077,26 +1193,15 @@ impl Runtime {
             self.spare_bytes[host as usize] -= len;
             return buffer;
         }
-        // `CLEAVE_VK_DEVICE_BUDGET`, bytes: the mirrors kept within it, the
-        // least recently used evicted past it, as when the device's memory
-        // runs out (what tests it, on a small program).
-        if let (false, Some(budget)) = (host, device_budget()) {
-            loop {
-                let used: usize = self.mirrors.values().map(|m| m.len).sum();
-                if used + len <= budget {
-                    break;
-                }
-                self.finish();
-                let victim = self
-                    .mirrors
-                    .iter()
-                    .filter(|(key, _)| !pinned.contains(key))
-                    .min_by_key(|(_, mirror)| mirror.last_use)
-                    .map(|(&key, _)| key);
-                match victim {
-                    Some(key) => self.evict(key),
-                    None => break,
-                }
+        if !host {
+            self.make_room(len, pinned);
+            if self.profiling
+                && let Some([used, budget, blocks, allocations]) = self.gpu.device_memory_detail()
+                && used > self.stats.device_peak[0]
+            {
+                let mirrors: usize = self.mirrors.values().map(|m| m.len).sum();
+                self.stats.device_peak =
+                    [used, budget, mirrors as u64, self.spare_bytes[0] as u64, blocks, allocations];
             }
         }
         self.stats.buffers_made += 1;
@@ -1134,6 +1239,60 @@ impl Runtime {
                     }
                 }
             }
+        }
+    }
+
+    /// Whether `len` more bytes of the device's memory would take the process
+    /// past what it may use: `CLEAVE_VK_DEVICE_BUDGET` bytes of mirrors (what
+    /// tests it, on a small program), or 95% of the system's budget for it
+    /// (`Gpu::device_memory`: past the budget, Windows doesn't fail an
+    /// allocation but moves device memory to the host's behind the device's
+    /// back, nanoLM's step 3x slower beside a game).
+    fn over_budget(&self, len: usize) -> bool {
+        if let Some(budget) = device_budget() {
+            let mirrors: usize = self.mirrors.values().map(|m| m.len).sum();
+            if mirrors + len > budget {
+                return true;
+            }
+        }
+        self.gpu.device_memory().is_some_and(|(used, budget)| used + len as u64 > budget / 20 * 19)
+    }
+
+    /// The spare device buffers freed (`spare`) once the device has finished
+    /// what's recorded: one is spare as soon as its last command is recorded
+    /// (`defer`).
+    fn free_spare_device_buffers(&mut self) {
+        let device: Vec<(usize, bool)> = self.spare.keys().filter(|(_, host)| !host).copied().collect();
+        for key in device {
+            for buffer in self.spare.remove(&key).unwrap_or_default() {
+                self.defer(Garbage::Free(buffer));
+            }
+        }
+        self.spare_bytes[0] = 0;
+        self.spare_order[0].clear();
+    }
+
+    /// Room for `len` more bytes of the device's memory (`over_budget`): the
+    /// device's work finished, the spare buffers freed, then the least
+    /// recently used mirrors the dispatch being prepared doesn't bind
+    /// (`pinned`) evicted, until it fits or nothing more can go.
+    fn make_room(&mut self, len: usize, pinned: &[usize]) {
+        if !self.over_budget(len) {
+            return;
+        }
+        self.finish();
+        self.free_spare_device_buffers();
+        while self.over_budget(len) {
+            let victim = self
+                .mirrors
+                .iter()
+                .filter(|(key, _)| !pinned.contains(key))
+                .min_by_key(|(_, mirror)| mirror.last_use)
+                .map(|(&key, _)| key);
+            let Some(key) = victim else { break };
+            self.evict(key);
+            // Its buffer freed, not kept spare.
+            self.free_spare_device_buffers();
         }
     }
 
@@ -1216,6 +1375,28 @@ impl Runtime {
         }
         self.stats.submits += 1;
         self.in_flight.push(batch);
+        // What the device has finished released now, not at the host's next
+        // wait: the buffers the batches free (spare ones pushed out) piled
+        // up between waits, 3.7 GiB of nanoLM's device memory. At most
+        // `MOST_IN_FLIGHT` batches ahead of the device, the oldest waited
+        // for past that.
+        self.retire_finished();
+        if self.in_flight.len() > MOST_IN_FLIGHT {
+            let waiting = std::time::Instant::now();
+            let fence = self.in_flight[0].fence;
+            unsafe { self.gpu.device.wait_for_fences(&[fence], true, u64::MAX) }
+                .unwrap_or_else(|e| abort_with(format!("waiting for a batch: {e}")));
+            self.stats.waits += 1;
+            self.stats.wait_ns += waiting.elapsed().as_nanos() as u64;
+            self.retire_finished();
+        }
+        // The system's budget read again, the spare buffers given back when
+        // it has shrunk under what the process uses (another program took
+        // device memory); `take_buffer` evicts mirrors if that isn't enough.
+        self.gpu.refresh_budget(self.stats.submits as u32);
+        if self.over_budget(0) {
+            self.free_spare_device_buffers();
+        }
     }
 
     /// Submits what is recorded and waits for everything submitted, then
@@ -1234,32 +1415,73 @@ impl Runtime {
         self.stats.waits += 1;
         self.stats.wait_ns += waiting.elapsed().as_nanos() as u64;
         for batch in std::mem::take(&mut self.in_flight) {
-            if let Some(pool) = batch.queries {
-                if !batch.timed.is_empty() {
-                    let mut ticks = vec![0u64; 2 * batch.timed.len()];
-                    let read = unsafe {
-                        device.get_query_pool_results(pool, 0, &mut ticks, vk::QueryResultFlags::TYPE_64)
-                    };
-                    if read.is_ok() {
-                        for (i, &kernel) in batch.timed.iter().enumerate() {
-                            let ns = ticks[2 * i + 1].saturating_sub(ticks[2 * i]) as f64 * self.gpu.timestamp_period as f64;
-                            self.profile[kernel].gpu_ns += ns;
-                            self.profile[kernel].timed += 1;
-                        }
-                    }
-                }
-                unsafe { device.destroy_query_pool(pool, None) };
-            }
-            unsafe {
-                device.destroy_fence(batch.fence, None);
-                device.free_command_buffers(self.gpu.command_pool, &[batch.command]);
-            }
-            for garbage in batch.garbage {
-                self.dispose(garbage);
-            }
+            self.retire(batch);
         }
         for message in self.gpu.validation_messages() {
             eprintln!("cleave Vulkan validation: {message}");
+        }
+    }
+
+    /// The batches the device has finished, from the oldest, released
+    /// (`retire`); none waited for.
+    fn retire_finished(&mut self) {
+        while let Some(batch) = self.in_flight.first() {
+            if !unsafe { self.gpu.device.get_fence_status(batch.fence) }.unwrap_or(false) {
+                break;
+            }
+            let batch = self.in_flight.remove(0);
+            self.retire(batch);
+        }
+    }
+
+    /// A batch the device has finished: its timings read, its objects
+    /// destroyed, what it kept alive released (`dispose`).
+    fn retire(&mut self, batch: Batch) {
+        let device = &self.gpu.device;
+        if let Some(pool) = batch.queries {
+            if !batch.timed.is_empty() {
+                let mut ticks = vec![0u64; 2 * batch.timed.len()];
+                let read = unsafe {
+                    device.get_query_pool_results(pool, 0, &mut ticks, vk::QueryResultFlags::TYPE_64)
+                };
+                if read.is_ok() {
+                    for (i, &kernel) in batch.timed.iter().enumerate() {
+                        let ns = ticks[2 * i + 1].saturating_sub(ticks[2 * i]) as f64 * self.gpu.timestamp_period as f64;
+                        self.profile[kernel].gpu_ns += ns;
+                        self.profile[kernel].timed += 1;
+                    }
+                    // The batch's span, from its first kernel's start to
+                    // its last's end, against the union of its kernels'
+                    // intervals: what's left is the device between
+                    // kernels (barriers draining it, launches, copies).
+                    let mut intervals: Vec<(u64, u64)> =
+                        ticks.chunks(2).map(|t| (t[0], t[1].max(t[0]))).collect();
+                    intervals.sort_unstable();
+                    let (first, last) = (intervals[0].0, intervals.iter().map(|i| i.1).max().unwrap_or(0));
+                    let mut busy = 0u64;
+                    let mut current = intervals[0];
+                    for &(start, end) in &intervals[1..] {
+                        if start > current.1 {
+                            busy += current.1 - current.0;
+                            current = (start, end);
+                        } else {
+                            current.1 = current.1.max(end);
+                        }
+                    }
+                    busy += current.1 - current.0;
+                    let period = self.gpu.timestamp_period as f64;
+                    self.stats.batch_span_ns += ((last - first) as f64 * period) as u64;
+                    self.stats.batch_busy_ns += (busy as f64 * period) as u64;
+                }
+            }
+            unsafe { device.destroy_query_pool(pool, None) };
+        }
+        unsafe {
+            device.destroy_fence(batch.fence, None);
+            device.free_command_buffers(self.gpu.command_pool, &[batch.command]);
+        }
+        for garbage in batch.garbage {
+            self.dispose(garbage);
         }
     }
 
@@ -1290,7 +1512,7 @@ impl Runtime {
         for &key in &stale {
             let len = self.mirrors[&key].len;
             let staging = self.take_buffer(len, true, &[]);
-            let command = self.record();
+            let command = self.record(&[self.mirrors[&key].buffer.buffer], &[staging.buffer]);
             let region = [vk::BufferCopy::default().size(len as u64)];
             unsafe { gpu.device.cmd_copy_buffer(command, self.mirrors[&key].buffer.buffer, staging.buffer, &region) };
             staged.push((key, staging));
@@ -1323,7 +1545,7 @@ impl Runtime {
         let mut staging = self.take_buffer(len, true, &[]);
         // SAFETY: the caller's range is live host memory.
         staging.write(unsafe { std::slice::from_raw_parts(start as *const u8, len) });
-        let command = self.record();
+        let command = self.record(&[staging.buffer], &[target]);
         let region = [vk::BufferCopy::default().size(len as u64)];
         unsafe { gpu.device.cmd_copy_buffer(command, staging.buffer, target, &region) };
         self.defer(Garbage::Buffer(staging));
@@ -1603,7 +1825,10 @@ pub unsafe extern "C" fn cleave_vk_dispatch(
         Some((pool, set))
     };
     phase!(3);
-    let command = runtime.record();
+    let written: Vec<vk::Buffer> =
+        (0..count).filter(|&i| flags[i] & ARG_WRITTEN != 0).map(|i| buffers[i]).collect();
+    // Every argument counted as read: the compiler's read flag is a hint.
+    let command = runtime.record(&buffers, &written);
     let batch = runtime.recording.as_mut().expect("a batch");
     let query = match batch.queries {
         Some(pool) if batch.timed.len() < TIMED_PER_BATCH => {

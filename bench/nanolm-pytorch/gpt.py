@@ -12,28 +12,31 @@ schedule. The sizes must match the kernel's `define`s. The losses must match cle
 The same arguments as cleave's `bench` mode; the first step must be 0, the twin doesn't resume.
 cleave also saves a checkpoint at the end of each round, counted in its round's time; the twin
 doesn't.
+
+`NANOLM_DEVICE=cuda` runs it on the GPU, against cleave's Vulkan build (`--features vulkan`), in
+f32 throughout as cleave: TF32 products are turned off (`allow_tf32`), the attention is PyTorch's
+own fused f32 kernel. That needs a CUDA build of PyTorch (`pyproject.toml`).
 """
 
 import math
-import re
+import os
 import sys
 import time
-from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 
-from data import CACHE, TRAIN_SEED, VAL_SEED, VOCAB, Corpus, batch, read_checkpoint
+from data import CACHE, DEFINES, TRAIN_SEED, VAL_SEED, VOCAB, Corpus, B, T, batch, read_checkpoint
 
 arg = lambda i, default: int(sys.argv[i]) if len(sys.argv) > i else default
 FIRST, ROUNDS, PER_ROUND = arg(1, 0), arg(2, 10), arg(3, 100)
 if FIRST != 0:
     sys.exit("the twin starts from gpt_init.ckpt: the first step must be 0 (it doesn't resume)")
-# The sizes are the kernel's `define`s, read from its source.
-KERNEL = Path(__file__).resolve().parents[2] / "examples" / "nanolm" / "src" / "kernel.cleave"
-DEFINES = {m[1]: int(m[2]) for m in re.finditer(r"^define (\w+): i32 = (\d+);", KERNEL.read_text(), re.M)}
-T, D, DH, HIDDEN, LAYERS = (DEFINES[k] for k in ("CONTEXT", "WIDTH", "HEAD", "HIDDEN", "LAYERS"))
-B = DEFINES["BATCH"]
+DEVICE = torch.device(os.environ.get("NANOLM_DEVICE", "cpu"))
+if DEVICE.type == "cuda":
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+D, DH, HIDDEN, LAYERS = (DEFINES[k] for k in ("WIDTH", "HEAD", "HIDDEN", "LAYERS"))
 LR, MUON_LR = 0.001, 0.02
 WARMUP, DECAY_STEPS = DEFINES["WARMUP"], DEFINES["DECAY_STEPS"]
 CLIP = 1.0 * B * T  # `CLIP_PER_ROW * ROWS`: the loss is summed over the rows
@@ -42,7 +45,7 @@ MODEL_DIR = CACHE.parent / f"nanolm2-d{D}-l{LAYERS}-t{T}-v{VOCAB}-bench"
 H = D // DH
 
 corpus = Corpus()
-leaves = [torch.tensor(a, requires_grad=True) for a in read_checkpoint(MODEL_DIR / "gpt_init.ckpt")]
+leaves = [torch.tensor(a, device=DEVICE, requires_grad=True) for a in read_checkpoint(MODEL_DIR / "gpt_init.ckpt")]
 assert len(leaves) == 1 + 16 * LAYERS + 1, f"{len(leaves)} leaves: not the v2 model's checkpoint"
 it = iter(leaves)
 take = lambda n: [next(it) for _ in range(n)]
@@ -62,7 +65,7 @@ def rms_norm(x, g):
 # pos * 10000^(-2j/DH); the position of a row is its index within its window of T.
 _j = torch.arange(DH // 2, dtype=torch.float32)
 _theta = (torch.arange(B * T) % T).float()[:, None] * torch.exp(-2.0 * _j / DH * math.log(10000.0))[None, :]
-COS, SIN = torch.cos(_theta), torch.sin(_theta)
+COS, SIN = torch.cos(_theta).to(DEVICE), torch.sin(_theta).to(DEVICE)
 
 
 def rope(x):
@@ -93,9 +96,14 @@ def loss(x, y):
     return F.cross_entropy(rms_norm(h, nf) @ tok.T, y.reshape(-1), reduction="sum")
 
 
+def on_device(tokens, seed, i):
+    """Batch `i` (`data.batch`), on the device."""
+    return (torch.from_numpy(a).to(DEVICE) for a in batch(tokens, seed, i))
+
+
 def mean_loss(tokens, seed, first, batches):
     with torch.no_grad():
-        total = sum(loss(*map(torch.from_numpy, batch(tokens, seed, s))).item() for s in range(first, first + batches))
+        total = sum(loss(*on_device(tokens, seed, s)).item() for s in range(first, first + batches))
     return total / (batches * B * T)
 
 
@@ -145,7 +153,8 @@ def muon_step(lr):
 
 
 # The same lines as the cleave host's `round_done` (`examples/nanolm/src/main.rs`), timed the same
-# way: from one report to the next, the round's training steps plus the losses reported at its end.
+# way: from one report to the next, the round's training steps plus the losses reported at its end
+# (whose `item()` waits for the device).
 # As in cleave, the total (`elapsed`) counts from before the first report, the rounds' minutes
 # from right after it.
 begin = time.perf_counter()
@@ -154,7 +163,7 @@ start = last = time.perf_counter()
 for r in range(ROUNDS):
     for k in range(PER_ROUND):
         s = r * PER_ROUND + k
-        x, y = map(torch.from_numpy, batch(corpus.train, TRAIN_SEED, s))
+        x, y = on_device(corpus.train, TRAIN_SEED, s)
         for p in params:
             p.grad = None
         loss(x, y).backward()

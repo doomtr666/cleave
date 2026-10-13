@@ -9,13 +9,15 @@ targets.
 """
 
 import math
+import re
 from pathlib import Path
 
 import numpy as np
 
-B = 32
-T = 256
-VOCAB = 4096
+# The sizes are the kernel's `define`s, read from its source, as the cleave host's `build.rs` does.
+KERNEL = Path(__file__).resolve().parents[2] / "examples" / "nanolm" / "src" / "kernel.cleave"
+DEFINES = {m[1]: int(m[2]) for m in re.finditer(r"^define (\w+): i32 = (\d+);", KERNEL.read_text(), re.M)}
+B, T, VOCAB = DEFINES["BATCH"], DEFINES["CONTEXT"], DEFINES["VOCAB"]
 TRAIN_SEED = 0x5A01A_7A1
 VAL_SEED = 0x5A01A_7A2
 

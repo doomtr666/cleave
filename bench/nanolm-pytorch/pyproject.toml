@@ -1,20 +1,20 @@
 [tool.poetry]
 name = "cleave-nanolm-bench"
 version = "0.1.0"
-description = "PyTorch CPU twin of examples/nanolm, for a direct loss and perf comparison against cleave"
+description = "PyTorch twin of examples/nanolm, for a direct loss and perf comparison against cleave, on the CPU or the GPU"
 package-mode = false
 
 [tool.poetry.dependencies]
 python = "^3.10"
-# CPU-only wheel explicitly, not PyPI's default CUDA-bundled build (~2.7GB on
-# Windows/Linux) -- irrelevant weight for a CPU-only comparison, and this
-# keeps the isolated poetry env small.
-torch = { version = "^2.3", source = "pytorch-cpu" }
+# A CUDA build (~2.7GB): the GPU comparison against cleave's Vulkan backend
+# (`NANOLM_DEVICE=cuda`); on the CPU it runs the same code as the CPU-only
+# build.
+torch = { version = "^2.3", source = "pytorch-cu130" }
 numpy = "^1.26"
 
 [[tool.poetry.source]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 priority = "explicit"
 
 [build-system]
