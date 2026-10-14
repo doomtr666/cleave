@@ -1059,6 +1059,52 @@ extern "C" fn report() {
             k.name
         );
     }
+    // Where the device's time goes beyond the costliest kernels: by the
+    // function a kernel was outlined from, and by how long its dispatches
+    // last (what fusing small kernels could save). A kernel's time estimated
+    // from its timed dispatches' mean.
+    let estimate = |k: &KernelProfile| if k.timed > 0 { k.gpu_ns / k.timed as f64 * k.dispatches as f64 } else { 0.0 };
+    let all: f64 = runtime.profile.iter().map(estimate).sum::<f64>().max(1.0);
+    let mut functions: std::collections::HashMap<&str, (f64, u64, usize)> = Default::default();
+    let mut lengths = [(0.0, 0u64, 0usize); 4];
+    const LENGTHS: [(&str, f64); 4] = [("under 5 us", 5.0), ("5-20 us", 20.0), ("20-100 us", 100.0), ("100 us and up", f64::MAX)];
+    for k in &runtime.profile {
+        let ns = estimate(k);
+        let function = k.name.split("_kernel").next().unwrap_or(&k.name);
+        let entry = functions.entry(function).or_default();
+        entry.0 += ns;
+        entry.1 += k.dispatches;
+        entry.2 += 1;
+        let mean = if k.timed > 0 { k.gpu_ns / k.timed as f64 / 1e3 } else { 0.0 };
+        let bucket = LENGTHS.iter().position(|(_, below)| mean < *below).unwrap_or(3);
+        lengths[bucket].0 += ns;
+        lengths[bucket].1 += k.dispatches;
+        lengths[bucket].2 += 1;
+    }
+    let _ = writeln!(out, "  device time by dispatch length:");
+    for ((label, _), (ns, dispatches, count)) in LENGTHS.iter().zip(lengths) {
+        let _ = writeln!(
+            out,
+            "  {:>9.1} ms {:>5.1}%  {:>9} dispatches of {:>5} kernels  {label}",
+            ns / 1e6,
+            100.0 * ns / all,
+            dispatches,
+            count
+        );
+    }
+    let mut functions: Vec<_> = functions.into_iter().collect();
+    functions.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+    let _ = writeln!(out, "  device time by function:");
+    for (function, (ns, dispatches, count)) in functions.iter().take(25) {
+        let _ = writeln!(
+            out,
+            "  {:>9.1} ms {:>5.1}%  {:>9} dispatches of {:>5} kernels  {function}",
+            ns / 1e6,
+            100.0 * ns / all,
+            dispatches,
+            count
+        );
+    }
     eprint!("{out}");
 }
 

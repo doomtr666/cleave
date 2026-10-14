@@ -1122,8 +1122,10 @@ static scf::ForOp regroupNestedSum(scf::ForOp loop) {
 }
 
 // A loop over rows `r` accumulating into elements a loop over `c` in it
-// picks by `c` alone (`for r { s = f(r); for c { d[c] = d[c] + g(r, c, s) } }`,
-// `rms_norm_grad_g`, a bias's gradient), its order of loops exchanged:
+// picks by `c` at one index position, the others anything the row computes
+// (`for r { s = f(r); for c { d[c] = d[c] + g(r, c, s) } }`, `rms_norm_grad_g`,
+// a bias's gradient; `g[ids[r], c] += u[r, c]`, an embedding's, rows of the
+// table hit by several rows), its order of loops exchanged:
 // `perRow` computes each row's values the inner loop needs (`s`, stored in
 // `buffers` by row; an index computed from `r` alone is recomputed instead),
 // `perColumn` then runs, for each `c`, the rows in their order. The same
@@ -1184,7 +1186,9 @@ static std::optional<Interchange> interchangeAccumulation(scf::ForOp loop) {
         onRow.insert(result);
   });
   // What the inner loop writes: reached with its own variable at one
-  // position and never with the row; nothing in the rows' part reads it.
+  // position, which no row's value gives (each `c` its own elements, every
+  // update of one by the rows in their order); nothing in the rows' part
+  // reads it.
   Value c = inner.getInductionVar();
   llvm::DenseSet<Value> written;
   bool ok = true;
@@ -1214,21 +1218,19 @@ static std::optional<Interchange> interchangeAccumulation(scf::ForOp loop) {
       return;
     }
     std::optional<unsigned> here;
-    for (auto [i, index] : llvm::enumerate(indices)) {
-      if (onRow.contains(index))
-        ok = false;
+    for (auto [i, index] : llvm::enumerate(indices))
       if (isInductionVariable(index, c))
         here = i;
-    }
     auto [it, fresh] = position.try_emplace(accessed, here.value_or(~0u));
     if (!here || (!fresh && it->second != *here))
       ok = false;
   });
   if (!ok)
     return std::nullopt;
-  // The rows' values the inner loop uses: recomputed if computed from the
-  // row and constants alone by operations without memory effects, stored by
-  // row otherwise.
+  // The rows' values the inner loop uses: what operations without memory
+  // effects compute recomputed, from the row, constants and the results of
+  // the others (a load, a reduction's loop: `ids[r]` under its index cast),
+  // which are stored by row (32-bit integers and floats only).
   SetVector<Value> crossing;
   inner.getBody()->walk([&](Operation *op) {
     for (Value operand : op->getOperands())
@@ -1236,30 +1238,25 @@ static std::optional<Interchange> interchangeAccumulation(scf::ForOp loop) {
         crossing.insert(operand);
   });
   llvm::DenseSet<Operation *> recompute;
-  SmallVector<Value> stored;
-  for (Value v : crossing) {
-    SmallVector<Operation *> slice;
-    SmallVector<Value> pending{v};
-    bool pure = true;
-    while (!pending.empty() && pure) {
-      Operation *def = pending.pop_back_val().getDefiningOp();
-      if (!def || def->getBlock() != body)
-        continue;
-      if (!isPure(def) || def->getNumRegions() != 0) {
-        pure = false;
-        break;
-      }
-      slice.push_back(def);
+  SetVector<Value> stored;
+  SmallVector<Value> pending(crossing.begin(), crossing.end());
+  llvm::DenseSet<Value> seen;
+  while (!pending.empty()) {
+    Value v = pending.pop_back_val();
+    if (!seen.insert(v).second)
+      continue;
+    Operation *def = v.getDefiningOp();
+    if (!def || def->getBlock() != body)
+      continue;
+    if (isPure(def) && def->getNumRegions() == 0) {
+      recompute.insert(def);
       for (Value operand : def->getOperands())
         pending.push_back(operand);
+      continue;
     }
-    if (pure) {
-      recompute.insert(slice.begin(), slice.end());
-    } else {
-      if (!v.getType().isIntOrFloat() || v.getType().getIntOrFloatBitWidth() != 32)
-        return std::nullopt;
-      stored.push_back(v);
-    }
+    if (!v.getType().isIntOrFloat() || v.getType().getIntOrFloatBitWidth() != 32)
+      return std::nullopt;
+    stored.insert(v);
   }
 
   OpBuilder builder(loop);
@@ -2848,7 +2845,113 @@ static int64_t cleaveCooperativeRowsOf128(MlirOperation op) { return cleaveCoope
 // staged in workgroup memory.
 struct ProductTiling {
   int64_t bm, bn, bk, tm, tn;
+  int64_t threads() const { return (bm / tm) * (bn / tn); }
+  // Whether it can compute an `m` x `n` product over `k`: tiles dividing it,
+  // each thread a whole block and a whole share of each slice's loads, a
+  // workgroup of at most 1024 threads, its workgroup memory (two `bk` x `bm`
+  // and `bk` x `bn` slices, padded) within 48 KiB.
+  bool fits(int64_t m, int64_t n, int64_t k) const {
+    if (bm <= 0 || bn <= 0 || bk <= 0 || tm <= 0 || tn <= 0 || bm % tm != 0 || bn % tn != 0)
+      return false;
+    int64_t t = threads();
+    int64_t shared = 4 * bk * ((bm + 4) + (bn + 4));
+    return m % bm == 0 && n % bn == 0 && k % bk == 0 && t >= 32 && t <= 1024 && (bm * bk) % t == 0 &&
+           (bn * bk) % t == 0 && shared <= 48 * 1024;
+  }
 };
+
+// `CLEAVE_GPU_MATMUL=bm,bn,bk,tm,tn,split` (read at compile time): the
+// tiling and split of every product it fits (`ProductTiling::fits`), split 0
+// chosen as without it: what a tuner tries one configuration after another
+// (`bench/gpu_matmul/tune.rs`).
+struct ProductConfig {
+  ProductTiling tiling;
+  int64_t split;
+};
+static std::optional<ProductConfig> forcedProductConfig() {
+  static const std::optional<ProductConfig> config = []() -> std::optional<ProductConfig> {
+    const char *v = std::getenv("CLEAVE_GPU_MATMUL");
+    if (!v)
+      return std::nullopt;
+    SmallVector<StringRef> fields;
+    StringRef(v).split(fields, ',');
+    SmallVector<int64_t> values;
+    for (StringRef field : fields) {
+      int64_t value;
+      if (field.trim().getAsInteger(10, value))
+        return std::nullopt;
+      values.push_back(value);
+    }
+    if (values.size() != 6)
+      return std::nullopt;
+    return ProductConfig{{values[0], values[1], values[2], values[3], values[4]}, values[5]};
+  }();
+  return config;
+}
+
+// The tuned products' table (`matmul_table.inc`, written by
+// `bench/gpu_matmul/tune.rs`, or the file `CLEAVE_GPU_MATMUL_TABLE` names at
+// compile time): the fastest configuration measured for each shape and
+// layout (whether `k` is contiguous in A and in B).
+static const char *const kTunedProducts =
+#include "matmul_table.inc"
+    ;
+struct TunedProduct {
+  int64_t m, n, k;
+  bool aK, bK;
+  ProductConfig config;
+};
+static const std::vector<TunedProduct> &tunedProducts() {
+  static const std::vector<TunedProduct> table = [] {
+    std::string text = kTunedProducts;
+    if (const char *path = std::getenv("CLEAVE_GPU_MATMUL_TABLE")) {
+      if (auto file = llvm::MemoryBuffer::getFile(path))
+        text = (*file)->getBuffer().str();
+    }
+    std::vector<TunedProduct> entries;
+    SmallVector<StringRef> lines;
+    StringRef(text).split(lines, '\n');
+    for (StringRef line : lines) {
+      SmallVector<StringRef> fields;
+      line.trim().split(fields, ' ', -1, /*KeepEmpty=*/false);
+      if (fields.size() != 11)
+        continue;
+      int64_t v[11];
+      bool bad = false;
+      for (int i = 0; i < 11; ++i)
+        bad |= fields[i].getAsInteger(10, v[i]);
+      if (!bad)
+        entries.push_back({v[0], v[1], v[2], v[3] != 0, v[4] != 0, {{v[5], v[6], v[7], v[8], v[9]}, v[10]}});
+    }
+    return entries;
+  }();
+  return table;
+}
+
+// The tuned configuration of an `m` x `n` product over `k` of that layout:
+// its own shape's, else the nearest tuned shape's (each dimension within a
+// factor of 2) whose configuration fits it; none otherwise.
+static std::optional<ProductConfig> tunedProductConfig(int64_t m, int64_t n, int64_t k, bool aK, bool bK) {
+  std::optional<ProductConfig> chosen;
+  double nearest = 1e30;
+  for (const TunedProduct &entry : tunedProducts()) {
+    if (entry.aK != aK || entry.bK != bK || !entry.config.tiling.fits(m, n, k) ||
+        (entry.config.split > 1 && k % (entry.config.split * entry.config.tiling.bk) != 0))
+      continue;
+    double distance = 0;
+    bool near = true;
+    for (auto [mine, theirs] : {std::pair{m, entry.m}, std::pair{n, entry.n}, std::pair{k, entry.k}}) {
+      double ratio = std::log2(double(mine) / double(theirs));
+      near &= std::abs(ratio) <= 1.0;
+      distance += std::abs(ratio);
+    }
+    if (near && distance < nearest) {
+      nearest = distance;
+      chosen = entry.config;
+    }
+  }
+  return chosen;
+}
 
 // Vulkan backend: every `linalg` op that is a product (two parallel loops
 // `m` and `n` indexing its output, one reduction `k`; one input indexed by
@@ -3058,6 +3161,16 @@ static int64_t cleaveTileMatmulsForGpu(MlirOperation op) {
           break;
       }
     }
+    // A configuration forced (`CLEAVE_GPU_MATMUL`), else the tuned one
+    // (`tunedProductConfig`), else the choice above.
+    std::optional<ProductConfig> forced = forcedProductConfig();
+    if (forced && !forced->tiling.fits(m, n, k))
+      forced.reset();
+    if (!forced)
+      forced = tunedProductConfig(m, n, k, product.getMatchingIndexingMap(a).getDimPosition(1) == dimK,
+                                  product.getMatchingIndexingMap(b).getDimPosition(1) == dimK);
+    if (forced)
+      tiling = &forced->tiling;
     const int64_t bm = tiling->bm, bn = tiling->bn, bk = tiling->bk, tm = tiling->tm, tn = tiling->tn;
     const int64_t threadsX = bn / tn, threadsY = bm / tm, threads = threadsX * threadsY;
     // Split-K: the reduction cut in `split` slices, each a workgroup's along
@@ -3076,9 +3189,14 @@ static int64_t cleaveTileMatmulsForGpu(MlirOperation op) {
                       additive->getOperand(0) != additive->getOperand(1);
     int64_t split = 1;
     const int64_t workgroups = (m / bm) * (n / bn);
-    while (splittable && workgroups * split < kEnoughWorkgroups && k % (2 * split * bk) == 0 &&
-           k / (2 * split) >= 4 * bk)
-      split *= 2;
+    if (forced && forced->split > 0) {
+      if (splittable && k % (forced->split * bk) == 0)
+        split = forced->split;
+    } else {
+      while (splittable && workgroups * split < kEnoughWorkgroups && k % (2 * split * bk) == 0 &&
+             k / (2 * split) >= 4 * bk)
+        split *= 2;
+    }
     const int64_t slice = k / split;
     // A fill of the result just before the product (nothing between them
     // touching memory: `sgemm`'s `beta` 0): the value its elements start
@@ -3151,7 +3269,8 @@ static int64_t cleaveTileMatmulsForGpu(MlirOperation op) {
     }
     if (debuggingParallelization()) {
       std::optional<DirectUses> cUses = directUses(c, product);
-      llvm::errs() << "cleave-tile-matmuls-for-gpu: " << func.getName() << ": " << m << "x" << n << "x" << k << ", "
+      llvm::errs() << "cleave-tile-matmuls-for-gpu: " << func.getName() << ": " << m << "x" << n << "x" << k << " by "
+                   << bm << "," << bn << "," << bk << "," << tm << "," << tn << "," << split << ", "
                    << llvm::count(liveTiles, false) << " dead tiles of " << tilesM * tilesN << " (result "
                    << (cUses ? "read by loads only" : "used otherwise") << "), "
                    << (liveK.empty() ? "no" : "some") << " zero slices\n";

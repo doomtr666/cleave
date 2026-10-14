@@ -7,9 +7,12 @@ const SOURCES: [&str; 2] = ["cpp/shim.cpp", "cpp/gpu.cpp"];
 const HEADER: &str = "cpp/cleave.h";
 /// Compiled alone, with MSVC, to precompile `HEADER`.
 const PCH_SOURCE: &str = "cpp/pch.cpp";
+/// Data a source includes (the tuned products' table), part of its
+/// objects' hash.
+const INCLUDED: [&str; 1] = ["cpp/matmul_table.inc"];
 
 fn main() {
-    for file in SOURCES.iter().chain([&HEADER, &PCH_SOURCE]) {
+    for file in SOURCES.iter().chain([&HEADER, &PCH_SOURCE]).chain(INCLUDED.iter()) {
         println!("cargo:rerun-if-changed={file}");
     }
     println!("cargo:rerun-if-env-changed=CLEAVE_LLVM_PREFIX");
@@ -117,7 +120,9 @@ fn precompiled_header(prefix: &str) -> (std::path::PathBuf, std::path::PathBuf) 
 /// build script runs, and a source is seconds of MLIR headers even
 /// precompiled.
 fn cached_object(source: &str, prefix: &str, pch: Option<&std::path::Path>) -> std::path::PathBuf {
-    let hash = content_hash(&[source, HEADER], prefix);
+    let mut hashed = vec![source, HEADER];
+    hashed.extend(INCLUDED);
+    let hash = content_hash(&hashed, prefix);
     let stem = std::path::Path::new(source).file_stem().and_then(|s| s.to_str()).expect("a source name");
     let cached = out_dir().join(format!("{stem}-{hash:016x}.o"));
     if !cached.exists() {

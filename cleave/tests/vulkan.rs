@@ -689,7 +689,7 @@ fn causal_attention_skips_the_masked_half() {
             assert!((g - e).abs() <= 1e-4 * scale, "{}: value {i}: {g} on the GPU, {e} on the CPU", device.name);
         }
         assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
-        assert_eq!(stderr.matches("1024x1024x64, 120 dead tiles of 256").count(), 2, "{}: {stderr}", device.name);
+        assert_eq!(stderr.matches(", 120 dead tiles of 256").count(), 2, "{}: {stderr}", device.name);
         assert_eq!(stderr.matches("some zero slices").count(), 4, "{}: {stderr}", device.name);
     }
 }
@@ -752,6 +752,51 @@ fn a_host_loop_folds_into_its_kernels_by_groups() {
         }
         assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
         assert!(stderr.contains("folded 4 iterations by 2"), "{}: {stderr}", device.name);
+    }
+}
+
+/// An embedding's gradient, each upstream row added into the table row its
+/// id picks (rows hit by several ids), runs by column, each column's rows in
+/// their order (`interchangeAccumulation`): the CPU's values to the bit, in
+/// 4 dispatches. It ran a kernel per row, the id read on the host before
+/// each (8192 dispatches and host synchronizations a nanoLM step).
+#[test]
+fn an_embedding_gradient_runs_by_column() {
+    let src = "
+        use nn;
+        use io;
+        fn main() -> i32 {
+            rand_seed(5);
+            let table: Tensor<f32, 512, 128> = Init::he();
+            let u: Tensor<f32, 1024, 128> = Init::he();
+            let ids = [for n in 0..1024: (n * 37 + n / 3) - ((n * 37 + n / 3) / 512) * 512];
+            let g = Embed::embed_grad(table, ids, u);
+            for r in [0, 5, 77, 300, 511] {
+                for c in [0, 64, 127] { println(g[r, c]); };
+            };
+            0
+        }
+    ";
+    let devices = devices();
+    if devices.is_empty() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("cleave-vulkan-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("embedding_gradient.cleave");
+    std::fs::write(&source, src).unwrap();
+    let cpu = Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--no-debug-info", "--run"])
+        .arg(&source)
+        .output()
+        .expect("cannot run cleave");
+    let expected = String::from_utf8_lossy(&cpu.stdout).into_owned();
+    assert!(expected.contains("main returned: 0"), "cpu: {expected}");
+    for (index, device) in devices.iter().enumerate() {
+        let (stdout, stderr) = stats_on(index, "embedding_gradient", src);
+        assert_eq!(stdout, expected, "{}: {stderr}", device.name);
+        assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
+        assert!(stderr.contains(": 4 dispatches"), "{}: {stderr}", device.name);
     }
 }
 
