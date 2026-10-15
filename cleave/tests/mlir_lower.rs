@@ -7705,3 +7705,62 @@ fn display_of_an_array_and_a_rectangular_tensor_render_correctly() {
         }"#;
     assert_eq!(run_i32(&context, src), 1);
 }
+
+/// `bf16` (`doc/plan-quantization.md`, phase 1): its arithmetic rounds every result to bf16 (8 bits
+/// of mantissa), conversions widen exactly and narrow to the nearest (ties to even), comparisons
+/// order it, and its transcendentals are the f32 result rounded. Each expected value is the exact
+/// bf16 neighbor worked out by hand.
+#[test]
+fn bf16_arithmetic_rounds_to_bf16() {
+    let context = context();
+    let src = "
+        use convert;
+        fn main() -> i32 {
+            let a: bf16 = 1.5;
+            let b: bf16 = 2.25;
+            let exact: f32 = (a * b + a).to();
+            let x: f32 = 3.14159265;
+            let pi: bf16 = x.to();
+            let pi_back: f32 = pi.to();
+            // 1 + 2^-8 is halfway between 1 and 1 + 2^-7: ties to even, back to 1.
+            let tie: f32 = 1.00390625;
+            let tied: bf16 = tie.to();
+            let tied_back: f32 = tied.to();
+            // 256 + 1 isn't a bf16 (spacing 2 there): the sum rounds back to 256.
+            let big: bf16 = 256.0;
+            let one: bf16 = 1.0;
+            let sum: f32 = (big + one).to();
+            let e: f32 = exp(a).to();
+            if exact == 4.875 and pi_back == 3.140625 and tied_back == 1.0 and sum == 256.0
+                and e == 4.46875 and pi > a and a < b { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// A product of `bf16` tensors accumulates in f32 and is rounded once (`mlir_lower.rs`,
+/// `widened_16_bit_float_tensor`): 259 ones sum to 259, rounded to the bf16 260 (a tie, to the
+/// even mantissa), where accumulating in bf16 would stick at 256 (`256 + 1` rounds back to 256).
+/// Elementwise ops stay in bf16; a product above `BLAS_MIN_WORK` takes the same path, never `sgemm`
+/// (f32 only): 512x512x512 against sums worked out by hand (255 and 256, both exact in bf16).
+#[test]
+fn bf16_products_accumulate_in_f32() {
+    let context = context();
+    let src = "
+        use linalg;
+        use convert;
+        fn main() -> i32 {
+            let a: Tensor<bf16, 1, 259> = [for i in 0..1: [for j in 0..259: 1.0]];
+            let b: Tensor<bf16, 259, 1> = [for i in 0..259: [for j in 0..1: 1.0]];
+            let s: f32 = matmul(a, b)[0, 0].to();
+            let twice: f32 = (a + a)[0, 7].to();
+            let m: Tensor<bf16, 512, 512> = [for i in 0..512: [for j in 0..512: rem(i + j, 3).to()]];
+            let n: Tensor<bf16, 512, 512> = [for i in 0..512: [for j in 0..512: rem(i * j, 2).to()]];
+            let c = matmul(m, n);
+            let x: f32 = c[5, 7].to();
+            let y: f32 = c[300, 301].to();
+            if s == 260.0 and twice == 2.0 and x == 255.0 and y == 256.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}

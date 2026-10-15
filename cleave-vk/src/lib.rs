@@ -36,6 +36,232 @@ fn fail(what: &str) -> impl FnOnce(vk::Result) -> Error + '_ {
 pub struct DeviceInfo {
     pub name: String,
     pub discrete: bool,
+    /// The cooperative-matrix products the device runs (`VK_KHR_cooperative_matrix`), empty
+    /// without the extension: what a tensor-core kernel can be built from
+    /// (`doc/plan-quantization.md`, phase 0).
+    pub cooperative_matrices: Vec<CooperativeMatrixShape>,
+}
+
+/// One cooperative-matrix product a device supports: `result[M, N] = A[M, K] B[K, N] + C[M, N]`
+/// with these element types, over a subgroup (`scope`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CooperativeMatrixShape {
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+    pub a: String,
+    pub b: String,
+    pub c: String,
+    pub result: String,
+    pub saturating: bool,
+    pub scope: String,
+}
+
+impl std::fmt::Display for CooperativeMatrixShape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}x{}x{} {}*{}+{} -> {} ({}{})",
+            self.m,
+            self.n,
+            self.k,
+            self.a,
+            self.b,
+            self.c,
+            self.result,
+            self.scope,
+            if self.saturating { ", saturating" } else { "" }
+        )
+    }
+}
+
+/// `VK_KHR_shader_bfloat16`, newer than `ash` 0.38: its name and its features structure
+/// (`VkPhysicalDeviceShaderBfloat16FeaturesKHR`, structure type 1000141000 in the Vulkan registry).
+const SHADER_BFLOAT16_NAME: &CStr = c"VK_KHR_shader_bfloat16";
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ShaderBfloat16Features {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    shader_bfloat16_type: vk::Bool32,
+    shader_bfloat16_dot_product: vk::Bool32,
+    shader_bfloat16_cooperative_matrix: vk::Bool32,
+}
+
+impl Default for ShaderBfloat16Features {
+    fn default() -> Self {
+        Self {
+            s_type: vk::StructureType::from_raw(1000141000),
+            p_next: std::ptr::null_mut(),
+            shader_bfloat16_type: 0,
+            shader_bfloat16_dot_product: 0,
+            shader_bfloat16_cooperative_matrix: 0,
+        }
+    }
+}
+
+/// `VK_NV_cooperative_matrix2`, newer than `ash` 0.38: workgroup-scope cooperative matrices and
+/// tensor addressing (`VkPhysicalDeviceCooperativeMatrix2FeaturesNV`, structure type 1000593000
+/// in the Vulkan registry). Enabled for measurement (`doc/plan-quantization.md`, phase 0).
+const COOPERATIVE_MATRIX2_NAME: &CStr = c"VK_NV_cooperative_matrix2";
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CooperativeMatrix2Features {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    workgroup_scope: vk::Bool32,
+    flexible_dimensions: vk::Bool32,
+    reductions: vk::Bool32,
+    conversions: vk::Bool32,
+    per_element_operations: vk::Bool32,
+    tensor_addressing: vk::Bool32,
+    block_loads: vk::Bool32,
+}
+
+impl Default for CooperativeMatrix2Features {
+    fn default() -> Self {
+        Self {
+            s_type: vk::StructureType::from_raw(1000593000),
+            p_next: std::ptr::null_mut(),
+            workgroup_scope: 0,
+            flexible_dimensions: 0,
+            reductions: 0,
+            conversions: 0,
+            per_element_operations: 0,
+            tensor_addressing: 0,
+            block_loads: 0,
+        }
+    }
+}
+
+/// The optional device features `Gpu::new` enables where they exist: queried from the device,
+/// then the same values handed to `vkCreateDevice` (only these fields, every other feature off).
+#[derive(Clone, Default)]
+struct OptionalFeatures {
+    v11: vk::PhysicalDeviceVulkan11Features<'static>,
+    v12: vk::PhysicalDeviceVulkan12Features<'static>,
+    coopmat: vk::PhysicalDeviceCooperativeMatrixFeaturesKHR<'static>,
+    bf16: ShaderBfloat16Features,
+    statistics: vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR<'static>,
+    coopmat2: CooperativeMatrix2Features,
+}
+
+impl OptionalFeatures {
+    fn query(
+        instance: &ash::Instance,
+        physical: vk::PhysicalDevice,
+        coopmat: bool,
+        bf16: bool,
+        statistics: bool,
+        coopmat2: bool,
+    ) -> Self {
+        let mut all = Self::default();
+        let mut features2 = vk::PhysicalDeviceFeatures2::default();
+        all.link(&mut features2, coopmat, bf16, statistics, coopmat2);
+        if unsafe { instance.get_physical_device_properties(physical) }.api_version >= vk::API_VERSION_1_2 {
+            unsafe { instance.get_physical_device_features2(physical, &mut features2) };
+        }
+        // Only what kernels may need; the rest stays off.
+        let mut wanted = Self::default();
+        wanted.v11.storage_buffer16_bit_access = all.v11.storage_buffer16_bit_access;
+        wanted.v12.vulkan_memory_model = all.v12.vulkan_memory_model;
+        wanted.v12.vulkan_memory_model_device_scope = all.v12.vulkan_memory_model_device_scope;
+        wanted.v12.shader_float16 = all.v12.shader_float16;
+        wanted.coopmat.cooperative_matrix = all.coopmat.cooperative_matrix;
+        wanted.bf16.shader_bfloat16_type = all.bf16.shader_bfloat16_type;
+        wanted.bf16.shader_bfloat16_cooperative_matrix = all.bf16.shader_bfloat16_cooperative_matrix;
+        wanted.statistics.pipeline_executable_info = all.statistics.pipeline_executable_info;
+        wanted.coopmat2 = CooperativeMatrix2Features { p_next: std::ptr::null_mut(), ..all.coopmat2 };
+        wanted
+    }
+
+    /// Chains the structures behind `head`: Vulkan 1.1, 1.2, then the extensions present.
+    fn link(
+        &mut self,
+        head: &mut vk::PhysicalDeviceFeatures2,
+        coopmat: bool,
+        bf16: bool,
+        statistics: bool,
+        coopmat2: bool,
+    ) {
+        let mut next: *mut std::ffi::c_void = std::ptr::null_mut();
+        if coopmat2 {
+            self.coopmat2.p_next = next;
+            next = (&raw mut self.coopmat2).cast();
+        }
+        if statistics {
+            self.statistics.p_next = next;
+            next = (&raw mut self.statistics).cast();
+        }
+        if bf16 {
+            self.bf16.p_next = next;
+            next = (&raw mut self.bf16).cast();
+        }
+        if coopmat {
+            self.coopmat.p_next = next;
+            next = (&raw mut self.coopmat).cast();
+        }
+        self.v12.p_next = next;
+        self.v11.p_next = (&raw mut self.v12).cast();
+        head.p_next = (&raw mut self.v11).cast();
+    }
+}
+
+/// A cooperative-matrix element type's name. `ash` 0.38 (Vulkan 1.3.281) predates bfloat16
+/// (`VK_KHR_shader_bfloat16`) and fp8 (`VK_EXT_shader_float8`), whose values come from the
+/// Vulkan registry; anything else unknown is shown by its raw value.
+fn component_type_name(t: vk::ComponentTypeKHR) -> String {
+    match t.as_raw() {
+        0 => "f16".into(),
+        1 => "f32".into(),
+        2 => "f64".into(),
+        3 => "i8".into(),
+        4 => "i16".into(),
+        5 => "i32".into(),
+        6 => "i64".into(),
+        7 => "u8".into(),
+        8 => "u16".into(),
+        9 => "u32".into(),
+        10 => "u64".into(),
+        1000141000 => "bf16".into(),
+        1000491002 => "f8e4m3".into(),
+        1000491003 => "f8e5m2".into(),
+        raw => format!("type#{raw}"),
+    }
+}
+
+fn cooperative_matrices(entry: &ash::Entry, instance: &ash::Instance, physical: vk::PhysicalDevice) -> Vec<CooperativeMatrixShape> {
+    let supported = unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
+    let has = supported
+        .iter()
+        .any(|e| e.extension_name_as_c_str().is_ok_and(|n| n == ash::khr::cooperative_matrix::NAME));
+    if !has {
+        return Vec::new();
+    }
+    let loader = ash::khr::cooperative_matrix::Instance::new(entry, instance);
+    let properties = unsafe { loader.get_physical_device_cooperative_matrix_properties(physical) }.unwrap_or_default();
+    properties
+        .iter()
+        .map(|p| CooperativeMatrixShape {
+            m: p.m_size,
+            n: p.n_size,
+            k: p.k_size,
+            a: component_type_name(p.a_type),
+            b: component_type_name(p.b_type),
+            c: component_type_name(p.c_type),
+            result: component_type_name(p.result_type),
+            saturating: p.saturating_accumulation != 0,
+            scope: match p.scope {
+                vk::ScopeKHR::SUBGROUP => "subgroup".into(),
+                vk::ScopeKHR::WORKGROUP => "workgroup".into(),
+                vk::ScopeKHR::DEVICE => "device".into(),
+                vk::ScopeKHR::QUEUE_FAMILY => "queue family".into(),
+                other => format!("scope#{}", other.as_raw()),
+            },
+        })
+        .collect()
 }
 
 /// Every Vulkan device the loader finds, in its order.
@@ -43,16 +269,20 @@ pub fn devices() -> Result<Vec<DeviceInfo>, Error> {
     let (entry, instance) = create_instance(false)?;
     let found = unsafe { instance.enumerate_physical_devices() }
         .map_err(fail("enumerating devices"))
-        .map(|physicals| physicals.iter().map(|&p| device_info(&instance, p)).collect());
+        .map(|physicals| physicals.iter().map(|&p| device_info(&entry, &instance, p)).collect());
     unsafe { instance.destroy_instance(None) };
     drop(entry);
     found
 }
 
-fn device_info(instance: &ash::Instance, physical: vk::PhysicalDevice) -> DeviceInfo {
+fn device_info(entry: &ash::Entry, instance: &ash::Instance, physical: vk::PhysicalDevice) -> DeviceInfo {
     let properties = unsafe { instance.get_physical_device_properties(physical) };
     let name = properties.device_name_as_c_str().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    DeviceInfo { name, discrete: properties.device_type == vk::PhysicalDeviceType::DISCRETE_GPU }
+    DeviceInfo {
+        name,
+        discrete: properties.device_type == vk::PhysicalDeviceType::DISCRETE_GPU,
+        cooperative_matrices: cooperative_matrices(entry, instance, physical),
+    }
 }
 
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
@@ -107,6 +337,10 @@ pub struct Gpu {
     timestamp_period: f32,
     /// Whether VMA reads the system's budget (`VK_EXT_memory_budget`).
     has_budget: bool,
+    /// `VK_KHR_pipeline_executable_properties`, when the device has it: every pipeline is created
+    /// with its statistics captured (registers, local and shared memory... as the driver reports
+    /// them), read back by [`Gpu::kernel_statistics`].
+    executable_properties: Option<ash::khr::pipeline_executable_properties::Device>,
     debug: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
     instance: ash::Instance,
     _entry: ash::Entry,
@@ -162,7 +396,7 @@ impl Gpu {
         };
 
         let physicals = unsafe { instance.enumerate_physical_devices() }.map_err(fail("enumerating devices"))?;
-        let infos: Vec<DeviceInfo> = physicals.iter().map(|&p| device_info(&instance, p)).collect();
+        let infos: Vec<DeviceInfo> = physicals.iter().map(|&p| device_info(&entry, &instance, p)).collect();
         let chosen = match &options.device {
             Some(wanted) => match wanted.parse::<usize>() {
                 Ok(index) => (index < physicals.len()).then_some(index),
@@ -198,14 +432,49 @@ impl Gpu {
         if has_budget {
             extensions.push(ash::ext::memory_budget::NAME.as_ptr());
         }
-        let device = unsafe {
-            instance.create_device(
-                physical,
-                &vk::DeviceCreateInfo::default().queue_create_infos(&queues).enabled_extension_names(&extensions),
-                None,
-            )
+        // The optional features kernels may use, each enabled where the device has it
+        // (`doc/plan-quantization.md`): cooperative matrices (tensor cores), bfloat16, 16-bit
+        // storage-buffer access, the Vulkan memory model the cooperative-matrix ops require.
+        // Kernels that don't use them are unaffected; one that does, on a device without them,
+        // is refused at pipeline creation (and by the validation layer).
+        let device_version = unsafe { instance.get_physical_device_properties(physical) }.api_version;
+        let has_coopmat = has(ash::khr::cooperative_matrix::NAME) && device_version >= vk::API_VERSION_1_2;
+        let has_bf16 = has_coopmat && has(SHADER_BFLOAT16_NAME);
+        if has_coopmat {
+            extensions.push(ash::khr::cooperative_matrix::NAME.as_ptr());
         }
-        .map_err(fail("creating the device"))?;
+        if has_bf16 {
+            extensions.push(SHADER_BFLOAT16_NAME.as_ptr());
+        }
+        let has_statistics =
+            has(ash::khr::pipeline_executable_properties::NAME) && device_version >= vk::API_VERSION_1_2;
+        if has_statistics {
+            extensions.push(ash::khr::pipeline_executable_properties::NAME.as_ptr());
+        }
+        let has_coopmat2 = has_coopmat && has(COOPERATIVE_MATRIX2_NAME);
+        if has_coopmat2 {
+            extensions.push(COOPERATIVE_MATRIX2_NAME.as_ptr());
+        }
+        let features =
+            OptionalFeatures::query(&instance, physical, has_coopmat, has_bf16, has_statistics, has_coopmat2);
+        if has_coopmat2 && std::env::var_os("CLEAVE_VK_SHOW_FEATURES").is_some() {
+            let f = &features.coopmat2;
+            eprintln!(
+                "VK_NV_cooperative_matrix2: workgroup scope {}, flexible dimensions {}, reductions {}, conversions {}, per-element {}, tensor addressing {}, block loads {}",
+                f.workgroup_scope, f.flexible_dimensions, f.reductions, f.conversions, f.per_element_operations, f.tensor_addressing, f.block_loads
+            );
+        }
+        let mut enabled = features.clone();
+        let mut enabled2 = vk::PhysicalDeviceFeatures2::default();
+        enabled.link(&mut enabled2, has_coopmat, has_bf16, has_statistics, has_coopmat2);
+        let device_info = vk::DeviceCreateInfo::default().queue_create_infos(&queues).enabled_extension_names(&extensions);
+        let device_info = if device_version >= vk::API_VERSION_1_2 {
+            vk::DeviceCreateInfo { p_next: (&raw const enabled2).cast(), ..device_info }
+        } else {
+            device_info
+        };
+        let device =
+            unsafe { instance.create_device(physical, &device_info, None) }.map_err(fail("creating the device"))?;
         let push_descriptor = has_push.then(|| ash::khr::push_descriptor::Device::new(&instance, &device));
         let max_push_descriptors = if has_push {
             let mut push = vk::PhysicalDevicePushDescriptorPropertiesKHR::default();
@@ -238,6 +507,8 @@ impl Gpu {
             unsafe { vk_mem::Allocator::new(allocator_info) }.map_err(fail("creating the memory allocator"))?;
 
         let timestamp_period = unsafe { instance.get_physical_device_properties(physical) }.limits.timestamp_period;
+        let executable_properties = (has_statistics && features.statistics.pipeline_executable_info != 0)
+            .then(|| ash::khr::pipeline_executable_properties::Device::new(&instance, &device));
         Ok(Gpu {
             info: infos[chosen].clone(),
             allocator: std::mem::ManuallyDrop::new(allocator),
@@ -248,6 +519,7 @@ impl Gpu {
             max_push_descriptors,
             timestamp_period,
             has_budget,
+            executable_properties,
             debug,
             instance,
             _entry: entry,
@@ -397,13 +669,46 @@ impl Gpu {
         let pipeline = unsafe {
             device.create_compute_pipelines(
                 vk::PipelineCache::null(),
-                &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(pipeline_layout)],
+                &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(pipeline_layout).flags(
+                    if self.executable_properties.is_some() {
+                        vk::PipelineCreateFlags::CAPTURE_STATISTICS_KHR
+                    } else {
+                        vk::PipelineCreateFlags::empty()
+                    },
+                )],
                 None,
             )
         }
         .map_err(|(_, result)| fail("creating the compute pipeline")(result))?[0];
         unsafe { device.destroy_shader_module(module, None) };
         Ok(Kernel { gpu: self, bindings, pushed, set_layout, pipeline_layout, pipeline })
+    }
+
+    /// What the driver reports about `kernel`'s compiled code (`VK_KHR_pipeline_executable_properties`):
+    /// per executable, its statistics as `(name, value)` (on NVIDIA: registers per thread, local
+    /// memory, shared memory, ...). Empty without the extension.
+    pub fn kernel_statistics(&self, kernel: &Kernel) -> Vec<(String, String)> {
+        let Some(properties) = &self.executable_properties else { return Vec::new() };
+        let info = vk::PipelineInfoKHR::default().pipeline(kernel.pipeline);
+        let executables = unsafe { properties.get_pipeline_executable_properties(&info) }.unwrap_or_default();
+        let text = |chars: &[std::ffi::c_char]| unsafe { CStr::from_ptr(chars.as_ptr()) }.to_string_lossy().into_owned();
+        let mut out = Vec::new();
+        for index in 0..executables.len() as u32 {
+            let executable = vk::PipelineExecutableInfoKHR::default().pipeline(kernel.pipeline).executable_index(index);
+            let statistics = unsafe { properties.get_pipeline_executable_statistics(&executable) }.unwrap_or_default();
+            for s in &statistics {
+                let value = unsafe {
+                    match s.format {
+                        vk::PipelineExecutableStatisticFormatKHR::BOOL32 => (s.value.b32 != 0).to_string(),
+                        vk::PipelineExecutableStatisticFormatKHR::INT64 => s.value.i64.to_string(),
+                        vk::PipelineExecutableStatisticFormatKHR::UINT64 => s.value.u64.to_string(),
+                        _ => s.value.f64.to_string(),
+                    }
+                };
+                out.push((text(&s.name), value));
+            }
+        }
+        out
     }
 
     /// Runs `kernel` over `groups` workgroups with `buffers` bound in order,
@@ -512,6 +817,66 @@ impl Gpu {
         })();
         unsafe { device.destroy_descriptor_pool(pool, None) };
         result
+    }
+
+    /// Copies the first `bytes` bytes of `from` into `to` on the device, and waits: how data
+    /// reaches a [`Gpu::device_buffer`] (from a mapped [`Gpu::buffer`]) and comes back.
+    pub fn copy(&self, from: &Buffer, to: &Buffer, bytes: usize) -> Result<(), Error> {
+        assert!(bytes <= from.bytes && bytes <= to.bytes, "{bytes} bytes copied between buffers of {} and {}", from.bytes, to.bytes);
+        let device = &self.device;
+        let command = unsafe {
+            device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(self.command_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+        }
+        .map_err(fail("allocating a command buffer"))?[0];
+        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.map_err(fail("creating a fence"))?;
+        let run = (|| unsafe {
+            device
+                .begin_command_buffer(command, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))
+                .map_err(fail("beginning the command buffer"))?;
+            // The host's writes to a mapped source, and earlier kernels' writes, visible to the copy;
+            // the copy visible to later kernels and to the host.
+            let before = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::HOST_WRITE | vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            device.cmd_pipeline_barrier(
+                command,
+                vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[before],
+                &[],
+                &[],
+            );
+            device.cmd_copy_buffer(command, from.buffer, to.buffer, &[vk::BufferCopy::default().size(bytes as u64)]);
+            let after = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::HOST_READ);
+            device.cmd_pipeline_barrier(
+                command,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[after],
+                &[],
+                &[],
+            );
+            device.end_command_buffer(command).map_err(fail("ending the command buffer"))?;
+            let commands = [command];
+            device
+                .queue_submit(self.queue, &[vk::SubmitInfo::default().command_buffers(&commands)], fence)
+                .map_err(fail("submitting the copy"))?;
+            device.wait_for_fences(&[fence], true, u64::MAX).map_err(fail("waiting for the copy"))
+        })();
+        unsafe {
+            device.destroy_fence(fence, None);
+            device.free_command_buffers(self.command_pool, &[command]);
+        }
+        run
     }
 }
 

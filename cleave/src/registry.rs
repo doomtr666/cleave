@@ -491,7 +491,7 @@ impl Registry {
                 "false" => Some(ConstValue::Bool(false)),
                 _ => None,
             }
-        } else if p.segments.len() == 1 && matches!(p.segments[0].as_str(), "f32" | "f64") {
+        } else if p.segments.len() == 1 && crate::scalars::is_float(&p.segments[0]) {
             raw.parse::<f64>().ok().map(ConstValue::float)
         } else {
             raw.parse::<u64>().ok().map(ConstValue::Int)

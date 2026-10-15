@@ -2374,10 +2374,7 @@ fn is_array_element(t: &Ty) -> bool {
         // (`Net`, nanoLM's `Gpt`) is a `Ty::Con` too, and arrays of structs
         // were made the default for them, never released (eight micro-batch
         // gradients leaked per training step).
-        Ty::Con(name) => matches!(
-            name.as_str(),
-            "f32" | "f64" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "bool"
-        ),
+        Ty::Con(name) => crate::scalars::is_scalar(name),
         Ty::Array(e, _) => is_array_element(e),
         _ => false,
     }

@@ -6733,6 +6733,32 @@ fn lower_raw_mlir_op<'c>(
     if op == "memref.stride" {
         return build_memref_stride(ctx, block, env, args, result_ty);
     }
+    // A product of 16-bit floats (`bf16`, `f16`) accumulates in f32 and is
+    // rounded once, at the end (`stdlib/num`'s `bf16`, `doc/plan-quantization.md`):
+    // the semantics of the hardware's products (`bf16 * bf16 + f32`), the most
+    // accurate a 16-bit result can be. Computed into an f32 tensor of the same
+    // shape, then `arith.truncf` to the result type. Never the BLAS tier:
+    // `sgemm` is f32 only.
+    if matches!(op, "linalg.matmul" | "linalg.matmul_transpose_a" | "linalg.matmul_transpose_b") {
+        if let Some(wide_ty) = widened_16_bit_float_tensor(ctx, result_ty) {
+            let wide = match op {
+                "linalg.matmul" => build_matmul_no_seed(ctx, block, env, args, wide_ty),
+                "linalg.matmul_transpose_a" => build_matmul_transpose_no_seed(ctx, block, env, args, wide_ty, true),
+                _ => build_matmul_transpose_no_seed(ctx, block, env, args, wide_ty, false),
+            };
+            return block
+                .append_operation(
+                    OperationBuilder::new("arith.truncf", gen_loc(ctx.context))
+                        .add_operands(&[wide])
+                        .add_results(&[result_ty])
+                        .build()
+                        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build arith.truncf: {e}")),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+        }
+    }
     // `linalg.matmul`/`linalg.transpose` — see `build_matmul_no_seed`'s own
     // doc comment for why these two need real, dedicated Rust code (not the
     // generic `linalg.`-prefix path just below, and not the *named* ops
@@ -7163,9 +7189,30 @@ fn build_matmul_named_op<'c>(
     elem_ty: Type<'c>,
     result_ty: Type<'c>,
 ) -> Value<'c, 'c> {
-    let payload = Block::new(&[(elem_ty, location), (elem_ty, location), (elem_ty, location)]);
-    let av: Value = payload.argument(0).unwrap().into();
-    let bv: Value = payload.argument(1).unwrap().into();
+    // Each block argument has its operand's element type; an input narrower than the accumulator
+    // (`bf16` into `f32`, `widened_16_bit_float_tensor`) is extended first, the body MLIR's own
+    // builder gives a mixed-precision `linalg.matmul`.
+    let a_elem = shaped_element_type(a.r#type()).unwrap_or(elem_ty);
+    let b_elem = shaped_element_type(b.r#type()).unwrap_or(elem_ty);
+    let payload = Block::new(&[(a_elem, location), (b_elem, location), (elem_ty, location)]);
+    let widen = |v: Value<'c, 'c>, from: Type<'c>| -> Value<'c, 'c> {
+        if from == elem_ty {
+            return v;
+        }
+        payload
+            .append_operation(
+                OperationBuilder::new("arith.extf", location)
+                    .add_operands(&[v])
+                    .add_results(&[elem_ty])
+                    .build()
+                    .unwrap(),
+            )
+            .result(0)
+            .unwrap()
+            .into()
+    };
+    let av: Value = widen(payload.argument(0).unwrap().into(), a_elem);
+    let bv: Value = widen(payload.argument(1).unwrap().into(), b_elem);
     let cv: Value = payload.argument(2).unwrap().into();
     let prod: Value = payload
         .append_operation(
@@ -8022,6 +8069,19 @@ fn lower_extern_out_param_call<'c>(
         .build()
         .unwrap_or_else(|e| panic!("MLIR lowering: failed to build bufferization.to_tensor: {e}"));
     block.append_operation(to_tensor).result(0).unwrap().into()
+}
+
+/// For a ranked tensor of 16-bit floats (`bf16`, `f16`), the same shape in f32:
+/// where its products accumulate. `None` for any other type.
+fn widened_16_bit_float_tensor<'c>(ctx: &LowerCtx<'c, '_>, ty: Type<'c>) -> Option<Type<'c>> {
+    let element = RankedTensorType::try_from(ty).ok()?.element().to_string();
+    if !matches!(element.as_str(), "bf16" | "f16") {
+        return None;
+    }
+    let text = ty.to_string();
+    let suffix = format!("x{element}>");
+    let shape = text.strip_suffix(&suffix)?;
+    Type::parse(ctx.context, &format!("{shape}xf32>"))
 }
 
 /// The element type of a tensor, vector or memref type; `None` otherwise.

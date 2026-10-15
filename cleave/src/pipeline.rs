@@ -816,6 +816,21 @@ pub fn lower_to_llvm<'c>(
 ) -> Result<(), Vec<String>> {
     let vulkan = options.backend == Backend::Vulkan;
     register_passes();
+    // 16-bit floats (`bf16`, `f16`) aren't generated for the GPU yet: its kernels and their tiling
+    // (`cleave-tile-matmuls-for-gpu`'s vector loads) assume 32-bit elements, and read a `bf16`
+    // tensor wrong without failing. Refused here until the cooperative-matrix path exists
+    // (`doc/plan-quantization.md`, phase 4), never computed wrong.
+    if vulkan {
+        let text = module.as_operation().to_string();
+        if text.contains("xbf16>") || text.contains("xf16>") {
+            return Err(vec![
+                "`bf16`/`f16` tensors aren't supported on the Vulkan backend yet: its kernels assume \
+                 32-bit floats (`doc/plan-quantization.md`, phase 4). Compile for the CPU, or keep \
+                 the tensors in `f32`."
+                    .to_string(),
+            ]);
+        }
+    }
     let dump = |module: &Module, variable: &str| {
         if let Ok(path) = std::env::var(variable) {
             std::fs::write(&path, module.as_operation().to_string())

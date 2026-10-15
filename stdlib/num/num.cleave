@@ -49,6 +49,11 @@ algebra Float<T> : Num {}
 
 #[mlir_type(f32)] impl Float<f32> {}
 #[mlir_type(f64)] impl Float<f64> {}
+// bfloat16: f32's 8-bit exponent (its range, no overflow where f32 wouldn't) with 8 bits of
+// mantissa (~2-3 significant digits). A storage and tensor-core type (`doc/plan-quantization.md`):
+// its own arithmetic below rounds every result to bf16, as the type says; a program wanting f32
+// arithmetic converts explicitly (`.to()`, `stdlib/convert`).
+#[mlir_type(bf16)] impl Float<bf16> {}
 
 // Real primitive arithmetic — the base case `doc/type_inference.md`'s
 // "circular-primitive-impl problem" describes: a stub body like `fn add(x,
@@ -284,6 +289,19 @@ impl Ring<f64> {
     fn one() -> f64 { 1.0 }
 }
 
+impl Additive<bf16> {
+    fn add(a: bf16, b: bf16) -> bf16 { mlir::arith::addf(a, b) }
+    fn sub(a: bf16, b: bf16) -> bf16 { mlir::arith::subf(a, b) }
+    fn neg(a: bf16) -> bf16 { mlir::arith::negf(a) }
+    fn zero() -> bf16 { 0.0 }
+}
+
+impl Ring<bf16> {
+    fn mul(a: bf16, b: bf16) -> bf16 { mlir::arith::mulf(a, b) }
+    fn div(a: bf16, b: bf16) -> bf16 { mlir::arith::divf(a, b) }
+    fn one() -> bf16 { 1.0 }
+}
+
 // Named, individually-differentiable transcendental primitives — `exp`/
 // `tanh` (more added when actually needed, not speculatively: `log`/`sin`/
 // `cos`/... follow the identical shape). `Ring<T>`'s own `add`/`sub`/`mul`/
@@ -348,6 +366,17 @@ impl Transcendental<f64> {
     fn sin(x: f64) -> f64 { mlir::math::sin(x) }
     fn cos(x: f64) -> f64 { mlir::math::cos(x) }
     fn sqrt(x: f64) -> f64 { mlir::math::sqrt(x) }
+}
+
+// bf16 has no math library of its own: each function computed in f32, its result rounded to bf16
+// (the nearest bf16 of the f32 result, itself within an ulp of the exact value).
+impl Transcendental<bf16> {
+    fn exp(x: bf16) -> bf16 { let y: f32 = mlir::arith::extf(x); let r: f32 = mlir::math::exp(y); mlir::arith::truncf(r) }
+    fn tanh(x: bf16) -> bf16 { let y: f32 = mlir::arith::extf(x); let r: f32 = mlir::math::tanh(y); mlir::arith::truncf(r) }
+    fn log(x: bf16) -> bf16 { let y: f32 = mlir::arith::extf(x); let r: f32 = mlir::math::log(y); mlir::arith::truncf(r) }
+    fn sin(x: bf16) -> bf16 { let y: f32 = mlir::arith::extf(x); let r: f32 = mlir::math::sin(y); mlir::arith::truncf(r) }
+    fn cos(x: bf16) -> bf16 { let y: f32 = mlir::arith::extf(x); let r: f32 = mlir::math::cos(y); mlir::arith::truncf(r) }
+    fn sqrt(x: bf16) -> bf16 { let y: f32 = mlir::arith::extf(x); let r: f32 = mlir::math::sqrt(y); mlir::arith::truncf(r) }
 }
 
 // Comparison — same reasoning and shape as `Ring` above. `eq`/`neq` are
@@ -430,6 +459,15 @@ impl Ord<f64> {
     fn ge(a: f64, b: f64) -> bool { mlir::arith::cmpf(a, b, predicate: "3 : i64") }
     fn eq(a: f64, b: f64) -> bool { mlir::arith::cmpf(a, b, predicate: "1 : i64") }
     fn neq(a: f64, b: f64) -> bool { mlir::arith::cmpf(a, b, predicate: "6 : i64") }
+}
+
+impl Ord<bf16> {
+    fn lt(a: bf16, b: bf16) -> bool { mlir::arith::cmpf(a, b, predicate: "4 : i64") }
+    fn le(a: bf16, b: bf16) -> bool { mlir::arith::cmpf(a, b, predicate: "5 : i64") }
+    fn gt(a: bf16, b: bf16) -> bool { mlir::arith::cmpf(a, b, predicate: "2 : i64") }
+    fn ge(a: bf16, b: bf16) -> bool { mlir::arith::cmpf(a, b, predicate: "3 : i64") }
+    fn eq(a: bf16, b: bf16) -> bool { mlir::arith::cmpf(a, b, predicate: "1 : i64") }
+    fn neq(a: bf16, b: bf16) -> bool { mlir::arith::cmpf(a, b, predicate: "6 : i64") }
 }
 
 // `mod`/`rem` deliberately never became operators (`grammar.md`'s own

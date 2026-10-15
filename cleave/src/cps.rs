@@ -3407,10 +3407,7 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
 fn scalar_array_leaf(ty: &Ty) -> bool {
     match ty {
         Ty::Array(elem, _) => scalar_array_leaf(elem),
-        Ty::Con(name) => matches!(
-            name.as_str(),
-            "f32" | "f64" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "bool"
-        ),
+        Ty::Con(name) => crate::scalars::is_scalar(name),
         _ => false,
     }
 }
@@ -3606,7 +3603,7 @@ fn convert_array_repeat_over_resolved_dims(
 /// Whether a type is a scalar: an array of them is laid out flat, one array
 /// value whatever its rank.
 fn is_scalar_ty(ty: &Ty) -> bool {
-    matches!(ty, Ty::Con(n) if matches!(n.as_str(), "i8" | "i16" | "i32" | "i64" | "f32" | "f64" | "bool" | "index"))
+    matches!(ty, Ty::Con(n) if matches!(n.as_str(), "i8" | "i16" | "i32" | "i64" | "bool" | "index") || crate::scalars::is_float(n))
 }
 
 /// Whether `ty` is an array whose elements are arrays of structs: each
@@ -4383,7 +4380,7 @@ fn complex_literal(
 fn parse_number(text: &str, ty: &Ty) -> CVal {
     let is_float = match ty {
         Ty::Var(_) => text.contains('.') || text.contains('e') || text.contains('E'),
-        _ => matches!(ty.to_string().as_str(), "f32" | "f64"),
+        _ => crate::scalars::is_float(&ty.to_string()),
     };
     if is_float {
         CVal::Float(

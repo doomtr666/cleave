@@ -1735,11 +1735,7 @@ fn concrete_ty_from_ast(ty: &Type, registry: &Registry) -> Option<Ty> {
                 // specialization's own inference resolves it, and names the
                 // call). Taken for a type `M`, it made a `probe<M>` whose
                 // `N` nothing binds, a CPS panic.
-                let is_type = registry.has_struct(&name)
-                    || matches!(
-                        name.as_str(),
-                        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "f32" | "f64" | "bool"
-                    );
+                let is_type = registry.has_struct(&name) || crate::scalars::is_scalar(&name);
                 return is_type.then_some(Ty::Con(name));
             }
             let type_args: Vec<Ty> = args

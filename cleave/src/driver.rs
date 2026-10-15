@@ -823,7 +823,7 @@ fn synthesize_derive_signatures(mut program: Program) -> Result<Program, Vec<Dia
                 &ret.kind,
                 TypeKind::Path(path, _)
                     if path.segments.len() == 1
-                        && matches!(path.segments[0].as_str(), "f32" | "f64")
+                        && crate::scalars::is_float(&path.segments[0])
             );
             if !is_scalar_float {
                 errors.push(Diagnostic::error(

@@ -1185,3 +1185,48 @@ fn a_spawn_on_the_gpu_reports_that_it_runs_in_place() {
         );
     }
 }
+
+/// Each device's cooperative-matrix products (`VK_KHR_cooperative_matrix`), printed: what a
+/// tensor-core kernel can be built from (`doc/plan-quantization.md`, phase 0). Every listed product
+/// has positive sizes and a known scope; a device with the extension lists at least one f16 product
+/// (the extension's baseline on every driver seen so far).
+#[test]
+fn cooperative_matrix_shapes_are_listed_per_device() {
+    for device in devices() {
+        eprintln!("{}: {} cooperative-matrix products", device.name, device.cooperative_matrices.len());
+        for shape in &device.cooperative_matrices {
+            eprintln!("  {shape}");
+            assert!(shape.m > 0 && shape.n > 0 && shape.k > 0, "{}: {shape}", device.name);
+            assert!(!shape.scope.starts_with("scope#"), "{}: {shape}", device.name);
+        }
+        if !device.cooperative_matrices.is_empty() {
+            assert!(device.cooperative_matrices.iter().any(|s| s.a == "f16"), "{}: no f16 product", device.name);
+        }
+    }
+}
+
+/// `bf16` tensors are refused on the Vulkan backend, with a message, until its kernels handle
+/// 16-bit floats (`doc/plan-quantization.md`, phase 4): before, the 32-bit tiling read them wrong
+/// and the product came back wrong without any error.
+#[test]
+fn bf16_tensors_are_refused_on_the_gpu() {
+    let src = "
+        use linalg;
+        use io;
+        use convert;
+        fn main() -> i32 {
+            let a: Tensor<bf16, 64, 64> = [for i in 0..64: [for j in 0..64: 1.0]];
+            let c = matmul(a, a);
+            let x: f32 = c[0, 0].to();
+            println(x);
+            0
+        }
+    ";
+    let devices = devices();
+    if devices.is_empty() {
+        return;
+    }
+    let (stdout, stderr) = run_on(0, "bf16_refused", src);
+    assert!(stderr.contains("`bf16`/`f16` tensors aren't supported on the Vulkan backend yet"), "{stdout}{stderr}");
+    assert!(!stdout.contains("64"), "{stdout}");
+}

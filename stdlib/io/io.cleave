@@ -33,6 +33,14 @@ impl Print<i32> { extern(print_i32) fn print(x: i32) -> i32; }
 impl Print<i64> { extern(print_i64) fn print(x: i64) -> i64; }
 impl Print<f32> { extern(print_f32) fn print(x: f32) -> f32; }
 impl Print<f64> { extern(print_f64) fn print(x: f64) -> f64; }
+// Printed as the f32 it widens to, exactly.
+impl Print<bf16> {
+    fn print(x: bf16) -> bf16 {
+        let wide: f32 = mlir::arith::extf(x);
+        print(wide);
+        x
+    }
+}
 
 // A string is a plain `[i8; N]` array (see `doc/backlog.md`'s own "No
 // string support at all" item) — no new representation, just an ordinary

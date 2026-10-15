@@ -863,3 +863,14 @@ To define, then implement:
   failed to unroll ("no `impl Index<__Tuple8<...>>`") — fixed 2026-10-15, so nanoLM's sum over its
   parts can be one loop for any `SPLIT` instead of a term per part. The array form (for folding) is
   `doc/plan-spawn-gpu.md`, step 2.
+
+## An `mlir::` intrinsic whose result type nothing fixes gets a misleading error (2026-10-15)
+
+`mlir::...` intrinsics take their result type from the context. In
+`mlir::arith::truncf(mlir::math::exp(y))` nothing fixes `exp`'s result (`truncf`'s input is open
+too), so the instance stays undetermined, and `undetermined_instance_error`
+(`monomorphize.rs`) reports the nearest algebra instead: "`Transcendental::exp<bf16>` cannot be
+specialized for (bf16): no `impl Transcendental<f32>`" — while that impl exists. The fix in the
+program is an annotation (`let r: f32 = mlir::math::exp(y);`); the compiler should say so: "the
+result of `mlir::math::exp` has no type here: annotate it". Found writing `Transcendental<bf16>`
+(`stdlib/num`).

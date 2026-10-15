@@ -2275,7 +2275,7 @@ fn build_pattern(
             let var = Var::from(Symbol::from(format!("?{name}")));
             Some((ast.add(ENodeOrVar::Var(var)), Some(resolved_ty.clone())))
         }
-        ExprKind::NumberLit { text, .. } if matches!(ty, "f32" | "f64") => {
+        ExprKind::NumberLit { text, .. } if crate::scalars::is_float(ty) => {
             let n: f64 = text.parse().ok()?;
             Some((
                 ast.add(ENodeOrVar::ENode(CleaveLang::Float(n.into()))),
@@ -2773,7 +2773,7 @@ pub fn derivative_rewrites(
     HashSet<String>,
     std::sync::Arc<std::sync::Mutex<HashSet<String>>>,
 ) {
-    let one = if matches!(ty, "f32" | "f64") {
+    let one = if crate::scalars::is_float(ty) {
         CleaveLang::Float(1.0.into())
     } else {
         CleaveLang::Int(1)
@@ -4729,7 +4729,7 @@ fn synthesize_one_gradient(
     new_params.push(k_ret);
 
     let root_ty = of_unit.result.to_string();
-    let seed = if matches!(root_ty.as_str(), "f32" | "f64") {
+    let seed = if crate::scalars::is_float(&root_ty) {
         fwd.egraph.add(CleaveLang::Float(1.0.into()))
     } else {
         fwd.egraph.add(CleaveLang::Int(1))
@@ -5632,7 +5632,7 @@ fn undifferentiable_unit(
 /// anywhere in its body, so `d(f)/dp` is trivially this, no e-graph node
 /// needed at all.
 fn zero_value(ty: &Ty) -> CVal {
-    if matches!(ty.to_string().as_str(), "f32" | "f64") {
+    if crate::scalars::is_float(&ty.to_string()) {
         CVal::Float(0.0)
     } else {
         CVal::Int(0)
@@ -5757,7 +5757,7 @@ fn inject_cross_leaf_independence(
             if i == j {
                 continue;
             }
-            let is_float = matches!(ty_j, Ty::Con(name) if matches!(name.as_str(), "f32" | "f64"));
+            let is_float = matches!(ty_j, Ty::Con(name) if crate::scalars::is_float(name));
             let leaf_zero = if is_float {
                 CleaveLang::Float(0.0.into())
             } else {
@@ -5898,7 +5898,7 @@ enum ParamShape {
 }
 
 fn is_scalar_width(name: &str) -> bool {
-    matches!(name, "i8" | "i16" | "i32" | "i64" | "f32" | "f64" | "bool")
+    matches!(name, "i8" | "i16" | "i32" | "i64" | "bool") || crate::scalars::is_float(name)
 }
 
 /// `Tensor<T,Dims...>`'s own concrete instantiation (`Ty::App("Tensor",

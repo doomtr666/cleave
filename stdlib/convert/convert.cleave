@@ -48,6 +48,28 @@ impl Convert<f32, f64> {
 
 // Narrowing, rounded to nearest: explicit like every conversion here, so the precision lost is
 // never lost silently.
+// bfloat16 (`doc/plan-quantization.md`): widening is exact; narrowing rounds to the nearest bf16,
+// ties to even (`arith.truncf`'s default).
+impl Convert<bf16, f32> {
+    fn convert(x) { mlir::arith::extf(x) }
+}
+
+impl Convert<f32, bf16> {
+    fn convert(x) { mlir::arith::truncf(x) }
+}
+
+impl Convert<bf16, f64> {
+    fn convert(x) { mlir::arith::extf(x) }
+}
+
+impl Convert<f64, bf16> {
+    fn convert(x) { mlir::arith::truncf(x) }
+}
+
+impl Convert<i32, bf16> {
+    fn convert(x) { mlir::arith::sitofp(x) }
+}
+
 impl Convert<f64, f32> {
     fn convert(x) { mlir::arith::truncf(x) }
 }

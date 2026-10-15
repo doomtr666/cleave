@@ -26,4 +26,5 @@ pub mod resolve;
 pub mod rc_opt;
 pub mod run;
 pub mod rust_bindings;
+pub mod scalars;
 pub mod unroll;
