@@ -433,6 +433,7 @@ pub fn lower_program<'c>(
     mlir_types: &HashMap<String, String>,
     struct_schemas: HashMap<String, StructSchema>,
 ) -> Module<'c> {
+    report_spawn_mapping(program);
     let location = gen_loc(context);
     let module = Module::new(location);
     let signatures = program
@@ -8087,6 +8088,28 @@ fn ensure_extern_declared<'c>(
         location,
     );
     ctx.module.body().append_operation(decl);
+}
+
+/// How each `spawn` site runs, when it doesn't become a task
+/// (`doc/plan-spawn-gpu.md`, step 1): in place, as an ordinary call, either
+/// because the backend has no host tasks (Vulkan: the device does the parallel
+/// work, host tasks only contended to record it) or because tasks were turned
+/// off (`--no-tasks`). Never a silent choice: on stderr under
+/// `CLEAVE_DEBUG_PARALLELIZE=1`, with the GPU's other parallelization reports.
+fn report_spawn_mapping(program: &CpsProgram) {
+    let options = crate::options::current();
+    if options.host_tasks() || !std::env::var("CLEAVE_DEBUG_PARALLELIZE").is_ok_and(|v| v == "1") {
+        return;
+    }
+    let why = if options.tasks {
+        "no host tasks on the Vulkan backend"
+    } else {
+        "tasks are off (--no-tasks)"
+    };
+    for (caller, callee, count) in crate::cps::spawn_sites(program) {
+        let times = if count > 1 { format!(" ({count} spawns)") } else { String::new() };
+        eprintln!("cleave-spawn: {caller}: `{callee}` runs in place{times}: {why}");
+    }
 }
 
 /// A spawned call (`PrimOp::Spawn`, `doc/plan-spawn.md`): the same `func.call`

@@ -4766,6 +4766,46 @@ pub fn uses_spawn(program: &CpsProgram) -> bool {
     program.funcs.iter().any(|f| walk(&f.def.body))
 }
 
+/// Every `spawn` site, as `(caller, callee, count)`: the top-level function a
+/// spawn is in, the function it spawns, how many times (a comprehension's
+/// spawns are unrolled into one per element). For the report of how spawns
+/// are mapped (`doc/plan-spawn-gpu.md`, step 1).
+pub fn spawn_sites(program: &CpsProgram) -> Vec<(String, String, usize)> {
+    fn walk(e: &CExpr, found: &mut Vec<String>) {
+        match e {
+            CExpr::LetPrim { op, cont, .. } => {
+                if let PrimOp::Spawn { unit } = op {
+                    found.push(unit.clone());
+                }
+                walk(cont, found);
+            }
+            CExpr::App { .. } => {}
+            CExpr::Fix { defs, body } => {
+                for d in defs {
+                    walk(&d.body, found);
+                }
+                walk(body, found);
+            }
+            CExpr::If { then_branch, else_branch, .. } => {
+                walk(then_branch, found);
+                walk(else_branch, found);
+            }
+        }
+    }
+    let mut sites: Vec<(String, String, usize)> = Vec::new();
+    for f in &program.funcs {
+        let mut found = Vec::new();
+        walk(&f.def.body, &mut found);
+        for callee in found {
+            match sites.iter_mut().find(|(caller, c, _)| *caller == f.def.name && *c == callee) {
+                Some(site) => site.2 += 1,
+                None => sites.push((f.def.name.clone(), callee, 1)),
+            }
+        }
+    }
+    sites
+}
+
 /// A spawned call must not reach, through any chain of calls, an `extern`
 /// that isn't `#[pure]` (`doc/plan-spawn.md`, §2): the random generator's one
 /// global stream, printing, checkpoint files — global state a task running

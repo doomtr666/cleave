@@ -1,6 +1,6 @@
 # Plan: what `spawn` means on the GPU
 
-Status: proposed, 2026-10-15. Nothing implemented yet. Extends `doc/plan-spawn.md` ("GPU (not
+Status: step 1 done (2026-10-15); the rest proposed. Extends `doc/plan-spawn.md` ("GPU (not
 implemented; the semantics must already allow it)") and `doc/plan-vk-runtime.md` (section 7); the
 backlog entry "`spawn` on the GPU: the semantics aren't defined, and today's behavior is an accident"
 is the problem statement.
@@ -54,9 +54,11 @@ The mappings, in the order a GPU backend prefers them:
 
 ## Steps
 
-1. **Report what happens today.** A diagnostic per `spawn` site on the Vulkan backend ("run in place:
-   no host tasks on this backend"), under the existing debug switch, then in the placement report. A
-   test that checks it. Nothing else changes.
+1. ✅ (2026-10-15) **Report what happens today.** Under `CLEAVE_DEBUG_PARALLELIZE=1`, one line per
+   `spawn` site that doesn't become a task, with its count and why: ``cleave-spawn: main: `make` runs in
+   place (4 spawns): no host tasks on the Vulkan backend`` (or "tasks are off (--no-tasks)")
+   (`mlir_lower.rs::report_spawn_mapping`, `cps::spawn_sites`); `vulkan.rs::
+   a_spawn_on_the_gpu_reports_that_it_runs_in_place`. Joins the placement report when there is one.
 2. **A homogeneous `spawn` comprehension yields an array.** When every element has the same type (the
    same function), `[for j in 0..N: spawn f(...)]` is an `[T; N]` (arrays of structs exist already:
    `[for i in 0..LAYERS: new_block()]`, by context), and lowers as a loop over `j`, not N unrolled

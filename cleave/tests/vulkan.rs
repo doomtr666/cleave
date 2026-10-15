@@ -1137,3 +1137,51 @@ fn a_miniature_transformer_has_the_cpus_gradients() {
         assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
     }
 }
+
+/// A `spawn` on the Vulkan backend runs in place, as an ordinary call (no host
+/// tasks there), and says so under `CLEAVE_DEBUG_PARALLELIZE=1`, once per site
+/// with its count (`doc/plan-spawn-gpu.md`, step 1): the mapping is reported,
+/// never silent. A comprehension's spawns, summed over the tuple by an
+/// unrolled loop, give the CPU's value.
+#[test]
+fn a_spawn_on_the_gpu_reports_that_it_runs_in_place() {
+    let src = "
+        use io;
+        struct P { a: f32, b: f32 }
+        fn make(x: f32) -> P { P(a: x, b: 2.0 * x) }
+        fn add(p: P, q: P) -> P { P(a: p.a + q.a, b: p.b + q.b) }
+        fn main() -> i32 {
+            let g = [for j in 0..4: spawn make(1.5)];
+            let mut acc = g[0];
+            for j in 1..4 { acc = add(acc, g[j]); };
+            println(acc.b);
+            0
+        }
+    ";
+    let devices = devices();
+    if devices.is_empty() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("cleave-vulkan-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("spawn_in_place.cleave");
+    std::fs::write(&source, src).unwrap();
+    for (index, device) in devices.iter().enumerate() {
+        let output = Command::new(env!("CARGO_BIN_EXE_cleave"))
+            .args(["--backend", "vulkan", "--no-openmp", "--no-debug-info", "--run"])
+            .arg(&source)
+            .env("CLEAVE_VK_DEVICE", index.to_string())
+            .env("CLEAVE_DEBUG_PARALLELIZE", "1")
+            .output()
+            .expect("cannot run cleave");
+        let (stdout, stderr) =
+            (String::from_utf8_lossy(&output.stdout).into_owned(), String::from_utf8_lossy(&output.stderr).into_owned());
+        assert!(stdout.lines().any(|l| l.trim() == "12"), "{}: {stdout}", device.name);
+        assert_eq!(
+            stderr.matches("cleave-spawn: main: `make` runs in place (4 spawns): no host tasks on the Vulkan backend").count(),
+            1,
+            "{}: {stderr}",
+            device.name
+        );
+    }
+}
