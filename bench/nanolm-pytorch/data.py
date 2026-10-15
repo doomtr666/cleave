@@ -16,7 +16,10 @@ import numpy as np
 
 # The sizes are the kernel's `define`s, read from its source, as the cleave host's `build.rs` does.
 KERNEL = Path(__file__).resolve().parents[2] / "examples" / "nanolm" / "src" / "kernel.cleave"
-DEFINES = {m[1]: int(m[2]) for m in re.finditer(r"^define (\w+): i32 = (\d+);", KERNEL.read_text(), re.M)}
+DEFINES = {
+    m[1]: int(m[3]) if m[2] == "i32" else float(m[3])
+    for m in re.finditer(r"^define (\w+): (i32|f32) = ([\d.]+);", KERNEL.read_text(), re.M)
+}
 B, T, VOCAB = DEFINES["BATCH"], DEFINES["CONTEXT"], DEFINES["VOCAB"]
 TRAIN_SEED = 0x5A01A_7A1
 VAL_SEED = 0x5A01A_7A2

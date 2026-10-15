@@ -1150,7 +1150,10 @@ pub fn emit_exe(
     std::fs::write(&shim_path, shim_src)
         .map_err(|e| vec![format!("failed to write {}: {e}", shim_path.display())])?;
 
-    let runtime_lib = cleave_rt_library()?;
+    // The Vulkan backend's runtime holds `cleave-rt` too (`cleave-vk`'s
+    // `staticlib`, what `cleave-build` links such an executable with).
+    let runtime_lib =
+        runtime_library(if options.backend == Backend::Vulkan { "cleave_vk" } else { "cleave_rt" })?;
     let mut cmd = std::process::Command::new("rustc");
     cmd.arg(&shim_path)
         .arg("-o")
@@ -1183,26 +1186,27 @@ pub fn emit_exe(
     }
 }
 
-/// The `cleave-rt` static library to link a standalone executable with: the
-/// most recently built of `cleave_rt.lib`/`libcleave_rt.a` beside the running
-/// `cleave` (or one level up, for a test binary in `deps/`) and of Cargo's
-/// hash-suffixed copies in `deps/`. Building `cleave` rebuilds `cleave-rt` as
+/// The runtime static library to link a standalone executable with (`crate`:
+/// `cleave_rt`, or `cleave_vk` for the Vulkan backend): the most recently
+/// built of `<crate>.lib`/`lib<crate>.a` beside the running `cleave` (or one
+/// level up, for a test binary in `deps/`) and of Cargo's hash-suffixed
+/// copies in `deps/`. Building `cleave` rebuilds `cleave-rt` as
 /// a dependency into `deps/` only; the unsuffixed copy beside it is refreshed
 /// only by building `cleave-rt` itself, so it goes stale as the runtime gains
 /// symbols (`cleave_parallel_threads`, unresolved at link time, found with
 /// `--emit-exe`). The newest one is the one built from the current sources.
 /// A `cleave` installed with no runtime library near it finds none.
-fn cleave_rt_library() -> Result<PathBuf, Vec<String>> {
+fn runtime_library(name: &str) -> Result<PathBuf, Vec<String>> {
     let exe = std::env::current_exe().map_err(|e| {
         vec![format!(
             "failed to locate the running cleave executable: {e}"
         )]
     })?;
-    let is_runtime = |name: &str| {
-        name == "cleave_rt.lib"
-            || name == "libcleave_rt.a"
-            || (name.starts_with("cleave_rt-") && name.ends_with(".lib"))
-            || (name.starts_with("libcleave_rt-") && name.ends_with(".a"))
+    let is_runtime = |file: &str| {
+        file == format!("{name}.lib")
+            || file == format!("lib{name}.a")
+            || (file.starts_with(&format!("{name}-")) && file.ends_with(".lib"))
+            || (file.starts_with(&format!("lib{name}-")) && file.ends_with(".a"))
     };
     let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
     for dir in exe.ancestors().skip(1).take(2) {
@@ -1222,7 +1226,7 @@ fn cleave_rt_library() -> Result<PathBuf, Vec<String>> {
     }
     newest.map(|(_, path)| path).ok_or_else(|| {
         vec![format!(
-            "no cleave-rt static library (cleave_rt.lib / libcleave_rt.a) near {}",
+            "no runtime static library ({name}.lib / lib{name}.a) near {}",
             exe.display()
         )]
     })

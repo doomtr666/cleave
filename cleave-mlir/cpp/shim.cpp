@@ -631,6 +631,10 @@ Value viewRoot(Value v) {
       v = rc.getSource();
     else if (auto meta = dyn_cast<memref::ExtractStridedMetadataOp>(def))
       v = meta.getSource();
+    else if (auto view = dyn_cast<UnrealizedConversionCastOp>(def);
+             view && view->getNumOperands() == 1 && isa<MemRefType>(view->getOperand(0).getType()) &&
+             isa<MemRefType>(view->getResult(0).getType()))
+      v = view->getOperand(0); // a vector view (`cleave-tile-matmuls-for-gpu`)
     else
       break;
   }

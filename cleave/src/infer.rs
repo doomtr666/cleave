@@ -2329,6 +2329,11 @@ struct PendingIndex {
     index_spans: Vec<Span>,
     result: TyVar,
     span: Span,
+    /// The enclosing `for` the single index is the variable of, when its
+    /// bounds fold (`unrollable_loop_index`): a base that turns out to be a
+    /// struct or tuple asks for that loop's unrolling instead of an `Index`
+    /// impl (`check_pending_indices`).
+    unroll: Option<(NodeId, u64, u64)>,
 }
 
 fn unfolded_comprehension(span: Span) -> TypeError {
@@ -5841,6 +5846,17 @@ impl<'r> Infer<'r> {
                 self.pending_indices.push(pending);
                 continue;
             }
+            if let Some((for_id, start, end)) = pending.unroll
+                && self.is_positional_struct(&resolved)
+            {
+                // As the eager path does for a base already known: the loop
+                // unrolls (`unroll.rs`), each copy's index a constant, and
+                // this access is typed again then; its element stays open.
+                if !self.unroll_requests.iter().any(|(id, _, _)| *id == for_id) {
+                    self.unroll_requests.push((for_id, start, end));
+                }
+                continue;
+            }
             let result_ty = if is_placeholder(&resolved) {
                 Ty::Con("<not-yet-inferred>".to_string())
             } else {
@@ -7020,6 +7036,14 @@ impl<'r> Infer<'r> {
                 // (peel an array dimension, or dispatch `Index<Container,
                 // Elem,K>`) is what's deferred below, when it can't be
                 // decided yet.
+                // A base still open here may turn out a struct or tuple (a
+                // comprehension's result, typed once its target defaults):
+                // indexed by an unrollable loop's variable, that loop must
+                // unroll then, so the deferred index keeps it.
+                let unroll = match indices.as_slice() {
+                    [idx] => self.unrollable_loop_index(idx),
+                    _ => None,
+                };
                 let mut index_tys: Vec<Ty> = Vec::with_capacity(indices.len());
                 let mut index_spans: Vec<Span> = Vec::with_capacity(indices.len());
                 for idx in indices {
@@ -7122,6 +7146,7 @@ impl<'r> Infer<'r> {
                             index_spans,
                             result,
                             span: expr.span,
+                            unroll,
                         });
                         Ok(Ty::Var(result))
                     }

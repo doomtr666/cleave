@@ -550,6 +550,18 @@ What to do, by priority:
 
 **Codebook (vector) quantization for inference.** Token-by-token generation is bound by memory bandwidth, not compute. Quantizing weights jointly in small blocks against a codebook beats scalar quantization at the same bit budget (packing gain, the reason QAM constellations exist): QuIP# (E8 lattice, 8-weight blocks), AQLM, VPTQ (learned codebooks). At 2-3 bits per weight a nanoLM fits in L2. Training-aware quantization goes through `grad` with a straight-through estimator (`floor` forward, identity backward). In cleave: a `Quantized<Codebook, N>` type behind an algebra, decoding fused into the matmul.
 
+The coding-theory view (2026-10-15): not more information per bit (Shannon), more bits per *symbol*,
+by coding weights jointly as points in 2, 8 or 24 dimensions, exactly what QAM does. The gains have
+their radio names: packing gain (dense lattices cover space better than a cubic grid: ~0.65 dB for
+E8, ~1.03 dB for Leech) and shaping gain (up to 1.53 dB, ~0.25 bit per dimension, the constellation
+shaped to the weights' distribution, as probabilistic shaping does). The state of the art reads like
+a telecom textbook: QuIP# (2024) first applies a random Hadamard rotation (incoherence processing:
+weights become near-Gaussian, outliers spread out, CDMA-style spreading applied to weights) then an
+E8-lattice codebook over groups of 8; QTIP (2024) uses trellis-coded quantization, the cousin of
+Ungerboeck's trellis-coded modulation, decoded by Viterbi, the best results at 2 bits per weight;
+AQLM and VPTQ learn their codebooks. In cleave the decode is inverse Hadamard (a fast O(n log n)
+transform) plus a codebook lookup, fused into the tile loads (the compressed-tensors entry below).
+
 ## Spectral layers: a differentiable FFT algebra, long convolutions for nanoLM, a Fourier neural operator for the PINN (idea, 2026-10-04)
 
 Signal processing as a layer vocabulary, the direction the user likes best for a scientific language:
@@ -604,3 +616,250 @@ then tiling non-matmul nests, choosing which loop to parallelize and how many th
 (the per-shape OpenMP entry), and emptiness/interval facts in general (the zero-trip-loop pass is the
 trivial case). First step: measure, on one nanoLM block, which whole-memory passes remain between two
 matmuls and what a fusion across reductions would remove, before building anything.
+
+## Numerical error as a first-class analysis: propagated error bounds, adjoint attribution, accuracy rewrites (idea, 2026-10-14)
+
+Floating-point addition isn't associative, so every parallel reduction picks an order, and no order is
+"the right one" (Higham, *Accuracy and Stability of Numerical Algorithms*, ch. 4: no ordering is best in
+general). Today cleave reorders sums silently (`regroupNestedSum`, the GPU reductions; `parallel_grad`'s
+fixed tree is deterministic but no more exact). The direction: make accuracy a property the compiler
+computes and reports, the way it already reports folded loops and dead tiles.
+
+- **Forward error propagation, the `grad` way.** Each value carries `(v, e)`, `e` a bound on its
+  accumulated error; each operation `z = f(x, y)` gives `e_z = |∂f/∂x| e_x + |∂f/∂y| e_y + u |z|`, `u`
+  the unit roundoff (Wilkinson's running error analysis, Higham ch. 3). Affine arithmetic (Stolfi and de
+  Figueiredo) keeps named noise symbols so that `x - x` has no error, where intervals overestimate.
+- **Adjoint error attribution, almost free with `grad`.** One reverse pass gives `∂y/∂vᵢ` for every
+  intermediate `vᵢ`, hence `err(y) ≈ Σᵢ |∂y/∂vᵢ| u |vᵢ|` *with each operation's share*: a diagnostic
+  "4 of the 6 digits lost come from the subtraction at line 214". The same sensitivities choose a
+  precision per variable (ADAPT, 2018): what contributes little can drop to `f32`/`bf16`.
+- **Accuracy rewrites in the e-graph.** Herbie finds a mathematically equivalent, numerically better
+  expression by searching an e-graph (`sqrt(x+1) - sqrt(x)` → `1 / (sqrt(x+1) + sqrt(x))`): cleave's
+  own machinery, aimed at accuracy instead of speed, with the error analysis above as its cost function.
+- **Measurement next to prediction.** A stochastic-rounding mode (CADNA, LIP6; Verificarlo, UVSQ, itself
+  an LLVM pass) as an MLIR pass: run several times with random rounding, report each result's
+  significant digits. Catches what a first-order analysis misses (near-zero divisors, nonlinear blow-up).
+- **Reduction strategies as declared laws, not silent choices.** Sequential, fixed tree (fast, error
+  O(log n · u), deterministic), compensated (Kahan/TwoSum/FMA), or correctly rounded and therefore
+  order-independent: Kulisch's exact fixed-point accumulator (~4300 bits for `f64` products), or
+  ExBLAS (Collange, Defour, Graillat, Iakymchuk: per-thread floating-point expansions feeding a shared
+  superaccumulator, exact and reproducible on GPUs at a few times a plain sum). An `ExactSum` algebra in
+  the stdlib, chosen by law where a program asks for reproducibility; every reassociation reported.
+
+**The user-facing form: an `EXPLAIN` for precision.** `--explain precision` at compile time (needs the
+value ranges of the interval entry above; without them it flags patterns: cancellation risks, long
+reassociated sums, ill-conditioned divisions, with the e-graph's suggested rewrite, applied only on
+opt-in), and `--explain precision=run` on a real execution, the more realistic first step: an
+instrumented run with one adjoint pass reporting each output's significant digits (cross-checked by the
+stochastic mode), the share of lost digits per source line with its cause, and precision advice (what
+to raise to `f64`, what tolerates `bf16`).
+
+Limits to keep in mind: the propagated bounds are first-order (linearized) and worst-case bounds are
+pessimistic (a statistical root-sum-of-squares estimate is closer); hence the stochastic mode beside it.
+Related: the interval/value-range entry above (a lattice for values, this one for their errors).
+
+## Variable precision as algebras, and a deep-zoom Mandelbrot showcase (idea, 2026-10-14)
+
+More `Float` algebras in the stdlib, nothing in the compiler, from lightest to heaviest:
+
+- **Double-double / quad-double** (Bailey's QD): 2 or 4 non-overlapping floats, operations from the
+  error-free transforms (TwoSum, TwoProd via FMA). ~32 / ~64 decimal digits from plain float
+  arithmetic: vectorizes, runs on GPUs. Also double-single (two `f32`) where `f64` is slow (1/64 rate
+  on consumer GPUs).
+- **`BigFloat<BITS>`**: the mantissa a `[u64; BITS / 64]`, the precision a const generic, so no dynamic
+  allocation (stack or registers, GPU-compatible, limb loops unrolled), which MPFR's runtime precision
+  can't offer.
+- **Adaptive precision**: Shewchuk's robust geometric predicates (orientation, in-circle) computed in
+  `f64` with an error bound, escalating to exact expansions only when the bound can't decide. Exact
+  results at nearly plain-`f64` cost; what makes convex hulls and Delaunay triangulations correct on
+  nearly collinear points (the target use cases), written once over `T` with the predicates plugged in
+  by the algebra.
+- Composes with the numerical-error entry above: `--explain precision` finds the line losing digits;
+  raise *that* line to double-double, not the whole program.
+
+**Showcase: a deep-zoom Mandelbrot** (extends `examples/mandelbrot`). `f64` pixelizes around 1e13-1e15
+zoom; famous zooms go past 1e1000. Perturbation theory (K. I. Martin, 2013): one reference orbit `Zₙ`
+in `BigFloat<BITS>`, then each pixel follows only its offset `δₙ₊₁ = 2 Zₙ δₙ + δₙ² + δc` in low
+precision (extended-exponent `f32` on the GPU); refinements: series approximation to skip iterations,
+glitch detection, rebasing (2021). A heterogeneous-computing demo by construction: the sequential
+reference orbit on the CPU, millions of perturbed pixels on the GPU, one program; any depth by changing
+`BITS`.
+
+## Compute-to-display interop on Vulkan: results on screen without a host round trip (idea, 2026-10-14)
+
+Vulkan does compute and graphics on the same device, so a cleave kernel's output can be presented
+without going back through host memory: the kernel writes a buffer or image that is textured or blitted
+into a swapchain directly (a 4K simulation at 60 fps can't afford a GPU → CPU → GPU trip per frame).
+Ways in, Rust side: `cleave-vk` exposes its `VkDevice` and buffer handles to a renderer (`ash`, or
+`wgpu` through its Vulkan interop), or memory shared across devices with `VK_KHR_external_memory`;
+`egui` on top for live controls and plots. Language side: a `Present`/`Display` algebra in the stdlib
+for a `[H, W, 4]` tensor, which the compiler already knows lives on the device.
+
+What it enables: real-time simulations (fluids, particles, N-body) with physics and rendering in one
+loop; the deep-zoom Mandelbrot above driven by the mouse; Karl Sims-style evolving creatures
+(neuroevolution, physics and rendering all on the GPU); a live training dashboard for nanoLM (curves,
+attention maps, samples while it learns).
+
+## Compressed tensors, decompressed per tile inside the kernels that read them (idea, 2026-10-15)
+
+Owning the whole chain means not waiting for a vendor's libraries to support a format. The principle:
+a tensor lives compressed in memory, and decompression is fused into the tile loads of the kernels
+that read it. The tiled matmul already has the stage: global → (vec4) → shared memory → registers →
+compute; the decompression goes between global and shared, the rest of the kernel unchanged.
+
+- **Fixed rate per block**, for random access: each tile finds its bytes without decoding earlier
+  ones. ZFP's fixed-rate mode (Lindstrom, LLNL: 4^d blocks, near-orthogonal transform, bit planes),
+  or block-scaled formats: OCP Microscaling MXFP8/MXFP4 (one shared exponent per 32 values, in
+  hardware on Blackwell), NF4 (QLoRA), int8 with a per-block scale. Blosc (shuffle + LZ4, "faster
+  than memcpy") is the lossless, sequential cousin.
+- **Blocks aligned on the tiles**: the compiler knows `bm`/`bn`/`bk` (the autotuner picks them), so it
+  can align the format to the tiling, or make the format one more autotuning dimension.
+- **Explicit intent**, never a compiler choice: lossy or not, at what tolerance, in the type
+  (`Compressed<Mx<fp8, 32>, f32, N, M>`, `Zfp<f32, rate: 12>`), behind a storage algebra — the same
+  rule as `bf16` (`Dense<f32>` means real f32 everywhere; `Dense<bf16>` lets the backend pick
+  AVX-512 BF16 or cooperative matrices).
+- **Where it pays: memory-bound kernels only.** Optimizer state (Adam's moments, twice the model,
+  read and written every step: 8-bit Adam, Dettmers 2021); activations saved for the backward
+  (compressed on write, ActNN 2021: larger batches or contexts); token-by-token inference and the KV
+  cache; elementwise and norm kernels; stencils on large grids. Not the training matmuls at nanoLM's
+  sizes, which are compute-bound (at cuBLAS parity): there `bf16` is the lever (twice the compute
+  density on tensor cores, half the bytes). Together they cover both sides of the roofline.
+- Needs a roofline model per kernel, which the compiler can compute from the shapes, and a diagnostic
+  saying where compression helps and where it doesn't (memory- vs compute-bound).
+
+Related: "Fewer bits per weight" above (the codebook-quantization form of the same fusion).
+
+## Spectral compression of weights: reorder the free axis, then concentrate energy (idea, 2026-10-15)
+
+Frequency-domain compression needs an axis with a notion of neighborhood: it works on physical fields
+(FNO keeps the low modes), on sequence positions (long convolutions), on images (JPEG's block DCT),
+but not as such on a hidden layer's neuron axis, whose order is arbitrary (permutation symmetry).
+Gradients have a usable structure empirically: DeMo (Peng, Kingma et al., 2024) sends only the
+dominant block-DCT components of each node's momentum, cutting distributed-training communication by
+orders of magnitude (pairs with the DiLoCo direction).
+
+How much the symmetries are worth, for nanoLM's sizes: permutations of a width-768 layer carry
+log2(768!) ≈ 6,250 bits (~780 bytes) per layer, negligible; attention's continuous symmetries
+(`W_q A`, `W_k A^-T` for any invertible `A`, same for `W_v`/`W_o`) are ~2·64² parameters per head,
+~1.6 M of 116 M (~1.4%). The real redundancy is precision (4 bits instead of 32) and low intrinsic
+dimension (Li et al., 2018).
+
+The idea: the neuron order being free, choose it — the permutation that makes the axis smooth
+(neighbouring neurons with similar weights, as Cuthill-McKee renumbers a sparse matrix to shrink its
+bandwidth), then a block DCT can concentrate the energy, the symmetry turned into a degree of freedom.
+Bound to keep in mind: for one matrix the optimal linear energy compaction is the SVD (Eckart-Young,
+the Karhunen-Loève transform), which a DCT can't beat; the DCT's case is practical — no basis to
+store, O(n log n), and blockwise, so decompressible per tile (the compressed-tensors entry above).
+
+The experiment that decides, on an existing checkpoint, CPU only: a few nanoLM matrices (`wq`, the MLP
+projections, `wo`); rows reordered (Fiedler vector of a row-similarity graph, or greedy nearest
+neighbour); the energy captured versus coefficients kept for the SVD (upper bound), the block DCT
+after reordering, the block DCT in the original order, and a random permutation (control); then the
+validation loss of the model rebuilt from each, the only metric that counts. If the reordered DCT
+approaches the SVD curve, the idea holds, with per-tile decompression on top.
+
+## Error-correcting codes in computation: checked matmuls, coded distribution, codes as quantizers (idea, 2026-10-15)
+
+Guardrail first: Shannon's separation theorem — compressing and protecting are separable without loss,
+so adding parity to a coarse encoding *for storage* gains nothing (those bits are better spent on finer
+quantization; quantization error isn't channel noise). Three uses that do work:
+
+- **Codes as quantizers, and parity-only compression.** Treat the raw weight vector as a noisy
+  received word and *decode* it to the nearest codeword: the codeword is the quantized value
+  (trellis-coded quantization, QTIP with Viterbi — see "Fewer bits per weight"). And Slepian-Wolf /
+  Wyner-Ziv: when the decoder already holds correlated side information (a prediction, a previous
+  version, another node's weights), sending only the code's syndrome lets it "correct" its guess into
+  the data — compression with parity alone; a lead for synchronizing nearby weights between nodes
+  (DiLoCo).
+- **Algorithm-based fault tolerance** (Huang and Abraham, 1984): a checksum row and column appended to
+  `A` and `B` propagate through `C = A·B`; checking `C`'s sums costs O(n²) against the product's
+  O(n³), and locates and corrects a single error without recomputing. A real problem at scale: silent
+  data corruption on thousands of GPUs (reported by Meta and Google) spoils whole training runs. Von
+  Neumann's 1956 point again (reliable computation from unreliable parts). The compiler can insert it
+  into matmuls, as an explicit reliability intent (`#[checked]`), with a diagnostic per detected fault.
+- **Coded computing for distribution** (Lee et al., 2017; polynomial codes, Yu et al., 2017): split
+  `A` into k blocks, encode them into n > k with an MDS (Reed-Solomon-like) code, one product per
+  node; any k results reconstruct `C`, so slow or vanished nodes (stragglers, reclaimed spot
+  instances) are erasures to ignore, not waits. Fits heterogeneous or rented machines.
+
+## Learned precision: let training decide where the bits go (idea, 2026-10-15)
+
+A rate-allocation problem: a total bit budget to spread over groups of weights (layers, heads, blocks)
+so as to degrade the loss least. The optimum is reverse water-filling (rate-distortion theory): more
+bits where sensitivity is high, none below a threshold — exactly OFDM/DMT bit loading (DSL, 5G
+adaptive modulation and coding), weight groups as subcarriers, the loss's sensitivity as their SNR.
+
+- **Sensitivity** from curvature: the Hessian, or its Fisher-information approximation (HAWQ, 2019,
+  allocates bits per layer by the Hessian's trace). `grad` gives it; the Fisher form is the same
+  machinery as a Cramér-Rao bound.
+- **Learned by the network itself**, two ways. Differentiable precision: bit widths or quantization
+  steps as trained parameters (LSQ, differentiable quantization), a `λ × bits` term in the loss,
+  gradients through the rounding by the straight-through estimator. Or the Bayesian version, the
+  idea's true ancestor: Hinton and van Camp (1993), *Keeping neural networks simple by minimizing the
+  description length of the weights* — each weight has a learned uncertainty σ (variational
+  inference); a large σ means it needn't be precise (few bits), a small one that it's critical;
+  Louizos et al. (2017), *Bayesian Compression for Deep Learning*, pick each layer's precision from
+  the learned variances (minimum description length).
+- **In cleave**: a `Gaussian<T>` algebra (mean, σ) on the weights is Hinton and van Camp's scheme;
+  the outcome (a precision per group) maps to storage formats per tensor or tile (f32, bf16, fp8,
+  int4, an E8 codebook — the entries above). The user sets the budget (the explicit intent),
+  training finds the allocation. For scientific code, `--explain precision`'s adjoint attribution
+  answers the same question on the rounding side.
+
+## What the adjoint actually reads: store and compute only what matters for the gradient (idea, 2026-10-15)
+
+Two linked intuitions. An activation is a brutal lossy compression (the information-bottleneck view,
+Tishby 2015; its strong "compression phase" claim is disputed, Saxe et al. 2018 tie it to saturating
+activations), so computing precisely what is then crushed is waste: a ReLU discards every negative
+pre-activation, and knowing the sign is enough to know a unit will be zero (Deja Vu 2023 and
+PowerInfer predict active neurons cheaply and skip the rest at inference; *ReLU Strikes Back* 2023:
+ReLU LLMs are >90% sparse in the MLP). And: what isn't in the gradient isn't touched by training.
+
+The generic, compiler-level form: cleave sees the forward and the synthesized backward in one graph,
+so it can answer "what does the adjoint actually read?" and keep only that.
+- A ReLU's backward reads only the sign mask: save 1 bit per element (bit-packed) instead of the f32
+  activation, 32x less, exactly. GELU/SwiGLU need more, rarely all of it.
+- A saved value read only by an insensitive consumer can be stored at reduced precision (ActNN 2021
+  for activations), when the user allows it (the explicit-intent rule), its sensitivity from the
+  adjoint (`--explain precision`'s attribution).
+- Forward work that reaches nothing the gradient touches is dead for training.
+- Gradients themselves can be sparsified (top-k, DeMo's DCT components) with error feedback, the
+  residual reinjected next step — a zero gradient today isn't useless forever (dead ReLUs never come
+  back), so nothing is dropped for good without it.
+
+Liveness and precision analysis applied to the backward's tape: any differentiated program benefits,
+not only nanoLM (memory for larger batches or contexts, bandwidth in the backward).
+
+## `spawn` on the GPU: the semantics aren't defined, and today's behavior is an accident (2026-10-15)
+
+`doc/plan-spawn.md` ("GPU (not implemented; the semantics must already allow it)") states the intent:
+on a GPU, `spawn` is async compute (a task's kernels on a queue of their own, event dependencies
+between queues, the host blocking only when it reads), and the split factor is a per-target setting.
+None of it exists. What happens today on the Vulkan backend: there are no host tasks, so a `spawn`
+comprehension's tasks run one after another (serial elision, legal but chosen by nobody and reported
+nowhere), each with its own stream of small dispatches. Measured on nanoLM (2026-10-15): the same
+gradient as 8 parts is 2.4% slower than as 2, which is why its kernel now says `SPLIT = 2` — a GPU
+tuning written into the program, which costs a CPU build its thread parallelism (8 parts, one per
+core). The program shouldn't have to choose.
+
+To define, then implement:
+- **The mappings, and when each is legal.** (a) Fold into a grid: tasks of the same function on
+  independent inputs of the same shapes become one more grid dimension of the same kernels, as
+  `cleave-fold-loops-into-grids` does for host loops, under its memory cap (`foldedBytes`, grouped by
+  the largest divisor that fits) — `doc/plan-vk-runtime.md`, section 7. (b) Async compute queues, for
+  heterogeneous tasks that can overlap (a compute-bound product beside a bandwidth-bound norm), with
+  stream-ordered allocation. (c) Sequential, as the fallback. (d) Across processors: a task placed on
+  the CPU while another runs on the GPU (the heterogeneous scheduling of `doc/plan-vulkan.md`).
+- **The guarantees that hold whatever the mapping**: no shared mutable state (already the language's
+  rule), results as futures, and a deterministic reduction order where results are combined (today
+  the explicit fixed tree), so the numbers don't depend on the mapping chosen.
+- **The choice made by the compiler and reported** (a placement/parallelism diagnostic: "spawn at
+  line N: folded into the grid by 4 under 64 MiB", "run sequentially: tasks of different shapes"),
+  never a silent default.
+- **The per-target split factor**, if a program still wants one: a `define` set per backend from the
+  build (`build.rs` can already override defines, `Build::define`), not a value written for one
+  target in the source.
+- **Writing split code generically**: a `for` over a `spawn` comprehension's tuple by its variable
+  failed to unroll ("no `impl Index<__Tuple8<...>>`") — fixed 2026-10-15, so nanoLM's sum over its
+  parts can be one loop for any `SPLIT` instead of a term per part. The array form (for folding) is
+  `doc/plan-spawn-gpu.md`, step 2.

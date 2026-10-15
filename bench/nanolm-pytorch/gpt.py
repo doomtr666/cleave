@@ -29,7 +29,7 @@ import torch.nn.functional as F
 from data import CACHE, DEFINES, TRAIN_SEED, VAL_SEED, VOCAB, Corpus, B, T, batch, read_checkpoint
 
 arg = lambda i, default: int(sys.argv[i]) if len(sys.argv) > i else default
-FIRST, ROUNDS, PER_ROUND = arg(1, 0), arg(2, 10), arg(3, 100)
+FIRST, ROUNDS, PER_ROUND, END = arg(1, 0), arg(2, 10), arg(3, 100), arg(4, 0)
 if FIRST != 0:
     sys.exit("the twin starts from gpt_init.ckpt: the first step must be 0 (it doesn't resume)")
 DEVICE = torch.device(os.environ.get("NANOLM_DEVICE", "cpu"))
@@ -37,9 +37,10 @@ if DEVICE.type == "cuda":
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
 D, DH, HIDDEN, LAYERS = (DEFINES[k] for k in ("WIDTH", "HEAD", "HIDDEN", "LAYERS"))
-LR, MUON_LR = 0.001, 0.02
-WARMUP, DECAY_STEPS = DEFINES["WARMUP"], DEFINES["DECAY_STEPS"]
-CLIP = 1.0 * B * T  # `CLIP_PER_ROW * ROWS`: the loss is summed over the rows
+LR, MUON_LR = 0.001, DEFINES["MUON_LR"]
+WARMUP, REWARM_AT, COOLDOWN = DEFINES["WARMUP"], DEFINES["REWARM_AT"], DEFINES["COOLDOWN"]
+ACCUM, VAL_BATCHES = DEFINES["ACCUM"], DEFINES["VAL_BATCHES"]
+CLIP = DEFINES["CLIP_PER_ROW"] * ACCUM * B * T  # the loss is summed over the step's rows
 EPS = 1e-5
 MODEL_DIR = CACHE.parent / f"nanolm2-d{D}-l{LAYERS}-t{T}-v{VOCAB}-bench"
 H = D // DH
@@ -111,11 +112,13 @@ def validation(batches):
     return mean_loss(corpus.val, VAL_SEED, 0, batches)
 
 
-def learning_rate(s, base):
-    if s < WARMUP:
-        return base * (s + 1) / WARMUP
-    t = (s - WARMUP) / (DECAY_STEPS - WARMUP)
-    return base * (1.0 - 0.9 * t) if t < 1.0 else base * 0.1
+def learning_rate(s, base, end=END):
+    since = s - REWARM_AT if REWARM_AT > 0 and s >= REWARM_AT else s
+    warm = base * (since + 1) / WARMUP if since < WARMUP else base
+    if end > 0 and s > end - COOLDOWN:
+        t = (s - (end - COOLDOWN)) / COOLDOWN
+        return warm * (1.0 - 0.9 * t) if t < 1.0 else warm * 0.1
+    return warm
 
 
 # Muon for the dense layers' weight matrices (every `w` of `wq`/`wk`/`wv`/`wo` and the SwiGLU),
@@ -158,24 +161,25 @@ def muon_step(lr):
 # As in cleave, the total (`elapsed`) counts from before the first report, the rounds' minutes
 # from right after it.
 begin = time.perf_counter()
-print(f"step 0: validation {corpus.per_token(validation(4))}, learning rate {learning_rate(0, LR):.6f}")
+print(f"step 0: validation {corpus.per_token(validation(VAL_BATCHES))}, learning rate {learning_rate(0, LR):.6f}")
 start = last = time.perf_counter()
 for r in range(ROUNDS):
     for k in range(PER_ROUND):
         s = r * PER_ROUND + k
-        x, y = on_device(corpus.train, TRAIN_SEED, s)
         for p in params:
             p.grad = None
-        loss(x, y).backward()
+        # `step_grad`: the step's `ACCUM` batches, their gradients summed.
+        for a in range(ACCUM):
+            loss(*on_device(corpus.train, TRAIN_SEED, s * ACCUM + a)).backward()
         torch.nn.utils.clip_grad_norm_(params, CLIP)
         for g in adamw.param_groups:
             g["lr"] = learning_rate(s, LR)
         adamw.step()
         muon_step(learning_rate(s, MUON_LR))
     step = (r + 1) * PER_ROUND
-    # The round's last four training batches, just trained on, as `gpt_train_loss` does.
-    train = mean_loss(corpus.train, TRAIN_SEED, step - 4, 4)
-    val = validation(4)
+    # The next step's first four training batches, not trained on yet, as `gpt_train_loss` does.
+    train = mean_loss(corpus.train, TRAIN_SEED, step * ACCUM, 4)
+    val = validation(VAL_BATCHES)
     now = time.perf_counter()
     print(
         f"step {step}: train {train:.4f}, validation {corpus.per_token(val)}, learning rate {learning_rate(step, LR):.6f}, "
@@ -183,6 +187,6 @@ for r in range(ROUNDS):
         flush=True,
     )
     last = now
-nats = validation(20)
+nats = validation(VAL_BATCHES)
 print(f"transformer: {corpus.per_token(nats)}")
 print(f"elapsed: {time.perf_counter() - begin:.2f}s")

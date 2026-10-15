@@ -12,8 +12,16 @@ include!(concat!(env!("OUT_DIR"), "/kernel_bindings.rs"));
 /// A loss in nats per token, with its equivalent in bits per character (comparable across
 /// tokenizers, and with the character-level model's).
 fn per_token(nats: f32) -> String {
-    let bits_per_char = f64::from(nats) / std::f64::consts::LN_2 / data::chars_per_token();
-    format!("{nats:.4} nats/token ({bits_per_char:.4} bits/char)")
+    format!("{nats:.4} nats/token ({:.4} bits/char)", bits_per_char(nats))
+}
+
+fn bits_per_char(nats: f32) -> f64 {
+    f64::from(nats) / std::f64::consts::LN_2 / data::chars_per_token()
+}
+
+/// `NANOLM_PROFILE=1`: each round's line followed by its time per phase.
+fn profiling() -> bool {
+    std::env::var_os("NANOLM_PROFILE").is_some_and(|v| v != "0")
 }
 
 /// When the previous round ended (or training started), for `round_done`'s timings.
@@ -87,8 +95,28 @@ pub extern "C" fn phase_done(phase: i32) {
 /// checkpoint's format unchanged.
 const STEP_FILE: &str = "gpt.step";
 
+/// One round's line: the step, the tokens trained on so far (every step is
+/// `gpt_step_tokens()` of them), the validation loss with its bits per character, the training
+/// loss (the next step's batches, not trained on yet), the learning rate, then the round's
+/// throughput and the time since the run started.
+fn round_line(step: i32, train: Option<f32>, validation: f32, rate: f32, timing: Option<(f64, f64)>) -> String {
+    let seen = f64::from(step) * f64::from(unsafe { gpt_step_tokens() }) / 1e6;
+    let mut line = format!(
+        "step {step:>6} | {seen:8.1} M tok | val {validation:.4} ({:.4} bpc)",
+        bits_per_char(validation)
+    );
+    if let Some(train) = train {
+        line += &format!(" | train {train:.4}");
+    }
+    line += &format!(" | lr {rate:.2e}");
+    if let Some((tokens_per_second, minutes)) = timing {
+        line += &format!(" | {:5.2} k tok/s | {minutes:6.1} min", tokens_per_second / 1e3);
+    }
+    line
+}
+
 /// Called by the kernel at the end of each training round (and once before the first): the step
-/// reached, the losses, the learning rate; printed with the time per step since the last round.
+/// reached, the losses, the learning rate; printed with the throughput since the last round.
 /// A round's end follows its checkpoint (`train_gpt`): the step is recorded as the checkpoint's.
 #[unsafe(no_mangle)]
 pub extern "C" fn round_done(step: i32, train_loss: f32, validation_loss: f32, rate: f32) {
@@ -96,7 +124,7 @@ pub extern "C" fn round_done(step: i32, train_loss: f32, validation_loss: f32, r
     let mut round = ROUND.lock().unwrap();
     match *round {
         None => {
-            println!("step {step}: validation {}, learning rate {rate:.6}", per_token(validation_loss));
+            println!("{}", round_line(step, None, validation_loss, rate, None));
             mark_phases(now);
             *round = Some((now, now, step));
         }
@@ -104,12 +132,15 @@ pub extern "C" fn round_done(step: i32, train_loss: f32, validation_loss: f32, r
             if let Err(e) = std::fs::write(STEP_FILE, step.to_string()) {
                 eprintln!("cannot record the checkpoint's step in {STEP_FILE}: {e}");
             }
-            let per_step = (now - last).as_secs_f64() * 1000.0 / f64::from((step - last_step).max(1));
-            println!(
-                "step {step}: train {train_loss:.4}, validation {}, learning rate {rate:.6}, {per_step:.0} ms/step, {:.1} min elapsed",
-                per_token(validation_loss),
-                (now - start).as_secs_f64() / 60.0
-            );
+            let tokens = f64::from(step - last_step) * f64::from(unsafe { gpt_step_tokens() });
+            let tokens_per_second = tokens / (now - last).as_secs_f64().max(1e-9);
+            let minutes = (now - start).as_secs_f64() / 60.0;
+            println!("{}", round_line(step, Some(train_loss), validation_loss, rate, Some((tokens_per_second, minutes))));
+            if !profiling() {
+                mark_phases(now);
+                *round = Some((start, now, step));
+                return;
+            }
             // The round's phases, per step; the checkpoint and evaluation ran once, in this call's
             // arguments.
             // Each phase's CPU use: the share of the team's threads busy (CPU time over wall time
@@ -176,15 +207,16 @@ fn main() {
             corpus::alphabet().len(),
             data::chars_per_token()
         );
-        let o = data::offset(data::train().len(), data::TRAIN_SEED, 0, 0);
-        println!("first training window: {:?}", data::bpe().decode(&data::train()[o..o + data::T]));
         if which == "corpus" {
             // Only builds the corpus (downloading what isn't cached yet) and shows it.
+            let o = data::offset(data::train().len(), data::TRAIN_SEED, 0, 0);
+            println!("first training window: {:?}", data::bpe().decode(&data::train()[o..o + data::T]));
             return;
         }
-
-        let nats = unsafe { bigram_baseline(200, 50) };
-        println!("bigram baseline: {}", per_token(nats));
+        if which != "gpt" && which != "bench" {
+            let nats = unsafe { bigram_baseline(200, 50) };
+            println!("bigram baseline: {}", per_token(nats));
+        }
     }
     if which == "bigram" {
         let learned = unsafe { train_bigram(10, 0.05, 1) };
@@ -201,8 +233,9 @@ fn main() {
         unsafe { generate(count, temperature, top_p, seed) };
         println!();
     } else if which == "gpt" || which == "bench" {
-        // `gpt [first_step|resume [rounds [steps_per_round]]]`; a first step above 0 resumes from
-        // `gpt.ckpt`, `resume` at the step it was saved at (`gpt.step`). A first step that isn't
+        // `gpt [first_step|resume [rounds [steps_per_round [end_step]]]]`; a first step above 0
+        // resumes from `gpt.ckpt`, `resume` at the step it was saved at (`gpt.step`). An end step
+        // decays the learning rate toward it (`learning_rate`'s cooldown); without one it stays. A first step that isn't
         // the checkpoint's would replay batches the model has seen, at the schedule's learning
         // rate for another step: refused.
         let arg = |i: usize, default: i32| std::env::args().nth(i).map_or(default, |a| a.parse().expect("an integer"));
@@ -218,9 +251,9 @@ fn main() {
             eprintln!("`gpt.ckpt` was saved at step {saved}, not {first}: resume with `gpt resume` or `gpt {saved}`");
             std::process::exit(2);
         }
-        let (rounds, per_round) = (arg(3, 10), arg(4, 100));
+        let (rounds, per_round, end) = (arg(3, 10), arg(4, 100), arg(5, 0));
         let start = std::time::Instant::now();
-        let nats = unsafe { train_gpt(first, rounds, per_round, 0.001, 1, first > 0) };
+        let nats = unsafe { train_gpt(first, rounds, per_round, 0.001, 1, first > 0, end) };
         println!("transformer: {}", per_token(nats));
         println!("elapsed: {:?}", start.elapsed());
     } else {

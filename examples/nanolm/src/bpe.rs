@@ -249,26 +249,97 @@ fn write_u16(path: &Path, tokens: &[u16]) {
     std::fs::write(path, bytes).unwrap_or_else(|e| panic!("cannot write {}: {e}", path.display()));
 }
 
+/// A file of little-endian `u16`s, read a block at a time (a corpus of billions of tokens, not
+/// twice in memory).
 fn read_u16(path: &Path) -> Vec<u16> {
-    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-    bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect()
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let len = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
+    let mut tokens = Vec::with_capacity(len / 2);
+    let mut block = vec![0u8; 64 << 20];
+    loop {
+        let n = file.read(&mut block).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        if n == 0 {
+            break;
+        }
+        assert!(n % 2 == 0 || tokens.len() * 2 + n == len, "{}: torn read", path.display());
+        tokens.extend(block[..n].chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])));
+    }
+    tokens
+}
+
+/// `path` (character ids) a chunk of about `size` bytes at a time, each cut after a paragraph's
+/// end (a line break: no piece spans two chunks, so encoding chunk by chunk is encoding the whole).
+fn paragraph_chunks(path: &Path, size: usize, mut f: impl FnMut(usize, &[u8])) {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let mut buffer: Vec<u8> = Vec::with_capacity(2 * size);
+    let mut index = 0;
+    loop {
+        let start = buffer.len();
+        buffer.resize(start + size, 0);
+        let n = file.read(&mut buffer[start..]).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        buffer.truncate(start + n);
+        if n == 0 {
+            if !buffer.is_empty() {
+                f(index, &buffer);
+            }
+            return;
+        }
+        // Through the last line break (id 0, `\n`); the rest begins the next chunk.
+        if let Some(end) = buffer.iter().rposition(|&c| c == 0) {
+            f(index, &buffer[..=end]);
+            index += 1;
+            buffer.drain(..=end);
+        }
+    }
+}
+
+/// Whether the tokenized corpus of `vocab` tokens is in `dir`.
+pub fn built(dir: &Path, vocab: usize) -> bool {
+    let out = dir.join(format!("bpe{vocab}"));
+    ["merges.txt", "train.bin", "val.bin"].iter().all(|f| out.join(f).exists())
 }
 
 /// The tokenizer and the tokenized corpus, `(bpe, train, val)`, built on first use from the
-/// character corpus in `dir` (`.cache/french`).
-pub fn load(dir: &Path, vocab: usize, train: &[u8], val: &[u8]) -> (Bpe, Vec<u16>, Vec<u16>) {
+/// character corpus in `dir` (`.cache/french`, `corpus::build`): the merges learned from one 16 MB
+/// chunk of the training text in eight (a gigabyte of the eight, spread over every source), the
+/// text then encoded a 64 MB chunk at a time, straight to disk.
+pub fn load(dir: &Path, vocab: usize) -> (Bpe, Vec<u16>, Vec<u16>) {
     let alphabet = crate::corpus::alphabet();
     let out = dir.join(format!("bpe{vocab}"));
     let (merges, train_path, val_path) = (out.join("merges.txt"), out.join("train.bin"), out.join("val.bin"));
-    if !train_path.exists() || !val_path.exists() || !merges.exists() {
+    if !built(dir, vocab) {
         std::fs::create_dir_all(&out).unwrap_or_else(|e| panic!("cannot create {}: {e}", out.display()));
-        eprintln!("nanolm: learning a {vocab}-token BPE ...");
-        let bpe = Bpe::train(train, &alphabet, vocab);
+        let chars = dir.join("train.bin");
+        let mut sample = Vec::new();
+        paragraph_chunks(&chars, 16 << 20, |k, chunk| {
+            if k % 8 == 0 {
+                sample.extend_from_slice(chunk);
+            }
+        });
+        eprintln!("nanolm: learning a {vocab}-token BPE from {:.1} G characters ...", sample.len() as f64 / 1e9);
+        let bpe = Bpe::train(&sample, &alphabet, vocab);
+        drop(sample);
         bpe.save(&merges);
         eprintln!("nanolm: tokenizing the corpus ...");
-        write_u16(&val_path, &bpe.encode(val));
-        // Written last: its presence means the tokenized corpus is complete.
-        write_u16(&train_path, &bpe.encode(train));
+        let val = std::fs::read(dir.join("val.bin")).unwrap_or_else(|e| panic!("cannot read the validation text: {e}"));
+        write_u16(&val_path, &bpe.encode(&val));
+        let partial = out.join("train.partial");
+        let mut file = std::io::BufWriter::new(
+            std::fs::File::create(&partial).unwrap_or_else(|e| panic!("cannot write {}: {e}", partial.display())),
+        );
+        paragraph_chunks(&chars, 64 << 20, |k, chunk| {
+            use std::io::Write;
+            let bytes: Vec<u8> = bpe.encode(chunk).iter().flat_map(|t| t.to_le_bytes()).collect();
+            file.write_all(&bytes).unwrap_or_else(|e| panic!("cannot write {}: {e}", partial.display()));
+            if (k + 1) % 16 == 0 {
+                eprintln!("nanolm: {} G characters tokenized", (k + 1) * 64 / 1024);
+            }
+        });
+        drop(file);
+        // Renamed last: its presence means the tokenized corpus is complete.
+        std::fs::rename(&partial, &train_path).unwrap_or_else(|e| panic!("cannot write {}: {e}", train_path.display()));
     }
     (Bpe::read(&merges, &alphabet), read_u16(&train_path), read_u16(&val_path))
 }

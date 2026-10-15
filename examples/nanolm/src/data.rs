@@ -29,9 +29,17 @@ struct Corpus {
 static CORPUS: OnceLock<Corpus> = OnceLock::new();
 
 pub fn init(cache_dir: &str) {
-    let (dir, chars, val_chars) = crate::corpus::load(Path::new(cache_dir));
-    let (bpe, train, val) = crate::bpe::load(&dir, VOCAB, &chars, &val_chars);
-    let chars_per_token = val_chars.len() as f64 / val.len() as f64;
+    // The character corpus only when neither it nor the tokenized one is there yet: another
+    // vocabulary only learns new merges from the characters (`train.bin` is renamed into place
+    // last, so its presence means the character corpus is complete).
+    let dir = Path::new(cache_dir).join("french");
+    let chars_built = dir.join("train.bin").exists() && dir.join("val.bin").exists();
+    if !crate::bpe::built(&dir, VOCAB) && !chars_built {
+        crate::corpus::build(Path::new(cache_dir));
+    }
+    let (bpe, train, val) = crate::bpe::load(&dir, VOCAB);
+    let val_chars = std::fs::metadata(dir.join("val.bin")).map(|m| m.len()).unwrap_or(0);
+    let chars_per_token = val_chars as f64 / val.len() as f64;
     CORPUS
         .set(Corpus { bpe, train, val, chars_per_token })
         .unwrap_or_else(|_| panic!("data::init called twice"));

@@ -147,15 +147,25 @@ define BATCH: i32 = 8;
 define CONTEXT: i32 = 1024;
 define ROWS: i32 = BATCH * CONTEXT;
 // Tokens: `bpe.rs`'s vocabulary, the 104 characters and the merges learned over them.
-define VOCAB: i32 = 4096;
+define VOCAB: i32 = 8192;
 
-// Linear warmup over `WARMUP` steps, then a linear decay to a tenth of the rate at `DECAY_STEPS`,
-// flat after: a function of the step alone, so a resumed run continues the same schedule. Muon's
-// rate follows the same schedule from its own base.
+// Batches per optimizer step: their gradients summed, a step of `ACCUM * ROWS` tokens (a larger
+// batch, less noise, in the memory of one). Step `s` trains on batches `s * ACCUM ..`.
+define ACCUM: i32 = 8;
+
+// Warmup, stable, decay: a linear warmup over `WARMUP` steps, the base rate held after it, and
+// for a run given an end step, a linear decay to a tenth over the `COOLDOWN` steps before it.
+// A function of the step (and the end) alone, so a resumed run continues the same schedule.
+// `REWARM_AT` starts a second warmup: the step a run trained under an earlier, decaying
+// schedule resumed at (0: none). Muon's rate follows the same schedule from its own base.
 define WARMUP: i32 = 200;
-define DECAY_STEPS: i32 = 20000;
-define MUON_LR: f32 = 0.02;
-// The gradient's norm is clipped at 1 per row: the loss is summed over the batch's `ROWS`.
+define REWARM_AT: i32 = 0;
+define COOLDOWN: i32 = 1000;
+define MUON_LR: f32 = 0.01;
+// Validation batches per evaluation: fixed windows of the held-out books (`data.rs`'s
+// `VAL_SEED`), the same at every round, so rounds compare without sampling noise between them.
+define VAL_BATCHES: i32 = 16;
+// The gradient's norm is clipped at 1 per row: the loss is summed over the step's rows.
 define CLIP_PER_ROW: f32 = 1.0;
 
 struct Block {
@@ -176,6 +186,8 @@ impl Trainable<Gpt> {}
 // The model's size, for the host to name its checkpoint directory (`main.rs`).
 export fn gpt_width() -> i32 { WIDTH }
 export fn gpt_layers() -> i32 { LAYERS }
+// Tokens per optimizer step, for the host's throughput report.
+export fn gpt_step_tokens() -> i32 { ACCUM * ROWS }
 
 fn ones() -> Tensor<f32, 1, WIDTH> { [for i in 0..1: [for j in 0..WIDTH: 1.0]] }
 
@@ -218,8 +230,10 @@ fn gpt_logits<const N: i32>(x: [i32; N], m: Gpt) -> Tensor<f32, N, VOCAB> {
 // micro-batches of whole sequences, each one's gradient computed in its own
 // task, the gradients summed. The loss is a sum over rows, so the sum of the
 // parts' gradients is the batch's gradient (up to the order of the float
-// additions).
-define SPLIT: i32 = 8;
+// additions). 2 for the GPU: the Vulkan backend has no host tasks, so the parts run one after
+// another, and fewer, larger ones are fewer dispatches (+2.4% over 8, 2026-10-15; device memory
+// peak 9.4 GB of 12). A CPU build wants one part per thread instead (8).
+define SPLIT: i32 = 2;
 define MICRO: i32 = ROWS / SPLIT;
 
 fn gpt_loss_micro(x: [i32; MICRO], y: [i32; MICRO], m: Gpt) -> f32 {
@@ -233,8 +247,11 @@ fn micro(a: [i32; ROWS], j: i32) -> [i32; MICRO] { [for k in 0..MICRO: a[j * MIC
 
 fn parallel_grad(x: [i32; ROWS], y: [i32; ROWS], m: Gpt) -> Gpt {
     let g = [for j in 0..SPLIT: spawn gpt_grad_micro(micro(x, j), micro(y, j), m)];
-    // A balanced tree, in a fixed order: the same result whatever the thread count.
-    accumulate(accumulate(accumulate(g[0], g[1]), accumulate(g[2], g[3])), accumulate(accumulate(g[4], g[5]), accumulate(g[6], g[7])))
+    // In a fixed order, whatever the thread count: the same result. The parts are a tuple, so the
+    // loop unrolls (`doc/plan-compile-time-sequences.md`), one term per part of `SPLIT`.
+    let mut acc = g[0];
+    for j in 1..SPLIT { acc = accumulate(acc, g[j]); };
+    acc
 }
 
 // A batch's summed loss, its micro-batches evaluated in parallel as the gradient's are, summed in
@@ -252,29 +269,39 @@ fn gpt_validation_loss(m: Gpt, batches: i32) -> f32 {
     (total / (batches * ROWS).to()).to()
 }
 
-// The loss on training batches `first..first + batches` (the round's last ones, just trained on):
-// next to the validation loss, whether the model under- or over-fits.
+// The loss on training batches `first..first + batches` (the next step's, not trained on yet):
+// next to the validation loss, how the training text and the held-out books differ.
 fn gpt_train_loss(m: Gpt, first: i32, batches: i32) -> f32 {
     let mut total: f64 = 0.0;
     for s in first..first + batches { total = total + parallel_loss(train_inputs(s), train_targets(s), m); };
     (total / (batches * ROWS).to()).to()
 }
 
-fn learning_rate(s: i32, base: f32) -> f32 {
-    if s < WARMUP {
-        base * (s + 1).to() / WARMUP.to()
+// Step `s`'s rate from `base`, for a run ending at step `end` (0: no end, no decay).
+fn learning_rate(s: i32, base: f32, end: i32) -> f32 {
+    let since = if REWARM_AT > 0 and s >= REWARM_AT { s - REWARM_AT } else { s };
+    let warm = if since < WARMUP { base * (since + 1).to() / WARMUP.to() } else { base };
+    if end > 0 and s > end - COOLDOWN {
+        let t: f32 = (s - (end - COOLDOWN)).to() / COOLDOWN.to();
+        if t < 1.0 { warm * (1.0 - 0.9 * t) } else { warm * 0.1 }
     } else {
-        let t: f32 = (s - WARMUP).to() / (DECAY_STEPS - WARMUP).to();
-        if t < 1.0 { base * (1.0 - 0.9 * t) } else { base * 0.1 }
+        warm
     }
 }
 
 // Step `s`'s optimizer: Muon on the hidden matrices, AdamW (base rate `lr`) on the rest.
-fn optimizer(s: i32, lr: f32) -> Muon {
+fn optimizer(s: i32, lr: f32, end: i32) -> Muon {
     Muon(
-        lr: learning_rate(s, MUON_LR), momentum: 0.95, weight_decay: 0.0,
-        adamw: AdamW(lr: learning_rate(s, lr), beta1: 0.9, beta2: 0.95, eps: 0.00000001, weight_decay: 0.0)
+        lr: learning_rate(s, MUON_LR, end), momentum: 0.95, weight_decay: 0.0,
+        adamw: AdamW(lr: learning_rate(s, lr, end), beta1: 0.9, beta2: 0.95, eps: 0.00000001, weight_decay: 0.0)
     )
+}
+
+// Step `s`'s gradient: its `ACCUM` batches', summed.
+fn step_grad(s: i32, m: Gpt) -> Gpt {
+    let mut g = parallel_grad(train_inputs(s * ACCUM), train_targets(s * ACCUM), m);
+    for a in 1..ACCUM { g = accumulate(g, parallel_grad(train_inputs(s * ACCUM + a), train_targets(s * ACCUM + a), m)); };
+    g
 }
 
 // The end of a round, for the host to report with timings (`main.rs`).
@@ -287,37 +314,38 @@ extern fn phase_done(phase: i32);
 // steps starting at step `first` (batches and learning rates are functions of the step, so a
 // resumed run continues the same sequence), checkpointing the model, optimizer state and random
 // generator to `gpt.ckpt` after each round. Checkpoints live in the working directory, one per
-// model size (`main.rs`). `lr` is AdamW's base rate, the one reported.
-export fn train_gpt(first: i32, rounds: i32, per_round: i32, lr: f32, seed: i64, resume: bool) -> f32 {
+// model size (`main.rs`). `lr` is AdamW's base rate, the one reported; `end` the step the
+// schedule decays toward (0: none).
+export fn train_gpt(first: i32, rounds: i32, per_round: i32, lr: f32, seed: i64, resume: bool, end: i32) -> f32 {
     rand_seed(seed);
-    let clip: f32 = CLIP_PER_ROW * ROWS.to();
+    let clip: f32 = CLIP_PER_ROW * (ACCUM * ROWS).to();
     let fresh = new_gpt();
     let mut m = fresh;
-    let mut state = init_state(optimizer(first, lr), fresh);
+    let mut state = init_state(optimizer(first, lr, end), fresh);
     if resume {
-        let (rm, rs, rseed) = restore("gpt.ckpt", (fresh, init_state(optimizer(first, lr), fresh), 0:i64));
+        let (rm, rs, rseed) = restore("gpt.ckpt", (fresh, init_state(optimizer(first, lr, end), fresh), 0:i64));
         m = rm;
         state = rs;
         rand_seed(rseed);
     } else {
         save("gpt_init.ckpt", m);
     };
-    round_done(first, 0.0, gpt_validation_loss(m, 4), learning_rate(first, lr));
+    round_done(first, 0.0, gpt_validation_loss(m, VAL_BATCHES), learning_rate(first, lr, end));
     for r in 0..rounds {
         for k in 0..per_round {
             let s = first + r * per_round + k;
-            let raw = parallel_grad(train_inputs(s), train_targets(s), m);
+            let raw = step_grad(s, m);
             phase_done(0);
             let g = clip_grad_norm(raw, clip);
             phase_done(1);
-            (m, state) = step(optimizer(s, lr), m, g, state);
+            (m, state) = step(optimizer(s, lr, end), m, g, state);
             phase_done(2);
         };
         save("gpt.ckpt", (m, state, rand_state()));
         let next = first + (r + 1) * per_round;
-        round_done(next, gpt_train_loss(m, next - 4, 4), gpt_validation_loss(m, 4), learning_rate(next, lr));
+        round_done(next, gpt_train_loss(m, next * ACCUM, 4), gpt_validation_loss(m, VAL_BATCHES), learning_rate(next, lr, end));
     };
-    gpt_validation_loss(m, 20)
+    gpt_validation_loss(m, VAL_BATCHES)
 }
 
 // ------------------------------------------------------------------ generation
@@ -352,7 +380,7 @@ fn decode_block(x: Tensor<f32, 1, WIDTH>, b: Block, kc: Tensor<f32, CONTEXT, WID
 // tokens fed in, then each drawn one.
 export fn generate(count: i32, temperature: f32, top_p: f32, seed: i64) -> i32 {
     let fresh = new_gpt();
-    let (m, _, _) = restore("gpt.ckpt", (fresh, init_state(optimizer(0, 0.001), fresh), 0:i64));
+    let (m, _, _) = restore("gpt.ckpt", (fresh, init_state(optimizer(0, 0.001, 0), fresh), 0:i64));
     rand_seed(seed);
     let prompt = prompt_ids();
     let len = prompt_len();

@@ -2845,6 +2845,13 @@ static int64_t cleaveCooperativeRowsOf128(MlirOperation op) { return cleaveCoope
 // staged in workgroup memory.
 struct ProductTiling {
   int64_t bm, bn, bk, tm, tn;
+  // Which operands are read from device memory 4 elements at a time
+  // (`vector<4xf32>` loads), where they can be: bit 1 those whose rows are
+  // contiguous, bit 2 those whose `k` is.
+  int64_t vec = 0;
+  // Whether workgroup memory holds two slices, the next one stored while the
+  // current one is computed with: one barrier a slice instead of two.
+  int64_t db = 0;
   int64_t threads() const { return (bm / tm) * (bn / tn); }
   // Whether it can compute an `m` x `n` product over `k`: tiles dividing it,
   // each thread a whole block and a whole share of each slice's loads, a
@@ -2854,16 +2861,16 @@ struct ProductTiling {
     if (bm <= 0 || bn <= 0 || bk <= 0 || tm <= 0 || tn <= 0 || bm % tm != 0 || bn % tn != 0)
       return false;
     int64_t t = threads();
-    int64_t shared = 4 * bk * ((bm + 4) + (bn + 4));
+    int64_t shared = (db ? 2 : 1) * 4 * bk * ((bm + 4) + (bn + 4));
     return m % bm == 0 && n % bn == 0 && k % bk == 0 && t >= 32 && t <= 1024 && (bm * bk) % t == 0 &&
            (bn * bk) % t == 0 && shared <= 48 * 1024;
   }
 };
 
-// `CLEAVE_GPU_MATMUL=bm,bn,bk,tm,tn,split` (read at compile time): the
-// tiling and split of every product it fits (`ProductTiling::fits`), split 0
-// chosen as without it: what a tuner tries one configuration after another
-// (`bench/gpu_matmul/tune.rs`).
+// `CLEAVE_GPU_MATMUL=bm,bn,bk,tm,tn,split[,vec[,db]]` (read at compile time):
+// the tiling and split of every product it fits (`ProductTiling::fits`),
+// split 0 chosen as without it: what a tuner tries one configuration after
+// another (`bench/gpu_matmul/tune.rs`).
 struct ProductConfig {
   ProductTiling tiling;
   int64_t split;
@@ -2882,9 +2889,10 @@ static std::optional<ProductConfig> forcedProductConfig() {
         return std::nullopt;
       values.push_back(value);
     }
-    if (values.size() != 6)
+    if (values.size() < 6 || values.size() > 8)
       return std::nullopt;
-    return ProductConfig{{values[0], values[1], values[2], values[3], values[4]}, values[5]};
+    values.resize(8, 0);
+    return ProductConfig{{values[0], values[1], values[2], values[3], values[4], values[6], values[7]}, values[5]};
   }();
   return config;
 }
@@ -2892,7 +2900,8 @@ static std::optional<ProductConfig> forcedProductConfig() {
 // The tuned products' table (`matmul_table.inc`, written by
 // `bench/gpu_matmul/tune.rs`, or the file `CLEAVE_GPU_MATMUL_TABLE` names at
 // compile time): the fastest configuration measured for each shape and
-// layout (whether `k` is contiguous in A and in B).
+// layout (whether `k` is contiguous in A and in B), `vec` and `db` last (0
+// when left out).
 static const char *const kTunedProducts =
 #include "matmul_table.inc"
     ;
@@ -2914,14 +2923,15 @@ static const std::vector<TunedProduct> &tunedProducts() {
     for (StringRef line : lines) {
       SmallVector<StringRef> fields;
       line.trim().split(fields, ' ', -1, /*KeepEmpty=*/false);
-      if (fields.size() != 11)
+      if (fields.size() < 11 || fields.size() > 13)
         continue;
-      int64_t v[11];
+      int64_t v[13] = {};
       bool bad = false;
-      for (int i = 0; i < 11; ++i)
+      for (size_t i = 0; i < fields.size(); ++i)
         bad |= fields[i].getAsInteger(10, v[i]);
       if (!bad)
-        entries.push_back({v[0], v[1], v[2], v[3] != 0, v[4] != 0, {{v[5], v[6], v[7], v[8], v[9]}, v[10]}});
+        entries.push_back(
+            {v[0], v[1], v[2], v[3] != 0, v[4] != 0, {{v[5], v[6], v[7], v[8], v[9], v[11], v[12]}, v[10]}});
     }
     return entries;
   }();
@@ -3270,7 +3280,8 @@ static int64_t cleaveTileMatmulsForGpu(MlirOperation op) {
     if (debuggingParallelization()) {
       std::optional<DirectUses> cUses = directUses(c, product);
       llvm::errs() << "cleave-tile-matmuls-for-gpu: " << func.getName() << ": " << m << "x" << n << "x" << k << " by "
-                   << bm << "," << bn << "," << bk << "," << tm << "," << tn << "," << split << ", "
+                   << bm << "," << bn << "," << bk << "," << tm << "," << tn << "," << split << ","
+                   << tiling->vec << "," << tiling->db << ", "
                    << llvm::count(liveTiles, false) << " dead tiles of " << tilesM * tilesN << " (result "
                    << (cUses ? "read by loads only" : "used otherwise") << "), "
                    << (liveK.empty() ? "no" : "some") << " zero slices\n";
@@ -3297,9 +3308,19 @@ static int64_t cleaveTileMatmulsForGpu(MlirOperation op) {
     Attribute workgroup = spirv::StorageClassAttr::get(ctx, spirv::StorageClass::Workgroup);
     const int64_t aLanes = tm % 4 == 0 && (bk * bm / 4) % threads == 0 ? 4 : 1;
     const int64_t bLanes = tn % 4 == 0 && (bk * bn / 4) % threads == 0 ? 4 : 1;
+    const bool doubled = tiling->db != 0;
     auto sharedType = [&](Type element, int64_t rows, int64_t lanes) {
       Type stored = lanes > 1 ? Type(VectorType::get({lanes}, element)) : element;
-      return MemRefType::get({bk, rows / lanes + 1}, stored, MemRefLayoutAttrInterface{}, workgroup);
+      SmallVector<int64_t> shape{bk, rows / lanes + 1};
+      if (doubled)
+        shape.insert(shape.begin(), 2);
+      return MemRefType::get(shape, stored, MemRefLayoutAttrInterface{}, workgroup);
+    };
+    // An element of workgroup memory: in slice `buffer` (null when single).
+    auto cell = [&](Value buffer, Value kk, Value group) -> SmallVector<Value> {
+      if (buffer)
+        return {buffer, kk, group};
+      return {kk, group};
     };
     auto aShared = sharedType(aType.getElementType(), bm, aLanes);
     auto bShared = sharedType(bType.getElementType(), bn, bLanes);
@@ -3312,6 +3333,32 @@ static int64_t cleaveTileMatmulsForGpu(MlirOperation op) {
       partials = memref::AllocOp::create(builder, loc, MemRefType::get({split, m, n}, cElement));
       discardContents(builder, loc, partials, module);
     }
+    // Device memory read 4 elements at a time (`tiling->vec`) along the
+    // operand's contiguous dimension, its workgroup memory holding groups of
+    // 4 rows: a `vector<4xf32>` view of its buffer, one load for 4 (a cast,
+    // which `cleave-lower-gpu-launches` binds as the memory it views). Rows
+    // contiguous (B of `x W`, both of `x^T u`): a load is a group, stored as
+    // it came. `k` contiguous (A of `x W`, both of `x W^T`): a thread loads 4
+    // rows' 4 `k`s and stores them transposed, 4 groups of 4 rows, which
+    // takes its share of the slice in blocks of 16 (`quads`).
+    auto rowsOf = [&](OpOperand *operand) { return operand == a ? bm : bn; };
+    auto quads = [&](OpOperand *operand) {
+      return product.getMatchingIndexingMap(operand).getDimPosition(1) == dimK;
+    };
+    auto vectorView = [&](OpOperand *operand, int64_t lanes) -> Value {
+      if (!(tiling->vec & (quads(operand) ? 2 : 1)) || lanes != 4 ||
+          (quads(operand) && (bk % 4 != 0 || (rowsOf(operand) * bk) % (16 * threads) != 0)))
+        return {};
+      auto type = cast<MemRefType>(operand->get().getType());
+      if (type.getRank() != 2 || !type.getLayout().isIdentity() || !type.getElementType().isF32() ||
+          type.getShape()[1] % 4 != 0)
+        return {};
+      auto viewType = MemRefType::get({type.getShape()[0], type.getShape()[1] / 4},
+                                      VectorType::get({4}, type.getElementType()));
+      return UnrealizedConversionCastOp::create(builder, loc, TypeRange{viewType}, ValueRange{operand->get()})
+          .getResult(0);
+    };
+    Value aView = vectorView(a, aLanes), bView = vectorView(b, bLanes);
     auto launch = gpu::LaunchOp::create(builder, loc, constant(builder, n / bn), constant(builder, m / bm),
                                         constant(builder, split), constant(builder, threadsX),
                                         constant(builder, threadsY), one,
@@ -3379,8 +3426,37 @@ static int64_t cleaveTileMatmulsForGpu(MlirOperation op) {
     auto load = [&](OpBuilder &at, OpOperand *operand, unsigned outer, Value origin, int64_t rows, int64_t lanes,
                     Value k0) {
       SmallVector<Value> values;
+      Value view = operand == a ? aView : bView;
+      if (view && quads(operand)) {
+        // Block `t + i * threads`: rows `4 * (block / (bk / 4))`, `k`s
+        // `4 * (block % (bk / 4))`, neighbouring threads along `k`; its 16
+        // values by `k`, then row.
+        for (int64_t i = 0; i < rows * bk / 16 / threads; ++i) {
+          Value block = add(at, tid, constant(at, i * threads));
+          Value kq = arith::RemUIOp::create(at, loc, block, constant(at, bk / 4));
+          Value rq = arith::DivUIOp::create(at, loc, block, constant(at, bk / 4));
+          Value quad = add(at, arith::DivUIOp::create(at, loc, k0, constant(at, 4)), kq);
+          SmallVector<Value> reads;
+          for (int64_t lane = 0; lane < 4; ++lane) {
+            Value row = add(at, origin, add(at, mul(at, rq, 4), constant(at, lane)));
+            reads.push_back(memref::LoadOp::create(at, loc, view, indicesOf(operand, {{outer, row}, {dimK, quad}})));
+          }
+          for (int64_t j = 0; j < 4; ++j)
+            for (int64_t lane = 0; lane < 4; ++lane)
+              values.push_back(vector::ExtractOp::create(at, loc, reads[lane], ArrayRef<int64_t>{j}).getResult());
+        }
+        return values;
+      }
       for (int64_t r = 0; r < rows * bk / lanes / threads; ++r) {
         auto [kk, group] = slot(at, operand, rows, lanes, r);
+        if (view) {
+          // The group's 4 rows in one load from the view, taken apart.
+          Value quad = add(at, arith::DivUIOp::create(at, loc, origin, constant(at, 4)), group);
+          Value read = memref::LoadOp::create(at, loc, view, indicesOf(operand, {{outer, quad}, {dimK, add(at, k0, kk)}}));
+          for (int64_t lane = 0; lane < lanes; ++lane)
+            values.push_back(vector::ExtractOp::create(at, loc, read, ArrayRef<int64_t>{lane}).getResult());
+          continue;
+        }
         for (int64_t lane = 0; lane < lanes; ++lane) {
           Value row = add(at, mul(at, group, lanes), constant(at, lane));
           values.push_back(memref::LoadOp::create(
@@ -3390,8 +3466,23 @@ static int64_t cleaveTileMatmulsForGpu(MlirOperation op) {
       }
       return values;
     };
-    auto store = [&](OpBuilder &at, OpOperand *operand, Value shared, int64_t rows, int64_t lanes,
+    auto store = [&](OpBuilder &at, OpOperand *operand, Value shared, Value buffer, int64_t rows, int64_t lanes,
                      ValueRange values) {
+      if ((operand == a ? aView : bView) && quads(operand)) {
+        // `load`'s blocks: each `k`'s 4 rows a group.
+        Type element = values[0].getType();
+        for (int64_t i = 0; i < rows * bk / 16 / threads; ++i) {
+          Value block = add(at, tid, constant(at, i * threads));
+          Value kq = arith::RemUIOp::create(at, loc, block, constant(at, bk / 4));
+          Value rq = arith::DivUIOp::create(at, loc, block, constant(at, bk / 4));
+          for (int64_t j = 0; j < 4; ++j) {
+            Value group = vector::FromElementsOp::create(at, loc, VectorType::get({4}, element),
+                                                         values.slice(i * 16 + j * 4, 4));
+            memref::StoreOp::create(at, loc, group, shared, cell(buffer, add(at, mul(at, kq, 4), constant(at, j)), rq));
+          }
+        }
+        return;
+      }
       for (int64_t r = 0; r < rows * bk / lanes / threads; ++r) {
         auto [kk, group] = slot(at, operand, rows, lanes, r);
         ValueRange elements = values.slice(r * lanes, lanes);
@@ -3399,17 +3490,17 @@ static int64_t cleaveTileMatmulsForGpu(MlirOperation op) {
                                        at, loc, VectorType::get({lanes}, elements[0].getType()), elements)
                                        .getResult()
                                  : elements[0];
-        memref::StoreOp::create(at, loc, stored, shared, ValueRange{kk, group});
+        memref::StoreOp::create(at, loc, stored, shared, cell(buffer, kk, group));
       }
     };
     // This thread's `count` values of a row of workgroup memory: its groups
     // (`group * threadsAlong + t`), each `lanes` wide, taken apart.
-    auto readRow = [&](OpBuilder &at, Value shared, Value kk, Value t, int64_t threadsAlong, int64_t lanes,
-                       int64_t count) {
+    auto readRow = [&](OpBuilder &at, Value shared, Value buffer, Value kk, Value t, int64_t threadsAlong,
+                       int64_t lanes, int64_t count) {
       SmallVector<Value> values;
       for (int64_t group = 0; group < count / lanes; ++group) {
         Value read = memref::LoadOp::create(at, loc, shared,
-                                            ValueRange{kk, add(at, t, constant(at, group * threadsAlong))});
+                                            cell(buffer, kk, add(at, t, constant(at, group * threadsAlong))));
         for (int64_t lane = 0; lane < lanes; ++lane)
           values.push_back(lanes > 1 ? vector::ExtractOp::create(at, loc, read, ArrayRef<int64_t>{lane}).getResult()
                                      : read);
@@ -3444,47 +3535,99 @@ static int64_t cleaveTileMatmulsForGpu(MlirOperation op) {
       kEnd = arith::MinUIOp::create(kb, loc, kEnd, byRow([](auto range) { return range.second; }));
     }
     Value kLoad = liveK.empty() ? kFirst : arith::MinUIOp::create(kb, loc, kFirst, constant(kb, k - bk)).getResult();
-    SmallVector<Value> carried(initial);
-    for (Value v : load(kb, a, dimM, m0, bm, aLanes, kLoad))
-      carried.push_back(v);
-    for (Value v : load(kb, b, dimN, n0, bn, bLanes, kLoad))
-      carried.push_back(v);
     const size_t accumulators = initial.size();
-    auto outerLoop = scf::ForOp::create(
-        kb, loc, kFirst, kEnd, constant(kb, bk), carried,
-        [&](OpBuilder &lb, Location, Value k0, ValueRange inflow) {
-          ValueRange accumulated = inflow.take_front(accumulators);
-          ValueRange aSlice = inflow.slice(accumulators, aCount), bSlice = inflow.drop_front(accumulators + aCount);
-          store(lb, a, as, bm, aLanes, aSlice);
-          store(lb, b, bs, bn, bLanes, bSlice);
-          gpu::BarrierOp::create(lb, loc);
-          Value next = arith::MinUIOp::create(lb, loc, add(lb, k0, constant(lb, bk)),
-                                              arith::SubIOp::create(lb, loc, kEnd, constant(lb, bk)));
-          SmallVector<Value> aNext = load(lb, a, dimM, m0, bm, aLanes, next),
-                             bNext = load(lb, b, dimN, n0, bn, bLanes, next);
-          // The slice's `bk` steps unrolled: straight-line code the driver's
-          // compiler schedules as a whole, no loop carrying `tm * tn` values.
-          SmallVector<Value> acc(accumulated.begin(), accumulated.end());
-          for (int64_t step = 0; step < bk; ++step) {
-            Value kk = constant(lb, step);
-            SmallVector<Value> aValues = readRow(lb, as, kk, ty, threadsY, aLanes, tm);
-            SmallVector<Value> bValues = readRow(lb, bs, kk, tx, threadsX, bLanes, tn);
-            for (int64_t i = 0; i < tm; ++i)
-              for (int64_t j = 0; j < tn; ++j) {
-                IRMapping mapping;
-                mapping.map(aArg, aValues[i]);
-                mapping.map(bArg, bValues[j]);
-                mapping.map(cArg, acc[i * tn + j]);
-                for (Operation &inner : body->without_terminator())
-                  lb.clone(inner, mapping);
-                acc[i * tn + j] = mapping.lookupOrDefault(yielded);
-              }
+    // The slice's `bk` steps unrolled, read from workgroup memory `buffer`:
+    // straight-line code the driver's compiler schedules as a whole, no loop
+    // carrying `tm * tn` values.
+    auto compute = [&](OpBuilder &lb, Value buffer, SmallVector<Value> &acc) {
+      for (int64_t step = 0; step < bk; ++step) {
+        Value kk = constant(lb, step);
+        SmallVector<Value> aValues = readRow(lb, as, buffer, kk, ty, threadsY, aLanes, tm);
+        SmallVector<Value> bValues = readRow(lb, bs, buffer, kk, tx, threadsX, bLanes, tn);
+        for (int64_t i = 0; i < tm; ++i)
+          for (int64_t j = 0; j < tn; ++j) {
+            IRMapping mapping;
+            mapping.map(aArg, aValues[i]);
+            mapping.map(bArg, bValues[j]);
+            mapping.map(cArg, acc[i * tn + j]);
+            for (Operation &inner : body->without_terminator())
+              lb.clone(inner, mapping);
+            acc[i * tn + j] = mapping.lookupOrDefault(yielded);
           }
-          gpu::BarrierOp::create(lb, loc);
-          acc.append(aNext.begin(), aNext.end());
-          acc.append(bNext.begin(), bNext.end());
-          scf::YieldOp::create(lb, loc, acc);
-        });
+      }
+    };
+    // The slice after `k0`'s, never past the reduction's end (the last
+    // iteration loads its own again).
+    auto nextOf = [&](OpBuilder &lb, Value k0) -> Value {
+      return arith::MinUIOp::create(lb, loc, add(lb, k0, constant(lb, bk)),
+                                    arith::SubIOp::create(lb, loc, kEnd, constant(lb, bk)));
+    };
+    scf::ForOp outerLoop;
+    if (doubled) {
+      // Two slices in workgroup memory (`tiling->db`), one barrier a slice:
+      // the first stored before the loop, the second loaded into registers;
+      // each iteration stores the slice it came with into the other half,
+      // loads the one after into registers (carried by the loop, so that the
+      // driver's compiler can't sink the loads past the arithmetic hiding
+      // their latency), computes with the current half, and waits once:
+      // every thread's stores seen before the next iteration reads them,
+      // its reads of this half done before the iteration after overwrites it.
+      Value zero = constant(kb, 0);
+      store(kb, a, as, zero, bm, aLanes, load(kb, a, dimM, m0, bm, aLanes, kLoad));
+      store(kb, b, bs, zero, bn, bLanes, load(kb, b, dimN, n0, bn, bLanes, kLoad));
+      Value secondLoad = arith::MinUIOp::create(kb, loc, add(kb, kLoad, constant(kb, bk)), constant(kb, k - bk));
+      SmallVector<Value> carried(initial);
+      for (Value v : load(kb, a, dimM, m0, bm, aLanes, secondLoad))
+        carried.push_back(v);
+      for (Value v : load(kb, b, dimN, n0, bn, bLanes, secondLoad))
+        carried.push_back(v);
+      gpu::BarrierOp::create(kb, loc);
+      outerLoop = scf::ForOp::create(
+          kb, loc, kFirst, kEnd, constant(kb, bk), carried,
+          [&](OpBuilder &lb, Location, Value k0, ValueRange inflow) {
+            ValueRange accumulated = inflow.take_front(accumulators);
+            ValueRange aSlice = inflow.slice(accumulators, aCount), bSlice = inflow.drop_front(accumulators + aCount);
+            Value index = arith::DivUIOp::create(lb, loc, arith::SubIOp::create(lb, loc, k0, kFirst), constant(lb, bk));
+            Value current = arith::RemUIOp::create(lb, loc, index, constant(lb, 2));
+            Value other = arith::SubIOp::create(lb, loc, constant(lb, 1), current);
+            store(lb, a, as, other, bm, aLanes, aSlice);
+            store(lb, b, bs, other, bn, bLanes, bSlice);
+            Value after = nextOf(lb, nextOf(lb, k0));
+            SmallVector<Value> aAfter = load(lb, a, dimM, m0, bm, aLanes, after),
+                               bAfter = load(lb, b, dimN, n0, bn, bLanes, after);
+            SmallVector<Value> acc(accumulated.begin(), accumulated.end());
+            compute(lb, current, acc);
+            gpu::BarrierOp::create(lb, loc);
+            acc.append(aAfter.begin(), aAfter.end());
+            acc.append(bAfter.begin(), bAfter.end());
+            scf::YieldOp::create(lb, loc, acc);
+          });
+    } else {
+      // Double-buffered through registers (above).
+      SmallVector<Value> carried(initial);
+      for (Value v : load(kb, a, dimM, m0, bm, aLanes, kLoad))
+        carried.push_back(v);
+      for (Value v : load(kb, b, dimN, n0, bn, bLanes, kLoad))
+        carried.push_back(v);
+      outerLoop = scf::ForOp::create(
+          kb, loc, kFirst, kEnd, constant(kb, bk), carried,
+          [&](OpBuilder &lb, Location, Value k0, ValueRange inflow) {
+            ValueRange accumulated = inflow.take_front(accumulators);
+            ValueRange aSlice = inflow.slice(accumulators, aCount), bSlice = inflow.drop_front(accumulators + aCount);
+            store(lb, a, as, Value(), bm, aLanes, aSlice);
+            store(lb, b, bs, Value(), bn, bLanes, bSlice);
+            gpu::BarrierOp::create(lb, loc);
+            Value next = nextOf(lb, k0);
+            SmallVector<Value> aNext = load(lb, a, dimM, m0, bm, aLanes, next),
+                               bNext = load(lb, b, dimN, n0, bn, bLanes, next);
+            SmallVector<Value> acc(accumulated.begin(), accumulated.end());
+            compute(lb, Value(), acc);
+            gpu::BarrierOp::create(lb, loc);
+            acc.append(aNext.begin(), aNext.end());
+            acc.append(bNext.begin(), bNext.end());
+            scf::YieldOp::create(lb, loc, acc);
+          });
+    }
     for (int64_t i = 0; i < tm; ++i)
       for (int64_t j = 0; j < tn; ++j) {
         if (split > 1)
@@ -4468,7 +4611,8 @@ static int64_t cleaveLowerGpuLaunches(MlirOperation op) {
       return found;
     };
     bool ok = true;
-    for (auto [i, operand] : llvm::enumerate(operands)) {
+    for (auto [i, argument] : llvm::enumerate(operands)) {
+      Value operand = argument;
       // A scalar (a value known only at run time, `Scale::scale`'s factor):
       // a one-element buffer on the stack, as `convert-gpu-to-spirv` wraps
       // it in a one-element storage buffer; an `index` as SPIR-V's 32-bit
@@ -4487,6 +4631,11 @@ static int64_t cleaveLowerGpuLaunches(MlirOperation op) {
         memref::StoreOp::create(builder, loc, constI64(4), flags, slot);
         continue;
       }
+      // A vector view of a buffer (`cleave-tile-matmuls-for-gpu`): the buffer
+      // it views, bound as it is.
+      if (auto view = operand.getDefiningOp<UnrealizedConversionCastOp>();
+          view && view->getNumOperands() == 1 && isa<MemRefType>(view->getOperand(0).getType()))
+        operand = view->getOperand(0);
       auto type = dyn_cast<MemRefType>(operand.getType());
       SmallVector<int64_t> strides;
       int64_t offset;
@@ -4532,6 +4681,15 @@ static int64_t cleaveLowerGpuLaunches(MlirOperation op) {
     ++lowered;
   }
 
+  // The vector views the launches took, bound as their buffers: unused now.
+  SmallVector<Operation *> views;
+  module.walk([&](UnrealizedConversionCastOp view) {
+    if (view->use_empty() && view->getNumOperands() == 1 && isa<MemRefType>(view->getOperand(0).getType()) &&
+        isa<MemRefType>(view->getResult(0).getType()))
+      views.push_back(view);
+  });
+  for (Operation *view : views)
+    view->erase();
   // The kernels now live in the globals: their modules go.
   SmallVector<Operation *> kernelModules;
   for (Operation &child : module.getBody()->getOperations())

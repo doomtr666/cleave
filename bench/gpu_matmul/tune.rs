@@ -1,12 +1,16 @@
 // Tunes the Vulkan backend's tiled products (`cleave-tile-matmuls-for-gpu`)
 // on nanoLM's product shapes (`bench/gpu_matmul/matmul.cleave`): each
-// configuration `bm,bn,bk,tm,tn,split` forced in turn (`CLEAVE_GPU_MATMUL`,
-// applied to every product it fits), the kernels' device time per shape read
-// from `CLEAVE_VK_PROFILE`, the fastest configuration kept for each shape
-// and compared with the compiler's own choice. First the tilings with the
-// compiler's split, then each shape's best few with every split. Writes the
+// configuration `bm,bn,bk,tm,tn,split,vec` forced in turn
+// (`CLEAVE_GPU_MATMUL`, applied to every product it fits), the kernels'
+// device time per shape read from `CLEAVE_VK_PROFILE`, the fastest
+// configuration kept for each shape and compared with the compiler's own
+// choice. The device's clock varies: every configuration runs once, each
+// shape's few fastest again (the least of `RUNS` runs). First the tilings, with
+// each choice of vector loads (`vec`: bit 1 the operands whose rows are
+// contiguous, bit 2 those whose `k` is), with the compiler's split, then each shape's
+// best with every split. Writes the
 // winners that beat it to `target/gpu_matmul_table.txt`, one line per shape:
-// `m n k a_k_contiguous b_k_contiguous bm bn bk tm tn split`; with
+// `m n k a_k_contiguous b_k_contiguous bm bn bk tm tn split vec`; with
 // `--install`, to the compiler's own table too (`cleave-mlir/cpp/
 // matmul_table.inc`, which the compiler then uses: rebuild it).
 //
@@ -17,6 +21,10 @@ use std::process::Command;
 
 /// How many times `matmul.cleave` calls each shape (its `REPS`).
 const REPS: f64 = 20.0;
+/// Runs per finalist (each shape's `FINALISTS` fastest after one run of
+/// every configuration), the least time of each kept.
+const RUNS: usize = 3;
+const FINALISTS: usize = 3;
 
 /// (function in `matmul.cleave`, m, n, k, whether `k` is contiguous in A
 /// (row-major `m x k`) and in B (`n x k`, transposed)): the product of an
@@ -45,11 +53,12 @@ struct Config {
     tm: i64,
     tn: i64,
     split: i64,
+    vec: i64,
 }
 
 impl Config {
     fn env(&self) -> String {
-        format!("{},{},{},{},{},{}", self.bm, self.bn, self.bk, self.tm, self.tn, self.split)
+        format!("{},{},{},{},{},{},{}", self.bm, self.bn, self.bk, self.tm, self.tn, self.split, self.vec)
     }
     /// The compiler's `ProductTiling::fits`.
     fn fits(&self, m: i64, n: i64, k: i64) -> bool {
@@ -76,7 +85,9 @@ fn measure(cleave: &str, config: Option<&Config>) -> Option<(HashMap<String, f64
     let mut command = Command::new(cleave);
     command
         .args(["--backend", "vulkan", "--no-openmp", "--no-debug-info", "--run", "bench/gpu_matmul/matmul.cleave"])
-        .env("CLEAVE_VK_PROFILE", "1");
+        .env("CLEAVE_VK_PROFILE", "1")
+        // Without the compiler's table: the reference is its own heuristic.
+        .env("CLEAVE_GPU_MATMUL_TABLE", "target/gpu_matmul_empty_table.txt");
     if let Some(config) = config {
         command.env("CLEAVE_GPU_MATMUL", config.env());
     }
@@ -106,16 +117,28 @@ fn main() {
         .skip(1)
         .find(|a| a != "--install")
         .unwrap_or_else(|| "target/release/cleave.exe".to_string());
+    std::fs::write("target/gpu_matmul_empty_table.txt", "").expect("cannot write an empty table");
     let (baseline, expected) = measure(&cleave, None).expect("the compiler's own choice fails");
     // Each shape's best: (microseconds, configuration).
-    let mut best: HashMap<&str, (f64, Config)> = HashMap::new();
+    // Each shape's fastest so far, at most `keep` of them: (microseconds,
+    // configuration).
+    type Ranking<'a> = HashMap<&'a str, Vec<(f64, Config)>>;
     let mut tried = 0;
-    let mut run = |config: &Config, best: &mut HashMap<&str, (f64, Config)>| {
+    let mut run = |config: &Config, runs: usize, keep: usize, ranking: &mut Ranking| {
         if !SHAPES.iter().any(|&(_, m, n, k, _, _)| config.fits(m, n, k)) {
             return;
         }
         tried += 1;
-        let Some((times, check)) = measure(&cleave, Some(config)) else { return };
+        let mut times: HashMap<String, f64> = HashMap::new();
+        let mut check = f64::NAN;
+        for _ in 0..runs {
+            let Some((run, value)) = measure(&cleave, Some(config)) else { return };
+            check = value;
+            for (function, us) in run {
+                let least = times.entry(function).or_insert(f64::MAX);
+                *least = least.min(us);
+            }
+        }
         if (check - expected).abs() > 1e-4 * expected.abs().max(1.0) {
             eprintln!("  {config:?}: {check}, not {expected}");
             return;
@@ -125,23 +148,29 @@ fn main() {
             if !config.fits(m, n, k) {
                 continue;
             }
-            let entry = best.entry(function).or_insert((f64::MAX, *config));
-            if us < entry.0 {
-                *entry = (us, *config);
-            }
+            let entries = ranking.entry(function).or_default();
+            entries.push((us, *config));
+            entries.sort_by(|a, b| a.0.total_cmp(&b.0));
+            entries.truncate(keep);
         }
         eprint!("\r  {tried} configurations tried");
     };
-    // The tilings, the compiler's split.
+    // The tilings, the compiler's split, once each.
     let mut tilings = Vec::new();
-    for bm in [32, 64, 128, 256] {
-        for bn in [32, 64, 128, 256] {
+    // Where the winners were on an RTX 4070 SUPER over a wider grid (tiles
+    // up to 256, blocks from 2, every `vec`): tiles of 64 and 128, blocks of
+    // 4 and 8, `vec` 2 alone never ahead. Each configuration costs a compile
+    // and the driver building its kernels (about 1.5 s): the grid kept small.
+    for bm in [32, 64, 128] {
+        for bn in [32, 64, 128] {
             for bk in [8, 16, 32] {
-                for tm in [2, 4, 8] {
-                    for tn in [2, 4, 8] {
+                for tm in [4, 8] {
+                    for tn in [4, 8] {
                         let threads = (bm / tm) * (bn / tn);
                         if (64..=512).contains(&threads) && tm * tn <= 64 {
-                            tilings.push(Config { bm, bn, bk, tm, tn, split: 0 });
+                            for vec in [0, 1, 3] {
+                                tilings.push(Config { bm, bn, bk, tm, tn, split: 0, vec });
+                            }
                         }
                     }
                 }
@@ -149,14 +178,30 @@ fn main() {
         }
     }
     eprintln!("{} tilings", tilings.len());
+    let mut first = Ranking::new();
     for config in &tilings {
-        run(config, &mut best);
+        run(config, 1, FINALISTS, &mut first);
     }
+    // Each shape's finalists again, `RUNS` times.
+    let mut finalists: Vec<Config> = first.values().flatten().map(|&(_, c)| c).collect();
+    finalists.sort_by_key(|c| c.env());
+    finalists.dedup();
+    let mut ranking = Ranking::new();
+    for config in &finalists {
+        run(config, RUNS, 1, &mut ranking);
+    }
+    let mut best: HashMap<&str, (f64, Config)> = ranking.iter().map(|(&f, e)| (f, e[0])).collect();
     // Each shape's best tiling with every split.
     let winners: Vec<Config> = best.values().map(|&(_, c)| c).collect();
     for tiling in winners {
         for split in [1, 2, 4, 8] {
-            run(&Config { split, ..tiling }, &mut best);
+            run(&Config { split, ..tiling }, RUNS, 1, &mut ranking);
+        }
+    }
+    for (&function, entries) in &ranking {
+        let entry = best.entry(function).or_insert(entries[0]);
+        if entries[0].0 < entry.0 {
+            *entry = entries[0];
         }
     }
     eprintln!();
@@ -180,8 +225,8 @@ fn main() {
         );
         if us < now {
             table += &format!(
-                "{m} {n} {k} {} {} {} {} {} {} {} {}\n",
-                a_k as i32, b_k as i32, config.bm, config.bn, config.bk, config.tm, config.tn, config.split
+                "{m} {n} {k} {} {} {} {} {} {} {} {} {}\n",
+                a_k as i32, b_k as i32, config.bm, config.bn, config.bk, config.tm, config.tn, config.split, config.vec
             );
         }
     }

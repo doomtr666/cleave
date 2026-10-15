@@ -376,8 +376,24 @@ fn tiled_products_match_the_cpu() {
     assert!(cpu.contains("main returned: 0"), "cpu: {cpu}");
     let lines = |out: &str| -> Vec<String> { out.lines().map(str::to_string).collect() };
     let expected = lines(&cpu);
-    for (index, device) in devices.iter().enumerate() {
-        let (stdout, stderr) = stats_on(index, "tiled_products", src);
+    // The compiler's own tilings, then one reading both operands from
+    // device memory 4 elements at a time (`CLEAVE_GPU_MATMUL`'s `vec` 3: rows
+    // contiguous as they come, `k` contiguous transposed in registers).
+    for ((index, device), forced) in
+        devices.iter().enumerate().flat_map(|d| [(d, None), (d, Some("64,64,16,8,8,0,3"))])
+    {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cleave"));
+        command
+            .args(["--backend", "vulkan", "--no-openmp", "--no-debug-info", "--run"])
+            .arg(&source)
+            .env("CLEAVE_VK_DEVICE", index.to_string())
+            .env("CLEAVE_VK_VALIDATION", "1");
+        if let Some(config) = forced {
+            command.env("CLEAVE_GPU_MATMUL", config);
+        }
+        let output = command.output().expect("cannot run cleave");
+        let (stdout, stderr) =
+            (String::from_utf8_lossy(&output.stdout).into_owned(), String::from_utf8_lossy(&output.stderr).into_owned());
         let got = lines(&stdout);
         assert_eq!(got.len(), expected.len(), "{}: {stdout}
 {stderr}", device.name);
@@ -626,7 +642,9 @@ fn a_nest_of_independent_loops_runs_a_thread_per_innermost_iteration() {
 
 /// Causal attention skips the work the mask makes useless, found at compile
 /// time (`cleave-tile-matmuls-for-gpu`): the tiles of `Q K^T` above the
-/// diagonal, which the softmax never reads (120 of 256), and in the products
+/// diagonal, which the softmax never reads (120 of 256), forward and backward,
+/// the same tiles of the backward's `dP = U V^T`, which the score gradient
+/// reads only up to the diagonal (`attention_score_grad`), and in the products
 /// by the weights or the score gradient (`P V`, `dQ`, `dK`, `dV`), the
 /// slices of the reduction where those are zero (stored as 0, or as a
 /// product with the zero weights). The same values as the CPU, forward and
@@ -689,7 +707,7 @@ fn causal_attention_skips_the_masked_half() {
             assert!((g - e).abs() <= 1e-4 * scale, "{}: value {i}: {g} on the GPU, {e} on the CPU", device.name);
         }
         assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
-        assert_eq!(stderr.matches(", 120 dead tiles of 256").count(), 2, "{}: {stderr}", device.name);
+        assert_eq!(stderr.matches(", 120 dead tiles of 256").count(), 3, "{}: {stderr}", device.name);
         assert_eq!(stderr.matches("some zero slices").count(), 4, "{}: {stderr}", device.name);
     }
 }

@@ -877,15 +877,19 @@ fn causal_softmax<const L: i32>(scores: Tensor<f32, L, L>, dh: i32) -> Tensor<f3
 }
 
 // `dS = P * (dP - rowsum(dP * P)) / sqrt(DH)`, the gradient of the scaled
-// scores from that of the weights (masked entries have `P = 0`, so `dS = 0`).
+// scores from that of the weights, for the causal `P` of `causal_softmax`: masked
+// entries have `P = 0`, so row `i` sums and computes over `0..=i` only and `dS = 0`
+// after (the same values, half the work; the zero tail written as `causal_softmax`
+// writes its own, so the products reading `dS` skip it the same way).
 fn attention_score_grad<const L: i32>(p: Tensor<f32, L, L>, dp: Tensor<f32, L, L>, dh: i32) -> Tensor<f32, L, L> {
     let width: f32 = dh.to();
     let scale = 1.0 / mlir::math::sqrt(width);
     let mut ds: [[f32; L]; L] = mlir::memref::alloc();
     for i in 0..L {
         let mut dot = 0.0;
-        for j in 0..L { dot = dot + dp[i, j] * p[i, j]; };
-        for j in 0..L { ds[i, j] = p[i, j] * (dp[i, j] - dot) * scale; };
+        for j in 0..i + 1 { dot = dot + dp[i, j] * p[i, j]; };
+        for j in 0..i + 1 { ds[i, j] = p[i, j] * (dp[i, j] - dot) * scale; };
+        for j in i + 1..L { ds[i, j] = 0.0; };
     };
     Tensor(data: ds)
 }

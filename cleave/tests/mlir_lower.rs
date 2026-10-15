@@ -5270,6 +5270,31 @@ fn for_loops_over_heterogeneous_collections_are_unrolled() {
     assert_eq!(run_i32(&context, src), 1);
 }
 
+/// A `for` indexing by its variable a tuple that a comprehension of structs
+/// produced unrolls too: the comprehension's type is only known once its
+/// target defaults (a tuple: arrays of structs aren't a default), after the
+/// loop's index was seen, so the deferred index asks for the unrolling then
+/// (`check_pending_indices`) instead of failing on `Index<__Tuple4<...>>`.
+/// The shape of nanoLM's sum over its `spawn`ed micro-batch gradients.
+#[test]
+fn a_loop_over_a_comprehension_of_structs_unrolls() {
+    let context = context();
+    let src = "
+        struct P { a: f32, b: f32 }
+        fn make(x: f32) -> P { P(a: x, b: 2.0 * x) }
+        fn add(p: P, q: P) -> P { P(a: p.a + q.a, b: p.b + q.b) }
+        fn main() -> i32 {
+            let g = [for j in 0..4: make(1.5)];
+            let mut acc = g[0];
+            for j in 1..4 { acc = add(acc, g[j]); };
+            let mut seen = 0.0;
+            for j in 0..4 { seen = seen + g[j].a; };
+            if acc.b == 12.0 and seen == 6.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
 /// An impl over a pack of types (`impl<Ts...: Show> Show<Ts...>`) covers
 /// tuples of any length whose elements all have their own `Show`; its loop
 /// unrolls per concrete tuple (`unroll.rs`: one concrete impl per tuple type
