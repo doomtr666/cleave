@@ -871,7 +871,8 @@ pub fn lower_to_llvm<'c>(
         &format!(
             "builtin.module(cleave-fold-passthrough-iter-args,ownership-based-buffer-deallocation,\
              buffer-deallocation-simplification,bufferization-lower-deallocations,\
-             cleave-lower-adoptions,cleave-dealloc-at-last-use,convert-bufferization-to-memref,\
+             cleave-lower-adoptions,cleave-dealloc-at-last-use,cleave-release-after-field-uses,\
+             convert-bufferization-to-memref,\
              cleave-lower-spawns{{tasks={}}})",
             options.host_tasks()
         ),
@@ -909,10 +910,13 @@ pub fn lower_to_llvm<'c>(
             "builtin.module(cleave-set-spirv-entry-abi,gpu.module(lower-affine),cleave-guard-zero-trip-loops,\
              gpu.module(arith-emulate-unsupported-floats{source-types=bf16 target-type=f32},\
              math-extend-to-supported-types{target-type=f32}),\
-             spirv-attach-target{ver=v1.3 caps=Shader,StorageBuffer16BitAccess,BFloat16TypeKHR \
-             exts=SPV_KHR_storage_buffer_storage_class,SPV_KHR_16bit_storage,SPV_KHR_bfloat16},\
+             spirv-attach-target{ver=v1.6 caps=Shader,StorageBuffer16BitAccess,BFloat16TypeKHR,\
+             CooperativeMatrixKHR,BFloat16CooperativeMatrixKHR \
+             exts=SPV_KHR_storage_buffer_storage_class,SPV_KHR_16bit_storage,SPV_KHR_bfloat16,\
+             SPV_KHR_cooperative_matrix},cleave-spirv-target-env,\
              cleave-accurate-kernel-math,gpu.module(convert-math-to-spirv),convert-gpu-to-spirv,\
-             spirv.module(spirv-lower-abi-attrs,spirv-update-vce),\
+             cleave-lower-fragment-carriers,spirv.module(spirv-lower-abi-attrs,spirv-update-vce),\
+             cleave-spirv-requirements,\
              cleave-lower-gpu-launches,cleave-sync-host-accesses)",
         )?;
         dump(module, "CLEAVE_DUMP_POST_GPU");

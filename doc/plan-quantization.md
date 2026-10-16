@@ -226,6 +226,33 @@ What bf16 weights and activations need, in order:
    (`gpu.cpp::freshInLoop`: a gradient field's descriptor, cast again outside the loop, is fresh
    for it) took the total from 20.4 s to **14.7 s**, losses unchanged.
    Next: the attention in bf16, the output head, and the remaining conversion kernels.
+4. ✅ (2026-10-16) Cooperative matrices in the generated kernels: every product of bf16 operands
+   into f32 the runtime's GEMM doesn't take (a block of a larger matrix at its row stride, a head
+   of attention) is tiled on fragments by `cleave-tile-matmuls-for-gpu` (`tileProductOnFragments`:
+   64 x 64 blocks, 4 subgroups each 2 x 2 fragments of 16 x 16, f32 accumulators, operands loaded
+   where they are, transposed ones column major; dead tiles and zero slices skipped as for the
+   scalar products). MLIR's `gpu.subgroup_mma` takes no bf16 and SPIR-V's operations want
+   pointers, so a fragment's load or store is carried through `convert-gpu-to-spirv` as a
+   `spirv.CompositeConstruct` of its first element's `memref.load` (or a `memref.store` of a
+   `spirv.CompositeExtract`), marked with its stride and layout, and made the real
+   `spirv.KHR.CooperativeMatrixLoad`/`Store` after the conversion
+   (`cleave-lower-fragment-carriers`); the access analyses read a carrier as its whole fragment
+   (`fragmentSpan`). On the way: the kernels' SPIR-V environment is 1.6 (`cleave-spirv-target-env`
+   gives `convert-math-to-spirv` the attached one; `cleave-spirv-requirements` declares the
+   version the code was converted for, and for fragments the Vulkan memory model and
+   `BFloat16CooperativeMatrixKHR`, which `spirv-update-vce` doesn't deduce). Assumes subgroups of
+   32 invocations (NVIDIA's). `vulkan.rs::bf16_products_of_blocks_run_on_cooperative_matrices`.
+   The bf16 attention (`stdlib/nn`, `CausalAttention<Tensor<bf16>>`): products on fragments,
+   softmax and score gradient in f32 written in bf16 (`causal_softmax_bf16`,
+   `attention_score_grad_bf16`, the weights recomputed rather than stored in f32). nanoLM
+   (`bench 0 1 3`, device time): attention forward 2.69 -> 1.96 s, backward 2.14 -> 2.07 s, total
+   14.66 -> 13.85 s, losses unchanged. `Q K^T` now writes its f32 scores at the memory's speed:
+   what's left there is not materializing them (a flash attention, the products and the softmax
+   in one kernel), a compiler feature of its own.
+   Found on the way, older than all this: a gradient summing a tuple's fields read them after
+   their release (tensor-level fusion moved the sum past it; zeros or NaN on the GPU, the CPU's
+   values by luck), `cleave-release-after-field-uses`,
+   `vulkan.rs::a_sum_of_a_tuples_fields_reads_them_before_their_release`.
 
 ### 5. Mixed-precision training, written by the user
 

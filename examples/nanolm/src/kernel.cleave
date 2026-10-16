@@ -214,9 +214,11 @@ fn new_gpt() -> Gpt {
 fn block<const N: i32>(x: Tensor<f32, N, WIDTH>, b: Block) -> Tensor<f32, N, WIDTH> {
     let shape = AttentionShape::<CONTEXT, HEAD>();
     let h = rms_norm(x, b.n1);
-    let q = rope(b.wq.dense_forward_bf16(h), shape);
-    let k = rope(b.wk.dense_forward_bf16(h), shape);
-    let a = causal_attention(q, k, b.wv.dense_forward_bf16(h), shape);
+    // Attention on bf16 queries, keys and values: its products on the tensor cores.
+    let q: Tensor<bf16, N, WIDTH> = rope(b.wq.dense_forward_bf16(h), shape).to();
+    let k: Tensor<bf16, N, WIDTH> = rope(b.wk.dense_forward_bf16(h), shape).to();
+    let v: Tensor<bf16, N, WIDTH> = b.wv.dense_forward_bf16(h).to();
+    let a: Tensor<f32, N, WIDTH> = causal_attention(q, k, v, shape).to();
     let x2 = x + b.wo.dense_forward_bf16(a);
     x2 + b.mlp.swiglu_forward_bf16(rms_norm(x2, b.n2))
 }

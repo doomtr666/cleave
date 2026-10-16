@@ -1418,6 +1418,126 @@ fn bf16_tensor_products_run_on_tensor_cores() {
     }
 }
 
+// A gradient summing the fields of a tuple (`causal_attention_backward`'s
+// `(dq, dk, dv)`, all three reaching `x`) reads them before they're released:
+// tensor-level fusion made the sum one kernel after the fields' releases,
+// zeros or NaN on the GPU (whose copies the releases retired), the CPU's
+// values by luck (`cleave-release-after-field-uses`).
+#[test]
+fn a_sum_of_a_tuples_fields_reads_them_before_their_release() {
+    let src = "
+        use io;
+        use linalg;
+        use nn;
+        fn loss(x: Tensor<f32, 512, 256>, w: Tensor<f32, 512, 256>) -> f32 {
+            let a = causal_attention(x, x * w, x, AttentionShape::<256, 64>());
+            sum(a * a)
+        }
+        dloss = grad(loss, x);
+        fn main() -> i32 {
+            rand_seed(1);
+            let x: Tensor<f32, 512, 256> = Init::he();
+            let w: Tensor<f32, 512, 256> = Init::he();
+            let g = dloss(x, w);
+            for r in [0, 1, 100, 300] {
+                let mut s: f32 = 0.0;
+                for j in 0..256 { s = s + g[r, j] * g[r, j]; };
+                println(s);
+            };
+            0
+        }
+    ";
+    let numbers = |out: &str| -> Vec<f64> { out.lines().filter_map(|l| l.trim().parse().ok()).collect() };
+    let expected = numbers(&run_cpu("tuple_fields", src));
+    assert_eq!(expected.len(), 4, "{expected:?}");
+    for (index, device) in devices().iter().enumerate() {
+        let dir = std::env::temp_dir().join(format!("cleave-vulkan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("tuple_fields.cleave");
+        std::fs::write(&source, src).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_cleave"))
+            .args(["--backend", "vulkan", "--no-openmp", "--no-debug-info", "--run"])
+            .arg(&source)
+            .env("CLEAVE_VK_DEVICE", index.to_string())
+            .env("CLEAVE_VK_VALIDATION", "1")
+            .output()
+            .expect("cannot run cleave");
+        let (stdout, stderr) =
+            (String::from_utf8_lossy(&output.stdout).into_owned(), String::from_utf8_lossy(&output.stderr).into_owned());
+        let got = numbers(&stdout);
+        assert_eq!(got.len(), expected.len(), "{}: {stdout}{stderr}", device.name);
+        for (g, e) in got.iter().zip(&expected) {
+            assert!((g - e).abs() <= 1e-4 * e.abs(), "{}: {got:?} on the GPU, {expected:?} on the CPU", device.name);
+        }
+        assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
+    }
+}
+
+// Products of bf16 tensors the runtime's GEMM doesn't take (blocks of larger
+// matrices, at their row stride: attention's heads) run on cooperative
+// matrices in generated kernels (`cleave-tile-matmuls-for-gpu`'s fragments,
+// loaded where they are, transposed ones column major), the CPU's values.
+#[test]
+fn bf16_products_of_blocks_run_on_cooperative_matrices() {
+    let src = "
+        use io;
+        use linalg;
+        use convert;
+        fn main() -> i32 {
+            let a: Tensor<bf16, 256, 128> = [for i in 0..256: [for j in 0..128: rem(i + 2 * j, 5).to()]];
+            let b: Tensor<bf16, 128, 192> = [for i in 0..128: [for j in 0..192: rem(3 * i + j, 7).to()]];
+            let ah: Tensor<bf16, 256, 64> = slice(a, 0, 64);
+            let bh: Tensor<bf16, 64, 192> = slice(b, 64, 0);
+            let c: Tensor<f32, 256, 192> = matmul_wide(ah, bh);
+            let t: Tensor<f32, 64, 64> = matmul_wide_transpose_a(ah, ah);
+            let u: Tensor<f32, 256, 256> = matmul_wide_transpose_b(ah, ah);
+            // In f64: integers past 2^24, exact in any order.
+            let mut s: f64 = 0.0;
+            for i in 0..256 { for j in 0..192 { let x: f64 = c[i, j].to(); s = s + x * rem(i + j, 3).to(); }; };
+            for i in 0..64 { for j in 0..64 { let x: f64 = t[i, j].to(); s = s + x * rem(i * j, 5).to(); }; };
+            for i in 0..256 { for j in 0..256 { let x: f64 = u[i, j].to(); s = s + x * rem(i + 3 * j, 2).to(); }; };
+            println(s);
+            println(c[200, 191]);
+            println(t[3, 60]);
+            println(u[17, 250]);
+            0
+        }
+    ";
+    let numbers = |out: &str| -> Vec<f64> { out.lines().filter_map(|l| l.trim().parse().ok()).collect() };
+    let expected = numbers(&run_cpu("bf16_blocks", src));
+    assert_eq!(expected.len(), 4, "{expected:?}");
+    for (index, device) in devices().iter().enumerate() {
+        if !device.cooperative_matrices.iter().any(|s| s.a == "bf16" && s.c == "f32") {
+            eprintln!("skipped on {}: no bf16 cooperative matrices", device.name);
+            continue;
+        }
+        let dir = std::env::temp_dir().join(format!("cleave-vulkan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("bf16_blocks.cleave");
+        std::fs::write(&source, src).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_cleave"))
+            .args(["--backend", "vulkan", "--no-openmp", "--no-debug-info", "--run"])
+            .arg(&source)
+            .env("CLEAVE_VK_DEVICE", index.to_string())
+            .env("CLEAVE_VK_VALIDATION", "1")
+            .env("CLEAVE_DEBUG_PARALLELIZE", "1")
+            .output()
+            .expect("cannot run cleave");
+        let (stdout, stderr) =
+            (String::from_utf8_lossy(&output.stdout).into_owned(), String::from_utf8_lossy(&output.stderr).into_owned());
+        // Small integers: every product and sum exact, in any order.
+        assert_eq!(numbers(&stdout), expected, "{}: {stdout}{stderr}", device.name);
+        for product in ["256x192x64", "64x64x256", "256x256x64"] {
+            assert!(
+                stderr.contains(&format!("{product} on cooperative matrices")),
+                "{}: {product} not on cooperative matrices: {stderr}",
+                device.name
+            );
+        }
+        assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
+    }
+}
+
 // `matmul_wide`'s gradient on the GPU: the forward product and both adjoint
 // products (`matmul_wide_transpose_a/b`) on the bf16-operand GEMM, the values
 // the CPU computes.

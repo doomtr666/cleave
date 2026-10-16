@@ -1698,6 +1698,82 @@ static int64_t cleaveDeallocAtLastUse(MlirOperation op) {
   return moved;
 }
 
+// A struct field's buffer released (`cleave_release` of its address,
+// `mlir_lower.rs`) before an access through another name of it: the field
+// read again from the same struct value (an `llvm.extractvalue` at the same
+// position) and converted to a memref once more. `mlir_lower.rs` releases a
+// field after its last use, but tensor-level fusion (`linalg-fuse-elementwise-
+// ops`) moves uses: a gradient summing a tuple's fields (`dq + dv + w * dk`,
+// attention's) became one `linalg.generic` after the fields' releases, reading
+// freed memory (zeros or NaN on the GPU, whose copies the release retired).
+// The release moves to just after the last op of its block reaching the field
+// by any of its names (`lastUseInBlock`), with what uses its result. None
+// moves when the field escapes, or when a result of what would move is used
+// before that op. Returns how many moved.
+static int64_t cleaveReleaseAfterFieldUses(MlirOperation op) {
+  SmallVector<func::CallOp> releases;
+  unwrap(op)->walk([&](func::CallOp call) {
+    if (call.getCallee() == "cleave_release" && call.getNumOperands() == 1)
+      releases.push_back(call);
+  });
+  int64_t moved = 0;
+  for (func::CallOp release : releases) {
+    // The address back to the memref it was taken from.
+    Value at = release.getOperand(0);
+    while (Operation *def = at.getDefiningOp()) {
+      if (isa<memref::ExtractAlignedPointerAsIndexOp>(def) || !followsAddress(def))
+        break;
+      at = def->getOperand(0);
+    }
+    auto pointer = at.getDefiningOp<memref::ExtractAlignedPointerAsIndexOp>();
+    if (!pointer)
+      continue;
+    auto cast = viewRoot(pointer.getSource()).getDefiningOp<UnrealizedConversionCastOp>();
+    auto field = cast && cast->getNumOperands() == 1 ? cast->getOperand(0).getDefiningOp<LLVM::ExtractValueOp>()
+                                                     : LLVM::ExtractValueOp();
+    if (!field)
+      continue;
+    // Every name of the field: each read of it from the struct, converted.
+    SmallVector<Value> names;
+    for (Operation *user : field.getContainer().getUsers())
+      if (auto read = dyn_cast<LLVM::ExtractValueOp>(user); read && read.getPosition() == field.getPosition())
+        for (Operation *converted : read->getUsers())
+          if (isa<UnrealizedConversionCastOp>(converted))
+            names.push_back(converted->getResult(0));
+    Block *block = release->getBlock();
+    Operation *last = nullptr;
+    if (!llvm::all_of(names, [&](Value name) { return lastUseInBlock(name, release, release, block, last); }) ||
+        !last || !release->isBeforeInBlock(last) || last->hasTrait<OpTrait::IsTerminator>())
+      continue;
+    // The release and what uses its result (a child's release on it), in
+    // order; each of their results used only among them or after `last`.
+    llvm::SetVector<Operation *> moving;
+    moving.insert(release);
+    for (size_t i = 0; i < moving.size(); ++i)
+      for (Value result : moving[i]->getResults())
+        for (Operation *user : result.getUsers())
+          if (Operation *anchor = block->findAncestorOpInBlock(*user); anchor && anchor->isBeforeInBlock(last))
+            moving.insert(anchor);
+    bool movable = llvm::all_of(moving, [&](Operation *op) {
+      return op->getBlock() == block && llvm::all_of(op->getUsers(), [&](Operation *user) {
+               Operation *anchor = block->findAncestorOpInBlock(*user);
+               return anchor && (moving.contains(anchor) || last->isBeforeInBlock(anchor));
+             });
+    });
+    if (!movable)
+      continue;
+    SmallVector<Operation *> ordered(moving.begin(), moving.end());
+    llvm::sort(ordered, [](Operation *x, Operation *y) { return x->isBeforeInBlock(y); });
+    Operation *after = last;
+    for (Operation *op : ordered) {
+      op->moveAfter(after);
+      after = op;
+    }
+    ++moved;
+  }
+  return moved;
+}
+
 // Every parallel region (`spawn`'s team, `cleaveLowerSpawns`; a parallel
 // loop's, `--convert-scf-to-openmp`) starts with each member placing itself:
 // `cleave_bind_worker(omp_get_thread_num())` (`cleave-rt`), one member per
@@ -2048,6 +2124,9 @@ namespace {
 CLEAVE_COUNTING_PASS(LowerBlasMatmulsPass, "cleave-lower-blas-matmuls",
                      "BLAS-marked products lowered to sgemm calls",
                      cleaveLowerBlasMatmuls)
+CLEAVE_COUNTING_PASS(ReleaseAfterFieldUsesPass, "cleave-release-after-field-uses",
+                     "struct fields' releases moved after their last access by any name",
+                     cleaveReleaseAfterFieldUses)
 CLEAVE_COUNTING_PASS(ReuseDyingInputsPass, "cleave-reuse-dying-inputs",
                      "elementwise results written into a dying operand",
                      cleaveReuseDyingInputs)
@@ -2931,6 +3010,7 @@ extern "C" void cleaveRegisterPasses() {
     PassRegistration<FoldPassthroughIterArgsPass>();
     PassRegistration<LowerAdoptionsPass>();
     PassRegistration<DeallocAtLastUsePass>();
+    PassRegistration<ReleaseAfterFieldUsesPass>();
     PassRegistration<LowerSpawnsPass>();
     PassRegistration<ApproximateMathPass>();
     PassRegistration<AccurateKernelMathPass>();

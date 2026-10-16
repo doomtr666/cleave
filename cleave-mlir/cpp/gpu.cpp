@@ -381,6 +381,59 @@ static constexpr const char *kGemmBf16 = "cleave_vk_gemm_bf16";
 static constexpr const char *kGemmBf16Operands = "cleave_vk_gemm_bf16_operands";
 static constexpr const char *kComputeAttr = "cleave.compute";
 
+// A cooperative matrix fragment's load or store in a kernel before SPIR-V
+// (`cleave-tile-matmuls-for-gpu`), which `cleave-lower-fragment-carriers`
+// makes a `spirv.KHR.CooperativeMatrixLoad` or `Store` once
+// `convert-gpu-to-spirv` has made the memory a pointer: a
+// `spirv.CompositeConstruct` of the matrix from a `memref.load` of its first
+// element, or a `memref.store` there of a `spirv.CompositeExtract` of it,
+// marked with the memory's row stride in elements (`kFragmentStride`) and,
+// when the fragment's rows are the memory's columns, `kFragmentColumnMajor`.
+// MLIR's own fragments (`gpu.subgroup_mma_*`) take no bf16, and SPIR-V's
+// operations want a pointer, which a kernel has only after the conversion.
+// The analyses of accesses read a carrier as the whole fragment
+// (`fragmentSpan`).
+static constexpr const char *kFragmentStride = "cleave.fragment_stride";
+static constexpr const char *kFragmentColumnMajor = "cleave.fragment_column_major";
+
+// The elements a fragment carrier (`kFragmentStride`) reaches from its
+// indices, along its memory's last two: its rows and columns, transposed when
+// column major. None for any other access.
+static std::optional<std::pair<int64_t, int64_t>> fragmentSpan(Operation *access) {
+  Operation *carrier = nullptr;
+  spirv::CooperativeMatrixType type;
+  if (auto load = dyn_cast<memref::LoadOp>(access)) {
+    for (Operation *user : load->getUsers())
+      if (isa<spirv::CompositeConstructOp>(user) && user->hasAttr(kFragmentStride)) {
+        carrier = user;
+        type = dyn_cast<spirv::CooperativeMatrixType>(user->getResult(0).getType());
+      }
+  } else if (auto store = dyn_cast<memref::StoreOp>(access)) {
+    Operation *def = store.getValueToStore().getDefiningOp();
+    if (def && isa<spirv::CompositeExtractOp>(def) && def->hasAttr(kFragmentStride)) {
+      carrier = def;
+      type = dyn_cast<spirv::CooperativeMatrixType>(def->getOperand(0).getType());
+    }
+  }
+  if (!carrier || !type)
+    return std::nullopt;
+  int64_t rows = type.getRows(), columns = type.getColumns();
+  if (carrier->hasAttr(kFragmentColumnMajor))
+    std::swap(rows, columns);
+  return std::make_pair(rows, columns);
+}
+
+// Along each of an access's indices, how many elements it reaches from there:
+// 1, a fragment's rows and columns for its last two (`fragmentSpan`).
+static SmallVector<int64_t> accessSpans(Operation *access, size_t indices) {
+  SmallVector<int64_t> spans(indices, 1);
+  if (std::optional<std::pair<int64_t, int64_t>> span = fragmentSpan(access); span && indices >= 2) {
+    spans[indices - 2] = span->first;
+    spans[indices - 1] = span->second;
+  }
+  return spans;
+}
+
 // Whether the memory of `alloc` (a `memref.alloc`) can only be reached
 // through it: every use is an access, a view, a cast, a free, a metadata
 // query or a `linalg` op; never stored, passed to a call, or its address
@@ -572,17 +625,28 @@ struct AffineSystem {
 // `scope`) may reach the box of elements `box` (each index's lowest and
 // highest): false only when no iteration of the loops and kernels around it
 // can (`AffineSystem`); true too when an index isn't affine.
-static bool mayReach(Operation *scope, ValueRange indices, ArrayRef<std::pair<int64_t, int64_t>> box) {
+static bool mayReach(Operation *scope, ValueRange indices, ArrayRef<std::pair<int64_t, int64_t>> box,
+                     ArrayRef<int64_t> spans = {}) {
   AffineForms forms(scope, /*divisions=*/true);
   AffineSystem system(forms);
-  for (auto [index, range] : llvm::zip(indices, box)) {
+  for (auto [i, index, range] : llvm::enumerate(indices, box)) {
     std::optional<Affine> affine = forms.of(index);
     if (!affine)
       return true;
-    system.between(system.rowOf(*affine, 1), AffineSystem::constantRow(range.first),
+    // An access reaching `span` elements from its index reaches the box from
+    // `span - 1` before it.
+    int64_t span = i < spans.size() ? spans[i] : 1;
+    system.between(system.rowOf(*affine, 1), AffineSystem::constantRow(range.first - (span - 1)),
                    AffineSystem::constantRow(range.second));
   }
   return !system.isEmpty();
+}
+
+// `mayReach` for a `memref.load` or `memref.store`, a fragment carrier
+// reaching its whole fragment (`accessSpans`).
+template <typename Access>
+static bool accessMayReach(Operation *scope, Access access, ArrayRef<std::pair<int64_t, int64_t>> box) {
+  return mayReach(scope, access.getIndices(), box, accessSpans(access, access.getIndices().size()));
 }
 
 // Whether no element of `memref` one iteration of `scope` writes is read or
@@ -622,6 +686,8 @@ static bool accessesAreDisjoint(Operation *scope, ArrayRef<Value> band, Value me
       indices = store.getIndices(), writes = true;
     else
       return WalkResult::advance();
+    // A fragment carrier's every element (`accessSpans`).
+    SmallVector<int64_t> spans = accessSpans(inner, indices.size());
     SmallVector<Affine> variable;
     SmallVector<int64_t> constants;
     for (Value index : indices) {
@@ -649,8 +715,11 @@ static bool accessesAreDisjoint(Operation *scope, ArrayRef<Value> band, Value me
       groups.push_back({writes, variable, SmallVector<std::set<int64_t>>(constants.size())});
       group = std::prev(groups.end());
     }
-    for (auto [set, c] : llvm::zip(group->constants, constants))
-      set.insert(c);
+    // Every element along it: the ends alone would make a progression
+    // stepping over the rest.
+    for (auto [set, c, span] : llvm::zip(group->constants, constants, spans))
+      for (int64_t e = 0; e < span; ++e)
+        set.insert(c + e);
     return WalkResult::advance();
   });
   constexpr size_t kMostGroups = 64;
@@ -3059,6 +3128,41 @@ static std::optional<DirectUses> directUses(Value memref, Operation *product) {
 
 static bool runsBefore(Operation *op, Operation *later);
 
+// What `memref` (a `memref.alloc` of the function) is the conversion of: a
+// `linalg.generic` of identity maps over all of it whose body converts its
+// one input (`arith.truncf`, `arith.extf`: attention's weights rounded to
+// bf16), when nothing else writes it or reaches it but reads. None otherwise.
+static std::pair<linalg::GenericOp, Value> conversionOf(Value memref) {
+  while (auto cast = memref.getDefiningOp<memref::CastOp>())
+    memref = cast.getSource();
+  if (!memref.getDefiningOp<memref::AllocOp>())
+    return {};
+  linalg::GenericOp writer;
+  for (OpOperand &use : memref.getUses()) {
+    Operation *user = use.getOwner();
+    if (auto generic = dyn_cast<linalg::GenericOp>(user); generic && generic.isDpsInit(&use)) {
+      if (writer)
+        return {};
+      writer = generic;
+    } else if (auto linalgOp = dyn_cast<linalg::LinalgOp>(user); linalgOp && !linalgOp.isDpsInput(&use)) {
+      return {};
+    } else if (!isa<memref::LoadOp, memref::DeallocOp, memref::ExtractAlignedPointerAsIndexOp,
+                    memref::ExtractStridedMetadataOp, linalg::LinalgOp>(user)) {
+      return {};
+    }
+  }
+  if (!writer || !writer.hasPureBufferSemantics() || writer.getNumDpsInputs() != 1 || writer.getNumDpsInits() != 1 ||
+      writer.getNumReductionLoops() != 0 ||
+      !llvm::all_of(writer.getIndexingMapsArray(), [](AffineMap map) { return map.isIdentity(); }))
+    return {};
+  Block *body = writer.getBlock();
+  Operation *converted = body->getTerminator()->getOperand(0).getDefiningOp();
+  if (!isa_and_nonnull<arith::TruncFOp, arith::ExtFOp>(converted) || converted->getOperand(0) != body->getArgument(0) ||
+      body->getOperations().size() != 2)
+    return {};
+  return {writer, writer.getDpsInputs()[0]};
+}
+
 // Whether every element of `memref` in `box` (each index's lowest and
 // highest) is zero when `reader` reads it, or never written: what writes
 // there before it (`directUses`, all of it before `reader`) writes zero, a
@@ -3068,6 +3172,9 @@ static bool runsBefore(Operation *op, Operation *later);
 // weights `p` are), its other factors assumed finite.
 static bool zeroOn(Value memref, ArrayRef<std::pair<int64_t, int64_t>> box, Operation *reader, func::FuncOp func,
                    int depth) {
+  // A rounding of another buffer: zero where that one is.
+  if (auto [conversion, source] = conversionOf(memref); conversion)
+    return runsBefore(conversion, reader) && zeroOn(source, box, conversion, func, depth);
   std::optional<DirectUses> uses = directUses(memref, nullptr);
   if (!uses || !llvm::all_of(uses->fills, [](linalg::FillOp fill) {
         return matchPattern(fill.getInputs()[0], m_AnyZeroFloat());
@@ -3077,7 +3184,7 @@ static bool zeroOn(Value memref, ArrayRef<std::pair<int64_t, int64_t>> box, Oper
     if (!runsBefore(store, reader))
       return false;
     Value value = store.getValueToStore();
-    if (matchPattern(value, m_AnyZeroFloat()) || !mayReach(func, store.getIndices(), box))
+    if (matchPattern(value, m_AnyZeroFloat()) || !accessMayReach(func, store, box))
       continue;
     // A factor loaded where it's stored, from memory zero on the box.
     std::function<bool(Value)> zeroFactor = [&](Value v) {
@@ -3088,6 +3195,9 @@ static bool zeroOn(Value memref, ArrayRef<std::pair<int64_t, int64_t>> box, Oper
                zeroOn(load.getMemRef(), box, load, func, depth - 1);
       if (auto product = v.getDefiningOp<arith::MulFOp>())
         return zeroFactor(product.getLhs()) || zeroFactor(product.getRhs());
+      // A conversion keeps a zero (the weights rounded to bf16).
+      if (isa_and_nonnull<arith::TruncFOp, arith::ExtFOp>(v.getDefiningOp()))
+        return zeroFactor(v.getDefiningOp()->getOperand(0));
       return false;
     };
     if (!zeroFactor(value))
@@ -3121,6 +3231,302 @@ static void discardContents(OpBuilder &builder, Location loc, Value memref, Modu
   }
   auto [first, bytes] = memrefSpan(builder, loc, memref);
   func::CallOp::create(builder, loc, name, TypeRange{}, ValueRange{first, bytes});
+}
+
+// The fill of `c` just before `product`, nothing between them touching
+// memory (`sgemm`'s `beta` 0): the value its elements start from.
+static linalg::FillOp fillBefore(Operation *product, Value c) {
+  for (Operation *before = product->getPrevNode(); before; before = before->getPrevNode()) {
+    if (auto candidate = dyn_cast<linalg::FillOp>(before))
+      return candidate.hasPureBufferSemantics() && candidate.getOutputs()[0] == c ? candidate : linalg::FillOp();
+    if (!isMemoryEffectFree(before))
+      break;
+  }
+  return {};
+}
+
+// A guard around the work of `launch`'s workgroup: whether bit `y * tilesN +
+// x` of the mask `live` (32-bit words) is set, the same for the whole
+// workgroup (its barriers then reached by all of it or none). Every operation
+// of its body but its allocations moved inside.
+static void guardLiveTiles(OpBuilder &kb, Location loc, gpu::LaunchOp launch, int64_t tilesN, ArrayRef<bool> live) {
+  Block &kernel = launch.getBody().front();
+  SmallVector<Operation *> work;
+  for (Operation &op : kernel.without_terminator())
+    if (!isa<memref::AllocOp>(op))
+      work.push_back(&op);
+  Type i32 = kb.getI32Type();
+  auto constant = [&](int64_t v) -> Value { return arith::ConstantIndexOp::create(kb, loc, v); };
+  Value tile = arith::AddIOp::create(
+      kb, loc, arith::MulIOp::create(kb, loc, launch.getBlockIds().y, constant(tilesN)), launch.getBlockIds().x);
+  Value word = arith::IndexCastOp::create(kb, loc, i32, arith::DivUIOp::create(kb, loc, tile, constant(32)));
+  Value bit = arith::IndexCastOp::create(kb, loc, i32, arith::RemUIOp::create(kb, loc, tile, constant(32)));
+  auto maskOf = [&](size_t w) {
+    uint32_t mask = 0;
+    for (size_t t = w * 32; t < std::min(live.size(), (w + 1) * 32); ++t)
+      if (live[t])
+        mask |= uint32_t(1) << (t % 32);
+    return arith::ConstantIntOp::create(kb, loc, i32, int64_t(int32_t(mask))).getResult();
+  };
+  size_t words = (live.size() + 31) / 32;
+  Value mask = maskOf(words - 1);
+  for (size_t w = words - 1; w-- > 0;)
+    mask = arith::SelectOp::create(
+        kb, loc,
+        arith::CmpIOp::create(kb, loc, arith::CmpIPredicate::eq, word, arith::ConstantIntOp::create(kb, loc, i32, int64_t(w))),
+        maskOf(w), mask);
+  Value one32 = arith::ConstantIntOp::create(kb, loc, i32, 1);
+  Value isLive = arith::CmpIOp::create(kb, loc, arith::CmpIPredicate::ne,
+                                       arith::AndIOp::create(kb, loc, arith::ShRUIOp::create(kb, loc, mask, bit), one32),
+                                       arith::ConstantIntOp::create(kb, loc, i32, 0));
+  auto guard = scf::IfOp::create(kb, loc, TypeRange{}, isLive, /*withElseRegion=*/false);
+  Operation *end = guard.thenBlock()->getTerminator();
+  for (Operation *op : work)
+    op->moveBefore(end);
+}
+
+// Vulkan backend: a product of bf16 operands into f32 (`mlir_lower.rs`'s
+// widened products, `stdlib/linalg`'s `MatMulWide`) that the runtime's GEMM
+// didn't take (`cleave-lower-gpu-gemms`: a block of a larger matrix, a head of
+// attention, a shape it doesn't divide), computed on cooperative matrices (the
+// tensor cores) in a kernel of its own: a workgroup of 4 subgroups per `tile`
+// x `tile` block of the result, each subgroup a quarter of it in 16 x 16
+// fragments accumulated in f32, the operands' fragments loaded from device
+// memory where they are, at their row stride, those transposed column major
+// (`kFragmentStride`). For a body that is the sum of products (`c + ext(a) *
+// ext(b)`) over operands whose rows are contiguous. The work no one needs
+// skipped as `cleaveTileMatmulsForGpu` skips it: tiles nothing reads, slices
+// of the reduction where `a` is zero. The sum is in another order than the
+// scalar kernel's. Subgroups of 32 invocations assumed (NVIDIA's;
+// `doc/plan-quantization.md`). Whether it rewrote `product`.
+static bool tileProductOnFragments(linalg::LinalgOp product, OpOperand *a, OpOperand *b, unsigned dimM,
+                                   unsigned dimN, unsigned dimK, int64_t m, int64_t n, int64_t k, ModuleOp module) {
+  OpOperand *cOperand = product.getDpsInitOperand(0);
+  Value c = cOperand->get();
+  auto aType = cast<MemRefType>(a->get().getType()), bType = cast<MemRefType>(b->get().getType()),
+       cType = cast<MemRefType>(c.getType());
+  if (!aType.getElementType().isBF16() || !bType.getElementType().isBF16() || !cType.getElementType().isF32())
+    return false;
+  // The body: `c + ext(a) * ext(b)`, nothing else.
+  Block *body = product.getBlock();
+  Value aArg = body->getArgument(a->getOperandNumber()), bArg = body->getArgument(b->getOperandNumber()),
+        cArg = body->getArgument(cOperand->getOperandNumber());
+  if (!llvm::all_of(body->getOperations(), [](Operation &op) {
+        return isa<arith::ExtFOp, arith::MulFOp, arith::AddFOp, linalg::YieldOp>(op);
+      }))
+    return false;
+  auto sum = body->getTerminator()->getOperand(0).getDefiningOp<arith::AddFOp>();
+  Value term = !sum ? Value() : sum.getLhs() == cArg ? sum.getRhs() : sum.getRhs() == cArg ? sum.getLhs() : Value();
+  auto times = term ? term.getDefiningOp<arith::MulFOp>() : arith::MulFOp();
+  auto source = [](Value v) {
+    if (auto ext = v.getDefiningOp<arith::ExtFOp>())
+      return ext.getIn();
+    return v;
+  };
+  if (!times || !((source(times.getLhs()) == aArg && source(times.getRhs()) == bArg) ||
+                  (source(times.getLhs()) == bArg && source(times.getRhs()) == aArg)))
+    return false;
+  // Each operand's row stride, its rows contiguous.
+  auto rowStride = [](MemRefType type) -> std::optional<int64_t> {
+    SmallVector<int64_t> strides;
+    int64_t offset;
+    if (type.getRank() != 2 || failed(type.getStridesAndOffset(strides, offset)) || strides[1] != 1 ||
+        ShapedType::isDynamic(strides[0]))
+      return std::nullopt;
+    return strides[0];
+  };
+  std::optional<int64_t> aStride = rowStride(aType), bStride = rowStride(bType), cStride = rowStride(cType);
+  if (!aStride || !bStride || !cStride)
+    return false;
+  // A fragment's rows are the memory's columns where the operand is
+  // transposed.
+  AffineMap aMap = product.getMatchingIndexingMap(a), bMap = product.getMatchingIndexingMap(b),
+            cMap = product.getMatchingIndexingMap(cOperand);
+  const bool aColumns = aMap.getDimPosition(0) != dimM, bColumns = bMap.getDimPosition(0) != dimK,
+             cColumns = cMap.getDimPosition(0) != dimM;
+  // 64 x 64 blocks, 32 x 32 where those don't divide the result. Smaller
+  // blocks for more workgroups were slower: a fragment loaded per
+  // multiply-add instead of one per two (attention's heads, folded into the
+  // grid, make the workgroups anyway: `P V`, 1024 x 64 x 1024 by 6 heads,
+  // 42 us in 32 x 32 blocks, 36 in 64 x 64; `Q K^T` 81 and 29).
+  constexpr int64_t kFragment = 16, kSubgroup = 32;
+  if (k % kFragment != 0)
+    return false;
+  int64_t tile = m % 64 == 0 && n % 64 == 0 ? 64 : m % 32 == 0 && n % 32 == 0 ? 32 : 0;
+  // `CLEAVE_GPU_COOPMAT_TILE` (at compile time): the block size of every
+  // product it divides, what a measurement tries.
+  if (const char *forced = std::getenv("CLEAVE_GPU_COOPMAT_TILE")) {
+    int64_t size = std::strtoll(forced, nullptr, 10);
+    if (size > 0 && size % 32 == 0 && m % size == 0 && n % size == 0)
+      tile = size;
+  }
+  if (!tile)
+    return false;
+  const int64_t frags = tile / 2 / kFragment; // a subgroup's, along each dimension
+  const int64_t tilesM = m / tile, tilesN = n / tile, slices = k / kFragment;
+  linalg::FillOp fill = fillBefore(product, c);
+  Value filled = fill ? fill.getInputs()[0] : Value();
+
+  // The work no one needs (`cleaveTileMatmulsForGpu`): tiles of the result no
+  // load reaches, and by row of tiles the slices of the reduction where `a`
+  // is zero.
+  auto func = product->getParentOfType<func::FuncOp>();
+  auto boxOf = [](AffineMap map, ArrayRef<std::pair<unsigned, std::pair<int64_t, int64_t>>> ranges) {
+    SmallVector<std::pair<int64_t, int64_t>> box;
+    for (unsigned r = 0; r < map.getNumResults(); ++r)
+      for (auto [dim, range] : ranges)
+        if (map.getDimPosition(r) == dim)
+          box.push_back(range);
+    return box;
+  };
+  SmallVector<bool> liveTiles;
+  if (std::optional<DirectUses> uses = directUses(c, product);
+      uses && uses->readers.empty() && tilesM * tilesN * int64_t(uses->loads.size()) <= 4096) {
+    for (int64_t tm = 0; tm < tilesM; ++tm)
+      for (int64_t tn = 0; tn < tilesN; ++tn) {
+        SmallVector<std::pair<int64_t, int64_t>> box =
+            boxOf(cMap, {{dimM, {tm * tile, tm * tile + tile - 1}}, {dimN, {tn * tile, tn * tile + tile - 1}}});
+        liveTiles.push_back(
+            llvm::any_of(uses->loads, [&](memref::LoadOp load) { return accessMayReach(func, load, box); }));
+      }
+    if (llvm::all_of(liveTiles, [](bool live) { return live; }))
+      liveTiles.clear();
+  }
+  SmallVector<std::pair<int64_t, int64_t>> liveK; // by row of tiles: `[first, end)`
+  std::optional<DirectUses> aUses = directUses(a->get(), product);
+  if (((aUses && !aUses->stores.empty()) || conversionOf(a->get()).first) && tilesM * slices <= 4096) {
+    for (int64_t tm = 0; tm < tilesM; ++tm) {
+      int64_t first = -1, last = -1;
+      for (int64_t slice = 0; slice < slices; ++slice) {
+        SmallVector<std::pair<int64_t, int64_t>> box = boxOf(
+            aMap, {{dimM, {tm * tile, tm * tile + tile - 1}}, {dimK, {slice * kFragment, slice * kFragment + kFragment - 1}}});
+        if (!zeroOn(a->get(), box, product, func, /*depth=*/2)) {
+          if (first < 0)
+            first = slice;
+          last = slice;
+        }
+      }
+      liveK.push_back(first < 0 ? std::pair<int64_t, int64_t>{0, 0}
+                                : std::pair<int64_t, int64_t>{first * kFragment, (last + 1) * kFragment});
+    }
+    if (llvm::all_of(liveK, [&](auto range) { return range == std::pair<int64_t, int64_t>{0, k}; }))
+      liveK.clear();
+  }
+  if (debuggingParallelization())
+    llvm::errs() << "cleave-tile-matmuls-for-gpu: " << func.getName() << ": " << m << "x" << n << "x" << k
+                 << " on cooperative matrices, " << tile << " x " << tile << " blocks, "
+                 << llvm::count(liveTiles, false) << " dead of " << tilesM * tilesN << ", "
+                 << (liveK.empty() ? "no" : "some") << " zero slices\n";
+
+  MLIRContext *ctx = module.getContext();
+  OpBuilder builder(product);
+  Location loc = product.getLoc();
+  auto constant = [&](OpBuilder &at, int64_t v) -> Value { return arith::ConstantIndexOp::create(at, loc, v); };
+  auto add = [&](OpBuilder &at, Value x, Value y) -> Value { return arith::AddIOp::create(at, loc, x, y); };
+  auto mul = [&](OpBuilder &at, Value x, int64_t y) -> Value { return arith::MulIOp::create(at, loc, x, constant(at, y)); };
+  Value one = constant(builder, 1);
+  auto launch = gpu::LaunchOp::create(builder, loc, constant(builder, tilesN), constant(builder, tilesM), one,
+                                      constant(builder, 4 * kSubgroup), one, one,
+                                      /*dynamicSharedMemorySize=*/nullptr, /*asyncTokenType=*/nullptr);
+  Block &kernel = launch.getBody().front();
+  if (kernel.empty() || !kernel.back().hasTrait<OpTrait::IsTerminator>()) {
+    OpBuilder atEnd = OpBuilder::atBlockEnd(&kernel);
+    gpu::TerminatorOp::create(atEnd, loc);
+  }
+  OpBuilder kb(&kernel, std::prev(kernel.end()));
+  // This subgroup's quarter of the block: its first row and column.
+  Value subgroup = arith::DivUIOp::create(kb, loc, launch.getThreadIds().x, constant(kb, kSubgroup));
+  Value rowHalf = arith::DivUIOp::create(kb, loc, subgroup, constant(kb, 2));
+  Value columnHalf = arith::RemUIOp::create(kb, loc, subgroup, constant(kb, 2));
+  Value m0 = add(kb, mul(kb, launch.getBlockIds().y, tile), mul(kb, rowHalf, tile / 2));
+  Value n0 = add(kb, mul(kb, launch.getBlockIds().x, tile), mul(kb, columnHalf, tile / 2));
+  auto indicesOf = [&](OpOperand *operand, ArrayRef<std::pair<unsigned, Value>> at) {
+    AffineMap map = product.getMatchingIndexingMap(operand);
+    SmallVector<Value> indices;
+    for (unsigned r = 0; r < map.getNumResults(); ++r)
+      for (auto [dim, value] : at)
+        if (map.getDimPosition(r) == dim)
+          indices.push_back(value);
+    return indices;
+  };
+  auto fragmentType = [&](Type element, spirv::CooperativeMatrixUseKHR use) {
+    return spirv::CooperativeMatrixType::get(element, kFragment, kFragment, spirv::Scope::Subgroup, use);
+  };
+  Type bf16 = BFloat16Type::get(ctx), f32 = Float32Type::get(ctx);
+  auto aFragment = fragmentType(bf16, spirv::CooperativeMatrixUseKHR::MatrixA);
+  auto bFragment = fragmentType(bf16, spirv::CooperativeMatrixUseKHR::MatrixB);
+  auto accumulator = fragmentType(f32, spirv::CooperativeMatrixUseKHR::MatrixAcc);
+  auto mark = [&](Operation *carrier, int64_t stride, bool columns) {
+    carrier->setAttr(kFragmentStride, IntegerAttr::get(IntegerType::get(ctx, 64), stride));
+    if (columns)
+      carrier->setAttr(kFragmentColumnMajor, UnitAttr::get(ctx));
+  };
+  // A fragment loaded (`kFragmentStride`): its first element's load, the
+  // matrix made of it.
+  auto loadFragment = [&](OpBuilder &at, OpOperand *operand, SmallVector<Value> indices, Type type, int64_t stride,
+                          bool columns) -> Value {
+    Value first = memref::LoadOp::create(at, loc, operand->get(), indices);
+    auto carrier = spirv::CompositeConstructOp::create(at, loc, type, ValueRange{first});
+    mark(carrier, stride, columns);
+    return carrier;
+  };
+  SmallVector<Value> initial;
+  for (int64_t i = 0; i < frags; ++i)
+    for (int64_t j = 0; j < frags; ++j) {
+      if (filled) {
+        initial.push_back(spirv::CompositeConstructOp::create(kb, loc, accumulator, ValueRange{filled}));
+        continue;
+      }
+      SmallVector<Value> at =
+          indicesOf(cOperand, {{dimM, add(kb, m0, constant(kb, i * kFragment))}, {dimN, add(kb, n0, constant(kb, j * kFragment))}});
+      initial.push_back(loadFragment(kb, cOperand, at, accumulator, *cStride, cColumns));
+    }
+  // Within this row of tiles' live slices (`liveK`, by `y`).
+  Value kFirst = constant(kb, 0), kEnd = constant(kb, k);
+  if (!liveK.empty()) {
+    auto byRow = [&](auto pick) {
+      Value value = constant(kb, pick(liveK.back()));
+      for (int64_t tm = tilesM - 2; tm >= 0; --tm) {
+        Value here = arith::CmpIOp::create(kb, loc, arith::CmpIPredicate::eq, launch.getBlockIds().y, constant(kb, tm));
+        value = arith::SelectOp::create(kb, loc, here, constant(kb, pick(liveK[tm])), value);
+      }
+      return value;
+    };
+    kFirst = byRow([](auto range) { return range.first; });
+    kEnd = byRow([](auto range) { return range.second; });
+  }
+  auto loop = scf::ForOp::create(
+      kb, loc, kFirst, kEnd, constant(kb, kFragment), initial,
+      [&](OpBuilder &lb, Location, Value k0, ValueRange acc) {
+        SmallVector<Value> as, bs;
+        for (int64_t i = 0; i < frags; ++i)
+          as.push_back(loadFragment(lb, a, indicesOf(a, {{dimM, add(lb, m0, constant(lb, i * kFragment))}, {dimK, k0}}),
+                                    aFragment, *aStride, aColumns));
+        for (int64_t j = 0; j < frags; ++j)
+          bs.push_back(loadFragment(lb, b, indicesOf(b, {{dimK, k0}, {dimN, add(lb, n0, constant(lb, j * kFragment))}}),
+                                    bFragment, *bStride, bColumns));
+        SmallVector<Value> next;
+        for (int64_t i = 0; i < frags; ++i)
+          for (int64_t j = 0; j < frags; ++j)
+            next.push_back(spirv::KHRCooperativeMatrixMulAddOp::create(lb, loc, accumulator, as[i], bs[j],
+                                                                       acc[i * frags + j],
+                                                                       spirv::CooperativeMatrixOperandsKHRAttr()));
+        scf::YieldOp::create(lb, loc, next);
+      });
+  for (int64_t i = 0; i < frags; ++i)
+    for (int64_t j = 0; j < frags; ++j) {
+      auto carrier = spirv::CompositeExtractOp::create(kb, loc, loop.getResult(i * frags + j), ArrayRef<int32_t>{0});
+      mark(carrier, *cStride, cColumns);
+      memref::StoreOp::create(
+          kb, loc, carrier, c,
+          indicesOf(cOperand, {{dimM, add(kb, m0, constant(kb, i * kFragment))}, {dimN, add(kb, n0, constant(kb, j * kFragment))}}));
+    }
+  if (!liveTiles.empty())
+    guardLiveTiles(kb, loc, launch, tilesN, liveTiles);
+  product->erase();
+  if (fill)
+    fill->erase();
+  return true;
 }
 
 static int64_t cleaveTileMatmulsForGpu(MlirOperation op) {
@@ -3180,6 +3586,10 @@ static int64_t cleaveTileMatmulsForGpu(MlirOperation op) {
       continue;
     SmallVector<int64_t> ranges = product.getStaticLoopRanges();
     int64_t m = ranges[dimM], n = ranges[dimN], k = ranges[dimK];
+    if (tileProductOnFragments(product, a, b, dimM, dimN, dimK, m, n, k, module)) {
+      ++tiled;
+      continue;
+    }
     SmallVector<const ProductTiling *> fitting;
     for (const ProductTiling &candidate : tilings) {
       int64_t threads = (candidate.bm / candidate.tm) * (candidate.bn / candidate.tn);
@@ -3244,16 +3654,7 @@ static int64_t cleaveTileMatmulsForGpu(MlirOperation op) {
     // from instead of the result's, the fill gone (2 of attention's 6
     // kernels per head). Its `cleave_vk_discard`, before it, stays
     // (`cleave-mark-full-overwrites` runs first).
-    linalg::FillOp fill;
-    for (Operation *before = product->getPrevNode(); before; before = before->getPrevNode()) {
-      if (auto candidate = dyn_cast<linalg::FillOp>(before)) {
-        if (candidate.hasPureBufferSemantics() && candidate.getOutputs()[0] == c)
-          fill = candidate;
-        break;
-      }
-      if (!isMemoryEffectFree(before))
-        break;
-    }
+    linalg::FillOp fill = fillBefore(product, c);
     Value filled = fill ? fill.getInputs()[0] : Value();
     // The work no one needs, found at compile time (`mayReach`, Presburger
     // arithmetic over the accesses' loops): tiles of the result no load
@@ -3281,7 +3682,7 @@ static int64_t cleaveTileMatmulsForGpu(MlirOperation op) {
           SmallVector<std::pair<int64_t, int64_t>> box =
               boxOf(outMap, {{dimM, {tm * bm, tm * bm + bm - 1}}, {dimN, {tn * bn, tn * bn + bn - 1}}});
           liveTiles.push_back(llvm::any_of(uses->loads, [&](memref::LoadOp load) {
-            return mayReach(func, load.getIndices(), box);
+            return accessMayReach(func, load, box);
           }));
         }
       if (llvm::all_of(liveTiles, [](bool live) { return live; }))
@@ -3669,43 +4070,8 @@ static int64_t cleaveTileMatmulsForGpu(MlirOperation op) {
               kb, loc, outerLoop.getResult(i * tn + j), c,
               indicesOf(product.getDpsInitOperand(0), {{dimM, rowOf(kb, i)}, {dimN, columnOf(kb, j)}}));
       }
-    if (!liveTiles.empty()) {
-      // The workgroup's work done if its tile is live: bit `y * tilesN + x`
-      // of a mask in 32-bit words (`liveTiles`), the same for the whole
-      // workgroup (its barriers then reached by all of it or none).
-      SmallVector<Operation *> work;
-      for (Operation &op : kernel.without_terminator())
-        if (!isa<memref::AllocOp>(op))
-          work.push_back(&op);
-      Type i32 = kb.getI32Type();
-      Value tile = add(kb, mul(kb, launch.getBlockIds().y, tilesN), launch.getBlockIds().x);
-      Value word = arith::IndexCastOp::create(kb, loc, i32, arith::DivUIOp::create(kb, loc, tile, constant(kb, 32)));
-      Value bit = arith::IndexCastOp::create(kb, loc, i32, arith::RemUIOp::create(kb, loc, tile, constant(kb, 32)));
-      auto maskOf = [&](size_t w) {
-        uint32_t mask = 0;
-        for (size_t t = w * 32; t < std::min(liveTiles.size(), (w + 1) * 32); ++t)
-          if (liveTiles[t])
-            mask |= uint32_t(1) << (t % 32);
-        return arith::ConstantIntOp::create(kb, loc, i32, int64_t(int32_t(mask))).getResult();
-      };
-      size_t words = (liveTiles.size() + 31) / 32;
-      Value mask = maskOf(words - 1);
-      for (size_t w = words - 1; w-- > 0;)
-        mask = arith::SelectOp::create(
-            kb, loc,
-            arith::CmpIOp::create(kb, loc, arith::CmpIPredicate::eq, word,
-                                  arith::ConstantIntOp::create(kb, loc, i32, int64_t(w))),
-            maskOf(w), mask);
-      Value one32 = arith::ConstantIntOp::create(kb, loc, i32, 1);
-      Value live = arith::CmpIOp::create(
-          kb, loc, arith::CmpIPredicate::ne,
-          arith::AndIOp::create(kb, loc, arith::ShRUIOp::create(kb, loc, mask, bit), one32),
-          arith::ConstantIntOp::create(kb, loc, i32, 0));
-      auto guard = scf::IfOp::create(kb, loc, TypeRange{}, live, /*withElseRegion=*/false);
-      Operation *end = guard.thenBlock()->getTerminator();
-      for (Operation *op : work)
-        op->moveBefore(end);
-    }
+    if (!liveTiles.empty())
+      guardLiveTiles(kb, loc, launch, tilesN, liveTiles);
     if (split > 1) {
       // The slices added to the result, an element per thread, in order.
       constexpr int64_t kThreads = 256;
@@ -4774,6 +5140,147 @@ CLEAVE_COUNTING_PASS(ParallelizeLoopsPass, "cleave-parallelize-loops",
 CLEAVE_COUNTING_PASS(GpuCopiesPass, "cleave-gpu-copies",
                      "copies between heap payloads made linalg copies, for the GPU",
                      cleaveGpuCopies)
+// Vulkan backend: each `gpu.module`'s SPIR-V environment, attached as a
+// target (`spirv-attach-target`, which `convert-gpu-to-spirv` reads), set
+// where `convert-math-to-spirv` looks for it too (`spirv.target_env`): it
+// fell back to SPIR-V 1.0 with `Shader` alone, where a kernel's cooperative
+// matrix fragments (`kFragmentStride`) are illegal.
+static int64_t cleaveSpirvTargetEnv(MlirOperation op) {
+  int64_t set = 0;
+  unwrap(op)->walk([&](gpu::GPUModuleOp kernels) {
+    ArrayAttr targets = kernels.getTargetsAttr();
+    if (!targets)
+      return;
+    for (Attribute target : targets)
+      if (auto env = dyn_cast<spirv::TargetEnvAttr>(target)) {
+        kernels->setAttr(spirv::getTargetEnvAttrName(), env);
+        ++set;
+        return;
+      }
+  });
+  return set;
+}
+CLEAVE_COUNTING_PASS(SpirvTargetEnvPass, "cleave-spirv-target-env",
+                     "GPU modules' attached SPIR-V environments set for the SPIR-V conversions",
+                     cleaveSpirvTargetEnv)
+
+// Vulkan backend, after `spirv-update-vce` (each kernel module's version,
+// capabilities and extensions deduced from its operations): what Vulkan
+// requires beyond them. Every module declares the version its conversion
+// targeted (`spirv.target_env`), which the code assumes beyond any
+// operation's needs: storage buffers among an entry point's interface,
+// `arith`'s overflow flags as decorations (both 1.4). A module of cooperative
+// matrices (`kFragmentStride`'s) declares the Vulkan memory model, which
+// Vulkan requires with `CooperativeMatrixKHR` (the runtime enables it), core
+// since SPIR-V 1.5, and `BFloat16CooperativeMatrixKHR` for bf16 fragments,
+// which the deduction misses.
+static int64_t cleaveSpirvRequirements(MlirOperation op) {
+  int64_t changed = 0;
+  unwrap(op)->walk([&](spirv::ModuleOp kernels) {
+    std::optional<spirv::VerCapExtAttr> triple = kernels.getVceTriple();
+    if (!triple)
+      return;
+    bool cooperative = false, bf16Fragments = false;
+    kernels.walk([&](Operation *inner) {
+      for (Type t : inner->getResultTypes())
+        if (auto fragment = dyn_cast<spirv::CooperativeMatrixType>(t)) {
+          cooperative = true;
+          bf16Fragments |= fragment.getElementType().isBF16();
+        }
+    });
+    spirv::Version version = triple->getVersion();
+    if (auto env = kernels->getAttrOfType<spirv::TargetEnvAttr>(spirv::getTargetEnvAttrName()))
+      version = std::max(version, env.getVersion());
+    SmallVector<spirv::Capability> capabilities(triple->getCapabilities());
+    bool added = false;
+    if (cooperative) {
+      version = std::max(version, spirv::Version::V_1_5);
+      // bf16 fragments' own capability, which the deduction misses.
+      for (spirv::Capability needed : {spirv::Capability::VulkanMemoryModel, spirv::Capability::BFloat16CooperativeMatrixKHR})
+        if ((needed != spirv::Capability::BFloat16CooperativeMatrixKHR || bf16Fragments) &&
+            !llvm::is_contained(capabilities, needed)) {
+          capabilities.push_back(needed);
+          added = true;
+        }
+      kernels.setMemoryModel(spirv::MemoryModel::Vulkan);
+    }
+    if (version == triple->getVersion() && !added)
+      return;
+    SmallVector<spirv::Extension> extensions(triple->getExtensions());
+    kernels.setVceTripleAttr(spirv::VerCapExtAttr::get(version, capabilities, extensions, kernels.getContext()));
+    ++changed;
+  });
+  return changed;
+}
+CLEAVE_COUNTING_PASS(SpirvRequirementsPass, "cleave-spirv-requirements",
+                     "SPIR-V kernel modules given what Vulkan requires beyond their operations",
+                     cleaveSpirvRequirements)
+
+// Vulkan backend, after `convert-gpu-to-spirv`: each fragment carrier
+// (`kFragmentStride`) made the cooperative matrix load or store it stands for,
+// at the pointer the conversion made for its first element's `memref.load`
+// or `memref.store`, with the marked row stride and layout. A carrier whose
+// access isn't there any more is an error.
+struct LowerFragmentCarriersPass : PassWrapper<LowerFragmentCarriersPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LowerFragmentCarriersPass)
+  LowerFragmentCarriersPass() = default;
+  LowerFragmentCarriersPass(const LowerFragmentCarriersPass &other) : PassWrapper(other) {}
+  StringRef getArgument() const final { return "cleave-lower-fragment-carriers"; }
+  StringRef getName() const final { return "cleave-lower-fragment-carriers"; }
+  StringRef getDescription() const final {
+    return "cooperative matrix fragment carriers made SPIR-V cooperative matrix loads and stores";
+  }
+  Statistic lowered{this, "lowered", "fragment loads and stores"};
+  void runOnOperation() final {
+    // In the converted kernels (the `gpu.module`s they came from stay until
+    // `cleave-lower-gpu-launches`).
+    SmallVector<Operation *> carriers;
+    getOperation().walk([&](spirv::ModuleOp kernels) {
+      kernels.walk([&](Operation *op) {
+        if (op->hasAttr(kFragmentStride) && isa<spirv::CompositeConstructOp, spirv::CompositeExtractOp>(op))
+          carriers.push_back(op);
+      });
+    });
+    for (Operation *carrier : carriers) {
+      OpBuilder builder(carrier);
+      Location loc = carrier->getLoc();
+      auto strideAttr = carrier->getAttrOfType<IntegerAttr>(kFragmentStride);
+      auto layout = carrier->hasAttr(kFragmentColumnMajor) ? spirv::CooperativeMatrixLayoutKHR::ColumnMajor
+                                                           : spirv::CooperativeMatrixLayoutKHR::RowMajor;
+      auto strideAt = [&](OpBuilder &at) {
+        return spirv::ConstantOp::create(at, loc, at.getI32Type(), at.getI32IntegerAttr(int32_t(strideAttr.getInt())));
+      };
+      if (auto construct = dyn_cast<spirv::CompositeConstructOp>(carrier)) {
+        auto load = construct.getConstituents()[0].getDefiningOp<spirv::LoadOp>();
+        if (!load) {
+          carrier->emitError("a cooperative matrix fragment's load lost in the conversion to SPIR-V");
+          return signalPassFailure();
+        }
+        Value fragment = spirv::KHRCooperativeMatrixLoadOp::create(builder, loc, construct.getType(), load.getPtr(),
+                                                                   strideAt(builder), layout);
+        construct.replaceAllUsesWith(fragment);
+        construct.erase();
+        if (load->use_empty())
+          load.erase();
+      } else {
+        for (Operation *user : llvm::make_early_inc_range(carrier->getUsers())) {
+          auto store = dyn_cast<spirv::StoreOp>(user);
+          if (!store || store.getValue() != carrier->getResult(0)) {
+            carrier->emitError("a cooperative matrix fragment's store lost in the conversion to SPIR-V");
+            return signalPassFailure();
+          }
+          OpBuilder at(store);
+          spirv::KHRCooperativeMatrixStoreOp::create(at, loc, store.getPtr(), carrier->getOperand(0), strideAt(at),
+                                                     layout);
+          store.erase();
+        }
+        carrier->erase();
+      }
+      ++lowered;
+    }
+  }
+};
+
 // Vulkan backend: products for the tensor cores become calls to the runtime's
 // GEMMs before the kernels are formed, their operands bound as a kernel's are
 // (`memrefSpan`, the mirrors' keys), the transpositions read from the indexing
@@ -4904,6 +5411,9 @@ void registerGpuPasses() {
   PassRegistration<GpuCopiesPass>();
   PassRegistration<SyncHostAccessesPass>();
   PassRegistration<LowerGpuGemmsPass>();
+  PassRegistration<LowerFragmentCarriersPass>();
+  PassRegistration<SpirvTargetEnvPass>();
+  PassRegistration<SpirvRequirementsPass>();
   PassRegistration<FoldLoopsIntoGridsPass>();
   PassRegistration<LowerGpuLaunchesPass>();
 }

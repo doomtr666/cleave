@@ -812,6 +812,65 @@ impl<const N: i32, const D: i32, const L: i32, const DH: i32> CausalAttention<Te
     }
 }
 
+// Causal attention on bf16 queries, keys and values (`doc/plan-quantization.md`), the program's
+// choice: every product of bf16 operands accumulated in f32 (`matmul_wide`: on the Vulkan
+// backend, cooperative matrices in the generated kernels, each head a block of its matrices), the
+// softmax and the score gradient in f32 from the f32 products, the weights and the score gradient
+// written in bf16 for the products that read them (`causal_softmax_bf16`,
+// `attention_score_grad_bf16`), the results rounded to bf16. The gradient as the f32 version's,
+// one pass per block.
+impl<const N: i32, const D: i32, const L: i32, const DH: i32> CausalAttention<Tensor<bf16, N, D>, AttentionShape<L, DH>> {
+    #[no_inline]
+    fn causal_attention(q, k, v, shape) {
+        let mut out: Tensor<bf16, N, D> = uninitialized();
+        for s in 0..N / L {
+            for h in 0..D / DH {
+                let r0 = s * L;
+                let c0 = h * DH;
+                let qh: Tensor<bf16, L, DH> = slice(q, r0, c0);
+                let kh: Tensor<bf16, L, DH> = slice(k, r0, c0);
+                let vh: Tensor<bf16, L, DH> = slice(v, r0, c0);
+                let scores: Tensor<f32, L, L> = matmul_wide_transpose_b(qh, kh);
+                let p = causal_softmax_bf16(scores, DH);
+                let oh: Tensor<f32, L, DH> = matmul_wide(p, vh);
+                let ob: Tensor<bf16, L, DH> = oh.to();
+                out = update(out, ob, r0, c0);
+            };
+        };
+        out
+    }
+    #[no_inline]
+    fn causal_attention_backward(q, k, v, shape, u) {
+        let mut dq: Tensor<bf16, N, D> = uninitialized();
+        let mut dk: Tensor<bf16, N, D> = uninitialized();
+        let mut dv: Tensor<bf16, N, D> = uninitialized();
+        for s in 0..N / L {
+            for h in 0..D / DH {
+                let r0 = s * L;
+                let c0 = h * DH;
+                let qh: Tensor<bf16, L, DH> = slice(q, r0, c0);
+                let kh: Tensor<bf16, L, DH> = slice(k, r0, c0);
+                let vh: Tensor<bf16, L, DH> = slice(v, r0, c0);
+                let uh: Tensor<bf16, L, DH> = slice(u, r0, c0);
+                let scores: Tensor<f32, L, L> = matmul_wide_transpose_b(qh, kh);
+                let pb = causal_softmax_bf16(scores, DH);
+                let dp: Tensor<f32, L, L> = matmul_wide_transpose_b(uh, vh);
+                let ds = attention_score_grad_bf16(scores, dp, DH);
+                let gq: Tensor<f32, L, DH> = matmul_wide(ds, kh);
+                let gk: Tensor<f32, L, DH> = matmul_wide_transpose_a(ds, qh);
+                let gv: Tensor<f32, L, DH> = matmul_wide_transpose_a(pb, uh);
+                let gqb: Tensor<bf16, L, DH> = gq.to();
+                let gkb: Tensor<bf16, L, DH> = gk.to();
+                let gvb: Tensor<bf16, L, DH> = gv.to();
+                dq = update(dq, gqb, r0, c0);
+                dk = update(dk, gkb, r0, c0);
+                dv = update(dv, gvb, r0, c0);
+            };
+        };
+        (dq, dk, dv)
+    }
+}
+
 // Attention over a key/value cache, the decoding side of `causal_attention`: each of the `N`
 // query rows attends to the first `count` rows of `k` and `v`, `[L, D]` with heads `DH` wide, the
 // keys and values of the tokens seen so far (the newest included). Rows are slots, not positions:
@@ -849,8 +908,8 @@ fn cached_attention<const N: i32, const D: i32, const L: i32, const DH: i32>(q: 
 
 // A tensor whose every element its producer writes (`sgemm` with `beta` 0, a block-by-block
 // result): no initialization to pay for.
-fn uninitialized<const R: i32, const C: i32>() -> Tensor<f32, R, C> {
-    let buffer: [f32; R, C] = mlir::memref::alloc();
+fn uninitialized<T: Float, const R: i32, const C: i32>() -> Tensor<T, R, C> {
+    let buffer: [T; R, C] = mlir::memref::alloc();
     mlir::bufferization::to_tensor(buffer, restrict: "unit")
 }
 
@@ -889,6 +948,47 @@ fn attention_score_grad<const L: i32>(p: Tensor<f32, L, L>, dp: Tensor<f32, L, L
         let mut dot = 0.0;
         for j in 0..i + 1 { dot = dot + dp[i, j] * p[i, j]; };
         for j in 0..i + 1 { ds[i, j] = p[i, j] * (dp[i, j] - dot) * scale; };
+        for j in i + 1..L { ds[i, j] = 0.0; };
+    };
+    Tensor(data: ds)
+}
+
+// `causal_softmax`'s weights rounded to bf16 (the bf16 attention's): each row's exponentials
+// computed twice, for its sum and then for the weights, rather than stored in f32 and read back,
+// one pass writing bf16 where the f32 version writes, reads and writes again (and a conversion
+// read it all once more).
+fn causal_softmax_bf16<const L: i32>(scores: Tensor<f32, L, L>, dh: i32) -> Tensor<bf16, L, L> {
+    let width: f32 = dh.to();
+    let scale = 1.0 / mlir::math::sqrt(width);
+    let mut p: [[bf16; L]; L] = mlir::memref::alloc();
+    for i in 0..L {
+        let mut m = scores[i, 0];
+        for j in 1..i + 1 { if scores[i, j] > m { m = scores[i, j]; }; };
+        let mut z = 0.0;
+        for j in 0..i + 1 { z = z + exp((scores[i, j] - m) * scale); };
+        let rz = 1.0 / z;
+        for j in 0..i + 1 { p[i, j] = (exp((scores[i, j] - m) * scale) * rz).to(); };
+        for j in i + 1..L { p[i, j] = 0.0; };
+    };
+    Tensor(data: p)
+}
+
+// `attention_score_grad` from the scores rather than the weights, rounded to bf16 (the bf16
+// attention's): each row's weights recomputed (`causal_softmax_bf16`'s maximum and sum, then
+// each weight where it's needed), no f32 weights stored for it.
+fn attention_score_grad_bf16<const L: i32>(scores: Tensor<f32, L, L>, dp: Tensor<f32, L, L>, dh: i32) -> Tensor<bf16, L, L> {
+    let width: f32 = dh.to();
+    let scale = 1.0 / mlir::math::sqrt(width);
+    let mut ds: [[bf16; L]; L] = mlir::memref::alloc();
+    for i in 0..L {
+        let mut m = scores[i, 0];
+        for j in 1..i + 1 { if scores[i, j] > m { m = scores[i, j]; }; };
+        let mut z = 0.0;
+        for j in 0..i + 1 { z = z + exp((scores[i, j] - m) * scale); };
+        let rz = 1.0 / z;
+        let mut dot = 0.0;
+        for j in 0..i + 1 { dot = dot + dp[i, j] * exp((scores[i, j] - m) * scale) * rz; };
+        for j in 0..i + 1 { ds[i, j] = (exp((scores[i, j] - m) * scale) * rz * (dp[i, j] - dot) * scale).to(); };
         for j in i + 1..L { ds[i, j] = 0.0; };
     };
     Tensor(data: ds)
