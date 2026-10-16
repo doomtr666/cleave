@@ -40,6 +40,9 @@ pub struct DeviceInfo {
     /// without the extension: what a tensor-core kernel can be built from
     /// (`doc/plan-quantization.md`, phase 0).
     pub cooperative_matrices: Vec<CooperativeMatrixShape>,
+    /// Whether kernels can hold bfloat16 values (`VK_KHR_shader_bfloat16`'s `shaderBFloat16Type`):
+    /// what a program with `bf16` tensors needs on this device.
+    pub bf16: bool,
 }
 
 /// One cooperative-matrix product a device supports: `result[M, N] = A[M, K] B[K, N] + C[M, N]`
@@ -278,10 +281,15 @@ pub fn devices() -> Result<Vec<DeviceInfo>, Error> {
 fn device_info(entry: &ash::Entry, instance: &ash::Instance, physical: vk::PhysicalDevice) -> DeviceInfo {
     let properties = unsafe { instance.get_physical_device_properties(physical) };
     let name = properties.device_name_as_c_str().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let extensions = unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
+    let has_bf16 = extensions.iter().any(|e| e.extension_name_as_c_str().is_ok_and(|n| n == SHADER_BFLOAT16_NAME))
+        && properties.api_version >= vk::API_VERSION_1_2;
+    let bf16 = has_bf16 && OptionalFeatures::query(instance, physical, false, true, false, false).bf16.shader_bfloat16_type != 0;
     DeviceInfo {
         name,
         discrete: properties.device_type == vk::PhysicalDeviceType::DISCRETE_GPU,
         cooperative_matrices: cooperative_matrices(entry, instance, physical),
+        bf16,
     }
 }
 
@@ -632,6 +640,18 @@ impl Gpu {
     /// `spirv`, reading and writing `bindings` storage buffers (set 0,
     /// bindings `0..bindings`, in the order a dispatch passes them).
     pub fn kernel(&self, spirv: &[u32], entry: &str, bindings: u32) -> Result<Kernel<'_>, Error> {
+        self.kernel_specialized(spirv, entry, bindings, &[])
+    }
+
+    /// [`Gpu::kernel`] with specialization constants: `(constant_id, value)` pairs, each a 32-bit
+    /// value (a `uint`, or a `bool` as 0 or 1).
+    pub fn kernel_specialized(
+        &self,
+        spirv: &[u32],
+        entry: &str,
+        bindings: u32,
+        constants: &[(u32, u32)],
+    ) -> Result<Kernel<'_>, Error> {
         let device = &self.device;
         let module = unsafe { device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(spirv), None) }
             .map_err(fail("creating the shader module"))?;
@@ -662,10 +682,18 @@ impl Gpu {
             unsafe { device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts), None) }
                 .map_err(fail("creating the pipeline layout"))?;
         let name = CString::new(entry).map_err(|_| Error(format!("entry point name {entry:?}")))?;
+        let entries: Vec<vk::SpecializationMapEntry> = constants
+            .iter()
+            .enumerate()
+            .map(|(i, &(id, _))| vk::SpecializationMapEntry::default().constant_id(id).offset(4 * i as u32).size(4))
+            .collect();
+        let values: Vec<u8> = constants.iter().flat_map(|&(_, v)| v.to_le_bytes()).collect();
+        let specialization = vk::SpecializationInfo::default().map_entries(&entries).data(&values);
         let stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(module)
             .name(&name);
+        let stage = if constants.is_empty() { stage } else { stage.specialization_info(&specialization) };
         let pipeline = unsafe {
             device.create_compute_pipelines(
                 vk::PipelineCache::null(),
@@ -1412,7 +1440,9 @@ extern "C" fn report() {
             k.name
         );
     }
-    for k in kernels.iter().take(30) {
+    // `CLEAVE_VK_PROFILE_KERNELS`: how many kernels to list, 30 by default.
+    let listed = std::env::var("CLEAVE_VK_PROFILE_KERNELS").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
+    for k in kernels.iter().take(listed) {
         let mean = if k.timed > 0 { k.gpu_ns / k.timed as f64 / 1e3 } else { 0.0 };
         let _ = writeln!(
             out,
@@ -2082,6 +2112,144 @@ pub unsafe extern "C" fn cleave_vk_dispatch(
     bytes: i64,
     flags: i64,
 ) {
+    // SAFETY: as documented, every pointer is valid for what it describes.
+    let entry = unsafe { CStr::from_ptr(entry as usize as *const std::ffi::c_char) }.to_string_lossy().into_owned();
+    let count = count as usize;
+    let (pointers, bytes, flags) = unsafe {
+        (
+            std::slice::from_raw_parts(pointers as usize as *const i64, count),
+            std::slice::from_raw_parts(bytes as usize as *const i64, count),
+            std::slice::from_raw_parts(flags as usize as *const i64, count),
+        )
+    };
+    // SAFETY: `spirv` points to `words` words, as documented.
+    let binary = unsafe { std::slice::from_raw_parts(spirv as usize as *const u32, words as usize) };
+    unsafe { dispatch(binary, &entry, &entry, &[], [groups_x, groups_y, groups_z], pointers, bytes, flags) };
+}
+
+/// The bfloat16 GEMM kernel (`kernels/gemm_bf16.comp`), compiled by `kernels/build.ps1`.
+static GEMM_BF16: &[u8] = include_bytes!("../kernels/gemm_bf16.spv");
+
+/// A product the program asked to compute in bfloat16 (`stdlib/linalg`'s `MatMulBf16`, lowered by
+/// `cleave-lower-gpu-gemms`): `C = op(A) op(B)` with `A`, `B`, `C` float32 heap payloads (`a`, `b`,
+/// `c`, `*_bytes` bytes each, mirrored as a kernel's arguments are), `A` `m x k` (`k x m` stored
+/// when `ta`), `B` `k x n` (`n x k` when `tb`), on the tensor cores (`kernels/gemm_bf16.comp`). `m`
+/// and `n` multiples of 128, `k` of 32: the compiler checks. Recorded like a dispatch, not waited for.
+///
+/// # Safety
+///
+/// Each pointer is a live heap payload of the given size, as for [`cleave_vk_dispatch`]'s mirrored
+/// arguments.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cleave_vk_gemm_bf16(
+    a: i64,
+    a_bytes: i64,
+    b: i64,
+    b_bytes: i64,
+    c: i64,
+    c_bytes: i64,
+    m: i64,
+    n: i64,
+    k: i64,
+    ta: i64,
+    tb: i64,
+) {
+    static WORDS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    let binary = WORDS.get_or_init(|| {
+        GEMM_BF16.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect()
+    });
+    if m % 128 != 0 || n % 128 != 0 || k % 32 != 0 {
+        abort_with(format!("cleave_vk_gemm_bf16: {m}x{n}x{k} is not a multiple of 128x128x32"));
+    }
+    let (lda, ldb, ldc) = (if ta != 0 { m } else { k }, if tb != 0 { k } else { n }, n);
+    let constants = [
+        (0, m as u32),
+        (1, n as u32),
+        (2, k as u32),
+        (3, lda as u32),
+        (4, ldb as u32),
+        (5, ldc as u32),
+        (6, (ta != 0) as u32),
+        (7, (tb != 0) as u32),
+    ];
+    let name = format!("gemm_bf16<{m}x{n}x{k}{}{}>", if ta != 0 { ", A^T" } else { "" }, if tb != 0 { ", B^T" } else { "" });
+    let pointers = [a, b, c];
+    let bytes = [a_bytes, b_bytes, c_bytes];
+    let flags = [ARG_MIRROR | ARG_READ, ARG_MIRROR | ARG_READ, ARG_MIRROR | ARG_WRITTEN];
+    unsafe { dispatch(binary, "main", &name, &constants, [n / 128, m / 128, 1], &pointers, &bytes, &flags) };
+}
+
+/// The bfloat16-operand GEMM kernel (`kernels/gemm_bf16_in.comp`).
+static GEMM_BF16_OPERANDS: &[u8] = include_bytes!("../kernels/gemm_bf16_in.spv");
+
+/// A product of bf16 tensors (`cleave-lower-gpu-gemms`): as [`cleave_vk_gemm_bf16`], with `a` and `b`
+/// bfloat16 in memory (`kernels/gemm_bf16_in.comp`, no rounding on the way), `c` float32. `m` and
+/// `n` multiples of 128, `k` of 32, every leading dimension of 8: the compiler checks.
+///
+/// # Safety
+///
+/// As [`cleave_vk_gemm_bf16`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cleave_vk_gemm_bf16_operands(
+    a: i64,
+    a_bytes: i64,
+    b: i64,
+    b_bytes: i64,
+    c: i64,
+    c_bytes: i64,
+    m: i64,
+    n: i64,
+    k: i64,
+    ta: i64,
+    tb: i64,
+) {
+    static WORDS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    let binary = WORDS.get_or_init(|| {
+        GEMM_BF16_OPERANDS.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect()
+    });
+    if m % 128 != 0 || n % 128 != 0 || k % 32 != 0 {
+        abort_with(format!("cleave_vk_gemm_bf16_operands: {m}x{n}x{k} is not a multiple of 128x128x32"));
+    }
+    let (lda, ldb, ldc) = (if ta != 0 { m } else { k }, if tb != 0 { k } else { n }, n);
+    let constants = [
+        (0, m as u32),
+        (1, n as u32),
+        (2, k as u32),
+        (3, lda as u32),
+        (4, ldb as u32),
+        (5, ldc as u32),
+        (6, (ta != 0) as u32),
+        (7, (tb != 0) as u32),
+    ];
+    let name = format!(
+        "gemm_bf16_operands<{m}x{n}x{k}{}{}>",
+        if ta != 0 { ", A^T" } else { "" },
+        if tb != 0 { ", B^T" } else { "" }
+    );
+    let pointers = [a, b, c];
+    let bytes = [a_bytes, b_bytes, c_bytes];
+    let flags = [ARG_MIRROR | ARG_READ, ARG_MIRROR | ARG_READ, ARG_MIRROR | ARG_WRITTEN];
+    unsafe { dispatch(binary, "main", &name, &constants, [n / 128, m / 128, 1], &pointers, &bytes, &flags) };
+}
+
+/// One kernel launch: `cleave_vk_dispatch`'s work, for any kernel. `entry` is the binary's entry
+/// point, `key` how the kernel is cached and profiled (with `constants`, its specialization: the
+/// same binary specialized differently is another kernel).
+///
+/// # Safety
+///
+/// As [`cleave_vk_dispatch`]: each `pointers[i]` to `bytes[i]` bytes the caller owns, a live
+/// payload when flagged [`ARG_MIRROR`].
+unsafe fn dispatch(
+    binary: &[u32],
+    entry: &str,
+    key_name: &str,
+    constants: &[(u32, u32)],
+    [groups_x, groups_y, groups_z]: [i64; 3],
+    pointers: &[i64],
+    bytes: &[i64],
+    flags: &[i64],
+) {
     let entered = std::time::Instant::now();
     let mut guard = lock();
     let runtime = runtime(&mut guard);
@@ -2097,26 +2265,21 @@ pub unsafe extern "C" fn cleave_vk_dispatch(
             phase_waited = runtime.stats.wait_ns;
         }};
     }
-    // SAFETY: as documented, every pointer is valid for what it describes.
-    let entry = unsafe { CStr::from_ptr(entry as usize as *const std::ffi::c_char) }.to_string_lossy().into_owned();
-    let count = count as usize;
-    let pointers = unsafe { std::slice::from_raw_parts(pointers as usize as *const i64, count) };
-    let bytes = unsafe { std::slice::from_raw_parts(bytes as usize as *const i64, count) };
-    let flags = unsafe { std::slice::from_raw_parts(flags as usize as *const i64, count) };
+    let count = pointers.len();
     if tracing() {
         let args: Vec<String> =
             (0..count).map(|i| format!("{:#x}+{} f{}", pointers[i], bytes[i], flags[i])).collect();
         eprintln!("cleave Vulkan dispatch `{entry}` [{groups_x}, {groups_y}, {groups_z}]: {}", args.join(", "));
     }
-    let key = (spirv as usize, entry.clone());
+    let key = (binary.as_ptr() as usize, key_name.to_string());
     if !runtime.kernels.contains_key(&key) {
-        let binary = unsafe { std::slice::from_raw_parts(spirv as usize as *const u32, words as usize) };
-        let kernel =
-            gpu.kernel(binary, &entry, count as u32).unwrap_or_else(|e| abort_with(format!("kernel `{entry}`: {e}")));
+        let kernel = gpu
+            .kernel_specialized(binary, entry, count as u32, constants)
+            .unwrap_or_else(|e| abort_with(format!("kernel `{key_name}`: {e}")));
         runtime.kernels.insert(key.clone(), kernel);
         let id = runtime.profile.len();
         runtime.profile.push(KernelProfile {
-            name: format!("{entry} #{id} [{groups_x}, {groups_y}, {groups_z}]"),
+            name: format!("{key_name} #{id} [{groups_x}, {groups_y}, {groups_z}]"),
             ..Default::default()
         });
         runtime.kernel_ids.insert(key.clone(), id);

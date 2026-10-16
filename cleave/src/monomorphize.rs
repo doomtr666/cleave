@@ -2363,6 +2363,17 @@ fn seed_adjoint_rule_references(
     } else {
         vec![&rule.body]
     };
+    // A parameter's contributions are summed (`egraph.rs::accumulate_
+    // adjoint`) when its value has several uses: `Additive::add` at its type,
+    // which the forward program needn't ever call (a bf16 tensor rounded
+    // once, read by two `matmul_wide`s, is never added in bf16).
+    for p in &rule.params {
+        if let Some(ty) = param_tys.get(p.name.as_str())
+            && let Some(seed) = find_impl_for_target(templates, registry, "Additive", "add", &[Some(ty.clone())])
+        {
+            impl_worklist.push(seed);
+        }
+    }
     for body in bodies {
         resolve_derivative_rule_expr_ty(
             body,

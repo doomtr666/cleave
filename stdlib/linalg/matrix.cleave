@@ -220,6 +220,91 @@ impl<const P: i32, const Q: i32, const R: i32>
     }
 }
 
+// The transposed products of bf16 tensors: as `matmul` on them, a bf16 result accumulated in f32
+// and rounded once (`mlir_lower.rs::widened_16_bit_float_tensor`), never BLAS (f32 only); on the
+// Vulkan backend the tensor cores (`cleave-lower-gpu-gemms`). What a bf16 layer's backward needs.
+impl<const P: i32, const Q: i32, const R: i32>
+    MatMulTransposeA<Tensor<bf16,P,Q>, Tensor<bf16,P,R>, Tensor<bf16,Q,R>> {
+    fn matmul_transpose_a(a, b) { mlir::linalg::matmul_transpose_a(a, b) }
+}
+
+impl<const P: i32, const Q: i32, const R: i32>
+    MatMulTransposeB<Tensor<bf16,P,Q>, Tensor<bf16,R,Q>, Tensor<bf16,P,R>> {
+    fn matmul_transpose_b(a, b) { mlir::linalg::matmul_transpose_b(a, b) }
+}
+
+// bf16 operands, an f32 result (`doc/plan-quantization.md`): the product of mixed precision, its
+// accumulator kept, no rounding of the result (`matmul` of bf16 tensors rounds it to bf16). On the
+// Vulkan backend the tensor cores with bf16 operands (`cleave-lower-gpu-gemms`). Its adjoint: the
+// upstream f32 gradient rounded to bf16 once, the operands' gradients computed the same way and
+// rounded to their bf16 type.
+algebra MatMulWide<A, B, C> {
+    fn matmul_wide(a: A, b: B) -> C;
+    adjoint matmul_wide(a, b), u: (
+        round_bf16(matmul_wide_transpose_b(round_bf16(u), b)),
+        round_bf16(matmul_wide_transpose_a(a, round_bf16(u)))
+    );
+}
+
+algebra MatMulWideTransposeA<A, B, C> {
+    fn matmul_wide_transpose_a(a: A, b: B) -> C;
+}
+
+algebra MatMulWideTransposeB<A, B, C> {
+    fn matmul_wide_transpose_b(a: A, b: B) -> C;
+}
+
+impl<const N: i32, const M: i32, const K: i32>
+    MatMulWide<Tensor<bf16,N,M>, Tensor<bf16,M,K>, Tensor<f32,N,K>> {
+    fn matmul_wide(a, b) { mlir::linalg::matmul(a, b) }
+}
+
+impl<const P: i32, const Q: i32, const R: i32>
+    MatMulWideTransposeA<Tensor<bf16,P,Q>, Tensor<bf16,P,R>, Tensor<f32,Q,R>> {
+    fn matmul_wide_transpose_a(a, b) { mlir::linalg::matmul_transpose_a(a, b) }
+}
+
+impl<const P: i32, const Q: i32, const R: i32>
+    MatMulWideTransposeB<Tensor<bf16,P,Q>, Tensor<bf16,R,Q>, Tensor<f32,P,R>> {
+    fn matmul_wide_transpose_b(a, b) { mlir::linalg::matmul_transpose_b(a, b) }
+}
+
+// A product computed in bfloat16 (`doc/plan-quantization.md`): the f32 operands
+// rounded to bf16 (to nearest, ties to even), multiplied, accumulated in f32,
+// an f32 result. The program's choice of precision for this product, written
+// where it's made: on the Vulkan backend the tensor cores' bf16 x bf16 + f32
+// (`cleave-lower-gpu-gemms`, `cleave_vk_gemm_bf16`), on the CPU the same
+// rounding then a mixed-precision product. Its adjoint is computed in bf16 as
+// well, through the transposed forms, as `MatMul`'s is through its own.
+algebra MatMulBf16<A, B, C> {
+    fn matmul_bf16(a: A, b: B) -> C;
+    adjoint matmul_bf16(a, b), u: (matmul_bf16_transpose_b(u, b), matmul_bf16_transpose_a(a, u));
+}
+
+algebra MatMulBf16TransposeA<A, B, C> {
+    fn matmul_bf16_transpose_a(a: A, b: B) -> C;
+}
+
+algebra MatMulBf16TransposeB<A, B, C> {
+    fn matmul_bf16_transpose_b(a: A, b: B) -> C;
+    adjoint matmul_bf16_transpose_b(a, b), u: (matmul_bf16(u, b), matmul_bf16_transpose_a(u, a));
+}
+
+impl<const N: i32, const M: i32, const K: i32>
+    MatMulBf16<Tensor<f32,N,M>, Tensor<f32,M,K>, Tensor<f32,N,K>> {
+    fn matmul_bf16(a, b) { mlir::linalg::matmul(a, b, compute: "bf16") }
+}
+
+impl<const P: i32, const Q: i32, const R: i32>
+    MatMulBf16TransposeA<Tensor<f32,P,Q>, Tensor<f32,P,R>, Tensor<f32,Q,R>> {
+    fn matmul_bf16_transpose_a(a, b) { mlir::linalg::matmul_transpose_a(a, b, compute: "bf16") }
+}
+
+impl<const P: i32, const Q: i32, const R: i32>
+    MatMulBf16TransposeB<Tensor<f32,P,Q>, Tensor<f32,R,Q>, Tensor<f32,P,R>> {
+    fn matmul_bf16_transpose_b(a, b) { mlir::linalg::matmul_transpose_b(a, b, compute: "bf16") }
+}
+
 // `dW = H^T*dZ` — `a: Tensor<T,N,M>` (`H`, read as if transposed) times
 // `u: Tensor<T,N,K>` (`dZ`) gives `Tensor<T,M,K>` (`dW`'s own shape),
 // matching `MatMul`'s own `adjoint`'s second return slot exactly.

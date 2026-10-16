@@ -1,0 +1,139 @@
+// C[M,N] = op(A) op(B): float32 in memory, multiplied in bfloat16 on cooperative matrices (tensor
+// cores), accumulated and stored in float32. The GPU side of a product the program asked to compute
+// in bf16 (`doc/plan-quantization.md`). Structure after NVIDIA's `vk_cooperative_matrix_perf`
+// shared-memory shader (MIT): 128x128 output tiles, K by 32, 8 subgroups of 64x32, the next tile's
+// global loads in registers while the current one is multiplied.
+//
+// A is M x K, or K x M stored when `TA` (read transposed); B is K x N, or N x K when `TB`. Every
+// matrix row major with its leading dimension (`LDA`, `LDB`, `LDC`, in elements). The float32 inputs
+// are rounded to bfloat16 (to nearest, ties to even) as they're copied into shared memory, where a
+// tile keeps the order it has in memory (contiguous writes); a transposed operand's fragments are
+// then loaded column major.
+// M and N multiples of 128, K of 32, leading dimensions of 4 (the caller checks).
+//
+// Compiled by `glslangValidator --target-env vulkan1.3 -V gemm_bf16.comp -o gemm_bf16.spv`
+// (`cleave-vk/kernels/build.ps1`); the binary is embedded in `cleave-vk`.
+#version 450
+#pragma use_vulkan_memory_model
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_bfloat16 : require
+
+layout(constant_id = 0) const uint M = 128;
+layout(constant_id = 1) const uint N = 128;
+layout(constant_id = 2) const uint K = 32;
+layout(constant_id = 3) const uint LDA = 32;
+layout(constant_id = 4) const uint LDB = 128;
+layout(constant_id = 5) const uint LDC = 128;
+layout(constant_id = 6) const bool TA = false;
+layout(constant_id = 7) const bool TB = false;
+
+const uint BM = 128;
+const uint BN = 128;
+const uint BK = 32;
+const uint SG_ROWS = 2;
+const uint SG_COLS = 4;
+const uint THREADS = SG_ROWS * SG_COLS * 32;
+const uint WM = BM / SG_ROWS;
+const uint WN = BN / SG_COLS;
+const uint FM = WM / 16;
+const uint FN = WN / 16;
+const uint PAD = 8;
+// Shared row lengths: a tile as stored in memory, k-major rows when transposed.
+const uint SA = TA ? BM + PAD : BK + PAD;
+const uint SB = TB ? BK + PAD : BN + PAD;
+const uint SA_SIZE = (BM + PAD) * (BK + PAD);
+const uint SB_SIZE = (BN + PAD) * (BK + PAD);
+// Float vectors of a tile, per thread.
+const uint VA = BM * BK / 4 / THREADS;
+const uint VB = BK * BN / 4 / THREADS;
+
+layout(local_size_x = THREADS) in;
+layout(set = 0, binding = 0) readonly buffer InA { vec4 a[]; };
+layout(set = 0, binding = 1) readonly buffer InB { vec4 b[]; };
+layout(set = 0, binding = 2) writeonly buffer OutC { float c[]; };
+
+shared bfloat16_t As[SA_SIZE];
+shared bfloat16_t Bs[SB_SIZE];
+
+// Vector `v` of the A tile: its row and column in the tile as stored in memory (`TA`: k rows of m),
+// and its address.
+void a_place(uint v, uint row0, uint k0, out uint r, out uint c, out uint addr) {
+    if (TA) {
+        r = v / (BM / 4); c = (v % (BM / 4)) * 4;
+        addr = ((k0 + r) * LDA + row0 + c) / 4;
+    } else {
+        r = v / (BK / 4); c = (v % (BK / 4)) * 4;
+        addr = ((row0 + r) * LDA + k0 + c) / 4;
+    }
+}
+
+void b_place(uint v, uint col0, uint k0, out uint r, out uint c, out uint addr) {
+    if (TB) {
+        r = v / (BK / 4); c = (v % (BK / 4)) * 4;
+        addr = ((col0 + r) * LDB + k0 + c) / 4;
+    } else {
+        r = v / (BN / 4); c = (v % (BN / 4)) * 4;
+        addr = ((k0 + r) * LDB + col0 + c) / 4;
+    }
+}
+
+// Four consecutive floats of a tile's row (as stored in memory) into shared memory as bfloat16.
+void a_store(uint r, uint c, vec4 x) {
+    [[unroll]] for (uint i = 0; i < 4; i++) As[r * SA + c + i] = bfloat16_t(x[i]);
+}
+
+void b_store(uint r, uint c, vec4 x) {
+    [[unroll]] for (uint i = 0; i < 4; i++) Bs[r * SB + c + i] = bfloat16_t(x[i]);
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint row0 = gl_WorkGroupID.y * BM;
+    uint col0 = gl_WorkGroupID.x * BN;
+    uint wr = (gl_SubgroupID / SG_COLS) * WM;
+    uint wc = (gl_SubgroupID % SG_COLS) * WN;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[FM][FN];
+    [[unroll]] for (uint i = 0; i < FM; i++)
+        [[unroll]] for (uint j = 0; j < FN; j++)
+            acc[i][j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    vec4 ra[VA];
+    vec4 rb[VB];
+    uint tr, tc, addr;
+    [[unroll]] for (uint x = 0; x < VA; x++) { a_place(t + x * THREADS, row0, 0, tr, tc, addr); ra[x] = a[addr]; }
+    [[unroll]] for (uint x = 0; x < VB; x++) { b_place(t + x * THREADS, col0, 0, tr, tc, addr); rb[x] = b[addr]; }
+
+    for (uint k0 = 0; k0 < K; k0 += BK) {
+        barrier();
+        [[unroll]] for (uint x = 0; x < VA; x++) { a_place(t + x * THREADS, row0, k0, tr, tc, addr); a_store(tr, tc, ra[x]); }
+        [[unroll]] for (uint x = 0; x < VB; x++) { b_place(t + x * THREADS, col0, k0, tr, tc, addr); b_store(tr, tc, rb[x]); }
+        barrier();
+        if (k0 + BK < K) {
+            [[unroll]] for (uint x = 0; x < VA; x++) { a_place(t + x * THREADS, row0, k0 + BK, tr, tc, addr); ra[x] = a[addr]; }
+            [[unroll]] for (uint x = 0; x < VB; x++) { b_place(t + x * THREADS, col0, k0 + BK, tr, tc, addr); rb[x] = b[addr]; }
+        }
+        [[unroll]] for (uint kk = 0; kk < BK; kk += 16) {
+            coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> fa[FM];
+            [[unroll]] for (uint i = 0; i < FM; i++) {
+                if (TA) coopMatLoad(fa[i], As, kk * SA + wr + i * 16, SA, gl_CooperativeMatrixLayoutColumnMajor);
+                else coopMatLoad(fa[i], As, (wr + i * 16) * SA + kk, SA, gl_CooperativeMatrixLayoutRowMajor);
+            }
+            [[unroll]] for (uint j = 0; j < FN; j++) {
+                coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> fb;
+                if (TB) coopMatLoad(fb, Bs, (wc + j * 16) * SB + kk, SB, gl_CooperativeMatrixLayoutColumnMajor);
+                else coopMatLoad(fb, Bs, kk * SB + wc + j * 16, SB, gl_CooperativeMatrixLayoutRowMajor);
+                [[unroll]] for (uint i = 0; i < FM; i++)
+                    acc[i][j] = coopMatMulAdd(fa[i], fb, acc[i][j]);
+            }
+        }
+    }
+
+    [[unroll]] for (uint i = 0; i < FM; i++)
+        [[unroll]] for (uint j = 0; j < FN; j++)
+            coopMatStore(acc[i][j], c, (row0 + wr + i * 16) * LDC + col0 + wc + j * 16, LDC, gl_CooperativeMatrixLayoutRowMajor);
+}

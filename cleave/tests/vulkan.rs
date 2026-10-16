@@ -21,6 +21,20 @@ fn run_on(index: usize, name: &str, src: &str) -> (String, String) {
     (String::from_utf8_lossy(&output.stdout).into_owned(), String::from_utf8_lossy(&output.stderr).into_owned())
 }
 
+/// Runs `src` on the CPU, returning stdout: the reference a device's values are compared against.
+fn run_cpu(name: &str, src: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("cleave-vulkan-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join(format!("{name}-cpu.cleave"));
+    std::fs::write(&source, src).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--no-debug-info", "--run"])
+        .arg(&source)
+        .output()
+        .expect("cannot run cleave");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 fn devices() -> Vec<cleave_vk::DeviceInfo> {
     match cleave_vk::devices() {
         Ok(devices) if !devices.is_empty() => devices,
@@ -572,6 +586,56 @@ fn a_sum_over_rows_into_columns_runs_by_column() {
         assert!((got - expected).abs() <= 1e-5 * expected.abs(), "{}: {got} on the GPU, {expected} on the CPU", device.name);
         assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
         assert!(stderr.contains(" 3 dispatches"), "{}: {stderr}", device.name);
+    }
+}
+
+/// A bias's gradient (`reduce0`, a `linalg` sum over rows into a gradient's
+/// field) runs a workgroup per column, as `rms_norm_grad_g` does: its
+/// memory, cast again where the gradient is read or released, is fresh for
+/// the loop that never reaches those other names (`freshInLoop`). A thread
+/// per column made 8 workgroups here, 1.1 ms per nanoLM layer.
+#[test]
+fn a_bias_gradient_sums_its_rows_a_workgroup_per_column() {
+    let src = "
+        use io;
+        use linalg;
+        use nn;
+        fn loss(layer: Dense<f32, 256, 512>, x: Tensor<f32, 1024, 256>) -> f32 {
+            sum(layer.dense_forward(x))
+        }
+        dloss = grad(loss, layer);
+        fn main() -> i32 {
+            let x: Tensor<f32, 1024, 256> = [for i in 0..1024: [for j in 0..256: 0.25]];
+            let layer = Dense::<f32, 256, 512>(w: [for i in 0..256: [for j in 0..512: 0.5]], b: [for i in 0..1: [for j in 0..512: 0.0]]);
+            let g = dloss(layer, x);
+            println(g.w[1, 2]);
+            println(g.b[0, 3]);
+            0
+        }
+    ";
+    let numbers = |out: &str| -> Vec<f64> { out.lines().filter_map(|l| l.trim().parse().ok()).collect() };
+    let expected = numbers(&run_cpu("bias_gradient", src));
+    assert_eq!(expected, [256.0, 1024.0]);
+    for (index, device) in devices().iter().enumerate() {
+        let dir = std::env::temp_dir().join(format!("cleave-vulkan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("bias_gradient.cleave");
+        std::fs::write(&source, src).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_cleave"))
+            .args(["--backend", "vulkan", "--no-openmp", "--no-debug-info", "--run"])
+            .arg(&source)
+            .env("CLEAVE_VK_DEVICE", index.to_string())
+            .env("CLEAVE_VK_VALIDATION", "1")
+            .env("CLEAVE_VK_PROFILE", "1")
+            .output()
+            .expect("cannot run cleave");
+        let (stdout, stderr) =
+            (String::from_utf8_lossy(&output.stdout).into_owned(), String::from_utf8_lossy(&output.stderr).into_owned());
+        assert_eq!(numbers(&stdout), expected, "{}: {stdout}{stderr}", device.name);
+        // The reduction's kernel and the one the forward broadcast makes.
+        let per_column = stderr.lines().filter(|l| l.contains(" us ") && l.ends_with(" [512, 1, 1]")).count();
+        assert_eq!(per_column, 2, "{}: no workgroup per column in {stderr}", device.name);
+        assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
     }
 }
 
@@ -1205,28 +1269,211 @@ fn cooperative_matrix_shapes_are_listed_per_device() {
     }
 }
 
-/// `bf16` tensors are refused on the Vulkan backend, with a message, until its kernels handle
-/// 16-bit floats (`doc/plan-quantization.md`, phase 4): before, the 32-bit tiling read them wrong
-/// and the product came back wrong without any error.
+/// `bf16` tensors on the GPU round as the CPU does: SPIR-V has no bf16 arithmetic, so kernels compute
+/// in f32 and round each result to bf16 (`arith-emulate-unsupported-floats`, the bf16 capabilities
+/// declared; without them MLIR silently held bf16 values as f32, and `1 + 2^-9` stayed `1 + 2^-9`).
+/// Products of bf16 tensors accumulate in f32 (259 ones: the bf16 260, not 256). Devices without bf16
+/// in shaders are skipped, saying so.
 #[test]
-fn bf16_tensors_are_refused_on_the_gpu() {
+fn bf16_tensors_round_on_the_gpu_as_on_the_cpu() {
     let src = "
-        use linalg;
         use io;
+        use linalg;
         use convert;
         fn main() -> i32 {
-            let a: Tensor<bf16, 64, 64> = [for i in 0..64: [for j in 0..64: 1.0]];
-            let c = matmul(a, a);
-            let x: f32 = c[0, 0].to();
-            println(x);
+            let a: Tensor<f32, 64, 256> = [for i in 0..64: [for j in 0..256: 1.001953125]];
+            let h: Tensor<bf16, 64, 256> = a.to();
+            let back: Tensor<f32, 64, 256> = h.to();
+            println(back[3, 10]);
+            let twice: Tensor<f32, 64, 256> = (h + h).to();
+            println(twice[3, 10]);
+            let x: Tensor<bf16, 1, 259> = [for i in 0..1: [for j in 0..259: 1.0]];
+            let y: Tensor<bf16, 259, 1> = [for i in 0..259: [for j in 0..1: 1.0]];
+            let s: f32 = matmul(x, y)[0, 0].to();
+            println(s);
             0
         }
     ";
-    let devices = devices();
-    if devices.is_empty() {
-        return;
+    let numbers = |out: &str| -> Vec<f64> { out.lines().filter_map(|l| l.trim().parse().ok()).collect() };
+    assert_eq!(numbers(&run_cpu("bf16_rounding", src)), vec![1.0, 2.0, 260.0]);
+    for (index, device) in devices().iter().enumerate() {
+        if !device.bf16 {
+            eprintln!("skipped on {}: no bf16 in shaders", device.name);
+            continue;
+        }
+        let (stdout, stderr) = run_on(index, "bf16_rounding", src);
+        assert_eq!(numbers(&stdout), vec![1.0, 2.0, 260.0], "{}: {stdout}{stderr}", device.name);
+        assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
     }
-    let (stdout, stderr) = run_on(0, "bf16_refused", src);
-    assert!(stderr.contains("`bf16`/`f16` tensors aren't supported on the Vulkan backend yet"), "{stdout}{stderr}");
-    assert!(!stdout.contains("64"), "{stdout}");
+}
+
+/// Products asked in bfloat16 (`matmul_bf16` and its transposed forms, `stdlib/linalg`) run on the
+/// tensor cores (`cleave-lower-gpu-gemms`, `cleave_vk_gemm_bf16`: the profile names the kernel) and
+/// give the CPU's values: operands rounded to bf16, f32 accumulation. `1 + 2^-9` rounds to 1 in
+/// bf16, so the bf16 product (128) differs from the f32 one (128.25) on purpose. On devices without
+/// bf16 cooperative matrices, skipped.
+#[test]
+fn bf16_products_run_on_tensor_cores() {
+    let src = "
+        use io;
+        use linalg;
+        use convert;
+        fn main() -> i32 {
+            let a: Tensor<f32, 256, 128> = [for i in 0..256: [for j in 0..128: 1.001953125]];
+            let b: Tensor<f32, 128, 128> = [for i in 0..128: [for j in 0..128: rem(i + j, 3).to()]];
+            println(matmul_bf16(a, b)[3, 5]);
+            println(matmul(a, b)[3, 5]);
+            println(matmul_bf16_transpose_a(a, a)[2, 9]);
+            println(matmul_bf16_transpose_b(b, b)[4, 4]);
+            0
+        }
+    ";
+    let numbers = |out: &str| -> Vec<f64> { out.lines().filter_map(|l| l.trim().parse().ok()).collect() };
+    assert_eq!(numbers(&run_cpu("bf16_products", src)), vec![128.0, 128.25, 256.0, 215.0]);
+    for (index, device) in devices().iter().enumerate() {
+        if !device.cooperative_matrices.iter().any(|s| s.a == "bf16" && s.c == "f32") {
+            eprintln!("skipped on {}: no bf16 cooperative matrices", device.name);
+            continue;
+        }
+        let dir = std::env::temp_dir().join(format!("cleave-vulkan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("bf16_products.cleave");
+        std::fs::write(&source, src).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_cleave"))
+            .args(["--backend", "vulkan", "--no-openmp", "--no-debug-info", "--run"])
+            .arg(&source)
+            .env("CLEAVE_VK_DEVICE", index.to_string())
+            .env("CLEAVE_VK_VALIDATION", "1")
+            .env("CLEAVE_VK_PROFILE", "1")
+            .output()
+            .expect("cannot run cleave");
+        let (stdout, stderr) =
+            (String::from_utf8_lossy(&output.stdout).into_owned(), String::from_utf8_lossy(&output.stderr).into_owned());
+        assert_eq!(numbers(&stdout), vec![128.0, 128.25, 256.0, 215.0], "{}: {stdout}{stderr}", device.name);
+        for kernel in ["gemm_bf16<256x128x128>", "gemm_bf16<128x128x256, A^T>", "gemm_bf16<128x128x128, B^T>"] {
+            assert!(stderr.contains(kernel), "{}: no {kernel} in {stderr}", device.name);
+        }
+        assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
+    }
+}
+
+/// A product of bf16 tensors runs on the tensor cores with its operands read as bf16
+/// (`cleave-lower-gpu-gemms`, `cleave_vk_gemm_bf16_operands`), every transposition, and gives the
+/// CPU's values (f32 accumulation); one whose shape the kernel can't take stays a generated kernel,
+/// same values. Devices without bf16 cooperative matrices skipped.
+#[test]
+fn bf16_tensor_products_run_on_tensor_cores() {
+    let src = "
+        use io;
+        use linalg;
+        use convert;
+        fn main() -> i32 {
+            let m: Tensor<bf16, 512, 256> = [for i in 0..512: [for j in 0..256: rem(i + j, 3).to()]];
+            let n: Tensor<bf16, 256, 384> = [for i in 0..256: [for j in 0..384: rem(i * j, 2).to()]];
+            let c: Tensor<f32, 512, 384> = matmul(m, n).to();
+            println(c[5, 7]);
+            let ta: Tensor<f32, 256, 256> = matmul_transpose_a(m, m).to();
+            println(ta[3, 4]);
+            let tb: Tensor<f32, 384, 384> = matmul_transpose_b(n.transpose(), n.transpose()).to();
+            println(tb[1, 2]);
+            let x: Tensor<bf16, 1, 259> = [for i in 0..1: [for j in 0..259: 1.0]];
+            let y: Tensor<bf16, 259, 1> = [for i in 0..259: [for j in 0..1: 1.0]];
+            let s: f32 = matmul(x, y)[0, 0].to();
+            println(s);
+            0
+        }
+    ";
+    let numbers = |out: &str| -> Vec<f64> { out.lines().filter_map(|l| l.trim().parse().ok()).collect() };
+    let expected = numbers(&run_cpu("bf16_tensor_products", src));
+    assert_eq!(expected.len(), 4, "{expected:?}");
+    assert_eq!(expected[3], 260.0);
+    for (index, device) in devices().iter().enumerate() {
+        if !device.cooperative_matrices.iter().any(|s| s.a == "bf16" && s.c == "f32") {
+            eprintln!("skipped on {}: no bf16 cooperative matrices", device.name);
+            continue;
+        }
+        let dir = std::env::temp_dir().join(format!("cleave-vulkan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("bf16_tensor_products.cleave");
+        std::fs::write(&source, src).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_cleave"))
+            .args(["--backend", "vulkan", "--no-openmp", "--no-debug-info", "--run"])
+            .arg(&source)
+            .env("CLEAVE_VK_DEVICE", index.to_string())
+            .env("CLEAVE_VK_VALIDATION", "1")
+            .env("CLEAVE_VK_PROFILE", "1")
+            .output()
+            .expect("cannot run cleave");
+        let (stdout, stderr) =
+            (String::from_utf8_lossy(&output.stdout).into_owned(), String::from_utf8_lossy(&output.stderr).into_owned());
+        assert_eq!(numbers(&stdout), expected, "{}: {stdout}{stderr}", device.name);
+        for kernel in [
+            "gemm_bf16_operands<512x384x256>",
+            "gemm_bf16_operands<256x256x512, A^T>",
+            "gemm_bf16_operands<384x384x256, B^T>",
+        ] {
+            assert!(stderr.contains(kernel), "{}: no {kernel} in {stderr}", device.name);
+        }
+        assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
+    }
+}
+
+// `matmul_wide`'s gradient on the GPU: the forward product and both adjoint
+// products (`matmul_wide_transpose_a/b`) on the bf16-operand GEMM, the values
+// the CPU computes.
+#[test]
+fn wide_bf16_products_differentiate_on_tensor_cores() {
+    let src = "
+        use io;
+        use linalg;
+        use convert;
+        use nn;
+        fn loss(x: Tensor<f32, 256, 128>, w: Tensor<f32, 128, 384>) -> f32 {
+            let xb: Tensor<bf16, 256, 128> = x.to();
+            let wb: Tensor<bf16, 128, 384> = w.to();
+            sum(matmul_wide(xb, wb))
+        }
+        dloss_w = grad(loss, w);
+        dloss_x = grad(loss, x);
+        fn main() -> i32 {
+            let x: Tensor<f32, 256, 128> = [for i in 0..256: [for j in 0..128: 1.001953125]];
+            let w: Tensor<f32, 128, 384> = [for i in 0..128: [for j in 0..384: 0.5]];
+            println(loss(x, w));
+            println(dloss_w(x, w)[17, 99]);
+            println(dloss_x(x, w)[3, 4]);
+            0
+        }
+    ";
+    let numbers = |out: &str| -> Vec<f64> { out.lines().filter_map(|l| l.trim().parse().ok()).collect() };
+    let expected = numbers(&run_cpu("wide_bf16_products", src));
+    assert_eq!(expected, [6291456.0, 256.0, 192.0]);
+    for (index, device) in devices().iter().enumerate() {
+        if !device.cooperative_matrices.iter().any(|s| s.a == "bf16" && s.c == "f32") {
+            eprintln!("skipped on {}: no bf16 cooperative matrices", device.name);
+            continue;
+        }
+        let dir = std::env::temp_dir().join(format!("cleave-vulkan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("wide_bf16_products.cleave");
+        std::fs::write(&source, src).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_cleave"))
+            .args(["--backend", "vulkan", "--no-openmp", "--no-debug-info", "--run"])
+            .arg(&source)
+            .env("CLEAVE_VK_DEVICE", index.to_string())
+            .env("CLEAVE_VK_VALIDATION", "1")
+            .env("CLEAVE_VK_PROFILE", "1")
+            .output()
+            .expect("cannot run cleave");
+        let (stdout, stderr) =
+            (String::from_utf8_lossy(&output.stdout).into_owned(), String::from_utf8_lossy(&output.stderr).into_owned());
+        assert_eq!(numbers(&stdout), expected, "{}: {stdout}{stderr}", device.name);
+        for kernel in [
+            "gemm_bf16_operands<256x384x128>",
+            "gemm_bf16_operands<128x384x256, A^T>",
+            "gemm_bf16_operands<256x128x384, B^T>",
+        ] {
+            assert!(stderr.contains(kernel), "{}: no {kernel} in {stderr}", device.name);
+        }
+        assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
+    }
 }

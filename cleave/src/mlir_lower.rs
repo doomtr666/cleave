@@ -6688,6 +6688,22 @@ fn mark_blas<'c>(context: &'c Context, product: Value<'c, 'c>) {
     }
 }
 
+/// Marks `product` as computed in `precision` (`cleave.compute`), for the Vulkan backend's
+/// `cleave-lower-gpu-gemms`.
+fn mark_compute<'c>(context: &'c Context, product: Value<'c, 'c>, precision: &str) {
+    let result = cleave_mlir::ir::operation::OperationResult::try_from(product)
+        .unwrap_or_else(|_| panic!("MLIR lowering: a marked product must be an op's result"));
+    let owner = result.owner();
+    let value = StringAttribute::new(context, precision);
+    unsafe {
+        cleave_mlir::sys::mlirOperationSetAttributeByName(
+            owner.to_raw(),
+            StringRef::new("cleave.compute").to_raw(),
+            value.to_raw(),
+        );
+    }
+}
+
 fn lower_raw_mlir_op<'c>(
     ctx: &LowerCtx<'c, '_>,
     block: &Block<'c>,
@@ -6732,6 +6748,60 @@ fn lower_raw_mlir_op<'c>(
     }
     if op == "memref.stride" {
         return build_memref_stride(ctx, block, env, args, result_ty);
+    }
+    // A product the program asked to compute in bfloat16 (`compute: "bf16"`,
+    // `stdlib/linalg`'s `MatMulBf16`): f32 operands rounded to bf16, multiplied,
+    // accumulated in f32, an f32 result. On the CPU exactly that: `arith.truncf`
+    // of the operands, then a mixed-precision `linalg.matmul`. On Vulkan an f32
+    // `linalg.matmul` marked `cleave.compute = "bf16"`, which
+    // `cleave-lower-gpu-gemms` hands to the runtime's tensor-core GEMM (which
+    // rounds as it loads). The same values either way.
+    if matches!(op, "linalg.matmul" | "linalg.matmul_transpose_a" | "linalg.matmul_transpose_b")
+        && let Some((_, compute)) = attrs.iter().find(|(name, _)| name == "compute")
+    {
+        let compute = compute.trim_matches('"');
+        assert_eq!(compute, "bf16", "MLIR lowering: `compute` is \"bf16\" or absent, not {compute:?}");
+        let transpose = match op {
+            "linalg.matmul_transpose_a" => Some(true),
+            "linalg.matmul_transpose_b" => Some(false),
+            _ => None,
+        };
+        if crate::options::current().backend == crate::pipeline::Backend::Vulkan {
+            let product = match transpose {
+                None => build_matmul_no_seed(ctx, block, env, args, result_ty),
+                Some(lhs) => build_matmul_transpose_no_seed(ctx, block, env, args, result_ty, lhs),
+            };
+            mark_compute(ctx.context, product, compute);
+            return product;
+        }
+        let [a_arg, b_arg] = args else {
+            panic!("MLIR lowering: `{op}` needs exactly two operands, got {}", args.len())
+        };
+        let location = gen_loc(ctx.context);
+        let to_bf16 = |v: Value<'c, 'c>| -> Value<'c, 'c> {
+            let narrow = Type::parse(ctx.context, &v.r#type().to_string().replace("xf32>", "xbf16>"))
+                .unwrap_or_else(|| panic!("MLIR lowering: a bf16 product's operands must be f32 tensors"));
+            block
+                .append_operation(
+                    OperationBuilder::new("arith.truncf", location)
+                        .add_operands(&[v])
+                        .add_results(&[narrow])
+                        .build()
+                        .unwrap_or_else(|e| panic!("MLIR lowering: failed to build arith.truncf: {e}")),
+                )
+                .result(0)
+                .unwrap()
+                .into()
+        };
+        let a = to_bf16(lower_cval(ctx.context, block, env, a_arg, result_ty));
+        let b = to_bf16(lower_cval(ctx.context, block, env, b_arg, result_ty));
+        let init = zero_filled_seed(ctx, block, result_ty);
+        let elem_ty = shaped_element_type(result_ty)
+            .unwrap_or_else(|| panic!("MLIR lowering: a matmul's result must be a tensor"));
+        return match transpose {
+            None => build_matmul_named_op(ctx.context, block, location, a, b, init, elem_ty, result_ty),
+            Some(lhs) => build_matmul_transpose_named_op(ctx.context, block, a, b, init, result_ty, lhs),
+        };
     }
     // A product of 16-bit floats (`bf16`, `f16`) accumulates in f32 and is
     // rounded once, at the end (`stdlib/num`'s `bf16`, `doc/plan-quantization.md`):

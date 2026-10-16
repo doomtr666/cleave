@@ -374,6 +374,12 @@ static int64_t cleaveSetSpirvEntryAbi(MlirOperation op) {
 // Marks an address the Vulkan backend takes for its runtime's own calls,
 // not one escaping to other code (`cleave-sync-host-accesses`).
 static constexpr const char *kRuntimeAddress = "cleave.vk_runtime_address";
+// The runtime's bfloat16 tensor-core product (`cleave-vk`, `cleave_vk_gemm_bf16`), and the marker of
+// a `linalg.matmul` the program asked to compute in bf16 (`stdlib/linalg`'s `MatMulBf16`,
+// `mlir_lower.rs`).
+static constexpr const char *kGemmBf16 = "cleave_vk_gemm_bf16";
+static constexpr const char *kGemmBf16Operands = "cleave_vk_gemm_bf16_operands";
+static constexpr const char *kComputeAttr = "cleave.compute";
 
 // Whether the memory of `alloc` (a `memref.alloc`) can only be reached
 // through it: every use is an access, a view, a cast, a free, a metadata
@@ -2037,7 +2043,13 @@ static int64_t cleaveSyncHostAccesses(MlirOperation op) {
     return 0;
   MLIRContext *context = module.getContext();
   StringRef dispatchName = "cleave_vk_dispatch";
-  if (!module.lookupSymbol<func::FuncOp>(dispatchName))
+  // The runtime's calls that launch device work: a kernel, or a bf16 product
+  // (`cleave-lower-gpu-gemms`).
+  auto isLaunch = [&](StringRef callee) {
+    return callee == dispatchName || callee == kGemmBf16 || callee == kGemmBf16Operands;
+  };
+  if (!module.lookupSymbol<func::FuncOp>(dispatchName) && !module.lookupSymbol<func::FuncOp>(kGemmBf16) &&
+      !module.lookupSymbol<func::FuncOp>(kGemmBf16Operands))
     return 0; // nothing launches a kernel: nothing to keep coherent
 
   // Functions that may launch a kernel, transitively.
@@ -2051,7 +2063,7 @@ static int64_t cleaveSyncHostAccesses(MlirOperation op) {
       bool launches = false;
       func.walk([&](func::CallOp call) {
         auto callee = module.lookupSymbol<func::FuncOp>(call.getCallee());
-        if (call.getCallee() == dispatchName || (callee && launching.contains(callee)))
+        if (isLaunch(call.getCallee()) || (callee && launching.contains(callee)))
           launches = true;
       });
       if (launches) {
@@ -2065,7 +2077,7 @@ static int64_t cleaveSyncHostAccesses(MlirOperation op) {
     region->walk([&](Operation *inner) {
       if (auto call = dyn_cast<func::CallOp>(inner)) {
         auto callee = module.lookupSymbol<func::FuncOp>(call.getCallee());
-        if (call.getCallee() == dispatchName || (callee && launching.contains(callee)))
+        if (isLaunch(call.getCallee()) || (callee && launching.contains(callee)))
           found = true;
       } else if (isa<func::CallIndirectOp>(inner)) {
         found = true;
@@ -2573,6 +2585,25 @@ static Value cloneBefore(Value v, scf::ForOp loop, OpBuilder &builder, IRMapping
   return clone->getResult(cast<OpResult>(v).getResultNumber());
 }
 
+// Whether `root` is fresh memory as far as `loop` sees: `isFreshUnaliased`,
+// or a fresh descriptor also cast to other names (`isFreshDescriptor`'s
+// aliases: a gradient's field, released or read after the loop, `reduce0`'s
+// bias gradient) that the loop itself never reaches.
+static bool freshInLoop(Value root, scf::ForOp loop, ModuleOp module, FreshMemo &fresh) {
+  if (isFreshUnaliased(root, module, fresh))
+    return true;
+  auto cast = root.getDefiningOp<UnrealizedConversionCastOp>();
+  SmallVector<Value> aliases;
+  if (!cast || !isFreshDescriptor(cast, &aliases))
+    return false;
+  bool reached = false;
+  loop.getBody()->walk([&](Operation *inner) {
+    for (Value operand : inner->getOperands())
+      reached |= isa<BaseMemRefType>(operand.getType()) && llvm::is_contained(aliases, viewRoot(operand));
+  });
+  return !reached;
+}
+
 // A loop accumulating into one element of memory (`for r { d[c] = d[c] +
 // f(r) }`, `interchangeAccumulation`'s columns) made to carry it instead:
 // loaded before the loop, the loop's value, stored after. `cleaveCooperativeRows`
@@ -2581,7 +2612,7 @@ static Value cloneBefore(Value v, scf::ForOp loop, OpBuilder &builder, IRMapping
 // kernels). The loop carries nothing; its body's one store, at indices
 // the same in every iteration (`isInvariantIn`), follows a load of the same
 // element (`sameValue`) in the body
-// itself; the memory is a fresh allocation's (`isFreshUnaliased`: nothing
+// itself; the memory is a fresh allocation's (`freshInLoop`: nothing
 // else the loop reads aliases it) that nothing else in the loop reaches, and
 // the loop writes nothing else. Whether it changed `loop`.
 static bool promoteAccumulation(scf::ForOp loop, ModuleOp module, FreshMemo &fresh) {
@@ -2601,7 +2632,7 @@ static bool promoteAccumulation(scf::ForOp loop, ModuleOp module, FreshMemo &fre
   if (!ok || !store)
     return false;
   Value root = viewRoot(store.getMemRef());
-  if (!isFreshUnaliased(root, module, fresh) ||
+  if (!freshInLoop(root, loop, module, fresh) ||
       !llvm::all_of(store.getIndices(), [&](Value index) { return isInvariantIn(index, loop); }))
     return false;
   memref::LoadOp load;
@@ -4743,6 +4774,110 @@ CLEAVE_COUNTING_PASS(ParallelizeLoopsPass, "cleave-parallelize-loops",
 CLEAVE_COUNTING_PASS(GpuCopiesPass, "cleave-gpu-copies",
                      "copies between heap payloads made linalg copies, for the GPU",
                      cleaveGpuCopies)
+// Vulkan backend: products for the tensor cores become calls to the runtime's
+// GEMMs before the kernels are formed, their operands bound as a kernel's are
+// (`memrefSpan`, the mirrors' keys), the transpositions read from the indexing
+// maps:
+// - a product the program asked to compute in bfloat16 (a `linalg.matmul`
+//   marked `cleave.compute = "bf16"`, on float32 memrefs: `stdlib/linalg`'s
+//   `MatMulBf16`), `cleave_vk_gemm_bf16(a, a_bytes, b, b_bytes, c, c_bytes, m,
+//   n, k, ta, tb)`, which rounds the operands as it loads them. A shape the
+//   kernel can't take is an error, located: computed in f32 instead it would
+//   compute something else.
+// - a product of bf16 tensors (a `linalg.matmul` with bf16 operands into f32,
+//   `mlir_lower.rs::widened_16_bit_float_tensor`),
+//   `cleave_vk_gemm_bf16_operands`, the same arguments. A shape the kernel
+//   can't take stays a generated kernel, which computes the same values.
+// The kernels need whole row-major matrices (an identity layout) with M and N
+// multiples of 128 and K of 32.
+struct LowerGpuGemmsPass : PassWrapper<LowerGpuGemmsPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LowerGpuGemmsPass)
+  StringRef getArgument() const final { return "cleave-lower-gpu-gemms"; }
+  StringRef getName() const final { return "cleave-lower-gpu-gemms"; }
+  StringRef getDescription() const final {
+    return "bf16 products to the Vulkan runtime's tensor-core GEMM";
+  }
+  void runOnOperation() final {
+    ModuleOp module = getOperation();
+    // (the product, whether its operands are bf16 in memory)
+    SmallVector<std::pair<linalg::MatmulOp, bool>> products;
+    auto elementOf = [](Value v) -> Type {
+      auto type = dyn_cast<MemRefType>(v.getType());
+      return type ? type.getElementType() : Type();
+    };
+    module.walk([&](linalg::MatmulOp product) {
+      if (product->getParentOfType<gpu::GPUModuleOp>() || !product.hasPureBufferSemantics())
+        return;
+      auto compute = product->getAttrOfType<StringAttr>(kComputeAttr);
+      if (compute && compute.getValue() == "bf16") {
+        products.push_back({product, false});
+        return;
+      }
+      Type a = elementOf(product.getDpsInputs()[0]), b = elementOf(product.getDpsInputs()[1]);
+      Type c = elementOf(product.getDpsInits()[0]);
+      if (a && b && c && a.isBF16() && b.isBF16() && c.isF32())
+        products.push_back({product, true});
+    });
+    if (products.empty())
+      return;
+    MLIRContext *context = module.getContext();
+    Type i64 = IntegerType::get(context, 64);
+    for (StringRef name : {StringRef(kGemmBf16), StringRef(kGemmBf16Operands)}) {
+      if (module.lookupSymbol<func::FuncOp>(name))
+        continue;
+      OpBuilder top(context);
+      top.setInsertionPointToStart(module.getBody());
+      auto declaration = func::FuncOp::create(top, module.getLoc(), name,
+                                              FunctionType::get(context, SmallVector<Type>(11, i64), {}));
+      declaration.setPrivate();
+    }
+    AffineExpr d0 = getAffineDimExpr(0, context), d1 = getAffineDimExpr(1, context), d2 = getAffineDimExpr(2, context);
+    auto map = [&](AffineExpr x, AffineExpr y) { return AffineMap::get(3, 0, {x, y}, context); };
+    bool failed = false;
+    for (auto [product, bf16Operands] : products) {
+      Location loc = product.getLoc();
+      Value a = product.getDpsInputs()[0], b = product.getDpsInputs()[1], c = product.getDpsInits()[0];
+      auto whole = [](Value v) {
+        auto type = dyn_cast<MemRefType>(v.getType());
+        return type && type.getRank() == 2 && type.hasStaticShape() && type.getLayout().isIdentity();
+      };
+      SmallVector<AffineMap> maps = product.getIndexingMapsArray();
+      bool ta = maps[0] == map(d2, d0), tb = maps[1] == map(d1, d2);
+      bool knownMaps = (ta || maps[0] == map(d0, d2)) && (tb || maps[1] == map(d2, d1)) && maps[2] == map(d0, d1);
+      if (!whole(a) || !whole(b) || !whole(c) || !knownMaps) {
+        if (bf16Operands)
+          continue; // a generated kernel computes the same values
+        product.emitError("a bf16 product on the GPU needs whole row-major f32 matrices "
+                          "(doc/plan-quantization.md)");
+        failed = true;
+        continue;
+      }
+      auto aType = cast<MemRefType>(a.getType()), cType = cast<MemRefType>(c.getType());
+      int64_t m = cType.getDimSize(0), n = cType.getDimSize(1), k = aType.getDimSize(ta ? 0 : 1);
+      if (m % 128 != 0 || n % 128 != 0 || k % 32 != 0) {
+        if (bf16Operands)
+          continue;
+        product.emitError() << "a bf16 product of " << m << "x" << n << "x" << k
+                            << " on the GPU needs M and N multiples of 128 and K of 32 "
+                               "(doc/plan-quantization.md)";
+        failed = true;
+        continue;
+      }
+      OpBuilder builder(product);
+      auto constant = [&](int64_t v) -> Value { return arith::ConstantIntOp::create(builder, loc, i64, v); };
+      auto [aPtr, aBytes] = memrefSpan(builder, loc, a, /*fromBase=*/true);
+      auto [bPtr, bBytes] = memrefSpan(builder, loc, b, /*fromBase=*/true);
+      auto [cPtr, cBytes] = memrefSpan(builder, loc, c, /*fromBase=*/true);
+      func::CallOp::create(builder, loc, bf16Operands ? kGemmBf16Operands : kGemmBf16, TypeRange{},
+                           ValueRange{aPtr, aBytes, bPtr, bBytes, cPtr, cBytes, constant(m), constant(n),
+                                      constant(k), constant(ta), constant(tb)});
+      product.erase();
+    }
+    if (failed)
+      signalPassFailure();
+  }
+};
+
 CLEAVE_COUNTING_PASS(SyncHostAccessesPass, "cleave-sync-host-accesses",
                      "host accesses to memory kernels may share, reported to the Vulkan runtime",
                      cleaveSyncHostAccesses)
@@ -4768,6 +4903,7 @@ void registerGpuPasses() {
   PassRegistration<ParallelizeLoopsPass>();
   PassRegistration<GpuCopiesPass>();
   PassRegistration<SyncHostAccessesPass>();
+  PassRegistration<LowerGpuGemmsPass>();
   PassRegistration<FoldLoopsIntoGridsPass>();
   PassRegistration<LowerGpuLaunchesPass>();
 }

@@ -1209,6 +1209,22 @@ fn swiglu_forward<T: Float, const B: i32, const D: i32, const H: i32>(m: SwiGlu<
     m.down.dense_forward(silu(m.gate.dense_forward(x)) * m.up.dense_forward(x))
 }
 
+// `dense_forward` and `swiglu_forward` in mixed precision (`doc/plan-quantization.md`): the f32
+// weights stay the master copy the optimizer updates; each product takes a bf16 working copy of
+// them and of its input, runs on the tensor cores where the backend has them (bf16 operands, f32
+// accumulation, an f32 result: `matmul_wide`); bias, gating, residuals in f32. The
+// gradients follow the same path back (`Convert`'s adjoint), reaching the weights in f32. The
+// program's choice, per layer.
+fn dense_forward_bf16<const B: i32, const In: i32, const Out: i32>(layer: Dense<f32,In,Out>, x: Tensor<f32,B,In>) -> Tensor<f32,B,Out> {
+    let w: Tensor<bf16, In, Out> = layer.w.to();
+    let xb: Tensor<bf16, B, In> = x.to();
+    matmul_wide(xb, w) + broadcast0(layer.b)
+}
+
+fn swiglu_forward_bf16<const B: i32, const D: i32, const H: i32>(m: SwiGlu<f32, D, H>, x: Tensor<f32, B, D>) -> Tensor<f32, B, D> {
+    m.down.dense_forward_bf16(silu(m.gate.dense_forward_bf16(x)) * m.up.dense_forward_bf16(x))
+}
+
 // A table of learned vectors, one row per token: `embedding_forward` reads the
 // rows of a batch of ids, `embedding_logits` scores a batch of vectors against
 // every row, the output layer of a language model whose head is tied to its

@@ -200,3 +200,160 @@ fn tiled_bf16_gemm_probe() {
         eprintln!("{name}: {n}^3 bf16 GEMM, {:.1} TFLOPS ({:.2} ms)", flops / best / 1e12, best * 1e3);
     }
 }
+
+/// `kernels/gemm_bf16.spv`: `C = op(A) op(B)`, float32 in memory, bfloat16 on the tensor cores,
+/// float32 out, for each of the four transpositions, on a non-square shape (M = 256, N = 384,
+/// K = 96); small integers, exact. `n`, `m`, `k` and the transpositions as specialization constants.
+fn run_gemm_bf16(gpu: &Gpu, m: usize, n: usize, k: usize, ta: bool, tb: bool, a: &[f32], b: &[f32]) -> (Vec<f32>, f64) {
+    run_gemm(gpu, include_bytes!("../kernels/gemm_bf16.spv"), false, m, n, k, ta, tb, a, b)
+}
+
+/// The GEMM kernel `binary`, its operands given as f32 and uploaded as f32, or as bf16 when
+/// `bf16_operands` (`kernels/gemm_bf16_in.spv`).
+#[allow(clippy::too_many_arguments)]
+fn run_gemm(
+    gpu: &Gpu,
+    binary: &[u8],
+    bf16_operands: bool,
+    m: usize,
+    n: usize,
+    k: usize,
+    ta: bool,
+    tb: bool,
+    a: &[f32],
+    b: &[f32],
+) -> (Vec<f32>, f64) {
+    let spirv: Vec<u32> = binary.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect();
+    let element = if bf16_operands { 2 } else { 4 };
+    let (lda, ldb, ldc) = (if ta { m } else { k }, if tb { k } else { n }, n);
+    let constants = [
+        (0, m as u32),
+        (1, n as u32),
+        (2, k as u32),
+        (3, lda as u32),
+        (4, ldb as u32),
+        (5, ldc as u32),
+        (6, ta as u32),
+        (7, tb as u32),
+    ];
+    let kernel = gpu.kernel_specialized(&spirv, "main", 3, &constants).expect("the GEMM kernel");
+    let buffer_a = gpu.device_buffer(m * k * element).unwrap();
+    let buffer_b = gpu.device_buffer(k * n * element).unwrap();
+    let buffer_c = gpu.device_buffer(m * n * 4).unwrap();
+    let mut staging = gpu.buffer((m * k).max(k * n).max(m * n) * 4).unwrap();
+    let upload = |staging: &mut cleave_vk::Buffer, buffer: &cleave_vk::Buffer, x: &[f32]| {
+        if bf16_operands {
+            staging.write(&x.iter().map(|&v| bf16_bits(v)).collect::<Vec<u16>>());
+        } else {
+            staging.write(x);
+        }
+        gpu.copy(staging, buffer, x.len() * element).unwrap();
+    };
+    upload(&mut staging, &buffer_a, a);
+    upload(&mut staging, &buffer_b, b);
+    let mut best = f64::MAX;
+    for _ in 0..3 {
+        let start = std::time::Instant::now();
+        gpu.dispatch(&kernel, &[&buffer_a, &buffer_b, &buffer_c], [(n / 128) as u32, (m / 128) as u32, 1]).unwrap();
+        best = best.min(start.elapsed().as_secs_f64());
+    }
+    let mut c = vec![0f32; m * n];
+    gpu.copy(&buffer_c, &staging, m * n * 4).unwrap();
+    staging.read(&mut c);
+    (c, best)
+}
+
+/// The product of `op(A) op(B)` on the CPU, A stored `m x k` (or `k x m` when `ta`), B `k x n` (or
+/// `n x k` when `tb`).
+fn reference_product(m: usize, n: usize, k: usize, ta: bool, tb: bool, a: &[f32], b: &[f32]) -> Vec<f32> {
+    let at = |i: usize, p: usize| if ta { a[p * m + i] } else { a[i * k + p] };
+    let bt = |p: usize, j: usize| if tb { b[j * k + p] } else { b[p * n + j] };
+    let mut c = vec![0f32; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            c[i * n + j] = (0..k).map(|p| at(i, p) * bt(p, j)).sum();
+        }
+    }
+    c
+}
+
+fn bf16_devices() -> Vec<(usize, String)> {
+    let Ok(devices) = cleave_vk::devices() else { return Vec::new() };
+    devices
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.cooperative_matrices.iter().any(|s| (s.m, s.n, s.k) == (16, 16, 16) && s.a == "bf16" && s.c == "f32"))
+        .map(|(i, d)| (i, d.name.clone()))
+        .collect()
+}
+
+#[test]
+fn the_bf16_gemm_kernel_computes_every_transposition() {
+    let (m, n, k) = (256, 384, 96);
+    let value = |i: usize, salt: usize| (((i.wrapping_mul(2654435761) ^ salt) >> 7) % 7) as f32 - 3.0;
+    let a: Vec<f32> = (0..m * k).map(|i| value(i, 0x51)).collect();
+    let b: Vec<f32> = (0..k * n).map(|i| value(i, 0xa3)).collect();
+    for (index, name) in bf16_devices() {
+        let gpu = Gpu::open(&Options { device: Some(index.to_string()), validation: true }).unwrap();
+        for (ta, tb) in [(false, false), (true, false), (false, true), (true, true)] {
+            let (c, _) = run_gemm_bf16(&gpu, m, n, k, ta, tb, &a, &b);
+            assert_eq!(c, reference_product(m, n, k, ta, tb, &a, &b), "{name}: ta {ta}, tb {tb}");
+        }
+        let messages = gpu.validation_messages();
+        assert!(messages.is_empty(), "{name}: validation messages:\n{}", messages.join("\n"));
+        eprintln!("ok on {name}");
+    }
+}
+
+/// The bf16 GEMM kernel's throughput at 4096^3, each transposition. A measurement:
+/// `cargo test --release -p cleave-vk --test coopmat gemm_kernel_throughput -- --ignored --nocapture`.
+/// `kernels/gemm_bf16_in.spv`: the same products with bf16 operands in memory, every transposition.
+#[test]
+fn the_bf16_operand_gemm_kernel_computes_every_transposition() {
+    let (m, n, k) = (256, 384, 96);
+    let value = |i: usize, salt: usize| (((i.wrapping_mul(2654435761) ^ salt) >> 7) % 7) as f32 - 3.0;
+    let a: Vec<f32> = (0..m * k).map(|i| value(i, 0x51)).collect();
+    let b: Vec<f32> = (0..k * n).map(|i| value(i, 0xa3)).collect();
+    for (index, name) in bf16_devices() {
+        let gpu = Gpu::open(&Options { device: Some(index.to_string()), validation: true }).unwrap();
+        for (ta, tb) in [(false, false), (true, false), (false, true), (true, true)] {
+            let (c, _) = run_gemm(&gpu, include_bytes!("../kernels/gemm_bf16_in.spv"), true, m, n, k, ta, tb, &a, &b);
+            assert_eq!(c, reference_product(m, n, k, ta, tb, &a, &b), "{name}: ta {ta}, tb {tb}");
+        }
+        let messages = gpu.validation_messages();
+        assert!(messages.is_empty(), "{name}: validation messages:
+{}", messages.join("
+"));
+        eprintln!("ok on {name}");
+    }
+}
+
+#[test]
+#[ignore]
+fn bf16_operand_gemm_kernel_throughput() {
+    let s = 4096;
+    let a: Vec<f32> = (0..s * s).map(|i| (i % 5) as f32 - 2.0).collect();
+    let b: Vec<f32> = (0..s * s).map(|i| (i % 3) as f32 - 1.0).collect();
+    for (index, name) in bf16_devices() {
+        let gpu = Gpu::open(&Options { device: Some(index.to_string()), validation: false }).unwrap();
+        for (ta, tb) in [(false, false), (true, false), (false, true), (true, true)] {
+            let (_, seconds) = run_gemm(&gpu, include_bytes!("../kernels/gemm_bf16_in.spv"), true, s, s, s, ta, tb, &a, &b);
+            eprintln!("{name}: bf16 operands, ta {ta}, tb {tb}: {:.1} TFLOPS", 2.0 * (s as f64).powi(3) / seconds / 1e12);
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn bf16_gemm_kernel_throughput() {
+    let s = 4096;
+    let a: Vec<f32> = (0..s * s).map(|i| (i % 5) as f32 - 2.0).collect();
+    let b: Vec<f32> = (0..s * s).map(|i| (i % 3) as f32 - 1.0).collect();
+    for (index, name) in bf16_devices() {
+        let gpu = Gpu::open(&Options { device: Some(index.to_string()), validation: false }).unwrap();
+        for (ta, tb) in [(false, false), (true, false), (false, true), (true, true)] {
+            let (_, seconds) = run_gemm_bf16(&gpu, s, s, s, ta, tb, &a, &b);
+            eprintln!("{name}: ta {ta}, tb {tb}: {:.1} TFLOPS", 2.0 * (s as f64).powi(3) / seconds / 1e12);
+        }
+    }
+}

@@ -32,6 +32,11 @@
 
 algebra Convert<From, To> {
     fn convert(x: From) -> To;
+    // Between float widths (bf16 <-> f32 <-> f64, scalars or tensors): the derivative of a rounding
+    // is taken as 1, the upstream adjoint converted back to the input's width — mixed precision's
+    // usual rule (`doc/plan-quantization.md`): a product computed in bf16 gets its gradient in bf16,
+    // which reaches the f32 weights widened.
+    adjoint convert(x), u: convert(u);
 }
 
 impl Convert<i32, f64> {

@@ -1658,11 +1658,22 @@ fn resolve_multi_target_call_ty(
     known: &[(usize, &str)],
     registry: &Registry,
 ) -> Option<String> {
-    'templates: for (_, targets) in registry.all_impls(owner) {
+    'templates: for (generics, targets) in registry.all_impls(owner) {
         if known.iter().any(|&(idx, _)| idx >= targets.len()) {
             continue;
         }
+        // A bare name that isn't one of the impl's generics is concrete
+        // (`RoundBf16<Tensor<f32, Dims...>, Tensor<bf16, Dims...>>`'s `f32`
+        // and `bf16`): bound to itself, it must match itself and resolves to
+        // itself.
         let mut subst: HashMap<String, String> = HashMap::default();
+        let mut bare = Vec::new();
+        targets.iter().for_each(|t| bare_type_names(t, &mut bare));
+        for name in bare {
+            if !generics.iter().any(|g| g.name() == name) {
+                subst.insert(name.to_string(), name.to_string());
+            }
+        }
         for &(idx, concrete) in known {
             if !match_type_pattern(targets[idx], concrete, &mut subst) {
                 continue 'templates;
@@ -1697,14 +1708,9 @@ fn match_type_pattern(pattern: &Type, concrete: &str, subst: &mut HashMap<String
     };
     let name = p.segments.join("::");
     if gens.is_empty() {
-        // A bare name: one of the impl's own pattern generics (bind or
-        // check agreement) if never seen among any *concrete* leaf name
-        // this codebase's stdlib impls ever declare bare in a target
-        // position — every real one (`Ring<f32>`, say) has no generic
-        // parameters needing resolution *from* it in the first place
-        // (`resolve_multi_target_call_ty`'s own callers only ever reach
-        // here for a genuinely *generic* impl), so treating every bare
-        // name as a pattern variable is sound in practice.
+        // A bare name: bind it, or check agreement with its binding. The
+        // impl's concrete names (`f32`) are already bound, to themselves
+        // (`resolve_multi_target_call_ty`).
         return match subst.get(&name) {
             Some(existing) => existing == concrete,
             None => {
@@ -1722,7 +1728,26 @@ fn match_type_pattern(pattern: &Type, concrete: &str, subst: &mut HashMap<String
     if concrete[..open] != name {
         return false;
     }
-    let parts = split_top_level_commas(&concrete[open + 1..close]);
+    let mut parts = split_top_level_commas(&concrete[open + 1..close]);
+    // A trailing pack (`Tensor<T, Dims...>`) takes every remaining
+    // argument, possibly none, bound as their list (`"64, 32"`).
+    let mut gens: &[GenericArg] = gens;
+    if let Some((last, fixed)) = gens.split_last()
+        && let Some(pack) = pack_name(last)
+    {
+        if parts.len() < fixed.len() {
+            return false;
+        }
+        let rest = parts.split_off(fixed.len()).join(", ");
+        match subst.get(pack) {
+            Some(existing) if *existing != rest => return false,
+            Some(_) => {}
+            None => {
+                subst.insert(pack.to_string(), rest);
+            }
+        }
+        gens = fixed;
+    }
     if parts.len() != gens.len() {
         return false;
     }
@@ -1756,6 +1781,36 @@ fn match_type_pattern(pattern: &Type, concrete: &str, subst: &mut HashMap<String
     })
 }
 
+/// Every bare type name (`T`, `f32`) a target pattern mentions.
+fn bare_type_names<'a>(pattern: &'a Type, out: &mut Vec<&'a str>) {
+    let TypeKind::Path(p, gens) = &pattern.kind else { return };
+    if gens.is_empty() {
+        if let [name] = p.segments.as_slice() {
+            out.push(name);
+        }
+        return;
+    }
+    for g in gens {
+        if let GenericArg::Type(t) = g {
+            bare_type_names(t, out);
+        }
+    }
+}
+
+/// The pack a generic argument expands (`Dims...`), if it is one.
+fn pack_name(arg: &GenericArg) -> Option<&str> {
+    match arg {
+        GenericArg::Type(t) => match &t.kind {
+            TypeKind::PackRef(name) => Some(name),
+            _ => None,
+        },
+        GenericArg::Const(e) => match &e.kind {
+            ExprKind::PackRef(name) => Some(name),
+            _ => None,
+        },
+    }
+}
+
 /// `match_type_pattern`'s own inverse — rebuilds one declared target
 /// pattern's own concrete text from an already-complete `subst`. `None`,
 /// not a guess, the moment any generic name the pattern references was
@@ -1771,6 +1826,14 @@ fn resolve_type_pattern(pattern: &Type, subst: &HashMap<String, String>) -> Opti
     }
     let mut parts = Vec::with_capacity(gens.len());
     for g in gens {
+        // A pack: its bound list, nothing if it's empty.
+        if let Some(pack) = pack_name(g) {
+            match subst.get(pack)? {
+                list if list.is_empty() => {}
+                list => parts.push(list.clone()),
+            }
+            continue;
+        }
         parts.push(match g {
             GenericArg::Type(t) => resolve_type_pattern(t, subst)?,
             GenericArg::Const(e) => match &e.kind {

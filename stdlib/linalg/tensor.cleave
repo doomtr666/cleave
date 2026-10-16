@@ -37,6 +37,9 @@
 // everything below is) lives; a rank-1-specific file (`vector.cleave`,
 // dot/cross product, norm, ...) isn't created yet — added when something
 // actually needs one, not speculatively.
+// `use convert;` — for the f32/bf16 tensor conversions below (`Convert`).
+use convert;
+
 struct Tensor<T: Float, const Dims...: i32> { data: [T; Dims...] }
 
 // `#[mlir_type(...)]` only ever decorates an `impl` block (`ast.rs`'s own
@@ -126,6 +129,26 @@ impl<T: Float, const Dims...: i32> Ring<Tensor<T, Dims...>> {
 // d(x));`, already declared on the algebra itself (`num.cleave`), applies
 // here unchanged -- `mul`/`exp` both resolve against *this* impl's own
 // `Tensor<T,Dims...>` once `Forward::walk`'s multi-level inlining reaches it.
+// Tensors between f32 and bf16, element by element (`doc/plan-quantization.md`): widening exact,
+// narrowing to the nearest bf16, ties to even, as the scalars' (`stdlib/convert`).
+impl<const Dims...: i32> Convert<Tensor<f32, Dims...>, Tensor<bf16, Dims...>> {
+    fn convert(x) { mlir::arith::truncf(x) }
+}
+
+impl<const Dims...: i32> Convert<Tensor<bf16, Dims...>, Tensor<f32, Dims...>> {
+    fn convert(x) { mlir::arith::extf(x) }
+}
+
+// An f32 tensor rounded to the bf16 tensor of the same shape: `Convert`'s narrowing with a single
+// target, what an adjoint rule can name without saying the type (`MatMulWide`'s, `stdlib/linalg`).
+algebra RoundBf16<A, B> {
+    fn round_bf16(x: A) -> B;
+}
+
+impl<const Dims...: i32> RoundBf16<Tensor<f32, Dims...>, Tensor<bf16, Dims...>> {
+    fn round_bf16(x) { mlir::arith::truncf(x) }
+}
+
 impl<T: Float, const Dims...: i32> Transcendental<Tensor<T, Dims...>> {
     fn exp(x: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::math::exp(x) }
     fn sin(x: Tensor<T, Dims...>) -> Tensor<T, Dims...> { mlir::math::sin(x) }

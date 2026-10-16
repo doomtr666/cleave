@@ -7764,3 +7764,56 @@ fn bf16_products_accumulate_in_f32() {
     ";
     assert_eq!(run_i32(&context, src), 1);
 }
+
+// `matmul_wide` (bf16 operands, an f32 product) differentiates: its adjoint
+// names `round_bf16`, whose output type comes from a variadic impl
+// (`Tensor<f32, Dims...> -> Tensor<bf16, Dims...>`) with concrete element
+// types. 1 + 2^-9 rounds to 1 in bf16.
+#[test]
+fn wide_bf16_products_differentiate() {
+    let context = context();
+    let src = "
+        use linalg;
+        use convert;
+        use nn;
+        fn loss(x: Tensor<f32, 8, 8>, w: Tensor<f32, 8, 8>) -> f32 {
+            let xb: Tensor<bf16, 8, 8> = x.to();
+            let wb: Tensor<bf16, 8, 8> = w.to();
+            sum(matmul_wide(xb, wb))
+        }
+        dloss_w = grad(loss, w);
+        dloss_x = grad(loss, x);
+        fn main() -> i32 {
+            let x: Tensor<f32, 8, 8> = [for i in 0..8: [for j in 0..8: 1.001953125]];
+            let w: Tensor<f32, 8, 8> = [for i in 0..8: [for j in 0..8: 0.5]];
+            if loss(x, w) == 256.0 and dloss_w(x, w)[1, 6] == 8.0 and dloss_x(x, w)[3, 4] == 4.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+// A bf16 tensor read by two products: its adjoint's contributions are summed
+// in bf16, a sum the forward program never computes (`Additive::add` seeded
+// from the adjoint rule's parameter types, `monomorphize.rs`).
+#[test]
+fn a_shared_bf16_operand_sums_its_adjoints() {
+    let context = context();
+    let src = "
+        use linalg;
+        use convert;
+        use nn;
+        fn loss(x: Tensor<f32, 8, 8>, w: Tensor<f32, 8, 8>) -> f32 {
+            let xb: Tensor<bf16, 8, 8> = x.to();
+            let wb: Tensor<bf16, 8, 8> = w.to();
+            sum(matmul_wide(xb, wb)) + sum(matmul_wide(xb, xb))
+        }
+        dloss_w = grad(loss, w);
+        dloss_x = grad(loss, x);
+        fn main() -> i32 {
+            let x: Tensor<f32, 8, 8> = [for i in 0..8: [for j in 0..8: 1.001953125]];
+            let w: Tensor<f32, 8, 8> = [for i in 0..8: [for j in 0..8: 0.5]];
+            if loss(x, w) == 768.0 and dloss_w(x, w)[1, 6] == 8.0 and dloss_x(x, w)[3, 4] == 20.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}

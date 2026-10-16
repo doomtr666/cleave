@@ -177,6 +177,56 @@ Requires the device features at pipeline creation; a device without bf16 coopera
 iGPU, by phase 0's answer) gets a located error, or, only where the user allowed it, the SIMT kernel
 on bf16 inputs. Tests: `vulkan.rs`'s product tests in bf16 against the CPU, on both devices.
 
+### 4a. The fast path (done, 2026-10-15): bf16 products on f32 tensors
+
+Before bf16 tensors exist on the GPU: `MatMulBf16` and its transposed forms (`stdlib/linalg`;
+`dense_forward_bf16`, `swiglu_forward_bf16` in `stdlib/nn`) take f32 tensors and compute the product
+in bf16. CPU: `arith.truncf` of the operands, mixed-precision `linalg.matmul`. Vulkan: an f32
+`linalg.matmul` marked `cleave.compute = "bf16"`, which `cleave-lower-gpu-gemms` turns into a call
+to `cleave_vk_gemm_bf16`, the runtime's tensor-core GEMM (`cleave-vk/kernels/gemm_bf16.comp`, after
+NVIDIA's reference: f32 loaded and rounded to bf16 into shared memory, the four transpositions,
+28-35 TFLOPS at 4096^3 against 19.6 for our f32 kernels). Shapes the kernel can't take (M, N not
+multiples of 128, K of 32) are a compile error. nanoLM's blocks use it: **13.91 k tok/s against
+11.72 in f32 (+19%)**, losses equal to four decimals over 20 steps (`bench 0 1 20`). The attention,
+still f32, becomes the largest cost (~25% of device time).
+
+### 4b. bf16 tensors on the GPU (next)
+
+What bf16 weights and activations need, in order:
+1. ✅ (2026-10-15) Generated kernels reading and writing 2-byte elements. In SPIR-V the bf16 type is for storage,
+   conversions and cooperative matrices only, not ordinary arithmetic: elementwise operations on bf16
+   computed in f32 and stored as bf16 (`arith-emulate-unsupported-floats`), the capabilities declared
+   (16-bit storage access, `BFloat16TypeKHR`). Lifts `pipeline.rs`'s refusal. Done: the SPIR-V stage
+   runs `arith-emulate-unsupported-floats{source-types=bf16 target-type=f32}` and
+   `math-extend-to-supported-types` on the kernels and declares `StorageBuffer16BitAccess` and
+   `BFloat16TypeKHR`. Found on the way: without the capability, MLIR's SPIR-V type conversion
+   silently held bf16 values as f32 (`1 + 2^-9` never rounded to 1), the real cause of the wrong bf16
+   product seen earlier; `vulkan.rs::bf16_tensors_round_on_the_gpu_as_on_the_cpu` checks it.
+   `DeviceInfo::bf16` says which devices can (not the iGPU). `Tensor<f32>` <-> `Tensor<bf16>`
+   conversions in `stdlib/linalg`.
+2. ✅ (2026-10-15) The GEMM kernel with bf16 operands in memory, chosen by operand type:
+   `cleave-vk/kernels/gemm_bf16_in.comp` (operands copied into shared memory as they are, a tile in
+   memory order, transposed fragments loaded column major), **59-62 TFLOPS at 4096^3 for every
+   transposition**, exact (`tests/coopmat.rs`); `cleave_vk_gemm_bf16_operands`; `cleave-lower-gpu-gemms`
+   sends every product of bf16 tensors into f32 there (a shape the kernel can't take stays a generated
+   kernel, same values). `MatMulTransposeA`/`B` impls for bf16 tensors (a bf16 layer's backward).
+   `vulkan.rs::bf16_tensor_products_run_on_tensor_cores`.
+3. nanoLM's mixed precision, explicit: f32 master weights in the optimizer, a bf16 working copy
+   refreshed each step, bf16 activations between layers; norms, softmax, optimizer in f32.
+   In progress (2026-10-16). `matmul_wide` (`stdlib/linalg`: bf16 operands, an f32 product, its
+   adjoint through `matmul_wide_transpose_a/b` on the rounded upstream, `round_bf16`), used by
+   `dense_forward_bf16`: the f32 weights and activations rounded once per layer, every product on
+   `gemm_bf16_operands`. Compiler fixes it needed, generic: a variadic impl's output type resolved
+   in an adjoint body (`egraph.rs::resolve_multi_target_call_ty`: trailing packs, concrete bare
+   names); `Additive::add` seeded at every adjoint-ruled parameter's type (a bf16 tensor read by
+   two products sums its adjoints in bf16, a sum the forward never computes). Measured
+   (`bench 0 1 3`, device time): GEMMs 7.6 s -> 4.1 s against the fast path, but the backward's
+   column sums (`reduce0`, bias gradients: a thread per column, latency-bound) doubled once the
+   conversions pushed their input out of L2. Promoting them to a workgroup per column
+   (`gpu.cpp::freshInLoop`: a gradient field's descriptor, cast again outside the loop, is fresh
+   for it) took the total from 20.4 s to **14.7 s**, losses unchanged.
+   Next: the attention in bf16, the output head, and the remaining conversion kernels.
+
 ### 5. Mixed-precision training, written by the user
 
 bf16 has 8 bits of mantissa: an update smaller than 2^-8 of a weight vanishes. The standard recipe

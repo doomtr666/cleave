@@ -207,15 +207,18 @@ fn new_gpt() -> Gpt {
 // Not inlined: called `LAYERS` times per forward pass, each call a whole block of work, compiled
 // once per row count instead of once per layer (the training gradient is synthesized from its body by the
 // e-graph, unaffected). Rows are whole sequences of `CONTEXT`: row `r` is position `r mod CONTEXT`.
+// The projections and the MLP compute their products in bfloat16 (`dense_forward_bf16`,
+// `swiglu_forward_bf16`: tensor cores on the GPU, f32 weights and accumulation); the norms, the
+// attention, the residuals and the output head stay in f32.
 #[no_inline]
 fn block<const N: i32>(x: Tensor<f32, N, WIDTH>, b: Block) -> Tensor<f32, N, WIDTH> {
     let shape = AttentionShape::<CONTEXT, HEAD>();
     let h = rms_norm(x, b.n1);
-    let q = rope(b.wq.dense_forward(h), shape);
-    let k = rope(b.wk.dense_forward(h), shape);
-    let a = causal_attention(q, k, b.wv.dense_forward(h), shape);
-    let x2 = x + b.wo.dense_forward(a);
-    x2 + b.mlp.swiglu_forward(rms_norm(x2, b.n2))
+    let q = rope(b.wq.dense_forward_bf16(h), shape);
+    let k = rope(b.wk.dense_forward_bf16(h), shape);
+    let a = causal_attention(q, k, b.wv.dense_forward_bf16(h), shape);
+    let x2 = x + b.wo.dense_forward_bf16(a);
+    x2 + b.mlp.swiglu_forward_bf16(rms_norm(x2, b.n2))
 }
 
 // Any number of rows `N`, whole sequences of `CONTEXT`: a micro-batch (`MICRO`).

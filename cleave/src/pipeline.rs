@@ -614,6 +614,8 @@ pub unsafe fn register_cleave_rt_symbols(engine: &cleave_mlir::ExecutionEngine) 
     unsafe {
         engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
         engine.register_symbol("cleave_vk_dispatch", cleave_vk::cleave_vk_dispatch as *mut ());
+        engine.register_symbol("cleave_vk_gemm_bf16", cleave_vk::cleave_vk_gemm_bf16 as *mut ());
+        engine.register_symbol("cleave_vk_gemm_bf16_operands", cleave_vk::cleave_vk_gemm_bf16_operands as *mut ());
         engine.register_symbol("cleave_vk_sync_host", cleave_vk::cleave_vk_sync_host as *mut ());
         engine.register_symbol("cleave_vk_host_wrote", cleave_vk::cleave_vk_host_wrote as *mut ());
         engine.register_symbol("cleave_vk_discard", cleave_vk::cleave_vk_discard as *mut ());
@@ -816,22 +818,7 @@ pub fn lower_to_llvm<'c>(
 ) -> Result<(), Vec<String>> {
     let vulkan = options.backend == Backend::Vulkan;
     register_passes();
-    // 16-bit floats (`bf16`, `f16`) aren't generated for the GPU yet: its kernels and their tiling
-    // (`cleave-tile-matmuls-for-gpu`'s vector loads) assume 32-bit elements, and read a `bf16`
-    // tensor wrong without failing. Refused here until the cooperative-matrix path exists
-    // (`doc/plan-quantization.md`, phase 4), never computed wrong.
-    if vulkan {
-        let text = module.as_operation().to_string();
-        if text.contains("xbf16>") || text.contains("xf16>") {
-            return Err(vec![
-                "`bf16`/`f16` tensors aren't supported on the Vulkan backend yet: its kernels assume \
-                 32-bit floats (`doc/plan-quantization.md`, phase 4). Compile for the CPU, or keep \
-                 the tensors in `f32`."
-                    .to_string(),
-            ]);
-        }
-    }
-    let dump = |module: &Module, variable: &str| {
+    let dump =|module: &Module, variable: &str| {
         if let Ok(path) = std::env::var(variable) {
             std::fs::write(&path, module.as_operation().to_string())
                 .unwrap_or_else(|e| eprintln!("{variable}: failed to write {path}: {e}"));
@@ -906,7 +893,7 @@ pub fn lower_to_llvm<'c>(
         run_stage(
             module,
             "GPU kernels",
-            "builtin.module(cleave-blas-to-linalg,cleave-parallelize-loops,cleave-gpu-copies,cleave-parallel-iterators-first,cleave-mark-full-overwrites,cleave-tile-matmuls-for-gpu,\
+            "builtin.module(cleave-lower-gpu-gemms,cleave-blas-to-linalg,cleave-parallelize-loops,cleave-gpu-copies,cleave-parallel-iterators-first,cleave-mark-full-overwrites,cleave-tile-matmuls-for-gpu,\
              func.func(convert-linalg-to-parallel-loops),cleave-cooperative-rows,\
              cleave-tile-parallel-loops-for-gpu{threads=64},func.func(gpu-map-parallel-loops,\
              convert-parallel-loops-to-gpu,canonicalize),cleave-sink-views-into-launches,\
@@ -920,7 +907,10 @@ pub fn lower_to_llvm<'c>(
             module,
             "SPIR-V kernels",
             "builtin.module(cleave-set-spirv-entry-abi,gpu.module(lower-affine),cleave-guard-zero-trip-loops,\
-             spirv-attach-target{ver=v1.3 caps=Shader exts=SPV_KHR_storage_buffer_storage_class},\
+             gpu.module(arith-emulate-unsupported-floats{source-types=bf16 target-type=f32},\
+             math-extend-to-supported-types{target-type=f32}),\
+             spirv-attach-target{ver=v1.3 caps=Shader,StorageBuffer16BitAccess,BFloat16TypeKHR \
+             exts=SPV_KHR_storage_buffer_storage_class,SPV_KHR_16bit_storage,SPV_KHR_bfloat16},\
              cleave-accurate-kernel-math,gpu.module(convert-math-to-spirv),convert-gpu-to-spirv,\
              spirv.module(spirv-lower-abi-attrs,spirv-update-vce),\
              cleave-lower-gpu-launches,cleave-sync-host-accesses)",
