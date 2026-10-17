@@ -63,6 +63,25 @@ fn run_example(name: &str) -> RunResult {
     }
 }
 
+/// `run_example` for a program given as source, written to a scratch file.
+fn run_source(name: &str, src: &str) -> RunResult {
+    let dir = std::env::temp_dir().join(format!("cleave-examples-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{name}.cleave"));
+    std::fs::write(&path, src).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .arg(&path)
+        .arg("--run")
+        .env("CLEAVE_DEBUG_POOL", "1")
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn the cleave binary: {e}"));
+    RunResult {
+        success: output.status.success(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
 /// The common, strict bar every clean example must clear: `main` runs to
 /// completion returning `0` (the process's own exit code, not just "no
 /// panic"), and *nothing* was written to `stderr` at all -- confirmed, by
@@ -86,6 +105,52 @@ fn assert_clean(r: &RunResult) {
         "expected empty stderr, got:\n{}",
         r.stderr
     );
+}
+
+/// A tensor stored into several structs, the first released before the
+/// last is built: two layers' bf16 attention gradients each fill a pair
+/// adjoint `(u, zero)` of `causal_attention_stats`' output, with one shared
+/// zero. Written in place into the first pair's field and read by the
+/// second through it, the zero was freed with the first pair: the second
+/// gradient retained a freed block (`inf`s in nanoLM's step).
+/// `mlir_lower.rs::build_tensor_descriptor_value` copies a value used
+/// elsewhere; the pool's checks find nothing.
+#[test]
+fn a_tensor_shared_by_two_gradient_pairs_is_never_read_freed() {
+    let src = r#"use io;
+use linalg;
+use convert;
+use nn;
+struct Block { wq: Dense<f32, 64, 64> }
+impl Trainable<Block> {}
+struct Gpt { tok: Embedding<f32, 128, 64>, blocks: [Block; 2] }
+impl Trainable<Gpt> {}
+#[no_inline]
+fn block(x: Tensor<f32, 256, 64>, b: Block) -> Tensor<f32, 256, 64> {
+    let shape = AttentionShape::<256, 64>();
+    let q: Tensor<bf16, 256, 64> = b.wq.dense_forward_bf16(x).to();
+    let v: Tensor<bf16, 256, 64> = x.to();
+    let a: Tensor<f32, 256, 64> = causal_attention(q, v, v, shape).to();
+    x + a
+}
+fn loss(x: [i32; 256], m: Gpt) -> f32 {
+    let mut h = embedding_forward(m.tok, x);
+    for i in 0..2 { h = block(h, m.blocks[i]); };
+    sum(h * h)
+}
+dloss = grad(loss, m);
+fn main() -> i32 {
+    rand_seed(1);
+    let m = Gpt(tok: Init::xavier(), blocks: [for i in 0..2: Block(wq: Init::xavier())]);
+    let x: [i32; 256] = [for i in 0..256: i * 7 + 3 - ((i * 7 + 3) / 128) * 128];
+    let x2: [i32; 256] = [for i in 0..256: i * 5 + 1 - ((i * 5 + 1) / 128) * 128];
+    let g0 = dloss(x2, m);
+    let g = dloss(x, m);
+    println(g.blocks[0].wq.w[1, 2]);
+    0
+}
+"#;
+    assert_clean(&run_source("shared_pair_tensor", src));
 }
 
 #[test]

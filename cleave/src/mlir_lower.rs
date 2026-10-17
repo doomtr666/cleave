@@ -152,6 +152,11 @@ struct LowerCtx<'c, 'm> {
     /// buffer (one more reference) instead of copying it -- recorded where
     /// the view is created, never recovered by inspecting IR shapes.
     field_views: RefCell<HashMap<usize, Value<'c, 'c>>>,
+    /// How many struct constructions each CPS variable is a field of,
+    /// anywhere in the program (`CVar`s are unique program-wide): a tensor
+    /// stored into a field is written *in place* there
+    /// (`build_tensor_descriptor_value`) only when this struct is the one.
+    struct_field_uses: HashMap<CVar, usize>,
     /// Every struct name with at least one real `PrimOp::Struct`
     /// construction site anywhere in the whole program —
     /// `refcount::collect_constructed_struct_names`'s own doc comment has
@@ -548,6 +553,7 @@ pub fn lower_program<'c>(
             currently_region_local: std::cell::Cell::new(false),
             pending_rebinds: RefCell::new(Vec::new()),
             field_views: RefCell::new(HashMap::default()),
+            struct_field_uses: count_struct_field_uses(program),
             constructed_structs,
             field_mutated_structs,
             extern_boundary_structs,
@@ -4216,11 +4222,20 @@ fn build_tensor_descriptor_value<'c>(
         return descriptor_val;
     }
 
+    // A value stored into several structs (a gradient's shared zero, one
+    // per pair it fills) is copied into each field rather than written in
+    // place: in place, the first field's buffer *is* the value's and every
+    // later struct shares it through that field, which may be released
+    // before them (the field then freed under a later struct built from the
+    // same value). Copied, each struct owns its own buffer.
+    let shared_value = matches!(arg, CVal::Var(v) if ctx.struct_field_uses.get(v).copied().unwrap_or(0) > 1);
     // The value's own defining op, when it sits in this same block -- where
     // the destination chain must go (see the doc comment above). Built into
-    // a detached staging block first, then moved there in one go.
+    // a detached staging block first, then moved there in one go. Not for a
+    // shared value: the destination after its producer, One-Shot copies.
     let producer = cleave_mlir::ir::operation::OperationResult::try_from(value)
         .ok()
+        .filter(|_| !shared_value)
         .map(|r| r.owner())
         .filter(|op| op.block().is_some_and(|b| b.to_raw().ptr == block.to_raw().ptr))
         .map(|op| op.to_raw());
@@ -4361,7 +4376,7 @@ fn build_tensor_descriptor_value<'c>(
             }),
     );
 
-    if let CVal::Var(var) = arg {
+    if let (CVal::Var(var), false) = (arg, shared_value) {
         let view = OperationBuilder::new("bufferization.to_tensor", location)
             .add_operands(&[dest_memref])
             .add_attributes(&[(Identifier::new(context, "restrict"), unit)])
@@ -6115,12 +6130,48 @@ fn copy_array_into_llvm_field<'c>(
 /// The arrays safe on the stack: built by `PrimOp::Array` from a handful of
 /// scalars, and only ever passed to an `Index::index` instance, which reads
 /// its indices and keeps nothing (`stdlib/core`'s `Index` algebra: the
-/// index array is a temporary of `x[i, j]`, `cps.rs`'s `ExprKind::Index`).
+/// index array is a temporary of `x[i, j]`, `cps.rs`'s `ExprKind::Index`),
+/// or as the indices of an `IndexSet::set` (`t[i, j] = v` on a tensor).
 /// On the heap, each one was a counted allocation and release per element
 /// access, the bulk of a cross-entropy step's cost (profiled: ~60% in
 /// `cleave_alloc_rc`/`cleave_release`); on the stack, once `index` is
 /// inlined, it disappears. Every loop body already restores the stack each
 /// iteration (`cleave-insert-stack-scopes`).
+/// How many struct constructions (`PrimOp::Struct`) each variable is a
+/// field of (`LowerCtx::struct_field_uses`).
+fn count_struct_field_uses(program: &CpsProgram) -> HashMap<CVar, usize> {
+    fn walk(e: &CExpr, uses: &mut HashMap<CVar, usize>) {
+        match e {
+            CExpr::LetPrim { op, args, cont, .. } => {
+                if matches!(op, PrimOp::Struct(..)) {
+                    for a in args {
+                        if let CVal::Var(x) = a {
+                            *uses.entry(*x).or_insert(0) += 1;
+                        }
+                    }
+                }
+                walk(cont, uses);
+            }
+            CExpr::App { .. } => {}
+            CExpr::If { then_branch, else_branch, .. } => {
+                walk(then_branch, uses);
+                walk(else_branch, uses);
+            }
+            CExpr::Fix { defs, body } => {
+                for d in defs {
+                    walk(&d.body, uses);
+                }
+                walk(body, uses);
+            }
+        }
+    }
+    let mut uses = HashMap::default();
+    for f in &program.funcs {
+        walk(&f.def.body, &mut uses);
+    }
+    uses
+}
+
 fn stack_index_arrays(program: &CpsProgram) -> HashSet<CVar> {
     fn small_scalar_array(ty: &Ty) -> bool {
         matches!(ty, Ty::Array(elem, size)
@@ -6146,10 +6197,13 @@ fn stack_index_arrays(program: &CpsProgram) -> HashSet<CVar> {
                 walk(cont, candidates, other_uses);
             }
             CExpr::App { func, args } => {
+                // `Index::index` reads its arguments; `IndexSet::set` reads
+                // its indices (its container it may return).
                 let to_index = matches!(func, CVal::Label(name) if name.starts_with("Index::index<"));
+                let to_set = matches!(func, CVal::Label(name) if name.starts_with("IndexSet::set<"));
                 note(func, false, other_uses);
-                for a in args {
-                    note(a, to_index, other_uses);
+                for (i, a) in args.iter().enumerate() {
+                    note(a, to_index || (to_set && i == 1), other_uses);
                 }
             }
             CExpr::If { cond, then_branch, else_branch } => {

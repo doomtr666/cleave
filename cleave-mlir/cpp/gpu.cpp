@@ -436,15 +436,16 @@ static SmallVector<int64_t> accessSpans(Operation *access, size_t indices) {
 
 // Whether the memory of `alloc` (a `memref.alloc`) can only be reached
 // through it: every use is an access, a view, a cast, a free, a metadata
-// query or a `linalg` op; never stored, passed to a call, or its address
-// taken. Then no other memref aliases it.
+// query, a copy (reading or writing its elements, aliasing neither: a block
+// put back by `update`) or a `linalg` op; never stored, passed to a call, or
+// its address taken. Then no other memref aliases it.
 static bool allocationStaysLocal(Value alloc) {
   SmallVector<Value> pending{alloc};
   while (!pending.empty()) {
     Value v = pending.pop_back_val();
     for (Operation *user : v.getUsers()) {
       if (isa<memref::LoadOp, memref::StoreOp, memref::DeallocOp, memref::DimOp, memref::ExtractStridedMetadataOp,
-              linalg::LinalgOp>(user))
+              memref::CopyOp, linalg::LinalgOp>(user))
         continue;
       if (isa<ViewLikeOpInterface, memref::CastOp>(user)) {
         for (Value result : user->getResults())
@@ -1402,17 +1403,23 @@ static std::optional<Interchange> interchangeAccumulation(scf::ForOp loop) {
 static int64_t cleaveParallelizeLoops(MlirOperation op) {
   Operation *root = unwrap(op);
   MLIRContext *ctx = root->getContext();
+  upliftCountedWhiles(root);
   {
+    // The loops' values carried unchanged, now that they're `scf.for`s
+    // (`cleave-fold-passthrough-iter-args` saw `scf.while`s): a buffer a
+    // loop updates in place (a tensor written element by element,
+    // bufferized) and its ownership flag, `false | flag`. Carried, they keep
+    // the loop sequential.
     RewritePatternSet patterns(ctx);
-    scf::populateUpliftWhileToForPatterns(patterns);
-    SmallVector<Operation *> loops;
-    root->walk([&](scf::WhileOp loop) {
-      if (!loop->getParentOfType<gpu::GPUModuleOp>())
-        loops.push_back(loop);
+    scf::ForOp::getCanonicalizationPatterns(patterns, ctx);
+    SmallVector<Operation *> ops;
+    root->walk([&](Operation *op) {
+      if (isa<scf::ForOp, arith::OrIOp>(op) && !op->getParentOfType<gpu::GPUModuleOp>())
+        ops.push_back(op);
     });
     GreedyRewriteConfig config;
     config.setStrictness(GreedyRewriteStrictness::ExistingAndNewOps);
-    (void)applyOpPatternsGreedily(loops, FrozenRewritePatternSet(std::move(patterns)), config);
+    (void)applyOpPatternsGreedily(ops, FrozenRewritePatternSet(std::move(patterns)), config);
   }
   auto module = dyn_cast<ModuleOp>(root);
   if (!module)
@@ -2458,10 +2465,19 @@ static bool sameLoad(Value a, Value b) {
 
 // The reductions `loop` carries, one per iter_arg, if every one is of a form
 // `CarriedReduction` knows and the loop writes no memory; none otherwise.
-static std::optional<SmallVector<CarriedReduction>> carriedReductions(scf::ForOp loop) {
+static std::optional<SmallVector<CarriedReduction>> carriedReductions(scf::ForOp loop, bool elementStores = false) {
   Block *body = loop.getBody();
   bool writes = false;
   loop.getBody()->walk([&](Operation *inner) {
+    // With `elementStores`, a store at the loop's own element (its
+    // induction variable among the indices: each iteration's own) is allowed
+    // beside the reductions (`online_causal_attention`'s weights, stored as
+    // their sum is taken).
+    if (auto store = dyn_cast<memref::StoreOp>(inner);
+        store && elementStores && llvm::any_of(store.getIndices(), [&](Value index) {
+          return isInductionVariable(index, loop.getInductionVar());
+        }))
+      return;
     if (!isMemoryEffectFree(inner) && !isa<memref::LoadOp>(inner) &&
         !inner->hasTrait<OpTrait::HasRecursiveMemoryEffects>())
       writes = true;
@@ -3285,36 +3301,87 @@ static void guardLiveTiles(OpBuilder &kb, Location loc, gpu::LaunchOp launch, in
     op->moveBefore(end);
 }
 
-// Vulkan backend: a product of bf16 operands into f32 (`mlir_lower.rs`'s
-// widened products, `stdlib/linalg`'s `MatMulWide`) that the runtime's GEMM
-// didn't take (`cleave-lower-gpu-gemms`: a block of a larger matrix, a head of
-// attention, a shape it doesn't divide), computed on cooperative matrices (the
-// tensor cores) in a kernel of its own: a workgroup of 4 subgroups per `tile`
-// x `tile` block of the result, each subgroup a quarter of it in 16 x 16
-// fragments accumulated in f32, the operands' fragments loaded from device
-// memory where they are, at their row stride, those transposed column major
-// (`kFragmentStride`). For a body that is the sum of products (`c + ext(a) *
-// ext(b)`) over operands whose rows are contiguous. The work no one needs
-// skipped as `cleaveTileMatmulsForGpu` skips it: tiles nothing reads, slices
-// of the reduction where `a` is zero. The sum is in another order than the
-// scalar kernel's. Subgroups of 32 invocations assumed (NVIDIA's;
-// `doc/plan-quantization.md`). Whether it rewrote `product`.
-static bool tileProductOnFragments(linalg::LinalgOp product, OpOperand *a, OpOperand *b, unsigned dimM,
-                                   unsigned dimN, unsigned dimK, int64_t m, int64_t n, int64_t k, ModuleOp module) {
-  OpOperand *cOperand = product.getDpsInitOperand(0);
-  Value c = cOperand->get();
-  auto aType = cast<MemRefType>(a->get().getType()), bType = cast<MemRefType>(b->get().getType()),
-       cType = cast<MemRefType>(c.getType());
-  if (!aType.getElementType().isBF16() || !bType.getElementType().isBF16() || !cType.getElementType().isF32())
-    return false;
+// A product the fragment kernels compute (`tileProductOnFragments`,
+// `cleave-fuse-row-pipelines`): a `linalg` contraction of bf16 operands into
+// f32 whose body is the sum of products (`c + ext(a) * ext(b)`), every operand
+// two-dimensional with contiguous rows. `m` and `n` its output's loops, `k`
+// the reduction; `a` the operand indexed by `m` and `k`, `b` by `k` and `n`;
+// each operand's row stride, and whether a fragment's rows are its memory's
+// columns (a transposed operand, loaded column major).
+struct FragmentProduct {
+  mutable linalg::LinalgOp op;
+  OpOperand *a, *b, *c;
+  unsigned dimM, dimN, dimK;
+  int64_t m, n, k;
+  int64_t aStride, bStride, cStride;
+  bool aColumns, bColumns, cColumns;
+  // `operand`'s indices for loop values `at` (by loop dimension), in the
+  // order its map reads them.
+  SmallVector<Value> indicesOf(OpOperand *operand, ArrayRef<std::pair<unsigned, Value>> at) const {
+    AffineMap map = op.getMatchingIndexingMap(operand);
+    SmallVector<Value> indices;
+    for (unsigned r = 0; r < map.getNumResults(); ++r)
+      for (auto [dim, value] : at)
+        if (map.getDimPosition(r) == dim)
+          indices.push_back(value);
+    return indices;
+  }
+};
+
+// A 16 x 16 fragment's side, and a subgroup's invocations (assumed: NVIDIA's).
+constexpr int64_t kFragment = 16, kSubgroup = 32;
+
+// The row stride of a two-dimensional memref whose rows are contiguous, if it
+// is static.
+static std::optional<int64_t> rowStrideOf(MemRefType type) {
+  SmallVector<int64_t> strides;
+  int64_t offset;
+  if (type.getRank() != 2 || failed(type.getStridesAndOffset(strides, offset)) || strides[1] != 1 ||
+      ShapedType::isDynamic(strides[0]))
+    return std::nullopt;
+  return strides[0];
+}
+
+static std::optional<FragmentProduct> fragmentProductOf(linalg::LinalgOp product) {
+  if (!product.hasPureBufferSemantics() || product.getNumLoops() != 3 || product.getNumDpsInputs() != 2 ||
+      product.getNumDpsInits() != 1 || product.getNumReductionLoops() != 1)
+    return std::nullopt;
+  FragmentProduct p;
+  p.op = product;
+  p.c = product.getDpsInitOperand(0);
+  AffineMap cMap = product.getMatchingIndexingMap(p.c);
+  if (cMap.getNumResults() != 2 || !cMap.isProjectedPermutation())
+    return std::nullopt;
+  p.dimM = cMap.getDimPosition(0);
+  p.dimN = cMap.getDimPosition(1);
+  p.dimK = 3 - p.dimM - p.dimN;
+  if (product.getIteratorTypesArray()[p.dimK] != utils::IteratorType::reduction)
+    return std::nullopt;
+  p.a = product.getDpsInputOperand(0);
+  p.b = product.getDpsInputOperand(1);
+  auto indexes = [&](OpOperand *operand, unsigned d1, unsigned d2) {
+    AffineMap map = product.getMatchingIndexingMap(operand);
+    return map.getNumResults() == 2 && map.isProjectedPermutation() &&
+           ((map.getDimPosition(0) == d1 && map.getDimPosition(1) == d2) ||
+            (map.getDimPosition(0) == d2 && map.getDimPosition(1) == d1));
+  };
+  if (!indexes(p.a, p.dimM, p.dimK))
+    std::swap(p.a, p.b);
+  if (!indexes(p.a, p.dimM, p.dimK) || !indexes(p.b, p.dimK, p.dimN))
+    return std::nullopt;
+  auto aType = dyn_cast<MemRefType>(p.a->get().getType()), bType = dyn_cast<MemRefType>(p.b->get().getType()),
+       cType = dyn_cast<MemRefType>(p.c->get().getType());
+  if (!aType || !bType || !cType || !aType.hasStaticShape() || !bType.hasStaticShape() || !cType.hasStaticShape() ||
+      !aType.getElementType().isBF16() || !bType.getElementType().isBF16() || !cType.getElementType().isF32())
+    return std::nullopt;
   // The body: `c + ext(a) * ext(b)`, nothing else.
   Block *body = product.getBlock();
-  Value aArg = body->getArgument(a->getOperandNumber()), bArg = body->getArgument(b->getOperandNumber()),
-        cArg = body->getArgument(cOperand->getOperandNumber());
+  Value aArg = body->getArgument(p.a->getOperandNumber()), bArg = body->getArgument(p.b->getOperandNumber()),
+        cArg = body->getArgument(p.c->getOperandNumber());
   if (!llvm::all_of(body->getOperations(), [](Operation &op) {
         return isa<arith::ExtFOp, arith::MulFOp, arith::AddFOp, linalg::YieldOp>(op);
       }))
-    return false;
+    return std::nullopt;
   auto sum = body->getTerminator()->getOperand(0).getDefiningOp<arith::AddFOp>();
   Value term = !sum ? Value() : sum.getLhs() == cArg ? sum.getRhs() : sum.getRhs() == cArg ? sum.getLhs() : Value();
   auto times = term ? term.getDefiningOp<arith::MulFOp>() : arith::MulFOp();
@@ -3325,33 +3392,245 @@ static bool tileProductOnFragments(linalg::LinalgOp product, OpOperand *a, OpOpe
   };
   if (!times || !((source(times.getLhs()) == aArg && source(times.getRhs()) == bArg) ||
                   (source(times.getLhs()) == bArg && source(times.getRhs()) == aArg)))
-    return false;
-  // Each operand's row stride, its rows contiguous.
-  auto rowStride = [](MemRefType type) -> std::optional<int64_t> {
-    SmallVector<int64_t> strides;
-    int64_t offset;
-    if (type.getRank() != 2 || failed(type.getStridesAndOffset(strides, offset)) || strides[1] != 1 ||
-        ShapedType::isDynamic(strides[0]))
-      return std::nullopt;
-    return strides[0];
-  };
-  std::optional<int64_t> aStride = rowStride(aType), bStride = rowStride(bType), cStride = rowStride(cType);
+    return std::nullopt;
+  std::optional<int64_t> aStride = rowStrideOf(aType), bStride = rowStrideOf(bType), cStride = rowStrideOf(cType);
   if (!aStride || !bStride || !cStride)
+    return std::nullopt;
+  p.aStride = *aStride;
+  p.bStride = *bStride;
+  p.cStride = *cStride;
+  p.aColumns = product.getMatchingIndexingMap(p.a).getDimPosition(0) != p.dimM;
+  p.bColumns = product.getMatchingIndexingMap(p.b).getDimPosition(0) != p.dimK;
+  p.cColumns = cMap.getDimPosition(0) != p.dimM;
+  SmallVector<int64_t> ranges = product.getStaticLoopRanges();
+  p.m = ranges[p.dimM];
+  p.n = ranges[p.dimN];
+  p.k = ranges[p.dimK];
+  if (p.k % kFragment != 0)
+    return std::nullopt;
+  return p;
+}
+
+// A 16 x 16 fragment of `element`s for `use`, a subgroup's.
+static spirv::CooperativeMatrixType fragmentType(Type element, spirv::CooperativeMatrixUseKHR use) {
+  return spirv::CooperativeMatrixType::get(element, kFragment, kFragment, spirv::Scope::Subgroup, use);
+}
+
+// Marks a fragment carrier (`kFragmentStride`).
+static void markFragment(Operation *carrier, int64_t stride, bool columns) {
+  MLIRContext *ctx = carrier->getContext();
+  carrier->setAttr(kFragmentStride, IntegerAttr::get(IntegerType::get(ctx, 64), stride));
+  if (columns)
+    carrier->setAttr(kFragmentColumnMajor, UnitAttr::get(ctx));
+}
+
+// A fragment of `memref` loaded from `indices` (its first element), the rows
+// `stride` elements apart, column major if `columns`: the carrier
+// `cleave-lower-fragment-carriers` makes a cooperative matrix load.
+static Value loadFragment(OpBuilder &at, Location loc, Value memref, ValueRange indices,
+                          spirv::CooperativeMatrixType type, int64_t stride, bool columns) {
+  Value first = memref::LoadOp::create(at, loc, memref, indices);
+  auto carrier = spirv::CompositeConstructOp::create(at, loc, type, ValueRange{first});
+  markFragment(carrier, stride, columns);
+  return carrier;
+}
+
+// `fragment` stored to `memref` at `indices` (`loadFragment`'s converse).
+static void storeFragment(OpBuilder &at, Location loc, Value fragment, Value memref, ValueRange indices,
+                          int64_t stride, bool columns) {
+  auto carrier = spirv::CompositeExtractOp::create(at, loc, fragment, ArrayRef<int32_t>{0});
+  markFragment(carrier, stride, columns);
+  memref::StoreOp::create(at, loc, carrier, memref, indices);
+}
+
+// Tiles of 16-bit operands staged in the workgroup's memory, 16 bytes at a
+// time (`kernels/gemm_bf16_in.comp`'s `uvec4`s): fragments loaded straight
+// from device memory, each a scatter of small accesses the driver issues,
+// made 46% of the fused attention's samples (long scoreboard, LG throttle:
+// Nsight Graphics), where the runtime's GEMM stages its tiles.
+//
+// An operand's buffer seen as rows of `vector<4xi32>`, 8 elements each: a
+// cast of its base buffer (whole, row major), which
+// `cleave-lower-gpu-launches` binds as that buffer, and the operand's first
+// element in it (`row`, `column`: a subview's offsets, the column a multiple
+// of 8). None when the operand isn't such a view of 16-bit elements.
+struct VectorSource {
+  Value view;
+  Value row, column;
+};
+
+static Value uncastIndex(Value v);
+static void workgroupBarrier(OpBuilder &b, Location loc);
+
+// Whether `v` (an index, or a subview's static offset) is a multiple of `n`:
+// a constant, or a product or sum of what is, through casts.
+static bool isMultipleOf(OpFoldResult v, int64_t n) {
+  if (std::optional<int64_t> c = getConstantIntValue(v))
+    return *c % n == 0;
+  Value value = dyn_cast<Value>(v);
+  if (!value)
     return false;
-  // A fragment's rows are the memory's columns where the operand is
-  // transposed.
-  AffineMap aMap = product.getMatchingIndexingMap(a), bMap = product.getMatchingIndexingMap(b),
-            cMap = product.getMatchingIndexingMap(cOperand);
-  const bool aColumns = aMap.getDimPosition(0) != dimM, bColumns = bMap.getDimPosition(0) != dimK,
-             cColumns = cMap.getDimPosition(0) != dimM;
+  Operation *def = uncastIndex(value).getDefiningOp();
+  if (!def)
+    return false;
+  if (isa<arith::MulIOp>(def))
+    return isMultipleOf(def->getOperand(0), n) || isMultipleOf(def->getOperand(1), n);
+  if (isa<arith::AddIOp, arith::SubIOp>(def))
+    return isMultipleOf(def->getOperand(0), n) && isMultipleOf(def->getOperand(1), n);
+  return false;
+}
+
+static std::optional<VectorSource> vectorSourceOf(OpBuilder &host, Location loc, Value memref) {
+  auto type = dyn_cast<MemRefType>(memref.getType());
+  if (!type || type.getRank() != 2 || type.getElementTypeBitWidth() != 16)
+    return std::nullopt;
+  Value base = memref;
+  SmallVector<OpFoldResult> offsets{host.getIndexAttr(0), host.getIndexAttr(0)};
+  if (auto subview = memref.getDefiningOp<memref::SubViewOp>()) {
+    if (!llvm::all_of(subview.getMixedStrides(), [](OpFoldResult s) { return getConstantIntValue(s) == 1; }))
+      return std::nullopt;
+    base = subview.getSource();
+    offsets = subview.getMixedOffsets();
+  }
+  auto baseType = dyn_cast<MemRefType>(base.getType());
+  if (!baseType || baseType.getRank() != 2 || !baseType.hasStaticShape() || !baseType.getLayout().isIdentity() ||
+      baseType.getShape()[1] % 8 != 0 || !isMultipleOf(offsets[1], 8))
+    return std::nullopt;
+  // A buffer the loops around the product don't make: one they do is an
+  // allocation `cleave-fold-loops-into-grids` gives each folded iteration its
+  // own of, which a view wouldn't follow (attention's weights, made per head).
+  Operation *defined = base.getDefiningOp() ? base.getDefiningOp() : base.getParentBlock()->getParentOp();
+  for (Operation *around = host.getInsertionBlock()->getParentOp(); around; around = around->getParentOp())
+    if (isa<LoopLikeOpInterface>(around) && around->isAncestor(defined))
+      return std::nullopt;
+  MLIRContext *ctx = host.getContext();
+  auto viewType = MemRefType::get({baseType.getShape()[0], baseType.getShape()[1] / 8},
+                                  VectorType::get({4}, IntegerType::get(ctx, 32)));
+  // The view where its buffer is defined, out of any loop around the product
+  // (`cleave-fold-loops-into-grids` folds a loop only when its launches take
+  // nothing the body computes but indices).
+  OpBuilder atBase(ctx);
+  if (Operation *def = base.getDefiningOp())
+    atBase.setInsertionPointAfter(def);
+  else
+    atBase.setInsertionPointToStart(cast<BlockArgument>(base).getOwner());
+  Value view = UnrealizedConversionCastOp::create(atBase, loc, TypeRange{viewType}, ValueRange{base}).getResult(0);
+  auto asValue = [&](OpFoldResult v) -> Value {
+    if (Value value = dyn_cast<Value>(v))
+      return value;
+    return arith::ConstantIndexOp::create(host, loc, *getConstantIntValue(v));
+  };
+  return VectorSource{view, asValue(offsets[0]), asValue(offsets[1])};
+}
+
+// The `rows` x `columns` elements of `source` from (`row0`, `column0`) (the
+// operand's own coordinates, `column0` and `columns` multiples of 8) into
+// `tile` (`rows` x `columns / 8 + pad` vectors in the workgroup's memory),
+// the workgroup's `threads` threads a vector at a time, neighbours on
+// neighbouring addresses.
+static void loadTile(OpBuilder &b, Location loc, const VectorSource &source, Value row0, Value column0, int64_t rows,
+                     int64_t columns, Value tile, Value tid, int64_t threads) {
+  auto constant = [&](int64_t v) -> Value { return arith::ConstantIndexOp::create(b, loc, v); };
+  const int64_t perRow = columns / 8, total = rows * perRow;
+  Value firstRow = arith::AddIOp::create(b, loc, source.row, row0);
+  Value firstVector = arith::DivUIOp::create(b, loc, arith::AddIOp::create(b, loc, source.column, column0), constant(8));
+  for (int64_t v = 0; v < (total + threads - 1) / threads; ++v) {
+    Value index = arith::AddIOp::create(b, loc, tid, constant(v * threads));
+    auto body = [&](OpBuilder &ib) {
+      Value width = arith::ConstantIndexOp::create(ib, loc, perRow);
+      Value r = arith::DivUIOp::create(ib, loc, index, width);
+      Value c = arith::RemUIOp::create(ib, loc, index, width);
+      Value loaded = memref::LoadOp::create(
+          ib, loc, source.view,
+          ValueRange{arith::AddIOp::create(ib, loc, firstRow, r), arith::AddIOp::create(ib, loc, firstVector, c)});
+      memref::StoreOp::create(ib, loc, loaded, tile, ValueRange{r, c});
+    };
+    if ((v + 1) * threads <= total) {
+      body(b);
+    } else {
+      Value inside = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::ult, index, constant(total));
+      auto guard = scf::IfOp::create(b, loc, TypeRange{}, inside, /*withElseRegion=*/false);
+      OpBuilder gb = OpBuilder::atBlockBegin(guard.thenBlock());
+      body(gb);
+    }
+  }
+}
+
+// `loadTile` in two halves, for a tile loaded ahead (into registers, carried
+// by a loop) and stored when its turn comes: this thread's vectors of the
+// tile (every thread as many: `rows * columns / 8` a multiple of
+// `threads`), then those vectors in `tile`.
+static SmallVector<Value> tileVectors(OpBuilder &b, Location loc, const VectorSource &source, Value row0,
+                                      Value column0, int64_t rows, int64_t columns, Value tid, int64_t threads) {
+  auto constant = [&](int64_t v) -> Value { return arith::ConstantIndexOp::create(b, loc, v); };
+  const int64_t perRow = columns / 8;
+  Value firstRow = arith::AddIOp::create(b, loc, source.row, row0);
+  Value firstVector = arith::DivUIOp::create(b, loc, arith::AddIOp::create(b, loc, source.column, column0), constant(8));
+  SmallVector<Value> vectors;
+  for (int64_t v = 0; v < rows * perRow / threads; ++v) {
+    Value index = arith::AddIOp::create(b, loc, tid, constant(v * threads));
+    Value r = arith::DivUIOp::create(b, loc, index, constant(perRow));
+    Value c = arith::RemUIOp::create(b, loc, index, constant(perRow));
+    vectors.push_back(memref::LoadOp::create(
+        b, loc, source.view, ValueRange{arith::AddIOp::create(b, loc, firstRow, r), arith::AddIOp::create(b, loc, firstVector, c)}));
+  }
+  return vectors;
+}
+
+static void storeTileVectors(OpBuilder &b, Location loc, ValueRange vectors, Value tile, int64_t columns, Value tid,
+                             int64_t threads) {
+  auto constant = [&](int64_t v) -> Value { return arith::ConstantIndexOp::create(b, loc, v); };
+  const int64_t perRow = columns / 8;
+  for (auto [v, vector] : llvm::enumerate(vectors)) {
+    Value index = arith::AddIOp::create(b, loc, tid, constant(int64_t(v) * threads));
+    memref::StoreOp::create(b, loc, vector, tile,
+                            ValueRange{arith::DivUIOp::create(b, loc, index, constant(perRow)),
+                                       arith::RemUIOp::create(b, loc, index, constant(perRow))});
+  }
+}
+
+// A fragment of 16-bit elements loaded from a tile of `vector<4xi32>`s
+// (`loadTile`) at (`row`, `vector`), the rows `stride` vectors apart: the
+// carrier (`kFragmentStride`) reaches its first element through the vector's
+// first word, read as two of them; `cleave-lower-fragment-carriers` follows
+// it back to the vector's load, whose pointer the cooperative matrix load
+// takes (a pointer to vectors of another type, as GLSL's `uvec4` tiles).
+static Value loadFragmentFromVectors(OpBuilder &b, Location loc, Value tile, Value row, Value vector,
+                                     spirv::CooperativeMatrixType type, int64_t stride, bool columns) {
+  Value loaded = memref::LoadOp::create(b, loc, tile, ValueRange{row, vector});
+  Value word = spirv::CompositeExtractOp::create(b, loc, loaded, ArrayRef<int32_t>{0});
+  Value pair = spirv::BitcastOp::create(b, loc, VectorType::get({2}, type.getElementType()), word);
+  Value first = spirv::CompositeExtractOp::create(b, loc, pair, ArrayRef<int32_t>{0});
+  auto carrier = spirv::CompositeConstructOp::create(b, loc, type, ValueRange{first});
+  markFragment(carrier, stride, columns);
+  return carrier;
+}
+
+// Vulkan backend: a product of bf16 operands into f32 (`mlir_lower.rs`'s
+// widened products, `stdlib/linalg`'s `MatMulWide`; `fragmentProductOf`) that
+// the runtime's GEMM didn't take (`cleave-lower-gpu-gemms`: a block of a
+// larger matrix, a head of attention, a shape it doesn't divide), computed on
+// cooperative matrices (the tensor cores) in a kernel of its own: a workgroup
+// of 4 subgroups per `tile` x `tile` block of the result, each subgroup a
+// quarter of it in 16 x 16 fragments accumulated in f32, the operands'
+// fragments loaded from device memory where they are, at their row stride,
+// those transposed column major (`kFragmentStride`). The work no one needs
+// skipped as `cleaveTileMatmulsForGpu` skips it: tiles nothing reads, slices
+// of the reduction where `a` is zero. The sum is in another order than the
+// scalar kernel's. Subgroups of 32 invocations assumed (NVIDIA's;
+// `doc/plan-quantization.md`). Whether it rewrote the product.
+static bool tileProductOnFragments(const FragmentProduct &p, ModuleOp module) {
+  linalg::LinalgOp product = p.op;
+  OpOperand *a = p.a, *b = p.b, *cOperand = p.c;
+  Value c = cOperand->get();
+  const unsigned dimM = p.dimM, dimN = p.dimN, dimK = p.dimK;
+  const int64_t m = p.m, n = p.n, k = p.k;
+  AffineMap aMap = product.getMatchingIndexingMap(a), cMap = product.getMatchingIndexingMap(cOperand);
   // 64 x 64 blocks, 32 x 32 where those don't divide the result. Smaller
   // blocks for more workgroups were slower: a fragment loaded per
   // multiply-add instead of one per two (attention's heads, folded into the
   // grid, make the workgroups anyway: `P V`, 1024 x 64 x 1024 by 6 heads,
   // 42 us in 32 x 32 blocks, 36 in 64 x 64; `Q K^T` 81 and 29).
-  constexpr int64_t kFragment = 16, kSubgroup = 32;
-  if (k % kFragment != 0)
-    return false;
   int64_t tile = m % 64 == 0 && n % 64 == 0 ? 64 : m % 32 == 0 && n % 32 == 0 ? 32 : 0;
   // `CLEAVE_GPU_COOPMAT_TILE` (at compile time): the block size of every
   // product it divides, what a measurement tries.
@@ -3425,6 +3704,13 @@ static bool tileProductOnFragments(linalg::LinalgOp product, OpOperand *a, OpOpe
   auto add = [&](OpBuilder &at, Value x, Value y) -> Value { return arith::AddIOp::create(at, loc, x, y); };
   auto mul = [&](OpBuilder &at, Value x, int64_t y) -> Value { return arith::MulIOp::create(at, loc, x, constant(at, y)); };
   Value one = constant(builder, 1);
+  // Both operands' tiles staged in the workgroup's memory (`VectorSource`),
+  // slices of `kSlice` of the reduction, when both are views it can read 16
+  // bytes at a time; else each fragment loaded from device memory.
+  const int64_t kSlice = k % 32 == 0 ? 32 : kFragment;
+  std::optional<VectorSource> aSource = vectorSourceOf(builder, loc, a->get());
+  std::optional<VectorSource> bSource = vectorSourceOf(builder, loc, b->get());
+  const bool aStaged = aSource.has_value(), bStaged = bSource.has_value(), staged = aStaged || bStaged;
   auto launch = gpu::LaunchOp::create(builder, loc, constant(builder, tilesN), constant(builder, tilesM), one,
                                       constant(builder, 4 * kSubgroup), one, one,
                                       /*dynamicSharedMemorySize=*/nullptr, /*asyncTokenType=*/nullptr);
@@ -3440,36 +3726,10 @@ static bool tileProductOnFragments(linalg::LinalgOp product, OpOperand *a, OpOpe
   Value columnHalf = arith::RemUIOp::create(kb, loc, subgroup, constant(kb, 2));
   Value m0 = add(kb, mul(kb, launch.getBlockIds().y, tile), mul(kb, rowHalf, tile / 2));
   Value n0 = add(kb, mul(kb, launch.getBlockIds().x, tile), mul(kb, columnHalf, tile / 2));
-  auto indicesOf = [&](OpOperand *operand, ArrayRef<std::pair<unsigned, Value>> at) {
-    AffineMap map = product.getMatchingIndexingMap(operand);
-    SmallVector<Value> indices;
-    for (unsigned r = 0; r < map.getNumResults(); ++r)
-      for (auto [dim, value] : at)
-        if (map.getDimPosition(r) == dim)
-          indices.push_back(value);
-    return indices;
-  };
-  auto fragmentType = [&](Type element, spirv::CooperativeMatrixUseKHR use) {
-    return spirv::CooperativeMatrixType::get(element, kFragment, kFragment, spirv::Scope::Subgroup, use);
-  };
   Type bf16 = BFloat16Type::get(ctx), f32 = Float32Type::get(ctx);
   auto aFragment = fragmentType(bf16, spirv::CooperativeMatrixUseKHR::MatrixA);
   auto bFragment = fragmentType(bf16, spirv::CooperativeMatrixUseKHR::MatrixB);
   auto accumulator = fragmentType(f32, spirv::CooperativeMatrixUseKHR::MatrixAcc);
-  auto mark = [&](Operation *carrier, int64_t stride, bool columns) {
-    carrier->setAttr(kFragmentStride, IntegerAttr::get(IntegerType::get(ctx, 64), stride));
-    if (columns)
-      carrier->setAttr(kFragmentColumnMajor, UnitAttr::get(ctx));
-  };
-  // A fragment loaded (`kFragmentStride`): its first element's load, the
-  // matrix made of it.
-  auto loadFragment = [&](OpBuilder &at, OpOperand *operand, SmallVector<Value> indices, Type type, int64_t stride,
-                          bool columns) -> Value {
-    Value first = memref::LoadOp::create(at, loc, operand->get(), indices);
-    auto carrier = spirv::CompositeConstructOp::create(at, loc, type, ValueRange{first});
-    mark(carrier, stride, columns);
-    return carrier;
-  };
   SmallVector<Value> initial;
   for (int64_t i = 0; i < frags; ++i)
     for (int64_t j = 0; j < frags; ++j) {
@@ -3477,9 +3737,9 @@ static bool tileProductOnFragments(linalg::LinalgOp product, OpOperand *a, OpOpe
         initial.push_back(spirv::CompositeConstructOp::create(kb, loc, accumulator, ValueRange{filled}));
         continue;
       }
-      SmallVector<Value> at =
-          indicesOf(cOperand, {{dimM, add(kb, m0, constant(kb, i * kFragment))}, {dimN, add(kb, n0, constant(kb, j * kFragment))}});
-      initial.push_back(loadFragment(kb, cOperand, at, accumulator, *cStride, cColumns));
+      SmallVector<Value> at = p.indicesOf(
+          cOperand, {{dimM, add(kb, m0, constant(kb, i * kFragment))}, {dimN, add(kb, n0, constant(kb, j * kFragment))}});
+      initial.push_back(loadFragment(kb, loc, c, at, accumulator, p.cStride, p.cColumns));
     }
   // Within this row of tiles' live slices (`liveK`, by `y`).
   Value kFirst = constant(kb, 0), kEnd = constant(kb, k);
@@ -3495,32 +3755,90 @@ static bool tileProductOnFragments(linalg::LinalgOp product, OpOperand *a, OpOpe
     kFirst = byRow([](auto range) { return range.first; });
     kEnd = byRow([](auto range) { return range.second; });
   }
+  // Staged: each operand's tile as it lies in memory (a transposed one's
+  // rows its `k`s), rows padded by a vector against bank conflicts.
+  Attribute workgroup = spirv::StorageClassAttr::get(ctx, spirv::StorageClass::Workgroup);
+  auto tileShape = [&](bool kRows) {
+    return kRows ? std::make_pair(kSlice, tile) : std::make_pair(tile, kSlice);
+  };
+  auto [aRows, aColumnsInTile] = tileShape(p.aColumns);
+  auto [bRows, bColumnsInTile] = tileShape(!p.bColumns);
+  auto vectors = VectorType::get({4}, kb.getI32Type());
+  Value aTile, bTile, tileM0, tileN0, mLocal, nLocal;
+  if (staged) {
+    if (aStaged)
+      aTile = memref::AllocOp::create(
+          kb, loc, MemRefType::get({aRows, aColumnsInTile / 8 + 1}, vectors, MemRefLayoutAttrInterface{}, workgroup));
+    if (bStaged)
+      bTile = memref::AllocOp::create(
+          kb, loc, MemRefType::get({bRows, bColumnsInTile / 8 + 1}, vectors, MemRefLayoutAttrInterface{}, workgroup));
+    tileM0 = mul(kb, launch.getBlockIds().y, tile);
+    tileN0 = mul(kb, launch.getBlockIds().x, tile);
+    mLocal = mul(kb, rowHalf, tile / 2);
+    nLocal = mul(kb, columnHalf, tile / 2);
+    // Whole slices: the live range rounded out to them.
+    kFirst = arith::MulIOp::create(kb, loc, arith::DivUIOp::create(kb, loc, kFirst, constant(kb, kSlice)),
+                                   constant(kb, kSlice));
+    kEnd = arith::MinUIOp::create(
+        kb, loc, constant(kb, k),
+        arith::MulIOp::create(kb, loc,
+                              arith::DivUIOp::create(kb, loc, add(kb, kEnd, constant(kb, kSlice - 1)),
+                                                     constant(kb, kSlice)),
+                              constant(kb, kSlice)));
+  }
+  // A fragment from a staged tile: its rows and columns in the operand's
+  // order, `transposed` its memory's columns.
+  auto fromTile = [&](OpBuilder &b, Value tileMemory, Value fragmentRow, Value fragmentColumn, int64_t columnsInTile,
+                      spirv::CooperativeMatrixType type, bool transposed) {
+    Value row = transposed ? fragmentColumn : fragmentRow, column = transposed ? fragmentRow : fragmentColumn;
+    return loadFragmentFromVectors(b, loc, tileMemory, row, arith::DivUIOp::create(b, loc, column, constant(b, 8)), type,
+                                   columnsInTile / 8 + 1, transposed);
+  };
   auto loop = scf::ForOp::create(
-      kb, loc, kFirst, kEnd, constant(kb, kFragment), initial,
+      kb, loc, kFirst, kEnd, constant(kb, staged ? kSlice : kFragment), initial,
       [&](OpBuilder &lb, Location, Value k0, ValueRange acc) {
-        SmallVector<Value> as, bs;
-        for (int64_t i = 0; i < frags; ++i)
-          as.push_back(loadFragment(lb, a, indicesOf(a, {{dimM, add(lb, m0, constant(lb, i * kFragment))}, {dimK, k0}}),
-                                    aFragment, *aStride, aColumns));
-        for (int64_t j = 0; j < frags; ++j)
-          bs.push_back(loadFragment(lb, b, indicesOf(b, {{dimK, k0}, {dimN, add(lb, n0, constant(lb, j * kFragment))}}),
-                                    bFragment, *bStride, bColumns));
-        SmallVector<Value> next;
-        for (int64_t i = 0; i < frags; ++i)
+        if (staged) {
+          SmallVector<Value> aAt = p.indicesOf(a, {{dimM, tileM0}, {dimK, k0}});
+          SmallVector<Value> bAt = p.indicesOf(b, {{dimK, k0}, {dimN, tileN0}});
+          if (aStaged)
+            loadTile(lb, loc, *aSource, aAt[0], aAt[1], aRows, aColumnsInTile, aTile, launch.getThreadIds().x,
+                     4 * kSubgroup);
+          if (bStaged)
+            loadTile(lb, loc, *bSource, bAt[0], bAt[1], bRows, bColumnsInTile, bTile, launch.getThreadIds().x,
+                     4 * kSubgroup);
+          workgroupBarrier(lb, loc);
+        }
+        SmallVector<Value> next(acc.begin(), acc.end());
+        for (int64_t kk = 0; kk < (staged ? kSlice : kFragment); kk += kFragment) {
+          SmallVector<Value> as, bs;
+          Value kAt = add(lb, k0, constant(lb, kk));
+          for (int64_t i = 0; i < frags; ++i)
+            as.push_back(aStaged ? fromTile(lb, aTile, add(lb, mLocal, constant(lb, i * kFragment)), constant(lb, kk),
+                                            aColumnsInTile, aFragment, p.aColumns)
+                                 : loadFragment(lb, loc, a->get(),
+                                                p.indicesOf(a, {{dimM, add(lb, m0, constant(lb, i * kFragment))}, {dimK, kAt}}),
+                                                aFragment, p.aStride, p.aColumns));
           for (int64_t j = 0; j < frags; ++j)
-            next.push_back(spirv::KHRCooperativeMatrixMulAddOp::create(lb, loc, accumulator, as[i], bs[j],
-                                                                       acc[i * frags + j],
-                                                                       spirv::CooperativeMatrixOperandsKHRAttr()));
+            bs.push_back(bStaged ? fromTile(lb, bTile, constant(lb, kk), add(lb, nLocal, constant(lb, j * kFragment)),
+                                            bColumnsInTile, bFragment, p.bColumns)
+                                 : loadFragment(lb, loc, b->get(),
+                                                p.indicesOf(b, {{dimK, kAt}, {dimN, add(lb, n0, constant(lb, j * kFragment))}}),
+                                                bFragment, p.bStride, p.bColumns));
+          for (int64_t i = 0; i < frags; ++i)
+            for (int64_t j = 0; j < frags; ++j)
+              next[i * frags + j] = spirv::KHRCooperativeMatrixMulAddOp::create(
+                  lb, loc, accumulator, as[i], bs[j], next[i * frags + j], spirv::CooperativeMatrixOperandsKHRAttr());
+        }
+        if (staged)
+          workgroupBarrier(lb, loc);
         scf::YieldOp::create(lb, loc, next);
       });
   for (int64_t i = 0; i < frags; ++i)
-    for (int64_t j = 0; j < frags; ++j) {
-      auto carrier = spirv::CompositeExtractOp::create(kb, loc, loop.getResult(i * frags + j), ArrayRef<int32_t>{0});
-      mark(carrier, *cStride, cColumns);
-      memref::StoreOp::create(
-          kb, loc, carrier, c,
-          indicesOf(cOperand, {{dimM, add(kb, m0, constant(kb, i * kFragment))}, {dimN, add(kb, n0, constant(kb, j * kFragment))}}));
-    }
+    for (int64_t j = 0; j < frags; ++j)
+      storeFragment(kb, loc, loop.getResult(i * frags + j), c,
+                    p.indicesOf(cOperand, {{dimM, add(kb, m0, constant(kb, i * kFragment))},
+                                           {dimN, add(kb, n0, constant(kb, j * kFragment))}}),
+                    p.cStride, p.cColumns);
   if (!liveTiles.empty())
     guardLiveTiles(kb, loc, launch, tilesN, liveTiles);
   product->erase();
@@ -3528,6 +3846,1916 @@ static bool tileProductOnFragments(linalg::LinalgOp product, OpOperand *a, OpOpe
     fill->erase();
   return true;
 }
+
+// A barrier of the workgroup ordering its memory only: the fused kernels'
+// threads share nothing else (each writes its own elements of device
+// memory). Ordering device memory too made each a memory barrier (`MEMBAR`,
+// 5.5% of the fused attention's samples in Nsight Graphics).
+static void workgroupBarrier(OpBuilder &b, Location loc) {
+  MLIRContext *ctx = b.getContext();
+  spirv::ControlBarrierOp::create(
+      b, loc, spirv::ScopeAttr::get(ctx, spirv::Scope::Workgroup), spirv::ScopeAttr::get(ctx, spirv::Scope::Workgroup),
+      spirv::MemorySemanticsAttr::get(ctx, spirv::MemorySemantics::AcquireRelease |
+                                               spirv::MemorySemantics::WorkgroupMemory));
+}
+
+// `v` without the index casts around it.
+static Value uncastIndex(Value v) {
+  while (true) {
+    if (auto cast = v.getDefiningOp<arith::IndexCastOp>())
+      v = cast.getIn();
+    else if (auto cast = v.getDefiningOp<arith::IndexCastUIOp>())
+      v = cast.getIn();
+    else
+      return v;
+  }
+}
+
+// Erases `buffer` (a `memref.alloc` no longer accessed) with what only takes
+// its address or shape (`cleave_vk_discard`'s arguments) and its
+// deallocations (alone, or alone in an `scf.if`). False, nothing erased, when
+// something else uses it.
+static bool eraseBuffer(Value buffer) {
+  llvm::SetVector<Operation *> doomed;
+  SmallVector<Value> work{buffer};
+  while (!work.empty()) {
+    Value v = work.pop_back_val();
+    for (Operation *user : v.getUsers()) {
+      if (doomed.contains(user))
+        continue;
+      if (isa<memref::DeallocOp>(user)) {
+        auto guard = dyn_cast<scf::IfOp>(user->getParentOp());
+        doomed.insert(guard && guard.getNumResults() == 0 && guard.thenBlock()->getOperations().size() == 2 &&
+                              guard.getElseRegion().empty()
+                          ? guard.getOperation()
+                          : user);
+      } else if (isa<memref::ExtractStridedMetadataOp, memref::ExtractAlignedPointerAsIndexOp>(user) ||
+                 (v != buffer && isMemoryEffectFree(user) && user->getNumRegions() == 0)) {
+        doomed.insert(user);
+        for (Value r : user->getResults())
+          work.push_back(r);
+      } else if (auto call = dyn_cast<func::CallOp>(user); call && call.getCallee() == "cleave_vk_discard") {
+        doomed.insert(user);
+      } else {
+        return false;
+      }
+    }
+  }
+  // Users first.
+  while (!doomed.empty()) {
+    SmallVector<Operation *> unused;
+    for (Operation *op : doomed)
+      if (op->use_empty())
+        unused.push_back(op);
+    if (unused.empty())
+      return false;
+    for (Operation *op : unused) {
+      doomed.remove(op);
+      op->erase();
+    }
+  }
+  buffer.getDefiningOp()->erase();
+  return true;
+}
+
+// One row pipeline fused (`cleaveFuseRowPipelines`), if `rows` heads one.
+static bool fuseRowPipeline(scf::ParallelOp rows, ModuleOp module) {
+  // Rows per workgroup, threads per row: 16 and 8 for whole rows, 32 and 4
+  // in blocks (`bytesFor` below), what measured fastest of 16, 32 and 64.
+  constexpr int64_t kThreads = 4 * kSubgroup;
+  int64_t kRows = 16, kGroup = kThreads / kRows;
+  constexpr int64_t kWorkgroupBytes = 48 * 1024; // NVIDIA's Vulkan limit
+  auto refuse = [&](scf::ParallelOp loop, const Twine &why) {
+    if (debuggingParallelization())
+      llvm::errs() << "cleave-fuse-row-pipelines: " << loop->getParentOfType<func::FuncOp>().getName() << ": "
+                   << why << '\n';
+    return false;
+  };
+  std::optional<int64_t> lower = getConstantIntValue(rows.getLowerBound()[0]),
+                         upper = getConstantIntValue(rows.getUpperBound()[0]),
+                         step = getConstantIntValue(rows.getStep()[0]);
+  if (lower != 0 || step != 1 || !upper || *upper % kRows != 0)
+    return false;
+  const int64_t M = *upper;
+  Value iv = rows.getInductionVars()[0];
+  Block *block = rows->getBlock();
+  // The loop's accesses: row `i` of fresh buffers, or loads of others.
+  llvm::SetVector<Value> read, written;
+  bool ok = true;
+  rows.getBody()->walk([&](Operation *inner) {
+    Value memref;
+    ValueRange indices;
+    bool store = false;
+    if (auto load = dyn_cast<memref::LoadOp>(inner))
+      memref = load.getMemRef(), indices = load.getIndices();
+    else if (auto st = dyn_cast<memref::StoreOp>(inner))
+      memref = st.getMemRef(), indices = st.getIndices(), store = true;
+    else
+      return;
+    bool atRow = indices.size() == 2 && uncastIndex(indices[0]) == iv &&
+                 memref.getDefiningOp<memref::AllocOp>() && memref.getDefiningOp()->getBlock() == block;
+    if (store && !atRow)
+      ok = false;
+    else if (store)
+      written.insert(memref);
+    else if (atRow)
+      read.insert(memref);
+  });
+  if (!ok || written.empty())
+    return refuse(rows, "a row loop stores elsewhere than at its row of a fresh buffer");
+  // Its body: scalars, reductions, maps.
+  SmallVector<Operation *> body;
+  for (Operation &inner : rows.getBody()->without_terminator()) {
+    if (auto forOp = dyn_cast<scf::ForOp>(inner)) {
+      if (forOp.getNumRegionIterArgs() == 0 ? !elementsAreIndependent(forOp) : !carriedReductions(forOp))
+        return refuse(rows, "an inner loop neither a reduction nor a map");
+    } else if (!isa<memref::LoadOp, memref::StoreOp>(inner) && (inner.getNumRegions() != 0 || !isPure(&inner))) {
+      return refuse(rows, Twine("its body has ") + inner.getName().getStringRef());
+    }
+    body.push_back(&inner);
+  }
+  // The producers: a fragment product writing each buffer read, filled
+  // before it, in this block before the loop.
+  struct Producer {
+    Value buffer;
+    FragmentProduct p;
+    mutable linalg::FillOp fill;
+  };
+  SmallVector<Producer> producers;
+  for (Value buffer : read) {
+    std::optional<FragmentProduct> product;
+    for (Operation *user : buffer.getUsers())
+      if (auto linalgOp = dyn_cast<linalg::LinalgOp>(user); linalgOp && linalgOp.getNumDpsInits() == 1 &&
+                                                            linalgOp.getDpsInitOperand(0)->get() == buffer)
+        if (std::optional<FragmentProduct> candidate = fragmentProductOf(linalgOp))
+          product = candidate;
+    if (!product || product->op->getBlock() != block || !product->op->isBeforeInBlock(rows) || product->cColumns ||
+        product->m != M)
+      return refuse(rows, "a buffer it reads isn't a fragment product's");
+    linalg::FillOp fill = fillBefore(product->op, buffer);
+    if (!fill)
+      return refuse(rows, "a product it reads isn't filled first");
+    producers.push_back({buffer, *product, fill});
+  }
+  // The consumers: fragment products of each buffer written, after it.
+  struct Consumer {
+    Value buffer;
+    FragmentProduct p;
+    mutable linalg::FillOp fill;
+  };
+  SmallVector<Consumer> consumers;
+  for (Value buffer : written) {
+    for (Operation *user : buffer.getUsers()) {
+      if (rows->isAncestor(user) ||
+          isa<memref::DeallocOp, memref::ExtractStridedMetadataOp, memref::ExtractAlignedPointerAsIndexOp>(user))
+        continue;
+      auto linalgOp = dyn_cast<linalg::LinalgOp>(user);
+      std::optional<FragmentProduct> product = linalgOp ? fragmentProductOf(linalgOp) : std::nullopt;
+      if (!product || product->a->get() != buffer || product->aColumns || product->cColumns ||
+          product->m != M || user->getBlock() != block || !rows->isBeforeInBlock(user))
+        return refuse(rows, "a buffer it writes is used otherwise than by a fragment product's rows");
+      linalg::FillOp fill = fillBefore(user, product->c->get());
+      if (!fill)
+        return refuse(rows, "a product of what it writes isn't filled first");
+      consumers.push_back({buffer, *product, fill});
+    }
+  }
+  if (consumers.empty())
+    return refuse(rows, "nothing consumes what it writes");
+  // Every buffer the pipeline contracts.
+  SmallVector<Value> buffers(read.begin(), read.end());
+  buffers.append(written.begin(), written.end());
+  // Between the first producer and the last consumer, nothing else
+  // touching memory: allocations, the buffers' addresses for the runtime,
+  // the consumers' fills, deallocations.
+  Operation *first = rows, *last = rows;
+  for (Producer &p : producers)
+    if (p.fill->isBeforeInBlock(first))
+      first = p.fill;
+  for (Consumer &c : consumers)
+    if (last->isBeforeInBlock(c.p.op))
+      last = c.p.op;
+  llvm::DenseSet<Operation *> pattern{rows};
+  for (Producer &p : producers)
+    pattern.insert(p.p.op), pattern.insert(p.fill);
+  for (Consumer &c : consumers)
+    pattern.insert(c.p.op), pattern.insert(c.fill);
+  for (Operation *at = first; at != last; at = at->getNextNode()) {
+    if (pattern.contains(at) || isMemoryEffectFree(at) ||
+        isa<memref::AllocOp, memref::ExtractStridedMetadataOp, memref::ExtractAlignedPointerAsIndexOp>(at))
+      continue;
+    if (auto call = dyn_cast<func::CallOp>(at); call && call.getCallee() == "cleave_vk_discard")
+      continue;
+    auto guard = dyn_cast<scf::IfOp>(at);
+    if (guard && guard.getNumResults() == 0 && guard.thenBlock()->getOperations().size() == 2 &&
+        isa<memref::DeallocOp>(guard.thenBlock()->front()))
+      continue;
+    if (isa<memref::DeallocOp>(at))
+      continue;
+    return refuse(rows, Twine("between its products, ") + at->getName().getStringRef());
+  }
+  // Every buffer `M` rows by the same `N` columns (the loops' `j`).
+  const int64_t N = cast<MemRefType>(buffers.front().getType()).getShape()[1];
+  for (Value buffer : buffers)
+    if (cast<MemRefType>(buffer.getType()).getShape() != ArrayRef<int64_t>{M, N})
+      return refuse(rows, "its buffers' shapes differ");
+  // The workgroup's memory: `kRows` rows of every buffer, `width` columns of
+  // them at a time, and the trees' slots. All of each row when they fit
+  // (`resident`: each producer computed once); else blocks of `kColumns`
+  // columns, each producer's recomputed for every loop reading it
+  // (`doc/plan-fusion.md`, phase 2).
+  constexpr int64_t kColumns = 64;
+  auto bytesFor = [&](int64_t width) {
+    int64_t bytes = 0;
+    for (Value buffer : buffers)
+      bytes += kRows * width * int64_t((cast<MemRefType>(buffer.getType()).getElementTypeBitWidth() + 7) / 8);
+    for (Operation *op : body)
+      if (auto forOp = dyn_cast<scf::ForOp>(op))
+        bytes += kRows * kGroup * 4 * (forOp.getNumRegionIterArgs() + 1);
+    return bytes + 2 * kRows * 4;
+  };
+  // In blocks, the producers recomputed for each pass: attention at L = 1024,
+  // its `K` and `V` tiles staged (`VectorSource`), 15.1 ms against 15.6 for
+  // the kernels it replaces (12 heads, 80 launches), a third of the
+  // dispatches.
+  int64_t width = N;
+  if (bytesFor(N) > kWorkgroupBytes) {
+    if (M % 32 == 0)
+      kRows = 32, kGroup = kThreads / kRows;
+    width = kColumns;
+    if (N % width != 0 || bytesFor(width) > kWorkgroupBytes)
+      return refuse(rows, Twine("even blocks of its rows need ") + Twine(bytesFor(width)) +
+                              " bytes of workgroup memory");
+  }
+  if (width % (4 * kFragment) != 0)
+    return refuse(rows, "its columns aren't a multiple of 64");
+  const bool resident = width == N;
+  auto accessesOf = [&](Operation *scope, Value buffer) {
+    SmallVector<Operation *> accesses;
+    scope->walk([&](Operation *inner) {
+      if ((isa<memref::LoadOp>(inner) && inner->getOperand(0) == buffer) ||
+          (isa<memref::StoreOp>(inner) && inner->getOperand(1) == buffer))
+        accesses.push_back(inner);
+    });
+    return accesses;
+  };
+  auto columnOf = [](Operation *access) {
+    return isa<memref::LoadOp>(access) ? access->getOperand(2) : access->getOperand(3);
+  };
+  // Every inner loop steps by 1 and reaches the buffers at its own column
+  // (its iterations then cut into the blocks); an access outside the inner
+  // loops is a load of a producer's at a constant column.
+  for (Operation *op : body) {
+    auto forOp = dyn_cast<scf::ForOp>(op);
+    if (forOp && getConstantIntValue(forOp.getStep()) != std::optional<int64_t>(1))
+      return refuse(rows, "an inner loop doesn't step by 1");
+    for (Value buffer : buffers)
+      for (Operation *access : accessesOf(op, buffer)) {
+        bool atColumn = forOp ? uncastIndex(columnOf(access)) == forOp.getInductionVar()
+                              : isa<memref::LoadOp>(access) && read.contains(buffer) &&
+                                    getConstantIntValue(uncastIndex(columnOf(access)));
+        if (!atColumn)
+          return refuse(rows, "an access of a buffer at another column than its loop's");
+      }
+  }
+  // Each consumer's live slices of the reduction, by block of rows
+  // (`zeroOn`: the weights above the diagonal).
+  auto func = rows->getParentOfType<func::FuncOp>();
+  SmallVector<SmallVector<std::pair<int64_t, int64_t>>> liveK;
+  for (Consumer &c : consumers) {
+    SmallVector<std::pair<int64_t, int64_t>> ranges;
+    for (int64_t blockRow = 0; blockRow < M / kRows; ++blockRow) {
+      int64_t firstSlice = -1, lastSlice = -1;
+      for (int64_t slice = 0; slice < c.p.k / kFragment; ++slice) {
+        SmallVector<std::pair<int64_t, int64_t>> box{{blockRow * kRows, blockRow * kRows + kRows - 1},
+                                                     {slice * kFragment, slice * kFragment + kFragment - 1}};
+        if (!zeroOn(c.buffer, box, c.p.op, func, /*depth=*/2)) {
+          if (firstSlice < 0)
+            firstSlice = slice;
+          lastSlice = slice;
+        }
+      }
+      ranges.push_back(firstSlice < 0 ? std::pair<int64_t, int64_t>{0, 0}
+                                      : std::pair<int64_t, int64_t>{firstSlice * kFragment, (lastSlice + 1) * kFragment});
+    }
+    liveK.push_back(ranges);
+  }
+  if (debuggingParallelization())
+    llvm::errs() << "cleave-fuse-row-pipelines: " << func.getName() << ": " << producers.size()
+                 << " producers, a row loop, " << consumers.size() << " consumers, " << M << " x " << N << ", "
+                 << (resident ? "whole rows" : "blocks of 64 columns") << ", " << bytesFor(width)
+                 << " bytes of workgroup memory\n";
+
+  // The kernel, where the first consumer was.
+  MLIRContext *ctx = module.getContext();
+  Operation *at = consumers.front().p.op;
+  for (Consumer &c : consumers)
+    if (c.p.op->isBeforeInBlock(at))
+      at = c.p.op;
+  OpBuilder builder(at);
+  Location loc = rows.getLoc();
+  auto constant = [&](OpBuilder &b, int64_t v) -> Value { return arith::ConstantIndexOp::create(b, loc, v); };
+  Value one = constant(builder, 1);
+  // Each producer's and consumer's `b` staged in the workgroup's memory by
+  // tiles, 16 bytes at a time (`VectorSource`), where it's such a view and
+  // its tile splits evenly among the threads; else its fragments loaded from
+  // device memory.
+  SmallVector<std::optional<VectorSource>> producerSources, consumerSources;
+  for (const Producer &p : producers) {
+    std::optional<VectorSource> source = vectorSourceOf(builder, loc, p.p.b->get());
+    producerSources.push_back(width * p.p.k / 8 % kThreads == 0 ? source : std::nullopt);
+  }
+  for (const Consumer &c : consumers) {
+    std::optional<VectorSource> source = vectorSourceOf(builder, loc, c.p.b->get());
+    consumerSources.push_back(kColumns * c.p.n / 8 % kThreads == 0 ? source : std::nullopt);
+  }
+  // Within the workgroup's memory with the blocks (`bytesFor`): the tiles
+  // staged while they fit, consumers' first (a block of 64 columns each),
+  // then producers' (as wide as the blocks: whole rows, resident, can make
+  // one too large).
+  {
+    int64_t budget = kWorkgroupBytes - bytesFor(width);
+    auto tileBytes = [](int64_t kExtent, int64_t nExtent, bool transposed) {
+      auto [rows, columns] = transposed ? std::make_pair(nExtent, kExtent) : std::make_pair(kExtent, nExtent);
+      return rows * (columns / 8 + 1) * 16;
+    };
+    for (auto [index, c] : llvm::enumerate(consumers))
+      if (consumerSources[index]) {
+        int64_t bytes = tileBytes(kColumns, c.p.n, c.p.bColumns);
+        if (bytes > budget)
+          consumerSources[index].reset();
+        else
+          budget -= bytes;
+      }
+    for (auto [index, p] : llvm::enumerate(producers))
+      if (producerSources[index]) {
+        int64_t bytes = tileBytes(p.p.k, width, p.p.bColumns);
+        if (bytes > budget)
+          producerSources[index].reset();
+        else
+          budget -= bytes;
+      }
+  }
+  auto launch = gpu::LaunchOp::create(builder, loc, constant(builder, M / kRows), one, one,
+                                      constant(builder, kThreads), one, one,
+                                      /*dynamicSharedMemorySize=*/nullptr, /*asyncTokenType=*/nullptr);
+  Block &kernel = launch.getBody().front();
+  if (kernel.empty() || !kernel.back().hasTrait<OpTrait::IsTerminator>()) {
+    OpBuilder atEnd = OpBuilder::atBlockEnd(&kernel);
+    gpu::TerminatorOp::create(atEnd, loc);
+  }
+  OpBuilder kb(&kernel, std::prev(kernel.end()));
+  Attribute workgroup = spirv::StorageClassAttr::get(ctx, spirv::StorageClass::Workgroup);
+  Value tid = launch.getThreadIds().x;
+  // In order (the last blocks of rows first, the heaviest under a causal mask,
+  // was 7% slower: nearly every workgroup is resident at once anyway).
+  Value blockRow = launch.getBlockIds().x;
+  Value rowBase = arith::MulIOp::create(kb, loc, blockRow, constant(kb, kRows));
+  Value subgroup = arith::DivUIOp::create(kb, loc, tid, constant(kb, kSubgroup));
+  Value r = arith::DivUIOp::create(kb, loc, tid, constant(kb, kGroup));
+  Value t = arith::RemUIOp::create(kb, loc, tid, constant(kb, kGroup));
+  Value i = arith::AddIOp::create(kb, loc, rowBase, r);
+  // `width` columns of `kRows` rows of each buffer, in the workgroup's memory.
+  llvm::DenseMap<Value, Value> local;
+  for (Value buffer : buffers) {
+    auto type = cast<MemRefType>(buffer.getType());
+    local[buffer] = memref::AllocOp::create(
+        kb, loc, MemRefType::get({kRows, width}, type.getElementType(), MemRefLayoutAttrInterface{}, workgroup));
+  }
+  Type bf16 = BFloat16Type::get(ctx), f32 = Float32Type::get(ctx);
+  auto aFragment = fragmentType(bf16, spirv::CooperativeMatrixUseKHR::MatrixA);
+  auto bFragment = fragmentType(bf16, spirv::CooperativeMatrixUseKHR::MatrixB);
+  auto accumulator = fragmentType(f32, spirv::CooperativeMatrixUseKHR::MatrixAcc);
+  const int64_t kRowFragments = kRows / kFragment;
+  // Each producer's `a` for the block's rows, its fragments by row and slice
+  // of the reduction, loaded once into registers: what every block of
+  // columns multiplies.
+  SmallVector<SmallVector<Value>> aRegisters;
+  for (const Producer &p : producers) {
+    SmallVector<Value> fragments;
+    for (int64_t rf = 0; rf < kRowFragments; ++rf)
+      for (int64_t k0 = 0; k0 < p.p.k; k0 += kFragment)
+        fragments.push_back(loadFragment(
+            kb, loc, p.p.a->get(),
+            p.p.indicesOf(p.p.a, {{p.p.dimM, arith::AddIOp::create(kb, loc, rowBase, constant(kb, rf * kFragment))},
+                                  {p.p.dimK, constant(kb, k0)}}),
+            aFragment, p.p.aStride, p.p.aColumns));
+    aRegisters.push_back(fragments);
+  }
+  // The block's rows of `which` producers' columns from `j0` (index), into
+  // the workgroup's memory: each subgroup the columns of fragments `subgroup
+  // + 4 s` (`width` a multiple of 64: as many each), each of its
+  // `kRowFragments` fragments over the whole reduction. In two halves, so
+  // that a block's `b` fragments can be loaded ahead (`producerLoads`), while
+  // the block before is worked on, and multiplied later (`producersFrom`):
+  // the profile's first stall was these loads' latency (47% of the samples).
+  const int64_t columnsEach = width / (4 * kFragment);
+  auto vectors = VectorType::get({4}, kb.getI32Type());
+  // A staged `b`'s tile: its rows and columns as it lies in memory (a
+  // transposed one's rows its `n`s).
+  auto bTileShape = [&](const FragmentProduct &fp, int64_t kExtent, int64_t nExtent) {
+    return fp.bColumns ? std::make_pair(nExtent, kExtent) : std::make_pair(kExtent, nExtent);
+  };
+  SmallVector<Value> producerTiles;
+  for (auto [index, p] : llvm::enumerate(producers)) {
+    Value tile;
+    if (producerSources[index]) {
+      auto [tileRows, tileColumns] = bTileShape(p.p, p.p.k, width);
+      tile = memref::AllocOp::create(
+          kb, loc, MemRefType::get({tileRows, tileColumns / 8 + 1}, vectors, MemRefLayoutAttrInterface{}, workgroup));
+    }
+    producerTiles.push_back(tile);
+  }
+  // A fragment of a staged `b` tile at (`kLocal`, `nLocal`) in the
+  // operand's order.
+  auto fromBTile = [&](OpBuilder &b, const FragmentProduct &fp, Value tile, int64_t tileColumns, Value kLocal,
+                       Value nLocal) {
+    Value row = fp.bColumns ? nLocal : kLocal, column = fp.bColumns ? kLocal : nLocal;
+    return loadFragmentFromVectors(b, loc, tile, row, arith::DivUIOp::create(b, loc, column, constant(b, 8)), bFragment,
+                                   tileColumns / 8 + 1, fp.bColumns);
+  };
+  // The block from `j0`'s loads: a staged producer's thread's vectors of its
+  // `b` tile, another's `b` fragments.
+  auto producerLoads = [&](OpBuilder &b, Value j0, ArrayRef<size_t> which) {
+    SmallVector<Value> loaded;
+    for (size_t index : which) {
+      const FragmentProduct &fp = producers[index].p;
+      if (const std::optional<VectorSource> &source = producerSources[index]) {
+        auto [tileRows, tileColumns] = bTileShape(fp, fp.k, width);
+        SmallVector<Value> at = fp.indicesOf(fp.b, {{fp.dimK, constant(b, 0)}, {fp.dimN, j0}});
+        for (Value v : tileVectors(b, loc, *source, at[0], at[1], tileRows, tileColumns, tid, kThreads))
+          loaded.push_back(v);
+        continue;
+      }
+      for (int64_t s = 0; s < columnsEach; ++s) {
+        Value f = arith::AddIOp::create(b, loc, subgroup, constant(b, 4 * s));
+        Value column = arith::AddIOp::create(b, loc, j0, arith::MulIOp::create(b, loc, f, constant(b, kFragment)));
+        for (int64_t ks = 0; ks < fp.k / kFragment; ++ks)
+          loaded.push_back(loadFragment(b, loc, fp.b->get(),
+                                        fp.indicesOf(fp.b, {{fp.dimK, constant(b, ks * kFragment)}, {fp.dimN, column}}),
+                                        bFragment, fp.bStride, fp.bColumns));
+      }
+    }
+    return loaded;
+  };
+  auto producersFrom = [&](OpBuilder &b, ArrayRef<size_t> which, ValueRange loaded) {
+    size_t next = 0;
+    // The staged tiles stored first, one barrier for all.
+    bool stored = false;
+    SmallVector<size_t> starts;
+    for (size_t index : which) {
+      starts.push_back(next);
+      const FragmentProduct &fp = producers[index].p;
+      if (producerSources[index]) {
+        auto [tileRows, tileColumns] = bTileShape(fp, fp.k, width);
+        size_t count = size_t(tileRows * tileColumns / 8 / kThreads);
+        storeTileVectors(b, loc, loaded.slice(next, count), producerTiles[index], tileColumns, tid, kThreads);
+        next += count;
+        stored = true;
+      } else {
+        next += size_t(columnsEach * (fp.k / kFragment));
+      }
+    }
+    if (stored)
+      workgroupBarrier(b, loc);
+    for (auto [position, index] : llvm::enumerate(which)) {
+      const Producer &p = producers[index];
+      const FragmentProduct &fp = p.p;
+      size_t at = starts[position];
+      for (int64_t s = 0; s < columnsEach; ++s) {
+        Value f = arith::AddIOp::create(b, loc, subgroup, constant(b, 4 * s));
+        Value n0 = arith::MulIOp::create(b, loc, f, constant(b, kFragment));
+        SmallVector<Value> sums;
+        for (int64_t rf = 0; rf < kRowFragments; ++rf)
+          sums.push_back(spirv::CompositeConstructOp::create(b, loc, accumulator, ValueRange{p.fill.getInputs()[0]}));
+        for (int64_t ks = 0; ks < fp.k / kFragment; ++ks) {
+          Value fbm;
+          if (producerSources[index]) {
+            auto [tileRows, tileColumns] = bTileShape(fp, fp.k, width);
+            (void)tileRows;
+            fbm = fromBTile(b, fp, producerTiles[index], tileColumns, constant(b, ks * kFragment), n0);
+          } else {
+            fbm = loaded[at + s * (fp.k / kFragment) + ks];
+          }
+          for (int64_t rf = 0; rf < kRowFragments; ++rf)
+            sums[rf] = spirv::KHRCooperativeMatrixMulAddOp::create(b, loc, accumulator,
+                                                                   aRegisters[index][rf * (fp.k / kFragment) + ks], fbm,
+                                                                   sums[rf], spirv::CooperativeMatrixOperandsKHRAttr());
+        }
+        for (int64_t rf = 0; rf < kRowFragments; ++rf)
+          storeFragment(b, loc, sums[rf], local[p.buffer], ValueRange{constant(b, rf * kFragment), n0}, width, false);
+      }
+    }
+  };
+  auto computeProducers = [&](OpBuilder &b, Value j0, ArrayRef<size_t> which) {
+    producersFrom(b, which, producerLoads(b, j0, which));
+  };
+  // The first block of columns' first column from `j0`, never past the last
+  // block (what a load ahead of the loop's end reads: the last block again).
+  auto clampBlock = [&](OpBuilder &b, Value j0) -> Value {
+    return arith::MinUIOp::create(b, loc, j0, constant(b, N - width));
+  };
+  // The producers whose buffers `scope` reads.
+  auto producersReadBy = [&](Operation *scope) {
+    SmallVector<size_t> which;
+    for (auto [index, p] : llvm::enumerate(producers))
+      if (!accessesOf(scope, p.buffer).empty())
+        which.push_back(index);
+    return which;
+  };
+  IRMapping mapping;
+  mapping.map(iv, i);
+  // A cloned access of a buffer made one of its block in the workgroup's
+  // memory: row `r`, its column less `j0` (null: the column itself).
+  auto remap = [&](Operation *cloned, Value j0) {
+    cloned->walk([&](Operation *inner) {
+      unsigned memrefOperand = isa<memref::LoadOp>(inner) ? 0 : isa<memref::StoreOp>(inner) ? 1 : ~0u;
+      if (memrefOperand == ~0u)
+        return;
+      auto it = local.find(inner->getOperand(memrefOperand));
+      if (it == local.end())
+        return;
+      inner->setOperand(memrefOperand, it->second);
+      inner->setOperand(memrefOperand + 1, r);
+      if (!j0)
+        return;
+      OpBuilder before(inner);
+      inner->setOperand(memrefOperand + 2, arith::SubIOp::create(before, loc, inner->getOperand(memrefOperand + 2), j0));
+    });
+  };
+  // An inner loop's bounds for this thread: from `lower + t`, by `kGroup`, in
+  // the loop's own integer type, within the `size` columns from `j0`.
+  auto inType = [&](OpBuilder &b, Value index, Type type) -> Value {
+    return type.isIndex() ? index : arith::IndexCastOp::create(b, loc, type, index).getResult();
+  };
+  auto shareIn = [&](OpBuilder &b, Value lb, Value ub, Value j0, int64_t size) {
+    Type type = lb.getType();
+    Value first = arith::MaxSIOp::create(b, loc, lb, inType(b, j0, type));
+    Value end = arith::MinSIOp::create(b, loc, ub, inType(b, arith::AddIOp::create(b, loc, j0, constant(b, size)), type));
+    Value start = arith::AddIOp::create(b, loc, first, inType(b, t, type));
+    Value g = type.isIndex() ? constant(b, kGroup) : arith::ConstantIntOp::create(b, loc, type, kGroup).getResult();
+    return std::make_tuple(start, end, g);
+  };
+  // The blocks of columns any row of the block reaches in `[lb, ub)` (each
+  // thread's own bounds): the smallest `lb` and the largest `ub` among the
+  // rows, through the workgroup's memory, rounded to blocks.
+  auto spanOf = [&](Value lb, Value ub) {
+    Type i32 = kb.getI32Type();
+    if (resident)
+      return std::make_pair(constant(kb, 0), constant(kb, N));
+    Value ends = memref::AllocOp::create(kb, loc, MemRefType::get({kRows, 2}, i32, MemRefLayoutAttrInterface{}, workgroup));
+    auto asI32 = [&](OpBuilder &b, Value v) -> Value {
+      return v.getType() == i32         ? v
+             : v.getType().isIndex() ? Value(arith::IndexCastOp::create(b, loc, i32, v))
+                                     : Value(arith::TruncIOp::create(b, loc, i32, v));
+    };
+    Value isFirst = arith::CmpIOp::create(kb, loc, arith::CmpIPredicate::eq, t, constant(kb, 0));
+    auto only = scf::IfOp::create(kb, loc, TypeRange{}, isFirst, /*withElseRegion=*/false);
+    {
+      OpBuilder tb = OpBuilder::atBlockBegin(only.thenBlock());
+      memref::StoreOp::create(tb, loc, asI32(tb, lb), ends, ValueRange{r, constant(tb, 0)});
+      memref::StoreOp::create(tb, loc, asI32(tb, ub), ends, ValueRange{r, constant(tb, 1)});
+    }
+    workgroupBarrier(kb, loc);
+    Value low = memref::LoadOp::create(kb, loc, ends, ValueRange{constant(kb, 0), constant(kb, 0)});
+    Value high = memref::LoadOp::create(kb, loc, ends, ValueRange{constant(kb, 0), constant(kb, 1)});
+    for (int64_t row = 1; row < kRows; ++row) {
+      low = arith::MinSIOp::create(kb, loc, low,
+                                   memref::LoadOp::create(kb, loc, ends, ValueRange{constant(kb, row), constant(kb, 0)}));
+      high = arith::MaxSIOp::create(kb, loc, high,
+                                    memref::LoadOp::create(kb, loc, ends, ValueRange{constant(kb, row), constant(kb, 1)}));
+    }
+    Value w = arith::ConstantIntOp::create(kb, loc, i32, width);
+    low = arith::MaxSIOp::create(kb, loc, low, arith::ConstantIntOp::create(kb, loc, i32, 0));
+    high = arith::MinSIOp::create(kb, loc, high, arith::ConstantIntOp::create(kb, loc, i32, N));
+    Value first = arith::MulIOp::create(kb, loc, arith::DivSIOp::create(kb, loc, low, w), w);
+    // Rounded up (`high` isn't negative; no `ceildivsi` in SPIR-V).
+    Value end = arith::MulIOp::create(
+        kb, loc,
+        arith::DivSIOp::create(kb, loc,
+                               arith::AddIOp::create(kb, loc, high, arith::ConstantIntOp::create(kb, loc, i32, width - 1)),
+                               w),
+        w);
+    return std::make_pair(Value(arith::IndexCastOp::create(kb, loc, kb.getIndexType(), first)),
+                          Value(arith::IndexCastOp::create(kb, loc, kb.getIndexType(), end)));
+  };
+  Value isFirst = arith::CmpIOp::create(kb, loc, arith::CmpIPredicate::eq, t, constant(kb, 0));
+  Value zero32 = arith::ConstantIntOp::create(kb, loc, kb.getI32Type(), 0);
+  if (resident) {
+    SmallVector<size_t> all(producers.size());
+    std::iota(all.begin(), all.end(), 0);
+    computeProducers(kb, constant(kb, 0), all);
+    workgroupBarrier(kb, loc);
+  }
+  // In blocks, the producers `scope` reads computed for the block from `j0`
+  // (resident: there all along).
+  auto blockOf = [&](OpBuilder &b, Value j0, Operation *scope) {
+    if (resident)
+      return;
+    computeProducers(b, j0, producersReadBy(scope));
+    workgroupBarrier(b, loc);
+  };
+  // The row loop's body, row `r` of the block by its `kGroup` threads, its
+  // map loops kept for the consumers' phase.
+  SmallVector<scf::ForOp> maps;
+  for (Operation *inner : body) {
+    auto forOp = dyn_cast<scf::ForOp>(inner);
+    if (isa<memref::StoreOp>(inner)) {
+      auto only = scf::IfOp::create(kb, loc, TypeRange{}, isFirst, /*withElseRegion=*/false);
+      OpBuilder thenBuilder = OpBuilder::atBlockBegin(only.thenBlock());
+      remap(thenBuilder.clone(*inner, mapping), Value());
+    } else if (!forOp) {
+      // A producer's load at its constant column: that column's block.
+      Value j0;
+      bool reads = !producersReadBy(inner).empty();
+      if (reads && !resident) {
+        int64_t column = *getConstantIntValue(uncastIndex(columnOf(inner)));
+        j0 = constant(kb, column / width * width);
+        blockOf(kb, j0, inner);
+      }
+      remap(kb.clone(*inner, mapping), j0);
+      if (reads && !resident)
+        workgroupBarrier(kb, loc);
+    } else if (forOp.getNumRegionIterArgs() == 0) {
+      maps.push_back(forOp);
+    } else {
+      // Each thread's partial values over its share of each block its rows
+      // reach, and whether it had any; then a tree per row in the
+      // workgroup's memory.
+      SmallVector<CarriedReduction> reductions = *carriedReductions(forOp);
+      SmallVector<Value> inits;
+      for (Value init : forOp.getInitArgs())
+        inits.push_back(mapping.lookupOrDefault(init));
+      SmallVector<Value> carried(inits);
+      carried.push_back(arith::ConstantIntOp::create(kb, loc, kb.getI1Type(), 0));
+      Value lower = mapping.lookupOrDefault(forOp.getLowerBound()), upper = mapping.lookupOrDefault(forOp.getUpperBound());
+      auto [first, end] = spanOf(lower, upper);
+      // In blocks, the first block's producer fragments loaded before the
+      // loop, each next one's at the start of the iteration before
+      // (`producerLoads`), carried along with the partial values.
+      SmallVector<size_t> which = resident ? SmallVector<size_t>{} : producersReadBy(forOp);
+      const size_t partials = carried.size();
+      for (Value fragment : producerLoads(kb, clampBlock(kb, first), which))
+        carried.push_back(fragment);
+      auto blocks = scf::ForOp::create(
+          kb, loc, first, end, constant(kb, width), carried, [&](OpBuilder &bb, Location, Value j0, ValueRange all) {
+            ValueRange in = all.take_front(partials);
+            SmallVector<Value> ahead;
+            if (!which.empty()) {
+              Value after = clampBlock(bb, arith::AddIOp::create(bb, loc, j0, constant(bb, width)));
+              ahead = producerLoads(bb, after, which);
+              producersFrom(bb, which, all.drop_front(partials));
+              workgroupBarrier(bb, loc);
+            }
+            auto [start, stop, st] = shareIn(bb, lower, upper, j0, width);
+            auto partial = scf::ForOp::create(
+                bb, loc, start, stop, st, in, [&](OpBuilder &lb, Location, Value j, ValueRange acc) {
+                  IRMapping inner = mapping;
+                  inner.map(forOp.getInductionVar(), j);
+                  for (auto [arg, value] : llvm::zip(forOp.getRegionIterArgs(), acc.drop_back()))
+                    inner.map(arg, value);
+                  for (Operation &op : forOp.getBody()->without_terminator())
+                    if (!llvm::any_of(reductions,
+                                      [&](const CarriedReduction &rd) { return llvm::is_contained(rd.chain, &op); }))
+                      lb.clone(op, inner);
+                  Value seen = acc.back();
+                  SmallVector<Value> next;
+                  for (const CarriedReduction &rd : reductions) {
+                    Value x = inner.lookupOrDefault(rd.x), mine = acc[rd.index];
+                    Value combined = rd.apply(lb, loc, forOp.getRegionIterArgs()[rd.index], mine, x);
+                    next.push_back(arith::SelectOp::create(lb, loc, seen, combined, x));
+                  }
+                  next.push_back(arith::ConstantIntOp::create(lb, loc, lb.getI1Type(), 1));
+                  scf::YieldOp::create(lb, loc, next);
+                });
+            remap(partial, resident ? Value() : j0);
+            if (!resident)
+              workgroupBarrier(bb, loc);
+            SmallVector<Value> yielded(partial.getResults().begin(), partial.getResults().end());
+            yielded.append(ahead.begin(), ahead.end());
+            scf::YieldOp::create(bb, loc, yielded);
+          });
+      SmallVector<Value> totals(blocks.getResults().begin(), blocks.getResults().begin() + partials);
+      Value seen = totals.back();
+      Value flags = memref::AllocOp::create(
+          kb, loc, MemRefType::get({kRows, kGroup}, kb.getI32Type(), MemRefLayoutAttrInterface{}, workgroup));
+      memref::StoreOp::create(kb, loc, arith::ExtUIOp::create(kb, loc, kb.getI32Type(), seen), flags, ValueRange{r, t});
+      SmallVector<Value> slots;
+      for (const CarriedReduction &rd : reductions) {
+        Type type = forOp.getRegionIterArgs()[rd.index].getType();
+        Value slot = memref::AllocOp::create(kb, loc,
+                                             MemRefType::get({kRows, kGroup}, type, MemRefLayoutAttrInterface{}, workgroup));
+        memref::StoreOp::create(kb, loc, totals[rd.index], slot, ValueRange{r, t});
+        slots.push_back(slot);
+      }
+      workgroupBarrier(kb, loc);
+      for (int64_t half = kGroup / 2; half >= 1; half /= 2) {
+        Value active = arith::CmpIOp::create(kb, loc, arith::CmpIPredicate::ult, t, constant(kb, half));
+        auto round = scf::IfOp::create(kb, loc, TypeRange{}, active, /*withElseRegion=*/false);
+        OpBuilder sb = OpBuilder::atBlockBegin(round.thenBlock());
+        Value other = arith::AddIOp::create(sb, loc, t, constant(sb, half));
+        Value mineSeen = arith::CmpIOp::create(sb, loc, arith::CmpIPredicate::ne,
+                                               memref::LoadOp::create(sb, loc, flags, ValueRange{r, t}), zero32);
+        Value otherSeen = arith::CmpIOp::create(sb, loc, arith::CmpIPredicate::ne,
+                                                memref::LoadOp::create(sb, loc, flags, ValueRange{r, other}), zero32);
+        for (auto [rd, slot] : llvm::zip(reductions, slots)) {
+          Value mine = memref::LoadOp::create(sb, loc, slot, ValueRange{r, t});
+          Value theirs = memref::LoadOp::create(sb, loc, slot, ValueRange{r, other});
+          Value both = rd.apply(sb, loc, forOp.getRegionIterArgs()[rd.index], mine, theirs);
+          Value merged = arith::SelectOp::create(sb, loc, mineSeen, both, theirs);
+          memref::StoreOp::create(sb, loc, arith::SelectOp::create(sb, loc, otherSeen, merged, mine), slot,
+                                  ValueRange{r, t});
+        }
+        Value either = arith::OrIOp::create(sb, loc, mineSeen, otherSeen);
+        memref::StoreOp::create(sb, loc, arith::ExtUIOp::create(sb, loc, sb.getI32Type(), either), flags,
+                                ValueRange{r, t});
+        workgroupBarrier(kb, loc);
+      }
+      Value any = arith::CmpIOp::create(kb, loc, arith::CmpIPredicate::ne,
+                                        memref::LoadOp::create(kb, loc, flags, ValueRange{r, constant(kb, 0)}), zero32);
+      for (auto [rd, slot] : llvm::zip(reductions, slots)) {
+        Value total = memref::LoadOp::create(kb, loc, slot, ValueRange{r, constant(kb, 0)});
+        Value withInit = rd.apply(kb, loc, forOp.getRegionIterArgs()[rd.index], inits[rd.index], total);
+        mapping.map(forOp.getResult(rd.index), arith::SelectOp::create(kb, loc, any, withInit, inits[rd.index]).getResult());
+      }
+      workgroupBarrier(kb, loc);
+    }
+  }
+  // The consumers, block by block of the columns any of them reads within
+  // the block of rows' live slices (`liveK`): the map loops' producers, the
+  // maps into the block of what they write, then every consumer's
+  // accumulators (each subgroup the columns of fragments `subgroup + 4 s` of
+  // its output, all its `kRowFragments` rows, in registers across the
+  // blocks).
+  auto byBlock = [&](ArrayRef<std::pair<int64_t, int64_t>> live, auto pick) {
+    Value value = constant(kb, pick(live.back()));
+    for (int64_t row = int64_t(live.size()) - 2; row >= 0; --row) {
+      Value here = arith::CmpIOp::create(kb, loc, arith::CmpIPredicate::eq, blockRow, constant(kb, row));
+      value = arith::SelectOp::create(kb, loc, here, constant(kb, pick(live[row])), value);
+    }
+    return value;
+  };
+  Value firstColumn = constant(kb, N), endColumn = constant(kb, 0);
+  for (auto live : liveK) {
+    firstColumn = arith::MinUIOp::create(kb, loc, firstColumn, byBlock(live, [](auto range) { return range.first; }));
+    endColumn = arith::MaxUIOp::create(kb, loc, endColumn, byBlock(live, [](auto range) { return range.second; }));
+  }
+  // In blocks of `kColumns` (resident too: the maps and the products by block,
+  // what the live slices reach).
+  firstColumn = arith::MulIOp::create(kb, loc, arith::DivUIOp::create(kb, loc, firstColumn, constant(kb, kColumns)),
+                                constant(kb, kColumns));
+  SmallVector<size_t> mapProducers;
+  for (scf::ForOp map : maps)
+    for (size_t index : producersReadBy(map))
+      if (!llvm::is_contained(mapProducers, index))
+        mapProducers.push_back(index);
+  // (consumer, s) for each column of accumulators.
+  SmallVector<std::pair<size_t, int64_t>> columns;
+  SmallVector<Value> initial;
+  for (auto [index, c] : llvm::enumerate(consumers))
+    for (int64_t s = 0; s < (c.p.n / kFragment + 3) / 4; ++s) {
+      columns.push_back({index, s});
+      for (int64_t rf = 0; rf < kRowFragments; ++rf)
+        initial.push_back(spirv::CompositeConstructOp::create(kb, loc, accumulator, ValueRange{c.fill.getInputs()[0]}));
+    }
+  auto fragmentAt = [&](OpBuilder &b, int64_t s) {
+    return arith::AddIOp::create(b, loc, subgroup, constant(b, 4 * s)).getResult();
+  };
+  // Each consumer's `b` fragments for the block from `j0`, by column of
+  // accumulators then slice, loaded ahead like the producers' (a column past
+  // the output's loads its last one: never used, never out of bounds).
+  // A staged consumer's `b` tile (`kColumns` of its reduction by its whole
+  // output's width), and where each consumer's loads start in what
+  // `consumerLoads` returns: a staged one's thread's vectors of the tile,
+  // another's fragments by column of accumulators then slice.
+  SmallVector<Value> consumerTiles;
+  for (auto [index, c] : llvm::enumerate(consumers)) {
+    Value tile;
+    if (consumerSources[index]) {
+      auto [tileRows, tileColumns] = bTileShape(c.p, kColumns, c.p.n);
+      tile = memref::AllocOp::create(
+          kb, loc, MemRefType::get({tileRows, tileColumns / 8 + 1}, vectors, MemRefLayoutAttrInterface{}, workgroup));
+    }
+    consumerTiles.push_back(tile);
+  }
+  SmallVector<size_t> consumerStarts;
+  auto consumerLoads = [&](OpBuilder &b, Value j0) {
+    SmallVector<Value> fragments;
+    consumerStarts.clear();
+    Value first = arith::MinUIOp::create(b, loc, j0, constant(b, N - kColumns));
+    for (auto [index, c] : llvm::enumerate(consumers)) {
+      consumerStarts.push_back(fragments.size());
+      if (const std::optional<VectorSource> &source = consumerSources[index]) {
+        auto [tileRows, tileColumns] = bTileShape(c.p, kColumns, c.p.n);
+        SmallVector<Value> at = c.p.indicesOf(c.p.b, {{c.p.dimK, first}, {c.p.dimN, constant(b, 0)}});
+        for (Value v : tileVectors(b, loc, *source, at[0], at[1], tileRows, tileColumns, tid, kThreads))
+          fragments.push_back(v);
+      }
+    }
+    for (auto slot : columns) {
+      if (consumerSources[slot.first])
+        continue;
+      const FragmentProduct &p = consumers[slot.first].p;
+      Value f = arith::MinUIOp::create(b, loc, fragmentAt(b, slot.second), constant(b, p.n / kFragment - 1));
+      Value n0 = arith::MulIOp::create(b, loc, f, constant(b, kFragment));
+      for (int64_t kk = 0; kk < kColumns; kk += kFragment) {
+        Value k0 = arith::AddIOp::create(b, loc, first, constant(b, kk));
+        fragments.push_back(loadFragment(b, loc, p.b->get(), p.indicesOf(p.b, {{p.dimK, k0}, {p.dimN, n0}}), bFragment,
+                                         p.bStride, p.bColumns));
+      }
+    }
+    return fragments;
+  };
+  SmallVector<size_t> ahead = resident ? SmallVector<size_t>{} : mapProducers;
+  const size_t accumulators = initial.size();
+  for (Value fragment : producerLoads(kb, clampBlock(kb, firstColumn), ahead))
+    initial.push_back(fragment);
+  const size_t producerFragments = initial.size() - accumulators;
+  for (Value fragment : consumerLoads(kb, firstColumn))
+    initial.push_back(fragment);
+  auto byColumns = scf::ForOp::create(
+      kb, loc, firstColumn, endColumn, constant(kb, kColumns), initial, [&](OpBuilder &bb, Location, Value j0, ValueRange all) {
+        ValueRange acc = all.take_front(accumulators);
+        ValueRange producerNow = all.slice(accumulators, producerFragments);
+        ValueRange consumerNow = all.drop_front(accumulators + producerFragments);
+        Value after = arith::AddIOp::create(bb, loc, j0, constant(bb, kColumns));
+        SmallVector<Value> loadsAhead = producerLoads(bb, clampBlock(bb, after), ahead);
+        SmallVector<Value> consumerAhead = consumerLoads(bb, after);
+        if (!ahead.empty()) {
+          producersFrom(bb, ahead, producerNow);
+          workgroupBarrier(bb, loc);
+        }
+        for (scf::ForOp map : maps) {
+          auto [start, stop, st] = shareIn(bb, mapping.lookupOrDefault(map.getLowerBound()),
+                                           mapping.lookupOrDefault(map.getUpperBound()), j0, kColumns);
+          auto shared = scf::ForOp::create(bb, loc, start, stop, st, ValueRange{},
+                                           [&](OpBuilder &lb, Location, Value j, ValueRange) {
+                                             IRMapping inner = mapping;
+                                             inner.map(map.getInductionVar(), j);
+                                             for (Operation &op : map.getBody()->without_terminator())
+                                               lb.clone(op, inner);
+                                             scf::YieldOp::create(lb, loc);
+                                           });
+          remap(shared, resident ? Value() : j0);
+        }
+        // The staged consumers' tiles for this block, before the barrier
+        // that also orders the maps' writes.
+        for (auto [index, c] : llvm::enumerate(consumers))
+          if (consumerSources[index]) {
+            auto [tileRows, tileColumns] = bTileShape(c.p, kColumns, c.p.n);
+            size_t count = size_t(tileRows * tileColumns / 8 / kThreads);
+            storeTileVectors(bb, loc, consumerNow.slice(consumerStarts[index], count), consumerTiles[index], tileColumns,
+                             tid, kThreads);
+          }
+        workgroupBarrier(bb, loc);
+        SmallVector<Value> next;
+        for (auto [column, slot] : llvm::enumerate(columns)) {
+          const Consumer &c = consumers[slot.first];
+          const FragmentProduct &p = c.p;
+          ValueRange sums = acc.slice(column * kRowFragments, kRowFragments);
+          Value f = fragmentAt(bb, slot.second);
+          Value inside = arith::CmpIOp::create(bb, loc, arith::CmpIPredicate::ult, f, constant(bb, p.n / kFragment));
+          auto guard = scf::IfOp::create(bb, loc, TypeRange(sums), inside, /*withElseRegion=*/true);
+          {
+            OpBuilder gb = OpBuilder::atBlockBegin(guard.thenBlock());
+            Value n0 = arith::MulIOp::create(gb, loc, f, constant(gb, kFragment));
+            SmallVector<Value> updated(sums.begin(), sums.end());
+            // The block's columns of what the loop wrote: from `j0` in the
+            // workgroup's memory when in blocks, at `j0` when resident.
+            Value localFirst = resident ? j0 : constant(gb, 0);
+            // An unstaged consumer's fragments after every staged one's
+            // vectors, in the order `consumerLoads` loads them.
+            size_t unstaged = 0;
+            for (size_t before = 0; before < column; ++before)
+              if (!consumerSources[columns[before].first])
+                ++unstaged;
+            size_t vectorsLoaded = consumerStarts.empty() ? 0 : 0;
+            for (auto [index, other] : llvm::enumerate(consumers))
+              if (consumerSources[index]) {
+                auto [tileRows, tileColumns] = bTileShape(other.p, kColumns, other.p.n);
+                vectorsLoaded += size_t(tileRows * tileColumns / 8 / kThreads);
+              }
+            for (int64_t kk = 0; kk < kColumns; kk += kFragment) {
+              Value fbm;
+              if (consumerSources[slot.first]) {
+                auto [tileRows, tileColumns] = bTileShape(p, kColumns, p.n);
+                (void)tileRows;
+                fbm = fromBTile(gb, p, consumerTiles[slot.first], tileColumns, constant(gb, kk), n0);
+              } else {
+                fbm = consumerNow[vectorsLoaded + unstaged * (kColumns / kFragment) + kk / kFragment];
+              }
+              for (int64_t rf = 0; rf < kRowFragments; ++rf) {
+                Value fa = loadFragment(gb, loc, local[c.buffer],
+                                        ValueRange{constant(gb, rf * kFragment),
+                                                   arith::AddIOp::create(gb, loc, localFirst, constant(gb, kk))},
+                                        aFragment, width, false);
+                updated[rf] = spirv::KHRCooperativeMatrixMulAddOp::create(gb, loc, accumulator, fa, fbm, updated[rf],
+                                                                          spirv::CooperativeMatrixOperandsKHRAttr());
+              }
+            }
+            scf::YieldOp::create(gb, loc, updated);
+            OpBuilder eb = OpBuilder::atBlockBegin(guard.elseBlock());
+            scf::YieldOp::create(eb, loc, sums);
+          }
+          next.append(guard.getResults().begin(), guard.getResults().end());
+        }
+        workgroupBarrier(bb, loc);
+        next.append(loadsAhead.begin(), loadsAhead.end());
+        next.append(consumerAhead.begin(), consumerAhead.end());
+        scf::YieldOp::create(bb, loc, next);
+      });
+  for (auto [column, slot] : llvm::enumerate(columns)) {
+    const FragmentProduct &p = consumers[slot.first].p;
+    Value f = fragmentAt(kb, slot.second);
+    Value inside = arith::CmpIOp::create(kb, loc, arith::CmpIPredicate::ult, f, constant(kb, p.n / kFragment));
+    auto guard = scf::IfOp::create(kb, loc, TypeRange{}, inside, /*withElseRegion=*/false);
+    OpBuilder gb = OpBuilder::atBlockBegin(guard.thenBlock());
+    Value n0 = arith::MulIOp::create(gb, loc, f, constant(gb, kFragment));
+    for (int64_t rf = 0; rf < kRowFragments; ++rf)
+      storeFragment(gb, loc, byColumns.getResult(column * kRowFragments + rf), p.c->get(),
+                    p.indicesOf(p.c, {{p.dimM, arith::AddIOp::create(gb, loc, rowBase, constant(gb, rf * kFragment))},
+                                      {p.dimN, n0}}),
+                    p.cStride, false);
+  }
+  // The ops replaced, then the buffers.
+  for (Consumer &c : consumers) {
+    c.p.op->erase();
+    c.fill->erase();
+  }
+  rows->erase();
+  for (Producer &p : producers) {
+    p.p.op->erase();
+    p.fill->erase();
+  }
+  for (Value buffer : buffers)
+    if (!eraseBuffer(buffer)) {
+      module.emitError("cleave-fuse-row-pipelines: a fused buffer still used");
+      return true;
+    }
+  return true;
+}
+
+// Vulkan backend: a row pipeline made one kernel (`doc/plan-fusion.md`). A
+// row loop (`scf.parallel (i)`, its body scalar operations and inner loops
+// over `j`, reductions and maps), its producers (fragment products,
+// `fragmentProductOf`, each writing a fresh buffer the loop reads at row `i`
+// only) and its consumers (fragment products whose `a` is a fresh buffer the
+// loop writes at row `i` only, read as `a[m, k]`): attention's scores,
+// softmax and weighted values. The kernel takes a block of rows per
+// workgroup: the producers' rows computed on fragments into the workgroup's
+// memory (their `a` loaded once into registers), the loop's body run for
+// each row by a group of threads (its inner loops shared among them,
+// reductions combined by a tree in workgroup memory, as
+// `cleave-cooperative-rows` does for a row), its maps' stores to workgroup
+// memory, then the consumers' rows accumulated on fragments from it, block
+// of columns by block within the rows' live slices. The intermediates never
+// reach device memory, and every value is the kernels' it replaces. Whole
+// rows when they fit the workgroup's memory (phase 1: attention at L = 256,
+// 28% faster); else, when asked, blocks of 64 columns, the producers
+// recomputed for each pass (phase 2). Returns how many pipelines it fused.
+static int64_t cleaveFuseRowPipelines(MlirOperation op) {
+  auto module = dyn_cast<ModuleOp>(unwrap(op));
+  // `CLEAVE_GPU_FUSE=0` (at compile time): no fusion, what a measurement
+  // compares with.
+  if (const char *v = std::getenv("CLEAVE_GPU_FUSE"); !module || (v && std::string(v) == "0"))
+    return 0;
+  SmallVector<scf::ParallelOp> loops;
+  module.walk([&](scf::ParallelOp loop) {
+    if (loop.getNumLoops() == 1 && loop.getNumResults() == 0 && !loop->getParentOfType<gpu::LaunchOp>() &&
+        !loop->getParentOfType<gpu::GPUModuleOp>() && !loop->getParentOfType<scf::ParallelOp>())
+      loops.push_back(loop);
+  });
+  int64_t fused = 0;
+  for (scf::ParallelOp rows : loops)
+    if (fuseRowPipeline(rows, module))
+      ++fused;
+  return fused;
+}
+CLEAVE_COUNTING_PASS(FuseRowPipelinesPass, "cleave-fuse-row-pipelines",
+                     "row loops fused with the products they read and feed, one kernel each",
+                     cleaveFuseRowPipelines)
+
+// Vulkan backend: block programs (`doc/plan-fusion.md`). A loop whose
+// iterations are independent blocks of work with products of small blocks
+// among their operations (`stdlib/nn`'s `online_causal_attention`: a block of
+// rows, its scores, weights and weighted values by blocks of keys) made a
+// kernel of a workgroup per iteration, what Triton calls a program per block:
+// the body's allocations in the workgroup's memory, its parallel loops and
+// elementwise operations shared out among the threads, its products on
+// fragments by its subgroups, its loops over blocks run by the whole
+// workgroup, a barrier after each step. Every value as the separate kernels
+// compute it; nothing of a block's in device memory. Returns how many loops it
+// made kernels.
+namespace {
+
+// Whether `v` is computed from `iv` (through any operation in this function).
+bool dependsOn(Value v, Value iv, llvm::DenseMap<Value, bool> &memo) {
+  if (v == iv)
+    return true;
+  if (auto known = memo.find(v); known != memo.end())
+    return known->second;
+  memo[v] = false;
+  Operation *def = v.getDefiningOp();
+  bool depends = def && llvm::any_of(def->getOperands(), [&](Value operand) { return dependsOn(operand, iv, memo); });
+  memo[v] = depends;
+  return depends;
+}
+
+// The coefficient of `iv` in `v`, when `v` is a sum of `iv` times a constant
+// and of values that don't depend on it (through casts).
+std::optional<int64_t> coefficientOf(Value v, Value iv, llvm::DenseMap<Value, bool> &memo) {
+  v = uncastIndex(v);
+  if (v == iv)
+    return 1;
+  if (!dependsOn(v, iv, memo))
+    return 0;
+  Operation *def = v.getDefiningOp();
+  if (!def)
+    return std::nullopt;
+  if (isa<arith::AddIOp, arith::SubIOp>(def)) {
+    std::optional<int64_t> x = coefficientOf(def->getOperand(0), iv, memo),
+                           y = coefficientOf(def->getOperand(1), iv, memo);
+    if (!x || !y)
+      return std::nullopt;
+    return isa<arith::AddIOp>(def) ? *x + *y : *x - *y;
+  }
+  if (isa<arith::MulIOp>(def)) {
+    for (int i = 0; i < 2; ++i)
+      if (std::optional<int64_t> c = getConstantIntValue(def->getOperand(1 - i)))
+        if (std::optional<int64_t> x = coefficientOf(def->getOperand(i), iv, memo))
+          return *x * *c;
+  }
+  return std::nullopt;
+}
+
+struct BlockProgram {
+  Location loc;
+  MLIRContext *ctx;
+  Block *body;          // the loop's body, whose allocations are the program's own
+  gpu::LaunchOp launch;
+  OpBuilder top;        // the kernel's start: its workgroup allocations
+  // The products' operands from device memory staged in the workgroup's
+  // memory by tiles (`VectorSource`): each operand's source, and a buffer of
+  // vectors per role (`a`, `b`) as large as the largest operand in it, which
+  // every product reuses (a barrier between two products).
+  llvm::DenseMap<Value, VectorSource> sources;
+  Value tiles[2];
+  int64_t tileRowLength[2] = {0, 0};
+  // Operands defined in the block but read by products in a loop inside it
+  // (`online_causal_attention`'s block of queries, the same for every block
+  // of keys): each its own tile, loaded once where it's defined rather than
+  // at every product. Its tile and row length; `staged` once loaded.
+  struct Resident {
+    Value tile;
+    int64_t rowLength;
+    bool staged = false;
+  };
+  llvm::DenseMap<Value, Resident> residents;
+  int64_t workgroupBytes = 0; // the program's own buffers', reuse counted
+  // The workgroup buffers of allocations freed so far, by type: a later
+  // allocation of the same type takes one (the scores' buffer, freed, holds
+  // the weighted values; the weights', the block of output).
+  llvm::DenseMap<Type, SmallVector<Value>> freed;
+  // The operands of the loop being emitted loaded a turn ahead: this
+  // thread's vectors of their tiles, which their product stores to the tile.
+  llvm::DenseMap<Value, SmallVector<Value>> prefetched;
+  int64_t loadedAhead = 0; // operands loaded a turn ahead, for the debug output
+
+  // Whether `v` can be computed at another turn of `loop`: from values
+  // defined outside it and its induction variable, by pure operations of its
+  // body.
+  static bool computable(scf::ForOp loop, Value v) {
+    if (v == loop.getInductionVar())
+      return true;
+    if (auto arg = dyn_cast<BlockArgument>(v))
+      return arg.getOwner() != loop.getBody() && !loop->isAncestor(arg.getOwner()->getParentOp());
+    Operation *def = v.getDefiningOp();
+    if (!loop->isAncestor(def))
+      return true;
+    if (def->getBlock() != loop.getBody() || def->getNumRegions() != 0 || !isMemoryEffectFree(def))
+      return false;
+    return llvm::all_of(def->getOperands(), [&](Value operand) { return computable(loop, operand); });
+  }
+  // `v` (`computable`) at the turn whose induction value is `iv`.
+  Value valueAt(OpBuilder &b, scf::ForOp loop, Value v, Value iv, IRMapping &local) {
+    if (v == loop.getInductionVar())
+      return iv;
+    if (Value known = local.lookupOrNull(v))
+      return known;
+    Operation *def = v.getDefiningOp();
+    if (!def || !loop->isAncestor(def))
+      return mapping.lookupOrDefault(v);
+    for (Value operand : def->getOperands())
+      local.map(operand, valueAt(b, loop, operand, iv, local));
+    Operation *copy = b.clone(*def, local);
+    for (auto [result, value] : llvm::zip(def->getResults(), copy->getResults()))
+      local.map(result, value);
+    return local.lookup(v);
+  }
+  // The staged operands `loop`'s products read that it defines, each at a
+  // position its turn decides, every thread as many vectors of it.
+  SmallVector<Value> operandsAhead(scf::ForOp loop) {
+    llvm::SetVector<Value> ahead;
+    for (Operation &op : loop.getBody()->without_terminator()) {
+      auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
+      std::optional<FragmentProduct> p = linalgOp ? fragmentProductOf(linalgOp) : std::nullopt;
+      if (!p)
+        continue;
+      for (auto [role, operand] : llvm::enumerate(std::array<Value, 2>{p->a->get(), p->b->get()})) {
+        auto source = sources.find(operand);
+        Operation *def = operand.getDefiningOp();
+        auto shape = cast<MemRefType>(operand.getType()).getShape();
+        if (source == sources.end() || residents.count(operand) || !tiles[role] || !def ||
+            def->getBlock() != loop.getBody() || (shape[0] * shape[1] / 8) % kThreads != 0 ||
+            !computable(loop, source->second.row) || !computable(loop, source->second.column))
+          continue;
+        ahead.insert(operand);
+      }
+    }
+    return ahead.takeVector();
+  }
+  // This thread's vectors of `operand`'s tile at the turn of `loop` whose
+  // induction value is `iv`.
+  SmallVector<Value> vectorsAt(OpBuilder &b, scf::ForOp loop, Value operand, Value iv) {
+    const VectorSource &found = sources.find(operand)->second;
+    IRMapping local;
+    VectorSource source{found.view, valueAt(b, loop, found.row, iv, local), valueAt(b, loop, found.column, iv, local)};
+    auto shape = cast<MemRefType>(operand.getType()).getShape();
+    return tileVectors(b, loc, source, constant(b, 0), constant(b, 0), shape[0], shape[1], tid, kThreads);
+  }
+  Value tid, subgroup;
+  IRMapping mapping;
+  llvm::DenseSet<Operation *> dead; // what only takes addresses for the runtime
+  std::string failure;
+  static inline const int64_t kSubgroups = [] {
+    const char *v = std::getenv("CLEAVE_GPU_BLOCK_SUBGROUPS");
+    return v ? std::atoll(v) : int64_t(8);
+  }();
+  static inline const int64_t kThreads = kSubgroups * kSubgroup;
+
+  BlockProgram(Location loc, Block *body, gpu::LaunchOp launch)
+      : loc(loc), ctx(launch.getContext()), body(body), launch(launch), top(launch.getContext()) {}
+
+  Value constant(OpBuilder &b, int64_t v) { return arith::ConstantIndexOp::create(b, loc, v); }
+  void fail(const Twine &why) {
+    if (failure.empty())
+      failure = why.str();
+  }
+
+  // Whether `op` needs the whole workgroup: a product or another `linalg`
+  // op, a parallel loop, an allocation, in it.
+  static bool needsWorkgroup(Operation *op) {
+    bool needs = false;
+    op->walk([&](Operation *inner) {
+      if (isa<linalg::LinalgOp, scf::ParallelOp, memref::AllocOp>(inner))
+        needs = true;
+    });
+    return needs;
+  }
+  static bool writesMemory(Operation *op) {
+    bool writes = false;
+    op->walk([&](Operation *inner) {
+      if (!isa<memref::LoadOp>(inner) && !isMemoryEffectFree(inner) &&
+          !inner->hasTrait<OpTrait::HasRecursiveMemoryEffects>())
+        writes = true;
+    });
+    return writes;
+  }
+
+  // The iterations of a nest (`lower`, `upper`, `steps` by dimension, mapped
+  // already) shared out among the threads, `emit` given each one's induction
+  // values in the original types.
+  void distribute(OpBuilder &b, ArrayRef<Value> lower, ArrayRef<Value> upper, ArrayRef<Value> steps,
+                  function_ref<void(OpBuilder &, SmallVector<Value>)> emit) {
+    auto asIndex = [&](OpBuilder &at, Value v) -> Value {
+      return v.getType().isIndex() ? v : arith::IndexCastOp::create(at, loc, at.getIndexType(), v).getResult();
+    };
+    SmallVector<Value> counts;
+    Value total = constant(b, 1);
+    for (auto [lb, ub, st] : llvm::zip(lower, upper, steps)) {
+      Value span = arith::SubIOp::create(b, loc, asIndex(b, ub), asIndex(b, lb));
+      Value count = arith::DivSIOp::create(
+          b, loc, arith::AddIOp::create(b, loc, span, arith::SubIOp::create(b, loc, asIndex(b, st), constant(b, 1))),
+          asIndex(b, st));
+      count = arith::MaxSIOp::create(b, loc, count, constant(b, 0));
+      counts.push_back(count);
+      total = arith::MulIOp::create(b, loc, total, count);
+    }
+    scf::ForOp::create(b, loc, tid, total, constant(b, kThreads), ValueRange{},
+                       [&](OpBuilder &lb, Location, Value index, ValueRange) {
+                         SmallVector<Value> ivs(lower.size());
+                         Value rest = index;
+                         for (int64_t d = int64_t(lower.size()) - 1; d >= 0; --d) {
+                           Value i = arith::RemUIOp::create(lb, loc, rest, counts[d]);
+                           rest = arith::DivUIOp::create(lb, loc, rest, counts[d]);
+                           Value scaled = arith::MulIOp::create(lb, loc, i, asIndex(lb, steps[d]));
+                           Value iv = arith::AddIOp::create(lb, loc, asIndex(lb, lower[d]), scaled);
+                           ivs[d] = lower[d].getType().isIndex()
+                                        ? iv
+                                        : arith::IndexCastOp::create(lb, loc, lower[d].getType(), iv).getResult();
+                         }
+                         emit(lb, ivs);
+                         scf::YieldOp::create(lb, loc);
+                       });
+  }
+
+  // A product on fragments: each subgroup its share of the output's 16 x 16
+  // fragments (`f = subgroup + kSubgroups s`), each over the whole reduction.
+  void emitProduct(OpBuilder &b, const FragmentProduct &p, Value filled) {
+    Type bf16 = BFloat16Type::get(ctx), f32 = Float32Type::get(ctx);
+    auto aFragment = fragmentType(bf16, spirv::CooperativeMatrixUseKHR::MatrixA);
+    auto bFragment = fragmentType(bf16, spirv::CooperativeMatrixUseKHR::MatrixB);
+    auto accumulator = fragmentType(f32, spirv::CooperativeMatrixUseKHR::MatrixAcc);
+    Value a = mapping.lookupOrDefault(p.a->get()), bOperand = mapping.lookupOrDefault(p.b->get()),
+          c = mapping.lookupOrDefault(p.c->get());
+    const int64_t columns = p.n / kFragment, fragments = (p.m / kFragment) * columns;
+    // Each operand staged whole into its role's tile, where it has a source.
+    bool staged[2] = {false, false};
+    Value tileOf[2] = {tiles[0], tiles[1]};
+    int64_t rowLengthOf[2] = {tileRowLength[0], tileRowLength[1]};
+    bool loaded = false;
+    for (auto [role, operand] : llvm::enumerate(std::array<Value, 2>{p.a->get(), p.b->get()})) {
+      if (auto resident = residents.find(operand); resident != residents.end() && resident->second.staged) {
+        tileOf[role] = resident->second.tile;
+        rowLengthOf[role] = resident->second.rowLength;
+        staged[role] = true;
+        continue;
+      }
+      auto it = sources.find(operand);
+      if (it == sources.end() || !tiles[role])
+        continue;
+      if (auto ahead = prefetched.find(operand); ahead != prefetched.end()) {
+        storeTileVectors(b, loc, ahead->second, tiles[role], cast<MemRefType>(operand.getType()).getShape()[1], tid,
+                         kThreads);
+        staged[role] = loaded = true;
+        continue;
+      }
+      auto type = cast<MemRefType>(operand.getType());
+      VectorSource source{it->second.view, mapping.lookupOrDefault(it->second.row),
+                          mapping.lookupOrDefault(it->second.column)};
+      loadTile(b, loc, source, constant(b, 0), constant(b, 0), type.getShape()[0], type.getShape()[1], tiles[role], tid,
+               kThreads);
+      staged[role] = loaded = true;
+    }
+    if (loaded)
+      workgroupBarrier(b, loc);
+    // A fragment of an operand at (`indices`, the operand's memory order).
+    auto fragmentOf = [&](OpBuilder &at, int role, Value memref, SmallVector<Value> indices,
+                          spirv::CooperativeMatrixType type, int64_t stride, bool transposed) -> Value {
+      if (!staged[role])
+        return loadFragment(at, loc, memref, indices, type, stride, transposed);
+      return loadFragmentFromVectors(at, loc, tileOf[role], indices[0],
+                                     arith::DivUIOp::create(at, loc, indices[1], constant(at, 8)), type,
+                                     rowLengthOf[role], transposed);
+    };
+    for (int64_t s = 0; s < (fragments + kSubgroups - 1) / kSubgroups; ++s) {
+      Value f = arith::AddIOp::create(b, loc, subgroup, constant(b, kSubgroups * s));
+      auto emit = [&](OpBuilder &gb) {
+        Value m0 = arith::MulIOp::create(gb, loc, arith::DivUIOp::create(gb, loc, f, constant(gb, columns)),
+                                         constant(gb, kFragment));
+        Value n0 = arith::MulIOp::create(gb, loc, arith::RemUIOp::create(gb, loc, f, constant(gb, columns)),
+                                         constant(gb, kFragment));
+        Value initial = filled ? Value(spirv::CompositeConstructOp::create(gb, loc, accumulator, ValueRange{filled}))
+                               : loadFragment(gb, loc, c, p.indicesOf(p.c, {{p.dimM, m0}, {p.dimN, n0}}), accumulator,
+                                              p.cStride, p.cColumns);
+        auto loop = scf::ForOp::create(
+            gb, loc, constant(gb, 0), constant(gb, p.k), constant(gb, kFragment), ValueRange{initial},
+            [&](OpBuilder &lb, Location, Value k0, ValueRange acc) {
+              Value fa = fragmentOf(lb, 0, a, p.indicesOf(p.a, {{p.dimM, m0}, {p.dimK, k0}}), aFragment, p.aStride,
+                                    p.aColumns);
+              Value fb = fragmentOf(lb, 1, bOperand, p.indicesOf(p.b, {{p.dimK, k0}, {p.dimN, n0}}), bFragment,
+                                    p.bStride, p.bColumns);
+              scf::YieldOp::create(lb, loc,
+                                   ValueRange{spirv::KHRCooperativeMatrixMulAddOp::create(
+                                       lb, loc, accumulator, fa, fb, acc[0], spirv::CooperativeMatrixOperandsKHRAttr())});
+            });
+        storeFragment(gb, loc, loop.getResult(0), c, p.indicesOf(p.c, {{p.dimM, m0}, {p.dimN, n0}}), p.cStride,
+                      p.cColumns);
+      };
+      if ((s + 1) * kSubgroups <= fragments) {
+        emit(b);
+      } else {
+        Value inside = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::ult, f, constant(b, fragments));
+        auto guard = scf::IfOp::create(b, loc, TypeRange{}, inside, /*withElseRegion=*/false);
+        OpBuilder gb = OpBuilder::atBlockBegin(guard.thenBlock());
+        emit(gb);
+      }
+    }
+    workgroupBarrier(b, loc);
+  }
+
+  // A parallel loop over rows whose body runs inner loops over the row (a
+  // softmax, `online_causal_attention`'s row of a block), `group` threads a
+  // row (as many rows as threads by `group`): its inner loops shared among
+  // the row's threads, element `j` to thread `j mod group`, reductions'
+  // partial values combined by a tree in the workgroup's memory (as
+  // `cleave-cooperative-rows` does with a workgroup a row), a store outside
+  // them the first thread's, a barrier after each inner loop. False, nothing
+  // emitted, when the loop isn't such a loop.
+  bool emitRows(OpBuilder &b, scf::ParallelOp parallel) {
+    if (parallel.getNumLoops() != 1)
+      return false;
+    std::optional<int64_t> lower = getConstantIntValue(parallel.getLowerBound()[0]),
+                           upper = getConstantIntValue(parallel.getUpperBound()[0]),
+                           step = getConstantIntValue(parallel.getStep()[0]);
+    if (!lower || !upper || !step || *step <= 0)
+      return false;
+    const int64_t rows = (*upper - *lower + *step - 1) / *step;
+    if (rows <= 0 || kThreads % rows != 0 || kThreads / rows < 2)
+      return false;
+    const int64_t group = kThreads / rows;
+    bool hasInner = false;
+    for (Operation &op : parallel.getBody()->without_terminator()) {
+      if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+        hasInner = true;
+        bool fits = forOp.getNumRegionIterArgs() == 0 ? elementsAreIndependent(forOp)
+                                                      : bool(carriedReductions(forOp, /*elementStores=*/true));
+        if (!fits)
+          return false;
+      } else if (writesMemory(&op) && !isa<memref::StoreOp>(op)) {
+        return false;
+      }
+    }
+    if (!hasInner)
+      return false;
+    Value r = arith::DivUIOp::create(b, loc, tid, constant(b, group));
+    Value t = arith::RemUIOp::create(b, loc, tid, constant(b, group));
+    Value isFirst = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq, t, constant(b, 0));
+    IRMapping inner = mapping;
+    inner.map(parallel.getInductionVars()[0],
+              arith::AddIOp::create(b, loc, constant(b, *lower), arith::MulIOp::create(b, loc, r, constant(b, *step)))
+                  .getResult());
+    auto share = [&](scf::ForOp loop) {
+      Value lb = inner.lookupOrDefault(loop.getLowerBound()), ub = inner.lookupOrDefault(loop.getUpperBound()),
+            st = inner.lookupOrDefault(loop.getStep());
+      Type type = lb.getType();
+      Value tt = type.isIndex() ? t : arith::IndexCastOp::create(b, loc, type, t).getResult();
+      Value g = type.isIndex() ? constant(b, group) : arith::ConstantIntOp::create(b, loc, type, group).getResult();
+      Value start = arith::AddIOp::create(b, loc, lb, arith::MulIOp::create(b, loc, tt, st));
+      return std::make_tuple(start, ub, Value(arith::MulIOp::create(b, loc, st, g)));
+    };
+    Attribute workgroup = spirv::StorageClassAttr::get(ctx, spirv::StorageClass::Workgroup);
+    Value zero32 = arith::ConstantIntOp::create(b, loc, b.getI32Type(), 0);
+    for (Operation &op : parallel.getBody()->without_terminator()) {
+      auto forOp = dyn_cast<scf::ForOp>(op);
+      if (isa<memref::StoreOp>(op)) {
+        auto only = scf::IfOp::create(b, loc, TypeRange{}, isFirst, /*withElseRegion=*/false);
+        OpBuilder thenBuilder = OpBuilder::atBlockBegin(only.thenBlock());
+        thenBuilder.clone(op, inner);
+        workgroupBarrier(b, loc);
+      } else if (!forOp) {
+        b.clone(op, inner);
+      } else if (forOp.getNumRegionIterArgs() == 0) {
+        auto [start, ub, st] = share(forOp);
+        scf::ForOp::create(b, loc, start, ub, st, ValueRange{}, [&](OpBuilder &lb, Location, Value j, ValueRange) {
+          IRMapping body = inner;
+          body.map(forOp.getInductionVar(), j);
+          for (Operation &inside : forOp.getBody()->without_terminator())
+            lb.clone(inside, body);
+          scf::YieldOp::create(lb, loc);
+        });
+        workgroupBarrier(b, loc);
+      } else {
+        SmallVector<CarriedReduction> reductions = *carriedReductions(forOp, /*elementStores=*/true);
+        auto [start, ub, st] = share(forOp);
+        SmallVector<Value> inits;
+        for (Value init : forOp.getInitArgs())
+          inits.push_back(inner.lookupOrDefault(init));
+        SmallVector<Value> carried(inits);
+        carried.push_back(arith::ConstantIntOp::create(b, loc, b.getI1Type(), 0));
+        auto partial = scf::ForOp::create(b, loc, start, ub, st, carried, [&](OpBuilder &lb, Location, Value j,
+                                                                             ValueRange acc) {
+          IRMapping body = inner;
+          body.map(forOp.getInductionVar(), j);
+          for (auto [arg, value] : llvm::zip(forOp.getRegionIterArgs(), acc.drop_back()))
+            body.map(arg, value);
+          for (Operation &inside : forOp.getBody()->without_terminator())
+            if (!llvm::any_of(reductions, [&](const CarriedReduction &rd) { return llvm::is_contained(rd.chain, &inside); }))
+              lb.clone(inside, body);
+          Value seen = acc.back();
+          SmallVector<Value> next;
+          for (const CarriedReduction &rd : reductions) {
+            Value x = body.lookupOrDefault(rd.x), mine = acc[rd.index];
+            next.push_back(arith::SelectOp::create(lb, loc, seen,
+                                                   rd.apply(lb, loc, forOp.getRegionIterArgs()[rd.index], mine, x), x));
+          }
+          next.push_back(arith::ConstantIntOp::create(lb, loc, lb.getI1Type(), 1));
+          scf::YieldOp::create(lb, loc, next);
+        });
+        Value flags = memref::AllocOp::create(
+            top, loc, MemRefType::get({rows, group}, top.getI32Type(), MemRefLayoutAttrInterface{}, workgroup));
+        memref::StoreOp::create(b, loc, arith::ExtUIOp::create(b, loc, b.getI32Type(), partial.getResults().back()),
+                                flags, ValueRange{r, t});
+        SmallVector<Value> slots;
+        for (const CarriedReduction &rd : reductions) {
+          Type type = forOp.getRegionIterArgs()[rd.index].getType();
+          Value slot = memref::AllocOp::create(
+              top, loc, MemRefType::get({rows, group}, type, MemRefLayoutAttrInterface{}, workgroup));
+          memref::StoreOp::create(b, loc, partial.getResult(rd.index), slot, ValueRange{r, t});
+          slots.push_back(slot);
+        }
+        workgroupBarrier(b, loc);
+        for (int64_t half = group / 2; half >= 1; half /= 2) {
+          Value active = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::ult, t, constant(b, half));
+          auto round = scf::IfOp::create(b, loc, TypeRange{}, active, /*withElseRegion=*/false);
+          OpBuilder sb = OpBuilder::atBlockBegin(round.thenBlock());
+          Value other = arith::AddIOp::create(sb, loc, t, constant(sb, half));
+          Value mineSeen = arith::CmpIOp::create(sb, loc, arith::CmpIPredicate::ne,
+                                                 memref::LoadOp::create(sb, loc, flags, ValueRange{r, t}), zero32);
+          Value otherSeen = arith::CmpIOp::create(sb, loc, arith::CmpIPredicate::ne,
+                                                  memref::LoadOp::create(sb, loc, flags, ValueRange{r, other}), zero32);
+          for (auto [rd, slot] : llvm::zip(reductions, slots)) {
+            Value mine = memref::LoadOp::create(sb, loc, slot, ValueRange{r, t});
+            Value theirs = memref::LoadOp::create(sb, loc, slot, ValueRange{r, other});
+            Value both = rd.apply(sb, loc, forOp.getRegionIterArgs()[rd.index], mine, theirs);
+            Value merged = arith::SelectOp::create(sb, loc, mineSeen, both, theirs);
+            memref::StoreOp::create(sb, loc, arith::SelectOp::create(sb, loc, otherSeen, merged, mine), slot,
+                                    ValueRange{r, t});
+          }
+          memref::StoreOp::create(sb, loc,
+                                  arith::ExtUIOp::create(sb, loc, sb.getI32Type(),
+                                                         arith::OrIOp::create(sb, loc, mineSeen, otherSeen)),
+                                  flags, ValueRange{r, t});
+          workgroupBarrier(b, loc);
+        }
+        Value any = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::ne,
+                                          memref::LoadOp::create(b, loc, flags, ValueRange{r, constant(b, 0)}), zero32);
+        for (auto [rd, slot] : llvm::zip(reductions, slots)) {
+          Value total = memref::LoadOp::create(b, loc, slot, ValueRange{r, constant(b, 0)});
+          Value withInit = rd.apply(b, loc, forOp.getRegionIterArgs()[rd.index], inits[rd.index], total);
+          inner.map(forOp.getResult(rd.index), arith::SelectOp::create(b, loc, any, withInit, inits[rd.index]).getResult());
+        }
+        // Every thread has its totals before a later tree reuses no slot, but
+        // the next loop may read what this one's threads stored.
+        workgroupBarrier(b, loc);
+      }
+    }
+    return true;
+  }
+
+  // An elementwise `linalg` op (identity maps, parallel loops: a copy, a
+  // conversion) shared out among the threads.
+  void emitElementwise(OpBuilder &b, linalg::LinalgOp op) {
+    if (op.getNumReductionLoops() != 0 ||
+        !llvm::all_of(op.getIndexingMapsArray(), [](AffineMap map) { return map.isIdentity(); })) {
+      fail(Twine("a `linalg` op not elementwise: ") + op->getName().getStringRef());
+      return;
+    }
+    SmallVector<int64_t> ranges = op.getStaticLoopRanges();
+    SmallVector<Value> lower, upper, steps;
+    for (int64_t r : ranges) {
+      lower.push_back(constant(b, 0));
+      upper.push_back(constant(b, r));
+      steps.push_back(constant(b, 1));
+    }
+    Block *opBody = op.getBlock();
+    distribute(b, lower, upper, steps, [&](OpBuilder &lb, SmallVector<Value> ivs) {
+      IRMapping inner = mapping;
+      for (OpOperand &operand : op->getOpOperands()) {
+        Value memref = mapping.lookupOrDefault(operand.get());
+        Value arg = opBody->getArgument(operand.getOperandNumber());
+        if (op.isDpsInput(&operand) || !arg.use_empty())
+          inner.map(arg, memref::LoadOp::create(lb, loc, memref, ivs).getResult());
+      }
+      for (Operation &inside : opBody->without_terminator())
+        lb.clone(inside, inner);
+      for (auto [result, init] : llvm::zip(opBody->getTerminator()->getOperands(), op.getDpsInits()))
+        memref::StoreOp::create(lb, loc, inner.lookupOrDefault(result), mapping.lookupOrDefault(init), ivs);
+    });
+    workgroupBarrier(b, loc);
+  }
+
+  void emitBlock(OpBuilder &b, Block &block) {
+    for (Operation &op : block.without_terminator()) {
+      if (!failure.empty())
+        return;
+      if (dead.contains(&op))
+        continue;
+      if (auto alloc = dyn_cast<memref::AllocOp>(op)) {
+        MemRefType type = alloc.getType();
+        if (!type.hasStaticShape() || !type.getLayout().isIdentity()) {
+          fail("an allocation of a shape known at run time");
+          return;
+        }
+        Attribute workgroup = spirv::StorageClassAttr::get(ctx, spirv::StorageClass::Workgroup);
+        auto local = MemRefType::get(type.getShape(), type.getElementType(), MemRefLayoutAttrInterface{}, workgroup);
+        SmallVector<Value> &reusable = freed[local];
+        if (!reusable.empty()) {
+          mapping.map(alloc.getResult(), reusable.pop_back_val());
+        } else {
+          mapping.map(alloc.getResult(), memref::AllocOp::create(top, loc, local).getResult());
+          workgroupBytes += local.getNumElements() * ((local.getElementTypeBitWidth() + 7) / 8);
+        }
+        continue;
+      }
+      // A deallocation: its buffer free for a later allocation (every step
+      // ends with a barrier: no thread still reads it when one writes it).
+      auto release = [&](memref::DeallocOp dealloc) {
+        if (Value local = mapping.lookupOrNull(dealloc.getMemref()))
+          freed[local.getType()].push_back(local);
+      };
+      if (auto dealloc = dyn_cast<memref::DeallocOp>(op)) {
+        release(dealloc);
+        continue;
+      }
+      if (auto guard = dyn_cast<scf::IfOp>(op); guard && guard.getNumResults() == 0 && guard.getElseRegion().empty() &&
+                                                  guard.thenBlock()->getOperations().size() == 2 &&
+                                                  isa<memref::DeallocOp>(guard.thenBlock()->front())) {
+        release(cast<memref::DeallocOp>(guard.thenBlock()->front()));
+        continue;
+      }
+      if (auto fill = dyn_cast<linalg::FillOp>(op)) {
+        // A fill a product starts from: that product's initial value.
+        bool feedsProduct = false;
+        for (Operation *after = op.getNextNode(); after; after = after->getNextNode())
+          if (auto linalgOp = dyn_cast<linalg::LinalgOp>(after); linalgOp && fragmentProductOf(linalgOp) &&
+                                                                fillBefore(after, fill.getOutputs()[0]) == fill) {
+            feedsProduct = true;
+            break;
+          }
+        if (feedsProduct)
+          continue;
+        Value value = mapping.lookupOrDefault(fill.getInputs()[0]);
+        Value target = mapping.lookupOrDefault(fill.getOutputs()[0]);
+        auto type = cast<MemRefType>(target.getType());
+        SmallVector<Value> lower, upper, steps;
+        for (int64_t extent : type.getShape()) {
+          lower.push_back(constant(b, 0));
+          upper.push_back(constant(b, extent));
+          steps.push_back(constant(b, 1));
+        }
+        distribute(b, lower, upper, steps,
+                   [&](OpBuilder &lb, SmallVector<Value> ivs) { memref::StoreOp::create(lb, loc, value, target, ivs); });
+        workgroupBarrier(b, loc);
+        continue;
+      }
+      if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
+        if (std::optional<FragmentProduct> product = fragmentProductOf(linalgOp)) {
+          linalg::FillOp fill = fillBefore(&op, product->c->get());
+          emitProduct(b, *product, fill ? mapping.lookupOrDefault(fill.getInputs()[0]) : Value());
+        } else {
+          emitElementwise(b, linalgOp);
+        }
+        continue;
+      }
+      if (auto parallel = dyn_cast<scf::ParallelOp>(op)) {
+        if (parallel.getNumResults() != 0 || llvm::any_of(parallel.getBody()->without_terminator(), [](Operation &inner) {
+              return needsWorkgroup(&inner);
+            })) {
+          fail("a parallel loop with results or workgroup work in it");
+          return;
+        }
+        if (emitRows(b, parallel)) {
+          workgroupBarrier(b, loc);
+          continue;
+        }
+        auto map = [&](ValueRange values) {
+          return llvm::to_vector(llvm::map_range(values, [&](Value v) { return mapping.lookupOrDefault(v); }));
+        };
+        distribute(b, map(parallel.getLowerBound()), map(parallel.getUpperBound()), map(parallel.getStep()),
+                   [&](OpBuilder &lb, SmallVector<Value> ivs) {
+                     IRMapping inner = mapping;
+                     for (auto [iv, value] : llvm::zip(parallel.getInductionVars(), ivs))
+                       inner.map(iv, value);
+                     for (Operation &inside : parallel.getBody()->without_terminator())
+                       lb.clone(inside, inner);
+                   });
+        workgroupBarrier(b, loc);
+        continue;
+      }
+      if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+        if (needsWorkgroup(forOp)) {
+          // A loop over blocks: the whole workgroup's, its bounds the same
+          // for every thread. The operands its products stage that it
+          // defines (a block of keys at the block's index), loaded a turn
+          // ahead into registers, carried by the loop.
+          Value lower = mapping.lookupOrDefault(forOp.getLowerBound()),
+                upper = mapping.lookupOrDefault(forOp.getUpperBound()), step = mapping.lookupOrDefault(forOp.getStep());
+          SmallVector<Value> ahead = operandsAhead(forOp);
+          loadedAhead += int64_t(ahead.size());
+          SmallVector<Value> inits;
+          for (Value init : forOp.getInitArgs())
+            inits.push_back(mapping.lookupOrDefault(init));
+          SmallVector<int64_t> counts;
+          for (Value operand : ahead) {
+            SmallVector<Value> vectors = vectorsAt(b, forOp, operand, lower);
+            counts.push_back(int64_t(vectors.size()));
+            inits.append(vectors.begin(), vectors.end());
+          }
+          const unsigned carried = forOp.getNumRegionIterArgs();
+          auto loop = scf::ForOp::create(
+              b, loc, lower, upper, step, inits, [&](OpBuilder &lb, Location, Value iv, ValueRange args) {
+                mapping.map(forOp.getInductionVar(), iv);
+                for (auto [arg, value] : llvm::zip(forOp.getRegionIterArgs(), args))
+                  mapping.map(arg, value);
+                // The next turn's vectors (this turn's again at the last).
+                Value next = arith::AddIOp::create(lb, loc, iv, step);
+                Value more = arith::CmpIOp::create(
+                    lb, loc, forOp.getUnsignedCmp() ? arith::CmpIPredicate::ult : arith::CmpIPredicate::slt, next, upper);
+                next = arith::SelectOp::create(lb, loc, more, next, iv);
+                SmallVector<Value> following;
+                unsigned at = carried;
+                for (auto [operand, count] : llvm::zip(ahead, counts)) {
+                  prefetched[operand] = SmallVector<Value>(args.begin() + at, args.begin() + at + count);
+                  at += count;
+                  SmallVector<Value> vectors = vectorsAt(lb, forOp, operand, next);
+                  following.append(vectors.begin(), vectors.end());
+                }
+                emitBlock(lb, *forOp.getBody());
+                for (Value operand : ahead)
+                  prefetched.erase(operand);
+                SmallVector<Value> yielded;
+                for (Value v : forOp.getBody()->getTerminator()->getOperands())
+                  yielded.push_back(mapping.lookupOrDefault(v));
+                yielded.append(following.begin(), following.end());
+                scf::YieldOp::create(lb, loc, yielded);
+              });
+          loop.setUnsignedCmp(forOp.getUnsignedCmp());
+          for (auto [result, value] : llvm::zip(forOp.getResults(), loop.getResults()))
+            mapping.map(result, value);
+          continue;
+        }
+        if (forOp.getNumRegionIterArgs() == 0 && elementsAreIndependent(forOp)) {
+          distribute(b, {mapping.lookupOrDefault(forOp.getLowerBound())}, {mapping.lookupOrDefault(forOp.getUpperBound())},
+                     {mapping.lookupOrDefault(forOp.getStep())}, [&](OpBuilder &lb, SmallVector<Value> ivs) {
+                       IRMapping inner = mapping;
+                       inner.map(forOp.getInductionVar(), ivs[0]);
+                       for (Operation &inside : forOp.getBody()->without_terminator())
+                         lb.clone(inside, inner);
+                     });
+          workgroupBarrier(b, loc);
+          continue;
+        }
+      }
+      if (writesMemory(&op)) {
+        // Anything else writing memory, or holding regions: the first thread's,
+        // then a barrier (its results, if any, can't be shared that way).
+        if (op.getNumResults() != 0) {
+          fail(Twine("an operation with effects and results: ") + op.getName().getStringRef());
+          return;
+        }
+        Value first = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq, tid, constant(b, 0));
+        auto only = scf::IfOp::create(b, loc, TypeRange{}, first, /*withElseRegion=*/false);
+        OpBuilder thenBuilder = OpBuilder::atBlockBegin(only.thenBlock());
+        thenBuilder.clone(op, mapping);
+        workgroupBarrier(b, loc);
+        continue;
+      }
+      // Scalars, loads, loops computing values: every thread's, the same
+      // values.
+      b.clone(op, mapping);
+      // A resident operand staged into its tile as soon as it's defined.
+      for (Value result : op.getResults())
+        if (auto resident = residents.find(result); resident != residents.end()) {
+          auto type = cast<MemRefType>(result.getType());
+          const VectorSource &found = sources.find(result)->second;
+          VectorSource source{found.view, mapping.lookupOrDefault(found.row), mapping.lookupOrDefault(found.column)};
+          loadTile(b, loc, source, constant(b, 0), constant(b, 0), type.getShape()[0], type.getShape()[1],
+                   resident->second.tile, tid, kThreads);
+          workgroupBarrier(b, loc);
+          resident->second.staged = true;
+        }
+    }
+  }
+};
+
+// Whether the iterations of `loop` are independent blocks: everything it
+// writes either memory it allocates itself or a block of an outer buffer, a
+// view whose offset along some dimension is the induction variable times at
+// least the view's size there; its carried values passed through.
+bool independentBlocks(scf::ForOp loop) {
+  auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+  for (auto [arg, yielded] : llvm::zip(loop.getRegionIterArgs(), yield.getOperands()))
+    if (arg != yielded)
+      return false;
+  Value iv = loop.getInductionVar();
+  llvm::DenseMap<Value, bool> memo;
+  auto disjoint = [&](Value target) {
+    Value root = viewRoot(target);
+    if (Operation *def = root.getDefiningOp(); def && isa<memref::AllocOp>(def) && loop->isAncestor(def))
+      return true;
+    auto subview = target.getDefiningOp<memref::SubViewOp>();
+    if (!subview)
+      return false;
+    for (auto [offset, size] : llvm::zip(subview.getMixedOffsets(), subview.getStaticSizes())) {
+      Value v = dyn_cast<Value>(offset);
+      if (!v || ShapedType::isDynamic(size))
+        continue;
+      if (std::optional<int64_t> c = coefficientOf(v, iv, memo); c && std::abs(*c) >= size)
+        return true;
+    }
+    return false;
+  };
+  bool ok = true;
+  loop.getBody()->walk([&](Operation *op) {
+    if (auto store = dyn_cast<memref::StoreOp>(op))
+      ok &= disjoint(store.getMemRef());
+    else if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op))
+      for (Value init : linalgOp.getDpsInits())
+        ok &= disjoint(init);
+    else if (auto call = dyn_cast<func::CallOp>(op); call && call.getCallee() != "cleave_vk_discard")
+      ok = false;
+  });
+  return ok;
+}
+
+bool containsFragmentProduct(Operation *scope) {
+  bool found = false;
+  scope->walk([&](linalg::LinalgOp op) {
+    if (fragmentProductOf(op))
+      found = true;
+  });
+  return found;
+}
+
+} // namespace
+
+static int64_t cleaveBlockPrograms(MlirOperation op) {
+  auto module = dyn_cast<ModuleOp>(unwrap(op));
+  if (const char *v = std::getenv("CLEAVE_GPU_BLOCKS"); !module || (v && std::string(v) == "0"))
+    return 0;
+  constexpr int64_t kWorkgroupBytes = 48 * 1024;
+  // The innermost loops of independent blocks with products in them.
+  SmallVector<scf::ForOp> candidates;
+  module.walk([&](scf::ForOp loop) {
+    if (loop->getParentOfType<gpu::LaunchOp>() || loop->getParentOfType<gpu::GPUModuleOp>() ||
+        !containsFragmentProduct(loop) || !independentBlocks(loop))
+      return;
+    bool inner = false;
+    loop.getBody()->walk([&](scf::ForOp nested) {
+      if (containsFragmentProduct(nested) && independentBlocks(nested))
+        inner = true;
+    });
+    if (!inner)
+      candidates.push_back(loop);
+  });
+  int64_t made = 0;
+  for (scf::ForOp loop : candidates) {
+    auto refuse = [&](const Twine &why) {
+      if (debuggingParallelization())
+        llvm::errs() << "cleave-block-programs: " << loop->getParentOfType<func::FuncOp>().getName() << ": " << why
+                     << '\n';
+    };
+    std::optional<int64_t> lower = getConstantIntValue(loop.getLowerBound()),
+                           upper = getConstantIntValue(loop.getUpperBound()), step = getConstantIntValue(loop.getStep());
+    if (!lower || !upper || !step || *step <= 0) {
+      refuse("its bounds aren't constants");
+      continue;
+    }
+    const int64_t trips = (*upper - *lower + *step - 1) / *step;
+    int64_t bytes = 0;
+    loop.getBody()->walk([&](memref::AllocOp alloc) {
+      MemRefType type = alloc.getType();
+      if (type.hasStaticShape())
+        bytes += type.getNumElements() * ((type.getElementTypeBitWidth() + 7) / 8);
+    });
+    if (bytes > kWorkgroupBytes) {
+      refuse(Twine("its blocks need ") + Twine(bytes) + " bytes of workgroup memory");
+      continue;
+    }
+    OpBuilder builder(loop);
+    Location loc = loop.getLoc();
+    Value one = arith::ConstantIndexOp::create(builder, loc, 1);
+    auto launch = gpu::LaunchOp::create(builder, loc, arith::ConstantIndexOp::create(builder, loc, trips), one, one,
+                                        arith::ConstantIndexOp::create(builder, loc, BlockProgram::kThreads), one, one,
+                                        /*dynamicSharedMemorySize=*/nullptr, /*asyncTokenType=*/nullptr);
+    Block &kernel = launch.getBody().front();
+    if (kernel.empty() || !kernel.back().hasTrait<OpTrait::IsTerminator>()) {
+      OpBuilder atEnd = OpBuilder::atBlockEnd(&kernel);
+      gpu::TerminatorOp::create(atEnd, loc);
+    }
+    BlockProgram program(loc, loop.getBody(), launch);
+    program.top.setInsertionPoint(&kernel, kernel.begin());
+    // The products' operands that can be staged (16-bit views of buffers made
+    // outside the loop), and the two tiles they need, within the workgroup's
+    // memory left.
+    {
+      // Each staged operand by role, or resident (defined in the body, read
+      // by a product in a loop in it).
+      llvm::SetVector<std::pair<Value, int>> uses;
+      loop.getBody()->walk([&](linalg::LinalgOp linalgOp) {
+        std::optional<FragmentProduct> p = fragmentProductOf(linalgOp);
+        if (!p)
+          return;
+        for (auto [role, operand] : llvm::enumerate(std::array<Value, 2>{p->a->get(), p->b->get()})) {
+          if (Operation *def = viewRoot(operand).getDefiningOp(); def && loop->isAncestor(def))
+            continue;
+          std::optional<VectorSource> source = vectorSourceOf(builder, loc, operand);
+          auto type = cast<MemRefType>(operand.getType());
+          if (!source || type.getShape()[1] % 8 != 0)
+            continue;
+          program.sources[operand] = *source;
+          Operation *def = operand.getDefiningOp();
+          bool resident = def && def->getBlock() == loop.getBody() && linalgOp->getBlock() != loop.getBody();
+          uses.insert({operand, resident ? -1 : int(role)});
+        }
+      });
+      // The tiles' bytes, with the residents or without (staged at each
+      // product in their roles' tiles).
+      auto plan = [&](bool withResidents, int64_t largest[2][2]) {
+        int64_t residentBytes = 0;
+        for (auto [operand, role] : uses) {
+          auto shape = cast<MemRefType>(operand.getType()).getShape();
+          if (role < 0 && withResidents) {
+            residentBytes += 16 * shape[0] * (shape[1] / 8 + 1);
+            continue;
+          }
+          if (role < 0)
+            for (OpOperand &use : operand.getUses())
+              if (auto user = dyn_cast<linalg::LinalgOp>(use.getOwner()))
+                if (std::optional<FragmentProduct> p = fragmentProductOf(user))
+                  role = &use == p->a ? 0 : &use == p->b ? 1 : role;
+          if (role < 0)
+            continue;
+          largest[role][0] = std::max(largest[role][0], shape[0]);
+          largest[role][1] = std::max(largest[role][1], shape[1] / 8 + 1);
+        }
+        return residentBytes + 16 * (largest[0][0] * largest[0][1] + largest[1][0] * largest[1][1]);
+      };
+      int64_t largest[2][2] = {{0, 0}, {0, 0}}; // by role: rows, vectors a row
+      bool withResidents = true;
+      int64_t tileBytes = plan(true, largest);
+      if (bytes + tileBytes > kWorkgroupBytes) {
+        withResidents = false;
+        largest[0][0] = largest[0][1] = largest[1][0] = largest[1][1] = 0;
+        tileBytes = plan(false, largest);
+      }
+      if (!program.sources.empty() && bytes + tileBytes <= kWorkgroupBytes) {
+        Attribute workgroup = spirv::StorageClassAttr::get(launch.getContext(), spirv::StorageClass::Workgroup);
+        auto vectors = VectorType::get({4}, IntegerType::get(launch.getContext(), 32));
+        auto tile = [&](int64_t rows, int64_t rowLength) -> Value {
+          return memref::AllocOp::create(
+              program.top, loc, MemRefType::get({rows, rowLength}, vectors, MemRefLayoutAttrInterface{}, workgroup));
+        };
+        for (int role = 0; role < 2; ++role)
+          if (largest[role][0] > 0) {
+            program.tiles[role] = tile(largest[role][0], largest[role][1]);
+            program.tileRowLength[role] = largest[role][1];
+          }
+        if (withResidents)
+          for (auto [operand, role] : uses)
+            if (role < 0) {
+              auto shape = cast<MemRefType>(operand.getType()).getShape();
+              program.residents[operand] = BlockProgram::Resident{tile(shape[0], shape[1] / 8 + 1), shape[1] / 8 + 1};
+            }
+        bytes += tileBytes;
+      }
+    }
+    OpBuilder kb(&kernel, std::prev(kernel.end()));
+    program.tid = launch.getThreadIds().x;
+    program.subgroup = arith::DivUIOp::create(kb, loc, program.tid, program.constant(kb, kSubgroup));
+    // The iteration: the workgroup's.
+    Value iteration = arith::AddIOp::create(
+        kb, loc, program.constant(kb, *lower), arith::MulIOp::create(kb, loc, launch.getBlockIds().x, program.constant(kb, *step)));
+    Type ivType = loop.getInductionVar().getType();
+    program.mapping.map(loop.getInductionVar(),
+                        ivType.isIndex() ? iteration : arith::IndexCastOp::create(kb, loc, ivType, iteration).getResult());
+    for (auto [arg, init] : llvm::zip(loop.getRegionIterArgs(), loop.getInitArgs()))
+      program.mapping.map(arg, init);
+    // What only takes the program's buffers' addresses for the runtime
+    // (`cleave_vk_discard` and its arguments): left out.
+    SmallVector<Operation *> work;
+    loop.getBody()->walk([&](func::CallOp call) {
+      if (call.getCallee() == "cleave_vk_discard")
+        work.push_back(call);
+    });
+    while (!work.empty()) {
+      Operation *op = work.pop_back_val();
+      if (!program.dead.insert(op).second)
+        continue;
+      for (Value operand : op->getOperands())
+        if (Operation *def = operand.getDefiningOp(); def && loop->isAncestor(def) && !isa<memref::AllocOp>(def) &&
+                                                       llvm::all_of(def->getUsers(), [&](Operation *user) {
+                                                         return program.dead.contains(user) ||
+                                                                llvm::is_contained(work, user);
+                                                       }))
+          work.push_back(def);
+    }
+    program.emitBlock(kb, *loop.getBody());
+    if (debuggingParallelization() && failed(mlir::verify(launch))) {
+      llvm::errs() << "cleave-block-programs: an invalid kernel\n";
+      launch->print(llvm::errs(), OpPrintingFlags().useLocalScope());
+    }
+    if (!program.failure.empty()) {
+      refuse(program.failure);
+      launch->erase();
+      continue;
+    }
+    if (debuggingParallelization())
+      llvm::errs() << "cleave-block-programs: " << loop->getParentOfType<func::FuncOp>().getName() << ": " << trips
+                   << " blocks, " << bytes << " bytes of workgroup memory each, " << program.residents.size()
+                   << " resident operands, " << program.sources.size() << " staged, " << program.loadedAhead
+                   << " loaded ahead\n";
+    for (auto [result, init] : llvm::zip(loop.getResults(), loop.getInitArgs()))
+      result.replaceAllUsesWith(init);
+    loop->erase();
+    ++made;
+  }
+  return made;
+}
+CLEAVE_COUNTING_PASS(BlockProgramsPass, "cleave-block-programs",
+                     "loops of independent blocks with products made a kernel of a workgroup per block",
+                     cleaveBlockPrograms)
 
 static int64_t cleaveTileMatmulsForGpu(MlirOperation op) {
   auto module = dyn_cast<ModuleOp>(unwrap(op));
@@ -3586,7 +5814,8 @@ static int64_t cleaveTileMatmulsForGpu(MlirOperation op) {
       continue;
     SmallVector<int64_t> ranges = product.getStaticLoopRanges();
     int64_t m = ranges[dimM], n = ranges[dimN], k = ranges[dimK];
-    if (tileProductOnFragments(product, a, b, dimM, dimN, dimK, m, n, k, module)) {
+    if (std::optional<FragmentProduct> fragments = fragmentProductOf(product);
+        fragments && tileProductOnFragments(*fragments, module)) {
       ++tiled;
       continue;
     }
@@ -4939,9 +7168,58 @@ static int64_t cleaveLowerGpuLaunches(MlirOperation op) {
         continue;
       }
       SmallVector<uint32_t> words;
-      if (failed(spirv::serialize(spirvModule, words))) {
+      // `CLEAVE_VK_DEBUG_INFO=1` (at compile time): each instruction's source line (`OpLine`),
+      // what a shader profiler maps its samples to (Nsight Graphics). The serializer takes plain
+      // file locations only: each op's location made the innermost one it holds (a call site's
+      // callee, a fused location's first file location).
+      spirv::SerializationOptions serialization;
+      if (const char *v = std::getenv("CLEAVE_VK_DEBUG_INFO"); v && std::string(v) == "1") {
+        serialization.emitDebugInfo = true;
+        std::function<std::optional<Location>(Location)> plain = [&](Location loc) -> std::optional<Location> {
+          if (isa<FileLineColLoc>(loc))
+            return loc;
+          if (auto call = dyn_cast<CallSiteLoc>(loc))
+            return plain(call.getCallee());
+          if (auto fused = dyn_cast<FusedLoc>(loc))
+            for (Location inner : fused.getLocations())
+              if (std::optional<Location> found = plain(inner))
+                return found;
+          if (auto named = dyn_cast<NameLoc>(loc))
+            return plain(named.getChildLoc());
+          return std::nullopt;
+        };
+        spirvModule.walk([&](Operation *op) {
+          if (std::optional<Location> found = plain(op->getLoc()))
+            op->setLoc(*found);
+        });
+        // The debug information is `NonSemantic.Shader.DebugInfo`'s, which the module declares.
+        if (std::optional<spirv::VerCapExtAttr> triple = spirvModule.getVceTriple()) {
+          SmallVector<spirv::Extension> extensions(triple->getExtensions());
+          if (!llvm::is_contained(extensions, spirv::Extension::SPV_KHR_non_semantic_info))
+            extensions.push_back(spirv::Extension::SPV_KHR_non_semantic_info);
+          SmallVector<spirv::Capability> capabilities(triple->getCapabilities());
+          spirvModule.setVceTripleAttr(
+              spirv::VerCapExtAttr::get(triple->getVersion(), capabilities, extensions, spirvModule.getContext()));
+        }
+      }
+      if (failed(spirv::serialize(spirvModule, words, serialization))) {
         launch.emitError("the kernel's SPIR-V module doesn't serialize");
         continue;
+      }
+      // `CLEAVE_DUMP_SPIRV=<directory>` (at compile time): each kernel's binary written there,
+      // `<function>_<kernel>.spv`, for `spirv-dis` and other tools.
+      if (const char *directory = std::getenv("CLEAVE_DUMP_SPIRV")) {
+        auto func = launch->getParentOfType<func::FuncOp>();
+        std::string name = ((func ? func.getName().str() : std::string("kernel")) + "_" + kernelModule.str());
+        for (char &c : name)
+          if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_')
+            c = '_';
+        if (name.size() > 120)
+          name = name.substr(name.size() - 120);
+        std::error_code error;
+        llvm::raw_fd_ostream out((Twine(directory) + "/" + name + ".spv").str(), error);
+        if (!error)
+          out.write(reinterpret_cast<const char *>(words.data()), words.size() * sizeof(uint32_t));
       }
       SmallVector<APInt> wordValues;
       for (uint32_t word : words)
@@ -5251,7 +7529,17 @@ struct LowerFragmentCarriersPass : PassWrapper<LowerFragmentCarriersPass, Operat
         return spirv::ConstantOp::create(at, loc, at.getI32Type(), at.getI32IntegerAttr(int32_t(strideAttr.getInt())));
       };
       if (auto construct = dyn_cast<spirv::CompositeConstructOp>(carrier)) {
-        auto load = construct.getConstituents()[0].getDefiningOp<spirv::LoadOp>();
+        // The element's load, through the words a vector tile's carrier
+        // reads it as (`loadFragmentFromVectors`).
+        SmallVector<Operation *> chain;
+        Value at = construct.getConstituents()[0];
+        while (Operation *def = at.getDefiningOp()) {
+          if (!isa<spirv::CompositeExtractOp, spirv::BitcastOp>(def))
+            break;
+          chain.push_back(def);
+          at = def->getOperand(0);
+        }
+        auto load = at.getDefiningOp<spirv::LoadOp>();
         if (!load) {
           carrier->emitError("a cooperative matrix fragment's load lost in the conversion to SPIR-V");
           return signalPassFailure();
@@ -5260,6 +7548,9 @@ struct LowerFragmentCarriersPass : PassWrapper<LowerFragmentCarriersPass, Operat
                                                                    strideAt(builder), layout);
         construct.replaceAllUsesWith(fragment);
         construct.erase();
+        for (Operation *op : chain)
+          if (op->use_empty())
+            op->erase();
         if (load->use_empty())
           load.erase();
       } else {
@@ -5414,6 +7705,8 @@ void registerGpuPasses() {
   PassRegistration<LowerFragmentCarriersPass>();
   PassRegistration<SpirvTargetEnvPass>();
   PassRegistration<SpirvRequirementsPass>();
+  PassRegistration<FuseRowPipelinesPass>();
+  PassRegistration<BlockProgramsPass>();
   PassRegistration<FoldLoopsIntoGridsPass>();
   PassRegistration<LowerGpuLaunchesPass>();
 }

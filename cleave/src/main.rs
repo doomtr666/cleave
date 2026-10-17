@@ -737,7 +737,7 @@ fn real_main() -> ExitCode {
             }
         };
         // The pipeline every test running a program uses too (`cleave::run`).
-        match cleave::run::run_main(&program, &registry, None, &options, &[]) {
+        match cleave::run::run_main(&program, &registry, Some(&sources), &options, &[]) {
             Ok(result) => {
                 println!("main returned: {result}");
                 // What the Vulkan runtime moved (`--backend vulkan`).

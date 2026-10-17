@@ -83,6 +83,9 @@ using namespace mlir;
 // The base a memref is a view of (`shim.cpp`).
 Value viewRoot(Value v);
 
+// Counted `scf.while`s under `root` made `scf.for`s (`shim.cpp`).
+void upliftCountedWhiles(Operation *root);
+
 // Registers the Vulkan backend's passes (`gpu.cpp`).
 void registerGpuPasses();
 

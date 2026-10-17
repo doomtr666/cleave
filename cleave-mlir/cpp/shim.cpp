@@ -1566,6 +1566,111 @@ static int64_t cleaveReuseDyingInputs(MlirOperation op) {
   return reused;
 }
 
+// Drops the copies whose source is an allocation nothing writes: they copy
+// undefined values, which the destination may as well keep (a tuple's field
+// a function returns uninitialized, `CausalAttention`'s f32 statistics:
+// copied into the result's buffer, a kernel on the GPU, a `memcpy` on the
+// CPU). The allocation's uses: the copies reading it, views of it,
+// metadata queries, its deallocation. After bufferization. Returns how many
+// copies went.
+static int64_t cleaveDropUndefinedCopies(MlirOperation op) {
+  SmallVector<Operation *> undefined;
+  unwrap(op)->walk([&](memref::AllocOp alloc) {
+    SmallVector<Operation *> copies;
+    SmallVector<Value> pending{alloc.getResult()};
+    while (!pending.empty()) {
+      Value v = pending.pop_back_val();
+      for (OpOperand &use : v.getUses()) {
+        Operation *user = use.getOwner();
+        if (isa<memref::DeallocOp, memref::ExtractStridedMetadataOp, memref::DimOp>(user))
+          continue;
+        if (isa<ViewLikeOpInterface, memref::CastOp>(user)) {
+          for (Value result : user->getResults())
+            pending.push_back(result);
+          continue;
+        }
+        if (auto copy = dyn_cast<memref::CopyOp>(user); copy && use.get() == copy.getSource()) {
+          copies.push_back(copy);
+          continue;
+        }
+        if (auto copy = dyn_cast<linalg::CopyOp>(user);
+            copy && copy.hasPureBufferSemantics() && use.get() == copy.getInputs()[0]) {
+          copies.push_back(copy);
+          continue;
+        }
+        return; // written, or read otherwise
+      }
+    }
+    undefined.append(copies.begin(), copies.end());
+  });
+  for (Operation *copy : undefined)
+    copy->erase();
+  return int64_t(undefined.size());
+}
+
+// `scf::upliftWhileToForLoop`, the induction variable's value on leaving
+// the loop corrected: upstream (LLVM 22) gives the last turn's,
+// `lb + (ceildiv(ub - lb, step) - 1) * step`, where the `while`'s result is
+// the value its test failed on, `lb + max(ceildiv(ub - lb, step), 0) * step`
+// (`while acc < n { acc = acc + 1 }; acc` gave `n - 1`).
+namespace {
+struct UpliftCountedWhile : OpRewritePattern<scf::WhileOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(scf::WhileOp loop, PatternRewriter &rewriter) const override {
+    // The uses of the result the induction variable leaves the loop as.
+    SmallVector<OpOperand *> exitUses;
+    Value lower, upper;
+    Block *before = loop.getBeforeBody();
+    if (auto cmp = before->empty() ? arith::CmpIOp() : dyn_cast<arith::CmpIOp>(before->front())) {
+      bool less = cmp.getPredicate() == arith::CmpIPredicate::slt;
+      bool greater = cmp.getPredicate() == arith::CmpIPredicate::sgt;
+      auto counter = dyn_cast<BlockArgument>(less ? cmp.getLhs() : cmp.getRhs());
+      if ((less || greater) && counter && counter.getOwner() == before) {
+        lower = loop.getInits()[counter.getArgNumber()];
+        upper = less ? cmp.getRhs() : cmp.getLhs();
+        for (auto [i, forwarded] : llvm::enumerate(loop.getConditionOp().getArgs()))
+          if (forwarded == counter)
+            for (OpOperand &use : loop.getResult(i).getUses())
+              exitUses.push_back(&use);
+      }
+    }
+    FailureOr<scf::ForOp> uplifted = scf::upliftWhileToForLoop(rewriter, loop);
+    if (failed(uplifted))
+      return failure();
+    if (!exitUses.empty()) {
+      rewriter.setInsertionPointAfter(*uplifted);
+      Location loc = uplifted->getLoc();
+      Value step = uplifted->getStep();
+      Type type = step.getType();
+      auto constant = [&](int64_t v) -> Value {
+        return isa<IndexType>(type) ? Value(arith::ConstantIndexOp::create(rewriter, loc, v))
+                                    : Value(arith::ConstantIntOp::create(rewriter, loc, type, v));
+      };
+      Value span = arith::MaxSIOp::create(rewriter, loc, arith::SubIOp::create(rewriter, loc, upper, lower), constant(0));
+      Value trips = arith::DivSIOp::create(
+          rewriter, loc, arith::AddIOp::create(rewriter, loc, span, arith::SubIOp::create(rewriter, loc, step, constant(1))),
+          step);
+      Value exit = arith::AddIOp::create(rewriter, loc, lower, arith::MulIOp::create(rewriter, loc, trips, step));
+      rewriter.replaceAllUsesWith(exitUses.front()->get(), exit);
+    }
+    return success();
+  }
+};
+} // namespace
+
+void upliftCountedWhiles(Operation *root) {
+  RewritePatternSet patterns(root->getContext());
+  patterns.add<UpliftCountedWhile>(root->getContext());
+  SmallVector<Operation *> whiles;
+  root->walk([&](scf::WhileOp loop) {
+    if (!loop->getParentOfType<gpu::GPUModuleOp>())
+      whiles.push_back(loop);
+  });
+  GreedyRewriteConfig config;
+  config.setStrictness(GreedyRewriteStrictness::ExistingAndNewOps);
+  (void)applyOpPatternsGreedily(whiles, FrozenRewritePatternSet(std::move(patterns)), config);
+}
+
 // Removes the loop-carried values a loop yields back unchanged (`scf.for`'s
 // own canonicalization, its loops alone): the loop's result is then the
 // value it was given. Before `--ownership-based-buffer-deallocation`. A tile
@@ -1577,6 +1682,12 @@ static int64_t cleaveReuseDyingInputs(MlirOperation op) {
 // gradient: 273 buffers in one deallocation). Returns how many loop-carried
 // values went.
 static int64_t cleaveFoldPassthroughIterArgs(MlirOperation op) {
+  // Counted `scf.while`s (the front end's loops carrying values) made
+  // `scf.for`s first: a tensor written element by element in a loop,
+  // bufferized in place, is carried as its buffer, yielded back unchanged,
+  // which the deallocation would otherwise see as a buffer of unknown origin
+  // (a run-time alias check), and the loop as sequential.
+  upliftCountedWhiles(unwrap(op));
   SmallVector<Operation *> loops;
   int64_t before = 0;
   unwrap(op)->walk([&](scf::ForOp loop) {
@@ -2143,6 +2254,8 @@ CLEAVE_COUNTING_PASS(ForwardReadOnlyArgumentsPass,
                      "cleave-forward-read-only-arguments",
                      "layout-only copies passed to read-only parameters, removed",
                      cleaveForwardReadOnlyArguments)
+CLEAVE_COUNTING_PASS(DropUndefinedCopiesPass, "cleave-drop-undefined-copies",
+                     "copies from an allocation nothing writes, dropped", cleaveDropUndefinedCopies)
 CLEAVE_COUNTING_PASS(FoldPassthroughIterArgsPass,
                      "cleave-fold-passthrough-iter-args",
                      "loop-carried values yielded back unchanged, removed",
@@ -3008,6 +3121,7 @@ extern "C" void cleaveRegisterPasses() {
     PassRegistration<DropZeroTripWhilesPass>();
     registerGpuPasses();
     PassRegistration<FoldPassthroughIterArgsPass>();
+    PassRegistration<DropUndefinedCopiesPass>();
     PassRegistration<LowerAdoptionsPass>();
     PassRegistration<DeallocAtLastUsePass>();
     PassRegistration<ReleaseAfterFieldUsesPass>();

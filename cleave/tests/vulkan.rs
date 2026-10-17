@@ -428,10 +428,12 @@ fn tiled_products_match_the_cpu() {
 /// through a cast, are discarded rather than uploaded, and so are the three
 /// results, fresh heap allocations made memrefs in the function
 /// (`isFreshDescriptor`). Up: the four inputs, 256 KiB each, and scalar
-/// kernel arguments; one submit per result read. Its loop over heads, a
-/// `scf.while` for the deallocation's bookkeeping, is folded into its
-/// kernels (`cleave-fold-loops-into-grids`), the bookkeeping left in a host
-/// loop: 10 dispatches.
+/// kernel arguments; one submit per result read. Its loop over heads, made
+/// an `scf.for` before the deallocation (`upliftCountedWhiles`), is folded
+/// into its kernels (`cleave-fold-loops-into-grids`), the bookkeeping left in
+/// a host loop: 10 dispatches, after the forward's 4 (`causal_attention_stats`,
+/// whose output the backward takes; its f32 statistics, none, not copied:
+/// `cleave-drop-undefined-copies`).
 #[test]
 fn attention_gradients_stay_on_the_device_across_heads() {
     let src = "
@@ -443,7 +445,8 @@ fn attention_gradients_stay_on_the_device_across_heads() {
             let k: Tensor<f32, 256, 256> = Init::he();
             let v: Tensor<f32, 256, 256> = Init::he();
             let u: Tensor<f32, 256, 256> = Init::he();
-            let (a, b, c) = CausalAttention::causal_attention_backward(q, k, v, AttentionShape::<256, 64>(), u);
+            let (o, stats) = CausalAttention::causal_attention_stats(q, k, v, AttentionShape::<256, 64>());
+            let (a, b, c) = CausalAttention::causal_attention_backward(q, k, v, AttentionShape::<256, 64>(), u, o, stats);
             println(a[3, 5] + b[7, 9] + c[1, 2]);
             0
         }
@@ -454,7 +457,7 @@ fn attention_gradients_stay_on_the_device_across_heads() {
 stderr: {stderr}", device.name);
         assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
         assert!(
-            stderr.contains(": 10 dispatches, 1048672 bytes uploaded, 786432 bytes downloaded, 3 submits"),
+            stderr.contains(": 14 dispatches, 1048620 bytes uploaded, 786432 bytes downloaded, 3 submits"),
             "{}: {stderr}",
             device.name
         );
@@ -724,8 +727,8 @@ fn causal_attention_skips_the_masked_half() {
             let k: Tensor<f32, 1024, 128> = Init::he();
             let v: Tensor<f32, 1024, 128> = Init::he();
             let u: Tensor<f32, 1024, 128> = Init::he();
-            let o = causal_attention(q, k, v, AttentionShape::<1024, 64>());
-            let (a, b, c) = CausalAttention::causal_attention_backward(q, k, v, AttentionShape::<1024, 64>(), u);
+            let (o, stats) = CausalAttention::causal_attention_stats(q, k, v, AttentionShape::<1024, 64>());
+            let (a, b, c) = CausalAttention::causal_attention_backward(q, k, v, AttentionShape::<1024, 64>(), u, o, stats);
             for r in [0, 5, 63, 64, 517, 1000, 1023] {
                 for col in [0, 33, 64, 127] {
                     println(o[r, col]);
@@ -1414,6 +1417,233 @@ fn bf16_tensor_products_run_on_tensor_cores() {
         ] {
             assert!(stderr.contains(kernel), "{}: no {kernel} in {stderr}", device.name);
         }
+        assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
+    }
+}
+
+// The bf16 attention's scores, softmax and weighted values fused into one
+// kernel (`cleave-fuse-row-pipelines`): whole rows of the scores and weights
+// in the workgroup's memory when they fit (L = 256), else blocks of 64
+// columns, the scores recomputed for each pass (L = 1024). The CPU's
+// values to the bit: the same arithmetic, only where the intermediates live
+// changes.
+fn fused_attention_matches_the_cpu(context: usize, rows: usize, fusion: Option<&str>, expected_mode: &str) {
+    let src = format!(
+        "
+        use io;
+        use linalg;
+        use convert;
+        use nn;
+        fn main() -> i32 {{
+            rand_seed(1);
+            let q: Tensor<f32, {rows}, 128> = Init::he();
+            let k: Tensor<f32, {rows}, 128> = Init::he();
+            let v: Tensor<f32, {rows}, 128> = Init::he();
+            let qb: Tensor<bf16, {rows}, 128> = q.to();
+            let kb: Tensor<bf16, {rows}, 128> = k.to();
+            let vb: Tensor<bf16, {rows}, 128> = v.to();
+            let a: Tensor<f32, {rows}, 128> = exact_causal_attention(qb, kb, vb, AttentionShape::<{context}, 64>()).to();
+            for r in [0, 1, 17, {last_of_first}, {first_of_second}, {last}] {{
+                let mut s: f32 = 0.0;
+                for j in 0..128 {{ s = s + a[r, j] * a[r, j]; }};
+                println(s);
+            }};
+            0
+        }}
+    ",
+        last_of_first = context - 1,
+        first_of_second = context % rows,
+        last = rows - 1
+    );
+    let numbers = |out: &str| -> Vec<f64> { out.lines().filter_map(|l| l.trim().parse().ok()).collect() };
+    let name = format!("fused_attention_{context}");
+    let expected = numbers(&run_cpu(&name, &src));
+    assert_eq!(expected.len(), 6, "{expected:?}");
+    for (index, device) in devices().iter().enumerate() {
+        if !device.cooperative_matrices.iter().any(|s| s.a == "bf16" && s.c == "f32") {
+            eprintln!("skipped on {}: no bf16 cooperative matrices", device.name);
+            continue;
+        }
+        let dir = std::env::temp_dir().join(format!("cleave-vulkan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join(format!("{name}.cleave"));
+        std::fs::write(&source, &src).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cleave"));
+        command
+            .args(["--backend", "vulkan", "--no-openmp", "--no-debug-info", "--run"])
+            .arg(&source)
+            .env("CLEAVE_VK_DEVICE", index.to_string())
+            .env("CLEAVE_VK_VALIDATION", "1")
+            .env("CLEAVE_DEBUG_PARALLELIZE", "1");
+        if let Some(fusion) = fusion {
+            command.env("CLEAVE_GPU_FUSE", fusion);
+        }
+        let output = command.output().expect("cannot run cleave");
+        let (stdout, stderr) =
+            (String::from_utf8_lossy(&output.stdout).into_owned(), String::from_utf8_lossy(&output.stderr).into_owned());
+        assert_eq!(numbers(&stdout), expected, "{}: {stdout}{stderr}", device.name);
+        assert!(
+            stderr.contains(&format!("1 producers, a row loop, 1 consumers, {context} x {context}, {expected_mode}")),
+            "{}: not fused ({expected_mode}): {stderr}",
+            device.name
+        );
+        assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
+    }
+}
+
+#[test]
+fn attention_fuses_into_one_kernel_with_whole_rows() {
+    fused_attention_matches_the_cpu(256, 512, None, "whole rows");
+}
+
+#[test]
+fn attention_fuses_into_one_kernel_in_blocks() {
+    fused_attention_matches_the_cpu(1024, 1024, None, "blocks of 64 columns");
+}
+
+// `online_causal_attention`'s loop over blocks of 32 rows made one kernel, a
+// workgroup per block (`cleave-block-programs`): its products on fragments,
+// its rows a few threads each, the block of queries staged once for every
+// block of keys; the CPU's values. Heads of 16 columns: tiles of fewer
+// vectors than threads, products of fewer fragments than subgroups.
+fn online_attention_matches_the_cpu(head: usize) {
+    let src = format!(
+        "
+        use io;
+        use linalg;
+        use convert;
+        use nn;
+        fn main() -> i32 {{
+            rand_seed(1);
+            let q: Tensor<f32, 512, 128> = Init::he();
+            let k: Tensor<f32, 512, 128> = Init::he();
+            let v: Tensor<f32, 512, 128> = Init::he();
+            let qb: Tensor<bf16, 512, 128> = q.to();
+            let kb: Tensor<bf16, 512, 128> = k.to();
+            let vb: Tensor<bf16, 512, 128> = v.to();
+            let a: Tensor<f32, 512, 128> = online_causal_attention(qb, kb, vb, AttentionShape::<256, {head}>()).to();
+            for r in [0, 1, 31, 32, 255, 256, 511] {{
+                let mut s: f32 = 0.0;
+                for j in 0..128 {{ s = s + a[r, j] * a[r, j]; }};
+                println(s);
+            }};
+            0
+        }}
+    "
+    );
+    let numbers = |out: &str| -> Vec<f64> { out.lines().filter_map(|l| l.trim().parse().ok()).collect() };
+    let name = format!("online_attention_{head}");
+    let expected = numbers(&run_cpu(&name, &src));
+    assert_eq!(expected.len(), 7, "{expected:?}");
+    for (index, device) in devices().iter().enumerate() {
+        if !device.cooperative_matrices.iter().any(|s| s.a == "bf16" && s.c == "f32") {
+            eprintln!("skipped on {}: no bf16 cooperative matrices", device.name);
+            continue;
+        }
+        let dir = std::env::temp_dir().join(format!("cleave-vulkan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join(format!("{name}.cleave"));
+        std::fs::write(&source, &src).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_cleave"))
+            .args(["--backend", "vulkan", "--no-openmp", "--no-debug-info", "--run"])
+            .arg(&source)
+            .env("CLEAVE_VK_DEVICE", index.to_string())
+            .env("CLEAVE_VK_VALIDATION", "1")
+            .env("CLEAVE_DEBUG_PARALLELIZE", "1")
+            .output()
+            .expect("cannot run cleave");
+        let (stdout, stderr) =
+            (String::from_utf8_lossy(&output.stdout).into_owned(), String::from_utf8_lossy(&output.stderr).into_owned());
+        assert_eq!(numbers(&stdout), expected, "{}: {stdout}{stderr}", device.name);
+        assert!(
+            stderr.contains("cleave-block-programs: main: 8 blocks,") && stderr.contains("1 resident operands"),
+            "{}: not a block program: {stderr}",
+            device.name
+        );
+        assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
+    }
+}
+
+#[test]
+fn online_attention_runs_a_workgroup_per_block_of_rows() {
+    online_attention_matches_the_cpu(64);
+}
+
+#[test]
+fn online_attention_with_narrow_heads_runs_a_workgroup_per_block_of_rows() {
+    online_attention_matches_the_cpu(16);
+}
+
+// The gradient of bf16 causal attention: the forward (`causal_attention_stats`,
+// its output and each row's log-sum-exp) computed once, read by the rule's
+// backward (`online_causal_attention_backward`), whose loops over blocks of
+// keys and of queries are block programs; the CPU's values.
+#[test]
+fn bf16_attention_gradient_reads_its_forwards_statistics() {
+    let src = "
+        use io;
+        use linalg;
+        use convert;
+        use nn;
+        fn loss(x: Tensor<bf16, 512, 256>, w: Tensor<bf16, 512, 256>) -> f32 {
+            let a: Tensor<f32, 512, 256> = causal_attention(x, w, x, AttentionShape::<256, 64>()).to();
+            sum(a * a)
+        }
+        dloss = grad(loss, x);
+        fn main() -> i32 {
+            rand_seed(1);
+            let x: Tensor<f32, 512, 256> = Init::he();
+            let w: Tensor<f32, 512, 256> = Init::he();
+            let xb: Tensor<bf16, 512, 256> = x.to();
+            let wb: Tensor<bf16, 512, 256> = w.to();
+            let g: Tensor<f32, 512, 256> = dloss(xb, wb).to();
+            for r in [0, 1, 100, 300, 511] {
+                let mut s: f32 = 0.0;
+                for j in 0..256 { s = s + g[r, j] * g[r, j]; };
+                println(s);
+            };
+            0
+        }
+    ";
+    let numbers = |out: &str| -> Vec<f64> { out.lines().filter_map(|l| l.trim().parse().ok()).collect() };
+    let expected = numbers(&run_cpu("attention_gradient", src));
+    assert_eq!(expected.len(), 5, "{expected:?}");
+    for (index, device) in devices().iter().enumerate() {
+        if !device.cooperative_matrices.iter().any(|s| s.a == "bf16" && s.c == "f32") {
+            eprintln!("skipped on {}: no bf16 cooperative matrices", device.name);
+            continue;
+        }
+        let dir = std::env::temp_dir().join(format!("cleave-vulkan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("attention_gradient.cleave");
+        std::fs::write(&source, src).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_cleave"))
+            .args(["--backend", "vulkan", "--no-openmp", "--no-debug-info", "--run"])
+            .arg(&source)
+            .env("CLEAVE_VK_DEVICE", index.to_string())
+            .env("CLEAVE_VK_VALIDATION", "1")
+            .env("CLEAVE_DEBUG_PARALLELIZE", "1")
+            .output()
+            .expect("cannot run cleave");
+        let (stdout, stderr) =
+            (String::from_utf8_lossy(&output.stdout).into_owned(), String::from_utf8_lossy(&output.stderr).into_owned());
+        let got = numbers(&stdout);
+        assert_eq!(got.len(), expected.len(), "{}: {stdout}{stderr}", device.name);
+        for (g, e) in got.iter().zip(&expected) {
+            assert!((g - e).abs() <= 1e-4 * e.abs(), "{}: {got:?} on the GPU, {expected:?} on the CPU", device.name);
+        }
+        assert_eq!(
+            stderr.matches("cleave-block-programs: CausalAttention::causal_attention_backward").count(),
+            2,
+            "{}: {stderr}",
+            device.name
+        );
+        assert_eq!(
+            stderr.matches("cleave-block-programs: CausalAttention::causal_attention_stats").count(),
+            1,
+            "{}: {stderr}",
+            device.name
+        );
         assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
     }
 }

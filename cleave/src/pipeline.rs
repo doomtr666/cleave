@@ -845,7 +845,7 @@ pub fn lower_to_llvm<'c>(
         "tensors",
         &format!(
             "builtin.module(cleave-limit-inlining{{threshold={threshold}}},{inline}\
-             cleave-drop-zero-trip-whiles,convert-elementwise-to-linalg,linalg-fuse-elementwise-ops,\
+             cleave-drop-zero-trip-whiles,sroa,mem2reg,convert-elementwise-to-linalg,linalg-fuse-elementwise-ops,\
              {cpu_matmuls}cleave-reuse-dying-inputs)",
             threshold = options.inline_threshold,
             inline = if options.inline { "inline," } else { "" },
@@ -861,7 +861,7 @@ pub fn lower_to_llvm<'c>(
          cleave-elide-block-copies,scf-forall-to-parallel,cleave-forward-dead-source-copies,\
          buffer-results-to-out-params{hoist-static-allocs=true},\
          cleave-forward-out-param-copies,cleave-forward-copies-to-destinations,\
-         cleave-forward-read-only-arguments)",
+         cleave-forward-read-only-arguments,cleave-drop-undefined-copies)",
     )?;
     dump(module, "CLEAVE_DUMP_POST_OUT_PARAMS");
 
@@ -893,8 +893,17 @@ pub fn lower_to_llvm<'c>(
         // that each side sees the other's writes (`cleave-sync-host-accesses`).
         run_stage(
             module,
+            "GPU loops",
+            "builtin.module(cleave-lower-gpu-gemms,cleave-blas-to-linalg,cleave-parallelize-loops,cleave-gpu-copies,\
+             cleave-parallel-iterators-first,cleave-mark-full-overwrites)",
+        )?;
+        // The loops each kernel will come from, the parallel ones made
+        // `scf.parallel`, the products still `linalg` ops: what fusion sees.
+        dump(module, "CLEAVE_DUMP_GPU_LOOPS");
+        run_stage(
+            module,
             "GPU kernels",
-            "builtin.module(cleave-lower-gpu-gemms,cleave-blas-to-linalg,cleave-parallelize-loops,cleave-gpu-copies,cleave-parallel-iterators-first,cleave-mark-full-overwrites,cleave-tile-matmuls-for-gpu,\
+            "builtin.module(cleave-block-programs,cleave-fuse-row-pipelines,cleave-tile-matmuls-for-gpu,\
              func.func(convert-linalg-to-parallel-loops),cleave-cooperative-rows,\
              cleave-tile-parallel-loops-for-gpu{threads=64},func.func(gpu-map-parallel-loops,\
              convert-parallel-loops-to-gpu,canonicalize),cleave-sink-views-into-launches,\

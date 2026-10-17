@@ -731,19 +731,25 @@ fn rope_at<T: Float, const N: i32, const D: i32, const L: i32, const DH: i32>(x:
 // seeing any position after it (`-inf` scores, zero weights). The result has
 // the layout of `q`.
 //
-// Its gradient is declared as a whole, in one pass per block that recomputes
-// the attention weights `P` once (rather than storing them from the forward
-// pass): `dV = Pᵀ dO`, `dP = dO Vᵀ`, `dS = P * (dP - rowsum(dP * P)) /
-// sqrt(DH)`, `dQ = dS K`, `dK = dSᵀ Q`. The three gradients come back as one
-// tuple, read three times by the rule: one call (one e-class), computed once.
-// The shape isn't differentiable (`_`).
-algebra CausalAttention<X, S> {
+// Its gradient is declared as a whole, recomputing the attention weights `P`
+// (rather than storing them from the forward pass): `dV = Pᵀ dO`,
+// `dP = dO Vᵀ`, `dS = P * (dP - rowsum(dP * P)) / sqrt(DH)`, `dQ = dS K`,
+// `dK = dSᵀ Q`. It reads the forward's output `o` and statistics `R` (an
+// impl's choice: each row's log-sum-exp by head for bf16), which the forward
+// computes with it: the differentiated operation is `causal_attention_stats`,
+// `causal_attention` its output (`[0]`, inlined), and the rule's own call to
+// it the forward's (one e-class, computed once). Its upstream adjoint is a
+// pair; the statistics' part is never used (`u[0]` only). The three
+// gradients come back as one tuple, read three times by the rule: one call,
+// computed once. The shape isn't differentiable (`_`).
+algebra CausalAttention<X, S, R> {
     fn causal_attention(q: X, k: X, v: X, shape: S) -> X;
-    fn causal_attention_backward(q: X, k: X, v: X, shape: S, u: X) -> (X, X, X);
-    adjoint causal_attention(q, k, v, shape), u: (
-        causal_attention_backward(q, k, v, shape, u)[0],
-        causal_attention_backward(q, k, v, shape, u)[1],
-        causal_attention_backward(q, k, v, shape, u)[2],
+    fn causal_attention_stats(q: X, k: X, v: X, shape: S) -> (X, R);
+    fn causal_attention_backward(q: X, k: X, v: X, shape: S, u: X, o: X, stats: R) -> (X, X, X);
+    adjoint causal_attention_stats(q, k, v, shape), u: (
+        causal_attention_backward(q, k, v, shape, u[0], causal_attention_stats(q, k, v, shape)[0], causal_attention_stats(q, k, v, shape)[1])[0],
+        causal_attention_backward(q, k, v, shape, u[0], causal_attention_stats(q, k, v, shape)[0], causal_attention_stats(q, k, v, shape)[1])[1],
+        causal_attention_backward(q, k, v, shape, u[0], causal_attention_stats(q, k, v, shape)[0], causal_attention_stats(q, k, v, shape)[1])[2],
         _
     );
 }
@@ -763,9 +769,16 @@ algebra CausalAttention<X, S> {
 // lines, which LLVM's loop passes (`IndVarSimplify` above all) handle superlinearly, most of a
 // 3-minute compile. Called instead, each instance is compiled once; the matmuls and elementwise
 // operations inside still inline into it, so a step runs at the same speed (measured).
-impl<const N: i32, const D: i32, const L: i32, const DH: i32> CausalAttention<Tensor<f32, N, D>, AttentionShape<L, DH>> {
-    #[no_inline]
+//
+// The f32 backward recomputes its weights from the scores: its statistics are none it reads (an
+// uninitialized tensor of the type the algebra wants).
+impl<const N: i32, const D: i32, const L: i32, const DH: i32> CausalAttention<Tensor<f32, N, D>, AttentionShape<L, DH>, Tensor<f32, N, D / DH>> {
     fn causal_attention(q, k, v, shape) {
+        let (out, _) = causal_attention_stats(q, k, v, shape);
+        out
+    }
+    #[no_inline]
+    fn causal_attention_stats(q, k, v, shape) {
         let mut out: Tensor<f32, N, D> = uninitialized();
         for s in 0..N / L {
             for h in 0..D / DH {
@@ -780,11 +793,12 @@ impl<const N: i32, const D: i32, const L: i32, const DH: i32> CausalAttention<Te
                 out = update(out, sgemm(false, false, 1.0, p, vh, 0.0, oh), r0, c0);
             };
         };
-        out
+        let none: Tensor<f32, N, D / DH> = uninitialized();
+        (out, none)
     }
     // `(dQ, dK, dV)`, every block's weights and score gradient computed once.
     #[no_inline]
-    fn causal_attention_backward(q, k, v, shape, u) {
+    fn causal_attention_backward(q, k, v, shape, u, o, stats) {
         let mut dq: Tensor<f32, N, D> = uninitialized();
         let mut dk: Tensor<f32, N, D> = uninitialized();
         let mut dv: Tensor<f32, N, D> = uninitialized();
@@ -816,59 +830,58 @@ impl<const N: i32, const D: i32, const L: i32, const DH: i32> CausalAttention<Te
 // choice: every product of bf16 operands accumulated in f32 (`matmul_wide`: on the Vulkan
 // backend, cooperative matrices in the generated kernels, each head a block of its matrices), the
 // softmax and the score gradient in f32 from the f32 products, the weights and the score gradient
-// written in bf16 for the products that read them (`causal_softmax_bf16`,
-// `attention_score_grad_bf16`), the results rounded to bf16. The gradient as the f32 version's,
-// one pass per block.
-impl<const N: i32, const D: i32, const L: i32, const DH: i32> CausalAttention<Tensor<bf16, N, D>, AttentionShape<L, DH>> {
-    #[no_inline]
+// written in bf16 for the products that read them, the results rounded to bf16. The forward
+// computed online (`online_causal_attention_stats`: weights rounded against each block of 64
+// keys' running maximum; `L` a multiple of 64, `DH` of 16), with each row's log-sum-exp by head;
+// `exact_causal_attention` rounds the normalized weights instead. The gradient by blocks from the
+// output and those statistics (`online_causal_attention_backward`), each weight the exact
+// attention's to f32 rounding; `exact_causal_attention_backward` the whole-row one.
+impl<const N: i32, const D: i32, const L: i32, const DH: i32> CausalAttention<Tensor<bf16, N, D>, AttentionShape<L, DH>, Tensor<f32, N, D / DH>> {
     fn causal_attention(q, k, v, shape) {
-        let mut out: Tensor<bf16, N, D> = uninitialized();
-        for s in 0..N / L {
-            for h in 0..D / DH {
-                let r0 = s * L;
-                let c0 = h * DH;
-                let qh: Tensor<bf16, L, DH> = slice(q, r0, c0);
-                let kh: Tensor<bf16, L, DH> = slice(k, r0, c0);
-                let vh: Tensor<bf16, L, DH> = slice(v, r0, c0);
-                let scores: Tensor<f32, L, L> = matmul_wide_transpose_b(qh, kh);
-                let p = causal_softmax_bf16(scores, DH);
-                let oh: Tensor<f32, L, DH> = matmul_wide(p, vh);
-                let ob: Tensor<bf16, L, DH> = oh.to();
-                out = update(out, ob, r0, c0);
-            };
-        };
+        let (out, _) = causal_attention_stats(q, k, v, shape);
         out
     }
     #[no_inline]
-    fn causal_attention_backward(q, k, v, shape, u) {
-        let mut dq: Tensor<bf16, N, D> = uninitialized();
-        let mut dk: Tensor<bf16, N, D> = uninitialized();
-        let mut dv: Tensor<bf16, N, D> = uninitialized();
-        for s in 0..N / L {
-            for h in 0..D / DH {
-                let r0 = s * L;
-                let c0 = h * DH;
-                let qh: Tensor<bf16, L, DH> = slice(q, r0, c0);
-                let kh: Tensor<bf16, L, DH> = slice(k, r0, c0);
-                let vh: Tensor<bf16, L, DH> = slice(v, r0, c0);
-                let uh: Tensor<bf16, L, DH> = slice(u, r0, c0);
-                let scores: Tensor<f32, L, L> = matmul_wide_transpose_b(qh, kh);
-                let pb = causal_softmax_bf16(scores, DH);
-                let dp: Tensor<f32, L, L> = matmul_wide_transpose_b(uh, vh);
-                let ds = attention_score_grad_bf16(scores, dp, DH);
-                let gq: Tensor<f32, L, DH> = matmul_wide(ds, kh);
-                let gk: Tensor<f32, L, DH> = matmul_wide_transpose_a(ds, qh);
-                let gv: Tensor<f32, L, DH> = matmul_wide_transpose_a(pb, uh);
-                let gqb: Tensor<bf16, L, DH> = gq.to();
-                let gkb: Tensor<bf16, L, DH> = gk.to();
-                let gvb: Tensor<bf16, L, DH> = gv.to();
-                dq = update(dq, gqb, r0, c0);
-                dk = update(dk, gkb, r0, c0);
-                dv = update(dv, gvb, r0, c0);
-            };
-        };
-        (dq, dk, dv)
+    fn causal_attention_stats(q, k, v, shape) {
+        online_causal_attention_stats(q, k, v, shape)
     }
+    #[no_inline]
+    fn causal_attention_backward(q, k, v, shape, u, o, stats) {
+        online_causal_attention_backward(q, k, v, shape, u, o, stats)
+    }
+}
+
+// The gradient of bf16 causal attention a head's whole rows at a time (`causal_softmax_bf16`,
+// `attention_score_grad_bf16`: the score matrices in device memory), the dot `rowsum(dP * P)` from
+// the f32 weights: what `online_causal_attention_backward` is checked against.
+fn exact_causal_attention_backward<const N: i32, const D: i32, const L: i32, const DH: i32>(q: Tensor<bf16, N, D>, k: Tensor<bf16, N, D>, v: Tensor<bf16, N, D>, shape: AttentionShape<L, DH>, u: Tensor<bf16, N, D>) -> (Tensor<bf16, N, D>, Tensor<bf16, N, D>, Tensor<bf16, N, D>) {
+    let mut dq: Tensor<bf16, N, D> = uninitialized();
+    let mut dk: Tensor<bf16, N, D> = uninitialized();
+    let mut dv: Tensor<bf16, N, D> = uninitialized();
+    for s in 0..N / L {
+        for h in 0..D / DH {
+            let r0 = s * L;
+            let c0 = h * DH;
+            let qh: Tensor<bf16, L, DH> = slice(q, r0, c0);
+            let kh: Tensor<bf16, L, DH> = slice(k, r0, c0);
+            let vh: Tensor<bf16, L, DH> = slice(v, r0, c0);
+            let uh: Tensor<bf16, L, DH> = slice(u, r0, c0);
+            let scores: Tensor<f32, L, L> = matmul_wide_transpose_b(qh, kh);
+            let pb = causal_softmax_bf16(scores, DH);
+            let dp: Tensor<f32, L, L> = matmul_wide_transpose_b(uh, vh);
+            let ds = attention_score_grad_bf16(scores, dp, DH);
+            let gq: Tensor<f32, L, DH> = matmul_wide(ds, kh);
+            let gk: Tensor<f32, L, DH> = matmul_wide_transpose_a(ds, qh);
+            let gv: Tensor<f32, L, DH> = matmul_wide_transpose_a(pb, uh);
+            let gqb: Tensor<bf16, L, DH> = gq.to();
+            let gkb: Tensor<bf16, L, DH> = gk.to();
+            let gvb: Tensor<bf16, L, DH> = gv.to();
+            dq = update(dq, gqb, r0, c0);
+            dk = update(dk, gkb, r0, c0);
+            dv = update(dv, gvb, r0, c0);
+        };
+    };
+    (dq, dk, dv)
 }
 
 // Attention over a key/value cache, the decoding side of `causal_attention`: each of the `N`
@@ -951,6 +964,202 @@ fn attention_score_grad<const L: i32>(p: Tensor<f32, L, L>, dp: Tensor<f32, L, L
         for j in i + 1..L { ds[i, j] = 0.0; };
     };
     Tensor(data: ds)
+}
+
+// Causal attention on bf16 tensors with each block's whole softmax: the weights normalized, then
+// rounded to bf16 (`causal_softmax_bf16`), against which `online_causal_attention` (the
+// `CausalAttention` impl's forward) rounds within an ulp.
+fn exact_causal_attention<const N: i32, const D: i32, const L: i32, const DH: i32>(q: Tensor<bf16, N, D>, k: Tensor<bf16, N, D>, v: Tensor<bf16, N, D>, shape: AttentionShape<L, DH>) -> Tensor<bf16, N, D> {
+    let mut out: Tensor<bf16, N, D> = uninitialized();
+    for s in 0..N / L {
+        for h in 0..D / DH {
+            let r0 = s * L;
+            let c0 = h * DH;
+            let qh: Tensor<bf16, L, DH> = slice(q, r0, c0);
+            let kh: Tensor<bf16, L, DH> = slice(k, r0, c0);
+            let vh: Tensor<bf16, L, DH> = slice(v, r0, c0);
+            let scores: Tensor<f32, L, L> = matmul_wide_transpose_b(qh, kh);
+            let p = causal_softmax_bf16(scores, DH);
+            let oh: Tensor<f32, L, DH> = matmul_wide(p, vh);
+            let ob: Tensor<bf16, L, DH> = oh.to();
+            out = update(out, ob, r0, c0);
+        };
+    };
+    out
+}
+
+// Causal attention on bf16 tensors computed online (Milakov & Gimelshein, 2018; FlashAttention, Dao
+// et al., 2022): each row's keys taken by blocks of 64, the row's maximum and sum carried from block
+// to block, the weights rounded to bf16 against the running maximum, `exp((s - m) / sqrt(DH))`
+// (not divided by the sum), the weighted values accumulated in f32, rescaled when the maximum grows,
+// divided by the sum at the end. The block of 64 keys is part of the definition: it fixes where the
+// rounding falls. Against `causal_softmax_bf16`'s weights (rounded once divided), each weight within
+// an ulp of bf16, the result within about 1e-3. Its products take blocks of 32 rows (any split of
+// the rows computes the same) by 64 keys: what a kernel per block of rows computes on the tensor
+// cores without the scores ever in device memory (`doc/plan-fusion.md`).
+fn online_causal_attention<const N: i32, const D: i32, const L: i32, const DH: i32>(q: Tensor<bf16, N, D>, k: Tensor<bf16, N, D>, v: Tensor<bf16, N, D>, shape: AttentionShape<L, DH>) -> Tensor<bf16, N, D> {
+    let (out, _) = online_causal_attention_stats(q, k, v, shape);
+    out
+}
+
+// `online_causal_attention` and each row's log-sum-exp by head, `lse[i, h] = m / sqrt(DH) +
+// log(z)` (its scores' maximum and its sum, both in the scaled units its weights are in): what
+// its backward reads to recompute each weight once, `exp(s / sqrt(DH) - lse)`.
+fn online_causal_attention_stats<const N: i32, const D: i32, const L: i32, const DH: i32>(q: Tensor<bf16, N, D>, k: Tensor<bf16, N, D>, v: Tensor<bf16, N, D>, shape: AttentionShape<L, DH>) -> (Tensor<bf16, N, D>, Tensor<f32, N, D / DH>) {
+    let width: f32 = DH.to();
+    let scale = 1.0 / mlir::math::sqrt(width);
+    let mut out: Tensor<bf16, N, D> = uninitialized();
+    let mut lse: Tensor<f32, N, D / DH> = uninitialized();
+    for s in 0..N / L {
+        for h in 0..D / DH {
+            for rb in 0..L / 32 {
+                let r0 = s * L + rb * 32;
+                let c0 = h * DH;
+                let qb: Tensor<bf16, 32, DH> = slice(q, r0, c0);
+                let mut zeros: [[f32; DH]; 32] = mlir::memref::alloc();
+                let mut m: [f32; 32] = mlir::memref::alloc();
+                let mut z: [f32; 32] = mlir::memref::alloc();
+                for r in 0..32 {
+                    m[r] = -3.0e38;
+                    z[r] = 0.0;
+                    for d in 0..DH { zeros[r, d] = 0.0; };
+                };
+                // The weighted values, rescaled in place, each block's product added to them
+                // (`fma`: on the tensor cores, accumulated from them).
+                let mut acc: Tensor<f32, 32, DH> = Tensor(data: zeros);
+                // The blocks of keys the block of rows reaches (causal: up to its last row).
+                for kb in 0..(rb * 32 + 32 + 63) / 64 {
+                    let kblock: Tensor<bf16, 64, DH> = slice(k, s * L + kb * 64, c0);
+                    let vblock: Tensor<bf16, 64, DH> = slice(v, s * L + kb * 64, c0);
+                    let scores: Tensor<f32, 32, 64> = matmul_wide_transpose_b(qb, kblock);
+                    let mut p: [[bf16; 64]; 32] = mlir::memref::alloc();
+                    for r in 0..32 {
+                        // The block's keys row `r` sees: those up to its own position.
+                        let reach = rb * 32 + r - kb * 64 + 1;
+                        let last = if reach > 64 { 64 } else { if reach < 0 { 0 } else { reach } };
+                        let mut mb = m[r];
+                        for j in 0..last { if scores[r, j] > mb { mb = scores[r, j]; }; };
+                        let a = exp((m[r] - mb) * scale);
+                        let mut zb = 0.0;
+                        for j in 0..last {
+                            let e = exp((scores[r, j] - mb) * scale);
+                            zb = zb + e;
+                            p[r, j] = e.to();
+                        };
+                        for j in last..64 { p[r, j] = 0.0; };
+                        z[r] = z[r] * a + zb;
+                        m[r] = mb;
+                        for d in 0..DH { acc[r, d] = acc[r, d] * a; };
+                    };
+                    let weights: Tensor<bf16, 32, 64> = Tensor(data: p);
+                    acc = fma(weights, vblock, acc);
+                };
+                let mut ob: [[bf16; DH]; 32] = mlir::memref::alloc();
+                let mut lb: [[f32; 1]; 32] = mlir::memref::alloc();
+                for r in 0..32 {
+                    let rz = 1.0 / z[r];
+                    for d in 0..DH { ob[r, d] = (acc[r, d] * rz).to(); };
+                    lb[r, 0] = m[r] * scale + log(z[r]);
+                };
+                let block: Tensor<bf16, 32, DH> = Tensor(data: ob);
+                out = update(out, block, r0, c0);
+                let stats: Tensor<f32, 32, 1> = Tensor(data: lb);
+                lse = update(lse, stats, r0, h);
+            };
+        };
+    };
+    (out, lse)
+}
+
+// The gradient of causal attention on bf16 tensors from its forward's output `o` and row
+// statistics `lse` (`online_causal_attention_stats`), by blocks (FlashAttention-2, Dao, 2023): each
+// row's `dot = dO · O` (by head, from the bf16 output: within its rounding of `rowsum(dP * P)`),
+// then for each block of 32 keys, every block of 32 queries that sees it: the weights
+// `P = exp(S / sqrt(DH) - lse)` (rounded to bf16), `dS = P * (dP - dot) / sqrt(DH)` (rounded to
+// bf16), `dV += Pᵀ dO`, `dK += dSᵀ Q` accumulated in f32; then for each block of 32 queries,
+// `dQ += dS K` over the blocks of keys it sees, from `dS` kept by blocks. Each weight is the exact
+// attention's (`causal_softmax_bf16`'s) to f32 rounding; the products' sums reassociated by block.
+fn online_causal_attention_backward<const N: i32, const D: i32, const L: i32, const DH: i32>(q: Tensor<bf16, N, D>, k: Tensor<bf16, N, D>, v: Tensor<bf16, N, D>, shape: AttentionShape<L, DH>, u: Tensor<bf16, N, D>, o: Tensor<bf16, N, D>, lse: Tensor<f32, N, D / DH>) -> (Tensor<bf16, N, D>, Tensor<bf16, N, D>, Tensor<bf16, N, D>) {
+    let width: f32 = DH.to();
+    let scale = 1.0 / mlir::math::sqrt(width);
+    let mut dots: [[f32; D / DH]; N] = mlir::memref::alloc();
+    for i in 0..N {
+        for h in 0..D / DH {
+            let mut s = 0.0;
+            for d in 0..DH {
+                let a: f32 = u[i, h * DH + d].to();
+                let b: f32 = o[i, h * DH + d].to();
+                s = s + a * b;
+            };
+            dots[i, h] = s;
+        };
+    };
+    let mut dq: Tensor<bf16, N, D> = uninitialized();
+    let mut dk: Tensor<bf16, N, D> = uninitialized();
+    let mut dv: Tensor<bf16, N, D> = uninitialized();
+    for s in 0..N / L {
+        for h in 0..D / DH {
+            let c0 = h * DH;
+            // The score gradient's blocks the queries' pass reads (those on or below the
+            // diagonal, the only ones written or read).
+            let mut ds: Tensor<bf16, L, L> = uninitialized();
+            for kb in 0..L / 32 {
+                let k0 = s * L + kb * 32;
+                let kblock: Tensor<bf16, 32, DH> = slice(k, k0, c0);
+                let vblock: Tensor<bf16, 32, DH> = slice(v, k0, c0);
+                let mut zk: [[f32; DH]; 32] = mlir::memref::alloc();
+                let mut zv: [[f32; DH]; 32] = mlir::memref::alloc();
+                for r in 0..32 { for d in 0..DH { zk[r, d] = 0.0; zv[r, d] = 0.0; }; };
+                let mut gk: Tensor<f32, 32, DH> = Tensor(data: zk);
+                let mut gv: Tensor<f32, 32, DH> = Tensor(data: zv);
+                for qb in kb..L / 32 {
+                    let r0 = s * L + qb * 32;
+                    let qblock: Tensor<bf16, 32, DH> = slice(q, r0, c0);
+                    let ublock: Tensor<bf16, 32, DH> = slice(u, r0, c0);
+                    let scores: Tensor<f32, 32, 32> = matmul_wide_transpose_b(qblock, kblock);
+                    let dp: Tensor<f32, 32, 32> = matmul_wide_transpose_b(ublock, vblock);
+                    let mut p: [[bf16; 32]; 32] = mlir::memref::alloc();
+                    let mut g: [[bf16; 32]; 32] = mlir::memref::alloc();
+                    for r in 0..32 {
+                        let l = lse[r0 + r, h];
+                        let dot = dots[r0 + r, h];
+                        // The keys row `r` sees: those up to its own position.
+                        let reach = qb * 32 + r - kb * 32 + 1;
+                        let last = if reach > 32 { 32 } else { reach };
+                        for j in 0..last {
+                            let w = exp(scores[r, j] * scale - l);
+                            p[r, j] = w.to();
+                            g[r, j] = (w * (dp[r, j] - dot) * scale).to();
+                        };
+                        for j in last..32 { p[r, j] = 0.0; g[r, j] = 0.0; };
+                    };
+                    let weights: Tensor<bf16, 32, 32> = Tensor(data: p);
+                    let grads: Tensor<bf16, 32, 32> = Tensor(data: g);
+                    gv = fma_transpose_a(weights, ublock, gv);
+                    gk = fma_transpose_a(grads, qblock, gk);
+                    ds = update(ds, grads, qb * 32, kb * 32);
+                };
+                let gkb: Tensor<bf16, 32, DH> = gk.to();
+                let gvb: Tensor<bf16, 32, DH> = gv.to();
+                dk = update(dk, gkb, k0, c0);
+                dv = update(dv, gvb, k0, c0);
+            };
+            for qb in 0..L / 32 {
+                let r0 = s * L + qb * 32;
+                let mut zq: [[f32; DH]; 32] = mlir::memref::alloc();
+                for r in 0..32 { for d in 0..DH { zq[r, d] = 0.0; }; };
+                let mut gq: Tensor<f32, 32, DH> = Tensor(data: zq);
+                for kb in 0..qb + 1 {
+                    let grads: Tensor<bf16, 32, 32> = slice(ds, qb * 32, kb * 32);
+                    let kblock: Tensor<bf16, 32, DH> = slice(k, s * L + kb * 32, c0);
+                    gq = fma(grads, kblock, gq);
+                };
+                let gqb: Tensor<bf16, 32, DH> = gq.to();
+                dq = update(dq, gqb, r0, c0);
+            };
+        };
+    };
+    (dq, dk, dv)
 }
 
 // `causal_softmax`'s weights rounded to bf16 (the bf16 attention's): each row's exponentials

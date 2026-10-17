@@ -75,6 +75,20 @@ measure the same way (held at most, ms/step), and the waste a block serving a sm
 Next time: keep the binary's whole output (`cargo test ... 2>&1 | tee`), the test name and the exit
 code; after a change touching those areas, a loop of runs (`for i in $(seq 50)`).
 
+## A program's `define`/`const` is visible inside the stdlib: a generic of the same name must shadow it
+
+A whole-program `define N` reached the stdlib's `impl<const N: i32>` bodies:
+the CPS resolved a value-position `N` (`for i in 0..N`, `N.to()`) to the
+global before the generic (fixed, `cps.rs`, 2026-10-17:
+`mlir_lower.rs::a_programs_define_doesnt_shadow_a_stdlib_const_generic`;
+found as heap corruption, `0xC0000374`, a 1×256 tensor written as 1024
+rows). The same order remains where a bare name in turbofish position is
+read without the enclosing generics at hand: `monomorphize.rs::
+concrete_ty_from_ast` returns the global's value for `probe::<N>()` inside
+a generic `fn f<const N: i32>`. The real rule is visibility: a crate sees
+its own consts and those of crates it `use`s, never its users'; a generic
+in scope shadows any of them.
+
 ## Debt: a constraint on a never-generalized abstract variable is checked nowhere
 
 `infer.rs`'s module comment, in its own words: a constraint on a variable still abstract and never

@@ -1364,11 +1364,20 @@ impl Forward {
                 if l != loop_def.name {
                     return None;
                 }
+                // The counter goes up by one a turn (a `while` over its
+                // counter may step otherwise: not this loop).
+                let next = self.cval_to_id(args.first()?)?;
+                if self.egraph[next].data.const_int != Some(idx + 1) {
+                    return None;
+                }
                 carried_ids = self.cvals_to_ids(&args[1..])?;
             }
             for (&p, &id) in carried_params.iter().zip(&carried_ids) {
                 self.env.insert(p, id);
             }
+            // What follows the loop sees the counter's value on leaving it.
+            let exit = self.egraph.add(CleaveLang::Int(start.max(end)));
+            self.env.insert(i_var, exit);
             Some(())
         };
         if unroll().is_none() {
@@ -1419,10 +1428,14 @@ fn recognize_unrollable_loop<'a>(defs: &'a [CFunDef], body: &'a CExpr) -> Option
     let CExpr::Fix { defs: cond_defs, body: cond_body } = &loop_def.body else {
         return None;
     };
-    let (_, _, cmp_args, if_expr) = recognize_real_call(cond_defs, cond_body)?;
-    let [_, CVal::Int(end)] = cmp_args else {
+    // `counter < end`: the loop's first parameter against a constant.
+    let (_, cmp_unit, cmp_args, if_expr) = recognize_real_call(cond_defs, cond_body)?;
+    let [CVal::Var(counter), CVal::Int(end)] = cmp_args else {
         return None;
     };
+    if !cmp_unit.starts_with("Ord::lt<") || loop_def.params.first() != Some(counter) {
+        return None;
+    }
     let CExpr::If { then_branch, else_branch, .. } = if_expr else {
         return None;
     };
@@ -2362,7 +2375,13 @@ fn build_pattern(
             let ExprKind::NumberLit { text, .. } = &index.kind else { return None };
             let k: usize = text.parse().ok()?;
             let (base_id, _) = build_pattern(base, algebra, ty, type_env, d_var, None, referenced, registry, ast)?;
-            let ENodeOrVar::ENode(CleaveLang::Op(unit, _)) = &ast[base_id] else { return None };
+            // The upstream adjoint `u` of a rule's method returning a tuple:
+            // its fields are that method's result's (`apply_adjoint_rule`).
+            let unit = match (&ast[base_id], &base.kind) {
+                (ENodeOrVar::ENode(CleaveLang::Op(unit, _)), _) => unit.to_string(),
+                (ENodeOrVar::Var(_), ExprKind::Path(p)) => type_env.get(format!("{}[]", p.segments.join("::")).as_str())?.clone(),
+                _ => return None,
+            };
             let sym = Symbol::from(format!("tuplefield:{unit}:{k}"));
             Some((ast.add(ENodeOrVar::ENode(CleaveLang::Op(sym, vec![base_id]))), None))
         }
@@ -5013,14 +5032,20 @@ fn backward_walk(
             .collect();
         if !own_fields.is_empty() {
             // A parameter's declared type, or what the op reading it says:
-            // a field's type, or an array element's.
-            let ty = known_types.get(&id).cloned().or_else(|| {
-                let (name, _) = defs.get(&id)?;
-                field_ops
-                    .get(name)
-                    .map(|(_, _, field_ty)| field_ty.clone())
-                    .or_else(|| load_ops.get(name).map(|(_, elem_ty)| elem_ty.clone()))
-            });
+            // a field's type, or an array element's; or the e-class's own
+            // (a call returning a tuple, `causal_attention_stats`, read
+            // through its fields).
+            let ty = known_types
+                .get(&id)
+                .cloned()
+                .or_else(|| {
+                    let (name, _) = defs.get(&id)?;
+                    field_ops
+                        .get(name)
+                        .map(|(_, _, field_ty)| field_ty.clone())
+                        .or_else(|| load_ops.get(name).map(|(_, elem_ty)| elem_ty.clone()))
+                })
+                .or_else(|| egraph[id].data.own_ty.clone());
             let Some(ty) = ty else {
                 return Err(format!(
                     "internal error: a struct-typed value (e-class {id:?}, defined by {:?}) has field contributions but its own type is unknown",
@@ -5161,7 +5186,7 @@ fn backward_walk(
             return Err(format!("no adjoint rule for `{algebra}::{method}`"));
         };
         let Some(contributions) =
-            apply_adjoint_rule(egraph, algebra, ty, rule, &children, u, registry, referenced)
+            apply_adjoint_rule(egraph, algebra, ty, name_str, rule, &children, u, registry, referenced)
         else {
             return Err(format!(
                 "adjoint `{algebra}::{method}` couldn't be applied to `{name_str}` — check its own declared rule body"
@@ -5593,6 +5618,7 @@ fn apply_adjoint_rule(
     egraph: &mut egg::EGraph<CleaveLang, ConstantFold>,
     algebra: &str,
     ty: &str,
+    unit: &str,
     rule: &AdjointRuleDecl,
     children: &[egg::Id],
     u: egg::Id,
@@ -5604,6 +5630,10 @@ fn apply_adjoint_rule(
     }
     let sig = registry.fn_sig(algebra, &rule.method)?;
     let subst_ty = generic_substitution(algebra, ty, registry);
+    // `u[k]`, a field of the upstream adjoint of a method returning a tuple:
+    // named as the method's own result's field (`tuplefield:<unit>:<k>`),
+    // the type `u` has (`build_pattern`'s `Index` arm reads it here).
+    let upstream_unit_key = format!("{}[]", rule.upstream);
     let mut type_env: HashMap<&str, String> = rule
         .params
         .iter()
@@ -5623,6 +5653,7 @@ fn apply_adjoint_rule(
         .and_then(|ret| resolve_declared_type(ret, &subst_ty))
         .unwrap_or_else(|| ty.to_string());
     type_env.insert(rule.upstream.as_str(), upstream_ty);
+    type_env.insert(upstream_unit_key.as_str(), unit.to_string());
 
     let bodies: Vec<&Expr> = if rule.params.len() > 1 {
         match &rule.body.kind {

@@ -232,6 +232,47 @@ fn parked_contains(base: usize) -> bool {
     PARKED.lock().unwrap().get_or_insert_with(Default::default).contains(&base)
 }
 
+// Under `CLEAVE_DEBUG_POOL`, every headered block also gets `REDZONE` bytes
+// after its data, filled with `REDZONE_BYTE` and checked when the block is
+// freed: a write past the end of a buffer (an out-of-bounds store a kernel or
+// a loop made) stops the program there, naming the block, its size and where
+// it was allocated, instead of corrupting the next block or the system heap
+// (`0xC0000374` much later, wherever the allocator next looks).
+const REDZONE: usize = 64;
+const REDZONE_BYTE: u8 = 0xCB;
+static ALLOC_SITES: std::sync::Mutex<Option<std::collections::HashMap<usize, String>>> = std::sync::Mutex::new(None);
+
+/// The bytes a headered block of `data_size` takes from its class: header
+/// and padding, data, and the red zone under `CLEAVE_DEBUG_POOL`.
+fn block_total(data_size: usize) -> usize {
+    data_offset(data_size) + data_size + if *CLEAVE_DEBUG_POOL { REDZONE } else { 0 }
+}
+
+/// Fills the red zone of the block at `base` (data `data_size` bytes) and
+/// records where it was allocated.
+unsafe fn arm_redzone(base: *mut u8, data_size: usize) {
+    unsafe {
+        let end = base.add(data_offset(data_size) + data_size);
+        std::ptr::write_bytes(end, REDZONE_BYTE, REDZONE);
+    }
+    ALLOC_SITES.lock().unwrap().get_or_insert_with(Default::default).insert(base as usize, first_cleave_frame());
+}
+
+/// Checks the red zone of the block at `base` before it's freed.
+unsafe fn check_redzone(base: *mut u8, data_size: usize) {
+    let end = unsafe { base.add(data_offset(data_size) + data_size) };
+    let zone = unsafe { std::slice::from_raw_parts(end, REDZONE) };
+    if let Some(first) = zone.iter().position(|&b| b != REDZONE_BYTE) {
+        let site = ALLOC_SITES.lock().unwrap().get_or_insert_with(Default::default).get(&(base as usize)).cloned();
+        eprintln!(
+            "CLEAVE_DEBUG_POOL: block {base:p} of {data_size} bytes written past its end (byte {first} after it),              allocated at {}, freed at {}",
+            site.as_deref().unwrap_or("?"),
+            first_cleave_frame()
+        );
+        std::process::abort();
+    }
+}
+
 // `CLEAVE_TRACE_RC=1` -- a ledger of every allocation, retain and release
 // (block, allocation serial, resulting count, cleave source line), for a
 // small reproduction: one line per call floods a real workload
@@ -1022,7 +1063,7 @@ unsafe fn block_base(header: *mut RcHeader) -> *mut u8 {
 #[unsafe(no_mangle)]
 pub extern "C" fn cleave_alloc_rc(data_size: i64) -> *mut u8 {
     let offset = data_offset(data_size as usize);
-    let total = offset + data_size as usize;
+    let total = block_total(data_size as usize);
     let class = size_class(total);
     unsafe {
         // Pop under `POOL_LOCK` (`POOL_LOCK`'s own doc comment: real,
@@ -1072,6 +1113,9 @@ pub extern "C" fn cleave_alloc_rc(data_size: i64) -> *mut u8 {
         let header = base.add(offset - RC_HEADER_SIZE) as *mut RcHeader;
         (*header).refcount = 1;
         (*header).data_size = data_size;
+        if *CLEAVE_DEBUG_POOL {
+            arm_redzone(base, data_size as usize);
+        }
         if *CLEAVE_TRACE_RC {
             let serial = record_alloc_serial(base as usize);
             eprintln!("ALLOC   {base:p} #{serial}  {}", first_cleave_frame());
@@ -1261,7 +1305,10 @@ pub unsafe extern "C" fn cleave_release(ptr: *mut u8) -> bool {
             // regardless of which physical allocator backs it.
             if !is_in_arena(header as *mut u8) {
                 let data_size = (*header).data_size as usize;
-                let total = data_offset(data_size) + data_size;
+                if *CLEAVE_DEBUG_POOL {
+                    check_redzone(base, data_size);
+                }
+                let total = block_total(data_size);
                 let class = size_class(total);
                 if class < NUM_SIZE_CLASSES {
                     // Cache it instead of returning it to the OS heap --

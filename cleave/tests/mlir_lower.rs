@@ -1134,6 +1134,33 @@ fn a_while_loop_lowers_to_scf_while() {
     assert!(text.contains("scf.yield"), "got:\n{text}");
 }
 
+/// A `while` over its own counter looks like a `for` to the e-graph's
+/// unrolling (`recognize_unrollable_loop`: a loop from a constant, tested
+/// against a constant): unrolled only when it steps by one, and what follows
+/// it reads the counter's value on leaving (it once read the last turn's, 4).
+#[test]
+fn a_while_loop_stepping_by_two_is_not_unrolled_as_a_for() {
+    let context = context();
+    assert_eq!(
+        run_i32(&context, "fn main() -> i32 { let mut acc = 0; while acc < 5 { acc = acc + 2; }; acc }"),
+        6
+    );
+}
+
+/// A `while` over its counter to a bound known at run time, made an
+/// `scf.for` (`upliftCountedWhiles`): the counter's value after the loop is
+/// the one its test failed on, `max(n, 0)` here (upstream's uplift gave the
+/// last turn's, `n - 1`), zero turns included.
+#[test]
+fn a_counted_while_leaves_its_counter_at_the_failing_value() {
+    let context = context();
+    let src = "
+        #[no_inline]
+        fn count(n: i32) -> i32 { let mut acc = 0; while acc < n { acc = acc + 1; }; acc }
+        fn main() -> i32 { count(5) * 100 + count(0 - 3) }";
+    assert_eq!(run_i32(&context, src), 500);
+}
+
 #[test]
 fn a_while_loop_actually_computes_the_right_value() {
     let context = context();
@@ -3164,6 +3191,25 @@ fn sum_mean_max_of_a_vector_compute_correctly() {
     assert_eq!(run_i32(&context, src), 1);
 }
 
+/// A program's `define N` doesn't reach the stdlib's const generic `N`: in
+/// `impl<const N: i32> Mean<Tensor<T, N>, T>`, `N` read as a value
+/// (`N.to()`) is the generic, here 3, not the program's 1024 (the CPS took a
+/// whole-program const of the generic's name first: `mean` divided by 1024,
+/// and `for i in 0..N` loops wrote past their buffers).
+#[test]
+fn a_programs_define_doesnt_shadow_a_stdlib_const_generic() {
+    let context = context();
+    let src = r#"
+        use nn;
+        define N: i32 = 1024;
+        fn main() -> i32 {
+            let v = Tensor::<f32, 3>(data: [1.0, 5.0, 3.0]);
+            if mean(v) == 3.0 and N == 1024 { 1 } else { 0 }
+        }
+    "#;
+    assert_eq!(run_i32(&context, src), 1);
+}
+
 /// `Dense<T,In,Out>` (`stdlib/nn/nn.cleave`) -- the fully-connected-layer
 /// helper the session's own `Network`/`xor_tensor.cleave` rewrite bundles
 /// multiple of. `layer.forward(x)` needs `matmul` and `+` (`Ring::add`) to
@@ -4172,6 +4218,38 @@ fn grad_of_a_single_parameter_function_computes_the_scalar_derivative() {
         fn main() -> i32 {
             let d: f32 = gw(3.0);
             if d == 6.0 { 1 } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 1);
+}
+
+/// An adjoint rule on a method returning a tuple (`causal_attention_stats`'s
+/// shape): its upstream adjoint is a pair, read by field (`u[0]`), its
+/// forward's own call (`pair(x)[1]`) the same e-class as the program's;
+/// `d(x^2)/dx` through the pair's first field.
+#[test]
+fn grad_through_a_tuple_returning_method_reads_its_upstream_by_field() {
+    let context = context();
+    let src = "
+        algebra Pair<X> {
+            fn pair(x: X) -> (X, X);
+            fn pair_back(x: X, u: X, first: X, second: X) -> X;
+            adjoint pair(x), u: pair_back(x, u[0], pair(x)[0], pair(x)[1]);
+        }
+        impl Pair<f32> {
+            #[no_inline]
+            fn pair(x) { (x * x, x * 3.0) }
+            #[no_inline]
+            fn pair_back(x, u, first, second) { u * 2.0 * x + 0.0 * first + 0.0 * second }
+        }
+        fn f(x: f32) -> f32 {
+            let (a, b) = pair(x);
+            a
+        }
+        gw = grad(f, x);
+        fn main() -> i32 {
+            let d: f32 = gw(5.0);
+            if d == 10.0 { 1 } else { 0 }
         }
     ";
     assert_eq!(run_i32(&context, src), 1);

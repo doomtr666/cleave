@@ -2380,6 +2380,18 @@ fn convert_expr(expr: &Expr, env: &CEnv, ctx: &Ctx, k: &dyn Fn(CVal, &CEnv) -> C
                     )
                 }
                 Some(v) => v.clone(),
+                // A const generic in scope first, then a whole-program
+                // `const`/`define` of the same name: the generic shadows it
+                // (a program's `define N` was read by the stdlib's `for i in
+                // 0..N` of every `impl<const N: i32>`, writing past buffers).
+                // The generic's reference is its resolved `Ty::Const`; a
+                // global's is its declared type (below).
+                None if matches!(ctx.node_types.get(&expr.id), Some(Ty::Const(_))) => match &ctx.node_types[&expr.id] {
+                    Ty::Const(ConstValue::Int(n)) => CVal::Int(*n),
+                    Ty::Const(ConstValue::Bool(b)) => CVal::Bool(*b),
+                    Ty::Const(ConstValue::Float(bits)) => CVal::Float(f64::from_bits(*bits)),
+                    _ => unreachable!(),
+                },
                 None => match ctx.global_consts.get(&name) {
                     // A whole-program `const` -- `infer.rs`'s own
                     // `ExprKind::Path` fallback resolves this reference to

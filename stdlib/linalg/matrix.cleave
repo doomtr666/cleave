@@ -476,6 +476,25 @@ impl<const P: i32, const Q: i32, const R: i32>
     }
 }
 
+// bf16 operands accumulated into an f32 `c` (`matmul_wide`'s mixed precision): `c + a b`, each
+// product added to `c`'s value (a carried accumulator, `online_causal_attention`'s), `c`'s buffer
+// written in place where `c` dies there. On the Vulkan backend the fragments' accumulator starts
+// from `c`.
+impl<const N: i32, const M: i32, const K: i32>
+    Fma<Tensor<bf16,N,M>, Tensor<bf16,M,K>, Tensor<f32,N,K>> {
+    fn fma(a, b, c) { mlir::linalg::matmul_add(a, b, c) }
+}
+
+impl<const P: i32, const Q: i32, const R: i32>
+    FmaTransposeA<Tensor<bf16,P,Q>, Tensor<bf16,P,R>, Tensor<f32,Q,R>> {
+    fn fma_transpose_a(a, b, c) { mlir::linalg::matmul_transpose_a_add(a, b, c) }
+}
+
+impl<const P: i32, const Q: i32, const R: i32>
+    FmaTransposeB<Tensor<bf16,P,Q>, Tensor<bf16,R,Q>, Tensor<f32,P,R>> {
+    fn fma_transpose_b(a, b, c) { mlir::linalg::matmul_transpose_b_add(a, b, c) }
+}
+
 impl<T: Float, const N: i32, const M: i32, const K: i32>
     MatMul<Tensor<T,N,M>, Tensor<T,M,K>, Tensor<T,N,K>> {
     // `doc/backlog.md`'s own "`--inline` itself, directly confirmed as the

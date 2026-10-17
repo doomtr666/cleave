@@ -64,6 +64,11 @@ pub fn run_main_with<T>(
 ) -> Result<T, Vec<String>> {
     crate::options::set(options.clone());
     cleave_rt::install_crash_trace();
+    // Each source file's path for the debug information, as `emit_object` has it: a stdlib
+    // body's lines in its own file (a kernel's `OpLine`s, `CLEAVE_VK_DEBUG_INFO`).
+    if let Some(sources) = sources {
+        crate::mlir_lower::set_gen_file_table(sources.path_table());
+    }
     let cps_program = build_optimized_cps(program, registry, sources)?;
 
     let dialect_registry = DialectRegistry::new();

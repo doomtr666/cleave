@@ -108,6 +108,7 @@ impl Default for ShaderBfloat16Features {
 /// tensor addressing (`VkPhysicalDeviceCooperativeMatrix2FeaturesNV`, structure type 1000593000
 /// in the Vulkan registry). Enabled for measurement (`doc/plan-quantization.md`, phase 0).
 const COOPERATIVE_MATRIX2_NAME: &CStr = c"VK_NV_cooperative_matrix2";
+const FRAME_BOUNDARY_NAME: &CStr = c"VK_EXT_frame_boundary";
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -269,7 +270,7 @@ fn cooperative_matrices(entry: &ash::Entry, instance: &ash::Instance, physical: 
 
 /// Every Vulkan device the loader finds, in its order.
 pub fn devices() -> Result<Vec<DeviceInfo>, Error> {
-    let (entry, instance) = create_instance(false)?;
+    let (entry, instance) = create_instance(false, false)?;
     let found = unsafe { instance.enumerate_physical_devices() }
         .map_err(fail("enumerating devices"))
         .map(|physicals| physicals.iter().map(|&p| device_info(&entry, &instance, p)).collect());
@@ -295,12 +296,12 @@ fn device_info(entry: &ash::Entry, instance: &ash::Instance, physical: vk::Physi
 
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 
-fn create_instance(validation: bool) -> Result<(ash::Entry, ash::Instance), Error> {
+fn create_instance(validation: bool, labels: bool) -> Result<(ash::Entry, ash::Instance), Error> {
     // SAFETY: loading the system's Vulkan loader; nothing else runs it.
     let entry = unsafe { ash::Entry::load() }.map_err(|e| Error(format!("no Vulkan loader: {e}")))?;
     let app = vk::ApplicationInfo::default().application_name(c"cleave").api_version(vk::API_VERSION_1_3);
     let layers = if validation { vec![VALIDATION_LAYER.as_ptr()] } else { Vec::new() };
-    let extensions = if validation { vec![ash::ext::debug_utils::NAME.as_ptr()] } else { Vec::new() };
+    let extensions = if validation || labels { vec![ash::ext::debug_utils::NAME.as_ptr()] } else { Vec::new() };
     let info = vk::InstanceCreateInfo::default()
         .application_info(&app)
         .enabled_layer_names(&layers)
@@ -345,6 +346,10 @@ pub struct Gpu {
     timestamp_period: f32,
     /// Whether VMA reads the system's budget (`VK_EXT_memory_budget`).
     has_budget: bool,
+    /// `VK_EXT_frame_boundary`, when a tool offers it: the next frame's number, each batch a frame.
+    frames: Option<std::sync::atomic::AtomicU64>,
+    /// `CLEAVE_VK_LABELS=1`: kernels and dispatches named for tools (`VK_EXT_debug_utils`).
+    labels: Option<ash::ext::debug_utils::Device>,
     /// `VK_KHR_pipeline_executable_properties`, when the device has it: every pipeline is created
     /// with its statistics captured (registers, local and shared memory... as the driver reports
     /// them), read back by [`Gpu::kernel_statistics`].
@@ -383,7 +388,10 @@ impl Gpu {
 
     pub fn open(options: &Options) -> Result<Gpu, Error> {
         let validation = options.validation;
-        let (entry, instance) = create_instance(validation)?;
+        // `CLEAVE_VK_LABELS=1`: each kernel's pipeline named and each dispatch labeled with its
+        // name (`VK_EXT_debug_utils`), what a profiler or frame debugger shows (Nsight Graphics).
+        let labels = std::env::var("CLEAVE_VK_LABELS").is_ok_and(|v| v == "1");
+        let (entry, instance) = create_instance(validation, labels)?;
         let debug = if validation {
             let utils = ash::ext::debug_utils::Instance::new(&entry, &instance);
             let info = vk::DebugUtilsMessengerCreateInfoEXT::default()
@@ -463,6 +471,13 @@ impl Gpu {
         if has_coopmat2 {
             extensions.push(COOPERATIVE_MATRIX2_NAME.as_ptr());
         }
+        // `VK_EXT_frame_boundary`, where a tool offers it (Nsight Graphics' layer): each batch
+        // submitted is marked a frame, what a frame debugger or profiler captures in a program that
+        // presents nothing.
+        let has_frames = has(FRAME_BOUNDARY_NAME);
+        if has_frames {
+            extensions.push(FRAME_BOUNDARY_NAME.as_ptr());
+        }
         let features =
             OptionalFeatures::query(&instance, physical, has_coopmat, has_bf16, has_statistics, has_coopmat2);
         if has_coopmat2 && std::env::var_os("CLEAVE_VK_SHOW_FEATURES").is_some() {
@@ -475,6 +490,10 @@ impl Gpu {
         let mut enabled = features.clone();
         let mut enabled2 = vk::PhysicalDeviceFeatures2::default();
         enabled.link(&mut enabled2, has_coopmat, has_bf16, has_statistics, has_coopmat2);
+        let mut frames = vk::PhysicalDeviceFrameBoundaryFeaturesEXT::default().frame_boundary(true);
+        if has_frames {
+            enabled2 = enabled2.push_next(&mut frames);
+        }
         let device_info = vk::DeviceCreateInfo::default().queue_create_infos(&queues).enabled_extension_names(&extensions);
         let device_info = if device_version >= vk::API_VERSION_1_2 {
             vk::DeviceCreateInfo { p_next: (&raw const enabled2).cast(), ..device_info }
@@ -517,6 +536,7 @@ impl Gpu {
         let timestamp_period = unsafe { instance.get_physical_device_properties(physical) }.limits.timestamp_period;
         let executable_properties = (has_statistics && features.statistics.pipeline_executable_info != 0)
             .then(|| ash::khr::pipeline_executable_properties::Device::new(&instance, &device));
+        let debug_labels = labels.then(|| ash::ext::debug_utils::Device::new(&instance, &device));
         Ok(Gpu {
             info: infos[chosen].clone(),
             allocator: std::mem::ManuallyDrop::new(allocator),
@@ -527,6 +547,8 @@ impl Gpu {
             max_push_descriptors,
             timestamp_period,
             has_budget,
+            frames: has_frames.then(|| std::sync::atomic::AtomicU64::new(0)),
+            labels: debug_labels,
             executable_properties,
             debug,
             instance,
@@ -1810,8 +1832,14 @@ impl Runtime {
             );
             device.end_command_buffer(batch.command).unwrap_or_else(|e| abort_with(format!("ending a command buffer: {e}")));
             let commands = [batch.command];
+            let mut frame = vk::FrameBoundaryEXT::default().flags(vk::FrameBoundaryFlagsEXT::FRAME_END);
+            let mut submit = vk::SubmitInfo::default().command_buffers(&commands);
+            if let Some(frames) = &self.gpu.frames {
+                frame = frame.frame_id(frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+                submit = submit.push_next(&mut frame);
+            }
             device
-                .queue_submit(self.gpu.queue, &[vk::SubmitInfo::default().command_buffers(&commands)], batch.fence)
+                .queue_submit(self.gpu.queue, &[submit], batch.fence)
                 .unwrap_or_else(|e| abort_with(format!("submitting a batch: {e}")));
         }
         self.stats.submits += 1;
@@ -2276,6 +2304,22 @@ unsafe fn dispatch(
         let kernel = gpu
             .kernel_specialized(binary, entry, count as u32, constants)
             .unwrap_or_else(|e| abort_with(format!("kernel `{key_name}`: {e}")));
+        // `CLEAVE_VK_KERNEL_STATISTICS=1`: what the driver reports of each kernel's compiled code
+        // as it's created (registers per thread, local memory: spills; `Gpu::kernel_statistics`).
+        if std::env::var("CLEAVE_VK_KERNEL_STATISTICS").is_ok_and(|v| v == "1") {
+            let statistics: Vec<String> =
+                gpu.kernel_statistics(&kernel).into_iter().map(|(name, value)| format!("{name} {value}")).collect();
+            eprintln!(
+                "cleave Vulkan kernel {key_name} #{} [{groups_x}, {groups_y}, {groups_z}]: {}",
+                runtime.profile.len(),
+                statistics.join(", ")
+            );
+        }
+        if let Some(labels) = &gpu.labels {
+            let name = std::ffi::CString::new(format!("{key_name} #{}", runtime.profile.len())).unwrap_or_default();
+            let info = vk::DebugUtilsObjectNameInfoEXT::default().object_handle(kernel.pipeline).object_name(&name);
+            let _ = unsafe { labels.set_debug_utils_object_name(&info) };
+        }
         runtime.kernels.insert(key.clone(), kernel);
         let id = runtime.profile.len();
         runtime.profile.push(KernelProfile {
@@ -2425,7 +2469,15 @@ unsafe fn dispatch(
             }
             (None, None) => unreachable!("a kernel pushes its buffers only with VK_KHR_push_descriptor"),
         }
+        let label = gpu.labels.as_ref().map(|labels| {
+            let name = std::ffi::CString::new(runtime.profile[kernel_id].name.clone()).unwrap_or_default();
+            labels.cmd_begin_debug_utils_label(command, &vk::DebugUtilsLabelEXT::default().label_name(&name));
+            labels
+        });
         device.cmd_dispatch(command, groups_x as u32, groups_y as u32, groups_z as u32);
+        if let Some(labels) = label {
+            labels.cmd_end_debug_utils_label(command);
+        }
         if let Some((pool, first)) = query {
             device.cmd_write_timestamp(command, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, first + 1);
         }
