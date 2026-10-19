@@ -1064,6 +1064,11 @@ pub struct Stats {
     /// kernel ran (the union of their intervals).
     pub batch_span_ns: u64,
     pub batch_busy_ns: u64,
+    /// `CLEAVE_VK_PROFILE`: the device's clock at the first timed kernel's
+    /// start and the last one's end, every batch's (ticks): the window the
+    /// device worked in, against which the batches' spans tell how long it
+    /// waited for the host between batches.
+    pub device_window: Option<(u64, u64)>,
     /// The most device memory the process used (`Gpu::device_memory`), as
     /// a new buffer was made, and then: the budget, the mirrors', the spare
     /// buffers', VMA's blocks' and allocations'.
@@ -1180,6 +1185,13 @@ struct Runtime {
     /// Profiling: the downloads host reads caused, by the function reading
     /// (count, bytes).
     host_reads: std::collections::HashMap<String, (u64, u64)>,
+    /// Profiling: why the queue is being drained (the host read waiting for
+    /// it, `cleave_vk_sync_host`'s caller), and, once drained, since when
+    /// and why: the device then waits for the host's next submit, a wait
+    /// counted against that cause (`idle_by_cause`: time, drains).
+    drain_cause: Option<String>,
+    drained: Option<(std::time::Instant, String)>,
+    idle_by_cause: std::collections::HashMap<String, (u64, u64)>,
     /// Buffers whose last use the device has finished, kept for the next
     /// one of the same size and kind (mapped for the host or not) instead of
     /// freed: a step makes and frees the same sizes thousands of times (each
@@ -1315,6 +1327,9 @@ fn runtime(guard: &mut Option<Runtime>) -> &mut Runtime {
             kernel_ids: Default::default(),
             profile: Vec::new(),
             host_reads: Default::default(),
+            drain_cause: None,
+            drained: None,
+            idle_by_cause: Default::default(),
             spare: Default::default(),
             spare_bytes: [0, 0],
             spare_order: Default::default(),
@@ -1406,6 +1421,17 @@ extern "C" fn report() {
         idle as f64 / 1e6,
         100.0 * idle as f64 / s.batch_span_ns.max(1) as f64
     );
+    if let Some((first, last)) = s.device_window {
+        let window = ((last - first) as f64 * runtime.gpu.timestamp_period as f64) as u64;
+        let waiting = window.saturating_sub(s.batch_span_ns);
+        let _ = writeln!(
+            out,
+            "  device window, first kernel to last: {:.1} ms, {:.1} ms ({:.0}%) of it between batches (waiting for the host)",
+            window as f64 / 1e6,
+            waiting as f64 / 1e6,
+            100.0 * waiting as f64 / window.max(1) as f64
+        );
+    }
     let [used, budget, mirrors, spare, blocks, allocations] = s.device_peak.map(|b| b as f64 / 1048576.0);
     let _ = writeln!(
         out,
@@ -1434,6 +1460,16 @@ extern "C" fn report() {
     readers.sort_by_key(|(_, (_, bytes))| std::cmp::Reverse(*bytes));
     for (name, (reads, bytes)) in readers.iter().take(10) {
         let _ = writeln!(out, "  {:>10.1} MiB down in {:>8} host reads  {}", mib(*bytes), reads, name);
+    }
+    let mut idle: Vec<(&String, &(u64, u64))> = runtime.idle_by_cause.iter().collect();
+    idle.sort_by_key(|(_, (ns, _))| std::cmp::Reverse(*ns));
+    let _ = writeln!(
+        out,
+        "  device idle after a drain, until the host's next submit: {:.1} ms",
+        idle.iter().map(|(_, (ns, _))| *ns).sum::<u64>() as f64 / 1e6
+    );
+    for (cause, (ns, drains)) in idle.iter().take(12) {
+        let _ = writeln!(out, "  {:>10.1} ms after {:>6} drains  {}", *ns as f64 / 1e6, drains, cause);
     }
     let causes: Vec<String> = UPLOAD_CAUSES
         .iter()
@@ -1676,6 +1712,9 @@ impl Runtime {
             // (what it holds freed or made spare), every spare freed, then once
             // more.
             Err(_) => {
+                if self.profiling {
+                    self.drain_cause = Some("out of device memory".to_string());
+                }
                 self.finish();
                 self.spare.clear();
                 self.spare_bytes = [0, 0];
@@ -1685,19 +1724,32 @@ impl Runtime {
                         Ok(buffer) => return buffer,
                         Err(e) if host => abort_with(format!("a buffer of {len} bytes: {e}")),
                         Err(e) => {
-                            // The least recently used mirror the dispatch being
-                            // prepared doesn't bind, its device copy brought home
-                            // first if newer.
-                            let victim = self
+                            // The least recently used mirrors the dispatch being
+                            // prepared doesn't bind, twice the bytes wanted (the
+                            // allocator's blocks are fragmented: freeing exactly
+                            // `len` seldom makes room for it), their device copies
+                            // brought home together: one wait per attempt, not
+                            // one per mirror (nanoLM: ~500 a step).
+                            let mut candidates: Vec<(u64, usize, usize)> = self
                                 .mirrors
                                 .iter()
                                 .filter(|(key, _)| !pinned.contains(key))
-                                .min_by_key(|(_, mirror)| mirror.last_use)
-                                .map(|(&key, _)| key);
-                            let Some(key) = victim else {
+                                .map(|(&key, mirror)| (mirror.last_use, key, mirror.len))
+                                .collect();
+                            if candidates.is_empty() {
                                 abort_with(format!("a buffer of {len} bytes, every mirror evicted: {e}"))
-                            };
-                            self.evict(key);
+                            }
+                            candidates.sort_unstable();
+                            let mut victims = Vec::new();
+                            let mut freed = 0usize;
+                            for (_, key, bytes) in candidates {
+                                if freed >= 2 * len {
+                                    break;
+                                }
+                                victims.push(key);
+                                freed += bytes;
+                            }
+                            self.evict_all(&victims);
                         }
                     }
                 }
@@ -1743,8 +1795,42 @@ impl Runtime {
         if !self.over_budget(len) {
             return;
         }
+        if self.profiling {
+            self.drain_cause = Some("over the memory budget (make_room)".to_string());
+        }
         self.finish();
         self.free_spare_device_buffers();
+        // The least recently used mirrors whose bytes cover what's over,
+        // brought home together: one wait for all of them, not one each (a
+        // drain apiece, the device idle between: nanoLM near its budget
+        // evicted ~500 mirrors a step).
+        if self.over_budget(len) {
+            let over = self.gpu.device_memory().map_or(0, |(used, budget)| {
+                (used + len as u64).saturating_sub(budget / 20 * 19) as usize
+            });
+            let mirror_over = device_budget().map_or(0, |budget| {
+                (self.mirrors.values().map(|m| m.len).sum::<usize>() + len).saturating_sub(budget)
+            });
+            let need = over.max(mirror_over);
+            let mut candidates: Vec<(u64, usize, usize)> = self
+                .mirrors
+                .iter()
+                .filter(|(key, _)| !pinned.contains(key))
+                .map(|(&key, mirror)| (mirror.last_use, key, mirror.len))
+                .collect();
+            candidates.sort_unstable();
+            let mut victims = Vec::new();
+            let mut freed = 0usize;
+            for (_, key, bytes) in candidates {
+                if freed >= need {
+                    break;
+                }
+                victims.push(key);
+                freed += bytes;
+            }
+            self.evict_all(&victims);
+            self.free_spare_device_buffers();
+        }
         while self.over_budget(len) {
             let victim = self
                 .mirrors
@@ -1762,7 +1848,29 @@ impl Runtime {
     /// Frees the mirror at `key`, the device being idle (`finish`): its
     /// contents brought home if the device wrote them since; the next
     /// dispatch that binds the payload uploads it again.
+    /// `evict` for several mirrors, their contents brought home together.
+    fn evict_all(&mut self, keys: &[usize]) {
+        if keys.is_empty() {
+            return;
+        }
+        if self.profiling && self.drain_cause.is_none() {
+            self.drain_cause = Some("evicted mirrors, together".to_string());
+        }
+        self.download(keys);
+        for &key in keys {
+            if let Some(mirror) = self.mirrors.remove(&key) {
+                drop(mirror.buffer);
+                self.stats.evictions += 1;
+            }
+        }
+        bump(&DEVICE_GENERATION);
+        bump(&HOST_GENERATION);
+    }
+
     fn evict(&mut self, key: usize) {
+        if self.profiling && self.drain_cause.is_none() {
+            self.drain_cause = Some("an evicted mirror".to_string());
+        }
         self.download(&[key]);
         if let Some(mirror) = self.mirrors.remove(&key) {
             drop(mirror.buffer);
@@ -1842,6 +1950,11 @@ impl Runtime {
                 .queue_submit(self.gpu.queue, &[submit], batch.fence)
                 .unwrap_or_else(|e| abort_with(format!("submitting a batch: {e}")));
         }
+        if let Some((since, cause)) = self.drained.take() {
+            let entry = self.idle_by_cause.entry(cause).or_default();
+            entry.0 += since.elapsed().as_nanos() as u64;
+            entry.1 += 1;
+        }
         self.stats.submits += 1;
         self.in_flight.push(batch);
         // What the device has finished released now, not at the host's next
@@ -1885,6 +1998,10 @@ impl Runtime {
         self.stats.wait_ns += waiting.elapsed().as_nanos() as u64;
         for batch in std::mem::take(&mut self.in_flight) {
             self.retire(batch);
+        }
+        if self.profiling {
+            let cause = self.drain_cause.take().unwrap_or_else(|| "other (end of run, budget, ...)".to_string());
+            self.drained = Some((std::time::Instant::now(), cause));
         }
         for message in self.gpu.validation_messages() {
             eprintln!("cleave Vulkan validation: {message}");
@@ -1941,6 +2058,10 @@ impl Runtime {
                     let period = self.gpu.timestamp_period as f64;
                     self.stats.batch_span_ns += ((last - first) as f64 * period) as u64;
                     self.stats.batch_busy_ns += (busy as f64 * period) as u64;
+                    self.stats.device_window = Some(match self.stats.device_window {
+                        Some((a, b)) => (a.min(first), b.max(last)),
+                        None => (first, last),
+                    });
                 }
             }
             unsafe { device.destroy_query_pool(pool, None) };
@@ -2042,6 +2163,9 @@ impl Runtime {
             .copied()
             .filter(|&key| !(discard && key >= start && key + self.mirrors[&key].len <= start + len))
             .collect();
+        if self.profiling && self.drain_cause.is_none() {
+            self.drain_cause = Some("a mirror retired by an overlapping one (mirror)".to_string());
+        }
         self.download(&kept);
         for key in retired {
             let mirror = self.mirrors.remove(&key).expect("a mirror");
@@ -2367,6 +2491,9 @@ unsafe fn dispatch(
     for i in 0..count {
         if flags[i] & ARG_MIRROR == 0 {
             let keys = runtime.overlapping(pointers[i] as usize, bytes[i] as usize);
+            if runtime.profiling && !keys.is_empty() {
+                runtime.drain_cause = Some(format!("a copied argument a mirror covers, for {}", runtime.profile[kernel_id].name));
+            }
             runtime.download(&keys);
         }
     }
@@ -2498,6 +2625,9 @@ unsafe fn dispatch(
     // live until the batch is done.
     let written_copies = (0..count).any(|i| flags[i] & ARG_WRITTEN != 0 && copies[i].is_some());
     if written_copies {
+        if runtime.profiling {
+            runtime.drain_cause = Some(format!("a copied argument written by {}", runtime.profile[kernel_id].name));
+        }
         runtime.finish();
     }
     for (i, copy) in copies.into_iter().enumerate() {
@@ -2605,7 +2735,11 @@ pub extern "C" fn cleave_vk_sync_host(ptr: i64, bytes: i64) {
         let waited = runtime.stats.wait_ns;
         let keys = runtime.overlapping(ptr as usize, bytes as usize);
         let before = runtime.stats.downloaded_bytes;
+        if runtime.profiling {
+            runtime.drain_cause = Some(reader());
+        }
         runtime.download(&keys);
+        runtime.drain_cause = None;
         let downloaded = runtime.stats.downloaded_bytes - before;
         if runtime.profiling && downloaded > 0 {
             let entry = runtime.host_reads.entry(reader()).or_default();

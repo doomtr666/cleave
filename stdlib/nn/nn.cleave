@@ -1557,6 +1557,13 @@ fn embedding_logits<const V: i32, const D: i32, const N: i32>(e: Embedding<f32, 
     matmul_transpose_b(h, e.table)
 }
 
+// `embedding_logits` with its product in bfloat16 (`matmul_bf16_transpose_b`: the f32 table and
+// vectors rounded, an f32 accumulator and result; its adjoint's products in bf16 as well), as
+// `dense_forward_bf16` is `dense_forward`'s.
+fn embedding_logits_bf16<const V: i32, const D: i32, const N: i32>(e: Embedding<f32, V, D>, h: Tensor<f32, N, D>) -> Tensor<f32, N, V> {
+    matmul_bf16_transpose_b(h, e.table)
+}
+
 impl<Opt: ElementwiseOptimizer, T: Float, const V: i32, const D: i32, S> Optimizer<Opt, Embedding<T, V, D>, S> {
     fn init_state(opt, e) { init_state(opt, e.table) }
     fn step(opt, e, grad, state) {

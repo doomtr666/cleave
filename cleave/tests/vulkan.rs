@@ -1421,6 +1421,118 @@ fn bf16_tensor_products_run_on_tensor_cores() {
     }
 }
 
+/// Products of bf16 tensors on the tensor cores into fresh destinations, ten of them: the kernel
+/// overwrites each whole, so none is uploaded (`cleave-lower-gpu-gemms`'s discard, the fill it
+/// leaves out having carried one). Without it, every destination was uploaded (7.5 MiB here;
+/// nanoLM 23k tokens/s to 5k).
+#[test]
+fn a_bf16_products_fresh_destination_is_not_uploaded() {
+    let src = "
+        use io;
+        use linalg;
+        use convert;
+        fn main() -> i32 {
+            let a: Tensor<bf16, 512, 256> = [for i in 0..512: [for j in 0..256: rem(i + j, 3).to()]];
+            let b: Tensor<bf16, 256, 384> = [for i in 0..256: [for j in 0..384: rem(i * j, 2).to()]];
+            let mut acc: Tensor<f32, 512, 384> = [for i in 0..512: [for j in 0..384: 0.0]];
+            for it in 0..10 {
+                let c: Tensor<f32, 512, 384> = matmul(a, b).to();
+                acc = acc + c;
+            };
+            println(acc[5, 7]);
+            0
+        }
+    ";
+    for (index, device) in devices().iter().enumerate() {
+        if !device.cooperative_matrices.iter().any(|s| s.a == "bf16" && s.c == "f32") {
+            eprintln!("skipped on {}: no bf16 cooperative matrices", device.name);
+            continue;
+        }
+        let (stdout, stderr) = stats_on(index, "bf16_fresh_destination", src);
+        assert!(stdout.contains("1280"), "{}: {stdout}{stderr}", device.name);
+        assert!(stderr.contains(" 0 bytes uploaded"), "{}: {stderr}", device.name);
+        assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
+    }
+}
+
+/// A cross-entropy's gradient between an output head's bf16 products (`embedding_logits_bf16`):
+/// the loop computing it from the logits runs on the device, though the buffers it reads and
+/// writes reach the runtime's GEMMs by address (`allocationStaysLocal`'s runtime addresses). It
+/// stayed on the host, each step's logits brought back and its gradient sent up (12 submits;
+/// nanoLM 41 GB each way over 20 steps). Ten gradients: the inputs uploaded once, the sum
+/// downloaded once, one submit; the CPU's value up to the bf16 rounding of the products.
+#[test]
+fn a_cross_entropy_between_bf16_products_stays_on_the_device() {
+    let src = "
+        use io;
+        use linalg;
+        use convert;
+        use nn;
+        fn loss(h: Tensor<f32, 128, 128>, y: [i32; 128], e: Embedding<f32, 256, 128>) -> f32 {
+            sparse_cross_entropy(embedding_logits_bf16(e, h), y)
+        }
+        dloss = grad(loss, e);
+        fn main() -> i32 {
+            rand_seed(1);
+            let e: Embedding<f32, 256, 128> = Init::xavier();
+            let h: Tensor<f32, 128, 128> = Init::xavier();
+            let y: [i32; 128] = [for i in 0..128: i * 7 - (i * 7 / 256) * 256];
+            let mut acc: Tensor<f32, 256, 128> = [for i in 0..256: [for j in 0..128: 0.0]];
+            for it in 0..10 {
+                let g = dloss(h, y, e);
+                acc = acc + g.table;
+            };
+            println(acc[3, 5]);
+            0
+        }
+    ";
+    let numbers = |out: &str| -> Vec<f64> { out.lines().filter_map(|l| l.trim().parse().ok()).collect() };
+    let expected = numbers(&run_cpu("bf16_head_cross_entropy", src));
+    assert_eq!(expected.len(), 1, "{expected:?}");
+    for (index, device) in devices().iter().enumerate() {
+        if !device.cooperative_matrices.iter().any(|s| s.a == "bf16" && s.c == "f32") {
+            eprintln!("skipped on {}: no bf16 cooperative matrices", device.name);
+            continue;
+        }
+        let (stdout, stderr) = stats_on(index, "bf16_head_cross_entropy", src);
+        let got = numbers(&stdout);
+        assert!(got.len() == 1 && (got[0] - expected[0]).abs() <= 1e-3 * expected[0].abs(), "{}: {stdout} vs {expected:?}", device.name);
+        assert!(stderr.contains(" 131072 bytes downloaded, 1 submits"), "{}: {stderr}", device.name);
+        assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
+    }
+}
+
+/// A product of bf16 tensors accumulating into its destination (`fma`, `matmul_add`), of a shape
+/// the tensor cores' kernel takes: that kernel stores `C` without reading it, so the product stays
+/// a generated kernel and keeps the destination's values. It was the kernel, the destination lost
+/// (63 for 1063), while a product from zeros drops its fill (`cleave-lower-gpu-gemms`).
+#[test]
+fn a_bf16_product_accumulating_into_its_destination_keeps_it() {
+    let src = "
+        use io;
+        use linalg;
+        use convert;
+        fn main() -> i32 {
+            let a: Tensor<bf16, 128, 128> = [for i in 0..128: [for j in 0..128: rem(i + j, 3).to()]];
+            let b: Tensor<bf16, 128, 128> = [for i in 0..128: [for j in 0..128: rem(i * j, 2).to()]];
+            let c: Tensor<f32, 128, 128> = [for i in 0..128: [for j in 0..128: 1000.0]];
+            println(fma(a, b, c)[5, 7]);
+            0
+        }
+    ";
+    let numbers = |out: &str| -> Vec<f64> { out.lines().filter_map(|l| l.trim().parse().ok()).collect() };
+    assert_eq!(numbers(&run_cpu("bf16_accumulating_product", src)), vec![1063.0]);
+    for (index, device) in devices().iter().enumerate() {
+        if !device.cooperative_matrices.iter().any(|s| s.a == "bf16" && s.c == "f32") {
+            eprintln!("skipped on {}: no bf16 cooperative matrices", device.name);
+            continue;
+        }
+        let (stdout, stderr) = run_on(index, "bf16_accumulating_product", src);
+        assert_eq!(numbers(&stdout), vec![1063.0], "{}: {stdout}{stderr}", device.name);
+        assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
+    }
+}
+
 // The bf16 attention's scores, softmax and weighted values fused into one
 // kernel (`cleave-fuse-row-pipelines`): whole rows of the scores and weights
 // in the workgroup's memory when they fit (L = 256), else blocks of 64

@@ -920,7 +920,7 @@ pub fn lower_to_llvm<'c>(
              gpu.module(arith-emulate-unsupported-floats{source-types=bf16 target-type=f32},\
              math-extend-to-supported-types{target-type=f32}),\
              spirv-attach-target{ver=v1.6 caps=Shader,StorageBuffer16BitAccess,BFloat16TypeKHR,\
-             CooperativeMatrixKHR,BFloat16CooperativeMatrixKHR \
+             CooperativeMatrixKHR,BFloat16CooperativeMatrixKHR,GroupNonUniform,GroupNonUniformShuffle \
              exts=SPV_KHR_storage_buffer_storage_class,SPV_KHR_16bit_storage,SPV_KHR_bfloat16,\
              SPV_KHR_cooperative_matrix},cleave-spirv-target-env,\
              cleave-accurate-kernel-math,gpu.module(convert-math-to-spirv),convert-gpu-to-spirv,\

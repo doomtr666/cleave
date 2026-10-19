@@ -208,8 +208,8 @@ fn new_gpt() -> Gpt {
 // once per row count instead of once per layer (the training gradient is synthesized from its body by the
 // e-graph, unaffected). Rows are whole sequences of `CONTEXT`: row `r` is position `r mod CONTEXT`.
 // The projections and the MLP compute their products in bfloat16 (`dense_forward_bf16`,
-// `swiglu_forward_bf16`: tensor cores on the GPU, f32 weights and accumulation); the norms, the
-// attention, the residuals and the output head stay in f32.
+// `swiglu_forward_bf16`: tensor cores on the GPU, f32 weights and accumulation), as do the
+// attention's and the output head's (`gpt_logits`); the norms and the residuals stay in f32.
 #[no_inline]
 fn block<const N: i32>(x: Tensor<f32, N, WIDTH>, b: Block) -> Tensor<f32, N, WIDTH> {
     let shape = AttentionShape::<CONTEXT, HEAD>();
@@ -228,7 +228,7 @@ fn gpt_logits<const N: i32>(x: [i32; N], m: Gpt) -> Tensor<f32, N, VOCAB> {
     let h0 = embedding_forward(m.tok, x);
     let mut h = h0;
     for i in 0..LAYERS { h = block(h, m.blocks[i]); };
-    embedding_logits(m.tok, rms_norm(h, m.nf))
+    embedding_logits_bf16(m.tok, rms_norm(h, m.nf))
 }
 
 // Data parallelism (`doc/plan-spawn.md`): a batch's `ROWS` split into `SPLIT`
