@@ -336,8 +336,21 @@ impl Build {
         // `cleave-rt` would each have their own allocator state, and the
         // Vulkan runtime's free hook would hear only the one it was set in.
         let runtime = if options.backend == cleave::pipeline::Backend::Vulkan { "cleave-vk" } else { "cleave-rt" };
-        println!("cargo:rustc-link-lib=static={}", runtime.replace('-', "_"));
-        println!("cargo:rustc-link-search=native={}", build_runtime(&out_dir, runtime).display());
+        let runtime_dir = build_runtime(&out_dir, runtime);
+        if cfg!(windows) {
+            println!("cargo:rustc-link-lib=static={}", runtime.replace('-', "_"));
+            println!("cargo:rustc-link-search=native={}", runtime_dir.display());
+        } else {
+            // After the kernel's object, by path: rustc puts `rustc-link-arg`s
+            // last, behind every `rustc-link-lib`, and GNU `ld` resolves an
+            // object's references only against the archives after it.
+            // `cleave-vk`'s holds VMA, C++: its standard library, which MSVC's
+            // objects name themselves.
+            println!("cargo:rustc-link-arg={}", runtime_dir.join(format!("lib{}.a", runtime.replace('-', "_"))).display());
+            if options.backend == cleave::pipeline::Backend::Vulkan {
+                println!("cargo:rustc-link-arg=-lstdc++");
+            }
+        }
 
         // `--openmp`'s parallel loops, or `spawn`'s tasks (`cleave::pipeline::
         // compile_and_emit`'s result).
@@ -347,8 +360,15 @@ impl Build {
             // scripts too).
             let prefix = cleave::toolchain::llvm_prefix().unwrap_or_else(|e| panic!("cleave-build: {e} to link libomp"));
             let lib_dir = cleave::toolchain::libomp_link_dir(&prefix);
-            println!("cargo:rustc-link-lib=dylib={}", cleave::toolchain::LIBOMP_LINK_NAME);
-            println!("cargo:rustc-link-search=native={lib_dir}");
+            if cfg!(windows) {
+                println!("cargo:rustc-link-lib=dylib={}", cleave::toolchain::LIBOMP_LINK_NAME);
+                println!("cargo:rustc-link-search=native={lib_dir}");
+            } else {
+                // After the object too: ahead of it, `--as-needed` (rustc's
+                // default) drops a library nothing before it uses.
+                println!("cargo:rustc-link-arg=-L{lib_dir}");
+                println!("cargo:rustc-link-arg=-l{}", cleave::toolchain::LIBOMP_LINK_NAME);
+            }
             if cfg!(windows) {
                 // The DLL next to the binary, where Windows looks for it at
                 // start: `OUT_DIR` (`target/<profile>/build/<pkg>/out`) is

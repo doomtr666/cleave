@@ -159,9 +159,18 @@ impl<const A0: i32, const A1: i32, const B0: i32, const B1: i32, const C0: i32, 
         // before bufferization). A function returning `c`'s buffer copies
         // it into its plain-layout result, a copy removed in turn
         // (`cleave_mlir::forward_copies_to_destinations`).
+        //
+        // `c`'s buffer first: `raw_sgemm` reads `a` and `b` while it writes
+        // `c`, so their reads come after its write for One-Shot Bufferize,
+        // and `c` gets a buffer of its own whenever it is `a` or `b`'s
+        // tensor (a read after a write of the same buffer). Taken after
+        // theirs, the reads came first, and `sgemm(.., blk, b, 0.0, blk)`
+        // wrote the block it was still reading (zeros where OpenBLAS clears
+        // `C` before reading `A`: `a_block_read_by_its_own_write_is_still_copied`
+        // on some CI machines).
+        let mut c_buf: [f32;C0,C1] = mlir::bufferization::to_buffer(c, layout: "strided<[?, ?], offset: ?>");
         let a_buf: [f32;A0,A1] = mlir::bufferization::to_buffer(a, read_only: "unit", layout: "strided<[?, ?], offset: ?>");
         let b_buf: [f32;B0,B1] = mlir::bufferization::to_buffer(b, read_only: "unit", layout: "strided<[?, ?], offset: ?>");
-        let mut c_buf: [f32;C0,C1] = mlir::bufferization::to_buffer(c, layout: "strided<[?, ?], offset: ?>");
         let lda: i32 = mlir::memref::stride(a_buf, 0);
         let ldb: i32 = mlir::memref::stride(b_buf, 0);
         let ldc: i32 = mlir::memref::stride(c_buf, 0);

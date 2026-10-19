@@ -70,7 +70,7 @@ fn compile_object(
 fn disassemble(object_path: &std::path::Path) -> String {
     let prefix = std::env::var("CLEAVE_LLVM_PREFIX")
         .expect("CLEAVE_LLVM_PREFIX must be set to disassemble the probe object");
-    let objdump = std::path::Path::new(&prefix).join("bin/llvm-objdump.exe");
+    let objdump = std::path::Path::new(&prefix).join(format!("bin/llvm-objdump{}", std::env::consts::EXE_SUFFIX));
     let output = Command::new(&objdump)
         .arg("-d")
         .arg("--x86-asm-syntax=intel")

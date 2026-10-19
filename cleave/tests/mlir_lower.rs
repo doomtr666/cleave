@@ -7816,6 +7816,31 @@ fn bf16_arithmetic_rounds_to_bf16() {
     assert_eq!(run_i32(&context, src), 1);
 }
 
+/// Tensors narrowed to `bf16` on a CPU without a conversion instruction (`x86-64-v3`: no AVX-512
+/// BF16, like GitHub's Windows runners): LLVM calls compiler-rt's `__truncsfbf2`, which
+/// `cleave-rt` provides (`register_cleave_rt_symbols`). It wasn't there: every bf16 program failed
+/// to link on such a CPU. The values are the native instruction's (1.0625 and 32.96875 here).
+#[test]
+fn bf16_narrows_on_a_cpu_without_a_bf16_instruction() {
+    let src = "
+        use convert;
+        use linalg;
+        use nn;
+        fn main() -> i32 {
+            let x: Tensor<f32, 4, 8> = [for i in 0..4: [for j in 0..8: 1.0 + (i * 8 + j).to() / 512.0]];
+            let b: Tensor<bf16, 4, 8> = x.to();
+            let y: Tensor<f32, 4, 8> = b.to();
+            if y[3, 7] == 1.0625 and sum(y) == 32.96875 { 1 } else { 0 }
+        }
+    ";
+    let options = CodegenOptions {
+        openmp: false,
+        target_cpu: Some("x86-64-v3".to_string()),
+        ..CodegenOptions::default()
+    };
+    assert_eq!(cleave::run::run_source("bf16_narrow.cleave", src, &options), Ok(1));
+}
+
 /// A product of `bf16` tensors accumulates in f32 and is rounded once (`mlir_lower.rs`,
 /// `widened_16_bit_float_tensor`): 259 ones sum to 259, rounded to the bf16 260 (a tie, to the
 /// even mantissa), where accumulating in bf16 would stick at 256 (`256 + 1` rounds back to 256).

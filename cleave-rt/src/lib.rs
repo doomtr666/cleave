@@ -2768,6 +2768,26 @@ pub unsafe extern "C" fn memrefCopy(elem_size: i64, src: *const UnrankedMemRef, 
         }
     }
 }
+
+/// A float32 rounded to bfloat16, to nearest with ties to even, a NaN kept a
+/// quiet NaN: compiler-rt's `__truncsfbf2`, which LLVM calls for a
+/// conversion to `bf16` on a CPU without one (AVX-512 BF16's `vcvtneps2bf16`
+/// on a Zen 4/5; none on GitHub's Windows runners, where every bf16 program
+/// failed to link). The `bf16` comes back as LLVM passes one, in the low 16
+/// bits of the float register (`xmm0`): an `f32` with those bits.
+#[unsafe(no_mangle)]
+pub extern "C" fn __truncsfbf2(x: f32) -> f32 {
+    f32::from_bits(u32::from(f32_to_bf16_bits(x)))
+}
+
+/// `__truncsfbf2`'s rounding, on the bits.
+fn f32_to_bf16_bits(x: f32) -> u16 {
+    let bits = x.to_bits();
+    if x.is_nan() {
+        return ((bits >> 16) | 0x40) as u16;
+    }
+    (bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) >> 16) as u16
+}
 /// A `Buffer<T>` (`stdlib/buffer`, `doc/plan-buffer.md`): the refcounted
 /// object (`cleave_alloc_rc`) a buffer value points to. `data` is a separate
 /// allocation of `cap` slots of `slot_bytes` each, so growing it leaves the
@@ -2920,6 +2940,42 @@ pub extern "C" fn rand_normal_f64() -> f64 {
     let u1 = rand_uniform_f64().max(1e-15);
     let u2 = rand_uniform_f64();
     (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+}
+
+#[cfg(test)]
+mod bf16_tests {
+    use super::{__truncsfbf2, f32_to_bf16_bits};
+
+    #[test]
+    fn rounds_to_nearest_with_ties_to_even() {
+        assert_eq!(f32_to_bf16_bits(1.0), 0x3f80);
+        assert_eq!(f32_to_bf16_bits(-2.5), 0xc020);
+        // 1 + 2^-8: halfway between 1 (0x3f80) and 1 + 2^-7 (0x3f81), to the even one.
+        assert_eq!(f32_to_bf16_bits(1.00390625), 0x3f80);
+        // 1 + 3 * 2^-8: halfway between 0x3f81 and 0x3f82, to the even one.
+        assert_eq!(f32_to_bf16_bits(1.01171875), 0x3f82);
+        // Just past halfway: up.
+        assert_eq!(f32_to_bf16_bits(f32::from_bits(0x3f80_8001)), 0x3f81);
+    }
+
+    #[test]
+    fn keeps_infinities_and_overflows_to_them() {
+        assert_eq!(f32_to_bf16_bits(f32::INFINITY), 0x7f80);
+        assert_eq!(f32_to_bf16_bits(f32::NEG_INFINITY), 0xff80);
+        assert_eq!(f32_to_bf16_bits(f32::MAX), 0x7f80);
+    }
+
+    #[test]
+    fn a_nan_stays_a_quiet_nan() {
+        let bits = f32_to_bf16_bits(f32::from_bits(0x7f80_0001));
+        assert_eq!(bits & 0x7f80, 0x7f80);
+        assert_ne!(bits & 0x7f, 0);
+    }
+
+    #[test]
+    fn returns_the_bits_low_in_a_float() {
+        assert_eq!(__truncsfbf2(1.01171875).to_bits(), 0x3f82);
+    }
 }
 
 #[cfg(test)]

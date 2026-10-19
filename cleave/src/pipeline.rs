@@ -611,86 +611,102 @@ pub fn compile_and_emit(
 /// SAFETY: each `cleave_rt::*` pointer is a real, valid `extern "C" fn`,
 /// live for the process's whole lifetime.
 pub unsafe fn register_cleave_rt_symbols(engine: &cleave_mlir::ExecutionEngine) {
-    unsafe {
-        engine.register_symbol("memrefCopy", cleave_rt::memrefCopy as *mut ());
-        engine.register_symbol("cleave_vk_dispatch", cleave_vk::cleave_vk_dispatch as *mut ());
-        engine.register_symbol("cleave_vk_gemm_bf16", cleave_vk::cleave_vk_gemm_bf16 as *mut ());
-        engine.register_symbol("cleave_vk_gemm_bf16_operands", cleave_vk::cleave_vk_gemm_bf16_operands as *mut ());
-        engine.register_symbol("cleave_vk_sync_host", cleave_vk::cleave_vk_sync_host as *mut ());
-        engine.register_symbol("cleave_vk_host_wrote", cleave_vk::cleave_vk_host_wrote as *mut ());
-        engine.register_symbol("cleave_vk_discard", cleave_vk::cleave_vk_discard as *mut ());
-        engine.register_symbol("cleave_parallel_threads", cleave_rt::cleave_parallel_threads as *mut ());
-        engine.register_symbol("cleave_bind_worker", cleave_rt::cleave_bind_worker as *mut ());
-        engine.register_symbol("rand_seed", cleave_rt::rand_seed as *mut ());
-        engine.register_symbol("rand_state", cleave_rt::rand_state as *mut ());
-        engine.register_symbol("cleave_ckpt_create", cleave_rt::checkpoint::cleave_ckpt_create as *mut ());
-        engine.register_symbol("cleave_ckpt_open", cleave_rt::checkpoint::cleave_ckpt_open as *mut ());
-        engine.register_symbol("cleave_ckpt_close", cleave_rt::checkpoint::cleave_ckpt_close as *mut ());
-        engine.register_symbol("cleave_ckpt_write_f32s", cleave_rt::checkpoint::cleave_ckpt_write_f32s as *mut ());
-        engine.register_symbol("cleave_ckpt_read_f32s", cleave_rt::checkpoint::cleave_ckpt_read_f32s as *mut ());
-        engine.register_symbol("cleave_ckpt_write_f32", cleave_rt::checkpoint::cleave_ckpt_write_f32 as *mut ());
-        engine.register_symbol("cleave_ckpt_read_f32", cleave_rt::checkpoint::cleave_ckpt_read_f32 as *mut ());
-        engine.register_symbol("cleave_ckpt_write_f64", cleave_rt::checkpoint::cleave_ckpt_write_f64 as *mut ());
-        engine.register_symbol("cleave_ckpt_read_f64", cleave_rt::checkpoint::cleave_ckpt_read_f64 as *mut ());
-        engine.register_symbol("cleave_ckpt_write_i32", cleave_rt::checkpoint::cleave_ckpt_write_i32 as *mut ());
-        engine.register_symbol("cleave_ckpt_read_i32", cleave_rt::checkpoint::cleave_ckpt_read_i32 as *mut ());
-        engine.register_symbol("cleave_ckpt_write_i64", cleave_rt::checkpoint::cleave_ckpt_write_i64 as *mut ());
-        engine.register_symbol("cleave_ckpt_read_i64", cleave_rt::checkpoint::cleave_ckpt_read_i64 as *mut ());
-        engine.register_symbol("rand_uniform_f32", cleave_rt::rand_uniform_f32 as *mut ());
-        engine.register_symbol("rand_uniform_f64", cleave_rt::rand_uniform_f64 as *mut ());
-        engine.register_symbol("rand_normal_f32", cleave_rt::rand_normal_f32 as *mut ());
-        engine.register_symbol("rand_normal_f64", cleave_rt::rand_normal_f64 as *mut ());
-        engine.register_symbol("print_i8", cleave_rt::print_i8 as *mut ());
-        engine.register_symbol("print_i16", cleave_rt::print_i16 as *mut ());
-        engine.register_symbol("print_i32", cleave_rt::print_i32 as *mut ());
-        engine.register_symbol("print_i64", cleave_rt::print_i64 as *mut ());
-        engine.register_symbol("print_f32", cleave_rt::print_f32 as *mut ());
-        engine.register_symbol("print_f64", cleave_rt::print_f64 as *mut ());
-        engine.register_symbol("print_bytes", cleave_rt::print_bytes as *mut ());
-        engine.register_symbol(
+    unsafe { register_cleave_rt_symbols_but(engine, &[]) }
+}
+
+/// `register_cleave_rt_symbols` without the symbols named in `replaced`,
+/// which the caller registers its own way (a test's stand-in for one: the
+/// engine takes a name once).
+///
+/// SAFETY: as `register_cleave_rt_symbols`.
+pub unsafe fn register_cleave_rt_symbols_but(engine: &cleave_mlir::ExecutionEngine, replaced: &[&str]) {
+    let register = |name: &str, f: *mut ()| {
+        if !replaced.contains(&name) {
+            // SAFETY: `f` is one of the `cleave_rt`/`cleave_vk` functions below.
+            unsafe { engine.register_symbol(name, f) }
+        }
+    };
+    {
+        register("memrefCopy", cleave_rt::memrefCopy as *mut ());
+        register("__truncsfbf2", cleave_rt::__truncsfbf2 as *mut ());
+        register("cleave_vk_dispatch", cleave_vk::cleave_vk_dispatch as *mut ());
+        register("cleave_vk_gemm_bf16", cleave_vk::cleave_vk_gemm_bf16 as *mut ());
+        register("cleave_vk_gemm_bf16_operands", cleave_vk::cleave_vk_gemm_bf16_operands as *mut ());
+        register("cleave_vk_sync_host", cleave_vk::cleave_vk_sync_host as *mut ());
+        register("cleave_vk_host_wrote", cleave_vk::cleave_vk_host_wrote as *mut ());
+        register("cleave_vk_discard", cleave_vk::cleave_vk_discard as *mut ());
+        register("cleave_parallel_threads", cleave_rt::cleave_parallel_threads as *mut ());
+        register("cleave_bind_worker", cleave_rt::cleave_bind_worker as *mut ());
+        register("rand_seed", cleave_rt::rand_seed as *mut ());
+        register("rand_state", cleave_rt::rand_state as *mut ());
+        register("cleave_ckpt_create", cleave_rt::checkpoint::cleave_ckpt_create as *mut ());
+        register("cleave_ckpt_open", cleave_rt::checkpoint::cleave_ckpt_open as *mut ());
+        register("cleave_ckpt_close", cleave_rt::checkpoint::cleave_ckpt_close as *mut ());
+        register("cleave_ckpt_write_f32s", cleave_rt::checkpoint::cleave_ckpt_write_f32s as *mut ());
+        register("cleave_ckpt_read_f32s", cleave_rt::checkpoint::cleave_ckpt_read_f32s as *mut ());
+        register("cleave_ckpt_write_f32", cleave_rt::checkpoint::cleave_ckpt_write_f32 as *mut ());
+        register("cleave_ckpt_read_f32", cleave_rt::checkpoint::cleave_ckpt_read_f32 as *mut ());
+        register("cleave_ckpt_write_f64", cleave_rt::checkpoint::cleave_ckpt_write_f64 as *mut ());
+        register("cleave_ckpt_read_f64", cleave_rt::checkpoint::cleave_ckpt_read_f64 as *mut ());
+        register("cleave_ckpt_write_i32", cleave_rt::checkpoint::cleave_ckpt_write_i32 as *mut ());
+        register("cleave_ckpt_read_i32", cleave_rt::checkpoint::cleave_ckpt_read_i32 as *mut ());
+        register("cleave_ckpt_write_i64", cleave_rt::checkpoint::cleave_ckpt_write_i64 as *mut ());
+        register("cleave_ckpt_read_i64", cleave_rt::checkpoint::cleave_ckpt_read_i64 as *mut ());
+        register("rand_uniform_f32", cleave_rt::rand_uniform_f32 as *mut ());
+        register("rand_uniform_f64", cleave_rt::rand_uniform_f64 as *mut ());
+        register("rand_normal_f32", cleave_rt::rand_normal_f32 as *mut ());
+        register("rand_normal_f64", cleave_rt::rand_normal_f64 as *mut ());
+        register("print_i8", cleave_rt::print_i8 as *mut ());
+        register("print_i16", cleave_rt::print_i16 as *mut ());
+        register("print_i32", cleave_rt::print_i32 as *mut ());
+        register("print_i64", cleave_rt::print_i64 as *mut ());
+        register("print_f32", cleave_rt::print_f32 as *mut ());
+        register("print_f64", cleave_rt::print_f64 as *mut ());
+        register("print_bytes", cleave_rt::print_bytes as *mut ());
+        register(
             "print_buffer_bytes",
             cleave_rt::print_buffer_bytes as *mut (),
         );
-        engine.register_symbol("format_f32", cleave_rt::format_f32 as *mut ());
-        engine.register_symbol("format_f64", cleave_rt::format_f64 as *mut ());
-        engine.register_symbol("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
-        engine.register_symbol("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
-        engine.register_symbol("cleave_retain", cleave_rt::cleave_retain as *mut ());
-        engine.register_symbol("cleave_release", cleave_rt::cleave_release as *mut ());
+        register("format_f32", cleave_rt::format_f32 as *mut ());
+        register("format_f64", cleave_rt::format_f64 as *mut ());
+        register("cleave_alloc", cleave_rt::cleave_alloc as *mut ());
+        register("cleave_alloc_rc", cleave_rt::cleave_alloc_rc as *mut ());
+        register("cleave_retain", cleave_rt::cleave_retain as *mut ());
+        register("cleave_release", cleave_rt::cleave_release as *mut ());
         // `doc/plan-affine-ownership.md`'s Stage 2 -- only ever called when
         // `CLEAVE_AFFINE_STRUCTS=1` (`mlir_lower.rs::lower_program`'s own
         // doc comment), registered unconditionally here regardless, same
         // as every other `cleave-rt` symbol on this list.
-        engine.register_symbol("cleave_alloc_pool", cleave_rt::cleave_alloc_pool as *mut ());
-        engine.register_symbol(
+        register("cleave_alloc_pool", cleave_rt::cleave_alloc_pool as *mut ());
+        register(
             "cleave_release_pool",
             cleave_rt::cleave_release_pool as *mut (),
         );
-        engine.register_symbol(
+        register(
             "cleave_release_void",
             cleave_rt::cleave_release_void as *mut (),
         );
-        engine.register_symbol(
+        register(
             "cleave_alloc_local",
             cleave_rt::cleave_alloc_local as *mut (),
         );
-        engine.register_symbol(
+        register(
             "cleave_region_enter",
             cleave_rt::cleave_region_enter as *mut (),
         );
-        engine.register_symbol(
+        register(
             "cleave_region_exit",
             cleave_rt::cleave_region_exit as *mut (),
         );
-        engine.register_symbol("cleave_buffer_alloc", cleave_rt::cleave_buffer_alloc as *mut ());
-        engine.register_symbol("cleave_buffer_grow", cleave_rt::cleave_buffer_grow as *mut ());
-        engine.register_symbol("cleave_buffer_capacity", cleave_rt::cleave_buffer_capacity as *mut ());
-        engine.register_symbol("cleave_buffer_free_data", cleave_rt::cleave_buffer_free_data as *mut ());
+        register("cleave_buffer_alloc", cleave_rt::cleave_buffer_alloc as *mut ());
+        register("cleave_buffer_grow", cleave_rt::cleave_buffer_grow as *mut ());
+        register("cleave_buffer_capacity", cleave_rt::cleave_buffer_capacity as *mut ());
+        register("cleave_buffer_free_data", cleave_rt::cleave_buffer_free_data as *mut ());
         // `stdlib/blas/blas.cleave`'s own `raw_sgemm` extern -- lazily loads
         // `openblas.dll` on first real call (`cleave_rt::blas_dynload`), so
         // registering it here unconditionally costs nothing for a program
         // that never calls into `blas`.
-        engine.register_symbol("cleave_blas_sgemm", cleave_rt::cleave_blas_sgemm as *mut ());
+        register("cleave_blas_sgemm", cleave_rt::cleave_blas_sgemm as *mut ());
     }
 }
 
@@ -1180,17 +1196,28 @@ pub fn emit_exe(
         .arg(format!("link-arg={}", object_path.display()))
         .arg("-C")
         .arg(format!("link-arg={}", runtime_lib.display()));
+    if !cfg!(windows) && options.backend == Backend::Vulkan {
+        // `cleave-vk`'s VMA is C++: its standard library, which MSVC's
+        // objects name themselves.
+        cmd.arg("-C").arg("link-arg=-lstdc++");
+    }
     if options.openmp || (options.host_tasks() && crate::cps::uses_spawn(&cps_program)) {
         // `__kmpc_*` references, from `--openmp`'s parallel loops or `spawn`'s
         // tasks, resolved against the toolchain's `libomp`.
         let prefix = crate::toolchain::llvm_prefix().map_err(|e| vec![format!("{e} to link libomp")])?;
-        cmd.arg("-L")
-            .arg(crate::toolchain::libomp_link_dir(&prefix))
-            .arg("-l")
-            .arg(crate::toolchain::LIBOMP_LINK_NAME);
-        if !cfg!(windows) {
-            // Found at run time where it was linked from.
-            cmd.arg("-C").arg(format!("link-arg=-Wl,-rpath,{}", crate::toolchain::libomp_link_dir(&prefix)));
+        let lib_dir = crate::toolchain::libomp_link_dir(&prefix);
+        if cfg!(windows) {
+            cmd.arg("-L").arg(&lib_dir).arg("-l").arg(crate::toolchain::LIBOMP_LINK_NAME);
+        } else {
+            // After the object (`link-arg`s come last): ahead of it,
+            // `--as-needed` drops a library nothing before it uses. Found at
+            // run time where it was linked from.
+            cmd.arg("-C")
+                .arg(format!("link-arg=-L{lib_dir}"))
+                .arg("-C")
+                .arg(format!("link-arg=-l{}", crate::toolchain::LIBOMP_LINK_NAME))
+                .arg("-C")
+                .arg(format!("link-arg=-Wl,-rpath,{lib_dir}"));
         }
     }
     let status = cmd.status();

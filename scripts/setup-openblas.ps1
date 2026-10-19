@@ -30,7 +30,7 @@ param(
     # Same reasoning as `setup-toolchain.ps1`'s own `$CacheDir` default --
     # `target\` (already gitignored), not `%LOCALAPPDATA%`, so a multi-drive
     # dev setup never has this land on the wrong disk.
-    [string]$CacheDir = (Join-Path $PSScriptRoot "..\target\openblas"),
+    [string]$CacheDir = ([System.IO.Path]::Combine($PSScriptRoot, "..", "target", "openblas")),
     [string]$ExistingPrefix = "",
     [switch]$Force
 )
@@ -38,8 +38,8 @@ param(
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
-$repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
-$cargoConfigPath = Join-Path $repoRoot ".cargo\config.toml"
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$cargoConfigPath = [System.IO.Path]::Combine($repoRoot, ".cargo", "config.toml")
 
 function Merge-CleaveCargoConfigEnv([hashtable]$NewEntries) {
     $entries = [ordered]@{}
@@ -68,7 +68,9 @@ function Merge-CleaveCargoConfigEnv([hashtable]$NewEntries) {
     foreach ($key in $entries.Keys) {
         $lines += "$key = `"$($entries[$key])`""
     }
-    Set-Content -Path $cargoConfigPath -Value ($lines -join "`n") -Encoding utf8
+    # UTF-8 without a BOM, from Windows PowerShell 5.1 (whose `-Encoding utf8`
+    # writes one) as from `pwsh`.
+    [System.IO.File]::WriteAllText($cargoConfigPath, ($lines -join "`n") + "`n", (New-Object System.Text.UTF8Encoding $false))
     Write-Host "Wrote $cargoConfigPath"
 }
 
@@ -78,21 +80,24 @@ function Write-OpenblasPrefix([string]$Prefix) {
     Write-Host "OPENBLAS_PREFIX -> $Prefix (only needed as an override -- see this script's own top comment)"
 }
 
+# Windows PowerShell 5.1 has no `$IsWindows`; `pwsh` on Linux runs this too.
+$onWindows = ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT)
+# The file `cleave-rt` loads (`blas_dynload`), relative to the prefix.
+$library = if ($onWindows) { "bin/openblas.dll" } else { "lib/libopenblas.so" }
+
 if ($ExistingPrefix -ne "") {
-    $probe = Join-Path $ExistingPrefix "lib\openblas.lib"
+    $probe = Join-Path $ExistingPrefix $library
     if (-not (Test-Path $probe)) {
-        throw "-ExistingPrefix '$ExistingPrefix' doesn't look like a real OpenBLAS install (no lib\openblas.lib under it)"
+        throw "-ExistingPrefix '$ExistingPrefix' doesn't look like a real OpenBLAS install (no $library under it)"
     }
     Write-OpenblasPrefix $ExistingPrefix
 } else {
-    $onWindows = ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT)
-    if (-not $onWindows) {
-        throw "setup-openblas.ps1: cleave-openblas-redist has no prebuilt release for this platform yet (Windows/MSVC only today)."
-    }
 
-    $tagFile = Join-Path $repoRoot "ci\openblas-version.txt"
+    $tagFile = [System.IO.Path]::Combine($repoRoot, "ci", "openblas-version.txt")
     $tag = (Get-Content $tagFile | Select-Object -First 1).Trim()
-    $asset = "openblas-windows-msvc.zip"
+    # cleave-openblas-redist's assets: the prefix's contents at the root of
+    # the Windows zip, under `openblas-linux-x86_64/` in the Linux tarball.
+    $asset = if ($onWindows) { "openblas-windows-msvc.zip" } else { "openblas-linux-x86_64.tar.gz" }
     $url = "https://github.com/doomtr666/cleave-openblas-redist/releases/download/$tag/$asset"
     $marker = Join-Path $CacheDir ".cleave-openblas-version"
 
@@ -110,10 +115,16 @@ if ($ExistingPrefix -ne "") {
         Write-Host "Downloading cleave OpenBLAS $tag ($asset)..."
         New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
         Get-ChildItem -Path $CacheDir -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-        $zipPath = Join-Path ([System.IO.Path]::GetTempPath()) $asset
-        Invoke-WebRequest -Uri $url -OutFile $zipPath -UseBasicParsing
-        Expand-Archive -Path $zipPath -DestinationPath $CacheDir -Force
-        Remove-Item $zipPath -Force
+        $archive = Join-Path ([System.IO.Path]::GetTempPath()) $asset
+        Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing
+        if ($onWindows) {
+            Expand-Archive -Path $archive -DestinationPath $CacheDir -Force
+        } else {
+            # `tar` keeps `libopenblas.so`'s symlinks; its top directory dropped.
+            & tar -xzf $archive -C $CacheDir --strip-components=1
+            if ($LASTEXITCODE -ne 0) { throw "tar failed to extract $archive" }
+        }
+        Remove-Item $archive -Force
         Set-Content -Path $marker -Value $tag
         Write-Host "Installed cleave OpenBLAS $tag to $CacheDir"
     }

@@ -38,7 +38,8 @@ pub fn check_sources(
 /// main() -> i32`), returning what it returned. `extra_symbols` resolve the
 /// `extern fn`s the program declares beyond `cleave-rt`'s
 /// (`pipeline::register_cleave_rt_symbols`): a test's own host functions,
-/// never one of the runtime's (the JIT aborts on a symbol defined twice).
+/// or its stand-in for one of the runtime's, registered instead of it (the
+/// JIT aborts on a symbol defined twice).
 /// `libomp` is loaded when the code needs it (OpenMP, or tasks a program
 /// spawns), from `CLEAVE_LLVM_PREFIX`.
 pub fn run_main(
@@ -104,7 +105,8 @@ pub fn run_main_with<T>(
     // the whole process (`register_cleave_rt_symbols`'s doc comment); the
     // caller vouches for `extra_symbols` the same way.
     unsafe {
-        crate::pipeline::register_cleave_rt_symbols(&engine);
+        let replaced: Vec<&str> = extra_symbols.iter().map(|(name, _)| *name).collect();
+        crate::pipeline::register_cleave_rt_symbols_but(&engine, &replaced);
         for (name, f) in extra_symbols {
             engine.register_symbol(name, *f);
         }

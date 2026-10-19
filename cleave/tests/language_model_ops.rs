@@ -1707,6 +1707,66 @@ fn a_block_read_by_its_own_write_is_still_copied() {
     assert_eq!(run(src), 7.0 + 110.0 + 1500.0 + 23000.0 + 10000.0);
 }
 
+/// `a_block_read_by_its_own_write_is_still_copied` on any CPU: `cleave_blas_sgemm` replaced by
+/// one that clears `C` (`beta` 0) before it reads `A`, as a BLAS may. `sgemm`'s destination is
+/// its operand's tensor: given the same buffer (`stdlib/blas`'s `to_buffer`s, `c`'s taken after
+/// `a`'s), the product read zeros. Only OpenBLAS's kernel on some machines showed it, its result
+/// otherwise right.
+#[test]
+fn an_sgemm_destination_that_is_its_operand_gets_its_own_buffer() {
+    unsafe extern "C" fn clearing_sgemm(
+        trans_a: i32,
+        trans_b: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        a: *const f32,
+        _a_len: i64,
+        lda: i32,
+        b: *const f32,
+        _b_len: i64,
+        ldb: i32,
+        beta: f32,
+        c: *mut f32,
+        _c_len: i64,
+        ldc: i32,
+    ) {
+        assert!(trans_a == 0 && trans_b == 0 && beta == 0.0);
+        let (m, n, k, lda, ldb, ldc) = (m as usize, n as usize, k as usize, lda as usize, ldb as usize, ldc as usize);
+        unsafe {
+            for i in 0..m {
+                for j in 0..n {
+                    *c.add(i * ldc + j) = 0.0;
+                }
+            }
+            for i in 0..m {
+                for j in 0..n {
+                    let mut s = 0.0;
+                    for p in 0..k {
+                        s += *a.add(i * lda + p) * *b.add(p * ldb + j);
+                    }
+                    *c.add(i * ldc + j) = alpha * s;
+                }
+            }
+        }
+    }
+    let src = "
+        use nn;
+        fn main() -> i32 {
+            let x = Tensor::<f32, 2, 4>(data: [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]);
+            let b = Tensor::<f32, 2, 2>(data: [[1.0, 1.0], [1.0, 2.0]]);
+            let blk: Tensor<f32, 2, 2> = slice(x, 0, 2);
+            let y = update(x, sgemm(false, false, 1.0, blk, b, 0.0, blk), 0, 2);
+            // [[3, 4], [7, 8]] @ [[1, 1], [1, 2]] = [[7, 11], [15, 23]]
+            if y[0, 2] == 7.0 and y[0, 3] == 11.0 and y[1, 2] == 15.0 and y[1, 3] == 23.0 and y[0, 0] == 1.0 { 1 } else { 0 }
+        }
+    ";
+    let options = CodegenOptions { openmp: false, ..CodegenOptions::default() };
+    let symbols: [(&str, *mut ()); 1] = [("cleave_blas_sgemm", clearing_sgemm as *mut ())];
+    assert_eq!(cleave::run::run_source_with("sgemm_alias.cleave", src, &options, &symbols), Ok(1));
+}
+
 /// A dense layer and its activation on the BLAS tier (`BLAS_MIN_WORK`
 /// lowered to 0): the activation is tiled by rows with the product fused in,
 /// each tile's bias broadcast and `sgemm` (accumulating into it, `beta = 1`)

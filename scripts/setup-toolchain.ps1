@@ -20,7 +20,7 @@ param(
     # deleting it along with the rest of the build output (re-downloading
     # rather than rebuilding from source) is an accepted, deliberate
     # trade-off here, not an oversight.
-    [string]$CacheDir = (Join-Path $PSScriptRoot "..\target\llvm-mlir-22"),
+    [string]$CacheDir = ([System.IO.Path]::Combine($PSScriptRoot, "..", "target", "llvm-mlir-22")),
     [string]$ExistingPrefix = "",
     [switch]$Force
 )
@@ -31,8 +31,8 @@ $ErrorActionPreference = "Stop"
 # documented workaround, not a cosmetic choice.
 $ProgressPreference = "SilentlyContinue"
 
-$repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
-$cargoConfigPath = Join-Path $repoRoot ".cargo\config.toml"
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$cargoConfigPath = [System.IO.Path]::Combine($repoRoot, ".cargo", "config.toml")
 
 function Write-CleaveCargoConfig([string]$Prefix) {
     $forward = $Prefix -replace '\\', '/'
@@ -46,31 +46,29 @@ function Write-CleaveCargoConfig([string]$Prefix) {
 [env]
 CLEAVE_LLVM_PREFIX = "$forward"
 "@
-    Set-Content -Path $cargoConfigPath -Value $content -Encoding utf8
+    # UTF-8 without a BOM, from Windows PowerShell 5.1 (whose `-Encoding utf8`
+    # writes one) as from `pwsh`.
+    [System.IO.File]::WriteAllText($cargoConfigPath, $content + "`n", (New-Object System.Text.UTF8Encoding $false))
     Write-Host "Wrote $cargoConfigPath -> $Prefix"
 }
 
+# Windows PowerShell 5.1 has no `$IsWindows`; `pwsh` on Linux runs this too.
+$onWindows = ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT)
+$exeSuffix = if ($onWindows) { ".exe" } else { "" }
+
 if ($ExistingPrefix -ne "") {
-    $probe = Join-Path $ExistingPrefix "bin\mlir-opt.exe"
+    $probe = Join-Path (Join-Path $ExistingPrefix "bin") "mlir-opt$exeSuffix"
     if (-not (Test-Path $probe)) {
-        throw "-ExistingPrefix '$ExistingPrefix' doesn't look like a real LLVM/MLIR install (no bin\mlir-opt.exe under it)"
+        throw "-ExistingPrefix '$ExistingPrefix' doesn't look like a real LLVM/MLIR install (no bin/mlir-opt$exeSuffix under it)"
     }
     Write-CleaveCargoConfig $ExistingPrefix
 } else {
-    $onWindows = ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT)
-    if (-not $onWindows) {
-        throw "setup-toolchain.ps1: cleave-llvm-redist has no prebuilt release for this platform yet (Windows/MSVC only today -- a Linux build is planned; until then, build LLVM from source per doc/building.md's own fallback section)."
-    }
 
-    $tagFile = Join-Path $repoRoot "ci\toolchain-version.txt"
+    $tagFile = [System.IO.Path]::Combine($repoRoot, "ci", "toolchain-version.txt")
     $tag = (Get-Content $tagFile | Select-Object -First 1).Trim()
-    # Only "windows-msvc" exists today -- cleave-llvm-redist's own build-
-    # release workflow is Windows-only so far (its own header comment says
-    # so). A Linux job there will add a second asset (naming convention not
-    # settled yet); this is the one line that'll need to branch on the host
-    # OS once it does.
-    $platform = "windows-msvc"
-    $asset = "llvm-mlir-22-$platform.zip"
+    # cleave-llvm-redist's assets: the install prefix's contents at the
+    # archive's root, zipped for Windows/MSVC, a `tar.xz` for Linux x86_64.
+    $asset = if ($onWindows) { "llvm-mlir-22-windows-msvc.zip" } else { "llvm-mlir-22-linux-x86_64.tar.xz" }
     $url = "https://github.com/doomtr666/cleave-llvm-redist/releases/download/$tag/$asset"
     $marker = Join-Path $CacheDir ".cleave-toolchain-version"
 
@@ -88,10 +86,17 @@ if ($ExistingPrefix -ne "") {
         Write-Host "Downloading cleave toolchain $tag ($asset)..."
         New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
         Get-ChildItem -Path $CacheDir -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-        $zipPath = Join-Path ([System.IO.Path]::GetTempPath()) $asset
-        Invoke-WebRequest -Uri $url -OutFile $zipPath -UseBasicParsing
-        Expand-Archive -Path $zipPath -DestinationPath $CacheDir -Force
-        Remove-Item $zipPath -Force
+        $archive = Join-Path ([System.IO.Path]::GetTempPath()) $asset
+        Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing
+        if ($onWindows) {
+            Expand-Archive -Path $archive -DestinationPath $CacheDir -Force
+        } else {
+            # `tar`, not `Expand-Archive`: it keeps the symlinks and the
+            # executable bits a Linux install tree needs.
+            & tar -xJf $archive -C $CacheDir
+            if ($LASTEXITCODE -ne 0) { throw "tar failed to extract $archive" }
+        }
+        Remove-Item $archive -Force
         Set-Content -Path $marker -Value $tag
         Write-Host "Installed cleave toolchain $tag to $CacheDir"
     }

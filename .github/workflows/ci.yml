@@ -1,8 +1,8 @@
 name: ci
 
-# Windows-only -- the toolchain cleave builds against (the prebuilt
-# LLVM/MLIR of `cleave-llvm-redist`), `cleave-rt`'s MSVC-specific parts and
-# the shim's MSVC build flags are Windows/MSVC work so far.
+# Windows (MSVC) and Linux (x86_64), the same steps: the prebuilt LLVM/MLIR
+# of `cleave-llvm-redist` and OpenBLAS of `cleave-openblas-redist` for each,
+# fetched by the same scripts a dev machine runs (`pwsh` on Linux).
 
 on:
   push:
@@ -11,7 +11,15 @@ on:
 
 jobs:
   test:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            toolchain: C:\llvm-mlir-22
+          - os: ubuntu-24.04
+            toolchain: /home/runner/llvm-mlir-22
+    runs-on: ${{ matrix.os }}
     # Used to be 350 (a from-source LLVM+clang+MLIR+openmp build's own real
     # budget, `doc/backlog.md`'s "cleave-llvm-redist" entry) -- now just
     # downloading a prebuilt archive plus an ordinary `cargo build`/`test`,
@@ -29,17 +37,18 @@ jobs:
         id: toolchain-cache
         uses: actions/cache@v4
         with:
-          path: C:\llvm-mlir-22
+          path: ${{ matrix.toolchain }}
           # The release tag itself, not just its hash -- included directly
           # so bumping `ci/toolchain-version.txt` always busts the cache,
           # the same reasoning the old from-source cache key used for
           # `ci/llvm-cmake-flags.txt`.
-          key: cleave-toolchain-${{ hashFiles('ci/toolchain-version.txt') }}
+          key: cleave-toolchain-${{ runner.os }}-${{ hashFiles('ci/toolchain-version.txt') }}
 
       # Needed unconditionally, cache hit or not -- `cargo build` itself
       # needs `link.exe` on an `-msvc` target regardless of where the
       # toolchain came from this run.
       - name: Set up MSVC dev environment
+        if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
 
       # `doc/backlog.md`'s "cleave-llvm-redist" entry -- a prebuilt release
@@ -53,7 +62,7 @@ jobs:
       - name: Download prebuilt LLVM/MLIR/openmp toolchain (cache miss only)
         if: steps.toolchain-cache.outputs.cache-hit != 'true'
         shell: pwsh
-        run: .\scripts\setup-toolchain.ps1 -CacheDir C:\llvm-mlir-22
+        run: ./scripts/setup-toolchain.ps1 -CacheDir ${{ matrix.toolchain }}
 
       # Cache hit: the archive was never re-downloaded, so `.cargo/
       # config.toml` (gitignored, `CLEAVE_LLVM_PREFIX`)
@@ -61,7 +70,7 @@ jobs:
       - name: Point cargo at the toolchain
         if: steps.toolchain-cache.outputs.cache-hit == 'true'
         shell: pwsh
-        run: .\scripts\setup-toolchain.ps1 -ExistingPrefix C:\llvm-mlir-22
+        run: ./scripts/setup-toolchain.ps1 -ExistingPrefix ${{ matrix.toolchain }}
 
       # `cleave-rt` loads `openblas.dll` at runtime from `target\openblas`
       # (`cleave-rt/Cargo.toml`'s own doc comment) -- without this step,
@@ -72,12 +81,12 @@ jobs:
       - name: Cache prebuilt OpenBLAS
         uses: actions/cache@v4
         with:
-          path: target\openblas
-          key: cleave-openblas-${{ hashFiles('ci/openblas-version.txt') }}
+          path: target/openblas
+          key: cleave-openblas-${{ runner.os }}-${{ hashFiles('ci/openblas-version.txt') }}
 
       - name: Download prebuilt OpenBLAS
         shell: pwsh
-        run: .\scripts\setup-openblas.ps1
+        run: ./scripts/setup-openblas.ps1
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
