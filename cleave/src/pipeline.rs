@@ -875,7 +875,7 @@ pub fn lower_to_llvm<'c>(
         "builtin.module(eliminate-empty-tensors,\
          one-shot-bufferize{bufferize-function-boundaries=true function-boundary-type-conversion=identity-layout-map allow-return-allocs-from-loops=true},\
          cleave-elide-block-copies,scf-forall-to-parallel,cleave-forward-dead-source-copies,\
-         buffer-results-to-out-params{hoist-static-allocs=true},\
+         cleave-copy-returned-adoptions,buffer-results-to-out-params{hoist-static-allocs=true},\
          cleave-forward-out-param-copies,cleave-forward-copies-to-destinations,\
          cleave-forward-read-only-arguments,cleave-drop-undefined-copies)",
     )?;

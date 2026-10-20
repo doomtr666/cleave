@@ -277,6 +277,29 @@ fn leak_per_iteration(prelude: &str, body: &str) -> i64 {
     (live72 - live8) / 64
 }
 
+/// A function returning one field of a tuple a call gave it, the other
+/// ignored (`let (out, _) = pair(x); out`, `causal_attention` over
+/// `causal_attention_stats`): the returned tensor is adopted, the tuple and
+/// its other field released (`refcount.rs`, `TensorViews::adopt_returned`).
+/// The tuple was kept alive by the returned view and never released: a
+/// tensor leaked per call, nanoLM's attention statistics at every
+/// forward-only call until the host ran out of memory.
+#[test]
+fn a_returned_field_of_a_tuple_releases_the_rest() {
+    let _serial = serial();
+    let per = leak_per_iteration(
+        "#[no_inline]
+         fn pair(x: Tensor<f32, 64, 48>) -> (Tensor<f32, 64, 48>, Tensor<f32, 64, 48>) { (x + x, x * x) }
+         #[no_inline]
+         fn first(x: Tensor<f32, 64, 48>) -> Tensor<f32, 64, 48> {
+             let (a, _) = pair(x);
+             a
+         }",
+        "for i in 0..STEPS { m = first(m); };",
+    );
+    assert!(per < NOISE, "{per} bytes per call");
+}
+
 #[test]
 fn muon_steps_leave_no_allocation_behind() {
     let _serial = serial();

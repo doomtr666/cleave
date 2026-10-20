@@ -1566,6 +1566,35 @@ static int64_t cleaveReuseDyingInputs(MlirOperation op) {
   return reused;
 }
 
+// An adoption (`PrimOp::Adopt`, a `bufferization.clone` marked
+// `cleave.adopt`) a function returns, made an allocation and a copy of its
+// source, where the adoption is. `buffer-results-to-out-params{hoist-static-
+// allocs}` takes a returned clone for an allocation it can replace with the
+// caller's buffer, and drops it: the copy its contents came by went with it,
+// and the caller's buffer was never written (`refcount.rs`'s returned views:
+// `causal_attention`'s gradient read zeros and NaN). As an allocation and a
+// copy, the hoisting makes the copy write the caller's buffer, before the
+// struct the adopted field came from is released. Before bufferization's
+// out-parameters. Returns how many it rewrote.
+static int64_t cleaveCopyReturnedAdoptions(MlirOperation op) {
+  SmallVector<bufferization::CloneOp> returned;
+  unwrap(op)->walk([&](bufferization::CloneOp clone) {
+    if (clone->hasAttr("cleave.adopt") && llvm::any_of(clone.getOutput().getUsers(), [](Operation *user) {
+          return isa<func::ReturnOp>(user);
+        }))
+      returned.push_back(clone);
+  });
+  for (bufferization::CloneOp clone : returned) {
+    OpBuilder b(clone);
+    auto type = cast<MemRefType>(clone.getOutput().getType());
+    Value buffer = memref::AllocOp::create(b, clone.getLoc(), type);
+    memref::CopyOp::create(b, clone.getLoc(), clone.getInput(), buffer);
+    clone.getOutput().replaceAllUsesWith(buffer);
+    clone.erase();
+  }
+  return int64_t(returned.size());
+}
+
 // Drops the copies whose source is an allocation nothing writes: they copy
 // undefined values, which the destination may as well keep (a tuple's field
 // a function returns uninitialized, `CausalAttention`'s f32 statistics:
@@ -2254,6 +2283,8 @@ CLEAVE_COUNTING_PASS(ForwardReadOnlyArgumentsPass,
                      "cleave-forward-read-only-arguments",
                      "layout-only copies passed to read-only parameters, removed",
                      cleaveForwardReadOnlyArguments)
+CLEAVE_COUNTING_PASS(CopyReturnedAdoptionsPass, "cleave-copy-returned-adoptions",
+                     "returned adoptions made an allocation and a copy", cleaveCopyReturnedAdoptions)
 CLEAVE_COUNTING_PASS(DropUndefinedCopiesPass, "cleave-drop-undefined-copies",
                      "copies from an allocation nothing writes, dropped", cleaveDropUndefinedCopies)
 CLEAVE_COUNTING_PASS(FoldPassthroughIterArgsPass,
@@ -3122,6 +3153,7 @@ extern "C" void cleaveRegisterPasses() {
     registerGpuPasses();
     PassRegistration<FoldPassthroughIterArgsPass>();
     PassRegistration<DropUndefinedCopiesPass>();
+    PassRegistration<CopyReturnedAdoptionsPass>();
     PassRegistration<LowerAdoptionsPass>();
     PassRegistration<DeallocAtLastUsePass>();
     PassRegistration<ReleaseAfterFieldUsesPass>();

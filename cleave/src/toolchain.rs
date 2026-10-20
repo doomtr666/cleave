@@ -14,19 +14,29 @@ pub fn llvm_prefix() -> Result<String, String> {
 /// verbatim (`libomp.lib`), a GNU-style one adds the `lib` prefix itself.
 pub const LIBOMP_LINK_NAME: &str = if cfg!(target_env = "msvc") { "libomp" } else { "omp" };
 
-/// The directory holding `libomp`'s import or shared library, to link against.
+/// The directory holding `libomp`'s import or shared library, to link against:
+/// `lib` on Windows; on Linux, `lib/<target triple>`, where LLVM installs its
+/// runtimes there (`LLVM_ENABLE_PER_TARGET_RUNTIME_DIR`, on by default: the
+/// `cleave-llvm-redist` Linux toolchain's `libomp.so` is in
+/// `lib/x86_64-unknown-linux-gnu`), else `lib`.
 pub fn libomp_link_dir(prefix: &str) -> String {
+    if cfg!(target_os = "linux") {
+        let per_target = format!("{prefix}/lib/{}-unknown-linux-gnu", std::env::consts::ARCH);
+        if std::path::Path::new(&per_target).join("libomp.so").exists() {
+            return per_target;
+        }
+    }
     format!("{prefix}/lib")
 }
 
 /// `libomp`'s shared library, which a running program loads: a DLL in `bin`
-/// on Windows, a shared object in `lib` elsewhere.
+/// on Windows, a shared object in its link directory elsewhere.
 pub fn libomp_shared_library(prefix: &str) -> String {
     if cfg!(windows) {
         format!("{prefix}/bin/libomp.dll")
     } else if cfg!(target_os = "macos") {
-        format!("{prefix}/lib/libomp.dylib")
+        format!("{}/libomp.dylib", libomp_link_dir(prefix))
     } else {
-        format!("{prefix}/lib/libomp.so")
+        format!("{}/libomp.so", libomp_link_dir(prefix))
     }
 }

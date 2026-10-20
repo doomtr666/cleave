@@ -492,6 +492,8 @@ impl TensorViews {
         let mut scope: HashSet<CVar> = top.def.params.iter().copied().collect();
         let mut def_scopes: HashMap<String, HashSet<CVar>> = HashMap::default();
         views.adopt_out_of_scope(&top.def.body, &mut scope, &mut def_scopes);
+        let params: HashSet<CVar> = top.def.params.iter().copied().collect();
+        views.adopt_returned(&top.def.body, top.k_ret, &params);
         views.collect_handed(&top.def.body);
         views
     }
@@ -540,6 +542,43 @@ impl TensorViews {
                     self.adopt_out_of_scope(&d.body, &mut inner, def_scopes);
                 }
                 self.adopt_out_of_scope(body, scope, def_scopes);
+            }
+        }
+    }
+
+    /// A view the function returns (`k_ret`) whose containers it owns (none
+    /// is a parameter): adopted (`standalone`), so that the containers are
+    /// released at the return like any other owned value, the view's buffer
+    /// kept by the adoption for the caller. Kept as a view, its container
+    /// stayed live through the return and was never released: `let (out, _)
+    /// = stats(..); out` leaked the tuple's other fields, nanoLM's
+    /// attention statistics at every forward-only call (and, through
+    /// `spawn`, its output too), until the host ran out of memory. A view
+    /// of a parameter is left to `retain_returned_params`.
+    fn adopt_returned(&mut self, e: &CExpr, k_ret: CVar, params: &HashSet<CVar>) {
+        match e {
+            CExpr::LetPrim { cont, .. } => self.adopt_returned(cont, k_ret, params),
+            CExpr::App { func: CVal::Var(k), args } if *k == k_ret => {
+                for arg in args {
+                    if let CVal::Var(v) = arg {
+                        let containers = self.containers(*v);
+                        if !containers.is_empty() && containers.iter().all(|c| !params.contains(c)) {
+                            self.container.remove(v);
+                            self.standalone.insert(*v);
+                        }
+                    }
+                }
+            }
+            CExpr::App { .. } => {}
+            CExpr::If { then_branch, else_branch, .. } => {
+                self.adopt_returned(then_branch, k_ret, params);
+                self.adopt_returned(else_branch, k_ret, params);
+            }
+            CExpr::Fix { defs, body } => {
+                for d in defs {
+                    self.adopt_returned(&d.body, k_ret, params);
+                }
+                self.adopt_returned(body, k_ret, params);
             }
         }
     }

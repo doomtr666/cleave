@@ -322,7 +322,7 @@ mod alloc_stats {
 
     pub static ENABLED: LazyLock<bool> = LazyLock::new(|| std::env::var("CLEAVE_ALLOC_STATS").is_ok());
 
-    const FRAMES: usize = 8;
+    const FRAMES: usize = 16;
 
     #[derive(Default)]
     struct Site {
@@ -520,9 +520,32 @@ mod alloc_stats {
         eprintln!();
     }
 
+    /// `CLEAVE_ALLOC_STATS=stack`: a site is its whole stack, callers too
+    /// (`a <- b <- c`), not just the function that allocated: which caller
+    /// of `online_causal_attention_stats` held on to its results.
+    static STACKS: LazyLock<bool> = LazyLock::new(|| std::env::var("CLEAVE_ALLOC_STATS").is_ok_and(|v| v == "stack"));
+
     /// The first frame above the runtime: the generated function that
-    /// allocated, with its `.cleave` line when there is debug info.
+    /// allocated, with its `.cleave` line when there is debug info; with
+    /// `STACKS`, it and every frame above it.
     fn label(ips: &[usize; FRAMES]) -> String {
+        if *STACKS {
+            let frames: Vec<String> = (0..FRAMES)
+                .filter(|&i| ips[i] != 0)
+                .map(|i| {
+                    let mut one = [0usize; FRAMES];
+                    one[0] = ips[i];
+                    frame(&one)
+                })
+                .filter(|f| f != "<unknown>")
+                .collect();
+            return if frames.is_empty() { "<unknown>".to_string() } else { frames.join(" <- ") };
+        }
+        frame(ips)
+    }
+
+    /// `label`'s first frame above the runtime.
+    fn frame(ips: &[usize; FRAMES]) -> String {
         for &ip in ips.iter().filter(|&&ip| ip != 0) {
             let mut found: Option<String> = None;
             backtrace::resolve(ip as *mut std::ffi::c_void, |symbol| {
