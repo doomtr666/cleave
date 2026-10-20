@@ -2119,6 +2119,553 @@ static bool staysOnHost(Value memref, ModuleOp module, const llvm::DenseSet<Oper
 // accesses); a call to anything else, or an operation that doesn't declare
 // its memory effects, reads and writes every memref it's given. Returns how
 // many accesses it reported.
+static int64_t cleaveSyncHostAccesses(MlirOperation op);
+
+// Vulkan backend: the host's synchronizations (`cleave_vk_sync_host`) that
+// follow one another with only reads between them (loads, loops and branches
+// that only load and compute, allocations, deallocations, stores to host-only
+// arrays, other synchronizations), each with what
+// computes its range, gathered into one call at the first,
+// `cleave_vk_sync_host_ranges(ptrs, bytes, n)`: one download of everything,
+// one wait for the device. Each was its own download, wait, and the device
+// idle until the next one (a gradient norm's 256 sums, read together once
+// `cleave-defer-host-reads` gathered them, still synchronized one by one).
+// Nothing between a synchronization's old place and the first one writes
+// memory, launches or calls: what it brings back is the same. After
+// `cleave-sync-host-accesses`. Returns how many it merged into others.
+static int64_t cleaveMergeHostSyncs(MlirOperation op) {
+  auto module = dyn_cast<ModuleOp>(unwrap(op));
+  if (!module)
+    return 0;
+  auto isSync = [](Operation *o) {
+    auto call = dyn_cast<func::CallOp>(o);
+    return call && call.getCallee() == "cleave_vk_sync_host";
+  };
+  // An op a synchronization can be moved above: it writes nothing,
+  // launches nothing, calls nothing (another synchronization aside).
+  // A buffer of the function's own whose address the runtime is never given
+  // (no `kRuntimeAddress` pointer taken, no call): only the host has it.
+  auto hostOnly = [](Value root) {
+    if (!root.getDefiningOp<memref::AllocOp>() && !root.getDefiningOp<memref::AllocaOp>())
+      return false;
+    SmallVector<Value> pending{root};
+    while (!pending.empty()) {
+      Value v = pending.pop_back_val();
+      for (Operation *user : v.getUsers()) {
+        if (isa<func::CallOp, gpu::LaunchFuncOp>(user) || user->hasAttr(kRuntimeAddress))
+          return false;
+        if (isa<ViewLikeOpInterface, memref::CastOp>(user))
+          for (Value r : user->getResults())
+            pending.push_back(r);
+      }
+    }
+    return true;
+  };
+  // A deallocation is one too (or the runtime's release it was lowered to):
+  // what the synchronization brings back is read after it, so it isn't the
+  // buffer freed.
+  std::function<bool(Operation *)> passable = [&](Operation *o) -> bool {
+    if (isSync(o) || isa<memref::LoadOp, memref::DeallocOp>(o))
+      return true;
+    // A fresh buffer (the host array the values read are stored into): it
+    // holds nothing a synchronization brings back.
+    if (isa<memref::AllocOp, memref::AllocaOp>(o))
+      return true;
+    // The runtime's release of a buffer (a deallocation, lowered).
+    if (auto call = dyn_cast<func::CallOp>(o); call && call.getCallee().starts_with("cleave_release"))
+      return true;
+    // A store to a buffer the runtime never sees (a host array of a
+    // structure's parts' sums): not what a synchronization brings back.
+    if (auto store = dyn_cast<memref::StoreOp>(o))
+      return hostOnly(viewRoot(store.getMemRef()));
+    if (isa<func::CallOp>(o))
+      return false;
+    if (o->getNumRegions() == 0)
+      return isMemoryEffectFree(o);
+    if (!isa<scf::ForOp, scf::IfOp>(o))
+      return false;
+    bool ok = true;
+    o->walk([&](Operation *inner) {
+      if (inner != o && !isa<scf::YieldOp>(inner) && !passable(inner))
+        ok = false;
+    });
+    return ok;
+  };
+  int64_t merged = 0;
+  SmallVector<SmallVector<func::CallOp>> groups;
+  module.walk([&](Block *block) {
+    SmallVector<func::CallOp> group;
+    for (Operation &o : *block) {
+      if (isSync(&o)) {
+        group.push_back(cast<func::CallOp>(&o));
+        continue;
+      }
+      if (!group.empty() && !passable(&o)) {
+        if (group.size() > 1)
+          groups.push_back(group);
+        group.clear();
+      }
+    }
+    if (group.size() > 1)
+      groups.push_back(group);
+  });
+  if (groups.empty())
+    return 0;
+  MLIRContext *ctx = module.getContext();
+  OpBuilder top(ctx);
+  top.setInsertionPointToStart(module.getBody());
+  Type i64 = top.getI64Type();
+  if (!module.lookupSymbol<func::FuncOp>("cleave_vk_sync_host_ranges"))
+    func::FuncOp::create(top, top.getUnknownLoc(), "cleave_vk_sync_host_ranges", top.getFunctionType({i64, i64, i64}, {}))
+        .setPrivate();
+  for (SmallVector<func::CallOp> &group : groups) {
+    func::CallOp first = group.front();
+    Block *block = first->getBlock();
+    // Each later one's range, computed where it is, moved up to the first:
+    // the pure ops of its block it depends on, after the first.
+    SmallVector<func::CallOp> kept{first};
+    for (func::CallOp sync : llvm::drop_begin(group)) {
+      SmallVector<Operation *> cone;
+      bool movable = true;
+      std::function<void(Value)> need = [&](Value v) {
+        Operation *def = v.getDefiningOp();
+        if (!def || def->getBlock() != block || def->isBeforeInBlock(first) || llvm::is_contained(cone, def))
+          return;
+        if (!isMemoryEffectFree(def) && !isa<memref::ExtractAlignedPointerAsIndexOp>(def)) {
+          movable = false;
+          return;
+        }
+        for (Value w : def->getOperands())
+          need(w);
+        cone.push_back(def);
+      };
+      for (Value v : sync->getOperands())
+        need(v);
+      if (!movable)
+        continue;
+      llvm::sort(cone, [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
+      for (Operation *o : cone)
+        o->moveBefore(first);
+      kept.push_back(sync);
+    }
+    if (kept.size() < 2)
+      continue;
+    // `ptrs` and `bytes`, two arrays on the stack, filled where the first
+    // synchronization was.
+    OpBuilder b(first);
+    Location loc = first.getLoc();
+    int64_t n = kept.size();
+    auto arrayType = MemRefType::get({n}, i64);
+    Value ptrs = memref::AllocaOp::create(b, loc, arrayType);
+    Value sizes = memref::AllocaOp::create(b, loc, arrayType);
+    for (auto [i, sync] : llvm::enumerate(kept)) {
+      Value at = arith::ConstantIndexOp::create(b, loc, int64_t(i));
+      memref::StoreOp::create(b, loc, sync.getOperand(0), ptrs, ValueRange{at});
+      memref::StoreOp::create(b, loc, sync.getOperand(1), sizes, ValueRange{at});
+    }
+    auto address = [&](Value array) -> Value {
+      Value index = memref::ExtractAlignedPointerAsIndexOp::create(b, loc, array);
+      return arith::IndexCastOp::create(b, loc, i64, index);
+    };
+    func::CallOp::create(b, loc, "cleave_vk_sync_host_ranges", TypeRange{},
+                         ValueRange{address(ptrs), address(sizes), arith::ConstantIntOp::create(b, loc, i64, n)});
+    for (func::CallOp sync : kept)
+      sync->erase();
+    merged += n - 1;
+  }
+  return merged;
+}
+
+static void discardContents(OpBuilder &builder, Location loc, Value memref, ModuleOp module);
+
+// Vulkan backend: a scalar that kernels take, computed by the host from what
+// other kernels wrote (reads, `memref.load`s or a `scf.for` that only loads
+// and computes, and arithmetic on scalars), computed by the device instead:
+// a kernel of one thread doing the same, storing it into a buffer of one
+// element, which the kernels load at their start. The host read waited for
+// the device to finish all it was given, which then idled until the host
+// gave it the next kernel: Muon's normalization (`1 / (sqrt(sum(g * g)) +
+// eps)`, its sum's partial sums summed by the host), one per matrix and step,
+// 0.55 s of nanoLM's device idle every 6 steps. Only for a scalar the host
+// doesn't use itself (a branch on it needs it there), read from buffers a
+// kernel can be given (allocations, the function's arguments, not views),
+// and nothing between the reads and the new kernel writing them; the
+// deallocations between moved after it. Before `gpu-kernel-outlining`, on
+// `gpu.launch`es: outlining makes both kernels, what they capture their
+// arguments. Returns how many scalars it moved.
+static int64_t cleaveDeviceScalars(MlirOperation op) {
+  auto module = dyn_cast<ModuleOp>(unwrap(op));
+  if (!module)
+    return 0;
+  auto scalarType = [](Type t) { return t.isIntOrIndexOrFloat(); };
+  // A read of a buffer: a load, or a loop of loads and pure arithmetic
+  // yielding scalars; the buffers it reads into `roots`.
+  auto isRead = [&](Operation *o, SmallVector<Value> &roots) {
+    auto bindable = [](Value m) {
+      auto type = dyn_cast<MemRefType>(m.getType());
+      if (!type || !type.getLayout().isIdentity())
+        return false;
+      if (m.getDefiningOp<memref::AllocOp>())
+        return true;
+      auto arg = dyn_cast<BlockArgument>(m);
+      return arg && isa<func::FuncOp>(arg.getOwner()->getParentOp());
+    };
+    if (auto load = dyn_cast<memref::LoadOp>(o)) {
+      if (!bindable(load.getMemRef()))
+        return false;
+      roots.push_back(load.getMemRef());
+      return true;
+    }
+    if (!isa<scf::ForOp>(o) || o->getNumResults() == 0 || !llvm::all_of(o->getResultTypes(), scalarType))
+      return false;
+    bool ok = true, loads = false;
+    o->walk([&](Operation *inner) {
+      if (inner == o || isa<scf::YieldOp>(inner))
+        return WalkResult::advance();
+      if (auto load = dyn_cast<memref::LoadOp>(inner)) {
+        if (!bindable(load.getMemRef()) || o->isAncestor(load.getMemRef().getParentBlock()->getParentOp())) {
+          ok = false;
+          return WalkResult::interrupt();
+        }
+        roots.push_back(load.getMemRef());
+        loads = true;
+        return WalkResult::advance();
+      }
+      if (inner->getNumRegions() == 0 && isMemoryEffectFree(inner))
+        return WalkResult::advance();
+      ok = false;
+      return WalkResult::interrupt();
+    });
+    return ok && loads;
+  };
+  // The scalars kernels capture, each with the launches capturing it.
+  SmallVector<Value> candidates;
+  module.walk([&](gpu::LaunchOp launch) {
+    llvm::SetVector<Value> captured;
+    getUsedValuesDefinedAbove(launch.getBody(), captured);
+    for (Value v : captured)
+      if (scalarType(v.getType()) && v.getDefiningOp() && !llvm::is_contained(candidates, v))
+        candidates.push_back(v);
+  });
+  int64_t moved = 0;
+  for (Value v : candidates) {
+    Operation *def = v.getDefiningOp();
+    Block *block = def->getBlock();
+    // Every use inside a kernel.
+    if (!llvm::all_of(v.getUsers(), [](Operation *user) { return user->getParentOfType<gpu::LaunchOp>(); }))
+      continue;
+    // What computes it in `block`: reads, and pure scalar arithmetic on them,
+    // on constants and on scalars computed before.
+    SmallVector<Operation *> slice, reads;
+    SmallVector<Value> roots;
+    bool ok = true;
+    std::function<void(Value)> need = [&](Value w) {
+      Operation *d = w.getDefiningOp();
+      if (!ok || !d || d->getBlock() != block || llvm::is_contained(slice, d))
+        return;
+      if (d->hasTrait<OpTrait::ConstantLike>() || !scalarType(w.getType()))
+        return; // captured by the kernel as it is (a buffer read: `isRead`)
+      if (isRead(d, roots)) {
+        reads.push_back(d);
+      } else if (d->getNumRegions() != 0 || !isMemoryEffectFree(d) || !llvm::all_of(d->getResultTypes(), scalarType)) {
+        ok = false;
+        return;
+      }
+      llvm::SetVector<Value> operands(d->getOperands().begin(), d->getOperands().end());
+      if (d->getNumRegions())
+        getUsedValuesDefinedAbove(d->getRegions(), operands);
+      for (Value o : operands)
+        need(o);
+      slice.push_back(d);
+    };
+    need(v);
+    if (!ok || reads.empty())
+      continue;
+    llvm::sort(slice, [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
+    // Only the scalar's own computation: nothing else uses its parts.
+    if (!llvm::all_of(slice, [&](Operation *o) {
+          return o == def || llvm::all_of(o->getUsers(), [&](Operation *user) {
+                   Operation *mine = block->findAncestorOpInBlock(*user);
+                   return mine && llvm::is_contained(slice, mine);
+                 });
+        }))
+      continue;
+    // The new kernel goes after the last read: whatever the rest of the slice
+    // uses from outside it is there by then.
+    Operation *lastRead = reads.front();
+    for (Operation *r : reads)
+      if (lastRead->isBeforeInBlock(r))
+        lastRead = r;
+    Operation *firstRead = slice.front();
+    for (Operation *o : slice) {
+      llvm::SetVector<Value> operands(o->getOperands().begin(), o->getOperands().end());
+      if (o->getNumRegions())
+        getUsedValuesDefinedAbove(o->getRegions(), operands);
+      for (Value w : operands) {
+        Operation *d = w.getDefiningOp();
+        if (d && d->getBlock() == block && !llvm::is_contained(slice, d) && !d->isBeforeInBlock(lastRead) &&
+            d != lastRead)
+          ok = false;
+      }
+    }
+    // Between the first read and the new kernel, nothing touches what they
+    // read but its deallocations, moved after it.
+    llvm::SmallPtrSet<Value, 8> rootSet(roots.begin(), roots.end());
+    SmallVector<Operation *> deallocs;
+    for (Operation *x = firstRead->getNextNode(); ok && x != lastRead->getNextNode(); x = x->getNextNode()) {
+      if (llvm::is_contained(slice, x))
+        continue;
+      if (auto dealloc = dyn_cast<memref::DeallocOp>(x); dealloc && rootSet.contains(dealloc.getMemref())) {
+        deallocs.push_back(x);
+        continue;
+      }
+      x->walk([&](Operation *inner) {
+        for (Value w : inner->getOperands())
+          if (isa<BaseMemRefType>(w.getType()) && rootSet.contains(viewRoot(w)))
+            ok = false;
+      });
+    }
+    if (!ok)
+      continue;
+    // The kernel: one thread computing the slice, its value stored into
+    // `cell`.
+    Location loc = def->getLoc();
+    OpBuilder b(block, std::next(lastRead->getIterator()));
+    auto cellType = MemRefType::get({1}, v.getType());
+    Value cell = memref::AllocOp::create(b, loc, cellType);
+    discardContents(b, loc, cell, module);
+    Value one = arith::ConstantIndexOp::create(b, loc, 1);
+    auto kernel = gpu::LaunchOp::create(b, loc, one, one, one, one, one, one);
+    {
+      OpBuilder kb = OpBuilder::atBlockBegin(&kernel.getBody().front());
+      IRMapping map;
+      for (Operation *o : slice)
+        kb.clone(*o, map);
+      Value zero = arith::ConstantIndexOp::create(kb, loc, 0);
+      memref::StoreOp::create(kb, loc, map.lookup(v), cell, ValueRange{zero});
+      gpu::TerminatorOp::create(kb, loc);
+    }
+    for (Operation *d : deallocs)
+      d->moveAfter(kernel);
+    // The kernels taking it load it at their start.
+    llvm::SetVector<gpu::LaunchOp> consumers;
+    for (Operation *user : v.getUsers())
+      consumers.insert(user->getParentOfType<gpu::LaunchOp>());
+    Operation *last = nullptr;
+    for (gpu::LaunchOp consumer : consumers) {
+      OpBuilder cb = OpBuilder::atBlockBegin(&consumer.getBody().front());
+      Value zero = arith::ConstantIndexOp::create(cb, loc, 0);
+      Value loaded = memref::LoadOp::create(cb, loc, cell, ValueRange{zero});
+      v.replaceUsesWithIf(loaded, [&](OpOperand &use) { return consumer->isAncestor(use.getOwner()); });
+      Operation *mine = block->findAncestorOpInBlock(*consumer);
+      if (mine && (!last || last->isBeforeInBlock(mine)))
+        last = mine;
+    }
+    OpBuilder after(block, std::next(last->getIterator()));
+    memref::DeallocOp::create(after, loc, cell);
+    // The host's computation, unused now.
+    for (Operation *o : llvm::reverse(slice))
+      if (o->use_empty())
+        o->erase();
+    ++moved;
+  }
+  return moved;
+}
+
+// Vulkan backend: the host's reads of what kernels wrote (a `memref.load`, or
+// a `scf.for` that only loads and computes, a reduction's partial sums
+// summed), each moved down to just before the first op using what it read,
+// its buffer's deallocation with it, past the launches between that don't
+// touch that buffer. A read waits for the device to finish all it was given
+// (`cleave_vk_sync_host`), which then idles until the host gives it more:
+// interleaved with the launches, every read paid that. Gathered after them,
+// the first waits and the others find their values there. nanoLM's gradient
+// norm read each of its 256 tensors' sums between the next ones' launches:
+// 2.1 s of the device idle over 20 steps. Nothing between the read's old
+// place and its new one touches the buffer: its values are the same. After
+// the kernels are outlined. Returns how many reads it moved.
+static int64_t cleaveDeferHostReads(MlirOperation op) {
+  auto module = dyn_cast<ModuleOp>(unwrap(op));
+  if (!module)
+    return 0;
+  // What a read reads (the roots of its memrefs, defined outside it), if it
+  // is one: a load, or a loop of loads and pure arithmetic.
+  auto readsOf = [](Operation *o) -> std::optional<llvm::SmallPtrSet<Value, 4>> {
+    llvm::SmallPtrSet<Value, 4> roots;
+    if (auto load = dyn_cast<memref::LoadOp>(o)) {
+      roots.insert(viewRoot(load.getMemRef()));
+      return roots;
+    }
+    if (!isa<scf::ForOp>(o) || o->getNumResults() == 0)
+      return std::nullopt;
+    bool ok = true;
+    o->walk([&](Operation *inner) {
+      if (inner == o)
+        return WalkResult::advance();
+      if (auto load = dyn_cast<memref::LoadOp>(inner)) {
+        roots.insert(viewRoot(load.getMemRef()));
+        return WalkResult::advance();
+      }
+      if (isa<scf::YieldOp>(inner) || isMemoryEffectFree(inner))
+        return WalkResult::advance();
+      ok = false;
+      return WalkResult::interrupt();
+    });
+    if (!ok || roots.empty())
+      return std::nullopt;
+    return roots;
+  };
+  // Whether `o` (and what it holds) touches one of `roots`, other than by
+  // deallocating it (`deallocs`, moved along).
+  auto touches = [](Operation *o, const llvm::SmallPtrSet<Value, 4> &roots, SmallVector<Operation *> &deallocs) {
+    if (auto dealloc = dyn_cast<memref::DeallocOp>(o); dealloc && roots.contains(viewRoot(dealloc.getMemref()))) {
+      deallocs.push_back(o);
+      return false;
+    }
+    bool hit = false;
+    o->walk([&](Operation *inner) {
+      for (Value v : inner->getOperands())
+        if (isa<BaseMemRefType>(v.getType()) && roots.contains(viewRoot(v)))
+          hit = true;
+    });
+    return hit;
+  };
+  // A store of a value into a buffer of the function's own that no launch or
+  // call is given (a host array, a structure's parts' sums before they're
+  // summed), at constant indices: moved down too, to the first op that
+  // touches that buffer (the next store to it keeps them in order), so that
+  // the read whose value it stores can follow it down.
+  auto hostOnly = [](Value root) {
+    if (!root.getDefiningOp<memref::AllocOp>())
+      return false;
+    for (Operation *user : root.getUsers())
+      if (isa<gpu::LaunchFuncOp, func::CallOp>(user))
+        return false;
+    return true;
+  };
+  auto constantIndices = [](memref::StoreOp store) -> std::optional<SmallVector<int64_t>> {
+    SmallVector<int64_t> indices;
+    for (Value i : store.getIndices()) {
+      std::optional<int64_t> c = getConstantIntValue(i);
+      if (!c)
+        return std::nullopt;
+      indices.push_back(*c);
+    }
+    return indices;
+  };
+  // Whether the ops from `from` up to `to` (excluded) launch a kernel: the
+  // only moves worth making, and each makes the loop below progress (the
+  // launches stay; reads and stores only move down past them).
+  auto launchesBetween = [](Operation *from, Operation *to) {
+    for (Operation *x = from; x && x != to; x = x->getNextNode())
+      if (x->walk([](gpu::LaunchFuncOp) { return WalkResult::interrupt(); }).wasInterrupted())
+        return true;
+    return false;
+  };
+  // Pure arithmetic on scalars (no regions, no memory), which a read's value
+  // flows through before its use: `sum(a) + sum(b)` summed as soon as both
+  // are read, then `+ sum(c)` once `c`'s launches are done. Moved down too, to
+  // its own first use, so that the reads it waits for follow it there.
+  auto scalarArithmetic = [](Operation *o) {
+    if (o->getNumOperands() == 0 || o->getNumResults() == 0 || o->getNumRegions() != 0 || !isMemoryEffectFree(o))
+      return false;
+    return llvm::all_of(o->getResultTypes(), [](Type t) { return t.isIntOrIndexOrFloat(); });
+  };
+  // Whether `v` comes from a read, through such arithmetic, in `block`.
+  std::function<bool(Value, Block *)> fromRead = [&](Value v, Block *block) {
+    Operation *def = v.getDefiningOp();
+    if (!def || def->getBlock() != block)
+      return false;
+    if (readsOf(def))
+      return true;
+    return scalarArithmetic(def) && llvm::any_of(def->getOperands(), [&](Value w) { return fromRead(w, block); });
+  };
+  int64_t moved = 0;
+  module.walk([&](func::FuncOp function) {
+    if (function.isExternal())
+      return;
+    // Until nothing moves: a read follows its store down, which follows the
+    // read of its buffer, and so on up a structure's sums.
+    for (bool changed = true; changed;) {
+      changed = false;
+      function.walk([&](Block *block) {
+        SmallVector<Operation *> ops;
+        for (Operation &o : *block)
+          ops.push_back(&o);
+        for (Operation *o : ops) {
+          if (auto store = dyn_cast<memref::StoreOp>(o)) {
+            Value root = viewRoot(store.getMemRef());
+            std::optional<SmallVector<int64_t>> at = constantIndices(store);
+            if (!at || !hostOnly(root))
+              continue;
+            Operation *stop = o->getNextNode();
+            for (; stop && !stop->hasTrait<OpTrait::IsTerminator>(); stop = stop->getNextNode()) {
+              bool hit = false;
+              stop->walk([&](Operation *inner) {
+                for (Value v : inner->getOperands())
+                  if (isa<BaseMemRefType>(v.getType()) && viewRoot(v) == root)
+                    hit = true;
+              });
+              if (hit)
+                break;
+            }
+            if (stop && stop != o->getNextNode() && launchesBetween(o->getNextNode(), stop)) {
+              o->moveBefore(stop);
+              changed = true;
+              ++moved;
+            }
+            continue;
+          }
+          // The first op of `block` using `o`'s results.
+          auto firstUse = [&]() {
+            Operation *first = nullptr;
+            for (Value result : o->getResults())
+              for (Operation *user : result.getUsers())
+                if (Operation *mine = block->findAncestorOpInBlock(*user);
+                    mine && (!first || mine->isBeforeInBlock(first)))
+                  first = mine;
+            return first;
+          };
+          if (scalarArithmetic(o) &&
+              llvm::any_of(o->getOperands(), [&](Value v) { return fromRead(v, block); })) {
+            Operation *first = firstUse();
+            if (first && first != o->getNextNode() && o->isBeforeInBlock(first) &&
+                launchesBetween(o->getNextNode(), first)) {
+              o->moveBefore(first);
+              changed = true;
+              ++moved;
+            }
+            continue;
+          }
+          std::optional<llvm::SmallPtrSet<Value, 4>> roots = readsOf(o);
+          if (!roots)
+            continue;
+          // The first op of `block` using what it read.
+          Operation *first = firstUse();
+          if (!first || first == o->getNextNode() || !o->isBeforeInBlock(first))
+            continue;
+          // Nothing in between touches its buffers but their deallocations.
+          SmallVector<Operation *> deallocs;
+          bool clear = true;
+          for (Operation *x = o->getNextNode(); x != first; x = x->getNextNode())
+            if (touches(x, *roots, deallocs)) {
+              clear = false;
+              break;
+            }
+          if (!clear || !launchesBetween(o->getNextNode(), first))
+            continue;
+          o->moveBefore(first);
+          for (Operation *d : deallocs)
+            d->moveBefore(first);
+          changed = true;
+          ++moved;
+        }
+      });
+    }
+  });
+  return moved;
+}
+
 static int64_t cleaveSyncHostAccesses(MlirOperation op) {
   auto module = dyn_cast<ModuleOp>(unwrap(op));
   if (!module)
@@ -8140,6 +8687,12 @@ struct LowerGpuGemmsPass : PassWrapper<LowerGpuGemmsPass, OperationPass<ModuleOp
   }
 };
 
+CLEAVE_COUNTING_PASS(DeviceScalarsPass, "cleave-device-scalars",
+                     "scalars kernels take, computed from kernels' results by the device", cleaveDeviceScalars)
+CLEAVE_COUNTING_PASS(DeferHostReadsPass, "cleave-defer-host-reads",
+                     "host reads of kernels' results moved after the launches between", cleaveDeferHostReads)
+CLEAVE_COUNTING_PASS(MergeHostSyncsPass, "cleave-merge-host-syncs",
+                     "host synchronizations following one another merged into one", cleaveMergeHostSyncs)
 CLEAVE_COUNTING_PASS(SyncHostAccessesPass, "cleave-sync-host-accesses",
                      "host accesses to memory kernels may share, reported to the Vulkan runtime",
                      cleaveSyncHostAccesses)
@@ -8154,6 +8707,7 @@ CLEAVE_COUNTING_PASS(LowerGpuLaunchesPass, "cleave-lower-gpu-launches",
 
 void registerGpuPasses() {
   PassRegistration<TileParallelLoopsForGpuPass>();
+  PassRegistration<DeviceScalarsPass>();
   PassRegistration<SetSpirvEntryAbiPass>();
   PassRegistration<ParallelIteratorsFirstPass>();
   PassRegistration<MarkFullOverwritesPass>();
@@ -8166,6 +8720,8 @@ void registerGpuPasses() {
   PassRegistration<GpuCopiesPass>();
   PassRegistration<SyncHostAccessesPass>();
   PassRegistration<LowerGpuGemmsPass>();
+  PassRegistration<DeferHostReadsPass>();
+  PassRegistration<MergeHostSyncsPass>();
   PassRegistration<LowerFragmentCarriersPass>();
   PassRegistration<SpirvTargetEnvPass>();
   PassRegistration<SpirvRequirementsPass>();

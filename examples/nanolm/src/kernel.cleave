@@ -235,9 +235,8 @@ fn gpt_logits<const N: i32>(x: [i32; N], m: Gpt) -> Tensor<f32, N, VOCAB> {
 // micro-batches of whole sequences, each one's gradient computed in its own
 // task, the gradients summed. The loss is a sum over rows, so the sum of the
 // parts' gradients is the batch's gradient (up to the order of the float
-// additions). 2 for the GPU: the Vulkan backend has no host tasks, so the parts run one after
-// another, and fewer, larger ones are fewer dispatches (+2.4% over 8, 2026-10-15; device memory
-// peak 9.4 GB of 12). A CPU build wants one part per thread instead (8).
+// additions). Set per backend by the build (`build.rs`'s `split`: 8 on the CPU, a part per
+// core; 2 on Vulkan, whose parts run one after another), 2 when compiled without it.
 define SPLIT: i32 = 2;
 define MICRO: i32 = ROWS / SPLIT;
 

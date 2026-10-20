@@ -872,7 +872,9 @@ To define, then implement:
   never a silent default.
 - **The per-target split factor**, if a program still wants one: a `define` set per backend from the
   build (`build.rs` can already override defines, `Build::define`), not a value written for one
-  target in the source.
+  target in the source. Done for nanoLM (2026-10-20): its `build.rs` sets `SPLIT` to 8 on the CPU
+  and 2 on Vulkan, `NANOLM_SPLIT=<n>` to measure another (1 on Vulkan, measured once its device memory
+  peak went from 10.3 to 6.7 GB: 4% slower than 2, 24.9k tokens/s against 26.0k).
 - **Writing split code generically**: a `for` over a `spawn` comprehension's tuple by its variable
   failed to unroll ("no `impl Index<__Tuple8<...>>`") — fixed 2026-10-15, so nanoLM's sum over its
   parts can be one loop for any `SPLIT` instead of a term per part. The array form (for folding) is

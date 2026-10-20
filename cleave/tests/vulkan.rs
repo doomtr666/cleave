@@ -437,7 +437,8 @@ fn tiled_products_match_the_cpu() {
 /// through a cast, are discarded rather than uploaded, and so are the three
 /// results, fresh heap allocations made memrefs in the function
 /// (`isFreshDescriptor`). Up: the four inputs, 256 KiB each, and scalar
-/// kernel arguments; one submit per result read. Its loop over heads, made
+/// kernel arguments; one submit for the three result reads, their host
+/// syncs merged (`cleave-merge-host-syncs`). Its loop over heads, made
 /// an `scf.for` before the deallocation (`upliftCountedWhiles`), is folded
 /// into its kernels (`cleave-fold-loops-into-grids`), the bookkeeping left in
 /// a host loop: 10 dispatches, after the forward's 4 (`causal_attention_stats`,
@@ -466,10 +467,86 @@ fn attention_gradients_stay_on_the_device_across_heads() {
 stderr: {stderr}", device.name);
         assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
         assert!(
-            stderr.contains(": 14 dispatches, 1048620 bytes uploaded, 786432 bytes downloaded, 3 submits"),
+            stderr.contains(": 14 dispatches, 1048620 bytes uploaded, 786432 bytes downloaded, 1 submits"),
             "{}: {stderr}",
             device.name
         );
+    }
+}
+
+/// Sums the host reads, each computed by its own kernels, wait for the device
+/// once (`cleave-defer-host-reads`, `cleave-merge-host-syncs`): each read,
+/// the arithmetic its value goes through (`sum(a) + sum(b)`) and its store
+/// into a host array (a structure's parts' sums, `GradNorm`) moved down past
+/// the later sums' launches, and their synchronizations merged into one,
+/// past the host array's allocation. Read between the launches, each made the
+/// device wait for the host: 3 submits.
+#[test]
+fn host_reads_of_sums_wait_for_the_device_once() {
+    let program = |sums: &str| {
+        format!(
+            "
+            use nn;
+            use io;
+            fn main() -> i32 {{
+                rand_seed(1);
+                let a: Tensor<f32, 64, 256> = Init::he();
+                let b: Tensor<f32, 64, 256> = Init::he();
+                let c: Tensor<f32, 64, 256> = Init::he();
+                {sums}
+                println(s);
+                0
+            }}
+        "
+        )
+    };
+    let added = program("let s = sum(a * a) + sum(b * b) + sum(c * c);");
+    let stored = program(
+        "let parts = [sum(a * a), sum(b * b), sum(c * c)];
+         let mut s = 0.0;
+         for i in 0..parts.len() { s = s + parts[i]; };",
+    );
+    for (index, device) in devices().iter().enumerate() {
+        for (name, src) in [("sums_added", &added), ("sums_stored", &stored)] {
+            let (stdout, stderr) = stats_on(index, name, src);
+            assert!(stdout.contains("1544.19") && stdout.contains("main returned: 0"), "{}: {name}: {stdout}
+{stderr}", device.name);
+            assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
+            assert!(stderr.contains("768 bytes downloaded, 1 submits"), "{}: {name}: {stderr}", device.name);
+        }
+    }
+}
+
+/// A scalar a kernel takes, computed from another kernel's results (Muon's
+/// normalization, `1 / (sqrt(sum(g * g)) + eps)`, its sum's partial sums
+/// summed by the host), is computed by the device: a kernel of one thread,
+/// its value in a buffer of one element the scaling kernel loads
+/// (`cleave-device-scalars`). Neither the partial sums downloaded nor the
+/// device waited for: one submit, for the result the host prints, which is
+/// the only download (64 KiB); the host's sum made it wait first (2 submits,
+/// 256 bytes of partial sums more).
+#[test]
+fn a_scalar_computed_from_kernels_results_stays_on_the_device() {
+    let src = "
+        use nn;
+        use io;
+        fn main() -> i32 {
+            rand_seed(1);
+            let g: Tensor<f32, 64, 256> = Init::he();
+            let mut sq = 0.0;
+            for r in 0..64 { for c in 0..256 { sq = sq + g[r, c] * g[r, c]; }; };
+            let x: Tensor<f32, 64, 256> = Scale::scale(g, 1.0 / (sqrt(sq) + 0.0000001));
+            let y = x + x;
+            println(y[3, 4]);
+            0
+        }
+    ";
+    for (index, device) in devices().iter().enumerate() {
+        let (stdout, stderr) = stats_on(index, "device_scalar", src);
+        assert!(stdout.contains("0.013598") && stdout.contains("main returned: 0"), "{}: {stdout}
+{stderr}", device.name);
+        assert!(!stderr.contains("cleave Vulkan validation"), "{}: {stderr}", device.name);
+        assert!(stderr.contains(": 4 dispatches, 65560 bytes uploaded, 65536 bytes downloaded, 1 submits"), "{}: {stderr}", device.name);
     }
 }
 

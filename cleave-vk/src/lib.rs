@@ -2830,6 +2830,69 @@ pub extern "C" fn cleave_vk_sync_host(ptr: i64, bytes: i64) {
     }
 }
 
+/// [`cleave_vk_sync_host`] for `n` ranges at once (`ptrs[i]`, `bytes[i]`):
+/// what kernels wrote in any of them brought back together, one wait for the
+/// device instead of one each. Inserted by the compiler for the host's reads
+/// that follow one another (`cleave-merge-host-syncs`): a gradient norm's
+/// 256 sums, each its own download, its own wait and the device idle after
+/// it.
+///
+/// # Safety
+///
+/// `ptrs` and `bytes` point to `n` values each.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cleave_vk_sync_host_ranges(ptrs: *const i64, bytes: *const i64, n: i64) {
+    let call = SYNC_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    sample_caller(call, "cleave_vk_sync_host_ranges");
+    if !MIRRORS_LIVE.load(std::sync::atomic::Ordering::Acquire) || n <= 0 {
+        return;
+    }
+    // SAFETY: the caller's.
+    let (ptrs, bytes) =
+        unsafe { (std::slice::from_raw_parts(ptrs, n as usize), std::slice::from_raw_parts(bytes, n as usize)) };
+    let generation = DEVICE_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+    let pending: Vec<(i64, i64)> = ptrs
+        .iter()
+        .zip(bytes)
+        .map(|(&p, &b)| (p, b))
+        .filter(|&(p, b)| !recently(&SYNCED, p, b, generation))
+        .collect();
+    if pending.is_empty() {
+        return;
+    }
+    let entered = std::time::Instant::now();
+    let mut guard = lock();
+    if let Some(runtime) = guard.as_mut() {
+        let waited = runtime.stats.wait_ns;
+        let mut keys: Vec<usize> = Vec::new();
+        for &(p, b) in &pending {
+            for key in runtime.overlapping(p as usize, b as usize) {
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            }
+        }
+        let before = runtime.stats.downloaded_bytes;
+        if runtime.profiling {
+            runtime.drain_cause = Some(caller_of("cleave_vk_sync_host_ranges"));
+        }
+        runtime.download(&keys);
+        runtime.drain_cause = None;
+        let downloaded = runtime.stats.downloaded_bytes - before;
+        if runtime.profiling && downloaded > 0 {
+            let entry = runtime.host_reads.entry(caller_of("cleave_vk_sync_host_ranges")).or_default();
+            entry.0 += 1;
+            entry.1 += downloaded;
+        }
+        runtime.stats.runtime_ns += entered.elapsed().as_nanos() as u64;
+        runtime.stats.sync_ns += (entered.elapsed().as_nanos() as u64).saturating_sub(runtime.stats.wait_ns - waited);
+        let now = DEVICE_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+        for &(p, b) in &pending {
+            remember(&SYNCED, p, b, now);
+        }
+    }
+}
+
 /// Profiling: one host synchronization call in 4096 (the `call`-th) counted
 /// against the function making it, from a backtrace: who makes millions.
 fn sample_caller(call: u64, entry: &str) {

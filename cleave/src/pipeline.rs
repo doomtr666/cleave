@@ -633,6 +633,7 @@ pub unsafe fn register_cleave_rt_symbols_but(engine: &cleave_mlir::ExecutionEngi
         register("cleave_vk_gemm_bf16", cleave_vk::cleave_vk_gemm_bf16 as *mut ());
         register("cleave_vk_gemm_bf16_operands", cleave_vk::cleave_vk_gemm_bf16_operands as *mut ());
         register("cleave_vk_sync_host", cleave_vk::cleave_vk_sync_host as *mut ());
+        register("cleave_vk_sync_host_ranges", cleave_vk::cleave_vk_sync_host_ranges as *mut ());
         register("cleave_vk_host_wrote", cleave_vk::cleave_vk_host_wrote as *mut ());
         register("cleave_vk_discard", cleave_vk::cleave_vk_discard as *mut ());
         register("cleave_parallel_threads", cleave_rt::cleave_parallel_threads as *mut ());
@@ -924,7 +925,7 @@ pub fn lower_to_llvm<'c>(
              cleave-tile-parallel-loops-for-gpu{threads=64},func.func(gpu-map-parallel-loops,\
              convert-parallel-loops-to-gpu,canonicalize),cleave-sink-views-into-launches,\
              func.func(fold-memref-alias-ops),gpu-launch-sink-index-computations,\
-             cleave-fold-loops-into-grids,gpu-kernel-outlining)",
+             cleave-fold-loops-into-grids,cleave-device-scalars,gpu-kernel-outlining,cleave-defer-host-reads)",
         )?;
         // The kernels outlined, before SPIR-V: what to read when one computes
         // something else on the device than on the host.
@@ -942,7 +943,7 @@ pub fn lower_to_llvm<'c>(
              cleave-accurate-kernel-math,gpu.module(convert-math-to-spirv),convert-gpu-to-spirv,\
              cleave-lower-fragment-carriers,spirv.module(spirv-lower-abi-attrs,spirv-update-vce),\
              cleave-spirv-requirements,\
-             cleave-lower-gpu-launches,cleave-sync-host-accesses)",
+             cleave-lower-gpu-launches,cleave-sync-host-accesses,cleave-merge-host-syncs)",
         )?;
         dump(module, "CLEAVE_DUMP_POST_GPU");
     }
