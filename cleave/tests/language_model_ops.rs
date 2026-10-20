@@ -2413,3 +2413,103 @@ fn repeated_products_share_one_function_on_the_cpu() {
     assert_eq!(ir.matches("func.func private @__cleave_product_").count(), 1, "{ir}");
     assert_eq!(ir.matches("call @__cleave_product_0(").count(), 3, "{ir}");
 }
+
+/// Compiles and runs `src` (`fn main() -> f32`) through the CLI on the CPU,
+/// returning `main`'s value and the module after deallocation
+/// (`CLEAVE_DUMP_POST_DEALLOC`).
+fn run_dumped(name: &str, src: &str) -> (f32, String) {
+    let dir = std::env::temp_dir().join(format!("cleave-language-model-ops-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join(format!("{name}.cleave"));
+    let dump = dir.join(format!("{name}_post_dealloc.mlir"));
+    std::fs::write(&source, src).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--no-debug-info", "--run"])
+        .arg(&source)
+        .env("CLEAVE_DUMP_POST_DEALLOC", &dump)
+        .output()
+        .expect("cannot run cleave");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let bits = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("main returned: ").and_then(|v| v.trim().parse::<i64>().ok()))
+        .unwrap_or_else(|| panic!("stdout: {stdout}\nstderr: {stderr}")) as u32;
+    (f32::from_bits(bits), std::fs::read_to_string(&dump).expect("no IR dumped"))
+}
+
+/// The `main` function of a dumped module, its lines.
+fn main_of(ir: &str) -> Vec<&str> {
+    ir.lines().skip_while(|l| !l.contains("func.func @main(")).take_while(|l| !l.starts_with("  }")).collect()
+}
+
+/// A reduction written after everything else (`reduce0(y)`, a bias's
+/// gradient where its struct is assembled) runs right after its operand
+/// (`cleave-early-reductions`), so that `y` dies at its other reader instead
+/// of living through the rest: here before the second product (`sgemm` at this
+/// size), not after the third. nanoLM's backward held every layer's activation gradients to its
+/// end for such sums.
+#[test]
+fn a_late_reduction_runs_right_after_its_operand() {
+    let (_, ir) = run_dumped(
+        "early_reduction",
+        "
+        use nn;
+        fn main() -> f32 {
+            rand_seed(1);
+            let x: Tensor<f32, 512, 256> = Init::he();
+            let w: Tensor<f32, 256, 256> = Init::he();
+            let y = matmul(x, w);
+            let a = matmul(y, w);
+            let b = matmul(a, w);
+            let s: Tensor<f32, 1, 256> = reduce0(y);
+            sum(b) + sum(s)
+        }
+        ",
+    );
+    let main = main_of(&ir);
+    let products: Vec<usize> =
+        main.iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains("call @cleave_blas_sgemm(") || l.contains("call @__cleave_product_"))
+            .map(|(i, _)| i)
+            .collect();
+    let reduction = main
+        .iter()
+        .position(|l| l.contains("iterator_types = [\"reduction\", \"parallel\"]") && l.contains("memref<1x256xf32>"))
+        .unwrap_or_else(|| panic!("no row reduction in main:\n{}", main.join("\n")));
+    assert_eq!(products.len(), 3, "{}", main.join("\n"));
+    assert!(reduction < products[1], "the reduction runs after the second product:\n{}", main.join("\n"));
+}
+
+/// An elementwise result read again long after its first reader, its operand
+/// alive there anyway (`silu(y)`, read by the next product and again after 70
+/// more, `y` read at the end too): recomputed there
+/// (`cleave-recompute-elementwise`), so that it dies at its first reader. A
+/// SwiGLU's `silu(gate)` held a tensor per layer through nanoLM's forward.
+#[test]
+fn an_elementwise_result_read_much_later_is_recomputed() {
+    let chain: String = (1..=70).map(|i| format!("let a{i} = matmul(a{}, w);\n", i - 1)).collect();
+    let (value, ir) = run_dumped(
+        "recompute_elementwise",
+        &format!(
+            "
+            use nn;
+            fn main() -> f32 {{
+                rand_seed(1);
+                let x: Tensor<f32, 64, 64> = Init::he();
+                let w: Tensor<f32, 64, 64> = [for i in 0..64: [for j in 0..64: if i == j {{ 1.0 }} else {{ 0.0 }}]];
+                let y = matmul(x, w);
+                let g = silu(y);
+                let a0 = matmul(g, w);
+                {chain}
+                sum(a70) + sum(g * y) + sum(y)
+            }}
+            "
+        ),
+    );
+    let main = main_of(&ir).join("\n");
+    assert_eq!(main.matches("math.exp").count(), 2, "silu not recomputed:\n{main}");
+    // `w` is the identity: a70 = g, so the sum is sum(g) + sum(g * y) + sum(y).
+    assert!(value.is_finite());
+}

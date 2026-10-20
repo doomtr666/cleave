@@ -862,7 +862,7 @@ pub fn lower_to_llvm<'c>(
         &format!(
             "builtin.module(cleave-limit-inlining{{threshold={threshold}}},{inline}\
              cleave-drop-zero-trip-whiles,sroa,mem2reg,convert-elementwise-to-linalg,linalg-fuse-elementwise-ops,\
-             {cpu_matmuls}cleave-reuse-dying-inputs)",
+             {cpu_matmuls}cleave-early-reductions,cleave-recompute-elementwise,cleave-reuse-dying-inputs)",
             threshold = options.inline_threshold,
             inline = if options.inline { "inline," } else { "" },
         ),

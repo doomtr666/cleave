@@ -4,6 +4,7 @@
 // integers and strings cross it.
 
 #include "cleave.h"
+#include "mlir/Transforms/RegionUtils.h"
 
 // Tells LLVM what the `cleave-rt` allocator entry points *are*, the way clang
 // annotates `malloc`/`free` (`allockind`/`allocsize`/`alloc-family`, `noalias`
@@ -1626,6 +1627,233 @@ static int64_t cleaveOutlineProducts(MlirOperation op) {
   return moved;
 }
 
+// The ops that reduce a tensor to a much smaller one (a result at most a
+// quarter of their largest operand: a row sum, a norm's weight gradient),
+// side-effect free (on tensors, or a call to a function that is), moved up
+// to just after their last operand's definition, with the cheap ops that only
+// make their starting value (`tensor.empty`, `linalg.fill`, a constant), never
+// above a spawn's markers. Where a
+// gradient's struct is put together, at the end of the function, each bias's
+// and norm weight's gradient summed there the rows of a tensor the whole
+// backward kept alive for it: nanoLM's backward held every layer's gradients
+// of its activations to the end, 2.5 GB of its 4 GB of device memory at its
+// peak. Moved up, those tensors die at their last other use. Each operand
+// is available where the op lands, and the op reads nothing else: the values
+// are the same. Before bufferization. Returns how many ops it moved.
+static int64_t cleaveEarlyReductions(MlirOperation op) {
+  auto module = cast<ModuleOp>(unwrap(op));
+  // Functions free of side effects, their callees too.
+  llvm::DenseMap<Operation *, bool> pure;
+  std::function<bool(func::FuncOp)> isPure = [&](func::FuncOp f) -> bool {
+    if (f.isExternal())
+      return false;
+    if (auto it = pure.find(f); it != pure.end())
+      return it->second;
+    pure[f] = false; // a recursive call isn't proven pure
+    bool result = true;
+    f.walk([&](Operation *o) {
+      if (o == f.getOperation() || isa<func::ReturnOp>(o))
+        return WalkResult::advance();
+      if (auto call = dyn_cast<func::CallOp>(o)) {
+        auto callee = module.lookupSymbol<func::FuncOp>(call.getCallee());
+        if (callee && isPure(callee))
+          return WalkResult::advance();
+      } else if (isMemoryEffectFree(o)) {
+        return WalkResult::advance();
+      }
+      result = false;
+      return WalkResult::interrupt();
+    });
+    return pure[f] = result;
+  };
+  auto bytes = [](Type t) -> int64_t {
+    auto shaped = dyn_cast<RankedTensorType>(t);
+    if (!shaped || !shaped.hasStaticShape())
+      return 0;
+    return shaped.getNumElements() * ((shaped.getElementTypeBitWidth() + 7) / 8);
+  };
+  auto sideEffectFree = [&](Operation *o) {
+    if (auto call = dyn_cast<func::CallOp>(o)) {
+      auto callee = module.lookupSymbol<func::FuncOp>(call.getCallee());
+      return callee && isPure(callee);
+    }
+    return isMemoryEffectFree(o);
+  };
+  // What only makes a starting value, moved along with the op that reads it.
+  auto isStart = [](Operation *o) {
+    return isa<tensor::EmptyOp, arith::ConstantOp, linalg::FillOp>(o) && o->hasOneUse();
+  };
+  SmallVector<Operation *> candidates;
+  module.walk([&](Operation *o) {
+    if (o->getNumResults() == 0 || o->getNumRegions() > 1 || isa<func::FuncOp, ModuleOp>(o))
+      return;
+    // A reduction: a result at most a quarter of its largest operand (a
+    // sum over 4096 rows: 4096 times smaller), not an elementwise op of
+    // several operands, whose result is as large as each.
+    int64_t largest = 0, out = 0;
+    for (Value v : o->getOperands())
+      largest = std::max(largest, bytes(v.getType()));
+    for (Value v : o->getResults()) {
+      if (!isa<RankedTensorType>(v.getType()))
+        return;
+      out += bytes(v.getType());
+    }
+    if (largest > 0 && 4 * out <= largest && sideEffectFree(o))
+      candidates.push_back(o);
+  });
+  int64_t moved = 0;
+  for (Operation *o : candidates) {
+    Block *block = o->getBlock();
+    // The latest op of `block` an operand needs: `anchor` (null: the block's
+    // start). The starting values' makers in `starts`, to move along.
+    Operation *anchor = nullptr;
+    SmallVector<Operation *> starts;
+    std::function<void(Value)> need = [&](Value v) {
+      Operation *def = v.getDefiningOp();
+      Operation *mine = def ? block->findAncestorOpInBlock(*def) : nullptr;
+      if (!mine)
+        return; // a block argument or defined outside: there from the start
+      if (isStart(mine) && mine == def) {
+        for (Value w : mine->getOperands())
+          need(w);
+        starts.push_back(mine);
+        return;
+      }
+      if (!anchor || anchor->isBeforeInBlock(mine))
+        anchor = mine;
+    };
+    for (Value v : o->getOperands())
+      need(v);
+    // And what its regions read from above (a `linalg.generic`'s scalar
+    // taken from outside its body): an operand too, for dominance.
+    llvm::SetVector<Value> above;
+    getUsedValuesDefinedAbove(o->getRegions(), above);
+    for (Value v : above)
+      need(v);
+    // Not above a spawn's markers (`cleave_spawn_next`, `cleave_task_wait`):
+    // a spawned call's results are there only after its wait, though their
+    // values are defined at the call (`c = a + b` of two spawned results,
+    // moved above the wait, read them before their tasks ran). Any other op
+    // leaves a tensor's value as it is.
+    for (Operation *x = o->getPrevNode(); x && x != anchor; x = x->getPrevNode())
+      if (auto call = dyn_cast<func::CallOp>(x);
+          call && (call.getCallee() == "cleave_spawn_next" || call.getCallee() == "cleave_task_wait")) {
+        anchor = x;
+        break;
+      }
+    Operation *after = anchor;
+    // Already right after it, starts included?
+    Operation *expected = anchor ? anchor->getNextNode() : &block->front();
+    if (starts.empty() ? expected == o : false)
+      continue;
+    if (anchor && !anchor->isBeforeInBlock(o))
+      continue;
+    // The starting values' makers first, in their order, then the op.
+    llvm::sort(starts, [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
+    starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
+    for (Operation *s : starts) {
+      if (after)
+        s->moveAfter(after);
+      else
+        s->moveBefore(&block->front());
+      after = s;
+    }
+    if (after)
+      o->moveAfter(after);
+    else
+      o->moveBefore(&block->front());
+    ++moved;
+  }
+  return moved;
+}
+
+// An elementwise op (`linalg.generic`, every loop parallel, into a fresh
+// `tensor.empty`) whose result is read again long after its first reader
+// (`kGap` ops later in the same block) while its operands are still alive
+// there anyway (each read within `kGap` ops of it): recomputed just before
+// that later reader, which reads the copy, as do the readers after it. Its
+// result then dies at its first readers instead of living across all that
+// lies between: a SwiGLU's `silu(gate)`, read by the forward and again by
+// the backward, held a 4096 x 2048 tensor per layer through the whole
+// forward (0.5 GB of nanoLM's peak), next to `gate`, which the backward keeps
+// anyway. A cheap op recomputed from what's there, for a tensor less held.
+// Before bufferization. Returns how many ops it copied.
+static int64_t cleaveRecomputeElementwise(MlirOperation op) {
+  constexpr int64_t kGap = 64;
+  int64_t copied = 0;
+  SmallVector<linalg::GenericOp> candidates;
+  unwrap(op)->walk([&](linalg::GenericOp generic) {
+    if (generic.hasPureTensorSemantics() && generic.getNumDpsInits() == 1 && generic->getNumResults() == 1 &&
+        generic.getNumLoops() == generic.getNumParallelLoops() && generic.getNumDpsInputs() >= 1 &&
+        generic.getDpsInits()[0].getDefiningOp<tensor::EmptyOp>() && isMemoryEffectFree(generic))
+      candidates.push_back(generic);
+  });
+  llvm::DenseMap<Block *, llvm::DenseMap<Operation *, int64_t>> orders;
+  auto indexIn = [&](Block *block, Operation *o) -> int64_t {
+    auto &order = orders[block];
+    if (order.empty()) {
+      int64_t i = 0;
+      for (Operation &x : *block)
+        order[&x] = i++;
+    }
+    return order.lookup(o);
+  };
+  // Where in `block` `v` is last read: the index of the op holding that read.
+  auto lastRead = [&](Block *block, Value v) -> std::optional<int64_t> {
+    std::optional<int64_t> last;
+    for (OpOperand &use : v.getUses())
+      if (Operation *mine = block->findAncestorOpInBlock(*use.getOwner())) {
+        int64_t i = indexIn(block, mine);
+        if (!last || i > *last)
+          last = i;
+      }
+    return last;
+  };
+  for (linalg::GenericOp generic : candidates) {
+    Block *block = generic->getBlock();
+    Value result = generic->getResult(0);
+    // Its readers, by where they are in `block`.
+    SmallVector<std::pair<int64_t, OpOperand *>> readers;
+    bool elsewhere = false;
+    for (OpOperand &use : result.getUses()) {
+      Operation *mine = block->findAncestorOpInBlock(*use.getOwner());
+      if (!mine) {
+        elsewhere = true;
+        break;
+      }
+      readers.push_back({indexIn(block, mine), &use});
+    }
+    if (elsewhere || readers.size() < 2)
+      continue;
+    llvm::sort(readers, [](auto &a, auto &b) { return a.first < b.first; });
+    int64_t first = readers.front().first;
+    auto later = llvm::find_if(readers, [&](auto &r) { return r.first - first > kGap; });
+    if (later == readers.end())
+      continue;
+    int64_t at = later->first;
+    bool alive = llvm::all_of(generic.getDpsInputs(), [&](Value v) {
+      Operation *def = v.getDefiningOp();
+      if (!def || !block->findAncestorOpInBlock(*def))
+        return true; // an argument, or from outside: there throughout
+      std::optional<int64_t> last = lastRead(block, v);
+      return last && *last >= at - kGap;
+    });
+    if (!alive)
+      continue;
+    Operation *reader = block->findAncestorOpInBlock(*later->second->getOwner());
+    OpBuilder b(reader);
+    IRMapping mapping;
+    Operation *empty = b.clone(*generic.getDpsInits()[0].getDefiningOp(), mapping);
+    mapping.map(generic.getDpsInits()[0], empty->getResult(0));
+    Operation *copy = b.clone(*generic, mapping);
+    for (auto it = later; it != readers.end(); ++it)
+      it->second->set(copy->getResult(0));
+    orders.erase(block); // indices moved
+    ++copied;
+  }
+  return copied;
+}
+
 // An elementwise op (`linalg.generic`, every loop parallel) writing a fresh
 // tensor (`tensor.empty`) while one of its operands, of the same type and
 // read through the same identity map, has no other use: the op writes into
@@ -2362,6 +2590,10 @@ CLEAVE_COUNTING_PASS(ReleaseAfterFieldUsesPass, "cleave-release-after-field-uses
                      cleaveReleaseAfterFieldUses)
 CLEAVE_COUNTING_PASS(OutlineProductsPass, "cleave-outline-products",
                      "repeated CPU products moved into a function each", cleaveOutlineProducts)
+CLEAVE_COUNTING_PASS(EarlyReductionsPass, "cleave-early-reductions",
+                     "ops shrinking their operands moved up to them", cleaveEarlyReductions)
+CLEAVE_COUNTING_PASS(RecomputeElementwisePass, "cleave-recompute-elementwise",
+                     "elementwise ops recomputed for a later reader", cleaveRecomputeElementwise)
 CLEAVE_COUNTING_PASS(ReuseDyingInputsPass, "cleave-reuse-dying-inputs",
                      "elementwise results written into a dying operand",
                      cleaveReuseDyingInputs)
@@ -3241,6 +3473,8 @@ extern "C" void cleaveRegisterPasses() {
     PassRegistration<LowerNonAffineLinalgPass>();
     PassRegistration<LowerBlasMatmulsPass>();
     PassRegistration<ReuseDyingInputsPass>();
+    PassRegistration<RecomputeElementwisePass>();
+    PassRegistration<EarlyReductionsPass>();
     PassRegistration<OutlineProductsPass>();
     PassRegistration<ElideBlockCopiesPass>();
     PassRegistration<ForwardCopiesToDestinationsPass>();

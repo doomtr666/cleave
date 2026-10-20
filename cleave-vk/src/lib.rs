@@ -654,8 +654,14 @@ impl Gpu {
         };
         let (buffer, allocation) =
             unsafe { self.allocator.create_buffer(&info, &allocation_info) }.map_err(fail("allocating a buffer"))?;
-        let mapped = self.allocator.get_allocation_info(&allocation).mapped_data as *mut u8;
-        Ok(Buffer { gpu: self, buffer, allocation, bytes, mapped })
+        let info = self.allocator.get_allocation_info(&allocation);
+        let mapped = info.mapped_data as *mut u8;
+        // SAFETY: the allocator is alive as long as `self`.
+        let properties = unsafe { self.allocator.get_memory_properties() };
+        let device_local = properties.memory_types[info.memory_type as usize]
+            .property_flags
+            .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL);
+        Ok(Buffer { gpu: self, buffer, allocation, bytes, mapped, device_local, released: 0 })
     }
 
     /// A compute kernel: the entry point `entry` of the SPIR-V module
@@ -952,6 +958,11 @@ pub struct Buffer<'g> {
     allocation: vk_mem::Allocation,
     bytes: usize,
     mapped: *mut u8,
+    /// In the device's memory (`CLEAVE_VK_PROFILE`'s accounting).
+    device_local: bool,
+    /// Kept spare (`Runtime::spare`): the batch its last commands were
+    /// recorded in (`Batch::seq`), 0 for none still pending.
+    released: u64,
 }
 
 impl Buffer<'_> {
@@ -1071,8 +1082,9 @@ pub struct Stats {
     pub device_window: Option<(u64, u64)>,
     /// The most device memory the process used (`Gpu::device_memory`), as
     /// a new buffer was made, and then: the budget, the mirrors', the spare
-    /// buffers', VMA's blocks' and allocations'.
-    pub device_peak: [u64; 6],
+    /// buffers', VMA's blocks' and allocations', the host-mapped buffers'
+    /// held spare, and those the batches in flight keep until they finish.
+    pub device_peak: [u64; 8],
 }
 
 /// The causes [`Stats::upload_causes`] counts.
@@ -1121,6 +1133,8 @@ enum Garbage {
 /// (`doc/plan-vulkan.md`, Phase 2): dispatches, uploads, downloads, a full
 /// memory barrier between any two.
 struct Batch {
+    /// Its place in recording order, from 1 (`Buffer::released`).
+    seq: u64,
     command: vk::CommandBuffer,
     fence: vk::Fence,
     commands: usize,
@@ -1177,6 +1191,8 @@ struct Runtime {
     mirrors: std::collections::BTreeMap<usize, Mirror>,
     recording: Option<Batch>,
     in_flight: Vec<Batch>,
+    /// Batches recorded so far (`Batch::seq`).
+    batches: u64,
     stats: Stats,
     /// Each kernel's index into `profile`, by the same key as `kernels`.
     kernel_ids: std::collections::HashMap<(usize, String), usize>,
@@ -1212,8 +1228,12 @@ struct Runtime {
 
 /// How much memory `Runtime::spare` keeps: the device's freed first when
 /// its memory runs out (`take_buffer`), so what's kept never pushes
-/// mirrors out; the host's for staging only.
-const SPARE_DEVICE_BYTES: usize = 1 << 30;
+/// mirrors out; the host's for staging only. Room for what a backward frees
+/// at once: at 1 GiB, nanoLM's pushed hundreds of 12 MB buffers out each
+/// step, made again by the next micro-batch (10k buffers a step), each
+/// held until its batch finished (`free_after_last_use`) and leaving holes
+/// in VMA's blocks: a 9.2 GB peak for 4.2 GB of mirrors. At 4 GiB, 6.7 GB.
+const SPARE_DEVICE_BYTES: usize = 4 << 30;
 const SPARE_HOST_BYTES: usize = 256 << 20;
 
 static RUNTIME: Mutex<Option<Runtime>> = Mutex::new(None);
@@ -1323,6 +1343,7 @@ fn runtime(guard: &mut Option<Runtime>) -> &mut Runtime {
             mirrors: Default::default(),
             recording: None,
             in_flight: Vec::new(),
+            batches: 0,
             stats: Stats::default(),
             kernel_ids: Default::default(),
             profile: Vec::new(),
@@ -1432,12 +1453,14 @@ extern "C" fn report() {
             100.0 * waiting as f64 / window.max(1) as f64
         );
     }
-    let [used, budget, mirrors, spare, blocks, allocations] = s.device_peak.map(|b| b as f64 / 1048576.0);
+    let [used, budget, mirrors, spare, blocks, allocations, host_spare, kept] =
+        s.device_peak.map(|b| b as f64 / 1048576.0);
     let _ = writeln!(
         out,
         "  device memory at its peak: {used:.0} MiB of a {budget:.0} MiB budget: {mirrors:.0} MiB of mirrors, \
          {spare:.0} MiB of spare buffers, {:.0} MiB else (allocations in VMA's blocks {allocations:.0} MiB of \
-         {blocks:.0} MiB); {} mirrors evicted",
+         {blocks:.0} MiB; host-mapped buffers then: {host_spare:.0} MiB spare, {kept:.0} MiB kept by batches \
+         in flight); {} mirrors evicted",
         used - mirrors - spare,
         s.evictions
     );
@@ -1622,7 +1645,9 @@ impl Runtime {
                 unsafe { device.cmd_reset_query_pool(command, pool, 0, 2 * TIMED_PER_BATCH as u32) };
                 pool
             });
+            self.batches += 1;
             self.recording = Some(Batch {
+                seq: self.batches,
                 command,
                 fence,
                 commands: 0,
@@ -1672,12 +1697,26 @@ impl Runtime {
         // any command touching a buffer an unfinished one touched). Waiting for the fence left the spare empty
         // between waits, every new mirror a new buffer (320k a nanoLM step).
         // One the host maps waits: the host writes it when it's taken.
-        if let Garbage::Buffer(buffer) = &garbage
-            && buffer.mapped.is_null()
-        {
-            self.dispose(garbage);
-            return;
+        if let Garbage::Buffer(mut buffer) = garbage {
+            if buffer.mapped.is_null() {
+                buffer.released = self.pending_seq();
+                self.dispose(Garbage::Buffer(buffer));
+                return;
+            }
+            return self.defer_pending(Garbage::Buffer(buffer));
         }
+        self.defer_pending(garbage);
+    }
+
+    /// The batch commands recorded now end up in, or the last one in flight:
+    /// what may still use a buffer released now. 0 for none.
+    fn pending_seq(&self) -> u64 {
+        self.recording.as_ref().or(self.in_flight.last()).map_or(0, |b| b.seq)
+    }
+
+    /// `defer`'s general case: kept by the pending batch, dropped at once
+    /// when there's none.
+    fn defer_pending(&mut self, garbage: Garbage) {
         if let Some(batch) = self.recording.as_mut().or(self.in_flight.last_mut()) {
             batch.garbage.push(garbage);
         } else {
@@ -1699,8 +1738,26 @@ impl Runtime {
                 && used > self.stats.device_peak[0]
             {
                 let mirrors: usize = self.mirrors.values().map(|m| m.len).sum();
-                self.stats.device_peak =
-                    [used, budget, mirrors as u64, self.spare_bytes[0] as u64, blocks, allocations];
+                let kept: usize = self
+                    .recording
+                    .iter()
+                    .chain(self.in_flight.iter())
+                    .flat_map(|b| b.garbage.iter())
+                    .map(|g| match g {
+                        Garbage::Buffer(b) | Garbage::Free(b) if b.device_local => b.bytes,
+                        _ => 0,
+                    })
+                    .sum();
+                self.stats.device_peak = [
+                    used,
+                    budget,
+                    mirrors as u64,
+                    self.spare_bytes[0] as u64,
+                    blocks,
+                    allocations,
+                    self.spare_bytes[1] as u64,
+                    kept as u64,
+                ];
             }
         }
         self.stats.buffers_made += 1;
@@ -1880,6 +1937,26 @@ impl Runtime {
         }
     }
 
+    /// A spare buffer pushed out (`dispose`), freed once the batch its last
+    /// commands were recorded in is done (`Buffer::released`): at once when
+    /// it is. It was kept by the batch pending when it was pushed out, a newer
+    /// one: 975 buffers, 3.4 GB of nanoLM's device memory, waiting for four
+    /// batches in flight to finish, at its peak.
+    fn free_after_last_use(&mut self, buffer: Buffer<'static>) {
+        let seq = buffer.released;
+        if let Some(batch) = self.recording.as_mut().filter(|b| b.seq == seq) {
+            batch.garbage.push(Garbage::Free(buffer));
+            return;
+        }
+        if let Some(batch) = self.in_flight.iter_mut().find(|b| b.seq == seq)
+            && !unsafe { self.gpu.device.get_fence_status(batch.fence) }.unwrap_or(false)
+        {
+            batch.garbage.push(Garbage::Free(buffer));
+            return;
+        }
+        drop(buffer); // its batch is done
+    }
+
     fn dispose(&mut self, garbage: Garbage) {
         match garbage {
             Garbage::Buffer(buffer) => {
@@ -1896,7 +1973,7 @@ impl Runtime {
                         // Perhaps still bound by a command in flight.
                         let pushed_out = kept.remove(0);
                         self.spare_bytes[kind] -= oldest;
-                        self.defer(Garbage::Free(pushed_out));
+                        self.free_after_last_use(pushed_out);
                     }
                 }
                 self.spare_bytes[kind] += len;

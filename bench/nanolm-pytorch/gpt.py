@@ -13,9 +13,19 @@ The same arguments as cleave's `bench` mode; the first step must be 0, the twin 
 cleave also saves a checkpoint at the end of each round, counted in its round's time; the twin
 doesn't.
 
-`NANOLM_DEVICE=cuda` runs it on the GPU, against cleave's Vulkan build (`--features vulkan`), in
-f32 throughout as cleave: TF32 products are turned off (`allow_tf32`), the attention is PyTorch's
-own fused f32 kernel. That needs a CUDA build of PyTorch (`pyproject.toml`).
+`NANOLM_DEVICE=cuda` runs it on the GPU, against cleave's Vulkan build (`--features vulkan`). That
+needs a CUDA build of PyTorch (`pyproject.toml`). Its precision, `NANOLM_PRECISION`:
+
+- `f32` (the default): f32 throughout, TF32 products turned off (`allow_tf32`), the attention
+  PyTorch's fused f32 kernel. The losses match an all-f32 cleave kernel's.
+- `bf16`: the forward under `torch.autocast` in bfloat16, PyTorch's usual mixed precision, as the
+  kernel chooses its own (`dense_forward_bf16`, `swiglu_forward_bf16`, the bf16 attention,
+  `embedding_logits_bf16`): the products in bf16 with f32 accumulation, the attention PyTorch's
+  fused bf16 kernel (FlashAttention), the norms, residuals and loss in f32 (the f32 biases promote
+  the products' results back). A bf16 product's result is rounded to bf16 here, kept in f32 by
+  cleave's: the losses are close, not equal. The speed comparison against today's kernel.
+
+`NANOLM_COMPILE=1` compiles the loss (`torch.compile`): PyTorch's best case, its kernels fused.
 """
 
 import math
@@ -36,13 +46,22 @@ DEVICE = torch.device(os.environ.get("NANOLM_DEVICE", "cpu"))
 if DEVICE.type == "cuda":
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
+PRECISION = os.environ.get("NANOLM_PRECISION", "f32")
+if PRECISION not in ("f32", "bf16"):
+    sys.exit(f"NANOLM_PRECISION={PRECISION}: f32 or bf16")
+COMPILE = os.environ.get("NANOLM_COMPILE") == "1"
+print(f"device {DEVICE}, precision {PRECISION}{', compiled' if COMPILE else ''}")
 D, DH, HIDDEN, LAYERS = (DEFINES[k] for k in ("WIDTH", "HEAD", "HIDDEN", "LAYERS"))
 LR, MUON_LR = 0.001, DEFINES["MUON_LR"]
 WARMUP, REWARM_AT, COOLDOWN = DEFINES["WARMUP"], DEFINES["REWARM_AT"], DEFINES["COOLDOWN"]
 ACCUM, VAL_BATCHES = DEFINES["ACCUM"], DEFINES["VAL_BATCHES"]
 CLIP = DEFINES["CLIP_PER_ROW"] * ACCUM * B * T  # the loss is summed over the step's rows
 EPS = 1e-5
-MODEL_DIR = CACHE.parent / f"nanolm2-d{D}-l{LAYERS}-t{T}-v{VOCAB}-bench"
+# cleave's `bench` directory: `-bench-vulkan` for its Vulkan build (the GPU comparison), `-bench` for
+# its CPU one; the one this device compares against first, else the other (the same initial weights).
+_BENCH = CACHE.parent / f"nanolm2-d{D}-l{LAYERS}-t{T}-v{VOCAB}-bench"
+_CANDIDATES = [_BENCH.with_name(_BENCH.name + "-vulkan"), _BENCH] if DEVICE.type == "cuda" else [_BENCH, _BENCH.with_name(_BENCH.name + "-vulkan")]
+MODEL_DIR = next((d for d in _CANDIDATES if (d / "gpt_init.ckpt").exists()), _CANDIDATES[0])
 H = D // DH
 
 corpus = Corpus()
@@ -90,11 +109,21 @@ def block(x, p):
     return x + (F.silu(h @ wg + bg) * (h @ wu + bu)) @ wd + bd
 
 
-def loss(x, y):
+def forward_loss(x, y):
     h = tok[x.reshape(-1)]
     for p in blocks:
         h = block(h, p)
     return F.cross_entropy(rms_norm(h, nf) @ tok.T, y.reshape(-1), reduction="sum")
+
+
+forward = torch.compile(forward_loss) if COMPILE else forward_loss
+
+
+def loss(x, y):
+    if PRECISION == "bf16":
+        with torch.autocast(DEVICE.type, dtype=torch.bfloat16):
+            return forward(x, y).float()
+    return forward(x, y)
 
 
 def on_device(tokens, seed, i):
