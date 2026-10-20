@@ -850,7 +850,7 @@ pub fn lower_to_llvm<'c>(
     let cpu_matmuls = if vulkan {
         ""
     } else {
-        "cleave-blas-tile-and-fuse{rows=BLAS_ROWS},cleave-lower-blas-matmuls,\
+        "cleave-outline-products,cleave-blas-tile-and-fuse{rows=BLAS_ROWS},cleave-lower-blas-matmuls,\
          cleave-split-row-remainders{rows=ROW_TILE},transform-interpreter{entry-point=__transform_main},\
          loop-invariant-subset-hoisting,"
     }
@@ -1050,7 +1050,12 @@ pub fn target(options: &CodegenOptions) -> Result<cleave_mlir::Target, Vec<Strin
         options.target_cpu.as_deref(),
         options.target_features.as_deref(),
         options.opt_level as usize,
-        false,
+        // Position-independent off Windows: an object goes into a Rust
+        // executable (`--emit-exe`, `cleave-build`), position-independent
+        // there by default (PIE), which absolute relocations can't be linked
+        // into (`R_X86_64_64 ... recompile with -fPIC`, Linux CI). The JIT
+        // takes either.
+        !cfg!(windows),
         options.llvm_loop_unroll,
     )
     .map_err(|e| vec![format!("invalid target: {e}")])

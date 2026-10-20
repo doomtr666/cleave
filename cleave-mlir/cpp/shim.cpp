@@ -1533,6 +1533,99 @@ static int64_t cleaveLowerBlasMatmuls(MlirOperation op) {
   return lowered;
 }
 
+// The CPU's products (`linalg.matmul` not for BLAS, of static shapes, where
+// the matmul schedule takes them: right in a function or a `scf.while`)
+// grouped by what they compute: operand and result types, attributes
+// (transpositions, the compute type), and the zero (or other constant) a
+// fresh result starts from (a `linalg.fill` of a `tensor.empty` used by the
+// product alone). Each group of two or more becomes one function, `no_inline`,
+// called from every site: its product tiled and vectorized once. Inlined,
+// every product got its own vectorized copy: nanoLM's bf16 training step
+// (16 layers, a dozen products each, forward and backward, none on BLAS)
+// became one function of a million operations, whose code generation LLVM
+// didn't finish in two hours. A product met once stays where it is. Before
+// the matmul schedule, after inlining. Returns how many products it moved.
+static int64_t cleaveOutlineProducts(MlirOperation op) {
+  auto module = cast<ModuleOp>(unwrap(op));
+  struct Site {
+    linalg::MatmulOp product;
+    linalg::FillOp fill; // the fresh result's, moved with the product
+  };
+  std::map<std::string, SmallVector<Site>> groups; // ordered by key: deterministic names
+  module.walk([&](linalg::MatmulOp product) {
+    if (!product.hasPureTensorSemantics() || product->hasAttr("cleave.blas") ||
+        !isa<func::FuncOp, scf::WhileOp>(product->getParentOp()))
+      return;
+    for (Value v : product->getOperands())
+      if (!cast<ShapedType>(v.getType()).hasStaticShape())
+        return;
+    linalg::FillOp fill = product.getDpsInits()[0].getDefiningOp<linalg::FillOp>();
+    if (fill && (!fill->hasOneUse() || !fill.getOutputs()[0].getDefiningOp<tensor::EmptyOp>() ||
+                 !fill.getInputs()[0].getDefiningOp<arith::ConstantOp>()))
+      fill = {};
+    std::string key;
+    llvm::raw_string_ostream os(key);
+    os << product->getName() << product->getAttrDictionary();
+    for (Type t : product->getOperandTypes())
+      os << ',' << t;
+    if (fill)
+      os << ",fill " << fill.getInputs()[0].getDefiningOp<arith::ConstantOp>().getValue();
+    groups[key].push_back({product, fill});
+  });
+  MLIRContext *ctx = module.getContext();
+  int64_t moved = 0, made = 0;
+  for (auto &[key, sites] : groups) {
+    if (sites.size() < 2)
+      continue;
+    Site first = sites.front();
+    // Its parameters: `a`, `b`, and `c` unless the fill makes it.
+    SmallVector<Value> operands{first.product.getDpsInputs()[0], first.product.getDpsInputs()[1]};
+    if (!first.fill)
+      operands.push_back(first.product.getDpsInits()[0]);
+    SmallVector<Type> types = llvm::to_vector(llvm::map_range(operands, [](Value v) { return v.getType(); }));
+    Type result = first.product->getResult(0).getType();
+    OpBuilder top(ctx);
+    top.setInsertionPointToEnd(module.getBody());
+    std::string name = "__cleave_product_" + std::to_string(made++);
+    auto function = func::FuncOp::create(top, first.product.getLoc(), name, FunctionType::get(ctx, types, {result}));
+    function.setPrivate();
+    function->setAttr("no_inline", UnitAttr::get(ctx));
+    Block *entry = function.addEntryBlock();
+    OpBuilder b = OpBuilder::atBlockEnd(entry);
+    IRMapping mapping;
+    for (auto [operand, arg] : llvm::zip(operands, entry->getArguments()))
+      mapping.map(operand, arg);
+    if (first.fill) {
+      b.clone(*first.fill.getInputs()[0].getDefiningOp(), mapping);
+      b.clone(*first.fill.getOutputs()[0].getDefiningOp(), mapping);
+      b.clone(*first.fill, mapping);
+    }
+    Operation *body = b.clone(*first.product, mapping);
+    func::ReturnOp::create(b, first.product.getLoc(), body->getResult(0));
+    // No location of the function the product came from: with debug info,
+    // each names that function's subprogram, which LLVM rejects in another
+    // function (the translation to LLVM IR failed).
+    function->walk([&](Operation *inner) { inner->setLoc(UnknownLoc::get(ctx)); });
+    for (Site site : sites) {
+      OpBuilder at(site.product);
+      SmallVector<Value> args{site.product.getDpsInputs()[0], site.product.getDpsInputs()[1]};
+      if (!site.fill)
+        args.push_back(site.product.getDpsInits()[0]);
+      auto call = func::CallOp::create(at, site.product.getLoc(), function, args);
+      site.product->getResult(0).replaceAllUsesWith(call.getResult(0));
+      site.product->erase();
+      if (site.fill) {
+        Operation *empty = site.fill.getOutputs()[0].getDefiningOp();
+        site.fill->erase();
+        if (empty->use_empty())
+          empty->erase();
+      }
+      ++moved;
+    }
+  }
+  return moved;
+}
+
 // An elementwise op (`linalg.generic`, every loop parallel) writing a fresh
 // tensor (`tensor.empty`) while one of its operands, of the same type and
 // read through the same identity map, has no other use: the op writes into
@@ -2267,6 +2360,8 @@ CLEAVE_COUNTING_PASS(LowerBlasMatmulsPass, "cleave-lower-blas-matmuls",
 CLEAVE_COUNTING_PASS(ReleaseAfterFieldUsesPass, "cleave-release-after-field-uses",
                      "struct fields' releases moved after their last access by any name",
                      cleaveReleaseAfterFieldUses)
+CLEAVE_COUNTING_PASS(OutlineProductsPass, "cleave-outline-products",
+                     "repeated CPU products moved into a function each", cleaveOutlineProducts)
 CLEAVE_COUNTING_PASS(ReuseDyingInputsPass, "cleave-reuse-dying-inputs",
                      "elementwise results written into a dying operand",
                      cleaveReuseDyingInputs)
@@ -3146,6 +3241,7 @@ extern "C" void cleaveRegisterPasses() {
     PassRegistration<LowerNonAffineLinalgPass>();
     PassRegistration<LowerBlasMatmulsPass>();
     PassRegistration<ReuseDyingInputsPass>();
+    PassRegistration<OutlineProductsPass>();
     PassRegistration<ElideBlockCopiesPass>();
     PassRegistration<ForwardCopiesToDestinationsPass>();
     PassRegistration<ForwardReadOnlyArgumentsPass>();

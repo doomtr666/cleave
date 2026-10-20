@@ -32,6 +32,15 @@ fn run_cpu(name: &str, src: &str) -> String {
         .arg(&source)
         .output()
         .expect("cannot run cleave");
+    // A reference that failed says why, rather than an empty list of values
+    // (two tests on Linux CI, with no other clue).
+    assert!(
+        output.status.success(),
+        "{name} failed on the CPU ({}):\n{}{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 

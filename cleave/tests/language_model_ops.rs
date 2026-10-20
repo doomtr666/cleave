@@ -2358,3 +2358,58 @@ fn a_branch_decided_by_a_specialized_functions_sizes_is_pruned() {
     }
     assert!(!has_if(&matmul.def.body), "{:?}", matmul.def.body);
 }
+
+/// Products the CPU computes alike (`linalg.matmul` of one signature, here
+/// three bf16 products of 64 x 64, none for BLAS) share one function
+/// (`cleave-outline-products`), tiled and vectorized once and called from
+/// each site; the values are the products'. Each had its own vectorized copy
+/// inlined: nanoLM's bf16 training step, a dozen products per layer over 16
+/// layers, made a function LLVM didn't finish compiling in two hours.
+#[test]
+fn repeated_products_share_one_function_on_the_cpu() {
+    let dir = std::env::temp_dir().join(format!("cleave-language-model-ops-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("shared_products.cleave");
+    let dump = dir.join("shared_products_post_dealloc.mlir");
+    std::fs::write(
+        &source,
+        "
+        use linalg;
+        use convert;
+        use nn;
+        fn main() -> f32 {
+            let a: Tensor<bf16, 64, 64> = [for i in 0..64: [for j in 0..64: rem(i + j, 3).to()]];
+            let b: Tensor<bf16, 64, 64> = [for i in 0..64: [for j in 0..64: rem(i * j, 2).to()]];
+            let c: Tensor<bf16, 64, 64> = [for i in 0..64: [for j in 0..64: rem(i + 2 * j, 5).to()]];
+            let p: Tensor<f32, 64, 64> = matmul_wide(a, b);
+            let q: Tensor<f32, 64, 64> = matmul_wide(b, c);
+            let r: Tensor<f32, 64, 64> = matmul_wide(c, a);
+            sum(p) + 2.0 * sum(q) + 3.0 * sum(r)
+        }
+        ",
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cleave"))
+        .args(["--no-openmp", "--no-debug-info", "--run"])
+        .arg(&source)
+        .env("CLEAVE_DUMP_POST_DEALLOC", &dump)
+        .output()
+        .expect("cannot run cleave");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let a = |i: i64, j: i64| ((i + j) % 3) as f64;
+    let b = |i: i64, j: i64| ((i * j) % 2) as f64;
+    let c = |i: i64, j: i64| ((i + 2 * j) % 5) as f64;
+    let total = |x: &dyn Fn(i64, i64) -> f64, y: &dyn Fn(i64, i64) -> f64| -> f64 {
+        (0..64).flat_map(|i| (0..64).map(move |j| (i, j))).map(|(i, j)| (0..64).map(|k| x(i, k) * y(k, j)).sum::<f64>()).sum()
+    };
+    let expected = (total(&a, &b) + 2.0 * total(&b, &c) + 3.0 * total(&c, &a)) as f32;
+    let bits: u32 = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("main returned: ").and_then(|v| v.trim().parse::<i64>().ok()))
+        .unwrap_or_else(|| panic!("stdout: {stdout}\nstderr: {stderr}")) as u32;
+    assert_eq!(f32::from_bits(bits), expected, "stderr: {stderr}");
+    let ir = std::fs::read_to_string(&dump).expect("no IR dumped");
+    assert_eq!(ir.matches("func.func private @__cleave_product_").count(), 1, "{ir}");
+    assert_eq!(ir.matches("call @__cleave_product_0(").count(), 3, "{ir}");
+}
