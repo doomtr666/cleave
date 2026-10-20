@@ -3242,6 +3242,90 @@ pub fn install_crash_trace() {
             crash_trace::AddVectoredExceptionHandler(1, crash_trace::handler);
         });
     }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        static INSTALLED: std::sync::Once = std::sync::Once::new();
+        if std::env::var_os("CLEAVE_CRASH_TRACE").is_none() {
+            return;
+        }
+        INSTALLED.call_once(crash_trace_linux::install);
+    }
+}
+
+/// `install_crash_trace` on Linux: a handler for `SIGILL`, `SIGSEGV`, `SIGBUS`
+/// and `SIGFPE` printing the signal, the faulting instruction's address and
+/// the shared object holding it (none: JIT-compiled code), the address
+/// accessed, and the stack; then the default action (`SA_RESETHAND`: the
+/// fault again, the process dies as it would have). Not async-signal-safe,
+/// and needn't be: the process is dying. Found wanting on Linux CI, two
+/// programs killed by `SIGILL` with nothing on `stderr`.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod crash_trace_linux {
+    use std::ffi::{CStr, c_char, c_int, c_void};
+
+    /// glibc's `struct sigaction` on x86-64.
+    #[repr(C)]
+    struct SigAction {
+        handler: usize,
+        mask: [u64; 16],
+        flags: c_int,
+        restorer: usize,
+    }
+
+    #[repr(C)]
+    struct DlInfo {
+        fname: *const c_char,
+        fbase: *mut c_void,
+        sname: *const c_char,
+        saddr: *mut c_void,
+    }
+
+    const SA_SIGINFO: c_int = 4;
+    const SA_RESETHAND: c_int = 0x8000_0000u32 as c_int;
+    const SIGNALS: [c_int; 4] = [4, 7, 8, 11]; // SIGILL, SIGBUS, SIGFPE, SIGSEGV
+
+    #[link(name = "dl")]
+    unsafe extern "C" {
+        fn sigaction(signal: c_int, action: *const SigAction, old: *mut SigAction) -> c_int;
+        fn dladdr(address: *const c_void, info: *mut DlInfo) -> c_int;
+    }
+
+    pub fn install() {
+        let action = SigAction {
+            handler: handler as extern "C" fn(c_int, *const u8, *const u8) as usize,
+            mask: [0; 16],
+            flags: SA_SIGINFO | SA_RESETHAND,
+            restorer: 0,
+        };
+        for signal in SIGNALS {
+            unsafe { sigaction(signal, &action, std::ptr::null_mut()) };
+        }
+    }
+
+    /// `info`: a `siginfo_t`, the address accessed at byte 16. `context`: a
+    /// `ucontext_t`, the instruction pointer at byte 168 (`uc_mcontext.
+    /// gregs[REG_RIP]`).
+    extern "C" fn handler(signal: c_int, info: *const u8, context: *const u8) {
+        let (accessed, pc) = unsafe {
+            (*(info.add(16) as *const usize), *(context.add(168) as *const usize))
+        };
+        let mut dl = DlInfo {
+            fname: std::ptr::null(),
+            fbase: std::ptr::null_mut(),
+            sname: std::ptr::null(),
+            saddr: std::ptr::null_mut(),
+        };
+        let text = |p: *const c_char| {
+            if p.is_null() { "?".to_string() } else { unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned() }
+        };
+        let place = if unsafe { dladdr(pc as *const c_void, &mut dl) } != 0 {
+            format!("{} +{:#x} ({})", text(dl.fname), pc - dl.fbase as usize, text(dl.sname))
+        } else {
+            "no shared object (JIT-compiled code)".to_string()
+        };
+        eprintln!("CLEAVE_CRASH_TRACE: signal {signal} at {pc:#x} in {place}, address {accessed:#x}");
+        eprintln!("{:?}", backtrace::Backtrace::new());
+    }
 }
 
 #[cfg(windows)]

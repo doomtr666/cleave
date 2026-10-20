@@ -111,10 +111,15 @@ jobs:
       # CI -- this is the same fix already documented for that case,
       # applied where `cargo test` itself runs rather than left to each
       # developer's own shell.
+      # `CLEAVE_CRASH_TRACE`: a program the tests run that dies on a fault
+      # (an illegal instruction, an access violation) prints where, in which
+      # module, and its stack (`cleave_rt::install_crash_trace`): no debugger
+      # on a runner.
       - name: cargo test
         run: cargo test --release --no-fail-fast
         env:
           RUST_MIN_STACK: "67108864"
+          CLEAVE_CRASH_TRACE: "1"
 
       # The example crates outside `default-members`: no network and no
       # training here, but each one's `build.rs` compiles a real kernel
