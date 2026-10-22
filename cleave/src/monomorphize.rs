@@ -1095,6 +1095,7 @@ fn collect_instantiations_block(
                         "set",
                         &[base_ty.clone(), idx_array_ty, value_ty],
                         &base_ty,
+                        false,
                     ) {
                         ImplMatch::Found(tmpl_idx, mapping) => {
                             call_names.insert(stmt.id, display_impl_instantiation(&templates[tmpl_idx], &mapping));
@@ -2927,7 +2928,7 @@ fn derive_impl_instantiation(
     let Some(ret_ty) = node_types.get(&call_id).cloned() else {
         return ImplMatch::NoCandidates;
     };
-    derive_impl_instantiation_for(templates, registry, algebra, method, arg_tys, &ret_ty)
+    derive_impl_instantiation_for(templates, registry, algebra, method, arg_tys, &ret_ty, false)
 }
 
 /// `derive_impl_instantiation` given the call's result type directly — for
@@ -2940,6 +2941,7 @@ fn derive_impl_instantiation_for(
     method: &str,
     arg_tys: &[Ty],
     ret_ty: &Ty,
+    specialize: bool,
 ) -> ImplMatch {
     let owned_by =
         |t: &&ImplTemplate| t.method_name == method && algebra.map_or(true, |a| t.algebra == a);
@@ -3014,6 +3016,31 @@ fn derive_impl_instantiation_for(
             .collect();
         matches.push((idx, Some(mapping)));
     }
+    // Several, one strictly more specific than the others at the arguments
+    // the call fixes: that one (specialization, `Infer::most_specific_impl`'s
+    // rule). For a call whose result is still open only if nothing else
+    // decides it (`specialize`, `InstanceEngine::specialize`): a row of one's
+    // `Optimizer<Muon, Tensor<f32, 1, C>, ..>` over a matrix's, its state's
+    // type then that impl's; but a tuple `collect`ed into what the context
+    // asks for, never into whichever struct of two `f32`s is most specific.
+    if matches.len() > 1 && (specialize || is_fully_concrete(&query)) {
+        let known: Vec<usize> = arg_tys
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| is_fully_concrete(t))
+            .map(|(i, _)| i)
+            .collect();
+        let beats = |a: usize, b: usize| {
+            template_at_least_as_specific(&templates[a], &templates[b], &known)
+                && !template_at_least_as_specific(&templates[b], &templates[a], &known)
+        };
+        let winners: Vec<usize> = (0..matches.len())
+            .filter(|&k| (0..matches.len()).all(|j| j == k || beats(matches[k].0, matches[j].0)))
+            .collect();
+        if let [k] = winners[..] {
+            matches = vec![matches.swap_remove(k)];
+        }
+    }
     // A query still holding type variables (a generic lambda's body walked
     // before any instantiation) can match several impls without being
     // ambiguous: its concrete instantiation decides later, so nothing is
@@ -3047,6 +3074,29 @@ fn derive_impl_instantiation_for(
                 .collect(),
         },
     }
+}
+
+/// Whether template `a` is at least as specific as `b` at the parameters
+/// `positions`: `a`'s patterns there an instance of `b`'s, `a`'s own
+/// variables left distinct variables (`Infer::impl_at_least_as_specific`, on
+/// templates).
+fn template_at_least_as_specific(a: &ImplTemplate, b: &ImplTemplate, positions: &[usize]) -> bool {
+    let mut trial = Subst::default();
+    let mut vars = HashSet::default();
+    for &p in positions {
+        let (Some(pa), Some(pb)) = (a.param_patterns.get(p), b.param_patterns.get(p)) else {
+            return false;
+        };
+        free_vars(pa, &mut vars);
+        if unify(&mut trial, pb, pa).is_err() {
+            return false;
+        }
+    }
+    let mut seen = HashSet::default();
+    vars.iter().all(|v| match trial.apply(&Ty::Var(*v)) {
+        Ty::Var(x) | Ty::Pack(x) => seen.insert(x),
+        _ => false,
+    })
 }
 
 /// Like `derive_instantiation`, but for a lambda-bound name used as a bare
@@ -3627,6 +3677,17 @@ struct InstanceEngine<'a> {
     in_progress: RefCell<HashSet<String>>,
     done: RefCell<HashMap<String, (String, Ty)>>,
     produced: RefCell<Produced>,
+    /// The calls (`call_key`) an instance's body left undetermined, its
+    /// arguments known but nothing deciding its result among several impls:
+    /// resolved by the most specific one when the instance is inferred again
+    /// (`derive_impl_instantiation_for`'s `specialize`).
+    specialize: RefCell<HashSet<String>>,
+}
+
+/// A call to `algebra::method` at the argument types `args`, for
+/// `InstanceEngine::specialize`.
+fn call_key(algebra: &str, method: &str, args: &[Ty]) -> String {
+    format!("{algebra}::{method}({})", args.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "))
 }
 
 /// What `InstanceEngine` hands back to `monomorphize`.
@@ -3683,6 +3744,7 @@ impl<'a> InstanceEngine<'a> {
             in_progress: RefCell::new(HashSet::default()),
             done: RefCell::new(HashMap::default()),
             produced: RefCell::new(Produced::default()),
+            specialize: RefCell::new(HashSet::default()),
         }
     }
 
@@ -3766,42 +3828,72 @@ impl<'a> InstanceEngine<'a> {
                 start: 0,
                 end: 0,
             });
-        let mut decl = t.decl.clone();
-        let (infer, outcome) = self.infer_unrolling(&mut decl, |infer, decl| {
-            // Targets the call left open become this session's own variables.
-            let mut open: HashMap<TyVar, Ty> = HashMap::default();
-            let target_tys: Vec<Ty> = t
-                .target_patterns
+        // Inferred again while that leaves calls undetermined that the most
+        // specific impl can decide (`specialize`).
+        let (decl, infer, result) = loop {
+            let mut decl = t.decl.clone();
+            let (infer, outcome) = self.infer_unrolling(&mut decl, |infer, decl| {
+                // Targets the call left open become this session's own variables.
+                let mut open: HashMap<TyVar, Ty> = HashMap::default();
+                let target_tys: Vec<Ty> = t
+                    .target_patterns
+                    .iter()
+                    .map(|p| {
+                        let ty = substitute(p, mapping);
+                        let mut fv = HashSet::default();
+                        free_vars(&ty, &mut fv);
+                        for v in fv {
+                            open.entry(v).or_insert_with(|| infer.fresh_var());
+                        }
+                        substitute(&ty, &open)
+                    })
+                    .collect();
+                infer.infer_impl_fn_instance(
+                    &self.global_env,
+                    &t.algebra,
+                    &t.impl_generics,
+                    &t.impl_targets,
+                    decl,
+                    span,
+                    &target_tys,
+                    args,
+                )
+            });
+            let result = match outcome {
+                Ok(r) => r,
+                Err(e) => {
+                    self.in_progress.borrow_mut().remove(&key);
+                    *self.last_error.borrow_mut() = Some(e);
+                    return None;
+                }
+            };
+            let body = decl.body.clone().unwrap_or(Block { stmts: Vec::new(), tail: None });
+            let mut exprs = Vec::new();
+            collect_exprs_block(&body, &mut exprs);
+            let node_types: HashMap<NodeId, Ty> = exprs
                 .iter()
-                .map(|p| {
-                    let ty = substitute(p, mapping);
-                    let mut fv = HashSet::default();
-                    free_vars(&ty, &mut fv);
-                    for v in fv {
-                        open.entry(v).or_insert_with(|| infer.fresh_var());
-                    }
-                    substitute(&ty, &open)
-                })
+                .filter_map(|e| infer.node_types.get(&e.id).map(|ty| (e.id, ty.clone())))
                 .collect();
-            infer.infer_impl_fn_instance(
-                &self.global_env,
-                &t.algebra,
-                &t.impl_generics,
-                &t.impl_targets,
-                decl,
-                span,
-                &target_tys,
-                args,
-            )
-        });
-        self.in_progress.borrow_mut().remove(&key);
-        let result = match outcome {
-            Ok(r) => r,
-            Err(e) => {
-                *self.last_error.borrow_mut() = Some(e);
+            if !is_fully_concrete(&result)
+                || infer.param_types.iter().any(|p| !is_fully_concrete(p))
+                || node_types.values().any(|v| !is_fully_concrete(v))
+            {
+                let fresh = self
+                    .undetermined_calls(&exprs, &node_types)
+                    .into_iter()
+                    .filter(|k| self.specialize.borrow_mut().insert(k.clone()))
+                    .count();
+                if fresh > 0 {
+                    continue;
+                }
+                self.in_progress.borrow_mut().remove(&key);
+                *self.last_error.borrow_mut() =
+                    self.undetermined_instance_error(&display_impl_instantiation(t, mapping), args, &exprs, &node_types);
                 return None;
             }
+            break (decl, infer, result);
         };
+        self.in_progress.borrow_mut().remove(&key);
         let body = decl.body.clone().unwrap_or(Block { stmts: Vec::new(), tail: None });
 
         let mut exprs = Vec::new();
@@ -3810,14 +3902,6 @@ impl<'a> InstanceEngine<'a> {
             .iter()
             .filter_map(|e| infer.node_types.get(&e.id).map(|ty| (e.id, ty.clone())))
             .collect();
-        if !is_fully_concrete(&result)
-            || infer.param_types.iter().any(|p| !is_fully_concrete(p))
-            || node_types.values().any(|v| !is_fully_concrete(v))
-        {
-            *self.last_error.borrow_mut() =
-                self.undetermined_instance_error(&display_impl_instantiation(t, mapping), args, &exprs, &node_types);
-            return None;
-        }
         let lambda_schemes = self.instance_lambdas(&infer, &exprs, &mut node_types);
 
         // The template's own bindings, now that the instance is concrete.
@@ -3957,6 +4041,30 @@ impl InstanceEngine<'_> {
             }
             self.next_node.set(ids.current());
         }
+    }
+
+    /// The algebra calls (`call_key`) in an instance's body whose arguments
+    /// are all known but whose result isn't, their method one algebra's.
+    fn undetermined_calls(&self, exprs: &[&Expr], node_types: &HashMap<NodeId, Ty>) -> Vec<String> {
+        let mut keys = Vec::new();
+        for e in exprs {
+            let ExprKind::Call(path, _, call_args, _) = &e.kind else { continue };
+            if node_types.get(&e.id).is_none_or(is_fully_concrete) {
+                continue;
+            }
+            let Some(arg_tys) = call_args
+                .iter()
+                .map(|a| node_types.get(&a.id).filter(|t| is_fully_concrete(t)).cloned())
+                .collect::<Option<Vec<Ty>>>()
+            else {
+                continue;
+            };
+            let Some(method) = path.segments.last() else { continue };
+            if let [algebra] = self.registry.algebras_with_fn(method, call_args.len()).as_slice() {
+                keys.push(call_key(algebra, method, &arg_tys));
+            }
+        }
+        keys
     }
 
     /// Why an instance's body left a type undetermined, for its error: the
@@ -4199,7 +4307,8 @@ impl InstanceOracle for InstanceEngine<'_> {
         // a broadcast's shape); otherwise an unbound variable no template can
         // share a number with.
         let ret = ret.cloned().unwrap_or(Ty::Var(TyVar(u32::MAX - 1)));
-        match derive_impl_instantiation_for(self.templates, self.registry, Some(algebra), method, args, &ret) {
+        let specialize = self.specialize.borrow().contains(&call_key(algebra, method, args));
+        match derive_impl_instantiation_for(self.templates, self.registry, Some(algebra), method, args, &ret, specialize) {
             ImplMatch::FoundConcrete(idx) => {
                 let t = &self.templates[idx];
                 Some((display_impl_instantiation(t, &HashMap::default()), t.ret_pattern.clone()))

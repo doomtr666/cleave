@@ -245,28 +245,32 @@ fn adam_direction<T: Float + Ring, const Dims...: i32>(grad: Tensor<T, Dims...>,
     (m_hat / denom, AdamState::<T, Dims...>(m: m, v: v, beta1_pow: beta1_pow, beta2_pow: beta2_pow))
 }
 
-impl<const R: i32, const C: i32> Optimizer<Muon, Tensor<f32, R, C>, AdamState<f32, R, C>> {
-    fn init_state(opt, model) {
-        AdamState::<f32, R, C>(m: Ring::zero(), v: Ring::zero(), beta1_pow: 1.0, beta2_pow: 1.0)
-    }
-    // Not inlined, as `Adam`'s. A row of one (a bias, a gain) goes to AdamW;
-    // a matrix keeps its momentum in `state.m` (`v` unused), steps along the
-    // orthogonalized Nesterov momentum, scaled by `sqrt(max(1, R / C))` so
-    // that tall and wide matrices move alike, with AdamW's decoupled decay.
+// What Muon keeps of a matrix between steps: its momentum, nothing more (an
+// `AdamState` carried a second moment no step read, as large as the matrix).
+struct MuonState<T: Float, const Dims...: i32> { m: Tensor<T, Dims...> }
+
+// A row of one (a bias, a norm gain) goes to AdamW, its state AdamW's. The
+// more specific impl: a matrix of one row matches the one below as well, and
+// this one wins (specialization, `doc/type_inference.md`).
+impl<const C: i32> Optimizer<Muon, Tensor<f32, 1, C>, AdamState<f32, 1, C>> {
+    fn init_state(opt, model) { init_state(opt.adamw, model) }
+    fn step(opt, model, grad, state) { step(opt.adamw, model, grad, state) }
+}
+
+// A matrix keeps its momentum, steps along the orthogonalized Nesterov
+// momentum, scaled by `sqrt(max(1, R / C))` so that tall and wide matrices
+// move alike, with AdamW's decoupled decay. Not inlined, as `Adam`'s.
+impl<const R: i32, const C: i32> Optimizer<Muon, Tensor<f32, R, C>, MuonState<f32, R, C>> {
+    fn init_state(opt, model) { MuonState::<f32, R, C>(m: Ring::zero()) }
     #[no_inline]
     fn step(opt, model, grad, state) {
-        if R == 1 {
-            step(opt.adamw, model, grad, state)
-        } else {
-            let buf: Tensor<f32, R, C> = Scale::scale(state.m, opt.momentum) + Scale::scale(grad, 1.0 - opt.momentum);
-            let nesterov: Tensor<f32, R, C> = Scale::scale(grad, 1.0 - opt.momentum) + Scale::scale(buf, opt.momentum);
-            let r: f32 = R.to();
-            let c: f32 = C.to();
-            let aspect: f32 = if r > c { sqrt(r / c) } else { 1.0 };
-            let update: Tensor<f32, R, C> = Scale::scale(newton_schulz5(nesterov), opt.lr * aspect);
-            (Scale::scale(model, 1.0 - opt.lr * opt.weight_decay) - update,
-             AdamState::<f32, R, C>(m: buf, v: state.v, beta1_pow: state.beta1_pow, beta2_pow: state.beta2_pow))
-        }
+        let buf: Tensor<f32, R, C> = Scale::scale(state.m, opt.momentum) + Scale::scale(grad, 1.0 - opt.momentum);
+        let nesterov: Tensor<f32, R, C> = Scale::scale(grad, 1.0 - opt.momentum) + Scale::scale(buf, opt.momentum);
+        let r: f32 = R.to();
+        let c: f32 = C.to();
+        let aspect: f32 = if r > c { sqrt(r / c) } else { 1.0 };
+        let update: Tensor<f32, R, C> = Scale::scale(newton_schulz5(nesterov), opt.lr * aspect);
+        (Scale::scale(model, 1.0 - opt.lr * opt.weight_decay) - update, MuonState::<f32, R, C>(m: buf))
     }
 }
 

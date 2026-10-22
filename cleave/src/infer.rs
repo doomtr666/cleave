@@ -4514,7 +4514,15 @@ impl<'r> Infer<'r> {
                         let pattern_b = self.ty_from_ast_mapped(tb, &mapping_b);
                         unify(&mut trial, &pattern_a, &pattern_b).is_ok()
                     });
-                    if all_overlap {
+                    // One strictly more specific than the other everywhere
+                    // (`impl Twice<i32>` beside `impl<T: Ring> Twice<T>`):
+                    // specialization, not a conflict — where both apply,
+                    // dispatch takes it (`most_specific_impl`).
+                    let positions: Vec<usize> = (0..targets_a.len()).collect();
+                    let specializes = all_overlap
+                        && (self.impl_at_least_as_specific(&algebra, i, j, &positions)
+                            != self.impl_at_least_as_specific(&algebra, j, i, &positions));
+                    if all_overlap && !specializes {
                         // Group every `Type` generic's own bounds — from
                         // *both* impls — by the resolved type its fresh var
                         // now shares in `trial`; two bounds land in the same
@@ -4605,8 +4613,14 @@ impl<'r> Infer<'r> {
     /// structural match against `Complex<T>` alone isn't enough if `T`'s
     /// own resolved argument doesn't actually satisfy `T: Float`.
     fn matching_impls(&mut self, algebra: &str, query: &[Ty]) -> Vec<Subst> {
+        self.matching_impls_indexed(algebra, query).into_iter().map(|(_, trial)| trial).collect()
+    }
+
+    /// `matching_impls`, each match with its impl's index in
+    /// `Registry::all_impls(algebra)`.
+    fn matching_impls_indexed(&mut self, algebra: &str, query: &[Ty]) -> Vec<(usize, Subst)> {
         let mut out = Vec::new();
-        for (generics, targets) in self.registry.all_impls(algebra) {
+        for (index, (generics, targets)) in self.registry.all_impls(algebra).into_iter().enumerate() {
             if targets.len() != query.len() {
                 continue;
             }
@@ -4654,10 +4668,67 @@ impl<'r> Infer<'r> {
                 GenericParam::Const { .. } => true,
             });
             if bounds_satisfied {
-                out.push(trial);
+                out.push((index, trial));
             }
         }
         out
+    }
+
+    /// Whether impl `a` of `algebra` is at least as specific as impl `b` at
+    /// `positions` of their targets: `a`'s patterns there an instance of
+    /// `b`'s (`Tensor<f32, 1, C>` of `Tensor<f32, R, C>`, `R := 1`), its own
+    /// generics left as distinct variables, nothing of `a` pinned by `b`.
+    fn impl_at_least_as_specific(&mut self, algebra: &str, a: usize, b: usize, positions: &[usize]) -> bool {
+        let impls = self.registry.all_impls(algebra);
+        let ((generics_a, targets_a), (generics_b, targets_b)) = (&impls[a], &impls[b]);
+        let mapping_a = self.fresh_vars_for_generics(generics_a);
+        let mapping_b = self.fresh_vars_for_generics(generics_b);
+        let mut trial = Subst::default();
+        for &p in positions {
+            let pattern_a = self.ty_from_ast_mapped(targets_a[p], &mapping_a);
+            let pattern_b = self.ty_from_ast_mapped(targets_b[p], &mapping_b);
+            if unify(&mut trial, &pattern_b, &pattern_a).is_err() {
+                return false;
+            }
+        }
+        let mut seen = HashSet::default();
+        mapping_a.values().all(|v| match trial.apply(v) {
+            Ty::Var(x) | Ty::Pack(x) => seen.insert(x),
+            _ => false,
+        })
+    }
+
+    /// Of several impls matching a call (`matching_impls_indexed`), the one
+    /// strictly more specific than every other at the positions the call
+    /// determines (concrete in `query`), if there is one: specialization,
+    /// `impl Optimizer<Muon, Tensor<f32, 1, C>, AdamState<f32, 1, C>>` over
+    /// `impl Optimizer<Muon, Tensor<f32, R, C>, MuonState<f32, R, C>>` for a
+    /// row of one, its state then the more specific impl's. A rule, not a
+    /// guess: two impls neither of which is more specific than the other
+    /// stay an ambiguity.
+    fn most_specific_impl(&mut self, algebra: &str, query: &[Ty], matches: &[(usize, Subst)]) -> Option<usize> {
+        let positions: Vec<usize> = query
+            .iter()
+            .enumerate()
+            .filter(|(_, q)| is_fully_concrete(&self.subst.apply(q)))
+            .map(|(i, _)| i)
+            .collect();
+        let indices: Vec<usize> = matches.iter().map(|(i, _)| *i).collect();
+        let mut winner = None;
+        for (k, &a) in indices.iter().enumerate() {
+            let beats_all = indices.iter().all(|&b| {
+                b == a
+                    || (self.impl_at_least_as_specific(algebra, a, b, &positions)
+                        && !self.impl_at_least_as_specific(algebra, b, a, &positions))
+            });
+            if beats_all {
+                if winner.is_some() {
+                    return None;
+                }
+                winner = Some(k);
+            }
+        }
+        winner
     }
 
     /// Non-committing existence probe: does `algebra` have an `impl` whose
@@ -4826,11 +4897,16 @@ impl<'r> Infer<'r> {
                 return Ok(true);
             }
         }
-        let matches = self.matching_impls(algebra, tys);
+        let mut matches = self.matching_impls_indexed(algebra, tys);
         if matches.is_empty() {
             return Ok(false);
         }
         if matches.len() > 1 {
+            if let Some(k) = self.most_specific_impl(algebra, tys, &matches) {
+                self.subst = matches.swap_remove(k).1;
+                return Ok(true);
+            }
+            let matches: Vec<Subst> = matches.iter().map(|(_, trial)| trial.clone()).collect();
             let resolved: Vec<Vec<Ty>> = matches
                 .iter()
                 .map(|trial| tys.iter().map(|q| trial.apply(q)).collect())
@@ -4854,7 +4930,7 @@ impl<'r> Infer<'r> {
                 });
             }
         }
-        self.subst = matches.into_iter().next().unwrap();
+        self.subst = matches.into_iter().next().unwrap().1;
         Ok(true)
     }
 

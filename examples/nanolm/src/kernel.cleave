@@ -352,6 +352,61 @@ export fn train_gpt(first: i32, rounds: i32, per_round: i32, lr: f32, seed: i64,
     gpt_validation_loss(m, VAL_BATCHES)
 }
 
+// One-shot migration of a `gpt.ckpt` saved before Muon kept a matrix's momentum alone
+// (`MuonState`): every leaf's state was then an `AdamState`, AdamW's, its unused second moment and
+// bias corrections saved with it. Read back into the current shape: everything as saved, but a
+// `MuonState`, its momentum read and the three records after it skipped. To be deleted once the
+// running checkpoints are converted (`nanolm migrate-muon-state`).
+algebra RestoreFromAdamW<T> {
+    fn restore_from_adamw(f: i64, like: T) -> T;
+}
+
+impl<const R: i32, const C: i32> RestoreFromAdamW<Tensor<f32, R, C>> {
+    fn restore_from_adamw(f, like) { restore_part(f, like) }
+}
+
+impl RestoreFromAdamW<i64> {
+    fn restore_from_adamw(f, like) { restore_part(f, like) }
+}
+
+impl<T: Float, const Dims...: i32> RestoreFromAdamW<AdamState<T, Dims...>> {
+    fn restore_from_adamw(f, like) { restore_part(f, like) }
+}
+
+impl<T: Float, const Dims...: i32> RestoreFromAdamW<MuonState<T, Dims...>> {
+    fn restore_from_adamw(f, like) {
+        let m = restore_part(f, like.m);
+        let unused_v = restore_part(f, like.m);
+        let pow: f32 = 1.0;
+        let unused_beta1_pow = restore_part(f, pow);
+        let unused_beta2_pow = restore_part(f, pow);
+        MuonState::<T, Dims...>(m: m)
+    }
+}
+
+impl<Ts...: RestoreFromAdamW> RestoreFromAdamW<Ts...> {
+    fn restore_from_adamw(f, like) {
+        [for i in 0..like.len(): restore_from_adamw(f, like[i])]
+    }
+}
+
+impl<M: Parameters> RestoreFromAdamW<M> {
+    fn restore_from_adamw(f, like) {
+        [for i in 0..like.len(): restore_from_adamw(f, like[i])]
+    }
+}
+
+// `gpt.ckpt` rewritten in the current shape (`RestoreFromAdamW`).
+export fn migrate_muon_state() -> i32 {
+    let fresh = new_gpt();
+    let like = (fresh, init_state(optimizer(0, 0.001, 0), fresh), 0:i64);
+    let f = checkpoint_open("gpt.ckpt");
+    let migrated = restore_from_adamw(f, like);
+    cleave_ckpt_close(f);
+    save("gpt.ckpt", migrated);
+    0
+}
+
 // ------------------------------------------------------------------ generation
 
 // The prompt, encoded by the host (`main.rs`), left-aligned in a context of `CONTEXT`; its length.

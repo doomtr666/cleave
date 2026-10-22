@@ -1085,6 +1085,12 @@ pub struct Stats {
     /// buffers', VMA's blocks' and allocations', the host-mapped buffers'
     /// held spare, and those the batches in flight keep until they finish.
     pub device_peak: [u64; 8],
+    /// The most device memory the process's buffers held, the spare ones
+    /// apart (VMA's allocations less `Runtime::spare`'s): what its work needs,
+    /// the spare buffers being given back whenever memory runs short
+    /// (`make_room`). Then: the mirrors', and those the batches in flight
+    /// keep until they finish.
+    pub device_live_peak: [u64; 3],
 }
 
 /// The causes [`Stats::upload_causes`] counts.
@@ -1117,7 +1123,14 @@ struct Mirror {
     /// When a dispatch last used it (`Runtime::uses`): the least recent go
     /// first when the device's memory runs out.
     last_use: u64,
+    /// `CLEAVE_VK_PROFILE`: the first kernel bound to it (`Runtime::profile`'s
+    /// index; `NO_ORIGIN` until one is), what made it: its function is where
+    /// its memory goes at the peak (`Runtime::live_peak_origins`).
+    origin: usize,
 }
+
+/// `Mirror::origin` before any kernel is bound to it.
+const NO_ORIGIN: usize = usize::MAX;
 
 /// What a batch keeps alive until the device has finished it: what its
 /// commands use and nothing else holds any more.
@@ -1224,6 +1237,10 @@ struct Runtime {
     spare_order: [std::collections::VecDeque<usize>; 2],
     /// A clock of mirror uses (`Mirror::last_use`).
     uses: u64,
+    /// `CLEAVE_VK_PROFILE`: at the peak of the device memory in use
+    /// (`Stats::device_live_peak`), the mirrors' bytes by the function of the
+    /// kernel that made them (`Mirror::origin`), largest first.
+    live_peak_origins: Vec<(String, u64)>,
 }
 
 /// How much memory `Runtime::spare` keeps: the device's freed first when
@@ -1355,6 +1372,7 @@ fn runtime(guard: &mut Option<Runtime>) -> &mut Runtime {
             spare_bytes: [0, 0],
             spare_order: Default::default(),
             uses: 0,
+            live_peak_origins: Vec::new(),
             profiling: {
                 let profiling = std::env::var("CLEAVE_VK_PROFILE").is_ok_and(|v| v == "1");
                 if profiling {
@@ -1464,6 +1482,18 @@ extern "C" fn report() {
         used - mirrors - spare,
         s.evictions
     );
+    let [live, live_mirrors, live_kept] = s.device_live_peak.map(|b| b as f64 / 1048576.0);
+    let _ = writeln!(
+        out,
+        "  device memory in use at its peak, spare buffers apart: {live:.0} MiB: {live_mirrors:.0} MiB of mirrors,          {:.0} MiB else ({live_kept:.0} MiB of it kept by batches in flight until they finish)",
+        live - live_mirrors
+    );
+    if !runtime.live_peak_origins.is_empty() {
+        let _ = writeln!(out, "  its mirrors by the function of the kernel that made them:");
+        for (function, bytes) in runtime.live_peak_origins.iter().take(20) {
+            let _ = writeln!(out, "    {:>9.1} MiB  {function}", *bytes as f64 / 1048576.0);
+        }
+    }
     let mut kernels: Vec<&KernelProfile> = runtime.profile.iter().collect();
     kernels.sort_by(|a, b| b.gpu_ns.total_cmp(&a.gpu_ns));
     let mib = |b: u64| b as f64 / 1048576.0;
@@ -1714,6 +1744,41 @@ impl Runtime {
         self.recording.as_ref().or(self.in_flight.last()).map_or(0, |b| b.seq)
     }
 
+    /// The device memory held once a device buffer of `len` bytes is taken
+    /// (`take_buffer`), the spare buffers apart: a new peak recorded
+    /// (`Stats::device_live_peak`). A spare buffer taken counts as much as a
+    /// new one: either way `len` more bytes are in use.
+    fn note_live_device_memory(&mut self, len: usize) {
+        let Some([_, _, _, allocations]) = self.gpu.device_memory_detail() else { return };
+        let live = (allocations + len as u64).saturating_sub(self.spare_bytes[0] as u64);
+        if live <= self.stats.device_live_peak[0] {
+            return;
+        }
+        let mirrors: usize = self.mirrors.values().map(|m| m.len).sum();
+        let kept: usize = self
+            .recording
+            .iter()
+            .chain(self.in_flight.iter())
+            .flat_map(|b| b.garbage.iter())
+            .map(|g| match g {
+                Garbage::Buffer(b) | Garbage::Free(b) if b.device_local => b.bytes,
+                _ => 0,
+            })
+            .sum();
+        self.stats.device_live_peak = [live, mirrors as u64, kept as u64];
+        let mut origins: std::collections::HashMap<&str, u64> = Default::default();
+        for mirror in self.mirrors.values() {
+            let function = match self.profile.get(mirror.origin) {
+                Some(k) => k.name.split("_kernel").next().unwrap_or(&k.name),
+                None => "<no kernel bound yet>",
+            };
+            *origins.entry(function).or_default() += mirror.len as u64;
+        }
+        let mut origins: Vec<(String, u64)> = origins.into_iter().map(|(f, b)| (f.to_string(), b)).collect();
+        origins.sort_by_key(|(_, b)| std::cmp::Reverse(*b));
+        self.live_peak_origins = origins;
+    }
+
     /// `defer`'s general case: kept by the pending batch, dropped at once
     /// when there's none.
     fn defer_pending(&mut self, garbage: Garbage) {
@@ -1727,6 +1792,9 @@ impl Runtime {
     /// A buffer of `len` bytes, mapped for the host (`host`) or in the
     /// device's own memory: a spare one if there is (`spare`), else a new one.
     fn take_buffer(&mut self, len: usize, host: bool, pinned: &[usize]) -> Buffer<'static> {
+        if self.profiling && !host {
+            self.note_live_device_memory(len);
+        }
         if let Some(buffer) = self.spare.get_mut(&(len, host)).and_then(Vec::pop) {
             self.spare_bytes[host as usize] -= len;
             return buffer;
@@ -2253,7 +2321,10 @@ impl Runtime {
         self.uses += 1;
         if !self.mirrors.contains_key(&start) {
             let buffer = self.take_buffer(len, false, pinned);
-            self.mirrors.insert(start, Mirror { len, buffer, host_dirty: true, device_newer: false, last_use: self.uses });
+            self.mirrors.insert(
+                start,
+                Mirror { len, buffer, host_dirty: true, device_newer: false, last_use: self.uses, origin: NO_ORIGIN },
+            );
             MIRRORS_LIVE.store(true, std::sync::atomic::Ordering::Release);
             bump(&DEVICE_GENERATION);
             bump(&HOST_GENERATION);
@@ -2550,6 +2621,9 @@ unsafe fn dispatch(
             let new = !runtime.mirrors.get(&start).is_some_and(|m| m.len == len);
             let before = runtime.stats.uploaded_bytes;
             runtime.mirror(start, len, false, &pinned);
+            if let Some(mirror) = runtime.mirrors.get_mut(&start).filter(|m| m.origin == NO_ORIGIN) {
+                mirror.origin = kernel_id;
+            }
             let uploaded = runtime.stats.uploaded_bytes - before;
             if uploaded > 0 {
                 let cause = match (new, flags[i] & ARG_READ != 0) {

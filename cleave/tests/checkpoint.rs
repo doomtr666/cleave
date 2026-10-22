@@ -47,10 +47,23 @@ fn a_saved_value_is_restored_as_it_was() {
 /// A small `Trainable` model trained with Adam: 10 steps straight, and 5
 /// steps, a checkpoint (model, optimizer state, random generator), a restore
 /// into a freshly initialized model and 5 more steps, end with the same
-/// weights to the bit and the same next random number.
+/// weights to the bit and the same next random number. Under Adam, and under
+/// Muon: its matrices' state their momentum alone (`MuonState`), its biases'
+/// AdamW's (`AdamState`), both saved and restored.
 #[test]
 fn a_run_resumed_from_a_checkpoint_is_the_same_run() {
-    let path = scratch("resume.ckpt");
+    for (name, optimizer) in [
+        ("adam", "Adam(lr: 0.01, beta1: 0.9, beta2: 0.999, eps: 0.00000001)"),
+        (
+            "muon",
+            "Muon(lr: 0.02, momentum: 0.95, weight_decay: 0.0, adamw: AdamW(lr: 0.01, beta1: 0.9, beta2: 0.95, eps: 0.00000001, weight_decay: 0.0))",
+        ),
+    ] {
+        assert_eq!(run(&resumed_run(&scratch(&format!("resume-{name}.ckpt")), optimizer)), 1, "{name}");
+    }
+}
+
+fn resumed_run(path: &str, optimizer: &str) -> String {
     let prelude = "
         use nn;
         use checkpoint;
@@ -67,13 +80,13 @@ fn a_run_resumed_from_a_checkpoint_is_the_same_run() {
         }
         fn fingerprint(net: Net) -> f32 { sum(net.l1.w) + sum(net.l2.w) + sum(net.l2.b) }
     ";
-    let src = format!(
+    format!(
         "{prelude}
         fn main() -> i32 {{
             rand_seed(7);
             let x: Tensor<f32, 32, 16> = Init::he();
             let y: Tensor<f32, 32, 10> = Init::he();
-            let opt = Adam(lr: 0.01, beta1: 0.9, beta2: 0.999, eps: 0.00000001);
+            let opt = {optimizer};
             let fresh = Net(l1: Init::he(), l2: Init::xavier());
 
             let (straight, _) = train(x, y, opt, fresh, init_state(opt, fresh), 10);
@@ -97,8 +110,7 @@ fn a_run_resumed_from_a_checkpoint_is_the_same_run() {
                 and fingerprint(resumed) != fingerprint(fresh) {{ 1 }} else {{ 0 }}
         }}
     "
-    );
-    assert_eq!(run(&src), 1);
+    )
 }
 
 /// The same resumed run with a model whose layers are an array

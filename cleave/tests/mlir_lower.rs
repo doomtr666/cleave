@@ -5596,18 +5596,64 @@ fn type_errors(src: &str) -> Vec<String> {
 }
 
 /// Coherence is checked by the real compile: two impls that could both apply
-/// to one type are rejected, before any call is even made.
+/// to one type, neither more specific than the other, are rejected before
+/// any call is even made.
 #[test]
 fn overlapping_impls_are_rejected_by_the_real_compile() {
     let errors = type_errors(
         "
-        algebra Twice<T> { fn twice(x: T) -> T; }
-        impl<T: Ring> Twice<T> { fn twice(x) { x + x } }
-        impl Twice<i32> { fn twice(x) { x * 2 } }
+        algebra Pick<A, B> { fn pick(a: A, b: B) -> i32; }
+        impl<T: Ring> Pick<T, i32> { fn pick(a, b) { 1 } }
+        impl<T: Ring> Pick<i32, T> { fn pick(a, b) { 2 } }
         fn main() -> i32 { 0 }
     ",
     );
     assert!(errors.iter().any(|e| e.contains("overlapping")), "got: {errors:?}");
+}
+
+/// Specialization: an impl strictly more specific than another it overlaps
+/// (`Twice<i32>` beside `Twice<T: Ring>`) is no conflict; a call both match
+/// takes it, the others the generic one.
+#[test]
+fn a_more_specific_impl_specializes_an_overlapping_one() {
+    let context = context();
+    let src = "
+        algebra Twice<T> { fn twice(x: T) -> T; }
+        impl<T: Ring> Twice<T> { fn twice(x) { x + x } }
+        impl Twice<i32> { fn twice(x) { x * 3 } }
+        fn main() -> i32 {
+            let wide: i64 = twice(7:i64);
+            if wide == 14 { twice(5) } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 15);
+}
+
+/// A call whose result the arguments leave open, two impls matching it: the
+/// one more specific at the arguments it fixes decides the result (a row of
+/// one, `Tensor<f32, 1, C>`, over any matrix, `Tensor<f32, R, C>`), here and
+/// in a generic function's instance; a matrix of several rows, the other.
+/// Muon's state: AdamW's for a row, its momentum alone for a matrix.
+#[test]
+fn the_more_specific_impl_decides_what_a_call_leaves_open() {
+    let context = context();
+    let src = "
+        use linalg;
+        algebra Kind<M, S> { fn kind(m: M) -> S; }
+        impl<const C: i32> Kind<Tensor<f32, 1, C>, i32> { fn kind(m) { 10 } }
+        impl<const R: i32, const C: i32> Kind<Tensor<f32, R, C>, i64> { fn kind(m) { 2 } }
+        fn of<M>(m: M) -> i32 { let k = kind(m); size_of_kind(k) }
+        fn size_of_kind(k: i32) -> i32 { k }
+        fn main() -> i32 {
+            let row: Tensor<f32, 1, 3> = Ring::zero();
+            let matrix: Tensor<f32, 2, 3> = Ring::zero();
+            let r = kind(row);
+            let m = kind(matrix);
+            let wide: i64 = m;
+            if wide == 2 { r + of(row) } else { 0 }
+        }
+    ";
+    assert_eq!(run_i32(&context, src), 20);
 }
 
 /// Not an overlap: the generic impl's bound can't be met by the concrete

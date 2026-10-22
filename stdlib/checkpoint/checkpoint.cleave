@@ -171,3 +171,10 @@ impl<T: Float, const Dims...: i32> Checkpoint<AdamState<T, Dims...>> {
         )
     }
 }
+
+impl<T: Float, const Dims...: i32> Checkpoint<MuonState<T, Dims...>> {
+    #[no_inline]
+    fn save_part(f, s) { save_part(f, s.m); }
+    #[no_inline]
+    fn restore_part(f, like) { MuonState::<T, Dims...>(m: restore_part(f, like.m)) }
+}

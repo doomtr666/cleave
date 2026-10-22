@@ -179,7 +179,7 @@ fn main() {
     // Checkpoints are written next to the corpus.
     std::env::set_current_dir(&cache).expect("cannot enter the cache directory");
     let which = std::env::args().nth(1).unwrap_or_else(|| "lm".to_string());
-    if which == "gpt" || which == "bench" || which == "write" {
+    if which == "gpt" || which == "bench" || which == "write" || which == "migrate-muon-state" {
         // One directory per model size, context and vocabulary: its checkpoints don't fit another. `bench` trains
         // exactly as `gpt` does, in a directory of its own, so that a comparison run against the
         // PyTorch twin never overwrites the real run's checkpoints.
@@ -197,6 +197,19 @@ fn main() {
         std::fs::create_dir_all(&dir).expect("cannot create the model's checkpoint directory");
         std::env::set_current_dir(&dir).expect("cannot enter the model's checkpoint directory");
         eprintln!("checkpoints in .cache/{dir}");
+    }
+    if which == "migrate-muon-state" {
+        // One-shot (`migrate_muon_state`): `gpt.ckpt` from before Muon's `MuonState`, rewritten
+        // in the current shape; the original kept aside, and never overwritten by a second run.
+        const BACKUP: &str = "gpt.ckpt.adamstate";
+        if std::path::Path::new(BACKUP).exists() {
+            eprintln!("{BACKUP} exists: this checkpoint was already migrated");
+            std::process::exit(2);
+        }
+        std::fs::copy("gpt.ckpt", BACKUP).expect("cannot back up gpt.ckpt");
+        unsafe { migrate_muon_state() };
+        println!("gpt.ckpt migrated (the original in {BACKUP})");
+        return;
     }
     if which != "write" {
         println!(

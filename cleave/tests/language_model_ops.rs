@@ -2513,3 +2513,42 @@ fn an_elementwise_result_read_much_later_is_recomputed() {
     // `w` is the identity: a70 = g, so the sum is sum(g) + sum(g * y) + sum(y).
     assert!(value.is_finite());
 }
+
+/// The MLP with its activations in bf16 (`swiglu_forward_bf16`: `dense_bf16`,
+/// `swiglu_gate` and its adjoint rule) against the f32 one on the same
+/// weights: its loss and its gradients within bf16's rounding (2^-8
+/// relative, a few of them along the way), and a backward through
+/// `swiglu_gate`'s own adjoint, from the bf16 gate and up projections.
+#[test]
+fn the_bf16_mlp_and_its_gradient_match_the_f32_one() {
+    let src = |out: &str| {
+        format!(
+            "
+            use nn;
+            fn loss32(m: SwiGlu<f32, 8, 16>, x: Tensor<f32, 4, 8>) -> f32 {{ sum(swiglu_forward(m, x) * swiglu_forward(m, x)) }}
+            fn loss16(m: SwiGlu<f32, 8, 16>, x: Tensor<f32, 4, 8>) -> f32 {{ sum(swiglu_forward_bf16(m, x) * swiglu_forward_bf16(m, x)) }}
+            d32 = grad(loss32, m);
+            d16 = grad(loss16, m);
+            fn main() -> f32 {{
+                rand_seed(3);
+                let m: SwiGlu<f32, 8, 16> = SwiGlu(gate: Init::he(), up: Init::he(), down: Dense(w: Init::he(), b: Init::he()));
+                let x: Tensor<f32, 4, 8> = Init::he();
+                {out}
+            }}
+        "
+        )
+    };
+    let pair = |expr: &str| {
+        (run(&src(&expr.replace("{}", "16"))), run(&src(&expr.replace("{}", "32"))))
+    };
+    let (l16, l32) = pair("loss{}(m, x)");
+    assert!((l16 - l32).abs() <= 0.02 * l32.abs(), "loss: {l16} in bf16, {l32} in f32");
+    for part in ["gate.w[2, 5]", "gate.w[7, 11]", "up.w[0, 3]", "up.w[5, 14]", "down.w[9, 4]", "gate.b[0, 6]", "down.b[0, 2]"] {
+        let (g16, g32) = pair(&format!("d{{}}(m, x).{part}"));
+        let scale = run(&src("let g = d32(m, x); mlir::math::sqrt(sum(g.gate.w * g.gate.w) / 128.0)"));
+        assert!(
+            (g16 - g32).abs() <= 0.03 * (g32.abs() + scale),
+            "{part}: {g16} in bf16, {g32} in f32 (scale {scale})"
+        );
+    }
+}

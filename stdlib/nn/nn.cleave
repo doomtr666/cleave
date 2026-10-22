@@ -1521,17 +1521,70 @@ fn swiglu_forward<T: Float, const B: i32, const D: i32, const H: i32>(m: SwiGlu<
 // `dense_forward` and `swiglu_forward` in mixed precision (`doc/plan-quantization.md`): the f32
 // weights stay the master copy the optimizer updates; each product takes a bf16 working copy of
 // them and of its input, runs on the tensor cores where the backend has them (bf16 operands, f32
-// accumulation, an f32 result: `matmul_wide`); bias, gating, residuals in f32. The
-// gradients follow the same path back (`Convert`'s adjoint), reaching the weights in f32. The
-// program's choice, per layer.
+// accumulation: `matmul_wide`). The gradients follow the same path back (`Convert`'s adjoint),
+// reaching the weights in f32. The program's choice, per layer.
+//
+// `dense_forward_bf16`: an f32 result, its bias added in f32.
 fn dense_forward_bf16<const B: i32, const In: i32, const Out: i32>(layer: Dense<f32,In,Out>, x: Tensor<f32,B,In>) -> Tensor<f32,B,Out> {
     let w: Tensor<bf16, In, Out> = layer.w.to();
     let xb: Tensor<bf16, B, In> = x.to();
     matmul_wide(xb, w) + broadcast0(layer.b)
 }
 
+// `dense_forward_bf16` from a bf16 input to a bf16 result: the bias added to the f32 product, the
+// sum rounded to bf16, as PyTorch's autocast does a linear layer. What reads it keeps half the
+// memory an f32 result took (a backward keeps its activations until it reaches them).
+fn dense_bf16<const B: i32, const In: i32, const Out: i32>(layer: Dense<f32,In,Out>, x: Tensor<bf16,B,In>) -> Tensor<bf16,B,Out> {
+    let w: Tensor<bf16, In, Out> = layer.w.to();
+    let z: Tensor<f32, B, Out> = matmul_wide(x, w) + broadcast0(layer.b);
+    z.to()
+}
+
+// SwiGLU's gating, `silu(g) * u`, on bf16 tensors: computed in f32, rounded to bf16, as PyTorch's
+// autocast does on bf16 activations. Its adjoint reads `g` and `u` themselves, so a backward
+// keeps the two bf16 tensors: derived through the f32 arithmetic instead, it kept their f32
+// conversions, twice the memory (nanoLM: a GiB of its 4.8 GiB at the peak). The gradients in
+// bf16, as the adjoint of a bf16 product's operand is (`Convert`'s adjoint).
+algebra SwiGluGate<T> {
+    fn swiglu_gate(g: T, u: T) -> T;
+    fn swiglu_gate_grad_g(g: T, u: T, d: T) -> T;
+    fn swiglu_gate_grad_u(g: T, d: T) -> T;
+    adjoint swiglu_gate(g, u), d: (swiglu_gate_grad_g(g, u, d), swiglu_gate_grad_u(g, d));
+}
+
+impl<const Dims...: i32> SwiGluGate<Tensor<bf16, Dims...>> {
+    fn swiglu_gate(g, u) {
+        let gf: Tensor<f32, Dims...> = g.to();
+        let uf: Tensor<f32, Dims...> = u.to();
+        let h: Tensor<f32, Dims...> = silu(gf) * uf;
+        h.to()
+    }
+    // `d (silu(g) u) / dg = u silu'(g)`.
+    fn swiglu_gate_grad_g(g, u, d) {
+        let gf: Tensor<f32, Dims...> = g.to();
+        let uf: Tensor<f32, Dims...> = u.to();
+        let df: Tensor<f32, Dims...> = d.to();
+        let dg: Tensor<f32, Dims...> = df * uf * silu_grad(gf);
+        dg.to()
+    }
+    // `d (silu(g) u) / du = silu(g)`.
+    fn swiglu_gate_grad_u(g, d) {
+        let gf: Tensor<f32, Dims...> = g.to();
+        let df: Tensor<f32, Dims...> = d.to();
+        let du: Tensor<f32, Dims...> = df * silu(gf);
+        du.to()
+    }
+}
+
+// The MLP with its activations in bf16: the input rounded once for both products, the gate's and
+// the up projection's results in bf16 (`dense_bf16`), gated in bf16 (`swiglu_gate`), the down
+// projection's result in f32 for the residual it's added to.
 fn swiglu_forward_bf16<const B: i32, const D: i32, const H: i32>(m: SwiGlu<f32, D, H>, x: Tensor<f32, B, D>) -> Tensor<f32, B, D> {
-    m.down.dense_forward_bf16(silu(m.gate.dense_forward_bf16(x)) * m.up.dense_forward_bf16(x))
+    let xb: Tensor<bf16, B, D> = x.to();
+    let g = dense_bf16(m.gate, xb);
+    let u = dense_bf16(m.up, xb);
+    let wd: Tensor<bf16, H, D> = m.down.w.to();
+    matmul_wide(swiglu_gate(g, u), wd) + broadcast0(m.down.b)
 }
 
 // A table of learned vectors, one row per token: `embedding_forward` reads the
