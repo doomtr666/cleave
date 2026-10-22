@@ -44,7 +44,14 @@ static PHASE_TIMES: Mutex<Option<PhaseTimes>> = Mutex::new(None);
 
 unsafe extern "C" {
     fn cleave_parallel_threads() -> i32;
+    fn cleave_ckpt_saves_begun() -> i64;
+    fn cleave_ckpt_wait_for(n: i64) -> i64;
+    fn cleave_ckpt_wait();
 }
+
+/// The threads recording each round's step once its checkpoint is in place
+/// (`round_done`), joined before the process ends.
+static STEP_WRITERS: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
@@ -117,7 +124,10 @@ fn round_line(step: i32, train: Option<f32>, validation: f32, rate: f32, timing:
 
 /// Called by the kernel at the end of each training round (and once before the first): the step
 /// reached, the losses, the learning rate; printed with the throughput since the last round.
-/// A round's end follows its checkpoint (`train_gpt`): the step is recorded as the checkpoint's.
+/// A round's end follows its checkpoint (`train_gpt`): the step is recorded as the checkpoint's,
+/// once the checkpoint is in place (saved in the background, `cleave-rt`'s `checkpoint.rs`): a
+/// process stopped before then resumes from the previous checkpoint at the previous step. A thread
+/// waits for it; a later round's save in place first leaves the step to that round's thread.
 #[unsafe(no_mangle)]
 pub extern "C" fn round_done(step: i32, train_loss: f32, validation_loss: f32, rate: f32) {
     let now = Instant::now();
@@ -129,9 +139,15 @@ pub extern "C" fn round_done(step: i32, train_loss: f32, validation_loss: f32, r
             *round = Some((now, now, step));
         }
         Some((start, last, last_step)) => {
-            if let Err(e) = std::fs::write(STEP_FILE, step.to_string()) {
-                eprintln!("cannot record the checkpoint's step in {STEP_FILE}: {e}");
-            }
+            let save = unsafe { cleave_ckpt_saves_begun() };
+            let writer = std::thread::spawn(move || {
+                if unsafe { cleave_ckpt_wait_for(save) } == save
+                    && let Err(e) = std::fs::write(STEP_FILE, step.to_string())
+                {
+                    eprintln!("cannot record the checkpoint's step in {STEP_FILE}: {e}");
+                }
+            });
+            STEP_WRITERS.lock().unwrap().push(writer);
             let tokens = f64::from(step - last_step) * f64::from(unsafe { gpt_step_tokens() });
             let tokens_per_second = tokens / (now - last).as_secs_f64().max(1e-9);
             let minutes = (now - start).as_secs_f64() / 60.0;
@@ -267,6 +283,10 @@ fn main() {
         let (rounds, per_round, end) = (arg(3, 10), arg(4, 100), arg(5, 0));
         let start = std::time::Instant::now();
         let nats = unsafe { train_gpt(first, rounds, per_round, 0.001, 1, first > 0, end) };
+        unsafe { cleave_ckpt_wait() };
+        for writer in std::mem::take(&mut *STEP_WRITERS.lock().unwrap()) {
+            let _ = writer.join();
+        }
         println!("transformer: {}", per_token(nats));
         println!("elapsed: {:?}", start.elapsed());
     } else {

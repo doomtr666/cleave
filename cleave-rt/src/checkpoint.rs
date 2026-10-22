@@ -12,13 +12,24 @@
 //! once complete: a process stopped mid-save leaves the previous checkpoint
 //! intact.
 //!
+//! Written in the background: each record is copied and handed to a thread
+//! of the checkpoint's own, which writes it, then flushes the file to disk and
+//! renames it once the checkpoint is closed. The program carries on meanwhile
+//! (a training run's next steps on the device: nanoLM's GPU waited seconds per
+//! save for the disk). One save at a time: a checkpoint created or opened, or
+//! the process ending, first waits for the saves under way
+//! (`cleave_ckpt_wait`), so a read always finds the last save complete. A
+//! host recording that a save is in place (nanoLM's `gpt.step`) waits for it
+//! (`cleave_ckpt_saves_begun`, `cleave_ckpt_wait_for`).
+//!
 //! Errors end the process with a message: there is no unwinding across the C
 //! boundary, and cleave has no exceptions to turn one into.
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::mpsc::{Sender, channel};
+use std::sync::{Condvar, Mutex};
 
 const MAGIC: &[u8; 8] = b"CLVCKPT\0";
 const VERSION: u32 = 1;
@@ -40,10 +51,9 @@ fn tag_name(tag: u8) -> &'static str {
 }
 
 enum Open {
+    /// The records go to the checkpoint's writer thread (`writer`).
     Writing {
-        out: BufWriter<File>,
-        tmp: PathBuf,
-        path: PathBuf,
+        records: Sender<Vec<u8>>,
     },
     Reading {
         input: BufReader<File>,
@@ -72,6 +82,72 @@ fn with_file<R>(handle: i64, f: impl FnOnce(&mut Open) -> R) -> R {
     }
 }
 
+/// Saves begun and saves complete (their file in place), in order: one at a
+/// time, so the `n`th begun is in place once `n` are complete.
+static SAVES: Mutex<(u64, u64)> = Mutex::new((0, 0));
+static SAVED: Condvar = Condvar::new();
+
+/// How many checkpoints were created so far: the last one is in place once
+/// `cleave_ckpt_wait_for` that many returns.
+#[unsafe(no_mangle)]
+pub extern "C" fn cleave_ckpt_saves_begun() -> i64 {
+    SAVES.lock().unwrap_or_else(|e| e.into_inner()).0 as i64
+}
+
+/// Waits until `n` checkpoints are in place (written, flushed, renamed);
+/// returns how many are.
+#[unsafe(no_mangle)]
+pub extern "C" fn cleave_ckpt_wait_for(n: i64) -> i64 {
+    let mut saves = SAVES.lock().unwrap_or_else(|e| e.into_inner());
+    while (saves.1 as i64) < n {
+        saves = SAVED.wait(saves).unwrap_or_else(|e| e.into_inner());
+    }
+    saves.1 as i64
+}
+
+/// Waits until every checkpoint created so far is in place.
+#[unsafe(no_mangle)]
+pub extern "C" fn cleave_ckpt_wait() {
+    cleave_ckpt_wait_for(cleave_ckpt_saves_begun());
+}
+
+/// The process's end waits for the saves under way (`atexit`): returning
+/// from `main` would otherwise end the writer thread mid-file.
+fn wait_at_exit() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    unsafe extern "C" {
+        fn atexit(f: extern "C" fn()) -> i32;
+    }
+    extern "C" fn at_exit() {
+        cleave_ckpt_wait();
+    }
+    ONCE.call_once(|| unsafe {
+        atexit(at_exit);
+    });
+}
+
+/// The thread writing one checkpoint: its records in order, then, once
+/// they're all sent (the checkpoint closed), the file flushed to disk and
+/// renamed into place.
+fn writer(mut out: BufWriter<File>, records: std::sync::mpsc::Receiver<Vec<u8>>, tmp: PathBuf, path: PathBuf) {
+    // A save that fails ends the process, its waits released first: the end
+    // of the process waits for every save (`wait_at_exit`).
+    let failed = |message: String| -> ! {
+        SAVES.lock().unwrap_or_else(|e| e.into_inner()).1 += 1;
+        SAVED.notify_all();
+        fail(message)
+    };
+    for record in records {
+        out.write_all(&record).unwrap_or_else(|e| failed(format!("cannot write {}: {e}", tmp.display())));
+    }
+    let file = out.into_inner().unwrap_or_else(|e| failed(format!("cannot write {}: {e}", tmp.display())));
+    file.sync_all().unwrap_or_else(|e| failed(format!("cannot write {}: {e}", tmp.display())));
+    drop(file);
+    std::fs::rename(&tmp, &path).unwrap_or_else(|e| failed(format!("cannot replace {}: {e}", path.display())));
+    SAVES.lock().unwrap_or_else(|e| e.into_inner()).1 += 1;
+    SAVED.notify_all();
+}
+
 fn register(open: Open) -> i64 {
     let mut files = FILES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(i) = files.iter().position(Option::is_none) {
@@ -89,6 +165,8 @@ fn register(open: Open) -> i64 {
 /// `path` must point to `len` readable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cleave_ckpt_create(path: *const u8, len: i64) -> i64 {
+    cleave_ckpt_wait();
+    wait_at_exit();
     let path = path_from(path, len);
     let mut tmp = path.clone().into_os_string();
     tmp.push(".tmp");
@@ -97,7 +175,13 @@ pub unsafe extern "C" fn cleave_ckpt_create(path: *const u8, len: i64) -> i64 {
     let mut out = BufWriter::new(file);
     let header = out.write_all(MAGIC).and_then(|()| out.write_all(&VERSION.to_le_bytes()));
     header.unwrap_or_else(|e| fail(format!("cannot write {}: {e}", tmp.display())));
-    register(Open::Writing { out, tmp, path })
+    SAVES.lock().unwrap_or_else(|e| e.into_inner()).0 += 1;
+    let (records, received) = channel();
+    std::thread::Builder::new()
+        .name("cleave checkpoint".to_string())
+        .spawn(move || writer(out, received, tmp, path))
+        .unwrap_or_else(|e| fail(format!("cannot start the checkpoint's writer: {e}")));
+    register(Open::Writing { records })
 }
 
 /// Opens the checkpoint at `path` for reading.
@@ -106,6 +190,7 @@ pub unsafe extern "C" fn cleave_ckpt_create(path: *const u8, len: i64) -> i64 {
 /// `path` must point to `len` readable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cleave_ckpt_open(path: *const u8, len: i64) -> i64 {
+    cleave_ckpt_wait();
     let path = path_from(path, len);
     let file = File::open(&path).unwrap_or_else(|e| fail(format!("cannot open {}: {e}", path.display())));
     let mut input = BufReader::new(file);
@@ -125,8 +210,8 @@ pub unsafe extern "C" fn cleave_ckpt_open(path: *const u8, len: i64) -> i64 {
     register(Open::Reading { input, path, leaf: 0 })
 }
 
-/// Ends a checkpoint: a written one replaces `path` atomically; a read one
-/// must have been read to its end.
+/// Ends a checkpoint: a written one replaces `path` atomically, in the
+/// background (`writer`); a read one must have been read to its end.
 #[unsafe(no_mangle)]
 pub extern "C" fn cleave_ckpt_close(handle: i64) {
     let open = {
@@ -134,15 +219,8 @@ pub extern "C" fn cleave_ckpt_close(handle: i64) {
         files.get_mut(handle as usize).and_then(Option::take)
     };
     match open {
-        Some(Open::Writing { out, tmp, path }) => {
-            let file = out
-                .into_inner()
-                .unwrap_or_else(|e| fail(format!("cannot write {}: {e}", tmp.display())));
-            file.sync_all().unwrap_or_else(|e| fail(format!("cannot write {}: {e}", tmp.display())));
-            drop(file);
-            std::fs::rename(&tmp, &path)
-                .unwrap_or_else(|e| fail(format!("cannot replace {}: {e}", path.display())));
-        }
+        // The last record sent: the writer finishes the file.
+        Some(Open::Writing { records }) => drop(records),
         Some(Open::Reading { mut input, path, leaf }) => {
             let mut rest = [0u8; 1];
             if input.read(&mut rest).unwrap_or(0) != 0 {
@@ -167,15 +245,19 @@ fn shape_text(tag: u8, dims: &[i64]) -> String {
 
 fn write_record(handle: i64, tag: u8, dims: &[i64], payload: &[u8]) {
     with_file(handle, |open| {
-        let Open::Writing { out, tmp, .. } = open else {
+        let Open::Writing { records } = open else {
             fail(format!("checkpoint {handle} is open for reading, not writing"))
         };
-        let mut record = vec![tag, dims.len() as u8];
+        // A copy: the program may change or free its value as soon as this
+        // returns.
+        let mut record = Vec::with_capacity(2 + 8 * dims.len() + payload.len());
+        record.extend_from_slice(&[tag, dims.len() as u8]);
         for d in dims {
             record.extend_from_slice(&d.to_le_bytes());
         }
-        let written = out.write_all(&record).and_then(|()| out.write_all(payload));
-        written.unwrap_or_else(|e| fail(format!("cannot write {}: {e}", tmp.display())));
+        record.extend_from_slice(payload);
+        // A writer gone has ended the process (`fail`).
+        let _ = records.send(record);
     });
 }
 
@@ -273,3 +355,33 @@ scalar!(cleave_ckpt_write_f32, cleave_ckpt_read_f32, f32, TAG_F32);
 scalar!(cleave_ckpt_write_f64, cleave_ckpt_read_f64, f64, TAG_F64);
 scalar!(cleave_ckpt_write_i32, cleave_ckpt_read_i32, i32, TAG_I32);
 scalar!(cleave_ckpt_write_i64, cleave_ckpt_read_i64, i64, TAG_I64);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A checkpoint closed is written in the background, and in place for
+    /// whatever comes next: opened right after its close, with no wait of the
+    /// caller's own, it reads back whole; the saves begun and in place counted.
+    #[test]
+    fn a_checkpoint_saved_in_the_background_reads_back_at_once() {
+        let path = std::env::temp_dir().join(format!("cleave-ckpt-{}.ckpt", std::process::id()));
+        let name = path.to_string_lossy().into_owned();
+        let begun = cleave_ckpt_saves_begun();
+        let data: Vec<f32> = (0..1 << 20).map(|i| i as f32 * 0.5).collect();
+        let f = unsafe { cleave_ckpt_create(name.as_ptr(), name.len() as i64) };
+        unsafe { cleave_ckpt_write_f32s(f, 1, data.len() as i32, 0, 0, data.as_ptr(), data.len() as i64) };
+        cleave_ckpt_write_i64(f, 42);
+        cleave_ckpt_close(f);
+        assert_eq!(cleave_ckpt_saves_begun(), begun + 1);
+
+        let f = unsafe { cleave_ckpt_open(name.as_ptr(), name.len() as i64) };
+        assert!(cleave_ckpt_wait_for(begun + 1) >= begun + 1, "the save is in place once a read opens it");
+        let mut back = vec![0f32; data.len()];
+        unsafe { cleave_ckpt_read_f32s(f, 1, data.len() as i32, 0, 0, back.as_mut_ptr(), back.len() as i64) };
+        assert_eq!(cleave_ckpt_read_i64(f), 42);
+        cleave_ckpt_close(f);
+        assert_eq!(back, data);
+        let _ = std::fs::remove_file(&path);
+    }
+}
